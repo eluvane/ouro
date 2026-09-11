@@ -103,11 +103,14 @@ Nightly uses `checks`, `analysis`, `tests`, `samples-1`, `samples-2`, `kernel`,
 and `trust` groups. The `trust` job runs the stage-loop fixpoint/drift gate and
 then the deeper OuroSmith profile in the same checkout. `Full` runs even after
 a job failure and fails unless every matrix group succeeds. Reports are
-uploaded separately as `nightly-<group>` artifacts. Hosted PR check names are
-`Checks`, `Analysis`, `Tests`, `OuroSmith`, `Samples (1/2)`, and `Samples (2/2)`;
-`scripts/apply_github_settings.py` recommends the matching required checks,
-including both sample shards and OuroSmith. Existing hosted branch rules need
-the same check-name update when adopting the split workflow.
+uploaded separately as `nightly-<group>` artifacts. Hosted PR matrix jobs use static names `PR` and `Portable` so a skipped
+matrix does not publish an unevaluated expression. When those jobs run,
+GitHub appends the matrix value: `PR (checks)`, `PR (analysis)`, `PR (tests)`,
+`PR (smith)`, `PR (samples-1)`, `PR (samples-2)`, `Portable (ubuntu-latest)`,
+and `Portable (macos-latest)`. `scripts/apply_github_settings.py` recommends
+those running check names, plus `Paths`, `Kernel`, `Editor`, and `Review`.
+Existing hosted branch rules need the same check-name update when adopting
+the split workflow.
 
 Focused suites remain the fastest way to iterate. The Python PR profile is still
 the final local composition before review until `pr-native` parity is explicitly
