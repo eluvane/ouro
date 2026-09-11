@@ -165,12 +165,21 @@ def build_command(argv: list[str], log: Path, *, timeout_s: float = 600) -> str 
     return None
 
 
+def ensure_compiler(log: Path | None = None) -> str | None:
+    path = ROOT / "_build/smith/compiler-build.log" if log is None else log
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return build_command(
+        [sys.executable, str(ROOT / "scripts/ouro_build.py"), "build", "--jobs", str(job_count())],
+        path,
+    )
+
+
 def ensure_tools(out: Path, required: tuple[str, ...] = TOOLS) -> str | None:
     if not required or len(set(required)) != len(required):
         raise ValueError("native tool selection must be nonempty and unique")
     for tool in required:
         tool_entry(tool)
-    reason = build_command([sys.executable, str(ROOT / "scripts/ouro_build.py"), "build", "--jobs", str(job_count())], out / "compiler-build.log")
+    reason = ensure_compiler(out / "compiler-build.log")
     if reason:
         return reason
     for tool in required:

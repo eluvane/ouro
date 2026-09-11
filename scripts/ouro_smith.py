@@ -47,9 +47,16 @@ FAULT_SEEDS = {"pr": 16, "nightly": 100, "kernel": 40}
 
 
 def compiler_for(args):
-    from ourosmith.host import compiler_path
+    from ourosmith.host import compiler_path, ensure_compiler
     from ourosmith.native import digest
 
+    if getattr(args, "compiler", None) is None:
+        try:
+            compiler_path(None)
+        except (FileNotFoundError, ValueError):
+            reason = ensure_compiler()
+            if reason:
+                raise FileNotFoundError(f"native binary unavailable: {reason}") from None
     selected = compiler_path(args.compiler)
     current = digest(selected)
     if getattr(args, "compiler_digest", current) != current:

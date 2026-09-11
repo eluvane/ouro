@@ -109,6 +109,8 @@ GitHub appends the matrix value: `PR (checks)`, `PR (analysis)`, `PR (tests)`,
 `PR (smith)`, `PR (samples-1)`, `PR (samples-2)`, `Portable (ubuntu-latest)`,
 and `Portable (macos-latest)`. Portable restores the compiler cache when
 present, then builds `ouro1` before `kernel_hardening_suite.py`.
+The `analysis`, `tests`, `smith`, `samples-1`, and `samples-2` jobs also
+build `ouro1` after a cache miss; `checks` stays lint/quality-only.
 `scripts/apply_github_settings.py` recommends
 those running check names, plus `Paths`, `Kernel`, `Editor`, and `Review`.
 Existing hosted branch rules need the same check-name update when adopting
