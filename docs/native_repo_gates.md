@@ -63,7 +63,7 @@ instead of being guessed. Structured checks reject privileged triggers, broad
 write permissions, `continue-on-error`, mutable external action refs, missing
 job timeouts, duplicate display names, unsafe cache save paths, and unsupported
 `scripts/ci_gate.py` invocations. Release write access is accepted only in the
-exact guarded draft-publication job.
+exact guarded draft-publication job and the exact guarded weekly snapshot job.
 
 Full PR readiness still uses `python3 scripts/ci_gate.py --profile pr` unless a workflow explicitly selects the native profile and its parity coverage is sufficient for that context. The Python PR profile routes the supported docs, project, and workflow policy rows through `sh scripts/ouro_repo_gate.sh --profile docs-native`, `project-native`, and `workflow-native`; the legacy Python entry points remain compatibility commands for direct callers.
 

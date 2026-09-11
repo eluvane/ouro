@@ -17,6 +17,9 @@ dates are added when a release is published.
 
 ### Added
 
+- The hosted Release workflow publishes a dated `weekly-YYYYMMDD` snapshot of
+  `main` when the tree changed, without bumping the project version.
+
 - Standalone native LSP, package verification and user tests invoke sibling
   executables through bounded capture with explicit process failures. LSP
   workspace authorization, package integrity checks and retained suite

@@ -66,12 +66,19 @@ same inputs can be compared.
 
 ## GitHub release
 
-`.github/workflows/ouro-release.yml` runs on release tags and manual dispatch.
+`.github/workflows/ouro-release.yml` runs on release tags, Monday schedule,
+and manual dispatch.
 A tag run creates a draft GitHub Release and uploads the generated archives,
 manifest, notes, and checksums.
 
 A maintainer reviews the draft, changelog, checksums, validation reports,
 security status, and generated-artifact hashes before publication.
+
+A Monday schedule on `main`, or a dispatch with `weekly_snapshot`, publishes a
+dated `weekly-YYYYMMDD` GitHub Release when `main` has commits since the last
+weekly snapshot (or in the last eight days if none exists). The snapshot keeps
+the current project version, uses commit subjects as notes, and does not mark
+the release as latest. Empty weeks publish nothing.
 
 ## Checklist
 

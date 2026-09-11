@@ -375,7 +375,7 @@ evidence, updated docs, no active references, and no bootstrap dependency.
 | `ouro-nightly-full.yml` | Scheduled full checks |
 | `ouro-manual-trust.yml` | On-demand check profiles |
 | `dependency-review.yml` | Changed dependency and workflow checks |
-| `ouro-release.yml` | Build and publish releases |
+| `ouro-release.yml` | Build and publish tag drafts and weekly snapshots |
 | `ouro-pages.yml` | Build `site/` and publish GitHub Pages |
 
 Hosted path selection is fail-closed for validation: missing revisions, a Git
@@ -398,7 +398,8 @@ stable, but the dependency action and workflow scan run only when their owned
 paths changed.
 
 Workflow permissions are explicit. Validation jobs are read-only; release
-publication requests write access only in the tag-gated publish job. The public
+publication requests write access only in the tag-gated draft job and the
+guarded weekly snapshot job. The public
 site workflow requests `pages` and `id-token` write only in the main-branch
 publish job. External actions are pinned to a full commit SHA.
 
@@ -555,9 +556,10 @@ steps. Duplicate keys and unsupported anchors, aliases, merge keys, tags, flow
 mappings, quoted/complex keys, or tab indentation fail closed. Privileged
 triggers, `continue-on-error`, broad write permissions, and mutable external
 action refs are rejected structurally. Write exceptions are the exact
-draft-publish job with its tag guard and draft release command, and the exact
-pages publish job with its main-branch push guard and official deploy-pages
-action. `scripts/github_workflow_gate.py` preserves the legacy CLI/report path while
+draft-publish job with its tag guard and draft release command, the exact
+weekly snapshot job with its main-branch schedule or dispatch guard, and the
+exact pages publish job with its main-branch push guard and official
+deploy-pages action. `scripts/github_workflow_gate.py` preserves the legacy CLI/report path while
 delegating policy to this native profile.
 
 `sh scripts/frontend_security_suite.sh` is a blocking PR check for malformed and
