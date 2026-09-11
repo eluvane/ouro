@@ -486,13 +486,33 @@ def run_self_tests() -> None:
     print("RELEASE_PACKAGE_SELF_TEST: PASS versions=11 tracked_links=5 archive_formats=2 reparse=1")
 
 
+def changelog_section(version: str) -> str:
+    text = read("CHANGELOG.md")
+    header = f"## [{version}]"
+    start = text.find(header)
+    if start < 0:
+        raise SystemExit(f"release package: CHANGELOG.md has no {header} section")
+    rest = text[start:]
+    next_heading = rest.find("\n## [", 1)
+    footer = rest.find("\n<p align=")
+    end = len(rest)
+    if next_heading != -1:
+        end = min(end, next_heading)
+    if footer != -1:
+        end = min(end, footer)
+    body = rest[:end].strip()
+    if not body:
+        raise SystemExit(f"release package: CHANGELOG.md section {header} is empty")
+    return body
+
+
 def write_release_notes(path: Path, version: str) -> None:
-    text = f"""# Ouro v{version}
-
-This release candidate contains the Ouro source tree, committed bootstrap seeds, repository-local CI/release policy, and generated SHA256 checksums.
-
-It does not claim signed binaries, SLSA provenance, or a stable 1.0 language surface. See `CHANGELOG.md`, `docs/stability.md`, `docs/releasing.md`, and `docs/tcb.md` inside the archive before publishing it as a public release.
-"""
+    text = (
+        f"# Ouro v{version}\n\n"
+        f"{changelog_section(version)}\n\n"
+        "This is a source archive plus checksums. It does not claim signed "
+        "binaries, SLSA provenance, or a stable 1.0 language surface.\n"
+    )
     path.write_text(text, encoding="utf-8")
 
 

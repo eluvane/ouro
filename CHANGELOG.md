@@ -15,8 +15,12 @@ dates are added when a release is published.
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-09-12
+
 ### Added
 
+- Initial development baseline for the Ouro language, kernel, bootstrap path,
+  standard library, samples, and repository tooling.
 - The hosted Release workflow publishes a dated `weekly-YYYYMMDD` snapshot of
   `main` when the tree changed, without bumping the project version.
 
@@ -632,11 +636,6 @@ dates are added when a release is published.
 - The C producer/runtime and host build scripts remain transitional
   dependencies. Caches, analyzers, and generated artifacts do not authorize
   unchecked declarations.
-
-## [0.1.0]
-
-- Initial development baseline for the Ouro language, kernel, bootstrap path,
-  standard library, samples, and repository tooling.
 
 <p align="center">
   <img
