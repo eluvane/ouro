@@ -9,10 +9,10 @@ cd "$ROOT"
 # Native acceptance uses an explicitly provisioned directory, never a C fallback.
 NATIVE_TOOLS=""
 if [ "${1:-}" = --native-tools ]; then
-	[ "$#" -ge 2 ] && [ -n "$2" ] || {
+	if [ "$#" -lt 2 ] || [ -z "$2" ]; then
 		echo "usage: sh scripts/samples_suite.sh --native-tools DIR [suite options]" >&2
 		exit 2
-	}
+	fi
 	NATIVE_TOOLS=$2
 	case "$NATIVE_TOOLS" in
 	/* | [A-Za-z]:*) ;;

@@ -17,6 +17,12 @@ integration may change.
 
 ## [Unreleased]
 
+### Fixed
+
+- Restored bootstrap input hashing so a clean host can freeze and build `ouro1`.
+- Split oversized checker modules and cleared the release-quality findings that
+  were failing the PR firewall.
+
 ## [0.1.0] - 2026-09-12
 
 First public source release of the standalone native Ouro toolchain:

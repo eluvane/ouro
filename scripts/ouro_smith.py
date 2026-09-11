@@ -52,9 +52,10 @@ def compiler_for(args):
 
     selected = compiler_path(args.compiler)
     current = digest(selected)
-    if getattr(args, "_compiler_sha256", current) != current:
+    if getattr(args, "compiler_digest", current) != current:
         raise ValueError("selected native compiler changed during this command")
-    args.compiler, args._compiler_sha256 = selected, current
+    args.compiler = selected
+    args.compiler_digest = current
     return selected
 
 
@@ -92,10 +93,11 @@ def surface_tools(args, out, report):
         overrides, evidence = prepare_tools(out / "build", compiler_for(args))
         report.sections["surface_toolchain"] = evidence
         report.sections["provenance"]["binaries"].update(binary_state(overrides.values()))
-        return overrides
     except (OSError, ValueError) as error:
         report.skip("surface:tools", str(error))
         return None
+    else:
+        return overrides
 
 
 def cmd_run(args: argparse.Namespace) -> int:

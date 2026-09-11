@@ -14,6 +14,8 @@ from ourosmith.host import environment
 from ourosmith.limits import run_limited
 from repo_support import hash_json, sha256_path, write_json_atomic
 
+digest = sha256_path
+
 LAW_ENTRY = "tests/compiler_fault_tests.ouro"
 LAW_EXPECTATIONS = {
     "CHK.sort-cumul": "90/body/type-mismatch", "CTL.sort-cumul": "accepted",
@@ -95,9 +97,11 @@ def build_receipt(executable: Path, units: list[str], source_hashes: dict,
                  and receipt["binary_sha256"] == digest(executable)
                  and inputs["compiler_sha256"] == compiler_sha
                  and inputs["sources"] == expected_sources)
-        return receipt if valid else None
+        valid_receipt = receipt if valid else None
     except (OSError, ValueError, KeyError, TypeError, IndexError):
         return None
+    else:
+        return valid_receipt
 
 
 

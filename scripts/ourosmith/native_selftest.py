@@ -113,7 +113,7 @@ class NativeHarnessTests(unittest.TestCase):
         from ourosmith import migration
         from ourosmith.selftest import migration_archive
 
-        archived, snapshot, manifest, report, _external = migration_archive()
+        archived, snapshot, manifest, _report, _external = migration_archive()
         archived.pop("contracts")
         archived["categories"][0]["strategies"] = ["external/old-owner/example"]
         historical_hash = migration.archive_hash(archived)
@@ -226,7 +226,7 @@ class NativeHarnessTests(unittest.TestCase):
         self.assertTrue(all(seed == 17 for _, _, seed in attempts))
         calls = []
         unchanged = shrink(CoreConfig([17], "pr", 4, 4, 1), 17, wanted,
-                           lambda cfg, seed: calls.append(seed) or Failure("other-property", "wrong-class", wanted.detail))
+                           lambda _cfg, seed: calls.append(seed) or Failure("other-property", "wrong-class", wanted.detail))
         self.assertEqual((unchanged.depth, unchanged.max_defs), (4, 4))
         self.assertEqual(len(calls), 1)
 
@@ -295,8 +295,8 @@ class NativeHarnessTests(unittest.TestCase):
         work = ROOT / "_build/smith/selftest"
         work.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(dir=work) as directory:
-            directory = Path(directory)
-            executable, compiler = directory / "driver.exe", directory / "producer.exe"
+            root = Path(directory)
+            executable, compiler = root / "driver.exe", root / "producer.exe"
             executable.write_bytes(b"binary fixture")
             compiler.write_bytes(b"producer fixture")
             entry = "tests/fixture.ouro"
@@ -311,7 +311,7 @@ class NativeHarnessTests(unittest.TestCase):
                 path.write_text(json.dumps(value), encoding="utf-8")
             save(data)
             with patch("ourosmith.native.source_inputs", return_value=([entry], sources)):
-                yield SimpleNamespace(directory=directory, executable=executable, compiler=compiler, entry=entry,
+                yield SimpleNamespace(directory=root, executable=executable, compiler=compiler, entry=entry,
                                       sources=sources, data=data, save=save)
 
     def test_native_receipt_binds_every_source_entry_producer_and_binary(self):
@@ -390,21 +390,21 @@ class NativeHarnessTests(unittest.TestCase):
         work = ROOT / "_build/smith/selftest"
         work.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(dir=work) as directory:
-            directory = Path(directory)
-            path = directory / "finding.json"
+            root = Path(directory)
+            path = root / "finding.json"
             path.write_text(json.dumps(finding), encoding="utf-8")
             with patch("ourosmith.core.run.generator_hash", return_value="frozen"), \
-                 patch.object(ouro_smith, "compiler_for", return_value=directory / "fixture-producer"), \
+                 patch.object(ouro_smith, "compiler_for", return_value=root / "fixture-producer"), \
                  patch.object(ouro_smith, "native_program", return_value=object()) as program, \
                  patch.object(ouro_smith, "bind"), patch.object(ouro_smith, "CoreRunner") as runner, \
                  patch.object(ouro_smith, "finish_report", return_value=0), contextlib.redirect_stdout(io.StringIO()):
-                result = ouro_smith.main(["replay", "--finding", str(path), "--seed", "999", "--depth", "8", "--out", str(directory / "replay")])
+                result = ouro_smith.main(["replay", "--finding", str(path), "--seed", "999", "--depth", "8", "--out", str(root / "replay")])
                 self.assertEqual(result, 0)
                 self.assertEqual(runner.call_args.args[0], CoreConfig([17], "kernel", 2, 1, 0))
                 program.assert_called_once()
             with patch("ourosmith.core.run.generator_hash", return_value="different"), \
                  patch.object(ouro_smith, "native_program") as program, contextlib.redirect_stderr(io.StringIO()):
-                self.assertEqual(ouro_smith.main(["replay", "--finding", str(path), "--out", str(directory / "stale")]), 1)
+                self.assertEqual(ouro_smith.main(["replay", "--finding", str(path), "--out", str(root / "stale")]), 1)
                 program.assert_not_called()
 
     def test_malformed_checker_campaign_never_authorizes_retirement(self):

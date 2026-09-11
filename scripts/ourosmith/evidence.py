@@ -266,9 +266,10 @@ def fault_provenance_problems(faults, current):
         required = {path.relative_to(ROOT).as_posix() for path in paths}
         problems = provenance_problems(faults.get("provenance", {}), current, surface=True, required=required)
         problems.extend(checker_evidence_problems(campaign, [fault for fault in FAULTS if fault.target == "checker"], compiler=compiler))
-        return problems
     except (OSError, ValueError, KeyError, TypeError):
         return ["fault producer, native campaign or full tested binary set is missing"]
+    else:
+        return problems
 
 
 def ci_pr_receipt(out, current):

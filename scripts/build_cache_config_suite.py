@@ -1090,7 +1090,7 @@ def test_frontend_native_async_protocol(tmp: Path) -> None:
             "stdout_hex": "".join(line + "\n" for line in case["lines"]).encode().hex(),
             "stderr_hex": case["stderr"].encode().hex(), "exit": 1 if case["held"] else case["exit"],
             "pid": 1, "elapsed_s": 3, "image_unchanged": True,
-            "events": [{"line": line, "observed_s": at} for line, at in zip(case["lines"], times)],
+            "events": [{"line": line, "observed_s": at} for line, at in zip(case["lines"], times, strict=True)],
             "cancelled_by_harness": case["held"], "alive_before_cancel": case["held"],
             "held_after_construction_s": 1.30 if case["held"] else None})
     good = {"kind": native.KIND + ".runtime", "status": "passed", "native_bootstrap": False,
@@ -1171,7 +1171,7 @@ def test_frontend_native_async_protocol(tmp: Path) -> None:
         producer.write_bytes(b"synthetic common producer; never executed")
         producer_hash = native.sha256_file(producer)
 
-        def fake_image(path, variant):
+        def fake_image(path, _variant):
             return {"sha256": native.sha256_file(path), "bytes": path.stat().st_size,
                     "machine": "x86_64", "imports": list(native.IMPORTS)}
 

@@ -97,6 +97,7 @@ for the declaration syntax and [TCB](tcb.md) for the pure dependency boundary.
 | Declaration data and typed failures | `compiler/file_check_model.ouro` |
 | Derived environment indexes | `compiler/file_check_environment.ouro` |
 | Input-work limits | `compiler/file_check_work.ouro` |
+| Lookup, lift, substitution, and surface elaboration | `compiler/file_elab_lookup.ouro` |
 | Reduction and conversion | `compiler/file_elab_core.ouro` and `compiler/string_nf_*.ouro` |
 | Positivity and structural recursion | `compiler/file_elab_positive.ouro` and `compiler/file_elab_term.ouro` |
 | Inference and expected-type checking | `compiler/file_elab_infer.ouro` |

@@ -294,8 +294,8 @@ class ExternalEvidenceTests(EvidenceTreeTests):
                 for changed in bad:
                     accepted[profile] = changed
                     with self.subTest(profile=profile, changed=changed):
-                        credits = {value for value in self.read() if value.startswith('external/law/' + profile)}
-                        self.assertEqual(credits, set())
+                        law_credits = {value for value in self.read() if value.startswith('external/law/' + profile)}
+                        self.assertEqual(law_credits, set())
                 accepted[profile] = good
 
     def test_resource_report_is_not_read_without_the_required_successful_command(self):

@@ -35,7 +35,7 @@ The checker has a deliberately small, pure dependency closure:
 | Primitive contracts | `compiler/primitive_model.ouro`, `compiler/primitive_contracts.ouro`, `compiler/primitive_registry.ouro`, `compiler/primitive_check.ouro`, `compiler/primitive_roles.ouro` |
 | String reduction | `compiler/string_nf_bytes.ouro`, `compiler/string_nf_values.ouro`, `compiler/string_nf_eval.ouro` |
 | Environment and resource accounting | `compiler/file_check_environment.ouro`, `compiler/file_check_work.ouro` |
-| Declaration checking | `compiler/file_elab_core.ouro`, `compiler/file_check_result.ouro`, `compiler/file_elab_positive.ouro`, `compiler/file_elab_term.ouro`, `compiler/file_elab_infer.ouro`, `compiler/file_elab.ouro` |
+| Declaration checking | `compiler/file_elab_core.ouro`, `compiler/file_elab_lookup.ouro`, `compiler/file_check_result.ouro`, `compiler/file_elab_positive.ouro`, `compiler/file_elab_term.ouro`, `compiler/file_elab_infer.ouro`, `compiler/file_elab.ouro` |
 | Dependent refinement and constructors | `compiler/file_refine_scope.ouro`, `compiler/file_refine_case.ouro`, `compiler/file_refine.ouro`, `compiler/constructor_closures.ouro` |
 
 These modules may import only modules in this list. They contain no host

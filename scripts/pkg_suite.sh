@@ -10,10 +10,10 @@ cd "$ROOT"
 # Native acceptance uses an explicitly provisioned directory, never a C fallback.
 NATIVE_TOOLS=""
 if [ "${1:-}" = --native-tools ]; then
-	[ "$#" -ge 2 ] && [ -n "$2" ] || {
+	if [ "$#" -lt 2 ] || [ -z "$2" ]; then
 		echo "usage: sh scripts/pkg_suite.sh --native-tools DIR [suite options]" >&2
 		exit 2
-	}
+	fi
 	NATIVE_TOOLS=$2
 	case "$NATIVE_TOOLS" in
 	/* | [A-Za-z]:*) ;;
@@ -32,10 +32,10 @@ case "$OUT" in
 *) OUT="$ROOT/$OUT" ;;
 esac
 if [ -n "$NATIVE_TOOLS" ]; then
-	[ ! -e "$OUT" ] && [ ! -L "$OUT" ] || {
+	if [ -e "$OUT" ] || [ -L "$OUT" ]; then
 		echo "PKG_SUITE: FAIL native acceptance requires a fresh PKG_SUITE_OUT" >&2
 		exit 1
-	}
+	fi
 else
 	rm -rf "$OUT"
 fi

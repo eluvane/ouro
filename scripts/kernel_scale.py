@@ -205,11 +205,12 @@ def report_evidence(report_path: Path, profile: str) -> dict:
         result = evaluate(report, profile)
         passed = result['pass'] and report.get('pass') is True
         failures = result['failures'] + ([] if report.get('pass') is True else ['reported_failure'])
-        credits = (['external/law/scale:' + operation for operation in SCALE]
+        law_credits = (['external/law/scale:' + operation for operation in SCALE]
                    if profile == 'scale' else ['external/law/depth'])
-        return {'pass': passed, 'credits': credits if passed else [], 'failures': failures}
     except (KeyError, OSError, TypeError, ValueError) as error:
         return {'pass': False, 'credits': [], 'failures': [str(error)]}
+    else:
+        return {'pass': passed, 'credits': law_credits if passed else [], 'failures': failures}
 
 
 def pin_one_cpu() -> list[int]:

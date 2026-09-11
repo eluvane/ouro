@@ -219,9 +219,9 @@ class CoreRunner:
                 minimum = self.config
                 original_failure = failure
                 attempts = {}
-                def evaluate(candidate, selected):
+                def evaluate(candidate, selected, seen=attempts):
                     found = self.evaluate(candidate, selected)[1]
-                    attempts[(candidate.depth, candidate.max_defs)] = found
+                    seen[(candidate.depth, candidate.max_defs)] = found
                     return found
                 if self.config.shrink_budget and failure.classification not in {"oracle-unavailable", "crash", "timeout", "memory", "generator-error"}:
                     minimum = shrink(self.config, seed, failure, evaluate)

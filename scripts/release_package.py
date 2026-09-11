@@ -18,7 +18,7 @@ import subprocess
 import tarfile
 import tempfile
 import zipfile
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import BinaryIO, Optional, Sequence
 from unittest.mock import patch
@@ -629,7 +629,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     if args.cut_changelog:
         version = parse_seal_version()
-        date = args.date or datetime.now(timezone.utc).date().isoformat()
+        date = args.date or datetime.now(UTC).date().isoformat()
         path = ROOT / "CHANGELOG.md"
         try:
             current = path.read_text(encoding="utf-8")
