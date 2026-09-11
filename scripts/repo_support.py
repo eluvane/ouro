@@ -20,7 +20,12 @@ from typing import Any, Callable, Sequence
 
 
 def configure_native_stack() -> None:
-    """Match OuroSmith's native stack reserve without raising the hard cap."""
+    """Match OuroSmith's native stack reserve without raising the hard cap.
+
+    Homebrew and framework CPython on macOS pin the main-thread stack, so
+    ``setrlimit(RLIMIT_STACK)`` raises even for the current values. Keep the
+    inherited limit instead of aborting bootstrap on those hosts.
+    """
     if os.name == "nt":
         return
     import resource
@@ -29,10 +34,14 @@ def configure_native_stack() -> None:
     if soft == resource.RLIM_INFINITY:
         return
     target = max(soft, 128 * 1024 * 1024)
-    if hard != resource.RLIM_INFINITY:
+    if hard != resource.RLIM_INFINITY and hard >= 0:
         target = min(target, hard)
-    if target != soft:
+    if target == soft:
+        return
+    try:
         resource.setrlimit(resource.RLIMIT_STACK, (target, hard))
+    except (OSError, ValueError):
+        return
 
 
 def relative_path(root: Path, path: Path, *, resolve: bool = True) -> str:

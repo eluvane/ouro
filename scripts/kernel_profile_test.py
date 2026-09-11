@@ -7,7 +7,7 @@ import unittest
 import uuid
 
 import kernel_profile as profile
-from repo_support import hash_json
+from repo_support import configure_native_stack, hash_json
 
 
 def process(stdout=''):
@@ -240,6 +240,9 @@ class KernelProfileTests(unittest.TestCase):
         finally:
             self.assertTrue(work.resolve().is_relative_to(parent.resolve()))
             shutil.rmtree(work)
+
+    def test_native_stack_setup_does_not_abort_when_the_host_pins_the_limit(self):
+        configure_native_stack()
 
     def test_old_pass_baseline_is_not_a_current_measurement(self):
         current = {'context': {'producer_sha256': 'new'}, 'max_elapsed_ms': 300.0}
