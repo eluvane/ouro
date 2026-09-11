@@ -390,8 +390,14 @@ evidence, updated docs, no active references, and no bootstrap dependency.
 | `ouro-nightly-full.yml` | Scheduled full checks |
 | `ouro-manual-trust.yml` | On-demand check profiles |
 | `dependency-review.yml` | Changed dependency and workflow checks |
-| `ouro-release.yml` | Build and publish tag drafts and weekly snapshots |
+| `ouro-release.yml` | Build host toolchains and publish tag drafts and weekly snapshots |
 | `ouro-pages.yml` | Build `site/` and publish GitHub Pages |
+
+The release workflow builds host `ouro1` on macOS x86_64 (`darwin`), macOS ARM
+(`darwin_aarch64`), Linux x86_64 (`linux`), Linux ARM (`linux_aarch64`), and
+Windows x86_64 (`windows`). It publishes `ouro-<version>-<platform>.tar.zst`
+and `.zip` for each of those names. Those build and assemble jobs stay
+read-only.
 
 Hosted path selection is fail-closed for validation: missing revisions, a Git
 error, or an empty diff runs every applicable job. An editor-only change runs

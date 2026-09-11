@@ -17,6 +17,13 @@ integration may change.
 
 ## [Unreleased]
 
+### Changed
+
+- GitHub Releases now publish Lean-style host archives
+  (`ouro-<version>-<platform>.tar.zst` and `.zip`) for `darwin`,
+  `darwin_aarch64`, `linux`, `linux_aarch64`, and `windows`, instead of
+  source-only `ouro-*-source` packs.
+
 ### Fixed
 
 - Restored bootstrap input hashing so a clean host can freeze and build `ouro1`.

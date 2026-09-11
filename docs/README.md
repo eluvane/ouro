@@ -73,7 +73,7 @@ you are trying to do.
 - [Continuous integration](ci.md) — local profiles and hosted workflow roles.
 - [OuroSmith](ouro_smith.md) — generated tests, independent oracles, replay,
   and migration of the manual corpus.
-- [Releasing](releasing.md) — source package and release-candidate procedure.
+- [Releasing](releasing.md) — host toolchain archives and release-candidate procedure.
 - [RFCs](rfc/README.md) — design proposals and accepted decisions.
 - [Roadmap](roadmap.md) — native transition stages and acceptance criteria.
 - [Security policy](../SECURITY.md) — private vulnerability reporting.
