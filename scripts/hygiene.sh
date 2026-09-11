@@ -127,7 +127,7 @@ fi
 if grep -q "compile_checked_from_decls" compiler/pipeline.ouro \
 	&& grep -q "pipeline_compile_checked_source" compiler/driver.ouro \
 	&& grep -q "pipeline_compile_checked_units" compiler/driver.ouro \
-	&& grep -q "check_module fuel selected items" compiler/pipeline_support.ouro \
+	&& grep -q "check_module fuel selected resolved" compiler/pipeline_support.ouro \
 	&& grep -q "checked_program_erase (compile_checked_source" compiler/driver.ouro \
 	&& grep -q "checked_program_erase (compile_checked_units" compiler/driver.ouro; then
 	ok "host/selfhost stitch share checked declaration pipeline"

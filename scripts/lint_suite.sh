@@ -48,10 +48,10 @@ out=$(CDPATH='' cd "$out" && pwd)
 		exit 1
 	fi
 	sh "$ROOT/scripts/ouro1.sh" lint good >"$out/launcher-good.out" 2>"$out/launcher-good.err"
-	[ ! -s "$out/launcher-good.out" ] && [ ! -s "$out/launcher-good.err" ] || {
+	if [ -s "$out/launcher-good.out" ] || [ -s "$out/launcher-good.err" ]; then
 		echo "LINT_SUITE: FAIL launcher reported a clean fixture" >&2
 		exit 1
-	}
+	fi
 	set +e
 	sh "$ROOT/scripts/ouro1.sh" lint good/_build/ignored.ouro \
 		>"$out/launcher-explicit.out" 2>"$out/launcher-explicit.err"

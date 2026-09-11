@@ -179,9 +179,10 @@ def run_corpus(report, program, *, timeout_s=20, directory=CORPUS_DIR, only=None
     failures = inspect_retained(result)
     if failures:
         for name, category, detail in failures:
-            if category not in {"crash", "timeout", "memory", "property-violation", "oracle-unavailable"}:
-                category = "oracle-unavailable"
-            report.add(Finding(LAYER, name, category, 0, report.profile, report.generator_hash, name,
+            kind = category
+            if kind not in {"crash", "timeout", "memory", "property-violation", "oracle-unavailable"}:
+                kind = "oracle-unavailable"
+            report.add(Finding(LAYER, name, kind, 0, report.profile, report.generator_hash, name,
                                "native-retained", "typed retained law holds", detail,
                                {"entry": program.entry, "law": name}, "python scripts/ouro_smith.py corpus"))
     else:

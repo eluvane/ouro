@@ -89,9 +89,10 @@ def evidence_problems(row, *, entry=None):
         if (row["strict_check"] != {"exit_code": 0, "stdout_sha256": hashlib.sha256(b"CHECK_OK\n").hexdigest()}
                 or type(row["strict_check"].get("exit_code")) is not int):
             return ["native driver evidence lacks an exact successful strict source check"]
-        return []
     except (OSError, ValueError, KeyError, TypeError):
         return ["native driver evidence or its current source inputs are unavailable"]
+    else:
+        return []
 
 
 @dataclass
@@ -167,7 +168,7 @@ def prepare(entry, work, compiler, *, memory_mb, executable=None, log=print):
         built = run_limited(command, cwd=ROOT, env=env, timeout_s=900, memory_mb=memory_mb)
         save_result(work / "build", built)
         if not built.ok:
-            raise ValueError(f"native build failed: {built.classify()} exit={built.returncode}; {work / 'build.json'}")
+            raise ValueError(f"native build failed: {built.classify()} exit={built.returncode}; {work / 'build.json'}") from None
         receipt, _units, _sources = receipt_for(executable, entry, compiler)
     if source_inputs(entry) != (units, before) or digest(compiler) != producer_before:
         raise ValueError("native driver source or producer changed while preparing")

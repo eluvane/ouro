@@ -107,7 +107,9 @@ uploaded separately as `nightly-<group>` artifacts. Hosted PR matrix jobs use st
 matrix does not publish an unevaluated expression. When those jobs run,
 GitHub appends the matrix value: `PR (checks)`, `PR (analysis)`, `PR (tests)`,
 `PR (smith)`, `PR (samples-1)`, `PR (samples-2)`, `Portable (ubuntu-latest)`,
-and `Portable (macos-latest)`. `scripts/apply_github_settings.py` recommends
+and `Portable (macos-latest)`. Portable restores the compiler cache when
+present, then builds `ouro1` before `kernel_hardening_suite.py`.
+`scripts/apply_github_settings.py` recommends
 those running check names, plus `Paths`, `Kernel`, `Editor`, and `Review`.
 Existing hosted branch rules need the same check-name update when adopting
 the split workflow.

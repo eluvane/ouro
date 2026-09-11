@@ -329,10 +329,11 @@ def worker(args):
         report["race_both_observed_absence"] = True
         report["readbacks"] = readbacks(output)
         report["pass"] = True
-        return 0
     except BaseException as error:
         report["error"] = type(error).__name__ + ": " + str(error)
         raise
+    else:
+        return 0
     finally:
         for entry in children:
             proc = entry["proc"]
@@ -379,10 +380,11 @@ def main(argv=None):
     except (OSError, ValueError, KeyError, TypeError) as error:
         report["error"] = str(error)
         raise
+    else:
+        print("FRONTEND_NATIVE_FS_CREATE: PASS cases=14")
+        return 0
     finally:
         write_json_atomic(args.out / "report.json", report)
-    print("FRONTEND_NATIVE_FS_CREATE: PASS cases=14")
-    return 0
 
 
 if __name__ == "__main__":
@@ -390,4 +392,4 @@ if __name__ == "__main__":
         raise SystemExit(main())
     except (OSError, ValueError, RuntimeError, KeyError, TypeError) as error:
         print("FRONTEND_NATIVE_FS_CREATE: FAIL " + str(error), file=sys.stderr)
-        raise SystemExit(1)
+        raise SystemExit(1) from error

@@ -14,6 +14,9 @@ from ourosmith.host import environment
 from ourosmith.limits import run_limited
 from repo_support import finite_number, hash_json, read_json_object, sha256_path, write_json_atomic
 
+load_json = read_json_object
+sha = sha256_path
+
 ROOT = Path(__file__).resolve().parents[1]
 REPORT_KIND = 'ouro.kernel-profile-report.v2'
 BASELINE_KIND = 'ouro.kernel-baseline.v2'

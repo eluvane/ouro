@@ -12,12 +12,14 @@ import shutil
 import stat
 import time
 from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 from ourosmith import ROOT, generator_hash
 from ourosmith.host import prepare_tools
-from ourosmith.report import Report
+
+if TYPE_CHECKING:
+    from pathlib import Path
+    from ourosmith.report import Report
 
 FAULTS_KIND = "ouro.smith-faults.v1"
 

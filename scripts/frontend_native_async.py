@@ -139,7 +139,7 @@ def verify_builds(directory, before, producer, producer_hash, receipts, complete
     return images
 
 
-def run_section(producer, work, run, build_timeout, probe_timeout, verify_inputs):
+def run_section(producer, work, run, build_timeout, _probe_timeout, verify_inputs):
     if os.name != "nt":
         return {"kind": KIND, "status": "unavailable", "reason": "Windows x86-64 runtime required",
                 "native_bootstrap": False, "rows": []}
@@ -253,7 +253,7 @@ def verify_row(row, case):
     times = [event.get("observed_s") for event in events]
     require(all(finite(value) and value <= 15 and value <= row["elapsed_s"] for value in times)
             and times == sorted(times), "native async observation times are invalid")
-    at = dict(zip(case["lines"], times))
+    at = dict(zip(case["lines"], times, strict=True))
     for first, second in case["waits"]:
         require(0.85 <= at[second] - at[first] <= 12, "native async one-second interval differs")
     if case["lines"][:2] == BEGIN:
@@ -281,7 +281,7 @@ def verify_runtime_report(report, images, directory=None):
     require(isinstance(rows, list) and all(isinstance(row, dict) for row in rows)
             and [row.get("case") for row in rows] == [case["case"] for case in cases],
             "native async runtime cases missing, duplicated or reordered")
-    for row, case in zip(rows, cases):
+    for row, case in zip(rows, cases, strict=True):
         verify_row(row, case)
         if directory is not None:
             for stream in ("stdout", "stderr"):

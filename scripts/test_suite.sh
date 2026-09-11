@@ -9,10 +9,10 @@ cd "$ROOT"
 # Native acceptance uses an explicitly provisioned directory, never a C fallback.
 NATIVE_TOOLS=""
 if [ "${1:-}" = --native-tools ]; then
-	[ "$#" -ge 2 ] && [ -n "$2" ] || {
+	if [ "$#" -lt 2 ] || [ -z "$2" ]; then
 		echo "usage: sh scripts/test_suite.sh --native-tools DIR [suite options]" >&2
 		exit 2
-	}
+	fi
 	NATIVE_TOOLS=$2
 	case "$NATIVE_TOOLS" in
 	/* | [A-Za-z]:*) ;;
@@ -29,10 +29,10 @@ SUITE_MODE="test"
 DEFAULT_OUT="$ROOT/_build/test_suite"
 case "${1:-}" in
 --native-build-collection)
-	[ "$#" -eq 2 ] && [ -n "$2" ] || {
+	if [ "$#" -ne 2 ] || [ -z "$2" ]; then
 		echo "usage: sh scripts/test_suite.sh --native-build-collection DRIVER.exe" >&2
 		exit 2
-	}
+	fi
 	SUITE_MODE="native-build-collection"
 	NATIVE_BUILD_DRIVER=$2
 	DEFAULT_OUT="$ROOT/_build/native_build_collection"

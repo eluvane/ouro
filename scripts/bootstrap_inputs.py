@@ -13,10 +13,12 @@ import json
 from pathlib import Path, PurePosixPath
 import tarfile
 
+from repo_support import sha256_bytes
+
 ROOT = Path(__file__).resolve().parents[1]
 MANIFEST = "compiler/bootstrap/c-bootstrap-v1.json"
 ARCHIVE = "compiler/bootstrap/c-bootstrap-v1.tar.gz"
-from repo_support import sha256_bytes
+digest = sha256_bytes
 
 KIND = "ouro.c-bootstrap-inputs.v1"
 STAGE0 = ("compiler/stage0/driver_u.c", "compiler/stage0/backend_u.c")
