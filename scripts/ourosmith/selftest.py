@@ -1052,17 +1052,35 @@ class LimitTests(unittest.TestCase):
         result = self.execute("x = bytearray(256 * 1024 * 1024)", memory=64)
         self.assertEqual(result.classify(), "memory", result)
 
+    def test_posix_rlimit_falls_back_when_sticky_hard_cap_is_rejected(self):
+        from ourosmith import exec_child
+
+        calls = []
+
+        class Fake:
+            @staticmethod
+            def setrlimit(_which, pair):
+                calls.append(pair)
+                if pair[0] == pair[1]:
+                    raise ValueError("current limit exceeds maximum limit")
+
+        self.assertEqual(exec_child._apply_rlimit(Fake, 1, ((64, 64), (64, -1))), (64, -1))
+        self.assertEqual(calls, [(64, 64), (64, -1)])
+        with self.assertRaises(ValueError):
+            exec_child._apply_rlimit(Fake, 1, ((8, 8),))
+
     @unittest.skipIf(os.name == "nt", "POSIX resource limits")
     def test_native_stack_stays_inside_address_space_budget(self):
         result = self.execute("import json,resource; print(json.dumps([resource.getrlimit(k) for k in (resource.RLIMIT_AS, resource.RLIMIT_STACK, resource.RLIMIT_CORE)]))", memory=64)
         self.assertTrue(result.ok, result)
         address, stack, core = json.loads(result.stdout)
-        self.assertEqual(address, [64 * 1024 * 1024] * 2)
+        self.assertEqual(address[0], 64 * 1024 * 1024)
+        self.assertTrue(address[1] == address[0] or address[1] == -1)
         expected_stack = address[0] if stack[1] == -1 else min(address[0], stack[1])
         if stack[0] != expected_stack:
             # Hosts that pin the main-thread stack keep the inherited soft limit.
             self.assertLessEqual(stack[0], address[0])
-        self.assertEqual(core, [0, 0])
+        self.assertEqual(core[0], 0)
 
     def test_worker_count_respects_runner_cpu_capacity(self):
         from ourosmith.host import job_count
