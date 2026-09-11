@@ -1,0 +1,142 @@
+-- Shared, repository-owned inputs for the canonical scale/depth entry points.
+import "../compiler/file_elab.ouro";
+import "compiler_retained_fixtures.ouro";
+import "../std/cli.ouro";
+import "../std/io.ouro";
+
+def probe_nest_linear (make : CoreTerm -> CoreTerm) : Nat -> CoreTerm -> CoreTerm :=
+  fix nest (count : Nat) (body : CoreTerm) : CoreTerm :=
+    match count with | Z => body | S remaining => nest remaining (make body) end;
+
+-- Construction consumes every requested node. Blocks bound the host stack of
+-- the unoptimized generated program without changing the nested Core shape.
+def probe_nest (make : CoreTerm -> CoreTerm) (count : Nat) (body : CoreTerm) : CoreTerm :=
+    match divmod_nat count fuel1k with
+    | MkPair blocks remaining =>
+        probe_nest_linear (fun (inner : CoreTerm) => probe_nest_linear make fuel1k inner)
+          blocks (probe_nest_linear make remaining body)
+    end;
+
+def probe_lam (depth : Nat) : CoreTerm :=
+    probe_nest (fun (body : CoreTerm) => CLam retained_nat body) depth (CRel 0);
+
+def probe_pi (depth : Nat) : CoreTerm :=
+    probe_nest (fun (body : CoreTerm) => CPi retained_nat body) depth retained_nat;
+
+def probe_domain (depth : Nat) : CoreTerm :=
+    probe_nest (fun (body : CoreTerm) => CPi body retained_nat) depth retained_nat;
+
+def probe_let (depth : Nat) : CoreTerm :=
+    match depth with
+    | Z => retained_zero
+    | S remaining => CLetIn retained_zero retained_nat
+        (probe_nest (fun (body : CoreTerm) => CLetIn (CRel 0) retained_nat body) remaining (CRel 0))
+    end;
+
+def probe_app (depth : Nat) : CoreTerm :=
+    let function : CoreTerm := CConst 70 in
+    probe_nest (fun (body : CoreTerm) => CApp function body) depth retained_zero;
+
+def probe_spine (depth : Nat) : CoreTerm :=
+    probe_nest (fun (body : CoreTerm) => CApp body retained_zero) depth (CConst 70);
+
+-- add name 1 and S name denote the same Nat. The former keeps generated IDs
+-- in the runtime's ordinary numeric representation, like the original ML loop.
+-- The index itself also accepts raw Peano IDs; structural tests cover that path.
+def probe_constant_item (name : Nat) : FileItem :=
+    FDef name retained_nat
+      (match eqNat name 100 with | True => retained_zero | False => CConst (sub name 1) end);
+
+def probe_constant_items (count : Nat) : List FileItem :=
+    (fix collect (remaining : Nat) (name : Nat) (items : List FileItem) : List FileItem :=
+      match remaining with
+      | Z => reverse FileItem items
+      | S rest => collect rest (add name 1) (Cons FileItem (probe_constant_item name) items)
+      end) count 100 (Nil FileItem);
+
+inductive ProbeOutcome : Type :=
+  | ProbeAccepted : ProbeOutcome
+  | ProbeResource : ProbeOutcome
+  | ProbeRejected : Nat -> ProbeOutcome;
+
+def probe_check_outcome (A : Type) (result : CheckResult A) : ProbeOutcome :=
+    match result with
+    | CheckOk _ => ProbeAccepted
+    | CheckErr failure => match failure with
+        | CheckResourceLimit => ProbeResource
+        | CheckMalformedCore _ => ProbeRejected (check_failure_code 1 failure)
+        | CheckTypeFailure _ => ProbeRejected (check_failure_code 1 failure)
+        | CheckReductionFailure _ => ProbeRejected (check_failure_code 1 failure)
+        | CheckUnsupported _ => ProbeRejected (check_failure_code 1 failure)
+        | CheckCancelled => ProbeRejected (check_failure_code 1 failure)
+        | CheckInternalFailure _ => ProbeRejected (check_failure_code 1 failure)
+        | CheckPrimitiveFailure _ => ProbeRejected (check_failure_code 1 failure)
+        end
+    end;
+
+def probe_normal_bool (result : NormalizeResult Bool) : ProbeOutcome :=
+    match result with
+    | Normalized value => match value with | True => ProbeAccepted | False => ProbeRejected 1 end
+    | NormalizeExhausted => ProbeResource | NormalizeMalformed _ => ProbeRejected 3
+    end;
+
+def probe_same (fuel : Nat) (expected : CoreTerm) (result : NormalizeResult CoreTerm) : ProbeOutcome :=
+    match result with
+    | NormalizeExhausted => ProbeResource | NormalizeMalformed _ => ProbeRejected 3
+    | Normalized actual => probe_normal_bool (eqTerm_checked fuel expected actual)
+    end;
+
+def probe_inferred (fuel : Nat) (expected : CoreTerm) (result : CheckResult CoreTerm) : ProbeOutcome :=
+    match result with
+    | CheckOk actual => probe_normal_bool (eqTerm_checked fuel expected actual)
+    | CheckErr failure => probe_check_outcome CoreTerm (CheckErr CoreTerm failure)
+    end;
+
+def probe_declaration_outcome (result : DeclarationResult) : ProbeOutcome :=
+    match result with
+    | DeclarationsOk _ => ProbeAccepted
+    | DeclarationsErr _ _ failure => probe_check_outcome Unit (CheckErr Unit failure)
+    end;
+
+def probe_then (outcome : ProbeOutcome) (next : Unit -> ProbeOutcome) : ProbeOutcome :=
+    match outcome with
+    | ProbeAccepted => next MkUnit | ProbeResource => ProbeResource | ProbeRejected code => ProbeRejected code end;
+
+inductive ProbeCase : Type :=
+  | MkProbeCase : List CheckInputWork -> (Unit -> ProbeOutcome) -> ProbeCase;
+
+def probe_outcome_name (outcome : ProbeOutcome) : String :=
+    match outcome with | ProbeAccepted => "success" | ProbeResource => "resource" | ProbeRejected _ => "failure" end;
+
+def probe_outcome_code (outcome : ProbeOutcome) : Nat :=
+    match outcome with | ProbeAccepted => 0 | ProbeResource => 4 | ProbeRejected code => code end;
+
+def probe_work_visited (remaining : Maybe Nat) : Nat :=
+    match remaining with | Nothing => checker_input_work_limit | Just left => sub checker_input_work_limit left end;
+
+def probe_work_exhausted (remaining : Maybe Nat) : String :=
+    match remaining with | Nothing => "true" | Just _ => "false" end;
+
+-- The audit uses the same input work representation as the real checked API.
+-- It does not decide the outcome: only the following actual API invocation does.
+def probe_execute (profile : String) (name : String) (depth : Nat) (case : ProbeCase) : IO Unit :=
+    match case with
+    | MkProbeCase work action =>
+        do println (str_cat4 "KERNEL_" profile "_START operation="
+             (str_cat4 name " depth=" (str_of_nat depth) ""));
+           let remaining : Maybe Nat := check_input_work_remaining checker_input_work_limit work in
+           do println (str_cat4 "KERNEL_" profile "_INPUT limit="
+                (str_cat4 (str_of_nat checker_input_work_limit) " visited="
+                  (str_of_nat (probe_work_visited remaining))
+                  (str_concat " exhausted=" (probe_work_exhausted remaining))));
+              let outcome : ProbeOutcome := action MkUnit in
+              do println (str_cat4 "KERNEL_" profile "_RESULT operation="
+                   (str_cat4 name " outcome=" (probe_outcome_name outcome)
+                     (str_concat " code=" (str_of_nat (probe_outcome_code outcome)))));
+                 match outcome with
+                 | ProbeAccepted => exit 0 | ProbeResource => exit 0 | ProbeRejected _ => exit 1
+                 end
+    end;
+
+def probe_add_function (fuel : Nat) (entries : List Entry) : DeclarationResult :=
+    check_declaration CheckExactCore fuel entries (FAxiom 70 retained_nat_fn);

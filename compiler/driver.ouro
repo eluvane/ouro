@@ -1,0 +1,99 @@
+-- Source composition uses the same pipeline and nominal values as packed
+-- frontend translation units. Every successful public compilation returns
+-- bodies from the canonical declaration checker.
+
+-- @entry lex_then_parse
+-- @entry lex_parse_desugar
+-- @entry compile_source
+-- @entry compile_to_cores
+-- @entry compile_units
+-- @entry compile_checked_source
+-- @entry compile_checked_units
+
+import "lexer.ouro";
+import "parser.ouro";
+import "desugar_match.ouro";
+import "lower_rewrite.ouro";
+import "lower.ouro";
+import "compile_file.ouro";
+import "import_resolve.ouro";
+import "file_elab.ouro";
+import "preprocess_import.ouro";
+import "preprocess_record.ouro";
+import "pipeline.ouro";
+import "canonical_model.ouro";
+
+def driver_parse_file (fuel : Nat) (tokens : List Token) (position : Nat)
+    : ParseResult (List Decl) :=
+    parse_file parse fuel tokens position;
+
+def lex_then_parse (fuel : Nat) (src : List Nat) : ParseResult (List Decl) :=
+    match lex_all fuel src with
+    | LexMalformed _ => PErr (List Decl) (S Z)
+    | LexExhausted _ => PErr (List Decl) (S (S Z))
+    | LexOk tokens _ =>
+        let unit : CanonicalSourceUnit := canonical_from_lexed src tokens in
+        match driver_parse_file fuel (canonical_tokens unit) Z with
+        | POk decls rest position => POk (List Decl) decls rest position
+        | PErr position =>
+            PErr (List Decl) (canonical_original_position unit position)
+        end
+    end;
+
+def lex_parse_desugar (fuel : Nat) (src : List Nat)
+    : ParseResult (List Decl) :=
+    match lex_then_parse fuel src with
+    | POk decls rest position =>
+        POk (List Decl) (desugar_file decls) rest position
+    | PErr position => PErr (List Decl) position
+    end;
+
+-- This adapter only maps the canonical elaborator over lowered bodies. The
+-- shared pipeline checks the complete ordered declaration plan afterwards.
+def driver_elaborate_surfaces (fuel : Nat)
+    : List (Pair Nat Surface) -> List (Pair Nat CoreTerm) :=
+    fix driver_elaborate_surfaces (surfaces : List (Pair Nat Surface))
+        : List (Pair Nat CoreTerm) :=
+      match surfaces with
+      | Nil => Nil (Pair Nat CoreTerm)
+      | Cons pair rest =>
+          match pair with
+          | MkPair name surface =>
+              Cons (Pair Nat CoreTerm)
+                (MkPair Nat CoreTerm name (elaborate fuel surface (Nil Nat)))
+                (driver_elaborate_surfaces rest)
+          end
+      end;
+
+def compile_checked_source (fuel : Nat) (src : List Nat)
+    : CompResult CheckedProgram :=
+    pipeline_compile_checked_source lex_go driver_parse_file desugar_file rewrite_declarations
+      lower_expr_env2 compile_program driver_elaborate_surfaces elaborate
+      check_module preprocess_imports_reg preprocess_records_reg
+      fuel src;
+
+def compile_checked_units (fuel : Nat) (root : List Nat)
+    (files : List (Pair (List Nat) (List Nat)))
+    : CompResult CheckedProgram :=
+    pipeline_compile_checked_units lex_go intern_string driver_parse_file
+      resolve_imports desugar_file rewrite_declarations lower_expr_env2 compile_program
+      driver_elaborate_surfaces elaborate check_module
+      preprocess_imports_reg preprocess_records_reg fuel root files;
+
+def compile_to_cores (fuel : Nat) (src : List Nat)
+    : CompResult (List (Pair Nat CoreTerm)) :=
+    checked_program_erase (compile_checked_source fuel src);
+
+def compile_units (fuel : Nat) (root : List Nat)
+    (files : List (Pair (List Nat) (List Nat)))
+    : CompResult (List (Pair Nat CoreTerm)) :=
+    checked_program_erase (compile_checked_units fuel root files);
+
+def compile_source (fuel : Nat) (src : List Nat)
+    : CompResult CompilationSummary :=
+    match compile_to_cores fuel src with
+    | CErr error => CErr CompilationSummary error
+    | COk checked =>
+        COk CompilationSummary
+          (MkCompilationSummary pipeline_all_ok (named_infos checked))
+    end;

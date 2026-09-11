@@ -1,0 +1,220 @@
+-- Constructor-aware match helpers on shared Ast plus ctor/owner pairs.
+-- Silent when the inductive of the first arm is unknown. The drive passes
+-- the unit's DInductive ctor/owner pairs and does not import the compiler
+-- facts.ouro cone.
+
+-- @entry analyze_match_ast
+
+import "../../std/data.ouro";
+import "../../std/listx.ouro";
+import "../../std/runtime.ouro";
+import "ast.ouro";
+
+inductive MatchIssue : Type :=
+  | IPartialMatch : Nat -> MatchIssue
+  | IDeadBranch : Nat -> MatchIssue;
+
+def inil : List MatchIssue := [];
+def appendI (xs : List MatchIssue) (ys : List MatchIssue) : List MatchIssue :=
+    append MatchIssue xs ys;
+
+def ctor_owner (ctor : Nat) : List (Pair Nat Nat) -> Maybe Nat :=
+  lookup Nat Nat eq_nat ctor;
+
+def pair_ctor (p : Pair Nat Nat) : Nat :=
+  match p with
+  | MkPair c _ => c
+  end;
+
+def pair_owner (p : Pair Nat Nat) : Nat :=
+  match p with
+  | MkPair _ owner => owner
+  end;
+
+def ctors_of (ind : Nat) : List (Pair Nat Nat) -> List Nat :=
+  fun (fs : List (Pair Nat Nat)) =>
+    map (Pair Nat Nat) Nat pair_ctor
+      (filter (Pair Nat Nat)
+        (fun (p : Pair Nat Nat) => eq_nat (pair_owner p) ind) fs);
+
+def dups : List Nat -> List Nat :=
+  fix dups (xs : List Nat) : List Nat :=
+    match xs with
+    | Nil => Nil Nat
+    | Cons c rest =>
+        match elem Nat eq_nat c rest with
+        | True => Cons Nat c (dups rest)
+        | False => dups rest
+        end
+    end;
+
+def missing (have : List Nat) : List Nat -> List Nat :=
+  filter Nat (fun (c : Nat) => notb (elem Nat eq_nat c have));
+
+def issues_partial : List Nat -> List MatchIssue :=
+  map Nat MatchIssue (fun (ctor : Nat) => IPartialMatch ctor);
+
+def issues_dead : List Nat -> List MatchIssue :=
+  map Nat MatchIssue (fun (ctor : Nat) => IDeadBranch ctor);
+
+-- The parser keeps nested patterns as binder slots, so `MkTest n True _` is
+-- an arm for MkTest whose slot names a constructor. Such an arm is refined:
+-- it covers only part of the constructor and never makes a later arm dead.
+def arm_refined (ctor_like : List Nat) (binders : List Nat) : Bool :=
+    any Nat (fun (b : Nat) => elem Nat eq_nat b ctor_like) binders;
+
+def arms_ast (ctor_like : List Nat) : Ast -> List (Pair Nat Bool) :=
+  fun (root : Ast) =>
+    (fix arms_ast (fuel : Nat) (a : Ast) : List (Pair Nat Bool) :=
+      match fuel with
+      | Z => Nil (Pair Nat Bool)
+      | S remaining =>
+          let descend : Ast -> List (Pair Nat Bool) :=
+            fun (child : Ast) => arms_ast remaining child in
+          match a with
+          | ABranch ctor binders _ rest =>
+              Cons (Pair Nat Bool)
+                (MkPair Nat Bool ctor (arm_refined ctor_like binders)) (descend rest)
+          | AMatch _ b => descend b
+          | ADo xs => concat_map Ast (Pair Nat Bool) descend xs
+          | ANoBranch => Nil (Pair Nat Bool)
+          | AVar _ => Nil (Pair Nat Bool)
+          | AHole _ => Nil (Pair Nat Bool)
+          | ASort _ => Nil (Pair Nat Bool)
+          | ANatLit _ => Nil (Pair Nat Bool)
+          | AApp _ _ => Nil (Pair Nat Bool)
+          | ALam _ _ _ => Nil (Pair Nat Bool)
+          | APi _ _ _ => Nil (Pair Nat Bool)
+          | ALet _ _ _ _ => Nil (Pair Nat Bool)
+          | AAscribe _ _ => Nil (Pair Nat Bool)
+          | ABinder _ _ _ => Nil (Pair Nat Bool)
+          | ANoBinder => Nil (Pair Nat Bool)
+          | AFix _ _ _ _ => Nil (Pair Nat Bool)
+          | AHandle _ _ => Nil (Pair Nat Bool)
+          | AClause _ _ _ _ => Nil (Pair Nat Bool)
+          | ANoClause => Nil (Pair Nat Bool)
+          | APerform _ _ => Nil (Pair Nat Bool)
+          | AList _ => Nil (Pair Nat Bool)
+          | AStr _ => Nil (Pair Nat Bool)
+          end
+      end) (ast_size root) root;
+
+def arm_ctor (arm : Pair Nat Bool) : Nat :=
+    match arm with
+    | MkPair c _ => c
+    end;
+
+-- An arm is dead once an earlier irrefutable arm claimed its constructor.
+def dead_arms : List Nat -> List (Pair Nat Bool) -> List Nat :=
+  fun (initial : List Nat) (input : List (Pair Nat Bool)) =>
+  (fix dead_arms (arms : List (Pair Nat Bool)) (seen : List Nat) : List Nat :=
+    match arms with
+    | Nil => Nil Nat
+    | Cons arm rest =>
+        match arm with
+        | MkPair c refined =>
+            match elem Nat eq_nat c seen with
+            | True => Cons Nat c (dead_arms rest seen)
+            | False =>
+                match refined with
+                | True => dead_arms rest seen
+                | False => dead_arms rest (Cons Nat c seen)
+                end
+            end
+        end
+    end) input initial;
+
+def cover_arms (fs : List (Pair Nat Nat)) (arms : List (Pair Nat Bool))
+    : List MatchIssue :=
+    let have : List Nat := map (Pair Nat Bool) Nat arm_ctor arms in
+    match have with
+    | Nil => inil
+    | Cons c0 _ =>
+        match ctor_owner c0 fs with
+        | Nothing => inil
+        | Just ind =>
+            let need : List Nat := ctors_of ind fs in
+            appendI (issues_partial (missing have need))
+              (issues_dead (dead_arms (Nil Nat) arms))
+        end
+    end;
+
+def match_walk_list (walk : Ast -> List MatchIssue) : List Ast -> List MatchIssue :=
+  concat_map Ast MatchIssue walk;
+
+-- expr_adapt keeps multi-scrutinee rows under an AList scrutinee; their
+-- first-column constructors are not a coverage witness.
+def is_multi_scrutinee (s : Ast) : Bool :=
+    match s with
+    | AList _ => True
+    | AStr _ => False
+    | AVar _ => False
+    | AHole _ => False
+    | ASort _ => False
+    | ANatLit _ => False
+    | AApp _ _ => False
+    | ALam _ _ _ => False
+    | APi _ _ _ => False
+    | ALet _ _ _ _ => False
+    | AAscribe _ _ => False
+    | ABinder _ _ _ => False
+    | ANoBinder => False
+    | AFix _ _ _ _ => False
+    | ABranch _ _ _ _ => False
+    | ANoBranch => False
+    | AMatch _ _ => False
+    | APerform _ _ => False
+    | AHandle _ _ => False
+    | AClause _ _ _ _ => False
+    | ANoClause => False
+    | ADo _ => False
+    end;
+
+def walk_ast (fs : List (Pair Nat Nat)) (ctor_like : List Nat)
+    : Ast -> List MatchIssue :=
+  fun (root : Ast) =>
+    (fix walk_ast (fuel : Nat) (a : Ast) : List MatchIssue :=
+      match fuel with
+      | Z => inil
+      | S remaining =>
+          let descend : Ast -> List MatchIssue :=
+            fun (child : Ast) => walk_ast remaining child in
+          match a with
+          | AMatch s branches =>
+              let cover : List MatchIssue :=
+                match is_multi_scrutinee s with
+                | True => inil
+                | False => cover_arms fs (arms_ast ctor_like branches)
+                end in
+              appendI cover (appendI (descend s) (descend branches))
+          | AApp f x => appendI (descend f) (descend x)
+          | ALam _ ann body => appendI (descend ann) (descend body)
+          | APi _ dom cod => appendI (descend dom) (descend cod)
+          | ALet _ ann v body =>
+              appendI (descend ann) (appendI (descend v) (descend body))
+          | AAscribe e t => appendI (descend e) (descend t)
+          | ABinder _ ty rest => appendI (descend ty) (descend rest)
+          | AFix _ binders ret body =>
+              appendI (descend binders) (appendI (descend ret) (descend body))
+          | ABranch _ _ body rest => appendI (descend body) (descend rest)
+          | AHandle inner cls => appendI (descend inner) (descend cls)
+          | AClause _ _ body rest => appendI (descend body) (descend rest)
+          | ADo xs => match_walk_list descend xs
+          | APerform _ args => match_walk_list descend args
+          | AList xs => match_walk_list descend xs
+          | AStr _ => inil
+          | AVar _ => inil
+          | AHole _ => inil
+          | ASort _ => inil
+          | ANatLit _ => inil
+          | ANoBinder => inil
+          | ANoBranch => inil
+          | ANoClause => inil
+          end
+      end) (ast_size root) root;
+
+-- ctor_like: ids that name constructors, including imported ones the unit
+-- cannot see as DInductive.
+def analyze_match_ast (fs : List (Pair Nat Nat)) (ctor_like : List Nat)
+    (a : Ast) : List MatchIssue :=
+    walk_ast fs ctor_like a;

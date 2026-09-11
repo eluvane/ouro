@@ -1,0 +1,226 @@
+-- Fault-injection laws for the canonical checker. Expectations are independent
+-- values and exact typed failures, never another mutated checker operation.
+import "compiler_retained_fixtures.ouro";
+import "../compiler/file_elab.ouro";
+import "../compiler/source_text.ouro";
+import "../std/io.ouro";
+import "compiler_test_phase.ouro";
+
+inductive CheckerFaultLaw : Type :=
+  | CheckerFaultLawOf : String -> String -> String -> CheckerFaultLaw;
+
+def fault_fuel : Nat := mul 50 40;
+
+def fault_type_code (fault : CheckTypeFault) : String :=
+    match fault with
+    | CheckTypeMismatch => "type-mismatch" | CheckExpectedSort => "expected-sort"
+    | CheckExpectedFunction => "expected-function" | CheckCaseMotive => "case-motive"
+    | CheckNonPositive => "non-positive" | CheckNonTerminating => "non-terminating"
+    | CheckUniverseBound => "universe-bound"
+    end;
+
+def fault_core_code (fault : CheckCoreFault) : String :=
+    match fault with
+    | CheckUnboundVariable index => prim_string_concat "unbound-variable=" (prim_string_of_nat index)
+    | CheckUnboundGlobal name => prim_string_concat "unbound-global=" (prim_string_of_nat name)
+    | CheckUnknownInductive name => prim_string_concat "unknown-inductive=" (prim_string_of_nat name)
+    | CheckUnknownConstructor name index => prim_string_concat "unknown-constructor="
+        (prim_string_concat (prim_string_of_nat name) (prim_string_concat "/" (prim_string_of_nat index)))
+    | CheckConstructorParameters => "constructor-parameters" | CheckCaseMetadata => "case-metadata"
+    | CheckFixMetadata => "fix-metadata"
+    | CheckLiteralType name => prim_string_concat "literal-type=" (prim_string_of_nat name)
+    | CheckDuplicateName name => prim_string_concat "duplicate-name=" (prim_string_of_nat name)
+    | CheckUnresolvedLiteral name => prim_string_concat "unresolved-literal=" (prim_string_of_nat name)
+    end;
+
+def fault_error_code (failure : CheckFailure) : String :=
+    match failure with
+    | CheckTypeFailure fault => fault_type_code fault
+    | CheckMalformedCore fault => fault_core_code fault
+    | CheckReductionFailure _ => "reduction-failure" | CheckResourceLimit => "resource-limit"
+    | CheckUnsupported _ => "unsupported" | CheckCancelled => "cancelled"
+    | CheckInternalFailure _ => "internal-failure" | CheckPrimitiveFailure _ => "primitive-failure"
+    end;
+
+def fault_declaration_status (result : DeclarationResult) : String :=
+    match result with
+    | DeclarationsOk _ => "accepted"
+    | DeclarationsErr name phase failure =>
+        prim_string_concat (prim_string_of_nat name)
+          (prim_string_concat "/" (prim_string_concat (compiler_test_phase_name phase)
+            (prim_string_concat "/" (fault_error_code failure))))
+    end;
+
+def fault_declaration (name : String) (expected : String) (items : List FileItem) : CheckerFaultLaw :=
+    CheckerFaultLawOf name expected
+      (fault_declaration_status (check_declarations CheckExactCore keep_checking fault_fuel items));
+
+-- A narrow value decoder is independent of Core conversion and normalization.
+def fault_nat_value : Nat -> CoreTerm -> Maybe Nat :=
+    fix decode (fuel : Nat) (term : CoreTerm) : Maybe Nat :=
+      match fuel with
+      | Z => Nothing Nat
+      | S remaining => match term with
+          | CConstruct ind index params =>
+              match andb (eqNat ind 10) (andb (eqNat index 0) (eqNat params 0)) with
+              | True => Just Nat 0 | False => Nothing Nat end
+          | CApp head argument => match head with
+              | CConstruct ind index params =>
+                  match andb (eqNat ind 10) (andb (eqNat index 1) (eqNat params 0)) with
+                  | False => Nothing Nat
+                  | True => match decode remaining argument with
+                      | Nothing => Nothing Nat | Just value => Just Nat (S value) end
+                  end
+              | CRel _ => Nothing Nat | CSort _ => Nothing Nat | CPi _ _ => Nothing Nat
+              | CLam _ _ => Nothing Nat | CApp _ _ => Nothing Nat | CLetIn _ _ _ => Nothing Nat
+              | CConst _ => Nothing Nat | CInd _ => Nothing Nat | CCase _ _ _ _ => Nothing Nat
+              | CFix _ _ _ _ _ => Nothing Nat | CStrLit _ _ => Nothing Nat | CStrBytes _ _ => Nothing Nat
+              end
+          | CRel _ => Nothing Nat | CSort _ => Nothing Nat | CPi _ _ => Nothing Nat
+          | CLam _ _ => Nothing Nat | CLetIn _ _ _ => Nothing Nat | CConst _ => Nothing Nat
+          | CInd _ => Nothing Nat | CCase _ _ _ _ => Nothing Nat | CFix _ _ _ _ _ => Nothing Nat
+          | CStrLit _ _ => Nothing Nat | CStrBytes _ _ => Nothing Nat
+          end
+      end;
+
+def fault_normal_value (term : CoreTerm) : String :=
+    match fault_nat_value 20 term with
+    | Just value => prim_string_concat "nat=" (prim_string_of_nat value)
+    | Nothing => match term with
+        | CConst name => prim_string_concat "neutral=" (prim_string_of_nat name)
+        | CRel _ => "other" | CSort _ => "other" | CPi _ _ => "other" | CLam _ _ => "other"
+        | CApp _ _ => "other" | CLetIn _ _ _ => "other" | CInd _ => "other"
+        | CConstruct _ _ _ => "other" | CCase _ _ _ _ => "stuck-case" | CFix _ _ _ _ _ => "other"
+        | CStrLit _ _ => "unresolved-literal" | CStrBytes _ _ => "string"
+        end
+    end;
+
+def fault_normal_status (result : NormalizeResult CoreTerm) : String :=
+    match result with
+    | Normalized value => fault_normal_value value
+    | NormalizeExhausted => "exhausted" | NormalizeMalformed _ => "malformed"
+    end;
+
+def fault_normal (name : String) (expected : String) (items : List FileItem) (term : CoreTerm)
+    : CheckerFaultLaw :=
+    CheckerFaultLawOf name expected
+      (match check_declarations CheckExactCore keep_checking fault_fuel items with
+       | DeclarationsErr ident phase failure =>
+           fault_declaration_status (DeclarationsErr ident phase failure)
+       | DeclarationsOk entries => fault_normal_status (normalize_checked fault_fuel entries term)
+       end);
+
+def fault_unchanged_recursion : CoreTerm :=
+    CFix 50 0 1 retained_nat_fn (CLam retained_nat (CApp (CRel 1) (CRel 0)));
+
+def fault_family_items (result_type : CoreTerm) : List FileItem :=
+    [ FInd retained_nat_decl, FInd retained_bool_decl
+    , FAxiom 30 (CPi (CSort 0) (CSort 0))
+    , FAxiom 80 (CApp (CConst 30) retained_nat)
+    , FDef 90 (CApp (CConst 30) result_type) (CConst 80)
+    ];
+
+def fault_case_value : CoreTerm :=
+    CCase retained_nat_info retained_nat_motive (CApp retained_succ retained_zero)
+      ([retained_zero, CLam retained_nat (CApp retained_succ (CRel 0))] : List CoreTerm);
+
+def fault_pair_case : CoreTerm :=
+    CCase (MkCaseInfo 30 2 ([2] : List Nat))
+      (CLam (retained_pair retained_nat retained_bool) retained_nat)
+      (retained_pair_value retained_nat retained_bool (CApp retained_succ retained_zero) retained_true)
+      ([CLam retained_nat (CLam retained_bool (CRel 1))] : List CoreTerm);
+
+def fault_string_items : List FileItem :=
+    [ FIntrinsic 18 (CSort 0) (prim_string_to_char_codes "ouro.string") (Nothing CoreTerm)
+    , FIntrinsic 100 (CPi (CConst 18) (CPi (CConst 18) (CConst 18)))
+        (prim_string_to_char_codes "ouro.string.concat") (Nothing CoreTerm)
+    , FDef 90 (CConst 18)
+        (CApp (CApp (CConst 100) (CStrBytes ([65, 0] : List Nat) 18))
+          (CStrBytes ([66, 255] : List Nat) 18))
+    ];
+
+def fault_string_result (result : NormalizeResult CoreTerm) : String :=
+    match result with
+    | NormalizeExhausted => "exhausted" | NormalizeMalformed _ => "malformed"
+    | Normalized value => match value with
+        | CStrBytes bytes typ =>
+            match andb (eqNat typ 18) (source_bytes_equal bytes ([65, 0, 66, 255] : List Nat)) with
+            | True => "bytes=65,0,66,255/type=18" | False => "wrong-string-bytes"
+            end
+        | CRel _ => "other" | CSort _ => "other" | CPi _ _ => "other" | CLam _ _ => "other"
+        | CApp _ _ => "other" | CLetIn _ _ _ => "other" | CConst _ => "other" | CInd _ => "other"
+        | CConstruct _ _ _ => "other" | CCase _ _ _ _ => "other" | CFix _ _ _ _ _ => "other"
+        | CStrLit _ _ => "unresolved-literal"
+        end
+    end;
+
+def fault_string_concat : CheckerFaultLaw :=
+    CheckerFaultLawOf "CHK.string-concat" "bytes=65,0,66,255/type=18"
+      (match check_declarations CheckExactCore keep_checking fault_fuel fault_string_items with
+       | DeclarationsErr ident phase failure => fault_declaration_status (DeclarationsErr ident phase failure)
+       | DeclarationsOk entries => fault_string_result (normalize_checked fault_fuel entries (CConst 90))
+       end);
+
+def fault_extra_coverage : CoreTerm :=
+    CLam retained_bool
+      (CCase (MkCaseInfo 20 0 ([0, 0, 0] : List Nat))
+        (CLam retained_bool retained_nat) (CRel 0)
+        ([retained_zero, retained_zero, retained_zero] : List CoreTerm));
+
+def fault_laws : List CheckerFaultLaw :=
+    [ fault_declaration "CHK.sort-cumul" "90/body/type-mismatch" [FDef 90 (CSort 0) (CSort 0)]
+    , fault_declaration "CTL.sort-cumul" "accepted" [FDef 90 (CSort 2) (CSort 0)]
+    , fault_declaration "CHK.termination" "90/body/non-terminating"
+        (retained_nat_items (FDef 90 retained_nat_fn fault_unchanged_recursion))
+    , fault_declaration "CTL.termination" "accepted"
+        (retained_nat_items (FDef 90 retained_nat_fn (retained_copy 50)))
+    , fault_declaration "CHK.nested-other-parameter" "90/body/non-terminating"
+        (retained_nat_items (FDef 90 retained_nat_fn retained_nested_other_parameter))
+    , fault_declaration "CTL.nested-structural-parameter" "accepted"
+        (retained_nat_items (FDef 90 retained_nat_fn retained_nested_nonzero))
+    , fault_declaration "CHK.application-arguments" "90/body/type-mismatch" (fault_family_items retained_bool)
+    , fault_declaration "CTL.application-arguments" "accepted" (fault_family_items retained_nat)
+    , fault_declaration "CHK.positivity" "60/inductive/non-positive" [FInd retained_negative_decl]
+    , fault_declaration "CTL.positivity" "accepted" [FInd retained_box_decl]
+    , fault_normal "CHK.iota-constructor" "nat=1"
+        (retained_nat_items (FDef 90 retained_nat fault_case_value)) (CConst 90)
+    , fault_normal "CHK.iota-parameters" "nat=1"
+        [FInd retained_nat_decl, FInd retained_bool_decl, FInd retained_pair_decl,
+         FDef 90 retained_nat fault_pair_case] (CConst 90)
+    , fault_string_concat
+    , fault_declaration "CHK.lambda-annotation" "90/body/type-mismatch"
+        (retained_nat_bool_items (FDef 90 retained_nat_fn (CLam retained_bool retained_zero)))
+    , fault_declaration "CTL.lambda-annotation" "accepted"
+        (retained_nat_items (FDef 90 retained_nat_fn (CLam retained_nat retained_zero)))
+    , fault_declaration "CHK.duplicate-global" "80/plan/duplicate-name=80"
+        [FInd retained_nat_decl, FDef 80 retained_nat retained_zero, FDef 80 retained_nat retained_zero]
+    , fault_declaration "CTL.distinct-globals" "accepted"
+        [FInd retained_nat_decl, FDef 80 retained_nat retained_zero, FDef 81 retained_nat retained_zero]
+    , fault_declaration "CHK.case-coverage-missing" "90/body/case-metadata"
+        (retained_nat_bool_items (FDef 90 (CPi retained_bool retained_nat) retained_bad_coverage))
+    , fault_declaration "CHK.case-coverage-extra" "90/body/case-metadata"
+        (retained_nat_bool_items (FDef 90 (CPi retained_bool retained_nat) fault_extra_coverage))
+    , fault_declaration "CTL.case-coverage" "accepted"
+        (retained_nat_bool_items retained_bool_case)
+    , fault_normal "CTL.opaque-neutral" "neutral=80"
+        [FInd retained_nat_decl, FAxiom 80 retained_nat, FDef 90 retained_nat (CConst 80)] (CConst 90)
+    ];
+
+def fault_run : List CheckerFaultLaw -> Bool -> IO Unit :=
+    fix run (laws : List CheckerFaultLaw) (failed : Bool) : IO Unit :=
+      match laws with
+      | Nil => match failed with
+          | True => do println "CHECKER_FAULTS: FAIL"; exit 1
+          | False => do println "CHECKER_FAULTS: PASS"; exit 0
+          end
+      | Cons law rest => match law with
+          | CheckerFaultLawOf name expected actual =>
+              let passed : Bool := prim_string_eq expected actual in
+              do println (prim_string_concat (match passed with | True => "PASS " | False => "FAIL " end)
+                   (prim_string_concat name (prim_string_concat " got=" actual)));
+                 run rest (orb failed (notb passed))
+          end
+      end;
+
+-- @entry main
+def main : IO Unit := fault_run fault_laws False;

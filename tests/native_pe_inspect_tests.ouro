@@ -1,0 +1,137 @@
+-- Pure reader laws; the only IO is the normal test report.
+import "native_pe_inspect_fixtures.ouro";
+import "../std/test.ouro";
+
+def native_pe_probe_rejected (name : String) (image : String) (expected : String) : Test :=
+    match native_pe_inspect_imports image with
+    | Left error => assert_eq name (native_pe_inspect_error_code error) expected
+    | Right _ => test_fail name "malformed PE accepted"
+    end;
+
+def native_pe_probe_result_error (A : Type) (name : String)
+    (result : Either NativePeInspectError A) (expected : String) : Test :=
+    match result with
+    | Left error => assert_eq name (native_pe_inspect_error_code error) expected
+    | Right _ => test_fail name "partial inspection returned success"
+    end;
+
+def native_pe_probe_header_laws : List Test :=
+    [ native_pe_probe_rejected "empty input" "" "header_dos"
+    , native_pe_probe_rejected "truncated DOS header" (str_slice native_pe_probe_image 0 63) "header_dos"
+    , native_pe_probe_rejected "bad DOS signature" (native_pe_probe_changed 0 [78, 90]) "header_dos"
+    , native_pe_probe_rejected "large e_lfanew is bounded" (native_pe_probe_changed 60 [240, 255, 255, 255]) "header_coff"
+    , native_pe_probe_rejected "e_lfanew cannot overlap DOS" (native_pe_probe_changed 60 [0, 0, 0, 0]) "header_coff"
+    , native_pe_probe_rejected "truncated COFF header" (str_slice native_pe_probe_image 0 87) "header_coff"
+    , native_pe_probe_rejected "bad PE signature" (native_pe_probe_changed 64 [80, 70]) "header_signature"
+    , native_pe_probe_rejected "signature includes both zero bytes" (native_pe_probe_changed 67 [1]) "header_signature"
+    , native_pe_probe_rejected "wrong machine" (native_pe_probe_changed 68 [76, 1]) "header_machine"
+    , native_pe_probe_rejected "PE32 is not PE32+" (native_pe_probe_changed 88 [11, 1]) "header_magic"
+    , native_pe_probe_rejected "short declared optional header" (native_pe_probe_changed 84 [127, 0]) "header_optional_size"
+    , native_pe_probe_rejected "truncated optional header" (str_slice native_pe_probe_image 0 (add 256 71)) "header_optional_size"
+    , native_pe_probe_rejected "missing import directory slot" (native_pe_probe_changed 196 [1, 0, 0, 0]) "header_directories"
+    , native_pe_probe_rejected "directory count exceeds optional size" (native_pe_probe_changed 196 [17, 0, 0, 0]) "header_directories"
+    , native_pe_probe_rejected "large directory count cannot wrap" (native_pe_probe_changed 196 [255, 255, 255, 255]) "header_directories"
+    , native_pe_probe_rejected "empty section table" (native_pe_probe_changed 70 [0, 0]) "header_sections"
+    , native_pe_probe_rejected "Windows section limit" (native_pe_probe_changed 70 [97, 0]) "header_sections"
+    , native_pe_probe_rejected "section table exceeds SizeOfHeaders" (native_pe_probe_changed 148 [94, 1, 0, 0]) "header_section_table"
+    , native_pe_probe_rejected "truncated section table" (str_slice native_pe_probe_image 0 (add 256 111)) "header_section_table"
+    , native_pe_probe_rejected "section raw bytes exceed EOF" (native_pe_probe_changed (add 256 88) [1, 2, 0, 0]) "section_range"
+    , native_pe_probe_rejected "section raw data overlaps headers" (native_pe_probe_changed (add 256 92) [255, 1, 0, 0]) "section_range"
+    , native_pe_probe_rejected "section RVA range cannot wrap" (native_pe_probe_changed (add 256 84) [240, 255, 255, 255]) "section_range"
+    , native_pe_probe_rejected "section file range cannot wrap" (native_pe_probe_changed (add 256 92) [240, 255, 255, 255]) "section_range"
+    , native_pe_probe_rejected "overlapping section RVAs are ambiguous"
+        (native_pe_probe_patches native_pe_probe_image
+          [MkPair Nat String 70 (str_of_codes [2, 0]),
+           MkPair Nat String (add 256 112) (str_slice native_pe_probe_image (add 256 72) 40)]) "rva_ambiguous"
+    , native_pe_probe_rejected "machine error precedes missing import directory"
+        (native_pe_probe_patches native_pe_probe_image
+          [MkPair Nat String 68 (str_of_codes [76, 1]), MkPair Nat String 208 (native_pe_probe_zeros 4)]) "header_machine"
+    ];
+
+def native_pe_probe_import_laws : List Test :=
+    [ native_pe_probe_rejected "missing import directory" (native_pe_probe_changed 208 [0, 0, 0, 0]) "import_directory"
+    , native_pe_probe_rejected "import directory shorter than one descriptor" (native_pe_probe_changed 212 [19, 0, 0, 0]) "import_directory"
+    , native_pe_probe_rejected "unmapped import RVA" (native_pe_probe_changed 208 [0, 32, 0, 0]) "rva_unmapped"
+    , native_pe_probe_rejected "import RVA span cannot wrap" (native_pe_probe_changed 208 [255, 255, 255, 255]) "rva_overflow"
+    , native_pe_probe_rejected "directory cannot cross raw section end" (native_pe_probe_changed 208 [244, 17, 0, 0]) "rva_outside_raw"
+    , native_pe_probe_rejected "virtual-only data is not file-backed"
+        (native_pe_probe_patches native_pe_probe_image
+          [MkPair Nat String (add 256 80) (str_of_codes [0, 4, 0, 0]),
+           MkPair Nat String 208 (str_of_codes [0, 18, 0, 0])]) "rva_outside_raw"
+    , native_pe_probe_rejected "null descriptor beyond directory size cannot terminate"
+        (native_pe_probe_changed 212 [20, 0, 0, 0]) "import_descriptor_terminator"
+    , native_pe_probe_rejected "partial null descriptor cannot terminate"
+        (native_pe_probe_changed 212 [39, 0, 0, 0]) "import_descriptor_terminator"
+    , native_pe_probe_rejected "descriptor timestamp prevents false null row"
+        (native_pe_probe_changed (add (mul 2 256) 24) [1]) "rva_unmapped"
+    , native_pe_probe_rejected "lookup table requires a full first entry"
+        (native_pe_probe_changed (mul 2 256) [255, 17, 0, 0]) "rva_outside_raw"
+    , native_pe_probe_rejected "unterminated thunk cannot borrow bytes after raw section"
+        (native_pe_probe_patches native_pe_probe_image
+          [MkPair Nat String (mul 2 256) (str_of_codes [248, 17, 0, 0]),
+           MkPair Nat String (add (mul 3 256) 248) (str_of_codes [104, 16, 0, 0, 0, 0, 0, 0])]) "import_thunk_terminator"
+    , native_pe_probe_rejected "partial final thunk cannot terminate"
+        (native_pe_probe_patches native_pe_probe_image
+          [MkPair Nat String (mul 2 256) (str_of_codes [244, 17, 0, 0]),
+           MkPair Nat String (add (mul 3 256) 244) (str_of_codes [104, 16, 0, 0, 0, 0, 0, 0])]) "import_thunk_terminator"
+    , native_pe_probe_rejected "ordinal import is rejected" (native_pe_probe_changed (add (mul 2 256) 47) [128]) "import_ordinal"
+    , native_pe_probe_rejected "reserved thunk high bits" (native_pe_probe_changed (add (mul 2 256) 44) [1]) "import_name_rva"
+    , native_pe_probe_rejected "named import RVA is 31 bits" (native_pe_probe_changed (add (mul 2 256) 43) [128]) "import_name_rva"
+    , native_pe_probe_rejected "ordinal takes priority over invalid name RVA"
+        (native_pe_probe_patches native_pe_probe_image
+          [MkPair Nat String (add (mul 2 256) 43) (str_of_codes [128]), MkPair Nat String (add (mul 2 256) 47) (str_of_codes [128])]) "import_ordinal"
+    , native_pe_probe_rejected "hint and name must both fit raw data"
+        (native_pe_probe_changed (add (mul 2 256) 40) [255, 17, 0, 0]) "rva_outside_raw"
+    , native_pe_probe_rejected "import names are ASCII" (native_pe_probe_changed (add (mul 2 256) 106) [255]) "import_ascii"
+    , native_pe_probe_rejected "empty import name" (native_pe_probe_changed (add (mul 2 256) 106) [0]) "import_empty_name"
+    , native_pe_probe_rejected "DLL names are ASCII" (native_pe_probe_changed (add (mul 2 256) 88) [255]) "import_ascii"
+    , native_pe_probe_rejected "DLL name requires null terminator"
+        (native_pe_probe_patches native_pe_probe_image
+          [MkPair Nat String (add (mul 2 256) 12) (str_of_codes [252, 17, 0, 0]), MkPair Nat String (add (mul 3 256) 252) "ABCD"]) "import_name_terminator"
+    , native_pe_probe_rejected "symbol name requires null terminator"
+        (native_pe_probe_patches native_pe_probe_image
+          [MkPair Nat String (add (mul 2 256) 40) (str_of_codes [250, 17, 0, 0]), MkPair Nat String (add (mul 3 256) 252) "ABCD"]) "import_name_terminator"
+    , native_pe_probe_rejected "case-insensitive duplicate DLL" native_pe_probe_duplicate_dll "duplicate_dll"
+    , native_pe_probe_rejected "duplicate DLL precedes its malformed lookup table"
+        (native_pe_probe_patch native_pe_probe_duplicate_dll (add (mul 2 256) 20) (str_of_codes [255, 255, 255, 127])) "duplicate_dll"
+    , native_pe_probe_rejected "duplicate symbol" (native_pe_probe_changed (add (mul 2 256) 48) [104, 16, 0, 0]) "duplicate_symbol"
+    , native_pe_probe_rejected "name budget never returns a partial string" native_pe_probe_long_name "import_name_limit"
+    , native_pe_probe_result_error (List String) "thunk budget never returns partial symbols"
+        (native_pe_inspect_thunks native_pe_probe_image [NativePeInspectSectionAt (mul 16 256) (mul 2 256) (mul 2 256) (mul 2 256)]
+          (add (mul 2 256) 40) 24 1 0 []) "import_thunk_limit"
+    , native_pe_probe_result_error (List NativePeImportLibrary) "descriptor budget never returns partial libraries"
+        (native_pe_inspect_descriptors native_pe_probe_image [NativePeInspectSectionAt (mul 16 256) (mul 2 256) (mul 2 256) (mul 2 256)]
+          (mul 2 256) 40 1 0 []) "import_descriptor_limit"
+    ];
+
+def native_pe_probe_positive_laws : List Test :=
+    [ assert_true "read exact DLL and symbols" (native_pe_probe_matches native_pe_probe_image native_pe_probe_expected)
+    , assert_true "DLL spelling is case-insensitive"
+        (native_pe_probe_matches (native_pe_probe_patch native_pe_probe_image (add (mul 2 256) 88) "KERNEL32.DLL") native_pe_probe_expected)
+    , assert_true "OriginalFirstThunk zero falls back to IAT"
+        (native_pe_probe_matches (native_pe_probe_changed (mul 2 256) [0, 0, 0, 0]) native_pe_probe_expected)
+    , assert_true "raw padding may exceed VirtualSize"
+        (native_pe_probe_matches (native_pe_probe_changed (add 256 80) [100, 0, 0, 0]) native_pe_probe_expected)
+    , assert_true "symbol set order is immaterial"
+        (native_pe_probe_matches native_pe_probe_image [NativePeImportLibraryOf "kernel32.dll" ["HeapFree", "HeapAlloc"]])
+    , assert_true "caller rejects incomplete symbol set"
+        (notb (native_pe_probe_matches native_pe_probe_image [NativePeImportLibraryOf "kernel32.dll" ["HeapAlloc"]]))
+    , assert_true "caller rejects extra expected symbol"
+        (notb (native_pe_probe_matches native_pe_probe_image [NativePeImportLibraryOf "kernel32.dll" ["HeapAlloc", "HeapFree", "HeapCreate"]]))
+    , assert_true "symbol case remains significant"
+        (notb (native_pe_probe_matches native_pe_probe_image [NativePeImportLibraryOf "kernel32.dll" ["heapalloc", "HeapFree"]]))
+    , assert_true "caller rejects duplicate expected symbols"
+        (notb (native_pe_probe_matches native_pe_probe_image [NativePeImportLibraryOf "kernel32.dll" ["HeapAlloc", "HeapAlloc"]]))
+    , assert_true "caller rejects an extra expected DLL"
+        (notb (native_pe_probe_matches native_pe_probe_image
+          [NativePeImportLibraryOf "kernel32.dll" ["HeapAlloc", "HeapFree"], NativePeImportLibraryOf "ntdll.dll" []]))
+    , assert_true "caller rejects an unexpected actual DLL"
+        (notb (native_pe_probe_matches (native_pe_probe_patch native_pe_probe_image (add (mul 2 256) 88) "differentdll") native_pe_probe_expected))
+    , assert_true "empty lookup table cannot satisfy caller symbols"
+        (notb (native_pe_probe_matches (native_pe_probe_changed (add (mul 2 256) 40) [0, 0, 0, 0]) native_pe_probe_expected))
+    ];
+
+-- @entry main
+def main : IO Unit :=
+    test_run (append Test native_pe_probe_header_laws
+      (append Test native_pe_probe_import_laws native_pe_probe_positive_laws));

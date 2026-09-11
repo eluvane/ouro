@@ -1,0 +1,312 @@
+-- Autofix CLI: writes require complete constructor visibility, a converged
+-- rewrite plan, and token-preserving canonical formatting. Check mode stays
+-- fail-closed on drift or any unavailable prerequisite.
+
+-- @entry main
+
+import "pipeline.ouro";
+import "../../std/io.ouro";
+import "../../std/fs.ouro";
+import "../../std/args.ouro";
+import "../../std/stringx.ouro";
+
+-- Bounded import traversal steps, including already-seen queue entries.
+-- Exhaustion is an error, never permission to rewrite with partial facts.
+def fx_cone_fuel : Nat := 512;
+
+inductive FxConeError : Type :=
+  | FxImportRead : String -> String -> FxConeError
+  | FxImportBudget : FxConeError;
+
+def fx_cone_error_message (e : FxConeError) : String :=
+    match e with
+    | FxImportRead path cause => str_cat4 "cannot read import " path ": " cause
+    | FxImportBudget => "constructor import traversal exhausted its budget"
+    end;
+
+-- Constructor names from the complete import cone. Empty queues succeed
+-- even at zero fuel; every nonempty exhausted queue fails explicitly.
+def fx_cone_go : Nat -> List String -> List String -> List String
+    -> IO (Either FxConeError (List String)) :=
+  fix go (fuel : Nat) (queue : List String) (seen : List String) (ctors : List String)
+      : IO (Either FxConeError (List String)) :=
+    match queue with
+    | Nil => io_pure (Either FxConeError (List String))
+        (Right FxConeError (List String) ctors)
+    | Cons path rest =>
+        match fuel with
+        | Z => io_pure (Either FxConeError (List String))
+            (Left FxConeError (List String) FxImportBudget)
+        | S fuel2 =>
+            let normalized : String := path_normalize path in
+            match elem String str_eq normalized seen with
+            | True => go fuel2 rest seen ctors
+            | False =>
+                do let! loaded := fs_read_checked normalized;
+                   match loaded with
+                   | Left e => io_pure (Either FxConeError (List String))
+                       (Left FxConeError (List String)
+                         (FxImportRead normalized (fs_error_message e)))
+                   | Right src =>
+                       go fuel2
+                         (append String rest
+                           (map String String (fx_resolve_import normalized)
+                             (fx_harvest_imports src)))
+                         (Cons String normalized seen)
+                         (append String (fx_harvest_ctors src) ctors)
+                   end
+            end
+        end
+    end;
+
+def fx_cone_ctors (path : String) (src : String) : IO (Either FxConeError (List String)) :=
+    fx_cone_go fx_cone_fuel
+      (map String String (fx_resolve_import path) (fx_harvest_imports src))
+      ([path_normalize path] : List String)
+      (Nil String);
+
+def fx_count_text (edits : List FxEdit) : String :=
+    let n : Nat := length FxEdit edits in
+    str_cat3 (show_nat n) " edit" (match eqNat n (S Z) with | True => "" | False => "s" end);
+
+def fx_change_text (edits : List FxEdit) : String :=
+    match edits with
+    | Nil => "formatting"
+    | Cons _ _ => str_cat3 "fixes (" (fx_count_text edits) ")"
+    end;
+
+def fx_write (path : String) (out : String) (edits : List FxEdit) : IO Bool :=
+    do let! written := fs_write_checked path out;
+       match written with
+       | Left e =>
+           do eprintln (str_cat3 path ": " (fs_error_message e));
+              io_pure Bool False
+       | Right _ =>
+           do println (str_cat3 "fixed " path (str_cat3 " (" (fx_change_text edits) ")"));
+              println (str_unlines (fx_report path edits));
+              io_pure Bool True
+       end
+
+def fx_changed (a : Args) (path : String) (out : String) (edits : List FxEdit) : IO Bool :=
+    match args_flag a "check" with
+    | True =>
+        do eprintln (str_cat3 path ": needs " (fx_change_text edits));
+           eprintln (str_unlines (fx_report path edits));
+           io_pure Bool False
+    | False =>
+        match args_flag a "write" with
+        | True => fx_write path out edits
+        | False =>
+            do print out;
+               io_pure Bool True
+        end
+    end
+
+def fx_loaded (a : Args) (path : String) (src : String) : IO Bool :=
+    do let! visibility := fx_cone_ctors path src;
+       match visibility with
+       | Left e =>
+           do eprintln (str_cat3 path ": fix refused: " (fx_cone_error_message e));
+              io_pure Bool False
+       | Right ctors =>
+           match fx_prepare ctors src with
+           | Left e =>
+               do eprintln (str_cat3 path ": " (fx_prepare_error_message e));
+                  io_pure Bool False
+           | Right outcome =>
+               match outcome with
+               | MkFxOutcome out edits =>
+                   match str_eq src out with
+                   | True =>
+                       match orb (args_flag a "check") (args_flag a "write") with
+                       | True => io_pure Bool True
+                       | False =>
+                           do print out;
+                              io_pure Bool True
+                       end
+                   | False => fx_changed a path out edits
+                   end
+               end
+           end
+       end
+
+def fx_one (a : Args) (path : String) : IO Bool :=
+    do let! present := fs_exists path;
+       match present with
+       | False =>
+           do eprintln (str_concat path ": no such file");
+              io_pure Bool False
+       | True =>
+           do let! loaded := fs_read_checked path;
+              match loaded with
+              | Left e =>
+                  do eprintln (str_cat3 path ": " (fs_error_message e));
+                     io_pure Bool False
+              | Right src => fx_loaded a path src
+              end
+       end
+
+def fx_and (a : Args) (ok : Bool) (path : String) : IO Bool :=
+    do let! one := fx_one a path;
+       io_pure Bool (andb ok one)
+
+def fx_run (a : Args) : IO Unit :=
+    match args_positional a with
+    | Nil => do eprintln "usage: ouro-fix [--check | --write] FILE...";
+                exit 2
+    | Cons p ps =>
+        do let! ok := io_fold String Bool (fx_and a) True (Cons String p ps);
+           exit (match ok with | True => Z | False => S Z end)
+    end;
+
+-- Selftest inputs and expected rewrites come from the generated fixture root.
+-- Each expected output must also be a fixpoint.
+
+def fx_fixture_name (entry : String) : Maybe String :=
+    match str_ends entry ".in" with
+    | False => Nothing String
+    | True => Just String (str_slice entry Z (sub (str_len entry) 3))
+    end;
+
+def fx_fixture_names (fixtures : String) : IO (List String) :=
+    do let! entries := fs_list fixtures;
+       io_pure (List String) (str_sort (filter_map String String fx_fixture_name entries))
+
+def fx_selftest_lf (text : String) : String :=
+    str_replace text "\r" "";
+
+def fx_selftest_read (path : String) : IO String :=
+    do let! loaded := fs_read_checked path;
+       match loaded with
+       | Left e => do eprintln (str_concat "FIX_SUITE: FAIL " (fs_error_message e));
+                      exit (S Z);
+                      io_pure String ""
+       | Right text => io_pure String text
+       end
+
+def fx_selftest_write (path : String) (content : String) : IO Unit :=
+    do let! written := fs_write_checked path content;
+       match written with
+       | Left e => do eprintln (str_concat "FIX_SUITE: FAIL " (fs_error_message e));
+                      exit (S Z)
+       | Right _ => io_unit
+       end
+
+def fx_safety_report (ok : Bool) (row : Pair String Bool) : IO Bool :=
+    match row with
+    | MkPair name passed =>
+        do match passed with
+           | True => println (str_concat "FIX_SAFE_OK " name)
+           | False => eprintln (str_concat "FIX_SAFE_FAIL " name)
+           end;
+           io_pure Bool (andb ok passed)
+    end;
+
+-- These exercise the production import reader and --write path, not a mock.
+-- All materialized files are owned selftest output. A stale absent-target
+-- fixture is a test failure rather than an opportunity to erase a file.
+def fx_selftest_safety (out : String) : IO Bool :=
+    let good_path : String := fs_child out "precision-good.ouro" in
+    let dep_path : String := fs_child out "precision-dep.ouro" in
+    let bad_path : String := fs_child out "precision-missing.ouro" in
+    let good_src : String := "import \"precision-dep.ouro\";\n" in
+    let bad_src : String := "import \"precision-absent.ouro\";\ndef f : Nat:=0;\n" in
+    let write_args : Args := args_of_argv_bools
+      (["write"] : List String) (["ouro-fix", "--write"] : List String) in
+    do fx_selftest_write good_path good_src;
+       fx_selftest_write dep_path
+         "import \"precision-good.ouro\";\ninductive Flag : Type :=\n  | on : Flag\n  | off : Flag;\n";
+       fx_selftest_write bad_path bad_src;
+       let! absent_exists := fs_exists (fs_child out "precision-absent.ouro");
+       let! empty := fx_cone_go Z (Nil String) (Nil String) (["on"] : List String);
+       let! limited := fx_cone_go Z ([good_path] : List String) (Nil String) (Nil String);
+       let! visible := fx_cone_ctors good_path good_src;
+       let! written := fx_one write_args bad_path;
+       let! unchanged := fx_selftest_read bad_path;
+       io_fold (Pair String Bool) Bool fx_safety_report True
+         ([ MkPair String Bool "empty-cone-at-zero-budget"
+              (match empty with
+               | Left _ => False
+               | Right names => elem String str_eq "on" names
+               end)
+          , MkPair String Bool "incomplete-cone-is-an-error"
+              (match limited with
+               | Left e => match e with | FxImportBudget => True | FxImportRead _ _ => False end
+               | Right _ => False
+               end)
+          , MkPair String Bool "cyclic-cone-keeps-lowercase-constructors"
+              (match visible with
+               | Left _ => False
+               | Right names => andb (elem String str_eq "on" names)
+                   (elem String str_eq "off" names)
+               end)
+          , MkPair String Bool "missing-import-never-writes"
+              (andb (notb absent_exists) (andb (notb written) (str_eq bad_src unchanged)))
+          ] : List (Pair String Bool))
+
+
+def fx_fixture_issue (actual : String) (expected : String) (again : String) : String :=
+    match str_eq actual expected with
+    | False => "output"
+    | True =>
+        match str_eq again expected with
+        | False => "idempotence"
+        | True => ""
+        end
+    end;
+
+def fx_selftest_fixture (fixtures : String) (out : String) (name : String) : IO Bool :=
+    do let! source := fx_selftest_read (fs_child fixtures (str_concat name ".in"));
+       let! golden := fx_selftest_read (fs_child fixtures (str_concat name ".golden"));
+       let expected : String := fx_selftest_lf golden in
+       let outcome : FxOutcome := fx_fix (Nil String) (fx_selftest_lf source) in
+       let actual : String := fx_outcome_text outcome in
+       let again : String := fx_fix_string (Nil String) expected in
+       let issue : String := fx_fixture_issue actual expected again in
+       do fx_selftest_write (fs_child out (str_concat name ".out")) actual;
+          fx_selftest_write (fs_child out (str_concat name ".again")) again;
+          fx_selftest_write (fs_child out (str_concat name ".report"))
+            (str_unlines (fx_report name (fx_outcome_edits outcome)));
+          match str_null issue with
+          | True => do println (str_concat "FIX_OK " name);
+                       io_pure Bool True
+          | False => do eprintln (str_cat4 "FIX_FAIL " name " " issue);
+                        io_pure Bool False
+          end
+
+def fx_selftest_and (fixtures : String) (out : String) (ok : Bool) (name : String) : IO Bool :=
+    do let! one := fx_selftest_fixture fixtures out name;
+       io_pure Bool (andb ok one)
+
+def run_fix_selftest (a : Args) : IO Unit :=
+    let fixtures : String := args_opt_or a "fixtures" "_build/smith/fixtures/fix" in
+    let out : String := args_opt_or a "out" "_build/fix_suite" in
+    do let! made := fs_mkdir_p_checked out;
+       match made with
+       | Left e => do eprintln (str_concat "FIX_SUITE: FAIL " (fs_error_message e));
+                      exit (S Z)
+       | Right _ =>
+           do let! names := fx_fixture_names fixtures;
+              let! ok := io_fold String Bool (fx_selftest_and fixtures out) True names;
+              let! safe := fx_selftest_safety out;
+              match andb safe
+                  (andb ok (match names with | Nil => False | Cons _ _ => True end)) with
+              | True => do println (str_cat3 "FIX_SUITE: PASS rows="
+                            (show_nat (length String names)) (str_concat " out=" out));
+                           exit Z
+              | False => do eprintln (str_cat3 "FIX_SUITE: FAIL rows="
+                            (show_nat (length String names)) "");
+                            exit (S Z)
+              end
+       end
+
+def fx_switches : List String :=
+    [ "check", "write", "selftest" ];
+
+def main : IO Unit :=
+    do let! argv := prim_argv;
+       let a : Args := args_of_argv_bools fx_switches argv in
+       match args_flag a "selftest" with
+       | True => run_fix_selftest a
+       | False => fx_run a
+       end

@@ -1,0 +1,116 @@
+-- First-order expressions with checked Bool and local Maybe elimination.
+-- Unsupported recursion and escaping lambdas return typed lowering errors.
+import "lower_case.ouro";
+
+def lower_global (fuel : Nat) (step : LowerStep) (sig : CheckEnvironment) (contracts : List LowerContract)
+    (environment : List LowerBinding) (id : Nat) (args : List CoreTerm) (expected : LowerType) (state : LowerState)
+    : Either NativeLowerError LowerResult :=
+    match lower_find_entry id (check_environment_entries sig) with
+    | Nothing => Left NativeLowerError LowerResult (LowerUnknownGlobal id)
+    | Just entry => match entry with
+      | MkBoundEntry _ _ binding => match binding with
+        | PrimitiveIntrinsicBinding primitive _ _ specialization =>
+            lower_intrinsic fuel step sig environment primitive specialization args expected state
+        | PrimitiveExternBinding _ => lower_direct fuel step contracts environment id args expected state end
+      | MkEntry _ _ body => match body with
+        | Nothing => Left NativeLowerError LowerResult (LowerUnknownGlobal id)
+        | Just _ => lower_direct fuel step contracts environment id args expected state end
+      | MkIndEntry _ _ => Left NativeLowerError LowerResult (LowerUnknownGlobal id)
+      | MkRoleEntry _ => Left NativeLowerError LowerResult (LowerUnknownGlobal id) end end;
+
+-- Immediate first-order lambda application needs no closure allocation. Each
+-- argument is evaluated in the caller's environment; lambda binders extend only
+-- the body environment, so a later argument cannot accidentally capture them.
+def lower_lambda_application (step : LowerStep) (sig : CheckEnvironment) (caller : List LowerBinding)
+    : Nat -> List LowerBinding -> CoreTerm -> List CoreTerm -> LowerType -> LowerState -> Either NativeLowerError LowerResult :=
+  fix apply_lambda (fuel : Nat) (captured : List LowerBinding) (body : CoreTerm) (args : List CoreTerm)
+      (expected : LowerType) (state : LowerState) : Either NativeLowerError LowerResult :=
+    match fuel with | Z => Left NativeLowerError LowerResult LowerResourceExhausted
+    | S next => match args with
+      | Nil => step captured body expected state
+      | Cons argument rest => match lower_term_view body with
+        | LowerLambdaTerm annotation inner => lower_bind LowerType LowerResult (lower_classify_type next sig annotation)
+            (fun (typ : LowerType) => lower_bind Unit LowerResult
+              (lower_require (andb (notb (lower_type_action typ))
+                (match lower_type_mir typ with | Nothing => False | Just _ => True end)) (LowerUnsupportedType annotation))
+              (fun (_ : Unit) => lower_bind LowerResult LowerResult (step caller argument typ state)
+                (fun (result : LowerResult) => match result with | LowerResultOf _ scalar after =>
+                  apply_lambda next (Cons LowerBinding (LowerScalarBinding typ scalar) captured) inner rest expected after end)))
+        | LowerLocalTerm _ => Left NativeLowerError LowerResult (LowerUnsupportedTerm 4)
+        | LowerApplyTerm _ _ => Left NativeLowerError LowerResult (LowerUnsupportedTerm 4)
+        | LowerLetTerm _ _ _ => Left NativeLowerError LowerResult (LowerUnsupportedTerm 4)
+        | LowerGlobalTerm _ => Left NativeLowerError LowerResult (LowerUnsupportedTerm 4)
+        | LowerConstructorTerm _ _ _ => Left NativeLowerError LowerResult (LowerUnsupportedTerm 4)
+        | LowerCaseTerm _ _ _ _ => Left NativeLowerError LowerResult (LowerUnsupportedTerm 4)
+        | LowerOtherTerm _ => Left NativeLowerError LowerResult (LowerUnsupportedTerm 4) end end end;
+
+def lower_application (fuel : Nat) (step : LowerStep) (sig : CheckEnvironment) (contracts : List LowerContract)
+    (environment : List LowerBinding) (term : CoreTerm) (expected : LowerType) (state : LowerState)
+    : Either NativeLowerError LowerResult :=
+    lower_bind (Pair CoreTerm (List CoreTerm)) LowerResult (lower_spine fuel term ([] : List CoreTerm))
+      (fun (spine : Pair CoreTerm (List CoreTerm)) => match spine with | MkPair head args =>
+        match lower_term_view head with
+        | LowerGlobalTerm id => lower_global fuel step sig contracts environment id args expected state
+        | LowerLocalTerm _ => Left NativeLowerError LowerResult (LowerUnsupportedTerm 4)
+        | LowerLambdaTerm _ _ => lower_lambda_application step sig environment fuel environment head args expected state
+        | LowerApplyTerm _ _ => Left NativeLowerError LowerResult (LowerUnsupportedTerm 4)
+        | LowerLetTerm _ _ _ => Left NativeLowerError LowerResult (LowerUnsupportedTerm 4)
+        | LowerConstructorTerm _ _ _ => Left NativeLowerError LowerResult (LowerUnsupportedTerm 4)
+        | LowerCaseTerm _ _ _ _ => Left NativeLowerError LowerResult (LowerUnsupportedTerm 4)
+        | LowerOtherTerm _ => Left NativeLowerError LowerResult (LowerUnsupportedTerm 4) end end);
+
+def lower_expression (sig : CheckEnvironment) (contracts : List LowerContract)
+    : Nat -> LowerStep :=
+  fix expression (fuel : Nat) (environment : List LowerBinding) (term : CoreTerm)
+      (expected : LowerType) (state : LowerState) : Either NativeLowerError LowerResult :=
+    match fuel with | Z => Left NativeLowerError LowerResult LowerResourceExhausted
+    | S next => let step : LowerStep :=
+        fun (scope : List LowerBinding) (body : CoreTerm) (typ : LowerType) (current : LowerState) =>
+          expression next scope body typ current in
+      match lower_term_view term with
+      | LowerLocalTerm id => match compiler_nth LowerBinding environment id with
+        | Nothing => Left NativeLowerError LowerResult (LowerUnboundLocal id)
+        | Just binding => match binding with
+          | LowerScalarBinding typ value => lower_map Unit LowerResult
+              (fun (_ : Unit) => LowerResultOf expected value state) (lower_type_same next expected typ)
+          | LowerActionBinding typ action captured => lower_bind Unit LowerResult (lower_type_same next expected typ)
+              (fun (_ : Unit) => step captured action expected state)
+          | LowerNatBinding typ _ => Left NativeLowerError LowerResult (LowerUnsupportedType typ)
+          | LowerMaybeBinding typ _ _ => Left NativeLowerError LowerResult (LowerUnsupportedType typ) end end
+      | LowerLetTerm annotation value body => lower_let next step sig environment annotation value body expected state
+      | LowerGlobalTerm id => lower_global next step sig contracts environment id ([] : List CoreTerm) expected state
+      | LowerApplyTerm _ _ => lower_application next step sig contracts environment term expected state
+      | LowerConstructorTerm ind index params => lower_constructor_value next sig ind index params expected state
+      | LowerCaseTerm info _ scrutinee branches => lower_case next step sig environment info scrutinee branches expected state
+      | LowerLambdaTerm _ _ => Left NativeLowerError LowerResult (LowerUnsupportedTerm 3)
+      | LowerOtherTerm tag => Left NativeLowerError LowerResult (LowerUnsupportedTerm tag) end end;
+
+inductive LowerFunctionBody : Type :=
+  | LowerFunctionBodyOf : List MirLocal -> List LowerBinding -> CoreTerm -> Nat -> LowerFunctionBody;
+
+def lower_parameters (sig : CheckEnvironment)
+    : Nat -> List LowerType -> CoreTerm -> Nat -> List LowerBinding -> Either NativeLowerError LowerFunctionBody :=
+  fix parameters (fuel : Nat) (args : List LowerType) (body : CoreTerm) (id : Nat) (environment : List LowerBinding)
+      : Either NativeLowerError LowerFunctionBody :=
+    match fuel with | Z => Left NativeLowerError LowerFunctionBody LowerResourceExhausted
+    | S next => match args with
+      | Nil => Right NativeLowerError LowerFunctionBody (LowerFunctionBodyOf ([] : List MirLocal) environment body id)
+      | Cons arg rest => match lower_term_view body with
+        | LowerLambdaTerm annotation inner =>
+            lower_bind LowerType LowerFunctionBody (lower_classify_type next sig annotation)
+              (fun (typ : LowerType) => lower_bind Unit LowerFunctionBody (lower_type_same next typ arg)
+                (fun (_ : Unit) => match lower_type_mir arg with
+                  | Nothing => Left NativeLowerError LowerFunctionBody (LowerUnsupportedType annotation)
+                  | Just mir => lower_bind Unit LowerFunctionBody (lower_require (ltb_nat id pe_max_rva) LowerResourceExhausted)
+                      (fun (_ : Unit) => lower_map LowerFunctionBody LowerFunctionBody
+                        (fun (tail : LowerFunctionBody) => match tail with | LowerFunctionBodyOf locals captured term final =>
+                          LowerFunctionBodyOf (Cons MirLocal (MirLocalDef id mir) locals) captured term final end)
+                        (parameters next rest inner (S id)
+                          (Cons LowerBinding (LowerScalarBinding arg (Just MirValue (MirUse id))) environment))) end))
+        | LowerLocalTerm _ => Left NativeLowerError LowerFunctionBody (LowerUnsupportedTerm 3)
+        | LowerApplyTerm _ _ => Left NativeLowerError LowerFunctionBody (LowerUnsupportedTerm 3)
+        | LowerLetTerm _ _ _ => Left NativeLowerError LowerFunctionBody (LowerUnsupportedTerm 3)
+        | LowerGlobalTerm _ => Left NativeLowerError LowerFunctionBody (LowerUnsupportedTerm 3)
+        | LowerConstructorTerm _ _ _ => Left NativeLowerError LowerFunctionBody (LowerUnsupportedTerm 3)
+        | LowerCaseTerm _ _ _ _ => Left NativeLowerError LowerFunctionBody (LowerUnsupportedTerm 3)
+        | LowerOtherTerm _ => Left NativeLowerError LowerFunctionBody (LowerUnsupportedTerm 3) end end end;

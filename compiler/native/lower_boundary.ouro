@@ -1,0 +1,200 @@
+-- CheckedProgram is a public data constructor. Rebuild its declarations with
+-- the existing strict checker before any native consumer trusts its metadata.
+import "lower_model.ouro";
+import "../file_elab.ouro";
+
+def lower_check (A : Type) (name : Nat) (result : CheckResult A) : Either NativeLowerError A :=
+    match result with
+    | CheckOk value => Right NativeLowerError A value
+    | CheckErr failure => match lower_failure_resource failure with
+      | True => Left NativeLowerError A LowerResourceExhausted
+      | False => Left NativeLowerError A (LowerDeclarationFailure name CheckDeclarationBody failure) end end;
+
+def lower_normalize (fuel : Nat) (sig : CheckEnvironment) (term : CoreTerm)
+    : Either NativeLowerError CoreTerm :=
+    lower_check CoreTerm 0 (check_from_normalize CoreTerm (normalize_checked_indexed fuel sig term));
+
+def lower_core_equal (fuel : Nat) (name : Nat) (a : CoreTerm) (b : CoreTerm)
+    : Either NativeLowerError Unit :=
+    lower_bind Bool Unit (lower_check Bool name (check_from_normalize Bool (eqTerm_checked fuel a b)))
+      (fun (same : Bool) => lower_require same (LowerMetadataMismatch name));
+
+def lower_role_key (role : PrimitiveRole) : List (Pair PrimitiveRole (List Nat)) -> List Nat :=
+  fix find (keys : List (Pair PrimitiveRole (List Nat))) : List Nat :=
+    match keys with | Nil => ([] : List Nat) | Cons pair rest => match pair with | MkPair candidate key =>
+      match primitive_role_equal role candidate with | True => key | False => find rest end end end;
+
+def lower_windows_target : List Nat := ([119, 105, 110, 100, 111, 119, 115, 45, 120, 56, 54, 95, 54, 52] : List Nat);
+def lower_windows_abi : List Nat := ([119, 105, 110, 54, 52] : List Nat);
+def lower_kernel_library : List Nat := ([107, 101, 114, 110, 101, 108, 51, 50, 46, 100, 108, 108] : List Nat);
+def lower_exit_symbol : List Nat := ([69, 120, 105, 116, 80, 114, 111, 99, 101, 115, 115] : List Nat);
+
+def lower_rebuild_entry (entry : Entry) : Either NativeLowerError FileItem :=
+    match entry with
+    | MkEntry id typ body => Right NativeLowerError FileItem (match body with
+      | Nothing => FAxiom id typ | Just value => FDef id typ value end)
+    | MkIndEntry id declaration => match declaration with | MkIndDecl name _ _ _ _ =>
+      lower_map Unit FileItem (fun (_ : Unit) => FInd declaration)
+        (lower_require (eqNat id name) (LowerMetadataMismatch id)) end
+    | MkRoleEntry binding => match binding with | PrimitiveRoleOf role shape => match shape with
+      | PrimitiveInductiveOf id _ _ _ _ => Right NativeLowerError FileItem
+          (FRepresentation id (lower_role_key role primitive_role_keys)) end end
+    | MkBoundEntry id typ binding => match binding with
+      | PrimitiveIntrinsicBinding primitive _ _ specialization =>
+          Right NativeLowerError FileItem (FIntrinsic id typ (primitive_key primitive) specialization)
+      | PrimitiveExternBinding external => match external with
+        | CheckedExternOf _ _ dll symbol _ gc => Right NativeLowerError FileItem
+            (FExtern id typ (ExternRequestOf lower_windows_target lower_windows_abi dll symbol False gc)) end end end;
+
+def lower_rebuild_items : Nat -> List Entry -> Either NativeLowerError (List FileItem) :=
+  fix rebuild (fuel : Nat) (entries : List Entry) : Either NativeLowerError (List FileItem) :=
+    match fuel with | Z => Left NativeLowerError (List FileItem) LowerResourceExhausted
+    | S next => match entries with | Nil => Right NativeLowerError (List FileItem) ([] : List FileItem)
+      | Cons entry rest => lower_bind FileItem (List FileItem) (lower_rebuild_entry entry)
+          (fun (item : FileItem) => lower_map (List FileItem) (List FileItem)
+            (fun (items : List FileItem) => Cons FileItem item items) (rebuild next rest)) end end;
+
+def lower_gc_equal (a : PrimitiveGc) (b : PrimitiveGc) : Bool :=
+    eqNat (lower_gc_code a) (lower_gc_code b);
+
+def lower_execution_equal (a : PrimitiveExecution) (b : PrimitiveExecution) : Bool :=
+    eqNat (lower_execution_code a) (lower_execution_code b);
+
+def lower_abi_value_equal (fuel : Nat) (id : Nat) (a : PrimitiveAbiValue) (b : PrimitiveAbiValue)
+    : Either NativeLowerError Unit :=
+    match a, b with
+    | PrimitiveAbiWord left, PrimitiveAbiWord right => lower_require (primitive_word_equal left right) (LowerMetadataMismatch id)
+    | PrimitiveAbiPointer left, PrimitiveAbiPointer right => lower_core_equal fuel id left right
+    | PrimitiveAbiFunction left, PrimitiveAbiFunction right => lower_core_equal fuel id left right
+    | PrimitiveAbiWord _, PrimitiveAbiPointer _ => Left NativeLowerError Unit (LowerMetadataMismatch id)
+    | PrimitiveAbiWord _, PrimitiveAbiFunction _ => Left NativeLowerError Unit (LowerMetadataMismatch id)
+    | PrimitiveAbiPointer _, PrimitiveAbiWord _ => Left NativeLowerError Unit (LowerMetadataMismatch id)
+    | PrimitiveAbiPointer _, PrimitiveAbiFunction _ => Left NativeLowerError Unit (LowerMetadataMismatch id)
+    | PrimitiveAbiFunction _, PrimitiveAbiWord _ => Left NativeLowerError Unit (LowerMetadataMismatch id)
+    | PrimitiveAbiFunction _, PrimitiveAbiPointer _ => Left NativeLowerError Unit (LowerMetadataMismatch id) end;
+
+def lower_abi_args_equal (fuel : Nat) (id : Nat)
+    : List PrimitiveAbiValue -> List PrimitiveAbiValue -> Either NativeLowerError Unit :=
+  fix compare (left : List PrimitiveAbiValue) (right : List PrimitiveAbiValue) : Either NativeLowerError Unit :=
+    match left, right with
+    | Nil, Nil => Right NativeLowerError Unit MkUnit
+    | Cons a rest, Cons b more => lower_bind Unit Unit (lower_abi_value_equal fuel id a b)
+        (fun (_ : Unit) => compare rest more)
+    | Nil, Cons _ _ => Left NativeLowerError Unit (LowerMetadataMismatch id)
+    | Cons _ _, Nil => Left NativeLowerError Unit (LowerMetadataMismatch id) end;
+
+def lower_abi_equal (fuel : Nat) (id : Nat) (a : PrimitiveAbiSignature) (b : PrimitiveAbiSignature)
+    : Either NativeLowerError Unit :=
+    match a, b with | PrimitiveAbiSignatureOf args result, PrimitiveAbiSignatureOf other answer =>
+      lower_bind Unit Unit (lower_abi_args_equal fuel id args other) (fun (_ : Unit) =>
+        match result, answer with | Nothing, Nothing => Right NativeLowerError Unit MkUnit
+        | Just left, Just right => lower_abi_value_equal fuel id left right
+        | Nothing, Just _ => Left NativeLowerError Unit (LowerMetadataMismatch id)
+        | Just _, Nothing => Left NativeLowerError Unit (LowerMetadataMismatch id) end) end;
+
+def lower_specialization_equal (fuel : Nat) (id : Nat) (a : Maybe CoreTerm) (b : Maybe CoreTerm)
+    : Either NativeLowerError Unit :=
+    match a, b with
+    | Nothing, Nothing => Right NativeLowerError Unit MkUnit
+    | Just left, Just right => lower_core_equal fuel id left right
+    | Nothing, Just _ => Left NativeLowerError Unit (LowerMetadataMismatch id)
+    | Just _, Nothing => Left NativeLowerError Unit (LowerMetadataMismatch id) end;
+
+def lower_metadata_equal (fuel : Nat) (id : Nat) (a : PrimitiveBinding) (b : PrimitiveBinding)
+    : Either NativeLowerError Unit :=
+    match a, b with
+    | PrimitiveIntrinsicBinding left exec gc specialization, PrimitiveIntrinsicBinding right kind other expected =>
+        lower_bind Unit Unit (lower_require (andb (primitive_id_equal left right)
+          (andb (lower_execution_equal exec kind) (lower_gc_equal gc other))) (LowerMetadataMismatch id))
+          (fun (_ : Unit) => lower_specialization_equal fuel id specialization expected)
+    | PrimitiveExternBinding left, PrimitiveExternBinding right => match left, right with
+      | CheckedExternOf _ _ dll symbol signature gc, CheckedExternOf _ _ library label expected other =>
+          lower_bind Unit Unit (lower_require (andb (pe_bytes_equal dll library)
+            (andb (pe_bytes_equal symbol label) (lower_gc_equal gc other))) (LowerMetadataMismatch id))
+            (fun (_ : Unit) => lower_abi_equal fuel id signature expected) end
+    | PrimitiveIntrinsicBinding _ _ _ _, PrimitiveExternBinding _ => Left NativeLowerError Unit (LowerMetadataMismatch id)
+    | PrimitiveExternBinding _, PrimitiveIntrinsicBinding _ _ _ _ => Left NativeLowerError Unit (LowerMetadataMismatch id) end;
+
+def lower_core_list_equal (fuel : Nat) (id : Nat) : List CoreTerm -> List CoreTerm -> Either NativeLowerError Unit :=
+  fix compare (left : List CoreTerm) (right : List CoreTerm) : Either NativeLowerError Unit :=
+    match left, right with | Nil, Nil => Right NativeLowerError Unit MkUnit
+    | Cons a rest, Cons b more => lower_bind Unit Unit (lower_core_equal fuel id a b) (fun (_ : Unit) => compare rest more)
+    | Nil, Cons _ _ => Left NativeLowerError Unit (LowerMetadataMismatch id)
+    | Cons _ _, Nil => Left NativeLowerError Unit (LowerMetadataMismatch id) end;
+
+def lower_role_equal (fuel : Nat) (a : PrimitiveRoleBinding) (b : PrimitiveRoleBinding)
+    : Either NativeLowerError Unit :=
+    match a, b with | PrimitiveRoleOf role left, PrimitiveRoleOf other right => match left, right with
+    | PrimitiveInductiveOf id params indices family ctors, PrimitiveInductiveOf name count arity typ constructors =>
+      lower_bind Unit Unit (lower_require (andb (primitive_role_equal role other)
+        (andb (eqNat id name) (andb (eqNat params count) (eqNat indices arity)))) (LowerMetadataMismatch id))
+        (fun (_ : Unit) => lower_bind Unit Unit (lower_core_equal fuel id family typ)
+          (fun (_ : Unit) => lower_core_list_equal fuel id ctors constructors)) end end;
+
+-- Ordinary terms were supplied unchanged to exact replay. These comparisons
+-- additionally prevent an externally constructed binding from lying about ABI,
+-- GC behavior, primitive execution class, or the checked representation role.
+def lower_optional_metadata (fuel : Nat) (id : Nat) (a : Maybe PrimitiveBinding) (b : Maybe PrimitiveBinding)
+    : Either NativeLowerError Unit :=
+    match a, b with | Nothing, Nothing => Right NativeLowerError Unit MkUnit
+    | Just left, Just right => lower_metadata_equal fuel id left right
+    | Nothing, Just _ => Left NativeLowerError Unit (LowerMetadataMismatch id)
+    | Just _, Nothing => Left NativeLowerError Unit (LowerMetadataMismatch id) end;
+
+def lower_optional_role (fuel : Nat) (id : Nat) (a : Maybe PrimitiveRoleBinding) (b : Maybe PrimitiveRoleBinding)
+    : Either NativeLowerError Unit :=
+    match a, b with | Nothing, Nothing => Right NativeLowerError Unit MkUnit
+    | Just left, Just right => lower_role_equal fuel left right
+    | Nothing, Just _ => Left NativeLowerError Unit (LowerMetadataMismatch id)
+    | Just _, Nothing => Left NativeLowerError Unit (LowerMetadataMismatch id) end;
+
+def lower_entries_equal (fuel : Nat) : List Entry -> List Entry -> Either NativeLowerError Unit :=
+  fix compare (left : List Entry) (right : List Entry) : Either NativeLowerError Unit :=
+    match left, right with | Nil, Nil => Right NativeLowerError Unit MkUnit
+    | Cons a rest, Cons b more =>
+      let id : Nat := lower_entry_id a in
+      lower_bind Unit Unit (lower_require (andb (eqNat id (lower_entry_id b))
+        (eqNat (lower_entry_tag a) (lower_entry_tag b))) (LowerMetadataMismatch id))
+        (fun (_ : Unit) => lower_bind Unit Unit
+          (lower_optional_metadata fuel id (lower_entry_primitive a) (lower_entry_primitive b))
+          (fun (_ : Unit) => lower_bind Unit Unit (lower_optional_role fuel id (lower_entry_role a) (lower_entry_role b))
+            (fun (_ : Unit) => compare rest more)))
+    | Nil, Cons _ _ => Left NativeLowerError Unit (LowerMetadataMismatch 0)
+    | Cons _ _, Nil => Left NativeLowerError Unit (LowerMetadataMismatch 0) end;
+
+def lower_expected_bodies : List Entry -> List (Pair Nat CoreTerm) :=
+  fix collect (entries : List Entry) : List (Pair Nat CoreTerm) :=
+    match entries with | Nil => ([] : List (Pair Nat CoreTerm)) | Cons entry rest => match entry with
+      | MkEntry id _ body => match body with | Nothing => collect rest
+        | Just term => Cons (Pair Nat CoreTerm) (MkPair Nat CoreTerm id term) (collect rest) end
+      | MkIndEntry _ _ => collect rest | MkBoundEntry _ _ _ => collect rest | MkRoleEntry _ => collect rest end end;
+
+def lower_bodies_equal (fuel : Nat) : List (Pair Nat CoreTerm) -> List (Pair Nat CoreTerm) -> Either NativeLowerError Unit :=
+  fix compare (left : List (Pair Nat CoreTerm)) (right : List (Pair Nat CoreTerm)) : Either NativeLowerError Unit :=
+    match left, right with | Nil, Nil => Right NativeLowerError Unit MkUnit
+    | Cons pair rest, Cons other more => match pair, other with | MkPair id a, MkPair name b =>
+        lower_bind Bool Unit (lower_check Bool id (check_from_normalize Bool (eqTerm_checked fuel a b)))
+          (fun (same : Bool) => lower_bind Unit Unit
+            (lower_require (andb (eqNat id name) same) (LowerBodyMismatch id)) (fun (_ : Unit) => compare rest more)) end
+    | Cons pair _, Nil => match pair with | MkPair id _ => Left NativeLowerError Unit (LowerBodyMismatch id) end
+    | Nil, Cons pair _ => match pair with | MkPair id _ => Left NativeLowerError Unit (LowerBodyMismatch id) end end;
+
+-- Internal host seam: the traversal and all metadata/body checks remain
+-- here. Public native consumers always use the strict default below.
+def lower_recheck_program_with
+    (check_one : CheckMode -> Nat -> CheckEnvironment -> FileItem -> IndexedDeclarationResult)
+    (fuel : Nat) (program : CheckedProgram) : Either NativeLowerError CheckedProgram :=
+    match program with | CheckedProgramOf state entries bodies =>
+      lower_bind (List FileItem) CheckedProgram (lower_rebuild_items fuel (reverse Entry entries))
+        (fun (items : List FileItem) => match
+          check_indexed_declarations_with check_one CheckExactCore keep_checking fuel (Nil Nat) items with
+          | DeclarationsErr id phase failure => match lower_failure_resource failure with
+            | True => Left NativeLowerError CheckedProgram LowerResourceExhausted
+            | False => Left NativeLowerError CheckedProgram (LowerDeclarationFailure id phase failure) end
+          | DeclarationsOk fresh => lower_bind Unit CheckedProgram (lower_entries_equal fuel entries fresh)
+              (fun (_ : Unit) => lower_map Unit CheckedProgram
+                (fun (_ : Unit) => CheckedProgramOf state fresh bodies)
+                (lower_bodies_equal fuel bodies (lower_expected_bodies (reverse Entry fresh)))) end) end;
+
+def lower_recheck_program (fuel : Nat) (program : CheckedProgram) : Either NativeLowerError CheckedProgram :=
+    lower_recheck_program_with check_indexed_declaration fuel program;

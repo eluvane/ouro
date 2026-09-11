@@ -1,0 +1,98 @@
+-- Ordinary source-owned managed Runtime code using existing raw capabilities.
+-- No GetLastError is read after a managed foreign-call return can allocate.
+import "windows_text.ouro";
+import "windows_path.ouro";
+import "../../std/executable_model.ouro";
+
+extern windows_get_module_file_name : RawPtr U8 -> RawPtr U8 -> U32 -> Runtime U32 :=
+    "windows-x86_64" "win64" "kernel32.dll" "GetModuleFileNameW" "nogc";
+
+intrinsic executable_u8_to_nat : U8 -> Nat := "ouro.u8.to_nat.bits";
+intrinsic executable_u32_to_nat : U32 -> Nat := "ouro.u32.to_nat.bits";
+
+def WindowsExecutableResult : Type := Either ExecutablePathError String;
+
+def windows_executable_fail (error : ExecutablePathError) : Runtime WindowsExecutableResult :=
+    runtime_pure WindowsExecutableResult (Left ExecutablePathError String error);
+
+-- Only owned UTF-8 storage and an already bounded exact count reach this loop.
+-- The first recursive argument decreases. Raw pages remain owned until the
+-- completed managed String, including all bytes after any zero, is returned.
+def windows_executable_read (base : RawPtr U8) (one : USize)
+    : Nat -> USize -> List Nat -> Runtime String :=
+  fix read (remaining : Nat) (offset : USize) (bytes : List Nat) : Runtime String :=
+    match remaining with
+    | Z => runtime_pure String (str_of_codes (reverse_lin Nat bytes))
+    | S rest => runtime_bind (RawPtr U8) String (raw_add U8 base offset) (fun (address : RawPtr U8) =>
+        runtime_bind U8 String (raw_load_u8 address) (fun (byte : U8) =>
+          read rest (usize_add offset one) (Cons Nat (executable_u8_to_nat byte) bytes)))
+    end;
+
+def windows_executable_convert (wide : RawPtr U8) (units : USize) (utf8 : RawPtr U8)
+    (capacity : USize) (count : RawPtr U32) (one : USize) : Runtime WindowsExecutableResult :=
+    runtime_bind Bool WindowsExecutableResult (raw_windows_path_valid wide units one) (fun (valid : Bool) =>
+      match valid with
+      | False => windows_executable_fail ExecutablePathInvalidPath
+      | True => runtime_bind U32 WindowsExecutableResult
+          (raw_windows_utf16_to_utf8 wide units utf8 capacity count) (fun (status : U32) =>
+            match u32_equal status (u32_sub status status) with
+            | False => windows_executable_fail ExecutablePathConversionFailed
+            | True => runtime_bind U32 WindowsExecutableResult (raw_load_u32 count) (fun (actual : U32) =>
+                match executable_path_byte_length (executable_u32_to_nat actual)
+                  (executable_u32_to_nat (raw_size_to_u32 capacity)) with
+                | Left error => windows_executable_fail error
+                | Right bytes => runtime_bind String WindowsExecutableResult
+                    (windows_executable_read utf8 one bytes (usize_sub one one) ([] : List Nat))
+                    (fun (value : String) => runtime_pure WindowsExecutableResult (executable_path_value value))
+                end)
+            end)
+      end);
+
+-- The owner is partitioned into 32768 UTF-16 units, 98304 UTF-8 bytes, then
+-- a disjoint aligned four-byte count cell. Capacity includes the wide NUL.
+def windows_executable_query (owner : RawPtr U8) (wide_capacity : USize) (one : USize)
+    : Runtime WindowsExecutableResult :=
+    let wide_bytes : USize := usize_add wide_capacity wide_capacity in
+    let utf8_capacity : USize := usize_add wide_bytes wide_capacity in
+    let count_offset : USize := usize_add wide_bytes utf8_capacity in
+    runtime_bind (RawPtr U8) WindowsExecutableResult (raw_add U8 owner wide_bytes) (fun (utf8 : RawPtr U8) =>
+      runtime_bind (RawPtr U8) WindowsExecutableResult (raw_add U8 owner count_offset) (fun (cell : RawPtr U8) =>
+        runtime_bind (RawPtr U32) WindowsExecutableResult (raw_cast U8 U32 cell) (fun (count : RawPtr U32) =>
+          runtime_bind Unit WindowsExecutableResult (raw_store_u32 count (raw_size_to_u32 (usize_sub one one)))
+            (fun (_ : Unit) => runtime_bind U32 WindowsExecutableResult
+              (windows_get_module_file_name (raw_null U8) owner (raw_size_to_u32 wide_capacity)) (fun (actual : U32) =>
+                match executable_path_query_length (executable_u32_to_nat actual)
+                  (executable_u32_to_nat (raw_size_to_u32 wide_capacity)) with
+                | Left error => windows_executable_fail error
+                | Right _ => windows_executable_convert owner (raw_u32_to_size actual) utf8 utf8_capacity count one
+                end)))));
+
+-- All ordinary results converge here, including conversion/count failures.
+-- Only the original allocation base is released, exactly once. No raw pointer
+-- is read after release. Process termination/OOM follows existing runtime rules.
+def windows_executable_owned (owner : RawPtr U8) (wide_capacity : USize) (one : USize)
+    : Runtime WindowsExecutableResult :=
+    runtime_bind WindowsExecutableResult WindowsExecutableResult (windows_executable_query owner wide_capacity one)
+      (fun (result : WindowsExecutableResult) => runtime_bind Bool WindowsExecutableResult (raw_pages_release owner)
+        (fun (released : Bool) => runtime_pure WindowsExecutableResult (executable_path_released result released)));
+
+def windows_executable_path_checked : Runtime WindowsExecutableResult :=
+    match usize_from_nat 1, u32_from_nat 15 with
+    | Just one, Just shift =>
+        let two : USize := usize_add one one in
+        let four : USize := usize_add two two in
+        let eight : USize := usize_add four four in
+        let wide_capacity : USize := usize_shift_left one shift in
+        let wide_bytes : USize := usize_add wide_capacity wide_capacity in
+        let utf8_capacity : USize := usize_add wide_bytes wide_capacity in
+        let allocation_bytes : USize := usize_add (usize_add wide_bytes utf8_capacity) four in
+        runtime_bind (RawPtr U8) WindowsExecutableResult (raw_pages_allocate allocation_bytes eight)
+          (fun (owner : RawPtr U8) => runtime_bind USize WindowsExecutableResult (raw_to_bits U8 owner)
+            (fun (address : USize) => match usize_equal address (usize_sub one one) with
+              | True => windows_executable_fail ExecutablePathAllocationFailed
+              | False => windows_executable_owned owner wide_capacity one
+              end))
+    | Just _, Nothing => windows_executable_fail ExecutablePathConstantsFailed
+    | Nothing, Just _ => windows_executable_fail ExecutablePathConstantsFailed
+    | Nothing, Nothing => windows_executable_fail ExecutablePathConstantsFailed
+    end;

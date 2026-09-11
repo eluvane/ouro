@@ -1,0 +1,624 @@
+-- Analyzer facts are the stable bridge between typed frontend output and native policy runners.
+-- Fact kind/tag order is host-facing; update runners and baselines with any change here.
+
+-- @entry collect_program_facts
+-- @entry normalize_expr
+-- @entry normalize_surface
+-- @entry normalize_core
+-- @export fact_kind_count; @doc docs/tcb.md
+-- @export empty_bundle; @doc docs/tcb.md
+-- @export collect_typed_asts; @doc docs/tcb.md
+-- @export collect_surface_asts; @doc docs/tcb.md
+-- @export collect_core_asts; @doc docs/tcb.md
+
+import "../std/data.ouro";
+import "base.ouro";
+import "ast.ouro";
+import "core.ouro";
+
+inductive FactKind : Type :=
+  | FDeclaration : FactKind
+  | FReference : FactKind
+  | FExport : FactKind
+  | FConstructor : FactKind
+  | FModule : FactKind
+  | FBranch : FactKind
+  | FEffect : FactKind;
+
+-- kind, name, owner, flags (bit0 export, bit1 entry), span
+inductive Fact : Type :=
+  | MkFact : FactKind -> Nat -> Nat -> Nat -> Nat -> Fact;
+
+-- De Bruijn / globally-disambiguated typed AST. Binders are implicit in
+-- NLam/NPi/NLet/NFix; NBound is a depth, NGlobal/NConst/NConstruct keep
+-- interned ids so unrelated helpers with the same shape do not collide.
+inductive Norm : Type :=
+  | NBound : Nat -> Norm
+  | NGlobal : Nat -> Norm
+  | NHole : Nat -> Norm
+  | NSort : Nat -> Norm
+  | NNat : Nat -> Norm
+  | NApp : Norm -> Norm -> Norm
+  | NLam : Norm -> Norm -> Norm
+  | NPi : Norm -> Norm -> Norm
+  | NLet : Norm -> Norm -> Norm -> Norm
+  | NAscribe : Norm -> Norm -> Norm
+  | NMatch : Norm -> Norm -> Norm
+  | NFix : Norm -> Norm -> Norm
+  | NBranch : Nat -> Norm -> Norm -> Norm
+  | NNoBranch : Norm
+  | NConst : Nat -> Norm
+  | NConstruct : Nat -> Nat -> Norm
+  | NInd : Nat -> Norm
+  | NPerform : Nat -> Norm -> Norm
+  | NHandle : Norm -> Norm -> Norm
+  | NClause : Nat -> Norm -> Norm -> Norm
+  | NNoClause : Norm
+  | NDo : Norm -> Norm -> Norm
+  | NBytes : List Nat -> Norm;
+
+inductive TypedAst : Type :=
+  | MkTypedAst : Nat -> Norm -> TypedAst;
+
+inductive FactsBundle : Type :=
+  | MkFacts : List Fact -> List TypedAst -> FactsBundle;
+
+def fact_kind_count : Nat := 7;
+
+def empty_bundle : FactsBundle :=
+  MkFacts (Nil Fact) (Nil TypedAst);
+
+-- Declaration kinds, same numbering the native runner reports. Only the first
+-- two tag facts emitted here; the other two exist because the mirror has to
+-- name every kind the runner can print.
+-- @export kindModule; @doc docs/tcb.md
+-- @export kindBranch; @doc docs/tcb.md
+def kindDef : Nat := Z;
+def kindCtor : Nat := S kindDef;
+def kindModule : Nat := S kindCtor;
+def kindBranch : Nat := S kindModule;
+
+def flagNone : Nat := Z;
+def flagExport : Nat := S Z;
+def flagEntry : Nat := 2;
+def flagBoth : Nat := 3;
+
+-- FEffect flags: perform / handle-clause / discarded-k / declared-op.
+def flagEffPerform : Nat := S Z;
+def flagEffHandle : Nat := 2;
+def flagEffDecl : Nat := 8;
+
+def norm_of_args (nf : Expr -> Norm) : List Expr -> Norm :=
+  fix norm_of_args (xs : List Expr) : Norm :=
+    match xs with
+    | Nil => NNoClause
+    | Cons e rest => NApp (nf e) (norm_of_args rest)
+    end;
+
+def norm_of_clauses (nf : Expr -> Norm)
+    : List (Pair Nat (Pair (List Nat) Expr)) -> Norm :=
+  fix norm_of_clauses (xs : List (Pair Nat (Pair (List Nat) Expr))) : Norm :=
+    match xs with
+    | Nil => NNoClause
+    | Cons p rest =>
+        match p with
+        | MkPair op inner =>
+            match inner with
+            | MkPair _binders body =>
+                NClause op (nf body) (norm_of_clauses rest)
+            end
+        end
+    end;
+
+def norm_of_do (nf : Expr -> Norm) : List Expr -> Norm :=
+  fix norm_of_do (xs : List Expr) : Norm :=
+    match xs with
+    | Nil => NNoClause
+    | Cons e rest => NDo (nf e) (norm_of_do rest)
+    end;
+
+def factFlags (exported : Bool) (entry : Bool) : Nat :=
+    match exported with
+    | True =>
+        match entry with
+        | True => flagBoth
+        | False => flagExport
+        end
+    | False =>
+        match entry with
+        | True => flagEntry
+        | False => flagNone
+        end
+    end;
+
+def memNatF (target : Nat) : List Nat -> Bool := elem Nat eqNat target;
+
+def indexOfF (target : Nat) : List Nat -> Maybe Nat :=
+  fix indexOfF (xs : List Nat) : Maybe Nat :=
+    match xs with
+    | Nil => Nothing Nat
+    | Cons y rest =>
+        match eqNat target y with
+        | True => Just Nat Z
+        | False =>
+            match indexOfF rest with
+            | Nothing => Nothing Nat
+            | Just n => Just Nat (S n)
+            end
+        end
+    end;
+
+def resolve_name (name : Nat) (env : List Nat) : Norm :=
+    match indexOfF name env with
+    | Just d => NBound d
+    | Nothing => NGlobal name
+    end;
+
+def fcons (f : Fact) (fs : List Fact) : List Fact := Cons Fact f fs;
+
+def fact_list1 (f : Fact) : List Fact :=
+    let xs : List Fact := [f] in xs;
+
+def ast_list1 (a : TypedAst) : List TypedAst :=
+    let xs : List TypedAst := [a] in xs;
+
+def fappend (xs : List Fact) (ys : List Fact) : List Fact :=
+  append Fact xs ys;
+
+def first_expr_f (xs : List Expr) : Expr :=
+    match xs with
+    | Nil => EHole (Nothing Nat)
+    | Cons e _ => e
+    end;
+
+-- Fuel-bounded Expr → normalized typed AST. Binders push interned names;
+-- uses become NBound depth or NGlobal id.
+def normalize_expr : Nat -> List Nat -> Expr -> Norm :=
+  fix normalize_expr (fuel : Nat) (env : List Nat) (e : Expr) : Norm :=
+    match fuel with
+    | Z => NHole Z
+    | S fuel' =>
+        match e with
+        | EVar n => resolve_name n env
+        | EHole m =>
+            match m with
+            | Nothing => NHole Z
+            | Just n => NHole n
+            end
+        | ESort n => NSort n
+        | ENat n => NNat n
+        | EApp f x =>
+            NApp (normalize_expr fuel' env f) (normalize_expr fuel' env x)
+        | ELam n ann body =>
+            match ann with
+            | Nothing =>
+                NLam (NHole Z) (normalize_expr fuel' (Cons Nat n env) body)
+            | Just t =>
+                NLam (normalize_expr fuel' env t)
+                  (normalize_expr fuel' (Cons Nat n env) body)
+            end
+        | EPi n dom cod =>
+            NPi (normalize_expr fuel' env dom)
+              (normalize_expr fuel' (Cons Nat n env) cod)
+        | ELet n ann v body =>
+            match ann with
+            | Nothing =>
+                NLet (NHole Z) (normalize_expr fuel' env v)
+                  (normalize_expr fuel' (Cons Nat n env) body)
+            | Just t =>
+                NLet (normalize_expr fuel' env t) (normalize_expr fuel' env v)
+                  (normalize_expr fuel' (Cons Nat n env) body)
+            end
+        | EAscribe t ty =>
+            NAscribe (normalize_expr fuel' env t) (normalize_expr fuel' env ty)
+        | EMatch scrut branches =>
+            NMatch (normalize_expr fuel' env scrut)
+              (normalize_expr fuel' env branches)
+        | EFix n _binders ret body =>
+            NFix (normalize_expr fuel' env ret)
+              (normalize_expr fuel' (Cons Nat n env) body)
+        | EEffectRow inner _row => normalize_expr fuel' env inner
+        | EPerform n args =>
+            NPerform n
+              (norm_of_args (fun (child : Expr) => normalize_expr fuel' env child) args)
+        | EDo xs =>
+            norm_of_do (fun (child : Expr) => normalize_expr fuel' env child) xs
+        | EHandle inner cls =>
+            NHandle (normalize_expr fuel' env inner)
+              (norm_of_clauses (fun (child : Expr) => normalize_expr fuel' env child) cls)
+        | EBranch pats body rest =>
+            match pats with
+            | Nil =>
+                NBranch Z (normalize_expr fuel' env body)
+                  (normalize_expr fuel' env rest)
+            | Cons ctor binders =>
+                NBranch ctor (normalize_expr fuel' (append Nat binders env) body)
+                  (normalize_expr fuel' env rest)
+            end
+        | ENoBranch => NNoBranch
+        | EBinder n ty rest =>
+            NPi (normalize_expr fuel' env ty)
+              (normalize_expr fuel' (Cons Nat n env) rest)
+        | ENoBinder => NNoBranch
+        | EMultiMatch scruts _rows =>
+            NMatch (normalize_expr fuel' env (first_expr_f scruts)) NNoBranch
+        | EStr n => NNat n
+        | EDoBind _n rhs =>
+            NLet (NHole Z) (normalize_expr fuel' env rhs) (NHole Z)
+        | EList xs =>
+            norm_of_args (fun (child : Expr) => normalize_expr fuel' env child) xs
+        end
+    end;
+
+-- Lowered Surface is the first typed form: SVar is a binder, SConst/SInd/
+-- SConstruct are resolved globals. This is what duplication should compare.
+def normalize_surface : Nat -> List Nat -> Surface -> Norm :=
+  fix normalize_surface (fuel : Nat) (env : List Nat) (s : Surface) : Norm :=
+    match fuel with
+    | Z => NHole Z
+    | S fuel' =>
+        match s with
+        | SVar n => resolve_name n env
+        | SSort u => NSort u
+        | SPi n dom cod =>
+            NPi (normalize_surface fuel' env dom)
+              (normalize_surface fuel' (Cons Nat n env) cod)
+        | SLam n ann body =>
+            NLam (normalize_surface fuel' env ann)
+              (normalize_surface fuel' (Cons Nat n env) body)
+        | SApp f a =>
+            NApp (normalize_surface fuel' env f)
+              (normalize_surface fuel' env a)
+        | SLet n v ty body =>
+            NLet (normalize_surface fuel' env ty)
+              (normalize_surface fuel' env v)
+              (normalize_surface fuel' (Cons Nat n env) body)
+        | SConst n => NConst n
+        | SInd n => NInd n
+        | SConstruct i j _np => NConstruct i j
+        | SCase _ci _p scrut bs =>
+            NMatch (normalize_surface fuel' env scrut)
+              ((fix go (xs : List Surface) : Norm :=
+                  match xs with
+                  | Nil => NNoBranch
+                  | Cons b rest =>
+                      NBranch Z (normalize_surface fuel' env b) (go rest)
+                  end) bs)
+        | SFix n _rec _ar ty body =>
+            NFix (normalize_surface fuel' env ty)
+              (normalize_surface fuel' (Cons Nat n env) body)
+        | SHole n => NHole n
+        | SEffectRow ty => normalize_surface fuel' env ty
+        | SPerform op args =>
+            NPerform op
+              ((fix go (xs : List Surface) : Norm :=
+                  match xs with
+                  | Nil => NNoClause
+                  | Cons a rest =>
+                      NApp (normalize_surface fuel' env a) (go rest)
+                  end) args)
+        | SStr n _ty => NNat n
+        end
+    end;
+
+-- Elaborated CoreTerm is already de Bruijn. CRel stays a bound index;
+-- CConst/CInd/CConstruct are the typed global/constructor facts.
+def normalize_core : Nat -> CoreTerm -> Norm :=
+  fix normalize_core (fuel : Nat) (t : CoreTerm) : Norm :=
+    match fuel with
+    | Z => NHole Z
+    | S fuel' =>
+        match t with
+        | CRel n => NBound n
+        | CSort u => NSort u
+        | CPi dom cod =>
+            NPi (normalize_core fuel' dom) (normalize_core fuel' cod)
+        | CLam ann body =>
+            NLam (normalize_core fuel' ann) (normalize_core fuel' body)
+        | CApp f a =>
+            NApp (normalize_core fuel' f) (normalize_core fuel' a)
+        | CLetIn v ty body =>
+            NLet (normalize_core fuel' ty) (normalize_core fuel' v)
+              (normalize_core fuel' body)
+        | CConst n => NConst n
+        | CInd n => NInd n
+        | CConstruct i j _np => NConstruct i j
+        | CCase _ci _p scrut bs =>
+            NMatch (normalize_core fuel' scrut)
+              ((fix go (xs : List CoreTerm) : Norm :=
+                  match xs with
+                  | Nil => NNoBranch
+                  | Cons b rest =>
+                      NBranch Z (normalize_core fuel' b) (go rest)
+                  end) bs)
+        | CFix _n _rec _ar ty body =>
+            NFix (normalize_core fuel' ty) (normalize_core fuel' body)
+        | CStrLit n _ty => NNat n
+        | CStrBytes bytes _ty => NBytes bytes
+        end
+    end;
+
+def fuelFacts : Nat := fuel1k;
+
+def refs_in_norm : Nat -> Nat -> Norm -> List Fact :=
+  fix refs_in_norm (fuel : Nat) (src : Nat) (n : Norm) : List Fact :=
+    match fuel with
+    | Z => Nil Fact
+    | S fuel' =>
+        match n with
+        | NBound _ => Nil Fact
+        | NGlobal dst =>
+            fact_list1 (MkFact FReference src dst flagNone Z)
+        | NHole _ => Nil Fact
+        | NSort _ => Nil Fact
+        | NNat _ => Nil Fact
+        | NBytes _ => Nil Fact
+        | NApp f x =>
+            fappend (refs_in_norm fuel' src f) (refs_in_norm fuel' src x)
+        | NLam a b =>
+            fappend (refs_in_norm fuel' src a) (refs_in_norm fuel' src b)
+        | NPi a b =>
+            fappend (refs_in_norm fuel' src a) (refs_in_norm fuel' src b)
+        | NLet a b c =>
+            fappend (refs_in_norm fuel' src a)
+              (fappend (refs_in_norm fuel' src b) (refs_in_norm fuel' src c))
+        | NAscribe a b =>
+            fappend (refs_in_norm fuel' src a) (refs_in_norm fuel' src b)
+        | NMatch a b =>
+            fappend (refs_in_norm fuel' src a) (refs_in_norm fuel' src b)
+        | NFix a b =>
+            fappend (refs_in_norm fuel' src a) (refs_in_norm fuel' src b)
+        | NBranch ctor a b =>
+            fcons (MkFact FReference src ctor flagNone Z)
+              (fappend (refs_in_norm fuel' src a) (refs_in_norm fuel' src b))
+        | NNoBranch => Nil Fact
+        | NConst dst =>
+            fact_list1 (MkFact FReference src dst flagNone Z)
+        | NConstruct i _j =>
+            fact_list1 (MkFact FReference src i flagNone Z)
+        | NInd dst =>
+            fact_list1 (MkFact FReference src dst flagNone Z)
+        | NPerform op args =>
+            fcons (MkFact FEffect op src flagEffPerform Z)
+              (fcons (MkFact FReference src op flagNone Z)
+                (refs_in_norm fuel' src args))
+        | NHandle inner cls =>
+            fappend (refs_in_norm fuel' src inner)
+              (refs_in_norm fuel' src cls)
+        | NClause op body rest =>
+            fcons (MkFact FEffect op src flagEffHandle Z)
+              (fappend (refs_in_norm fuel' src body)
+                (refs_in_norm fuel' src rest))
+        | NNoClause => Nil Fact
+        | NDo a b =>
+            fappend (refs_in_norm fuel' src a) (refs_in_norm fuel' src b)
+        end
+    end;
+
+def branches_in_norm : Nat -> Nat -> Nat -> Norm -> List Fact :=
+  fix branches_in_norm (fuel : Nat) (owner : Nat) (span : Nat) (n : Norm)
+      : List Fact :=
+    match fuel with
+    | Z => Nil Fact
+    | S fuel' =>
+        match n with
+        | NBound _ => Nil Fact
+        | NGlobal _ => Nil Fact
+        | NHole _ => Nil Fact
+        | NSort _ => Nil Fact
+        | NNat _ => Nil Fact
+        | NBytes _ => Nil Fact
+        | NApp f x =>
+            fappend (branches_in_norm fuel' owner span f)
+              (branches_in_norm fuel' owner span x)
+        | NLam a b =>
+            fappend (branches_in_norm fuel' owner span a)
+              (branches_in_norm fuel' owner span b)
+        | NPi a b =>
+            fappend (branches_in_norm fuel' owner span a)
+              (branches_in_norm fuel' owner span b)
+        | NLet a b c =>
+            fappend (branches_in_norm fuel' owner span a)
+              (fappend (branches_in_norm fuel' owner span b)
+                (branches_in_norm fuel' owner span c))
+        | NAscribe a b =>
+            fappend (branches_in_norm fuel' owner span a)
+              (branches_in_norm fuel' owner span b)
+        | NMatch a b =>
+            fappend (branches_in_norm fuel' owner span a)
+              (branches_in_norm fuel' owner span b)
+        | NFix a b =>
+            fappend (branches_in_norm fuel' owner span a)
+              (branches_in_norm fuel' owner span b)
+        | NBranch ctor a b =>
+            fcons (MkFact FBranch owner ctor flagNone span)
+              (fappend (branches_in_norm fuel' owner span a)
+                (branches_in_norm fuel' owner span b))
+        | NNoBranch => Nil Fact
+        | NConst _ => Nil Fact
+        | NConstruct _ _ => Nil Fact
+        | NInd _ => Nil Fact
+        | NPerform _ args =>
+            branches_in_norm fuel' owner span args
+        | NHandle inner cls =>
+            fappend (branches_in_norm fuel' owner span inner)
+              (branches_in_norm fuel' owner span cls)
+        | NClause _ body rest =>
+            fappend (branches_in_norm fuel' owner span body)
+              (branches_in_norm fuel' owner span rest)
+        | NNoClause => Nil Fact
+        | NDo a b =>
+            fappend (branches_in_norm fuel' owner span a)
+              (branches_in_norm fuel' owner span b)
+        end
+    end;
+
+def ctor_facts_of (owner : Nat) (span : Nat) : List (Pair Nat Expr) -> List Fact :=
+  fix ctor_facts_of (cs : List (Pair Nat Expr))
+      : List Fact :=
+    match cs with
+    | Nil => Nil Fact
+    | Cons c rest =>
+        match c with
+        | MkPair nameId _ty =>
+            fcons (MkFact FConstructor nameId owner flagNone span)
+              (fcons (MkFact FDeclaration nameId kindCtor flagNone span)
+                (ctor_facts_of rest))
+        end
+    end;
+
+def opaque_decl_facts (exports : List Nat) (entries : List Nat) (span : Nat)
+    (name : Nat) (ty : Expr) (specialization : Maybe Expr)
+    : Pair (List Fact) (List TypedAst) :=
+    let flags : Nat := factFlags (memNatF name exports) (memNatF name entries) in
+    let exported : List Fact := match memNatF name exports with
+      | True => fact_list1 (MkFact FExport name name flags span)
+      | False => Nil Fact
+      end in
+    let references : List Fact :=
+      fappend (refs_in_norm fuelFacts name (normalize_expr fuelFacts (Nil Nat) ty))
+        (match specialization with
+         | Nothing => Nil Fact
+         | Just value => refs_in_norm fuelFacts name
+             (normalize_expr fuelFacts (Nil Nat) value)
+         end) in
+    MkPair (List Fact) (List TypedAst)
+      (fcons (MkFact FDeclaration name kindDef flags span)
+        (fappend exported references))
+      (Nil TypedAst);
+
+def facts_of_decl (exports : List Nat) (entries : List Nat) (span : Nat)
+    (d : Decl) : Pair (List Fact) (List TypedAst) :=
+    match d with
+    | DDef n ty body =>
+        let flags : Nat :=
+          factFlags (memNatF n exports) (memNatF n entries) in
+        let ast : Norm :=
+          normalize_expr fuelFacts (Nil Nat) body in
+        let declF : Fact :=
+          MkFact FDeclaration n kindDef flags span in
+        let exF : List Fact :=
+          match memNatF n exports with
+          | True =>
+              fact_list1 (MkFact FExport n n flags span)
+          | False => Nil Fact
+          end in
+        let more : List Fact :=
+          fappend (refs_in_norm fuelFacts n ast)
+            (fappend (refs_in_norm fuelFacts n
+                       (normalize_expr fuelFacts (Nil Nat) ty))
+              (branches_in_norm fuelFacts n span ast)) in
+        MkPair (List Fact) (List TypedAst)
+          (fcons declF (fappend exF more))
+          (ast_list1 (MkTypedAst n ast))
+    | DAxiom n _ty =>
+        let flags : Nat :=
+          factFlags (memNatF n exports) (memNatF n entries) in
+        MkPair (List Fact) (List TypedAst)
+          (fcons (MkFact FDeclaration n kindDef flags span)
+            (match memNatF n exports with
+             | True =>
+                 fact_list1 (MkFact FExport n n flags span)
+             | False => Nil Fact
+             end))
+          (Nil TypedAst)
+    | DInductive n _ps _fam cs =>
+        let flags : Nat :=
+          factFlags (memNatF n exports) (memNatF n entries) in
+        MkPair (List Fact) (List TypedAst)
+          (fcons (MkFact FDeclaration n kindDef flags span)
+            (ctor_facts_of n span cs))
+          (Nil TypedAst)
+    | DEffect n ops _ctrs =>
+        MkPair (List Fact) (List TypedAst)
+          (fcons (MkFact FDeclaration n kindDef flagNone span)
+            ((fix go (xs : List (Pair Nat Expr)) : List Fact :=
+                match xs with
+                | Nil => Nil Fact
+                | Cons c rest =>
+                    match c with
+                    | MkPair opId _ty =>
+                        fcons (MkFact FEffect opId n flagEffDecl span)
+                          (go rest)
+                    end
+                end) ops))
+          (Nil TypedAst)
+    | DImport n =>
+        MkPair (List Fact) (List TypedAst)
+          (fact_list1 (MkFact FModule n n flagNone span))
+          (Nil TypedAst)
+    | DIntrinsic n ty _ specialization =>
+        opaque_decl_facts exports entries span n ty specialization
+    | DExtern n ty _ => opaque_decl_facts exports entries span n ty (Nothing Expr)
+    | DRepresentation target _ =>
+        MkPair (List Fact) (List TypedAst)
+          (fact_list1 (MkFact FReference target target flagNone span))
+          (Nil TypedAst)
+    end;
+
+def collect_go (exports : List Nat) (entries : List Nat)
+    : Nat -> List Decl -> FactsBundle :=
+  fun (start_span : Nat) (decls : List Decl) =>
+  (fix collect_go (ds : List Decl) (span : Nat) : FactsBundle :=
+    match ds with
+    | Nil => empty_bundle
+    | Cons d rest =>
+        match collect_go rest (S span) with
+        | MkFacts fs as_ =>
+            match facts_of_decl exports entries span d with
+            | MkPair more moreAst =>
+                MkFacts (fappend more fs) (append TypedAst moreAst as_)
+            end
+        end
+    end) decls start_span;
+
+-- Host supplies interned @export / @entry ids. Declarations, constructors,
+-- imports (modules), references and match branches come from the AST.
+def collect_program_facts (exports : List Nat) (entries : List Nat)
+    (ds : List Decl) : FactsBundle :=
+    collect_go exports entries Z ds;
+
+def collect_typed_asts : List Decl -> List TypedAst :=
+  fix collect_typed_asts (ds : List Decl) : List TypedAst :=
+    match ds with
+    | Nil => Nil TypedAst
+    | Cons d rest =>
+        match d with
+        | DDef n _ body =>
+            Cons TypedAst
+              (MkTypedAst n (normalize_expr fuelFacts (Nil Nat) body))
+              (collect_typed_asts rest)
+        | DAxiom _ _ => collect_typed_asts rest
+        | DInductive _ _ _ _ => collect_typed_asts rest
+        | DEffect _ _ _ => collect_typed_asts rest
+        | DImport _ => collect_typed_asts rest
+        | DIntrinsic _ _ _ _ => collect_typed_asts rest
+        | DExtern _ _ _ => collect_typed_asts rest
+        | DRepresentation _ _ => collect_typed_asts rest
+        end
+    end;
+
+def collect_surface_asts : List (Pair Nat Surface) -> List TypedAst :=
+  fix collect_surface_asts (xs : List (Pair Nat Surface)) : List TypedAst :=
+    match xs with
+    | Nil => Nil TypedAst
+    | Cons p rest =>
+        match p with
+        | MkPair n s =>
+            Cons TypedAst
+              (MkTypedAst n (normalize_surface fuelFacts (Nil Nat) s))
+              (collect_surface_asts rest)
+        end
+    end;
+
+def collect_core_asts : List (Pair Nat CoreTerm) -> List TypedAst :=
+  fix collect_core_asts (xs : List (Pair Nat CoreTerm)) : List TypedAst :=
+    match xs with
+    | Nil => Nil TypedAst
+    | Cons p rest =>
+        match p with
+        | MkPair n t =>
+            Cons TypedAst (MkTypedAst n (normalize_core fuelFacts t))
+              (collect_core_asts rest)
+        end
+    end;

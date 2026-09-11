@@ -1,0 +1,103 @@
+-- Detailed checked-walk status for security-sensitive inventory callers.
+
+import "fs.ouro";
+
+
+inductive FsWalkResult : Type :=
+  | FsWalkComplete : List String -> FsWalkResult
+  | FsWalkTruncated : String -> FsWalkResult
+  | FsWalkUnreadable : String -> FsWalkResult
+  | FsWalkUnsafe : String -> FsWalkResult;
+
+
+def fs_walk_map (f : List String -> List String) (r : FsWalkResult)
+    : FsWalkResult :=
+    match r with
+    | FsWalkComplete files => FsWalkComplete (f files)
+    | FsWalkTruncated path => FsWalkTruncated path
+    | FsWalkUnreadable path => FsWalkUnreadable path
+    | FsWalkUnsafe path => FsWalkUnsafe path
+    end;
+
+
+def fs_walk_message (r : FsWalkResult) : String :=
+    match r with
+    | FsWalkComplete _ => ""
+    | FsWalkTruncated path => str_concat "filesystem walk limit reached at: " path
+    | FsWalkUnreadable path => str_concat "filesystem walk could not read: " path
+    | FsWalkUnsafe path => str_concat "filesystem walk rejected link or escape: " path
+    end;
+
+
+def fs_walk_path_safe (root_real : String) (path : String) : IO Bool :=
+    do let! resolved := prim_fs_realpath path;
+       io_pure Bool
+         (andb (notb (str_null resolved)) (path_under root_real resolved))
+
+
+-- The budget counts every visited entry. Children are sorted; links, reparse
+-- points, canonical escapes, unreadable directories, and exhaustion are explicit.
+def fs_walk_checked_go : Nat -> String -> List String -> List String
+    -> IO FsWalkResult :=
+  fix fs_walk_checked_go (left : Nat) (root_real : String)
+      (todo : List String) (rev : List String) : IO FsWalkResult :=
+    match todo with
+    | Nil => io_pure FsWalkResult (FsWalkComplete (reverse String rev))
+    | Cons path rest =>
+        match left with
+        | Z => io_pure FsWalkResult (FsWalkTruncated path)
+        | S left2 =>
+            do let! kind := prim_fs_kind path;
+               match eq_nat kind (S Z) with
+               | True =>
+                   do let! safe := fs_walk_path_safe root_real path;
+                      match safe with
+                      | True => fs_walk_checked_go left2 root_real rest
+                          (Cons String path rev)
+                      | False => io_pure FsWalkResult (FsWalkUnsafe path)
+                      end
+               | False =>
+                   match eq_nat kind (S (S Z)) with
+                   | False =>
+                       match eq_nat kind Z with
+                       | True => io_pure FsWalkResult (FsWalkUnreadable path)
+                       | False => io_pure FsWalkResult (FsWalkUnsafe path)
+                       end
+                   | True =>
+                       do let! safe := fs_walk_path_safe root_real path;
+                          match safe with
+                          | False => io_pure FsWalkResult (FsWalkUnsafe path)
+                          | True =>
+                              do let! readable := prim_fs_listable path;
+                                 match readable with
+                                 | False => io_pure FsWalkResult
+                                     (FsWalkUnreadable path)
+                                 | True =>
+                                     do let! kids := fs_list_paths path;
+                                        fs_walk_checked_go left2 root_real
+                                          (append String
+                                            (sort_insert String prim_string_le kids)
+                                            rest)
+                                          rev
+                                 end
+                          end
+                   end
+               end
+        end
+    end;
+
+
+def fs_walk_checked (root : String) : IO FsWalkResult :=
+    do let! resolved := prim_fs_realpath root;
+       match str_null resolved with
+       | True => io_pure FsWalkResult (FsWalkUnreadable root)
+       | False => fs_walk_checked_go fs_walk_fuel resolved
+           ([root] : List String) (Nil String)
+       end
+
+
+def fs_walk_ouro_checked (root : String) : IO FsWalkResult :=
+    io_bind FsWalkResult FsWalkResult (fs_walk_checked root)
+      (fun (walked : FsWalkResult) =>
+        io_pure FsWalkResult
+          (fs_walk_map (filter String path_ends_ouro) walked));

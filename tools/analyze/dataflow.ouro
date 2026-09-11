@@ -1,0 +1,290 @@
+-- Dataflow is local to one definition body; cross-definition facts belong to
+-- the host runner. Binder ids are lexer intern ids, so `_` is Z and names the
+-- source spelt with a leading underscore arrive in `discards`.
+
+-- @entry analyze_dataflow
+-- @entry df_count_uses
+
+import "../../std/data.ouro";
+import "../../std/listx.ouro";
+import "../../std/natx.ouro";
+import "ast.ouro";
+
+-- definition parameter never read; let binding never read; let bound to a
+-- bare variable; hole in a value position.
+inductive DfIssue : Type :=
+  | IUnusedParam : Nat -> DfIssue
+  | IDeadStore : Nat -> DfIssue
+  | IAlias : Nat -> DfIssue
+  | IHoleFlow : Nat -> DfIssue;
+
+def df_inil : List DfIssue := [];
+
+def df_icons (i : DfIssue) (is : List DfIssue) : List DfIssue :=
+    Cons DfIssue i is;
+
+def df_append (xs : List DfIssue) (ys : List DfIssue) : List DfIssue :=
+    append DfIssue xs ys;
+
+-- Free occurrences of `target`, shadowing-aware: a rebinding hides the outer
+-- variable in the subtree it scopes over. Fix parameters scope over the
+-- return type and body; branch and clause binders over their body.
+def df_count_uses (target : Nat) : Ast -> Nat :=
+  fun (root : Ast) =>
+    (fix df_count_uses (fuel : Nat) (a : Ast) : Nat :=
+      match fuel with
+      | Z => Z
+      | S remaining =>
+          let descend : Ast -> Nat :=
+            fun (child : Ast) => df_count_uses remaining child in
+          match a with
+          | AVar id => match eq_nat id target with | True => S Z | False => Z end
+          | AHole _ => Z
+          | ASort _ => Z
+          | ANatLit _ => Z
+          | AStr _ => Z
+          | AApp f x => add (descend f) (descend x)
+          | ALam id ann body =>
+              add (descend ann)
+                (match eq_nat id target with
+                 | True => Z
+                 | False => descend body
+                 end)
+          | APi id dom cod =>
+              add (descend dom)
+                (match eq_nat id target with
+                 | True => Z
+                 | False => descend cod
+                 end)
+          | ALet id ann v body =>
+              add (descend ann)
+                (add (descend v)
+                  (match eq_nat id target with
+                   | True => Z
+                   | False => descend body
+                   end))
+          | AAscribe e t => add (descend e) (descend t)
+          | ABinder id ty rest =>
+              add (descend ty)
+                (match eq_nat id target with
+                 | True => Z
+                 | False => descend rest
+                 end)
+          | ANoBinder => Z
+          | AFix r binders ret body =>
+              match eq_nat r target with
+              | True => Z
+              | False =>
+                  add (descend binders)
+                    (match mem Nat eq_nat target (ast_binder_ids binders) with
+                     | True => Z
+                     | False => add (descend ret) (descend body)
+                     end)
+              end
+          | ABranch _ ids body rest =>
+              add
+                (match mem Nat eq_nat target ids with
+                 | True => Z
+                 | False => descend body
+                 end)
+                (descend rest)
+          | ANoBranch => Z
+          | AMatch scrut branches => add (descend scrut) (descend branches)
+          | APerform _ args => ast_sum (map Ast Nat descend args)
+          | AHandle inner cls => add (descend inner) (descend cls)
+          | AClause _ ids body rest =>
+              add
+                (match mem Nat eq_nat target ids with
+                 | True => Z
+                 | False => descend body
+                 end)
+                (descend rest)
+          | ANoClause => Z
+          | ADo xs => ast_sum (map Ast Nat descend xs)
+          | AList xs => ast_sum (map Ast Nat descend xs)
+          end
+      end) (ast_size root) root;
+
+-- Count one parameter in its own suffix, not in the complete telescope.
+-- Its annotation precedes its scope. A later binder's annotation still sees
+-- it, but rebinding the same interned name masks it in the return/body.
+def df_fix_scope_uses (id : Nat) (rest : Ast) (ret : Ast) (body : Ast) : Nat :=
+    add (df_count_uses id rest)
+      (match mem Nat eq_nat id (ast_binder_ids rest) with
+       | True => Z
+       | False => add (df_count_uses id ret) (df_count_uses id body)
+       end);
+
+-- Ordered (binder id, free-use count) facts shared by dataflow and naming.
+-- Equal intern ids at different positions remain separate binder facts.
+def df_fix_param_uses : Ast -> Ast -> Ast -> List (Pair Nat Nat) :=
+  fix df_fix_param_uses (binders : Ast) (ret : Ast) (body : Ast)
+      : List (Pair Nat Nat) :=
+    match binders with
+    | ABinder id _ rest =>
+        Cons (Pair Nat Nat)
+          (MkPair Nat Nat id (df_fix_scope_uses id rest ret body))
+          (df_fix_param_uses rest ret body)
+    | AVar _ => []
+    | AHole _ => []
+    | ASort _ => []
+    | ANatLit _ => []
+    | AStr _ => []
+    | AApp _ _ => []
+    | ALam _ _ _ => []
+    | APi _ _ _ => []
+    | ALet _ _ _ _ => []
+    | AAscribe _ _ => []
+    | ANoBinder => []
+    | AFix _ _ _ _ => []
+    | ABranch _ _ _ _ => []
+    | ANoBranch => []
+    | AMatch _ _ => []
+    | APerform _ _ => []
+    | AHandle _ _ => []
+    | AClause _ _ _ _ => []
+    | ANoClause => []
+    | ADo _ => []
+    | AList _ => []
+    end;
+
+def df_unused (target : Nat) (scope : Ast) : Bool :=
+    match df_count_uses target scope with
+    | Z => True
+    | S _ => False
+    end;
+
+-- Ids that are wildcards or spelt as explicit discards are never reported.
+def df_reportable (discards : List Nat) (id : Nat) : Bool :=
+    match id with
+    | Z => False
+    | S _ => notb (mem Nat eq_nat id discards)
+    end;
+
+-- A let whose value is a bare name adds nothing the name did not already
+-- say. Literals are not aliases: a local name for a constant is how a magic
+-- value gets documented. `let! x := action; rest` arrives as a let whose body
+-- is the rest of the do block; x names the action's result, not the action.
+def df_is_alias (v : Ast) (body : Ast) : Bool :=
+    andb (ast_is tag_var (ast_peel_ascribe v)) (notb (ast_is tag_do body));
+
+def df_let_issues (discards : List Nat) (id : Nat) (v : Ast) (body : Ast)
+    : List DfIssue :=
+    match df_reportable discards id with
+    | False => df_inil
+    | True =>
+        match df_unused id body with
+        | True => df_icons (IDeadStore id) df_inil
+        | False =>
+            match df_is_alias v body with
+            | True => df_icons (IAlias id) df_inil
+            | False => df_inil
+            end
+        end
+    end;
+
+-- The declared type the unit ascribes to a definition binds the same
+-- parameters again (`(A : Type) (e : Empty) : A` is a Pi over A), so a
+-- shadowing-aware count sees nothing; any occurrence there reads the
+-- parameter.
+def df_typed_use (ty : Ast) (id : Nat) : Bool := ast_occurs id ty;
+
+-- Definition-level parameters: the fix telescope, or the leading lambdas of
+-- a non-recursive body. Type parameters count as used when a later binder
+-- type or the declared return type mentions them.
+def df_param_issues (discards : List Nat) : Ast -> Ast -> List DfIssue :=
+  fun (expected_type : Ast) (root : Ast) =>
+    (fix df_param_issues (fuel : Nat) (ty : Ast) (a : Ast) : List DfIssue :=
+      match fuel with
+      | Z => df_inil
+      | S remaining =>
+          let descend : Ast -> Ast -> List DfIssue :=
+            fun (next_ty : Ast) (child : Ast) => df_param_issues remaining next_ty child in
+          match a with
+          | AAscribe e t => descend t e
+          | ALam id _ann body =>
+              df_append
+                (match andb (df_reportable discards id)
+                  (andb (df_unused id body) (notb (df_typed_use ty id))) with
+                 | True => df_icons (IUnusedParam id) df_inil
+                 | False => df_inil
+                 end)
+                (descend ty body)
+          | AFix _ binders ret body =>
+              concat_map (Pair Nat Nat) DfIssue
+                (fun (use : Pair Nat Nat) =>
+                  match use with
+                  | MkPair id count =>
+                      match andb (df_reportable discards id)
+                        (andb (eq_nat count Z) (notb (df_typed_use ty id))) with
+                      | True => df_icons (IUnusedParam id) df_inil
+                      | False => df_inil
+                      end
+                  end)
+                (df_fix_param_uses binders ret body)
+          | AVar _ => df_inil
+          | AHole _ => df_inil
+          | ASort _ => df_inil
+          | ANatLit _ => df_inil
+          | AStr _ => df_inil
+          | AApp _ _ => df_inil
+          | APi _ _ _ => df_inil
+          | ALet _ _ _ _ => df_inil
+          | ABinder _ _ _ => df_inil
+          | ANoBinder => df_inil
+          | ABranch _ _ _ _ => df_inil
+          | ANoBranch => df_inil
+          | AMatch _ _ => df_inil
+          | APerform _ _ => df_inil
+          | AHandle _ _ => df_inil
+          | AClause _ _ _ _ => df_inil
+          | ANoClause => df_inil
+          | ADo _ => df_inil
+          | AList _ => df_inil
+          end
+      end) (ast_size root) expected_type root;
+
+-- Value-position walk: annotations and types are skipped, so a hole standing
+-- for an inferred type is not a hole flowing into a value.
+def df_value_issues (discards : List Nat) : Ast -> List DfIssue :=
+  fun (root : Ast) =>
+    (fix df_value_issues (fuel : Nat) (a : Ast) : List DfIssue :=
+      match fuel with
+      | Z => df_inil
+      | S remaining =>
+          let descend : Ast -> List DfIssue :=
+            fun (child : Ast) => df_value_issues remaining child in
+          match a with
+          | AHole id => df_icons (IHoleFlow id) df_inil
+          | AVar _ => df_inil
+          | ASort _ => df_inil
+          | ANatLit _ => df_inil
+          | AStr _ => df_inil
+          | AApp f x => df_append (descend f) (descend x)
+          | ALam _ _ body => descend body
+          | APi _ _ _ => df_inil
+          | ALet id _ v body =>
+              df_append (df_let_issues discards id v body)
+                (df_append (descend v) (descend body))
+          | AAscribe e _ => descend e
+          | ABinder _ _ _ => df_inil
+          | ANoBinder => df_inil
+          | AFix _ _ _ body => descend body
+          | ABranch _ _ body rest =>
+              df_append (descend body) (descend rest)
+          | ANoBranch => df_inil
+          | AMatch scrut branches =>
+              df_append (descend scrut) (descend branches)
+          | APerform _ args => concat_map Ast DfIssue descend args
+          | AHandle inner cls => df_append (descend inner) (descend cls)
+          | AClause _ _ body rest =>
+              df_append (descend body) (descend rest)
+          | ANoClause => df_inil
+          | ADo xs => concat_map Ast DfIssue descend xs
+          | AList xs => concat_map Ast DfIssue descend xs
+          end
+      end) (ast_size root) root;
+
+-- discards: intern ids whose source spelling starts with `_`.
+def analyze_dataflow (discards : List Nat) (a : Ast) : List DfIssue :=
+    df_append (df_param_issues discards ANoBinder a) (df_value_issues discards a);

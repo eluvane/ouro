@@ -1,0 +1,192 @@
+-- Successor and predecessor operate on every limb. They never cap a Nat at a
+-- machine width, and allocate a fresh canonical object before copying payload.
+import "managed_nat.ouro";
+
+def managed_nat_find_change (value : MirValue) (count : MirValue) (skip : MirValue) (state : ManagedState)
+    : Either NativeLowerError ManagedResult :=
+    lower_bind (Pair Nat ManagedState) ManagedResult (managed_fresh_local MirUSize state)
+      (fun (fresh : Pair Nat ManagedState) => match fresh with | MkPair index next =>
+        lower_bind LowerLoopBlocks ManagedResult (lower_loop_blocks (managed_flow next))
+          (fun (labels : LowerLoopBlocks) => match labels with | LowerLoopAt header body finish flow =>
+            lower_bind (Pair Nat ManagedState) ManagedResult
+              (managed_fresh_block (managed_emit (MirMove index (managed_bits MirUSize 0)) (managed_with_flow next flow)))
+              (fun (extra : Pair Nat ManagedState) => match extra with | MkPair advance ready =>
+                lower_bind ManagedResult ManagedResult (managed_compare MirLess (MirUse index) count
+                  (managed_switch_block header (MirJump header) ready))
+                  (fun (bounded : ManagedResult) => match bounded with | ManagedResultOf within after_test =>
+                    lower_bind ManagedResult ManagedResult (managed_nat_load_limb value (MirUse index)
+                      (managed_switch_block body (MirBranch within body finish) after_test))
+                      (fun (loaded : ManagedResult) => match loaded with | ManagedResultOf limb after_load =>
+                        lower_bind ManagedResult ManagedResult (managed_compare MirEqual limb skip after_load)
+                          (fun (tested : ManagedResult) => match tested with | ManagedResultOf again after_compare =>
+                            Right NativeLowerError ManagedResult (ManagedResultOf (MirUse index)
+                              (managed_switch_block finish (MirJump header)
+                                (managed_emit (MirBinaryOp index MirAdd (MirUse index) (managed_bits MirUSize 1))
+                                  (managed_switch_block advance (MirBranch again advance finish) after_compare))))
+                            end) end) end) end) end) end);
+
+def managed_nat_changed_limb (successor : Bool) (value : MirValue) (count : MirValue)
+    (index : MirValue) (state : ManagedState) : Either NativeLowerError ManagedResult :=
+    lower_bind (Pair Nat ManagedState) ManagedResult (managed_fresh_local MirU32 state)
+      (fun (fresh : Pair Nat ManagedState) => match fresh with | MkPair cell next =>
+        lower_bind ManagedResult ManagedResult (managed_compare MirLess index count
+          (managed_emit (MirMove cell (managed_bits MirU32 1)) next))
+          (fun (tested : ManagedResult) => match tested with | ManagedResultOf present after =>
+            lower_map ManagedState ManagedResult (fun (finish : ManagedState) => ManagedResultOf (MirUse cell) finish)
+              (managed_nat_when present (fun (entered : ManagedState) => lower_map ManagedResult ManagedState
+                (fun (loaded : ManagedResult) => match loaded with | ManagedResultOf limb ready =>
+                  managed_emit (MirBinaryOp cell (match successor with | True => MirAdd | False => MirSub end)
+                    limb (managed_bits MirU32 1)) ready end) (managed_nat_load_limb value index entered)) after) end) end);
+
+def managed_nat_result_count (successor : Bool) (count : MirValue) (index : MirValue)
+    (changed : MirValue) (state : ManagedState) : Either NativeLowerError ManagedResult :=
+    let resize : ManagedState -> Either NativeLowerError ManagedResult := fun (current : ManagedState) =>
+      match successor with
+      | True => managed_compare MirEqual index count current
+      | False => lower_bind ManagedResult ManagedResult
+          (managed_binary MirUSize MirAdd index (managed_bits MirUSize 1) current)
+          (fun (after_index : ManagedResult) => match after_index with | ManagedResultOf following next =>
+            lower_bind ManagedResult ManagedResult (managed_compare MirEqual following count next)
+              (fun (high : ManagedResult) => match high with | ManagedResultOf last after =>
+                lower_bind ManagedResult ManagedResult (managed_compare MirEqual changed (managed_bits MirU32 0) after)
+                  (fun (zero : ManagedResult) => match zero with | ManagedResultOf vanished ready =>
+                    managed_binary MirU8 MirAnd last vanished ready end) end) end) end in
+    lower_bind ManagedResult ManagedResult (resize state)
+      (fun (tested : ManagedResult) => match tested with | ManagedResultOf flag next =>
+        lower_bind ManagedResult ManagedResult (managed_convert MirUSize MirZeroExtend flag next)
+          (fun (extended : ManagedResult) => match extended with | ManagedResultOf delta after =>
+            managed_binary MirUSize (match successor with | True => MirAdd | False => MirSub end) count delta after end) end);
+
+def managed_nat_copy_limb (value : MirValue) (target : MirValue) (change : MirValue)
+    (changed : MirValue) (fill : MirValue) (index : MirValue) (state : ManagedState)
+    : Either NativeLowerError ManagedState :=
+    lower_bind (Pair Nat ManagedState) ManagedState (managed_fresh_local MirU32 state)
+      (fun (fresh : Pair Nat ManagedState) => match fresh with | MkPair cell next =>
+        lower_bind ManagedResult ManagedState (managed_compare MirGreaterEqual index change
+          (managed_emit (MirMove cell fill) next))
+          (fun (tested : ManagedResult) => match tested with | ManagedResultOf following after =>
+            lower_bind ManagedState ManagedState (managed_nat_when following (fun (entered : ManagedState) =>
+              lower_bind ManagedResult ManagedState (managed_compare MirGreater index change
+                (managed_emit (MirMove cell changed) entered))
+                (fun (beyond : ManagedResult) => match beyond with | ManagedResultOf unchanged ready =>
+                  managed_nat_when unchanged (fun (copied : ManagedState) => lower_map ManagedResult ManagedState
+                    (fun (loaded : ManagedResult) => match loaded with | ManagedResultOf limb complete =>
+                      managed_emit (MirMove cell limb) complete end) (managed_nat_load_limb value index copied)) ready end)) after)
+              (managed_nat_store_limb target index (MirUse cell)) end) end);
+
+def managed_nat_copy (value : MirValue) (target : MirValue) (count : MirValue)
+    (change : MirValue) (changed : MirValue) (fill : MirValue) (state : ManagedState)
+    : Either NativeLowerError ManagedState :=
+    lower_bind (Pair Nat ManagedState) ManagedState (managed_fresh_local MirUSize state)
+      (fun (fresh : Pair Nat ManagedState) => match fresh with | MkPair index next =>
+        lower_bind LowerLoopBlocks ManagedState (lower_loop_blocks (managed_flow next))
+          (fun (labels : LowerLoopBlocks) => match labels with | LowerLoopAt header body finish flow =>
+            lower_bind ManagedResult ManagedState (managed_compare MirLess (MirUse index) count
+              (managed_switch_block header (MirJump header)
+                (managed_emit (MirMove index (managed_bits MirUSize 0)) (managed_with_flow next flow))))
+              (fun (tested : ManagedResult) => match tested with | ManagedResultOf again after_test =>
+                lower_map ManagedState ManagedState (fun (copied : ManagedState) =>
+                  managed_switch_block finish (MirJump header)
+                    (managed_emit (MirBinaryOp index MirAdd (MirUse index) (managed_bits MirUSize 1)) copied))
+                  (managed_nat_copy_limb value target change changed fill (MirUse index)
+                    (managed_switch_block body (MirBranch again body finish) after_test)) end) end) end);
+
+def managed_nat_adjust (compiler : ManagedCompiler) (successor : Bool) (value : MirValue)
+    (count : MirValue) (state : ManagedState) : Either NativeLowerError ManagedResult :=
+    lower_bind ManagedResult ManagedResult (managed_nat_find_change value count
+      (match successor with | True => managed_nat_max_limb | False => managed_bits MirU32 0 end) state)
+      (fun (found : ManagedResult) => match found with | ManagedResultOf index next =>
+        lower_bind ManagedResult ManagedResult (managed_nat_changed_limb successor value count index next)
+          (fun (updated : ManagedResult) => match updated with | ManagedResultOf changed after =>
+            lower_bind ManagedResult ManagedResult (managed_nat_result_count successor count index changed after)
+              (fun (resized : ManagedResult) => match resized with | ManagedResultOf size ready =>
+                lower_bind ManagedResult ManagedResult (managed_nat_allocate compiler size ready)
+                  (fun (allocated : ManagedResult) => match allocated with | ManagedResultOf target after_alloc =>
+                    lower_map ManagedState ManagedResult (fun (finish : ManagedState) => ManagedResultOf target finish)
+                      (managed_nat_copy value target size index changed
+                        (match successor with | True => managed_bits MirU32 0 | False => managed_nat_max_limb end) after_alloc) end) end) end) end);
+
+def managed_nat_successor_body (compiler : ManagedCompiler) (value : MirValue) (state : ManagedState)
+    : Either NativeLowerError ManagedResult :=
+    lower_bind ManagedResult ManagedResult (managed_nat_count compiler value state)
+      (fun (loaded : ManagedResult) => match loaded with | ManagedResultOf count next =>
+        managed_nat_adjust compiler True value count next end);
+
+def managed_nat_predecessor_body (compiler : ManagedCompiler) (value : MirValue) (state : ManagedState)
+    : Either NativeLowerError ManagedResult :=
+    lower_bind ManagedResult ManagedResult (managed_nat_count compiler value state)
+      (fun (loaded : ManagedResult) => match loaded with | ManagedResultOf count next =>
+        lower_bind ManagedResult ManagedResult (managed_compare MirNotEqual count (managed_bits MirUSize 0) next)
+          (fun (tested : ManagedResult) => match tested with | ManagedResultOf nonzero after =>
+            lower_bind ManagedState ManagedResult (managed_guard nonzero after)
+              (managed_nat_adjust compiler False value count) end) end);
+
+def managed_nat_successor (compiler : ManagedCompiler) (value : MirValue) (state : ManagedState)
+    : Either NativeLowerError ManagedResult :=
+    managed_nat_helper ([111,117,114,111,95,110,97,116,95,115,117,99,99,101,115,115,111,114] : List Nat)
+      ([MirLocalDef 0 MirManagedPtr] : List MirLocal) ([value] : List MirValue) MirManagedPtr
+      (managed_nat_successor_body compiler (MirUse 0)) state;
+
+def managed_nat_predecessor (compiler : ManagedCompiler) (value : MirValue) (state : ManagedState)
+    : Either NativeLowerError ManagedResult :=
+    managed_nat_helper ([111,117,114,111,95,110,97,116,95,112,114,101,100,101,99,101,115,115,111,114] : List Nat)
+      ([MirLocalDef 0 MirManagedPtr] : List MirLocal) ([value] : List MirValue) MirManagedPtr
+      (managed_nat_predecessor_body compiler (MirUse 0)) state;
+
+-- Only syntactic Z/S spines are compacted. A nonliteral returns Nothing;
+-- exhausted traversal and malformed Nat constructor shapes remain errors.
+def managed_nat_literal (family : Nat) : Nat -> CoreTerm -> Either NativeLowerError (Maybe Nat) :=
+  fix recognize (fuel : Nat) (term : CoreTerm) : Either NativeLowerError (Maybe Nat) :=
+    match fuel with | Z => Left NativeLowerError (Maybe Nat) LowerResourceExhausted
+    | S next => match lower_term_view term with
+      | LowerConstructorTerm actual index parameters => match eqNat actual family with
+        | False => Right NativeLowerError (Maybe Nat) (Nothing Nat)
+        | True => lower_map Unit (Maybe Nat) (fun (_ : Unit) => Just Nat 0)
+            (lower_require (andb (eqNat index 0) (eqNat parameters 0)) (LowerInvalidCall family)) end
+      | LowerApplyTerm head argument => match lower_term_view head with
+        | LowerConstructorTerm actual index parameters => match eqNat actual family with
+          | False => Right NativeLowerError (Maybe Nat) (Nothing Nat)
+          | True => lower_bind Unit (Maybe Nat)
+              (lower_require (andb (eqNat index 1) (eqNat parameters 0)) (LowerInvalidCall family))
+              (fun (_ : Unit) => lower_map (Maybe Nat) (Maybe Nat) (fun (tail : Maybe Nat) =>
+                match tail with | Nothing => Nothing Nat | Just value => Just Nat (S value) end) (recognize next argument)) end
+        | LowerLocalTerm _ => Right NativeLowerError (Maybe Nat) (Nothing Nat)
+        | LowerLambdaTerm _ _ => Right NativeLowerError (Maybe Nat) (Nothing Nat)
+        | LowerApplyTerm _ _ => Right NativeLowerError (Maybe Nat) (Nothing Nat)
+        | LowerLetTerm _ _ _ => Right NativeLowerError (Maybe Nat) (Nothing Nat)
+        | LowerGlobalTerm _ => Right NativeLowerError (Maybe Nat) (Nothing Nat)
+        | LowerCaseTerm _ _ _ _ => Right NativeLowerError (Maybe Nat) (Nothing Nat)
+        | LowerOtherTerm _ => Right NativeLowerError (Maybe Nat) (Nothing Nat) end
+      | LowerLocalTerm _ => Right NativeLowerError (Maybe Nat) (Nothing Nat)
+      | LowerLambdaTerm _ _ => Right NativeLowerError (Maybe Nat) (Nothing Nat)
+      | LowerLetTerm _ _ _ => Right NativeLowerError (Maybe Nat) (Nothing Nat)
+      | LowerGlobalTerm _ => Right NativeLowerError (Maybe Nat) (Nothing Nat)
+      | LowerCaseTerm _ _ _ _ => Right NativeLowerError (Maybe Nat) (Nothing Nat)
+      | LowerOtherTerm _ => Right NativeLowerError (Maybe Nat) (Nothing Nat) end end;
+
+def managed_nat_literal_value (compiler : ManagedCompiler) (value : Nat) (state : ManagedState)
+    : Either NativeLowerError ManagedResult :=
+    lower_bind Unit ManagedResult (lower_require (leb_nat value pe_max_rva) LowerResourceExhausted)
+      (fun (_ : Unit) => let zero : Bool := eqNat value 0 in
+        lower_map ManagedResult ManagedResult (fun (allocated : ManagedResult) => match allocated with
+          | ManagedResultOf natural next => let counted : ManagedState := managed_emit
+              (MirStore natural (codegen_disp 32) (managed_bits MirUSize (match zero with | True => 0 | False => 1 end))) next in
+            ManagedResultOf natural (match zero with | True => counted | False => managed_emit
+              (MirStore natural (codegen_disp 40) (managed_bits MirU32 value)) counted end) end)
+          (managed_allocate_value compiler 8 (match zero with | True => 40 | False => 48 end) state));
+
+def managed_nat_constructor (compiler : ManagedCompiler) (step : ManagedStep) (scope : ManagedScope)
+    (fuel : Nat) (family : Nat) (index : Nat) (parameters : Nat) (arguments : List CoreTerm) (state : ManagedState)
+    : Either NativeLowerError ManagedResult :=
+    lower_bind Unit ManagedResult (lower_require (eqNat parameters 0) (LowerInvalidCall family))
+      (fun (_ : Unit) => match index with
+        | Z => lower_bind Unit ManagedResult (lower_require (eqNat (length CoreTerm arguments) 0) (LowerInvalidCall family))
+            (fun (_ : Unit) => managed_nat_literal_value compiler 0 state)
+        | S previous => lower_bind Unit ManagedResult (lower_require (eqNat previous 0) (LowerInvalidCall family))
+            (fun (_ : Unit) => lower_bind CoreTerm ManagedResult (lower_single CoreTerm arguments)
+              (fun (argument : CoreTerm) => lower_bind (Maybe Nat) ManagedResult (managed_nat_literal family fuel argument)
+                (fun (literal : Maybe Nat) => match literal with
+                  | Just value => managed_nat_literal_value compiler (S value) state
+                  | Nothing => lower_bind ManagedResult ManagedResult (step scope argument state)
+                      (fun (evaluated : ManagedResult) => match evaluated with | ManagedResultOf value next =>
+                        managed_nat_successor compiler value next end) end))) end);

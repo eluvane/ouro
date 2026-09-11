@@ -1,0 +1,265 @@
+-- Small process/CLI helpers are wrappers over std/io and std/args.
+
+import "args.ouro";
+import "format.ouro";
+import "io.ouro";
+
+inductive ProcessError : Type :=
+  | ProcessFailed : String -> Nat -> String -> ProcessError;
+
+def process_error_code (e : ProcessError) : String :=
+    match e with
+    | ProcessFailed _ _ _ => "process_failed"
+    end;
+
+def process_error_command (e : ProcessError) : String :=
+    match e with
+    | ProcessFailed cmd _ _ => cmd
+    end;
+
+def process_error_status (e : ProcessError) : Nat :=
+    match e with
+    | ProcessFailed _ status _ => status
+    end;
+
+def process_error_stderr (e : ProcessError) : String :=
+    match e with
+    | ProcessFailed _ _ err => err
+    end;
+
+def process_error_message (e : ProcessError) : String :=
+    match e with
+    | ProcessFailed cmd status err =>
+        str_cat4 "process failed: " cmd " exit=" (str_concat (show_nat status) (str_concat " stderr=" err))
+    end;
+
+def process_argv : IO (List String) := argv;
+
+def process_args : IO Args :=
+    io_bind (List String) Args argv
+      (fun (ws : List String) => io_pure Args (args_of_argv ws));
+
+def process_env (name : String) : IO (Maybe String) := env_get name;
+
+def process_env_or (name : String) (fallback : String) : IO String :=
+    env_or name fallback;
+
+def process_exit (code : Nat) : IO Unit := exit code;
+
+def process_stdout (s : String) : IO Unit := print s;
+
+def process_stderr (s : String) : IO Unit := eprint s;
+
+def process_out_line (s : String) : IO Unit := println s;
+
+def process_err_line (s : String) : IO Unit := eprintln s;
+
+def process_run (cmd : String) (cmd_args : List String) : IO ProcResult :=
+    proc_exec cmd cmd_args;
+
+def process_run_checked (cmd : String) (cmd_args : List String) : IO (Either ProcessError ProcResult) :=
+    io_bind ProcResult (Either ProcessError ProcResult) (proc_exec cmd cmd_args)
+      (fun (r : ProcResult) =>
+        match proc_ok r with
+        | True => io_pure (Either ProcessError ProcResult) (Right ProcessError ProcResult r)
+        | False =>
+            io_pure (Either ProcessError ProcResult)
+              (Left ProcessError ProcResult
+                (ProcessFailed cmd (proc_code r) (proc_stderr r)))
+        end);
+
+-- Foreground execution inherits stdin/stdout/stderr, current directory and
+-- environment. A successful wait returns every child exit code unchanged.
+-- Setup/wait errors are separate from a nonzero child exit.
+inductive ProcessRunError : Type :=
+  | ProcessUnavailable : String -> Nat -> ProcessRunError
+  | ProcessExited : String -> Nat -> ProcessRunError;
+
+def process_run_error_code (error : ProcessRunError) : String :=
+    match error with
+    | ProcessUnavailable _ _ => "process_unavailable"
+    | ProcessExited _ _ => "process_exit" end;
+
+def process_run_error_status (error : ProcessRunError) : Nat :=
+    match error with | ProcessUnavailable _ status => status | ProcessExited _ status => status end;
+
+def process_run_error_message (error : ProcessRunError) : String :=
+    match error with
+    | ProcessUnavailable command status =>
+        str_cat4 "process unavailable: " command " OS error=" (show_nat status)
+    | ProcessExited command status =>
+        str_cat4 "process failed: " command " exit=" (show_nat status) end;
+
+def process_run_inherited (command : String) (arguments : List String) : IO (Either ProcessRunError Nat) :=
+    io_bind (Pair Nat Nat) (Either ProcessRunError Nat) (prim_process_inherit command arguments)
+      (fun (result : Pair Nat Nat) => match result with | MkPair status code =>
+        io_pure (Either ProcessRunError Nat) (match eq_nat status 0 with
+          | True => Right ProcessRunError Nat code
+          | False => Left ProcessRunError Nat (ProcessUnavailable command status) end) end);
+
+def process_run_inherited_checked (command : String) (arguments : List String) : IO (Either ProcessRunError Nat) :=
+    io_bind (Either ProcessRunError Nat) (Either ProcessRunError Nat) (process_run_inherited command arguments)
+      (fun (result : Either ProcessRunError Nat) => io_pure (Either ProcessRunError Nat)
+        (match result with
+        | Left error => Left ProcessRunError Nat error
+        | Right code => match eq_nat code 0 with
+            | True => Right ProcessRunError Nat code
+            | False => Left ProcessRunError Nat (ProcessExited command code) end end));
+
+-- Captured execution with one contained process tree. Zero stream cap means
+-- that stream must remain empty. CPU count 1 is the supported initial policy.
+inductive ProcessCaptureLimits : Type :=
+  | ProcessCaptureLimitsOf : Nat -> Nat -> Nat -> Nat -> Nat -> ProcessCaptureLimits;
+
+inductive ProcessCaptureLimitField : Type :=
+  | CaptureTimeoutLimit : ProcessCaptureLimitField
+  | CaptureMemoryLimit : ProcessCaptureLimitField
+  | CaptureCpuLimit : ProcessCaptureLimitField
+  | CaptureStdoutLimit : ProcessCaptureLimitField
+  | CaptureStderrLimit : ProcessCaptureLimitField;
+
+inductive ProcessCaptureStream : Type :=
+  | CaptureStdout : ProcessCaptureStream | CaptureStderr : ProcessCaptureStream;
+
+inductive ProcessCaptureResult : Type :=
+  | ProcessCaptureResultOf : ProcResult -> Nat -> ProcessCaptureResult;
+
+inductive ProcessCaptureError : Type :=
+  | ProcessCaptureInvalidLimits : ProcessCaptureLimitField -> ProcessCaptureError
+  | ProcessCaptureOsError : Nat -> ProcessCaptureError
+  | ProcessCaptureTimedOut : Nat -> String -> String -> ProcessCaptureError
+  | ProcessCaptureCleanupFailed : Nat -> ProcessCaptureError
+  | ProcessCaptureResourceLimit : Nat -> Nat -> String -> String -> ProcessCaptureError
+  | ProcessCaptureOutputLimit : ProcessCaptureStream -> Nat -> Nat -> ProcessCaptureError
+  | ProcessCaptureProtocolError : Nat -> ProcessCaptureError;
+
+def process_capture_proc_result (result : ProcessCaptureResult) : ProcResult :=
+    match result with | ProcessCaptureResultOf process _ => process end;
+
+def process_capture_peak_bytes (result : ProcessCaptureResult) : Nat :=
+    match result with | ProcessCaptureResultOf _ peak => peak end;
+
+def process_capture_default_limits (timeout_ms : Nat) (stdout_bytes : Nat) (stderr_bytes : Nat)
+    : ProcessCaptureLimits :=
+    ProcessCaptureLimitsOf timeout_ms (mul 12 256) 1 stdout_bytes stderr_bytes;
+
+def process_capture_limit_name (field : ProcessCaptureLimitField) : String :=
+    match field with
+    | CaptureTimeoutLimit => "timeout_ms" | CaptureMemoryLimit => "memory_mib"
+    | CaptureCpuLimit => "cpu_count" | CaptureStdoutLimit => "stdout_bytes"
+    | CaptureStderrLimit => "stderr_bytes" end;
+
+def process_capture_error_code (error : ProcessCaptureError) : String :=
+    match error with
+    | ProcessCaptureInvalidLimits _ => "process_capture_limits"
+    | ProcessCaptureOsError _ => "process_capture_os"
+    | ProcessCaptureTimedOut _ _ _ => "process_capture_timeout"
+    | ProcessCaptureCleanupFailed _ => "process_capture_cleanup"
+    | ProcessCaptureResourceLimit _ _ _ _ => "process_capture_resource"
+    | ProcessCaptureOutputLimit _ _ _ => "process_capture_output_limit"
+    | ProcessCaptureProtocolError _ => "process_capture_protocol" end;
+
+def process_capture_error_message (error : ProcessCaptureError) : String :=
+    match error with
+    | ProcessCaptureInvalidLimits field => str_concat "invalid captured-process limit: " (process_capture_limit_name field)
+    | ProcessCaptureOsError code => str_concat "captured process OS error=" (show_nat code)
+    | ProcessCaptureTimedOut milliseconds _ _ => str_cat4 "captured process timeout=" (show_nat milliseconds) " ms" ""
+    | ProcessCaptureCleanupFailed code => str_concat "captured process cleanup error=" (show_nat code)
+    | ProcessCaptureResourceLimit event peak _ _ => str_cat4 "captured process memory event=" (show_nat event) " peak_bytes=" (show_nat peak)
+    | ProcessCaptureOutputLimit stream limit actual =>
+        str_cat4 (match stream with | CaptureStdout => "stdout bytes=" | CaptureStderr => "stderr bytes=" end)
+          (show_nat actual) " exceeds cap=" (show_nat limit)
+    | ProcessCaptureProtocolError kind => str_concat "invalid captured-process outcome=" (show_nat kind) end;
+
+def process_capture_word_base : Nat := mul 256 256;
+def process_capture_u32_bound : Nat := pow_nat 2 32;
+def process_capture_u64_bound : Nat := pow_nat 2 64;
+
+def process_capture_limits_error (limits : ProcessCaptureLimits) : Maybe ProcessCaptureLimitField :=
+    match limits with | ProcessCaptureLimitsOf timeout memory cpu output error =>
+      match andb (ltb_nat 0 timeout) (ltb_nat timeout (sub process_capture_u32_bound 1)) with
+      | False => Just ProcessCaptureLimitField CaptureTimeoutLimit
+      | True => match andb (ltb_nat 0 memory) (ltb_nat memory (pow_nat 2 44)) with
+        | False => Just ProcessCaptureLimitField CaptureMemoryLimit
+        | True => match eq_nat cpu 1 with
+          | False => Just ProcessCaptureLimitField CaptureCpuLimit
+          | True => match ltb_nat output (sub process_capture_u64_bound 47) with
+            | False => Just ProcessCaptureLimitField CaptureStdoutLimit
+            | True => match ltb_nat error (sub process_capture_u64_bound 47) with
+              | False => Just ProcessCaptureLimitField CaptureStderrLimit
+              | True => Nothing ProcessCaptureLimitField end end end end end end;
+
+def process_capture_limits_pair (limits : ProcessCaptureLimits) : Pair Nat (Pair Nat (Pair Nat (Pair Nat Nat))) :=
+    match limits with | ProcessCaptureLimitsOf timeout memory cpu output error =>
+      MkPair Nat (Pair Nat (Pair Nat (Pair Nat Nat))) timeout
+        (MkPair Nat (Pair Nat (Pair Nat Nat)) memory
+          (MkPair Nat (Pair Nat Nat) cpu (MkPair Nat Nat output error))) end;
+
+def process_capture_request (limits : ProcessCaptureLimits) (input : String)
+    : Pair String (Pair Nat (Pair Nat (Pair Nat (Pair Nat Nat)))) :=
+    MkPair String (Pair Nat (Pair Nat (Pair Nat (Pair Nat Nat)))) input (process_capture_limits_pair limits);
+
+def process_capture_invalid_field (field : Nat) : ProcessCaptureError :=
+    match eq_nat field 1 with | True => ProcessCaptureInvalidLimits CaptureTimeoutLimit | False =>
+      match eq_nat field 2 with | True => ProcessCaptureInvalidLimits CaptureMemoryLimit | False =>
+        match eq_nat field 3 with | True => ProcessCaptureInvalidLimits CaptureCpuLimit | False =>
+          match eq_nat field 4 with | True => ProcessCaptureInvalidLimits CaptureStdoutLimit | False =>
+            match eq_nat field 5 with | True => ProcessCaptureInvalidLimits CaptureStderrLimit
+            | False => ProcessCaptureProtocolError field end end end end end;
+
+def process_capture_decode (limits : ProcessCaptureLimits)
+    (reply : Pair Nat (Pair Nat (Pair Nat (Pair String String))))
+    : Either ProcessCaptureError ProcessCaptureResult :=
+    match limits with | ProcessCaptureLimitsOf timeout memory cpu output_limit error_limit =>
+      match reply with | MkPair kind rest => match rest with | MkPair detail observed =>
+        match observed with | MkPair peak streams => match streams with | MkPair output error =>
+          match eq_nat kind 0 with
+          | True => match ltb_nat detail process_capture_u32_bound with
+            | True => Right ProcessCaptureError ProcessCaptureResult
+                (ProcessCaptureResultOf (MkProcResult detail output error) peak)
+            | False => Left ProcessCaptureError ProcessCaptureResult (ProcessCaptureProtocolError kind) end
+          | False => Left ProcessCaptureError ProcessCaptureResult
+              (match eq_nat kind 1 with | True => ProcessCaptureOsError detail | False =>
+                match eq_nat kind 2 with | True => ProcessCaptureTimedOut timeout output error | False =>
+                  match eq_nat kind 3 with | True => ProcessCaptureCleanupFailed detail | False =>
+                    match eq_nat kind 4 with | True => process_capture_invalid_field detail | False =>
+                      match eq_nat kind 5 with | True => ProcessCaptureResourceLimit detail peak output error | False =>
+                        match eq_nat kind 6 with | True => ProcessCaptureOutputLimit CaptureStdout output_limit detail | False =>
+                          match eq_nat kind 7 with | True => ProcessCaptureOutputLimit CaptureStderr error_limit detail
+                          | False => ProcessCaptureProtocolError kind end end end end end end end)
+          end end end end end end;
+
+-- Keep malformed bridge results fail-closed as well. Stream lengths and peak
+-- are checked independently from the child's expected exit code.
+def process_capture_decode_checked (limits : ProcessCaptureLimits)
+    (reply : Pair Nat (Pair Nat (Pair Nat (Pair String String))))
+    : Either ProcessCaptureError ProcessCaptureResult :=
+    match limits with | ProcessCaptureLimitsOf timeout memory cpu output_limit error_limit =>
+      match reply with | MkPair kind rest => match rest with | MkPair detail observed =>
+        match observed with | MkPair peak streams => match streams with | MkPair output error =>
+          match ltb_nat output_limit (str_len output) with
+          | True => Left ProcessCaptureError ProcessCaptureResult
+              (ProcessCaptureOutputLimit CaptureStdout output_limit (str_len output))
+          | False => match ltb_nat error_limit (str_len error) with
+            | True => Left ProcessCaptureError ProcessCaptureResult
+                (ProcessCaptureOutputLimit CaptureStderr error_limit (str_len error))
+            | False => match ltb_nat (mul memory (mul 16 process_capture_word_base)) peak with
+              | True => Left ProcessCaptureError ProcessCaptureResult (ProcessCaptureResourceLimit 10 peak output error)
+              | False => process_capture_decode limits reply end end end
+        end end end end end;
+
+def process_run_captured_bounded_with_input (limits : ProcessCaptureLimits) (command : String)
+    (arguments : List String) (input : String)
+    : IO (Either ProcessCaptureError ProcessCaptureResult) :=
+    match process_capture_limits_error limits with
+    | Just field => io_pure (Either ProcessCaptureError ProcessCaptureResult)
+        (Left ProcessCaptureError ProcessCaptureResult (ProcessCaptureInvalidLimits field))
+    | Nothing => io_bind (Pair Nat (Pair Nat (Pair Nat (Pair String String))))
+        (Either ProcessCaptureError ProcessCaptureResult)
+        (prim_process_capture_bounded command arguments (process_capture_request limits input))
+        (fun (reply : Pair Nat (Pair Nat (Pair Nat (Pair String String)))) =>
+          io_pure (Either ProcessCaptureError ProcessCaptureResult) (process_capture_decode_checked limits reply)) end;
+
+def process_run_captured_bounded (limits : ProcessCaptureLimits) (command : String) (arguments : List String)
+    : IO (Either ProcessCaptureError ProcessCaptureResult) :=
+    process_run_captured_bounded_with_input limits command arguments "";

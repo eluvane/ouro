@@ -1,0 +1,240 @@
+-- SHA-256 and HMAC-SHA256 in Ouro. Word32 ops come from std/word.ouro
+-- (host-fast at emit). Not a TLS stack and not a C digest primitive.
+
+import "word.ouro";
+import "bytes.ouro";
+
+def n64 : Nat := mul 32 2;
+def n48 : Nat := add 32 16;
+def n56 : Nat := add n48 8;
+def b80 : Nat := mul 16 8;
+def b36 : Nat := add 32 22;
+def b5c : Nat := add 64 28;
+
+def sha256_h0_hex : String :=
+    "6a09e667bb67ae853c6ef372a54ff53a510e527f9b05688c1f83d9ab5be0cd19";
+
+def sha256_k_hex : String :=
+    "428a2f9871374491b5c0fbcfe9b5dba53956c25b59f111f1923f82a4ab1c5ed5d807aa9812835b01243185be550c7dc372be5d7480deb1fe9bdc06a7c19bf174e49b69c1efbe47860fc19dc6240ca1cc2de92c6f4a7484aa5cb0a9dc76f988da983e5152a831c66db00327c8bf597fc7c6e00bf3d5a7914706ca63511429296727b70a852e1b21384d2c6dfc53380d13650a7354766a0abb81c2c92e92722c85a2bfe8a1a81a664bc24b8b70c76c51a3d192e819d6990624f40e3585106aa07019a4c1161e376c082748774c34b0bcb5391c0cb34ed8aa4a5b9cca4f682e6ff3748f82ee78a5636f84c878148cc7020890befffaa4506cebbef9a3f7c67178f2";
+
+def pack_words : List Nat -> List Nat :=
+  fix pack_words (bs : List Nat) : List Nat :=
+    match bs with
+    | Nil => Nil Nat
+    | Cons a rest =>
+      match rest with
+      | Nil => Nil Nat
+      | Cons b rest2 =>
+        match rest2 with
+        | Nil => Nil Nat
+        | Cons c rest3 =>
+          match rest3 with
+          | Nil => Nil Nat
+          | Cons d rest4 =>
+            Cons Nat (w32_of_bytes a b c d) (pack_words rest4)
+          end
+        end
+      end
+    end;
+
+def words_of_hex (hex : String) : List Nat :=
+    match hex_decode (str_codes hex) with
+    | Nothing => Nil Nat
+    | Just bs => pack_words bs
+    end;
+
+def sha256_k : List Nat := words_of_hex sha256_k_hex;
+def sha256_iv : List Nat := words_of_hex sha256_h0_hex;
+
+def take_fuel (A : Type) : Nat -> List A -> List A :=
+  fix take_fuel (n : Nat) (xs : List A) : List A :=
+    match n with
+    | Z => Nil A
+    | S n2 =>
+      match xs with
+      | Nil => Nil A
+      | Cons x rest => Cons A x (take_fuel n2 rest)
+      end
+    end;
+
+def drop_fuel (A : Type) : Nat -> List A -> List A :=
+  fix drop_fuel (n : Nat) (xs : List A) : List A :=
+    match n with
+    | Z => xs
+    | S n2 =>
+      match xs with
+      | Nil => Nil A
+      | Cons _ rest => drop_fuel n2 rest
+      end
+    end;
+
+def be64_len (bitlen : Nat) : List Nat :=
+    [ Z
+    , Z
+    , Z
+    , Z
+    , w32_b0 bitlen
+    , w32_b1 bitlen
+    , w32_b2 bitlen
+    , w32_b3 bitlen
+    ];
+
+def sha256_pad (bs : List Nat) : List Nat :=
+    let n : Nat := length Nat bs in
+    let with1 : List Nat := append Nat bs [b80] in
+    let rem : Nat := mod_nat (length Nat with1) n64 in
+    let zeros : Nat :=
+      match leb_nat rem n56 with
+      | True => sub n56 rem
+      | False => add (sub n64 rem) n56
+      end in
+    append Nat (append Nat with1 (replicate Nat Z zeros)) (be64_len (mul n 8));
+
+def ch32 (e : Nat) (f : Nat) (g : Nat) : Nat :=
+    xor32 (and32 e f) (and32 (not32 e) g);
+
+def maj32 (a : Nat) (b : Nat) (c : Nat) : Nat :=
+    xor32 (xor32 (and32 a b) (and32 a c)) (and32 b c);
+
+def sig0 (x : Nat) : Nat :=
+    xor32 (xor32 (rotr32 x 7) (rotr32 x 18)) (shr32 x 3);
+
+def sig1 (x : Nat) : Nat :=
+    xor32 (xor32 (rotr32 x 17) (rotr32 x 19)) (shr32 x 10);
+
+def sum0 (x : Nat) : Nat :=
+    xor32 (xor32 (rotr32 x 2) (rotr32 x 13)) (rotr32 x 22);
+
+def sum1 (x : Nat) : Nat :=
+    xor32 (xor32 (rotr32 x 6) (rotr32 x 11)) (rotr32 x 25);
+
+inductive ShaSt : Type :=
+  | MkSha : Nat -> Nat -> Nat -> Nat -> Nat -> Nat -> Nat -> Nat -> ShaSt;
+
+def sha_from_list (xs : List Nat) : ShaSt :=
+    MkSha (nth Nat Z Z xs) (nth Nat Z 1 xs) (nth Nat Z 2 xs)
+      (nth Nat Z 3 xs) (nth Nat Z 4 xs) (nth Nat Z 5 xs)
+      (nth Nat Z 6 xs) (nth Nat Z 7 xs);
+
+def sha_to_bytes (st : ShaSt) : List Nat :=
+    match st with
+    | MkSha a b c d e f g h =>
+      append Nat
+        (append Nat
+          [ w32_b0 a
+          , w32_b1 a
+          , w32_b2 a
+          , w32_b3 a
+          , w32_b0 b
+          , w32_b1 b
+          , w32_b2 b
+          , w32_b3 b
+          , w32_b0 c
+          , w32_b1 c
+          , w32_b2 c
+          , w32_b3 c
+          , w32_b0 d
+          , w32_b1 d
+          , w32_b2 d
+          , w32_b3 d
+          ]
+          [ w32_b0 e
+          , w32_b1 e
+          , w32_b2 e
+          , w32_b3 e
+          , w32_b0 f
+          , w32_b1 f
+          , w32_b2 f
+          , w32_b3 f
+          ])
+        [ w32_b0 g
+        , w32_b1 g
+        , w32_b2 g
+        , w32_b3 g
+        , w32_b0 h
+        , w32_b1 h
+        , w32_b2 h
+        , w32_b3 h
+        ]
+    end;
+
+def w_at (ws : List Nat) (i : Nat) : Nat := nth Nat Z i ws;
+
+def w_extend (w0 : List Nat) : List Nat :=
+    (fix go (fuel : Nat) (acc : List Nat) : List Nat :=
+      match fuel with
+      | Z => acc
+      | S fuel2 =>
+        let i : Nat := length Nat acc in
+        let s0 : Nat := sig0 (w_at acc (sub i 15)) in
+        let s1 : Nat := sig1 (w_at acc (sub i 2)) in
+        let wt : Nat :=
+          add32 (add32 (w_at acc (sub i 16)) s0)
+            (add32 (w_at acc (sub i 7)) s1) in
+        go fuel2 (append Nat acc [wt])
+      end) n48 w0;
+
+def sha_round (k : Nat) (w : Nat) (st : ShaSt) : ShaSt :=
+    match st with
+    | MkSha a b c d e f g h =>
+      let t1 : Nat := h |> add32 (sum1 e) |> add32 (ch32 e f g) |> add32 k |> add32 w in
+      let t2 : Nat := add32 (sum0 a) (maj32 a b c) in
+      MkSha (add32 t1 t2) a b c (add32 d t1) e f g
+    end;
+
+def sha_compress (st : ShaSt) (block : List Nat) : ShaSt :=
+    let w : List Nat := w_extend (pack_words block) in
+    let mid : ShaSt :=
+      (fix go (fuel : Nat) (i : Nat) (cur : ShaSt) : ShaSt :=
+        match fuel with
+        | Z => cur
+        | S fuel2 =>
+          go fuel2 (S i)
+            (sha_round (w_at sha256_k i) (w_at w i) cur)
+        end) n64 Z st in
+    match st with
+    | MkSha a0 b0 c0 d0 e0 f0 g0 h0 =>
+      match mid with
+      | MkSha a b c d e f g h =>
+        MkSha (add32 a0 a) (add32 b0 b) (add32 c0 c) (add32 d0 d)
+          (add32 e0 e) (add32 f0 f) (add32 g0 g) (add32 h0 h)
+      end
+    end;
+
+def sha_blocks : Nat -> List Nat -> ShaSt -> ShaSt :=
+  fix sha_blocks (fuel : Nat) (bs : List Nat) (st : ShaSt) : ShaSt :=
+    match fuel with
+    | Z => st
+    | S fuel2 =>
+      match bs with
+      | Nil => st
+      | Cons _ _ =>
+        sha_blocks fuel2 (drop_fuel Nat n64 bs)
+          (sha_compress st (take_fuel Nat n64 bs))
+      end
+    end;
+
+def sha256_bytes (bs : List Nat) : List Nat :=
+    let padded : List Nat := sha256_pad bs in
+    let blocks : Nat := add 1 (div_nat (length Nat padded) n64) in
+    sha_to_bytes (sha_blocks blocks padded (sha_from_list sha256_iv));
+
+def sha256 (s : String) : String :=
+    str_of_codes (hex_encode (sha256_bytes (str_codes s)));
+
+def key_block (key : List Nat) : List Nat :=
+    let k : List Nat :=
+      match leb_nat (length Nat key) n64 with
+      | True => key
+      | False => sha256_bytes key
+      end in
+    append Nat k (replicate Nat Z (sub n64 (length Nat k)));
+
+def hmac_sha256_bytes (key : List Nat) (msg : List Nat) : List Nat :=
+    let k : List Nat := key_block key in
+    let ipad : List Nat := zip_with Nat Nat Nat xor_byte k (replicate Nat b36 n64) in
+    let opad : List Nat := zip_with Nat Nat Nat xor_byte k (replicate Nat b5c n64) in
+    sha256_bytes (append Nat opad (sha256_bytes (append Nat ipad msg)));
+
+def hmac_sha256 (key : String) (msg : String) : String :=
+    str_of_codes (hex_encode (hmac_sha256_bytes (str_codes key) (str_codes msg)));

@@ -1,0 +1,107 @@
+-- Local definitions are transparent while synthesizing types. Expansion is
+-- confined to these probes; emitted computation nodes retain their references.
+
+import "file_elab_infer.ouro";
+
+-- Like lookup_ctx, entries use the coordinate system at their own binder.
+-- Values are expanded before insertion and lifted once by the new binder;
+-- lookup lifts by the entry's age. Missing trailing entries are assumptions.
+inductive RefineScope : Type :=
+  | MkRefineScope : List CoreTerm -> List (Maybe CoreTerm) -> RefineScope;
+
+def refine_scope_from_context (ctx : List CoreTerm) : RefineScope :=
+    MkRefineScope ctx (Nil (Maybe CoreTerm));
+
+def refine_scope_context (scope : RefineScope) : List CoreTerm :=
+    match scope with | MkRefineScope ctx _ => ctx end;
+
+def refine_local_value : Nat -> List (Maybe CoreTerm) -> Maybe CoreTerm :=
+    fix refine_local_value (index : Nat) (definitions : List (Maybe CoreTerm))
+        : Maybe CoreTerm :=
+      match definitions with
+      | Nil => Nothing CoreTerm
+      | Cons value rest =>
+          match index with | Z => value | S remaining => refine_local_value remaining rest end
+      end;
+
+def refine_local_variable (definitions : List (Maybe CoreTerm))
+    (depth : Nat) (index : Nat) : CoreTerm :=
+    match compiler_le_nat depth index with
+    | False => CRel index
+    | True =>
+        match refine_local_value (sub index depth) definitions with
+        | Nothing => CRel index
+        | Just value => lift index value
+        end
+    end;
+
+-- Structural traversal includes binder annotations and every explicit branch.
+-- A stored value contains no references to earlier definitions, so replacing
+-- it requires only a lift, not recursive unfolding or another fuel counter.
+def refine_local_expand (definitions : List (Maybe CoreTerm))
+    : CoreTerm -> Nat -> CoreTerm :=
+    fix walk (term : CoreTerm) (depth : Nat) : CoreTerm :=
+      match term with
+      | CRel index => refine_local_variable definitions depth index
+      | CSort _ => term
+      | CConst _ => term
+      | CInd _ => term
+      | CConstruct _ _ _ => term
+      | CStrBytes _ _ => term
+      | CStrLit _ _ => term
+      | CPi domain codomain => CPi (walk domain depth) (walk codomain (S depth))
+      | CLam annotation body => CLam (walk annotation depth) (walk body (S depth))
+      | CApp function argument => CApp (walk function depth) (walk argument depth)
+      | CLetIn value annotation body =>
+          CLetIn (walk value depth) (walk annotation depth) (walk body (S depth))
+      | CFix name rec_arg arity annotation body =>
+          CFix name rec_arg arity (walk annotation depth) (walk body (S depth))
+      | CCase info predicate scrutinee branches =>
+          CCase info (walk predicate depth) (walk scrutinee depth)
+            ((fix visit (remaining : List CoreTerm) : List CoreTerm :=
+                match remaining with
+                | Nil => Nil CoreTerm
+                | Cons branch rest => Cons CoreTerm (walk branch depth) (visit rest)
+                end) branches)
+      end;
+
+def refine_scope_expand (scope : RefineScope) (term : CoreTerm) : CoreTerm :=
+    match scope with
+    | MkRefineScope _ definitions =>
+        match definitions with
+        | Nil => term
+        | Cons _ _ => refine_local_expand definitions term Z
+        end
+    end;
+
+def refine_scope_assume (scope : RefineScope) (annotation : CoreTerm) : RefineScope :=
+    match scope with
+    | MkRefineScope ctx definitions =>
+        MkRefineScope (extend ctx (refine_scope_expand scope annotation))
+          (match definitions with
+           | Nil => Nil (Maybe CoreTerm)
+           | Cons _ _ => Cons (Maybe CoreTerm) (Nothing CoreTerm) definitions
+           end)
+    end;
+
+def refine_scope_define (scope : RefineScope) (annotation : CoreTerm)
+    (value : CoreTerm) : RefineScope :=
+    match scope with
+    | MkRefineScope ctx definitions =>
+        MkRefineScope (extend ctx (refine_scope_expand scope annotation))
+          (Cons (Maybe CoreTerm) (Just CoreTerm (lift 1 (refine_scope_expand scope value)))
+            definitions)
+    end;
+
+def refine_scope_infer_indexed (fuel : Nat) (sig : CheckEnvironment) (scope : RefineScope)
+    (term : CoreTerm) : CheckResult CoreTerm :=
+    infer_checked_worker fuel sig (refine_scope_context scope) (IGTerm (refine_scope_expand scope term));
+
+def refine_scope_pi_indexed (fuel : Nat) (sig : CheckEnvironment) (scope : RefineScope)
+    (typ : CoreTerm) : CheckResult PiParts :=
+    pi_view_checked_indexed fuel sig (refine_scope_expand scope typ);
+
+-- Raw-list compatibility boundaries derive lookup state exactly once.
+def refine_scope_infer (fuel : Nat) (sig : List Entry) (scope : RefineScope) (term : CoreTerm)
+    : CheckResult CoreTerm :=
+    refine_scope_infer_indexed fuel (check_environment_from_entries sig) scope term;

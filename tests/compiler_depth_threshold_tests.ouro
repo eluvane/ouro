@@ -1,0 +1,144 @@
+-- Threshold laws compare the retained exact depth operation and isolate
+-- fallback dispatch. Declaration acceptance remains covered by driver laws.
+import "../std/test.ouro";
+import "../compiler/base.ouro";
+import "../compiler/pipeline_support.ouro";
+
+def threshold_test_leaf : Surface := SSort 0;
+
+def threshold_test_chain : Nat -> Surface :=
+  fix build (count : Nat) : Surface :=
+    match count with
+    | Z => threshold_test_leaf
+    | S remaining => SApp threshold_test_leaf (build remaining)
+    end;
+
+def threshold_test_shared : Nat -> Surface :=
+  fix build (count : Nat) : Surface :=
+    match count with
+    | Z => threshold_test_leaf
+    | S remaining =>
+        let child : Surface := build remaining in SApp child child
+    end;
+
+-- Put the child in every recursive field, including both list positions.
+def threshold_test_children (child : Surface) : List Surface :=
+    let leaf : Surface := threshold_test_leaf in
+    let info : CaseInfo := MkCaseInfo 7 0 [] in
+    [ SPi 7 child leaf, SPi 7 leaf child
+    , SLam 7 child leaf, SLam 7 leaf child
+    , SApp child leaf, SApp leaf child
+    , SLet 7 child leaf leaf, SLet 7 leaf child leaf, SLet 7 leaf leaf child
+    , SCase info child leaf [], SCase info leaf child []
+    , SCase info leaf leaf [child, leaf], SCase info leaf leaf [leaf, child]
+    , SFix 7 0 1 child leaf, SFix 7 0 1 leaf child
+    , SEffectRow child
+    , SPerform 7 [child, leaf], SPerform 7 [leaf, child]
+    ];
+
+def threshold_test_forms : List Surface :=
+    append Surface
+      [ SVar 7, SSort 0, SConst 7, SInd 7, SConstruct 7 0 0
+      , SHole 7, SPerform 7 [], SStr 7 8
+      ]
+      (append Surface (threshold_test_children threshold_test_leaf)
+        (threshold_test_children (threshold_test_chain 30)));
+
+def threshold_test_pairs (surfaces : List Surface) : List (Pair Nat Surface) :=
+    map Surface (Pair Nat Surface) (fun (surface : Surface) =>
+      MkPair Nat Surface 7 surface) surfaces;
+
+def threshold_test_surface_law (minimum : Nat) : Bool :=
+    all Surface (fun (surface : Surface) =>
+      compiler_bool_equal (surface_depth_at_least minimum surface)
+        (gebNat (surface_depth surface) minimum)) threshold_test_forms;
+
+def threshold_test_list_law (minimum : Nat) : Bool :=
+    all (List Surface) (fun (surfaces : List Surface) =>
+      let pairs : List (Pair Nat Surface) := threshold_test_pairs surfaces in
+      compiler_bool_equal (surfaces_depth_at_least minimum pairs)
+        (gebNat (surfaces_max_depth pairs) minimum))
+      [ [], [threshold_test_leaf], [threshold_test_chain 30]
+      , [threshold_test_leaf, threshold_test_chain 31]
+      , [threshold_test_chain 31, threshold_test_leaf]
+      ];
+
+def threshold_test_preflight_error (code : Nat)
+    (_surfaces : List (Pair Nat Surface)) : CompResult (List (Pair Nat CoreTerm)) :=
+    CErr (List (Pair Nat CoreTerm)) (ErrCode code 77);
+
+def threshold_test_preflight_ok (_surfaces : List (Pair Nat Surface))
+    : CompResult (List (Pair Nat CoreTerm)) :=
+    COk (List (Pair Nat CoreTerm)) [MkPair Nat CoreTerm 7 (CSort 0)];
+
+def threshold_test_fallback (fuel : Nat) (surfaces : List (Pair Nat Surface))
+    : List (Pair Nat CoreTerm) :=
+    [MkPair Nat CoreTerm (add fuel (length (Pair Nat Surface) surfaces)) (CSort 0)];
+
+def threshold_test_compile (code : Nat) (surfaces : List Surface)
+    : CompResult (List (Pair Nat CoreTerm)) :=
+    compile_surfaces (threshold_test_preflight_error code) threshold_test_fallback
+      64 (threshold_test_pairs surfaces);
+
+def threshold_test_error (code : Nat) (result : CompResult (List (Pair Nat CoreTerm))) : Bool :=
+    match result with
+    | COk _ => False
+    | CErr error => match error with
+        | ErrCode actual detail => andb (eqNat actual code) (eqNat detail 77)
+        end
+    end;
+
+def threshold_test_marker (expected : Nat) (result : CompResult (List (Pair Nat CoreTerm))) : Bool :=
+    match result with
+    | CErr _ => False
+    | COk cores => match cores with
+        | Nil => False
+        | Cons pair rest => match pair with
+            | MkPair name _ => andb (eqNat name expected)
+                (match rest with | Nil => True | Cons _ _ => False end)
+            end
+        end
+    end;
+
+def threshold_test_holes : Bool :=
+    all Surface (fun (surface : Surface) =>
+      threshold_test_error 2
+        (threshold_test_compile 2 [threshold_test_chain 31, surface]))
+      (Cons Surface (SHole 9) (threshold_test_children (SHole 9)));
+
+def threshold_test_equivalence : List Test :=
+    map Nat Test (fun (minimum : Nat) =>
+      assert_true (str_concat "exact surface/list depth equivalence at " (prim_string_of_nat minimum))
+        (andb (threshold_test_surface_law minimum) (threshold_test_list_law minimum)))
+      [0, 1, 2, 3, 31, 32, 33, 34];
+
+def threshold_test_fallback_laws : List Test :=
+    [ assert_true "empty surfaces preserve preflight failure"
+        (threshold_test_error 2 (threshold_test_compile 2 []))
+    , assert_true "depth 31 preserves preflight failure"
+        (threshold_test_error 2 (threshold_test_compile 2 [threshold_test_chain 30]))
+    , assert_true "depth 32 selects fallback with original fuel and surfaces"
+        (threshold_test_marker 65 (threshold_test_compile 2 [threshold_test_chain 31]))
+    , assert_true "depth 33 selects fallback"
+        (threshold_test_marker 65 (threshold_test_compile 2 [threshold_test_chain 32]))
+    , assert_true "deep surface after a shallow declaration selects fallback"
+        (threshold_test_marker 66
+          (threshold_test_compile 2 [threshold_test_leaf, threshold_test_chain 31]))
+    , assert_true "specific preflight failure remains unchanged"
+        (threshold_test_error 3 (threshold_test_compile 3 [threshold_test_chain 31]))
+    , assert_true "successful preflight result remains unchanged"
+        (threshold_test_marker 7 (compile_surfaces threshold_test_preflight_ok
+          threshold_test_fallback 64 (threshold_test_pairs [SHole 9])))
+    , assert_true "full hole check still visits every child after the depth threshold"
+        threshold_test_holes
+    , assert_true "hole before deep declaration rejects fallback"
+        (threshold_test_error 2 (threshold_test_compile 2 [SHole 9, threshold_test_chain 31]))
+    , assert_true "deep chain needs only the requested depth"
+        (surface_depth_at_least 32 (threshold_test_chain (mul 64 32)))
+    , assert_true "shared tree stops on the first path reaching the threshold"
+        (surface_depth_at_least 32 (threshold_test_shared 64))
+    ];
+
+-- @entry main
+def main : IO Unit :=
+    test_run (append Test threshold_test_equivalence threshold_test_fallback_laws);

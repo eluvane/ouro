@@ -1,0 +1,762 @@
+-- Self-hosted TCB mirror: frontend output is trusted only after this checker accepts it.
+-- Fuel exhaustion must be fail-closed; bounded recursion may refuse work, never invent a proof.
+
+-- @entry check
+-- @export elab; @doc docs/tcb.md
+
+import "../std/data.ouro";
+
+-- Domain Option (None/Some); std Maybe uses Nothing/Just.
+inductive Option (A : Type) : Type :=
+  | None : Option A
+  | Some : A -> Option A;
+
+-- CaseInfo: ind, nparams, arities. CStrLit tag 11 (ids = content equality).
+inductive CaseInfo : Type :=
+  | MkCaseInfo : Nat -> Nat -> List Nat -> CaseInfo;
+
+inductive CoreTerm : Type :=
+  | CRel      : Nat -> CoreTerm
+  | CSort     : Nat -> CoreTerm
+  | CPi       : CoreTerm -> CoreTerm -> CoreTerm
+  | CLam      : CoreTerm -> CoreTerm -> CoreTerm
+  | CApp      : CoreTerm -> CoreTerm -> CoreTerm
+  | CLetIn    : CoreTerm -> CoreTerm -> CoreTerm -> CoreTerm
+  | CConst    : Nat -> CoreTerm
+  | CInd      : Nat -> CoreTerm
+  | CConstruct: Nat -> Nat -> Nat -> CoreTerm
+  | CCase     : CaseInfo -> CoreTerm -> CoreTerm -> List CoreTerm -> CoreTerm
+  | CFix      : Nat -> Nat -> Nat -> CoreTerm -> CoreTerm -> CoreTerm
+  | CStrLit   : Nat -> Nat -> CoreTerm;
+
+inductive Surface : Type :=
+  | SVar      : Nat -> Surface
+  | SSort     : Nat -> Surface
+  | SPi       : Nat -> Surface -> Surface -> Surface
+  | SLam      : Nat -> Surface -> Surface -> Surface
+  | SApp      : Surface -> Surface -> Surface
+  | SLet      : Nat -> Surface -> Surface -> Surface -> Surface
+  | SConst    : Nat -> Surface
+  | SInd      : Nat -> Surface
+  | SConstruct: Nat -> Nat -> Nat -> Surface
+  | SCase     : CaseInfo -> Surface -> Surface -> List Surface -> Surface
+  | SFix      : Nat -> Nat -> Nat -> Surface -> Surface -> Surface;
+
+def eqNat : Nat -> Nat -> Bool :=
+  fix eqNat (n : Nat) (m : Nat) : Bool :=
+    match n, m with
+    | Z, Z => True
+    | Z, S _ => False
+    | S _, Z => False
+    | S n', S m' => eqNat n' m'
+    end;
+
+def leNat : Nat -> Nat -> Bool :=
+  fix leNat (n : Nat) (m : Nat) : Bool :=
+    match n, m with
+    | Z, Z => True
+    | Z, S _ => True
+    | S _, Z => False
+    | S n', S m' => leNat n' m'
+    end;
+
+def ltNat (n : Nat) (m : Nat) : Bool := leNat (S n) m;
+
+def pred (n : Nat) : Nat := match n with | Z => Z | S n' => n' end;
+
+inductive Ctor : Type := | MkCtor : Nat -> CoreTerm -> Ctor;
+inductive Param : Type := | MkParam : Nat -> CoreTerm -> Param;
+inductive IndDecl : Type :=
+  | MkIndDecl : Nat -> List Param -> Nat -> List Ctor -> IndDecl;
+
+-- Axioms: ty only (None body) — stuck under delta.
+inductive Entry : Type :=
+  | MkEntry : Nat -> CoreTerm -> Option CoreTerm -> Entry
+  | MkIndEntry : Nat -> IndDecl -> Entry;
+
+def lookup_entry (A : Type) (name : Nat)
+    (on_const : CoreTerm -> Option CoreTerm -> Option A)
+    (on_ind : IndDecl -> Option A) : List Entry -> Option A :=
+    fix lookup_entry (sig : List Entry) : Option A :=
+      match sig with
+      | Nil => None A
+      | Cons e sig' =>
+          match e with
+          | MkEntry n ty body =>
+              match eqNat n name with
+              | True => on_const ty body
+              | False => lookup_entry sig'
+              end
+          | MkIndEntry n decl =>
+              match eqNat n name with
+              | True => on_ind decl
+              | False => lookup_entry sig'
+              end
+          end
+      end;
+
+def lookup_const (name : Nat) : List Entry -> Option CoreTerm :=
+    lookup_entry CoreTerm name
+      (fun (_ty : CoreTerm) (body : Option CoreTerm) => body)
+      (fun (_d : IndDecl) => None CoreTerm);
+
+def lookup_type (name : Nat) : List Entry -> Option CoreTerm :=
+    lookup_entry CoreTerm name
+      (fun (ty : CoreTerm) (_body : Option CoreTerm) => Some CoreTerm ty)
+      (fun (_d : IndDecl) => None CoreTerm);
+
+def lookup_ind (name : Nat) : List Entry -> Option IndDecl :=
+    lookup_entry IndDecl name
+      (fun (_ty : CoreTerm) (_body : Option CoreTerm) => None IndDecl)
+      (fun (decl : IndDecl) => Some IndDecl decl);
+
+-- lift: free Rel >= c by d. subst: Rel n ↦ lift n v.
+def lift_rec : Nat -> Nat -> Nat -> CoreTerm -> CoreTerm :=
+  fix lift_rec (fuel : Nat) (d : Nat) (c : Nat) (t : CoreTerm) : CoreTerm :=
+    match fuel with
+    | Z => t
+    | S fuel' =>
+        match t with
+        | CRel i =>
+            match leNat c i with
+            | True => CRel (add i d)
+            | False => t
+            end
+        | CSort _ => t
+        | CPi a b => CPi (lift_rec fuel' d c a) (lift_rec fuel' d (S c) b)
+        | CLam ann body =>
+            CLam (lift_rec fuel' d c ann) (lift_rec fuel' d (S c) body)
+        | CApp f a => CApp (lift_rec fuel' d c f) (lift_rec fuel' d c a)
+        | CLetIn v ty body =>
+            CLetIn (lift_rec fuel' d c v) (lift_rec fuel' d c ty)
+              (lift_rec fuel' d (S c) body)
+        | CConst _ => t
+        | CInd _ => t
+        | CConstruct _ _ _ => t
+        | CStrLit _ _ => t
+        | CCase ci p s bs =>
+            match ci with
+            | MkCaseInfo _ind _np arities =>
+                -- Mismatch arities: leave bs unlifted (no wrong shifts).
+                match
+                  ((fix same_len (xs : List CoreTerm) (ars : List Nat) : Bool :=
+                      match xs, ars with
+                      | Nil, Nil => True
+                      | Cons _ xs', Cons _ ars' => same_len xs' ars'
+                      | Nil, Cons _ _ => False
+                      | Cons _ _, Nil => False
+                      end) bs arities)
+                with
+                | False =>
+                    CCase ci (lift_rec fuel' d c p) (lift_rec fuel' d c s) bs
+                | True =>
+                    CCase ci (lift_rec fuel' d c p) (lift_rec fuel' d c s)
+                      ((fix go (xs : List CoreTerm) (ars : List Nat) : List CoreTerm :=
+                          match xs, ars with
+                          | Nil, Nil => Nil CoreTerm
+                          | Cons b xs', Cons ar ars' =>
+                              Cons CoreTerm (lift_rec fuel' d (add c ar) b)
+                                (go xs' ars')
+                          | Nil, Cons _ _ => Nil CoreTerm
+                          | Cons _ _, Nil => Nil CoreTerm
+                          end) bs arities)
+                end
+            end
+        | CFix name ra ar ty body =>
+            CFix name ra ar (lift_rec fuel' d c ty)
+              (lift_rec fuel' d (S c) body)
+        end
+    end;
+
+def lift (d : Nat) (t : CoreTerm) : CoreTerm :=
+    lift_rec 200 d Z t;
+
+def subst_rec : Nat -> Nat -> CoreTerm -> CoreTerm -> CoreTerm :=
+  fix subst_rec (fuel : Nat) (n : Nat) (v : CoreTerm) (t : CoreTerm)
+      : CoreTerm :=
+    match fuel with
+    | Z => t
+    | S fuel' =>
+        match t with
+        | CRel i =>
+            match eqNat i n with
+            | True => lift n v
+            | False =>
+                match ltNat n i with
+                | True => CRel (pred i)
+                | False => t
+                end
+            end
+        | CSort _ => t
+        | CPi a b => CPi (subst_rec fuel' n v a) (subst_rec fuel' (S n) v b)
+        | CLam ann body =>
+            CLam (subst_rec fuel' n v ann) (subst_rec fuel' (S n) v body)
+        | CApp f a => CApp (subst_rec fuel' n v f) (subst_rec fuel' n v a)
+        | CLetIn x ty body =>
+            CLetIn (subst_rec fuel' n v x) (subst_rec fuel' n v ty)
+              (subst_rec fuel' (S n) v body)
+        | CConst _ => t
+        | CInd _ => t
+        | CConstruct _ _ _ => t
+        | CStrLit _ _ => t
+        | CCase ci p s bs =>
+            match ci with
+            | MkCaseInfo _ind _np arities =>
+                match
+                  ((fix same_len (xs : List CoreTerm) (ars : List Nat) : Bool :=
+                      match xs, ars with
+                      | Nil, Nil => True
+                      | Cons _ xs', Cons _ ars' => same_len xs' ars'
+                      | Nil, Cons _ _ => False
+                      | Cons _ _, Nil => False
+                      end) bs arities)
+                with
+                | False =>
+                    CCase ci (subst_rec fuel' n v p) (subst_rec fuel' n v s) bs
+                | True =>
+                    CCase ci (subst_rec fuel' n v p) (subst_rec fuel' n v s)
+                      ((fix go (xs : List CoreTerm) (ars : List Nat) : List CoreTerm :=
+                          match xs, ars with
+                          | Nil, Nil => Nil CoreTerm
+                          | Cons b xs', Cons ar ars' =>
+                              Cons CoreTerm (subst_rec fuel' (add n ar) v b)
+                                (go xs' ars')
+                          | Nil, Cons _ _ => Nil CoreTerm
+                          | Cons _ _, Nil => Nil CoreTerm
+                          end) bs arities)
+                end
+            end
+        | CFix name ra ar ty body =>
+            CFix name ra ar (subst_rec fuel' n v ty)
+              (subst_rec fuel' (S n) v body)
+        end
+    end;
+
+def subst (v : CoreTerm) (t : CoreTerm) : CoreTerm :=
+    subst_rec 200 Z v t;
+
+-- Fuel-bounded βδ/let normalize. Conv = βδ-nf eq (no eta; corpus avoids eta-only).
+def lamBody (t : CoreTerm) : Option CoreTerm :=
+    match t with
+    | CLam _ann body => Some CoreTerm body
+    | CRel _ => None CoreTerm
+    | CSort _ => None CoreTerm
+    | CPi _ _ => None CoreTerm
+    | CApp _ _ => None CoreTerm
+    | CLetIn _ _ _ => None CoreTerm
+    | CConst _ => None CoreTerm
+    | CInd _ => None CoreTerm
+    | CConstruct _ _ _ => None CoreTerm
+    | CStrLit _ _ => None CoreTerm
+    | CCase _ _ _ _ => None CoreTerm
+    | CFix _ _ _ _ _ => None CoreTerm
+    end;
+
+inductive Spine : Type := | MkSpine : CoreTerm -> List CoreTerm -> Spine;
+
+def app_spine (fuel : Nat) (t : CoreTerm) : Spine :=
+    (fix go (fuel2 : Nat) (cur : CoreTerm) (args : List CoreTerm)
+        : Spine :=
+      match fuel2 with
+      | Z => MkSpine cur args
+      | S fuel2' =>
+          match cur with
+          | CApp f a => go fuel2' f (Cons CoreTerm a args)
+          | CRel _ => MkSpine cur args
+          | CSort _ => MkSpine cur args
+          | CPi _ _ => MkSpine cur args
+          | CLam _ _ => MkSpine cur args
+          | CLetIn _ _ _ => MkSpine cur args
+          | CConst _ => MkSpine cur args
+          | CInd _ => MkSpine cur args
+          | CConstruct _ _ _ => MkSpine cur args
+          | CStrLit _ _ => MkSpine cur args
+          | CCase _ _ _ _ => MkSpine cur args
+          | CFix _ _ _ _ _ => MkSpine cur args
+          end
+      end) fuel t (Nil CoreTerm);
+
+inductive ArgsLen : Type :=
+  | MkArgsLen : List CoreTerm -> Nat -> ArgsLen;
+
+def snoc_with_len (xs : List CoreTerm) (x : CoreTerm) : ArgsLen :=
+    (fix go (ys : List CoreTerm) : ArgsLen :=
+        match ys with
+        | Nil => MkArgsLen ([x] : List CoreTerm) (S Z)
+        | Cons y ys' =>
+            match go ys' with
+            | MkArgsLen zs n => MkArgsLen (Cons CoreTerm y zs) (S n)
+            end
+        end) xs;
+
+def nth (A : Type) : List A -> Nat -> Option A :=
+    fix nth (xs : List A) (n : Nat) : Option A :=
+      match xs with
+      | Nil => None A
+      | Cons x xs' =>
+          match n with
+          | Z => Some A x
+          | S n' => nth xs' n'
+          end
+      end;
+
+def mk_app (f : CoreTerm) (args : List CoreTerm) : CoreTerm :=
+    (fix mk_app (xs : List CoreTerm) (acc : CoreTerm) : CoreTerm :=
+        match xs with
+        | Nil => acc
+        | Cons a xs' => mk_app xs' (CApp acc a)
+        end) args f;
+
+-- Application reduction keeps the caller's exact remaining fuel.
+def normalize_app (recur : CoreTerm -> CoreTerm) (fuel : Nat)
+    (f : CoreTerm) (a : CoreTerm) : CoreTerm :=
+    let f' : CoreTerm := recur f in
+    -- Beta: subst un-normalized a (discarded args not evaluated). Sync file_elab.
+    match lamBody f' with
+    | Some body => recur (subst a body)
+    | None =>
+        let a' : CoreTerm := recur a in
+        match app_spine fuel f' with
+        | MkSpine head args =>
+            match head with
+            | CFix name ra ar ty body =>
+                match snoc_with_len args a' with
+                | MkArgsLen args' args_len =>
+                    match ltNat ra args_len with
+                    | False => CApp f' a'
+                    | True =>
+                        match nth CoreTerm args' ra with
+                        | None => CApp f' a'
+                        | Some rec_v =>
+                            match app_spine fuel (recur rec_v) with
+                            | MkSpine h_rec _ =>
+                                match h_rec with
+                                | CConstruct _ _ _ =>
+                                    let fix_val : CoreTerm := CFix name ra ar ty body in
+                                    let lifted_args : List CoreTerm := map CoreTerm CoreTerm (fun (x : CoreTerm) => lift 1 x) args' in
+                                    let app_body : CoreTerm := mk_app body lifted_args in
+                                    recur (subst fix_val app_body)
+                                | CRel _ => CApp f' a'
+                                | CSort _ => CApp f' a'
+                                | CPi _ _ => CApp f' a'
+                                | CLam _ _ => CApp f' a'
+                                | CApp _ _ => CApp f' a'
+                                | CLetIn _ _ _ => CApp f' a'
+                                | CConst _ => CApp f' a'
+                                | CInd _ => CApp f' a'
+                                | CStrLit _ _ => CApp f' a'
+                                | CCase _ _ _ _ => CApp f' a'
+                                | CFix _ _ _ _ _ => CApp f' a'
+                                end
+                            end
+                        end
+                    end
+                end
+            | CRel _ => CApp f' a'
+            | CSort _ => CApp f' a'
+            | CPi _ _ => CApp f' a'
+            | CLam _ _ => CApp f' a'
+            | CApp _ _ => CApp f' a'
+            | CLetIn _ _ _ => CApp f' a'
+            | CConst _ => CApp f' a'
+            | CInd _ => CApp f' a'
+            | CConstruct _ _ _ => CApp f' a'
+            | CStrLit _ _ => CApp f' a'
+            | CCase _ _ _ _ => CApp f' a'
+            end
+        end
+    end;
+
+-- @bound(cyclo <= 81)
+def normalize : Nat -> List Entry -> CoreTerm -> CoreTerm :=
+  fix normalize (fuel : Nat) (sig : List Entry) (t : CoreTerm) : CoreTerm :=
+    match fuel with
+    | Z => t
+    | S fuel' =>
+        match t with
+        | CRel _ => t
+        | CSort _ => t
+        | CInd _ => t
+        | CConstruct _ _ _ => t
+        | CStrLit _ _ => t
+        | CConst n =>
+            match lookup_const n sig with
+            | Some body => normalize fuel' sig body
+            | None => t
+            end
+        | CPi a b => CPi (normalize fuel' sig a) (normalize fuel' sig b)
+        | CLam ann body =>
+            CLam (normalize fuel' sig ann) (normalize fuel' sig body)
+        | CApp f a =>
+            normalize_app (fun (child : CoreTerm) => normalize fuel' sig child)
+              fuel' f a
+        | CLetIn v _ty body =>
+            let v' : CoreTerm := normalize fuel' sig v in
+            normalize fuel' sig (subst v' body)
+        | CCase ci p s bs =>
+            let p' : CoreTerm := normalize fuel' sig p in
+            let s' : CoreTerm := normalize fuel' sig s in
+            let normalize_branches : List CoreTerm -> List CoreTerm :=
+              fix normalize_branches (xs : List CoreTerm) : List CoreTerm :=
+                match xs with
+                | Nil => Nil CoreTerm
+                | Cons b xs' =>
+                    Cons CoreTerm (normalize fuel' sig b) (normalize_branches xs')
+                end
+            in
+            let apply_branch : Nat -> CoreTerm -> List CoreTerm -> CoreTerm :=
+              fix apply_branch (f2 : Nat) (b : CoreTerm) (args : List CoreTerm)
+                  : CoreTerm :=
+                match f2 with
+                | Z => CCase ci p' s' (normalize_branches bs)
+                | S f2' =>
+                    match args with
+                    | Nil => normalize fuel' sig b
+                    | Cons a args' =>
+                        match lamBody b with
+                        | Some body => apply_branch f2' (subst a body) args'
+                        | None => apply_branch f2' (CApp b a) args'
+                        end
+                    end
+                end
+            in
+            match app_spine fuel' s' with
+            | MkSpine h args =>
+                match h with
+                | CConstruct i j np =>
+                    match ci with
+                    | MkCaseInfo ind nparams arities =>
+                        match eqNat ind i with
+                        | False => CCase ci p' s' (normalize_branches bs)
+                        | True =>
+                            match eqNat nparams np with
+                            | False => CCase ci p' s' (normalize_branches bs)
+                            | True =>
+                                match nth Nat arities j with
+                                | None => CCase ci p' s' (normalize_branches bs)
+                                | Some arity =>
+                                    match eqNat (length CoreTerm args)
+                                                (add nparams arity) with
+                                    | False => CCase ci p' s' (normalize_branches bs)
+                                    | True =>
+                                        let real_args : List CoreTerm :=
+                                          drop CoreTerm nparams args in
+                                        match nth CoreTerm bs j with
+                                        | None => CCase ci p' s' (normalize_branches bs)
+                                        | Some b => apply_branch fuel' (normalize fuel' sig b) real_args
+                                        end
+                                    end
+                                end
+                            end
+                        end
+                    end
+                | CRel _ => CCase ci p' s' (normalize_branches bs)
+                | CSort _ => CCase ci p' s' (normalize_branches bs)
+                | CPi _ _ => CCase ci p' s' (normalize_branches bs)
+                | CLam _ _ => CCase ci p' s' (normalize_branches bs)
+                | CApp _ _ => CCase ci p' s' (normalize_branches bs)
+                | CLetIn _ _ _ => CCase ci p' s' (normalize_branches bs)
+                | CConst _ => CCase ci p' s' (normalize_branches bs)
+                | CInd _ => CCase ci p' s' (normalize_branches bs)
+                | CStrLit _ _ => CCase ci p' s' (normalize_branches bs)
+                | CCase _ _ _ _ => CCase ci p' s' (normalize_branches bs)
+                | CFix _ _ _ _ _ => CCase ci p' s' (normalize_branches bs)
+                end
+            end
+        | CFix name ra ar ty body =>
+            CFix name ra ar (normalize fuel' sig ty)
+              (normalize fuel' sig body)
+        end
+    end;
+
+-- eqTerm via injective encoding (tags 0..11; length prefixes; fuel→None).
+def encodeCaseInfo (ci : CaseInfo) : List Nat :=
+    match ci with
+    | MkCaseInfo ind np arities =>
+        Cons Nat ind
+          (Cons Nat np
+            (Cons Nat (length Nat arities) arities))
+    end;
+
+-- Encode case metadata and branches with the caller's child encoder.
+def encode_case (encode_child : CoreTerm -> Option (List Nat))
+    (ci : CaseInfo) (p : CoreTerm) (s : CoreTerm) (bs : List CoreTerm)
+    : Option (List Nat) :=
+    match encode_child p with
+    | None => None (List Nat)
+    | Some ep =>
+        match encode_child s with
+        | None => None (List Nat)
+        | Some es =>
+            match
+              ((fix go (xs : List CoreTerm) : Option (List Nat) :=
+                  match xs with
+                  | Nil => Some (List Nat) (Nil Nat)
+                  | Cons b xs' =>
+                      match encode_child b with
+                      | None => None (List Nat)
+                      | Some eb =>
+                          match go xs' with
+                          | None => None (List Nat)
+                          | Some rest =>
+                              Some (List Nat) (append Nat eb rest)
+                          end
+                      end
+                  end) bs)
+            with
+            | None => None (List Nat)
+            | Some ebs =>
+                Some (List Nat)
+                  (Cons Nat 9
+                    (append Nat (encodeCaseInfo ci)
+                      (append Nat ep
+                        (append Nat es
+                          (Cons Nat (length CoreTerm bs) ebs)))))
+            end
+        end
+    end;
+
+def encode_pair (encode_child : CoreTerm -> Option (List Nat)) (tag : Nat)
+    (left : CoreTerm) (right : CoreTerm) : Option (List Nat) :=
+    match encode_child left with
+    | None => None (List Nat)
+    | Some el =>
+        match encode_child right with
+        | None => None (List Nat)
+        | Some er => Some (List Nat) (Cons Nat tag (append Nat el er))
+        end
+    end;
+
+-- @bound(cyclo <= 49)
+def encode : Nat -> CoreTerm -> Option (List Nat) :=
+  fix encode (fuel : Nat) (t : CoreTerm) : Option (List Nat) :=
+    match fuel with
+    | Z => None (List Nat)
+    | S fuel' =>
+        match t with
+        | CRel i => Some (List Nat) ([0, i] : List Nat)
+        | CSort u => Some (List Nat) ([1, u] : List Nat)
+        | CConst n => Some (List Nat) ([6, n] : List Nat)
+        | CInd n => Some (List Nat) ([7, n] : List Nat)
+        | CConstruct i j p =>
+            Some (List Nat)
+              ([8, i, j, p] : List Nat)
+        | CStrLit n ty =>
+            Some (List Nat) ([11, n, ty] : List Nat)
+        | CPi a b =>
+            encode_pair (fun (child : CoreTerm) => encode fuel' child) 2 a b
+        | CLam a b =>
+            encode_pair (fun (child : CoreTerm) => encode fuel' child) 3 a b
+        | CApp f a =>
+            encode_pair (fun (child : CoreTerm) => encode fuel' child) 4 f a
+        | CLetIn v ty b =>
+            match encode fuel' v with
+            | None => None (List Nat)
+            | Some ev =>
+                match encode fuel' ty with
+                | None => None (List Nat)
+                | Some ety =>
+                    match encode fuel' b with
+                    | None => None (List Nat)
+                    | Some eb =>
+                        Some (List Nat)
+                          (Cons Nat 5
+                            (append Nat ev (append Nat ety eb)))
+                    end
+                end
+            end
+        | CCase ci p s bs =>
+            encode_case (fun (child : CoreTerm) => encode fuel' child) ci p s bs
+        | CFix name ra ar ty body =>
+            match encode fuel' ty with
+            | None => None (List Nat)
+            | Some ety =>
+                match encode fuel' body with
+                | None => None (List Nat)
+                | Some eb =>
+                    Some (List Nat)
+                      (Cons Nat 10
+                        (Cons Nat name
+                          (Cons Nat ra
+                            (Cons Nat ar (append Nat ety eb)))))
+                end
+            end
+        end
+    end;
+
+def eqList : List Nat -> List Nat -> Bool :=
+  fix eqList (l1 : List Nat) (l2 : List Nat) : Bool :=
+    match l1, l2 with
+    | Nil, Nil => True
+    | Nil, Cons _ _ => False
+    | Cons _ _, Nil => False
+    | Cons x xs, Cons y ys =>
+        match eqNat x y with
+        | True => eqList xs ys
+        | False => False
+        end
+    end;
+
+def eqCaseInfo (ci1 : CaseInfo) (ci2 : CaseInfo) : Bool :=
+    match ci1, ci2 with
+    | MkCaseInfo ind np arities, MkCaseInfo ind' np' arities' =>
+        match eqNat ind ind' with
+        | False => False
+        | True =>
+            match eqNat np np' with
+            | False => False
+            | True => eqList arities arities'
+            end
+        end
+    end;
+
+-- Shallow views group equal field layouts without serializing child terms.
+inductive TermEqView : Type :=
+  | EVAtom : Nat -> Nat -> Nat -> Nat -> TermEqView
+  | EVPair : Nat -> CoreTerm -> CoreTerm -> TermEqView
+  | EVLet : CoreTerm -> CoreTerm -> CoreTerm -> TermEqView
+  | EVCase : CaseInfo -> CoreTerm -> CoreTerm -> List CoreTerm -> TermEqView
+  | EVFix : Nat -> Nat -> Nat -> CoreTerm -> CoreTerm -> TermEqView;
+
+def eq_view (term : CoreTerm) : TermEqView :=
+    match term with
+    | CRel i => EVAtom 0 i 0 0
+    | CSort u => EVAtom 1 u 0 0
+    | CPi a b => EVPair 2 a b
+    | CLam a b => EVPair 3 a b
+    | CApp f a => EVPair 4 f a
+    | CLetIn v ty body => EVLet v ty body
+    | CConst n => EVAtom 6 n 0 0
+    | CInd n => EVAtom 7 n 0 0
+    | CConstruct i j np => EVAtom 8 i j np
+    | CCase ci p s bs => EVCase ci p s bs
+    | CFix name ra ar ty body => EVFix name ra ar ty body
+    | CStrLit n ty => EVAtom 11 n ty 0
+    end;
+
+-- Direct structural equality keeps conv off the temporary encode/List Nat path.
+def eqTerm : Nat -> CoreTerm -> CoreTerm -> Bool :=
+  fix eqTerm (fuel : Nat) (t1 : CoreTerm) (t2 : CoreTerm) : Bool :=
+    match fuel with
+    | Z => False
+    | S fuel' =>
+        match eq_view t1, eq_view t2 with
+        | EVAtom tag a b c, EVAtom tag' a' b' c' =>
+            match eqNat tag tag' with
+            | False => False
+            | True =>
+                match eqNat a a' with
+                | False => False
+                | True =>
+                    match eqNat b b' with
+                    | False => False
+                    | True => eqNat c c'
+                    end
+                end
+            end
+        | EVPair tag a b, EVPair tag' a' b' =>
+            match eqNat tag tag' with
+            | False => False
+            | True =>
+                match eqTerm fuel' a a' with
+                | False => False
+                | True => eqTerm fuel' b b'
+                end
+            end
+        | EVLet v ty body, EVLet v' ty' body' =>
+            match eqTerm fuel' v v' with
+            | False => False
+            | True =>
+                match eqTerm fuel' ty ty' with
+                | False => False
+                | True => eqTerm fuel' body body'
+                end
+            end
+        | EVCase ci p s bs, EVCase ci' p' s' bs' =>
+            match eqCaseInfo ci ci' with
+            | False => False
+            | True =>
+                match eqTerm fuel' p p' with
+                | False => False
+                | True =>
+                    match eqTerm fuel' s s' with
+                    | False => False
+                    | True =>
+                        (fix eqListTerm (fuel2 : Nat) (xs : List CoreTerm) (ys : List CoreTerm) : Bool :=
+                            match fuel2 with
+                            | Z => False
+                            | S fuel2' =>
+                                match xs, ys with
+                                | Nil, Nil => True
+                                | Nil, Cons _ _ => False
+                                | Cons _ _, Nil => False
+                                | Cons x xs', Cons y ys' =>
+                                    match eqTerm fuel2' x y with
+                                    | False => False
+                                    | True => eqListTerm fuel2' xs' ys'
+                                    end
+                                end
+                            end) fuel' bs bs'
+                    end
+                end
+            end
+        | EVFix name ra ar ty body, EVFix name' ra' ar' ty' body' =>
+            match eqNat name name' with
+            | False => False
+            | True =>
+                match eqNat ra ra' with
+                | False => False
+                | True =>
+                    match eqNat ar ar' with
+                    | False => False
+                    | True =>
+                        match eqTerm fuel' ty ty' with
+                        | False => False
+                        | True => eqTerm fuel' body body'
+                        end
+                    end
+                end
+            end
+        | EVAtom _ _ _ _, EVPair _ _ _ => False
+        | EVAtom _ _ _ _, EVLet _ _ _ => False
+        | EVAtom _ _ _ _, EVCase _ _ _ _ => False
+        | EVAtom _ _ _ _, EVFix _ _ _ _ _ => False
+        | EVPair _ _ _, EVAtom _ _ _ _ => False
+        | EVPair _ _ _, EVLet _ _ _ => False
+        | EVPair _ _ _, EVCase _ _ _ _ => False
+        | EVPair _ _ _, EVFix _ _ _ _ _ => False
+        | EVLet _ _ _, EVAtom _ _ _ _ => False
+        | EVLet _ _ _, EVPair _ _ _ => False
+        | EVLet _ _ _, EVCase _ _ _ _ => False
+        | EVLet _ _ _, EVFix _ _ _ _ _ => False
+        | EVCase _ _ _ _, EVAtom _ _ _ _ => False
+        | EVCase _ _ _ _, EVPair _ _ _ => False
+        | EVCase _ _ _ _, EVLet _ _ _ => False
+        | EVCase _ _ _ _, EVFix _ _ _ _ _ => False
+        | EVFix _ _ _ _ _, EVAtom _ _ _ _ => False
+        | EVFix _ _ _ _ _, EVPair _ _ _ => False
+        | EVFix _ _ _ _ _, EVLet _ _ _ => False
+        | EVFix _ _ _ _ _, EVCase _ _ _ _ => False
+        end
+    end;
+
+def conv (fuel : Nat) (sig : List Entry) (t1 : CoreTerm) (t2 : CoreTerm) : Bool :=
+    eqTerm fuel (normalize fuel sig t1) (normalize fuel sig t2);
+
+-- None = unbound (never aliases Rel 0).
+def lookup (name : Nat) : List Nat -> Option Nat :=
+    fix go (ctx : List Nat) : Option Nat :=
+      match ctx with
+      | Nil => None Nat
+      | Cons y ys =>
+          match eqNat y name with
+          | True => Some Nat Z
+          | False =>
+              match go ys with
+              | None => None Nat
+              | Some i => Some Nat (S i)
+              end
+          end
+      end;
+
+-- Surface → core. None = fuel out / unbound.

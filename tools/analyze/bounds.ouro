@@ -1,0 +1,239 @@
+-- Resource metrics are deterministic proxies for review gates, not a proof of
+-- runtime complexity. `@bound(metric <= N)` and `@bound(metric < N)` above a
+-- definition assert one of: nodes, depth, allocs, stack, steps, cyclo.
+
+-- @entry bounds_metrics
+-- @entry bnd_metric
+-- @entry bnd_check
+
+import "../../std/data.ouro";
+import "../../std/listx.ouro";
+import "../../std/natx.ouro";
+import "../../std/runtime.ouro";
+import "ast.ouro";
+
+-- nodes, depth, allocs, stack, steps, cyclo.
+inductive BndMetrics : Type :=
+  | MkBndMetrics : Nat -> Nat -> Nat -> Nat -> Nat -> Nat -> BndMetrics;
+
+-- applications, matches, lets, fixes, arms, nodes, max depth, max stack.
+inductive BndAcc : Type :=
+  | MkBndAcc : Nat -> Nat -> Nat -> Nat -> Nat -> Nat -> Nat -> Nat -> BndAcc;
+
+def bnd_zero : BndAcc := MkBndAcc Z Z Z Z Z Z Z Z;
+
+def bnd_touch (acc : BndAcc) (depth : Nat) (stack : Nat) : BndAcc :=
+    match acc with
+    | MkBndAcc a m l f b n d s =>
+        MkBndAcc a m l f b (S n) (maxNat d depth) (maxNat s stack)
+    end;
+
+def bnd_app (acc : BndAcc) : BndAcc :=
+    match acc with
+    | MkBndAcc a m l f b n d s => MkBndAcc (S a) m l f b n d s
+    end;
+
+def bnd_match (acc : BndAcc) : BndAcc :=
+    match acc with
+    | MkBndAcc a m l f b n d s => MkBndAcc a (S m) l f b n d s
+    end;
+
+def bnd_let (acc : BndAcc) : BndAcc :=
+    match acc with
+    | MkBndAcc a m l f b n d s => MkBndAcc a m (S l) f b n d s
+    end;
+
+def bnd_fix (acc : BndAcc) : BndAcc :=
+    match acc with
+    | MkBndAcc a m l f b n d s => MkBndAcc a m l (S f) b n d s
+    end;
+
+def bnd_arm (acc : BndAcc) : BndAcc :=
+    match acc with
+    | MkBndAcc a m l f b n d s => MkBndAcc a m l f (S b) n d s
+    end;
+
+-- Threaded walk. Every node is touched first; children sit at S depth. The
+-- stack grows by one per binder in scope: lambda, pi, let body, fix name and
+-- telescope, pattern binders for their arm body.
+def bnd_visit : Ast -> Nat -> Nat -> BndAcc -> BndAcc :=
+  fun (root : Ast) (initial_depth : Nat) (initial_stack : Nat) (initial_acc : BndAcc) =>
+    (fix bnd_visit (fuel : Nat) (node : Ast) (depth : Nat) (stack : Nat) (acc0 : BndAcc) : BndAcc :=
+      match fuel with
+      | Z => acc0
+      | S remaining =>
+          let descend : Ast -> Nat -> Nat -> BndAcc -> BndAcc :=
+            fun (child : Ast) (next_depth : Nat) (next_stack : Nat) (next_acc0 : BndAcc) => bnd_visit remaining child next_depth next_stack next_acc0 in
+          let acc1 : BndAcc := bnd_touch acc0 depth stack in
+          let kids : BndAcc -> BndAcc :=
+            fun (acc : BndAcc) =>
+              foldl Ast BndAcc (fun (a : BndAcc) (k : Ast) => descend k (S depth) stack a)
+                acc (ast_children node) in
+          match node with
+          | AApp f x =>
+              descend x (S depth) stack (descend f (S depth) stack (bnd_app acc1))
+          | AMatch scrut branches =>
+              descend branches (S depth) stack
+                (descend scrut (S depth) stack (bnd_match acc1))
+          | AHandle inner cls =>
+              descend cls (S depth) stack
+                (descend inner (S depth) stack (bnd_match acc1))
+          | ABranch _ ids body rest =>
+              descend rest (S depth) stack
+                (descend body (S depth) (add stack (length Nat ids)) (bnd_arm acc1))
+          | AClause _ ids body rest =>
+              descend rest (S depth) stack
+                (descend body (S depth) (add stack (length Nat ids)) (bnd_arm acc1))
+          | ALet _ ann v body =>
+              descend body (S depth) (S stack)
+                (descend v (S depth) stack (descend ann (S depth) stack (bnd_let acc1)))
+          | AFix _ binders ret body =>
+              descend body (S depth) (S stack)
+                (descend ret (S depth) (S stack)
+                  (descend binders (S depth) (S stack) (bnd_fix acc1)))
+          | ALam _ ann body =>
+              descend body (S depth) (S stack) (descend ann (S depth) stack acc1)
+          | APi _ dom cod =>
+              descend cod (S depth) (S stack) (descend dom (S depth) stack acc1)
+          | ABinder _ ty rest =>
+              descend rest (S depth) (S stack) (descend ty (S depth) stack acc1)
+          | AVar _ => acc1
+          | AHole _ => acc1
+          | ASort _ => acc1
+          | ANatLit _ => acc1
+          | AStr _ => acc1
+          | ANoBinder => acc1
+          | ANoBranch => acc1
+          | ANoClause => acc1
+          | AAscribe _ _ => kids acc1
+          | APerform _ _ => kids (bnd_app acc1)
+          | ADo _ => kids acc1
+          | AList _ => kids acc1
+          end
+      end) (ast_size root) root initial_depth initial_stack initial_acc;
+
+def bounds_metrics (a : Ast) : BndMetrics :=
+    match bnd_visit a (S Z) Z bnd_zero with
+    | MkBndAcc apps matches lets fixes arms nodes depth stack =>
+        let nested : Nat :=
+          match ast_is_fix_body a with
+          | True => pred fixes
+          | False => fixes
+          end in
+        MkBndMetrics nodes depth (add apps (add matches (add lets fixes))) stack
+          (add apps arms) (S (add matches (add arms nested)))
+    end;
+
+def bnd_metric_names : List String :=
+  [ "nodes", "depth", "allocs", "stack", "steps", "cyclo" ];
+
+-- Metric by name; Nothing for an unknown metric.
+def bnd_metric (m : BndMetrics) (name : String) : Maybe Nat :=
+    match m with
+    | MkBndMetrics nodes depth allocs stack steps cyclo =>
+        match prim_string_eq name "nodes" with
+        | True => Just Nat nodes
+        | False =>
+            match prim_string_eq name "depth" with
+            | True => Just Nat depth
+            | False =>
+                match prim_string_eq name "allocs" with
+                | True => Just Nat allocs
+                | False =>
+                    match prim_string_eq name "stack" with
+                    | True => Just Nat stack
+                    | False =>
+                        match prim_string_eq name "steps" with
+                        | True => Just Nat steps
+                        | False =>
+                            match prim_string_eq name "cyclo" with
+                            | True => Just Nat cyclo
+                            | False => Nothing Nat
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end;
+
+-- `<=` or `<`; any other operator fails closed.
+def bnd_check (value : Nat) (op : String) (limit : Nat) : Bool :=
+    match prim_string_eq op "<=" with
+    | True => leb_nat value limit
+    | False =>
+        match prim_string_eq op "<" with
+        | True => ltb_nat value limit
+        | False => False
+        end
+    end;
+
+-- metric name, operator, limit, as written in `@bound(nodes <= 42)`.
+inductive BndClaim : Type :=
+  | MkBndClaim : String -> String -> Nat -> BndClaim;
+
+def bnd_claim_metric (c : BndClaim) : String :=
+    match c with | MkBndClaim m _ _ => m end;
+
+def bnd_claim_op (c : BndClaim) : String :=
+    match c with | MkBndClaim _ o _ => o end;
+
+def bnd_claim_limit (c : BndClaim) : Nat :=
+    match c with | MkBndClaim _ _ l => l end;
+
+def bnd_ch_zero : Nat := 48;
+
+def bnd_is_digit (c : Nat) : Bool := andb (leb_nat 48 c) (leb_nat c 57);
+
+def bnd_nat_of (s : String) : Maybe Nat :=
+    let cs : List Nat := prim_string_to_char_codes s in
+    match cs with
+    | Nil => Nothing Nat
+    | Cons _ _ =>
+        match all Nat bnd_is_digit cs with
+        | False => Nothing Nat
+        | True =>
+            Just Nat
+              (foldl Nat Nat (fun (acc : Nat) (c : Nat) => add (mul 10 acc) (sub c bnd_ch_zero))
+                Z cs)
+        end
+    end;
+
+def bnd_known_op (op : String) : Bool :=
+    orb (prim_string_eq op "<=") (prim_string_eq op "<");
+
+-- "nodes <= 42" -> claim; malformed text, an unknown metric, or an operator
+-- other than `<=`/`<` -> Nothing.
+def bnd_parse_claim (text : String) : Maybe BndClaim :=
+    match prim_string_tokens text with
+    | Nil => Nothing BndClaim
+    | Cons metric rest =>
+        match rest with
+        | Nil => Nothing BndClaim
+        | Cons op rest2 =>
+            match rest2 with
+            | Nil => Nothing BndClaim
+            | Cons lim rest3 =>
+                match rest3 with
+                | Cons _ _ => Nothing BndClaim
+                | Nil =>
+                    match bnd_nat_of lim with
+                    | Nothing => Nothing BndClaim
+                    | Just n =>
+                        match andb (elem String prim_string_eq metric bnd_metric_names)
+                          (bnd_known_op op) with
+                        | False => Nothing BndClaim
+                        | True => Just BndClaim (MkBndClaim metric op n)
+                        end
+                    end
+                end
+            end
+        end
+    end;
+
+-- The claim holds for the metrics; a malformed or unknown claim fails.
+def bnd_claim_holds (m : BndMetrics) (c : BndClaim) : Bool :=
+    match bnd_metric m (bnd_claim_metric c) with
+    | Nothing => False
+    | Just v => bnd_check v (bnd_claim_op c) (bnd_claim_limit c)
+    end;

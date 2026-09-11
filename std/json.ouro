@@ -1,0 +1,552 @@
+-- JSON helpers are prefixed because imports flatten into one namespace.
+
+import "runtime.ouro";
+import "char.ouro";
+import "listx.ouro";
+
+inductive Json : Type :=
+  | JNull : Json
+  | JBool : Bool -> Json
+  | JNum : String -> Json
+  | JStr : String -> Json
+  | JArr : List Json -> Json
+  | JObj : List (Pair String Json) -> Json;
+
+inductive ParseR : Type :=
+  | POk : Json -> Nat -> ParseR
+  | PErr : Nat -> ParseR;
+
+inductive ParseHead : Type :=
+  | PHReady : ParseR -> ParseHead
+  | PHArray : Nat -> ParseHead
+  | PHObject : Nat -> ParseHead
+  | PHError : Nat -> ParseHead;
+
+def eqNat (n : Nat) (m : Nat) : Bool :=
+    match compareNat n m with
+    | EQ => True
+    | LT => False
+    | GT => False
+    end;
+
+def lebNat (n : Nat) (m : Nat) : Bool :=
+    match compareNat n m with
+    | GT => False
+    | LT => True
+    | EQ => True
+    end;
+
+-- Host byte lookup is constant time on a compact string.  parse_json compacts
+-- once before walking, instead of restarting from a linked-list head for every
+-- indexed byte.
+def json_ch_at (s : String) (i : Nat) : Nat := prim_string_byte_at s i;
+
+def skip_ws : Nat -> String -> Nat -> Nat :=
+  fix skip_ws (fuel : Nat) (s : String) (i : Nat) : Nat :=
+    match fuel with
+    | Z => i
+    | S fuel' =>
+        let c : Nat := json_ch_at s i in
+        match orb (eqNat c 32) (orb (eqNat c 9) (orb (eqNat c 10) (eqNat c 13))) with
+        | True => skip_ws fuel' s (S i)
+        | False => i
+        end
+    end;
+
+def starts_with_at (s : String) (i : Nat) (pat : List Nat) : Bool :=
+    (fix go (ps : List Nat) (j : Nat) : Bool :=
+        match ps with
+        | Nil => True
+        | Cons p rest =>
+            match eqNat (json_ch_at s (add i j)) p with
+            | False => False
+            | True => go rest (S j)
+            end
+        end) pat Z;
+
+def esc_codes : List Nat -> List Nat :=
+  fix esc_codes (cs : List Nat) : List Nat :=
+    match cs with
+    | Nil => Nil Nat
+    | Cons c rest =>
+        match eqNat c 34 with
+        | True => Cons Nat 92 (Cons Nat 34 (esc_codes rest))
+        | False =>
+            match eqNat c 92 with
+            | True => Cons Nat 92 (Cons Nat 92 (esc_codes rest))
+            | False =>
+                match eqNat c 10 with
+                | True => Cons Nat 92 (Cons Nat 110 (esc_codes rest))
+                | False =>
+                    match eqNat c 13 with
+                    | True => Cons Nat 92 (Cons Nat 114 (esc_codes rest))
+                    | False =>
+                        match eqNat c 9 with
+                        | True => Cons Nat 92 (Cons Nat 116 (esc_codes rest))
+                        | False => Cons Nat c (esc_codes rest)
+                        end
+                    end
+                end
+            end
+        end
+    end;
+
+def json_escape_str (s : String) : String :=
+    prim_string_of_char_codes
+      (Cons Nat 34
+        (append Nat (esc_codes (prim_string_to_char_codes s))
+          ([34] : List Nat)));
+
+def json_print_fuel : Nat -> Json -> String :=
+  fix json_print_fuel (fuel : Nat) (j : Json) : String :=
+    match fuel with
+    | Z => "null"
+    | S fuel' =>
+        match j with
+        | JNull => "null"
+        | JBool b => match b with | True => "true" | False => "false" end
+        | JNum s => s
+        | JStr s => json_escape_str s
+        | JArr xs =>
+            prim_string_concat "["
+              (prim_string_concat
+                ((fix go (ys : List Json) (first : Bool) : String :=
+                    match ys with
+                    | Nil => ""
+                    | Cons z zs =>
+                        prim_string_concat
+                          (match first with | True => "" | False => "," end)
+                          (prim_string_concat (json_print_fuel fuel' z)
+                            (go zs False))
+                    end) xs True)
+                "]")
+        | JObj kvs =>
+            prim_string_concat "{"
+              (prim_string_concat
+                ((fix go (ys : List (Pair String Json)) (first : Bool) : String :=
+                    match ys with
+                    | Nil => ""
+                    | Cons p qs =>
+                        match p with
+                        | MkPair k v =>
+                            prim_string_concat
+                              (match first with | True => "" | False => "," end)
+                              (prim_string_concat (json_escape_str k)
+                                (prim_string_concat ":"
+                                  (prim_string_concat (json_print_fuel fuel' v)
+                                    (go qs False))))
+                        end
+                    end) kvs True)
+                "}")
+        end
+    end;
+
+def ten : Nat := 10;
+
+def json_print (j : Json) : String :=
+    json_print_fuel (mul (mul ten ten) ten) j;
+
+def json_unescape_char (c : Nat) : Maybe Nat :=
+    (fix go (xs : List (Pair Nat Nat)) : Maybe Nat :=
+      match xs with
+      | Nil => Nothing Nat
+      | Cons p rest =>
+        match p with
+        | MkPair code decoded =>
+          match eqNat c code with
+          | True => Just Nat decoded
+          | False => go rest
+          end
+        end
+      end)
+    ([ MkPair Nat Nat 110 10
+     , MkPair Nat Nat 116 9
+     , MkPair Nat Nat 114 13
+     , MkPair Nat Nat 34 34
+     , MkPair Nat Nat 92 92
+     , MkPair Nat Nat 47 47
+     , MkPair Nat Nat 98 8
+     , MkPair Nat Nat 102 12
+     ] : List (Pair Nat Nat));
+
+def decode_esc (s : String) (i : Nat) : Maybe (Pair Nat Nat) :=
+    match json_unescape_char (json_ch_at s i) with
+    | Nothing => Nothing (Pair Nat Nat)
+    | Just ch => Just (Pair Nat Nat) (MkPair Nat Nat ch (S i))
+    end;
+
+-- Four hex digits, with the first malformed or missing byte as the error.
+def json_hex_quad (s : String) (start : Nat) : Pair (Maybe Nat) Nat :=
+    (fix go (left : Nat) (i : Nat) (value : Nat) : Pair (Maybe Nat) Nat :=
+      match left with
+      | Z => MkPair (Maybe Nat) Nat (Just Nat value) i
+      | S left2 =>
+        let c : Nat := json_ch_at s i in
+        match is_hex c with
+        | False => MkPair (Maybe Nat) Nat (Nothing Nat) i
+        | True => go left2 (S i) (add (mul 16 value) (digit_val c))
+        end
+      end) 4 start Z;
+
+-- Only valid Unicode scalars reach this encoder. Split the high groups first
+-- so repeated-subtraction division stays bounded by 63, even for U+10FFFF.
+def json_scalar_utf8 (value : Nat) : List Nat :=
+    match lebNat value 127 with
+    | True => [value]
+    | False =>
+      match ltb_nat value (mul 32 64) with
+      | True =>
+        let high : Nat := div_nat value 64 in
+        [add 192 high, add 128 (sub value (mul high 64))]
+      | False =>
+        let group : Nat := mul 64 64 in
+        match ltb_nat value (mul 16 group) with
+        | True =>
+          let high : Nat := div_nat value group in
+          let rest : Nat := sub value (mul high group) in
+          let middle : Nat := div_nat rest 64 in
+          [add 224 high, add 128 middle, add 128 (sub rest (mul middle 64))]
+        | False =>
+          let wide_group : Nat := mul 64 group in
+          let high : Nat := div_nat value wide_group in
+          let rest : Nat := sub value (mul high wide_group) in
+          let middle : Nat := div_nat rest group in
+          let low : Nat := sub rest (mul middle group) in
+          let third : Nat := div_nat low 64 in
+          [add 240 high, add 128 middle, add 128 third, add 128 (sub low (mul third 64))]
+        end
+      end
+    end;
+
+-- Entry is the u after a backslash. A high surrogate requires an immediately
+-- adjacent low-surrogate escape; lone lows and non-low partners are errors.
+def json_unicode_escape (s : String) (i : Nat) : Pair (Maybe (List Nat)) Nat :=
+    match json_hex_quad s (S i) with
+    | MkPair decoded next =>
+      match decoded with
+      | Nothing => MkPair (Maybe (List Nat)) Nat (Nothing (List Nat)) next
+      | Just value =>
+        let high_start : Nat := mul 216 256 in
+        let low_start : Nat := mul 220 256 in
+        let surrogate_end : Nat := mul 224 256 in
+        match andb (lebNat high_start value) (ltb_nat value surrogate_end) with
+        | False =>
+          MkPair (Maybe (List Nat)) Nat (Just (List Nat) (json_scalar_utf8 value)) next
+        | True =>
+          match lebNat low_start value with
+          | True => MkPair (Maybe (List Nat)) Nat (Nothing (List Nat)) i
+          | False =>
+            match eqNat (json_ch_at s next) 92 with
+            | False => MkPair (Maybe (List Nat)) Nat (Nothing (List Nat)) next
+            | True =>
+              let low_u : Nat := S next in
+              match eqNat (json_ch_at s low_u) 117 with
+              | False => MkPair (Maybe (List Nat)) Nat (Nothing (List Nat)) low_u
+              | True =>
+                match json_hex_quad s (S low_u) with
+                | MkPair low_decoded after_low =>
+                  match low_decoded with
+                  | Nothing => MkPair (Maybe (List Nat)) Nat (Nothing (List Nat)) after_low
+                  | Just low =>
+                    match andb (lebNat low_start low) (ltb_nat low surrogate_end) with
+                    | False => MkPair (Maybe (List Nat)) Nat (Nothing (List Nat)) low_u
+                    | True =>
+                      let scalar : Nat :=
+                        add (mul 256 256)
+                          (add (mul 32 (mul 32 (sub value high_start))) (sub low low_start)) in
+                      MkPair (Maybe (List Nat)) Nat
+                        (Just (List Nat) (json_scalar_utf8 scalar)) after_low
+                    end
+                  end
+                end
+              end
+            end
+          end
+        end
+      end
+    end;
+
+-- Reverse byte accumulation plus one final conversion is linear: no growing
+-- concatenations or repeated suffix slicing. Four explicit scanner arguments
+-- keep native tail calls eligible even for very large compiler/tool strings.
+def json_string_scan : Nat -> Pair String Nat -> Nat -> List Nat -> Pair (Maybe String) Nat :=
+    fix json_string_scan (fuel : Nat) (input : Pair String Nat) (i : Nat)
+        (acc : List Nat) : Pair (Maybe String) Nat :=
+      match input with
+      | MkPair s len =>
+        match fuel with
+        | Z => MkPair (Maybe String) Nat (Nothing String) (pred i)
+        | S fuel2 =>
+          match lebNat len i with
+          | True => MkPair (Maybe String) Nat (Nothing String) (pred i)
+          | False =>
+            let c : Nat := json_ch_at s i in
+            match eqNat c 34 with
+            | True =>
+              MkPair (Maybe String) Nat
+                (Just String (prim_string_of_char_codes (reverse_lin Nat acc))) (S i)
+            | False =>
+              match lebNat c 31 with
+              | True => MkPair (Maybe String) Nat (Nothing String) i
+              | False =>
+                match eqNat c 92 with
+                | False => json_string_scan fuel2 input (S i) (Cons Nat c acc)
+                | True =>
+                  let escaped : Nat := S i in
+                  match lebNat len escaped with
+                  | True => MkPair (Maybe String) Nat (Nothing String) i
+                  | False =>
+                    match eqNat (json_ch_at s escaped) 117 with
+                    | True =>
+                      match json_unicode_escape s escaped with
+                      | MkPair decoded next =>
+                        match decoded with
+                        | Nothing => MkPair (Maybe String) Nat (Nothing String) next
+                        | Just bytes =>
+                          json_string_scan fuel2 input next (rev_append Nat bytes acc)
+                        end
+                      end
+                    | False =>
+                      match decode_esc s escaped with
+                      | Nothing => MkPair (Maybe String) Nat (Nothing String) escaped
+                      | Just pair =>
+                        match pair with
+                        | MkPair byte next =>
+                          json_string_scan fuel2 input next (Cons Nat byte acc)
+                        end
+                      end
+                    end
+                  end
+                end
+              end
+            end
+          end
+        end
+      end;
+
+-- Entry must point at the opening quote. Success points past the closing
+-- quote. Existing errors retain their byte offsets, including the last
+-- consumed byte for a missing close. Raw bytes >= 32 retain their byte values;
+-- escaped Unicode is strictly decoded, including an escaped NUL.
+def json_string_parse (s : String) (i : Nat) : Pair (Maybe String) Nat :=
+    let len : Nat := prim_string_length s in
+    match andb (ltb_nat i len) (eqNat (json_ch_at s i) 34) with
+    | False => MkPair (Maybe String) Nat (Nothing String) i
+    | True => json_string_scan (sub len i) (MkPair String Nat s len) (S i) (Nil Nat)
+    end;
+
+def parse_string_lit (fuel : Nat) (s : String) (i0 : Nat) : ParseR :=
+    match fuel with
+    | Z => PErr i0
+    | S _ =>
+        match json_string_parse s i0 with
+        | MkPair decoded next =>
+            match decoded with
+            | Nothing => PErr next
+            | Just text => POk (JStr text) next
+            end
+        end
+    end;
+
+def json_is_digit (c : Nat) : Bool :=
+    andb (lebNat 48 c) (lebNat c 57);
+
+def json_consume_digits (s : String) (start : Nat) : Nat :=
+    (fix go (fuel : Nat) (j : Nat) : Nat :=
+      match fuel with
+      | Z => j
+      | S fuel2 =>
+        match json_is_digit (json_ch_at s j) with
+        | True => go fuel2 (S j)
+        | False => j
+        end
+      end) (mul ten (mul ten ten)) start;
+
+def parse_num (s : String) (i : Nat) : ParseR :=
+    let after_sign : Nat :=
+      match eqNat (json_ch_at s i) 45 with
+      | True => S i
+      | False => i
+      end in
+    let first : Nat := json_ch_at s after_sign in
+    match json_is_digit first with
+    | False => PErr after_sign
+    | True =>
+      let after_int : Nat :=
+        match eqNat first 48 with
+        | True => S after_sign
+        | False => json_consume_digits s (S after_sign)
+        end in
+      match andb (eqNat first 48) (json_is_digit (json_ch_at s after_int)) with
+      | True => PErr after_int
+      | False =>
+        match eqNat (json_ch_at s after_int) 46 with
+        | False =>
+          POk (JNum (prim_string_slice s i (sub after_int i))) after_int
+        | True =>
+          let frac_start : Nat := S after_int in
+          let after_frac : Nat := json_consume_digits s frac_start in
+          match eqNat after_frac frac_start with
+          | True => PErr frac_start
+          | False =>
+            POk (JNum (prim_string_slice s i (sub after_frac i))) after_frac
+          end
+        end
+      end
+    end;
+
+def parse_head (fuel : Nat) (s : String) (i0 : Nat) : ParseHead :=
+    let i : Nat := skip_ws fuel s i0 in
+    let c : Nat := json_ch_at s i in
+    match starts_with_at s i
+      ([110, 117, 108, 108] : List Nat) with
+    | True => PHReady (POk JNull (add i 4))
+    | False =>
+        match starts_with_at s i
+          ([116, 114, 117, 101] : List Nat) with
+        | True => PHReady (POk (JBool True) (add i 4))
+        | False =>
+            match starts_with_at s i
+              ([102, 97, 108, 115, 101] : List Nat) with
+            | True => PHReady (POk (JBool False) (add i 5))
+            | False =>
+                match eqNat c 34 with
+                | True => PHReady (parse_string_lit fuel s i)
+                | False =>
+                    match orb (eqNat c 45) (andb (lebNat 48 c) (lebNat c 57)) with
+                    | True => PHReady (parse_num s i)
+                    | False =>
+                        match eqNat c 91 with
+                        | True => PHArray i
+                        | False =>
+                            match eqNat c 123 with
+                            | True => PHObject i
+                            | False => PHError i
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end;
+
+def parse_val : Nat -> Nat -> String -> Nat -> ParseR :=
+  fix parse_val (depth : Nat) (fuel : Nat) (s : String) (i0 : Nat) : ParseR :=
+    match depth with
+    | Z => PErr i0
+    | S depth' =>
+      match fuel with
+      | Z => PErr i0
+      | S fuel' =>
+        match parse_head fuel s i0 with
+        | PHReady r => r
+        | PHArray i =>
+            (fix go (f2 : Nat) (j0 : Nat) (acc : List Json) : ParseR :=
+                match f2 with
+                | Z => PErr j0
+                | S f2' =>
+                    let j : Nat := skip_ws fuel s j0 in
+                    match eqNat (json_ch_at s j) 93 with
+                    | True =>
+                        match acc with
+                        | Nil => POk (JArr (Nil Json)) (S j)
+                        | Cons _ _ => PErr j
+                        end
+                    | False =>
+                        match parse_val depth' fuel' s j with
+                        | PErr e => PErr e
+                        | POk v j2 =>
+                            let j3 : Nat := skip_ws fuel s j2 in
+                            match eqNat (json_ch_at s j3) 44 with
+                            | True => go f2' (S j3) (Cons Json v acc)
+                            | False =>
+                                match eqNat (json_ch_at s j3) 93 with
+                                | True =>
+                                    POk (JArr (reverse Json (Cons Json v acc))) (S j3)
+                                | False => PErr j3
+                                end
+                            end
+                        end
+                    end
+                end) fuel (S i) (Nil Json)
+        | PHObject i =>
+            (fix go (f2 : Nat) (j0 : Nat)
+                (acc : List (Pair String Json)) : ParseR :=
+                match f2 with
+                | Z => PErr j0
+                | S f2' =>
+                    let j : Nat := skip_ws fuel s j0 in
+                    match eqNat (json_ch_at s j) 125 with
+                    | True =>
+                        match acc with
+                        | Nil => POk (JObj (Nil (Pair String Json))) (S j)
+                        | Cons _ _ => PErr j
+                        end
+                    | False =>
+                        match parse_string_lit fuel s j with
+                        | PErr e => PErr e
+                        | POk ks j1 =>
+                            match ks with
+                            | JStr k =>
+                                let j2 : Nat := skip_ws fuel s j1 in
+                                match eqNat (json_ch_at s j2) 58 with
+                                | False => PErr j2
+                                | True =>
+                                    match parse_val depth' fuel' s (S j2) with
+                                    | PErr e => PErr e
+                                    | POk v j3 =>
+                                        let j4 : Nat := skip_ws fuel s j3 in
+                                        let acc' : List (Pair String Json) :=
+                                          Cons (Pair String Json)
+                                            (MkPair String Json k v) acc in
+                                        match eqNat (json_ch_at s j4) 44 with
+                                        | True => go f2' (S j4) acc'
+                                        | False =>
+                                            match eqNat (json_ch_at s j4) 125 with
+                                            | True =>
+                                                POk
+                                                  (JObj
+                                                    (reverse (Pair String Json) acc'))
+                                                  (S j4)
+                                            | False => PErr j4
+                                            end
+                                        end
+                                    end
+                                end
+                            | JNull => PErr j
+                            | JBool _ => PErr j
+                            | JNum _ => PErr j
+                            | JArr _ => PErr j
+                            | JObj _ => PErr j
+                            end
+                        end
+                    end
+                end) fuel (S i) (Nil (Pair String Json))
+        | PHError e => PErr e
+        end
+      end
+    end;
+
+-- Large strings and arrays may be valid, but recursive JSON structure is
+-- capped independently so a tiny deeply nested frame cannot exhaust the host.
+def json_max_depth : Nat := mul 16 8;
+
+def parse_json (s : String) : Maybe Json :=
+    let len : Nat := prim_string_length s in
+    let input : String := prim_string_slice s Z len in
+    let fuel : Nat := mul (10) (S len) in
+    match parse_val json_max_depth fuel input Z with
+    | PErr _ => Nothing Json
+    | POk v i =>
+        let i2 : Nat := skip_ws fuel input i in
+        match lebNat len i2 with
+        | True => Just Json v
+        | False => Nothing Json
+        end
+    end;
+
+def json_roundtrip_ok (s : String) : Bool :=
+    match parse_json s with
+    | Nothing => False
+    | Just j => prim_string_eq (json_print j) s
+    end;

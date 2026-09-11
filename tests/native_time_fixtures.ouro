@@ -1,0 +1,197 @@
+-- Explicit typed-MIR tests. The real checked Ouro allocator/collector remain
+-- underneath managed values; only the eight-byte clock buffer uses doubles.
+import "native_managed_fixtures.ouro";
+import "native_time_cases.ouro";
+import "native_lower_fixture_common.ouro";
+
+def native_time_fixture_poison : MirValue :=
+    MirBits MirUSize (X64Words64 (X64Bytes32 255 255 255 255) (X64Bytes32 255 255 255 255));
+
+def native_time_fixture_field (symbol : Nat) (offset : Nat) (expected : MirValue) (state : ManagedState)
+    : Either NativeLowerError ManagedState :=
+    lower_bind ManagedResult ManagedState (managed_address symbol state)
+      (fun (address : ManagedResult) => match address with | ManagedResultOf base next =>
+        lower_bind ManagedResult ManagedState (managed_load MirUSize base offset next)
+          (fun (loaded : ManagedResult) => match loaded with | ManagedResultOf actual after =>
+            managed_require_equal actual expected after end) end);
+
+def native_time_fixture_pointer (symbol : Nat) (actual : MirValue) (state : ManagedState)
+    : Either NativeLowerError ManagedState :=
+    lower_bind ManagedResult ManagedState (managed_address symbol state)
+      (fun (address : ManagedResult) => match address with | ManagedResultOf expected next =>
+        managed_require_equal actual expected next end);
+
+def native_time_fixture_stats (base : Nat) (allocated : Nat) (queried : Nat) (released : Nat)
+    (state : ManagedState) : Either NativeLowerError ManagedState :=
+    lower_bind ManagedState ManagedState
+      (native_time_fixture_field (add base 205) 0 (managed_bits MirUSize allocated) state)
+      (fun (next : ManagedState) => lower_bind ManagedState ManagedState
+        (native_time_fixture_field (add base 205) 8 (managed_bits MirUSize queried) next)
+        (fun (after : ManagedState) => lower_bind ManagedState ManagedState
+          (native_time_fixture_field (add base 205) 16 (managed_bits MirUSize released) after)
+          (native_time_fixture_field (add base 205) 24 (managed_bits MirUSize 0))));
+
+def native_time_fixture_allocate (base : Nat) (mode : Nat) (state : ManagedState)
+    : Either NativeLowerError ManagedResult :=
+    lower_bind ManagedState ManagedResult (managed_require_equal (MirUse 0) (managed_bits MirUSize 8) state)
+      (fun (sized : ManagedState) => lower_bind ManagedState ManagedResult
+        (managed_require_equal (MirUse 1) (managed_bits MirUSize 8) sized)
+        (fun (aligned : ManagedState) => lower_bind ManagedState ManagedResult
+          (native_time_fixture_field (add base 205) 24 (managed_bits MirUSize 0) aligned)
+          (fun (inactive : ManagedState) => lower_bind ManagedResult ManagedResult
+            (native_managed_fixture_increment (add base 205) 0 inactive)
+            (fun (counted : ManagedResult) => match counted with | ManagedResultOf _ next =>
+              match eqNat mode 104 with
+              | True => Right NativeLowerError ManagedResult (ManagedResultOf (managed_bits MirRawPtr 0) next)
+              | False => lower_bind ManagedState ManagedResult
+                  (native_managed_fixture_store (add base 205) 24 (managed_bits MirUSize 1) next)
+                  (fun (active : ManagedState) => lower_bind ManagedState ManagedResult
+                    (native_managed_fixture_store (add base 204) 0 native_time_fixture_poison active)
+                    (managed_address (add base 204))) end end))));
+
+-- The first sample is one tick before 1970; reuse reads one tick after 1970.
+-- Both words come from the independent boundary table, never the production epoch.
+def native_time_fixture_sample (iteration : MirValue) (state : ManagedState)
+    : Either NativeLowerError ManagedResult :=
+    lower_bind NativeTimeCase ManagedResult (native_time_case 3)
+      (fun (first : NativeTimeCase) => match first with | NativeTimeCaseOf before _ =>
+        lower_bind NativeTimeCase ManagedResult (native_time_case 5)
+          (fun (second : NativeTimeCase) => match second with | NativeTimeCaseOf after _ =>
+            lower_bind ManagedResult ManagedResult
+              (managed_compare MirEqual iteration (managed_bits MirUSize 1) state)
+              (fun (compared : ManagedResult) => match compared with | ManagedResultOf initial next =>
+                managed_string_choose MirUSize initial
+                  (fun (chosen : ManagedState) => Right NativeLowerError ManagedResult (ManagedResultOf before chosen))
+                  (fun (chosen : ManagedState) => Right NativeLowerError ManagedResult (ManagedResultOf after chosen)) next end) end) end);
+
+def native_time_fixture_query (base : Nat) (mode : Nat) (state : ManagedState)
+    : Either NativeLowerError ManagedResult :=
+    let failed : Bool := orb (eqNat mode 101) (eqNat mode 103) in
+    lower_bind ManagedState ManagedResult (native_time_fixture_pointer (add base 204) (MirUse 0) state)
+      (fun (pointed : ManagedState) => lower_bind ManagedState ManagedResult
+        (native_time_fixture_field (add base 205) 24 (managed_bits MirUSize 1) pointed)
+        (fun (active : ManagedState) => lower_bind ManagedState ManagedResult
+          (native_time_fixture_field (add base 204) 0 (managed_bits MirUSize 0) active)
+          (fun (initialized : ManagedState) => lower_bind ManagedResult ManagedResult
+            (native_managed_fixture_increment (add base 205) 8 initialized)
+            (fun (counted : ManagedResult) => match counted with | ManagedResultOf iteration next =>
+              match failed with
+              | True => Right NativeLowerError ManagedResult (ManagedResultOf (managed_bits MirU32 1) next)
+              | False => lower_bind ManagedResult ManagedResult (native_time_fixture_sample iteration next)
+                  (fun (sampled : ManagedResult) => match sampled with | ManagedResultOf ticks after =>
+                    lower_map ManagedState ManagedResult
+                      (fun (written : ManagedState) => ManagedResultOf (managed_bits MirU32 0) written)
+                      (native_managed_fixture_store (add base 204) 0 ticks after) end) end end))));
+
+def native_time_fixture_release (base : Nat) (mode : Nat) (state : ManagedState)
+    : Either NativeLowerError ManagedResult :=
+    lower_bind ManagedState ManagedResult (native_time_fixture_pointer (add base 204) (MirUse 0) state)
+      (fun (pointed : ManagedState) => lower_bind ManagedState ManagedResult
+        (native_time_fixture_field (add base 205) 24 (managed_bits MirUSize 1) pointed)
+        (fun (active : ManagedState) => lower_bind ManagedResult ManagedResult
+          (native_managed_fixture_increment (add base 205) 16 active)
+          (fun (counted : ManagedResult) => match counted with | ManagedResultOf _ next =>
+            lower_bind ManagedState ManagedResult
+              (native_managed_fixture_store (add base 205) 24 (managed_bits MirUSize 0) next)
+              (fun (inactive : ManagedState) => lower_map ManagedState ManagedResult
+                (fun (poisoned : ManagedState) => ManagedResultOf
+                  (managed_bits MirU8 (match orb (eqNat mode 102) (eqNat mode 103) with | True => 0 | False => 1 end)) poisoned)
+                (native_managed_fixture_store (add base 204) 0 native_time_fixture_poison inactive)) end)));
+
+-- Inspect cleanup before forwarding a fatal result to the real Windows exit.
+def native_time_fixture_exit (base : Nat) (mode : Nat) (exit : Nat) (state : ManagedState)
+    : Either NativeLowerError ManagedResult :=
+    let calls : Nat := match eqNat mode 104 with | True => 0 | False => 1 end in
+    lower_bind ManagedState ManagedResult (managed_require_equal (MirUse 0) (managed_bits MirU32 73) state)
+      (fun (coded : ManagedState) => lower_map ManagedState ManagedResult
+        (fun (checked : ManagedState) => ManagedResultOf (managed_bits MirU32 42)
+          (managed_emit (MirCall MirMayGc (Nothing Nat) (MirDirect exit) ([MirUse 0] : List MirValue)) checked))
+        (native_time_fixture_stats base 1 calls calls coded));
+
+def native_time_fixture_conversion (compiler : ManagedCompiler) (mode : Nat) (state : ManagedState)
+    : Either NativeLowerError ManagedResult :=
+    lower_bind NativeTimeCase ManagedResult (native_time_case mode)
+      (fun (selected : NativeTimeCase) => match selected with | NativeTimeCaseOf ticks expected =>
+        lower_bind ManagedResult ManagedResult (managed_time_text compiler ticks state)
+          (fun (converted : ManagedResult) => match converted with | ManagedResultOf text next =>
+            lower_map ManagedState ManagedResult (fun (checked : ManagedState) =>
+              ManagedResultOf (managed_bits MirU32 42) checked)
+              (native_managed_fixture_text compiler text expected next) end) end);
+
+def native_time_fixture_reuse (compiler : ManagedCompiler) (base : Nat) (action : MirValue)
+    (token : MirValue) (first : MirValue) (state : ManagedState) : Either NativeLowerError ManagedResult :=
+    lower_bind ManagedState ManagedResult (native_time_fixture_stats base 1 1 1 state)
+      (fun (once : ManagedState) => lower_bind ManagedResult ManagedResult (managed_invoke compiler 5 action token once)
+        (fun (again : ManagedResult) => match again with | ManagedResultOf second next =>
+          lower_bind ManagedState ManagedResult (native_time_fixture_stats base 2 2 2 next)
+            (fun (twice : ManagedState) => lower_bind ManagedState ManagedResult
+              (native_managed_fixture_text compiler first (prim_string_to_char_codes "-1") twice)
+              (fun (retained : ManagedState) => lower_bind ManagedState ManagedResult
+                (native_managed_fixture_text compiler second (prim_string_to_char_codes "0") retained)
+                (fun (fresh : ManagedState) => lower_map ManagedState ManagedResult
+                  (fun (checked : ManagedState) => ManagedResultOf (managed_bits MirU32 42) checked)
+                  (native_time_fixture_field (add base 204) 0 native_time_fixture_poison fresh)))) end));
+
+def native_time_fixture_lifecycle (compiler : ManagedCompiler) (base : Nat) (mode : Nat) (state : ManagedState)
+    : Either NativeLowerError ManagedResult :=
+    let runtime : ManagedTimeRuntime := ManagedTimeRuntimeOf (add base 200) (add base 201) (add base 202) (add base 203) in
+    lower_bind ManagedResult ManagedResult (managed_action compiler ([] : List MirValue)
+      (fun (_ : List MirValue) (entered : ManagedState) => managed_time_body compiler runtime entered) state)
+      (fun (created : ManagedResult) => match created with | ManagedResultOf action next =>
+        lower_bind ManagedState ManagedResult (native_time_fixture_stats base 0 0 0 next)
+          (fun (deferred : ManagedState) =>
+            -- The hidden ABI token is a valid zero-field managed object. Its
+            -- family is irrelevant here: the clock action never inspects it.
+            lower_bind ManagedResult ManagedResult
+              (managed_constructor compiler 0 (managed_bits MirUSize 0) ([] : List MirValue) deferred)
+              (fun (argument : ManagedResult) => match argument with | ManagedResultOf token after =>
+                lower_bind ManagedResult ManagedResult (managed_invoke compiler 5 action token after)
+                  (fun (ran : ManagedResult) => match ran with | ManagedResultOf first after_first =>
+                    match eqNat mode 100 with
+                    | True => native_time_fixture_reuse compiler base action token first after_first
+                    | False => Right NativeLowerError ManagedResult (ManagedResultOf (managed_bits MirU32 42) after_first)
+                    end end) end)) end);
+
+def native_time_fixture_hooks (base : Nat) (mode : Nat) (exit : Nat)
+    : Either NativeLowerError (List MirFunction) :=
+    lower_bind MirFunction (List MirFunction) (native_managed_fixture_function (add base 200)
+      (prim_string_to_char_codes "time_test_allocate") ([MirLocalDef 0 MirUSize, MirLocalDef 1 MirUSize] : List MirLocal)
+      (Just MirType MirRawPtr) (native_time_fixture_allocate base mode))
+      (fun (allocate : MirFunction) => lower_bind MirFunction (List MirFunction)
+        (native_managed_fixture_function (add base 201) (prim_string_to_char_codes "time_test_release")
+          ([MirLocalDef 0 MirRawPtr] : List MirLocal) (Just MirType MirU8) (native_time_fixture_release base mode))
+        (fun (release : MirFunction) => lower_bind MirFunction (List MirFunction)
+          (native_managed_fixture_function (add base 202) (prim_string_to_char_codes "time_test_query")
+            ([MirLocalDef 0 MirRawPtr] : List MirLocal) (Just MirType MirU32) (native_time_fixture_query base mode))
+          (fun (query : MirFunction) => lower_map MirFunction (List MirFunction)
+            (fun (fatal : MirFunction) => ([allocate, release, query, fatal] : List MirFunction))
+            (native_managed_fixture_function (add base 203) (prim_string_to_char_codes "time_test_exit")
+              ([MirLocalDef 0 MirU32] : List MirLocal) (Nothing MirType) (native_time_fixture_exit base mode exit)))));
+
+def native_time_fixture (mode : Nat) (runtime : NativeManagedRuntime) : Either NativeLowerError MirProgram :=
+    match runtime with | NativeManagedRuntimeOf _ _ _ _ exit base _ =>
+      let conversion : Bool := notb (leb_nat 14 mode) in
+      let compiler : ManagedCompiler := native_managed_fixture_compiler runtime in
+      lower_bind Unit MirProgram
+        (lower_require (orb conversion (andb (leb_nat 100 mode) (leb_nat mode 104))) (LowerInvalidCall mode))
+        (fun (_ : Unit) => lower_bind (List MirFunction) MirProgram
+          (match conversion with | True => Right NativeLowerError (List MirFunction) ([] : List MirFunction)
+            | False => native_time_fixture_hooks base mode exit end)
+          (fun (hooks : List MirFunction) => lower_map ManagedResult MirProgram
+            (fun (compiled : ManagedResult) => match compiled with | ManagedResultOf value after =>
+              match after with | ManagedStateOf _ functions data _ _ flow => match flow with | LowerStateOf _ locals _ _ =>
+                let main : MirFunction := MirFunctionDef (S base) (prim_string_to_char_codes "time_test_main")
+                  ([] : List MirLocal) (reverse MirLocal locals) (Just MirType MirU32) 0
+                  (lower_finish_blocks (MirReturn (Just MirValue value)) flow) in
+                let descriptors : List MirData := map Nat MirData (fun (kind : Nat) =>
+                  MirDataDef (managed_descriptor compiler kind) False (mir_managed_descriptor_bytes kind))
+                  ([1,2,3,4,5,6,7,8,9,10,11,12,13,14,15] : List Nat) in
+                managed_fixture_finish runtime
+                  (Cons MirFunction main (append MirFunction hooks (reverse MirFunction functions)))
+                  (append MirData descriptors (append MirData
+                    ([MirDataDef (add base 204) True (pe_zeros 8), MirDataDef (add base 205) True (pe_zeros 32)] : List MirData)
+                    (reverse MirData data))) end end end)
+            ((match conversion with | True => native_time_fixture_conversion compiler mode
+              | False => native_time_fixture_lifecycle compiler base mode end)
+              (ManagedStateOf (add base 300) ([] : List MirFunction) ([] : List MirData) ([] : List Nat) ([] : List Nat)
+                (lower_empty_state 0))))) end;

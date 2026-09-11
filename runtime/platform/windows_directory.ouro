@@ -1,0 +1,103 @@
+-- Raw directory searches over caller-owned UTF-16 paths and output storage.
+-- A successful first call creates one search handle, closed with FindClose.
+-- No function allocates managed storage, sorts entries, or filters names.
+import "windows_file.ouro";
+
+extern windows_find_first_file : RawPtr U8 -> U32 -> RawPtr U8 -> U32 -> RawPtr U8 -> U32 -> Runtime (RawPtr U8) :=
+    "windows-x86_64" "win64" "kernel32.dll" "FindFirstFileExW" "nogc";
+extern windows_find_next_file : RawPtr U8 -> RawPtr U8 -> Runtime U32 :=
+    "windows-x86_64" "win64" "kernel32.dll" "FindNextFileW" "nogc";
+extern windows_find_close : RawPtr U8 -> Runtime U32 :=
+    "windows-x86_64" "win64" "kernel32.dll" "FindClose" "nogc";
+
+-- WIN32_FIND_DATAW is 592 bytes, aligned to 4 on Windows x64. Its fields:
+-- attributes U32 at 0; FILETIME pairs at 4/12/20 (creation/access/write);
+-- size high/low U32 at 28/32; reserved U32 at 36/40; NUL-terminated UTF-16
+-- filename[260] at 44; alternate filename[14] at 564. FindExInfoBasic leaves
+-- the alternate name empty. Reserved fields are not application storage.
+-- This internal size helper receives one=1 from a checked conversion.
+def raw_windows_directory_data_bytes (one : USize) : USize :=
+    let two : USize := usize_add one one in
+    let four : USize := usize_add two two in
+    let eight : USize := usize_add four four in
+    let sixteen : USize := usize_add eight eight in
+    let thirtytwo : USize := usize_add sixteen sixteen in
+    let sixtyfour : USize := usize_add thirtytwo thirtytwo in
+    usize_add (usize_shift_left one (raw_size_to_u32 (usize_add eight one)))
+      (usize_add sixtyfour sixteen);
+
+def raw_windows_directory_output (output : RawPtr U8) (capacity : USize) (one : USize) : Runtime Bool :=
+    let zero : USize := usize_sub one one in
+    let two : USize := usize_add one one in
+    let four : USize := usize_add two two in
+    runtime_bind Bool Bool (raw_buffer_range output capacity zero (raw_windows_directory_data_bytes one))
+      (fun (valid : Bool) => match valid with | False => runtime_pure Bool False | True =>
+        runtime_bind USize Bool (raw_to_bits U8 output) (fun (address : USize) =>
+          runtime_pure Bool (usize_equal (usize_and address (usize_sub four one)) zero)) end);
+
+-- Validate every range before calling Windows or writing owner. Search data,
+-- the complete terminated pattern, and the aligned USize owner are disjoint.
+def raw_windows_directory_storage (pattern : RawPtr U8) (units : USize) (output : RawPtr U8)
+    (capacity : USize) (owner : RawPtr USize) (one : USize) : Runtime Bool :=
+    let two : USize := usize_add one one in
+    let four : USize := usize_add two two in
+    let eight : USize := usize_add four four in
+    let bytes : USize := raw_windows_directory_data_bytes one in
+    runtime_bind Bool Bool (raw_windows_directory_output output capacity one) (fun (valid : Bool) =>
+      match valid with | False => runtime_pure Bool False | True =>
+        runtime_bind (RawPtr U8) Bool (raw_cast USize U8 owner) (fun (cell : RawPtr U8) =>
+          runtime_bind Bool Bool (raw_windows_path_output pattern units cell eight eight one)
+            (fun (owner_valid : Bool) => match owner_valid with | False => runtime_pure Bool False | True =>
+              let terminated : USize := usize_add units one in
+              runtime_bind Bool Bool (raw_windows_storage_disjoint pattern (usize_add terminated terminated) output bytes)
+                (fun (separate : Bool) => match separate with | False => runtime_pure Bool False | True =>
+                  raw_windows_storage_disjoint cell eight output bytes end) end)) end);
+
+-- Pattern is the exact Win32 search pattern (usually directory\*), with its
+-- explicit NUL excluded from units. Zero returns the first entry and writes
+-- the owned handle bits. A failed first call leaves owner unchanged; missing
+-- matches/path remain Win32 errors (2/3), not iteration EOF. Output is valid
+-- only on zero. Windows may leave it unspecified after an OS failure.
+def raw_windows_directory_first (pattern : RawPtr U8) (units : USize) (output : RawPtr U8)
+    (capacity : USize) (owner : RawPtr USize) : Runtime U32 :=
+    match usize_from_nat 1 with
+    | Nothing => runtime_bind Unit U32 (raw_windows_panic_code (raw_size_to_u32 units))
+        (fun (unexpected : Unit) => runtime_pure U32 (raw_size_to_u32 units))
+    | Just one => runtime_bind Bool U32 (raw_windows_directory_storage pattern units output capacity owner one)
+        (fun (valid : Bool) => match valid with | False => runtime_pure U32 (raw_windows_parameter_error one) | True =>
+          let zero : U32 := raw_size_to_u32 (usize_sub one one) in
+          runtime_bind (RawPtr U8) U32 (windows_find_first_file pattern (raw_size_to_u32 one) output zero (raw_null U8) zero)
+            (fun (search_handle : RawPtr U8) =>
+              runtime_bind Bool U32 (raw_windows_handle_valid search_handle one) (fun (opened : Bool) =>
+                match opened with | False => raw_windows_last_failure one | True =>
+                  runtime_bind USize U32 (raw_to_bits U8 search_handle) (fun (bits : USize) =>
+                    runtime_bind Unit U32 (raw_store_usize owner bits)
+                      (fun (stored : Unit) => runtime_pure U32 zero)) end)) end) end;
+
+-- Zero is another entry; ERROR_NO_MORE_FILES (18) is EOF; every other nonzero
+-- code is a failure. Neither EOF nor failure closes the handle. Output is
+-- unspecified after an OS failure, including EOF, and must not be consumed.
+-- Entries retain OS order, dot names, and reparse-point metadata as returned.
+def raw_windows_directory_next (search_handle : RawPtr U8) (output : RawPtr U8) (capacity : USize) : Runtime U32 :=
+    match usize_from_nat 1 with
+    | Nothing => runtime_bind Unit U32 (raw_windows_panic_code (raw_size_to_u32 capacity))
+        (fun (unexpected : Unit) => runtime_pure U32 (raw_size_to_u32 capacity))
+    | Just one => runtime_bind Bool U32 (raw_windows_directory_output output capacity one) (fun (valid : Bool) =>
+        match valid with | False => runtime_pure U32 (raw_windows_parameter_error one) | True =>
+          runtime_bind Bool U32 (raw_windows_handle_valid search_handle one) (fun (opened : Bool) =>
+            match opened with | False => runtime_pure U32 (raw_windows_invalid_handle one) | True =>
+              runtime_bind U32 U32 (windows_find_next_file search_handle output)
+                (fun (status : U32) => raw_windows_bool_status status one) end) end) end;
+
+-- Call once when relinquishing a successful search handle, including at EOF.
+-- After attempting FindClose, never reuse the handle. Zero confirms cleanup;
+-- a nonzero result reports cleanup failure. Do not pass it to CloseHandle.
+def raw_windows_directory_close (search_handle : RawPtr U8) : Runtime U32 :=
+    match usize_from_nat 1 with
+    | Nothing => runtime_bind USize U32 (raw_to_bits U8 search_handle) (fun (bits : USize) =>
+        runtime_bind Unit U32 (raw_windows_panic_code (raw_size_to_u32 bits))
+          (fun (unexpected : Unit) => runtime_pure U32 (raw_size_to_u32 bits)))
+    | Just one => runtime_bind Bool U32 (raw_windows_handle_valid search_handle one) (fun (valid : Bool) =>
+        match valid with | False => runtime_pure U32 (raw_windows_invalid_handle one) | True =>
+          runtime_bind U32 U32 (windows_find_close search_handle)
+            (fun (status : U32) => raw_windows_bool_status status one) end) end;

@@ -1,0 +1,836 @@
+-- Fail-closed GitHub workflow parsing and authorization checks.
+
+import "report.ouro";
+import "paths.ouro";
+import "../../std/fs.ouro";
+import "../../std/fs_walk.ouro";
+import "../../std/listx.ouro";
+import "../../std/pathx.ouro";
+import "../../std/stringx.ouro";
+import "../../std/text.ouro";
+import "../../std/format.ouro";
+import "../../std/natx.ouro";
+
+
+def workflow_issue_add (reason : String) (path : String)
+    (issues : List GateIssue) : List GateIssue :=
+    snoc GateIssue issues (gate_issue reason path);
+
+
+def workflow_nat_metric (name : String) (value : Nat) : GateMetric :=
+    gate_metric name (show_nat value);
+
+
+def workflow_gate_check (name : String) (issues : List GateIssue) : GateCheck :=
+    MkGateCheck name True (Nil GateMetric) issues;
+
+
+def workflow_gate_check_metrics (name : String) (metrics : List GateMetric)
+    (issues : List GateIssue) : GateCheck :=
+    MkGateCheck name True metrics issues;
+
+
+def workflow_with_file_text (root : String) (rel : String)
+    (issues : List GateIssue) (k : String -> List GateIssue)
+    : IO (List GateIssue) :=
+    do let! loaded := fs_read_checked (repo_join root rel);
+       match loaded with
+       | Left e =>
+           io_pure (List GateIssue)
+             (workflow_issue_add (fs_error_message e) rel issues)
+       | Right text => io_pure (List GateIssue) (k text)
+       end
+
+-- GitHub workflow authorization is derived from a deliberately small YAML
+-- subset. Unsupported or ambiguous YAML is blocking instead of falling back to
+-- raw text matching. The owned workflows use two-space mappings, ordinary
+-- sequence items, and literal/folded scalar bodies, which is all this parser
+-- accepts.
+inductive WorkflowEntry : Type :=
+  | WorkflowField : String -> String -> String -> WorkflowEntry
+  | WorkflowBody : String -> String -> WorkflowEntry;
+
+inductive WorkflowFrame : Type :=
+  | MkWorkflowFrame : Nat -> String -> WorkflowFrame;
+
+inductive WorkflowBlock : Type :=
+  | WorkflowNoBlock : WorkflowBlock
+  | WorkflowInBlock : Nat -> String -> WorkflowBlock;
+
+inductive WorkflowParseState : Type :=
+  | MkWorkflowParseState : List WorkflowFrame -> List String
+      -> List WorkflowEntry -> List GateIssue -> WorkflowBlock
+      -> WorkflowParseState;
+
+inductive WorkflowDoc : Type :=
+  | MkWorkflowDoc : List WorkflowEntry -> List GateIssue -> WorkflowDoc;
+
+
+def workflow_entry_path (entry : WorkflowEntry) : String :=
+    match entry with
+    | WorkflowField path _ _ => path
+    | WorkflowBody path _ => path
+    end;
+
+
+def workflow_entry_key (entry : WorkflowEntry) : String :=
+    match entry with
+    | WorkflowField _ key _ => key
+    | WorkflowBody _ _ => ""
+    end;
+
+
+def workflow_entry_value (entry : WorkflowEntry) : String :=
+    match entry with
+    | WorkflowField _ _ value => value
+    | WorkflowBody _ value => value
+    end;
+
+
+def workflow_entry_is_field (entry : WorkflowEntry) : Bool :=
+    match entry with
+    | WorkflowField _ _ _ => True
+    | WorkflowBody _ _ => False
+    end;
+
+
+def workflow_doc_entries (doc : WorkflowDoc) : List WorkflowEntry :=
+    match doc with
+    | MkWorkflowDoc entries _ => entries
+    end;
+
+
+def workflow_doc_issues (doc : WorkflowDoc) : List GateIssue :=
+    match doc with
+    | MkWorkflowDoc _ issues => issues
+    end;
+
+
+def workflow_frame_indent (frame : WorkflowFrame) : Nat :=
+    match frame with
+    | MkWorkflowFrame indent _ => indent
+    end;
+
+
+def workflow_frame_path (frame : WorkflowFrame) : String :=
+    match frame with
+    | MkWorkflowFrame _ path => path
+    end;
+
+
+def workflow_frames_pop (indent : Nat) : List WorkflowFrame -> List WorkflowFrame :=
+  fix workflow_frames_pop (frames : List WorkflowFrame) : List WorkflowFrame :=
+    match frames with
+    | Nil => Nil WorkflowFrame
+    | Cons frame rest =>
+        match leb_nat indent (workflow_frame_indent frame) with
+        | True => workflow_frames_pop rest
+        | False => frames
+        end
+    end;
+
+
+def workflow_parent_path (frames : List WorkflowFrame) : String :=
+    match frames with
+    | Nil => ""
+    | Cons frame _ => workflow_frame_path frame
+    end;
+
+
+def workflow_child_path (parent : String) (key : String) : String :=
+    match str_null parent with
+    | True => key
+    | False => str_cat3 parent "/" key
+    end;
+
+
+def workflow_expected_indent (frames : List WorkflowFrame) : Nat :=
+    match frames with
+    | Nil => Z
+    | Cons frame _ => add (workflow_frame_indent frame) 2
+    end;
+
+
+def workflow_line_reason (reason : String) (line_no : Nat) : String :=
+    str_cat3 reason " at line " (show_nat line_no);
+
+
+def workflow_key_char (c : Nat) : Bool :=
+    orb (is_alnum c) (orb (eq_nat c ch_minus) (eq_nat c ch_under));
+
+
+def workflow_key_valid (key : String) : Bool :=
+    andb (notb (str_null key)) (str_char_all workflow_key_char key);
+
+
+def workflow_line_indent (line : String) : Nat :=
+    length Nat (take_while Nat is_space (str_codes line));
+
+
+def workflow_line_has_tab (line : String) : Bool :=
+    str_char_any is_tab line;
+
+
+def workflow_strip_comment_codes (initial_single : Bool) (initial_double : Bool)
+    (initial_escaped : Bool) (initial_boundary : Bool) (initial_codes : List Nat)
+    : Maybe (List Nat) :=
+  (fix go (codes : List Nat) (single : Bool) (double : Bool) (escaped : Bool)
+      (boundary : Bool) : Maybe (List Nat) :=
+    match codes with
+    | Nil =>
+        match orb single double with
+        | True => Nothing (List Nat)
+        | False => Just (List Nat) (Nil Nat)
+        end
+    | Cons c rest =>
+        match escaped with
+        | True =>
+            match go rest single double False (is_ws c) with
+            | Nothing => Nothing (List Nat)
+            | Just tail => Just (List Nat) (Cons Nat c tail)
+            end
+        | False =>
+            match andb double (eq_nat c ch_bslash) with
+            | True =>
+                match go rest single double True False with
+                | Nothing => Nothing (List Nat)
+                | Just tail => Just (List Nat) (Cons Nat c tail)
+                end
+            | False =>
+                match andb (notb double) (eq_nat c ch_squote) with
+                | True =>
+                    match go rest (notb single) double False False with
+                    | Nothing => Nothing (List Nat)
+                    | Just tail => Just (List Nat) (Cons Nat c tail)
+                    end
+                | False =>
+                    match andb (notb single) (eq_nat c ch_quote) with
+                    | True =>
+                        match go rest single (notb double) False False with
+                        | Nothing => Nothing (List Nat)
+                        | Just tail => Just (List Nat) (Cons Nat c tail)
+                        end
+                    | False =>
+                        match andb (andb (notb single) (notb double))
+                                (andb boundary (eq_nat c ch_hash)) with
+                        | True => Just (List Nat) (Nil Nat)
+                        | False =>
+                            match go rest single double False (is_ws c) with
+                            | Nothing => Nothing (List Nat)
+                            | Just tail => Just (List Nat) (Cons Nat c tail)
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end) initial_codes initial_single initial_double initial_escaped initial_boundary;
+
+
+def workflow_strip_comment (line : String) : Maybe String :=
+    match workflow_strip_comment_codes False False False True (str_codes line) with
+    | Nothing => Nothing String
+    | Just codes => Just String (str_of_codes codes)
+    end;
+
+
+def workflow_block_scalar (value : String) : Bool :=
+    elem String str_eq (str_trim value)
+      ([ "|", "|-", "|+", ">", ">-", ">+" ] : List String);
+
+
+def workflow_scalar_unquote (value : String) : String :=
+    let cleaned : String := str_trim value in
+    let n : Nat := str_len cleaned in
+    match ltb_nat n 2 with
+    | True => cleaned
+    | False =>
+        match orb
+                (andb (str_starts cleaned "\"") (str_ends cleaned "\""))
+                (andb (str_starts cleaned "'") (str_ends cleaned "'")) with
+        | True => str_slice cleaned 1 (sub n 2)
+        | False => cleaned
+        end
+    end;
+
+
+def workflow_scalar_normalized (value : String) : String :=
+    str_lower (workflow_scalar_unquote value);
+
+
+def workflow_value_ambiguous (key : String) (value : String) : Bool :=
+    let cleaned : String := str_trim value in
+    orb (str_eq key "<<")
+      (orb (str_starts cleaned "{")
+        (orb (str_starts cleaned "&")
+          (orb (str_starts cleaned "*") (str_starts cleaned "!"))));
+
+
+def workflow_state_add_issue (path : String) (reason : String)
+    (state : WorkflowParseState) : WorkflowParseState :=
+    match state with
+    | MkWorkflowParseState frames seen entries issues block =>
+        MkWorkflowParseState frames seen entries
+          (workflow_issue_add reason path issues) block
+    end;
+
+
+def workflow_parse_mapping (path : String) (line_no : Nat) (indent : Nat)
+    (sequence : Bool) (content : String) (state : WorkflowParseState)
+    : WorkflowParseState :=
+    match state with
+    | MkWorkflowParseState frames seen entries issues _ =>
+        let parents : List WorkflowFrame := workflow_frames_pop indent frames in
+        let issues0 : List GateIssue :=
+          match eq_nat indent (workflow_expected_indent parents) with
+          | True => issues
+          | False => workflow_issue_add
+              (workflow_line_reason "unsupported YAML indentation" line_no)
+              path issues
+          end in
+        match str_split_first content ":" with
+        | Nothing =>
+            MkWorkflowParseState parents seen entries
+              (workflow_issue_add (workflow_line_reason "expected a YAML mapping key" line_no)
+                path issues0) WorkflowNoBlock
+        | Just pair =>
+            match pair with
+            | MkPair raw_key raw_value =>
+                let key : String := str_trim raw_key in
+                let value : String := str_trim raw_value in
+                let parent : String := workflow_parent_path parents in
+                let item_path : String :=
+                  match sequence with
+                  | True => workflow_child_path parent
+                      (str_cat3 "[" (show_nat line_no) "]")
+                  | False => parent
+                  end in
+                let field_path : String := workflow_child_path item_path key in
+                let issues1 : List GateIssue :=
+                  match workflow_key_valid key with
+                  | True => issues0
+                  | False => workflow_issue_add
+                      (workflow_line_reason "unsupported quoted or complex YAML key" line_no)
+                      path issues0
+                  end in
+                let issues2 : List GateIssue :=
+                  match workflow_value_ambiguous key value with
+                  | True => workflow_issue_add
+                      (workflow_line_reason "YAML aliases, merges, tags, and flow mappings are not allowed" line_no)
+                      path issues1
+                  | False => issues1
+                  end in
+                let issues3 : List GateIssue :=
+                  match elem String str_eq field_path seen with
+                  | True => workflow_issue_add
+                      (workflow_line_reason "duplicate YAML mapping key" line_no)
+                      path issues2
+                  | False => issues2
+                  end in
+                let next_frames : List WorkflowFrame :=
+                  match sequence with
+                  | True =>
+                      match str_null value with
+                      | True => Cons WorkflowFrame
+                          (MkWorkflowFrame indent field_path) parents
+                      | False => Cons WorkflowFrame
+                          (MkWorkflowFrame indent item_path) parents
+                      end
+                  | False =>
+                      match str_null value with
+                      | True => Cons WorkflowFrame
+                          (MkWorkflowFrame indent field_path) parents
+                      | False => parents
+                      end
+                  end in
+                let next_block : WorkflowBlock :=
+                  match workflow_block_scalar value with
+                  | True => WorkflowInBlock indent field_path
+                  | False => WorkflowNoBlock
+                  end in
+                MkWorkflowParseState next_frames
+                  (Cons String field_path seen)
+                  (Cons WorkflowEntry
+                    (WorkflowField field_path key value) entries)
+                  issues3 next_block
+            end
+        end
+    end;
+
+
+def workflow_parse_sequence_scalar (path : String) (line_no : Nat)
+    (indent : Nat) (value : String) (state : WorkflowParseState)
+    : WorkflowParseState :=
+    match state with
+    | MkWorkflowParseState frames seen entries issues _ =>
+        let parents : List WorkflowFrame := workflow_frames_pop indent frames in
+        let issues0 : List GateIssue :=
+          match eq_nat indent (workflow_expected_indent parents) with
+          | True => issues
+          | False => workflow_issue_add
+              (workflow_line_reason "unsupported YAML indentation" line_no)
+              path issues
+          end in
+        let cleaned : String := str_trim value in
+        let ambiguous : Bool :=
+          orb (str_starts cleaned "{")
+            (orb (str_starts cleaned "&")
+              (orb (str_starts cleaned "*") (str_starts cleaned "!"))) in
+        let issues1 : List GateIssue :=
+          match ambiguous with
+          | True => workflow_issue_add
+              (workflow_line_reason "YAML aliases, tags, and flow mappings are not allowed" line_no)
+              path issues0
+          | False => issues0
+          end in
+        MkWorkflowParseState parents seen entries issues1 WorkflowNoBlock
+    end;
+
+
+def workflow_parse_active_line (path : String) (line_no : Nat) (raw : String)
+    (state : WorkflowParseState) : WorkflowParseState :=
+    match workflow_strip_comment raw with
+    | Nothing => workflow_state_add_issue path
+        (workflow_line_reason "unterminated YAML quote" line_no) state
+    | Just uncommented =>
+        let cleaned : String := str_trim uncommented in
+        match str_null cleaned with
+        | True => state
+        | False =>
+            let indent : Nat := workflow_line_indent uncommented in
+            match str_starts cleaned "- " with
+            | False =>
+                workflow_parse_mapping path line_no indent False cleaned state
+            | True =>
+                let item : String := str_trim (str_drop cleaned 2) in
+                match str_contains item ":" with
+                | True => workflow_parse_mapping path line_no indent True item state
+                | False => workflow_parse_sequence_scalar path line_no indent item state
+                end
+            end
+        end
+    end;
+
+
+def workflow_parse_step (path : String) (line_no : Nat) (raw : String)
+    (state : WorkflowParseState) : WorkflowParseState :=
+    let state0 : WorkflowParseState :=
+      match workflow_line_has_tab raw with
+      | True => workflow_state_add_issue path
+          (workflow_line_reason "tabs are not allowed in workflow YAML" line_no) state
+      | False => state
+      end in
+    match str_null (str_trim raw) with
+    | True => state0
+    | False =>
+        match state0 with
+        | MkWorkflowParseState frames seen entries issues block =>
+            match block with
+            | WorkflowNoBlock => workflow_parse_active_line path line_no raw state0
+            | WorkflowInBlock header_indent block_path =>
+                let indent : Nat := workflow_line_indent raw in
+                match gtb_nat indent header_indent with
+                | False =>
+                    workflow_parse_active_line path line_no raw
+                      (MkWorkflowParseState frames seen entries issues WorkflowNoBlock)
+                | True =>
+                    let body : String := str_trim raw in
+                    match str_starts body "#" with
+                    | True => state0
+                    | False => MkWorkflowParseState frames seen
+                        (Cons WorkflowEntry (WorkflowBody block_path body) entries)
+                        issues block
+                    end
+                end
+            end
+        end
+    end;
+
+
+def workflow_parse (path : String) (text : String) : WorkflowDoc :=
+    let initial : WorkflowParseState :=
+      MkWorkflowParseState (Nil WorkflowFrame) (Nil String)
+        (Nil WorkflowEntry) (Nil GateIssue) WorkflowNoBlock in
+    let final : WorkflowParseState :=
+      (fix go (lines : List String) (line_no : Nat) (state : WorkflowParseState)
+          : WorkflowParseState :=
+        match lines with
+        | Nil => state
+        | Cons line rest =>
+            go rest (S line_no) (workflow_parse_step path line_no line state)
+        end) (str_lines text) 1 initial in
+    match final with
+    | MkWorkflowParseState _ _ entries issues _ =>
+        MkWorkflowDoc (reverse WorkflowEntry entries) (reverse GateIssue issues)
+    end;
+
+
+def workflow_path_keep (rel : String) : Bool :=
+    andb (str_starts rel ".github/workflows/")
+      (andb (orb (path_has_ext rel ".yml") (path_has_ext rel ".yaml"))
+        (notb (str_eq rel ".github/workflows/quality-bootstrap.yml")));
+
+
+def workflow_paths_checked (root : String) : IO FsWalkResult :=
+    do let! walked := fs_walk_checked (repo_join root ".github/workflows");
+       io_pure FsWalkResult
+         (fs_walk_map
+           (fun (files : List String) =>
+             let rels : List String := map String String (path_relative root) files in
+             str_sort (filter String workflow_path_keep rels))
+           walked)
+
+
+-- Compatibility helper. Security decisions use workflow_paths_checked and
+-- inspect every result constructor.
+def workflow_field_value_at (entries : List WorkflowEntry) (wanted : String)
+    : Maybe String :=
+    match find WorkflowEntry
+            (fun (entry : WorkflowEntry) =>
+              andb (workflow_entry_is_field entry)
+                (str_eq (workflow_entry_path entry) wanted))
+            entries with
+    | Nothing => Nothing String
+    | Just entry => Just String (workflow_entry_value entry)
+    end;
+
+
+def workflow_required_mapping_issue (path : String) (entries : List WorkflowEntry)
+    (wanted : String) (issues : List GateIssue) : List GateIssue :=
+    match workflow_field_value_at entries wanted with
+    | Nothing => workflow_issue_add
+        (str_concat "missing required workflow mapping: " wanted) path issues
+    | Just value =>
+        match str_null (str_trim value) with
+        | True => issues
+        | False => workflow_issue_add
+            (str_concat "workflow mapping must use block form: " wanted) path issues
+        end
+    end;
+
+
+def workflow_required_structure_issues (path : String)
+    (entries : List WorkflowEntry) (issues : List GateIssue) : List GateIssue :=
+    let issues0 : List GateIssue :=
+      foldl String (List GateIssue)
+        (fun (acc : List GateIssue) (wanted : String) =>
+          workflow_required_mapping_issue path entries wanted acc)
+        issues ([ "on", "permissions", "concurrency", "jobs" ] : List String) in
+    match workflow_field_value_at entries "permissions/contents" with
+    | Nothing => workflow_issue_add "top-level permissions must explicitly set contents: read" path issues0
+    | Just value =>
+        match str_eq (workflow_scalar_normalized value) "read" with
+        | True => issues0
+        | False => workflow_issue_add "top-level permissions must explicitly set contents: read" path issues0
+        end
+    end;
+
+
+def workflow_hex40 (value : String) : Bool :=
+    andb (eq_nat (str_len value) 40) (str_char_all is_hex value);
+
+
+def workflow_action_issue (path : String) (entry : WorkflowEntry)
+    (issues : List GateIssue) : List GateIssue :=
+    match andb (workflow_entry_is_field entry)
+            (str_eq (workflow_entry_key entry) "uses") with
+    | False => issues
+    | True =>
+        let spec : String := workflow_scalar_unquote (workflow_entry_value entry) in
+        match orb (str_starts spec "./") (str_starts spec "docker://") with
+        | True => issues
+        | False =>
+            match str_split_first spec "@" with
+            | Nothing => workflow_issue_add
+                "external action is not pinned to a full 40-character commit SHA"
+                path issues
+            | Just pair =>
+                match workflow_hex40 (snd String String pair) with
+                | True => issues
+                | False => workflow_issue_add
+                    "external action is not pinned to a full 40-character commit SHA"
+                    path issues
+                end
+            end
+        end
+    end;
+
+
+def workflow_dangerous_entry_issues (path : String) (entry : WorkflowEntry)
+    (issues : List GateIssue) : List GateIssue :=
+    match workflow_entry_is_field entry with
+    | False => issues
+    | True =>
+        let entry_path : String := workflow_entry_path entry in
+        let key : String := workflow_entry_key entry in
+        let value : String := workflow_scalar_normalized (workflow_entry_value entry) in
+        let issues0 : List GateIssue :=
+          match str_eq entry_path "on/pull_request_target" with
+          | True => workflow_issue_add "privileged pull_request_target trigger" path issues
+          | False => issues
+          end in
+        let issues1 : List GateIssue :=
+          match str_eq key "continue-on-error" with
+          | False => issues0
+          | True =>
+              match str_eq value "false" with
+              | True => issues0
+              | False => workflow_issue_add "masked failing check" path issues0
+              end
+          end in
+        let issues2 : List GateIssue :=
+          match str_eq value "write-all" with
+          | True => workflow_issue_add "write-all permissions" path issues1
+          | False => issues1
+          end in
+        workflow_action_issue path entry issues2
+    end;
+
+
+def workflow_dangerous_issues_for_doc (path : String) (doc : WorkflowDoc)
+    (issues : List GateIssue) : List GateIssue :=
+    foldl WorkflowEntry (List GateIssue)
+      (fun (acc : List GateIssue) (entry : WorkflowEntry) =>
+        workflow_dangerous_entry_issues path entry acc)
+      (append GateIssue issues (workflow_doc_issues doc))
+      (workflow_doc_entries doc);
+
+
+def workflow_dangerous_issues_for_text (path : String) (text : String)
+    (issues : List GateIssue) : List GateIssue :=
+    workflow_dangerous_issues_for_doc path (workflow_parse path text) issues;
+
+
+def workflow_dangerous_file_issues (root : String) (path : String) (issues : List GateIssue)
+    : IO (List GateIssue) :=
+    workflow_with_file_text root path issues
+      (fun (text : String) =>
+        workflow_dangerous_issues_for_text path text issues)
+
+
+def workflow_dangerous_paths_issues (root : String) (paths : List String)
+    (issues : List GateIssue) : IO (List GateIssue) :=
+  io_fold String (List GateIssue)
+    (fun (acc : List GateIssue) (path : String) =>
+      workflow_dangerous_file_issues root path acc)
+    issues paths;
+
+
+def workflow_dangerous_patterns_check (root : String) : IO GateCheck :=
+    do let! walked := workflow_paths_checked root;
+       match walked with
+       | FsWalkComplete paths =>
+           do let! issues := workflow_dangerous_paths_issues root paths (Nil GateIssue);
+              io_pure GateCheck
+                (workflow_gate_check_metrics "workflow-dangerous-patterns"
+                  ([ workflow_nat_metric "workflows" (length String paths) ] : List GateMetric) issues)
+       | FsWalkTruncated _ => io_pure GateCheck
+           (workflow_gate_check "workflow-dangerous-patterns"
+             ([ gate_issue (fs_walk_message walked) ".github/workflows" ] : List GateIssue))
+       | FsWalkUnreadable _ => io_pure GateCheck
+           (workflow_gate_check "workflow-dangerous-patterns"
+             ([ gate_issue (fs_walk_message walked) ".github/workflows" ] : List GateIssue))
+       | FsWalkUnsafe _ => io_pure GateCheck
+           (workflow_gate_check "workflow-dangerous-patterns"
+             ([ gate_issue (fs_walk_message walked) ".github/workflows" ] : List GateIssue))
+       end
+
+
+def workflow_release_guarded (entries : List WorkflowEntry) : Bool :=
+    match workflow_field_value_at entries "jobs/publish-draft-release/if" with
+    | Nothing => False
+    | Just value =>
+        andb (str_contains value "startsWith(github.ref, 'refs/tags/v')")
+          (str_contains value "github.event_name == 'push'")
+    end;
+
+
+def workflow_release_command_paths (entries : List WorkflowEntry) : List String :=
+    foldl WorkflowEntry (List String)
+      (fun (paths : List String) (entry : WorkflowEntry) =>
+        match entry with
+        | WorkflowField _ _ _ => paths
+        | WorkflowBody body_path line =>
+            match andb
+                    (str_starts body_path "jobs/publish-draft-release/")
+                    (andb (str_ends body_path "/run")
+                      (str_starts (str_trim line) "gh release create ")) with
+            | True => snoc String paths body_path
+            | False => paths
+            end
+        end)
+      (Nil String) entries;
+
+
+def workflow_release_path_has_draft (entries : List WorkflowEntry)
+    (run_path : String) : Bool :=
+    any WorkflowEntry
+      (fun (entry : WorkflowEntry) =>
+        match entry with
+        | WorkflowField _ _ _ => False
+        | WorkflowBody body_path line =>
+            andb (str_eq body_path run_path)
+              (str_starts (str_trim line) "--draft")
+        end)
+      entries;
+
+
+def workflow_release_command_guarded (entries : List WorkflowEntry) : Bool :=
+    any String (workflow_release_path_has_draft entries)
+      (workflow_release_command_paths entries);
+
+
+def release_write_allowed_doc (path : String) (doc : WorkflowDoc) : Bool :=
+    let entries : List WorkflowEntry := workflow_doc_entries doc in
+    andb (str_eq (path_basename path) "ouro-release.yml")
+      (andb (workflow_release_guarded entries)
+        (workflow_release_command_guarded entries));
+
+
+def pages_deploy_guarded (entries : List WorkflowEntry) : Bool :=
+    match workflow_field_value_at entries "jobs/publish-pages/if" with
+    | Nothing => False
+    | Just value =>
+        andb (str_contains value "github.ref == 'refs/heads/main'")
+          (str_contains value "github.event_name == 'push'")
+    end;
+
+
+def pages_deploy_action (entries : List WorkflowEntry) : Bool :=
+    any WorkflowEntry
+      (fun (entry : WorkflowEntry) =>
+        andb (workflow_entry_is_field entry)
+          (andb (str_eq (workflow_entry_key entry) "uses")
+            (andb (str_starts (workflow_entry_path entry) "jobs/publish-pages/")
+              (str_starts (workflow_scalar_unquote (workflow_entry_value entry))
+                "actions/deploy-pages@"))))
+      entries;
+
+
+def pages_write_allowed_doc (path : String) (doc : WorkflowDoc) : Bool :=
+    let entries : List WorkflowEntry := workflow_doc_entries doc in
+    andb (str_eq (path_basename path) "ouro-pages.yml")
+      (andb (pages_deploy_guarded entries) (pages_deploy_action entries));
+
+
+def pages_write_path (entry_path : String) : Bool :=
+    orb (str_eq entry_path "jobs/publish-pages/permissions/pages")
+      (str_eq entry_path "jobs/publish-pages/permissions/id-token");
+
+
+def workflow_permission_path (path : String) : Bool :=
+    orb (str_starts path "permissions/")
+      (str_contains path "/permissions/");
+
+
+def workflow_permission_entry_issues (path : String) (doc : WorkflowDoc)
+    (entry : WorkflowEntry) (issues : List GateIssue) : List GateIssue :=
+    match workflow_entry_is_field entry with
+    | False => issues
+    | True =>
+        let entry_path : String := workflow_entry_path entry in
+        let key : String := workflow_entry_key entry in
+        let raw_value : String := workflow_entry_value entry in
+        let value : String := workflow_scalar_normalized raw_value in
+        let issues0 : List GateIssue :=
+          match andb (str_eq key "permissions")
+                  (notb (str_null (str_trim raw_value))) with
+          | True => workflow_issue_add "permissions must use an explicit block mapping" path issues
+          | False => issues
+          end in
+        match workflow_permission_path entry_path with
+        | False => issues0
+        | True =>
+            match str_eq value "write" with
+            | True =>
+                match orb
+                        (andb
+                          (str_eq entry_path
+                            "jobs/publish-draft-release/permissions/contents")
+                          (release_write_allowed_doc path doc))
+                        (andb (pages_write_path entry_path)
+                          (pages_write_allowed_doc path doc)) with
+                | True => issues0
+                | False => workflow_issue_add
+                    "write permission is allowed only for the guarded draft tag release job or the guarded pages publish job"
+                    path issues0
+                end
+            | False =>
+                match orb (str_eq value "read") (str_eq value "none") with
+                | True => issues0
+                | False => workflow_issue_add "unsupported workflow permission value" path issues0
+                end
+            end
+        end
+    end;
+
+
+def workflow_has_upload_action (entries : List WorkflowEntry) : Bool :=
+    any WorkflowEntry
+      (fun (entry : WorkflowEntry) =>
+        andb (workflow_entry_is_field entry)
+          (andb (str_eq (workflow_entry_key entry) "uses")
+            (str_starts (workflow_scalar_unquote (workflow_entry_value entry))
+              "actions/upload-artifact@")))
+      entries;
+
+
+def workflow_permission_issues_for_doc (path : String) (doc : WorkflowDoc)
+    (issues : List GateIssue) : List GateIssue :=
+    let entries : List WorkflowEntry := workflow_doc_entries doc in
+    let issues0 : List GateIssue :=
+      workflow_required_structure_issues path entries
+        (append GateIssue issues (workflow_doc_issues doc)) in
+    let issues1 : List GateIssue :=
+      foldl WorkflowEntry (List GateIssue)
+        (fun (acc : List GateIssue) (entry : WorkflowEntry) =>
+          workflow_permission_entry_issues path doc entry acc)
+        issues0 entries in
+    match str_eq (path_basename path) "dependency-review.yml" with
+    | True => issues1
+    | False =>
+        match workflow_has_upload_action entries with
+        | True => issues1
+        | False => workflow_issue_add "missing report artifact upload" path issues1
+        end
+    end;
+
+
+def workflow_permission_issues_for_text (path : String) (text : String) (issues : List GateIssue)
+    : List GateIssue :=
+    workflow_permission_issues_for_doc path (workflow_parse path text) issues;
+
+
+def workflow_permission_file_issues (root : String) (path : String) (issues : List GateIssue)
+    : IO (List GateIssue) :=
+    workflow_with_file_text root path issues
+      (fun (text : String) =>
+        workflow_permission_issues_for_text path text issues)
+
+
+def workflow_permission_paths_issues (root : String) (paths : List String)
+    (issues : List GateIssue) : IO (List GateIssue) :=
+  io_fold String (List GateIssue)
+    (fun (acc : List GateIssue) (path : String) =>
+      workflow_permission_file_issues root path acc)
+    issues paths;
+
+
+def workflow_permissions_check (root : String) : IO GateCheck :=
+    do let! walked := workflow_paths_checked root;
+       match walked with
+       | FsWalkComplete paths =>
+           do let! issues := workflow_permission_paths_issues root paths (Nil GateIssue);
+              io_pure GateCheck
+                (workflow_gate_check_metrics "workflow-permissions-sanity"
+                  ([ workflow_nat_metric "workflows" (length String paths) ] : List GateMetric) issues)
+       | FsWalkTruncated _ => io_pure GateCheck
+           (workflow_gate_check "workflow-permissions-sanity"
+             ([ gate_issue (fs_walk_message walked) ".github/workflows" ] : List GateIssue))
+       | FsWalkUnreadable _ => io_pure GateCheck
+           (workflow_gate_check "workflow-permissions-sanity"
+             ([ gate_issue (fs_walk_message walked) ".github/workflows" ] : List GateIssue))
+       | FsWalkUnsafe _ => io_pure GateCheck
+           (workflow_gate_check "workflow-permissions-sanity"
+             ([ gate_issue (fs_walk_message walked) ".github/workflows" ] : List GateIssue))
+       end

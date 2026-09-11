@@ -1,0 +1,135 @@
+-- Deterministic Core generators retain the old scoped and typed property domains.
+import "../compiler/file_elab.ouro";
+import "../std/cli.ouro";
+import "../std/io.ouro";
+import "../std/word.ouro";
+import "../std/fs.ouro";
+
+def property_fuel : Nat := mul 20 50;
+
+-- Generation is untrusted test data. Word32 operations keep the replay state
+-- separate from small bounded choices, so larger runs do not repeat every 997
+-- samples or couple the goal to the term's outer constructor.
+def property_mix (mixed : Nat) : Nat :=
+    let first : Nat := xor32
+        (mul (xor32 mixed (shr32 mixed 16)) (w32_of_bytes 127 235 53 45)) 0 in
+    let second : Nat := xor32
+        (mul (xor32 first (shr32 first 15)) (w32_of_bytes 132 108 166 139)) 0 in
+    xor32 second (shr32 second 16);
+
+def property_seed (seed : Nat) (salt : Nat) : Nat :=
+    property_mix (xor32 (property_mix seed) (add32 salt (mul 61 37)));
+
+def property_choice (seed : Nat) (bound : Nat) : Nat :=
+    mod_nat (and32 seed 255) bound;
+
+def property_even (seed : Nat) : Bool := eqNat (and32 seed 1) 0;
+
+def property_nat : CoreTerm := CInd 10;
+def property_bool : CoreTerm := CInd 20;
+def property_zero : CoreTerm := CConstruct 10 0 0;
+def property_succ : CoreTerm := CConstruct 10 1 0;
+def property_false : CoreTerm := CConstruct 20 0 0;
+def property_true : CoreTerm := CConstruct 20 1 0;
+def property_function : CoreTerm := CPi property_nat property_nat;
+def property_nat_case : CaseInfo := MkCaseInfo 10 0 ([0, 1] : List Nat);
+def property_bool_case : CaseInfo := MkCaseInfo 20 0 ([0, 0] : List Nat);
+
+def property_declarations : List FileItem :=
+    [ FInd (MkIndDecl 10 ([] : List Param) ([] : List CoreTerm) 0
+        ([MkCtor 11 property_nat, MkCtor 12 property_function] : List Ctor))
+    , FInd (MkIndDecl 20 ([] : List Param) ([] : List CoreTerm) 0
+        ([MkCtor 21 property_bool, MkCtor 22 property_bool] : List Ctor))
+    , FDef 30 property_function (CLam property_nat (CRel 0))
+    , FDef 31 property_nat (CApp property_succ property_zero)
+    , FDef 32 (CPi property_bool property_bool)
+        (CLam property_bool (CCase property_bool_case (CLam property_bool property_bool)
+          (CRel 0) ([property_true, property_false] : List CoreTerm)))
+    ];
+
+def property_environment (token : Nat) : DeclarationResult :=
+    check_declarations CheckExactCore keep_checking (add property_fuel token) property_declarations;
+
+inductive PropertyGoal : Type :=
+  | PropertyNat : PropertyGoal
+  | PropertyBool : PropertyGoal
+  | PropertyFunction : PropertyGoal
+  | PropertyType : PropertyGoal;
+
+def property_goal (seed : Nat) : PropertyGoal :=
+    match property_choice seed 4 with
+    | Z => PropertyNat
+    | S first => match first with
+        | Z => PropertyBool
+        | S second => match second with | Z => PropertyFunction | S _ => PropertyType end
+        end
+    end;
+
+def property_goal_type (goal : PropertyGoal) : CoreTerm :=
+    match goal with
+    | PropertyNat => property_nat | PropertyBool => property_bool
+    | PropertyFunction => property_function | PropertyType => CSort 0
+    end;
+
+def property_goal_leaf (goal : PropertyGoal) (seed : Nat) : CoreTerm :=
+    let first : Bool := property_even seed in
+    match goal with
+    | PropertyNat => match first with | True => property_zero | False => CConst 31 end
+    | PropertyBool => match first with | True => property_false | False => property_true end
+    | PropertyFunction => match first with | True => property_succ | False => CConst 30 end
+    | PropertyType => match first with | True => property_nat | False => property_bool end
+    end;
+
+def property_typed_leaf (goal : PropertyGoal) (seed : Nat) (context : List CoreTerm) : CoreTerm :=
+    let matches : CoreTerm -> Bool :=
+      fun (typ : CoreTerm) => eqTerm property_fuel typ (property_goal_type goal) in
+    let target : Nat := property_choice seed (add 2 (count_if CoreTerm matches context)) in
+    (fix choose (rest : List CoreTerm) (index : Nat) (selected : Nat) : CoreTerm :=
+      match rest with
+      -- The two remaining positions select the two closed leaves.
+      | Nil => property_goal_leaf goal selected
+      | Cons typ tail =>
+          match matches typ with
+          | True => match selected with
+              | Z => CRel index | S next => choose tail (S index) next end
+          | False => choose tail (S index) selected
+          end
+      end) context 0 target;
+
+def property_equal (left : CoreTerm) (right : CoreTerm) : Bool :=
+    match eqTerm_checked property_fuel left right with
+    | Normalized same => same | NormalizeExhausted => False | NormalizeMalformed _ => False
+    end;
+
+def property_converts (entries : List Entry) (left : CoreTerm) (right : CoreTerm) : Bool :=
+    match conv_checked property_fuel entries left right with
+    | Normalized same => same | NormalizeExhausted => False | NormalizeMalformed _ => False
+    end;
+
+def property_require (condition : Bool) (name : String)
+    (next : Unit -> Maybe String) : Maybe String :=
+    match condition with | False => Just String name | True => next MkUnit end;
+
+def property_from_check (A : Type) (name : String) (result : CheckResult A)
+    (next : A -> Maybe String) : Maybe String :=
+    match result with
+    | CheckOk value => next value
+    | CheckErr failure => Just String (str_cat3 name " check-code=" (str_of_nat (check_failure_code 1 failure)))
+    end;
+
+def property_from_normal (name : String) (result : NormalizeResult CoreTerm)
+    (next : CoreTerm -> Maybe String) : Maybe String :=
+    match result with
+    | Normalized value => next value
+    | NormalizeExhausted => Just String (str_concat name " exhausted")
+    | NormalizeMalformed _ => Just String (str_concat name " malformed")
+    end;
+
+def property_nats (values : List Nat) : String :=
+    str_join "," (map Nat String str_of_nat values);
+
+-- The existing Core diagnostic encoding is sufficient for replay reports.
+-- Generated trees (fuel <= 5) and fixed shapes are far below this print bound;
+-- the encoding is never used as an equality, scope, or acceptance oracle.
+def property_show (term : CoreTerm) : String :=
+    str_cat3 "core[" (property_nats (encode property_fuel term)) "]";

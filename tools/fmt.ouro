@@ -1,0 +1,452 @@
+-- Formatter CLI writes only when requested and only after token/fixpoint
+-- validation; check mode keeps CI fail-closed on drift or unsafe candidates.
+
+-- @entry main
+
+import "fmt_pipeline.ouro";
+import "../std/io.ouro";
+import "../std/fs.ouro";
+import "../std/args.ouro";
+
+-- Exit status is the union over files, so one unformatted file fails the run
+-- but every file still gets reported.
+def fmt_write (path : String) (src : String) (out : String) : IO Bool :=
+    match str_eq src out with
+    | True => io_pure Bool True
+    | False =>
+        do let! written := fs_write_checked path out;
+           match written with
+           | Left e =>
+               do eprintln (str_cat3 path ": " (fs_error_message e));
+                  io_pure Bool False
+           | Right _ =>
+               do println (concat "formatted " path);
+                  io_pure Bool True
+           end
+    end
+
+
+def fmt_loaded (a : Args) (path : String) (src : String) : IO Bool :=
+    match fmt_checked src with
+    | Left e =>
+        do eprintln (str_cat3 path ": " (fmt_error_message e));
+           io_pure Bool False
+    | Right out =>
+        match args_flag a "check" with
+        | True =>
+            match str_eq src out with
+            | True => io_pure Bool True
+            | False =>
+                do eprintln (concat path ": needs formatting");
+                   io_pure Bool False
+            end
+        | False =>
+            match args_flag a "write" with
+            | True => fmt_write path src out
+            | False =>
+                do print out;
+                   io_pure Bool True
+            end
+        end
+    end
+
+
+def fmt_one (a : Args) (path : String) : IO Bool :=
+    do let! present := fs_exists path;
+       match present with
+       | False =>
+           do eprintln (concat path ": no such file");
+              io_pure Bool False
+       | True =>
+           do let! loaded := fs_read_checked path;
+              match loaded with
+              | Left e =>
+                  do eprintln (str_cat3 path ": " (fs_error_message e));
+                     io_pure Bool False
+              | Right src => fmt_loaded a path src
+              end
+       end
+
+def fmt_and (a : Args) (ok : Bool) (path : String) : IO Bool :=
+    do let! one := fmt_one a path;
+       io_pure Bool (andb ok one)
+
+def fmt_run (a : Args) : IO Unit :=
+    match args_positional a with
+    | Nil => do eprintln "usage: ouro-fmt [--check | --write] FILE...";
+                exit 2
+    | Cons p ps =>
+        do let! ok := io_fold String Bool (fmt_and a) True (Cons String p ps);
+           exit (match ok with | True => Z | False => S Z end)
+    end;
+
+inductive FmtSelftestResult : Type :=
+  | MkFmtSelftestResult : String -> Bool -> String -> FmtSelftestResult;
+
+
+def fmt_selftest_result_name (r : FmtSelftestResult) : String :=
+    match r with | MkFmtSelftestResult name _ _ => name end;
+
+
+def fmt_selftest_result_pass (r : FmtSelftestResult) : Bool :=
+    match r with | MkFmtSelftestResult _ passed _ => passed end;
+
+
+def fmt_selftest_result_issue (r : FmtSelftestResult) : String :=
+    match r with | MkFmtSelftestResult _ _ issue => issue end;
+
+
+def fmt_selftest_lf (text : String) : String :=
+    str_replace text "\r" "";
+
+
+def fmt_selftest_write (path : String) (content : String) : IO Unit :=
+    do let! written := fs_write_checked path content;
+       match written with
+       | Left e => do eprintln (str_concat "FMT_SUITE: FAIL " (fs_error_message e));
+                      exit (S Z)
+       | Right _ => io_unit
+       end
+
+
+def fmt_selftest_read (path : String) : IO String :=
+    do let! loaded := fs_read_checked path;
+       match loaded with
+       | Left e => do eprintln (str_concat "FMT_SUITE: FAIL " (fs_error_message e));
+                      exit (S Z);
+                      io_pure String ""
+       | Right text => io_pure String text
+       end
+
+
+def fmt_selftest_mkdir (path : String) : IO Unit :=
+    do let! made := fs_mkdir_p_checked path;
+       match made with
+       | Left e => do eprintln (str_concat "FMT_SUITE: FAIL " (fs_error_message e));
+                      exit (S Z)
+       | Right _ => io_unit
+       end
+
+
+def fmt_selftest_copy (src : String) (dst : String) : IO Unit :=
+    do let! copied := fs_copy_checked src dst;
+       match copied with
+       | Left e => do eprintln (str_concat "FMT_SUITE: FAIL " (fs_error_message e));
+                      exit (S Z)
+       | Right _ => io_unit
+       end
+
+
+def fmt_selftest_failure (name : String) (issue : String) : IO FmtSelftestResult :=
+    do eprintln (str_cat4 "FMT_FAIL " name " " issue);
+       io_pure FmtSelftestResult (MkFmtSelftestResult name False issue)
+
+
+def fmt_selftest_success (name : String) : IO FmtSelftestResult :=
+    do println (str_concat "FMT_OK " name);
+       io_pure FmtSelftestResult (MkFmtSelftestResult name True "")
+
+
+def fmt_selftest_expected (probe_failure : Bool) (name : String) (golden : String)
+    : String :=
+    match andb probe_failure (str_eq name "messy") with
+    | True => str_concat golden "deliberate selftest mismatch\n"
+    | False => golden
+    end;
+
+
+def fmt_selftest_fixture_issue (name : String) (source : String)
+    (actual : String) (expected : String) (again_out : String) : String :=
+    match str_eq actual expected with
+    | False => "output"
+    | True =>
+        match str_eq again_out expected with
+        | False => "idempotence"
+        | True =>
+            match andb (str_eq name "messy") (str_eq source actual) with
+            | True => "check-dirty exit=0"
+            | False => ""
+            end
+        end
+    end;
+
+
+def fmt_selftest_fixture (fixtures : String) (out : String) (probe_failure : Bool)
+    (name : String) : IO FmtSelftestResult :=
+    let src : String := fs_child fixtures (str_concat name ".in") in
+    let golden_path : String := fs_child fixtures (str_concat name ".golden") in
+    do let! source := fmt_selftest_read src;
+       let! golden := fmt_selftest_read golden_path;
+       let actual : String := fmt_selftest_lf (fmt_string source) in
+       let again_out : String := fmt_selftest_lf (fmt_string golden) in
+       let expected : String := fmt_selftest_expected probe_failure name golden in
+       do fmt_selftest_write (fs_child out (str_concat name ".out")) actual;
+          fmt_selftest_write (fs_child out (str_concat name ".diff"))
+            (match str_eq actual expected with
+             | True => ""
+             | False => "output mismatch\n"
+             end);
+          fmt_selftest_write (fs_child out (str_concat name ".again")) again_out;
+          fmt_selftest_write (fs_child out (str_concat name ".idem"))
+            (match str_eq again_out expected with
+             | True => ""
+             | False => "idempotence mismatch\n"
+             end);
+          fmt_selftest_write (fs_child out (str_concat name ".err"))
+            (match andb (str_eq name "messy") (notb (str_eq source actual)) with
+             | True => str_cat3 src ": needs formatting" "\n"
+             | False => ""
+             end);
+          let issue : String := fmt_selftest_fixture_issue name source actual
+            expected again_out in
+          match str_null issue with
+          | True => fmt_selftest_success name
+          | False => fmt_selftest_failure name issue
+          end
+
+
+-- A raw CR in a quoted token must not be normalized by a line-oriented
+-- candidate. Exercise the actual --write path and compare bytes afterwards.
+def fmt_selftest_refusal (out : String) : IO Bool :=
+    let path : String := fs_child out "token-refusal.in" in
+    let source : String := "def text : String := \"a\rb\";\n" in
+    let a : Args := args_of_argv_bools
+      (["write"] : List String) (["ouro-fmt", "--write"] : List String) in
+    do fmt_selftest_write path source;
+       let! accepted := fmt_loaded a path source;
+       let! after := fmt_selftest_read path;
+       io_pure Bool (andb (notb accepted) (str_eq source after))
+
+
+def fmt_selftest_write_case (fixtures : String) (out : String) : IO FmtSelftestResult :=
+    let path : String := fs_child out "write.in" in
+    let a : Args := args_of_argv_bools
+      (["write"] : List String) (["ouro-fmt", "--write"] : List String) in
+    do fmt_selftest_copy (fs_child fixtures "messy.in") path;
+       let! source := fmt_selftest_read path;
+       let! written := fmt_loaded a path source;
+       let! actual := fmt_selftest_read path;
+       let! golden := fmt_selftest_read (fs_child fixtures "messy.golden");
+       let! safe := fmt_selftest_refusal out;
+       let checked : Bool := str_eq actual (fmt_string actual) in
+       let passed : Bool := andb (andb written safe)
+         (andb checked (str_eq (fmt_selftest_lf actual) golden)) in
+       do fmt_selftest_write (fs_child out "write.log")
+            (match str_eq source actual with
+             | True => ""
+             | False => str_cat3 "formatted " path "\n"
+             end);
+          fmt_selftest_write (fs_child out "write.diff")
+            (match str_eq (fmt_selftest_lf actual) golden with
+             | True => ""
+             | False => "write mismatch\n"
+             end);
+          match passed with
+          | True => fmt_selftest_success "write"
+          | False => fmt_selftest_failure "write" "mode-or-token-safety"
+          end
+
+
+def fmt_selftest_tree_files : IO (List String) :=
+    do let! std_files := fs_walk_ouro "std";
+       let! sample_files := fs_walk_ouro "samples";
+       let! tool_files := fs_walk_ouro "tools";
+       io_pure (List String)
+         (str_sort (append String std_files (append String sample_files tool_files)))
+
+
+def run_fmt_selftest_tree_prepare (out : String) : IO Unit :=
+    do let! files := fmt_selftest_tree_files;
+       fmt_selftest_write (fs_child out "tree.list")
+         (str_concat (str_unlines files) "\n");
+       exit Z
+
+
+def fmt_selftest_tree_row_count (out : String) : IO Nat :=
+    do let! listing := fmt_selftest_read (fs_child out "tree.list");
+       io_pure Nat (length String (str_lines (str_trim listing)))
+
+
+def fmt_selftest_result_row (r : FmtSelftestResult) : String :=
+    str_join "\t"
+      ([ fmt_selftest_result_name r
+       , show_bool (fmt_selftest_result_pass r)
+       , fmt_selftest_result_issue r
+       ] : List String);
+
+
+def fmt_selftest_report (results : List FmtSelftestResult) : String :=
+    str_concat
+      (str_unlines
+        (Cons String "name\tpass\tissue"
+          (map FmtSelftestResult String fmt_selftest_result_row results))) "\n";
+
+
+def fmt_selftest_failure_count (results : List FmtSelftestResult) : Nat :=
+    count_if FmtSelftestResult
+      (fun (r : FmtSelftestResult) => notb (fmt_selftest_result_pass r)) results;
+
+
+def fmt_selftest_finish (out : String) (display_out : String)
+    (results : List FmtSelftestResult) : IO Unit :=
+    do fmt_selftest_write (fs_child out "selftest-report.tsv")
+         (fmt_selftest_report results);
+       match eq_nat (fmt_selftest_failure_count results) Z with
+       | True => do println
+            (str_cat3 "FMT_SUITE: PASS rows="
+              (show_nat (length FmtSelftestResult results))
+              (str_concat " out=" display_out));
+                    exit Z
+       | False => do eprintln
+            (str_cat3 "FMT_SUITE: FAIL rows="
+              (show_nat (length FmtSelftestResult results))
+              (str_concat " failures="
+                (show_nat (fmt_selftest_failure_count results))));
+                     exit (S Z)
+       end
+
+
+def fmt_selftest_result_path (out : String) (name : String) : String :=
+    fs_child out (str_concat ".selftest-" (str_concat name ".result"));
+
+
+def fmt_selftest_store_result (out : String) (result : FmtSelftestResult)
+    : IO Unit :=
+    fmt_selftest_write
+      (fmt_selftest_result_path out (fmt_selftest_result_name result))
+      (str_concat (fmt_selftest_result_row result) "\n")
+
+
+def fmt_selftest_worker_finish (out : String) (result : FmtSelftestResult)
+    : IO Unit :=
+    do fmt_selftest_store_result out result;
+       exit
+         (match fmt_selftest_result_pass result with
+          | True => Z
+          | False => S Z
+          end)
+
+
+def run_fmt_selftest_tree_finalize (a : Args) : IO Unit :=
+    let out : String := args_opt_or a "out" "_build/fmt_suite" in
+    let passed : Bool := notb (args_flag a "tree-failed") in
+    let result : FmtSelftestResult :=
+      MkFmtSelftestResult "tree" passed
+        (match passed with | True => "" | False => "unformatted" end) in
+    do let! tree_rows := fmt_selftest_tree_row_count out;
+       match passed with
+       | True => println
+           (str_cat3 "FMT_OK tree files=" (show_nat tree_rows) "")
+       | False => eprintln "FMT_FAIL tree unformatted"
+       end;
+       fmt_selftest_worker_finish out result
+
+
+def run_fmt_selftest_worker (a : Args) (name : String) : IO Unit :=
+    let fixtures : String := args_opt_or a "fixtures" "_build/smith/fixtures/fmt" in
+    let out : String := args_opt_or a "out" "_build/fmt_suite" in
+    do fmt_selftest_mkdir out;
+       match str_eq name "write" with
+       | True => do let! result := fmt_selftest_write_case fixtures out;
+                    fmt_selftest_worker_finish out result
+       | False =>
+           do let! result := fmt_selftest_fixture fixtures out
+                (args_flag a "selftest-probe-failure") name;
+              fmt_selftest_worker_finish out result
+       end
+
+
+def fmt_selftest_parse_result (text : String) : FmtSelftestResult :=
+    let fields : List String := str_split (str_trim text) 9 in
+    MkFmtSelftestResult
+      (nth String "" Z fields)
+      (str_eq (nth String "" (S Z) fields) "true")
+      (nth String "" (S (S Z)) fields);
+
+
+def fmt_selftest_load_results (out : String)
+    : List String -> IO (List FmtSelftestResult) :=
+  fix fmt_selftest_load_results (names : List String)
+      : IO (List FmtSelftestResult) :=
+    match names with
+    | Nil => io_pure (List FmtSelftestResult) (Nil FmtSelftestResult)
+    | Cons name rest =>
+        let path : String := fmt_selftest_result_path out name in
+        do let! text := fmt_selftest_read path;
+           fs_remove path;
+           let! results := fmt_selftest_load_results rest;
+           io_pure (List FmtSelftestResult)
+             (Cons FmtSelftestResult (fmt_selftest_parse_result text) results)
+    end;
+
+
+def run_fmt_selftest_finalize (a : Args) : IO Unit :=
+    let out : String := args_opt_or a "out" "_build/fmt_suite" in
+    let display_out : String := args_opt_or a "display-out" out in
+    do let! results := fmt_selftest_load_results out
+         ([ "clean", "messy", "syntax_keep", "write", "tree" ] : List String);
+       fmt_selftest_finish out display_out results
+
+
+def fmt_selftest_orchestrator : String :=
+    "exe=$1\nout=$2\ndisplay=$3\nprobe=$4\nlauncher=$5\nfixtures=$6\nrun_case() {\n  if [ \"$probe\" = true ]; then\n    \"$exe\" \"--selftest-worker=$1\" \"--out=$out\" \"--fixtures=$fixtures\" --selftest-probe-failure || :\n  else\n    \"$exe\" \"--selftest-worker=$1\" \"--out=$out\" \"--fixtures=$fixtures\" || :\n  fi\n}\nrun_case clean\nrun_case messy\nrun_case syntax_keep\nrun_case write\n\"$exe\" --selftest-tree-prepare \"--out=$out\" || exit 1\n: > \"$out/tree.log\"\ntree_failed=false\nwhile IFS= read -r path; do\n  \"$exe\" --check \"$path\" >> \"$out/tree.log\" 2>&1 || tree_failed=true\ndone < \"$out/tree.list\"\nif [ \"$tree_failed\" = true ]; then\n  \"$exe\" --selftest-tree-finalize --tree-failed \"--out=$out\" || :\nelse\n  \"$exe\" --selftest-tree-finalize \"--out=$out\" || :\nfi\nrm -f \"$launcher\"\n\"$exe\" --selftest-finalize \"--out=$out\" \"--display-out=$display\"\n";
+
+
+def run_fmt_selftest_plan (a : Args) : IO Unit :=
+    let out : String := args_opt_or a "out" "_build/fmt_suite" in
+    let launcher : String := fs_child out ".fmt-selftest-launcher.sh" in
+    do fmt_selftest_mkdir out;
+       fmt_selftest_write launcher fmt_selftest_orchestrator;
+       println (show_bool (args_flag a "selftest-probe-failure"));
+       exit Z
+
+
+def run_fmt_selftest (exe : String) (a : Args) : IO Unit :=
+    let fixtures : String := args_opt_or a "fixtures" "_build/smith/fixtures/fmt" in
+    let out : String := args_opt_or a "out" "_build/fmt_suite" in
+    let launcher : String := fs_child out ".fmt-selftest-launcher.sh" in
+    do let! display_out := env_or "FMT_SUITE_DISPLAY_OUT" out;
+       fmt_selftest_mkdir out;
+       fmt_selftest_write launcher fmt_selftest_orchestrator;
+       let! result := proc_exec "sh"
+         ([ launcher, exe, out, display_out
+          , show_bool (args_flag a "selftest-probe-failure"), launcher, fixtures
+          ] : List String);
+       do print (proc_stdout result);
+          eprint (proc_stderr result);
+          exit (proc_code result)
+
+
+def fmt_switches : List String :=
+    [ "check", "write", "selftest", "selftest-probe-failure", "selftest-finalize"
+    , "selftest-tree-prepare", "selftest-tree-finalize", "selftest-plan"
+    , "tree-failed" ];
+
+def main : IO Unit :=
+    do let! argv := prim_argv;
+       let a : Args := args_of_argv_bools fmt_switches argv in
+       match args_opt a "selftest-worker" with
+       | Just name => run_fmt_selftest_worker a name
+       | Nothing =>
+           match args_flag a "selftest-plan" with
+           | True => run_fmt_selftest_plan a
+           | False =>
+               match args_flag a "selftest-tree-prepare" with
+               | True => run_fmt_selftest_tree_prepare
+                   (args_opt_or a "out" "_build/fmt_suite")
+               | False =>
+               match args_flag a "selftest-tree-finalize" with
+               | True => run_fmt_selftest_tree_finalize a
+               | False =>
+                   match args_flag a "selftest-finalize" with
+                   | True => run_fmt_selftest_finalize a
+                   | False =>
+                       match args_flag a "selftest" with
+                       | True => run_fmt_selftest (nth String "" Z argv) a
+                       | False => fmt_run a
+                       end
+                       end
+                   end
+               end
+           end
+       end

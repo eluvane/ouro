@@ -1,0 +1,158 @@
+-- Two deterministic passes over typed instructions. Local branches use label
+-- offsets; cross-function/data/import references become checked PE fixups.
+import "codegen_model.ouro";
+
+def codegen_atom_instruction (atom : CodegenAtom) : Maybe X64Instruction :=
+    match atom with
+    | CodegenInstruction instruction => Just X64Instruction instruction
+    | CodegenJump _ => Just X64Instruction (X64JumpRelative (codegen_disp 0))
+    | CodegenJumpIf condition _ => Just X64Instruction (X64JumpIf condition (codegen_disp 0))
+    | CodegenDirectCall _ => Just X64Instruction (X64CallRelative (codegen_disp 0))
+    | CodegenImportCall _ => Just X64Instruction (X64CallIndirect (X64MemoryOperand (X64Rip (codegen_disp 0))))
+    | CodegenSymbolAddress _ imported => Just X64Instruction
+        (match imported with | True => X64Load X64Bits64 X64Rax (X64Rip (codegen_disp 0))
+          | False => X64Lea X64Rax (X64Rip (codegen_disp 0)) end)
+    | CodegenMark _ => Nothing X64Instruction | CodegenBoundary _ _ => Nothing X64Instruction end;
+
+def codegen_encode_maybe (instruction : Maybe X64Instruction) : Either NativeCodegenError (List Nat) :=
+    match instruction with | Nothing => Right NativeCodegenError (List Nat) ([] : List Nat)
+    | Just operation => mapLeft X64EncodeError (List Nat) NativeCodegenError
+        (fun (err : X64EncodeError) => NativeEncodingError err) (x64_encode operation) end;
+
+-- The first pass validates every instruction and retains its exact encoded
+-- bytes. Local branches are encoded again only after their targets are known.
+-- Keeping the complete first pass preserves error order: an invalid operand
+-- anywhere precedes resolution errors such as a missing earlier branch label.
+inductive CodegenMeasured : Type :=
+  | CodegenMeasuredAtom : CodegenAtom -> List Nat -> CodegenMeasured;
+
+inductive CodegenLayout : Type :=
+  | CodegenLayoutOf : List CodegenLabelAt -> List CodegenMeasured -> CodegenLayout;
+
+def codegen_measure : List CodegenAtom -> Nat -> Either NativeCodegenError CodegenLayout :=
+  fix measure (atoms : List CodegenAtom) (offset : Nat) : Either NativeCodegenError CodegenLayout :=
+    match atoms with | Nil => Right NativeCodegenError CodegenLayout
+        (CodegenLayoutOf ([] : List CodegenLabelAt) ([] : List CodegenMeasured))
+    | Cons atom rest => match codegen_encode_maybe (codegen_atom_instruction atom) with
+      | Left err => Left NativeCodegenError CodegenLayout err
+      | Right bytes => match leb_nat (length Nat bytes) (sub pe_max_rva offset) with
+        | False => Left NativeCodegenError CodegenLayout NativeCodeTooLarge
+        | True => mapRight NativeCodegenError CodegenLayout CodegenLayout
+            (fun (layout : CodegenLayout) => match layout with | CodegenLayoutOf labels measured =>
+              CodegenLayoutOf (match atom with
+                | CodegenMark label => Cons CodegenLabelAt (CodegenLabelOffset label offset) labels
+                | CodegenInstruction _ => labels | CodegenJump _ => labels | CodegenJumpIf _ _ => labels
+                | CodegenDirectCall _ => labels | CodegenImportCall _ => labels
+                | CodegenSymbolAddress _ _ => labels | CodegenBoundary _ _ => labels end)
+                (Cons CodegenMeasured (CodegenMeasuredAtom atom bytes) measured) end)
+            (measure rest (add offset (length Nat bytes))) end end end;
+
+def codegen_labels (atoms : List CodegenAtom) (offset : Nat)
+    : Either NativeCodegenError (List CodegenLabelAt) :=
+    mapRight NativeCodegenError CodegenLayout (List CodegenLabelAt)
+      (fun (layout : CodegenLayout) => match layout with | CodegenLayoutOf labels _ => labels end)
+      (codegen_measure atoms offset);
+
+def codegen_find_label (label : CodegenLabel) : List CodegenLabelAt -> Either NativeCodegenError Nat :=
+  fix codegen_find_label (labels : List CodegenLabelAt) : Either NativeCodegenError Nat :=
+    match labels with
+    | Nil => Left NativeCodegenError Nat (NativeMissingLabel (match label with
+        | CodegenBlockLabel id => id | CodegenSiteLabel id _ _ => id end))
+    | Cons item rest => match item with | CodegenLabelOffset other offset =>
+      match codegen_label_equal label other with | True => Right NativeCodegenError Nat offset
+        | False => codegen_find_label rest end end end;
+
+def codegen_encode_atom (labels : List CodegenLabelAt) (offset : Nat) (atom : CodegenAtom)
+    : Either NativeCodegenError (List Nat) :=
+    match atom with
+    | CodegenJump label => match codegen_find_label label labels with
+      | Left err => Left NativeCodegenError (List Nat) err | Right target =>
+        codegen_encode_maybe (Just X64Instruction (X64JumpRelative (codegen_relative target (add offset 5)))) end
+    | CodegenJumpIf condition label => match codegen_find_label label labels with
+      | Left err => Left NativeCodegenError (List Nat) err | Right target =>
+        codegen_encode_maybe (Just X64Instruction (X64JumpIf condition (codegen_relative target (add offset 6)))) end
+    | CodegenInstruction _ => codegen_encode_maybe (codegen_atom_instruction atom)
+    | CodegenDirectCall _ => codegen_encode_maybe (codegen_atom_instruction atom)
+    | CodegenImportCall _ => codegen_encode_maybe (codegen_atom_instruction atom)
+    | CodegenSymbolAddress _ _ => codegen_encode_maybe (codegen_atom_instruction atom)
+    | CodegenMark _ => Right NativeCodegenError (List Nat) ([] : List Nat)
+    | CodegenBoundary _ _ => Right NativeCodegenError (List Nat) ([] : List Nat) end;
+
+def codegen_atom_fixups (offset : Nat) (atom : CodegenAtom) : List PeFixup :=
+    match atom with
+    | CodegenDirectCall id => ([PeRel32 PeText (add offset 1) (add offset 5) (PeSymbolTarget id)] : List PeFixup)
+    | CodegenImportCall id => ([PeRel32 PeText (add offset 2) (add offset 6) (PeImportTarget id)] : List PeFixup)
+    | CodegenSymbolAddress id imported => ([PeRel32 PeText (add offset 3) (add offset 7)
+        (match imported with | True => PeImportTarget id | False => PeSymbolTarget id end)] : List PeFixup)
+    | CodegenInstruction _ => ([] : List PeFixup) | CodegenJump _ => ([] : List PeFixup) | CodegenJumpIf _ _ => ([] : List PeFixup)
+    | CodegenMark _ => ([] : List PeFixup) | CodegenBoundary _ _ => ([] : List PeFixup) end;
+
+def codegen_prepend (base : Nat) (offset : Nat) (atom : CodegenAtom)
+    (bytes : List Nat) (encoded : CodegenEncoded) : CodegenEncoded :=
+    match encoded with | CodegenEncodedParts tail fixups calls =>
+      let absolute : Nat := add base offset in
+      CodegenEncodedParts (append Nat bytes tail)
+        (append PeFixup (codegen_atom_fixups absolute atom) fixups)
+        (match atom with
+          | CodegenBoundary block site => Cons NativeCallSite (NativeCallAt block site (add pe_section_alignment absolute)) calls
+          | CodegenInstruction _ => calls | CodegenJump _ => calls | CodegenJumpIf _ _ => calls
+          | CodegenDirectCall _ => calls | CodegenImportCall _ => calls | CodegenSymbolAddress _ _ => calls
+          | CodegenMark _ => calls end) end;
+
+def codegen_emit_atoms (labels : List CodegenLabelAt) (base : Nat)
+    : List CodegenAtom -> Nat -> Either NativeCodegenError CodegenEncoded :=
+  fix codegen_emit_atoms (atoms : List CodegenAtom) (offset : Nat) : Either NativeCodegenError CodegenEncoded :=
+    match atoms with | Nil => Right NativeCodegenError CodegenEncoded
+        (CodegenEncodedParts ([] : List Nat) ([] : List PeFixup) ([] : List NativeCallSite))
+    | Cons atom rest => match codegen_encode_atom labels offset atom with
+      | Left err => Left NativeCodegenError CodegenEncoded err | Right bytes =>
+        match codegen_emit_atoms rest (add offset (length Nat bytes)) with
+        | Left err => Left NativeCodegenError CodegenEncoded err | Right encoded =>
+          Right NativeCodegenError CodegenEncoded (codegen_prepend base offset atom bytes encoded) end end end;
+
+-- These measured bytes are produced afresh by codegen_measure inside
+-- codegen_assemble; a caller-supplied layout is not an acceptance certificate.
+def codegen_emit_measured (labels : List CodegenLabelAt) (base : Nat)
+    : List CodegenMeasured -> Nat -> Either NativeCodegenError CodegenEncoded :=
+  fix emit (measured : List CodegenMeasured) (offset : Nat) : Either NativeCodegenError CodegenEncoded :=
+    match measured with | Nil => Right NativeCodegenError CodegenEncoded
+        (CodegenEncodedParts ([] : List Nat) ([] : List PeFixup) ([] : List NativeCallSite))
+    | Cons item rest => match item with | CodegenMeasuredAtom atom saved =>
+      let encoded : Either NativeCodegenError (List Nat) := match atom with
+        | CodegenJump _ => codegen_encode_atom labels offset atom
+        | CodegenJumpIf _ _ => codegen_encode_atom labels offset atom
+        | CodegenInstruction _ => Right NativeCodegenError (List Nat) saved
+        | CodegenDirectCall _ => Right NativeCodegenError (List Nat) saved
+        | CodegenImportCall _ => Right NativeCodegenError (List Nat) saved
+        | CodegenSymbolAddress _ _ => Right NativeCodegenError (List Nat) saved
+        | CodegenMark _ => Right NativeCodegenError (List Nat) saved
+        | CodegenBoundary _ _ => Right NativeCodegenError (List Nat) saved end in
+      match encoded with | Left err => Left NativeCodegenError CodegenEncoded err
+      | Right bytes => mapRight NativeCodegenError CodegenEncoded CodegenEncoded
+          (codegen_prepend base offset atom bytes)
+          (emit rest (add offset (length Nat bytes))) end end end;
+
+def codegen_assemble (atoms : List CodegenAtom) (base : Nat) (initial : Nat) : Either NativeCodegenError CodegenEncoded :=
+    match codegen_measure atoms initial with | Left err => Left NativeCodegenError CodegenEncoded err
+    | Right layout => match layout with | CodegenLayoutOf labels measured =>
+      codegen_emit_measured labels base measured initial end end;
+
+-- A native __chkstk-equivalent leaf. RAX is the allocation, R10 the descending
+-- address, and R11 the remaining count. The call's return slot is skipped.
+-- Each page and the final address is read before the caller changes RSP.
+-- Argument registers and all nonvolatile registers remain unchanged.
+-- This nonallocating leaf is not a GC safepoint; managed argument registers
+-- are spilled immediately after the enclosing prolog finishes.
+-- https://learn.microsoft.com/cpp/build/prolog-and-epilog
+def codegen_probe_atoms : List CodegenAtom :=
+    codegen_join ([
+      codegen_raw ([X64Lea X64R10 (X64Base X64Rsp (codegen_disp 8)), X64Mov X64Bits64 X64R11 X64Rax] : List X64Instruction),
+      ([CodegenMark (CodegenBlockLabel 0)] : List CodegenAtom),
+      codegen_raw ([X64ArithmeticImm32 X64Bits64 X64Compare X64R11 (pe_word32 pe_section_alignment)] : List X64Instruction),
+      ([CodegenJumpIf X64Below (CodegenBlockLabel 1)] : List CodegenAtom),
+      codegen_raw ([X64ArithmeticImm32 X64Bits64 X64Subtract X64R10 (pe_word32 pe_section_alignment),
+        X64TestMemory8 (X64Base X64R10 (codegen_disp 0)) 0,
+        X64ArithmeticImm32 X64Bits64 X64Subtract X64R11 (pe_word32 pe_section_alignment)] : List X64Instruction),
+      ([CodegenJump (CodegenBlockLabel 0), CodegenMark (CodegenBlockLabel 1)] : List CodegenAtom),
+      codegen_raw ([X64ArithmeticReg X64Bits64 X64Subtract X64R10 X64R11,
+        X64TestMemory8 (X64Base X64R10 (codegen_disp 0)) 0, X64Return] : List X64Instruction)] : List (List CodegenAtom));

@@ -1,0 +1,98 @@
+-- Byte offsets and counts are mathematical Nat values. Overflow while
+-- converting to USize takes the specified out-of-range/clamping branch.
+import "managed_strings.ouro";
+import "managed_nat.ouro";
+
+def managed_string_value (value : MirValue) (state : ManagedState) : Either NativeLowerError ManagedResult :=
+    Right NativeLowerError ManagedResult (ManagedResultOf value state);
+
+def managed_string_length_value (compiler : ManagedCompiler) (value : MirValue) (state : ManagedState)
+    : Either NativeLowerError ManagedResult :=
+    lower_bind ManagedResult ManagedResult (managed_string_size compiler value state)
+      (fun (loaded : ManagedResult) => match loaded with | ManagedResultOf length next =>
+        managed_nat_from_word compiler PrimitiveWordUSize length next end);
+
+def managed_string_load_byte (value : MirValue) (index : MirValue) (state : ManagedState)
+    : Either NativeLowerError ManagedResult :=
+    lower_bind ManagedResult ManagedResult (managed_binary MirUSize MirAdd index (managed_bits MirUSize 40) state)
+      (fun (at : ManagedResult) => match at with | ManagedResultOf offset next =>
+        managed_fresh MirU8 (fun (local : Nat) => MirLoadAt local value offset) next end);
+
+def managed_string_byte_at_value (compiler : ManagedCompiler) (value : MirValue) (index : MirValue) (state : ManagedState)
+    : Either NativeLowerError ManagedResult :=
+    lower_bind ManagedResult ManagedResult (managed_string_size compiler value state)
+      (fun (loaded : ManagedResult) => match loaded with | ManagedResultOf length next =>
+        lower_bind ManagedNatWordResult ManagedResult (managed_nat_checked_word compiler PrimitiveWordUSize index next)
+          (fun (converted : ManagedNatWordResult) => match converted with | ManagedNatWordOf fits offset after =>
+            lower_bind ManagedResult ManagedResult (managed_compare MirLess offset length after)
+              (fun (tested : ManagedResult) => match tested with | ManagedResultOf within after_test =>
+                lower_bind ManagedResult ManagedResult (managed_binary MirU8 MirAnd fits within after_test)
+                  (fun (condition : ManagedResult) => match condition with | ManagedResultOf valid after_condition =>
+                    lower_bind ManagedResult ManagedResult (managed_string_choose MirU8 valid
+                      (managed_string_load_byte value offset) (managed_string_value (managed_bits MirU8 0)) after_condition)
+                      (fun (byte : ManagedResult) => match byte with | ManagedResultOf bits finish =>
+                        managed_nat_from_word compiler PrimitiveWordU8 bits finish end) end) end) end) end);
+
+-- Clamp an arbitrary Nat to a machine-sized bound without wrapping it.
+def managed_string_clamp_nat (compiler : ManagedCompiler) (value : MirValue) (maximum : MirValue) (state : ManagedState)
+    : Either NativeLowerError ManagedResult :=
+    lower_bind ManagedNatWordResult ManagedResult (managed_nat_checked_word compiler PrimitiveWordUSize value state)
+      (fun (converted : ManagedNatWordResult) => match converted with | ManagedNatWordOf fits bits next =>
+        lower_bind ManagedResult ManagedResult (managed_compare MirLessEqual bits maximum next)
+          (fun (tested : ManagedResult) => match tested with | ManagedResultOf within after_test =>
+            lower_bind ManagedResult ManagedResult (managed_binary MirU8 MirAnd fits within after_test)
+              (fun (condition : ManagedResult) => match condition with | ManagedResultOf bounded after_condition =>
+                managed_string_choose MirUSize bounded (managed_string_value bits)
+                  (managed_string_value maximum) after_condition end) end) end);
+
+-- The caller has proved start <= input length and count <= length - start.
+def managed_string_copy_slice (compiler : ManagedCompiler) (value : MirValue)
+    (start : MirValue) (count : MirValue) (state : ManagedState) : Either NativeLowerError ManagedResult :=
+    lower_bind ManagedResult ManagedResult (managed_string_allocate compiler count state)
+      (fun (allocated : ManagedResult) => match allocated with | ManagedResultOf result next =>
+        lower_bind ManagedResult ManagedResult (managed_binary MirUSize MirAdd start (managed_bits MirUSize 40) next)
+          (fun (at : ManagedResult) => match at with | ManagedResultOf offset after =>
+            lower_map ManagedState ManagedResult (fun (finish : ManagedState) => ManagedResultOf result finish)
+              (managed_bytes_copy value offset result (managed_bits MirUSize 40) count after) end) end);
+
+def managed_string_slice_value (compiler : ManagedCompiler) (value : MirValue)
+    (start : MirValue) (count : MirValue) (state : ManagedState) : Either NativeLowerError ManagedResult :=
+    lower_bind ManagedResult ManagedResult (managed_string_size compiler value state)
+      (fun (loaded : ManagedResult) => match loaded with | ManagedResultOf length next =>
+        lower_bind ManagedResult ManagedResult (managed_string_clamp_nat compiler start length next)
+          (fun (begin : ManagedResult) => match begin with | ManagedResultOf offset after_start =>
+            lower_bind ManagedResult ManagedResult (managed_binary MirUSize MirSub length offset after_start)
+              (fun (remaining : ManagedResult) => match remaining with | ManagedResultOf available after_remaining =>
+                lower_bind ManagedResult ManagedResult (managed_string_clamp_nat compiler count available after_remaining)
+                  (fun (size : ManagedResult) => match size with | ManagedResultOf bounded finish =>
+                    managed_string_copy_slice compiler value offset bounded finish end) end) end) end);
+
+def managed_string_unary (step : ManagedStep) (scope : ManagedScope)
+    (operation : MirValue -> ManagedState -> Either NativeLowerError ManagedResult)
+    (arguments : List CoreTerm) (state : ManagedState) : Either NativeLowerError ManagedResult :=
+    lower_bind CoreTerm ManagedResult (lower_single CoreTerm arguments)
+      (fun (term : CoreTerm) => lower_bind ManagedResult ManagedResult (step scope term state)
+        (fun (evaluated : ManagedResult) => match evaluated with | ManagedResultOf value next => operation value next end));
+
+def managed_string_binary_values (step : ManagedStep) (scope : ManagedScope)
+    (operation : MirValue -> MirValue -> ManagedState -> Either NativeLowerError ManagedResult)
+    (arguments : List CoreTerm) (state : ManagedState) : Either NativeLowerError ManagedResult :=
+    lower_bind (Pair CoreTerm CoreTerm) ManagedResult (lower_pair CoreTerm arguments)
+      (fun (pair : Pair CoreTerm CoreTerm) => match pair with | MkPair first second =>
+        lower_bind ManagedResult ManagedResult (step scope first state)
+          (fun (left : ManagedResult) => match left with | ManagedResultOf left_value next =>
+            lower_bind ManagedResult ManagedResult (step scope second next)
+              (fun (right : ManagedResult) => match right with | ManagedResultOf right_value after =>
+                operation left_value right_value after end) end) end);
+
+def managed_string_ternary (step : ManagedStep) (scope : ManagedScope)
+    (operation : MirValue -> MirValue -> MirValue -> ManagedState -> Either NativeLowerError ManagedResult)
+    (arguments : List CoreTerm) (state : ManagedState) : Either NativeLowerError ManagedResult :=
+    lower_three ManagedResult arguments (fun (first : CoreTerm) (second : CoreTerm) (third : CoreTerm) =>
+      lower_bind ManagedResult ManagedResult (step scope first state)
+        (fun (left : ManagedResult) => match left with | ManagedResultOf a next =>
+          lower_bind ManagedResult ManagedResult (step scope second next)
+            (fun (middle : ManagedResult) => match middle with | ManagedResultOf b after =>
+              lower_bind ManagedResult ManagedResult (step scope third after)
+                (fun (right : ManagedResult) => match right with | ManagedResultOf c finish =>
+                  operation a b c finish end) end) end));

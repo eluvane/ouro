@@ -1,0 +1,59 @@
+-- Mutation authority follows the checked identity and complete signature.
+import "../compiler/file_elab.ouro";
+import "../compiler/checked_program_output.ouro";
+import "../std/test.ouro";
+import "compiler_binding_surface.ouro";
+
+def mutation_binding_declaration (mutation : PrimitiveId) (typ : CoreTerm) : FileItem :=
+    FIntrinsic 120 typ (primitive_key mutation) (Nothing CoreTerm);
+
+def mutation_binding_metadata (mutation : PrimitiveId) (aliases : Bool) : Bool :=
+    match compiler_binding_check_last compiler_binding_unit_extra_base (mutation_binding_declaration mutation (compiler_binding_mode_type aliases 0)) with
+    | DeclarationsErr _ _ _ => False | DeclarationsOk entries =>
+      any Entry (fun (entry : Entry) => match entry with
+        | MkBoundEntry name _ binding => match eqNat name 120 with | False => False | True =>
+            match binding with | PrimitiveExternBinding _ => False
+            | PrimitiveIntrinsicBinding actual execution gc specialization => andb (primitive_id_equal actual mutation)
+                (andb (match execution with | PrimitiveRuntimeAction => True
+                  | PrimitiveTypeOnly => False | PrimitivePureValue => False end)
+                  (andb (match gc with | PrimitiveMayGc => True | PrimitiveNoGc => False end)
+                    (match specialization with | Nothing => True | Just _ => False end))) end end
+        | MkEntry _ _ _ => False | MkIndEntry _ _ => False | MkRoleEntry _ => False end) entries end;
+
+def mutation_binding_rejected (mutation : PrimitiveId) (mode : Nat) : Bool :=
+    match compiler_binding_check_last compiler_binding_unit_extra_base (mutation_binding_declaration mutation (compiler_binding_mode_type False mode)) with
+    | DeclarationsOk _ => False
+    | DeclarationsErr name phase failure => andb (eqNat name 120)
+        (eqNat (declaration_failure_code CheckExactCore phase failure) 2) end;
+
+def mutation_binding_shim (mutation : PrimitiveId) (axiom_only : Bool) : Bool :=
+    match compiler_binding_check_last compiler_binding_unit_extra_base (match axiom_only with
+      | True => FAxiom 120 (compiler_binding_mode_type False 0)
+      | False => mutation_binding_declaration mutation (compiler_binding_mode_type True 0) end) with
+    | DeclarationsErr _ _ _ => False | DeclarationsOk entries =>
+      let shims : List (Pair Nat (List Nat)) :=
+        checked_program_c_shims (CheckedProgramOf empty_intern entries ([] : List (Pair Nat CoreTerm))) in
+      match axiom_only with
+      | True => notb (any (Pair Nat (List Nat)) (fun (item : Pair Nat (List Nat)) =>
+          match item with | MkPair name _ => eqNat name 120 end) shims)
+      | False => any (Pair Nat (List Nat)) (fun (item : Pair Nat (List Nat)) => match item with | MkPair name key =>
+          andb (eqNat name 120) (primitive_bytes_equal key (prim_string_to_char_codes
+            (match primitive_id_equal mutation PrimitiveDirectoryCreate with
+              | True => "prim_fs_mkdir" | False => "prim_fs_remove" end))) end) shims end end;
+
+def mutation_binding_tests (mutation : PrimitiveId) : List Test :=
+    let key : String := prim_string_of_char_codes (primitive_key mutation) in
+    [assert_true (str_concat key " records canonical effect and GC metadata") (mutation_binding_metadata mutation False),
+     assert_true (str_concat key " accepts normalized String, Unit and Runtime aliases") (mutation_binding_metadata mutation True),
+     assert_true (str_concat key " rejects a non-String path") (mutation_binding_rejected mutation 1),
+     assert_true (str_concat key " rejects a pure Unit result") (mutation_binding_rejected mutation 2),
+     assert_true (str_concat key " rejects a Runtime String result") (mutation_binding_rejected mutation 3),
+     assert_true (str_concat key " rejects the missing path argument") (mutation_binding_rejected mutation 4),
+     assert_true (str_concat key " rejects an extra path argument") (mutation_binding_rejected mutation 5),
+     assert_true (str_concat key " rejects an unrelated one-constructor Unit") (mutation_binding_rejected mutation 6),
+     assert_true (str_concat key " maps a renamed checked identity to the retained C handler") (mutation_binding_shim mutation False),
+     assert_true (str_concat key " gives no checked authority to a same-shaped axiom") (mutation_binding_shim mutation True)];
+
+def main : IO Unit :=
+    test_run (concat_map PrimitiveId Test mutation_binding_tests
+      ([PrimitiveDirectoryCreate, PrimitivePathRemove] : List PrimitiveId));

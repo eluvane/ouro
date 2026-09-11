@@ -1,0 +1,125 @@
+-- Reusable acceptance helpers for practical application-surface toollets.
+--
+-- The reusable public APIs live under std/practical.ouro. This tool-local
+-- library composes them into concrete CLI/data/file/process shapes without
+-- adding a new runtime boundary or a C/Python fallback.
+
+import "../std/practical.ouro";
+import "../std/fs_walk.ouro";
+
+inductive AppSurfaceError : Type :=
+  | AppJsonInvalid : AppSurfaceError
+  | AppCsvMissingColumn : String -> AppSurfaceError
+  | AppCsvProjectionInvalid : List String -> AppSurfaceError;
+
+def app_surface_error_message (e : AppSurfaceError) : String :=
+    match e with
+    | AppJsonInvalid => "invalid json"
+    | AppCsvMissingColumn name => str_concat "missing column: " name
+    | AppCsvProjectionInvalid errors =>
+        validation_render_errors String (fun (message : String) => message) errors
+    end;
+
+def app_json_pair_string (key : String) (value : String) : Pair String Json :=
+    MkPair String Json key (jsonx_string value);
+
+def app_json_pair_nat (key : String) (value : Nat) : Pair String Json :=
+    MkPair String Json key (jsonx_num_nat value);
+
+def app_json_pair_bool (key : String) (value : Bool) : Pair String Json :=
+    MkPair String Json key (jsonx_bool value);
+
+def app_status_report (kind : String) (ok : Bool) (message : String) : Json :=
+    jsonx_object
+      ([ app_json_pair_string "kind" kind
+       , app_json_pair_bool "pass" ok
+       , app_json_pair_string "message" message
+       ] : List (Pair String Json));
+
+def app_report_text (j : Json) : String :=
+    jsonx_render j;
+
+def app_json_validate_report (text : String) : Json :=
+    match parse_json text with
+    | Nothing => app_status_report "ouro.app_surface.json.validate" False "invalid_json"
+    | Just _ => app_status_report "ouro.app_surface.json.validate" True "valid_json"
+    end;
+
+def app_json_minify (text : String) : Either AppSurfaceError String :=
+    match parse_json text with
+    | Nothing => Left AppSurfaceError String AppJsonInvalid
+    | Just j => Right AppSurfaceError String (jsonx_render j)
+    end;
+
+def app_csv_report_json (label : String) (rows : List (List String)) : Json :=
+    jsonx_object
+      ([ app_json_pair_string "kind" "ouro.app_surface.csv.report"
+       , app_json_pair_string "label" label
+       , app_json_pair_nat "rows" (csv_nrows rows)
+       , app_json_pair_nat "data_rows" (table_count_rows rows)
+       , app_json_pair_nat "columns" (csv_ncols rows)
+       ] : List (Pair String Json));
+
+def app_csv_select_column (rows : List (List String)) (name : String)
+    : Either AppSurfaceError String :=
+    match csv_lookup_col (table_header rows) name with
+    | Nothing => Left AppSurfaceError String (AppCsvMissingColumn name)
+    | Just _ => Right AppSurfaceError String (str_unlines (table_col_named rows name))
+    end;
+
+def app_tsv_from_csv_columns (rows : List (List String)) (names : List String)
+    : Either AppSurfaceError String :=
+    match tablex_project_required rows names with
+    | Left errors =>
+        Left AppSurfaceError String (AppCsvProjectionInvalid errors)
+    | Right projected => Right AppSurfaceError String (tsv_print projected)
+    end;
+
+def app_config_report_json (cfg : Config) : Json :=
+    jsonx_object
+      ([ app_json_pair_string "kind" "ouro.app_surface.config.report"
+       , app_json_pair_nat "keys" (length String (config_keys cfg))
+       ] : List (Pair String Json));
+
+def app_config_normalize (text : String) : String :=
+    config_render (config_parse text);
+
+def app_path_within_workspace (workspace : String) (relative : String)
+    : Either FsError String :=
+    let rel : String := path_normalize relative in
+    match orb (path_is_abs rel) (orb (str_eq rel "..") (str_starts rel "../")) with
+    | True => Left FsError String (FsOperationFailed "unsafe_relative_path" relative)
+    | False =>
+        Right FsError String
+          (path_join_normalized ([workspace, rel] : List String))
+    end;
+
+def app_fs_walk_report_json (root : String) (walked : FsWalkResult) : Json :=
+    match walked with
+    | FsWalkComplete files =>
+        jsonx_object
+          ([ app_json_pair_string "kind" "ouro.app_surface.fs.scan"
+           , app_json_pair_bool "pass" True
+           , app_json_pair_string "root" root
+           , app_json_pair_nat "files" (length String files)
+           ] : List (Pair String Json))
+    | FsWalkTruncated path =>
+        app_status_report "ouro.app_surface.fs.scan" False
+          (str_concat "truncated:" path)
+    | FsWalkUnreadable path =>
+        app_status_report "ouro.app_surface.fs.scan" False
+          (str_concat "unreadable:" path)
+    | FsWalkUnsafe path =>
+        app_status_report "ouro.app_surface.fs.scan" False
+          (str_concat "unsafe:" path)
+    end;
+
+def app_proc_result_report (cmd : CommandSpec) (result : ProcResult) : Json :=
+    jsonx_object
+      ([ app_json_pair_string "kind" "ouro.app_surface.process.run"
+       , app_json_pair_bool "pass" (proc_ok result)
+       , app_json_pair_string "command" (command_render cmd)
+       , app_json_pair_nat "exit" (proc_code result)
+       , app_json_pair_nat "stdout_bytes" (str_len (proc_stdout result))
+       , app_json_pair_nat "stderr_bytes" (str_len (proc_stderr result))
+       ] : List (Pair String Json));

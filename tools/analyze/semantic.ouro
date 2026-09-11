@@ -1,0 +1,275 @@
+-- Semantic smells stay conservative: every rule needs a shape the real AST
+-- shows directly, never a guess about a relation the host cannot prove.
+
+-- @entry analyze_semantic
+-- @entry sem_succ_chain
+
+import "../../std/data.ouro";
+import "../../std/listx.ouro";
+import "../../std/natx.ouro";
+import "ast.ouro";
+
+-- literal or successor chain above the threshold (value); scrutinee that
+-- nests a match, let, lambda, fix, handle or do (Z); lambda nesting depth;
+-- one-arm match whose body is a Bool constructor (Z); definition with two or
+-- more parameters that its body never mentions (parameter count).
+inductive SemIssue : Type :=
+  | IMagicNat : Nat -> SemIssue
+  | IComplexScrut : Nat -> SemIssue
+  | ILambdaNest : Nat -> SemIssue
+  | IPartialEq : Nat -> SemIssue
+  | IOddIdentity : Nat -> SemIssue;
+
+def sem_inil : List SemIssue := [];
+
+def sem_icons (i : SemIssue) (is : List SemIssue) : List SemIssue :=
+    Cons SemIssue i is;
+
+def sem_append (xs : List SemIssue) (ys : List SemIssue) : List SemIssue :=
+    append SemIssue xs ys;
+
+-- Length of a uniform successor chain `s (s (s x))` headed by `succ`; Z when
+-- the spine is not such a chain.
+def sem_succ_chain (succ : Nat) : Ast -> Nat :=
+  fix sem_succ_chain (a : Ast) : Nat :=
+    match a with
+    | AApp f x =>
+        match ast_var_id f with
+        | Nothing => Z
+        | Just h =>
+            match eq_nat h succ with
+            | False => Z
+            | True => S (sem_succ_chain x)
+            end
+        end
+    | AVar _ => Z
+    | AHole _ => Z
+    | ASort _ => Z
+    | ANatLit _ => Z
+    | AStr _ => Z
+    | ALam _ _ _ => Z
+    | APi _ _ _ => Z
+    | ALet _ _ _ _ => Z
+    | AAscribe _ _ => Z
+    | ABinder _ _ _ => Z
+    | ANoBinder => Z
+    | AFix _ _ _ _ => Z
+    | ABranch _ _ _ _ => Z
+    | ANoBranch => Z
+    | AMatch _ _ => Z
+    | APerform _ _ => Z
+    | AHandle _ _ => Z
+    | AClause _ _ _ _ => Z
+    | ANoClause => Z
+    | ADo _ => Z
+    | AList _ => Z
+    end;
+
+def sem_nests_control (a : Ast) : Bool :=
+    orb (ast_is tag_match a)
+      (orb (ast_is tag_let a)
+        (orb (ast_is tag_fix a)
+          (orb (ast_is tag_handle a) (ast_is tag_do a))));
+
+-- Application spines and ascriptions are ordinary scrutinees. Only the
+-- peeled head counts: `match (f (match ...))` is an application, not a
+-- nested match.
+def sem_complex_scrut (s : Ast) : Bool := sem_nests_control (ast_peel_ascribe s);
+
+def sem_bool_body (bool_ids : List Nat) (body : Ast) : Bool :=
+    match ast_var_id (ast_peel_ascribe body) with
+    | Just id => mem Nat eq_nat id bool_ids
+    | Nothing => False
+    end;
+
+-- Exactly one arm, and it returns a Bool constructor: the other constructor
+-- has no arm, so the predicate is partial.
+def sem_partial_eq (bool_ids : List Nat) (branches : Ast) : Bool :=
+    match branches with
+    | ABranch _ _ body rest =>
+        andb (ast_is tag_no_branch rest) (sem_bool_body bool_ids body)
+    | ANoBranch => False
+    | AVar _ => False
+    | AHole _ => False
+    | ASort _ => False
+    | ANatLit _ => False
+    | AStr _ => False
+    | AApp _ _ => False
+    | ALam _ _ _ => False
+    | APi _ _ _ => False
+    | ALet _ _ _ _ => False
+    | AAscribe _ _ => False
+    | ABinder _ _ _ => False
+    | ANoBinder => False
+    | AFix _ _ _ _ => False
+    | AMatch _ _ => False
+    | APerform _ _ => False
+    | AHandle _ _ => False
+    | AClause _ _ _ _ => False
+    | ANoClause => False
+    | ADo _ => False
+    | AList _ => False
+    end;
+
+def sem_match_issues (bool_ids : List Nat) (scrut : Ast) (branches : Ast)
+    : List SemIssue :=
+    sem_append
+      (match sem_complex_scrut scrut with
+       | True => sem_icons (IComplexScrut Z) sem_inil
+       | False => sem_inil
+       end)
+      (match sem_partial_eq bool_ids branches with
+       | True => sem_icons (IPartialEq Z) sem_inil
+       | False => sem_inil
+       end);
+
+-- Unnamed Nat literals at or below this are bytes or ASCII codes. Fuels
+-- and other named quantities live in a definition.
+def sem_lit_limit : Nat := 255;
+
+-- Magic literals and long successor chains report once per spine and do not
+-- descend into the reported chain. `thresh` is the successor-chain limit;
+-- decimal literals use `sem_lit_limit`.
+def sem_walk (thresh : Nat) (succ : Nat) (bool_ids : List Nat)
+    : Ast -> List SemIssue :=
+  fun (root : Ast) =>
+    (fix sem_walk (fuel : Nat) (a : Ast) : List SemIssue :=
+      match fuel with
+      | Z => sem_inil
+      | S remaining =>
+          let descend : Ast -> List SemIssue :=
+            fun (child : Ast) => sem_walk remaining child in
+          match a with
+          | ANatLit n =>
+              match ltb_nat sem_lit_limit n with
+              | True => sem_icons (IMagicNat n) sem_inil
+              | False => sem_inil
+              end
+          | AApp f x =>
+              let len : Nat := sem_succ_chain succ a in
+              match ltb_nat thresh len with
+              | True => sem_icons (IMagicNat len) sem_inil
+              | False => sem_append (descend f) (descend x)
+              end
+          | AMatch scrut branches =>
+              sem_append (sem_match_issues bool_ids scrut branches)
+                (sem_append (descend scrut) (descend branches))
+          | AVar _ => sem_inil
+          | AHole _ => sem_inil
+          | ASort _ => sem_inil
+          | AStr _ => sem_inil
+          | ALam _ ann body => sem_append (descend ann) (descend body)
+          | APi _ dom cod => sem_append (descend dom) (descend cod)
+          | ALet _ ann v body =>
+              sem_append (descend ann) (sem_append (descend v) (descend body))
+          | AAscribe e t => sem_append (descend e) (descend t)
+          | ABinder _ ty rest => sem_append (descend ty) (descend rest)
+          | ANoBinder => sem_inil
+          | AFix _ binders ret body =>
+              sem_append (descend binders)
+                (sem_append (descend ret) (descend body))
+          | ABranch _ _ body rest => sem_append (descend body) (descend rest)
+          | ANoBranch => sem_inil
+          | APerform _ args => concat_map Ast SemIssue descend args
+          | AHandle inner cls => sem_append (descend inner) (descend cls)
+          | AClause _ _ body rest => sem_append (descend body) (descend rest)
+          | ANoClause => sem_inil
+          | ADo xs => concat_map Ast SemIssue descend xs
+          | AList xs => concat_map Ast SemIssue descend xs
+          end
+      end) (ast_size root) root;
+
+-- Deepest lambda nesting; Pi binders and fix telescopes do not count.
+def sem_lam_depth : Ast -> Nat :=
+  fun (root : Ast) =>
+    (fix sem_lam_depth (fuel : Nat) (a : Ast) : Nat :=
+      match fuel with
+      | Z => Z
+      | S remaining =>
+          let descend : Ast -> Nat :=
+            fun (child : Ast) => sem_lam_depth remaining child in
+          let sem_depth_of : List Ast -> Nat :=
+            fun (xs : List Ast) => maximum_nat Z (map Ast Nat descend xs) in
+          match a with
+          | ALam _ ann body =>
+              maxNat (descend ann) (S (descend body))
+          | AVar _ => Z
+          | AHole _ => Z
+          | ASort _ => Z
+          | ANatLit _ => Z
+          | AStr _ => Z
+          | AApp _ _ => sem_depth_of (ast_children a)
+          | APi _ _ _ => sem_depth_of (ast_children a)
+          | ALet _ _ _ _ => sem_depth_of (ast_children a)
+          | AAscribe _ _ => sem_depth_of (ast_children a)
+          | ABinder _ _ _ => sem_depth_of (ast_children a)
+          | ANoBinder => Z
+          | AFix _ _ _ _ => sem_depth_of (ast_children a)
+          | ABranch _ _ _ _ => sem_depth_of (ast_children a)
+          | ANoBranch => Z
+          | AMatch _ _ => sem_depth_of (ast_children a)
+          | APerform _ _ => sem_depth_of (ast_children a)
+          | AHandle _ _ => sem_depth_of (ast_children a)
+          | AClause _ _ _ _ => sem_depth_of (ast_children a)
+          | ANoClause => Z
+          | ADo _ => sem_depth_of (ast_children a)
+          | AList _ => sem_depth_of (ast_children a)
+          end
+      end) (ast_size root) root;
+
+-- Leading lambda parameters, then a fix telescope; the body is what remains.
+def sem_two_or_more (xs : List Nat) : Bool :=
+    match xs with
+    | Nil => False
+    | Cons _ rest =>
+        match rest with
+        | Nil => False
+        | Cons _ _ => True
+        end
+    end;
+
+-- Two or more parameters and a body that mentions none of them.
+-- Discard ids (`_` / leading underscore) are intentional and do not count.
+def sem_kept_params (discards : List Nat) (params : List Nat) : List Nat :=
+    filter Nat (fun (id : Nat) =>
+      match id with
+      | Z => False
+      | S _ => notb (mem Nat eq_nat id discards)
+      end) params;
+
+def sem_odd_identity (discards : List Nat) (a : Ast) : List SemIssue :=
+    let params : List Nat := sem_kept_params discards (ast_params a) in
+    match sem_two_or_more params with
+    | False => sem_inil
+    | True =>
+        match any Nat (fun (id : Nat) => ast_occurs id (ast_core_body a)) params with
+        | True => sem_inil
+        | False => sem_icons (IOddIdentity (length Nat params)) sem_inil
+        end
+    end;
+
+-- A definition whose whole body is a literal names that literal; it is the
+-- fix for a magic number, not an instance of one.
+def sem_names_literal (a : Ast) : Bool :=
+    ast_is tag_nat (ast_peel_ascribe a);
+
+-- The parameter telescope is the definition's signature, not nesting; only
+-- lambdas inside the body count.
+def sem_lam_issues (max_lam : Nat) (a : Ast) : List SemIssue :=
+    let depth : Nat := sem_lam_depth (ast_core_body a) in
+    match ltb_nat max_lam depth with
+    | True => sem_icons (ILambdaNest depth) sem_inil
+    | False => sem_inil
+    end;
+
+-- thresh: largest literal or successor chain that is not magic; succ: id of
+-- the successor constructor (Z when absent); bool_ids: True/False ids.
+def analyze_semantic (thresh : Nat) (max_lam : Nat) (succ : Nat)
+    (bool_ids : List Nat) (discards : List Nat) (a : Ast) : List SemIssue :=
+    let smells : List SemIssue :=
+      match sem_names_literal a with
+      | True => sem_inil
+      | False => sem_walk thresh succ bool_ids a
+      end in
+    sem_append smells
+      (sem_append (sem_lam_issues max_lam a) (sem_odd_identity discards a));

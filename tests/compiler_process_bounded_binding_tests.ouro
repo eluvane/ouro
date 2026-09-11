@@ -1,0 +1,56 @@
+-- Foreground process authority requires exact checked OS-status/exit types.
+import "../compiler/driver.ouro";
+import "compiler_startup_test_support.ouro";
+
+def bounded_binding_prefix : String :=
+    prim_string_concat
+      "intrinsic Action : Type -> Type := \"ouro.runtime\"; intrinsic Text : Type := \"ouro.string\"; inductive Count : Type := | Zero : Count | Next : Count -> Count; representation Count := \"ouro.nat\"; "
+      "inductive Chain (A : Type) : Type := | End : Chain A | Link : A -> Chain A -> Chain A; representation Chain := \"ouro.list\"; inductive Couple (A : Type) (B : Type) : Type := | Both : A -> B -> Couple A B; representation Couple := \"ouro.pair\"; def Deferred (A : Type) : Type := Action A; def Name : Type := Text; def Limits : Type := Couple Count (Couple Count (Couple Count (Couple Count Count))); def Request : Type := Couple Text Limits; def Reply : Type := Couple Count (Couple Count (Couple Count (Couple Text Text))); ";
+
+def bounded_binding_compile (source : String) : CompResult CheckedProgram :=
+    compile_checked_source (mul 100 50)
+      (prim_string_to_char_codes (prim_string_concat bounded_binding_prefix source));
+
+def bounded_binding_selected (source : String) : Bool :=
+    match bounded_binding_compile source with
+    | CErr _ => False
+    | COk program =>
+        (fix find (entries : List Entry) : Bool :=
+          match entries with | Nil => False | Cons entry rest =>
+            match entry with
+            | MkBoundEntry _ _ binding =>
+                match binding with
+                | PrimitiveExternBinding _ => find rest
+                | PrimitiveIntrinsicBinding id mode gc specialization =>
+                    match primitive_id_equal id PrimitiveProcessBounded with
+                    | False => find rest
+                    | True =>
+                        andb (match mode with | PrimitiveRuntimeAction => True
+                          | PrimitivePureValue => False | PrimitiveTypeOnly => False end)
+                          (andb (match gc with | PrimitiveMayGc => True | PrimitiveNoGc => False end)
+                            (match specialization with | Nothing => True | Just _ => False end))
+                    end
+                end
+            | MkEntry _ _ _ => find rest
+            | MkIndEntry _ _ => find rest
+            | MkRoleEntry _ => find rest
+            end
+          end) (checked_program_entries program)
+    end;
+
+def bounded_binding_rejected (source : String) : Bool :=
+    match bounded_binding_compile source with
+    | COk _ => False
+    | CErr error => match error with | ErrCode code _ => eqNat code 42 end
+    end;
+
+def main : IO Unit := startup_test_run
+    [startup_test_assert "checked allocating Runtime action" (bounded_binding_selected "intrinsic run : Text -> Chain Text -> Request -> Action Reply := \"ouro.process.capture_bounded\";"),
+     startup_test_assert "transparent aliases" (bounded_binding_selected "intrinsic run : Name -> Chain Name -> Request -> Deferred Reply := \"ouro.process.capture_bounded\";"),
+     startup_test_assert "missing caps" (bounded_binding_rejected "intrinsic run : Text -> Chain Text -> Action Reply := \"ouro.process.capture_bounded\";"),
+     startup_test_assert "collapsed status" (bounded_binding_rejected "intrinsic run : Text -> Chain Text -> Request -> Action Count := \"ouro.process.capture_bounded\";"),
+     startup_test_assert "missing peak" (bounded_binding_rejected "intrinsic run : Text -> Chain Text -> Request -> Action (Couple Count (Couple Count (Couple Text Text))) := \"ouro.process.capture_bounded\";"),
+     startup_test_assert "pure result" (bounded_binding_rejected "intrinsic run : Text -> Chain Text -> Request -> Reply := \"ouro.process.capture_bounded\";"),
+     startup_test_assert "scalar argv" (bounded_binding_rejected "intrinsic run : Text -> Text -> Request -> Action Reply := \"ouro.process.capture_bounded\";"),
+     startup_test_assert "wrong limit scalar" (bounded_binding_rejected "intrinsic run : Text -> Chain Text -> Text -> Action Reply := \"ouro.process.capture_bounded\";"),
+     startup_test_assert "wrong stream bytes" (bounded_binding_rejected "intrinsic run : Text -> Chain Text -> Request -> Action (Couple Count (Couple Count (Couple Count (Couple Count Count)))) := \"ouro.process.capture_bounded\";")];

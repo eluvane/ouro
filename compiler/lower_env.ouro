@@ -1,0 +1,791 @@
+-- LowerEnv is a cross-module ABI for constructor lookup, global ids, and already-lowered declarations.
+
+import "../std/data.ouro";
+import "ast.ouro";
+import "core.ouro";
+import "pipeline_abi.ouro";
+
+-- LowerEnv: constIds, indIds, ctors, stringTyId, unitId, ioId, ioBindId,
+-- pureId, listId, nilId, consId, ioPayloads, declTypes. The extra ids/hints are used
+-- only by the selfhost lowerer's bounded IO/list-literal ergonomics paths;
+-- they do not add kernel/runtime primitives.
+-- Special ids are ordered as String, Unit, IO, io_bind, pure, List, Nil, Cons.
+def empty_special_ids : List Nat := ([Z, Z, Z, Z, Z, Z, Z, Z] : List Nat);
+
+def empty_env : LowerEnv :=
+  MkLowerEnv (Nil Nat) (Nil Nat) (Nil CtorInfo) empty_special_ids
+    (Nil (Pair Nat Surface)) (Nil (Pair Nat Surface));
+
+def env_constIds (env : LowerEnv) : List Nat :=
+    match env with
+    | MkLowerEnv cs _ _ _ _ _ => cs
+    end;
+
+def env_indIds (env : LowerEnv) : List Nat :=
+    match env with
+    | MkLowerEnv _ is _ _ _ _ => is
+    end;
+
+def env_ctors (env : LowerEnv) : List CtorInfo :=
+    match env with
+    | MkLowerEnv _ _ cs _ _ _ => cs
+    end;
+
+def env_specialIds (env : LowerEnv) : List Nat :=
+    match env with
+    | MkLowerEnv _ _ _ sp _ _ => sp
+    end;
+
+def nth_nat_or_zero (xs : List Nat) (idx : Nat) : Nat :=
+  (fix go (ys : List Nat) (i : Nat) : Nat :=
+    match ys with
+    | Nil => Z
+    | Cons x rest =>
+        match i with
+        | Z => x
+        | S i' => go rest i'
+        end
+    end) xs idx;
+
+def env_stringTyId (env : LowerEnv) : Nat :=
+    nth_nat_or_zero (env_specialIds env) Z;
+
+def env_unitId (env : LowerEnv) : Nat :=
+    nth_nat_or_zero (env_specialIds env) (S Z);
+
+def env_ioId (env : LowerEnv) : Nat :=
+    nth_nat_or_zero (env_specialIds env) (S (S Z));
+
+def env_ioBindId (env : LowerEnv) : Nat :=
+    nth_nat_or_zero (env_specialIds env) (3);
+
+def env_pureId (env : LowerEnv) : Nat :=
+    nth_nat_or_zero (env_specialIds env) (4);
+
+def env_listId (env : LowerEnv) : Nat :=
+    nth_nat_or_zero (env_specialIds env) (5);
+
+def env_nilId (env : LowerEnv) : Nat :=
+    nth_nat_or_zero (env_specialIds env) (6);
+
+def env_consId (env : LowerEnv) : Nat :=
+    nth_nat_or_zero (env_specialIds env) (7);
+
+def env_ioPayloads (env : LowerEnv) : List (Pair Nat Surface) :=
+    match env with
+    | MkLowerEnv _ _ _ _ payloads _ => payloads
+    end;
+
+def env_declTypes (env : LowerEnv) : List (Pair Nat Surface) :=
+    match env with
+    | MkLowerEnv _ _ _ _ _ types => types
+    end;
+
+def ctor_nameId (c : CtorInfo) : Nat :=
+    match c with
+    | MkCtorInfo n _ _ _ _ => n
+    end;
+
+def ctor_indId (c : CtorInfo) : Nat :=
+    match c with
+    | MkCtorInfo _ i _ _ _ => i
+    end;
+
+def ctor_idx (c : CtorInfo) : Nat :=
+    match c with
+    | MkCtorInfo _ _ j _ _ => j
+    end;
+
+def ctor_nparams (c : CtorInfo) : Nat :=
+    match c with
+    | MkCtorInfo _ _ _ p _ => p
+    end;
+
+def ctor_arity (c : CtorInfo) : Nat :=
+    match c with
+    | MkCtorInfo _ _ _ _ a => a
+    end;
+
+def lookup_ctor (nameId : Nat) : List CtorInfo -> Maybe CtorInfo :=
+    fix lookup_ctor (cs : List CtorInfo) : Maybe CtorInfo :=
+      match cs with
+      | Nil => Nothing CtorInfo
+      | Cons c cs' =>
+          match eqNat (ctor_nameId c) nameId with
+          | True => Just CtorInfo c
+          | False => lookup_ctor cs'
+          end
+      end;
+
+def resolve_var (env : LowerEnv) (nameId : Nat) : Surface :=
+    match lookup_ctor nameId (env_ctors env) with
+    | Just c => SConstruct (ctor_indId c) (ctor_idx c) (ctor_nparams c)
+    | Nothing =>
+        match memNat nameId (env_indIds env) with
+        | True => SInd nameId
+        | False =>
+            match memNat nameId (env_constIds env) with
+            | True => SConst nameId
+            | False => SVar nameId
+            end
+        end
+    end;
+
+def nth_surf : List Surface -> Nat -> Maybe Surface :=
+  fix nth_surf (xs : List Surface) (i : Nat) : Maybe Surface :=
+    match xs with
+    | Nil => Nothing Surface
+    | Cons x xs' =>
+        match i with
+        | Z => Just Surface x
+        | S i' => nth_surf xs' i'
+        end
+    end;
+
+def head_surf (xs : List Surface) : Maybe Surface :=
+    match xs with
+    | Nil => Nothing Surface
+    | Cons x _ => Just Surface x
+    end;
+
+def apply_params (indId : Nat) (params : List Surface) : Surface :=
+    (fix go (ps : List Surface) (acc : Surface) : Surface :=
+        match ps with
+        | Nil => acc
+        | Cons p ps' => go ps' (SApp acc p)
+        end) params (SInd indId);
+
+-- Peel SApp → Just (indId, params L→R). Acc prepends; do not reverse.
+def peel_ind_apps (s0 : Surface) : Maybe (Pair Nat (List Surface)) :=
+    (fix go (s : Surface) (acc : List Surface) : Maybe (Pair Nat (List Surface)) :=
+        match s with
+        | SApp f a => go f (Cons Surface a acc)
+        | SInd n =>
+            Just (Pair Nat (List Surface))
+              (MkPair Nat (List Surface) n acc)
+        | SVar _ => Nothing (Pair Nat (List Surface))
+        | SSort _ => Nothing (Pair Nat (List Surface))
+        | SPi _ _ _ => Nothing (Pair Nat (List Surface))
+        | SLam _ _ _ => Nothing (Pair Nat (List Surface))
+        | SLet _ _ _ _ => Nothing (Pair Nat (List Surface))
+        | SConst _ => Nothing (Pair Nat (List Surface))
+        | SConstruct _ _ _ => Nothing (Pair Nat (List Surface))
+        | SCase _ _ _ _ => Nothing (Pair Nat (List Surface))
+        | SFix _ _ _ _ _ => Nothing (Pair Nat (List Surface))
+        | SHole _ => Nothing (Pair Nat (List Surface))
+        | SEffectRow _ => Nothing (Pair Nat (List Surface))
+        | SPerform _ _ => Nothing (Pair Nat (List Surface))
+        | SStr _ _ => Nothing (Pair Nat (List Surface))
+        end) s0 (Nil Surface);
+
+def lookup_local (nameId : Nat) : List (Pair Nat Surface) -> Maybe Surface :=
+    fix go (xs : List (Pair Nat Surface)) : Maybe Surface :=
+      match xs with
+      | Nil => Nothing Surface
+      | Cons p xs' =>
+          match p with
+          | MkPair n ty =>
+              match eqNat n nameId with
+              | True => Just Surface ty
+              | False => go xs'
+              end
+          end
+      end;
+
+def cons_local (n : Nat) (ty : Surface) (xs : List (Pair Nat Surface)) : List (Pair Nat Surface) :=
+    Cons (Pair Nat Surface) (MkPair Nat Surface n ty) xs;
+
+def extend_locals : List (Pair Nat Surface) -> List (Pair Nat Surface) -> List (Pair Nat Surface) :=
+  fix extend_locals (bs : List (Pair Nat Surface)) (locals : List (Pair Nat Surface)) : List (Pair Nat Surface) :=
+    match bs with
+    | Nil => locals
+    | Cons p bs' =>
+        match p with
+        | MkPair n ty => extend_locals bs' (cons_local n ty locals)
+        end
+    end;
+
+def synth_param_vars (n0 : Nat) : List Nat :=
+    (fix go (n : Nat) (acc : List Nat) : List Nat :=
+        match n with
+        | Z => acc
+        | S n' => go n' (Cons Nat n' acc)
+        end) n0 (Nil Nat);
+
+def synth_param_surfs (n0 : Nat) : List Surface :=
+    (fix go (n : Nat) (acc : List Surface) : List Surface :=
+        match n with
+        | Z => acc
+        | S n' => go n' (Cons Surface (SVar n') acc)
+        end) n0 (Nil Surface);
+
+def mk_match_motive (indId : Nat) (nparams : Nat) (params : List Surface) (r : Surface) : Surface :=
+    let nindices : Nat := sub (length Surface params) nparams in
+    let total : Nat := add nparams nindices in
+    let pvars : List Nat := synth_param_vars total in
+    let psurfs : List Surface := synth_param_surfs total in
+    let family : Surface := apply_params indId psurfs in
+    let core : Surface := SLam Z family r in
+    (fix wrap (vs : List Nat) (acc : Surface) : Surface :=
+         match vs with
+         | Nil => acc
+         | Cons v vs' =>
+             let ann : Surface :=
+               match length Nat vs with
+               | Z => SSort Z
+               | S idx =>
+                   match idx with
+                   | Z => SSort Z
+                   | S _ => SInd Z
+                   end
+               end in
+             wrap vs' (SLam v ann acc)
+         end) (reverse Nat pvars) core;
+
+-- Binder ann: params[i] else last→family else head/SInd 0.
+-- SVar 0 is underscore and is not bound in the outer context; a dummy
+-- inductive keeps the binder (extract only erases sort anns).
+def binder_ann_at (idx : Nat) (lastIdx : Nat) (params : List Surface) (family : Surface) : Surface :=
+    match nth_surf params idx with
+    | Just p => p
+    | Nothing =>
+        match eqNat idx lastIdx with
+        | True => family
+        | False =>
+            match head_surf params with
+            | Just p0 => p0
+            | Nothing => SInd Z
+            end
+        end
+    end;
+
+def wrap_lams_branch (vars : List Nat) (body : Surface) (params : List Surface) (family : Surface) : Surface :=
+    let lastIdx : Nat :=
+      match length Nat vars with
+      | Z => Z
+      | S n' => n'
+      end in
+    (fix go (vs : List Nat) (i : Nat) : Surface :=
+        match vs with
+        | Nil => body
+        | Cons v vs' =>
+            let ann : Surface := binder_ann_at i lastIdx params family in
+            SLam v ann (go vs' (S i))
+        end) vars Z;
+
+-- Pattern binders as (name,ann) for locals (nested match sees outer types).
+def branch_binder_pairs (vars0 : List Nat) (params : List Surface) (family : Surface) : List (Pair Nat Surface) :=
+    let lastIdx : Nat :=
+      match length Nat vars0 with
+      | Z => Z
+      | S n' => n'
+      end in
+    (fix go (vs : List Nat) (i : Nat) : List (Pair Nat Surface) :=
+        match vs with
+        | Nil => Nil (Pair Nat Surface)
+        | Cons v vs' =>
+            Cons (Pair Nat Surface)
+              (MkPair Nat Surface v (binder_ann_at i lastIdx params family))
+              (go vs' (S i))
+        end) vars0 Z;
+
+def fold_pi : List (Pair Nat Surface) -> Surface -> Surface :=
+  fix fold_pi (xs : List (Pair Nat Surface)) (acc : Surface) : Surface :=
+    match xs with
+    | Nil => acc
+    | Cons p xs' =>
+        match p with
+        | MkPair id ty => SPi id ty (fold_pi xs' acc)
+        end
+    end;
+
+def fold_lam : List (Pair Nat Surface) -> Surface -> Surface :=
+  fix fold_lam (xs : List (Pair Nat Surface)) (acc : Surface) : Surface :=
+    match xs with
+    | Nil => acc
+    | Cons p xs' =>
+        match p with
+        | MkPair id ty => SLam id ty (fold_lam xs' acc)
+        end
+    end;
+
+def is_ssort (s : Surface) : Bool :=
+    match s with
+    | SVar _ => False
+    | SSort _ => True
+    | SPi _ _ _ => False
+    | SLam _ _ _ => False
+    | SApp _ _ => False
+    | SLet _ _ _ _ => False
+    | SConst _ => False
+    | SInd _ => False
+    | SConstruct _ _ _ => False
+    | SCase _ _ _ _ => False
+    | SFix _ _ _ _ _ => False
+    | SHole _ => False
+    | SEffectRow _ => False
+    | SPerform _ _ => False
+    | SStr _ _ => False
+    end;
+
+def first_nonsort_at : List (Pair Nat Surface) -> Nat -> Nat :=
+  fix first_nonsort_at (xs : List (Pair Nat Surface)) (i : Nat) : Nat :=
+    match xs with
+    | Nil => Z
+    | Cons p xs' =>
+        match p with
+        | MkPair _ ty =>
+            match is_ssort ty with
+            | True => first_nonsort_at xs' (S i)
+            | False => i
+            end
+        end
+    end;
+
+def nat_Z : Surface := SConstruct Z Z Z;
+def nat_S : Surface := SConstruct Z (S Z) Z;
+
+def hole0 : Surface := SHole Z;
+def sort0 : Surface := SSort Z;
+
+def unit_surface (env : LowerEnv) : Surface :=
+    match env_unitId env with
+    | Z => hole0
+    | S _ => SInd (env_unitId env)
+    end;
+
+def io_surface (env : LowerEnv) (payload : Surface) : Surface :=
+    match env_ioId env with
+    | Z => hole0
+    | S _ => SApp (SConst (env_ioId env)) payload
+    end;
+
+def io_bind_surface (env : LowerEnv) : Surface :=
+    match env_ioBindId env with
+    | Z => hole0
+    | S _ => SConst (env_ioBindId env)
+    end;
+
+def is_list_head (env : LowerEnv) (s : Surface) : Bool :=
+    match s with
+    | SInd n => eqNat n (env_listId env)
+    | SVar _ => False
+    | SSort _ => False
+    | SPi _ _ _ => False
+    | SLam _ _ _ => False
+    | SApp _ _ => False
+    | SLet _ _ _ _ => False
+    | SConst _ => False
+    | SConstruct _ _ _ => False
+    | SCase _ _ _ _ => False
+    | SFix _ _ _ _ _ => False
+    | SHole _ => False
+    | SEffectRow _ => False
+    | SPerform _ _ => False
+    | SStr _ _ => False
+    end;
+
+def peel_list_elem (env : LowerEnv) (s : Surface) : Maybe Surface :=
+    match s with
+    | SApp h elem =>
+        match is_list_head env h with
+        | True => Just Surface elem
+        | False => Nothing Surface
+        end
+    | SVar _ => Nothing Surface
+    | SSort _ => Nothing Surface
+    | SPi _ _ _ => Nothing Surface
+    | SLam _ _ _ => Nothing Surface
+    | SLet _ _ _ _ => Nothing Surface
+    | SConst _ => Nothing Surface
+    | SInd _ => Nothing Surface
+    | SConstruct _ _ _ => Nothing Surface
+    | SCase _ _ _ _ => Nothing Surface
+    | SFix _ _ _ _ _ => Nothing Surface
+    | SHole _ => Nothing Surface
+    | SEffectRow _ => Nothing Surface
+    | SPerform _ _ => Nothing Surface
+    | SStr _ _ => Nothing Surface
+    end;
+
+def ctor_surface_by_name (env : LowerEnv) (nameId : Nat) : Surface :=
+    match nameId with
+    | Z => hole0
+    | S _ =>
+        match lookup_ctor nameId (env_ctors env) with
+        | Nothing => hole0
+        | Just c => SConstruct (ctor_indId c) (ctor_idx c) (ctor_nparams c)
+        end
+    end;
+
+def list_nil_surface (env : LowerEnv) (elemTy : Surface) : Surface :=
+    SApp (ctor_surface_by_name env (env_nilId env)) elemTy;
+
+def list_cons_surface (env : LowerEnv) (elemTy : Surface) (head : Surface) (tail : Surface) : Surface :=
+    SApp (SApp (SApp (ctor_surface_by_name env (env_consId env)) elemTy) head) tail;
+
+def is_io_head (env : LowerEnv) (s : Surface) : Bool :=
+    match s with
+    | SConst n => eqNat n (env_ioId env)
+    | SVar _ => False
+    | SSort _ => False
+    | SPi _ _ _ => False
+    | SLam _ _ _ => False
+    | SApp _ _ => False
+    | SLet _ _ _ _ => False
+    | SInd _ => False
+    | SConstruct _ _ _ => False
+    | SCase _ _ _ _ => False
+    | SFix _ _ _ _ _ => False
+    | SHole _ => False
+    | SEffectRow _ => False
+    | SPerform _ _ => False
+    | SStr _ _ => False
+    end;
+
+def peel_io_payload (env : LowerEnv) (s : Surface) : Maybe Surface :=
+    match s with
+    | SApp h payload =>
+        match is_io_head env h with
+        | True => Just Surface payload
+        | False => Nothing Surface
+        end
+    | SVar _ => Nothing Surface
+    | SSort _ => Nothing Surface
+    | SPi _ _ _ => Nothing Surface
+    | SLam _ _ _ => Nothing Surface
+    | SLet _ _ _ _ => Nothing Surface
+    | SConst _ => Nothing Surface
+    | SInd _ => Nothing Surface
+    | SConstruct _ _ _ => Nothing Surface
+    | SCase _ _ _ _ => Nothing Surface
+    | SFix _ _ _ _ _ => Nothing Surface
+    | SHole _ => Nothing Surface
+    | SEffectRow _ => Nothing Surface
+    | SPerform _ _ => Nothing Surface
+    | SStr _ _ => Nothing Surface
+    end;
+
+def expected_io_payload_or_unit (env : LowerEnv) (er : Maybe Surface) : Surface :=
+    match er with
+    | Just ty =>
+        match peel_io_payload env ty with
+        | Just payload => payload
+        | Nothing => unit_surface env
+        end
+    | Nothing => unit_surface env
+    end;
+
+def lookup_io_payload (env : LowerEnv) (nameId : Nat) : Maybe Surface :=
+    lookup_local nameId (env_ioPayloads env);
+
+def lookup_decl_type (env : LowerEnv) (nameId : Nat) : Maybe Surface :=
+    lookup_local nameId (env_declTypes env);
+
+def lookup_ctor_type (env : LowerEnv) (indId : Nat) (index : Nat)
+    : Maybe Surface :=
+    (fix go (ctors : List CtorInfo) : Maybe Surface :=
+      match ctors with
+      | Nil => Nothing Surface
+      | Cons ctor rest =>
+          match andb (eqNat (ctor_indId ctor) indId) (eqNat (ctor_idx ctor) index) with
+          | True => lookup_decl_type env (ctor_nameId ctor)
+          | False => go rest
+          end
+      end) (env_ctors env);
+
+def expr_io_payload_hint (env : LowerEnv) (locals : List (Pair Nat Surface)) (e : Expr)
+    : Maybe Surface :=
+  (fix go (x : Expr) : Maybe Surface :=
+    match x with
+    | EVar n =>
+        match lookup_local n locals with
+        | Just ty => peel_io_payload env ty
+        | Nothing => lookup_io_payload env n
+        end
+    | EApp f _ => go f
+    | EAscribe e0 _ty => go e0
+    | EDoBind _ body => go body
+    | EHole _ => Nothing Surface
+    | ESort _ => Nothing Surface
+    | ENat _ => Nothing Surface
+    | EStr _ => Nothing Surface
+    | EList _ => Nothing Surface
+    | ELam _ _ _ => Nothing Surface
+    | EPi _ _ _ => Nothing Surface
+    | ELet _ _ _ _ => Nothing Surface
+    | EMatch _ _ => Nothing Surface
+    | EFix _ _ _ _ => Nothing Surface
+    | EEffectRow _ _ => Nothing Surface
+    | EPerform _ _ => Nothing Surface
+    | EDo _ => Nothing Surface
+    | EHandle _ _ => Nothing Surface
+    | EBranch _ _ _ => Nothing Surface
+    | ENoBranch => Nothing Surface
+    | EBinder _ _ _ => Nothing Surface
+    | ENoBinder => Nothing Surface
+    | EMultiMatch _ _ => Nothing Surface
+    end) e;
+
+def expr_io_payload_or_unit (env : LowerEnv) (locals : List (Pair Nat Surface))
+    (e : Expr) : Surface :=
+    match expr_io_payload_hint env locals e with
+    | Just payload => payload
+    | Nothing => unit_surface env
+    end;
+
+def surface_subst_name (name : Nat) (value : Surface) : Surface -> Surface :=
+  fix surface_subst_name (surface : Surface) : Surface :=
+    match surface with
+    | SVar current =>
+        match eqNat name current with
+        | True => value
+        | False => surface
+        end
+    | SSort _ => surface
+    | SPi binder dom cod =>
+        SPi binder (surface_subst_name dom)
+          (match eqNat binder name with
+           | True => cod
+           | False => surface_subst_name cod
+           end)
+    | SLam binder ann body =>
+        SLam binder (surface_subst_name ann)
+          (match eqNat binder name with
+           | True => body
+           | False => surface_subst_name body
+           end)
+    | SApp f a => SApp (surface_subst_name f) (surface_subst_name a)
+    | SLet binder val ty body =>
+        SLet binder (surface_subst_name val) (surface_subst_name ty)
+          (match eqNat binder name with
+           | True => body
+           | False => surface_subst_name body
+           end)
+    | SConst _ => surface
+    | SInd _ => surface
+    | SConstruct _ _ _ => surface
+    | SCase ci p scrut branches =>
+        SCase ci (surface_subst_name p) (surface_subst_name scrut)
+          ((fix substitute_branches (rest : List Surface) : List Surface :=
+              match rest with
+              | Nil => Nil Surface
+              | Cons branch tail =>
+                  Cons Surface (surface_subst_name branch)
+                    (substitute_branches tail)
+              end) branches)
+    | SFix binder rec_arg arity ty body =>
+        SFix binder rec_arg arity (surface_subst_name ty)
+          (match eqNat binder name with
+           | True => body
+           | False => surface_subst_name body
+           end)
+    | SHole _ => surface
+    | SEffectRow ty => SEffectRow (surface_subst_name ty)
+    | SPerform op args =>
+        SPerform op
+          ((fix substitute_arguments (rest : List Surface) : List Surface :=
+              match rest with
+              | Nil => Nil Surface
+              | Cons argument tail =>
+                  Cons Surface (surface_subst_name argument)
+                    (substitute_arguments tail)
+              end) args)
+    | SStr _ _ => surface
+    end;
+
+def surface_branch_body : Surface -> Surface :=
+  fix surface_branch_body (term : Surface) : Surface :=
+    match term with
+    | SLam _ _ body => surface_branch_body body
+    | SVar _ => term
+    | SSort _ => term
+    | SPi _ _ _ => term
+    | SApp _ _ => term
+    | SLet _ _ _ _ => term
+    | SConst _ => term
+    | SInd _ => term
+    | SConstruct _ _ _ => term
+    | SCase _ _ _ _ => term
+    | SFix _ _ _ _ _ => term
+    | SHole _ => term
+    | SEffectRow _ => term
+    | SPerform _ _ => term
+    | SStr _ _ => term
+    end;
+
+def surface_type_hint (env : LowerEnv) (locals : List (Pair Nat Surface))
+    (fuel : Nat) (surface : Surface) : Maybe Surface :=
+    (fix go (remaining : Nat) (context : List (Pair Nat Surface)) (term : Surface)
+        : Maybe Surface :=
+      match remaining with
+      | Z => Nothing Surface
+      | S next =>
+          match term with
+          | SVar name =>
+              match lookup_local name context with
+              | Just ty => Just Surface ty
+              | Nothing => lookup_decl_type env name
+              end
+          | SConst name => lookup_decl_type env name
+          | SInd name => lookup_decl_type env name
+          | SConstruct indId index _ => lookup_ctor_type env indId index
+          | SApp f arg =>
+              match go next context f with
+              | Nothing => Nothing Surface
+              | Just fn_ty =>
+                  match fn_ty with
+                  | SPi binder _ cod =>
+                      Just Surface (surface_subst_name binder arg cod)
+                  | SVar _ => Nothing Surface
+                  | SSort _ => Nothing Surface
+                  | SLam _ _ _ => Nothing Surface
+                  | SApp _ _ => Nothing Surface
+                  | SLet _ _ _ _ => Nothing Surface
+                  | SConst _ => Nothing Surface
+                  | SInd _ => Nothing Surface
+                  | SConstruct _ _ _ => Nothing Surface
+                  | SCase _ _ _ _ => Nothing Surface
+                  | SFix _ _ _ _ _ => Nothing Surface
+                  | SHole _ => Nothing Surface
+                  | SEffectRow _ => Nothing Surface
+                  | SPerform _ _ => Nothing Surface
+                  | SStr _ _ => Nothing Surface
+                  end
+              end
+          | SLam binder ann body =>
+              match go next (cons_local binder ann context) body with
+              | Nothing => Nothing Surface
+              | Just result => Just Surface (SPi binder ann result)
+              end
+          | SLet binder value ty body =>
+              match go next (cons_local binder ty context) body with
+              | Nothing => Nothing Surface
+              | Just result =>
+                  Just Surface (surface_subst_name binder value result)
+              end
+          | SCase _ _ _ branches =>
+              -- A hint only: the checker validates every branch afterwards.
+              match branches with
+              | Nil => Nothing Surface
+              | Cons branch _ => go next context (surface_branch_body branch)
+              end
+          | SFix _ _ _ ty _ => Just Surface ty
+          | SSort level => Just Surface (SSort (S level))
+          | SPi _ _ _ => Nothing Surface
+          | SHole _ => Nothing Surface
+          | SEffectRow _ => Nothing Surface
+          | SPerform _ _ => Nothing Surface
+          | SStr _ typeId => Just Surface (SConst typeId)
+          end
+      end) fuel locals surface;
+
+def surface_pi_domain (ty : Surface) : Maybe Surface :=
+    match ty with
+    | SPi _ domain _ => Just Surface domain
+    | SVar _ => Nothing Surface
+    | SSort _ => Nothing Surface
+    | SLam _ _ _ => Nothing Surface
+    | SApp _ _ => Nothing Surface
+    | SLet _ _ _ _ => Nothing Surface
+    | SConst _ => Nothing Surface
+    | SInd _ => Nothing Surface
+    | SConstruct _ _ _ => Nothing Surface
+    | SCase _ _ _ _ => Nothing Surface
+    | SFix _ _ _ _ _ => Nothing Surface
+    | SHole _ => Nothing Surface
+    | SEffectRow _ => Nothing Surface
+    | SPerform _ _ => Nothing Surface
+    | SStr _ _ => Nothing Surface
+    end;
+
+def surface_lambda_domain (term : Surface) : Maybe Surface :=
+    match term with
+    | SLam _ domain _ => Just Surface domain
+    | SVar _ => Nothing Surface
+    | SSort _ => Nothing Surface
+    | SPi _ _ _ => Nothing Surface
+    | SApp _ _ => Nothing Surface
+    | SLet _ _ _ _ => Nothing Surface
+    | SConst _ => Nothing Surface
+    | SInd _ => Nothing Surface
+    | SConstruct _ _ _ => Nothing Surface
+    | SCase _ _ _ _ => Nothing Surface
+    | SFix _ _ _ _ _ => Nothing Surface
+    | SHole _ => Nothing Surface
+    | SEffectRow _ => Nothing Surface
+    | SPerform _ _ => Nothing Surface
+    | SStr _ _ => Nothing Surface
+    end;
+
+def surface_argument_expected (env : LowerEnv)
+    (locals : List (Pair Nat Surface)) (callee : Surface) : Maybe Surface :=
+    match surface_lambda_domain callee with
+    | Just domain => Just Surface domain
+    | Nothing =>
+        match surface_type_hint env locals fuel1k callee with
+        | Nothing => Nothing Surface
+        | Just ty => surface_pi_domain ty
+        end
+    end;
+
+def surface_io_payload_hint (env : LowerEnv)
+    (locals : List (Pair Nat Surface)) (surface : Surface) : Maybe Surface :=
+    match surface_type_hint env locals fuel1k surface with
+    | Nothing => Nothing Surface
+    | Just ty => peel_io_payload env ty
+    end;
+
+def apply_io_bind_surface (env : LowerEnv) (aTy : Surface) (bTy : Surface)
+    (ma : Surface) (k : Surface) : Surface :=
+    SApp (SApp (SApp (SApp (io_bind_surface env) aTy) bTy) ma) k;
+
+-- Bounded handler subset for the selfhost pipeline.  A pure-only handler
+-- lowers to an explicit let-binding for the handled computation:
+--   handle c with | pure x => body end  ==>  let x : expected := c in body
+-- Operation clauses are intentionally not lowered here; without checked
+-- operation result types/continuation types, accepting them would be unsound.
+def one_nat (xs : List Nat) : Maybe Nat :=
+    match xs with
+    | Nil => Nothing Nat
+    | Cons x rest =>
+        match rest with
+        | Nil => Just Nat x
+        | Cons _ _ => Nothing Nat
+        end
+    end;
+
+def is_pure_handler_op (env : LowerEnv) (op : Nat) : Bool :=
+    match env_pureId env with
+    | Z => False
+    | S _ => eqNat op (env_pureId env)
+    end;
+
+def pure_only_handler_clause
+    (env : LowerEnv)
+    (clauses : List (Pair Nat (Pair (List Nat) Expr)))
+    : Maybe (Pair Nat Expr) :=
+    match clauses with
+    | Nil => Nothing (Pair Nat Expr)
+    | Cons clause rest =>
+        match rest with
+        | Cons _ _ => Nothing (Pair Nat Expr)
+        | Nil =>
+            match clause with
+            | MkPair op payload =>
+                match is_pure_handler_op env op with
+                | False => Nothing (Pair Nat Expr)
+                | True =>
+                    match payload with
+                    | MkPair binders body =>
+                        match one_nat binders with
+                        | Just x => Just (Pair Nat Expr) (MkPair Nat Expr x body)
+                        | Nothing => Nothing (Pair Nat Expr)
+                        end
+                    end
+                end
+            end
+        end
+    end;
+
+-- @bound(cyclo <= 82)

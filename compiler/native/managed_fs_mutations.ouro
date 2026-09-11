@@ -1,0 +1,99 @@
+-- Directory creation and non-recursive removal retain their Unit surface.
+-- Conversion and cleanup failures remain fatal. Existing checked filesystem
+-- wrappers inspect postconditions after these low-level actions run.
+import "managed_fs_predicates.ouro";
+
+def managed_fs_mutation_operation (primitive : PrimitiveId) : Maybe Bool :=
+    match primitive_id_equal primitive PrimitiveDirectoryCreate with
+    | True => Just Bool True
+    | False => match primitive_id_equal primitive PrimitivePathRemove with
+      | True => Just Bool False | False => Nothing Bool end end;
+
+def managed_fs_mutation_name (create : Bool) : List Nat :=
+    match create with
+    | True => ([114,97,119,95,119,105,110,100,111,119,115,95,100,105,114,101,99,116,111,114,121,95,112,97,114,101,110,116,115] : List Nat)
+    | False => ([114,97,119,95,119,105,110,100,111,119,115,95,112,97,116,104,95,114,101,109,111,118,101] : List Nat) end;
+
+def managed_fs_mutation_expected (compiler : ManagedCompiler) : Either NativeLowerError CoreTerm :=
+    let bindings : List PrimitiveResolved := primitive_environment (managed_compiler_entries compiler) in
+    lower_from_primitive CoreTerm (CSort 0)
+      (primitive_bind CoreTerm CoreTerm (primitive_type_ref PrimitiveRuntimeType bindings) (fun (runtime : CoreTerm) =>
+        primitive_bind CoreTerm CoreTerm (primitive_type_ref PrimitiveRawPtrType bindings) (fun (pointer : CoreTerm) =>
+          primitive_bind CoreTerm CoreTerm (primitive_type_ref PrimitiveU8Type bindings) (fun (byte : CoreTerm) =>
+            primitive_bind CoreTerm CoreTerm (primitive_type_ref PrimitiveUSizeType bindings) (fun (size : CoreTerm) =>
+              primitive_map CoreTerm CoreTerm (fun (word : CoreTerm) =>
+                primitive_arrow ([CApp pointer byte, size] : List CoreTerm) (CApp runtime word))
+                (primitive_type_ref PrimitiveU32Type bindings))))));
+
+def managed_fs_mutation_roots (compiler : ManagedCompiler) (fuel : Nat) : Either NativeLowerError (List Nat) :=
+    let operations : List Bool := append Bool
+      (match managed_stdio_has compiler PrimitiveDirectoryCreate with | True => ([True] : List Bool) | False => ([] : List Bool) end)
+      (match managed_stdio_has compiler PrimitivePathRemove with | True => ([False] : List Bool) | False => ([] : List Bool) end) in
+    match operations with
+    | Nil => Right NativeLowerError (List Nat) ([] : List Nat)
+    | Cons _ _ => lower_bind CoreTerm (List Nat) (managed_fs_mutation_expected compiler) (fun (expected : CoreTerm) =>
+        lower_bind (List Nat) (List Nat)
+          ((fix resolve (rest : List Bool) : Either NativeLowerError (List Nat) :=
+            match rest with | Nil => Right NativeLowerError (List Nat) ([] : List Nat)
+            | Cons create tail => lower_bind Nat (List Nat)
+                (managed_runtime_definition compiler fuel (managed_fs_mutation_name create) expected)
+                (fun (id : Nat) => lower_map (List Nat) (List Nat) (Cons Nat id) (resolve tail)) end) operations)
+          (fun (queries : List Nat) =>
+            (fix helpers (rest : List ManagedStartupHelper) : Either NativeLowerError (List Nat) :=
+              match rest with | Nil => Right NativeLowerError (List Nat) queries
+              | Cons helper tail => lower_bind CoreTerm (List Nat) (managed_startup_expected compiler helper)
+                  (fun (annotation : CoreTerm) => lower_bind Nat (List Nat)
+                    (managed_runtime_definition compiler fuel (managed_startup_helper_name helper) annotation)
+                    (fun (id : Nat) => lower_map (List Nat) (List Nat) (Cons Nat id) (helpers tail))) end)
+              ([ManagedStartupAllocate, ManagedStartupRelease, ManagedStartupToWide] : List ManagedStartupHelper))) end;
+
+def managed_fs_mutation_query (compiler : ManagedCompiler) (create : Bool) (scope : ManagedStartupScope)
+    (wide : MirValue) (units : MirValue) (count : MirValue) (state : ManagedState)
+    : Either NativeLowerError ManagedResult :=
+    lower_bind CoreTerm ManagedResult (managed_fs_mutation_expected compiler) (fun (expected : CoreTerm) =>
+      lower_bind LowerContract ManagedResult
+        (managed_runtime_contract compiler primitive_default_fuel (managed_fs_mutation_name create) expected)
+        (fun (contract : LowerContract) => lower_bind ManagedResult ManagedResult
+          (managed_fresh MirU32 (fun (local : Nat) => MirCall MirMayGc (Just Nat local)
+            (MirDirect (lower_contract_id contract)) ([wide, units] : List MirValue)) state)
+          (fun (queried : ManagedResult) => match queried with | ManagedResultOf status next =>
+            lower_bind ManagedResult ManagedResult (managed_compare MirNotEqual status (managed_bits MirU32 87) next)
+              (fun (checked : ManagedResult) => match checked with | ManagedResultOf valid after =>
+                managed_startup_check compiler scope valid (managed_unit_value compiler) after end) end)));
+
+def managed_fs_mutation_storage (compiler : ManagedCompiler) (create : Bool) (value : MirValue) (bytes : MirValue)
+    (count : MirValue) (scope : ManagedStartupScope) (state : ManagedState)
+    : Either NativeLowerError ManagedResult :=
+    managed_startup_buffer compiler scope bytes
+      (managed_startup_name_copy compiler (managed_fs_mutation_query compiler create) value bytes count) state;
+
+def managed_fs_mutation_action (compiler : ManagedCompiler) (create : Bool) (path : MirValue) (state : ManagedState)
+    : Either NativeLowerError ManagedResult :=
+    managed_action compiler ([path] : List MirValue)
+      (fun (captures : List MirValue) (entered : ManagedState) =>
+        lower_bind MirValue ManagedResult (lower_single MirValue captures)
+          (fun (value : MirValue) => managed_fs_path_body compiler (managed_unit_value compiler)
+            (managed_fs_mutation_storage compiler create) value entered)) state;
+
+def managed_fs_mutation_value (compiler : ManagedCompiler) (create : Bool) (state : ManagedState)
+    : Either NativeLowerError ManagedResult :=
+    let caller : LowerState := managed_flow state in
+    lower_bind (Pair Nat ManagedState) ManagedResult (managed_fresh_symbol state)
+      (fun (fresh : Pair Nat ManagedState) => match fresh with | MkPair symbol reserved =>
+        lower_bind ManagedResult ManagedResult
+          (managed_fs_mutation_action compiler create (MirUse 1) (managed_with_flow reserved (lower_empty_state 2)))
+          (fun (compiled : ManagedResult) => match compiled with | ManagedResultOf action after =>
+            let name : List Nat := match create with
+              | True => ([111,117,114,111,95,102,115,95,109,107,100,105,114] : List Nat)
+              | False => ([111,117,114,111,95,102,115,95,114,101,109,111,118,101] : List Nat) end in
+            let function : MirFunction := managed_finish_function symbol name
+              ([MirLocalDef 0 MirManagedPtr, MirLocalDef 1 MirManagedPtr] : List MirLocal) action after in
+            managed_emit_callable compiler 3 symbol False ([] : List MirValue)
+              (managed_with_flow (managed_add_function function after) caller) end) end);
+
+def managed_fs_mutation_primitive (compiler : ManagedCompiler) (step : ManagedStep) (scope : ManagedScope)
+    (create : Bool) (arguments : List CoreTerm) (state : ManagedState) : Either NativeLowerError ManagedResult :=
+    lower_bind CoreTerm ManagedResult (lower_single CoreTerm arguments) (fun (term : CoreTerm) =>
+      lower_bind ManagedResult ManagedResult (step scope term state)
+        (fun (value : ManagedResult) => match value with | ManagedResultOf path next =>
+          managed_fs_mutation_action compiler create path next end));

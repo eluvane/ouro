@@ -1,0 +1,269 @@
+-- CFG issues are structural and conservative; this core avoids whole-program
+-- exhaustiveness guesses. Coverage against constructor signatures belongs to
+-- match_cover.ouro; this core only looks at the shape of matches and fixes.
+
+-- @entry analyze_cfg
+-- @entry cfg_cyclomatic
+
+import "../../std/data.ouro";
+import "../../std/listx.ouro";
+import "../../std/natx.ouro";
+import "ast.ouro";
+
+-- empty match; one-arm match binding nothing (constructor); fix whose body
+-- never matches on one of its parameters (name); arm repeating an earlier
+-- unrefined arm's constructor.
+inductive CfgIssue : Type :=
+  | IEmptyMatch : Nat -> CfgIssue
+  | ITrivialMatch : Nat -> CfgIssue
+  | IUncheckedRecursion : Nat -> CfgIssue
+  | IUnreachableBranch : Nat -> CfgIssue;
+
+def cfg_inil : List CfgIssue := [];
+
+def cfg_icons (i : CfgIssue) (is : List CfgIssue) : List CfgIssue :=
+    Cons CfgIssue i is;
+
+def cfg_append (xs : List CfgIssue) (ys : List CfgIssue) : List CfgIssue :=
+    append CfgIssue xs ys;
+
+def cfg_max1 (n : Nat) : Nat :=
+    match n with
+    | Z => S Z
+    | S _ => n
+    end;
+
+-- Cyclomatic complexity: 1 + sum over matches of max(arms, 1).
+def cfg_cyclo_go : Ast -> Nat :=
+  fun (root : Ast) =>
+    (fix cfg_cyclo_go (fuel : Nat) (a : Ast) : Nat :=
+      match fuel with
+      | Z => Z
+      | S remaining =>
+          let descend : Ast -> Nat :=
+            fun (child : Ast) => cfg_cyclo_go remaining child in
+          let own : Nat :=
+            match ast_is tag_match a with
+            | True =>
+                match ast_children a with
+                | Nil => Z
+                | Cons _ rest =>
+                    match rest with
+                    | Nil => Z
+                    | Cons branches _ => cfg_max1 (ast_arm_count branches)
+                    end
+                end
+            | False => Z
+            end in
+          add own (ast_sum (map Ast Nat descend (ast_children a)))
+      end) (ast_size root) root;
+
+def cfg_cyclomatic (a : Ast) : Nat := S (cfg_cyclo_go a);
+
+-- A pattern slot naming a constructor refines the arm: `MkBox n On` covers
+-- part of MkBox only and never makes a later MkBox arm unreachable.
+def cfg_refined (ctor_like : List Nat) (binders : List Nat) : Bool :=
+    any Nat (fun (b : Nat) => mem Nat eq_nat b ctor_like) binders;
+
+-- Arms whose constructor an earlier unrefined arm already claimed.
+def cfg_dup_arms (ctor_like : List Nat) : Ast -> List Nat -> List CfgIssue :=
+  fix cfg_dup_arms (b : Ast) (seen : List Nat) : List CfgIssue :=
+    match b with
+    | ABranch ctor binders _ rest =>
+        match mem Nat eq_nat ctor seen with
+        | True => cfg_icons (IUnreachableBranch ctor) (cfg_dup_arms rest seen)
+        | False =>
+            match cfg_refined ctor_like binders with
+            | True => cfg_dup_arms rest seen
+            | False => cfg_dup_arms rest (Cons Nat ctor seen)
+            end
+        end
+    | ANoBranch => cfg_inil
+    | AVar _ => cfg_inil
+    | AHole _ => cfg_inil
+    | ASort _ => cfg_inil
+    | ANatLit _ => cfg_inil
+    | AApp _ _ => cfg_inil
+    | ALam _ _ _ => cfg_inil
+    | APi _ _ _ => cfg_inil
+    | ALet _ _ _ _ => cfg_inil
+    | AAscribe _ _ => cfg_inil
+    | ABinder _ _ _ => cfg_inil
+    | ANoBinder => cfg_inil
+    | AFix _ _ _ _ => cfg_inil
+    | AMatch _ _ => cfg_inil
+    | APerform _ _ => cfg_inil
+    | AHandle _ _ => cfg_inil
+    | AClause _ _ _ _ => cfg_inil
+    | ANoClause => cfg_inil
+    | ADo _ => cfg_inil
+    | AList _ => cfg_inil
+    | AStr _ => cfg_inil
+    end;
+
+-- A one-arm match that binds nothing is the arm's body; destructuring a
+-- single-constructor value (`MkPair a b`) binds and is not trivial, and a
+-- constructor of an indexed family (`refl`) refines the indices, so matching
+-- on it is the elimination itself.
+def cfg_trivial (dependent : List Nat) (branches : Ast) : List CfgIssue :=
+    match branches with
+    | ABranch ctor binders _ rest =>
+        match orb (notb (ast_is tag_no_branch rest)) (mem Nat eq_nat ctor dependent) with
+        | True => cfg_inil
+        | False =>
+            match binders with
+            | Nil => cfg_icons (ITrivialMatch ctor) cfg_inil
+            | Cons _ _ => cfg_inil
+            end
+        end
+    | ANoBranch => cfg_inil
+    | AVar _ => cfg_inil
+    | AHole _ => cfg_inil
+    | ASort _ => cfg_inil
+    | ANatLit _ => cfg_inil
+    | AApp _ _ => cfg_inil
+    | ALam _ _ _ => cfg_inil
+    | APi _ _ _ => cfg_inil
+    | ALet _ _ _ _ => cfg_inil
+    | AAscribe _ _ => cfg_inil
+    | ABinder _ _ _ => cfg_inil
+    | ANoBinder => cfg_inil
+    | AFix _ _ _ _ => cfg_inil
+    | AMatch _ _ => cfg_inil
+    | APerform _ _ => cfg_inil
+    | AHandle _ _ => cfg_inil
+    | AClause _ _ _ _ => cfg_inil
+    | ANoClause => cfg_inil
+    | ADo _ => cfg_inil
+    | AList _ => cfg_inil
+    | AStr _ => cfg_inil
+    end;
+
+-- The scrutinee is a name bound with an uninhabited type in scope: a
+-- branchless match on it is ex falso, the kernel's coverage case.
+def cfg_absurd (empty_vars : List Nat) (scrut : Ast) : Bool :=
+    match ast_var_id (ast_peel_ascribe scrut) with
+    | Nothing => False
+    | Just id => mem Nat eq_nat id empty_vars
+    end;
+
+-- Empty, trivial, and unreachable arms of one match; no nested bodies. The
+-- rows of a multi-scrutinee match (`AList` scrutinee) keep only their first
+-- column's constructor, so repeated or single arms say nothing there.
+def cfg_match_issues (ctor_like : List Nat) (dependent : List Nat)
+    (empty_vars : List Nat) (scrut : Ast) (branches : Ast) : List CfgIssue :=
+    match ast_arm_count branches with
+    | Z =>
+        match cfg_absurd empty_vars scrut with
+        | True => cfg_inil
+        | False => cfg_icons (IEmptyMatch Z) cfg_inil
+        end
+    | S _ =>
+        match ast_is tag_list scrut with
+        | True => cfg_inil
+        | False =>
+            cfg_append (cfg_trivial dependent branches)
+              (cfg_dup_arms ctor_like branches (Nil Nat))
+        end
+    end;
+
+-- A fix with parameters whose body calls itself but never scrutinises one of
+-- them recurses without a structural check.
+def cfg_fix_issue (r : Nat) (binders : Ast) (body : Ast) : List CfgIssue :=
+    match ast_recursion_unguarded r binders body with
+    | True => cfg_icons (IUncheckedRecursion r) cfg_inil
+    | False => cfg_inil
+    end;
+
+def cfg_node_issues (ctor_like : List Nat) (dependent : List Nat)
+    (empty_vars : List Nat) (a : Ast) : List CfgIssue :=
+    match a with
+    | AMatch scrut branches =>
+        cfg_match_issues ctor_like dependent empty_vars scrut branches
+    | AFix r binders _ body => cfg_fix_issue r binders body
+    | AVar _ => cfg_inil
+    | AHole _ => cfg_inil
+    | ASort _ => cfg_inil
+    | ANatLit _ => cfg_inil
+    | AApp _ _ => cfg_inil
+    | ALam _ _ _ => cfg_inil
+    | APi _ _ _ => cfg_inil
+    | ALet _ _ _ _ => cfg_inil
+    | AAscribe _ _ => cfg_inil
+    | ABinder _ _ _ => cfg_inil
+    | ANoBinder => cfg_inil
+    | ABranch _ _ _ _ => cfg_inil
+    | ANoBranch => cfg_inil
+    | APerform _ _ => cfg_inil
+    | AHandle _ _ => cfg_inil
+    | AClause _ _ _ _ => cfg_inil
+    | ANoClause => cfg_inil
+    | ADo _ => cfg_inil
+    | AList _ => cfg_inil
+    | AStr _ => cfg_inil
+    end;
+
+-- A binder annotated with an uninhabited inductive (`(e : Empty)`) joins the
+-- names a branchless match may eliminate.
+def cfg_bind (uninhabited : List Nat) (empty_vars : List Nat) (id : Nat) (ann : Ast)
+    : List Nat :=
+    match ast_app_head ann with
+    | Nothing => empty_vars
+    | Just h =>
+        match mem Nat eq_nat h uninhabited with
+        | True => Cons Nat id empty_vars
+        | False => empty_vars
+        end
+    end;
+
+def cfg_walk (ctor_like : List Nat) (dependent : List Nat) (uninhabited : List Nat)
+    : List Nat -> Ast -> List CfgIssue :=
+  fun (initial_empty : List Nat) (root : Ast) =>
+    (fix cfg_walk (fuel : Nat) (empty_vars : List Nat) (a : Ast) : List CfgIssue :=
+      match fuel with
+      | Z => cfg_inil
+      | S remaining =>
+          let descend : List Nat -> Ast -> List CfgIssue :=
+            fun (next_empty_vars : List Nat) (child : Ast) => cfg_walk remaining next_empty_vars child in
+          let here : List CfgIssue :=
+            cfg_node_issues ctor_like dependent empty_vars a in
+          let rest : List CfgIssue :=
+            match a with
+            | ALam id ann body =>
+                cfg_append (descend empty_vars ann)
+                  (descend (cfg_bind uninhabited empty_vars id ann) body)
+            | APi id dom cod =>
+                cfg_append (descend empty_vars dom)
+                  (descend (cfg_bind uninhabited empty_vars id dom) cod)
+            | ABinder id ty next =>
+                cfg_append (descend empty_vars ty)
+                  (descend (cfg_bind uninhabited empty_vars id ty) next)
+            | AVar _ => cfg_inil
+            | AHole _ => cfg_inil
+            | ASort _ => cfg_inil
+            | ANatLit _ => cfg_inil
+            | AStr _ => cfg_inil
+            | ANoBinder => cfg_inil
+            | ANoBranch => cfg_inil
+            | ANoClause => cfg_inil
+            | AApp _ _ => concat_map Ast CfgIssue (descend empty_vars) (ast_children a)
+            | ALet _ _ _ _ => concat_map Ast CfgIssue (descend empty_vars) (ast_children a)
+            | AAscribe _ _ => concat_map Ast CfgIssue (descend empty_vars) (ast_children a)
+            | AFix _ _ _ _ => concat_map Ast CfgIssue (descend empty_vars) (ast_children a)
+            | ABranch _ _ _ _ => concat_map Ast CfgIssue (descend empty_vars) (ast_children a)
+            | AMatch _ _ => concat_map Ast CfgIssue (descend empty_vars) (ast_children a)
+            | APerform _ _ => concat_map Ast CfgIssue (descend empty_vars) (ast_children a)
+            | AHandle _ _ => concat_map Ast CfgIssue (descend empty_vars) (ast_children a)
+            | AClause _ _ _ _ => concat_map Ast CfgIssue (descend empty_vars) (ast_children a)
+            | ADo _ => concat_map Ast CfgIssue (descend empty_vars) (ast_children a)
+            | AList _ => concat_map Ast CfgIssue (descend empty_vars) (ast_children a)
+            end in
+          cfg_append here rest
+      end) (ast_size root) initial_empty root;
+
+-- ctor_like: ids that name constructors, so refined arms are recognised;
+-- dependent: constructors of indexed families; uninhabited: inductives with
+-- no constructors.
+def analyze_cfg (ctor_like : List Nat) (dependent : List Nat)
+    (uninhabited : List Nat) (a : Ast) : List CfgIssue :=
+    cfg_walk ctor_like dependent uninhabited (Nil Nat) a;

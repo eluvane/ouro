@@ -1,0 +1,654 @@
+-- File-level kernel driver: declarations are checked left-to-right against the environment they extend.
+-- Failure codes are host-facing, so factoring must keep their meanings stable.
+
+
+import "file_elab_positive.ouro";
+import "file_check_result.ouro";
+
+inductive PiParts : Type := | MkPi : CoreTerm -> CoreTerm -> PiParts;
+
+inductive PiList : Type := | MkPiList : List CoreTerm -> CoreTerm -> PiList;
+
+def piViewRaw (t : CoreTerm) : Maybe PiParts :=
+    match t with
+    | CPi a b => Just PiParts (MkPi a b)
+    | CRel _ => Nothing PiParts
+    | CSort _ => Nothing PiParts
+    | CLam _ _ => Nothing PiParts
+    | CApp _ _ => Nothing PiParts
+    | CLetIn _ _ _ => Nothing PiParts
+    | CConst _ => Nothing PiParts
+    | CInd _ => Nothing PiParts
+    | CConstruct _ _ _ => Nothing PiParts
+    | CStrBytes _ _ => Nothing PiParts
+    | CStrLit _ _ => Nothing PiParts
+    | CCase _ _ _ _ => Nothing PiParts
+    | CFix _ _ _ _ _ => Nothing PiParts
+    end;
+
+-- Inspect the head without reducing unused codomains or dropping failures.
+def pi_view_checked_indexed (fuel : Nat) (sig : CheckEnvironment) (term : CoreTerm) : CheckResult PiParts :=
+    check_bind CoreTerm PiParts
+      (check_from_normalize CoreTerm (whnf_checked_worker fuel sig term))
+      (fun (head : CoreTerm) =>
+        check_from_maybe PiParts (CheckTypeFailure CheckExpectedFunction) (piViewRaw head));
+
+def lookup_ctx (ctx : List CoreTerm) (i : Nat) : Maybe CoreTerm :=
+    match compiler_nth CoreTerm ctx i with
+    | Nothing => Nothing CoreTerm
+    | Just ty => Just CoreTerm (lift i ty)
+    end;
+
+def extend (ctx : List CoreTerm) (ty : CoreTerm) : List CoreTerm :=
+    Cons CoreTerm (lift 1 ty) ctx;
+
+-- Products keep convertible domains and cumulative codomains.
+def cumul_checked_indexed : Nat -> CheckEnvironment -> CoreTerm -> CoreTerm -> CheckResult Bool :=
+  fix cumul_checked_indexed (fuel : Nat) (sig : CheckEnvironment) (t1 : CoreTerm) (t2 : CoreTerm)
+      : CheckResult Bool :=
+    match fuel with
+    | Z => CheckErr Bool CheckResourceLimit
+    | S fuel' =>
+        check_bind Bool Bool (check_from_normalize Bool (conv_checked_worker fuel' sig t1 t2))
+          (fun (equal : Bool) =>
+            match equal with
+            | True => CheckOk Bool True
+            | False =>
+                check_bind CoreTerm Bool
+                  (check_from_normalize CoreTerm (whnf_checked_worker fuel' sig t1))
+                  (fun (n1 : CoreTerm) =>
+                    check_bind CoreTerm Bool
+                      (check_from_normalize CoreTerm (whnf_checked_worker fuel' sig t2))
+                      (fun (n2 : CoreTerm) =>
+                        match core_sort_level n1, core_sort_level n2 with
+                        | Just u, Just v => CheckOk Bool (compiler_le_nat u v)
+                        | Just _, Nothing => CheckOk Bool False
+                        | Nothing, Just _ => CheckOk Bool False
+                        | Nothing, Nothing =>
+                            match piViewRaw n1, piViewRaw n2 with
+                            | Just left, Just right =>
+                                match left, right with
+                                | MkPi a b, MkPi c d =>
+                                    check_bind Bool Bool
+                                      (check_from_normalize Bool (conv_checked_worker fuel' sig a c))
+                                      (fun (same_domain : Bool) =>
+                                        match same_domain with
+                                        | False => CheckOk Bool False
+                                        | True => cumul_checked_indexed fuel' sig b d
+                                        end)
+                                end
+                            | Just _, Nothing => CheckOk Bool False
+                            | Nothing, Just _ => CheckOk Bool False
+                            | Nothing, Nothing => CheckOk Bool False
+                            end
+                        end))
+            end)
+    end;
+
+def check_convertible_indexed (fuel : Nat) (sig : CheckEnvironment) (left : CoreTerm)
+    (right : CoreTerm) : CheckResult Unit :=
+    check_require_result (check_from_normalize Bool (conv_checked_worker fuel sig left right))
+      (CheckTypeFailure CheckTypeMismatch);
+
+def check_cumulative_indexed (fuel : Nat) (sig : CheckEnvironment) (actual : CoreTerm)
+    (expected : CoreTerm) : CheckResult Unit :=
+    check_require_result (cumul_checked_indexed fuel sig actual expected)
+      (CheckTypeFailure CheckTypeMismatch);
+
+def mk_pis (doms : List CoreTerm) (body : CoreTerm) : CoreTerm :=
+    (fix mk_pis (xs : List CoreTerm) : CoreTerm :=
+        match xs with
+        | Nil => body
+        | Cons a xs' => CPi a (mk_pis xs')
+        end) doms;
+
+def params_types : List Param -> List CoreTerm :=
+  fix params_types (ps : List Param) : List CoreTerm :=
+    match ps with
+    | Nil => Nil CoreTerm
+    | Cons p ps' =>
+        match p with
+        | MkParam _ ty => Cons CoreTerm ty (params_types ps')
+        end
+    end;
+
+def instantiate_params (t : CoreTerm) (pts : List CoreTerm) : CoreTerm :=
+    (fix go (remaining : List CoreTerm) (current : CoreTerm) : CoreTerm :=
+        match remaining with
+        | Nil => current
+        | Cons pt remaining' =>
+            match current with
+            | CPi _ b => go remaining' (subst pt b)
+            | CRel i => CRel i
+            | CSort u => CSort u
+            | CLam a b => CLam a b
+            | CApp f a => CApp f a
+            | CLetIn v ty b => CLetIn v ty b
+            | CConst n => CConst n
+            | CInd n => CInd n
+            | CConstruct i j p => CConstruct i j p
+            | CStrBytes n ty => CStrBytes n ty
+            | CStrLit n ty => CStrLit n ty
+            | CCase ci p s bs => CCase ci p s bs
+            | CFix n ra ar ty b => CFix n ra ar ty b
+            end
+        end) pts t;
+
+def peel_pis : CoreTerm -> PiList :=
+  fix peel_pis (t : CoreTerm) : PiList :=
+    match t with
+    | CPi a b =>
+        match peel_pis b with
+        | MkPiList doms body => MkPiList (Cons CoreTerm a doms) body
+        end
+    | CRel i => MkPiList (Nil CoreTerm) (CRel i)
+    | CSort u => MkPiList (Nil CoreTerm) (CSort u)
+    | CLam a b => MkPiList (Nil CoreTerm) (CLam a b)
+    | CApp f a => MkPiList (Nil CoreTerm) (CApp f a)
+    | CLetIn v ty b => MkPiList (Nil CoreTerm) (CLetIn v ty b)
+    | CConst n => MkPiList (Nil CoreTerm) (CConst n)
+    | CInd n => MkPiList (Nil CoreTerm) (CInd n)
+    | CConstruct i j p => MkPiList (Nil CoreTerm) (CConstruct i j p)
+    | CStrBytes n ty => MkPiList (Nil CoreTerm) (CStrBytes n ty)
+    | CStrLit n ty => MkPiList (Nil CoreTerm) (CStrLit n ty)
+    | CCase ci p s bs => MkPiList (Nil CoreTerm) (CCase ci p s bs)
+    | CFix n ra ar ty b => MkPiList (Nil CoreTerm) (CFix n ra ar ty b)
+    end;
+
+def instantiate_params_checked_indexed (fuel : Nat) (sig : CheckEnvironment)
+    : List CoreTerm -> CoreTerm -> CheckResult CoreTerm :=
+  fix instantiate (arguments : List CoreTerm) (typ : CoreTerm) : CheckResult CoreTerm :=
+    match arguments with
+    | Nil => CheckOk CoreTerm typ
+    | Cons argument rest =>
+        check_bind PiParts CoreTerm (pi_view_checked_indexed fuel sig typ)
+          (fun (parts : PiParts) =>
+            match parts with
+            | MkPi _ codomain => instantiate rest (subst argument codomain)
+            end)
+    end;
+
+def peel_pis_checked_indexed (sig : CheckEnvironment) : Nat -> CoreTerm -> CheckResult PiList :=
+  fix peel (fuel : Nat) (typ : CoreTerm) : CheckResult PiList :=
+    match fuel with
+    | Z => CheckErr PiList CheckResourceLimit
+    | S fuel' =>
+        check_bind CoreTerm PiList
+          (check_from_normalize CoreTerm (whnf_checked_worker fuel' sig typ))
+          (fun (head : CoreTerm) =>
+            match piViewRaw head with
+            | Nothing => CheckOk PiList (MkPiList (Nil CoreTerm) head)
+            | Just parts =>
+                match parts with
+                | MkPi domain codomain =>
+                    check_map PiList PiList
+                      (fun (tail : PiList) =>
+                        match tail with
+                        | MkPiList domains body => MkPiList (Cons CoreTerm domain domains) body
+                        end) (peel fuel' codomain)
+                end
+            end)
+    end;
+
+def pi_arity : CoreTerm -> Nat :=
+  fix pi_arity (t : CoreTerm) : Nat :=
+    match t with
+    | CPi _ b => S (pi_arity b)
+    | CRel _ => Z
+    | CSort _ => Z
+    | CLam _ _ => Z
+    | CApp _ _ => Z
+    | CLetIn _ _ _ => Z
+    | CConst _ => Z
+    | CInd _ => Z
+    | CConstruct _ _ _ => Z
+    | CStrBytes _ _ => Z
+    | CStrLit _ _ => Z
+    | CCase _ _ _ _ => Z
+    | CFix _ _ _ _ _ => Z
+    end;
+
+def lift_list (d : Nat) : List CoreTerm -> List CoreTerm :=
+    fix lift_list (xs : List CoreTerm) : List CoreTerm :=
+      match xs with
+      | Nil => Nil CoreTerm
+      | Cons x xs' => Cons CoreTerm (lift d x) (lift_list xs')
+      end;
+
+def arg_rels : Nat -> List CoreTerm :=
+  fix arg_rels (k : Nat) : List CoreTerm :=
+    match k with
+    | Z => Nil CoreTerm
+    | S k' => Cons CoreTerm (CRel k') (arg_rels k')
+    end;
+
+def branch_expected (ind : Nat) (nparams : Nat) (params : List CoreTerm) (p : CoreTerm) (j : Nat) (arg_types : List CoreTerm) (index_args : List CoreTerm) : CoreTerm :=
+    let k : Nat := length CoreTerm arg_types in
+    mk_pis arg_types
+      (CApp
+          (mk_app (lift k p) index_args)
+          (mk_app (CConstruct ind j nparams)
+            (append CoreTerm (lift_list k params) (arg_rels k))));
+
+def return_pred_indices_indexed (sig : CheckEnvironment) (ind : Nat) (nindices : Nat)
+    (params : List CoreTerm) : Nat -> Nat -> CoreTerm -> CoreTerm -> CheckResult Unit :=
+  fix take_pi (fuel : Nat) (remaining : Nat) (expected_type : CoreTerm)
+      (typ : CoreTerm) : CheckResult Unit :=
+    match fuel with
+    | Z => CheckErr Unit CheckResourceLimit
+    | S fuel' =>
+        check_bind PiParts Unit (pi_view_checked_indexed fuel' sig typ)
+          (fun (parts : PiParts) =>
+            match parts with
+            | MkPi domain codomain =>
+                match remaining with
+                | Z =>
+                    let expected : CoreTerm := mk_app (CInd ind)
+                      (append CoreTerm (lift_list nindices params) (arg_rels nindices)) in
+                    check_bind Unit Unit (check_convertible_indexed fuel' sig domain expected)
+                      (fun (_same : Unit) =>
+                        check_map Nat Unit (fun (_level : Nat) => MkUnit)
+                          (check_sort_indexed fuel' sig codomain))
+                | S rest =>
+                    check_bind PiParts Unit (pi_view_checked_indexed fuel' sig expected_type)
+                      (fun (expected_parts : PiParts) =>
+                        match expected_parts with
+                        | MkPi expected_dom expected_cod =>
+                            check_bind Unit Unit (check_convertible_indexed fuel' sig domain expected_dom)
+                              (fun (_same : Unit) => take_pi fuel' rest expected_cod codomain)
+                        end)
+                end
+            end)
+    end;
+
+def check_return_pred_checked_indexed (fuel : Nat) (sig : CheckEnvironment) (ci : CaseInfo)
+    (params : List CoreTerm) (p_ty : CoreTerm) : CheckResult Unit :=
+    match ci with
+    | MkCaseInfo ind nparams _ =>
+        check_bind IndDecl Unit
+          (check_from_maybe IndDecl (CheckMalformedCore (CheckUnknownInductive ind))
+            (check_environment_ind ind sig))
+          (fun (idecl : IndDecl) =>
+            match idecl with
+            | MkIndDecl _ declared_params indices sort _ctors =>
+                let nindices : Nat := length CoreTerm indices in
+                let index_telescope : CoreTerm :=
+                  instantiate_params
+                    (mk_pis (params_types declared_params) (mk_pis indices (CSort sort)))
+                    params in
+                check_bind Unit Unit
+                  (check_require (eqNat nparams (length Param declared_params))
+                    (CheckMalformedCore CheckCaseMetadata))
+                  (fun (_shape : Unit) =>
+                    return_pred_indices_indexed sig ind nindices params fuel nindices index_telescope p_ty)
+            end)
+    end;
+
+def asInd (t : CoreTerm) : Maybe Nat :=
+    match t with
+    | CInd n => Just Nat n
+    | CRel _ => Nothing Nat
+    | CSort _ => Nothing Nat
+    | CPi _ _ => Nothing Nat
+    | CLam _ _ => Nothing Nat
+    | CApp _ _ => Nothing Nat
+    | CLetIn _ _ _ => Nothing Nat
+    | CConst _ => Nothing Nat
+    | CConstruct _ _ _ => Nothing Nat
+    | CStrBytes _ _ => Nothing Nat
+    | CStrLit _ _ => Nothing Nat
+    | CCase _ _ _ _ => Nothing Nat
+    | CFix _ _ _ _ _ => Nothing Nat
+    end;
+
+-- The signature-free probe is conservative about unknown containers.
+def arg_positive (fuel : Nat) (name : Nat) (term : CoreTerm) : Bool :=
+    positive_arg fuel (Nil Entry) (Nil PositiveFunctor) name term;
+
+-- Termination helpers use the shared base memNat.
+def isRel (t : CoreTerm) : Maybe Nat :=
+    match t with
+    | CRel i => Just Nat i
+    | CSort _ => Nothing Nat
+    | CPi _ _ => Nothing Nat
+    | CLam _ _ => Nothing Nat
+    | CApp _ _ => Nothing Nat
+    | CLetIn _ _ _ => Nothing Nat
+    | CConst _ => Nothing Nat
+    | CInd _ => Nothing Nat
+    | CConstruct _ _ _ => Nothing Nat
+    | CStrBytes _ _ => Nothing Nat
+    | CStrLit _ _ => Nothing Nat
+    | CCase _ _ _ _ => Nothing Nat
+    | CFix _ _ _ _ _ => Nothing Nat
+    end;
+
+def shiftSmall : List Nat -> List Nat :=
+  fix shiftSmall (xs : List Nat) : List Nat :=
+    match xs with
+    | Nil => Nil Nat
+    | Cons x xs' => Cons Nat (S x) (shiftSmall xs')
+    end;
+
+def addRange (k : Nat) (small : List Nat) : List Nat :=
+    (fix go (i : Nat) (acc : List Nat) : List Nat :=
+        match i with
+        | Z => acc
+        | S i' => go i' (Cons Nat i' acc)
+        end) k small;
+
+def shiftBy : Nat -> List Nat -> List Nat :=
+  fix shiftBy (k : Nat) (small : List Nat) : List Nat :=
+    match k with
+    | Z => small
+    | S k' => shiftBy k' (shiftSmall small)
+    end;
+
+def peelLams : Nat -> CoreTerm -> Maybe CoreTerm :=
+  fix peelLams (k : Nat) (t : CoreTerm) : Maybe CoreTerm :=
+    match k with
+    | Z => Just CoreTerm t
+    | S k' =>
+        match lamBody t with
+        | Nothing => Nothing CoreTerm
+        | Just body => peelLams k' body
+        end
+    end;
+
+def app_rec_arg_view (arity : Nat) (rec_arg : Nat)
+    (args : List CoreTerm) : Maybe CoreTerm :=
+    (fix go (xs : List CoreTerm) (need : Nat) (target : Nat)
+        (found : Maybe CoreTerm) : Maybe CoreTerm :=
+        match xs with
+        | Nil =>
+            match need with
+            | Z => found
+            | S _ => Nothing CoreTerm
+            end
+        | Cons a xs' =>
+            let need' : Nat :=
+              match need with
+              | Z => Z
+              | S need0 => need0
+              end
+            in
+            match found with
+            | Just sa =>
+                match need' with
+                | Z => Just CoreTerm sa
+                | S _ => go xs' need' target (Just CoreTerm sa)
+                end
+            | Nothing =>
+                match target with
+                | Z =>
+                    match need' with
+                    | Z => Just CoreTerm a
+                    | S _ => go xs' need' Z (Just CoreTerm a)
+                    end
+                | S target' => go xs' need' target' (Nothing CoreTerm)
+                end
+            end
+        end) args arity rec_arg (Nothing CoreTerm);
+
+def case_small_scope (k : Nat) (gains : Bool) (small : List Nat) : List Nat :=
+    let shifted : List Nat := shiftBy k small in
+    match gains with
+    | True => addRange k shifted
+    | False => shifted
+    end;
+
+def nested_app_small (rec_arg : Nat) (arity : Nat)
+    (args : List CoreTerm) (small : List Nat) : Bool :=
+    match ltNat rec_arg arity with
+    | False => False
+    | True =>
+        match app_rec_arg_view arity rec_arg args with
+        | Nothing => False
+        | Just argument =>
+            match isRel argument with
+            | Nothing => False
+            | Just index => memNat index small
+            end
+        end
+    end;
+
+-- Mode-tagged termination (shallow arms; nested match hung elab).
+inductive TermMode : Type :=
+  | TMTerm : CoreTerm -> TermMode
+  | TMApp : CoreTerm -> TermMode
+  | TMAppRec : List CoreTerm -> TermMode
+  | TMAppOther : List CoreTerm -> TermMode
+  | TMAppHead : CoreTerm -> List CoreTerm -> TermMode
+  | TMNested : Nat -> Nat -> Nat -> CoreTerm -> TermMode
+  | TMCase : CaseInfo -> CoreTerm -> CoreTerm -> List CoreTerm -> TermMode
+  | TMCaseBs : CaseInfo -> CoreTerm -> List CoreTerm -> TermMode
+  | TMCaseGo : List Nat -> List CoreTerm -> Bool -> TermMode
+  | TMAll : List CoreTerm -> TermMode;
+
+def term_app_head (descend : List Nat -> Nat -> TermMode -> CheckResult Bool)
+    (small : List Nat) (depth : Nat) (head : CoreTerm)
+    (args : List CoreTerm) : CheckResult Bool :=
+    match asFixHead head with
+    | YesFix _ nested_rec nested_arity typ body =>
+        match nested_app_small nested_rec nested_arity args small with
+        | False => descend small depth (TMAll (Cons CoreTerm head args))
+        | True =>
+            check_and (descend small depth (TMAll (Cons CoreTerm typ args)))
+              (fun (_accepted : Unit) =>
+                descend (shiftSmall small) (S depth)
+                  (TMNested nested_rec Z nested_arity body))
+        end
+    | NotFix => descend small depth (TMAll (Cons CoreTerm head args))
+    end;
+
+def term_nested (descend : List Nat -> Nat -> TermMode -> CheckResult Bool)
+    (small : List Nat) (depth : Nat) (nested_rec : Nat)
+    (index : Nat) (remaining : Nat) (body : CoreTerm) : CheckResult Bool :=
+    match remaining with
+    | Z => descend small depth (TMTerm body)
+    | S remaining' =>
+        match body with
+        | CLam typ rest =>
+            check_and (descend small depth (TMTerm typ))
+              (fun (_accepted : Unit) =>
+                let shifted : List Nat := shiftSmall small in
+                let small' : List Nat :=
+                  match eqNat index nested_rec with
+                  | True => Cons Nat Z shifted
+                  | False => shifted
+                  end in
+                descend small' (S depth)
+                  (TMNested nested_rec (S index) remaining' rest))
+        | CRel _ => descend small depth (TMTerm body)
+        | CSort _ => descend small depth (TMTerm body)
+        | CPi _ _ => descend small depth (TMTerm body)
+        | CApp _ _ => descend small depth (TMTerm body)
+        | CLetIn _ _ _ => descend small depth (TMTerm body)
+        | CConst _ => descend small depth (TMTerm body)
+        | CInd _ => descend small depth (TMTerm body)
+        | CConstruct _ _ _ => descend small depth (TMTerm body)
+        | CStrBytes _ _ => descend small depth (TMTerm body)
+        | CStrLit _ _ => descend small depth (TMTerm body)
+        | CCase _ _ _ _ => descend small depth (TMTerm body)
+        | CFix _ _ _ _ _ => descend small depth (TMTerm body)
+        end
+    end;
+
+-- An annotation is visited before its constructor field enters the small scope.
+def term_branch (descend : List Nat -> Nat -> TermMode -> CheckResult Bool)
+    (gains : Bool) : Nat -> List Nat -> Nat -> CoreTerm -> CheckResult Bool :=
+  fix term_branch (remaining : Nat) (small : List Nat) (depth : Nat)
+      (body : CoreTerm) : CheckResult Bool :=
+    match remaining with
+    | Z => descend small depth (TMTerm body)
+    | S remaining' =>
+        match body with
+        | CLam typ inner =>
+            let shifted : List Nat := shiftSmall small in
+            let small' : List Nat :=
+              match gains with
+              | True => Cons Nat Z shifted
+              | False => shifted
+              end in
+            check_and (descend small depth (TMTerm typ))
+              (fun (_accepted : Unit) => term_branch remaining' small' (S depth) inner)
+        | CRel _ => CheckOk Bool False
+        | CSort _ => CheckOk Bool False
+        | CPi _ _ => CheckOk Bool False
+        | CApp _ _ => CheckOk Bool False
+        | CLetIn _ _ _ => CheckOk Bool False
+        | CConst _ => CheckOk Bool False
+        | CInd _ => CheckOk Bool False
+        | CConstruct _ _ _ => CheckOk Bool False
+        | CStrBytes _ _ => CheckOk Bool False
+        | CStrLit _ _ => CheckOk Bool False
+        | CCase _ _ _ _ => CheckOk Bool False
+        | CFix _ _ _ _ _ => CheckOk Bool False
+        end
+    end;
+
+def term_run : Nat -> Nat -> Nat -> List Nat -> Nat -> TermMode -> CheckResult Bool :=
+  fix term_run (fuel : Nat) (rec_arg : Nat) (arity : Nat) (small : List Nat)
+      (depth : Nat) (mode : TermMode) : CheckResult Bool :=
+    match fuel with
+    | Z => CheckErr Bool CheckResourceLimit
+    | S fuel' =>
+        let struct_idx : Nat := sub depth (S rec_arg) in
+        let descend : List Nat -> Nat -> TermMode -> CheckResult Bool :=
+          fun (scope : List Nat) (level : Nat) (next : TermMode) =>
+            term_run fuel' rec_arg arity scope level next in
+        match mode with
+        | TMTerm t =>
+            match t with
+            | CRel i => CheckOk Bool (notb (eqNat i depth))
+            | CSort _ => CheckOk Bool True
+            | CConst _ => CheckOk Bool True
+            | CInd _ => CheckOk Bool True
+            | CConstruct _ _ _ => CheckOk Bool True
+            | CStrBytes _ _ => CheckOk Bool True
+            | CStrLit _ _ => CheckOk Bool True
+            | CPi a b =>
+                check_and (descend small depth (TMTerm a))
+                  (fun (_accepted : Unit) => descend (shiftSmall small) (S depth) (TMTerm b))
+            | CLam a b =>
+                check_and (descend small depth (TMTerm a))
+                  (fun (_accepted : Unit) => descend (shiftSmall small) (S depth) (TMTerm b))
+            | CLetIn v ty b =>
+                check_and (descend small depth (TMTerm v))
+                  (fun (_value : Unit) =>
+                    check_and (descend small depth (TMTerm ty))
+                      (fun (_annotation : Unit) =>
+                        descend (shiftSmall small) (S depth) (TMTerm b)))
+            | CFix _ _ _ ty b =>
+                check_and (descend small depth (TMTerm ty))
+                  (fun (_accepted : Unit) => descend (shiftSmall small) (S depth) (TMTerm b))
+            | CApp _ _ => descend small depth (TMApp t)
+            | CCase ci p s bs => descend small depth (TMCase ci p s bs)
+            end
+        | TMApp t =>
+            check_bind Spine Bool (check_from_normalize Spine (app_spine_checked fuel' t))
+              (fun (spine : Spine) =>
+                match spine with
+                | MkSpine head args =>
+                    match isRel head with
+                    | Just h =>
+                        match eqNat h depth with
+                        | True => descend small depth (TMAppRec args)
+                        | False => descend small depth (TMAppOther (Cons CoreTerm head args))
+                        end
+                    | Nothing => descend small depth (TMAppHead head args)
+                    end
+                end)
+        | TMAppRec args =>
+            match app_rec_arg_view arity rec_arg args with
+            | Nothing => CheckOk Bool False
+            | Just sa =>
+                match isRel sa with
+                | Nothing => CheckOk Bool False
+                | Just j =>
+                    match memNat j small with
+                    | False => CheckOk Bool False
+                    | True => descend small depth (TMAll args)
+                    end
+                end
+            end
+        | TMAppOther xs => descend small depth (TMAll xs)
+        | TMAppHead head args => term_app_head descend small depth head args
+        | TMNested nested_rec index remaining body =>
+            term_nested descend small depth nested_rec index remaining body
+        | TMAll xs =>
+            match xs with
+            | Nil => CheckOk Bool True
+            | Cons a xs' =>
+                check_and (descend small depth (TMTerm a))
+                  (fun (_accepted : Unit) => descend small depth (TMAll xs'))
+            end
+        | TMCase ci p s bs =>
+            check_and (descend small depth (TMTerm p))
+              (fun (_predicate : Unit) =>
+                check_and (descend small depth (TMTerm s))
+                  (fun (_scrutinee : Unit) => descend small depth (TMCaseBs ci s bs)))
+        | TMCaseBs ci s bs =>
+            let gains : Bool :=
+              match isRel s with
+              | Just j => orb (eqNat j struct_idx) (memNat j small)
+              | Nothing => False
+              end in
+            match ci with
+            | MkCaseInfo _ind _np carities => descend small depth (TMCaseGo carities bs gains)
+            end
+        | TMCaseGo ks xs gains =>
+            match ks, xs with
+            | Nil, Nil => CheckOk Bool True
+            | Cons k ks', Cons b xs' =>
+                check_and (term_branch descend gains k small depth b)
+                  (fun (_accepted : Unit) => descend small depth (TMCaseGo ks' xs' gains))
+            | Nil, Cons _ _ => CheckErr Bool (CheckMalformedCore CheckCaseMetadata)
+            | Cons _ _, Nil => CheckErr Bool (CheckMalformedCore CheckCaseMetadata)
+            end
+        end
+    end;
+
+def check_termination_checked (rec_arg : Nat) (arity : Nat) (fuel : Nat) (body : CoreTerm)
+    : CheckResult Unit :=
+    check_require_result (term_run fuel rec_arg arity (Nil Nat) Z (TMTerm body))
+      (CheckTypeFailure CheckNonTerminating);
+
+def check_termination (rec_arg : Nat) (arity : Nat) (fuel : Nat) (body : CoreTerm) : Bool :=
+    check_succeeded Unit (check_termination_checked rec_arg arity fuel body);
+
+-- InferGoal pipeline (flat; nested Case/Fix hung elab).
+inductive InferGoal : Type :=
+  | IGTerm : CoreTerm -> InferGoal
+  | IGPi : CoreTerm -> CoreTerm -> InferGoal
+  | IGLam : CoreTerm -> CoreTerm -> InferGoal
+  | IGApp : CoreTerm -> CoreTerm -> InferGoal
+  | IGLet : CoreTerm -> CoreTerm -> CoreTerm -> InferGoal
+  | IGInd : Nat -> InferGoal
+  | IGCtor : Nat -> Nat -> Nat -> InferGoal
+  | IGFix : Nat -> Nat -> Nat -> CoreTerm -> CoreTerm -> InferGoal
+  | IGCase : CaseInfo -> CoreTerm -> CoreTerm -> List CoreTerm -> InferGoal
+  | IGCaseAfterP : CaseInfo -> CoreTerm -> CoreTerm -> List CoreTerm -> CoreTerm -> InferGoal
+  | IGCaseAfterS : CaseInfo -> CoreTerm -> CoreTerm -> List CoreTerm -> CoreTerm -> CoreTerm -> InferGoal
+  | IGCaseBranches : Nat -> Nat -> Nat -> List Nat -> List CoreTerm -> CoreTerm -> CoreTerm -> List CoreTerm -> InferGoal;
+
+-- @bound(cyclo <= 270)
+
+-- Raw-list compatibility boundaries derive lookup state exactly once.
+def pi_view_checked (fuel : Nat) (sig : List Entry) (term : CoreTerm)
+    : CheckResult PiParts :=
+    check_input_guard PiParts ([CheckInputTerm term] : List CheckInputWork)
+      (fun (_work : Unit) =>
+        pi_view_checked_indexed fuel (check_environment_from_entries sig) term);
+
+def cumul_checked (fuel : Nat) (sig : List Entry) (left : CoreTerm) (right : CoreTerm)
+    : CheckResult Bool :=
+    check_input_guard Bool ([CheckInputTerm left, CheckInputTerm right] : List CheckInputWork)
+      (fun (_work : Unit) =>
+        cumul_checked_indexed fuel (check_environment_from_entries sig) left right);
+
+def check_convertible (fuel : Nat) (sig : List Entry) (left : CoreTerm) (right : CoreTerm)
+    : CheckResult Unit :=
+    check_input_guard Unit ([CheckInputTerm left, CheckInputTerm right] : List CheckInputWork)
+      (fun (_work : Unit) =>
+        check_convertible_indexed fuel (check_environment_from_entries sig) left right);

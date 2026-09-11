@@ -1,0 +1,65 @@
+-- Clock authority is attached to the checked identity and complete type.
+import "../compiler/file_elab.ouro";
+import "../compiler/checked_program_output.ouro";
+import "../std/test.ouro";
+
+def time_binding_base : List FileItem :=
+    [FIntrinsic 100 (CSort 0) (primitive_key PrimitiveStringType) (Nothing CoreTerm),
+     FIntrinsic 101 (CPi (CSort 0) (CSort 0)) (primitive_key PrimitiveRuntimeType) (Nothing CoreTerm),
+     FDef 102 (CSort 0) (CConst 100), FDef 103 (CPi (CSort 0) (CSort 0)) (CConst 101)];
+
+def time_binding_type (aliases : Bool) : CoreTerm :=
+    match aliases with | True => CApp (CConst 103) (CConst 102)
+    | False => CApp (CConst 101) (CConst 100) end;
+
+def time_binding_check (declaration : FileItem) : DeclarationResult :=
+    check_declarations CheckExactCore keep_checking (mul 20 50)
+      (append FileItem time_binding_base ([declaration] : List FileItem));
+
+def time_binding_intrinsic (typ : CoreTerm) : FileItem :=
+    FIntrinsic 120 typ (primitive_key PrimitiveTimeNow) (Nothing CoreTerm);
+
+def time_binding_metadata (aliases : Bool) : Bool :=
+    match time_binding_check (time_binding_intrinsic (time_binding_type aliases)) with
+    | DeclarationsErr _ _ _ => False | DeclarationsOk entries =>
+      any Entry (fun (entry : Entry) => match entry with
+        | MkBoundEntry name _ binding => andb (eqNat name 120)
+            (match binding with | PrimitiveExternBinding _ => False
+            | PrimitiveIntrinsicBinding id execution gc specialization =>
+                andb (primitive_id_equal id PrimitiveTimeNow)
+                  (andb (match execution with | PrimitiveRuntimeAction => True
+                    | PrimitiveTypeOnly => False | PrimitivePureValue => False end)
+                    (andb (match gc with | PrimitiveMayGc => True | PrimitiveNoGc => False end)
+                      (match specialization with | Nothing => True | Just _ => False end))) end)
+        | MkEntry _ _ _ => False | MkIndEntry _ _ => False | MkRoleEntry _ => False end) entries end;
+
+def time_binding_rejected (typ : CoreTerm) : Bool :=
+    match time_binding_check (time_binding_intrinsic typ) with
+    | DeclarationsOk _ => False | DeclarationsErr name phase failure =>
+      andb (eqNat name 120) (eqNat (declaration_failure_code CheckExactCore phase failure) 2) end;
+
+def time_binding_shim (axiom_only : Bool) : Bool :=
+    match time_binding_check (match axiom_only with
+      | True => FAxiom 120 (time_binding_type False)
+      | False => time_binding_intrinsic (time_binding_type True) end) with
+    | DeclarationsErr _ _ _ => False | DeclarationsOk entries =>
+      let shims : List (Pair Nat (List Nat)) :=
+        checked_program_c_shims (CheckedProgramOf empty_intern entries ([] : List (Pair Nat CoreTerm))) in
+      match axiom_only with
+      | True => notb (any (Pair Nat (List Nat)) (fun (item : Pair Nat (List Nat)) =>
+          match item with | MkPair name _ => eqNat name 120 end) shims)
+      | False => any (Pair Nat (List Nat)) (fun (item : Pair Nat (List Nat)) =>
+          match item with | MkPair name key => andb (eqNat name 120)
+            (primitive_bytes_equal key (prim_string_to_char_codes "prim_time_now")) end) shims end end;
+
+def main : IO Unit :=
+    test_run
+      [assert_true "time identity records effect and GC metadata" (time_binding_metadata False),
+       assert_true "time identity accepts transparent type aliases" (time_binding_metadata True),
+       assert_true "time rejects a pure String result" (time_binding_rejected (CConst 100)),
+       assert_true "time rejects an extra String argument"
+         (time_binding_rejected (CPi (CConst 100) (time_binding_type False))),
+       assert_true "time rejects a function as the action result"
+         (time_binding_rejected (CApp (CConst 101) (CPi (CConst 100) (CConst 100)))),
+       assert_true "time maps renamed identity to the existing C handler" (time_binding_shim False),
+       assert_true "time leaves ordinary axioms outside checked C shims" (time_binding_shim True)];

@@ -1,0 +1,170 @@
+-- Workspace, temp-path, backup, and file workflow helpers.
+
+import "fsx.ouro";
+import "pathx.ouro";
+import "report.ouro";
+import "validation.ouro";
+
+inductive Workspace : Type :=
+  | MkWorkspace : String -> Workspace;
+
+def workspace_root (w : Workspace) : String :=
+    match w with
+    | MkWorkspace root => root
+    end;
+
+def workspace_file (w : Workspace) (relative : String) : String :=
+    path_join ([workspace_root w, relative] : List String);
+
+def workspace_dir (w : Workspace) (relative : String) : String :=
+    workspace_file w relative;
+
+def workspace_make (root : String) : IO (Either FsError Workspace) :=
+    do let! made := fs_mkdir_p_checked root;
+       match made with
+       | Left e => fs_err Workspace e
+       | Right _ => fs_ok Workspace (MkWorkspace root)
+       end
+
+def workspace_ensure_dir (w : Workspace) (relative : String) : IO (Either FsError Unit) :=
+    fs_mkdir_p_checked (workspace_dir w relative);
+
+def workspace_read_text (w : Workspace) (relative : String) : IO (Either FsError String) :=
+    fsx_read_text (workspace_file w relative);
+
+def workspace_write_text (w : Workspace) (relative : String) (content : String) : IO (Either FsError Unit) :=
+    fsx_write_text (workspace_file w relative) content;
+
+def workspace_write_lines (w : Workspace) (relative : String) (lines : List String) : IO (Either FsError Unit) :=
+    fsx_write_lines (workspace_file w relative) lines;
+
+def workspace_list (w : Workspace) (relative : String) : IO (Either FsError (List String)) :=
+    fs_list_checked (workspace_dir w relative);
+
+def workspace_temp_path (w : Workspace) (name : String) : String :=
+    workspace_file w (path_join ([".tmp", name] : List String));
+
+def workspace_timestamped_temp_path (w : Workspace) (prefix : String) (suffix : String) : IO String :=
+    do let! stamp := time_now_string;
+       io_pure String (workspace_temp_path w (str_cat3 prefix stamp suffix))
+
+def workspace_write_temp_text (w : Workspace) (prefix : String) (suffix : String) (content : String) : IO (Either FsError String) :=
+    do let! path := workspace_timestamped_temp_path w prefix suffix;
+       let! wrote := fsx_write_text path content;
+       match wrote with
+       | Left e => fs_err String e
+       | Right _ => fs_ok String path
+       end
+
+def fsx_backup_path (path : String) : String :=
+    str_concat path ".bak";
+
+def fsx_backup_before_overwrite (path : String) : IO (Either FsError Unit) :=
+    do let! exists := fs_is_file path;
+       match exists with
+       | False => fs_ok Unit MkUnit
+       | True => fs_copy_checked path (fsx_backup_path path)
+       end
+
+def fsx_write_backup_checked (path : String) (content : String) : IO (Either FsError Unit) :=
+    do let! backed := fsx_backup_before_overwrite path;
+       match backed with
+       | Left e => fs_err Unit e
+       | Right _ => fsx_write_text path content
+       end
+
+def fsx_read_transform_write_checked (src : String) (dst : String) (f : String -> String) : IO (Either FsError Unit) :=
+    do let! text := fsx_read_text src;
+       match text with
+       | Left e => fs_err Unit e
+       | Right content => fsx_write_text dst (f content)
+       end
+
+def fsx_list_files_filtered (root : String) (p : String -> Bool) : IO (Either FsError (List String)) :=
+    do let! ready := fs_check_dir root;
+       match ready with
+       | Left e => fs_err (List String) e
+       | Right _ =>
+         do let! files := fs_walk root;
+            fs_ok (List String) (filter String p files)
+       end
+
+def fsx_list_files_by_ext (root : String) (ext : String) : IO (Either FsError (List String)) :=
+    fsx_list_files_filtered root (fun (path : String) => path_has_ext path ext);
+
+def fsx_copy_one_under (src_root : String) (dst_root : String) (state : Either FsError Unit) (path : String) : IO (Either FsError Unit) :=
+    match state with
+    | Left e => fs_err Unit e
+    | Right _ =>
+      let rel : String := path_relative src_root path in
+      fs_copy_checked path (path_join ([dst_root, rel] : List String))
+    end;
+
+def fsx_copy_tree_checked (src_root : String) (dst_root : String) : IO (Either FsError Unit) :=
+    do let! ready := fs_check_dir src_root;
+       match ready with
+       | Left e => fs_err Unit e
+       | Right _ =>
+         do let! made := fs_mkdir_p_checked dst_root;
+            match made with
+            | Left e => fs_err Unit e
+            | Right _ =>
+              do let! files := fs_walk src_root;
+                 io_fold String (Either FsError Unit)
+                   (fsx_copy_one_under src_root dst_root)
+                   (Right FsError Unit MkUnit)
+                   files
+            end
+       end
+
+-- Delete files first, then directories, then the root. Fuel bounds directory
+-- depth; exhaustion is an error instead of a silent leftover tree.
+def fsx_remove_tree_checked (root : String) : IO (Either FsError Unit) :=
+    match fs_nonempty_path root with
+    | Left e => fs_err Unit e
+    | Right _ =>
+      io_bind Bool (Either FsError Unit) (fs_exists root)
+        (fun (exists : Bool) =>
+          match exists with
+          | False => fs_ok Unit MkUnit
+          | True =>
+            (fix go (fuel : Nat) (path : String) : IO (Either FsError Unit) :=
+              match fuel with
+              | Z => fs_err Unit (FsOperationFailed "remove_tree" path)
+              | S fuel2 =>
+                io_bind Bool (Either FsError Unit) (fs_is_dir path)
+                  (fun (is_directory : Bool) =>
+                    match is_directory with
+                    | False => fsx_remove_if_exists path
+                    | True =>
+                      io_bind (Either FsError (List String))
+                        (Either FsError Unit)
+                        (fs_list_checked path)
+                        (fun (listed : Either FsError (List String)) =>
+                          match listed with
+                          | Left e => fs_err Unit e
+                          | Right names =>
+                            io_bind (Either FsError Unit)
+                              (Either FsError Unit)
+                              (io_fold String (Either FsError Unit)
+                                (fun (state : Either FsError Unit)
+                                  (name : String) =>
+                                  match state with
+                                  | Left e => fs_err Unit e
+                                  | Right _ => go fuel2 (fs_child path name)
+                                  end)
+                                (Right FsError Unit MkUnit)
+                                names)
+                              (fun (children : Either FsError Unit) =>
+                                match children with
+                                | Left e => fs_err Unit e
+                                | Right _ => fsx_remove_if_exists path
+                                end)
+                          end)
+                    end)
+              end) fs_walk_fuel root
+          end)
+    end;
+
+def workspace_report (w : Workspace) : Report :=
+    report_add "workspace" (workspace_root w) report_empty;

@@ -1,0 +1,62 @@
+-- Boxed raw operations preserve the checked storage specialization and the
+-- caller-owned raw lifetime contract. No raw address becomes a managed root.
+import "managed_extern.ouro";
+
+def managed_raw_load_body (compiler : ManagedCompiler) (typ : MirType)
+    (captures : List MirValue) (state : ManagedState) : Either NativeLowerError ManagedResult :=
+    lower_bind MirValue ManagedResult (lower_single MirValue captures) (fun (boxed : MirValue) =>
+      lower_bind ManagedResult ManagedResult (managed_unbox_pointer compiler boxed state)
+        (fun (pointer : ManagedResult) => match pointer with | ManagedResultOf address next =>
+          lower_bind ManagedResult ManagedResult (managed_load typ address 0 next)
+            (fun (loaded : ManagedResult) => match loaded with | ManagedResultOf value after =>
+              managed_box_scalar compiler typ value after end) end));
+
+def managed_raw_store_body (compiler : ManagedCompiler) (typ : MirType)
+    (captures : List MirValue) (state : ManagedState) : Either NativeLowerError ManagedResult :=
+    lower_bind (Pair MirValue MirValue) ManagedResult (lower_pair MirValue captures)
+      (fun (pair : Pair MirValue MirValue) => match pair with | MkPair boxed contents =>
+        lower_bind ManagedResult ManagedResult (managed_unbox_pointer compiler boxed state)
+          (fun (pointer : ManagedResult) => match pointer with | ManagedResultOf address next =>
+            lower_bind ManagedResult ManagedResult (managed_unbox_scalar compiler typ contents next)
+              (fun (unboxed : ManagedResult) => match unboxed with | ManagedResultOf value after =>
+                managed_unit_value compiler (managed_emit (MirStore address (codegen_disp 0) value) after) end) end) end);
+
+def managed_raw_storage (compiler : ManagedCompiler) (step : ManagedStep) (scope : ManagedScope)
+    (fuel : Nat) (specialization : Maybe CoreTerm) (store : Bool) (arguments : List CoreTerm) (state : ManagedState)
+    : Either NativeLowerError ManagedResult :=
+    lower_bind LowerType ManagedResult (lower_storage_type fuel (managed_compiler_entries compiler) specialization)
+      (fun (storage : LowerType) => match lower_type_mir storage with
+        | Nothing => Left NativeLowerError ManagedResult (LowerUnsupportedType (lower_type_core storage))
+        | Just typ => lower_bind Unit ManagedResult (lower_require
+            (eqNat (length CoreTerm arguments) (match store with | True => 2 | False => 1 end)) (LowerInvalidCall 0))
+            (fun (_ : Unit) => lower_bind ManagedFields ManagedResult (managed_arguments compiler step scope arguments state)
+              (fun (captured : ManagedFields) => match captured with | ManagedFieldsOf values next =>
+                managed_action compiler values (match store with | True => managed_raw_store_body compiler typ
+                  | False => managed_raw_load_body compiler typ end) next end)) end);
+
+def managed_raw_add_body (compiler : ManagedCompiler) (captures : List MirValue) (state : ManagedState)
+    : Either NativeLowerError ManagedResult :=
+    lower_bind (Pair MirValue MirValue) ManagedResult (lower_pair MirValue captures)
+      (fun (pair : Pair MirValue MirValue) => match pair with | MkPair boxed offset =>
+        lower_bind ManagedResult ManagedResult (managed_unbox_pointer compiler boxed state)
+          (fun (pointer : ManagedResult) => match pointer with | ManagedResultOf address next =>
+            lower_bind ManagedResult ManagedResult (managed_unbox_word compiler PrimitiveWordUSize offset next)
+              (fun (unboxed : ManagedResult) => match unboxed with | ManagedResultOf bytes after =>
+                lower_bind ManagedResult ManagedResult
+                  (managed_fresh MirRawPtr (fun (local : Nat) => MirPointerAdd local address bytes) after)
+                  (fun (added : ManagedResult) => match added with | ManagedResultOf value finished =>
+                    managed_box_pointer compiler value finished end) end) end) end);
+
+def managed_raw_add (compiler : ManagedCompiler) (step : ManagedStep) (scope : ManagedScope)
+    (arguments : List CoreTerm) (state : ManagedState) : Either NativeLowerError ManagedResult :=
+    lower_three ManagedResult arguments (fun (_ : CoreTerm) (pointer : CoreTerm) (offset : CoreTerm) =>
+      lower_bind ManagedFields ManagedResult (managed_arguments compiler step scope ([pointer, offset] : List CoreTerm) state)
+        (fun (captured : ManagedFields) => match captured with | ManagedFieldsOf values next =>
+          managed_action compiler values (managed_raw_add_body compiler) next end));
+
+def managed_raw_cast (compiler : ManagedCompiler) (step : ManagedStep) (scope : ManagedScope)
+    (arguments : List CoreTerm) (state : ManagedState) : Either NativeLowerError ManagedResult :=
+    lower_three ManagedResult arguments (fun (_ : CoreTerm) (_ : CoreTerm) (pointer : CoreTerm) =>
+      lower_bind ManagedResult ManagedResult (step scope pointer state)
+        (fun (captured : ManagedResult) => match captured with | ManagedResultOf value next =>
+          managed_action_pure compiler value next end));

@@ -1,0 +1,132 @@
+-- The helper candidate is checked source. Mutated raw-contract tables below
+-- test the internal linker boundary independently of helper name lookup.
+import "../compiler/native/managed_startup_memory.ouro";
+import "../compiler/driver.ouro";
+import "compiler_startup_test_support.ouro";
+
+def startup_helper_prefix : String :=
+    prim_string_concat
+      "intrinsic Effect : Type -> Type := \"ouro.runtime\"; intrinsic Pointer : Type -> Type := \"ouro.raw_ptr\"; intrinsic Byte : Type := \"ouro.u8\"; intrinsic Word : Type := \"ouro.u32\"; intrinsic Size : Type := \"ouro.usize\"; "
+      "intrinsic pure : (A : Type) -> A -> Effect A := \"ouro.runtime.pure\"; axiom zero : Word; def AliasWord : Type := Word; def AliasPointer (A : Type) : Type := Pointer A; def Deferred (A : Type) : Type := Effect A; ";
+
+def startup_helper_source (mode : Nat) : String :=
+    prim_string_concat startup_helper_prefix (match eqNat mode 7 with
+      | True => "axiom raw_windows_argv_open : Pointer Size -> Pointer Word -> Effect Word;"
+      | False => match eqNat mode 9 with
+        | True => "extern raw_windows_argv_open : Pointer Size -> Pointer Word -> Effect Word := \"windows-x86_64\" \"win64\" \"kernel32.dll\" \"GetLastError\" \"nogc\";"
+        | False => match eqNat mode 1 with
+          | True => "def raw_windows_argv_open (owner : AliasPointer Size) (count : AliasPointer AliasWord) : Deferred AliasWord := pure Word zero;"
+          | False => "def raw_windows_argv_open (owner : Pointer Size) (count : Pointer Word) : Effect Word := pure Word zero;" end end end);
+
+def startup_helper_compiler (program : CheckedProgram) (contracts : List LowerContract) : ManagedCompiler :=
+    ManagedCompilerOf program ([] : List Nat) 0 0 0 0 0 0 contracts
+      (check_environment_from_entries (checked_program_entries program));
+
+def startup_helper_contracts (mode : Nat) (contract : LowerContract) : List LowerContract :=
+    match contract with | LowerContractOf id annotation arguments result binding =>
+      match eqNat mode 2 with | True => ([] : List LowerContract) | False =>
+        ([LowerContractOf (match eqNat mode 3 with | True => S id | False => id end)
+          (match eqNat mode 4 with | True => CSort 0 | False => annotation end) arguments result
+          (match eqNat mode 5 with
+            | True => Just PrimitiveBinding (PrimitiveIntrinsicBinding PrimitiveArgv PrimitiveRuntimeAction PrimitiveMayGc (Nothing CoreTerm))
+            | False => binding end)] : List LowerContract) end end;
+
+def startup_helper_resolve (mode : Nat) (program : CheckedProgram) : Either NativeLowerError Nat :=
+    let compiler : ManagedCompiler := startup_helper_compiler program ([] : List LowerContract) in
+    let name : List Nat := managed_startup_helper_name ManagedStartupArgvOpen in
+    lower_bind Nat Nat (managed_source_symbol program name) (fun (id : Nat) =>
+      match lookup_type id (checked_program_entries program) with
+      | Nothing => Left NativeLowerError Nat (LowerUnknownGlobal id)
+      | Just annotation => lower_bind LowerContract Nat
+          (lower_make_contract primitive_default_fuel (checked_program_entries program) id annotation (Nothing PrimitiveBinding))
+          (fun (contract : LowerContract) => lower_bind CoreTerm Nat
+            (managed_startup_expected compiler ManagedStartupArgvOpen) (fun (expected : CoreTerm) =>
+              lower_bind LowerContract Nat
+                (managed_runtime_contract (startup_helper_compiler program (startup_helper_contracts mode contract))
+                  (match eqNat mode 8 with | True => 0 | False => primitive_default_fuel end) name expected)
+                (fun (selected : LowerContract) => lower_map Unit Nat (fun (_ : Unit) => id)
+                  (lower_require (eqNat (lower_contract_id selected) id) (LowerInvalidCall id))))) end);
+
+def startup_helper_status (result : Either NativeLowerError Nat) : String :=
+    match result with
+      | Right _ => "linked" | Left error => match error with
+        | LowerResourceExhausted => "resource" | LowerMetadataMismatch _ => "metadata"
+        | LowerBodyMismatch _ => "body" | LowerInvalidCall _ => "call"
+        | LowerDeclarationFailure _ _ _ => "declaration" | LowerUnsupportedType _ => "type"
+        | LowerUnsupportedTerm _ => "term" | LowerUnsupportedPrimitive _ => "primitive"
+        | LowerUnknownGlobal _ => "global" | LowerUnboundLocal _ => "local" | LowerEffectMismatch => "effect"
+        | LowerInvalidEntry _ => "entry" | LowerMirFailure _ => "mir" | LowerBackendFailure _ => "backend" end end;
+
+def startup_helper_probe (mode : Nat) : String :=
+    match compile_checked_source (mul 100 50) (prim_string_to_char_codes (startup_helper_source mode)) with
+    | CErr _ => "source-rejected"
+    | COk program => startup_helper_status (startup_helper_resolve mode program) end;
+
+-- All candidates share one checked program and one derived environment. A
+-- successful lookup must not authorize another body, type, or raw contract.
+def startup_helper_shared_source : String :=
+    prim_string_concat (startup_helper_source 1)
+      " def plain_helper (owner : Pointer Size) (count : Pointer Word) : Effect Word := pure Word zero; axiom missing_body : Pointer Size -> Pointer Word -> Effect Word; def wrong_pointer (owner : Pointer Word) (count : Pointer Word) : Effect Word := pure Word zero;";
+
+def startup_helper_shared_checks (compiler : ManagedCompiler) (expected : CoreTerm) (contract : LowerContract)
+    : List StartupTest :=
+    let name : List Nat := managed_startup_helper_name ManagedStartupArgvOpen in
+    let definition : Nat -> List Nat -> CoreTerm -> String := fun (fuel : Nat) (candidate : List Nat) (wanted : CoreTerm) =>
+      startup_helper_status (managed_runtime_definition compiler fuel candidate wanted) in
+    let linked : List LowerContract -> String := fun (contracts : List LowerContract) =>
+      startup_helper_status (lower_map LowerContract Nat lower_contract_id
+        (managed_runtime_contract (managed_compiler_with_raw compiler contracts) primitive_default_fuel name expected)) in
+    [startup_test_eq "shared environment links the aliased signature"
+       (definition primitive_default_fuel name expected) "linked",
+     startup_test_eq "shared environment links the direct signature"
+       (definition primitive_default_fuel (prim_string_to_char_codes "plain_helper") expected) "linked",
+     startup_test_eq "shared environment rejects a candidate without a body"
+       (definition primitive_default_fuel (prim_string_to_char_codes "missing_body") expected) "body",
+     startup_test_eq "shared environment rejects the wrong pointer pointee"
+       (definition primitive_default_fuel (prim_string_to_char_codes "wrong_pointer") expected) "metadata",
+     startup_test_eq "same candidate name does not authorize a different expected type"
+       (definition primitive_default_fuel name (CSort 0)) "metadata",
+     startup_test_eq "shared environment preserves normalization fuel failure"
+       (definition 0 name expected) "resource",
+     startup_test_eq "shared environment still links after rejected candidates"
+       (definition primitive_default_fuel name expected) "linked",
+     startup_test_eq "raw contract replacement retains the shared alias environment"
+       (linked (startup_helper_contracts 0 contract)) "linked",
+     startup_test_eq "shared environment does not authorize a missing raw contract"
+       (linked (startup_helper_contracts 2 contract)) "call",
+     startup_test_eq "shared environment does not authorize a changed raw Core contract"
+       (linked (startup_helper_contracts 4 contract)) "metadata",
+     startup_test_eq "shared environment does not authorize a primitive helper binding"
+       (linked (startup_helper_contracts 5 contract)) "body"];
+
+def startup_helper_shared_laws : List StartupTest :=
+    match compile_checked_source (mul 100 50) (prim_string_to_char_codes startup_helper_shared_source) with
+    | CErr _ => [startup_test_assert "shared environment fixture source is accepted" False]
+    | COk program =>
+      let compiler : ManagedCompiler := startup_helper_compiler program ([] : List LowerContract) in
+      let laws : Either NativeLowerError (List StartupTest) :=
+        lower_bind CoreTerm (List StartupTest) (managed_startup_expected compiler ManagedStartupArgvOpen)
+          (fun (expected : CoreTerm) => lower_bind Nat (List StartupTest)
+            (managed_source_symbol program (managed_startup_helper_name ManagedStartupArgvOpen)) (fun (id : Nat) =>
+              match lookup_type id (managed_compiler_entries compiler) with
+              | Nothing => Left NativeLowerError (List StartupTest) (LowerUnknownGlobal id)
+              | Just annotation => lower_map LowerContract (List StartupTest)
+                  (fun (contract : LowerContract) => startup_helper_shared_checks compiler expected contract)
+                  (lower_make_contract_indexed primitive_default_fuel (managed_compiler_environment compiler)
+                    id annotation (Nothing PrimitiveBinding)) end)) in
+      match laws with
+      | Left _ => [startup_test_assert "shared environment fixture contract is accepted" False]
+      | Right values => values end end;
+
+def main : IO Unit :=
+    startup_test_run (append StartupTest
+      [startup_test_eq "checked startup body links the same raw definition" (startup_helper_probe 0) "linked",
+       startup_test_eq "startup helper accepts normalized pointer, word and Runtime aliases" (startup_helper_probe 1) "linked",
+       startup_test_eq "checked body without compiled raw contract is rejected" (startup_helper_probe 2) "call",
+       startup_test_eq "another raw contract ID cannot authorize the helper" (startup_helper_probe 3) "call",
+       startup_test_eq "same raw ID with different Core contract is rejected" (startup_helper_probe 4) "metadata",
+       startup_test_eq "primitive binding cannot replace a compiled helper body" (startup_helper_probe 5) "body",
+       startup_test_eq "a helper axiom cannot supply an implementation" (startup_helper_probe 7) "body",
+       startup_test_eq "helper normalization preserves fuel failure" (startup_helper_probe 8) "resource",
+       startup_test_eq "a foreign declaration cannot masquerade as a checked helper body" (startup_helper_probe 9) "body"]
+      startup_helper_shared_laws);

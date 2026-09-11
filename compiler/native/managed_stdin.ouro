@@ -1,0 +1,58 @@
+-- Both stdin actions are deferred. Applying the byte-reader closure only
+-- captures its Nat; invoking the resulting action performs conversion and IO.
+import "managed_stdin_read.ouro";
+
+def managed_stdin_operation (primitive : PrimitiveId) : Maybe Bool :=
+    match primitive_id_equal primitive PrimitiveStdinReadLine with | True => Just Bool False | False =>
+      match primitive_id_equal primitive PrimitiveStdinReadBytes with | True => Just Bool True
+      | False => Nothing Bool end end;
+
+def managed_stdin_bytes_body (compiler : ManagedCompiler) (runtime : ManagedStdinRuntime)
+    (value : MirValue) (state : ManagedState) : Either NativeLowerError ManagedResult :=
+    match runtime with | ManagedStdinRuntimeOf _ _ _ exit =>
+      lower_bind ManagedNatWordResult ManagedResult (managed_nat_checked_word compiler PrimitiveWordUSize value state)
+        (fun (converted : ManagedNatWordResult) => match converted with | ManagedNatWordOf fits capacity next =>
+          lower_bind ManagedState ManagedResult (managed_stdio_require exit fits next)
+            (managed_stdin_read compiler runtime False capacity) end) end;
+
+def managed_stdin_bytes_action (compiler : ManagedCompiler) (value : MirValue) (state : ManagedState)
+    : Either NativeLowerError ManagedResult :=
+    lower_bind ManagedStdinRuntime ManagedResult (managed_stdin_runtime compiler) (fun (runtime : ManagedStdinRuntime) =>
+      managed_action compiler ([value] : List MirValue)
+        (fun (captures : List MirValue) (entered : ManagedState) => lower_bind MirValue ManagedResult
+          (lower_single MirValue captures) (fun (saved : MirValue) => managed_stdin_bytes_body compiler runtime saved entered)) state);
+
+def managed_stdin_line_action (compiler : ManagedCompiler) (state : ManagedState)
+    : Either NativeLowerError ManagedResult :=
+    lower_bind ManagedStdinRuntime ManagedResult (managed_stdin_runtime compiler) (fun (runtime : ManagedStdinRuntime) =>
+      managed_action compiler ([] : List MirValue)
+        (fun (_ : List MirValue) (entered : ManagedState) =>
+          managed_stdin_read compiler runtime True (managed_bits MirUSize managed_stdin_line_limit) entered) state);
+
+def managed_stdin_bytes_partial (compiler : ManagedCompiler) (state : ManagedState)
+    : Either NativeLowerError ManagedResult :=
+    let caller : LowerState := managed_flow state in
+    lower_bind (Pair Nat ManagedState) ManagedResult (managed_fresh_symbol state)
+      (fun (fresh : Pair Nat ManagedState) => match fresh with | MkPair symbol reserved =>
+        lower_bind ManagedResult ManagedResult
+          (managed_stdin_bytes_action compiler (MirUse 1) (managed_with_flow reserved (lower_empty_state 2)))
+          (fun (compiled : ManagedResult) => match compiled with | ManagedResultOf action after =>
+            let function : MirFunction := managed_finish_function symbol
+              ([111,117,114,111,95,115,116,100,105,110,95,112,97,114,116,105,97,108] : List Nat)
+              ([MirLocalDef 0 MirManagedPtr, MirLocalDef 1 MirManagedPtr] : List MirLocal) action after in
+            managed_emit_callable compiler 3 symbol False ([] : List MirValue)
+              (managed_with_flow (managed_add_function function after) caller) end) end);
+
+def managed_stdin_value (compiler : ManagedCompiler) (bytes : Bool) (state : ManagedState)
+    : Either NativeLowerError ManagedResult :=
+    match bytes with | False => managed_stdin_line_action compiler state
+    | True => managed_stdin_bytes_partial compiler state end;
+
+def managed_stdin_primitive (compiler : ManagedCompiler) (step : ManagedStep) (scope : ManagedScope)
+    (bytes : Bool) (arguments : List CoreTerm) (state : ManagedState) : Either NativeLowerError ManagedResult :=
+    match bytes with
+    | False => lower_bind Unit ManagedResult (lower_require (eqNat (length CoreTerm arguments) 0) (LowerInvalidCall 0))
+        (fun (_ : Unit) => managed_stdin_line_action compiler state)
+    | True => lower_bind CoreTerm ManagedResult (lower_single CoreTerm arguments) (fun (term : CoreTerm) =>
+        lower_bind ManagedResult ManagedResult (step scope term state) (fun (value : ManagedResult) => match value with
+          | ManagedResultOf count next => managed_stdin_bytes_action compiler count next end)) end;

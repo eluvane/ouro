@@ -1,0 +1,249 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [ main, master ]
+  push:
+    branches: [ main, master ]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ouro-pr-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  paths:
+    name: Paths
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      core: ${{ steps.changes.outputs.core }}
+      kernel: ${{ steps.changes.outputs.kernel }}
+      editor: ${{ steps.changes.outputs.editor }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Select jobs
+        id: changes
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: python3 scripts/ci_gate.py --select-paths --base "$BASE_SHA" --head "$HEAD_SHA"
+
+  quick-firewall:
+    name: ${{ matrix.label }}
+    needs: paths
+    if: ${{ needs.paths.outputs.core == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - group: checks
+            label: Checks
+          - group: analysis
+            label: Analysis
+          - group: tests
+            label: Tests
+          - group: smith
+            label: OuroSmith
+          - group: samples-1
+            label: Samples (1/2)
+          - group: samples-2
+            label: Samples (2/2)
+    permissions:
+      contents: read
+    env:
+      OURO_CI: "1"
+      OURO_REPRODUCIBLE: "1"
+      OURO_PACK_STRICT: "1"
+      OURO_JOBS: "10"
+      OURO_CACHE_DIR: _cache/ouro
+      OURO_BUILD_DIR: _build
+      OURO_C_BUILD_DIR: _build/c
+      OURO_CCACHE: disabled
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Restore cache
+        id: ouro-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            _cache/ouro
+            _build/c
+          key: ouro-pr-${{ matrix.group }}-${{ runner.os }}-${{ hashFiles('Ouro.seal', 'scripts/**', 'compiler/**', 'runtime/**', 'tools/**', 'tests/**', 'std/**', 'quality/smith/**', 'docs/generated_artifact_hashes.sha256') }}
+          restore-keys: |
+            ouro-pr-${{ matrix.group }}-${{ runner.os }}-
+            ouro-pr-${{ runner.os }}-
+
+      - name: Show host toolchain
+        run: |
+          python3 --version
+          cc --version || true
+
+      - name: Install check-only tools
+        if: ${{ matrix.group == 'checks' }}
+        run: |
+          python3 -m pip install --disable-pip-version-check --quiet ruff==0.15.21
+          if ! command -v shellcheck >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y shellcheck
+          fi
+          shellcheck --version
+
+      - name: Run checks
+        run: python3 scripts/ci_gate.py --profile pr --group "${{ matrix.group }}" --out "_build/ci/pr-${{ matrix.group }}"
+
+      - name: Save cache
+        if: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master') && steps.ouro-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            _cache/ouro
+            _build/c
+          key: ${{ steps.ouro-cache.outputs.cache-primary-key }}
+
+      - name: Upload reports
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ matrix.group }}-${{ runner.os }}
+          if-no-files-found: ignore
+          retention-days: 14
+          path: |
+            _build/**/*.json
+            _build/**/*.log
+            _build/**/*.out
+            _build/**/*.txt
+            _build/**/*.err
+            _build/**/*.sarif
+            _build/**/*.md
+            _build/**/gate.log
+
+  native-kernel-regressions:
+    name: Kernel
+    needs: paths
+    if: ${{ needs.paths.outputs.kernel == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    env:
+      OURO_CI: "1"
+      OURO_REPRODUCIBLE: "1"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Run canonical compiler checks
+        run: python3 scripts/ci_gate.py --profile kernel --out _build/ci/kernel
+
+      - name: Upload compiler reports
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: compiler-kernel
+          if-no-files-found: error
+          retention-days: 14
+          path: |
+            _build/**/*.json
+            _build/**/*.log
+            _build/**/*.out
+            _build/**/*.err
+
+  editor:
+    name: Editor
+    needs: paths
+    if: ${{ needs.paths.outputs.editor == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Restore npm cache
+        id: editor-npm-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.npm
+          key: ouro-editor-npm-${{ runner.os }}-${{ hashFiles('editors/vscode/package-lock.json') }}
+          restore-keys: |
+            ouro-editor-npm-${{ runner.os }}-
+
+      - name: Install dependencies
+        working-directory: editors/vscode
+        run: npm ci --prefer-offline --no-audit --no-fund
+
+      - name: Save npm cache
+        if: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master') && steps.editor-npm-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.npm
+          key: ${{ steps.editor-npm-cache.outputs.cache-primary-key }}
+
+      - name: Test
+        working-directory: editors/vscode
+        run: npm test
+
+  portable-kernel-smoke:
+    name: Portable (${{ matrix.os }})
+    needs: paths
+    if: ${{ needs.paths.outputs.core == 'true' }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ ubuntu-latest, macos-latest ]
+    permissions:
+      contents: read
+    env:
+      OURO_CI: "1"
+      OURO_REPRODUCIBLE: "1"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Run checks
+        run: |
+          python3 --version
+          python3 -m py_compile scripts/kernel_scale.py scripts/kernel_profile.py scripts/kernel_hardening_suite.py scripts/github_workflow_gate.py scripts/generated_artifact_drift_check.py scripts/cache_parity_suite.py scripts/ci_gate.py scripts/strict_quality_firewall.py
+          python3 scripts/kernel_hardening_suite.py --out _build/portable_compiler
+
+      - name: Upload reports
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: portable-${{ matrix.os }}
+          if-no-files-found: ignore
+          retention-days: 14
+          path: |
+            _build/**/*.json
+            _build/**/*.log
+            _build/**/*.out
+            _build/**/*.txt

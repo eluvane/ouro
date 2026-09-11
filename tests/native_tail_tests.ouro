@@ -1,0 +1,134 @@
+import "native_tail_fixtures.ouro";
+import "native_mir_validation_tests.ouro";
+
+def tail_continuation_test (name : String) (value : Nat) (instructions : List MirInstruction)
+    (blocks : List MirBlock) (term : MirTerminator) (expected : Bool) : Test :=
+    let actual : Bool := codegen_tail_result blocks value instructions term in
+    let live : List (Pair MirInstruction (List Nat)) := map MirInstruction (Pair MirInstruction (List Nat))
+      (fun (instruction : MirInstruction) => MkPair MirInstruction (List Nat) instruction ([99] : List Nat)) instructions in
+    let projected : Bool := codegen_tail_live_result blocks term value live in
+    assert_true name (andb (match expected with | True => actual | False => notb actual end)
+      (match expected with | True => projected | False => notb projected end));
+
+def tail_suffix_test (name : String) (instructions : List MirInstruction) (returned : Nat) (expected : Bool) : Test :=
+    tail_continuation_test name 1 instructions ([] : List MirBlock) (tail_return returned) expected;
+
+def tail_reject_instruction (name : String) (instruction : MirInstruction) : Test :=
+    tail_suffix_test name ([instruction] : List MirInstruction) 1 False;
+
+def tail_call_count (name : String) (program : MirProgram) (symbol : Nat) (expected : Nat) : Test :=
+    match codegen_program mir_default_limits program with
+    | Left _ => test_fail name "whole checked codegen rejected fixture"
+    | Right image => match image with | NativeImageOf _ frames =>
+      match find NativeFrameInfo (fun (frame : NativeFrameInfo) => match frame with
+        | NativeFrameAt id _ _ _ => eq_nat id symbol end) frames with
+      | Nothing => test_fail name "missing function frame"
+      | Just frame => match frame with | NativeFrameAt _ _ _ calls =>
+        assert_true name (eq_nat (length NativeCallSite calls) expected) end end end end;
+
+def tail_named_count (name : String) (expected : Nat) : Test :=
+    match tail_fixture_named name with
+    | Nothing => test_fail name "missing fixture"
+    | Just program => tail_call_count (str_concat "tail PE call sites: " name) program 2 expected end;
+
+def tail_bad_program (instructions : List MirInstruction) (result : Maybe MirType) (term : MirTerminator) : MirProgram :=
+    tail_program MirU32 (tail_named_function 2 ([] : List MirLocal)
+      ([MirLocalDef 0 MirU32, MirLocalDef 1 MirU8, MirLocalDef 2 MirRawPtr] : List MirLocal) result
+      ([MirBlockDef 0 instructions term] : List MirBlock)) ([tail_constant] : List MirFunction)
+      ([] : List MirValue) (mir_fixture_nat MirU32 42);
+
+def tail_checked_reject (name : String) (expected : MirError) (program : MirProgram) : Test :=
+    match codegen_program mir_default_limits program with
+    | Right _ => test_fail name "invalid MIR emitted"
+    | Left error => match error with
+      | NativeMirError problem => assert_eq name (mir_test_error_text problem) (mir_test_error_text expected)
+      | NativeEncodingError _ => test_fail name "MIR validation did not own rejection"
+      | NativePeError _ => test_fail name "MIR validation did not own rejection"
+      | NativeMissingSlot _ => test_fail name "MIR validation did not own rejection"
+      | NativeMissingLabel _ => test_fail name "MIR validation did not own rejection"
+      | NativeCodeTooLarge => test_fail name "MIR validation did not own rejection" end end;
+
+def tail_void_program : MirProgram := MirProgramDef ([
+    mir_fixture_function ([] : List MirLocal) ([MirBlockDef 0
+      ([MirCall MirMayGc mir_fixture_no_dest (MirDirect 2) ([] : List MirValue)] : List MirInstruction)
+      (MirReturn mir_fixture_no_value)] : List MirBlock),
+    tail_named_function 2 ([] : List MirLocal) ([] : List MirLocal) mir_fixture_void
+      ([MirBlockDef 0 ([] : List MirInstruction) (MirReturn mir_fixture_no_value)] : List MirBlock)] : List MirFunction)
+    ([] : List MirData) ([] : List MirLibrary) 1;
+
+def tail_valid_call : MirInstruction := MirCall MirMayGc (Just Nat 0) (MirDirect 3) ([] : List MirValue);
+
+def tail_tests : List Test := [
+    tail_suffix_test "tail terminal return" ([] : List MirInstruction) 1 True,
+    tail_suffix_test "tail returned local must match" ([] : List MirInstruction) 2 False,
+    tail_suffix_test "tail self copy" ([MirMove 1 (MirUse 1)] : List MirInstruction) 1 True,
+    tail_suffix_test "tail copy chain" ([MirMove 2 (MirUse 1), MirMove 3 (MirUse 2)] : List MirInstruction) 3 True,
+    tail_suffix_test "tail round-trip alias" ([MirMove 2 (MirUse 1), MirMove 1 (MirUse 2)] : List MirInstruction) 1 True,
+    tail_suffix_test "tail old sibling alias remains conservative" ([MirMove 2 (MirUse 1), MirMove 3 (MirUse 1)] : List MirInstruction) 3 False,
+    tail_suffix_test "tail copy cannot change returned value" ([MirMove 2 (MirUse 1)] : List MirInstruction) 1 False,
+    tail_reject_instruction "tail mutation is retained" (MirMove 1 (mir_fixture_nat MirU32 99)),
+    tail_reject_instruction "tail unrelated copy is retained" (MirMove 2 (MirUse 3)),
+    tail_reject_instruction "tail arithmetic is retained" (MirBinaryOp 1 MirAdd (MirUse 1) (mir_fixture_nat MirU32 1)),
+    tail_reject_instruction "tail comparison is retained" (MirCompare 2 MirEqual (MirUse 1) (MirUse 1)),
+    tail_reject_instruction "tail conversion is retained" (MirConvert 2 MirNarrow (MirUse 1)),
+    tail_reject_instruction "tail load is retained" (MirLoad 2 (MirUse 3) (codegen_disp 0)),
+    tail_reject_instruction "tail store is retained" (MirStore (MirUse 3) (codegen_disp 0) (MirUse 1)),
+    tail_reject_instruction "tail indexed load is retained" (MirLoadAt 2 (MirUse 3) (MirUse 4)),
+    tail_reject_instruction "tail indexed store is retained" (MirStoreAt (MirUse 3) (MirUse 4) (MirUse 1)),
+    tail_reject_instruction "tail address is retained" (MirAddress 2 3),
+    tail_reject_instruction "tail pointer arithmetic is retained" (MirPointerAdd 2 (MirUse 3) (MirUse 4)),
+    tail_reject_instruction "tail following call is retained" (MirCall MirMayGc (Just Nat 2) (MirDirect 3) ([] : List MirValue)),
+    tail_reject_instruction "tail managed allocation is retained" (MirManagedAlloc 2 3 4 5 (MirUse 6)),
+    tail_reject_instruction "tail managed context is retained" (MirManagedContext 2),
+    tail_continuation_test "tail void return stays ordinary" 1 ([] : List MirInstruction) ([] : List MirBlock)
+      (MirReturn mir_fixture_no_value) False,
+    tail_continuation_test "tail literal return stays ordinary" 1 ([] : List MirInstruction) ([] : List MirBlock)
+      (MirReturn (Just MirValue (mir_fixture_nat MirU32 42))) False,
+    tail_continuation_test "tail trap stays ordinary" 1 ([] : List MirInstruction) ([] : List MirBlock) MirTrap False,
+    tail_continuation_test "tail branch stays ordinary" 1 ([] : List MirInstruction) ([] : List MirBlock) (MirBranch (MirUse 2) 0 0) False,
+    tail_continuation_test "tail unconditional join" 1 ([MirMove 2 (MirUse 1)] : List MirInstruction)
+      ([MirBlockDef 0 ([MirMove 3 (MirUse 2)] : List MirInstruction) (MirJump 1),
+        MirBlockDef 1 ([] : List MirInstruction) (tail_return 3)] : List MirBlock) (MirJump 0) True,
+    tail_continuation_test "tail join effect stays ordinary" 1 ([] : List MirInstruction)
+      ([MirBlockDef 0 ([MirStore (MirUse 2) (codegen_disp 0) (MirUse 1)] : List MirInstruction) (tail_return 1)] : List MirBlock)
+      (MirJump 0) False,
+    tail_continuation_test "tail missing jump target stays ordinary" 1 ([] : List MirInstruction) ([] : List MirBlock) (MirJump 7) False,
+    tail_continuation_test "tail cycle exhausts bounded traversal" 1 ([] : List MirInstruction)
+      ([MirBlockDef 0 ([] : List MirInstruction) (MirJump 1), MirBlockDef 1 ([] : List MirInstruction) (MirJump 0)] : List MirBlock)
+      (MirJump 0) False,
+    assert_true "tail zero fuel cannot accept return"
+      (notb (codegen_tail_return ([] : List MirBlock) 0 1 (tail_return 1))),
+    tail_named_count "million_direct" 1, tail_named_count "million_indirect" 1,
+    tail_named_count "shuffle_direct" 0, tail_named_count "shuffle_indirect" 0,
+    tail_named_count "u8_join" 0, tail_named_count "u32_max" 0,
+    tail_named_count "five_args" 1, tail_named_count "post_store" 1,
+    tail_call_count "tail zero-argument call removes return PC"
+      (tail_bad_program ([tail_valid_call] : List MirInstruction) (Just MirType MirU32) (tail_return 0)) 2 0,
+    tail_call_count "tail no-result call keeps return PC" tail_void_program 1 1,
+    tail_checked_reject "tail checked unknown target" (MirInvalidCall 999)
+      (tail_bad_program ([MirCall MirMayGc (Just Nat 0) (MirDirect 999) ([] : List MirValue)] : List MirInstruction)
+        (Just MirType MirU32) (tail_return 0)),
+    tail_checked_reject "tail checked missing join" (MirUnknownBlock 99)
+      (tail_bad_program ([tail_valid_call] : List MirInstruction) (Just MirType MirU32) (MirJump 99)),
+    tail_checked_reject "tail checked destination width" (MirTypeMismatch 1)
+      (tail_bad_program ([MirCall MirMayGc (Just Nat 1) (MirDirect 3) ([] : List MirValue)] : List MirInstruction)
+        (Just MirType MirU32) (tail_return 0)),
+    tail_checked_reject "tail checked return width" (MirTypeMismatch 2)
+      (tail_bad_program ([tail_valid_call, MirMove 1 (mir_fixture_nat MirU8 0)] : List MirInstruction)
+        (Just MirType MirU32) (tail_return 1)),
+    tail_checked_reject "tail checked missing return" (MirInvalidReturn 2)
+      (tail_bad_program ([tail_valid_call] : List MirInstruction) (Just MirType MirU32) (MirReturn mir_fixture_no_value)),
+    tail_checked_reject "tail checked uninitialized indirect target" (MirUninitialized 0 2)
+      (tail_bad_program ([MirCall MirMayGc (Just Nat 0)
+        (MirIndirect (MirSignatureOf ([] : List MirType) (Just MirType MirU32)) (MirUse 2)) ([] : List MirValue)] : List MirInstruction)
+        (Just MirType MirU32) (tail_return 0)),
+    tail_checked_reject "tail checked argument count" (MirInvalidCall 2)
+      (tail_bad_program ([MirCall MirMayGc (Just Nat 0) (MirDirect 3) ([mir_fixture_nat MirU32 1] : List MirValue)] : List MirInstruction)
+        (Just MirType MirU32) (tail_return 0)),
+    tail_checked_reject "tail checked indirect pointer type" (MirTypeMismatch 0)
+      (tail_bad_program ([MirCall MirMayGc (Just Nat 0)
+        (MirIndirect (MirSignatureOf ([] : List MirType) (Just MirType MirU32)) (mir_fixture_nat MirU32 0)) ([] : List MirValue)] : List MirInstruction)
+        (Just MirType MirU32) (tail_return 0))];
+
+-- @entry main
+def main : IO Unit := test_run tail_tests

@@ -1,0 +1,250 @@
+-- Kind 8 is an immutable natural: USize limb count at 32, followed by
+-- little-endian U32 limbs at 40. Zero has no limbs; the highest limb is nonzero.
+-- The descriptor traces no references. Indexed accesses keep the owner live.
+import "managed_model.ouro";
+
+inductive ManagedNatWordResult : Type :=
+  | ManagedNatWordOf : MirValue -> MirValue -> ManagedState -> ManagedNatWordResult;
+
+def managed_nat_max_limb : MirValue :=
+    MirBits MirU32 (X64Words64 (X64Bytes32 255 255 255 255) codegen_zero);
+
+-- Keep limb validation and loops in bounded typed functions. Otherwise many
+-- Nat operations in one source body accumulate a large definite-assignment
+-- graph. Fresh symbols need no name-based lookup or additional compiler state.
+def managed_nat_helper (name : List Nat) (parameters : List MirLocal) (arguments : List MirValue)
+    (result_type : MirType) (body : ManagedState -> Either NativeLowerError ManagedResult) (state : ManagedState)
+    : Either NativeLowerError ManagedResult :=
+    let caller : LowerState := managed_flow state in
+    lower_bind (Pair Nat ManagedState) ManagedResult (managed_fresh_symbol state)
+      (fun (fresh : Pair Nat ManagedState) => match fresh with | MkPair symbol reserved =>
+        lower_bind ManagedResult ManagedResult
+          (body (managed_with_flow reserved (lower_empty_state (length MirLocal parameters))))
+          (fun (compiled : ManagedResult) => match compiled with | ManagedResultOf value after =>
+            match managed_flow after with | LowerStateOf _ locals _ _ =>
+              let function : MirFunction := MirFunctionDef symbol name parameters (reverse MirLocal locals)
+                (Just MirType result_type) 0 (lower_finish_blocks (MirReturn (Just MirValue value)) (managed_flow after)) in
+              managed_fresh result_type (fun (local : Nat) => MirCall MirMayGc (Just Nat local)
+                (MirDirect symbol) arguments) (managed_with_flow (managed_add_function function after) caller) end end) end);
+
+def managed_nat_when (condition : MirValue)
+    (action : ManagedState -> Either NativeLowerError ManagedState) (state : ManagedState)
+    : Either NativeLowerError ManagedState :=
+    lower_bind (Pair Nat ManagedState) ManagedState (managed_fresh_block state)
+      (fun (yes : Pair Nat ManagedState) => match yes with | MkPair selected next =>
+        lower_bind (Pair Nat ManagedState) ManagedState (managed_fresh_block next)
+          (fun (join : Pair Nat ManagedState) => match join with | MkPair finish ready =>
+            lower_map ManagedState ManagedState (managed_switch_block finish (MirJump finish))
+              (action (managed_switch_block selected (MirBranch condition selected finish) ready)) end) end);
+
+def managed_nat_limb_offset (index : MirValue) (state : ManagedState)
+    : Either NativeLowerError ManagedResult :=
+    lower_bind ManagedResult ManagedResult (managed_binary MirUSize MirShl index (managed_bits MirU32 2) state)
+      (fun (shifted : ManagedResult) => match shifted with | ManagedResultOf offset next =>
+        managed_binary MirUSize MirAdd offset (managed_bits MirUSize 40) next end);
+
+def managed_nat_load_limb (value : MirValue) (index : MirValue) (state : ManagedState)
+    : Either NativeLowerError ManagedResult :=
+    lower_bind ManagedResult ManagedResult (managed_nat_limb_offset index state)
+      (fun (address : ManagedResult) => match address with | ManagedResultOf offset next =>
+        managed_fresh MirU32 (fun (local : Nat) => MirLoadAt local value offset) next end);
+
+def managed_nat_store_limb (value : MirValue) (index : MirValue) (limb : MirValue) (state : ManagedState)
+    : Either NativeLowerError ManagedState :=
+    lower_map ManagedResult ManagedState (fun (address : ManagedResult) => match address with
+      | ManagedResultOf offset next => managed_emit (MirStoreAt value offset limb) next end)
+      (managed_nat_limb_offset index state);
+
+def managed_nat_check_high (value : MirValue) (count : MirValue) (state : ManagedState)
+    : Either NativeLowerError ManagedState :=
+    lower_bind ManagedResult ManagedState (managed_compare MirNotEqual count (managed_bits MirUSize 0) state)
+      (fun (tested : ManagedResult) => match tested with | ManagedResultOf nonzero next =>
+        managed_nat_when nonzero (fun (entered : ManagedState) =>
+          lower_bind ManagedResult ManagedState (managed_binary MirUSize MirSub count (managed_bits MirUSize 1) entered)
+            (fun (last : ManagedResult) => match last with | ManagedResultOf index after =>
+              lower_bind ManagedResult ManagedState (managed_nat_load_limb value index after)
+                (fun (loaded : ManagedResult) => match loaded with | ManagedResultOf high ready =>
+                  lower_bind ManagedResult ManagedState (managed_compare MirNotEqual high (managed_bits MirU32 0) ready)
+                    (fun (checked : ManagedResult) => match checked with | ManagedResultOf valid finish =>
+                      managed_guard valid finish end) end) end)) next end);
+
+-- Bound the count by recorded allocation bytes before computing any offset.
+def managed_nat_count_body (compiler : ManagedCompiler) (value : MirValue) (state : ManagedState)
+    : Either NativeLowerError ManagedResult :=
+    lower_bind ManagedState ManagedResult (managed_expect_descriptor compiler 8 value state)
+      (fun (checked : ManagedState) => lower_bind ManagedResult ManagedResult (managed_load MirUSize value 8 checked)
+        (fun (size : ManagedResult) => match size with | ManagedResultOf bytes next =>
+          lower_bind ManagedResult ManagedResult (managed_compare MirGreaterEqual bytes (managed_bits MirUSize 40) next)
+            (fun (tested : ManagedResult) => match tested with | ManagedResultOf valid after =>
+              lower_bind ManagedState ManagedResult (managed_guard valid after)
+                (fun (bounded : ManagedState) => lower_bind ManagedResult ManagedResult
+                  (managed_binary MirUSize MirSub bytes (managed_bits MirUSize 40) bounded)
+                  (fun (payload : ManagedResult) => match payload with | ManagedResultOf available ready =>
+                    lower_bind ManagedResult ManagedResult (managed_binary MirUSize MirShr available (managed_bits MirU32 2) ready)
+                      (fun (capacity : ManagedResult) => match capacity with | ManagedResultOf maximum after_capacity =>
+                        lower_bind ManagedResult ManagedResult (managed_load MirUSize value 32 after_capacity)
+                          (fun (loaded : ManagedResult) => match loaded with | ManagedResultOf count after_count =>
+                            lower_bind ManagedResult ManagedResult (managed_compare MirLessEqual count maximum after_count)
+                              (fun (range : ManagedResult) => match range with | ManagedResultOf fits after_range =>
+                                lower_bind ManagedState ManagedResult (managed_guard fits after_range)
+                                  (fun (count_checked : ManagedState) => lower_map ManagedState ManagedResult
+                                    (fun (complete : ManagedState) => ManagedResultOf count complete)
+                                    (managed_nat_check_high value count count_checked)) end) end) end) end)) end) end));
+
+def managed_nat_count (compiler : ManagedCompiler) (value : MirValue) (state : ManagedState)
+    : Either NativeLowerError ManagedResult :=
+    managed_nat_helper ([111,117,114,111,95,110,97,116,95,99,111,117,110,116] : List Nat)
+      ([MirLocalDef 0 MirManagedPtr] : List MirLocal) ([value] : List MirValue) MirUSize
+      (managed_nat_count_body compiler (MirUse 0)) state;
+
+-- count <= floor((MAX_USIZE - 47) / 4) proves multiply, prefix and round-up.
+def managed_nat_allocate (compiler : ManagedCompiler) (count : MirValue) (state : ManagedState)
+    : Either NativeLowerError ManagedResult :=
+    let maximum : MirValue := MirBits MirUSize
+      (X64Words64 (X64Bytes32 244 255 255 255) (X64Bytes32 255 255 255 63)) in
+    lower_bind ManagedResult ManagedResult (managed_compare MirLessEqual count maximum state)
+      (fun (tested : ManagedResult) => match tested with | ManagedResultOf valid next =>
+        lower_bind ManagedState ManagedResult (managed_guard valid next)
+          (fun (checked : ManagedState) => lower_bind ManagedResult ManagedResult
+            (managed_binary MirUSize MirShl count (managed_bits MirU32 2) checked)
+            (fun (scaled : ManagedResult) => match scaled with | ManagedResultOf payload after =>
+              lower_bind ManagedResult ManagedResult (managed_binary MirUSize MirAdd payload (managed_bits MirUSize 47) after)
+                (fun (padded : ManagedResult) => match padded with | ManagedResultOf bytes ready =>
+                  lower_bind ManagedResult ManagedResult (managed_binary MirUSize MirShr bytes (managed_bits MirU32 3) ready)
+                    (fun (rounded : ManagedResult) => match rounded with | ManagedResultOf words after_round =>
+                      lower_bind ManagedResult ManagedResult (managed_binary MirUSize MirShl words (managed_bits MirU32 3) after_round)
+                        (fun (aligned : ManagedResult) => match aligned with | ManagedResultOf size after_size =>
+                          lower_map ManagedResult ManagedResult (fun (allocated : ManagedResult) => match allocated with
+                            | ManagedResultOf value finish => ManagedResultOf value
+                                (managed_emit (MirStore value (codegen_disp 32) count) finish) end)
+                            (managed_allocate_sized compiler 8 size after_size) end) end) end) end)) end);
+
+def managed_nat_unsigned (word : PrimitiveWord) (value : MirValue) (state : ManagedState)
+    : Either NativeLowerError ManagedResult :=
+    match word with
+    | PrimitiveWordU8 => managed_convert MirU64 MirZeroExtend value state
+    | PrimitiveWordU32 => managed_convert MirU64 MirZeroExtend value state
+    | PrimitiveWordU64 => Right NativeLowerError ManagedResult (ManagedResultOf value state)
+    | PrimitiveWordUSize => managed_convert MirU64 MirReinterpret value state
+    | PrimitiveWordI32 => lower_bind ManagedResult ManagedResult (managed_convert MirU32 MirReinterpret value state)
+        (fun (bits : ManagedResult) => match bits with | ManagedResultOf unsigned next =>
+          managed_convert MirU64 MirZeroExtend unsigned next end) end;
+
+def managed_nat_word_count (value : MirValue) (high : MirValue) (state : ManagedState)
+    : Either NativeLowerError ManagedResult :=
+    lower_bind ManagedResult ManagedResult (managed_compare MirNotEqual value (managed_bits MirU64 0) state)
+      (fun (lower : ManagedResult) => match lower with | ManagedResultOf nonzero next =>
+        lower_bind ManagedResult ManagedResult (managed_compare MirNotEqual high (managed_bits MirU32 0) next)
+          (fun (upper : ManagedResult) => match upper with | ManagedResultOf high_nonzero after =>
+            lower_bind ManagedResult ManagedResult (managed_convert MirUSize MirZeroExtend nonzero after)
+              (fun (first : ManagedResult) => match first with | ManagedResultOf low_count ready =>
+                lower_bind ManagedResult ManagedResult (managed_convert MirUSize MirZeroExtend high_nonzero ready)
+                  (fun (second : ManagedResult) => match second with | ManagedResultOf high_count finish =>
+                    managed_binary MirUSize MirAdd low_count high_count finish end) end) end) end);
+
+def managed_nat_from_bits (compiler : ManagedCompiler) (value : MirValue) (low : MirValue)
+    (high : MirValue) (state : ManagedState) : Either NativeLowerError ManagedResult :=
+    lower_bind ManagedResult ManagedResult (managed_nat_word_count value high state)
+      (fun (size : ManagedResult) => match size with | ManagedResultOf count next =>
+        lower_bind ManagedResult ManagedResult (managed_nat_allocate compiler count next)
+          (fun (allocated : ManagedResult) => match allocated with | ManagedResultOf natural after =>
+            lower_bind ManagedResult ManagedResult (managed_compare MirNotEqual count (managed_bits MirUSize 0) after)
+              (fun (tested : ManagedResult) => match tested with | ManagedResultOf nonzero ready =>
+                lower_map ManagedState ManagedResult (fun (finish : ManagedState) => ManagedResultOf natural finish)
+                  (managed_nat_when nonzero (fun (entered : ManagedState) => Right NativeLowerError ManagedState
+                    (managed_emit_all ([MirStore natural (codegen_disp 40) low,
+                      MirStore natural (codegen_disp 44) high] : List MirInstruction) entered)) ready) end) end) end);
+
+-- I32.to_nat is its unsigned bit pattern, as required by the primitive ABI.
+def managed_nat_from_word (compiler : ManagedCompiler) (word : PrimitiveWord) (value : MirValue) (state : ManagedState)
+    : Either NativeLowerError ManagedResult :=
+    lower_bind ManagedResult ManagedResult (managed_nat_unsigned word value state)
+      (fun (converted : ManagedResult) => match converted with | ManagedResultOf bits next =>
+        lower_bind ManagedResult ManagedResult (managed_convert MirU32 MirNarrow bits next)
+          (fun (lower : ManagedResult) => match lower with | ManagedResultOf low after =>
+            lower_bind ManagedResult ManagedResult (managed_binary MirU64 MirShr bits (managed_bits MirU32 32) after)
+              (fun (shifted : ManagedResult) => match shifted with | ManagedResultOf upper ready =>
+                lower_bind ManagedResult ManagedResult (managed_convert MirU32 MirNarrow upper ready)
+                  (fun (higher : ManagedResult) => match higher with | ManagedResultOf high finish =>
+                    managed_nat_from_bits compiler bits low high finish end) end) end) end);
+
+def managed_nat_word_max (word : PrimitiveWord) : MirValue :=
+    match word with
+    | PrimitiveWordU8 => managed_bits MirU64 255
+    | PrimitiveWordU32 => MirBits MirU64 (X64Words64 (X64Bytes32 255 255 255 255) codegen_zero)
+    | PrimitiveWordI32 => MirBits MirU64 (X64Words64 (X64Bytes32 255 255 255 127) codegen_zero)
+    | PrimitiveWordU64 => MirBits MirU64 (X64Words64 (X64Bytes32 255 255 255 255) (X64Bytes32 255 255 255 255))
+    | PrimitiveWordUSize => MirBits MirU64 (X64Words64 (X64Bytes32 255 255 255 255) (X64Bytes32 255 255 255 255)) end;
+
+def managed_nat_narrow (word : PrimitiveWord) (value : MirValue) (state : ManagedState)
+    : Either NativeLowerError ManagedResult :=
+    match word with
+    | PrimitiveWordU8 => managed_convert MirU8 MirNarrow value state
+    | PrimitiveWordU32 => managed_convert MirU32 MirNarrow value state
+    | PrimitiveWordI32 => managed_convert MirI32 MirNarrow value state
+    | PrimitiveWordU64 => Right NativeLowerError ManagedResult (ManagedResultOf value state)
+    | PrimitiveWordUSize => managed_convert MirUSize MirReinterpret value state end;
+
+def managed_nat_small_high (value : MirValue) (cell : Nat) (state : ManagedState)
+    : Either NativeLowerError ManagedState :=
+    lower_bind ManagedResult ManagedState (managed_load MirU32 value 44 state)
+      (fun (loaded : ManagedResult) => match loaded with | ManagedResultOf high next =>
+        lower_bind ManagedResult ManagedState (managed_convert MirU64 MirZeroExtend high next)
+          (fun (extended : ManagedResult) => match extended with | ManagedResultOf bits after =>
+            lower_bind ManagedResult ManagedState (managed_binary MirU64 MirShl bits (managed_bits MirU32 32) after)
+              (fun (shifted : ManagedResult) => match shifted with | ManagedResultOf upper ready =>
+                Right NativeLowerError ManagedState (managed_emit (MirBinaryOp cell MirOr (MirUse cell) upper) ready) end) end) end);
+
+-- The caller has proved count <= 2. Every payload load is dominated by count.
+def managed_nat_small_bits_body (value : MirValue) (count : MirValue) (state : ManagedState)
+    : Either NativeLowerError ManagedResult :=
+    lower_bind (Pair Nat ManagedState) ManagedResult (managed_fresh_local MirU64 state)
+      (fun (fresh : Pair Nat ManagedState) => match fresh with | MkPair cell next =>
+        lower_bind ManagedResult ManagedResult (managed_compare MirNotEqual count (managed_bits MirUSize 0)
+          (managed_emit (MirMove cell (managed_bits MirU64 0)) next))
+          (fun (tested : ManagedResult) => match tested with | ManagedResultOf nonzero after =>
+            lower_map ManagedState ManagedResult (fun (finish : ManagedState) => ManagedResultOf (MirUse cell) finish)
+              (managed_nat_when nonzero (fun (entered : ManagedState) =>
+                lower_bind ManagedResult ManagedState (managed_load MirU32 value 40 entered)
+                  (fun (loaded : ManagedResult) => match loaded with | ManagedResultOf low ready =>
+                    lower_bind ManagedResult ManagedState (managed_convert MirU64 MirZeroExtend low ready)
+                      (fun (extended : ManagedResult) => match extended with | ManagedResultOf bits after_low =>
+                        lower_bind ManagedResult ManagedState (managed_compare MirEqual count (managed_bits MirUSize 2)
+                          (managed_emit (MirMove cell bits) after_low))
+                          (fun (upper : ManagedResult) => match upper with | ManagedResultOf two after_test =>
+                            managed_nat_when two (managed_nat_small_high value cell) after_test end) end) end)) after) end) end);
+
+def managed_nat_small_bits (value : MirValue) (count : MirValue) (state : ManagedState)
+    : Either NativeLowerError ManagedResult :=
+    managed_nat_helper ([111,117,114,111,95,110,97,116,95,115,109,97,108,108,95,98,105,116,115] : List Nat)
+      ([MirLocalDef 0 MirManagedPtr, MirLocalDef 1 MirUSize] : List MirLocal) ([value, count] : List MirValue) MirU64
+      (managed_nat_small_bits_body (MirUse 0) (MirUse 1)) state;
+
+def managed_nat_checked_bits (word : PrimitiveWord) (value : MirValue) (count : MirValue)
+    (fits : Nat) (bits : Nat) (state : ManagedState) : Either NativeLowerError ManagedState :=
+    lower_bind ManagedResult ManagedState (managed_nat_small_bits value count state)
+      (fun (loaded : ManagedResult) => match loaded with | ManagedResultOf unsigned next =>
+        lower_bind ManagedResult ManagedState (managed_compare MirLessEqual unsigned (managed_nat_word_max word) next)
+          (fun (tested : ManagedResult) => match tested with | ManagedResultOf within after =>
+            managed_nat_when within (fun (entered : ManagedState) => lower_map ManagedResult ManagedState
+              (fun (converted : ManagedResult) => match converted with | ManagedResultOf scalar ready =>
+                managed_emit_all ([MirMove fits (managed_bits MirU8 1), MirMove bits scalar] : List MirInstruction) ready end)
+              (managed_nat_narrow word unsigned entered)) after end) end);
+
+-- fits is U8; bits has the requested word type. Overflow returns (0, 0).
+-- Callers must inspect fits before using bits as a successful conversion.
+def managed_nat_checked_word (compiler : ManagedCompiler) (word : PrimitiveWord) (value : MirValue) (state : ManagedState)
+    : Either NativeLowerError ManagedNatWordResult :=
+    lower_bind ManagedResult ManagedNatWordResult (managed_nat_count compiler value state)
+      (fun (loaded : ManagedResult) => match loaded with | ManagedResultOf count next =>
+        lower_bind (Pair Nat ManagedState) ManagedNatWordResult (managed_fresh_local MirU8 next)
+          (fun (flag : Pair Nat ManagedState) => match flag with | MkPair fits after_flag =>
+            lower_bind (Pair Nat ManagedState) ManagedNatWordResult (managed_fresh_local (lower_word word) after_flag)
+              (fun (cell : Pair Nat ManagedState) => match cell with | MkPair bits after_cell =>
+                lower_bind ManagedResult ManagedNatWordResult (managed_compare MirLessEqual count (managed_bits MirUSize 2)
+                  (managed_emit_all ([MirMove fits (managed_bits MirU8 0),
+                    MirMove bits (managed_bits (lower_word word) 0)] : List MirInstruction) after_cell))
+                  (fun (tested : ManagedResult) => match tested with | ManagedResultOf small ready =>
+                    lower_map ManagedState ManagedNatWordResult (fun (finish : ManagedState) =>
+                      ManagedNatWordOf (MirUse fits) (MirUse bits) finish)
+                      (managed_nat_when small (managed_nat_checked_bits word value count fits bits) ready) end) end) end) end);

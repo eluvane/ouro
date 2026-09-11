@@ -1,0 +1,159 @@
+-- Core CaseInfo is retained here. A selected arm checks its exact family,
+-- constructor ordinal and runtime field count before binding any payload.
+import "managed_closures.ouro";
+
+inductive ManagedArm : Type :=
+  | ManagedArmOf : ManagedScope -> CoreTerm -> Nat -> ManagedState -> ManagedArm;
+
+def managed_arm_bind : Nat -> Nat -> ManagedScope -> CoreTerm -> MirValue -> Nat -> ManagedState
+    -> Either NativeLowerError ManagedArm :=
+  fix bind_fields (fuel : Nat) (remaining : Nat) (scope : ManagedScope) (branch : CoreTerm)
+      (scrutinee : MirValue) (field : Nat) (state : ManagedState) : Either NativeLowerError ManagedArm :=
+    match remaining with
+    | Z => Right NativeLowerError ManagedArm (ManagedArmOf scope branch field state)
+    | S more => match fuel with | Z => Left NativeLowerError ManagedArm LowerResourceExhausted
+      | S next => match lower_term_view branch with
+        | LowerLambdaTerm annotation body => match is_sort_ann annotation with
+          | True => bind_fields next more (Cons (Maybe MirValue) (Nothing MirValue) scope) body scrutinee field state
+          | False => lower_bind ManagedResult ManagedArm (managed_load MirManagedPtr scrutinee (add 56 (mul 8 field)) state)
+              (fun (loaded : ManagedResult) => match loaded with | ManagedResultOf value after =>
+                bind_fields next more (Cons (Maybe MirValue) (Just MirValue value) scope) body scrutinee (S field) after end) end
+        | LowerLocalTerm _ => Left NativeLowerError ManagedArm (LowerUnsupportedTerm 9)
+        | LowerApplyTerm _ _ => Left NativeLowerError ManagedArm (LowerUnsupportedTerm 9)
+        | LowerLetTerm _ _ _ => Left NativeLowerError ManagedArm (LowerUnsupportedTerm 9)
+        | LowerGlobalTerm _ => Left NativeLowerError ManagedArm (LowerUnsupportedTerm 9)
+        | LowerConstructorTerm _ _ _ => Left NativeLowerError ManagedArm (LowerUnsupportedTerm 9)
+        | LowerCaseTerm _ _ _ _ => Left NativeLowerError ManagedArm (LowerUnsupportedTerm 9)
+        | LowerOtherTerm _ => Left NativeLowerError ManagedArm (LowerUnsupportedTerm 9) end end end;
+
+-- Count erased and live binders before generating loads, so a malformed
+-- object cannot make field binding read beyond the declared payload range.
+def managed_arm_count : Nat -> Nat -> CoreTerm -> Either NativeLowerError Nat :=
+  fix count_fields (fuel : Nat) (remaining : Nat) (branch : CoreTerm) : Either NativeLowerError Nat :=
+    match remaining with | Z => Right NativeLowerError Nat 0
+    | S more => match fuel with | Z => Left NativeLowerError Nat LowerResourceExhausted
+      | S next => match lower_term_view branch with
+        | LowerLambdaTerm annotation body => lower_map Nat Nat (fun (fields : Nat) =>
+            match is_sort_ann annotation with | True => fields | False => S fields end) (count_fields next more body)
+        | LowerLocalTerm _ => Left NativeLowerError Nat (LowerUnsupportedTerm 9)
+        | LowerApplyTerm _ _ => Left NativeLowerError Nat (LowerUnsupportedTerm 9)
+        | LowerLetTerm _ _ _ => Left NativeLowerError Nat (LowerUnsupportedTerm 9)
+        | LowerGlobalTerm _ => Left NativeLowerError Nat (LowerUnsupportedTerm 9)
+        | LowerConstructorTerm _ _ _ => Left NativeLowerError Nat (LowerUnsupportedTerm 9)
+        | LowerCaseTerm _ _ _ _ => Left NativeLowerError Nat (LowerUnsupportedTerm 9)
+        | LowerOtherTerm _ => Left NativeLowerError Nat (LowerUnsupportedTerm 9) end end end;
+
+def managed_selected_arm (step : ManagedStep) (fuel : Nat) (scope : ManagedScope) (arity : Nat)
+    (branch : CoreTerm) (scrutinee : MirValue) (count : MirValue) (state : ManagedState)
+    : Either NativeLowerError ManagedResult :=
+    lower_bind Nat ManagedResult (managed_arm_count fuel arity branch) (fun (fields : Nat) =>
+      lower_bind ManagedState ManagedResult (managed_require_equal count (managed_bits MirUSize fields) state)
+        (fun (checked : ManagedState) => lower_bind ManagedArm ManagedResult
+          (managed_arm_bind fuel arity scope branch scrutinee 0 checked)
+          (fun (bound : ManagedArm) => match bound with | ManagedArmOf environment body _ next =>
+            step environment body next end)));
+
+def managed_case_branches (step : ManagedStep) (scope : ManagedScope) (scrutinee : MirValue)
+    (tag : MirValue) (count : MirValue) (result : Nat) (finish : Nat)
+    : Nat -> List Nat -> List CoreTerm -> Nat -> ManagedState -> Either NativeLowerError ManagedState :=
+  fix branches (fuel : Nat) (arities : List Nat) (bodies : List CoreTerm) (index : Nat) (state : ManagedState)
+      : Either NativeLowerError ManagedState :=
+    match arities, bodies with
+    | Nil, Nil => Right NativeLowerError ManagedState (managed_switch_block finish MirTrap state)
+    | Nil, Cons _ _ => Left NativeLowerError ManagedState (LowerUnsupportedTerm 9)
+    | Cons _ _, Nil => Left NativeLowerError ManagedState (LowerUnsupportedTerm 9)
+    | Cons arity rest, Cons branch more => match fuel with
+      | Z => Left NativeLowerError ManagedState LowerResourceExhausted
+      | S next => lower_bind (Pair Nat ManagedState) ManagedState (managed_fresh_block state)
+          (fun (yes : Pair Nat ManagedState) => match yes with | MkPair selected first =>
+            lower_bind (Pair Nat ManagedState) ManagedState (managed_fresh_block first)
+              (fun (no : Pair Nat ManagedState) => match no with | MkPair following ready =>
+                lower_bind ManagedResult ManagedState (managed_compare MirEqual tag (managed_bits MirUSize index) ready)
+                  (fun (tested : ManagedResult) => match tested with | ManagedResultOf condition after_test =>
+                    lower_bind ManagedResult ManagedState
+                      (managed_selected_arm step next scope arity branch scrutinee count
+                        (managed_switch_block selected (MirBranch condition selected following) after_test))
+                      (fun (compiled : ManagedResult) => match compiled with | ManagedResultOf value after_arm =>
+                        branches next rest more (S index) (managed_switch_block following (MirJump finish)
+                          (managed_emit (MirMove result value) after_arm)) end) end) end) end) end end;
+
+def managed_case_body (compiler : ManagedCompiler) (step : ManagedStep) (fuel : Nat) (scope : ManagedScope)
+    (info : CaseInfo) (scrutinee : MirValue) (branches : List CoreTerm) (state : ManagedState)
+    : Either NativeLowerError ManagedResult :=
+    match info with | MkCaseInfo family _ arities =>
+      lower_bind ManagedState ManagedResult (managed_expect_descriptor compiler 1 scrutinee state)
+        (fun (checked : ManagedState) => lower_bind ManagedResult ManagedResult (managed_load MirUSize scrutinee 32 checked)
+          (fun (loaded_family : ManagedResult) => match loaded_family with | ManagedResultOf actual next =>
+            lower_bind ManagedState ManagedResult (managed_require_equal actual (managed_bits MirUSize family) next)
+              (fun (family_checked : ManagedState) => lower_bind ManagedResult ManagedResult (managed_load MirUSize scrutinee 40 family_checked)
+                (fun (loaded_tag : ManagedResult) => match loaded_tag with | ManagedResultOf tag after_tag =>
+                  lower_bind ManagedResult ManagedResult (managed_load MirUSize scrutinee 48 after_tag)
+                    (fun (loaded_count : ManagedResult) => match loaded_count with | ManagedResultOf count after_count =>
+                      lower_bind (Pair Nat ManagedState) ManagedResult (managed_fresh_local MirManagedPtr after_count)
+                        (fun (cell : Pair Nat ManagedState) => match cell with | MkPair result after_cell =>
+                          lower_bind (Pair Nat ManagedState) ManagedResult (managed_fresh_block after_cell)
+                            (fun (join : Pair Nat ManagedState) => match join with | MkPair finish after_join =>
+                              lower_map ManagedState ManagedResult (fun (complete : ManagedState) =>
+                                ManagedResultOf (MirUse result) complete)
+                                (managed_case_branches step scope scrutinee tag count result finish fuel arities branches 0 after_join)
+                              end) end) end) end)) end)) end;
+
+def managed_nat_selected (step : ManagedStep) (scope : ManagedScope) (branch : CoreTerm)
+    (predecessor : MirValue) (state : ManagedState) : Either NativeLowerError ManagedResult :=
+    match lower_term_view branch with
+    | LowerLambdaTerm annotation body => lower_bind Unit ManagedResult
+        (lower_require (notb (is_sort_ann annotation)) (LowerUnsupportedTerm 9))
+        (fun (_ : Unit) => step (Cons (Maybe MirValue) (Just MirValue predecessor) scope) body state)
+    | LowerLocalTerm _ => Left NativeLowerError ManagedResult (LowerUnsupportedTerm 9)
+    | LowerApplyTerm _ _ => Left NativeLowerError ManagedResult (LowerUnsupportedTerm 9)
+    | LowerLetTerm _ _ _ => Left NativeLowerError ManagedResult (LowerUnsupportedTerm 9)
+    | LowerGlobalTerm _ => Left NativeLowerError ManagedResult (LowerUnsupportedTerm 9)
+    | LowerConstructorTerm _ _ _ => Left NativeLowerError ManagedResult (LowerUnsupportedTerm 9)
+    | LowerCaseTerm _ _ _ _ => Left NativeLowerError ManagedResult (LowerUnsupportedTerm 9)
+    | LowerOtherTerm _ => Left NativeLowerError ManagedResult (LowerUnsupportedTerm 9) end;
+
+def managed_nat_case_arms (compiler : ManagedCompiler) (step : ManagedStep) (scope : ManagedScope)
+    (scrutinee : MirValue) (zero_branch : CoreTerm) (successor_branch : CoreTerm) (state : ManagedState)
+    : Either NativeLowerError ManagedResult :=
+    lower_bind ManagedResult ManagedResult (managed_nat_count compiler scrutinee state)
+      (fun (loaded : ManagedResult) => match loaded with | ManagedResultOf count next =>
+        lower_bind (Pair Nat ManagedState) ManagedResult (managed_fresh_local MirManagedPtr next)
+          (fun (fresh : Pair Nat ManagedState) => match fresh with | MkPair result after_cell =>
+            lower_bind LowerLoopBlocks ManagedResult (lower_loop_blocks (managed_flow after_cell))
+              (fun (labels : LowerLoopBlocks) => match labels with | LowerLoopAt zero successor finish flow =>
+                lower_bind ManagedResult ManagedResult (managed_compare MirEqual count (managed_bits MirUSize 0)
+                  (managed_with_flow after_cell flow))
+                  (fun (tested : ManagedResult) => match tested with | ManagedResultOf empty after_test =>
+                    lower_bind ManagedResult ManagedResult (step scope zero_branch
+                      (managed_switch_block zero (MirBranch empty zero successor) after_test))
+                      (fun (zero_result : ManagedResult) => match zero_result with | ManagedResultOf value after_zero =>
+                        lower_bind ManagedResult ManagedResult (managed_nat_predecessor compiler scrutinee
+                          (managed_switch_block successor (MirJump finish) (managed_emit (MirMove result value) after_zero)))
+                          (fun (prior : ManagedResult) => match prior with | ManagedResultOf predecessor after_prior =>
+                            lower_map ManagedResult ManagedResult (fun (selected : ManagedResult) => match selected with
+                              | ManagedResultOf answer after_successor => ManagedResultOf (MirUse result)
+                                  (managed_switch_block finish (MirJump finish)
+                                    (managed_emit (MirMove result answer) after_successor)) end)
+                              (managed_nat_selected step scope successor_branch predecessor after_prior) end) end) end) end) end) end);
+
+def managed_nat_case_body (compiler : ManagedCompiler) (step : ManagedStep) (scope : ManagedScope)
+    (info : CaseInfo) (scrutinee : MirValue) (branches : List CoreTerm) (state : ManagedState)
+    : Either NativeLowerError ManagedResult :=
+    match info with | MkCaseInfo family parameters arities =>
+      lower_bind (Pair Nat Nat) ManagedResult (lower_pair Nat arities)
+        (fun (counts : Pair Nat Nat) => match counts with | MkPair zero successor =>
+          lower_bind Unit ManagedResult (lower_require (andb (eqNat parameters 0)
+            (andb (eqNat zero 0) (eqNat successor 1))) (LowerInvalidCall family))
+            (fun (_ : Unit) => lower_bind (Pair CoreTerm CoreTerm) ManagedResult (lower_pair CoreTerm branches)
+              (fun (bodies : Pair CoreTerm CoreTerm) => match bodies with | MkPair zero_branch successor_branch =>
+                managed_nat_case_arms compiler step scope scrutinee zero_branch successor_branch state end)) end) end;
+
+def managed_case_expression (compiler : ManagedCompiler) (step : ManagedStep) (fuel : Nat) (scope : ManagedScope)
+    (info : CaseInfo) (scrutinee : CoreTerm) (branches : List CoreTerm) (state : ManagedState)
+    : Either NativeLowerError ManagedResult :=
+    lower_bind ManagedResult ManagedResult (step scope scrutinee state)
+      (fun (result : ManagedResult) => match result with | ManagedResultOf value next =>
+        match info with | MkCaseInfo family _ _ =>
+          match lower_is_role (managed_compiler_entries compiler) (CInd family) PrimitiveNatRole with
+          | True => managed_nat_case_body compiler step scope info value branches next
+          | False => managed_case_body compiler step fuel scope info value branches next end end end);

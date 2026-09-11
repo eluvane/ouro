@@ -1,0 +1,353 @@
+-- Windows x64 PE32+ image model and bounded byte/layout operations.
+-- Specification: https://learn.microsoft.com/windows/win32/debug/pe-format
+-- No host IO is used here. Offsets are mathematical Nat values in the previous
+-- compiler's dialect; serialized fields and image bounds are checked explicitly.
+
+import "x64.ouro";
+
+inductive PeSection : Type :=
+  | PeText : PeSection
+  | PeReadOnly : PeSection
+  | PeWritable : PeSection
+  | PeImports : PeSection
+  | PeExceptions : PeSection
+  | PeUnwindData : PeSection
+  | PeFunctionMap : PeSection
+  | PeRelocations : PeSection;
+
+inductive PeSymbol : Type :=
+  | PeNamedSymbol : Nat -> PeSection -> Nat -> PeSymbol;
+
+-- Import IDs name IAT slots, not the imported function's eventual address.
+-- Library and function names are nonempty ASCII without a terminating NUL.
+inductive PeImport : Type :=
+  | PeNamedImport : Nat -> List Nat -> PeImport;
+
+inductive PeLibrary : Type :=
+  | PeImportLibrary : List Nat -> List PeImport -> PeLibrary;
+
+inductive PeTarget : Type :=
+  | PeSymbolTarget : Nat -> PeTarget
+  | PeImportTarget : Nat -> PeTarget;
+
+-- For Rel32, the second offset is the end of the containing instruction, not
+-- necessarily the end of the four-byte field. Fixup slots must initially be zero.
+-- Fixups must be ordered by section, then offset, without overlapping fields.
+inductive PeFixup : Type :=
+  | PeRel32 : PeSection -> Nat -> Nat -> PeTarget -> PeFixup
+  | PeRva32 : PeSection -> Nat -> PeTarget -> PeFixup
+  | PeVa64 : PeSection -> Nat -> PeTarget -> PeFixup;
+
+-- Supported prologs push each listed nonvolatile GPR, then subtract allocation
+-- bytes from RSP with the x64 encoder's imm32 form. No frame pointer is used.
+-- A call frame reserves at least 32 bytes of shadow space and aligns RSP to 16.
+-- Frames >= one page use PeProbedFrame: mov EAX,allocation; call probe;
+-- sub RSP,RAX. The displacement is measured from the helper-call return PC.
+-- The codegen-owned helper preserves RAX/arguments/nonvolatile registers.
+-- Leaf/body/epilog correctness remains the checked MIR/codegen's responsibility.
+inductive PeFrame : Type :=
+  | PeLeaf : PeFrame
+  | PeCallFrame : List X64Register -> Nat -> PeFrame
+  | PeProbedFrame : List X64Register -> Nat -> X64Displacement -> PeFrame;
+
+inductive PeFunction : Type :=
+  | PeCodeFunction : Nat -> Nat -> List Nat -> PeFrame -> PeFunction;
+
+-- Function ID refers to a text symbol; size excludes any following function.
+-- Functions must be in address order and their ranges must not overlap.
+inductive PeProgram : Type :=
+  | PeProgramParts : List Nat -> List Nat -> List Nat -> List PeSymbol
+      -> List PeLibrary -> List PeFixup -> List PeFunction -> Nat -> PeProgram;
+
+inductive PeError : Type :=
+  | PeInvalidByte : Nat -> PeError
+  | PeImageTooLarge : PeError
+  | PeEmptyText : PeError
+  | PeDuplicateSymbol : Nat -> PeError
+  | PeMissingSymbol : Nat -> PeError
+  | PeInvalidSymbol : Nat -> PeError
+  | PeInvalidName : PeError
+  | PeDuplicateLibrary : PeError
+  | PeDuplicateImport : Nat -> PeError
+  | PeMissingImport : Nat -> PeError
+  | PeEmptyLibrary : PeError
+  | PeInvalidFixup : Nat -> PeError
+  | PeUnorderedFixup : Nat -> PeError
+  | PeNonzeroFixup : Nat -> PeError
+  | PeRelativeOverflow : Nat -> PeError
+  | PeMissingEntry : Nat -> PeError
+  | PeInvalidFunction : Nat -> PeError
+  | PeUnorderedFunction : Nat -> PeError
+  | PeUnsupportedFrame : Nat -> PeError
+  | PeStackProbeRequired : Nat -> PeError
+  | PePrologMismatch : Nat -> PeError
+  | PeInstructionError : X64EncodeError -> PeError;
+
+inductive PePlacedSection : Type :=
+  | PeSectionAt : PeSection -> Nat -> Nat -> Nat -> List Nat -> PePlacedSection;
+
+-- SectionAt contains kind, RVA, file offset, rounded raw size, and unpadded data.
+inductive PeLayout : Type :=
+  | PeLayoutAt : Nat -> Nat -> List PePlacedSection -> PeLayout;
+
+inductive PeFunctionAddress : Type :=
+  | PeFunctionAt : Nat -> Nat -> Nat -> List Nat -> PeFunctionAddress;
+
+inductive PeImage : Type :=
+  | PeImageFile : List Nat -> List PeFunctionAddress -> PeImage;
+
+def pe_file_alignment : Nat := mul 2 256;
+def pe_section_alignment : Nat := mul 16 256;
+def pe_header_size : Nat := mul 4 256;
+def pe_byte2_place : Nat := mul 256 256;
+def pe_byte3_place : Nat := mul 256 pe_byte2_place;
+-- PE32+ images are smaller than 2 GiB; keep all RVAs in that range.
+def pe_max_rva : Nat := add (mul 127 pe_byte3_place) (sub pe_byte3_place 1);
+-- Image stack, not an RVA. Matches the Windows producer `--stack,2147483648`.
+def pe_stack_reserve : Nat := mul 128 pe_byte3_place;
+
+def pe_section_code (section : PeSection) : Nat :=
+    match section with
+    | PeText => 0 | PeReadOnly => 1 | PeWritable => 2 | PeImports => 3
+    | PeExceptions => 4 | PeUnwindData => 5 | PeFunctionMap => 6 | PeRelocations => 7
+    end;
+
+def pe_section_equal (left : PeSection) (right : PeSection) : Bool :=
+    eq_nat (pe_section_code left) (pe_section_code right);
+
+def pe_input_section (section : PeSection) : Bool := ltb_nat (pe_section_code section) 3;
+
+def pe_zeros : Nat -> List Nat :=
+  fix pe_zeros (count : Nat) : List Nat :=
+    match count with | Z => ([] : List Nat) | S rest => Cons Nat 0 (pe_zeros rest) end;
+
+def pe_join : List (List Nat) -> List Nat :=
+  fix pe_join (parts : List (List Nat)) : List Nat :=
+    match parts with | Nil => ([] : List Nat) | Cons part rest => append Nat part (pe_join rest) end;
+
+def pe_bytes_equal (left : List Nat) (right : List Nat) : Bool :=
+    andb (eq_nat (length Nat left) (length Nat right))
+      (foldr (Pair Nat Nat) Bool
+        (fun (pair : Pair Nat Nat) (equal : Bool) =>
+          match pair with | MkPair a b => andb (eq_nat a b) equal end)
+        True (zip Nat Nat left right));
+
+def pe_byte_error (err : X64EncodeError) : PeError :=
+    match err with
+    | X64ByteOutOfRange byte => PeInvalidByte byte
+    | X64DisplacementOutOfRange => PeInstructionError err
+    | X64StackPointerIndex => PeInstructionError err
+    | X64ShiftOutOfRange _ _ => PeInstructionError err end;
+
+-- A whole section can be much larger than an instruction's byte list. Keep
+-- the encoder check's recursion bounded, preserving byte/error order and the
+-- original immutable list. Each nonempty chunk consumes at least one byte.
+-- The default runner evaluates the same pure chunk check immediately.
+-- A development host can bound its temporary allocations around this thunk.
+def pe_run_byte_check (work : Unit -> Either PeError (List Nat)) : Either PeError (List Nat) :=
+    work MkUnit;
+
+def pe_check_byte_chunk (bytes : List Nat) : Either PeError Unit :=
+    match x64_validate_bytes bytes with
+    | Left error => Left PeError Unit (pe_byte_error error)
+    | Right _ => Right PeError Unit MkUnit end;
+
+-- A partial application captures only this chunk's size and remaining bytes.
+-- Computing the suffix in the same thunk lets a host release its traversal
+-- temporaries and retain the suffix with the checked chunk's result.
+def pe_check_byte_step (chunk : Nat) (remaining : List Nat) (_ : Unit) : Either PeError (List Nat) :=
+    match pe_check_byte_chunk (take Nat chunk remaining) with
+    | Left error => Left PeError (List Nat) error
+    | Right _ => Right PeError (List Nat) (drop Nat chunk remaining) end;
+
+def pe_check_bytes_with
+    (run_check : (Unit -> Either PeError (List Nat)) -> Either PeError (List Nat))
+    (bytes : List Nat) : Either PeError (List Nat) :=
+    let chunk : Nat := mul 4 256 in
+    mapRight PeError Unit (List Nat) (fun (_ : Unit) => bytes)
+      ((fix check (fuel : Nat) (remaining : List Nat) : Either PeError Unit :=
+        match remaining with | Nil => Right PeError Unit MkUnit
+        | Cons _ _ => match fuel with | Z => Left PeError Unit PeImageTooLarge
+          | S next => match run_check (pe_check_byte_step chunk remaining) with
+            | Left error => Left PeError Unit error
+            | Right suffix => check next suffix end end end)
+        (length Nat bytes) bytes);
+
+def pe_check_bytes (bytes : List Nat) : Either PeError (List Nat) :=
+    pe_check_bytes_with pe_run_byte_check bytes;
+
+def pe_ascii_name : List Nat -> Bool :=
+  fix pe_ascii_name (name : List Nat) : Bool :=
+    match name with
+    | Nil => True
+    | Cons byte rest => andb (andb (ltb_nat 0 byte) (ltb_nat byte 128)) (pe_ascii_name rest)
+    end;
+
+def pe_name_valid (name : List Nat) : Bool :=
+    andb (ltb_nat 0 (length Nat name)) (pe_ascii_name name);
+
+def pe_lower_ascii (byte : Nat) : Nat :=
+    match andb (leb_nat 65 byte) (leb_nat byte 90) with | True => add byte 32 | False => byte end;
+
+def pe_library_equal (left : List Nat) (right : List Nat) : Bool :=
+    pe_bytes_equal (map Nat Nat pe_lower_ascii left) (map Nat Nat pe_lower_ascii right);
+
+def pe_align (alignment : Nat) (value : Nat) : Nat :=
+    let remainder : Nat := mod_nat value alignment in
+    match remainder with | Z => value | S _ => add value (sub alignment remainder) end;
+
+-- Extract a base-256 digit with at most 255 subtractions. This avoids dividing
+-- a large RVA by 256 using the previous dialect's linear div_nat implementation.
+def pe_digit (value : Nat) (place : Nat) : Pair Nat Nat :=
+    (fix go (fuel : Nat) (rest : Nat) (digit : Nat) : Pair Nat Nat :=
+      match fuel with
+      | Z => MkPair Nat Nat digit rest
+      | S next =>
+        match ltb_nat rest place with
+        | True => MkPair Nat Nat digit rest
+        | False => go next (sub rest place) (S digit)
+        end
+      end) 255 value 0;
+
+def pe_word32 (value : Nat) : X64Word32 :=
+    match pe_digit value pe_byte3_place with
+    | MkPair byte3 rest3 =>
+      match pe_digit rest3 pe_byte2_place with
+      | MkPair byte2 rest2 =>
+        match pe_digit rest2 256 with
+        | MkPair byte1 byte0 => X64Bytes32 byte0 byte1 byte2 byte3
+        end
+      end
+    end;
+
+-- Internal field emitters follow validation of the enclosing layout/table.
+def pe_le32 (value : Nat) : List Nat :=
+    match pe_word32 value with | X64Bytes32 a b c d => ([a, b, c, d] : List Nat) end;
+
+def pe_le16 (value : Nat) : List Nat :=
+    match pe_digit value 256 with | MkPair high low => ([low, high] : List Nat) end;
+
+def pe_le64_rva (value : Nat) : List Nat := append Nat (pe_le32 value) (pe_zeros 4);
+
+-- The fixed preferred image base is 0x0000000140000000. Since RVAs are <2 GiB,
+-- adding them cannot carry beyond byte 3 or overflow this 64-bit base address.
+def pe_va64 (rva : Nat) : List Nat :=
+    match pe_word32 rva with | X64Bytes32 a b c d => ([a, b, c, add d 64, 1, 0, 0, 0] : List Nat) end;
+
+def pe_pad (alignment : Nat) (bytes : List Nat) : List Nat :=
+    let size : Nat := length Nat bytes in
+    append Nat bytes (pe_zeros (sub (pe_align alignment size) size));
+
+def pe_symbol_id (symbol : PeSymbol) : Nat :=
+    match symbol with | PeNamedSymbol name _ _ => name end;
+
+def pe_find_symbol (name : Nat) : List PeSymbol -> Maybe PeSymbol :=
+  fix pe_find_symbol (symbols : List PeSymbol) : Maybe PeSymbol :=
+    match symbols with
+    | Nil => Nothing PeSymbol
+    | Cons symbol rest =>
+      match eq_nat name (pe_symbol_id symbol) with | True => Just PeSymbol symbol | False => pe_find_symbol rest end
+    end;
+
+def pe_find_section (kind : PeSection) : List PePlacedSection -> Maybe PePlacedSection :=
+  fix pe_find_section (sections : List PePlacedSection) : Maybe PePlacedSection :=
+    match sections with
+    | Nil => Nothing PePlacedSection
+    | Cons section rest =>
+      match section with
+      | PeSectionAt tag _ _ _ _ =>
+        match pe_section_equal kind tag with | True => Just PePlacedSection section | False => pe_find_section rest end
+      end
+    end;
+
+def pe_layout_empty : PeLayout := PeLayoutAt pe_section_alignment pe_header_size ([] : List PePlacedSection);
+
+def pe_advance (alignment : Nat) (start : Nat) (size : Nat) : Either PeError Nat :=
+    match andb (leb_nat start pe_max_rva) (leb_nat size (sub pe_max_rva alignment)) with
+    | False => Left PeError Nat PeImageTooLarge
+    | True =>
+      let rounded : Nat := pe_align alignment (maxNat 1 size) in
+      match leb_nat rounded (sub pe_max_rva start) with
+      | False => Left PeError Nat PeImageTooLarge
+      | True => Right PeError Nat (add start rounded)
+      end
+    end;
+
+def pe_place_section (layout : PeLayout) (kind : PeSection) (bytes : List Nat) : Either PeError PeLayout :=
+    match layout with
+    | PeLayoutAt next_rva next_file sections =>
+      let size : Nat := length Nat bytes in
+      match pe_advance pe_section_alignment next_rva size with
+      | Left err => Left PeError PeLayout err
+      | Right end_rva =>
+        match pe_advance pe_file_alignment next_file size with
+        | Left err => Left PeError PeLayout err
+        | Right end_file => Right PeError PeLayout
+            (PeLayoutAt end_rva end_file
+              (append PePlacedSection sections ([PeSectionAt kind next_rva next_file (sub end_file next_file) bytes] : List PePlacedSection)))
+        end
+      end
+    end;
+
+def pe_layout_sections (layout : PeLayout) : List PePlacedSection :=
+    match layout with | PeLayoutAt _ _ sections => sections end;
+
+def pe_layout_rva (layout : PeLayout) : Nat := match layout with | PeLayoutAt rva _ _ => rva end;
+
+def pe_section_measure (section : PePlacedSection) : Pair PePlacedSection Nat :=
+    match section with | PeSectionAt _ _ _ _ bytes => MkPair PePlacedSection Nat section (length Nat bytes) end;
+
+-- The ordinary lookup measures only the first matching original section.
+def pe_section_lookup (sections : List PePlacedSection) (kind : PeSection) : Maybe (Pair PePlacedSection Nat) :=
+    match pe_find_section kind sections with
+    | Nothing => Nothing (Pair PePlacedSection Nat)
+    | Just section => Just (Pair PePlacedSection Nat) (pe_section_measure section)
+    end;
+
+def pe_symbol_rva_with (lookup : PeSection -> Maybe (Pair PePlacedSection Nat))
+    (symbols : List PeSymbol) (name : Nat) : Either PeError Nat :=
+    match pe_find_symbol name symbols with
+    | Nothing => Left PeError Nat (PeMissingSymbol name)
+    | Just symbol =>
+      match symbol with
+      | PeNamedSymbol _ kind offset =>
+        match andb (pe_input_section kind) (leb_nat offset pe_max_rva) with
+        | False => Left PeError Nat (PeInvalidSymbol name)
+        | True =>
+          match lookup kind with
+          | Nothing => Left PeError Nat (PeInvalidSymbol name)
+          | Just measured => match measured with | MkPair section size =>
+            match section with
+            | PeSectionAt _ rva _ _ _ =>
+              match ltb_nat offset size with
+              | False => Left PeError Nat (PeInvalidSymbol name)
+              | True => Right PeError Nat (add rva offset)
+              end
+            end
+          end end
+        end
+      end
+    end;
+
+def pe_symbol_rva (sections : List PePlacedSection) (symbols : List PeSymbol) (name : Nat) : Either PeError Nat :=
+    pe_symbol_rva_with (pe_section_lookup sections) symbols name;
+
+def pe_validate_symbols (sections : List PePlacedSection) : List PeSymbol -> Either PeError Unit :=
+  fix pe_validate_symbols (symbols : List PeSymbol) : Either PeError Unit :=
+    match symbols with
+    | Nil => Right PeError Unit MkUnit
+    | Cons symbol rest =>
+      let name : Nat := pe_symbol_id symbol in
+      match pe_find_symbol name rest with
+      | Just _ => Left PeError Unit (PeDuplicateSymbol name)
+      | Nothing =>
+        match leb_nat name pe_max_rva with
+        | False => Left PeError Unit (PeInvalidSymbol name)
+        | True =>
+          match pe_symbol_rva sections symbols name with
+          | Left err => Left PeError Unit err
+          | Right _ => pe_validate_symbols rest
+          end
+        end
+      end
+    end;

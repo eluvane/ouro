@@ -1,0 +1,244 @@
+-- Direct Windows x86-64 PE32+ writer. No COFF objects, assembler, linker, CRT,
+-- process invocation, or host filesystem primitive participates in this module.
+-- The caller supplies checked code/data; this writer owns the executable image.
+-- Ordinary binary output is the caller's responsibility.
+
+import "pe_fixups.ouro";
+import "pe_unwind.ouro";
+
+def pe_section_name (kind : PeSection) : List Nat :=
+    match kind with
+    | PeText => ([46, 116, 101, 120, 116, 0, 0, 0] : List Nat)
+    | PeReadOnly => ([46, 114, 100, 97, 116, 97, 0, 0] : List Nat)
+    | PeWritable => ([46, 100, 97, 116, 97, 0, 0, 0] : List Nat)
+    | PeImports => ([46, 105, 100, 97, 116, 97, 0, 0] : List Nat)
+    | PeExceptions => ([46, 112, 100, 97, 116, 97, 0, 0] : List Nat)
+    | PeUnwindData => ([46, 120, 100, 97, 116, 97, 0, 0] : List Nat)
+    | PeFunctionMap => ([46, 111, 117, 114, 111, 109, 97, 112] : List Nat)
+    | PeRelocations => ([46, 114, 101, 108, 111, 99, 0, 0] : List Nat)
+    end;
+
+def pe_section_characteristics (kind : PeSection) : List Nat :=
+    match kind with
+    | PeText => ([32, 0, 0, 96] : List Nat)
+    | PeWritable => ([64, 0, 0, 192] : List Nat)
+    | PeImports => ([64, 0, 0, 192] : List Nat)
+    | PeRelocations => ([64, 0, 0, 66] : List Nat)
+    | PeReadOnly => ([64, 0, 0, 64] : List Nat)
+    | PeExceptions => ([64, 0, 0, 64] : List Nat)
+    | PeUnwindData => ([64, 0, 0, 64] : List Nat)
+    | PeFunctionMap => ([64, 0, 0, 64] : List Nat)
+    end;
+
+def pe_section_header (section : PePlacedSection) : List Nat :=
+    match section with
+    | PeSectionAt kind rva raw raw_size bytes =>
+      pe_join ([pe_section_name kind, pe_le32 (maxNat 1 (length Nat bytes)), pe_le32 rva,
+        pe_le32 raw_size, pe_le32 raw, pe_zeros 12, pe_section_characteristics kind] : List (List Nat))
+    end;
+
+def pe_directory (rva : Nat) (size : Nat) : List Nat :=
+    match size with | Z => pe_zeros 8 | S _ => append Nat (pe_le32 rva) (pe_le32 size) end;
+
+def pe_section_directory (kind : PeSection) (sections : List PePlacedSection) : List Nat :=
+    match pe_find_section kind sections with
+    | Nothing => pe_zeros 8
+    | Just section => match section with | PeSectionAt _ rva _ _ bytes => pe_directory rva (length Nat bytes) end
+    end;
+
+def pe_directories (sections : List PePlacedSection) (imports : PeImportTable) : List Nat :=
+    match imports with
+    | PeImportTableData _ _ iat_rva iat_size descriptor_size =>
+      let import_directory : List Nat :=
+        match pe_find_section PeImports sections with
+        | Nothing => pe_zeros 8
+        | Just section => match section with | PeSectionAt _ rva _ _ _ => pe_directory rva descriptor_size end
+        end in
+      pe_join ([pe_zeros 8, import_directory, pe_zeros 8, pe_section_directory PeExceptions sections,
+        pe_zeros 8, pe_section_directory PeRelocations sections, pe_zeros 48,
+        pe_directory iat_rva iat_size, pe_zeros 24] : List (List Nat))
+    end;
+
+def pe_initialized_size (sections : List PePlacedSection) : Nat :=
+    foldr PePlacedSection Nat
+      (fun (section : PePlacedSection) (size : Nat) =>
+        match section with
+        | PeSectionAt kind _ _ raw_size _ =>
+          match pe_section_equal kind PeText with | True => size | False => add raw_size size end
+        end) 0 sections;
+
+def pe_optional_header (layout : PeLayout) (entry : Nat) (text_rva : Nat)
+    (text_size : Nat) (imports : PeImportTable) : List Nat :=
+    pe_join
+      ([ ([11, 2, 0, 0] : List Nat)
+       , pe_le32 text_size, pe_le32 (pe_initialized_size (pe_layout_sections layout)), pe_zeros 4
+       , pe_le32 entry, pe_le32 text_rva
+       , ([0, 0, 0, 64, 1, 0, 0, 0] : List Nat)
+       , pe_le32 pe_section_alignment, pe_le32 pe_file_alignment
+       , ([6, 0, 0, 0, 0, 0, 0, 0, 6, 0, 0, 0] : List Nat)
+       , pe_zeros 4, pe_le32 (pe_layout_rva layout), pe_le32 pe_header_size, pe_zeros 4
+       , ([3, 0, 96, 129] : List Nat)
+       , pe_le64_rva pe_stack_reserve, pe_le64_rva pe_section_alignment
+       , ([0, 0, 16, 0, 0, 0, 0, 0] : List Nat), pe_le64_rva pe_section_alignment
+       , pe_zeros 4, pe_le32 16, pe_directories (pe_layout_sections layout) imports
+       ] : List (List Nat));
+
+-- 64-byte MZ header and a DOS stub that returns error status 1 (INT 21h/4Ch).
+-- Windows starts at the PE entry point; it never executes this 16-bit stub.
+def pe_dos_header : List Nat :=
+    pe_join
+      ([ ([77, 90, 128, 0, 1, 0, 0, 0, 4, 0, 0, 0, 255, 255, 0, 0,
+           64, 0, 0, 0, 0, 0, 0, 0, 64, 0, 0, 0] : List Nat)
+       , pe_zeros 32, pe_le32 128, ([184, 1, 76, 205, 33] : List Nat), pe_zeros 59
+       ] : List (List Nat));
+
+def pe_file_header : List Nat :=
+    pe_join ([([80, 69, 0, 0, 100, 134, 8, 0] : List Nat), pe_zeros 12,
+      ([240, 0, 34, 0] : List Nat)] : List (List Nat));
+
+def pe_section_payload (section : PePlacedSection) : List Nat :=
+    match section with
+    | PeSectionAt _ _ _ raw_size bytes => append Nat bytes (pe_zeros (sub raw_size (length Nat bytes)))
+    end;
+
+def pe_serialize_image_with
+    (run_check : (Unit -> Either PeError (List Nat)) -> Either PeError (List Nat))
+    (layout : PeLayout) (entry : Nat) (imports : PeImportTable)
+    (addresses : List PeFunctionAddress) : Either PeError PeImage :=
+    let sections : List PePlacedSection := pe_layout_sections layout in
+    match pe_find_section PeText sections with
+    | Nothing => Left PeError PeImage PeEmptyText
+    | Just text =>
+      match text with
+      | PeSectionAt _ text_rva _ text_size _ =>
+        let headers : List Nat := pe_pad pe_file_alignment
+          (pe_join ([pe_dos_header, pe_file_header, pe_optional_header layout entry text_rva text_size imports,
+            pe_join (map PePlacedSection (List Nat) pe_section_header sections)] : List (List Nat))) in
+        match andb (eq_nat (length PePlacedSection sections) 8) (eq_nat (length Nat headers) pe_header_size) with
+        | False => Left PeError PeImage PeImageTooLarge
+        | True => mapRight PeError (List Nat) PeImage
+            (fun (bytes : List Nat) => PeImageFile bytes addresses)
+            (pe_check_bytes_with run_check (append Nat headers (pe_join (map PePlacedSection (List Nat) pe_section_payload sections))))
+        end
+      end
+    end;
+
+-- Validation and placement consume the same immutable input arrays. Splitting
+-- their composition lets a development host release checking temporaries;
+-- neither this Unit result nor an internal layout is program acceptance.
+def pe_validate_input_with
+    (run_check : (Unit -> Either PeError (List Nat)) -> Either PeError (List Nat))
+    (text : List Nat) (read_only : List Nat) (writable : List Nat) : Either PeError Unit :=
+    match text with
+    | Nil => Left PeError Unit PeEmptyText
+    | Cons _ _ => match pe_check_bytes_with run_check text with
+      | Left err => Left PeError Unit err
+      | Right _ => match pe_check_bytes_with run_check read_only with
+        | Left err => Left PeError Unit err
+        | Right _ => match pe_check_bytes_with run_check writable with
+          | Left err => Left PeError Unit err
+          | Right _ => Right PeError Unit MkUnit end end end end;
+
+def pe_validate_input (text : List Nat) (read_only : List Nat) (writable : List Nat) : Either PeError Unit :=
+    pe_validate_input_with pe_run_byte_check text read_only writable;
+
+def pe_place_input (text : List Nat) (read_only : List Nat) (writable : List Nat) : Either PeError PeLayout :=
+    match pe_place_section pe_layout_empty PeText text with
+    | Left err => Left PeError PeLayout err
+    | Right text_layout => match pe_place_section text_layout PeReadOnly read_only with
+      | Left err => Left PeError PeLayout err
+      | Right data_layout => pe_place_section data_layout PeWritable writable end end;
+
+def pe_input_layout (text : List Nat) (read_only : List Nat) (writable : List Nat) : Either PeError PeLayout :=
+    match pe_validate_input text read_only writable with
+    | Left err => Left PeError PeLayout err
+    | Right _ => pe_place_input text read_only writable end;
+
+def pe_place_metadata (layout : PeLayout) (pdata : List Nat) (xdata : List Nat)
+    (names : List Nat) (relocations : List Nat) : Either PeError PeLayout :=
+    match pe_place_section layout PeExceptions pdata with
+    | Left err => Left PeError PeLayout err
+    | Right exception_layout =>
+      match pe_place_section exception_layout PeUnwindData xdata with
+      | Left err => Left PeError PeLayout err
+      | Right unwind_layout =>
+        match pe_place_section unwind_layout PeFunctionMap names with
+        | Left err => Left PeError PeLayout err
+        | Right map_layout => pe_place_section map_layout PeRelocations relocations
+        end
+      end
+    end;
+
+def pe_complete_image_with
+    (run_check : (Unit -> Either PeError (List Nat)) -> Either PeError (List Nat))
+    (layout : PeLayout) (entry : Nat) (imports : PeImportTable)
+    (functions : List PeFunctionInfo) (relocations : List Nat) : Either PeError PeImage :=
+    let function_count : Nat := length PeFunctionInfo functions in
+    match pe_advance pe_section_alignment (pe_layout_rva layout) (mul 12 function_count) with
+    | Left err => Left PeError PeImage err
+    | Right xdata_rva =>
+      match pe_encode_function_tables functions xdata_rva with
+      | PeFunctionTablesData pdata xdata map_entries addresses =>
+        let names : List Nat := append Nat (pe_function_map_header function_count) map_entries in
+        match pe_place_metadata layout pdata xdata names relocations with
+        | Left err => Left PeError PeImage err
+        | Right complete_layout => pe_serialize_image_with run_check complete_layout entry imports addresses
+        end
+      end
+    end;
+
+def pe_complete_image (layout : PeLayout) (entry : Nat) (imports : PeImportTable)
+    (functions : List PeFunctionInfo) (relocations : List Nat) : Either PeError PeImage :=
+    pe_complete_image_with pe_run_byte_check layout entry imports functions relocations;
+
+def pe_link_program (layout : PeLayout) (symbols : List PeSymbol) (imports : PeImportTable)
+    (fixups : List PeFixup) (functions : List PeFunction) (entry : Nat) : Either PeError PeImage :=
+    match imports with
+    | PeImportTableData _ targets _ _ _ =>
+      match pe_plan_fixups (pe_layout_sections layout) symbols targets fixups with
+      | Left err => Left PeError PeImage err
+      | Right patches =>
+        let patched_layout : PeLayout := pe_apply_patches layout patches in
+        match pe_collect_functions (pe_layout_sections patched_layout) symbols functions with
+        | Left err => Left PeError PeImage err
+        | Right checked_functions =>
+          match pe_entry_rva entry checked_functions with
+          | Left err => Left PeError PeImage err
+          | Right entry_rva =>
+            match pe_build_relocations (pe_layout_sections patched_layout) patches with
+            | Left err => Left PeError PeImage err
+            | Right relocations => pe_complete_image patched_layout entry_rva imports checked_functions relocations
+            end
+          end
+        end
+      end
+    end;
+
+def pe_prepare_imports (layout : PeLayout) (symbols : List PeSymbol) (libraries : List PeLibrary)
+    (fixups : List PeFixup) (functions : List PeFunction) (entry : Nat) : Either PeError PeImage :=
+    match pe_validate_symbols (pe_layout_sections layout) symbols with
+    | Left err => Left PeError PeImage err
+    | Right _ =>
+      match pe_build_imports (pe_layout_rva layout) libraries with
+      | Left err => Left PeError PeImage err
+      | Right imports =>
+        match imports with
+        | PeImportTableData bytes _ _ _ _ =>
+          match pe_place_section layout PeImports bytes with
+          | Left err => Left PeError PeImage err
+          | Right import_layout => pe_link_program import_layout symbols imports fixups functions entry
+          end
+        end
+      end
+    end;
+
+-- Public image writer: malformed data, unresolved symbols, invalid unwind
+-- descriptions, and out-of-range patches return an error without image bytes.
+def pe_write_image (program : PeProgram) : Either PeError PeImage :=
+    match program with
+    | PeProgramParts text read_only writable symbols libraries fixups functions entry =>
+      match pe_input_layout text read_only writable with
+      | Left err => Left PeError PeImage err
+      | Right layout => pe_prepare_imports layout symbols libraries fixups functions entry
+      end
+    end;

@@ -1,0 +1,93 @@
+-- The original frontier construction, fuel and error order are retained
+-- as an oracle for the internal monotone-set convergence optimization.
+import "native_mir_validation_tests.ouro";
+
+def mir_reach_reference (fuel : Nat) (entry : Nat) (blocks : List MirBlock) : Either MirError Unit :=
+    (fix go (remaining : Nat) (seen : List Nat) : Either MirError Unit :=
+      match remaining with | Z => Left MirError Unit MirResourceExhausted | S next =>
+        let reached : List Nat := foldr MirBlock (List Nat)
+          (fun (block : MirBlock) (ids : List Nat) => match mir_has (mir_block_id block) seen with
+            | False => ids | True => mir_union (mir_successors block) ids end) seen blocks in
+        match mir_set_equal reached seen with
+        | False => go next reached
+        | True => mir_each MirBlock (fun (block : MirBlock) =>
+            mir_require (mir_has (mir_block_id block) reached) (MirUnreachableBlock (mir_block_id block))) blocks end end)
+      fuel ([entry] : List Nat);
+
+def mir_reach_result_text (result : Either MirError Unit) : String :=
+    match result with | Right _ => "accepted" | Left error => mir_test_error_text error end;
+
+def mir_reach_equivalent (fuel : Nat) (entry : Nat) (blocks : List MirBlock) : Bool :=
+    str_eq (mir_reach_result_text (mir_reach_reference fuel entry blocks))
+      (mir_reach_result_text (mir_reachable fuel entry blocks));
+
+def mir_reach_all_fuels (entry : Nat) (blocks : List MirBlock) : Bool :=
+    all Nat (fun (fuel : Nat) => mir_reach_equivalent fuel entry blocks) ([0, 1, 2, 3, 4, 5, 6, 7, 8] : List Nat);
+
+def mir_reach_same (name : String) (entry : Nat) (blocks : List MirBlock) : Test :=
+    assert_true name (mir_reach_all_fuels entry blocks);
+
+def mir_reach_block (id : Nat) (term : MirTerminator) : MirBlock :=
+    MirBlockDef id ([] : List MirInstruction) term;
+
+def mir_reach_linear : List MirBlock :=
+    [mir_reach_block 0 (MirJump 1), mir_reach_block 1 (MirJump 2),
+      mir_reach_block 2 (MirJump 3), mir_reach_block 3 MirTrap];
+
+def mir_reach_diamond : List MirBlock :=
+    [mir_reach_block 0 (MirBranch (mir_fixture_nat MirU8 1) 1 2),
+      mir_reach_block 1 (MirJump 3), mir_reach_block 2 (MirJump 3), mir_reach_block 3 MirTrap];
+
+def mir_reach_cycle : List MirBlock :=
+    [mir_reach_block 0 (MirJump 1), mir_reach_block 1 (MirJump 2), mir_reach_block 2 (MirJump 0)];
+
+def mir_reach_terms : List MirTerminator := [MirTrap, MirJump 0, MirJump 1, MirJump 2];
+
+def mir_reach_graph_family : Bool :=
+    all MirTerminator (fun (first : MirTerminator) =>
+      all MirTerminator (fun (second : MirTerminator) =>
+        all MirTerminator (fun (third : MirTerminator) =>
+          let blocks : List MirBlock := [mir_reach_block 0 first, mir_reach_block 1 second, mir_reach_block 2 third] in
+          andb (andb (mir_reach_all_fuels 0 blocks) (mir_reach_all_fuels 2 blocks))
+            (andb (mir_reach_all_fuels 0 (reverse MirBlock blocks))
+              (mir_reach_all_fuels 2 (reverse MirBlock blocks)))) mir_reach_terms) mir_reach_terms) mir_reach_terms;
+
+def native_mir_reachability_tests : List Test :=
+    [mir_reach_same "Reachability retains every fuel boundary on a forward path" 0 mir_reach_linear,
+      mir_reach_same "Reachability retains every fuel boundary with reversed blocks" 0 (reverse MirBlock mir_reach_linear),
+      mir_reach_same "Reachability preserves diamond joins" 0 mir_reach_diamond,
+      mir_reach_same "Reachability preserves cyclic frontiers" 0 mir_reach_cycle,
+      mir_reach_same "Reachability preserves unreachable block rejection" 0
+        (append MirBlock mir_reach_cycle ([mir_reach_block 91 MirTrap, mir_reach_block 92 MirTrap] : List MirBlock)),
+      mir_reach_same "Reachability preserves unreachable error order after reversal" 0
+        (reverse MirBlock (append MirBlock mir_reach_cycle
+          ([mir_reach_block 91 MirTrap, mir_reach_block 92 MirTrap] : List MirBlock))),
+      mir_reach_same "Reachability keeps arbitrary-input unknown successor behavior" 0
+        ([mir_reach_block 0 (MirJump 99)] : List MirBlock),
+      mir_reach_same "Reachability deduplicates repeated branch successors" 0
+        ([mir_reach_block 0 (MirBranch (mir_fixture_nat MirU8 1) 1 1), mir_reach_block 1 MirTrap] : List MirBlock),
+      mir_reach_same "Reachability keeps arbitrary-input duplicate block behavior" 0
+        ([mir_reach_block 0 (MirJump 1), mir_reach_block 0 (MirJump 2),
+          mir_reach_block 1 MirTrap, mir_reach_block 2 MirTrap] : List MirBlock),
+      mir_reach_same "Reachability compares complete natural IDs" 256
+        ([mir_reach_block 256 (MirJump pe_byte2_place), mir_reach_block pe_byte2_place (MirJump (S pe_byte2_place)),
+          mir_reach_block (S pe_byte2_place) MirTrap] : List MirBlock),
+      mir_reach_same "Reachability keeps arbitrary-input empty graph behavior" 9 ([] : List MirBlock),
+      mir_reach_same "Reachability keeps arbitrary-input absent entry behavior" 9 mir_reach_linear,
+      mir_reach_same "Reachability preserves a self loop" 7 ([mir_reach_block 7 (MirJump 7)] : List MirBlock),
+      assert_true "Reachability matches 64 graphs, both block orders, two entries and nine fuels" mir_reach_graph_family,
+      assert_eq "Reachability still spends the final convergence step"
+        (mir_reach_result_text (mir_reachable 3 0 mir_reach_linear)) "resource",
+      assert_eq "Reachability accepts exactly sufficient frontier fuel"
+        (mir_reach_result_text (mir_reachable 4 0 mir_reach_linear)) "accepted",
+      assert_eq "Reachability preserves the first unreachable block ID"
+        (mir_reach_result_text (mir_reachable 8 0
+          (append MirBlock mir_reach_cycle ([mir_reach_block 91 MirTrap, mir_reach_block 92 MirTrap] : List MirBlock))))
+        "unreachable:91",
+      assert_eq "Reachability preserves the first unreachable block after reversal"
+        (mir_reach_result_text (mir_reachable 8 0
+          (reverse MirBlock (append MirBlock mir_reach_cycle
+            ([mir_reach_block 91 MirTrap, mir_reach_block 92 MirTrap] : List MirBlock))))) "unreachable:92"];
+
+-- @entry main
+def main : IO Unit := test_run native_mir_reachability_tests

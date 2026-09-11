@@ -1,0 +1,138 @@
+-- PE publication, byte preservation, rejected staging and cleanup use the
+-- same checked output owner as the native builder.
+
+import "analyze/precision/assertions.ouro";
+import "native_lower_fixtures.ouro";
+import "native_lower_constant_fixtures.ouro";
+import "../compiler/native/diagnostics.ouro";
+import "../tools/native_build_output.ouro";
+
+def native_build_write_path : String :=
+    "_build/native/write_tests/lower_constant_word.exe";
+
+def native_build_write_mz (bytes : List Nat) : Bool :=
+    match bytes with
+    | Cons a rest =>
+        match rest with
+        | Cons b _ => andb (eq_nat a 77) (eq_nat b 90)
+        | Nil => False
+        end
+    | Nil => False
+    end;
+
+def native_build_write_fail (name : String) (detail : String) : IO Unit :=
+    do eprintln detail;
+       precision_run name
+         ([ MkPair String Bool "compile-lower-constant-word" False
+          , MkPair String Bool "written-mz-header" False
+          ] : List (Pair String Bool))
+
+def native_build_write_error (result : Either FsError Unit) (code : String) : Bool :=
+    match result with
+    | Left e => prim_string_eq (fs_error_code e) code
+    | Right _ => False
+    end;
+
+def native_build_write_matches (path : String) (content : String) : IO Bool :=
+    do let! loaded := fs_read_checked path;
+       io_pure Bool
+         (match loaded with
+          | Left _ => False
+          | Right written => prim_string_eq written content
+          end)
+
+def native_build_write_rejected_stage (output : String) (staged : String)
+    (expected : String) (code : String) : IO Bool :=
+    do let! scratch := prim_fs_temp_file_in (native_build_dirname native_build_write_path);
+       match prim_string_eq scratch "" with
+       | True => io_pure Bool False
+       | False =>
+           do let! written := fs_write_checked scratch staged;
+              match written with
+              | Left e =>
+                  do eprintln (fs_error_message e);
+                     let! removed := fsx_remove_if_exists scratch;
+                     match removed with
+                     | Left cleanup => eprintln (fs_error_message cleanup)
+                     | Right _ => io_unit
+                     end;
+                     io_pure Bool False
+              | Right _ =>
+                  do let! rejected := native_build_commit_checked output scratch expected;
+                     let! remains := fs_exists scratch;
+                     io_pure Bool (andb (native_build_write_error rejected code) (notb remains))
+              end
+       end
+
+def native_build_write_checks (content : String) : IO Unit :=
+    do let! initial := native_build_publish_checked native_build_write_path "previous-image";
+       match initial with
+       | Left e => native_build_write_fail "native-build-write" (fs_error_message e)
+       | Right _ =>
+           do let! previous := native_build_write_matches native_build_write_path "previous-image";
+              let! published := native_build_publish_checked native_build_write_path content;
+              match published with
+              | Left e => native_build_write_fail "native-build-write" (fs_error_message e)
+              | Right _ =>
+                  do let! back := fs_read_checked native_build_write_path;
+                     let! empty := native_build_publish_checked "" content;
+                     let! directory := native_build_publish_checked
+                       (native_build_dirname native_build_write_path) content;
+                     let! blocked := native_build_publish_checked
+                       (str_concat native_build_write_path "/child.exe") content;
+                     let! partial := native_build_write_rejected_stage
+                       native_build_write_path "MZ-partial" content "operation_failed";
+                     let! truncated := native_build_write_rejected_stage native_build_write_path
+                       (prim_string_of_char_codes ([77, 90, 0] : List Nat))
+                       (prim_string_of_char_codes ([77, 90, 0, 1] : List Nat)) "operation_failed";
+                     let! corrupt := native_build_write_rejected_stage native_build_write_path
+                       (prim_string_of_char_codes ([77, 90, 0, 1] : List Nat))
+                       (prim_string_of_char_codes ([77, 90, 0, 2] : List Nat)) "operation_failed";
+                     let! refused := native_build_write_rejected_stage
+                       (native_build_dirname native_build_write_path) content content "not_file";
+                     let! preserved := native_build_write_matches native_build_write_path content;
+                     precision_run "native-build-write"
+                       ([ MkPair String Bool "compile-lower-constant-word" True
+                        , MkPair String Bool "publish-initial-output" previous
+                        , MkPair String Bool "replace-exact-binary-output"
+                            (match back with
+                             | Left _ => False
+                             | Right bytes => prim_string_eq bytes content
+                             end)
+                        , MkPair String Bool "written-mz-header"
+                            (match back with
+                             | Left _ => False
+                             | Right bytes => native_build_write_mz (prim_string_to_char_codes bytes)
+                             end)
+                        , MkPair String Bool "reject-empty-output" (native_build_write_error empty "empty_path")
+                        , MkPair String Bool "reject-directory-output" (native_build_write_error directory "not_file")
+                        , MkPair String Bool "reject-blocked-parent" (native_build_write_error blocked "operation_failed")
+                        , MkPair String Bool "reject-partial-stage-and-cleanup" partial
+                        , MkPair String Bool "reject-truncation-after-nul" truncated
+                        , MkPair String Bool "reject-corruption-after-nul" corrupt
+                        , MkPair String Bool "reject-rename-and-cleanup" refused
+                        , MkPair String Bool "failed-publication-preserves-image" preserved
+                        , MkPair String Bool "drive-root-parent"
+                            (prim_string_eq (native_build_dirname "C:\\app.exe") "C:\\")
+                        , MkPair String Bool "unc-parent"
+                            (prim_string_eq (native_build_dirname "\\\\server\\share\\app.exe") "\\\\server\\share")
+                        ] : List (Pair String Bool))
+              end
+       end
+
+-- @entry main
+def main : IO Unit :=
+    match native_compile_source lower_fixture_fuel mir_default_limits
+        lower_fixture_main (prim_string_to_char_codes lower_constant_word) with
+    | Left error =>
+        native_build_write_fail "native-build-write"
+          (managed_driver_source_error error)
+    | Right image =>
+        match image with
+        | NativeImageOf pe _ =>
+            match pe with
+            | PeImageFile bytes _ =>
+                native_build_write_checks (prim_string_of_char_codes bytes)
+            end
+        end
+    end;

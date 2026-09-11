@@ -1,0 +1,422 @@
+-- Ouro.seal v1. Handwritten project form: blocks of key = value, no escapes.
+
+import "../../std/text.ouro";
+import "../../std/format.ouro";
+
+inductive SealVal : Type :=
+  | SealStr : String -> SealVal
+  | SealNat : Nat -> SealVal
+  | SealBool : Bool -> SealVal;
+
+inductive SealBlock : Type :=
+  | MkSealBlock : String -> List (Pair String SealVal) -> SealBlock;
+
+inductive SealDoc : Type :=
+  | MkSealDoc : Nat -> List SealBlock -> SealDoc;
+
+inductive SealParse : Type :=
+  | SPNeedHeader : SealParse
+  | SPReady : Nat -> List SealBlock -> SealParse
+  | SPInBlock : Nat -> List SealBlock -> String -> List (Pair String SealVal) -> SealParse
+  | SPFail : SealParse;
+
+def seal_ch_hash : Nat := 35;
+def seal_ch_dash : Nat := 45;
+def seal_ch_dquote : Nat := 34;
+def seal_ch_squote : Nat := 39;
+def seal_ch_under : Nat := 95;
+def seal_format_version : Nat := 1;
+
+def seal_rev (A : Type) (xs : List A) : List A :=
+    foldl A (List A) (fun (acc : List A) (x : A) => Cons A x acc)
+      (Nil A) xs;
+
+def seal_keep (A : Type) (p : A -> Bool) (xs : List A) : List A :=
+    foldl A (List A)
+      (fun (acc : List A) (x : A) =>
+        match p x with
+        | True => append A acc ([x] : List A)
+        | False => acc
+        end)
+      (Nil A) xs;
+
+def seal_val_text (v : SealVal) : String :=
+    match v with
+    | SealStr s => s
+    | SealNat n => show_nat n
+    | SealBool True => "true"
+    | SealBool False => "false"
+    end;
+
+def seal_quote (s : String) : String :=
+    str_cat3 "\"" s "\"";
+
+def seal_val_render (v : SealVal) : String :=
+    match v with
+    | SealStr s => seal_quote s
+    | SealNat n => show_nat n
+    | SealBool True => "true"
+    | SealBool False => "false"
+    end;
+
+-- The scanned list decreases; the quote state may change at each character.
+def seal_cut_codes : List Nat -> Nat -> List Nat :=
+  fix seal_cut_codes (cs : List Nat) (quote : Nat) : List Nat :=
+    match cs with
+    | Nil => Nil Nat
+    | Cons c rest =>
+        match eq_nat quote Z with
+        | False =>
+            match eq_nat c quote with
+            | True => Cons Nat c (seal_cut_codes rest Z)
+            | False => Cons Nat c (seal_cut_codes rest quote)
+            end
+        | True =>
+            match eq_nat c seal_ch_hash with
+            | True => Nil Nat
+            | False =>
+                match andb (eq_nat c seal_ch_dash)
+                        (match rest with
+                         | Nil => False
+                         | Cons n _ => eq_nat n seal_ch_dash
+                         end)
+                with
+                | True => Nil Nat
+                | False =>
+                    match orb (eq_nat c seal_ch_dquote)
+                            (eq_nat c seal_ch_squote) with
+                    | True => Cons Nat c (seal_cut_codes rest c)
+                    | False => Cons Nat c (seal_cut_codes rest Z)
+                    end
+                end
+            end
+        end
+    end;
+
+def seal_cut_line (line : String) : String :=
+    str_trim (str_of_codes (seal_cut_codes (str_codes line) Z));
+
+def seal_ident_char (c : Nat) : Bool :=
+    orb (is_alpha c)
+      (orb (is_digit c)
+        (orb (eq_nat c seal_ch_under) (eq_nat c seal_ch_dash)));
+
+def seal_ident_start (c : Nat) : Bool :=
+    orb (is_alpha c) (eq_nat c seal_ch_under);
+
+def seal_ident_ok (name : String) : Bool :=
+    let cs : List Nat := str_codes name in
+    match cs with
+    | Nil => False
+    | Cons first rest =>
+        andb (seal_ident_start first) (all Nat seal_ident_char rest)
+    end;
+
+def seal_parse_header (s : String) : Maybe Nat :=
+    match str_words s with
+    | Nil => Nothing Nat
+    | Cons w rest =>
+        match andb (str_eq w "seal")
+                (match rest with
+                 | Nil => False
+                 | Cons _ more =>
+                     match more with
+                     | Nil => True
+                     | Cons _ _ => False
+                     end
+                 end)
+        with
+        | False => Nothing Nat
+        | True =>
+            match rest with
+            | Nil => Nothing Nat
+            | Cons n _ =>
+                match str_parse_nat n with
+                | Nothing => Nothing Nat
+                | Just v =>
+                    match eq_nat v seal_format_version with
+                    | True => Just Nat v
+                    | False => Nothing Nat
+                    end
+                end
+            end
+        end
+    end;
+
+def seal_parse_string (s : String) : Maybe String :=
+    match andb (str_starts s "\"") (str_ends s "\"") with
+    | False => Nothing String
+    | True =>
+        match leb_nat 2 (str_len s) with
+        | False => Nothing String
+        | True =>
+            let inner : String := str_slice s (S Z) (sub (str_len s) 2) in
+            match orb (str_contains inner "\"") (str_contains inner "\n") with
+            | True => Nothing String
+            | False => Just String inner
+            end
+        end
+    end;
+
+def seal_parse_value (raw : String) : Maybe SealVal :=
+    let s : String := str_trim raw in
+    match str_null s with
+    | True => Nothing SealVal
+    | False =>
+        match seal_parse_string s with
+        | Just inner => Just SealVal (SealStr inner)
+        | Nothing =>
+            match str_eq s "true" with
+            | True => Just SealVal (SealBool True)
+            | False =>
+                match str_eq s "false" with
+                | True => Just SealVal (SealBool False)
+                | False =>
+                    match str_parse_nat s with
+                    | Just n => Just SealVal (SealNat n)
+                    | Nothing =>
+                        match seal_ident_ok s with
+                        | True => Just SealVal (SealStr s)
+                        | False => Nothing SealVal
+                        end
+                    end
+                end
+            end
+        end
+    end;
+
+def seal_parse_binding (s : String) : Maybe (Pair String SealVal) :=
+    match str_split_first s "=" with
+    | Nothing => Nothing (Pair String SealVal)
+    | Just parts =>
+        match parts with
+        | MkPair key raw =>
+            let k : String := str_trim key in
+            match seal_ident_ok k with
+            | False => Nothing (Pair String SealVal)
+            | True =>
+                match seal_parse_value raw with
+                | Nothing => Nothing (Pair String SealVal)
+                | Just v => Just (Pair String SealVal)
+                    (MkPair String SealVal k v)
+                end
+            end
+        end
+    end;
+
+def seal_open_block (s : String) : Maybe String :=
+    match str_ends s "{" with
+    | False => Nothing String
+    | True =>
+        let name : String :=
+          str_trim (str_slice s Z (sub (str_len s) 1)) in
+        match seal_ident_ok name with
+        | True => Just String name
+        | False => Nothing String
+        end
+    end;
+
+def seal_block_name (b : SealBlock) : String :=
+    match b with
+    | MkSealBlock n _ => n
+    end;
+
+def seal_block_fields (b : SealBlock) : List (Pair String SealVal) :=
+    match b with
+    | MkSealBlock _ fs => fs
+    end;
+
+def seal_find_block (blocks : List SealBlock) (name : String)
+    : Maybe SealBlock :=
+    find SealBlock
+      (fun (b : SealBlock) => str_eq (seal_block_name b) name) blocks;
+
+def seal_field (fields : List (Pair String SealVal)) (key : String)
+    : Maybe SealVal :=
+    match find (Pair String SealVal)
+            (fun (p : Pair String SealVal) =>
+              match p with
+              | MkPair k _ => str_eq k key
+              end)
+            fields with
+    | Nothing => Nothing SealVal
+    | Just p =>
+        match p with
+        | MkPair _ v => Just SealVal v
+        end
+    end;
+
+def seal_field_text (fields : List (Pair String SealVal)) (key : String)
+    (fallback : String) : String :=
+    match seal_field fields key with
+    | Nothing => fallback
+    | Just v => seal_val_text v
+    end;
+
+def seal_step (st : SealParse) (line : String) : SealParse :=
+    let s : String := seal_cut_line line in
+    match str_null s with
+    | True => st
+    | False =>
+        match st with
+        | SPFail => SPFail
+        | SPNeedHeader =>
+            match seal_parse_header s with
+            | Nothing => SPFail
+            | Just v => SPReady v (Nil SealBlock)
+            end
+        | SPReady ver blocks =>
+            match seal_open_block s with
+            | Nothing => SPFail
+            | Just name =>
+                match seal_find_block blocks name with
+                | Just _ => SPFail
+                | Nothing =>
+                    SPInBlock ver blocks name
+                      (Nil (Pair String SealVal))
+                end
+            end
+        | SPInBlock ver blocks name fields =>
+            match str_eq s "}" with
+            | True =>
+                SPReady ver
+                  (Cons SealBlock
+                    (MkSealBlock name (seal_rev (Pair String SealVal) fields))
+                    blocks)
+            | False =>
+                match seal_parse_binding s with
+                | Nothing => SPFail
+                | Just bind =>
+                    match bind with
+                    | MkPair k _ =>
+                        match seal_field fields k with
+                        | Just _ => SPFail
+                        | Nothing =>
+                            SPInBlock ver blocks name
+                              (Cons (Pair String SealVal) bind fields)
+                        end
+                    end
+                end
+            end
+        end
+    end;
+
+def seal_finish (st : SealParse) : Maybe SealDoc :=
+    match st with
+    | SPReady ver blocks =>
+        Just SealDoc (MkSealDoc ver (seal_rev SealBlock blocks))
+    | SPNeedHeader => Nothing SealDoc
+    | SPInBlock _ _ _ _ => Nothing SealDoc
+    | SPFail => Nothing SealDoc
+    end;
+
+def seal_parse (text : String) : Maybe SealDoc :=
+    seal_finish
+      (foldl String SealParse seal_step SPNeedHeader (str_lines text));
+
+def seal_doc_blocks (d : SealDoc) : List SealBlock :=
+    match d with
+    | MkSealDoc _ blocks => blocks
+    end;
+
+def seal_block_named (d : SealDoc) (name : String)
+    : List (Pair String SealVal) :=
+    match seal_find_block (seal_doc_blocks d) name with
+    | Nothing => Nil (Pair String SealVal)
+    | Just b => seal_block_fields b
+    end;
+
+def seal_binding_line (p : Pair String SealVal) : String :=
+    match p with
+    | MkPair k v =>
+        str_cat4 "  " k " = " (seal_val_render v)
+    end;
+
+def seal_render_block (b : SealBlock) : String :=
+    match b with
+    | MkSealBlock name fields =>
+        str_cat4 name " {\n"
+          (str_concat
+            (str_join "\n"
+              (map (Pair String SealVal) String seal_binding_line fields))
+            (match fields with
+             | Nil => ""
+             | Cons _ _ => "\n"
+             end))
+          "}\n"
+    end;
+
+def seal_render (d : SealDoc) : String :=
+    match d with
+    | MkSealDoc ver blocks =>
+        str_cat3 (str_concat "seal " (show_nat ver)) "\n\n"
+          (str_join "\n"
+            (map SealBlock String seal_render_block blocks))
+    end;
+
+def seal_upsert_block (blocks : List SealBlock) (name : String)
+    (fields : List (Pair String SealVal)) : List SealBlock :=
+    let next : SealBlock := MkSealBlock name fields in
+    match seal_find_block blocks name with
+    | Nothing =>
+        append SealBlock blocks ([next] : List SealBlock)
+    | Just _ =>
+        map SealBlock SealBlock
+          (fun (b : SealBlock) =>
+            match str_eq (seal_block_name b) name with
+            | True => next
+            | False => b
+            end)
+          blocks
+    end;
+
+def seal_drop_block (blocks : List SealBlock) (name : String)
+    : List SealBlock :=
+    seal_keep SealBlock
+      (fun (b : SealBlock) => notb (str_eq (seal_block_name b) name))
+      blocks;
+
+def seal_pair (k : String) (v : String) : Pair String SealVal :=
+    MkPair String SealVal k (SealStr v);
+
+def seal_project_fields (p_name : String) (p_version : String)
+    (kept : List (Pair String SealVal)) : List (Pair String SealVal) :=
+    let rest : List (Pair String SealVal) :=
+      seal_keep (Pair String SealVal)
+        (fun (p : Pair String SealVal) =>
+          match p with
+          | MkPair k _ =>
+              notb (orb (str_eq k "name") (str_eq k "version"))
+          end)
+        kept in
+    Cons (Pair String SealVal) (seal_pair "name" p_name)
+      (Cons (Pair String SealVal) (seal_pair "version" p_version) rest);
+
+def seal_dep_field (d : Pair String String) : Pair String SealVal :=
+    match d with
+    | MkPair k v => seal_pair k v
+    end;
+
+def seal_put_identity (d : SealDoc) (p_name : String) (p_version : String)
+    (deps : List (Pair String String)) (registry : String) : SealDoc :=
+    match d with
+    | MkSealDoc ver blocks =>
+        let with_project : List SealBlock :=
+          seal_upsert_block blocks "project"
+            (seal_project_fields p_name p_version
+              (seal_block_named d "project")) in
+        let with_deps : List SealBlock :=
+          seal_upsert_block with_project "deps"
+            (map (Pair String String) (Pair String SealVal)
+              seal_dep_field deps) in
+        let next : List SealBlock :=
+          match str_null registry with
+          | True => seal_drop_block with_deps "registry"
+          | False =>
+              seal_upsert_block with_deps "registry"
+                (Cons (Pair String SealVal)
+                  (seal_pair "source" registry)
+                  (Nil (Pair String SealVal)))
+          end in
+        MkSealDoc ver next
+    end;

@@ -1,0 +1,196 @@
+-- Command-line grammar is small by design: long options, single-dash flags, and -- to end options.
+-- Boolean switches are passed in so --flag value cannot accidentally consume a positional word.
+
+import "map.ouro";
+
+inductive Args : Type :=
+  | MkArgs : List String -> Map String -> List String -> Args;
+
+def args_positional (a : Args) : List String :=
+    match a with
+    | MkArgs ps _ _ => ps
+    end;
+
+def args_opts (a : Args) : Map String :=
+    match a with
+    | MkArgs _ os _ => os
+    end;
+
+def args_flags (a : Args) : List String :=
+    match a with
+    | MkArgs _ _ fs => fs
+    end;
+
+def args_empty : Args :=
+    MkArgs (Nil String) (map_empty String) (Nil String);
+
+def args_flag (a : Args) (name : String) : Bool :=
+    str_set_mem name (args_flags a);
+
+def args_opt (a : Args) (name : String) : Maybe String :=
+    map_get String name (args_opts a);
+
+def args_opt_or (a : Args) (name : String) (d : String) : String :=
+    map_get_or String d name (args_opts a);
+
+-- Positional word i, "" when absent. args_cmd is the usual subcommand slot.
+def args_at (a : Args) (i : Nat) : String :=
+    nth String "" i (args_positional a);
+
+def args_cmd (a : Args) : String := args_at a Z;
+
+def args_add_pos (a : Args) (w : String) : Args :=
+    MkArgs (snoc String (args_positional a) w) (args_opts a) (args_flags a);
+
+def args_add_flag (a : Args) (name : String) : Args :=
+    MkArgs (args_positional a) (args_opts a)
+      (snoc String (args_flags a) name);
+
+def args_add_opt (a : Args) (name : String) (v : String) : Args :=
+    MkArgs (args_positional a)
+      (map_insert String name v (args_opts a)) (args_flags a);
+
+def is_dashed (w : String) : Bool := str_starts w "-";
+
+-- A long option name without its leading dashes, Nothing for other words.
+def long_name (w : String) : Maybe String :=
+    str_strip_prefix w "--";
+
+def short_name (w : String) : Maybe String :=
+    match long_name w with
+    | Just _ => Nothing String
+    | Nothing => str_strip_prefix w "-"
+    end;
+
+def args_parse_go : Nat -> List String -> Args -> Bool -> List String -> Args :=
+  fix args_parse_go (fuel : Nat) (bools : List String) (acc : Args)
+      (only_pos : Bool) (ws : List String) : Args :=
+    match fuel with
+    | Z => acc
+    | S fuel2 =>
+      match ws with
+      | Nil => acc
+      | Cons w rest =>
+        match only_pos with
+        | True => args_parse_go fuel2 bools (args_add_pos acc w) True rest
+        | False =>
+          match str_eq w "--" with
+          | True => args_parse_go fuel2 bools acc True rest
+          | False =>
+            match long_name w with
+            | Just name =>
+              match str_split_first name "=" with
+              | Just kv =>
+                match kv with
+                | MkPair k v =>
+                  args_parse_go fuel2 bools (args_add_opt acc k v) False rest
+                end
+              | Nothing =>
+                match str_set_mem name bools with
+                | True =>
+                  args_parse_go fuel2 bools (args_add_flag acc name) False rest
+                | False =>
+                  match rest with
+                  | Cons nxt rest2 =>
+                    match is_dashed nxt with
+                    | False =>
+                      args_parse_go fuel2 bools
+                        (args_add_opt acc name nxt) False rest2
+                    | True =>
+                      args_parse_go fuel2 bools
+                        (args_add_flag acc name) False rest
+                    end
+                  | Nil => acc
+                  end
+                end
+              end
+            | Nothing =>
+              match short_name w with
+              | Just name =>
+                args_parse_go fuel2 bools (args_add_flag acc name) False rest
+              | Nothing =>
+                args_parse_go fuel2 bools (args_add_pos acc w) False rest
+              end
+            end
+          end
+        end
+      end
+    end;
+
+def args_parse_bools (bools : List String) (ws : List String) : Args :=
+    args_parse_go (S (length String ws)) bools args_empty False ws;
+
+def args_parse (ws : List String) : Args :=
+    args_parse_bools (Nil String) ws;
+
+-- prim_argv keeps the program path in slot 0; tools want the rest.
+def args_of_argv (argv : List String) : Args :=
+    args_parse (tail String argv);
+
+def args_of_argv_bools (bools : List String) (argv : List String) : Args :=
+    args_parse_bools bools (tail String argv);
+
+-- Strict command entry points can reject a non-boolean long option whose
+-- value is absent before using the intentionally forgiving Args parser.
+def args_argv_options_complete (bools : List String) (argv : List String) : Bool :=
+    let complete_long : (List String -> Bool) -> String -> List String -> Bool :=
+      fun (next : List String -> Bool) (name : String) (rest : List String) =>
+        match str_split_first name "=" with
+        | Just _ => next rest
+        | Nothing =>
+          match str_set_mem name bools with
+          | True => next rest
+          | False =>
+            match rest with
+            | Nil => False
+            | Cons nxt rest2 =>
+              match is_dashed nxt with
+              | True => False
+              | False => next rest2
+              end
+            end
+          end
+        end
+    in
+    let complete_step : (List String -> Bool) -> String -> List String -> Bool :=
+      fun (next : List String -> Bool) (w : String) (rest : List String) =>
+        match str_eq w "--" with
+        | True => True
+        | False =>
+          match long_name w with
+          | Nothing => next rest
+          | Just name => complete_long next name rest
+          end
+        end
+    in
+    let go : Nat -> List String -> Bool :=
+      fix go (fuel : Nat) (ws : List String) : Bool :=
+        match fuel with
+        | Z => True
+        | S fuel2 =>
+          match ws with
+          | Nil => True
+          | Cons w rest =>
+              complete_step (fun (remaining : List String) => go fuel2 remaining)
+                w rest
+          end
+        end
+    in
+    let ws : List String := tail String argv in
+    go (S (length String ws)) ws;
+
+def opt_show (p : Pair String String) : String :=
+    match p with
+    | MkPair k v => str_cat3 k "=" v
+    end;
+
+def args_show (a : Args) : String :=
+    let rows : List String :=
+      ([ str_concat "positional=" (str_join "," (args_positional a))
+      , str_concat "flags=" (str_join "," (args_flags a))
+      , str_concat "opts="
+          (str_join ","
+            (map (Pair String String) String opt_show
+              (map_pairs String (args_opts a))))
+      ] : List String) in
+    str_unlines rows;

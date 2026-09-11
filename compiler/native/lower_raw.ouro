@@ -1,0 +1,118 @@
+-- Raw operations retain their checked pointee/storage types. The caller owns
+-- address validity, alignment, bounds and lifetime; managed values are absent.
+import "lower_ops.ouro";
+
+def lower_three (A : Type) (values : List CoreTerm)
+    (next : CoreTerm -> CoreTerm -> CoreTerm -> Either NativeLowerError A) : Either NativeLowerError A :=
+    match values with | Nil => Left NativeLowerError A (LowerInvalidCall 0)
+    | Cons a rest => match rest with | Nil => Left NativeLowerError A (LowerInvalidCall 0)
+      | Cons b more => match more with | Nil => Left NativeLowerError A (LowerInvalidCall 0)
+        | Cons c last => match last with | Nil => next a b c
+          | Cons _ _ => Left NativeLowerError A (LowerInvalidCall 0) end end end end;
+
+def lower_pointer_type (fuel : Nat) (sig : CheckEnvironment) (pointee : CoreTerm) : Either NativeLowerError LowerType :=
+    lower_bind CoreTerm LowerType
+      (lower_from_primitive CoreTerm pointee (primitive_type_ref PrimitiveRawPtrType (primitive_environment (check_environment_entries sig))))
+      (fun (pointer : CoreTerm) => lower_classify_type fuel sig (CApp pointer pointee));
+
+def lower_unit_type (fuel : Nat) (sig : CheckEnvironment) : Either NativeLowerError LowerType :=
+    lower_bind CoreTerm LowerType
+      (lower_from_primitive CoreTerm (CSort 0) (primitive_role_ref PrimitiveUnitRole (primitive_roles_environment (check_environment_entries sig))))
+      (fun (unit : CoreTerm) => lower_classify_type fuel sig unit);
+
+def lower_raw_arguments (fuel : Nat) (step : LowerStep) (sig : CheckEnvironment) (environment : List LowerBinding)
+    (types : List LowerType) (result : LowerType) (args : List CoreTerm) (expected : LowerType) (state : LowerState)
+    : Either NativeLowerError LowerArguments :=
+    lower_bind LowerType LowerArguments (lower_runtime_type sig result) (fun (action : LowerType) =>
+      lower_bind Unit LowerArguments (lower_type_same fuel expected action)
+        (fun (_ : Unit) => lower_arguments step environment 0 types args state));
+
+def lower_raw_unary (fuel : Nat) (step : LowerStep) (sig : CheckEnvironment) (environment : List LowerBinding)
+    (argument : LowerType) (result : LowerType) (args : List CoreTerm) (expected : LowerType) (state : LowerState)
+    (instruction : Nat -> MirValue -> MirInstruction) : Either NativeLowerError LowerResult :=
+    lower_bind LowerArguments LowerResult
+      (lower_raw_arguments fuel step sig environment ([argument] : List LowerType) result args expected state)
+      (fun (values : LowerArguments) => match values with | LowerArgumentsOf actual after =>
+        lower_bind MirValue LowerResult (lower_single MirValue actual)
+          (fun (value : MirValue) => lower_fresh_result expected (fun (id : Nat) => instruction id value) after) end);
+
+def lower_raw_null (fuel : Nat) (sig : CheckEnvironment) (args : List CoreTerm) (expected : LowerType) (state : LowerState)
+    : Either NativeLowerError LowerResult :=
+    lower_bind CoreTerm LowerResult (lower_single CoreTerm args) (fun (pointee : CoreTerm) =>
+      lower_bind LowerType LowerResult (lower_pointer_type fuel sig pointee) (fun (typ : LowerType) =>
+        lower_map Unit LowerResult
+          (fun (_ : Unit) => LowerResultOf expected (Just MirValue (MirBits MirRawPtr lower_zero)) state)
+          (lower_type_same fuel expected typ)));
+
+def lower_storage_type_indexed (fuel : Nat) (sig : CheckEnvironment) (specialization : Maybe CoreTerm)
+    : Either NativeLowerError LowerType :=
+    match specialization with
+    | Nothing => Left NativeLowerError LowerType (LowerInvalidCall 0)
+    | Just storage => lower_bind LowerType LowerType (lower_scalar_type fuel sig storage)
+        (fun (typ : LowerType) => match lower_type_mir typ with
+          | Nothing => Left NativeLowerError LowerType (LowerUnsupportedType storage)
+          | Just _ => Right NativeLowerError LowerType typ end) end;
+
+def lower_storage_type (fuel : Nat) (entries : List Entry) (specialization : Maybe CoreTerm)
+    : Either NativeLowerError LowerType :=
+    lower_storage_type_indexed fuel (check_environment_from_entries entries) specialization;
+
+def lower_raw_load (fuel : Nat) (step : LowerStep) (sig : CheckEnvironment) (environment : List LowerBinding)
+    (specialization : Maybe CoreTerm) (args : List CoreTerm) (expected : LowerType) (state : LowerState)
+    : Either NativeLowerError LowerResult :=
+    lower_bind LowerType LowerResult (lower_storage_type_indexed fuel sig specialization) (fun (storage : LowerType) =>
+      lower_bind LowerType LowerResult (lower_pointer_type fuel sig (lower_type_core storage)) (fun (pointer : LowerType) =>
+        lower_raw_unary fuel step sig environment pointer storage args expected state
+          (fun (id : Nat) (address : MirValue) => MirLoad id address (codegen_disp 0))));
+
+def lower_raw_store (fuel : Nat) (step : LowerStep) (sig : CheckEnvironment) (environment : List LowerBinding)
+    (specialization : Maybe CoreTerm) (args : List CoreTerm) (expected : LowerType) (state : LowerState)
+    : Either NativeLowerError LowerResult :=
+    lower_bind LowerType LowerResult (lower_storage_type_indexed fuel sig specialization) (fun (storage : LowerType) =>
+      lower_bind LowerType LowerResult (lower_pointer_type fuel sig (lower_type_core storage)) (fun (pointer : LowerType) =>
+        lower_bind LowerType LowerResult (lower_unit_type fuel sig) (fun (unit : LowerType) =>
+          lower_bind LowerArguments LowerResult
+            (lower_raw_arguments fuel step sig environment ([pointer, storage] : List LowerType) unit args expected state)
+            (fun (values : LowerArguments) => match values with | LowerArgumentsOf actual after =>
+              lower_map (Pair MirValue MirValue) LowerResult (fun (pair : Pair MirValue MirValue) => match pair with
+                | MkPair address value => LowerResultOf expected (Nothing MirValue)
+                    (lower_emit (MirStore address (codegen_disp 0) value) after) end) (lower_pair MirValue actual) end))));
+
+def lower_raw_add (fuel : Nat) (step : LowerStep) (sig : CheckEnvironment) (environment : List LowerBinding)
+    (args : List CoreTerm) (expected : LowerType) (state : LowerState) : Either NativeLowerError LowerResult :=
+    lower_three LowerResult args (fun (pointee : CoreTerm) (address : CoreTerm) (offset : CoreTerm) =>
+      lower_bind LowerType LowerResult (lower_pointer_type fuel sig pointee) (fun (pointer : LowerType) =>
+        lower_bind LowerType LowerResult (lower_word_type fuel sig PrimitiveWordUSize) (fun (size : LowerType) =>
+          lower_bind LowerArguments LowerResult
+            (lower_raw_arguments fuel step sig environment ([pointer, size] : List LowerType) pointer
+              ([address, offset] : List CoreTerm) expected state)
+            (fun (values : LowerArguments) => match values with | LowerArgumentsOf actual after =>
+              lower_bind (Pair MirValue MirValue) LowerResult (lower_pair MirValue actual)
+                (fun (pair : Pair MirValue MirValue) => match pair with | MkPair base bytes =>
+                  lower_fresh_result expected (fun (id : Nat) => MirPointerAdd id base bytes) after end) end))));
+
+def lower_raw_cast (fuel : Nat) (step : LowerStep) (sig : CheckEnvironment) (environment : List LowerBinding)
+    (args : List CoreTerm) (expected : LowerType) (state : LowerState) : Either NativeLowerError LowerResult :=
+    lower_three LowerResult args (fun (from : CoreTerm) (into : CoreTerm) (address : CoreTerm) =>
+      lower_bind LowerType LowerResult (lower_pointer_type fuel sig from) (fun (source : LowerType) =>
+        lower_bind LowerType LowerResult (lower_pointer_type fuel sig into) (fun (result : LowerType) =>
+          lower_bind LowerArguments LowerResult
+            (lower_raw_arguments fuel step sig environment ([source] : List LowerType) result
+              ([address] : List CoreTerm) expected state)
+            (fun (values : LowerArguments) => match values with | LowerArgumentsOf actual after =>
+              lower_map MirValue LowerResult
+                (fun (value : MirValue) => LowerResultOf expected (Just MirValue value) after)
+                (lower_single MirValue actual) end))));
+
+def lower_raw_bits (fuel : Nat) (step : LowerStep) (sig : CheckEnvironment) (environment : List LowerBinding)
+    (from_bits : Bool) (args : List CoreTerm) (expected : LowerType) (state : LowerState)
+    : Either NativeLowerError LowerResult :=
+    lower_bind (Pair CoreTerm CoreTerm) LowerResult (lower_pair CoreTerm args)
+      (fun (pair : Pair CoreTerm CoreTerm) => match pair with | MkPair pointee operand =>
+        lower_bind LowerType LowerResult (lower_pointer_type fuel sig pointee) (fun (pointer : LowerType) =>
+          lower_bind LowerType LowerResult (lower_word_type fuel sig PrimitiveWordUSize) (fun (size : LowerType) =>
+            lower_raw_unary fuel step sig environment
+              (match from_bits with | True => size | False => pointer end)
+              (match from_bits with | True => pointer | False => size end)
+              ([operand] : List CoreTerm) expected state (fun (id : Nat) (value : MirValue) =>
+                MirConvert id (match from_bits with | True => MirRawFromBits | False => MirRawToBits end) value))) end);

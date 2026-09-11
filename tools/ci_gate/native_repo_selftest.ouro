@@ -1,0 +1,732 @@
+-- Native fixture and compatibility assertions for repository control-plane migration.
+
+import "../repo_gate/paths.ouro";
+import "gates.ouro";
+import "report.ouro";
+import "../repo_gate/checks.ouro";
+import "../repo_gate/parity_closure.ouro";
+import "../repo_gate/report.ouro";
+import "../../std/workspace.ouro";
+import "../../std/json.ouro";
+import "../../std/io.ouro";
+import "../../std/args.ouro";
+
+
+inductive NativeRepoSelftestState : Type :=
+  | MkNativeRepoSelftestState : Nat -> Nat -> NativeRepoSelftestState
+
+
+def native_selftest_rows (s : NativeRepoSelftestState) : Nat :=
+    match s with | MkNativeRepoSelftestState rows _ => rows end
+
+
+def native_selftest_failures (s : NativeRepoSelftestState) : Nat :=
+    match s with | MkNativeRepoSelftestState _ failures => failures end
+
+
+def native_selftest_row (s : NativeRepoSelftestState) (name : String) (ok : Bool)
+    : IO NativeRepoSelftestState :=
+    let rows : Nat := S (native_selftest_rows s) in
+    match ok with
+    | True =>
+        do println (str_concat "OURO_NATIVE_REPO_CI_OK " name);
+           io_pure NativeRepoSelftestState
+             (MkNativeRepoSelftestState rows (native_selftest_failures s))
+    | False =>
+        do eprintln (str_concat "OURO_NATIVE_REPO_CI_FAIL " name);
+           io_pure NativeRepoSelftestState
+             (MkNativeRepoSelftestState rows (S (native_selftest_failures s)))
+    end
+
+
+def native_bool_eq (a : Bool) (b : Bool) : Bool :=
+    match a with | True => b | False => notb b end
+
+
+def nrs_copy_file (src : String) (dst : String) : IO Unit :=
+    do let! copied := fs_copy_checked src dst;
+       match copied with
+       | Left e => do eprintln (fs_error_message e); exit 1
+       | Right _ => io_unit
+       end
+
+
+def nrs_copy_tree (src : String) (dst : String) : IO Unit :=
+    do let! files := fs_walk src;
+       io_foreach String
+         (fun (path : String) =>
+           nrs_copy_file path (path_join ([ dst, path_relative src path ] : List String)))
+         files
+
+
+def nrs_copy_visible_repo_file (root : String) (dst : String) (rel : String)
+    : IO Unit :=
+    match str_null (str_trim rel) with
+    | True => io_unit
+    | False =>
+        let src : String := path_join ([ root, rel ] : List String) in
+        do let! present := fs_exists src;
+           match present with
+           | False => io_unit
+           | True => nrs_copy_file src (path_join ([ dst, rel ] : List String))
+           end
+    end
+
+
+def nrs_repo_copy (root : String) (dst : String) : IO Unit :=
+    do let! made := fs_mkdir_p_checked dst;
+       match made with
+       | Left e => do eprintln (fs_error_message e); exit 1
+       | Right _ =>
+         do let! listed := proc_exec "git"
+              ([ "-C", root, "ls-files", "--cached", "--others", "--exclude-standard" ]
+                : List String);
+            match proc_ok listed with
+            | False => do eprintln "native selftest: git ls-files failed"; exit 1
+            | True => io_foreach String (nrs_copy_visible_repo_file root dst)
+                (str_lines (proc_stdout listed))
+            end
+       end
+
+
+def nrs_remove_file (path : String) : IO Unit :=
+    do fs_remove path;
+       let! present := fs_exists path;
+       match present with
+       | False => io_unit
+       | True => do eprintln (str_concat "native selftest: failed to remove " path); exit 1
+       end
+
+
+def native_make_fixture (root : String) : IO Unit :=
+    do repo_write (path_join ([root, "samples/hello.ouro"] : List String))
+         "-- @entry main\n\nimport \"../../std/io.ouro\";\n\ndef main : IO Unit := println \"hello\"\n";
+       repo_write (path_join ([root, "README.md"] : List String))
+         "# Fixture\n\n<!-- readme-example: samples/hello.ouro -->\n```ouro\n-- @entry main\n\nimport \"../../std/io.ouro\";\n\ndef main : IO Unit := println \"hello\"\n```\n";
+       repo_write (path_join ([root, "docs/README.md"] : List String))
+         "# Fixture docs\n\n- [Guide](guide.md)\n";
+       repo_write (path_join ([root, "docs/guide.md"] : List String))
+         "# Guide\n\nSee [root](../README.md), docs/guide.md, and samples/*.ouro.\n";
+       repo_write (path_join ([root, ".github/workflows/fixture.yml"] : List String))
+         "name: Fixture\n\non:\n  pull_request:\n    branches: [ main ]\n\npermissions:\n  contents: read\n\nconcurrency:\n  group: fixture\n  cancel-in-progress: true\n\njobs:\n  fixture:\n    name: fixture gate\n    runs-on: ubuntu-latest\n    timeout-minutes: 5\n    steps:\n      - name: Upload report\n        uses: actions/upload-artifact@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa # v1.0.0\n        with:\n          name: report\n          path: _build/report.json\n"
+
+
+def native_profile_pass (profile : String) (root : String) : IO Bool :=
+    do let! base := run_profile_checks profile root;
+       let! extra := run_profile_extra_checks profile root;
+       io_pure Bool (checks_pass (append GateCheck base extra))
+
+
+def native_profile_expected (profile : String) (root : String) (expected : Bool) : IO Bool :=
+    do let! actual := native_profile_pass profile root;
+       io_pure Bool (native_bool_eq actual expected)
+
+
+def native_env_assignment (name : String) (value : String) : String :=
+    str_cat3 name "=" value
+
+
+def native_wrapper_run (python : String) (root : String) (script : String)
+    (work : String) (report : String) : IO ProcResult :=
+    proc_exec "env"
+      ([ native_env_assignment "OURO_REPO_GATE_ROOT" root, python, script,
+         "--work", work, "--report", report ] : List String)
+
+
+def native_wrapper_expected (python : String) (root : String) (script : String)
+    (work : String) (report : String) (expected : Bool) : IO Bool :=
+    do let! result := native_wrapper_run python root script work report;
+       io_pure Bool (native_bool_eq (proc_ok result) expected)
+
+
+def native_repo_report_schema_ok : Bool :=
+    let check : GateCheck := MkGateCheck "fixture-required-files" True (Nil GateMetric) (Nil GateIssue) in
+    let report : String := gate_report_string "fixture" ([check] : List GateCheck) in
+    andb (str_contains report "\"kind\":\"ouro.repo-gate-report.v1\"")
+      (andb (str_contains report "\"version\":\"1\"")
+        (andb (str_contains report "\"profile\":\"fixture\"")
+          (andb (str_contains report "\"pass\":true")
+            (str_contains report "\"gates\":["))))
+
+
+def native_text_policy_free (path : String) (tokens : List String) : IO Bool :=
+    do let! loaded := fs_read_checked path;
+       match loaded with
+       | Left _ => io_pure Bool False
+       | Right text => io_pure Bool (all String (fun (token : String) => notb (str_contains text token)) tokens)
+       end
+
+
+def native_prepare_small_fixtures (out : String) : IO Unit :=
+    let valid : String := path_join ([out, "fixture-valid"] : List String) in
+    do native_make_fixture valid;
+       io_foreach String
+         (fun (name : String) =>
+           nrs_copy_tree valid (path_join ([out, name] : List String)))
+         ([ "fixture-missing", "fixture-broken-link", "fixture-missing-docpath",
+            "fixture-retired", "fixture-missing-phrase",
+            "fixture-dangerous-workflow" ] : List String);
+       nrs_remove_file (path_join ([out, "fixture-missing/docs/guide.md"] : List String));
+       repo_write (path_join ([out, "fixture-broken-link/docs/guide.md"] : List String))
+         "# Broken\n[Abs](/README.md)\n";
+       repo_write (path_join ([out, "fixture-missing-docpath/docs/guide.md"] : List String))
+         "# Guide\n\nSee docs/missing.md\n";
+       repo_write (path_join ([out, "fixture-retired/docs/retired.md"] : List String))
+         "# Retired\n";
+       repo_write (path_join ([out, "fixture-missing-phrase/docs/README.md"] : List String))
+         "# Docs\n\n- [Guide](guide.md)\n";
+       repo_write
+         (path_join ([out, "fixture-dangerous-workflow/.github/workflows/fixture.yml"]
+           : List String))
+         "name: Bad\non:\n  pull_request_target:\npermissions: write-all\njobs:\n  bad:\n    name: bad\n    runs-on: ubuntu-latest\n    timeout-minutes: 5\n    steps:\n      - run: echo bad\n"
+
+
+def native_prepare_docs_fixtures (root : String) (out : String) : IO Unit :=
+    let valid : String := path_join ([out, "docs-valid"] : List String) in
+    do nrs_repo_copy root valid;
+       io_foreach String
+         (fun (name : String) =>
+           nrs_copy_tree valid (path_join ([out, name] : List String)))
+         ([ "docs-missing-required", "docs-readme-drift", "docs-broken-link",
+            "docs-generated-api-missing" ] : List String);
+       nrs_remove_file
+         (path_join ([out, "docs-missing-required/docs/getting_started.md"] : List String));
+       repo_write (path_join ([out, "docs-readme-drift/README.md"] : List String))
+         "# Drifted README\n\n<!-- readme-example: samples/examples/nat.ouro -->\n```ouro\ndefinitely_not_the_sample\n```\n";
+       let! loaded := fs_read_checked
+         (path_join ([out, "docs-broken-link/docs/README.md"] : List String));
+       match loaded with
+       | Left e => do eprintln (fs_error_message e); exit 1
+       | Right text => repo_write
+           (path_join ([out, "docs-broken-link/docs/README.md"] : List String))
+           (str_concat text "\n[Broken](missing.md)\n")
+       end;
+       nrs_remove_file
+         (path_join ([out, "docs-generated-api-missing/docs/api/README.md"] : List String))
+
+
+def native_prepare_project_readme_fixture (out : String) : IO Unit :=
+    do let! loaded := fs_read_checked
+         (path_join ([out, "project-valid/README.md"] : List String));
+       match loaded with
+       | Left e => do eprintln (fs_error_message e); exit 1
+       | Right text => repo_write
+           (path_join ([out, "project-missing-phrase/README.md"] : List String))
+           (str_replace text "pre-1.0" "pre-one-dot-zero")
+       end
+
+
+def native_prepare_project_version_fixture (out : String) : IO Unit :=
+    do let! loaded := fs_read_checked
+         (path_join ([out, "project-valid/Ouro.seal"] : List String));
+       match loaded with
+       | Left e => do eprintln (fs_error_message e); exit 1
+       | Right text => repo_write
+           (path_join ([out, "project-version-drift/Ouro.seal"] : List String))
+           (str_replace text "version = \"0.1.0\"" "version = \"999.0.0\"")
+       end
+
+
+def native_prepare_project_text_fixtures (out : String) : IO Unit :=
+    do native_prepare_project_readme_fixture out;
+       native_prepare_project_version_fixture out
+
+
+def native_prepare_project_fixtures (root : String) (out : String) : IO Unit :=
+    let valid : String := path_join ([out, "project-valid"] : List String) in
+    do nrs_repo_copy root valid;
+       io_foreach String
+         (fun (name : String) =>
+           nrs_copy_tree valid (path_join ([out, name] : List String)))
+         ([ "project-missing-file", "project-retired-path", "project-missing-phrase",
+            "project-bad-pr-template", "project-bad-issue-form",
+            "project-version-drift" ] : List String);
+       nrs_remove_file (path_join ([out, "project-missing-file/LICENSE"] : List String));
+       repo_write (path_join ([out, "project-retired-path/docs/Ouro-improved.md"] : List String))
+         "# Retired\n";
+       repo_write
+         (path_join ([out, "project-bad-pr-template/.github/pull_request_template.md"]
+           : List String)) "# Bad template\n";
+       repo_write
+         (path_join ([out, "project-bad-issue-form/.github/ISSUE_TEMPLATE/bug_report.yml"]
+           : List String)) "name: Bad\n";
+       native_prepare_project_text_fixtures out
+
+
+def native_prepare_repo_fixtures (root : String) (out : String) : IO Unit :=
+    do native_prepare_small_fixtures out;
+       native_prepare_docs_fixtures root out;
+       native_prepare_project_fixtures root out
+
+
+def native_repo_fixture_rows (state : NativeRepoSelftestState) (root : String) (out : String)
+    (_python : String) (probe : Bool) : IO NativeRepoSelftestState :=
+    do native_prepare_repo_fixtures root out;
+       let! r1ok := native_profile_expected "fixture" (path_join ([out,"fixture-valid"] : List String)) True;
+       let! r1 := native_selftest_row state "repo-fixture-present" (andb r1ok (notb probe));
+       let! v2 := native_profile_expected "fixture" (path_join ([out,"fixture-missing"] : List String)) False;
+       let! r2 := native_selftest_row r1 "repo-required-missing" v2;
+       let! v3 := native_profile_expected "fixture" (path_join ([out,"fixture-broken-link"] : List String)) False;
+       let! r3 := native_selftest_row r2 "repo-broken-markdown-link" v3;
+       let! v4 := native_profile_expected "fixture" (path_join ([out,"fixture-missing-docpath"] : List String)) False;
+       let! r4 := native_selftest_row r3 "repo-documented-path-missing" v4;
+       let! v5 := native_profile_expected "fixture" (path_join ([out,"fixture-retired"] : List String)) False;
+       let! r5 := native_selftest_row r4 "repo-retired-path-present" v5;
+       let! v6 := native_profile_expected "fixture" (path_join ([out,"fixture-missing-phrase"] : List String)) False;
+       let! r6 := native_selftest_row r5 "repo-required-phrase-missing" v6;
+       let! v7 := native_profile_expected "fixture" (path_join ([out,"fixture-dangerous-workflow"] : List String)) False;
+       native_selftest_row r6 "repo-workflow-dangerous-pattern" v7
+
+
+def native_wrapper_profile_case (state : NativeRepoSelftestState) (out : String) (python : String)
+    (profile : String) (script : String) (report_name : String) (label : String)
+    (dir : String) (expected : Bool) : IO NativeRepoSelftestState :=
+    do let! native_ok := native_profile_expected profile (path_join ([out,dir] : List String)) expected;
+       let! next := native_selftest_row state (str_cat3 profile "-native-" label) native_ok;
+       let! wrapper_ok := native_wrapper_expected python (path_join ([out,dir] : List String)) script
+         (path_join ([out,str_cat3 "legacy-" profile (str_concat "-" label)] : List String))
+         (path_join ([out,str_cat3 "legacy-" profile (str_concat "-" label),report_name] : List String)) expected;
+       native_selftest_row next (str_cat3 profile "-wrapper-" label) wrapper_ok
+
+
+def native_docs_suite_rows (state : NativeRepoSelftestState) (out : String) (python : String)
+    : IO NativeRepoSelftestState :=
+    do let! s1 := native_wrapper_profile_case state out python "docs" "scripts/docs_examples_gate.py" "docs-examples-gate.json" "valid" "docs-valid" True;
+       let! s2 := native_wrapper_profile_case s1 out python "docs" "scripts/docs_examples_gate.py" "docs-examples-gate.json" "missing-required" "docs-missing-required" False;
+       let! s3 := native_wrapper_profile_case s2 out python "docs" "scripts/docs_examples_gate.py" "docs-examples-gate.json" "readme-drift" "docs-readme-drift" False;
+       let! s4 := native_wrapper_profile_case s3 out python "docs" "scripts/docs_examples_gate.py" "docs-examples-gate.json" "broken-link" "docs-broken-link" False;
+       native_wrapper_profile_case s4 out python "docs" "scripts/docs_examples_gate.py" "docs-examples-gate.json" "generated-api-missing" "docs-generated-api-missing" False
+
+
+def native_project_suite_rows (state : NativeRepoSelftestState) (out : String) (python : String)
+    : IO NativeRepoSelftestState :=
+    do let! s6 := native_wrapper_profile_case state out python "project" "scripts/github_project_gate.py" "github-project-gate.json" "valid" "project-valid" True;
+       let! s7 := native_wrapper_profile_case s6 out python "project" "scripts/github_project_gate.py" "github-project-gate.json" "missing-file" "project-missing-file" False;
+       let! s8 := native_wrapper_profile_case s7 out python "project" "scripts/github_project_gate.py" "github-project-gate.json" "retired-path" "project-retired-path" False;
+       let! s9 := native_wrapper_profile_case s8 out python "project" "scripts/github_project_gate.py" "github-project-gate.json" "missing-phrase" "project-missing-phrase" False;
+       let! s10 := native_wrapper_profile_case s9 out python "project" "scripts/github_project_gate.py" "github-project-gate.json" "bad-pr-template" "project-bad-pr-template" False;
+       let! s11 := native_wrapper_profile_case s10 out python "project" "scripts/github_project_gate.py" "github-project-gate.json" "bad-issue-form" "project-bad-issue-form" False;
+       let! s12 := native_wrapper_profile_case s11 out python "project" "scripts/github_project_gate.py" "github-project-gate.json" "version-drift" "project-version-drift" False;
+       let! s13 := native_selftest_row s12 "repo-json-schema" native_repo_report_schema_ok;
+       let! wrapper_missing := native_wrapper_expected python (path_join ([out,"fixture-missing"] : List String))
+            "scripts/docs_examples_gate.py" (path_join ([out,"parity-work"] : List String))
+            (path_join ([out,"parity-work/report.json"] : List String)) False;
+       let! native_missing := native_profile_expected "fixture" (path_join ([out,"fixture-missing"] : List String)) False;
+       native_selftest_row s13 "legacy-wrapper-native-parity" (andb wrapper_missing native_missing)
+
+def native_proc_expected (program : String) (args : List String) (expected : Bool) : IO Bool :=
+    do let! result := proc_exec program args;
+       io_pure Bool (native_bool_eq (proc_ok result) expected)
+
+
+def native_ci_report_schema_ok : Bool :=
+    let result : CiResult := MkCiResult "optional" "unavailable" (["missing"] : List String)
+      False False Z (Nothing Nat) "x.log" "x.json" (["unavailable"] : List String) in
+    let report : String := ci_report_string "selftest-unavailable" ([result] : List CiResult) in
+    andb (str_contains report "\"kind\":\"ouro.ci-gate-report.v1\"")
+      (andb (str_contains report "\"profile\":\"selftest-unavailable\"")
+        (andb (str_contains report "\"status\":\"unavailable\"")
+          (andb (str_contains report "\"required\":false")
+            (str_contains report "\"blocking\":false"))))
+
+
+inductive NativeProcCase : Type :=
+  | MkNativeProcCase : String -> List String -> Bool -> NativeProcCase;
+
+
+def native_proc_case_name (c : NativeProcCase) : String :=
+    match c with | MkNativeProcCase name _ _ => name end;
+
+
+def native_proc_case_args (c : NativeProcCase) : List String :=
+    match c with | MkNativeProcCase _ args _ => args end;
+
+
+def native_proc_case_expected (c : NativeProcCase) : Bool :=
+    match c with | MkNativeProcCase _ _ expected => expected end;
+
+
+def native_ci_process_cases (root : String) (out : String) (fixtures : String) : List NativeProcCase :=
+    [ MkNativeProcCase "checker-type-mismatch-regression"
+        ([ "scripts/ouro1.sh", "test", str_cat3 "--manifest=" fixtures "/manifest.tsv",
+           "--prefix=CHECK.type-mismatch", str_concat "--root=" fixtures,
+           str_concat "--out="
+             (path_join ([out,"checker-type-mismatch"] : List String)),
+           "--suite-label=CHECKER_REGRESSION" ] : List String) True
+    , MkNativeProcCase "ci-pr-native-selected-gate"
+        ([ "scripts/ouro_ci_gate.sh", "--profile", "pr-native", "--gate",
+           "repo-gate-workflow", "--root", root, "--out",
+           path_join ([out,"ci-pr-native-workflow"] : List String) ] : List String) True
+    , MkNativeProcCase "ci-retirement-inventory"
+        ([ "scripts/ouro_ci_gate.sh", "--profile", "retirement", "--gate",
+           "repo-gate-retirement", "--root", root, "--out",
+           path_join ([out,"ci-retirement-inventory"] : List String) ] : List String) True
+    , MkNativeProcCase "ci-small-profile-pass"
+        ([ "scripts/ouro_ci_gate.sh", "--profile", "selftest-pass", "--root",
+           path_join ([out,"fixture-valid"] : List String), "--out",
+           path_join ([out,"ci-pass"] : List String) ] : List String) True
+    , MkNativeProcCase "ci-small-profile-blocking-fail"
+        ([ "scripts/ouro_ci_gate.sh", "--profile", "selftest-pass", "--root",
+           path_join ([out,"fixture-missing"] : List String), "--out",
+           path_join ([out,"ci-fail"] : List String) ] : List String) False
+    , MkNativeProcCase "ci-unavailable-optional"
+        ([ "scripts/ouro_ci_gate.sh", "--profile", "selftest-unavailable", "--root",
+           path_join ([out,"fixture-valid"] : List String), "--out",
+           path_join ([out,"ci-unavailable"] : List String) ] : List String) True
+    ];
+
+
+def native_run_proc_cases : List NativeProcCase -> NativeRepoSelftestState -> IO NativeRepoSelftestState :=
+  fix native_run_proc_cases (cases : List NativeProcCase)
+      (state : NativeRepoSelftestState) : IO NativeRepoSelftestState :=
+    match cases with
+    | Nil => io_pure NativeRepoSelftestState state
+    | Cons c rest =>
+        do let! passed := native_proc_expected "sh" (native_proc_case_args c)
+             (native_proc_case_expected c);
+           let! next := native_selftest_row state (native_proc_case_name c) passed;
+           native_run_proc_cases rest next
+    end;
+
+
+def native_ci_list_rows (state : NativeRepoSelftestState) : IO NativeRepoSelftestState :=
+    let pr_names : List String := map CiGate String ci_gate_name
+      (select_ci_gates "pr-native" (Nothing String)) in
+    let pr_ok : Bool := andb (elem String str_eq "repo-gate-docs" pr_names)
+      (andb (elem String str_eq "repo-gate-project" pr_names)
+        (elem String str_eq "repo-gate-workflow" pr_names)) in
+    do let! s34 := native_selftest_row state "ci-pr-native-list-deterministic" pr_ok;
+       let control_names : List String := map CiGate String ci_gate_name
+         (select_ci_gates "control-plane-native" (Nothing String)) in
+       let control_ok : Bool := andb
+         (elem String str_eq "repo-gate-control-plane" control_names)
+         (andb (elem String str_eq "host-bound-report" control_names)
+           (elem String str_eq "native-retirement-fixtures" control_names)) in
+       native_selftest_row s34 "ci-control-plane-list" control_ok
+
+
+def native_host_pass_schema (loaded : Either FsError String) : Bool :=
+    match loaded with
+    | Left _ => False
+    | Right text => andb
+        (str_contains text "ouro.host-bound-control-plane-report.v3")
+        (andb (str_contains text "\"pass\":true")
+          (andb (str_contains text "\"validation\":{")
+            (andb (str_contains text "\"migration_status\":\"host-bound\"")
+              (str_contains text "\"removal_eligibility\":\"wrapper-only\""))))
+    end;
+
+
+def native_host_fail_schema (loaded : Either FsError String) : Bool :=
+    match loaded with
+    | Left _ => False
+    | Right text => andb (str_contains text "\"pass\":false")
+        (str_contains text "\"status\":\"fail\"")
+    end;
+
+
+def native_host_report_rows (state : NativeRepoSelftestState)
+    (out : String) : IO NativeRepoSelftestState :=
+    let pass_out : String := path_join ([out,"host-bound"] : List String) in
+    let fail_out : String := path_join ([out,"host-bound-fail"] : List String) in
+    do let! ran := native_proc_expected "sh"
+         ([ "scripts/ouro_ci_gate.sh", "--profile", "host-bound", "--out",
+            pass_out ] : List String) True;
+       let! s42 := native_selftest_row state "ci-host-bound-report" ran;
+       let! loaded := fs_read_checked (path_join ([pass_out,"host-bound.json"] : List String));
+       let! s43 := native_selftest_row s42 "host-bound-json-schema"
+         (native_host_pass_schema loaded);
+       let! rejected := native_proc_expected "sh"
+         ([ "scripts/ouro_ci_gate.sh", "--profile", "host-bound", "--root",
+            path_join ([out,"fixture-valid"] : List String), "--out", fail_out ]
+           : List String) False;
+       let! s44 := native_selftest_row s43 "host-bound-invalid-root-rejected" rejected;
+       let! failed_report := fs_read_checked
+         (path_join ([fail_out,"host-bound.json"] : List String));
+       native_selftest_row s44 "host-bound-failure-report"
+         (native_host_fail_schema failed_report)
+
+
+def native_ci_selection_rows (state : NativeRepoSelftestState)
+    (root : String) (out : String) (fixtures : String) : IO NativeRepoSelftestState :=
+    do let! s35 := native_ci_list_rows state;
+       let! s40 := native_run_proc_cases (native_ci_process_cases root out fixtures) s35;
+       let! s41 := native_selftest_row s40 "ci-json-schema" native_ci_report_schema_ok;
+       native_host_report_rows s41 out
+
+
+def native_docs_wrapper_report_rows (state : NativeRepoSelftestState)
+    (out : String) (python : String) : IO NativeRepoSelftestState :=
+    let work : String := path_join ([out,"legacy-docs-wrapper"] : List String) in
+    let report : String := path_join ([work,"docs-examples-gate.json"] : List String) in
+    do let! ran := native_wrapper_expected python
+         (path_join ([out,"docs-valid"] : List String))
+         "scripts/docs_examples_gate.py" work report True;
+       let! s44 := native_selftest_row state "legacy-docs-wrapper-report" ran;
+       let! loaded := fs_read_checked report;
+       let schema : Bool :=
+         match loaded with
+         | Left _ => False
+         | Right text => andb (str_contains text "ouro.docs-examples-gate.v2")
+             (str_contains text "\"native_profile\": \"docs-native\"")
+         end in
+       native_selftest_row s44 "legacy-docs-wrapper-cli-native-report" schema
+
+
+def native_project_wrapper_report_rows (state : NativeRepoSelftestState)
+    (out : String) (python : String) : IO NativeRepoSelftestState :=
+    let work : String := path_join ([out,"legacy-project-wrapper"] : List String) in
+    let report : String := path_join ([work,"github-project-gate.json"] : List String) in
+    do let! ran := native_wrapper_expected python
+         (path_join ([out,"project-valid"] : List String))
+         "scripts/github_project_gate.py" work report True;
+       let! s46 := native_selftest_row state "legacy-project-wrapper-report" ran;
+       let! loaded := fs_read_checked report;
+       let schema : Bool :=
+         match loaded with
+         | Left _ => False
+         | Right text => andb (str_contains text "ouro.github-project-gate.v3")
+             (andb (str_contains text "\"native_profile\": \"project-native\"")
+               (str_contains text "\"status\": \"host-bound\""))
+         end in
+       native_selftest_row s46 "legacy-project-wrapper-cli-native-report" schema
+
+
+def native_workflow_wrapper_report_rows (state : NativeRepoSelftestState)
+    (out : String) (python : String) : IO NativeRepoSelftestState :=
+    let work : String := path_join ([out,"legacy-workflow-wrapper"] : List String) in
+    let report : String := path_join ([work,"github-workflow-gate.json"] : List String) in
+    do let! ran := native_proc_expected python
+         ([ "scripts/github_workflow_gate.py", "--work", work, "--report", report ] : List String) True;
+       let! s48 := native_selftest_row state "legacy-workflow-wrapper-report" ran;
+       let! loaded := fs_read_checked report;
+       let schema : Bool :=
+         match loaded with
+         | Left _ => False
+         | Right text => str_contains text "\"profile\":\"workflow-native\""
+         end in
+       native_selftest_row s48 "legacy-workflow-wrapper-cli-native-report" schema
+
+
+def native_docs_forbidden_tokens : List String :=
+    [ "MARKDOWN_LINK_RE", "README_EXAMPLE_RE", "REQUIRED_DOCS",
+      "GENERATED_API_PREFIX", "BARE_PATH_RE", "urlparse",
+      "maintained_doc_paths", "check_markdown_links",
+      "check_readme_example", "re.compile" ];
+
+
+def native_project_forbidden_tokens : List String :=
+    [ "REQUIRED_FILES", "RETIRED_PATHS", "REQUIRED_PHRASES",
+      "PUBLIC_META_PATTERNS", "check_versions", "check_issue_forms",
+      "check_required_files", "gh repo view", "subprocess.run", "re.compile" ];
+
+
+def native_workflow_forbidden_tokens : List String :=
+    [ "pull_request_target", "contents: write", "dependency-review",
+      "readme-example", "REQUIRED_FILES", "MARKDOWN_LINK_RE",
+      "BARE_PATH_RE", "re.compile" ];
+
+
+def native_policy_free_rows (state : NativeRepoSelftestState)
+    : IO NativeRepoSelftestState :=
+    do let! docs := native_text_policy_free "scripts/docs_examples_gate.py"
+         native_docs_forbidden_tokens;
+       let! s50 := native_selftest_row state "docs-wrapper-policy-free" docs;
+       let! project := native_text_policy_free "scripts/github_project_gate.py"
+         native_project_forbidden_tokens;
+       let! s51 := native_selftest_row s50 "project-wrapper-policy-free" project;
+       let! workflow := native_text_policy_free "scripts/github_workflow_gate.py"
+         native_workflow_forbidden_tokens;
+       native_selftest_row s51 "workflow-wrapper-policy-free" workflow
+
+
+def native_python_route_tokens : List String :=
+    [ "github-workflow-gate sh scripts/ouro_repo_gate.sh --profile workflow-native"
+    , "github-project-gate sh scripts/ouro_repo_gate.sh --profile project-native"
+    , "docs-examples sh scripts/ouro_repo_gate.sh --profile docs-native"
+    ];
+
+
+def native_python_inventory_tokens : List String :=
+    [ "python-syntax", "scripts/github_workflow_gate.py"
+    , "scripts/github_project_gate.py", "scripts/docs_examples_gate.py" ];
+
+
+def native_text_contains_all (text : String) (tokens : List String) : Bool :=
+    all String (fun (token : String) => str_contains text token) tokens;
+
+
+def native_python_route_rows (state : NativeRepoSelftestState)
+    (python : String) : IO NativeRepoSelftestState :=
+    do let! listed := proc_exec python
+         ([ "scripts/ci_gate.py", "--profile", "pr", "--list" ] : List String);
+       let! s53 := native_selftest_row state
+         "python-ci-docs-project-workflow-native-route"
+         (andb (proc_ok listed)
+           (native_text_contains_all (proc_stdout listed) native_python_route_tokens));
+       native_selftest_row s53 "py-compile-inventory-mention-not-execution-route"
+         (native_text_contains_all (proc_stdout listed) native_python_inventory_tokens)
+
+
+def native_smith_registry_contract : Bool :=
+    let valid : String := "{\"layers\":{\"surface\":{\"generator_features\":[\"form:list\",\"form:record\",\"parity:imports\"]}}}" in
+    let invalid : List String :=
+      [ "{", "{}"
+      , "{\"layers\":{\"surface\":{\"generator_features\":\"form:list form:record parity:imports\"}}}"
+      , "{\"layers\":{\"surface\":{\"generator_features\":[\"form:list\",\"form:record\"]}}}"
+      , "{\"unrelated\":[\"form:list\",\"form:record\",\"parity:imports\"]}"
+      ] in
+    andb (nullb GateIssue (smith_strategy_issues valid))
+      (all String (fun (text : String) =>
+        notb (nullb GateIssue (smith_strategy_issues text))) invalid);
+
+
+def native_policy_route_rows (state : NativeRepoSelftestState)
+    (python : String) : IO NativeRepoSelftestState :=
+    do let! s52 := native_policy_free_rows state;
+       let! registry := native_selftest_row s52 "smith-registry-json-contract" native_smith_registry_contract;
+       native_python_route_rows registry python
+
+
+inductive NativeManifestCase : Type :=
+  | MkNativeManifestCase : String -> String -> String -> Nat -> String -> String
+      -> NativeManifestCase;
+
+
+def native_manifest_cases (out : String) : List NativeManifestCase :=
+    let valid_out : String := path_join ([out,"manifest","manifest-valid"] : List String) in
+    [ MkNativeManifestCase "manifest-valid" "valid.tsv" "SELF." Z
+        (str_concat "SELF_SUITE: PASS rows=2 out=" (str_concat valid_out "\n")) ""
+    , MkNativeManifestCase "manifest-malformed" "malformed.tsv" "BAD"
+        (S (S Z)) ""
+        "MANIFEST_ERROR line 1: expected exactly six tab-separated columns\n"
+    , MkNativeManifestCase "manifest-duplicate" "duplicate.tsv" "DUP"
+        (S (S Z)) "" "MANIFEST_ERROR duplicate id: DUP\n"
+    , MkNativeManifestCase "manifest-unsafe" "unsafe.tsv" "UNSAFE"
+        (S (S Z)) "" "MANIFEST_ERROR line 1: unsafe or empty path\n"
+    , MkNativeManifestCase "manifest-unsupported" "unsupported.tsv" "UNSUPPORTED"
+        (S (S Z)) ""
+        "MANIFEST_ERROR unsupported selected tool for UNSUPPORTED: lint\n"
+    , MkNativeManifestCase "manifest-missing" "missing.tsv" "MISSING"
+        (S Z) ""
+        "SELF_SUITE_FAIL MISSING missing file\nSELF_SUITE: FAIL rows=1 failures=1\n"
+    , MkNativeManifestCase "manifest-zero-selected" "valid.tsv" "NONE."
+        (S (S Z)) "" "MANIFEST_ERROR no rows selected\n"
+    ];
+
+
+def native_manifest_case_args (out : String) (name : String) (fixture : String)
+    (prefix : String) (fixtures : String) : List String :=
+    ([ "scripts/ouro1.sh", "test",
+       str_cat4 "--manifest=" fixtures "/" fixture,
+       str_concat "--prefix=" prefix, str_concat "--root=" fixtures,
+       str_concat "--out=" (path_join ([out,"manifest",name] : List String)),
+       "--suite-label=SELF_SUITE" ] : List String);
+
+
+def native_manifest_case_ok (result : ProcResult) (expected_code : Nat)
+    (expected_stdout : String) (expected_stderr : String) : Bool :=
+    andb (eq_nat (proc_code result) expected_code)
+      (andb (str_eq (proc_stdout result) expected_stdout)
+        (str_eq (proc_stderr result) expected_stderr));
+
+
+def native_run_manifest_cases (fixtures : String) : List NativeManifestCase -> String
+    -> NativeRepoSelftestState -> IO NativeRepoSelftestState :=
+  fix native_run_manifest_cases (cases : List NativeManifestCase) (out : String)
+      (state : NativeRepoSelftestState) : IO NativeRepoSelftestState :=
+    match cases with
+    | Nil => io_pure NativeRepoSelftestState state
+    | Cons c rest =>
+        match c with
+        | MkNativeManifestCase name fixture prefix expected_code
+            expected_stdout expected_stderr =>
+            do let! result := proc_exec "sh"
+                 (native_manifest_case_args out name fixture prefix fixtures);
+               let! next := native_selftest_row state name
+                 (native_manifest_case_ok result expected_code
+                   expected_stdout expected_stderr);
+               native_run_manifest_cases rest out next
+        end
+    end;
+
+
+def native_manifest_rows (state : NativeRepoSelftestState) (out : String)
+    (fixtures : String)
+    : IO NativeRepoSelftestState :=
+    native_run_manifest_cases fixtures (native_manifest_cases out) out state;
+
+
+def native_finish_pass_text (state : NativeRepoSelftestState) (out : String) : String :=
+    str_cat4 "OURO_NATIVE_REPO_CI_SUITE: PASS rows="
+      (show_nat (native_selftest_rows state)) " out=" out;
+
+
+def native_finish_fail_text (state : NativeRepoSelftestState) (out : String) : String :=
+    str_cat4 "OURO_NATIVE_REPO_CI_SUITE: FAIL rows="
+      (show_nat (native_selftest_rows state)) " failures="
+      (str_cat3 (show_nat (native_selftest_failures state)) " out=" out);
+
+
+def native_finish_selftest (state : NativeRepoSelftestState) (out : String) : IO Unit :=
+    match native_selftest_failures state with
+    | Z => do println (native_finish_pass_text state out); exit Z
+    | S _ => do eprintln (native_finish_fail_text state out); exit (S Z)
+    end
+
+
+inductive NativeSelftestSection : Type :=
+  | NativeFixtures : NativeSelftestSection
+  | NativeDocs : NativeSelftestSection
+  | NativeProject : NativeSelftestSection
+  | NativeCi : NativeSelftestSection
+  | NativeWrappers : NativeSelftestSection
+  | NativePolicy : NativeSelftestSection
+  | NativeManifest : NativeSelftestSection;
+
+
+def native_selftest_sections : List (Pair String NativeSelftestSection) :=
+  [ MkPair String NativeSelftestSection "fixtures" NativeFixtures
+  , MkPair String NativeSelftestSection "docs" NativeDocs
+  , MkPair String NativeSelftestSection "project" NativeProject
+  , MkPair String NativeSelftestSection "ci" NativeCi
+  , MkPair String NativeSelftestSection "wrappers" NativeWrappers
+  , MkPair String NativeSelftestSection "policy" NativePolicy
+  , MkPair String NativeSelftestSection "manifest" NativeManifest ];
+
+
+def native_find_section (name : String) : Maybe NativeSelftestSection :=
+  map_get NativeSelftestSection name native_selftest_sections;
+
+
+def native_section_rows (selected : NativeSelftestSection) (root : String)
+    (out : String) (fixtures : String) (python : String) (probe : Bool)
+    : IO NativeRepoSelftestState :=
+    let initial : NativeRepoSelftestState := MkNativeRepoSelftestState Z Z in
+    match selected with
+    | NativeFixtures => native_repo_fixture_rows initial root out python probe
+    | NativeDocs => native_docs_suite_rows initial out python
+    | NativeProject => native_project_suite_rows initial out python
+    | NativeCi => native_ci_selection_rows initial root out fixtures
+    | NativeWrappers =>
+        do let! docs := native_docs_wrapper_report_rows initial out python;
+           let! project := native_project_wrapper_report_rows docs out python;
+           native_workflow_wrapper_report_rows project out python
+    | NativePolicy => native_policy_route_rows initial python
+    | NativeManifest => native_manifest_rows initial out fixtures
+    end;
+
+
+def run_native_repo_ci_selftest (a : Args) : IO Unit :=
+    let root : String := args_opt_or a "root" "." in
+    let out : String := args_opt_or a "out" "_build/ouro_native_repo_ci_suite" in
+    let fixtures : String := args_opt_or a "fixtures" "_build/smith/fixtures/manifest" in
+    let section : Maybe NativeSelftestSection := native_find_section (args_opt_or a "section" "") in
+    do let! python := env_or "PYTHON" "python3";
+       let! display_out := env_or "OURO_NATIVE_REPO_CI_DISPLAY_OUT" out;
+       match section with
+       | Nothing => do eprintln "native selftest requires a known --section; use scripts/ouro_native_repo_ci_suite.sh for all sections"; exit 2
+       | Just selected =>
+           do let! result := native_section_rows selected root out fixtures python (args_flag a "probe-failure");
+             native_finish_selftest result display_out
+       end

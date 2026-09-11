@@ -1,0 +1,79 @@
+-- Synchronous byte input uses the process-owned stdin handle. No read-ahead,
+-- allocation, newline conversion or handle close is performed by this layer.
+-- Status zero reports actual bytes; zero bytes means EOF. Failure is a Win32
+-- status with the caller's count restored by the checked transfer helper.
+import "windows_file.ouro";
+
+extern windows_get_file_type : RawPtr U8 -> Runtime U32 :=
+    "windows-x86_64" "win64" "kernel32.dll" "GetFileType" "nogc";
+
+-- A successful zero-byte pipe read may be a zero-byte write, not EOF.
+-- Keep its retry state outside the complete U32 status space.
+def raw_windows_stdin_retry (one : USize) : USize :=
+    let two : USize := usize_add one one in
+    let four : USize := usize_add two two in
+    let eight : USize := usize_add four four in
+    let sixteen : USize := usize_add eight eight in
+    usize_shift_left one (raw_size_to_u32 (usize_add sixteen sixteen));
+
+def raw_windows_stdin_pipe_eof (one : USize) : U32 :=
+    let two : USize := usize_add one one in
+    let four : USize := usize_add two two in
+    let eight : USize := usize_add four four in
+    let sixteen : USize := usize_add eight eight in
+    let thirtytwo : USize := usize_add sixteen sixteen in
+    raw_size_to_u32 (usize_add (usize_add thirtytwo thirtytwo)
+      (usize_add thirtytwo (usize_add eight (usize_add four one))));
+
+def raw_windows_stdin_pipe_step (stream_handle : RawPtr U8) (buffer : RawPtr U8)
+    (bytes : USize) (count : RawPtr U32) (one : USize) : Runtime USize :=
+    runtime_bind U32 USize (raw_windows_file_read stream_handle buffer bytes count) (fun (status : U32) =>
+      let zero : U32 := u32_sub status status in
+      match u32_equal status (raw_windows_stdin_pipe_eof one) with
+      | True => runtime_bind U32 USize (raw_windows_store_count count zero)
+          (fun (cleared : U32) => runtime_pure USize (usize_sub one one))
+      | False => match u32_equal status zero with
+        | False => runtime_pure USize (raw_u32_to_size status)
+        | True => runtime_bind U32 USize (raw_load_u32 count) (fun (actual : U32) =>
+            runtime_pure USize (match u32_equal actual zero with
+              | True => raw_windows_stdin_retry one | False => usize_sub one one end)) end end);
+
+def raw_windows_stdin_pipe (stream_handle : RawPtr U8) (buffer : RawPtr U8)
+    (bytes : USize) (count : RawPtr U32) (one : USize) : Runtime U32 :=
+    match u8_from_nat 1 with | Nothing => runtime_pure U32 (raw_windows_general_error one) | Just running =>
+      let retry : USize := raw_windows_stdin_retry one in
+      runtime_bind USize U32 (runtime_loop USize retry
+        (fun (status : USize) => runtime_pure U8 (match usize_equal status retry with
+          | True => running | False => u8_sub running running end))
+        (fun (status : USize) => raw_windows_stdin_pipe_step stream_handle buffer bytes count one))
+        (fun (finished : USize) => runtime_pure U32 (raw_size_to_u32 finished)) end;
+
+-- Validate storage even for an empty request, but do not inspect stdin then.
+-- GetFileType distinguishes disk/character EOF from empty pipe messages.
+def raw_windows_stdin (buffer : RawPtr U8) (bytes : USize) (count : RawPtr U32) : Runtime U32 :=
+    match usize_from_nat 1 with
+    | Nothing => runtime_bind Unit U32 (raw_windows_panic_code (raw_size_to_u32 bytes))
+        (fun (unexpected : Unit) => runtime_pure U32 (raw_size_to_u32 bytes))
+    | Just one =>
+      let zero : USize := usize_sub one one in
+      runtime_bind Bool U32 (raw_windows_conversion_storage buffer bytes (raw_null U8) zero count one)
+        (fun (storage : Bool) => match storage with
+          | False => runtime_pure U32 (raw_windows_parameter_error one)
+          | True => match usize_equal bytes zero with
+            | True => raw_windows_store_count count (raw_size_to_u32 zero)
+            | False =>
+              let two : USize := usize_add one one in
+              let four : USize := usize_add two two in
+              let selector : U32 := raw_size_to_u32 (usize_add (usize_add four four) two) in
+              runtime_bind (RawPtr U8) U32
+                (windows_get_std_handle (u32_sub (u32_sub selector selector) selector))
+                (fun (stream_handle : RawPtr U8) => runtime_bind Bool U32
+                  (raw_windows_handle_valid stream_handle one) (fun (valid : Bool) => match valid with
+                    | False => runtime_pure U32 (raw_windows_invalid_handle one)
+                    | True => runtime_bind U32 U32 (windows_get_file_type stream_handle) (fun (kind : U32) =>
+                        match u32_equal kind (raw_size_to_u32 (usize_add two one)) with
+                        | True => raw_windows_stdin_pipe stream_handle buffer bytes count one
+                        | False => match (match u32_equal kind (raw_size_to_u32 one) with
+                            | True => True | False => u32_equal kind (raw_size_to_u32 two) end) with
+                          | True => raw_windows_file_read stream_handle buffer bytes count
+                          | False => raw_windows_last_failure one end end) end)) end end) end;

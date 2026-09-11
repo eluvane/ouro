@@ -1,0 +1,200 @@
+-- HTTP message codec and native Windows WinHTTP POST transport.
+-- Transport failures have status zero and an explicit reason. HTTP errors
+-- retain their actual status and binary response body; response headers are
+-- not collected by this transport. TLS certificate verification is OS-owned.
+
+import "runtime.ouro";
+import "format.ouro";
+import "stringx.ouro";
+import "parse.ouro";
+import "../runtime/platform/windows_http.ouro";
+
+-- The checked native action returns the HTTP status, exact response bytes,
+-- and transport failure reason. Status zero denotes a transport failure.
+intrinsic prim_http_request : String -> List (Pair String String) -> String -> IO (Pair Nat (Pair String String))
+    := "ouro.http.post";
+
+def crlf : String := "\r\n";
+def n200 : Nat := mul 100 2;
+def n300 : Nat := mul 100 3;
+
+inductive HttpReq : Type :=
+  | MkHttpReq : String -> String -> List (Pair String String) -> String -> HttpReq;
+
+inductive HttpResp : Type :=
+  | MkHttpResp : Nat -> String -> List (Pair String String) -> String -> HttpResp;
+
+def http_method (r : HttpReq) : String :=
+    match r with
+    | MkHttpReq m _ _ _ => m
+    end;
+
+def http_target (r : HttpReq) : String :=
+    match r with
+    | MkHttpReq _ t _ _ => t
+    end;
+
+def http_req_headers (r : HttpReq) : List (Pair String String) :=
+    match r with
+    | MkHttpReq _ _ hs _ => hs
+    end;
+
+def http_req_body (r : HttpReq) : String :=
+    match r with
+    | MkHttpReq _ _ _ b => b
+    end;
+
+def http_status (r : HttpResp) : Nat :=
+    match r with
+    | MkHttpResp c _ _ _ => c
+    end;
+
+def http_reason (r : HttpResp) : String :=
+    match r with
+    | MkHttpResp _ s _ _ => s
+    end;
+
+def http_resp_headers (r : HttpResp) : List (Pair String String) :=
+    match r with
+    | MkHttpResp _ _ hs _ => hs
+    end;
+
+def http_body (r : HttpResp) : String :=
+    match r with
+    | MkHttpResp _ _ _ b => b
+    end;
+
+def http_ok (r : HttpResp) : Bool :=
+    andb (leb_nat n200 (http_status r)) (ltb_nat (http_status r) n300);
+
+def header_ok (s : String) : Bool :=
+    andb (notb (str_contains s "\n")) (notb (str_contains s "\r"));
+
+def header_line (p : Pair String String) : String :=
+    match p with
+    | MkPair k v =>
+      match andb (header_ok k) (header_ok v) with
+      | True => str_cat4 k ": " v crlf
+      | False => ""
+      end
+    end;
+
+def render_headers (hs : List (Pair String String)) : String :=
+    str_join "" (map (Pair String String) String header_line hs);
+
+def render_request (r : HttpReq) : String :=
+    match r with
+    | MkHttpReq method target headers body =>
+      match andb (header_ok method) (header_ok target) with
+      | False => ""
+      | True =>
+        str_concat
+          (str_cat4 method " " target " HTTP/1.0")
+          (str_concat crlf
+            (str_concat (render_headers headers)
+              (str_concat
+                (str_cat3 "Content-Length: " (str_of_nat (str_len body)) crlf)
+                (str_concat crlf body))))
+      end
+    end;
+
+def parse_header (line : String) : Maybe (Pair String String) :=
+    match str_split_first line ":" with
+    | Nothing => Nothing (Pair String String)
+    | Just p =>
+      Just (Pair String String)
+        (MkPair String String (str_trim (fst String String p))
+          (str_trim (snd String String p)))
+    end;
+
+def parse_headers : List String -> Maybe (List (Pair String String)) :=
+  fix parse_headers (ls : List String) : Maybe (List (Pair String String)) :=
+    match ls with
+    | Nil => Just (List (Pair String String)) (Nil (Pair String String))
+    | Cons line rest =>
+      match str_null (str_trim line) with
+      | True => parse_headers rest
+      | False =>
+        match parse_header line with
+        | Nothing => Nothing (List (Pair String String))
+        | Just header =>
+          match parse_headers rest with
+          | Nothing => Nothing (List (Pair String String))
+          | Just headers =>
+            Just (List (Pair String String))
+              (Cons (Pair String String) header headers)
+          end
+        end
+      end
+    end;
+
+def parse_status_line (line : String) : Maybe (Pair Nat String) :=
+    match str_split_first line " " with
+    | Nothing => Nothing (Pair Nat String)
+    | Just p1 =>
+      match str_split_first (snd String String p1) " " with
+      | Nothing =>
+        match parse_nat (str_trim (snd String String p1)) with
+        | Nothing => Nothing (Pair Nat String)
+        | Just code =>
+          Just (Pair Nat String) (MkPair Nat String code "")
+        end
+      | Just p2 =>
+        match parse_nat (str_trim (fst String String p2)) with
+        | Nothing => Nothing (Pair Nat String)
+        | Just code =>
+          Just (Pair Nat String)
+            (MkPair Nat String code (str_trim (snd String String p2)))
+        end
+      end
+    end;
+
+def split_http_lines (s : String) : List String :=
+    match str_contains s crlf with
+    | True => str_split_str s crlf
+    | False => str_lines s
+    end;
+
+def parse_response_parts (head : String) (body : String) : HttpResp :=
+    let lines : List String := split_http_lines head in
+    match lines with
+    | Nil => MkHttpResp Z "empty" (Nil (Pair String String)) body
+    | Cons line rest =>
+      match parse_headers rest with
+      | Nothing => MkHttpResp Z "unparsed" (Nil (Pair String String)) body
+      | Just headers =>
+        match parse_status_line line with
+        | Nothing => MkHttpResp Z "unparsed" (Nil (Pair String String)) body
+        | Just parsed =>
+          match parsed with
+          | MkPair code reason => MkHttpResp code reason headers body
+          end
+        end
+      end
+    end;
+
+def parse_response (raw : String) : HttpResp :=
+    match str_split_first raw (str_concat crlf crlf) with
+    | Just parts =>
+      parse_response_parts (fst String String parts) (snd String String parts)
+    | Nothing =>
+      match str_split_first raw "\n\n" with
+      | Just parts =>
+        parse_response_parts (fst String String parts) (snd String String parts)
+      | Nothing => MkHttpResp Z "unparsed" (Nil (Pair String String)) raw
+      end
+    end;
+
+def http_fail (msg : String) : HttpResp :=
+    MkHttpResp Z msg (Nil (Pair String String)) "";
+
+def http_post (url : String) (headers : List (Pair String String))
+    (body : String) : IO HttpResp :=
+    io_bind (Pair Nat (Pair String String)) HttpResp
+      (prim_http_request url headers body)
+      (fun (result : Pair Nat (Pair String String)) =>
+        match result with | MkPair code payload =>
+          match payload with | MkPair bytes reason =>
+            io_pure HttpResp (MkHttpResp code reason (Nil (Pair String String)) bytes)
+          end
+        end);

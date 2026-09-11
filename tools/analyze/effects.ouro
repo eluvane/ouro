@@ -1,0 +1,243 @@
+-- Effect analysis walks APerform/AHandle/ADo. It does not guess from
+-- identifier spelling; interned op ids are the facts.
+
+-- @entry analyze_effects
+
+import "../../std/data.ouro";
+import "../../std/listx.ouro";
+import "../../std/runtime.ouro";
+import "ast.ouro";
+import "policy_ids.ouro";
+
+inductive EffIssue : Type :=
+  | IPureHole : Nat -> EffIssue
+  | IConstRebind : Nat -> EffIssue
+  | IUnhandledPerform : Nat -> EffIssue
+  | IHandleMissingOp : Nat -> EffIssue
+  | IDiscardedCont : Nat -> EffIssue
+  | IPureEffect : Nat -> EffIssue;
+
+def eff_icons (i : EffIssue) (is : List EffIssue) : List EffIssue :=
+    Cons EffIssue i is;
+def eff_inil : List EffIssue := [];
+def eff_append_issues (xs : List EffIssue) (ys : List EffIssue) : List EffIssue :=
+    append EffIssue xs ys;
+
+def clause_ops : Ast -> List Nat :=
+  fix clause_ops (c : Ast) : List Nat :=
+    match c with
+    | AClause op _ _ rest => Cons Nat op (clause_ops rest)
+    | ANoClause => Nil Nat
+    | AVar _ => Nil Nat
+    | AHole _ => Nil Nat
+    | ASort _ => Nil Nat
+    | ANatLit _ => Nil Nat
+    | AApp _ _ => Nil Nat
+    | ALam _ _ _ => Nil Nat
+    | APi _ _ _ => Nil Nat
+    | ALet _ _ _ _ => Nil Nat
+    | AAscribe _ _ => Nil Nat
+    | ABinder _ _ _ => Nil Nat
+    | ANoBinder => Nil Nat
+    | AFix _ _ _ _ => Nil Nat
+    | ABranch _ _ _ _ => Nil Nat
+    | ANoBranch => Nil Nat
+    | AMatch _ _ => Nil Nat
+    | APerform _ _ => Nil Nat
+    | AHandle _ _ => Nil Nat
+    | ADo _ => Nil Nat
+    | AList _ => Nil Nat
+    | AStr _ => Nil Nat
+    end;
+
+def handled (op : Nat) : List (List Nat) -> Bool :=
+  fix handled (st : List (List Nat)) : Bool :=
+    match st with
+    | Nil => False
+    | Cons ops rest =>
+        match mem_id op ops with
+        | True => True
+        | False => handled rest
+        end
+    end;
+
+def missing_ops (have : List Nat) : List Nat -> List Nat :=
+  fix missing_ops (xs : List Nat) : List Nat :=
+    match xs with
+    | Nil => Nil Nat
+    | Cons op rest =>
+        match mem_id op have with
+        | True => missing_ops rest
+        | False => Cons Nat op (missing_ops rest)
+        end
+    end;
+
+def concat_performs (go : Ast -> List Nat) : List Ast -> List Nat :=
+  concat_map Ast Nat go;
+
+def performs_in : Ast -> List Nat :=
+  fun (root : Ast) =>
+    (fix performs_in (fuel : Nat) (a : Ast) : List Nat :=
+      match fuel with
+      | Z => Nil Nat
+      | S remaining =>
+          let descend : Ast -> List Nat :=
+            fun (child : Ast) => performs_in remaining child in
+          match a with
+          | APerform op args =>
+              Cons Nat op (concat_performs descend args)
+          | AHandle inner cls =>
+              append Nat (descend inner) (descend cls)
+          | AClause _ _ body rest =>
+              append Nat (descend body) (descend rest)
+          | ADo xs => concat_performs descend xs
+          | AList xs => concat_performs descend xs
+          | AStr _ => Nil Nat
+          | AApp f x => append Nat (descend f) (descend x)
+          | ALam _ ann body => append Nat (descend ann) (descend body)
+          | APi _ dom cod => append Nat (descend dom) (descend cod)
+          | ALet _ ann v body =>
+              append Nat (descend ann)
+                (append Nat (descend v) (descend body))
+          | AAscribe e t => append Nat (descend e) (descend t)
+          | ABinder _ ty rest => append Nat (descend ty) (descend rest)
+          | AFix _ binders ret body =>
+              append Nat (descend binders)
+                (append Nat (descend ret) (descend body))
+          | ABranch _ _ body rest =>
+              append Nat (descend body) (descend rest)
+          | AMatch s b => append Nat (descend s) (descend b)
+          | AVar _ => Nil Nat
+          | AHole _ => Nil Nat
+          | ASort _ => Nil Nat
+          | ANatLit _ => Nil Nat
+          | ANoBinder => Nil Nat
+          | ANoBranch => Nil Nat
+          | ANoClause => Nil Nat
+          end
+      end) (ast_size root) root;
+
+def miss_issues : List Nat -> List EffIssue :=
+  map Nat EffIssue (fun (op : Nat) => IHandleMissingOp op);
+
+def walk_args (go : Ast -> List EffIssue) : List Ast -> List EffIssue :=
+  concat_map Ast EffIssue go;
+
+def prim_eff (ly : Layer) (ids : CapIds) (n : Nat) : List EffIssue :=
+    match mem_id n (cap_proc ids) with
+    | True =>
+        match layer_allows_proc ly with
+        | True => eff_inil
+        | False => eff_icons (IUnhandledPerform n) eff_inil
+        end
+    | False =>
+        match mem_id n (cap_http ids) with
+        | True =>
+            match layer_allows_http ly with
+            | True => eff_inil
+            | False => eff_icons (IUnhandledPerform n) eff_inil
+            end
+        | False => eff_inil
+        end
+    end;
+
+def analyze_go (ids : CapIds) (ly : Layer)
+    : Bool -> List (List Nat) -> Ast -> List EffIssue :=
+  fun (initial_pure : Bool) (initial_handlers : List (List Nat)) (root : Ast) =>
+    (fix analyze_go (fuel : Nat) (pure : Bool) (st : List (List Nat)) (a : Ast) : List EffIssue :=
+      match fuel with
+      | Z => eff_inil
+      | S remaining =>
+          let descend : Bool -> List (List Nat) -> Ast -> List EffIssue :=
+            fun (next_pure : Bool) (next_st : List (List Nat)) (child : Ast) => analyze_go remaining next_pure next_st child in
+          match a with
+          | AHole n =>
+              match pure with
+              | True => eff_icons (IPureHole n) eff_inil
+              | False => eff_inil
+              end
+          | AVar n => prim_eff ly ids n
+          | APerform op args =>
+              let u : List EffIssue :=
+                match handled op st with
+                | True => eff_inil
+                | False => eff_icons (IUnhandledPerform op) eff_inil
+                end in
+              let p : List EffIssue :=
+                match pure with
+                | True => eff_icons (IPureEffect op) eff_inil
+                | False => eff_inil
+                end in
+              eff_append_issues u
+                (eff_append_issues p
+                  (eff_append_issues (prim_eff ly ids op)
+                    (walk_args (descend pure st) args)))
+          | AHandle inner cls =>
+              let ops : List Nat := clause_ops cls in
+              let miss : List EffIssue :=
+                miss_issues (missing_ops ops (performs_in inner)) in
+              let st2 : List (List Nat) := Cons (List Nat) ops st in
+              eff_append_issues miss
+                (eff_append_issues (descend pure st2 inner) (descend pure st cls))
+          | AClause op binders body rest =>
+              let disc : List EffIssue :=
+                match eq_nat op (cap_pure ids) with
+                | True =>
+                    match performs_in body with
+                    | Nil => eff_inil
+                    | Cons p _ => eff_icons (IPureEffect p) eff_inil
+                    end
+                | False =>
+                    match last_id binders with
+                    | Nothing => eff_inil
+                    | Just k =>
+                        match eq_nat k (cap_under ids) with
+                        | True => eff_icons (IDiscardedCont op) eff_inil
+                        | False => eff_inil
+                        end
+                    end
+                end in
+              let bodyPure : Bool :=
+                orb pure (eq_nat op (cap_pure ids)) in
+              eff_append_issues disc
+                (eff_append_issues (descend bodyPure st body) (descend pure st rest))
+          | ADo xs => walk_args (descend pure st) xs
+          | AList xs => walk_args (descend pure st) xs
+          | AStr _ => eff_inil
+          | AApp f x =>
+              let h : List EffIssue :=
+                match head_id f with
+                | Nothing => eff_inil
+                | Just n => prim_eff ly ids n
+                end in
+              eff_append_issues h
+                (eff_append_issues (descend pure st f) (descend pure st x))
+          | ALam _ ann body =>
+              eff_append_issues (descend pure st ann) (descend pure st body)
+          | APi _ dom cod =>
+              eff_append_issues (descend pure st dom) (descend pure st cod)
+          | ALet _ ann v body =>
+              eff_append_issues (descend pure st ann)
+                (eff_append_issues (descend pure st v) (descend pure st body))
+          | AAscribe e t =>
+              eff_append_issues (descend pure st e) (descend pure st t)
+          | ABinder _ ty rest =>
+              eff_append_issues (descend pure st ty) (descend pure st rest)
+          | AFix _ binders ret body =>
+              eff_append_issues (descend pure st binders)
+                (eff_append_issues (descend pure st ret) (descend pure st body))
+          | ABranch _ _ body rest =>
+              eff_append_issues (descend pure st body) (descend pure st rest)
+          | AMatch s b =>
+              eff_append_issues (descend pure st s) (descend pure st b)
+          | ASort _ => eff_inil
+          | ANatLit _ => eff_inil
+          | ANoBinder => eff_inil
+          | ANoBranch => eff_inil
+          | ANoClause => eff_inil
+          end
+      end) (ast_size root) initial_pure initial_handlers root;
+
+def analyze_effects (a : Ast) (pure : Bool) (ids : CapIds) (ly : Layer)
+    : List EffIssue :=
+    analyze_go ids ly pure (Nil (List Nat)) a;

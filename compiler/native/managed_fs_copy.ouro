@@ -1,0 +1,126 @@
+-- Copy captures both paths. Each invocation converts both in one raw scope,
+-- invokes the checked OS adapter and releases all six temporary pages.
+import "managed_fs_mutations.ouro";
+
+def managed_copy_name : List Nat :=
+    ([114,97,119,95,119,105,110,100,111,119,115,95,102,105,108,101,95,99,111,112,121] : List Nat);
+
+def managed_copy_expected (compiler : ManagedCompiler) : Either NativeLowerError CoreTerm :=
+    let bindings : List PrimitiveResolved := primitive_environment (managed_compiler_entries compiler) in
+    lower_from_primitive CoreTerm (CSort 0)
+      (primitive_bind CoreTerm CoreTerm (primitive_type_ref PrimitiveRuntimeType bindings) (fun (runtime : CoreTerm) =>
+        primitive_bind CoreTerm CoreTerm (primitive_type_ref PrimitiveRawPtrType bindings) (fun (pointer : CoreTerm) =>
+          primitive_bind CoreTerm CoreTerm (primitive_type_ref PrimitiveU8Type bindings) (fun (byte : CoreTerm) =>
+            primitive_bind CoreTerm CoreTerm (primitive_type_ref PrimitiveUSizeType bindings) (fun (size : CoreTerm) =>
+              primitive_map CoreTerm CoreTerm (fun (word : CoreTerm) =>
+                let path : CoreTerm := CApp pointer byte in
+                primitive_arrow ([path, size, path, size] : List CoreTerm) (CApp runtime word))
+                (primitive_type_ref PrimitiveU32Type bindings))))));
+
+def managed_copy_roots (compiler : ManagedCompiler) (fuel : Nat) : Either NativeLowerError (List Nat) :=
+    match managed_stdio_has compiler PrimitiveFileCopy with
+    | False => Right NativeLowerError (List Nat) ([] : List Nat)
+    | True => lower_bind CoreTerm (List Nat) (managed_copy_expected compiler) (fun (expected : CoreTerm) =>
+        lower_bind Nat (List Nat) (managed_runtime_definition compiler fuel managed_copy_name expected)
+          (fun (query : Nat) =>
+            (fix helpers (rest : List ManagedStartupHelper) : Either NativeLowerError (List Nat) :=
+              match rest with | Nil => Right NativeLowerError (List Nat) ([query] : List Nat)
+              | Cons helper tail => lower_bind CoreTerm (List Nat) (managed_startup_expected compiler helper)
+                  (fun (annotation : CoreTerm) => lower_bind Nat (List Nat)
+                    (managed_runtime_definition compiler fuel (managed_startup_helper_name helper) annotation)
+                    (fun (id : Nat) => lower_map (List Nat) (List Nat) (Cons Nat id) (helpers tail))) end)
+              ([ManagedStartupAllocate, ManagedStartupRelease, ManagedStartupToWide] : List ManagedStartupHelper))) end;
+
+def managed_copy_query (compiler : ManagedCompiler) (source : MirValue) (source_units : MirValue)
+    (scope : ManagedStartupScope) (target : MirValue) (target_units : MirValue) (count : MirValue)
+    (state : ManagedState) : Either NativeLowerError ManagedResult :=
+    lower_bind CoreTerm ManagedResult (managed_copy_expected compiler) (fun (expected : CoreTerm) =>
+      lower_bind LowerContract ManagedResult
+        (managed_runtime_contract compiler primitive_default_fuel managed_copy_name expected)
+        (fun (contract : LowerContract) => lower_bind ManagedResult ManagedResult
+          (managed_fresh MirU32 (fun (local : Nat) => MirCall MirMayGc (Just Nat local)
+            (MirDirect (lower_contract_id contract)) ([source, source_units, target, target_units] : List MirValue)) state)
+          (fun (copied : ManagedResult) => match copied with | ManagedResultOf status next =>
+            managed_startup_status compiler scope status (managed_unit_value compiler) next end)));
+
+def managed_copy_storage (compiler : ManagedCompiler)
+    (endpoint : ManagedStartupScope -> MirValue -> MirValue -> MirValue -> ManagedState -> Either NativeLowerError ManagedResult)
+    (value : MirValue) (bytes : MirValue) (count : MirValue) (scope : ManagedStartupScope) (state : ManagedState)
+    : Either NativeLowerError ManagedResult :=
+    managed_startup_buffer compiler scope bytes
+      (managed_startup_name_copy compiler endpoint value bytes count) state;
+
+-- The destination inherits the source's scope, so failures during its size,
+-- allocation or conversion also release the source's temporary storage.
+def managed_copy_path (compiler : ManagedCompiler)
+    (endpoint : ManagedStartupScope -> MirValue -> MirValue -> MirValue -> ManagedState -> Either NativeLowerError ManagedResult)
+    (value : MirValue) (scope : ManagedStartupScope) (state : ManagedState) : Either NativeLowerError ManagedResult :=
+    lower_bind ManagedResult ManagedResult (managed_string_size compiler value state)
+      (fun (sized : ManagedResult) => match sized with | ManagedResultOf bytes next =>
+        lower_bind ManagedResult ManagedResult (managed_compare MirNotEqual bytes (managed_bits MirUSize 0) next)
+          (fun (positive : ManagedResult) => match positive with | ManagedResultOf nonempty after =>
+            lower_bind ManagedResult ManagedResult (managed_compare MirLessEqual bytes managed_startup_int_max after)
+              (fun (bounded : ManagedResult) => match bounded with | ManagedResultOf fits entered =>
+                lower_bind ManagedResult ManagedResult (managed_binary MirU8 MirAnd nonempty fits entered)
+                  (fun (checked : ManagedResult) => match checked with | ManagedResultOf valid final =>
+                    managed_startup_check compiler scope valid
+                      (managed_startup_buffer compiler scope (managed_bits MirUSize 8)
+                        (managed_copy_storage compiler endpoint value bytes)) final end) end) end) end);
+
+def managed_copy_target (compiler : ManagedCompiler) (target : MirValue) (scope : ManagedStartupScope)
+    (source : MirValue) (source_units : MirValue) (count : MirValue) (state : ManagedState)
+    : Either NativeLowerError ManagedResult :=
+    managed_copy_path compiler (managed_copy_query compiler source source_units) target scope state;
+
+def managed_copy_action (compiler : ManagedCompiler) (source : MirValue) (target : MirValue)
+    (state : ManagedState) : Either NativeLowerError ManagedResult :=
+    managed_action compiler ([source, target] : List MirValue)
+      (fun (captures : List MirValue) (entered : ManagedState) =>
+        lower_bind (Pair MirValue MirValue) ManagedResult (lower_pair MirValue captures)
+          (fun (pair : Pair MirValue MirValue) => match pair with | MkPair from to =>
+            managed_copy_path compiler (managed_copy_target compiler to) from
+              (ManagedStartupScopeOf ([] : List MirValue) (Nothing MirValue)) entered end)) state;
+
+def managed_copy_partial (compiler : ManagedCompiler) (source : MirValue) (state : ManagedState)
+    : Either NativeLowerError ManagedResult :=
+    let caller : LowerState := managed_flow state in
+    lower_bind (Pair Nat ManagedState) ManagedResult (managed_fresh_symbol state)
+      (fun (fresh : Pair Nat ManagedState) => match fresh with | MkPair symbol reserved =>
+        lower_bind ManagedResult ManagedResult
+          (managed_load MirManagedPtr (MirUse 0) 40 (managed_with_flow reserved (lower_empty_state 2)))
+          (fun (loaded : ManagedResult) => match loaded with | ManagedResultOf name entered =>
+            lower_bind ManagedResult ManagedResult (managed_copy_action compiler name (MirUse 1) entered)
+              (fun (compiled : ManagedResult) => match compiled with | ManagedResultOf action after =>
+                let function : MirFunction := managed_finish_function symbol
+                  ([111,117,114,111,95,99,111,112,121,95,116,97,114,103,101,116] : List Nat)
+                  ([MirLocalDef 0 MirManagedPtr, MirLocalDef 1 MirManagedPtr] : List MirLocal) action after in
+                managed_emit_callable compiler 3 symbol False ([source] : List MirValue)
+                  (managed_with_flow (managed_add_function function after) caller) end) end) end);
+
+def managed_copy_value (compiler : ManagedCompiler) (state : ManagedState) : Either NativeLowerError ManagedResult :=
+    let caller : LowerState := managed_flow state in
+    lower_bind (Pair Nat ManagedState) ManagedResult (managed_fresh_symbol state)
+      (fun (fresh : Pair Nat ManagedState) => match fresh with | MkPair symbol reserved =>
+        lower_bind ManagedResult ManagedResult
+          (managed_copy_partial compiler (MirUse 1) (managed_with_flow reserved (lower_empty_state 2)))
+          (fun (compiled : ManagedResult) => match compiled with | ManagedResultOf value after =>
+            let function : MirFunction := managed_finish_function symbol
+              ([111,117,114,111,95,99,111,112,121,95,115,111,117,114,99,101] : List Nat)
+              ([MirLocalDef 0 MirManagedPtr, MirLocalDef 1 MirManagedPtr] : List MirLocal) value after in
+            managed_emit_callable compiler 3 symbol False ([] : List MirValue)
+              (managed_with_flow (managed_add_function function after) caller) end) end);
+
+def managed_copy_primitive (compiler : ManagedCompiler) (step : ManagedStep) (scope : ManagedScope)
+    (arguments : List CoreTerm) (state : ManagedState) : Either NativeLowerError ManagedResult :=
+    match eqNat (length CoreTerm arguments) 2 with
+    | True => lower_bind (Pair CoreTerm CoreTerm) ManagedResult (lower_pair CoreTerm arguments)
+        (fun (pair : Pair CoreTerm CoreTerm) => match pair with | MkPair source target =>
+          lower_bind ManagedResult ManagedResult (step scope source state)
+            (fun (from : ManagedResult) => match from with | ManagedResultOf value next =>
+              lower_bind ManagedResult ManagedResult (step scope target next)
+                (fun (to : ManagedResult) => match to with | ManagedResultOf destination after =>
+                  managed_copy_action compiler value destination after end) end) end)
+    | False => lower_bind CoreTerm ManagedResult (lower_single CoreTerm arguments)
+        (fun (source : CoreTerm) => lower_bind ManagedResult ManagedResult (step scope source state)
+          (fun (from : ManagedResult) => match from with | ManagedResultOf value next =>
+            managed_copy_partial compiler value next end)) end;

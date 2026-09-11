@@ -1,0 +1,136 @@
+-- Decimal conversion divides a private copy of the immutable Nat limbs.
+-- The working value remains a managed owner; no raw interior address escapes.
+import "managed_string_access.ouro";
+
+def managed_decimal_capacity (count : MirValue) (state : ManagedState) : Either NativeLowerError ManagedResult :=
+    let maximum : MirValue := MirBits MirUSize
+      (X64Words64 (X64Bytes32 255 255 255 255) (X64Bytes32 255 255 255 255)) in
+    lower_bind ManagedResult ManagedResult (managed_binary MirUSize MirDiv maximum (managed_bits MirUSize 10) state)
+      (fun (bound : ManagedResult) => match bound with | ManagedResultOf limit next =>
+        lower_bind ManagedResult ManagedResult (managed_compare MirLessEqual count limit next)
+          (fun (tested : ManagedResult) => match tested with | ManagedResultOf fits after =>
+            lower_bind ManagedState ManagedResult (managed_guard fits after)
+              (fun (checked : ManagedState) => managed_binary MirUSize MirMul count (managed_bits MirUSize 10) checked) end) end);
+
+-- carry < 10, so (carry << 32) | limb fits U64 and its quotient fits U32.
+def managed_decimal_divide_limb (value : MirValue) (index : Nat) (carry : Nat) (state : ManagedState)
+    : Either NativeLowerError ManagedState :=
+    lower_bind ManagedResult ManagedState (managed_nat_load_limb value (MirUse index) state)
+      (fun (loaded : ManagedResult) => match loaded with | ManagedResultOf limb next =>
+        lower_bind ManagedResult ManagedState (managed_convert MirU64 MirZeroExtend limb next)
+          (fun (extended : ManagedResult) => match extended with | ManagedResultOf low after =>
+            lower_bind ManagedResult ManagedState (managed_binary MirU64 MirShl (MirUse carry) (managed_bits MirU32 32) after)
+              (fun (shifted : ManagedResult) => match shifted with | ManagedResultOf high ready =>
+                lower_bind ManagedResult ManagedState (managed_binary MirU64 MirOr high low ready)
+                  (fun (joined : ManagedResult) => match joined with | ManagedResultOf dividend after_join =>
+                    lower_bind ManagedResult ManagedState (managed_binary MirU64 MirDiv dividend (managed_bits MirU64 10) after_join)
+                      (fun (divided : ManagedResult) => match divided with | ManagedResultOf quotient after_divide =>
+                        lower_bind ManagedResult ManagedState (managed_binary MirU64 MirRem dividend (managed_bits MirU64 10) after_divide)
+                          (fun (remainder : ManagedResult) => match remainder with | ManagedResultOf digit after_remainder =>
+                            lower_bind ManagedResult ManagedState (managed_convert MirU32 MirNarrow quotient after_remainder)
+                              (fun (narrowed : ManagedResult) => match narrowed with | ManagedResultOf result finish =>
+                                managed_nat_store_limb value (MirUse index) result (managed_emit (MirMove carry digit) finish)
+                                end) end) end) end) end) end) end);
+
+def managed_decimal_divide_loop (value : MirValue) (count : MirValue) (state : ManagedState)
+    : Either NativeLowerError ManagedResult :=
+    lower_bind (Pair Nat ManagedState) ManagedResult (managed_fresh_local MirUSize state)
+      (fun (position : Pair Nat ManagedState) => match position with | MkPair index after_position =>
+        lower_bind (Pair Nat ManagedState) ManagedResult (managed_fresh_local MirU64 after_position)
+          (fun (remainder : Pair Nat ManagedState) => match remainder with | MkPair carry after_remainder =>
+            let initialized : ManagedState := managed_emit_all
+              ([MirMove index count, MirMove carry (managed_bits MirU64 0)] : List MirInstruction) after_remainder in
+            lower_bind LowerLoopBlocks ManagedResult (lower_loop_blocks (managed_flow initialized))
+              (fun (labels : LowerLoopBlocks) => match labels with | LowerLoopAt header body finish flow =>
+                lower_bind ManagedResult ManagedResult (managed_compare MirNotEqual (MirUse index) (managed_bits MirUSize 0)
+                  (managed_with_flow initialized (lower_switch_block header (MirJump header) flow)))
+                  (fun (tested : ManagedResult) => match tested with | ManagedResultOf running next =>
+                    lower_map ManagedState ManagedResult (fun (divided : ManagedState) => ManagedResultOf (MirUse carry)
+                      (managed_switch_block finish (MirJump header) divided))
+                      (managed_decimal_divide_limb value index carry
+                        (managed_emit (MirBinaryOp index MirSub (MirUse index) (managed_bits MirUSize 1))
+                          (managed_switch_block body (MirBranch running body finish) next))) end) end) end) end);
+
+-- Dividing a canonical base-2^32 number by ten removes at most one limb.
+-- The caller proves count > 0; the result is again canonical before returning.
+def managed_decimal_divide (value : MirValue) (count : Nat) (state : ManagedState)
+    : Either NativeLowerError ManagedResult :=
+    lower_bind ManagedResult ManagedResult (managed_decimal_divide_loop value (MirUse count) state)
+      (fun (divided : ManagedResult) => match divided with | ManagedResultOf digit next =>
+        lower_bind ManagedResult ManagedResult (managed_binary MirUSize MirSub (MirUse count) (managed_bits MirUSize 1) next)
+          (fun (last : ManagedResult) => match last with | ManagedResultOf index after =>
+            lower_bind ManagedResult ManagedResult (managed_nat_load_limb value index after)
+              (fun (loaded : ManagedResult) => match loaded with | ManagedResultOf high ready =>
+                lower_bind ManagedResult ManagedResult (managed_compare MirEqual high (managed_bits MirU32 0) ready)
+                  (fun (tested : ManagedResult) => match tested with | ManagedResultOf empty after_test =>
+                    lower_map ManagedState ManagedResult (fun (trimmed : ManagedState) => ManagedResultOf digit
+                      (managed_emit (MirStore value (codegen_disp 32) (MirUse count)) trimmed))
+                      (managed_nat_when empty (fun (selected : ManagedState) => Right NativeLowerError ManagedState
+                        (managed_emit (MirMove count index) selected)) after_test) end) end) end) end);
+
+-- Digits are placed from the end, leaving a contiguous forward-order suffix.
+def managed_decimal_store_digit (buffer : MirValue) (cursor : Nat) (digit : MirValue) (state : ManagedState)
+    : Either NativeLowerError ManagedState :=
+    lower_bind ManagedResult ManagedState (managed_compare MirNotEqual (MirUse cursor) (managed_bits MirUSize 0) state)
+      (fun (tested : ManagedResult) => match tested with | ManagedResultOf room next =>
+        lower_bind ManagedState ManagedState (managed_guard room next)
+          (fun (checked : ManagedState) => lower_bind ManagedResult ManagedState (managed_convert MirU8 MirNarrow digit checked)
+            (fun (narrowed : ManagedResult) => match narrowed with | ManagedResultOf bits after =>
+              lower_bind ManagedResult ManagedState (managed_binary MirU8 MirAdd bits (managed_bits MirU8 48) after)
+                (fun (encoded : ManagedResult) => match encoded with | ManagedResultOf byte ready =>
+                  lower_map ManagedResult ManagedState (fun (at : ManagedResult) => match at with
+                    | ManagedResultOf offset finish => managed_emit (MirStoreAt buffer offset byte) finish end)
+                    (managed_binary MirUSize MirAdd (MirUse cursor) (managed_bits MirUSize 40)
+                      (managed_emit (MirBinaryOp cursor MirSub (MirUse cursor) (managed_bits MirUSize 1)) ready)) end) end)) end);
+
+def managed_decimal_digits (value : MirValue) (count : MirValue) (buffer : MirValue)
+    (capacity : MirValue) (state : ManagedState) : Either NativeLowerError ManagedResult :=
+    lower_bind (Pair Nat ManagedState) ManagedResult (managed_fresh_local MirUSize state)
+      (fun (remaining : Pair Nat ManagedState) => match remaining with | MkPair size after_size =>
+        lower_bind (Pair Nat ManagedState) ManagedResult (managed_fresh_local MirUSize after_size)
+          (fun (position : Pair Nat ManagedState) => match position with | MkPair cursor after_cursor =>
+            let initialized : ManagedState := managed_emit_all
+              ([MirMove size count, MirMove cursor capacity] : List MirInstruction) after_cursor in
+            lower_bind LowerLoopBlocks ManagedResult (lower_loop_blocks (managed_flow initialized))
+              (fun (labels : LowerLoopBlocks) => match labels with | LowerLoopAt header body finish flow =>
+                lower_bind ManagedResult ManagedResult (managed_compare MirNotEqual (MirUse size) (managed_bits MirUSize 0)
+                  (managed_with_flow initialized (lower_switch_block header (MirJump header) flow)))
+                  (fun (tested : ManagedResult) => match tested with | ManagedResultOf running next =>
+                    lower_bind ManagedResult ManagedResult
+                      (managed_decimal_divide value size (managed_switch_block body (MirBranch running body finish) next))
+                      (fun (divided : ManagedResult) => match divided with | ManagedResultOf digit after_divide =>
+                        lower_map ManagedState ManagedResult (fun (stored : ManagedState) => ManagedResultOf (MirUse cursor)
+                          (managed_switch_block finish (MirJump header) stored))
+                          (managed_decimal_store_digit buffer cursor digit after_divide) end) end) end) end) end);
+
+def managed_decimal_copy (compiler : ManagedCompiler) (value : MirValue) (count : MirValue) (state : ManagedState)
+    : Either NativeLowerError ManagedResult :=
+    lower_bind ManagedResult ManagedResult (managed_nat_allocate compiler count state)
+      (fun (allocated : ManagedResult) => match allocated with | ManagedResultOf copy next =>
+        lower_bind ManagedResult ManagedResult (managed_binary MirUSize MirShl count (managed_bits MirU32 2) next)
+          (fun (scaled : ManagedResult) => match scaled with | ManagedResultOf bytes after =>
+            lower_map ManagedState ManagedResult (fun (copied : ManagedState) => ManagedResultOf copy copied)
+              (managed_bytes_copy value (managed_bits MirUSize 40) copy (managed_bits MirUSize 40) bytes after) end) end);
+
+def managed_decimal_nonzero (compiler : ManagedCompiler) (value : MirValue) (count : MirValue) (state : ManagedState)
+    : Either NativeLowerError ManagedResult :=
+    lower_bind ManagedResult ManagedResult (managed_decimal_capacity count state)
+      (fun (bounded : ManagedResult) => match bounded with | ManagedResultOf capacity next =>
+        lower_bind ManagedResult ManagedResult (managed_decimal_copy compiler value count next)
+          (fun (copied : ManagedResult) => match copied with | ManagedResultOf copy after_copy =>
+            lower_bind ManagedResult ManagedResult (managed_string_allocate compiler capacity after_copy)
+              (fun (allocated : ManagedResult) => match allocated with | ManagedResultOf buffer after_buffer =>
+                lower_bind ManagedResult ManagedResult (managed_decimal_digits copy count buffer capacity after_buffer)
+                  (fun (converted : ManagedResult) => match converted with | ManagedResultOf start after_digits =>
+                    lower_bind ManagedResult ManagedResult (managed_binary MirUSize MirSub capacity start after_digits)
+                      (fun (length : ManagedResult) => match length with | ManagedResultOf size finish =>
+                        managed_string_copy_slice compiler buffer start size finish end) end) end) end) end);
+
+def managed_string_of_nat_value (compiler : ManagedCompiler) (value : MirValue) (state : ManagedState)
+    : Either NativeLowerError ManagedResult :=
+    lower_bind ManagedResult ManagedResult (managed_nat_count compiler value state)
+      (fun (loaded : ManagedResult) => match loaded with | ManagedResultOf count next =>
+        lower_bind ManagedResult ManagedResult (managed_compare MirEqual count (managed_bits MirUSize 0) next)
+          (fun (tested : ManagedResult) => match tested with | ManagedResultOf zero after =>
+            managed_string_choose MirManagedPtr zero (managed_string_literal compiler ([48] : List Nat))
+              (managed_decimal_nonzero compiler value count) after end) end);

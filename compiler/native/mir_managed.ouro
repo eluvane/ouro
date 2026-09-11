@@ -1,0 +1,56 @@
+-- The initial managed ABI uses exact, contiguous reference ranges. Descriptor
+-- data contains no addresses; object identity is its readonly symbol address.
+import "mir_model.ouro";
+
+def mir_managed_prefix (kind : Nat) : Nat :=
+    match eq_nat kind 1 with | True => 56 | False =>
+      match andb (leb_nat 3 kind) (leb_nat kind 5) with | True => 48 | False => 40 end end;
+
+def mir_managed_descriptor_bytes (kind : Nat) : List Nat :=
+    match andb (leb_nat 1 kind) (leb_nat kind 15) with | False => ([] : List Nat) | True =>
+      let start : Nat := match eq_nat kind 1 with | True => 56 | False =>
+        match leb_nat kind 5 with | True => 40 | False => 0 end end in
+      let mode : Nat := match leb_nat kind 2 with | True => 2 | False =>
+        match leb_nat kind 5 with | True => 1 | False => 0 end end in
+      let count : Nat := match eq_nat kind 1 with | True => 48 | False =>
+        match eq_nat kind 2 with | True => 32 | False =>
+          match leb_nat kind 5 with | True => 1 | False => 0 end end end in
+      pe_join ([pe_le32 1, pe_le32 kind, pe_le64_rva (mir_managed_prefix kind),
+        pe_le64_rva start, pe_le64_rva mode, pe_le64_rva count] : List (List Nat)) end;
+
+def mir_managed_descriptor_valid (bytes : List Nat) : Bool :=
+    andb (eq_nat (length Nat bytes) 40)
+      (pe_bytes_equal bytes (mir_managed_descriptor_bytes (nth Nat 0 4 bytes)));
+
+def mir_program_instructions (program : MirProgram) : List MirInstruction :=
+    match program with | MirProgramDef functions _ _ _ =>
+      concat_map MirFunction MirInstruction (fun (function : MirFunction) => match function with
+        | MirFunctionDef _ _ _ _ _ _ blocks => concat_map MirBlock MirInstruction
+            (fun (block : MirBlock) => match block with | MirBlockDef _ instructions _ => instructions end) blocks end) functions end;
+
+def mir_managed_descriptors (program : MirProgram) : List Nat :=
+    foldr MirInstruction (List Nat) (fun (instruction : MirInstruction) (ids : List Nat) =>
+      match instruction with
+      | MirManagedAlloc _ _ _ descriptor _ => mir_add descriptor ids
+      | MirManagedContext _ => ids
+      | MirMove _ _ => ids | MirBinaryOp _ _ _ _ => ids | MirCompare _ _ _ _ => ids
+      | MirConvert _ _ _ => ids | MirLoad _ _ _ => ids | MirStore _ _ _ => ids
+      | MirLoadAt _ _ _ => ids | MirStoreAt _ _ _ => ids
+      | MirAddress _ _ => ids | MirPointerAdd _ _ _ => ids | MirCall _ _ _ _ => ids end)
+      ([] : List Nat) (mir_program_instructions program);
+
+def mir_function_has_roots (function : MirFunction) : Bool :=
+    match function with | MirFunctionDef _ _ args locals _ _ _ =>
+      any MirLocal (fun (local : MirLocal) => mir_type_equal (mir_local_type local) MirManagedPtr)
+        (append MirLocal args locals) end;
+
+def mir_managed_enabled (program : MirProgram) : Bool :=
+    match program with | MirProgramDef functions _ _ _ =>
+      orb (any MirFunction mir_function_has_roots functions)
+        (any MirInstruction (fun (instruction : MirInstruction) => match instruction with
+          | MirManagedAlloc _ _ _ _ _ => True | MirManagedContext _ => True
+          | MirMove _ _ => False | MirBinaryOp _ _ _ _ => False | MirCompare _ _ _ _ => False
+          | MirConvert _ _ _ => False | MirLoad _ _ _ => False | MirStore _ _ _ => False
+          | MirLoadAt _ _ _ => False | MirStoreAt _ _ _ => False
+          | MirAddress _ _ => False | MirPointerAdd _ _ _ => False | MirCall _ _ _ _ => False end)
+          (mir_program_instructions program)) end;

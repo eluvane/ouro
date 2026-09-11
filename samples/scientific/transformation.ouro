@@ -1,0 +1,204 @@
+-- Deterministic transformation identity and invocation validation.
+
+import "execution_evidence.ouro";
+import "../../std/process.ouro";
+
+def invocationCanonical
+  (Input : Type)
+  (Output : Type)
+  (spec : ToolSpec Input Output)
+  (inputs : List ArtifactIdentity) : String :=
+  match spec with
+  | MkToolSpec tool arguments parameters environment determinism contract =>
+      str_join "|"
+        ([ canonicalField "schema" "ouro.external-tool.v2"
+        , canonicalField "tool" (toolIdentityName tool)
+        , canonicalField "executable" (toolIdentityExecutable tool)
+        , canonicalField "version" (toolIdentityVersion tool)
+        , canonicalField "arguments" (canonicalStrings arguments)
+        , canonicalField "parameters" (canonicalParameters parameters)
+        , canonicalField "environment" (canonicalEnvironment environment)
+        , canonicalField "determinism" (canonicalDeterminism determinism)
+        , canonicalField "inputs" (canonicalArtifactIdentities inputs)
+        , canonicalField "output-contract" (canonicalOutputContract contract)
+        ] : List String)
+  end;
+
+def invocationTransformationIdentity
+  (Input : Type)
+  (Output : Type)
+  (spec : ToolSpec Input Output)
+  (inputs : List ArtifactIdentity) : TransformationIdentity :=
+  MkTransformationIdentity
+    (str_concat "transform:sha256:"
+      (sha256 (invocationCanonical Input Output spec inputs)));
+
+def transformationOutputIdentity
+  (identity : TransformationIdentity) : ArtifactIdentity :=
+  DerivedArtifactIdentity identity (Nothing ContentIdentity);
+
+def invocationOutputIdentity
+  (Input : Type)
+  (Output : Type)
+  (spec : ToolSpec Input Output)
+  (inputs : List ArtifactIdentity) : ArtifactIdentity :=
+  transformationOutputIdentity
+    (invocationTransformationIdentity Input Output spec inputs);
+
+def reproducibilityFor
+  (environment : ExecutionEnvironment)
+  (determinism : ToolDeterminism)
+  (identity : TransformationIdentity) : Reproducibility :=
+  match environment, determinism with
+  | PinnedEnvironment _, DeterministicTool =>
+      ReproducibilityMetadataComplete identity
+  | UnpinnedEnvironment reason, DeterministicTool =>
+      IncompleteReproducibility (str_concat "unpinned environment: " reason)
+  | PinnedEnvironment _, NondeterministicTool reason =>
+      IncompleteReproducibility (str_concat "nondeterministic tool: " reason)
+  | UnpinnedEnvironment environmentReason, NondeterministicTool toolReason =>
+      IncompleteReproducibility
+        (str_cat3 "unpinned environment: " environmentReason
+          (str_concat "; nondeterministic tool: " toolReason))
+  end;
+
+def invalidSpec (message : String) : Either ExternalToolError Unit :=
+  Left ExternalToolError Unit (InvalidExternalToolSpec message);
+
+def validSpec : Either ExternalToolError Unit :=
+  Right ExternalToolError Unit MkUnit;
+
+def requireField (name : String) (value : String) : Either ExternalToolError Unit :=
+  match str_null value with
+  | True => invalidSpec (str_concat name " is empty")
+  | False => validSpec
+  end;
+
+def thenValidate
+  (first : Either ExternalToolError Unit)
+  (next : Unit -> Either ExternalToolError Unit) : Either ExternalToolError Unit :=
+  match first with
+  | Left error => Left ExternalToolError Unit error
+  | Right unit => next unit
+  end;
+
+def validateContentIdentity
+  (identity : ContentIdentity) : Either ExternalToolError Unit :=
+  thenValidate
+    (requireField "content identity algorithm"
+      (contentIdentityAlgorithm identity))
+    (fun (_ : Unit) =>
+      requireField "content identity digest" (contentIdentityDigest identity));
+
+def validateOptionalContent
+  (content : Maybe ContentIdentity) : Either ExternalToolError Unit :=
+  match content with
+  | Nothing => validSpec
+  | Just identity => validateContentIdentity identity
+  end;
+
+def validateArtifactIdentity
+  (identity : ArtifactIdentity) : Either ExternalToolError Unit :=
+  match identity with
+  | DeclaredSourceIdentity source content =>
+      thenValidate (requireField "source artifact identity" source)
+        (fun (_ : Unit) => validateOptionalContent content)
+  | DerivedArtifactIdentity transformation content =>
+      thenValidate
+        (requireField "transformation identity"
+          (transformationIdentityValue transformation))
+        (fun (_ : Unit) => validateOptionalContent content)
+  end;
+
+def validateArtifactIdentities
+  : List ArtifactIdentity -> Either ExternalToolError Unit :=
+  fix validateArtifactIdentities
+    (identities : List ArtifactIdentity) : Either ExternalToolError Unit :=
+    match identities with
+    | Nil => validSpec
+    | Cons identity rest =>
+        thenValidate (validateArtifactIdentity identity)
+          (fun (_ : Unit) => validateArtifactIdentities rest)
+    end;
+
+def validateParameter
+  (parameter : ReproducibilityParameter) : Either ExternalToolError Unit :=
+  thenValidate (requireField "parameter name" (parameterName parameter))
+    (fun (_ : Unit) =>
+      requireField "parameter value" (parameterValue parameter));
+
+def validateParameters
+  : List ReproducibilityParameter -> Either ExternalToolError Unit :=
+  fix validateParameters
+    (parameters : List ReproducibilityParameter)
+    : Either ExternalToolError Unit :=
+    match parameters with
+    | Nil => validSpec
+    | Cons parameter rest =>
+        thenValidate (validateParameter parameter)
+          (fun (_ : Unit) => validateParameters rest)
+    end;
+
+def validateEnvironment
+  (environment : ExecutionEnvironment) : Either ExternalToolError Unit :=
+  match environment with
+  | PinnedEnvironment identity => requireField "environment identity" identity
+  | UnpinnedEnvironment reason => requireField "unpinned environment reason" reason
+  end;
+
+def validateDeterminism
+  (determinism : ToolDeterminism) : Either ExternalToolError Unit :=
+  match determinism with
+  | DeterministicTool => validSpec
+  | NondeterministicTool reason => requireField "nondeterminism reason" reason
+  end;
+
+def validateOutputContract
+  (contract : OutputContract) : Either ExternalToolError Unit :=
+  thenValidate (requireField "output kind" (outputContractKind contract))
+    (fun (_ : Unit) =>
+      requireField "output path" (outputContractPath contract));
+
+def validateToolSpec
+  (Input : Type)
+  (Output : Type)
+  (spec : ToolSpec Input Output) : Either ExternalToolError Unit :=
+  match spec with
+  | MkToolSpec tool _ parameters environment determinism contract =>
+      thenValidate (requireField "tool name" (toolIdentityName tool))
+        (fun (_ : Unit) =>
+          thenValidate (requireField "tool executable" (toolIdentityExecutable tool))
+            (fun (_ : Unit) =>
+              thenValidate (requireField "tool version" (toolIdentityVersion tool))
+                (fun (_ : Unit) =>
+                  thenValidate (validateParameters parameters)
+                    (fun (_ : Unit) =>
+                      thenValidate (validateEnvironment environment)
+                        (fun (_ : Unit) =>
+                          thenValidate (validateDeterminism determinism)
+                            (fun (_ : Unit) =>
+                              validateOutputContract contract))))))
+  end;
+
+def validateInvocation
+  (Input : Type)
+  (Output : Type)
+  (spec : ToolSpec Input Output)
+  (inputs : List ArtifactIdentity) : Either ExternalToolError Unit :=
+  thenValidate (validateToolSpec Input Output spec)
+    (fun (_ : Unit) => validateArtifactIdentities inputs);
+
+def executionAttempt
+  (Input : Type)
+  (Output : Type)
+  (spec : ToolSpec Input Output)
+  (inputs : List ArtifactIdentity)
+  (result : ProcResult) : ExecutionAttempt :=
+  match spec with
+  | MkToolSpec tool arguments parameters environment determinism contract =>
+      MkExecutionAttempt tool arguments parameters environment determinism inputs
+        contract (invocationTransformationIdentity Input Output spec inputs)
+        (proc_code result)
+        (streamMetadata (proc_stdout result))
+        (streamMetadata (proc_stderr result))
+  end;

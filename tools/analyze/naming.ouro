@@ -1,0 +1,199 @@
+-- Naming rules the tooling itself depends on: a leading underscore marks a
+-- discard for the dataflow and lint cores, and a capital initial is how the
+-- structured cores tell constructors from binders in pattern slots. Names
+-- that break either convention mislead every other analyzer.
+
+-- @entry analyze_naming
+-- @entry nm_def_issues
+-- @entry nm_ctor_misspelt
+
+import "../../std/data.ouro";
+import "../../std/listx.ouro";
+import "../../std/natx.ouro";
+import "ast.ouro";
+import "dataflow.ouro";
+
+-- discard-spelt binder that is read (binder); one-character definition name
+-- (Z); definition name with a capital initial (Z). Constructor spellings are
+-- a unit-wide check, `nm_ctor_misspelt`.
+inductive NameIssue : Type :=
+  | IUsedDiscard : Nat -> NameIssue
+  | IShortName : Nat -> NameIssue
+  | ICapitalDef : Nat -> NameIssue;
+
+def nm_inil : List NameIssue := [];
+
+def nm_one (i : NameIssue) : List NameIssue := Cons NameIssue i nm_inil;
+
+def nm_append (xs : List NameIssue) (ys : List NameIssue) : List NameIssue :=
+    append NameIssue xs ys;
+
+def nm_upper_a : Nat := 65;
+def nm_upper_z : Nat := 90;
+def nm_lower_a : Nat := 97;
+def nm_lower_z : Nat := 122;
+def nm_underscore : Nat := 95;
+
+def nm_is_upper (c : Nat) : Bool := andb (leb_nat nm_upper_a c) (leb_nat c nm_upper_z);
+
+def nm_is_lower (c : Nat) : Bool := andb (leb_nat nm_lower_a c) (leb_nat c nm_lower_z);
+
+def nm_initial (codes : List Nat) : Nat :=
+    match codes with
+    | Nil => Z
+    | Cons c _ => c
+    end;
+
+def nm_one_char (codes : List Nat) : Bool :=
+    match codes with
+    | Nil => False
+    | Cons _ rest => match rest with | Nil => True | Cons _ _ => False end
+    end;
+
+def nm_used_discard (discards : List Nat) (id : Nat) (scope : Ast) : List NameIssue :=
+    match id with
+    | Z => nm_inil
+    | S _ =>
+        match mem Nat eq_nat id discards with
+        | False => nm_inil
+        | True =>
+            match df_count_uses id scope with
+            | Z => nm_inil
+            | S _ => nm_one (IUsedDiscard id)
+            end
+        end
+    end;
+
+def nm_used_discards (discards : List Nat) (ids : List Nat) (scope : Ast) : List NameIssue :=
+    concat_map Nat NameIssue (fun (id : Nat) => nm_used_discard discards id scope) ids;
+
+-- Dataflow owns positional telescope-use facts. In particular, an outer
+-- name in a parameter's own annotation is not a read of that parameter.
+def nm_fix_param (discards : List Nat) (use : Pair Nat Nat) : List NameIssue :=
+    match use with
+    | MkPair id count =>
+        match id with
+        | Z => nm_inil
+        | S _ =>
+            match mem Nat eq_nat id discards with
+            | False => nm_inil
+            | True =>
+                match count with
+                | Z => nm_inil
+                | S _ => nm_one (IUsedDiscard id)
+                end
+            end
+        end
+    end;
+
+def nm_node_issues (discards : List Nat) (a : Ast) : List NameIssue :=
+    match a with
+    | ALam id _ body => nm_used_discard discards id body
+    | APi id _ cod => nm_used_discard discards id cod
+    | ALet id _ _ body => nm_used_discard discards id body
+    | AFix _ binders ret body =>
+        concat_map (Pair Nat Nat) NameIssue (nm_fix_param discards)
+          (df_fix_param_uses binders ret body)
+    | ABranch _ ids body _ => nm_used_discards discards ids body
+    | AClause _ ids body _ => nm_used_discards discards ids body
+    | AVar _ => nm_inil
+    | AHole _ => nm_inil
+    | ASort _ => nm_inil
+    | ANatLit _ => nm_inil
+    | AStr _ => nm_inil
+    | AApp _ _ => nm_inil
+    | AAscribe _ _ => nm_inil
+    | ABinder _ _ _ => nm_inil
+    | ANoBinder => nm_inil
+    | ANoBranch => nm_inil
+    | AMatch _ _ => nm_inil
+    | APerform _ _ => nm_inil
+    | AHandle _ _ => nm_inil
+    | ANoClause => nm_inil
+    | ADo _ => nm_inil
+    | AList _ => nm_inil
+    end;
+
+def nm_walk (discards : List Nat) : Ast -> List NameIssue :=
+  fun (root : Ast) =>
+    (fix nm_walk (fuel : Nat) (a : Ast) : List NameIssue :=
+      match fuel with
+      | Z => nm_inil
+      | S remaining =>
+          let descend : Ast -> List NameIssue :=
+            fun (child : Ast) => nm_walk remaining child in
+          nm_append (nm_node_issues discards a)
+            (concat_map Ast NameIssue descend (ast_children a))
+      end) (ast_size root) root;
+
+-- A definition whose declared type ends in a Sort names a type or a type
+-- family, which the convention spells with a capital.
+def nm_type_level (a : Ast) : Bool :=
+    match ast_declared_type a with
+    | Nothing => True
+    | Just t => ast_is tag_sort (ast_result_type t)
+    end;
+
+-- What is left of `codes` after the prefix `t`.
+def nm_after_prefix : List Nat -> List Nat -> Maybe (List Nat) :=
+  fix go (t : List Nat) (codes : List Nat) : Maybe (List Nat) :=
+    match t with
+    | Nil => Just (List Nat) codes
+    | Cons c trest =>
+        match codes with
+        | Nil => Nothing (List Nat)
+        | Cons d drest =>
+            match eq_nat c d with
+            | True => go trest drest
+            | False => Nothing (List Nat)
+            end
+        end
+    end;
+
+-- `Type_field` is the projection convention: the record sugar generates it
+-- and handwritten accessors follow it, so the capital belongs to the type.
+def nm_accessor_of (t : List Nat) (codes : List Nat) : Bool :=
+    match nm_after_prefix t codes with
+    | Nothing => False
+    | Just rest =>
+        match rest with
+        | Nil => False
+        | Cons c more =>
+            match more with
+            | Nil => False
+            | Cons _ _ => eq_nat c nm_underscore
+            end
+        end
+    end;
+
+def nm_accessor (inductives : List Nat) (codes_of : Nat -> List Nat) (codes : List Nat) : Bool :=
+    any Nat (fun (t : Nat) => nm_accessor_of (codes_of t) codes) inductives;
+
+-- inductives: ids of the unit's inductives, spelt by `codes_of`; only a
+-- capital initial consults them. codes: the definition's name as character
+-- codes.
+def nm_def_issues (inductives : List Nat) (codes_of : Nat -> List Nat) (codes : List Nat)
+    (a : Ast) : List NameIssue :=
+    nm_append
+      (match nm_one_char codes with
+       | True => nm_one (IShortName Z)
+       | False => nm_inil
+       end)
+      (match nm_is_upper (nm_initial codes) with
+       | False => nm_inil
+       | True =>
+           match orb (nm_type_level a) (nm_accessor inductives codes_of codes) with
+           | True => nm_inil
+           | False => nm_one (ICapitalDef Z)
+           end
+       end);
+
+-- codes: a constructor's name as character codes.
+def nm_ctor_misspelt (codes : List Nat) : Bool :=
+    let c : Nat := nm_initial codes in
+    orb (nm_is_lower c) (eq_nat c nm_underscore);
+
+-- discards: ids whose source spelling starts with `_`.
+def analyze_naming (discards : List Nat) (inductives : List Nat) (codes_of : Nat -> List Nat)
+    (codes : List Nat) (a : Ast) : List NameIssue :=
+    nm_append (nm_def_issues inductives codes_of codes a) (nm_walk discards a);

@@ -1,0 +1,714 @@
+-- Pure lint core: host code owns parsing, spans, IO, and exit policy.
+
+-- @entry lintCtx / collectRefs / lintDeadModule
+-- The Warning vocabulary below is a root: it is the module's reported surface,
+-- and one code (WEmptyMatch) is deliberately never produced here.
+-- @entry Warning
+-- Warnings: WHole WUnbound WUnused WShadow WCtorArity WRedundantBranch
+-- WPartialMatch WUnreachableArm WDupBinder WNonRecFix WUnknownCtor
+-- WMixedCtors WEmptyMatch WShadowCtor WCtorAppArity WMatchOnHole/Lit/Sort
+-- WEmptyTelescope WUnusedDef WUnusedCtor WUnusedInd.
+-- Contracts:
+--   * Scope = local sigs + every constructor id in scope + closed flag (no
+--     imports, so the sigs are the whole constructor universe).
+--   * Arity/coverage/over-application need a local sig; an unknown arm head
+--     is reported only in a closed module or next to a local constructor.
+--   * A pattern slot naming a constructor refines the arm (`MkT n True _`)
+--     instead of binding; refined arms never make later arms unreachable.
+--   * `_` noise filtered by host; pattern binders unused-checked.
+--   * Type positions count as uses; occurs scope-aware on all term binders.
+--   * ABinder telescope sequential L→R; AFix under rec-name.
+--   * ARow = one multi-scrutinee row: columns are checked like arms, whole
+--     rows like patterns (duplicate or subsumed rows are unreachable).
+--   * collectRefs free-var aware (local binder cannot keep top-level live).
+--   * RedundantBranch (earlier) + UnreachableArm (later) = complementary blame.
+
+import "../std/data.ouro";
+import "../std/listx.ouro";
+import "base.ouro";
+
+-- Sig: ind, ctor, data-arity (pattern binders), nParams (for Nil A apps).
+inductive Sig : Type := | MkSig : Nat -> Nat -> Nat -> Nat -> Sig;
+
+-- Scope: sigs declared in this module, every constructor id in scope
+-- (declared or imported), closed (True when the module imports nothing).
+inductive Scope : Type := | MkScope : List Sig -> List Nat -> Bool -> Scope;
+
+-- Right-nested binder/branch chains (one inductive family). ARow is one row
+-- of a multi-scrutinee match: column patterns (ctor, slots), body, next row.
+inductive Ast : Type :=
+  | AVar      : Nat -> Ast
+  | AHole     : Nat -> Ast
+  | ASort     : Nat -> Ast
+  | ANatLit   : Nat -> Ast
+  | AApp      : Ast -> Ast -> Ast
+  | ALam      : Nat -> Ast -> Ast -> Ast
+  | APi       : Nat -> Ast -> Ast -> Ast
+  | ALet      : Nat -> Ast -> Ast -> Ast -> Ast
+  | AAscribe  : Ast -> Ast -> Ast
+  | ABinder   : Nat -> Ast -> Ast -> Ast
+  | ANoBinder : Ast
+  | AFix      : Nat -> Ast -> Ast -> Ast -> Ast
+  | ABranch   : Nat -> List Nat -> Ast -> Ast -> Ast
+  | ANoBranch : Ast
+  | AMatch    : Ast -> Ast -> Ast
+  | ARow      : List (Pair Nat (List Nat)) -> Ast -> Ast -> Ast;
+
+inductive Warning : Type :=
+  | WHole    : Nat -> Warning
+  | WUnbound : Nat -> Warning
+  | WUnused  : Nat -> Warning
+  | WShadow  : Nat -> Warning
+  | WCtorArity : Nat -> Warning
+  | WRedundantBranch : Nat -> Warning
+  | WPartialMatch : Nat -> Warning
+  | WUnreachableArm : Nat -> Warning
+  | WDupBinder : Nat -> Warning
+  | WNonRecFix : Nat -> Warning
+  | WUnknownCtor : Nat -> Warning
+  | WMixedCtors : Nat -> Warning
+  | WEmptyMatch : Nat -> Warning
+  | WShadowCtor : Nat -> Warning
+  | WCtorAppArity : Nat -> Warning
+  | WMatchOnHole : Nat -> Warning
+  | WMatchOnLit : Nat -> Warning
+  | WMatchOnSort : Nat -> Warning
+  | WEmptyTelescope : Nat -> Warning
+  | WUnusedDef : Nat -> Warning
+  | WUnusedCtor : Nat -> Warning
+  | WUnusedInd : Nat -> Warning;
+
+-- @bound(nodes <= 36) @bound(depth <= 13) @bound(allocs <= 10) @bound(stack <= 5) @bound(steps <= 12) @bound(cyclo <= 13) @minimal
+def ltNat : Nat -> Nat -> Bool :=
+  fix ltNat (n : Nat) (m : Nat) : Bool :=
+    match m with
+    | Z => False
+    | S m' => match n with | Z => True | S n' => ltNat n' m' end
+    end;
+
+-- @bound(nodes <= 9) @bound(depth <= 5) @bound(allocs <= 5) @bound(stack <= 2) @bound(steps <= 5) @bound(cyclo <= 4) @minimal
+def wnil : List Warning := [];
+-- @bound(nodes <= 23) @bound(depth <= 9) @bound(allocs <= 8) @bound(stack <= 4) @bound(steps <= 8) @bound(cyclo <= 4) @minimal
+def wcons (w : Warning) (ws : List Warning) : List Warning := Cons Warning w ws;
+-- @bound(nodes <= 23) @bound(depth <= 9) @bound(allocs <= 8) @bound(stack <= 4) @bound(steps <= 8) @bound(cyclo <= 4) @minimal
+def ncons (n : Nat) (ns : List Nat) : List Nat := Cons Nat n ns;
+
+def scopeSigs (scope : Scope) : List Sig :=
+    match scope with | MkScope sigs _ _ => sigs end;
+
+def scopeClosed (scope : Scope) : Bool :=
+    match scope with | MkScope _ _ closed => closed end;
+
+-- Membership that stops at the first hit and compares inline. memNat goes
+-- through elem, which applies its equality closure to every cell and folds
+-- the answers with a strict orb; contexts and constructor sets reach hundreds
+-- of ids, and this runs for every variable, binder, and pattern slot.
+def memIds : List Nat -> Nat -> Bool :=
+  fix memIds (xs : List Nat) (x : Nat) : Bool :=
+    match xs with
+    | Nil => False
+    | Cons y ys =>
+        match eqNat x y with
+        | True => True
+        | False => memIds ys x
+        end
+    end;
+
+def isCtor (scope : Scope) (id : Nat) : Bool :=
+    match scope with | MkScope _ ctors _ => memIds ctors id end;
+
+-- Slots of a pattern that bind a variable; a slot naming a constructor
+-- refines the arm instead.
+def patBinders (scope : Scope) (ids : List Nat) : List Nat :=
+    filter Nat (fun (id : Nat) => notb (isCtor scope id)) ids;
+
+-- Every slot of every column of a multi-scrutinee row.
+def rowSlots (cols : List (Pair Nat (List Nat))) : List Nat :=
+    concat_map (Pair Nat (List Nat)) Nat (snd Nat (List Nat)) cols;
+
+-- Telescope binders, each paired with the chain that follows it (the
+-- binders whose types may still use it).
+def binderTails : Ast -> List (Pair Nat Ast) :=
+  fix binderTails (b : Ast) : List (Pair Nat Ast) :=
+    match b with
+    | ABinder id _ rest => Cons (Pair Nat Ast) (MkPair Nat Ast id rest) (binderTails rest)
+    | ANoBinder => Nil (Pair Nat Ast)
+    | AVar _ => Nil (Pair Nat Ast)
+    | AHole _ => Nil (Pair Nat Ast)
+    | ASort _ => Nil (Pair Nat Ast)
+    | ANatLit _ => Nil (Pair Nat Ast)
+    | AApp _ _ => Nil (Pair Nat Ast)
+    | ALam _ _ _ => Nil (Pair Nat Ast)
+    | APi _ _ _ => Nil (Pair Nat Ast)
+    | ALet _ _ _ _ => Nil (Pair Nat Ast)
+    | AAscribe _ _ => Nil (Pair Nat Ast)
+    | AFix _ binders _ _ => binderTails binders
+    | ABranch _ _ _ _ => Nil (Pair Nat Ast)
+    | ANoBranch => Nil (Pair Nat Ast)
+    | AMatch _ _ => Nil (Pair Nat Ast)
+    | ARow _ _ _ => Nil (Pair Nat Ast)
+    end;
+
+def binderIds (b : Ast) : List Nat := map (Pair Nat Ast) Nat (fst Nat Ast) (binderTails b);
+
+-- Free use of target (type positions count). Scope-aware; AFix stops on rec-name.
+-- Arguments are evaluated before a call, so an orb over two subtrees walks
+-- both; the matches below stop at the first subtree that uses the target.
+def occurs (target : Nat) : Ast -> Bool :=
+    fix occurs (a : Ast) : Bool :=
+      match a with
+      | AVar id => eqNat id target
+      | AHole _ => False
+      | ASort _ => False
+      | ANatLit _ => False
+      | AApp f x =>
+          match occurs f with
+          | True => True
+          | False => occurs x
+          end
+      | ALam id ann body =>
+          match occurs ann with
+          | True => True
+          | False =>
+              match eqNat id target with | True => False | False => occurs body end
+          end
+      | APi id dom cod =>
+          match occurs dom with
+          | True => True
+          | False =>
+              match eqNat id target with | True => False | False => occurs cod end
+          end
+      | ALet id ann v body =>
+          match occurs ann with
+          | True => True
+          | False =>
+              match occurs v with
+              | True => True
+              | False =>
+                  match eqNat id target with | True => False | False => occurs body end
+              end
+          end
+      | AAscribe e t =>
+          match occurs e with
+          | True => True
+          | False => occurs t
+          end
+      | ABinder id ty rest =>
+          match occurs ty with
+          | True => True
+          | False =>
+              match eqNat id target with | True => False | False => occurs rest end
+          end
+      | ANoBinder => False
+      | AFix id binders ret body =>
+          match eqNat id target with
+          | True => False
+          | False =>
+              match memIds (binderIds binders) target with
+              | True => occurs binders
+              | False =>
+                  match occurs binders with
+                  | True => True
+                  | False =>
+                      match occurs ret with
+                      | True => True
+                      | False => occurs body
+                      end
+                  end
+              end
+          end
+      | ABranch _ ids body rest =>
+          match memIds ids target with
+          | True => occurs rest
+          | False =>
+              match occurs body with
+              | True => True
+              | False => occurs rest
+              end
+          end
+      | ANoBranch => False
+      | AMatch scrut branches =>
+          match occurs scrut with
+          | True => True
+          | False => occurs branches
+          end
+      | ARow cols body rest =>
+          match memIds (rowSlots cols) target with
+          | True => occurs rest
+          | False =>
+              match occurs body with
+              | True => True
+              | False => occurs rest
+              end
+          end
+      end;
+
+-- One warning per id that satisfies p.
+def warnEach (w : Nat -> Warning) (p : Nat -> Bool) (ids : List Nat) : List Warning :=
+    map Nat Warning w (filter Nat p ids);
+
+def unused (ids : List Nat) (body : Ast) : List Warning :=
+    warnEach (fun (id : Nat) => WUnused id) (fun (id : Nat) => notb (occurs id body)) ids;
+
+def shadows (binders : List Nat) (ctx : List Nat) : List Warning :=
+    warnEach (fun (id : Nat) => WShadow id) (memIds ctx) binders;
+
+-- Dup in same binder list (host drops `_`).
+-- @bound(nodes <= 45) @bound(depth <= 13) @bound(allocs <= 15) @bound(stack <= 5) @bound(steps <= 17) @bound(cyclo <= 9)
+def dupBinders : List Nat -> List Warning :=
+  fix dupBinders (ids : List Nat) : List Warning :=
+    match ids with
+    | Nil => wnil
+    | Cons id rest =>
+        match memIds rest id with
+        | True => wcons (WDupBinder id) (dupBinders rest)
+        | False => dupBinders rest
+        end
+    end;
+
+-- Types in the remaining telescope see the old binding until it is
+-- shadowed. The return type and body see the final telescope scope.
+def occursAfterBinders (target : Nat) (binders : Ast) (ret : Ast) (body : Ast) : Bool :=
+    match occurs target binders with
+    | True => True
+    | False =>
+        match memIds (binderIds binders) target with
+        | True => False
+        | False =>
+            match occurs target ret with
+            | True => True
+            | False => occurs target body
+            end
+        end
+    end;
+
+-- Fix never uses rec-name → WNonRecFix (walk children; occurs stops on AFix).
+-- @bound(nodes <= 41) @bound(depth <= 12) @bound(allocs <= 10) @bound(stack <= 4) @bound(steps <= 12) @bound(cyclo <= 7)
+def nonRecFix (r : Nat) (binders : Ast) (ret : Ast) (body : Ast) : List Warning :=
+    match occursAfterBinders r binders ret body with
+    | True => wnil
+    | False => wcons (WNonRecFix r) wnil
+    end;
+
+-- Sequential unused for AFix telescope (later binder types count as uses).
+def unusedBinders (b : Ast) (ret : Ast) (body : Ast) : List Warning :=
+    concat_map (Pair Nat Ast) Warning
+      (fun (p : Pair Nat Ast) =>
+        match p with
+        | MkPair id rest =>
+            match occursAfterBinders id rest ret body with
+            | True => wnil
+            | False => wcons (WUnused id) wnil
+            end
+        end)
+      (binderTails b);
+
+def sigInd (s : Sig) : Nat := match s with | MkSig ind _ _ _ => ind end;
+def sigCtor (s : Sig) : Nat := match s with | MkSig _ c _ _ => c end;
+def sigArity (s : Sig) : Nat := match s with | MkSig _ _ arity _ => arity end;
+-- Maximal well-formed application: type parameters plus data arguments.
+def sigAppMax (s : Sig) : Nat := match s with | MkSig _ _ arity np => add arity np end;
+
+-- Field of the sig declaring ctor, if the module declares it.
+def lookupSig (field : Sig -> Nat) (sigs : List Sig) (ctor : Nat) : Maybe Nat :=
+    mapMaybe Sig Nat field (find Sig (fun (s : Sig) => eqNat (sigCtor s) ctor) sigs);
+
+def lookupCtorArity (sigs : List Sig) (ctor : Nat) : Maybe Nat := lookupSig sigArity sigs ctor;
+def lookupCtorAppMax (sigs : List Sig) (ctor : Nat) : Maybe Nat := lookupSig sigAppMax sigs ctor;
+def inductiveOfCtor (sigs : List Sig) (ctor : Nat) : Maybe Nat := lookupSig sigInd sigs ctor;
+
+def ctorsOfInductive (sigs : List Sig) (ind : Nat) : List Nat :=
+    map Sig Nat sigCtor (filter Sig (fun (s : Sig) => eqNat ind (sigInd s)) sigs);
+
+def hasSigs (sigs : List Sig) : Bool :=
+    match sigs with | Nil => False | Cons _ _ => True end;
+
+def collectCtorIds (sigs : List Sig) : List Nat := map Sig Nat sigCtor sigs;
+
+-- Lambda, pi, let, and fix binders only: a pattern slot that names a
+-- constructor is a refinement, not a binder.
+def checkShadowCtors (scope : Scope) (binders : List Nat) : List Warning :=
+    warnEach (fun (id : Nat) => WShadowCtor id) (isCtor scope) binders;
+
+-- Head variable of an application spine (Nothing for any other head) and
+-- the number of arguments applied to it. Ascriptions preserve the spine.
+def appSpine : Ast -> Pair (Maybe Nat) Nat :=
+  fix appSpine (a : Ast) : Pair (Maybe Nat) Nat :=
+    match a with
+    | AApp f _ =>
+        match appSpine f with
+        | MkPair h n => MkPair (Maybe Nat) Nat h (S n)
+        end
+    | AVar id => MkPair (Maybe Nat) Nat (Just Nat id) Z
+    | AHole _ => MkPair (Maybe Nat) Nat (Nothing Nat) Z
+    | ASort _ => MkPair (Maybe Nat) Nat (Nothing Nat) Z
+    | ANatLit _ => MkPair (Maybe Nat) Nat (Nothing Nat) Z
+    | ALam _ _ _ => MkPair (Maybe Nat) Nat (Nothing Nat) Z
+    | APi _ _ _ => MkPair (Maybe Nat) Nat (Nothing Nat) Z
+    | ALet _ _ _ _ => MkPair (Maybe Nat) Nat (Nothing Nat) Z
+    | AAscribe e _ => appSpine e
+    | ABinder _ _ _ => MkPair (Maybe Nat) Nat (Nothing Nat) Z
+    | ANoBinder => MkPair (Maybe Nat) Nat (Nothing Nat) Z
+    | AFix _ _ _ _ => MkPair (Maybe Nat) Nat (Nothing Nat) Z
+    | ABranch _ _ _ _ => MkPair (Maybe Nat) Nat (Nothing Nat) Z
+    | ANoBranch => MkPair (Maybe Nat) Nat (Nothing Nat) Z
+    | AMatch _ _ => MkPair (Maybe Nat) Nat (Nothing Nat) Z
+    | ARow _ _ _ => MkPair (Maybe Nat) Nat (Nothing Nat) Z
+    end;
+
+-- Over-app on maximal spine (data-arity+nParams); silent without sigs/underApp.
+def checkCtorAppArity (a : Ast) (sigs : List Sig) (underApp : Bool) : List Warning :=
+    match orb underApp (notb (hasSigs sigs)) with
+    | True => wnil
+    | False =>
+        match appSpine a with
+        | MkPair spineHead nArgs =>
+            match spineHead with
+            | Nothing => wnil
+            | Just id =>
+                match lookupCtorAppMax sigs id with
+                | Nothing => wnil
+                | Just maxArgs =>
+                    match ltNat maxArgs nArgs with
+                    | True => wcons (WCtorAppArity id) wnil
+                    | False => wnil
+                    end
+                end
+            end
+        end
+    end;
+
+-- A match whose scrutinee can never be a constructor value.
+def checkSillyScrut (scrut : Ast) : List Warning :=
+    match scrut with
+    | AHole id => wcons (WMatchOnHole id) wnil
+    | ANatLit n => wcons (WMatchOnLit n) wnil
+    | ASort n => wcons (WMatchOnSort n) wnil
+    | AVar _ => wnil
+    | AApp _ _ => wnil
+    | ALam _ _ _ => wnil
+    | APi _ _ _ => wnil
+    | ALet _ _ _ _ => wnil
+    | AAscribe _ _ => wnil
+    | ABinder _ _ _ => wnil
+    | ANoBinder => wnil
+    | AFix _ _ _ _ => wnil
+    | ABranch _ _ _ _ => wnil
+    | ANoBranch => wnil
+    | AMatch _ _ => wnil
+    | ARow _ _ _ => wnil
+    end;
+
+-- Rows of a match: an arm is a one-column row, a multi-scrutinee row keeps
+-- its columns.
+def flattenRows : Ast -> List (List (Pair Nat (List Nat))) :=
+  fix flattenRows (b : Ast) : List (List (Pair Nat (List Nat))) :=
+    match b with
+    | ABranch ctor ids _ rest =>
+        Cons (List (Pair Nat (List Nat)))
+          (Cons (Pair Nat (List Nat)) (MkPair Nat (List Nat) ctor ids)
+            (Nil (Pair Nat (List Nat))))
+          (flattenRows rest)
+    | ARow cols _ rest =>
+        Cons (List (Pair Nat (List Nat))) cols (flattenRows rest)
+    | ANoBranch => Nil (List (Pair Nat (List Nat)))
+    | AVar _ => Nil (List (Pair Nat (List Nat)))
+    | AHole _ => Nil (List (Pair Nat (List Nat)))
+    | ASort _ => Nil (List (Pair Nat (List Nat)))
+    | ANatLit _ => Nil (List (Pair Nat (List Nat)))
+    | AApp _ _ => Nil (List (Pair Nat (List Nat)))
+    | ALam _ _ _ => Nil (List (Pair Nat (List Nat)))
+    | APi _ _ _ => Nil (List (Pair Nat (List Nat)))
+    | ALet _ _ _ _ => Nil (List (Pair Nat (List Nat)))
+    | AAscribe _ _ => Nil (List (Pair Nat (List Nat)))
+    | ABinder _ _ _ => Nil (List (Pair Nat (List Nat)))
+    | ANoBinder => Nil (List (Pair Nat (List Nat)))
+    | AFix _ _ _ _ => Nil (List (Pair Nat (List Nat)))
+    | AMatch _ _ => Nil (List (Pair Nat (List Nat)))
+    end;
+
+def ctorList (branches : List (Pair Nat (List Nat))) : List Nat :=
+    map (Pair Nat (List Nat)) Nat (fst Nat (List Nat)) branches;
+
+def allCovered (needed : List Nat) (have : List Nat) : Bool :=
+    all Nat (memIds have) needed;
+
+def checkArity (sigs : List Sig) (p : Pair Nat (List Nat)) : List Warning :=
+    match p with
+    | MkPair ctor ids =>
+        match lookupCtorArity sigs ctor with
+        | Nothing => wnil
+        | Just arity =>
+            match eqNat arity (length Nat ids) with
+            | True => wnil
+            | False => wcons (WCtorArity ctor) wnil
+            end
+        end
+    end;
+
+def checkArities (branches : List (Pair Nat (List Nat))) (sigs : List Sig) : List Warning :=
+    concat_map (Pair Nat (List Nat)) Warning (checkArity sigs) branches;
+
+-- An earlier slot covers a later one when it binds, or names the same
+-- constructor.
+def slotSubsumes (scope : Scope) (slots : Pair Nat Nat) : Bool :=
+    match slots with
+    | MkPair a b => orb (notb (isCtor scope a)) (eqNat a b)
+    end;
+
+-- Same ctor, same arity, every slot covered.
+def armSubsumes (scope : Scope) (earlier : Pair Nat (List Nat))
+    (later : Pair Nat (List Nat)) : Bool :=
+    match earlier with
+    | MkPair ca sa =>
+        match later with
+        | MkPair cb sb =>
+            andb (eqNat ca cb)
+              (andb (eqNat (length Nat sa) (length Nat sb))
+                (all (Pair Nat Nat) (slotSubsumes scope) (zip Nat Nat sa sb)))
+        end
+    end;
+
+def hasSig (sigs : List Sig) (ctor : Nat) : Bool :=
+    any Sig (fun (s : Sig) => eqNat (sigCtor s) ctor) sigs;
+
+-- Inductive of the first arm head with a local sig (skip a leading typo).
+def firstInductive (branches : List (Pair Nat (List Nat))) (sigs : List Sig) : Maybe Nat :=
+    match find Nat (hasSig sigs) (ctorList branches) with
+    | Nothing => Nothing Nat
+    | Just ctor => inductiveOfCtor sigs ctor
+    end;
+
+-- @bound(nodes <= 65) @bound(depth <= 14) @bound(allocs <= 23) @bound(stack <= 8) @bound(steps <= 25) @bound(cyclo <= 10)
+def checkCoverage (branches : List (Pair Nat (List Nat))) (sigs : List Sig) : List Warning :=
+    match firstInductive branches sigs with
+    | Nothing => wnil
+    | Just ind =>
+        match allCovered (ctorsOfInductive sigs ind) (ctorList branches) with
+        | True => wnil
+        | False => wcons (WPartialMatch ind) wnil
+        end
+    end;
+
+-- One arm head against the scope. ind: inductive of the first head with a
+-- local sig. A head with no sig is a typo when the module is closed or when
+-- another head is local; an imported ctor next to a local one mixes types.
+def headWarning (scope : Scope) (ind : Maybe Nat) (ctor : Nat) : List Warning :=
+    match inductiveOfCtor (scopeSigs scope) ctor with
+    | Just i =>
+        match ind with
+        | Nothing => wnil
+        | Just k =>
+            match eqNat i k with
+            | True => wnil
+            | False => wcons (WMixedCtors ctor) wnil
+            end
+        end
+    | Nothing =>
+        match ind with
+        | Just _ =>
+            match isCtor scope ctor with
+            | True => wcons (WMixedCtors ctor) wnil
+            | False => wcons (WUnknownCtor ctor) wnil
+            end
+        | Nothing =>
+            match andb (scopeClosed scope) (notb (isCtor scope ctor)) with
+            | True => wcons (WUnknownCtor ctor) wnil
+            | False => wnil
+            end
+        end
+    end;
+
+def lintCtors (bs : List (Pair Nat (List Nat))) (scope : Scope) : List Warning :=
+    match hasSigs (scopeSigs scope) with
+    | False => wnil
+    | True =>
+        let ind : Maybe Nat := firstInductive bs (scopeSigs scope) in
+        concat_map (Pair Nat (List Nat)) Warning
+          (fun (p : Pair Nat (List Nat)) => headWarning scope ind (fst Nat (List Nat) p))
+          bs
+    end;
+
+-- One column of a match: the arms of a single match, or the patterns one
+-- scrutinee of a multi-scrutinee match is compared against.
+def lintArms (bs : List (Pair Nat (List Nat))) (scope : Scope) : List Warning :=
+    append Warning (checkArities bs (scopeSigs scope))
+      (append Warning (checkCoverage bs (scopeSigs scope)) (lintCtors bs scope));
+
+-- Column k of every row that has one.
+def rowColumn (k : Nat) (rows : List (List (Pair Nat (List Nat)))) : List (Pair Nat (List Nat)) :=
+    concat_map (List (Pair Nat (List Nat))) (Pair Nat (List Nat))
+      (fun (row : List (Pair Nat (List Nat))) =>
+        take (Pair Nat (List Nat)) (S Z) (drop (Pair Nat (List Nat)) k row))
+      rows;
+
+-- Columns 0..n-1 checked like the arms of one match each.
+def lintColumns (scope : Scope) (rows : List (List (Pair Nat (List Nat))))
+    : Nat -> List Warning :=
+  fix lintColumns (n : Nat) : List Warning :=
+    match n with
+    | Z => wnil
+    | S k => append Warning (lintColumns k) (lintArms (rowColumn k rows) scope)
+    end;
+
+-- Every column of an earlier row covers the same column of a later row.
+def rowSubsumes (scope : Scope) (earlier : List (Pair Nat (List Nat)))
+    (later : List (Pair Nat (List Nat))) : Bool :=
+    andb (eqNat (length (Pair Nat (List Nat)) earlier) (length (Pair Nat (List Nat)) later))
+      (all (Pair (Pair Nat (List Nat)) (Pair Nat (List Nat)))
+        (fun (arms : Pair (Pair Nat (List Nat)) (Pair Nat (List Nat))) =>
+          match arms with
+          | MkPair a b => armSubsumes scope a b
+          end)
+        (zip (Pair Nat (List Nat)) (Pair Nat (List Nat)) earlier later));
+
+-- A row is reported through its first column's constructor.
+def rowHead (row : List (Pair Nat (List Nat))) : Nat := head Nat Z (ctorList row);
+
+-- A row covered by a later row is redundant (the later row can never fire
+-- through it, and the earlier one is the odd duplicate).
+def checkRowRedundancy (scope : Scope)
+    : List (List (Pair Nat (List Nat))) -> List Warning :=
+  fix checkRowRedundancy (rows : List (List (Pair Nat (List Nat)))) : List Warning :=
+    match rows with
+    | Nil => wnil
+    | Cons row rest =>
+        match any (List (Pair Nat (List Nat))) (rowSubsumes scope row) rest with
+        | True => wcons (WRedundantBranch (rowHead row)) (checkRowRedundancy rest)
+        | False => checkRowRedundancy rest
+        end
+    end;
+
+-- A row covered by an earlier row can never fire.
+def checkRowUnreachable (scope : Scope)
+    : List (List (Pair Nat (List Nat))) -> List (List (Pair Nat (List Nat)))
+      -> List Warning :=
+  fix checkRowUnreachable (rows : List (List (Pair Nat (List Nat))))
+      (earlier : List (List (Pair Nat (List Nat)))) : List Warning :=
+    match rows with
+    | Nil => wnil
+    | Cons row rest =>
+        match any (List (Pair Nat (List Nat)))
+            (fun (e : List (Pair Nat (List Nat))) => rowSubsumes scope e row) earlier with
+        | True =>
+            wcons (WUnreachableArm (rowHead row)) (checkRowUnreachable rest earlier)
+        | False =>
+            checkRowUnreachable rest (Cons (List (Pair Nat (List Nat))) row earlier)
+        end
+    end;
+
+-- Per-column arm checks plus whole-row reachability and binder duplicates.
+-- No WEmptyMatch: untyped AST cannot distinguish Empty elim (kernel covers).
+def lintMatch (branches : Ast) (scope : Scope) : List Warning :=
+    let rows : List (List (Pair Nat (List Nat))) := flattenRows branches in
+    let width : Nat :=
+      match rows with
+      | Nil => Z
+      | Cons row _ => length (Pair Nat (List Nat)) row
+      end in
+    append Warning (lintColumns scope rows width)
+      (append Warning (checkRowRedundancy scope rows)
+        (append Warning
+          (checkRowUnreachable scope rows (Nil (List (Pair Nat (List Nat)))))
+          (concat_map (List (Pair Nat (List Nat))) Warning
+            (fun (row : List (Pair Nat (List Nat))) =>
+              dupBinders (patBinders scope (rowSlots row)))
+            rows)));
+
+-- One lambda/pi/let binder: shadowing, constructor capture, and use.
+def lintBinder (scope : Scope) (id : Nat) (ctx : List Nat) (body : Ast)
+    : List Warning :=
+    append Warning (shadows (ncons id (Nil Nat)) ctx)
+      (append Warning (checkShadowCtors scope (ncons id (Nil Nat)))
+        (unused (ncons id (Nil Nat)) body));
+
+-- WEmptyTelescope: `fix f := ...` with no binders that still uses f.
+def emptyTelescope (r : Nat) (bIds : List Nat) (ret : Ast) (body : Ast)
+    : List Warning :=
+    match bIds with
+    | Cons _ _ => wnil
+    | Nil =>
+        match occurs r ret with
+        | True => wcons (WEmptyTelescope r) wnil
+        | False =>
+            match occurs r body with
+            | True => wcons (WEmptyTelescope r) wnil
+            | False => wnil
+            end
+        end
+    end;
+
+-- underApp: only maximal AApp spines get WCtorAppArity.
+def lintCtx : Ast -> Scope -> List Nat -> Bool -> List Warning :=
+  fix lintCtx (a : Ast) (scope : Scope) (ctx : List Nat) (underApp : Bool) : List Warning :=
+    match a with
+    | AVar id =>
+        match memIds ctx id with
+        | True => wnil
+        | False => wcons (WUnbound id) wnil
+        end
+    | AHole id => wcons (WHole id) wnil
+    | ASort _ => wnil
+    | ANatLit _ => wnil
+    | AApp f x =>
+        append Warning (checkCtorAppArity (AApp f x) (scopeSigs scope) underApp)
+          (append Warning (lintCtx f scope ctx True)
+            (lintCtx x scope ctx False))
+    | ALam id ann body =>
+        append Warning (lintCtx ann scope ctx False)
+          (append Warning (lintBinder scope id ctx body)
+            (lintCtx body scope (ncons id ctx) False))
+    | APi id dom cod =>
+        append Warning (lintCtx dom scope ctx False)
+          (append Warning (lintBinder scope id ctx cod)
+            (lintCtx cod scope (ncons id ctx) False))
+    | ALet id ann v body =>
+        append Warning (lintCtx ann scope ctx False)
+          (append Warning (lintCtx v scope ctx False)
+            (append Warning (lintBinder scope id ctx body)
+              (lintCtx body scope (ncons id ctx) False)))
+    | AAscribe e t =>
+        append Warning (lintCtx e scope ctx underApp) (lintCtx t scope ctx False)
+    -- Sequential telescope (later binders see earlier).
+    | ABinder id ty rest =>
+        append Warning (lintCtx ty scope ctx False)
+          (lintCtx rest scope (ncons id ctx) False)
+    | ANoBinder => wnil
+    | AFix r binders ret body =>
+        -- Telescope under rec-name; unusedBinders sequential.
+        let bIds : List Nat := binderIds binders in
+          let fullCtx : List Nat := ncons r (append Nat bIds ctx) in
+            append Warning (lintCtx binders scope (ncons r ctx) False)
+              (append Warning (lintCtx ret scope fullCtx False)
+                (append Warning (shadows (ncons r bIds) ctx)
+                  (append Warning (checkShadowCtors scope (ncons r bIds))
+                    (append Warning (dupBinders (ncons r bIds))
+                      (append Warning (nonRecFix r binders ret body)
+                        (append Warning (emptyTelescope r bIds ret body)
+                          (append Warning (unusedBinders binders ret body)
+                            (lintCtx body scope fullCtx False))))))))
+    -- Slots that name a constructor refine the arm; the rest bind.
+    | ABranch _ ids body rest =>
+        let binders : List Nat := patBinders scope ids in
+          append Warning (shadows binders ctx)
+            (append Warning (unused binders body)
+              (append Warning (lintCtx body scope (append Nat binders ctx) False)
+                (lintCtx rest scope ctx False)))
+    | ANoBranch => wnil
+    | AMatch scrut branches =>
+        append Warning (lintCtx scrut scope ctx False)
+          (append Warning (lintCtx branches scope ctx False)
+            (append Warning (lintMatch branches scope)
+              (checkSillyScrut scrut)))
+    | ARow cols body rest =>
+        let binders : List Nat := patBinders scope (rowSlots cols) in
+          append Warning (shadows binders ctx)
+            (append Warning (unused binders body)
+              (append Warning (lintCtx body scope (append Nat binders ctx) False)
+                (lintCtx rest scope ctx False)))
+    end;
+
+-- Free references of a term (arm heads included); bound names are dropped.
+-- @bound(nodes <= 15) @bound(depth <= 6) @bound(allocs <= 6) @bound(stack <= 3) @bound(steps <= 6) @bound(cyclo <= 3) @minimal
+-- entries: (owner, refs) per top-level declaration. A self-reference does
+-- not keep a declaration live.

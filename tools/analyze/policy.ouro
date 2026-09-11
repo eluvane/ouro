@@ -1,0 +1,653 @@
+-- Policy composition keeps analyzer families independent while emitting one
+-- stable result stream. The fact cores under tools/analyze decide; this
+-- module maps host records to core facts and core issues back to ADiag. Every
+-- core issue carries the index of the host record it was built from, so the
+-- diagnostic position, path, and witness come from that record.
+
+import "extract.ouro";
+import "architecture.ouro";
+import "deadcode.ouro";
+import "suppressions.ouro";
+import "api_surface.ouro";
+import "trust.ouro";
+
+def drop_after_prefix (p : String) : List String -> String :=
+  fix drop_after_prefix (prefixes : List String) : String :=
+    match prefixes with
+    | Nil => ""
+    | Cons prefix rest =>
+        match str_index p prefix with
+        | Just j => str_drop p (add j (str_len prefix))
+        | Nothing => drop_after_prefix rest
+        end
+    end;
+
+def supp_broad_markers : List String :=
+  [ "disable-all"
+  , "disable=*"
+  , "suppress=*"
+  ];
+
+def supp_scope_markers : List String :=
+  [ "scope=file"
+  , "scope=module"
+  ];
+
+def supp_code_prefixes : List String :=
+  [ "disable="
+  , "suppress="
+  ];
+
+def parse_supp (file : Nat) (line_no : Nat) (line0 : String) : Maybe ASupp :=
+  let line : String := strip_cr line0 in
+  let t : String := str_ltrim line in
+  match str_starts t "--" with
+  | False => Nothing ASupp
+  | True =>
+  match str_index t "ouro-lint:" with
+  | Nothing => Nothing ASupp
+  | Just i =>
+      let p : String := str_drop t i in
+      let broad : Bool := contains_any p supp_broad_markers in
+      let code : String :=
+        match broad with
+        | True => "*"
+        | False =>
+            match take_code (drop_after_prefix p supp_code_prefixes) with
+            | MkPair nm _ => nm
+            end
+        end in
+      Just ASupp
+        (MkASupp code file line_no (S i) broad
+          (str_contains p "reason=")
+          (contains_any p supp_scope_markers)
+          (orb broad (is_known_code code))
+          (andb (notb broad) (is_forbidden_code code)) False)
+  end
+  end;
+
+def collect_supps (file : Nat) (candidates : List (Pair Nat (List Nat)))
+    : List ASupp :=
+  concat_map (Pair Nat (List Nat)) ASupp
+    (fun (candidate : Pair Nat (List Nat)) =>
+      match candidate with
+      | MkPair line_no codes =>
+          match parse_supp file line_no (str_of_codes codes) with
+          | Nothing => Nil ASupp
+          | Just s => singleton ASupp s
+          end
+      end) candidates;
+
+def split_tab_cs (cs : List Nat)
+    : Maybe (Pair (List Nat) (List Nat)) :=
+  match span Nat (fun (c : Nat) => notb (eq_nat c ch_tab)) cs with
+  | MkPair acc after =>
+      match after with
+      | Nil => Nothing (Pair (List Nat) (List Nat))
+      | Cons _ rest =>
+          Just (Pair (List Nat) (List Nat))
+            (MkPair (List Nat) (List Nat) acc rest)
+      end
+  end;
+
+def take_before (s : String) (sep : String) : String :=
+  match str_index s sep with
+  | Just k => str_take s k
+  | Nothing => s
+  end;
+
+def take_hash (hash_s : String) : String :=
+  take_before (take_before hash_s " ") "#";
+
+def take_intent (intent0 : String) : String :=
+  str_rtrim (take_before intent0 "#");
+
+def finish_base (path : String) (name : String) (hash_s : String)
+    (rest3 : List Nat) : ABase :=
+  match split_tab_cs rest3 with
+  | Nothing =>
+      MkABase path name (parse_hex64 hash_s) (str_of_codes rest3) ""
+  | Just p4 =>
+      match p4 with
+      | MkPair ns_cs intent_cs =>
+          MkABase path name (parse_hex64 (take_hash hash_s))
+            (str_of_codes ns_cs) (take_intent (str_of_codes intent_cs))
+      end
+  end;
+
+def parse_base_hash (path : String) (name : String) (rest2 : List Nat)
+    : ABase :=
+  match split_tab_cs rest2 with
+  | Nothing => MkABase path name (parse_hex64 (str_of_codes rest2)) "" ""
+  | Just p3 =>
+      match p3 with
+      | MkPair hash_cs rest3 =>
+          finish_base path name (str_of_codes hash_cs) rest3
+      end
+  end;
+
+def parse_base_name (path : String) (rest : List Nat) : Maybe ABase :=
+  match split_tab_cs rest with
+  | Nothing => Nothing ABase
+  | Just p2 =>
+      match p2 with
+      | MkPair name_cs rest2 =>
+          Just ABase (parse_base_hash path (str_of_codes name_cs) rest2)
+      end
+  end;
+
+def parse_base_data (cs : List Nat) : Maybe ABase :=
+  match split_tab_cs cs with
+  | Nothing => Nothing ABase
+  | Just p1 =>
+      match p1 with
+      | MkPair path_cs rest => parse_base_name (str_of_codes path_cs) rest
+      end
+  end;
+
+def parse_base_clean (cs : List Nat) : Maybe ABase :=
+  match cs with
+  | Nil => Nothing ABase
+  | Cons c _ =>
+      match orb (eq_nat c ch_hash) (eq_nat c ch_cr) with
+      | True => Nothing ABase
+      | False => parse_base_data cs
+      end
+  end;
+
+def load_baseline_cs (css : List (List Nat)) : List ABase :=
+  concat_map (List Nat) ABase
+    (fun (cs : List Nat) =>
+      match parse_base_clean cs with
+      | Nothing => Nil ABase
+      | Just b => singleton ABase b
+      end) css;
+
+def load_baseline_text (t : String) : List ABase :=
+  load_baseline_cs (split_on ch_lf (str_codes t));
+
+def find_base (path : String) (name : String) (xs : List ABase) : Maybe ABase :=
+  find ABase
+    (fun (b : ABase) =>
+      andb (str_eq (ABase_path b) path) (str_eq (ABase_name b) name))
+    xs;
+
+-- Architecture facts: a file is a node keyed by its index, a resolved import
+-- is an edge keyed by its index in the edge list. Unresolved imports have no
+-- target node and take no part in the graph.
+def arch_nodes (files : List AFile) : List ArchNode :=
+  (fix go (xs : List AFile) (i : Nat) : List ArchNode :=
+    match xs with
+    | Nil => Nil ArchNode
+    | Cons f rest =>
+        Cons ArchNode
+          (MkArchNode i (AFile_layer f) (AFile_trusted f)
+            (AFile_compiler_internal f) (AFile_std_runtime f))
+          (go rest (S i))
+    end) files Z;
+
+def arch_edges (edges : List AEdge) : List ArchEdge :=
+  (fix go (xs : List AEdge) (i : Nat) : List ArchEdge :=
+    match xs with
+    | Nil => Nil ArchEdge
+    | Cons e rest =>
+        match eq_nat (AEdge_dst e) no_idx with
+        | True => go rest (S i)
+        | False =>
+            Cons ArchEdge
+              (MkArchEdge i (AEdge_src e) (AEdge_dst e)
+                (AEdge_allow_layer e) (AEdge_allow_trust e))
+              (go rest (S i))
+        end
+    end) edges Z;
+
+def edge_at (i : Nat) (edges : List AEdge) : AEdge :=
+  nth AEdge (MkAEdge no_idx no_idx "" Z Z False False) i edges;
+
+def edge_diag (analyzer : String) (e : AEdge) (code : String) (rule : String)
+    (msg : String) (hint : String) (witness : String) : ADiag :=
+  mk_diag code "error" analyzer rule (AEdge_src e) (AEdge_line e) (AEdge_col e)
+    msg hint witness;
+
+def layer_tag (f : AFile) : String :=
+  str_cat3 "(layer=" (str_of_nat (AFile_layer f)) ")";
+
+def arch_diag (files : List AFile) (edges : List AEdge) (issue : ArchIssue)
+    : ADiag :=
+  let e : AEdge := edge_at (arch_issue_span issue) edges in
+  let src : AFile := file_at (AEdge_src e) files in
+  let dst : AFile := file_at (AEdge_dst e) files in
+  match issue with
+  | IArchCycle _ path =>
+      edge_diag "architecture" e "OURO-ARCH001" "import-cycle"
+        "module/import graph contains a cycle"
+        "Break the cycle by extracting the shared declarations into a lower-level module."
+        (str_join " -> "
+          (map Nat String (fun (id : Nat) => AFile_path (file_at id files)) path))
+  | IArchForbiddenDirection _ =>
+      edge_diag "architecture" e "OURO-ARCH002" "forbidden-dependency-direction"
+        "import points from an inner layer to an outer layer"
+        "Move the dependency behind an allowed lower-layer interface or add a versioned architecture-policy exception."
+        (str_cat4 "edge " (AFile_path src) (layer_tag src)
+          (str_cat3 " -> " (AFile_path dst) (layer_tag dst)))
+  | IArchStdRuntimeCompilerInternal _ =>
+      edge_diag "architecture" e "OURO-ARCH003" "std-runtime-compiler-internal-import"
+        "std/runtime source imports compiler internals"
+        "Split the shared API into std/runtime or invert the dependency through a stable interface."
+        (str_cat4 "std/runtime source " (AFile_path src)
+          " imports compiler-internal " (AFile_path dst))
+  | IArchLayerBoundary _ =>
+      edge_diag "architecture" e "OURO-ARCH004" "layer-boundary-violation"
+        "import skips across declared layer boundaries"
+        "Use an adjacent layer facade or document a narrow policy exception on this import."
+        (str_cat4 "edge " (AFile_path src) (layer_tag src)
+          (str_cat3 " jumps to " (AFile_path dst) (layer_tag dst)))
+  | IArchTCBBoundary _ =>
+      edge_diag "architecture" e "OURO-ARCH005" "kernel-tcb-boundary"
+        "untrusted source imports trusted kernel/TCB source"
+        "Remove this dependency or move the crossing into an explicitly reviewed TCB policy edge."
+        (str_cat4 "untrusted " (AFile_path src) " -> trusted " (AFile_path dst))
+  end;
+
+-- The cycle walk enters every module at most once, so one fuel unit per file
+-- plus the closing step bounds it.
+def arch_diags (files : List AFile) (edges : List AEdge) : List ADiag :=
+  map ArchIssue ADiag (arch_diag files edges)
+    (analyze_architecture (S (S (length AFile files)))
+      (arch_nodes files) (arch_edges edges));
+
+-- Trust facts share the import edges; TRUST002-TRUST004 need per-definition
+-- effect and taint facts that only the structured drive has, so this runner
+-- feeds the core edges only.
+def trust_edges (files : List AFile) (edges : List AEdge) : List TrustEdge :=
+  (fix go (xs : List AEdge) (i : Nat) : List TrustEdge :=
+    match xs with
+    | Nil => Nil TrustEdge
+    | Cons e rest =>
+        match eq_nat (AEdge_dst e) no_idx with
+        | True => go rest (S i)
+        | False =>
+            Cons TrustEdge
+              (MkTrustEdge i (AFile_trusted (file_at (AEdge_src e) files))
+                (AFile_trusted (file_at (AEdge_dst e) files))
+                (AEdge_allow_trust e))
+              (go rest (S i))
+        end
+    end) edges Z;
+
+def trust_diag (files : List AFile) (edges : List AEdge) (issue : TrustIssue)
+    : List ADiag :=
+  let e : AEdge := edge_at (trust_issue_span issue) edges in
+  let src : String := AFile_path (file_at (AEdge_src e) files) in
+  let dst : String := AFile_path (file_at (AEdge_dst e) files) in
+  match issue with
+  | ITrustInfluencesKernel _ =>
+      [edge_diag "trust" e "OURO-TRUST001" "influences-kernel"
+          "untrusted definition influences a kernel/checking path"
+          "Remove the import or mark an explicit TCB policy exception."
+          (str_cat4 "trust-path: untrusted " src " -> trusted " dst)]
+  | ITrustPolicyViolation _ =>
+      [edge_diag "trust" e "OURO-TRUST005" "tcb-policy-violation"
+          "trusted source depends on a source outside the declared TCB policy"
+          "Move the dependency into the trusted set or mark the import as a reviewed TCB dependency with ouro-analyze:allow-trust-import."
+          (str_cat4 "trust-path: trusted " src " -> untrusted " dst)]
+  | ITrustEffectBoundary _ _ => Nil ADiag
+  | ITrustPrimitiveReach _ _ => Nil ADiag
+  | ITrustTaintedProofPath _ _ => Nil ADiag
+  end;
+
+def trust_diags (files : List AFile) (edges : List AEdge) : List ADiag :=
+  concat_map TrustIssue ADiag (trust_diag files edges)
+    (analyze_trust (trust_edges files edges) (Nil TrustDef));
+
+-- API facts: only API-checked declarations are exported for the core. Names
+-- are interned as the index of their first API-checked occurrence, which is
+-- all the duplicate rule compares. A baseline row present counts as the
+-- namespace/use-intent metadata OURO-API005 asks for.
+def api_checked (decls : List ADecl) : List (Pair Nat ADecl) :=
+  (fix go (xs : List ADecl) (i : Nat) : List (Pair Nat ADecl) :=
+    match xs with
+    | Nil => Nil (Pair Nat ADecl)
+    | Cons d rest =>
+        match ADecl_is_api_checked d with
+        | True => Cons (Pair Nat ADecl) (MkPair Nat ADecl i d) (go rest (S i))
+        | False => go rest (S i)
+        end
+    end) decls Z;
+
+def api_name_id (names : List String) (name : String) : Nat :=
+  match index_of String str_eq name names with
+  | Just i => i
+  | Nothing => length String names
+  end;
+
+def api_fact (files : List AFile) (base : List ABase) (names : List String)
+    (entry : Pair Nat ADecl) : ApiDecl :=
+  match entry with
+  | MkPair i d =>
+      let path : String := AFile_path (file_at (ADecl_file d) files) in
+      match find_base path (ADecl_name d) base with
+      | Nothing =>
+          MkApiDecl i (api_name_id names (ADecl_name d)) True False False False False
+      | Just b =>
+          MkApiDecl i (api_name_id names (ADecl_name d)) True True
+            (notb (w64_eq (ABase_sig_hash b) (ADecl_sig_hash d)))
+            (str_eq (ABase_use_intent b) "internal") True
+      end
+  end;
+
+def api_facts (files : List AFile) (decls : List ADecl) (base : List ABase)
+    : List ApiDecl :=
+  let checked : List (Pair Nat ADecl) := api_checked decls in
+  let names : List String :=
+    map (Pair Nat ADecl) String
+      (fun (entry : Pair Nat ADecl) =>
+        match entry with | MkPair _ d => ADecl_name d end)
+      checked in
+  map (Pair Nat ADecl) ApiDecl (api_fact files base names) checked;
+
+def api_diag_at (d : ADecl) (code : String) (rule : String) (msg : String)
+    (hint : String) (witness : String) : ADiag :=
+  mk_diag code "error" "api_surface" rule (ADecl_file d) (ADecl_line d)
+    (ADecl_col d) msg hint witness;
+
+def api_base_hash (files : List AFile) (base : List ABase) (d : ADecl) : String :=
+  match find_base (AFile_path (file_at (ADecl_file d) files)) (ADecl_name d) base with
+  | Nothing => hex64_show w64_zero
+  | Just b => hex64_show (ABase_sig_hash b)
+  end;
+
+def api_decl_diag (files : List AFile) (decls : List ADecl) (base : List ABase)
+    (base_path : String) (d : ADecl) (issue : ApiIssue) : List ADiag :=
+  let path : String := AFile_path (file_at (ADecl_file d) files) in
+  let place : String := str_cat3 path ":" (str_of_nat (ADecl_line d)) in
+  match issue with
+  | IApiNewExport _ =>
+      [api_diag_at d "OURO-API001" "unexpected-new-export"
+          "public API grew without an explicit baseline entry"
+          "Add the export to the API baseline with a documented reason, or keep it internal."
+          (str_cat4 "public definition " place " "
+            (str_cat3 (ADecl_name d) " is absent from " base_path))]
+  | IApiDuplicate _ other =>
+      match decl_at other decls with
+      | Nothing => Nil ADiag
+      | Just o =>
+          [api_diag_at d "OURO-API002" "duplicate-public-api"
+              "public API name is already exported by another public definition"
+              "Rename the new definition or reuse the existing public API instead of exporting a second one."
+              (str_cat4 "public name " (ADecl_name d) " is already exported at "
+                (str_cat3 (AFile_path (file_at (ADecl_file o) files)) ":"
+                  (str_of_nat (ADecl_line o))))]
+      end
+  | IApiAbiChanged _ =>
+      [api_diag_at d "OURO-API003" "api-signature-drift"
+          "public API signature differs from the baseline"
+          "Review the API/ABI change and refresh the baseline only if the change is intentional."
+          (str_cat4 place " " (ADecl_name d)
+            (str_cat4 " hash=" (hex64_show (ADecl_sig_hash d)) " baseline="
+              (api_base_hash files base d)))]
+  | IApiPublicInternal _ =>
+      [api_diag_at d "OURO-API004" "internal-only-public"
+          "public definition is marked internal-only in the API baseline"
+          "Drop the public/export marker or change the baseline use-intent."
+          (str_cat4 place " " (ADecl_name d)
+            (str_cat3 " ns=" (ADecl_ns d) " intent=internal"))]
+  | IApiSurfaceGrowth _ =>
+      [api_diag_at d "OURO-API005" "unplanned-surface-growth"
+          "public API grew without namespace/use-intent metadata"
+          "Add a baseline row with namespace and use-intent=public|planned."
+          (str_cat4 "unplanned public surface " path ":"
+            (str_cat3 (ADecl_name d) " ns=" (ADecl_ns d)))]
+  end;
+
+def api_diag (files : List AFile) (decls : List ADecl) (base : List ABase)
+    (base_path : String) (issue : ApiIssue) : List ADiag :=
+  match decl_at (api_issue_span issue) decls with
+  | Nothing => Nil ADiag
+  | Just d => api_decl_diag files decls base base_path d issue
+  end;
+
+def api_diags (files : List AFile) (decls : List ADecl)
+    (base : List ABase) (base_path : String) : List ADiag :=
+  concat_map ApiIssue ADiag (api_diag files decls base base_path)
+    (analyze_api_surface (api_facts files decls base));
+
+-- Dead-code facts: a declaration is a node keyed by its index, a reference an
+-- edge between indices. Roots are entries and public API (std paths,
+-- `-- public`, API roots, axioms), so public API is never dead only because
+-- this checkout has no caller. An `@export` is not a root: an export nothing
+-- reaches is a dead export. A match arm reaches the core only when the shadow
+-- scan proved it unreachable; it has no incoming reference, so the core
+-- reports it like any other dead node, and arms it could not prove stay silent.
+def dead_kind_of (kind : Nat) : Nat :=
+  match eq_nat kind kind_ctor with
+  | True => dead_kind_ctor
+  | False =>
+      match eq_nat kind kind_module with
+      | True => dead_kind_module
+      | False => dead_kind_def
+      end
+  end;
+
+def dead_decls (decls : List ADecl) : List DeadDecl :=
+  (fix go (xs : List ADecl) (i : Nat) : List DeadDecl :=
+    match xs with
+    | Nil => Nil DeadDecl
+    | Cons d rest =>
+        match eq_nat (ADecl_kind d) kind_branch with
+        | True =>
+            match ADecl_certain_dead d with
+            | False => go rest (S i)
+            | True =>
+                Cons DeadDecl (MkDeadDecl i dead_kind_branch False False False i)
+                  (go rest (S i))
+            end
+        | False =>
+            Cons DeadDecl
+              (MkDeadDecl i (dead_kind_of (ADecl_kind d)) (ADecl_is_public_api d)
+                (ADecl_is_export d) (ADecl_is_entry d) i)
+              (go rest (S i))
+        end
+    end) decls Z;
+
+def dead_refs (refs : List ARef) : List DeadRef :=
+  map ARef DeadRef (fun (r : ARef) => MkDeadRef (ARef_src r) (ARef_dst r)) refs;
+
+def dead_owner (d : ADecl) : String :=
+  match str_null (ADecl_owner d) with
+  | True => "<unknown>"
+  | False => (ADecl_owner d)
+  end;
+
+def dead_diag_at (d : ADecl) (code : String) (rule : String) (msg : String)
+    (hint : String) (witness : String) : ADiag :=
+  mk_diag code "warning" "deadcode" rule (ADecl_file d) (ADecl_line d)
+    (ADecl_col d) msg hint witness;
+
+def dead_decl_diag (d : ADecl) (issue : DeadIssue) : ADiag :=
+  match issue with
+  | IDeadDef _ =>
+      dead_diag_at d "OURO-DEAD001" "unreachable-definition"
+        "private definition is unreachable from known roots"
+        "Delete it, make it reachable from an entry point, or add a public API baseline root fact."
+        (str_concat "declaration " (ADecl_name d))
+  | IDeadExport _ =>
+      dead_diag_at d "OURO-DEAD002" "unreachable-export"
+        "exported definition is unreachable from known roots"
+        "Reference it from an entry, keep it as public API, or drop the export."
+        (str_concat "export " (ADecl_name d))
+  | IDeadCtor _ =>
+      dead_diag_at d "OURO-DEAD003" "unreachable-constructor"
+        "constructor is unreachable from known roots"
+        "Delete it, reference it, or mark an export/entry root."
+        (str_concat "constructor " (ADecl_name d))
+  | IDeadModule _ =>
+      dead_diag_at d "OURO-DEAD004" "unreachable-module"
+        "module is unreachable from known roots"
+        "Import it from a live module, add an entry, or delete it."
+        (str_concat "module " (ADecl_name d))
+  | IDeadBranch _ =>
+      dead_diag_at d "OURO-DEAD005" "unreachable-branch"
+        "match branch is unreachable"
+        "Remove the shadowed arm or reorder constructors."
+        (str_cat4 "branch " (ADecl_name d) " on " (dead_owner d))
+  end;
+
+def dead_diag (decls : List ADecl) (issue : DeadIssue) : List ADiag :=
+  match decl_at (dead_issue_span issue) decls with
+  | Nothing => Nil ADiag
+  | Just d => ([dead_decl_diag d issue] : List ADiag)
+  end;
+
+-- The worklist pops each root once and each reference target at most once,
+-- so declarations plus references bound it. Diagnostics are returned in
+-- reverse declaration order, the order the sorted output relies on for equal
+-- positions.
+def dead_diags (_files : List AFile) (decls : List ADecl) (refs : List ARef)
+    : List ADiag :=
+  reverse ADiag
+    (concat_map DeadIssue ADiag (dead_diag decls)
+      (analyze_deadcode (S (add (length ADecl decls) (length ARef refs)))
+        (dead_decls decls) (dead_refs refs)));
+
+def supp_match (s : ASupp) (d : ADiag) : Bool :=
+  match orb (ASupp_broad s) (orb (notb (ASupp_known s)) (orb (ASupp_forbidden s)
+    (orb (notb (ASupp_has_reason s)) (ASupp_scope_file s)))) with
+  | True => False
+  | False =>
+      match eq_nat (ASupp_file s) (ADiag_file d) with
+      | False => False
+      | True =>
+          match str_eq (ASupp_code s) (ADiag_code d) with
+          | False => False
+          | True => orb (eq_nat (ADiag_line d) (ASupp_line s)) (eq_nat (ADiag_line d) (S (ASupp_line s)))
+          end
+      end
+  end;
+
+def apply_supps (supps : List ASupp) (diags : List ADiag)
+    : Pair (List ASupp) (List ADiag) :=
+  let marked : List ADiag :=
+    map ADiag ADiag
+      (fun (d : ADiag) =>
+        match any ASupp (fun (s : ASupp) => supp_match s d) supps with
+        | True =>
+            MkADiag (ADiag_code d) (ADiag_severity d) (ADiag_analyzer d)
+              (ADiag_rule d) (ADiag_file d) (ADiag_line d) (ADiag_col d)
+              (ADiag_message d) (ADiag_hint d) (ADiag_witness d) True
+        | False => d
+        end)
+      diags in
+  let used : List ASupp :=
+    map ASupp ASupp
+      (fun (s : ASupp) =>
+        match any ADiag (fun (d : ADiag) => supp_match s d) diags with
+        | True =>
+            MkASupp (ASupp_code s) (ASupp_file s) (ASupp_line s) (ASupp_col s)
+              (ASupp_broad s) (ASupp_has_reason s) (ASupp_scope_file s)
+              (ASupp_known s) (ASupp_forbidden s) True
+        | False => s
+        end)
+      supps in
+  MkPair (List ASupp) (List ADiag) used marked;
+
+-- Suppression facts: the code id is the known-code table index plus one, the
+-- wildcard is the core's all-rules id, and an unknown code gets the id past
+-- the table. The reason id only records presence, and the scope is the
+-- next-line or file scope the parser saw.
+def supp_known_ids : List Nat :=
+  (fix go (xs : List String) (i : Nat) : List Nat :=
+    match xs with
+    | Nil => Nil Nat
+    | Cons _ rest => Cons Nat (S i) (go rest (S i))
+    end) known_codes Z;
+
+def supp_code_id (s : ASupp) : Nat :=
+  match ASupp_broad s with
+  | True => supp_code_all
+  | False =>
+      match index_of String str_eq (ASupp_code s) known_codes with
+      | Just i => S i
+      | Nothing => S (length String known_codes)
+      end
+  end;
+
+def supp_scope_id (s : ASupp) : Nat :=
+  match ASupp_scope_file s with
+  | True => supp_scope_file
+  | False => supp_scope_line
+  end;
+
+def supp_reason_id (s : ASupp) : Nat :=
+  match ASupp_has_reason s with
+  | True => S Z
+  | False => Z
+  end;
+
+def supp_facts (supps : List ASupp) : List Suppression :=
+  (fix go (xs : List ASupp) (i : Nat) : List Suppression :=
+    match xs with
+    | Nil => Nil Suppression
+    | Cons s rest =>
+        Cons Suppression
+          (MkSuppression i (supp_code_id s) (supp_reason_id s) (supp_scope_id s)
+            (ASupp_used s) (notb (ASupp_forbidden s)))
+          (go rest (S i))
+    end) supps Z;
+
+def supp_at (i : Nat) (supps : List ASupp) : ASupp :=
+  nth ASupp (MkASupp "" no_idx Z Z False False False False False False) i supps;
+
+def supp_shown_code (s : ASupp) : String :=
+  match str_null (ASupp_code s) with
+  | True => "<missing>"
+  | False => (ASupp_code s)
+  end;
+
+def supp_diag_at (s : ASupp) (code : String) (rule : String) (msg : String)
+    (hint : String) (witness : String) : ADiag :=
+  mk_diag code "error" "suppressions" rule (ASupp_file s) (ASupp_line s)
+    (ASupp_col s) msg hint witness;
+
+def supp_diag (files : List AFile) (supps : List ASupp) (issue : SuppIssue)
+    : ADiag :=
+  let s : ASupp := supp_at (supp_issue_span issue) supps in
+  let code : String := supp_shown_code s in
+  match issue with
+  | ISuppBroad _ =>
+      supp_diag_at s "OURO-SUP001" "broad-disable"
+        "broad analyzer suppression is forbidden"
+        "Suppress exactly one stable diagnostic code and keep the scope to the next line."
+        (str_concat "suppression disables every rule in "
+          (AFile_path (file_at (ASupp_file s) files)))
+  | ISuppMissingReason _ =>
+      supp_diag_at s "OURO-SUP002" "missing-reason"
+        "suppression is missing a reason"
+        "Add a short reason=... explaining why the precise rule is intentionally suppressed."
+        (str_concat "suppression for " (str_concat code " has no reason=..."))
+  | ISuppUnknown _ =>
+      supp_diag_at s "OURO-SUP003" "unknown-suppression"
+        "suppression names an unknown diagnostic code"
+        "Use a stable OURO-* code from the analyzer rule registry."
+        (str_concat "unknown suppressed code " code)
+  | ISuppUnused _ =>
+      supp_diag_at s "OURO-SUP004" "unused-suppression"
+        "suppression did not suppress any diagnostic"
+        "Remove the stale suppression or move it to the exact line before the diagnostic it suppresses."
+        (str_cat4 "no emitted diagnostic matched " code
+          " at line " (str_of_nat (ASupp_line s)))
+  | ISuppForbidden _ =>
+      supp_diag_at s "OURO-SUP005" "forbidden-suppression"
+        "this diagnostic family cannot be suppressed in source"
+        "Fix the TCB/security violation or change the versioned trust policy after review."
+        (str_concat (ASupp_code s) " is forbidden by TCB/security suppression policy")
+  | ISuppScopeTooWide _ =>
+      supp_diag_at s "OURO-SUP006" "scope-too-wide"
+        "suppression scope is wider than the strict policy allows"
+        "Use the default next-line scope for the single diagnostic instance."
+        (str_concat "suppression for " (str_concat code " uses file/module scope"))
+  end;
+
+def supp_diags (files : List AFile) (supps : List ASupp) : List ADiag :=
+  map SuppIssue ADiag (supp_diag files supps)
+    (analyze_suppressions supp_known_ids supp_scope_line (supp_facts supps));

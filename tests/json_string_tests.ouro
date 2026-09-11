@@ -1,0 +1,147 @@
+-- Decoder byte/offset contracts. Run through the native managed backend for
+-- embedded NUL: the transitional C String conversion is NUL-terminated.
+
+import "../std/json.ouro";
+import "../std/collections.ouro";
+import "../std/test.ouro";
+
+def json_test_string (source : String) (start : Nat) (bytes : List Nat) (after : Nat) : Bool :=
+    match json_string_parse source start with
+    | MkPair decoded next =>
+      match decoded with
+      | Nothing => False
+      | Just text =>
+        andb (eq_nat next after)
+          (list_eq Nat eq_nat (prim_string_to_char_codes text) bytes)
+      end
+    end;
+
+def json_test_failure (source : String) (start : Nat) (offset : Nat) : Bool :=
+    match json_string_parse source start with
+    | MkPair decoded next =>
+      match decoded with
+      | Nothing => eq_nat next offset
+      | Just _ => False
+      end
+    end;
+
+def json_test_rejected (source : String) : Bool :=
+    match parse_json source with
+    | Nothing => True
+    | Just _ => False
+    end;
+
+def json_test_nested_unicode : Bool :=
+    match parse_json "{\"\\u006b\":[\"\\uD83D\\uDE00\"]}" with
+    | Nothing => False
+    | Just json =>
+      match json with
+      | JObj entries =>
+        match entries with
+        | Nil => False
+        | Cons entry rest =>
+          match rest with
+          | Cons _ _ => False
+          | Nil =>
+            match entry with
+            | MkPair key value =>
+              match value with
+              | JArr values =>
+                match values with
+                | Nil => False
+                | Cons first tail =>
+                  match tail with
+                  | Cons _ _ => False
+                  | Nil =>
+                    match first with
+                    | JStr text =>
+                      andb (str_eq key "k")
+                        (list_eq Nat eq_nat (str_codes text) ([240, 159, 152, 128] : List Nat))
+                    | JNull => False
+                    | JBool _ => False
+                    | JNum _ => False
+                    | JArr _ => False
+                    | JObj _ => False
+                    end
+                  end
+                end
+              | JNull => False
+              | JBool _ => False
+              | JNum _ => False
+              | JStr _ => False
+              | JObj _ => False
+              end
+            end
+          end
+        end
+      | JNull => False
+      | JBool _ => False
+      | JNum _ => False
+      | JStr _ => False
+      | JArr _ => False
+      end
+    end;
+
+def json_test_large_string : Bool :=
+    let body : String :=
+      (fix double (count : Nat) (text : String) : String :=
+        match count with
+        | Z => text
+        | S rest => double rest (str_concat text text)
+        end) 12 "x" in
+    match parse_string_lit 1 (str_cat3 "\"" body "\"!") 0 with
+    | PErr _ => False
+    | POk value next =>
+      match value with
+      | JStr text => andb (eq_nat next 4098) (str_eq text body)
+      | JNull => False
+      | JBool _ => False
+      | JNum _ => False
+      | JArr _ => False
+      | JObj _ => False
+      end
+    end;
+
+-- @entry main
+def main : IO Unit :=
+    test_run
+      ([ assert_true "empty string and next byte" (json_test_string "\"\"tail" 0 [] 2)
+      , assert_true "nonzero opening offset" (json_test_string "xx\"ab\"tail" 2 [97, 98] 6)
+      , assert_true "all simple escapes" (json_test_string "\"\\\"\\\\\\/\\b\\f\\n\\r\\t\"" 0 [34, 92, 47, 8, 12, 10, 13, 9] 18)
+      , assert_true "escaped NUL keeps following bytes" (json_test_string "\"a\\u0000b\"" 0 [97, 0, 98] 10)
+      , assert_true "UTF8 scalar width boundaries" (json_test_string "\"\\u007f\\u0080\\u07ff\\u0800\\uffff\"" 0 [127, 194, 128, 223, 191, 224, 160, 128, 239, 191, 191] 32)
+      , assert_true "BMP surrogate neighbors" (json_test_string "\"\\uD7FF\\uE000\"" 0 [237, 159, 191, 238, 128, 128] 14)
+      , assert_true "surrogate pair emoji" (json_test_string "\"\\uD83D\\uDE00\"" 0 [240, 159, 152, 128] 14)
+      , assert_true "lowest supplementary scalar" (json_test_string "\"\\uD800\\uDC00\"" 0 [240, 144, 128, 128] 14)
+      , assert_true "highest supplementary scalar" (json_test_string "\"\\udbff\\udfff\"" 0 [244, 143, 191, 191] 14)
+      , assert_true "raw UTF8 bytes preserved" (json_test_string (str_of_codes [34, 195, 169, 34]) 0 [195, 169] 4)
+      , assert_true "existing raw byte contract" (json_test_string (str_of_codes [34, 255, 34]) 0 [255] 3)
+      , assert_true "opening quote required" (json_test_failure "abc" 0 0)
+      , assert_true "entry beyond end" (json_test_failure "\"\"" 7 7)
+      , assert_true "opening quote only" (json_test_failure "\"" 0 0)
+      , assert_true "missing closing quote" (json_test_failure "\"abc" 0 3)
+      , assert_true "missing close after escape" (json_test_failure "\"\\n" 0 2)
+      , assert_true "missing close after unicode" (json_test_failure "\"\\u0041" 0 6)
+      , assert_true "trailing backslash" (json_test_failure "\"abc\\" 0 4)
+      , assert_true "invalid simple escape" (json_test_failure "xx\"\\x\"" 2 4)
+      , assert_true "raw newline rejected" (json_test_failure "\"a\nb\"" 0 2)
+      , assert_true "raw NUL rejected at its byte" (json_test_failure (str_of_codes [34, 97, 0, 98, 34]) 0 2)
+      , assert_true "raw last control byte rejected" (json_test_failure (str_of_codes [34, 31, 34]) 0 1)
+      , assert_true "invalid hex digit" (json_test_failure "\"\\u01x3\"" 0 5)
+      , assert_true "short hex escape at close" (json_test_failure "\"\\u12\"" 0 5)
+      , assert_true "short hex escape at EOF" (json_test_failure "\"\\u12" 0 5)
+      , assert_true "NUL cannot terminate hex escape" (json_test_failure (str_of_codes [34, 92, 117, 48, 0, 48, 48, 34]) 0 4)
+      , assert_true "lone low surrogate" (json_test_failure "\"\\uDC00\"" 0 2)
+      , assert_true "high surrogate missing partner" (json_test_failure "\"\\uD800\"" 0 7)
+      , assert_true "high surrogate missing partner at EOF" (json_test_failure "\"\\uD800" 0 7)
+      , assert_true "high surrogate nonadjacent partner" (json_test_failure "\"\\uD800x\\uDC00\"" 0 7)
+      , assert_true "high surrogate wrong escape" (json_test_failure "\"\\uD800\\n\"" 0 8)
+      , assert_true "high surrogate BMP partner" (json_test_failure "\"\\uD800\\u0041\"" 0 8)
+      , assert_true "high surrogate high partner" (json_test_failure "\"\\uD800\\uD800\"" 0 8)
+      , assert_true "invalid low surrogate hex" (json_test_failure "\"\\uD800\\uDCx0\"" 0 11)
+      , assert_true "truncated low surrogate hex" (json_test_failure "\"\\uD800\\uDC" 0 11)
+      , assert_true "unicode object key and nested value" json_test_nested_unicode
+      , assert_true "public parser rejects malformed unicode" (json_test_rejected "{\"k\":\"\\uD800\"}")
+      , assert_true "public parser rejects trailing content" (json_test_rejected "\"ok\"x")
+      , assert_true "large leaf is independent of structure fuel" json_test_large_string
+      ] : List Test);

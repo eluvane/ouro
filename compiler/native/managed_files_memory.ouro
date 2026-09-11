@@ -1,0 +1,153 @@
+-- Exact helper types retain RawPtr pointees and checked declaration identity.
+-- Managed file captures remain GC roots; raw pages and handles stay explicit.
+import "managed_startup_memory.ouro";
+
+inductive ManagedFileHelper : Type :=
+  | ManagedFileAllocate : ManagedFileHelper | ManagedFileRelease : ManagedFileHelper
+  | ManagedFileToWide : ManagedFileHelper | ManagedFileOpenRead : ManagedFileHelper
+  | ManagedFileOpenWrite : ManagedFileHelper | ManagedFileLength : ManagedFileHelper
+  | ManagedFilePrepare : ManagedFileHelper | ManagedFileRead : ManagedFileHelper
+  | ManagedFileWrite : ManagedFileHelper | ManagedFileClose : ManagedFileHelper;
+
+inductive ManagedFileScope : Type :=
+  | ManagedFileScopeOf : List MirValue -> Maybe MirValue -> ManagedFileScope;
+
+def managed_file_helper_name (helper : ManagedFileHelper) : List Nat :=
+    match helper with
+    | ManagedFileAllocate => managed_stdio_helper_name ManagedStdioAllocate
+    | ManagedFileRelease => managed_stdio_helper_name ManagedStdioRelease
+    | ManagedFileToWide => managed_startup_helper_name ManagedStartupToWide
+    | ManagedFileOpenRead => ([114,97,119,95,119,105,110,100,111,119,115,95,102,105,108,101,95,111,112,101,110] : List Nat)
+    | ManagedFileOpenWrite => ([114,97,119,95,119,105,110,100,111,119,115,95,102,105,108,101,95,111,112,101,110,95,119,114,105,116,101] : List Nat)
+    | ManagedFileLength => ([114,97,119,95,119,105,110,100,111,119,115,95,102,105,108,101,95,108,101,110,103,116,104] : List Nat)
+    | ManagedFilePrepare => ([114,97,119,95,119,105,110,100,111,119,115,95,102,105,108,101,95,112,114,101,112,97,114,101,95,119,114,105,116,101] : List Nat)
+    | ManagedFileRead => ([114,97,119,95,119,105,110,100,111,119,115,95,102,105,108,101,95,114,101,97,100] : List Nat)
+    | ManagedFileWrite => ([114,97,119,95,119,105,110,100,111,119,115,95,102,105,108,101,95,119,114,105,116,101] : List Nat)
+    | ManagedFileClose => ([114,97,119,95,119,105,110,100,111,119,115,95,102,105,108,101,95,99,108,111,115,101] : List Nat) end;
+
+def managed_file_status_expected (compiler : ManagedCompiler) (helper : ManagedFileHelper)
+    : Either NativeLowerError CoreTerm :=
+    let bindings : List PrimitiveResolved := primitive_environment (managed_compiler_entries compiler) in
+    lower_from_primitive CoreTerm (CSort 0)
+      (primitive_bind CoreTerm CoreTerm (primitive_type_ref PrimitiveRuntimeType bindings) (fun (runtime : CoreTerm) =>
+        primitive_bind CoreTerm CoreTerm (primitive_type_ref PrimitiveRawPtrType bindings) (fun (pointer : CoreTerm) =>
+          primitive_bind CoreTerm CoreTerm (primitive_type_ref PrimitiveU8Type bindings) (fun (byte : CoreTerm) =>
+            primitive_bind CoreTerm CoreTerm (primitive_type_ref PrimitiveU32Type bindings) (fun (word : CoreTerm) =>
+              primitive_bind CoreTerm CoreTerm (primitive_type_ref PrimitiveUSizeType bindings) (fun (size : CoreTerm) =>
+                primitive_map CoreTerm CoreTerm (fun (boolean : CoreTerm) =>
+                  let buffer : CoreTerm := CApp pointer byte in
+                  let owner : CoreTerm := CApp pointer size in
+                  let arguments : List CoreTerm := match helper with
+                    | ManagedFileOpenRead => ([buffer, size, word, word, word, boolean, owner] : List CoreTerm)
+                    | ManagedFileOpenWrite => ([buffer, size, owner] : List CoreTerm)
+                    | ManagedFileLength => ([buffer, owner] : List CoreTerm) | ManagedFilePrepare => ([buffer, owner] : List CoreTerm)
+                    | ManagedFileRead => ([buffer, buffer, size, CApp pointer word] : List CoreTerm)
+                    | ManagedFileWrite => ([buffer, buffer, size, CApp pointer word] : List CoreTerm)
+                    | ManagedFileClose => ([buffer] : List CoreTerm)
+                    | ManagedFileAllocate => ([] : List CoreTerm) | ManagedFileRelease => ([] : List CoreTerm)
+                    | ManagedFileToWide => ([] : List CoreTerm) end in
+                  primitive_arrow arguments (CApp runtime word))
+                  (primitive_role_ref PrimitiveBoolRole (primitive_roles_environment (managed_compiler_entries compiler)))))))));
+
+def managed_file_expected (compiler : ManagedCompiler) (helper : ManagedFileHelper)
+    : Either NativeLowerError CoreTerm :=
+    match helper with
+    | ManagedFileAllocate => managed_stdio_expected compiler ManagedStdioAllocate
+    | ManagedFileRelease => managed_stdio_expected compiler ManagedStdioRelease
+    | ManagedFileToWide => managed_startup_expected compiler ManagedStartupToWide
+    | ManagedFileOpenRead => managed_file_status_expected compiler helper
+    | ManagedFileOpenWrite => managed_file_status_expected compiler helper
+    | ManagedFileLength => managed_file_status_expected compiler helper
+    | ManagedFilePrepare => managed_file_status_expected compiler helper
+    | ManagedFileRead => managed_file_status_expected compiler helper
+    | ManagedFileWrite => managed_file_status_expected compiler helper
+    | ManagedFileClose => managed_file_status_expected compiler helper end;
+
+def managed_file_helpers (compiler : ManagedCompiler) : List ManagedFileHelper :=
+    let reading : Bool := managed_stdio_has compiler PrimitiveFileRead in
+    let writing : Bool := managed_stdio_has compiler PrimitiveFileWrite in
+    match orb reading writing with | False => ([] : List ManagedFileHelper) | True =>
+      append ManagedFileHelper ([ManagedFileAllocate, ManagedFileRelease, ManagedFileToWide, ManagedFileClose] : List ManagedFileHelper)
+        (append ManagedFileHelper (match reading with | False => ([] : List ManagedFileHelper)
+          | True => ([ManagedFileOpenRead, ManagedFileLength, ManagedFileRead] : List ManagedFileHelper) end)
+          (match writing with | False => ([] : List ManagedFileHelper)
+            | True => ([ManagedFileOpenWrite, ManagedFilePrepare, ManagedFileWrite] : List ManagedFileHelper) end)) end;
+
+def managed_file_roots (compiler : ManagedCompiler) (fuel : Nat) : Either NativeLowerError (List Nat) :=
+    (fix resolve (helpers : List ManagedFileHelper) : Either NativeLowerError (List Nat) :=
+      match helpers with | Nil => Right NativeLowerError (List Nat) ([] : List Nat) | Cons helper rest =>
+        lower_bind CoreTerm (List Nat) (managed_file_expected compiler helper) (fun (expected : CoreTerm) =>
+          lower_bind Nat (List Nat) (managed_runtime_definition compiler fuel (managed_file_helper_name helper) expected)
+            (fun (id : Nat) => lower_map (List Nat) (List Nat) (Cons Nat id) (resolve rest))) end)
+      (managed_file_helpers compiler);
+
+def managed_file_call (compiler : ManagedCompiler) (helper : ManagedFileHelper)
+    (arguments : List MirValue) (state : ManagedState) : Either NativeLowerError ManagedResult :=
+    lower_bind CoreTerm ManagedResult (managed_file_expected compiler helper) (fun (expected : CoreTerm) =>
+      lower_bind LowerContract ManagedResult
+        (managed_runtime_contract compiler primitive_default_fuel (managed_file_helper_name helper) expected)
+        (fun (contract : LowerContract) =>
+          let typ : MirType := match helper with
+            | ManagedFileAllocate => MirRawPtr | ManagedFileRelease => MirU8 | ManagedFileToWide => MirU32
+            | ManagedFileOpenRead => MirU32 | ManagedFileOpenWrite => MirU32 | ManagedFileLength => MirU32
+            | ManagedFilePrepare => MirU32 | ManagedFileRead => MirU32 | ManagedFileWrite => MirU32
+            | ManagedFileClose => MirU32 end in
+          managed_fresh typ (fun (local : Nat) =>
+            MirCall MirMayGc (Just Nat local) (MirDirect (lower_contract_id contract)) arguments) state));
+
+def managed_file_own (buffer : MirValue) (scope : ManagedFileScope) : ManagedFileScope :=
+    match scope with | ManagedFileScopeOf buffers stream => ManagedFileScopeOf (Cons MirValue buffer buffers) stream end;
+
+def managed_file_handle (stream : MirValue) (scope : ManagedFileScope) : ManagedFileScope :=
+    match scope with | ManagedFileScopeOf buffers _ => ManagedFileScopeOf buffers (Just MirValue stream) end;
+
+-- Close first, then release all pages in reverse acquisition order. A failed
+-- close/release does not prevent the remaining cleanup calls from running.
+def managed_file_cleanup (compiler : ManagedCompiler) (scope : ManagedFileScope) (state : ManagedState)
+    : Either NativeLowerError ManagedResult :=
+    match scope with | ManagedFileScopeOf buffers stream => match stream with
+      | Nothing => managed_startup_release_all compiler buffers (managed_bits MirU8 1) state
+      | Just stream_handle => lower_bind ManagedResult ManagedResult
+          (managed_file_call compiler ManagedFileClose ([stream_handle] : List MirValue) state)
+          (fun (closed : ManagedResult) => match closed with | ManagedResultOf status next =>
+            lower_bind ManagedResult ManagedResult (managed_startup_zero status next)
+              (fun (checked : ManagedResult) => match checked with | ManagedResultOf okay after =>
+                managed_startup_release_all compiler buffers okay after end) end) end end;
+
+-- Failure paths terminate after cleanup; they never join with a fake IO value.
+def managed_file_require (compiler : ManagedCompiler) (scope : ManagedFileScope) (condition : MirValue)
+    (state : ManagedState) : Either NativeLowerError ManagedState :=
+    lower_bind Nat ManagedState (managed_stdio_exit_symbol compiler) (fun (exit : Nat) =>
+      lower_bind LowerLoopBlocks ManagedState (lower_loop_blocks (managed_flow state))
+        (fun (labels : LowerLoopBlocks) => match labels with | LowerLoopAt valid invalid _ flow =>
+          lower_map ManagedResult ManagedState (fun (cleaned : ManagedResult) => match cleaned with
+            | ManagedResultOf _ after => managed_switch_block valid MirTrap
+                (managed_emit (MirCall MirMayGc (Nothing Nat) (MirDirect exit)
+                  ([managed_bits MirU32 73] : List MirValue)) after) end)
+            (managed_file_cleanup compiler scope
+              (managed_with_flow state (lower_switch_block invalid (MirBranch condition valid invalid) flow))) end));
+
+def managed_file_status (compiler : ManagedCompiler) (scope : ManagedFileScope) (status : MirValue)
+    (state : ManagedState) : Either NativeLowerError ManagedState :=
+    lower_bind ManagedResult ManagedState (managed_startup_zero status state)
+      (fun (checked : ManagedResult) => match checked with | ManagedResultOf okay next =>
+        managed_file_require compiler scope okay next end);
+
+def managed_file_buffer (compiler : ManagedCompiler) (scope : ManagedFileScope) (bytes : MirValue)
+    (body : MirValue -> ManagedFileScope -> ManagedState -> Either NativeLowerError ManagedResult)
+    (state : ManagedState) : Either NativeLowerError ManagedResult :=
+    lower_bind ManagedResult ManagedResult
+      (managed_file_call compiler ManagedFileAllocate ([bytes, managed_bits MirUSize 8] : List MirValue) state)
+      (fun (allocated : ManagedResult) => match allocated with | ManagedResultOf buffer next =>
+        lower_bind ManagedResult ManagedResult (managed_compare MirNotEqual buffer (managed_bits MirRawPtr 0) next)
+          (fun (checked : ManagedResult) => match checked with | ManagedResultOf okay after =>
+            lower_bind ManagedState ManagedResult (managed_file_require compiler scope okay after)
+              (body buffer (managed_file_own buffer scope)) end) end);
+
+def managed_file_complete (compiler : ManagedCompiler) (scope : ManagedFileScope) (value : MirValue)
+    (state : ManagedState) : Either NativeLowerError ManagedResult :=
+    lower_bind Nat ManagedResult (managed_stdio_exit_symbol compiler) (fun (exit : Nat) =>
+      lower_bind ManagedResult ManagedResult (managed_file_cleanup compiler scope state)
+        (fun (cleaned : ManagedResult) => match cleaned with | ManagedResultOf okay next =>
+          lower_map ManagedState ManagedResult (fun (finished : ManagedState) => ManagedResultOf value finished)
+            (managed_stdio_require exit okay next) end));

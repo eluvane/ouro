@@ -1,0 +1,645 @@
+-- Formatter decisions are pure so the CLI, docs fixtures, and LSP can share byte-identical output.
+
+-- @entry analyze
+-- @entry format
+
+import "../../compiler/base.ouro";
+import "../../std/data.ouro";
+
+-- Issue tag order (fixture codes): 0 crlf … 10 pipe-space.
+inductive Issue : Type :=
+  | ICrlf : Nat -> Issue
+  | IFinalNewline : Nat -> Issue
+  | IEofBlanks : Nat -> Issue
+  | ITabs : Nat -> Issue
+  | ITrailingWs : Nat -> Issue
+  | IIndent : Nat -> Issue
+  | ILineLength : Nat -> Issue
+  | ICommentSpace : Nat -> Issue
+  | IColonEqSpace : Nat -> Issue
+  | IFatArrowSpace : Nat -> Issue
+  | IPipeSpace : Nat -> Issue;
+
+def even : Nat -> Bool :=
+  fix even (n : Nat) : Bool :=
+    match n with
+    | Z => True
+    | S n' =>
+        match n' with
+        | Z => False
+        | S n'' => even n''
+        end
+    end;
+
+def lengthN (xs : List Nat) : Nat := length Nat xs;
+
+def lengthL (xs : List (List Nat)) : Nat := length (List Nat) xs;
+
+def appendN (xs : List Nat) (ys : List Nat) : List Nat := append Nat xs ys;
+
+def appendI (xs : List Issue) (ys : List Issue) : List Issue := append Issue xs ys;
+
+def reverseN (xs : List Nat) : List Nat := reverse Nat xs;
+
+def reverseL (xs : List (List Nat)) : List (List Nat) := reverse (List Nat) xs;
+
+def icons (i : Issue) (is : List Issue) : List Issue := Cons Issue i is;
+
+def inil : List Issue := [];
+
+def n1 : Nat := S Z;
+def n2 : Nat := S n1;
+def n3 : Nat := S n2;
+def n4 : Nat := S n3;
+def n5 : Nat := S n4;
+def n8 : Nat := mul n2 (mul n2 n2);
+def n10 : Nat := mul n2 n5;
+def n16 : Nat := mul n2 n8;
+def n32 : Nat := mul n2 n16;
+def n64 : Nat := mul n2 n32;
+def n100 : Nat := mul n10 n10;
+
+-- ASCII: tab=9 LF=10 CR=13 sp=32 " =34 - =45 : =58 = =61 > =62 \ =92 | =124
+def chTab : Nat := S n8;
+def chLF : Nat := S chTab;
+def chCR : Nat := S (S (S chLF));
+def chSpace : Nat := n32;
+def chDQuote : Nat := S (S n32);
+def chDash : Nat := S (add n32 (add n8 n4));
+def chColon : Nat := add n32 (add n16 (add n8 n2));
+def chEq : Nat := S (S (S chColon));
+def chGt : Nat := S chEq;
+def chBSlash : Nat := add n64 (add n16 (add n8 n4));
+def chPipe : Nat := 124;
+
+def isWS (c : Nat) : Bool := orb (eqNat c chSpace) (eqNat c chTab);
+
+-- The compiler admits apostrophes in identifiers, not as string delimiters.
+def isQuote (c : Nat) : Bool := eqNat c chDQuote;
+
+-- A forward pipe is one token, including at the start of a continuation
+-- line. The diagnostic and rewrite share this distinction from an arm bar.
+def pipeHasSeparator (next : Nat) : Bool :=
+    orb (eqNat next chSpace) (eqNat next chGt);
+
+-- CR LF and bare CR → LF.
+def normalizeEOL : List Nat -> List Nat :=
+  fix normalizeEOL (xs : List Nat) : List Nat :=
+    match xs with
+    | Nil => Nil Nat
+    | Cons c rest =>
+        match eqNat c chCR with
+        | True =>
+            match rest with
+            | Nil => [chLF]
+            | Cons c2 rest2 =>
+                match eqNat c2 chLF with
+                | True => Cons Nat chLF (normalizeEOL rest2)
+                | False => Cons Nat chLF (normalizeEOL rest)
+                end
+            end
+        | False => Cons Nat c (normalizeEOL rest)
+        end
+    end;
+
+def lastIsLF : List Nat -> Bool :=
+  fix lastIsLF (xs : List Nat) : Bool :=
+    match xs with
+    | Nil => False
+    | Cons c rest =>
+        match rest with
+        | Nil => eqNat c chLF
+        | Cons _ _ => lastIsLF rest
+        end
+    end;
+
+def dropFinalLF (xs : List Nat) : List Nat :=
+    reverseN (
+      match reverseN xs with
+      | Nil => Nil Nat
+      | Cons c rest =>
+          match eqNat c chLF with
+          | True => rest
+          | False => Cons Nat c rest
+          end
+      end
+    );
+
+-- Split on LF (no EOL in lines). Empty body → one empty line (JS split).
+def splitOnLF (body : List Nat) : List (List Nat) :=
+    (fix go (xs : List Nat) (cur : List Nat) (acc : List (List Nat)) : List (List Nat) :=
+      match xs with
+      | Nil => reverseL (Cons (List Nat) (reverseN cur) acc)
+      | Cons c rest =>
+          match eqNat c chLF with
+          | True => go rest (Nil Nat) (Cons (List Nat) (reverseN cur) acc)
+          | False => go rest (Cons Nat c cur) acc
+          end
+      end) body (Nil Nat) (Nil (List Nat));
+
+def countTrailEmptyGo : List (List Nat) -> Nat :=
+  fix countTrailEmptyGo (xs : List (List Nat)) : Nat :=
+    match xs with
+    | Nil => Z
+    | Cons line rest =>
+        match line with
+        | Nil => S (countTrailEmptyGo rest)
+        | Cons _ _ => Z
+        end
+    end;
+
+def countTrailEmpty (lines : List (List Nat)) : Nat := countTrailEmptyGo (reverseL lines);
+
+def containsChar (target : Nat) : List Nat -> Bool :=
+    elem Nat eqNat target;
+
+def hasTrailingWS (line : List Nat) : Bool :=
+    match reverseN line with
+    | Nil => False
+    | Cons c _ => isWS c
+    end;
+
+-- Leading spaces only (not tabs).
+def leadSpaces : List Nat -> Nat :=
+  fix leadSpaces (xs : List Nat) : Nat :=
+    match xs with
+    | Nil => Z
+    | Cons c rest =>
+        match eqNat c chSpace with
+        | True => S (leadSpaces rest)
+        | False => Z
+        end
+    end;
+
+def hasContent : List Nat -> Bool :=
+  fix hasContent (xs : List Nat) : Bool :=
+    match xs with
+    | Nil => False
+    | Cons c rest =>
+        match isWS c with
+        | True => hasContent rest
+        | False => True
+        end
+    end;
+
+inductive StripMode : Type :=
+  | SmNormal : StripMode
+  | SmInStr : Nat -> StripMode
+  | SmEsc : Nat -> StripMode;
+
+-- Replace string literals with spaces (open/close → one space each; interior dropped).
+def stripAsciiStringsGo : List Nat -> StripMode -> List Nat :=
+  fix stripAsciiStringsGo (xs : List Nat) (mode : StripMode) : List Nat :=
+    match xs with
+    | Nil => Nil Nat
+    | Cons c rest =>
+        match mode with
+        | SmNormal =>
+            match isQuote c with
+            | True => Cons Nat chSpace (stripAsciiStringsGo rest (SmInStr c))
+            | False => Cons Nat c (stripAsciiStringsGo rest SmNormal)
+            end
+        | SmInStr q =>
+            match eqNat c chBSlash with
+            | True => stripAsciiStringsGo rest (SmEsc q)
+            | False =>
+                match eqNat c q with
+                | True => Cons Nat chSpace (stripAsciiStringsGo rest SmNormal)
+                | False => stripAsciiStringsGo rest (SmInStr q)
+                end
+            end
+        | SmEsc q => stripAsciiStringsGo rest (SmInStr q)
+        end
+    end;
+
+def stripAsciiStrings (xs : List Nat) : List Nat := stripAsciiStringsGo xs SmNormal;
+
+-- Code prefix before first `--`.
+def codeBeforeComment : List Nat -> List Nat :=
+  fix codeBeforeComment (xs : List Nat) : List Nat :=
+    match xs with
+    | Nil => Nil Nat
+    | Cons c rest =>
+        match eqNat c chDash with
+        | True =>
+            match rest with
+            | Nil => [c]
+            | Cons c2 _ =>
+                match eqNat c2 chDash with
+                | True => Nil Nat
+                | False => Cons Nat c (codeBeforeComment rest)
+                end
+            end
+        | False => Cons Nat c (codeBeforeComment rest)
+        end
+    end;
+
+def afterCommentStart : List Nat -> Maybe (List Nat) :=
+  fix afterCommentStart (xs : List Nat) : Maybe (List Nat) :=
+    match xs with
+    | Nil => Nothing (List Nat)
+    | Cons c rest =>
+        match eqNat c chDash with
+        | True =>
+            match rest with
+            | Nil => Nothing (List Nat)
+            | Cons c2 rest2 =>
+                match eqNat c2 chDash with
+                | True => Just (List Nat) rest2
+                | False => afterCommentStart rest
+                end
+            end
+        | False => afterCommentStart rest
+        end
+    end;
+
+def badCommentSpace (noStr : List Nat) : Bool :=
+    match afterCommentStart noStr with
+    | Nothing => False
+    | Just after =>
+        match after with
+        | Nil => False
+        | Cons c _ =>
+            match eqNat c chSpace with
+            | True => False
+            | False =>
+                notb (eqNat c chDash)
+            end
+        end
+    end;
+
+def startsWith2 (o1 : Nat) (o2 : Nat) (xs : List Nat) : Bool :=
+    match xs with
+    | Nil => False
+    | Cons c rest =>
+        match eqNat c o1 with
+        | True =>
+            match rest with
+            | Nil => False
+            | Cons c2 _ => eqNat c2 o2
+            end
+        | False => False
+        end
+    end;
+
+-- `:=` / `=>` spacing (kind Z = colon-eq else fat-arrow). Recurse on 2nd op char.
+def scanOpSpacing : List Nat -> Bool -> Nat -> Nat -> Nat -> Nat -> List Issue :=
+  fix scanOpSpacing (xs : List Nat) (prevWS : Bool) (o1 : Nat) (o2 : Nat)
+      (lineNo : Nat) (kind : Nat) : List Issue :=
+    match xs with
+    | Nil => inil
+    | Cons c rest =>
+        match startsWith2 o1 o2 xs with
+        | True =>
+            let afterWS : Bool :=
+              match rest with
+              | Nil => True
+              | Cons _ rest2 =>
+                  match rest2 with
+                  | Nil => True
+                  | Cons a _ => isWS a
+                  end
+              end
+            in
+            let bad : Bool := orb (notb prevWS) (notb afterWS) in
+            let restIss : List Issue := scanOpSpacing rest True o1 o2 lineNo kind in
+            match bad with
+            | True =>
+                match eqNat kind Z with
+                | True => icons (IColonEqSpace lineNo) restIss
+                | False => icons (IFatArrowSpace lineNo) restIss
+                end
+            | False => restIss
+            end
+        | False => scanOpSpacing rest (isWS c) o1 o2 lineNo kind
+        end
+    end;
+
+def checkColonEq (lineNo : Nat) (code : List Nat) : List Issue :=
+    scanOpSpacing code True chColon chEq lineNo Z;
+
+def checkFatArrow (lineNo : Nat) (code : List Nat) : List Issue :=
+    scanOpSpacing code True chEq chGt lineNo n1;
+
+def badPipeSpace : List Nat -> Bool :=
+  fix badPipeSpace (xs : List Nat) : Bool :=
+    match xs with
+    | Nil => False
+    | Cons c rest =>
+        match isWS c with
+        | True => badPipeSpace rest
+        | False =>
+            match eqNat c chPipe with
+            | True =>
+                match rest with
+                | Nil => True
+                | Cons a _ => notb (pipeHasSeparator a)
+                end
+            | False => False
+            end
+        end
+    end;
+
+def note (b : Bool) (i : Issue) (acc : List Issue) : List Issue :=
+    match b with
+    | True => appendI acc (icons i inil)
+    | False => acc
+    end;
+
+-- Per-line issues in format.js order (append, do not prepend).
+def analyzeLine (lineNo : Nat) (line : List Nat) : List Issue :=
+    let noStr : List Nat := stripAsciiStrings line in
+    let code : List Nat := codeBeforeComment noStr in
+    let iss0 : List Issue :=
+      note (compiler_lt_nat n100 (lengthN line)) (ILineLength lineNo)
+        (note (andb (hasContent line) (notb (even (leadSpaces line))))
+          (IIndent lineNo)
+          (note (hasTrailingWS line) (ITrailingWs lineNo)
+            (note (containsChar chTab noStr) (ITabs lineNo) inil))) in
+    let iss1 : List Issue :=
+      appendI (note (badCommentSpace noStr) (ICommentSpace lineNo) iss0)
+        (checkColonEq lineNo code) in
+    note (badPipeSpace line) (IPipeSpace lineNo)
+      (appendI iss1 (checkFatArrow lineNo code));
+
+def analyzeLinesGo : List (List Nat) -> Nat -> List Issue :=
+  fix analyzeLinesGo (xs : List (List Nat)) (ln : Nat) : List Issue :=
+    match xs with
+    | Nil => inil
+    | Cons line rest => appendI (analyzeLine ln line) (analyzeLinesGo rest (S ln))
+    end;
+
+def analyzeLines (lines : List (List Nat)) : List Issue := analyzeLinesGo lines n1;
+
+def analyze (src : List Nat) : List Issue :=
+    let crIss : List Issue :=
+      match containsChar chCR src with
+      | True => icons (ICrlf n1) inil
+      | False => inil
+      end
+    in
+    let norm : List Nat := normalizeEOL src in
+    let hasFinal : Bool := lastIsLF norm in
+    let body : List Nat :=
+      match hasFinal with
+      | True => dropFinalLF norm
+      | False => norm
+      end
+    in
+    let lines : List (List Nat) := splitOnLF body in
+    let nLines : Nat := lengthL lines in
+    let eofIss : List Issue :=
+      match hasFinal with
+      | True =>
+          match compiler_lt_nat n1 (countTrailEmpty lines) with
+          | True => icons (IEofBlanks nLines) inil
+          | False => inil
+          end
+      | False => icons (IFinalNewline nLines) inil
+      end
+    in
+    appendI crIss (appendI eofIss (analyzeLines lines));
+
+-- Tabs inside strings are data. This also preserves escaped quotes rather
+-- than accidentally returning to code mode in the middle of a literal.
+def expandCodeTabs : List Nat -> StripMode -> List Nat :=
+  fix expandCodeTabs (xs : List Nat) (mode : StripMode) : List Nat :=
+    match xs with
+    | Nil => Nil Nat
+    | Cons c rest =>
+        match mode with
+        | SmNormal =>
+            match isQuote c with
+            | True => Cons Nat c (expandCodeTabs rest (SmInStr c))
+            | False =>
+                match eqNat c chTab with
+                | True => Cons Nat chSpace (Cons Nat chSpace (expandCodeTabs rest SmNormal))
+                | False => Cons Nat c (expandCodeTabs rest SmNormal)
+                end
+            end
+        | SmInStr q =>
+            match eqNat c chBSlash with
+            | True => Cons Nat c (expandCodeTabs rest (SmEsc q))
+            | False =>
+                match eqNat c q with
+                | True => Cons Nat c (expandCodeTabs rest SmNormal)
+                | False => Cons Nat c (expandCodeTabs rest (SmInStr q))
+                end
+            end
+        | SmEsc q => Cons Nat c (expandCodeTabs rest (SmInStr q))
+        end
+    end;
+
+-- @bound(nodes <= 58) @bound(depth <= 12) @bound(allocs <= 21) @bound(stack <= 5) @bound(steps <= 22) @bound(cyclo <= 7) @minimal
+def expandTabs (xs : List Nat) : List Nat := expandCodeTabs xs SmNormal;
+
+-- @bound(nodes <= 52) @bound(depth <= 15) @bound(allocs <= 17) @bound(stack <= 6) @bound(steps <= 18) @bound(cyclo <= 8)
+def stripTrailingWS (line : List Nat) : List Nat :=
+    reverseN (
+      (fix dropWS (xs : List Nat) : List Nat :=
+        match xs with
+        | Nil => Nil Nat
+        | Cons c rest =>
+            match isWS c with
+            | True => dropWS rest
+            | False => Cons Nat c rest
+            end
+        end) (reverseN line)
+    );
+
+-- @bound(nodes <= 37) @bound(depth <= 12) @bound(allocs <= 12) @bound(stack <= 5) @bound(steps <= 13) @bound(cyclo <= 8)
+def fixLeadIndent (line : List Nat) : List Nat :=
+    match hasContent line with
+    | False => line
+    | True =>
+        match even (leadSpaces line) with
+        | True => line
+        | False => Cons Nat chSpace line
+        end
+    end;
+
+-- @bound(nodes <= 98) @bound(depth <= 17) @bound(allocs <= 39) @bound(stack <= 6) @bound(steps <= 40) @bound(cyclo <= 8)
+def takeLeadingWS (xs : List Nat) : Pair (List Nat) (List Nat) :=
+    (fix go (ys : List Nat) (acc : List Nat) : Pair (List Nat) (List Nat) :=
+      match ys with
+      | Nil => MkPair (List Nat) (List Nat) (reverseN acc) (Nil Nat)
+      | Cons c rest =>
+          match isWS c with
+          | True => go rest (Cons Nat c acc)
+          | False => MkPair (List Nat) (List Nat) (reverseN acc) ys
+          end
+      end) xs (Nil Nat);
+
+-- @bound(nodes <= 67) @bound(depth <= 22) @bound(allocs <= 22) @bound(stack <= 7) @bound(steps <= 25) @bound(cyclo <= 15)
+def fixPipeSpace (line : List Nat) : List Nat :=
+    match takeLeadingWS line with
+    | MkPair pre rest =>
+        match rest with
+        | Nil => line
+        | Cons c rest2 =>
+            match eqNat c chPipe with
+            | False => line
+            | True =>
+                match rest2 with
+                | Nil => line
+                | Cons a _ =>
+                    match pipeHasSeparator a with
+                    | True => line
+                    | False => appendN pre (Cons Nat chPipe (Cons Nat chSpace rest2))
+                    end
+                end
+            end
+        end
+    end;
+
+-- Ops/comments/strings; reversed acc; short-circuit after fixed `--`. prevWS starts True.
+-- @bound(nodes <= 474) @bound(depth <= 31) @bound(allocs <= 186) @bound(stack <= 9) @bound(steps <= 201) @bound(cyclo <= 59)
+def fixContentGo : List Nat -> StripMode -> Bool -> List Nat -> List Nat :=
+  fix fixContentGo (xs : List Nat) (mode : StripMode) (prevWS : Bool) (acc : List Nat) : List Nat :=
+    match xs with
+    | Nil => reverseN acc
+    | Cons c rest =>
+        match mode with
+        | SmNormal =>
+            match startsWith2 chDash chDash xs with
+            | True =>
+                match rest with
+                | Nil => reverseN (Cons Nat c acc)
+                | Cons c2 rest2 =>
+                    match rest2 with
+                    | Nil =>
+                        reverseN (Cons Nat c2 (Cons Nat c acc))
+                    | Cons a _ =>
+                        match orb (eqNat a chSpace) (eqNat a chDash) with
+                        | True =>
+                            appendN (reverseN (Cons Nat c2 (Cons Nat c acc))) rest2
+                        | False =>
+                            appendN
+                              (reverseN
+                                (Cons Nat chSpace
+                                  (Cons Nat c2 (Cons Nat c acc))))
+                              rest2
+                        end
+                    end
+                end
+            | False =>
+                match startsWith2 chColon chEq xs with
+                | True =>
+                    match rest with
+                    | Nil => reverseN (Cons Nat c acc)
+                    | Cons c2 rest2 =>
+                        let accB : List Nat :=
+                          match prevWS with
+                          | True => acc
+                          | False => Cons Nat chSpace acc
+                          end
+                        in
+                        let accOp : List Nat := Cons Nat c2 (Cons Nat c accB) in
+                        match rest2 with
+                        | Nil => reverseN accOp
+                        | Cons a _ =>
+                            match isWS a with
+                            | True => fixContentGo rest2 SmNormal True accOp
+                            | False => fixContentGo rest2 SmNormal True (Cons Nat chSpace accOp)
+                            end
+                        end
+                    end
+                | False =>
+                    match startsWith2 chEq chGt xs with
+                    | True =>
+                        match rest with
+                        | Nil => reverseN (Cons Nat c acc)
+                        | Cons c2 rest2 =>
+                            let accB : List Nat :=
+                              match prevWS with
+                              | True => acc
+                              | False => Cons Nat chSpace acc
+                              end
+                            in
+                            let accOp : List Nat := Cons Nat c2 (Cons Nat c accB) in
+                            match rest2 with
+                            | Nil => reverseN accOp
+                            | Cons a _ =>
+                                match isWS a with
+                                | True => fixContentGo rest2 SmNormal True accOp
+                                | False => fixContentGo rest2 SmNormal True (Cons Nat chSpace accOp)
+                                end
+                            end
+                        end
+                    | False =>
+                        match isQuote c with
+                        | True => fixContentGo rest (SmInStr c) False (Cons Nat c acc)
+                        | False => fixContentGo rest SmNormal (isWS c) (Cons Nat c acc)
+                        end
+                    end
+                end
+            end
+        | SmInStr q =>
+            match eqNat c chBSlash with
+            | True => fixContentGo rest (SmEsc q) False (Cons Nat c acc)
+            | False =>
+                match eqNat c q with
+                | True => fixContentGo rest SmNormal False (Cons Nat c acc)
+                | False => fixContentGo rest (SmInStr q) False (Cons Nat c acc)
+                end
+            end
+        | SmEsc q =>
+            fixContentGo rest (SmInStr q) False (Cons Nat c acc)
+        end
+    end;
+
+def fixContent (line : List Nat) : List Nat := fixContentGo line SmNormal True (Nil Nat);
+
+-- Per-line fixer (order matters).
+-- @bound(nodes <= 40) @bound(depth <= 12) @bound(allocs <= 20) @bound(stack <= 5) @bound(steps <= 15) @bound(cyclo <= 5) @minimal
+def fixLine (line : List Nat) : List Nat :=
+    fixContent (fixPipeSpace (fixLeadIndent (stripTrailingWS (expandTabs line))));
+
+-- Drop trailing empty lines (keep interior blanks).
+-- @bound(nodes <= 64) @bound(depth <= 16) @bound(allocs <= 23) @bound(stack <= 6) @bound(steps <= 24) @bound(cyclo <= 8)
+def dropTrailEmpty (lines : List (List Nat)) : List (List Nat) :=
+    reverseL (
+      (fix drop_empty_prefix (xs : List (List Nat)) : List (List Nat) :=
+        match xs with
+        | Nil => Nil (List Nat)
+        | Cons line rest =>
+            match line with
+            | Nil => drop_empty_prefix rest
+            | Cons _ _ => Cons (List Nat) line rest
+            end
+        end) (reverseL lines)
+    );
+
+-- @bound(nodes <= 50) @bound(depth <= 14) @bound(allocs <= 20) @bound(stack <= 6) @bound(steps <= 20) @bound(cyclo <= 8)
+def joinWithLF : List (List Nat) -> List Nat :=
+  fix joinWithLF (xs : List (List Nat)) : List Nat :=
+    match xs with
+    | Nil => Nil Nat
+    | Cons line rest =>
+        match rest with
+        | Nil => line
+        | Cons _ _ => appendN line (Cons Nat chLF (joinWithLF rest))
+        end
+    end;
+
+-- LF-only rewrite; one final LF; no excess trailing blanks. Idempotent on clean input.
+-- @bound(nodes <= 109) @bound(depth <= 16) @bound(allocs <= 42) @bound(stack <= 7) @bound(steps <= 37) @bound(cyclo <= 10)
+def format (src : List Nat) : List Nat :=
+    let norm : List Nat := normalizeEOL src in
+    let body : List Nat :=
+      match lastIsLF norm with
+      | True => dropFinalLF norm
+      | False => norm
+      end
+    in
+    let lines0 : List (List Nat) := splitOnLF body in
+    let lines1 : List (List Nat) :=
+      (fix mapFix (xs : List (List Nat)) : List (List Nat) :=
+        match xs with
+        | Nil => Nil (List Nat)
+        | Cons line rest => Cons (List Nat) (fixLine line) (mapFix rest)
+        end) lines0
+    in
+    let lines2 : List (List Nat) := dropTrailEmpty lines1 in
+    let joined : List Nat := joinWithLF lines2 in
+    appendN joined ([chLF]);

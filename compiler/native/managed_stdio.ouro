@@ -1,0 +1,323 @@
+-- Checked host actions bridge ordinary values to the existing raw Ouro IO.
+-- A bounded staging allocation keeps managed interior addresses out of MIR.
+import "managed_strings.ouro";
+
+inductive ManagedStdioOperation : Type :=
+  | ManagedStdoutWrite : ManagedStdioOperation | ManagedStderrWrite : ManagedStdioOperation
+  | ManagedStdoutFlush : ManagedStdioOperation | ManagedProcessExit : ManagedStdioOperation;
+
+inductive ManagedStdioHelper : Type :=
+  | ManagedStdioAllocate : ManagedStdioHelper | ManagedStdioRelease : ManagedStdioHelper
+  | ManagedStdioStdout : ManagedStdioHelper | ManagedStdioStderr : ManagedStdioHelper;
+
+-- These IDs come from verified definitions selected by the raw dependency pass.
+inductive ManagedStdioRuntime : Type :=
+  | ManagedStdioRuntimeOf : Nat -> Nat -> Nat -> ManagedStdioRuntime;
+
+def managed_stdio_buffer_bytes : Nat := mul 16 256;
+def managed_stdio_chunk_bytes : Nat := sub managed_stdio_buffer_bytes 4;
+
+def managed_stdio_operation (primitive : PrimitiveId) : Maybe ManagedStdioOperation :=
+    match primitive_id_equal primitive PrimitiveStdoutWrite with
+    | True => Just ManagedStdioOperation ManagedStdoutWrite
+    | False => match primitive_id_equal primitive PrimitiveStderrWrite with
+      | True => Just ManagedStdioOperation ManagedStderrWrite
+      | False => match primitive_id_equal primitive PrimitiveStdoutFlush with
+        | True => Just ManagedStdioOperation ManagedStdoutFlush
+        | False => match primitive_id_equal primitive PrimitiveProcessExit with
+          | True => Just ManagedStdioOperation ManagedProcessExit
+          | False => Nothing ManagedStdioOperation end end end end;
+
+def managed_stdio_helper_name (helper : ManagedStdioHelper) : List Nat :=
+    match helper with
+    | ManagedStdioAllocate => ([114,97,119,95,112,97,103,101,115,95,97,108,108,111,99,97,116,101] : List Nat)
+    | ManagedStdioRelease => ([114,97,119,95,112,97,103,101,115,95,114,101,108,101,97,115,101] : List Nat)
+    | ManagedStdioStdout => ([114,97,119,95,119,105,110,100,111,119,115,95,115,116,100,111,117,116] : List Nat)
+    | ManagedStdioStderr => ([114,97,119,95,119,105,110,100,111,119,115,95,115,116,100,101,114,114] : List Nat) end;
+
+def managed_stdio_expected (compiler : ManagedCompiler) (helper : ManagedStdioHelper)
+    : Either NativeLowerError CoreTerm :=
+    let bindings : List PrimitiveResolved := primitive_environment (managed_compiler_entries compiler) in
+    lower_from_primitive CoreTerm (CSort 0)
+      (primitive_bind CoreTerm CoreTerm (primitive_type_ref PrimitiveRuntimeType bindings) (fun (runtime : CoreTerm) =>
+        primitive_bind CoreTerm CoreTerm (primitive_type_ref PrimitiveRawPtrType bindings) (fun (pointer : CoreTerm) =>
+          primitive_bind CoreTerm CoreTerm (primitive_type_ref PrimitiveU8Type bindings) (fun (byte : CoreTerm) =>
+            primitive_bind CoreTerm CoreTerm (primitive_type_ref PrimitiveU32Type bindings) (fun (word : CoreTerm) =>
+              primitive_bind CoreTerm CoreTerm (primitive_type_ref PrimitiveUSizeType bindings) (fun (size : CoreTerm) =>
+                primitive_map CoreTerm CoreTerm (fun (boolean : CoreTerm) =>
+                  let buffer : CoreTerm := CApp pointer byte in
+                  match helper with
+                  | ManagedStdioAllocate => primitive_arrow ([size, size] : List CoreTerm) (CApp runtime buffer)
+                  | ManagedStdioRelease => CPi buffer (CApp runtime boolean)
+                  | ManagedStdioStdout => primitive_arrow ([buffer, size, CApp pointer word] : List CoreTerm) (CApp runtime boolean)
+                  | ManagedStdioStderr => primitive_arrow ([buffer, size, CApp pointer word] : List CoreTerm) (CApp runtime boolean) end)
+                  (primitive_role_ref PrimitiveBoolRole (primitive_roles_environment (managed_compiler_entries compiler)))))))));
+
+def managed_stdio_has (compiler : ManagedCompiler) (wanted : PrimitiveId) : Bool :=
+    any Entry (fun (entry : Entry) => match entry with
+      | MkBoundEntry _ _ binding => match binding with
+        | PrimitiveIntrinsicBinding primitive _ _ _ => primitive_id_equal primitive wanted
+        | PrimitiveExternBinding _ => False end
+      | MkEntry _ _ _ => False | MkIndEntry _ _ => False | MkRoleEntry _ => False end)
+      (managed_compiler_entries compiler);
+
+def managed_stdio_helpers (compiler : ManagedCompiler) : List ManagedStdioHelper :=
+    let stdout : Bool := managed_stdio_has compiler PrimitiveStdoutWrite in
+    let stderr : Bool := managed_stdio_has compiler PrimitiveStderrWrite in
+    match orb stdout stderr with | False => ([] : List ManagedStdioHelper) | True =>
+      append ManagedStdioHelper ([ManagedStdioAllocate, ManagedStdioRelease] : List ManagedStdioHelper)
+        (append ManagedStdioHelper (match stdout with | True => ([ManagedStdioStdout] : List ManagedStdioHelper)
+          | False => ([] : List ManagedStdioHelper) end)
+          (match stderr with | True => ([ManagedStdioStderr] : List ManagedStdioHelper)
+            | False => ([] : List ManagedStdioHelper) end)) end;
+
+def managed_stdio_roots (compiler : ManagedCompiler) (fuel : Nat) : Either NativeLowerError (List Nat) :=
+    (fix resolve (helpers : List ManagedStdioHelper) : Either NativeLowerError (List Nat) :=
+      match helpers with | Nil => Right NativeLowerError (List Nat) ([] : List Nat) | Cons helper rest =>
+        lower_bind CoreTerm (List Nat) (managed_stdio_expected compiler helper) (fun (expected : CoreTerm) =>
+          lower_bind Nat (List Nat) (managed_runtime_definition compiler fuel (managed_stdio_helper_name helper) expected)
+            (fun (id : Nat) => lower_map (List Nat) (List Nat) (Cons Nat id) (resolve rest))) end)
+      (managed_stdio_helpers compiler);
+
+def managed_stdio_contract (compiler : ManagedCompiler) (helper : ManagedStdioHelper)
+    : Either NativeLowerError Nat :=
+    lower_bind CoreTerm Nat (managed_stdio_expected compiler helper) (fun (expected : CoreTerm) =>
+      lower_map LowerContract Nat lower_contract_id
+        (managed_runtime_contract compiler primitive_default_fuel (managed_stdio_helper_name helper) expected));
+
+def managed_stdio_runtime (compiler : ManagedCompiler) (stderr : Bool) : Either NativeLowerError ManagedStdioRuntime :=
+    lower_bind Nat ManagedStdioRuntime (managed_stdio_contract compiler ManagedStdioAllocate) (fun (allocate : Nat) =>
+      lower_bind Nat ManagedStdioRuntime (managed_stdio_contract compiler ManagedStdioRelease) (fun (release : Nat) =>
+        lower_map Nat ManagedStdioRuntime (ManagedStdioRuntimeOf allocate release)
+          (managed_stdio_contract compiler (match stderr with | False => ManagedStdioStdout | True => ManagedStdioStderr end))));
+
+-- Standard IO failures use the already declared, exact Windows ExitProcess.
+-- A same-named function or different foreign symbol cannot replace this ABI.
+def managed_stdio_exit_symbol (compiler : ManagedCompiler) : Either NativeLowerError Nat :=
+    match compiler with | ManagedCompilerOf _ _ _ _ _ _ id _ _ _ =>
+      let bindings : List PrimitiveResolved := primitive_environment (managed_compiler_entries compiler) in
+      lower_bind CoreTerm Nat (lower_from_primitive CoreTerm (CSort 0)
+        (primitive_runtime_argument_expected bindings (primitive_roles_environment (managed_compiler_entries compiler))
+          (primitive_type_ref PrimitiveU32Type bindings))) (fun (expected : CoreTerm) =>
+        match lower_find_contract id (managed_compiler_raw compiler) with
+        | Nothing => Left NativeLowerError Nat (LowerInvalidCall id)
+        | Just contract => match contract with | LowerContractOf _ annotation _ _ binding =>
+          lower_bind Unit Nat (lower_core_equal primitive_default_fuel id annotation expected) (fun (_ : Unit) =>
+            match binding with | Nothing => Left NativeLowerError Nat (LowerBodyMismatch id)
+            | Just metadata => match metadata with
+              | PrimitiveIntrinsicBinding _ _ _ _ => Left NativeLowerError Nat (LowerMetadataMismatch id)
+              | PrimitiveExternBinding external => match external with | CheckedExternOf _ _ library symbol _ gc =>
+                lower_map Unit Nat (fun (_ : Unit) => id) (lower_require
+                  (andb (primitive_bytes_equal library lower_kernel_library)
+                    (andb (primitive_bytes_equal symbol lower_exit_symbol)
+                      (match gc with | PrimitiveNoGc => True | PrimitiveMayGc => False end)))
+                  (LowerMetadataMismatch id)) end end end) end end) end;
+
+def managed_stdio_require (exit : Nat) (condition : MirValue) (state : ManagedState)
+    : Either NativeLowerError ManagedState :=
+    lower_map LowerLoopBlocks ManagedState (fun (labels : LowerLoopBlocks) => match labels with
+      | LowerLoopAt valid invalid _ flow => managed_with_flow state
+          (lower_switch_block valid MirTrap
+            (lower_emit (MirCall MirMayGc (Nothing Nat) (MirDirect exit) ([managed_bits MirU32 73] : List MirValue))
+              (lower_switch_block invalid (MirBranch condition valid invalid) flow))) end)
+      (lower_loop_blocks (managed_flow state));
+
+def managed_stdio_chunk (remaining : MirValue) (state : ManagedState) : Either NativeLowerError ManagedResult :=
+    lower_bind ManagedResult ManagedResult (managed_compare MirLess remaining (managed_bits MirUSize managed_stdio_chunk_bytes) state)
+      (fun (tested : ManagedResult) => match tested with | ManagedResultOf smaller after =>
+        managed_string_choose MirUSize smaller
+          (fun (selected : ManagedState) => Right NativeLowerError ManagedResult (ManagedResultOf remaining selected))
+          (fun (selected : ManagedState) => Right NativeLowerError ManagedResult (ManagedResultOf (managed_bits MirUSize managed_stdio_chunk_bytes) selected)) after end);
+
+def managed_stdio_copy_chunk (writer : Nat) (value : MirValue) (buffer : MirValue) (written : MirValue)
+    (offset : MirValue) (bytes : MirValue) (state : ManagedState) : Either NativeLowerError ManagedFields :=
+    lower_bind ManagedResult ManagedFields (managed_binary MirUSize MirSub bytes offset state)
+      (fun (remaining : ManagedResult) => match remaining with | ManagedResultOf available next =>
+        lower_bind ManagedResult ManagedFields (managed_stdio_chunk available next)
+          (fun (chunk : ManagedResult) => match chunk with | ManagedResultOf count after_chunk =>
+            lower_bind ManagedResult ManagedFields (managed_binary MirUSize MirAdd offset (managed_bits MirUSize 40) after_chunk)
+              (fun (source : ManagedResult) => match source with | ManagedResultOf source_offset after_offset =>
+                lower_bind ManagedState ManagedFields
+                  (managed_bytes_copy value source_offset buffer (managed_bits MirUSize 0) count after_offset)
+                  (fun (copied : ManagedState) => lower_map ManagedResult ManagedFields
+                    (fun (result : ManagedResult) => match result with | ManagedResultOf success after =>
+                      ManagedFieldsOf ([success, count] : List MirValue) after end)
+                    (managed_fresh MirU8 (fun (local : Nat) => MirCall MirMayGc (Just Nat local)
+                      (MirDirect writer) ([buffer, count, written] : List MirValue)) copied)) end) end) end);
+
+-- A failed writer may have emitted a prefix. Stop immediately; only complete
+-- chunks advance the source offset. The raw helper retries partial OS writes.
+def managed_stdio_write_loop (writer : Nat) (value : MirValue) (buffer : MirValue) (written : MirValue)
+    (bytes : MirValue) (state : ManagedState) : Either NativeLowerError ManagedResult :=
+    lower_bind (Pair Nat ManagedState) ManagedResult (managed_fresh_local MirUSize state)
+      (fun (position : Pair Nat ManagedState) => match position with | MkPair offset next =>
+        lower_bind (Pair Nat ManagedState) ManagedResult (managed_fresh_local MirU8 next)
+          (fun (flag : Pair Nat ManagedState) => match flag with | MkPair success ready =>
+            let initial : ManagedState := managed_emit_all
+              ([MirMove offset (managed_bits MirUSize 0), MirMove success (managed_bits MirU8 1)] : List MirInstruction) ready in
+            lower_bind LowerLoopBlocks ManagedResult (lower_loop_blocks (managed_flow initial))
+              (fun (labels : LowerLoopBlocks) => match labels with | LowerLoopAt header body finish flow =>
+                lower_bind ManagedResult ManagedResult (managed_compare MirLess (MirUse offset) bytes
+                  (managed_with_flow initial (lower_switch_block header (MirJump header) flow)))
+                  (fun (bounds : ManagedResult) => match bounds with | ManagedResultOf remaining after_bounds =>
+                    lower_bind ManagedResult ManagedResult (managed_binary MirU8 MirAnd remaining (MirUse success) after_bounds)
+                      (fun (condition : ManagedResult) => match condition with | ManagedResultOf running after_condition =>
+                        lower_bind ManagedFields ManagedResult
+                          (managed_stdio_copy_chunk writer value buffer written (MirUse offset) bytes
+                            (managed_switch_block body (MirBranch running body finish) after_condition))
+                          (fun (chunk : ManagedFields) => match chunk with | ManagedFieldsOf fields after_chunk =>
+                            lower_bind (Pair MirValue MirValue) ManagedResult (lower_pair MirValue fields)
+                              (fun (pair : Pair MirValue MirValue) => match pair with | MkPair okay count =>
+                                lower_map ManagedState ManagedResult (fun (after : ManagedState) =>
+                                  ManagedResultOf (MirUse success) (managed_switch_block finish (MirJump header)
+                                    (managed_emit (MirMove success okay) after)))
+                                  (managed_nat_when okay (fun (entered : ManagedState) => Right NativeLowerError ManagedState
+                                    (managed_emit (MirBinaryOp offset MirAdd (MirUse offset) count) entered)) after_chunk) end) end) end) end) end) end) end);
+
+-- Status: 0 complete, 1 write failed, 2 release failed, 3 both failed,
+-- 4 allocation failed. The action converts every nonzero status to exit 73.
+def managed_stdio_release_status (release : Nat) (buffer : MirValue) (write_ok : MirValue) (state : ManagedState)
+    : Either NativeLowerError ManagedResult :=
+    lower_bind ManagedResult ManagedResult
+      (managed_fresh MirU8 (fun (local : Nat) => MirCall MirMayGc (Just Nat local) (MirDirect release) ([buffer] : List MirValue)) state)
+      (fun (freed : ManagedResult) => match freed with | ManagedResultOf release_ok after_release =>
+        lower_bind ManagedResult ManagedResult (managed_binary MirU8 MirSub (managed_bits MirU8 1) write_ok after_release)
+          (fun (write : ManagedResult) => match write with | ManagedResultOf write_failed after_write =>
+            lower_bind ManagedResult ManagedResult (managed_binary MirU8 MirSub (managed_bits MirU8 1) release_ok after_write)
+              (fun (cleanup : ManagedResult) => match cleanup with | ManagedResultOf release_failed after_cleanup =>
+                lower_bind ManagedResult ManagedResult (managed_binary MirU8 MirShl release_failed (managed_bits MirU32 1) after_cleanup)
+                  (fun (flag : ManagedResult) => match flag with | ManagedResultOf shifted after =>
+                    managed_binary MirU8 MirOr write_failed shifted after end) end) end) end);
+
+def managed_stdio_write_allocated (runtime : ManagedStdioRuntime) (value : MirValue) (bytes : MirValue)
+    (buffer : MirValue) (state : ManagedState) : Either NativeLowerError ManagedResult :=
+    match runtime with | ManagedStdioRuntimeOf _ release writer =>
+      lower_bind ManagedResult ManagedResult
+        (managed_fresh MirRawPtr (fun (local : Nat) => MirPointerAdd local buffer (managed_bits MirUSize managed_stdio_chunk_bytes)) state)
+        (fun (scratch : ManagedResult) => match scratch with | ManagedResultOf written next =>
+          lower_bind ManagedResult ManagedResult (managed_stdio_write_loop writer value buffer written bytes next)
+            (fun (result : ManagedResult) => match result with | ManagedResultOf complete after =>
+              managed_stdio_release_status release buffer complete after end) end) end;
+
+def managed_stdio_write_nonempty (runtime : ManagedStdioRuntime) (value : MirValue) (bytes : MirValue)
+    (state : ManagedState) : Either NativeLowerError ManagedResult :=
+    match runtime with | ManagedStdioRuntimeOf allocate _ _ =>
+      lower_bind ManagedResult ManagedResult
+        (managed_fresh MirRawPtr (fun (local : Nat) => MirCall MirMayGc (Just Nat local) (MirDirect allocate)
+          ([managed_bits MirUSize managed_stdio_buffer_bytes, managed_bits MirUSize 8] : List MirValue)) state)
+        (fun (allocated : ManagedResult) => match allocated with | ManagedResultOf buffer next =>
+          lower_bind ManagedResult ManagedResult (managed_compare MirNotEqual buffer (managed_bits MirRawPtr 0) next)
+            (fun (checked : ManagedResult) => match checked with | ManagedResultOf okay after =>
+              managed_string_choose MirU8 okay (managed_stdio_write_allocated runtime value bytes buffer)
+                (fun (failed : ManagedState) => Right NativeLowerError ManagedResult (ManagedResultOf (managed_bits MirU8 4) failed)) after end) end) end;
+
+def managed_stdio_write_status (compiler : ManagedCompiler) (runtime : ManagedStdioRuntime)
+    (value : MirValue) (state : ManagedState) : Either NativeLowerError ManagedResult :=
+    lower_bind ManagedResult ManagedResult (managed_string_size compiler value state)
+      (fun (size : ManagedResult) => match size with | ManagedResultOf bytes next =>
+        lower_bind ManagedResult ManagedResult (managed_compare MirNotEqual bytes (managed_bits MirUSize 0) next)
+          (fun (checked : ManagedResult) => match checked with | ManagedResultOf nonempty after =>
+            managed_string_choose MirU8 nonempty (managed_stdio_write_nonempty runtime value bytes)
+              (fun (empty : ManagedState) => Right NativeLowerError ManagedResult (ManagedResultOf (managed_bits MirU8 0) empty)) after end) end);
+
+def managed_stdio_write_body (compiler : ManagedCompiler) (runtime : ManagedStdioRuntime) (exit : Nat)
+    (captures : List MirValue) (state : ManagedState) : Either NativeLowerError ManagedResult :=
+    lower_bind MirValue ManagedResult (lower_single MirValue captures) (fun (value : MirValue) =>
+      lower_bind ManagedResult ManagedResult
+        (managed_nat_helper ([111,117,114,111,95,115,116,100,105,111,95,119,114,105,116,101] : List Nat)
+          ([MirLocalDef 0 MirManagedPtr] : List MirLocal) ([value] : List MirValue) MirU8
+          (managed_stdio_write_status compiler runtime (MirUse 0)) state)
+        (fun (written : ManagedResult) => match written with | ManagedResultOf status next =>
+          lower_bind ManagedResult ManagedResult (managed_compare MirEqual status (managed_bits MirU8 0) next)
+            (fun (checked : ManagedResult) => match checked with | ManagedResultOf success after =>
+              lower_bind ManagedState ManagedResult (managed_stdio_require exit success after)
+                (managed_unit_value compiler) end) end));
+
+def managed_stdio_write_action (compiler : ManagedCompiler) (stderr : Bool) (value : MirValue) (state : ManagedState)
+    : Either NativeLowerError ManagedResult :=
+    lower_bind ManagedStdioRuntime ManagedResult (managed_stdio_runtime compiler stderr) (fun (runtime : ManagedStdioRuntime) =>
+      lower_bind Nat ManagedResult (managed_stdio_exit_symbol compiler) (fun (exit : Nat) =>
+        managed_action compiler ([value] : List MirValue) (managed_stdio_write_body compiler runtime exit) state));
+
+-- Flush is still an action. Synchronous native writes retain no pending bytes.
+def managed_stdio_flush (compiler : ManagedCompiler) (state : ManagedState) : Either NativeLowerError ManagedResult :=
+    managed_action compiler ([] : List MirValue)
+      (fun (_ : List MirValue) (entered : ManagedState) => managed_unit_value compiler entered) state;
+
+def managed_stdio_exit_body (compiler : ManagedCompiler) (exit : Nat) (value : MirValue) (state : ManagedState)
+    : Either NativeLowerError ManagedState :=
+    lower_bind ManagedNatWordResult ManagedState (managed_nat_checked_word compiler PrimitiveWordU32 value state)
+      (fun (converted : ManagedNatWordResult) => match converted with | ManagedNatWordOf fits code next =>
+        lower_map ManagedState ManagedState
+          (managed_emit (MirCall MirMayGc (Nothing Nat) (MirDirect exit) ([code] : List MirValue)))
+          (managed_stdio_require exit fits next) end);
+
+-- This callable never returns: both conversion failure and successful exit
+-- end with ExitProcess and a trap if the OS violates that declared contract.
+def managed_stdio_exit_action (compiler : ManagedCompiler) (value : MirValue) (state : ManagedState)
+    : Either NativeLowerError ManagedResult :=
+    let caller : LowerState := managed_flow state in
+    lower_bind Nat ManagedResult (managed_stdio_exit_symbol compiler) (fun (exit : Nat) =>
+      lower_bind (Pair Nat ManagedState) ManagedResult (managed_fresh_symbol state)
+        (fun (fresh : Pair Nat ManagedState) => match fresh with | MkPair symbol reserved =>
+          lower_bind (Pair ManagedScope ManagedState) ManagedResult
+            (managed_capture_scope ([Just MirValue value] : List (Maybe MirValue)) 0 (managed_with_flow reserved (lower_empty_state 2)))
+            (fun (captured : Pair ManagedScope ManagedState) => match captured with | MkPair environment entered =>
+              lower_bind MirValue ManagedResult (lower_single MirValue (managed_values environment)) (fun (saved : MirValue) =>
+                lower_bind ManagedState ManagedResult (managed_stdio_exit_body compiler exit saved entered)
+                  (fun (after : ManagedState) => match managed_flow after with | LowerStateOf _ locals _ _ =>
+                    let function : MirFunction := MirFunctionDef symbol
+                      ([111,117,114,111,95,115,116,100,105,111,95,101,120,105,116] : List Nat)
+                      ([MirLocalDef 0 MirManagedPtr, MirLocalDef 1 MirManagedPtr] : List MirLocal)
+                      (reverse MirLocal locals) (Just MirType MirManagedPtr) 0 (lower_finish_blocks MirTrap (managed_flow after)) in
+                    managed_emit_callable compiler 5 symbol False ([value] : List MirValue)
+                      (managed_with_flow (managed_add_function function after) caller) end)) end) end));
+
+def managed_stdio_unary (compiler : ManagedCompiler) (operation : ManagedStdioOperation)
+    (value : MirValue) (state : ManagedState) : Either NativeLowerError ManagedResult :=
+    match operation with
+    | ManagedStdoutWrite => managed_stdio_write_action compiler False value state
+    | ManagedStderrWrite => managed_stdio_write_action compiler True value state
+    | ManagedProcessExit => managed_stdio_exit_action compiler value state
+    | ManagedStdoutFlush => Left NativeLowerError ManagedResult (LowerInvalidCall 0) end;
+
+-- First-class writes/exit are ordinary unary closures. Applying them captures
+-- the argument into an action; constructing either callable performs no IO.
+def managed_stdio_partial (compiler : ManagedCompiler) (operation : ManagedStdioOperation) (state : ManagedState)
+    : Either NativeLowerError ManagedResult :=
+    let caller : LowerState := managed_flow state in
+    lower_bind (Pair Nat ManagedState) ManagedResult (managed_fresh_symbol state)
+      (fun (fresh : Pair Nat ManagedState) => match fresh with | MkPair symbol reserved =>
+        lower_bind ManagedResult ManagedResult
+          (managed_stdio_unary compiler operation (MirUse 1) (managed_with_flow reserved (lower_empty_state 2)))
+          (fun (compiled : ManagedResult) => match compiled with | ManagedResultOf action after =>
+            let function : MirFunction := managed_finish_function symbol
+              ([111,117,114,111,95,115,116,100,105,111,95,112,97,114,116,105,97,108] : List Nat)
+              ([MirLocalDef 0 MirManagedPtr, MirLocalDef 1 MirManagedPtr] : List MirLocal) action after in
+            managed_emit_callable compiler 3 symbol False ([] : List MirValue)
+              (managed_with_flow (managed_add_function function after) caller) end) end);
+
+def managed_stdio_value (compiler : ManagedCompiler) (operation : ManagedStdioOperation) (state : ManagedState)
+    : Either NativeLowerError ManagedResult :=
+    match operation with
+    | ManagedStdoutFlush => managed_stdio_flush compiler state
+    | ManagedStdoutWrite => managed_stdio_partial compiler operation state
+    | ManagedStderrWrite => managed_stdio_partial compiler operation state
+    | ManagedProcessExit => managed_stdio_partial compiler operation state end;
+
+def managed_stdio_primitive (compiler : ManagedCompiler) (step : ManagedStep) (scope : ManagedScope)
+    (operation : ManagedStdioOperation) (arguments : List CoreTerm) (state : ManagedState)
+    : Either NativeLowerError ManagedResult :=
+    match operation with
+    | ManagedStdoutFlush => lower_bind Unit ManagedResult
+        (lower_require (eqNat (length CoreTerm arguments) 0) (LowerInvalidCall 0))
+        (fun (_ : Unit) => managed_stdio_flush compiler state)
+    | ManagedStdoutWrite => lower_bind CoreTerm ManagedResult (lower_single CoreTerm arguments) (fun (term : CoreTerm) =>
+        lower_bind ManagedResult ManagedResult (step scope term state) (fun (value : ManagedResult) => match value with
+          | ManagedResultOf argument next => managed_stdio_unary compiler operation argument next end))
+    | ManagedStderrWrite => lower_bind CoreTerm ManagedResult (lower_single CoreTerm arguments) (fun (term : CoreTerm) =>
+        lower_bind ManagedResult ManagedResult (step scope term state) (fun (value : ManagedResult) => match value with
+          | ManagedResultOf argument next => managed_stdio_unary compiler operation argument next end))
+    | ManagedProcessExit => lower_bind CoreTerm ManagedResult (lower_single CoreTerm arguments) (fun (term : CoreTerm) =>
+        lower_bind ManagedResult ManagedResult (step scope term state) (fun (value : ManagedResult) => match value with
+          | ManagedResultOf argument next => managed_stdio_unary compiler operation argument next end)) end;

@@ -1,0 +1,144 @@
+-- Runtime construction captures values once. An action's code runs only when
+-- the Runtime entry or a bind invokes its distinct callable descriptor.
+import "managed_case.ouro";
+
+def ManagedActionBody : Type := List MirValue -> ManagedState -> Either NativeLowerError ManagedResult;
+
+def managed_action (compiler : ManagedCompiler) (captures : List MirValue)
+    (body : ManagedActionBody) (state : ManagedState) : Either NativeLowerError ManagedResult :=
+    let caller : LowerState := managed_flow state in
+    lower_bind (Pair Nat ManagedState) ManagedResult (managed_fresh_symbol state)
+      (fun (fresh : Pair Nat ManagedState) => match fresh with | MkPair symbol reserved =>
+        lower_bind (Pair ManagedScope ManagedState) ManagedResult
+          (managed_capture_scope (map MirValue (Maybe MirValue) (Just MirValue) captures) 0
+            (managed_with_flow reserved (lower_empty_state 2)))
+          (fun (captured : Pair ManagedScope ManagedState) => match captured with | MkPair environment entered =>
+            lower_bind ManagedResult ManagedResult (body (managed_values environment) entered)
+              (fun (compiled : ManagedResult) => match compiled with | ManagedResultOf value after =>
+                let function : MirFunction := managed_finish_function symbol
+                  ([111,117,114,111,95,109,97,110,97,103,101,100,95,97,99,116,105,111,110] : List Nat)
+                  ([MirLocalDef 0 MirManagedPtr, MirLocalDef 1 MirManagedPtr] : List MirLocal) value after in
+                managed_emit_callable compiler 5 symbol False captures
+                  (managed_with_flow (managed_add_function function after) caller) end) end) end);
+
+def managed_action_pure (compiler : ManagedCompiler) (value : MirValue) (state : ManagedState)
+    : Either NativeLowerError ManagedResult :=
+    managed_action compiler ([value] : List MirValue) (fun (captures : List MirValue) (entered : ManagedState) =>
+      lower_map MirValue ManagedResult (fun (saved : MirValue) => ManagedResultOf saved entered)
+        (lower_single MirValue captures)) state;
+
+def managed_runtime_pure (compiler : ManagedCompiler) (step : ManagedStep) (scope : ManagedScope)
+    (arguments : List CoreTerm) (state : ManagedState) : Either NativeLowerError ManagedResult :=
+    lower_bind (Pair CoreTerm CoreTerm) ManagedResult (lower_pair CoreTerm arguments)
+      (fun (pair : Pair CoreTerm CoreTerm) => match pair with | MkPair _ term =>
+        lower_bind ManagedResult ManagedResult (step scope term state)
+          (fun (value : ManagedResult) => match value with | ManagedResultOf captured after =>
+            managed_action_pure compiler captured after end) end);
+
+def managed_bind_body (compiler : ManagedCompiler) (captures : List MirValue) (state : ManagedState)
+    : Either NativeLowerError ManagedResult :=
+    lower_bind (Pair MirValue MirValue) ManagedResult (lower_pair MirValue captures)
+      (fun (pair : Pair MirValue MirValue) => match pair with | MkPair action continuation =>
+        lower_bind ManagedResult ManagedResult (managed_invoke compiler 5 action (MirUse 1) state)
+          (fun (ran : ManagedResult) => match ran with | ManagedResultOf value next =>
+            lower_bind ManagedResult ManagedResult (managed_call compiler continuation value next)
+              (fun (continued : ManagedResult) => match continued with | ManagedResultOf following after =>
+                managed_invoke compiler 5 following (MirUse 1) after end) end) end);
+
+def managed_runtime_bind (compiler : ManagedCompiler) (step : ManagedStep) (scope : ManagedScope)
+    (arguments : List CoreTerm) (state : ManagedState) : Either NativeLowerError ManagedResult :=
+    lower_four ManagedResult arguments (fun (_ : CoreTerm) (_ : CoreTerm) (action : CoreTerm) (continuation : CoreTerm) =>
+      lower_bind ManagedResult ManagedResult (step scope action state)
+        (fun (first : ManagedResult) => match first with | ManagedResultOf saved next =>
+          lower_bind ManagedResult ManagedResult (step scope continuation next)
+            (fun (second : ManagedResult) => match second with | ManagedResultOf following after =>
+              managed_action compiler ([saved, following] : List MirValue) (managed_bind_body compiler) after end) end));
+
+-- Loop callbacks produce deferred actions. Invoke each returned action once
+-- with the current entry token; construction alone performs no iteration.
+def managed_loop_callback (compiler : ManagedCompiler) (callback : MirValue) (value : MirValue)
+    (state : ManagedState) : Either NativeLowerError ManagedResult :=
+    lower_bind ManagedResult ManagedResult (managed_call compiler callback value state)
+      (fun (called : ManagedResult) => match called with | ManagedResultOf action next =>
+        managed_invoke compiler 5 action (MirUse 1) next end);
+
+def managed_loop_values (compiler : ManagedCompiler) (initial : MirValue) (condition : MirValue)
+    (advance : MirValue) (state : ManagedState) : Either NativeLowerError ManagedResult :=
+    lower_bind (Pair Nat ManagedState) ManagedResult (managed_fresh_local MirManagedPtr state)
+      (fun (cell : Pair Nat ManagedState) => match cell with | MkPair cursor next =>
+        let initialized : ManagedState := managed_emit (MirMove cursor initial) next in
+        lower_bind LowerLoopBlocks ManagedResult (lower_loop_blocks (managed_flow initialized))
+          (fun (labels : LowerLoopBlocks) => match labels with | LowerLoopAt header body finish flow =>
+            lower_bind ManagedResult ManagedResult
+              (managed_loop_callback compiler condition (MirUse cursor)
+                (managed_with_flow initialized (lower_switch_block header (MirJump header) flow)))
+              (fun (tested : ManagedResult) => match tested with | ManagedResultOf boxed after_test =>
+                lower_bind ManagedResult ManagedResult (managed_unbox_word compiler PrimitiveWordU8 boxed after_test)
+                  (fun (unboxed : ManagedResult) => match unboxed with | ManagedResultOf running after_condition =>
+                    lower_map ManagedResult ManagedResult (fun (advanced : ManagedResult) => match advanced with
+                      | ManagedResultOf value after_step => ManagedResultOf (MirUse cursor)
+                          (managed_switch_block finish (MirJump header) (managed_emit (MirMove cursor value) after_step)) end)
+                      (managed_loop_callback compiler advance (MirUse cursor)
+                        (managed_switch_block body (MirBranch running body finish) after_condition)) end) end) end) end);
+
+def managed_loop_body (compiler : ManagedCompiler) (captures : List MirValue) (state : ManagedState)
+    : Either NativeLowerError ManagedResult :=
+    match captures with
+    | Nil => Left NativeLowerError ManagedResult (LowerInvalidCall 0)
+    | Cons initial callbacks => lower_bind (Pair MirValue MirValue) ManagedResult (lower_pair MirValue callbacks)
+        (fun (pair : Pair MirValue MirValue) => match pair with | MkPair condition advance =>
+          managed_loop_values compiler initial condition advance state end) end;
+
+-- The initialized state is a root before the first condition, and the CFG
+-- backedge replaces it only after the step action returns its next state.
+def managed_runtime_loop (compiler : ManagedCompiler) (step : ManagedStep) (scope : ManagedScope)
+    (arguments : List CoreTerm) (state : ManagedState) : Either NativeLowerError ManagedResult :=
+    lower_four ManagedResult arguments (fun (_ : CoreTerm) (initial : CoreTerm) (condition : CoreTerm) (advance : CoreTerm) =>
+      lower_bind ManagedResult ManagedResult (step scope initial state)
+        (fun (first : ManagedResult) => match first with | ManagedResultOf value next =>
+          lower_bind ManagedResult ManagedResult (step scope condition next)
+            (fun (second : ManagedResult) => match second with | ManagedResultOf predicate after =>
+              lower_bind ManagedResult ManagedResult (step scope advance after)
+                (fun (third : ManagedResult) => match third with | ManagedResultOf following finished =>
+                  managed_action compiler ([value, predicate, following] : List MirValue)
+                    (managed_loop_body compiler) finished end) end) end));
+
+-- Raw pointer bits remain an untraced payload. Boxing owns only the wrapper;
+-- it neither validates nor transfers ownership of the referenced raw storage.
+def managed_box_pointer (compiler : ManagedCompiler) (value : MirValue) (state : ManagedState)
+    : Either NativeLowerError ManagedResult :=
+    lower_map ManagedResult ManagedResult (fun (allocated : ManagedResult) => match allocated with
+      | ManagedResultOf base next => ManagedResultOf base (managed_emit (MirStore base (codegen_disp 32) value) next) end)
+      (managed_allocate_value compiler 14 40 state);
+
+def managed_unbox_pointer (compiler : ManagedCompiler) (value : MirValue) (state : ManagedState)
+    : Either NativeLowerError ManagedResult :=
+    lower_bind ManagedState ManagedResult (managed_expect_descriptor compiler 14 value state)
+      (fun (next : ManagedState) => managed_load MirRawPtr value 32 next);
+
+def managed_raw_null (compiler : ManagedCompiler) (arguments : List CoreTerm) (state : ManagedState)
+    : Either NativeLowerError ManagedResult :=
+    lower_bind CoreTerm ManagedResult (lower_single CoreTerm arguments) (fun (_ : CoreTerm) =>
+      managed_box_pointer compiler (managed_bits MirRawPtr 0) state);
+
+def managed_raw_bits_body (compiler : ManagedCompiler) (from_bits : Bool) (captures : List MirValue)
+    (state : ManagedState) : Either NativeLowerError ManagedResult :=
+    lower_bind MirValue ManagedResult (lower_single MirValue captures) (fun (boxed : MirValue) =>
+      lower_bind ManagedResult ManagedResult (match from_bits with
+        | True => managed_unbox_word compiler PrimitiveWordUSize boxed state
+        | False => managed_unbox_pointer compiler boxed state end)
+        (fun (unboxed : ManagedResult) => match unboxed with | ManagedResultOf value next =>
+          lower_bind ManagedResult ManagedResult (managed_convert
+            (match from_bits with | True => MirRawPtr | False => MirUSize end)
+            (match from_bits with | True => MirRawFromBits | False => MirRawToBits end) value next)
+            (fun (converted : ManagedResult) => match converted with | ManagedResultOf pointer after =>
+              match from_bits with | True => managed_box_pointer compiler pointer after
+              | False => managed_box_word compiler PrimitiveWordUSize pointer after end end) end));
+
+def managed_raw_bits (compiler : ManagedCompiler) (step : ManagedStep) (scope : ManagedScope)
+    (from_bits : Bool) (arguments : List CoreTerm) (state : ManagedState) : Either NativeLowerError ManagedResult :=
+    lower_bind (Pair CoreTerm CoreTerm) ManagedResult (lower_pair CoreTerm arguments)
+      (fun (pair : Pair CoreTerm CoreTerm) => match pair with | MkPair _ term =>
+        lower_bind ManagedResult ManagedResult (step scope term state)
+          (fun (argument : ManagedResult) => match argument with | ManagedResultOf value after =>
+            managed_action compiler ([value] : List MirValue) (managed_raw_bits_body compiler from_bits) after end) end);

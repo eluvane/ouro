@@ -1,0 +1,565 @@
+-- Rewrite smells: shapes the real AST shows directly that a shorter
+-- expression replaces without changing what the definition computes. Every
+-- rule names the replacement in its finding, so a reader can apply it by hand.
+
+-- @entry analyze_simplify
+
+import "../../std/data.ouro";
+import "../../std/listx.ouro";
+import "../../std/natx.ouro";
+import "ast.ouro";
+import "duplication.ouro";
+
+-- Interned ids of True, False, notb, andb, orb; Z when the unit never
+-- mentions the name, which matches no node.
+inductive SimpIds : Type :=
+  | MkSimpIds : Nat -> Nat -> Nat -> Nat -> Nat -> SimpIds;
+
+def simp_true (i : SimpIds) : Nat :=
+    match i with | MkSimpIds t _ _ _ _ => t end;
+
+def simp_false (i : SimpIds) : Nat :=
+    match i with | MkSimpIds _ f _ _ _ => f end;
+
+def simp_notb (i : SimpIds) : Nat :=
+    match i with | MkSimpIds _ _ n _ _ => n end;
+
+def simp_andb (i : SimpIds) : Nat :=
+    match i with | MkSimpIds _ _ _ a _ => a end;
+
+def simp_orb (i : SimpIds) : Nat :=
+    match i with | MkSimpIds _ _ _ _ o => o end;
+
+-- Bool match returning its scrutinee (Z); Bool match negating its scrutinee
+-- (Z); arms that all share one body (arm count); lambda that only forwards
+-- its argument (binder); notb applied to notb (Z); andb/orb with a True or
+-- False operand (operator, literal); arms that each rebuild their own
+-- constructor over their binders (arm count).
+inductive SimpIssue : Type :=
+  | IBoolIdentity : Nat -> SimpIssue
+  | IBoolNegation : Nat -> SimpIssue
+  | IIdenticalArms : Nat -> SimpIssue
+  | IEtaLambda : Nat -> SimpIssue
+  | IDoubleNot : Nat -> SimpIssue
+  | IConstBoolOperand : Nat -> Nat -> SimpIssue
+  | IRewrapIdentity : Nat -> SimpIssue;
+
+def simp_inil : List SimpIssue := [];
+
+def simp_one (i : SimpIssue) : List SimpIssue := Cons SimpIssue i simp_inil;
+
+def simp_append (xs : List SimpIssue) (ys : List SimpIssue) : List SimpIssue :=
+    append SimpIssue xs ys;
+
+def simp_two : Nat := 2;
+
+-- Id of a bare variable, through ascriptions; Z for anything else.
+def simp_body_is (target : Nat) (arms : List AstArm) (ctor : Nat) : Bool :=
+    match find AstArm (fun (m : AstArm) => eq_nat (ast_arm_ctor m) ctor) arms with
+    | Nothing => False
+    | Just m => eq_nat (ast_var_or_zero (ast_arm_body m)) target
+    end;
+
+-- Exactly the two Bool arms; identity when each returns its own
+-- constructor, negation when each returns the other. The definition of notb
+-- itself is the negation and is exempt.
+def simp_bool_issues (ids : SimpIds) (self : Nat) (arms : List AstArm) : List SimpIssue :=
+    let t : Nat := simp_true ids in
+    let f : Nat := simp_false ids in
+    match orb (eq_nat t Z) (eq_nat f Z) with
+    | True => simp_inil
+    | False =>
+        match eq_nat (length AstArm arms) simp_two with
+        | False => simp_inil
+        | True =>
+            match andb (simp_body_is t arms t) (simp_body_is f arms f) with
+            | True => simp_one (IBoolIdentity Z)
+            | False =>
+                match andb (simp_body_is f arms t) (simp_body_is t arms f) with
+                | False => simp_inil
+                | True =>
+                    match eq_nat self (simp_notb ids) with
+                    | True => simp_inil
+                    | False => simp_one (IBoolNegation Z)
+                    end
+                end
+            end
+        end
+    end;
+
+-- A body that mentions one of its own pattern binders is not interchangeable
+-- with another arm's body even when the trees agree, because the same
+-- interned id is a different variable there.
+def simp_mentions_binders (m : AstArm) : Bool :=
+    any Nat (fun (id : Nat) =>
+      match id with
+      | Z => False
+      | S _ => ast_occurs id (ast_arm_body m)
+      end) (ast_arm_binders m);
+
+-- Stops at the first arm that differs: `all` and `andb` evaluate every
+-- operand, and comparing two large bodies walks both.
+def simp_rest_like (first : Ast) : List AstArm -> Bool :=
+  fix go (arms : List AstArm) : Bool :=
+    match arms with
+    | Nil => True
+    | Cons m rest =>
+        match alpha_eq first (ast_arm_body m) with
+        | False => False
+        | True =>
+            match simp_mentions_binders m with
+            | True => False
+            | False => go rest
+            end
+        end
+    end;
+
+def simp_identical_issues (arms : List AstArm) : List SimpIssue :=
+    match arms with
+    | Nil => simp_inil
+    | Cons first rest =>
+        match rest with
+        | Nil => simp_inil
+        | Cons _ _ =>
+            match simp_rest_like (ast_arm_body first) rest with
+            | False => simp_inil
+            | True =>
+                match simp_mentions_binders first with
+                | True => simp_inil
+                | False => simp_one (IIdenticalArms (length AstArm arms))
+                end
+            end
+        end
+    end;
+
+-- The trailing arguments are exactly the binders, in order, as bare
+-- variables.
+def simp_tail_is_binders : List Ast -> List Nat -> Bool :=
+  fix simp_tail_is_binders (args : List Ast) (ids : List Nat) : Bool :=
+    match args with
+    | Nil => match ids with | Nil => True | Cons _ _ => False end
+    | Cons a more =>
+        match ids with
+        | Nil => False
+        | Cons id ids2 =>
+            match id with
+            | Z => False
+            | S _ => andb (eq_nat (ast_var_or_zero a) id) (simp_tail_is_binders more ids2)
+            end
+        end
+    end;
+
+def simp_mentions_any (ids : List Nat) (a : Ast) : Bool :=
+    any Nat (fun (id : Nat) => ast_occurs id a) ids;
+
+-- `| C x y => C T x y`: the body's spine is the arm's constructor, its leading
+-- arguments (type parameters) mention no binder, and the rest are the binders.
+def simp_rewraps (ctor_like : List Nat) (m : AstArm) : Bool :=
+    match ast_head_is (ast_arm_ctor m) (ast_arm_body m) with
+    | False => False
+    | True =>
+        match any Nat (fun (id : Nat) => mem Nat eq_nat id ctor_like) (ast_arm_binders m) with
+        | True => False
+        | False =>
+            let args : List Ast := ast_args (ast_arm_body m) in
+            let k : Nat := length Nat (ast_arm_binders m) in
+            let lead : Nat := sub (length Ast args) k in
+            andb (simp_tail_is_binders (drop Ast lead args) (ast_arm_binders m))
+              (notb (any Ast (simp_mentions_any (ast_arm_binders m)) (take Ast lead args)))
+        end
+    end;
+
+-- Two or more arms: a one-arm match is usually a refinement or a proof step.
+def simp_rewrap_issues (ctor_like : List Nat) (arms : List AstArm) : List SimpIssue :=
+    match arms with
+    | Nil => simp_inil
+    | Cons _ rest =>
+        match rest with
+        | Nil => simp_inil
+        | Cons _ _ =>
+            match all AstArm (simp_rewraps ctor_like) arms with
+            | True => simp_one (IRewrapIdentity (length AstArm arms))
+            | False => simp_inil
+            end
+        end
+    end;
+
+def simp_atom (a : Ast) : Bool :=
+    orb (ast_is tag_var a)
+      (orb (ast_is tag_nat a) (orb (ast_is tag_str a) (ast_is tag_sort a)));
+
+-- Eliminating a match must not eliminate evaluation of an unknown call,
+-- perform, or workflow. Identity/rewrap rules retain the scrutinee once;
+-- identical-arm elimination does not, so it needs this stronger condition.
+def simp_identical_safe (scrut : Ast) (arms : List AstArm) : List SimpIssue :=
+    match simp_atom (ast_peel_ascribe scrut) with
+    | True => simp_identical_issues arms
+    | False => simp_inil
+    end;
+
+-- Multi-scrutinee rows keep their columns under an AList scrutinee; the
+-- rules here read single-scrutinee matches only.
+def simp_match_issues (ids : SimpIds) (ctor_like : List Nat) (self : Nat) (scrut : Ast)
+    (branches : Ast) : List SimpIssue :=
+    match ast_is tag_list scrut with
+    | True => simp_inil
+    | False =>
+        match ast_arms branches with
+        | Nothing => simp_inil
+        | Just arms =>
+            -- A Bool identity is also a rewrap; the specific rule wins.
+            match simp_bool_issues ids self arms with
+            | Nil => simp_append (simp_identical_safe scrut arms) (simp_rewrap_issues ctor_like arms)
+            | Cons b _ => Cons SimpIssue b (simp_identical_safe scrut arms)
+            end
+        end
+    end;
+
+-- Variables and literals applied to variables and literals: a spine that is
+-- cheap to evaluate once and carries no control flow of its own.
+def simp_atom_spine : Ast -> Bool :=
+  fix simp_atom_spine (a : Ast) : Bool :=
+    match a with
+    | AApp f x => andb (simp_atom x) (simp_atom_spine f)
+    | AAscribe e _ => simp_atom_spine e
+    | AVar _ => True
+    | AHole _ => False
+    | ASort _ => True
+    | ANatLit _ => True
+    | AStr _ => True
+    | ALam _ _ _ => False
+    | APi _ _ _ => False
+    | ALet _ _ _ _ => False
+    | ABinder _ _ _ => False
+    | ANoBinder => False
+    | AFix _ _ _ _ => False
+    | ABranch _ _ _ _ => False
+    | ANoBranch => False
+    | AMatch _ _ => False
+    | APerform _ _ => False
+    | AHandle _ _ => False
+    | AClause _ _ _ _ => False
+    | ANoClause => False
+    | ADo _ => False
+    | AList _ => False
+    end;
+
+-- `fun x => f x` where f is an atom that never mentions x. A prefix
+-- (`fun x => add one x`, `fun p => fst Nat Nat p`) is a section, and a
+-- constructor head (`fun x => S x`) is the house style for `map`. A spine
+-- headed by an enclosing fix is exempt: passing the recursive name unapplied
+-- is a different program for the termination checker.
+def simp_eta_issue (recs : List Nat) (ctor_like : List Nat) (x : Nat) (body : Ast)
+    : List SimpIssue :=
+    match x with
+    | Z => simp_inil
+    | S _ =>
+        match ast_peel_ascribe body with
+        | AApp f arg =>
+            match eq_nat (ast_var_or_zero arg) x with
+            | False => simp_inil
+            | True =>
+                match ast_args f with
+                | Cons _ _ => simp_inil
+                | Nil =>
+                    match andb (simp_atom_spine f) (notb (ast_occurs x f)) with
+                    | False => simp_inil
+                    | True =>
+                        match ast_app_head f with
+                        | Nothing => simp_inil
+                        | Just h =>
+                            match orb (mem Nat eq_nat h recs)
+                              (mem Nat eq_nat h ctor_like) with
+                            | True => simp_inil
+                            | False => simp_one (IEtaLambda x)
+                            end
+                        end
+                    end
+                end
+            end
+        | AVar _ => simp_inil
+        | AHole _ => simp_inil
+        | ASort _ => simp_inil
+        | ANatLit _ => simp_inil
+        | AStr _ => simp_inil
+        | ALam _ _ _ => simp_inil
+        | APi _ _ _ => simp_inil
+        | ALet _ _ _ _ => simp_inil
+        | AAscribe _ _ => simp_inil
+        | ABinder _ _ _ => simp_inil
+        | ANoBinder => simp_inil
+        | AFix _ _ _ _ => simp_inil
+        | ABranch _ _ _ _ => simp_inil
+        | ANoBranch => simp_inil
+        | AMatch _ _ => simp_inil
+        | APerform _ _ => simp_inil
+        | AHandle _ _ => simp_inil
+        | AClause _ _ _ _ => simp_inil
+        | ANoClause => simp_inil
+        | ADo _ => simp_inil
+        | AList _ => simp_inil
+        end
+    end;
+
+def simp_is_call_of (h : Nat) (a : Ast) : Bool :=
+    match h with
+    | Z => False
+    | S _ => andb (ast_is tag_app (ast_peel_ascribe a)) (ast_head_is h a)
+    end;
+
+-- `notb (notb e)`: reported once, at the outer application.
+def simp_double_not (ids : SimpIds) (a : Ast) : List SimpIssue :=
+    match simp_is_call_of (simp_notb ids) a with
+    | False => simp_inil
+    | True =>
+        match ast_args a with
+        | Nil => simp_inil
+        | Cons inner more =>
+            match more with
+            | Cons _ _ => simp_inil
+            | Nil =>
+                match simp_is_call_of (simp_notb ids) inner with
+                | True =>
+                    match ast_args inner with
+                    | Nil => simp_inil
+                    | Cons _ rest =>
+                        match rest with
+                        | Nil => simp_one (IDoubleNot Z)
+                        | Cons _ _ => simp_inil
+                        end
+                    end
+                | False => simp_inil
+                end
+            end
+        end
+    end;
+
+def simp_bool_lit (ids : SimpIds) (a : Ast) : Nat :=
+    let v : Nat := ast_var_or_zero a in
+    match v with
+    | Z => Z
+    | S _ =>
+        match orb (eq_nat v (simp_true ids)) (eq_nat v (simp_false ids)) with
+        | True => v
+        | False => Z
+        end
+    end;
+
+def simp_first_lit (ids : SimpIds) : List Ast -> Nat :=
+  fix simp_first_lit (args : List Ast) : Nat :=
+    match args with
+    | Nil => Z
+    | Cons a rest =>
+        match simp_bool_lit ids a with
+        | Z => simp_first_lit rest
+        | S n => S n
+        end
+    end;
+
+-- Neutral operands retain the other argument once. Absorbing operands
+-- would erase its evaluation, so only atoms justify that recommendation.
+def simp_const_safe (ids : SimpIds) (op : Nat) (lit : Nat) (args : List Ast) : Bool :=
+    match orb (andb (eq_nat op (simp_andb ids)) (eq_nat lit (simp_true ids)))
+      (andb (eq_nat op (simp_orb ids)) (eq_nat lit (simp_false ids))) with
+    | True => True
+    | False => all Ast (fun (a : Ast) => simp_atom (ast_peel_ascribe a)) args
+    end;
+
+-- Saturated andb/orb with a True or False operand, without erasing an
+-- unknown computation.
+def simp_const_operand (ids : SimpIds) (a : Ast) : List SimpIssue :=
+    let op : Nat :=
+      match simp_is_call_of (simp_andb ids) a with
+      | True => simp_andb ids
+      | False =>
+          match simp_is_call_of (simp_orb ids) a with
+          | True => simp_orb ids
+          | False => Z
+          end
+      end in
+    match op with
+    | Z => simp_inil
+    | S _ =>
+        let args : List Ast := ast_args a in
+        match eq_nat (length Ast args) simp_two with
+        | False => simp_inil
+        | True =>
+            match simp_first_lit ids args with
+            | Z => simp_inil
+            | S n =>
+                match simp_const_safe ids op (S n) args with
+                | True => simp_one (IConstBoolOperand op (S n))
+                | False => simp_inil
+                end
+            end
+        end
+    end;
+
+-- Interned spellings are not resolved symbols. A local declaration masks
+-- the configured helper only in the subtree where that declaration binds.
+def simp_hidden (shadowed : List Nat) (id : Nat) : Bool :=
+    match id with
+    | Z => False
+    | S _ => mem Nat eq_nat id shadowed
+    end;
+
+def simp_visible (shadowed : List Nat) (id : Nat) : Nat :=
+    match simp_hidden shadowed id with
+    | True => Z
+    | False => id
+    end;
+
+def simp_scoped_ids (shadowed : List Nat) (ids : SimpIds) : SimpIds :=
+    MkSimpIds (simp_visible shadowed (simp_true ids))
+      (simp_visible shadowed (simp_false ids))
+      (simp_visible shadowed (simp_notb ids))
+      (simp_visible shadowed (simp_andb ids))
+      (simp_visible shadowed (simp_orb ids));
+
+-- Unlike a double negation, a boolean match need not mention notb at all.
+-- Keep that existing suggestion, but never introduce a locally hidden notb.
+def simp_scope_allows (ids : SimpIds) (shadowed : List Nat) (a : Ast) (i : SimpIssue) : Bool :=
+    match i with
+    | IBoolNegation _ => notb (simp_hidden shadowed (simp_notb ids))
+    | IBoolIdentity _ => True
+    | IIdenticalArms _ => True
+    | IEtaLambda _ => True
+    | IDoubleNot _ => True
+    | IConstBoolOperand _ _ => True
+    | IRewrapIdentity _ =>
+        match a with
+        | AMatch _ branches =>
+            notb (any Nat (simp_hidden shadowed) (ast_arm_ctors branches))
+        | AVar _ => False
+        | AHole _ => False
+        | ASort _ => False
+        | ANatLit _ => False
+        | AStr _ => False
+        | AApp _ _ => False
+        | ALam _ _ _ => False
+        | APi _ _ _ => False
+        | ALet _ _ _ _ => False
+        | AAscribe _ _ => False
+        | ABinder _ _ _ => False
+        | ANoBinder => False
+        | AFix _ _ _ _ => False
+        | ABranch _ _ _ _ => False
+        | ANoBranch => False
+        | APerform _ _ => False
+        | AHandle _ _ => False
+        | AClause _ _ _ _ => False
+        | ANoClause => False
+        | ADo _ => False
+        | AList _ => False
+        end
+    end;
+
+def simp_node_issues (ids : SimpIds) (ctor_like : List Nat) (self : Nat)
+    (shadowed : List Nat) (recs : List Nat) (a : Ast) : List SimpIssue :=
+    match a with
+    | AMatch scrut branches =>
+        filter SimpIssue (simp_scope_allows ids shadowed a)
+          (simp_match_issues (simp_scoped_ids shadowed ids) ctor_like self scrut branches)
+    | ALam x _ body => simp_eta_issue recs ctor_like x body
+    | AApp _ _ =>
+        let scoped : SimpIds := simp_scoped_ids shadowed ids in
+        simp_append (simp_double_not scoped a) (simp_const_operand scoped a)
+    | AVar _ => simp_inil
+    | AHole _ => simp_inil
+    | ASort _ => simp_inil
+    | ANatLit _ => simp_inil
+    | AStr _ => simp_inil
+    | APi _ _ _ => simp_inil
+    | ALet _ _ _ _ => simp_inil
+    | AAscribe _ _ => simp_inil
+    | ABinder _ _ _ => simp_inil
+    | ANoBinder => simp_inil
+    | AFix _ _ _ _ => simp_inil
+    | ABranch _ _ _ _ => simp_inil
+    | ANoBranch => simp_inil
+    | APerform _ _ => simp_inil
+    | AHandle _ _ => simp_inil
+    | AClause _ _ _ _ => simp_inil
+    | ANoClause => simp_inil
+    | ADo _ => simp_inil
+    | AList _ => simp_inil
+    end;
+
+def simp_walk (ids : SimpIds) (ctor_like : List Nat) (self : Nat)
+    (initial_shadowed : List Nat) : List Nat -> Ast -> List SimpIssue :=
+  fun (initial_recs : List Nat) (root : Ast) =>
+    (fix simp_walk (fuel : Nat) (shadowed : List Nat) (recs : List Nat) (a : Ast)
+        : List SimpIssue :=
+      match fuel with
+      | Z => simp_inil
+      | S remaining =>
+          let descend : List Nat -> List Nat -> Ast -> List SimpIssue :=
+            fun (hidden : List Nat) (rs : List Nat) (child : Ast) =>
+              simp_walk remaining hidden rs child in
+          let here : List SimpIssue :=
+            simp_node_issues ids ctor_like self shadowed recs a in
+          let kids : List SimpIssue :=
+            match a with
+            | AVar _ => simp_inil
+            | AHole _ => simp_inil
+            | ASort _ => simp_inil
+            | ANatLit _ => simp_inil
+            | AStr _ => simp_inil
+            | ANoBinder => simp_inil
+            | ANoBranch => simp_inil
+            | ANoClause => simp_inil
+            | AApp f x =>
+                simp_append (descend shadowed recs f) (descend shadowed recs x)
+            | ALam id ann body =>
+                simp_append (descend shadowed recs ann)
+                  (descend (Cons Nat id shadowed) recs body)
+            | APi id dom cod =>
+                simp_append (descend shadowed recs dom)
+                  (descend (Cons Nat id shadowed) recs cod)
+            | ALet id ann value body =>
+                simp_append (descend shadowed recs ann)
+                  (simp_append (descend shadowed recs value)
+                    (descend (Cons Nat id shadowed) recs body))
+            | AAscribe value ty =>
+                simp_append (descend shadowed recs value) (descend shadowed recs ty)
+            | ABinder id ty rest =>
+                simp_append (descend shadowed recs ty)
+                  (descend (Cons Nat id shadowed) recs rest)
+            | AFix r binders ret body =>
+                let rs : List Nat := Cons Nat r recs in
+                let recursive : List Nat := Cons Nat r shadowed in
+                let inner : List Nat := append Nat (ast_binder_ids binders) recursive in
+                simp_append (descend recursive rs binders)
+                  (simp_append (descend inner rs ret) (descend inner rs body))
+            | ABranch _ bound body rest =>
+                let locals : List Nat :=
+                  filter Nat (fun (id : Nat) => notb (mem Nat eq_nat id ctor_like)) bound in
+                simp_append (descend (append Nat locals shadowed) recs body)
+                  (descend shadowed recs rest)
+            | AMatch scrut branches =>
+                simp_append (descend shadowed recs scrut) (descend shadowed recs branches)
+            | APerform _ args => concat_map Ast SimpIssue (descend shadowed recs) args
+            | AHandle value clauses =>
+                simp_append (descend shadowed recs value) (descend shadowed recs clauses)
+            | AClause _ bound body rest =>
+                simp_append (descend (append Nat bound shadowed) recs body)
+                  (descend shadowed recs rest)
+            | ADo xs => concat_map Ast SimpIssue (descend shadowed recs) xs
+            | AList xs => concat_map Ast SimpIssue (descend shadowed recs) xs
+            end in
+          simp_append here kids
+      end) (ast_size root) initial_shadowed initial_recs root;
+
+-- ctor_like: ids spelt with a capital, so refined pattern slots are told
+-- apart from binders; self: the definition's own name. The parameter
+-- telescope is the definition's signature and is not inspected; the body
+-- behind it is. Its binders still mask global helper spellings there.
+def analyze_simplify (ids : SimpIds) (ctor_like : List Nat) (self : Nat) (a : Ast)
+    : List SimpIssue :=
+    let r : Nat := ast_root_fix a in
+    let recs : List Nat :=
+      match r with
+      | Z => Nil Nat
+      | S _ => [r]
+      end in
+    simp_walk ids ctor_like self (append Nat (ast_params a) recs) recs (ast_core_body a);

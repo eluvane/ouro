@@ -1,0 +1,117 @@
+-- Resolved literal bytes are payload, not references or match branches.
+import "../compiler/facts.ouro";
+import "../compiler/source_text.ouro";
+import "../std/test.ouro";
+
+def facts_literal_fuel : Nat := 64;
+def facts_literal_bytes : List Nat := [65, 0, 22, 65, 255, 0];
+def facts_literal_core : CoreTerm := CStrBytes facts_literal_bytes 18;
+
+def facts_literal_payload (expected : List Nat) (term : Norm) : Bool :=
+    match term with
+    | NBytes bytes => source_bytes_equal expected bytes
+    | NBound _ => False | NGlobal _ => False | NHole _ => False
+    | NSort _ => False | NNat _ => False | NApp _ _ => False
+    | NLam _ _ => False | NPi _ _ => False | NLet _ _ _ => False
+    | NAscribe _ _ => False | NMatch _ _ => False | NFix _ _ => False
+    | NBranch _ _ _ => False | NNoBranch => False | NConst _ => False
+    | NConstruct _ _ => False | NInd _ => False | NPerform _ _ => False
+    | NHandle _ _ => False | NClause _ _ _ => False | NNoClause => False
+    | NDo _ _ => False
+    end;
+
+def facts_literal_kind (kind : FactKind) : Nat :=
+    match kind with
+    | FDeclaration => 0 | FReference => 1 | FExport => 2
+    | FConstructor => 3 | FModule => 4 | FBranch => 5 | FEffect => 6
+    end;
+
+-- Every emitted fact must have the expected kind, owner, target, flags and span.
+-- Comparing the complete list also rejects extra facts manufactured from bytes.
+def facts_literal_exact (kind : Nat) (owner : Nat) (span : Nat)
+    : List Nat -> List Fact -> Bool :=
+  fix compare (targets : List Nat) (facts : List Fact) : Bool :=
+    match targets with
+    | Nil => nullb Fact facts
+    | Cons target rest => match facts with
+        | Nil => False
+        | Cons fact tail => match fact with
+            | MkFact actual source destination flags location =>
+                andb (eqNat (facts_literal_kind actual) kind)
+                  (andb (eqNat source owner)
+                    (andb (eqNat destination target)
+                      (andb (eqNat flags 0)
+                        (andb (eqNat location span) (compare rest tail)))))
+            end
+        end
+    end;
+
+def facts_literal_norm : Norm := normalize_core facts_literal_fuel facts_literal_core;
+
+def facts_literal_refs (term : Norm) (expected : List Nat) : Bool :=
+    facts_literal_exact 1 90 0 expected (refs_in_norm facts_literal_fuel 90 term);
+
+def facts_literal_branches (term : Norm) (expected : List Nat) : Bool :=
+    facts_literal_exact 5 90 77 expected (branches_in_norm facts_literal_fuel 90 77 term);
+
+def facts_literal_collected : Bool :=
+    match collect_core_asts
+      ([MkPair Nat CoreTerm 90 facts_literal_core] : List (Pair Nat CoreTerm)) with
+    | Nil => False
+    | Cons ast rest => match ast with
+        | MkTypedAst owner term => andb (eqNat owner 90)
+            (andb (facts_literal_payload facts_literal_bytes term) (nullb TypedAst rest))
+        end
+    end;
+
+def facts_literal_application : Norm :=
+    normalize_core facts_literal_fuel (CApp (CConst 65) facts_literal_core);
+
+def facts_literal_let : Norm :=
+    normalize_core facts_literal_fuel
+      (CLetIn facts_literal_core (CConst 18) (CApp (CConst 71) (CRel 0)));
+
+-- Genuine source branches retain constructor IDs beside the resolved payload.
+def facts_literal_neighbor : Norm :=
+    NApp facts_literal_norm
+      (normalize_expr facts_literal_fuel ([] : List Nat)
+        (EMatch (EVar 70)
+          (EBranch ([7] : List Nat) (EVar 71)
+            (EBranch ([8] : List Nat) (EVar 72) ENoBranch))));
+
+-- Core normalization records one anonymous branch per real case body.
+def facts_literal_case : Norm :=
+    normalize_core facts_literal_fuel
+      (CCase (MkCaseInfo 40 0 ([0, 0] : List Nat)) (CSort 0) (CConst 70)
+        ([facts_literal_core, CApp (CConst 71) facts_literal_core] : List CoreTerm));
+
+def facts_literal_laws : List Test :=
+    [ assert_true "NBytes preserves order repeated bytes embedded NUL and byte 255"
+        (facts_literal_payload facts_literal_bytes facts_literal_norm)
+    , assert_true "an empty literal remains an NBytes payload"
+        (facts_literal_payload ([] : List Nat)
+          (normalize_core facts_literal_fuel (CStrBytes ([] : List Nat) 18)))
+    , assert_true "core AST collection retains the literal payload and declaration ID"
+        facts_literal_collected
+    , assert_true "literal bytes and type ID produce no reference facts"
+        (facts_literal_refs facts_literal_norm ([] : List Nat))
+    , assert_true "literal bytes produce no branch facts"
+        (facts_literal_branches facts_literal_norm ([] : List Nat))
+    , assert_true "a real function reference is retained beside matching byte values"
+        (facts_literal_refs facts_literal_application ([65] : List Nat))
+    , assert_true "a literal application does not create match branches"
+        (facts_literal_branches facts_literal_application ([] : List Nat))
+    , assert_true "let annotation and body references survive a literal initializer"
+        (facts_literal_refs facts_literal_let ([18, 71] : List Nat))
+    , assert_true "real source branch references remain exact beside literal bytes"
+        (facts_literal_refs facts_literal_neighbor ([70, 7, 71, 8, 72] : List Nat))
+    , assert_true "real source branches retain owner constructor flags and span"
+        (facts_literal_branches facts_literal_neighbor ([7, 8] : List Nat))
+    , assert_true "Core case references exclude the bytes in each branch body"
+        (facts_literal_refs facts_literal_case ([70, 0, 0, 71] : List Nat))
+    , assert_true "Core case has exactly its two real branches with literal bodies"
+        (facts_literal_branches facts_literal_case ([0, 0] : List Nat))
+    ];
+
+-- @entry main
+def main : IO Unit := test_run facts_literal_laws;

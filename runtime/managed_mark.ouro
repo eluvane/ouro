@@ -1,0 +1,154 @@
+-- Collector work uses a separate raw reservation, never managed allocation.
+-- Scratch words 0..3 belong to root inspection; word 4 is the stack length,
+-- word 5 its capacity, and words 6..7 are heap-validation counters.
+-- After validation, a nonzero word 6 enables the index after the worklist;
+-- zero preserves the original 8+N-word scratch contract. Word 5 stays fixed.
+-- Pending object addresses start at word 8. Each object is pushed once.
+import "managed_index.ouro";
+
+def managed_object_known (context : RawPtr U8) (wanted : USize) (scratch : RawPtr U8) : Runtime Bool :=
+    let zero : USize := usize_sub wanted wanted in
+    let one : USize := managed_one wanted in
+    let two : USize := usize_add one one in
+    let three : USize := usize_add two one in
+    runtime_bind USize Bool (managed_read_word context two) (fun (count : USize) =>
+      runtime_bind Unit Bool (managed_write_word scratch three count) (fun (bounded : Unit) =>
+        runtime_bind (RawPtr U8) Bool (managed_read_pointer context zero) (fun (first : RawPtr U8) =>
+          match u8_from_nat 1 with | Nothing => runtime_pure Bool False | Just running =>
+            runtime_bind (RawPtr U8) Bool (runtime_loop (RawPtr U8) first
+              (fun (base : RawPtr U8) => runtime_bind USize U8 (raw_to_bits U8 base) (fun (bits : USize) =>
+                runtime_pure U8 (match raw_bool_and (raw_bool_not (usize_equal bits zero))
+                  (raw_bool_not (usize_equal bits wanted)) with | True => running | False => u8_sub running running end)))
+              (fun (base : RawPtr U8) => runtime_bind USize (RawPtr U8) (managed_read_word scratch three) (fun (remaining : USize) =>
+                runtime_bind Unit (RawPtr U8) (managed_require (raw_bool_not (usize_equal remaining zero)) wanted) (fun (budget : Unit) =>
+                  runtime_bind Unit (RawPtr U8) (managed_check_object context base) (fun (checked : Unit) =>
+                    runtime_bind Unit (RawPtr U8) (managed_write_word scratch three (usize_sub remaining one))
+                      (fun (spent : Unit) => managed_read_pointer base two))))))
+              (fun (found : RawPtr U8) => runtime_bind USize Bool (raw_to_bits U8 found) (fun (bits : USize) =>
+                runtime_pure Bool (raw_bool_and (raw_bool_not (usize_equal wanted zero)) (usize_equal bits wanted)))) end)));
+
+-- Collector-only lookup after managed_gc_heap False has checked every
+-- header and the exact list count. Until sweep, mark changes only scratch
+-- and mark words: links, sizes and descriptors cannot change or reenter
+-- user code. Retain the count bound and exact non-null allocation base;
+-- the caller still checks the found object's complete layout and mark.
+def managed_object_in_checked_heap (context : RawPtr U8) (wanted : USize) (scratch : RawPtr U8) : Runtime Bool :=
+    let zero : USize := usize_sub wanted wanted in
+    let one : USize := managed_one wanted in
+    let two : USize := usize_add one one in
+    let three : USize := usize_add two one in
+    runtime_bind USize Bool (managed_read_word context two) (fun (count : USize) =>
+      runtime_bind Unit Bool (managed_write_word scratch three count) (fun (bounded : Unit) =>
+        runtime_bind (RawPtr U8) Bool (managed_read_pointer context zero) (fun (first : RawPtr U8) =>
+          match u8_from_nat 1 with | Nothing => runtime_pure Bool False | Just running =>
+            runtime_bind (RawPtr U8) Bool (runtime_loop (RawPtr U8) first
+              (fun (base : RawPtr U8) => runtime_bind USize U8 (raw_to_bits U8 base) (fun (bits : USize) =>
+                runtime_pure U8 (match raw_bool_and (raw_bool_not (usize_equal bits zero))
+                  (raw_bool_not (usize_equal bits wanted)) with | True => running | False => u8_sub running running end)))
+              (fun (base : RawPtr U8) => runtime_bind USize (RawPtr U8) (managed_read_word scratch three) (fun (remaining : USize) =>
+                runtime_bind Unit (RawPtr U8) (managed_require (raw_bool_not (usize_equal remaining zero)) wanted) (fun (budget : Unit) =>
+                  runtime_bind Unit (RawPtr U8) (managed_write_word scratch three (usize_sub remaining one))
+                    (fun (spent : Unit) => managed_read_pointer base two)))))
+              (fun (found : RawPtr U8) => runtime_bind USize Bool (raw_to_bits U8 found) (fun (bits : USize) =>
+                runtime_pure Bool (raw_bool_and (raw_bool_not (usize_equal wanted zero)) (usize_equal bits wanted)))) end)));
+
+-- Only managed_collect enables this table after validating the whole heap.
+-- Legacy scratch has word 6 zero after validation and retains the old scan.
+def managed_object_in_mark_heap (context : RawPtr U8) (wanted : USize) (scratch : RawPtr U8) : Runtime Bool :=
+    let zero : USize := usize_sub wanted wanted in
+    let one : USize := managed_one wanted in
+    let two : USize := usize_add one one in
+    let four : USize := usize_add two two in
+    let five : USize := usize_add four one in
+    let six : USize := usize_add four two in
+    runtime_bind USize Bool (managed_read_word scratch six) (fun (capacity : USize) =>
+      match usize_equal capacity zero with
+      | True => managed_object_in_checked_heap context wanted scratch
+      | False => runtime_bind USize Bool (managed_read_word scratch five) (fun (count : USize) =>
+          runtime_bind (RawPtr U8) Bool (managed_gc_index_table scratch count) (fun (table : RawPtr U8) =>
+            managed_gc_index_contains table capacity wanted scratch)) end);
+
+-- All callers establish that base is a live allocation with a valid layout.
+def managed_mark_push (base : RawPtr U8) (scratch : RawPtr U8) (anchor : USize) : Runtime Unit :=
+    let zero : USize := usize_sub anchor anchor in
+    let one : USize := managed_one anchor in
+    let two : USize := usize_add one one in
+    let three : USize := usize_add two one in
+    let four : USize := usize_add two two in
+    let five : USize := usize_add four one in
+    let eight : USize := managed_word_offset one in
+    runtime_bind USize Unit (managed_read_word base three) (fun (mark : USize) =>
+      runtime_bind Unit Unit (managed_require (raw_bool_not (usize_less one mark)) anchor) (fun (valid : Unit) =>
+        match usize_equal mark zero with | False => runtime_pure Unit MkUnit | True =>
+          runtime_bind USize Unit (managed_read_word scratch four) (fun (count : USize) =>
+            runtime_bind USize Unit (managed_read_word scratch five) (fun (capacity : USize) =>
+              runtime_bind Unit Unit (managed_require (usize_less count capacity) anchor) (fun (room : Unit) =>
+                runtime_bind Unit Unit (managed_write_pointer scratch (usize_add eight count) base) (fun (stored : Unit) =>
+                  runtime_bind Unit Unit (managed_write_word scratch four (usize_add count one))
+                    (fun (pushed : Unit) => managed_write_word base three one))))) end));
+
+-- Raw scalar payloads never call this entry. Null slots are initialized roots,
+-- not objects. Every other traced value must be an exact registered base.
+def managed_mark_reference_with_heap (context : RawPtr U8) (value : USize) (scratch : RawPtr U8)
+    (heap_checked : Bool) : Runtime Unit :=
+    match usize_equal value (usize_sub value value) with | True => runtime_pure Unit MkUnit | False =>
+      runtime_bind Bool Unit (match heap_checked with
+        | False => managed_object_known context value scratch
+        | True => managed_object_in_mark_heap context value scratch end) (fun (known : Bool) =>
+        runtime_bind Unit Unit (managed_require known value) (fun (registered : Unit) =>
+          runtime_bind (RawPtr U8) Unit (raw_from_bits U8 value) (fun (base : RawPtr U8) =>
+            runtime_bind Unit Unit (managed_check_object context base)
+              (fun (valid : Unit) => managed_mark_push base scratch value)))) end;
+
+def managed_mark_range_with_heap (context : RawPtr U8) (base : RawPtr U8) (start : USize)
+    (count : USize) (scratch : RawPtr U8)
+    (heap_checked : Bool) : Runtime Unit :=
+    let zero : USize := usize_sub count count in
+    let one : USize := managed_one count in
+    let three : USize := usize_add (usize_add one one) one in
+    let first : USize := managed_shift_right start (raw_size_to_u32 three) in
+    match u8_from_nat 1 with | Nothing => managed_panic count | Just running =>
+      runtime_bind USize Unit (runtime_loop USize zero
+        (fun (index : USize) => runtime_pure U8 (match usize_less index count with
+          | True => running | False => u8_sub running running end))
+        (fun (index : USize) => runtime_bind USize USize (managed_read_word base (usize_add first index))
+          (fun (reference : USize) => runtime_bind Unit USize (managed_mark_reference_with_heap context reference scratch heap_checked)
+            (fun (marked : Unit) => runtime_pure USize (usize_add index one)))))
+        (fun (finished : USize) => runtime_pure Unit MkUnit) end;
+
+def managed_mark_edges_with_heap (context : RawPtr U8) (base : RawPtr U8) (scratch : RawPtr U8)
+    (heap_checked : Bool) : Runtime Unit :=
+    runtime_bind USize Unit (raw_to_bits U8 base) (fun (bits : USize) =>
+      let zero : USize := usize_sub bits bits in
+      let one : USize := managed_one bits in
+      let two : USize := usize_add one one in
+      let three : USize := usize_add two one in
+      let four : USize := usize_add two two in
+      runtime_bind (RawPtr U8) Unit (managed_read_pointer base zero) (fun (descriptor : RawPtr U8) =>
+        runtime_bind USize Unit (managed_read_word descriptor two) (fun (start : USize) =>
+          runtime_bind USize Unit (managed_read_word descriptor three) (fun (mode : USize) =>
+            runtime_bind USize Unit (managed_read_word descriptor four) (fun (argument : USize) =>
+              runtime_bind USize Unit (match usize_equal mode two with
+                | True => managed_read_word base (managed_shift_right argument (raw_size_to_u32 three))
+                | False => runtime_pure USize argument end)
+                (fun (count : USize) => managed_mark_range_with_heap context base start count scratch heap_checked))))));
+
+def managed_mark_pending_with_heap (context : RawPtr U8) (scratch : RawPtr U8)
+    (heap_checked : Bool) : Runtime Unit :=
+    runtime_bind USize Unit (raw_to_bits U8 scratch) (fun (bits : USize) =>
+      let zero : USize := usize_sub bits bits in
+      let one : USize := managed_one bits in
+      let two : USize := usize_add one one in
+      let four : USize := usize_add two two in
+      let eight : USize := managed_word_offset one in
+      match u8_from_nat 1 with | Nothing => managed_panic bits | Just running =>
+        runtime_bind USize Unit (managed_read_word scratch four) (fun (initial : USize) =>
+          runtime_bind USize Unit (runtime_loop USize initial
+            (fun (count : USize) => runtime_pure U8 (match usize_equal count zero with
+              | True => u8_sub running running | False => running end))
+            (fun (count : USize) => let remaining : USize := usize_sub count one in
+              runtime_bind (RawPtr U8) USize (managed_read_pointer scratch (usize_add eight remaining))
+                (fun (base : RawPtr U8) => runtime_bind Unit USize (managed_write_word scratch four remaining)
+                  (fun (popped : Unit) => runtime_bind Unit USize (managed_mark_edges_with_heap context base scratch heap_checked)
+                    (fun (traced : Unit) => managed_read_word scratch four)))))
+            (fun (finished : USize) => runtime_pure Unit MkUnit)) end);

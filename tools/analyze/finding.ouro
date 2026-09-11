@@ -1,0 +1,385 @@
+-- Definition-anchored analyzer finding plus the stable rule table that
+-- renders it. Codes are registry keys from quality/diagnostics.json. This
+-- module stays off std/string so it can share a cone with the lexer.
+
+-- @entry rule_of_code
+-- @entry show_finding
+-- @entry sort_findings
+-- @entry dedupe_findings
+
+import "../../std/data.ouro";
+import "../../std/listx.ouro";
+import "../../std/runtime.ouro";
+
+-- code, definition line (1-based; Z when unknown), definition name, witness.
+inductive Finding : Type :=
+  | MkFinding : String -> Nat -> String -> String -> Finding;
+
+-- family, rule, message, hint.
+inductive RuleRow : Type :=
+  | MkRule : String -> String -> String -> String -> RuleRow;
+
+def finding_code (f : Finding) : String :=
+    match f with | MkFinding c _ _ _ => c end;
+
+def finding_line (f : Finding) : Nat :=
+    match f with | MkFinding _ l _ _ => l end;
+
+def finding_def (f : Finding) : String :=
+    match f with | MkFinding _ _ d _ => d end;
+
+def finding_witness (f : Finding) : String :=
+    match f with | MkFinding _ _ _ w => w end;
+
+def rule_family (r : RuleRow) : String :=
+    match r with | MkRule fam _ _ _ => fam end;
+
+def rule_name (r : RuleRow) : String :=
+    match r with | MkRule _ name _ _ => name end;
+
+def rule_message (r : RuleRow) : String :=
+    match r with | MkRule _ _ msg _ => msg end;
+
+def rule_hint (r : RuleRow) : String :=
+    match r with | MkRule _ _ _ hint => hint end;
+
+def rule_row (code : String) (fam : String) (name : String) (msg : String)
+    (hint : String) : Pair String RuleRow :=
+    MkPair String RuleRow code (MkRule fam name msg hint);
+
+-- Families that read the shape of a definition.
+def shape_rules : List (Pair String RuleRow) :=
+  [ rule_row "OURO-EFF001" "effects" "pure-hole"
+      "pure context contains a hole"
+      "Fill the hole or drop the @pure annotation."
+  , rule_row "OURO-EFF002" "effects" "const-rebind"
+      "constant rebound inside a handler"
+      "Do not rebind a top-level constant in handler clauses."
+  , rule_row "OURO-EFF003" "effects" "unhandled-perform"
+      "unhandled perform"
+      "Wrap the perform in a handle that has a clause for this operation."
+  , rule_row "OURO-EFF004" "effects" "handle-missing-op"
+      "handle missing performed op"
+      "Add a clause for every operation performed inside the handled expression."
+  , rule_row "OURO-EFF005" "effects" "discarded-continuation"
+      "handler discards continuation"
+      "Name the continuation and resume it, or document the one-shot abort."
+  , rule_row "OURO-EFF006" "effects" "pure-effect"
+      "perform inside a pure context"
+      "Move the perform out of the @pure definition or drop the annotation."
+  , rule_row "OURO-CAP001" "capability" "fs-primitive"
+      "fs primitive outside allowed layer"
+      "Call the checked std/fs wrapper from an io, tools, or samples layer."
+  , rule_row "OURO-CAP002" "capability" "proc-primitive"
+      "prim_proc_exec outside allowed layer"
+      "Call std/process from an io, tools, or samples layer."
+  , rule_row "OURO-CAP003" "capability" "http-primitive"
+      "prim_http_post outside allowed layer"
+      "Keep prim_http_post inside the layers that own network access."
+  , rule_row "OURO-CAP004" "capability" "host-fast-peano"
+      "host-fast name with Peano/fix body"
+      "Host-fast names must stay primitive bindings; rename the recursive definition."
+  , rule_row "OURO-XTR001" "extract" "type-as-value"
+      "Type/Sort used as a runtime value"
+      "Pass a term, not a Sort; types are erased at extraction."
+  , rule_row "OURO-XTR002" "extract" "proof-in-io"
+      "proof or Sort under IO"
+      "Keep proofs and Sorts out of IO code paths."
+  , rule_row "OURO-XTR003" "extract" "kernel-from-std"
+      "kernel name referenced from std"
+      "std must not depend on kernel entry points; move the caller to selfhost or tools."
+  , rule_row "OURO-MATCH001" "match" "partial-match"
+      "partial match on known constructors"
+      "Add arms for the missing constructors."
+  , rule_row "OURO-MATCH002" "match" "dead-branch"
+      "dead or duplicate match branch"
+      "Remove the duplicate arm; the first arm for a constructor wins."
+  , rule_row "OURO-CFG001" "cfg" "empty-match"
+      "match has no branches"
+      "Add a constructor arm or match on an empty inductive only with an explicit @property exhaustive waiver."
+  , rule_row "OURO-CFG002" "cfg" "trivial-match"
+      "one-arm match binds nothing"
+      "Replace the match with the arm body, or bind the constructor's fields."
+  , rule_row "OURO-CFG003" "cfg" "unchecked-recursion"
+      "recursive fix never scrutinises a parameter"
+      "Match on a parameter or a fuel argument before the recursive call."
+  , rule_row "OURO-CFG004" "cfg" "unreachable-branch"
+      "branch repeats an earlier arm's constructor"
+      "Remove the arm; the earlier unrefined arm already covers this constructor."
+  , rule_row "OURO-DF001" "dataflow" "unused-param"
+      "definition parameter is never read"
+      "Use the parameter, or spell it with a leading underscore to mark the discard."
+  , rule_row "OURO-DF002" "dataflow" "dead-store"
+      "let-binding is never used"
+      "Remove the binding or use the value."
+  , rule_row "OURO-DF003" "dataflow" "alias"
+      "let-binding aliases a name"
+      "Use the original name; the binding adds nothing."
+  , rule_row "OURO-DF004" "dataflow" "hole-flow"
+      "hole flows into a value position"
+      "Fill the hole; a hole in a value position never evaluates."
+  , rule_row "OURO-SEM001" "semantic" "magic-number"
+      "unnamed numeric literal above the threshold"
+      "Name the literal in a top-level definition."
+  , rule_row "OURO-SEM002" "semantic" "complex-scrutinee"
+      "match scrutinee nests control flow"
+      "Bind the scrutinee with let and match on the name."
+  , rule_row "OURO-SEM003" "semantic" "lambda-nesting"
+      "lambda nesting exceeds the limit"
+      "Lift inner lambdas into named definitions."
+  , rule_row "OURO-SEM004" "semantic" "partial-bool-eq"
+      "one-arm match returning a Bool constructor"
+      "Return the comparison directly or cover every constructor."
+  , rule_row "OURO-SEM005" "semantic" "odd-identity"
+      "parameters never mentioned by the body"
+      "Drop the unused parameters or use them."
+  , rule_row "OURO-PROP001" "property" "no-holes"
+      "@property no-holes is violated"
+      "Fill remaining holes or drop the property directive."
+  , rule_row "OURO-PROP002" "property" "exhaustive-empty"
+      "@property exhaustive: match has no arms"
+      "Add arms for every constructor."
+  , rule_row "OURO-PROP003" "property" "exhaustive-missing"
+      "@property exhaustive: match misses a constructor"
+      "Add an arm for the missing constructor."
+  , rule_row "OURO-PROP004" "property" "terminates"
+      "@property terminates: recursion has no structural guard"
+      "Scrutinise a parameter or a fuel argument before recursing."
+  , rule_row "OURO-SIMP001" "simplify" "bool-identity"
+      "match on a Bool returns its own scrutinee"
+      "Return the scrutinee directly."
+  , rule_row "OURO-SIMP002" "simplify" "bool-negation"
+      "match on a Bool swaps True and False"
+      "Apply notb to the scrutinee."
+  , rule_row "OURO-SIMP003" "simplify" "identical-arms"
+      "every arm of the match has the same body"
+      "Replace the match with the shared body."
+  , rule_row "OURO-SIMP004" "simplify" "eta-lambda"
+      "lambda only forwards its argument to a function"
+      "Pass the function itself instead of wrapping it."
+  , rule_row "OURO-SIMP005" "simplify" "double-negation"
+      "notb applied to notb"
+      "Drop both negations."
+  , rule_row "OURO-SIMP006" "simplify" "constant-bool-operand"
+      "andb or orb with a True or False operand"
+      "Simplify: andb x True is x, andb x False is False, orb x True is True, orb x False is x."
+  , rule_row "OURO-SIMP007" "simplify" "rewrap-identity"
+      "every arm rebuilds the constructor it matched"
+      "Return the scrutinee; the match copies it."
+  , rule_row "OURO-PERF001" "perf" "literal-in-loop"
+      "numeric literal rebuilt on every iteration of a fix"
+      "Name the literal in a top-level definition so it is built once."
+  , rule_row "OURO-PERF002" "perf" "accumulator-append"
+      "append to an accumulator parameter inside the recursion"
+      "Cons onto the accumulator and reverse once at the end."
+  , rule_row "OURO-PERF003" "perf" "length-for-emptiness"
+      "length computed only to test for emptiness"
+      "Match on the list: Nil or Cons."
+  , rule_row "OURO-PERF004" "perf" "repeated-conversion"
+      "the same conversion of the same parameter repeated on one path"
+      "Bind the converted value once with let."
+  , rule_row "OURO-PERF005" "perf" "strict-bool-operand"
+      "andb or orb operand nests control flow or a recursive call"
+      "Use a match so the second operand short-circuits."
+  , rule_row "OURO-NAME001" "naming" "used-discard"
+      "binder spelt with a leading underscore is read"
+      "Rename the binder; the underscore tells the dataflow rules it is a discard."
+  , rule_row "OURO-NAME002" "naming" "short-name"
+      "one-character definition name"
+      "Give the definition a searchable name."
+  , rule_row "OURO-NAME003" "naming" "capital-value"
+      "value definition spelt with a capital initial"
+      "Use a lowercase initial; capitals mark types and constructors."
+  , rule_row "OURO-NAME004" "naming" "lowercase-constructor"
+      "constructor spelt with a lowercase or underscore initial"
+      "Capitalise the constructor; pattern slots read a lowercase name as a binder."
+  , rule_row "OURO-ERR001" "errors" "string-error"
+      "result type is Either String"
+      "Declare an error inductive and return Either <Error> instead."
+  , rule_row "OURO-ERR002" "errors" "error-to-success"
+      "failure arm drops its payload and answers with the success constructor"
+      "Propagate the error or return a value that records it."
+  , rule_row "OURO-ERR003" "errors" "ignored-result"
+      "io_bind over an Either binds its result to a discard"
+      "Match on the Either and handle the Left case."
+  ];
+
+-- Families that check a claim: a value fact, a path condition, an
+-- annotation, or a metric.
+def claim_rules : List (Pair String RuleRow) :=
+  [ rule_row "OURO-ABS001" "absint" "div-zero"
+      "division by a definitely zero divisor"
+      "Guard the divisor or match on it before dividing."
+  , rule_row "OURO-ABS002" "absint" "dead-positive-arm"
+      "arm on a positive constructor for a definitely zero scrutinee"
+      "Remove the arm or widen the scrutinee."
+  , rule_row "OURO-ABS003" "absint" "assert-positive"
+      "body is definitely zero although a contract asserts it positive"
+      "Fix the body or the @ensures clause."
+  , rule_row "OURO-SYM001" "symexec" "contradiction"
+      "nested match where no arm can fire under the path condition"
+      "Remove the unreachable match or rebind the variable."
+  , rule_row "OURO-SYM002" "symexec" "unsat-arm"
+      "arm constructor contradicts the path condition"
+      "Remove the arm; the outer match already fixed this constructor."
+  , rule_row "OURO-SYM003" "symexec" "nonterminating-call"
+      "recursive call repeats every parameter unchanged"
+      "Decrease a parameter or scrutinise it before the call."
+  , rule_row "OURO-TAINT001" "taint" "taint-to-sink"
+      "tainted value reaches a sink"
+      "Sanitize the value or split the source from the sink."
+  , rule_row "OURO-TAINT002" "taint" "hole-to-sink"
+      "hole is passed straight to a sink"
+      "Fill the hole before it reaches the sink."
+  , rule_row "OURO-TAINT003" "taint" "secret-in-public"
+      "public definition mentions a secret"
+      "Keep secrets behind a non-public accessor."
+  , rule_row "OURO-CTR001" "contracts" "orphan-annotation"
+      "contract annotation has no definition below it"
+      "Move the annotation directly above its definition or remove it."
+  , rule_row "OURO-CTR002" "contracts" "requires-empty"
+      "@requires annotation is empty"
+      "Write the precondition or remove the annotation."
+  , rule_row "OURO-CTR003" "contracts" "pure-performs"
+      "@pure definition performs an effect"
+      "Move the effect out of the definition or drop @pure."
+  , rule_row "OURO-CTR004" "contracts" "missing-on-public"
+      "public definition has no requires or ensures clause"
+      "Add a @requires or @ensures clause, or drop @property contracts."
+  , rule_row "OURO-CTR005" "contracts" "duplicate-annotation"
+      "annotation is repeated"
+      "Keep one copy of the annotation."
+  , rule_row "OURO-CTR006" "contracts" "unknown-tag"
+      "unknown annotation tag"
+      "Use requires, ensures, invariant, modifies, or pure; tooling tags are entry, export, doc, bound, minimal, property, lint, trust-reviewed."
+  , rule_row "OURO-CTR007" "contracts" "ensures-empty"
+      "@ensures annotation is empty"
+      "Write the postcondition or remove the annotation."
+  , rule_row "OURO-CTR008" "contracts" "modifies-empty"
+      "@modifies annotation is empty"
+      "Name the modified state or remove the annotation."
+  , rule_row "OURO-CX001" "complexity" "cyclomatic"
+      "cyclomatic complexity above the limit"
+      "Split the definition or factor arms into helpers."
+  , rule_row "OURO-CX002" "complexity" "cognitive"
+      "cognitive complexity above the limit"
+      "Flatten nested matches or extract helpers."
+  , rule_row "OURO-BND001" "bounds" "bound-violated"
+      "@bound claim does not hold"
+      "Shrink the definition or raise the claimed bound with a reason."
+  , rule_row "OURO-MIN001" "minimal" "not-minimal"
+      "@minimal definition has a smaller equivalent"
+      "Apply the rewrite named in the witness or drop @minimal."
+  , rule_row "OURO-DUP001" "duplication" "exact-clone"
+      "exact structural clone of an earlier definition"
+      "Reuse the earlier definition or parameterise the shared body."
+  , rule_row "OURO-DUP002" "duplication" "near-clone"
+      "near clone differing only in literals or holes"
+      "Parameterise the differing literal and share one definition."
+  , rule_row "OURO-TRUST002" "trust" "effect-boundary"
+      "trusted definition performs an effect without policy allowance"
+      "Keep the trusted checking path pure, or record the review with @trust-reviewed REASON."
+  , rule_row "OURO-TRUST003" "trust" "primitive-reach"
+      "untrusted definition reaches a trusted checking entry"
+      "Call the kernel through the compiler pipeline, or record the review with @trust-reviewed REASON."
+  , rule_row "OURO-TRUST004" "trust" "tainted-proof-path"
+      "trusted definition reads a taint source"
+      "Validate the input outside the trusted path, or record the review with @trust-reviewed REASON."
+  ];
+
+-- The trust family is forbid-level in the registry; every other structured
+-- family reports warnings.
+def rule_severity (r : RuleRow) : String :=
+    match prim_string_eq (rule_family r) "trust" with
+    | True => "error"
+    | False => "warning"
+    end;
+
+def rule_rows : List (Pair String RuleRow) :=
+    append (Pair String RuleRow) shape_rules claim_rules;
+
+def rule_of_code (code : String) : RuleRow :=
+    match lookup String RuleRow prim_string_eq code rule_rows with
+    | Just r => r
+    | Nothing =>
+        MkRule "structured" "unknown" "structured analyzer finding"
+          "See tools/analyze/README.md for the family table."
+    end;
+
+def finding_cat (a : String) (b : String) : String := prim_string_concat a b;
+
+def finding_cat3 (a : String) (b : String) (c : String) : String :=
+    prim_string_concat a (prim_string_concat b c);
+
+def shown_line (n : Nat) : Nat :=
+    match n with
+    | Z => S Z
+    | S _ => n
+    end;
+
+-- `def NAME: WITNESS`; findings anchored to a comment block instead of a
+-- definition carry an empty name and show the witness alone.
+def show_witness (f : Finding) : String :=
+    match prim_string_length (finding_def f) with
+    | Z => finding_witness f
+    | S _ =>
+        finding_cat3 "def " (finding_def f) (finding_cat ": " (finding_witness f))
+    end;
+
+-- path:line:1: severity[CODE] family/rule: message + hint + witness, the
+-- same shape tools/analyze/main.ouro prints for host facts.
+def show_finding (path : String) (f : Finding) : String :=
+    let r : RuleRow := rule_of_code (finding_code f) in
+    let loc : String :=
+      finding_cat3 path ":"
+        (finding_cat (prim_string_of_nat (shown_line (finding_line f)))
+          (finding_cat3 ":1: " (rule_severity r) "[")) in
+    let head : String :=
+      finding_cat3 loc (finding_code f)
+        (finding_cat3 "] " (rule_family r)
+          (finding_cat3 "/" (rule_name r) (finding_cat ": " (rule_message r)))) in
+    finding_cat3 head
+      (finding_cat "\n  hint: " (rule_hint r))
+      (finding_cat "\n  witness: " (show_witness f));
+
+def finding_eq (a : Finding) (b : Finding) : Bool :=
+    andb (prim_string_eq (finding_code a) (finding_code b))
+      (andb (eq_nat (finding_line a) (finding_line b))
+        (andb (prim_string_eq (finding_def a) (finding_def b))
+          (prim_string_eq (finding_witness a) (finding_witness b))));
+
+def str_lt (a : String) (b : String) : Bool :=
+    andb (prim_string_le a b) (notb (prim_string_eq a b));
+
+-- Line, then code, then witness: deterministic output for golden files.
+def finding_le (a : Finding) (b : Finding) : Bool :=
+    match ltb_nat (finding_line a) (finding_line b) with
+    | True => True
+    | False =>
+        match eq_nat (finding_line a) (finding_line b) with
+        | False => False
+        | True =>
+            match str_lt (finding_code a) (finding_code b) with
+            | True => True
+            | False =>
+                match prim_string_eq (finding_code a) (finding_code b) with
+                | False => False
+                | True => prim_string_le (finding_witness a) (finding_witness b)
+                end
+            end
+        end
+    end;
+
+def dedupe_findings : List Finding -> List Finding :=
+  fix dedupe_findings (xs : List Finding) : List Finding :=
+    match xs with
+    | Nil => Nil Finding
+    | Cons f rest =>
+        match elem Finding finding_eq f rest with
+        | True => dedupe_findings rest
+        | False => Cons Finding f (dedupe_findings rest)
+        end
+    end;
+
+def sort_findings (xs : List Finding) : List Finding :=
+    sort_insert Finding finding_le xs;

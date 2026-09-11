@@ -1,0 +1,556 @@
+-- Ouro native lint CLI: walk paths, parse, run lint.ouro. IO only.
+
+-- @entry main
+
+import "../std/io.ouro";
+import "lint_host.ouro";
+
+-- The compiler lexer intentionally has its own character vocabulary. Importing
+-- std/fs here would pull std/char into the same flat tool cone, so keep the
+-- lint host's small checked filesystem seam local and typed.
+inductive LintFsError : Type :=
+  | LintFsEmptyPath : LintFsError
+  | LintFsMissing : String -> LintFsError
+  | LintFsExpectedFile : String -> LintFsError
+  | LintFsExpectedDirectory : String -> LintFsError
+  | LintFsOperationFailed : String -> String -> LintFsError;
+
+def lint_fs_error_message (e : LintFsError) : String :=
+    match e with
+    | LintFsEmptyPath => "filesystem path is empty"
+    | LintFsMissing path => concat "path not found: " path
+    | LintFsExpectedFile path => concat "expected file: " path
+    | LintFsExpectedDirectory path => concat "expected directory: " path
+    | LintFsOperationFailed op path =>
+        concat "filesystem " (concat op (concat " failed: " path))
+    end;
+
+def lint_fs_ok (A : Type) (x : A) : IO (Either LintFsError A) :=
+    io_pure (Either LintFsError A) (Right LintFsError A x);
+
+def lint_fs_err (A : Type) (e : LintFsError) : IO (Either LintFsError A) :=
+    io_pure (Either LintFsError A) (Left LintFsError A e);
+
+def lint_fs_check_file (path : String) : IO (Either LintFsError Unit) :=
+    match prim_string_eq path "" with
+    | True => lint_fs_err Unit LintFsEmptyPath
+    | False =>
+        do let! exists := prim_fs_exists path;
+           match exists with
+           | False => lint_fs_err Unit (LintFsMissing path)
+           | True =>
+               do let! isdir := prim_fs_is_dir path;
+                  match isdir with
+                  | True => lint_fs_err Unit (LintFsExpectedFile path)
+                  | False => lint_fs_ok Unit MkUnit
+                  end
+           end
+    end;
+
+def lint_fs_check_dir (path : String) : IO (Either LintFsError Unit) :=
+    match prim_string_eq path "" with
+    | True => lint_fs_err Unit LintFsEmptyPath
+    | False =>
+        do let! exists := prim_fs_exists path;
+           match exists with
+           | False => lint_fs_err Unit (LintFsMissing path)
+           | True =>
+               do let! isdir := prim_fs_is_dir path;
+                  match isdir with
+                  | True => lint_fs_ok Unit MkUnit
+                  | False => lint_fs_err Unit (LintFsExpectedDirectory path)
+                  end
+           end
+    end;
+
+def lint_fs_read_checked (path : String) : IO (Either LintFsError String) :=
+    io_bind (Either LintFsError Unit) (Either LintFsError String)
+      (lint_fs_check_file path)
+      (fun (ready : Either LintFsError Unit) =>
+        match ready with
+        | Left e => lint_fs_err String e
+        | Right _ =>
+            io_bind String (Either LintFsError String)
+              (prim_fs_read_file path)
+              (fun (text : String) => lint_fs_ok String text)
+        end);
+
+def lint_fs_write_checked (path : String) (body : String)
+    : IO (Either LintFsError Unit) :=
+    match prim_string_eq path "" with
+    | True => lint_fs_err Unit LintFsEmptyPath
+    | False =>
+        do let! isdir := prim_fs_is_dir path;
+           match isdir with
+           | True => lint_fs_err Unit (LintFsExpectedFile path)
+           | False =>
+               do prim_fs_write_file path body;
+                  let! exists := prim_fs_exists path;
+                  match exists with
+                  | True => lint_fs_ok Unit MkUnit
+                  | False =>
+                      lint_fs_err Unit (LintFsOperationFailed "write" path)
+                  end
+           end
+    end;
+
+def lint_fs_mkdir_p_checked (path : String) : IO (Either LintFsError Unit) :=
+    match prim_string_eq path "" with
+    | True => lint_fs_err Unit LintFsEmptyPath
+    | False =>
+        do prim_fs_mkdir path;
+           let! isdir := prim_fs_is_dir path;
+           match isdir with
+           | True => lint_fs_ok Unit MkUnit
+           | False => lint_fs_err Unit (LintFsOperationFailed "mkdir" path)
+           end
+    end;
+
+def lint_path_basename (path : String) : String :=
+    let codes : List Nat := ncodes path in
+    match last_slash codes with
+    | Nothing => path
+    | Just i => nstr (drop Nat (S i) codes)
+    end;
+
+def lint_path_stem (path : String) : String :=
+    let base : String := lint_path_basename path in
+    match prim_string_ends base ".ouro" with
+    | True => prim_string_slice base Z (sub (prim_string_length base) 5)
+    | False => base
+    end;
+
+def lint_cat4 (a : String) (b : String) (c : String) (d : String) : String :=
+    concat a (concat b (concat c d));
+
+def skip_dir_names : List String :=
+    [ ".", "..", "_build", "_cache", "_opam", "_tools", ".git", "node_modules", "test", "tests",
+      "fixtures", "bench", "future" ];
+
+def skip_dir (name : String) : Bool :=
+    elem String prim_string_eq name skip_dir_names;
+
+-- ouro-structural: {"rule":"STRUCT_DUPLICATE_IMPLEMENTATION","category":"performance-specialization","related":["tools/analyze/drive_main.ouro#child"],"reason":"Keep lint and analyzer compilation cones separate; importing std/pathx introduces std/char declarations that collide with the lexer in the flat namespace."}
+def child (dir : String) (name : String) : String :=
+    match prim_string_length dir with
+    | Z => name
+    | S _ =>
+        match prim_string_eq dir "." with
+        | True => name
+        | False => concat dir (concat "/" name)
+        end
+    end;
+
+def walk_go : Nat -> List String -> List String -> IO (List String) :=
+  fix walk_go (fuel : Nat) (pending : List String) (acc : List String)
+      : IO (List String) :=
+    match fuel with
+    | Z => io_pure (List String) acc
+    | S fuel2 =>
+        match pending with
+        | Nil => io_pure (List String) acc
+        | Cons p rest =>
+            io_bind Bool (List String) (prim_fs_exists p)
+              (fun (ex : Bool) =>
+                match ex with
+                | False => walk_go fuel2 rest acc
+                | True =>
+                    io_bind Bool (List String) (prim_fs_is_dir p)
+                      (fun (isdir : Bool) =>
+                        match isdir with
+                        | False =>
+                            match prim_string_ends p ".ouro" with
+                            | True =>
+                                walk_go fuel2 rest
+                                  (Cons String p acc)
+                            | False => walk_go fuel2 rest acc
+                            end
+                        | True =>
+                            io_bind (List String) (List String)
+                              (prim_fs_list_dir p)
+                              (fun (names : List String) =>
+                                let kids : List String :=
+                                  map String String (child p)
+                                    (filter String
+                                      (fun (n : String) => notb (skip_dir n))
+                                      names) in
+                                walk_go fuel2
+                                  (append String kids rest) acc)
+                        end)
+                end)
+        end
+    end;
+
+def walk_root (root : String) : IO (List String) :=
+    walk_go (mul 128 128) (singleton String root) (Nil String);
+
+def gather (roots : List String) : IO (List String) :=
+  io_fold String (List String)
+    (fun (acc : List String) (r : String) =>
+      io_bind (List String) (List String) (walk_root r)
+        (fun (more : List String) =>
+          io_pure (List String) (append String acc more)))
+    (Nil String) roots;
+
+def defaults : List String := ["std", "compiler", "tools/analyze", "samples", "tools"];
+
+def emit_lines (xs : List String) : IO Nat :=
+  io_bind Unit Nat (io_foreach String println xs)
+    (fun (_ : Unit) => io_pure Nat (length String xs));
+
+def lint_fail (path : String) (e : LintFsError) : IO Nat :=
+    io_bind Unit Nat
+      (eprintln (concat path (concat ": " (lint_fs_error_message e))))
+      (fun (_ : Unit) => io_pure Nat (S Z));
+
+def snoc_resolved (from : String) (xs : List String) (acc : List String)
+    : List String :=
+  foldl String (List String)
+    (fun (a : List String) (n : String) => snoc_str a (resolve_import from n))
+    acc xs;
+
+-- Names and constructor names harvested from the transitive import cone.
+-- Harvests are appended without dedup: consumers only test membership, and a
+-- dedup insert per name walked a list of thousands for every name in the cone.
+def known_pair (names : List String) (ctors : List String)
+    : Pair (List String) (List String) :=
+    MkPair (List String) (List String) names ctors;
+
+def known_go : Nat -> List String -> List String -> List String -> List String
+    -> IO (Pair (List String) (List String)) :=
+  fix known_go (fuel : Nat) (pending : List String) (seen : List String)
+      (names : List String) (ctors : List String)
+      : IO (Pair (List String) (List String)) :=
+    match fuel with
+    | Z => io_pure (Pair (List String) (List String)) (known_pair names ctors)
+    | S fuel2 =>
+        match pending with
+        | Nil => io_pure (Pair (List String) (List String)) (known_pair names ctors)
+        | Cons p rest =>
+            match mem_str p seen with
+            | True => known_go fuel2 rest seen names ctors
+            | False =>
+                io_bind Bool (Pair (List String) (List String)) (prim_fs_exists p)
+                  (fun (ex : Bool) =>
+                    match ex with
+                    | False => known_go fuel2 rest (snoc_str seen p) names ctors
+                    | True =>
+                        io_bind Bool (Pair (List String) (List String))
+                          (prim_fs_is_dir p)
+                          (fun (isdir : Bool) =>
+                            match isdir with
+                            | True =>
+                                known_go fuel2 rest (snoc_str seen p) names ctors
+                            | False =>
+                                io_bind (Either LintFsError String)
+                                  (Pair (List String) (List String))
+                                  (lint_fs_read_checked p)
+                                  (fun (loaded : Either LintFsError String) =>
+                                    either LintFsError String
+                                      (IO (Pair (List String) (List String)))
+                                      (fun (_ : LintFsError) =>
+                                        known_go fuel2 rest
+                                          (snoc_str seen p) names ctors)
+                                      (fun (src : String) =>
+                                        known_go fuel2
+                                          (snoc_resolved p
+                                            (harvest_imports src) rest)
+                                          (snoc_str seen p)
+                                          (append String (harvest_names src) names)
+                                          (append String (harvest_ctor_names src)
+                                            ctors))
+                                      loaded)
+                            end)
+                    end)
+            end
+        end
+    end;
+
+def seed_imports : List String -> IO (List String) :=
+  fix seed_imports (xs : List String) : IO (List String) :=
+    match xs with
+    | Nil => io_pure (List String) (Nil String)
+    | Cons p rest =>
+        io_bind Bool (List String) (prim_fs_exists p)
+          (fun (ex : Bool) =>
+            match ex with
+            | False => seed_imports rest
+            | True =>
+                io_bind Bool (List String) (prim_fs_is_dir p)
+                  (fun (isdir : Bool) =>
+                    match isdir with
+                    | True => seed_imports rest
+                    | False =>
+                        io_bind (Either LintFsError String) (List String)
+                          (lint_fs_read_checked p)
+                          (fun (loaded : Either LintFsError String) =>
+                            either LintFsError String (IO (List String))
+                              (fun (_ : LintFsError) => seed_imports rest)
+                              (fun (src : String) =>
+                                io_bind (List String) (List String)
+                                  (seed_imports rest)
+                                  (fun (acc : List String) =>
+                                    io_pure (List String)
+                                      (snoc_resolved p
+                                        (harvest_imports src) acc)))
+                              loaded)
+                    end)
+            end)
+    end;
+
+def collect_known (files : List String) : IO (Pair (List String) (List String)) :=
+    io_bind (List String) (Pair (List String) (List String)) (seed_imports files)
+      (fun (imps : List String) =>
+        known_go (mul 128 128) imps (Nil String) (Nil String) (Nil String));
+
+def lint_src (path : String) (src : String) : IO Nat :=
+    io_bind (Pair (List String) (List String)) Nat
+      (collect_known (singleton String path))
+      (fun (known : Pair (List String) (List String)) =>
+        match known with
+        | MkPair names ctors => emit_lines (lint_lines path src names ctors)
+        end);
+
+def lint_path (path : String) : IO Nat :=
+    io_bind (Either LintFsError String) Nat (lint_fs_read_checked path)
+      (fun (loaded : Either LintFsError String) =>
+        either LintFsError String (IO Nat)
+          (lint_fail path) (lint_src path) loaded);
+
+def lint_paths (xs : List String) : IO Nat :=
+  io_fold String Nat
+    (fun (n : Nat) (p : String) =>
+      io_bind Nat Nat (lint_path p)
+        (fun (m : Nat) => io_pure Nat (add n m)))
+    Z xs;
+
+def root_missing (r : String) : IO Nat :=
+    io_bind Bool Nat (prim_fs_exists r)
+      (fun (ex : Bool) =>
+        match ex with
+        | True => io_pure Nat Z
+        | False =>
+            io_bind Unit Nat
+              (eprintln (lint_fs_error_message (LintFsMissing r)))
+              (fun (_ : Unit) => io_pure Nat (S Z))
+        end);
+
+def start (argv : List String) : IO Unit :=
+    let roots : List String :=
+      match tail String argv with
+      | Nil => defaults
+      | Cons x xs => Cons String x xs
+      end in
+    io_bind Nat Unit (io_fold String Nat
+        (fun (n : Nat) (r : String) =>
+          io_bind Nat Nat (root_missing r)
+            (fun (m : Nat) => io_pure Nat (add n m)))
+        Z roots)
+      (fun (missing : Nat) =>
+        match missing with
+        | S _ => exit (S Z)
+        | Z =>
+            io_bind (List String) Unit (gather roots)
+              (fun (files : List String) =>
+                io_bind Nat Unit (lint_paths files)
+                  (fun (n : Nat) =>
+                    match n with
+                    | Z => exit Z
+                    | S _ => exit (S Z)
+                    end))
+        end);
+
+def lint_selftest_write (path : String) (body : String) : IO Unit :=
+    do let! written := lint_fs_write_checked path body;
+       match written with
+       | Left e =>
+           do eprintln (concat "LINT_SUITE: FAIL " (lint_fs_error_message e));
+              exit (S Z)
+       | Right _ => io_unit
+       end
+
+
+def lint_selftest_output_path (out : String) (label : String) (path : String)
+    (suffix : String) : String :=
+    child out
+      (lint_cat4 label "_" (lint_path_stem path) suffix);
+
+
+def lint_selftest_case_pass (expect_findings : Bool) (r : ProcResult) : Bool :=
+    match expect_findings with
+    | True =>
+        andb (eqNat (proc_code r) (S Z))
+          (andb (notb (prim_string_eq (proc_stdout r) ""))
+            (prim_string_eq (proc_stderr r) ""))
+    | False =>
+        andb (eqNat (proc_code r) Z)
+          (andb (prim_string_eq (proc_stdout r) "")
+            (prim_string_eq (proc_stderr r) ""))
+    end;
+
+
+def lint_selftest_case_finish (expect_findings : Bool) (path : String)
+    (r : ProcResult) : IO Bool :=
+    match lint_selftest_case_pass expect_findings r with
+    | True => io_pure Bool True
+    | False =>
+        match expect_findings with
+        | True =>
+            do println (concat "MISS " path);
+               io_pure Bool False
+        | False =>
+            do println (concat "FP " path);
+               io_foreach String
+                 (fun (line : String) => println (concat "  " line))
+                 (prim_string_split (proc_stdout r) ch_lf);
+               io_pure Bool False
+        end
+    end;
+
+
+def lint_selftest_write_result (stdout_path : String) (stderr_path : String)
+    (result : ProcResult) : IO Unit :=
+    match result with
+    | MkProcResult _ stdout stderr =>
+        do lint_selftest_write stdout_path stdout;
+           lint_selftest_write stderr_path stderr
+    end;
+
+
+def lint_selftest_write_case (label : String) (out : String) (path : String)
+    (result : ProcResult) : IO Unit :=
+    lint_selftest_write_result
+      (lint_selftest_output_path out label path ".out")
+      (lint_selftest_output_path out label path ".err") result;
+
+
+def lint_selftest_process_case_result (expect_findings : Bool) (label : String)
+    (out : String) (path : String) (result : ProcResult) : IO Bool :=
+    io_bind Unit Bool (lint_selftest_write_case label out path result)
+      (fun (_ : Unit) => lint_selftest_case_finish expect_findings path result);
+
+
+def lint_selftest_read_case_failure (label : String) (out : String)
+    (path : String) (e : LintFsError) : IO Bool :=
+    let message : String := concat (lint_fs_error_message e) "\n" in
+    io_bind Unit Bool
+      (lint_selftest_write_case label out path (MkProcResult (S (S Z)) "" message))
+      (fun (_ : Unit) =>
+        io_bind Unit Bool
+          (eprintln (lint_cat4 "LINT_SUITE: FAIL " path ": "
+            (lint_fs_error_message e)))
+          (fun (_ : Unit) => io_pure Bool False));
+
+
+def lint_selftest_process_ready (exe : String) (expect_findings : Bool)
+    (label : String) (out : String) (path : String)
+    (ready : Either LintFsError String) : IO Bool :=
+    match ready with
+    | Left e => lint_selftest_read_case_failure label out path e
+    | Right _ =>
+        io_bind ProcResult Bool (proc_exec exe (singleton String path))
+          (fun (result : ProcResult) =>
+            lint_selftest_process_case_result expect_findings label out path result)
+    end;
+
+
+def lint_selftest_process_case (exe : String) (expect_findings : Bool)
+    (label : String) (out : String) (path : String) : IO Bool :=
+    io_bind (Either LintFsError String) Bool (lint_fs_read_checked path)
+      (fun (ready : Either LintFsError String) =>
+        lint_selftest_process_ready exe expect_findings label out path ready);
+
+
+def lint_selftest_files (exe : String) (expect_findings : Bool) (label : String)
+    (out : String) (paths : List String) : IO Nat :=
+    io_fold String Nat
+      (fun (failures : Nat) (path : String) =>
+        io_bind Bool Nat
+          (lint_selftest_process_case exe expect_findings label out path)
+          (fun (passed : Bool) =>
+            match passed with
+            | True => io_pure Nat failures
+            | False => io_pure Nat (S failures)
+            end))
+      Z paths;
+
+
+def lint_selftest_paths (root : String)
+    : IO (Either LintFsError (List String)) :=
+    do let! ready := lint_fs_check_dir root;
+       match ready with
+       | Left e => lint_fs_err (List String) e
+       | Right _ =>
+           do let! names := prim_fs_list_dir root;
+              let files : List String :=
+                map String String (child root)
+                  (filter String (fun (path : String) =>
+                    prim_string_ends path ".ouro")
+                    (sort_insert String prim_string_le names)) in
+              lint_fs_ok (List String) files
+       end
+
+
+def lint_selftest_group (exe : String) (expect_findings : Bool) (label : String)
+    (root : String) (out : String) : IO Nat :=
+    do let! loaded := lint_selftest_paths root;
+       match loaded with
+       | Left e =>
+           do eprintln (concat "LINT_SUITE: FAIL " (lint_fs_error_message e));
+              io_pure Nat (S Z)
+       | Right paths =>
+           match paths with
+           | Nil =>
+               do eprintln (concat "LINT_SUITE: FAIL no fixtures under " root);
+                  io_pure Nat (S Z)
+           | Cons _ _ => lint_selftest_files exe expect_findings label out paths
+           end
+       end
+
+
+def lint_arg_value (prefix : String) (fallback : String) : List String -> String :=
+  fix lint_arg_value (xs : List String) : String :=
+    match xs with
+    | Nil => fallback
+    | Cons x rest =>
+        match prim_string_starts x prefix with
+        | True =>
+            let n : Nat := prim_string_length prefix in
+            prim_string_slice x n (sub (prim_string_length x) n)
+        | False => lint_arg_value rest
+        end
+    end;
+
+
+def run_lint_selftest (argv : List String) : IO Unit :=
+    let exe : String := nth String "" Z argv in
+    let out : String := lint_arg_value "--out=" "_build/tmp/lint_suite" argv in
+    let bad_root : String :=
+      lint_arg_value "--bad-root=" "_build/smith/fixtures/lint/bad" argv in
+    let good_root : String :=
+      lint_arg_value "--good-root=" "_build/smith/fixtures/lint/good" argv in
+    do let! made := lint_fs_mkdir_p_checked out;
+       match made with
+       | Left e =>
+           do eprintln (concat "LINT_SUITE: FAIL " (lint_fs_error_message e));
+              exit (S Z)
+       | Right _ =>
+           do println "=== bad (must report) ===";
+              let! bad := lint_selftest_group exe True "bad" bad_root out;
+              println (concat "bad_miss=" (of_nat bad));
+              println "=== good (must be clean) ===";
+              let! good := lint_selftest_group exe False "good" good_root out;
+              println (concat "good_fp=" (of_nat good));
+              match add bad good with
+              | Z => exit Z
+              | S _ => exit (S Z)
+              end
+       end
+
+
+def main : IO Unit :=
+    do let! argv := prim_argv;
+       match elem String prim_string_eq "--selftest" argv with
+       | True => run_lint_selftest argv
+       | False => start argv
+       end

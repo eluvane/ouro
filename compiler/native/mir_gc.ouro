@@ -1,0 +1,102 @@
+-- A NoGc body cannot allocate a managed value or enter a collector, including
+-- through recursion, imports or indirect calls. Raw OS storage is permitted.
+-- Call-site annotations are checked against this graph; they are not evidence
+-- from which the graph is inferred. Collector bodies and collector calls have
+-- deliberately different effects: their body must be NoGc, their call MayGc.
+import "mir_flow.ouro";
+
+def mir_gc_is_no_gc (gc : MirGc) : Bool :=
+    match gc with | MirNoGc => True | MirMayGc => False end;
+
+def mir_managed_collectors (program : MirProgram) : List Nat :=
+    foldr MirInstruction (List Nat) (fun (instruction : MirInstruction) (ids : List Nat) =>
+      match instruction with
+      | MirManagedAlloc _ _ collector _ _ => mir_add collector ids
+      | MirMove _ _ => ids | MirBinaryOp _ _ _ _ => ids | MirCompare _ _ _ _ => ids
+      | MirConvert _ _ _ => ids | MirLoad _ _ _ => ids | MirStore _ _ _ => ids
+      | MirLoadAt _ _ _ => ids | MirStoreAt _ _ _ => ids
+      | MirAddress _ _ => ids | MirPointerAdd _ _ _ => ids | MirCall _ _ _ _ => ids
+      | MirManagedContext _ => ids end) ([] : List Nat) (mir_program_instructions program);
+
+def mir_gc_target_no_gc (libraries : List MirLibrary) (collectors : List Nat)
+    (bodies : List Nat) (target : MirCallTarget) : Bool :=
+    match target with
+    | MirIndirect _ _ => False
+    | MirDirect id => match mir_has id collectors with | True => False | False =>
+        match mir_has id bodies with | True => True | False =>
+          match mir_find_extern id libraries with | Nothing => False
+          | Just external => match external with | MirExternDef gc _ _ _ => mir_gc_is_no_gc gc end end end end end;
+
+def mir_gc_body_no_gc (libraries : List MirLibrary) (collectors : List Nat)
+    (bodies : List Nat) (function : MirFunction) : Bool :=
+    match function with | MirFunctionDef _ _ _ _ _ _ blocks =>
+      all MirBlock (fun (block : MirBlock) => match block with | MirBlockDef _ instructions _ =>
+        all MirInstruction (fun (instruction : MirInstruction) => match instruction with
+          | MirManagedAlloc _ _ _ _ _ => False
+          | MirCall _ _ target _ => mir_gc_target_no_gc libraries collectors bodies target
+          | MirMove _ _ => True | MirBinaryOp _ _ _ _ => True | MirCompare _ _ _ _ => True
+          | MirConvert _ _ _ => True | MirLoad _ _ _ => True | MirStore _ _ _ => True
+          | MirLoadAt _ _ _ => True | MirStoreAt _ _ _ => True
+          | MirAddress _ _ => True | MirPointerAdd _ _ _ => True | MirManagedContext _ => True end)
+          instructions end) blocks end;
+
+-- Start with all bodies and remove any body whose outgoing call escapes the
+-- set. A closed recursive SCC remains NoGc; a MayGc exit removes the complete
+-- SCC. Each changed round strictly shrinks the set. The existing flow budget
+-- bounds rounds and an unfinished classification is always a resource error.
+def mir_gc_infer (fuel : Nat) (program : MirProgram) : Either MirError (List Nat) :=
+    match program with | MirProgramDef functions _ libraries _ =>
+      let collectors : List Nat := mir_managed_collectors program in
+      (fix classify (remaining : Nat) (candidates : List MirFunction) : Either MirError (List Nat) :=
+        match remaining with | Z => Left MirError (List Nat) MirResourceExhausted
+        | S next => let bodies : List Nat := map MirFunction Nat mir_function_id candidates in
+          let kept : List MirFunction := filter MirFunction
+            (mir_gc_body_no_gc libraries collectors bodies) candidates in
+          match eq_nat (length MirFunction kept) (length MirFunction candidates) with
+          | True => Right MirError (List Nat) bodies
+          | False => classify next kept end end) fuel functions end;
+
+def mir_gc_check_instruction (libraries : List MirLibrary) (collectors : List Nat)
+    (bodies : List Nat) (caller : Nat) (instruction : MirInstruction) : Either MirError Unit :=
+    match instruction with
+    | MirCall gc _ target _ =>
+        mir_require (orb (notb (mir_gc_is_no_gc gc)) (mir_gc_target_no_gc libraries collectors bodies target))
+          (MirGcCallMismatch caller (match target with | MirDirect id => id | MirIndirect _ _ => 0 end))
+    | MirManagedAlloc _ allocator collector _ _ =>
+        match mir_require (mir_has allocator bodies) (MirGcUnsafeRuntime allocator) with
+        | Left err => Left MirError Unit err
+        | Right _ => mir_require (mir_has collector bodies) (MirGcUnsafeRuntime collector) end
+    | MirMove _ _ => Right MirError Unit MkUnit | MirBinaryOp _ _ _ _ => Right MirError Unit MkUnit
+    | MirCompare _ _ _ _ => Right MirError Unit MkUnit | MirConvert _ _ _ => Right MirError Unit MkUnit
+    | MirLoad _ _ _ => Right MirError Unit MkUnit | MirStore _ _ _ => Right MirError Unit MkUnit
+    | MirLoadAt _ _ _ => Right MirError Unit MkUnit | MirStoreAt _ _ _ => Right MirError Unit MkUnit
+    | MirAddress _ _ => Right MirError Unit MkUnit | MirPointerAdd _ _ _ => Right MirError Unit MkUnit
+    | MirManagedContext _ => Right MirError Unit MkUnit end;
+
+def mir_gc_check (program : MirProgram) (bodies : List Nat) : Either MirError Unit :=
+    match program with | MirProgramDef functions _ libraries _ =>
+      let collectors : List Nat := mir_managed_collectors program in
+      mir_each MirFunction (fun (function : MirFunction) => match function with
+        | MirFunctionDef id _ _ _ _ _ blocks => mir_each MirBlock (fun (block : MirBlock) => match block with
+          | MirBlockDef _ instructions _ =>
+            mir_each MirInstruction (mir_gc_check_instruction libraries collectors bodies id) instructions end) blocks end) functions end;
+
+-- Used only to finish newly lowered MIR. Public validation never calls this
+-- rewrite: a forged NoGc annotation must be rejected, not silently repaired.
+def mir_gc_annotate (program : MirProgram) (bodies : List Nat) : MirProgram :=
+    match program with | MirProgramDef functions objects libraries entry =>
+      let collectors : List Nat := mir_managed_collectors program in
+      MirProgramDef (map MirFunction MirFunction (fun (function : MirFunction) => match function with
+        | MirFunctionDef id name args locals result first blocks =>
+          MirFunctionDef id name args locals result first
+            (map MirBlock MirBlock (fun (block : MirBlock) => match block with | MirBlockDef block_id instructions term =>
+              MirBlockDef block_id (map MirInstruction MirInstruction (fun (instruction : MirInstruction) =>
+                match instruction with | MirCall _ dest target values => MirCall
+                    (match mir_gc_target_no_gc libraries collectors bodies target with | True => MirNoGc | False => MirMayGc end)
+                    dest target values
+                | MirMove _ _ => instruction | MirBinaryOp _ _ _ _ => instruction | MirCompare _ _ _ _ => instruction
+                | MirConvert _ _ _ => instruction | MirLoad _ _ _ => instruction | MirStore _ _ _ => instruction
+                | MirLoadAt _ _ _ => instruction | MirStoreAt _ _ _ => instruction
+                | MirAddress _ _ => instruction | MirPointerAdd _ _ _ => instruction
+                | MirManagedAlloc _ _ _ _ _ => instruction | MirManagedContext _ => instruction end) instructions) term end) blocks)
+          end) functions) objects libraries entry end;

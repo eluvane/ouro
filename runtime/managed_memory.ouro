@@ -1,0 +1,54 @@
+-- Internal raw storage helpers for the native managed runtime. Only the
+-- compiler's allocation bridge publishes ManagedPtr values. These helpers
+-- receive live, aligned storage and never expose a source RawPtr-to-value cast.
+import "platform/windows_x64.ouro";
+
+intrinsic managed_load_size : RawPtr USize -> Runtime USize := "ouro.raw.load" USize;
+intrinsic managed_store_size : RawPtr USize -> USize -> Runtime Unit := "ouro.raw.store" USize;
+intrinsic managed_shift_right : USize -> U32 -> USize := "ouro.usize.shr";
+
+-- The registry guarantees this checked conversion of literal 1 succeeds.
+def managed_one (anchor : USize) : USize :=
+    let one : USize := raw_one anchor in one;
+
+def managed_word_offset (index : USize) : USize :=
+    let scaled : USize := raw_times_eight index in scaled;
+
+-- Word indices are bounded by the caller's descriptor, object or frame size.
+def managed_read_word (base : RawPtr U8) (index : USize) : Runtime USize :=
+    runtime_bind (RawPtr U8) USize (raw_add U8 base (managed_word_offset index))
+      (fun (address : RawPtr U8) => runtime_bind (RawPtr USize) USize (raw_cast U8 USize address)
+        (fun (cell : RawPtr USize) => managed_load_size cell));
+
+def managed_write_word (base : RawPtr U8) (index : USize) (value : USize) : Runtime Unit :=
+    runtime_bind (RawPtr U8) Unit (raw_add U8 base (managed_word_offset index))
+      (fun (address : RawPtr U8) => runtime_bind (RawPtr USize) Unit (raw_cast U8 USize address)
+        (fun (cell : RawPtr USize) => managed_store_size cell value));
+
+def managed_read_pointer (base : RawPtr U8) (index : USize) : Runtime (RawPtr U8) :=
+    runtime_bind USize (RawPtr U8) (managed_read_word base index)
+      (fun (bits : USize) => raw_from_bits U8 bits);
+
+def managed_write_pointer (base : RawPtr U8) (index : USize) (value : RawPtr U8) : Runtime Unit :=
+    runtime_bind USize Unit (raw_to_bits U8 value)
+      (fun (bits : USize) => managed_write_word base index bits);
+
+def managed_read_u32 (base : RawPtr U8) (offset : USize) : Runtime U32 :=
+    let result : Runtime U32 := raw_load_word_at base offset in result;
+
+def managed_pointer_is_null (pointer : RawPtr U8) : Runtime Bool :=
+    runtime_bind USize Bool (raw_to_bits U8 pointer)
+      (fun (bits : USize) => runtime_pure Bool (usize_equal bits (usize_sub bits bits)));
+
+def managed_panic (anchor : USize) : Runtime Unit :=
+    match u32_from_nat 73 with | Just code => raw_windows_panic_code code
+    | Nothing => raw_windows_panic_code (raw_size_to_u32 (usize_sub anchor anchor)) end;
+
+def managed_require (valid : Bool) (anchor : USize) : Runtime Unit :=
+    match valid with | True => runtime_pure Unit MkUnit | False => managed_panic anchor end;
+
+def managed_increment (scratch : RawPtr U8) (index : USize) : Runtime Unit :=
+    runtime_bind USize Unit (managed_read_word scratch index) (fun (value : USize) =>
+      let next : USize := usize_add value (managed_one value) in
+      runtime_bind Unit Unit (managed_require (usize_less value next) value)
+        (fun (checked : Unit) => managed_write_word scratch index next));

@@ -1,0 +1,114 @@
+-- Compiler-owned integration for explicitly declared primitive identities.
+-- The registry describes signatures; ordinary Core checking owns conversion.
+
+import "file_elab_term.ouro";
+import "primitive_registry.ouro";
+
+def check_from_primitive (A : Type) (result : Either PrimitiveError A) : CheckResult A :=
+    match result with
+    | Right value => CheckOk A value
+    | Left failure =>
+        match failure with
+        | PrimitiveResourceExhausted => CheckErr A CheckResourceLimit
+        | PrimitiveUnknownKey => CheckErr A (CheckPrimitiveFailure failure)
+        | PrimitiveMissingType _ => CheckErr A (CheckPrimitiveFailure failure)
+        | PrimitiveDuplicateType _ => CheckErr A (CheckPrimitiveFailure failure)
+        | PrimitiveDuplicateName _ => CheckErr A (CheckPrimitiveFailure failure)
+        | PrimitiveInvalidTypeBinding _ => CheckErr A (CheckPrimitiveFailure failure)
+        | PrimitiveMissingRole _ => CheckErr A (CheckPrimitiveFailure failure)
+        | PrimitiveDuplicateRole _ => CheckErr A (CheckPrimitiveFailure failure)
+        | PrimitiveInvalidRole _ => CheckErr A (CheckPrimitiveFailure failure)
+        | PrimitiveUnsupportedTarget => CheckErr A (CheckPrimitiveFailure failure)
+        | PrimitiveUnsupportedAbi => CheckErr A (CheckPrimitiveFailure failure)
+        | PrimitiveInvalidExternName => CheckErr A (CheckPrimitiveFailure failure)
+        | PrimitiveVariadicExtern => CheckErr A (CheckPrimitiveFailure failure)
+        | PrimitiveDependentAbi => CheckErr A (CheckPrimitiveFailure failure)
+        | PrimitiveUnsupportedAbiType => CheckErr A (CheckPrimitiveFailure failure)
+        | PrimitiveRuntimeResultRequired => CheckErr A (CheckPrimitiveFailure failure)
+        | PrimitiveInvalidFunctionPointer => CheckErr A (CheckPrimitiveFailure failure)
+        | PrimitiveSpecializationRequired => CheckErr A (CheckPrimitiveFailure failure)
+        | PrimitiveUnexpectedSpecialization => CheckErr A (CheckPrimitiveFailure failure)
+        | PrimitiveInvalidConversion => CheckErr A (CheckPrimitiveFailure failure)
+        | PrimitiveInvalidLayout _ => CheckErr A (CheckPrimitiveFailure failure)
+        end
+    end;
+
+def primitive_environment : List Entry -> List PrimitiveResolved :=
+  fix collect (entries : List Entry) : List PrimitiveResolved :=
+    match entries with
+    | Nil => Nil PrimitiveResolved
+    | Cons entry rest =>
+        match entry with
+        | MkEntry _ _ _ => collect rest
+        | MkIndEntry _ _ => collect rest
+        | MkRoleEntry _ => collect rest
+        | MkBoundEntry name typ binding =>
+            match binding with
+            | PrimitiveIntrinsicBinding id _ _ _ =>
+                Cons PrimitiveResolved (PrimitiveResolvedAs name id typ) (collect rest)
+            | PrimitiveExternBinding _ => collect rest
+            end
+        end
+    end;
+
+-- Called only with already checked type syntax. Conversion never invokes
+-- native code, including operations classified as pure by the runtime.
+def primitive_normalizer_indexed (sig : CheckEnvironment) (fuel : Nat) (term : CoreTerm)
+    : Either PrimitiveError CoreTerm :=
+    match normalize_checked_indexed fuel sig term with
+    | Normalized normal => Right PrimitiveError CoreTerm normal
+    | NormalizeExhausted => Left PrimitiveError CoreTerm PrimitiveResourceExhausted
+    | NormalizeMalformed _ => Left PrimitiveError CoreTerm PrimitiveUnsupportedAbiType
+    end;
+
+-- The registry has its own bounded workload. A larger module budget must not
+-- reject a declaration that fits this bound; actual exhaustion still propagates.
+def primitive_check_budget (fuel : Nat) : Nat :=
+    match compiler_le_nat fuel primitive_max_fuel with
+    | True => fuel
+    | False => primitive_max_fuel
+    end;
+
+-- Preserve the checked, fully normalized specialization for native lowering.
+-- A later consumer must not recover its type by interpreting the source key.
+def primitive_normalized_specialization_indexed (fuel : Nat) (sig : CheckEnvironment)
+    (specialization : Maybe CoreTerm) : CheckResult (Maybe CoreTerm) :=
+    match specialization with
+    | Nothing => CheckOk (Maybe CoreTerm) (Nothing CoreTerm)
+    | Just annotation => check_map CoreTerm (Maybe CoreTerm)
+        (fun (normal : CoreTerm) => Just CoreTerm normal)
+        (check_from_normalize CoreTerm (normalize_checked_indexed fuel sig annotation))
+    end;
+
+def primitive_checked_intrinsic_indexed (fuel : Nat) (sig : CheckEnvironment)
+    (roles : List PrimitiveRoleBinding) (name : Nat) (typ : CoreTerm)
+    (key : List Nat) (specialization : Maybe CoreTerm) : CheckResult PrimitiveBinding :=
+    let earlier : List PrimitiveResolved := primitive_environment (check_environment_entries sig) in
+    let registry_fuel : Nat := primitive_check_budget fuel in
+    check_bind PrimitiveId PrimitiveBinding (check_from_primitive PrimitiveId (primitive_decode registry_fuel key))
+      (fun (id : PrimitiveId) =>
+        check_bind (Maybe CoreTerm) PrimitiveBinding
+          (primitive_normalized_specialization_indexed registry_fuel sig specialization)
+          (fun (normal : Maybe CoreTerm) =>
+            check_bind CoreTerm PrimitiveBinding
+              (check_from_primitive CoreTerm
+                (primitive_expected_signature registry_fuel (primitive_normalizer_indexed sig) earlier roles id normal))
+              (fun (expected : CoreTerm) =>
+                check_bind Unit PrimitiveBinding (check_convertible_indexed fuel sig typ expected)
+                  (fun (_signature : Unit) =>
+                    check_map Unit PrimitiveBinding (fun (_unique : Unit) => primitive_binding id normal)
+                      (check_from_primitive Unit
+                        (primitive_validate_bindings registry_fuel (primitive_normalizer_indexed sig)
+                          (Cons PrimitiveResolved (PrimitiveResolvedAs name id typ) earlier)))))));
+
+def primitive_checked_extern_indexed (fuel : Nat) (sig : CheckEnvironment)
+    (roles : List PrimitiveRoleBinding) (typ : CoreTerm) (request : ExternRequest)
+    : CheckResult PrimitiveBinding :=
+    check_map CheckedExtern PrimitiveBinding (fun (external : CheckedExtern) => PrimitiveExternBinding external)
+      (check_from_primitive CheckedExtern
+        (primitive_check_extern (primitive_check_budget fuel) (primitive_normalizer_indexed sig)
+          (primitive_environment (check_environment_entries sig)) roles request typ));
+
+-- Compatibility entry points derive one lookup environment before recursive work.
+def primitive_normalizer (sig : List Entry) (fuel : Nat) (term : CoreTerm) : Either PrimitiveError CoreTerm :=
+    primitive_normalizer_indexed (check_environment_from_entries sig) fuel term;

@@ -1,0 +1,53 @@
+-- Checked helper identity retains every raw pointee and ordinary body.
+import "managed_realpath_strings.ouro";
+import "managed_runtime_symbols.ouro";
+
+inductive ManagedTempHelper : Type :=
+  | ManagedTempAllocate : ManagedTempHelper
+  | ManagedTempRelease : ManagedTempHelper
+  | ManagedTempCreate : ManagedTempHelper;
+
+def managed_temp_helper_name (helper : ManagedTempHelper) : List Nat :=
+    match helper with
+    | ManagedTempAllocate => managed_file_helper_name ManagedFileAllocate
+    | ManagedTempRelease => managed_file_helper_name ManagedFileRelease
+    | ManagedTempCreate => managed_runtime_symbol "raw_windows_temp_create" end;
+
+def managed_temp_expected (compiler : ManagedCompiler) (helper : ManagedTempHelper)
+    : Either NativeLowerError CoreTerm :=
+    match helper with
+    | ManagedTempAllocate => managed_file_expected compiler ManagedFileAllocate
+    | ManagedTempRelease => managed_file_expected compiler ManagedFileRelease
+    | ManagedTempCreate =>
+        let bindings : List PrimitiveResolved := primitive_environment (managed_compiler_entries compiler) in
+        lower_from_primitive CoreTerm (CSort 0)
+          (primitive_bind CoreTerm CoreTerm (primitive_type_ref PrimitiveRuntimeType bindings) (fun (runtime : CoreTerm) =>
+            primitive_bind CoreTerm CoreTerm (primitive_type_ref PrimitiveRawPtrType bindings) (fun (pointer : CoreTerm) =>
+              primitive_bind CoreTerm CoreTerm (primitive_type_ref PrimitiveU8Type bindings) (fun (byte : CoreTerm) =>
+                primitive_bind CoreTerm CoreTerm (primitive_type_ref PrimitiveU32Type bindings) (fun (word : CoreTerm) =>
+                  primitive_bind CoreTerm CoreTerm (primitive_type_ref PrimitiveUSizeType bindings) (fun (size : CoreTerm) =>
+                    primitive_map CoreTerm CoreTerm (fun (boolean : CoreTerm) =>
+                      primitive_arrow ([CApp pointer byte, size, boolean, CApp pointer byte, CApp pointer word] : List CoreTerm)
+                        (CApp runtime word))
+                      (primitive_role_ref PrimitiveBoolRole (primitive_roles_environment (managed_compiler_entries compiler))))))))) end;
+
+def managed_temp_roots (compiler : ManagedCompiler) (fuel : Nat) : Either NativeLowerError (List Nat) :=
+    match orb (managed_stdio_has compiler PrimitiveFileTemp) (managed_stdio_has compiler PrimitiveFileTempIn) with
+    | False => Right NativeLowerError (List Nat) ([] : List Nat)
+    | True => (fix resolve (helpers : List ManagedTempHelper) : Either NativeLowerError (List Nat) :=
+        match helpers with | Nil => Right NativeLowerError (List Nat) ([] : List Nat)
+        | Cons helper rest => lower_bind CoreTerm (List Nat) (managed_temp_expected compiler helper)
+            (fun (expected : CoreTerm) => lower_bind Nat (List Nat)
+              (managed_runtime_definition compiler fuel (managed_temp_helper_name helper) expected)
+              (fun (id : Nat) => lower_map (List Nat) (List Nat) (Cons Nat id) (resolve rest))) end)
+        ([ManagedTempAllocate, ManagedTempRelease, ManagedTempCreate] : List ManagedTempHelper) end;
+
+def managed_temp_call (compiler : ManagedCompiler) (source : MirValue) (bytes : MirValue)
+    (in_directory : Bool) (storage : MirValue) (count : MirValue) (state : ManagedState)
+    : Either NativeLowerError ManagedResult :=
+    lower_bind CoreTerm ManagedResult (managed_temp_expected compiler ManagedTempCreate) (fun (expected : CoreTerm) =>
+      lower_bind LowerContract ManagedResult
+        (managed_runtime_contract compiler primitive_default_fuel (managed_temp_helper_name ManagedTempCreate) expected)
+        (fun (contract : LowerContract) => managed_fresh MirU32 (fun (local : Nat) =>
+          MirCall MirMayGc (Just Nat local) (MirDirect (lower_contract_id contract))
+            ([source, bytes, managed_bits MirU8 (match in_directory with | True => 1 | False => 0 end), storage, count] : List MirValue)) state));

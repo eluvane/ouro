@@ -1,0 +1,76 @@
+-- Windows x86-64 raw platform adapter; no managed allocation or C shim.
+import "../native_types.ouro";
+
+-- One shared raw declaration prevents duplicate PE import names.
+extern windows_capture_sleep : U32 -> Runtime Unit :=
+    "windows-x86_64" "win64" "kernel32.dll" "Sleep" "nogc";
+
+extern windows_virtual_alloc : RawPtr U8 -> USize -> U32 -> U32 -> Runtime (RawPtr U8) :=
+    "windows-x86_64" "win64" "kernel32.dll" "VirtualAlloc" "nogc";
+extern windows_virtual_free : RawPtr U8 -> USize -> U32 -> Runtime U32 :=
+    "windows-x86_64" "win64" "kernel32.dll" "VirtualFree" "nogc";
+extern windows_exit_process : U32 -> Runtime Unit :=
+    "windows-x86_64" "win64" "kernel32.dll" "ExitProcess" "nogc";
+
+-- Panic uses a nonzero exit status even if the caller supplied zero. The
+-- adapter allocates no Ouro memory; Windows owns process/DLL termination.
+-- The checked conversion of literal 1 always yields Just under its registry
+-- contract, so its Nothing branch cannot execute on the supported native path.
+def raw_windows_panic_code (code : U32) : Runtime Unit :=
+    match u32_equal code (u32_sub code code) with
+    | False => windows_exit_process code
+    | True => match u32_from_nat 1 with
+      | Just one => windows_exit_process one
+      | Nothing => windows_exit_process (u32_sub code code) end end;
+
+-- Only the original live allocation base may be released. A null base is
+-- rejected; False preserves ownership and reports OS failure. True consumes
+-- ownership of the entire reservation. No pointer may be used afterwards.
+-- Null checking is not an ownership proof: Windows can accept a misaligned
+-- interior alias within the first page. Passing such an alias is outside this
+-- unsafe API's contract, even if VirtualFree happens to report success.
+def raw_pages_release (base : RawPtr U8) : Runtime Bool :=
+    runtime_bind USize Bool (raw_to_bits U8 base) (fun (address : USize) =>
+      let zero : USize := usize_sub address address in
+      match usize_equal address zero with | True => runtime_pure Bool False | False =>
+        match u32_from_nat 1 with | Nothing => runtime_pure Bool False | Just one =>
+          match u32_from_nat 15 with | Nothing => runtime_pure Bool False | Just shift =>
+            runtime_bind U32 Bool (windows_virtual_free base zero (u32_shift_left one shift))
+              (fun (released : U32) => runtime_pure Bool
+                (raw_bool_not (u32_equal released (u32_sub released released)))) end end end);
+
+-- Internal rejection path: consumes the original owner base after a failed
+-- post-allocation check. A cleanup failure terminates instead of losing the
+-- allocation behind a null result. Panic code must describe that failed check.
+def raw_pages_reject (base : RawPtr U8) (code : U32) : Runtime (RawPtr U8) :=
+    runtime_bind Bool (RawPtr U8) (raw_pages_release base) (fun (released : Bool) =>
+      match released with
+      | True => runtime_pure (RawPtr U8) (raw_null U8)
+      | False => runtime_bind Unit (RawPtr U8) (raw_windows_panic_code code)
+          (fun (unexpected : Unit) => runtime_pure (RawPtr U8) base) end);
+
+-- Returns a zero-initialized, writable allocation of at least bytes bytes,
+-- aligned to alignment. Both must be positive, alignment a power of two, and
+-- rounding must fit USize. Invalid input or OS failure returns null.
+-- The returned pointer is the owner base: release exactly once with
+-- raw_pages_release. This API creates no managed object or collector root.
+-- Windows may decline an alignment; a misaligned reservation is released.
+-- Failure to release that rejected reservation panics, never loses ownership
+-- while pretending that cleanup succeeded.
+def raw_pages_allocate (bytes : USize) (alignment : USize) : Runtime (RawPtr U8) :=
+    let zero : USize := usize_sub bytes bytes in
+    let rounded : USize := raw_size_round_up bytes alignment in
+    match usize_equal rounded zero with | True => runtime_pure (RawPtr U8) (raw_null U8)
+    | False => match u32_from_nat 3 with | Nothing => runtime_pure (RawPtr U8) (raw_null U8)
+      | Just flags => match u32_from_nat 12 with | Nothing => runtime_pure (RawPtr U8) (raw_null U8)
+        | Just shift => match u32_from_nat 4 with | Nothing => runtime_pure (RawPtr U8) (raw_null U8)
+          | Just writable => match usize_from_nat 1 with | Nothing => runtime_pure (RawPtr U8) (raw_null U8)
+            | Just one => runtime_bind (RawPtr U8) (RawPtr U8)
+              (windows_virtual_alloc (raw_null U8) rounded (u32_shift_left flags shift) writable)
+              (fun (base : RawPtr U8) => runtime_bind USize (RawPtr U8) (raw_to_bits U8 base)
+                (fun (address : USize) => match usize_equal address zero with
+                  | True => runtime_pure (RawPtr U8) (raw_null U8)
+                  | False => match usize_equal (usize_and address (usize_sub alignment one)) zero with
+                    | True => runtime_pure (RawPtr U8) base
+                    | False => raw_pages_reject base flags end end))
+            end end end end end;

@@ -1,0 +1,77 @@
+-- Raw Windows paths are nonempty UTF-16 sequences with one trailing zero.
+-- Length excludes that terminator. The caller owns units+1 readable units;
+-- arithmetic/range checks do not prove that arbitrary memory is readable.
+import "windows_common.ouro";
+
+def raw_windows_wide_unit (base : RawPtr U8) (index : USize) (one : USize) : Runtime USize :=
+    let two : USize := usize_add one one in
+    let four : USize := usize_add two two in
+    let eight : USize := usize_add four four in
+    runtime_bind (RawPtr U8) USize (raw_add U8 base (usize_add index index)) (fun (first : RawPtr U8) =>
+      runtime_bind U8 USize (raw_load_u8 first) (fun (low : U8) =>
+        runtime_bind (RawPtr U8) USize (raw_add U8 first one) (fun (second : RawPtr U8) =>
+          runtime_bind U8 USize (raw_load_u8 second) (fun (high : U8) =>
+            runtime_pure USize (usize_add (raw_u32_to_size (u8_to_u32 low))
+              (usize_shift_left (raw_u32_to_size (u8_to_u32 high)) (raw_size_to_u32 eight)))))));
+
+-- The failure sentinel units+1 ends the loop. A high surrogate consumes its
+-- following low surrogate; isolated surrogates and embedded zeroes fail.
+def raw_windows_path_step (base : RawPtr U8) (units : USize) (index : USize) (one : USize) : Runtime USize :=
+    let zero : USize := usize_sub one one in
+    let two : USize := usize_add one one in
+    let four : USize := usize_add two two in
+    let eight : USize := usize_add four four in
+    let sixteen : USize := usize_add eight eight in
+    let twentyseven : USize := usize_add sixteen (usize_add eight (usize_add two one)) in
+    let high_start : USize := usize_shift_left twentyseven (raw_size_to_u32 (usize_add eight (usize_add two one))) in
+    let low_start : USize := usize_add high_start (usize_shift_left one (raw_size_to_u32 (usize_add eight two))) in
+    let after_surrogates : USize := usize_add low_start (usize_sub low_start high_start) in
+    let next : USize := usize_add index one in
+    let invalid : USize := usize_add units one in
+    runtime_bind USize USize (raw_windows_wide_unit base index one) (fun (code : USize) =>
+      match usize_equal code zero with | True => runtime_pure USize invalid | False =>
+        match usize_less code high_start with | True => runtime_pure USize next | False =>
+          match usize_less code after_surrogates with | False => runtime_pure USize next | True =>
+            match raw_bool_and (usize_less code low_start) (usize_less next units) with
+            | False => runtime_pure USize invalid
+            | True => runtime_bind USize USize (raw_windows_wide_unit base next one) (fun (low : USize) =>
+                runtime_pure USize (match raw_bool_and (raw_bool_not (usize_less low low_start))
+                  (usize_less low after_surrogates) with
+                  | True => usize_add next one | False => invalid end)) end end end end);
+
+def raw_windows_path_valid (base : RawPtr U8) (units : USize) (one : USize) : Runtime Bool :=
+    let zero : USize := usize_sub one one in
+    match raw_bool_and (raw_bool_not (usize_equal units zero))
+      (raw_bool_not (usize_less (raw_windows_int_max one) units)) with
+    | False => runtime_pure Bool False
+    | True => let storage_units : USize := usize_add units one in
+        let storage_bytes : USize := usize_add storage_units storage_units in
+        runtime_bind Bool Bool (raw_windows_wide_aligned base storage_units one) (fun (aligned : Bool) =>
+          match aligned with | False => runtime_pure Bool False | True =>
+            runtime_bind Bool Bool (raw_buffer_range base storage_bytes zero storage_bytes) (fun (valid : Bool) =>
+              match valid with | False => runtime_pure Bool False | True =>
+                match u8_from_nat 1 with | Nothing => runtime_pure Bool False | Just running =>
+                  runtime_bind USize Bool (runtime_loop USize zero
+                    (fun (index : USize) => runtime_pure U8 (match usize_less index units with
+                      | True => running | False => u8_sub running running end))
+                    (fun (index : USize) => raw_windows_path_step base units index one))
+                    (fun (finished : USize) => match usize_equal finished units with
+                      | False => runtime_pure Bool False
+                      | True => runtime_bind USize Bool (raw_windows_wide_unit base units one)
+                          (fun (terminator : USize) => runtime_pure Bool (usize_equal terminator zero)) end)
+                end end) end) end;
+
+-- Validate a caller-owned output buffer before an OS operation. The buffer
+-- must be aligned, nonempty and disjoint from the complete terminated path.
+def raw_windows_path_output (path : RawPtr U8) (units : USize) (output : RawPtr U8)
+    (bytes : USize) (alignment : USize) (one : USize) : Runtime Bool :=
+    let zero : USize := usize_sub one one in
+    runtime_bind Bool Bool (raw_windows_path_valid path units one) (fun (valid : Bool) =>
+      match valid with | False => runtime_pure Bool False | True =>
+        runtime_bind Bool Bool (raw_buffer_range output bytes zero bytes) (fun (range : Bool) =>
+          match range with | False => runtime_pure Bool False | True =>
+            runtime_bind USize Bool (raw_to_bits U8 output) (fun (address : USize) =>
+              match usize_equal (usize_and address (usize_sub alignment one)) zero with
+              | False => runtime_pure Bool False
+              | True => let terminated : USize := usize_add units one in
+                  raw_windows_storage_disjoint path (usize_add terminated terminated) output bytes end) end) end);

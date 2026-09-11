@@ -1,0 +1,97 @@
+import "compiler_io_metadata_fixtures.ouro";
+import "../compiler/extract.ouro";
+
+def output_io_expected_types (offset : Nat) : List Nat :=
+    map Nat Nat (add offset) ([17, 9, 8, 7, 5, 4, 3, 2, 1] : List Nat);
+
+def output_io_types (offset : Nat) (program : CheckedProgram) : Bool :=
+    match checked_program_type_globals_indexed whnf_checked_indexed output_io_fuel program with
+    | CErr _ => False | COk actual => primitive_bytes_equal actual (output_io_expected_types offset) end;
+
+def output_io_indexed_types (program : CheckedProgram) : Bool :=
+    match checked_program_type_globals whnf_checked output_io_fuel program with
+    | CErr _ => False | COk raw =>
+      match checked_program_type_globals_indexed whnf_checked_indexed output_io_fuel program with
+      | CErr _ => False | COk indexed => primitive_bytes_equal raw indexed end end;
+
+-- Independent prefix tokens for the four IR forms expected below. Any other
+-- node is an explicit mismatch, including extraction errors and type stubs.
+def output_io_ir_tokens : JsIR -> List Nat :=
+  fix output_io_ir_tokens (ir : JsIR) : List Nat :=
+    match ir with
+    | JVar name => [0, name] | JGlob name => [1, name]
+    | JLam name body => append Nat ([2, name] : List Nat) (output_io_ir_tokens body)
+    | JApp callee argument => Cons Nat 3
+        (append Nat (output_io_ir_tokens callee) (output_io_ir_tokens argument))
+    | JCtor _ _ _ => [255] | JSwitch _ _ _ => [255] | JFix _ _ _ => [255]
+    | JLet _ _ _ => [255] | JErr _ => [255] | JStr _ => [255] | JStrBytes _ => [255]
+    end;
+
+def output_io_extracted (program : CheckedProgram) (wanted : Nat) (expected : List Nat) : Bool :=
+    match checked_program_type_globals_indexed whnf_checked_indexed output_io_fuel program with
+    | CErr _ => False | COk types =>
+      match lookup_const wanted (checked_program_entries program) with
+      | Nothing => False | Just body =>
+        primitive_bytes_equal (output_io_ir_tokens (extract_term_with types body)) expected end end;
+
+def output_io_shim (program : CheckedProgram) (wanted : Nat) (expected : String) : Bool :=
+    (fix find (rest : List (Pair Nat (List Nat))) : Bool :=
+      match rest with | Nil => False | Cons pair tail => match pair with | MkPair name key =>
+        match eqNat name wanted with
+        | True => primitive_bytes_equal key (prim_string_to_char_codes expected)
+        | False => find tail end end end) (checked_program_c_shims program);
+
+def output_io_shim_ids (program : CheckedProgram) : Bool :=
+    primitive_bytes_equal
+      (map (Pair Nat (List Nat)) Nat (fun (pair : Pair Nat (List Nat)) => match pair with | MkPair name _ => name end)
+        (checked_program_c_shims program))
+      ([14, 13, 12, 11, 10, 4, 3, 2, 1] : List Nat);
+
+def output_io_convertible (program : CheckedProgram) : Bool :=
+    let entries : List Entry := checked_program_entries program in
+    andb (check_succeeded Unit (check_convertible output_io_fuel entries
+      (output_io_apply 7 (CInd 5)) (output_io_apply 1 (CInd 5))))
+      (check_succeeded Unit (check_convertible output_io_fuel entries
+        (CConst 17) (output_io_apply 1 (CInd 5))));
+
+def output_io_shifted : Bool :=
+    match output_io_fixture 100 with | CErr _ => False | COk program =>
+      andb (output_io_types 100 program)
+        (andb (output_io_shim program 110 "io_pure") (output_io_shim program 111 "io_bind")) end;
+
+def output_io_bad_signature : Bool :=
+    let items : List FileItem :=
+      [FIntrinsic 1 (CPi (CSort 0) (CSort 0)) (primitive_key PrimitiveRuntimeType) (Nothing CoreTerm),
+       FIntrinsic 2 (output_io_bind_type 1) (primitive_key PrimitiveRuntimePure) (Nothing CoreTerm)] in
+    match check_declarations CheckExactCore keep_checking output_io_fuel items with
+    | DeclarationsOk _ => False
+    | DeclarationsErr name phase failure => andb (eqNat name 2)
+        (eqNat (declaration_failure_code CheckExactCore phase failure) 2)
+    end;
+
+def output_io_metadata_tests : List (Pair String Bool) :=
+    match output_io_fixture 0 with
+    | CErr _ => [MkPair String Bool "IO metadata fixture checks" False]
+    | COk program =>
+      [MkPair String Bool "IO aliases erase only checked type families" (output_io_types 0 program),
+       MkPair String Bool "IO alias metadata agrees across normalizers" (output_io_indexed_types program),
+       MkPair String Bool "IO aliases convert to the single Runtime identity" (output_io_convertible program),
+       MkPair String Bool "polymorphic pure keeps its value binder"
+         (output_io_extracted program 15 ([2, 0, 3, 1, 10, 0, 0] : List Nat)),
+       MkPair String Bool "polymorphic bind keeps action and continuation"
+         (output_io_extracted program 16 ([2, 0, 2, 1, 3, 3, 1, 11, 0, 0, 0, 1] : List Nat)),
+       MkPair String Bool "closed IO alias disappears from pure application"
+         (output_io_extracted program 22 ([3, 1, 15, 1, 21] : List Nat)),
+       MkPair String Bool "opaque function value remains a pure argument"
+         (output_io_extracted program 23 ([3, 1, 15, 1, 18] : List Nat)),
+       MkPair String Bool "bind erases both type arguments and retains its closure"
+         (output_io_extracted program 24 ([3, 3, 1, 16, 1, 22, 2, 0, 1, 21] : List Nat)),
+       MkPair String Bool "renamed checked pure selects the existing C implementation" (output_io_shim program 10 "io_pure"),
+       MkPair String Bool "renamed checked bind selects the existing C implementation" (output_io_shim program 11 "io_bind"),
+       MkPair String Bool "Loop named io_pure remains explicitly unsupported" (output_io_shim program 12 "ouro.runtime.loop"),
+       MkPair String Bool "raw null named io_bind remains explicitly unsupported" (output_io_shim program 13 "ouro.raw.null"),
+       MkPair String Bool "extern named prim_string_concat remains explicitly unsupported" (output_io_shim program 14 "ouro.extern"),
+       MkPair String Bool "transparent IO wrappers never become C shim bindings" (output_io_shim_ids program),
+       MkPair String Bool "identifier offsets preserve IO type metadata and C keys" output_io_shifted,
+       MkPair String Bool "mismatched Runtime signature rejects before metadata" output_io_bad_signature]
+    end;

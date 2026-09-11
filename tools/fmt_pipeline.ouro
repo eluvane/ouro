@@ -1,0 +1,74 @@
+-- Pure formatter pipeline; IO wrappers must not affect byte output.
+
+import "../std/string.ouro";
+import "analyze/format.ouro";
+import "fix/lex.ouro";
+
+-- Same rules as tools/analyze/format.ouro's `format`, minus its even-indent
+-- fix: rounding a leading indent up to a multiple of two breaks continuation
+-- lines aligned under an opening token, and the native analyzer does not
+-- report those either (`analyze --enable-format` is clean on std/).
+def fmt_line (line : List Nat) : List Nat :=
+    fixContent (fixPipeSpace (stripTrailingWS (expandTabs line)));
+
+def fmt_codes (src : List Nat) : List Nat :=
+    let norm : List Nat := normalizeEOL src in
+    let body : List Nat :=
+      match lastIsLF norm with
+      | True => dropFinalLF norm
+      | False => norm
+      end
+    in
+    appendN (joinWithLF (dropTrailEmpty
+      (map (List Nat) (List Nat) fmt_line (splitOnLF body))))
+      ([chLF]);
+
+-- Candidate generation is kept pure for golden tests. Production writers
+-- must use fmt_checked, including the final normalization in ouro-fix.
+def fmt_string (s : String) : String :=
+    str_of_codes (fmt_codes (str_codes s));
+
+inductive FmtError : Type :=
+  | FmtTokenChange : FmtError
+  | FmtUnstable : FmtError;
+
+def fmt_error_message (e : FmtError) : String :=
+    match e with
+    | FmtTokenChange => "formatting refused: normalization would change a source token"
+    | FmtUnstable => "formatting refused: normalization is not idempotent"
+    end;
+
+-- Share the positional lexer with the fixer instead of inventing another
+-- string/comment scanner. Literal text includes its quotes and escapes;
+-- token equality therefore rejects changes to embedded tabs/CR/newlines as
+-- well as splitting operators. Comments and layout are not language tokens.
+def fmt_same_tokens : List FxTok -> List FxTok -> Bool :=
+  fix fmt_same_tokens (left : List FxTok) (right : List FxTok) : Bool :=
+    match left with
+    | Nil => match right with | Nil => True | Cons _ _ => False end
+    | Cons a rest =>
+        match right with
+        | Nil => False
+        | Cons b tail =>
+            match andb (eq_nat (fx_tok_kind a) (fx_tok_kind b))
+                (str_eq (fx_tok_text a) (fx_tok_text b)) with
+            | True => fmt_same_tokens rest tail
+            | False => False
+            end
+        end
+    end;
+
+def fmt_checked (src : String) : Either FmtError String :=
+    let out : String := fmt_string src in
+    match str_eq src out with
+    | True => Right FmtError String out
+    | False =>
+        match fmt_same_tokens (fx_lex src) (fx_lex out) with
+        | False => Left FmtError String FmtTokenChange
+        | True =>
+            match str_eq out (fmt_string out) with
+            | True => Right FmtError String out
+            | False => Left FmtError String FmtUnstable
+            end
+        end
+    end;

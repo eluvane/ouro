@@ -1,0 +1,80 @@
+-- Native test owner: checked raw Ouro supplies the runtime bodies, and the
+-- existing liveness fixtures supply MIR. Publish one validated binary image.
+import "native_live_runtime.ouro";
+import "../tools/native_build_core.ouro";
+
+-- Match the existing managed source driver's fixture limits.
+def native_live_runner_limits : MirLimits :=
+    MirLimitsWith (mul 32 256) (mul 16 pe_byte2_place) (mul 16 256);
+
+def native_live_runner_cases : List String :=
+    ["reclaim", "calls", "loop", "branch_true", "branch_false"];
+
+def native_live_runner_usage : String :=
+    "usage: native-live CASE OUT.exe [RAW_RUNTIME_ROOT.ouro]\ncases: reclaim calls loop branch_true branch_false";
+
+def native_live_runner_fail (code : Nat) (message : String) : IO Unit :=
+    do eprintln (str_concat "native-live: " message);
+       exit code
+
+def native_live_runner_image (name : String) (root : String) (files : NativeBuildFiles)
+    : Either NativeSourceError NativeImage :=
+    match managed_fixture_runtime_with_limits native_live_runner_limits
+        (prim_string_to_char_codes (native_build_normalize root)) files with
+    | Left error => Left NativeSourceError NativeImage error
+    | Right runtime => match live_runtime_named (prim_string_to_char_codes name) runtime with
+      | Nothing => Left NativeSourceError NativeImage (NativeSourceLowerError (LowerInvalidEntry 0))
+      | Just program => mapLeft NativeCodegenError NativeImage NativeSourceError
+          (fun (error : NativeCodegenError) => NativeSourceLowerError (LowerBackendFailure error))
+          (codegen_program native_live_runner_limits program)
+      end
+    end;
+
+def native_live_runner_emit (name : String) (output : String) (source : String) : IO Unit :=
+    do let! loaded := native_build_load_source source;
+       match loaded with
+       | Left error => native_live_runner_fail 1 (native_build_error_message error)
+       | Right input => match input with
+         | MkPair root files => match native_live_runner_image name root files with
+           | Left error => native_live_runner_fail 1 (managed_driver_source_error error)
+           | Right image =>
+               do let! published := native_build_publish_image output image;
+                  match published with
+                  | Left error => native_live_runner_fail 1 (native_build_error_message error)
+                  | Right _ => println (str_concat "NATIVE_LIVE: emitted " name)
+                  end
+           end
+         end
+       end
+
+def native_live_runner_run (name : String) (output : String) (source : String) : IO Unit :=
+    match any String (fun (known : String) => str_eq name known) native_live_runner_cases with
+    | False => native_live_runner_fail 2 native_live_runner_usage
+    | True => match orb (str_null output) (str_null source) with
+      | True => native_live_runner_fail 2 native_live_runner_usage
+      | False => native_live_runner_emit name output source
+      end
+    end;
+
+def native_live_runner_args (words : List String) : IO Unit :=
+    match words with
+    | Nil => native_live_runner_fail 2 native_live_runner_usage
+    | Cons name more => match more with
+      | Nil => native_live_runner_fail 2 native_live_runner_usage
+      | Cons output rest => match rest with
+        | Nil => native_live_runner_run name output "tests/native_managed/runtime.ouro"
+        | Cons source extra => match extra with
+          | Nil => native_live_runner_run name output source
+          | Cons _ _ => native_live_runner_fail 2 native_live_runner_usage
+          end
+        end
+      end
+    end;
+
+-- @entry main
+def main : IO Unit :=
+    do let! arguments := argv;
+       match arguments with
+       | Nil => native_live_runner_fail 2 native_live_runner_usage
+       | Cons _ words => native_live_runner_args words
+       end

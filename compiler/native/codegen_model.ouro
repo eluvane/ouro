@@ -1,0 +1,158 @@
+-- Deterministic frame-slot code generation. Only volatile RAX/RCX/RDX/R8-R11
+-- are used, so no nonvolatile register is modified. Windows integer ABI:
+-- https://learn.microsoft.com/cpp/build/x64-calling-convention
+import "mir_live.ouro";
+import "pe.ouro";
+
+inductive NativeCodegenError : Type :=
+  | NativeMirError : MirError -> NativeCodegenError
+  | NativeEncodingError : X64EncodeError -> NativeCodegenError
+  | NativePeError : PeError -> NativeCodegenError
+  | NativeMissingSlot : Nat -> NativeCodegenError
+  | NativeMissingLabel : Nat -> NativeCodegenError
+  | NativeCodeTooLarge : NativeCodegenError;
+
+inductive NativeRootSlot : Type :=
+  | NativeRootAt : Nat -> Nat -> NativeRootSlot;
+
+-- Call metadata identifies block/instruction and the return RVA. Every managed
+-- local (including arguments) has a null-initialized slot before any body call.
+-- The same slots are registered through real shadow frames. Dead slots are
+-- cleared before a MayGc call; live operand reads remain roots during the call.
+inductive NativeCallSite : Type :=
+  | NativeCallAt : Nat -> Nat -> Nat -> NativeCallSite;
+
+inductive NativeFrameInfo : Type :=
+  | NativeFrameAt : Nat -> Nat -> List NativeRootSlot -> List NativeCallSite -> NativeFrameInfo;
+
+inductive NativeImage : Type :=
+  | NativeImageOf : PeImage -> List NativeFrameInfo -> NativeImage;
+
+inductive CodegenSlot : Type :=
+  | CodegenSlotAt : Nat -> MirType -> Nat -> CodegenSlot;
+
+inductive CodegenFrame : Type :=
+  | CodegenFrameOf : Nat -> List CodegenSlot -> CodegenFrame;
+
+inductive CodegenLabel : Type :=
+  | CodegenBlockLabel : Nat -> CodegenLabel
+  | CodegenSiteLabel : Nat -> Nat -> Nat -> CodegenLabel;
+
+inductive CodegenAtom : Type :=
+  | CodegenInstruction : X64Instruction -> CodegenAtom
+  | CodegenMark : CodegenLabel -> CodegenAtom
+  | CodegenJump : CodegenLabel -> CodegenAtom
+  | CodegenJumpIf : X64Condition -> CodegenLabel -> CodegenAtom
+  | CodegenDirectCall : Nat -> CodegenAtom
+  | CodegenImportCall : Nat -> CodegenAtom
+  | CodegenSymbolAddress : Nat -> Bool -> CodegenAtom
+  | CodegenBoundary : Nat -> Nat -> CodegenAtom;
+
+inductive CodegenLabelAt : Type :=
+  | CodegenLabelOffset : CodegenLabel -> Nat -> CodegenLabelAt;
+
+inductive CodegenEncoded : Type :=
+  | CodegenEncodedParts : List Nat -> List PeFixup -> List NativeCallSite -> CodegenEncoded;
+
+def codegen_zero : X64Word32 := X64Bytes32 0 0 0 0;
+def codegen_disp (offset : Nat) : X64Displacement := X64Forward (pe_word32 offset);
+def codegen_relative (target : Nat) (origin : Nat) : X64Displacement :=
+    match leb_nat origin target with | True => codegen_disp (sub target origin)
+    | False => X64Backward (pe_word32 (sub origin target)) end;
+
+def codegen_width (ty : MirType) : X64Width :=
+    match eq_nat (mir_type_bits ty) 64 with | True => X64Bits64 | False => X64Bits32 end;
+
+def codegen_raw (instructions : List X64Instruction) : List CodegenAtom :=
+    map X64Instruction CodegenAtom (fun (instruction : X64Instruction) => CodegenInstruction instruction) instructions;
+
+def codegen_join (parts : List (List CodegenAtom)) : List CodegenAtom :=
+    concat_map (List CodegenAtom) CodegenAtom (fun (part : List CodegenAtom) => part) parts;
+
+def codegen_slot (id : Nat) : List CodegenSlot -> Either NativeCodegenError CodegenSlot :=
+  fix codegen_slot (slots : List CodegenSlot) : Either NativeCodegenError CodegenSlot :=
+    match slots with | Nil => Left NativeCodegenError CodegenSlot (NativeMissingSlot id)
+    | Cons slot rest => match slot with | CodegenSlotAt key _ _ => match eq_nat key id with
+      | True => Right NativeCodegenError CodegenSlot slot | False => codegen_slot rest end end end;
+
+def codegen_slots : List MirLocal -> Nat -> List CodegenSlot :=
+  fix codegen_slots (locals : List MirLocal) (offset : Nat) : List CodegenSlot :=
+    match locals with | Nil => ([] : List CodegenSlot) | Cons local rest => match local with | MirLocalDef id ty =>
+      Cons CodegenSlot (CodegenSlotAt id ty offset) (codegen_slots rest (add offset 8)) end end;
+
+def codegen_call_arity (instruction : MirInstruction) : Nat :=
+    match instruction with | MirCall _ _ _ args => length MirValue args
+    | MirManagedAlloc _ _ _ _ _ => 3 | MirManagedContext _ => 0
+    | MirMove _ _ => 0 | MirBinaryOp _ _ _ _ => 0 | MirCompare _ _ _ _ => 0
+    | MirConvert _ _ _ => 0 | MirLoad _ _ _ => 0 | MirStore _ _ _ => 0
+    | MirLoadAt _ _ _ => 0 | MirStoreAt _ _ _ => 0
+    | MirAddress _ _ => 0 | MirPointerAdd _ _ _ => 0 end;
+
+def codegen_frame (function : MirFunction) : CodegenFrame :=
+    match function with | MirFunctionDef _ _ args locals _ _ blocks =>
+      let count : Nat := foldr MirBlock Nat (fun (block : MirBlock) (other : Nat) =>
+        match block with | MirBlockDef _ instructions _ =>
+          maxNat other (foldr MirInstruction Nat (fun (instruction : MirInstruction) (n : Nat) =>
+            maxNat n (codegen_call_arity instruction)) 4 instructions) end) 4 blocks in
+      let outgoing : Nat := mul count 8 in
+      let all_locals : List MirLocal := append MirLocal args locals in
+      let shadow : Nat := match mir_function_has_roots function with | True => 24 | False => 0 end in
+      let size : Nat := sub (pe_align 16 (add (add outgoing (add (mul 8 (length MirLocal all_locals)) shadow)) 8)) 8 in
+      CodegenFrameOf size (codegen_slots all_locals outgoing) end;
+
+def codegen_root_slots (slots : List CodegenSlot) : List NativeRootSlot :=
+    concat_map CodegenSlot NativeRootSlot (fun (slot : CodegenSlot) => match slot with
+      | CodegenSlotAt id ty offset => match mir_type_equal ty MirManagedPtr with
+        | False => ([] : List NativeRootSlot) | True => ([NativeRootAt id offset] : List NativeRootSlot) end end) slots;
+
+def codegen_runtime_id (program : MirProgram) : Nat :=
+    add 2 (foldr Nat Nat maxNat 0 (mir_global_ids program));
+
+def codegen_load_value (slots : List CodegenSlot) (reg : X64Register) (value : MirValue)
+    : Either NativeCodegenError (List CodegenAtom) :=
+    match value with
+    | MirUse id => match codegen_slot id slots with | Left err => Left NativeCodegenError (List CodegenAtom) err
+      | Right slot => match slot with | CodegenSlotAt _ _ offset =>
+        Right NativeCodegenError (List CodegenAtom)
+          (codegen_raw ([X64Load X64Bits64 reg (X64Base X64Rsp (codegen_disp offset))] : List X64Instruction)) end end
+    | MirBits ty word => Right NativeCodegenError (List CodegenAtom)
+        (codegen_raw ([match codegen_width ty with | X64Bits64 => X64MovImm64 reg word
+          | X64Bits32 => match word with | X64Words64 low _ => X64MovImm32 reg low end end] : List X64Instruction)) end;
+
+def codegen_value_type (slots : List CodegenSlot) (value : MirValue) : Either NativeCodegenError MirType :=
+    match value with | MirBits ty _ => Right NativeCodegenError MirType ty
+    | MirUse id => match codegen_slot id slots with | Left err => Left NativeCodegenError MirType err
+      | Right slot => match slot with | CodegenSlotAt _ ty _ => Right NativeCodegenError MirType ty end end end;
+
+def codegen_normalize (ty : MirType) (reg : X64Register) : List CodegenAtom :=
+    match ty with
+    | MirU8 => codegen_raw ([X64ArithmeticImm32 X64Bits32 X64And reg (pe_word32 255)] : List X64Instruction)
+    | MirU32 => codegen_raw ([X64Mov X64Bits32 reg reg] : List X64Instruction)
+    | MirI32 => codegen_raw ([X64Mov X64Bits32 reg reg] : List X64Instruction)
+    | MirU64 => ([] : List CodegenAtom) | MirUSize => ([] : List CodegenAtom) | MirRawPtr => ([] : List CodegenAtom) | MirManagedPtr => ([] : List CodegenAtom) end;
+
+def codegen_save_slot (slot : CodegenSlot) (reg : X64Register) : List CodegenAtom :=
+    match slot with | CodegenSlotAt _ ty offset => append CodegenAtom (codegen_normalize ty reg)
+      (codegen_raw ([X64Store X64Bits64 (X64Base X64Rsp (codegen_disp offset)) reg] : List X64Instruction)) end;
+
+def codegen_save (slots : List CodegenSlot) (id : Nat) (reg : X64Register)
+    : Either NativeCodegenError (List CodegenAtom) :=
+    mapRight NativeCodegenError CodegenSlot (List CodegenAtom)
+      (fun (slot : CodegenSlot) => codegen_save_slot slot reg) (codegen_slot id slots);
+
+def codegen_parts (parts : List (Either NativeCodegenError (List CodegenAtom)))
+    : Either NativeCodegenError (List CodegenAtom) :=
+    (fix go (rest : List (Either NativeCodegenError (List CodegenAtom)))
+        : Either NativeCodegenError (List CodegenAtom) :=
+      match rest with | Nil => Right NativeCodegenError (List CodegenAtom) ([] : List CodegenAtom)
+      | Cons part tail => match part with | Left err => Left NativeCodegenError (List CodegenAtom) err
+        | Right atoms => mapRight NativeCodegenError (List CodegenAtom) (List CodegenAtom) (append CodegenAtom atoms) (go tail) end end) parts;
+
+def codegen_ready (atoms : List CodegenAtom) : Either NativeCodegenError (List CodegenAtom) :=
+    Right NativeCodegenError (List CodegenAtom) atoms;
+
+def codegen_label_equal (a : CodegenLabel) (b : CodegenLabel) : Bool :=
+    match a, b with | CodegenBlockLabel x, CodegenBlockLabel y => eq_nat x y
+    | CodegenSiteLabel x y z, CodegenSiteLabel p q r => andb (eq_nat x p) (andb (eq_nat y q) (eq_nat z r))
+    | CodegenBlockLabel _, CodegenSiteLabel _ _ _ => False
+    | CodegenSiteLabel _ _ _, CodegenBlockLabel _ => False end;

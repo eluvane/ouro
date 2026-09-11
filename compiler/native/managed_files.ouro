@@ -1,0 +1,67 @@
+-- Applying the checked primitive only captures its arguments. Every action
+-- invocation reopens the file; write supports both stages of partial use.
+import "managed_files_path.ouro";
+
+def managed_file_operation (primitive : PrimitiveId) : Maybe Bool :=
+    match primitive_id_equal primitive PrimitiveFileRead with | True => Just Bool False | False =>
+      match primitive_id_equal primitive PrimitiveFileWrite with | True => Just Bool True
+      | False => Nothing Bool end end;
+
+def managed_file_action (compiler : ManagedCompiler) (path : MirValue) (content : Maybe MirValue)
+    (state : ManagedState) : Either NativeLowerError ManagedResult :=
+    let captures : List MirValue := match content with | Nothing => ([path] : List MirValue) | Just value => ([path, value] : List MirValue) end in
+    managed_action compiler captures (fun (values : List MirValue) (entered : ManagedState) =>
+      match content with
+      | Nothing => lower_bind MirValue ManagedResult (lower_single MirValue values)
+          (fun (name : MirValue) => managed_file_body compiler name (Nothing MirValue) entered)
+      | Just _ => lower_bind (Pair MirValue MirValue) ManagedResult (lower_pair MirValue values)
+          (fun (pair : Pair MirValue MirValue) => match pair with | MkPair name value =>
+            managed_file_body compiler name (Just MirValue value) entered end) end) state;
+
+def managed_file_write_partial (compiler : ManagedCompiler) (path : MirValue) (state : ManagedState)
+    : Either NativeLowerError ManagedResult :=
+    let caller : LowerState := managed_flow state in
+    lower_bind (Pair Nat ManagedState) ManagedResult (managed_fresh_symbol state)
+      (fun (fresh : Pair Nat ManagedState) => match fresh with | MkPair symbol reserved =>
+        lower_bind ManagedResult ManagedResult
+          (managed_load MirManagedPtr (MirUse 0) 40 (managed_with_flow reserved (lower_empty_state 2)))
+          (fun (loaded : ManagedResult) => match loaded with | ManagedResultOf name entered =>
+            lower_bind ManagedResult ManagedResult (managed_file_action compiler name (Just MirValue (MirUse 1)) entered)
+              (fun (compiled : ManagedResult) => match compiled with | ManagedResultOf action after =>
+                let function : MirFunction := managed_finish_function symbol
+                  ([111,117,114,111,95,102,105,108,101,95,99,111,110,116,101,110,116] : List Nat)
+                  ([MirLocalDef 0 MirManagedPtr, MirLocalDef 1 MirManagedPtr] : List MirLocal) action after in
+                managed_emit_callable compiler 3 symbol False ([path] : List MirValue)
+                  (managed_with_flow (managed_add_function function after) caller) end) end) end);
+
+def managed_file_value (compiler : ManagedCompiler) (writing : Bool) (state : ManagedState)
+    : Either NativeLowerError ManagedResult :=
+    let caller : LowerState := managed_flow state in
+    lower_bind (Pair Nat ManagedState) ManagedResult (managed_fresh_symbol state)
+      (fun (fresh : Pair Nat ManagedState) => match fresh with | MkPair symbol reserved =>
+        lower_bind ManagedResult ManagedResult (match writing with
+          | False => managed_file_action compiler (MirUse 1) (Nothing MirValue) (managed_with_flow reserved (lower_empty_state 2))
+          | True => managed_file_write_partial compiler (MirUse 1) (managed_with_flow reserved (lower_empty_state 2)) end)
+          (fun (compiled : ManagedResult) => match compiled with | ManagedResultOf value after =>
+            let function : MirFunction := managed_finish_function symbol
+              ([111,117,114,111,95,102,105,108,101,95,112,97,116,104] : List Nat)
+              ([MirLocalDef 0 MirManagedPtr, MirLocalDef 1 MirManagedPtr] : List MirLocal) value after in
+            managed_emit_callable compiler 3 symbol False ([] : List MirValue)
+              (managed_with_flow (managed_add_function function after) caller) end) end);
+
+def managed_file_primitive (compiler : ManagedCompiler) (step : ManagedStep) (scope : ManagedScope)
+    (writing : Bool) (arguments : List CoreTerm) (state : ManagedState)
+    : Either NativeLowerError ManagedResult :=
+    match andb writing (eqNat (length CoreTerm arguments) 2) with
+    | True => lower_bind (Pair CoreTerm CoreTerm) ManagedResult (lower_pair CoreTerm arguments)
+        (fun (pair : Pair CoreTerm CoreTerm) => match pair with | MkPair path content =>
+          lower_bind ManagedResult ManagedResult (step scope path state)
+            (fun (name : ManagedResult) => match name with | ManagedResultOf value next =>
+              lower_bind ManagedResult ManagedResult (step scope content next)
+                (fun (supplied : ManagedResult) => match supplied with | ManagedResultOf bytes after =>
+                  managed_file_action compiler value (Just MirValue bytes) after end) end) end)
+    | False => lower_bind CoreTerm ManagedResult (lower_single CoreTerm arguments)
+        (fun (path : CoreTerm) => lower_bind ManagedResult ManagedResult (step scope path state)
+          (fun (name : ManagedResult) => match name with | ManagedResultOf value next =>
+            match writing with | False => managed_file_action compiler value (Nothing MirValue) next
+            | True => managed_file_write_partial compiler value next end end)) end;

@@ -1,0 +1,60 @@
+import "windows_process_base.ouro";
+
+-- Status zero means the process is signaled and exit_code was written.
+-- WAIT_TIMEOUT (258) leaves it unchanged; other failures are Win32 errors.
+-- Handle and count are caller owned. The count must not alias owner state.
+def raw_windows_process_wait (process : RawPtr U8) (milliseconds : U32) (exit_code : RawPtr U32) : Runtime U32 :=
+    let one : USize := raw_process_one (raw_u32_to_size milliseconds) in
+    runtime_bind Bool U32 (raw_windows_count_cell exit_code one) (fun (cell : Bool) =>
+      match cell with | False => runtime_pure U32 (raw_windows_parameter_error one) | True =>
+        runtime_bind Bool U32 (raw_windows_handle_valid process one) (fun (valid : Bool) =>
+          match valid with | False => runtime_pure U32 (raw_windows_invalid_handle one) | True =>
+            runtime_bind U32 U32 (windows_wait_process process milliseconds) (fun (wait : U32) =>
+              match u32_equal wait (raw_size_to_u32 (usize_add (raw_process_eight (raw_process_eight (usize_add (usize_add one one) (usize_add one one)))) (usize_add one one))) with | True => runtime_pure U32 wait | False =>
+                match u32_equal wait (raw_size_to_u32 (usize_sub one one)) with
+                | False => match u32_equal wait (u32_sub (raw_size_to_u32 (usize_sub one one)) (raw_size_to_u32 one)) with
+                    | True => raw_windows_last_failure one | False => runtime_pure U32 (raw_windows_general_error one) end
+                | True => runtime_bind U32 U32 (raw_load_u32 exit_code) (fun (saved : U32) =>
+                    runtime_bind U32 U32 (windows_process_exit_code process exit_code) (fun (queried : U32) =>
+                      runtime_bind U32 U32 (raw_windows_bool_status queried one) (fun (status : U32) =>
+                        match u32_equal status (raw_size_to_u32 (usize_sub one one)) with | True => runtime_pure U32 status
+                        | False => raw_windows_file_restore_count exit_code saved status end))) end end) end) end);
+
+-- Cancel only this process, then wait for termination. A timeout leaves its
+-- handle owned and usable for another wait. Completion racing cancellation is
+-- success. It deliberately promises no descendant-process termination.
+def raw_windows_process_cancel (process : RawPtr U8) (code : U32) (milliseconds : U32) (exit_code : RawPtr U32) : Runtime U32 :=
+    let one : USize := raw_process_one (raw_u32_to_size milliseconds) in
+    let process_number_0 : USize := (usize_sub one one) in
+
+    runtime_bind U32 U32 (raw_windows_process_wait process (raw_size_to_u32 process_number_0) exit_code) (fun (polled : U32) =>
+      match u32_equal polled (raw_size_to_u32 (usize_add (raw_process_eight (raw_process_eight (usize_add (usize_add one one) (usize_add one one)))) (usize_add one one))) with | False => runtime_pure U32 polled | True =>
+        runtime_bind U32 U32 (windows_terminate_process process code) (fun (terminated : U32) =>
+          runtime_bind U32 U32 (raw_windows_bool_status terminated one) (fun (status : U32) =>
+            match u32_equal status (raw_size_to_u32 process_number_0) with
+            | True => raw_windows_process_wait process milliseconds exit_code
+            | False => runtime_bind U32 U32 (raw_windows_process_wait process (raw_size_to_u32 process_number_0) exit_code)
+                (fun (raced : U32) => runtime_pure U32 (match u32_equal raced (raw_size_to_u32 process_number_0) with
+                  | True => raced | False => status end)) end)) end);
+
+-- Close both owned handles; on failure retain every unclosed handle. Closing
+-- a live process detaches it; callers that require termination must cancel/wait.
+def raw_windows_process_close (owner : RawPtr U8) : Runtime U32 :=
+    runtime_bind USize U32 (raw_to_bits U8 owner) (fun (anchor : USize) =>
+      let one : USize := raw_process_one anchor in
+      runtime_bind Bool U32 (raw_process_storage owner (raw_process_eight (usize_add one (usize_add one one))) one) (fun (valid : Bool) =>
+        match valid with | False => runtime_pure U32 (raw_windows_parameter_error one) | True =>
+          runtime_bind U32 U32 (raw_process_close_cell owner (raw_process_eight one) one) (fun (thread : U32) =>
+            runtime_bind U32 U32 (raw_process_close_cell owner (usize_sub one one) one) (fun (process : U32) =>
+              runtime_pure U32 (match u32_equal thread (raw_size_to_u32 (usize_sub one one)) with
+                | True => process | False => thread end))) end));
+
+-- Rewind a capture file only after all writers have stopped. Duplicate file
+-- handles share their file position, so seeking while the child runs is invalid.
+def raw_windows_process_rewind (capture : RawPtr U8) : Runtime U32 :=
+    runtime_bind USize U32 (raw_to_bits U8 capture) (fun (anchor : USize) =>
+      let one : USize := raw_process_one anchor in
+      runtime_bind Bool U32 (raw_windows_handle_valid capture one) (fun (valid : Bool) =>
+        match valid with | False => runtime_pure U32 (raw_windows_invalid_handle one) | True =>
+          runtime_bind U32 U32 (windows_seek_file capture (usize_to_u64 (usize_sub one one)) (raw_null U8) (raw_size_to_u32 (usize_sub one one)))
+            (fun (status : U32) => raw_windows_bool_status status one) end));

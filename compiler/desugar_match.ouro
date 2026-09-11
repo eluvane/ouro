@@ -1,0 +1,578 @@
+-- @entry desugar_file
+
+import "base.ouro";
+import "../std/data.ouro";
+import "ast.ouro";
+
+-- AST tags come from ast.ouro (EVar=0..EList=22; DDef=0..DRepresentation=7).
+def hundred : Nat := mul ten ten;
+def thousand : Nat := mul ten hundred;
+def nineK : Nat := mul (9) thousand;
+def bigFuel : Nat := mul hundred hundred;
+
+def lookupSubst (n : Nat) : List (Pair Nat Nat) -> Maybe Nat :=
+    fix lookupSubst (s : List (Pair Nat Nat)) : Maybe Nat :=
+      match s with
+      | Nil => Nothing Nat
+      | Cons p rest =>
+          match p with
+          | MkPair a b =>
+              match eqNat a n with
+              | True => Just Nat b
+              | False => lookupSubst rest
+              end
+          end
+      end;
+
+def removeOne (n : Nat) : List (Pair Nat Nat) -> List (Pair Nat Nat) :=
+    fix removeOne (s : List (Pair Nat Nat)) : List (Pair Nat Nat) :=
+      match s with
+      | Nil => Nil (Pair Nat Nat)
+      | Cons p rest =>
+          match p with
+          | MkPair a _b =>
+              match eqNat a n with
+              | True => removeOne rest
+              | False => Cons (Pair Nat Nat) p (removeOne rest)
+              end
+          end
+      end;
+
+def removeMany : List Nat -> List (Pair Nat Nat) -> List (Pair Nat Nat) :=
+  fix removeMany (ns : List Nat) (s : List (Pair Nat Nat)) : List (Pair Nat Nat) :=
+    match ns with
+    | Nil => s
+    | Cons n rest => removeMany rest (removeOne n s)
+    end;
+
+def binderIds : Expr -> List Nat :=
+  fix binderIds (b : Expr) : List Nat :=
+    match b with
+    | EBinder id _ty rest => Cons Nat id (binderIds rest)
+    | EVar _ => Nil Nat
+    | EHole _ => Nil Nat
+    | ESort _ => Nil Nat
+    | ENat _ => Nil Nat
+    | EApp _ _ => Nil Nat
+    | ELam _ _ _ => Nil Nat
+    | EPi _ _ _ => Nil Nat
+    | ELet _ _ _ _ => Nil Nat
+    | EAscribe _ _ => Nil Nat
+    | EMatch _ _ => Nil Nat
+    | EFix _ _ _ _ => Nil Nat
+    | EEffectRow _ _ => Nil Nat
+    | EPerform _ _ => Nil Nat
+    | EDo _ => Nil Nat
+    | EDoBind _ _ => Nil Nat
+    | EList _ => Nil Nat
+    | EHandle _ _ => Nil Nat
+    | EBranch _ _ _ => Nil Nat
+    | ENoBranch => Nil Nat
+    | ENoBinder => Nil Nat
+    | EMultiMatch _ _ => Nil Nat
+    | EStr _ => Nil Nat
+    end;
+
+def rowBound : List (Pair Nat (List Nat)) -> List Nat :=
+  fix rowBound (pats : List (Pair Nat (List Nat))) : List Nat :=
+    match pats with
+    | Nil => Nil Nat
+    | Cons p rest =>
+        match p with
+        | MkPair _ctor vs => append Nat vs (rowBound rest)
+        end
+    end;
+
+-- @bound(cyclo <= 70)
+def rename_expr : Nat -> List (Pair Nat Nat) -> Expr -> Expr :=
+  fix rename_expr (fuel : Nat) (subst : List (Pair Nat Nat)) (e : Expr) : Expr :=
+    match fuel with
+    | Z => e
+    | S fuel' =>
+        match e with
+        | EVar n =>
+            match lookupSubst n subst with
+            | Nothing => EVar n
+            | Just n' => EVar n'
+            end
+        | EHole h => EHole h
+        | ESort u => ESort u
+        | ENat n => ENat n
+        | EStr s => EStr s
+        | EApp f a =>
+            EApp (rename_expr fuel' subst f) (rename_expr fuel' subst a)
+        | ELam id ann body =>
+            ELam id
+              (match ann with
+              | Nothing => Nothing Expr
+              | Just ty => Just Expr (rename_expr fuel' subst ty)
+              end : Maybe Expr)
+              (rename_expr fuel' (removeOne id subst) body)
+        | EPi id dom cod =>
+            EPi id
+              (rename_expr fuel' subst dom)
+              (rename_expr fuel' (removeOne id subst) cod)
+        | ELet id ann v body =>
+            ELet id
+              (match ann with
+              | Nothing => Nothing Expr
+              | Just ty => Just Expr (rename_expr fuel' subst ty)
+              end : Maybe Expr)
+              (rename_expr fuel' subst v)
+              (rename_expr fuel' (removeOne id subst) body)
+        | EAscribe e0 t =>
+            EAscribe (rename_expr fuel' subst e0) (rename_expr fuel' subst t)
+        | EMatch scrut br =>
+            EMatch (rename_expr fuel' subst scrut) (rename_expr fuel' subst br)
+        | EFix nm binders ret body =>
+            let fix_subst : List (Pair Nat Nat) :=
+              removeMany (Cons Nat nm (binderIds binders)) subst in
+            EFix nm
+              (rename_expr fuel' subst binders)
+              (rename_expr fuel' fix_subst ret)
+              (rename_expr fuel' fix_subst body)
+        | EEffectRow ty ops =>
+            EEffectRow (rename_expr fuel' subst ty) ops
+        | EPerform op args =>
+            EPerform op
+              ((fix go (xs : List Expr) : List Expr :=
+                  match xs with
+                  | Nil => Nil Expr
+                  | Cons x xs' =>
+                      Cons Expr (rename_expr fuel' subst x) (go xs')
+                  end) args)
+        | EDo es =>
+            EDo
+              ((fix go (xs : List Expr) : List Expr :=
+                  match xs with
+                  | Nil => Nil Expr
+                  | Cons x xs' =>
+                      Cons Expr (rename_expr fuel' subst x) (go xs')
+                  end) es)
+        | EDoBind name action =>
+            EDoBind name (rename_expr fuel' subst action)
+        | EList elems =>
+            EList
+              ((fix go (xs : List Expr) : List Expr :=
+                  match xs with
+                  | Nil => Nil Expr
+                  | Cons x xs' =>
+                      Cons Expr (rename_expr fuel' subst x) (go xs')
+                  end) elems)
+        | EHandle comp clauses =>
+            EHandle (rename_expr fuel' subst comp)
+              ((fix go (cs : List (Pair Nat (Pair (List Nat) Expr)))
+                  : List (Pair Nat (Pair (List Nat) Expr)) :=
+                  match cs with
+                  | Nil => Nil (Pair Nat (Pair (List Nat) Expr))
+                  | Cons c cs' =>
+                      match c with
+                      | MkPair op payload =>
+                          match payload with
+                          | MkPair vs body =>
+                              Cons (Pair Nat (Pair (List Nat) Expr))
+                                (MkPair Nat (Pair (List Nat) Expr) op
+                                  (MkPair (List Nat) Expr vs
+                                    (rename_expr fuel'
+                                      (removeMany vs subst) body)))
+                                (go cs')
+                          end
+                      end
+                  end) clauses)
+        | EBranch vs body rest =>
+            -- Packed ctor head is not a binder.
+            match vs with
+            | Nil =>
+                EBranch vs
+                  (rename_expr fuel' subst body)
+                  (rename_expr fuel' subst rest)
+            | Cons ctor pvars =>
+                EBranch (Cons Nat ctor pvars)
+                  (rename_expr fuel' (removeMany pvars subst) body)
+                  (rename_expr fuel' subst rest)
+            end
+        | ENoBranch => ENoBranch
+        | EBinder id ty rest =>
+            EBinder id
+              (rename_expr fuel' subst ty)
+              (rename_expr fuel' (removeOne id subst) rest)
+        | ENoBinder => ENoBinder
+        | EMultiMatch scruts rows =>
+            EMultiMatch
+              ((fix go (xs : List Expr) : List Expr :=
+                  match xs with
+                  | Nil => Nil Expr
+                  | Cons x xs' =>
+                      Cons Expr (rename_expr fuel' subst x) (go xs')
+                  end) scruts)
+              ((fix go
+                  (rs : List (Pair (List (Pair Nat (List Nat))) Expr))
+                  : List (Pair (List (Pair Nat (List Nat))) Expr) :=
+                  match rs with
+                  | Nil => Nil (Pair (List (Pair Nat (List Nat))) Expr)
+                  | Cons r rs' =>
+                      match r with
+                      | MkPair pats body =>
+                          Cons (Pair (List (Pair Nat (List Nat))) Expr)
+                            (MkPair (List (Pair Nat (List Nat))) Expr pats
+                              (rename_expr fuel'
+                                (removeMany (rowBound pats) subst) body))
+                            (go rs')
+                      end
+                  end) rows)
+        end
+    end;
+
+def addToGroups (ctor : Nat) (vars : List Nat) (rest : List (Pair Nat (List Nat))) (body : Expr) : List (Pair Nat (List (Pair (List Nat) (Pair (List (Pair Nat (List Nat))) Expr)))) ->
+    List (Pair Nat (List (Pair (List Nat) (Pair (List (Pair Nat (List Nat))) Expr)))) :=
+    fix go
+      (gs : List (Pair Nat (List (Pair (List Nat) (Pair (List (Pair Nat (List Nat))) Expr)))))
+      : List (Pair Nat (List (Pair (List Nat) (Pair (List (Pair Nat (List Nat))) Expr)))) :=
+      match gs with
+      | Nil =>
+          Cons (Pair Nat (List (Pair (List Nat) (Pair (List (Pair Nat (List Nat))) Expr))))
+            (MkPair Nat (List (Pair (List Nat) (Pair (List (Pair Nat (List Nat))) Expr))) ctor
+              (Cons (Pair (List Nat) (Pair (List (Pair Nat (List Nat))) Expr))
+                (MkPair (List Nat) (Pair (List (Pair Nat (List Nat))) Expr) vars
+                  (MkPair (List (Pair Nat (List Nat))) Expr rest body))
+                (Nil (Pair (List Nat) (Pair (List (Pair Nat (List Nat))) Expr)))))
+            (Nil (Pair Nat (List (Pair (List Nat) (Pair (List (Pair Nat (List Nat))) Expr)))))
+      | Cons g gs' =>
+          match g with
+          | MkPair c entries =>
+              match eqNat c ctor with
+              | True =>
+                  Cons (Pair Nat (List (Pair (List Nat) (Pair (List (Pair Nat (List Nat))) Expr))))
+                    (MkPair Nat (List (Pair (List Nat) (Pair (List (Pair Nat (List Nat))) Expr))) c
+                      (append (Pair (List Nat) (Pair (List (Pair Nat (List Nat))) Expr)) entries
+                        (Cons (Pair (List Nat) (Pair (List (Pair Nat (List Nat))) Expr))
+                          (MkPair (List Nat) (Pair (List (Pair Nat (List Nat))) Expr) vars
+                            (MkPair (List (Pair Nat (List Nat))) Expr rest body))
+                          (Nil (Pair (List Nat) (Pair (List (Pair Nat (List Nat))) Expr))))))
+                    gs'
+              | False =>
+                  Cons (Pair Nat (List (Pair (List Nat) (Pair (List (Pair Nat (List Nat))) Expr))))
+                    g (go gs')
+              end
+          end
+      end;
+
+def groupByCtor (rows : List (Pair (List (Pair Nat (List Nat))) Expr)) : List (Pair Nat (List (Pair (List Nat) (Pair (List (Pair Nat (List Nat))) Expr)))) :=
+    (fix go
+        (rs : List (Pair (List (Pair Nat (List Nat))) Expr))
+        (acc : List (Pair Nat (List (Pair (List Nat) (Pair (List (Pair Nat (List Nat))) Expr)))))
+        : List (Pair Nat (List (Pair (List Nat) (Pair (List (Pair Nat (List Nat))) Expr)))) :=
+        match rs with
+        | Nil => acc
+        | Cons r rs' =>
+            match r with
+            | MkPair pats body =>
+                match pats with
+                | Nil => go rs' acc
+                | Cons p prest =>
+                    match p with
+                    | MkPair ctor vars =>
+                        go rs' (addToGroups ctor vars prest body acc)
+                    end
+                end
+            end
+        end) rows
+      (Nil (Pair Nat (List (Pair (List Nat) (Pair (List (Pair Nat (List Nat))) Expr)))));
+
+def entryVars (e : Pair (List Nat) (Pair (List (Pair Nat (List Nat))) Expr)) : List Nat :=
+    match e with
+    | MkPair vs _ => vs
+    end;
+
+def entryRest (e : Pair (List Nat) (Pair (List (Pair Nat (List Nat))) Expr)) : List (Pair Nat (List Nat)) :=
+    match e with
+    | MkPair _ payload =>
+        match payload with
+        | MkPair rest _ => rest
+        end
+    end;
+
+def entryBody (e : Pair (List Nat) (Pair (List (Pair Nat (List Nat))) Expr)) : Expr :=
+    match e with
+    | MkPair _ payload =>
+        match payload with
+        | MkPair _ body => body
+        end
+    end;
+
+def pickCanonAt (i : Nat) (entries : List (Pair (List Nat) (Pair (List (Pair Nat (List Nat))) Expr))) : Nat :=
+    (fix go
+        (es : List (Pair (List Nat) (Pair (List (Pair Nat (List Nat))) Expr))) : Nat :=
+        match es with
+        | Nil => add nineK i
+        | Cons e es' =>
+            match compiler_nth_nat i (entryVars e) with
+            | Z => go es'
+            | S n' => S n'
+            end
+        end) entries;
+
+def tabulateCanon (n : Nat) (entries : List (Pair (List Nat) (Pair (List (Pair Nat (List Nat))) Expr))) : List Nat :=
+    (fix go (k : Nat) (i : Nat) : List Nat :=
+        match k with
+        | Z => Nil Nat
+        | S k' => Cons Nat (pickCanonAt i entries) (go k' (S i))
+        end) n Z;
+
+def canonicalVars (entries : List (Pair (List Nat) (Pair (List (Pair Nat (List Nat))) Expr))) : List Nat :=
+    match entries with
+    | Nil => Nil Nat
+    | Cons e _ => tabulateCanon (length Nat (entryVars e)) entries
+    end;
+
+def buildSubst : List Nat -> List Nat -> List (Pair Nat Nat) :=
+  fix buildSubst (vars : List Nat) (canon : List Nat) : List (Pair Nat Nat) :=
+    match vars with
+    | Nil => Nil (Pair Nat Nat)
+    | Cons v vs =>
+        match canon with
+        | Nil => Nil (Pair Nat Nat)
+        | Cons c cs =>
+            match eqNat v Z with
+            | True => buildSubst vs cs
+            | False =>
+                match eqNat v c with
+                | True => buildSubst vs cs
+                | False =>
+                    Cons (Pair Nat Nat) (MkPair Nat Nat v c)
+                      (buildSubst vs cs)
+                end
+            end
+        end
+    end;
+
+def entriesToRows (fuel : Nat) (canon : List Nat) (entries : List (Pair (List Nat) (Pair (List (Pair Nat (List Nat))) Expr))) : List (Pair (List (Pair Nat (List Nat))) Expr) :=
+    (fix go
+        (es : List (Pair (List Nat) (Pair (List (Pair Nat (List Nat))) Expr)))
+        : List (Pair (List (Pair Nat (List Nat))) Expr) :=
+        match es with
+        | Nil => Nil (Pair (List (Pair Nat (List Nat))) Expr)
+        | Cons e es' =>
+            Cons (Pair (List (Pair Nat (List Nat))) Expr)
+              (MkPair (List (Pair Nat (List Nat))) Expr (entryRest e)
+                (rename_expr fuel (buildSubst (entryVars e) canon) (entryBody e)))
+              (go es')
+        end) entries;
+
+def desugar_match :
+    Nat -> List Expr -> List (Pair (List (Pair Nat (List Nat))) Expr) -> Expr :=
+  fix desugar_match (fuel : Nat) (scruts : List Expr)
+    (rows : List (Pair (List (Pair Nat (List Nat))) Expr)) : Expr :=
+    match fuel with
+    | Z => EHole (Nothing Nat)
+    | S fuel' =>
+        match scruts with
+        | Nil =>
+            match rows with
+            | Nil => EHole (Nothing Nat)
+            | Cons r _ =>
+                match r with
+                | MkPair pats body =>
+                    match pats with
+                    | Nil => body
+                    | Cons _ _ => EHole (Nothing Nat)
+                    end
+                end
+            end
+        | Cons s rest_sc =>
+            match rest_sc with
+            | Nil => EMatch s (build_branches rows)
+            | Cons _ _ =>
+                let groups : List (Pair Nat (List (Pair (List Nat)
+                      (Pair (List (Pair Nat (List Nat))) Expr)))) :=
+                  groupByCtor rows in
+                EMatch s
+                  ((fix go
+                      (gs : List (Pair Nat (List (Pair (List Nat)
+                        (Pair (List (Pair Nat (List Nat))) Expr)))))
+                      : Expr :=
+                      match gs with
+                      | Nil => ENoBranch
+                      | Cons g gs' =>
+                          match g with
+                          | MkPair ctor entries =>
+                              let canon : List Nat := canonicalVars entries in
+                              let nested : List (Pair (List (Pair Nat (List Nat))) Expr) :=
+                                entriesToRows fuel' canon entries in
+                              let body : Expr :=
+                                desugar_match fuel' rest_sc nested in
+                              EBranch (Cons Nat ctor canon) body (go gs')
+                          end
+                      end) groups)
+            end
+        end
+    end;
+
+-- One arm per Expr constructor, so the branch count follows the surface AST.
+-- @bound(cyclo <= 64)
+def desugar_expr : Nat -> Expr -> Expr :=
+  fix desugar_expr (fuel : Nat) (e : Expr) : Expr :=
+    match fuel with
+    | Z => e
+    | S fuel' =>
+        match e with
+        | EVar n => EVar n
+        | EHole h => EHole h
+        | ESort u => ESort u
+        | ENat n => ENat n
+        | EStr s => EStr s
+        | EApp f a =>
+            EApp (desugar_expr fuel' f) (desugar_expr fuel' a)
+        | ELam id ann body =>
+            ELam id
+              (match ann with
+              | Nothing => Nothing Expr
+              | Just t => Just Expr (desugar_expr fuel' t)
+              end : Maybe Expr)
+              (desugar_expr fuel' body)
+        | EPi id dom cod =>
+            EPi id (desugar_expr fuel' dom) (desugar_expr fuel' cod)
+        | ELet id ann v body =>
+            ELet id
+              (match ann with
+              | Nothing => Nothing Expr
+              | Just t => Just Expr (desugar_expr fuel' t)
+              end : Maybe Expr)
+              (desugar_expr fuel' v)
+              (desugar_expr fuel' body)
+        | EAscribe e0 t =>
+            EAscribe (desugar_expr fuel' e0) (desugar_expr fuel' t)
+        | EMatch scrut br =>
+            EMatch (desugar_expr fuel' scrut) (desugar_expr fuel' br)
+        | EFix nm binders ret body =>
+            EFix nm
+              (desugar_expr fuel' binders)
+              (desugar_expr fuel' ret)
+              (desugar_expr fuel' body)
+        | EEffectRow ty ops =>
+            EEffectRow (desugar_expr fuel' ty) ops
+        | EPerform op args =>
+            EPerform op
+              ((fix go (xs : List Expr) : List Expr :=
+                  match xs with
+                  | Nil => Nil Expr
+                  | Cons x xs' =>
+                      Cons Expr (desugar_expr fuel' x) (go xs')
+                  end) args)
+        | EDo es =>
+            EDo
+              ((fix go (xs : List Expr) : List Expr :=
+                  match xs with
+                  | Nil => Nil Expr
+                  | Cons x xs' =>
+                      Cons Expr (desugar_expr fuel' x) (go xs')
+                  end) es)
+        | EDoBind name action =>
+            EDoBind name (desugar_expr fuel' action)
+        | EList elems =>
+            EList
+              ((fix go (xs : List Expr) : List Expr :=
+                  match xs with
+                  | Nil => Nil Expr
+                  | Cons x xs' =>
+                      Cons Expr (desugar_expr fuel' x) (go xs')
+                  end) elems)
+        | EHandle comp clauses =>
+            EHandle (desugar_expr fuel' comp)
+              ((fix go (cs : List (Pair Nat (Pair (List Nat) Expr)))
+                  : List (Pair Nat (Pair (List Nat) Expr)) :=
+                  match cs with
+                  | Nil => Nil (Pair Nat (Pair (List Nat) Expr))
+                  | Cons c cs' =>
+                      match c with
+                      | MkPair op payload =>
+                          match payload with
+                          | MkPair vs body =>
+                              Cons (Pair Nat (Pair (List Nat) Expr))
+                                (MkPair Nat (Pair (List Nat) Expr) op
+                                  (MkPair (List Nat) Expr vs
+                                    (desugar_expr fuel' body)))
+                                (go cs')
+                          end
+                      end
+                  end) clauses)
+        | EBranch vs body rest =>
+            EBranch vs (desugar_expr fuel' body)
+              (desugar_expr fuel' rest)
+        | ENoBranch => ENoBranch
+        | EBinder id ty rest =>
+            EBinder id (desugar_expr fuel' ty) (desugar_expr fuel' rest)
+        | ENoBinder => ENoBinder
+        | EMultiMatch scruts rows =>
+            let scruts' : List Expr :=
+              (fix go (xs : List Expr) : List Expr :=
+                  match xs with
+                  | Nil => Nil Expr
+                  | Cons x xs' =>
+                      Cons Expr (desugar_expr fuel' x) (go xs')
+                  end) scruts in
+            let rows' : List (Pair (List (Pair Nat (List Nat))) Expr) :=
+              (fix go
+                  (rs : List (Pair (List (Pair Nat (List Nat))) Expr))
+                  : List (Pair (List (Pair Nat (List Nat))) Expr) :=
+                  match rs with
+                  | Nil => Nil (Pair (List (Pair Nat (List Nat))) Expr)
+                  | Cons r rs' =>
+                      match r with
+                      | MkPair pats body =>
+                          Cons (Pair (List (Pair Nat (List Nat))) Expr)
+                            (MkPair (List (Pair Nat (List Nat))) Expr pats
+                              (desugar_expr fuel' body))
+                            (go rs')
+                      end
+                  end) rows in
+            desugar_match fuel' scruts' rows'
+        end
+    end;
+
+def mapPairNatExpr (fuel : Nat) : List (Pair Nat Expr) -> List (Pair Nat Expr) :=
+    fix go (xs : List (Pair Nat Expr)) : List (Pair Nat Expr) :=
+      match xs with
+      | Nil => Nil (Pair Nat Expr)
+      | Cons p rest =>
+          match p with
+          | MkPair n e =>
+              Cons (Pair Nat Expr)
+                (MkPair Nat Expr n (desugar_expr fuel e))
+                (go rest)
+          end
+      end;
+
+def desugar_decl (fuel : Nat) (d : Decl) : Decl :=
+    match d with
+    | DDef n ty body =>
+        DDef n (desugar_expr fuel ty) (desugar_expr fuel body)
+    | DAxiom n ty =>
+        DAxiom n (desugar_expr fuel ty)
+    | DInductive n params ty ctors =>
+        DInductive n
+          (mapPairNatExpr fuel params)
+          (desugar_expr fuel ty)
+          (mapPairNatExpr fuel ctors)
+    | DEffect n ops handlers =>
+        DEffect n
+          (mapPairNatExpr fuel ops)
+          (mapPairNatExpr fuel handlers)
+    | DImport n => DImport n
+    | DIntrinsic n ty key specialization =>
+        DIntrinsic n (desugar_expr fuel ty) key
+          (match specialization with
+           | Nothing => Nothing Expr
+           | Just value => Just Expr (desugar_expr fuel value)
+           end)
+    | DExtern n ty metadata => DExtern n (desugar_expr fuel ty) metadata
+    | DRepresentation target key => DRepresentation target key
+    end;
+
+def desugar_file (f : List Decl) : List Decl :=
+    (fix go (ds : List Decl) : List Decl :=
+        match ds with
+        | Nil => Nil Decl
+        | Cons d ds' =>
+            Cons Decl (desugar_decl bigFuel d) (go ds')
+        end) f;

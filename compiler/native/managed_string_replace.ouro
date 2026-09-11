@@ -1,0 +1,95 @@
+-- Replacement consumes nonoverlapping matches. A first pass checks the exact
+-- output length; the second copies into one allocation, retaining all owners.
+import "managed_string_search.ouro";
+
+def managed_string_match_at (input : MirValue) (length : MirValue) (pattern : MirValue)
+    (width : MirValue) (index : MirValue) (state : ManagedState) : Either NativeLowerError ManagedResult :=
+    lower_bind ManagedResult ManagedResult (managed_binary MirUSize MirSub length index state)
+      (fun (remaining : ManagedResult) => match remaining with | ManagedResultOf available next =>
+        lower_bind ManagedResult ManagedResult (managed_compare MirLessEqual width available next)
+          (fun (tested : ManagedResult) => match tested with | ManagedResultOf fits after =>
+            managed_string_choose MirU8 fits
+              (fun (selected : ManagedState) => lower_bind ManagedResult ManagedResult
+                (managed_binary MirUSize MirAdd index (managed_bits MirUSize 40) selected)
+                (fun (at : ManagedResult) => match at with | ManagedResultOf offset ready =>
+                  managed_bytes_equal input offset pattern (managed_bits MirUSize 40) width ready end))
+              (managed_string_value (managed_bits MirU8 0)) after end) end);
+
+def managed_string_rewrite_copy (source : MirValue) (start : MirValue) (count : MirValue)
+    (target : Maybe MirValue) (written : MirValue) (state : ManagedState) : Either NativeLowerError ManagedState :=
+    match target with | Nothing => Right NativeLowerError ManagedState state
+    | Just output => lower_bind ManagedResult ManagedState
+        (managed_binary MirUSize MirAdd start (managed_bits MirUSize 40) state)
+        (fun (read_at : ManagedResult) => match read_at with | ManagedResultOf source_offset next =>
+          lower_bind ManagedResult ManagedState (managed_binary MirUSize MirAdd written (managed_bits MirUSize 40) next)
+            (fun (write_at : ManagedResult) => match write_at with | ManagedResultOf target_offset after =>
+              managed_bytes_copy source source_offset output target_offset count after end) end) end;
+
+def managed_string_rewrite_piece (source : MirValue) (start : MirValue) (count : MirValue)
+    (consumed : MirValue) (index : Nat) (written : Nat) (target : Maybe MirValue) (state : ManagedState)
+    : Either NativeLowerError ManagedResult :=
+    lower_bind ManagedResult ManagedResult (managed_binary MirUSize MirAdd (MirUse written) count state)
+      (fun (added : ManagedResult) => match added with | ManagedResultOf total next =>
+        lower_bind ManagedResult ManagedResult (managed_compare MirGreaterEqual total (MirUse written) next)
+          (fun (tested : ManagedResult) => match tested with | ManagedResultOf fits after =>
+            lower_bind ManagedState ManagedResult (managed_guard fits after)
+              (fun (checked : ManagedState) => lower_map ManagedState ManagedResult
+                (fun (copied : ManagedState) => ManagedResultOf (MirUse written) (managed_emit_all
+                  ([MirBinaryOp index MirAdd (MirUse index) consumed, MirMove written total] : List MirInstruction) copied))
+                (managed_string_rewrite_copy source start count target (MirUse written) checked)) end) end);
+
+-- width is nonzero and each input advance is bounded by the remaining input.
+-- Nothing performs only checked counting; Just target copies the same pieces.
+def managed_string_replace_scan (input : MirValue) (length : MirValue) (pattern : MirValue)
+    (width : MirValue) (replacement : MirValue) (replacement_size : MirValue)
+    (target : Maybe MirValue) (state : ManagedState) : Either NativeLowerError ManagedResult :=
+    lower_bind (Pair Nat ManagedState) ManagedResult (managed_fresh_local MirUSize state)
+      (fun (position : Pair Nat ManagedState) => match position with | MkPair index after_position =>
+        lower_bind (Pair Nat ManagedState) ManagedResult (managed_fresh_local MirUSize after_position)
+          (fun (output : Pair Nat ManagedState) => match output with | MkPair written after_output =>
+            let initialized : ManagedState := managed_emit_all
+              ([MirMove index (managed_bits MirUSize 0), MirMove written (managed_bits MirUSize 0)] : List MirInstruction) after_output in
+            lower_bind LowerLoopBlocks ManagedResult (lower_loop_blocks (managed_flow initialized))
+              (fun (labels : LowerLoopBlocks) => match labels with | LowerLoopAt header body finish flow =>
+                lower_bind ManagedResult ManagedResult (managed_compare MirLess (MirUse index) length
+                  (managed_with_flow initialized (lower_switch_block header (MirJump header) flow)))
+                  (fun (tested : ManagedResult) => match tested with | ManagedResultOf running next =>
+                    lower_bind ManagedResult ManagedResult (managed_string_match_at input length pattern width (MirUse index)
+                      (managed_switch_block body (MirBranch running body finish) next))
+                      (fun (matched : ManagedResult) => match matched with | ManagedResultOf equal after_match =>
+                        lower_map ManagedResult ManagedResult (fun (piece : ManagedResult) => match piece with
+                          | ManagedResultOf _ after_piece => ManagedResultOf (MirUse written)
+                              (managed_switch_block finish (MirJump header) after_piece) end)
+                          (managed_string_choose MirUSize equal
+                            (managed_string_rewrite_piece replacement (managed_bits MirUSize 0) replacement_size
+                              width index written target)
+                            (managed_string_rewrite_piece input (MirUse index) (managed_bits MirUSize 1)
+                              (managed_bits MirUSize 1) index written target) after_match) end) end) end) end) end);
+
+def managed_string_replace_nonempty (compiler : ManagedCompiler) (input : MirValue) (length : MirValue)
+    (pattern : MirValue) (width : MirValue) (replacement : MirValue) (replacement_size : MirValue)
+    (state : ManagedState) : Either NativeLowerError ManagedResult :=
+    lower_bind ManagedResult ManagedResult
+      (managed_string_replace_scan input length pattern width replacement replacement_size (Nothing MirValue) state)
+      (fun (counted : ManagedResult) => match counted with | ManagedResultOf size next =>
+        lower_bind ManagedResult ManagedResult (managed_string_allocate compiler size next)
+          (fun (allocated : ManagedResult) => match allocated with | ManagedResultOf result after =>
+            lower_bind ManagedResult ManagedResult
+              (managed_string_replace_scan input length pattern width replacement replacement_size (Just MirValue result) after)
+              (fun (copied : ManagedResult) => match copied with | ManagedResultOf written ready =>
+                lower_map ManagedState ManagedResult (fun (finish : ManagedState) => ManagedResultOf result finish)
+                  (managed_require_equal written size ready) end) end) end);
+
+def managed_string_replace_values (compiler : ManagedCompiler) (input : MirValue) (pattern : MirValue)
+    (replacement : MirValue) (state : ManagedState) : Either NativeLowerError ManagedResult :=
+    lower_bind ManagedResult ManagedResult (managed_string_size compiler input state)
+      (fun (first : ManagedResult) => match first with | ManagedResultOf length next =>
+        lower_bind ManagedResult ManagedResult (managed_string_size compiler pattern next)
+          (fun (second : ManagedResult) => match second with | ManagedResultOf width after =>
+            lower_bind ManagedResult ManagedResult (managed_string_size compiler replacement after)
+              (fun (third : ManagedResult) => match third with | ManagedResultOf replacement_size ready =>
+                lower_bind ManagedResult ManagedResult (managed_compare MirEqual width (managed_bits MirUSize 0) ready)
+                  (fun (tested : ManagedResult) => match tested with | ManagedResultOf empty after_test =>
+                    managed_string_choose MirManagedPtr empty (managed_string_value input)
+                      (managed_string_replace_nonempty compiler input length pattern width replacement replacement_size) after_test
+                    end) end) end) end);

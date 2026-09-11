@@ -1,0 +1,457 @@
+-- Self-hosted TCB mirror: frontend output is trusted only after this checker accepts it.
+-- Fuel exhaustion must be fail-closed; bounded recursion may refuse work, never invent a proof.
+
+-- ouro-analyze:allow-layer-import reason=split-selfhost-kernel-mirror
+import "kernel_term.ouro";
+
+def infer_run_term
+  (infer_run : Nat -> List Entry -> List CoreTerm -> InferMode -> Option CoreTerm)
+  (fuel' : Nat)
+  (sig : List Entry)
+  (ctx : List CoreTerm)
+  (t : CoreTerm) : Option CoreTerm :=
+    match t with
+    | CRel i => lookup_ctx ctx i
+    | CSort u => Some CoreTerm (CSort (S u))
+    | CPi a b => infer_run fuel' sig ctx (IMPi a b)
+    | CLam ann body => infer_run fuel' sig ctx (IMLam ann body)
+    | CApp f a => infer_run fuel' sig ctx (IMApp f a)
+    | CLetIn v ty body => infer_run fuel' sig ctx (IMLet v ty body)
+    | CConst n => lookup_type n sig
+    | CStrLit _ ty => Some CoreTerm (CConst ty)
+    | CInd n => infer_run fuel' sig ctx (IMInd n)
+    | CConstruct i j np => infer_run fuel' sig ctx (IMCtor i j np)
+    | CCase ci p s bs => infer_run fuel' sig ctx (IMCase ci p s bs)
+    | CFix surface_name ra ar ty body =>
+        infer_run fuel' sig ctx (IMFix surface_name ra ar ty body)
+    end;
+
+def infer_run_pi
+  (infer_run : Nat -> List Entry -> List CoreTerm -> InferMode -> Option CoreTerm)
+  (fuel' : Nat)
+  (sig : List Entry)
+  (ctx : List CoreTerm)
+  (a : CoreTerm)
+  (b : CoreTerm) : Option CoreTerm :=
+    match infer_run fuel' sig ctx (IMTerm a) with
+    | None => None CoreTerm
+    | Some a_ty =>
+        match asSort a_ty with
+        | None => None CoreTerm
+        | Some u =>
+            match infer_run fuel' sig (extend ctx a) (IMTerm b) with
+            | None => None CoreTerm
+            | Some b_ty =>
+                match asSort b_ty with
+                | None => None CoreTerm
+                | Some v => Some CoreTerm (CSort (maxNat u v))
+                end
+            end
+        end
+    end;
+
+def infer_run_lam
+  (infer_run : Nat -> List Entry -> List CoreTerm -> InferMode -> Option CoreTerm)
+  (fuel' : Nat)
+  (sig : List Entry)
+  (ctx : List CoreTerm)
+  (ann : CoreTerm)
+  (body : CoreTerm) : Option CoreTerm :=
+    match infer_run fuel' sig ctx (IMTerm ann) with
+    | None => None CoreTerm
+    | Some ann_ty =>
+        match asSort ann_ty with
+        | None => None CoreTerm
+        | Some _u =>
+            match infer_run fuel' sig (extend ctx ann) (IMTerm body) with
+            | None => None CoreTerm
+            | Some body_ty => Some CoreTerm (CPi ann body_ty)
+            end
+        end
+    end;
+
+def infer_run_app
+  (infer_run : Nat -> List Entry -> List CoreTerm -> InferMode -> Option CoreTerm)
+  (fuel' : Nat)
+  (sig : List Entry)
+  (ctx : List CoreTerm)
+  (f : CoreTerm)
+  (a : CoreTerm) : Option CoreTerm :=
+    match infer_run fuel' sig ctx (IMTerm f) with
+    | None => None CoreTerm
+    | Some f_ty =>
+        match piView fuel' sig f_ty with
+        | None => None CoreTerm
+        | Some parts =>
+            match parts with
+            | MkPi dom cod =>
+                match infer_run fuel' sig ctx (IMTerm a) with
+                | None => None CoreTerm
+                | Some a_ty =>
+                    match cumul fuel' sig a_ty dom with
+                    | False => None CoreTerm
+                    | True =>
+                        Some CoreTerm
+                          (normalize fuel' sig (subst a cod))
+                    end
+                end
+            end
+        end
+    end;
+
+def infer_run_let
+  (infer_run : Nat -> List Entry -> List CoreTerm -> InferMode -> Option CoreTerm)
+  (fuel' : Nat)
+  (sig : List Entry)
+  (ctx : List CoreTerm)
+  (v : CoreTerm)
+  (ty : CoreTerm)
+  (body : CoreTerm) : Option CoreTerm :=
+    match infer_run fuel' sig ctx (IMTerm v) with
+    | None => None CoreTerm
+    | Some v_ty =>
+        match cumul fuel' sig v_ty ty with
+        | False => None CoreTerm
+        | True =>
+            match infer_run fuel' sig ctx (IMTerm ty) with
+            | None => None CoreTerm
+            | Some ty_ty =>
+                match asSort ty_ty with
+                | None => None CoreTerm
+                | Some _u =>
+                    match infer_run fuel' sig (extend ctx ty) (IMTerm body) with
+                    | None => None CoreTerm
+                    | Some body_ty =>
+                        Some CoreTerm (subst v body_ty)
+                    end
+                end
+            end
+        end
+    end;
+
+def infer_run_ind
+  (_infer_run : Nat -> List Entry -> List CoreTerm -> InferMode -> Option CoreTerm)
+  (fuel' : Nat)
+  (sig : List Entry)
+  (_ctx : List CoreTerm)
+  (n : Nat) : Option CoreTerm :=
+    match lookup_ind n sig with
+    | None => None CoreTerm
+    | Some idecl =>
+        match check_inductive fuel' idecl with
+        | False => None CoreTerm
+        | True =>
+            match idecl with
+            | MkIndDecl _ params sort _ =>
+                Some CoreTerm (mk_pis (params_types params) (CSort sort))
+            end
+        end
+    end;
+
+def infer_run_ctor
+  (_infer_run : Nat -> List Entry -> List CoreTerm -> InferMode -> Option CoreTerm)
+  (_fuel' : Nat)
+  (sig : List Entry)
+  (_ctx : List CoreTerm)
+  (i : Nat)
+  (j : Nat)
+  (np : Nat) : Option CoreTerm :=
+    match lookup_ind i sig with
+    | None => None CoreTerm
+    | Some idecl =>
+        match idecl with
+        | MkIndDecl _ params _sort ctors =>
+            match eqNat np (length Param params) with
+            | False => None CoreTerm
+            | True =>
+                match nth Ctor ctors j with
+                | None => None CoreTerm
+                | Some c =>
+                    match c with
+                    | MkCtor _ ty => Some CoreTerm ty
+                    end
+                end
+            end
+        end
+    end;
+
+def infer_run_case
+  (infer_run : Nat -> List Entry -> List CoreTerm -> InferMode -> Option CoreTerm)
+  (fuel' : Nat)
+  (sig : List Entry)
+  (ctx : List CoreTerm)
+  (ci : CaseInfo)
+  (p : CoreTerm)
+  (s : CoreTerm)
+  (bs : List CoreTerm) : Option CoreTerm :=
+    match ci with
+    | MkCaseInfo ind _nparams _ci_ctors =>
+        match lookup_ind ind sig with
+        | None => None CoreTerm
+        | Some idecl =>
+            infer_run fuel' sig ctx (IMCaseInd ci p s bs idecl)
+        end
+    end;
+
+def infer_run_caseind
+  (infer_run : Nat -> List Entry -> List CoreTerm -> InferMode -> Option CoreTerm)
+  (fuel' : Nat)
+  (sig : List Entry)
+  (ctx : List CoreTerm)
+  (ci : CaseInfo)
+  (p : CoreTerm)
+  (s : CoreTerm)
+  (bs : List CoreTerm)
+  (idecl : IndDecl) : Option CoreTerm :=
+    match check_coverage idecl (length CoreTerm bs) with
+    | False => None CoreTerm
+    | True => infer_run fuel' sig ctx (IMCasePTy ci p s bs idecl)
+    end;
+
+def infer_run_casepty
+  (infer_run : Nat -> List Entry -> List CoreTerm -> InferMode -> Option CoreTerm)
+  (fuel' : Nat)
+  (sig : List Entry)
+  (ctx : List CoreTerm)
+  (ci : CaseInfo)
+  (p : CoreTerm)
+  (s : CoreTerm)
+  (bs : List CoreTerm)
+  (idecl : IndDecl) : Option CoreTerm :=
+    match infer_run fuel' sig ctx (IMTerm p) with
+    | None => None CoreTerm
+    | Some p_ty =>
+        match idecl with
+        | MkIndDecl _ params _sort _ctors =>
+            match check_return_pred fuel' sig ctx ci (params_types params) p_ty with
+            | False => None CoreTerm
+            | True => infer_run fuel' sig ctx (IMCaseScrut ci p s bs idecl)
+            end
+        end
+    end;
+
+def infer_run_casescrut
+  (infer_run : Nat -> List Entry -> List CoreTerm -> InferMode -> Option CoreTerm)
+  (fuel' : Nat)
+  (sig : List Entry)
+  (ctx : List CoreTerm)
+  (ci : CaseInfo)
+  (p : CoreTerm)
+  (s : CoreTerm)
+  (bs : List CoreTerm)
+  (idecl : IndDecl) : Option CoreTerm :=
+    match infer_run fuel' sig ctx (IMTerm s) with
+    | None => None CoreTerm
+    | Some s_ty =>
+        infer_run fuel' sig ctx (IMCaseSpine ci p s bs idecl s_ty)
+    end;
+
+def infer_run_casespine
+  (infer_run : Nat -> List Entry -> List CoreTerm -> InferMode -> Option CoreTerm)
+  (fuel' : Nat)
+  (sig : List Entry)
+  (ctx : List CoreTerm)
+  (ci : CaseInfo)
+  (p : CoreTerm)
+  (s : CoreTerm)
+  (bs : List CoreTerm)
+  (idecl : IndDecl)
+  (s_ty : CoreTerm) : Option CoreTerm :=
+    match app_spine fuel' (normalize fuel' sig s_ty) with
+    | MkSpine h spine_args =>
+        match asInd h with
+        | None => None CoreTerm
+        | Some ind' =>
+            match ci with
+            | MkCaseInfo ind nparams _ci_ctors =>
+                match eqNat ind' ind with
+                | False => None CoreTerm
+                | True =>
+                    match eqNat (length CoreTerm spine_args) nparams with
+                    | False => None CoreTerm
+                    | True =>
+                        infer_run fuel' sig ctx
+                          (IMCaseArgs ci p s bs idecl spine_args)
+                    end
+                end
+            end
+        end
+    end;
+
+def infer_run_caseargs
+  (infer_run : Nat -> List Entry -> List CoreTerm -> InferMode -> Option CoreTerm)
+  (fuel' : Nat)
+  (sig : List Entry)
+  (ctx : List CoreTerm)
+  (ci : CaseInfo)
+  (p : CoreTerm)
+  (s : CoreTerm)
+  (bs : List CoreTerm)
+  (idecl : IndDecl)
+  (spine_args : List CoreTerm) : Option CoreTerm :=
+    match idecl with
+    | MkIndDecl _ _params _sort ctors =>
+        infer_run fuel' sig ctx
+          (IMBranches ci p s spine_args Z ctors bs)
+    end;
+
+def infer_run_branches
+  (infer_run : Nat -> List Entry -> List CoreTerm -> InferMode -> Option CoreTerm)
+  (fuel' : Nat)
+  (sig : List Entry)
+  (ctx : List CoreTerm)
+  (ci : CaseInfo)
+  (p : CoreTerm)
+  (s : CoreTerm)
+  (spine_args : List CoreTerm)
+  (j : Nat)
+  (ctors : List Ctor)
+  (bs : List CoreTerm) : Option CoreTerm :=
+    match ctors, bs with
+    | Nil, Nil =>
+        -- native: P applied to indices ++ [scrutinee]; nix=0 → P s
+        Some CoreTerm (CApp p s)
+    | Cons c cs', Cons b bs' =>
+        match ci with
+        | MkCaseInfo ind nparams ci_ctors =>
+            match nth Nat ci_ctors j with
+            | None => None CoreTerm
+            | Some k =>
+                match c with
+                | MkCtor _ ctor_type =>
+                    -- Ctor telescope shorter than nparams → refuse.
+                    match leNat nparams (pi_arity ctor_type) with
+                    | False => None CoreTerm
+                    | True =>
+                        let inst : CoreTerm :=
+                          instantiate_params ctor_type spine_args in
+                        match peel_pis inst with
+                        | MkPiList arg_types _ret =>
+                            match eqNat (length CoreTerm arg_types) k with
+                            | False => None CoreTerm
+                            | True =>
+                                let expected : CoreTerm :=
+                                  branch_expected ind nparams spine_args p j
+                                    arg_types in
+                                match infer_run fuel' sig ctx (IMTerm b) with
+                                | None => None CoreTerm
+                                | Some b_ty =>
+                                    match cumul fuel' sig b_ty expected with
+                                    | False => None CoreTerm
+                                    | True =>
+                                        infer_run fuel' sig ctx
+                                          (IMBranches ci p s spine_args
+                                            (S j) cs' bs')
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    | Nil, Cons _ _ => None CoreTerm
+    | Cons _ _, Nil => None CoreTerm
+    end;
+
+def infer_run_fix
+  (infer_run : Nat -> List Entry -> List CoreTerm -> InferMode -> Option CoreTerm)
+  (fuel' : Nat)
+  (sig : List Entry)
+  (ctx : List CoreTerm)
+  (fix_name : Nat)
+  (ra : Nat)
+  (ar : Nat)
+  (ty : CoreTerm)
+  (body : CoreTerm) : Option CoreTerm :=
+    match infer_run fuel' sig ctx (IMTerm ty) with
+    | None => None CoreTerm
+    | Some ty_ty =>
+        match asSort ty_ty with
+        | None => None CoreTerm
+        | Some _u =>
+            match leNat ar (pi_arity ty) with
+            | False => None CoreTerm
+            | True =>
+                match ltNat ra ar with
+                | False => None CoreTerm
+                | True =>
+                    infer_run fuel' sig ctx
+                      (IMFixBody fix_name ra ar ty body)
+                end
+            end
+        end
+    end;
+
+def infer_run_fixbody
+  (infer_run : Nat -> List Entry -> List CoreTerm -> InferMode -> Option CoreTerm)
+  (fuel' : Nat)
+  (sig : List Entry)
+  (ctx : List CoreTerm)
+  (body_name : Nat)
+  (ra : Nat)
+  (ar : Nat)
+  (ty : CoreTerm)
+  (body : CoreTerm) : Option CoreTerm :=
+    let fix_ty : CoreTerm := lift 1 ty in
+    match infer_run fuel' sig (extend ctx ty) (IMTerm body) with
+    | None => None CoreTerm
+    | Some body_ty =>
+        match cumul fuel' sig body_ty fix_ty with
+        | False => None CoreTerm
+        | True =>
+            infer_run fuel' sig ctx (IMFixTerm body_name ra ar ty body)
+        end
+    end;
+
+def infer_run_fixterm
+  (_infer_run : Nat -> List Entry -> List CoreTerm -> InferMode -> Option CoreTerm)
+  (fuel' : Nat)
+  (_sig : List Entry)
+  (_ctx : List CoreTerm)
+  (_term_name : Nat)
+  (ra : Nat)
+  (ar : Nat)
+  (ty : CoreTerm)
+  (body : CoreTerm) : Option CoreTerm :=
+    match check_termination ra ar fuel' body with
+    | False => None CoreTerm
+    | True => Some CoreTerm ty
+    end;
+
+def infer_run : Nat -> List Entry -> List CoreTerm -> InferMode -> Option CoreTerm :=
+  fix infer_run (fuel : Nat) (sig : List Entry) (ctx : List CoreTerm)
+      (mode : InferMode) : Option CoreTerm :=
+    match fuel with
+    | Z => None CoreTerm
+    | S fuel' =>
+        match mode with
+        | IMTerm t => infer_run_term infer_run fuel' sig ctx t
+        | IMPi a b => infer_run_pi infer_run fuel' sig ctx a b
+        | IMLam ann body => infer_run_lam infer_run fuel' sig ctx ann body
+        | IMApp f a => infer_run_app infer_run fuel' sig ctx f a
+        | IMLet v ty body => infer_run_let infer_run fuel' sig ctx v ty body
+        | IMInd n => infer_run_ind infer_run fuel' sig ctx n
+        | IMCtor i j np => infer_run_ctor infer_run fuel' sig ctx i j np
+        | IMCase ci p s bs => infer_run_case infer_run fuel' sig ctx ci p s bs
+        | IMCaseInd ci p s bs idecl => infer_run_caseind infer_run fuel' sig ctx ci p s bs idecl
+        | IMCasePTy ci p s bs idecl => infer_run_casepty infer_run fuel' sig ctx ci p s bs idecl
+        | IMCaseScrut ci p s bs idecl => infer_run_casescrut infer_run fuel' sig ctx ci p s bs idecl
+        | IMCaseSpine ci p s bs idecl s_ty => infer_run_casespine infer_run fuel' sig ctx ci p s bs idecl s_ty
+        | IMCaseArgs ci p s bs idecl spine_args => infer_run_caseargs infer_run fuel' sig ctx ci p s bs idecl spine_args
+        | IMBranches ci p s spine_args j ctors bs => infer_run_branches infer_run fuel' sig ctx ci p s spine_args j ctors bs
+        | IMFix fix_name ra ar ty body => infer_run_fix infer_run fuel' sig ctx fix_name ra ar ty body
+        | IMFixBody body_name ra ar ty body => infer_run_fixbody infer_run fuel' sig ctx body_name ra ar ty body
+        | IMFixTerm term_name ra ar ty body => infer_run_fixterm infer_run fuel' sig ctx term_name ra ar ty body
+        end
+    end;
+
+def infer (fuel : Nat) (sig : List Entry) (ctx : List CoreTerm) (t : CoreTerm) : Option CoreTerm :=
+    infer_run fuel sig ctx (IMTerm t);
+
+-- @entry check
+def check (fuel : Nat) (sig : List Entry) (ctx : List CoreTerm) (t : CoreTerm) (ty : CoreTerm) : Bool :=
+    match infer fuel sig ctx t with
+    | None => False
+    | Some t_ty => cumul fuel sig t_ty ty
+    end;

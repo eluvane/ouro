@@ -1,0 +1,102 @@
+-- Shared boxed word adapters. Host-specific primitive dispatch stays in the
+-- managed_primitives* owners so the stdio driver can reject process/http/temp.
+import "managed_raw.ouro";
+
+def managed_word_argument (compiler : ManagedCompiler) (step : ManagedStep) (scope : ManagedScope)
+    (word : PrimitiveWord) (term : CoreTerm) (state : ManagedState) : Either NativeLowerError ManagedResult :=
+    lower_bind ManagedResult ManagedResult (step scope term state)
+      (fun (boxed : ManagedResult) => match boxed with | ManagedResultOf value next =>
+        managed_unbox_word compiler word value next end);
+
+def managed_word_result (compiler : ManagedCompiler) (word : PrimitiveWord) (operation : PrimitiveWordOp)
+    (left : MirValue) (right : MirValue) (state : ManagedState) : Either NativeLowerError ManagedResult :=
+    let primitive : PrimitiveId := PrimitiveWordOperation word operation in
+    match orb (primitive_id_equal primitive (PrimitiveWordOperation word PrimitiveWordEqual))
+        (primitive_id_equal primitive (PrimitiveWordOperation word PrimitiveWordLess)) with
+    | True => lower_bind ManagedResult ManagedResult (managed_compare
+        (match primitive_id_equal primitive (PrimitiveWordOperation word PrimitiveWordEqual) with
+          | True => MirEqual | False => MirLess end) left right state)
+        (fun (compared : ManagedResult) => match compared with | ManagedResultOf condition after =>
+          managed_boolean compiler condition after end)
+    | False => lower_bind MirBinary ManagedResult (lower_binary_operation word operation)
+        (fun (binary : MirBinary) => lower_bind ManagedResult ManagedResult (managed_binary (lower_word word) binary left right state)
+          (fun (computed : ManagedResult) => match computed with | ManagedResultOf value after =>
+            managed_box_word compiler word value after end)) end;
+
+def managed_word_operation (compiler : ManagedCompiler) (step : ManagedStep) (scope : ManagedScope)
+    (word : PrimitiveWord) (operation : PrimitiveWordOp) (arguments : List CoreTerm) (state : ManagedState)
+    : Either NativeLowerError ManagedResult :=
+    lower_bind (Pair CoreTerm CoreTerm) ManagedResult (lower_pair CoreTerm arguments)
+      (fun (pair : Pair CoreTerm CoreTerm) => match pair with | MkPair a b =>
+        let shift : Bool := orb (primitive_id_equal (PrimitiveWordOperation word operation) (PrimitiveWordOperation word PrimitiveShiftLeft))
+          (primitive_id_equal (PrimitiveWordOperation word operation) (PrimitiveWordOperation word PrimitiveShiftRight)) in
+        lower_bind ManagedResult ManagedResult (managed_word_argument compiler step scope word a state)
+          (fun (left : ManagedResult) => match left with | ManagedResultOf first next =>
+            lower_bind ManagedResult ManagedResult
+              (managed_word_argument compiler step scope (match shift with | True => PrimitiveWordU32 | False => word end) b next)
+              (fun (right : ManagedResult) => match right with | ManagedResultOf second after =>
+                managed_word_result compiler word operation first second after end) end) end);
+
+def managed_word_conversion (compiler : ManagedCompiler) (step : ManagedStep) (scope : ManagedScope)
+    (from : PrimitiveWord) (into : PrimitiveWord) (conversion : PrimitiveConversion)
+    (arguments : List CoreTerm) (state : ManagedState) : Either NativeLowerError ManagedResult :=
+    lower_bind MirConversion ManagedResult (lower_conversion_operation from into conversion)
+      (fun (operation : MirConversion) => lower_bind CoreTerm ManagedResult (lower_single CoreTerm arguments)
+        (fun (term : CoreTerm) => lower_bind ManagedResult ManagedResult (managed_word_argument compiler step scope from term state)
+          (fun (argument : ManagedResult) => match argument with | ManagedResultOf value next =>
+            lower_bind ManagedResult ManagedResult (managed_convert (lower_word into) operation value next)
+              (fun (converted : ManagedResult) => match converted with | ManagedResultOf result after =>
+                managed_box_word compiler into result after end) end)));
+
+def managed_nat_optional (compiler : ManagedCompiler) (optional : Nat) (word : PrimitiveWord)
+    (fits : MirValue) (bits : MirValue) (state : ManagedState) : Either NativeLowerError ManagedResult :=
+    lower_bind (Pair Nat ManagedState) ManagedResult (managed_fresh_local MirManagedPtr state)
+      (fun (fresh : Pair Nat ManagedState) => match fresh with | MkPair cell next =>
+        lower_bind LowerLoopBlocks ManagedResult (lower_loop_blocks (managed_flow next))
+          (fun (labels : LowerLoopBlocks) => match labels with | LowerLoopAt yes no finish flow =>
+            lower_bind ManagedResult ManagedResult (managed_box_word compiler word bits
+              (managed_switch_block yes (MirBranch fits yes no) (managed_with_flow next flow)))
+              (fun (boxed : ManagedResult) => match boxed with | ManagedResultOf value after_box =>
+                lower_bind ManagedResult ManagedResult
+                  (managed_constructor compiler optional (managed_bits MirUSize 1) ([value] : List MirValue) after_box)
+                  (fun (present : ManagedResult) => match present with | ManagedResultOf just after_just =>
+                    lower_map ManagedResult ManagedResult (fun (absent : ManagedResult) => match absent with
+                      | ManagedResultOf nothing after_nothing => ManagedResultOf (MirUse cell)
+                          (managed_switch_block finish (MirJump finish) (managed_emit (MirMove cell nothing) after_nothing)) end)
+                      (managed_constructor compiler optional (managed_bits MirUSize 0) ([] : List MirValue)
+                        (managed_switch_block no (MirJump finish) (managed_emit (MirMove cell just) after_just))) end) end) end) end);
+
+def managed_word_from_dynamic_nat (compiler : ManagedCompiler) (step : ManagedStep) (scope : ManagedScope)
+    (optional : Nat) (word : PrimitiveWord) (term : CoreTerm) (state : ManagedState)
+    : Either NativeLowerError ManagedResult :=
+    lower_bind ManagedResult ManagedResult (step scope term state)
+      (fun (evaluated : ManagedResult) => match evaluated with | ManagedResultOf natural next =>
+        lower_bind ManagedNatWordResult ManagedResult (managed_nat_checked_word compiler word natural next)
+          (fun (converted : ManagedNatWordResult) => match converted with | ManagedNatWordOf fits bits after =>
+            managed_nat_optional compiler optional word fits bits after end) end);
+
+-- Compact syntactic literals retain the checked word fast path. All other
+-- checked Nat terms are evaluated through the arbitrary-precision ABI.
+def managed_word_from_nat (compiler : ManagedCompiler) (step : ManagedStep) (scope : ManagedScope)
+    (fuel : Nat) (word : PrimitiveWord)
+    (arguments : List CoreTerm) (state : ManagedState) : Either NativeLowerError ManagedResult :=
+    let entries : List Entry := managed_compiler_entries compiler in
+    lower_bind Nat ManagedResult (lower_role_identity entries PrimitiveNatRole) (fun (natural : Nat) =>
+      lower_bind Nat ManagedResult (lower_role_identity entries PrimitiveMaybeRole) (fun (optional : Nat) =>
+        lower_bind CoreTerm ManagedResult (lower_single CoreTerm arguments) (fun (term : CoreTerm) =>
+          lower_bind (Maybe Nat) ManagedResult (managed_nat_literal natural fuel term)
+            (fun (literal : Maybe Nat) => match literal with
+              | Nothing => managed_word_from_dynamic_nat compiler step scope optional word term state
+              | Just value => lower_bind Unit ManagedResult (lower_require (leb_nat value pe_max_rva) LowerResourceExhausted)
+                  (fun (_ : Unit) => match lower_nat_word word (LowerNatBits (X64Words64 (pe_word32 value) codegen_zero) False) with
+              | Nothing => managed_constructor compiler optional (managed_bits MirUSize 0) ([] : List MirValue) state
+              | Just bits => lower_bind ManagedResult ManagedResult (managed_box_word compiler word bits state)
+                  (fun (boxed : ManagedResult) => match boxed with | ManagedResultOf value next =>
+                    managed_constructor compiler optional (managed_bits MirUSize 1) ([value] : List MirValue) next end) end) end))));
+
+def managed_word_to_nat (compiler : ManagedCompiler) (step : ManagedStep) (scope : ManagedScope)
+    (word : PrimitiveWord) (arguments : List CoreTerm) (state : ManagedState) : Either NativeLowerError ManagedResult :=
+    lower_bind CoreTerm ManagedResult (lower_single CoreTerm arguments)
+      (fun (term : CoreTerm) => lower_bind ManagedResult ManagedResult (managed_word_argument compiler step scope word term state)
+        (fun (unboxed : ManagedResult) => match unboxed with | ManagedResultOf value next =>
+          managed_nat_from_word compiler word value next end));

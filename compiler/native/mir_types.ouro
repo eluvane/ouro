@@ -1,0 +1,192 @@
+-- Local, instruction and call signature checks. CFG checks are in mir_flow.
+import "mir_managed.ouro";
+
+def mir_checks (checks : List (Either MirError Unit)) : Either MirError Unit :=
+    mir_each (Either MirError Unit) (fun (check : Either MirError Unit) => check) checks;
+
+def mir_type_of_local (locals : List MirLocal) (id : Nat) : Either MirError MirType :=
+    match mir_find_local id locals with
+    | Nothing => Left MirError MirType (MirUnknownLocal id)
+    | Just local => Right MirError MirType (mir_local_type local) end;
+
+def mir_type_of_value (locals : List MirLocal) (value : MirValue) : Either MirError MirType :=
+    match value with
+    | MirUse id => mir_type_of_local locals id
+    | MirBits ty word => match x64_word64_bytes word with
+      | Left _ => Left MirError MirType MirInvalidLiteral
+      | Right bytes =>
+        let used : Nat := match mir_pointer ty with | True => 0 | False => div_nat (mir_type_bits ty) 8 end in
+        match all Nat (fun (byte : Nat) => eq_nat byte 0) (drop Nat used bytes) with
+        | True => Right MirError MirType ty | False => Left MirError MirType MirInvalidLiteral end end end;
+
+def mir_expect_value (locals : List MirLocal) (id : Nat) (ty : MirType) (value : MirValue) : Either MirError Unit :=
+    match mir_type_of_value locals value with
+    | Left err => Left MirError Unit err
+    | Right actual => mir_require (mir_type_equal actual ty) (MirTypeMismatch id) end;
+
+def mir_check_pointer (locals : List MirLocal) (value : MirValue) : Either MirError Unit :=
+    match mir_type_of_value locals value with | Left err => Left MirError Unit err
+    | Right ty => mir_require (mir_pointer ty) (MirTypeMismatch 0) end;
+
+def mir_check_displacement (disp : X64Displacement) : Either MirError Unit :=
+    match x64_displacement_bytes disp with
+    | Left _ => Left MirError Unit MirInvalidDisplacement | Right _ => Right MirError Unit MkUnit end;
+
+def mir_check_args (locals : List MirLocal) (id : Nat) : List MirType -> List MirValue -> Either MirError Unit :=
+  fix mir_check_args (types : List MirType) (args : List MirValue) : Either MirError Unit :=
+    match types, args with
+    | Nil, Nil => Right MirError Unit MkUnit
+    | Cons ty types2, Cons value args2 => match mir_expect_value locals id ty value with
+      | Left err => Left MirError Unit err | Right _ => mir_check_args types2 args2 end
+    | Nil, Cons _ _ => Left MirError Unit (MirInvalidCall id)
+    | Cons _ _, Nil => Left MirError Unit (MirInvalidCall id) end;
+
+def mir_check_call_result (locals : List MirLocal) (id : Nat)
+    (dest : Maybe Nat) (result : Maybe MirType) : Either MirError Unit :=
+    match dest, result with
+    | Nothing, Nothing => Right MirError Unit MkUnit
+    | Just local, Just ty => match mir_type_of_local locals local with
+      | Left err => Left MirError Unit err
+      | Right actual => mir_require (mir_type_equal actual ty) (MirTypeMismatch local) end
+    | Nothing, Just _ => Left MirError Unit (MirInvalidCall id)
+    | Just _, Nothing => Left MirError Unit (MirInvalidCall id) end;
+
+def mir_call_signature (program : MirProgram) (locals : List MirLocal) (target : MirCallTarget)
+    : Either MirError MirSignature :=
+    match target with | MirDirect id => mir_symbol_signature program id
+    | MirIndirect signature address => match mir_expect_value locals 0 MirRawPtr address with
+      | Left err => Left MirError MirSignature err | Right _ => Right MirError MirSignature signature end end;
+
+def mir_check_call (program : MirProgram) (locals : List MirLocal) (id : Nat)
+    (dest : Maybe Nat) (target : MirCallTarget) (args : List MirValue) : Either MirError Unit :=
+    match mir_call_signature program locals target with
+    | Left err => Left MirError Unit err
+    | Right signature => match signature with | MirSignatureOf parameters result =>
+      mir_checks ([mir_check_args locals id parameters args, mir_check_call_result locals id dest result]
+        : List (Either MirError Unit)) end end;
+
+def mir_conversion_valid (conversion : MirConversion) (source : MirType) (dest : MirType) : Bool :=
+    let integers : Bool := andb (mir_integer source) (mir_integer dest) in
+    match conversion with
+    | MirNarrow => andb integers (ltb_nat (mir_type_bits dest) (mir_type_bits source))
+    | MirZeroExtend => andb integers
+        (andb (notb (mir_type_equal source MirI32)) (ltb_nat (mir_type_bits source) (mir_type_bits dest)))
+    | MirSignExtend => andb integers (andb (mir_type_equal source MirI32) (eq_nat (mir_type_bits dest) 64))
+    | MirReinterpret => andb integers (eq_nat (mir_type_bits source) (mir_type_bits dest))
+    | MirRawToBits => andb (mir_type_equal source MirRawPtr) (mir_type_equal dest MirUSize)
+    | MirRawFromBits => andb (mir_type_equal source MirUSize) (mir_type_equal dest MirRawPtr) end;
+
+def mir_symbol_exists (program : MirProgram) (id : Nat) : Bool :=
+    match program with | MirProgramDef functions objects libraries _ =>
+      orb (any MirFunction (fun (function : MirFunction) => eq_nat id (mir_function_id function)) functions)
+        (orb (any MirData (fun (object : MirData) => eq_nat id (mir_data_id object)) objects)
+          (match mir_find_extern id libraries with | Nothing => False | Just _ => True end)) end;
+
+def mir_check_binary (locals : List MirLocal) (id : Nat) (operation : MirBinary)
+    (left : MirValue) (right : MirValue) : Either MirError Unit :=
+    match mir_type_of_local locals id with | Left err => Left MirError Unit err | Right ty =>
+      let right_type : MirType := match operation with | MirShl => MirU32 | MirShr => MirU32
+        | MirAdd => ty | MirSub => ty | MirMul => ty | MirAnd => ty | MirOr => ty
+        | MirXor => ty | MirDiv => ty | MirRem => ty end in
+      mir_checks ([mir_require (mir_integer ty) (MirTypeMismatch id),
+        mir_expect_value locals id ty left, mir_expect_value locals id right_type right]
+        : List (Either MirError Unit)) end;
+
+def mir_check_compare (locals : List MirLocal) (id : Nat) (operation : MirComparison)
+    (left : MirValue) (right : MirValue) : Either MirError Unit :=
+    match mir_type_of_local locals id with | Left err => Left MirError Unit err | Right dest =>
+      match mir_type_of_value locals left with | Left err => Left MirError Unit err | Right ty =>
+        let equality : Bool := match operation with | MirEqual => True | MirNotEqual => True
+          | MirLess => False | MirLessEqual => False | MirGreater => False | MirGreaterEqual => False end in
+        mir_checks ([mir_require (mir_type_equal dest MirU8) (MirTypeMismatch id),
+          mir_require (orb (mir_integer ty) equality) (MirTypeMismatch id),
+          mir_expect_value locals id ty right] : List (Either MirError Unit)) end end;
+
+def mir_check_managed_allocator (program : MirProgram) (allocator : Nat) : Either MirError Unit :=
+    match program with | MirProgramDef functions _ _ _ =>
+      match mir_find_function allocator functions with
+      | Nothing => Left MirError Unit (MirInvalidCall allocator)
+      | Just function => match mir_function_signature function with | MirSignatureOf args result =>
+        let expected : List MirType := ([MirRawPtr, MirRawPtr, MirUSize] : List MirType) in
+        mir_require (andb (eq_nat (length MirType args) 3)
+          (andb (all (Pair MirType MirType) (fun (pair : Pair MirType MirType) => match pair with
+            | MkPair actual wanted => mir_type_equal actual wanted end) (zip MirType MirType args expected))
+            (match result with | Nothing => False | Just ty => mir_type_equal ty MirRawPtr end)))
+          (MirInvalidCall allocator) end end end;
+
+def mir_check_managed_descriptor (program : MirProgram) (descriptor : Nat) : Either MirError Unit :=
+    match program with | MirProgramDef _ objects _ _ =>
+      match find MirData (fun (object : MirData) => eq_nat (mir_data_id object) descriptor) objects with
+      | Nothing => Left MirError Unit (MirInvalidData descriptor)
+      | Just object => match object with | MirDataDef _ writable bytes =>
+        mir_require (andb (notb writable) (mir_managed_descriptor_valid bytes)) (MirInvalidData descriptor) end end end;
+
+def mir_check_managed_collector (program : MirProgram) (collector : Nat) : Either MirError Unit :=
+    match program with | MirProgramDef functions _ _ _ =>
+      match mir_find_function collector functions with
+      | Nothing => Left MirError Unit (MirInvalidCall collector)
+      | Just function => match mir_function_signature function with | MirSignatureOf args result =>
+        mir_require (andb (match args with | Nil => False | Cons arg rest =>
+          andb (mir_type_equal arg MirRawPtr) (eq_nat (length MirType rest) 0) end)
+          (match result with | Nothing => False | Just ty => mir_type_equal ty MirU8 end))
+          (MirInvalidCall collector) end end end;
+
+def mir_check_instruction (program : MirProgram) (locals : List MirLocal) (function : Nat)
+    (instruction : MirInstruction) : Either MirError Unit :=
+    match instruction with
+    | MirMove id value => match mir_type_of_local locals id with
+      | Left err => Left MirError Unit err | Right ty => mir_expect_value locals id ty value end
+    | MirBinaryOp id operation left right => mir_check_binary locals id operation left right
+    | MirCompare id operation left right => mir_check_compare locals id operation left right
+    | MirConvert id conversion value => match mir_type_of_local locals id with
+      | Left err => Left MirError Unit err | Right dest => match mir_type_of_value locals value with
+        | Left err => Left MirError Unit err
+        | Right source => mir_require (mir_conversion_valid conversion source dest) (MirInvalidConversion id) end end
+    | MirLoad id address disp => match mir_type_of_local locals id with
+      | Left err => Left MirError Unit err | Right _ =>
+        mir_checks ([mir_check_pointer locals address, mir_check_displacement disp] : List (Either MirError Unit)) end
+    | MirStore address disp value => match mir_type_of_value locals value with
+      | Left err => Left MirError Unit err | Right _ =>
+        mir_checks ([mir_check_pointer locals address, mir_check_displacement disp] : List (Either MirError Unit)) end
+    | MirLoadAt id address offset => match mir_type_of_local locals id with
+      | Left err => Left MirError Unit err | Right _ =>
+        mir_checks ([mir_check_pointer locals address, mir_expect_value locals id MirUSize offset]
+          : List (Either MirError Unit)) end
+    | MirStoreAt address offset value => match mir_type_of_value locals value with
+      | Left err => Left MirError Unit err | Right _ =>
+        mir_checks ([mir_check_pointer locals address, mir_expect_value locals 0 MirUSize offset]
+          : List (Either MirError Unit)) end
+    | MirAddress id symbol => match mir_type_of_local locals id with
+      | Left err => Left MirError Unit err | Right ty =>
+        mir_checks ([mir_require (mir_type_equal ty MirRawPtr) (MirInvalidAddress id),
+          mir_require (mir_symbol_exists program symbol) (MirUnknownSymbol symbol)] : List (Either MirError Unit)) end
+    | MirPointerAdd id address offset => match mir_type_of_local locals id with
+      | Left err => Left MirError Unit err | Right ty =>
+        mir_checks ([mir_require (mir_type_equal ty MirRawPtr) (MirInvalidAddress id),
+          mir_expect_value locals id MirRawPtr address, mir_expect_value locals id MirUSize offset]
+          : List (Either MirError Unit)) end
+    | MirCall _ dest target args => mir_check_call program locals function dest target args
+    | MirManagedAlloc id allocator collector descriptor bytes =>
+        mir_checks ([mir_check_call_result locals function (Just Nat id) (Just MirType MirManagedPtr),
+          mir_check_managed_allocator program allocator, mir_check_managed_collector program collector,
+          mir_check_managed_descriptor program descriptor,
+          mir_expect_value locals id MirUSize bytes] : List (Either MirError Unit))
+    | MirManagedContext id => mir_check_call_result locals function (Just Nat id) (Just MirType MirRawPtr) end;
+
+def mir_check_return (locals : List MirLocal) (id : Nat) (expected : Maybe MirType)
+    (value : Maybe MirValue) : Either MirError Unit :=
+    match expected, value with
+    | Nothing, Nothing => Right MirError Unit MkUnit
+    | Just ty, Just result => mir_expect_value locals id ty result
+    | Nothing, Just _ => Left MirError Unit (MirInvalidReturn id)
+    | Just _, Nothing => Left MirError Unit (MirInvalidReturn id) end;
+
+def mir_check_block_types (program : MirProgram) (locals : List MirLocal) (function : Nat)
+    (result : Maybe MirType) (ids : List Nat) (block : MirBlock) : Either MirError Unit :=
+    match block with | MirBlockDef _ instructions term =>
+      mir_checks ([mir_each MirInstruction (mir_check_instruction program locals function) instructions,
+        mir_each Nat (fun (id : Nat) => mir_require (mir_has id ids) (MirUnknownBlock id)) (mir_successors block),
+        match term with | MirBranch condition _ _ => mir_expect_value locals function MirU8 condition
+        | MirReturn value => mir_check_return locals function result value
+        | MirJump _ => Right MirError Unit MkUnit | MirTrap => Right MirError Unit MkUnit end]
+        : List (Either MirError Unit)) end;

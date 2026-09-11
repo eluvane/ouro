@@ -1,0 +1,150 @@
+-- Bad/good/false-positive formatter fixtures and the shared fix -> fmt
+-- contract. The public checked pipelines are tested without duplicating
+-- their implementation or accepting a merely smaller diagnostic count.
+
+-- @entry main
+
+import "../../../tools/fix/pipeline.ouro";
+import "../../../std/stringx.ouro";
+import "assertions.ouro";
+
+def precision_fmt_expected (src : String) (expected : String) : Bool :=
+    match fmt_checked src with
+    | Left _ => False
+    | Right out => andb (str_eq out expected) (str_eq out (fmt_string out))
+    end;
+
+def precision_fmt_code (issue : Issue) : String :=
+    match issue with
+    | ICrlf n => str_concat "ICrlf:" (show_nat n)
+    | IFinalNewline n => str_concat "IFinalNewline:" (show_nat n)
+    | IEofBlanks n => str_concat "IEofBlanks:" (show_nat n)
+    | ITabs n => str_concat "ITabs:" (show_nat n)
+    | ITrailingWs n => str_concat "ITrailingWs:" (show_nat n)
+    | IIndent n => str_concat "IIndent:" (show_nat n)
+    | ILineLength n => str_concat "ILineLength:" (show_nat n)
+    | ICommentSpace n => str_concat "ICommentSpace:" (show_nat n)
+    | IColonEqSpace n => str_concat "IColonEqSpace:" (show_nat n)
+    | IFatArrowSpace n => str_concat "IFatArrowSpace:" (show_nat n)
+    | IPipeSpace n => str_concat "IPipeSpace:" (show_nat n)
+    end;
+
+def precision_fmt_diagnostics (src : String) (expected : List String) : Bool :=
+    precision_strings expected (map Issue String precision_fmt_code (analyze (str_codes src)));
+
+def precision_fmt_refused (src : String) : Bool :=
+    match fmt_checked src with
+    | Right _ => False
+    | Left e => match e with | FmtTokenChange => True | FmtUnstable => False end
+    end;
+
+def precision_fix_expected (src : String) (expected : String)
+    (rules : List String) : Bool :=
+    match fx_prepare (Nil String) src with
+    | Left _ => False
+    | Right outcome =>
+        match fx_prepare (Nil String) (fx_outcome_text outcome) with
+        | Left _ => False
+        | Right again =>
+            andb (str_eq (fx_outcome_text outcome) expected)
+              (andb (str_eq (fx_outcome_text again) expected)
+                (andb (precision_strings rules
+                    (map FxEdit String fx_edit_rule (fx_outcome_edits outcome)))
+                  (precision_strings ([] : List String)
+                    (map FxEdit String fx_edit_rule (fx_outcome_edits again)))))
+        end
+    end;
+
+def precision_fix_budget_refused : Bool :=
+    match fx_finish (Nil String)
+        (MkFxOutcome "def n : Nat := 0;;\n" (Nil FxEdit)) with
+    | Right _ => False
+    | Left e =>
+        match e with
+        | FxNotConverged => True
+        | FxFormatError _ => False
+        | FxFormatReopensFix => False
+        end
+    end;
+
+def precision_fix_format_refused : Bool :=
+    match fx_prepare (Nil String) "def s : String := \"a\rb\";\n" with
+    | Right _ => False
+    | Left e =>
+        match e with
+        | FxNotConverged => False
+        | FxFormatReopensFix => False
+        | FxFormatError cause =>
+            match cause with | FmtTokenChange => True | FmtUnstable => False end
+        end
+    end;
+
+def precision_fmt_pipe : String := "def y : Nat :=\n  x\n  |> f;\n";
+def precision_fmt_prime : String := "def n' : Nat := 0;\n";
+def precision_fmt_tab : String := "def s : String := \"a\tb\";\n";
+def precision_fmt_escape : String :=
+    str_cat3 "def s : String := " (str_of_codes ([34, 97, 92, 34, 9, 98, 34] : List Nat)) ";\n";
+def precision_fmt_multiline : String := "def s : String := \"a\nx;;\nb\";\n";
+
+-- Lines are one-based and columns zero-based in the positional lexer.
+def precision_multiline_position : Bool :=
+    match find FxTok (fun (t : FxTok) => fx_is_word t "next")
+        (fx_lex "\"a\nb\" next") with
+    | Nothing => False
+    | Just token =>
+        andb (eqNat (fx_tok_line token) 2)
+          (andb (eqNat (fx_tok_col token) 3) (notb (fx_tok_bol token)))
+    end;
+
+def precision_format_cases : List (Pair String Bool) :=
+    [ MkPair String Bool "pipe/bad/arm-spacing"
+        (precision_fmt_diagnostics "|Z => 0\n" (["IPipeSpace:1"] : List String))
+    , MkPair String Bool "pipe/good/canonical-arm"
+        (precision_fmt_diagnostics "| Z => 0\n" ([] : List String))
+    , MkPair String Bool "pipe/fp/forward-pipe-continuation"
+        (andb (precision_fmt_diagnostics precision_fmt_pipe ([] : List String))
+          (precision_fmt_expected precision_fmt_pipe precision_fmt_pipe))
+    , MkPair String Bool "pipe/fix/arm-and-arrow"
+        (precision_fmt_expected "|Z=>0\n" "| Z => 0\n")
+    , MkPair String Bool "prime/bad/diagnostic-after-identifier"
+        (precision_fmt_diagnostics "def n' : Nat:=0;\n" (["IColonEqSpace:1"] : List String))
+    , MkPair String Bool "prime/good/canonical-identifier"
+        (precision_fmt_diagnostics precision_fmt_prime ([] : List String))
+    , MkPair String Bool "prime/fix/normalize-without-swallowing-code"
+        (precision_fmt_expected "def n' : Nat:=0;\n" precision_fmt_prime)
+    , MkPair String Bool "prime/fp/string-content-is-not-code"
+        (precision_fmt_diagnostics "def s : String := \"n':=x |> f --text\";\n" ([] : List String))
+    , MkPair String Bool "tabs/bad/code-tab"
+        (precision_fmt_diagnostics "\tdef n : Nat := 0;\n" (["ITabs:1"] : List String))
+    , MkPair String Bool "tabs/good/spaces"
+        (precision_fmt_diagnostics "  def n : Nat := 0;\n" ([] : List String))
+    , MkPair String Bool "tabs/fp/literal-byte-is-data"
+        (andb (precision_fmt_diagnostics precision_fmt_tab ([] : List String))
+          (precision_fmt_expected precision_fmt_tab precision_fmt_tab))
+    , MkPair String Bool "tabs/fix/only-code-whitespace"
+        (precision_fmt_expected "\tdef n' : Nat:=0;\n" "  def n' : Nat := 0;\n")
+    , MkPair String Bool "tabs/fp/escaped-quote-keeps-literal-state"
+        (andb (precision_fmt_diagnostics precision_fmt_escape ([] : List String))
+          (precision_fmt_expected precision_fmt_escape precision_fmt_escape))
+    , MkPair String Bool "tokens/bad/splitting-a-forward-pipe"
+        (notb (fmt_same_tokens (fx_lex "x |> f") (fx_lex "x | > f")))
+    , MkPair String Bool "tokens/bad/raw-cr-literal-is-not-rewritten"
+        (precision_fmt_refused "def s : String := \"a\rb\";\n")
+    , MkPair String Bool "tokens/bad/multiline-literal-is-not-normal-code"
+        (precision_fmt_refused "def s : String := \"a\n|Z=>0\nb\";\n")
+    , MkPair String Bool "tokens/good/position-after-multiline-string"
+        precision_multiline_position
+    , MkPair String Bool "fix/fp/semicolons-in-multiline-string-are-data"
+        (precision_fix_expected precision_fmt_multiline precision_fmt_multiline ([] : List String))
+    , MkPair String Bool "fix/good/formatting-only-is-canonical"
+        (precision_fix_expected "def n' : Nat:=0;\n" precision_fmt_prime ([] : List String))
+    , MkPair String Bool "fix/bad/safe-intent-then-format-then-no-op"
+        (precision_fix_expected "def n' : Nat:=0;;\n" precision_fmt_prime (["double-semi"] : List String))
+    , MkPair String Bool "fix/fp/no-guessed-division-replacement"
+        (precision_fix_expected "def n : Nat := div_nat 1 0;\n"
+          "def n : Nat := div_nat 1 0;\n" ([] : List String))
+    , MkPair String Bool "fix/bad/unconverged-plan-is-refused" precision_fix_budget_refused
+    , MkPair String Bool "fix/bad/unsafe-formatting-is-refused" precision_fix_format_refused
+    ];
+
+def main : IO Unit := precision_run "format-fix" precision_format_cases;

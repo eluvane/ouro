@@ -1,0 +1,108 @@
+-- Checked scalar operations are optional; every failed conversion invokes
+-- the original source closure with the original arbitrary-size Nat operands.
+import "managed_closures.ouro";
+import "managed_nat_small_shapes.ouro";
+
+def managed_small_nat_choose (condition : MirValue)
+    (yes : ManagedState -> Either NativeLowerError ManagedResult)
+    (no : ManagedState -> Either NativeLowerError ManagedResult) (state : ManagedState)
+    : Either NativeLowerError ManagedResult :=
+    lower_bind (Pair Nat ManagedState) ManagedResult (managed_fresh_local MirManagedPtr state)
+      (fun (fresh : Pair Nat ManagedState) => match fresh with | MkPair result next =>
+        lower_bind LowerLoopBlocks ManagedResult (lower_loop_blocks (managed_flow next))
+          (fun (labels : LowerLoopBlocks) => match labels with | LowerLoopAt accept reject finish flow =>
+            lower_bind ManagedResult ManagedResult
+              (yes (managed_switch_block accept (MirBranch condition accept reject) (managed_with_flow next flow)))
+              (fun (accepted : ManagedResult) => match accepted with | ManagedResultOf selected after_yes =>
+                lower_map ManagedResult ManagedResult (fun (rejected : ManagedResult) => match rejected with
+                  | ManagedResultOf fallback after_no => ManagedResultOf (MirUse result)
+                      (managed_switch_block finish (MirJump finish) (managed_emit (MirMove result fallback) after_no)) end)
+                  (no (managed_switch_block reject (MirJump finish)
+                    (managed_emit (MirMove result selected) after_yes))) end) end) end);
+
+def managed_small_nat_original (compiler : ManagedCompiler) (original : MirValue)
+    (left : MirValue) (right : MirValue) (state : ManagedState) : Either NativeLowerError ManagedResult :=
+    lower_bind ManagedResult ManagedResult (managed_call compiler original left state)
+      (fun (partial : ManagedResult) => match partial with | ManagedResultOf closure after =>
+        managed_call compiler closure right after end);
+
+def managed_small_nat_product (compiler : ManagedCompiler) (left : MirValue) (right : MirValue) (state : ManagedState)
+    : Either NativeLowerError ManagedResult :=
+    lower_bind ManagedResult ManagedResult (managed_convert MirU64 MirZeroExtend left state)
+      (fun (first : ManagedResult) => match first with | ManagedResultOf a next =>
+        lower_bind ManagedResult ManagedResult (managed_convert MirU64 MirZeroExtend right next)
+          (fun (second : ManagedResult) => match second with | ManagedResultOf b after =>
+            lower_bind ManagedResult ManagedResult (managed_binary MirU64 MirMul a b after)
+              (fun (product : ManagedResult) => match product with | ManagedResultOf bits complete =>
+                managed_nat_from_word compiler PrimitiveWordU64 bits complete end) end) end);
+
+def managed_small_nat_quotient (compiler : ManagedCompiler) (remainder : Bool) (original_left : MirValue)
+    (left : MirValue) (right : MirValue) (state : ManagedState) : Either NativeLowerError ManagedResult :=
+    lower_bind ManagedResult ManagedResult (managed_compare MirEqual right (managed_bits MirU64 0) state)
+      (fun (zero : ManagedResult) => match zero with | ManagedResultOf empty next =>
+        managed_small_nat_choose empty
+          (fun (entered : ManagedState) => match remainder with
+            | True => Right NativeLowerError ManagedResult (ManagedResultOf original_left entered)
+            | False => managed_nat_from_word compiler PrimitiveWordU64 (managed_bits MirU64 0) entered end)
+          (fun (entered : ManagedState) => lower_bind ManagedResult ManagedResult
+            (managed_binary MirU64 (match remainder with | True => MirRem | False => MirDiv end) left right entered)
+            (fun (divided : ManagedResult) => match divided with | ManagedResultOf bits complete =>
+              managed_nat_from_word compiler PrimitiveWordU64 bits complete end)) next end);
+
+def managed_small_nat_scalar (compiler : ManagedCompiler) (operation : ManagedNatSmallOperation)
+    (original_left : MirValue) (left : MirValue) (right : MirValue) (state : ManagedState)
+    : Either NativeLowerError ManagedResult :=
+    match operation with
+    | ManagedNatSmallMultiply => managed_small_nat_product compiler left right state
+    | ManagedNatSmallDivide => managed_small_nat_quotient compiler False original_left left right state
+    | ManagedNatSmallRemainder => managed_small_nat_quotient compiler True original_left left right state end;
+
+def managed_small_nat_result (compiler : ManagedCompiler) (operation : ManagedNatSmallOperation)
+    (original : MirValue) (left : MirValue) (right : MirValue) (state : ManagedState)
+    : Either NativeLowerError ManagedResult :=
+    let width : PrimitiveWord := match operation with
+      | ManagedNatSmallMultiply => PrimitiveWordU32
+      | ManagedNatSmallDivide => PrimitiveWordU64 | ManagedNatSmallRemainder => PrimitiveWordU64 end in
+    lower_bind ManagedNatWordResult ManagedResult (managed_nat_checked_word compiler width left state)
+      (fun (first : ManagedNatWordResult) => match first with | ManagedNatWordOf left_fits a next =>
+        lower_bind ManagedNatWordResult ManagedResult (managed_nat_checked_word compiler width right next)
+          (fun (second : ManagedNatWordResult) => match second with | ManagedNatWordOf right_fits b after =>
+            lower_bind ManagedResult ManagedResult (managed_binary MirU8 MirAnd left_fits right_fits after)
+              (fun (tested : ManagedResult) => match tested with | ManagedResultOf both complete =>
+                managed_small_nat_choose both (managed_small_nat_scalar compiler operation left a b)
+                  (managed_small_nat_original compiler original left right) complete end) end) end);
+
+def managed_small_nat_apply (compiler : ManagedCompiler) (operation : ManagedNatSmallOperation)
+    (captures : List MirValue) (state : ManagedState) : Either NativeLowerError ManagedResult :=
+    match captures with
+    | Nil => Left NativeLowerError ManagedResult (LowerInvalidCall 0)
+    | Cons original tail => match tail with
+      | Nil => Left NativeLowerError ManagedResult (LowerInvalidCall 0)
+      | Cons left next => match next with
+        | Nil => Left NativeLowerError ManagedResult (LowerInvalidCall 0)
+        | Cons right rest => match rest with
+          | Nil => managed_small_nat_result compiler operation original left right state
+          | Cons _ _ => Left NativeLowerError ManagedResult (LowerInvalidCall 0) end end end end;
+
+def managed_small_nat_value (compiler : ManagedCompiler) (operation : ManagedNatSmallOperation)
+    : Nat -> List MirValue -> ManagedState -> Either NativeLowerError ManagedResult :=
+  fix partial (remaining : Nat) (captures : List MirValue) (state : ManagedState)
+      : Either NativeLowerError ManagedResult :=
+    match remaining with
+    | Z => managed_small_nat_apply compiler operation captures state
+    | S rest =>
+        let caller : LowerState := managed_flow state in
+        lower_bind (Pair Nat ManagedState) ManagedResult (managed_fresh_symbol state)
+          (fun (fresh : Pair Nat ManagedState) => match fresh with | MkPair symbol reserved =>
+            lower_bind (Pair ManagedScope ManagedState) ManagedResult
+              (managed_capture_scope (map MirValue (Maybe MirValue) (Just MirValue) captures) 0
+                (managed_with_flow reserved (lower_empty_state 2)))
+              (fun (captured : Pair ManagedScope ManagedState) => match captured with | MkPair environment entered =>
+                lower_bind ManagedResult ManagedResult
+                  (partial rest (append MirValue (managed_values environment) ([MirUse 1] : List MirValue)) entered)
+                  (fun (compiled : ManagedResult) => match compiled with | ManagedResultOf value after =>
+                    let function : MirFunction := managed_finish_function symbol
+                      ([111,117,114,111,95,110,97,116,95,98,105,110,97,114,121] : List Nat)
+                      ([MirLocalDef 0 MirManagedPtr, MirLocalDef 1 MirManagedPtr] : List MirLocal) value after in
+                    managed_emit_callable compiler 3 symbol False captures
+                      (managed_with_flow (managed_add_function function after) caller) end) end) end) end;

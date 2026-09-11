@@ -1,0 +1,248 @@
+-- Elaboration only resolves names to de Bruijn core; the kernel still owns type soundness.
+
+-- @entry elaborate
+-- @entry synth
+-- @entry elaborate_goal
+
+-- CaseInfo, CoreTerm and Surface come from core.ouro, and eqNat/ten/fuel1k from
+-- base.ouro, so a driver can hold this elaborator and the rest of the pipeline
+-- in one translation unit. The names below carry an _e suffix where
+-- compiler.ouro has its own restricted version of the same idea; both reach a
+-- driver through the import graph and only one of each name can exist there.
+import "../std/data.ouro";
+import "base.ouro";
+import "core.ouro";
+
+-- Fail-closed sentinel: unbound Rel (pipeline has <<1000 binders).
+def invalid_core_e : CoreTerm := CRel fuel1k;
+
+-- Name → de Bruijn (head = 0). Missing → fuel1k (never aliases Rel 0).
+def lookup_rel (name : Nat) : List Nat -> Nat :=
+    fix lookup_rel (ctx : List Nat) : Nat :=
+      match ctx with
+      | Nil => fuel1k
+      | Cons y ys =>
+          match eqNat y name with
+          | True => Z
+          | False => S (lookup_rel ys)
+          end
+      end;
+
+-- Fuel-bounded elab: named surface → de Bruijn core.
+def elaborate_fuel : Nat -> Surface -> List Nat -> CoreTerm :=
+  fix elaborate_fuel (fuel : Nat) (s : Surface) (ctx : List Nat) : CoreTerm :=
+    match fuel with
+    | Z => invalid_core_e
+    | S fuel' =>
+        match s with
+        | SVar name => CRel (lookup_rel name ctx)
+        | SSort u => CSort u
+        | SPi name dom cod =>
+            CPi (elaborate_fuel fuel' dom ctx)
+              (elaborate_fuel fuel' cod (Cons Nat name ctx))
+        | SLam name ann body =>
+            CLam (elaborate_fuel fuel' ann ctx)
+              (elaborate_fuel fuel' body (Cons Nat name ctx))
+        | SApp f a =>
+            CApp (elaborate_fuel fuel' f ctx) (elaborate_fuel fuel' a ctx)
+        | SLet name v ty body =>
+            CLetIn (elaborate_fuel fuel' v ctx) (elaborate_fuel fuel' ty ctx)
+              (elaborate_fuel fuel' body (Cons Nat name ctx))
+        | SConst n => CConst n
+        | SInd n => CInd n
+        | SConstruct i j np => CConstruct i j np
+        | SCase ci p scrut bs =>
+            CCase ci (elaborate_fuel fuel' p ctx)
+              (elaborate_fuel fuel' scrut ctx)
+              ((fix go (xs : List Surface) : List CoreTerm :=
+                  match xs with
+                  | Nil => Nil CoreTerm
+                  | Cons b xs' =>
+                      Cons CoreTerm (elaborate_fuel fuel' b ctx) (go xs')
+                  end) bs)
+        | SFix name rec_arg arity ty body =>
+            CFix name rec_arg arity (elaborate_fuel fuel' ty ctx)
+              (elaborate_fuel fuel' body (Cons Nat name ctx))
+        | SHole _ => invalid_core_e
+        | SStr n ty => CStrLit n ty
+        | SEffectRow ty => elaborate_fuel fuel' ty ctx
+        | SPerform op args =>
+            (fix go (xs : List Surface) (acc : CoreTerm) : CoreTerm :=
+                match xs with
+                | Nil => acc
+                | Cons a xs' =>
+                    go xs' (CApp acc (elaborate_fuel fuel' a ctx))
+                end) args (CConst op)
+        end
+    end;
+
+-- Undirected holes fail closed; use elaborate_goal when goal type is known.
+def elab (s : Surface) (ctx : List Nat) : CoreTerm :=
+    elaborate_fuel fuel1k s ctx;
+
+-- 2-arg entry used by the current selfhost pipeline.
+def elaborate (s : Surface) (ctx : List Nat) : CoreTerm :=
+    elab s ctx;
+
+-- Option comes from base.ouro.
+
+-- Shift free Rel >= c by d.
+def lift_rec : Nat -> Nat -> Nat -> CoreTerm -> CoreTerm :=
+  fix lift_rec (fuel : Nat) (d : Nat) (c : Nat) (t : CoreTerm) : CoreTerm :=
+    match fuel with
+    | Z => t
+    | S fuel' =>
+        match t with
+        | CRel i =>
+            match compiler_le_nat c i with
+            | True => CRel (add i d)
+            | False => CRel i
+            end
+        | CSort u => CSort u
+        | CPi a b => CPi (lift_rec fuel' d c a) (lift_rec fuel' d (S c) b)
+        | CLam a b => CLam (lift_rec fuel' d c a) (lift_rec fuel' d (S c) b)
+        | CApp f a => CApp (lift_rec fuel' d c f) (lift_rec fuel' d c a)
+        | CLetIn v ty b =>
+            CLetIn (lift_rec fuel' d c v) (lift_rec fuel' d c ty)
+              (lift_rec fuel' d (S c) b)
+        | CConst n => CConst n
+        | CInd n => CInd n
+        | CConstruct i j np => CConstruct i j np
+        | CStrBytes n ty => CStrBytes n ty
+        | CStrLit n ty => CStrLit n ty
+        | CCase ci p s bs =>
+            CCase ci (lift_rec fuel' d c p) (lift_rec fuel' d c s)
+              ((fix go (xs : List CoreTerm) : List CoreTerm :=
+                  match xs with
+                  | Nil => Nil CoreTerm
+                  | Cons b xs' =>
+                      Cons CoreTerm (lift_rec fuel' d c b) (go xs')
+                  end) bs)
+        | CFix n ra ar ty b =>
+            CFix n ra ar (lift_rec fuel' d c ty) (lift_rec fuel' d (S c) b)
+        end
+    end;
+
+def lift1 (t : CoreTerm) : CoreTerm := lift_rec 200 (S Z) Z t;
+
+-- Typed ctx stores lift1 ty (lookup_rel lifts by index).
+def cons_tctx (ann : CoreTerm) (tctx : List CoreTerm) : List CoreTerm :=
+    Cons CoreTerm (lift1 ann) tctx;
+
+-- Synthesis boundary: always None (holes fail closed at kernel).
+def synthesize (_fuel : Nat) (_ctx : List CoreTerm) (_goal : CoreTerm) : Option CoreTerm :=
+    None CoreTerm;
+
+def fill_hole (fuel : Nat) (ctx : List CoreTerm) (goal : CoreTerm) : CoreTerm :=
+    match synthesize fuel ctx goal with
+    | Some t => t
+    | None => invalid_core_e
+    end;
+
+-- Goal-directed: holes/lam/let/case use goal; rest → elaborate_fuel.
+def elab_directed : Nat -> Surface -> List Nat -> List CoreTerm -> Option CoreTerm -> CoreTerm :=
+  fix elab_directed (fuel : Nat) (s : Surface) (nctx : List Nat)
+      (tctx : List CoreTerm) (goal : Option CoreTerm) : CoreTerm :=
+    match fuel with
+    | Z => invalid_core_e
+    | S fuel' =>
+        match s with
+        | SHole _ =>
+            match goal with
+            | None => invalid_core_e
+            | Some g => fill_hole fuel' tctx g
+            end
+        | SLam name ann body =>
+            let ann_c : CoreTerm := elaborate_fuel fuel' ann nctx in
+            let body_goal : Option CoreTerm :=
+              match goal with
+              | None => None CoreTerm
+              | Some g =>
+                  match g with
+                  | CPi _ b => Some CoreTerm b
+                  | CRel _ => None CoreTerm
+                  | CSort _ => None CoreTerm
+                  | CLam _ _ => None CoreTerm
+                  | CApp _ _ => None CoreTerm
+                  | CLetIn _ _ _ => None CoreTerm
+                  | CConst _ => None CoreTerm
+                  | CInd _ => None CoreTerm
+                  | CConstruct _ _ _ => None CoreTerm
+                  | CStrBytes _ _ => None CoreTerm
+                  | CStrLit _ _ => None CoreTerm
+                  | CCase _ _ _ _ => None CoreTerm
+                  | CFix _ _ _ _ _ => None CoreTerm
+                  end
+              end
+            in
+            CLam ann_c
+              (elab_directed fuel' body (Cons Nat name nctx)
+                (cons_tctx ann_c tctx) body_goal)
+        | SLet name v ty body =>
+            let ty_c : CoreTerm := elaborate_fuel fuel' ty nctx in
+            let v_c : CoreTerm :=
+              elab_directed fuel' v nctx tctx (Some CoreTerm ty_c) in
+            CLetIn v_c ty_c
+              (elab_directed fuel' body (Cons Nat name nctx)
+                (cons_tctx ty_c tctx) goal)
+        | SCase ci p scrut bs =>
+            let scrut_c : CoreTerm := elaborate_fuel fuel' scrut nctx in
+            let p_c : CoreTerm :=
+              match goal with
+              | None => elaborate_fuel fuel' p nctx
+              | Some g =>
+                  match ci with
+                  | MkCaseInfo ind nparams _ars =>
+                      match nparams with
+                      | Z => CLam (CInd ind) (lift1 g)
+                      | S _ => elaborate_fuel fuel' p nctx
+                      end
+                  end
+              end
+            in
+            CCase ci p_c scrut_c
+              ((fix go (xs : List Surface) : List CoreTerm :=
+                  match xs with
+                  | Nil => Nil CoreTerm
+                  | Cons b xs' =>
+                      Cons CoreTerm
+                        (elab_directed fuel' b nctx tctx goal)
+                        (go xs')
+                  end) bs)
+        | SFix name ra ar ty body =>
+            let ty_c : CoreTerm := elaborate_fuel fuel' ty nctx in
+            CFix name ra ar ty_c
+              (elab_directed fuel' body (Cons Nat name nctx)
+                (cons_tctx ty_c tctx) (Some CoreTerm (lift1 ty_c)))
+        | SVar _ => elaborate_fuel fuel' s nctx
+        | SSort _ => elaborate_fuel fuel' s nctx
+        | SPi _ _ _ => elaborate_fuel fuel' s nctx
+        | SApp _ _ => elaborate_fuel fuel' s nctx
+        | SConst _ => elaborate_fuel fuel' s nctx
+        | SInd _ => elaborate_fuel fuel' s nctx
+        | SConstruct _ _ _ => elaborate_fuel fuel' s nctx
+        | SStr _ _ => elaborate_fuel fuel' s nctx
+        | SEffectRow ty => elab_directed fuel' ty nctx tctx goal
+        | SPerform _ _ => elaborate_fuel fuel' s nctx
+        end
+    end;
+
+def synth (ctx : List CoreTerm) (goal : CoreTerm) : Option CoreTerm :=
+    synthesize 32 ctx goal;
+
+def elaborate_goal (s : Surface) (ctx : List Nat) (goal : CoreTerm) : CoreTerm :=
+    elab_directed fuel1k s ctx (Nil CoreTerm) (Some CoreTerm goal);
+
+def elaborate_surfaces (fuel : Nat)
+    : List (Pair Nat Surface) -> List (Pair Nat CoreTerm) :=
+  fix go (xs : List (Pair Nat Surface)) : List (Pair Nat CoreTerm) :=
+    match xs with
+    | Nil => Nil (Pair Nat CoreTerm)
+    | Cons p xs' =>
+        match p with
+        | MkPair n s =>
+            Cons (Pair Nat CoreTerm)
+              (MkPair Nat CoreTerm n (elaborate_fuel fuel s (Nil Nat)))
+              (go xs')
+        end
+    end;

@@ -1,0 +1,238 @@
+-- Machine IR for the Windows x64 backend. Nat below names compiler objects;
+-- language Nat is not a machine integer and must be lowered separately.
+import "pe_model.ouro";
+import "../base.ouro";
+import "../../std/listx.ouro";
+
+inductive MirType : Type :=
+  | MirU8 : MirType | MirU32 : MirType | MirU64 : MirType
+  | MirI32 : MirType | MirUSize : MirType
+  | MirRawPtr : MirType | MirManagedPtr : MirType;
+
+inductive MirLocal : Type :=
+  | MirLocalDef : Nat -> MirType -> MirLocal;
+
+-- Integer literals contain their exact bit pattern. Pointer literals are null.
+inductive MirValue : Type :=
+  | MirUse : Nat -> MirValue
+  | MirBits : MirType -> X64Word64 -> MirValue;
+
+inductive MirSignature : Type :=
+  | MirSignatureOf : List MirType -> Maybe MirType -> MirSignature;
+
+-- Arithmetic wraps to the destination width. Div/rem trap on zero, and I32
+-- also traps on MIN/-1. Shift counts are masked by width-1, including U8.
+inductive MirBinary : Type :=
+  | MirAdd : MirBinary | MirSub : MirBinary | MirMul : MirBinary
+  | MirAnd : MirBinary | MirOr : MirBinary | MirXor : MirBinary
+  | MirDiv : MirBinary | MirRem : MirBinary
+  | MirShl : MirBinary | MirShr : MirBinary;
+
+inductive MirComparison : Type :=
+  | MirEqual : MirComparison | MirNotEqual : MirComparison
+  | MirLess : MirComparison | MirLessEqual : MirComparison
+  | MirGreater : MirComparison | MirGreaterEqual : MirComparison;
+
+-- Conversion names make bit loss and extension explicit. Raw addresses may
+-- cross only the USize boundary; managed root kinds cannot be reinterpreted.
+inductive MirConversion : Type :=
+  | MirNarrow : MirConversion | MirZeroExtend : MirConversion
+  | MirSignExtend : MirConversion | MirReinterpret : MirConversion
+  | MirRawToBits : MirConversion | MirRawFromBits : MirConversion;
+
+-- NoGc forbids managed allocation and entering the collector. A foreign
+-- NoGc declaration remains an explicit unsafe ABI contract.
+inductive MirGc : Type :=
+  | MirNoGc : MirGc | MirMayGc : MirGc;
+
+inductive MirCallTarget : Type :=
+  | MirDirect : Nat -> MirCallTarget
+  | MirIndirect : MirSignature -> MirValue -> MirCallTarget;
+
+-- Memory operations and indirect-call signatures are raw unsafe assertions.
+-- They neither establish object bounds/lifetimes nor change checker authority.
+inductive MirInstruction : Type :=
+  | MirMove : Nat -> MirValue -> MirInstruction
+  | MirBinaryOp : Nat -> MirBinary -> MirValue -> MirValue -> MirInstruction
+  | MirCompare : Nat -> MirComparison -> MirValue -> MirValue -> MirInstruction
+  | MirConvert : Nat -> MirConversion -> MirValue -> MirInstruction
+  | MirLoad : Nat -> MirValue -> X64Displacement -> MirInstruction
+  | MirStore : MirValue -> X64Displacement -> MirValue -> MirInstruction
+  -- Indexed access reads an owner and a USize byte offset separately. Its
+  -- transient machine address is never a MIR value or a managed-to-raw cast.
+  | MirLoadAt : Nat -> MirValue -> MirValue -> MirInstruction
+  | MirStoreAt : MirValue -> MirValue -> MirValue -> MirInstruction
+  | MirAddress : Nat -> Nat -> MirInstruction
+  | MirPointerAdd : Nat -> MirValue -> MirValue -> MirInstruction
+  | MirCall : MirGc -> Maybe Nat -> MirCallTarget -> List MirValue -> MirInstruction
+  -- Compiler-private managed allocation bridge. The allocator is a checked
+  -- Ouro raw function; descriptor is a readonly, canonical v1 data symbol.
+  -- There is no corresponding public source intrinsic or raw-pointer cast.
+  | MirManagedAlloc : Nat -> Nat -> Nat -> Nat -> MirValue -> MirInstruction
+  | MirManagedContext : Nat -> MirInstruction;
+
+inductive MirTerminator : Type :=
+  | MirJump : Nat -> MirTerminator
+  | MirBranch : MirValue -> Nat -> Nat -> MirTerminator
+  | MirReturn : Maybe MirValue -> MirTerminator
+  | MirTrap : MirTerminator;
+
+inductive MirBlock : Type :=
+  | MirBlockDef : Nat -> List MirInstruction -> MirTerminator -> MirBlock;
+
+-- Arguments and remaining locals are disjoint, ordered declarations. Entry is
+-- a block ID, independent of physical block order. Every block is validated.
+inductive MirFunction : Type :=
+  | MirFunctionDef : Nat -> List Nat -> List MirLocal -> List MirLocal
+      -> Maybe MirType -> Nat -> List MirBlock -> MirFunction;
+
+inductive MirData : Type :=
+  | MirDataDef : Nat -> Bool -> List Nat -> MirData;
+
+-- Data's Bool is True for writable storage; each object is aligned to 8 bytes.
+inductive MirExtern : Type :=
+  | MirExternDef : MirGc -> Nat -> List Nat -> MirSignature -> MirExtern;
+
+inductive MirLibrary : Type :=
+  | MirLibraryDef : List Nat -> List MirExtern -> MirLibrary;
+
+-- Functions, data, and externs share one symbol-ID namespace.
+inductive MirProgram : Type :=
+  | MirProgramDef : List MirFunction -> List MirData -> List MirLibrary -> Nat -> MirProgram;
+
+-- Bounds apply before graph analysis/code generation. The last field limits
+-- dataflow iterations; exhaustion is an error, never a successful fixed point.
+inductive MirLimits : Type :=
+  | MirLimitsWith : Nat -> Nat -> Nat -> MirLimits;
+
+inductive MirError : Type :=
+  | MirResourceExhausted : MirError
+  | MirDuplicateSymbol : Nat -> MirError | MirUnknownSymbol : Nat -> MirError
+  | MirDuplicateLocal : Nat -> MirError | MirUnknownLocal : Nat -> MirError
+  | MirDuplicateBlock : Nat -> MirError | MirUnknownBlock : Nat -> MirError
+  | MirUninitialized : Nat -> Nat -> MirError
+  | MirTypeMismatch : Nat -> MirError | MirInvalidLiteral : MirError
+  | MirInvalidConversion : Nat -> MirError | MirInvalidAddress : Nat -> MirError
+  | MirInvalidCall : Nat -> MirError | MirInvalidReturn : Nat -> MirError
+  | MirInvalidEntry : Nat -> MirError | MirInvalidName : Nat -> MirError
+  | MirInvalidDisplacement : MirError | MirInvalidData : Nat -> MirError
+  | MirUnreachableBlock : Nat -> MirError
+  | MirGcCallMismatch : Nat -> Nat -> MirError
+  | MirGcUnsafeRuntime : Nat -> MirError;
+
+inductive MirCheckedProgram : Type :=
+  | MirChecked : MirProgram -> MirCheckedProgram;
+
+-- Hard ceilings on requested budgets. The node/flow ceilings used to be
+-- pe_byte2_place (65536), which rejects a compiler-sized MIR program before
+-- any per-function callback runs. Packed nats keep large budgets cheap.
+def mir_limit_node_ceiling : Nat := pe_byte3_place;
+def mir_limit_byte_ceiling : Nat := pe_byte3_place;
+def mir_limit_flow_ceiling : Nat := pe_byte3_place;
+def mir_default_limits : MirLimits := MirLimitsWith (mul 16 256) (mul 16 pe_byte2_place) (mul 16 256);
+def native_compiler_limits : MirLimits :=
+    MirLimitsWith pe_byte3_place pe_byte3_place pe_byte3_place;
+
+def mir_type_code (ty : MirType) : Nat :=
+    match ty with | MirU8 => 0 | MirU32 => 1 | MirU64 => 2 | MirI32 => 3
+    | MirUSize => 4 | MirRawPtr => 5 | MirManagedPtr => 6 end;
+
+def mir_type_equal (a : MirType) (b : MirType) : Bool := eq_nat (mir_type_code a) (mir_type_code b);
+def mir_integer (ty : MirType) : Bool := ltb_nat (mir_type_code ty) 5;
+def mir_pointer (ty : MirType) : Bool := notb (mir_integer ty);
+def mir_type_bits (ty : MirType) : Nat :=
+    match ty with | MirU8 => 8 | MirU32 => 32 | MirI32 => 32
+    | MirU64 => 64 | MirUSize => 64 | MirRawPtr => 64 | MirManagedPtr => 64 end;
+
+def mir_local_id (local : MirLocal) : Nat := match local with | MirLocalDef id _ => id end;
+def mir_local_type (local : MirLocal) : MirType := match local with | MirLocalDef _ ty => ty end;
+def mir_function_id (function : MirFunction) : Nat :=
+    match function with | MirFunctionDef id _ _ _ _ _ _ => id end;
+def mir_block_id (block : MirBlock) : Nat := match block with | MirBlockDef id _ _ => id end;
+def mir_data_id (data : MirData) : Nat := match data with | MirDataDef id _ _ => id end;
+def mir_extern_id (external : MirExtern) : Nat := match external with | MirExternDef _ id _ _ => id end;
+
+def mir_find_local (id : Nat) : List MirLocal -> Maybe MirLocal :=
+  fix mir_find_local (locals : List MirLocal) : Maybe MirLocal :=
+    match locals with | Nil => Nothing MirLocal
+    | Cons local rest => match eq_nat id (mir_local_id local) with
+      | True => Just MirLocal local | False => mir_find_local rest end end;
+
+def mir_find_function (id : Nat) : List MirFunction -> Maybe MirFunction :=
+  fix mir_find_function (functions : List MirFunction) : Maybe MirFunction :=
+    match functions with | Nil => Nothing MirFunction
+    | Cons function rest => match eq_nat id (mir_function_id function) with
+      | True => Just MirFunction function | False => mir_find_function rest end end;
+
+def mir_find_extern (id : Nat) : List MirLibrary -> Maybe MirExtern :=
+  fix mir_find_extern (libraries : List MirLibrary) : Maybe MirExtern :=
+    match libraries with | Nil => Nothing MirExtern | Cons library rest =>
+      match library with | MirLibraryDef _ externs =>
+        match find MirExtern (fun (external : MirExtern) => eq_nat id (mir_extern_id external)) externs with
+        | Just external => Just MirExtern external | Nothing => mir_find_extern rest end end end;
+
+def mir_function_signature (function : MirFunction) : MirSignature :=
+    match function with | MirFunctionDef _ _ args _ result _ _ =>
+      MirSignatureOf (map MirLocal MirType mir_local_type args) result end;
+
+def mir_symbol_signature (program : MirProgram) (id : Nat) : Either MirError MirSignature :=
+    match program with | MirProgramDef functions _ libraries _ =>
+      match mir_find_function id functions with
+      | Just function => Right MirError MirSignature (mir_function_signature function)
+      | Nothing => match mir_find_extern id libraries with
+        | Just external => match external with | MirExternDef _ _ _ signature => Right MirError MirSignature signature end
+        | Nothing => Left MirError MirSignature (MirInvalidCall id) end end end;
+
+def mir_require (condition : Bool) (err : MirError) : Either MirError Unit :=
+    match condition with | True => Right MirError Unit MkUnit | False => Left MirError Unit err end;
+
+def mir_each (A : Type) (check : A -> Either MirError Unit) : List A -> Either MirError Unit :=
+  fix mir_each (items : List A) : Either MirError Unit :=
+    match items with | Nil => Right MirError Unit MkUnit
+    | Cons item rest => match check item with
+      | Left err => Left MirError Unit err | Right _ => mir_each rest end end;
+
+-- Membership stops at the first match. Eager elem evaluates every equality
+-- and retains needless comparison closures in the bootstrap runtime.
+def mir_has (id : Nat) (ids : List Nat) : Bool :=
+    match find Nat (eqNat id) ids with | Nothing => False | Just _ => True end;
+def mir_add (id : Nat) (ids : List Nat) : List Nat :=
+    match mir_has id ids with | True => ids | False => Cons Nat id ids end;
+def mir_union (a : List Nat) (b : List Nat) : List Nat := foldr Nat (List Nat) mir_add b a;
+def mir_intersection (a : List Nat) (b : List Nat) : List Nat :=
+    filter Nat (fun (id : Nat) => mir_has id b) a;
+-- Fixed-point facts commonly have identical order. Check that linear case
+-- first; differently ordered sets retain the full membership comparison.
+def mir_set_equal (a : List Nat) (b : List Nat) : Bool :=
+    match pe_bytes_equal a b with | True => True | False =>
+      andb (all Nat (fun (id : Nat) => mir_has id b) a) (all Nat (fun (id : Nat) => mir_has id a) b) end;
+
+def mir_successors (block : MirBlock) : List Nat :=
+    match block with | MirBlockDef _ _ term => match term with
+    | MirJump target => ([target] : List Nat) | MirBranch _ yes no => ([yes, no] : List Nat)
+    | MirReturn _ => ([] : List Nat) | MirTrap => ([] : List Nat) end end;
+
+def mir_destination (instruction : MirInstruction) : Maybe Nat :=
+    match instruction with
+    | MirMove id _ => Just Nat id | MirBinaryOp id _ _ _ => Just Nat id
+    | MirCompare id _ _ _ => Just Nat id | MirConvert id _ _ => Just Nat id
+    | MirLoad id _ _ => Just Nat id | MirLoadAt id _ _ => Just Nat id | MirAddress id _ => Just Nat id
+    | MirPointerAdd id _ _ => Just Nat id | MirCall _ id _ _ => id
+    | MirManagedAlloc id _ _ _ _ => Just Nat id | MirManagedContext id => Just Nat id
+    | MirStore _ _ _ => Nothing Nat | MirStoreAt _ _ _ => Nothing Nat end;
+
+def mir_reads (instruction : MirInstruction) : List MirValue :=
+    match instruction with
+    | MirMove _ value => ([value] : List MirValue) | MirBinaryOp _ _ a b => ([a, b] : List MirValue)
+    | MirCompare _ _ a b => ([a, b] : List MirValue) | MirConvert _ _ value => ([value] : List MirValue)
+    | MirLoad _ address _ => ([address] : List MirValue) | MirStore address _ value => ([address, value] : List MirValue)
+    | MirLoadAt _ address offset => ([address, offset] : List MirValue) | MirStoreAt address offset value => ([address, offset, value] : List MirValue)
+    | MirAddress _ _ => ([] : List MirValue) | MirPointerAdd _ address offset => ([address, offset] : List MirValue)
+    | MirManagedAlloc _ _ _ _ bytes => ([bytes] : List MirValue) | MirManagedContext _ => ([] : List MirValue)
+    | MirCall _ _ target args => match target with
+      | MirDirect _ => args | MirIndirect _ address => Cons MirValue address args end end;
+
+def mir_terminator_reads (term : MirTerminator) : List MirValue :=
+    match term with | MirBranch value _ _ => ([value] : List MirValue)
+    | MirReturn value => match value with | Nothing => ([] : List MirValue) | Just result => ([result] : List MirValue) end
+    | MirJump _ => ([] : List MirValue) | MirTrap => ([] : List MirValue) end;

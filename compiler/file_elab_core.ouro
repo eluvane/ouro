@@ -1,0 +1,1233 @@
+-- File-level kernel driver: declarations are checked left-to-right against the environment they extend.
+-- Failure codes are host-facing, so factoring must keep their meanings stable.
+
+-- @entry check_file
+-- @entry check_surf_file
+-- @entry check_cores_with_inds
+
+import "base.ouro";
+import "file_check_model.ouro";
+import "file_check_environment.ouro";
+import "file_check_work.ouro";
+import "string_nf_eval.ouro";
+
+-- CoreTerm, Surface, CaseInfo, Maybe, and eqNat come from the canonical
+-- frontend model so declaration plans and the checker share one typed ABI.
+
+def ltNat (n : Nat) (m : Nat) : Bool := compiler_le_nat (S n) m;
+
+def core_pred (n : Nat) : Nat := match n with | Z => Z | S n' => n' end;
+
+def lookup_entry (A : Type) (name : Nat)
+    (on_const : CoreTerm -> Maybe CoreTerm -> Maybe A)
+    (on_ind : IndDecl -> Maybe A) : List Entry -> Maybe A :=
+    fix lookup_entry (sig : List Entry) : Maybe A :=
+      match sig with
+      | Nil => Nothing A
+      | Cons e sig' =>
+          match e with
+          | MkEntry n ty body =>
+              match eqNat n name with
+              | True => on_const ty body
+              | False => lookup_entry sig'
+              end
+          | MkIndEntry n decl =>
+              match eqNat n name with
+              | True => on_ind decl
+              | False => lookup_entry sig'
+              end
+          | MkBoundEntry n ty _ =>
+              match eqNat n name with
+              | True => on_const ty (Nothing CoreTerm)
+              | False => lookup_entry sig'
+              end
+          | MkRoleEntry _ => lookup_entry sig'
+          end
+      end;
+
+def lookup_const (name : Nat) : List Entry -> Maybe CoreTerm :=
+    lookup_entry CoreTerm name
+      (fun (_ty : CoreTerm) (body : Maybe CoreTerm) => body)
+      (fun (_d : IndDecl) => Nothing CoreTerm);
+
+def lookup_type (name : Nat) : List Entry -> Maybe CoreTerm :=
+    lookup_entry CoreTerm name
+      (fun (ty : CoreTerm) (_body : Maybe CoreTerm) => Just CoreTerm ty)
+      (fun (_d : IndDecl) => Nothing CoreTerm);
+
+def lookup_ind (name : Nat) : List Entry -> Maybe IndDecl :=
+    lookup_entry IndDecl name
+      (fun (_ty : CoreTerm) (_body : Maybe CoreTerm) => Nothing IndDecl)
+      (fun (decl : IndDecl) => Just IndDecl decl);
+
+-- A definition repeatedly looks up constructor families, including every S in
+-- a numeric literal. Keep those descriptors near the front during checking.
+-- Resolve each cached entry through the original lookup so shadowed IDs keep
+-- their original meaning. The complete signature remains available afterwards;
+-- this temporary view is never returned as the ordered checked environment.
+def declaration_lookup_environment (sig : List Entry) : List Entry :=
+    (fix collect (remaining : List Entry) (families : List Entry) : List Entry :=
+      match remaining with
+      | Nil => append Entry families sig
+      | Cons entry rest =>
+          match entry with
+          | MkIndEntry name _ =>
+              match lookup_ind name sig with
+              | Nothing => collect rest families
+              | Just declaration => collect rest (Cons Entry (MkIndEntry name declaration) families)
+              end
+          | MkEntry _ _ _ => collect rest families
+          | MkBoundEntry _ _ _ => collect rest families
+          | MkRoleEntry _ => collect rest families
+          end
+      end) sig (Nil Entry);
+
+-- Structural traversal cannot silently stop before reaching a free variable.
+-- Case branches already contain their lambdas; metadata introduces no binders.
+def lift_rec : CoreTerm -> Nat -> Nat -> CoreTerm :=
+  fix lift_rec (t : CoreTerm) (d : Nat) (c : Nat) : CoreTerm :=
+    match t with
+    | CRel i =>
+        match compiler_le_nat c i with
+        | True => CRel (add i d)
+        | False => t
+        end
+    | CSort _ => t
+    | CPi a b => CPi (lift_rec a d c) (lift_rec b d (S c))
+    | CLam ann body => CLam (lift_rec ann d c) (lift_rec body d (S c))
+    | CApp f a => CApp (lift_rec f d c) (lift_rec a d c)
+    | CLetIn v ty body =>
+        CLetIn (lift_rec v d c) (lift_rec ty d c) (lift_rec body d (S c))
+    | CConst _ => t
+    | CInd _ => t
+    | CConstruct _ _ _ => t
+    | CStrBytes _ _ => t
+    | CStrLit _ _ => t
+    | CCase ci p s bs =>
+        CCase ci (lift_rec p d c) (lift_rec s d c)
+          ((fix branches (xs : List CoreTerm) : List CoreTerm :=
+              match xs with
+              | Nil => Nil CoreTerm
+              | Cons branch rest =>
+                  Cons CoreTerm (lift_rec branch d c) (branches rest)
+              end) bs)
+    | CFix name ra ar ty body =>
+        CFix name ra ar (lift_rec ty d c) (lift_rec body d (S c))
+    end;
+
+def lift (d : Nat) (t : CoreTerm) : CoreTerm :=
+    match d with | Z => t | S _ => lift_rec t d Z end;
+
+def subst_rec : CoreTerm -> Nat -> CoreTerm -> CoreTerm :=
+  fix subst_rec (t : CoreTerm) (n : Nat) (v : CoreTerm) : CoreTerm :=
+    match t with
+    | CRel i =>
+        match eqNat i n with
+        | True => lift n v
+        | False =>
+            match ltNat n i with
+            | True => CRel (core_pred i)
+            | False => t
+            end
+        end
+    | CSort _ => t
+    | CPi a b => CPi (subst_rec a n v) (subst_rec b (S n) v)
+    | CLam ann body => CLam (subst_rec ann n v) (subst_rec body (S n) v)
+    | CApp f a => CApp (subst_rec f n v) (subst_rec a n v)
+    | CLetIn x ty body =>
+        CLetIn (subst_rec x n v) (subst_rec ty n v) (subst_rec body (S n) v)
+    | CConst _ => t
+    | CInd _ => t
+    | CConstruct _ _ _ => t
+    | CStrBytes _ _ => t
+    | CStrLit _ _ => t
+    | CCase ci p s bs =>
+        CCase ci (subst_rec p n v) (subst_rec s n v)
+          ((fix branches (xs : List CoreTerm) : List CoreTerm :=
+              match xs with
+              | Nil => Nil CoreTerm
+              | Cons branch rest =>
+                  Cons CoreTerm (subst_rec branch n v) (branches rest)
+              end) bs)
+    | CFix name ra ar ty body =>
+        CFix name ra ar (subst_rec ty n v) (subst_rec body (S n) v)
+    end;
+
+def subst (v : CoreTerm) (t : CoreTerm) : CoreTerm :=
+    subst_rec t Z v;
+
+-- Replacements are newest first and already expressed in the outer context.
+-- Materialize each demanded domain/value once, then substitute the remaining
+-- body once. Metadata adds no binders; case branches contain their lambdas.
+def subst_many_rec (count : Nat) (values : List CoreTerm)
+    : CoreTerm -> Nat -> CoreTerm :=
+  fix instantiate (term : CoreTerm) (cutoff : Nat) : CoreTerm :=
+    match term with
+    | CRel index =>
+        match ltNat index cutoff with
+        | True => term
+        | False =>
+            let free : Nat := sub index cutoff in
+            match compiler_nth CoreTerm values free with
+            | Just value => lift cutoff value
+            | Nothing => CRel (sub index count)
+            end
+        end
+    | CPi domain codomain => CPi (instantiate domain cutoff) (instantiate codomain (S cutoff))
+    | CLam annotation body => CLam (instantiate annotation cutoff) (instantiate body (S cutoff))
+    | CApp function argument => CApp (instantiate function cutoff) (instantiate argument cutoff)
+    | CLetIn value annotation body =>
+        CLetIn (instantiate value cutoff) (instantiate annotation cutoff) (instantiate body (S cutoff))
+    | CCase info predicate scrutinee branches =>
+        CCase info (instantiate predicate cutoff) (instantiate scrutinee cutoff)
+          ((fix visit (remaining : List CoreTerm) : List CoreTerm :=
+              match remaining with
+              | Nil => Nil CoreTerm
+              | Cons branch rest => Cons CoreTerm (instantiate branch cutoff) (visit rest)
+              end) branches)
+    | CFix name rec_arg arity annotation body =>
+        CFix name rec_arg arity (instantiate annotation cutoff) (instantiate body (S cutoff))
+    | CSort _ => term
+    | CConst _ => term
+    | CInd _ => term
+    | CConstruct _ _ _ => term
+    | CStrBytes _ _ => term
+    | CStrLit _ _ => term
+    end;
+
+def subst_many (count : Nat) (values : List CoreTerm) (term : CoreTerm) : CoreTerm :=
+    match count with | Z => term | S _ => subst_many_rec count values term Z end;
+
+-- Fuel-bounded beta/delta/let normalize_worker; conversion also compares function eta.
+def lamBody (t : CoreTerm) : Maybe CoreTerm :=
+    match t with
+    | CLam _ann body => Just CoreTerm body
+    | CRel _ => Nothing CoreTerm
+    | CSort _ => Nothing CoreTerm
+    | CPi _ _ => Nothing CoreTerm
+    | CApp _ _ => Nothing CoreTerm
+    | CLetIn _ _ _ => Nothing CoreTerm
+    | CConst _ => Nothing CoreTerm
+    | CInd _ => Nothing CoreTerm
+    | CConstruct _ _ _ => Nothing CoreTerm
+    | CStrBytes _ _ => Nothing CoreTerm
+    | CStrLit _ _ => Nothing CoreTerm
+    | CCase _ _ _ _ => Nothing CoreTerm
+    | CFix _ _ _ _ _ => Nothing CoreTerm
+    end;
+
+inductive CtorHead : Type :=
+  | NotCtor : CtorHead
+  | YesCtor : Nat -> Nat -> Nat -> CtorHead;
+
+inductive FixHead : Type :=
+  | NotFix : FixHead
+  | YesFix : Nat -> Nat -> Nat -> CoreTerm -> CoreTerm -> FixHead;
+
+def asCtorHead (t : CoreTerm) : CtorHead :=
+    match t with
+    | CConstruct i j np => YesCtor i j np
+    | CRel _ => NotCtor
+    | CSort _ => NotCtor
+    | CPi _ _ => NotCtor
+    | CLam _ _ => NotCtor
+    | CApp _ _ => NotCtor
+    | CLetIn _ _ _ => NotCtor
+    | CConst _ => NotCtor
+    | CStrBytes _ _ => NotCtor
+    | CStrLit _ _ => NotCtor
+    | CInd _ => NotCtor
+    | CCase _ _ _ _ => NotCtor
+    | CFix _ _ _ _ _ => NotCtor
+    end;
+
+def asFixHead (t : CoreTerm) : FixHead :=
+    match t with
+    | CFix name ra ar ty body => YesFix name ra ar ty body
+    | CRel _ => NotFix
+    | CSort _ => NotFix
+    | CPi _ _ => NotFix
+    | CLam _ _ => NotFix
+    | CApp _ _ => NotFix
+    | CLetIn _ _ _ => NotFix
+    | CConst _ => NotFix
+    | CInd _ => NotFix
+    | CConstruct _ _ _ => NotFix
+    | CStrBytes _ _ => NotFix
+    | CStrLit _ _ => NotFix
+    | CCase _ _ _ _ => NotFix
+    end;
+
+def normalize_and_then (first : NormalizeResult Bool)
+    (next : Unit -> NormalizeResult Bool) : NormalizeResult Bool :=
+    normalize_bind Bool Bool first
+      (fun (equal : Bool) =>
+        match equal with
+        | False => Normalized Bool False
+        | True => next MkUnit
+        end);
+
+inductive Spine : Type := | MkSpine : CoreTerm -> List CoreTerm -> Spine;
+
+def app_spine (fuel : Nat) (t : CoreTerm) : Spine :=
+    (fix go (fuel2 : Nat) (cur : CoreTerm) (args : List CoreTerm)
+        : Spine :=
+      match fuel2 with
+      | Z => MkSpine cur args
+      | S fuel2' =>
+          match cur with
+          | CApp f a => go fuel2' f (Cons CoreTerm a args)
+          | CRel _ => MkSpine cur args
+          | CSort _ => MkSpine cur args
+          | CPi _ _ => MkSpine cur args
+          | CLam _ _ => MkSpine cur args
+          | CLetIn _ _ _ => MkSpine cur args
+          | CConst _ => MkSpine cur args
+          | CInd _ => MkSpine cur args
+          | CConstruct _ _ _ => MkSpine cur args
+          | CStrBytes _ _ => MkSpine cur args
+          | CStrLit _ _ => MkSpine cur args
+          | CCase _ _ _ _ => MkSpine cur args
+          | CFix _ _ _ _ _ => MkSpine cur args
+          end
+      end) fuel t (Nil CoreTerm);
+
+def app_spine_checked (fuel : Nat) (term : CoreTerm) : NormalizeResult Spine :=
+    (fix collect (remaining : Nat) (current : CoreTerm) (arguments : List CoreTerm)
+        : NormalizeResult Spine :=
+      match remaining with
+      | Z => NormalizeExhausted Spine
+      | S remaining' =>
+          match current with
+          | CApp function argument =>
+              collect remaining' function (Cons CoreTerm argument arguments)
+          | CRel _ => Normalized Spine (MkSpine current arguments)
+          | CSort _ => Normalized Spine (MkSpine current arguments)
+          | CPi _ _ => Normalized Spine (MkSpine current arguments)
+          | CLam _ _ => Normalized Spine (MkSpine current arguments)
+          | CLetIn _ _ _ => Normalized Spine (MkSpine current arguments)
+          | CConst _ => Normalized Spine (MkSpine current arguments)
+          | CInd _ => Normalized Spine (MkSpine current arguments)
+          | CConstruct _ _ _ => Normalized Spine (MkSpine current arguments)
+          | CStrBytes _ _ => Normalized Spine (MkSpine current arguments)
+          | CStrLit _ _ => Normalized Spine (MkSpine current arguments)
+          | CCase _ _ _ _ => Normalized Spine (MkSpine current arguments)
+          | CFix _ _ _ _ _ => Normalized Spine (MkSpine current arguments)
+          end
+      end) fuel term (Nil CoreTerm);
+
+inductive ArgsLen : Type :=
+  | MkArgsLen : List CoreTerm -> Nat -> ArgsLen;
+
+def snoc_with_len (xs : List CoreTerm) (x : CoreTerm) : ArgsLen :=
+    (fix go (ys : List CoreTerm) : ArgsLen :=
+        match ys with
+        | Nil => MkArgsLen ([x] : List CoreTerm) (S Z)
+        | Cons y ys' =>
+            match go ys' with
+            | MkArgsLen zs n => MkArgsLen (Cons CoreTerm y zs) (S n)
+            end
+        end) xs;
+
+def mk_app (f : CoreTerm) (args : List CoreTerm) : CoreTerm :=
+    (fix mk_app (xs : List CoreTerm) (acc : CoreTerm) : CoreTerm :=
+        match xs with
+        | Nil => acc
+        | Cons a xs' => mk_app xs' (CApp acc a)
+        end) args f;
+
+def normalize_case_count : Nat -> List Nat -> List CoreTerm -> NormalizeResult Unit :=
+  fix normalize_case_count (fuel : Nat) (arities : List Nat) (branches : List CoreTerm)
+      : NormalizeResult Unit :=
+    match fuel with
+    | Z => NormalizeExhausted Unit
+    | S fuel' =>
+        match arities, branches with
+        | Nil, Nil => Normalized Unit MkUnit
+        | Cons _ rest_arities, Cons _ rest_branches =>
+            normalize_case_count fuel' rest_arities rest_branches
+        | Nil, Cons _ _ => NormalizeMalformed Unit NormalizeCaseBranchCount
+        | Cons _ _, Nil => NormalizeMalformed Unit NormalizeCaseBranchCount
+        end
+    end;
+
+def normalize_fix_type (reduce : CoreTerm -> NormalizeResult CoreTerm)
+    : Nat -> CoreTerm -> NormalizeResult Unit :=
+    fix normalize_fix_type (arity : Nat) (annotation : CoreTerm) : NormalizeResult Unit :=
+      match arity with
+      | Z => Normalized Unit MkUnit
+      | S remaining =>
+          normalize_bind CoreTerm Unit (reduce annotation)
+            (fun (head : CoreTerm) =>
+              match head with
+              | CPi _ codomain => normalize_fix_type remaining codomain
+              | CRel _ => NormalizeMalformed Unit NormalizeFixArity
+              | CSort _ => NormalizeMalformed Unit NormalizeFixArity
+              | CLam _ _ => NormalizeMalformed Unit NormalizeFixArity
+              | CApp _ _ => NormalizeMalformed Unit NormalizeFixArity
+              | CLetIn _ _ _ => NormalizeMalformed Unit NormalizeFixArity
+              | CConst _ => NormalizeMalformed Unit NormalizeFixArity
+              | CInd _ => NormalizeMalformed Unit NormalizeFixArity
+              | CConstruct _ _ _ => NormalizeMalformed Unit NormalizeFixArity
+              | CStrBytes _ _ => NormalizeMalformed Unit NormalizeFixArity
+              | CStrLit _ _ => NormalizeMalformed Unit NormalizeFixArity
+              | CCase _ _ _ _ => NormalizeMalformed Unit NormalizeFixArity
+              | CFix _ _ _ _ _ => NormalizeMalformed Unit NormalizeFixArity
+              end)
+      end;
+
+def normalize_stuck_application (function : CoreTerm) (argument : CoreTerm)
+    : NormalizeResult CoreTerm :=
+    match function with
+    | CSort _ => NormalizeMalformed CoreTerm NormalizeNonFunction
+    | CPi _ _ => NormalizeMalformed CoreTerm NormalizeNonFunction
+    | CStrBytes _ _ => NormalizeMalformed CoreTerm NormalizeNonFunction
+    | CStrLit _ _ => NormalizeMalformed CoreTerm NormalizeNonFunction
+    | CLam _ _ => NormalizeMalformed CoreTerm NormalizeUnreducedHead
+    | CLetIn _ _ _ => NormalizeMalformed CoreTerm NormalizeUnreducedHead
+    | CRel _ => Normalized CoreTerm (CApp function argument)
+    | CConst _ => Normalized CoreTerm (CApp function argument)
+    | CInd _ => Normalized CoreTerm (CApp function argument)
+    | CConstruct _ _ _ => Normalized CoreTerm (CApp function argument)
+    | CApp _ _ => Normalized CoreTerm (CApp function argument)
+    | CCase _ _ _ _ => Normalized CoreTerm (CApp function argument)
+    | CFix _ _ _ _ _ => Normalized CoreTerm (CApp function argument)
+    end;
+
+def normalize_fix_application (reduce : CoreTerm -> NormalizeResult CoreTerm)
+    (fuel : Nat) (name : Nat) (rec_arg : Nat) (arity : Nat)
+    (annotation : CoreTerm) (body : CoreTerm) (arguments : List CoreTerm)
+    (argument : CoreTerm) (stuck : CoreTerm) : NormalizeResult CoreTerm :=
+    match snoc_with_len arguments argument with
+    | MkArgsLen supplied count =>
+        match ltNat rec_arg count with
+        | False => Normalized CoreTerm stuck
+        | True =>
+            match compiler_nth CoreTerm supplied rec_arg with
+            | Nothing => NormalizeMalformed CoreTerm NormalizeFixArgument
+            | Just structural =>
+                normalize_bind CoreTerm CoreTerm (reduce structural)
+                  (fun (value : CoreTerm) =>
+                    normalize_bind Spine CoreTerm (app_spine_checked fuel value)
+                      (fun (spine : Spine) =>
+                        match spine with
+                        | MkSpine head _ =>
+                            match asCtorHead head with
+                            | NotCtor => Normalized CoreTerm stuck
+                            | YesCtor _ _ _ =>
+                                let self : CoreTerm := CFix name rec_arg arity annotation body in
+                                let lifted : List CoreTerm := map CoreTerm CoreTerm
+                                  (fun (term : CoreTerm) => lift 1 term) supplied in
+                                reduce (subst self (mk_app body lifted))
+                            end
+                        end))
+            end
+        end
+    end;
+
+def normalize_application (reduce : CoreTerm -> NormalizeResult CoreTerm)
+    (fuel : Nat) (sig : CheckEnvironment) (function : CoreTerm) (argument : CoreTerm) : NormalizeResult CoreTerm :=
+    match lamBody function with
+    | Just body => reduce (subst argument body)
+    | Nothing =>
+        normalize_bind Spine CoreTerm (app_spine_checked fuel function)
+          (fun (spine : Spine) =>
+            match spine with
+            | MkSpine head arguments =>
+                match asFixHead head with
+                | NotFix => normalize_bind (Maybe CoreTerm) CoreTerm
+                    (normalize_string_application reduce fuel (check_environment_entries sig) head arguments argument)
+                    (fun (result : Maybe CoreTerm) => match result with
+                      | Nothing => normalize_stuck_application function argument
+                      | Just value => Normalized CoreTerm value
+                      end)
+                | YesFix name rec_arg arity annotation body =>
+                    normalize_fix_application reduce fuel name rec_arg arity annotation body
+                      arguments argument (CApp function argument)
+                end
+            end)
+    end;
+
+def normalize_case_branch (reduce : CoreTerm -> NormalizeResult CoreTerm)
+    (nparams : Nat) (arities : List Nat) (branches : List CoreTerm)
+    (index : Nat) (arguments : List CoreTerm) : NormalizeResult CoreTerm :=
+    match compiler_nth Nat arities index, compiler_nth CoreTerm branches index with
+    | Nothing, Nothing => NormalizeMalformed CoreTerm NormalizeCaseConstructor
+    | Nothing, Just _ => NormalizeMalformed CoreTerm NormalizeCaseConstructor
+    | Just _, Nothing => NormalizeMalformed CoreTerm NormalizeCaseConstructor
+    | Just arity, Just branch =>
+        match eqNat (length CoreTerm arguments) (add nparams arity) with
+        | False => NormalizeMalformed CoreTerm NormalizeCaseArguments
+        | True => reduce (mk_app branch (drop CoreTerm nparams arguments))
+        end
+    end;
+
+def normalize_case_constructor (reduce : CoreTerm -> NormalizeResult CoreTerm)
+    (info : CaseInfo) (branches : List CoreTerm) (ind : Nat) (index : Nat)
+    (nparams : Nat) (arguments : List CoreTerm) : NormalizeResult CoreTerm :=
+    match info with
+    | MkCaseInfo expected expected_params arities =>
+        match eqNat ind expected with
+        | False => NormalizeMalformed CoreTerm NormalizeCaseInductive
+        | True =>
+            match eqNat nparams expected_params with
+            | False => NormalizeMalformed CoreTerm NormalizeCaseParameters
+            | True => normalize_case_branch reduce nparams arities branches index arguments
+            end
+        end
+    end;
+
+def normalize_stuck_case (head : CoreTerm) (info : CaseInfo) (motive : CoreTerm)
+    (scrutinee : CoreTerm) (branches : List CoreTerm) : NormalizeResult CoreTerm :=
+    let stuck : CoreTerm := CCase info motive scrutinee branches in
+    match head with
+    | CSort _ => NormalizeMalformed CoreTerm NormalizeCaseScrutinee
+    | CPi _ _ => NormalizeMalformed CoreTerm NormalizeCaseScrutinee
+    | CLam _ _ => NormalizeMalformed CoreTerm NormalizeCaseScrutinee
+    | CStrBytes _ _ => NormalizeMalformed CoreTerm NormalizeCaseScrutinee
+    | CStrLit _ _ => NormalizeMalformed CoreTerm NormalizeCaseScrutinee
+    | CLetIn _ _ _ => NormalizeMalformed CoreTerm NormalizeUnreducedHead
+    | CApp _ _ => NormalizeMalformed CoreTerm NormalizeUnreducedHead
+    | CRel _ => Normalized CoreTerm stuck
+    | CConst _ => Normalized CoreTerm stuck
+    | CInd _ => Normalized CoreTerm stuck
+    | CConstruct _ _ _ => Normalized CoreTerm stuck
+    | CCase _ _ _ _ => Normalized CoreTerm stuck
+    | CFix _ _ _ _ _ => Normalized CoreTerm stuck
+    end;
+
+def normalize_case (reduce : CoreTerm -> NormalizeResult CoreTerm)
+    (fuel : Nat) (info : CaseInfo) (motive : CoreTerm) (scrutinee : CoreTerm)
+    (branches : List CoreTerm) : NormalizeResult CoreTerm :=
+    match info with
+    | MkCaseInfo _ _ arities =>
+        normalize_bind Unit CoreTerm (normalize_case_count fuel arities branches)
+          (fun (_counted : Unit) =>
+            normalize_bind CoreTerm CoreTerm (reduce scrutinee)
+              (fun (value : CoreTerm) =>
+                normalize_bind Spine CoreTerm (app_spine_checked fuel value)
+                  (fun (spine : Spine) =>
+                    match spine with
+                    | MkSpine head arguments =>
+                        match asCtorHead head with
+                        | NotCtor => normalize_stuck_case head info motive value branches
+                        | YesCtor ind index nparams =>
+                            normalize_case_constructor reduce info branches ind index nparams arguments
+                        end
+                    end)))
+    end;
+
+-- Weak-head reduction does not normalize discarded beta/let arguments or
+-- unselected case branches. Their typing belongs to the declaration checker.
+-- Every demanded reduction and metadata check carries its exact failure.
+-- Normalize transparent aliases and require their checked String identity.
+def normalize_string_bytes (reduce : CoreTerm -> NormalizeResult CoreTerm)
+    (fuel : Nat) (sig : CheckEnvironment) (bytes : List Nat) (typ : Nat) : NormalizeResult CoreTerm :=
+    normalize_bind Unit CoreTerm (string_nf_validate fuel bytes)
+      (fun (_valid : Unit) => normalize_bind CoreTerm CoreTerm (reduce (CConst typ))
+        (fun (normal : CoreTerm) =>
+          match string_value_type_head (check_environment_entries sig) normal with
+          | Just name => Normalized CoreTerm (CStrBytes bytes name)
+          | Nothing => NormalizeMalformed CoreTerm NormalizeStringType
+          end));
+
+-- Dispatch one demanded head. Recursive calls arrive through a closure whose
+-- fuel is already a structural predecessor of the caller's fuel.
+def normalize_head_checked (reduce : CoreTerm -> NormalizeResult CoreTerm)
+    (fuel : Nat) (sig : CheckEnvironment) (term : CoreTerm) : NormalizeResult CoreTerm :=
+        match term with
+        | CConst name =>
+            match check_environment_const name sig with
+            | Nothing => Normalized CoreTerm term
+            | Just body => reduce body
+            end
+        | CApp function argument =>
+            normalize_bind CoreTerm CoreTerm (reduce function)
+              (fun (head : CoreTerm) => normalize_application reduce fuel sig head argument)
+        | CLetIn value _annotation body => reduce (subst value body)
+        | CCase info motive scrutinee branches =>
+            normalize_case reduce fuel info motive scrutinee branches
+        | CFix _ rec_arg arity annotation _ =>
+            match ltNat rec_arg arity with
+            | False => NormalizeMalformed CoreTerm NormalizeFixArgument
+            | True =>
+                normalize_bind Unit CoreTerm (normalize_fix_type reduce arity annotation)
+                  (fun (_checked : Unit) => Normalized CoreTerm term)
+            end
+        | CRel _ => Normalized CoreTerm term
+        | CSort _ => Normalized CoreTerm term
+        | CPi _ _ => Normalized CoreTerm term
+        | CLam _ _ => Normalized CoreTerm term
+        | CInd _ => Normalized CoreTerm term
+        | CConstruct _ _ _ => Normalized CoreTerm term
+        | CStrBytes bytes typ => normalize_string_bytes reduce fuel sig bytes typ
+        | CStrLit _ _ => NormalizeMalformed CoreTerm NormalizeUnresolvedLiteral
+        end;
+
+inductive SubstitutionHead : Type :=
+  | SubstitutionLet : CoreTerm -> CoreTerm -> SubstitutionHead
+  | SubstitutionTerm : CoreTerm -> SubstitutionHead;
+
+def substitution_head (count : Nat) (values : List CoreTerm) (term : CoreTerm) : SubstitutionHead :=
+    match term with
+    | CLetIn value _ body => SubstitutionLet (subst_many count values value) body
+    | CRel _ => SubstitutionTerm (subst_many count values term)
+    | CSort _ => SubstitutionTerm term
+    | CPi _ _ => SubstitutionTerm (subst_many count values term)
+    | CLam _ _ => SubstitutionTerm (subst_many count values term)
+    | CApp _ _ => SubstitutionTerm (subst_many count values term)
+    | CConst _ => SubstitutionTerm term
+    | CInd _ => SubstitutionTerm term
+    | CConstruct _ _ _ => SubstitutionTerm term
+    | CStrBytes _ _ => SubstitutionTerm term
+    | CStrLit _ _ => SubstitutionTerm term
+    | CCase _ _ _ _ => SubstitutionTerm (subst_many count values term)
+    | CFix _ _ _ _ _ => SubstitutionTerm (subst_many count values term)
+    end;
+
+def whnf_deferred : Nat -> CheckEnvironment -> Nat -> List CoreTerm -> CoreTerm -> NormalizeResult CoreTerm :=
+  fix reduce_head (fuel : Nat) (sig : CheckEnvironment) (count : Nat)
+      (values : List CoreTerm) (term : CoreTerm) : NormalizeResult CoreTerm :=
+    match fuel with
+    | Z => NormalizeExhausted CoreTerm
+    | S remaining =>
+        match substitution_head count values term with
+        | SubstitutionLet value body =>
+            reduce_head remaining sig (S count) (Cons CoreTerm value values) body
+        | SubstitutionTerm actual =>
+            normalize_head_checked
+              (fun (next : CoreTerm) => reduce_head remaining sig Z (Nil CoreTerm) next)
+              remaining sig actual
+        end
+    end;
+
+def whnf_checked_worker (fuel : Nat) (sig : CheckEnvironment) (term : CoreTerm) : NormalizeResult CoreTerm :=
+    whnf_deferred fuel sig Z (Nil CoreTerm) term;
+
+def normalize_pair (reduce : CoreTerm -> NormalizeResult CoreTerm)
+    (build : CoreTerm -> CoreTerm -> CoreTerm) (first : CoreTerm) (second : CoreTerm)
+    : NormalizeResult CoreTerm :=
+    normalize_bind CoreTerm CoreTerm (reduce first)
+      (fun (left : CoreTerm) =>
+        normalize_bind CoreTerm CoreTerm (reduce second)
+          (fun (right : CoreTerm) => Normalized CoreTerm (build left right)));
+
+def normalize_terms (reduce : CoreTerm -> NormalizeResult CoreTerm)
+    : Nat -> List CoreTerm -> NormalizeResult (List CoreTerm) :=
+    fix normalize_terms (fuel : Nat) (terms : List CoreTerm)
+        : NormalizeResult (List CoreTerm) :=
+      match fuel with
+      | Z => NormalizeExhausted (List CoreTerm)
+      | S fuel' =>
+          match terms with
+          | Nil => Normalized (List CoreTerm) (Nil CoreTerm)
+          | Cons branch rest =>
+              normalize_bind CoreTerm (List CoreTerm) (reduce branch)
+                (fun (head : CoreTerm) =>
+                  normalize_bind (List CoreTerm) (List CoreTerm)
+                    (normalize_terms fuel' rest)
+                    (fun (tail : List CoreTerm) =>
+                      Normalized (List CoreTerm) (Cons CoreTerm head tail)))
+          end
+      end;
+
+-- Normalize a neutral application spine once, rather than normalizing each
+-- growing function prefix again. The head was already exposed by WHNF.
+def normalize_spine_form (reduce : CoreTerm -> NormalizeResult CoreTerm)
+    (fuel : Nat) (term : CoreTerm) : NormalizeResult CoreTerm :=
+    normalize_bind Spine CoreTerm (app_spine_checked fuel term)
+      (fun (spine : Spine) =>
+        match spine with
+        | MkSpine head arguments =>
+            normalize_bind CoreTerm CoreTerm (reduce head)
+              (fun (function : CoreTerm) =>
+                normalize_bind (List CoreTerm) CoreTerm (normalize_terms reduce fuel arguments)
+                  (fun (normalized : List CoreTerm) =>
+                    Normalized CoreTerm (mk_app function normalized)))
+        end);
+
+def normalize_form (reduce : CoreTerm -> NormalizeResult CoreTerm)
+    (fuel : Nat) (term : CoreTerm) : NormalizeResult CoreTerm :=
+    match term with
+    | CPi domain codomain =>
+        normalize_pair reduce
+          (fun (left : CoreTerm) (right : CoreTerm) => CPi left right) domain codomain
+    | CLam annotation body =>
+        normalize_pair reduce
+          (fun (left : CoreTerm) (right : CoreTerm) => CLam left right) annotation body
+    | CApp _ _ => normalize_spine_form reduce fuel term
+    | CFix name rec_arg arity annotation body =>
+        normalize_pair reduce
+          (fun (left : CoreTerm) (right : CoreTerm) => CFix name rec_arg arity left right)
+          annotation body
+    | CCase info motive scrutinee branches =>
+        normalize_bind CoreTerm CoreTerm (reduce motive)
+          (fun (predicate : CoreTerm) =>
+            normalize_bind CoreTerm CoreTerm (reduce scrutinee)
+              (fun (value : CoreTerm) =>
+                normalize_bind (List CoreTerm) CoreTerm (normalize_terms reduce fuel branches)
+                  (fun (normalized : List CoreTerm) =>
+                    Normalized CoreTerm (CCase info predicate value normalized))))
+    | CLetIn _ _ _ => NormalizeMalformed CoreTerm NormalizeUnreducedHead
+    | CRel _ => Normalized CoreTerm term
+    | CSort _ => Normalized CoreTerm term
+    | CConst _ => Normalized CoreTerm term
+    | CInd _ => Normalized CoreTerm term
+    | CConstruct _ _ _ => Normalized CoreTerm term
+    | CStrBytes _ _ => Normalized CoreTerm term
+    | CStrLit _ _ => NormalizeMalformed CoreTerm NormalizeUnresolvedLiteral
+    end;
+
+def normalize_checked_worker : Nat -> CheckEnvironment -> CoreTerm -> NormalizeResult CoreTerm :=
+  fix normalize_checked_worker (fuel : Nat) (sig : CheckEnvironment) (term : CoreTerm)
+      : NormalizeResult CoreTerm :=
+    match fuel with
+    | Z => NormalizeExhausted CoreTerm
+    | S fuel' =>
+        normalize_bind CoreTerm CoreTerm (whnf_checked_worker fuel sig term)
+          (fun (head : CoreTerm) =>
+            normalize_form
+              (fun (next : CoreTerm) => normalize_checked_worker fuel' sig next) fuel' head)
+    end;
+
+-- encode is kept for debugging/preflight consumers.
+def encodeCaseInfo (ci : CaseInfo) : List Nat :=
+    match ci with
+    | MkCaseInfo ind np arities => Cons Nat ind (Cons Nat np arities)
+    end;
+
+def encode : Nat -> CoreTerm -> List Nat :=
+  fix encode (fuel : Nat) (t : CoreTerm) : List Nat :=
+    match fuel with
+    | Z => Nil Nat
+    | S fuel' =>
+        match t with
+        | CRel i => ([0, i] : List Nat)
+        | CSort u => ([1, u] : List Nat)
+        | CConst n => ([6, n] : List Nat)
+        | CInd n => ([7, n] : List Nat)
+        | CConstruct i j p =>
+            ([8, i, j, p] : List Nat)
+        | CStrLit n ty => ([11, n, ty] : List Nat)
+        | CStrBytes bytes ty => Cons Nat 12 (Cons Nat ty (Cons Nat (length Nat bytes) bytes))
+        | CPi a b =>
+            Cons Nat 2 (append Nat (encode fuel' a) (encode fuel' b))
+        | CLam a b =>
+            Cons Nat 3 (append Nat (encode fuel' a) (encode fuel' b))
+        | CApp f a =>
+            Cons Nat 4 (append Nat (encode fuel' f) (encode fuel' a))
+        | CLetIn v ty b =>
+            Cons Nat 5
+              (append Nat (encode fuel' v)
+                  (append Nat (encode fuel' ty) (encode fuel' b)))
+        | CCase ci p s bs =>
+            Cons Nat 9
+              (append Nat (encodeCaseInfo ci)
+                  (append Nat (encode fuel' p)
+                    (append Nat (encode fuel' s)
+                        ((fix go (xs : List CoreTerm) : List Nat :=
+                            match xs with
+                            | Nil => Nil Nat
+                            | Cons b xs' =>
+                                append Nat (encode fuel' b) (go xs')
+                            end) bs))))
+        | CFix name ra ar ty body =>
+            Cons Nat 10
+              (Cons Nat name
+                  (Cons Nat ra
+                    (Cons Nat ar
+                        (append Nat (encode fuel' ty) (encode fuel' body)))))
+        end
+    end;
+
+def eqList : List Nat -> List Nat -> Bool :=
+  fix eqList (l1 : List Nat) (l2 : List Nat) : Bool :=
+    match l1, l2 with
+    | Nil, Nil => True
+    | Nil, Cons _ _ => False
+    | Cons _ _, Nil => False
+    | Cons x xs, Cons y ys =>
+        match eqNat x y with
+        | True => eqList xs ys
+        | False => False
+        end
+    end;
+
+def eqCaseInfo (ci1 : CaseInfo) (ci2 : CaseInfo) : Bool :=
+    match ci1, ci2 with
+    | MkCaseInfo ind np arities, MkCaseInfo ind' np' arities' =>
+        match eqNat ind ind' with
+        | False => False
+        | True =>
+            match eqNat np np' with
+            | False => False
+            | True => eqList arities arities'
+            end
+        end
+    end;
+
+-- Direct structural equality avoids temporary List Nat encodings in conv_worker.
+-- The recursive worker is passed into bounded helpers so no one definition
+-- exceeds the frontend's extraction limit.
+def eq_term_list
+  (eq_term : Nat -> CoreTerm -> CoreTerm -> NormalizeResult Bool)
+  : Nat -> List CoreTerm -> List CoreTerm -> NormalizeResult Bool :=
+  fix eq_term_list (fuel : Nat) (xs : List CoreTerm) (ys : List CoreTerm)
+      : NormalizeResult Bool :=
+    match fuel with
+    | Z => NormalizeExhausted Bool
+    | S fuel' =>
+        match xs, ys with
+        | Nil, Nil => Normalized Bool True
+        | Nil, Cons _ _ => Normalized Bool False
+        | Cons _ _, Nil => Normalized Bool False
+        | Cons x xs', Cons y ys' =>
+            normalize_and_then (eq_term fuel' x y)
+              (fun (_matched : Unit) => eq_term_list fuel' xs' ys')
+        end
+    end;
+
+def eq_term_construct (i : Nat) (j : Nat) (np : Nat)
+    (i2 : Nat) (j2 : Nat) (np2 : Nat) : Bool :=
+    andb (eqNat i i2) (andb (eqNat j j2) (eqNat np np2));
+
+def eq_term_two
+  (eq_term : Nat -> CoreTerm -> CoreTerm -> NormalizeResult Bool)
+  (fuel : Nat) (a : CoreTerm) (b : CoreTerm)
+  (a2 : CoreTerm) (b2 : CoreTerm) : NormalizeResult Bool :=
+    normalize_and_then (eq_term fuel a a2)
+      (fun (_matched : Unit) => eq_term fuel b b2);
+
+def eq_term_let
+  (eq_term : Nat -> CoreTerm -> CoreTerm -> NormalizeResult Bool)
+  (fuel : Nat) (v : CoreTerm) (ty : CoreTerm) (body : CoreTerm)
+  (v2 : CoreTerm) (ty2 : CoreTerm) (body2 : CoreTerm) : NormalizeResult Bool :=
+    normalize_and_then (eq_term fuel v v2)
+      (fun (_matched : Unit) => eq_term_two eq_term fuel ty body ty2 body2);
+
+def eq_term_case
+  (eq_term : Nat -> CoreTerm -> CoreTerm -> NormalizeResult Bool)
+  (fuel : Nat) (ci : CaseInfo) (p : CoreTerm) (s : CoreTerm)
+  (bs : List CoreTerm) (ci2 : CaseInfo) (p2 : CoreTerm) (s2 : CoreTerm)
+  (bs2 : List CoreTerm) : NormalizeResult Bool :=
+    match eqCaseInfo ci ci2 with
+    | False => Normalized Bool False
+    | True =>
+        normalize_and_then (eq_term_two eq_term fuel p s p2 s2)
+          (fun (_matched : Unit) => eq_term_list eq_term fuel bs bs2)
+    end;
+
+def eq_term_fix
+  (eq_term : Nat -> CoreTerm -> CoreTerm -> NormalizeResult Bool)
+  (fuel : Nat) (_name : Nat) (ra : Nat) (ar : Nat)
+  (ty : CoreTerm) (body : CoreTerm)
+  (_name2 : Nat) (ra2 : Nat) (ar2 : Nat)
+  (ty2 : CoreTerm) (body2 : CoreTerm) : NormalizeResult Bool :=
+    match andb (eqNat ra ra2) (eqNat ar ar2) with
+    | False => Normalized Bool False
+    | True => eq_term_two eq_term fuel ty body ty2 body2
+    end;
+
+inductive EqNatHead : Type :=
+  | NoEqNat : EqNatHead
+  | YesEqNat : Nat -> EqNatHead;
+
+inductive EqPairHead : Type :=
+  | NoEqPair : EqPairHead
+  | YesEqPair : CoreTerm -> CoreTerm -> EqPairHead;
+
+inductive EqLetHead : Type :=
+  | NoEqLet : EqLetHead
+  | YesEqLet : CoreTerm -> CoreTerm -> CoreTerm -> EqLetHead;
+
+inductive EqCaseHead : Type :=
+  | NoEqCase : EqCaseHead
+  | YesEqCase : CaseInfo -> CoreTerm -> CoreTerm -> List CoreTerm -> EqCaseHead;
+
+def eq_nat_head (kind : Nat) (t : CoreTerm) : EqNatHead :=
+    match t with
+    | CRel n => match eqNat kind Z with | True => YesEqNat n | False => NoEqNat end
+    | CSort n => match eqNat kind 1 with | True => YesEqNat n | False => NoEqNat end
+    | CConst n => match eqNat kind 2 with | True => YesEqNat n | False => NoEqNat end
+    | CInd n => match eqNat kind 3 with | True => YesEqNat n | False => NoEqNat end
+    | CPi _ _ => NoEqNat
+    | CLam _ _ => NoEqNat
+    | CApp _ _ => NoEqNat
+    | CLetIn _ _ _ => NoEqNat
+    | CConstruct _ _ _ => NoEqNat
+    | CCase _ _ _ _ => NoEqNat
+    | CFix _ _ _ _ _ => NoEqNat
+    | CStrBytes _ _ => NoEqNat
+    | CStrLit _ _ => NoEqNat
+    end;
+
+def eq_pair_head (kind : Nat) (t : CoreTerm) : EqPairHead :=
+    match t with
+    | CPi a b => match eqNat kind Z with | True => YesEqPair a b | False => NoEqPair end
+    | CLam a b => match eqNat kind 1 with | True => YesEqPair a b | False => NoEqPair end
+    | CApp a b => match eqNat kind 2 with | True => YesEqPair a b | False => NoEqPair end
+    | CRel _ => NoEqPair
+    | CSort _ => NoEqPair
+    | CLetIn _ _ _ => NoEqPair
+    | CConst _ => NoEqPair
+    | CInd _ => NoEqPair
+    | CConstruct _ _ _ => NoEqPair
+    | CCase _ _ _ _ => NoEqPair
+    | CFix _ _ _ _ _ => NoEqPair
+    | CStrBytes _ _ => NoEqPair
+    | CStrLit _ _ => NoEqPair
+    end;
+
+def eq_let_head (t : CoreTerm) : EqLetHead :=
+    match t with
+    | CLetIn v ty body => YesEqLet v ty body
+    | CRel _ => NoEqLet
+    | CSort _ => NoEqLet
+    | CPi _ _ => NoEqLet
+    | CLam _ _ => NoEqLet
+    | CApp _ _ => NoEqLet
+    | CConst _ => NoEqLet
+    | CInd _ => NoEqLet
+    | CConstruct _ _ _ => NoEqLet
+    | CCase _ _ _ _ => NoEqLet
+    | CFix _ _ _ _ _ => NoEqLet
+    | CStrBytes _ _ => NoEqLet
+    | CStrLit _ _ => NoEqLet
+    end;
+
+def eq_case_head (t : CoreTerm) : EqCaseHead :=
+    match t with
+    | CCase ci p s bs => YesEqCase ci p s bs
+    | CRel _ => NoEqCase
+    | CSort _ => NoEqCase
+    | CPi _ _ => NoEqCase
+    | CLam _ _ => NoEqCase
+    | CApp _ _ => NoEqCase
+    | CLetIn _ _ _ => NoEqCase
+    | CConst _ => NoEqCase
+    | CInd _ => NoEqCase
+    | CConstruct _ _ _ => NoEqCase
+    | CFix _ _ _ _ _ => NoEqCase
+    | CStrBytes _ _ => NoEqCase
+    | CStrLit _ _ => NoEqCase
+    end;
+
+def eq_term_nat (kind : Nat) (n : Nat) (t : CoreTerm) : Bool :=
+    match eq_nat_head kind t with
+    | NoEqNat => False
+    | YesEqNat n2 => eqNat n n2
+    end;
+
+def eq_term_pair
+  (eq_term : Nat -> CoreTerm -> CoreTerm -> NormalizeResult Bool)
+  (fuel : Nat) (kind : Nat) (a : CoreTerm) (b : CoreTerm)
+  (t : CoreTerm) : NormalizeResult Bool :=
+    match eq_pair_head kind t with
+    | NoEqPair => Normalized Bool False
+    | YesEqPair a2 b2 => eq_term_two eq_term fuel a b a2 b2
+    end;
+
+def eq_term_let_against
+  (eq_term : Nat -> CoreTerm -> CoreTerm -> NormalizeResult Bool)
+  (fuel : Nat) (v : CoreTerm) (ty : CoreTerm) (body : CoreTerm)
+  (t : CoreTerm) : NormalizeResult Bool :=
+    match eq_let_head t with
+    | NoEqLet => Normalized Bool False
+    | YesEqLet v2 ty2 body2 =>
+        eq_term_let eq_term fuel v ty body v2 ty2 body2
+    end;
+
+def eq_term_case_against
+  (eq_term : Nat -> CoreTerm -> CoreTerm -> NormalizeResult Bool)
+  (fuel : Nat) (ci : CaseInfo) (p : CoreTerm) (s : CoreTerm)
+  (bs : List CoreTerm) (t : CoreTerm) : NormalizeResult Bool :=
+    match eq_case_head t with
+    | NoEqCase => Normalized Bool False
+    | YesEqCase ci2 p2 s2 bs2 =>
+        eq_term_case eq_term fuel ci p s bs ci2 p2 s2 bs2
+    end;
+
+def eq_term_ctor_against (i : Nat) (j : Nat) (np : Nat)
+    (t : CoreTerm) : Bool :=
+    match asCtorHead t with
+    | NotCtor => False
+    | YesCtor i2 j2 np2 => eq_term_construct i j np i2 j2 np2
+    end;
+
+def eq_term_fix_against
+  (eq_term : Nat -> CoreTerm -> CoreTerm -> NormalizeResult Bool)
+  (fuel : Nat) (name : Nat) (ra : Nat) (ar : Nat)
+  (ty : CoreTerm) (body : CoreTerm) (t : CoreTerm) : NormalizeResult Bool :=
+    match asFixHead t with
+    | NotFix => Normalized Bool False
+    | YesFix name2 ra2 ar2 ty2 body2 =>
+        eq_term_fix eq_term fuel name ra ar ty body name2 ra2 ar2 ty2 body2
+    end;
+
+def eq_term_bytes (fuel : Nat) (bytes : List Nat) (typ : Nat) (term : CoreTerm)
+    : NormalizeResult Bool :=
+    match term with
+    | CStrBytes other other_type => match eqNat typ other_type with
+        | False => Normalized Bool False
+        | True => string_nf_equal fuel bytes other
+        end
+    | CRel _ => Normalized Bool False | CSort _ => Normalized Bool False
+    | CPi _ _ => Normalized Bool False | CLam _ _ => Normalized Bool False
+    | CApp _ _ => Normalized Bool False | CLetIn _ _ _ => Normalized Bool False
+    | CConst _ => Normalized Bool False | CInd _ => Normalized Bool False
+    | CConstruct _ _ _ => Normalized Bool False | CCase _ _ _ _ => Normalized Bool False
+    | CFix _ _ _ _ _ => Normalized Bool False | CStrLit _ _ => Normalized Bool False
+    end;
+
+def eq_term_step
+  (eq_term : Nat -> CoreTerm -> CoreTerm -> NormalizeResult Bool)
+  (fuel : Nat) (t1 : CoreTerm) (t2 : CoreTerm) : NormalizeResult Bool :=
+    match t1 with
+    | CRel n => Normalized Bool (eq_term_nat Z n t2)
+    | CSort n => Normalized Bool (eq_term_nat 1 n t2)
+    | CConst n => Normalized Bool (eq_term_nat 2 n t2)
+    | CInd n => Normalized Bool (eq_term_nat 3 n t2)
+    | CPi a b => eq_term_pair eq_term fuel Z a b t2
+    | CLam a b => eq_term_pair eq_term fuel 1 a b t2
+    | CApp f a => eq_term_pair eq_term fuel 2 f a t2
+    | CLetIn v ty body => eq_term_let_against eq_term fuel v ty body t2
+    | CConstruct i j np => Normalized Bool (eq_term_ctor_against i j np t2)
+    | CCase ci p s bs => eq_term_case_against eq_term fuel ci p s bs t2
+    | CFix name ra ar ty body =>
+        eq_term_fix_against eq_term fuel name ra ar ty body t2
+    | CStrLit _ _ => NormalizeMalformed Bool NormalizeUnresolvedLiteral
+    | CStrBytes bytes typ => eq_term_bytes fuel bytes typ t2
+    end;
+
+def eqTerm_checked : Nat -> CoreTerm -> CoreTerm -> NormalizeResult Bool :=
+  fix eqTerm_checked (fuel : Nat) (t1 : CoreTerm) (t2 : CoreTerm)
+      : NormalizeResult Bool :=
+    match fuel with
+    | Z => NormalizeExhausted Bool
+    | S fuel' =>
+        eq_term_step
+          (fun (_requested : Nat) (left : CoreTerm) (right : CoreTerm) =>
+            eqTerm_checked fuel' left right)
+          fuel' t1 t2
+    end;
+
+def eqTerm (fuel : Nat) (left : CoreTerm) (right : CoreTerm) : Bool :=
+    match eqTerm_checked fuel left right with
+    | Normalized equal => equal
+    | NormalizeExhausted => False
+    | NormalizeMalformed _ => False
+    end;
+
+-- Eta applies to neutral function values, never to sorts, Pi types or strings.
+def conversion_neutral : CoreTerm -> Bool :=
+  fix conversion_neutral (term : CoreTerm) : Bool :=
+    match term with
+    | CRel _ => True
+    | CConst _ => True
+    | CInd _ => True
+    | CConstruct _ _ _ => True
+    | CCase _ _ _ _ => True
+    | CFix _ _ _ _ _ => True
+    | CApp fn _ => conversion_neutral fn
+    | CSort _ => False
+    | CPi _ _ => False
+    | CLam _ _ => False
+    | CLetIn _ _ _ => False
+    | CStrBytes _ _ => False
+    | CStrLit _ _ => False
+    end;
+
+def conversion_normal_checked_worker (sig : CheckEnvironment)
+    : Nat -> CoreTerm -> CoreTerm -> NormalizeResult Bool :=
+  fix conversion_normal_checked_worker (fuel : Nat) (left : CoreTerm) (right : CoreTerm)
+      : NormalizeResult Bool :=
+    match fuel with
+    | Z => NormalizeExhausted Bool
+    | S fuel' =>
+        match lamBody left, lamBody right with
+        | Just body, Just other => conversion_normal_checked_worker fuel' body other
+        | Just body, Nothing =>
+            match conversion_neutral right with
+            | False => Normalized Bool False
+            | True =>
+                normalize_bind CoreTerm Bool
+                  (normalize_checked_worker fuel' sig (CApp (lift 1 right) (CRel 0)))
+                  (fun (applied : CoreTerm) => conversion_normal_checked_worker fuel' body applied)
+            end
+        | Nothing, Just body =>
+            match conversion_neutral left with
+            | False => Normalized Bool False
+            | True =>
+                normalize_bind CoreTerm Bool
+                  (normalize_checked_worker fuel' sig (CApp (lift 1 left) (CRel 0)))
+                  (fun (applied : CoreTerm) => conversion_normal_checked_worker fuel' applied body)
+            end
+        | Nothing, Nothing =>
+            eq_term_step
+              (fun (_requested : Nat) (first : CoreTerm) (second : CoreTerm) =>
+                conversion_normal_checked_worker fuel' first second)
+              fuel' left right
+        end
+    end;
+
+def conv_checked_worker (fuel : Nat) (sig : CheckEnvironment) (t1 : CoreTerm) (t2 : CoreTerm)
+    : NormalizeResult Bool :=
+    normalize_bind Bool Bool (eqTerm_checked fuel t1 t2)
+      (fun (equal : Bool) =>
+        match equal with
+        | True => Normalized Bool True
+        | False =>
+            normalize_bind CoreTerm Bool (normalize_checked_worker fuel sig t1)
+              (fun (left : CoreTerm) =>
+                normalize_bind CoreTerm Bool (normalize_checked_worker fuel sig t2)
+                  (fun (right : CoreTerm) => conversion_normal_checked_worker sig fuel left right))
+        end);
+
+-- Missing name → large Rel (no alias of in-scope binder).
+def missing_chunk : Nat := 400;
+def missing_rel : Nat := add missing_chunk (add missing_chunk missing_chunk);
+
+def core_lookup (name : Nat) : List Nat -> Nat :=
+    fix core_lookup (ctx : List Nat) : Nat :=
+      match ctx with
+      | Nil => missing_rel
+      | Cons y ys =>
+          match eqNat y name with
+          | True => Z
+          | False => S (core_lookup ys)
+          end
+      end;
+
+-- Preflight: surface fits fuel (public API fails closed on exhaustion).
+def surface_fits : Nat -> Surface -> Bool :=
+  fix surface_fits (fuel : Nat) (s : Surface) : Bool :=
+    match fuel with
+    | Z => False
+    | S fuel' =>
+        let children_fit : List Surface -> Bool :=
+          fix children_fit (xs : List Surface) : Bool :=
+            match xs with
+            | Nil => True
+            | Cons child rest =>
+                match surface_fits fuel' child with
+                | False => False
+                | True => children_fit rest
+                end
+            end in
+        match s with
+        | SVar _ => True
+        | SSort _ => True
+        | SPi _ dom cod => andb (surface_fits fuel' dom) (surface_fits fuel' cod)
+        | SLam _ ann body => andb (surface_fits fuel' ann) (surface_fits fuel' body)
+        | SApp f a => andb (surface_fits fuel' f) (surface_fits fuel' a)
+        | SLet _ v ty body =>
+            andb (surface_fits fuel' v)
+              (andb (surface_fits fuel' ty) (surface_fits fuel' body))
+        | SConst _ => True
+        | SInd _ => True
+        | SConstruct _ _ _ => True
+        | SCase _ p scrut bs =>
+            match surface_fits fuel' p with
+            | False => False
+            | True =>
+                match surface_fits fuel' scrut with
+                | False => False
+                | True => children_fit bs
+                end
+            end
+        | SFix _ _ _ ty body =>
+            andb (surface_fits fuel' ty) (surface_fits fuel' body)
+        | SHole _ => True
+        | SEffectRow ty => surface_fits fuel' ty
+        | SPerform _ args => children_fit args
+        | SStr _ _ => True
+        end
+    end;
+
+-- Totality sentinel (public API prechecks surface_fits).
+def elab_exhausted : CoreTerm := CRel missing_rel;
+
+def elaborate : Nat -> Surface -> List Nat -> CoreTerm :=
+  fix elaborate (fuel : Nat) (s : Surface) (ctx : List Nat) : CoreTerm :=
+    match fuel with
+    | Z => elab_exhausted
+    | S fuel' =>
+        match s with
+        | SVar name => CRel (core_lookup name ctx)
+        | SSort u => CSort u
+        | SPi name dom cod =>
+            CPi (elaborate fuel' dom ctx)
+              (elaborate fuel' cod (Cons Nat name ctx))
+        | SLam name ann body =>
+            CLam (elaborate fuel' ann ctx)
+              (elaborate fuel' body (Cons Nat name ctx))
+        | SApp f a =>
+            CApp (elaborate fuel' f ctx) (elaborate fuel' a ctx)
+        | SLet name v ty body =>
+            CLetIn (elaborate fuel' v ctx) (elaborate fuel' ty ctx)
+              (elaborate fuel' body (Cons Nat name ctx))
+        | SConst n => CConst n
+        | SInd n => CInd n
+        | SConstruct i j np => CConstruct i j np
+        | SCase ci p scrut bs =>
+            CCase ci (elaborate fuel' p ctx) (elaborate fuel' scrut ctx)
+              ((fix go (xs : List Surface) : List CoreTerm :=
+                  match xs with
+                  | Nil => Nil CoreTerm
+                  | Cons b xs' =>
+                      Cons CoreTerm (elaborate fuel' b ctx) (go xs')
+                  end) bs)
+        | SFix name rec_arg arity ty body =>
+            CFix name rec_arg arity (elaborate fuel' ty ctx)
+              (elaborate fuel' body (Cons Nat name ctx))
+        | SHole _ => elab_exhausted
+        | SEffectRow ty => elaborate fuel' ty ctx
+        | SPerform op args =>
+            (fix apply_args (xs : List Surface) (head : CoreTerm) : CoreTerm :=
+              match xs with
+              | Nil => head
+              | Cons arg rest =>
+                  apply_args rest (CApp head (elaborate fuel' arg ctx))
+              end) args (CConst op)
+        | SStr n ty => CStrLit n ty
+        end
+    end;
+
+-- Bidirectional check. Ctx = List CoreTerm (head = Rel 0); store lift1 ty.
+
+-- Recursive workers share one preflight at the checked entry boundary.
+-- Calls between workers never rescan an increasingly smaller input suffix.
+def whnf_checked_indexed (fuel : Nat) (sig : CheckEnvironment) (term : CoreTerm) : NormalizeResult CoreTerm :=
+    check_input_normalize_guard CoreTerm ([CheckInputTerm term] : List CheckInputWork)
+      (fun (_work : Unit) => whnf_checked_worker fuel sig term);
+
+def normalize_checked_indexed (fuel : Nat) (sig : CheckEnvironment) (term : CoreTerm) : NormalizeResult CoreTerm :=
+    check_input_normalize_guard CoreTerm ([CheckInputTerm term] : List CheckInputWork)
+      (fun (_work : Unit) => normalize_checked_worker fuel sig term);
+
+def conv_checked_indexed (fuel : Nat) (sig : CheckEnvironment) (left : CoreTerm) (right : CoreTerm)
+    : NormalizeResult Bool :=
+    check_input_normalize_guard Bool ([CheckInputTerm left, CheckInputTerm right] : List CheckInputWork)
+      (fun (_work : Unit) => conv_checked_worker fuel sig left right);
+
+def conversion_normal_checked_indexed (sig : CheckEnvironment) (fuel : Nat) (left : CoreTerm) (right : CoreTerm)
+    : NormalizeResult Bool :=
+    check_input_normalize_guard Bool ([CheckInputTerm left, CheckInputTerm right] : List CheckInputWork)
+      (fun (_work : Unit) => conversion_normal_checked_worker sig fuel left right);
+
+-- Raw-list compatibility boundaries derive lookup state exactly once.
+def whnf_checked (fuel : Nat) (sig : List Entry) (term : CoreTerm)
+    : NormalizeResult CoreTerm :=
+    whnf_checked_indexed fuel (check_environment_from_entries sig) term;
+
+def normalize_checked (fuel : Nat) (sig : List Entry) (term : CoreTerm)
+    : NormalizeResult CoreTerm :=
+    normalize_checked_indexed fuel (check_environment_from_entries sig) term;
+
+def conv_checked (fuel : Nat) (sig : List Entry) (left : CoreTerm) (right : CoreTerm)
+    : NormalizeResult Bool :=
+    conv_checked_indexed fuel (check_environment_from_entries sig) left right;
+
+def conversion_normal_checked (sig : List Entry) (fuel : Nat) (left : CoreTerm) (right : CoreTerm)
+    : NormalizeResult Bool :=
+    conversion_normal_checked_indexed (check_environment_from_entries sig) fuel left right;

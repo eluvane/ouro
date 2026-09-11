@@ -1,0 +1,119 @@
+-- Repository path enumeration is shared by the native gate profiles.
+
+import "../../std/fs.ouro";
+import "../../std/pathx.ouro";
+import "../../std/stringx.ouro";
+
+
+def repo_join (root : String) (rel : String) : String :=
+    path_join_normalized ([root, rel] : List String);
+
+
+def repo_path_nonempty (path : String) : Bool :=
+    notb (str_null path);
+
+
+def repo_walk_paths (root : String) : IO (List String) :=
+    do let! files := fs_walk root;
+       io_pure (List String)
+         (str_sort (map String String (path_relative root) files))
+
+
+def repo_paths (root : String) : IO (List String) :=
+    do let! checkout := fs_exists (repo_join root ".git");
+       match checkout with
+       | False => repo_walk_paths root
+       | True =>
+           do let! r := proc_exec "git"
+                ([ "-C", root, "ls-files", "--cached", "--others", "--exclude-standard" ] : List String);
+              match proc_ok r with
+              | True => io_pure (List String)
+                  -- git ls-files is path-sorted; filtering preserves that order
+                  -- without an allocation-heavy second insertion sort.
+                  (filter String repo_path_nonempty (str_lines (proc_stdout r)))
+              | False =>
+                  do eprintln "repository source inventory failed";
+                     exit 1;
+                     io_pure (List String) (Nil String)
+              end
+       end
+
+
+def skip_generated_prefixes : List String :=
+    [ "_build/", "_cache/", "_opam/", "_tools/" ];
+
+def skip_vendor_infixes : List String :=
+    [ "/node_modules/", "/.git/" ];
+
+def path_has_any_prefix (rel : String) (prefixes : List String) : Bool :=
+  any String (str_starts rel) prefixes;
+
+def path_has_any_infix (rel : String) (infixes : List String) : Bool :=
+  any String (str_contains rel) infixes;
+
+def skip_repo_path (rel : String) : Bool :=
+    orb (path_has_any_prefix rel
+          (snoc String skip_generated_prefixes "docs/api/"))
+      (path_has_any_infix rel skip_vendor_infixes);
+
+
+-- Repo paths use slash separators and all callers pass a dotted, nonempty
+-- extension. A basename equal to that extension is a hidden file, not a match.
+def repo_path_has_ext (rel : String) (ext : String) : Bool :=
+    match str_ends rel ext with
+    | False => False
+    | True =>
+      match str_eq rel ext with
+      | True => False
+      | False => notb (str_ends rel (str_concat "/" ext))
+      end
+    end;
+
+
+def path_ends_md (rel : String) : Bool :=
+    repo_path_has_ext rel ".md";
+
+
+def markdown_path_keep (rel : String) : Bool :=
+    andb (path_ends_md rel) (notb (skip_repo_path rel));
+
+
+def markdown_paths (root : String) : IO (List String) :=
+    do let! rels := repo_paths root;
+       io_pure (List String)
+         (filter String markdown_path_keep rels)
+
+
+def generated_api_markdown_path (rel : String) : Bool :=
+    andb (str_starts rel "docs/api/") (path_ends_md rel);
+
+
+def maintained_markdown_path (rel : String) : Bool :=
+    andb (path_ends_md rel) (notb (generated_api_markdown_path rel));
+
+def repo_write (path : String) (body : String) : IO Unit :=
+    do let! written := fs_write_checked path body;
+       match written with
+       | Left e =>
+           do eprintln (fs_error_message e);
+              exit 1
+       | Right _ => io_unit
+       end
+
+def repo_mkdir (path : String) : IO Unit :=
+    do let! made := fs_mkdir_p_checked path;
+       match made with
+       | Left e =>
+           do eprintln (fs_error_message e);
+              exit 1
+       | Right _ => io_unit
+       end
+
+def repo_pathish (value : String) : Bool :=
+    orb (str_contains value "/")
+      (orb (path_has_ext value ".ouro")
+        (orb (path_has_ext value ".py")
+          (orb (path_has_ext value ".sh")
+            (orb (path_has_ext value ".md")
+              (orb (path_has_ext value ".json")
+                (orb (path_has_ext value ".yml") (path_has_ext value ".yaml")))))));

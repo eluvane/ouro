@@ -1,0 +1,341 @@
+-- Test-side inspection of unbound Windows x86-64 PE import tables.
+-- This is not a loader or compiler acceptance path. Callers own DLL/symbol policy.
+-- Format: https://learn.microsoft.com/en-us/windows/win32/debug/pe-format
+import "../../std/string.ouro";
+
+inductive NativePeInspectError : Type :=
+  | NativePeHeaderError : String -> Nat -> NativePeInspectError
+  | NativePeSectionError : Nat -> NativePeInspectError
+  | NativePeRvaError : String -> Nat -> NativePeInspectError
+  | NativePeImportError : String -> Nat -> NativePeInspectError
+  | NativePeDuplicateDll : String -> NativePeInspectError
+  | NativePeDuplicateSymbol : String -> NativePeInspectError;
+
+inductive NativePeImportLibrary : Type :=
+  | NativePeImportLibraryOf : String -> List String -> NativePeImportLibrary;
+
+inductive NativePeInspectSection : Type :=
+  | NativePeInspectSectionAt : Nat -> Nat -> Nat -> Nat -> NativePeInspectSection;
+
+inductive NativePeInspectHeaders : Type :=
+  | NativePeInspectHeadersOf : List NativePeInspectSection -> Nat -> Nat -> NativePeInspectHeaders;
+
+inductive NativePeInspectSpan : Type :=
+  | NativePeInspectSpanAt : Nat -> Nat -> NativePeInspectSpan;
+
+def native_pe_inspect_error_code (error : NativePeInspectError) : String :=
+    match error with
+    | NativePeHeaderError code _ => str_concat "header_" code
+    | NativePeSectionError _ => "section_range"
+    | NativePeRvaError code _ => str_concat "rva_" code
+    | NativePeImportError code _ => str_concat "import_" code
+    | NativePeDuplicateDll _ => "duplicate_dll"
+    | NativePeDuplicateSymbol _ => "duplicate_symbol"
+    end;
+
+def native_pe_import_library_name (library : NativePeImportLibrary) : String :=
+    match library with | NativePeImportLibraryOf name _ => name end;
+
+def native_pe_import_library_symbols (library : NativePeImportLibrary) : List String :=
+    match library with | NativePeImportLibraryOf _ symbols => symbols end;
+
+-- Subtraction guards avoid computing an unchecked offset + width.
+def native_pe_inspect_range (size : Nat) (offset : Nat) (width : Nat) : Bool :=
+    andb (leb_nat offset size) (leb_nat width (sub size offset));
+
+def native_pe_inspect_u32_span : Nat := mul 256 (mul 256 (mul 256 256));
+
+-- Every use is dominated by a check of its containing header/table span.
+-- byte_at is O(1); never convert the complete executable to List Nat.
+def native_pe_inspect_u16 (image : String) (offset : Nat) : Nat :=
+    add (prim_string_byte_at image offset)
+      (mul 256 (prim_string_byte_at image (S offset)));
+
+def native_pe_inspect_u32 (image : String) (offset : Nat) : Nat :=
+    add (native_pe_inspect_u16 image offset)
+      (mul (mul 256 256) (native_pe_inspect_u16 image (add offset 2)));
+
+def native_pe_inspect_overlaps (address : Nat) (span : Nat)
+    (sections : List NativePeInspectSection) : Bool :=
+    any NativePeInspectSection (fun (section : NativePeInspectSection) =>
+      match section with
+      | NativePeInspectSectionAt other size _ _ =>
+          andb (notb (eq_nat span 0)) (andb (notb (eq_nat size 0))
+            (andb (ltb_nat address (add other size)) (ltb_nat other (add address span))))
+      end) sections;
+
+def native_pe_inspect_sections (image : String) (headers_size : Nat)
+    : Nat -> Nat -> Either NativePeInspectError (List NativePeInspectSection) :=
+  fix go (remaining : Nat) (offset : Nat)
+      : Either NativePeInspectError (List NativePeInspectSection) :=
+    match remaining with
+    | Z => Right NativePeInspectError (List NativePeInspectSection) []
+    | S rest =>
+        let virtual_size : Nat := native_pe_inspect_u32 image (add offset 8) in
+        let address : Nat := native_pe_inspect_u32 image (add offset 12) in
+        let raw_size : Nat := native_pe_inspect_u32 image (add offset 16) in
+        let raw_start : Nat := native_pe_inspect_u32 image (add offset 20) in
+        let span : Nat := maxNat virtual_size raw_size in
+        let valid : Bool := andb
+          (native_pe_inspect_range native_pe_inspect_u32_span address span)
+          (andb (native_pe_inspect_range (str_len image) raw_start raw_size)
+            (andb (native_pe_inspect_range native_pe_inspect_u32_span raw_start raw_size)
+              (orb (eq_nat raw_size 0) (leb_nat headers_size raw_start)))) in
+        match valid with
+        | False => Left NativePeInspectError (List NativePeInspectSection) (NativePeSectionError offset)
+        | True => match go rest (add offset 40) with
+          | Left error => Left NativePeInspectError (List NativePeInspectSection) error
+          | Right tail => match native_pe_inspect_overlaps address span tail with
+            | True => Left NativePeInspectError (List NativePeInspectSection) (NativePeRvaError "ambiguous" address)
+            | False => Right NativePeInspectError (List NativePeInspectSection)
+                (Cons NativePeInspectSection (NativePeInspectSectionAt address span raw_start raw_size) tail)
+            end
+          end
+        end
+    end;
+
+def native_pe_inspect_optional (image : String) (pe : Nat)
+    : Either NativePeInspectError NativePeInspectHeaders :=
+    let optional : Nat := add pe 24 in
+    let optional_size : Nat := native_pe_inspect_u16 image (add pe 20) in
+    let sections : Nat := native_pe_inspect_u16 image (add pe 6) in
+    match andb (leb_nat 128 optional_size)
+      (native_pe_inspect_range (str_len image) optional optional_size) with
+    | False => Left NativePeInspectError NativePeInspectHeaders (NativePeHeaderError "optional_size" optional)
+    | True => match eq_nat (native_pe_inspect_u16 image optional) (add (mul 2 256) 11) with
+      | False => Left NativePeInspectError NativePeInspectHeaders (NativePeHeaderError "magic" optional)
+      | True =>
+          let count : Nat := native_pe_inspect_u32 image (add optional 108) in
+          match andb (leb_nat 2 count) (native_pe_inspect_range optional_size 112 (mul 8 count)) with
+          | False => Left NativePeInspectError NativePeInspectHeaders (NativePeHeaderError "directories" optional)
+          | True => match andb (leb_nat 1 sections) (leb_nat sections 96) with
+            | False => Left NativePeInspectError NativePeInspectHeaders (NativePeHeaderError "sections" sections)
+            | True =>
+                let table : Nat := add optional optional_size in
+                let headers_size : Nat := native_pe_inspect_u32 image (add optional 60) in
+                match andb (leb_nat headers_size (str_len image))
+                  (native_pe_inspect_range headers_size table (mul sections 40)) with
+                | False => Left NativePeInspectError NativePeInspectHeaders (NativePeHeaderError "section_table" table)
+                | True => match native_pe_inspect_sections image headers_size sections table with
+                  | Left error => Left NativePeInspectError NativePeInspectHeaders error
+                  | Right parsed => Right NativePeInspectError NativePeInspectHeaders
+                      (NativePeInspectHeadersOf parsed
+                        (native_pe_inspect_u32 image (add optional 120))
+                        (native_pe_inspect_u32 image (add optional 124)))
+                  end
+                end
+            end
+          end
+      end
+    end;
+
+def native_pe_inspect_headers (image : String)
+    : Either NativePeInspectError NativePeInspectHeaders :=
+    match andb (leb_nat 64 (str_len image)) (str_eq (str_slice image 0 2) "MZ") with
+    | False => Left NativePeInspectError NativePeInspectHeaders (NativePeHeaderError "dos" 0)
+    | True =>
+        let pe : Nat := native_pe_inspect_u32 image 60 in
+        match andb (leb_nat 64 pe) (native_pe_inspect_range (str_len image) pe 24) with
+        | False => Left NativePeInspectError NativePeInspectHeaders (NativePeHeaderError "coff" pe)
+        | True => match andb (eq_nat (native_pe_inspect_u16 image pe) (add (mul 69 256) 80))
+            (eq_nat (native_pe_inspect_u16 image (add pe 2)) 0) with
+          | False => Left NativePeInspectError NativePeInspectHeaders (NativePeHeaderError "signature" pe)
+          | True => match eq_nat (native_pe_inspect_u16 image (add pe 4)) (add (mul 134 256) 100) with
+            | False => Left NativePeInspectError NativePeInspectHeaders (NativePeHeaderError "machine" pe)
+            | True => native_pe_inspect_optional image pe
+            end
+          end
+        end
+    end;
+
+-- A second section mapping the same RVA is ambiguous, including a virtual tail.
+def native_pe_inspect_find_section (rva : Nat)
+    : List NativePeInspectSection -> Maybe NativePeInspectSection
+      -> Either NativePeInspectError NativePeInspectSection :=
+  fix go (sections : List NativePeInspectSection) (found : Maybe NativePeInspectSection)
+      : Either NativePeInspectError NativePeInspectSection :=
+    match sections with
+    | Nil => match found with
+      | Nothing => Left NativePeInspectError NativePeInspectSection (NativePeRvaError "unmapped" rva)
+      | Just section => Right NativePeInspectError NativePeInspectSection section
+      end
+    | Cons section rest => match section with
+      | NativePeInspectSectionAt address span _ _ =>
+          match andb (leb_nat address rva) (ltb_nat (sub rva address) span) with
+          | False => go rest found
+          | True => match found with
+            | Just _ => Left NativePeInspectError NativePeInspectSection (NativePeRvaError "ambiguous" rva)
+            | Nothing => go rest (Just NativePeInspectSection section)
+            end
+          end
+      end
+    end;
+
+def native_pe_inspect_map (sections : List NativePeInspectSection) (rva : Nat) (width : Nat)
+    : Either NativePeInspectError NativePeInspectSpan :=
+    match eq_nat rva 0 with
+    | True => Left NativePeInspectError NativePeInspectSpan (NativePeRvaError "unmapped" rva)
+    | False =>
+    match native_pe_inspect_range native_pe_inspect_u32_span rva width with
+    | False => Left NativePeInspectError NativePeInspectSpan (NativePeRvaError "overflow" rva)
+    | True =>
+    match native_pe_inspect_find_section rva sections (Nothing NativePeInspectSection) with
+    | Left error => Left NativePeInspectError NativePeInspectSpan error
+    | Right section => match section with
+      | NativePeInspectSectionAt address _ raw_start raw_size =>
+          let delta : Nat := sub rva address in
+          match native_pe_inspect_range raw_size delta width with
+          | False => Left NativePeInspectError NativePeInspectSpan (NativePeRvaError "outside_raw" rva)
+          | True => Right NativePeInspectError NativePeInspectSpan
+              (NativePeInspectSpanAt (add raw_start delta) (sub raw_size delta))
+          end
+      end
+    end
+    end
+    end;
+
+-- The byte budget includes the terminating zero. Names are ASCII and nonempty.
+-- A raw-section boundary is never crossed to borrow a zero from another region.
+def native_pe_inspect_ascii (image : String) (start : Nat) (available : Nat)
+    : Nat -> Nat -> Either NativePeInspectError String :=
+  fix go (fuel : Nat) (size : Nat) : Either NativePeInspectError String :=
+    match fuel with
+    | Z => Left NativePeInspectError String (NativePeImportError "name_limit" start)
+    | S rest => match ltb_nat size available with
+      | False => Left NativePeInspectError String (NativePeImportError "name_terminator" start)
+      | True =>
+          let byte : Nat := prim_string_byte_at image (add start size) in
+          match eq_nat byte 0 with
+          | True => match eq_nat size 0 with
+            | True => Left NativePeInspectError String (NativePeImportError "empty_name" start)
+            | False => Right NativePeInspectError String (str_slice image start size)
+            end
+          | False => match ltb_nat byte 128 with
+            | False => Left NativePeInspectError String (NativePeImportError "ascii" (add start size))
+            | True => go rest (S size)
+            end
+          end
+      end
+    end;
+
+def native_pe_inspect_name (image : String) (sections : List NativePeInspectSection)
+    (rva : Nat) (skip : Nat) : Either NativePeInspectError String :=
+    match native_pe_inspect_map sections rva (S skip) with
+    | Left error => Left NativePeInspectError String error
+    | Right span => match span with
+      | NativePeInspectSpanAt offset available =>
+          native_pe_inspect_ascii image (add offset skip) (sub available skip) (mul 16 256) 0
+      end
+    end;
+
+-- PE32+ named imports use bits 0..30; bits 31..62 must be zero.
+-- Reject ordinal imports before the remaining high-bit checks.
+def native_pe_inspect_thunks (image : String) (sections : List NativePeInspectSection)
+    (start : Nat) (available : Nat)
+    : Nat -> Nat -> List String -> Either NativePeInspectError (List String) :=
+  fix go (fuel : Nat) (cursor : Nat) (symbols : List String)
+      : Either NativePeInspectError (List String) :=
+    match fuel with
+    | Z => Left NativePeInspectError (List String) (NativePeImportError "thunk_limit" start)
+    | S rest => match native_pe_inspect_range available cursor 8 with
+      | False => Left NativePeInspectError (List String) (NativePeImportError "thunk_terminator" start)
+      | True =>
+          let offset : Nat := add start cursor in
+          let low : Nat := native_pe_inspect_u32 image offset in
+          let high : Nat := native_pe_inspect_u32 image (add offset 4) in
+          match andb (eq_nat low 0) (eq_nat high 0) with
+          | True => Right NativePeInspectError (List String) (reverse_lin String symbols)
+          | False => match leb_nat 128 (prim_string_byte_at image (add offset 7)) with
+            | True => Left NativePeInspectError (List String) (NativePeImportError "ordinal" offset)
+            | False => match andb (eq_nat high 0)
+                (ltb_nat (prim_string_byte_at image (add offset 3)) 128) with
+              | False => Left NativePeInspectError (List String) (NativePeImportError "name_rva" offset)
+              | True => match native_pe_inspect_name image sections low 2 with
+                | Left error => Left NativePeInspectError (List String) error
+                | Right name => match elem String str_eq name symbols with
+                  | True => Left NativePeInspectError (List String) (NativePeDuplicateSymbol name)
+                  | False => go rest (add cursor 8) (Cons String name symbols)
+                  end
+                end
+              end
+            end
+          end
+      end
+    end;
+
+def native_pe_inspect_library (image : String) (sections : List NativePeInspectSection)
+    (offset : Nat) (dll : String) : Either NativePeInspectError NativePeImportLibrary :=
+    let original : Nat := native_pe_inspect_u32 image offset in
+    let first : Nat := native_pe_inspect_u32 image (add offset 16) in
+    let lookup : Nat := match eq_nat original 0 with | True => first | False => original end in
+    match native_pe_inspect_map sections lookup 8 with
+    | Left error => Left NativePeInspectError NativePeImportLibrary error
+    | Right span => match span with
+      | NativePeInspectSpanAt start available =>
+          match native_pe_inspect_thunks image sections start available (mul 16 256) 0 [] with
+          | Left error => Left NativePeInspectError NativePeImportLibrary error
+          | Right symbols => Right NativePeInspectError NativePeImportLibrary
+              (NativePeImportLibraryOf dll symbols)
+          end
+      end
+    end;
+
+def native_pe_inspect_null_descriptor (image : String) (offset : Nat) : Bool :=
+    andb (eq_nat (native_pe_inspect_u32 image offset) 0)
+      (andb (eq_nat (native_pe_inspect_u32 image (add offset 4)) 0)
+        (andb (eq_nat (native_pe_inspect_u32 image (add offset 8)) 0)
+          (andb (eq_nat (native_pe_inspect_u32 image (add offset 12)) 0)
+            (eq_nat (native_pe_inspect_u32 image (add offset 16)) 0))));
+
+def native_pe_inspect_descriptors (image : String) (sections : List NativePeInspectSection)
+    (start : Nat) (size : Nat)
+    : Nat -> Nat -> List NativePeImportLibrary
+      -> Either NativePeInspectError (List NativePeImportLibrary) :=
+  fix go (fuel : Nat) (cursor : Nat) (libraries : List NativePeImportLibrary)
+      : Either NativePeInspectError (List NativePeImportLibrary) :=
+    match fuel with
+    | Z => Left NativePeInspectError (List NativePeImportLibrary) (NativePeImportError "descriptor_limit" start)
+    | S rest => match native_pe_inspect_range size cursor 20 with
+      | False => Left NativePeInspectError (List NativePeImportLibrary) (NativePeImportError "descriptor_terminator" start)
+      | True =>
+          let offset : Nat := add start cursor in
+          match native_pe_inspect_null_descriptor image offset with
+          | True => Right NativePeInspectError (List NativePeImportLibrary) (reverse_lin NativePeImportLibrary libraries)
+          | False => match native_pe_inspect_name image sections
+              (native_pe_inspect_u32 image (add offset 12)) 0 with
+            | Left error => Left NativePeInspectError (List NativePeImportLibrary) error
+            | Right dll =>
+                let name : String := str_lower dll in
+                match any NativePeImportLibrary (fun (previous : NativePeImportLibrary) =>
+                  str_eq name (native_pe_import_library_name previous)) libraries with
+                | True => Left NativePeInspectError (List NativePeImportLibrary) (NativePeDuplicateDll name)
+                | False => match native_pe_inspect_library image sections offset name with
+                  | Left error => Left NativePeInspectError (List NativePeImportLibrary) error
+                  | Right library => go rest (add cursor 20) (Cons NativePeImportLibrary library libraries)
+                  end
+                end
+            end
+          end
+      end
+    end;
+
+-- Limits include terminators: 256 descriptors, 4096 thunks per DLL, 4096 name
+-- bytes. Exhaustion is an error, never a partial import list. Only section-backed
+-- imports are supported; bound/delay import resolution is outside this helper.
+def native_pe_inspect_imports (image : String)
+    : Either NativePeInspectError (List NativePeImportLibrary) :=
+    match native_pe_inspect_headers image with
+    | Left error => Left NativePeInspectError (List NativePeImportLibrary) error
+    | Right headers => match headers with
+      | NativePeInspectHeadersOf sections rva size =>
+          match andb (notb (eq_nat rva 0)) (leb_nat 20 size) with
+          | False => Left NativePeInspectError (List NativePeImportLibrary) (NativePeImportError "directory" rva)
+          | True => match native_pe_inspect_map sections rva size with
+            | Left error => Left NativePeInspectError (List NativePeImportLibrary) error
+            | Right span => match span with
+              | NativePeInspectSpanAt start _ => native_pe_inspect_descriptors image sections start size 256 0 []
+              end
+            end
+          end
+      end
+    end;

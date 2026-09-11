@@ -1,0 +1,183 @@
+-- Pure architecture policy core; host-supplied nodes and edges are the source
+-- of truth. Layer rank is inverted: smaller means more trusted/inner, so
+-- outward imports are suspect. Spans are host record ids the caller maps back
+-- to source positions; the cycle issue also carries the module ids of its
+-- witness path so the host can print it without a second graph walk.
+
+-- @entry analyze_architecture
+-- @entry arch_cycle_path
+
+import "../../std/data.ouro";
+import "../../std/listx.ouro";
+import "../../std/natx.ouro";
+
+-- module id, layer, trusted, compiler-internal, std-runtime.
+inductive ArchNode : Type :=
+  | MkArchNode : Nat -> Nat -> Bool -> Bool -> Bool -> ArchNode;
+
+-- span, source module id, target module id, allow-layer-exception,
+-- allow-trust-crossing.
+inductive ArchEdge : Type :=
+  | MkArchEdge : Nat -> Nat -> Nat -> Bool -> Bool -> ArchEdge;
+
+-- Every issue names the edge span; the cycle adds the module ids from the
+-- edge source through the cycle back to the edge source.
+inductive ArchIssue : Type :=
+  | IArchCycle : Nat -> List Nat -> ArchIssue
+  | IArchForbiddenDirection : Nat -> ArchIssue
+  | IArchStdRuntimeCompilerInternal : Nat -> ArchIssue
+  | IArchLayerBoundary : Nat -> ArchIssue
+  | IArchTCBBoundary : Nat -> ArchIssue;
+
+def arch_edge_span (e : ArchEdge) : Nat :=
+    match e with | MkArchEdge span _ _ _ _ => span end;
+
+def arch_edge_src (e : ArchEdge) : Nat :=
+    match e with | MkArchEdge _ src _ _ _ => src end;
+
+def arch_edge_dst (e : ArchEdge) : Nat :=
+    match e with | MkArchEdge _ _ dst _ _ => dst end;
+
+def arch_edge_allows_layer (e : ArchEdge) : Bool :=
+    match e with | MkArchEdge _ _ _ allow _ => allow end;
+
+def arch_edge_allows_trust (e : ArchEdge) : Bool :=
+    match e with | MkArchEdge _ _ _ _ allow => allow end;
+
+def arch_node_id (n : ArchNode) : Nat :=
+    match n with | MkArchNode id _ _ _ _ => id end;
+
+def arch_node_layer (n : ArchNode) : Nat :=
+    match n with | MkArchNode _ layer _ _ _ => layer end;
+
+def arch_node_trusted (n : ArchNode) : Bool :=
+    match n with | MkArchNode _ _ trusted _ _ => trusted end;
+
+def arch_node_compiler_internal (n : ArchNode) : Bool :=
+    match n with | MkArchNode _ _ _ internal _ => internal end;
+
+def arch_node_std_runtime (n : ArchNode) : Bool :=
+    match n with | MkArchNode _ _ _ _ runtime => runtime end;
+
+def arch_issue_span (i : ArchIssue) : Nat :=
+    match i with
+    | IArchCycle span _ => span
+    | IArchForbiddenDirection span => span
+    | IArchStdRuntimeCompilerInternal span => span
+    | IArchLayerBoundary span => span
+    | IArchTCBBoundary span => span
+    end;
+
+def arch_node_find (target : Nat) : List ArchNode -> Maybe ArchNode :=
+    find ArchNode (fun (n : ArchNode) => eq_nat (arch_node_id n) target);
+
+def arch_flag (b : Bool) (i : ArchIssue) : List ArchIssue :=
+    match b with
+    | True => ([i] : List ArchIssue)
+    | False => Nil ArchIssue
+    end;
+
+-- Depth-first walk from `from` to `target` along edge order; `path` holds the
+-- module ids visited so far, newest first. Fuel bounds the depth; one unit
+-- per module suffices because a module is never entered twice.
+def arch_path_to (edges : List ArchEdge)
+    : Nat -> Nat -> Nat -> List Nat -> List Nat -> Maybe (List Nat) :=
+  fix go (fuel : Nat) (from : Nat) (target : Nat) (seen : List Nat)
+      (path : List Nat) : Maybe (List Nat) :=
+    match fuel with
+    | Z => Nothing (List Nat)
+    | S fuel' =>
+        match eq_nat from target with
+        | True => Just (List Nat) (reverse Nat path)
+        | False =>
+            match mem Nat eq_nat from seen with
+            | True => Nothing (List Nat)
+            | False =>
+                let seen' : List Nat := Cons Nat from seen in
+                (fix scan (es : List ArchEdge) : Maybe (List Nat) :=
+                  match es with
+                  | Nil => Nothing (List Nat)
+                  | Cons e rest =>
+                      match eq_nat (arch_edge_src e) from with
+                      | False => scan rest
+                      | True =>
+                          match go fuel' (arch_edge_dst e) target seen'
+                            (Cons Nat (arch_edge_dst e) path) with
+                          | Just w => Just (List Nat) w
+                          | Nothing => scan rest
+                          end
+                      end
+                  end) edges
+            end
+        end
+    end;
+
+-- Module ids from the edge source, through its target, back to the source
+-- when the edge closes a cycle.
+def arch_cycle_path (fuel : Nat) (edges : List ArchEdge) (e : ArchEdge)
+    : Maybe (List Nat) :=
+    arch_path_to edges fuel (arch_edge_dst e) (arch_edge_src e) (Nil Nat)
+      ([arch_edge_dst e, arch_edge_src e] : List Nat);
+
+def arch_cycle_issue (fuel : Nat) (edges : List ArchEdge) (e : ArchEdge)
+    : List ArchIssue :=
+    match arch_cycle_path fuel edges e with
+    | Nothing => Nil ArchIssue
+    | Just path => ([IArchCycle (arch_edge_span e) path] : List ArchIssue)
+    end;
+
+def arch_with_ends (nodes : List ArchNode) (e : ArchEdge)
+    (rule : ArchNode -> ArchNode -> List ArchIssue) : List ArchIssue :=
+    match arch_node_find (arch_edge_src e) nodes with
+    | Nothing => Nil ArchIssue
+    | Just src =>
+        match arch_node_find (arch_edge_dst e) nodes with
+        | Nothing => Nil ArchIssue
+        | Just dst => rule src dst
+        end
+    end;
+
+def arch_direction_issue (nodes : List ArchNode) (e : ArchEdge) : List ArchIssue :=
+    match arch_edge_allows_layer e with
+    | True => Nil ArchIssue
+    | False =>
+        arch_with_ends nodes e (fun (src : ArchNode) (dst : ArchNode) =>
+          arch_flag (ltb_nat (arch_node_layer src) (arch_node_layer dst))
+            (IArchForbiddenDirection (arch_edge_span e)))
+    end;
+
+-- An adjacent outward edge is the direction rule's case; ARCH004 marks a
+-- wider layer escape.
+def arch_boundary_issue (nodes : List ArchNode) (e : ArchEdge) : List ArchIssue :=
+    match arch_edge_allows_layer e with
+    | True => Nil ArchIssue
+    | False =>
+        arch_with_ends nodes e (fun (src : ArchNode) (dst : ArchNode) =>
+          arch_flag (ltb_nat (S (arch_node_layer src)) (arch_node_layer dst))
+            (IArchLayerBoundary (arch_edge_span e)))
+    end;
+
+def arch_std_runtime_issue (nodes : List ArchNode) (e : ArchEdge) : List ArchIssue :=
+    arch_with_ends nodes e (fun (src : ArchNode) (dst : ArchNode) =>
+      arch_flag (andb (arch_node_std_runtime src) (arch_node_compiler_internal dst))
+        (IArchStdRuntimeCompilerInternal (arch_edge_span e)));
+
+def arch_trust_issue (nodes : List ArchNode) (e : ArchEdge) : List ArchIssue :=
+    match arch_edge_allows_trust e with
+    | True => Nil ArchIssue
+    | False =>
+        arch_with_ends nodes e (fun (src : ArchNode) (dst : ArchNode) =>
+          arch_flag (andb (notb (arch_node_trusted src)) (arch_node_trusted dst))
+            (IArchTCBBoundary (arch_edge_span e)))
+    end;
+
+def arch_edge_issues (fuel : Nat) (nodes : List ArchNode) (edges : List ArchEdge)
+    (e : ArchEdge) : List ArchIssue :=
+    append ArchIssue (arch_cycle_issue fuel edges e)
+      (append ArchIssue (arch_direction_issue nodes e)
+        (append ArchIssue (arch_std_runtime_issue nodes e)
+          (append ArchIssue (arch_boundary_issue nodes e) (arch_trust_issue nodes e))));
+
+def analyze_architecture (fuel : Nat) (nodes : List ArchNode) (edges : List ArchEdge)
+    : List ArchIssue :=
+    concat_map ArchEdge ArchIssue (arch_edge_issues fuel nodes edges) edges;

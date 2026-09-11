@@ -1,0 +1,186 @@
+-- Checked Native MIR -> x64 bytes -> PE32+. No host compiler, assembler,
+-- linker, shell, IO, or foreign code-generation API is called by this path.
+import "codegen_ops.ouro";
+import "codegen_assembly.ouro";
+
+inductive CodegenFunctions : Type :=
+  | CodegenFunctionsOf : List Nat -> List PeSymbol -> List PeFixup
+      -> List PeFunction -> List NativeFrameInfo -> CodegenFunctions;
+
+inductive CodegenData : Type :=
+  | CodegenDataOf : List Nat -> List Nat -> List PeSymbol -> CodegenData;
+
+-- This is input to the PE writer, not an accepted image. Keeping preparation
+-- separate lets a host release completed instruction-encoding temporaries.
+inductive CodegenPrepared : Type :=
+  | CodegenPreparedOf : PeProgram -> List NativeFrameInfo -> CodegenPrepared;
+
+def codegen_zero_roots (slots : List CodegenSlot) : List CodegenAtom :=
+    codegen_clear_dead_roots slots ([] : List Nat);
+
+def codegen_spill_args (slots : List CodegenSlot) (allocation : Nat)
+    : List MirLocal -> Nat -> Either NativeCodegenError (List CodegenAtom) :=
+  fix codegen_spill_args (args : List MirLocal) (index : Nat) : Either NativeCodegenError (List CodegenAtom) :=
+    match args with | Nil => codegen_ready ([] : List CodegenAtom) | Cons argument rest =>
+      let load : X64Instruction := match ltb_nat index 4 with
+        | True => X64Mov X64Bits64 X64Rax (codegen_argument_register index)
+        | False => X64Load X64Bits64 X64Rax (X64Base X64Rsp (codegen_disp (add allocation (add 8 (mul index 8))))) end in
+      codegen_parts ([codegen_ready (codegen_raw ([load] : List X64Instruction)),
+        codegen_save slots (mir_local_id argument) X64Rax, codegen_spill_args rest (S index)]
+          : List (Either NativeCodegenError (List CodegenAtom))) end;
+
+def codegen_body (program : MirProgram) (function : MirFunction) (frame : CodegenFrame)
+    : Either NativeCodegenError (List CodegenAtom) :=
+    match function with | MirFunctionDef id _ args _ _ entry blocks =>
+      match frame with | CodegenFrameOf allocation slots =>
+        let analyzed : Either MirError (List MirBlockFact) := match mir_function_has_roots function with
+          | False => Right MirError (List MirBlockFact) ([] : List MirBlockFact)
+          | True => mir_live_facts (S (length MirBlock blocks)) (mir_live_roots function) blocks end in
+        match analyzed with | Left err => Left NativeCodegenError (List CodegenAtom) (NativeMirError err)
+        | Right facts => codegen_parts ([codegen_ready (codegen_zero_roots slots), codegen_spill_args slots allocation args 0,
+            codegen_ready (codegen_runtime_initialize program id), codegen_shadow_enter program id allocation slots,
+            codegen_ready ([CodegenJump (CodegenBlockLabel entry)] : List CodegenAtom),
+            codegen_parts (map MirBlock (Either NativeCodegenError (List CodegenAtom))
+              (codegen_block program slots allocation facts blocks) blocks)] : List (Either NativeCodegenError (List CodegenAtom))) end end end;
+
+def codegen_pe_frame (allocation : Nat) (base : Nat) : PeFrame :=
+    match ltb_nat allocation pe_section_alignment with
+    | True => PeCallFrame ([] : List X64Register) allocation
+    | False => PeProbedFrame ([] : List X64Register) allocation (codegen_relative 0 (add base 10)) end;
+
+def codegen_functions (program : MirProgram) : List MirFunction -> Nat -> Either NativeCodegenError CodegenFunctions :=
+  fix codegen_functions (functions : List MirFunction) (base : Nat) : Either NativeCodegenError CodegenFunctions :=
+    match functions with
+    | Nil => Right NativeCodegenError CodegenFunctions (CodegenFunctionsOf ([] : List Nat) ([] : List PeSymbol)
+        ([] : List PeFixup) ([] : List PeFunction) ([] : List NativeFrameInfo))
+    | Cons function rest => match function with | MirFunctionDef id name _ _ _ _ _ =>
+      let frame : CodegenFrame := codegen_frame function in
+      match frame with | CodegenFrameOf allocation slots =>
+        let pe_frame : PeFrame := codegen_pe_frame allocation base in
+        match pe_encode_frame id pe_frame with
+        | Left err => Left NativeCodegenError CodegenFunctions (NativePeError err)
+        | Right info => match info with | PeUnwindInfoData prolog _ =>
+          match codegen_body program function frame with | Left err => Left NativeCodegenError CodegenFunctions err
+          | Right atoms => match codegen_assemble atoms base (length Nat prolog) with
+            | Left err => Left NativeCodegenError CodegenFunctions err
+            | Right encoded => match encoded with | CodegenEncodedParts body fixups calls =>
+              let bytes : List Nat := append Nat prolog body in
+              let size : Nat := length Nat bytes in
+              match leb_nat size (sub pe_max_rva base) with
+              | False => Left NativeCodegenError CodegenFunctions NativeCodeTooLarge
+              | True => match codegen_functions rest (add base size) with
+                | Left err => Left NativeCodegenError CodegenFunctions err
+                | Right tail => match tail with | CodegenFunctionsOf more symbols more_fixups records frames =>
+                  Right NativeCodegenError CodegenFunctions (CodegenFunctionsOf (append Nat bytes more)
+                    (Cons PeSymbol (PeNamedSymbol id PeText base) symbols) (append PeFixup fixups more_fixups)
+                    (Cons PeFunction (PeCodeFunction id size name pe_frame) records)
+                    (Cons NativeFrameInfo (NativeFrameAt id allocation (codegen_root_slots slots) calls) frames)) end end end end end end end end end end end;
+
+def codegen_data : List MirData -> Nat -> Nat -> CodegenData :=
+  fix codegen_data (objects : List MirData) (readonly_offset : Nat) (writable_offset : Nat) : CodegenData :=
+    match objects with
+    | Nil => CodegenDataOf ([] : List Nat) ([] : List Nat) ([] : List PeSymbol)
+    | Cons object rest => match object with | MirDataDef id writable bytes =>
+      let padded : List Nat := pe_pad 8 bytes in
+      let size : Nat := length Nat padded in
+      let following : CodegenData := codegen_data rest
+        (match writable with | True => readonly_offset | False => add readonly_offset size end)
+        (match writable with | True => add writable_offset size | False => writable_offset end) in
+      match following with | CodegenDataOf readonly_data writable_data symbols =>
+        CodegenDataOf (match writable with | True => readonly_data | False => append Nat padded readonly_data end)
+          (match writable with | True => append Nat padded writable_data | False => writable_data end)
+          (Cons PeSymbol (PeNamedSymbol id (match writable with | True => PeWritable | False => PeReadOnly end)
+            (match writable with | True => writable_offset | False => readonly_offset end)) symbols) end end end;
+
+def codegen_libraries (libraries : List MirLibrary) : List PeLibrary :=
+    map MirLibrary PeLibrary (fun (library : MirLibrary) => match library with
+      | MirLibraryDef name externs => PeImportLibrary name (map MirExtern PeImport
+        (fun (external : MirExtern) => match external with | MirExternDef _ id label _ => PeNamedImport id label end) externs) end) libraries;
+
+-- Each continuation owns completed function output, never assembly temporaries.
+-- A staging host may retain this ordinary value between calls; all encoding,
+-- offsets, fixups, metadata and error decisions remain in Ouro.
+inductive CodegenBuild : Type :=
+  | CodegenPending : CodegenEncoded -> List MirFunction -> Nat -> List CodegenFunctions -> CodegenBuild
+  | CodegenFinished : CodegenPrepared -> CodegenBuild;
+
+def codegen_prepend_functions (earlier : CodegenFunctions) (later : CodegenFunctions) : CodegenFunctions :=
+    match earlier, later with
+    | CodegenFunctionsOf bytes symbols fixups records frames,
+      CodegenFunctionsOf more more_symbols more_fixups more_records more_frames =>
+        CodegenFunctionsOf (append Nat bytes more) (append PeSymbol symbols more_symbols)
+          (append PeFixup fixups more_fixups) (append PeFunction records more_records)
+          (append NativeFrameInfo frames more_frames) end;
+
+def codegen_finish_preparation (program : MirProgram) (probe : CodegenEncoded)
+    (encoded : CodegenFunctions) : CodegenPrepared :=
+    match program with | MirProgramDef _ objects libraries entry =>
+      match probe with | CodegenEncodedParts probe_bytes _ _ =>
+        let probe_id : Nat := S (foldr Nat Nat maxNat 0 (mir_global_ids program)) in
+        let probe_size : Nat := length Nat probe_bytes in
+        match encoded with | CodegenFunctionsOf bytes symbols fixups records frames =>
+          match codegen_data (append MirData objects (codegen_runtime_data program)) 0 0 with
+          | CodegenDataOf readonly_data writable_data data_symbols =>
+            let pe : PeProgram := PeProgramParts (append Nat probe_bytes bytes) readonly_data writable_data
+              (Cons PeSymbol (PeNamedSymbol probe_id PeText 0) (append PeSymbol symbols data_symbols))
+              (codegen_libraries libraries) fixups
+              (Cons PeFunction (PeCodeFunction probe_id probe_size
+                ([95, 111, 117, 114, 111, 95, 112, 114, 111, 98, 101] : List Nat) PeLeaf) records) entry in
+            CodegenPreparedOf pe frames end end end end;
+
+def codegen_prepare_begin (program : MirProgram) : Either NativeCodegenError CodegenBuild :=
+    match codegen_assemble codegen_probe_atoms 0 0 with
+    | Left error => Left NativeCodegenError CodegenBuild error
+    | Right probe => match probe with | CodegenEncodedParts bytes _ _ =>
+      match program with | MirProgramDef functions _ _ _ =>
+        Right NativeCodegenError CodegenBuild (CodegenPending probe functions (length Nat bytes)
+          ([] : List CodegenFunctions)) end end end;
+
+def codegen_prepare_step (program : MirProgram) (state : CodegenBuild) : Either NativeCodegenError CodegenBuild :=
+    match state with
+    | CodegenFinished _ => Right NativeCodegenError CodegenBuild state
+    | CodegenPending probe pending base completed => match pending with
+      | Nil =>
+        let empty : CodegenFunctions := CodegenFunctionsOf ([] : List Nat) ([] : List PeSymbol)
+          ([] : List PeFixup) ([] : List PeFunction) ([] : List NativeFrameInfo) in
+        let encoded : CodegenFunctions := foldl CodegenFunctions CodegenFunctions
+          (fun (later : CodegenFunctions) (earlier : CodegenFunctions) => codegen_prepend_functions earlier later)
+          empty completed in
+        Right NativeCodegenError CodegenBuild (CodegenFinished (codegen_finish_preparation program probe encoded))
+      | Cons function rest => match codegen_functions program ([function] : List MirFunction) base with
+        | Left error => Left NativeCodegenError CodegenBuild error
+        | Right encoded => match encoded with | CodegenFunctionsOf bytes _ _ _ _ =>
+          Right NativeCodegenError CodegenBuild (CodegenPending probe rest (add base (length Nat bytes))
+            (Cons CodegenFunctions encoded completed)) end end end end;
+
+-- The complete entry point consumes the same continuation sequence. Its
+-- structural counter is exactly the input function list plus the final step.
+def codegen_prepare_run (program : MirProgram) : List MirFunction -> CodegenBuild -> Either NativeCodegenError CodegenPrepared :=
+  fix codegen_prepare_run (remaining : List MirFunction) (state : CodegenBuild) : Either NativeCodegenError CodegenPrepared :=
+    match codegen_prepare_step program state with
+    | Left error => Left NativeCodegenError CodegenPrepared error
+    | Right next => match remaining with
+      | Cons _ rest => codegen_prepare_run rest next
+      | Nil => match next with
+        | CodegenFinished prepared => Right NativeCodegenError CodegenPrepared prepared
+        | CodegenPending _ _ _ _ => Left NativeCodegenError CodegenPrepared NativeCodeTooLarge end end end;
+
+def codegen_prepare (program : MirProgram) : Either NativeCodegenError CodegenPrepared :=
+    match codegen_prepare_begin program with
+    | Left error => Left NativeCodegenError CodegenPrepared error
+    | Right state => match program with | MirProgramDef functions _ _ _ => codegen_prepare_run program functions state end end;
+
+def codegen_write (prepared : CodegenPrepared) : Either NativeCodegenError NativeImage :=
+    match prepared with | CodegenPreparedOf pe frames =>
+      mapLeft PeError NativeImage NativeCodegenError (fun (err : PeError) => NativePeError err)
+        (mapRight PeError PeImage NativeImage (fun (image : PeImage) => NativeImageOf image frames) (pe_write_image pe)) end;
+
+def codegen_checked (program : MirProgram) : Either NativeCodegenError NativeImage :=
+    match codegen_prepare program with
+    | Left error => Left NativeCodegenError NativeImage error
+    | Right prepared => codegen_write prepared end;
+
+def codegen_program (limits : MirLimits) (program : MirProgram) : Either NativeCodegenError NativeImage :=
+    match mir_validate limits program with
+    | Left err => Left NativeCodegenError NativeImage (NativeMirError err)
+    | Right checked => match checked with | MirChecked verified => codegen_checked verified end end;

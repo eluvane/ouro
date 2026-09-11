@@ -1,0 +1,357 @@
+-- Line harvest and tiny source rewrites. Lexer already imports std/char;
+-- reuse those codes instead of redeclaring them in this flat cone.
+--
+-- Lines are split and comment-stripped by host string primitives; only the
+-- short keyword prefix of a line is walked as a code list. The heap is
+-- process-lifetime, so a per-character Ouro loop over every file of an import
+-- cone costs gigabytes before the first warning prints.
+
+import "../std/io.ouro";
+import "../std/listx.ouro";
+import "../compiler/lexer.ouro";
+
+def ncodes (s : String) : List Nat := prim_string_to_char_codes s;
+def nstr (cs : List Nat) : String := prim_string_of_char_codes cs;
+
+def nat1 (c : Nat) : List Nat := singleton Nat c;
+
+def comment_open : String := "--";
+def module_kw_text : String := "module";
+
+def src_lines (src : String) : List String := prim_string_split src ch_lf;
+
+-- Text before the first `--`. Like the old code scan, this also cuts inside
+-- string literals; harvesting only looks at declaration heads.
+def strip_comment (line : String) : String :=
+    match prim_string_index line comment_open with
+    | Nothing => line
+    | Just k => prim_string_slice line Z k
+    end;
+
+def line_codes (line : String) : List Nat := ncodes (strip_comment line);
+
+def skip_ws_n (xs : List Nat) : List Nat :=
+  drop_while Nat source_is_ws xs;
+
+def take_ident_n (xs : List Nat) : Pair (List Nat) (List Nat) :=
+    match xs with
+    | Nil => MkPair (List Nat) (List Nat) (Nil Nat) (Nil Nat)
+    | Cons c _ =>
+        match source_is_ident_start c with
+        | False => MkPair (List Nat) (List Nat) (Nil Nat) xs
+        | True => span Nat source_is_ident_char xs
+        end
+    end;
+
+def starts_n (pat : List Nat) (xs : List Nat) : Bool :=
+  is_prefix Nat eqNat pat xs;
+
+def drop_n (pat : List Nat) (xs : List Nat) : List Nat :=
+  drop Nat (length Nat pat) xs;
+
+-- Stops at the first hit; std elem folds the whole list through a strict orb.
+def mem_str (x : String) : List String -> Bool :=
+  fix go (xs : List String) : Bool :=
+    match xs with
+    | Nil => False
+    | Cons y ys =>
+        match prim_string_eq x y with
+        | True => True
+        | False => go ys
+        end
+    end;
+
+-- Dedup insert: linear per call, so only for short lists such as paths.
+-- Harvested names are consed without dedup; every consumer tests membership.
+def snoc_str (xs : List String) (x : String) : List String :=
+    match mem_str x xs with
+    | True => xs
+    | False => Cons String x xs
+    end;
+
+def kw_def : List Nat := ncodes "def";
+def kw_axiom : List Nat := ncodes "axiom";
+def kw_intrinsic : List Nat := ncodes "intrinsic";
+def kw_extern : List Nat := ncodes "extern";
+def kw_ind : List Nat := ncodes "inductive";
+def kw_rec : List Nat := ncodes "record";
+def kw_imp : List Nat := ncodes "import";
+def kw_mod : List Nat := ncodes "module";
+def kw_where : List Nat := ncodes "where";
+def kw_end : List Nat := ncodes "end";
+
+def harvest_kws : List (List Nat) :=
+  [ kw_def, kw_axiom, kw_ind, kw_rec, kw_intrinsic, kw_extern ];
+
+def harvest_from_kw (t : List Nat) (kw : List Nat) (acc : List String) : List String :=
+  match take_ident_n (skip_ws_n (drop_n kw t)) with
+  | MkPair name _ =>
+      match name with
+      | Nil => acc
+      | Cons _ _ => Cons String (nstr name) acc
+      end
+  end;
+
+-- `name :` at the start of a trimmed line: record fields and ctor binders.
+def harvest_colon_name (t : List Nat) (acc : List String) : List String :=
+    match take_ident_n t with
+    | MkPair name after =>
+        match name with
+        | Nil => acc
+        | Cons _ _ =>
+            match skip_ws_n after with
+            | Cons d _ =>
+                match eqNat d ch_colon with
+                | True => Cons String (nstr name) acc
+                | False => acc
+                end
+            | Nil => acc
+            end
+        end
+    end;
+
+def harvest_ctor (t : List Nat) (acc : List String) : List String :=
+  match t with
+  | Cons c rest =>
+      match eqNat c ch_bar with
+      | True => harvest_colon_name (skip_ws_n rest) acc
+      | False => acc
+      end
+  | Nil => acc
+  end;
+
+-- Every `| Name :` segment of a line: constructors of a one-line inductive.
+def harvest_bars : List Nat -> List String -> List String :=
+  fix harvest_bars (xs : List Nat) (acc : List String) : List String :=
+    match xs with
+    | Nil => acc
+    | Cons c rest =>
+        match eqNat c ch_bar with
+        | True => harvest_bars rest (harvest_colon_name (skip_ws_n rest) acc)
+        | False => harvest_bars rest acc
+        end
+    end;
+
+def harvest_kw_line (t : List Nat) (acc : List String) : List String :=
+  match find (List Nat) (fun (kw : List Nat) =>
+    andb (starts_n kw t) (source_word_end (drop_n kw t))) harvest_kws with
+  | Nothing => harvest_ctor t acc
+  | Just kw =>
+      match starts_n kw_ind t with
+      | True => harvest_bars t (harvest_from_kw t kw acc)
+      | False => harvest_from_kw t kw acc
+      end
+  end;
+
+def harvest_line (ln : String) (acc : List String) : List String :=
+  harvest_kw_line (skip_ws_n (line_codes ln)) acc;
+
+def harvest_names (src : String) : List String :=
+  foldl String (List String)
+    (fun (acc : List String) (ln : String) => harvest_line ln acc)
+    (Nil String) (src_lines src);
+
+def has_semi (t : List Nat) : Bool := elem Nat eqNat ch_semi t;
+
+-- Inside an `inductive` declaration until its closing `;`. Effect operations
+-- and record fields also use `| name :` / `name :` lines and must stay out.
+def harvest_ctor_step (t : List Nat) (in_ind : Bool) (acc : List String)
+    : Pair Bool (List String) :=
+    match orb in_ind (starts_n kw_ind t) with
+    | False => MkPair Bool (List String) False acc
+    | True =>
+        MkPair Bool (List String) (notb (has_semi t)) (harvest_bars t acc)
+    end;
+
+-- Constructor names only, one-line and multi-line inductives alike.
+def harvest_ctor_names (src : String) : List String :=
+  (fix go (ls : List String) (in_ind : Bool) (acc : List String)
+      : List String :=
+    match ls with
+    | Nil => acc
+    | Cons ln rest =>
+        match harvest_ctor_step (skip_ws_n (line_codes ln)) in_ind acc with
+        | MkPair in_ind2 acc2 => go rest in_ind2 acc2
+        end
+    end) (src_lines src) False (Nil String);
+
+def harvest_rec_step (t : List Nat) (in_rec : Bool) (acc : List String)
+    : Pair Bool (List String) :=
+    match starts_n kw_rec t with
+    | True => MkPair Bool (List String) True acc
+    | False =>
+        match andb in_rec (starts_n kw_end t) with
+        | True => MkPair Bool (List String) False acc
+        | False =>
+            match in_rec with
+            | False => MkPair Bool (List String) False acc
+            | True => MkPair Bool (List String) True (harvest_colon_name t acc)
+            end
+        end
+    end;
+
+-- Field names from `record R where x : T; ... end`. Record expand emits
+-- accessors that bind every field and use one; those unused binders are
+-- an artifact, not a smell in the surface program.
+def harvest_record_fields (src : String) : List String :=
+  (fix go (ls : List String) (in_rec : Bool) (acc : List String)
+      : List String :=
+    match ls with
+    | Nil => acc
+    | Cons ln rest =>
+        match harvest_rec_step (skip_ws_n (line_codes ln)) in_rec acc with
+        | MkPair in_rec2 acc2 => go rest in_rec2 acc2
+        end
+    end) (src_lines src) False (Nil String);
+
+def harvest_import_line (ln : String) : Maybe String :=
+    let t : List Nat := skip_ws_n (line_codes ln) in
+    match starts_n kw_imp t with
+    | False => Nothing String
+    | True =>
+        let after : List Nat := skip_ws_n (drop_n kw_imp t) in
+        match after with
+        | Cons c rest =>
+            match eqNat c ch_dq with
+            | False => Nothing String
+            | True =>
+                match span Nat (fun (d : Nat) => notb (eqNat d ch_dq)) rest with
+                | MkPair acc tail =>
+                    match tail with
+                    | Nil => Nothing String
+                    | Cons _ _ => Just String (nstr acc)
+                    end
+                end
+            end
+        | Nil => Nothing String
+        end
+    end;
+
+def harvest_imports (src : String) : List String :=
+  foldl String (List String)
+    (fun (acc : List String) (ln : String) =>
+      match harvest_import_line ln with
+      | Nothing => acc
+      | Just p => snoc_str acc p
+      end)
+    (Nil String) (src_lines src);
+
+def last_slash (cs : List Nat) : Maybe Nat :=
+  (fix go (xs : List Nat) (i : Nat) (hit : Maybe Nat) : Maybe Nat :=
+    match xs with
+    | Nil => hit
+    | Cons c rest =>
+        match orb (eqNat c ch_slash) (eqNat c ch_bs) with
+        | True => go rest (S i) (Just Nat i)
+        | False => go rest (S i) hit
+        end
+    end) cs Z (Nothing Nat);
+
+def dirname (p : String) : String :=
+    let codes : List Nat := ncodes p in
+    match last_slash codes with
+    | Nothing => "."
+    | Just i =>
+        match i with
+        | Z => "/"
+        | S _ => nstr (take Nat i codes)
+        end
+    end;
+
+def resolve_import (from_file : String) (spell : String) : String :=
+    match ncodes spell with
+    | Cons c rest =>
+        match orb (orb (eqNat c ch_slash) (eqNat c ch_bs))
+          (match rest with
+           | Cons d _ => eqNat d ch_colon
+           | Nil => False
+           end) with
+        | True => spell
+        | False => concat (dirname from_file) (concat "/" spell)
+        end
+    | Nil => spell
+    end;
+
+def indent_of (cs : List Nat) : List Nat :=
+  take_while Nat (fun (c : Nat) => orb (eqNat c ch_space) (eqNat c ch_tab)) cs;
+
+def rewrite_mod_def (pref : List Nat) (ln : List Nat) : List Nat :=
+    let ind : List Nat := indent_of ln in
+    let t : List Nat := skip_ws_n ln in
+    let kw : List Nat :=
+      match starts_n kw_def t with
+      | True => kw_def
+      | False => kw_axiom
+      end in
+    match take_ident_n (skip_ws_n (drop_n kw t)) with
+    | MkPair name after =>
+        append Nat ind
+          (append Nat kw
+            (Cons Nat ch_space
+              (append Nat pref (Cons Nat ch_uscore (append Nat name after)))))
+    end;
+
+-- Output lines are consed in reverse and flattened once: appending each line
+-- to the accumulator copied the whole prefix per line, quadratic in the file.
+def expand_module_lines : List String -> List Nat -> List (List Nat)
+    -> List (List Nat) :=
+  fix go (ls : List String) (pref : List Nat) (acc : List (List Nat))
+      : List (List Nat) :=
+    match ls with
+    | Nil => acc
+    | Cons ln rest =>
+        let raw : List Nat := ncodes ln in
+        let t : List Nat := skip_ws_n (line_codes ln) in
+        match andb (starts_n kw_mod t)
+          (match pref with | Nil => True | Cons _ _ => False end) with
+        | True =>
+            match take_ident_n (skip_ws_n (drop_n kw_mod t)) with
+            | MkPair name after =>
+                match andb
+                  (match name with | Nil => False | Cons _ _ => True end)
+                  (starts_n kw_where (skip_ws_n after)) with
+                | True => go rest name acc
+                | False => go rest pref (Cons (List Nat) raw acc)
+                end
+            end
+        | False =>
+            match andb (starts_n kw_end t)
+              (match pref with | Nil => False | Cons _ _ => True end) with
+            | True => go rest (Nil Nat) acc
+            | False =>
+                match andb
+                  (orb (starts_n kw_def t) (starts_n kw_axiom t))
+                  (match pref with | Nil => False | Cons _ _ => True end) with
+                | True =>
+                    go rest pref (Cons (List Nat) (rewrite_mod_def pref raw) acc)
+                | False => go rest pref (Cons (List Nat) raw acc)
+                end
+            end
+        end
+    end;
+
+-- One `\n` after every line. The host splitter yields an empty last segment
+-- for a file ending in a newline; dropping it keeps the text length stable.
+def join_lines (rev_lines : List (List Nat)) : List Nat :=
+  let body : List (List Nat) :=
+    match rev_lines with
+    | Nil => rev_lines
+    | Cons last more =>
+        match last with
+        | Nil => more
+        | Cons _ _ => rev_lines
+        end
+    end in
+  concat_map (List Nat) Nat
+    (fun (ln : List Nat) => append Nat ln (nat1 ch_lf))
+    (reverse (List Nat) body);
+
+-- module Name where ... end;  -> prefix inner def/axiom names with Name_
+-- Files without the keyword anywhere (the common case) pass through untouched.
+def expand_modules (src : List Nat) : List Nat :=
+    let text : String := nstr src in
+    match prim_string_contains text module_kw_text with
+    | False => src
+    | True =>
+        join_lines (expand_module_lines (src_lines text) (Nil Nat) (Nil (List Nat)))
+    end;

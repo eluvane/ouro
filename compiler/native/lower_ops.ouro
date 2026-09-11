@@ -1,0 +1,188 @@
+-- Primitive execution is selected by the checked identity, never by a name.
+-- No pure operation invokes a Runtime action or calls host code while lowering.
+import "lower_types.ouro";
+
+def LowerStep : Type := List LowerBinding -> CoreTerm -> LowerType -> LowerState -> Either NativeLowerError LowerResult;
+
+inductive LowerArguments : Type :=
+  | LowerArgumentsOf : List MirValue -> LowerState -> LowerArguments;
+
+def lower_single (A : Type) (values : List A) : Either NativeLowerError A :=
+    match values with | Nil => Left NativeLowerError A (LowerInvalidCall 0)
+    | Cons value rest => match rest with | Nil => Right NativeLowerError A value
+      | Cons _ _ => Left NativeLowerError A (LowerInvalidCall 0) end end;
+
+def lower_pair (A : Type) (values : List A) : Either NativeLowerError (Pair A A) :=
+    match values with | Nil => Left NativeLowerError (Pair A A) (LowerInvalidCall 0)
+    | Cons first rest => match rest with | Nil => Left NativeLowerError (Pair A A) (LowerInvalidCall 0)
+      | Cons second more => match more with
+        | Nil => Right NativeLowerError (Pair A A) (MkPair A A first second)
+        | Cons _ _ => Left NativeLowerError (Pair A A) (LowerInvalidCall 0) end end end;
+
+def lower_four (A : Type) (values : List CoreTerm)
+    (next : CoreTerm -> CoreTerm -> CoreTerm -> CoreTerm -> Either NativeLowerError A) : Either NativeLowerError A :=
+    match values with | Nil => Left NativeLowerError A (LowerInvalidCall 0)
+    | Cons a rest => match rest with | Nil => Left NativeLowerError A (LowerInvalidCall 0)
+      | Cons b more => match more with | Nil => Left NativeLowerError A (LowerInvalidCall 0)
+        | Cons c tail => match tail with | Nil => Left NativeLowerError A (LowerInvalidCall 0)
+          | Cons d last => match last with | Nil => next a b c d
+            | Cons _ _ => Left NativeLowerError A (LowerInvalidCall 0) end end end end end;
+
+def lower_arguments (step : LowerStep) (environment : List LowerBinding) (id : Nat)
+    : List LowerType -> List CoreTerm -> LowerState -> Either NativeLowerError LowerArguments :=
+  fix arguments (types : List LowerType) (terms : List CoreTerm) (state : LowerState)
+      : Either NativeLowerError LowerArguments :=
+    match types, terms with
+    | Nil, Nil => Right NativeLowerError LowerArguments (LowerArgumentsOf ([] : List MirValue) state)
+    | Cons typ rest, Cons term more => lower_bind LowerResult LowerArguments (step environment term typ state)
+        (fun (result : LowerResult) => match result with | LowerResultOf _ value next => match value with
+          | Nothing => Left NativeLowerError LowerArguments (LowerInvalidCall id)
+          | Just scalar => lower_map LowerArguments LowerArguments
+              (fun (tail : LowerArguments) => match tail with | LowerArgumentsOf values final =>
+                LowerArgumentsOf (Cons MirValue scalar values) final end) (arguments rest more next) end end)
+    | Nil, Cons _ _ => Left NativeLowerError LowerArguments (LowerInvalidCall id)
+    | Cons _ _, Nil => Left NativeLowerError LowerArguments (LowerInvalidCall id) end;
+
+def lower_invoke (typ : LowerType) (id : Nat) (args : List MirValue) (state : LowerState)
+    : Either NativeLowerError LowerResult :=
+    match lower_type_mir typ with
+    | Nothing => Right NativeLowerError LowerResult
+        (LowerResultOf typ (Nothing MirValue) (lower_emit (MirCall MirMayGc (Nothing Nat) (MirDirect id) args) state))
+    | Just _ => lower_fresh_result typ (fun (destination : Nat) => MirCall MirMayGc (Just Nat destination) (MirDirect id) args) state end;
+
+def lower_direct (fuel : Nat) (step : LowerStep) (contracts : List LowerContract)
+    (environment : List LowerBinding) (id : Nat) (args : List CoreTerm) (expected : LowerType) (state : LowerState)
+    : Either NativeLowerError LowerResult :=
+    match lower_find_contract id contracts with
+    | Nothing => Left NativeLowerError LowerResult (LowerUnknownGlobal id)
+    | Just contract => match contract with | LowerContractOf _ _ parameters result _ =>
+      lower_bind Unit LowerResult (lower_type_same fuel expected result) (fun (_ : Unit) =>
+        lower_bind LowerArguments LowerResult (lower_arguments step environment id parameters args state)
+          (fun (arguments : LowerArguments) => match arguments with | LowerArgumentsOf values next =>
+            lower_invoke expected id values next end)) end end;
+
+def lower_binary_operation (word : PrimitiveWord) (operation : PrimitiveWordOp)
+    : Either NativeLowerError MirBinary :=
+    match operation with
+    | PrimitiveAddWrap => Right NativeLowerError MirBinary MirAdd
+    | PrimitiveSubWrap => Right NativeLowerError MirBinary MirSub
+    | PrimitiveMulWrap => Right NativeLowerError MirBinary MirMul
+    | PrimitiveBitAnd => Right NativeLowerError MirBinary MirAnd
+    | PrimitiveBitOr => Right NativeLowerError MirBinary MirOr
+    | PrimitiveBitXor => Right NativeLowerError MirBinary MirXor
+    | PrimitiveShiftLeft => Right NativeLowerError MirBinary MirShl
+    | PrimitiveShiftRight => Right NativeLowerError MirBinary MirShr
+    | PrimitiveWordEqual => Left NativeLowerError MirBinary (LowerUnsupportedPrimitive (PrimitiveWordOperation word operation))
+    | PrimitiveWordLess => Left NativeLowerError MirBinary (LowerUnsupportedPrimitive (PrimitiveWordOperation word operation))
+    | PrimitiveAddChecked => Left NativeLowerError MirBinary (LowerUnsupportedPrimitive (PrimitiveWordOperation word operation))
+    | PrimitiveSubChecked => Left NativeLowerError MirBinary (LowerUnsupportedPrimitive (PrimitiveWordOperation word operation))
+    | PrimitiveMulChecked => Left NativeLowerError MirBinary (LowerUnsupportedPrimitive (PrimitiveWordOperation word operation))
+    | PrimitiveDivChecked => Left NativeLowerError MirBinary (LowerUnsupportedPrimitive (PrimitiveWordOperation word operation))
+    | PrimitiveRemChecked => Left NativeLowerError MirBinary (LowerUnsupportedPrimitive (PrimitiveWordOperation word operation)) end;
+
+def lower_word_type (fuel : Nat) (sig : CheckEnvironment) (word : PrimitiveWord)
+    : Either NativeLowerError LowerType :=
+    lower_bind CoreTerm LowerType
+      (lower_from_primitive CoreTerm (CSort 0) (primitive_type_ref (primitive_word_type word) (primitive_environment (check_environment_entries sig))))
+      (fun (typ : CoreTerm) => lower_classify_type fuel sig typ);
+
+def lower_binary_arithmetic (fuel : Nat) (step : LowerStep) (sig : CheckEnvironment) (environment : List LowerBinding)
+    (word : PrimitiveWord) (operation : PrimitiveWordOp) (args : List CoreTerm) (expected : LowerType) (state : LowerState)
+    : Either NativeLowerError LowerResult :=
+    lower_bind MirBinary LowerResult (lower_binary_operation word operation) (fun (binary : MirBinary) =>
+      lower_bind LowerType LowerResult (lower_word_type fuel sig word) (fun (typ : LowerType) =>
+        lower_bind Unit LowerResult (lower_type_same fuel expected typ) (fun (_ : Unit) =>
+          let right_type : Either NativeLowerError LowerType := match orb
+              (primitive_id_equal (PrimitiveWordOperation word operation) (PrimitiveWordOperation word PrimitiveShiftLeft))
+              (primitive_id_equal (PrimitiveWordOperation word operation) (PrimitiveWordOperation word PrimitiveShiftRight)) with
+            | True => lower_word_type fuel sig PrimitiveWordU32
+            | False => Right NativeLowerError LowerType typ end in
+          lower_bind LowerType LowerResult right_type (fun (right : LowerType) =>
+            lower_bind LowerArguments LowerResult (lower_arguments step environment 0 ([typ, right] : List LowerType) args state)
+              (fun (values : LowerArguments) => match values with | LowerArgumentsOf actual next =>
+                lower_bind (Pair MirValue MirValue) LowerResult (lower_pair MirValue actual)
+                  (fun (pair : Pair MirValue MirValue) => match pair with | MkPair left operand =>
+                    lower_fresh_result expected (fun (id : Nat) => MirBinaryOp id binary left operand) next end) end)))));
+
+def lower_boolean_type (fuel : Nat) (sig : CheckEnvironment) : Either NativeLowerError LowerType :=
+    lower_bind CoreTerm LowerType
+      (lower_from_primitive CoreTerm (CSort 0) (primitive_role_ref PrimitiveBoolRole (primitive_roles_environment (check_environment_entries sig))))
+      (fun (typ : CoreTerm) => lower_classify_type fuel sig typ);
+
+def lower_comparison (fuel : Nat) (step : LowerStep) (sig : CheckEnvironment) (environment : List LowerBinding)
+    (word : PrimitiveWord) (comparison : MirComparison) (args : List CoreTerm)
+    (expected : LowerType) (state : LowerState) : Either NativeLowerError LowerResult :=
+    lower_bind LowerType LowerResult (lower_boolean_type fuel sig) (fun (boolean : LowerType) =>
+      lower_bind Unit LowerResult (lower_type_same fuel expected boolean) (fun (_ : Unit) =>
+        lower_bind LowerType LowerResult (lower_word_type fuel sig word) (fun (operand : LowerType) =>
+          lower_bind LowerArguments LowerResult (lower_arguments step environment 0 ([operand, operand] : List LowerType) args state)
+            (fun (values : LowerArguments) => match values with | LowerArgumentsOf actual next =>
+              lower_bind (Pair MirValue MirValue) LowerResult (lower_pair MirValue actual)
+                (fun (pair : Pair MirValue MirValue) => match pair with | MkPair left right =>
+                  lower_fresh_result expected (fun (id : Nat) => MirCompare id comparison left right) next end) end))));
+
+def lower_binary (fuel : Nat) (step : LowerStep) (sig : CheckEnvironment) (environment : List LowerBinding)
+    (word : PrimitiveWord) (operation : PrimitiveWordOp) (args : List CoreTerm) (expected : LowerType) (state : LowerState)
+    : Either NativeLowerError LowerResult :=
+    match primitive_id_equal (PrimitiveWordOperation word operation) (PrimitiveWordOperation word PrimitiveWordEqual) with
+    | True => lower_comparison fuel step sig environment word MirEqual args expected state
+    | False => match primitive_id_equal (PrimitiveWordOperation word operation) (PrimitiveWordOperation word PrimitiveWordLess) with
+      | True => lower_comparison fuel step sig environment word MirLess args expected state
+      | False => lower_binary_arithmetic fuel step sig environment word operation args expected state end end;
+
+def lower_conversion_operation (from : PrimitiveWord) (into : PrimitiveWord) (conversion : PrimitiveConversion)
+    : Either NativeLowerError MirConversion :=
+    match conversion with
+    | PrimitiveNarrowWrap => Right NativeLowerError MirConversion MirNarrow
+    | PrimitiveZeroExtend => Right NativeLowerError MirConversion MirZeroExtend
+    | PrimitiveSignExtend => Right NativeLowerError MirConversion MirSignExtend
+    | PrimitiveReinterpret => Right NativeLowerError MirConversion MirReinterpret
+    | PrimitiveConvertChecked => Left NativeLowerError MirConversion
+        (LowerUnsupportedPrimitive (PrimitiveWordConversion from into conversion)) end;
+
+def lower_conversion (fuel : Nat) (step : LowerStep) (sig : CheckEnvironment) (environment : List LowerBinding)
+    (from : PrimitiveWord) (into : PrimitiveWord) (conversion : PrimitiveConversion)
+    (args : List CoreTerm) (expected : LowerType) (state : LowerState) : Either NativeLowerError LowerResult :=
+    lower_bind MirConversion LowerResult (lower_conversion_operation from into conversion) (fun (operation : MirConversion) =>
+      lower_bind LowerType LowerResult (lower_word_type fuel sig from) (fun (argument : LowerType) =>
+        lower_bind LowerType LowerResult (lower_word_type fuel sig into) (fun (result : LowerType) =>
+          lower_bind Unit LowerResult (lower_type_same fuel expected result) (fun (_ : Unit) =>
+            lower_bind LowerArguments LowerResult (lower_arguments step environment 0 ([argument] : List LowerType) args state)
+              (fun (values : LowerArguments) => match values with | LowerArgumentsOf actual next =>
+                lower_bind MirValue LowerResult (lower_single MirValue actual)
+                  (fun (value : MirValue) => lower_fresh_result expected (fun (id : Nat) => MirConvert id operation value) next) end)))));
+
+def lower_runtime_pure (fuel : Nat) (step : LowerStep) (sig : CheckEnvironment) (environment : List LowerBinding)
+    (args : List CoreTerm) (expected : LowerType) (state : LowerState) : Either NativeLowerError LowerResult :=
+    lower_bind (Pair CoreTerm CoreTerm) LowerResult (lower_pair CoreTerm args)
+      (fun (pair : Pair CoreTerm CoreTerm) => match pair with | MkPair annotation value =>
+      lower_bind Unit LowerResult (lower_require (lower_type_action expected) LowerEffectMismatch) (fun (_ : Unit) =>
+        lower_bind LowerType LowerResult (lower_classify_type fuel sig annotation) (fun (typ : LowerType) =>
+          lower_bind LowerType LowerResult (lower_runtime_type sig typ) (fun (runtime : LowerType) =>
+            lower_bind Unit LowerResult (lower_type_same fuel expected runtime) (fun (_ : Unit) =>
+              lower_map LowerResult LowerResult (fun (result : LowerResult) => match result with
+                | LowerResultOf _ scalar next => LowerResultOf expected scalar next end) (step environment value typ state))))) end);
+
+def lower_runtime_bind (fuel : Nat) (step : LowerStep) (sig : CheckEnvironment) (environment : List LowerBinding)
+    (args : List CoreTerm) (expected : LowerType) (state : LowerState) : Either NativeLowerError LowerResult :=
+    lower_four LowerResult args (fun (first_type : CoreTerm) (second_type : CoreTerm)
+        (action : CoreTerm) (continuation : CoreTerm) =>
+      lower_bind Unit LowerResult (lower_require (lower_type_action expected) LowerEffectMismatch) (fun (_ : Unit) =>
+        lower_bind LowerType LowerResult (lower_classify_type fuel sig first_type) (fun (first : LowerType) =>
+          lower_bind LowerType LowerResult (lower_classify_type fuel sig second_type) (fun (second : LowerType) =>
+            lower_bind LowerType LowerResult (lower_runtime_type sig first) (fun (first_action : LowerType) =>
+              lower_bind LowerType LowerResult (lower_runtime_type sig second) (fun (second_action : LowerType) =>
+                lower_bind Unit LowerResult (lower_type_same fuel expected second_action) (fun (_ : Unit) =>
+                  match lower_term_view continuation with
+                  | LowerLambdaTerm annotation body => lower_bind LowerType LowerResult (lower_classify_type fuel sig annotation)
+                      (fun (parameter : LowerType) => lower_bind Unit LowerResult (lower_type_same fuel first parameter)
+                        (fun (_ : Unit) => lower_bind LowerResult LowerResult (step environment action first_action state)
+                          (fun (result : LowerResult) => match result with | LowerResultOf _ scalar next =>
+                            step (Cons LowerBinding (LowerScalarBinding first scalar) environment) body expected next end)))
+                  | LowerLocalTerm _ => Left NativeLowerError LowerResult (LowerUnsupportedTerm 3)
+                  | LowerApplyTerm _ _ => Left NativeLowerError LowerResult (LowerUnsupportedTerm 3)
+                  | LowerLetTerm _ _ _ => Left NativeLowerError LowerResult (LowerUnsupportedTerm 3)
+                  | LowerGlobalTerm _ => Left NativeLowerError LowerResult (LowerUnsupportedTerm 3)
+                  | LowerConstructorTerm _ _ _ => Left NativeLowerError LowerResult (LowerUnsupportedTerm 3)
+                  | LowerCaseTerm _ _ _ _ => Left NativeLowerError LowerResult (LowerUnsupportedTerm 3)
+                  | LowerOtherTerm _ => Left NativeLowerError LowerResult (LowerUnsupportedTerm 3) end)))))));

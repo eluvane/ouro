@@ -1,0 +1,702 @@
+-- Single entry that runs the structured families over one analysis unit and
+-- returns findings anchored to definitions: code, line, name, witness.
+-- Families are selected by name; `light_families` and `heavy_families` are
+-- the unions the CLI exposes as --enable-light and --enable-heavy.
+
+-- @entry drive_source
+-- @entry drive_findings
+-- @entry all_families
+-- @entry layer_name
+
+import "../../std/data.ouro";
+import "../../std/listx.ouro";
+import "../../std/natx.ouro";
+import "../../std/runtime.ouro";
+import "policy_ids.ouro";
+import "unit.ouro";
+import "finding.ouro";
+import "drive_env.ouro";
+import "drive_smells.ouro";
+import "effects.ouro";
+import "capability.ouro";
+import "extract_leak.ouro";
+import "match_cover.ouro";
+import "cfg.ouro";
+import "dataflow.ouro";
+import "semantic.ouro";
+import "property.ouro";
+import "absint.ouro";
+import "symexec.ouro";
+import "taint.ouro";
+import "contracts.ouro";
+import "complexity.ouro";
+import "bounds.ouro";
+import "minimal.ouro";
+import "duplication.ouro";
+import "trust.ouro";
+
+inductive DriveResult : Type :=
+  | DriveFindings : List Finding -> DriveResult
+  | DriveRejected : String -> DriveResult;
+
+-- Linear walks over each definition.
+def light_families : List String :=
+  [ fam_effects, fam_match, fam_cfg, fam_dataflow, fam_semantic, fam_property
+  , fam_metrics, fam_simplify, fam_perf, fam_naming, fam_errors ];
+
+-- Policy families, path exploration, and pairwise comparison. The trust
+-- family shares its flag with the base runner's import-edge rules.
+def heavy_families : List String :=
+  [ fam_capability, fam_extract, fam_taint, fam_contracts, fam_absint
+  , fam_symexec, fam_duplication, fam_trust ];
+
+-- Canonical order for banners.
+def all_families : List String :=
+  [ fam_effects, fam_capability, fam_extract, fam_match, fam_cfg, fam_dataflow
+  , fam_semantic, fam_property, fam_absint, fam_symexec, fam_taint
+  , fam_contracts, fam_metrics, fam_duplication, fam_trust, fam_simplify
+  , fam_perf, fam_naming, fam_errors ];
+
+-- Families the production tree is clean under after triage: zero findings
+-- and no known false positive over std, selfhost, tools, and samples. The
+-- nightly production gate (scripts/analyze_production_suite.py) fails on any
+-- finding from them. The promoted set is every family.
+def strict_families : List String := all_families;
+
+-- Literals above this are magic numbers unless a definition names them.
+def sem_magic_threshold : Nat := 10;
+
+-- Lambda nesting deeper than this is reported.
+def sem_lambda_limit : Nat := 3;
+
+-- Cyclomatic and cognitive complexity limits; Ouro's total matches over wide
+-- inductives make cyclomatic numbers large, so the limits are generous.
+def cx_cyclomatic_limit : Nat := 40;
+def cx_cognitive_limit : Nat := 80;
+
+-- Nested-match depth symbolic execution follows before widening.
+def sym_fuel : Nat := 32;
+
+-- Definitions below this node count are never clones.
+def dup_min_nodes : Nat := 12;
+
+def abs_zero_names : List String := [ "Z", "Nil" ];
+def abs_pos_names : List String := [ "S", "Cons" ];
+def abs_div_names : List String :=
+  [ "div_nat", "mod_nat", "divmod_nat", "div", "mod", "quot", "rem" ];
+
+def layer_override (src : String) (fallback : Layer) : Layer :=
+    match prim_string_contains src "ouro-analyze:layer=std" with
+    | True => LyStd
+    | False =>
+        match prim_string_contains src "ouro-analyze:layer=samples" with
+        | True => LySamples
+        | False =>
+            match prim_string_contains src "ouro-analyze:layer=io" with
+            | True => LyStdIo
+            | False => fallback
+            end
+        end
+    end;
+
+def layer_name (ly : Layer) : String :=
+    match ly with
+    | LyStd => "std"
+    | LyStdIo => "std-io"
+    | LyStdHttp => "std-http"
+    | LyStdWord => "std-word"
+    | LyCompiler => "compiler"
+    | LyAnalyze => "analyze"
+    | LyTools => "tools"
+    | LySamples => "samples"
+    | LyKernel => "kernel"
+    | LyOther => "other"
+    end;
+
+def def_info (e : DriveEnv) (d : UnitDef) : DefInfo :=
+    MkDefInfo (unit_def_line d) (unit_def_name d) (env_name e (unit_def_name d))
+      (unit_def_ast d) (ctr_parse_annos (unit_def_notes d))
+      (mem Nat eq_nat (unit_def_name d) (marks_public (env_marks e)));
+
+def anno_named (name : String) (a : CtrAnno) : Bool :=
+    prim_string_eq (ctr_anno_name a) name;
+
+def annos_named (name : String) (annos : List CtrAnno) : List CtrAnno :=
+    filter CtrAnno (anno_named name) annos;
+
+def has_anno (name : String) (annos : List CtrAnno) : Bool :=
+    any CtrAnno (anno_named name) annos;
+
+-- `@property WORD ...` directives mentioning `word`, on the definition or at
+-- file level.
+def property_wants (e : DriveEnv) (d : DefInfo) (word : String) : Bool :=
+    any CtrAnno
+      (fun (a : CtrAnno) =>
+        andb (anno_named "property" a) (prim_string_contains (ctr_anno_text a) word))
+      (append CtrAnno (info_annos d) (env_file_annos e));
+
+def def_is_pure (d : DefInfo) : Bool := has_anno "pure" (info_annos d);
+
+def hole_witness (e : DriveEnv) (n : Nat) (tail : String) : String :=
+    match n with
+    | Z => drive_cat "anonymous hole" tail
+    | S _ => drive_cat3 "hole ?" (env_name e n) tail
+    end;
+
+def eff_finding (e : DriveEnv) (d : DefInfo) (i : EffIssue) : Finding :=
+    match i with
+    | IPureHole n => finding_at "OURO-EFF001" d (hole_witness e n " under @pure")
+    | IConstRebind n =>
+        finding_at "OURO-EFF002" d (drive_cat "rebinds " (env_name e n))
+    | IUnhandledPerform op =>
+        finding_at "OURO-EFF003" d
+          (drive_cat3 "perform " (env_name e op) " outside any handle")
+    | IHandleMissingOp op =>
+        finding_at "OURO-EFF004" d
+          (drive_cat "handle has no clause for " (env_name e op))
+    | IDiscardedCont op =>
+        finding_at "OURO-EFF005" d
+          (drive_cat3 "clause " (env_name e op) " binds its continuation to _")
+    | IPureEffect op =>
+        finding_at "OURO-EFF006" d
+          (drive_cat3 "perform " (env_name e op) " under @pure")
+    end;
+
+def from_layer (e : DriveEnv) (n : Nat) (verb : String) : String :=
+    drive_cat3 (env_name e n) verb (layer_name (env_layer e));
+
+def cap_finding (e : DriveEnv) (d : DefInfo) (i : CapIssue) : Finding :=
+    match i with
+    | IPrimFs n => finding_at "OURO-CAP001" d (from_layer e n " called from layer ")
+    | IPrimProc n => finding_at "OURO-CAP002" d (from_layer e n " called from layer ")
+    | IPrimHttp n => finding_at "OURO-CAP003" d (from_layer e n " called from layer ")
+    | IHostFastPeano n =>
+        finding_at "OURO-CAP004" d
+          (drive_cat3 "fix " (env_name e n) " shadows a host-fast primitive")
+    end;
+
+def xtr_finding (e : DriveEnv) (d : DefInfo) (i : XtrIssue) : Finding :=
+    match i with
+    | ITypeAsValue _ =>
+        finding_at "OURO-XTR001" d "Type passed as a runtime argument"
+    | IProofInIO _ => finding_at "OURO-XTR002" d "Type or proof term under IO"
+    | IKernelFromStd n =>
+        finding_at "OURO-XTR003" d (from_layer e n " referenced from layer ")
+    end;
+
+def match_finding (e : DriveEnv) (d : DefInfo) (i : MatchIssue) : Finding :=
+    match i with
+    | IPartialMatch ctor =>
+        finding_at "OURO-MATCH001" d
+          (drive_cat "missing constructor " (env_name e ctor))
+    | IDeadBranch ctor =>
+        finding_at "OURO-MATCH002" d
+          (drive_cat "duplicate branch for " (env_name e ctor))
+    end;
+
+def cfg_finding (e : DriveEnv) (d : DefInfo) (i : CfgIssue) : Finding :=
+    match i with
+    | IEmptyMatch _ => finding_at "OURO-CFG001" d "match with no arms"
+    | ITrivialMatch c =>
+        finding_at "OURO-CFG002" d
+          (drive_cat3 "single arm " (env_name e c) " binds nothing")
+    | IUncheckedRecursion r =>
+        finding_at "OURO-CFG003" d
+          (drive_cat3 "fix " (env_name e r) " recurses without matching a parameter")
+    | IUnreachableBranch c =>
+        finding_at "OURO-CFG004" d
+          (drive_cat "arm repeats constructor " (env_name e c))
+    end;
+
+def df_finding (e : DriveEnv) (d : DefInfo) (i : DfIssue) : Finding :=
+    match i with
+    | IUnusedParam n =>
+        finding_at "OURO-DF001" d
+          (drive_cat3 "parameter " (env_name e n) " is never read")
+    | IDeadStore n =>
+        finding_at "OURO-DF002" d (drive_cat3 "let " (env_name e n) " is never used")
+    | IAlias n =>
+        finding_at "OURO-DF003" d (drive_cat3 "let " (env_name e n) " aliases a name")
+    | IHoleFlow n =>
+        finding_at "OURO-DF004" d (hole_witness e n " in a value position")
+    end;
+
+def sem_finding (d : DefInfo) (i : SemIssue) : Finding :=
+    match i with
+    | IMagicNat n =>
+        finding_at "OURO-SEM001" d (drive_cat "literal " (drive_nat n))
+    | IComplexScrut _ =>
+        finding_at "OURO-SEM002" d "scrutinee nests a match, let, fix, handle, or do"
+    | ILambdaNest depth =>
+        finding_at "OURO-SEM003" d
+          (drive_cat3 "lambda nesting depth " (drive_nat depth)
+            (drive_cat " exceeds " (drive_nat sem_lambda_limit)))
+    | IPartialEq _ =>
+        finding_at "OURO-SEM004" d "one-arm match returns a Bool constructor"
+    | IOddIdentity n =>
+        finding_at "OURO-SEM005" d
+          (drive_cat (drive_nat n) " parameters are never mentioned by the body")
+    end;
+
+def prop_finding (e : DriveEnv) (d : DefInfo) (i : PropIssue) : Finding :=
+    match i with
+    | INoHoles n =>
+        finding_at "OURO-PROP001" d (hole_witness e n " under @property no-holes")
+    | IExhaustiveEmpty _ =>
+        finding_at "OURO-PROP002" d "match with no arms under @property exhaustive"
+    | IExhaustiveMissing c =>
+        finding_at "OURO-PROP003" d
+          (drive_cat "missing constructor " (env_name e c))
+    | IAlwaysTerminates r =>
+        finding_at "OURO-PROP004" d
+          (drive_cat3 "fix " (env_name e r) " recurses without a structural guard")
+    end;
+
+def abs_finding (e : DriveEnv) (d : DefInfo) (i : AbsIssue) : Finding :=
+    match i with
+    | IDivZero h =>
+        finding_at "OURO-ABS001" d
+          (drive_cat3 "divisor passed to " (env_name e h) " is definitely zero")
+    | IEmptyList c =>
+        finding_at "OURO-ABS002" d
+          (drive_cat3 "arm " (env_name e c) " cannot fire: scrutinee is definitely zero")
+    | IAssertPos n =>
+        finding_at "OURO-ABS003" d
+          (drive_cat3 "body of " (env_name e n) " is definitely zero")
+    end;
+
+def sym_finding (e : DriveEnv) (d : DefInfo) (i : SymIssue) : Finding :=
+    match i with
+    | IContradiction v =>
+        finding_at "OURO-SYM001" d
+          (drive_cat3 "no arm can fire for " (env_name e v) " under the path condition")
+    | IUnsatArm c =>
+        finding_at "OURO-SYM002" d
+          (drive_cat3 "arm " (env_name e c) " contradicts the path condition")
+    | INonterm r =>
+        finding_at "OURO-SYM003" d
+          (drive_cat3 "fix " (env_name e r) " calls itself with every parameter unchanged")
+    end;
+
+def taint_finding (e : DriveEnv) (d : DefInfo) (i : TaintIssue) : Finding :=
+    match i with
+    | ITaintToSink k =>
+        finding_at "OURO-TAINT001" d
+          (drive_cat "tainted value reaches sink " (env_name e k))
+    | ITaintHoleSink k =>
+        finding_at "OURO-TAINT002" d (drive_cat "hole passed to sink " (env_name e k))
+    | ITaintSecretInPublic x =>
+        finding_at "OURO-TAINT003" d
+          (drive_cat3 "secret " (env_name e x) " mentioned by a public definition")
+    end;
+
+-- `@tag text` as written on the annotation at `line`; the line alone when
+-- no annotation matches.
+def anno_at (line : Nat) (annos : List CtrAnno) : String :=
+    match find CtrAnno (fun (a : CtrAnno) => eq_nat (ctr_anno_line a) line) annos with
+    | Nothing => drive_cat "line " (drive_nat line)
+    | Just a =>
+        drive_cat3 "@" (ctr_anno_name a)
+          (match prim_string_length (ctr_anno_text a) with
+           | Z => drive_cat " at line " (drive_nat line)
+           | S _ =>
+               drive_cat3 " " (ctr_anno_text a) (drive_cat " at line " (drive_nat line))
+           end)
+    end;
+
+def ctr_finding (e : DriveEnv) (d : DefInfo) (i : CtrIssue) : Finding :=
+    let annos : List CtrAnno := info_annos d in
+    match i with
+    | IOrphan l => finding_at "OURO-CTR001" d (anno_at l annos)
+    | IRequiresEmpty l => finding_at "OURO-CTR002" d (anno_at l annos)
+    | IPureButPerform op =>
+        finding_at "OURO-CTR003" d (drive_cat "@pure but performs " (env_name e op))
+    | IMissingOnPublic _ =>
+        finding_at "OURO-CTR004" d "public definition without @requires or @ensures"
+    | IDuplicateTag l => finding_at "OURO-CTR005" d (anno_at l annos)
+    | IUnknownTag l => finding_at "OURO-CTR006" d (anno_at l annos)
+    | IEnsuresEmpty l => finding_at "OURO-CTR007" d (anno_at l annos)
+    | IModifiesEmpty l => finding_at "OURO-CTR008" d (anno_at l annos)
+    end;
+
+-- Contract annotations in comment blocks no definition follows are anchored
+-- to their own line with no definition name.
+def orphan_finding (annos : List CtrAnno) (i : CtrIssue) : List Finding :=
+    match i with
+    | IOrphan l => [MkFinding "OURO-CTR001" l "" (anno_at l annos)]
+    | IUnknownTag l => [MkFinding "OURO-CTR006" l "" (anno_at l annos)]
+    | IRequiresEmpty _ => Nil Finding
+    | IPureButPerform _ => Nil Finding
+    | IMissingOnPublic _ => Nil Finding
+    | IDuplicateTag _ => Nil Finding
+    | IEnsuresEmpty _ => Nil Finding
+    | IModifiesEmpty _ => Nil Finding
+    end;
+
+def min_finding (e : DriveEnv) (d : DefInfo) (i : MinIssue) : Finding :=
+    match i with
+    | IMinHole n => finding_at "OURO-MIN001" d (hole_witness e n " can be filled")
+    | IMinAlias n =>
+        finding_at "OURO-MIN001" d
+          (drive_cat3 "let " (env_name e n) " aliases a variable or literal")
+    | IMinTrivialMatch c =>
+        finding_at "OURO-MIN001" d
+          (drive_cat3 "single arm " (env_name e c) " binds nothing")
+    | IMinConstantScrutinee c =>
+        finding_at "OURO-MIN001" d
+          (match c with
+           | Z => "match scrutinee is a literal"
+           | S _ => drive_cat3 "match scrutinee is constructor " (env_name e c) " applied"
+           end)
+    end;
+
+-- Implicit cyclomatic/cognitive limits do not match Ouro's wide matches.
+-- `@complexity` opts a definition into the default limits.
+def cx_findings (d : DefInfo) : List Finding :=
+    match has_anno "complexity" (info_annos d) with
+    | False => Nil Finding
+    | True =>
+        let m : CxMetrics := complexity_metrics (info_ast d) in
+        let cyclo : List Finding :=
+          match ltb_nat cx_cyclomatic_limit (cx_cyclomatic m) with
+          | True =>
+              [finding_at "OURO-CX001" d
+                (drive_cat3 "cyclomatic " (drive_nat (cx_cyclomatic m))
+                  (drive_cat " exceeds " (drive_nat cx_cyclomatic_limit)))]
+          | False => Nil Finding
+          end in
+        match ltb_nat cx_cognitive_limit (cx_cognitive m) with
+        | True =>
+            Cons Finding
+              (finding_at "OURO-CX002" d
+                (drive_cat3 "cognitive " (drive_nat (cx_cognitive m))
+                  (drive_cat " exceeds " (drive_nat cx_cognitive_limit))))
+              cyclo
+        | False => cyclo
+        end
+    end;
+
+def bound_finding (m : BndMetrics) (d : DefInfo) (a : CtrAnno) : List Finding :=
+    match bnd_parse_claim (ctr_anno_text a) with
+    | Nothing =>
+        [finding_at "OURO-BND001" d
+          (drive_cat3 "malformed @bound(" (ctr_anno_text a) ")")]
+    | Just c =>
+        match bnd_claim_holds m c with
+        | True => Nil Finding
+        | False =>
+            match bnd_metric m (bnd_claim_metric c) with
+            | Nothing =>
+                [finding_at "OURO-BND001" d
+                  (drive_cat3 "unknown metric in @bound(" (ctr_anno_text a) ")")]
+            | Just value =>
+                [finding_at "OURO-BND001" d
+                  (drive_cat3 (bnd_claim_metric c) " = "
+                    (drive_cat3 (drive_nat value) " violates @bound("
+                      (drive_cat (ctr_anno_text a) ")")))]
+            end
+        end
+    end;
+
+def bnd_findings (d : DefInfo) : List Finding :=
+    match annos_named "bound" (info_annos d) with
+    | Nil => Nil Finding
+    | Cons _ _ =>
+        let m : BndMetrics := bounds_metrics (info_ast d) in
+        concat_map CtrAnno Finding (bound_finding m d) (annos_named "bound" (info_annos d))
+    end;
+
+def min_findings (e : DriveEnv) (d : DefInfo) : List Finding :=
+    match has_anno "minimal" (info_annos d) with
+    | False => Nil Finding
+    | True =>
+        map MinIssue Finding (min_finding e d)
+          (minimal_issues (env_ctor_like e) (info_ast d))
+    end;
+
+def metrics_findings (e : DriveEnv) (d : DefInfo) : List Finding :=
+    append Finding (cx_findings d)
+      (append Finding (bnd_findings d) (min_findings e d));
+
+def prop_wants_of (e : DriveEnv) (d : DefInfo) : PropWants :=
+    MkPropWants (property_wants e d "no-holes") (property_wants e d "exhaustive")
+      (property_wants e d "terminates");
+
+-- An @ensures clause that promises a positive or non-empty result.
+def asserts_positive (d : DefInfo) : Bool :=
+    any CtrAnno
+      (fun (a : CtrAnno) =>
+        andb (anno_named "ensures" a)
+          (orb (prim_string_contains (ctr_anno_text a) "positive")
+            (orb (prim_string_contains (ctr_anno_text a) "nonzero")
+              (prim_string_contains (ctr_anno_text a) "non-empty"))))
+      (info_annos d);
+
+def abs_ids_of (e : DriveEnv) : AbsIds :=
+    let st : InternState := env_intern e in
+    MkAbsIds (unit_ids_of st abs_zero_names) (unit_ids_of st abs_pos_names)
+      (unit_ids_of st abs_div_names);
+
+def taint_ids_of (e : DriveEnv) : TaintIds :=
+    let st : InternState := env_intern e in
+    let m : UnitMarks := env_marks e in
+    MkTaintIds (append Nat (marks_sources m) (unit_ids_of st taint_source_prims))
+      (append Nat (marks_sinks m) (unit_ids_of st taint_sink_prims))
+      (marks_secrets m);
+
+-- Effect operations declared in the unit plus the effectful primitives.
+def effect_ops_of (e : DriveEnv) : List Nat :=
+    let st : InternState := env_intern e in
+    append Nat (marks_effect_ops (env_marks e))
+      (append Nat (unit_ids_of st taint_sink_prims) (unit_ids_of st taint_source_prims));
+
+def bool_ids_of (e : DriveEnv) : List Nat :=
+    unit_ids_of (env_intern e) (["True", "False"] : List String);
+
+def effects_findings (e : DriveEnv) (d : DefInfo) : List Finding :=
+    map EffIssue Finding (eff_finding e d)
+      (analyze_effects (info_ast d) (def_is_pure d) (env_cap e) (env_layer e));
+
+def capability_findings (e : DriveEnv) (d : DefInfo) : List Finding :=
+    map CapIssue Finding (cap_finding e d)
+      (analyze_capability (info_ast d) (env_layer e) (env_cap e));
+
+def extract_findings (e : DriveEnv) (d : DefInfo) : List Finding :=
+    map XtrIssue Finding (xtr_finding e d)
+      (analyze_extract_leak (info_ast d) (env_layer e) (env_cap e));
+
+def match_findings (e : DriveEnv) (d : DefInfo) : List Finding :=
+    map MatchIssue Finding (match_finding e d)
+      (analyze_match_ast (env_ctors e) (env_ctor_like e) (info_ast d));
+
+def cfg_findings (e : DriveEnv) (d : DefInfo) : List Finding :=
+    map CfgIssue Finding (cfg_finding e d)
+      (analyze_cfg (env_ctor_like e) (types_dependent (env_types e))
+        (types_uninhabited (env_types e)) (info_ast d));
+
+def dataflow_findings (e : DriveEnv) (d : DefInfo) : List Finding :=
+    map DfIssue Finding (df_finding e d) (analyze_dataflow (env_discards e) (info_ast d));
+
+-- Parser combinators nest lambdas by construction. Lambda nesting is a
+-- smell only when the definition asked for a complexity review.
+def sem_keep (d : DefInfo) (i : SemIssue) : Bool :=
+    match i with
+    | ILambdaNest _ => has_anno "complexity" (info_annos d)
+    | IMagicNat _ => True
+    | IComplexScrut _ => True
+    | IPartialEq _ => True
+    | IOddIdentity _ => True
+    end;
+
+def semantic_findings (e : DriveEnv) (d : DefInfo) : List Finding :=
+    map SemIssue Finding (sem_finding d)
+      (filter SemIssue (sem_keep d)
+        (analyze_semantic sem_magic_threshold sem_lambda_limit
+          (unit_id_of (env_intern e) "S") (bool_ids_of e) (env_discards e)
+          (info_ast d)));
+
+def property_findings (e : DriveEnv) (d : DefInfo) : List Finding :=
+    map PropIssue Finding (prop_finding e d)
+      (analyze_property (prop_wants_of e d) (env_ctors e) (info_ast d));
+
+def absint_findings (e : DriveEnv) (d : DefInfo) : List Finding :=
+    map AbsIssue Finding (abs_finding e d)
+      (analyze_absint (abs_ids_of e) (asserts_positive d) (info_id d) (info_ast d));
+
+def symexec_findings (e : DriveEnv) (d : DefInfo) : List Finding :=
+    map SymIssue Finding (sym_finding e d)
+      (analyze_symexec (env_ctor_like e) sym_fuel (info_ast d));
+
+def taint_findings (e : DriveEnv) (d : DefInfo) : List Finding :=
+    map TaintIssue Finding (taint_finding e d)
+      (analyze_taint (taint_ids_of e) (info_public d) (info_ast d));
+
+def contracts_findings (e : DriveEnv) (d : DefInfo) : List Finding :=
+    map CtrIssue Finding (ctr_finding e d)
+      (analyze_contracts (effect_ops_of e) (property_wants e d "contracts")
+        (info_public d) (info_annos d) (info_ast d));
+
+-- Trust facts of one definition for trust.ouro: the effect operations and
+-- effectful primitives it performs or mentions, the trusted checking entries
+-- it reaches, and the taint sources it reads. The compiler layer is the
+-- kernel's caller, so reaching a checking entry from it is not a fact.
+def trust_mentions (ids : List Nat) (a : Ast) : List Nat :=
+    nub Nat eq_nat (filter Nat (fun (id : Nat) => mem Nat eq_nat id ids) (taint_vars a));
+
+def trust_effects_of (e : DriveEnv) (a : Ast) : List Nat :=
+    nub Nat eq_nat (append Nat (performs_in a) (trust_mentions (effect_ops_of e) a));
+
+def trust_reaches_kernel (e : DriveEnv) (a : Ast) : List Nat :=
+    match env_layer e with
+    | LyCompiler => Nil Nat
+    | LyKernel => Nil Nat
+    | LyStd => trust_mentions (cap_kern (env_cap e)) a
+    | LyStdIo => trust_mentions (cap_kern (env_cap e)) a
+    | LyStdHttp => trust_mentions (cap_kern (env_cap e)) a
+    | LyStdWord => trust_mentions (cap_kern (env_cap e)) a
+    | LyAnalyze => trust_mentions (cap_kern (env_cap e)) a
+    | LyTools => trust_mentions (cap_kern (env_cap e)) a
+    | LySamples => trust_mentions (cap_kern (env_cap e)) a
+    | LyOther => trust_mentions (cap_kern (env_cap e)) a
+    end;
+
+-- `@trust-reviewed REASON` on the definition records a reviewed allowance.
+def trust_fact (e : DriveEnv) (d : DefInfo) : TrustDef :=
+    MkTrustDef (info_line d) (env_trusted e)
+      (trust_effects_of e (info_ast d))
+      (trust_reaches_kernel e (info_ast d))
+      (trust_mentions (taint_sources (taint_ids_of e)) (info_ast d))
+      (has_anno "trust-reviewed" (info_annos d));
+
+def trust_finding (e : DriveEnv) (d : DefInfo) (i : TrustIssue) : List Finding :=
+    match i with
+    | ITrustEffectBoundary _ op =>
+        [finding_at "OURO-TRUST002" d
+          (drive_cat3 "trusted definition performs " (env_name e op)
+            " without a reviewed allowance")]
+    | ITrustPrimitiveReach _ prim =>
+        [finding_at "OURO-TRUST003" d
+          (from_layer e prim " reached from untrusted layer ")]
+    | ITrustTaintedProofPath _ src =>
+        [finding_at "OURO-TRUST004" d
+          (drive_cat3 "trusted definition reads taint source " (env_name e src)
+            " without a reviewed allowance")]
+    | ITrustInfluencesKernel _ => Nil Finding
+    | ITrustPolicyViolation _ => Nil Finding
+    end;
+
+def trust_findings (e : DriveEnv) (d : DefInfo) : List Finding :=
+    concat_map TrustIssue Finding (trust_finding e d)
+      (analyze_trust (Nil TrustEdge) ([trust_fact e d] : List TrustDef));
+
+def runner (fam : String) (run : DriveEnv -> DefInfo -> List Finding)
+    : Pair String (DriveEnv -> DefInfo -> List Finding) :=
+    MkPair String (DriveEnv -> DefInfo -> List Finding) fam run;
+
+-- Every per-definition family; duplication and orphan contracts are unit-wide.
+def family_runners : List (Pair String (DriveEnv -> DefInfo -> List Finding)) :=
+  [ runner fam_effects effects_findings
+  , runner fam_capability capability_findings
+  , runner fam_extract extract_findings
+  , runner fam_match match_findings
+  , runner fam_cfg cfg_findings
+  , runner fam_dataflow dataflow_findings
+  , runner fam_semantic semantic_findings
+  , runner fam_property property_findings
+  , runner fam_absint absint_findings
+  , runner fam_symexec symexec_findings
+  , runner fam_taint taint_findings
+  , runner fam_contracts contracts_findings
+  , runner fam_metrics metrics_findings
+  , runner fam_trust trust_findings
+  , runner fam_simplify simplify_findings
+  , runner fam_perf perf_findings
+  , runner fam_naming naming_findings
+  , runner fam_errors errors_findings
+  ];
+
+-- The enabled runners applied to the unit once: a family that resolves its
+-- interned ids or other per-unit facts before the definition is supplied pays
+-- for them once, not once per definition.
+def unit_runners (fams : List String) (e : DriveEnv) : List (DefInfo -> List Finding) :=
+    map (Pair String (DriveEnv -> DefInfo -> List Finding)) (DefInfo -> List Finding)
+      (fun (r : Pair String (DriveEnv -> DefInfo -> List Finding)) =>
+        match r with | MkPair _ run => run e end)
+      (filter (Pair String (DriveEnv -> DefInfo -> List Finding))
+        (fun (r : Pair String (DriveEnv -> DefInfo -> List Finding)) =>
+          match r with | MkPair fam _ => fam_on fams fam end)
+        family_runners);
+
+def def_findings (runs : List (DefInfo -> List Finding)) (e : DriveEnv) (d : UnitDef)
+    : List Finding :=
+    let info : DefInfo := def_info e d in
+    concat_map (DefInfo -> List Finding) Finding
+      (fun (run : DefInfo -> List Finding) => run info) runs;
+
+def dup_finding (e : DriveEnv) (i : DupIssue) : Finding :=
+    match i with
+    | ICloneExact line earlier later =>
+        MkFinding "OURO-DUP001" line (env_name e later)
+          (drive_cat "exact clone of " (env_name e earlier))
+    | ICloneNear line earlier later =>
+        MkFinding "OURO-DUP002" line (env_name e later)
+          (drive_cat "near clone of " (env_name e earlier))
+    end;
+
+-- Evaluation is strict, so a disabled unit-wide family must be skipped by
+-- the match, not handed a computed result to drop.
+def dup_findings (fams : List String) (e : DriveEnv) (defs : List UnitDef)
+    : List Finding :=
+    match fam_on fams fam_duplication with
+    | False => Nil Finding
+    | True =>
+        map DupIssue Finding (dup_finding e)
+          (analyze_duplication dup_min_nodes
+            (map UnitDef DefAst
+              (fun (d : UnitDef) =>
+                MkDefAst (unit_def_name d) (unit_def_line d) (unit_def_ast d))
+              defs))
+    end;
+
+def orphan_findings (fams : List String) (e : DriveEnv) : List Finding :=
+    match fam_on fams fam_contracts with
+    | False => Nil Finding
+    | True =>
+        concat_map CtrIssue Finding (orphan_finding (env_file_annos e))
+          (ctr_orphan_issues (env_file_annos e))
+    end;
+
+-- The kernel layer is trusted. Fixture trust annotations use the same
+-- policy parser as the base runner; analyzer implementation is not TCB.
+def trusted_note (note : Pair Nat String) : Bool :=
+    match note with
+    | MkPair _ text =>
+        andb (prim_string_contains text "ouro-analyze:")
+          (prim_string_contains text "trusted=true")
+    end;
+
+def trusted_marks (marks : UnitMarks) (defs : List UnitDef) : Bool :=
+    orb (any (Pair Nat String) trusted_note (marks_loose marks))
+      (any UnitDef
+        (fun (d : UnitDef) => any (Pair Nat String) trusted_note (unit_def_notes d))
+        defs);
+
+def unit_trusted (ly : Layer) (marks : UnitMarks) (defs : List UnitDef) : Bool :=
+    match ly with
+    | LyKernel => True
+    | LyStd => trusted_marks marks defs
+    | LyStdIo => trusted_marks marks defs
+    | LyStdHttp => trusted_marks marks defs
+    | LyStdWord => trusted_marks marks defs
+    | LyCompiler => trusted_marks marks defs
+    | LyAnalyze => trusted_marks marks defs
+    | LyTools => trusted_marks marks defs
+    | LySamples => trusted_marks marks defs
+    | LyOther => trusted_marks marks defs
+    end;
+
+def drive_env (path : String) (src : String) (st : InternState) (ids : CapIds)
+    (types : UnitTypes) (marks : UnitMarks) (defs : List UnitDef)
+    : DriveEnv :=
+    let ly : Layer := layer_override src (layer_of_path path) in
+    MkDriveEnv st ids types (unit_ctor_like_ids st) (unit_discard_ids st) marks
+      ly (ctr_parse_annos (marks_loose marks)) (unit_trusted ly marks defs);
+
+def drive_findings (fams : List String) (path : String) (src : String)
+    : DriveResult :=
+    match unit_of_source src with
+    | UnitRejected why => DriveRejected why
+    | MkAnalysisUnit st ids types marks defs =>
+        let e : DriveEnv := drive_env path src st ids types marks defs in
+        let runs : List (DefInfo -> List Finding) := unit_runners fams e in
+        DriveFindings
+          (sort_findings
+            (dedupe_findings
+              (append Finding
+                (concat_map UnitDef Finding (def_findings runs e) defs)
+                (append Finding (dup_findings fams e defs)
+                  (append Finding (orphan_findings fams e) (ctor_name_findings fams e))))))
+    end;
+
+def drive_source (path : String) (src : String) : DriveResult :=
+    drive_findings all_families path src;

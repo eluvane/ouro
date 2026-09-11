@@ -1,0 +1,227 @@
+-- The first native Core subset keeps checked source metadata beside the MIR.
+-- Runtime values are suspended actions; a local binding never executes one.
+import "../checked_program.ouro";
+import "../primitive_registry.ouro";
+import "codegen.ouro";
+
+inductive NativeLowerError : Type :=
+  | LowerResourceExhausted : NativeLowerError
+  | LowerDeclarationFailure : Nat -> CheckPhase -> CheckFailure -> NativeLowerError
+  | LowerMetadataMismatch : Nat -> NativeLowerError
+  | LowerBodyMismatch : Nat -> NativeLowerError
+  | LowerUnsupportedType : CoreTerm -> NativeLowerError
+  | LowerUnsupportedTerm : Nat -> NativeLowerError
+  | LowerUnsupportedPrimitive : PrimitiveId -> NativeLowerError
+  | LowerUnknownGlobal : Nat -> NativeLowerError
+  | LowerUnboundLocal : Nat -> NativeLowerError
+  | LowerInvalidCall : Nat -> NativeLowerError
+  | LowerEffectMismatch : NativeLowerError
+  | LowerInvalidEntry : Nat -> NativeLowerError
+  | LowerMirFailure : MirError -> NativeLowerError
+  | LowerBackendFailure : NativeCodegenError -> NativeLowerError;
+
+-- Canonical Core type, optional scalar representation, and action flag.
+-- Nothing is allowed only for the explicitly registered Unit result.
+inductive LowerType : Type :=
+  | LowerTypeOf : CoreTerm -> Maybe MirType -> Bool -> LowerType;
+
+inductive LowerContract : Type :=
+  | LowerContractOf : Nat -> CoreTerm -> List LowerType -> LowerType
+      -> Maybe PrimitiveBinding -> LowerContract;
+
+inductive NativeLoweredProgram : Type :=
+  | NativeLoweredOf : CheckedProgram -> List LowerContract -> MirProgram -> NativeLoweredProgram;
+
+-- Compile-time Nat uses exact bytes and an overflow flag; it is never a MIR
+-- word or an unchecked Nat-to-word conversion.
+inductive LowerNatValue : Type :=
+  | LowerNatBits : X64Word64 -> Bool -> LowerNatValue;
+
+inductive LowerBinding : Type :=
+  | LowerScalarBinding : LowerType -> Maybe MirValue -> LowerBinding
+  | LowerActionBinding : LowerType -> CoreTerm -> List LowerBinding -> LowerBinding
+  | LowerNatBinding : CoreTerm -> LowerNatValue -> LowerBinding
+  | LowerMaybeBinding : CoreTerm -> LowerType -> Maybe MirValue -> LowerBinding;
+
+-- Current block, next unused block ID, and finished blocks in reverse order.
+inductive LowerFlow : Type :=
+  | LowerFlowOf : Nat -> Nat -> List MirBlock -> LowerFlow;
+
+-- Locals and instructions are accumulated in reverse order.
+inductive LowerState : Type :=
+  | LowerStateOf : Nat -> List MirLocal -> List MirInstruction -> LowerFlow -> LowerState;
+
+inductive LowerResult : Type :=
+  | LowerResultOf : LowerType -> Maybe MirValue -> LowerState -> LowerResult;
+
+def lower_bind (A : Type) (B : Type) (value : Either NativeLowerError A)
+    (next : A -> Either NativeLowerError B) : Either NativeLowerError B :=
+    match value with | Left err => Left NativeLowerError B err | Right item => next item end;
+
+def lower_map (A : Type) (B : Type) (convert : A -> B) (value : Either NativeLowerError A)
+    : Either NativeLowerError B :=
+    lower_bind A B value (fun (item : A) => Right NativeLowerError B (convert item));
+
+def lower_require (condition : Bool) (err : NativeLowerError) : Either NativeLowerError Unit :=
+    match condition with | True => Right NativeLowerError Unit MkUnit | False => Left NativeLowerError Unit err end;
+
+def lower_type_core (ty : LowerType) : CoreTerm := match ty with | LowerTypeOf core _ _ => core end;
+def lower_type_mir (ty : LowerType) : Maybe MirType := match ty with | LowerTypeOf _ mir _ => mir end;
+def lower_type_action (ty : LowerType) : Bool := match ty with | LowerTypeOf _ _ action => action end;
+def lower_contract_id (contract : LowerContract) : Nat :=
+    match contract with | LowerContractOf id _ _ _ _ => id end;
+
+def lower_word (word : PrimitiveWord) : MirType :=
+    match word with | PrimitiveWordU8 => MirU8 | PrimitiveWordU32 => MirU32
+    | PrimitiveWordU64 => MirU64 | PrimitiveWordI32 => MirI32 | PrimitiveWordUSize => MirUSize end;
+
+def lower_find_contract (id : Nat) : List LowerContract -> Maybe LowerContract :=
+  fix find (contracts : List LowerContract) : Maybe LowerContract :=
+    match contracts with | Nil => Nothing LowerContract | Cons contract rest =>
+      match eqNat id (lower_contract_id contract) with
+      | True => Just LowerContract contract | False => find rest end end;
+
+def lower_find_entry (id : Nat) : List Entry -> Maybe Entry :=
+  fix find (entries : List Entry) : Maybe Entry :=
+    match entries with | Nil => Nothing Entry | Cons entry rest =>
+      match entry with
+      | MkEntry name _ _ => match eqNat id name with | True => Just Entry entry | False => find rest end
+      | MkBoundEntry name _ _ => match eqNat id name with | True => Just Entry entry | False => find rest end
+      | MkIndEntry name _ => match eqNat id name with | True => Just Entry entry | False => find rest end
+      | MkRoleEntry _ => find rest end end;
+
+def lower_emit (instruction : MirInstruction) (state : LowerState) : LowerState :=
+    match state with | LowerStateOf next locals instructions flow =>
+      LowerStateOf next locals (Cons MirInstruction instruction instructions) flow end;
+
+def lower_empty_state (next_local : Nat) : LowerState :=
+    LowerStateOf next_local ([] : List MirLocal) ([] : List MirInstruction) (LowerFlowOf 0 1 ([] : List MirBlock));
+
+def lower_switch_block (target : Nat) (terminator : MirTerminator) (state : LowerState) : LowerState :=
+    match state with | LowerStateOf next locals instructions flow => match flow with | LowerFlowOf current label blocks =>
+      LowerStateOf next locals ([] : List MirInstruction)
+        (LowerFlowOf target label (Cons MirBlock (MirBlockDef current (reverse MirInstruction instructions) terminator) blocks)) end end;
+
+def lower_finish_blocks (terminator : MirTerminator) (state : LowerState) : List MirBlock :=
+    match state with | LowerStateOf _ _ instructions flow => match flow with | LowerFlowOf current _ blocks =>
+      reverse MirBlock (Cons MirBlock (MirBlockDef current (reverse MirInstruction instructions) terminator) blocks) end end;
+
+def lower_allocate (ty : LowerType) (state : LowerState)
+    : Either NativeLowerError (Pair Nat LowerState) :=
+    match lower_type_mir ty with
+    | Nothing => Left NativeLowerError (Pair Nat LowerState) (LowerUnsupportedType (lower_type_core ty))
+    | Just mir => match state with | LowerStateOf next locals instructions flow =>
+      match ltb_nat next pe_max_rva with
+      | False => Left NativeLowerError (Pair Nat LowerState) LowerResourceExhausted
+      | True => Right NativeLowerError (Pair Nat LowerState)
+          (MkPair Nat LowerState next (LowerStateOf (S next) (Cons MirLocal (MirLocalDef next mir) locals) instructions flow)) end end end;
+
+def lower_fresh_result (ty : LowerType) (instruction : Nat -> MirInstruction) (state : LowerState)
+    : Either NativeLowerError LowerResult :=
+    lower_map (Pair Nat LowerState) LowerResult
+      (fun (allocated : Pair Nat LowerState) => match allocated with | MkPair id next =>
+        LowerResultOf ty (Just MirValue (MirUse id)) (lower_emit (instruction id) next) end)
+      (lower_allocate ty state);
+
+def lower_zero : X64Word64 := X64Words64 (X64Bytes32 0 0 0 0) (X64Bytes32 0 0 0 0);
+
+def lower_failure_resource (failure : CheckFailure) : Bool :=
+    match failure with
+    | CheckResourceLimit => True | CheckTypeFailure _ => False
+    | CheckMalformedCore _ => False | CheckReductionFailure _ => False
+    | CheckUnsupported _ => False | CheckCancelled => False
+    | CheckInternalFailure _ => False | CheckPrimitiveFailure _ => False end;
+
+def lower_gc_code (gc : PrimitiveGc) : Nat :=
+    match gc with | PrimitiveNoGc => 0 | PrimitiveMayGc => 1 end;
+
+def lower_execution_code (execution : PrimitiveExecution) : Nat :=
+    match execution with | PrimitiveTypeOnly => 0 | PrimitivePureValue => 1 | PrimitiveRuntimeAction => 2 end;
+
+def lower_entry_id (entry : Entry) : Nat :=
+    match entry with | MkEntry id _ _ => id | MkIndEntry id _ => id | MkBoundEntry id _ _ => id
+    | MkRoleEntry role => match role with | PrimitiveRoleOf _ shape => match shape with
+      | PrimitiveInductiveOf id _ _ _ _ => id end end end;
+
+def lower_entry_tag (entry : Entry) : Nat :=
+    match entry with | MkEntry _ _ _ => 0 | MkIndEntry _ _ => 1 | MkBoundEntry _ _ _ => 2 | MkRoleEntry _ => 3 end;
+
+def lower_entry_primitive (entry : Entry) : Maybe PrimitiveBinding :=
+    match entry with | MkBoundEntry _ _ binding => Just PrimitiveBinding binding
+    | MkEntry _ _ _ => Nothing PrimitiveBinding | MkIndEntry _ _ => Nothing PrimitiveBinding | MkRoleEntry _ => Nothing PrimitiveBinding end;
+
+def lower_entry_role (entry : Entry) : Maybe PrimitiveRoleBinding :=
+    match entry with | MkRoleEntry role => Just PrimitiveRoleBinding role
+    | MkEntry _ _ _ => Nothing PrimitiveRoleBinding | MkIndEntry _ _ => Nothing PrimitiveRoleBinding
+    | MkBoundEntry _ _ _ => Nothing PrimitiveRoleBinding end;
+
+-- These small views keep the bootstrap dialect's exhaustive pattern matches
+-- explicit without weakening unsupported-form errors in the lowerer.
+inductive LowerTermView : Type :=
+  | LowerLocalTerm : Nat -> LowerTermView
+  | LowerLambdaTerm : CoreTerm -> CoreTerm -> LowerTermView
+  | LowerApplyTerm : CoreTerm -> CoreTerm -> LowerTermView
+  | LowerLetTerm : CoreTerm -> CoreTerm -> CoreTerm -> LowerTermView
+  | LowerGlobalTerm : Nat -> LowerTermView
+  | LowerConstructorTerm : Nat -> Nat -> Nat -> LowerTermView
+  | LowerCaseTerm : CaseInfo -> CoreTerm -> CoreTerm -> List CoreTerm -> LowerTermView
+  | LowerOtherTerm : Nat -> LowerTermView;
+
+def lower_term_view (term : CoreTerm) : LowerTermView :=
+    match term with
+    | CRel id => LowerLocalTerm id | CLam typ body => LowerLambdaTerm typ body
+    | CApp head arg => LowerApplyTerm head arg | CLetIn value typ body => LowerLetTerm typ value body
+    | CConst id => LowerGlobalTerm id | CConstruct ind index params => LowerConstructorTerm ind index params
+    | CSort _ => LowerOtherTerm 1 | CPi _ _ => LowerOtherTerm 2 | CInd _ => LowerOtherTerm 7
+    | CCase info motive scrutinee branches => LowerCaseTerm info motive scrutinee branches
+    | CFix _ _ _ _ _ => LowerOtherTerm 10
+    | CStrLit _ _ => LowerOtherTerm 11 | CStrBytes _ _ => LowerOtherTerm 12 end;
+
+inductive LowerPrimitiveView : Type :=
+  | LowerWordPrimitive : PrimitiveWord -> PrimitiveWordOp -> LowerPrimitiveView
+  | LowerConversionPrimitive : PrimitiveWord -> PrimitiveWord -> PrimitiveConversion -> LowerPrimitiveView
+  | LowerPurePrimitive : LowerPrimitiveView | LowerBindPrimitive : LowerPrimitiveView | LowerLoopPrimitive : LowerPrimitiveView
+  | LowerNullPrimitive : LowerPrimitiveView | LowerLoadPrimitive : LowerPrimitiveView
+  | LowerStorePrimitive : LowerPrimitiveView | LowerPointerAddPrimitive : LowerPrimitiveView
+  | LowerPointerCastPrimitive : LowerPrimitiveView | LowerPointerToBitsPrimitive : LowerPrimitiveView
+  | LowerPointerFromBitsPrimitive : LowerPrimitiveView | LowerOtherPrimitive : LowerPrimitiveView;
+
+def lower_primitive_view (id : PrimitiveId) : LowerPrimitiveView :=
+    match id with
+    | PrimitiveWordOperation word operation => LowerWordPrimitive word operation
+    | PrimitiveWordConversion from into operation => LowerConversionPrimitive from into operation
+    | PrimitiveRuntimePure => LowerPurePrimitive | PrimitiveRuntimeBind => LowerBindPrimitive | PrimitiveRuntimeLoop => LowerLoopPrimitive
+    | PrimitiveRawNull => LowerNullPrimitive
+    | PrimitiveRawLoad => LowerLoadPrimitive | PrimitiveRawStore => LowerStorePrimitive
+    | PrimitiveRawAddWrap => LowerPointerAddPrimitive | PrimitiveRawCast => LowerPointerCastPrimitive
+    | PrimitiveRawToBits => LowerPointerToBitsPrimitive | PrimitiveRawFromBits => LowerPointerFromBitsPrimitive
+    | PrimitiveU8Type => LowerOtherPrimitive | PrimitiveU32Type => LowerOtherPrimitive
+    | PrimitiveU64Type => LowerOtherPrimitive | PrimitiveI32Type => LowerOtherPrimitive
+    | PrimitiveUSizeType => LowerOtherPrimitive | PrimitiveRawPtrType => LowerOtherPrimitive
+    | PrimitiveRuntimeType => LowerOtherPrimitive | PrimitiveRawFnType => LowerOtherPrimitive
+    | PrimitiveStringType => LowerOtherPrimitive | PrimitiveWordFromNat _ => LowerOtherPrimitive
+    | PrimitiveWordToNat _ => LowerOtherPrimitive | PrimitiveStringOperation _ => LowerOtherPrimitive
+    | PrimitiveFnCall => LowerOtherPrimitive
+    | PrimitiveStdoutWrite => LowerOtherPrimitive
+    | PrimitiveStderrWrite => LowerOtherPrimitive
+    | PrimitiveStdoutFlush => LowerOtherPrimitive
+    | PrimitiveProcessExit => LowerOtherPrimitive
+    | PrimitiveArgv => LowerOtherPrimitive
+    | PrimitiveEnvGet => LowerOtherPrimitive
+    | PrimitiveTimeNow => LowerOtherPrimitive
+    | PrimitiveFileKind => LowerOtherPrimitive
+    | PrimitiveFileExists => LowerOtherPrimitive | PrimitiveFileIsDirectory => LowerOtherPrimitive
+    | PrimitiveDirectoryCreate => LowerOtherPrimitive | PrimitivePathRemove => LowerOtherPrimitive
+    | PrimitiveFileCopy => LowerOtherPrimitive
+    | PrimitiveFileRename => LowerOtherPrimitive
+    | PrimitiveFileRealpath => LowerOtherPrimitive
+    | PrimitiveFileTemp => LowerOtherPrimitive | PrimitiveFileTempIn => LowerOtherPrimitive
+    | PrimitiveProcessInherit => LowerOtherPrimitive
+    | PrimitiveProcessBounded => LowerOtherPrimitive
+    | PrimitiveProcessCapture => LowerOtherPrimitive | PrimitiveHttpPost => LowerOtherPrimitive
+    | PrimitiveStdinReadLine => LowerOtherPrimitive
+    | PrimitiveStdinReadBytes => LowerOtherPrimitive
+    | PrimitiveFileRead => LowerOtherPrimitive
+    | PrimitiveFileWrite => LowerOtherPrimitive
+    | PrimitiveDirectoryList => LowerOtherPrimitive
+    | PrimitiveDirectoryListable => LowerOtherPrimitive end;

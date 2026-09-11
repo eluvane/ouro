@@ -1,0 +1,114 @@
+-- Scan from the last byte and prepend each copied slice. The scan and copy
+-- loops use fixed native frames; every allocation still names live owners.
+import "managed_string_lists.ouro";
+
+def managed_string_separator (fits : MirValue) (separator : MirValue) (byte : MirValue) (state : ManagedState)
+    : Either NativeLowerError ManagedResult :=
+    lower_bind ManagedResult ManagedResult (managed_compare MirEqual byte separator state)
+      (fun (compared : ManagedResult) => match compared with | ManagedResultOf same next =>
+        managed_binary MirU8 MirAnd fits same next end);
+
+-- This inventory is exactly string_nf_whitespace: VT and FF are not spaces.
+def managed_string_whitespace (byte : MirValue) (state : ManagedState) : Either NativeLowerError ManagedResult :=
+    lower_bind ManagedResult ManagedResult (managed_compare MirEqual byte (managed_bits MirU8 9) state)
+      (fun (tab : ManagedResult) => match tab with | ManagedResultOf is_tab next =>
+        lower_bind ManagedResult ManagedResult (managed_compare MirEqual byte (managed_bits MirU8 10) next)
+          (fun (line : ManagedResult) => match line with | ManagedResultOf is_line after_line =>
+            lower_bind ManagedResult ManagedResult (managed_binary MirU8 MirOr is_tab is_line after_line)
+              (fun (first : ManagedResult) => match first with | ManagedResultOf either after_first =>
+                lower_bind ManagedResult ManagedResult (managed_compare MirEqual byte (managed_bits MirU8 13) after_first)
+                  (fun (carriage : ManagedResult) => match carriage with | ManagedResultOf is_carriage after_carriage =>
+                    lower_bind ManagedResult ManagedResult (managed_binary MirU8 MirOr either is_carriage after_carriage)
+                      (fun (second : ManagedResult) => match second with | ManagedResultOf control after_second =>
+                        lower_bind ManagedResult ManagedResult (managed_compare MirEqual byte (managed_bits MirU8 32) after_second)
+                          (fun (space : ManagedResult) => match space with | ManagedResultOf is_space after_space =>
+                            managed_binary MirU8 MirOr control is_space after_space end) end) end) end) end) end);
+
+-- The caller proves start <= end <= length, hence count <= length - start.
+-- The old list is read after slice allocation; the slice is read after Cons
+-- allocation. Liveness therefore roots both values at the corresponding GC.
+def managed_string_prepend_part (compiler : ManagedCompiler) (family : Nat) (value : MirValue)
+    (start : MirValue) (count : MirValue) (result : Nat) (state : ManagedState)
+    : Either NativeLowerError ManagedState :=
+    lower_bind ManagedResult ManagedState (managed_string_copy_slice compiler value start count state)
+      (fun (copied : ManagedResult) => match copied with | ManagedResultOf part next =>
+        lower_map ManagedResult ManagedState (fun (constructed : ManagedResult) => match constructed with
+          | ManagedResultOf node after => managed_emit (MirMove result node) after end)
+          (managed_constructor compiler family (managed_bits MirUSize 1) ([part, MirUse result] : List MirValue) next) end);
+
+def managed_string_prepend_selected (compiler : ManagedCompiler) (family : Nat) (value : MirValue)
+    (start : MirValue) (count : MirValue) (result : Nat) (empty : Bool) (state : ManagedState)
+    : Either NativeLowerError ManagedState :=
+    match empty with
+    | True => managed_string_prepend_part compiler family value start count result state
+    | False => lower_bind ManagedResult ManagedState (managed_compare MirNotEqual count (managed_bits MirUSize 0) state)
+        (fun (tested : ManagedResult) => match tested with | ManagedResultOf nonempty next =>
+          managed_nat_when nonempty (managed_string_prepend_part compiler family value start count result) next end) end;
+
+def managed_string_scan_step (compiler : ManagedCompiler) (family : Nat) (value : MirValue)
+    (delimiter : MirValue -> ManagedState -> Either NativeLowerError ManagedResult)
+    (empty : Bool) (index : Nat) (last : Nat) (result : Nat) (state : ManagedState)
+    : Either NativeLowerError ManagedState :=
+    lower_bind ManagedResult ManagedState (managed_string_load_byte value (MirUse index)
+      (managed_emit (MirBinaryOp index MirSub (MirUse index) (managed_bits MirUSize 1)) state))
+      (fun (loaded : ManagedResult) => match loaded with | ManagedResultOf byte next =>
+        lower_bind ManagedResult ManagedState (delimiter byte next)
+          (fun (tested : ManagedResult) => match tested with | ManagedResultOf matched after_test =>
+            managed_nat_when matched (fun (entered : ManagedState) =>
+              lower_bind ManagedResult ManagedState (managed_binary MirUSize MirAdd (MirUse index) (managed_bits MirUSize 1) entered)
+                (fun (begin : ManagedResult) => match begin with | ManagedResultOf start after_start =>
+                  lower_bind ManagedResult ManagedState (managed_binary MirUSize MirSub (MirUse last) start after_start)
+                    (fun (sized : ManagedResult) => match sized with | ManagedResultOf count after_count =>
+                      lower_map ManagedState ManagedState (managed_emit (MirMove last (MirUse index)))
+                        (managed_string_prepend_selected compiler family value start count result empty after_count) end) end))
+              after_test end) end);
+
+-- At each header 0 <= index <= last <= length. Decrement is dominated by
+-- index != 0, so the byte read and the following index + 1 cannot overflow.
+def managed_string_scan_parts (compiler : ManagedCompiler) (value : MirValue)
+    (delimiter : MirValue -> ManagedState -> Either NativeLowerError ManagedResult)
+    (empty : Bool) (state : ManagedState) : Either NativeLowerError ManagedResult :=
+    lower_bind Nat ManagedResult (lower_role_identity (managed_compiler_entries compiler) PrimitiveListRole)
+      (fun (family : Nat) => lower_bind ManagedResult ManagedResult (managed_string_size compiler value state)
+        (fun (loaded : ManagedResult) => match loaded with | ManagedResultOf length next =>
+          lower_bind ManagedResult ManagedResult (managed_constructor compiler family (managed_bits MirUSize 0) ([] : List MirValue) next)
+            (fun (nil : ManagedResult) => match nil with | ManagedResultOf tail after_nil =>
+              lower_bind (Pair Nat ManagedState) ManagedResult (managed_fresh_local MirUSize after_nil)
+                (fun (position : Pair Nat ManagedState) => match position with | MkPair index after_index =>
+                  lower_bind (Pair Nat ManagedState) ManagedResult (managed_fresh_local MirUSize after_index)
+                    (fun (boundary : Pair Nat ManagedState) => match boundary with | MkPair last after_last =>
+                      lower_bind (Pair Nat ManagedState) ManagedResult (managed_fresh_local MirManagedPtr after_last)
+                        (fun (list : Pair Nat ManagedState) => match list with | MkPair result after_result =>
+                          let initialized : ManagedState := managed_emit_all
+                            ([MirMove index length, MirMove last length, MirMove result tail] : List MirInstruction) after_result in
+                          lower_bind LowerLoopBlocks ManagedResult (lower_loop_blocks (managed_flow initialized))
+                            (fun (labels : LowerLoopBlocks) => match labels with | LowerLoopAt header body finish flow =>
+                              lower_bind ManagedResult ManagedResult (managed_compare MirNotEqual (MirUse index) (managed_bits MirUSize 0)
+                                (managed_with_flow initialized (lower_switch_block header (MirJump header) flow)))
+                                (fun (tested : ManagedResult) => match tested with | ManagedResultOf running after_test =>
+                                  lower_bind ManagedState ManagedResult
+                                    (managed_string_scan_step compiler family value delimiter empty index last result
+                                      (managed_switch_block body (MirBranch running body finish) after_test))
+                                    (fun (after_body : ManagedState) => lower_map ManagedState ManagedResult
+                                      (fun (finished : ManagedState) => ManagedResultOf (MirUse result) finished)
+                                      (managed_string_prepend_selected compiler family value (managed_bits MirUSize 0)
+                                        (MirUse last) result empty (managed_switch_block finish (MirJump header) after_body)))
+                                  end) end) end) end) end) end) end));
+
+def managed_string_split_body (compiler : ManagedCompiler) (value : MirValue) (separator : MirValue) (state : ManagedState)
+    : Either NativeLowerError ManagedResult :=
+    lower_bind ManagedNatWordResult ManagedResult (managed_nat_checked_word compiler PrimitiveWordU8 separator state)
+      (fun (converted : ManagedNatWordResult) => match converted with | ManagedNatWordOf fits byte next =>
+        managed_string_scan_parts compiler value (managed_string_separator fits byte) True next end);
+
+def managed_string_split_values (compiler : ManagedCompiler) (value : MirValue) (separator : MirValue) (state : ManagedState)
+    : Either NativeLowerError ManagedResult :=
+    managed_nat_helper ([111,117,114,111,95,115,116,114,105,110,103,95,115,112,108,105,116] : List Nat)
+      ([MirLocalDef 0 MirManagedPtr, MirLocalDef 1 MirManagedPtr] : List MirLocal) ([value, separator] : List MirValue) MirManagedPtr
+      (managed_string_split_body compiler (MirUse 0) (MirUse 1)) state;
+
+def managed_string_tokens_value (compiler : ManagedCompiler) (value : MirValue) (state : ManagedState)
+    : Either NativeLowerError ManagedResult :=
+    managed_nat_helper ([111,117,114,111,95,115,116,114,105,110,103,95,116,111,107,101,110,115] : List Nat)
+      ([MirLocalDef 0 MirManagedPtr] : List MirLocal) ([value] : List MirValue) MirManagedPtr
+      (managed_string_scan_parts compiler (MirUse 0) managed_string_whitespace False) state;

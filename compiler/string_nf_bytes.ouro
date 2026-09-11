@@ -1,0 +1,400 @@
+-- Pure byte semantics for checked String normalization. Fuel bounds every
+-- input-dependent traversal; exhaustion never returns a partial result.
+-- Internal workers run only after their complete byte inputs are validated.
+
+import "file_check_model.ouro";
+
+def string_nf_length : Nat -> List Nat -> NormalizeResult Nat :=
+  fix count (fuel : Nat) (bytes : List Nat) : NormalizeResult Nat :=
+    match fuel with
+    | Z => NormalizeExhausted Nat
+    | S remaining =>
+        match bytes with
+        | Nil => Normalized Nat 0
+        | Cons byte rest =>
+            match compiler_lt_nat byte 256 with
+            | False => NormalizeMalformed Nat NormalizeStringBytes
+            | True => normalize_bind Nat Nat (count remaining rest)
+                (fun (size : Nat) => Normalized Nat (S size))
+            end
+        end
+    end;
+
+def string_nf_validate (fuel : Nat) (bytes : List Nat) : NormalizeResult Unit :=
+    normalize_bind Nat Unit (string_nf_length fuel bytes)
+      (fun (_size : Nat) => Normalized Unit MkUnit);
+
+def string_nf_validate_two (fuel : Nat) (left : List Nat) (right : List Nat)
+    : NormalizeResult Unit :=
+    normalize_bind Unit Unit (string_nf_validate fuel left)
+      (fun (_left : Unit) => string_nf_validate fuel right);
+
+def string_nf_append_bytes : Nat -> List Nat -> List Nat -> NormalizeResult (List Nat) :=
+  fix append_bytes (fuel : Nat) (left : List Nat) (right : List Nat)
+      : NormalizeResult (List Nat) :=
+    match fuel with
+    | Z => NormalizeExhausted (List Nat)
+    | S remaining =>
+        match left with
+        | Nil => Normalized (List Nat) right
+        | Cons byte rest =>
+            normalize_bind (List Nat) (List Nat) (append_bytes remaining rest right)
+              (fun (tail : List Nat) => Normalized (List Nat) (Cons Nat byte tail))
+        end
+    end;
+
+def string_nf_concat (fuel : Nat) (left : List Nat) (right : List Nat)
+    : NormalizeResult (List Nat) :=
+    normalize_bind Unit (List Nat) (string_nf_validate_two fuel left right)
+      (fun (_valid : Unit) => string_nf_append_bytes fuel left right);
+
+def string_nf_at_bytes : Nat -> List Nat -> Nat -> NormalizeResult Nat :=
+  fix at_bytes (fuel : Nat) (bytes : List Nat) (index : Nat) : NormalizeResult Nat :=
+    match fuel with
+    | Z => NormalizeExhausted Nat
+    | S remaining =>
+        match bytes with
+        | Nil => Normalized Nat 0
+        | Cons byte rest =>
+            match index with
+            | Z => Normalized Nat byte
+            | S next => at_bytes remaining rest next
+            end
+        end
+    end;
+
+def string_nf_byte_at (fuel : Nat) (bytes : List Nat) (index : Nat) : NormalizeResult Nat :=
+    normalize_bind Unit Nat (string_nf_validate fuel bytes)
+      (fun (_valid : Unit) => string_nf_at_bytes fuel bytes index);
+
+def string_nf_drop_bytes : Nat -> Nat -> List Nat -> NormalizeResult (List Nat) :=
+  fix drop_bytes (fuel : Nat) (count : Nat) (bytes : List Nat)
+      : NormalizeResult (List Nat) :=
+    match fuel with
+    | Z => NormalizeExhausted (List Nat)
+    | S remaining =>
+        match count with
+        | Z => Normalized (List Nat) bytes
+        | S next =>
+            match bytes with
+            | Nil => Normalized (List Nat) (Nil Nat)
+            | Cons _ rest => drop_bytes remaining next rest
+            end
+        end
+    end;
+
+def string_nf_take_bytes : Nat -> Nat -> List Nat -> NormalizeResult (List Nat) :=
+  fix take_bytes (fuel : Nat) (count : Nat) (bytes : List Nat)
+      : NormalizeResult (List Nat) :=
+    match fuel with
+    | Z => NormalizeExhausted (List Nat)
+    | S remaining =>
+        match count with
+        | Z => Normalized (List Nat) (Nil Nat)
+        | S next =>
+            match bytes with
+            | Nil => Normalized (List Nat) (Nil Nat)
+            | Cons byte rest =>
+                normalize_bind (List Nat) (List Nat) (take_bytes remaining next rest)
+                  (fun (tail : List Nat) => Normalized (List Nat) (Cons Nat byte tail))
+            end
+        end
+    end;
+
+def string_nf_slice (fuel : Nat) (bytes : List Nat) (start : Nat) (count : Nat)
+    : NormalizeResult (List Nat) :=
+    normalize_bind Unit (List Nat) (string_nf_validate fuel bytes)
+      (fun (_valid : Unit) =>
+        normalize_bind (List Nat) (List Nat) (string_nf_drop_bytes fuel start bytes)
+          (fun (suffix : List Nat) => string_nf_take_bytes fuel count suffix));
+
+def string_nf_equal_bytes : Nat -> List Nat -> List Nat -> NormalizeResult Bool :=
+  fix equal_bytes (fuel : Nat) (left : List Nat) (right : List Nat) : NormalizeResult Bool :=
+    match fuel with
+    | Z => NormalizeExhausted Bool
+    | S remaining =>
+        match left, right with
+        | Nil, Nil => Normalized Bool True
+        | Nil, Cons _ _ => Normalized Bool False
+        | Cons _ _, Nil => Normalized Bool False
+        | Cons first rest, Cons other tail =>
+            match eqNat first other with
+            | False => Normalized Bool False
+            | True => equal_bytes remaining rest tail
+            end
+        end
+    end;
+
+def string_nf_equal (fuel : Nat) (left : List Nat) (right : List Nat) : NormalizeResult Bool :=
+    normalize_bind Unit Bool (string_nf_validate_two fuel left right)
+      (fun (_valid : Unit) => string_nf_equal_bytes fuel left right);
+
+def string_nf_divmod_ten (fuel : Nat) (value : Nat) : NormalizeResult (Pair Nat Nat) :=
+    (fix divide (remaining : Nat) (number : Nat) (quotient : Nat)
+        : NormalizeResult (Pair Nat Nat) :=
+      match remaining with
+      | Z => NormalizeExhausted (Pair Nat Nat)
+      | S next =>
+          match compiler_lt_nat number 10 with
+          | True => Normalized (Pair Nat Nat) (MkPair Nat Nat quotient number)
+          | False => divide next (sub number 10) (S quotient)
+          end
+      end) fuel value 0;
+
+def string_nf_decimal_bytes : Nat -> Nat -> NormalizeResult (List Nat) :=
+  fix decimal (fuel : Nat) (value : Nat) : NormalizeResult (List Nat) :=
+    match fuel with
+    | Z => NormalizeExhausted (List Nat)
+    | S remaining =>
+        normalize_bind (Pair Nat Nat) (List Nat) (string_nf_divmod_ten fuel value)
+          (fun (division : Pair Nat Nat) =>
+            match division with
+            | MkPair quotient digit =>
+                match quotient with
+                | Z => Normalized (List Nat) ([add 48 digit] : List Nat)
+                | S _ =>
+                    normalize_bind (List Nat) (List Nat) (decimal remaining quotient)
+                      (fun (prefix : List Nat) =>
+                        string_nf_append_bytes fuel prefix ([add 48 digit] : List Nat))
+                end
+            end)
+    end;
+
+def string_nf_to_codes (fuel : Nat) (bytes : List Nat) : NormalizeResult (List Nat) :=
+    normalize_bind Unit (List Nat) (string_nf_validate fuel bytes)
+      (fun (_valid : Unit) => Normalized (List Nat) bytes);
+
+def string_nf_mod_byte : Nat -> Nat -> NormalizeResult Nat :=
+  fix wrap (fuel : Nat) (value : Nat) : NormalizeResult Nat :=
+    match fuel with
+    | Z => NormalizeExhausted Nat
+    | S remaining =>
+        match compiler_lt_nat value 256 with
+        | True => Normalized Nat value
+        | False => wrap remaining (sub value 256)
+        end
+    end;
+
+def string_nf_of_codes : Nat -> List Nat -> NormalizeResult (List Nat) :=
+  fix of_codes (fuel : Nat) (codes : List Nat) : NormalizeResult (List Nat) :=
+    match fuel with
+    | Z => NormalizeExhausted (List Nat)
+    | S remaining =>
+        match codes with
+        | Nil => Normalized (List Nat) (Nil Nat)
+        | Cons code rest =>
+            normalize_bind Nat (List Nat) (string_nf_mod_byte fuel code)
+              (fun (byte : Nat) =>
+                normalize_bind (List Nat) (List Nat) (of_codes remaining rest)
+                  (fun (tail : List Nat) => Normalized (List Nat) (Cons Nat byte tail)))
+        end
+    end;
+
+def string_nf_starts_bytes : Nat -> List Nat -> List Nat -> NormalizeResult Bool :=
+  fix starts_bytes (fuel : Nat) (bytes : List Nat) (prefix : List Nat) : NormalizeResult Bool :=
+    match fuel with
+    | Z => NormalizeExhausted Bool
+    | S remaining =>
+        match prefix with
+        | Nil => Normalized Bool True
+        | Cons first tail =>
+            match bytes with
+            | Nil => Normalized Bool False
+            | Cons byte rest =>
+                match eqNat byte first with
+                | False => Normalized Bool False
+                | True => starts_bytes remaining rest tail
+                end
+            end
+        end
+    end;
+
+def string_nf_starts (fuel : Nat) (bytes : List Nat) (prefix : List Nat) : NormalizeResult Bool :=
+    normalize_bind Unit Bool (string_nf_validate_two fuel bytes prefix)
+      (fun (_valid : Unit) => string_nf_starts_bytes fuel bytes prefix);
+
+def string_nf_ends (fuel : Nat) (bytes : List Nat) (suffix : List Nat) : NormalizeResult Bool :=
+    normalize_bind Nat Bool (string_nf_length fuel bytes)
+      (fun (size : Nat) =>
+        normalize_bind Nat Bool (string_nf_length fuel suffix)
+          (fun (width : Nat) =>
+            normalize_bind (List Nat) Bool (string_nf_drop_bytes fuel (sub size width) bytes)
+              (fun (tail : List Nat) => string_nf_equal_bytes fuel tail suffix)));
+
+def string_nf_index_bytes : Nat -> List Nat -> List Nat -> Nat -> NormalizeResult (Maybe Nat) :=
+  fix find (fuel : Nat) (bytes : List Nat) (pattern : List Nat) (offset : Nat)
+      : NormalizeResult (Maybe Nat) :=
+    match fuel with
+    | Z => NormalizeExhausted (Maybe Nat)
+    | S remaining =>
+        match pattern with
+        | Nil => Normalized (Maybe Nat) (Just Nat offset)
+        | Cons _ _ =>
+            match bytes with
+            | Nil => Normalized (Maybe Nat) (Nothing Nat)
+            | Cons _ rest =>
+                normalize_bind Bool (Maybe Nat) (string_nf_starts_bytes fuel bytes pattern)
+                  (fun (matched : Bool) =>
+                    match matched with
+                    | True => Normalized (Maybe Nat) (Just Nat offset)
+                    | False => find remaining rest pattern (S offset)
+                    end)
+            end
+        end
+    end;
+
+def string_nf_index (fuel : Nat) (bytes : List Nat) (pattern : List Nat)
+    : NormalizeResult (Maybe Nat) :=
+    normalize_bind Unit (Maybe Nat) (string_nf_validate_two fuel bytes pattern)
+      (fun (_valid : Unit) => string_nf_index_bytes fuel bytes pattern 0);
+
+def string_nf_contains (fuel : Nat) (bytes : List Nat) (pattern : List Nat) : NormalizeResult Bool :=
+    normalize_bind (Maybe Nat) Bool (string_nf_index fuel bytes pattern)
+      (fun (found : Maybe Nat) =>
+        match found with
+        | Nothing => Normalized Bool False
+        | Just _ => Normalized Bool True
+        end);
+
+def string_nf_reverse_bytes (fuel : Nat) (bytes : List Nat) : NormalizeResult (List Nat) :=
+    (fix reverse_bytes (remaining : Nat) (input : List Nat) (reversed : List Nat)
+        : NormalizeResult (List Nat) :=
+      match remaining with
+      | Z => NormalizeExhausted (List Nat)
+      | S next =>
+          match input with
+          | Nil => Normalized (List Nat) reversed
+          | Cons byte rest => reverse_bytes next rest (Cons Nat byte reversed)
+          end
+      end) fuel bytes (Nil Nat);
+
+def string_nf_split_bytes
+    : Nat -> List Nat -> Nat -> List Nat -> NormalizeResult (List (List Nat)) :=
+  fix split_bytes (fuel : Nat) (bytes : List Nat) (separator : Nat) (reversed : List Nat)
+      : NormalizeResult (List (List Nat)) :=
+    match fuel with
+    | Z => NormalizeExhausted (List (List Nat))
+    | S remaining =>
+        match bytes with
+        | Nil =>
+            normalize_bind (List Nat) (List (List Nat)) (string_nf_reverse_bytes fuel reversed)
+              (fun (part : List Nat) => Normalized (List (List Nat)) ([part] : List (List Nat)))
+        | Cons byte rest =>
+            match eqNat byte separator with
+            | False => split_bytes remaining rest separator (Cons Nat byte reversed)
+            | True =>
+                normalize_bind (List Nat) (List (List Nat)) (string_nf_reverse_bytes fuel reversed)
+                  (fun (part : List Nat) =>
+                    normalize_bind (List (List Nat)) (List (List Nat))
+                      (split_bytes remaining rest separator (Nil Nat))
+                      (fun (parts : List (List Nat)) =>
+                        Normalized (List (List Nat)) (Cons (List Nat) part parts)))
+            end
+        end
+    end;
+
+def string_nf_split (fuel : Nat) (bytes : List Nat) (separator : Nat)
+    : NormalizeResult (List (List Nat)) :=
+    normalize_bind Unit (List (List Nat)) (string_nf_validate fuel bytes)
+      (fun (_valid : Unit) => string_nf_split_bytes fuel bytes separator (Nil Nat));
+
+def string_nf_replace_bytes
+    : Nat -> List Nat -> List Nat -> List Nat -> Nat -> NormalizeResult (List Nat) :=
+  fix replace_bytes (fuel : Nat) (bytes : List Nat) (pattern : List Nat)
+      (replacement : List Nat) (width : Nat) : NormalizeResult (List Nat) :=
+    match fuel with
+    | Z => NormalizeExhausted (List Nat)
+    | S remaining =>
+        match bytes with
+        | Nil => Normalized (List Nat) (Nil Nat)
+        | Cons byte rest =>
+            normalize_bind Bool (List Nat) (string_nf_starts_bytes fuel bytes pattern)
+              (fun (matched : Bool) =>
+                match matched with
+                | False =>
+                    normalize_bind (List Nat) (List Nat)
+                      (replace_bytes remaining rest pattern replacement width)
+                      (fun (tail : List Nat) => Normalized (List Nat) (Cons Nat byte tail))
+                | True =>
+                    normalize_bind (List Nat) (List Nat) (string_nf_drop_bytes fuel width bytes)
+                      (fun (suffix : List Nat) =>
+                        normalize_bind (List Nat) (List Nat)
+                          (replace_bytes remaining suffix pattern replacement width)
+                          (fun (tail : List Nat) => string_nf_append_bytes fuel replacement tail))
+                end)
+        end
+    end;
+
+def string_nf_replace (fuel : Nat) (bytes : List Nat) (pattern : List Nat) (replacement : List Nat)
+    : NormalizeResult (List Nat) :=
+    normalize_bind Unit (List Nat) (string_nf_validate_two fuel bytes pattern)
+      (fun (_inputs : Unit) =>
+        normalize_bind Unit (List Nat) (string_nf_validate fuel replacement)
+          (fun (_replacement : Unit) =>
+            match pattern with
+            | Nil => Normalized (List Nat) bytes
+            | Cons _ _ =>
+                normalize_bind Nat (List Nat) (string_nf_length fuel pattern)
+                  (fun (width : Nat) => string_nf_replace_bytes fuel bytes pattern replacement width)
+            end));
+
+def string_nf_less_equal_bytes : Nat -> List Nat -> List Nat -> NormalizeResult Bool :=
+  fix less_equal_bytes (fuel : Nat) (left : List Nat) (right : List Nat) : NormalizeResult Bool :=
+    match fuel with
+    | Z => NormalizeExhausted Bool
+    | S remaining =>
+        match left, right with
+        | Nil, Nil => Normalized Bool True
+        | Nil, Cons _ _ => Normalized Bool True
+        | Cons _ _, Nil => Normalized Bool False
+        | Cons first rest, Cons other tail =>
+            match compareNat first other with
+            | LT => Normalized Bool True
+            | GT => Normalized Bool False
+            | EQ => less_equal_bytes remaining rest tail
+            end
+        end
+    end;
+
+def string_nf_less_equal (fuel : Nat) (left : List Nat) (right : List Nat) : NormalizeResult Bool :=
+    normalize_bind Unit Bool (string_nf_validate_two fuel left right)
+      (fun (_valid : Unit) => string_nf_less_equal_bytes fuel left right);
+
+def string_nf_whitespace (byte : Nat) : Bool :=
+    orb (eqNat byte 32) (orb (eqNat byte 9) (orb (eqNat byte 10) (eqNat byte 13)));
+
+def string_nf_tokens_bytes : Nat -> List Nat -> List Nat -> NormalizeResult (List (List Nat)) :=
+  fix tokens_bytes (fuel : Nat) (bytes : List Nat) (reversed : List Nat)
+      : NormalizeResult (List (List Nat)) :=
+    match fuel with
+    | Z => NormalizeExhausted (List (List Nat))
+    | S remaining =>
+        match bytes with
+        | Nil =>
+            match reversed with
+            | Nil => Normalized (List (List Nat)) (Nil (List Nat))
+            | Cons _ _ =>
+                normalize_bind (List Nat) (List (List Nat)) (string_nf_reverse_bytes fuel reversed)
+                  (fun (part : List Nat) => Normalized (List (List Nat)) ([part] : List (List Nat)))
+            end
+        | Cons byte rest =>
+            match string_nf_whitespace byte with
+            | False => tokens_bytes remaining rest (Cons Nat byte reversed)
+            | True =>
+                match reversed with
+                | Nil => tokens_bytes remaining rest (Nil Nat)
+                | Cons _ _ =>
+                    normalize_bind (List Nat) (List (List Nat)) (string_nf_reverse_bytes fuel reversed)
+                      (fun (part : List Nat) =>
+                        normalize_bind (List (List Nat)) (List (List Nat))
+                          (tokens_bytes remaining rest (Nil Nat))
+                          (fun (parts : List (List Nat)) =>
+                            Normalized (List (List Nat)) (Cons (List Nat) part parts)))
+                end
+            end
+        end
+    end;
+
+def string_nf_tokens (fuel : Nat) (bytes : List Nat) : NormalizeResult (List (List Nat)) :=
+    normalize_bind Unit (List (List Nat)) (string_nf_validate fuel bytes)
+      (fun (_valid : Unit) => string_nf_tokens_bytes fuel bytes (Nil Nat));

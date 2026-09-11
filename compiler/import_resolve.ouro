@@ -1,0 +1,194 @@
+-- Import resolution rejects cycles before later stages assume a closed, acyclic unit graph.
+
+-- @entry resolve_imports
+
+-- Decl comes from ast.ouro rather than a local copy with matching tags, so a
+-- driver can hold the parser and this resolver in one unit. Bodies are still
+-- never inspected here.
+import "../std/data.ouro";
+import "base.ouro";
+import "ast.ouro";
+import "pipeline_abi.ouro";
+
+-- Option comes from base.ouro.
+
+-- A preloaded source file: path id + decls. Named SrcUnit because std/data.ouro
+-- already has a Unit type and both reach a driver through the import graph.
+
+-- Imported paths + flattened non-import decls (dep order).
+inductive St : Type :=
+  | MkSt : List Nat -> List Decl -> St;
+
+-- Mode-tagged DFS (no mutual recursion). RMode, because parser.ouro's Mode is
+-- its precedence level and both reach a driver through the import graph.
+inductive RMode : Type :=
+  | MVisit : Nat -> List Nat -> St -> RMode
+  | MImports : Nat -> List Decl -> List Decl -> List Nat -> St -> RMode;
+
+-- eqNat and memNat come from base.ouro.
+
+-- @bound(nodes <= 58)
+-- @bound(depth <= 14)
+-- @bound(allocs <= 18)
+-- @bound(stack <= 6)
+-- @bound(steps <= 19)
+-- @bound(cyclo <= 9)
+-- @minimal
+def findUnit (path : Nat) : List SrcUnit -> Option (List Decl) :=
+    fix go (us : List SrcUnit) : Option (List Decl) :=
+      match us with
+      | Nil => None (List Decl)
+      | Cons u us' =>
+          match u with
+          | MkSrcUnit p decls =>
+              match eqNat p path with
+              | True => Some (List Decl) decls
+              | False => go us'
+              end
+          end
+      end;
+
+-- The dependency predicate now covers all eight Decl variants explicitly.
+-- @bound(nodes <= 25)
+-- @bound(depth <= 12)
+-- @bound(allocs <= 6)
+-- @bound(stack <= 5)
+-- @bound(steps <= 8)
+-- @bound(cyclo <= 10)
+-- @minimal
+def isImport (d : Decl) : Bool :=
+    match d with
+    | DDef _ _ _ => False
+    | DAxiom _ _ => False
+    | DInductive _ _ _ _ => False
+    | DEffect _ _ _ => False
+    | DImport _ => True
+    | DIntrinsic _ _ _ _ => False
+    | DExtern _ _ _ => False
+    | DRepresentation _ _ => False
+    end;
+
+-- @bound(nodes <= 48)
+-- @bound(depth <= 14)
+-- @bound(allocs <= 18)
+-- @bound(stack <= 6)
+-- @bound(steps <= 18)
+-- @bound(cyclo <= 10)
+-- @minimal
+def localsOf : List Decl -> List Decl :=
+  fix localsOf (ds : List Decl) : List Decl :=
+    match ds with
+    | Nil => Nil Decl
+    | Cons d ds' =>
+        match isImport d with
+        | True => localsOf ds'
+        | False => Cons Decl d (localsOf ds')
+        end
+    end;
+
+def errCycle : Nat := S Z;
+def errMissing : Nat := 2;
+def errFuel : Nat := 3;
+
+-- DFS resolve (fuel + Mode); mirrors import_resolve.js loadAbs without FS.
+-- @bound(nodes <= 276)
+-- @bound(depth <= 48)
+-- @bound(allocs <= 107)
+-- @bound(stack <= 24)
+-- @bound(steps <= 118)
+-- @bound(cyclo <= 48)
+def run : Nat -> List SrcUnit -> RMode -> ResolveResult St :=
+  fix run (fuel : Nat) (units : List SrcUnit) (m : RMode) : ResolveResult St :=
+    match fuel with
+    | Z =>
+        match m with
+        | MVisit path _ _ => RErr St errFuel path
+        | MImports path _ _ _ _ => RErr St errFuel path
+        end
+    | S fuel' =>
+        match m with
+        | MVisit path stack st =>
+            match st with
+            | MkSt imported _acc =>
+                match memNat path imported with
+                | True => ROk St st
+                | False =>
+                    match memNat path stack with
+                    | True => RErr St errCycle path
+                    | False =>
+                        match findUnit path units with
+                        | None => RErr St errMissing path
+                        | Some decls =>
+                            run fuel' units
+                              (MImports path decls decls (Cons Nat path stack) st)
+                        end
+                    end
+                end
+            end
+        | MImports path remaining allDecls stack st =>
+            match remaining with
+            | Nil =>
+                match st with
+                | MkSt imp acc =>
+                    ROk St
+                      (MkSt
+                        (Cons Nat path imp)
+                        (append Decl acc (localsOf allDecls)))
+                end
+            | Cons d rest =>
+                let nextMode : RMode := MImports path rest allDecls stack st in
+                match d with
+                | DImport p =>
+                    match run fuel' units (MVisit p stack st) with
+                    | RErr c det => RErr St c det
+                    | ROk st2 =>
+                        run fuel' units
+                          (MImports path rest allDecls stack st2)
+                    end
+                | DDef _ _ _ =>
+                    run fuel' units nextMode
+                | DAxiom _ _ =>
+                    run fuel' units nextMode
+                | DInductive _ _ _ _ =>
+                    run fuel' units nextMode
+                | DEffect _ _ _ =>
+                    run fuel' units nextMode
+                | DIntrinsic _ _ _ _ =>
+                    run fuel' units nextMode
+                | DExtern _ _ _ =>
+                    run fuel' units nextMode
+                | DRepresentation _ _ =>
+                    run fuel' units nextMode
+                end
+            end
+        end
+    end;
+
+-- @bound(nodes <= 69)
+-- @bound(depth <= 14)
+-- @bound(allocs <= 24)
+-- @bound(stack <= 8)
+-- @bound(steps <= 25)
+-- @bound(cyclo <= 8)
+-- @minimal
+def resolve_imports_fuel (fuel : Nat) (units : List SrcUnit) (entry : Nat) : ResolveResult (List Decl) :=
+    match run fuel units (MVisit entry (Nil Nat) (MkSt (Nil Nat) (Nil Decl))) with
+    | ROk st =>
+        match st with
+        | MkSt _ decls => ROk (List Decl) decls
+        end
+    | RErr c det => RErr (List Decl) c det
+    end;
+
+def resolve_imports_cap : Nat := 256;
+
+-- Entry.
+-- @bound(nodes <= 25)
+-- @bound(depth <= 10)
+-- @bound(allocs <= 12)
+-- @bound(stack <= 5)
+-- @bound(steps <= 10)
+-- @bound(cyclo <= 4)
+-- @minimal
+def resolve_imports (units : List SrcUnit) (entry : Nat) : ResolveResult (List Decl) :=
+    resolve_imports_fuel resolve_imports_cap units entry;

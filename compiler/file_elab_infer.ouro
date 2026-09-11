@@ -1,0 +1,684 @@
+-- Canonical inference preserves failure kinds through every recursive phase.
+
+import "file_elab_term.ouro";
+
+-- Checking a let body removes one binder by substitution. Values and their
+-- annotations have already been checked in the outer scope, so a remaining
+-- unbound reference comes from the body. Report its original Core index.
+def let_bodies_result (A : Type) (count : Nat) (result : CheckResult A) : CheckResult A :=
+    match result with
+    | CheckOk _ => result
+    | CheckErr failure =>
+        match failure with
+        | CheckMalformedCore fault =>
+            match fault with
+            | CheckUnboundVariable index =>
+                CheckErr A (CheckMalformedCore (CheckUnboundVariable (add index count)))
+            | CheckUnboundGlobal _ => result
+            | CheckUnknownInductive _ => result
+            | CheckUnknownConstructor _ _ => result
+            | CheckConstructorParameters => result
+            | CheckCaseMetadata => result
+            | CheckFixMetadata => result
+            | CheckLiteralType _ => result
+            | CheckUnresolvedLiteral _ => result
+            | CheckDuplicateName _ => result
+            end
+        | CheckTypeFailure _ => result
+        | CheckReductionFailure _ => result
+        | CheckResourceLimit => result
+        | CheckUnsupported _ => result
+        | CheckCancelled => result
+        | CheckInternalFailure _ => result
+        | CheckPrimitiveFailure _ => result
+        end
+    end;
+
+def let_body_result (A : Type) (result : CheckResult A) : CheckResult A :=
+    let_bodies_result A 1 result;
+
+inductive LetParts : Type := | MkLetParts : CoreTerm -> CoreTerm -> CoreTerm -> LetParts;
+
+def let_parts (term : CoreTerm) : Maybe LetParts :=
+    match term with
+    | CLetIn value annotation body => Just LetParts (MkLetParts value annotation body)
+    | CRel _ => Nothing LetParts
+    | CSort _ => Nothing LetParts
+    | CPi _ _ => Nothing LetParts
+    | CLam _ _ => Nothing LetParts
+    | CApp _ _ => Nothing LetParts
+    | CConst _ => Nothing LetParts
+    | CInd _ => Nothing LetParts
+    | CConstruct _ _ _ => Nothing LetParts
+    | CStrBytes _ _ => Nothing LetParts
+    | CStrLit _ _ => Nothing LetParts
+    | CCase _ _ _ _ => Nothing LetParts
+    | CFix _ _ _ _ _ => Nothing LetParts
+    end;
+
+def check_inferred
+    (infer : CheckEnvironment -> List CoreTerm -> InferGoal -> CheckResult CoreTerm)
+    (fuel : Nat) (sig : CheckEnvironment) (ctx : List CoreTerm)
+    (term : CoreTerm) (expected : CoreTerm) : CheckResult Unit :=
+    check_bind CoreTerm Unit (infer sig ctx (IGTerm term))
+      (fun (actual : CoreTerm) => check_cumulative_indexed fuel sig actual expected);
+
+def check_head_using
+    (infer : CheckEnvironment -> List CoreTerm -> InferGoal -> CheckResult CoreTerm)
+    (check_body : List CoreTerm -> CoreTerm -> CoreTerm -> CheckResult Unit)
+    (fuel : Nat) (sig : CheckEnvironment) (ctx : List CoreTerm)
+    (term : CoreTerm) (expected : CoreTerm) : CheckResult Unit :=
+        match term with
+        | CLam annotation body =>
+            check_bind PiParts Unit (pi_view_checked_indexed fuel sig expected)
+              (fun (parts : PiParts) =>
+                match parts with
+                | MkPi domain codomain =>
+                    check_bind CoreTerm Unit (infer sig ctx (IGTerm annotation))
+                      (fun (annotation_type : CoreTerm) =>
+                        check_bind Nat Unit (check_sort_indexed fuel sig annotation_type)
+                          (fun (_level : Nat) =>
+                            check_bind Unit Unit (check_convertible_indexed fuel sig annotation domain)
+                              (fun (_same : Unit) =>
+                                check_body (extend ctx domain) body codomain)))
+                end)
+        | CLetIn value annotation body =>
+            check_bind CoreTerm Unit (infer sig ctx (IGTerm annotation))
+              (fun (annotation_type : CoreTerm) =>
+                check_bind Nat Unit (check_sort_indexed fuel sig annotation_type)
+                  (fun (_level : Nat) =>
+                    check_bind Unit Unit (check_body ctx value annotation)
+                      (fun (_value : Unit) =>
+                        -- A let binder denotes its checked value during type
+                        -- computation. The stored/runtime term keeps the let.
+                        let_body_result Unit
+                          (check_body ctx (subst value body) expected))))
+        | CRel _ => check_inferred infer fuel sig ctx term expected
+        | CSort _ => check_inferred infer fuel sig ctx term expected
+        | CPi _ _ => check_inferred infer fuel sig ctx term expected
+        | CApp _ _ => check_inferred infer fuel sig ctx term expected
+        | CConst _ => check_inferred infer fuel sig ctx term expected
+        | CInd _ => check_inferred infer fuel sig ctx term expected
+        | CConstruct _ _ _ => check_inferred infer fuel sig ctx term expected
+        | CStrBytes _ _ => check_inferred infer fuel sig ctx term expected
+        | CStrLit _ _ => check_inferred infer fuel sig ctx term expected
+        | CCase _ _ _ _ => check_inferred infer fuel sig ctx term expected
+        | CFix _ _ _ _ _ => check_inferred infer fuel sig ctx term expected
+        end;
+
+def check_let_value_using
+    (infer : CheckEnvironment -> List CoreTerm -> InferGoal -> CheckResult CoreTerm)
+    (check_value : CoreTerm -> CoreTerm -> CheckResult Unit)
+    (fuel : Nat) (sig : CheckEnvironment) (ctx : List CoreTerm)
+    (value : CoreTerm) (annotation : CoreTerm) : CheckResult Unit :=
+    check_bind CoreTerm Unit (infer sig ctx (IGTerm annotation))
+      (fun (annotation_type : CoreTerm) =>
+        check_bind Nat Unit (check_sort_indexed fuel sig annotation_type)
+          (fun (_level : Nat) => check_value value annotation));
+
+-- Delayed local values stay in the structurally fuelled checker. This removes
+-- repeated suffix copies without changing the number/order of checking steps.
+def check_term_using
+    (infer : CheckEnvironment -> List CoreTerm -> InferGoal -> CheckResult CoreTerm)
+    (sig : CheckEnvironment) (fuel : Nat) (ctx : List CoreTerm)
+    (term : CoreTerm) (expected : CoreTerm) : CheckResult Unit :=
+    (fix check_term (remaining : Nat) (context : List CoreTerm) (count : Nat)
+        (values : List CoreTerm) (input : CoreTerm) (typ : CoreTerm) : CheckResult Unit :=
+      match remaining with
+      | Z => CheckErr Unit CheckResourceLimit
+      | S next =>
+          let check_body : List CoreTerm -> CoreTerm -> CoreTerm -> CheckResult Unit :=
+            fun (next_ctx : List CoreTerm) (body : CoreTerm) (annotation : CoreTerm) =>
+              check_term next next_ctx Z (Nil CoreTerm) body annotation in
+          match let_parts input with
+          | Just parts => match parts with
+            | MkLetParts value annotation body =>
+                let actual_value : CoreTerm := subst_many count values value in
+                let actual_annotation : CoreTerm := subst_many count values annotation in
+                check_bind Unit Unit
+                  (let_bodies_result Unit count
+                    (check_let_value_using infer (check_body context) next sig context actual_value actual_annotation))
+                  (fun (_checked : Unit) =>
+                    check_term next context (S count) (Cons CoreTerm actual_value values) body typ)
+            end
+          | Nothing => let_bodies_result Unit count
+              (check_head_using infer check_body next sig context (subst_many count values input) typ)
+          end
+      end) fuel ctx Z (Nil CoreTerm) term expected;
+
+def infer_branch_expected_checked
+    (fuel : Nat) (sig : CheckEnvironment) (ind : Nat) (nparams : Nat) (nindices : Nat)
+    (args : List CoreTerm) (predicate : CoreTerm) (index : Nat) (arity : Nat)
+    (ctor : Ctor) : CheckResult CoreTerm :=
+    match ctor with
+    | MkCtor _ ctor_type =>
+        check_bind CoreTerm CoreTerm
+          (instantiate_params_checked_indexed fuel sig (take CoreTerm nparams args) ctor_type)
+          (fun (instantiated : CoreTerm) =>
+            check_bind PiList CoreTerm (peel_pis_checked_indexed sig fuel instantiated)
+              (fun (telescope : PiList) =>
+                match telescope with
+                | MkPiList domains result =>
+                    check_bind Spine CoreTerm (check_from_normalize Spine (app_spine_checked fuel result))
+                      (fun (spine : Spine) =>
+                        match spine with
+                        | MkSpine head result_args =>
+                            check_bind Nat CoreTerm
+                              (check_from_maybe Nat (CheckMalformedCore CheckCaseMetadata) (asInd head))
+                              (fun (actual_ind : Nat) =>
+                                check_bind Unit CoreTerm
+                                  (check_require
+                                    (andb (eqNat actual_ind ind)
+                                      (andb (eqNat (length CoreTerm result_args) (add nparams nindices))
+                                        (eqNat (length CoreTerm domains) arity)))
+                                    (CheckMalformedCore CheckCaseMetadata))
+                                  (fun (_shape : Unit) =>
+                                    CheckOk CoreTerm (branch_expected ind nparams
+                                      (take CoreTerm nparams args) predicate index domains
+                                      (drop CoreTerm nparams result_args))))
+                        end)
+                end))
+    end;
+
+def infer_branch_expected
+    (fuel : Nat) (sig : CheckEnvironment) (ind : Nat) (nparams : Nat) (nindices : Nat)
+    (args : List CoreTerm) (predicate : CoreTerm) (index : Nat) (arity : Nat)
+    (ctor : Ctor) : Maybe CoreTerm :=
+    check_to_maybe CoreTerm
+      (infer_branch_expected_checked fuel sig ind nparams nindices args predicate index arity ctor);
+
+def infer_check_branches
+    (infer : CheckEnvironment -> List CoreTerm -> InferGoal -> CheckResult CoreTerm)
+    (fuel : Nat) (sig : CheckEnvironment) (ctx : List CoreTerm)
+    (ind : Nat) (nparams : Nat) (nindices : Nat)
+    (args : List CoreTerm) (predicate : CoreTerm)
+    : List Ctor -> List Nat -> List CoreTerm -> Nat -> CheckResult Unit :=
+  fix branches (ctors : List Ctor) (arities : List Nat)
+      (bodies : List CoreTerm) (index : Nat) : CheckResult Unit :=
+    match ctors with
+    | Nil =>
+        match arities, bodies with
+        | Nil, Nil => CheckOk Unit MkUnit
+        | Nil, Cons _ _ => CheckErr Unit (CheckMalformedCore CheckCaseMetadata)
+        | Cons _ _, Nil => CheckErr Unit (CheckMalformedCore CheckCaseMetadata)
+        | Cons _ _, Cons _ _ => CheckErr Unit (CheckMalformedCore CheckCaseMetadata)
+        end
+    | Cons ctor rest =>
+        match arities, bodies with
+        | Cons arity arities', Cons body bodies' =>
+            check_bind CoreTerm Unit
+              (infer_branch_expected_checked fuel sig ind nparams nindices args predicate index arity ctor)
+              (fun (expected : CoreTerm) =>
+                check_bind Unit Unit (check_term_using infer sig fuel ctx body expected)
+                  (fun (_branch : Unit) => branches rest arities' bodies' (S index)))
+        | Nil, Nil => CheckErr Unit (CheckMalformedCore CheckCaseMetadata)
+        | Nil, Cons _ _ => CheckErr Unit (CheckMalformedCore CheckCaseMetadata)
+        | Cons _ _, Nil => CheckErr Unit (CheckMalformedCore CheckCaseMetadata)
+        end
+    end;
+
+def infer_term
+    (infer : CheckEnvironment -> List CoreTerm -> InferGoal -> CheckResult CoreTerm)
+    (fuel : Nat) (sig : CheckEnvironment) (ctx : List CoreTerm) (term : CoreTerm)
+    : CheckResult CoreTerm :=
+    match term with
+    | CRel index =>
+        check_from_maybe CoreTerm (CheckMalformedCore (CheckUnboundVariable index)) (lookup_ctx ctx index)
+    | CSort level => CheckOk CoreTerm (CSort (S level))
+    | CPi domain codomain => infer sig ctx (IGPi domain codomain)
+    | CLam annotation body => infer sig ctx (IGLam annotation body)
+    | CApp function argument => infer sig ctx (IGApp function argument)
+    | CLetIn value annotation body => infer sig ctx (IGLet value annotation body)
+    | CConst name =>
+        check_from_maybe CoreTerm (CheckMalformedCore (CheckUnboundGlobal name)) (check_environment_type name sig)
+    | CInd name => infer sig ctx (IGInd name)
+    | CConstruct ind index nparams => infer sig ctx (IGCtor ind index nparams)
+    | CStrLit literal _ =>
+        CheckErr CoreTerm (CheckMalformedCore (CheckUnresolvedLiteral literal))
+    | CStrBytes bytes name =>
+        check_bind Unit CoreTerm (check_from_normalize Unit (string_nf_validate fuel bytes))
+          (fun (_valid : Unit) => check_bind CoreTerm CoreTerm
+            (check_from_maybe CoreTerm (CheckMalformedCore (CheckLiteralType name)) (check_environment_type name sig))
+            (fun (typ : CoreTerm) =>
+              check_bind Nat CoreTerm (check_sort_indexed fuel sig typ)
+                (fun (_level : Nat) => check_bind CoreTerm CoreTerm
+                  (check_from_normalize CoreTerm (whnf_checked_worker fuel sig (CConst name)))
+                  (fun (normal : CoreTerm) => check_map Nat CoreTerm
+                    (fun (_canonical : Nat) => CConst name)
+                    (check_from_maybe Nat (CheckMalformedCore (CheckLiteralType name))
+                      (string_value_type_head (check_environment_entries sig) normal))))))
+    | CCase info predicate scrutinee branches => infer sig ctx (IGCase info predicate scrutinee branches)
+    | CFix name rec_arg arity annotation body => infer sig ctx (IGFix name rec_arg arity annotation body)
+    end;
+
+-- These atomic forms cannot consult a local binder. Avoid lifting an unused
+-- domain while leaving the representation of every observable context intact.
+def pi_codomain_context (ctx : List CoreTerm) (domain : CoreTerm) (codomain : CoreTerm)
+    : List CoreTerm :=
+    match codomain with
+    | CSort _ => ctx
+    | CConst _ => ctx
+    | CInd _ => ctx
+    | CConstruct _ _ _ => ctx
+    | CStrBytes _ _ => ctx
+    | CStrLit _ _ => ctx
+    | CRel _ => extend ctx domain
+    | CPi _ _ => extend ctx domain
+    | CLam _ _ => extend ctx domain
+    | CApp _ _ => extend ctx domain
+    | CLetIn _ _ _ => extend ctx domain
+    | CCase _ _ _ _ => extend ctx domain
+    | CFix _ _ _ _ _ => extend ctx domain
+    end;
+
+def infer_pi
+    (infer : CheckEnvironment -> List CoreTerm -> InferGoal -> CheckResult CoreTerm)
+    (fuel : Nat) (sig : CheckEnvironment) (ctx : List CoreTerm)
+    (domain : CoreTerm) (codomain : CoreTerm) : CheckResult CoreTerm :=
+    check_bind CoreTerm CoreTerm (infer sig ctx (IGTerm domain))
+      (fun (domain_type : CoreTerm) =>
+        check_bind Nat CoreTerm (check_sort_indexed fuel sig domain_type)
+          (fun (domain_level : Nat) =>
+            check_bind CoreTerm CoreTerm (infer sig (pi_codomain_context ctx domain codomain) (IGTerm codomain))
+              (fun (codomain_type : CoreTerm) =>
+                check_map Nat CoreTerm
+                  (fun (codomain_level : Nat) => CSort (maxNat domain_level codomain_level))
+                  (check_sort_indexed fuel sig codomain_type))));
+
+def infer_lambda
+    (infer : CheckEnvironment -> List CoreTerm -> InferGoal -> CheckResult CoreTerm)
+    (fuel : Nat) (sig : CheckEnvironment) (ctx : List CoreTerm)
+    (annotation : CoreTerm) (body : CoreTerm) : CheckResult CoreTerm :=
+    check_bind CoreTerm CoreTerm (infer sig ctx (IGTerm annotation))
+      (fun (annotation_type : CoreTerm) =>
+        check_bind Nat CoreTerm (check_sort_indexed fuel sig annotation_type)
+          (fun (_level : Nat) =>
+            check_map CoreTerm CoreTerm (fun (body_type : CoreTerm) => CPi annotation body_type)
+              (infer sig (extend ctx annotation) (IGTerm body))));
+
+-- Delayed codomains stay local to one application spine. Ordinary inference
+-- results retain their direct CoreTerm representation.
+inductive ApplicationFrame : Type := | MkApplicationFrame : Nat -> CoreTerm -> ApplicationFrame;
+inductive ApplicationInput : Type :=
+  | MkApplicationInput : Nat -> CoreTerm -> List ApplicationFrame -> ApplicationInput;
+
+def inference_application_input
+    : Nat -> CoreTerm -> List ApplicationFrame -> CheckResult ApplicationInput :=
+  fix collect (fuel : Nat) (term : CoreTerm) (frames : List ApplicationFrame)
+      : CheckResult ApplicationInput :=
+    match term with
+    | CApp function argument => match fuel with
+        | Z => CheckErr ApplicationInput CheckResourceLimit
+        | S first => match first with
+            | Z => CheckErr ApplicationInput CheckResourceLimit
+            | S remaining =>
+                collect remaining function (Cons ApplicationFrame (MkApplicationFrame remaining argument) frames)
+            end
+        end
+    | CRel _ => CheckOk ApplicationInput (MkApplicationInput fuel term frames)
+    | CSort _ => CheckOk ApplicationInput (MkApplicationInput fuel term frames)
+    | CPi _ _ => CheckOk ApplicationInput (MkApplicationInput fuel term frames)
+    | CLam _ _ => CheckOk ApplicationInput (MkApplicationInput fuel term frames)
+    | CLetIn _ _ _ => CheckOk ApplicationInput (MkApplicationInput fuel term frames)
+    | CConst _ => CheckOk ApplicationInput (MkApplicationInput fuel term frames)
+    | CInd _ => CheckOk ApplicationInput (MkApplicationInput fuel term frames)
+    | CConstruct _ _ _ => CheckOk ApplicationInput (MkApplicationInput fuel term frames)
+    | CStrBytes _ _ => CheckOk ApplicationInput (MkApplicationInput fuel term frames)
+    | CStrLit _ _ => CheckOk ApplicationInput (MkApplicationInput fuel term frames)
+    | CCase _ _ _ _ => CheckOk ApplicationInput (MkApplicationInput fuel term frames)
+    | CFix _ _ _ _ _ => CheckOk ApplicationInput (MkApplicationInput fuel term frames)
+    end;
+
+inductive ApplicationType : Type :=
+  | MkApplicationType : Nat -> List CoreTerm -> CoreTerm -> CoreTerm -> ApplicationType;
+
+def inference_application_type (fuel : Nat) (sig : CheckEnvironment)
+    (count : Nat) (values : List CoreTerm) (typ : CoreTerm) : CheckResult ApplicationType :=
+    match fuel with
+    | Z => CheckErr ApplicationType CheckResourceLimit
+    | S _ =>
+        match piViewRaw typ with
+        | Just parts => match parts with
+          | MkPi domain codomain =>
+              CheckOk ApplicationType (MkApplicationType count values (subst_many count values domain) codomain)
+          end
+        | Nothing => check_map PiParts ApplicationType
+            (fun (parts : PiParts) => match parts with
+              | MkPi domain codomain => MkApplicationType Z (Nil CoreTerm) domain codomain end)
+            (pi_view_checked_indexed fuel sig (subst_many count values typ))
+        end
+    end;
+
+def infer_application_spine
+    (descend : Nat -> CheckEnvironment -> List CoreTerm -> InferGoal -> CheckResult CoreTerm)
+    (fuel : Nat) (sig : CheckEnvironment) (ctx : List CoreTerm)
+    (function : CoreTerm) (argument : CoreTerm) : CheckResult CoreTerm :=
+    check_bind ApplicationInput CoreTerm
+      (inference_application_input fuel function ([MkApplicationFrame fuel argument] : List ApplicationFrame))
+      (fun (input : ApplicationInput) => match input with
+        | MkApplicationInput head_fuel head frames =>
+            check_bind CoreTerm CoreTerm (descend head_fuel sig ctx (IGTerm head))
+              (fun (head_type : CoreTerm) =>
+                (fix apply (remaining : List ApplicationFrame) (count : Nat)
+                    (values : List CoreTerm) (typ : CoreTerm) : CheckResult CoreTerm :=
+                  match remaining with
+                  | Nil => CheckOk CoreTerm (subst_many count values typ)
+                  | Cons frame rest => match frame with
+                    | MkApplicationFrame frame_fuel actual_argument =>
+                        check_bind ApplicationType CoreTerm
+                          (inference_application_type frame_fuel sig count values typ)
+                          (fun (parts : ApplicationType) => match parts with
+                            | MkApplicationType bindings replacements domain codomain =>
+                                check_bind Unit CoreTerm
+                                  (check_term_using (descend frame_fuel) sig frame_fuel ctx actual_argument domain)
+                                  (fun (_argument : Unit) =>
+                                    apply rest (S bindings) (Cons CoreTerm actual_argument replacements) codomain)
+                            end)
+                    end
+                  end) frames Z (Nil CoreTerm) head_type)
+        end);
+
+-- Argument applications also keep their pending cumulative checks in data.
+-- Each frame uses the original checker's predecessor budget; the structural
+-- argument traversal does not consume a second, depth-dependent C stack.
+inductive ApplicationCheckFrame : Type :=
+  | MkApplicationCheckFrame : Nat -> CoreTerm -> CoreTerm -> CoreTerm -> ApplicationCheckFrame;
+
+def inference_finish_applications (sig : CheckEnvironment)
+    : List ApplicationCheckFrame -> CoreTerm -> CheckResult CoreTerm :=
+  fix finish (frames : List ApplicationCheckFrame) (actual_type : CoreTerm) : CheckResult CoreTerm :=
+    match frames with
+    | Nil => CheckOk CoreTerm actual_type
+    | Cons frame rest => match frame with
+        | MkApplicationCheckFrame fuel domain argument codomain =>
+            check_bind Unit CoreTerm (check_cumulative_indexed fuel sig actual_type domain)
+              (fun (_argument : Unit) => finish rest (subst argument codomain))
+        end
+    end;
+
+def inference_check_last_argument
+    (descend : Nat -> CheckEnvironment -> List CoreTerm -> InferGoal -> CheckResult CoreTerm)
+    (fuel : Nat) (sig : CheckEnvironment) (ctx : List CoreTerm)
+    (argument : CoreTerm) (domain : CoreTerm) (codomain : CoreTerm)
+    (frames : List ApplicationCheckFrame) : CheckResult CoreTerm :=
+    check_bind Unit CoreTerm (check_term_using (descend fuel) sig fuel ctx argument domain)
+      (fun (_argument : Unit) => inference_finish_applications sig frames (subst argument codomain));
+
+def infer_single_application
+    (descend : Nat -> CheckEnvironment -> List CoreTerm -> InferGoal -> CheckResult CoreTerm)
+    (fuel : Nat) (sig : CheckEnvironment) (ctx : List CoreTerm)
+    (function : CoreTerm) (argument : CoreTerm) : CheckResult CoreTerm :=
+    (fix collect (actual_argument : CoreTerm) (current_fuel : Nat) (head : CoreTerm)
+        (frames : List ApplicationCheckFrame) : CheckResult CoreTerm :=
+      check_bind CoreTerm CoreTerm (descend current_fuel sig ctx (IGTerm head))
+        (fun (function_type : CoreTerm) =>
+          check_bind PiParts CoreTerm (pi_view_checked_indexed current_fuel sig function_type)
+            (fun (parts : PiParts) => match parts with
+              | MkPi domain codomain => match actual_argument with
+                  | CApp next_function next_argument => match current_fuel with
+                      | Z => CheckErr CoreTerm CheckResourceLimit
+                      | S checking_fuel => match checking_fuel with
+                          | Z => CheckErr CoreTerm CheckResourceLimit
+                          | S nested_fuel =>
+                              collect next_argument nested_fuel next_function
+                                (Cons ApplicationCheckFrame
+                                  (MkApplicationCheckFrame checking_fuel domain actual_argument codomain) frames)
+                          end
+                      end
+                  | CRel _ => inference_check_last_argument descend current_fuel sig ctx actual_argument domain codomain frames
+                  | CSort _ => inference_check_last_argument descend current_fuel sig ctx actual_argument domain codomain frames
+                  | CPi _ _ => inference_check_last_argument descend current_fuel sig ctx actual_argument domain codomain frames
+                  | CLam _ _ => inference_check_last_argument descend current_fuel sig ctx actual_argument domain codomain frames
+                  | CLetIn _ _ _ => inference_check_last_argument descend current_fuel sig ctx actual_argument domain codomain frames
+                  | CConst _ => inference_check_last_argument descend current_fuel sig ctx actual_argument domain codomain frames
+                  | CInd _ => inference_check_last_argument descend current_fuel sig ctx actual_argument domain codomain frames
+                  | CConstruct _ _ _ => inference_check_last_argument descend current_fuel sig ctx actual_argument domain codomain frames
+                  | CStrBytes _ _ => inference_check_last_argument descend current_fuel sig ctx actual_argument domain codomain frames
+                  | CStrLit _ _ => inference_check_last_argument descend current_fuel sig ctx actual_argument domain codomain frames
+                  | CCase _ _ _ _ => inference_check_last_argument descend current_fuel sig ctx actual_argument domain codomain frames
+                  | CFix _ _ _ _ _ => inference_check_last_argument descend current_fuel sig ctx actual_argument domain codomain frames
+                  end
+              end))) argument fuel function (Nil ApplicationCheckFrame);
+
+def infer_application
+    (descend : Nat -> CheckEnvironment -> List CoreTerm -> InferGoal -> CheckResult CoreTerm)
+    (fuel : Nat) (sig : CheckEnvironment) (ctx : List CoreTerm)
+    (function : CoreTerm) (argument : CoreTerm) : CheckResult CoreTerm :=
+    match function with
+    | CApp _ _ => infer_application_spine descend fuel sig ctx function argument
+    | CRel _ => infer_single_application descend fuel sig ctx function argument
+    | CSort _ => infer_single_application descend fuel sig ctx function argument
+    | CPi _ _ => infer_single_application descend fuel sig ctx function argument
+    | CLam _ _ => infer_single_application descend fuel sig ctx function argument
+    | CLetIn _ _ _ => infer_single_application descend fuel sig ctx function argument
+    | CConst _ => infer_single_application descend fuel sig ctx function argument
+    | CInd _ => infer_single_application descend fuel sig ctx function argument
+    | CConstruct _ _ _ => infer_single_application descend fuel sig ctx function argument
+    | CStrBytes _ _ => infer_single_application descend fuel sig ctx function argument
+    | CStrLit _ _ => infer_single_application descend fuel sig ctx function argument
+    | CCase _ _ _ _ => infer_single_application descend fuel sig ctx function argument
+    | CFix _ _ _ _ _ => infer_single_application descend fuel sig ctx function argument
+    end;
+
+def infer_inductive_indexed (sig : CheckEnvironment) (name : Nat) : CheckResult CoreTerm :=
+    check_bind IndDecl CoreTerm
+      (check_from_maybe IndDecl (CheckMalformedCore (CheckUnknownInductive name)) (check_environment_ind name sig))
+      (fun (decl : IndDecl) =>
+        match decl with
+        | MkIndDecl _ params indices sort _ =>
+            CheckOk CoreTerm (mk_pis (params_types params) (mk_pis indices (CSort sort)))
+        end);
+
+def infer_constructor_indexed (sig : CheckEnvironment) (ind : Nat) (index : Nat) (nparams : Nat)
+    : CheckResult CoreTerm :=
+    check_bind IndDecl CoreTerm
+      (check_from_maybe IndDecl (CheckMalformedCore (CheckUnknownInductive ind)) (check_environment_ind ind sig))
+      (fun (decl : IndDecl) =>
+        match decl with
+        | MkIndDecl _ params _indices _sort ctors =>
+            check_bind Unit CoreTerm
+              (check_require (eqNat nparams (length Param params)) (CheckMalformedCore CheckConstructorParameters))
+              (fun (_parameters : Unit) =>
+                check_bind Ctor CoreTerm
+                  (check_from_maybe Ctor (CheckMalformedCore (CheckUnknownConstructor ind index))
+                    (compiler_nth Ctor ctors index))
+                  (fun (ctor : Ctor) =>
+                    match ctor with | MkCtor _ typ => CheckOk CoreTerm typ end))
+        end);
+
+def infer_fix
+    (infer : CheckEnvironment -> List CoreTerm -> InferGoal -> CheckResult CoreTerm)
+    (fuel : Nat) (sig : CheckEnvironment) (ctx : List CoreTerm)
+    (rec_arg : Nat) (arity : Nat) (annotation : CoreTerm) (body : CoreTerm) : CheckResult CoreTerm :=
+    check_bind CoreTerm CoreTerm (infer sig ctx (IGTerm annotation))
+      (fun (annotation_type : CoreTerm) =>
+        check_bind Nat CoreTerm (check_sort_indexed fuel sig annotation_type)
+          (fun (_level : Nat) =>
+            check_bind PiList CoreTerm (peel_pis_checked_indexed sig fuel annotation)
+              (fun (telescope : PiList) =>
+                match telescope with
+                | MkPiList domains _ =>
+                    check_bind Unit CoreTerm
+                      (check_require (andb (compiler_le_nat arity (length CoreTerm domains)) (ltNat rec_arg arity))
+                        (CheckMalformedCore CheckFixMetadata))
+                      (fun (_metadata : Unit) =>
+                        check_bind Unit CoreTerm
+                          (check_term_using infer sig fuel (extend ctx annotation) body (lift 1 annotation))
+                          (fun (_body : Unit) =>
+                            check_map Unit CoreTerm (fun (_termination : Unit) => annotation)
+                              (check_termination_checked rec_arg arity fuel body)))
+                end)));
+
+def infer_case_shape
+    (infer : CheckEnvironment -> List CoreTerm -> InferGoal -> CheckResult CoreTerm)
+    (fuel : Nat) (sig : CheckEnvironment) (ctx : List CoreTerm)
+    (info : CaseInfo) (predicate : CoreTerm) (scrutinee : CoreTerm)
+    (bodies : List CoreTerm) (predicate_type : CoreTerm) (scrutinee_type : CoreTerm)
+    : CheckResult CoreTerm :=
+    match info with
+    | MkCaseInfo ind nparams arities =>
+        check_bind IndDecl CoreTerm
+          (check_from_maybe IndDecl (CheckMalformedCore (CheckUnknownInductive ind)) (check_environment_ind ind sig))
+          (fun (decl : IndDecl) =>
+            match decl with
+            | MkIndDecl _ params indices _ ctors =>
+                let nindices : Nat := length CoreTerm indices in
+                check_bind Unit CoreTerm
+                  (check_require
+                    (andb (eqNat nparams (length Param params))
+                      (andb (eqNat (length CoreTerm bodies) (length Ctor ctors))
+                        (eqNat (length Nat arities) (length Ctor ctors))))
+                    (CheckMalformedCore CheckCaseMetadata))
+                  (fun (_metadata : Unit) =>
+                    check_bind CoreTerm CoreTerm
+                      (check_from_normalize CoreTerm (whnf_checked_worker fuel sig scrutinee_type))
+                      (fun (normal_type : CoreTerm) =>
+                        check_bind Spine CoreTerm (check_from_normalize Spine (app_spine_checked fuel normal_type))
+                          (fun (spine : Spine) =>
+                            match spine with
+                            | MkSpine head args =>
+                                check_bind Nat CoreTerm
+                                  (check_from_maybe Nat (CheckTypeFailure CheckCaseMotive) (asInd head))
+                                  (fun (actual_ind : Nat) =>
+                                    check_bind Unit CoreTerm
+                                      (check_require
+                                        (andb (eqNat actual_ind ind) (eqNat (length CoreTerm args) (add nparams nindices)))
+                                        (CheckMalformedCore CheckCaseMetadata))
+                                      (fun (_arguments : Unit) =>
+                                        check_bind Unit CoreTerm
+                                          (check_return_pred_checked_indexed fuel sig info (take CoreTerm nparams args) predicate_type)
+                                          (fun (_motive : Unit) =>
+                                            infer sig ctx
+                                              (IGCaseBranches ind nparams nindices arities args predicate scrutinee bodies))))
+                            end)))
+            end)
+    end;
+
+def infer_case_branches
+    (infer : CheckEnvironment -> List CoreTerm -> InferGoal -> CheckResult CoreTerm)
+    (fuel : Nat) (sig : CheckEnvironment) (ctx : List CoreTerm)
+    (ind : Nat) (nparams : Nat) (nindices : Nat) (arities : List Nat)
+    (args : List CoreTerm) (predicate : CoreTerm) (scrutinee : CoreTerm) (bodies : List CoreTerm)
+    : CheckResult CoreTerm :=
+    check_bind IndDecl CoreTerm
+      (check_from_maybe IndDecl (CheckMalformedCore (CheckUnknownInductive ind)) (check_environment_ind ind sig))
+      (fun (decl : IndDecl) =>
+        match decl with
+        | MkIndDecl _ _ _ _ ctors =>
+            check_map Unit CoreTerm
+              (fun (_branches : Unit) =>
+                mk_app predicate (append CoreTerm (drop CoreTerm nparams args) ([scrutinee] : List CoreTerm)))
+              (infer_check_branches infer fuel sig ctx ind nparams nindices args predicate ctors arities bodies Z)
+        end);
+
+-- The structural guard decreases on every recursive call. Logical fuel keeps
+-- the old per-goal budget when a spine descends straight to its original head.
+-- Every requested logical budget is <= the parent's predecessor, hence remains
+-- <= guard fuel; no public entry supplies an independent logical budget.
+def infer_deferred : Nat -> Nat -> CheckEnvironment -> List CoreTerm -> Nat -> List CoreTerm -> InferGoal -> CheckResult CoreTerm :=
+  fix infer_deferred (guard : Nat) (fuel : Nat) (sig : CheckEnvironment) (ctx : List CoreTerm)
+      (count : Nat) (values : List CoreTerm) (goal : InferGoal) : CheckResult CoreTerm :=
+    match guard with
+    | Z => CheckErr CoreTerm CheckResourceLimit
+    | S next_guard => match fuel with
+      | Z => CheckErr CoreTerm CheckResourceLimit
+      | S fuel' =>
+          let descend : Nat -> CheckEnvironment -> List CoreTerm -> InferGoal -> CheckResult CoreTerm :=
+            fun (limit : Nat) (next_sig : CheckEnvironment) (next_ctx : List CoreTerm) (next_goal : InferGoal) =>
+              infer_deferred next_guard limit next_sig next_ctx Z (Nil CoreTerm) next_goal in
+          let infer : CheckEnvironment -> List CoreTerm -> InferGoal -> CheckResult CoreTerm := descend fuel' in
+          match goal with
+          | IGTerm term => match let_parts term with
+              | Just parts => match parts with
+                  | MkLetParts value annotation body =>
+                      infer_deferred next_guard fuel' sig ctx count values (IGLet value annotation body)
+                  end
+              | Nothing => let_bodies_result CoreTerm count
+                  (infer_term infer fuel' sig ctx (subst_many count values term))
+              end
+          | IGPi domain codomain => infer_pi infer fuel' sig ctx domain codomain
+          | IGLam annotation body => infer_lambda infer fuel' sig ctx annotation body
+          | IGApp function argument => infer_application descend fuel' sig ctx function argument
+          | IGLet value annotation body =>
+              let actual_value : CoreTerm := subst_many count values value in
+              let actual_annotation : CoreTerm := subst_many count values annotation in
+              check_bind Unit CoreTerm
+                (let_bodies_result Unit count
+                  (check_let_value_using infer
+                    (fun (input : CoreTerm) (typ : CoreTerm) => check_term_using infer sig fuel' ctx input typ)
+                    fuel' sig ctx actual_value actual_annotation))
+                (fun (_checked : Unit) =>
+                  infer_deferred next_guard fuel' sig ctx (S count) (Cons CoreTerm actual_value values) (IGTerm body))
+          | IGInd name => infer_inductive_indexed sig name
+          | IGCtor ind index nparams => infer_constructor_indexed sig ind index nparams
+          | IGFix _name rec_arg arity annotation body => infer_fix infer fuel' sig ctx rec_arg arity annotation body
+          | IGCase info predicate scrutinee bodies =>
+              check_bind CoreTerm CoreTerm (infer sig ctx (IGTerm predicate))
+                (fun (typ : CoreTerm) => infer sig ctx (IGCaseAfterP info predicate scrutinee bodies typ))
+          | IGCaseAfterP info predicate scrutinee bodies predicate_type =>
+              check_bind CoreTerm CoreTerm (infer sig ctx (IGTerm scrutinee))
+                (fun (typ : CoreTerm) =>
+                  infer sig ctx (IGCaseAfterS info predicate scrutinee bodies predicate_type typ))
+          | IGCaseAfterS info predicate scrutinee bodies predicate_type scrutinee_type =>
+              infer_case_shape infer fuel' sig ctx info predicate scrutinee bodies predicate_type scrutinee_type
+          | IGCaseBranches ind nparams nindices arities args predicate scrutinee bodies =>
+              infer_case_branches infer fuel' sig ctx ind nparams nindices arities args predicate scrutinee bodies
+          end
+      end
+    end;
+
+def infer_checked_worker (fuel : Nat) (sig : CheckEnvironment) (ctx : List CoreTerm) (goal : InferGoal)
+    : CheckResult CoreTerm :=
+    infer_deferred fuel fuel sig ctx Z (Nil CoreTerm) goal;
+
+def check_input_infer_goal (goal : InferGoal) (pending : List CheckInputWork) : List CheckInputWork :=
+    match goal with
+    | IGTerm term => Cons CheckInputWork (CheckInputTerm term) pending
+    | IGPi domain codomain => Cons CheckInputWork (CheckInputTerm domain) (Cons CheckInputWork (CheckInputTerm codomain) pending)
+    | IGLam annotation body => Cons CheckInputWork (CheckInputTerm annotation) (Cons CheckInputWork (CheckInputTerm body) pending)
+    | IGApp function argument => Cons CheckInputWork (CheckInputTerm function) (Cons CheckInputWork (CheckInputTerm argument) pending)
+    | IGLet value annotation body => Cons CheckInputWork (CheckInputTerm value)
+        (Cons CheckInputWork (CheckInputTerm annotation) (Cons CheckInputWork (CheckInputTerm body) pending))
+    | IGInd _ => pending
+    | IGCtor _ _ _ => pending
+    | IGFix _ _ _ annotation body => Cons CheckInputWork (CheckInputTerm annotation) (Cons CheckInputWork (CheckInputTerm body) pending)
+    | IGCase info predicate scrutinee branches => check_input_case info
+        (Cons CheckInputWork (CheckInputTerm predicate) (Cons CheckInputWork (CheckInputTerm scrutinee)
+          (Cons CheckInputWork (CheckInputTerms branches) pending)))
+    | IGCaseAfterP info predicate scrutinee branches predicate_type => check_input_case info
+        (Cons CheckInputWork (CheckInputTerm predicate) (Cons CheckInputWork (CheckInputTerm scrutinee)
+          (Cons CheckInputWork (CheckInputTerms branches) (Cons CheckInputWork (CheckInputTerm predicate_type) pending))))
+    | IGCaseAfterS info predicate scrutinee branches predicate_type scrutinee_type => check_input_case info
+        (Cons CheckInputWork (CheckInputTerm predicate) (Cons CheckInputWork (CheckInputTerm scrutinee)
+          (Cons CheckInputWork (CheckInputTerms branches) (Cons CheckInputWork (CheckInputTerm predicate_type)
+            (Cons CheckInputWork (CheckInputTerm scrutinee_type) pending)))))
+    | IGCaseBranches _ _ _ arities args predicate scrutinee branches =>
+        Cons CheckInputWork (CheckInputNaturals arities) (Cons CheckInputWork (CheckInputTerms args)
+          (Cons CheckInputWork (CheckInputTerm predicate) (Cons CheckInputWork (CheckInputTerm scrutinee)
+            (Cons CheckInputWork (CheckInputTerms branches) pending))))
+    end;
+
+def infer_checked_indexed (fuel : Nat) (sig : CheckEnvironment) (ctx : List CoreTerm) (goal : InferGoal)
+    : CheckResult CoreTerm :=
+    check_input_guard CoreTerm (check_input_infer_goal goal ([CheckInputTerms ctx] : List CheckInputWork))
+      (fun (_work : Unit) => infer_checked_worker fuel sig ctx goal);
+
+def check_term_checked_worker (fuel : Nat) (sig : CheckEnvironment) (ctx : List CoreTerm)
+    (term : CoreTerm) (expected : CoreTerm) : CheckResult Unit :=
+    check_term_using
+      (fun (next_sig : CheckEnvironment) (next_ctx : List CoreTerm) (goal : InferGoal) =>
+        infer_checked_worker fuel next_sig next_ctx goal) sig fuel ctx term expected;
+
+def check_term_checked_indexed (fuel : Nat) (sig : CheckEnvironment) (ctx : List CoreTerm)
+    (term : CoreTerm) (expected : CoreTerm) : CheckResult Unit :=
+    check_input_guard Unit ([CheckInputTerms ctx, CheckInputTerm term, CheckInputTerm expected] : List CheckInputWork)
+      (fun (_work : Unit) => check_term_checked_worker fuel sig ctx term expected);
+
+-- Raw-list compatibility boundaries derive lookup state exactly once.
+def infer_checked (fuel : Nat) (sig : List Entry) (ctx : List CoreTerm) (goal : InferGoal)
+    : CheckResult CoreTerm :=
+    infer_checked_indexed fuel (check_environment_from_entries sig) ctx goal;
+
+def check_term_checked (fuel : Nat) (sig : List Entry) (ctx : List CoreTerm) (term : CoreTerm) (expected : CoreTerm)
+    : CheckResult Unit :=
+    check_term_checked_indexed fuel (check_environment_from_entries sig) ctx term expected;

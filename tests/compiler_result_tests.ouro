@@ -1,0 +1,144 @@
+-- Error classes survive inference, reduction and the declaration boundary.
+
+import "../compiler/file_elab.ouro";
+import "../std/io.ouro";
+
+inductive ResultLaw : Type := | MkResultLaw : String -> Bool -> ResultLaw;
+
+def result_kind (A : Type) (result : CheckResult A) : Nat :=
+    match result with
+    | CheckOk _ => 0
+    | CheckErr failure =>
+        match failure with
+        | CheckTypeFailure _ => 1
+        | CheckMalformedCore _ => 2
+        | CheckReductionFailure _ => 3
+        | CheckResourceLimit => 4
+        | CheckUnsupported _ => 5
+        | CheckCancelled => 6
+        | CheckInternalFailure _ => 7
+        | CheckPrimitiveFailure _ => 8
+        end
+    end;
+
+def result_step_code (expected : Nat) (step : StepResult) : Bool :=
+    match step with
+    | StepErr actual name => andb (eqNat actual expected) (eqNat name 90)
+    | StepOk _ => False
+    end;
+
+def result_unknown_global : Bool :=
+    match infer_checked 100 (Nil Entry) (Nil CoreTerm) (IGTerm (CConst 77)) with
+    | CheckOk _ => False
+    | CheckErr failure =>
+        match failure with
+        | CheckMalformedCore fault =>
+            match fault with
+            | CheckUnboundGlobal name => eqNat name 77
+            | CheckUnboundVariable _ => False
+            | CheckUnknownInductive _ => False
+            | CheckUnknownConstructor _ _ => False
+            | CheckConstructorParameters => False
+            | CheckCaseMetadata => False
+            | CheckFixMetadata => False
+            | CheckLiteralType _ => False
+            | CheckUnresolvedLiteral _ => False
+            | CheckDuplicateName _ => False
+            end
+        | CheckTypeFailure _ => False
+        | CheckReductionFailure _ => False
+        | CheckResourceLimit => False
+        | CheckUnsupported _ => False
+        | CheckCancelled => False
+        | CheckInternalFailure _ => False
+        | CheckPrimitiveFailure _ => False
+        end
+    end;
+
+-- The cyclic environment is deliberately unchecked input to the reduction
+-- probe. An unfinished reduction must report its limit when conversion needs it.
+def result_cycle : List Entry :=
+    [MkEntry 70 (CSort 0) (Just CoreTerm (CConst 71)),
+     MkEntry 71 (CSort 0) (Just CoreTerm (CConst 70))];
+
+def result_zero_fix_arity : Bool :=
+    match infer_checked 100 [] [] (IGTerm (CFix 90 0 0 (CSort 0) (CRel 0))) with
+    | CheckOk _ => False
+    | CheckErr failure => match failure with
+        | CheckMalformedCore fault => match fault with
+            | CheckFixMetadata => True
+            | CheckUnboundGlobal _ => False
+            | CheckUnboundVariable _ => False
+            | CheckUnknownInductive _ => False
+            | CheckUnknownConstructor _ _ => False
+            | CheckConstructorParameters => False
+            | CheckCaseMetadata => False
+            | CheckLiteralType _ => False
+            | CheckUnresolvedLiteral _ => False
+            | CheckDuplicateName _ => False
+            end
+        | CheckTypeFailure _ => False
+        | CheckReductionFailure _ => False
+        | CheckResourceLimit => False
+        | CheckUnsupported _ => False
+        | CheckCancelled => False
+        | CheckInternalFailure _ => False
+        | CheckPrimitiveFailure _ => False
+        end
+    end;
+
+def result_laws : List ResultLaw :=
+    [ MkResultLaw "inference reports resource at zero budget"
+        (eqNat (result_kind CoreTerm (infer_checked 0 (Nil Entry) (Nil CoreTerm) (IGTerm (CSort 0)))) 4)
+    , MkResultLaw "ordinary sort inference succeeds"
+        (eqNat (result_kind CoreTerm (infer_checked 100 (Nil Entry) (Nil CoreTerm) (IGTerm (CSort 0)))) 0)
+    , MkResultLaw "unknown global keeps its identifier" result_unknown_global
+    , MkResultLaw "literal with absent type is malformed"
+        (eqNat (result_kind CoreTerm (infer_checked 100 (Nil Entry) (Nil CoreTerm) (IGTerm (CStrBytes ([] : List Nat) 77)))) 2)
+    , MkResultLaw "free relative variable is malformed"
+        (eqNat (result_kind CoreTerm (infer_checked 100 (Nil Entry) (Nil CoreTerm) (IGTerm (CRel 0)))) 2)
+    , MkResultLaw "sort mismatch is a type failure"
+        (eqNat (result_kind Unit (check_term_checked 100 (Nil Entry) (Nil CoreTerm) (CSort 0) (CSort 0))) 1)
+    , MkResultLaw "nonfunction application is a type failure"
+        (eqNat (result_kind CoreTerm
+          (infer_checked 100 (Nil Entry) (Nil CoreTerm) (IGTerm (CApp (CSort 0) (CSort 0))))) 1)
+    , MkResultLaw "malformed reduction keeps its error class"
+        (eqNat (result_kind Nat (check_sort 100 (Nil Entry) (CApp (CSort 0) (CSort 0)))) 3)
+    , MkResultLaw "conversion propagates unfinished alias reduction"
+        (eqNat (result_kind Unit (check_convertible 8 result_cycle (CConst 70) (CConst 71))) 4)
+    , MkResultLaw "Pi head lookup keeps reduction resource failure"
+        (eqNat (result_kind PiParts (pi_view_checked 8 result_cycle (CConst 70))) 4)
+    , MkResultLaw "cumulativity keeps reduction resource failure"
+        (eqNat (result_kind Bool (cumul_checked 8 result_cycle (CConst 70) (CSort 0))) 4)
+    , MkResultLaw "termination traversal reports resource"
+        (eqNat (result_kind Unit (check_termination_checked 0 1 0 (CLam (CSort 0) (CRel 0)))) 4)
+    , MkResultLaw "nondecreasing recursive reference is a type failure"
+        (eqNat (result_kind Unit (check_termination_checked 0 1 100 (CRel 0))) 1)
+    , MkResultLaw "declaration body resource maps to code 4"
+        (result_step_code 4 (check_item 1 (Nil Entry) (FDef 90 (CSort 1) (CSort 0))))
+    , MkResultLaw "the same declaration succeeds with sufficient budget"
+        (match check_item 100 (Nil Entry) (FDef 90 (CSort 1) (CSort 0)) with
+         | StepOk _ => True | StepErr _ _ => False end)
+    , MkResultLaw "declaration type mismatch remains code 1"
+        (result_step_code 1 (check_item 100 (Nil Entry) (FDef 90 (CSort 0) (CSort 0))))
+    , MkResultLaw "malformed declaration body is code 6"
+        (result_step_code 6 (check_item 100 (Nil Entry) (FDef 90 (CSort 0) (CConst 77))))
+    , MkResultLaw "source refinement propagates zero budget"
+        (result_step_code 4 (elaborate_check_item 0 (Nil Entry) (FDef 90 (CSort 1) (CSort 0))))
+    , MkResultLaw "constructor closure conversion propagates zero budget"
+        (eqNat (result_kind CoreTerm (close_constructors_checked 0 (Nil Entry) (CSort 0))) 4)
+    , MkResultLaw "zero fix arity has the exact malformed metadata fault" result_zero_fix_arity
+    ];
+
+-- @entry main
+def main : IO Unit :=
+    (fix run (laws : List ResultLaw) (failed : Bool) : IO Unit :=
+      match laws with
+      | Nil => match failed with | True => exit 1 | False => exit 0 end
+      | Cons law rest =>
+          match law with
+          | MkResultLaw name passed =>
+              do println (prim_string_concat (match passed with | True => "ok " | False => "FAIL " end) name);
+                 run rest (orb failed (notb passed))
+          end
+      end) result_laws False;

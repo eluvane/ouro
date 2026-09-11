@@ -1,0 +1,161 @@
+-- Type classification follows registered identities after checked reduction.
+-- Natural numbers, proofs, and closures never receive a machine-word fallback.
+import "lower_boundary.ouro";
+
+def lower_from_primitive (A : Type) (typ : CoreTerm) (value : Either PrimitiveError A)
+    : Either NativeLowerError A :=
+    match check_from_primitive A value with | CheckOk item => Right NativeLowerError A item
+    | CheckErr err => match lower_failure_resource err with | True => Left NativeLowerError A LowerResourceExhausted
+      | False => Left NativeLowerError A (LowerUnsupportedType typ) end end;
+
+def lower_is_role (entries : List Entry) (typ : CoreTerm) (kind : PrimitiveRole) : Bool :=
+    match primitive_shape typ with
+    | PrimitiveShapeAtom tag id => andb (eqNat tag 3)
+        (any PrimitiveRoleBinding (fun (role : PrimitiveRoleBinding) =>
+          andb (primitive_role_equal (primitive_role_kind role) kind)
+            (eqNat id (primitive_role_id role))) (primitive_roles_environment entries))
+    | PrimitiveShapePair _ _ _ => False | PrimitiveShapeOther => False end;
+
+def lower_is_unit (entries : List Entry) (typ : CoreTerm) : Bool :=
+    lower_is_role entries typ PrimitiveUnitRole;
+
+def lower_scalar_type (fuel : Nat) (sig : CheckEnvironment) (normal : CoreTerm)
+    : Either NativeLowerError LowerType :=
+    match lower_is_unit (check_environment_entries sig) normal with
+    | True => Right NativeLowerError LowerType (LowerTypeOf normal (Nothing MirType) False)
+    | False => match lower_is_role (check_environment_entries sig) normal PrimitiveBoolRole with
+      | True => Right NativeLowerError LowerType (LowerTypeOf normal (Just MirType MirU8) False)
+      | False => lower_bind PrimitiveAbiValue LowerType
+        (lower_from_primitive PrimitiveAbiValue normal
+          (primitive_abi_value (primitive_check_budget fuel) (primitive_normalizer_indexed sig)
+            (primitive_environment (check_environment_entries sig)) (primitive_roles_environment (check_environment_entries sig)) normal))
+        (fun (abi : PrimitiveAbiValue) => match abi with
+          | PrimitiveAbiWord word => Right NativeLowerError LowerType (LowerTypeOf normal (Just MirType (lower_word word)) False)
+          | PrimitiveAbiPointer _ => Right NativeLowerError LowerType (LowerTypeOf normal (Just MirType MirRawPtr) False)
+          | PrimitiveAbiFunction _ => Left NativeLowerError LowerType (LowerUnsupportedType normal) end) end end;
+
+def lower_classify_type (fuel : Nat) (sig : CheckEnvironment) (typ : CoreTerm)
+    : Either NativeLowerError LowerType :=
+    lower_bind CoreTerm LowerType (lower_normalize fuel sig typ) (fun (normal : CoreTerm) =>
+      match primitive_shape normal with
+      | PrimitiveShapePair tag head result => match andb (eqNat tag 5)
+          (primitive_head_is (primitive_environment (check_environment_entries sig)) head PrimitiveRuntimeType) with
+        | True => lower_map LowerType LowerType
+            (fun (scalar : LowerType) => LowerTypeOf normal (lower_type_mir scalar) True)
+            (lower_scalar_type fuel sig result)
+        | False => lower_scalar_type fuel sig normal end
+      | PrimitiveShapeAtom _ _ => lower_scalar_type fuel sig normal
+      | PrimitiveShapeOther => lower_scalar_type fuel sig normal end);
+
+def lower_type_same (fuel : Nat) (left : LowerType) (right : LowerType)
+    : Either NativeLowerError Unit :=
+    lower_bind Unit Unit
+      (lower_require (compiler_bool_equal (lower_type_action left) (lower_type_action right)) LowerEffectMismatch)
+      (fun (_ : Unit) => lower_core_equal fuel 0 (lower_type_core left) (lower_type_core right));
+
+def lower_pure_type (typ : LowerType) : Either NativeLowerError LowerType :=
+    match typ with | LowerTypeOf core mir action => match action with
+      | False => Right NativeLowerError LowerType typ
+      | True => match primitive_shape core with
+        | PrimitiveShapePair tag _ inner => lower_map Unit LowerType
+            (fun (_ : Unit) => LowerTypeOf inner mir False)
+            (lower_require (eqNat tag 5) (LowerUnsupportedType core))
+        | PrimitiveShapeAtom _ _ => Left NativeLowerError LowerType (LowerUnsupportedType core)
+        | PrimitiveShapeOther => Left NativeLowerError LowerType (LowerUnsupportedType core) end end end;
+
+def lower_runtime_type (sig : CheckEnvironment) (typ : LowerType) : Either NativeLowerError LowerType :=
+    lower_bind Unit LowerType (lower_require (notb (lower_type_action typ)) LowerEffectMismatch)
+      (fun (_ : Unit) => lower_map CoreTerm LowerType
+        (fun (runtime : CoreTerm) => LowerTypeOf (CApp runtime (lower_type_core typ)) (lower_type_mir typ) True)
+        (lower_from_primitive CoreTerm (lower_type_core typ)
+          (primitive_type_ref PrimitiveRuntimeType (primitive_environment (check_environment_entries sig)))));
+
+def lower_signature_result (fuel : Nat) (sig : CheckEnvironment) (normal : CoreTerm)
+    : Either NativeLowerError (Pair (List LowerType) LowerType) :=
+    lower_map LowerType (Pair (List LowerType) LowerType)
+      (fun (result : LowerType) => MkPair (List LowerType) LowerType ([] : List LowerType) result)
+      (lower_classify_type fuel sig normal);
+
+def lower_signature_parts (sig : CheckEnvironment)
+    : Nat -> CoreTerm -> Either NativeLowerError (Pair (List LowerType) LowerType) :=
+  fix parts (fuel : Nat) (normal : CoreTerm) : Either NativeLowerError (Pair (List LowerType) LowerType) :=
+    match fuel with | Z => Left NativeLowerError (Pair (List LowerType) LowerType) LowerResourceExhausted
+    | S next => match primitive_shape normal with
+      | PrimitiveShapePair tag domain codomain => match eqNat tag 4 with
+        | False => lower_signature_result next sig normal
+        | True => lower_bind LowerType (Pair (List LowerType) LowerType)
+          (lower_classify_type next sig domain) (fun (argument : LowerType) =>
+            lower_bind Unit (Pair (List LowerType) LowerType)
+              (lower_require (andb (notb (lower_type_action argument))
+                (match lower_type_mir argument with | Nothing => False | Just _ => True end))
+                (LowerUnsupportedType domain)) (fun (_ : Unit) =>
+                  lower_map (Pair (List LowerType) LowerType) (Pair (List LowerType) LowerType)
+                    (fun (tail : Pair (List LowerType) LowerType) => match tail with | MkPair args result =>
+                      MkPair (List LowerType) LowerType (Cons LowerType argument args) result end) (parts next codomain))) end
+      | PrimitiveShapeAtom _ _ => lower_signature_result next sig normal
+      | PrimitiveShapeOther => lower_signature_result next sig normal end end;
+
+def lower_make_contract_indexed (fuel : Nat) (sig : CheckEnvironment) (id : Nat) (typ : CoreTerm)
+    (binding : Maybe PrimitiveBinding) : Either NativeLowerError LowerContract :=
+    lower_bind CoreTerm LowerContract (lower_normalize fuel sig typ) (fun (normal : CoreTerm) =>
+      lower_map (Pair (List LowerType) LowerType) LowerContract
+        (fun (parts : Pair (List LowerType) LowerType) => match parts with | MkPair args result =>
+          LowerContractOf id normal args result binding end) (lower_signature_parts sig fuel normal));
+
+def lower_collect_contracts_indexed (sig : CheckEnvironment)
+    : Nat -> List Entry -> Either NativeLowerError (List LowerContract) :=
+  fix collect (fuel : Nat) (pending : List Entry) : Either NativeLowerError (List LowerContract) :=
+    match fuel with | Z => Left NativeLowerError (List LowerContract) LowerResourceExhausted
+    | S next => match pending with | Nil => Right NativeLowerError (List LowerContract) ([] : List LowerContract)
+      | Cons entry rest =>
+        let current : Either NativeLowerError (Maybe LowerContract) := match entry with
+          | MkEntry id typ body => match body with
+            | Nothing => Right NativeLowerError (Maybe LowerContract) (Nothing LowerContract)
+            | Just _ => lower_bind CoreTerm (Maybe LowerContract) (lower_normalize next sig typ)
+                (fun (normal : CoreTerm) => match core_sort_level normal with
+                  | Just _ => Right NativeLowerError (Maybe LowerContract) (Nothing LowerContract)
+                  | Nothing => lower_map LowerContract (Maybe LowerContract) (fun (contract : LowerContract) => Just LowerContract contract)
+                      (lower_make_contract_indexed next sig id normal (Nothing PrimitiveBinding)) end) end
+          | MkBoundEntry id typ binding => match binding with
+            | PrimitiveIntrinsicBinding _ _ _ _ => Right NativeLowerError (Maybe LowerContract) (Nothing LowerContract)
+            | PrimitiveExternBinding _ => lower_map LowerContract (Maybe LowerContract)
+                (fun (contract : LowerContract) => Just LowerContract contract)
+                (lower_make_contract_indexed next sig id typ (Just PrimitiveBinding binding)) end
+          | MkIndEntry _ _ => Right NativeLowerError (Maybe LowerContract) (Nothing LowerContract)
+          | MkRoleEntry _ => Right NativeLowerError (Maybe LowerContract) (Nothing LowerContract) end in
+        lower_bind (Maybe LowerContract) (List LowerContract) current (fun (contract : Maybe LowerContract) =>
+          lower_map (List LowerContract) (List LowerContract) (fun (contracts : List LowerContract) =>
+            match contract with | Nothing => contracts | Just value => Cons LowerContract value contracts end)
+            (collect next rest)) end end;
+
+-- Raw entry points derive their index from the ordered declarations. Recursive
+-- classification and normalization share that index; it is no acceptance token.
+def lower_make_contract (fuel : Nat) (entries : List Entry) (id : Nat) (typ : CoreTerm)
+    (binding : Maybe PrimitiveBinding) : Either NativeLowerError LowerContract :=
+    lower_make_contract_indexed fuel (check_environment_from_entries entries) id typ binding;
+
+def lower_collect_contracts (entries : List Entry) (fuel : Nat) (pending : List Entry)
+    : Either NativeLowerError (List LowerContract) :=
+    lower_collect_contracts_indexed (check_environment_from_entries entries) fuel pending;
+
+def lower_argument_types : List LowerType -> Either NativeLowerError (List MirType) :=
+  fix types (args : List LowerType) : Either NativeLowerError (List MirType) :=
+    match args with | Nil => Right NativeLowerError (List MirType) ([] : List MirType)
+    | Cons arg rest => match lower_type_mir arg with
+      | Nothing => Left NativeLowerError (List MirType) (LowerUnsupportedType (lower_type_core arg))
+      | Just mir => lower_map (List MirType) (List MirType)
+          (fun (more : List MirType) => Cons MirType mir more) (types rest) end end;
+
+def lower_mir_signature (contract : LowerContract) : Either NativeLowerError MirSignature :=
+    match contract with | LowerContractOf _ _ args result _ => lower_map (List MirType) MirSignature
+      (fun (types : List MirType) => MirSignatureOf types (lower_type_mir result)) (lower_argument_types args) end;
+
+def lower_spine : Nat -> CoreTerm -> List CoreTerm -> Either NativeLowerError (Pair CoreTerm (List CoreTerm)) :=
+  fix spine (fuel : Nat) (term : CoreTerm) (args : List CoreTerm) : Either NativeLowerError (Pair CoreTerm (List CoreTerm)) :=
+    match fuel with | Z => Left NativeLowerError (Pair CoreTerm (List CoreTerm)) LowerResourceExhausted
+    | S next => let ready : Either NativeLowerError (Pair CoreTerm (List CoreTerm)) :=
+        Right NativeLowerError (Pair CoreTerm (List CoreTerm)) (MkPair CoreTerm (List CoreTerm) term args) in
+      match lower_term_view term with | LowerApplyTerm head arg => spine next head (Cons CoreTerm arg args)
+      | LowerLocalTerm _ => ready | LowerLambdaTerm _ _ => ready | LowerLetTerm _ _ _ => ready
+      | LowerGlobalTerm _ => ready | LowerConstructorTerm _ _ _ => ready
+      | LowerCaseTerm _ _ _ _ => ready | LowerOtherTerm _ => ready end end;

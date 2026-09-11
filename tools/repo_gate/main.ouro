@@ -1,0 +1,164 @@
+-- Ouro-native repository/docs/project gate entry point.
+
+-- @entry main
+
+import "paths.ouro";
+import "checks.ouro";
+import "policy.ouro";
+import "parity_closure.ouro";
+import "hardening.ouro";
+import "report.ouro";
+import "../../std/args.ouro";
+import "../../std/fs.ouro";
+import "../../std/io.ouro";
+import "../../std/pathx.ouro";
+
+
+def repo_gate_switches : List String := [ "list", "help" ];
+
+
+def repo_gate_allowed_options : List String :=
+    [ "profile", "root", "out" ];
+
+
+def repo_gate_usage : String :=
+    "usage: ouro-repo-gate [--profile docs|docs-native|project|project-native|workflow|workflow-native|repo|repo-native|pr-native|control-plane|control-plane-native|retirement|fixture|compiler-boundary] [--root DIR] [--out DIR] [--list]";
+
+
+def repo_gate_profile_aliases : List (Pair String String) :=
+    [ MkPair String String "docs-native" "docs"
+    , MkPair String String "project-native" "project"
+    , MkPair String String "workflow-native" "workflow"
+    , MkPair String String "repo-native" "repo"
+    , MkPair String String "pr-native" "repo"
+    , MkPair String String "control-plane-native" "control-plane"
+    ];
+def normalize_repo_gate_profile (profile : String) : String :=
+  match lookup String String str_eq profile repo_gate_profile_aliases with
+  | Nothing => profile
+  | Just alias => alias
+  end;
+
+
+def repo_gate_flag_known (name : String) : Bool :=
+    elem String str_eq name repo_gate_switches;
+
+
+def repo_gate_option_known (row : Pair String String) : Bool :=
+    match row with
+    | MkPair name _ => elem String str_eq name repo_gate_allowed_options
+    end;
+
+
+def repo_gate_cli_valid (raw : List String) (a : Args) : Bool :=
+    andb (args_argv_options_complete repo_gate_switches raw)
+      (andb (nullb String (args_positional a))
+        (andb (all String repo_gate_flag_known (args_flags a))
+          (all (Pair String String) repo_gate_option_known
+            (map_pairs String (args_opts a)))));
+
+
+def repo_gate_cli_error (a : Args) : IO Unit :=
+    do eprintln "invalid repository gate arguments";
+       eprint (args_show a);
+       eprintln repo_gate_usage;
+       exit 2
+
+
+def repo_gate_validate_cli (raw : List String) (a : Args) : IO Unit :=
+    match repo_gate_cli_valid raw a with
+    | True => io_unit
+    | False => repo_gate_cli_error a
+    end;
+
+
+def print_profile_names (names : List String) : IO Unit :=
+  io_foreach String
+    (fun (name : String) => println (str_concat "BLOCKING " name))
+    names;
+
+
+def default_repo_gate_out (profile : String) : String :=
+    path_join (["_build", "ouro_repo_gate", profile] : List String);
+
+
+def repo_gate_unknown_profile (profile : String) : IO Unit :=
+    do eprintln (str_concat "unknown repository gate profile: " profile);
+       eprintln repo_gate_usage;
+       exit 2
+
+
+def repo_gate_no_checks (profile : String) : IO Unit :=
+    do eprintln (str_concat "no repository gates selected: " profile);
+       eprintln repo_gate_usage;
+       exit 2
+
+
+def repo_gate_root_check (root : String) : IO Unit :=
+    do let! ok := fs_is_dir root;
+       match ok with
+       | True => io_unit
+       | False =>
+           do eprintln (str_concat "repository root is not a directory: " root);
+              exit 2
+       end
+
+
+def repo_gate_check_names (profile : String) : List String :=
+    append String
+      (append String (profile_check_names profile) (profile_extra_check_names profile))
+      (hardening_extra_check_names profile);
+
+
+def run_repo_gate_known_profile (a : Args) (requested_profile : String) : IO Unit :=
+    let profile : String := normalize_repo_gate_profile requested_profile in
+    let root : String := args_opt_or a "root" "." in
+    let out : String := args_opt_or a "out" (default_repo_gate_out requested_profile) in
+    let names : List String := repo_gate_check_names profile in
+    match nullb String names with
+    | True => repo_gate_no_checks requested_profile
+    | False =>
+        match args_flag a "list" with
+        | True =>
+            do print_profile_names names;
+               exit 0
+        | False =>
+            do repo_gate_root_check root;
+               repo_mkdir out;
+               let! base_checks := run_profile_checks profile root;
+               let! extra_checks := run_profile_extra_checks profile root;
+               let! hardening_checks := run_hardening_extra_checks profile root;
+               let checks : List GateCheck :=
+                 append GateCheck (append GateCheck base_checks extra_checks)
+                   hardening_checks in
+               match nullb GateCheck checks with
+               | True => repo_gate_no_checks requested_profile
+               | False =>
+                   let report_path : String := fs_child out "repo-gate.json" in
+                   do repo_write report_path (gate_report_string requested_profile checks);
+                      println (gate_summary_text requested_profile checks report_path);
+                      match checks_pass checks with
+                      | True => exit 0
+                      | False => exit 1
+                      end
+               end
+        end
+    end;
+
+
+def run_repo_gate (a : Args) : IO Unit :=
+    let requested_profile : String := args_opt_or a "profile" "repo" in
+    match repo_gate_profile_known requested_profile with
+    | False => repo_gate_unknown_profile requested_profile
+    | True => run_repo_gate_known_profile a requested_profile
+    end;
+
+
+def main : IO Unit :=
+    do let! xs := argv;
+       let a : Args := args_of_argv_bools repo_gate_switches xs in
+       do repo_gate_validate_cli xs a;
+          match args_flag a "help" with
+          | True => do eprintln repo_gate_usage; exit 2
+          | False => run_repo_gate a
+          end

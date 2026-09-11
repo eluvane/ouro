@@ -1,0 +1,714 @@
+-- Key decoding, signature templates and checked native contracts. Callers
+-- first check declarations, then compare declared types with these templates
+-- using ordinary conversion. The normalizer callback is bounded/pure and must
+-- not execute machine or Runtime operations. Pure String normalization is
+-- compiler-owned and operates on checked byte literals. Errors propagate.
+import "primitive_contracts.ouro";
+
+
+def primitive_fuel (fuel : Nat) : Either PrimitiveError Unit :=
+    primitive_require (andb (compiler_lt_nat 0 fuel) (compiler_le_nat fuel primitive_max_fuel)) PrimitiveResourceExhausted;
+
+def primitive_ascii (limit : Nat) (bytes : List Nat) : Bool :=
+    (fix go (fuel : Nat) (rest : List Nat) : Bool :=
+      match rest with | Nil => True | Cons byte tail => match fuel with | Z => False
+        | S next => andb (andb (compiler_lt_nat 0 byte) (compiler_le_nat byte 127)) (go next tail) end end) limit bytes;
+
+def primitive_decode (fuel : Nat) (key : List Nat) : Either PrimitiveError PrimitiveId :=
+    primitive_bind Unit PrimitiveId (primitive_fuel fuel) (fun (_ : Unit) =>
+      match primitive_ascii 128 key with | False => Left PrimitiveError PrimitiveId PrimitiveUnknownKey
+      | True => (fix find (remaining : Nat) (entries : List (Pair PrimitiveId (List Nat))) : Either PrimitiveError PrimitiveId :=
+          match entries with | Nil => Left PrimitiveError PrimitiveId PrimitiveUnknownKey
+          | Cons entry tail => match remaining with | Z => Left PrimitiveError PrimitiveId PrimitiveResourceExhausted
+            | S next => match entry with | MkPair id bytes => match primitive_bytes_equal bytes key with
+              | True => Right PrimitiveError PrimitiveId id | False => find next tail end end end end) fuel primitive_key_table end);
+
+def primitive_normal_shape (fuel : Nat)
+    (normalize : Nat -> CoreTerm -> Either PrimitiveError CoreTerm)
+    (actual : CoreTerm) (expected : CoreTerm) (failure : PrimitiveError) : Either PrimitiveError Unit :=
+    primitive_bind CoreTerm Unit (normalize fuel actual) (fun (normal : CoreTerm) =>
+      primitive_bind Bool Unit (primitive_shape_equal fuel normal expected)
+        (fun (same : Bool) => primitive_require same failure));
+
+def primitive_validate_bindings (fuel : Nat)
+    (normalize : Nat -> CoreTerm -> Either PrimitiveError CoreTerm)
+    (bindings : List PrimitiveResolved) : Either PrimitiveError Unit :=
+    (fix go (remaining : Nat) (rest : List PrimitiveResolved) (names : List Nat) (types : List PrimitiveId)
+        : Either PrimitiveError Unit :=
+      match rest with | Nil => Right PrimitiveError Unit MkUnit
+      | Cons binding tail => match remaining with | Z => Left PrimitiveError Unit PrimitiveResourceExhausted
+        | S next => match binding with | PrimitiveResolvedAs name id signature =>
+          primitive_bind Unit Unit
+            (primitive_require (compiler_le_nat name primitive_max_offset) (PrimitiveInvalidTypeBinding name))
+            (fun (_ : Unit) => match memNat name names with
+              | True => Left PrimitiveError Unit (PrimitiveDuplicateName name)
+              | False => match primitive_type_signature id with
+                | Nothing => go next tail (Cons Nat name names) types
+                | Just expected => match elem PrimitiveId primitive_id_equal id types with
+                  | True => Left PrimitiveError Unit (PrimitiveDuplicateType id)
+                  | False => primitive_bind Unit Unit
+                      (primitive_normal_shape fuel normalize signature expected (PrimitiveInvalidTypeBinding name))
+                      (fun (_ : Unit) => go next tail (Cons Nat name names) (Cons PrimitiveId id types)) end end end) end end end)
+      fuel bindings (Nil Nat) (Nil PrimitiveId);
+
+def primitive_type_ref (id : PrimitiveId) : List PrimitiveResolved -> Either PrimitiveError CoreTerm :=
+  fix primitive_type_ref (bindings : List PrimitiveResolved) : Either PrimitiveError CoreTerm :=
+    match bindings with | Nil => Left PrimitiveError CoreTerm (PrimitiveMissingType id)
+    | Cons binding tail => match binding with | PrimitiveResolvedAs name actual _ =>
+      match primitive_id_equal id actual with | True => Right PrimitiveError CoreTerm (CConst name)
+      | False => primitive_type_ref tail end end end;
+
+
+def primitive_validate_role (fuel : Nat)
+    (normalize : Nat -> CoreTerm -> Either PrimitiveError CoreTerm)
+    (binding : PrimitiveRoleBinding) : Either PrimitiveError Unit :=
+    match binding with | PrimitiveRoleOf role shape => match shape with
+    | PrimitiveInductiveOf id params indices family ctors => match primitive_role_shape role id with
+      | PrimitiveInductiveOf _ want_params want_indices want_family want_ctors =>
+        let failure : PrimitiveError := PrimitiveInvalidRole role in
+        primitive_bind Unit Unit (primitive_require
+          (andb (compiler_le_nat id primitive_max_offset) (andb (eqNat params want_params) (eqNat indices want_indices))) failure)
+          (fun (_ : Unit) => primitive_bind Unit Unit (primitive_normal_shape fuel normalize family want_family failure)
+            (fun (_ : Unit) =>
+              (fix constructors (remaining : Nat) (actual : List CoreTerm) (expected : List CoreTerm) : Either PrimitiveError Unit :=
+                match actual, expected with | Nil, Nil => Right PrimitiveError Unit MkUnit
+                | Nil, Cons _ _ => Left PrimitiveError Unit failure | Cons _ _, Nil => Left PrimitiveError Unit failure
+                | Cons a more, Cons b rest => match remaining with | Z => Left PrimitiveError Unit PrimitiveResourceExhausted
+                  | S next => primitive_bind Unit Unit (primitive_normal_shape fuel normalize a b failure)
+                      (fun (_ : Unit) => constructors next more rest) end end) fuel ctors want_ctors)) end end end;
+
+def primitive_validate_roles (fuel : Nat)
+    (normalize : Nat -> CoreTerm -> Either PrimitiveError CoreTerm)
+    (roles : List PrimitiveRoleBinding) : Either PrimitiveError Unit :=
+    (fix go (remaining : Nat) (rest : List PrimitiveRoleBinding) (names : List Nat) (kinds : List PrimitiveRole)
+        : Either PrimitiveError Unit :=
+      match rest with | Nil => Right PrimitiveError Unit MkUnit
+      | Cons binding tail => match remaining with | Z => Left PrimitiveError Unit PrimitiveResourceExhausted
+        | S next => let role : PrimitiveRole := primitive_role_kind binding in
+          match orb (memNat (primitive_role_id binding) names) (elem PrimitiveRole primitive_role_equal role kinds) with
+          | True => Left PrimitiveError Unit (PrimitiveDuplicateRole role)
+          | False => primitive_bind Unit Unit (primitive_validate_role fuel normalize binding)
+              (fun (_ : Unit) => go next tail (Cons Nat (primitive_role_id binding) names) (Cons PrimitiveRole role kinds)) end end end)
+      fuel roles (Nil Nat) (Nil PrimitiveRole);
+
+def primitive_role_ref (role : PrimitiveRole) : List PrimitiveRoleBinding -> Either PrimitiveError CoreTerm :=
+  fix primitive_role_ref (roles : List PrimitiveRoleBinding) : Either PrimitiveError CoreTerm :=
+    match roles with | Nil => Left PrimitiveError CoreTerm (PrimitiveMissingRole role)
+    | Cons binding tail => match primitive_role_equal role (primitive_role_kind binding) with
+      | True => Right PrimitiveError CoreTerm (CInd (primitive_role_id binding))
+      | False => primitive_role_ref tail end end;
+
+def primitive_validate_context (fuel : Nat)
+    (normalize : Nat -> CoreTerm -> Either PrimitiveError CoreTerm)
+    (bindings : List PrimitiveResolved) (roles : List PrimitiveRoleBinding) : Either PrimitiveError Unit :=
+    primitive_bind Unit Unit (primitive_fuel fuel) (fun (_ : Unit) =>
+      primitive_bind Unit Unit (primitive_validate_bindings fuel normalize bindings)
+        (fun (_ : Unit) => primitive_validate_roles fuel normalize roles));
+
+def primitive_arrow (args : List CoreTerm) (result : CoreTerm) : CoreTerm :=
+    foldr CoreTerm CoreTerm (fun (arg : CoreTerm) (tail : CoreTerm) => CPi arg tail) result args;
+
+
+def primitive_word_expected (bindings : List PrimitiveResolved) (roles : List PrimitiveRoleBinding)
+    (word : PrimitiveWord) (op : PrimitiveWordOp) : Either PrimitiveError CoreTerm :=
+    primitive_bind CoreTerm CoreTerm (primitive_type_ref (primitive_word_type word) bindings)
+      (fun (ty : CoreTerm) =>
+        primitive_bind CoreTerm CoreTerm
+          (match primitive_word_shift op with | True => primitive_type_ref PrimitiveU32Type bindings
+           | False => Right PrimitiveError CoreTerm ty end)
+          (fun (right_type : CoreTerm) =>
+            primitive_map CoreTerm CoreTerm (fun (result : CoreTerm) => CPi ty (CPi right_type result))
+              (match primitive_word_comparison op with
+               | True => primitive_role_ref PrimitiveBoolRole roles
+               | False => match primitive_word_checked op with
+                 | True => primitive_map CoreTerm CoreTerm (fun (maybe_type : CoreTerm) => CApp maybe_type ty)
+                     (primitive_role_ref PrimitiveMaybeRole roles)
+                 | False => Right PrimitiveError CoreTerm ty end end)));
+
+def primitive_conversion_expected (bindings : List PrimitiveResolved) (roles : List PrimitiveRoleBinding)
+    (source : PrimitiveWord) (dest : PrimitiveWord) (mode : PrimitiveConversion) : Either PrimitiveError CoreTerm :=
+    primitive_bind Unit CoreTerm (primitive_require (primitive_conversion_valid source dest mode) PrimitiveInvalidConversion)
+      (fun (_ : Unit) => primitive_bind CoreTerm CoreTerm (primitive_type_ref (primitive_word_type source) bindings)
+        (fun (from : CoreTerm) => primitive_bind CoreTerm CoreTerm (primitive_type_ref (primitive_word_type dest) bindings)
+          (fun (to : CoreTerm) => primitive_map CoreTerm CoreTerm (fun (result : CoreTerm) => CPi from result)
+            (match mode with | PrimitiveConvertChecked =>
+               primitive_map CoreTerm CoreTerm (fun (maybe_type : CoreTerm) => CApp maybe_type to)
+                 (primitive_role_ref PrimitiveMaybeRole roles)
+             | PrimitiveNarrowWrap => Right PrimitiveError CoreTerm to
+             | PrimitiveZeroExtend => Right PrimitiveError CoreTerm to
+             | PrimitiveSignExtend => Right PrimitiveError CoreTerm to
+             | PrimitiveReinterpret => Right PrimitiveError CoreTerm to end))));
+
+def primitive_nat_conversion_expected (bindings : List PrimitiveResolved) (roles : List PrimitiveRoleBinding)
+    (word : PrimitiveWord) (from_nat : Bool) : Either PrimitiveError CoreTerm :=
+    primitive_bind CoreTerm CoreTerm (primitive_type_ref (primitive_word_type word) bindings)
+      (fun (ty : CoreTerm) => primitive_bind CoreTerm CoreTerm (primitive_role_ref PrimitiveNatRole roles)
+        (fun (nat : CoreTerm) => match from_nat with
+          | False => Right PrimitiveError CoreTerm (CPi ty nat)
+          | True => primitive_map CoreTerm CoreTerm (fun (maybe_type : CoreTerm) => CPi nat (CApp maybe_type ty))
+              (primitive_role_ref PrimitiveMaybeRole roles) end));
+
+def primitive_runtime_expected (bindings : List PrimitiveResolved) (id : PrimitiveId)
+    : Either PrimitiveError CoreTerm :=
+    primitive_bind CoreTerm CoreTerm (primitive_type_ref PrimitiveRuntimeType bindings)
+      (fun (runtime : CoreTerm) => match id with
+        | PrimitiveRuntimePure => Right PrimitiveError CoreTerm
+            (CPi (CSort 0) (CPi (CRel 0) (CApp runtime (CRel 1))))
+        | PrimitiveRuntimeBind => Right PrimitiveError CoreTerm
+            (CPi (CSort 0) (CPi (CSort 0) (CPi (CApp runtime (CRel 1))
+              (CPi (CPi (CRel 2) (CApp runtime (CRel 2))) (CApp runtime (CRel 2))))))
+        | PrimitiveRuntimeLoop => primitive_map CoreTerm CoreTerm
+            (fun (byte : CoreTerm) => CPi (CSort 0) (CPi (CRel 0)
+              (CPi (CPi (CRel 1) (CApp runtime byte))
+                (CPi (CPi (CRel 2) (CApp runtime (CRel 3))) (CApp runtime (CRel 3))))))
+            (primitive_type_ref PrimitiveU8Type bindings)
+        | PrimitiveU8Type => Left PrimitiveError CoreTerm PrimitiveUnknownKey
+        | PrimitiveU32Type => Left PrimitiveError CoreTerm PrimitiveUnknownKey
+        | PrimitiveU64Type => Left PrimitiveError CoreTerm PrimitiveUnknownKey
+        | PrimitiveI32Type => Left PrimitiveError CoreTerm PrimitiveUnknownKey
+        | PrimitiveUSizeType => Left PrimitiveError CoreTerm PrimitiveUnknownKey
+        | PrimitiveRawPtrType => Left PrimitiveError CoreTerm PrimitiveUnknownKey
+        | PrimitiveRuntimeType => Left PrimitiveError CoreTerm PrimitiveUnknownKey
+        | PrimitiveRawFnType => Left PrimitiveError CoreTerm PrimitiveUnknownKey
+        | PrimitiveStringType => Left PrimitiveError CoreTerm PrimitiveUnknownKey
+        | PrimitiveWordOperation _ _ => Left PrimitiveError CoreTerm PrimitiveUnknownKey
+        | PrimitiveWordConversion _ _ _ => Left PrimitiveError CoreTerm PrimitiveUnknownKey
+        | PrimitiveWordFromNat _ => Left PrimitiveError CoreTerm PrimitiveUnknownKey
+        | PrimitiveWordToNat _ => Left PrimitiveError CoreTerm PrimitiveUnknownKey
+        | PrimitiveStringOperation _ => Left PrimitiveError CoreTerm PrimitiveUnknownKey
+        | PrimitiveRawNull => Left PrimitiveError CoreTerm PrimitiveUnknownKey
+        | PrimitiveRawLoad => Left PrimitiveError CoreTerm PrimitiveUnknownKey
+        | PrimitiveRawStore => Left PrimitiveError CoreTerm PrimitiveUnknownKey
+        | PrimitiveRawAddWrap => Left PrimitiveError CoreTerm PrimitiveUnknownKey
+        | PrimitiveRawCast => Left PrimitiveError CoreTerm PrimitiveUnknownKey
+        | PrimitiveRawToBits => Left PrimitiveError CoreTerm PrimitiveUnknownKey
+        | PrimitiveRawFromBits => Left PrimitiveError CoreTerm PrimitiveUnknownKey
+        | PrimitiveFnCall => Left PrimitiveError CoreTerm PrimitiveUnknownKey
+        | PrimitiveStdoutWrite => Left PrimitiveError CoreTerm PrimitiveUnknownKey
+        | PrimitiveStderrWrite => Left PrimitiveError CoreTerm PrimitiveUnknownKey
+        | PrimitiveStdoutFlush => Left PrimitiveError CoreTerm PrimitiveUnknownKey
+        | PrimitiveProcessExit => Left PrimitiveError CoreTerm PrimitiveUnknownKey
+        | PrimitiveArgv => Left PrimitiveError CoreTerm PrimitiveUnknownKey
+        | PrimitiveEnvGet => Left PrimitiveError CoreTerm PrimitiveUnknownKey
+        | PrimitiveTimeNow => Left PrimitiveError CoreTerm PrimitiveUnknownKey
+        | PrimitiveFileKind => Left PrimitiveError CoreTerm PrimitiveUnknownKey
+        | PrimitiveFileExists => Left PrimitiveError CoreTerm PrimitiveUnknownKey
+        | PrimitiveFileIsDirectory => Left PrimitiveError CoreTerm PrimitiveUnknownKey
+        | PrimitiveDirectoryCreate => Left PrimitiveError CoreTerm PrimitiveUnknownKey
+        | PrimitivePathRemove => Left PrimitiveError CoreTerm PrimitiveUnknownKey
+        | PrimitiveFileCopy => Left PrimitiveError CoreTerm PrimitiveUnknownKey
+        | PrimitiveFileRename => Left PrimitiveError CoreTerm PrimitiveUnknownKey
+        | PrimitiveFileRealpath => Left PrimitiveError CoreTerm PrimitiveUnknownKey
+        | PrimitiveFileTemp => Left PrimitiveError CoreTerm PrimitiveUnknownKey
+        | PrimitiveFileTempIn => Left PrimitiveError CoreTerm PrimitiveUnknownKey
+        | PrimitiveProcessInherit => Left PrimitiveError CoreTerm PrimitiveUnknownKey
+        | PrimitiveProcessBounded => Left PrimitiveError CoreTerm PrimitiveUnknownKey
+        | PrimitiveProcessCapture => Left PrimitiveError CoreTerm PrimitiveUnknownKey
+        | PrimitiveHttpPost => Left PrimitiveError CoreTerm PrimitiveUnknownKey
+        | PrimitiveStdinReadLine => Left PrimitiveError CoreTerm PrimitiveUnknownKey
+        | PrimitiveStdinReadBytes => Left PrimitiveError CoreTerm PrimitiveUnknownKey
+        | PrimitiveFileRead => Left PrimitiveError CoreTerm PrimitiveUnknownKey
+        | PrimitiveFileWrite => Left PrimitiveError CoreTerm PrimitiveUnknownKey
+        | PrimitiveDirectoryList => Left PrimitiveError CoreTerm PrimitiveUnknownKey
+        | PrimitiveDirectoryListable => Left PrimitiveError CoreTerm PrimitiveUnknownKey end);
+
+def primitive_raw_expected (bindings : List PrimitiveResolved) (roles : List PrimitiveRoleBinding)
+    (id : PrimitiveId) : Either PrimitiveError CoreTerm :=
+    primitive_bind CoreTerm CoreTerm (primitive_type_ref PrimitiveRawPtrType bindings)
+      (fun (pointer : CoreTerm) => match id with
+        | PrimitiveRawNull => Right PrimitiveError CoreTerm (CPi (CSort 0) (CApp pointer (CRel 0)))
+        | PrimitiveRawLoad => Left PrimitiveError CoreTerm PrimitiveSpecializationRequired
+        | PrimitiveRawStore => Left PrimitiveError CoreTerm PrimitiveSpecializationRequired
+        | PrimitiveRawAddWrap => primitive_bind CoreTerm CoreTerm (primitive_type_ref PrimitiveRuntimeType bindings)
+            (fun (runtime : CoreTerm) => primitive_map CoreTerm CoreTerm
+              (fun (size : CoreTerm) => CPi (CSort 0) (CPi (CApp pointer (CRel 0))
+                (CPi size (CApp runtime (CApp pointer (CRel 2)))))) (primitive_type_ref PrimitiveUSizeType bindings))
+        | PrimitiveRawCast => primitive_map CoreTerm CoreTerm
+            (fun (runtime : CoreTerm) => CPi (CSort 0) (CPi (CSort 0) (CPi (CApp pointer (CRel 1))
+              (CApp runtime (CApp pointer (CRel 1)))))) (primitive_type_ref PrimitiveRuntimeType bindings)
+        | PrimitiveRawToBits => primitive_bind CoreTerm CoreTerm (primitive_type_ref PrimitiveRuntimeType bindings)
+            (fun (runtime : CoreTerm) => primitive_map CoreTerm CoreTerm
+              (fun (size : CoreTerm) => CPi (CSort 0) (CPi (CApp pointer (CRel 0)) (CApp runtime size)))
+              (primitive_type_ref PrimitiveUSizeType bindings))
+        | PrimitiveRawFromBits => primitive_bind CoreTerm CoreTerm (primitive_type_ref PrimitiveRuntimeType bindings)
+            (fun (runtime : CoreTerm) => primitive_map CoreTerm CoreTerm
+              (fun (size : CoreTerm) => CPi (CSort 0) (CPi size (CApp runtime (CApp pointer (CRel 1)))))
+              (primitive_type_ref PrimitiveUSizeType bindings))
+        | PrimitiveU8Type => Left PrimitiveError CoreTerm PrimitiveUnknownKey
+        | PrimitiveU32Type => Left PrimitiveError CoreTerm PrimitiveUnknownKey
+        | PrimitiveU64Type => Left PrimitiveError CoreTerm PrimitiveUnknownKey
+        | PrimitiveI32Type => Left PrimitiveError CoreTerm PrimitiveUnknownKey
+        | PrimitiveUSizeType => Left PrimitiveError CoreTerm PrimitiveUnknownKey
+        | PrimitiveRawPtrType => Left PrimitiveError CoreTerm PrimitiveUnknownKey
+        | PrimitiveRuntimeType => Left PrimitiveError CoreTerm PrimitiveUnknownKey
+        | PrimitiveRawFnType => Left PrimitiveError CoreTerm PrimitiveUnknownKey
+        | PrimitiveStringType => Left PrimitiveError CoreTerm PrimitiveUnknownKey
+        | PrimitiveWordOperation _ _ => Left PrimitiveError CoreTerm PrimitiveUnknownKey
+        | PrimitiveWordConversion _ _ _ => Left PrimitiveError CoreTerm PrimitiveUnknownKey
+        | PrimitiveWordFromNat _ => Left PrimitiveError CoreTerm PrimitiveUnknownKey
+        | PrimitiveWordToNat _ => Left PrimitiveError CoreTerm PrimitiveUnknownKey
+        | PrimitiveStringOperation _ => Left PrimitiveError CoreTerm PrimitiveUnknownKey
+        | PrimitiveRuntimePure => Left PrimitiveError CoreTerm PrimitiveUnknownKey
+        | PrimitiveRuntimeBind => Left PrimitiveError CoreTerm PrimitiveUnknownKey
+        | PrimitiveRuntimeLoop => Left PrimitiveError CoreTerm PrimitiveUnknownKey
+        | PrimitiveFnCall => Left PrimitiveError CoreTerm PrimitiveUnknownKey
+        | PrimitiveStdoutWrite => Left PrimitiveError CoreTerm PrimitiveUnknownKey
+        | PrimitiveStderrWrite => Left PrimitiveError CoreTerm PrimitiveUnknownKey
+        | PrimitiveStdoutFlush => Left PrimitiveError CoreTerm PrimitiveUnknownKey
+        | PrimitiveProcessExit => Left PrimitiveError CoreTerm PrimitiveUnknownKey
+        | PrimitiveArgv => Left PrimitiveError CoreTerm PrimitiveUnknownKey
+        | PrimitiveEnvGet => Left PrimitiveError CoreTerm PrimitiveUnknownKey
+        | PrimitiveTimeNow => Left PrimitiveError CoreTerm PrimitiveUnknownKey
+        | PrimitiveFileKind => Left PrimitiveError CoreTerm PrimitiveUnknownKey
+        | PrimitiveFileExists => Left PrimitiveError CoreTerm PrimitiveUnknownKey
+        | PrimitiveFileIsDirectory => Left PrimitiveError CoreTerm PrimitiveUnknownKey
+        | PrimitiveDirectoryCreate => Left PrimitiveError CoreTerm PrimitiveUnknownKey
+        | PrimitivePathRemove => Left PrimitiveError CoreTerm PrimitiveUnknownKey
+        | PrimitiveFileCopy => Left PrimitiveError CoreTerm PrimitiveUnknownKey
+        | PrimitiveFileRename => Left PrimitiveError CoreTerm PrimitiveUnknownKey
+        | PrimitiveFileRealpath => Left PrimitiveError CoreTerm PrimitiveUnknownKey
+        | PrimitiveFileTemp => Left PrimitiveError CoreTerm PrimitiveUnknownKey
+        | PrimitiveFileTempIn => Left PrimitiveError CoreTerm PrimitiveUnknownKey
+        | PrimitiveProcessInherit => Left PrimitiveError CoreTerm PrimitiveUnknownKey
+        | PrimitiveProcessBounded => Left PrimitiveError CoreTerm PrimitiveUnknownKey
+        | PrimitiveProcessCapture => Left PrimitiveError CoreTerm PrimitiveUnknownKey
+        | PrimitiveHttpPost => Left PrimitiveError CoreTerm PrimitiveUnknownKey
+        | PrimitiveStdinReadLine => Left PrimitiveError CoreTerm PrimitiveUnknownKey
+        | PrimitiveStdinReadBytes => Left PrimitiveError CoreTerm PrimitiveUnknownKey
+        | PrimitiveFileRead => Left PrimitiveError CoreTerm PrimitiveUnknownKey
+        | PrimitiveFileWrite => Left PrimitiveError CoreTerm PrimitiveUnknownKey
+        | PrimitiveDirectoryList => Left PrimitiveError CoreTerm PrimitiveUnknownKey
+        | PrimitiveDirectoryListable => Left PrimitiveError CoreTerm PrimitiveUnknownKey end);
+
+def primitive_string_expected (bindings : List PrimitiveResolved) (roles : List PrimitiveRoleBinding)
+    (op : PrimitiveStringOp) : Either PrimitiveError CoreTerm :=
+    primitive_bind CoreTerm CoreTerm (primitive_type_ref PrimitiveStringType bindings)
+      (fun (string : CoreTerm) => match op with
+        | PrimitiveStringConcat => Right PrimitiveError CoreTerm (CPi string (CPi string string))
+        | PrimitiveStringLength => primitive_map CoreTerm CoreTerm (fun (nat : CoreTerm) => CPi string nat)
+            (primitive_role_ref PrimitiveNatRole roles)
+        | PrimitiveStringByteAt => primitive_map CoreTerm CoreTerm (fun (nat : CoreTerm) => CPi string (CPi nat nat))
+            (primitive_role_ref PrimitiveNatRole roles)
+        | PrimitiveStringSlice => primitive_map CoreTerm CoreTerm (fun (nat : CoreTerm) => CPi string (CPi nat (CPi nat string)))
+            (primitive_role_ref PrimitiveNatRole roles)
+        | PrimitiveStringOfNat => primitive_map CoreTerm CoreTerm (fun (nat : CoreTerm) => CPi nat string)
+            (primitive_role_ref PrimitiveNatRole roles)
+        | PrimitiveStringToCodes => primitive_bind CoreTerm CoreTerm (primitive_role_ref PrimitiveNatRole roles)
+            (fun (nat : CoreTerm) => primitive_map CoreTerm CoreTerm (fun (list : CoreTerm) => CPi string (CApp list nat))
+              (primitive_role_ref PrimitiveListRole roles))
+        | PrimitiveStringOfCodes => primitive_bind CoreTerm CoreTerm (primitive_role_ref PrimitiveNatRole roles)
+            (fun (nat : CoreTerm) => primitive_map CoreTerm CoreTerm (fun (list : CoreTerm) => CPi (CApp list nat) string)
+              (primitive_role_ref PrimitiveListRole roles))
+        | PrimitiveStringIndex => primitive_bind CoreTerm CoreTerm (primitive_role_ref PrimitiveNatRole roles)
+            (fun (nat : CoreTerm) => primitive_map CoreTerm CoreTerm
+              (fun (maybe_type : CoreTerm) => CPi string (CPi string (CApp maybe_type nat)))
+              (primitive_role_ref PrimitiveMaybeRole roles))
+        | PrimitiveStringSplit => primitive_bind CoreTerm CoreTerm (primitive_role_ref PrimitiveNatRole roles)
+            (fun (nat : CoreTerm) => primitive_map CoreTerm CoreTerm (fun (list : CoreTerm) => CPi string (CPi nat (CApp list string)))
+              (primitive_role_ref PrimitiveListRole roles))
+        | PrimitiveStringReplace => Right PrimitiveError CoreTerm (CPi string (CPi string (CPi string string)))
+        | PrimitiveStringTokens => primitive_map CoreTerm CoreTerm (fun (list : CoreTerm) => CPi string (CApp list string))
+            (primitive_role_ref PrimitiveListRole roles)
+        | PrimitiveStringEqual => primitive_map CoreTerm CoreTerm (fun (bool : CoreTerm) => CPi string (CPi string bool))
+            (primitive_role_ref PrimitiveBoolRole roles)
+        | PrimitiveStringStarts => primitive_map CoreTerm CoreTerm (fun (bool : CoreTerm) => CPi string (CPi string bool))
+            (primitive_role_ref PrimitiveBoolRole roles)
+        | PrimitiveStringEnds => primitive_map CoreTerm CoreTerm (fun (bool : CoreTerm) => CPi string (CPi string bool))
+            (primitive_role_ref PrimitiveBoolRole roles)
+        | PrimitiveStringContains => primitive_map CoreTerm CoreTerm (fun (bool : CoreTerm) => CPi string (CPi string bool))
+            (primitive_role_ref PrimitiveBoolRole roles)
+        | PrimitiveStringLessEqual => primitive_map CoreTerm CoreTerm (fun (bool : CoreTerm) => CPi string (CPi string bool))
+            (primitive_role_ref PrimitiveBoolRole roles) end);
+
+def primitive_named_identity (name : Nat) : List PrimitiveResolved -> Maybe PrimitiveId :=
+  fix primitive_named_identity (bindings : List PrimitiveResolved) : Maybe PrimitiveId :=
+    match bindings with | Nil => Nothing PrimitiveId
+    | Cons binding rest => match binding with | PrimitiveResolvedAs actual id _ =>
+      match eqNat name actual with | True => Just PrimitiveId id | False => primitive_named_identity rest end end end;
+
+def primitive_head_is (bindings : List PrimitiveResolved) (head : CoreTerm) (id : PrimitiveId) : Bool :=
+    match primitive_shape head with
+    | PrimitiveShapeAtom tag name => match eqNat tag 2 with | False => False
+      | True => match primitive_named_identity name bindings with | Nothing => False
+        | Just actual => primitive_id_equal actual id end end
+    | PrimitiveShapePair _ _ _ => False | PrimitiveShapeOther => False end;
+
+-- All foreign types are concrete. This bounded node scan rejects Rel even
+-- inside pointee/function signatures, so dependent or polymorphic ABI fields
+-- cannot hide beneath a pointer. It never evaluates the terms it traverses.
+def primitive_closed_type (fuel : Nat) (term : CoreTerm) : Either PrimitiveError Unit :=
+    (fix scan (remaining : Nat) (pending : List CoreTerm) : Either PrimitiveError Unit :=
+      match pending with | Nil => Right PrimitiveError Unit MkUnit
+      | Cons current rest => match remaining with | Z => Left PrimitiveError Unit PrimitiveResourceExhausted
+        | S next => match current with
+          | CRel _ => Left PrimitiveError Unit PrimitiveDependentAbi
+          | CSort _ => scan next rest | CConst _ => scan next rest | CInd _ => scan next rest
+          | CPi a b => scan next (Cons CoreTerm a (Cons CoreTerm b rest))
+          | CApp a b => scan next (Cons CoreTerm a (Cons CoreTerm b rest))
+          | CLam _ _ => Left PrimitiveError Unit PrimitiveUnsupportedAbiType
+          | CLetIn _ _ _ => Left PrimitiveError Unit PrimitiveUnsupportedAbiType
+          | CConstruct _ _ _ => scan next rest
+          | CCase _ _ _ _ => Left PrimitiveError Unit PrimitiveUnsupportedAbiType
+          | CFix _ _ _ _ _ => Left PrimitiveError Unit PrimitiveUnsupportedAbiType
+          | CStrBytes _ _ => scan next rest
+          | CStrLit _ _ => scan next rest end end end) fuel ([term] : List CoreTerm);
+
+def primitive_abi_unit (roles : List PrimitiveRoleBinding) (term : CoreTerm) : Bool :=
+    match primitive_shape term with | PrimitiveShapeAtom tag id => match eqNat tag 3 with
+      | False => False | True => (fix find (rest : List PrimitiveRoleBinding) : Bool :=
+          match rest with | Nil => False | Cons role tail =>
+            orb (andb (primitive_role_equal (primitive_role_kind role) PrimitiveUnitRole)
+              (eqNat (primitive_role_id role) id)) (find tail) end) roles end
+    | PrimitiveShapePair _ _ _ => False | PrimitiveShapeOther => False end;
+
+def primitive_function_with (fuel : Nat) (bindings : List PrimitiveResolved) (roles : List PrimitiveRoleBinding)
+    (value_type : Nat -> CoreTerm -> Either PrimitiveError PrimitiveAbiValue)
+    (signature : CoreTerm) : Either PrimitiveError PrimitiveAbiSignature :=
+    (fix walk (remaining : Nat) (term : CoreTerm) : Either PrimitiveError PrimitiveAbiSignature :=
+      match remaining with | Z => Left PrimitiveError PrimitiveAbiSignature PrimitiveResourceExhausted
+      | S next => match primitive_shape term with
+        | PrimitiveShapePair tag a b => match eqNat tag 4 with
+          | True => primitive_bind PrimitiveAbiValue PrimitiveAbiSignature (value_type next a)
+              (fun (arg : PrimitiveAbiValue) => primitive_map PrimitiveAbiSignature PrimitiveAbiSignature
+                (fun (tail : PrimitiveAbiSignature) => match tail with | PrimitiveAbiSignatureOf args result =>
+                  PrimitiveAbiSignatureOf (Cons PrimitiveAbiValue arg args) result end) (walk next b))
+          | False => match andb (eqNat tag 5) (primitive_head_is bindings a PrimitiveRuntimeType) with
+            | False => Left PrimitiveError PrimitiveAbiSignature PrimitiveRuntimeResultRequired
+            | True => match primitive_abi_unit roles b with
+              | True => Right PrimitiveError PrimitiveAbiSignature
+                  (PrimitiveAbiSignatureOf (Nil PrimitiveAbiValue) (Nothing PrimitiveAbiValue))
+              | False => primitive_map PrimitiveAbiValue PrimitiveAbiSignature
+                  (fun (result : PrimitiveAbiValue) => PrimitiveAbiSignatureOf (Nil PrimitiveAbiValue)
+                    (Just PrimitiveAbiValue result)) (value_type next b) end end end
+        | PrimitiveShapeAtom _ _ => Left PrimitiveError PrimitiveAbiSignature PrimitiveRuntimeResultRequired
+        | PrimitiveShapeOther => Left PrimitiveError PrimitiveAbiSignature PrimitiveRuntimeResultRequired end end) fuel signature;
+
+def primitive_abi_value : Nat -> (Nat -> CoreTerm -> Either PrimitiveError CoreTerm)
+    -> List PrimitiveResolved -> List PrimitiveRoleBinding -> CoreTerm -> Either PrimitiveError PrimitiveAbiValue :=
+  fix primitive_abi_value (fuel : Nat) (normalize : Nat -> CoreTerm -> Either PrimitiveError CoreTerm)
+      (bindings : List PrimitiveResolved) (roles : List PrimitiveRoleBinding) (term : CoreTerm)
+      : Either PrimitiveError PrimitiveAbiValue :=
+    match fuel with | Z => Left PrimitiveError PrimitiveAbiValue PrimitiveResourceExhausted
+    | S next => primitive_bind CoreTerm PrimitiveAbiValue (normalize next term)
+        (fun (normal : CoreTerm) => primitive_bind Unit PrimitiveAbiValue (primitive_closed_type fuel normal)
+          (fun (_ : Unit) => match primitive_shape normal with
+            | PrimitiveShapeAtom tag name => match eqNat tag 2 with
+              | False => Left PrimitiveError PrimitiveAbiValue PrimitiveUnsupportedAbiType
+              | True => match primitive_named_identity name bindings with
+                | Nothing => Left PrimitiveError PrimitiveAbiValue PrimitiveUnsupportedAbiType
+                | Just id => (fix find (words : List PrimitiveWord) : Either PrimitiveError PrimitiveAbiValue :=
+                    match words with | Nil => Left PrimitiveError PrimitiveAbiValue PrimitiveUnsupportedAbiType
+                    | Cons word rest => match primitive_id_equal id (primitive_word_type word) with
+                      | True => Right PrimitiveError PrimitiveAbiValue (PrimitiveAbiWord word)
+                      | False => find rest end end) primitive_words end end
+            | PrimitiveShapePair tag head payload => match andb (eqNat tag 5) (primitive_head_is bindings head PrimitiveRawPtrType) with
+              | True => Right PrimitiveError PrimitiveAbiValue (PrimitiveAbiPointer payload)
+              | False => match andb (eqNat tag 5) (primitive_head_is bindings head PrimitiveRawFnType) with
+                | False => Left PrimitiveError PrimitiveAbiValue PrimitiveUnsupportedAbiType
+                | True => primitive_map PrimitiveAbiSignature PrimitiveAbiValue
+                    (fun (_signature : PrimitiveAbiSignature) => PrimitiveAbiFunction payload)
+                    (primitive_function_with next bindings roles
+                      (fun (_budget : Nat) (value : CoreTerm) => primitive_abi_value next normalize bindings roles value) payload) end end
+            | PrimitiveShapeOther => Left PrimitiveError PrimitiveAbiValue PrimitiveUnsupportedAbiType end)) end;
+
+-- The callback returns fully normalized checked types. No machine opcode or
+-- runtime action is interpreted. Both the source signature and its derived
+-- scalar ABI signature remain tied to the same registered type identities.
+def primitive_resolve_signature (fuel : Nat)
+    (normalize : Nat -> CoreTerm -> Either PrimitiveError CoreTerm)
+    (bindings : List PrimitiveResolved) (roles : List PrimitiveRoleBinding)
+    (signature : CoreTerm) : Either PrimitiveError PrimitiveAbiSignature :=
+    primitive_bind Unit PrimitiveAbiSignature (primitive_validate_context fuel normalize bindings roles)
+      (fun (_ : Unit) => primitive_bind CoreTerm PrimitiveAbiSignature (normalize fuel signature)
+        (fun (normal : CoreTerm) => primitive_bind Unit PrimitiveAbiSignature (primitive_closed_type fuel normal)
+          (fun (_ : Unit) => primitive_function_with fuel bindings roles
+            (fun (budget : Nat) (value : CoreTerm) => primitive_abi_value budget normalize bindings roles value) normal)));
+
+def primitive_check_extern (fuel : Nat)
+    (normalize : Nat -> CoreTerm -> Either PrimitiveError CoreTerm)
+    (bindings : List PrimitiveResolved) (roles : List PrimitiveRoleBinding)
+    (request : ExternRequest) (signature : CoreTerm) : Either PrimitiveError CheckedExtern :=
+    match request with | ExternRequestOf target abi dll symbol variadic gc =>
+      primitive_bind Unit CheckedExtern (primitive_fuel fuel) (fun (_ : Unit) =>
+        primitive_bind Unit CheckedExtern (primitive_require
+          (primitive_bytes_equal target ([119, 105, 110, 100, 111, 119, 115, 45, 120, 56, 54, 95, 54, 52] : List Nat)) PrimitiveUnsupportedTarget)
+          (fun (_ : Unit) => primitive_bind Unit CheckedExtern (primitive_require
+            (primitive_bytes_equal abi ([119, 105, 110, 54, 52] : List Nat)) PrimitiveUnsupportedAbi)
+            (fun (_ : Unit) => primitive_bind Unit CheckedExtern (primitive_require (notb variadic) PrimitiveVariadicExtern)
+              (fun (_ : Unit) => primitive_bind Unit CheckedExtern (primitive_require
+                (andb (andb (primitive_ascii (add 256 4) dll) (notb (primitive_bytes_equal dll (Nil Nat))))
+                  (andb (primitive_ascii (mul 4 256) symbol) (notb (primitive_bytes_equal symbol (Nil Nat))))) PrimitiveInvalidExternName)
+                (fun (_ : Unit) => primitive_map PrimitiveAbiSignature CheckedExtern
+                  (fun (checked : PrimitiveAbiSignature) => CheckedExternOf PrimitiveWindowsX64 PrimitiveWin64 dll symbol checked gc)
+                  (primitive_resolve_signature fuel normalize bindings roles signature)))))) end;
+
+def primitive_call_expected (fuel : Nat)
+    (normalize : Nat -> CoreTerm -> Either PrimitiveError CoreTerm)
+    (bindings : List PrimitiveResolved) (roles : List PrimitiveRoleBinding) (signature : CoreTerm)
+    : Either PrimitiveError CoreTerm :=
+    primitive_bind CoreTerm CoreTerm (normalize fuel signature) (fun (normal : CoreTerm) =>
+      primitive_bind PrimitiveAbiSignature CoreTerm (primitive_resolve_signature fuel normalize bindings roles normal)
+        (fun (_signature : PrimitiveAbiSignature) => primitive_map CoreTerm CoreTerm
+          (fun (pointer : CoreTerm) => CPi (CApp pointer normal) normal) (primitive_type_ref PrimitiveRawFnType bindings)));
+
+-- Scalar raw storage shares the ABI classifier: managed objects, closures,
+-- dependent values and proof terms have no implicit machine representation.
+-- A pointer's pointee stays descriptive; loading a pointer never loads that object.
+def primitive_storage_expected (fuel : Nat)
+    (normalize : Nat -> CoreTerm -> Either PrimitiveError CoreTerm)
+    (bindings : List PrimitiveResolved) (roles : List PrimitiveRoleBinding)
+    (id : PrimitiveId) (storage : CoreTerm) : Either PrimitiveError CoreTerm :=
+    primitive_bind CoreTerm CoreTerm (normalize fuel storage) (fun (normal : CoreTerm) =>
+      primitive_bind PrimitiveAbiValue CoreTerm (primitive_abi_value fuel normalize bindings roles normal)
+        (fun (_scalar : PrimitiveAbiValue) =>
+          primitive_bind CoreTerm CoreTerm (primitive_type_ref PrimitiveRawPtrType bindings)
+            (fun (pointer : CoreTerm) =>
+              primitive_bind CoreTerm CoreTerm (primitive_type_ref PrimitiveRuntimeType bindings)
+                (fun (runtime : CoreTerm) =>
+                  match primitive_id_equal id PrimitiveRawLoad with
+                  | True => Right PrimitiveError CoreTerm (CPi (CApp pointer normal) (CApp runtime normal))
+                  | False => match primitive_id_equal id PrimitiveRawStore with
+                    | False => Left PrimitiveError CoreTerm PrimitiveUnexpectedSpecialization
+                    | True => primitive_map CoreTerm CoreTerm
+                        (fun (unit : CoreTerm) => CPi (CApp pointer normal) (CPi normal (CApp runtime unit)))
+                        (primitive_role_ref PrimitiveUnitRole roles)
+                    end
+                  end))));
+
+-- Host operations construct Runtime actions. Their values never enter the
+-- foreign scalar ABI classifier or execute during checked conversion.
+def primitive_runtime_unit_expected (bindings : List PrimitiveResolved) (roles : List PrimitiveRoleBinding)
+    : Either PrimitiveError CoreTerm :=
+    primitive_bind CoreTerm CoreTerm (primitive_type_ref PrimitiveRuntimeType bindings)
+      (fun (runtime : CoreTerm) => primitive_map CoreTerm CoreTerm (CApp runtime)
+        (primitive_role_ref PrimitiveUnitRole roles));
+
+def primitive_runtime_argument_expected (bindings : List PrimitiveResolved) (roles : List PrimitiveRoleBinding)
+    (argument : Either PrimitiveError CoreTerm) : Either PrimitiveError CoreTerm :=
+    primitive_bind CoreTerm CoreTerm argument (fun (input : CoreTerm) =>
+      primitive_map CoreTerm CoreTerm (CPi input) (primitive_runtime_unit_expected bindings roles));
+
+-- Startup returns ordinary containers with the checked String identity.
+def primitive_startup_expected (bindings : List PrimitiveResolved) (roles : List PrimitiveRoleBinding)
+    (environment : Bool) : Either PrimitiveError CoreTerm :=
+    primitive_bind CoreTerm CoreTerm (primitive_type_ref PrimitiveRuntimeType bindings) (fun (runtime : CoreTerm) =>
+      primitive_bind CoreTerm CoreTerm (primitive_type_ref PrimitiveStringType bindings) (fun (string : CoreTerm) =>
+        primitive_map CoreTerm CoreTerm (fun (container : CoreTerm) =>
+          let result : CoreTerm := CApp runtime (CApp container string) in
+          match environment with | False => result | True => CPi string result end)
+          (primitive_role_ref (match environment with | False => PrimitiveListRole | True => PrimitiveMaybeRole end) roles)));
+
+-- File contents keep the checked String identity in an ordinary action.
+def primitive_file_expected (bindings : List PrimitiveResolved) (roles : List PrimitiveRoleBinding)
+    (writing : Bool) : Either PrimitiveError CoreTerm :=
+    primitive_bind CoreTerm CoreTerm (primitive_type_ref PrimitiveRuntimeType bindings) (fun (runtime : CoreTerm) =>
+      primitive_bind CoreTerm CoreTerm (primitive_type_ref PrimitiveStringType bindings) (fun (string : CoreTerm) =>
+        match writing with
+        | False => Right PrimitiveError CoreTerm (CPi string (CApp runtime string))
+        | True => primitive_map CoreTerm CoreTerm (fun (unit : CoreTerm) =>
+            primitive_arrow ([string, string] : List CoreTerm) (CApp runtime unit))
+            (primitive_role_ref PrimitiveUnitRole roles) end));
+-- A no-follow filesystem query returns the checked ordinary Nat role.
+def primitive_file_kind_expected (bindings : List PrimitiveResolved) (roles : List PrimitiveRoleBinding)
+    : Either PrimitiveError CoreTerm :=
+    primitive_bind CoreTerm CoreTerm (primitive_type_ref PrimitiveRuntimeType bindings) (fun (runtime : CoreTerm) =>
+      primitive_bind CoreTerm CoreTerm (primitive_type_ref PrimitiveStringType bindings) (fun (string : CoreTerm) =>
+        primitive_map CoreTerm CoreTerm (fun (natural : CoreTerm) => CPi string (CApp runtime natural))
+          (primitive_role_ref PrimitiveNatRole roles)));
+
+-- Predicates retain the checked ordinary Bool role inside Runtime.
+def primitive_file_predicate_expected (bindings : List PrimitiveResolved) (roles : List PrimitiveRoleBinding)
+    : Either PrimitiveError CoreTerm :=
+    primitive_bind CoreTerm CoreTerm (primitive_type_ref PrimitiveRuntimeType bindings) (fun (runtime : CoreTerm) =>
+      primitive_bind CoreTerm CoreTerm (primitive_type_ref PrimitiveStringType bindings) (fun (string : CoreTerm) =>
+        primitive_map CoreTerm CoreTerm (fun (boolean : CoreTerm) => CPi string (CApp runtime boolean))
+          (primitive_role_ref PrimitiveBoolRole roles)));
+
+-- Directory actions keep ordinary checked containers and Boolean results.
+def primitive_directory_expected (bindings : List PrimitiveResolved) (roles : List PrimitiveRoleBinding)
+    (listable : Bool) : Either PrimitiveError CoreTerm :=
+    primitive_bind CoreTerm CoreTerm (primitive_type_ref PrimitiveRuntimeType bindings) (fun (runtime : CoreTerm) =>
+      primitive_bind CoreTerm CoreTerm (primitive_type_ref PrimitiveStringType bindings) (fun (string : CoreTerm) =>
+        primitive_map CoreTerm CoreTerm (fun (role : CoreTerm) =>
+          CPi string (CApp runtime (match listable with | True => role | False => CApp role string end)))
+          (primitive_role_ref (match listable with | True => PrimitiveBoolRole | False => PrimitiveListRole end) roles)));
+
+def primitive_string_action_expected (bindings : List PrimitiveResolved) : Either PrimitiveError CoreTerm :=
+    primitive_bind CoreTerm CoreTerm (primitive_type_ref PrimitiveRuntimeType bindings)
+      (fun (runtime : CoreTerm) => primitive_map CoreTerm CoreTerm (CApp runtime)
+        (primitive_type_ref PrimitiveStringType bindings));
+
+-- Process capture and HTTP return ordinary checked pairs, not a new trusted
+-- result representation. Status zero denotes HTTP transport failure only.
+def primitive_capture_expected (bindings : List PrimitiveResolved) (roles : List PrimitiveRoleBinding)
+    (http : Bool) : Either PrimitiveError CoreTerm :=
+    primitive_bind CoreTerm CoreTerm (primitive_type_ref PrimitiveRuntimeType bindings) (fun (runtime : CoreTerm) =>
+      primitive_bind CoreTerm CoreTerm (primitive_type_ref PrimitiveStringType bindings) (fun (string : CoreTerm) =>
+        primitive_bind CoreTerm CoreTerm (primitive_role_ref PrimitiveNatRole roles) (fun (natural : CoreTerm) =>
+          primitive_bind CoreTerm CoreTerm (primitive_role_ref PrimitivePairRole roles) (fun (pair : CoreTerm) =>
+            primitive_map CoreTerm CoreTerm (fun (list : CoreTerm) =>
+              let strings : CoreTerm := CApp (CApp pair string) string in
+              let result : CoreTerm := CApp runtime (CApp (CApp pair natural) strings) in
+              let elements : CoreTerm := match http with | True => strings | False => string end in
+              CPi string (CPi (CApp list elements)
+                (match http with | True => CPi string result | False => result end)))
+              (primitive_role_ref PrimitiveListRole roles)))));
+
+-- Foreground execution reports OS failure separately from the child's exit.
+-- Both components use the existing checked Nat and Pair representations.
+def primitive_process_inherit_expected (bindings : List PrimitiveResolved) (roles : List PrimitiveRoleBinding)
+    : Either PrimitiveError CoreTerm :=
+    primitive_bind CoreTerm CoreTerm (primitive_type_ref PrimitiveRuntimeType bindings) (fun (runtime : CoreTerm) =>
+      primitive_bind CoreTerm CoreTerm (primitive_type_ref PrimitiveStringType bindings) (fun (string : CoreTerm) =>
+        primitive_bind CoreTerm CoreTerm (primitive_role_ref PrimitiveNatRole roles) (fun (natural : CoreTerm) =>
+          primitive_bind CoreTerm CoreTerm (primitive_role_ref PrimitivePairRole roles) (fun (pair : CoreTerm) =>
+            primitive_map CoreTerm CoreTerm (fun (list : CoreTerm) =>
+              CPi string (CPi (CApp list string) (CApp runtime (CApp (CApp pair natural) natural))))
+              (primitive_role_ref PrimitiveListRole roles)))));
+
+-- Limits and observations use ordinary checked pairs, preserving all U32 exits.
+def primitive_process_bounded_expected (bindings : List PrimitiveResolved) (roles : List PrimitiveRoleBinding)
+    : Either PrimitiveError CoreTerm :=
+    primitive_bind CoreTerm CoreTerm (primitive_type_ref PrimitiveRuntimeType bindings) (fun (runtime : CoreTerm) =>
+      primitive_bind CoreTerm CoreTerm (primitive_type_ref PrimitiveStringType bindings) (fun (string : CoreTerm) =>
+        primitive_bind CoreTerm CoreTerm (primitive_role_ref PrimitiveNatRole roles) (fun (natural : CoreTerm) =>
+          primitive_bind CoreTerm CoreTerm (primitive_role_ref PrimitivePairRole roles) (fun (pair : CoreTerm) =>
+            primitive_map CoreTerm CoreTerm (fun (list : CoreTerm) =>
+              let natural_pair : CoreTerm -> CoreTerm := fun (tail : CoreTerm) => CApp (CApp pair natural) tail in
+              let limits : CoreTerm := natural_pair (natural_pair (natural_pair (natural_pair natural))) in
+              let streams : CoreTerm := CApp (CApp pair string) string in
+              let result : CoreTerm := natural_pair (natural_pair (natural_pair streams)) in
+              let input_and_limits : CoreTerm := CApp (CApp pair string) limits in
+              CPi string (CPi (CApp list string) (CPi input_and_limits (CApp runtime result))))
+              (primitive_role_ref PrimitiveListRole roles)))));
+
+def primitive_expected_fixed (bindings : List PrimitiveResolved) (roles : List PrimitiveRoleBinding)
+    (id : PrimitiveId) : Either PrimitiveError CoreTerm :=
+    match id with
+    | PrimitiveU8Type => Right PrimitiveError CoreTerm (CSort 0)
+    | PrimitiveU32Type => Right PrimitiveError CoreTerm (CSort 0)
+    | PrimitiveU64Type => Right PrimitiveError CoreTerm (CSort 0)
+    | PrimitiveI32Type => Right PrimitiveError CoreTerm (CSort 0)
+    | PrimitiveUSizeType => Right PrimitiveError CoreTerm (CSort 0)
+    | PrimitiveStringType => Right PrimitiveError CoreTerm (CSort 0)
+    | PrimitiveRawPtrType => Right PrimitiveError CoreTerm (CPi (CSort 0) (CSort 0))
+    | PrimitiveRuntimeType => Right PrimitiveError CoreTerm (CPi (CSort 0) (CSort 0))
+    | PrimitiveRawFnType => Right PrimitiveError CoreTerm (CPi (CSort 0) (CSort 0))
+    | PrimitiveWordOperation word op => primitive_word_expected bindings roles word op
+    | PrimitiveWordConversion source dest mode => primitive_conversion_expected bindings roles source dest mode
+    | PrimitiveWordFromNat word => primitive_nat_conversion_expected bindings roles word True
+    | PrimitiveWordToNat word => primitive_nat_conversion_expected bindings roles word False
+    | PrimitiveStringOperation op => primitive_string_expected bindings roles op
+    | PrimitiveRuntimePure => primitive_runtime_expected bindings id
+    | PrimitiveRuntimeBind => primitive_runtime_expected bindings id
+    | PrimitiveRuntimeLoop => primitive_runtime_expected bindings id
+    | PrimitiveRawNull => primitive_raw_expected bindings roles id
+    | PrimitiveRawLoad => Left PrimitiveError CoreTerm PrimitiveSpecializationRequired
+    | PrimitiveRawStore => Left PrimitiveError CoreTerm PrimitiveSpecializationRequired
+    | PrimitiveRawAddWrap => primitive_raw_expected bindings roles id
+    | PrimitiveRawCast => primitive_raw_expected bindings roles id
+    | PrimitiveRawToBits => primitive_raw_expected bindings roles id
+    | PrimitiveRawFromBits => primitive_raw_expected bindings roles id
+    | PrimitiveFnCall => Left PrimitiveError CoreTerm PrimitiveSpecializationRequired
+    | PrimitiveStdoutWrite => primitive_runtime_argument_expected bindings roles (primitive_type_ref PrimitiveStringType bindings)
+    | PrimitiveStderrWrite => primitive_runtime_argument_expected bindings roles (primitive_type_ref PrimitiveStringType bindings)
+    | PrimitiveStdoutFlush => primitive_runtime_unit_expected bindings roles
+    | PrimitiveProcessExit => primitive_runtime_argument_expected bindings roles (primitive_role_ref PrimitiveNatRole roles)
+    | PrimitiveArgv => primitive_startup_expected bindings roles False
+    | PrimitiveEnvGet => primitive_startup_expected bindings roles True
+    | PrimitiveFileRead => primitive_file_expected bindings roles False
+    | PrimitiveFileWrite => primitive_file_expected bindings roles True
+    | PrimitiveFileKind => primitive_file_kind_expected bindings roles
+    | PrimitiveFileExists => primitive_file_predicate_expected bindings roles
+    | PrimitiveFileIsDirectory => primitive_file_predicate_expected bindings roles
+    | PrimitiveFileRealpath => primitive_file_expected bindings roles False
+    | PrimitiveDirectoryList => primitive_directory_expected bindings roles False
+    | PrimitiveDirectoryListable => primitive_directory_expected bindings roles True
+    | PrimitiveDirectoryCreate => primitive_runtime_argument_expected bindings roles (primitive_type_ref PrimitiveStringType bindings)
+    | PrimitivePathRemove => primitive_runtime_argument_expected bindings roles (primitive_type_ref PrimitiveStringType bindings)
+    | PrimitiveFileCopy => primitive_file_expected bindings roles True
+    | PrimitiveFileRename => primitive_bind CoreTerm CoreTerm (primitive_type_ref PrimitiveStringType bindings)
+        (fun (string : CoreTerm) => primitive_map CoreTerm CoreTerm (CPi string)
+          (primitive_file_kind_expected bindings roles))
+    | PrimitiveFileTemp => primitive_string_action_expected bindings
+    | PrimitiveFileTempIn => primitive_file_expected bindings roles False
+    | PrimitiveProcessInherit => primitive_process_inherit_expected bindings roles
+    | PrimitiveProcessBounded => primitive_process_bounded_expected bindings roles
+    | PrimitiveProcessCapture => primitive_capture_expected bindings roles False
+    | PrimitiveHttpPost => primitive_capture_expected bindings roles True
+    | PrimitiveTimeNow => primitive_string_action_expected bindings
+    | PrimitiveStdinReadLine => primitive_string_action_expected bindings
+    | PrimitiveStdinReadBytes => primitive_bind CoreTerm CoreTerm (primitive_type_ref PrimitiveRuntimeType bindings)
+        (fun (runtime : CoreTerm) => primitive_bind CoreTerm CoreTerm (primitive_type_ref PrimitiveStringType bindings)
+          (fun (string : CoreTerm) => primitive_map CoreTerm CoreTerm (fun (natural : CoreTerm) =>
+            CPi natural (CApp runtime string)) (primitive_role_ref PrimitiveNatRole roles))) end;
+
+def primitive_expected_signature (fuel : Nat)
+    (normalize : Nat -> CoreTerm -> Either PrimitiveError CoreTerm)
+    (bindings : List PrimitiveResolved) (roles : List PrimitiveRoleBinding)
+    (id : PrimitiveId) (specialization : Maybe CoreTerm) : Either PrimitiveError CoreTerm :=
+    primitive_bind Unit CoreTerm (primitive_validate_context fuel normalize bindings roles)
+      (fun (_ : Unit) => match specialization with
+        | Nothing => primitive_expected_fixed bindings roles id
+        | Just signature => match primitive_id_equal id PrimitiveFnCall with
+          | True => primitive_call_expected fuel normalize bindings roles signature
+          | False => match orb (primitive_id_equal id PrimitiveRawLoad) (primitive_id_equal id PrimitiveRawStore) with
+            | True => primitive_storage_expected fuel normalize bindings roles id signature
+            | False => Left PrimitiveError CoreTerm PrimitiveUnexpectedSpecialization
+            end
+          end
+        end);
+
+def primitive_abi_core (bindings : List PrimitiveResolved) (value : PrimitiveAbiValue)
+    : Either PrimitiveError CoreTerm :=
+    match value with
+    | PrimitiveAbiWord word => primitive_type_ref (primitive_word_type word) bindings
+    | PrimitiveAbiPointer pointee => primitive_map CoreTerm CoreTerm (fun (pointer : CoreTerm) => CApp pointer pointee)
+        (primitive_type_ref PrimitiveRawPtrType bindings)
+    | PrimitiveAbiFunction signature => primitive_map CoreTerm CoreTerm (fun (pointer : CoreTerm) => CApp pointer signature)
+        (primitive_type_ref PrimitiveRawFnType bindings) end;
+
+def primitive_abi_size (value : PrimitiveAbiValue) : Nat :=
+    match value with | PrimitiveAbiWord word => primitive_word_size word
+    | PrimitiveAbiPointer _ => 8 | PrimitiveAbiFunction _ => 8 end;
+
+def primitive_validate_layout (fuel : Nat)
+    (normalize : Nat -> CoreTerm -> Either PrimitiveError CoreTerm)
+    (bindings : List PrimitiveResolved) (roles : List PrimitiveRoleBinding)
+    (layout : PrimitiveRawLayout) : Either PrimitiveError PrimitiveCheckedLayout :=
+    primitive_bind Unit PrimitiveCheckedLayout (primitive_fuel fuel) (fun (_ : Unit) =>
+      match layout with | PrimitiveRawLayoutOf size alignment packed fields =>
+        primitive_bind Unit PrimitiveCheckedLayout (primitive_require
+          (andb (compiler_lt_nat 0 size) (compiler_le_nat size primitive_max_offset))
+          (PrimitiveInvalidLayout PrimitiveLayoutSize)) (fun (_ : Unit) =>
+          primitive_bind Unit PrimitiveCheckedLayout
+            (primitive_require (primitive_layout_alignment alignment) (PrimitiveInvalidLayout PrimitiveLayoutAlignment))
+            (fun (_ : Unit) => primitive_bind Unit PrimitiveCheckedLayout
+              (primitive_layout_divisible size alignment (PrimitiveInvalidLayout PrimitiveLayoutAlignment))
+              (fun (_ : Unit) => primitive_bind Unit PrimitiveCheckedLayout (primitive_validate_context fuel normalize bindings roles)
+                (fun (_ : Unit) => primitive_map (List PrimitiveRawField) PrimitiveCheckedLayout
+                  (fun (checked : List PrimitiveRawField) => PrimitiveLayoutChecked (PrimitiveRawLayoutOf size alignment packed checked))
+                  ((fix check_fields (remaining : Nat) (rest : List PrimitiveRawField) (end_offset : Nat) (ids : List Nat)
+                      : Either PrimitiveError (List PrimitiveRawField) :=
+                    match rest with | Nil => Right PrimitiveError (List PrimitiveRawField) (Nil PrimitiveRawField)
+                    | Cons field tail => match remaining with | Z => Left PrimitiveError (List PrimitiveRawField) PrimitiveResourceExhausted
+                      | S next => match field with | PrimitiveRawFieldAt id offset value =>
+                        let width : Nat := primitive_abi_size value in
+                        primitive_bind Unit (List PrimitiveRawField) (primitive_require
+                          (andb (compiler_le_nat id primitive_max_offset) (compiler_le_nat offset size))
+                          (PrimitiveInvalidLayout (PrimitiveLayoutFieldRange id))) (fun (_ : Unit) =>
+                          primitive_bind Unit (List PrimitiveRawField) (primitive_require (compiler_le_nat width (sub size offset))
+                            (PrimitiveInvalidLayout (PrimitiveLayoutFieldRange id))) (fun (_ : Unit) =>
+                            primitive_bind Unit (List PrimitiveRawField) (primitive_require (notb (memNat id ids))
+                              (PrimitiveInvalidLayout (PrimitiveLayoutDuplicateField id))) (fun (_ : Unit) =>
+                              primitive_bind Unit (List PrimitiveRawField) (primitive_require (compiler_le_nat end_offset offset)
+                                (PrimitiveInvalidLayout (PrimitiveLayoutFieldOverlap id))) (fun (_ : Unit) =>
+                                primitive_bind Unit (List PrimitiveRawField)
+                                  (primitive_layout_field_alignment packed alignment offset width id) (fun (_ : Unit) =>
+                                  primitive_bind CoreTerm (List PrimitiveRawField) (primitive_abi_core bindings value)
+                                    (fun (typ : CoreTerm) => primitive_bind PrimitiveAbiValue (List PrimitiveRawField)
+                                      (primitive_abi_value fuel normalize bindings roles typ)
+                                      (fun (checked : PrimitiveAbiValue) => primitive_map (List PrimitiveRawField) (List PrimitiveRawField)
+                                        (fun (more : List PrimitiveRawField) => Cons PrimitiveRawField (PrimitiveRawFieldAt id offset checked) more)
+                                        (check_fields next tail (add offset width) (Cons Nat id ids))))))))) end end end)
+                    fuel fields 0 (Nil Nat)))))) end);

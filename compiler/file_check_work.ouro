@@ -1,0 +1,129 @@
+-- Checked entry points bound input traversal before recursive Core operations.
+-- This is a work budget, not a syntax-depth limit: each term, list cursor and
+-- declaration descriptor costs one unit. Scalar numeric payloads cost no extra
+-- units. The iterative work list visits annotations, case metadata/branches,
+-- fixpoint types/bodies and literal bytes as well as ordinary term children.
+import "file_check_model.ouro";
+
+def checker_input_work_limit : Nat := mul 100 (mul 50 100);
+
+inductive CheckInputWork : Type :=
+  | CheckInputTerm : CoreTerm -> CheckInputWork
+  | CheckInputTerms : List CoreTerm -> CheckInputWork
+  | CheckInputNaturals : List Nat -> CheckInputWork
+  | CheckInputParams : List Param -> CheckInputWork
+  | CheckInputCtors : List Ctor -> CheckInputWork
+  | CheckInputInd : IndDecl -> CheckInputWork
+  | CheckInputItem : FileItem -> CheckInputWork;
+
+def check_input_case (info : CaseInfo) (pending : List CheckInputWork) : List CheckInputWork :=
+    match info with | MkCaseInfo _ _ arities => Cons CheckInputWork (CheckInputNaturals arities) pending end;
+
+def check_input_term_children (term : CoreTerm) (pending : List CheckInputWork) : List CheckInputWork :=
+    match term with
+    | CRel _ => pending
+    | CSort _ => pending
+    | CPi domain codomain => Cons CheckInputWork (CheckInputTerm domain)
+        (Cons CheckInputWork (CheckInputTerm codomain) pending)
+    | CLam annotation body => Cons CheckInputWork (CheckInputTerm annotation)
+        (Cons CheckInputWork (CheckInputTerm body) pending)
+    | CApp function argument => Cons CheckInputWork (CheckInputTerm function)
+        (Cons CheckInputWork (CheckInputTerm argument) pending)
+    | CLetIn value annotation body => Cons CheckInputWork (CheckInputTerm value)
+        (Cons CheckInputWork (CheckInputTerm annotation) (Cons CheckInputWork (CheckInputTerm body) pending))
+    | CConst _ => pending
+    | CInd _ => pending
+    | CConstruct _ _ _ => pending
+    | CStrLit _ _ => pending
+    | CStrBytes bytes _ => Cons CheckInputWork (CheckInputNaturals bytes) pending
+    | CCase info predicate scrutinee branches =>
+        check_input_case info (Cons CheckInputWork (CheckInputTerm predicate)
+          (Cons CheckInputWork (CheckInputTerm scrutinee) (Cons CheckInputWork (CheckInputTerms branches) pending)))
+    | CFix _ _ _ annotation body => Cons CheckInputWork (CheckInputTerm annotation)
+        (Cons CheckInputWork (CheckInputTerm body) pending)
+    end;
+
+def check_input_item_children (item : FileItem) (pending : List CheckInputWork) : List CheckInputWork :=
+    match item with
+    | FDef _ typ body => Cons CheckInputWork (CheckInputTerm typ) (Cons CheckInputWork (CheckInputTerm body) pending)
+    | FAxiom _ typ => Cons CheckInputWork (CheckInputTerm typ) pending
+    | FInd decl => Cons CheckInputWork (CheckInputInd decl) pending
+    | FIntrinsic _ typ key specialization =>
+        Cons CheckInputWork (CheckInputTerm typ)
+          (Cons CheckInputWork (CheckInputNaturals key)
+            (match specialization with
+             | Nothing => pending | Just term => Cons CheckInputWork (CheckInputTerm term) pending end))
+    | FExtern _ typ _ => Cons CheckInputWork (CheckInputTerm typ) pending
+    | FRepresentation _ key => Cons CheckInputWork (CheckInputNaturals key) pending
+    end;
+
+def check_input_children (work : CheckInputWork) (pending : List CheckInputWork) : List CheckInputWork :=
+    match work with
+    | CheckInputTerm term => check_input_term_children term pending
+    | CheckInputTerms terms => match terms with
+        | Nil => pending
+        | Cons term rest => Cons CheckInputWork (CheckInputTerm term) (Cons CheckInputWork (CheckInputTerms rest) pending)
+        end
+    | CheckInputNaturals values => match values with
+        | Nil => pending | Cons _ rest => Cons CheckInputWork (CheckInputNaturals rest) pending end
+    | CheckInputParams params => match params with
+        | Nil => pending | Cons param rest => match param with
+            | MkParam _ typ => Cons CheckInputWork (CheckInputTerm typ) (Cons CheckInputWork (CheckInputParams rest) pending)
+            end
+        end
+    | CheckInputCtors ctors => match ctors with
+        | Nil => pending | Cons ctor rest => match ctor with
+            | MkCtor _ typ => Cons CheckInputWork (CheckInputTerm typ) (Cons CheckInputWork (CheckInputCtors rest) pending)
+            end
+        end
+    | CheckInputInd decl => match decl with
+        | MkIndDecl _ params indices _ ctors => Cons CheckInputWork (CheckInputParams params)
+            (Cons CheckInputWork (CheckInputTerms indices) (Cons CheckInputWork (CheckInputCtors ctors) pending))
+        end
+    | CheckInputItem item => check_input_item_children item pending
+    end;
+
+-- Checking emptiness first admits an input costing exactly the stated budget.
+-- A batch returns its unvisited work and remaining budget. This bounds the C
+-- stack even when the generated code is compiled without tail-call optimization.
+inductive CheckInputProgress : Type :=
+  | CheckInputDone : Nat -> CheckInputProgress
+  | CheckInputPending : Nat -> List CheckInputWork -> CheckInputProgress
+  | CheckInputExhausted : CheckInputProgress;
+
+def check_input_work_batch : Nat -> Nat -> List CheckInputWork -> CheckInputProgress :=
+  fix visit (batch : Nat) (fuel : Nat) (pending : List CheckInputWork) : CheckInputProgress :=
+    match pending with
+    | Nil => CheckInputDone fuel
+    | Cons work rest => match fuel with
+        | Z => CheckInputExhausted
+        | S remaining => match batch with
+            | Z => CheckInputPending fuel pending
+            | S next => visit next remaining (check_input_children work rest)
+            end
+        end
+    end;
+
+def check_input_work_remaining (fuel : Nat) (pending : List CheckInputWork) : Maybe Nat :=
+    (fix batches (guard : Nat) (remaining : Nat) (work : List CheckInputWork) : Maybe Nat :=
+      match check_input_work_batch fuel1k remaining work with
+      | CheckInputDone left => Just Nat left
+      | CheckInputExhausted => Nothing Nat
+      | CheckInputPending left rest => match guard with
+          | Z => Nothing Nat | S next => batches next left rest
+          end
+      end) fuel fuel pending;
+
+def check_input_within_limit (pending : List CheckInputWork) : Bool :=
+    match check_input_work_remaining checker_input_work_limit pending with
+    | Nothing => False | Just _ => True end;
+
+def check_input_guard (A : Type) (pending : List CheckInputWork)
+    (run : Unit -> CheckResult A) : CheckResult A :=
+    match check_input_within_limit pending with
+    | False => CheckErr A CheckResourceLimit | True => run MkUnit end;
+
+def check_input_normalize_guard (A : Type) (pending : List CheckInputWork)
+    (run : Unit -> NormalizeResult A) : NormalizeResult A :=
+    match check_input_within_limit pending with
+    | False => NormalizeExhausted A | True => run MkUnit end;

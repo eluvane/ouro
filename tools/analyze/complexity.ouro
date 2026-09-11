@@ -1,0 +1,148 @@
+-- Complexity metrics weight branching structure, never naming or formatting.
+-- Cyclomatic: one plus matches, arms, handler clauses, and nested fixes.
+-- Cognitive: each match or handle adds its nesting level plus one, each arm
+-- adds its nesting level (at least one), fixes and matches deepen nesting.
+
+-- @entry complexity_metrics
+-- @entry cx_cyclomatic
+-- @entry cx_cognitive
+
+import "../../std/data.ouro";
+import "../../std/listx.ouro";
+import "../../std/natx.ouro";
+import "ast.ouro";
+
+-- cyclomatic, cognitive, parameters, nodes, depth.
+inductive CxMetrics : Type :=
+  | MkCxMetrics : Nat -> Nat -> Nat -> Nat -> Nat -> CxMetrics;
+
+def cx_cyclomatic (m : CxMetrics) : Nat :=
+    match m with | MkCxMetrics c _ _ _ _ => c end;
+
+def cx_cognitive (m : CxMetrics) : Nat :=
+    match m with | MkCxMetrics _ g _ _ _ => g end;
+
+-- branch points (matches and handles), arms (branches and clauses), nested
+-- fixes, nodes, max depth, cognitive.
+inductive CxAcc : Type :=
+  | MkCxAcc : Nat -> Nat -> Nat -> Nat -> Nat -> Nat -> CxAcc;
+
+def cx_zero : CxAcc := MkCxAcc Z Z Z Z Z Z;
+
+def cx_touch (acc : CxAcc) (depth : Nat) : CxAcc :=
+    match acc with
+    | MkCxAcc m b f n d g => MkCxAcc m b f (S n) (maxNat d depth) g
+    end;
+
+def cx_branch_point (acc : CxAcc) (weight : Nat) : CxAcc :=
+    match acc with
+    | MkCxAcc m b f n d g => MkCxAcc (S m) b f n d (add g weight)
+    end;
+
+def cx_arm (acc : CxAcc) (weight : Nat) : CxAcc :=
+    match acc with
+    | MkCxAcc m b f n d g => MkCxAcc m (S b) f n d (add g weight)
+    end;
+
+def cx_fix (acc : CxAcc) : CxAcc :=
+    match acc with
+    | MkCxAcc m b f n d g => MkCxAcc m b (S f) n d g
+    end;
+
+-- A top-level arm still costs one.
+def cx_arm_weight (nest : Nat) : Nat :=
+    match nest with
+    | Z => S Z
+    | S _ => nest
+    end;
+
+-- Threaded accumulator walk; children sit one level deeper.
+def cx_visit : Ast -> Nat -> Nat -> CxAcc -> CxAcc :=
+  fun (root : Ast) (initial_depth : Nat) (initial_nest : Nat) (initial_acc : CxAcc) =>
+    (fix cx_visit (fuel : Nat) (node : Ast) (depth : Nat) (nest : Nat) (acc0 : CxAcc) : CxAcc :=
+      match fuel with
+      | Z => acc0
+      | S remaining =>
+          let descend : Ast -> Nat -> Nat -> CxAcc -> CxAcc :=
+            fun (child : Ast) (next_depth : Nat) (next_nest : Nat) (next_acc0 : CxAcc) => cx_visit remaining child next_depth next_nest next_acc0 in
+          let acc1 : CxAcc := cx_touch acc0 depth in
+          let kids : CxAcc -> CxAcc :=
+            fun (acc : CxAcc) =>
+              foldl Ast CxAcc (fun (a : CxAcc) (k : Ast) => descend k (S depth) nest a)
+                acc (ast_children node) in
+          match node with
+          | AMatch scrut branches =>
+              let acc2 : CxAcc := descend scrut (S depth) nest (cx_branch_point acc1 (S nest)) in
+              descend branches (S depth) (S nest) acc2
+          | AHandle inner cls =>
+              let acc2 : CxAcc := descend inner (S depth) nest (cx_branch_point acc1 (S nest)) in
+              descend cls (S depth) (S nest) acc2
+          | ABranch _ _ body rest =>
+              let acc2 : CxAcc := descend body (S depth) nest (cx_arm acc1 (cx_arm_weight nest)) in
+              descend rest (S depth) nest acc2
+          | AClause _ _ body rest =>
+              let acc2 : CxAcc := descend body (S depth) nest (cx_arm acc1 (cx_arm_weight nest)) in
+              descend rest (S depth) nest acc2
+          | AFix _ binders ret body =>
+              let acc2 : CxAcc := descend binders (S depth) nest (cx_fix acc1) in
+              let acc3 : CxAcc := descend ret (S depth) nest acc2 in
+              descend body (S depth) (S nest) acc3
+          | AVar _ => acc1
+          | AHole _ => acc1
+          | ASort _ => acc1
+          | ANatLit _ => acc1
+          | AStr _ => acc1
+          | ANoBinder => acc1
+          | ANoBranch => acc1
+          | ANoClause => acc1
+          | AApp _ _ => kids acc1
+          | ALam _ _ _ => kids acc1
+          | APi _ _ _ => kids acc1
+          | ALet _ _ _ _ => kids acc1
+          | AAscribe _ _ => kids acc1
+          | ABinder _ _ _ => kids acc1
+          | APerform _ _ => kids acc1
+          | ADo _ => kids acc1
+          | AList _ => kids acc1
+          end
+      end) (ast_size root) root initial_depth initial_nest initial_acc;
+
+-- Leading lambdas, then a fix telescope.
+def cx_count_params : Ast -> Nat :=
+  fix cx_count_params (a : Ast) : Nat :=
+    match a with
+    | AAscribe e _ => cx_count_params e
+    | ALam _ _ body => S (cx_count_params body)
+    | AFix _ binders _ _ => length Nat (ast_binder_ids binders)
+    | AVar _ => Z
+    | AHole _ => Z
+    | ASort _ => Z
+    | ANatLit _ => Z
+    | AStr _ => Z
+    | AApp _ _ => Z
+    | APi _ _ _ => Z
+    | ALet _ _ _ _ => Z
+    | ABinder _ _ _ => Z
+    | ANoBinder => Z
+    | ABranch _ _ _ _ => Z
+    | ANoBranch => Z
+    | AMatch _ _ => Z
+    | APerform _ _ => Z
+    | AHandle _ _ => Z
+    | AClause _ _ _ _ => Z
+    | ANoClause => Z
+    | ADo _ => Z
+    | AList _ => Z
+    end;
+
+-- The definition's own fix is its body, not a nested one.
+def complexity_metrics (a : Ast) : CxMetrics :=
+    match cx_visit a (S Z) Z cx_zero with
+    | MkCxAcc m b f n d g =>
+        let nested : Nat :=
+          match ast_is_fix_body a with
+          | True => pred f
+          | False => f
+          end in
+        MkCxMetrics (S (add m (add b nested))) g (cx_count_params a) n d
+    end;

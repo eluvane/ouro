@@ -1,0 +1,163 @@
+-- Ordinary argument staging precedes Job creation. Result failures use only
+-- the bounded owner cleanup; no managed allocation failure enters INFINITE wait.
+import "managed_process_inherit_arguments.ouro";
+import "managed_process_result.ouro";
+
+def managed_process_bounded_cleanup (compiler : ManagedCompiler) (owner : MirValue) (scope : ManagedFileScope)
+    (state : ManagedState) : Either NativeLowerError ManagedResult :=
+    lower_bind ManagedResult ManagedResult (managed_process_call compiler ManagedProcessBoundedClose ([owner] : List MirValue) state)
+      (fun (closed : ManagedResult) => match closed with | ManagedResultOf status next =>
+        lower_bind ManagedResult ManagedResult (managed_startup_zero status next)
+          (fun (tested : ManagedResult) => match tested with | ManagedResultOf okay after =>
+            lower_bind ManagedResult ManagedResult (managed_file_cleanup compiler scope after)
+              (fun (released : ManagedResult) => match released with | ManagedResultOf freed finished =>
+                managed_binary MirU8 MirAnd okay freed finished end) end) end);
+
+def managed_process_bounded_require (compiler : ManagedCompiler) (owner : MirValue) (scope : ManagedFileScope)
+    (condition : MirValue) (state : ManagedState) : Either NativeLowerError ManagedState :=
+    lower_bind Nat ManagedState (managed_stdio_exit_symbol compiler) (fun (exit : Nat) =>
+      lower_bind LowerLoopBlocks ManagedState (lower_loop_blocks (managed_flow state))
+        (fun (labels : LowerLoopBlocks) => match labels with | LowerLoopAt valid invalid _ flow =>
+          lower_map ManagedResult ManagedState (fun (cleaned : ManagedResult) => match cleaned with
+            | ManagedResultOf _ after => managed_switch_block valid MirTrap
+                (managed_emit (MirCall MirMayGc (Nothing Nat) (MirDirect exit)
+                  ([managed_bits MirU32 73] : List MirValue)) after) end)
+            (managed_process_bounded_cleanup compiler owner scope
+              (managed_with_flow state (lower_switch_block invalid (MirBranch condition valid invalid) flow))) end));
+
+def managed_process_bounded_string (compiler : ManagedCompiler) (owner : MirValue) (scope : ManagedFileScope)
+    (offset : Nat) (state : ManagedState) : Either NativeLowerError ManagedResult :=
+    lower_bind ManagedResult ManagedResult (managed_load MirUSize owner (add offset 8) state)
+      (fun (sized : ManagedResult) => match sized with | ManagedResultOf bytes next =>
+        lower_bind ManagedResult ManagedResult (managed_binary MirUSize MirAdd bytes (managed_bits MirUSize 47) next)
+          (fun (added : ManagedResult) => match added with | ManagedResultOf total after =>
+            lower_bind ManagedResult ManagedResult (managed_compare MirGreaterEqual total bytes after)
+              (fun (tested : ManagedResult) => match tested with | ManagedResultOf fits bounded =>
+                lower_bind ManagedState ManagedResult (managed_process_bounded_require compiler owner scope fits bounded)
+                  (fun (checked : ManagedState) => lower_bind ManagedResult ManagedResult (managed_string_allocate compiler bytes checked)
+                    (fun (allocated : ManagedResult) => match allocated with | ManagedResultOf value entered =>
+                      lower_bind ManagedResult ManagedResult (managed_load MirUSize owner offset entered)
+                        (fun (loaded : ManagedResult) => match loaded with | ManagedResultOf bits located =>
+                          lower_bind ManagedResult ManagedResult (managed_convert MirRawPtr MirRawFromBits bits located)
+                            (fun (cast : ManagedResult) => match cast with | ManagedResultOf source copied =>
+                              lower_map ManagedState ManagedResult (fun (finished : ManagedState) => ManagedResultOf value finished)
+                                (managed_bytes_copy source (managed_bits MirUSize 0) value (managed_bits MirUSize 40) bytes copied) end) end) end)) end) end) end);
+
+def managed_process_bounded_input_buffer (compiler : ManagedCompiler) (owner : MirValue) (scope : ManagedFileScope)
+    (value : MirValue) (bytes : MirValue) (buffer : MirValue) (state : ManagedState)
+    : Either NativeLowerError ManagedState :=
+    let owned : ManagedFileScope := managed_file_own buffer scope in
+    lower_bind ManagedState ManagedState
+      (managed_bytes_copy value (managed_bits MirUSize 40) buffer (managed_bits MirUSize 0) bytes state)
+      (fun (copied : ManagedState) => lower_bind ManagedResult ManagedState
+        (managed_process_call compiler ManagedProcessBoundedInput ([owner, buffer, bytes] : List MirValue) copied)
+        (fun (pushed : ManagedResult) => match pushed with | ManagedResultOf status next =>
+          lower_bind ManagedState ManagedState (managed_process_status compiler owner owned status next)
+            (fun (checked : ManagedState) => lower_bind ManagedResult ManagedState
+              (managed_process_call compiler ManagedProcessRelease ([buffer] : List MirValue) checked)
+              (fun (released : ManagedResult) => match released with | ManagedResultOf okay after =>
+                managed_process_require compiler owner owned okay after end)) end));
+
+def managed_process_bounded_input (compiler : ManagedCompiler) (owner : MirValue) (scope : ManagedFileScope)
+    (value : MirValue) (state : ManagedState) : Either NativeLowerError ManagedState :=
+    lower_bind ManagedResult ManagedState (managed_string_size compiler value state)
+      (fun (sized : ManagedResult) => match sized with | ManagedResultOf bytes next =>
+        lower_bind ManagedResult ManagedState (managed_binary MirUSize MirAdd bytes (managed_bits MirUSize 1) next)
+          (fun (sized_buffer : ManagedResult) => match sized_buffer with | ManagedResultOf capacity sized_state =>
+            lower_bind ManagedResult ManagedState
+              (managed_process_call compiler ManagedProcessAllocate
+                ([capacity, managed_bits MirUSize 8] : List MirValue) sized_state)
+              (fun (allocated : ManagedResult) => match allocated with | ManagedResultOf buffer after =>
+                lower_bind ManagedResult ManagedState (managed_compare MirNotEqual buffer (managed_bits MirRawPtr 0) after)
+                  (fun (tested : ManagedResult) => match tested with | ManagedResultOf okay entered =>
+                    lower_bind ManagedState ManagedState (managed_process_require compiler owner scope okay entered)
+                      (managed_process_bounded_input_buffer compiler owner scope value bytes buffer) end) end) end) end);
+
+def managed_process_bounded_setting (compiler : ManagedCompiler) (owner : MirValue)
+    (field : Nat) (offset : Nat) (value : MirValue) (state : ManagedState)
+    : Either NativeLowerError ManagedState :=
+    lower_bind ManagedNatWordResult ManagedState (managed_nat_checked_word compiler PrimitiveWordUSize value state)
+      (fun (converted : ManagedNatWordResult) => match converted with | ManagedNatWordOf fits bits after =>
+        let stored : ManagedState := managed_emit (MirStore owner (codegen_disp offset) bits) after in
+        lower_bind ManagedResult ManagedState (managed_compare MirEqual fits (managed_bits MirU8 0) stored)
+          (fun (tested : ManagedResult) => match tested with | ManagedResultOf overflow ready =>
+            managed_nat_when overflow (fun (entered : ManagedState) => Right NativeLowerError ManagedState
+              (managed_emit_all ([MirStore owner (codegen_disp 184) (managed_bits MirUSize 4),
+                MirStore owner (codegen_disp 192) (managed_bits MirUSize field)] : List MirInstruction) entered)) ready end) end);
+
+-- Limits are five checked natural fields; the compiler does not grant meaning
+-- to constructor display names. Machine overflow is explicit invalid-limits.
+def managed_process_bounded_settings (compiler : ManagedCompiler) (owner : MirValue)
+    (limits : MirValue) (state : ManagedState) : Either NativeLowerError ManagedState :=
+    (fix fields (remaining : Nat) (cursor : MirValue) (index : Nat) (offset : Nat)
+        (entered : ManagedState) : Either NativeLowerError ManagedState :=
+      match remaining with
+      | Z => managed_process_bounded_setting compiler owner index offset cursor entered
+      | S rest => lower_bind ManagedResult ManagedState (managed_load MirManagedPtr cursor 56 entered)
+          (fun (head : ManagedResult) => match head with | ManagedResultOf value next =>
+            lower_bind ManagedResult ManagedState (managed_load MirManagedPtr cursor 64 next)
+              (fun (tail : ManagedResult) => match tail with | ManagedResultOf after loaded =>
+                lower_bind ManagedState ManagedState (managed_process_bounded_setting compiler owner index offset value loaded)
+                  (fun (configured : ManagedState) => fields rest after (add index 1) (add offset 8) configured) end) end)
+      end) 4 limits 1 144 state;
+
+def managed_process_bounded_result (compiler : ManagedCompiler) (owner : MirValue) (scope : ManagedFileScope)
+    (state : ManagedState) : Either NativeLowerError ManagedResult :=
+    lower_bind ManagedResult ManagedResult (managed_process_bounded_string compiler owner scope 64 state)
+  (fun (r0 : ManagedResult) => match r0 with | ManagedResultOf stdout s1 =>
+lower_bind ManagedResult ManagedResult (managed_process_bounded_string compiler owner scope 80 s1)
+  (fun (r1 : ManagedResult) => match r1 with | ManagedResultOf stderr s2 =>
+lower_bind ManagedResult ManagedResult (managed_process_pair compiler stdout stderr s2)
+  (fun (r2 : ManagedResult) => match r2 with | ManagedResultOf streams s3 =>
+lower_bind ManagedResult ManagedResult (managed_load MirUSize owner 200 s3)
+  (fun (r3 : ManagedResult) => match r3 with | ManagedResultOf peak_bits s4 =>
+lower_bind ManagedResult ManagedResult (managed_nat_from_word compiler PrimitiveWordUSize peak_bits s4)
+  (fun (r4 : ManagedResult) => match r4 with | ManagedResultOf peak s5 =>
+lower_bind ManagedResult ManagedResult (managed_process_pair compiler peak streams s5)
+  (fun (r5 : ManagedResult) => match r5 with | ManagedResultOf with_peak s6 =>
+lower_bind ManagedResult ManagedResult (managed_load MirUSize owner 192 s6)
+  (fun (r6 : ManagedResult) => match r6 with | ManagedResultOf detail_bits s7 =>
+lower_bind ManagedResult ManagedResult (managed_nat_from_word compiler PrimitiveWordUSize detail_bits s7)
+  (fun (r7 : ManagedResult) => match r7 with | ManagedResultOf detail s8 =>
+lower_bind ManagedResult ManagedResult (managed_process_pair compiler detail with_peak s8)
+  (fun (r8 : ManagedResult) => match r8 with | ManagedResultOf with_detail s9 =>
+lower_bind ManagedResult ManagedResult (managed_load MirUSize owner 184 s9)
+  (fun (r9 : ManagedResult) => match r9 with | ManagedResultOf kind_bits s10 =>
+lower_bind ManagedResult ManagedResult (managed_nat_from_word compiler PrimitiveWordUSize kind_bits s10)
+  (fun (r10 : ManagedResult) => match r10 with | ManagedResultOf kind s11 =>
+lower_bind ManagedResult ManagedResult (managed_process_pair compiler kind with_detail s11)
+  (fun (r11 : ManagedResult) => match r11 with | ManagedResultOf result s12 =>
+lower_bind ManagedResult ManagedResult (managed_process_bounded_cleanup compiler owner scope s12)
+  (fun (r12 : ManagedResult) => match r12 with | ManagedResultOf okay s13 =>
+lower_bind Nat ManagedResult (managed_stdio_exit_symbol compiler) (fun (exit : Nat) =>
+  lower_map ManagedState ManagedResult (fun (finished : ManagedState) => ManagedResultOf result finished)
+    (managed_stdio_require exit okay s13)) end) end) end) end) end) end) end) end) end) end) end) end) end);
+
+def managed_process_bounded_owned (compiler : ManagedCompiler) (executable : MirValue)
+    (arguments : MirValue) (request : MirValue) (owner : MirValue) (scope : ManagedFileScope)
+    (state : ManagedState) : Either NativeLowerError ManagedResult :=
+    lower_bind ManagedResult ManagedResult (managed_load MirManagedPtr request 56 state)
+      (fun (loaded_input : ManagedResult) => match loaded_input with | ManagedResultOf input after_input =>
+      lower_bind ManagedResult ManagedResult (managed_load MirManagedPtr request 64 after_input)
+        (fun (loaded_limits : ManagedResult) => match loaded_limits with | ManagedResultOf limits after_limits =>
+    lower_bind ManagedState ManagedResult (managed_process_bounded_settings compiler owner limits after_limits)
+      (fun (configured : ManagedState) => lower_bind ManagedState ManagedResult
+        (managed_process_bounded_input compiler owner scope input configured)
+        (fun (supplied_input : ManagedState) => lower_bind ManagedState ManagedResult
+        (managed_process_inherit_push compiler owner scope executable supplied_input)
+        (fun (pushed : ManagedState) => lower_bind ManagedState ManagedResult
+          (managed_process_inherit_arguments compiler owner scope arguments pushed)
+          (fun (supplied : ManagedState) => lower_bind ManagedResult ManagedResult
+            (managed_process_call compiler ManagedProcessBoundedRun ([owner] : List MirValue) supplied)
+            (fun (ran : ManagedResult) => match ran with | ManagedResultOf status after =>
+              lower_bind ManagedResult ManagedResult (managed_startup_zero status after)
+                (fun (tested : ManagedResult) => match tested with | ManagedResultOf okay ready =>
+                  lower_bind ManagedState ManagedResult
+                    (managed_process_bounded_require compiler owner scope okay ready)
+                    (managed_process_bounded_result compiler owner scope) end) end))))) end) end);
+
+def managed_process_bounded_body (compiler : ManagedCompiler) (executable : MirValue)
+    (arguments : MirValue) (limits : MirValue) (state : ManagedState)
+    : Either NativeLowerError ManagedResult :=
+    managed_file_buffer compiler (ManagedFileScopeOf ([] : List MirValue) (Nothing MirValue))
+      (managed_bits MirUSize 256) (managed_process_bounded_owned compiler executable arguments limits) state;

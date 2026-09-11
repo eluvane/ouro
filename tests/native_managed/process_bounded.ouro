@@ -1,0 +1,141 @@
+-- Direct native probes. Child modes are test-owned and never invoke a shell.
+import "../../std/processx.ouro";
+import "source_file_values.ouro";
+import "source_nat_values.ouro";
+
+def capture_probe_sleep (milliseconds : U32) : Runtime Unit :=
+    windows_capture_sleep milliseconds;
+extern capture_probe_pid : Runtime U32 :=
+    "windows-x86_64" "win64" "kernel32.dll" "GetCurrentProcessId" "nogc";
+
+def capture_probe_limit (timeout : Nat) (out : Nat) (err : Nat) : ProcessCaptureLimits :=
+    ProcessCaptureLimitsOf timeout 64 1 out err;
+
+def capture_probe_pass (name : String) : IO Unit := do println (str_concat "CAPTURE_OK " name); exit 42
+def capture_probe_error (expected : String) (result : Either ProcessCaptureError ProcessCaptureResult) : IO Unit :=
+    match result with
+    | Right _ => exit 91
+    | Left error => file_expect (str_eq (process_capture_error_code error) expected) end;
+
+def capture_probe_binary : IO Unit :=
+    do print file_binary; eprint file_binary; exit (add 256 3)
+
+def capture_probe_input : IO Unit :=
+    do let! input := prim_stdin_read_bytes 8;
+       file_expect (str_eq input file_binary);
+       let! eof := prim_stdin_read_bytes 1;
+       file_expect (eq_nat (str_len eof) 0);
+       capture_probe_binary
+
+def capture_probe_flood (error : Bool) : IO Unit :=
+    let chunk : String := file_double 12 "x" in
+    match usize_from_nat 0 with | Nothing => exit 91 | Just zero =>
+      match u8_from_nat 1 with | Nothing => exit 91 | Just running =>
+        runtime_bind USize Unit (runtime_loop USize zero
+          (fun (index : USize) => runtime_pure U8 running)
+          (fun (index : USize) => runtime_bind Unit USize
+            (match error with | True => eprint chunk | False => print chunk end)
+            (fun (written : Unit) => runtime_pure USize index))) (fun (ended : USize) => exit 91)
+      end end;
+
+def capture_probe_pause : IO Unit :=
+    match u32_from_nat (mul 240 250) with
+    | Nothing => exit 91 | Just milliseconds => do capture_probe_sleep milliseconds; exit 91 end;
+
+def capture_probe_success (result : Either ProcessCaptureError ProcessCaptureResult) : IO Unit :=
+    match result with
+    | Left error => do eprintln (process_capture_error_message error); exit 91
+    | Right captured => let child : ProcResult := process_capture_proc_result captured in
+        do file_expect (eq_nat (proc_code child) (add 256 3));
+           file_expect (str_eq (proc_stdout child) file_binary);
+           file_expect (str_eq (proc_stderr child) file_binary);
+           file_expect (ltb_nat 0 (process_capture_peak_bytes captured)) end;
+
+def capture_probe_record (path : String) : IO Unit :=
+    runtime_bind U32 Unit capture_probe_pid (fun (pid : U32) => prim_fs_write_file path (show_nat (nat_u32_to_nat pid)));
+
+def capture_probe_mode (program : String) (mode : String) (arguments : List String) : IO Unit :=
+    let first : String := nth String "" 0 arguments in
+    let second : String := nth String "" 1 arguments in
+    match str_eq mode "--child-input" with | True => capture_probe_input | False =>
+    match str_eq mode "--stdin" with
+    | True => do let! result := process_run_captured_bounded_with_input (capture_probe_limit (mul 20 250) 7 7) program ["--child-input"] file_binary;
+                 capture_probe_success result; capture_probe_pass "stdin"
+    | False =>
+    match str_eq mode "--child-binary" with | True => capture_probe_binary | False =>
+    match str_eq mode "--child-empty" with | True => do let! eof := prim_stdin_read_bytes 1; file_expect (eq_nat (str_len eof) 0); exit 73 | False =>
+    match str_eq mode "--child-sleep" with | True => do print file_binary; eprint file_binary; capture_probe_pause | False =>
+    match str_eq mode "--child-flood-out" with | True => capture_probe_flood False | False =>
+    match str_eq mode "--child-flood-err" with | True => capture_probe_flood True | False =>
+    match str_eq mode "--leaf" with | True => do capture_probe_record first; capture_probe_pause | False =>
+    match str_eq mode "--branch" with
+    | True => do capture_probe_record first; let! result := process_run_inherited program ["--leaf", second]; exit 91
+    | False => match str_eq mode "--tree" with
+      | True => do let! result := process_run_captured_bounded (capture_probe_limit (mul 120 250) 0 0) program ["--branch", first, second]; exit 91
+      | False => match str_eq mode "--tree-timeout" with
+        | True => do let! result := process_run_captured_bounded (capture_probe_limit (mul 20 250) 0 0) program ["--branch", first, second];
+                     capture_probe_error "process_capture_timeout" result; capture_probe_pass "tree-timeout"
+        | False => match str_eq mode "--basic" with
+          | True => do let! result := process_run_captured_bounded (capture_probe_limit (mul 20 250) 7 7) program ["--child-binary"];
+                       capture_probe_success result; capture_probe_pass "basic"
+          | False => match str_eq mode "--reuse" with
+            | True => let partial : List String -> Pair String (Pair Nat (Pair Nat (Pair Nat (Pair Nat Nat)))) -> IO (Pair Nat (Pair Nat (Pair Nat (Pair String String)))) := prim_process_capture_bounded program in
+                let action : IO (Pair Nat (Pair Nat (Pair Nat (Pair String String)))) := partial ["--child-input"] (process_capture_request (capture_probe_limit (mul 20 250) 7 7) file_binary) in
+                do let! a := action; capture_probe_success (process_capture_decode_checked (capture_probe_limit (mul 20 250) 7 7) a);
+                   let! b := action; capture_probe_success (process_capture_decode_checked (capture_probe_limit (mul 20 250) 7 7) b);
+                   capture_probe_pass "reuse"
+            | False => match str_eq mode "--deferred" with
+              | True => let action : IO (Either ProcessCaptureError ProcessCaptureResult) := process_run_captured_bounded (capture_probe_limit (mul 20 250) 0 0) program ["--child-flood-out"] in
+                  let invalid : IO (Either ProcessCaptureError ProcessCaptureResult) := process_run_captured_bounded (capture_probe_limit 250 0 0) (str_of_codes [255]) [] in
+                  do file_expect (eq_nat (length (IO (Either ProcessCaptureError ProcessCaptureResult)) [action, invalid]) 2); capture_probe_pass "deferred"
+              | False => match str_eq mode "--timeout" with
+                | True => do let! result := process_run_captured_bounded (capture_probe_limit (mul 4 250) 7 7) program ["--child-sleep"];
+                             match result with | Left error => match error with
+                               | ProcessCaptureTimedOut _ output stderr =>
+                                 match andb (str_eq output file_binary) (str_eq stderr file_binary) with
+                                 | True => capture_probe_pass "timeout"
+                                 | False => do eprintln (str_cat4 "timeout-out=" (show_nat (str_len output))
+                                               " err=" (show_nat (str_len stderr))); exit 91 end
+                               | ProcessCaptureInvalidLimits _ => do eprintln (process_capture_error_message error); exit 91
+                               | ProcessCaptureOsError _ => do eprintln (process_capture_error_message error); exit 91
+                               | ProcessCaptureCleanupFailed _ => do eprintln (process_capture_error_message error); exit 91
+                               | ProcessCaptureResourceLimit _ _ _ _ => do eprintln (process_capture_error_message error); exit 91
+                               | ProcessCaptureOutputLimit _ _ _ => do eprintln (process_capture_error_message error); exit 91
+                               | ProcessCaptureProtocolError _ => do eprintln (process_capture_error_message error); exit 91 end
+                             | Right captured => do eprintln (str_concat "timeout-exit="
+                                 (show_nat (proc_code (process_capture_proc_result captured)))); exit 91 end
+                | False => match str_eq mode "--stdout-cap" with
+                  | True => do let! result := process_run_captured_bounded (capture_probe_limit (mul 20 250) (mul 16 256) 0) program ["--child-flood-out"];
+                               capture_probe_error "process_capture_output_limit" result; capture_probe_pass "stdout-cap"
+                  | False => match str_eq mode "--stderr-cap" with
+                    | True => do let! result := process_run_captured_bounded (capture_probe_limit (mul 20 250) 0 (mul 16 256)) program ["--child-flood-err"];
+                                 capture_probe_error "process_capture_output_limit" result; capture_probe_pass "stderr-cap"
+                    | False => match str_eq mode "--negative73" with
+                      | True => do let! result := process_run_captured_bounded (capture_probe_limit (mul 20 250) 0 0) program ["--child-empty"];
+                                   match result with | Left _ => exit 91 | Right captured => do file_expect (eq_nat (proc_code (process_capture_proc_result captured)) 73); capture_probe_pass "negative73" end
+                      | False => match str_eq mode "--missing" with
+                        | True => do let! result := process_run_captured_bounded (capture_probe_limit 250 0 0) "./__ouro_absent_bounded_5f79d__.exe" [];
+                                     capture_probe_error "process_capture_os" result; capture_probe_pass "missing"
+                        | False => match str_eq mode "--invalid" with
+                          | True => do let! result := process_run_captured_bounded (capture_probe_limit 0 0 0) program ["--child-flood-out"];
+                                       capture_probe_error "process_capture_limits" result; capture_probe_pass "invalid"
+                          | False => match str_eq mode "--oversized" with
+                            | True => do let! result := process_run_captured_bounded (capture_probe_limit (mul 20 250) 0 0) first [];
+                                         match result with
+                                         | Left error => match error with
+                                           | ProcessCaptureResourceLimit _ _ _ _ => capture_probe_pass "oversized"
+                                           | ProcessCaptureInvalidLimits _ => do eprintln (process_capture_error_message error); exit 91
+                                           | ProcessCaptureOsError _ => do eprintln (process_capture_error_message error); exit 91
+                                           | ProcessCaptureTimedOut _ _ _ => do eprintln (process_capture_error_message error); exit 91
+                                           | ProcessCaptureCleanupFailed _ => do eprintln (process_capture_error_message error); exit 91
+                                           | ProcessCaptureOutputLimit _ _ _ => do eprintln (process_capture_error_message error); exit 91
+                                           | ProcessCaptureProtocolError _ => do eprintln (process_capture_error_message error); exit 91 end
+                                         | Right captured => do file_expect (eq_nat (proc_code (process_capture_proc_result captured)) 73);
+                                                                println "ENFORCEMENT_GAP hard-limit notification absent"; exit 74 end
+                            | False => exit 91 end end end end end end end end end end end end end end end end end end end end end;
+
+def main : IO Unit :=
+    do let! words := argv;
+       match words with | Cons program rest => match rest with
+         | Cons mode arguments => capture_probe_mode program mode arguments
+         | Nil => exit 91 end | Nil => exit 91 end

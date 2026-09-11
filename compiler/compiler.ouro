@@ -1,0 +1,390 @@
+-- @entry compile_pipeline
+-- @export compile_program; @doc docs/tcb.md
+-- @export extract_program; @doc docs/tcb.md
+-- @export compile_program_extract; @doc docs/tcb.md
+-- @export compile_core_extract_one; @doc docs/tcb.md
+-- @export pipeline_status_after; @doc docs/tcb.md
+-- @export extract_apps; @doc docs/tcb.md
+
+import "../std/data.ouro";
+import "core.ouro";
+import "pipeline_abi.ouro";
+
+def fuel32 : Nat := add (add ten ten) (add (12) ten);
+
+-- Outside valid contexts; checked paths reject missing names first.
+def compile_missing_rel : Nat := fuel1k;
+
+def lookup_c (name : Nat) : List Nat -> Nat :=
+    fix lookup_c (ctx : List Nat) : Nat :=
+      match ctx with
+      | Nil => compile_missing_rel
+      | Cons y ys =>
+          match eqNat y name with
+          | True => Z
+          | False => S (lookup_c ys)
+          end
+      end;
+
+def bound_name (name : Nat) : List Nat -> Bool :=
+    fix bound_name (ctx : List Nat) : Bool :=
+      match ctx with
+      | Nil => False
+      | Cons y ys =>
+          match eqNat y name with
+          | True => True
+          | False => bound_name ys
+          end
+      end;
+
+def case_info_has_future_global (ci : CaseInfo) (future : List Nat) : Bool :=
+    match ci with
+    | MkCaseInfo ind _ _ => bound_name ind future
+    end;
+
+def surface_has_future_global : Nat -> Surface -> List Nat -> Bool :=
+  fix surface_has_future_global (fuel : Nat) (s : Surface) (future : List Nat) : Bool :=
+    match fuel with
+    | Z => False
+    | S fuel' =>
+        match s with
+        | SVar _ => False
+        | SSort _ => False
+        | SPi _ dom cod =>
+            orb (surface_has_future_global fuel' dom future)
+              (surface_has_future_global fuel' cod future)
+        | SLam _ ann body =>
+            orb (surface_has_future_global fuel' ann future)
+              (surface_has_future_global fuel' body future)
+        | SApp f a =>
+            orb (surface_has_future_global fuel' f future)
+              (surface_has_future_global fuel' a future)
+        | SLet _ v ty body =>
+            orb (surface_has_future_global fuel' v future)
+              (orb (surface_has_future_global fuel' ty future)
+                (surface_has_future_global fuel' body future))
+        | SConst n => bound_name n future
+        | SInd n => bound_name n future
+        | SConstruct i _ _ => bound_name i future
+        | SCase ci p scrut bs =>
+            orb (case_info_has_future_global ci future)
+              (orb (surface_has_future_global fuel' p future)
+                (orb (surface_has_future_global fuel' scrut future)
+                  ((fix go (xs : List Surface) : Bool :=
+                      match xs with
+                      | Nil => False
+                      | Cons b xs' =>
+                          orb (surface_has_future_global fuel' b future) (go xs')
+                      end) bs)))
+        | SFix _ _ _ ty body =>
+            orb (surface_has_future_global fuel' ty future)
+              (surface_has_future_global fuel' body future)
+        | SHole _ => False
+        | SEffectRow ty => surface_has_future_global fuel' ty future
+        | SPerform op args =>
+            orb (bound_name op future)
+              ((fix go (xs : List Surface) : Bool :=
+                  match xs with
+                  | Nil => False
+                  | Cons a xs' =>
+                      orb (surface_has_future_global fuel' a future) (go xs')
+                  end) args)
+        | SStr _ ty => bound_name ty future
+        end
+    end;
+
+-- Totality sentinel (public paths reject unsupported first).
+def invalid_core_c : CoreTerm := CRel compile_missing_rel;
+
+-- Holes/fuel out → False (compile_pipeline fails closed).
+def surface_supported : Nat -> Surface -> List Nat -> Bool :=
+  fix surface_supported (fuel : Nat) (s : Surface) (ctx : List Nat) : Bool :=
+    match fuel with
+    | Z => False
+    | S fuel' =>
+        match s with
+        | SVar name => bound_name name ctx
+        | SSort _ => True
+        | SPi name dom cod =>
+            andb (surface_supported fuel' dom ctx)
+              (surface_supported fuel' cod (Cons Nat name ctx))
+        | SLam name ann body =>
+            andb (surface_supported fuel' ann ctx)
+              (surface_supported fuel' body (Cons Nat name ctx))
+        | SApp f a =>
+            andb (surface_supported fuel' f ctx)
+              (surface_supported fuel' a ctx)
+        | SLet name v ty body =>
+            andb (surface_supported fuel' v ctx)
+              (andb (surface_supported fuel' ty ctx)
+                (surface_supported fuel' body (Cons Nat name ctx)))
+        | SConst _ => True
+        | SInd _ => True
+        | SConstruct _ _ _ => True
+        | SCase _ p scrut bs =>
+            andb (surface_supported fuel' p ctx)
+              (andb (surface_supported fuel' scrut ctx)
+                ((fix go (xs : List Surface) : Bool :=
+                    match xs with
+                    | Nil => True
+                    | Cons b xs' =>
+                        andb (surface_supported fuel' b ctx) (go xs')
+                    end) bs))
+        | SFix name _ _ ty body =>
+            andb (surface_supported fuel' ty ctx)
+              (surface_supported fuel' body (Cons Nat name ctx))
+        | SHole _ => False
+        | SEffectRow ty => surface_supported fuel' ty ctx
+        | SPerform _ args =>
+            (fix go (xs : List Surface) : Bool :=
+                match xs with
+                | Nil => True
+                | Cons a xs' =>
+                    andb (surface_supported fuel' a ctx) (go xs')
+                end) args
+        | SStr _ _ => True
+        end
+    end;
+
+-- Total elab; callers must precheck surface_supported.
+def compile_elab_fuel : Nat -> Surface -> List Nat -> CoreTerm :=
+  fix compile_elab_fuel (fuel : Nat) (s : Surface) (ctx : List Nat) : CoreTerm :=
+    match fuel with
+    | Z => invalid_core_c
+    | S fuel' =>
+        match s with
+        | SVar name => CRel (lookup_c name ctx)
+        | SSort u => CSort u
+        | SPi name dom cod =>
+            CPi (compile_elab_fuel fuel' dom ctx)
+              (compile_elab_fuel fuel' cod (Cons Nat name ctx))
+        | SLam name ann body =>
+            CLam (compile_elab_fuel fuel' ann ctx)
+              (compile_elab_fuel fuel' body (Cons Nat name ctx))
+        | SApp f a =>
+            CApp (compile_elab_fuel fuel' f ctx) (compile_elab_fuel fuel' a ctx)
+        | SLet name v ty body =>
+            CLetIn (compile_elab_fuel fuel' v ctx) (compile_elab_fuel fuel' ty ctx)
+              (compile_elab_fuel fuel' body (Cons Nat name ctx))
+        | SConst n => CConst n
+        | SInd n => CInd n
+        | SConstruct i j np => CConstruct i j np
+        | SCase ci p scrut bs =>
+            CCase ci (compile_elab_fuel fuel' p ctx)
+              (compile_elab_fuel fuel' scrut ctx)
+              ((fix go (xs : List Surface) : List CoreTerm :=
+                  match xs with
+                  | Nil => Nil CoreTerm
+                  | Cons b xs' =>
+                      Cons CoreTerm (compile_elab_fuel fuel' b ctx) (go xs')
+                  end) bs)
+        | SFix name rec_arg arity ty body =>
+            CFix name rec_arg arity (compile_elab_fuel fuel' ty ctx)
+              (compile_elab_fuel fuel' body (Cons Nat name ctx))
+        | SHole _ => invalid_core_c
+        | SEffectRow ty => compile_elab_fuel fuel' ty ctx
+        | SPerform op args =>
+            (fix go (xs : List Surface) (acc : CoreTerm) : CoreTerm :=
+                match xs with
+                | Nil => acc
+                | Cons a xs' =>
+                    go xs' (CApp acc (compile_elab_fuel fuel' a ctx))
+                end) args (CConst op)
+        | SStr n ty => CStrLit n ty
+        end
+    end;
+
+def compile_surface (s : Surface) (ctx : List Nat) : CoreTerm :=
+    compile_elab_fuel fuel32 s ctx;
+
+-- Untrusted structural traversal only. Declaration acceptance belongs to
+-- file_elab; the CompResult returned by these lowering stages is not a proof
+-- that the term is scoped or well typed.
+def wf_core : Nat -> CoreTerm -> Bool :=
+  fix wf_core (fuel : Nat) (t : CoreTerm) : Bool :=
+    match fuel with
+    | Z => False
+    | S fuel' =>
+        match t with
+        | CRel _ => True
+        | CSort _ => True
+        | CPi a b => andb (wf_core fuel' a) (wf_core fuel' b)
+        | CLam a b => andb (wf_core fuel' a) (wf_core fuel' b)
+        | CApp f a => andb (wf_core fuel' f) (wf_core fuel' a)
+        | CLetIn v ty body =>
+            andb (wf_core fuel' v)
+              (andb (wf_core fuel' ty) (wf_core fuel' body))
+        | CConst _ => True
+        | CInd _ => True
+        | CConstruct _ _ _ => True
+        | CCase _ p scrut bs =>
+            andb (wf_core fuel' p)
+              (andb (wf_core fuel' scrut)
+                ((fix go (xs : List CoreTerm) : Bool :=
+                    match xs with
+                    | Nil => True
+                    | Cons b xs' => andb (wf_core fuel' b) (go xs')
+                    end) bs))
+        | CFix _ _ _ ty body =>
+            andb (wf_core fuel' ty) (wf_core fuel' body)
+        | CStrBytes _ _ => True
+        | CStrLit _ _ => True
+        end
+    end;
+
+def check_core (t : CoreTerm) : Bool := wf_core fuel32 t;
+
+def compile_and_check (s : Surface) (ctx : List Nat) : CompResult CoreTerm :=
+    match surface_supported fuel32 s ctx with
+    | False => CErr CoreTerm (ErrCode (S (S Z)) Z)
+    | True =>
+        let t : CoreTerm := compile_surface s ctx in
+        match check_core t with
+        | True => COk CoreTerm t
+        | False => CErr CoreTerm (ErrCode (S (S Z)) (S Z))
+        end
+    end;
+
+def extract_tag (t : CoreTerm) : Nat :=
+    match t with
+    | CRel _ => Z
+    | CSort _ => S Z
+    | CPi _ _ => 2
+    | CLam _ _ => 3
+    | CApp _ _ => 4
+    | CLetIn _ _ _ => 5
+    | CConst _ => 6
+    | CInd _ => 7
+    | CConstruct _ _ _ => 8
+    | CCase _ _ _ _ => 9
+    | CFix _ _ _ _ _ => 10
+    | CStrLit _ _ => 11
+    | CStrBytes _ _ => 12
+    end;
+
+def count_apps : Nat -> CoreTerm -> Nat :=
+  fix count_apps (fuel : Nat) (t : CoreTerm) : Nat :=
+    match fuel with
+    | Z => Z
+    | S fuel' =>
+        match t with
+        | CRel _ => Z
+        | CSort _ => Z
+        | CPi a b => add (count_apps fuel' a) (count_apps fuel' b)
+        | CLam a b => add (count_apps fuel' a) (count_apps fuel' b)
+        | CApp f a =>
+            S (add (count_apps fuel' f) (count_apps fuel' a))
+        | CLetIn v ty body =>
+            add (count_apps fuel' v)
+              (add (count_apps fuel' ty) (count_apps fuel' body))
+        | CConst _ => Z
+        | CInd _ => Z
+        | CConstruct _ _ _ => Z
+        | CCase _ p scrut bs =>
+            add (count_apps fuel' p)
+              (add (count_apps fuel' scrut)
+                ((fix go (xs : List CoreTerm) : Nat :=
+                    match xs with
+                    | Nil => Z
+                    | Cons b xs' => add (count_apps fuel' b) (go xs')
+                    end) bs))
+        | CFix _ _ _ ty body =>
+            add (count_apps fuel' ty) (count_apps fuel' body)
+        | CStrBytes _ _ => Z
+        | CStrLit _ _ => Z
+        end
+    end;
+
+def compile_pipeline (s : Surface) (ctx : List Nat) : CompResult CoreTerm :=
+    compile_and_check s ctx;
+
+def status_ok : Nat := Z;
+
+def status_err (detail : Nat) : Nat := S detail;
+
+def pipeline_ok : List Nat -> Nat :=
+  fix pipeline_ok (xs : List Nat) : Nat :=
+    match xs with
+    | Nil => Z
+    | Cons s xs' =>
+        match s with
+        | Z => pipeline_ok xs'
+        | S d => S d
+        end
+    end;
+
+def pipeline_ok_stages (p : Nat) (d : Nat) (l : Nat) (c : Nat) (e : Nat) : Nat :=
+    let xs : List Nat := ([p, d, l, c, e] : List Nat) in
+    pipeline_ok xs;
+
+def extract_apps (t : CoreTerm) : Nat := count_apps fuel32 t;
+
+def compile_program (xs : List (Pair Nat Surface)) : CompResult (List (Pair Nat CoreTerm)) :=
+  ((((fix go (items : List (Pair Nat Surface)) (future : List Nat)
+        (ctx : List Nat) (seen : List Nat)
+      : CompResult (List (Pair Nat CoreTerm)) :=
+      match items with
+      | Nil => COk (List (Pair Nat CoreTerm)) (Nil (Pair Nat CoreTerm))
+      | Cons p rest =>
+          match p with
+          | MkPair name surface =>
+              match future with
+              | Nil => CErr (List (Pair Nat CoreTerm)) (ErrCode (3) name)
+              | Cons _ future_rest =>
+                  match bound_name name seen with
+                  | True => CErr (List (Pair Nat CoreTerm)) (ErrCode (3) name)
+                  | False =>
+                      match surface_has_future_global fuel32 surface future_rest with
+                      | True => CErr (List (Pair Nat CoreTerm)) (ErrCode (3) name)
+                      | False =>
+                          match compile_pipeline surface ctx with
+                          | CErr e => CErr (List (Pair Nat CoreTerm)) e
+                          | COk core =>
+                              match go rest future_rest (Cons Nat name ctx) (Cons Nat name seen) with
+                              | CErr e => CErr (List (Pair Nat CoreTerm)) e
+                              | COk cores =>
+                                  COk (List (Pair Nat CoreTerm))
+                                    (Cons (Pair Nat CoreTerm)
+                                      (MkPair Nat CoreTerm name core) cores)
+                              end
+                          end
+                      end
+                  end
+              end
+          end
+      end) xs) (surface_names xs)) (Nil Nat)) (Nil Nat);
+
+def compile_core_extract : List (Pair Nat CoreTerm) -> List (Pair Nat Nat) :=
+  fix compile_core_extract (xs : List (Pair Nat CoreTerm))
+    : List (Pair Nat Nat) :=
+    match xs with
+    | Nil => Nil (Pair Nat Nat)
+    | Cons p xs' =>
+        match p with
+        | MkPair name t =>
+            Cons (Pair Nat Nat)
+              (MkPair Nat Nat name (extract_tag t))
+              (compile_core_extract xs')
+        end
+    end;
+
+def extract_program (xs : List (Pair Nat CoreTerm)) : CompResult (List (Pair Nat Nat)) :=
+    COk (List (Pair Nat Nat)) (compile_core_extract xs);
+
+def compile_program_extract (xs : List (Pair Nat Surface)) : CompResult (List (Pair Nat Nat)) :=
+    match compile_program xs with
+    | CErr e => CErr (List (Pair Nat Nat)) e
+    | COk cores => extract_program cores
+    end;
+
+def compile_core_extract_one (name : Nat) (t : CoreTerm) : Pair Nat Nat :=
+    MkPair Nat Nat name (extract_tag t);
+
+def pipeline_status_after (r : CompResult CoreTerm) : Nat :=
+    match r with
+    | CErr _ =>
+        pipeline_ok_stages status_ok status_ok status_ok
+          (status_err (S (S Z))) status_ok
+    | COk _ =>
+        pipeline_ok_stages status_ok status_ok status_ok status_ok status_ok
+    end;

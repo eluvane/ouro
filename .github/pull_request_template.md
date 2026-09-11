@@ -1,0 +1,36 @@
+<p align="center">
+  <img
+    width="100%"
+    src="https://capsule-render.vercel.app/api?type=waving&amp;height=220&amp;color=0:0B1220,50:1E1B4B,100:4F46E5&amp;text=PR&amp;fontColor=E2E8F0&amp;fontSize=54&amp;fontAlignY=50"
+    alt="PR banner"
+  />
+</p>
+
+## Summary
+
+Describe the problem and the change.
+
+## Validation
+
+List the commands you ran and any checks that were unavailable.
+
+```text
+
+```
+
+## Compatibility and trust
+
+Note any user-visible compatibility change, generated artifact, runtime impact,
+or trusted-boundary change. Write `None` when this does not apply.
+
+- [ ] Relevant tests or fixtures and documentation were updated.
+- [ ] `CHANGELOG.md` was updated for a user-visible change.
+- [ ] Generated files were produced through their documented generator.
+
+<p align="center">
+  <img
+    width="100%"
+    src="https://capsule-render.vercel.app/api?type=waving&amp;height=220&amp;color=0:0B1220,50:1E1B4B,100:4F46E5&amp;section=footer"
+    alt=""
+  />
+</p>

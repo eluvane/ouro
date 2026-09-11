@@ -1,0 +1,62 @@
+-- The project seal owns the version baseline after OCaml toolchain retirement.
+import "../tools/repo_gate/parity_closure.ouro";
+import "../std/test.ouro";
+
+def repo_version_text (seal : String) (package : String) (lock : String) : GateCheck :=
+    parity_version_result
+      (Right FsError String (str_cat3 "project {\n  version = \"" seal "\"\n}\n"))
+      (Right FsError String (str_cat3 "{\"version\":\"" package "\"}"))
+      (Right FsError String (str_cat3 "{\"version\":\"" lock "\"}"));
+
+def repo_version_reject (name : String) (result : GateCheck) : Test :=
+    assert_true name (andb (check_blocking result) (notb (check_pass result)));
+
+def repo_version_ok_seal : Either FsError String :=
+    Right FsError String "project {\n  version = \"0.1.0\"\n}\n";
+
+def repo_version_ok_json : Either FsError String :=
+    Right FsError String "{\"version\":\"0.1.0\"}";
+
+def repo_version_tests : List Test :=
+    let valid : GateCheck := repo_version_text "0.1.0" "0.1.0" "0.1.0" in
+    let missing : GateCheck := parity_version_result
+      (Left FsError String (FsMissing "Ouro.seal"))
+      (Left FsError String (FsMissing "editors/vscode/package.json"))
+      (Left FsError String (FsMissing "editors/vscode/package-lock.json")) in
+    [ assert_true "matching project versions pass" (check_pass valid)
+    , assert_true "matching prerelease versions pass"
+        (check_pass (repo_version_text "2.0.0-rc.1" "2.0.0-rc.1" "2.0.0-rc.1"))
+    , assert_true "version gate remains blocking" (check_blocking valid)
+    , assert_eq "version metrics cover every active owner"
+        (str_join "," (map GateMetric String metric_name (check_metrics valid)))
+        "ouro_seal,vscode_package,vscode_lock"
+    , repo_version_reject "seal drift is rejected" (repo_version_text "9.0.0" "0.1.0" "0.1.0")
+    , repo_version_reject "extension drift is rejected" (repo_version_text "0.1.0" "9.0.0" "0.1.0")
+    , repo_version_reject "lockfile drift is rejected" (repo_version_text "0.1.0" "0.1.0" "9.0.0")
+    , repo_version_reject "all empty versions are rejected" (repo_version_text "" "" "")
+    , repo_version_reject "empty seal version is rejected" (repo_version_text "" "0.1.0" "0.1.0")
+    , repo_version_reject "empty extension version is rejected" (repo_version_text "0.1.0" "" "0.1.0")
+    , repo_version_reject "empty lockfile version is rejected" (repo_version_text "0.1.0" "0.1.0" "")
+    , repo_version_reject "unreadable seal is rejected"
+        (parity_version_result (Left FsError String (FsMissing "Ouro.seal"))
+          repo_version_ok_json repo_version_ok_json)
+    , repo_version_reject "unreadable extension manifest is rejected"
+        (parity_version_result repo_version_ok_seal
+          (Left FsError String (FsOperationFailed "read" "editors/vscode/package.json"))
+          repo_version_ok_json)
+    , repo_version_reject "unreadable lockfile is rejected"
+        (parity_version_result repo_version_ok_seal repo_version_ok_json
+          (Left FsError String (FsExpectedFile "editors/vscode/package-lock.json")))
+    , assert_eq "every failed owner remains in the report"
+        (str_join "," (map GateIssue String issue_path (check_issues missing)))
+        "Ouro.seal,editors/vscode/package.json,editors/vscode/package-lock.json"
+    , assert_eq "drift points at the canonical project seal"
+        (str_join "," (map GateIssue String issue_path
+          (check_issues (repo_version_text "9.0.0" "0.1.0" "0.1.0")))) "Ouro.seal"
+    ];
+
+-- @entry main
+def main : IO Unit :=
+    (do let! actual := parity_version_check ".";
+        test_run (append Test repo_version_tests
+          [assert_true "active version files pass the filesystem check" (check_pass actual)]));

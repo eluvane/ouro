@@ -1,0 +1,172 @@
+-- Strict command grammar; std/cli owns the option values after validation.
+import "native_build_args.ouro";
+import "../std/cli.ouro";
+
+inductive NativeCliError : Type :=
+  | NativeCliMissingCommand : NativeCliError
+  | NativeCliUnknownCommand : String -> NativeCliError
+  | NativeCliUnknownOption : String -> NativeCliError
+  | NativeCliDuplicateOption : String -> NativeCliError
+  | NativeCliMissingValue : String -> NativeCliError
+  | NativeCliUnexpectedArgument : String -> NativeCliError
+  | NativeCliMissingSource : NativeCliError
+  | NativeCliInvalidSource : String -> NativeCliError
+  | NativeCliInvalidFuel : String -> NativeCliError
+  | NativeCliBuildRejected : NativeBuildError -> NativeCliError;
+
+inductive NativeCliCommand : Type :=
+  | NativeCliDoctor : NativeCliCommand
+  | NativeCliCheck : String -> Nat -> Maybe String -> NativeCliCommand
+  | NativeCliBuild : NativeBuildRequest -> NativeCliCommand
+  | NativeCliRun : NativeBuildRequest -> List String -> NativeCliCommand;
+
+def native_cli_usage : String :=
+    "usage:\n  coil doctor\n  coil check FILE [fuel] [--emit-checked-program FILE]\n  coil build FILE.ouro [--backend native] [--target x86_64-windows] [--out FILE]\n  coil run FILE.ouro [PROGRAM_ARG ...]\n";
+
+def native_cli_error_code (error : NativeCliError) : String :=
+    match error with
+    | NativeCliMissingCommand => "missing-command"
+    | NativeCliUnknownCommand _ => "unknown-command"
+    | NativeCliUnknownOption _ => "unknown-option"
+    | NativeCliDuplicateOption _ => "duplicate-option"
+    | NativeCliMissingValue _ => "missing-value"
+    | NativeCliUnexpectedArgument _ => "unexpected-argument"
+    | NativeCliMissingSource => "missing-source"
+    | NativeCliInvalidSource _ => "invalid-source"
+    | NativeCliInvalidFuel _ => "invalid-fuel"
+    | NativeCliBuildRejected _ => "rejected-build"
+    end;
+
+def native_cli_error_message (error : NativeCliError) : String :=
+    match error with
+    | NativeCliMissingCommand => "missing command"
+    | NativeCliUnknownCommand word => str_concat "unknown command: " word
+    | NativeCliUnknownOption word => str_concat "unknown option: " word
+    | NativeCliDuplicateOption word => str_concat "duplicate option: " word
+    | NativeCliMissingValue word => str_concat "missing value for " word
+    | NativeCliUnexpectedArgument word => str_concat "unexpected argument: " word
+    | NativeCliMissingSource => "missing source file"
+    | NativeCliInvalidSource source => str_concat "expected an .ouro source file: " source
+    | NativeCliInvalidFuel value => str_concat "invalid check fuel: " value
+    | NativeCliBuildRejected message => message
+    end;
+
+-- args_parse intentionally accepts a wider grammar and stores only the last
+-- value for an option. Reject unsupported and repeated input before using it.
+def native_cli_options : List String -> List String -> List String -> Either NativeCliError Unit :=
+  fix options (words : List String) (allowed : List String) (seen : List String)
+      : Either NativeCliError Unit :=
+    match words with
+    | Nil => Right NativeCliError Unit MkUnit
+    | Cons word rest => match is_dashed word with
+      | False => options rest allowed seen
+      | True => match elem String str_eq word allowed with
+        | False => Left NativeCliError Unit (NativeCliUnknownOption word)
+        | True => match elem String str_eq word seen with
+          | True => Left NativeCliError Unit (NativeCliDuplicateOption word)
+          | False => match rest with
+            | Nil => Left NativeCliError Unit (NativeCliMissingValue word)
+            | Cons value tail => match orb (str_null value) (is_dashed value) with
+              | True => Left NativeCliError Unit (NativeCliMissingValue word)
+              | False => options tail allowed (Cons String word seen)
+              end
+            end
+          end
+        end
+      end
+    end;
+
+def native_cli_check_words (args : Args) : Either NativeCliError NativeCliCommand :=
+    match args_positional args with
+    | Nil => Left NativeCliError NativeCliCommand NativeCliMissingSource
+    | Cons source rest => match str_null source with
+      | True => Left NativeCliError NativeCliCommand NativeCliMissingSource
+      | False => match rest with
+        | Nil => Right NativeCliError NativeCliCommand
+            (NativeCliCheck source native_build_check_default_fuel (cli_opt args "emit-checked-program"))
+        | Cons value tail => match tail with
+          | Cons extra _ => Left NativeCliError NativeCliCommand (NativeCliUnexpectedArgument extra)
+          | Nil => match str_parse_nat value with
+            | Nothing => Left NativeCliError NativeCliCommand (NativeCliInvalidFuel value)
+            | Just fuel => Right NativeCliError NativeCliCommand
+                (NativeCliCheck source fuel (cli_opt args "emit-checked-program"))
+            end
+          end
+        end
+      end
+    end;
+
+def native_cli_build_words (args : Args) : Either NativeCliError NativeCliCommand :=
+    match args_positional args with
+    | Nil => Left NativeCliError NativeCliCommand NativeCliMissingSource
+    | Cons source rest => match str_null source with
+      | True => Left NativeCliError NativeCliCommand NativeCliMissingSource
+      | False => match rest with
+        | Cons extra _ => Left NativeCliError NativeCliCommand (NativeCliUnexpectedArgument extra)
+        | Nil => match str_ends source ".ouro" with
+          | False => Left NativeCliError NativeCliCommand (NativeCliInvalidSource source)
+          | True => match native_build_parse
+              (args_opt_or args "backend" native_build_backend_native)
+              (args_opt_or args "target" native_build_default_target) source
+              (args_opt_or args "out" "") native_build_default_entry with
+            | Left error => Left NativeCliError NativeCliCommand (NativeCliBuildRejected error)
+            | Right request => Right NativeCliError NativeCliCommand (NativeCliBuild request)
+            end
+          end
+        end
+      end
+    end;
+
+-- Run has one source position. All following words belong to the program,
+-- including dashed words, empty arguments and a literal -- delimiter.
+def native_cli_run_source (source : String) (arguments : List String)
+    : Either NativeCliError NativeCliCommand :=
+    match str_null source with
+    | True => Left NativeCliError NativeCliCommand NativeCliMissingSource
+    | False => match str_ends source ".ouro" with
+      | False => Left NativeCliError NativeCliCommand (NativeCliInvalidSource source)
+      | True =>
+          let base : String := path_basename source in
+          let stem : String := str_take base (sub (str_len base) (str_len ".ouro")) in
+          let output : String := path_join ["_build", "native", "run", str_concat stem ".exe"] in
+          match native_build_parse native_build_backend_native native_build_default_target
+              source output native_build_default_entry with
+          | Left error => Left NativeCliError NativeCliCommand (NativeCliBuildRejected error)
+          | Right request => Right NativeCliError NativeCliCommand (NativeCliRun request arguments)
+          end
+      end
+    end;
+
+def native_cli_run_words (words : List String) : Either NativeCliError NativeCliCommand :=
+    match words with
+    | Nil => Left NativeCliError NativeCliCommand NativeCliMissingSource
+    | Cons source arguments => native_cli_run_source source arguments
+    end;
+
+def native_cli_parse (words : List String) : Either NativeCliError NativeCliCommand :=
+    match words with
+    | Nil => Left NativeCliError NativeCliCommand NativeCliMissingCommand
+    | Cons command rest => match str_eq command "doctor" with
+      | True => match rest with
+        | Nil => Right NativeCliError NativeCliCommand NativeCliDoctor
+        | Cons extra _ => Left NativeCliError NativeCliCommand (NativeCliUnexpectedArgument extra)
+        end
+      | False => match str_eq command "check" with
+        | True => match native_cli_options rest (["--emit-checked-program"] : List String) (Nil String) with
+          | Left error => Left NativeCliError NativeCliCommand error
+          | Right _ => native_cli_check_words (cli_parse (Nil String) rest)
+          end
+        | False => match str_eq command "build" with
+          | False => match str_eq command "run" with
+            | True => native_cli_run_words rest
+            | False => Left NativeCliError NativeCliCommand (NativeCliUnknownCommand command)
+            end
+          | True => match native_cli_options rest
+              (["--backend", "--target", "--out"] : List String) (Nil String) with
+            | Left error => Left NativeCliError NativeCliCommand error
+            | Right _ => native_cli_build_words (cli_parse (Nil String) rest)
+            end
+          end
+        end
+      end
+    end;

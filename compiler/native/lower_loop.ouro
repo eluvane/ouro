@@ -1,0 +1,97 @@
+-- Runtime.loop becomes a CFG loop. The condition runs before every step,
+-- including the first, and the loop state is initialized before that test.
+import "lower_raw.ouro";
+
+inductive LowerLoopBlocks : Type :=
+  | LowerLoopAt : Nat -> Nat -> Nat -> LowerState -> LowerLoopBlocks;
+
+def lower_loop_blocks (state : LowerState) : Either NativeLowerError LowerLoopBlocks :=
+    match state with | LowerStateOf next locals instructions flow => match flow with | LowerFlowOf current label blocks =>
+      lower_map Unit LowerLoopBlocks
+        (fun (_ : Unit) => LowerLoopAt label (S label) (add label 2)
+          (LowerStateOf next locals instructions (LowerFlowOf current (add label 3) blocks)))
+        (lower_require (leb_nat label (sub pe_max_rva 3)) LowerResourceExhausted) end end;
+
+def lower_loop_cell (typ : LowerType) (value : Maybe MirValue) (state : LowerState)
+    : Either NativeLowerError LowerResult :=
+    match lower_type_mir typ, value with
+    | Nothing, Nothing => Right NativeLowerError LowerResult (LowerResultOf typ (Nothing MirValue) state)
+    | Just _, Just scalar => lower_fresh_result typ (fun (id : Nat) => MirMove id scalar) state
+    | Nothing, Just _ => Left NativeLowerError LowerResult (LowerInvalidCall 0)
+    | Just _, Nothing => Left NativeLowerError LowerResult (LowerInvalidCall 0) end;
+
+def lower_loop_assign (cell : Maybe MirValue) (value : Maybe MirValue) (state : LowerState)
+    : Either NativeLowerError LowerState :=
+    match cell, value with
+    | Nothing, Nothing => Right NativeLowerError LowerState state
+    | Just slot, Just scalar => match slot with
+      | MirUse id => Right NativeLowerError LowerState (lower_emit (MirMove id scalar) state)
+      | MirBits _ _ => Left NativeLowerError LowerState (LowerInvalidCall 0) end
+    | Nothing, Just _ => Left NativeLowerError LowerState (LowerInvalidCall 0)
+    | Just _, Nothing => Left NativeLowerError LowerState (LowerInvalidCall 0) end;
+
+def lower_loop_callback (fuel : Nat) (step : LowerStep) (sig : CheckEnvironment) (environment : List LowerBinding)
+    (callback : CoreTerm) (typ : LowerType) (value : Maybe MirValue) (expected : LowerType) (state : LowerState)
+    : Either NativeLowerError LowerResult :=
+    match lower_term_view callback with
+    | LowerLambdaTerm annotation body => lower_bind LowerType LowerResult (lower_classify_type fuel sig annotation)
+        (fun (parameter : LowerType) => lower_bind Unit LowerResult (lower_type_same fuel typ parameter)
+          (fun (_ : Unit) => step (Cons LowerBinding (LowerScalarBinding typ value) environment) body expected state))
+    | LowerLocalTerm _ => Left NativeLowerError LowerResult (LowerUnsupportedTerm 3)
+    | LowerApplyTerm _ _ => Left NativeLowerError LowerResult (LowerUnsupportedTerm 3)
+    | LowerLetTerm _ _ _ => Left NativeLowerError LowerResult (LowerUnsupportedTerm 3)
+    | LowerGlobalTerm _ => Left NativeLowerError LowerResult (LowerUnsupportedTerm 3)
+    | LowerConstructorTerm _ _ _ => Left NativeLowerError LowerResult (LowerUnsupportedTerm 3)
+    | LowerCaseTerm _ _ _ _ => Left NativeLowerError LowerResult (LowerUnsupportedTerm 3)
+    | LowerOtherTerm _ => Left NativeLowerError LowerResult (LowerUnsupportedTerm 3) end;
+
+def lower_loop_flow (fuel : Nat) (step : LowerStep) (sig : CheckEnvironment) (environment : List LowerBinding)
+    (typ : LowerType) (condition_type : LowerType) (condition : CoreTerm) (advance : CoreTerm)
+    (cell : Maybe MirValue) (expected : LowerType) (state : LowerState) : Either NativeLowerError LowerResult :=
+    lower_bind LowerLoopBlocks LowerResult (lower_loop_blocks state)
+      (fun (labels : LowerLoopBlocks) => match labels with | LowerLoopAt header body finish ready =>
+        lower_bind LowerResult LowerResult
+          (lower_loop_callback fuel step sig environment condition typ cell condition_type
+            (lower_switch_block header (MirJump header) ready))
+          (fun (tested : LowerResult) => match tested with | LowerResultOf _ test after_test => match test with
+            | Nothing => Left NativeLowerError LowerResult (LowerInvalidCall 0)
+            | Just flag => lower_bind LowerResult LowerResult
+                (lower_loop_callback fuel step sig environment advance typ cell expected
+                  (lower_switch_block body (MirBranch flag body finish) after_test))
+                (fun (advanced : LowerResult) => match advanced with | LowerResultOf _ value after_step =>
+                  lower_map LowerState LowerResult (fun (updated : LowerState) =>
+                    LowerResultOf expected cell (lower_switch_block finish (MirJump header) updated))
+                    (lower_loop_assign cell value after_step) end) end end) end);
+
+def lower_runtime_loop (fuel : Nat) (step : LowerStep) (sig : CheckEnvironment) (environment : List LowerBinding)
+    (args : List CoreTerm) (expected : LowerType) (state : LowerState) : Either NativeLowerError LowerResult :=
+    lower_four LowerResult args (fun (annotation : CoreTerm) (initial : CoreTerm) (condition : CoreTerm) (advance : CoreTerm) =>
+      lower_bind LowerType LowerResult (lower_classify_type fuel sig annotation) (fun (typ : LowerType) =>
+        lower_bind LowerType LowerResult (lower_runtime_type sig typ) (fun (result_type : LowerType) =>
+          lower_bind Unit LowerResult (lower_type_same fuel expected result_type) (fun (_ : Unit) =>
+            lower_bind LowerType LowerResult (lower_word_type fuel sig PrimitiveWordU8) (fun (byte : LowerType) =>
+              lower_bind LowerType LowerResult (lower_runtime_type sig byte) (fun (condition_type : LowerType) =>
+                lower_bind LowerResult LowerResult (step environment initial typ state)
+                  (fun (value : LowerResult) => match value with | LowerResultOf _ scalar after =>
+                    lower_bind LowerResult LowerResult (lower_loop_cell typ scalar after)
+                      (fun (saved : LowerResult) => match saved with | LowerResultOf _ cell initialized =>
+                        lower_loop_flow fuel step sig environment typ condition_type condition advance cell expected initialized
+                        end) end)))))));
+
+def lower_intrinsic (fuel : Nat) (step : LowerStep) (sig : CheckEnvironment) (environment : List LowerBinding)
+    (id : PrimitiveId) (specialization : Maybe CoreTerm) (args : List CoreTerm) (expected : LowerType) (state : LowerState)
+    : Either NativeLowerError LowerResult :=
+    match lower_primitive_view id with
+    | LowerWordPrimitive word operation => lower_binary fuel step sig environment word operation args expected state
+    | LowerConversionPrimitive from into conversion => lower_conversion fuel step sig environment from into conversion args expected state
+    | LowerPurePrimitive => lower_runtime_pure fuel step sig environment args expected state
+    | LowerBindPrimitive => lower_runtime_bind fuel step sig environment args expected state
+    | LowerLoopPrimitive => lower_runtime_loop fuel step sig environment args expected state
+    | LowerNullPrimitive => lower_raw_null fuel sig args expected state
+    | LowerLoadPrimitive => lower_raw_load fuel step sig environment specialization args expected state
+    | LowerStorePrimitive => lower_raw_store fuel step sig environment specialization args expected state
+    | LowerPointerAddPrimitive => lower_raw_add fuel step sig environment args expected state
+    | LowerPointerCastPrimitive => lower_raw_cast fuel step sig environment args expected state
+    | LowerPointerToBitsPrimitive => lower_raw_bits fuel step sig environment False args expected state
+    | LowerPointerFromBitsPrimitive => lower_raw_bits fuel step sig environment True args expected state
+    | LowerOtherPrimitive => Left NativeLowerError LowerResult (LowerUnsupportedPrimitive id) end;

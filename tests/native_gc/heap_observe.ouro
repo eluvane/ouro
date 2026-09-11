@@ -1,0 +1,98 @@
+-- Test-only OS observations. The queried address is compared, never read.
+-- HeapWalk reports exact busy block bases; VirtualQuery observes final page
+-- release after HeapDestroy. Neither operation changes the managed root graph.
+import "../../runtime/managed.ouro";
+
+extern gc_test_virtual_query : RawPtr U8 -> RawPtr U8 -> USize -> Runtime USize :=
+    "windows-x86_64" "win64" "kernel32.dll" "VirtualQuery" "nogc";
+extern gc_heap_walk : RawPtr U8 -> RawPtr U8 -> Runtime U32 :=
+    "windows-x86_64" "win64" "kernel32.dll" "HeapWalk" "nogc";
+extern gc_heap_lock : RawPtr U8 -> Runtime U32 :=
+    "windows-x86_64" "win64" "kernel32.dll" "HeapLock" "nogc";
+extern gc_heap_unlock : RawPtr U8 -> Runtime U32 :=
+    "windows-x86_64" "win64" "kernel32.dll" "HeapUnlock" "nogc";
+extern gc_heap_last_error : Runtime U32 :=
+    "windows-x86_64" "win64" "kernel32.dll" "GetLastError" "nogc";
+
+-- Win64 PROCESS_HEAP_ENTRY occupies 40 bytes: lpData at 0 and wFlags at 14.
+-- The caller owns 64 aligned bytes; words 5/6 hold found and terminal error.
+def gc_heap_walk_step (heap : RawPtr U8) (wanted : USize) (buffer : RawPtr U8) (running : U8) : Runtime U8 :=
+    let zero : USize := usize_sub wanted wanted in
+    let one : USize := managed_one wanted in
+    let two : USize := usize_add one one in
+    let four : USize := usize_add two two in
+    let five : USize := usize_add four one in
+    let six : USize := usize_add four two in
+    let eight : USize := managed_word_offset one in
+    runtime_bind U32 U8 (gc_heap_walk heap buffer) (fun (status : U32) =>
+      match u32_equal status (raw_size_to_u32 zero) with
+      | True => runtime_bind U32 U8 gc_heap_last_error (fun (error : U32) =>
+          runtime_bind Unit U8 (managed_write_word buffer six (raw_u32_to_size error))
+            (fun (saved : Unit) => runtime_pure U8 (u8_sub running running)))
+      | False => runtime_bind USize U8 (managed_read_word buffer zero) (fun (address : USize) =>
+          runtime_bind U32 U8 (managed_read_u32 buffer (usize_add eight four)) (fun (flags : U32) =>
+            let busy : USize := usize_shift_left one (raw_size_to_u32 (usize_add (usize_add eight eight) two)) in
+            let found : Bool := raw_bool_and (usize_equal address wanted)
+              (raw_bool_not (usize_equal (usize_and (raw_u32_to_size flags) busy) zero)) in
+            runtime_bind Unit U8 (match found with | False => runtime_pure Unit MkUnit
+              | True => managed_write_word buffer five one end) (fun (recorded : Unit) =>
+                runtime_pure U8 running))) end);
+
+def gc_heap_busy (heap : RawPtr U8) (base : RawPtr U8) (buffer : RawPtr U8) : Runtime Bool :=
+    runtime_bind USize Bool (raw_to_bits U8 base) (fun (wanted : USize) =>
+      let zero : USize := usize_sub wanted wanted in
+      let one : USize := managed_one wanted in
+      let two : USize := usize_add one one in
+      let three : USize := usize_add two one in
+      let four : USize := usize_add two two in
+      let five : USize := usize_add four one in
+      let six : USize := usize_add four two in
+      let eight : USize := managed_word_offset one in
+      runtime_bind U32 Bool (gc_heap_lock heap) (fun (locked : U32) =>
+        runtime_bind Unit Bool (managed_require (raw_bool_not (u32_equal locked (raw_size_to_u32 zero))) wanted)
+          (fun (exclusive : Unit) => runtime_bind Unit Bool (managed_write_word buffer zero zero) (fun (first : Unit) =>
+            runtime_bind Unit Bool (managed_write_word buffer five zero) (fun (absent : Unit) =>
+              runtime_bind Unit Bool (managed_write_word buffer six zero) (fun (clear_error : Unit) =>
+                match u8_from_nat 1 with | Nothing => runtime_bind Unit Bool (managed_panic wanted)
+                  (fun (unexpected : Unit) => runtime_pure Bool False)
+                | Just running => runtime_bind U8 Bool (runtime_loop U8 running
+                    (fun (active : U8) => runtime_pure U8 active)
+                    (fun (_ : U8) => gc_heap_walk_step heap wanted buffer running)) (fun (finished : U8) =>
+                  runtime_bind U32 Bool (gc_heap_unlock heap) (fun (unlocked : U32) =>
+                    runtime_bind Unit Bool (managed_require (raw_bool_not (u32_equal unlocked (raw_size_to_u32 zero))) wanted)
+                      (fun (shared : Unit) => runtime_bind USize Bool (managed_read_word buffer six) (fun (error : USize) =>
+                        let no_more : USize := usize_add (usize_shift_left one (raw_size_to_u32 eight)) three in
+                        runtime_bind Unit Bool (managed_require (usize_equal error no_more) wanted) (fun (complete : Unit) =>
+                          runtime_bind USize Bool (managed_read_word buffer five) (fun (found : USize) =>
+                            runtime_pure Bool (usize_equal found one))))))) end))))));
+
+def gc_heap_pages_free (base : RawPtr U8) (buffer : RawPtr U8) (anchor : USize) : Runtime Unit :=
+    let one : USize := managed_one anchor in
+    let two : USize := usize_add one one in
+    let four : USize := usize_add two two in
+    let six : USize := usize_add four two in
+    let eight : USize := managed_word_offset one in
+    runtime_bind USize Unit (gc_test_virtual_query base buffer (managed_word_offset six)) (fun (written : USize) =>
+      runtime_bind Unit Unit (managed_require (usize_equal written (managed_word_offset six)) anchor) (fun (queried : Unit) =>
+        runtime_bind U32 Unit (managed_read_u32 buffer (managed_word_offset four)) (fun (state : U32) =>
+          managed_require (u32_equal state (raw_size_to_u32 (usize_shift_left one
+            (raw_size_to_u32 (usize_add eight eight))))) anchor)));
+
+def gc_heap_expect_allocation (context : RawPtr U8) (base : RawPtr U8) (buffer : RawPtr U8)
+    (expected : Bool) (anchor : USize) : Runtime Unit :=
+    let zero : USize := usize_sub anchor anchor in
+    let one : USize := managed_one anchor in
+    let four : USize := usize_add (usize_add one one) (usize_add one one) in
+    runtime_bind USize Unit (managed_read_word context four) (fun (count : USize) =>
+      let word : USize := managed_heap_handle_word count in
+      runtime_bind Unit Unit (managed_require (raw_bool_not (usize_equal word zero)) anchor) (fun (bounded : Unit) =>
+        runtime_bind (RawPtr U8) Unit (managed_read_pointer context word) (fun (heap : RawPtr U8) =>
+          runtime_bind Bool Unit (managed_pointer_is_null heap) (fun (retired : Bool) =>
+            match retired with
+            | True => runtime_bind Unit Unit (managed_require (raw_bool_not expected) anchor) (fun (dead : Unit) =>
+                runtime_bind Bool Unit (managed_heap_empty context) (fun (empty : Bool) =>
+                  runtime_bind Unit Unit (managed_require empty anchor) (fun (closed : Unit) =>
+                    gc_heap_pages_free base buffer anchor)))
+            | False => runtime_bind Bool Unit (gc_heap_busy heap base buffer) (fun (actual : Bool) =>
+                managed_require (match expected with | True => actual | False => raw_bool_not actual end) anchor)
+            end))));

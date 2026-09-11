@@ -1,0 +1,81 @@
+-- Checked Bool branches merge scalar/Unit results. Local Maybe elimination
+-- uses a known constructor; all source branches were rechecked before lowering.
+import "lower_constants.ouro";
+
+def lower_constructor_value (fuel : Nat) (sig : CheckEnvironment) (ind : Nat) (index : Nat) (params : Nat)
+    (expected : LowerType) (state : LowerState) : Either NativeLowerError LowerResult :=
+    match lower_is_role (check_environment_entries sig) (CInd ind) PrimitiveBoolRole with
+    | True => lower_bind Unit LowerResult
+        (lower_require (andb (eqNat params 0) (leb_nat index 1)) (LowerUnsupportedTerm 8))
+        (fun (_ : Unit) => lower_map Unit LowerResult
+          (fun (_ : Unit) => LowerResultOf expected
+            (Just MirValue (MirBits MirU8 (X64Words64
+              (X64Bytes32 (match eqNat index 0 with | True => 1 | False => 0 end) 0 0 0) (X64Bytes32 0 0 0 0)))) state)
+          (lower_type_same fuel expected (LowerTypeOf (CInd ind) (Just MirType MirU8) False)))
+    | False => lower_bind Unit LowerResult
+        (lower_require (andb (eqNat index 0) (andb (eqNat params 0) (lower_is_unit (check_environment_entries sig) (CInd ind)))) (LowerUnsupportedTerm 8))
+        (fun (_ : Unit) => lower_map Unit LowerResult (fun (_ : Unit) => LowerResultOf expected (Nothing MirValue) state)
+          (lower_type_same fuel expected (LowerTypeOf (CInd ind) (Nothing MirType) False))) end;
+
+def lower_case_shape (info : CaseInfo) (parameters : Nat) (first : Nat) (second : Nat)
+    : Either NativeLowerError Unit :=
+    match info with | MkCaseInfo family params arities =>
+      lower_bind (Pair Nat Nat) Unit (lower_pair Nat arities) (fun (pair : Pair Nat Nat) => match pair with | MkPair a b =>
+        lower_require (andb (eqNat params parameters) (andb (eqNat a first) (eqNat b second)))
+          (LowerMetadataMismatch family) end) end;
+
+def lower_case_cell (expected : LowerType) (state : LowerState) : Either NativeLowerError LowerResult :=
+    match lower_type_mir expected with
+    | Nothing => Right NativeLowerError LowerResult (LowerResultOf expected (Nothing MirValue) state)
+    | Just _ => lower_map (Pair Nat LowerState) LowerResult (fun (pair : Pair Nat LowerState) => match pair with
+        | MkPair id after => LowerResultOf expected (Just MirValue (MirUse id)) after end) (lower_allocate expected state) end;
+
+def lower_boolean_branches (step : LowerStep) (environment : List LowerBinding) (flag : MirValue)
+    (yes : CoreTerm) (no : CoreTerm) (expected : LowerType) (state : LowerState)
+    : Either NativeLowerError LowerResult :=
+    lower_bind LowerResult LowerResult (lower_case_cell expected state) (fun (saved : LowerResult) =>
+      match saved with | LowerResultOf _ cell allocated => lower_bind LowerLoopBlocks LowerResult (lower_loop_blocks allocated)
+        (fun (labels : LowerLoopBlocks) => match labels with | LowerLoopAt true_block false_block finish ready =>
+          lower_bind LowerResult LowerResult
+            (step environment yes expected (lower_switch_block true_block (MirBranch flag true_block false_block) ready))
+            (fun (first : LowerResult) => match first with | LowerResultOf _ first_value after_first =>
+              lower_bind LowerState LowerResult (lower_loop_assign cell first_value after_first) (fun (assigned : LowerState) =>
+                lower_bind LowerResult LowerResult
+                  (step environment no expected (lower_switch_block false_block (MirJump finish) assigned))
+                  (fun (second : LowerResult) => match second with | LowerResultOf _ second_value after_second =>
+                    lower_map LowerState LowerResult (fun (complete : LowerState) =>
+                      LowerResultOf expected cell (lower_switch_block finish (MirJump finish) complete))
+                      (lower_loop_assign cell second_value after_second) end)) end) end) end);
+
+def lower_boolean_case (fuel : Nat) (step : LowerStep) (sig : CheckEnvironment) (environment : List LowerBinding)
+    (info : CaseInfo) (scrutinee : CoreTerm) (branches : List CoreTerm) (expected : LowerType) (state : LowerState)
+    : Either NativeLowerError LowerResult :=
+    lower_bind Unit LowerResult (lower_case_shape info 0 0 0) (fun (_ : Unit) =>
+      lower_bind (Pair CoreTerm CoreTerm) LowerResult (lower_pair CoreTerm branches) (fun (pair : Pair CoreTerm CoreTerm) =>
+        match pair with | MkPair yes no => lower_bind LowerType LowerResult (lower_boolean_type fuel sig)
+          (fun (typ : LowerType) => lower_bind LowerResult LowerResult (step environment scrutinee typ state)
+            (fun (value : LowerResult) => match value with | LowerResultOf _ condition after => match condition with
+              | Nothing => Left NativeLowerError LowerResult (LowerInvalidCall 0)
+              | Just flag => lower_boolean_branches step environment flag yes no expected after end end)) end));
+
+def lower_maybe_case (fuel : Nat) (step : LowerStep) (sig : CheckEnvironment) (environment : List LowerBinding)
+    (info : CaseInfo) (scrutinee : CoreTerm) (branches : List CoreTerm) (expected : LowerType) (state : LowerState)
+    : Either NativeLowerError LowerResult :=
+    lower_bind Unit LowerResult (lower_case_shape info 1 0 1) (fun (_ : Unit) =>
+      lower_bind (Pair CoreTerm CoreTerm) LowerResult (lower_pair CoreTerm branches) (fun (pair : Pair CoreTerm CoreTerm) =>
+        match pair with | MkPair absent present => match info with | MkCaseInfo family _ _ =>
+          lower_bind LowerMaybeResult LowerResult (lower_maybe_value fuel step sig environment family scrutinee state)
+            (fun (value : LowerMaybeResult) => match value with | LowerMaybeOf _ typ payload after => match payload with
+              | Nothing => step environment absent expected after
+              | Just scalar => lower_loop_callback fuel step sig environment present typ (Just MirValue scalar) expected after end end)
+          end end));
+
+def lower_case (fuel : Nat) (step : LowerStep) (sig : CheckEnvironment) (environment : List LowerBinding)
+    (info : CaseInfo) (scrutinee : CoreTerm) (branches : List CoreTerm) (expected : LowerType) (state : LowerState)
+    : Either NativeLowerError LowerResult :=
+    match info with | MkCaseInfo family _ _ =>
+      match lower_is_role (check_environment_entries sig) (CInd family) PrimitiveBoolRole with
+      | True => lower_boolean_case fuel step sig environment info scrutinee branches expected state
+      | False => match lower_is_role (check_environment_entries sig) (CInd family) PrimitiveMaybeRole with
+        | True => lower_maybe_case fuel step sig environment info scrutinee branches expected state
+        | False => Left NativeLowerError LowerResult (LowerUnsupportedTerm 9) end end end;

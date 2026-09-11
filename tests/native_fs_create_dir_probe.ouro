@@ -1,0 +1,88 @@
+-- Native fixture protocol; all writes are below the explicit test target.
+import "native_fs_create_dir_faults.ouro";
+
+def fs_create_probe_fail (message : String) : IO Unit :=
+    do eprintln message; exit 4
+
+def fs_create_probe_claim (path : String) (token : String) : IO Unit :=
+    do let! result := fs_create_dir_exclusive_checked path;
+       match result with
+       | Left error =>
+           do println (str_cat4 "FS_CREATE_REFUSED " (fs_create_dir_error_code error) " created="
+                (match fs_create_dir_was_created result with | True => "1" | False => "0" end));
+              exit 3
+       | Right _ =>
+           do let! written := fs_write_checked (str_concat path "/claim.owner") token;
+              match written with
+              | Left error => fs_create_probe_fail (fs_error_message error)
+              | Right _ => do println (str_concat "FS_CREATE_CLAIM " token); exit 0
+              end
+       end
+
+-- Both contenders can observe absence before the controller releases stdin.
+-- Each then calls the same atomic create; only its successful caller writes.
+def fs_create_probe_race (path : String) (token : String) : IO Unit :=
+    do let! exists := fs_exists path;
+       match exists with
+       | True => fs_create_probe_fail "FS_CREATE_RACE_PREEXISTING"
+       | False =>
+           do println "FS_CREATE_READY";
+              flush;
+              let! command := readLine;
+              match str_eq command "GO" with
+              | False => fs_create_probe_fail "FS_CREATE_RACE_BAD_RELEASE"
+              | True => fs_create_probe_claim path token
+              end
+       end
+
+def fs_create_probe_fault (mode : String) (path : String) : IO Unit :=
+    match elem String str_eq mode (["nul", "utf8-overlong", "utf8-surrogate", "utf8-truncated",
+        "allocation-failure", "cleanup-created", "cleanup-refused", "cleanup-conversion"] : List String) with
+    | False => fs_create_probe_fail "FS_CREATE_UNKNOWN_FAULT"
+    | True =>
+        do let! observed := fs_create_fault_run mode path;
+           let! exists := fs_is_dir path;
+           let expected : Bool := orb (str_eq mode "cleanup-created") (str_eq mode "cleanup-refused") in
+           match andb observed (compiler_bool_equal expected exists) with
+           | False => fs_create_probe_fail (str_concat "FS_CREATE_FAULT_FAIL " mode)
+           | True => do println (str_concat "FS_CREATE_FAULT_OK " mode); exit 0
+           end
+    end;
+
+def fs_create_probe_dispatch (command : String) (first : String) (second : String) : IO Unit :=
+    match orb (str_null first) (str_null second) with
+    | True => fs_create_probe_fail "FS_CREATE_EMPTY_ARGUMENT"
+    | False => match str_eq command "create" with
+      | True => fs_create_probe_claim first second
+      | False => match str_eq command "race" with
+        | True => fs_create_probe_race first second
+        | False => match str_eq command "fault" with
+          | True => fs_create_probe_fault first second
+          | False => fs_create_probe_fail "FS_CREATE_UNKNOWN_COMMAND"
+          end
+        end
+      end
+    end;
+
+def fs_create_probe_arguments (words : List String) : IO Unit :=
+    match words with
+    | Nil => fs_create_probe_fail "FS_CREATE_ARGUMENTS"
+    | Cons command after_command => match after_command with
+      | Nil => fs_create_probe_fail "FS_CREATE_ARGUMENTS"
+      | Cons first after_first => match after_first with
+        | Nil => fs_create_probe_fail "FS_CREATE_ARGUMENTS"
+        | Cons second tail => match tail with
+          | Cons _ _ => fs_create_probe_fail "FS_CREATE_ARGUMENTS"
+          | Nil => fs_create_probe_dispatch command first second
+          end
+        end
+      end
+    end;
+
+-- @entry main
+def main : IO Unit :=
+    do let! arguments := argv;
+       match arguments with
+       | Nil => fs_create_probe_fail "FS_CREATE_ARGV"
+       | Cons _ words => fs_create_probe_arguments words
+       end

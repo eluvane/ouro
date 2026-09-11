@@ -1,0 +1,131 @@
+-- Fail-closed process boundary for typed external transformations.
+
+import "transformation.ouro";
+import "../../std/fs.ouro";
+import "../../std/process.ouro";
+
+def runExternalTool
+  (Input : Type)
+  (Output : Type)
+  (invocation : ToolInvocation Input Output)
+  : IO (Either ExternalToolError (SuccessfulExecution Input Output)) :=
+  match invocation with
+  | MkToolInvocation spec input inputs =>
+      match validateInvocation Input Output spec inputs with
+      | Left error =>
+          io_pure (Either ExternalToolError (SuccessfulExecution Input Output))
+            (Left ExternalToolError (SuccessfulExecution Input Output) error)
+      | Right _ =>
+          let tool : ToolIdentity := toolSpecIdentity Input Output spec in
+          let outputPath : String := toolSpecOutputPath Input Output spec in
+          do fs_mkdir_p (path_dirname outputPath);
+             fs_remove outputPath;
+             let! outputStillPresent := fs_file_exists outputPath;
+             match outputStillPresent with
+             | True =>
+                 io_pure
+                   (Either ExternalToolError (SuccessfulExecution Input Output))
+                   (Left ExternalToolError (SuccessfulExecution Input Output)
+                     (OutputPreparationFailed tool outputPath))
+             | False =>
+                 do let! result :=
+                      process_run
+                        (toolIdentityExecutable tool)
+                        (toolSpecArguments Input Output spec);
+                    let attempt : ExecutionAttempt :=
+                      executionAttempt Input Output spec inputs result in
+                    match proc_ok result with
+                    | False =>
+                        do fs_remove outputPath;
+                           io_pure
+                             (Either ExternalToolError
+                               (SuccessfulExecution Input Output))
+                             (Left ExternalToolError
+                               (SuccessfulExecution Input Output)
+                               (ExternalProcessFailed attempt))
+                    | True =>
+                        do let! outputExists := fs_file_exists outputPath;
+                           match outputExists with
+                           | False =>
+                               do fs_remove outputPath;
+                                  io_pure
+                                    (Either ExternalToolError
+                                      (SuccessfulExecution Input Output))
+                                    (Left ExternalToolError
+                                      (SuccessfulExecution Input Output)
+                                      (ExpectedOutputMissing attempt))
+                           | True =>
+                               let identity : TransformationIdentity :=
+                                 executionAttemptTransformationIdentity attempt in
+                               let execution : ExecutionRecord :=
+                                 MkExecutionRecord attempt
+                                   (transformationOutputIdentity identity)
+                                   (reproducibilityFor
+                                     (executionAttemptEnvironment attempt)
+                                     (executionAttemptDeterminism attempt)
+                                     identity) in
+                               let evidence : ExecutionEvidence Input Output :=
+                                 MkExecutionEvidence Input Output execution in
+                               io_pure
+                                 (Either ExternalToolError
+                                   (SuccessfulExecution Input Output))
+                                 (Right ExternalToolError
+                                   (SuccessfulExecution Input Output)
+                                   (MkSuccessfulExecution Input Output
+                                     input evidence))
+                           end
+                    end
+             end
+      end
+  end;
+
+def externalToolErrorAttempt
+  (error : ExternalToolError) : Maybe ExecutionAttempt :=
+  match error with
+  | InvalidExternalToolSpec _ => Nothing ExecutionAttempt
+  | OutputPreparationFailed _ _ => Nothing ExecutionAttempt
+  | ExternalProcessFailed attempt => Just ExecutionAttempt attempt
+  | ExpectedOutputMissing attempt => Just ExecutionAttempt attempt
+  end;
+
+def externalToolErrorTransformationIdentity
+  (error : ExternalToolError) : Maybe TransformationIdentity :=
+  match externalToolErrorAttempt error with
+  | Nothing => Nothing TransformationIdentity
+  | Just attempt =>
+      Just TransformationIdentity
+        (executionAttemptTransformationIdentity attempt)
+  end;
+
+def externalToolErrorCode (error : ExternalToolError) : String :=
+  match error with
+  | InvalidExternalToolSpec _ => "invalid_spec"
+  | OutputPreparationFailed _ _ => "output_preparation_failed"
+  | ExternalProcessFailed _ => "process_failed"
+  | ExpectedOutputMissing _ => "expected_output_missing"
+  end;
+
+def externalToolErrorStatus (error : ExternalToolError) : Nat :=
+  match error with
+  | InvalidExternalToolSpec _ => Z
+  | OutputPreparationFailed _ _ => Z
+  | ExternalProcessFailed attempt => executionAttemptStatus attempt
+  | ExpectedOutputMissing attempt => executionAttemptStatus attempt
+  end;
+
+def externalToolErrorMessage (error : ExternalToolError) : String :=
+  match error with
+  | InvalidExternalToolSpec message =>
+      str_concat "invalid external tool specification: " message
+  | OutputPreparationFailed tool outputPath =>
+      str_cat4 "expected output could not be cleared: "
+        (toolIdentityLabel tool) " path=" outputPath
+  | ExternalProcessFailed attempt =>
+      str_cat4 "external tool failed: "
+        (toolIdentityLabel (executionAttemptTool attempt))
+        " exit=" (show_nat (executionAttemptStatus attempt))
+  | ExpectedOutputMissing attempt =>
+      str_cat4 "external tool produced no expected output: "
+        (toolIdentityLabel (executionAttemptTool attempt))
+        " path=" (executionAttemptOutputPath attempt)
+  end;

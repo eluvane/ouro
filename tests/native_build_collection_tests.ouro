@@ -1,0 +1,225 @@
+-- Explicit driver invocation keeps this Windows PE regression independent of
+-- bootstrap. Run from the repository root with DRIVER.exe OUTPUT_DIRECTORY.
+import "analyze/precision/assertions.ouro";
+import "../tools/collect_core.ouro";
+import "../std/processx.ouro";
+
+def native_collect_root : String :=
+    "tests/native_build_collection/positive path/main.ouro";
+
+def native_collect_missing : String :=
+    "tests/native_build_collection/missing/main.ouro";
+
+def native_collect_cycle : String :=
+    "tests/native_build_collection/cycle/main.ouro";
+
+def native_collect_bad_import : String :=
+    "tests/native_build_collection/bad_import/main.ouro";
+
+def native_collect_expected : List String :=
+    [ "tests/native_build_import_lib.ouro"
+    , "tests/native_build_collection/positive path/shared/leaf.ouro"
+    , "tests/native_build_collection/positive path/nested lib.ouro"
+    , native_collect_root
+    ];
+
+def native_collect_missing_error : String :=
+    "collect_units: missing tests/native_build_collection/missing/absent.ouro";
+
+def native_collect_cycle_error : String :=
+    "collect_units: import cycle at tests/native_build_collection/cycle/main.ouro";
+
+def native_collect_units_match (result : Col) : Bool :=
+    match result with
+    | ColErr _ => False
+    | ColOk units => precision_strings units native_collect_expected
+    end;
+
+def native_collect_error_match (result : Col) (expected : String) : Bool :=
+    match result with
+    | ColErr error => str_eq error expected
+    | ColOk _ => False
+    end;
+
+def native_collect_imports_match (source : String) (expected : List String) : Bool :=
+    match import_paths source with
+    | ColErr _ => False
+    | ColOk paths => precision_strings paths expected
+    end;
+
+def native_collect_imports_rejected (source : String) : Bool :=
+    match import_paths source with
+    | ColErr _ => True
+    | ColOk _ => False
+    end;
+
+def native_collect_source_laws : List (Pair String Bool) :=
+    [ MkPair String Bool "import-multiline-operand"
+        (native_collect_imports_match "import\n  \"one.ouro\";" ["one.ouro"])
+    , MkPair String Bool "import-optional-semicolon-at-eof"
+        (native_collect_imports_match "import \"one.ouro\"" ["one.ouro"])
+    , MkPair String Bool "import-multiline-alias-without-semicolon"
+        (native_collect_imports_match "import\n \"one.ouro\"\n as\n Alias" ["one.ouro"])
+    , MkPair String Bool "imports-share-one-line"
+        (native_collect_imports_match "import \"one.ouro\"; import \"two.ouro\"" ["one.ouro", "two.ouro"])
+    , MkPair String Bool "import-comment-before-operand"
+        (native_collect_imports_match "import -- dependency\n \"one.ouro\"" ["one.ouro"])
+    , MkPair String Bool "import-comment-marker-inside-path"
+        (native_collect_imports_match "import \"--one.ouro\";" ["--one.ouro"])
+    , MkPair String Bool "import-escaped-quote-uses-lexer-decoding"
+        (native_collect_imports_match "import \"one\\\"two.ouro\";" ["one\"two.ouro"])
+    , MkPair String Bool "import-escaped-backslash-uses-lexer-decoding"
+        (native_collect_imports_match "import \"dir\\\\lib.ouro\";" ["dir\\lib.ouro"])
+    , MkPair String Bool "comment-does-not-add-import"
+        (native_collect_imports_match "-- import \"fake.ouro\";\nimport \"real.ouro\";" ["real.ouro"])
+    , MkPair String Bool "multiline-string-does-not-add-import"
+        (native_collect_imports_match
+          "def text : String := \"first\nimport \\\"fake.ouro\\\";\nlast\";\nimport \"real.ouro\";" ["real.ouro"])
+    , MkPair String Bool "whole-identifiers-do-not-add-import"
+        (native_collect_imports_match "axiom imports : Type; axiom import_path : Type; import \"real.ouro\";" ["real.ouro"])
+    , MkPair String Bool "record-projection-arguments-do-not-add-imports"
+        (andb (native_collect_imports_match
+          "record Packet : Type where x : String -> Nat; end; def field (p : Packet) : Nat := p.x \"fake.ouro\"; import \"real.ouro\";" ["real.ouro"])
+          (native_collect_imports_match
+            "def field (p : Packet) : Nat := p.import \"fake.ouro\"; import \"real.ouro\";" ["real.ouro"]))
+    , MkPair String Bool "unterminated-import-string-rejected"
+        (native_collect_imports_rejected "import \"unfinished.ouro")
+    , MkPair String Bool "malformed-import-does-not-return-partial-list"
+        (native_collect_imports_rejected "import \"one.ouro\"; import \"unfinished.ouro")
+    , MkPair String Bool "missing-import-alias-rejected"
+        (native_collect_imports_rejected "import \"one.ouro\" as ;")
+    , MkPair String Bool "duplicate-import-alias-rejected"
+        (native_collect_imports_rejected "import \"one.ouro\" as A; import \"two.ouro\" as A;")
+    , MkPair String Bool "reserved-import-alias-rejected"
+        (native_collect_imports_rejected "import \"one.ouro\" as def;")
+    , MkPair String Bool "UNC-root-retains-two-slashes"
+        (str_eq (collect_path_normalize "//server/share/folder/../main.ouro") "//server/share/main.ouro")
+    , MkPair String Bool "UNC-backslash-root-retains-network-prefix"
+        (str_eq (collect_path_normalize "\\\\server\\share\\folder\\..\\main.ouro") "//server/share/main.ouro")
+    , MkPair String Bool "UNC-relative-import-retains-network-prefix"
+        (str_eq (collect_path_resolve "//server/share/dir/main.ouro" "../lib.ouro") "//server/share/lib.ouro")
+    , MkPair String Bool "UNC-backslash-import-retains-network-prefix"
+        (str_eq (collect_path_resolve "\\\\server\\share\\dir\\main.ouro" "..\\lib.ouro") "//server/share/lib.ouro")
+    , MkPair String Bool "drive-root-normalization-preserved"
+        (str_eq (collect_path_normalize "I:\\src\\.\\main.ouro") "I:/src/main.ouro")
+    , MkPair String Bool "relative-root-normalization-preserved"
+        (str_eq (collect_path_normalize "./src/../main.ouro") "main.ouro")
+    , MkPair String Bool "single-slash-root-is-not-UNC"
+        (str_eq (collect_path_normalize "/src/../main.ouro") "/main.ouro")
+    ];
+
+def native_collect_laws : IO (List (Pair String Bool)) :=
+    do let! ordered := collect_walk collect_fuel [] [] native_collect_root;
+       let! normalized := collect_walk collect_fuel [] []
+         "./tests/native_build_collection/positive path/./main.ouro";
+       let! backslashes := collect_walk collect_fuel [] []
+         (str_replace native_collect_root "/" "\\");
+       let! missing := collect_walk collect_fuel [] [] native_collect_missing;
+       let! cycle := collect_walk collect_fuel [] [] native_collect_cycle;
+       let! exhausted := collect_walk Z [] [] native_collect_root;
+       io_pure (List (Pair String Bool))
+         (append (Pair String Bool) native_collect_source_laws
+         [ MkPair String Bool "dependency-order-spaces-and-dedup" (native_collect_units_match ordered)
+         , MkPair String Bool "collector-normalized-root" (native_collect_units_match normalized)
+         , MkPair String Bool "collector-backslash-root" (native_collect_units_match backslashes)
+         , MkPair String Bool "missing-import-ColErr" (native_collect_error_match missing native_collect_missing_error)
+         , MkPair String Bool "cycle-ColErr" (native_collect_error_match cycle native_collect_cycle_error)
+         , MkPair String Bool "fuel-ColErr" (native_collect_error_match exhausted "collect_units: too many units")
+         ])
+
+def native_collect_fail (rows : List (Pair String Bool)) (name : String)
+    (detail : String) : IO Unit :=
+    do eprintln detail;
+       precision_run "native-build-collection"
+         (append (Pair String Bool) rows [MkPair String Bool name False])
+
+def native_collect_matches (output : String) (expected : String) : IO Bool :=
+    do let! loaded := fs_read_checked output;
+       match loaded with
+       | Left error => do eprintln (fs_error_message error); io_pure Bool False
+       | Right actual => io_pure Bool (prim_string_eq actual expected)
+       end
+
+def native_collect_build (driver : String) (source : String) (output : String)
+    (units : List String) : IO Bool :=
+    do let! result := process_run_expected
+         (command_spec driver (append String [source, output] units)) Z;
+       match result with
+       | Left error => do eprintln (process_error_message error); io_pure Bool False
+       | Right built =>
+           io_pure Bool (str_eq (str_replace (proc_stdout built) "\r" "")
+             (str_concat output "\n"))
+       end
+
+def native_collect_reject (driver : String) (source : String) (output : String)
+    (previous : String) (diagnostic : String) : IO Bool :=
+    do let! result := process_run_expected (command_spec driver [source, output]) (S Z);
+       let! preserved := native_collect_matches output previous;
+       match result with
+       | Left error => do eprintln (process_error_message error); io_pure Bool False
+       | Right rejected =>
+           io_pure Bool (andb preserved
+             (andb (str_eq (proc_stdout rejected) "")
+               (str_contains (str_replace (proc_stderr rejected) "\r" "") diagnostic)))
+       end
+
+def native_collect_checks (driver : String) (directory : String)
+    (output : String) (image : String) (rows : List (Pair String Bool)) : IO Unit :=
+    let explicit_output : String := fs_child directory "explicit output.exe" in
+    do let! executed := process_run_expected (command_spec output []) 42;
+       let! explicit := native_collect_build driver native_collect_root explicit_output native_collect_expected;
+       let! same_explicit := native_collect_matches explicit_output image;
+       let! normalized := native_collect_build driver
+         "./tests/native_build_collection/positive path/./main.ouro" output [];
+       let! same_normalized := native_collect_matches output image;
+       let! missing := native_collect_reject driver native_collect_missing output image
+         (str_cat3 "native-build: " native_collect_missing_error "\n");
+       let! cycle := native_collect_reject driver native_collect_cycle output image
+         (str_cat3 "native-build: " native_collect_cycle_error "\n");
+       let! invalid := native_collect_reject driver native_collect_bad_import output image
+         "native-build: source:41:";
+       precision_run "native-build-collection"
+         (append (Pair String Bool) rows
+           [ MkPair String Bool "direct-build-path-only-stdout" True
+           , MkPair String Bool "direct-build-pe-header" (str_eq (str_slice image Z 2) "MZ")
+           , MkPair String Bool "direct-build-native-exit42"
+               (match executed with
+                | Left _ => False
+                | Right result => andb (str_eq (proc_stdout result) "") (str_eq (proc_stderr result) "")
+                end)
+           , MkPair String Bool "explicit-units-same-complete-image" (andb explicit same_explicit)
+           , MkPair String Bool "normalized-root-same-complete-image" (andb normalized same_normalized)
+           , MkPair String Bool "missing-import-preserves-output" missing
+           , MkPair String Bool "cycle-preserves-output" cycle
+           , MkPair String Bool "imported-type-failure-preserves-output" invalid
+           ])
+
+def native_collect_run (driver : String) (directory : String) : IO Unit :=
+    let output : String := fs_child directory "auto output.exe" in
+    do let! rows := native_collect_laws;
+       let! built := native_collect_build driver native_collect_root output [];
+       match built with
+       | False => native_collect_fail rows "direct-build-path-only-stdout" "direct root/output build failed"
+       | True =>
+           do let! image := fs_read_checked output;
+              match image with
+              | Left error => native_collect_fail rows "read-built-image" (fs_error_message error)
+              | Right bytes => native_collect_checks driver directory output bytes rows
+              end
+       end
+
+-- @entry main
+def main : IO Unit :=
+    do let! argv := process_argv;
+       match tail String argv with
+       | Cons driver rest =>
+           match rest with
+           | Cons directory extra =>
+               match extra with
+               | Nil => native_collect_run driver directory
+               | Cons _ _ => do eprintln "usage: native-build-collection DRIVER.exe OUTPUT_DIRECTORY"; exit 2
+               end
+           | Nil => do eprintln "usage: native-build-collection DRIVER.exe OUTPUT_DIRECTORY"; exit 2
+           end
+       | Nil => do eprintln "usage: native-build-collection DRIVER.exe OUTPUT_DIRECTORY"; exit 2
+       end

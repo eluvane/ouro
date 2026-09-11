@@ -1,0 +1,189 @@
+-- Startup adapters keep OS storage in explicit raw scopes. Every helper is
+-- selected from a checked body with its complete normalized Core signature.
+import "managed_stdio.ouro";
+
+inductive ManagedStartupHelper : Type :=
+  | ManagedStartupAllocate : ManagedStartupHelper | ManagedStartupRelease : ManagedStartupHelper
+  | ManagedStartupArgvOpen : ManagedStartupHelper | ManagedStartupArgvAt : ManagedStartupHelper
+  | ManagedStartupArgvClose : ManagedStartupHelper | ManagedStartupWideLength : ManagedStartupHelper
+  | ManagedStartupToWide : ManagedStartupHelper | ManagedStartupFromWide : ManagedStartupHelper
+  | ManagedStartupEnvironment : ManagedStartupHelper;
+
+inductive ManagedStartupScope : Type :=
+  | ManagedStartupScopeOf : List MirValue -> Maybe MirValue -> ManagedStartupScope;
+
+def managed_startup_helper_name (helper : ManagedStartupHelper) : List Nat :=
+    match helper with
+    | ManagedStartupAllocate => managed_stdio_helper_name ManagedStdioAllocate
+    | ManagedStartupRelease => managed_stdio_helper_name ManagedStdioRelease
+    | ManagedStartupArgvOpen => ([114,97,119,95,119,105,110,100,111,119,115,95,97,114,103,118,95,111,112,101,110] : List Nat)
+    | ManagedStartupArgvAt => ([114,97,119,95,119,105,110,100,111,119,115,95,97,114,103,118,95,97,116] : List Nat)
+    | ManagedStartupArgvClose => ([114,97,119,95,119,105,110,100,111,119,115,95,97,114,103,118,95,99,108,111,115,101] : List Nat)
+    | ManagedStartupWideLength => ([114,97,119,95,119,105,110,100,111,119,115,95,119,105,100,101,95,108,101,110,103,116,104] : List Nat)
+    | ManagedStartupToWide => ([114,97,119,95,119,105,110,100,111,119,115,95,117,116,102,56,95,116,111,95,117,116,102,49,54] : List Nat)
+    | ManagedStartupFromWide => ([114,97,119,95,119,105,110,100,111,119,115,95,117,116,102,49,54,95,116,111,95,117,116,102,56] : List Nat)
+    | ManagedStartupEnvironment => ([114,97,119,95,119,105,110,100,111,119,115,95,101,110,118,105,114,111,110,109,101,110,116,95,103,101,116] : List Nat) end;
+
+def managed_startup_status_expected (compiler : ManagedCompiler) (helper : ManagedStartupHelper)
+    : Either NativeLowerError CoreTerm :=
+      let bindings : List PrimitiveResolved := primitive_environment (managed_compiler_entries compiler) in
+      lower_from_primitive CoreTerm (CSort 0)
+        (primitive_bind CoreTerm CoreTerm (primitive_type_ref PrimitiveRuntimeType bindings) (fun (runtime : CoreTerm) =>
+          primitive_bind CoreTerm CoreTerm (primitive_type_ref PrimitiveRawPtrType bindings) (fun (pointer : CoreTerm) =>
+            primitive_bind CoreTerm CoreTerm (primitive_type_ref PrimitiveU8Type bindings) (fun (byte : CoreTerm) =>
+              primitive_bind CoreTerm CoreTerm (primitive_type_ref PrimitiveU32Type bindings) (fun (word : CoreTerm) =>
+                primitive_map CoreTerm CoreTerm (fun (size : CoreTerm) =>
+                  let buffer : CoreTerm := CApp pointer byte in
+                  let count : CoreTerm := CApp pointer word in
+                  let owner : CoreTerm := CApp pointer size in
+                  let arguments : List CoreTerm := match helper with
+                    | ManagedStartupArgvOpen => ([owner, count] : List CoreTerm)
+                    | ManagedStartupArgvAt => ([buffer, word, size, owner] : List CoreTerm)
+                    | ManagedStartupArgvClose => ([owner] : List CoreTerm)
+                    | ManagedStartupWideLength => ([buffer, size, count] : List CoreTerm)
+                    | ManagedStartupToWide => ([buffer, size, buffer, size, count] : List CoreTerm)
+                    | ManagedStartupFromWide => ([buffer, size, buffer, size, count] : List CoreTerm)
+                    | ManagedStartupEnvironment => ([buffer, size, buffer, size, count] : List CoreTerm)
+                    | ManagedStartupAllocate => ([] : List CoreTerm)
+                    | ManagedStartupRelease => ([] : List CoreTerm) end in
+                  primitive_arrow arguments (CApp runtime word))
+                  (primitive_type_ref PrimitiveUSizeType bindings))))));
+
+def managed_startup_expected (compiler : ManagedCompiler) (helper : ManagedStartupHelper)
+    : Either NativeLowerError CoreTerm :=
+    match helper with
+    | ManagedStartupAllocate => managed_stdio_expected compiler ManagedStdioAllocate
+    | ManagedStartupRelease => managed_stdio_expected compiler ManagedStdioRelease
+    | ManagedStartupArgvOpen => managed_startup_status_expected compiler helper
+    | ManagedStartupArgvAt => managed_startup_status_expected compiler helper
+    | ManagedStartupArgvClose => managed_startup_status_expected compiler helper
+    | ManagedStartupWideLength => managed_startup_status_expected compiler helper
+    | ManagedStartupToWide => managed_startup_status_expected compiler helper
+    | ManagedStartupFromWide => managed_startup_status_expected compiler helper
+    | ManagedStartupEnvironment => managed_startup_status_expected compiler helper end;
+
+def managed_startup_helpers (compiler : ManagedCompiler) : List ManagedStartupHelper :=
+    let argv : Bool := managed_stdio_has compiler PrimitiveArgv in
+    let environment : Bool := managed_stdio_has compiler PrimitiveEnvGet in
+    match orb argv environment with | False => ([] : List ManagedStartupHelper) | True =>
+      append ManagedStartupHelper ([ManagedStartupAllocate, ManagedStartupRelease, ManagedStartupFromWide] : List ManagedStartupHelper)
+        (append ManagedStartupHelper (match argv with | False => ([] : List ManagedStartupHelper)
+          | True => ([ManagedStartupArgvOpen, ManagedStartupArgvAt, ManagedStartupArgvClose, ManagedStartupWideLength] : List ManagedStartupHelper) end)
+          (match environment with | False => ([] : List ManagedStartupHelper)
+            | True => ([ManagedStartupToWide, ManagedStartupEnvironment] : List ManagedStartupHelper) end)) end;
+
+def managed_startup_roots (compiler : ManagedCompiler) (fuel : Nat) : Either NativeLowerError (List Nat) :=
+    (fix resolve (helpers : List ManagedStartupHelper) : Either NativeLowerError (List Nat) :=
+      match helpers with | Nil => Right NativeLowerError (List Nat) ([] : List Nat) | Cons helper rest =>
+        lower_bind CoreTerm (List Nat) (managed_startup_expected compiler helper) (fun (expected : CoreTerm) =>
+          lower_bind Nat (List Nat) (managed_runtime_definition compiler fuel (managed_startup_helper_name helper) expected)
+            (fun (id : Nat) => lower_map (List Nat) (List Nat) (Cons Nat id) (resolve rest))) end)
+      (managed_startup_helpers compiler);
+
+def managed_startup_call (compiler : ManagedCompiler) (helper : ManagedStartupHelper)
+    (arguments : List MirValue) (state : ManagedState) : Either NativeLowerError ManagedResult :=
+    lower_bind CoreTerm ManagedResult (managed_startup_expected compiler helper) (fun (expected : CoreTerm) =>
+      lower_bind LowerContract ManagedResult
+        (managed_runtime_contract compiler primitive_default_fuel (managed_startup_helper_name helper) expected)
+        (fun (contract : LowerContract) =>
+          let typ : MirType := match helper with
+            | ManagedStartupAllocate => MirRawPtr | ManagedStartupRelease => MirU8
+            | ManagedStartupArgvOpen => MirU32 | ManagedStartupArgvAt => MirU32
+            | ManagedStartupArgvClose => MirU32 | ManagedStartupWideLength => MirU32
+            | ManagedStartupToWide => MirU32 | ManagedStartupFromWide => MirU32
+            | ManagedStartupEnvironment => MirU32 end in
+          managed_fresh typ (fun (local : Nat) =>
+            MirCall MirMayGc (Just Nat local) (MirDirect (lower_contract_id contract)) arguments) state));
+
+def managed_startup_own (buffer : MirValue) (scope : ManagedStartupScope) : ManagedStartupScope :=
+    match scope with | ManagedStartupScopeOf buffers owner => ManagedStartupScopeOf (Cons MirValue buffer buffers) owner end;
+
+def managed_startup_argv_owner (cell : MirValue) (scope : ManagedStartupScope) : ManagedStartupScope :=
+    match scope with | ManagedStartupScopeOf buffers _ => ManagedStartupScopeOf buffers (Just MirValue cell) end;
+
+def managed_startup_zero (status : MirValue) (state : ManagedState) : Either NativeLowerError ManagedResult :=
+    managed_compare MirEqual status (managed_bits MirU32 0) state;
+
+-- Always attempt every owned release. The argv owner cell is still live when
+-- LocalFree runs; its containing page is released only afterwards.
+def managed_startup_release_all (compiler : ManagedCompiler) (buffers : List MirValue)
+    (okay : MirValue) (state : ManagedState) : Either NativeLowerError ManagedResult :=
+    (fix release (rest : List MirValue) (success : MirValue) (current : ManagedState)
+        : Either NativeLowerError ManagedResult :=
+      match rest with | Nil => Right NativeLowerError ManagedResult (ManagedResultOf success current)
+      | Cons buffer tail => lower_bind ManagedResult ManagedResult
+          (managed_startup_call compiler ManagedStartupRelease ([buffer] : List MirValue) current)
+          (fun (released : ManagedResult) => match released with | ManagedResultOf result next =>
+            lower_bind ManagedResult ManagedResult (managed_binary MirU8 MirAnd success result next)
+              (fun (combined : ManagedResult) => match combined with | ManagedResultOf all after => release tail all after end) end) end)
+      buffers okay state;
+
+def managed_startup_cleanup (compiler : ManagedCompiler) (scope : ManagedStartupScope) (state : ManagedState)
+    : Either NativeLowerError ManagedResult :=
+    match scope with | ManagedStartupScopeOf buffers owner => match owner with
+      | Nothing => managed_startup_release_all compiler buffers (managed_bits MirU8 1) state
+      | Just cell => lower_bind ManagedResult ManagedResult
+          (managed_startup_call compiler ManagedStartupArgvClose ([cell] : List MirValue) state)
+          (fun (closed : ManagedResult) => match closed with | ManagedResultOf status next =>
+            lower_bind ManagedResult ManagedResult (managed_startup_zero status next)
+              (fun (checked : ManagedResult) => match checked with | ManagedResultOf okay after =>
+                managed_startup_release_all compiler buffers okay after end) end) end end;
+
+def managed_startup_abort (compiler : ManagedCompiler) (scope : ManagedStartupScope) (state : ManagedState)
+    : Either NativeLowerError ManagedResult :=
+    lower_bind Nat ManagedResult (managed_stdio_exit_symbol compiler) (fun (exit : Nat) =>
+      lower_bind ManagedResult ManagedResult (managed_startup_cleanup compiler scope state)
+        (fun (cleaned : ManagedResult) => match cleaned with | ManagedResultOf _ next =>
+          lower_bind ManagedState ManagedResult (managed_stdio_require exit (managed_bits MirU8 0) next)
+            (managed_unit_value compiler) end));
+
+def managed_startup_check (compiler : ManagedCompiler) (scope : ManagedStartupScope) (condition : MirValue)
+    (body : ManagedState -> Either NativeLowerError ManagedResult) (state : ManagedState)
+    : Either NativeLowerError ManagedResult :=
+    managed_string_choose MirManagedPtr condition body (managed_startup_abort compiler scope) state;
+
+def managed_startup_status (compiler : ManagedCompiler) (scope : ManagedStartupScope) (status : MirValue)
+    (body : ManagedState -> Either NativeLowerError ManagedResult) (state : ManagedState)
+    : Either NativeLowerError ManagedResult :=
+    lower_bind ManagedResult ManagedResult (managed_startup_zero status state)
+      (fun (checked : ManagedResult) => match checked with | ManagedResultOf okay next =>
+        managed_startup_check compiler scope okay body next end);
+
+def managed_startup_release_value (compiler : ManagedCompiler) (scope : ManagedStartupScope)
+    (buffer : MirValue) (value : MirValue) (state : ManagedState) : Either NativeLowerError ManagedResult :=
+    lower_bind ManagedResult ManagedResult
+      (managed_startup_call compiler ManagedStartupRelease ([buffer] : List MirValue) state)
+      (fun (released : ManagedResult) => match released with | ManagedResultOf okay next =>
+        managed_startup_check compiler scope okay
+          (fun (after : ManagedState) => Right NativeLowerError ManagedResult (ManagedResultOf value after)) next end);
+
+-- The callback returns an owned managed value. It remains a GC root during
+-- raw cleanup. Failed branches clean the complete enclosing scope and exit.
+def managed_startup_buffer (compiler : ManagedCompiler) (scope : ManagedStartupScope) (bytes : MirValue)
+    (body : MirValue -> ManagedStartupScope -> ManagedState -> Either NativeLowerError ManagedResult)
+    (state : ManagedState) : Either NativeLowerError ManagedResult :=
+    lower_bind ManagedResult ManagedResult
+      (managed_startup_call compiler ManagedStartupAllocate ([bytes, managed_bits MirUSize 8] : List MirValue) state)
+      (fun (allocated : ManagedResult) => match allocated with | ManagedResultOf buffer next =>
+        lower_bind ManagedResult ManagedResult (managed_compare MirNotEqual buffer (managed_bits MirRawPtr 0) next)
+          (fun (checked : ManagedResult) => match checked with | ManagedResultOf okay after =>
+            managed_startup_check compiler scope okay (fun (entered : ManagedState) =>
+              lower_bind ManagedResult ManagedResult (body buffer (managed_startup_own buffer scope) entered)
+                (fun (result : ManagedResult) => match result with | ManagedResultOf value finished =>
+                  managed_startup_release_value compiler scope buffer value finished end)) after end) end);
+
+def managed_startup_pointer (base : MirValue) (offset : Nat) (state : ManagedState)
+    : Either NativeLowerError ManagedResult :=
+    managed_fresh MirRawPtr (fun (local : Nat) => MirPointerAdd local base (managed_bits MirUSize offset)) state;
+
+def managed_startup_count (cell : MirValue) (state : ManagedState) : Either NativeLowerError ManagedResult :=
+    lower_bind ManagedResult ManagedResult (managed_load MirU32 cell 0 state)
+      (fun (loaded : ManagedResult) => match loaded with | ManagedResultOf word next =>
+        managed_convert MirUSize MirZeroExtend word next end);
+
+def managed_startup_optional (compiler : ManagedCompiler) (value : Maybe MirValue) (state : ManagedState)
+    : Either NativeLowerError ManagedResult :=
+    lower_bind Nat ManagedResult (lower_role_identity (managed_compiler_entries compiler) PrimitiveMaybeRole)
+      (fun (family : Nat) => match value with
+        | Nothing => managed_constructor compiler family (managed_bits MirUSize 0) ([] : List MirValue) state
+        | Just string => managed_constructor compiler family (managed_bits MirUSize 1) ([string] : List MirValue) state end);

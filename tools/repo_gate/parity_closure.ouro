@@ -1,0 +1,845 @@
+-- Additive parity-closure checks layered on the existing repository gate.
+
+import "checks.ouro";
+import "workflow_checks.ouro";
+import "report.ouro";
+import "../ci_gate/host_bound.ouro";
+import "../../std/fs.ouro";
+import "../../std/io.ouro";
+import "../../std/natx.ouro";
+import "../../std/pathx.ouro";
+import "../../std/stringx.ouro";
+import "../../std/text.ouro";
+
+
+def parity_skip_markdown_path (rel : String) : Bool :=
+    orb (path_has_any_prefix rel skip_generated_prefixes)
+      (path_has_any_infix rel skip_vendor_infixes);
+
+
+def parity_markdown_path (rel : String) : Bool :=
+    andb (path_has_ext rel ".md") (notb (parity_skip_markdown_path rel));
+
+
+def parity_generated_api_markdown (rel : String) : Bool :=
+    andb (str_starts rel "docs/api/") (path_has_ext rel ".md");
+
+
+def parity_maintained_markdown (rel : String) : Bool :=
+    andb (parity_markdown_path rel) (notb (parity_generated_api_markdown rel));
+
+
+def parity_filter_markdown_paths (paths : List String) : List String :=
+    str_sort (filter String parity_markdown_path paths);
+
+
+def parity_markdown_paths (root : String) : IO (List String) :=
+    do let! paths := repo_paths root;
+       io_pure (List String) (parity_filter_markdown_paths paths)
+
+
+def parity_count_markdown_lines (lines : List String) : Nat :=
+  count_if String (fun (line : String) => path_has_ext line ".md") lines;
+
+
+def parity_git_markdown_count (root : String) (ref_name : String) : IO (Maybe Nat) :=
+    match str_null ref_name with
+    | True => io_pure (Maybe Nat) (Nothing Nat)
+    | False =>
+        do let! r := proc_exec "git" ([ "-C", root, "ls-tree", "-r", "--name-only", ref_name ] : List String);
+           match proc_ok r with
+           | True => io_pure (Maybe Nat) (Just Nat (parity_count_markdown_lines (str_lines (proc_stdout r))))
+           | False => io_pure (Maybe Nat) (Nothing Nat)
+           end
+    end;
+
+
+def parity_env_trim (name : String) : IO String :=
+    do let! m := env_get name;
+       io_pure String (str_trim (fromMaybe String "" m))
+
+
+def parity_try_base_candidates (root : String) (a : String) (b : String) : IO (Pair String (Maybe Nat)) :=
+    do let! ca := parity_git_markdown_count root a;
+       match ca with
+       | Just _ => io_pure (Pair String (Maybe Nat)) (MkPair String (Maybe Nat) a ca)
+       | Nothing =>
+           do let! cb := parity_git_markdown_count root b;
+              match cb with
+              | Just _ => io_pure (Pair String (Maybe Nat)) (MkPair String (Maybe Nat) b cb)
+              | Nothing => io_pure (Pair String (Maybe Nat)) (MkPair String (Maybe Nat) "" (Nothing Nat))
+              end
+       end
+
+
+def parity_base_markdown_count (root : String) : IO (Pair String (Maybe Nat)) :=
+    do let! explicit := parity_env_trim "OURO_REPO_GATE_BASE_REF";
+       match str_null explicit with
+       | False =>
+           do let! c := parity_git_markdown_count root explicit;
+              io_pure (Pair String (Maybe Nat)) (MkPair String (Maybe Nat) explicit c)
+       | True =>
+           do let! base := parity_env_trim "GITHUB_BASE_REF";
+              match str_null base with
+              | True => io_pure (Pair String (Maybe Nat)) (MkPair String (Maybe Nat) "" (Nothing Nat))
+              | False => parity_try_base_candidates root (str_concat "origin/" base) base
+              end
+       end
+
+
+def parity_maybe_nat_text (m : Maybe Nat) : String :=
+    match m with
+    | Nothing => "null"
+    | Just n => show_nat n
+    end;
+
+
+def parity_markdown_inventory_result (docs : List String)
+    (base_pair : Pair String (Maybe Nat)) : GateCheck :=
+    let maintained : Nat := count_if String parity_maintained_markdown docs in
+    let generated : Nat := count_if String parity_generated_api_markdown docs in
+    let current : Nat := length String docs in
+    match base_pair with
+    | MkPair base_ref base_count =>
+        let metrics : List GateMetric :=
+          [ nat_metric "current_markdown" current
+          , nat_metric "maintained_markdown" maintained
+          , nat_metric "generated_api_markdown" generated
+          , gate_metric "base_ref" base_ref
+          , gate_metric "base_markdown" (parity_maybe_nat_text base_count)
+          ] in
+        let issues : List GateIssue :=
+          match base_count with
+          | Nothing => Nil GateIssue
+          | Just base =>
+              match gtb_nat current base with
+              | True =>
+                  [ gate_issue "Markdown inventory grew relative to base ref"
+                      "docs/README.md" ]
+              | False => Nil GateIssue
+              end
+          end in
+        gate_check_metrics "markdown-inventory-parity" metrics issues
+    end;
+
+
+def parity_markdown_inventory_check (root : String) : IO GateCheck :=
+    do let! docs := parity_markdown_paths root;
+       let! base_pair := parity_base_markdown_count root;
+       io_pure GateCheck (parity_markdown_inventory_result docs base_pair)
+
+
+def parity_seal_version (text : String) : String :=
+    fromMaybe String "" (str_between text "version = \"" "\"");
+
+
+def parity_json_version_after_marker (text : String) : String :=
+    match str_split_first text "\"version\"" with
+    | Nothing => ""
+    | Just pair =>
+        match pair with
+        | MkPair _ rest => fromMaybe String "" (str_between (str_after rest ":") "\"" "\"")
+        end
+    end;
+
+
+def parity_read_issue (rel : String) (loaded : Either FsError String)
+    (issues : List GateIssue) : List GateIssue :=
+    match loaded with
+    | Left e => issue_add (fs_error_message e) rel issues
+    | Right _ => issues
+    end
+
+def parity_read_text (loaded : Either FsError String) : String :=
+    match loaded with
+    | Left _ => ""
+    | Right text => text
+    end
+
+def parity_version_result (seal : Either FsError String)
+    (package : Either FsError String) (lock : Either FsError String) : GateCheck :=
+    let read_issues : List GateIssue :=
+      parity_read_issue "editors/vscode/package-lock.json" lock
+        (parity_read_issue "editors/vscode/package.json" package
+          (parity_read_issue "Ouro.seal" seal (Nil GateIssue))) in
+    match read_issues with
+    | Cons _ _ => gate_check "version-baseline-parity" read_issues
+    | Nil =>
+        let baseline : String := parity_seal_version (parity_read_text seal) in
+        let package_version : String :=
+          parity_json_version_after_marker (parity_read_text package) in
+        let lock_version : String :=
+          parity_json_version_after_marker (parity_read_text lock) in
+        let ok : Bool :=
+          andb (notb (str_null baseline))
+            (andb (str_eq baseline package_version) (str_eq baseline lock_version)) in
+        let issues : List GateIssue :=
+          match ok with
+          | True => Nil GateIssue
+          | False =>
+              [ gate_issue "version baseline drift across seal/vscode files" "Ouro.seal" ]
+          end in
+        gate_check_metrics "version-baseline-parity"
+          [ gate_metric "ouro_seal" baseline
+          , gate_metric "vscode_package" package_version
+          , gate_metric "vscode_lock" lock_version
+          ] issues
+    end;
+
+
+def parity_version_check (root : String) : IO GateCheck :=
+    do let! seal := fs_read_checked (repo_join root "Ouro.seal");
+       let! package :=
+         fs_read_checked (repo_join root "editors/vscode/package.json");
+       let! lock :=
+         fs_read_checked (repo_join root "editors/vscode/package-lock.json");
+       io_pure GateCheck (parity_version_result seal package lock)
+
+
+def parity_hex_code (c : Nat) : Bool :=
+    orb (andb (leb_nat 48 c) (leb_nat c 57))
+      (orb (andb (leb_nat 97 c) (leb_nat c 102))
+        (andb (leb_nat 65 c) (leb_nat c 70)));
+
+
+def parity_hex40 (s : String) : Bool :=
+    andb (eq_nat (str_len s) 40) (str_char_all parity_hex_code s);
+
+
+def parity_action_line_issues (path : String) (line : String) (issues : List GateIssue) : List GateIssue :=
+    match str_split_first line "uses:" with
+    | Nothing => issues
+    | Just pair =>
+        match pair with
+        | MkPair _ raw =>
+            let spec : String := str_trim (str_before raw "#") in
+            let comment : String := str_after raw "#" in
+            match orb (str_starts spec "./") (str_starts spec "docker://") with
+            | True => issues
+            | False =>
+                match str_split_first spec "@" with
+                | Nothing => issue_add "external action is not pinned to a full 40-character commit SHA" path issues
+                | Just refpair =>
+                    match refpair with
+                    | MkPair _ ref =>
+                        let issues1 : List GateIssue :=
+                          match parity_hex40 ref with
+                          | True => issues
+                          | False => issue_add "external action is not pinned to a full 40-character commit SHA" path issues
+                          end in
+                        match str_contains comment "v" with
+                        | True => issues1
+                        | False => issue_add "pinned action lacks a readable version comment" path issues1
+                        end
+                    end
+                end
+            end
+        end
+    end;
+
+
+def workflow_selftest_issues (path : String) (text : String) : List GateIssue :=
+    append GateIssue
+      (workflow_dangerous_issues_for_text path text (Nil GateIssue))
+      (workflow_permission_issues_for_text path text (Nil GateIssue));
+
+
+def workflow_selftest_good : String :=
+    "name: Good\non:\n  push:\npermissions:\n  contents: read\nconcurrency:\n  group: good\njobs:\n  check:\n    permissions:\n      contents: read\n    steps:\n      - name: Check\n        uses: ./local-action\n";
+
+
+def workflow_selftest_comment_bypass : String :=
+    "name: Bypass\non:\n  \"pull_request_target\":\npermissions:\n  contents:    write\nconcurrency:\n  group: bypass\njobs:\n  pwn:\n    permissions:\n      contents:    write\n    steps:\n      - run: echo pwn\n        continue-on-error: yes\n# contents: read\n# actions/upload-artifact\n";
+
+
+def workflow_selftest_duplicate : String :=
+    "name: Duplicate\non:\n  push:\npermissions:\n  contents: read\n  contents: read\nconcurrency:\n  group: duplicate\njobs:\n  check:\n    permissions:\n      contents: read\n";
+
+
+def workflow_selftest_merge : String :=
+    "name: Merge\non:\n  push:\npermissions: &safe\n  contents: read\nconcurrency:\n  group: merge\njobs:\n  check:\n    permissions:\n      <<: *safe\n";
+
+
+def workflow_selftest_flow_trigger : String :=
+    "name: Flow\non: { pull_request_target: {} }\npermissions:\n  contents: read\nconcurrency:\n  group: flow\njobs:\n  check:\n    permissions:\n      contents: read\n";
+
+
+def workflow_selftest_unrelated_release : String :=
+    "name: Release\non:\n  push:\npermissions:\n  contents: read\nconcurrency:\n  group: release\njobs:\n  unsafe:\n    permissions:\n      contents: write\n    steps:\n      - uses: actions/upload-artifact@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n  publish-draft-release:\n    if: ${{ startsWith(github.ref, 'refs/tags/v') && github.event_name == 'push' }}\n    permissions:\n      contents: write\n    steps:\n      - run: |\n          gh release create \"$GITHUB_REF_NAME\" \\\n            --draft\n";
+
+
+def workflow_selftest_unrelated_pages : String :=
+    "name: Pages\non:\n  push:\npermissions:\n  contents: read\nconcurrency:\n  group: pages\njobs:\n  unsafe:\n    permissions:\n      pages: write\n    steps:\n      - uses: actions/upload-artifact@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n  publish-pages:\n    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}\n    permissions:\n      pages: write\n    steps:\n      - uses: actions/deploy-pages@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n";
+
+
+def workflow_selftest_require_reject (label : String) (path : String)
+    (text : String) (issues : List GateIssue) : List GateIssue :=
+    match nullb GateIssue (workflow_selftest_issues path text) with
+    | True => issue_add
+        (str_concat "workflow self-test accepted " label) "selftest" issues
+    | False => issues
+    end;
+
+
+def parity_workflow_self_tests_check (_root : String) : IO GateCheck :=
+    let bad_action : List GateIssue := parity_action_line_issues "selftest" "uses: actions/checkout@v7 # v7.0.1" (Nil GateIssue) in
+    let good_action : List GateIssue := parity_action_line_issues "selftest" "uses: actions/checkout@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa # v7.0.1" (Nil GateIssue) in
+    let issues0 : List GateIssue :=
+      match nullb GateIssue bad_action with
+      | True => [ gate_issue "workflow self-test accepted moving action tag" "selftest" ]
+      | False => Nil GateIssue
+      end in
+    let issues1 : List GateIssue :=
+      match nullb GateIssue good_action with
+      | True => issues0
+      | False => issue_add "workflow self-test rejected full-SHA action with version comment" "selftest" issues0
+      end in
+    let issues2 : List GateIssue :=
+      match nullb GateIssue
+              (workflow_selftest_issues "dependency-review.yml" workflow_selftest_good) with
+      | True => issues1
+      | False => issue_add "workflow self-test rejected safe structured workflow" "selftest" issues1
+      end in
+    let issues3 : List GateIssue :=
+      workflow_selftest_require_reject "comment-only policy markers"
+        "ouro-pr.yml" workflow_selftest_comment_bypass issues2 in
+    let issues4 : List GateIssue :=
+      workflow_selftest_require_reject "duplicate mapping keys"
+        "dependency-review.yml" workflow_selftest_duplicate issues3 in
+    let issues5 : List GateIssue :=
+      workflow_selftest_require_reject "YAML merge and alias"
+        "dependency-review.yml" workflow_selftest_merge issues4 in
+    let issues6 : List GateIssue :=
+      workflow_selftest_require_reject "flow-map privileged trigger"
+        "dependency-review.yml" workflow_selftest_flow_trigger issues5 in
+    let issues7 : List GateIssue :=
+      workflow_selftest_require_reject "unguarded write job with guarded release markers"
+        "ouro-release.yml" workflow_selftest_unrelated_release issues6 in
+    let issues8 : List GateIssue :=
+      workflow_selftest_require_reject "unguarded write job with guarded pages markers"
+        "ouro-pages.yml" workflow_selftest_unrelated_pages issues7 in
+    io_pure GateCheck (gate_check "workflow-policy-selftests" issues8);
+
+
+def control_allowed_migration (value : String) : Bool :=
+    elem String str_eq value
+      ([ "remove", "migrate", "thin-wrapper", "host-bound" ] : List String);
+
+
+def control_allowed_parity (value : String) : Bool :=
+    elem String str_eq value ([ "none", "partial", "full", "full-wrapper", "reference-only" ] : List String);
+
+
+def control_allowed_removal (value : String) : Bool :=
+    elem String str_eq value ([ "removable-now", "wrapper-only", "reference-only", "not-removable", "blocked" ] : List String);
+
+
+def control_bad_blocker (value : String) : Bool :=
+    let cleaned : String := str_lower (str_trim value) in
+    orb (str_null cleaned)
+      (elem String str_eq cleaned ([ "pending", "partial", "blocked", "todo", "tbd", "none" ] : List String));
+
+
+def control_path_before_anchor (value : String) : String :=
+    str_before value "#";
+
+
+def control_replacement_issues (root : String) (h : HostPath) (issues : List GateIssue)
+    : IO (List GateIssue) :=
+    match host_replacement h with
+    | Nothing =>
+        match str_eq (host_parity h) "none" with
+        | True => io_pure (List GateIssue) issues
+        | False =>
+            io_pure (List GateIssue)
+              (issue_add "non-none parity row has no native replacement" (host_path h) issues)
+        end
+    | Just replacement =>
+        let target : String := control_path_before_anchor replacement in
+        match str_null target with
+        | True => io_pure (List GateIssue) (issue_add "native replacement path is empty" (host_path h) issues)
+        | False =>
+            do let! present := fs_exists (repo_join root target);
+               match present with
+               | True => io_pure (List GateIssue) issues
+               | False => io_pure (List GateIssue)
+                   (issue_add (str_concat "native replacement path is missing: " target) (host_path h) issues)
+               end
+        end
+    end;
+
+
+def control_evidence_path_issues (root : String) (owner : String) (evidence : String)
+    (issues : List GateIssue) : IO (List GateIssue) :=
+    let target : String := control_path_before_anchor evidence in
+    match str_null target with
+    | True => io_pure (List GateIssue) (issue_add "declared evidence is empty" owner issues)
+    | False =>
+        match repo_pathish target with
+        | False => io_pure (List GateIssue) issues
+        | True =>
+            do let! present := fs_exists (repo_join root target);
+               match present with
+               | True => io_pure (List GateIssue) issues
+               | False => io_pure (List GateIssue)
+                   (issue_add (str_concat "declared evidence path is missing: " target) owner issues)
+               end
+        end
+    end;
+
+
+def control_evidence_list_issues (root : String) (owner : String)
+    (evidence : List String) (issues : List GateIssue) : IO (List GateIssue) :=
+  io_fold String (List GateIssue)
+    (fun (acc : List GateIssue) (item : String) =>
+      control_evidence_path_issues root owner item acc)
+    issues evidence;
+
+
+def control_has_independent_evidence (h : HostPath) : Bool :=
+    any String
+      (fun (item : String) =>
+        notb (str_eq (control_path_before_anchor item) (host_path h)))
+      (host_evidence h);
+
+
+def control_wrapper_forbidden_tokens : List String :=
+    [ "pull_request_target"
+    , "contents: write"
+    , "dependency-review"
+    , "readme-example"
+    , "REQUIRED_FILES"
+    , "MARKDOWN_LINK_RE"
+    , "BARE_PATH_RE"
+    , "re.compile"
+    ];
+
+
+def control_wrapper_token_issues (owner : String) (text : String)
+    (tokens : List String) (issues : List GateIssue) : List GateIssue :=
+  foldl String (List GateIssue)
+    (fun (acc : List GateIssue) (token : String) =>
+      match str_contains text token with
+      | False => acc
+      | True =>
+          issue_add (str_concat "full-wrapper contains forbidden policy token: " token)
+            owner acc
+      end)
+    issues tokens;
+
+
+def control_wrapper_issues (root : String) (h : HostPath) (issues : List GateIssue)
+    : IO (List GateIssue) :=
+    match str_eq (host_parity h) "full-wrapper" with
+    | False => io_pure (List GateIssue) issues
+    | True =>
+        workflow_with_file_text root (host_path h) issues
+          (fun (text : String) =>
+            control_wrapper_token_issues (host_path h) text
+              control_wrapper_forbidden_tokens issues)
+    end;
+
+
+def control_reference_native_use_issues (root : String) (h : HostPath) (issues : List GateIssue)
+    : IO (List GateIssue) :=
+    match str_eq (host_removal h) "reference-only" with
+    | False => io_pure (List GateIssue) issues
+    | True =>
+        workflow_with_file_text root "tools/ci_gate/gates.ouro" issues
+          (fun (native_gates : String) =>
+            match str_contains native_gates (host_path h) with
+            | False => issues
+            | True =>
+                issue_add
+                  "reference-only script is used by native CI profile definitions"
+                  (host_path h) issues
+            end)
+    end;
+
+
+def control_removable_present_issues (root : String) (h : HostPath) (issues : List GateIssue)
+    : IO (List GateIssue) :=
+    match str_eq (host_removal h) "removable-now" with
+    | False => io_pure (List GateIssue) issues
+    | True =>
+        do let! present := fs_exists (repo_join root (host_path h));
+           match present with
+           | False => io_pure (List GateIssue) issues
+           | True => io_pure (List GateIssue)
+               (issue_add "script marked removable-now still exists" (host_path h) issues)
+           end
+    end;
+
+
+def control_row_issues (root : String) (h : HostPath) (issues : List GateIssue)
+    : IO (List GateIssue) :=
+    let issues0 : List GateIssue :=
+      match control_allowed_migration (host_kind h) with
+      | True => issues
+      | False => issue_add "inventory row has invalid migration_status" (host_path h) issues
+      end in
+    let issues1 : List GateIssue :=
+      match str_null (host_path h) with
+      | True => issue_add "inventory row has empty path" "tools/ci_gate/host_inventory.ouro" issues0
+      | False => issues0
+      end in
+    let issues2 : List GateIssue :=
+      match str_null (host_role h) with
+      | True => issue_add "inventory row has empty role" (host_path h) issues1
+      | False => issues1
+      end in
+    let issues3 : List GateIssue :=
+      match control_allowed_parity (host_parity h) with
+      | True => issues2
+      | False => issue_add "inventory row has invalid parity_status" (host_path h) issues2
+      end in
+    let issues4 : List GateIssue :=
+      match control_allowed_removal (host_removal h) with
+      | True => issues3
+      | False => issue_add "inventory row has invalid removal_eligibility" (host_path h) issues3
+      end in
+    let issues5 : List GateIssue :=
+      match control_bad_blocker (host_blocker h) with
+      | False => issues4
+      | True => issue_add "inventory row has broad or empty blocker" (host_path h) issues4
+      end in
+    let issues6 : List GateIssue :=
+      match nullb String (host_evidence h) with
+      | True => issue_add "inventory row has no evidence" (host_path h) issues5
+      | False =>
+          match control_has_independent_evidence h with
+          | True => issues5
+          | False => issue_add "inventory row has no independent evidence" (host_path h) issues5
+          end
+      end in
+    do let! issues7 := control_replacement_issues root h issues6;
+       let! issues8 := control_evidence_list_issues root (host_path h) (host_evidence h) issues7;
+       let! issues9 := control_wrapper_issues root h issues8;
+       let! issues10 := control_reference_native_use_issues root h issues9;
+       control_removable_present_issues root h issues10
+
+
+def control_rows_issues (root : String) (rows : List HostPath)
+    (issues : List GateIssue) : IO (List GateIssue) :=
+  io_fold HostPath (List GateIssue)
+    (fun (acc : List GateIssue) (h : HostPath) =>
+      control_row_issues root h acc)
+    issues rows;
+
+
+def control_script_path (path : String) : Bool :=
+    orb (path_has_ext path ".py") (path_has_ext path ".sh");
+
+
+def control_inventory_active_script_row (h : HostPath) : Bool :=
+    andb (control_script_path (host_path h))
+      (notb (str_eq (host_kind h) "remove"));
+
+
+def control_inventory_script_paths : List String :=
+    str_sort
+      (map HostPath String host_path
+        (filter HostPath control_inventory_active_script_row host_bound_paths));
+
+
+def control_inventory_all_script_paths : List String :=
+    str_sort
+      (map HostPath String host_path
+        (filter HostPath (fun (h : HostPath) => control_script_path (host_path h))
+          host_bound_paths));
+
+
+def control_removed_script_paths : List String :=
+    map HostPath String host_path
+      (filter HostPath
+        (fun (h : HostPath) =>
+          andb (control_script_path (host_path h))
+            (str_eq (host_kind h) "remove"))
+        host_bound_paths);
+
+
+def control_keep_existing_path (root : String) (paths : List String)
+    (path : String) : IO (List String) :=
+    do let! present := fs_exists (repo_join root path);
+       match present with
+       | True => io_pure (List String) (snoc String paths path)
+       | False => io_pure (List String) paths
+       end
+
+
+def control_tracked_script_paths (root : String) : IO (Pair Bool (List String)) :=
+    do let! r := proc_exec "git"
+         ([ "-C", root, "ls-files", "--cached", "--others", "--exclude-standard" ] : List String);
+       match proc_ok r with
+       | False => io_pure (Pair Bool (List String))
+           (MkPair Bool (List String) False (Nil String))
+       | True =>
+           let candidates : List String :=
+             filter String control_script_path (str_lines (proc_stdout r)) in
+           do let! visible := io_fold String (List String)
+                (control_keep_existing_path root) (Nil String) candidates;
+              io_pure (Pair Bool (List String))
+                (MkPair Bool (List String) True (str_sort visible))
+       end
+
+
+def control_paths_missing_from (expected : List String) (actual : List String) : List String :=
+    filter String
+      (fun (path : String) => notb (elem String str_eq path actual))
+      expected;
+
+
+def control_duplicate_paths_go (initial_previous : Maybe String) (initial_paths : List String)
+    : List String :=
+  (fix scan (paths : List String) (previous : Maybe String) : List String :=
+    match paths with
+    | Nil => Nil String
+    | Cons path rest =>
+        let tail : List String := scan rest (Just String path) in
+        match previous with
+        | Nothing => tail
+        | Just value =>
+            match str_eq value path with
+            | True => Cons String path tail
+            | False => tail
+            end
+        end
+    end) initial_paths initial_previous;
+
+
+def control_duplicate_paths (paths : List String) : List String :=
+    control_duplicate_paths_go (Nothing String) (str_sort paths);
+
+
+def control_path_list_issues (message : String) (paths : List String)
+    (issues : List GateIssue) : List GateIssue :=
+  foldl String (List GateIssue)
+    (fun (acc : List GateIssue) (path : String) => issue_add message path acc)
+    issues paths;
+
+
+def control_inventory_coverage_issues (tracked_ok : Bool) (tracked : List String)
+    (inventory : List String) (issues : List GateIssue) : List GateIssue :=
+    let issues0 : List GateIssue :=
+      match tracked_ok with
+      | True => issues
+      | False => issue_add "unable to enumerate repository-visible scripts with git ls-files"
+          "tools/ci_gate/host_inventory.ouro" issues
+      end in
+    let missing : List String := control_paths_missing_from tracked inventory in
+    let stale : List String := control_paths_missing_from inventory tracked in
+    let duplicates : List String := control_duplicate_paths inventory in
+    control_path_list_issues "duplicate Python/shell inventory row" duplicates
+      (control_path_list_issues "inventory row is not a tracked Python/shell path" stale
+        (control_path_list_issues "tracked Python/shell path is missing from inventory" missing issues0));
+
+
+def control_inventory_coverage_selftests_check : IO GateCheck :=
+    let exact : List GateIssue :=
+      control_inventory_coverage_issues True
+        ([ "scripts/a.py", "scripts/b.sh" ] : List String)
+        ([ "scripts/a.py", "scripts/b.sh" ] : List String)
+        (Nil GateIssue) in
+    let missing : List GateIssue :=
+      control_inventory_coverage_issues True
+        ([ "scripts/a.py", "scripts/b.sh" ] : List String)
+        ([ "scripts/a.py" ] : List String)
+        (Nil GateIssue) in
+    let stale : List GateIssue :=
+      control_inventory_coverage_issues True
+        ([ "scripts/a.py" ] : List String)
+        ([ "scripts/a.py", "scripts/b.sh" ] : List String)
+        (Nil GateIssue) in
+    let duplicate : List GateIssue :=
+      control_inventory_coverage_issues True
+        ([ "scripts/a.py" ] : List String)
+        ([ "scripts/a.py", "scripts/a.py" ] : List String)
+        (Nil GateIssue) in
+    let unavailable : List GateIssue :=
+      control_inventory_coverage_issues False
+        (Nil String) (Nil String) (Nil GateIssue) in
+    let self_only_evidence : Bool :=
+      control_has_independent_evidence
+        (host_script "scripts/a.py" "selftest" "host capability"
+          ([ "scripts/a.py" ] : List String)) in
+    let independent_evidence : Bool :=
+      control_has_independent_evidence
+        (host_script "scripts/a.py" "selftest" "host capability"
+          ([ "scripts/a.py", "docs/a.md" ] : List String)) in
+    let issues0 : List GateIssue :=
+      match nullb GateIssue exact with
+      | True => Nil GateIssue
+      | False => [ gate_issue "coverage self-test rejected exact inventory" "selftest" ]
+      end in
+    let issues1 : List GateIssue :=
+      match nullb GateIssue missing with
+      | False => issues0
+      | True => issue_add "coverage self-test accepted missing tracked script" "selftest" issues0
+      end in
+    let issues2 : List GateIssue :=
+      match nullb GateIssue stale with
+      | False => issues1
+      | True => issue_add "coverage self-test accepted stale inventory row" "selftest" issues1
+      end in
+    let issues3 : List GateIssue :=
+      match nullb GateIssue duplicate with
+      | False => issues2
+      | True => issue_add "coverage self-test accepted duplicate inventory row" "selftest" issues2
+      end in
+    let issues4 : List GateIssue :=
+      match nullb GateIssue unavailable with
+      | False => issues3
+      | True => issue_add "coverage self-test accepted unavailable git inventory" "selftest" issues3
+      end in
+    let issues5 : List GateIssue :=
+      match self_only_evidence with
+      | False => issues4
+      | True => issue_add "coverage self-test accepted self-only evidence" "selftest" issues4
+      end in
+    let issues6 : List GateIssue :=
+      match independent_evidence with
+      | True => issues5
+      | False => issue_add "coverage self-test rejected independent evidence" "selftest" issues5
+      end in
+    io_pure GateCheck (gate_check "script-inventory-coverage-selftests" issues6);
+
+
+def control_plane_inventory_check (root : String) : IO GateCheck :=
+    do let! tracked_result := control_tracked_script_paths root;
+       match tracked_result with
+       | MkPair tracked_ok tracked =>
+           let coverage_issues0 : List GateIssue :=
+             control_inventory_coverage_issues tracked_ok tracked
+               control_inventory_script_paths (Nil GateIssue) in
+           let coverage_issues : List GateIssue :=
+             control_path_list_issues "duplicate Python/shell inventory row"
+               (control_duplicate_paths control_inventory_all_script_paths)
+               coverage_issues0 in
+           do let! issues := control_rows_issues root host_bound_paths coverage_issues;
+              io_pure GateCheck
+                (gate_check_metrics "control-plane-inventory-consistency"
+                  ([ nat_metric "host_bound_paths" (length HostPath host_bound_paths)
+                  , nat_metric "tracked_scripts" (length String tracked)
+                  , nat_metric "inventoried_scripts"
+                      (length String control_inventory_script_paths)
+                  , nat_metric "removed_scripts" (length String control_removed_script_paths)
+                  ] : List GateMetric) issues)
+       end
+
+
+def run_docs_parity_checks (root : String) : IO (List GateCheck) :=
+    do let! inventory := parity_markdown_inventory_check root;
+       io_pure (List GateCheck) ([ inventory ] : List GateCheck)
+
+
+def run_project_parity_checks (root : String) : IO (List GateCheck) :=
+    do let! versions := parity_version_check root;
+       io_pure (List GateCheck) ([ versions ] : List GateCheck)
+
+
+def run_workflow_parity_checks (root : String) : IO (List GateCheck) :=
+    do let! selftests := parity_workflow_self_tests_check root;
+       io_pure (List GateCheck) ([ selftests ] : List GateCheck)
+
+
+def run_control_plane_parity_checks (root : String) : IO (List GateCheck) :=
+    do let! docs := run_docs_parity_checks root;
+       let! project := run_project_parity_checks root;
+       let! workflow := run_workflow_parity_checks root;
+       let! coverage_selftests := control_inventory_coverage_selftests_check;
+       let! inventory := control_plane_inventory_check root;
+       io_pure (List GateCheck)
+         (append GateCheck docs
+           (append GateCheck project
+             (append GateCheck workflow
+               ([ coverage_selftests, inventory ] : List GateCheck))))
+
+
+def control_pending_migration_issues (rows : List HostPath)
+    (issues : List GateIssue) : List GateIssue :=
+  foldl HostPath (List GateIssue)
+    (fun (acc : List GateIssue) (h : HostPath) =>
+      match str_eq (host_kind h) "migrate" with
+      | True => issue_add "migration_status=migrate is not allowed in retirement"
+          (host_path h) acc
+      | False => acc
+      end)
+    issues rows;
+
+
+def control_no_pending_migrations_check : IO GateCheck :=
+    io_pure GateCheck
+      (gate_check "control-plane-no-pending-migrations"
+        (control_pending_migration_issues host_bound_paths (Nil GateIssue)));
+
+
+def run_retirement_parity_checks (root : String) : IO (List GateCheck) :=
+    do let! base := run_control_plane_parity_checks root;
+       let! pending := control_no_pending_migrations_check;
+       io_pure (List GateCheck)
+         (append GateCheck base ([ pending ] : List GateCheck))
+
+
+def run_repo_parity_checks (root : String) : IO (List GateCheck) :=
+    do let! docs := run_docs_parity_checks root;
+       let! project := run_project_parity_checks root;
+       let! workflow := run_workflow_parity_checks root;
+       io_pure (List GateCheck) (append GateCheck docs (append GateCheck project workflow))
+
+def run_profile_extra_checks (profile : String) (root : String) : IO (List GateCheck) :=
+    match str_eq profile "retirement" with
+    | True => run_retirement_parity_checks root
+    | False =>
+        match gate_profile profile with
+        | GpDocs => run_docs_parity_checks root
+        | GpProject => run_project_parity_checks root
+        | GpWorkflow => run_workflow_parity_checks root
+        | GpFixture => io_pure (List GateCheck) (Nil GateCheck)
+        | GpControlPlane => run_control_plane_parity_checks root
+        | GpCompilerBoundary => io_pure (List GateCheck) []
+        | GpRepo => run_repo_parity_checks root
+        end
+    end;
+
+
+def docs_parity_check_names : List String := [ "markdown-inventory-parity" ];
+
+
+def project_parity_check_names : List String := [ "version-baseline-parity" ];
+
+
+def workflow_parity_check_names : List String := [ "workflow-policy-selftests" ];
+
+
+def control_plane_parity_check_names : List String :=
+    append String docs_parity_check_names
+      (append String project_parity_check_names
+        (append String workflow_parity_check_names
+          ([ "script-inventory-coverage-selftests"
+          , "control-plane-inventory-consistency"
+          ] : List String)));
+
+
+def retirement_parity_check_names : List String :=
+    append String control_plane_parity_check_names
+      ([ "control-plane-no-pending-migrations" ] : List String);
+
+
+def repo_parity_check_names : List String :=
+    append String docs_parity_check_names
+      (append String project_parity_check_names workflow_parity_check_names);
+
+def profile_extra_check_names (profile : String) : List String :=
+    match str_eq profile "retirement" with
+    | True => retirement_parity_check_names
+    | False =>
+        match gate_profile profile with
+        | GpDocs => docs_parity_check_names
+        | GpProject => project_parity_check_names
+        | GpWorkflow => workflow_parity_check_names
+        | GpFixture => Nil String
+        | GpControlPlane => control_plane_parity_check_names
+        | GpCompilerBoundary => []
+        | GpRepo => repo_parity_check_names
+        end
+    end;

@@ -1,0 +1,206 @@
+-- Residual hardening checks that should stay small and fail-closed.
+
+import "paths.ouro";
+import "report.ouro";
+import "../ci_gate/host_inventory.ouro";
+import "../../std/pathx.ouro";
+import "../../std/stringx.ouro";
+
+
+def repo_gate_known_profiles : List String :=
+    [ "docs"
+    , "docs-native"
+    , "project"
+    , "project-native"
+    , "workflow"
+    , "workflow-native"
+    , "repo"
+    , "repo-native"
+    , "pr-native"
+    , "control-plane"
+    , "control-plane-native"
+    , "retirement"
+    , "fixture"
+    , "compiler-boundary"
+    ];
+
+
+def repo_gate_profile_known (profile : String) : Bool :=
+    elem String str_eq profile repo_gate_known_profiles;
+
+
+def hardening_issue_add (reason : String) (path : String)
+    (issues : List GateIssue) : List GateIssue :=
+    snoc GateIssue issues (gate_issue reason path);
+
+
+def hardening_nat_metric (name : String) (value : Nat) : GateMetric :=
+    gate_metric name (show_nat value);
+
+
+def hardening_path_target (value : String) : String :=
+    path_normalize (path_from_host (str_trim (str_before value "#")));
+
+
+def hardening_path_escapes_repo (target : String) : Bool :=
+    orb (path_is_abs target)
+      (orb (str_eq target "..") (str_starts target "../"));
+
+
+def hardening_escape_is_pathlike (target : String) : Bool :=
+    orb (repo_pathish target) (str_eq target "..");
+
+
+def hardening_path_safety_issues (owner : String) (label : String)
+    (value : String) (issues : List GateIssue) : List GateIssue :=
+    let target : String := hardening_path_target value in
+    match andb (hardening_path_escapes_repo target)
+          (hardening_escape_is_pathlike target) with
+    | False => issues
+    | True =>
+        hardening_issue_add
+          (str_concat (str_concat label " escapes repository: ") target)
+          owner issues
+    end;
+
+
+def hardening_evidence_path_issues (owner : String) (evidence : List String)
+    (issues : List GateIssue) : List GateIssue :=
+  foldl String (List GateIssue)
+    (fun (acc : List GateIssue) (item : String) =>
+      hardening_path_safety_issues owner "evidence path" item acc)
+    issues evidence;
+
+
+def hardening_replacement_issues (h : HostPath) (issues : List GateIssue)
+    : List GateIssue :=
+    match host_replacement h with
+    | Nothing => issues
+    | Just replacement =>
+        hardening_path_safety_issues (host_path h) "native replacement"
+          replacement issues
+    end;
+
+
+def hardening_row_issues (h : HostPath) (issues : List GateIssue)
+    : List GateIssue :=
+    let issues0 : List GateIssue :=
+      hardening_path_safety_issues (host_path h) "inventory path"
+        (host_path h) issues in
+    let issues1 : List GateIssue := hardening_replacement_issues h issues0 in
+    hardening_evidence_path_issues (host_path h) (host_evidence h) issues1;
+
+
+def hardening_inventory_path_safety_issues : List GateIssue :=
+  foldl HostPath (List GateIssue)
+    (fun (acc : List GateIssue) (h : HostPath) => hardening_row_issues h acc)
+    (Nil GateIssue) host_bound_paths;
+
+
+def hardening_inventory_path_safety_check : GateCheck :=
+    MkGateCheck "control-plane-path-safety" True
+      ([ hardening_nat_metric "host_bound_paths" (length HostPath host_bound_paths)
+      ] : List GateMetric)
+      hardening_inventory_path_safety_issues;
+
+
+def hardening_expect_true (name : String) (actual : Bool)
+    (issues : List GateIssue) : List GateIssue :=
+    match actual with
+    | True => issues
+    | False => hardening_issue_add (str_concat "self-test failed: " name) "selftest" issues
+    end;
+
+
+def hardening_expect_false (name : String) (actual : Bool)
+    (issues : List GateIssue) : List GateIssue :=
+    match actual with
+    | False => issues
+    | True => hardening_issue_add (str_concat "self-test failed: " name) "selftest" issues
+    end;
+
+
+def hardening_expect_no_issues (name : String) (found : List GateIssue)
+    (issues : List GateIssue) : List GateIssue :=
+    match nullb GateIssue found with
+    | True => issues
+    | False => hardening_issue_add (str_concat "self-test failed: " name) "selftest" issues
+    end;
+
+
+def hardening_expect_some_issues (name : String) (found : List GateIssue)
+    (issues : List GateIssue) : List GateIssue :=
+    match nullb GateIssue found with
+    | False => issues
+    | True => hardening_issue_add (str_concat "self-test failed: " name) "selftest" issues
+    end;
+
+
+def hardening_profile_selection_selftests_check : GateCheck :=
+    let issues0 : List GateIssue :=
+      hardening_expect_true "known profile accepted"
+        (repo_gate_profile_known "docs-native") (Nil GateIssue) in
+    let issues1 : List GateIssue :=
+      hardening_expect_true "canonical profile accepted"
+        (repo_gate_profile_known "control-plane") issues0 in
+    let issues2 : List GateIssue :=
+      hardening_expect_false "unknown profile rejected"
+        (repo_gate_profile_known "definitely-unknown") issues1 in
+    MkGateCheck "profile-selection-selftests" True (Nil GateMetric) issues2;
+
+
+def hardening_path_safety_selftests_check : GateCheck :=
+    let good : List GateIssue :=
+      hardening_path_safety_issues "selftest" "native replacement"
+        "tools/repo_gate/main.ouro#docs-native" (Nil GateIssue) in
+    let upward : List GateIssue :=
+      hardening_path_safety_issues "selftest" "native replacement"
+        "../outside.md" (Nil GateIssue) in
+    let exact_parent : List GateIssue :=
+      hardening_path_safety_issues "selftest" "evidence path"
+        ".." (Nil GateIssue) in
+    let nested : List GateIssue :=
+      hardening_path_safety_issues "selftest" "evidence path"
+        "scripts/../../outside.py" (Nil GateIssue) in
+    let absolute : List GateIssue :=
+      hardening_path_safety_issues "selftest" "inventory path"
+        "C:\\outside\\tool.py" (Nil GateIssue) in
+    let issues0 : List GateIssue :=
+      hardening_expect_no_issues "safe relative path accepted" good (Nil GateIssue) in
+    let issues1 : List GateIssue :=
+      hardening_expect_some_issues "parent path rejected" upward issues0 in
+    let issues2 : List GateIssue :=
+      hardening_expect_some_issues "exact parent path rejected" exact_parent issues1 in
+    let issues3 : List GateIssue :=
+      hardening_expect_some_issues "normalized parent escape rejected" nested issues2 in
+    let issues4 : List GateIssue :=
+      hardening_expect_some_issues "Windows absolute path rejected" absolute issues3 in
+    MkGateCheck "path-safety-selftests" True (Nil GateMetric) issues4;
+
+
+def hardening_profile_enabled (profile : String) : Bool :=
+    orb (str_eq profile "control-plane") (str_eq profile "retirement");
+
+
+def hardening_extra_check_names (profile : String) : List String :=
+    match hardening_profile_enabled profile with
+    | True =>
+        [ "profile-selection-selftests"
+        , "path-safety-selftests"
+        , "control-plane-path-safety"
+        ]
+    | False => Nil String
+    end;
+
+
+def run_hardening_extra_checks (profile : String) (_root : String)
+    : IO (List GateCheck) :=
+    match hardening_profile_enabled profile with
+    | True =>
+        io_pure (List GateCheck)
+          ([ hardening_profile_selection_selftests_check
+          , hardening_path_safety_selftests_check
+          , hardening_inventory_path_safety_check
+          ] : List GateCheck)
+    | False => io_pure (List GateCheck) (Nil GateCheck)
+    end;

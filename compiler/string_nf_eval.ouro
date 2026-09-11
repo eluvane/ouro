@@ -1,0 +1,221 @@
+-- Reduction dispatch is restricted to previously checked String bindings.
+-- Ordinary axioms and every machine/Runtime/extern operation remain neutral.
+import "string_nf_values.ouro";
+import "file_check_model.ouro";
+import "primitive_contracts.ouro";
+
+def string_nf_operation (id : PrimitiveId) : Maybe PrimitiveStringOp :=
+    (fix find (operations : List PrimitiveStringOp) : Maybe PrimitiveStringOp :=
+      match operations with
+      | Nil => Nothing PrimitiveStringOp
+      | Cons operation rest => match primitive_id_equal id (PrimitiveStringOperation operation) with
+          | True => Just PrimitiveStringOp operation | False => find rest
+          end
+      end) primitive_string_ops;
+
+def string_nf_binding (name : Nat) : List Entry -> Maybe PrimitiveStringOp :=
+  fix find (entries : List Entry) : Maybe PrimitiveStringOp :=
+    match entries with
+    | Nil => Nothing PrimitiveStringOp
+    | Cons entry rest => match entry with
+        | MkEntry current _ _ => match eqNat current name with
+            | True => Nothing PrimitiveStringOp | False => find rest end
+        | MkIndEntry current _ => match eqNat current name with
+            | True => Nothing PrimitiveStringOp | False => find rest end
+        | MkRoleEntry _ => find rest
+        | MkBoundEntry current _ binding => match eqNat current name with
+            | False => find rest
+            | True => match binding with
+                | PrimitiveExternBinding _ => Nothing PrimitiveStringOp
+                | PrimitiveIntrinsicBinding id _ _ _ => string_nf_operation id
+                end
+            end
+        end
+    end;
+
+-- Input kinds: bytes, checked Nat constructors, or a checked List Nat.
+def string_nf_input_kinds (operation : PrimitiveStringOp) : List Nat :=
+    match operation with
+    | PrimitiveStringConcat => ([0, 0] : List Nat)
+    | PrimitiveStringLength => ([0] : List Nat)
+    | PrimitiveStringByteAt => ([0, 1] : List Nat)
+    | PrimitiveStringSlice => ([0, 1, 1] : List Nat)
+    | PrimitiveStringEqual => ([0, 0] : List Nat)
+    | PrimitiveStringOfNat => ([1] : List Nat)
+    | PrimitiveStringToCodes => ([0] : List Nat)
+    | PrimitiveStringOfCodes => ([2] : List Nat)
+    | PrimitiveStringStarts => ([0, 0] : List Nat)
+    | PrimitiveStringEnds => ([0, 0] : List Nat)
+    | PrimitiveStringContains => ([0, 0] : List Nat)
+    | PrimitiveStringIndex => ([0, 0] : List Nat)
+    | PrimitiveStringSplit => ([0, 1] : List Nat)
+    | PrimitiveStringReplace => ([0, 0, 0] : List Nat)
+    | PrimitiveStringLessEqual => ([0, 0] : List Nat)
+    | PrimitiveStringTokens => ([0] : List Nat)
+    end;
+
+inductive StringNFInput : Type :=
+  | StringNFBytes : List Nat -> StringNFInput
+  | StringNFNumber : Nat -> StringNFInput;
+
+def string_nf_decode (reduce : CoreTerm -> NormalizeResult CoreTerm) (fuel : Nat)
+    (entries : List Entry) (kind : Nat) (term : CoreTerm) : NormalizeResult (Maybe StringNFInput) :=
+    match kind with
+    | Z => string_value_map (Maybe (List Nat)) (Maybe StringNFInput)
+        (fun (value : Maybe (List Nat)) => mapMaybe (List Nat) StringNFInput
+          (fun (bytes : List Nat) => StringNFBytes bytes) value)
+        (string_value_bytes reduce term)
+    | S previous => normalize_bind Nat (Maybe StringNFInput)
+        (string_value_required (string_value_role PrimitiveNatRole entries))
+        (fun (nat_family : Nat) => match previous with
+          | Z => string_value_map (Maybe Nat) (Maybe StringNFInput)
+              (fun (value : Maybe Nat) => mapMaybe Nat StringNFInput
+                (fun (number : Nat) => StringNFNumber number) value)
+              (string_value_nat reduce nat_family fuel term)
+          | S _ => normalize_bind Nat (Maybe StringNFInput)
+              (string_value_required (string_value_role PrimitiveListRole entries))
+              (fun (list_family : Nat) => string_value_map (Maybe (List Nat)) (Maybe StringNFInput)
+                (fun (value : Maybe (List Nat)) => mapMaybe (List Nat) StringNFInput
+                  (fun (bytes : List Nat) => StringNFBytes bytes) value)
+                (string_value_codes reduce nat_family list_family fuel term))
+          end)
+    end;
+
+def string_nf_decode_args (reduce : CoreTerm -> NormalizeResult CoreTerm) (entries : List Entry)
+    : Nat -> List Nat -> List CoreTerm -> NormalizeResult (Maybe (List StringNFInput)) :=
+  fix decode (fuel : Nat) (kinds : List Nat) (terms : List CoreTerm)
+      : NormalizeResult (Maybe (List StringNFInput)) :=
+    match fuel with
+    | Z => NormalizeExhausted (Maybe (List StringNFInput))
+    | S next => match kinds, terms with
+        | Nil, Nil => Normalized (Maybe (List StringNFInput)) (Just (List StringNFInput) ([] : List StringNFInput))
+        | Nil, Cons _ _ => NormalizeMalformed (Maybe (List StringNFInput)) NormalizeStringArguments
+        | Cons _ _, Nil => Normalized (Maybe (List StringNFInput)) (Nothing (List StringNFInput))
+        | Cons kind rest, Cons term more => normalize_bind (Maybe StringNFInput) (Maybe (List StringNFInput))
+            (string_nf_decode reduce next entries kind term)
+            (fun (value : Maybe StringNFInput) => match value with
+              | Nothing => Normalized (Maybe (List StringNFInput)) (Nothing (List StringNFInput))
+              | Just head => string_value_map (Maybe (List StringNFInput)) (Maybe (List StringNFInput))
+                  (fun (tail : Maybe (List StringNFInput)) =>
+                    mapMaybe (List StringNFInput) (List StringNFInput)
+                      (fun (values : List StringNFInput) => Cons StringNFInput head values) tail)
+                  (decode next rest more)
+              end)
+        end
+    end;
+
+def string_nf_bytes_arg (index : Nat) (values : List StringNFInput) : NormalizeResult (List Nat) :=
+    match compiler_nth StringNFInput values index with
+    | Nothing => NormalizeMalformed (List Nat) NormalizeStringArguments
+    | Just value => match value with
+        | StringNFBytes bytes => Normalized (List Nat) bytes
+        | StringNFNumber _ => NormalizeMalformed (List Nat) NormalizeStringArguments
+        end
+    end;
+
+def string_nf_nat_arg (index : Nat) (values : List StringNFInput) : NormalizeResult Nat :=
+    match compiler_nth StringNFInput values index with
+    | Nothing => NormalizeMalformed Nat NormalizeStringArguments
+    | Just value => match value with
+        | StringNFBytes _ => NormalizeMalformed Nat NormalizeStringArguments
+        | StringNFNumber number => Normalized Nat number
+        end
+    end;
+
+def string_nf_evaluate (fuel : Nat) (entries : List Entry) (operation : PrimitiveStringOp)
+    (values : List StringNFInput) : NormalizeResult CoreTerm :=
+    match operation with
+    | PrimitiveStringConcat => normalize_bind (List Nat) CoreTerm (string_nf_bytes_arg 0 values)
+      (fun (a0 : (List Nat)) => normalize_bind (List Nat) CoreTerm (string_nf_bytes_arg 1 values)
+        (fun (a1 : (List Nat)) => string_value_pack_bytes entries (string_nf_concat fuel a0 a1)))
+    | PrimitiveStringLength => normalize_bind (List Nat) CoreTerm (string_nf_bytes_arg 0 values)
+      (fun (a0 : (List Nat)) => string_value_pack_nat fuel entries (string_nf_length fuel a0))
+    | PrimitiveStringByteAt => normalize_bind (List Nat) CoreTerm (string_nf_bytes_arg 0 values)
+      (fun (a0 : (List Nat)) => normalize_bind Nat CoreTerm (string_nf_nat_arg 1 values)
+        (fun (a1 : Nat) => string_value_pack_nat fuel entries (string_nf_byte_at fuel a0 a1)))
+    | PrimitiveStringSlice => normalize_bind (List Nat) CoreTerm (string_nf_bytes_arg 0 values)
+      (fun (a0 : (List Nat)) => normalize_bind Nat CoreTerm (string_nf_nat_arg 1 values)
+        (fun (a1 : Nat) => normalize_bind Nat CoreTerm (string_nf_nat_arg 2 values)
+          (fun (a2 : Nat) => string_value_pack_bytes entries (string_nf_slice fuel a0 a1 a2))))
+    | PrimitiveStringEqual => normalize_bind (List Nat) CoreTerm (string_nf_bytes_arg 0 values)
+      (fun (a0 : (List Nat)) => normalize_bind (List Nat) CoreTerm (string_nf_bytes_arg 1 values)
+        (fun (a1 : (List Nat)) => string_value_pack_bool entries (string_nf_equal fuel a0 a1)))
+    | PrimitiveStringOfNat => normalize_bind Nat CoreTerm (string_nf_nat_arg 0 values)
+      (fun (a0 : Nat) => string_value_pack_bytes entries (string_nf_decimal_bytes fuel a0))
+    | PrimitiveStringToCodes => normalize_bind (List Nat) CoreTerm (string_nf_bytes_arg 0 values)
+      (fun (a0 : (List Nat)) => string_value_pack_codes fuel entries (string_nf_to_codes fuel a0))
+    | PrimitiveStringOfCodes => normalize_bind (List Nat) CoreTerm (string_nf_bytes_arg 0 values)
+      (fun (a0 : (List Nat)) => string_value_pack_bytes entries (string_nf_of_codes fuel a0))
+    | PrimitiveStringStarts => normalize_bind (List Nat) CoreTerm (string_nf_bytes_arg 0 values)
+      (fun (a0 : (List Nat)) => normalize_bind (List Nat) CoreTerm (string_nf_bytes_arg 1 values)
+        (fun (a1 : (List Nat)) => string_value_pack_bool entries (string_nf_starts fuel a0 a1)))
+    | PrimitiveStringEnds => normalize_bind (List Nat) CoreTerm (string_nf_bytes_arg 0 values)
+      (fun (a0 : (List Nat)) => normalize_bind (List Nat) CoreTerm (string_nf_bytes_arg 1 values)
+        (fun (a1 : (List Nat)) => string_value_pack_bool entries (string_nf_ends fuel a0 a1)))
+    | PrimitiveStringContains => normalize_bind (List Nat) CoreTerm (string_nf_bytes_arg 0 values)
+      (fun (a0 : (List Nat)) => normalize_bind (List Nat) CoreTerm (string_nf_bytes_arg 1 values)
+        (fun (a1 : (List Nat)) => string_value_pack_bool entries (string_nf_contains fuel a0 a1)))
+    | PrimitiveStringIndex => normalize_bind (List Nat) CoreTerm (string_nf_bytes_arg 0 values)
+      (fun (a0 : (List Nat)) => normalize_bind (List Nat) CoreTerm (string_nf_bytes_arg 1 values)
+        (fun (a1 : (List Nat)) => string_value_pack_index fuel entries (string_nf_index fuel a0 a1)))
+    | PrimitiveStringSplit => normalize_bind (List Nat) CoreTerm (string_nf_bytes_arg 0 values)
+      (fun (a0 : (List Nat)) => normalize_bind Nat CoreTerm (string_nf_nat_arg 1 values)
+        (fun (a1 : Nat) => string_value_pack_strings fuel entries (string_nf_split fuel a0 a1)))
+    | PrimitiveStringReplace => normalize_bind (List Nat) CoreTerm (string_nf_bytes_arg 0 values)
+      (fun (a0 : (List Nat)) => normalize_bind (List Nat) CoreTerm (string_nf_bytes_arg 1 values)
+        (fun (a1 : (List Nat)) => normalize_bind (List Nat) CoreTerm (string_nf_bytes_arg 2 values)
+          (fun (a2 : (List Nat)) => string_value_pack_bytes entries (string_nf_replace fuel a0 a1 a2))))
+    | PrimitiveStringLessEqual => normalize_bind (List Nat) CoreTerm (string_nf_bytes_arg 0 values)
+      (fun (a0 : (List Nat)) => normalize_bind (List Nat) CoreTerm (string_nf_bytes_arg 1 values)
+        (fun (a1 : (List Nat)) => string_value_pack_bool entries (string_nf_less_equal fuel a0 a1)))
+    | PrimitiveStringTokens => normalize_bind (List Nat) CoreTerm (string_nf_bytes_arg 0 values)
+      (fun (a0 : (List Nat)) => string_value_pack_strings fuel entries (string_nf_tokens fuel a0))
+    end;
+
+def string_nf_apply (reduce : CoreTerm -> NormalizeResult CoreTerm) (fuel : Nat)
+    (entries : List Entry) (name : Nat) (arguments : List CoreTerm)
+    : NormalizeResult (Maybe CoreTerm) :=
+    match string_nf_binding name entries with
+    | Nothing => Normalized (Maybe CoreTerm) (Nothing CoreTerm)
+    | Just operation =>
+        let kinds : List Nat := string_nf_input_kinds operation in
+        match eqNat (length Nat kinds) (length CoreTerm arguments) with
+        | False => Normalized (Maybe CoreTerm) (Nothing CoreTerm)
+        | True => normalize_bind (Maybe (List StringNFInput)) (Maybe CoreTerm)
+            (string_nf_decode_args reduce entries fuel kinds arguments)
+            (fun (decoded : Maybe (List StringNFInput)) => match decoded with
+              | Nothing => Normalized (Maybe CoreTerm) (Nothing CoreTerm)
+              | Just values => string_value_map CoreTerm (Maybe CoreTerm)
+                  (fun (value : CoreTerm) => Just CoreTerm value)
+                  (string_nf_evaluate fuel entries operation values)
+              end)
+        end
+    end;
+
+def normalize_string_application (reduce : CoreTerm -> NormalizeResult CoreTerm)
+    (fuel : Nat) (entries : List Entry) (head : CoreTerm) (arguments : List CoreTerm)
+    (argument : CoreTerm)
+    : NormalizeResult (Maybe CoreTerm) :=
+    match head with
+    | CConst name => match string_nf_binding name entries with
+        | Nothing => Normalized (Maybe CoreTerm) (Nothing CoreTerm)
+        | Just operation => match eqNat
+            (length Nat (string_nf_input_kinds operation)) (S (length CoreTerm arguments)) with
+            | False => Normalized (Maybe CoreTerm) (Nothing CoreTerm)
+            | True => string_nf_apply reduce fuel entries name
+                (append CoreTerm arguments ([argument] : List CoreTerm))
+            end
+        end
+    | CRel _ => Normalized (Maybe CoreTerm) (Nothing CoreTerm)
+    | CSort _ => Normalized (Maybe CoreTerm) (Nothing CoreTerm)
+    | CPi _ _ => Normalized (Maybe CoreTerm) (Nothing CoreTerm)
+    | CLam _ _ => Normalized (Maybe CoreTerm) (Nothing CoreTerm)
+    | CApp _ _ => Normalized (Maybe CoreTerm) (Nothing CoreTerm)
+    | CLetIn _ _ _ => Normalized (Maybe CoreTerm) (Nothing CoreTerm)
+    | CInd _ => Normalized (Maybe CoreTerm) (Nothing CoreTerm)
+    | CConstruct _ _ _ => Normalized (Maybe CoreTerm) (Nothing CoreTerm)
+    | CCase _ _ _ _ => Normalized (Maybe CoreTerm) (Nothing CoreTerm)
+    | CFix _ _ _ _ _ => Normalized (Maybe CoreTerm) (Nothing CoreTerm)
+    | CStrLit _ _ => Normalized (Maybe CoreTerm) (Nothing CoreTerm)
+    | CStrBytes _ _ => Normalized (Maybe CoreTerm) (Nothing CoreTerm)
+    end;

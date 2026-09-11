@@ -1,0 +1,203 @@
+-- Bounded, pure Nat constants and local Maybe values. A Maybe has no scalar
+-- ABI here: only its known constructor is eliminated, with its exact payload.
+import "lower_loop.ouro";
+
+def lower_role_identity (entries : List Entry) (role : PrimitiveRole) : Either NativeLowerError Nat :=
+    lower_bind CoreTerm Nat
+      (lower_from_primitive CoreTerm (CSort 0) (primitive_role_ref role (primitive_roles_environment entries)))
+      (fun (typ : CoreTerm) => match primitive_shape typ with
+        | PrimitiveShapeAtom tag id => lower_map Unit Nat (fun (_ : Unit) => id)
+            (lower_require (eqNat tag 3) (LowerUnsupportedType typ))
+        | PrimitiveShapePair _ _ _ => Left NativeLowerError Nat (LowerUnsupportedType typ)
+        | PrimitiveShapeOther => Left NativeLowerError Nat (LowerUnsupportedType typ) end);
+
+def lower_nat_increment32 (word : X64Word32) : Pair X64Word32 Bool :=
+    match word with | X64Bytes32 a b c d =>
+      match ltb_nat a 255 with | True => MkPair X64Word32 Bool (X64Bytes32 (S a) b c d) False
+      | False => match ltb_nat b 255 with | True => MkPair X64Word32 Bool (X64Bytes32 0 (S b) c d) False
+        | False => match ltb_nat c 255 with | True => MkPair X64Word32 Bool (X64Bytes32 0 0 (S c) d) False
+          | False => match ltb_nat d 255 with | True => MkPair X64Word32 Bool (X64Bytes32 0 0 0 (S d)) False
+            | False => MkPair X64Word32 Bool (X64Bytes32 0 0 0 0) True end end end end end;
+
+def lower_nat_increment (value : LowerNatValue) : LowerNatValue :=
+    match value with | LowerNatBits bits overflow => match bits with | X64Words64 low high =>
+      match lower_nat_increment32 low with | MkPair after carry => match carry with
+        | False => LowerNatBits (X64Words64 after high) overflow
+        | True => match lower_nat_increment32 high with | MkPair upper wrapped =>
+            LowerNatBits (X64Words64 after upper) (orb overflow wrapped) end end end end end;
+
+def lower_nat_fits (word : PrimitiveWord) (value : LowerNatValue) : Bool :=
+    match value with | LowerNatBits bits overflow => andb (notb overflow)
+      (match x64_word64_bytes bits with | Left _ => False | Right _ =>
+        match bits with | X64Words64 low high => match low with | X64Bytes32 _ b c d =>
+          let upper_zero : Bool := match high with | X64Bytes32 e f g h =>
+            andb (eqNat e 0) (andb (eqNat f 0) (andb (eqNat g 0) (eqNat h 0))) end in
+          match word with
+          | PrimitiveWordU8 => andb upper_zero (andb (eqNat b 0) (andb (eqNat c 0) (eqNat d 0)))
+          | PrimitiveWordU32 => upper_zero | PrimitiveWordI32 => andb upper_zero (ltb_nat d 128)
+          | PrimitiveWordU64 => True | PrimitiveWordUSize => True end end end end) end;
+
+def lower_nat_word (word : PrimitiveWord) (value : LowerNatValue) : Maybe MirValue :=
+    match lower_nat_fits word value with | False => Nothing MirValue
+    | True => match value with | LowerNatBits bits _ => Just MirValue (MirBits (lower_word word) bits) end end;
+
+def lower_constant_whnf (fuel : Nat) (sig : CheckEnvironment) (term : CoreTerm) : Either NativeLowerError CoreTerm :=
+    lower_check CoreTerm 0 (check_from_normalize CoreTerm (whnf_checked_indexed fuel sig term));
+
+def lower_nat_local (fuel : Nat) (environment : List LowerBinding) (family : Nat) (id : Nat)
+    : Either NativeLowerError LowerNatValue :=
+    match compiler_nth LowerBinding environment id with
+    | Nothing => Left NativeLowerError LowerNatValue (LowerUnboundLocal id)
+    | Just binding => match binding with
+      | LowerNatBinding typ value => lower_map Unit LowerNatValue (fun (_ : Unit) => value)
+          (lower_core_equal fuel 0 typ (CInd family))
+      | LowerScalarBinding typ _ => Left NativeLowerError LowerNatValue (LowerUnsupportedType (lower_type_core typ))
+      | LowerActionBinding _ _ _ => Left NativeLowerError LowerNatValue LowerEffectMismatch
+      | LowerMaybeBinding typ _ _ => Left NativeLowerError LowerNatValue (LowerUnsupportedType typ) end end;
+
+def lower_nat_decode_indexed (sig : CheckEnvironment) (environment : List LowerBinding) (family : Nat)
+    : Nat -> CoreTerm -> Either NativeLowerError LowerNatValue :=
+  fix decode (fuel : Nat) (term : CoreTerm) : Either NativeLowerError LowerNatValue :=
+    match fuel with | Z => Left NativeLowerError LowerNatValue LowerResourceExhausted
+    | S next => lower_bind CoreTerm LowerNatValue (lower_constant_whnf next sig term) (fun (normal : CoreTerm) =>
+      lower_bind (Pair CoreTerm (List CoreTerm)) LowerNatValue (lower_spine next normal ([] : List CoreTerm))
+        (fun (spine : Pair CoreTerm (List CoreTerm)) => match spine with | MkPair head args =>
+          match lower_term_view head with
+          | LowerLocalTerm id => lower_bind Unit LowerNatValue
+              (lower_require (eqNat (length CoreTerm args) 0) (LowerInvalidCall id))
+              (fun (_ : Unit) => lower_nat_local next environment family id)
+          | LowerConstructorTerm actual index params => lower_bind Unit LowerNatValue
+              (lower_require (andb (eqNat actual family) (eqNat params 0)) (LowerUnsupportedTerm 8))
+              (fun (_ : Unit) => match index with
+                | Z => lower_map Unit LowerNatValue (fun (_ : Unit) => LowerNatBits lower_zero False)
+                    (lower_require (eqNat (length CoreTerm args) 0) (LowerInvalidCall 0))
+                | S previous => lower_bind Unit LowerNatValue
+                    (lower_require (eqNat previous 0) (LowerUnsupportedTerm 8))
+                    (fun (_ : Unit) => lower_bind CoreTerm LowerNatValue (lower_single CoreTerm args)
+                      (fun (argument : CoreTerm) => lower_map LowerNatValue LowerNatValue lower_nat_increment (decode next argument))) end)
+          | LowerGlobalTerm _ => Left NativeLowerError LowerNatValue (LowerUnsupportedTerm 6)
+          | LowerLambdaTerm _ _ => Left NativeLowerError LowerNatValue (LowerUnsupportedTerm 3)
+          | LowerApplyTerm _ _ => Left NativeLowerError LowerNatValue (LowerUnsupportedTerm 4)
+          | LowerLetTerm _ _ _ => Left NativeLowerError LowerNatValue (LowerUnsupportedTerm 5)
+          | LowerCaseTerm _ _ _ _ => Left NativeLowerError LowerNatValue (LowerUnsupportedTerm 9)
+          | LowerOtherTerm tag => Left NativeLowerError LowerNatValue (LowerUnsupportedTerm tag) end end)) end;
+
+def lower_nat_decode (entries : List Entry) (environment : List LowerBinding) (family : Nat)
+    (fuel : Nat) (term : CoreTerm) : Either NativeLowerError LowerNatValue :=
+    lower_nat_decode_indexed (check_environment_from_entries entries) environment family fuel term;
+
+inductive LowerMaybeResult : Type :=
+  | LowerMaybeOf : CoreTerm -> LowerType -> Maybe MirValue -> LowerState -> LowerMaybeResult;
+
+def lower_maybe_word_type (fuel : Nat) (sig : CheckEnvironment) (annotation : CoreTerm)
+    : Either NativeLowerError LowerType :=
+    lower_bind CoreTerm LowerType (lower_normalize fuel sig annotation) (fun (normal : CoreTerm) =>
+      lower_bind PrimitiveAbiValue LowerType
+        (lower_from_primitive PrimitiveAbiValue normal
+          (primitive_abi_value (primitive_check_budget fuel) (primitive_normalizer_indexed sig)
+            (primitive_environment (check_environment_entries sig)) (primitive_roles_environment (check_environment_entries sig)) normal))
+        (fun (abi : PrimitiveAbiValue) => match abi with
+          | PrimitiveAbiWord _ => lower_classify_type fuel sig normal
+          | PrimitiveAbiPointer _ => Left NativeLowerError LowerType (LowerUnsupportedType normal)
+          | PrimitiveAbiFunction _ => Left NativeLowerError LowerType (LowerUnsupportedType normal) end));
+
+def lower_from_nat (fuel : Nat) (sig : CheckEnvironment) (environment : List LowerBinding)
+    (family : Nat) (word : PrimitiveWord) (args : List CoreTerm) (state : LowerState)
+    : Either NativeLowerError LowerMaybeResult :=
+    lower_bind Nat LowerMaybeResult (lower_role_identity (check_environment_entries sig) PrimitiveNatRole) (fun (natural : Nat) =>
+      lower_bind CoreTerm LowerMaybeResult (lower_single CoreTerm args) (fun (argument : CoreTerm) =>
+        lower_bind LowerNatValue LowerMaybeResult (lower_nat_decode_indexed sig environment natural fuel argument)
+          (fun (value : LowerNatValue) => lower_map LowerType LowerMaybeResult
+            (fun (typ : LowerType) => LowerMaybeOf (CApp (CInd family) (lower_type_core typ)) typ (lower_nat_word word value) state)
+            (lower_word_type fuel sig word))));
+
+def lower_maybe_intrinsic (fuel : Nat) (sig : CheckEnvironment) (environment : List LowerBinding)
+    (family : Nat) (id : Nat) (args : List CoreTerm) (state : LowerState) : Either NativeLowerError LowerMaybeResult :=
+    match lower_find_entry id (check_environment_entries sig) with
+    | Nothing => Left NativeLowerError LowerMaybeResult (LowerUnknownGlobal id)
+    | Just entry => match lower_entry_primitive entry with
+      | Nothing => Left NativeLowerError LowerMaybeResult (LowerUnsupportedTerm 6)
+      | Just binding => match binding with
+        | PrimitiveExternBinding _ => Left NativeLowerError LowerMaybeResult LowerEffectMismatch
+        | PrimitiveIntrinsicBinding primitive _ _ _ =>
+            (fix find (words : List PrimitiveWord) : Either NativeLowerError LowerMaybeResult :=
+              match words with | Nil => Left NativeLowerError LowerMaybeResult (LowerUnsupportedPrimitive primitive)
+              | Cons word rest => match primitive_id_equal primitive (PrimitiveWordFromNat word) with
+                | True => lower_from_nat fuel sig environment family word args state
+                | False => find rest end end)
+              ([PrimitiveWordU8, PrimitiveWordU32, PrimitiveWordU64, PrimitiveWordI32, PrimitiveWordUSize] : List PrimitiveWord) end end end;
+
+def lower_maybe_constructor (fuel : Nat) (step : LowerStep) (sig : CheckEnvironment) (environment : List LowerBinding)
+    (family : Nat) (actual : Nat) (index : Nat) (params : Nat) (args : List CoreTerm) (state : LowerState)
+    : Either NativeLowerError LowerMaybeResult :=
+    lower_bind Unit LowerMaybeResult
+      (lower_require (andb (eqNat actual family) (andb (eqNat params 1) (leb_nat index 1))) (LowerUnsupportedTerm 8))
+      (fun (_ : Unit) => match args with
+        | Nil => Left NativeLowerError LowerMaybeResult (LowerInvalidCall 0)
+        | Cons annotation rest => lower_bind LowerType LowerMaybeResult (lower_maybe_word_type fuel sig annotation)
+            (fun (typ : LowerType) => let core : CoreTerm := CApp (CInd family) (lower_type_core typ) in
+              match eqNat index 0 with
+              | True => lower_map Unit LowerMaybeResult (fun (_ : Unit) => LowerMaybeOf core typ (Nothing MirValue) state)
+                  (lower_require (eqNat (length CoreTerm rest) 0) (LowerInvalidCall 0))
+              | False => lower_bind CoreTerm LowerMaybeResult (lower_single CoreTerm rest) (fun (argument : CoreTerm) =>
+                  lower_map LowerResult LowerMaybeResult (fun (result : LowerResult) => match result with
+                    | LowerResultOf _ payload after => LowerMaybeOf core typ payload after end)
+                    (step environment argument typ state)) end) end);
+
+def lower_maybe_value (fuel : Nat) (step : LowerStep) (sig : CheckEnvironment) (environment : List LowerBinding)
+    (family : Nat) (term : CoreTerm) (state : LowerState) : Either NativeLowerError LowerMaybeResult :=
+    lower_bind CoreTerm LowerMaybeResult (lower_constant_whnf fuel sig term) (fun (normal : CoreTerm) =>
+      lower_bind (Pair CoreTerm (List CoreTerm)) LowerMaybeResult (lower_spine fuel normal ([] : List CoreTerm))
+        (fun (spine : Pair CoreTerm (List CoreTerm)) => match spine with | MkPair head args => match lower_term_view head with
+          | LowerGlobalTerm id => lower_maybe_intrinsic fuel sig environment family id args state
+          | LowerLocalTerm id => lower_bind Unit LowerMaybeResult
+              (lower_require (eqNat (length CoreTerm args) 0) (LowerInvalidCall id))
+              (fun (_ : Unit) => match compiler_nth LowerBinding environment id with
+                | Nothing => Left NativeLowerError LowerMaybeResult (LowerUnboundLocal id)
+                | Just binding => match binding with
+                  | LowerMaybeBinding typ word payload => lower_map Unit LowerMaybeResult
+                      (fun (_ : Unit) => LowerMaybeOf typ word payload state)
+                      (lower_core_equal fuel 0 typ (CApp (CInd family) (lower_type_core word)))
+                  | LowerScalarBinding typ _ => Left NativeLowerError LowerMaybeResult (LowerUnsupportedType (lower_type_core typ))
+                  | LowerActionBinding _ _ _ => Left NativeLowerError LowerMaybeResult LowerEffectMismatch
+                  | LowerNatBinding typ _ => Left NativeLowerError LowerMaybeResult (LowerUnsupportedType typ) end end)
+          | LowerConstructorTerm actual index params => lower_maybe_constructor fuel step sig environment family actual index params args state
+          | LowerLambdaTerm _ _ => Left NativeLowerError LowerMaybeResult (LowerUnsupportedTerm 3)
+          | LowerApplyTerm _ _ => Left NativeLowerError LowerMaybeResult (LowerUnsupportedTerm 4)
+          | LowerLetTerm _ _ _ => Left NativeLowerError LowerMaybeResult (LowerUnsupportedTerm 5)
+          | LowerCaseTerm _ _ _ _ => Left NativeLowerError LowerMaybeResult (LowerUnsupportedTerm 9)
+          | LowerOtherTerm tag => Left NativeLowerError LowerMaybeResult (LowerUnsupportedTerm tag) end end));
+
+inductive LowerLocalType : Type :=
+  | LowerLocalScalar : LowerLocalType
+  | LowerLocalNat : CoreTerm -> Nat -> LowerLocalType
+  | LowerLocalMaybe : CoreTerm -> Nat -> LowerLocalType;
+
+def lower_local_type (fuel : Nat) (sig : CheckEnvironment) (annotation : CoreTerm)
+    : Either NativeLowerError LowerLocalType :=
+    lower_map CoreTerm LowerLocalType (fun (normal : CoreTerm) => match primitive_shape normal with
+      | PrimitiveShapeAtom tag id => match andb (eqNat tag 3) (lower_is_role (check_environment_entries sig) normal PrimitiveNatRole) with
+        | True => LowerLocalNat normal id | False => LowerLocalScalar end
+      | PrimitiveShapePair tag head _ => match primitive_shape head with
+        | PrimitiveShapeAtom head_tag id => match andb (eqNat tag 5)
+            (andb (eqNat head_tag 3) (lower_is_role (check_environment_entries sig) head PrimitiveMaybeRole)) with
+          | True => LowerLocalMaybe normal id | False => LowerLocalScalar end
+        | PrimitiveShapePair _ _ _ => LowerLocalScalar | PrimitiveShapeOther => LowerLocalScalar end
+      | PrimitiveShapeOther => LowerLocalScalar end) (lower_normalize fuel sig annotation);
+
+def lower_let (fuel : Nat) (step : LowerStep) (sig : CheckEnvironment) (environment : List LowerBinding)
+    (annotation : CoreTerm) (value : CoreTerm) (body : CoreTerm) (expected : LowerType) (state : LowerState)
+    : Either NativeLowerError LowerResult :=
+    lower_bind LowerLocalType LowerResult (lower_local_type fuel sig annotation) (fun (kind : LowerLocalType) => match kind with
+      | LowerLocalNat typ family => lower_bind LowerNatValue LowerResult (lower_nat_decode_indexed sig environment family fuel value)
+          (fun (constant : LowerNatValue) => step (Cons LowerBinding (LowerNatBinding typ constant) environment) body expected state)
+      | LowerLocalMaybe typ family => lower_bind LowerMaybeResult LowerResult (lower_maybe_value fuel step sig environment family value state)
+          (fun (result : LowerMaybeResult) => match result with | LowerMaybeOf actual word payload after =>
+            lower_bind Unit LowerResult (lower_core_equal fuel 0 typ actual) (fun (_ : Unit) =>
+              step (Cons LowerBinding (LowerMaybeBinding typ word payload) environment) body expected after) end)
+      | LowerLocalScalar => lower_bind LowerType LowerResult (lower_classify_type fuel sig annotation)
+          (fun (typ : LowerType) => match lower_type_action typ with
+            | True => step (Cons LowerBinding (LowerActionBinding typ value environment) environment) body expected state
+            | False => lower_bind LowerResult LowerResult (step environment value typ state)
+                (fun (result : LowerResult) => match result with | LowerResultOf _ scalar after =>
+                  step (Cons LowerBinding (LowerScalarBinding typ scalar) environment) body expected after end) end) end);

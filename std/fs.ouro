@@ -1,0 +1,315 @@
+-- Filesystem helpers expose raw runtime prims plus checked wrappers that return Either FsError A with stable error codes.
+
+import "io.ouro";
+import "pathx.ouro";
+
+def fs_read (path : String) : IO String := prim_fs_read_file path;
+
+def fs_write (path : String) (content : String) : IO Unit :=
+    prim_fs_write_file path content;
+
+def fs_exists (path : String) : IO Bool := prim_fs_exists path;
+
+def fs_is_dir (path : String) : IO Bool := prim_fs_is_dir path;
+
+def fs_list (path : String) : IO (List String) := prim_fs_list_dir path;
+
+def fs_mkdir_p (path : String) : IO Unit := prim_fs_mkdir path;
+
+def fs_remove (path : String) : IO Unit := prim_fs_remove path;
+
+def fs_copy (src : String) (dst : String) : IO Unit :=
+    prim_fs_copy_file src dst;
+
+-- Create the directory a file lives in before writing it.
+def fs_write_deep (path : String) (content : String) : IO Unit :=
+    io_bind Unit Unit (fs_mkdir_p (path_dirname path))
+      (fun (_ : Unit) => fs_write path content);
+
+def fs_copy_deep (src : String) (dst : String) : IO Unit :=
+    io_bind Unit Unit (fs_mkdir_p (path_dirname dst))
+      (fun (_ : Unit) => fs_copy src dst);
+
+def fs_append (path : String) (extra : String) : IO Unit :=
+    io_bind String Unit (fs_read path)
+      (fun (old : String) => fs_write path (str_concat old extra));
+
+def fs_read_lines (path : String) : IO (List String) :=
+    io_bind String (List String) (fs_read path)
+      (fun (text : String) => io_pure (List String) (str_lines text));
+
+def fs_write_lines (path : String) (ls : List String) : IO Unit :=
+    fs_write path (str_join "\n" ls);
+
+-- Directory entries as full paths, in the order the host reported them.
+def fs_child (dir : String) (name : String) : String :=
+    let parts : List String := ([dir, name] : List String) in
+    path_join parts;
+
+def fs_list_paths (dir : String) : IO (List String) :=
+    io_bind (List String) (List String) (fs_list dir)
+      (fun (names : List String) =>
+        io_pure (List String)
+          (map String String (fs_child dir) names));
+
+-- Recursive inventory remains compact for common tools while failing closed:
+-- exhaustion, unreadable entries, and links/reparse points return no partial list.
+def fs_walk_go : Nat -> List String -> List String
+    -> IO (Maybe (List String)) :=
+  fix fs_walk_go (left : Nat) (todo : List String) (rev : List String)
+      : IO (Maybe (List String)) :=
+    match todo with
+    | Nil => io_pure (Maybe (List String))
+        (Just (List String) (reverse String rev))
+    | Cons path rest =>
+        match left with
+        | Z => io_pure (Maybe (List String)) (Nothing (List String))
+        | S left2 =>
+            do let! kind := prim_fs_kind path;
+               match eq_nat kind (S Z) with
+               | True => fs_walk_go left2 rest (Cons String path rev)
+               | False =>
+                   match eq_nat kind (S (S Z)) with
+                   | False => io_pure (Maybe (List String)) (Nothing (List String))
+                   | True =>
+                       do let! readable := prim_fs_listable path;
+                          match readable with
+                          | False => io_pure (Maybe (List String))
+                              (Nothing (List String))
+                          | True =>
+                              do let! kids := fs_list_paths path;
+                                 fs_walk_go left2
+                                   (append String
+                                     (sort_insert String prim_string_le kids) rest)
+                                   rev
+                          end
+                   end
+               end
+        end
+    end;
+
+
+def fs_walk_fuel : Nat := mul 128 128;
+
+
+def fs_walk (root : String) : IO (List String) :=
+    do let! walked := fs_walk_go fs_walk_fuel
+         ([root] : List String) (Nil String);
+       match walked with
+       | Nothing => io_pure (List String) (Nil String)
+       | Just files => io_pure (List String) files
+       end
+
+
+-- Only the .ouro files under a root, sorted is not promised.
+def fs_walk_ouro (root : String) : IO (List String) :=
+    io_bind (List String) (List String) (fs_walk root)
+      (fun (files : List String) =>
+        io_pure (List String) (filter String path_ends_ouro files));
+
+inductive FsError : Type :=
+  | FsEmptyPath : FsError
+  | FsMissing : String -> FsError
+  | FsExpectedFile : String -> FsError
+  | FsExpectedDirectory : String -> FsError
+  | FsOperationFailed : String -> String -> FsError;
+
+def fs_error_code (e : FsError) : String :=
+    match e with
+    | FsEmptyPath => "empty_path"
+    | FsMissing _ => "not_found"
+    | FsExpectedFile _ => "not_file"
+    | FsExpectedDirectory _ => "not_directory"
+    | FsOperationFailed _ _ => "operation_failed"
+    end;
+
+def fs_error_path (e : FsError) : String :=
+    match e with
+    | FsEmptyPath => ""
+    | FsMissing path => path
+    | FsExpectedFile path => path
+    | FsExpectedDirectory path => path
+    | FsOperationFailed _ path => path
+    end;
+
+def fs_error_message (e : FsError) : String :=
+    match e with
+    | FsEmptyPath => "filesystem path is empty"
+    | FsMissing path => str_concat "path not found: " path
+    | FsExpectedFile path => str_concat "expected file: " path
+    | FsExpectedDirectory path => str_concat "expected directory: " path
+    | FsOperationFailed op path => str_cat4 "filesystem " op " failed: " path
+    end;
+
+def fs_ok (A : Type) (x : A) : IO (Either FsError A) :=
+    io_pure (Either FsError A) (Right FsError A x);
+
+def fs_err (A : Type) (e : FsError) : IO (Either FsError A) :=
+    io_pure (Either FsError A) (Left FsError A e);
+
+def fs_nonempty_path (path : String) : Either FsError Unit :=
+    match str_null path with
+    | True => Left FsError Unit FsEmptyPath
+    | False => Right FsError Unit MkUnit
+    end;
+
+def fs_is_file (path : String) : IO Bool :=
+    io_bind Bool Bool (fs_exists path)
+      (fun (exists : Bool) =>
+        match exists with
+        | False => io_pure Bool False
+        | True =>
+            io_bind Bool Bool (fs_is_dir path)
+              (fun (isdir : Bool) => io_pure Bool (notb isdir))
+        end);
+
+def fs_file_exists (path : String) : IO Bool := fs_is_file path;
+
+def fs_dir_exists (path : String) : IO Bool := fs_is_dir path;
+
+def fs_check_file (path : String) : IO (Either FsError Unit) :=
+    match fs_nonempty_path path with
+    | Left e => fs_err Unit e
+    | Right _ =>
+        io_bind Bool (Either FsError Unit) (fs_exists path)
+          (fun (exists : Bool) =>
+            match exists with
+            | False => fs_err Unit (FsMissing path)
+            | True =>
+                io_bind Bool (Either FsError Unit) (fs_is_dir path)
+                  (fun (isdir : Bool) =>
+                    match isdir with
+                    | True => fs_err Unit (FsExpectedFile path)
+                    | False => fs_ok Unit MkUnit
+                    end)
+            end)
+    end;
+
+def fs_check_dir (path : String) : IO (Either FsError Unit) :=
+    match fs_nonempty_path path with
+    | Left e => fs_err Unit e
+    | Right _ =>
+        io_bind Bool (Either FsError Unit) (fs_exists path)
+          (fun (exists : Bool) =>
+            match exists with
+            | False => fs_err Unit (FsMissing path)
+            | True =>
+                io_bind Bool (Either FsError Unit) (fs_is_dir path)
+                  (fun (isdir : Bool) =>
+                    match isdir with
+                    | True => fs_ok Unit MkUnit
+                    | False => fs_err Unit (FsExpectedDirectory path)
+                    end)
+            end)
+    end;
+
+def fs_read_checked (path : String) : IO (Either FsError String) :=
+    io_bind (Either FsError Unit) (Either FsError String) (fs_check_file path)
+      (fun (ready : Either FsError Unit) =>
+        match ready with
+        | Left e => fs_err String e
+        | Right _ =>
+            io_bind String (Either FsError String) (fs_read path)
+              (fun (text : String) => fs_ok String text)
+        end);
+
+def fs_write_checked (path : String) (content : String) : IO (Either FsError Unit) :=
+    match fs_nonempty_path path with
+    | Left e => fs_err Unit e
+    | Right _ =>
+        io_bind Bool (Either FsError Unit) (fs_is_dir path)
+          (fun (isdir : Bool) =>
+            match isdir with
+            | True => fs_err Unit (FsExpectedFile path)
+            | False =>
+                io_bind Unit (Either FsError Unit) (fs_mkdir_p (path_dirname path))
+                  (fun (_ : Unit) =>
+                    io_bind Unit (Either FsError Unit) (fs_write path content)
+                      (fun (_ : Unit) =>
+                        io_bind Bool (Either FsError Unit) (fs_is_file path)
+                          (fun (ok : Bool) =>
+                            match ok with
+                            | True => fs_ok Unit MkUnit
+                            | False => fs_err Unit (FsOperationFailed "write" path)
+                            end)))
+            end)
+    end;
+
+def fs_append_checked (path : String) (extra : String) : IO (Either FsError Unit) :=
+    io_bind (Either FsError String) (Either FsError Unit) (fs_read_checked path)
+      (fun (old : Either FsError String) =>
+        match old with
+        | Left e => fs_err Unit e
+        | Right text => fs_write_checked path (str_concat text extra)
+        end);
+
+def fs_mkdir_p_checked (path : String) : IO (Either FsError Unit) :=
+    match fs_nonempty_path path with
+    | Left e => fs_err Unit e
+    | Right _ =>
+        io_bind Unit (Either FsError Unit) (fs_mkdir_p path)
+          (fun (_ : Unit) =>
+            io_bind Bool (Either FsError Unit) (fs_is_dir path)
+              (fun (ok : Bool) =>
+                match ok with
+                | True => fs_ok Unit MkUnit
+                | False => fs_err Unit (FsOperationFailed "mkdir" path)
+                end))
+    end;
+
+def fs_list_checked (path : String) : IO (Either FsError (List String)) :=
+    io_bind (Either FsError Unit) (Either FsError (List String)) (fs_check_dir path)
+      (fun (ready : Either FsError Unit) =>
+        match ready with
+        | Left e => fs_err (List String) e
+        | Right _ =>
+            io_bind (List String) (Either FsError (List String)) (fs_list path)
+              (fun (names : List String) => fs_ok (List String) names)
+        end);
+
+def fs_copy_checked (src : String) (dst : String) : IO (Either FsError Unit) :=
+    io_bind (Either FsError Unit) (Either FsError Unit) (fs_check_file src)
+      (fun (ready : Either FsError Unit) =>
+        match ready with
+        | Left e => fs_err Unit e
+        | Right _ =>
+            io_bind (Either FsError Unit) (Either FsError Unit) (fs_mkdir_p_checked (path_dirname dst))
+              (fun (made : Either FsError Unit) =>
+                match made with
+                | Left e => fs_err Unit e
+                | Right _ =>
+                    io_bind Unit (Either FsError Unit) (fs_copy src dst)
+                      (fun (_ : Unit) =>
+                        io_bind Bool (Either FsError Unit) (fs_is_file dst)
+                          (fun (ok : Bool) =>
+                            match ok with
+                            | True => fs_ok Unit MkUnit
+                            | False => fs_err Unit (FsOperationFailed "copy" dst)
+                            end))
+                end)
+        end);
+
+-- Replace a destination by a same-volume rename, preserving the OS verdict.
+-- Parents must already exist; failure never falls back to copy or delete.
+def fs_rename_checked (src : String) (dst : String) : IO (Either FsError Unit) :=
+    match fs_nonempty_path dst with
+    | Left e => fs_err Unit e
+    | Right _ =>
+        do let! ready := fs_check_file src;
+           match ready with
+           | Left e => fs_err Unit e
+           | Right _ =>
+               do let! isdir := fs_is_dir dst;
+                  match isdir with
+                  | True => fs_err Unit (FsExpectedFile dst)
+                  | False =>
+                      do let! status := prim_fs_rename src dst;
+                         match eq_nat status Z with
+                         | True => fs_ok Unit MkUnit
+                         | False => fs_err Unit
+                             (FsOperationFailed
+                               (str_concat "rename status=" (prim_string_of_nat status)) dst)
+                         end
+                  end
+           end
+    end;

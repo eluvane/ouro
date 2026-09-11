@@ -1,0 +1,574 @@
+-- Package installs vendor source into _ouro_pkgs, keeping the compiler unaware of package resolution.
+-- The handwritten form is Ouro.seal; the generated lock is Ouro.lock.
+
+-- @entry main
+
+import "model.ouro";
+import "security.ouro";
+import "../../std/args.ouro";
+import "../native_sibling.ouro";
+
+def pkg_usage : String :=
+    "usage: ouro-pkg (init [--name N] [--registry D] | add NAME [--range R] | install | lock | remove NAME | update | list | verify)";
+
+def fs_is_missing (e : FsError) : Bool :=
+    match e with
+    | FsMissing _ => True
+    | FsEmptyPath => False
+    | FsExpectedFile _ => False
+    | FsExpectedDirectory _ => False
+    | FsOperationFailed _ _ => False
+    end;
+
+-- Missing is optional. A present path that cannot be read is an error.
+def read_opt (path : String) : IO (Either FsError (Maybe String)) :=
+    do let! loaded := fs_read_checked path;
+       match loaded with
+       | Left e =>
+           match fs_is_missing e with
+           | True => fs_ok (Maybe String) (Nothing String)
+           | False => fs_err (Maybe String) e
+           end
+       | Right body => fs_ok (Maybe String) (Just String body)
+       end
+
+def pkg_fail (e : FsError) : IO Unit :=
+    do eprintln (fs_error_message e);
+       exit 1
+
+def pkg_write (path : String) (body : String) : IO Unit :=
+    do let! written := fs_write_checked path body;
+       match written with
+       | Left e => pkg_fail e
+       | Right _ => io_unit
+       end
+
+def load_seal : IO (Maybe SealDoc) :=
+    do let! text := read_opt pkg_manifest_name;
+       match text with
+       | Left e =>
+           do pkg_fail e;
+              io_pure (Maybe SealDoc) (Nothing SealDoc)
+       | Right m =>
+           io_pure (Maybe SealDoc)
+             (maybe String (Maybe SealDoc) (Nothing SealDoc) seal_parse m)
+       end
+
+def seal_pkg_valid (d : SealDoc) : Maybe Pkg :=
+    let p : Pkg := seal_to_pkg d in
+    match pkg_manifest_ok p with
+    | True => Just Pkg p
+    | False => Nothing Pkg
+    end;
+
+def load_manifest : IO (Maybe Pkg) :=
+    do let! doc := load_seal;
+       match doc with
+       | Nothing => io_pure (Maybe Pkg) (Nothing Pkg)
+       | Just d => io_pure (Maybe Pkg) (seal_pkg_valid d)
+       end
+
+def init_present (a : Args) (name : String) (present : Bool) : IO Unit :=
+    match present with
+    | True =>
+        do eprintln (str_concat pkg_manifest_name " already exists");
+           exit 1
+    | False =>
+        do pkg_write pkg_manifest_name
+             (pkg_render (pkg_new name
+               (args_opt_or a "registry" "samples/pkg/registry")));
+           println (str_concat "wrote " pkg_manifest_name)
+    end;
+
+def init_run (a : Args) : IO Unit :=
+    let name : String := args_opt_or a "name" "app" in
+    match pkg_ident_ok name with
+    | False => do eprintln (str_concat "init: invalid package name: " name);
+                  exit 2
+    | True => io_bind Bool Unit (fs_exists pkg_manifest_name)
+                (init_present a name)
+    end
+
+def add_run (a : Args) (doc : SealDoc) (p : Pkg) : IO Unit :=
+    let name : String := args_at a (S Z) in
+    match pkg_ident_ok name with
+    | False => do eprintln "add: expected a valid package name";
+                 exit 2
+    | True =>
+        let range : String := args_opt_or a "range" "*" in
+        let next : Pkg := pkg_with_dep p name range in
+        do pkg_write pkg_manifest_name
+             (seal_render (seal_put_identity doc (pkg_name next)
+               (pkg_version next) (pkg_deps next) (pkg_registry next)));
+           println (str_cat3 "added " name (str_concat " " range))
+    end;
+
+def remove_run (a : Args) (doc : SealDoc) (p : Pkg) : IO Unit :=
+    let name : String := args_at a (S Z) in
+    match pkg_ident_ok name with
+    | False => do eprintln "remove: expected a valid package name";
+                 exit 2
+    | True =>
+        let next : Pkg := pkg_without_dep p name in
+        do pkg_write pkg_manifest_name
+             (seal_render (seal_put_identity doc (pkg_name next)
+               (pkg_version next) (pkg_deps next) (pkg_registry next)));
+           println (str_concat "removed " name)
+    end;
+
+def install_file (src_root : String) (dst_root : String)
+    (st : Either FsError Digest) (f : String) : IO (Either FsError Digest) :=
+    match st with
+    | Left e => io_pure (Either FsError Digest) (Left FsError Digest e)
+    | Right d =>
+        let dst : String := fs_child dst_root (path_relative src_root f) in
+        do let! body := fs_read_checked f;
+           match body with
+           | Left e =>
+               io_pure (Either FsError Digest) (Left FsError Digest e)
+           | Right text =>
+               do let! written := fs_write_checked dst text;
+                  match written with
+                  | Left e =>
+                      io_pure (Either FsError Digest) (Left FsError Digest e)
+                  | Right _ =>
+                      io_pure (Either FsError Digest)
+                        (Right FsError Digest (digest_step d dst text))
+                  end
+           end
+    end
+
+-- Vendor only a complete no-follow walk; a partial/error traversal must never
+-- produce a lock digest that looks authoritative.
+def install_walked (src : String) (dst : String) (walked : FsWalkResult)
+    : IO (Either FsError Digest) :=
+    match walked with
+    | FsWalkComplete files =>
+        io_fold String (Either FsError Digest)
+          (install_file src dst) (Right FsError Digest digest_empty)
+          (str_sort files)
+    | FsWalkTruncated _ =>
+        fs_err Digest (FsOperationFailed "walk" (fs_walk_message walked))
+    | FsWalkUnreadable _ =>
+        fs_err Digest (FsOperationFailed "walk" (fs_walk_message walked))
+    | FsWalkUnsafe _ =>
+        fs_err Digest (FsOperationFailed "walk" (fs_walk_message walked))
+    end;
+
+def install_tree (src : String) (dst : String) : IO (Either FsError Digest) :=
+    io_bind FsWalkResult (Either FsError Digest) (fs_walk_checked src)
+      (install_walked src dst)
+
+def resolve_loaded (name : String) (range : String)
+    (loaded : Either FsError String) : IO Resolved :=
+    match loaded with
+    | Left e => io_pure Resolved
+        (RErr (str_cat3 "could not read package " name
+                 (str_concat ": " (fs_error_message e))))
+    | Right body => io_pure Resolved (resolve_body name range body)
+    end;
+
+def resolve_manifest (name : String) (range : String)
+    (manifest : Either String String) : IO Resolved :=
+    match manifest with
+    | Left msg => io_pure Resolved (RErr msg)
+    | Right manifest_real =>
+        io_bind (Either FsError String) Resolved
+          (fs_read_checked manifest_real) (resolve_loaded name range)
+    end;
+
+def resolve_source (name : String) (range : String)
+    (source : Either String String) : IO Resolved :=
+    match source with
+    | Left msg => io_pure Resolved (RErr msg)
+    | Right src_real =>
+        io_bind (Either String String) Resolved
+          (pkg_file_under src_real (pkg_manifest_path src_real))
+          (resolve_manifest name range)
+    end;
+
+def resolve_dep (registry : String) (name : String) (range : String)
+    : IO Resolved :=
+    io_bind (Either String String) Resolved
+      (pkg_source_dir_checked registry name) (resolve_source name range);
+
+inductive Install : Type :=
+  | MkInstall : List Locked -> List String -> Install;
+
+def install_locked (i : Install) : List Locked :=
+    match i with
+    | MkInstall ls _ => ls
+    end;
+
+def install_errors (i : Install) : List String :=
+    match i with
+    | MkInstall _ es => es
+    end;
+
+def install_add_error (i : Install) (msg : String) : Install :=
+    MkInstall (install_locked i) (snoc String (install_errors i) msg);
+
+def install_add_locked (i : Install) (l : Locked) : Install :=
+    MkInstall (snoc Locked (install_locked i) l) (install_errors i);
+
+def install_seen (i : Install) (name : String) : Bool :=
+    maybe Locked Bool False (fun (_l : Locked) => True)
+      (lock_find (install_locked i) name);
+
+def vendor_digest (p : Pkg) (src_real : String)
+    (d : Either FsError Digest) : IO (Either String Locked) :=
+    match d with
+    | Left e => io_pure (Either String Locked)
+        (Left String Locked (fs_error_message e))
+    | Right digest =>
+        do println (str_cat3 "installed " (pkg_name p)
+                      (str_concat " " (pkg_version p)));
+           io_pure (Either String Locked)
+             (Right String Locked
+               (MkLocked (pkg_name p) (pkg_version p)
+                 src_real (digest_show digest)))
+    end;
+
+def vendor_destination (p : Pkg) (src_real : String)
+    (destination : Either String String) : IO (Either String Locked) :=
+    match destination with
+    | Left msg => io_pure (Either String Locked) (Left String Locked msg)
+    | Right dest =>
+        io_bind (Either FsError Digest) (Either String Locked)
+          (install_tree src_real dest) (vendor_digest p src_real)
+    end;
+
+def vendor_source (p : Pkg) (source : Either String String)
+    : IO (Either String Locked) :=
+    match source with
+    | Left msg => io_pure (Either String Locked) (Left String Locked msg)
+    | Right src_real =>
+        io_bind (Either String String) (Either String Locked)
+          (pkg_vendor_ready (pkg_name p)) (vendor_destination p src_real)
+    end;
+
+def vendor_pkg (registry : String) (p : Pkg) : IO (Either String Locked) :=
+    io_bind (Either String String) (Either String Locked)
+      (pkg_source_dir_checked registry (pkg_name p)) (vendor_source p);
+
+-- Resolution walks the dependency graph breadth-first with a fuel bound, so a
+-- cycle in a registry stops instead of hanging. A vendored package contributes
+-- its own deps to the queue (greet -> hello).
+def install_step (registry : String) (acc : Install)
+    (dep : Pair String String) (rest : List (Pair String String))
+    : IO (Pair Install (List (Pair String String))) :=
+    match dep with
+    | MkPair name range =>
+        match install_seen acc name with
+        | True =>
+            io_pure (Pair Install (List (Pair String String)))
+              (MkPair Install (List (Pair String String)) acc rest)
+        | False =>
+            do let! r := resolve_dep registry name range;
+               match r with
+               | RErr msg =>
+                   io_pure (Pair Install (List (Pair String String)))
+                     (MkPair Install (List (Pair String String))
+                       (install_add_error acc msg) rest)
+               | ROk p =>
+                   do let! v := vendor_pkg registry p;
+                      match v with
+                      | Left msg =>
+                          io_pure (Pair Install (List (Pair String String)))
+                            (MkPair Install (List (Pair String String))
+                              (install_add_error acc msg) rest)
+                      | Right l =>
+                          io_pure (Pair Install (List (Pair String String)))
+                            (MkPair Install (List (Pair String String))
+                              (install_add_locked acc l)
+                              (append (Pair String String) rest (pkg_deps p)))
+                      end
+               end
+        end
+    end;
+
+def install_go : Nat -> String -> Install -> List (Pair String String)
+    -> IO Install :=
+  fix install_go (fuel : Nat) (registry : String) (acc : Install)
+      (pending : List (Pair String String)) : IO Install :=
+    match fuel with
+    | Z =>
+        io_pure Install
+          (install_add_error acc "install: dependency fuel exhausted")
+    | S fuel2 =>
+        match pending with
+        | Nil => io_pure Install acc
+        | Cons dep rest =>
+            do let! st := install_step registry acc dep rest;
+               match st with
+               | MkPair acc2 pending2 =>
+                   install_go fuel2 registry acc2 pending2
+               end
+        end
+    end;
+
+def install_finish (i : Install) : IO Unit :=
+    match install_errors i with
+    | Nil =>
+        do pkg_write pkg_lock_name (lock_render (install_locked i));
+           println (str_concat "wrote " pkg_lock_name)
+    | Cons e es =>
+        do io_foreach String eprintln (Cons String e es);
+           exit 1
+    end;
+
+def install_run (p : Pkg) : IO Unit :=
+    do let! i :=
+         install_go (mul 64 64) (pkg_registry p)
+           (MkInstall (Nil Locked) (Nil String)) (pkg_deps p);
+       install_finish i
+
+-- `lock` is the explicit resolve-and-vendor step; `update` re-resolves the
+-- same one-version local registry. Neither talks to the network.
+def dep_line (d : Pair String String) : String :=
+    match d with
+    | MkPair k v => str_cat3 "  " k (str_concat " " v)
+    end;
+
+def locked_line (l : Locked) : String :=
+    str_cat4 "  " (locked_name l)
+      (str_cat3 " " (locked_version l) " ")
+      (locked_digest l);
+
+def list_run (p : Pkg) : IO Unit :=
+    do println (str_cat3 (pkg_name p) " " (pkg_version p));
+       println "deps:";
+       io_foreach (Pair String String) (fun (d : Pair String String) =>
+         println (dep_line d)) (pkg_deps p);
+       let! lock := read_opt pkg_lock_name;
+       match lock with
+       | Left e => pkg_fail e
+       | Right m =>
+           match m with
+           | Nothing => println "locked: none"
+           | Just text =>
+               match lock_parse text with
+               | Nothing =>
+                   do eprintln (str_concat "list: invalid " pkg_lock_name);
+                      exit 1
+               | Just ls =>
+                   do println "locked:";
+                      io_foreach Locked (fun (l : Locked) => println (locked_line l))
+                        ls
+               end
+           end
+       end
+
+-- Recompute the digest of what is on disk under _ouro_pkgs/ and compare it
+-- with the lockfile, then typecheck every installed module. The paths fed to
+-- the digest are the installed ones, exactly as `install` recorded them.
+def digest_file (st : Either FsError Digest) (f : String)
+    : IO (Either FsError Digest) :=
+    match st with
+    | Left e => io_pure (Either FsError Digest) (Left FsError Digest e)
+    | Right d =>
+        do let! body := fs_read_checked f;
+           match body with
+           | Left e =>
+               io_pure (Either FsError Digest) (Left FsError Digest e)
+           | Right text =>
+               io_pure (Either FsError Digest)
+                 (Right FsError Digest (digest_step d f text))
+           end
+    end
+
+def verify_digest_done (d : Either FsError Digest)
+    : IO (Either FsError String) :=
+    match d with
+    | Left e => io_pure (Either FsError String) (Left FsError String e)
+    | Right acc => io_pure (Either FsError String)
+        (Right FsError String (digest_show acc))
+    end;
+
+def verify_digest_walked (walked : FsWalkResult)
+    : IO (Either FsError String) :=
+    match walked with
+    | FsWalkComplete files =>
+        io_bind (Either FsError Digest) (Either FsError String)
+          (io_fold String (Either FsError Digest)
+            digest_file (Right FsError Digest digest_empty) (str_sort files))
+          verify_digest_done
+    | FsWalkTruncated _ =>
+        fs_err String (FsOperationFailed "walk" (fs_walk_message walked))
+    | FsWalkUnreadable _ =>
+        fs_err String (FsOperationFailed "walk" (fs_walk_message walked))
+    | FsWalkUnsafe _ =>
+        fs_err String (FsOperationFailed "walk" (fs_walk_message walked))
+    end;
+
+def verify_digest (name : String) : IO (Either FsError String) :=
+    io_bind FsWalkResult (Either FsError String)
+      (fs_walk_checked (pkg_vendor_path name)) verify_digest_walked
+
+-- `ouro pkg verify` typechecks through the same entry a human would use.
+-- Package verification uses the shipped checker with the real inherited cwd.
+-- Child success still requires its positive marker and no CHECK_FAIL output.
+def pkg_verify_process_limits : ProcessCaptureLimits := native_sibling_limits (mul 120 (mul 10 100));
+
+def verify_process_result (path : String) (result : Either NativeSiblingError ProcResult) : IO Bool :=
+    match result with
+    | Left error =>
+        do eprintln (str_concat "check failed: " path);
+           eprintln (str_concat "  " (native_sibling_error_message error));
+           io_pure Bool False
+    | Right process =>
+        let combined : String := str_concat (proc_stdout process) (proc_stderr process) in
+        match native_sibling_check_ok process with
+        | True => io_pure Bool True
+        | False =>
+            do eprintln (str_concat "check failed: " path);
+               eprintln (str_cat3 "  exit=" (str_of_nat (proc_code process))
+                 (str_concat " out=" (str_replace combined "\r" "")));
+               io_pure Bool False
+        end
+    end;
+
+def verify_check (path : String) : IO Bool :=
+    do let! result := native_sibling_run pkg_verify_process_limits "coil.exe" (native_sibling_check_args path);
+       verify_process_result path result
+
+def verify_and_path (ok : Bool) (path : String) : IO Bool :=
+    do let! one := verify_check path;
+       io_pure Bool (andb ok one)
+
+def verify_walked_files (walked : FsWalkResult) : IO Bool :=
+    match walked with
+    | FsWalkComplete files =>
+        io_fold String Bool verify_and_path True (str_sort files)
+    | FsWalkTruncated _ =>
+        do eprintln (fs_walk_message walked); io_pure Bool False
+    | FsWalkUnreadable _ =>
+        do eprintln (fs_walk_message walked); io_pure Bool False
+    | FsWalkUnsafe _ =>
+        do eprintln (fs_walk_message walked); io_pure Bool False
+    end;
+
+def verify_shown (l : Locked) (shown : String) : IO Bool :=
+    match str_eq shown (locked_digest l) with
+    | True => io_bind FsWalkResult Bool
+        (fs_walk_ouro_checked (pkg_vendor_path (locked_name l)))
+        verify_walked_files
+    | False =>
+        do eprintln (str_cat4 "digest mismatch for " (locked_name l)
+                       (str_concat ": locked " (locked_digest l))
+                       (str_concat ", found " shown));
+           io_pure Bool False
+    end;
+
+def verify_got (l : Locked) (got : Either FsError String) : IO Bool :=
+    match got with
+    | Left e => do eprintln (fs_error_message e); io_pure Bool False
+    | Right shown => verify_shown l shown
+    end;
+
+def verify_one (l : Locked) : IO Bool :=
+    io_bind (Either FsError String) Bool (verify_digest (locked_name l))
+      (verify_got l)
+
+def verify_and_lock (ok : Bool) (l : Locked) : IO Bool :=
+    do let! one := verify_one l;
+       io_pure Bool (andb ok one)
+
+def verify_run : IO Unit :=
+    do let! lock := read_opt pkg_lock_name;
+       match lock with
+       | Left e => pkg_fail e
+       | Right m =>
+           match m with
+           | Nothing =>
+               do eprintln (str_concat "verify: missing " pkg_lock_name);
+                  exit 1
+           | Just text =>
+               match lock_parse text with
+               | Nothing =>
+                   do eprintln (str_concat "verify: invalid " pkg_lock_name);
+                      exit 1
+               | Just ls =>
+                   do let! ok :=
+                        io_fold Locked Bool verify_and_lock True ls;
+                      match ok with
+                      | True => println "verify: ok"
+                      | False => do eprintln "verify: failed";
+                                    exit 1
+                      end
+               end
+           end
+       end
+
+inductive PkgCmd : Type :=
+  | PkgInit : PkgCmd
+  | PkgVerify : PkgCmd
+  | PkgAdd : PkgCmd
+  | PkgRemove : PkgCmd
+  | PkgInstall : PkgCmd
+  | PkgLock : PkgCmd
+  | PkgUpdate : PkgCmd
+  | PkgList : PkgCmd
+  | PkgUnknown : PkgCmd;
+
+def pkg_cmd_rows : List (Pair String PkgCmd) :=
+    [ MkPair String PkgCmd "init" PkgInit
+    , MkPair String PkgCmd "verify" PkgVerify
+    , MkPair String PkgCmd "add" PkgAdd
+    , MkPair String PkgCmd "remove" PkgRemove
+    , MkPair String PkgCmd "install" PkgInstall
+    , MkPair String PkgCmd "lock" PkgLock
+    , MkPair String PkgCmd "update" PkgUpdate
+    , MkPair String PkgCmd "list" PkgList
+    ];
+
+def pkg_cmd_of (name : String) : PkgCmd :=
+  match lookup String PkgCmd str_eq name pkg_cmd_rows with
+  | Nothing => PkgUnknown
+  | Just cmd => cmd
+  end;
+
+def with_manifest (run : Pkg -> IO Unit) : IO Unit :=
+    do let! m := load_manifest;
+       match m with
+       | Nothing =>
+           do eprintln (str_concat "no " pkg_manifest_name);
+              exit 1
+       | Just p => run p
+       end
+
+def with_seal (run : SealDoc -> Pkg -> IO Unit) : IO Unit :=
+    do let! m := load_seal;
+       match m with
+       | Nothing =>
+           do eprintln (str_concat "no " pkg_manifest_name);
+              exit 1
+       | Just d =>
+           match seal_pkg_valid d with
+           | Nothing =>
+               do eprintln (str_concat "invalid " pkg_manifest_name);
+                  exit 1
+           | Just p => run d p
+           end
+       end
+
+def dispatch (a : Args) : IO Unit :=
+    match pkg_cmd_of (args_cmd a) with
+    | PkgInit => init_run a
+    | PkgVerify => verify_run
+    | PkgAdd => with_seal (add_run a)
+    | PkgRemove => with_seal (remove_run a)
+    | PkgInstall => with_manifest install_run
+    | PkgLock => with_manifest install_run
+    | PkgUpdate => with_manifest install_run
+    | PkgList => with_manifest list_run
+    | PkgUnknown =>
+        do eprintln pkg_usage;
+           exit 2
+    end;
+
+def pkg_switches : List String := [ "help" ];
+
+def main : IO Unit :=
+    do let! argv := prim_argv;
+       dispatch (args_of_argv_bools pkg_switches argv)

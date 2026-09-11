@@ -1,0 +1,178 @@
+-- Compact compiler input model. The parser consumes `canonical_tokens`; byte spans
+-- and explicit source directives remain available for diagnostics and tooling.
+-- Ordinary comments and formatting trivia are never stored in this artifact.
+
+import "source_text.ouro";
+import "../std/data.ouro";
+import "token.ouro";
+
+inductive SourceSpan : Type :=
+  | MkSourceSpan : Nat -> Nat -> SourceSpan;
+
+inductive SourceDirective : Type :=
+  | MkSourceDirective : Nat -> Nat -> List Nat -> SourceDirective;
+
+inductive CanonicalSourceUnit : Type :=
+  | MkCanonicalSourceUnit :
+      List Token -> List SourceSpan -> List SourceDirective -> Nat ->
+      CanonicalSourceUnit;
+
+def source_span_start (span : SourceSpan) : Nat :=
+  match span with
+  | MkSourceSpan start _end => start
+  end;
+
+
+
+
+
+
+
+def canonical_tokens (unit : CanonicalSourceUnit) : List Token :=
+  match unit with
+  | MkCanonicalSourceUnit tokens _spans _directives _source_bytes => tokens
+  end;
+
+def canonical_directives (unit : CanonicalSourceUnit) : List SourceDirective :=
+  match unit with
+  | MkCanonicalSourceUnit _tokens _spans directives _source_bytes => directives
+  end;
+
+def canonical_source_bytes (unit : CanonicalSourceUnit) : Nat :=
+  match unit with
+  | MkCanonicalSourceUnit _tokens _spans _directives source_bytes => source_bytes
+  end;
+
+def canonical_directive_count (unit : CanonicalSourceUnit) : Nat :=
+  length SourceDirective (canonical_directives unit);
+
+-- The current self-hosted lexer ABI exposes the token stream but not byte
+-- start/end pairs. This map therefore carries the stable original token index
+-- until the lexer ABI grows byte spans. It still prevents compact-byte
+-- diagnostics: parser positions are interpreted through this unit, not through
+-- an optional materialized compact string.
+def canonical_spans_from_tokens (tokens : List Token) : List SourceSpan :=
+  reverse SourceSpan
+    ((fix go (rest : List Token) (index : Nat) (acc : List SourceSpan)
+        : List SourceSpan :=
+      match rest with
+      | Nil => acc
+      | Cons _ tail =>
+          go tail (S index)
+            (Cons SourceSpan (MkSourceSpan index (S index)) acc)
+      end) tokens Z (Nil SourceSpan));
+
+def csm_ch_tab : Nat := 9;
+def csm_ch_lf : Nat := 10;
+def csm_ch_cr : Nat := 13;
+def csm_ch_dq : Nat := 34;
+def csm_ch_dash : Nat := 45;
+def csm_ch_at : Nat := 64;
+def csm_is_hspace (byte : Nat) : Bool :=
+  orb (eqNat byte 32) (eqNat byte csm_ch_tab);
+
+def csm_trim_hspace : List Nat -> List Nat :=
+  fix go (xs : List Nat) : List Nat :=
+    match xs with
+    | Nil => Nil Nat
+    | Cons byte rest =>
+        match csm_is_hspace byte with
+        | True => go rest
+        | False => xs
+        end
+    end;
+
+def csm_take_line (xs : List Nat) : List Nat :=
+  reverse Nat
+    ((fix go (rest : List Nat) (acc : List Nat) : List Nat :=
+      match rest with
+      | Nil => acc
+      | Cons byte tail =>
+          match orb (eqNat byte csm_ch_lf) (eqNat byte csm_ch_cr) with
+          | True => acc
+          | False => go tail (Cons Nat byte acc)
+          end
+      end) xs (Nil Nat));
+
+def csm_line_directive_text (comment_body : List Nat)
+    : Maybe (List Nat) :=
+  match csm_trim_hspace comment_body with
+  | Nil => Nothing (List Nat)
+  | Cons byte _ =>
+      match eqNat byte csm_ch_at with
+      | True => Just (List Nat) (csm_take_line (csm_trim_hspace comment_body))
+      | False => Nothing (List Nat)
+      end
+  end;
+
+def csm_starts_line_comment (rest : List Nat) : Bool :=
+  match rest with
+  | Nil => False
+  | Cons byte _ => eqNat byte csm_ch_dash
+  end;
+
+def canonical_directives_from_source (src : List Nat) : List SourceDirective :=
+  reverse SourceDirective
+    -- Each step consumes at least one byte, including skipped comments/strings.
+    ((fix go (fuel : Nat) (xs : List Nat) (pos : Nat) (acc : List SourceDirective)
+        : List SourceDirective :=
+      match fuel with
+      | Z => acc
+      | S fuel' =>
+          match xs with
+          | Nil => acc
+          | Cons byte rest =>
+              match andb (eqNat byte csm_ch_dash) (csm_starts_line_comment rest) with
+              | True =>
+                  match rest with
+                  | Nil => acc
+                  | Cons _ comment_body =>
+                      match source_skip_line_pos comment_body (S (S pos)) with
+                      | MkPair after_comment end_pos =>
+                          match csm_line_directive_text comment_body with
+                          | Nothing => go fuel' after_comment end_pos acc
+                          | Just text =>
+                              go fuel' after_comment end_pos
+                                (Cons SourceDirective
+                                  (MkSourceDirective pos end_pos text) acc)
+                          end
+                      end
+                  end
+              | False =>
+                  match eqNat byte csm_ch_dq with
+                  | True =>
+                      match source_skip_string_pos rest (S pos) with
+                      | MkPair after_string end_pos =>
+                          go fuel' after_string end_pos acc
+                      end
+                  | False => go fuel' rest (S pos) acc
+                  end
+              end
+          end
+      end) (length Nat src) src Z (Nil SourceDirective));
+
+def canonical_from_lexed (src : List Nat) (tokens : List Token)
+    : CanonicalSourceUnit :=
+  MkCanonicalSourceUnit tokens (canonical_spans_from_tokens tokens)
+    (canonical_directives_from_source src) (length Nat src);
+
+-- Parser positions are token indexes. Diagnostics are always reported against
+-- the original lexical input, so map the index through the source unit. EOF and
+-- out-of-range positions map to the source byte length.
+def canonical_original_position (unit : CanonicalSourceUnit) (index : Nat) : Nat :=
+  match unit with
+  | MkCanonicalSourceUnit _tokens spans _directives source_bytes =>
+      (fix go (left : Nat) (rest : List SourceSpan) : Nat :=
+        match left with
+        | Z =>
+            match rest with
+            | Nil => source_bytes
+            | Cons span _ => source_span_start span
+            end
+        | S left' =>
+            match rest with
+            | Nil => source_bytes
+            | Cons _ tail => go left' tail
+            end
+        end) index spans
+  end;

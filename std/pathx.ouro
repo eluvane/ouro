@@ -1,0 +1,225 @@
+-- Path helpers use POSIX spelling because package and doc artifacts store slash paths.
+
+import "csv.ouro";
+
+def path_sep : Nat := 47;
+def path_dot : Nat := 46;
+
+-- Host paths may use backslashes; package and doc artifacts store slashes.
+def path_from_host (p : String) : String :=
+    str_replace p "\\" "/";
+
+def path_split (p : String) : List String :=
+    filter String (fun (s : String) => notb (str_null s))
+      (str_split (path_from_host p) path_sep);
+
+def path_join (parts : List String) : String :=
+    str_join "/" parts;
+
+def path_has_drive (p : String) : Bool :=
+    match ltb_nat (str_len p) 2 with
+    | True => False
+    | False => str_eq (str_slice p 1 1) ":"
+    end;
+
+def path_is_abs (p : String) : Bool :=
+    let n : String := path_from_host p in
+    orb (str_starts n "/") (path_has_drive n);
+
+def path_basename (p : String) : String :=
+    last String p (path_split p);
+
+def path_dirname (p : String) : String :=
+    let normalized : String := path_from_host p in
+    let parts : List String := path_split normalized in
+    match parts with
+    | Nil => "."
+    | Cons _ _ =>
+      let d : String := path_join (init String parts) in
+      match path_has_drive normalized with
+      | True =>
+        match eq_nat (str_len d) 2 with
+        | True => str_concat d "/"
+        | False => d
+        end
+      | False =>
+        match path_is_abs normalized with
+        | True => str_concat "/" d
+        | False =>
+          match str_null d with
+          | True => "."
+          | False => d
+          end
+        end
+      end
+    end;
+
+-- The extension includes its dot ("lib.ouro" -> ".ouro"), which is what
+-- path_has_ext and std/gate/share.ouro compare against. A leading dot is a
+-- hidden file, not an extension, so ".gitignore" has none.
+def path_ext (p : String) : String :=
+    let base : String := path_basename p in
+    match str_index (str_rev base) "." with
+    | Nothing => ""
+    | Just i =>
+      let cut : Nat := S i in
+      match eq_nat cut (str_len base) with
+      | True => ""
+      | False => str_slice base (sub (str_len base) cut) cut
+      end
+    end;
+
+def path_stem (p : String) : String :=
+    let base : String := path_basename p in
+    let ext : String := path_ext p in
+    match str_null ext with
+    | True => base
+    | False => str_slice base Z (sub (str_len base) (str_len ext))
+    end;
+
+def path_has_ext (p : String) (ext : String) : Bool :=
+    str_eq (path_ext p) ext;
+
+def path_ends_ouro (p : String) : Bool :=
+    path_has_ext p ".ouro";
+
+def path_ends_sh (p : String) : Bool :=
+    path_has_ext p ".sh";
+
+def path_ends_py (p : String) : Bool :=
+    path_has_ext p ".py";
+
+def path_ends_ml (p : String) : Bool :=
+    orb (path_has_ext p ".ml") (path_has_ext p ".mli");
+
+def path_ends_js (p : String) : Bool :=
+    path_has_ext p ".js";
+
+def path_is_code (p : String) : Bool :=
+    orb (path_ends_ouro p)
+      (orb (path_ends_sh p)
+        (orb (path_ends_py p)
+          (orb (path_ends_ml p) (path_ends_js p))));
+
+-- True when `p` is `prefix` itself or a descendant after a `/` boundary.
+-- `"a"` does not contain `"apple"`; a prefix that already ends in `/` is the boundary.
+def path_under (prefix : String) (p : String) : Bool :=
+    let normalized_prefix : String := path_from_host prefix in
+    let normalized_path : String := path_from_host p in
+    match andb (notb (str_null normalized_prefix))
+      (str_starts normalized_path normalized_prefix) with
+    | False => False
+    | True =>
+      match str_ends normalized_prefix "/" with
+      | True => True
+      | False =>
+        let rest : String :=
+          str_slice normalized_path
+            (str_len normalized_prefix)
+            (sub (str_len normalized_path) (str_len normalized_prefix)) in
+        orb (str_null rest) (str_starts rest "/")
+      end
+    end;
+
+-- `p` with a leading `root` and the separator after it removed; `p` unchanged
+-- when it does not sit at or below root. Used to rebuild a tree under a new root.
+def path_relative (root : String) (p : String) : String :=
+    let normalized_root : String := path_from_host root in
+    let normalized_path : String := path_from_host p in
+    match str_eq normalized_root "." with
+    | True => normalized_path
+    | False =>
+        match path_under normalized_root normalized_path with
+        | False => normalized_path
+        | True =>
+            let i : Nat := str_len normalized_root in
+            let rest : String :=
+              str_slice normalized_path i (sub (str_len normalized_path) i) in
+            match str_starts rest "/" with
+            | True => str_slice rest (S Z) (sub (str_len rest) (S Z))
+            | False => rest
+            end
+        end
+    end;
+
+def path_skip_build (p : String) : Bool :=
+    orb (path_under "_build/" p)
+      (orb (path_under "_tools/" p)
+        (str_contains p "node_modules/"));
+
+def path_norm_pop (absolute : Bool) (acc : List String) : List String :=
+    match acc with
+    | Nil =>
+        match absolute with
+        | True => Nil String
+        | False => ([ ".." ] : List String)
+        end
+    | Cons head rest =>
+        match andb absolute (path_has_drive head) with
+        | True => acc
+        | False =>
+            match str_eq head ".." with
+            | True =>
+                match absolute with
+                | True => acc
+                | False => Cons String ".." acc
+                end
+            | False => rest
+            end
+        end
+    end;
+
+def path_norm_step (absolute : Bool) (seg : String) (acc : List String) : List String :=
+    match str_eq seg "." with
+    | True => acc
+    | False =>
+        match str_eq seg ".." with
+        | True => path_norm_pop absolute acc
+        | False => Cons String seg acc
+        end
+    end;
+
+def path_normalize_go (absolute : Bool) (parts : List String)
+    (acc : List String) : List String :=
+  (fix go (rest : List String) (state : List String) : List String :=
+    match rest with
+    | Nil => state
+    | Cons seg tail => go tail (path_norm_step absolute seg state)
+    end) parts acc;
+
+-- Preserve a Windows drive prefix instead of rewriting `C:/...` as `/C:/...`.
+def path_normalize (p : String) : String :=
+    let normalized : String := path_from_host p in
+    let absolute : Bool := path_is_abs normalized in
+    let drive : Bool := path_has_drive normalized in
+    let parts : List String := reverse_lin String (path_normalize_go absolute (path_split normalized) (Nil String)) in
+    let body : String := path_join parts in
+    match absolute with
+    | True =>
+        match drive with
+        | True =>
+            match eq_nat (str_len body) 2 with
+            | True => str_concat body "/"
+            | False => body
+            end
+        | False =>
+            match str_null body with
+            | True => "/"
+            | False => str_concat "/" body
+            end
+        end
+    | False =>
+        match str_null body with
+        | True => "."
+        | False => body
+        end
+    end;
+
+def path_join_normalized (parts : List String) : String :=
+    path_normalize (path_join parts);
+
+def path_resolve_from_file (base : String) (spell : String) : String :=
+  match path_is_abs spell with
+  | True => path_normalize spell
+  | False => path_join_normalized ([ path_dirname base, spell ] : List String)
+  end;

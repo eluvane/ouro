@@ -1,0 +1,714 @@
+-- Packed frontend stitcher: shortcuts here remain untrusted until compile_program/kernel checking succeeds.
+-- Import-alias and record expanders run before lexing so C seams never rescan source.
+
+-- @entry compile_from_decls
+-- @export collect_lower_env_from; @doc docs/tcb.md
+-- @export lower_decls_env; @doc docs/tcb.md
+-- @export compile_from_decls; @doc docs/tcb.md
+-- @export compile_checked_from_decls; @doc docs/tcb.md
+
+import "source_text.ouro";
+import "../std/data.ouro";
+import "ast.ouro";
+import "token.ouro";
+import "core.ouro";
+import "pipeline_abi.ouro";
+import "pipeline_surface.ouro";
+import "pipeline_check.ouro";
+import "file_check_model.ouro";
+import "path.ouro";
+import "lower_decl_types.ouro";
+import "checked_program.ouro";
+import "core_literals.ouro";
+
+def pipeline_thousand : Nat := fuel1k;
+
+def depth_gate : Nat :=
+  add ten (add ten (add ten (S (S Z))));
+
+def parse_err_code : Nat := ten;
+def lex_malformed_err_code : Nat := S ten;
+def lex_exhausted_err_code : Nat := S (S ten);
+
+def gebNat (n : Nat) (m : Nat) : Bool :=
+  match compareNat n m with
+  | LT => False
+  | EQ => True
+  | GT => True
+  end;
+
+def maxNat2 (a : Nat) (b : Nat) : Nat :=
+  match gebNat a b with
+  | True => a
+  | False => b
+  end;
+
+def ctor_infos_of (indId : Nat) (nparams : Nat) (idx : Nat)
+    (cs : List (Pair Nat Expr)) : List CtorInfo :=
+    (fix go (rest : List (Pair Nat Expr)) (index : Nat) : List CtorInfo :=
+      match rest with
+      | Nil => Nil CtorInfo
+      | Cons ctor tail =>
+          match ctor with
+          | MkPair nameId ty =>
+              Cons CtorInfo
+                (MkCtorInfo nameId indId index nparams (expr_pi_arity pipeline_thousand ty))
+                (go tail (S index))
+          end
+      end) cs idx;
+
+def id_of_name (st : InternState) (name : List Nat) : Nat :=
+  match st with
+  | MkIntern ids _nextId _strs _nextStr =>
+      match source_lookup_id ids name with
+      | Nothing => Z
+      | Just n => n
+      end
+  end;
+
+def name_String : List Nat := ([83, 116, 114, 105, 110, 103] : List Nat);
+def name_Unit : List Nat := ([85, 110, 105, 116] : List Nat);
+def name_IO : List Nat := ([73, 79] : List Nat);
+def name_io_bind : List Nat := ([105, 111, 95, 98, 105, 110, 100] : List Nat);
+def name_pure : List Nat := ([112, 117, 114, 101] : List Nat);
+def name_List : List Nat := ([76, 105, 115, 116] : List Nat);
+def name_Nil : List Nat := ([78, 105, 108] : List Nat);
+def name_Cons : List Nat := ([67, 111, 110, 115] : List Nat);
+
+def collect_lower_env_from (st : InternState) : List Decl -> LowerEnv :=
+  fix go (ds : List Decl) : LowerEnv :=
+    match ds with
+    | Nil =>
+        let specials : List Nat :=
+          ([id_of_name st name_String, id_of_name st name_Unit, id_of_name st name_IO, id_of_name st name_io_bind, id_of_name st name_pure, id_of_name st name_List, id_of_name st name_Nil, id_of_name st name_Cons] : List Nat) in
+        MkLowerEnv (Nil Nat) (Nil Nat) (Nil CtorInfo)
+          specials
+          (Nil (Pair Nat Surface)) (Nil (Pair Nat Surface))
+    | Cons d ds' =>
+        match go ds' with
+        | MkLowerEnv cids iids ctors specials pays types =>
+            match d with
+            | DDef n _ _ =>
+                MkLowerEnv (Cons Nat n cids) iids ctors specials pays types
+            | DAxiom n _ =>
+                MkLowerEnv (Cons Nat n cids) iids ctors specials pays types
+            | DIntrinsic n _ _ _ =>
+                MkLowerEnv (Cons Nat n cids) iids ctors specials pays types
+            | DExtern n _ _ =>
+                MkLowerEnv (Cons Nat n cids) iids ctors specials pays types
+            | DRepresentation _ _ =>
+                MkLowerEnv cids iids ctors specials pays types
+            | DInductive n ps _fam cs =>
+                MkLowerEnv cids (Cons Nat n iids)
+                  (append CtorInfo
+                    (ctor_infos_of n (length (Pair Nat Expr) ps) Z cs) ctors)
+                  specials pays types
+            | DEffect _ _ _ =>
+                MkLowerEnv cids iids ctors specials pays types
+            | DImport _ =>
+                MkLowerEnv cids iids ctors specials pays types
+            end
+        end
+    end;
+
+def lower_decls_env
+  (lower_expr_env2 : LowerEnv -> Maybe Surface -> Expr -> Surface)
+  (env : LowerEnv) : List Decl -> List (Pair Nat Surface) :=
+  fix go (rest : List Decl) : List (Pair Nat Surface) :=
+    match rest with
+    | Nil => Nil (Pair Nat Surface)
+    | Cons d rest' =>
+        match d with
+        | DDef n ty body =>
+            let tyS : Surface := lower_expr_env2 env (Nothing Surface) ty in
+            Cons (Pair Nat Surface)
+              (MkPair Nat Surface n
+                (lower_expr_env2 env (Just Surface tyS) body))
+              (go rest')
+        | DAxiom _ _ => go rest'
+        | DIntrinsic _ _ _ _ => go rest'
+        | DExtern _ _ _ => go rest'
+        | DRepresentation _ _ => go rest'
+        | DInductive _ _ _ _ => go rest'
+        | DEffect _ _ _ => go rest'
+        | DImport _ => go rest'
+        end
+    end;
+
+-- SVar 0 in a binder annotation is the underscore dummy. SInd 0 keeps the
+-- established runtime binder shape; expected-directed declaration checking
+-- ignores this frontend-only annotation instead of granting it global meaning.
+def rewrite_surface_pairs : List (Pair Nat Surface) -> List (Pair Nat Surface) :=
+  fix go (xs : List (Pair Nat Surface)) : List (Pair Nat Surface) :=
+    match xs with
+    | Nil => Nil (Pair Nat Surface)
+    | Cons p xs' =>
+        match p with
+        | MkPair n s =>
+            Cons (Pair Nat Surface)
+              (MkPair Nat Surface n (rewrite_dummy_anns s))
+              (go xs')
+        end
+    end;
+
+def pipeline_env_io_id (env : LowerEnv) : Nat :=
+    match env with
+    | MkLowerEnv _ _ _ specials _ _ => compiler_nth_nat 2 specials
+    end;
+
+def pipeline_surface_result : Surface -> Surface :=
+  fix pipeline_surface_result (surface : Surface) : Surface :=
+    match surface with
+    | SPi _ _ cod => pipeline_surface_result cod
+    | SVar _ => surface
+    | SSort _ => surface
+    | SLam _ _ _ => surface
+    | SApp _ _ => surface
+    | SLet _ _ _ _ => surface
+    | SConst _ => surface
+    | SInd _ => surface
+    | SConstruct _ _ _ => surface
+    | SCase _ _ _ _ => surface
+    | SFix _ _ _ _ _ => surface
+    | SHole _ => surface
+    | SEffectRow _ => surface
+    | SPerform _ _ => surface
+    | SStr _ _ => surface
+    end;
+
+def pipeline_io_payload (env : LowerEnv) (surface : Surface) : Maybe Surface :=
+    match pipeline_surface_result surface with
+    | SApp head _payload =>
+        match head with
+        | SConst name =>
+            match eqNat name (pipeline_env_io_id env) with
+            | True => Just Surface surface
+            | False => Nothing Surface
+            end
+        | SVar _ => Nothing Surface
+        | SSort _ => Nothing Surface
+        | SPi _ _ _ => Nothing Surface
+        | SLam _ _ _ => Nothing Surface
+        | SApp _ _ => Nothing Surface
+        | SLet _ _ _ _ => Nothing Surface
+        | SInd _ => Nothing Surface
+        | SConstruct _ _ _ => Nothing Surface
+        | SCase _ _ _ _ => Nothing Surface
+        | SFix _ _ _ _ _ => Nothing Surface
+        | SHole _ => Nothing Surface
+        | SEffectRow _ => Nothing Surface
+        | SPerform _ _ => Nothing Surface
+        | SStr _ _ => Nothing Surface
+        end
+    | SVar _ => Nothing Surface
+    | SSort _ => Nothing Surface
+    | SPi _ _ _ => Nothing Surface
+    | SLam _ _ _ => Nothing Surface
+    | SLet _ _ _ _ => Nothing Surface
+    | SConst _ => Nothing Surface
+    | SInd _ => Nothing Surface
+    | SConstruct _ _ _ => Nothing Surface
+    | SCase _ _ _ _ => Nothing Surface
+    | SFix _ _ _ _ _ => Nothing Surface
+    | SHole _ => Nothing Surface
+    | SEffectRow _ => Nothing Surface
+    | SPerform _ _ => Nothing Surface
+    | SStr _ _ => Nothing Surface
+    end;
+
+def collect_io_payloads
+  (lower_expr_env2 : LowerEnv -> Maybe Surface -> Expr -> Surface)
+  (env : LowerEnv) : List Decl -> List (Pair Nat Surface) :=
+  fix collect_io_payloads (decls : List Decl) : List (Pair Nat Surface) :=
+    match decls with
+    | Nil => Nil (Pair Nat Surface)
+    | Cons decl rest =>
+        let tail : List (Pair Nat Surface) := collect_io_payloads rest in
+        match decl with
+        | DDef name ty _ =>
+            match pipeline_io_payload env
+              (rewrite_dummy_anns
+                (lower_expr_env2 env (Nothing Surface) ty)) with
+            | Nothing => tail
+            | Just payload =>
+                Cons (Pair Nat Surface) (MkPair Nat Surface name payload) tail
+            end
+        | DAxiom name ty =>
+            match pipeline_io_payload env
+              (rewrite_dummy_anns
+                (lower_expr_env2 env (Nothing Surface) ty)) with
+            | Nothing => tail
+            | Just payload =>
+                Cons (Pair Nat Surface) (MkPair Nat Surface name payload) tail
+            end
+        | DInductive _ _ _ _ => tail
+        | DEffect _ _ _ => tail
+        | DImport _ => tail
+        | DIntrinsic _ _ _ _ => tail
+        | DExtern _ _ _ => tail
+        | DRepresentation _ _ => tail
+        end
+    end;
+
+def populate_decl_types
+  (lower_expr_env2 : LowerEnv -> Maybe Surface -> Expr -> Surface)
+  (env : LowerEnv) (decls : List Decl) : LowerEnv :=
+    match env with
+    | MkLowerEnv constants inductives ctors specials payloads _ =>
+        MkLowerEnv constants inductives ctors specials payloads
+          (collect_decl_types
+            (fun (known : List (Pair Nat Surface)) (ty : Expr) =>
+              rewrite_dummy_anns
+                (lower_expr_env2
+                  (MkLowerEnv constants inductives ctors specials payloads known)
+                  (Nothing Surface) ty))
+            decls)
+    end;
+
+def populate_io_payloads
+  (lower_expr_env2 : LowerEnv -> Maybe Surface -> Expr -> Surface)
+  (env : LowerEnv) (decls : List Decl) : LowerEnv :=
+    let typed_env : LowerEnv := populate_decl_types lower_expr_env2 env decls in
+    match typed_env with
+    | MkLowerEnv constants inductives ctors specials _ types =>
+        MkLowerEnv constants inductives ctors specials
+          (collect_io_payloads lower_expr_env2 typed_env decls) types
+    end;
+
+def surface_depth : Surface -> Nat :=
+  fix go (s : Surface) : Nat :=
+    match s with
+    | SVar _ => S Z
+    | SSort _ => S Z
+    | SPi _ a b => S (maxNat2 (go a) (go b))
+    | SLam _ a b => S (maxNat2 (go a) (go b))
+    | SApp f a => S (maxNat2 (go f) (go a))
+    | SLet _ v t b => S (maxNat2 (go v) (maxNat2 (go t) (go b)))
+    | SConst _ => S Z
+    | SInd _ => S Z
+    | SConstruct _ _ _ => S Z
+    | SCase _ p sc bs =>
+        S (maxNat2 (go p)
+            (maxNat2 (go sc)
+              ((fix max_list (xs : List Surface) : Nat :=
+                  match xs with
+                  | Nil => Z
+                  | Cons x xs' => maxNat2 (go x) (max_list xs')
+                  end) bs)))
+    | SFix _ _ _ t b => S (maxNat2 (go t) (go b))
+    | SHole _ => S Z
+    | SEffectRow t => S (go t)
+    | SPerform _ args =>
+        S ((fix max_list (xs : List Surface) : Nat :=
+              match xs with
+              | Nil => Z
+              | Cons x xs' => maxNat2 (go x) (max_list xs')
+              end) args)
+    | SStr _ _ => S Z
+    end;
+
+def surfaces_max_depth : List (Pair Nat Surface) -> Nat :=
+  fix go (xs : List (Pair Nat Surface)) : Nat :=
+    match xs with
+    | Nil => Z
+    | Cons p xs' =>
+        match p with
+        | MkPair _ s => maxNat2 (surface_depth s) (go xs')
+        end
+    end;
+
+-- The fallback needs only a threshold, not every subtree's exact maximum.
+-- Explicit matches stop once one child reaches it, including shared subtrees.
+def surface_depth_at_least : Nat -> Surface -> Bool :=
+  fix reaches (minimum : Nat) (surface : Surface) : Bool :=
+    match minimum with
+    | Z => True
+    | S remaining =>
+        match remaining with
+        | Z => True
+        | S _ =>
+            let any_child : List Surface -> Bool :=
+              fix visit (children : List Surface) : Bool :=
+                match children with
+                | Nil => False
+                | Cons child rest =>
+                    match reaches remaining child with
+                    | True => True
+                    | False => visit rest
+                    end
+                end in
+            match surface with
+            | SVar _ => False
+            | SSort _ => False
+            | SPi _ domain codomain => any_child ([domain, codomain] : List Surface)
+            | SLam _ annotation body => any_child ([annotation, body] : List Surface)
+            | SApp function argument => any_child ([function, argument] : List Surface)
+            | SLet _ value typ body => any_child ([value, typ, body] : List Surface)
+            | SConst _ => False
+            | SInd _ => False
+            | SConstruct _ _ _ => False
+            | SCase _ predicate scrutinee branches =>
+                any_child (Cons Surface predicate (Cons Surface scrutinee branches))
+            | SFix _ _ _ typ body => any_child ([typ, body] : List Surface)
+            | SHole _ => False
+            | SEffectRow payload => reaches remaining payload
+            | SPerform _ arguments => any_child arguments
+            | SStr _ _ => False
+            end
+        end
+    end;
+
+def surfaces_depth_at_least (minimum : Nat)
+    (surfaces : List (Pair Nat Surface)) : Bool :=
+    match minimum with
+    | Z => True
+    | S _ =>
+        (fix visit (remaining : List (Pair Nat Surface)) : Bool :=
+          match remaining with
+          | Nil => False
+          | Cons pair rest =>
+              match pair with
+              | MkPair _ surface =>
+                  match surface_depth_at_least minimum surface with
+                  | True => True
+                  | False => visit rest
+                  end
+              end
+          end) surfaces
+    end;
+
+def surface_has_hole : Surface -> Bool :=
+  fix go (s : Surface) : Bool :=
+    match s with
+    | SVar _ => False
+    | SSort _ => False
+    | SPi _ a b => orb (go a) (go b)
+    | SLam _ a b => orb (go a) (go b)
+    | SApp f a => orb (go f) (go a)
+    | SLet _ v t b => orb (go v) (orb (go t) (go b))
+    | SConst _ => False
+    | SInd _ => False
+    | SConstruct _ _ _ => False
+    | SCase _ p sc bs =>
+        orb (go p)
+          (orb (go sc)
+            ((fix any_list (xs : List Surface) : Bool :=
+                match xs with
+                | Nil => False
+                | Cons x xs' =>
+                    match go x with
+                    | True => True
+                    | False => any_list xs'
+                    end
+                end) bs))
+    | SFix _ _ _ t b => orb (go t) (go b)
+    | SHole _ => True
+    | SEffectRow t => go t
+    | SPerform _ args =>
+        (fix any_list (xs : List Surface) : Bool :=
+            match xs with
+            | Nil => False
+            | Cons x xs' =>
+                match go x with
+                | True => True
+                | False => any_list xs'
+                end
+            end) args
+    | SStr _ _ => False
+    end;
+
+def surfaces_have_hole : List (Pair Nat Surface) -> Bool :=
+  fix go (xs : List (Pair Nat Surface)) : Bool :=
+    match xs with
+    | Nil => False
+    | Cons p xs' =>
+        match p with
+        | MkPair _ s =>
+            match surface_has_hole s with
+            | True => True
+            | False => go xs'
+            end
+        end
+    end;
+
+-- Declaration checker plan. These helpers preserve declared types, axioms,
+-- inductives, and effects while pairing each DDef with the exact emitted body.
+def compile_surfaces
+  (compile_program : List (Pair Nat Surface) -> CompResult (List (Pair Nat CoreTerm)))
+  (elaborate_surfaces : Nat -> List (Pair Nat Surface) -> List (Pair Nat CoreTerm))
+  (fuel : Nat) (surfaces : List (Pair Nat Surface))
+  : CompResult (List (Pair Nat CoreTerm)) :=
+    match compile_program surfaces with
+    | COk cores => COk (List (Pair Nat CoreTerm)) cores
+    | CErr e =>
+        match e with
+        | ErrCode c _d =>
+            match eqNat c (S (S Z)) with
+            | False => CErr (List (Pair Nat CoreTerm)) e
+            | True =>
+                match andb (surfaces_depth_at_least depth_gate surfaces)
+                  (notb (surfaces_have_hole surfaces)) with
+                | False => CErr (List (Pair Nat CoreTerm)) e
+                | True => COk (List (Pair Nat CoreTerm))
+                    (elaborate_surfaces fuel surfaces)
+                end
+            end
+        end
+    end;
+
+def decl_check_names : List Decl -> List Nat :=
+  fix decl_check_names (decls : List Decl) : List Nat :=
+    match decls with
+    | Nil => Nil Nat
+    | Cons decl rest =>
+        let tail : List Nat := decl_check_names rest in
+        match decl with
+        | DDef name _ _ => Cons Nat name tail
+        | DAxiom name _ => Cons Nat name tail
+        | DIntrinsic name _ _ _ => Cons Nat name tail
+        | DExtern name _ _ => Cons Nat name tail
+        | DRepresentation _ _ => tail
+        | DInductive name _ _ _ => Cons Nat name tail
+        | DEffect _ _ ops => append Nat (rec_field_names ops) tail
+        | DImport _ => tail
+        end
+    end;
+
+def decls_have_effect : List Decl -> Bool :=
+  fix decls_have_effect (decls : List Decl) : Bool :=
+    match decls with
+    | Nil => False
+    | Cons decl rest =>
+        match decl with
+        | DEffect _ _ _ => True
+        | DDef _ _ _ => decls_have_effect rest
+        | DAxiom _ _ => decls_have_effect rest
+        | DIntrinsic _ _ _ _ => decls_have_effect rest
+        | DExtern _ _ _ => decls_have_effect rest
+        | DRepresentation _ _ => decls_have_effect rest
+        | DInductive _ _ _ _ => decls_have_effect rest
+        | DImport _ => decls_have_effect rest
+        end
+    end;
+
+def unit_decl_names : List SrcUnit -> Nat -> List Nat :=
+  fix unit_decl_names (units : List SrcUnit) (root_id : Nat) : List Nat :=
+  match units with
+  | Nil => Nil Nat
+  | Cons unit rest =>
+      match unit with
+      | MkSrcUnit path_id decls =>
+          match eqNat path_id root_id with
+          | True => decl_check_names decls
+          | False => unit_decl_names rest root_id
+          end
+      end
+  end;
+
+def checked_emitted_body (name : Nat) : List Entry -> Maybe CoreTerm :=
+  fix find (entries : List Entry) : Maybe CoreTerm :=
+    match entries with
+    | Nil => Nothing CoreTerm
+    | Cons entry rest =>
+        match entry with
+        | MkEntry current _ body =>
+            match eqNat name current with
+            | True => body
+            | False => find rest
+            end
+        | MkIndEntry _ _ => find rest
+        | MkBoundEntry _ _ _ => find rest
+        | MkRoleEntry _ => find rest
+        end
+    end;
+
+def checked_emitted_cores (checked : List Entry)
+    : List (Pair Nat CoreTerm) -> CompResult (List (Pair Nat CoreTerm)) :=
+  fix emit (cores : List (Pair Nat CoreTerm)) : CompResult (List (Pair Nat CoreTerm)) :=
+    match cores with
+    | Nil => COk (List (Pair Nat CoreTerm)) (Nil (Pair Nat CoreTerm))
+    | Cons pair rest =>
+        match pair with
+        | MkPair name _ =>
+            match checked_emitted_body name checked with
+            | Nothing => CErr (List (Pair Nat CoreTerm)) (ErrCode 46 name)
+            | Just body =>
+                match emit rest with
+                | CErr error => CErr (List (Pair Nat CoreTerm)) error
+                | COk tail => COk (List (Pair Nat CoreTerm))
+                    (Cons (Pair Nat CoreTerm) (MkPair Nat CoreTerm name body) tail)
+                end
+            end
+        end
+    end;
+
+def check_emitted_decls
+  (check_module : Nat -> List Nat -> List FileItem -> DeclarationResult)
+  (lower_expr_env2 : LowerEnv -> Maybe Surface -> Expr -> Surface)
+  (elaborate : Nat -> Surface -> List Nat -> CoreTerm)
+  (selected : List Nat) (fuel : Nat) (st : InternState) (env : LowerEnv) (decls : List Decl)
+  (cores : List (Pair Nat CoreTerm))
+  : CompResult CheckedProgram :=
+    match build_check_plan lower_expr_env2 elaborate fuel env st decls cores with
+    | CheckPlanErr detail =>
+        CErr CheckedProgram (ErrCode 46 detail)
+    | CheckPlanOk items =>
+        literal_bind (List FileItem) CheckedProgram (resolve_literal_plan fuel st items)
+          (fun (resolved : List FileItem) => match check_module fuel selected resolved with
+        | DeclarationsOk checked =>
+            match checked_emitted_cores checked cores with
+            | CErr failure => CErr CheckedProgram failure
+            | COk emitted => COk CheckedProgram (CheckedProgramOf st checked emitted)
+            end
+        | DeclarationsErr name phase failure =>
+            CErr CheckedProgram
+              (ErrCode (add 40 (declaration_failure_code CheckSourceCore phase failure)) name)
+        end)
+    end;
+
+-- Declaration compilation receives a closed import graph. A remaining import
+-- has no supplied unit and must not disappear during lowering or plan building.
+def first_unresolved_import : List Decl -> Maybe Nat :=
+  fix scan (decls : List Decl) : Maybe Nat :=
+    match decls with
+    | Nil => Nothing Nat
+    | Cons decl rest => match decl with
+      | DImport path => Just Nat path
+      | DDef _ _ _ => scan rest | DAxiom _ _ => scan rest
+      | DInductive _ _ _ _ => scan rest | DEffect _ _ _ => scan rest
+      | DIntrinsic _ _ _ _ => scan rest | DExtern _ _ _ => scan rest
+      | DRepresentation _ _ => scan rest end end;
+
+-- Canonical stitch: desugar matches, collect env, lower, rewrite dummy
+-- anns, compile_program, fuel32 fallback to elaborate_surfaces, then check the
+-- ordered declaration plan against the exact emitted bodies.
+def compile_checked_from_decls
+  (desugar_file : List Decl -> List Decl)
+  (rewrite_declarations : Nat -> LowerEnv -> List Decl -> List Decl)
+  (lower_expr_env2 : LowerEnv -> Maybe Surface -> Expr -> Surface)
+  (compile_program : List (Pair Nat Surface) -> CompResult (List (Pair Nat CoreTerm)))
+  (elaborate_surfaces : Nat -> List (Pair Nat Surface) -> List (Pair Nat CoreTerm))
+  (elaborate : Nat -> Surface -> List Nat -> CoreTerm)
+  (check_module : Nat -> List Nat -> List FileItem -> DeclarationResult)
+  (selected : List Nat) (fuel : Nat) (st : InternState) (ds : List Decl)
+  : CompResult CheckedProgram :=
+    match first_unresolved_import ds with
+    | Just path => CErr CheckedProgram (ErrCode 92 path)
+    | Nothing =>
+        let ds1 : List Decl := desugar_file ds in
+        let base_env : LowerEnv := collect_lower_env_from st ds1 in
+        let ds2 : List Decl := rewrite_declarations fuel base_env ds1 in
+        let env : LowerEnv := populate_io_payloads lower_expr_env2 base_env ds2 in
+        let surfaces : List (Pair Nat Surface) :=
+          rewrite_surface_pairs (lower_decls_env lower_expr_env2 env ds2) in
+        match compile_surfaces compile_program elaborate_surfaces fuel surfaces with
+        | CErr e => CErr CheckedProgram e
+        | COk cores =>
+            check_emitted_decls check_module lower_expr_env2 elaborate
+              selected fuel st env ds2 cores
+        end
+    end;
+
+def compile_from_decls
+  (desugar_file : List Decl -> List Decl)
+  (rewrite_declarations : Nat -> LowerEnv -> List Decl -> List Decl)
+  (lower_expr_env2 : LowerEnv -> Maybe Surface -> Expr -> Surface)
+  (compile_program : List (Pair Nat Surface) -> CompResult (List (Pair Nat CoreTerm)))
+  (elaborate_surfaces : Nat -> List (Pair Nat Surface) -> List (Pair Nat CoreTerm))
+  (elaborate : Nat -> Surface -> List Nat -> CoreTerm)
+  (check_module : Nat -> List Nat -> List FileItem -> DeclarationResult)
+  (selected : List Nat) (fuel : Nat) (st : InternState) (ds : List Decl)
+  : CompResult (List (Pair Nat CoreTerm)) :=
+    checked_program_erase
+      (compile_checked_from_decls desugar_file rewrite_declarations lower_expr_env2
+        compile_program elaborate_surfaces elaborate check_module selected fuel st ds);
+
+def name_of_id (st : InternState) (id : Nat) : List Nat :=
+  match st with
+  | MkIntern ids _next _strs _nextStr =>
+      (fix go (xs : List (Pair (List Nat) Nat)) : List Nat :=
+          match xs with
+          | Nil => Nil Nat
+          | Cons p xs' =>
+              match p with
+              | MkPair s i =>
+                  match eqNat i id with
+                  | True => s
+                  | False => go xs'
+                  end
+              end
+          end) ids
+  end;
+
+def str_of_id (st : InternState) (id : Nat) : List Nat :=
+  match st with
+  | MkIntern _ids _next strs _nextStr =>
+      (fix go (xs : List (Pair (List Nat) Nat)) : List Nat :=
+          match xs with
+          | Nil => Nil Nat
+          | Cons p xs' =>
+              match p with
+              | MkPair s i =>
+                  match eqNat i id with
+                  | True => s
+                  | False => go xs'
+                  end
+              end
+          end) strs
+  end;
+
+def canon_imports (base : List Nat)
+    (intern_string : InternState -> List Nat -> Pair Nat InternState)
+    (initial : InternState) (decls : List Decl) : Pair (List Decl) InternState :=
+  (fix go (ds : List Decl) (st : InternState)
+    : Pair (List Decl) InternState :=
+    match ds with
+    | Nil => MkPair (List Decl) InternState (Nil Decl) st
+    | Cons d ds' =>
+        match d with
+        | DImport spellId =>
+            match intern_string st (canon_path base (str_of_id st spellId)) with
+            | MkPair cid st1 =>
+                match go ds' st1 with
+                | MkPair rest st2 =>
+                    MkPair (List Decl) InternState
+                      (Cons Decl (DImport cid) rest) st2
+                end
+            end
+        | DDef _ _ _ =>
+            match go ds' st with
+            | MkPair rest st2 =>
+                MkPair (List Decl) InternState (Cons Decl d rest) st2
+            end
+        | DAxiom _ _ =>
+            match go ds' st with
+            | MkPair rest st2 =>
+                MkPair (List Decl) InternState (Cons Decl d rest) st2
+            end
+        | DInductive _ _ _ _ =>
+            match go ds' st with
+            | MkPair rest st2 =>
+                MkPair (List Decl) InternState (Cons Decl d rest) st2
+            end
+        | DEffect _ _ _ =>
+            match go ds' st with
+            | MkPair rest st2 =>
+                MkPair (List Decl) InternState (Cons Decl d rest) st2
+            end
+        | DIntrinsic _ _ _ _ =>
+            match go ds' st with
+            | MkPair rest st2 =>
+                MkPair (List Decl) InternState (Cons Decl d rest) st2
+            end
+        | DExtern _ _ _ =>
+            match go ds' st with
+            | MkPair rest st2 =>
+                MkPair (List Decl) InternState (Cons Decl d rest) st2
+            end
+        | DRepresentation _ _ =>
+            match go ds' st with
+            | MkPair rest st2 =>
+                MkPair (List Decl) InternState (Cons Decl d rest) st2
+            end
+        end
+    end) decls initial;

@@ -1,0 +1,282 @@
+-- Internal checked-Core managed lowering. Machine/raw functions retain their
+-- existing ABI; ordinary captured values use the managed object ABI v1.
+import "lower.ouro";
+import "../erasure.ouro";
+import "../source_text.ouro";
+
+-- Construction is a distinct stage, not evidence of MIR acceptance. The
+-- managed source entry validates these parts before returning them.
+inductive ManagedProgramParts : Type :=
+  | ManagedProgramOf : CheckedProgram -> List LowerContract -> MirProgram -> ManagedProgramParts;
+
+inductive ManagedCompiler : Type :=
+  | ManagedCompilerOf : CheckedProgram -> List Nat -> Nat -> Nat -> Nat -> Nat -> Nat -> Nat
+      -> List LowerContract -> CheckEnvironment -> ManagedCompiler;
+
+-- Fresh symbol, generated functions/data, pending/known globals, current flow.
+inductive ManagedState : Type :=
+  | ManagedStateOf : Nat -> List MirFunction -> List MirData -> List Nat -> List Nat -> LowerState -> ManagedState;
+
+inductive ManagedResult : Type :=
+  | ManagedResultOf : MirValue -> ManagedState -> ManagedResult;
+
+inductive ManagedFields : Type :=
+  | ManagedFieldsOf : List MirValue -> ManagedState -> ManagedFields;
+
+-- Nothing records an erased type binder and preserves Core de Bruijn indices.
+def ManagedScope : Type := List (Maybe MirValue);
+def ManagedStep : Type := ManagedScope -> CoreTerm -> ManagedState -> Either NativeLowerError ManagedResult;
+
+def managed_compiler_program (compiler : ManagedCompiler) : CheckedProgram :=
+    match compiler with | ManagedCompilerOf program _ _ _ _ _ _ _ _ _ => program end;
+
+def managed_compiler_entries (compiler : ManagedCompiler) : List Entry :=
+    checked_program_entries (managed_compiler_program compiler);
+
+-- Derived once from the same ordered checked entries, never separate
+-- acceptance evidence. Updating raw contracts retains this lookup state.
+def managed_compiler_environment (compiler : ManagedCompiler) : CheckEnvironment :=
+    match compiler with | ManagedCompilerOf _ _ _ _ _ _ _ _ _ environment => environment end;
+
+def managed_compiler_types (compiler : ManagedCompiler) : List Nat :=
+    match compiler with | ManagedCompilerOf _ types _ _ _ _ _ _ _ _ => types end;
+
+def managed_descriptor (compiler : ManagedCompiler) (kind : Nat) : Nat :=
+    match compiler with | ManagedCompilerOf _ _ _ _ _ _ _ base _ _ => add base kind end;
+
+def managed_compiler_raw (compiler : ManagedCompiler) : List LowerContract :=
+    match compiler with | ManagedCompilerOf _ _ _ _ _ _ _ _ contracts _ => contracts end;
+
+def managed_compiler_with_raw (compiler : ManagedCompiler) (contracts : List LowerContract) : ManagedCompiler :=
+    match compiler with | ManagedCompilerOf program types allocator collector release inspect exit base _ environment =>
+      ManagedCompilerOf program types allocator collector release inspect exit base contracts environment end;
+
+def managed_source_symbol (program : CheckedProgram) (name : List Nat) : Either NativeLowerError Nat :=
+    match checked_program_intern program with | MkIntern names _ _ _ =>
+      match source_lookup_id names name with | Just id => Right NativeLowerError Nat id
+      | Nothing => Left NativeLowerError Nat (LowerUnknownGlobal 0) end end;
+
+-- A runtime spelling selects a candidate definition, never a source primitive.
+-- Require its checked body and complete normalized Core type before linking.
+-- Pointer pointees and Runtime/Bool identities are part of this comparison.
+def managed_runtime_definition (compiler : ManagedCompiler) (fuel : Nat) (name : List Nat)
+    (expected : CoreTerm) : Either NativeLowerError Nat :=
+    lower_bind Nat Nat (managed_source_symbol (managed_compiler_program compiler) name) (fun (id : Nat) =>
+      match lower_find_entry id (managed_compiler_entries compiler) with
+      | Nothing => Left NativeLowerError Nat (LowerUnknownGlobal id)
+      | Just entry => match entry with
+        | MkEntry _ annotation body => match body with
+          | Nothing => Left NativeLowerError Nat (LowerBodyMismatch id)
+          | Just _ => let environment : CheckEnvironment := managed_compiler_environment compiler in
+              lower_bind CoreTerm Nat (lower_normalize fuel environment annotation) (fun (normal : CoreTerm) =>
+                lower_bind CoreTerm Nat (lower_normalize fuel environment expected) (fun (wanted : CoreTerm) =>
+                  lower_map Unit Nat (fun (_ : Unit) => id) (lower_core_equal fuel id normal wanted))) end
+        | MkBoundEntry _ _ _ => Left NativeLowerError Nat (LowerBodyMismatch id)
+        | MkIndEntry _ _ => Left NativeLowerError Nat (LowerBodyMismatch id)
+        | MkRoleEntry _ => Left NativeLowerError Nat (LowerBodyMismatch id) end end);
+
+-- The raw dependency pass must already have compiled the same definition.
+def managed_runtime_contract (compiler : ManagedCompiler) (fuel : Nat) (name : List Nat)
+    (expected : CoreTerm) : Either NativeLowerError LowerContract :=
+    lower_bind Nat LowerContract (managed_runtime_definition compiler fuel name expected) (fun (id : Nat) =>
+      match lower_find_contract id (managed_compiler_raw compiler) with
+      | Nothing => Left NativeLowerError LowerContract (LowerInvalidCall id)
+      | Just contract => match contract with | LowerContractOf _ annotation _ _ binding =>
+        match binding with | Just _ => Left NativeLowerError LowerContract (LowerBodyMismatch id)
+        | Nothing => lower_bind CoreTerm LowerContract
+            (lower_normalize fuel (managed_compiler_environment compiler) expected)
+            (fun (wanted : CoreTerm) => lower_map Unit LowerContract (fun (_ : Unit) => contract)
+              (lower_core_equal fuel id annotation wanted)) end end end);
+
+-- A pure helper may be needed through both ABIs. Its generic value accessor
+-- has a disjoint symbol instead of reusing the typed machine function symbol.
+def managed_global_symbol (compiler : ManagedCompiler) (source_id : Nat) : Nat :=
+    managed_descriptor compiler (add 32 source_id);
+
+def managed_word_kind (word : PrimitiveWord) : Nat :=
+    match word with | PrimitiveWordU8 => 9 | PrimitiveWordU32 => 10 | PrimitiveWordU64 => 11
+    | PrimitiveWordI32 => 12 | PrimitiveWordUSize => 13 end;
+
+def managed_bits (typ : MirType) (value : Nat) : MirValue :=
+    MirBits typ (X64Words64 (pe_word32 value) codegen_zero);
+
+def managed_flow (state : ManagedState) : LowerState :=
+    match state with | ManagedStateOf _ _ _ _ _ flow => flow end;
+
+def managed_with_flow (state : ManagedState) (flow : LowerState) : ManagedState :=
+    match state with | ManagedStateOf symbol functions data pending known _ =>
+      ManagedStateOf symbol functions data pending known flow end;
+
+def managed_emit (instruction : MirInstruction) (state : ManagedState) : ManagedState :=
+    managed_with_flow state (lower_emit instruction (managed_flow state));
+
+def managed_emit_all (instructions : List MirInstruction) (state : ManagedState) : ManagedState :=
+    foldl MirInstruction ManagedState (fun (current : ManagedState) (instruction : MirInstruction) =>
+      managed_emit instruction current) state instructions;
+
+def managed_fresh_local (typ : MirType) (state : ManagedState)
+    : Either NativeLowerError (Pair Nat ManagedState) :=
+    match managed_flow state with | LowerStateOf local locals instructions flow =>
+      lower_map Unit (Pair Nat ManagedState) (fun (_ : Unit) =>
+        MkPair Nat ManagedState local (managed_with_flow state
+          (LowerStateOf (S local) (Cons MirLocal (MirLocalDef local typ) locals) instructions flow)))
+        (lower_require (ltb_nat local pe_max_rva) LowerResourceExhausted) end;
+
+def managed_fresh (typ : MirType) (instruction : Nat -> MirInstruction) (state : ManagedState)
+    : Either NativeLowerError ManagedResult :=
+    lower_map (Pair Nat ManagedState) ManagedResult (fun (pair : Pair Nat ManagedState) => match pair with
+      | MkPair local next => ManagedResultOf (MirUse local) (managed_emit (instruction local) next) end)
+      (managed_fresh_local typ state);
+
+def managed_load (typ : MirType) (base : MirValue) (offset : Nat) (state : ManagedState)
+    : Either NativeLowerError ManagedResult :=
+    managed_fresh typ (fun (local : Nat) => MirLoad local base (codegen_disp offset)) state;
+
+def managed_address (symbol : Nat) (state : ManagedState) : Either NativeLowerError ManagedResult :=
+    managed_fresh MirRawPtr (fun (local : Nat) => MirAddress local symbol) state;
+
+def managed_compare (operation : MirComparison) (left : MirValue) (right : MirValue) (state : ManagedState)
+    : Either NativeLowerError ManagedResult :=
+    managed_fresh MirU8 (fun (local : Nat) => MirCompare local operation left right) state;
+
+def managed_binary (typ : MirType) (operation : MirBinary) (left : MirValue) (right : MirValue)
+    (state : ManagedState) : Either NativeLowerError ManagedResult :=
+    managed_fresh typ (fun (local : Nat) => MirBinaryOp local operation left right) state;
+
+def managed_convert (typ : MirType) (operation : MirConversion) (value : MirValue) (state : ManagedState)
+    : Either NativeLowerError ManagedResult :=
+    managed_fresh typ (fun (local : Nat) => MirConvert local operation value) state;
+
+def managed_fresh_symbol (state : ManagedState) : Either NativeLowerError (Pair Nat ManagedState) :=
+    match state with | ManagedStateOf symbol functions data pending known flow =>
+      lower_map Unit (Pair Nat ManagedState) (fun (_ : Unit) => MkPair Nat ManagedState symbol
+        (ManagedStateOf (S symbol) functions data pending known flow))
+        (lower_require (ltb_nat symbol pe_max_rva) LowerResourceExhausted) end;
+
+def managed_request_global (id : Nat) (state : ManagedState) : ManagedState :=
+    match state with | ManagedStateOf symbol functions data pending known flow =>
+      match mir_has id known with | True => state | False =>
+        ManagedStateOf symbol functions data (Cons Nat id pending) (Cons Nat id known) flow end end;
+
+def managed_add_function (function : MirFunction) (state : ManagedState) : ManagedState :=
+    match state with | ManagedStateOf symbol functions data pending known flow =>
+      ManagedStateOf symbol (Cons MirFunction function functions) data pending known flow end;
+
+def managed_add_data (object : MirData) (state : ManagedState) : ManagedState :=
+    match state with | ManagedStateOf symbol functions data pending known flow =>
+      ManagedStateOf symbol functions (Cons MirData object data) pending known flow end;
+
+def managed_finish_function (id : Nat) (name : List Nat) (arguments : List MirLocal)
+    (value : MirValue) (state : ManagedState) : MirFunction :=
+    match managed_flow state with | LowerStateOf _ locals _ _ =>
+      MirFunctionDef id name arguments (reverse MirLocal locals) (Just MirType MirManagedPtr) 0
+        (lower_finish_blocks (MirReturn (Just MirValue value)) (managed_flow state)) end;
+
+def managed_guard (condition : MirValue) (state : ManagedState) : Either NativeLowerError ManagedState :=
+    lower_map LowerLoopBlocks ManagedState (fun (labels : LowerLoopBlocks) => match labels with
+      | LowerLoopAt valid invalid _ flow => managed_with_flow state
+          (lower_switch_block valid MirTrap (lower_switch_block invalid (MirBranch condition valid invalid) flow)) end)
+      (lower_loop_blocks (managed_flow state));
+
+def managed_fresh_block (state : ManagedState) : Either NativeLowerError (Pair Nat ManagedState) :=
+    match managed_flow state with | LowerStateOf local locals instructions flow =>
+      match flow with | LowerFlowOf current label blocks => lower_map Unit (Pair Nat ManagedState)
+        (fun (_ : Unit) => MkPair Nat ManagedState label (managed_with_flow state
+          (LowerStateOf local locals instructions (LowerFlowOf current (S label) blocks))))
+        (lower_require (ltb_nat label pe_max_rva) LowerResourceExhausted) end end;
+
+def managed_switch_block (target : Nat) (terminator : MirTerminator) (state : ManagedState) : ManagedState :=
+    managed_with_flow state (lower_switch_block target terminator (managed_flow state));
+
+def managed_require_equal (left : MirValue) (right : MirValue) (state : ManagedState)
+    : Either NativeLowerError ManagedState :=
+    lower_bind ManagedResult ManagedState (managed_compare MirEqual left right state)
+      (fun (result : ManagedResult) => match result with | ManagedResultOf condition next => managed_guard condition next end);
+
+def managed_scope_erasure (scope : ManagedScope) : List BEntry :=
+    map (Maybe MirValue) BEntry (fun (binding : Maybe MirValue) => MkB 0 (match binding with
+      | Nothing => True | Just _ => False end)) scope;
+
+def managed_erased_argument (compiler : ManagedCompiler) (scope : ManagedScope) (argument : CoreTerm) : Bool :=
+    is_type_arg_ctx_with (managed_compiler_types compiler) argument (managed_scope_erasure scope);
+
+def managed_values (scope : ManagedScope) : List MirValue :=
+    concat_map (Maybe MirValue) MirValue (fun (binding : Maybe MirValue) => match binding with
+      | Nothing => ([] : List MirValue) | Just value => ([value] : List MirValue) end) scope;
+
+def managed_store_fields (base : MirValue) : List MirValue -> Nat -> ManagedState -> ManagedState :=
+  fix store_fields (values : List MirValue) (offset : Nat) (state : ManagedState) : ManagedState :=
+    match values with | Nil => state | Cons value rest => store_fields rest (add offset 8)
+      (managed_emit (MirStore base (codegen_disp offset) value) state) end;
+
+-- Dynamic sizes are checked and rounded by their representation owner before
+-- allocation. The raw allocator still rejects overflow, unaligned, or invalid
+-- sizes; this bridge preserves both descriptor identity and collector hooks.
+def managed_allocate_sized (compiler : ManagedCompiler) (kind : Nat) (bytes : MirValue) (state : ManagedState)
+    : Either NativeLowerError ManagedResult :=
+    match compiler with | ManagedCompilerOf _ _ allocator collector _ _ _ _ _ _ =>
+      managed_fresh MirManagedPtr (fun (local : Nat) =>
+        MirManagedAlloc local allocator collector (managed_descriptor compiler kind) bytes) state end;
+
+def managed_allocate_value (compiler : ManagedCompiler) (kind : Nat) (bytes : Nat) (state : ManagedState)
+    : Either NativeLowerError ManagedResult :=
+    lower_bind Unit ManagedResult (lower_require (leb_nat bytes pe_max_rva) LowerResourceExhausted)
+      (fun (_ : Unit) => managed_allocate_sized compiler kind (managed_bits MirUSize bytes) state);
+
+-- Check a boxed boundary before reading its payload or callable code pointer.
+def managed_expect_descriptor (compiler : ManagedCompiler) (kind : Nat) (value : MirValue) (state : ManagedState)
+    : Either NativeLowerError ManagedState :=
+    lower_bind ManagedResult ManagedState (managed_load MirRawPtr value 0 state)
+      (fun (actual : ManagedResult) => match actual with | ManagedResultOf descriptor next =>
+        lower_bind ManagedResult ManagedState (managed_address (managed_descriptor compiler kind) next)
+          (fun (expected : ManagedResult) => match expected with | ManagedResultOf wanted after =>
+            managed_require_equal descriptor wanted after end) end);
+
+def managed_box_word (compiler : ManagedCompiler) (word : PrimitiveWord) (value : MirValue) (state : ManagedState)
+    : Either NativeLowerError ManagedResult :=
+    lower_map ManagedResult ManagedResult (fun (allocated : ManagedResult) => match allocated with
+      | ManagedResultOf base next => ManagedResultOf base (managed_emit (MirStore base (codegen_disp 32) value) next) end)
+      (managed_allocate_value compiler (managed_word_kind word) 40 state);
+
+def managed_unbox_word (compiler : ManagedCompiler) (word : PrimitiveWord) (value : MirValue) (state : ManagedState)
+    : Either NativeLowerError ManagedResult :=
+    lower_bind ManagedState ManagedResult (managed_expect_descriptor compiler (managed_word_kind word) value state)
+      (fun (next : ManagedState) => managed_load (lower_word word) value 32 next);
+
+def managed_constructor (compiler : ManagedCompiler) (family : Nat) (tag : MirValue)
+    (fields : List MirValue) (state : ManagedState) : Either NativeLowerError ManagedResult :=
+    lower_map ManagedResult ManagedResult (fun (allocated : ManagedResult) => match allocated with
+      | ManagedResultOf base next => ManagedResultOf base (managed_store_fields base fields 56
+          (managed_emit_all ([MirStore base (codegen_disp 32) (managed_bits MirUSize family),
+            MirStore base (codegen_disp 40) tag,
+            MirStore base (codegen_disp 48) (managed_bits MirUSize (length MirValue fields))] : List MirInstruction) next)) end)
+      (managed_allocate_value compiler 1 (add 56 (mul 8 (length MirValue fields))) state);
+
+def managed_boolean (compiler : ManagedCompiler) (condition : MirValue) (state : ManagedState)
+    : Either NativeLowerError ManagedResult :=
+    lower_bind Nat ManagedResult (lower_role_identity (managed_compiler_entries compiler) PrimitiveBoolRole)
+      (fun (family : Nat) => lower_bind ManagedResult ManagedResult (managed_convert MirUSize MirZeroExtend condition state)
+        (fun (extended : ManagedResult) => match extended with | ManagedResultOf value next =>
+          lower_bind ManagedResult ManagedResult (managed_binary MirUSize MirSub (managed_bits MirUSize 1) value next)
+            (fun (tag : ManagedResult) => match tag with | ManagedResultOf ordinal after =>
+              managed_constructor compiler family ordinal ([] : List MirValue) after end) end));
+
+def managed_unbox_boolean (compiler : ManagedCompiler) (value : MirValue) (state : ManagedState)
+    : Either NativeLowerError ManagedResult :=
+    lower_bind Nat ManagedResult (lower_role_identity (managed_compiler_entries compiler) PrimitiveBoolRole)
+      (fun (family : Nat) => lower_bind ManagedState ManagedResult (managed_expect_descriptor compiler 1 value state)
+        (fun (checked : ManagedState) => lower_bind ManagedResult ManagedResult (managed_load MirUSize value 32 checked)
+          (fun (loaded_family : ManagedResult) => match loaded_family with | ManagedResultOf actual next =>
+            lower_bind ManagedState ManagedResult (managed_require_equal actual (managed_bits MirUSize family) next)
+              (fun (family_checked : ManagedState) => lower_bind ManagedResult ManagedResult (managed_load MirUSize value 48 family_checked)
+                (fun (loaded_count : ManagedResult) => match loaded_count with | ManagedResultOf count after_count =>
+                  lower_bind ManagedState ManagedResult (managed_require_equal count (managed_bits MirUSize 0) after_count)
+                    (fun (count_checked : ManagedState) => lower_bind ManagedResult ManagedResult (managed_load MirUSize value 40 count_checked)
+                      (fun (loaded_tag : ManagedResult) => match loaded_tag with | ManagedResultOf tag after_tag =>
+                        lower_bind ManagedResult ManagedResult (managed_compare MirLess tag (managed_bits MirUSize 2) after_tag)
+                          (fun (range : ManagedResult) => match range with | ManagedResultOf valid after_range =>
+                            lower_bind ManagedState ManagedResult (managed_guard valid after_range)
+                              (fun (tag_checked : ManagedState) => lower_bind ManagedResult ManagedResult
+                                (managed_binary MirUSize MirSub (managed_bits MirUSize 1) tag tag_checked)
+                                (fun (boolean : ManagedResult) => match boolean with | ManagedResultOf bits after =>
+                                  managed_convert MirU8 MirNarrow bits after end)) end) end)) end)) end)));

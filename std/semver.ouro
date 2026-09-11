@@ -1,0 +1,229 @@
+-- Semver is intentionally partial: prerelease/build metadata is rejected rather than guessed.
+-- Range parsing is longest-operator-first so >= and <= are not split as single-character ops.
+
+import "stringx.ouro";
+import "parse.ouro";
+
+inductive Semver : Type :=
+  | MkSemver : Nat -> Nat -> Nat -> Semver;
+
+def sv_major (v : Semver) : Nat :=
+    match v with
+    | MkSemver a _ _ => a
+    end;
+
+def sv_minor (v : Semver) : Nat :=
+    match v with
+    | MkSemver _ b _ => b
+    end;
+
+def sv_patch (v : Semver) : Nat :=
+    match v with
+    | MkSemver _ _ c => c
+    end;
+
+def sv_show (v : Semver) : String :=
+    match v with
+    | MkSemver a b c =>
+        str_cat3 (str_concat (show_nat a) ".")
+          (str_concat (show_nat b) ".")
+          (show_nat c)
+    end;
+
+-- Field i of a dotted version; a missing or empty field reads as 0.
+def sv_field (parts : List String) (i : Nat) : Maybe Nat :=
+    let s : String := nth String "" i parts in
+    match str_null s with
+    | True => Just Nat Z
+    | False => parse_nat s
+    end;
+
+def sv_parse (s : String) : Maybe Semver :=
+    let parts : List String := str_split (str_trim s) ch_dot in
+    match ltb_nat 3 (length String parts) with
+    | True => Nothing Semver
+    | False =>
+      match sv_field parts Z with
+      | Nothing => Nothing Semver
+      | Just a =>
+        match sv_field parts (S Z) with
+        | Nothing => Nothing Semver
+        | Just b =>
+          match sv_field parts (S (S Z)) with
+          | Nothing => Nothing Semver
+          | Just c => Just Semver (MkSemver a b c)
+          end
+        end
+      end
+    end;
+
+def sv_cmp (a : Semver) (b : Semver) : Ordering :=
+    match compareNat (sv_major a) (sv_major b) with
+    | LT => LT
+    | GT => GT
+    | EQ =>
+      match compareNat (sv_minor a) (sv_minor b) with
+      | LT => LT
+      | GT => GT
+      | EQ => compareNat (sv_patch a) (sv_patch b)
+      end
+    end;
+
+def sv_eq (a : Semver) (b : Semver) : Bool :=
+    match sv_cmp a b with
+    | EQ => True
+    | LT => False
+    | GT => False
+    end;
+
+def sv_lt (a : Semver) (b : Semver) : Bool :=
+    match sv_cmp a b with
+    | LT => True
+    | EQ => False
+    | GT => False
+    end;
+
+def sv_le (a : Semver) (b : Semver) : Bool :=
+    notb (sv_lt b a);
+
+-- Upper bound of a caret range: 1.2.3 -> 2.0.0, 0.2.3 -> 0.3.0, 0.0.3 -> 0.1.0.
+def sv_caret_limit (v : Semver) : Semver :=
+    match v with
+    | MkSemver a b _ =>
+        match a with
+        | S _ => MkSemver (S a) Z Z
+        | Z =>
+            match b with
+            | S _ => MkSemver Z (S b) Z
+            | Z => MkSemver Z (S Z) Z
+            end
+        end
+    end;
+
+def sv_tilde_limit (v : Semver) : Semver :=
+    match v with
+    | MkSemver a b _ => MkSemver a (S b) Z
+    end;
+
+inductive SvRange : Type :=
+  | SvAny : SvRange
+  | SvExact : Semver -> SvRange
+  | SvAtLeast : Semver -> SvRange
+  | SvGreater : Semver -> SvRange
+  | SvAtMost : Semver -> SvRange
+  | SvBelow : Semver -> SvRange
+  | SvBetween : Semver -> Semver -> SvRange
+  | SvBad : SvRange;
+
+-- Every wrapper is a named function rather than a bare constructor: a
+-- constructor passed as a value is not applicable at runtime.
+def sv_range_of (mk : Semver -> SvRange) (rest : String) : SvRange :=
+    match sv_parse rest with
+    | Nothing => SvBad
+    | Just v => mk v
+    end;
+
+def sv_caret (v : Semver) : SvRange := SvBetween v (sv_caret_limit v);
+
+def sv_tilde (v : Semver) : SvRange := SvBetween v (sv_tilde_limit v);
+
+def sv_exact (v : Semver) : SvRange := SvExact v;
+
+def sv_at_least (v : Semver) : SvRange := SvAtLeast v;
+
+def sv_greater (v : Semver) : SvRange := SvGreater v;
+
+def sv_at_most (v : Semver) : SvRange := SvAtMost v;
+
+def sv_below (v : Semver) : SvRange := SvBelow v;
+
+-- Longest operator first, so ">=" is not read as ">".
+def sv_range_parse (s : String) : SvRange :=
+    let t : String := str_trim s in
+    match orb (str_null t) (str_eq t "*") with
+    | True => SvAny
+    | False =>
+      match str_strip_prefix t ">=" with
+      | Just r => sv_range_of sv_at_least r
+      | Nothing =>
+        match str_strip_prefix t "<=" with
+        | Just r => sv_range_of sv_at_most r
+        | Nothing =>
+          match str_strip_prefix t "^" with
+          | Just r => sv_range_of sv_caret r
+          | Nothing =>
+            match str_strip_prefix t "~" with
+            | Just r => sv_range_of sv_tilde r
+            | Nothing =>
+              match str_strip_prefix t ">" with
+              | Just r => sv_range_of sv_greater r
+              | Nothing =>
+                match str_strip_prefix t "<" with
+                | Just r => sv_range_of sv_below r
+                | Nothing =>
+                  match str_strip_prefix t "=" with
+                  | Just r => sv_range_of sv_exact r
+                  | Nothing => sv_range_of sv_exact t
+                  end
+                end
+              end
+            end
+          end
+        end
+      end
+    end;
+
+def sv_in_range (r : SvRange) (v : Semver) : Bool :=
+    match r with
+    | SvAny => True
+    | SvBad => False
+    | SvExact w => sv_eq v w
+    | SvAtLeast w => sv_le w v
+    | SvGreater w => sv_lt w v
+    | SvAtMost w => sv_le v w
+    | SvBelow w => sv_lt v w
+    | SvBetween lo hi => andb (sv_le lo v) (sv_lt v hi)
+    end;
+
+def sv_matches (range : String) (version : String) : Bool :=
+    match sv_parse version with
+    | Nothing => False
+    | Just v => sv_in_range (sv_range_parse range) v
+    end;
+
+def sv_sort (vs : List Semver) : List Semver :=
+    sort_insert Semver sv_le vs;
+
+def sv_parse_all (vs : List String) : List Semver :=
+    foldr String (List Semver)
+      (fun (s : String) (acc : List Semver) =>
+        match sv_parse s with
+        | Nothing => acc
+        | Just v => Cons Semver v acc
+        end)
+      (Nil Semver) vs;
+
+-- Highest version satisfying the range, Nothing when none does.
+def sv_best (range : String) (vs : List Semver) : Maybe Semver :=
+    let r : SvRange := sv_range_parse range in
+    foldr Semver (Maybe Semver)
+      (fun (v : Semver) (acc : Maybe Semver) =>
+        match sv_in_range r v with
+        | False => acc
+        | True =>
+          match acc with
+          | Nothing => Just Semver v
+          | Just w =>
+            match sv_lt w v with
+            | True => Just Semver v
+            | False => acc
+            end
+          end
+        end)
+      (Nothing Semver) vs;
+
+def sv_best_str (range : String) (vs : List String) : Maybe String :=
+    match sv_best range (sv_parse_all vs) with
+    | Nothing => Nothing String
+    | Just v => Just String (sv_show v)
+    end;

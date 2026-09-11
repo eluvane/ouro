@@ -1,0 +1,72 @@
+-- Canonical stdin identities carry the complete argument, effect and result.
+import "../compiler/file_elab.ouro";
+import "../compiler/checked_program_output.ouro";
+import "../std/test.ouro";
+import "compiler_binding_surface.ouro";
+
+def stdin_binding_type (bytes : Bool) (aliases : Bool) (bad_argument : Bool) (pure_result : Bool) : CoreTerm :=
+    let text : CoreTerm := match aliases with | True => CConst 108 | False => CConst 100 end in
+    let count : CoreTerm := match aliases with | True => CConst 111 | False => CInd 102 end in
+    let runtime : CoreTerm := match aliases with | True => CConst 109 | False => CConst 101 end in
+    let result : CoreTerm := match pure_result with | True => text | False => CApp runtime text end in
+    match bytes with
+    | False => match bad_argument with | True => CPi text result | False => result end
+    | True => CPi (match bad_argument with | True => text | False => count end) result end;
+
+def stdin_binding_id (bytes : Bool) : PrimitiveId :=
+    match bytes with | False => PrimitiveStdinReadLine | True => PrimitiveStdinReadBytes end;
+
+def stdin_binding_declaration (bytes : Bool) (typ : CoreTerm) : FileItem :=
+    FIntrinsic 120 typ (primitive_key (stdin_binding_id bytes)) (Nothing CoreTerm);
+
+def stdin_binding_check (items : List FileItem) : DeclarationResult :=
+    check_declarations CheckExactCore keep_checking (mul 20 50) items;
+
+def stdin_binding_entries (bytes : Bool) (aliases : Bool) : DeclarationResult :=
+    stdin_binding_check (append FileItem compiler_binding_nat_base
+      ([stdin_binding_declaration bytes (stdin_binding_type bytes aliases False False)] : List FileItem));
+
+def stdin_binding_metadata (bytes : Bool) (aliases : Bool) : Bool :=
+    match stdin_binding_entries bytes aliases with | DeclarationsErr _ _ _ => False | DeclarationsOk entries =>
+      any Entry (fun (entry : Entry) => match entry with
+        | MkBoundEntry name _ binding => match eqNat name 120 with | False => False | True =>
+            match binding with | PrimitiveExternBinding _ => False
+            | PrimitiveIntrinsicBinding actual execution gc specialization => andb (primitive_id_equal actual (stdin_binding_id bytes))
+                (andb (match execution with | PrimitiveRuntimeAction => True
+                  | PrimitiveTypeOnly => False | PrimitivePureValue => False end)
+                  (andb (match gc with | PrimitiveMayGc => True | PrimitiveNoGc => False end)
+                    (match specialization with | Nothing => True | Just _ => False end))) end end
+        | MkEntry _ _ _ => False | MkIndEntry _ _ => False | MkRoleEntry _ => False end) entries end;
+
+def stdin_binding_rejected (bytes : Bool) (bad_argument : Bool) (pure_result : Bool) : Bool :=
+    match stdin_binding_check (append FileItem compiler_binding_nat_base
+      ([stdin_binding_declaration bytes (stdin_binding_type bytes False bad_argument pure_result)] : List FileItem)) with
+    | DeclarationsOk _ => False
+    | DeclarationsErr name phase failure => andb (eqNat name 120)
+        (eqNat (declaration_failure_code CheckExactCore phase failure) 2) end;
+
+def stdin_binding_shim (bytes : Bool) (axiom_only : Bool) : Bool :=
+    match stdin_binding_check (append FileItem compiler_binding_nat_base
+      ([match axiom_only with
+        | True => FAxiom 120 (stdin_binding_type bytes False False False)
+        | False => stdin_binding_declaration bytes (stdin_binding_type bytes True False False) end] : List FileItem)) with
+    | DeclarationsErr _ _ _ => False | DeclarationsOk entries =>
+      let shims : List (Pair Nat (List Nat)) :=
+        checked_program_c_shims (CheckedProgramOf empty_intern entries ([] : List (Pair Nat CoreTerm))) in
+      match axiom_only with
+      | True => notb (any (Pair Nat (List Nat)) (fun (item : Pair Nat (List Nat)) =>
+          match item with | MkPair name _ => eqNat name 120 end) shims)
+      | False => any (Pair Nat (List Nat)) (fun (item : Pair Nat (List Nat)) => match item with | MkPair name key =>
+          andb (eqNat name 120) (primitive_bytes_equal key (prim_string_to_char_codes (match bytes with
+            | False => "prim_stdin_read_line" | True => "prim_stdin_read_bytes" end))) end) shims end end;
+
+def main : IO Unit :=
+    test_run (concat_map Bool Test (fun (bytes : Bool) =>
+      let key : String := prim_string_of_char_codes (primitive_key (stdin_binding_id bytes)) in
+      ([assert_true (prim_string_concat key " records canonical effect and GC metadata") (stdin_binding_metadata bytes False),
+        assert_true (prim_string_concat key " accepts normalized argument and result aliases") (stdin_binding_metadata bytes True),
+        assert_true (prim_string_concat key " rejects the wrong argument shape") (stdin_binding_rejected bytes True False),
+        assert_true (prim_string_concat key " rejects a pure String result") (stdin_binding_rejected bytes False True),
+        assert_true (prim_string_concat key " maps a renamed checked identity to the retained C handler") (stdin_binding_shim bytes False),
+        assert_true (prim_string_concat key " gives no checked authority to a same-shaped axiom") (stdin_binding_shim bytes True)] : List Test))
+      ([False, True] : List Bool));

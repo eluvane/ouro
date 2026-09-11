@@ -1,0 +1,275 @@
+-- Abstract values are zero-like, positive-like, or top. A join preserves a
+-- value only when every arm agrees. Unknown binders mask outer facts and
+-- constructor-name defaults; absence of evidence never becomes a zero.
+
+-- @entry analyze_absint
+-- @entry abs_eval
+
+import "../../std/data.ouro";
+import "../../std/listx.ouro";
+import "../../std/natx.ouro";
+import "ast.ouro";
+
+-- division-like call whose divisor is definitely zero (callee); arm on a
+-- positive constructor for a scrutinee that is definitely zero (arm ctor);
+-- definition body definitely zero although a contract asserts it positive
+-- (definition name).
+inductive AbsIssue : Type :=
+  | IDivZero : Nat -> AbsIssue
+  | IEmptyList : Nat -> AbsIssue
+  | IAssertPos : Nat -> AbsIssue;
+
+-- zero-like ids, positive-like ids, division-like callee ids.
+inductive AbsIds : Type :=
+  | MkAbsIds : List Nat -> List Nat -> List Nat -> AbsIds;
+
+def abs_zeroish (ids : AbsIds) : List Nat :=
+    match ids with | MkAbsIds z _ _ => z end;
+
+def abs_posish (ids : AbsIds) : List Nat :=
+    match ids with | MkAbsIds _ p _ => p end;
+
+def abs_div_like (ids : AbsIds) : List Nat :=
+    match ids with | MkAbsIds _ _ d => d end;
+
+def abs_inil : List AbsIssue := [];
+
+def abs_icons (i : AbsIssue) (is : List AbsIssue) : List AbsIssue :=
+    Cons AbsIssue i is;
+
+def abs_append (xs : List AbsIssue) (ys : List AbsIssue) : List AbsIssue :=
+    append AbsIssue xs ys;
+
+def abs_zero : Nat := S Z;
+def abs_pos : Nat := 2;
+def abs_top : Nat := 3;
+
+def abs_is_zero (v : Nat) : Bool := eq_nat v abs_zero;
+
+def abs_is_pos (v : Nat) : Bool := eq_nat v abs_pos;
+
+-- Keep an explicit top entry: deleting a shadowed name would expose both an
+-- older let fact and the constructor defaults in abs_class_var.
+def abs_mask (names : List Nat) (env : List (Pair Nat Nat)) : List (Pair Nat Nat) :=
+    append (Pair Nat Nat)
+      (map Nat (Pair Nat Nat) (fun (id : Nat) => MkPair Nat Nat id abs_top) names)
+      env;
+
+def abs_global (env : List (Pair Nat Nat)) (id : Nat) : Bool :=
+    match lookup Nat Nat eq_nat id env with
+    | Nothing => True
+    | Just _ => False
+    end;
+
+def abs_join (left : Nat) (right : Nat) : Nat :=
+    match eq_nat left right with
+    | True => left
+    | False => abs_top
+    end;
+
+def abs_class_var (ids : AbsIds) (env : List (Pair Nat Nat)) (id : Nat) : Nat :=
+    match lookup Nat Nat eq_nat id env with
+    | Just v => v
+    | Nothing =>
+        match mem Nat eq_nat id (abs_zeroish ids) with
+        | True => abs_zero
+        | False =>
+            match mem Nat eq_nat id (abs_posish ids) with
+            | True => abs_pos
+            | False => abs_top
+            end
+        end
+    end;
+
+def abs_lit (n : Nat) : Nat :=
+    match n with
+    | Z => abs_zero
+    | S _ => abs_pos
+    end;
+
+def abs_list (xs : List Ast) : Nat :=
+    match xs with
+    | Nil => abs_zero
+    | Cons _ _ => abs_pos
+    end;
+
+-- Applying a positive constructor yields a positive value; any other head is
+-- top.
+def abs_app (ids : AbsIds) (env : List (Pair Nat Nat)) (f : Ast) : Nat :=
+    match ast_app_head f with
+    | Nothing => abs_top
+    | Just h =>
+        match abs_is_pos (abs_class_var ids env h) with
+        | True => abs_pos
+        | False => abs_top
+        end
+    end;
+
+def abs_eval_in (ids : AbsIds) : Ast -> List (Pair Nat Nat) -> Nat :=
+  fix abs_eval_in (a : Ast) (env : List (Pair Nat Nat)) : Nat :=
+    match a with
+    | ANatLit n => abs_lit n
+    | AList xs => abs_list xs
+    | AVar id => abs_class_var ids env id
+    | AAscribe e _ => abs_eval_in e env
+    | AApp f _ => abs_app ids env f
+    | ALet id _ v body =>
+        abs_eval_in body (Cons (Pair Nat Nat) (MkPair Nat Nat id (abs_eval_in v env)) env)
+    | AMatch _ branches => abs_eval_in branches env
+    | ABranch _ names body rest =>
+        let value : Nat := abs_eval_in body (abs_mask names env) in
+        match ast_is tag_no_branch rest with
+        | True => value
+        | False => abs_join value (abs_eval_in rest env)
+        end
+    | AHole _ => abs_top
+    | ASort _ => abs_top
+    | AStr _ => abs_top
+    | ALam _ _ _ => abs_top
+    | APi _ _ _ => abs_top
+    | ABinder _ _ _ => abs_top
+    | ANoBinder => abs_top
+    | AFix _ _ _ _ => abs_top
+    | ANoBranch => abs_top
+    | APerform _ _ => abs_top
+    | AHandle _ _ => abs_top
+    | AClause _ _ _ _ => abs_top
+    | ANoClause => abs_top
+    | ADo _ => abs_top
+    end;
+
+def abs_eval (ids : AbsIds) (a : Ast) : Nat :=
+    abs_eval_in ids a (Nil (Pair Nat Nat));
+
+-- f must be exactly a one-argument application of a bare callee. Looking
+-- through ascriptions is safe; accepting an arbitrary application spine
+-- would misclassify the third or later argument as the divisor.
+def abs_binary_head (f : Ast) : Maybe Nat :=
+    let plain : Ast := ast_peel_ascribe f in
+    match ast_is tag_app plain with
+    | False => Nothing Nat
+    | True =>
+        match ast_children plain with
+        | Nil => Nothing Nat
+        | Cons callee _ => ast_var_id (ast_peel_ascribe callee)
+        end
+    end;
+
+-- `div n d` with d definitely zero. A local binding named like a division
+-- primitive is not evidence that it implements division.
+def abs_div_issue (ids : AbsIds) (env : List (Pair Nat Nat)) (f : Ast) (x : Ast)
+    : List AbsIssue :=
+    match abs_binary_head f with
+    | Nothing => abs_inil
+    | Just h =>
+        match andb (abs_global env h) (mem Nat eq_nat h (abs_div_like ids)) with
+        | False => abs_inil
+        | True =>
+            match abs_is_zero (abs_eval_in ids x env) with
+            | True => abs_icons (IDivZero h) abs_inil
+            | False => abs_inil
+            end
+        end
+    end;
+
+-- Arms on positive constructors can never fire for a zero-like scrutinee.
+def abs_dead_arms (ids : AbsIds) (env : List (Pair Nat Nat)) (scrut : Ast)
+    (branches : Ast) : List AbsIssue :=
+    match abs_is_zero (abs_eval_in ids scrut env) with
+    | False => abs_inil
+    | True =>
+        map Nat AbsIssue (fun (c : Nat) => IEmptyList c)
+          (filter Nat (fun (c : Nat) => mem Nat eq_nat c (abs_posish ids))
+            (ast_arm_ctors branches))
+    end;
+
+def abs_walk (ids : AbsIds) : Ast -> List (Pair Nat Nat) -> List AbsIssue :=
+  fun (root : Ast) (initial_env : List (Pair Nat Nat)) =>
+    (fix abs_walk (fuel : Nat) (a : Ast) (env : List (Pair Nat Nat)) : List AbsIssue :=
+      match fuel with
+      | Z => abs_inil
+      | S remaining =>
+          let descend : Ast -> List (Pair Nat Nat) -> List AbsIssue :=
+            fun (child : Ast) (next_env : List (Pair Nat Nat)) => abs_walk remaining child next_env in
+          match a with
+          | AApp f x =>
+              abs_append (abs_div_issue ids env f x)
+                (abs_append (descend f env) (descend x env))
+          | ALet id ann v body =>
+              abs_append (descend ann env)
+                (abs_append (descend v env)
+                  (descend body
+                    (Cons (Pair Nat Nat) (MkPair Nat Nat id (abs_eval_in ids v env)) env)))
+          | AMatch scrut branches =>
+              abs_append (abs_dead_arms ids env scrut branches)
+                (abs_append (descend scrut env) (descend branches env))
+          | AVar _ => abs_inil
+          | AHole _ => abs_inil
+          | ASort _ => abs_inil
+          | ANatLit _ => abs_inil
+          | AStr _ => abs_inil
+          | ALam id ann body =>
+              abs_append (descend ann env) (descend body (abs_mask (singleton Nat id) env))
+          | APi id dom cod =>
+              abs_append (descend dom env) (descend cod (abs_mask (singleton Nat id) env))
+          | AAscribe e t => abs_append (descend e env) (descend t env)
+          | ABinder id ty rest =>
+              abs_append (descend ty env) (descend rest (abs_mask (singleton Nat id) env))
+          | ANoBinder => abs_inil
+          | AFix name binders ret body =>
+              let rec_env : List (Pair Nat Nat) := abs_mask (singleton Nat name) env in
+              let body_env : List (Pair Nat Nat) := abs_mask (ast_binder_ids binders) rec_env in
+              abs_append (descend binders rec_env)
+                (abs_append (descend ret body_env) (descend body body_env))
+          | ABranch _ names body rest =>
+              abs_append (descend body (abs_mask names env)) (descend rest env)
+          | ANoBranch => abs_inil
+          | APerform _ args =>
+              concat_map Ast AbsIssue (fun (arg : Ast) => descend arg env) args
+          | AHandle inner cls => abs_append (descend inner env) (descend cls env)
+          | AClause _ names body rest =>
+              abs_append (descend body (abs_mask names env)) (descend rest env)
+          | ANoClause => abs_inil
+          | ADo xs => concat_map Ast AbsIssue (fun (x : Ast) => descend x env) xs
+          | AList xs => concat_map Ast AbsIssue (fun (x : Ast) => descend x env) xs
+          end
+      end) (ast_size root) root initial_env;
+
+-- Inspect the result of leading lambdas, not the function value, while
+-- retaining their lexical scope. Fix results remain unknown.
+def abs_body_value (ids : AbsIds) (root : Ast) : Nat :=
+    (fix result_value (a : Ast) (env : List (Pair Nat Nat)) : Nat :=
+      match a with
+      | AAscribe e _ => result_value e env
+      | ALam id _ body => result_value body (abs_mask (singleton Nat id) env)
+      | AVar _ => abs_eval_in ids a env
+      | ANatLit _ => abs_eval_in ids a env
+      | AList _ => abs_eval_in ids a env
+      | AApp _ _ => abs_eval_in ids a env
+      | ALet _ _ _ _ => abs_eval_in ids a env
+      | AMatch _ _ => abs_eval_in ids a env
+      | AHole _ => abs_top
+      | ASort _ => abs_top
+      | AStr _ => abs_top
+      | APi _ _ _ => abs_top
+      | ABinder _ _ _ => abs_top
+      | ANoBinder => abs_top
+      | AFix _ _ _ _ => abs_top
+      | ABranch _ _ _ _ => abs_top
+      | ANoBranch => abs_top
+      | APerform _ _ => abs_top
+      | AHandle _ _ => abs_top
+      | AClause _ _ _ _ => abs_top
+      | ANoClause => abs_top
+      | ADo _ => abs_top
+      end) root (Nil (Pair Nat Nat));
+
+-- assert_pos: the definition carries a contract asserting a positive or
+-- non-empty result; name: its id for the witness.
+def analyze_absint (ids : AbsIds) (assert_pos : Bool) (name : Nat) (a : Ast)
+    : List AbsIssue :=
+    abs_append (abs_walk ids a (Nil (Pair Nat Nat)))
+      (match andb assert_pos (abs_is_zero (abs_body_value ids a)) with
+       | True => abs_icons (IAssertPos name) abs_inil
+       | False => abs_inil
+       end);

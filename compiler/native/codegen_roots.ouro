@@ -1,0 +1,114 @@
+-- A real shadow frame is {previous, descriptor, frame_base}. It lives after
+-- the function's locals and is linked only after all managed slots are zeroed
+-- and incoming arguments have been saved. All operations here are NoGc.
+import "codegen_model.ouro";
+
+def codegen_dead_root_slots (slots : List CodegenSlot) (live : List Nat) : List NativeRootSlot :=
+    filter NativeRootSlot (fun (root : NativeRootSlot) => match root with
+      | NativeRootAt id _ => notb (mir_has id live) end) (codegen_root_slots slots);
+
+-- This runs before argument loading. Every managed operand of a MayGc call
+-- is in the live set, including an old destination value read by that call.
+def codegen_clear_dead_roots (slots : List CodegenSlot) (live : List Nat) : List CodegenAtom :=
+    let dead : List NativeRootSlot := codegen_dead_root_slots slots live in
+    match dead with | Nil => ([] : List CodegenAtom) | Cons _ _ =>
+      append CodegenAtom (codegen_raw ([X64MovImm32 X64Rax codegen_zero] : List X64Instruction))
+        (codegen_raw (map NativeRootSlot X64Instruction (fun (root : NativeRootSlot) => match root with
+          | NativeRootAt _ offset => X64Store X64Bits64 (X64Base X64Rsp (codegen_disp offset)) X64Rax end) dead)) end;
+
+def codegen_shadow_symbol (program : MirProgram) (id : Nat) : Either NativeCodegenError Nat :=
+    match program with | MirProgramDef functions _ _ _ =>
+      match index_of Nat eq_nat id (map MirFunction Nat mir_function_id functions) with
+      | Nothing => Left NativeCodegenError Nat (NativeMissingLabel id)
+      | Just index => Right NativeCodegenError Nat (add (S (codegen_runtime_id program)) index) end end;
+
+def codegen_shadow_enter (program : MirProgram) (id : Nat) (allocation : Nat)
+    (slots : List CodegenSlot) : Either NativeCodegenError (List CodegenAtom) :=
+    match codegen_root_slots slots with | Nil => codegen_ready ([] : List CodegenAtom) | Cons _ _ =>
+      mapRight NativeCodegenError Nat (List CodegenAtom) (fun (descriptor : Nat) =>
+        let offset : Nat := sub allocation 24 in
+        codegen_join ([
+          ([CodegenSymbolAddress (codegen_runtime_id program) False] : List CodegenAtom),
+          codegen_raw ([X64Load X64Bits64 X64R10 (X64Base X64Rax (codegen_disp 8)),
+            X64Store X64Bits64 (X64Base X64Rsp (codegen_disp offset)) X64R10] : List X64Instruction),
+          ([CodegenSymbolAddress descriptor False] : List CodegenAtom),
+          codegen_raw ([X64Store X64Bits64 (X64Base X64Rsp (codegen_disp (add offset 8))) X64Rax,
+            X64Store X64Bits64 (X64Base X64Rsp (codegen_disp (add offset 16))) X64Rsp,
+            X64Lea X64R10 (X64Base X64Rsp (codegen_disp offset))] : List X64Instruction),
+          ([CodegenSymbolAddress (codegen_runtime_id program) False] : List CodegenAtom),
+          codegen_raw ([X64Store X64Bits64 (X64Base X64Rax (codegen_disp 8)) X64R10] : List X64Instruction)]
+            : List (List CodegenAtom))) (codegen_shadow_symbol program id) end;
+
+def codegen_shadow_leave (program : MirProgram) (allocation : Nat) (slots : List CodegenSlot)
+    (block : Nat) (site : Nat) : List CodegenAtom :=
+    match codegen_root_slots slots with | Nil => ([] : List CodegenAtom) | Cons _ _ =>
+      let offset : Nat := sub allocation 24 in
+      let valid : CodegenLabel := CodegenSiteLabel block site 16 in
+      codegen_join ([
+        ([CodegenSymbolAddress (codegen_runtime_id program) False] : List CodegenAtom),
+        codegen_raw ([X64Lea X64R10 (X64Base X64Rsp (codegen_disp offset)),
+          X64Load X64Bits64 X64R11 (X64Base X64Rax (codegen_disp 8)),
+          X64ArithmeticReg X64Bits64 X64Compare X64R10 X64R11] : List X64Instruction),
+        ([CodegenJumpIf X64Equal valid, CodegenInstruction X64Trap, CodegenMark valid] : List CodegenAtom),
+        codegen_raw ([X64Load X64Bits64 X64R10 (X64Base X64Rsp (codegen_disp offset)),
+          X64Store X64Bits64 (X64Base X64Rax (codegen_disp 8)) X64R10] : List X64Instruction)]
+            : List (List CodegenAtom)) end;
+
+def codegen_runtime_descriptors (program : MirProgram) : List Nat :=
+    match program with | MirProgramDef functions _ _ _ =>
+      append Nat (mir_managed_descriptors program)
+        ((fix collect (rest : List MirFunction) (symbol : Nat) : List Nat :=
+          match rest with | Nil => ([] : List Nat) | Cons function tail =>
+            match mir_function_has_roots function with
+            | False => collect tail (S symbol)
+            | True => Cons Nat symbol (collect tail (S symbol)) end end)
+          functions (S (codegen_runtime_id program))) end;
+
+-- The whitelist is written once on entry, before any body call. Addresses use
+-- ordinary symbol LEAs, so descriptor data needs no absolute-address fixups.
+def codegen_runtime_initialize (program : MirProgram) (id : Nat) : List CodegenAtom :=
+    match program with | MirProgramDef _ _ _ entry =>
+      match andb (eq_nat id entry) (mir_managed_enabled program) with | False => ([] : List CodegenAtom) | True =>
+        let objects : List Nat := mir_managed_descriptors program in
+        let descriptors : List Nat := codegen_runtime_descriptors program in
+        append CodegenAtom
+          ([CodegenSymbolAddress (codegen_runtime_id program) False,
+            CodegenInstruction (X64Mov X64Bits64 X64R10 X64Rax),
+            CodegenInstruction (X64MovImm32 X64Rax (pe_word32 (length Nat descriptors))),
+            CodegenInstruction (X64Store X64Bits64 (X64Base X64R10 (codegen_disp 32)) X64Rax)] : List CodegenAtom)
+          ((fix initialize (symbols : List Nat) (offset : Nat) : List CodegenAtom :=
+            match symbols with | Nil => ([] : List CodegenAtom) | Cons symbol rest => append CodegenAtom
+              ([CodegenSymbolAddress symbol False,
+                CodegenInstruction (X64Store X64Bits64 (X64Base X64R10 (codegen_disp offset)) X64Rax),
+                CodegenInstruction (X64MovImm32 X64Rax (pe_word32
+                  (match mir_has symbol objects with | True => 1 | False => 2 end))),
+                CodegenInstruction (X64Store X64Bits64 (X64Base X64R10 (codegen_disp (add offset 8))) X64Rax)]
+                    : List CodegenAtom)
+              (initialize rest (add offset 16)) end) descriptors 40) end end;
+
+def codegen_shadow_data : List MirFunction -> Nat -> List MirData :=
+  fix descriptors (functions : List MirFunction) (symbol : Nat) : List MirData :=
+    match functions with | Nil => ([] : List MirData) | Cons function rest =>
+      let tail : List MirData := descriptors rest (S symbol) in
+      match codegen_frame function with | CodegenFrameOf _ slots =>
+        let roots : List NativeRootSlot := codegen_root_slots slots in
+        match roots with | Nil => tail | Cons _ _ =>
+          Cons MirData (MirDataDef symbol False
+            (append Nat (pe_le64_rva (length NativeRootSlot roots))
+              (concat_map NativeRootSlot Nat (fun (root : NativeRootSlot) => match root with
+                | NativeRootAt _ offset => pe_le64_rva offset end) roots))) tail end end end;
+
+-- The five-word prefix and descriptor entries retain their offsets. The
+-- trailing budget and private-heap owner words both start at zero.
+def codegen_runtime_budget_offset (program : MirProgram) : Nat :=
+    add 40 (mul 16 (length Nat (codegen_runtime_descriptors program)));
+
+def codegen_runtime_heap_offset (program : MirProgram) : Nat :=
+    add 8 (codegen_runtime_budget_offset program);
+
+def codegen_runtime_data (program : MirProgram) : List MirData :=
+    match mir_managed_enabled program with | False => ([] : List MirData) | True =>
+      match program with | MirProgramDef functions _ _ _ =>
+        Cons MirData (MirDataDef (codegen_runtime_id program) True
+          (pe_zeros (add 8 (codegen_runtime_heap_offset program))))
+          (codegen_shadow_data functions (S (codegen_runtime_id program))) end end;

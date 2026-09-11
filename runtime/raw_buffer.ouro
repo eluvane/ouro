@@ -1,0 +1,99 @@
+-- Bounds-checked operations on caller-owned raw byte storage. The caller must
+-- supply live readable/writable allocations and their true capacities; these
+-- checks do not establish provenance, ownership, concurrency, or lifetime.
+import "native_types.ouro";
+
+-- A zero-length range is valid at any start <= capacity, including null.
+-- Nonempty ranges reject null and all address/size arithmetic overflow.
+def raw_buffer_range (base : RawPtr U8) (capacity : USize) (start : USize) (count : USize)
+    : Runtime Bool :=
+    let zero : USize := usize_sub capacity capacity in
+    match usize_less capacity start with | True => runtime_pure Bool False | False =>
+      match usize_less (usize_sub capacity start) count with | True => runtime_pure Bool False | False =>
+        match usize_equal count zero with | True => runtime_pure Bool True | False =>
+          match usize_from_nat 1 with | Nothing => runtime_pure Bool False | Just one =>
+            runtime_bind USize Bool (raw_to_bits U8 base) (fun (address : USize) =>
+              match usize_equal address zero with | True => runtime_pure Bool False | False =>
+                let first : USize := usize_add address start in
+                match usize_less first address with | True => runtime_pure Bool False | False =>
+                  let last : USize := usize_add first (usize_sub count one) in
+                  runtime_pure Bool (raw_bool_not (usize_less last first)) end end)
+          end end end end;
+
+-- Failure leaves storage unchanged. U8 has alignment one.
+def raw_buffer_write (base : RawPtr U8) (capacity : USize) (index : USize) (value : U8)
+    : Runtime Bool :=
+    match usize_from_nat 1 with | Nothing => runtime_pure Bool False | Just one =>
+      runtime_bind Bool Bool (raw_buffer_range base capacity index one) (fun (valid : Bool) =>
+        match valid with | False => runtime_pure Bool False | True =>
+          runtime_bind (RawPtr U8) Bool (raw_add U8 base index) (fun (address : RawPtr U8) =>
+            runtime_bind Unit Bool (raw_store_u8 address value)
+              (fun (unused : Unit) => runtime_pure Bool True)) end) end;
+
+-- Output must be a live writable byte. It may alias the source. Failure
+-- leaves output unchanged; True means exactly one byte was read and written.
+def raw_buffer_read (base : RawPtr U8) (capacity : USize) (index : USize) (output : RawPtr U8)
+    : Runtime Bool :=
+    match usize_from_nat 1 with | Nothing => runtime_pure Bool False | Just one =>
+      let zero : USize := usize_sub one one in
+      runtime_bind Bool Bool (raw_buffer_range base capacity index one) (fun (valid : Bool) =>
+        match valid with | False => runtime_pure Bool False | True =>
+          runtime_bind Bool Bool (raw_buffer_range output one zero one) (fun (writable : Bool) =>
+            match writable with | False => runtime_pure Bool False | True =>
+              runtime_bind (RawPtr U8) Bool (raw_add U8 base index) (fun (address : RawPtr U8) =>
+                runtime_bind U8 Bool (raw_load_u8 address) (fun (value : U8) =>
+                  runtime_bind Unit Bool (raw_store_u8 output value)
+                    (fun (unused : Unit) => runtime_pure Bool True))) end) end) end;
+
+-- Fill exactly capacity bytes. An empty fill succeeds without touching base.
+def raw_buffer_fill (base : RawPtr U8) (capacity : USize) (value : U8) : Runtime Bool :=
+    let zero : USize := usize_sub capacity capacity in
+    runtime_bind Bool Bool (raw_buffer_range base capacity zero capacity) (fun (valid : Bool) =>
+      match valid with | False => runtime_pure Bool False | True =>
+        match usize_from_nat 1 with | Nothing => runtime_pure Bool False | Just one =>
+          match u8_from_nat 1 with | Nothing => runtime_pure Bool False | Just running =>
+            runtime_bind USize Bool (runtime_loop USize zero
+              (fun (index : USize) => runtime_pure U8 (match usize_less index capacity with
+                | True => running | False => u8_sub running running end))
+              (fun (index : USize) => runtime_bind (RawPtr U8) USize (raw_add U8 base index)
+                (fun (address : RawPtr U8) => runtime_bind Unit USize (raw_store_u8 address value)
+                  (fun (unused : Unit) => runtime_pure USize (usize_add index one)))))
+              (fun (finished : USize) => runtime_pure Bool (usize_equal finished capacity)) end end end);
+
+-- These addresses describe nonempty ranges that have already passed
+-- raw_buffer_range. Subtraction avoids overflow at an exclusive end address.
+def raw_buffer_disjoint (first : USize) (first_count : USize) (second : USize) (second_count : USize)
+    : Bool :=
+    match usize_less first second with
+    | True => raw_bool_not (usize_less (usize_sub second first) first_count)
+    | False => raw_bool_not (usize_less (usize_sub first second) second_count) end;
+
+-- Copy exactly count bytes. Overlap is rejected before any write, except an
+-- identical source/destination, which is a successful no-op. This is memcpy,
+-- not memmove. Empty copies allow null pointers and perform no raw access.
+def raw_buffer_copy (destination : RawPtr U8) (destination_capacity : USize)
+    (source : RawPtr U8) (source_capacity : USize) (count : USize) : Runtime Bool :=
+    let zero : USize := usize_sub count count in
+    runtime_bind Bool Bool (raw_buffer_range destination destination_capacity zero count)
+      (fun (destination_valid : Bool) => match destination_valid with
+        | False => runtime_pure Bool False
+        | True => runtime_bind Bool Bool (raw_buffer_range source source_capacity zero count)
+          (fun (source_valid : Bool) => match source_valid with | False => runtime_pure Bool False | True =>
+            match usize_equal count zero with | True => runtime_pure Bool True | False =>
+              runtime_bind USize Bool (raw_to_bits U8 destination) (fun (destination_bits : USize) =>
+                runtime_bind USize Bool (raw_to_bits U8 source) (fun (source_bits : USize) =>
+                  match usize_equal destination_bits source_bits with | True => runtime_pure Bool True | False =>
+                    match raw_buffer_disjoint destination_bits count source_bits count with
+                    | False => runtime_pure Bool False
+                    | True => match usize_from_nat 1 with | Nothing => runtime_pure Bool False | Just one =>
+                      match u8_from_nat 1 with | Nothing => runtime_pure Bool False | Just running =>
+                        runtime_bind USize Bool (runtime_loop USize zero
+                          (fun (index : USize) => runtime_pure U8 (match usize_less index count with
+                            | True => running | False => u8_sub running running end))
+                          (fun (index : USize) => runtime_bind (RawPtr U8) USize (raw_add U8 source index)
+                            (fun (source_address : RawPtr U8) => runtime_bind U8 USize (raw_load_u8 source_address)
+                              (fun (value : U8) => runtime_bind (RawPtr U8) USize (raw_add U8 destination index)
+                                (fun (destination_address : RawPtr U8) => runtime_bind Unit USize (raw_store_u8 destination_address value)
+                                  (fun (unused : Unit) => runtime_pure USize (usize_add index one)))))))
+                          (fun (finished : USize) => runtime_pure Bool (usize_equal finished count))
+                      end end end end)) end end) end);

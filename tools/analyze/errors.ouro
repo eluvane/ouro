@@ -1,0 +1,293 @@
+-- Error-handling hygiene: raw String error channels, failure arms that answer
+-- with success while dropping the error, and checked results bound to a
+-- discard. The rules read declared types and explicit type arguments; they
+-- never infer a type the source does not spell out.
+
+-- @entry analyze_errors
+
+import "../../std/data.ouro";
+import "../../std/listx.ouro";
+import "../../std/natx.ouro";
+import "ast.ouro";
+import "dataflow.ouro";
+
+-- Either, String, IO, io_bind, io_pure, and the failure/success constructor
+-- pairs (Left/Right, Fail/Ok); a missing name is Z and matches nothing.
+inductive ErrIds : Type :=
+  | MkErrIds : Nat -> Nat -> Nat -> Nat -> Nat -> List (Pair Nat Nat) -> ErrIds;
+
+def errh_either (i : ErrIds) : Nat :=
+    match i with | MkErrIds e _ _ _ _ _ => e end;
+
+def errh_string (i : ErrIds) : Nat :=
+    match i with | MkErrIds _ s _ _ _ _ => s end;
+
+def errh_io (i : ErrIds) : Nat :=
+    match i with | MkErrIds _ _ io _ _ _ => io end;
+
+def errh_bind (i : ErrIds) : Nat :=
+    match i with | MkErrIds _ _ _ b _ _ => b end;
+
+def errh_pure (i : ErrIds) : Nat :=
+    match i with | MkErrIds _ _ _ _ p _ => p end;
+
+def errh_pairs (i : ErrIds) : List (Pair Nat Nat) :=
+    match i with | MkErrIds _ _ _ _ _ ps => ps end;
+
+-- result type is Either String (Z); failure arm drops its payload and
+-- returns the success constructor (failure, success); io_bind over an Either
+-- binds the result to a discard (binder).
+inductive ErrIssue : Type :=
+  | IStringError : Nat -> ErrIssue
+  | IErrorToSuccess : Nat -> Nat -> ErrIssue
+  | IIgnoredResult : Nat -> ErrIssue;
+
+def errh_inil : List ErrIssue := [];
+
+def errh_one (i : ErrIssue) : List ErrIssue := Cons ErrIssue i errh_inil;
+
+def errh_append (xs : List ErrIssue) (ys : List ErrIssue) : List ErrIssue :=
+    append ErrIssue xs ys;
+
+def errh_four : Nat := 4;
+
+def errh_head_of (a : Ast) : Nat :=
+    match ast_app_head a with
+    | Just h => h
+    | Nothing => Z
+    end;
+
+def errh_is_call_of (h : Nat) (a : Ast) : Bool :=
+    match h with
+    | Z => False
+    | S _ => andb (ast_is tag_app (ast_peel_ascribe a)) (eq_nat (errh_head_of a) h)
+    end;
+
+def errh_either_string (ids : ErrIds) (t : Ast) : Bool :=
+    match eq_nat (errh_string ids) Z with
+    | True => False
+    | False =>
+        match errh_is_call_of (errh_either ids) t with
+        | False => False
+        | True =>
+            match ast_args t with
+            | Nil => False
+            | Cons e _ => eq_nat (ast_var_or_zero e) (errh_string ids)
+            end
+        end
+    end;
+
+-- `IO (Either String A)` is the host error channel. Only a bare
+-- `Either String` result is the untyped-error smell.
+def errh_type_issues (ids : ErrIds) (a : Ast) : List ErrIssue :=
+    match ast_declared_type a with
+    | Nothing => errh_inil
+    | Just t =>
+        let result : Ast := ast_result_type t in
+        match errh_is_call_of (errh_io ids) result with
+        | True => errh_inil
+        | False =>
+            match errh_either_string ids result with
+            | True => errh_one (IStringError Z)
+            | False => errh_inil
+            end
+        end
+    end;
+
+-- Every payload binder is a wildcard, a discard, or never read.
+def errh_drops_payload (discards : List Nat) (m : AstArm) : Bool :=
+    all Nat (fun (id : Nat) =>
+      match id with
+      | Z => True
+      | S _ =>
+          orb (mem Nat eq_nat id discards)
+            (notb (ast_occurs id (ast_arm_body m)))
+      end) (ast_arm_binders m);
+
+-- Head of the value an arm evaluates to, through lets, do-blocks, and
+-- io_pure; Z when the arm branches again or performs.
+def errh_result_head (ids : ErrIds) : Ast -> Nat :=
+  fun (root : Ast) =>
+    (fix errh_result_head (fuel : Nat) (a : Ast) : Nat :=
+      match fuel with
+      | Z => Z
+      | S remaining =>
+          let descend : Ast -> Nat :=
+            fun (child : Ast) => errh_result_head remaining child in
+          match a with
+          | AAscribe e _ => descend e
+          | ALet _ _ _ body => descend body
+          | ADo xs =>
+              match xs with
+              | Nil => Z
+              | Cons x rest =>
+                  match rest with
+                  | Nil => descend x
+                  | Cons _ _ => descend (ADo rest)
+                  end
+              end
+          | AApp _ _ =>
+              match errh_is_call_of (errh_pure ids) a with
+              | False => errh_head_of a
+              | True =>
+                  match reverse Ast (ast_args a) with
+                  | Nil => Z
+                  | Cons last _ => descend last
+                  end
+              end
+          | AVar v => v
+          | AHole _ => Z
+          | ASort _ => Z
+          | ANatLit _ => Z
+          | AStr _ => Z
+          | ALam _ _ _ => Z
+          | APi _ _ _ => Z
+          | ABinder _ _ _ => Z
+          | ANoBinder => Z
+          | AFix _ _ _ _ => Z
+          | ABranch _ _ _ _ => Z
+          | ANoBranch => Z
+          | AMatch _ _ => Z
+          | APerform _ _ => Z
+          | AHandle _ _ => Z
+          | AClause _ _ _ _ => Z
+          | ANoClause => Z
+          | AList _ => Z
+          end
+      end) (ast_size root) root;
+
+def errh_success_of (pairs : List (Pair Nat Nat)) (failure : Nat) : Nat :=
+    match failure with
+    | Z => Z
+    | S _ =>
+        match lookup Nat Nat eq_nat failure pairs with
+        | Just s => s
+        | Nothing => Z
+        end
+    end;
+
+-- `| Left _ => Right T x`: the failure is not propagated, logged, or
+-- inspected; the caller sees a success it cannot tell from a real one.
+def errh_arm_issue (ids : ErrIds) (discards : List Nat) (m : AstArm) : List ErrIssue :=
+    let s : Nat := errh_success_of (errh_pairs ids) (ast_arm_ctor m) in
+    match s with
+    | Z => errh_inil
+    | S _ =>
+        match andb (errh_drops_payload discards m)
+          (eq_nat (errh_result_head ids (ast_arm_body m)) s) with
+        | True => errh_one (IErrorToSuccess (ast_arm_ctor m) s)
+        | False => errh_inil
+        end
+    end;
+
+def errh_match_issues (ids : ErrIds) (discards : List Nat) (branches : Ast) : List ErrIssue :=
+    match ast_arms branches with
+    | Nothing => errh_inil
+    | Just arms => concat_map AstArm ErrIssue (errh_arm_issue ids discards) arms
+    end;
+
+def errh_discarded (discards : List Nat) (x : Nat) (body : Ast) : Bool :=
+    match x with
+    | Z => True
+    | S _ =>
+        orb (mem Nat eq_nat x discards)
+          (match df_count_uses x body with
+           | Z => True
+           | S _ => False
+           end)
+    end;
+
+-- `io_bind (Either E A) B act (fun (_ : Either E A) => k)`: the checked result
+-- is bound and never looked at, so the failure is silently dropped.
+def errh_bind_issue (ids : ErrIds) (discards : List Nat) (a : Ast) : List ErrIssue :=
+    match errh_is_call_of (errh_bind ids) a with
+    | False => errh_inil
+    | True =>
+        let args : List Ast := ast_args a in
+        match eq_nat (length Ast args) errh_four with
+        | False => errh_inil
+        | True =>
+            match args with
+            | Nil => errh_inil
+            | Cons ty rest =>
+                match errh_is_call_of (errh_either ids) ty with
+                | False => errh_inil
+                | True =>
+                    match reverse Ast rest with
+                    | Nil => errh_inil
+                    | Cons k _ =>
+                        match ast_peel_ascribe k with
+                        | ALam x _ body =>
+                            match errh_discarded discards x body with
+                            | True => errh_one (IIgnoredResult x)
+                            | False => errh_inil
+                            end
+                        | AVar _ => errh_inil
+                        | AHole _ => errh_inil
+                        | ASort _ => errh_inil
+                        | ANatLit _ => errh_inil
+                        | AStr _ => errh_inil
+                        | AApp _ _ => errh_inil
+                        | APi _ _ _ => errh_inil
+                        | ALet _ _ _ _ => errh_inil
+                        | AAscribe _ _ => errh_inil
+                        | ABinder _ _ _ => errh_inil
+                        | ANoBinder => errh_inil
+                        | AFix _ _ _ _ => errh_inil
+                        | ABranch _ _ _ _ => errh_inil
+                        | ANoBranch => errh_inil
+                        | AMatch _ _ => errh_inil
+                        | APerform _ _ => errh_inil
+                        | AHandle _ _ => errh_inil
+                        | AClause _ _ _ _ => errh_inil
+                        | ANoClause => errh_inil
+                        | ADo _ => errh_inil
+                        | AList _ => errh_inil
+                        end
+                    end
+                end
+            end
+        end
+    end;
+
+def errh_node_issues (ids : ErrIds) (discards : List Nat) (a : Ast) : List ErrIssue :=
+    match a with
+    | AMatch _ branches => errh_match_issues ids discards branches
+    | AApp _ _ => errh_bind_issue ids discards a
+    | AVar _ => errh_inil
+    | AHole _ => errh_inil
+    | ASort _ => errh_inil
+    | ANatLit _ => errh_inil
+    | AStr _ => errh_inil
+    | ALam _ _ _ => errh_inil
+    | APi _ _ _ => errh_inil
+    | ALet _ _ _ _ => errh_inil
+    | AAscribe _ _ => errh_inil
+    | ABinder _ _ _ => errh_inil
+    | ANoBinder => errh_inil
+    | AFix _ _ _ _ => errh_inil
+    | ABranch _ _ _ _ => errh_inil
+    | ANoBranch => errh_inil
+    | APerform _ _ => errh_inil
+    | AHandle _ _ => errh_inil
+    | AClause _ _ _ _ => errh_inil
+    | ANoClause => errh_inil
+    | ADo _ => errh_inil
+    | AList _ => errh_inil
+    end;
+
+def errh_walk (ids : ErrIds) (discards : List Nat) : Ast -> List ErrIssue :=
+  fun (root : Ast) =>
+    (fix errh_walk (fuel : Nat) (a : Ast) : List ErrIssue :=
+      match fuel with
+      | Z => errh_inil
+      | S remaining =>
+          let descend : Ast -> List ErrIssue :=
+            fun (child : Ast) => errh_walk remaining child in
+          errh_append (errh_node_issues ids discards a)
+            (concat_map Ast ErrIssue descend (ast_children a))
+      end) (ast_size root) root;
+
+-- discards: ids whose source spelling starts with `_`.
+def analyze_errors (ids : ErrIds) (discards : List Nat) (a : Ast) : List ErrIssue :=
+    errh_append (errh_type_issues ids a) (errh_walk ids discards (ast_core_body a));

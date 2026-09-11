@@ -1,0 +1,210 @@
+-- Adapter boundary between compiler Expr and analyzer Ast; keep tag mapping explicit and total.
+-- Absent annotations become ANoBinder, never a hole. Do-binds scope over the
+-- rest of their block. Multi-scrutinee matches keep every row under an AList
+-- scrutinee so coverage cores can recognise them and stay silent. String
+-- literals keep their intern id under AStr so literal-sensitive cores never
+-- mistake them for Nat literals.
+
+-- @entry adapt
+-- @entry last_expr
+
+import "../../std/data.ouro";
+import "../../compiler/ast.ouro";
+import "ast.ouro";
+
+def last_expr : List Expr -> Expr :=
+  fix last_expr (xs : List Expr) : Expr :=
+    match xs with
+    | Nil => EHole (Nothing Nat)
+    | Cons e rest =>
+        match rest with
+        | Nil => e
+        | Cons _ _ => last_expr rest
+        end
+    end;
+
+def adapt_pats (pats : List Nat) (body : Ast) (rest : Ast) : Ast :=
+    match pats with
+    | Nil => rest
+    | Cons ctor binders => ABranch ctor binders body rest
+    end;
+
+def adapt_ann (ad : Expr -> Ast) (ann : Maybe Expr) : Ast :=
+    match ann with
+    | Nothing => ANoBinder
+    | Just t => ad t
+    end;
+
+def adapt_list (ad : Expr -> Ast) : List Expr -> List Ast :=
+  fix adapt_list (xs : List Expr) : List Ast :=
+    match xs with
+    | Nil => Nil Ast
+    | Cons e rest => Cons Ast (ad e) (adapt_list rest)
+    end;
+
+-- `let! x := rhs; rest` binds x over the remaining statements.
+def adapt_do (ad : Expr -> Ast) : List Expr -> List Ast :=
+  fix adapt_do (xs : List Expr) : List Ast :=
+    match xs with
+    | Nil => Nil Ast
+    | Cons e rest =>
+        match do_bind_of e with
+        | Just p =>
+            match p with
+            | MkPair n rhs =>
+                ([ALet n ANoBinder (ad rhs) (ADo (adapt_do rest))] : List Ast)
+            end
+        | Nothing => Cons Ast (ad e) (adapt_do rest)
+        end
+    end;
+
+def adapt_clauses (ad : Expr -> Ast) : List (Pair Nat (Pair (List Nat) Expr))
+    -> Ast :=
+  fix adapt_clauses (xs : List (Pair Nat (Pair (List Nat) Expr))) : Ast :=
+    match xs with
+    | Nil => ANoClause
+    | Cons p rest =>
+        match p with
+        | MkPair op inner =>
+            match inner with
+            | MkPair binders body =>
+                AClause op binders (ad body) (adapt_clauses rest)
+            end
+        end
+    end;
+
+def row_binders : List (Pair Nat (List Nat)) -> List Nat :=
+  fix row_binders (ps : List (Pair Nat (List Nat))) : List Nat :=
+    match ps with
+    | Nil => Nil Nat
+    | Cons p more =>
+        match p with
+        | MkPair _ ids => append Nat ids (row_binders more)
+        end
+    end;
+
+-- Rows keep the first column's constructor and every binder of the row.
+def adapt_rows (ad : Expr -> Ast) : List (Pair (List (Pair Nat (List Nat))) Expr)
+    -> Ast :=
+  fix adapt_rows (rs : List (Pair (List (Pair Nat (List Nat))) Expr)) : Ast :=
+    match rs with
+    | Nil => ANoBranch
+    | Cons row tl =>
+        match row with
+        | MkPair pats body =>
+            match pats with
+            | Nil => ALet Z ANoBinder (ad body) (adapt_rows tl)
+            | Cons p _ =>
+                match p with
+                | MkPair ctor _ =>
+                    ABranch ctor (row_binders pats) (ad body) (adapt_rows tl)
+                end
+            end
+        end
+    end;
+
+-- Exact source-node count bounds adapter callbacks through lists, options,
+-- handler clauses and multi-match rows; names and effect rows contain no Expr.
+def adapt_size : Expr -> Nat :=
+  fix adapt_size (e : Expr) : Nat :=
+    match e with
+    | EVar _ => S Z
+    | EHole _ => S Z
+    | ESort _ => S Z
+    | ENat _ => S Z
+    | EStr _ => S Z
+    | ENoBranch => S Z
+    | ENoBinder => S Z
+    | EApp f x => S (add (adapt_size f) (adapt_size x))
+    | ELam _ ann body =>
+        S (add (adapt_size body)
+          (match ann with | Nothing => Z | Just ty => adapt_size ty end))
+    | EPi _ dom cod => S (add (adapt_size dom) (adapt_size cod))
+    | ELet _ ann v body =>
+        S (add (add (adapt_size v) (adapt_size body))
+          (match ann with | Nothing => Z | Just ty => adapt_size ty end))
+    | EAscribe t ty => S (add (adapt_size t) (adapt_size ty))
+    | EMatch s b => S (add (adapt_size s) (adapt_size b))
+    | EFix _ binders ret body => S (add (adapt_size binders) (add (adapt_size ret) (adapt_size body)))
+    | EEffectRow inner _ => S (adapt_size inner)
+    | EPerform _ args => S ((fix sum (xs : List Expr) : Nat :=
+        match xs with | Nil => Z | Cons child rest => add (adapt_size child) (sum rest) end) args)
+    | EDo items => S ((fix sum (xs : List Expr) : Nat :=
+        match xs with | Nil => Z | Cons child rest => add (adapt_size child) (sum rest) end) items)
+    | EList items => S ((fix sum (xs : List Expr) : Nat :=
+        match xs with | Nil => Z | Cons child rest => add (adapt_size child) (sum rest) end) items)
+    | EHandle inner clauses => S (add (adapt_size inner)
+        ((fix sum (xs : List (Pair Nat (Pair (List Nat) Expr))) : Nat :=
+          match xs with
+          | Nil => Z
+          | Cons clause rest =>
+              match clause with
+              | MkPair _ data =>
+                  match data with
+                  | MkPair _ body => add (adapt_size body) (sum rest)
+                  end
+              end
+          end) clauses))
+    | EBranch _ body rest => S (add (adapt_size body) (adapt_size rest))
+    | EBinder _ ty rest => S (add (adapt_size ty) (adapt_size rest))
+    | EMultiMatch scruts rows => S (add
+        ((fix sum (xs : List Expr) : Nat :=
+          match xs with | Nil => Z | Cons child rest => add (adapt_size child) (sum rest) end) scruts)
+        ((fix sum (xs : List (Pair (List (Pair Nat (List Nat))) Expr)) : Nat :=
+          match xs with
+          | Nil => Z
+          | Cons row rest =>
+              match row with | MkPair _ body => add (adapt_size body) (sum rest) end
+          end) rows))
+    | EDoBind _ rhs => S (adapt_size rhs)
+    end;
+
+def adapt : Expr -> Ast :=
+  fun (initial_e : Expr) =>
+    (fix adapt (fuel : Nat) (e : Expr) : Ast :=
+      match fuel with
+      | Z => ANoBinder
+      | S remaining =>
+          let descend : Expr -> Ast :=
+            fun (next_e : Expr) => adapt remaining next_e in
+          match e with
+          | EVar n => AVar n
+          | EHole m =>
+              match m with
+              | Nothing => AHole Z
+              | Just n => AHole n
+              end
+          | ESort n => ASort n
+          | ENat n => ANatLit n
+          | EApp f x => AApp (descend f) (descend x)
+          | ELam n ann body => ALam n (adapt_ann descend ann) (descend body)
+          | EPi n dom cod => APi n (descend dom) (descend cod)
+          | ELet n ann v body => ALet n (adapt_ann descend ann) (descend v) (descend body)
+          | EAscribe t ty => AAscribe (descend t) (descend ty)
+          | EMatch scrut branches => AMatch (descend scrut) (descend branches)
+          | EFix n binders ret body =>
+              AFix n (descend binders) (descend ret) (descend body)
+          | EEffectRow inner _row => descend inner
+          | EPerform n args => APerform n (adapt_list descend args)
+          | EDo xs => ADo (adapt_do descend xs)
+          | EHandle inner cls => AHandle (descend inner) (adapt_clauses descend cls)
+          | EBranch pats body rest =>
+              adapt_pats pats (descend body) (descend rest)
+          | ENoBranch => ANoBranch
+          | EBinder n ty rest => ABinder n (descend ty) (descend rest)
+          | ENoBinder => ANoBinder
+          | EMultiMatch scruts rows =>
+              match scruts with
+              | Nil => AMatch (AList (Nil Ast)) (adapt_rows descend rows)
+              | Cons s rest0 =>
+                  match rest0 with
+                  | Nil => AMatch (descend s) (adapt_rows descend rows)
+                  | Cons _ _ =>
+                      AMatch (AList (adapt_list descend scruts)) (adapt_rows descend rows)
+                  end
+              end
+          | EStr n => AStr n
+          | EDoBind n rhs => ALet n ANoBinder (descend rhs) (ADo (Nil Ast))
+          | EList xs => AList (adapt_list descend xs)
+          end
+      end) (adapt_size initial_e) initial_e;

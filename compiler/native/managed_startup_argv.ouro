@@ -1,0 +1,104 @@
+-- Each argv action reads a fresh OS-owned table. Strings and list tails stay
+-- in managed root slots while later strings allocate or invoke raw helpers.
+import "managed_startup_strings.ouro";
+
+def managed_startup_argument_text (compiler : ManagedCompiler) (scope : ManagedStartupScope)
+    (wide : MirValue) (count : MirValue) (state : ManagedState) : Either NativeLowerError ManagedResult :=
+    lower_bind ManagedFields ManagedResult (managed_startup_scan compiler wide count state)
+      (fun (measured : ManagedFields) => match measured with | ManagedFieldsOf fields next =>
+        lower_bind (Pair MirValue MirValue) ManagedResult (lower_pair MirValue fields)
+          (fun (pair : Pair MirValue MirValue) => match pair with | MkPair units status =>
+            managed_startup_status compiler scope status (managed_startup_string compiler scope wide units count) next end) end);
+
+def managed_startup_argument (compiler : ManagedCompiler) (scope : ManagedStartupScope)
+    (table : MirValue) (argc : MirValue) (index : MirValue) (pointer : MirValue) (count : MirValue)
+    (state : ManagedState) : Either NativeLowerError ManagedResult :=
+    lower_bind ManagedResult ManagedResult
+      (managed_startup_call compiler ManagedStartupArgvAt ([table, argc, index, pointer] : List MirValue) state)
+      (fun (selected : ManagedResult) => match selected with | ManagedResultOf status next =>
+        managed_startup_status compiler scope status (fun (entered : ManagedState) =>
+          lower_bind ManagedResult ManagedResult (managed_load MirRawPtr pointer 0 entered)
+            (fun (loaded : ManagedResult) => match loaded with | ManagedResultOf wide after =>
+              managed_startup_argument_text compiler scope wide count after end)) next end);
+
+def managed_startup_argv_step (compiler : ManagedCompiler) (scope : ManagedStartupScope) (family : Nat)
+    (table : MirValue) (argc : MirValue) (pointer : MirValue) (count : MirValue)
+    (index : Nat) (list : Nat) (state : ManagedState) : Either NativeLowerError ManagedState :=
+    let entered : ManagedState := managed_emit (MirBinaryOp index MirSub (MirUse index) (managed_bits MirUSize 1)) state in
+    lower_bind ManagedResult ManagedState
+      (managed_startup_argument compiler scope table argc (MirUse index) pointer count entered)
+      (fun (converted : ManagedResult) => match converted with | ManagedResultOf string next =>
+        lower_map ManagedResult ManagedState (fun (linked : ManagedResult) => match linked with
+          | ManagedResultOf cons after => managed_emit (MirMove list cons) after end)
+          (managed_constructor compiler family (managed_bits MirUSize 1) ([string, MirUse list] : List MirValue) next) end);
+
+def managed_startup_argv_loop (compiler : ManagedCompiler) (scope : ManagedStartupScope) (family : Nat)
+    (table : MirValue) (argc : MirValue) (pointer : MirValue) (count : MirValue) (nil : MirValue)
+    (state : ManagedState) : Either NativeLowerError ManagedResult :=
+    lower_bind ManagedResult ManagedResult (managed_convert MirUSize MirZeroExtend argc state)
+      (fun (extended : ManagedResult) => match extended with | ManagedResultOf length next =>
+        lower_bind (Pair Nat ManagedState) ManagedResult (managed_fresh_local MirUSize next)
+          (fun (position : Pair Nat ManagedState) => match position with | MkPair index after =>
+            lower_bind (Pair Nat ManagedState) ManagedResult (managed_fresh_local MirManagedPtr after)
+              (fun (result : Pair Nat ManagedState) => match result with | MkPair list entered =>
+                let initialized : ManagedState := managed_emit_all
+                  ([MirMove index length, MirMove list nil] : List MirInstruction) entered in
+                lower_bind LowerLoopBlocks ManagedResult (lower_loop_blocks (managed_flow initialized))
+                  (fun (labels : LowerLoopBlocks) => match labels with | LowerLoopAt header body finish flow =>
+                    lower_bind ManagedResult ManagedResult
+                      (managed_compare MirNotEqual (MirUse index) (managed_bits MirUSize 0)
+                        (managed_with_flow initialized (lower_switch_block header (MirJump header) flow)))
+                      (fun (checked : ManagedResult) => match checked with | ManagedResultOf running tested =>
+                        lower_map ManagedState ManagedResult (fun (finished : ManagedState) =>
+                          ManagedResultOf (MirUse list) (managed_switch_block finish (MirJump header) finished))
+                          (managed_startup_argv_step compiler scope family table argc pointer count index list
+                            (managed_switch_block body (MirBranch running body finish) tested)) end) end) end) end) end);
+
+def managed_startup_argv_values (compiler : ManagedCompiler) (scope : ManagedStartupScope)
+    (table : MirValue) (argc : MirValue) (pointer : MirValue) (count : MirValue) (state : ManagedState)
+    : Either NativeLowerError ManagedResult :=
+    lower_bind Nat ManagedResult (lower_role_identity (managed_compiler_entries compiler) PrimitiveListRole)
+      (fun (family : Nat) => lower_bind ManagedResult ManagedResult
+        (managed_constructor compiler family (managed_bits MirUSize 0) ([] : List MirValue) state)
+        (fun (empty : ManagedResult) => match empty with | ManagedResultOf nil next =>
+          managed_startup_argv_loop compiler scope family table argc pointer count nil next end));
+
+def managed_startup_argv_opened (compiler : ManagedCompiler) (scope : ManagedStartupScope)
+    (storage : MirValue) (argc_cell : MirValue) (pointer : MirValue) (count : MirValue) (state : ManagedState)
+    : Either NativeLowerError ManagedResult :=
+    lower_bind ManagedResult ManagedResult (managed_load MirRawPtr storage 0 state)
+      (fun (loaded : ManagedResult) => match loaded with | ManagedResultOf table next =>
+        lower_bind ManagedResult ManagedResult (managed_load MirU32 argc_cell 0 next)
+          (fun (sized : ManagedResult) => match sized with | ManagedResultOf argc after =>
+            lower_bind ManagedResult ManagedResult
+              (managed_startup_argv_values compiler (managed_startup_argv_owner storage scope) table argc pointer count after)
+              (fun (copied : ManagedResult) => match copied with | ManagedResultOf list finished =>
+                lower_bind ManagedResult ManagedResult
+                  (managed_startup_call compiler ManagedStartupArgvClose ([storage] : List MirValue) finished)
+                  (fun (closed : ManagedResult) => match closed with | ManagedResultOf status final =>
+                    managed_startup_status compiler scope status
+                      (fun (returned : ManagedState) => Right NativeLowerError ManagedResult (ManagedResultOf list returned)) final end) end) end) end);
+
+def managed_startup_argv_storage (compiler : ManagedCompiler) (storage : MirValue) (scope : ManagedStartupScope)
+    (state : ManagedState) : Either NativeLowerError ManagedResult :=
+    lower_bind ManagedResult ManagedResult (managed_startup_pointer storage 8 state)
+      (fun (argc : ManagedResult) => match argc with | ManagedResultOf argc_cell next =>
+        lower_bind ManagedResult ManagedResult (managed_startup_pointer storage 16 next)
+          (fun (address : ManagedResult) => match address with | ManagedResultOf pointer after =>
+            lower_bind ManagedResult ManagedResult (managed_startup_pointer storage 24 after)
+              (fun (counter : ManagedResult) => match counter with | ManagedResultOf count entered =>
+                let initialized : ManagedState := managed_emit_all
+                  ([MirStore storage (codegen_disp 0) (managed_bits MirUSize 0),
+                    MirStore argc_cell (codegen_disp 0) (managed_bits MirU32 0)] : List MirInstruction) entered in
+                lower_bind ManagedResult ManagedResult
+                  (managed_startup_call compiler ManagedStartupArgvOpen ([storage, argc_cell] : List MirValue) initialized)
+                  (fun (opened : ManagedResult) => match opened with | ManagedResultOf status finished =>
+                    managed_startup_status compiler scope status
+                      (managed_startup_argv_opened compiler scope storage argc_cell pointer count) finished end) end) end) end);
+
+def managed_startup_argv_action (compiler : ManagedCompiler) (state : ManagedState)
+    : Either NativeLowerError ManagedResult :=
+    managed_action compiler ([] : List MirValue)
+      (fun (_ : List MirValue) (entered : ManagedState) =>
+        managed_startup_buffer compiler (ManagedStartupScopeOf ([] : List MirValue) (Nothing MirValue))
+          (managed_bits MirUSize 32) (managed_startup_argv_storage compiler) entered) state;

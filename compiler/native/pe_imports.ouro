@@ -1,0 +1,197 @@
+-- Named PE32+ imports. ILT and IAT are separate, contiguous, 8-byte tables.
+-- Input library/function order is preserved; timestamps and hints are zero.
+
+import "pe_model.ouro";
+
+inductive PeImportTable : Type :=
+  | PeImportTableData : List Nat -> List (Pair Nat Nat) -> Nat -> Nat -> Nat -> PeImportTable;
+
+-- ImportTableData: bytes, (ID, IAT RVA), IAT RVA/size, descriptor-table size.
+inductive PeImportNames : Type :=
+  | PeImportNamesData : List Nat -> List Nat -> List (Pair Nat Nat) -> PeImportNames;
+
+inductive PeImportParts : Type :=
+  | PeImportPartsData : List Nat -> List Nat -> List Nat -> List (Pair Nat Nat) -> PeImportParts;
+
+def pe_import_id (item : PeImport) : Nat := match item with | PeNamedImport name _ => name end;
+
+def pe_all_imports : List PeLibrary -> List PeImport :=
+  fix pe_all_imports (libraries : List PeLibrary) : List PeImport :=
+    match libraries with
+    | Nil => ([] : List PeImport)
+    | Cons library rest =>
+      match library with | PeImportLibrary _ imports => append PeImport imports (pe_all_imports rest) end
+    end;
+
+def pe_library_present (name : List Nat) : List PeLibrary -> Bool :=
+  fix pe_library_present (libraries : List PeLibrary) : Bool :=
+    match libraries with
+    | Nil => False
+    | Cons library rest =>
+      match library with | PeImportLibrary other _ => orb (pe_library_equal name other) (pe_library_present rest) end
+    end;
+
+def pe_import_name_present (name : List Nat) : List PeImport -> Bool :=
+  fix pe_import_name_present (imports : List PeImport) : Bool :=
+    match imports with
+    | Nil => False
+    | Cons item rest =>
+      match item with | PeNamedImport _ other => orb (pe_bytes_equal name other) (pe_import_name_present rest) end
+    end;
+
+def pe_validate_import_names : List PeImport -> Either PeError Unit :=
+  fix pe_validate_import_names (imports : List PeImport) : Either PeError Unit :=
+    match imports with
+    | Nil => Right PeError Unit MkUnit
+    | Cons item rest =>
+      match item with
+      | PeNamedImport name bytes =>
+        match andb (leb_nat name pe_max_rva) (pe_name_valid bytes) with
+        | False => Left PeError Unit PeInvalidName
+        | True =>
+          match pe_import_name_present bytes rest with
+          | True => Left PeError Unit (PeDuplicateImport name)
+          | False => pe_validate_import_names rest
+          end
+        end
+      end
+    end;
+
+def pe_validate_libraries : List PeLibrary -> Either PeError Unit :=
+  fix pe_validate_libraries (libraries : List PeLibrary) : Either PeError Unit :=
+    match libraries with
+    | Nil => Right PeError Unit MkUnit
+    | Cons library rest =>
+      match library with
+      | PeImportLibrary name imports =>
+        match pe_name_valid name with
+        | False => Left PeError Unit PeInvalidName
+        | True =>
+          match imports with
+          | Nil => Left PeError Unit PeEmptyLibrary
+          | Cons _ _ =>
+            match pe_library_present name rest with
+            | True => Left PeError Unit PeDuplicateLibrary
+            | False =>
+              match pe_validate_import_names imports with
+              | Left err => Left PeError Unit err
+              | Right _ => pe_validate_libraries rest
+              end
+            end
+          end
+        end
+      end
+    end;
+
+def pe_validate_import_ids : List PeImport -> Either PeError Unit :=
+  fix pe_validate_import_ids (imports : List PeImport) : Either PeError Unit :=
+    match imports with
+    | Nil => Right PeError Unit MkUnit
+    | Cons item rest =>
+      let name : Nat := pe_import_id item in
+      match elem Nat eq_nat name (map PeImport Nat pe_import_id rest) with
+      | True => Left PeError Unit (PeDuplicateImport name)
+      | False => pe_validate_import_ids rest
+      end
+    end;
+
+def pe_import_name_size (item : PeImport) : Nat :=
+    match item with | PeNamedImport _ name => pe_align 2 (add 3 (length Nat name)) end;
+
+def pe_import_strings_size : List PeLibrary -> Nat :=
+  fix pe_import_strings_size (libraries : List PeLibrary) : Nat :=
+    match libraries with
+    | Nil => 0
+    | Cons library rest =>
+      match library with
+      | PeImportLibrary name imports =>
+        add (pe_align 2 (S (length Nat name)))
+          (add (foldr PeImport Nat (fun (item : PeImport) (size : Nat) => add (pe_import_name_size item) size) 0 imports)
+            (pe_import_strings_size rest))
+      end
+    end;
+
+def pe_encode_import_names : List PeImport -> Nat -> Nat -> PeImportNames :=
+  fix pe_encode_import_names (imports : List PeImport) (name_rva : Nat) (iat_rva : Nat) : PeImportNames :=
+    match imports with
+    | Nil => PeImportNamesData ([] : List Nat) ([] : List Nat) ([] : List (Pair Nat Nat))
+    | Cons item rest =>
+      match item with
+      | PeNamedImport name bytes =>
+        let encoded : List Nat := pe_pad 2 (pe_join ([([0, 0] : List Nat), bytes, ([0] : List Nat)] : List (List Nat))) in
+        match pe_encode_import_names rest (add name_rva (length Nat encoded)) (add iat_rva 8) with
+        | PeImportNamesData thunks names targets =>
+          PeImportNamesData (append Nat (pe_le64_rva name_rva) thunks) (append Nat encoded names)
+            (Cons (Pair Nat Nat) (MkPair Nat Nat name iat_rva) targets)
+        end
+      end
+    end;
+
+def pe_encode_import_libraries : List PeLibrary -> Nat -> Nat -> Nat -> PeImportParts :=
+  fix pe_encode_import_libraries (libraries : List PeLibrary) (name_rva : Nat)
+      (ilt_rva : Nat) (iat_rva : Nat) : PeImportParts :=
+    match libraries with
+    | Nil => PeImportPartsData ([] : List Nat) ([] : List Nat) ([] : List Nat) ([] : List (Pair Nat Nat))
+    | Cons library rest =>
+      match library with
+      | PeImportLibrary name imports =>
+        let dll_name : List Nat := pe_pad 2 (append Nat name ([0] : List Nat)) in
+        let thunk_size : Nat := mul 8 (S (length PeImport imports)) in
+        match pe_encode_import_names imports (add name_rva (length Nat dll_name)) iat_rva with
+        | PeImportNamesData thunks names targets =>
+          match pe_encode_import_libraries rest
+              (add name_rva (add (length Nat dll_name) (length Nat names)))
+              (add ilt_rva thunk_size) (add iat_rva thunk_size) with
+          | PeImportPartsData next_descriptors next_thunks next_names next_targets =>
+            PeImportPartsData
+              (pe_join ([pe_le32 ilt_rva, pe_zeros 8, pe_le32 name_rva, pe_le32 iat_rva, next_descriptors] : List (List Nat)))
+              (pe_join ([thunks, pe_zeros 8, next_thunks] : List (List Nat)))
+              (pe_join ([dll_name, names, next_names] : List (List Nat)))
+              (append (Pair Nat Nat) targets next_targets)
+          end
+        end
+      end
+    end;
+
+def pe_import_table_unchecked (base_rva : Nat) (libraries : List PeLibrary) : Either PeError PeImportTable :=
+    match libraries with
+    | Nil => Right PeError PeImportTable (PeImportTableData ([] : List Nat) ([] : List (Pair Nat Nat)) 0 0 0)
+    | Cons _ _ =>
+      let directory_size : Nat := mul 20 (S (length PeLibrary libraries)) in
+      let ilt_offset : Nat := pe_align 8 directory_size in
+      let thunk_size : Nat := mul 8 (add (length PeImport (pe_all_imports libraries)) (length PeLibrary libraries)) in
+      let iat_offset : Nat := add ilt_offset thunk_size in
+      let names_offset : Nat := add iat_offset thunk_size in
+      let size : Nat := add names_offset (pe_import_strings_size libraries) in
+      match leb_nat size (sub pe_max_rva base_rva) with
+      | False => Left PeError PeImportTable PeImageTooLarge
+      | True =>
+        match pe_encode_import_libraries libraries (add base_rva names_offset) (add base_rva ilt_offset) (add base_rva iat_offset) with
+        | PeImportPartsData descriptors thunks names targets =>
+          Right PeError PeImportTable
+            (PeImportTableData
+              (pe_join ([descriptors, pe_zeros 20, pe_zeros (sub ilt_offset directory_size), thunks, thunks, names] : List (List Nat)))
+              targets (add base_rva iat_offset) thunk_size directory_size)
+        end
+      end
+    end;
+
+def pe_build_imports (base_rva : Nat) (libraries : List PeLibrary) : Either PeError PeImportTable :=
+    match pe_validate_libraries libraries with
+    | Left err => Left PeError PeImportTable err
+    | Right _ =>
+      match pe_validate_import_ids (pe_all_imports libraries) with
+      | Left err => Left PeError PeImportTable err
+      | Right _ => pe_import_table_unchecked base_rva libraries
+      end
+    end;
+
+def pe_import_rva (name : Nat) : List (Pair Nat Nat) -> Either PeError Nat :=
+  fix pe_import_rva (targets : List (Pair Nat Nat)) : Either PeError Nat :=
+    match targets with
+    | Nil => Left PeError Nat (PeMissingImport name)
+    | Cons item rest =>
+      match item with
+      | MkPair key rva => match eq_nat key name with | True => Right PeError Nat rva | False => pe_import_rva rest end
+      end
+    end;

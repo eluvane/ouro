@@ -1,0 +1,239 @@
+-- Shared byte-level source operations for lexer, preprocessing and diagnostics.
+-- No parser, registry, filesystem or error policy belongs in this cone.
+
+import "base.ouro";
+
+-- Byte predicates run per character. Cache numeral values so generated code
+-- does not rebuild Peano literals on each comparison.
+def source_ch_space : Nat := 32;
+def source_ch_tab : Nat := 9;
+def source_ch_lf : Nat := 10;
+def source_ch_cr : Nat := 13;
+def source_ch_zero : Nat := 48;
+def source_ch_nine : Nat := 57;
+def source_ch_upper_a : Nat := 65;
+def source_ch_upper_z : Nat := 90;
+def source_ch_lower_a : Nat := 97;
+def source_ch_lower_z : Nat := 122;
+def source_ch_under : Nat := 95;
+def source_ch_quote : Nat := 39;
+def source_ch_double_quote : Nat := 34;
+def source_ch_backslash : Nat := 92;
+def source_ch_dash : Nat := 45;
+
+def source_is_ws (c : Nat) : Bool :=
+  orb (eqNat c source_ch_space)
+    (orb (eqNat c source_ch_tab) (orb (eqNat c source_ch_lf) (eqNat c source_ch_cr)));
+
+def source_is_digit (c : Nat) : Bool :=
+  andb (compiler_le_nat source_ch_zero c) (compiler_le_nat c source_ch_nine);
+
+def source_is_alpha (c : Nat) : Bool :=
+  orb (andb (compiler_le_nat source_ch_upper_a c) (compiler_le_nat c source_ch_upper_z))
+      (andb (compiler_le_nat source_ch_lower_a c) (compiler_le_nat c source_ch_lower_z));
+
+def source_is_ident_start (c : Nat) : Bool :=
+  orb (source_is_alpha c) (eqNat c source_ch_under);
+
+def source_is_ident_char (c : Nat) : Bool :=
+  orb (source_is_ident_start c) (orb (source_is_digit c) (eqNat c source_ch_quote));
+
+def source_bytes_equal : List Nat -> List Nat -> Bool :=
+  fix source_bytes_equal (xs : List Nat) (ys : List Nat) : Bool :=
+    match xs with
+    | Nil =>
+        match ys with
+        | Nil => True
+        | Cons _ _ => False
+        end
+    | Cons x xs' =>
+        match ys with
+        | Nil => False
+        | Cons y ys' =>
+            match eqNat x y with
+            | True => source_bytes_equal xs' ys'
+            | False => False
+            end
+        end
+    end;
+
+def source_starts : List Nat -> List Nat -> Bool :=
+  fix source_starts (pat : List Nat) (xs : List Nat) : Bool :=
+    match pat with
+    | Nil => True
+    | Cons p ps =>
+        match xs with
+        | Nil => False
+        | Cons x xs' =>
+            match eqNat p x with
+            | True => source_starts ps xs'
+            | False => False
+            end
+        end
+    end;
+
+def source_drop_prefix : List Nat -> List Nat -> List Nat :=
+  fix source_drop_prefix (pat : List Nat) (xs : List Nat) : List Nat :=
+    match pat with
+    | Nil => xs
+    | Cons _ ps =>
+        match xs with
+        | Nil => Nil Nat
+        | Cons _ xs' => source_drop_prefix ps xs'
+        end
+    end;
+
+def source_word_end (src : List Nat) : Bool :=
+  match src with
+  | Nil => True
+  | Cons c _ =>
+      notb (source_is_ident_char c)
+  end;
+
+def source_skip_line : List Nat -> List Nat :=
+  fix source_skip_line (xs : List Nat) : List Nat :=
+    match xs with
+    | Nil => Nil Nat
+    | Cons c rest =>
+        match eqNat c source_ch_lf with
+        | True => xs
+        | False => source_skip_line rest
+        end
+    end;
+
+def source_skip_string : List Nat -> List Nat :=
+  fix source_skip_string (xs : List Nat) : List Nat :=
+    match xs with
+    | Nil => Nil Nat
+    | Cons c rest =>
+        match eqNat c source_ch_double_quote with
+        | True => rest
+        | False =>
+            match eqNat c source_ch_backslash with
+            | True =>
+                match rest with
+                | Nil => Nil Nat
+                | Cons _ rest2 => source_skip_string rest2
+                end
+            | False => source_skip_string rest
+            end
+        end
+    end;
+
+def source_is_comment (src : List Nat) : Bool :=
+  match src with
+  | Nil => False
+  | Cons c rest =>
+      match eqNat c source_ch_dash with
+      | False => False
+      | True =>
+          match rest with
+          | Nil => False
+          | Cons c2 _ => eqNat c2 source_ch_dash
+          end
+      end
+  end;
+
+def source_prefix_until (src : List Nat) (tail : List Nat) : List Nat :=
+  (fix go (xs : List Nat) : List Nat :=
+    match xs with
+    | Nil => Nil Nat
+    | Cons x xs' =>
+        match source_bytes_equal xs tail with
+        | True => Nil Nat
+        | False => Cons Nat x (go xs')
+        end
+    end) src;
+
+def source_take_ident (src : List Nat) : Pair (List Nat) (List Nat) :=
+  (fix go (xs : List Nat) (acc : List Nat) : Pair (List Nat) (List Nat) :=
+    match xs with
+    | Nil => MkPair (List Nat) (List Nat) (reverse Nat acc) (Nil Nat)
+    | Cons c rest =>
+        match source_is_ident_char c with
+        | True => go rest (Cons Nat c acc)
+        | False => MkPair (List Nat) (List Nat) (reverse Nat acc) xs
+        end
+    end) src (Nil Nat);
+
+def source_lookup_id :
+    List (Pair (List Nat) Nat) -> List Nat -> Maybe Nat :=
+  fix source_lookup_id (xs : List (Pair (List Nat) Nat)) (key : List Nat) : Maybe Nat :=
+    match xs with
+    | Nil => Nothing Nat
+    | Cons p rest =>
+        match p with
+        | MkPair k v =>
+            match source_bytes_equal k key with
+            | True => Just Nat v
+            | False => source_lookup_id rest key
+            end
+        end
+    end;
+
+def source_skip_line_pos : List Nat -> Nat -> Pair (List Nat) Nat :=
+  fix go (xs : List Nat) (pos : Nat) : Pair (List Nat) Nat :=
+    match xs with
+    | Nil => MkPair (List Nat) Nat (Nil Nat) pos
+    | Cons byte rest =>
+        match eqNat byte source_ch_lf with
+        | True => MkPair (List Nat) Nat rest (S pos)
+        | False => go rest (S pos)
+        end
+    end;
+
+def source_skip_string_pos : List Nat -> Nat -> Pair (List Nat) Nat :=
+  fix go (xs : List Nat) (pos : Nat) : Pair (List Nat) Nat :=
+    match xs with
+    | Nil => MkPair (List Nat) Nat (Nil Nat) pos
+    | Cons byte rest =>
+        match eqNat byte source_ch_double_quote with
+        | True => MkPair (List Nat) Nat rest (S pos)
+        | False =>
+            match eqNat byte source_ch_backslash with
+            | True =>
+                match rest with
+                | Nil => MkPair (List Nat) Nat (Nil Nat) (S pos)
+                | Cons _ rest2 => go rest2 (S (S pos))
+                end
+            | False => go rest (S pos)
+            end
+        end
+    end;
+
+def source_emit_reversed (initial : List Nat) (input : List Nat) : List Nat :=
+  (fix source_emit_reversed (xs : List Nat) (acc : List Nat) : List Nat :=
+    match xs with
+    | Nil => acc
+    | Cons c cs => source_emit_reversed cs (Cons Nat c acc)
+    end) input initial;
+
+def name_in (n : List Nat) : List (List Nat) -> Bool :=
+  fix name_in (xs : List (List Nat)) : Bool :=
+    match xs with
+    | Nil => False
+    | Cons y ys => orb (source_bytes_equal n y) (name_in ys)
+    end;
+
+def source_copy_comment_or_string (acc : List Nat) (src : List Nat)
+    : Maybe (Pair (List Nat) (List Nat)) :=
+  match src with
+  | Nil => Nothing (Pair (List Nat) (List Nat))
+  | Cons c rest =>
+      match source_is_comment src with
+      | True =>
+          let tail : List Nat := source_skip_line rest in
+          Just (Pair (List Nat) (List Nat))
+            (MkPair (List Nat) (List Nat)
+              (source_emit_reversed acc (source_prefix_until src tail)) tail)
+      | False =>
+          match eqNat c source_ch_double_quote with
+          | True =>
+              let tail : List Nat := source_skip_string rest in
+              Just (Pair (List Nat) (List Nat))
+                (MkPair (List Nat) (List Nat)
+                  (source_emit_reversed acc (source_prefix_until src tail)) tail)
+          | False => Nothing (Pair (List Nat) (List Nat))
+          end
+      end
+  end;

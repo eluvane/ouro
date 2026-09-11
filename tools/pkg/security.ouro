@@ -1,0 +1,158 @@
+-- Fail-closed package path validation shared by resolution, vendoring, and verify.
+
+import "model.ouro";
+import "../../std/fs_walk.ouro";
+
+def pkg_path_error (what : String) (path : String) : String :=
+    str_cat3 what ": " path;
+
+def pkg_dir_resolved (path : String) (resolved : String)
+    : IO (Either String String) :=
+    match str_null resolved with
+    | True => io_pure (Either String String)
+        (Left String String (pkg_path_error "could not resolve directory" path))
+    | False => io_pure (Either String String)
+        (Right String String resolved)
+    end;
+
+def pkg_existing_dir_real (path : String) : IO (Either String String) :=
+    io_bind Nat (Either String String) (prim_fs_kind path)
+      (fun (kind : Nat) =>
+        match eq_nat kind (S (S Z)) with
+        | False =>
+            match eq_nat kind (S (S (S Z))) with
+            | True => io_pure (Either String String)
+                (Left String String (pkg_path_error "unsafe link/reparse directory" path))
+            | False => io_pure (Either String String)
+                (Left String String (pkg_path_error "expected directory" path))
+            end
+        | True =>
+            io_bind String (Either String String) (prim_fs_realpath path)
+              (pkg_dir_resolved path)
+        end);
+
+def pkg_dir_made (path : String) (made : Either FsError Unit)
+    : IO (Either String String) :=
+    match made with
+    | Left e => io_pure (Either String String)
+        (Left String String (fs_error_message e))
+    | Right _ => pkg_existing_dir_real path
+    end;
+
+def pkg_prepare_dir_real (path : String) : IO (Either String String) :=
+    io_bind Nat (Either String String) (prim_fs_kind path)
+      (fun (kind : Nat) =>
+        match eq_nat kind Z with
+        | False => pkg_existing_dir_real path
+        | True =>
+            io_bind (Either FsError Unit) (Either String String)
+              (fs_mkdir_p_checked path) (pkg_dir_made path)
+        end);
+
+def pkg_source_finish (root_real : String) (src : String)
+    (src_result : Either String String) : IO (Either String String) :=
+    match src_result with
+    | Left msg => io_pure (Either String String) (Left String String msg)
+    | Right src_real =>
+        match path_under root_real src_real with
+        | True => io_pure (Either String String) (Right String String src_real)
+        | False => io_pure (Either String String)
+            (Left String String (pkg_path_error "package escapes registry" src))
+        end
+    end;
+
+def pkg_source_kind (name : String) (root_real : String) (src : String)
+    (kind : Nat) : IO (Either String String) :=
+    match eq_nat kind Z with
+    | True => io_pure (Either String String)
+        (Left String String (str_concat "missing package " name))
+    | False => io_bind (Either String String) (Either String String)
+        (pkg_existing_dir_real src) (pkg_source_finish root_real src)
+    end;
+
+def pkg_source_root (registry : String) (name : String)
+    (root_result : Either String String) : IO (Either String String) :=
+    match root_result with
+    | Left msg => io_pure (Either String String) (Left String String msg)
+    | Right root_real =>
+        let src : String := pkg_src_dir registry name in
+        io_bind Nat (Either String String) (prim_fs_kind src)
+          (pkg_source_kind name root_real src)
+    end;
+
+def pkg_source_dir_checked (registry : String) (name : String)
+    : IO (Either String String) :=
+    match pkg_ident_ok name with
+    | False => io_pure (Either String String)
+        (Left String String (pkg_path_error "invalid package name" name))
+    | True =>
+        io_bind (Either String String) (Either String String)
+          (pkg_existing_dir_real registry)
+          (pkg_source_root registry name)
+    end;
+
+def pkg_file_under (root_real : String) (path : String)
+    : IO (Either String String) :=
+    io_bind Nat (Either String String) (prim_fs_kind path)
+      (fun (kind : Nat) =>
+        match eq_nat kind (S Z) with
+        | False => io_pure (Either String String)
+            (Left String String (pkg_path_error "expected regular file" path))
+        | True =>
+            io_bind String (Either String String) (prim_fs_realpath path)
+              (fun (resolved : String) =>
+                match andb (notb (str_null resolved))
+                        (path_under root_real resolved) with
+                | True => io_pure (Either String String)
+                    (Right String String resolved)
+                | False => io_pure (Either String String)
+                    (Left String String (pkg_path_error "file escapes package root" path))
+                end)
+        end);
+
+def pkg_vendor_walk_ok (dest : String) (root_real : String)
+    (dest_real : String) : IO (Either String String) :=
+    match path_under root_real dest_real with
+    | False => io_pure (Either String String)
+        (Left String String (pkg_path_error "vendor directory escapes _ouro_pkgs" dest))
+    | True =>
+        io_bind FsWalkResult (Either String String) (fs_walk_checked dest)
+          (fun (walked : FsWalkResult) =>
+            match walked with
+            | FsWalkComplete _ => io_pure (Either String String)
+                (Right String String dest)
+            | FsWalkTruncated _ => io_pure (Either String String)
+                (Left String String (fs_walk_message walked))
+            | FsWalkUnreadable _ => io_pure (Either String String)
+                (Left String String (fs_walk_message walked))
+            | FsWalkUnsafe _ => io_pure (Either String String)
+                (Left String String (fs_walk_message walked))
+            end)
+    end;
+
+def pkg_vendor_dest (dest : String) (root_real : String)
+    (dest_result : Either String String) : IO (Either String String) :=
+    match dest_result with
+    | Left msg => io_pure (Either String String) (Left String String msg)
+    | Right dest_real => pkg_vendor_walk_ok dest root_real dest_real
+    end;
+
+def pkg_vendor_root (name : String) (root_result : Either String String)
+    : IO (Either String String) :=
+    match root_result with
+    | Left msg => io_pure (Either String String) (Left String String msg)
+    | Right root_real =>
+        let dest : String := pkg_vendor_path name in
+        io_bind (Either String String) (Either String String)
+          (pkg_prepare_dir_real dest) (pkg_vendor_dest dest root_real)
+    end;
+
+def pkg_vendor_ready (name : String) : IO (Either String String) :=
+    match pkg_ident_ok name with
+    | False => io_pure (Either String String)
+        (Left String String (pkg_path_error "invalid package name" name))
+    | True =>
+        io_bind (Either String String) (Either String String)
+          (pkg_prepare_dir_real "_ouro_pkgs")
+          (pkg_vendor_root name)
+    end;

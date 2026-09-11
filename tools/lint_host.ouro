@@ -1,0 +1,742 @@
+-- Host for lint.ouro: lex/parse/spans/filter. Keep this cone off std/char
+-- and tools/analyze so lexer.ch_* and parser RSS stay out of ouro-analyze.
+
+import "../std/io.ouro";
+import "../compiler/lint.ouro";
+import "../compiler/lexer.ouro";
+import "../compiler/parser.ouro";
+import "../compiler/preprocess_import.ouro";
+import "../compiler/preprocess_record.ouro";
+import "lint_names.ouro";
+
+-- Extra parse steps only. A 100k Peano addend is copied through parser
+-- closures and turns a 10k-byte file into multi-gigabyte RSS.
+def lint_fuel (n : Nat) : Nat := add n (mul 64 16);
+
+def lint_nat1 (c : Nat) : List Nat := singleton Nat c;
+
+def str1 (s : String) : List String := singleton String s;
+
+def adapt_pats (pats : List Nat) (body : Ast) (rest : Ast) : Ast :=
+    match pats with
+    | Nil => rest
+    | Cons ctor binders => ABranch ctor binders body rest
+    end;
+
+-- Binders as untyped lambdas around a body.
+def lams : List Nat -> Ast -> Ast :=
+  fix lams (ids : List Nat) (body : Ast) : Ast :=
+    match ids with
+    | Nil => body
+    | Cons id rest => ALam id (ASort Z) (lams rest body)
+    end;
+
+def adapt : Expr -> Ast :=
+  fix adapt (e : Expr) : Ast :=
+    match e with
+    | EVar n => AVar n
+    | EHole m =>
+        match m with
+        | Nothing => AHole Z
+        | Just n => AHole n
+        end
+    | ESort n => ASort n
+    | ENat n => ANatLit n
+    | EApp f x => AApp (adapt f) (adapt x)
+    | ELam n ann body =>
+        match ann with
+        | Nothing => ALam n (ASort Z) (adapt body)
+        | Just t => ALam n (adapt t) (adapt body)
+        end
+    | EPi n dom cod => APi n (adapt dom) (adapt cod)
+    | ELet n ann v body =>
+        match ann with
+        | Nothing => ALet n (ASort Z) (adapt v) (adapt body)
+        | Just t => ALet n (adapt t) (adapt v) (adapt body)
+        end
+    | EAscribe t ty => AAscribe (adapt t) (adapt ty)
+    | EMatch scrut branches => AMatch (adapt scrut) (adapt branches)
+    | EFix n binders ret body =>
+        AFix n (adapt binders) (adapt ret) (adapt body)
+    | EEffectRow inner _row => adapt inner
+    | EPerform n args =>
+        (fix go (xs : List Expr) (h : Ast) : Ast :=
+          match xs with
+          | Nil => h
+          | Cons a rest => go rest (AApp h (adapt a))
+          end) args (AVar n)
+    | EDo xs =>
+        (fix go (ys : List Expr) : Ast :=
+          match ys with
+          | Nil => ASort Z
+          | Cons a rest =>
+              let sequence : Ast -> Ast := fun (statement : Ast) =>
+                match rest with
+                | Nil => statement
+                | Cons _ _ => ALet Z (ASort Z) statement (go rest)
+                end in
+              -- Match the child directly: the recursive call on rhs must
+              -- retain its structural relationship to the enclosing EDo.
+              match a with
+              | EDoBind n rhs => ALet n (ASort Z) (adapt rhs) (go rest)
+              | EVar _ => sequence (adapt a)
+              | EHole _ => sequence (adapt a)
+              | ESort _ => sequence (adapt a)
+              | ENat _ => sequence (adapt a)
+              | EApp _ _ => sequence (adapt a)
+              | ELam _ _ _ => sequence (adapt a)
+              | EPi _ _ _ => sequence (adapt a)
+              | ELet _ _ _ _ => sequence (adapt a)
+              | EAscribe _ _ => sequence (adapt a)
+              | EMatch _ _ => sequence (adapt a)
+              | EFix _ _ _ _ => sequence (adapt a)
+              | EEffectRow _ _ => sequence (adapt a)
+              | EPerform _ _ => sequence (adapt a)
+              | EDo _ => sequence (adapt a)
+              | EHandle _ _ => sequence (adapt a)
+              | EBranch _ _ _ => sequence (adapt a)
+              | ENoBranch => sequence (adapt a)
+              | EBinder _ _ _ => sequence (adapt a)
+              | ENoBinder => sequence (adapt a)
+              | EMultiMatch _ _ => sequence (adapt a)
+              | EStr _ => sequence (adapt a)
+              | EList _ => sequence (adapt a)
+              end
+          end) xs
+    -- A clause binds its operation arguments and continuation over its own
+    -- body; clauses are sequenced like `do` statements under a discard let.
+    | EHandle inner cls =>
+        ALet Z (ASort Z) (adapt inner)
+          ((fix go (cs : List (Pair Nat (Pair (List Nat) Expr))) : Ast :=
+            match cs with
+            | Nil => ASort Z
+            | Cons c rest =>
+                match c with
+                | MkPair _ payload =>
+                    match payload with
+                    | MkPair binders body =>
+                        ALet Z (ASort Z) (lams binders (adapt body)) (go rest)
+                    end
+                end
+            end) cls)
+    | EBranch pats body rest =>
+        adapt_pats pats (adapt body) (adapt rest)
+    | ENoBranch => ANoBranch
+    | EBinder n ty rest => ABinder n (adapt ty) (adapt rest)
+    | ENoBinder => ANoBinder
+    | EMultiMatch scruts rows =>
+        match scruts with
+        | Nil => ASort Z
+        | Cons scrutinee rest0 =>
+            match rest0 with
+            | Nil =>
+                AMatch (adapt scrutinee)
+                  ((fix go (rs : List (Pair (List (Pair Nat (List Nat))) Expr))
+                      : Ast :=
+                    match rs with
+                    | Nil => ANoBranch
+                    | Cons row tl =>
+                        match row with
+                        | MkPair pats body =>
+                            match pats with
+                            | Nil =>
+                                ALet Z (ASort Z) (adapt body) (go tl)
+                            | Cons p _ =>
+                                match p with
+                                | MkPair ctor ids =>
+                                    ABranch ctor ids (adapt body) (go tl)
+                                end
+                            end
+                        end
+                    end) rows)
+            | Cons _ _ =>
+                -- Scrutinees form a tuple spine under a sort head so no
+                -- constructor looks over-applied; rows stay ARow siblings.
+                AMatch
+                  ((fix gs (ys : List Expr) (h : Ast) : Ast :=
+                    match ys with
+                    | Nil => h
+                    | Cons a tl => gs tl (AApp h (adapt a))
+                    end) scruts (ASort Z))
+                  ((fix gr (rs : List (Pair (List (Pair Nat (List Nat))) Expr))
+                      : Ast :=
+                    match rs with
+                    | Nil => ANoBranch
+                    | Cons row tl =>
+                        match row with
+                        | MkPair pats body => ARow pats (adapt body) (gr tl)
+                        end
+                    end) rows)
+            end
+        end
+    | EStr n => ANatLit n
+    | EDoBind n rhs => ALet n (ASort Z) (adapt rhs) (ASort Z)
+    | EList xs =>
+        (fix go (ys : List Expr) : Ast :=
+          match ys with
+          | Nil => ASort Z
+          | Cons a rest =>
+              ALet Z (ASort Z) (adapt a) (go rest)
+          end) xs
+    end;
+
+def pi_arity : Expr -> Nat :=
+  fix pi_arity (t : Expr) : Nat :=
+    match t with
+    | EPi _ _ body => S (pi_arity body)
+    | EVar _ => Z
+    | EHole _ => Z
+    | ESort _ => Z
+    | ENat _ => Z
+    | EApp _ _ => Z
+    | ELam _ _ _ => Z
+    | ELet _ _ _ _ => Z
+    | EAscribe _ _ => Z
+    | EMatch _ _ => Z
+    | EFix _ _ _ _ => Z
+    | EEffectRow _ _ => Z
+    | EPerform _ _ => Z
+    | EDo _ => Z
+    | EHandle _ _ => Z
+    | EBranch _ _ _ => Z
+    | ENoBranch => Z
+    | EBinder _ _ _ => Z
+    | ENoBinder => Z
+    | EMultiMatch _ _ => Z
+    | EStr _ => Z
+    | EDoBind _ _ => Z
+    | EList _ => Z
+    end;
+
+def ctor_sigs (ind : Nat) (nparams : Nat) (cs : List (Pair Nat Expr))
+    : List Sig :=
+  map (Pair Nat Expr) Sig
+    (fun (p : Pair Nat Expr) =>
+      match p with
+      | MkPair ctor ty => MkSig ind ctor (pi_arity ty) nparams
+      end) cs;
+
+def param_ids (ps : List (Pair Nat Expr)) : List Nat :=
+  map (Pair Nat Expr) Nat
+    (fun (p : Pair Nat Expr) =>
+      match p with
+      | MkPair n _ => n
+      end) ps;
+
+def file_has_import (ds : List Decl) : Bool :=
+  any Decl
+    (fun (d : Decl) =>
+      match d with
+      | DImport _ => True
+      | DDef _ _ _ => False
+      | DAxiom _ _ => False
+      | DInductive _ _ _ _ => False
+      | DEffect _ _ _ => False
+      | DIntrinsic _ _ _ _ => False
+      | DExtern _ _ _ => False
+      | DRepresentation _ _ => False
+      end) ds;
+
+def collect_sigs (ds : List Decl) : List Sig :=
+  concat_map Decl Sig
+    (fun (d : Decl) =>
+      match d with
+      | DInductive ind ps _ cs => ctor_sigs ind (length (Pair Nat Expr) ps) cs
+      | DDef _ _ _ => Nil Sig
+      | DAxiom _ _ => Nil Sig
+      | DEffect _ _ _ => Nil Sig
+      | DImport _ => Nil Sig
+      | DIntrinsic _ _ _ _ => Nil Sig
+      | DExtern _ _ _ => Nil Sig
+      | DRepresentation _ _ => Nil Sig
+      end) ds;
+
+-- Direct walk of the intern alist: this runs several times per warning, and
+-- a generic find pays a closure call per entry.
+def name_codes_go : List (Pair (List Nat) Nat) -> Nat -> List Nat :=
+  fix go (xs : List (Pair (List Nat) Nat)) (id : Nat) : List Nat :=
+    match xs with
+    | Nil => Nil Nat
+    | Cons p rest =>
+        match p with
+        | MkPair cs n =>
+            match eqNat n id with
+            | True => cs
+            | False => go rest id
+            end
+        end
+    end;
+
+def name_codes_of (st : InternState) (id : Nat) : List Nat :=
+    match eqNat id Z with
+    | True => lint_nat1 ch_uscore
+    | False => name_codes_go (unit_intern_ids st) id
+    end;
+
+def starts_uscore (cs : List Nat) : Bool :=
+    match cs with
+    | Nil => False
+    | Cons c _ => eqNat c ch_uscore
+    end;
+
+def is_discard (st : InternState) (id : Nat) : Bool :=
+    orb (eqNat id Z) (starts_uscore (name_codes_of st id));
+
+-- An unbound name is imported when the cone knows it and this file does not
+-- declare it. Both lists are consulted per warning instead of materialising
+-- their difference, which re-harvested the file once per known name.
+def keep_warn (st : InternState) (fields : List String)
+    (known : List String) (local_names : List String) (w : Warning) : Bool :=
+    match w with
+    | WUnbound n =>
+        let cs : List Nat := name_codes_of st n in
+        match orb (eqNat n Z) (starts_uscore cs) with
+        | True => False
+        | False =>
+            let name : String := nstr cs in
+            match mem_str name known with
+            | False => True
+            | True => mem_str name local_names
+            end
+        end
+    | WUnused n =>
+        let cs : List Nat := name_codes_of st n in
+        match orb (eqNat n Z) (starts_uscore cs) with
+        | True => False
+        | False => notb (mem_str (nstr cs) fields)
+        end
+    | WShadow n => notb (is_discard st n)
+    | WDupBinder n => notb (is_discard st n)
+    | WShadowCtor n => notb (is_discard st n)
+    | WHole _ => True
+    | WCtorArity _ => True
+    | WRedundantBranch _ => True
+    | WPartialMatch _ => True
+    | WUnreachableArm _ => True
+    | WNonRecFix _ => True
+    | WUnknownCtor _ => True
+    | WMixedCtors _ => True
+    | WEmptyMatch _ => True
+    | WCtorAppArity _ => True
+    | WMatchOnHole _ => True
+    | WMatchOnLit _ => True
+    | WMatchOnSort _ => True
+    | WEmptyTelescope _ => True
+    | WUnusedDef _ => True
+    | WUnusedCtor _ => True
+    | WUnusedInd _ => True
+    end;
+
+inductive WarnText : Type :=
+  | MkWarnText : String -> String -> String -> WarnText;
+
+def warn_text (w : Warning) : WarnText :=
+    match w with
+    | WHole _ =>
+        MkWarnText "OURO-LINT001" "hole"
+          "term hole `_` or `?` remains in a definition body"
+    | WUnbound _ => MkWarnText "OURO-LINT002" "unbound" "unbound name"
+    | WUnused _ => MkWarnText "OURO-LINT003" "unused" "unused local binder"
+    | WShadow _ =>
+        MkWarnText "OURO-LINT004" "shadow" "binder shadows an outer name"
+    | WCtorArity _ =>
+        MkWarnText "OURO-LINT005" "ctor-arity"
+          "constructor pattern has the wrong arity"
+    | WRedundantBranch _ =>
+        MkWarnText "OURO-LINT006" "redundant-branch"
+          "constructor arm is redundant"
+    | WPartialMatch _ =>
+        MkWarnText "OURO-LINT007" "partial-match"
+          "match is missing a constructor"
+    | WUnreachableArm _ =>
+        MkWarnText "OURO-LINT008" "unreachable-arm"
+          "constructor arm is unreachable"
+    | WDupBinder _ =>
+        MkWarnText "OURO-LINT009" "dup-binder"
+          "duplicate binder in the same telescope or pattern"
+    | WNonRecFix _ =>
+        MkWarnText "OURO-LINT016" "non-rec-fix"
+          "fixpoint does not use its recursive name"
+    | WUnknownCtor _ =>
+        MkWarnText "OURO-LINT017" "unknown-ctor"
+          "unknown constructor in a match arm"
+    | WMixedCtors _ =>
+        MkWarnText "OURO-LINT018" "mixed-ctors"
+          "match mixes constructors from different inductives"
+    | WEmptyMatch _ =>
+        MkWarnText "OURO-LINT020" "empty-match" "match has no branches"
+    | WShadowCtor _ =>
+        MkWarnText "OURO-LINT020" "shadow-ctor"
+          "binder shadows a constructor name"
+    | WCtorAppArity _ =>
+        MkWarnText "OURO-LINT021" "ctor-app-arity"
+          "constructor is applied to too many arguments"
+    | WMatchOnHole _ =>
+        MkWarnText "OURO-LINT023" "match-on-hole" "match scrutinee is a hole"
+    | WMatchOnLit _ =>
+        MkWarnText "OURO-LINT024" "match-on-lit" "match scrutinee is a literal"
+    | WMatchOnSort _ =>
+        MkWarnText "OURO-LINT025" "match-on-sort" "match scrutinee is a sort"
+    | WEmptyTelescope _ =>
+        MkWarnText "OURO-LINT026" "empty-telescope"
+          "recursive fixpoint has an empty telescope"
+    | WUnusedDef _ =>
+        MkWarnText "OURO-LINT027" "unused-def" "top-level definition is unused"
+    | WUnusedCtor _ =>
+        MkWarnText "OURO-LINT027" "unused-ctor" "constructor is unused"
+    | WUnusedInd _ =>
+        MkWarnText "OURO-LINT027" "unused-ind" "inductive is unused"
+    end;
+
+def warn_code (w : Warning) : String :=
+    match warn_text w with | MkWarnText code _ _ => code end;
+
+def warn_rule (w : Warning) : String :=
+    match warn_text w with | MkWarnText _ rule _ => rule end;
+
+def warn_msg (w : Warning) : String :=
+    match warn_text w with | MkWarnText _ _ msg => msg end;
+
+def of_nat (n : Nat) : String := prim_string_of_nat n;
+
+def cat3 (a : String) (b : String) (c : String) : String :=
+    concat (concat a b) c;
+
+def cat4 (a : String) (b : String) (c : String) (d : String) : String :=
+    concat (cat3 a b c) d;
+
+-- Byte at idx is not part of an identifier; out of range reads as zero.
+def boundary_at (src : String) (idx : Nat) : Bool :=
+    notb (source_is_ident_char (prim_string_byte_at src idx));
+
+def word_start (src : String) (idx : Nat) : Bool :=
+    match idx with
+    | Z => True
+    | S prev => boundary_at src prev
+    end;
+
+-- First whole-word occurrence of needle at or after off. The host scans the
+-- bytes; the earlier code-list walk built a needle-length list per source
+-- position for every warning, which dominated the heap on chatty files.
+def find_word : Nat -> String -> String -> Nat -> Maybe Nat :=
+  fix go (fuel : Nat) (src : String) (needle : String) (off : Nat) : Maybe Nat :=
+    match fuel with
+    | Z => Nothing Nat
+    | S fuel2 =>
+        let rest : String :=
+          match off with
+          | Z => src
+          | S _ => prim_string_slice src off (sub (prim_string_length src) off)
+          end in
+        match prim_string_index rest needle with
+        | Nothing => Nothing Nat
+        | Just k =>
+            let i : Nat := add off k in
+            match word_start src i with
+            | False => go fuel2 src needle (S i)
+            | True =>
+                match boundary_at src (add i (prim_string_length needle)) with
+                | True => Just Nat i
+                | False => go fuel2 src needle (S i)
+                end
+            end
+        end
+    end;
+
+def last_str : List String -> String :=
+  fix go (xs : List String) : String :=
+    match xs with
+    | Nil => ""
+    | Cons x rest =>
+        match rest with
+        | Nil => x
+        | Cons _ _ => go rest
+        end
+    end;
+
+-- One-based line and column of byte idx, from a host split of the prefix.
+def line_col_of (src : String) (idx : Nat) : Pair Nat Nat :=
+    let before : List String :=
+      prim_string_split (prim_string_slice src Z idx) ch_lf in
+    MkPair Nat Nat (length String before)
+      (S (prim_string_length (last_str before)));
+
+def warn_needle (st : InternState) (w : Warning) : String :=
+    match w with
+    | WHole n =>
+        match eqNat n Z with
+        | True => "_"
+        | False => concat "?" (nstr (name_codes_of st n))
+        end
+    | WMatchOnHole n =>
+        match eqNat n Z with
+        | True => "_"
+        | False => nstr (name_codes_of st n)
+        end
+    | WMatchOnLit _ => "match"
+    | WMatchOnSort _ => "match"
+    | WUnbound n => nstr (name_codes_of st n)
+    | WUnused n => nstr (name_codes_of st n)
+    | WShadow n => nstr (name_codes_of st n)
+    | WCtorArity n => nstr (name_codes_of st n)
+    | WRedundantBranch n => nstr (name_codes_of st n)
+    | WPartialMatch n => nstr (name_codes_of st n)
+    | WUnreachableArm n => nstr (name_codes_of st n)
+    | WDupBinder n => nstr (name_codes_of st n)
+    | WNonRecFix n => nstr (name_codes_of st n)
+    | WUnknownCtor n => nstr (name_codes_of st n)
+    | WMixedCtors n => nstr (name_codes_of st n)
+    | WEmptyMatch n => nstr (name_codes_of st n)
+    | WShadowCtor n => nstr (name_codes_of st n)
+    | WCtorAppArity n => nstr (name_codes_of st n)
+    | WEmptyTelescope n => nstr (name_codes_of st n)
+    | WUnusedDef n => nstr (name_codes_of st n)
+    | WUnusedCtor n => nstr (name_codes_of st n)
+    | WUnusedInd n => nstr (name_codes_of st n)
+    end;
+
+def span_of (src : String) (needle : String) : Pair Nat Nat :=
+    match prim_string_length needle with
+    | Z => MkPair Nat Nat (S Z) (S Z)
+    | S _ =>
+        match find_word (prim_string_length src) src needle Z with
+        | Nothing => MkPair Nat Nat (S Z) (S Z)
+        | Just i => line_col_of src i
+        end
+    end;
+
+def show_warn (path : String) (src : String) (st : InternState)
+    (w : Warning) : String :=
+    match span_of src (warn_needle st w) with
+    | MkPair line col =>
+        let loc : String :=
+          cat4 path ":" (of_nat line) (cat4 ":" (of_nat col) ": warning[" (warn_code w)) in
+        let head : String :=
+          cat4 loc "] lint/" (warn_rule w) ": " in
+        concat head (warn_msg w)
+    end;
+
+def lint_one (scope : Scope) (ctx : List Nat) (e : Expr) : List Warning :=
+    lintCtx (adapt e) scope ctx False;
+
+-- Interned ids of the constructor names harvested from the import cone.
+-- A name the file never mentions has no id and cannot matter.
+def imported_ctor_ids (st : InternState) (ctor_names : List String) : List Nat :=
+    concat_map (Pair (List Nat) Nat) Nat
+      (fun (p : Pair (List Nat) Nat) =>
+        match p with
+        | MkPair cs id =>
+            match mem_str (nstr cs) ctor_names with
+            | True => lint_nat1 id
+            | False => Nil Nat
+            end
+        end)
+      (unit_intern_ids st);
+
+def file_scope (st : InternState) (ds : List Decl) (ctor_names : List String)
+    : Scope :=
+    let sigs : List Sig := collect_sigs ds in
+    MkScope sigs
+      (append Nat (collectCtorIds sigs) (imported_ctor_ids st ctor_names))
+      (notb (file_has_import ds));
+
+def keep_type_warn (st : InternState) (w : Warning) : Bool :=
+    match w with
+    | WHole _ => True
+    | WUnbound n => notb (is_discard st n)
+    | WMatchOnHole _ => True
+    | WMatchOnLit _ => True
+    | WMatchOnSort _ => True
+    | WCtorAppArity _ => True
+    | WUnused _ => False
+    | WShadow _ => False
+    | WCtorArity _ => False
+    | WRedundantBranch _ => False
+    | WPartialMatch _ => False
+    | WUnreachableArm _ => False
+    | WDupBinder _ => False
+    | WNonRecFix _ => False
+    | WUnknownCtor _ => False
+    | WMixedCtors _ => False
+    | WEmptyMatch _ => False
+    | WShadowCtor _ => False
+    | WEmptyTelescope _ => False
+    | WUnusedDef _ => False
+    | WUnusedCtor _ => False
+    | WUnusedInd _ => False
+    end;
+
+def decl_bind_ids (d : Decl) : List Nat :=
+    match d with
+    | DDef n _ _ => lint_nat1 n
+    | DAxiom n _ => lint_nat1 n
+    | DInductive n _ _ cs => Cons Nat n (param_ids cs)
+    | DEffect n _ ops => Cons Nat n (param_ids ops)
+    | DImport _ => Nil Nat
+    | DIntrinsic n _ _ _ => lint_nat1 n
+    | DExtern n _ _ => lint_nat1 n
+    | DRepresentation _ _ => Nil Nat
+    end;
+
+-- Pi binders referenced in the rest of the type are type parameters.
+-- The matching lambdas around the body must not be reported unused when
+-- the body is `[]` / implicit (EList becomes ASort and drops the name).
+def used_pi_ids : Ast -> List Nat :=
+  fix used_pi_ids (t : Ast) : List Nat :=
+    match t with
+    | APi id _ cod =>
+        let rest : List Nat := used_pi_ids cod in
+        match occurs id cod with
+        | True => Cons Nat id rest
+        | False => rest
+        end
+    | AVar _ => Nil Nat
+    | AHole _ => Nil Nat
+    | ASort _ => Nil Nat
+    | ANatLit _ => Nil Nat
+    | AApp _ _ => Nil Nat
+    | ALam _ _ _ => Nil Nat
+    | ALet _ _ _ _ => Nil Nat
+    | AAscribe _ _ => Nil Nat
+    | ABinder _ _ _ => Nil Nat
+    | ANoBinder => Nil Nat
+    | AFix _ _ _ _ => Nil Nat
+    | ABranch _ _ _ _ => Nil Nat
+    | ANoBranch => Nil Nat
+    | AMatch _ _ => Nil Nat
+    | ARow _ _ _ => Nil Nat
+    end;
+
+def keep_body_warn (ty_used : List Nat) (w : Warning) : Bool :=
+    match w with
+    | WUnused n => notb (elem Nat eqNat n ty_used)
+    | WHole _ => True
+    | WUnbound _ => True
+    | WShadow _ => True
+    | WCtorArity _ => True
+    | WRedundantBranch _ => True
+    | WPartialMatch _ => True
+    | WUnreachableArm _ => True
+    | WDupBinder _ => True
+    | WNonRecFix _ => True
+    | WUnknownCtor _ => True
+    | WMixedCtors _ => True
+    | WEmptyMatch _ => True
+    | WShadowCtor _ => True
+    | WCtorAppArity _ => True
+    | WMatchOnHole _ => True
+    | WMatchOnLit _ => True
+    | WMatchOnSort _ => True
+    | WEmptyTelescope _ => True
+    | WUnusedDef _ => True
+    | WUnusedCtor _ => True
+    | WUnusedInd _ => True
+    end;
+
+def lint_decl (st : InternState) (scope : Scope) (ctx : List Nat)
+    (d : Decl) : List Warning :=
+    match d with
+    | DDef _ ty body =>
+        let ty_used : List Nat := used_pi_ids (adapt ty) in
+        append Warning
+          (filter Warning (keep_type_warn st) (lint_one scope ctx ty))
+          (filter Warning (keep_body_warn ty_used) (lint_one scope ctx body))
+    | DAxiom _ ty => lint_one scope ctx ty
+    | DInductive n ps ty cs =>
+        let pctx : List Nat :=
+          Cons Nat n (append Nat (param_ids ps) ctx) in
+        append Warning (lint_one scope pctx ty)
+          (concat_map (Pair Nat Expr) Warning
+            (fun (p : Pair Nat Expr) =>
+              match p with
+              | MkPair _ cty => lint_one scope pctx cty
+              end) cs)
+    | DEffect _ ps ops =>
+        concat_map (Pair Nat Expr) Warning
+          (fun (p : Pair Nat Expr) =>
+            match p with
+            | MkPair _ ty => lint_one scope ctx ty
+            end)
+          (append (Pair Nat Expr) ps ops)
+    | DImport _ => wnil
+    | DIntrinsic _ ty _ specialization =>
+        append Warning (lint_one scope ctx ty)
+          (match specialization with
+           | Nothing => wnil
+           | Just value => lint_one scope ctx value
+           end)
+    | DExtern _ ty _ => lint_one scope ctx ty
+    | DRepresentation target _ => lint_one scope ctx (EVar target)
+    end;
+
+def lint_decls (st : InternState) (scope : Scope) (ctx0 : List Nat)
+    (ds : List Decl) : List Warning :=
+  (fix go (xs : List Decl) (ctx : List Nat) : List Warning :=
+    match xs with
+    | Nil => wnil
+    | Cons d rest =>
+        let ws : List Warning := lint_decl st scope ctx d in
+        let ctx2 : List Nat := append Nat (decl_bind_ids d) ctx in
+        append Warning ws (go rest ctx2)
+    end) ds ctx0;
+
+inductive LintPrep : Type :=
+  | LintPrepOk : List Nat -> LintPrep
+  | LintPrepErr : String -> LintPrep;
+
+def lint_import_error (code : Nat) : String :=
+    match eqNat code imp_code_malformed with
+    | True => "OURO-IMP-001: malformed import alias or local open"
+    | False =>
+      match eqNat code imp_code_dup with
+      | True => "OURO-IMP-002: duplicate import alias"
+      | False =>
+        match eqNat code imp_code_unknown with
+        | True => "OURO-IMP-003: unknown import alias in open or qualifier"
+        | False =>
+          match eqNat code imp_code_badname with
+          | True => "OURO-IMP-004: invalid import alias name"
+          | False => "preprocess-import: unknown import error code"
+          end
+        end
+      end
+    end;
+
+def prep_codes (src : List Nat) : LintPrep :=
+    match preprocess_imports src with
+    | ImpErr code _ => LintPrepErr (lint_import_error code)
+    | ImpOk imported =>
+      match preprocess_records imported with
+      | PrepErr _ _ => LintPrepErr "preprocess-record"
+      | PrepOk expanded => LintPrepOk (expand_modules expanded)
+      end
+    end;
+
+-- known: every name harvested from the import cone; ctor_names: the
+-- constructor subset, which decides refinement and shadow-ctor in patterns.
+-- Constructors are not `def` names, so keep_warn must see them as imported
+-- or the cone lights up OURO-LINT002 on every `| Ctor =>` use.
+def lint_lines (path : String) (src : String) (known : List String)
+    (ctor_names : List String) : List String :=
+    let fuel : Nat := lint_fuel (prim_string_length src) in
+    match prep_codes (ncodes src) with
+    | LintPrepErr kind => str1 (concat path (concat ": " kind))
+    | LintPrepOk codes =>
+    match lex_all fuel codes with
+    | LexMalformed _ => str1 (concat path ": lex-malformed")
+    | LexExhausted _ => str1 (concat path ": lex-exhausted")
+    | LexOk toks st =>
+        match parse_file parse fuel toks Z with
+        | PErr _ => str1 (concat path ": parse-fail")
+        | POk ds _ _ =>
+            let local_names : List String := harvest_names src in
+            let rec_fields : List String := harvest_record_fields src in
+            let imported : List String :=
+              append String known
+                (append String ctor_names (harvest_ctor_names src)) in
+            map Warning String (show_warn path src st)
+              (filter Warning (keep_warn st rec_fields imported local_names)
+                (lint_decls st (file_scope st ds ctor_names) (Nil Nat) ds))
+        end
+    end
+    end;

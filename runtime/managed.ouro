@@ -1,0 +1,93 @@
+-- Managed objects share one lazy private Windows heap per context.
+-- Collection frees unreachable blocks and retires an empty heap; release-all
+-- performs shutdown cleanup after all shadow frames have been removed.
+import "managed_collect.ouro";
+
+def managed_publish_raw (context : RawPtr U8) (descriptor : RawPtr U8) (bytes : USize)
+    (base : RawPtr U8) (previous : RawPtr U8) (count : USize) (total : USize) : Runtime (RawPtr U8) :=
+    let zero : USize := usize_sub bytes bytes in
+    let one : USize := managed_one bytes in
+    let two : USize := usize_add one one in
+    let three : USize := usize_add two one in
+    runtime_bind Unit (RawPtr U8) (managed_write_pointer base zero descriptor) (fun (a : Unit) =>
+      runtime_bind Unit (RawPtr U8) (managed_write_word base one bytes) (fun (b : Unit) =>
+        runtime_bind Unit (RawPtr U8) (managed_write_pointer base two previous) (fun (c : Unit) =>
+          runtime_bind Unit (RawPtr U8) (managed_write_word base three zero) (fun (d : Unit) =>
+            runtime_bind Unit (RawPtr U8) (managed_write_word context two count) (fun (e : Unit) =>
+              runtime_bind Unit (RawPtr U8) (managed_write_word context three total) (fun (f : Unit) =>
+                runtime_bind Unit (RawPtr U8) (managed_write_pointer context zero base)
+                  (fun (g : Unit) => runtime_bind Unit (RawPtr U8) (managed_consume_collection_budget context bytes)
+                    (fun (charged : Unit) => runtime_pure (RawPtr U8) base))))))));
+
+def managed_try_allocate_raw (context : RawPtr U8) (descriptor : RawPtr U8) (bytes : USize)
+    : Runtime (RawPtr U8) :=
+    let zero : USize := usize_sub bytes bytes in
+    let one : USize := managed_one bytes in
+    let two : USize := usize_add one one in
+    let three : USize := usize_add two one in
+    runtime_bind Bool (RawPtr U8) (managed_descriptor_valid context descriptor bytes) (fun (valid : Bool) =>
+      match valid with | False => runtime_pure (RawPtr U8) (raw_null U8) | True =>
+        runtime_bind USize (RawPtr U8) (managed_read_word context two) (fun (count : USize) =>
+          runtime_bind USize (RawPtr U8) (managed_read_word context three) (fun (total : USize) =>
+            let next_count : USize := usize_add count one in
+            let next_total : USize := usize_add total bytes in
+            match raw_bool_and (usize_less count next_count) (usize_less total next_total) with
+            | False => runtime_pure (RawPtr U8) (raw_null U8)
+            | True => runtime_bind (RawPtr U8) (RawPtr U8) (managed_read_pointer context zero) (fun (previous : RawPtr U8) =>
+                runtime_bind (RawPtr U8) (RawPtr U8) (managed_heap_allocate context bytes) (fun (base : RawPtr U8) =>
+                  runtime_bind Bool (RawPtr U8) (managed_pointer_is_null base) (fun (failed : Bool) =>
+                    match failed with | True => runtime_pure (RawPtr U8) base
+                    | False => managed_publish_raw context descriptor bytes base previous next_count next_total end))) end)) end);
+
+-- The private MIR bridge calls exactly this raw signature. Failure ends in
+-- panic before any ManagedPtr exists; no caller receives a nullable value.
+def managed_allocate_raw (context : RawPtr U8) (descriptor : RawPtr U8) (bytes : USize)
+    : Runtime (RawPtr U8) :=
+    runtime_bind (RawPtr U8) (RawPtr U8) (managed_try_allocate_raw context descriptor bytes) (fun (base : RawPtr U8) =>
+      runtime_bind Bool (RawPtr U8) (managed_pointer_is_null base) (fun (failed : Bool) => match failed with
+        | False => runtime_pure (RawPtr U8) base
+        | True => runtime_bind Unit (RawPtr U8) (managed_panic bytes)
+            (fun (unexpected : Unit) => runtime_pure (RawPtr U8) (raw_null U8)) end));
+
+def managed_release_step (context : RawPtr U8) (base : RawPtr U8) : Runtime (RawPtr U8) :=
+    runtime_bind USize (RawPtr U8) (raw_to_bits U8 base) (fun (bits : USize) =>
+      let zero : USize := usize_sub bits bits in
+      let one : USize := managed_one bits in
+      let two : USize := usize_add one one in
+      let three : USize := usize_add two one in
+      runtime_bind (RawPtr U8) (RawPtr U8) (managed_read_pointer base two) (fun (next : RawPtr U8) =>
+        runtime_bind USize (RawPtr U8) (managed_read_word base one) (fun (bytes : USize) =>
+          runtime_bind USize (RawPtr U8) (managed_read_word context two) (fun (count : USize) =>
+            runtime_bind USize (RawPtr U8) (managed_read_word context three) (fun (total : USize) =>
+              match raw_bool_and (raw_bool_not (usize_equal count zero)) (raw_bool_not (usize_less total bytes)) with
+              | False => runtime_bind Unit (RawPtr U8) (managed_panic bits)
+                  (fun (unexpected : Unit) => runtime_pure (RawPtr U8) (raw_null U8))
+              | True => runtime_bind Bool (RawPtr U8) (managed_heap_release context base) (fun (released : Bool) =>
+                  match released with
+                  | False => runtime_pure (RawPtr U8) (raw_null U8)
+                  | True => runtime_bind Unit (RawPtr U8) (managed_write_word context two (usize_sub count one)) (fun (a : Unit) =>
+                      runtime_bind Unit (RawPtr U8) (managed_write_word context three (usize_sub total bytes)) (fun (b : Unit) =>
+                        runtime_bind Unit (RawPtr U8) (managed_write_pointer context zero next)
+                          (fun (c : Unit) => runtime_pure (RawPtr U8) next))) end) end)))));
+
+-- False preserves the first allocation Windows could not release. A live
+-- shadow frame rejects cleanup before any header or allocation is changed.
+def managed_release_all (context : RawPtr U8) : Runtime Bool :=
+    runtime_bind USize Bool (raw_to_bits U8 context) (fun (bits : USize) =>
+      let zero : USize := usize_sub bits bits in
+      let one : USize := managed_one bits in
+      runtime_bind USize Bool (managed_read_word context one) (fun (roots : USize) =>
+        match usize_equal roots zero with | False => runtime_pure Bool False | True =>
+          runtime_bind (RawPtr U8) Bool (managed_read_pointer context zero) (fun (first : RawPtr U8) =>
+            match u8_from_nat 1 with | Nothing => runtime_pure Bool False | Just running =>
+              runtime_bind (RawPtr U8) Bool (runtime_loop (RawPtr U8) first
+                (fun (base : RawPtr U8) => runtime_bind Bool U8 (managed_pointer_is_null base)
+                  (fun (empty : Bool) => runtime_pure U8 (match empty with
+                    | True => u8_sub running running | False => running end)))
+                (fun (base : RawPtr U8) => managed_release_step context base))
+                (fun (finished : RawPtr U8) => runtime_bind USize Bool (managed_read_word context zero)
+                  (fun (remaining : USize) => match usize_equal remaining zero with
+                    | False => runtime_pure Bool False | True =>
+                      runtime_bind Bool Bool (managed_heap_destroy_empty context) (fun (destroyed : Bool) =>
+                        match destroyed with | False => runtime_pure Bool False
+                        | True => managed_write_collection_budget context zero end) end)) end) end));

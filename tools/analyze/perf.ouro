@@ -1,0 +1,667 @@
+-- Cost smells of the extracted runtime: allocations a definition repeats on
+-- every iteration or evaluation although the value never changes. The rules
+-- read shapes only; they never estimate how often a path runs.
+
+-- @entry analyze_perf
+
+import "../../compiler/source_text.ouro";
+import "../../std/data.ouro";
+import "../../std/listx.ouro";
+import "../../std/natx.ouro";
+import "ast.ouro";
+
+-- length, Z, S, comparison heads, append heads, conversion heads, strict
+-- boolean operators, constructors the unit declares; a missing name is Z or
+-- absent from its list.
+inductive PerfIds : Type :=
+  | MkPerfIds : Nat -> Nat -> Nat -> List Nat -> List Nat -> List Nat -> List Nat
+      -> List Nat -> PerfIds;
+
+def perf_length (i : PerfIds) : Nat :=
+    match i with | MkPerfIds n _ _ _ _ _ _ _ => n end;
+
+def perf_zero (i : PerfIds) : Nat :=
+    match i with | MkPerfIds _ z _ _ _ _ _ _ => z end;
+
+def perf_succ (i : PerfIds) : Nat :=
+    match i with | MkPerfIds _ _ s _ _ _ _ _ => s end;
+
+def perf_compares (i : PerfIds) : List Nat :=
+    match i with | MkPerfIds _ _ _ cs _ _ _ _ => cs end;
+
+def perf_appends (i : PerfIds) : List Nat :=
+    match i with | MkPerfIds _ _ _ _ ap _ _ _ => ap end;
+
+def perf_convs (i : PerfIds) : List Nat :=
+    match i with | MkPerfIds _ _ _ _ _ cv _ _ => cv end;
+
+def perf_bool_ops (i : PerfIds) : List Nat :=
+    match i with | MkPerfIds _ _ _ _ _ _ ops _ => ops end;
+
+def perf_ctors (i : PerfIds) : List Nat :=
+    match i with | MkPerfIds _ _ _ _ _ _ _ cs => cs end;
+
+-- literal rebuilt inside a fix body (fix, value); append on a parameter fed
+-- back into the recursion (fix, head, parameter); length compared with a
+-- constant (Z) or scrutinised (S Z); the same conversion of the same
+-- parameter on one path (head, parameter, count); strict boolean operator
+-- whose operand nests control flow or a recursive call (operator).
+inductive PerfIssue : Type :=
+  | ILiteralInLoop : Nat -> Nat -> PerfIssue
+  | IAccumulatorAppend : Nat -> Nat -> Nat -> PerfIssue
+  | ILengthCompare : Nat -> PerfIssue
+  | IRepeatedConversion : Nat -> Nat -> Nat -> PerfIssue
+  | IStrictBoolOperand : Nat -> PerfIssue;
+
+def perf_inil : List PerfIssue := [];
+
+def perf_one (i : PerfIssue) : List PerfIssue := Cons PerfIssue i perf_inil;
+
+def perf_append (xs : List PerfIssue) (ys : List PerfIssue) : List PerfIssue :=
+    append PerfIssue xs ys;
+
+def perf_two : Nat := 2;
+
+def perf_head_in (heads : List Nat) (a : Ast) : Bool :=
+    match ast_app_head a with
+    | Nothing => False
+    | Just h =>
+        match h with
+        | Z => False
+        | S _ => andb (ast_is tag_app (ast_peel_ascribe a)) (mem Nat eq_nat h heads)
+        end
+    end;
+
+def perf_head_of (a : Ast) : Nat :=
+    match ast_app_head a with
+    | Just h => h
+    | Nothing => Z
+    end;
+
+-- Sorts, Pi types, and capitalised spines built only from those: the type
+-- arguments a polymorphic std helper takes before its values. A spine headed
+-- by a constructor the unit declares, or carrying a value argument, is a value.
+def perf_type_like (ids : PerfIds) (ctor_like : List Nat) : Ast -> Bool :=
+  fun (root : Ast) =>
+    (fix perf_type_like (fuel : Nat) (a : Ast) : Bool :=
+      match fuel with
+      | Z => False
+      | S remaining =>
+          let descend : Ast -> Bool :=
+            fun (child : Ast) => perf_type_like remaining child in
+          let p : Ast := ast_peel_ascribe a in
+          match orb (ast_is tag_sort p) (ast_is tag_pi p) with
+          | True => True
+          | False =>
+              match ast_app_head p with
+              | Nothing => False
+              | Just h =>
+                  match mem Nat eq_nat h (perf_ctors ids) with
+                  | True => False
+                  | False =>
+                      andb (mem Nat eq_nat h ctor_like) (all Ast descend (ast_args p))
+                  end
+              end
+          end
+      end) (ast_size root) root;
+
+def perf_value_args (ids : PerfIds) (ctor_like : List Nat) (a : Ast) : List Ast :=
+    drop_while Ast (perf_type_like ids ctor_like) (ast_args a);
+
+-- Maximal applications of `r` in the tree: a spine is recorded once and only
+-- its arguments are searched further.
+def perf_calls (r : Nat) : Ast -> List Ast :=
+  fun (root : Ast) =>
+    (fix perf_calls (fuel : Nat) (a : Ast) : List Ast :=
+      match fuel with
+      | Z => Nil Ast
+      | S remaining =>
+          let descend : Ast -> List Ast :=
+            fun (child : Ast) => perf_calls remaining child in
+          match andb (ast_is tag_app a) (ast_head_is r a) with
+          | True => Cons Ast a (concat_map Ast Ast descend (ast_args a))
+          | False => concat_map Ast Ast descend (ast_children a)
+          end
+      end) (ast_size root) root;
+
+-- `go (append T acc (Cons x Nil)) rest`: first value argument is the
+-- accumulator parameter, second is a constructor spine. Each round copies
+-- the whole accumulator. A variable chunk or `str_concat acc line` is not
+-- that singleton-snoc shape. Appending a parameter into another slot is not
+-- reported by the slot walk.
+def perf_accum_arg (ids : PerfIds) (ctor_like : List Nat) (r : Nat) (p : Nat)
+    (arg : Ast) : List PerfIssue :=
+    match perf_head_in (perf_appends ids) arg with
+    | False => perf_inil
+    | True =>
+        match perf_value_args ids ctor_like arg with
+        | Nil => perf_inil
+        | Cons first rest =>
+            let v : Nat := ast_var_or_zero first in
+            match v with
+            | Z => perf_inil
+            | S _ =>
+                match eq_nat v p with
+                | False => perf_inil
+                | True =>
+                    match rest with
+                    | Nil => perf_inil
+                    | Cons piece _ =>
+                        match mem Nat eq_nat (perf_head_of piece) (perf_ctors ids) with
+                        | True =>
+                            perf_one (IAccumulatorAppend r (perf_head_of arg) v)
+                        | False => perf_inil
+                        end
+                    end
+                end
+            end
+        end
+    end;
+
+-- Argument i of a recursive call against binder i of the fix.
+def perf_accum_slots (ids : PerfIds) (ctor_like : List Nat) (r : Nat)
+    : List Nat -> List Ast -> List PerfIssue :=
+  fix go (params : List Nat) (args : List Ast) : List PerfIssue :=
+    match params with
+    | Nil => perf_inil
+    | Cons p prest =>
+        match args with
+        | Nil => perf_inil
+        | Cons arg arest =>
+            perf_append (perf_accum_arg ids ctor_like r p arg) (go prest arest)
+        end
+    end;
+
+def perf_accum_issues (ids : PerfIds) (ctor_like : List Nat) (r : Nat) (binders : Ast)
+    (body : Ast) : List PerfIssue :=
+    let params : List Nat := ast_binder_ids binders in
+    match params with
+    | Nil => perf_inil
+    | Cons _ _ =>
+        concat_map Ast PerfIssue
+          (fun (call : Ast) => perf_accum_slots ids ctor_like r params (ast_args call))
+          (perf_calls r body)
+    end;
+
+def perf_is_length (ids : PerfIds) (a : Ast) : Bool :=
+    match perf_length ids with
+    | Z => False
+    | S _ => andb (ast_is tag_app (ast_peel_ascribe a)) (ast_head_is (perf_length ids) a)
+    end;
+
+def perf_small_lit (n : Nat) : Bool :=
+    match n with
+    | Z => True
+    | S m => match m with | Z => True | S _ => False end
+    end;
+
+-- 0, 1, Z, or S Z.
+def perf_small_const (ids : PerfIds) (a : Ast) : Bool :=
+    let p : Ast := ast_peel_ascribe a in
+    match p with
+    | ANatLit n => perf_small_lit n
+    | AVar v => andb (eq_nat v (perf_zero ids)) (notb (eq_nat v Z))
+    | AApp f x =>
+        andb (eq_nat (ast_var_or_zero f) (perf_succ ids))
+          (andb (notb (eq_nat (perf_succ ids) Z))
+            (andb (eq_nat (ast_var_or_zero x) (perf_zero ids)) (notb (eq_nat (perf_zero ids) Z))))
+    | AHole _ => False
+    | ASort _ => False
+    | AStr _ => False
+    | ALam _ _ _ => False
+    | APi _ _ _ => False
+    | ALet _ _ _ _ => False
+    | AAscribe _ _ => False
+    | ABinder _ _ _ => False
+    | ANoBinder => False
+    | AFix _ _ _ _ => False
+    | ABranch _ _ _ _ => False
+    | ANoBranch => False
+    | AMatch _ _ => False
+    | APerform _ _ => False
+    | AHandle _ _ => False
+    | AClause _ _ _ _ => False
+    | ANoClause => False
+    | ADo _ => False
+    | AList _ => False
+    end;
+
+-- `eq_nat (length T xs) Z` and friends: the whole list is walked to learn
+-- whether it is empty or a singleton.
+def perf_length_compare (ids : PerfIds) (a : Ast) : List PerfIssue :=
+    match perf_head_in (perf_compares ids) a with
+    | False => perf_inil
+    | True =>
+        match ast_args a with
+        | Nil => perf_inil
+        | Cons x more =>
+            match more with
+            | Nil => perf_inil
+            | Cons y tail =>
+                match tail with
+                | Cons _ _ => perf_inil
+                | Nil =>
+                    match orb (andb (perf_is_length ids x) (perf_small_const ids y))
+                      (andb (perf_is_length ids y) (perf_small_const ids x)) with
+                    | True => perf_one (ILengthCompare Z)
+                    | False => perf_inil
+                    end
+                end
+            end
+        end
+    end;
+
+def perf_arm_ignores_binders (m : AstArm) : Bool :=
+    all Nat (fun (id : Nat) =>
+      match id with
+      | Z => True
+      | S _ => notb (ast_occurs id (ast_arm_body m))
+      end) (ast_arm_binders m);
+
+-- `match length T xs with | Z => .. | S _ => ..` where no arm reads the
+-- count: a match on the list itself answers the same question in constant
+-- time.
+def perf_length_scrut (ids : PerfIds) (scrut : Ast) (branches : Ast) : List PerfIssue :=
+    match perf_is_length ids scrut with
+    | False => perf_inil
+    | True =>
+        match ast_arms branches with
+        | Nothing => perf_inil
+        | Just arms =>
+            match all AstArm perf_arm_ignores_binders arms with
+            | True => perf_one (ILengthCompare (S Z))
+            | False => perf_inil
+            end
+        end
+    end;
+
+def perf_calls_any (recs : List Nat) (a : Ast) : Bool :=
+    any Nat (fun (r : Nat) => ast_calls r a) recs;
+
+-- andb and orb evaluate both operands. House style puts a cheap test first
+-- and the recursive call second (`andb (is_zero x) (go rest)`). A recursive
+-- call in the first operand with a non-recursive second is the smell: the
+-- cheap test never gets to skip the walk. Nested match and two recursive
+-- operands (tree equality) are ordinary.
+def perf_strict_operand (ids : PerfIds) (recs : List Nat) (a : Ast) : List PerfIssue :=
+    match perf_head_in (perf_bool_ops ids) a with
+    | False => perf_inil
+    | True =>
+        match ast_args a with
+        | Cons x rest =>
+            match rest with
+            | Cons y tail =>
+                match tail with
+                | Cons _ _ => perf_inil
+                | Nil =>
+                    match andb (perf_calls_any recs x) (notb (perf_calls_any recs y)) with
+                    | True => perf_one (IStrictBoolOperand (perf_head_of a))
+                    | False => perf_inil
+                    end
+                end
+            | Nil => perf_inil
+            end
+        | Nil => perf_inil
+        end
+    end;
+
+-- head, argument variables.
+inductive PerfKey : Type :=
+  | MkPerfKey : Nat -> List Nat -> PerfKey;
+
+def perf_key_head (k : PerfKey) : Nat := match k with | MkPerfKey h _ => h end;
+
+def perf_key_args (k : PerfKey) : List Nat := match k with | MkPerfKey _ vs => vs end;
+
+def perf_key_eq (a : PerfKey) (b : PerfKey) : Bool :=
+    andb (eq_nat (perf_key_head a) (perf_key_head b))
+      (source_bytes_equal (perf_key_args a) (perf_key_args b));
+
+def perf_all_vars : List Ast -> Maybe (List Nat) :=
+  fix perf_all_vars (xs : List Ast) : Maybe (List Nat) :=
+    match xs with
+    | Nil => Just (List Nat) (Nil Nat)
+    | Cons x rest =>
+        match ast_var_or_zero x with
+        | Z => Nothing (List Nat)
+        | S v =>
+            match perf_all_vars rest with
+            | Nothing => Nothing (List Nat)
+            | Just vs => Just (List Nat) (Cons Nat (S v) vs)
+            end
+        end
+    end;
+
+-- Conversion spines over bare variables that are parameters of the definition
+-- or capitalised type names.
+def perf_key_of (ids : PerfIds) (ctor_like : List Nat) (params : List Nat) (a : Ast)
+    : List PerfKey :=
+    match perf_head_in (perf_convs ids) a with
+    | False => Nil PerfKey
+    | True =>
+        match perf_all_vars (ast_args a) with
+        | Nothing => Nil PerfKey
+        | Just vs =>
+            match all Nat (fun (v : Nat) =>
+                orb (mem Nat eq_nat v params) (mem Nat eq_nat v ctor_like)) vs with
+            | False => Nil PerfKey
+            | True =>
+                match any Nat (fun (v : Nat) => mem Nat eq_nat v params) vs with
+                | False => Nil PerfKey
+                | True => [MkPerfKey (perf_head_of a) vs]
+                end
+            end
+        end
+    end;
+
+def perf_keys (ids : PerfIds) (ctor_like : List Nat) (params : List Nat) : Ast -> List PerfKey :=
+  fun (root : Ast) =>
+    (fix perf_keys (fuel : Nat) (a : Ast) : List PerfKey :=
+      match fuel with
+      | Z => Nil PerfKey
+      | S remaining =>
+          let descend : Ast -> List PerfKey :=
+            fun (child : Ast) => perf_keys remaining child in
+          append PerfKey (perf_key_of ids ctor_like params a)
+            (concat_map Ast PerfKey descend (ast_children a))
+      end) (ast_size root) root;
+
+def perf_matches_key (k : PerfKey) (a : Ast) : Bool :=
+    match ast_is tag_app (ast_peel_ascribe a) with
+    | False => False
+    | True =>
+        match eq_nat (perf_head_of a) (perf_key_head k) with
+        | False => False
+        | True =>
+            match perf_all_vars (ast_args a) with
+            | Nothing => False
+            | Just vs => source_bytes_equal vs (perf_key_args k)
+            end
+        end
+    end;
+
+-- Occurrences of a key on the heaviest evaluation path, and on the heaviest
+-- path that also calls the enclosing fix when one does.
+inductive PerfPath : Type :=
+  | MkPerfPath : Nat -> Maybe Nat -> PerfPath;
+
+def perf_path_total (p : PerfPath) : Nat :=
+    match p with | MkPerfPath n _ => n end;
+
+def perf_path_rec (p : PerfPath) : Maybe Nat :=
+    match p with | MkPerfPath _ r => r end;
+
+def perf_path_zero : PerfPath := MkPerfPath Z (Nothing Nat);
+
+def perf_path_hit : PerfPath := MkPerfPath (S Z) (Nothing Nat);
+
+def perf_path_shift (n : Nat) (r : Maybe Nat) : Maybe Nat :=
+    match r with
+    | Nothing => Nothing Nat
+    | Just x => Just Nat (add x n)
+    end;
+
+def perf_path_max_rec (a : Maybe Nat) (b : Maybe Nat) : Maybe Nat :=
+    match a with
+    | Nothing => b
+    | Just x =>
+        match b with
+        | Nothing => Just Nat x
+        | Just y => Just Nat (maxNat x y)
+        end
+    end;
+
+-- `a` then `b` on one path.
+def perf_path_seq (a : PerfPath) (b : PerfPath) : PerfPath :=
+    match a with
+    | MkPerfPath ta ra =>
+        match b with
+        | MkPerfPath tb rb =>
+            MkPerfPath (add ta tb)
+              (perf_path_max_rec (perf_path_shift tb ra) (perf_path_shift ta rb))
+        end
+    end;
+
+-- `a` or `b`: arms are alternatives.
+def perf_path_alt (a : PerfPath) (b : PerfPath) : PerfPath :=
+    match a with
+    | MkPerfPath ta ra =>
+        match b with
+        | MkPerfPath tb rb => MkPerfPath (maxNat ta tb) (perf_path_max_rec ra rb)
+        end
+    end;
+
+def perf_path_seq_all : List PerfPath -> PerfPath :=
+  fix go (ps : List PerfPath) : PerfPath :=
+    match ps with
+    | Nil => perf_path_zero
+    | Cons p rest => perf_path_seq p (go rest)
+    end;
+
+-- The path through this node calls the enclosing fix.
+def perf_path_recur (p : PerfPath) : PerfPath :=
+    MkPerfPath (perf_path_total p) (Just Nat (perf_path_total p));
+
+-- A fix whose parameters do not include the converted variable converts the
+-- same value on every round, so an occurrence on a path that recurs counts
+-- twice; one in an arm that ends the loop runs once. The fix is opaque to
+-- the recursion of an enclosing one.
+def perf_path_loop (k : PerfKey) (binders : Ast) (inner : PerfPath) : PerfPath :=
+    match any Nat (fun (v : Nat) => mem Nat eq_nat v (ast_binder_ids binders))
+      (perf_key_args k) with
+    | True => MkPerfPath (perf_path_total inner) (Nothing Nat)
+    | False =>
+        match perf_path_rec inner with
+        | Nothing => MkPerfPath (perf_path_total inner) (Nothing Nat)
+        | Just rc => MkPerfPath (maxNat (perf_path_total inner) (add rc rc)) (Nothing Nat)
+        end
+    end;
+
+-- r: the enclosing fix, Z outside any.
+def perf_path (k : PerfKey) : Nat -> Ast -> PerfPath :=
+  fun (callee : Nat) (root : Ast) =>
+    (fix perf_path (fuel : Nat) (r : Nat) (a : Ast) : PerfPath :=
+      match fuel with
+      | Z => perf_path_zero
+      | S remaining =>
+          let descend : Nat -> Ast -> PerfPath :=
+            fun (next_r : Nat) (child : Ast) => perf_path remaining next_r child in
+          match perf_matches_key k a with
+          | True => perf_path_hit
+          | False =>
+              match a with
+              | ABranch _ _ body rest => perf_path_alt (descend r body) (descend r rest)
+              | AClause _ _ body rest => perf_path_alt (descend r body) (descend r rest)
+              | AFix name binders _ body => perf_path_loop k binders (descend name body)
+              | AVar _ => perf_path_zero
+              | AHole _ => perf_path_zero
+              | ASort _ => perf_path_zero
+              | ANatLit _ => perf_path_zero
+              | AStr _ => perf_path_zero
+              | AApp _ _ =>
+                  let spine : PerfPath :=
+                    perf_path_seq_all (map Ast PerfPath (descend r) (ast_children a)) in
+                  match r with
+                  | Z => spine
+                  | S _ =>
+                      match ast_head_is r a with
+                      | True => perf_path_recur spine
+                      | False => spine
+                      end
+                  end
+              | ALam _ _ body => descend r body
+              | APi _ _ _ => perf_path_zero
+              | ALet _ _ v body => perf_path_seq (descend r v) (descend r body)
+              | AAscribe e _ => descend r e
+              | ABinder _ _ _ => perf_path_zero
+              | ANoBinder => perf_path_zero
+              | ANoBranch => perf_path_zero
+              | AMatch scrut branches => perf_path_seq (descend r scrut) (descend r branches)
+              | APerform _ args => perf_path_seq_all (map Ast PerfPath (descend r) args)
+              | AHandle inner cls => perf_path_seq (descend r inner) (descend r cls)
+              | ANoClause => perf_path_zero
+              | ADo xs => perf_path_seq_all (map Ast PerfPath (descend r) xs)
+              | AList xs => perf_path_seq_all (map Ast PerfPath (descend r) xs)
+              end
+          end
+      end) (ast_size root) callee root;
+
+def perf_last_nat (d : Nat) : List Nat -> Nat :=
+  fix perf_last_nat (xs : List Nat) : Nat :=
+    match xs with
+    | Nil => d
+    | Cons x rest =>
+        match rest with
+        | Nil => x
+        | Cons _ _ => perf_last_nat rest
+        end
+    end;
+
+-- A key that occurs once repeats only through a fix that does not rebind its
+-- variables: an inner fix, or the root fix when the key is over the leading
+-- parameters rather than the telescope. root_binders is Nil without a root
+-- fix.
+def perf_may_repeat (root_fix : Bool) (root_binders : List Nat) (inner_fix : Bool)
+    (k : PerfKey) : Bool :=
+    match inner_fix with
+    | True => True
+    | False =>
+        match root_fix with
+        | False => False
+        | True =>
+            notb (any Nat (fun (v : Nat) => mem Nat eq_nat v root_binders) (perf_key_args k))
+        end
+    end;
+
+-- Distinct keys worth a path walk: those with a second occurrence, and those
+-- a loop can repeat. The walk is the expensive part, so the rest are skipped.
+def perf_repeated_keys (core : Ast) (keys : List PerfKey) : List PerfKey :=
+    let root_fix : Bool := ast_is tag_fix core in
+    let root_binders : List Nat := ast_binder_ids core in
+    let inner_fix : Bool := ast_exists (ast_is tag_fix) (ast_core_body core) in
+    filter PerfKey
+      (fun (k : PerfKey) =>
+        match leb_nat perf_two (length PerfKey (filter PerfKey (perf_key_eq k) keys)) with
+        | True => True
+        | False => perf_may_repeat root_fix root_binders inner_fix k
+        end)
+      (nub PerfKey perf_key_eq keys);
+
+def perf_conversion_issues (ids : PerfIds) (ctor_like : List Nat) (params : List Nat)
+    (core : Ast) : List PerfIssue :=
+    concat_map PerfKey PerfIssue
+      (fun (k : PerfKey) =>
+        let n : Nat := perf_path_total (perf_path k Z core) in
+        match leb_nat perf_two n with
+        | True =>
+            perf_one (IRepeatedConversion (perf_key_head k)
+              (perf_last_nat Z (perf_key_args k)) n)
+        | False => perf_inil
+        end)
+      (perf_repeated_keys core (perf_keys ids ctor_like params core));
+
+-- Leading parameter lambdas and the root fix telescope.
+-- Bytes and ASCII codes are rebuilt as small Peano chains; naming each one
+-- is not a win. Literals above 255 inside a fix are.
+def perf_byte_max : Nat := 255;
+
+def perf_literal_issue (thresh : Nat) (recs : List Nat) (n : Nat) : List PerfIssue :=
+    match recs with
+    | Nil => perf_inil
+    | Cons r _ =>
+        match andb (leb_nat thresh n) (ltb_nat perf_byte_max n) with
+        | True => perf_one (ILiteralInLoop r n)
+        | False => perf_inil
+        end
+    end;
+
+-- Value-position walk with the enclosing fixes innermost first. Types and
+-- annotations are skipped: literals there are erased, not rebuilt.
+def perf_walk (ids : PerfIds) (ctor_like : List Nat) (thresh : Nat)
+    : List Nat -> Ast -> List PerfIssue :=
+  fun (initial_recs : List Nat) (root : Ast) =>
+    (fix perf_walk (fuel : Nat) (recs : List Nat) (a : Ast) : List PerfIssue :=
+      match fuel with
+      | Z => perf_inil
+      | S remaining =>
+          let descend : List Nat -> Ast -> List PerfIssue :=
+            fun (next_recs : List Nat) (child : Ast) => perf_walk remaining next_recs child in
+          match a with
+          | ANatLit n => perf_literal_issue thresh recs n
+          | AVar _ => perf_inil
+          | AHole _ => perf_inil
+          | ASort _ => perf_inil
+          | AStr _ => perf_inil
+          | AApp f x =>
+              perf_append (perf_length_compare ids a)
+                (perf_append (perf_strict_operand ids recs a)
+                  (perf_append (descend recs f) (descend recs x)))
+          | ALam _ _ body => descend recs body
+          | APi _ _ _ => perf_inil
+          | ALet _ _ v body => perf_append (descend recs v) (descend recs body)
+          | AAscribe e _ => descend recs e
+          | ABinder _ _ _ => perf_inil
+          | ANoBinder => perf_inil
+          | AFix r binders _ body =>
+              perf_append (perf_accum_issues ids ctor_like r binders body)
+                (descend (Cons Nat r recs) body)
+          | ABranch _ _ body rest => perf_append (descend recs body) (descend recs rest)
+          | ANoBranch => perf_inil
+          | AMatch scrut branches =>
+              perf_append (perf_length_scrut ids scrut branches)
+                (perf_append (descend recs scrut) (descend recs branches))
+          | APerform _ args => concat_map Ast PerfIssue (descend recs) args
+          | AHandle inner cls => perf_append (descend recs inner) (descend recs cls)
+          | AClause _ _ body rest => perf_append (descend recs body) (descend recs rest)
+          | ANoClause => perf_inil
+          | ADo xs => concat_map Ast PerfIssue (descend recs) xs
+          | AList xs => concat_map Ast PerfIssue (descend recs) xs
+          end
+      end) (ast_size root) initial_recs root;
+
+def perf_root_fix : Ast -> Ast :=
+  fix perf_root_fix (a : Ast) : Ast :=
+    match a with
+    | AAscribe e _ => perf_root_fix e
+    | ALam _ _ body => perf_root_fix body
+    | AFix _ _ _ _ => a
+    | AVar _ => a
+    | AHole _ => a
+    | ASort _ => a
+    | ANatLit _ => a
+    | AStr _ => a
+    | AApp _ _ => a
+    | APi _ _ _ => a
+    | ALet _ _ _ _ => a
+    | ABinder _ _ _ => a
+    | ANoBinder => a
+    | ABranch _ _ _ _ => a
+    | ANoBranch => a
+    | AMatch _ _ => a
+    | APerform _ _ => a
+    | AHandle _ _ => a
+    | AClause _ _ _ _ => a
+    | ANoClause => a
+    | ADo _ => a
+    | AList _ => a
+    end;
+
+-- The root fix is walked as a fix so its telescope feeds the accumulator rule
+-- and its body counts as a loop for literals.
+def perf_root (a : Ast) : Ast :=
+    match ast_root_fix a with
+    | Z => ast_core_body a
+    | S _ => perf_root_fix a
+    end;
+
+-- thresh: smallest literal reported inside a fix body. A definition whose
+-- whole body is a literal names that literal and is the fix for the smell.
+def analyze_perf (ids : PerfIds) (ctor_like : List Nat) (thresh : Nat) (a : Ast)
+    : List PerfIssue :=
+    match ast_is tag_nat (ast_core_body a) with
+    | True => perf_inil
+    | False =>
+        let root : Ast := perf_root a in
+        perf_append (perf_walk ids ctor_like thresh (Nil Nat) root)
+          (perf_conversion_issues ids ctor_like (ast_params a) root)
+    end;

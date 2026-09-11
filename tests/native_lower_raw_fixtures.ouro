@@ -1,0 +1,120 @@
+-- Actual source programs for raw machine operations. Heap allocations are
+-- checked before access and freed before publishing the observed result.
+import "native_lower_fixtures.ouro";
+
+def lower_raw_common : String := lower_fixture_join
+    ([lower_fixture_base, lower_fixture_word_types,
+      "inductive Empty : Type := | EmptyValue : Empty; representation Empty := \"ouro.unit\"; ",
+      "intrinsic Pointer : Type -> Type := \"ouro.raw_ptr\"; intrinsic null : (A : Type) -> Pointer A := \"ouro.raw.null\"; ",
+      "intrinsic raw_add : (A : Type) -> Pointer A -> Size -> Runtime (Pointer A) := \"ouro.raw.add.wrap\"; ",
+      "intrinsic raw_cast : (A : Type) -> (B : Type) -> Pointer A -> Runtime (Pointer B) := \"ouro.raw.cast\"; ",
+      "intrinsic pointer_bits : (A : Type) -> Pointer A -> Runtime Size := \"ouro.raw.to_bits\"; ",
+      "intrinsic pointer_from_bits : (A : Type) -> Size -> Runtime (Pointer A) := \"ouro.raw.from_bits\"; ",
+      "intrinsic read_word : Pointer W -> Runtime W := \"ouro.raw.load\" W; intrinsic write_word : Pointer W -> W -> Runtime Empty := \"ouro.raw.store\" W; ",
+      "intrinsic read_byte : Pointer Byte -> Runtime Byte := \"ouro.raw.load\" Byte; intrinsic write_byte : Pointer Byte -> Byte -> Runtime Empty := \"ouro.raw.store\" Byte; ",
+      "intrinsic read_wide : Pointer Wide -> Runtime Wide := \"ouro.raw.load\" Wide; intrinsic write_wide : Pointer Wide -> Wide -> Runtime Empty := \"ouro.raw.store\" Wide; ",
+      "intrinsic read_signed : Pointer Signed -> Runtime Signed := \"ouro.raw.load\" Signed; intrinsic write_signed : Pointer Signed -> Signed -> Runtime Empty := \"ouro.raw.store\" Signed; ",
+      "intrinsic read_size : Pointer Size -> Runtime Size := \"ouro.raw.load\" Size; intrinsic write_size : Pointer Size -> Size -> Runtime Empty := \"ouro.raw.store\" Size; ",
+      "intrinsic read_pointer : Pointer (Pointer W) -> Runtime (Pointer W) := \"ouro.raw.load\" (Pointer W); intrinsic write_pointer : Pointer (Pointer W) -> Pointer W -> Runtime Empty := \"ouro.raw.store\" (Pointer W); ",
+      "intrinsic size_add : Size -> Size -> Size := \"ouro.usize.add.wrap\"; intrinsic size_sub : Size -> Size -> Size := \"ouro.usize.sub.wrap\"; ",
+      "intrinsic byte_add : Byte -> Byte -> Byte := \"ouro.u8.add.wrap\"; intrinsic byte_sub : Byte -> Byte -> Byte := \"ouro.u8.sub.wrap\"; ",
+      "intrinsic bit_or : W -> W -> W := \"ouro.u32.or\"; intrinsic bit_shr : W -> W -> W := \"ouro.u32.shr\"; intrinsic wide_shr : Wide -> W -> Wide := \"ouro.u64.shr\"; ",
+      "intrinsic loop_action : (A : Type) -> A -> (A -> Runtime Byte) -> (A -> Runtime A) -> Runtime A := \"ouro.runtime.loop\"; ",
+      "extern heap : Runtime (Pointer Empty) := \"windows-x86_64\" \"win64\" \"kernel32.dll\" \"GetProcessHeap\" \"maygc\"; ",
+      "extern allocate : Pointer Empty -> W -> Size -> Runtime (Pointer Byte) := \"windows-x86_64\" \"win64\" \"kernel32.dll\" \"HeapAlloc\" \"maygc\"; ",
+      "extern release : Pointer Empty -> W -> Pointer Byte -> Runtime W := \"windows-x86_64\" \"win64\" \"kernel32.dll\" \"HeapFree\" \"maygc\"; ",
+      "extern self : Runtime (Pointer W) := \"windows-x86_64\" \"win64\" \"kernel32.dll\" \"GetCurrentProcess\" \"maygc\"; ",
+      "extern process_id : Pointer W -> Runtime W := \"windows-x86_64\" \"win64\" \"kernel32.dll\" \"GetProcessId\" \"maygc\"; ",
+      "extern set_error : W -> Runtime Empty := \"windows-x86_64\" \"win64\" \"kernel32.dll\" \"SetLastError\" \"nogc\"; ",
+      "extern get_error : Runtime W := \"windows-x86_64\" \"win64\" \"kernel32.dll\" \"GetLastError\" \"nogc\"; ",
+      "def one_size : Runtime Size := bind (Pointer W) Size self (fun (token : Pointer W) => bind Size Size (pointer_bits W token) (fun (bits : Size) => pure Size (size_sub (size_sub bits bits) bits))); ",
+      "def one_word (one : Size) : W := narrow (as_wide one); def double_word (x : W) : W := add x x; ",
+      "def shift32 (one : Size) : W := double_word (double_word (double_word (double_word (double_word (one_word one))))); ",
+      "def marker_word (one : Size) : W := mulw (shift32 one) (shift32 one); ",
+      "def four_bytes (one : Size) : Size := let two : Size := size_add one one in size_add two two; ",
+      "def buffer_size (one : Size) : Size := let four : Size := four_bytes one in let eight : Size := size_add four four in let sixteen : Size := size_add eight eight in let thirtytwo : Size := size_add sixteen sixteen in size_add thirtytwo thirtytwo; ",
+      "def nonzero (value : W) (one : Size) : W := bit_shr (bit_or value (sub (sub value value) value)) (sub (shift32 one) (one_word one)); ",
+      "def fold_size (value : Size) (one : Size) : W := let wide : Wide := as_wide value in bit_or (narrow wide) (narrow (wide_shr wide (shift32 one))); ",
+      "def increment (amount : W) : Runtime W := bind W W get_error (fun (before : W) => let after : W := add before amount in bind Empty W (set_error after) (fun (ignored : Empty) => pure W after)); ",
+      "def double_error : Runtime W := bind W W get_error (fun (before : W) => let after : W := add before before in bind Empty W (set_error after) (fun (ignored : Empty) => pure W after)); "] : List String);
+
+-- GetCurrentProcess currently returns the -1 pseudo-handle. Its Runtime bits
+-- provide test constants without inventing native Nat/Maybe conversion rules.
+-- The buffer is 64 bytes. nonzero handles every nonzero Windows BOOL value.
+def lower_raw_heap_main : String := lower_fixture_join
+    (["def main : Runtime W := bind W W pid (fun (x : W) => bind Size W one_size (fun (one : Size) => ",
+      "bind (Pointer Empty) W heap (fun (owner : Pointer Empty) => let zero : W := sub x x in ",
+      "bind Empty W (set_error zero) (fun (reset : Empty) => bind (Pointer Byte) W (allocate owner zero (buffer_size one)) (fun (allocated : Pointer Byte) => ",
+      "bind (Pointer Byte) W (loop_action (Pointer Byte) allocated ",
+      "(fun (current : Pointer Byte) => bind Size Byte (pointer_bits Byte current) (fun (bits : Size) => pure Byte (byte (nonzero (fold_size bits one) one)))) ",
+      "(fun (current : Pointer Byte) => bind W (Pointer Byte) (exercise current x one) (fun (value : W) => ",
+      "bind W (Pointer Byte) (release owner zero current) (fun (status : W) => ",
+      "bind Empty (Pointer Byte) (set_error (mulw value (nonzero status one))) (fun (saved : Empty) => pure (Pointer Byte) (null Byte)))))) ",
+      "(fun (finished : Pointer Byte) => get_error))))));"] : List String);
+
+def lower_raw_bits_fixture : String := prim_string_concat lower_raw_common
+    "def main : Runtime W := bind W W pid (fun (x : W) => bind (Pointer W) W self (fun (original : Pointer W) => bind Size W (pointer_bits W original) (fun (bits : Size) => bind (Pointer W) W (pointer_from_bits W bits) (fun (restored : Pointer W) => bind W W (process_id restored) (fun (first : W) => bind (Pointer W) W (raw_add W (null W) bits) (fun (wrapped : Pointer W) => bind W W (process_id wrapped) (fun (second : W) => pure W (sub (add first second) x))))))));";
+
+def lower_raw_u32_fixture : String := lower_fixture_join
+    ([lower_raw_common,
+      "def exercise (p : Pointer Byte) (x : W) (one : Size) : Runtime W := bind (Pointer W) W (raw_cast Byte W p) (fun (word : Pointer W) => bind Empty W (write_word word x) (fun (stored : Empty) => read_word word)); ",
+      lower_raw_heap_main] : List String);
+
+def lower_raw_offsets_fixture : String := lower_fixture_join
+    ([lower_raw_common,
+      "def exercise (p : Pointer Byte) (x : W) (one : Size) : Runtime W := bind (Pointer W) W (raw_cast Byte W p) (fun (base : Pointer W) => ",
+      "bind (Pointer Byte) W (raw_add Byte p (four_bytes one)) (fun (neighbor : Pointer Byte) => bind (Pointer W) W (raw_cast Byte W neighbor) (fun (next : Pointer W) => ",
+      "bind Empty W (write_word next (sub x x)) (fun (cleared : Empty) => bind (Pointer W) W (raw_add W base (four_bytes one)) (fun (offset : Pointer W) => ",
+      "bind Empty W (write_word offset (add x x)) (fun (second_write : Empty) => bind Empty W (write_word base x) (fun (first_write : Empty) => ",
+      "bind W W (read_word next) (fun (second : W) => bind W W (read_word base) (fun (first : W) => pure W (sub second first)))))))))); ",
+      lower_raw_heap_main] : List String);
+
+def lower_raw_u64_fixture : String := lower_fixture_join
+    ([lower_raw_common,
+      "def exercise (p : Pointer Byte) (x : W) (one : Size) : Runtime W := bind (Pointer Wide) W (raw_cast Byte Wide p) (fun (wide : Pointer Wide) => ",
+      "bind (Pointer Byte) W (raw_add Byte p (four_bytes one)) (fun (neighbor : Pointer Byte) => bind (Pointer W) W (raw_cast Byte W neighbor) (fun (high : Pointer W) => ",
+      "bind Empty W (write_word high (sub x x)) (fun (cleared : Empty) => let negative : Wide := wide_sub (widen (sub x x)) (widen x) in ",
+      "bind Empty W (write_wide wide negative) (fun (stored : Empty) => bind Wide W (read_wide wide) (fun (loaded : Wide) => bind W W (read_word high) (fun (upper : W) => ",
+      "pure W (add (sub (sub x x) (narrow loaded)) (add (add upper (one_word one)) (add (narrow (wide_shr loaded (shift32 one))) (one_word one))))))))))); ",
+      lower_raw_heap_main] : List String);
+
+def lower_raw_u8_fixture : String := lower_fixture_join
+    ([lower_raw_common,
+      "def exercise (p : Pointer Byte) (x : W) (one : Size) : Runtime W := let tagged : W := bit_or x (marker_word one) in bind (Pointer W) W (raw_cast Byte W p) (fun (word : Pointer W) => ",
+      "bind Empty W (write_word word tagged) (fun (stored : Empty) => bind Byte W (read_byte p) (fun (low : Byte) => ",
+      "bind Empty W (write_byte p (byte (sub x x))) (fun (cleared : Empty) => bind W W (read_word word) (fun (upper : W) => pure W (sub (add (add upper (unbyte low)) x) tagged)))))); ",
+      lower_raw_heap_main] : List String);
+
+def lower_raw_i32_fixture : String := lower_fixture_join
+    ([lower_raw_common,
+      "def exercise (p : Pointer Byte) (x : W) (one : Size) : Runtime W := bind (Pointer Signed) W (raw_cast Byte Signed p) (fun (word : Pointer Signed) => ",
+      "bind (Pointer Byte) W (raw_add Byte p (four_bytes one)) (fun (neighbor : Pointer Byte) => bind (Pointer W) W (raw_cast Byte W neighbor) (fun (high : Pointer W) => ",
+      "bind Empty W (write_word high (marker_word one)) (fun (marked : Empty) => bind Empty W (write_signed word (as_signed (sub (sub x x) x))) (fun (stored : Empty) => ",
+      "bind Signed W (read_signed word) (fun (loaded : Signed) => bind W W (read_word high) (fun (upper : W) => pure W (add (sub (sub x x) (as_unsigned loaded)) (sub upper (marker_word one)))))))))); ",
+      lower_raw_heap_main] : List String);
+
+def lower_raw_usize_fixture : String := lower_fixture_join
+    ([lower_raw_common,
+      "def exercise (p : Pointer Byte) (x : W) (one : Size) : Runtime W := bind (Pointer Size) W (raw_cast Byte Size p) (fun (word : Pointer Size) => let bits : Size := size_sub (size_sub one one) one in ",
+      "bind (Pointer Byte) W (raw_add Byte p (four_bytes one)) (fun (neighbor : Pointer Byte) => bind (Pointer W) W (raw_cast Byte W neighbor) (fun (high : Pointer W) => ",
+      "bind Empty W (write_word high (sub x x)) (fun (cleared : Empty) => bind Empty W (write_size word bits) (fun (stored : Empty) => ",
+      "bind Size W (read_size word) (fun (loaded : Size) => bind (Pointer W) W (pointer_from_bits W loaded) (fun (restored : Pointer W) => process_id restored))))))); ",
+      lower_raw_heap_main] : List String);
+
+def lower_raw_pointer_fixture : String := lower_fixture_join
+    ([lower_raw_common,
+      "def exercise (p : Pointer Byte) (x : W) (one : Size) : Runtime W := bind (Pointer (Pointer W)) W (raw_cast Byte (Pointer W) p) (fun (word : Pointer (Pointer W)) => ",
+      "bind (Pointer Byte) W (raw_add Byte p (four_bytes one)) (fun (neighbor : Pointer Byte) => bind (Pointer W) W (raw_cast Byte W neighbor) (fun (high : Pointer W) => ",
+      "bind Empty W (write_word high (sub x x)) (fun (cleared : Empty) => bind (Pointer W) W self (fun (token : Pointer W) => ",
+      "bind Empty W (write_pointer word token) (fun (stored : Empty) => bind (Pointer W) W (read_pointer word) (fun (loaded : Pointer W) => process_id loaded))))))); ",
+      lower_raw_heap_main] : List String);
+
+def lower_raw_fixtures : List NativeLowerFixture :=
+    [NativeLowerFixtureOf "raw_bits" lower_raw_bits_fixture 0,
+     NativeLowerFixtureOf "raw_u32" lower_raw_u32_fixture 0,
+     NativeLowerFixtureOf "raw_offsets" lower_raw_offsets_fixture 0,
+     NativeLowerFixtureOf "raw_u64" lower_raw_u64_fixture 0,
+     NativeLowerFixtureOf "raw_u8" lower_raw_u8_fixture 0,
+     NativeLowerFixtureOf "raw_i32" lower_raw_i32_fixture 0,
+     NativeLowerFixtureOf "raw_usize" lower_raw_usize_fixture 0,
+     NativeLowerFixtureOf "raw_pointer" lower_raw_pointer_fixture 0];

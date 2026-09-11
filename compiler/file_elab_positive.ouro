@@ -1,0 +1,444 @@
+-- Strict positivity uses only previously checked declarations. A container may
+-- carry a recursive occurrence only after all of its type parameters have been
+-- proved covariant. Certificates are rebuilt from the signature, not trusted
+-- metadata. Indexed and dependent-parameter containers are conservative refusals.
+
+import "file_check_result.ouro";
+
+inductive PositiveFunctor : Type :=
+  | MkPositiveFunctor : Nat -> Nat -> PositiveFunctor;
+
+inductive PositiveFocus : Type :=
+  | PositiveInductive : Nat -> PositiveFocus
+  | PositiveParameters : Nat -> Nat -> PositiveFocus;
+
+def positive_under (focus : PositiveFocus) : PositiveFocus :=
+    match focus with
+    | PositiveInductive _ => focus
+    | PositiveParameters count offset => PositiveParameters count (S offset)
+    end;
+
+def positive_ind_hit (focus : PositiveFocus) (name : Nat) : Bool :=
+    match focus with
+    | PositiveInductive target => eqNat target name
+    | PositiveParameters _ _ => False
+    end;
+
+def positive_rel_hit (focus : PositiveFocus) (index : Nat) : Bool :=
+    match focus with
+    | PositiveInductive _ => False
+    | PositiveParameters count offset =>
+        andb (compiler_le_nat offset index) (ltNat index (add offset count))
+    end;
+
+def positive_all_checked (A : Type) (accept : A -> CheckResult Bool)
+    : List A -> CheckResult Bool :=
+    fix positive_all_checked (items : List A) : CheckResult Bool :=
+      match items with
+      | Nil => CheckOk Bool True
+      | Cons item rest =>
+          check_and (accept item)
+            (fun (_accepted : Unit) => positive_all_checked rest)
+      end;
+
+-- Use the same reducer as inference and conversion. Failed reductions cannot
+-- become a negative variance judgment or an unfinished head view.
+def positive_whnf_checked_indexed (fuel : Nat) (sig : CheckEnvironment) (term : CoreTerm)
+    : CheckResult CoreTerm :=
+    check_from_normalize CoreTerm (whnf_checked_indexed fuel sig term);
+
+-- True proves absence, including inside aliases and explicit branch lambdas.
+-- A False proof result and an exhausted search remain distinct.
+def positive_absent_checked_indexed
+    : Nat -> CheckEnvironment -> PositiveFocus -> CoreTerm -> CheckResult Bool :=
+  fix positive_absent_checked_indexed (fuel : Nat) (sig : CheckEnvironment) (focus : PositiveFocus)
+      (term : CoreTerm) : CheckResult Bool :=
+    match fuel with
+    | Z => CheckErr Bool CheckResourceLimit
+    | S fuel' =>
+        check_bind CoreTerm Bool (positive_whnf_checked_indexed fuel' sig term)
+          (fun (head : CoreTerm) =>
+            match head with
+            | CRel index => CheckOk Bool (notb (positive_rel_hit focus index))
+            | CInd name => CheckOk Bool (notb (positive_ind_hit focus name))
+            | CConstruct name _ _ => CheckOk Bool (notb (positive_ind_hit focus name))
+            | CSort _ => CheckOk Bool True
+            | CConst _ => CheckOk Bool True
+            | CStrBytes _ _ => CheckOk Bool True
+            | CStrLit _ _ => CheckOk Bool True
+            | CPi domain codomain =>
+                check_and (positive_absent_checked_indexed fuel' sig focus domain)
+                  (fun (_absent : Unit) =>
+                    positive_absent_checked_indexed fuel' sig (positive_under focus) codomain)
+            | CLam annotation body =>
+                check_and (positive_absent_checked_indexed fuel' sig focus annotation)
+                  (fun (_absent : Unit) =>
+                    positive_absent_checked_indexed fuel' sig (positive_under focus) body)
+            | CApp function argument =>
+                check_and (positive_absent_checked_indexed fuel' sig focus function)
+                  (fun (_absent : Unit) => positive_absent_checked_indexed fuel' sig focus argument)
+            | CLetIn _ _ _ => CheckErr Bool (CheckReductionFailure NormalizeUnreducedHead)
+            | CCase _ motive scrutinee branches =>
+                check_and (positive_absent_checked_indexed fuel' sig focus motive)
+                  (fun (_motive_absent : Unit) =>
+                    check_and (positive_absent_checked_indexed fuel' sig focus scrutinee)
+                      (fun (_scrutinee_absent : Unit) =>
+                        positive_all_checked CoreTerm
+                          (fun (branch : CoreTerm) =>
+                            positive_absent_checked_indexed fuel' sig focus branch) branches))
+            | CFix _ _ _ annotation body =>
+                check_and (positive_absent_checked_indexed fuel' sig focus annotation)
+                  (fun (_absent : Unit) =>
+                    positive_absent_checked_indexed fuel' sig (positive_under focus) body)
+            end)
+    end;
+
+def positive_functor_arity (name : Nat) : List PositiveFunctor -> Maybe Nat :=
+    fix positive_functor_arity (known : List PositiveFunctor) : Maybe Nat :=
+      match known with
+      | Nil => Nothing Nat
+      | Cons certificate rest =>
+          match certificate with
+          | MkPositiveFunctor candidate arity =>
+              match eqNat name candidate with
+              | True => Just Nat arity
+              | False => positive_functor_arity rest
+              end
+          end
+      end;
+
+def positive_application_checked_indexed
+  (accept : CoreTerm -> CheckResult Bool) (fuel : Nat) (sig : CheckEnvironment)
+  (known : List PositiveFunctor) (focus : PositiveFocus) (term : CoreTerm)
+      : CheckResult Bool :=
+    check_bind Spine Bool (check_from_normalize Spine (app_spine_checked fuel term))
+      (fun (spine : Spine) =>
+        match spine with
+        | MkSpine head arguments =>
+            match eq_nat_head 3 head with
+            | NoEqNat => positive_absent_checked_indexed fuel sig focus term
+            | YesEqNat name =>
+                match positive_ind_hit focus name with
+                | True =>
+                    positive_all_checked CoreTerm
+                      (positive_absent_checked_indexed fuel sig focus) arguments
+                | False =>
+                    match positive_functor_arity name known with
+                    | Nothing => positive_absent_checked_indexed fuel sig focus term
+                    | Just arity =>
+                        check_and (CheckOk Bool (eqNat arity (length CoreTerm arguments)))
+                          (fun (_saturated : Unit) => positive_all_checked CoreTerm accept arguments)
+                    end
+                end
+            end
+        end);
+
+def positive_type_checked_indexed : Nat -> CheckEnvironment -> List PositiveFunctor -> PositiveFocus
+    -> CoreTerm -> CheckResult Bool :=
+  fix positive_type_checked_indexed (fuel : Nat) (sig : CheckEnvironment) (known : List PositiveFunctor)
+      (focus : PositiveFocus) (term : CoreTerm) : CheckResult Bool :=
+    match fuel with
+    | Z => CheckErr Bool CheckResourceLimit
+    | S fuel' =>
+        check_bind CoreTerm Bool (positive_whnf_checked_indexed fuel' sig term)
+          (fun (head : CoreTerm) =>
+            match head with
+            | CPi domain codomain =>
+                check_and (positive_absent_checked_indexed fuel' sig focus domain)
+                  (fun (_absent : Unit) =>
+                    positive_type_checked_indexed fuel' sig known (positive_under focus) codomain)
+            | CLam annotation body =>
+                check_and (positive_absent_checked_indexed fuel' sig focus annotation)
+                  (fun (_absent : Unit) =>
+                    positive_type_checked_indexed fuel' sig known (positive_under focus) body)
+            | CApp _ _ =>
+                positive_application_checked_indexed
+                  (fun (argument : CoreTerm) =>
+                    positive_type_checked_indexed fuel' sig known focus argument)
+                  fuel' sig known focus head
+            | CRel _ => CheckOk Bool True
+            | CSort _ => CheckOk Bool True
+            | CConst _ => CheckOk Bool True
+            | CInd _ => CheckOk Bool True
+            | CStrBytes _ _ => CheckOk Bool True
+            | CStrLit _ _ => CheckOk Bool True
+            | CLetIn _ _ _ => CheckErr Bool (CheckReductionFailure NormalizeUnreducedHead)
+            | CConstruct _ _ _ => positive_absent_checked_indexed fuel' sig focus head
+            | CCase _ _ _ _ => positive_absent_checked_indexed fuel' sig focus head
+            | CFix _ _ _ _ _ => positive_absent_checked_indexed fuel' sig focus head
+            end)
+    end;
+
+-- Entry point for an individual constructor field. known must be the result of
+-- positive_environment_checked for sig; unchecked metadata is no certificate.
+def positive_arg_checked_indexed (fuel : Nat) (sig : CheckEnvironment) (known : List PositiveFunctor)
+    (name : Nat) (term : CoreTerm) : CheckResult Bool :=
+    positive_type_checked_indexed fuel sig known (PositiveInductive name) term;
+
+def positive_return_parameters_checked_indexed (fuel : Nat) (sig : CheckEnvironment) (depth : Nat)
+    : Nat -> Nat -> List CoreTerm -> CheckResult Bool :=
+    fix positive_return_parameters_checked_indexed (remaining : Nat) (seen : Nat)
+        (arguments : List CoreTerm) : CheckResult Bool :=
+      match remaining with
+      | Z => CheckOk Bool True
+      | S remaining' =>
+          match arguments with
+          | Nil => CheckOk Bool False
+          | Cons argument rest =>
+              check_bind CoreTerm Bool (positive_whnf_checked_indexed fuel sig argument)
+                (fun (head : CoreTerm) =>
+                  match eq_nat_head 0 head with
+                  | NoEqNat => CheckOk Bool False
+                  | YesEqNat index =>
+                      check_and (CheckOk Bool (eqNat index (sub depth (S seen))))
+                        (fun (_uniform : Unit) =>
+                          positive_return_parameters_checked_indexed remaining' (S seen) rest)
+                  end)
+          end
+      end;
+
+def positive_return_checked_indexed (fuel : Nat) (sig : CheckEnvironment) (name : Nat)
+    (nparams : Nat) (nindices : Nat) (depth : Nat) (term : CoreTerm) : CheckResult Bool :=
+    check_bind Spine Bool (check_from_normalize Spine (app_spine_checked fuel term))
+      (fun (spine : Spine) =>
+        match spine with
+        | MkSpine head arguments =>
+            match eq_nat_head 3 head with
+            | NoEqNat => CheckOk Bool False
+            | YesEqNat result_name =>
+                check_and
+                  (CheckOk Bool
+                    (andb (eqNat result_name name)
+                      (andb (compiler_le_nat nparams depth)
+                        (eqNat (length CoreTerm arguments) (add nparams nindices)))))
+                  (fun (_shape : Unit) =>
+                    check_and
+                      (positive_return_parameters_checked_indexed fuel sig depth nparams Z arguments)
+                      (fun (_uniform : Unit) =>
+                        positive_all_checked CoreTerm
+                          (positive_absent_checked_indexed fuel sig (PositiveInductive name))
+                          (drop CoreTerm nparams arguments)))
+            end
+        end);
+
+-- Uniform parameters are binders, not fields whose variance is being proved.
+-- Their annotations must agree with the declaration and cannot mention self.
+def positive_constructor_tail_checked_indexed (fuel : Nat) (sig : CheckEnvironment) (name : Nat)
+    : List Param -> CoreTerm -> CheckResult (Maybe CoreTerm) :=
+    fix positive_constructor_tail_checked_indexed (parameters : List Param) (term : CoreTerm)
+        : CheckResult (Maybe CoreTerm) :=
+      match parameters with
+      | Nil => CheckOk (Maybe CoreTerm) (Just CoreTerm term)
+      | Cons parameter rest =>
+          match parameter with
+          | MkParam _ annotation =>
+              check_bind CoreTerm (Maybe CoreTerm) (positive_whnf_checked_indexed fuel sig term)
+                (fun (head : CoreTerm) =>
+                  match eq_pair_head 0 head with
+                  | NoEqPair => CheckOk (Maybe CoreTerm) (Nothing CoreTerm)
+                  | YesEqPair domain codomain =>
+                      check_bind Bool (Maybe CoreTerm)
+                        (check_and (check_from_normalize Bool (conv_checked_indexed fuel sig domain annotation))
+                          (fun (_equal : Unit) =>
+                            positive_absent_checked_indexed fuel sig (PositiveInductive name) domain))
+                        (fun (accepted : Bool) =>
+                          match accepted with
+                          | False => CheckOk (Maybe CoreTerm) (Nothing CoreTerm)
+                          | True => positive_constructor_tail_checked_indexed rest codomain
+                          end)
+                  end)
+          end
+      end;
+
+def positive_fields_checked_indexed (sig : CheckEnvironment) (known : List PositiveFunctor)
+    (name : Nat) (nparams : Nat) (nindices : Nat)
+    : Nat -> PositiveFocus -> Nat -> CoreTerm -> CheckResult Bool :=
+    fix positive_fields_checked_indexed (fuel : Nat) (focus : PositiveFocus) (depth : Nat)
+        (term : CoreTerm) : CheckResult Bool :=
+      match fuel with
+      | Z => CheckErr Bool CheckResourceLimit
+      | S fuel' =>
+          check_bind CoreTerm Bool (positive_whnf_checked_indexed fuel' sig term)
+            (fun (head : CoreTerm) =>
+              match eq_pair_head 0 head with
+              | YesEqPair domain codomain =>
+                  check_and (positive_type_checked_indexed fuel' sig known focus domain)
+                    (fun (_positive : Unit) =>
+                      positive_fields_checked_indexed fuel' (positive_under focus) (S depth) codomain)
+              | NoEqPair =>
+                  positive_return_checked_indexed fuel' sig name nparams nindices depth head
+              end)
+      end;
+
+def positive_constructors_checked_indexed (fuel : Nat) (sig : CheckEnvironment)
+    (known : List PositiveFunctor) (focus : PositiveFocus) (name : Nat)
+    (parameters : List Param) (nindices : Nat) (constructors : List Ctor) : CheckResult Bool :=
+    let nparams : Nat := length Param parameters in
+    positive_all_checked Ctor
+      (fun (constructor : Ctor) =>
+        match constructor with
+        | MkCtor _ annotation =>
+            check_bind (Maybe CoreTerm) Bool
+              (positive_constructor_tail_checked_indexed fuel sig name parameters annotation)
+              (fun (tail : Maybe CoreTerm) =>
+                match tail with
+                | Nothing => CheckOk Bool False
+                | Just fields =>
+                    positive_fields_checked_indexed sig known name nparams nindices fuel focus nparams fields
+                end)
+        end) constructors;
+
+-- Full positivity entry point; declaration shape, typing and universes remain
+-- the responsibility of the declaration checker that supplies the environment.
+def positive_inductive_checked_indexed (fuel : Nat) (sig : CheckEnvironment)
+    (known : List PositiveFunctor) (declaration : IndDecl) : CheckResult Bool :=
+    match fuel with
+    | Z => CheckErr Bool CheckResourceLimit
+    | S fuel' =>
+        match declaration with
+        | MkIndDecl name parameters indices _sort constructors =>
+            let focus : PositiveFocus := PositiveInductive name in
+            check_and
+              (positive_all_checked Param
+                (fun (parameter : Param) =>
+                  match parameter with
+                  | MkParam _ annotation => positive_absent_checked_indexed fuel' sig focus annotation
+                  end) parameters)
+              (fun (_parameters : Unit) =>
+                check_and
+                  (positive_all_checked CoreTerm (positive_absent_checked_indexed fuel' sig focus) indices)
+                  (fun (_indices : Unit) =>
+                    positive_constructors_checked_indexed fuel' sig known focus name parameters
+                      (length CoreTerm indices) constructors))
+        end
+    end;
+
+def positive_type_parameters_checked_indexed (fuel : Nat) (sig : CheckEnvironment)
+    (parameters : List Param) : CheckResult Bool :=
+    positive_all_checked Param
+      (fun (parameter : Param) =>
+        match parameter with
+        | MkParam _ annotation =>
+            check_bind CoreTerm Bool (positive_whnf_checked_indexed fuel sig annotation)
+              (fun (head : CoreTerm) =>
+                match core_sort_level head with
+                | Nothing => CheckOk Bool False
+                | Just _ => CheckOk Bool True
+                end)
+        end) parameters;
+
+def positive_functor_checked_indexed (fuel : Nat) (sig : CheckEnvironment)
+    (known : List PositiveFunctor) (declaration : IndDecl) : CheckResult Bool :=
+    match fuel with
+    | Z => CheckErr Bool CheckResourceLimit
+    | S fuel' =>
+        match declaration with
+        | MkIndDecl name parameters indices _sort constructors =>
+            match indices with
+            | Cons _ _ => CheckOk Bool False
+            | Nil =>
+                let nparams : Nat := length Param parameters in
+                let provisional : List PositiveFunctor :=
+                  Cons PositiveFunctor (MkPositiveFunctor name nparams) known in
+                check_and (positive_type_parameters_checked_indexed fuel' sig parameters)
+                  (fun (_parameters : Unit) =>
+                    positive_constructors_checked_indexed fuel' sig provisional
+                      (PositiveParameters nparams Z) name parameters Z constructors)
+            end
+        end
+    end;
+
+-- The declaration checker forbids duplicate names. Keep the proof table safe
+-- even for a caller supplying such an environment: dependent certificates can
+-- become stale too, so a replacement invalidates all earlier certificates.
+def positive_prior (name : Nat) (earlier : List Entry)
+    (known : List PositiveFunctor) : List PositiveFunctor :=
+    match lookup_entry Bool name
+      (fun (_type : CoreTerm) (_body : Maybe CoreTerm) => Just Bool True)
+      (fun (_declaration : IndDecl) => Just Bool True) earlier with
+    | Nothing => known
+    | Just _ => Nil PositiveFunctor
+    end;
+
+-- Signatures are newest-first. Each proof sees only the earlier tail and its
+-- certificates, plus its own provisional covariance assumption. A negative proof
+-- adds no certificate; resource and reduction errors propagate to the caller.
+-- Nullary types cannot carry an argument occurrence and need no certificate.
+def positive_environment_checked
+    : Nat -> List Entry -> CheckResult (List PositiveFunctor) :=
+    fix positive_environment_checked (fuel : Nat) (sig : List Entry)
+        : CheckResult (List PositiveFunctor) :=
+      match sig with
+      | Nil => CheckOk (List PositiveFunctor) (Nil PositiveFunctor)
+      | Cons entry earlier =>
+          match fuel with
+          | Z => CheckErr (List PositiveFunctor) CheckResourceLimit
+          | S fuel' =>
+              check_bind (List PositiveFunctor) (List PositiveFunctor)
+                (positive_environment_checked fuel' earlier)
+                (fun (previous : List PositiveFunctor) =>
+                  match entry with
+                  | MkEntry name _ _ =>
+                      CheckOk (List PositiveFunctor) (positive_prior name earlier previous)
+                  | MkBoundEntry name _ _ =>
+                      CheckOk (List PositiveFunctor) (positive_prior name earlier previous)
+                  | MkRoleEntry _ => CheckOk (List PositiveFunctor) previous
+                  | MkIndEntry name declaration =>
+                      let known : List PositiveFunctor := positive_prior name earlier previous in
+                      match declaration with
+                      | MkIndDecl declared_name parameters _ _ _ =>
+                          match parameters with
+                          | Nil => CheckOk (List PositiveFunctor) known
+                          | Cons _ _ =>
+                              check_bind Bool (List PositiveFunctor)
+                                (check_and (CheckOk Bool (eqNat name declared_name))
+                                  (fun (_named : Unit) =>
+                                    positive_functor_checked_indexed fuel' (check_environment_from_entries earlier) known declaration))
+                                (fun (certified : Bool) =>
+                                  CheckOk (List PositiveFunctor)
+                                    (match certified with
+                                     | False => known
+                                     | True => Cons PositiveFunctor
+                                         (MkPositiveFunctor name (length Param parameters)) known
+                                     end))
+                          end
+                      end
+                  end)
+          end
+      end;
+
+def positive_absent_checked (fuel : Nat) (sig : List Entry) (focus : PositiveFocus) (term : CoreTerm) : CheckResult Bool :=
+    positive_absent_checked_indexed fuel (check_environment_from_entries sig) focus term;
+
+def positive_arg_checked (fuel : Nat) (sig : List Entry) (known : List PositiveFunctor) (name : Nat) (term : CoreTerm) : CheckResult Bool :=
+    positive_arg_checked_indexed fuel (check_environment_from_entries sig) known name term;
+
+def positive_inductive_checked (fuel : Nat) (sig : List Entry) (known : List PositiveFunctor) (declaration : IndDecl) : CheckResult Bool :=
+    positive_inductive_checked_indexed fuel (check_environment_from_entries sig) known declaration;
+
+def positive_functor_checked (fuel : Nat) (sig : List Entry) (known : List PositiveFunctor) (declaration : IndDecl) : CheckResult Bool :=
+    positive_functor_checked_indexed fuel (check_environment_from_entries sig) known declaration;
+
+-- Lossy probes are retained for diagnostics and direct Boolean laws. Acceptance
+-- uses the checked entry points so a failed proof cannot hide a resource error.
+def positive_absent (fuel : Nat) (sig : List Entry) (focus : PositiveFocus)
+    (term : CoreTerm) : Bool :=
+    check_bool (positive_absent_checked fuel sig focus term);
+
+def positive_arg (fuel : Nat) (sig : List Entry) (known : List PositiveFunctor)
+    (name : Nat) (term : CoreTerm) : Bool :=
+    check_bool (positive_arg_checked fuel sig known name term);
+
+def positive_inductive (fuel : Nat) (sig : List Entry)
+    (known : List PositiveFunctor) (declaration : IndDecl) : Bool :=
+    check_bool (positive_inductive_checked fuel sig known declaration);
+
+def positive_functor (fuel : Nat) (sig : List Entry)
+    (known : List PositiveFunctor) (declaration : IndDecl) : Bool :=
+    check_bool (positive_functor_checked fuel sig known declaration);
+
+def positive_environment (fuel : Nat) (sig : List Entry) : List PositiveFunctor :=
+    match positive_environment_checked fuel sig with
+    | CheckOk known => known
+    | CheckErr _ => Nil PositiveFunctor
+    end;

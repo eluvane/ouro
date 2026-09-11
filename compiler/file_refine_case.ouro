@@ -1,0 +1,297 @@
+-- Elaboration helpers for source matches. Their result is checked as ordinary
+-- Core; the declaration checker does not give synthetic annotations authority.
+
+import "file_refine_scope.ouro";
+
+def refine_mk_lams (domains : List CoreTerm) (body : CoreTerm) : CoreTerm :=
+    (fix wrap (remaining : List CoreTerm) : CoreTerm :=
+      match remaining with
+      | Nil => body
+      | Cons domain rest => CLam domain (wrap rest)
+      end) domains;
+
+def refine_pattern_index (fuel : Nat) (depth : Nat) (term : CoreTerm)
+    : List CoreTerm -> Nat -> CheckResult (Maybe Nat) :=
+  fix find (patterns : List CoreTerm) (index : Nat) : CheckResult (Maybe Nat) :=
+    match patterns with
+    | Nil => CheckOk (Maybe Nat) (Nothing Nat)
+    | Cons pattern rest =>
+        check_bind Bool (Maybe Nat)
+          (check_from_normalize Bool (eqTerm_checked fuel term (lift depth pattern)))
+          (fun (equal : Bool) =>
+            match equal with
+            | True => CheckOk (Maybe Nat) (Just Nat index)
+            | False => find rest (S index)
+            end)
+    end;
+
+-- Abstract actual indices and the scrutinee, preserving binders inside the
+-- result type. Substituting the actual arguments restores the expected type.
+def refine_abstract (fuel : Nat) (patterns : List CoreTerm) (count : Nat)
+    : CoreTerm -> Nat -> CheckResult CoreTerm :=
+  fix walk (term : CoreTerm) (depth : Nat) : CheckResult CoreTerm :=
+    check_bind (Maybe Nat) CoreTerm (refine_pattern_index fuel depth term patterns Z)
+      (fun (found : Maybe Nat) =>
+        match found with
+        | Just index => CheckOk CoreTerm (CRel (add depth (sub count (S index))))
+        | Nothing =>
+            match term with
+            | CRel index =>
+                CheckOk CoreTerm
+                  (match compiler_le_nat depth index with
+                  | True => CRel (add count index)
+                  | False => term
+                  end)
+            | CSort _ => CheckOk CoreTerm term
+            | CConst _ => CheckOk CoreTerm term
+            | CInd _ => CheckOk CoreTerm term
+            | CConstruct _ _ _ => CheckOk CoreTerm term
+            | CStrBytes _ _ => CheckOk CoreTerm term
+            | CStrLit _ _ => CheckOk CoreTerm term
+            | CPi domain codomain =>
+                check_bind CoreTerm CoreTerm (walk domain depth)
+                  (fun (dom : CoreTerm) =>
+                    check_map CoreTerm CoreTerm (fun (cod : CoreTerm) => CPi dom cod)
+                      (walk codomain (S depth)))
+            | CLam annotation body =>
+                check_bind CoreTerm CoreTerm (walk annotation depth)
+                  (fun (ann : CoreTerm) =>
+                    check_map CoreTerm CoreTerm (fun (rest : CoreTerm) => CLam ann rest)
+                      (walk body (S depth)))
+            | CApp function argument =>
+                check_bind CoreTerm CoreTerm (walk function depth)
+                  (fun (fn : CoreTerm) =>
+                    check_map CoreTerm CoreTerm (fun (arg : CoreTerm) => CApp fn arg)
+                      (walk argument depth))
+            | CLetIn value annotation body =>
+                check_bind CoreTerm CoreTerm (walk value depth)
+                  (fun (val : CoreTerm) =>
+                    check_bind CoreTerm CoreTerm (walk annotation depth)
+                      (fun (ann : CoreTerm) =>
+                        check_map CoreTerm CoreTerm
+                          (fun (rest : CoreTerm) => CLetIn val ann rest)
+                          (walk body (S depth))))
+            | CFix name rec_arg arity annotation body =>
+                check_bind CoreTerm CoreTerm (walk annotation depth)
+                  (fun (ann : CoreTerm) =>
+                    check_map CoreTerm CoreTerm
+                      (fun (rest : CoreTerm) => CFix name rec_arg arity ann rest)
+                      (walk body (S depth)))
+            | CCase info predicate scrutinee branches =>
+                check_bind CoreTerm CoreTerm (walk predicate depth)
+                  (fun (motive : CoreTerm) =>
+                    check_bind CoreTerm CoreTerm (walk scrutinee depth)
+                      (fun (scrut : CoreTerm) =>
+                        check_map (List CoreTerm) CoreTerm
+                          (fun (bodies : List CoreTerm) => CCase info motive scrut bodies)
+                          ((fix visit (remaining : List CoreTerm) : CheckResult (List CoreTerm) :=
+                            match remaining with
+                            | Nil => CheckOk (List CoreTerm) (Nil CoreTerm)
+                            | Cons branch rest =>
+                                check_bind CoreTerm (List CoreTerm) (walk branch depth)
+                                  (fun (body : CoreTerm) =>
+                                    check_map (List CoreTerm) (List CoreTerm)
+                                      (fun (tail : List CoreTerm) => Cons CoreTerm body tail)
+                                      (visit rest))
+                            end) branches)))
+            end
+        end);
+
+def refine_case_motive (fuel : Nat) (sig : CheckEnvironment) (decl : IndDecl)
+    (args : List CoreTerm) (scrutinee : CoreTerm) (result : CoreTerm) : CheckResult CoreTerm :=
+    match decl with
+    | MkIndDecl ind parameters indices sort _ =>
+        let nparams : Nat := length Param parameters in
+        let nindices : Nat := length CoreTerm indices in
+        let params : List CoreTerm := take CoreTerm nparams args in
+        let patterns : List CoreTerm :=
+          append CoreTerm (drop CoreTerm nparams args) ([scrutinee] : List CoreTerm) in
+        let family : CoreTerm := mk_app (CInd ind)
+          (append CoreTerm (lift_list nindices params) (arg_rels nindices)) in
+        check_bind CoreTerm CoreTerm
+          (instantiate_params_checked_indexed fuel sig params
+            (mk_pis (params_types parameters) (mk_pis indices (CSort sort))))
+          (fun (index_telescope : CoreTerm) =>
+            check_bind PiList CoreTerm (peel_pis_checked_indexed sig fuel index_telescope)
+              (fun (telescope : PiList) =>
+                match telescope with
+                | MkPiList domains _ =>
+                    check_map CoreTerm CoreTerm
+                      (fun (body : CoreTerm) => refine_mk_lams domains (CLam family body))
+                      (refine_abstract fuel patterns (S nindices) result Z)
+                end))
+    end;
+
+-- Removing a constructor scope is possible only if its result does not depend
+-- on any constructor field. A round trip proves that no variable was captured.
+def refine_outer_type (fuel : Nat) : Nat -> CoreTerm -> CheckResult CoreTerm :=
+  fix outside (binders : Nat) (typ : CoreTerm) : CheckResult CoreTerm :=
+    match binders with
+    | Z => CheckOk CoreTerm typ
+    | S remaining =>
+        let candidate : CoreTerm := subst (CSort Z) typ in
+        check_bind Bool CoreTerm
+          (check_from_normalize Bool (eqTerm_checked fuel (lift 1 candidate) typ))
+          (fun (equal : Bool) =>
+            match equal with
+            | False => CheckErr CoreTerm (CheckTypeFailure CheckCaseMotive)
+            | True => outside remaining candidate
+            end)
+    end;
+
+def refine_telescope_tail (fuel : Nat) (sig : CheckEnvironment)
+    : Nat -> CoreTerm -> CheckResult CoreTerm :=
+  fix tail (binders : Nat) (typ : CoreTerm) : CheckResult CoreTerm :=
+    match binders with
+    | Z => CheckOk CoreTerm typ
+    | S remaining =>
+        check_bind PiParts CoreTerm (pi_view_checked_indexed fuel sig typ)
+          (fun (parts : PiParts) =>
+            match parts with
+            | MkPi _ codomain => tail remaining codomain
+            end)
+    end;
+
+def refine_branch
+    (refine : RefineScope -> Maybe CoreTerm -> CoreTerm -> CheckResult CoreTerm)
+    (fuel : Nat) (sig : CheckEnvironment)
+    : Nat -> RefineScope -> Maybe CoreTerm -> CoreTerm -> CoreTerm -> CheckResult CoreTerm :=
+  fix branch (arity : Nat) (ctx : RefineScope) (result : Maybe CoreTerm)
+      (telescope : CoreTerm) (body : CoreTerm) : CheckResult CoreTerm :=
+    match arity with
+    | Z => refine ctx result body
+    | S remaining =>
+        check_bind PiParts CoreTerm (refine_scope_pi_indexed fuel sig ctx telescope)
+          (fun (parts : PiParts) =>
+            check_bind CoreTerm CoreTerm
+              (check_from_maybe CoreTerm (CheckMalformedCore CheckCaseMetadata) (lamBody body))
+              (fun (inner : CoreTerm) =>
+                match parts with
+                | MkPi domain codomain =>
+                    let inner_result : CheckResult (Maybe CoreTerm) :=
+                      match result with
+                      | Nothing => CheckOk (Maybe CoreTerm) (Nothing CoreTerm)
+                      | Just expected =>
+                          check_map PiParts (Maybe CoreTerm)
+                            (fun (expected_parts : PiParts) =>
+                              match expected_parts with
+                              | MkPi _ cod => Just CoreTerm cod
+                              end) (refine_scope_pi_indexed fuel sig ctx expected)
+                      end in
+                    check_bind (Maybe CoreTerm) CoreTerm inner_result
+                      (fun (expected_body : Maybe CoreTerm) =>
+                        check_map CoreTerm CoreTerm (fun (refined : CoreTerm) => CLam domain refined)
+                          (branch remaining (refine_scope_assume ctx domain) expected_body codomain inner))
+                end))
+    end;
+
+def refine_case_result
+    (refine : RefineScope -> Maybe CoreTerm -> CoreTerm -> CheckResult CoreTerm)
+    (fuel : Nat) (sig : CheckEnvironment) (ctx : RefineScope) (params : List CoreTerm)
+    (ctors : List Ctor) (bodies : List CoreTerm) : CheckResult CoreTerm :=
+    match ctors, bodies with
+    | Nil, Nil => CheckErr CoreTerm (CheckTypeFailure CheckCaseMotive)
+    | Nil, Cons _ _ => CheckErr CoreTerm (CheckMalformedCore CheckCaseMetadata)
+    | Cons _ _, Nil => CheckErr CoreTerm (CheckMalformedCore CheckCaseMetadata)
+    | Cons ctor _, Cons body _ =>
+        match ctor with
+        | MkCtor _ ctor_type =>
+            check_bind CoreTerm CoreTerm (instantiate_params_checked_indexed fuel sig params ctor_type)
+              (fun (telescope : CoreTerm) =>
+                check_bind PiList CoreTerm (peel_pis_checked_indexed sig fuel telescope)
+                  (fun (parts : PiList) =>
+                    match parts with
+                    | MkPiList domains _ =>
+                        let arity : Nat := length CoreTerm domains in
+                        check_bind CoreTerm CoreTerm
+                          (refine_branch refine fuel sig arity ctx (Nothing CoreTerm) telescope body)
+                          (fun (refined : CoreTerm) =>
+                            check_bind CoreTerm CoreTerm (refine_scope_infer_indexed fuel sig ctx refined)
+                              (fun (typ : CoreTerm) =>
+                                check_bind CoreTerm CoreTerm (refine_telescope_tail fuel sig arity typ)
+                                  (fun (result : CoreTerm) => refine_outer_type fuel arity result)))
+                    end))
+        end
+    end;
+
+def refine_case_branches
+    (refine : RefineScope -> Maybe CoreTerm -> CoreTerm -> CheckResult CoreTerm)
+    (fuel : Nat) (sig : CheckEnvironment) (ctx : RefineScope)
+    (ind : Nat) (nparams : Nat) (nindices : Nat) (args : List CoreTerm) (predicate : CoreTerm)
+    : List Ctor -> List Nat -> List CoreTerm -> Nat -> CheckResult (List CoreTerm) :=
+  fix visit (ctors : List Ctor) (arities : List Nat) (bodies : List CoreTerm) (index : Nat)
+      : CheckResult (List CoreTerm) :=
+    match ctors with
+    | Nil =>
+        match arities, bodies with
+        | Nil, Nil => CheckOk (List CoreTerm) (Nil CoreTerm)
+        | Nil, Cons _ _ => CheckErr (List CoreTerm) (CheckMalformedCore CheckCaseMetadata)
+        | Cons _ _, Nil => CheckErr (List CoreTerm) (CheckMalformedCore CheckCaseMetadata)
+        | Cons _ _, Cons _ _ => CheckErr (List CoreTerm) (CheckMalformedCore CheckCaseMetadata)
+        end
+    | Cons ctor rest =>
+        match arities, bodies with
+        | Nil, Nil => CheckErr (List CoreTerm) (CheckMalformedCore CheckCaseMetadata)
+        | Nil, Cons _ _ => CheckErr (List CoreTerm) (CheckMalformedCore CheckCaseMetadata)
+        | Cons _ _, Nil => CheckErr (List CoreTerm) (CheckMalformedCore CheckCaseMetadata)
+        | Cons arity arities', Cons body bodies' =>
+            check_bind CoreTerm (List CoreTerm)
+              (infer_branch_expected_checked fuel sig ind nparams nindices args predicate index arity ctor)
+              (fun (expected : CoreTerm) =>
+                check_bind CoreTerm (List CoreTerm)
+                  (refine_branch refine fuel sig arity ctx (Just CoreTerm expected) expected body)
+                  (fun (refined : CoreTerm) =>
+                    check_map (List CoreTerm) (List CoreTerm)
+                      (fun (tail : List CoreTerm) => Cons CoreTerm refined tail)
+                      (visit rest arities' bodies' (S index))))
+        end
+    end;
+
+def refine_case
+    (refine : RefineScope -> Maybe CoreTerm -> CoreTerm -> CheckResult CoreTerm)
+    (fuel : Nat) (sig : CheckEnvironment) (ctx : RefineScope)
+    (expected : Maybe CoreTerm) (info : CaseInfo) (scrutinee : CoreTerm)
+    (bodies : List CoreTerm) : CheckResult CoreTerm :=
+    check_bind CoreTerm CoreTerm (refine ctx (Nothing CoreTerm) scrutinee)
+      (fun (scrut : CoreTerm) =>
+        check_bind CoreTerm CoreTerm (refine_scope_infer_indexed fuel sig ctx scrut)
+          (fun (scrut_type : CoreTerm) =>
+            check_bind CoreTerm CoreTerm
+              (check_from_normalize CoreTerm (normalize_checked_worker fuel sig scrut_type))
+              (fun (normal_type : CoreTerm) =>
+                check_bind Spine CoreTerm (check_from_normalize Spine (app_spine_checked fuel normal_type))
+                  (fun (spine : Spine) =>
+                    match info, spine with
+                    | MkCaseInfo ind nparams arities, MkSpine head args =>
+                        check_bind IndDecl CoreTerm
+                          (check_from_maybe IndDecl (CheckMalformedCore (CheckUnknownInductive ind)) (check_environment_ind ind sig))
+                          (fun (decl : IndDecl) =>
+                            check_bind Nat CoreTerm
+                              (check_from_maybe Nat (CheckTypeFailure CheckCaseMotive) (asInd head))
+                              (fun (actual_ind : Nat) =>
+                                match decl with
+                                | MkIndDecl _ parameters indices _ ctors =>
+                                    check_bind Unit CoreTerm
+                                      (check_require
+                                        (andb (eqNat actual_ind ind)
+                                          (andb (eqNat nparams (length Param parameters))
+                                            (eqNat (length CoreTerm args) (add nparams (length CoreTerm indices)))))
+                                        (CheckMalformedCore CheckCaseMetadata))
+                                      (fun (_metadata : Unit) =>
+                                        let result : CheckResult CoreTerm :=
+                                          match expected with
+                                          | Just typ => CheckOk CoreTerm (refine_scope_expand ctx typ)
+                                          | Nothing => refine_case_result refine fuel sig ctx
+                                              (take CoreTerm nparams args) ctors bodies
+                                          end in
+                                        check_bind CoreTerm CoreTerm result
+                                          (fun (result_type : CoreTerm) =>
+                                            check_bind CoreTerm CoreTerm
+                                              (refine_case_motive fuel sig decl args (refine_scope_expand ctx scrut) result_type)
+                                              (fun (predicate : CoreTerm) =>
+                                                check_map (List CoreTerm) CoreTerm
+                                                  (fun (branches : List CoreTerm) => CCase info predicate scrut branches)
+                                                  (refine_case_branches refine fuel sig ctx ind nparams
+                                                    (length CoreTerm indices) args predicate ctors arities bodies Z))))
+                                end))
+                    end))));

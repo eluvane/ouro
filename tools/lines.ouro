@@ -1,0 +1,577 @@
+-- Small dogfood CLI for runtime IO, argv parsing, filesystem, paths, and strings.
+
+-- @entry main
+
+import "../std/io.ouro";
+import "../std/fs.ouro";
+import "../std/args.ouro";
+import "../std/process.ouro";
+import "../std/string.ouro";
+import "../std/stringx.ouro";
+import "../std/pathx.ouro";
+import "../std/format.ouro";
+import "../std/listx.ouro";
+
+inductive LinesOpts : Type :=
+  | MkLinesOpts : Bool -> Maybe String -> Maybe String -> LinesOpts;
+
+def lines_summary (o : LinesOpts) : Bool :=
+    match o with
+    | MkLinesOpts s _ _ => s
+    end;
+
+def lines_ext (o : LinesOpts) : Maybe String :=
+    match o with
+    | MkLinesOpts _ e _ => e
+    end;
+
+def lines_contains (o : LinesOpts) : Maybe String :=
+    match o with
+    | MkLinesOpts _ _ c => c
+    end;
+
+inductive LineStats : Type :=
+  | MkLineStats : Nat -> Nat -> Nat -> Nat -> Nat -> LineStats;
+
+def stats_lines (s : LineStats) : Nat :=
+    match s with
+    | MkLineStats n _ _ _ _ => n
+    end;
+
+def stats_bytes (s : LineStats) : Nat :=
+    match s with
+    | MkLineStats _ n _ _ _ => n
+    end;
+
+def stats_empty (s : LineStats) : Nat :=
+    match s with
+    | MkLineStats _ _ n _ _ => n
+    end;
+
+def stats_non_empty (s : LineStats) : Nat :=
+    match s with
+    | MkLineStats _ _ _ n _ => n
+    end;
+
+def stats_contains (s : LineStats) : Nat :=
+    match s with
+    | MkLineStats _ _ _ _ n => n
+    end;
+
+def stats_zero : LineStats := MkLineStats Z Z Z Z Z;
+
+def stats_add (a : LineStats) (b : LineStats) : LineStats :=
+    match a with
+    | MkLineStats al ab ae an ac =>
+        match b with
+        | MkLineStats bl bb be bn bc =>
+            MkLineStats (add al bl) (add ab bb) (add ae be) (add an bn)
+              (add ac bc)
+        end
+    end;
+
+inductive LinesState : Type :=
+  | MkLinesState : Bool -> Nat -> LineStats -> LinesState;
+
+def state_ok (s : LinesState) : Bool :=
+    match s with
+    | MkLinesState ok _ _ => ok
+    end;
+
+def state_files (s : LinesState) : Nat :=
+    match s with
+    | MkLinesState _ files _ => files
+    end;
+
+def state_stats (s : LinesState) : LineStats :=
+    match s with
+    | MkLinesState _ _ stats => stats
+    end;
+
+def state_zero : LinesState := MkLinesState True Z stats_zero;
+
+def state_fail (s : LinesState) : LinesState :=
+    MkLinesState False (state_files s) (state_stats s);
+
+def state_add_stats (s : LinesState) (stats : LineStats) : LinesState :=
+    MkLinesState (state_ok s) (S (state_files s))
+      (stats_add (state_stats s) stats);
+
+def lines_usage : String :=
+    "usage: ouro-lines [--summary] [--ext EXT] [--contains TEXT] PATH...";
+
+def stat_field (name : String) (n : Nat) : String :=
+    str_cat3 name "=" (show_nat n);
+
+def display_path (path : String) : String :=
+    path_normalize path;
+
+def text_lines_for_stats (text : String) : List String :=
+    match str_null text with
+    | True => Nil String
+    | False =>
+        match str_ends text "\n" with
+        | True => init String (str_lines text)
+        | False => str_lines text
+        end
+    end;
+
+def line_contains (needle : Maybe String) (line : String) : Bool :=
+    match needle with
+    | Nothing => False
+    | Just text => str_contains line text
+    end;
+
+def stats_of_text (needle : Maybe String) (text : String) : LineStats :=
+    let rows : List String := text_lines_for_stats text in
+    MkLineStats
+      (length String rows)
+      (str_len text)
+      (count_if String str_null rows)
+      (count_if String (fun (line : String) => notb (str_null line)) rows)
+      (count_if String (line_contains needle) rows);
+
+def row_base (label : String) (stats : LineStats) : String :=
+    str_join " "
+      ([ label
+      , stat_field "lines" (stats_lines stats)
+      , stat_field "bytes" (stats_bytes stats)
+      , stat_field "empty" (stats_empty stats)
+      , stat_field "non_empty" (stats_non_empty stats)
+      ] : List String);
+
+def row_with_contains (needle : Maybe String) (stats : LineStats)
+    (base : String) : String :=
+    match needle with
+    | Nothing => base
+    | Just _ => str_concat base (str_concat " " (stat_field "contains" (stats_contains stats)))
+    end;
+
+def file_row (opts : LinesOpts) (path : String) (stats : LineStats) : String :=
+    row_with_contains (lines_contains opts) stats
+      (row_base (str_concat "path=" (display_path path)) stats);
+
+def summary_row (opts : LinesOpts) (state : LinesState) : String :=
+    let stats : LineStats := state_stats state in
+    row_with_contains (lines_contains opts) stats
+      (str_join " "
+        ([ "summary"
+        , stat_field "files" (state_files state)
+        , stat_field "lines" (stats_lines stats)
+        , stat_field "bytes" (stats_bytes stats)
+        , stat_field "empty" (stats_empty stats)
+        , stat_field "non_empty" (stats_non_empty stats)
+        ] : List String));
+
+def default_walk_exts : List String :=
+  [ ".ouro"
+  , ".md"
+  , ".py"
+  , ".sh"
+  , ".c"
+  , ".h"
+  ];
+
+def has_any_ext (path : String) (exts : List String) : Bool :=
+  any String (fun (ext : String) => path_has_ext path ext) exts;
+
+def default_walk_ext (path : String) : Bool :=
+    has_any_ext path default_walk_exts;
+
+def file_ext_matches (ext : Maybe String) (path : String) : Bool :=
+    match ext with
+    | Nothing => True
+    | Just e => path_has_ext path e
+    end;
+
+def keep_arg_file (opts : LinesOpts) (path : String) : Bool :=
+    file_ext_matches (lines_ext opts) path;
+
+def keep_walk_file (opts : LinesOpts) (path : String) : Bool :=
+    match lines_ext opts with
+    | Nothing => default_walk_ext path
+    | Just e => path_has_ext path e
+    end;
+
+def analyze_file (opts : LinesOpts) (state : LinesState) (path : String)
+    : IO LinesState :=
+    do let! read := fs_read_checked path;
+       match read with
+       | Left e =>
+           do process_err_line (str_concat "error: " (fs_error_message e));
+              io_pure LinesState (state_fail state)
+       | Right text =>
+           let stats : LineStats := stats_of_text (lines_contains opts) text in
+           do io_unless (lines_summary opts) (process_out_line (file_row opts path stats));
+              io_pure LinesState (state_add_stats state stats)
+       end
+
+def analyze_walk_files (opts : LinesOpts) (state : LinesState)
+    (root : String) : IO LinesState :=
+    do let! files0 := fs_walk root;
+       let files : List String := str_sort (filter String (keep_walk_file opts) files0) in
+       io_fold String LinesState (analyze_file opts) state files
+
+def analyze_existing_path (opts : LinesOpts) (state : LinesState)
+    (path : String) : IO LinesState :=
+    do let! isdir := fs_is_dir path;
+       match isdir with
+       | True => analyze_walk_files opts state path
+       | False =>
+           match keep_arg_file opts path with
+           | True => analyze_file opts state path
+           | False => io_pure LinesState state
+           end
+       end
+
+def analyze_path (opts : LinesOpts) (state : LinesState) (path : String)
+    : IO LinesState :=
+    do let! present := fs_exists path;
+       match present with
+       | False =>
+           do process_err_line (str_concat "error: missing path: " (display_path path));
+              io_pure LinesState (state_fail state)
+       | True => analyze_existing_path opts state path
+       end
+
+def opts_of_args (a : Args) : LinesOpts :=
+    MkLinesOpts (args_flag a "summary") (args_opt a "ext")
+      (args_opt a "contains");
+
+def parse_error (a : Args) : Maybe String :=
+    match args_flag a "ext" with
+    | True => Just String "error: option requires value: --ext"
+    | False =>
+        match args_flag a "contains" with
+        | True => Just String "error: option requires value: --contains"
+        | False => Nothing String
+        end
+    end;
+
+def finish (opts : LinesOpts) (state : LinesState) : IO Unit :=
+    do io_when (lines_summary opts) (process_out_line (summary_row opts state));
+       match state_ok state with
+       | True => process_exit Z
+       | False => process_exit (S Z)
+       end
+
+def run_lines (a : Args) : IO Unit :=
+    match parse_error a with
+    | Just err =>
+        do process_err_line err;
+           process_err_line lines_usage;
+           process_exit (S Z)
+    | Nothing =>
+        match args_positional a with
+        | Nil =>
+            do process_err_line lines_usage;
+               process_exit (S Z)
+        | Cons _ _ =>
+            let opts : LinesOpts := opts_of_args a in
+            do let! state :=
+                 io_fold String LinesState (analyze_path opts) state_zero
+                   (args_positional a);
+               finish opts state
+        end
+    end;
+
+inductive LinesSelftestCase : Type :=
+  | MkLinesSelftestCase : String -> Nat -> List String -> String -> String -> LinesSelftestCase;
+
+
+def selftest_case_name (c : LinesSelftestCase) : String :=
+    match c with
+    | MkLinesSelftestCase name _ _ _ _ => name
+    end;
+
+
+def selftest_case_code (c : LinesSelftestCase) : Nat :=
+    match c with
+    | MkLinesSelftestCase _ code _ _ _ => code
+    end;
+
+
+def selftest_case_args (c : LinesSelftestCase) : List String :=
+    match c with
+    | MkLinesSelftestCase _ _ args _ _ => args
+    end;
+
+
+def selftest_case_stdout (c : LinesSelftestCase) : String :=
+    match c with
+    | MkLinesSelftestCase _ _ _ out _ => out
+    end;
+
+
+def selftest_case_stderr (c : LinesSelftestCase) : String :=
+    match c with
+    | MkLinesSelftestCase _ _ _ _ err => err
+    end;
+
+
+inductive LinesSelftestResult : Type :=
+  | MkLinesSelftestResult : String -> Bool -> Nat -> String -> LinesSelftestResult;
+
+
+def selftest_result_name (r : LinesSelftestResult) : String :=
+    match r with
+    | MkLinesSelftestResult name _ _ _ => name
+    end;
+
+
+def selftest_result_pass (r : LinesSelftestResult) : Bool :=
+    match r with
+    | MkLinesSelftestResult _ passed _ _ => passed
+    end;
+
+
+def selftest_result_code (r : LinesSelftestResult) : Nat :=
+    match r with
+    | MkLinesSelftestResult _ _ code _ => code
+    end;
+
+
+def selftest_result_issue (r : LinesSelftestResult) : String :=
+    match r with
+    | MkLinesSelftestResult _ _ _ issue => issue
+    end;
+
+
+def selftest_write (path : String) (content : String) : IO Unit :=
+    do let! written := fs_write_checked path content;
+       match written with
+       | Left e =>
+           do process_err_line (str_concat "LINES_SUITE: FAIL " (fs_error_message e));
+              process_exit (S Z)
+       | Right _ => io_unit
+       end
+
+
+def selftest_mkdir (path : String) : IO Unit :=
+    do let! made := fs_mkdir_p_checked path;
+       match made with
+       | Left e =>
+           do process_err_line (str_concat "LINES_SUITE: FAIL " (fs_error_message e));
+              process_exit (S Z)
+       | Right _ => io_unit
+       end
+
+
+def selftest_remove_file (path : String) : IO Unit :=
+    do fs_remove path;
+       let! present := fs_exists path;
+       match present with
+       | True =>
+           do process_err_line (str_concat "LINES_SUITE: FAIL could not remove fixture: " path);
+              process_exit (S Z)
+       | False => io_unit
+       end
+
+
+def selftest_clear_fixture (root : String) : IO Unit :=
+    do let! present := fs_exists root;
+       match present with
+       | False => io_unit
+       | True =>
+           do let! files := fs_walk root;
+              io_foreach String selftest_remove_file files
+       end
+
+
+def lines_selftest_setup (fixture : String) : IO Unit :=
+    let nested : String := fs_child fixture "nested" in
+    do selftest_clear_fixture fixture;
+       selftest_mkdir nested;
+       selftest_write (fs_child fixture "sample.ouro") "alpha\n\nbeta token\n";
+       selftest_write (fs_child fixture "extra.md") "docs\n";
+       selftest_write (fs_child fixture "skip.txt") "ignored\n";
+       selftest_write (fs_child nested "child.py") "nested token\n"
+
+
+def lines_selftest_cases (fixture : String) : List LinesSelftestCase :=
+    let sample : String := fs_child fixture "sample.ouro" in
+    let missing : String := fs_child fixture "missing.ouro" in
+    [ MkLinesSelftestCase "no_args" (S Z) (Nil String) ""
+        (str_concat lines_usage "\n")
+    , MkLinesSelftestCase "missing" (S Z) ([ missing ] : List String) ""
+        (str_cat3 "error: missing path: " (display_path missing) "\n")
+    , MkLinesSelftestCase "file" Z ([ sample ] : List String)
+        (str_cat3 "path=" (display_path sample)
+          " lines=3 bytes=18 empty=1 non_empty=2\n") ""
+    , MkLinesSelftestCase "contains" Z
+        ([ "--contains", "token", sample ] : List String)
+        (str_cat3 "path=" (display_path sample)
+          " lines=3 bytes=18 empty=1 non_empty=2 contains=1\n") ""
+    , MkLinesSelftestCase "summary" Z
+        ([ "--summary", sample ] : List String)
+        "summary files=1 lines=3 bytes=18 empty=1 non_empty=2\n" ""
+    , MkLinesSelftestCase "ext" Z
+        ([ "--ext", ".md", fixture ] : List String)
+        (str_cat3 "path=" (display_path (fs_child fixture "extra.md"))
+          " lines=1 bytes=5 empty=0 non_empty=1\n") ""
+    , MkLinesSelftestCase "dir_summary" Z
+        ([ "--summary", fixture ] : List String)
+        "summary files=3 lines=5 bytes=36 empty=1 non_empty=4\n" ""
+    , MkLinesSelftestCase "normalized" Z
+        ([ fs_child fixture "./sample.ouro" ] : List String)
+        (str_cat3 "path=" (display_path sample)
+          " lines=3 bytes=18 empty=1 non_empty=2\n") ""
+    ];
+
+
+def selftest_lf (text : String) : String :=
+    str_replace text "\r" "";
+
+
+def selftest_expected_stdout (probe_failure : Bool) (c : LinesSelftestCase) : String :=
+    match andb probe_failure (str_eq (selftest_case_name c) "file") with
+    | True => str_concat (selftest_case_stdout c) "deliberate selftest mismatch\n"
+    | False => selftest_case_stdout c
+    end;
+
+
+def selftest_case_issue (c : LinesSelftestCase) (r : ProcResult)
+    (out_ok : Bool) (err_ok : Bool) : String :=
+    match eq_nat (proc_code r) (selftest_case_code c) with
+    | False => str_cat4 "exit=" (show_nat (proc_code r)) " want="
+        (show_nat (selftest_case_code c))
+    | True =>
+        match out_ok with
+        | False => "output"
+        | True => match err_ok with | False => "stderr" | True => "" end
+        end
+    end;
+
+
+def selftest_case_log (c : LinesSelftestCase) (r : ProcResult)
+    (expected_out : String) (issue : String) : String :=
+    str_unlines
+      ([ str_concat "name=" (selftest_case_name c)
+      , str_concat "argv=" (str_join "\t" (selftest_case_args c))
+      , str_concat "exit=" (show_nat (proc_code r))
+      , str_concat "expected_exit=" (show_nat (selftest_case_code c))
+      , str_concat "issue=" issue
+      , "stdout:"
+      , selftest_lf (proc_stdout r)
+      , "expected_stdout:"
+      , expected_out
+      , "stderr:"
+      , selftest_lf (proc_stderr r)
+      , "expected_stderr:"
+      , selftest_case_stderr c
+      ] : List String);
+
+
+def run_lines_selftest_case (exe : String) (out : String) (probe_failure : Bool)
+    (c : LinesSelftestCase) : IO LinesSelftestResult :=
+    let name : String := selftest_case_name c in
+    do let! r := proc_exec exe (selftest_case_args c);
+       let actual_out : String := selftest_lf (proc_stdout r) in
+       let actual_err : String := selftest_lf (proc_stderr r) in
+       let expected_out : String := selftest_expected_stdout probe_failure c in
+       let code_ok : Bool := eq_nat (proc_code r) (selftest_case_code c) in
+       let out_ok : Bool := str_eq actual_out expected_out in
+       let err_ok : Bool := str_eq actual_err (selftest_case_stderr c) in
+       let passed : Bool := andb code_ok (andb out_ok err_ok) in
+       let issue : String := selftest_case_issue c r out_ok err_ok in
+       do selftest_write (fs_child out (str_concat name ".out")) (proc_stdout r);
+          selftest_write (fs_child out (str_concat name ".err")) (proc_stderr r);
+          selftest_write (fs_child out (str_concat name ".out.lf")) actual_out;
+          selftest_write (fs_child out (str_concat name ".err.lf")) actual_err;
+          selftest_write (fs_child out (str_concat name ".out.want")) expected_out;
+          selftest_write (fs_child out (str_concat name ".err.want"))
+            (selftest_case_stderr c);
+          selftest_write (fs_child out (str_concat name ".want"))
+            (match str_null expected_out with
+             | True => selftest_case_stderr c
+             | False => expected_out
+             end);
+          selftest_write (fs_child out (str_concat name ".diff"))
+            (match passed with
+             | True => ""
+             | False => str_concat issue "\n"
+             end);
+          selftest_write (fs_child out (str_concat name ".log"))
+            (selftest_case_log c r expected_out issue);
+          match passed with
+          | True => process_out_line (str_concat "LINES_OK " name)
+          | False => process_err_line (str_cat4 "LINES_FAIL " name " " issue)
+          end;
+          io_pure LinesSelftestResult
+            (MkLinesSelftestResult name passed (proc_code r) issue)
+
+
+def run_lines_selftest_cases (exe : String) (out : String) (probe_failure : Bool)
+    : List LinesSelftestCase -> IO (List LinesSelftestResult) :=
+  fix run_lines_selftest_cases (cases : List LinesSelftestCase)
+      : IO (List LinesSelftestResult) :=
+    match cases with
+    | Nil => io_pure (List LinesSelftestResult) (Nil LinesSelftestResult)
+    | Cons c rest =>
+        do let! result := run_lines_selftest_case exe out probe_failure c;
+           let! results := run_lines_selftest_cases rest;
+           io_pure (List LinesSelftestResult) (Cons LinesSelftestResult result results)
+    end;
+
+
+def selftest_result_row (r : LinesSelftestResult) : String :=
+    str_join "\t"
+      ([ selftest_result_name r
+      , show_bool (selftest_result_pass r)
+      , show_nat (selftest_result_code r)
+      , selftest_result_issue r
+      ] : List String);
+
+
+def selftest_report (results : List LinesSelftestResult) : String :=
+    str_concat
+      (str_unlines
+        (Cons String "name\tpass\texit\tissue"
+          (map LinesSelftestResult String selftest_result_row results))) "\n";
+
+
+def selftest_failure_count (results : List LinesSelftestResult) : Nat :=
+    count_if LinesSelftestResult
+      (fun (r : LinesSelftestResult) => notb (selftest_result_pass r)) results;
+
+
+def finish_lines_selftest (out : String) (results : List LinesSelftestResult)
+    : IO Unit :=
+    do selftest_write (fs_child out "selftest-report.tsv") (selftest_report results);
+       let! display_out := env_or "LINES_SUITE_DISPLAY_OUT" out;
+       match eq_nat (selftest_failure_count results) Z with
+       | True =>
+           do process_out_line
+                (str_cat4 "LINES_SUITE: PASS rows=" (show_nat (length LinesSelftestResult results))
+                  " out=" display_out);
+              process_exit Z
+       | False =>
+           do process_err_line
+                (str_cat4 "LINES_SUITE: FAIL rows=" (show_nat (length LinesSelftestResult results))
+                  " failures=" (str_cat3 (show_nat (selftest_failure_count results))
+                    " out=" display_out));
+              process_exit (S Z)
+       end
+
+
+def run_lines_selftest (exe : String) (a : Args) : IO Unit :=
+    let out : String := args_opt_or a "out" "_build/lines_suite" in
+    let fixture : String := args_opt_or a "fixture-root" "_build/lines_suite/fixtures" in
+    do selftest_mkdir out;
+       lines_selftest_setup fixture;
+       let! results := run_lines_selftest_cases exe out
+         (args_flag a "selftest-probe-failure") (lines_selftest_cases fixture);
+       finish_lines_selftest out results
+
+
+def lines_switches : List String :=
+    [ "summary", "selftest", "selftest-probe-failure" ];
+
+
+def main : IO Unit :=
+    do let! raw := process_argv;
+       let a : Args := args_of_argv_bools lines_switches raw in
+       match args_flag a "selftest" with
+       | True => run_lines_selftest (nth String "" Z raw) a
+       | False => run_lines a
+       end

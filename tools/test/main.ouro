@@ -1,0 +1,748 @@
+-- Runs user tests and retained suite fixtures through native subprocesses.
+
+-- @entry main
+
+import "../../std/fs.ouro";
+import "../../std/args.ouro";
+import "../../std/process.ouro";
+import "../../std/test.ouro";
+import "../../std/text.ouro";
+import "suites.ouro";
+import "sample_cases.ouro";
+import "common.ouro";
+import "discovery.ouro";
+import "manifest.ouro";
+
+def test_usage : String :=
+    "usage: ouro-test [PATH...]\n       ouro-test --manifest PATH --prefix PREFIX[,PREFIX...] [--root DIR] [--out DIR] [--suite-label LABEL]\n       ouro-test --native-suite=compiler-checking [--out DIR] [--list]";
+
+def bin_of (out : String) (p : String) : String :=
+    test_binary_path out (path_stem p);
+
+def runnable (text : String) : Bool :=
+    andb (str_contains text "-- @entry") (str_contains text "def main");
+
+def fail_msg (kind : String) (path : String) : IO Bool :=
+    do eprintln (str_cat3 "FAIL " kind (str_concat " " path));
+       io_pure Bool False
+
+def pass_msg (kind : String) (path : String) : IO Bool :=
+    do println (str_cat3 "ok " kind (str_concat " " path));
+       io_pure Bool True
+
+def run_check (path : String) : IO Bool :=
+    do let! outcome := test_check_process path False;
+       match outcome with
+       | Left error => do eprintln (test_process_error_message error); io_pure Bool False
+       | Right result => io_pure Bool (check_result_ok result)
+       end
+
+def run_build (src : String) (bin : String) : IO Bool :=
+    do let! outcome := test_build_process src bin;
+       match outcome with
+       | Left error => do eprintln (test_process_error_message error); io_pure Bool False
+       | Right result => match proc_ok result with
+         | True => io_pure Bool True
+         | False => do eprint (str_concat (proc_stdout result) (proc_stderr result)); io_pure Bool False
+         end
+       end
+
+def run_prog (bin : String) : IO (Pair Bool String) :=
+    do let! outcome := test_run_process test_runtime_limits bin [] "";
+       match outcome with
+       | Left error => do eprintln (test_process_error_message error);
+                          io_pure (Pair Bool String) (MkPair Bool String False "")
+       | Right result => match proc_ok result with
+         | False => do eprint (proc_stderr result);
+                       io_pure (Pair Bool String) (MkPair Bool String False (proc_stdout result))
+         | True => io_pure (Pair Bool String) (MkPair Bool String True (proc_stdout result))
+         end
+       end
+
+def compare_golden (path : String) (out : String) : IO Bool :=
+    let g : String := golden_of path in
+    do let! present := fs_exists g;
+       match present with
+       | False => io_pure Bool True
+       | True =>
+           do let! want := fs_read_checked g;
+              match want with
+              | Left e =>
+                  do eprintln (str_cat3 g ": " (fs_error_message e));
+                     fail_msg "read" g
+              | Right text =>
+                  io_pure Bool (str_eq (strip_cr out) (strip_cr text))
+              end
+       end
+
+def native_suite_mkdir (path : String) : IO Unit :=
+    do let! made := fs_mkdir_p_checked path;
+       match made with
+       | Left e => do eprintln (str_concat "NATIVE_SUITE_ERROR " (fs_error_message e));
+                      exit 1
+       | Right _ => io_unit
+       end
+
+
+def test_run_io (path : String) (out_dir : String) : IO Bool :=
+    let bin : String := bin_of out_dir path in
+    do native_suite_mkdir out_dir;
+       let! ok_build := run_build path bin;
+       match ok_build with
+       | False => fail_msg "build" path
+       | True =>
+           do let! ran := run_prog bin;
+              match ran with
+              | MkPair ok_run out =>
+                  match ok_run with
+                  | False => fail_msg "run" path
+                  | True =>
+                      do let! gold := compare_golden path out;
+                         match gold with
+                         | False => fail_msg "golden" path
+                         | True => pass_msg "run" path
+                         end
+                  end
+              end
+       end
+
+def test_one (path : String) (out_dir : String) : IO Bool :=
+    do let! present := fs_exists path;
+       match present with
+       | False => fail_msg "missing" path
+       | True =>
+           do let! ok_check := run_check path;
+              match ok_check with
+              | False => fail_msg "check" path
+              | True =>
+                  do let! text := fs_read_checked path;
+                     match text with
+                     | Left e =>
+                         do eprintln (str_cat3 path ": " (fs_error_message e));
+                            fail_msg "read" path
+                     | Right src =>
+                         match runnable src with
+                         | False => pass_msg "check" path
+                         | True => test_run_io path out_dir
+                         end
+                     end
+              end
+       end
+
+def test_and (out_dir : String) (ok : Bool) (path : String) : IO Bool :=
+    do let! one := test_one path out_dir;
+       io_pure Bool (andb ok one)
+
+def test_finish (ok : Bool) : IO Unit :=
+    match ok with
+    | True => do println "test: ok";
+                 exit 0
+    | False => do eprintln "test: failed";
+                  exit 1
+    end;
+
+def test_run_files (files : List String) : IO Unit :=
+    match files with
+    | Nil => do eprintln test_usage; exit 2
+    | Cons _ _ =>
+        do let! out_dir := load_out;
+           let! ok := io_fold String Bool (test_and out_dir) True files;
+           test_finish ok
+    end;
+
+inductive NativeSuiteRun : Type :=
+  | MkNativeSuiteRun : Nat -> Nat -> NativeSuiteRun;
+
+
+def native_suite_rows (run : NativeSuiteRun) : Nat :=
+    match run with | MkNativeSuiteRun rows _ => rows end;
+
+
+def native_suite_failures (run : NativeSuiteRun) : Nat :=
+    match run with | MkNativeSuiteRun _ failures => failures end;
+
+
+def native_suite_record (label : String) (name : String) (issue : String)
+    (run : NativeSuiteRun) : IO NativeSuiteRun :=
+    match str_null issue with
+    | True =>
+        do println (str_cat3 label "_OK " name);
+           io_pure NativeSuiteRun
+             (MkNativeSuiteRun (S (native_suite_rows run)) (native_suite_failures run))
+    | False =>
+        do eprintln (str_cat4 label "_FAIL " name (str_concat " " issue));
+           io_pure NativeSuiteRun
+             (MkNativeSuiteRun (S (native_suite_rows run)) (S (native_suite_failures run)))
+    end;
+
+
+def native_suite_write (path : String) (content : String) : IO Unit :=
+    do let! written := fs_write_checked path content;
+       match written with
+       | Left e => do eprintln (str_concat "NATIVE_SUITE_ERROR " (fs_error_message e));
+                      exit 1
+       | Right _ => io_unit
+       end
+
+
+def native_suite_check (out : String) (artifact : String) (path : String)
+    : IO (Either NativeTestProcessError ProcResult) :=
+    do let! outcome := test_check_process path True;
+       let output : String := test_process_output outcome in
+       let log_output : String := match outcome with
+         | Left _ => output
+         | Right result => match proc_ok result with
+           | True => output
+           | False => str_cat4 "CHECK_PROCESS_FAIL exit=" (show_nat (proc_code result)) "\n" output
+           end
+         end in
+       do native_suite_write (fs_child out (str_concat artifact ".check")) log_output;
+          io_pure (Either NativeTestProcessError ProcResult) outcome
+
+def native_suite_build (out : String) (artifact : String) (path : String) (bin : String)
+    : IO (Pair Bool String) :=
+    do let! outcome := test_build_process path bin;
+       let output : String := test_process_output outcome in
+       do native_suite_write (fs_child out (str_concat artifact ".build")) output;
+          io_pure (Pair Bool String) (MkPair Bool String (test_process_exit_is outcome 0) output)
+
+def native_suite_golden_present (policy : SuiteGolden) (present : Bool) : Bool :=
+    match policy with
+    | SuiteGoldenRequired => present
+    | SuiteGoldenOptional => True
+    | SuiteGoldenNone => True
+    end;
+
+
+def native_suite_compare_golden (out : String) (fixture : SuiteFixture)
+    (stdout : String) : IO Bool :=
+    let path : String := suite_fixture_path fixture in
+    let golden : String := golden_of path in
+    do let! present := fs_exists golden;
+       match native_suite_golden_present (suite_fixture_golden fixture) present with
+       | False => io_pure Bool False
+       | True =>
+           match present with
+           | False => io_pure Bool True
+           | True =>
+               do native_suite_write
+                    (fs_child out (str_concat (suite_fixture_name fixture) ".out.lf"))
+                    (strip_cr stdout);
+                  let! matched := compare_golden path stdout;
+                  do native_suite_write
+                       (fs_child out (str_concat (suite_fixture_name fixture) ".diff"))
+                       (match matched with
+                        | True => ""
+                        | False => "stdout mismatch\n"
+                        end);
+                     io_pure Bool matched
+           end
+       end
+
+
+def native_suite_expected_exit (probe_failure : Bool) (fixture : SuiteFixture) : Nat :=
+    match probe_failure with
+    | False => suite_fixture_exit fixture
+    | True =>
+        match orb (str_eq (suite_fixture_name fixture) "io_prims")
+          (orb (str_eq (suite_fixture_name fixture) "helpers")
+            (str_eq (suite_fixture_name fixture) "compiler_suite_contract")) with
+        | True => 99
+        | False => suite_fixture_exit fixture
+        end
+    end;
+
+
+def native_suite_fixture_row_name (runtime_mode : Bool) (fixture : SuiteFixture)
+    (phase : String) : String :=
+    match runtime_mode with
+    | True => suite_fixture_name fixture
+    | False => str_cat3 (suite_fixture_name fixture) "-" phase
+    end;
+
+
+def native_suite_run_built (label : String) (runtime_mode : Bool) (probe_failure : Bool)
+    (out : String) (run : NativeSuiteRun) (fixture : SuiteFixture) (bin : String)
+    : IO NativeSuiteRun :=
+    let name : String := suite_fixture_name fixture in
+    do let! outcome := test_run_process test_runtime_limits bin [] "";
+       match outcome with
+       | Left error =>
+           do native_suite_write (fs_child out (str_concat name ".out")) "";
+              native_suite_write (fs_child out (str_concat name ".err")) (test_process_output outcome);
+              native_suite_record label (native_suite_fixture_row_name runtime_mode fixture "run")
+                (test_process_error_message error) run
+       | Right result =>
+           do native_suite_write (fs_child out (str_concat name ".out")) (proc_stdout result);
+              native_suite_write (fs_child out (str_concat name ".err")) (proc_stderr result);
+              match eq_nat (proc_code result) (native_suite_expected_exit probe_failure fixture) with
+              | False => do eprint (str_concat (proc_stdout result) (proc_stderr result));
+                            native_suite_record label (native_suite_fixture_row_name runtime_mode fixture "run")
+                              (str_cat4 "exit=" (show_nat (proc_code result)) " want="
+                                (show_nat (native_suite_expected_exit probe_failure fixture))) run
+              | True =>
+                  do let! golden_ok := native_suite_compare_golden out fixture (proc_stdout result);
+                     match golden_ok with
+                     | False => native_suite_record label (native_suite_fixture_row_name runtime_mode fixture "golden")
+                         (match runtime_mode with | True => "output" | False => "stdout mismatch" end) run
+                     | True => native_suite_record label (native_suite_fixture_row_name runtime_mode fixture "run") "" run
+                     end
+              end
+       end
+
+def native_suite_run_fixture (label : String) (runtime_mode : Bool)
+    (probe_failure : Bool) (out : String) (run : NativeSuiteRun) (fixture : SuiteFixture)
+    : IO NativeSuiteRun :=
+    let name : String := suite_fixture_name fixture in
+    let path : String := suite_fixture_path fixture in
+    do let! checked := native_suite_check out name path;
+       match checked with
+       | Left error => native_suite_record label (native_suite_fixture_row_name runtime_mode fixture "check")
+           (test_process_error_message error) run
+       | Right result => match check_result_ok result with
+         | False => do eprint (test_process_output checked);
+                       native_suite_record label (native_suite_fixture_row_name runtime_mode fixture "check")
+                         (match runtime_mode with | True => "check" | False => "checker failed or CHECK_OK missing" end) run
+         | True =>
+             let bin : String := test_binary_path out name in
+             do let! built := native_suite_build out name path bin;
+                match built with
+                | MkPair build_pass build_output => match build_pass with
+                  | False => do eprint build_output;
+                                native_suite_record label (native_suite_fixture_row_name runtime_mode fixture "build")
+                                  (match runtime_mode with | True => "build" | False => "emit failed" end) run
+                  | True => native_suite_run_built label runtime_mode probe_failure out run fixture bin
+                  end
+                end
+         end
+       end
+
+def native_suite_run_fixtures (label : String) (runtime_mode : Bool)
+    (probe_failure : Bool) (out : String) : List SuiteFixture -> NativeSuiteRun -> IO NativeSuiteRun :=
+  fix native_suite_run_fixtures (fixtures : List SuiteFixture) (run : NativeSuiteRun)
+      : IO NativeSuiteRun :=
+    match fixtures with
+    | Nil => io_pure NativeSuiteRun run
+    | Cons fixture rest =>
+        do let! next := native_suite_run_fixture label runtime_mode probe_failure
+             out run fixture;
+           native_suite_run_fixtures rest next
+    end;
+
+
+def native_suite_check_row (label : String) (out : String) (artifact : String)
+    (path : String) (row_name : String) (run : NativeSuiteRun) : IO NativeSuiteRun :=
+    do let! checked := native_suite_check out artifact path;
+       match checked with
+       | Left error => native_suite_record label row_name (test_process_error_message error) run
+       | Right result => match check_result_ok result with
+         | True => native_suite_record label row_name "" run
+         | False => do eprint (test_process_output checked);
+                       native_suite_record label row_name "checker failed or CHECK_OK missing" run
+         end
+       end
+
+def native_suite_build_row (label : String) (out : String) (run : NativeSuiteRun) : IO NativeSuiteRun :=
+    do let! built := native_suite_build out "tool" "tools/test/main.ouro"
+         (test_binary_path out "ouro-test");
+       match built with
+       | MkPair passed output =>
+           match passed with
+           | True => native_suite_record label "test-tool-build" "" run
+           | False => do eprint output;
+                         native_suite_record label "test-tool-build" "emit failed" run
+           end
+       end
+
+
+def native_suite_command_row (label : String) (out : String) (artifact : String)
+    (row_name : String) (outcome : Either NativeTestProcessError ProcResult) (required : String)
+    (run : NativeSuiteRun) : IO NativeSuiteRun :=
+    match outcome with
+    | Left error =>
+        do native_suite_write (fs_child out (str_concat artifact ".out")) "";
+           native_suite_write (fs_child out (str_concat artifact ".err")) (test_process_output outcome);
+           native_suite_record label row_name (test_process_error_message error) run
+    | Right result =>
+        do native_suite_write (fs_child out (str_concat artifact ".out")) (proc_stdout result);
+           native_suite_write (fs_child out (str_concat artifact ".err")) (proc_stderr result);
+           let passed : Bool := andb (proc_ok result)
+             (match str_null required with | True => True | False => str_contains (proc_stdout result) required end) in
+           match passed with
+           | True => native_suite_record label row_name "" run
+           | False => do eprint (test_process_output outcome);
+                         native_suite_record label row_name (str_concat "exit=" (show_nat (proc_code result))) run
+           end
+    end;
+
+def native_suite_failure_tail (label : String) (failures : Nat)
+    (display_out : String) : String :=
+    let base : String := str_concat " failures=" (show_nat failures) in
+    match str_eq label "TEST" with
+    | True => str_concat base (str_concat " out=" display_out)
+    | False => base
+    end;
+
+
+def native_suite_finish (label : String) (out : String) (run : NativeSuiteRun)
+    : IO Unit :=
+    do let! display_out := env_or "OURO_TEST_SUITE_DISPLAY_OUT" out;
+       match eq_nat (native_suite_failures run) Z with
+       | True =>
+           do println (str_cat4 label "_SUITE: PASS rows="
+                (show_nat (native_suite_rows run)) (str_concat " out=" display_out));
+              exit 0
+       | False =>
+           do eprintln (str_cat4 label "_SUITE: FAIL rows="
+                (show_nat (native_suite_rows run))
+                (native_suite_failure_tail label (native_suite_failures run) display_out));
+              exit 1
+       end
+
+
+def sample_suite_success (c : SampleCase) (run : NativeSuiteRun)
+    : IO NativeSuiteRun :=
+    let suffix : String := sample_case_success_suffix c in
+    do println
+         (str_concat "SAMPLES_OK "
+           (str_concat (sample_case_path c)
+             (match str_null suffix with
+              | True => ""
+              | False => str_concat " " suffix
+              end)));
+       io_pure NativeSuiteRun
+         (MkNativeSuiteRun (S (native_suite_rows run)) (native_suite_failures run))
+
+
+def sample_suite_failure (c : SampleCase) (issue : String) (details : String)
+    (run : NativeSuiteRun) : IO NativeSuiteRun :=
+    do eprintln (str_cat4 "SAMPLES_FAIL " (sample_case_path c) " " issue);
+       match str_null details with
+       | True => io_unit
+       | False => eprint details
+       end;
+       io_pure NativeSuiteRun
+         (MkNativeSuiteRun (S (native_suite_rows run))
+           (S (native_suite_failures run)))
+
+
+def sample_suite_missing (c : SampleCase) (run : NativeSuiteRun)
+    : IO NativeSuiteRun :=
+    do eprintln (str_cat3 "SAMPLES_FAIL " (sample_case_path c) " missing");
+       io_pure NativeSuiteRun
+         (MkNativeSuiteRun (native_suite_rows run) (S (native_suite_failures run)))
+
+
+def sample_suite_check_issue (c : SampleCase) (outcome : Either NativeTestProcessError ProcResult) : String :=
+    match outcome with
+    | Left error => test_process_error_message error
+    | Right result => match sample_case_accept c with
+      | True => match check_result_ok result with | True => "" | False => "check" end
+      | False => match test_process_rejected result (sample_case_diagnostic c) with
+        | True => ""
+        | False => str_concat "expected " (sample_case_diagnostic c)
+        end
+      end
+    end;
+
+def sample_suite_expected_exit (probe_failure : Bool) (c : SampleCase) : Nat :=
+    match andb probe_failure (str_eq (sample_case_slug c) "samples_demo_01_hello") with
+    | True => 99
+    | False => sample_case_exit c
+    end;
+
+
+def sample_suite_run_process (c : SampleCase) (bin : String)
+    : IO (Either NativeTestProcessError ProcResult) :=
+    match sample_case_stdin c with
+    | Nothing => test_run_process test_runtime_limits bin [] ""
+    | Just input => test_run_input_file bin input
+    end;
+
+def sample_suite_compare_golden (out : String) (c : SampleCase)
+    (stdout : String) : IO (Pair Bool String) :=
+    let slug : String := sample_case_slug c in
+    do native_suite_write (fs_child out (str_concat slug ".out.lf"))
+         (strip_cr stdout);
+       match sample_case_golden c with
+       | Nothing => io_pure (Pair Bool String)
+           (MkPair Bool String False "required golden is not declared\n")
+       | Just golden =>
+           do let! present := fs_exists golden;
+              match present with
+              | False => io_pure (Pair Bool String)
+                  (MkPair Bool String False
+                    (str_concat "missing golden " (str_concat golden "\n")))
+              | True =>
+                  do let! expected := fs_read_checked golden;
+                     match expected with
+                     | Left e => io_pure (Pair Bool String)
+                         (MkPair Bool String False
+                           (str_concat (fs_error_message e) "\n"))
+                     | Right text =>
+                         match str_eq (strip_cr stdout) (strip_cr text) with
+                         | True =>
+                             do native_suite_write
+                                  (fs_child out (str_concat slug ".diff")) "";
+                                io_pure (Pair Bool String)
+                                  (MkPair Bool String True "")
+                         | False =>
+                             do native_suite_write
+                                  (fs_child out (str_concat slug ".diff"))
+                                  "stdout mismatch\n";
+                                io_pure (Pair Bool String)
+                                  (MkPair Bool String False "stdout mismatch\n")
+                         end
+                     end
+              end
+       end
+
+
+def sample_suite_run_built (probe_failure : Bool) (out : String)
+    (run : NativeSuiteRun) (c : SampleCase) (bin : String) : IO NativeSuiteRun :=
+    let slug : String := sample_case_slug c in
+    do let! outcome := sample_suite_run_process c bin;
+       match outcome with
+       | Left error =>
+           do native_suite_write (fs_child out (str_concat slug ".out")) "";
+              native_suite_write (fs_child out (str_concat slug ".err")) (test_process_output outcome);
+              sample_suite_failure c "process" (test_process_error_message error) run
+       | Right result =>
+           do native_suite_write (fs_child out (str_concat slug ".out")) (proc_stdout result);
+              native_suite_write (fs_child out (str_concat slug ".err")) (proc_stderr result);
+              match eq_nat (proc_code result) (sample_suite_expected_exit probe_failure c) with
+              | False => sample_suite_failure c (str_concat "exit=" (show_nat (proc_code result))) (proc_stderr result) run
+              | True =>
+                  do let! compared := sample_suite_compare_golden out c (proc_stdout result);
+                     match compared with
+                     | MkPair golden_ok diff => match golden_ok with
+                       | True => sample_suite_success c run
+                       | False => sample_suite_failure c "output" diff run
+                       end
+                     end
+              end
+       end
+
+def sample_suite_run_case (probe_failure : Bool) (out : String)
+    (run : NativeSuiteRun) (c : SampleCase) : IO NativeSuiteRun :=
+    let slug : String := sample_case_slug c in
+    let path : String := sample_case_path c in
+    do let! present := fs_exists path;
+       match present with
+       | False => sample_suite_missing c run
+       | True =>
+           do let! checked := native_suite_check out slug path;
+              let check_issue : String := sample_suite_check_issue c checked in
+              match str_null check_issue with
+              | False => sample_suite_failure c check_issue (test_process_output checked) run
+              | True => match sample_case_run c with
+                | False => sample_suite_success c run
+                | True =>
+                    let bin : String := test_binary_path out slug in
+                    do let! built := native_suite_build out slug path bin;
+                       match built with
+                       | MkPair build_pass build_output => match build_pass with
+                         | False => sample_suite_failure c "build" build_output run
+                         | True => sample_suite_run_built probe_failure out run c bin
+                         end
+                       end
+                end
+              end
+       end
+
+def sample_suite_run_cases (probe_failure : Bool) (out : String)
+    : List SampleCase -> NativeSuiteRun -> IO NativeSuiteRun :=
+  fix sample_suite_run_cases (cases : List SampleCase) (run : NativeSuiteRun)
+      : IO NativeSuiteRun :=
+    match cases with
+    | Nil => io_pure NativeSuiteRun run
+    | Cons c rest =>
+        do let! next := sample_suite_run_case probe_failure out run c;
+           sample_suite_run_cases rest next
+    end;
+
+
+def sample_suite_cli_valid (raw : List String) (args : Args) : Bool :=
+    andb (args_argv_options_complete
+      ([ "help", "list", "suite-probe-failure" ] : List String) raw)
+      (andb (nullb String (args_positional args))
+        (andb (all String (fun (flag : String) =>
+          elem String str_eq flag ([ "list", "suite-probe-failure" ] : List String))
+          (args_flags args))
+          (all (Pair String String) (fun (option : Pair String String) =>
+            match option with
+            | MkPair name _ => elem String str_eq name
+                ([ "native-suite", "out", "shard" ] : List String)
+            end) (map_pairs String (args_opts args)))));
+
+
+def sample_suite_selection (shard : String) : Maybe (List SampleCase) :=
+    match str_eq shard "all" with
+    | True => Just (List SampleCase) sample_suite_cases
+    | False =>
+        match str_eq shard "1/2" with
+        | True => Just (List SampleCase)
+            (sample_suite_alternate True sample_suite_cases True True)
+        | False =>
+            match str_eq shard "2/2" with
+            | True => Just (List SampleCase)
+                (sample_suite_alternate False sample_suite_cases True True)
+            | False => Nothing (List SampleCase)
+            end
+        end
+    end;
+
+
+def run_samples_selected (args : Args) (cases : List SampleCase) : IO Unit :=
+    let out : String := args_opt_or args "out" "_build/samples_suite" in
+    do native_suite_mkdir out;
+       let! run := sample_suite_run_cases (args_flag args "suite-probe-failure")
+         out cases (MkNativeSuiteRun Z Z);
+       native_suite_finish "SAMPLES" out run
+
+
+def sample_suite_cli_error : IO Unit :=
+    do eprintln "usage: ouro-test --native-suite=samples [--out DIR] [--shard=all|1/2|2/2] [--list]";
+       exit 2
+
+
+def run_samples_native_suite (raw : List String) (args : Args) : IO Unit :=
+    match sample_suite_cli_valid raw args with
+    | False => sample_suite_cli_error
+    | True =>
+        match sample_suite_selection (args_opt_or args "shard" "all") with
+        | Nothing => sample_suite_cli_error
+        | Just cases =>
+            match args_flag args "list" with
+            | False => run_samples_selected args cases
+            | True => io_foreach SampleCase (fun (c : SampleCase) =>
+                println (str_cat3 (sample_case_slug c) " "
+                  (match sample_case_run c with | True => "native" | False => "check" end))) cases
+            end
+        end
+    end;
+
+
+def run_runtime_io_native_suite (args : Args) : IO Unit :=
+    let out : String := args_opt_or args "out" "_build/runtime_io" in
+    let fixtures : String := args_opt_or args "fixtures" "_build/smith/fixtures/runtime" in
+    do native_suite_mkdir out;
+       let! run := native_suite_run_fixtures "RUNTIME_IO" True
+         (args_flag args "suite-probe-failure") out
+         (runtime_io_suite_fixtures fixtures) (MkNativeSuiteRun Z Z);
+       native_suite_finish "RUNTIME_IO" out run
+
+
+def native_suite_lines_row (out : String) (run : NativeSuiteRun) : IO NativeSuiteRun :=
+    do let! lines_out := env_or "LINES_SUITE_OUT" (fs_child out "lines");
+       native_suite_mkdir lines_out;
+       let bin : String := test_binary_path lines_out "ouro-lines" in
+       do let! built := native_suite_build lines_out "build" "tools/lines.ouro" bin;
+          match built with
+          | MkPair passed output => match passed with
+            | False => do eprint output; native_suite_record "TEST" "lines-suite" "build" run
+            | True =>
+                do let! result := test_run_process test_runtime_limits bin ["--selftest", str_concat "--out=" lines_out] "";
+                   native_suite_command_row "TEST" out "lines_suite" "lines-suite" result "LINES_SUITE: PASS" run
+            end
+          end
+
+def run_user_test_native_suite (args : Args) : IO Unit :=
+    let out : String := args_opt_or args "out" "_build/test_suite" in
+    let fixtures : String := args_opt_or args "fixtures" "_build/smith/fixtures/test" in
+    do native_suite_mkdir out;
+       let! run1 := native_suite_check_row "TEST" out "std_test"
+         "std/test.ouro" "std-test-check" (MkNativeSuiteRun Z Z);
+       let! run2 := native_suite_check_row "TEST" out "test_tool"
+         "tools/test/main.ouro" "test-tool-check" run1;
+       let! run3 := native_suite_build_row "TEST" out run2;
+       let! run4 := native_suite_run_fixtures "TEST" False
+         (args_flag args "suite-probe-failure") out
+         (user_test_suite_fixtures fixtures) run3;
+       let! run5 := native_suite_lines_row out run4;
+       -- This row tests the loaded runner; future coil test dispatch needs its own probe.
+       let! nested := test_run_self test_nested_limits [str_concat fixtures "/success.ouro"];
+       let! run6 := native_suite_command_row "TEST" out "ouro1_test" "ouro1-test"
+         nested "test: ok" run5;
+       native_suite_finish "TEST" out run6
+
+
+def run_compiler_check_native_suite (raw : List String) (args : Args) : IO Unit :=
+    let valid : Bool := andb (sample_suite_cli_valid raw args)
+      (match args_opt args "shard" with | Nothing => True | Just _ => False end) in
+    match valid with
+    | False => do eprintln test_usage; exit 2
+    | True =>
+        match compiler_check_suite_fixtures with
+        | Nil => do eprintln "COMPILER_CHECK_SUITE: FAIL no fixtures"; exit 1
+        | Cons _ _ =>
+            match args_flag args "list" with
+            | True => io_foreach SuiteFixture
+                (fun (fixture : SuiteFixture) => println (suite_fixture_path fixture))
+                compiler_check_suite_fixtures
+            | False =>
+                let out : String := args_opt_or args "out" "_build/compiler_check_suite" in
+                do native_suite_mkdir out;
+                   let! run := native_suite_run_fixtures "COMPILER_CHECK" False
+                     (args_flag args "suite-probe-failure") out
+                     compiler_check_suite_fixtures (MkNativeSuiteRun Z Z);
+                   native_suite_finish "COMPILER_CHECK" out run
+            end
+        end
+    end;
+
+
+def run_native_suite_cli (raw : List String) (args : Args) (name : String) : IO Unit :=
+    match str_eq name "runtime-io" with
+    | True => run_runtime_io_native_suite args
+    | False =>
+        match str_eq name "test" with
+        | True => run_user_test_native_suite args
+        | False =>
+            match str_eq name "samples" with
+            | True => run_samples_native_suite raw args
+            | False =>
+                match str_eq name "compiler-checking" with
+                | True => run_compiler_check_native_suite raw args
+                | False => do eprintln (str_concat "unknown native suite: " name);
+                             exit 2
+                end
+            end
+        end
+    end;
+
+
+def test_run_paths (paths : List String) : IO Unit :=
+    do let! discovered := test_discover paths;
+       match discovered with
+       | Left error => do eprintln (str_concat "TEST_DISCOVERY_ERROR " (fs_error_message error)); exit 1
+       | Right files => test_run_files files
+       end
+
+def main : IO Unit :=
+    do let! xs := argv;
+       let args : Args := args_of_argv_bools
+         ([ "help", "list", "suite-probe-failure" ] : List String) xs in
+       match args_flag args "help" with
+       | True => do println test_usage;
+                    exit 0
+       | False =>
+           match args_opt args "native-suite" with
+           | Just suite => run_native_suite_cli xs args suite
+           | Nothing =>
+               match args_flag args "native-suite" with
+               | True => do eprintln test_usage;
+                            exit 2
+               | False =>
+                   match args_opt args "manifest" with
+                   | Just manifest => manifest_run_cli args manifest
+                   | Nothing =>
+                       match args_flag args "manifest" with
+                       | True => do eprintln test_usage;
+                                    exit 2
+                       | False => test_run_paths (args_positional args)
+                       end
+                   end
+               end
+           end
+       end

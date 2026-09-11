@@ -1,0 +1,626 @@
+-- LSP IO shell: protocol decisions stay in model; this file owns stdio, subprocesses, and import reads.
+-- Diagnostics run on open/change/save. Unsaved buffers are checked via a
+-- sibling `*.lspbuf.ouro` scratch so imports stay relative to the document.
+
+-- @entry main
+
+import "lsp_process_model.ouro";
+import "native_sibling.ouro";
+import "../std/io.ouro";
+import "../std/fs.ouro";
+import "../std/pathx.ouro";
+
+-- Headers are read one byte at a time: prim_stdin_read_bytes is an fread, so
+-- asking for more than the client has sent would block until it does.
+def lsp_header_fuel : Nat := mul 64 64;
+
+-- Full-sync messages may be larger than one retained source document because
+-- JSON escaping and envelope fields add bytes.  Reject before asking the host
+-- reader to allocate the body.
+def lsp_max_frame_bytes : Nat := mul lsp_kib lsp_kib;
+
+def lsp_read_header : Nat -> String -> IO (Maybe String) :=
+  fix lsp_read_header (fuel : Nat) (acc : String) : IO (Maybe String) :=
+    match fuel with
+    | Z => io_pure (Maybe String) (Nothing String)
+    | S fuel2 =>
+        match str_ends acc rpc_header_end with
+        | True => io_pure (Maybe String) (Just String acc)
+        | False =>
+            do let! b := prim_stdin_read_bytes (S Z);
+               match str_null b with
+               | True => io_pure (Maybe String) (Nothing String)
+               | False => lsp_read_header fuel2 (str_concat acc b)
+               end
+        end
+    end;
+
+-- One message, or Nothing when the client closed the pipe.
+def lsp_read_message : IO (Maybe String) :=
+    do let! header := lsp_read_header lsp_header_fuel "";
+       match header with
+       | Nothing => io_pure (Maybe String) (Nothing String)
+       | Just h =>
+           match rpc_content_len h with
+           | Nothing => io_pure (Maybe String) (Nothing String)
+           | Just n =>
+               match leb_nat n lsp_max_frame_bytes with
+               | False => io_pure (Maybe String) (Nothing String)
+               | True =>
+                   do let! body := prim_stdin_read_bytes n;
+                      match eqNat (str_len body) n with
+                      | True => io_pure (Maybe String) (Just String body)
+                      | False => io_pure (Maybe String) (Nothing String)
+                      end
+               end
+           end
+       end
+
+def lsp_send (j : Json) : IO Unit :=
+    do print (rpc_send_json j);
+       flush
+
+def lsp_reply (msg : Json) (result : Json) : IO Unit :=
+    lsp_send (rpc_result (rpc_id msg) result);
+
+def lsp_keep (st : Lsp) : IO (Pair Lsp Bool) :=
+    io_pure (Pair Lsp Bool) (MkPair Lsp Bool st True);
+
+def lsp_stop (st : Lsp) : IO (Pair Lsp Bool) :=
+    io_pure (Pair Lsp Bool) (MkPair Lsp Bool st False);
+
+-- OURO_ROOT is set by scripts/ouro1.sh and by the editor launcher after its
+-- explicit trust check.  It is the authorization boundary; document URIs do
+-- not get to enlarge it.
+def lsp_workspace_root : IO String :=
+    do let! configured := prim_env_get "OURO_ROOT";
+       match configured with
+       | Nothing => io_pure String ""
+       | Just path =>
+           do let! kind := prim_fs_kind path;
+              match eq_nat kind (S (S Z)) with
+              | False => io_pure String ""
+              | True => prim_fs_realpath path
+              end
+       end
+
+def lsp_existing_file (root : String) (path : String) : IO (Maybe String) :=
+    match str_null root with
+    | True => io_pure (Maybe String) (Nothing String)
+    | False =>
+        do let! kind := prim_fs_kind path;
+           match eq_nat kind (S Z) with
+           | False => io_pure (Maybe String) (Nothing String)
+           | True =>
+               do let! resolved := prim_fs_realpath path;
+                  match andb (notb (str_null resolved))
+                    (path_under root resolved) with
+                  | True => io_pure (Maybe String) (Just String resolved)
+                  | False => io_pure (Maybe String) (Nothing String)
+                  end
+           end
+    end;
+
+-- Unsaved new documents need not exist yet.  Their existing parent is
+-- canonicalized, while existing files also reject final-component links and
+-- reparse points through prim_fs_kind.
+def lsp_document_path (root : String) (uri : String) : IO (Maybe String) :=
+    match uri_file_path uri with
+    | Nothing => io_pure (Maybe String) (Nothing String)
+    | Just path =>
+        do let! kind := prim_fs_kind path;
+           match eq_nat kind (S Z) with
+           | True => lsp_existing_file root path
+           | False =>
+               match eq_nat kind Z with
+               | False => io_pure (Maybe String) (Nothing String)
+               | True =>
+                   do let! parent := prim_fs_realpath (path_dirname path);
+                      match andb (notb (str_null parent))
+                        (path_under root parent) with
+                      | True => io_pure (Maybe String)
+                          (Just String (path_normalize path))
+                      | False => io_pure (Maybe String) (Nothing String)
+                      end
+               end
+           end
+    end;
+
+-- Imports are relative to their owning document.  Absolute spellings are not
+-- portable workspace dependencies, and every resolved target must be a
+-- canonical regular file below the authorized root.
+def lsp_import_path (root : String) (origin : String) (spelling : String)
+    : IO (Maybe String) :=
+    match orb (str_null spelling) (path_is_abs spelling) with
+    | True => io_pure (Maybe String) (Nothing String)
+    | False => lsp_existing_file root (path_resolve_from_file origin spelling)
+    end;
+
+def lsp_scratch (root : String) : IO String :=
+    let requested : String := fs_child root "_build" in
+    do let! kind := prim_fs_kind requested;
+       match eq_nat kind (S (S Z)) with
+       | False => io_pure String ""
+       | True =>
+           do let! dir := prim_fs_realpath requested;
+              match andb (notb (str_null dir)) (path_under root dir) with
+              | False => io_pure String ""
+              | True =>
+                  do let! scratch := prim_fs_temp_file_in dir;
+                     match str_null scratch with
+                     | True => io_pure String ""
+                     | False =>
+                         do let! resolved := prim_fs_realpath scratch;
+                            match andb (notb (str_null resolved))
+                              (path_under dir resolved) with
+                            | True => io_pure String resolved
+                            | False =>
+                                do fs_remove scratch;
+                                   io_pure String ""
+                            end
+                     end
+              end
+       end
+
+-- Diagnostics invoke the shipped checker after workspace path authorization.
+def lsp_publish (root : String) (uri : String) : IO Unit :=
+    do let! authorized := lsp_document_path root uri;
+       match authorized with
+       | Nothing =>
+           lsp_send (rpc_notify "textDocument/publishDiagnostics"
+             (publish_params uri (Nil Json)))
+       | Just path =>
+           do let! result := native_sibling_run lsp_check_process_limits "coil.exe" (native_sibling_check_args path);
+              lsp_send (rpc_notify "textDocument/publishDiagnostics"
+                (publish_params uri (lsp_process_diagnostics (uri_to_path uri) result)))
+       end
+
+def lsp_rewrite_line (root : String) (origin : String) (line : String)
+    : IO String :=
+    match str_strip_prefix (str_trim line) "import \"" with
+    | Nothing => io_pure String line
+    | Just rest =>
+        do let! safe := lsp_import_path root origin (str_before rest "\"");
+           match safe with
+           | Nothing => io_pure String
+               "import \"__ouro_lsp_rejected_import__.ouro\";"
+           | Just path =>
+               io_pure String
+                 (str_cat4 "import \"" "../" (path_relative root path) "\";")
+           end
+    end
+
+def lsp_rewrite_lines (root : String) (origin : String) : List String -> IO (List String) :=
+  fix lsp_rewrite_lines (lines : List String)
+      : IO (List String) :=
+    match lines with
+    | Nil => io_pure (List String) (Nil String)
+    | Cons line rest =>
+        do let! rewritten := lsp_rewrite_line root origin line;
+           let! more := lsp_rewrite_lines rest;
+           io_pure (List String) (Cons String rewritten more)
+    end;
+
+def lsp_rewrite_imports (root : String) (origin : String) (text : String)
+    : IO String :=
+    do let! lines := lsp_rewrite_lines root origin (str_lines text);
+       io_pure String (str_join "\n" lines)
+
+def lsp_write (path : String) (text : String) : IO Bool :=
+    do let! written := fs_write_checked path text;
+       match written with
+       | Left e =>
+           do eprintln (str_cat3 path ": " (fs_error_message e));
+              io_pure Bool False
+       | Right _ => io_pure Bool True
+       end
+
+def lsp_publish_buf_run (uri : String) (text : String) (scratch : String) : IO Unit :=
+    do let! wrote := lsp_write scratch text;
+       match wrote with
+       | False =>
+           do fs_remove scratch;
+              lsp_send (rpc_notify "textDocument/publishDiagnostics"
+                (publish_params uri (Nil Json)))
+       | True =>
+           do let! result := native_sibling_run lsp_check_process_limits "coil.exe" (native_sibling_check_args scratch);
+              fs_remove scratch;
+              lsp_send (rpc_notify "textDocument/publishDiagnostics"
+                (publish_params uri (lsp_process_diagnostics scratch result)))
+       end
+
+def lsp_publish_buf (root : String) (uri : String) (origin : String)
+    (text : String) : IO Unit :=
+    do let! scratch := lsp_scratch root;
+       match str_null scratch with
+       | True =>
+           lsp_send (rpc_notify "textDocument/publishDiagnostics"
+             (publish_params uri (Nil Json)))
+       | False =>
+           do let! rewritten := lsp_rewrite_imports root origin text;
+              lsp_publish_buf_run uri rewritten scratch
+       end
+
+def lsp_clear (uri : String) : IO Unit :=
+    lsp_send (rpc_notify "textDocument/publishDiagnostics"
+      (publish_params uri (Nil Json)));
+
+-- The symbol index of a document: its own declarations plus those of the files
+-- it imports, transitively. Rebuilt per request rather than cached, because a
+-- cache would have to be invalidated by edits to files the client never opened.
+def lsp_index_fuel : Nat := mul 64 64;
+
+def lsp_read_text (path : String) : IO String :=
+    do let! loaded := fs_read_checked path;
+       match loaded with
+       | Left e =>
+           match e with
+           | FsMissing _ => io_pure String ""
+           | FsEmptyPath => io_pure String ""
+           | FsExpectedFile _ => io_pure String ""
+           | FsExpectedDirectory _ => io_pure String ""
+           | FsOperationFailed _ _ =>
+               do eprintln (str_cat3 path ": " (fs_error_message e));
+                  io_pure String ""
+           end
+       | Right text => io_pure String text
+       end
+
+def lsp_import_paths (root : String) (origin : String) : List String -> IO (List String) :=
+  fix lsp_import_paths
+      (spellings : List String) : IO (List String) :=
+    match spellings with
+    | Nil => io_pure (List String) (Nil String)
+    | Cons spelling rest =>
+        do let! safe := lsp_import_path root origin spelling;
+           let! more := lsp_import_paths rest;
+           match safe with
+           | Nothing => io_pure (List String) more
+           | Just path => io_pure (List String) (Cons String path more)
+           end
+    end;
+
+def lsp_index_step (root : String) (path : String) (text : String)
+    (seen : List String) (pending : List String)
+    : IO (Pair (List Sym) (List String)) :=
+    do let! authorized := lsp_import_paths root path (imports_of text);
+       let more : List String :=
+         filter String (fun (p : String) => notb (str_set_mem p seen))
+           authorized in
+       io_pure (Pair (List Sym) (List String))
+         (MkPair (List Sym) (List String) (syms_of_module path text)
+           (append String pending more))
+
+def lsp_index_go : Nat -> String -> List Sym -> List String -> List String
+    -> IO (List Sym) :=
+  fix lsp_index_go (fuel : Nat) (root : String) (acc : List Sym)
+      (seen : List String) (pending : List String) : IO (List Sym) :=
+    match fuel with
+    | Z => io_pure (List Sym) acc
+    | S fuel2 =>
+        match pending with
+        | Nil => io_pure (List Sym) acc
+        | Cons path rest =>
+            match str_set_mem path seen with
+            | True => lsp_index_go fuel2 root acc seen rest
+            | False =>
+                do let! text := lsp_read_text path;
+                   let! step := lsp_index_step root path text
+                           (Cons String path seen) rest;
+                   match step with
+                   | MkPair syms pending2 =>
+                       lsp_index_go fuel2 root (append Sym acc syms)
+                         (Cons String path seen) pending2
+                   end
+            end
+        end
+    end;
+
+-- The open buffer is the source of truth for the document itself, so hover
+-- works on unsaved edits; imported files are read from disk.
+def lsp_index (st : Lsp) (uri : String) : IO (List Sym) :=
+    do let! authorized := lsp_document_path (lsp_root st) uri;
+       match authorized with
+       | Nothing => io_pure (List Sym) (Nil Sym)
+       | Just path =>
+           do let! step := lsp_index_step (lsp_root st) path
+                (lsp_text st uri) ([path] : List String) (Nil String);
+              match step with
+              | MkPair syms pending =>
+                  lsp_index_go lsp_index_fuel (lsp_root st) syms
+                    ([path] : List String) pending
+              end
+       end
+
+def lsp_word_of (st : Lsp) (msg : Json) : String :=
+    let params : Json := rpc_params msg in
+    word_at (lsp_text st (lsp_doc_uri params)) (lsp_pos_line params)
+      (lsp_pos_char params);
+
+def lsp_prefix_of (st : Lsp) (msg : Json) : String :=
+    let params : Json := rpc_params msg in
+    prefix_at (lsp_text st (lsp_doc_uri params)) (lsp_pos_line params)
+      (lsp_pos_char params);
+
+def lsp_store_document (st : Lsp) (uri : String) (text : String)
+    : IO (Pair Lsp Bool) :=
+    do let! authorized := lsp_document_path (lsp_root st) uri;
+       match authorized with
+       | Nothing =>
+           do lsp_clear uri;
+              lsp_keep st
+       | Just origin =>
+           match lsp_put_checked st uri text with
+           | Nothing =>
+               do lsp_clear uri;
+                  lsp_keep st
+           | Just st2 =>
+               do lsp_publish_buf (lsp_root st) uri origin text;
+                  lsp_keep st2
+           end
+       end
+
+def on_did_open (st : Lsp) (msg : Json) : IO (Pair Lsp Bool) :=
+    let params : Json := rpc_params msg in
+    let uri : String := lsp_doc_uri params in
+    let text : String :=
+      json_field_str (json_field params "textDocument") "text" "" in
+    lsp_store_document st uri text
+
+-- Full sync: the first change carries the whole document.
+def on_did_change (st : Lsp) (msg : Json) : IO (Pair Lsp Bool) :=
+    let params : Json := rpc_params msg in
+    let uri : String := lsp_doc_uri params in
+    let changes : List Json := json_items (json_field params "contentChanges") in
+    let text : String :=
+      json_field_str (head Json JNull changes) "text" (lsp_text st uri) in
+    match map_has String uri (lsp_docs st) with
+    | False => lsp_keep st
+    | True => lsp_store_document st uri text
+    end
+
+def on_did_save (st : Lsp) (msg : Json) : IO (Pair Lsp Bool) :=
+    let uri : String := lsp_doc_uri (rpc_params msg) in
+    do lsp_publish (lsp_root st) uri;
+       lsp_keep st
+
+def on_did_close (st : Lsp) (msg : Json) : IO (Pair Lsp Bool) :=
+    let uri : String := lsp_doc_uri (rpc_params msg) in
+    do lsp_clear uri;
+       lsp_keep (lsp_drop st uri)
+
+def on_sym (st : Lsp) (msg : Json) (ok : Sym -> Json) : IO (Pair Lsp Bool) :=
+    do let! syms := lsp_index st (lsp_doc_uri (rpc_params msg));
+       match sym_find (lsp_word_of st msg) syms with
+       | Nothing => lsp_reply msg JNull
+       | Just s => lsp_reply msg (ok s)
+       end;
+       lsp_keep st
+
+def on_completion (st : Lsp) (msg : Json) : IO (Pair Lsp Bool) :=
+    do let! syms := lsp_index st (lsp_doc_uri (rpc_params msg));
+       lsp_reply msg (completion_result (lsp_prefix_of st msg) syms);
+       lsp_keep st
+
+-- Formatting delegates to the sibling formatter (see tools/lsp_model.ouro for
+-- why it is not linked in). The buffer is written to a scratch file first, so
+-- unsaved edits are formatted and no import of the document is needed.
+def lsp_fmt_run (st : Lsp) (msg : Json) (text : String) (scratch : String) : IO (Pair Lsp Bool) :=
+    do let! wrote := lsp_write scratch text;
+       match wrote with
+       | False =>
+           do fs_remove scratch;
+              lsp_reply msg JNull;
+              lsp_keep st
+       | True =>
+           do let! result := native_sibling_run lsp_format_process_limits "ouro-fmt.exe" (native_sibling_format_args scratch);
+              fs_remove scratch;
+              match result with
+              | Left error => eprintln (str_concat "ouro-lsp: " (native_sibling_error_message error))
+              | Right _ => io_unit
+              end;
+              lsp_reply msg (lsp_process_format text result);
+              lsp_keep st
+       end
+
+def on_formatting (st : Lsp) (msg : Json) : IO (Pair Lsp Bool) :=
+    let uri : String := lsp_doc_uri (rpc_params msg) in
+    do let! authorized := lsp_document_path (lsp_root st) uri;
+       match authorized with
+       | Nothing =>
+           do lsp_reply msg JNull;
+              lsp_keep st
+       | Just _ =>
+           do let! scratch := lsp_scratch (lsp_root st);
+              match str_null scratch with
+              | True =>
+                  do lsp_reply msg JNull;
+                     lsp_keep st
+              | False => lsp_fmt_run st msg (lsp_text st uri) scratch
+              end
+       end
+
+def on_document_symbol (st : Lsp) (msg : Json) : IO (Pair Lsp Bool) :=
+    let uri : String := lsp_doc_uri (rpc_params msg) in
+    do let! authorized := lsp_document_path (lsp_root st) uri;
+       match authorized with
+       | Nothing =>
+           do lsp_reply msg (JArr (Nil Json));
+              lsp_keep st
+       | Just path =>
+           do let! syms := lsp_index st uri;
+              lsp_reply msg (document_symbol_result path syms);
+              lsp_keep st
+       end
+
+def workspace_symbols (st : Lsp) (uris : List String)
+    (acc : List Sym) : IO (List Sym) :=
+  (fix go (remaining : List String) (symbols : List Sym) : IO (List Sym) :=
+    match remaining with
+    | Nil => io_pure (List Sym) symbols
+    | Cons uri rest =>
+      do let! more := lsp_index st uri;
+         go rest (append Sym symbols more)
+    end) uris acc;
+
+
+def on_workspace_symbol (st : Lsp) (msg : Json) : IO (Pair Lsp Bool) :=
+    let query : String := json_field_str (rpc_params msg) "query" "" in
+    let uris : List String := map_keys String (lsp_docs st) in
+    do let! syms := workspace_symbols st uris (Nil Sym);
+       lsp_reply msg (workspace_symbol_result query syms);
+       lsp_keep st
+
+def on_prepare_rename (st : Lsp) (msg : Json) : IO (Pair Lsp Bool) :=
+    let params : Json := rpc_params msg in
+    do lsp_reply msg
+         (prepare_rename_result (lsp_text st (lsp_doc_uri params))
+           (lsp_pos_line params) (lsp_pos_char params));
+       lsp_keep st
+
+def on_rename (st : Lsp) (msg : Json) : IO (Pair Lsp Bool) :=
+    let params : Json := rpc_params msg in
+    let uri : String := lsp_doc_uri params in
+    let old : String := lsp_word_of st msg in
+    let newName : String := json_field_str params "newName" "" in
+    match orb (str_null old) (str_null newName) with
+    | True =>
+        do lsp_reply msg JNull;
+           lsp_keep st
+    | False =>
+        let text : String := lsp_text st uri in
+        do lsp_reply msg (rename_result uri text (rename_text text old newName));
+           lsp_keep st
+    end;
+
+def on_watched_files (st : Lsp) (_msg : Json) : IO (Pair Lsp Bool) :=
+    do io_foreach String (lsp_publish (lsp_root st))
+         (map_keys String (lsp_docs st));
+       lsp_keep st
+
+def on_unknown (st : Lsp) (msg : Json) : IO (Pair Lsp Bool) :=
+    match rpc_is_notification msg with
+    | True => lsp_keep st
+    | False =>
+        do lsp_send (rpc_error (rpc_id msg) rpc_err_method_not_found
+                       (str_concat "unsupported method: " (rpc_method msg)));
+           lsp_keep st
+    end;
+
+-- Nested matches stay in two trees so generated C paths do not collide
+-- across one long False-arm chain. Seventeen methods still do not
+-- justify a string switch.
+def lsp_dispatch_more (st : Lsp) (msg : Json) (m : String) : IO (Pair Lsp Bool) :=
+    match str_eq m "textDocument/documentSymbol" with
+    | True => on_document_symbol st msg
+    | False =>
+        match str_eq m "workspace/symbol" with
+        | True => on_workspace_symbol st msg
+        | False =>
+            match str_eq m "textDocument/prepareRename" with
+            | True => on_prepare_rename st msg
+            | False =>
+                match str_eq m "textDocument/rename" with
+                | True => on_rename st msg
+                | False =>
+                    match str_eq m "workspace/didChangeWatchedFiles" with
+                    | True => on_watched_files st msg
+                    | False => on_unknown st msg
+                    end
+                end
+            end
+        end
+    end;
+
+def lsp_dispatch (st : Lsp) (msg : Json) : IO (Pair Lsp Bool) :=
+    let m : String := rpc_method msg in
+    match str_eq m "initialize" with
+    | True => do lsp_reply msg lsp_initialize_result;
+                 lsp_keep st
+    | False =>
+            match str_eq m "initialized" with
+        | True => lsp_keep st
+        | False =>
+            match str_eq m "shutdown" with
+            | True => do lsp_reply msg JNull;
+                         lsp_keep (lsp_shutdown st)
+            | False =>
+                match str_eq m "exit" with
+                | True => lsp_stop st
+                | False =>
+                    match str_eq m "textDocument/didOpen" with
+                    | True => on_did_open st msg
+                    | False =>
+                        match str_eq m "textDocument/didChange" with
+                        | True => on_did_change st msg
+                        | False =>
+                            match str_eq m "textDocument/didSave" with
+                            | True => on_did_save st msg
+                            | False =>
+                                match str_eq m "textDocument/didClose" with
+                                | True => on_did_close st msg
+                                | False =>
+                                    match str_eq m "textDocument/hover" with
+                                    | True => on_sym st msg hover_result
+                                    | False =>
+                                        match str_eq m "textDocument/definition" with
+                                        | True => on_sym st msg location_result
+                                        | False =>
+                                            match str_eq m "textDocument/completion" with
+                                            | True => on_completion st msg
+                                            | False =>
+                                                match str_eq m "textDocument/formatting" with
+                                                | True => on_formatting st msg
+                                                | False => lsp_dispatch_more st msg m
+                                                end
+                                            end
+                                        end
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end;
+
+-- A body that is not JSON gets the standard parse error, with a null id
+-- because there is no id to read.
+def lsp_handle_body (st : Lsp) (body : String) : IO (Pair Lsp Bool) :=
+    match parse_json body with
+    | Nothing =>
+        do lsp_send (rpc_error JNull rpc_err_parse "invalid JSON");
+           lsp_keep st
+    | Just msg => lsp_dispatch st msg
+    end;
+
+def lsp_byte_span : Nat := 256;
+def lsp_loop_fuel : Nat := mul lsp_byte_span lsp_byte_span;
+
+def lsp_loop : Nat -> Lsp -> IO Lsp :=
+  fix lsp_loop (fuel : Nat) (st : Lsp) : IO Lsp :=
+    match fuel with
+    | Z => io_pure Lsp st
+    | S fuel2 =>
+        do let! msg := lsp_read_message;
+           let! next :=
+             match msg with
+             | Nothing => lsp_stop st
+             | Just body => lsp_handle_body st body
+             end;
+           match next with
+           | MkPair st2 go =>
+               match go with
+               | True => lsp_loop fuel2 st2
+               | False => io_pure Lsp st2
+               end
+           end
+    end;
+
+-- LSP asks a server to exit 0 after a shutdown request and 1 otherwise, which
+-- is also the honest answer when the pipe closes without a shutdown.
+def main : IO Unit :=
+    do let! root := lsp_workspace_root;
+       let! st := lsp_loop lsp_loop_fuel (lsp_with_root lsp_empty root);
+       exit (match lsp_down st with | True => Z | False => S Z end)

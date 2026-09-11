@@ -1,0 +1,76 @@
+-- Structural traversals retain workflow, path and Markdown gate behavior.
+import "../tools/repo_gate/checks.ouro";
+import "../tools/repo_gate/parity_closure.ouro";
+import "../std/test.ouro";
+
+def repo_recursion_text (name : String) (source : String) (expected : String) : Test :=
+    match workflow_strip_comment source with
+    | Nothing => test_fail name "unexpected unterminated quote"
+    | Just value => assert_eq name value expected
+    end;
+
+def repo_recursion_invalid_quote (name : String) (source : String) : Test :=
+    assert_true name (match workflow_strip_comment source with
+      | Nothing => True | Just _ => False end);
+
+def repo_recursion_reasons (issues : List GateIssue) : String :=
+    str_join "\n" (map GateIssue String issue_reason issues);
+
+def repo_recursion_pure_tests : List Test :=
+    let parsed : WorkflowDoc := workflow_parse "sample.yml"
+      "name: first\njobs:\n  build:\n    name: second\n" in
+    let invalid : WorkflowDoc := workflow_parse "sample.yml"
+      "name: first\n# second\nbroken: '" in
+    let block : WorkflowDoc := workflow_parse "sample.yml"
+      "run: |\n  echo '# keep'\nnext: value" in
+    [ repo_recursion_text "empty comment scan" "" ""
+    , repo_recursion_text "whole line comment" "# discard" ""
+    , repo_recursion_text "hash without whitespace stays a value"
+        "name: value#tag # discard" "name: value#tag "
+    , repo_recursion_text "single quoted hash is retained"
+        "name: '# keep' # discard" "name: '# keep' "
+    , repo_recursion_text "double quoted hash is retained"
+        "name: \"# keep\" # discard" "name: \"# keep\" "
+    , repo_recursion_text "escaped quote keeps double quote state"
+        "name: \"a\\\"# keep\" # discard" "name: \"a\\\"# keep\" "
+    , repo_recursion_text "doubled single quote preserves literal hash"
+        "name: 'a''# keep' # discard" "name: 'a''# keep' "
+    , repo_recursion_invalid_quote "unterminated single quote is rejected" "name: 'open"
+    , repo_recursion_invalid_quote "unterminated double quote is rejected" "name: \"open"
+    , assert_eq "workflow traversal retains field order and parent paths"
+        (str_join "|" (map WorkflowEntry String workflow_entry_path (workflow_doc_entries parsed)))
+        "name|jobs|jobs/build|jobs/build/name"
+    , assert_true "supported workflow remains clean" (nullb GateIssue (workflow_doc_issues parsed))
+    , assert_eq "workflow traversal retains one-based failure line"
+        (repo_recursion_reasons (workflow_doc_issues invalid)) "unterminated YAML quote at line 3"
+    , assert_eq "block scalar traversal preserves body and resumes fields"
+        (str_join "\n" (map WorkflowEntry String workflow_entry_value (workflow_doc_entries block)))
+        "|\necho '# keep'\nvalue"
+    , assert_eq "empty duplicate scan" (str_join "," (control_duplicate_paths [])) ""
+    , assert_eq "duplicate scan retains every repeated occurrence"
+        (str_join "," (control_duplicate_paths ["b", "a", "a", "c", "b", "b"])) "a,b,b"
+    , assert_eq "duplicate scan compares its initial previous path"
+        (str_join "," (control_duplicate_paths_go (Just String "a") ["a", "b", "b"])) "a,b"
+    ];
+
+-- @entry main
+def main : IO Unit :=
+    (do let! empty := markdown_line_link_issues "." "docs/ci.md" "" [];
+       let! external := markdown_line_link_issues "." "docs/ci.md"
+         "[one](https://example.invalid/a) [two](#local)" [];
+       let! local := markdown_line_link_issues "." "docs/ci.md"
+         "[root](../README.md) [guide](tooling.md)" [];
+       let! missing := markdown_line_link_issues "." "docs/ci.md"
+         "[one](missing-recursion-1.md) [two](missing-recursion-2.md)"
+         [gate_issue "existing issue" "docs/ci.md"];
+       let! escape := markdown_line_link_issues "." "docs/ci.md" "[escape](../../outside)" [];
+       test_run (append Test repo_recursion_pure_tests
+         [ assert_true "empty Markdown line remains clean" (nullb GateIssue empty)
+         , assert_true "external and anchor links remain clean" (nullb GateIssue external)
+         , assert_true "multiple existing local links remain clean" (nullb GateIssue local)
+         , assert_eq "all broken links and prior issues are retained"
+             (repo_recursion_reasons missing)
+             "existing issue\nbroken Markdown link: missing-recursion-1.md\nbroken Markdown link: missing-recursion-2.md"
+         , assert_eq "escaping local path stays blocking"
+             (repo_recursion_reasons escape) "relative Markdown link escapes repository: ../../outside"
+         ]));

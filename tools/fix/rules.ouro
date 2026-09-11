@@ -1,0 +1,652 @@
+-- Scope-aware rewrite rules for ouro-fix. Each rule proposes byte-span edits
+-- original source; the pipeline applies the disjoint subset and reruns to a
+-- fixpoint, so a rule only has to be locally correct and idempotent.
+
+import "basic_rules.ouro";
+import "scan.ouro";
+import "../../std/format.ouro";
+
+def fx_name_taken (seg : List FxTok) (name : String) : Bool :=
+    any FxTok (fun (t : FxTok) => fx_is_word t name) seg;
+
+-- Rename an unused binder to its discard spelling unless that name already
+-- appears in the declaration.
+def fx_rename_edit (seg : List FxTok) (name_tok : FxTok) (after : List FxTok) (l : Nat)
+    : List FxEdit :=
+    let name : String := fx_tok_text name_tok in
+    match fx_is_discard name with
+    | True => Nil FxEdit
+    | False =>
+    match fx_uses_name name after l with
+    | True => Nil FxEdit
+    | False =>
+        let fresh : String := str_concat "_" name in
+        match fx_name_taken seg fresh with
+        | True => Nil FxEdit
+        | False =>
+            fx_edit1 (MkFxEdit (fx_tok_start name_tok) (fx_tok_end name_tok) fresh
+              fx_rule_unused (fx_tok_line name_tok)
+              (str_cat3 "unused binder " (fx_quote name) (str_concat " renamed to " (fx_quote fresh))))
+        end
+    end
+    end;
+
+-- ( name : ... )
+def fx_group_binder (grp : List FxTok) : Maybe FxTok :=
+    match grp with
+    | Nil => Nothing FxTok
+    | Cons _ rest =>
+        match rest with
+        | Nil => Nothing FxTok
+        | Cons name rest2 =>
+            match rest2 with
+            | Nil => Nothing FxTok
+            | Cons colon _ =>
+                match andb (fx_is_ident name) (fx_is_word colon ":") with
+                | True => Just FxTok name
+                | False => Nothing FxTok
+                end
+            end
+        end
+    end;
+
+-- Binder tokens of a telescope paired with the tokens following their group.
+-- Bare identifiers count only for fun parameters.
+def fx_params : Nat -> Bool -> List FxTok -> List (Pair FxTok (List FxTok)) -> List (Pair FxTok (List FxTok)) :=
+  fix go (fuel : Nat) (bare : Bool) (ts : List FxTok) (acc : List (Pair FxTok (List FxTok)))
+      : List (Pair FxTok (List FxTok)) :=
+    match fuel with
+    | Z => reverse_lin (Pair FxTok (List FxTok)) acc
+    | S fuel2 =>
+        match ts with
+        | Nil => reverse_lin (Pair FxTok (List FxTok)) acc
+        | Cons t rest =>
+            match fx_is_word t "(" with
+            | True =>
+                match fx_group_go rest Z ([t] : List FxTok) with
+                | Nothing => reverse_lin (Pair FxTok (List FxTok)) acc
+                | Just grp_at =>
+                    match grp_at with
+                    | MkPair grp after =>
+                        match fx_group_binder grp with
+                        | Nothing => reverse_lin (Pair FxTok (List FxTok)) acc
+                        | Just name_tok =>
+                            go fuel2 bare after
+                              (Cons (Pair FxTok (List FxTok))
+                                (MkPair FxTok (List FxTok) name_tok after) acc)
+                        end
+                    end
+                end
+            | False =>
+                match andb bare (fx_is_ident t) with
+                | True => go fuel2 bare rest
+                    (Cons (Pair FxTok (List FxTok)) (MkPair FxTok (List FxTok) t rest) acc)
+                | False => reverse_lin (Pair FxTok (List FxTok)) acc
+                end
+            end
+        end
+    end;
+
+def fx_param_edits (seg : List FxTok) (params : List (Pair FxTok (List FxTok))) : List FxEdit :=
+    concat_map (Pair FxTok (List FxTok)) FxEdit
+      (fun (p : Pair FxTok (List FxTok)) =>
+        match p with
+        | MkPair name_tok after => fx_rename_edit seg name_tok after Z
+        end)
+      params;
+
+def fx_after_name (ts : List FxTok) : List FxTok :=
+    match ts with
+    | Nil => ts
+    | Cons _ rest => rest
+    end;
+
+-- Depth-zero tokens that end a binding statement: ; in end |
+def fx_stops_statement (c : Nat) : Bool :=
+    match eqNat c fx_c_semi with
+    | True => True
+    | False =>
+    match eqNat c fx_c_in with
+    | True => True
+    | False =>
+    match eqNat c fx_c_end with
+    | True => True
+    | False => eqNat c fx_c_bar
+    end
+    end
+    end;
+
+-- First depth-zero occurrence of a symbol with the tokens after it; gives up
+-- at statement boundaries.
+def fx_find_sym_tok (s : String) : Nat -> List FxTok -> Nat -> Maybe (Pair FxTok (List FxTok)) :=
+  fix go (fuel : Nat) (ts : List FxTok) (depth : Nat) : Maybe (Pair FxTok (List FxTok)) :=
+    match fuel with
+    | Z => Nothing (Pair FxTok (List FxTok))
+    | S fuel2 =>
+        match ts with
+        | Nil => Nothing (Pair FxTok (List FxTok))
+        | Cons t rest =>
+            let c : Nat := fx_tok_code t in
+            match eqNat c fx_c_open with
+            | True => go fuel2 rest (S depth)
+            | False =>
+            match eqNat c fx_c_close with
+            | True => match depth with
+                | Z => Nothing (Pair FxTok (List FxTok))
+                | S d2 => go fuel2 rest d2
+                end
+            | False =>
+            match depth with
+            | S _ => go fuel2 rest depth
+            | Z =>
+                match fx_is_word t s with
+                | True => Just (Pair FxTok (List FxTok)) (MkPair FxTok (List FxTok) t rest)
+                | False =>
+                    match fx_stops_statement c with
+                    | True => Nothing (Pair FxTok (List FxTok))
+                    | False => go fuel2 rest depth
+                    end
+                end
+            end
+            end
+            end
+        end
+    end;
+
+def fx_find_sym (s : String) (fuel : Nat) (ts : List FxTok) (depth : Nat) : Maybe (List FxTok) :=
+    match fx_find_sym_tok s fuel ts depth with
+    | Nothing => Nothing (List FxTok)
+    | Just found => match found with | MkPair _ after => Just (List FxTok) after end
+    end;
+
+def fx_has_effect (ts : List FxTok) : Bool :=
+    any FxTok (fun (t : FxTok) =>
+      orb (fx_is_word t "perform") (orb (fx_is_word t "?") (fx_is_word t "do"))) ts;
+
+-- let x [: T] := rhs in body with x unused: drop the binding, or rename it when
+-- the right-hand side may have effects or holes.
+def fx_let_edits (src : String) (seg : List FxTok) (t : FxTok) (rest : List FxTok) : List FxEdit :=
+    match rest with
+    | Nil => Nil FxEdit
+    | Cons name rest2 =>
+        match andb (fx_is_ident name) (notb (fx_is_discard (fx_tok_text name))) with
+        | False => Nil FxEdit
+        | True =>
+            match fx_uses_name (fx_tok_text name) rest2 (S Z) with
+            | True => Nil FxEdit
+            | False =>
+                match fx_find_sym ":=" fx_fuel_stmt rest2 Z with
+                | Nothing => Nil FxEdit
+                | Just after_assign =>
+                    match fx_body_split after_assign with
+                    | MkPair rhs stop_rest =>
+                        match stop_rest with
+                        | Nil => Nil FxEdit
+                        | Cons in_tok body =>
+                            match fx_is_word in_tok "in" with
+                            | False => Nil FxEdit
+                            | True =>
+                                match fx_has_effect rhs with
+                                | True => fx_rename_edit seg name rest2 (S Z)
+                                | False =>
+                                    fx_edit1 (fx_delete_edit src fx_rule_dead_let
+                                      (str_cat3 "unused binding " (fx_quote (str_concat "let " (fx_tok_text name))) " removed")
+                                      t in_tok (fx_maybe_head body))
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end;
+
+-- do let! x := action; ...  with x unused  ->  do action; ...
+def fx_let_bang_edits (t : FxTok) (rest : List FxTok) : List FxEdit :=
+    match rest with
+    | Nil => Nil FxEdit
+    | Cons name rest2 =>
+        match andb (fx_is_ident name) (notb (fx_is_discard (fx_tok_text name))) with
+        | False => Nil FxEdit
+        | True =>
+            match fx_uses_name (fx_tok_text name) rest2 Z with
+            | True => Nil FxEdit
+            | False =>
+                match fx_find_sym ":=" fx_fuel_stmt rest2 Z with
+                | Nothing => Nil FxEdit
+                | Just after_assign =>
+                    match after_assign with
+                    | Nil => Nil FxEdit
+                    | Cons rhs_first _ =>
+                        fx_edit1 (MkFxEdit (fx_tok_start t) (fx_tok_start rhs_first) ""
+                          fx_rule_dead_let (fx_tok_line t)
+                          (str_cat3 "unused bind " (fx_quote (str_concat "let! " (fx_tok_text name)))
+                            " reduced to a statement"))
+                    end
+                end
+            end
+        end
+    end;
+
+-- Pattern tokens up to the arrow of a match arm, and the tokens after it.
+def fx_take_pattern : Nat -> List FxTok -> List FxTok -> Maybe (Pair (List FxTok) (Pair FxTok (List FxTok))) :=
+  fix go (fuel : Nat) (ts : List FxTok) (acc : List FxTok)
+      : Maybe (Pair (List FxTok) (Pair FxTok (List FxTok))) :=
+    match fuel with
+    | Z => Nothing (Pair (List FxTok) (Pair FxTok (List FxTok)))
+    | S fuel2 =>
+        match ts with
+        | Nil => Nothing (Pair (List FxTok) (Pair FxTok (List FxTok)))
+        | Cons t rest =>
+            match fx_is_word t "=>" with
+            | True => Just (Pair (List FxTok) (Pair FxTok (List FxTok)))
+                        (MkPair (List FxTok) (Pair FxTok (List FxTok))
+                          (reverse_lin FxTok acc) (MkPair FxTok (List FxTok) t rest))
+            | False =>
+                match orb (fx_is_ident t) (fx_is_word t ",") with
+                | True => go fuel2 rest (Cons FxTok t acc)
+                | False => Nothing (Pair (List FxTok) (Pair FxTok (List FxTok)))
+                end
+            end
+        end
+    end;
+
+def fx_is_slot (ctors : List String) (t : FxTok) : Bool :=
+    andb (fx_is_ident t) (notb (fx_ctor_like ctors (fx_tok_text t)));
+
+-- Split pattern tokens into comma-separated columns.
+def fx_columns_go : List FxTok -> List FxTok -> List (List FxTok) -> List (List FxTok) :=
+  fix go (ts : List FxTok) (cur : List FxTok) (acc : List (List FxTok)) : List (List FxTok) :=
+    match ts with
+    | Nil => reverse_lin (List FxTok) (Cons (List FxTok) (reverse_lin FxTok cur) acc)
+    | Cons t rest =>
+        match fx_is_word t "," with
+        | True => go rest (Nil FxTok) (Cons (List FxTok) (reverse_lin FxTok cur) acc)
+        | False => go rest (Cons FxTok t cur) acc
+        end
+    end;
+
+def fx_columns (pat : List FxTok) : List (List FxTok) :=
+    fx_columns_go pat (Nil FxTok) (Nil (List FxTok));
+
+-- Binder slots of one column: a lone non-constructor identifier, or every
+-- non-constructor identifier after the constructor head.
+def fx_column_slots (ctors : List String) (col : List FxTok) : List FxTok :=
+    match col with
+    | Nil => Nil FxTok
+    | Cons _h rest =>
+        match rest with
+        | Nil => filter FxTok (fx_is_slot ctors) col
+        | Cons _ _ => filter FxTok (fx_is_slot ctors) rest
+        end
+    end;
+
+-- | pat => body: rename slots the body never mentions.
+def fx_arm_slot_edits (ctors : List String) (seg : List FxTok) (rest : List FxTok) : List FxEdit :=
+    match fx_take_pattern fx_fuel_small rest (Nil FxTok) with
+    | Nothing => Nil FxEdit
+    | Just found =>
+        match found with
+        | MkPair pat arrow_rest =>
+            match arrow_rest with
+            | MkPair _ body =>
+                concat_map FxTok FxEdit
+                  (fun (slot : FxTok) => fx_rename_edit seg slot body Z)
+                  (concat_map (List FxTok) FxTok (fx_column_slots ctors) (fx_columns pat))
+            end
+        end
+    end;
+
+-- bar token, pattern, arrow, body
+inductive FxArm : Type :=
+  | MkFxArm : FxTok -> List FxTok -> FxTok -> List FxTok -> FxArm;
+
+def fx_arm_bar (a : FxArm) : FxTok :=
+    match a with | MkFxArm b _ _ _ => b end;
+
+def fx_arm_pat (a : FxArm) : List FxTok :=
+    match a with | MkFxArm _ p _ _ => p end;
+
+def fx_arm_last (a : FxArm) : FxTok :=
+    match a with
+    | MkFxArm _ _ arrow body =>
+        match body with
+        | Nil => arrow
+        | Cons _ _ => fx_last_tok body
+        end
+    end;
+
+def fx_arm_body (a : FxArm) : List FxTok :=
+    match a with | MkFxArm _ _ _ b => b end;
+
+-- Tokens after the depth-zero "with" of a match; nested matches in the
+-- scrutinee abort the rule.
+def fx_find_with : Nat -> List FxTok -> Nat -> Maybe (List FxTok) :=
+  fix go (fuel : Nat) (ts : List FxTok) (depth : Nat) : Maybe (List FxTok) :=
+    match fuel with
+    | Z => Nothing (List FxTok)
+    | S fuel2 =>
+        match ts with
+        | Nil => Nothing (List FxTok)
+        | Cons t rest =>
+            let c : Nat := fx_tok_code t in
+            match eqNat c fx_c_open with
+            | True => go fuel2 rest (S depth)
+            | False =>
+            match eqNat c fx_c_close with
+            | True => match depth with
+                | Z => Nothing (List FxTok)
+                | S d2 => go fuel2 rest d2
+                end
+            | False =>
+            match depth with
+            | S _ => go fuel2 rest depth
+            | Z =>
+                match fx_is_word t "with" with
+                | True => Just (List FxTok) rest
+                | False =>
+                    match orb (eqNat c fx_c_block)
+                          (orb (eqNat c fx_c_end) (orb (eqNat c fx_c_bar) (fx_is_word t "=>"))) with
+                    | True => Nothing (List FxTok)
+                    | False => go fuel2 rest depth
+                    end
+                end
+            end
+            end
+            end
+        end
+    end;
+
+-- Arms of a match in order plus its closing "end" token.
+def fx_arms : Nat -> List FxTok -> List FxArm -> Maybe (Pair (List FxArm) FxTok) :=
+  fix go (fuel : Nat) (ts : List FxTok) (acc : List FxArm) : Maybe (Pair (List FxArm) FxTok) :=
+    match fuel with
+    | Z => Nothing (Pair (List FxArm) FxTok)
+    | S fuel2 =>
+        match ts with
+        | Nil => Nothing (Pair (List FxArm) FxTok)
+        | Cons bar rest =>
+            match fx_is_word bar "|" with
+            | False => Nothing (Pair (List FxArm) FxTok)
+            | True =>
+                match fx_take_pattern fx_fuel_small rest (Nil FxTok) with
+                | Nothing => Nothing (Pair (List FxArm) FxTok)
+                | Just found =>
+                    match found with
+                    | MkPair pat arrow_rest =>
+                        match arrow_rest with
+                        | MkPair arrow after =>
+                            match fx_body_split after with
+                            | MkPair body stop_rest =>
+                                match stop_rest with
+                                | Nil => Nothing (Pair (List FxArm) FxTok)
+                                | Cons stop _ =>
+                                    let acc2 : List FxArm :=
+                                      Cons FxArm (MkFxArm bar pat arrow body) acc in
+                                    match fx_is_word stop "end" with
+                                    | True => Just (Pair (List FxArm) FxTok)
+                                        (MkPair (List FxArm) FxTok (reverse_lin FxArm acc2) stop)
+                                    | False =>
+                                        match fx_is_word stop "|" with
+                                        | True => go fuel2 stop_rest acc2
+                                        | False => Nothing (Pair (List FxArm) FxTok)
+                                        end
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end;
+
+-- A lone binder column catches everything. Lowercase constructors from files
+-- outside the import cone would look like binders, so a catch-all must be a
+-- discard or be referenced by the arm body.
+def fx_col_general (ctors : List String) (body : List FxTok) (col : List FxTok) : Bool :=
+    match col with
+    | Nil => False
+    | Cons h rest =>
+        match rest with
+        | Cons _ _ => False
+        | Nil =>
+            match fx_is_slot ctors h with
+            | False => False
+            | True =>
+                match fx_is_discard (fx_tok_text h) with
+                | True => True
+                | False => fx_uses_name (fx_tok_text h) body Z
+                end
+            end
+        end
+    end;
+
+-- Column a covers column b: a catch-all, or the same constructor with only
+-- binder slots in a.
+def fx_col_covers (ctors : List String) (body_a : List FxTok) (a : List FxTok) (b : List FxTok) : Bool :=
+    match fx_col_general ctors body_a a with
+    | True => True
+    | False =>
+        match a with
+        | Nil => False
+        | Cons ha slots =>
+            match b with
+            | Nil => False
+            | Cons hb _ =>
+                match fx_is_ident ha with
+                | False => False
+                | True =>
+                    match str_eq (fx_tok_text ha) (fx_tok_text hb) with
+                    | False => False
+                    | True => all FxTok (fx_is_slot ctors) slots
+                    end
+                end
+            end
+        end
+    end;
+
+def fx_cols_cover (ctors : List String) (body_a : List FxTok) : List (List FxTok) -> List (List FxTok) -> Bool :=
+  fix go (xs : List (List FxTok)) (ys : List (List FxTok)) : Bool :=
+    match xs with
+    | Nil => match ys with | Nil => True | Cons _ _ => False end
+    | Cons a xrest =>
+        match ys with
+        | Nil => False
+        | Cons b yrest =>
+            match fx_col_covers ctors body_a a b with
+            | True => go xrest yrest
+            | False => False
+            end
+        end
+    end;
+
+def fx_arm_covers (ctors : List String) (a : FxArm) (b : FxArm) : Bool :=
+    fx_cols_cover ctors (fx_arm_body a) (fx_columns (fx_arm_pat a)) (fx_columns (fx_arm_pat b));
+
+def fx_pattern_text (src : String) (pat : List FxTok) : String :=
+    match pat with
+    | Nil => ""
+    | Cons _ _ => fx_toks_text src pat
+    end;
+
+-- Delete every arm covered by an earlier arm of the same match.
+def fx_arm_deletes (src : String) (ctors : List String) (end_tok : FxTok)
+    : List FxArm -> List FxArm -> List FxEdit -> List FxEdit :=
+  fix go (arms : List FxArm) (earlier : List FxArm) (acc : List FxEdit) : List FxEdit :=
+    match arms with
+    | Nil => reverse_lin FxEdit acc
+    | Cons a rest =>
+        let next : FxTok := match rest with
+          | Nil => end_tok
+          | Cons n _ => fx_arm_bar n
+          end in
+        match any FxArm (fun (e : FxArm) => fx_arm_covers ctors e a) earlier with
+        | False => go rest (Cons FxArm a earlier) acc
+        | True =>
+            go rest (Cons FxArm a earlier)
+              (Cons FxEdit (fx_delete_edit src fx_rule_arm
+                (str_cat3 "unreachable arm " (fx_quote (fx_pattern_text src (fx_arm_pat a))) " removed")
+                (fx_arm_bar a) (fx_arm_last a) (Just FxTok next)) acc)
+        end
+    end;
+
+-- match scrutinee with | arms end: remove arms an earlier arm already covers.
+def fx_match_edits (src : String) (ctors : List String) (rest : List FxTok) : List FxEdit :=
+    match fx_find_with fx_fuel_stmt rest Z with
+    | Nothing => Nil FxEdit
+    | Just after_with =>
+        match fx_arms fx_fuel_arms after_with (Nil FxArm) with
+        | Nothing => Nil FxEdit
+        | Just parsed =>
+            match parsed with
+            | MkPair arms end_tok => fx_arm_deletes src ctors end_tok arms (Nil FxArm) (Nil FxEdit)
+            end
+        end
+    end;
+
+-- Return-type colon and ":=" of a fix header, after skipping its telescope.
+def fx_fix_header : Nat -> List FxTok -> Maybe (Pair FxTok FxTok) :=
+  fix go (fuel : Nat) (ts : List FxTok) : Maybe (Pair FxTok FxTok) :=
+    match fuel with
+    | Z => Nothing (Pair FxTok FxTok)
+    | S fuel2 =>
+        match ts with
+        | Nil => Nothing (Pair FxTok FxTok)
+        | Cons t rest =>
+            match fx_is_word t "(" with
+            | True =>
+                match fx_group_go rest Z ([t] : List FxTok) with
+                | Nothing => Nothing (Pair FxTok FxTok)
+                | Just grp_at => match grp_at with | MkPair _ after => go fuel2 after end
+                end
+            | False =>
+                match fx_is_word t ":" with
+                | False => Nothing (Pair FxTok FxTok)
+                | True =>
+                    match fx_find_sym_tok ":=" fx_fuel_header rest Z with
+                    | Nothing => Nothing (Pair FxTok FxTok)
+                    | Just found =>
+                        match found with
+                        | MkPair assign _ => Just (Pair FxTok FxTok) (MkPair FxTok FxTok t assign)
+                        end
+                    end
+                end
+            end
+        end
+    end;
+
+-- First token of the declaration's right-hand side.
+def fx_def_rhs_head (seg : List FxTok) : Maybe FxTok :=
+    match fx_find_sym ":=" fx_fuel_stmt seg Z with
+    | Nothing => Nothing FxTok
+    | Just after => fx_maybe_head after
+    end;
+
+def fx_same_tok (a : FxTok) (b : FxTok) : Bool :=
+    eqNat (fx_tok_start a) (fx_tok_start b);
+
+-- def f : T := fix go (params) : R := body  with go never mentioned
+--   ->  def f : T := fun (params) => body
+-- Only the declaration head position is rewritten, where the annotation on the
+-- def keeps supplying the expected type that the fix return type provided.
+def fx_nonrec_fix_edits (seg : List FxTok) (t : FxTok) (rest : List FxTok) : List FxEdit :=
+    match rest with
+    | Nil => Nil FxEdit
+    | Cons name after_name =>
+        let head_ok : Bool := match fx_def_rhs_head seg with
+          | Nothing => False
+          | Just h => fx_same_tok h t
+          end in
+        let shape_ok : Bool := match head_ok with
+          | False => False
+          | True => andb (fx_is_ident name) (fx_is_word (fx_first_tok after_name) "(")
+          end in
+        let recursive : Bool := match shape_ok with
+          | False => True
+          | True => fx_uses_name (fx_tok_text name) after_name Z
+          end in
+        match recursive with
+        | True => Nil FxEdit
+        | False =>
+            match fx_fix_header fx_fuel_small after_name with
+            | Nothing => Nil FxEdit
+            | Just header =>
+                match header with
+                | MkPair colon assign =>
+                    let msg : String := str_cat3 "non-recursive fix " (fx_quote (fx_tok_text name))
+                      " rewritten as fun" in
+                    [ MkFxEdit (fx_tok_start t) (fx_tok_end name) "fun" fx_rule_nonrec_fix (fx_tok_line t) msg
+                    , MkFxEdit (fx_tok_start colon) (fx_tok_end assign) "=>" fx_rule_nonrec_fix
+                        (fx_tok_line colon) msg ]
+                end
+            end
+        end
+    end;
+
+def fx_binder_at (src : String) (ctors : List String) (seg : List FxTok) (c : Nat) (t : FxTok)
+    (rest : List FxTok) : List FxEdit :=
+    match eqNat c fx_c_bar with
+    | True => fx_arm_slot_edits ctors seg rest
+    | False =>
+    match eqNat c fx_c_let with
+    | True =>
+        match fx_is_word t "let" with
+        | True => fx_let_edits src seg t rest
+        | False => Nil FxEdit
+        end
+    | False =>
+    match eqNat c fx_c_block with
+    | True =>
+        match fx_is_word t "match" with
+        | True => fx_match_edits src ctors rest
+        | False => Nil FxEdit
+        end
+    | False =>
+    match eqNat c fx_c_let_bang with
+    | True => fx_let_bang_edits t rest
+    | False =>
+    match eqNat c fx_c_fun with
+    | True => fx_param_edits seg (fx_params fx_fuel_small True rest (Nil (Pair FxTok (List FxTok))))
+    | False =>
+    match eqNat c fx_c_fix with
+    | True => append FxEdit (fx_nonrec_fix_edits seg t rest)
+        (fx_param_edits seg (fx_params fx_fuel_small False (fx_after_name rest) (Nil (Pair FxTok (List FxTok)))))
+    | False =>
+    match eqNat c fx_c_def with
+    | True => fx_param_edits seg (fx_params fx_fuel_small False (fx_after_name rest) (Nil (Pair FxTok (List FxTok))))
+    | False => Nil FxEdit
+    end
+    end
+    end
+    end
+    end
+    end
+    end;
+
+def fx_binders_go (src : String) (ctors : List String) (seg : List FxTok) : List FxTok -> List FxEdit -> List FxEdit :=
+  fix go (ts : List FxTok) (acc : List FxEdit) : List FxEdit :=
+    match ts with
+    | Nil => acc
+    | Cons t rest =>
+        let c : Nat := fx_tok_code t in
+        match c with
+        | Z => go rest acc
+        | S _ => go rest (append FxEdit (fx_binder_at src ctors seg c t rest) acc)
+        end
+    end;
+
+-- Scope-aware rules run per def declaration.
+def fx_segment_rules (src : String) (ctors : List String) (seg : List FxTok) : List FxEdit :=
+    match seg with
+    | Nil => Nil FxEdit
+    | Cons t _ =>
+        match fx_is_word t "def" with
+        | True => fx_binders_go src ctors seg seg (Nil FxEdit)
+        | False => Nil FxEdit
+        end
+    end;
+
+def fx_all_rules (src : String) (ctors : List String) (ts : List FxTok) : List FxEdit :=
+    append FxEdit (fx_simple_rules src ts)
+      (concat_map (List FxTok) FxEdit (fx_segment_rules src ctors) (fx_segments ts));

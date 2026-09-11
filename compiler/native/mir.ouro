@@ -1,0 +1,210 @@
+-- Whole-program MIR validation. Code generation rechecks the public input;
+-- constructing the MirChecked wrapper by hand cannot bypass this boundary.
+import "mir_gc.ouro";
+
+def mir_spend (A : Type) : Nat -> List A -> Either MirError Nat :=
+  fix mir_spend (fuel : Nat) (items : List A) : Either MirError Nat :=
+    match items with | Nil => Right MirError Nat fuel | Cons _ rest =>
+      match fuel with | Z => Left MirError Nat MirResourceExhausted | S next => mir_spend next rest end end;
+
+def mir_count_instructions : List MirInstruction -> Nat -> Either MirError Nat :=
+  fix mir_count_instructions (instructions : List MirInstruction) (fuel : Nat) : Either MirError Nat :=
+    match instructions with | Nil => Right MirError Nat fuel | Cons instruction rest =>
+      match fuel with | Z => Left MirError Nat MirResourceExhausted | S next =>
+        match mir_spend MirValue next (mir_reads instruction) with
+        | Left err => Left MirError Nat err | Right left =>
+          let after_signature : Either MirError Nat := match instruction with
+            | MirCall _ _ target _ => match target with | MirDirect _ => Right MirError Nat left
+              | MirIndirect signature _ => match signature with | MirSignatureOf types _ => mir_spend MirType left types end end
+            | MirMove _ _ => Right MirError Nat left | MirBinaryOp _ _ _ _ => Right MirError Nat left
+            | MirCompare _ _ _ _ => Right MirError Nat left | MirConvert _ _ _ => Right MirError Nat left
+            | MirLoad _ _ _ => Right MirError Nat left | MirStore _ _ _ => Right MirError Nat left
+            | MirLoadAt _ _ _ => Right MirError Nat left | MirStoreAt _ _ _ => Right MirError Nat left
+            | MirAddress _ _ => Right MirError Nat left | MirPointerAdd _ _ _ => Right MirError Nat left
+            | MirManagedAlloc _ _ _ _ _ => Right MirError Nat left | MirManagedContext _ => Right MirError Nat left end in
+          match after_signature with | Left err => Left MirError Nat err
+          | Right available => mir_count_instructions rest available end end end end;
+
+def mir_count_blocks : List MirBlock -> Nat -> Either MirError Nat :=
+  fix mir_count_blocks (blocks : List MirBlock) (fuel : Nat) : Either MirError Nat :=
+    match blocks with | Nil => Right MirError Nat fuel | Cons block rest =>
+      match fuel with | Z => Left MirError Nat MirResourceExhausted | S next =>
+        match block with | MirBlockDef _ instructions _ => match mir_count_instructions instructions next with
+          | Left err => Left MirError Nat err | Right left => mir_count_blocks rest left end end end end;
+
+def mir_count_functions : List MirFunction -> Nat -> Either MirError Nat :=
+  fix mir_count_functions (functions : List MirFunction) (fuel : Nat) : Either MirError Nat :=
+    match functions with | Nil => Right MirError Nat fuel | Cons function rest =>
+      match fuel with | Z => Left MirError Nat MirResourceExhausted | S next =>
+        match function with | MirFunctionDef _ name args locals _ _ blocks =>
+          match mir_spend Nat next name with | Left err => Left MirError Nat err | Right a =>
+          match mir_spend MirLocal a args with | Left err => Left MirError Nat err | Right b =>
+          match mir_spend MirLocal b locals with | Left err => Left MirError Nat err | Right c =>
+          match mir_count_blocks blocks c with | Left err => Left MirError Nat err
+          | Right d => mir_count_functions rest d end end end end end end end;
+
+def mir_count_externs : List MirExtern -> Nat -> Either MirError Nat :=
+  fix mir_count_externs (externs : List MirExtern) (fuel : Nat) : Either MirError Nat :=
+    match externs with | Nil => Right MirError Nat fuel | Cons external rest =>
+      match fuel with | Z => Left MirError Nat MirResourceExhausted | S next =>
+        match external with | MirExternDef _ _ name signature => match signature with | MirSignatureOf args _ =>
+          match mir_spend Nat next name with | Left err => Left MirError Nat err | Right a =>
+          match mir_spend MirType a args with | Left err => Left MirError Nat err
+          | Right b => mir_count_externs rest b end end end end end end;
+
+def mir_count_libraries : List MirLibrary -> Nat -> Either MirError Nat :=
+  fix mir_count_libraries (libraries : List MirLibrary) (fuel : Nat) : Either MirError Nat :=
+    match libraries with | Nil => Right MirError Nat fuel | Cons library rest =>
+      match fuel with | Z => Left MirError Nat MirResourceExhausted | S next =>
+        match library with | MirLibraryDef name externs =>
+          match mir_spend Nat next name with | Left err => Left MirError Nat err | Right a =>
+          match mir_count_externs externs a with | Left err => Left MirError Nat err
+          | Right b => mir_count_libraries rest b end end end end end;
+
+def mir_count_data : List MirData -> Nat -> Either MirError Nat :=
+  fix mir_count_data (objects : List MirData) (fuel : Nat) : Either MirError Nat :=
+    match objects with | Nil => Right MirError Nat fuel | Cons object rest =>
+      match object with | MirDataDef _ _ bytes =>
+        match mir_spend Nat fuel bytes with | Left err => Left MirError Nat err
+        | Right left => mir_count_data rest left end end end;
+
+def mir_check_bounds (limits : MirLimits) (program : MirProgram) : Either MirError Unit :=
+    match limits with | MirLimitsWith nodes bytes flow =>
+      match andb (leb_nat nodes mir_limit_node_ceiling)
+          (andb (leb_nat bytes mir_limit_byte_ceiling) (leb_nat flow mir_limit_flow_ceiling)) with
+      | False => Left MirError Unit MirResourceExhausted | True =>
+        match program with | MirProgramDef functions objects libraries _ =>
+          match mir_count_functions functions nodes with | Left err => Left MirError Unit err | Right a =>
+          match mir_count_libraries libraries a with | Left err => Left MirError Unit err | Right b =>
+          match mir_spend MirData b objects with | Left err => Left MirError Unit err | Right _ =>
+          match mir_count_data objects bytes with | Left err => Left MirError Unit err
+          | Right _ => Right MirError Unit MkUnit end end end end end end end;
+
+-- Merge singleton runs to check uniqueness in O(n log n) comparisons and
+-- temporary list cells. A quadratic elem scan exhausted the previous runtime's
+-- bounded arena on an otherwise small 3072-local stack-probing fixture.
+def mir_merge_ids (make_error : Nat -> MirError) (left : List Nat) (right : List Nat)
+    : Either MirError (List Nat) :=
+    (fix go (fuel : Nat) (a : List Nat) (b : List Nat) : Either MirError (List Nat) :=
+      match a, b with
+      | Nil, Nil => Right MirError (List Nat) ([] : List Nat)
+      | Nil, Cons _ _ => Right MirError (List Nat) b
+      | Cons _ _, Nil => Right MirError (List Nat) a
+      | Cons x xs, Cons y ys => match fuel with
+        | Z => Left MirError (List Nat) MirResourceExhausted
+        | S next => match compareNat x y with
+          | EQ => Left MirError (List Nat) (make_error x)
+          | LT => mapRight MirError (List Nat) (List Nat)
+              (fun (tail : List Nat) => Cons Nat x tail) (go next xs b)
+          | GT => mapRight MirError (List Nat) (List Nat)
+              (fun (tail : List Nat) => Cons Nat y tail) (go next a ys) end end end)
+      (add (length Nat left) (length Nat right)) left right;
+
+def mir_merge_runs (make_error : Nat -> MirError) : List (List Nat) -> Either MirError (List (List Nat)) :=
+  fix mir_merge_runs (runs : List (List Nat)) : Either MirError (List (List Nat)) :=
+    match runs with | Nil => Right MirError (List (List Nat)) ([] : List (List Nat))
+    | Cons a rest => match rest with | Nil => Right MirError (List (List Nat)) ([a] : List (List Nat))
+      | Cons b tail => match mir_merge_ids make_error a b with
+        | Left err => Left MirError (List (List Nat)) err
+        | Right merged => mapRight MirError (List (List Nat)) (List (List Nat))
+            (fun (remaining : List (List Nat)) => Cons (List Nat) merged remaining) (mir_merge_runs tail) end end end;
+
+def mir_unique (make_error : Nat -> MirError) (ids : List Nat) : Either MirError Unit :=
+    (fix go (fuel : Nat) (runs : List (List Nat)) : Either MirError Unit :=
+      match runs with | Nil => Right MirError Unit MkUnit | Cons _ rest =>
+        match rest with | Nil => Right MirError Unit MkUnit | Cons _ _ =>
+          match fuel with | Z => Left MirError Unit MirResourceExhausted | S next =>
+            match mir_merge_runs make_error runs with | Left err => Left MirError Unit err
+            | Right merged => go next merged end end end end)
+      (length Nat ids) (map Nat (List Nat) (fun (id : Nat) => ([id] : List Nat)) ids);
+
+def mir_global_ids (program : MirProgram) : List Nat :=
+    match program with | MirProgramDef functions objects libraries _ =>
+      append Nat (map MirFunction Nat mir_function_id functions)
+        (append Nat (map MirData Nat mir_data_id objects)
+          (concat_map MirLibrary Nat (fun (library : MirLibrary) => match library with
+            | MirLibraryDef _ externs => map MirExtern Nat mir_extern_id externs end) libraries)) end;
+
+def mir_check_data (object : MirData) : Either MirError Unit :=
+    match object with | MirDataDef id _ bytes =>
+      mir_require (andb (ltb_nat 0 (length Nat bytes)) (all Nat (fun (byte : Nat) => ltb_nat byte 256) bytes))
+        (MirInvalidData id) end;
+
+def mir_check_libraries : List MirLibrary -> Either MirError Unit :=
+  fix mir_check_libraries (libraries : List MirLibrary) : Either MirError Unit :=
+    match libraries with | Nil => Right MirError Unit MkUnit | Cons library rest =>
+      match library with | MirLibraryDef name externs =>
+        mir_checks ([mir_require (andb (pe_name_valid name) (ltb_nat 0 (length MirExtern externs))) (MirInvalidName 0),
+          mir_require (notb (any MirLibrary (fun (other : MirLibrary) => match other with
+            | MirLibraryDef other_name _ => pe_library_equal name other_name end) rest)) (MirInvalidName 0),
+          mir_each MirExtern (fun (external : MirExtern) => match external with | MirExternDef _ id label _ =>
+            mir_require (andb (pe_name_valid label)
+              (eq_nat (length MirExtern (filter MirExtern (fun (other : MirExtern) => match other with
+                | MirExternDef _ _ other_label _ => pe_bytes_equal label other_label end) externs)) 1)) (MirInvalidName id) end) externs,
+          mir_check_libraries rest] : List (Either MirError Unit)) end end;
+
+def mir_check_function_with
+    (run_unit : (Unit -> Either MirError Unit) -> Either MirError Unit)
+    (check_flow : Nat -> Nat -> List Nat -> List Nat -> List MirBlock -> Either MirError Unit)
+    (program : MirProgram) (flow : Nat) (function : MirFunction) : Either MirError Unit :=
+    match function with | MirFunctionDef id name args remaining result entry blocks =>
+      let locals : List MirLocal := append MirLocal args remaining in
+      let ids : List Nat := map MirLocal Nat mir_local_id locals in
+      let block_ids : List Nat := map MirBlock Nat mir_block_id blocks in
+      match mir_checks ([mir_require (pe_name_valid name) (MirInvalidName id),
+        mir_unique (fun (key : Nat) => MirDuplicateLocal key) ids,
+        mir_unique (fun (key : Nat) => MirDuplicateBlock key) block_ids,
+        mir_require (mir_has entry block_ids) (MirUnknownBlock entry),
+        run_unit (fun (_ : Unit) => mir_each MirBlock (mir_check_block_types program locals id result block_ids) blocks)]
+        : List (Either MirError Unit)) with
+      | Left err => Left MirError Unit err
+      | Right _ => check_flow flow entry (map MirLocal Nat mir_local_id args) ids blocks end end;
+
+def mir_check_function (program : MirProgram) (flow : Nat) (function : MirFunction) : Either MirError Unit :=
+    mir_check_function_with (fun (work : Unit -> Either MirError Unit) => work MkUnit)
+      mir_check_declared_flow program flow function;
+
+def mir_check_entry (program : MirProgram) : Either MirError Unit :=
+    match program with | MirProgramDef functions _ _ entry => match mir_find_function entry functions with
+      | Nothing => Left MirError Unit (MirInvalidEntry entry)
+      | Just function => match function with | MirFunctionDef _ _ args _ _ _ _ =>
+        mir_require (eq_nat (length MirLocal args) 0) (MirInvalidEntry entry) end end end;
+
+-- A host may reclaim one function check's temporaries through this pure
+-- callback. Bounds, global checks and function traversal remain here.
+def mir_check_program_with
+    (check_function : MirProgram -> Nat -> MirFunction -> Either MirError Unit)
+    (limits : MirLimits) (program : MirProgram) : Either MirError Unit :=
+    match mir_check_bounds limits program with | Left err => Left MirError Unit err | Right _ =>
+      match program with | MirProgramDef functions objects libraries _ => match limits with | MirLimitsWith _ _ flow =>
+        match mir_checks ([mir_unique (fun (id : Nat) => MirDuplicateSymbol id) (mir_global_ids program),
+          mir_each Nat (fun (id : Nat) => mir_require (ltb_nat id pe_max_rva) MirResourceExhausted) (mir_global_ids program),
+          mir_each MirData mir_check_data objects, mir_check_libraries libraries,
+          mir_check_entry program, mir_each MirFunction (check_function program flow) functions]
+          : List (Either MirError Unit)) with
+        | Left err => Left MirError Unit err
+        | Right _ => Right MirError Unit MkUnit end end end end;
+
+def mir_check_program (limits : MirLimits) (program : MirProgram) : Either MirError Unit :=
+    mir_check_program_with mir_check_function limits program;
+
+def mir_validate_with
+    (check_function : MirProgram -> Nat -> MirFunction -> Either MirError Unit)
+    (limits : MirLimits) (program : MirProgram) : Either MirError MirCheckedProgram :=
+    match mir_check_program_with check_function limits program with | Left err => Left MirError MirCheckedProgram err | Right _ =>
+      match limits with | MirLimitsWith _ _ flow => match mir_gc_infer flow program with
+        | Left err => Left MirError MirCheckedProgram err
+        | Right bodies => match mir_gc_check program bodies with
+          | Left err => Left MirError MirCheckedProgram err
+          | Right _ => Right MirError MirCheckedProgram (MirChecked program) end end end end;
+
+def mir_validate (limits : MirLimits) (program : MirProgram) : Either MirError MirCheckedProgram :=
+    mir_validate_with mir_check_function limits program;
+
+def mir_annotate_calls (limits : MirLimits) (program : MirProgram) : Either MirError MirProgram :=
+    match mir_check_program limits program with | Left err => Left MirError MirProgram err | Right _ =>
+      match limits with | MirLimitsWith _ _ flow => match mir_gc_infer flow program with
+        | Left err => Left MirError MirProgram err
+        | Right bodies => let annotated : MirProgram := mir_gc_annotate program bodies in
+          match mir_gc_check annotated bodies with | Left err => Left MirError MirProgram err
+          | Right _ => Right MirError MirProgram annotated end end end end;

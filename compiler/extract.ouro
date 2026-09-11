@@ -1,0 +1,400 @@
+-- Extraction lowers checked CoreTerm to JsIR without adding trust; impossible cases remain explicit JErr values.
+-- Binder and global ids are preserved so C symbol names stay deterministic across rebuilds.
+
+-- @entry extract_term
+
+import "../std/data.ouro";
+import "base.ouro";
+import "core.ouro";
+import "erasure.ouro";
+import "jsir.ouro";
+
+-- CaseInfo/CoreTerm come from core.ouro, JsIR from jsir.ouro.
+-- Type-argument erasure lives in erasure.ouro so native lowering can
+-- import it without the JsIR printer cone.
+
+-- @bound(nodes <= 11)
+-- @bound(depth <= 6)
+-- @bound(allocs <= 5)
+-- @bound(stack <= 3)
+-- @bound(steps <= 5)
+-- @bound(cyclo <= 4)
+-- @minimal
+def next_name (n : Nat) : Nat := S n;
+
+-- Constructor parameters can be ordinary index values (not only terms whose
+-- type is Type). CConstruct carries the inductive parameter count, so erase
+-- exactly that prefix before retaining the constructor's runtime fields.
+def ctor_params_remaining : CoreTerm -> Nat :=
+  fix ctor_params_remaining (t : CoreTerm) : Nat :=
+    match t with
+    | CConstruct _ _ nparams => nparams
+    | CApp f _ =>
+        match ctor_params_remaining f with
+        | Z => Z
+        | S remaining => remaining
+        end
+    | CRel _ => Z
+    | CSort _ => Z
+    | CPi _ _ => Z
+    | CLam _ _ => Z
+    | CLetIn _ _ _ => Z
+    | CConst _ => Z
+    | CInd _ => Z
+    | CStrBytes _ _ => Z
+    | CStrLit _ _ => Z
+    | CCase _ _ _ _ => Z
+    | CFix _ _ _ _ _ => Z
+    end;
+
+inductive LamView : Type :=
+  | NotLam : LamView
+  | IsLam : CoreTerm -> CoreTerm -> LamView;
+
+def view_lam (t : CoreTerm) : LamView :=
+    match t with
+    | CLam ann body => IsLam ann body
+    | CRel _ => NotLam
+    | CSort _ => NotLam
+    | CPi _ _ => NotLam
+    | CApp _ _ => NotLam
+    | CLetIn _ _ _ => NotLam
+    | CConst _ => NotLam
+    | CInd _ => NotLam
+    | CConstruct _ _ _ => NotLam
+    | CStrBytes _ _ => NotLam
+    | CStrLit _ _ => NotLam
+    | CCase _ _ _ _ => NotLam
+    | CFix _ _ _ _ _ => NotLam
+    end;
+
+-- Fuel-bounded extract. CFix: bind self at Rel0; peel arity CLams as JLams.
+-- @bound(nodes <= 831)
+-- @bound(depth <= 57)
+-- @bound(allocs <= 342)
+-- @bound(stack <= 20)
+-- @bound(steps <= 382)
+-- @bound(cyclo <= 91)
+-- Keep the structurally decreasing fuel before invariant type-global names.
+def extract_fuel_with : Nat -> List Nat -> Nat -> List BEntry -> CoreTerm -> JsIR :=
+  fix extract_fuel_with (fuel : Nat) (type_globals : List Nat) (ns : Nat)
+      (ctx : List BEntry) (t : CoreTerm) : JsIR :=
+    match fuel with
+    | Z => JErr Z
+    | S fuel' =>
+        match t with
+        | CRel i =>
+            match nth_b ctx i with
+            | Nothing => JErr (S Z)
+            | Just b =>
+                match b with
+                | MkB name erased =>
+                    match erased with
+                    | True => JErr (S (S Z))
+                    | False => JVar name
+                    end
+                end
+            end
+        | CSort _ => JErr (3)
+        | CPi _ _ => JErr (4)
+        | CInd _ => JErr (5)
+        | CConst n => JGlob n
+        | CStrLit n _ => JStr n
+        | CStrBytes bytes _ => JStrBytes bytes
+        | CConstruct i j _ => JCtor i j (Nil JsIR)
+        | CLam ann body =>
+            match is_sort_ann ann with
+            | True =>
+                extract_fuel_with fuel' type_globals ns
+                  (Cons BEntry (MkB ns True) ctx) body
+            | False =>
+                JLam ns
+                  (extract_fuel_with fuel' type_globals (next_name ns)
+                    (Cons BEntry (MkB ns False) ctx) body)
+            end
+        | CApp f a =>
+            match ctor_params_remaining f with
+            | S _ => extract_fuel_with fuel' type_globals ns ctx f
+            | Z =>
+                match is_type_arg_ctx_with type_globals a ctx with
+                | True => extract_fuel_with fuel' type_globals ns ctx f
+                | False =>
+                    JApp (extract_fuel_with fuel' type_globals ns ctx f)
+                      (extract_fuel_with fuel' type_globals ns ctx a)
+                end
+            end
+        | CLetIn v ty body =>
+            match is_sort_ann ty with
+            | True =>
+                extract_fuel_with fuel' type_globals ns
+                  (Cons BEntry (MkB ns True) ctx) body
+            | False =>
+                JLet ns
+                  (extract_fuel_with fuel' type_globals (next_name ns) ctx v)
+                  (extract_fuel_with fuel' type_globals (next_name ns)
+                    (Cons BEntry (MkB ns False) ctx) body)
+            end
+        | CCase ci _p s bs =>
+            -- Arities: leading JLams are ctor args (printer).
+            match ci with
+            | MkCaseInfo _ind _np arities =>
+                JSwitch (extract_fuel_with fuel' type_globals ns ctx s) arities
+                  ((fix go (xs : List CoreTerm) : List JsIR :=
+                      match xs with
+                      | Nil => Nil JsIR
+                      | Cons b xs' =>
+                          Cons JsIR
+                            (extract_fuel_with fuel' type_globals ns ctx b)
+                            (go xs')
+                      end) bs)
+            end
+        | CFix _name _ra arity _ty body =>
+            -- Binder ids come from ns, never from the interned name: ns only
+            -- grows as the walk enters a binder, so an id can never repeat
+            -- inside its own scope. Naming the self binder after the fix (and
+            -- its params after S name) instead assumed interning order matched
+            -- binder order, and a nested fix then reused an outer binder's id,
+            -- which print_c resolves to the inner one.
+            let ctx1 : List BEntry := Cons BEntry (MkB ns False) ctx in
+            let ns0 : Nat := next_name ns in
+            (fix peel (peel_fuel : Nat) (remaining : Nat) (term : CoreTerm)
+                  (peel_ctx : List BEntry) (peel_ns : Nat)
+                  (params : List Nat) : JsIR :=
+                match peel_fuel with
+                | Z =>
+                    JFix ns (reverse Nat params)
+                      (extract_fuel_with fuel' type_globals peel_ns peel_ctx term)
+                | S peel_fuel' =>
+                    match remaining with
+                    | Z =>
+                        JFix ns (reverse Nat params)
+                          (extract_fuel_with fuel' type_globals peel_ns peel_ctx term)
+                    | S remaining' =>
+                        match view_lam term with
+                        | NotLam =>
+                            JFix ns (reverse Nat params)
+                              (extract_fuel_with fuel' type_globals peel_ns peel_ctx term)
+                        | IsLam ann body2 =>
+                            match is_sort_ann ann with
+                            | True =>
+                                peel peel_fuel' remaining' body2
+                                  (Cons BEntry (MkB peel_ns True) peel_ctx)
+                                  (next_name peel_ns) params
+                            | False =>
+                                peel peel_fuel' remaining' body2
+                                  (Cons BEntry (MkB peel_ns False) peel_ctx)
+                                  (next_name peel_ns)
+                                  (Cons Nat peel_ns params)
+                            end
+                        end
+                    end
+                end) fuel' arity body ctx1 ns0 (Nil Nat)
+        end
+    end;
+
+-- Type-error IR codes produced above: 3=CSort, 4=CPi, 5=CInd.
+def err_csort : Nat := 3;
+def err_cpi : Nat := S err_csort;
+def err_cind : Nat := S err_cpi;
+
+def is_type_ir : JsIR -> Bool :=
+  fix is_type_ir (j : JsIR) : Bool :=
+    match j with
+    | JErr n =>
+        orb (eqNat n err_csort)
+          (orb (eqNat n err_cpi) (eqNat n err_cind))
+    | JApp f _ => is_type_ir f
+    | JVar _ => False
+    | JGlob _ => False
+    | JLam _ _ => False
+    | JCtor _ _ _ => False
+    | JSwitch _ _ _ => False
+    | JFix _ _ _ => False
+    | JLet _ _ _ => False
+    | JStr _ => False
+    | JStrBytes _ => False
+    end;
+
+def drop_type_prefix : List JsIR -> List JsIR :=
+  fix drop_type_prefix (xs : List JsIR) : List JsIR :=
+    match xs with
+    | Nil => Nil JsIR
+    | Cons h t =>
+        match is_type_ir h with
+        | True => drop_type_prefix t
+        | False => xs
+        end
+    end;
+
+-- Consume the argument spine before the growing reconstructed base.
+def rebuild_apps : List JsIR -> JsIR -> JsIR :=
+  fix rebuild_apps (args : List JsIR) (base : JsIR) : JsIR :=
+    match args with
+    | Nil => base
+    | Cons a rest => rebuild_apps rest (JApp base a)
+    end;
+
+inductive NormMode : Type :=
+  | NOne : JsIR -> NormMode
+  | NList : List JsIR -> NormMode;
+
+inductive NormVal : Type :=
+  | NVOne : JsIR -> NormVal
+  | NVList : List JsIR -> NormVal;
+
+-- Fold leftover Type apps into constructor fields and drop type-error
+-- arguments. Single fix (no mutual recursion). This is the Ouro-side
+-- replacement for packer/bootstrap Type-app stripping.
+-- @bound(nodes <= 344)
+-- @bound(depth <= 30)
+-- @bound(allocs <= 127)
+-- @bound(stack <= 16)
+-- @bound(steps <= 149)
+-- @bound(cyclo <= 56)
+def normalize_work : Nat -> NormMode -> NormVal :=
+  fix normalize_work (fuel : Nat) (m : NormMode) : NormVal :=
+    match fuel with
+    | Z =>
+        match m with
+        | NOne j => NVOne j
+        | NList xs => NVList xs
+        end
+    | S fuel' =>
+        match m with
+        | NList xs =>
+            match xs with
+            | Nil => NVList (Nil JsIR)
+            | Cons h t =>
+                match normalize_work fuel' (NOne h) with
+                | NVOne h2 =>
+                    match normalize_work fuel' (NList t) with
+                    | NVList t2 => NVList (Cons JsIR h2 t2)
+                    | NVOne _ => NVList xs
+                    end
+                | NVList _ => NVList xs
+                end
+            end
+        | NOne j =>
+            match extract_collect_apps j (Nil JsIR) with
+            | MkPair base spine =>
+                match normalize_work fuel' (NList spine) with
+                | NVList spine1 =>
+                    match base with
+                    | JCtor i t args =>
+                        match normalize_work fuel' (NList args) with
+                        | NVList args1 =>
+                            NVOne
+                              (JCtor i t
+                                (drop_type_prefix (append JsIR args1 spine1)))
+                        | NVOne _ => NVOne j
+                        end
+                    | JGlob n =>
+                        NVOne (rebuild_apps (drop_type_prefix spine1) (JGlob n))
+                    | JLam n body =>
+                        match normalize_work fuel' (NOne body) with
+                        | NVOne body2 =>
+                            NVOne
+                              (rebuild_apps (drop_type_prefix spine1)
+                                (JLam n body2))
+                        | NVList _ => NVOne j
+                        end
+                    | JLet n v body =>
+                        match normalize_work fuel' (NOne v) with
+                        | NVOne v2 =>
+                            match normalize_work fuel' (NOne body) with
+                            | NVOne body2 =>
+                                NVOne
+                                  (rebuild_apps (drop_type_prefix spine1)
+                                    (JLet n v2 body2))
+                            | NVList _ => NVOne j
+                            end
+                        | NVList _ => NVOne j
+                        end
+                    | JFix n ps body =>
+                        match normalize_work fuel' (NOne body) with
+                        | NVOne body2 =>
+                            NVOne
+                              (rebuild_apps (drop_type_prefix spine1)
+                                (JFix n ps body2))
+                        | NVList _ => NVOne j
+                        end
+                    | JSwitch s ars bs =>
+                        match normalize_work fuel' (NOne s) with
+                        | NVOne s2 =>
+                            match normalize_work fuel' (NList bs) with
+                            | NVList bs2 =>
+                                NVOne
+                                  (rebuild_apps (drop_type_prefix spine1)
+                                    (JSwitch s2 ars bs2))
+                            | NVOne _ => NVOne j
+                            end
+                        | NVList _ => NVOne j
+                        end
+                    | JVar n =>
+                        NVOne (rebuild_apps (drop_type_prefix spine1) (JVar n))
+                    | JErr n =>
+                        NVOne (rebuild_apps (drop_type_prefix spine1) (JErr n))
+                    | JStr n =>
+                        NVOne (rebuild_apps (drop_type_prefix spine1) (JStr n))
+                    | JStrBytes bytes =>
+                        NVOne (rebuild_apps (drop_type_prefix spine1) (JStrBytes bytes))
+                    | JApp _ _ =>
+                        NVOne (rebuild_apps (drop_type_prefix spine1) base)
+                    end
+                | NVOne _ => NVOne j
+                end
+            end
+        end
+    end;
+
+def normalize_ir (fuel : Nat) (j : JsIR) : JsIR :=
+    match normalize_work fuel (NOne j) with
+    | NVOne j2 => j2
+    | NVList _ => j
+    end;
+
+def extract_fuel (fuel : Nat) (ns : Nat) (ctx : List BEntry)
+    (t : CoreTerm) : JsIR :=
+  extract_fuel_with fuel (Nil Nat) ns ctx t;
+
+-- A structural budget includes every child and branch. Literal naturals are
+-- unary core trees too, so a fixed fuel1k silently truncated valid programs.
+def extract_size : CoreTerm -> Nat :=
+  fix extract_size (t : CoreTerm) : Nat :=
+    S (match t with
+    | CRel _ => Z
+    | CSort _ => Z
+    | CPi a b => add (extract_size a) (extract_size b)
+    | CLam a b => add (extract_size a) (extract_size b)
+    | CApp f a => add (extract_size f) (extract_size a)
+    | CLetIn v ty b => add (extract_size v) (add (extract_size ty) (extract_size b))
+    | CConst _ => Z
+    | CInd _ => Z
+    | CConstruct _ _ _ => Z
+    | CStrBytes _ _ => Z
+    | CStrLit _ _ => Z
+    | CCase _ p s bs =>
+        add (extract_size p) (add (extract_size s)
+          ((fix sum (xs : List CoreTerm) : Nat :=
+            match xs with
+            | Nil => Z
+            | Cons b rest => add (extract_size b) (sum rest)
+            end) bs))
+    | CFix _ _ _ ty body => add (extract_size ty) (extract_size body)
+    end);
+
+def extract_term_with (type_globals : List Nat) (t : CoreTerm) : JsIR :=
+  let size : Nat := extract_size t in
+  -- Normalization visits a node and its argument-list cell on each edge.
+  normalize_ir (S (add size size))
+    (extract_fuel_with size type_globals Z (Nil BEntry) t);
+
+-- @bound(nodes <= 24)
+-- @bound(depth <= 10)
+-- @bound(allocs <= 10)
+-- @bound(stack <= 4)
+-- @bound(steps <= 10)
+-- @bound(cyclo <= 4)
+-- @minimal
+def extract_term (t : CoreTerm) : JsIR :=
+    extract_term_with (Nil Nat) t;

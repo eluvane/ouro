@@ -1,0 +1,99 @@
+-- Fixpoint driver: lex, collect edits, apply the disjoint subset, and repeat
+-- until no rule fires. Rounds are bounded so a misbehaving rule cannot spin,
+-- and the applied edits are kept for reporting.
+
+import "rules.ouro";
+import "../fmt_pipeline.ouro";
+
+-- final text, applied edits in application order
+inductive FxOutcome : Type :=
+  | MkFxOutcome : String -> List FxEdit -> FxOutcome;
+
+def fx_outcome_text (o : FxOutcome) : String :=
+    match o with | MkFxOutcome s _ => s end;
+
+def fx_outcome_edits (o : FxOutcome) : List FxEdit :=
+    match o with | MkFxOutcome _ es => es end;
+
+def fx_round (ctors : List String) (src : String) : Pair String (List FxEdit) :=
+    let edits : List FxEdit := fx_plan_edits (fx_all_rules src ctors (fx_lex src)) in
+    MkPair String (List FxEdit) (fx_apply src edits) edits;
+
+def fx_fixpoint (ctors : List String) : Nat -> String -> List FxEdit -> FxOutcome :=
+  fix go (fuel : Nat) (src : String) (applied : List FxEdit) : FxOutcome :=
+    match fuel with
+    | Z => MkFxOutcome src applied
+    | S fuel2 =>
+        match fx_round ctors src with
+        | MkPair out edits =>
+            match edits with
+            | Nil => MkFxOutcome src applied
+            | Cons _ _ => go fuel2 out (append FxEdit applied edits)
+            end
+        end
+    end;
+
+def fx_rounds : Nat := 8;
+
+-- Constructors visible without the import cone: the file's own declarations.
+def fx_local_ctors (src : String) : List String :=
+    fx_harvest_ctors src;
+
+-- Raw bounded execution is retained for the existing rewrite goldens. It is
+-- not permission to write: production callers must use fx_prepare below.
+def fx_fix (ctors : List String) (src : String) : FxOutcome :=
+    fx_fixpoint (append String (fx_local_ctors src) ctors) fx_rounds src (Nil FxEdit);
+
+def fx_fix_string (ctors : List String) (src : String) : String :=
+    fx_outcome_text (fx_fix ctors src);
+
+inductive FxPrepareError : Type :=
+  | FxNotConverged : FxPrepareError
+  | FxFormatError : FmtError -> FxPrepareError
+  | FxFormatReopensFix : FxPrepareError;
+
+def fx_prepare_error_message (e : FxPrepareError) : String :=
+    match e with
+    | FxNotConverged => "fix refused: rewrite budget exhausted before reaching a fixpoint"
+    | FxFormatError cause => fmt_error_message cause
+    | FxFormatReopensFix => "fix refused: formatting would reopen a rewrite"
+    end;
+
+-- Use the same rule intents as fx_round; do not maintain a second list of
+-- checks or declare a fuel-exhausted result clean.
+def fx_pending (ctors : List String) (src : String) : Bool :=
+    match fx_all_rules src ctors (fx_lex src) with
+    | Nil => False
+    | Cons _ _ => True
+    end;
+
+-- ctors includes local declarations and the complete imported constructor
+-- set. No output is publishable until both stages have reached a fixpoint.
+def fx_finish (ctors : List String) (o : FxOutcome) : Either FxPrepareError FxOutcome :=
+    let text : String := fx_outcome_text o in
+    match fx_pending ctors text with
+    | True => Left FxPrepareError FxOutcome FxNotConverged
+    | False =>
+        match fmt_checked text with
+        | Left e => Left FxPrepareError FxOutcome (FxFormatError e)
+        | Right formatted =>
+            match fx_pending ctors formatted with
+            | True => Left FxPrepareError FxOutcome FxFormatReopensFix
+            | False => Right FxPrepareError FxOutcome
+                (MkFxOutcome formatted (fx_outcome_edits o))
+            end
+        end
+    end;
+
+def fx_prepare (ctors : List String) (src : String) : Either FxPrepareError FxOutcome :=
+    fx_finish (append String (fx_local_ctors src) ctors) (fx_fix ctors src);
+
+-- path:line: rule: message. Lines refer to the text the rule saw, which is the
+-- original source for first-round edits.
+def fx_report_line (path : String) (e : FxEdit) : String :=
+    str_cat3 path ":"
+      (str_cat3 (show_nat (fx_edit_line e)) ": "
+        (str_cat3 (fx_edit_rule e) ": " (fx_edit_msg e)));
+
+def fx_report (path : String) (edits : List FxEdit) : List String :=
+    map FxEdit String (fx_report_line path) edits;

@@ -1,0 +1,113 @@
+-- Trust policy over facts the import graph, the effect walk, and the taint
+-- marks already produce; it must not become a second unsound analyzer. The
+-- main runner feeds import edges (TRUST001, TRUST005); the structured drive
+-- feeds per-definition facts (TRUST002-TRUST004). Spans are caller record ids.
+
+-- @entry analyze_trust
+
+import "../../std/data.ouro";
+import "../../std/listx.ouro";
+import "../../std/natx.ouro";
+
+-- span, source trusted, target trusted, reviewed allowance on the import.
+inductive TrustEdge : Type :=
+  | MkTrustEdge : Nat -> Bool -> Bool -> Bool -> TrustEdge;
+
+-- span, definition lives in a trusted unit, effect ids it performs or calls,
+-- trusted checking entries it reaches, taint source ids it reads, reviewed
+-- allowance on the definition.
+inductive TrustDef : Type :=
+  | MkTrustDef : Nat -> Bool -> List Nat -> List Nat -> List Nat -> Bool -> TrustDef;
+
+-- Definition issues carry the span and the offending id.
+inductive TrustIssue : Type :=
+  | ITrustInfluencesKernel : Nat -> TrustIssue
+  | ITrustEffectBoundary : Nat -> Nat -> TrustIssue
+  | ITrustPrimitiveReach : Nat -> Nat -> TrustIssue
+  | ITrustTaintedProofPath : Nat -> Nat -> TrustIssue
+  | ITrustPolicyViolation : Nat -> TrustIssue;
+
+def trust_edge_span (e : TrustEdge) : Nat :=
+    match e with | MkTrustEdge span _ _ _ => span end;
+
+def trust_edge_src_trusted (e : TrustEdge) : Bool :=
+    match e with | MkTrustEdge _ src _ _ => src end;
+
+def trust_edge_dst_trusted (e : TrustEdge) : Bool :=
+    match e with | MkTrustEdge _ _ dst _ => dst end;
+
+def trust_edge_allowed (e : TrustEdge) : Bool :=
+    match e with | MkTrustEdge _ _ _ allowed => allowed end;
+
+def trust_def_span (d : TrustDef) : Nat :=
+    match d with | MkTrustDef span _ _ _ _ _ => span end;
+
+def trust_def_trusted (d : TrustDef) : Bool :=
+    match d with | MkTrustDef _ trusted _ _ _ _ => trusted end;
+
+def trust_def_effects (d : TrustDef) : List Nat :=
+    match d with | MkTrustDef _ _ effects _ _ _ => effects end;
+
+def trust_def_prims (d : TrustDef) : List Nat :=
+    match d with | MkTrustDef _ _ _ prims _ _ => prims end;
+
+def trust_def_sources (d : TrustDef) : List Nat :=
+    match d with | MkTrustDef _ _ _ _ sources _ => sources end;
+
+def trust_def_allowed (d : TrustDef) : Bool :=
+    match d with | MkTrustDef _ _ _ _ _ allowed => allowed end;
+
+def trust_issue_span (i : TrustIssue) : Nat :=
+    match i with
+    | ITrustInfluencesKernel span => span
+    | ITrustEffectBoundary span _ => span
+    | ITrustPrimitiveReach span _ => span
+    | ITrustTaintedProofPath span _ => span
+    | ITrustPolicyViolation span => span
+    end;
+
+def trust_flag (b : Bool) (i : TrustIssue) : List TrustIssue :=
+    match b with
+    | True => ([i] : List TrustIssue)
+    | False => Nil TrustIssue
+    end;
+
+-- An untrusted module importing a trusted one influences the checking path;
+-- a trusted module importing an undeclared one grows the TCB silently.
+def trust_edge_issues (e : TrustEdge) : List TrustIssue :=
+    match trust_edge_allowed e with
+    | True => Nil TrustIssue
+    | False =>
+        append TrustIssue
+          (trust_flag
+            (andb (notb (trust_edge_src_trusted e)) (trust_edge_dst_trusted e))
+            (ITrustInfluencesKernel (trust_edge_span e)))
+          (trust_flag
+            (andb (trust_edge_src_trusted e) (notb (trust_edge_dst_trusted e)))
+            (ITrustPolicyViolation (trust_edge_span e)))
+    end;
+
+-- Trusted code must stay pure and must not read tainted input; untrusted
+-- code must not reach the trusted checking entries.
+def trust_def_issues (d : TrustDef) : List TrustIssue :=
+    match trust_def_allowed d with
+    | True => Nil TrustIssue
+    | False =>
+        let span : Nat := trust_def_span d in
+        match trust_def_trusted d with
+        | True =>
+            append TrustIssue
+              (map Nat TrustIssue (fun (op : Nat) => ITrustEffectBoundary span op)
+                (trust_def_effects d))
+              (map Nat TrustIssue (fun (src : Nat) => ITrustTaintedProofPath span src)
+                (trust_def_sources d))
+        | False =>
+            map Nat TrustIssue (fun (prim : Nat) => ITrustPrimitiveReach span prim)
+              (trust_def_prims d)
+        end
+    end;
+
+def analyze_trust (edges : List TrustEdge) (defs : List TrustDef) : List TrustIssue :=
+    append TrustIssue
+      (concat_map TrustEdge TrustIssue trust_edge_issues edges)
+      (concat_map TrustDef TrustIssue trust_def_issues defs);

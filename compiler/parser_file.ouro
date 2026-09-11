@@ -1,0 +1,387 @@
+-- File parser closes the declaration stream; the driver relies on its core-mode and EOF decisions.
+
+-- @entry parse_file
+-- @export is_core_mode; @doc docs/tcb.md
+-- @export close_parse; @doc docs/tcb.md
+-- @export closed_parse_file; @doc docs/tcb.md
+-- @export parse_file; @doc docs/tcb.md
+
+import "parser_min.ouro";
+
+def parse_expr (parse : Nat -> Mode -> List Token -> Nat -> Value -> ParseResult Value)
+    (fuel : Nat) (toks : List Token) (pos : Nat) : ParseResult Expr :=
+    match parse fuel MExpr toks pos (VNat Z) with
+    | PErr p => PErr Expr p
+    | POk v toks2 pos2 =>
+        match asExpr v with
+        | Nothing => PErr Expr pos2
+        | Just e => POk Expr e toks2 pos2
+        end
+    end;
+
+def skip_optional_semi (toks : List Token) (pos : Nat) : ParseResult Unit :=
+    match is_semi (peek toks) with
+    | True =>
+        match bump toks pos with
+        | MkPair toks2 pos2 => POk Unit MkUnit toks2 pos2
+        end
+    | False => POk Unit MkUnit toks pos
+    end;
+
+def parse_params (parse : Nat -> Mode -> List Token -> Nat -> Value -> ParseResult Value)
+    (fuel : Nat) (toks : List Token) (pos : Nat) : ParseResult (List (Pair Nat Expr)) :=
+    match parse fuel MTypedBinders toks pos (VNat Z) with
+    | PErr p => PErr (List (Pair Nat Expr)) p
+    | POk v toks2 pos2 =>
+        match asListPairNatExpr v with
+        | Nothing => PErr (List (Pair Nat Expr)) pos2
+        | Just ps => POk (List (Pair Nat Expr)) ps toks2 pos2
+        end
+    end;
+
+def parse_ctors (parse : Nat -> Mode -> List Token -> Nat -> Value -> ParseResult Value)
+    : Nat -> List Token -> Nat -> Bool -> ParseResult (List (Pair Nat Expr)) :=
+  fix parse_ctors (fuel : Nat) (toks : List Token) (pos : Nat) (seen : Bool) : ParseResult (List (Pair Nat Expr)) :=
+    match fuel with
+    | Z => PErr (List (Pair Nat Expr)) pos
+    | S fuel' =>
+        match is_bar (peek toks) with
+        | False =>
+            match is_eof (peek toks) with
+            | True =>
+                match seen with
+                | False => PErr (List (Pair Nat Expr)) pos
+                | True => POk (List (Pair Nat Expr)) (Nil (Pair Nat Expr)) toks pos
+                end
+            | False => POk (List (Pair Nat Expr)) (Nil (Pair Nat Expr)) toks pos
+            end
+        | True =>
+            bindParseResult Unit (List (Pair Nat Expr)) (expect_bar toks pos)
+              (fun (_u : Unit) (toks2 : List Token) (pos2 : Nat) =>
+                bindParseResult Nat (List (Pair Nat Expr)) (expect_ident toks2 pos2)
+                  (fun (c : Nat) (toks3 : List Token) (pos3 : Nat) =>
+                    bindParseResult Unit (List (Pair Nat Expr)) (expect_colon toks3 pos3)
+                      (fun (_u2 : Unit) (toks4 : List Token) (pos4 : Nat) =>
+                        bindParseResult Expr (List (Pair Nat Expr)) (parse_expr parse fuel' toks4 pos4)
+                          (fun (ty : Expr) (toks5 : List Token) (pos5 : Nat) =>
+                            bindParseResult (List (Pair Nat Expr)) (List (Pair Nat Expr)) (parse_ctors fuel' toks5 pos5 True)
+                              (fun (cs : List (Pair Nat Expr)) (toks6 : List Token) (pos6 : Nat) =>
+                                POk (List (Pair Nat Expr)) (Cons (Pair Nat Expr) (MkPair Nat Expr c ty) cs) toks6 pos6)))))
+            end
+    end;
+
+def parse_ops (parse : Nat -> Mode -> List Token -> Nat -> Value -> ParseResult Value)
+    : Nat -> List Token -> Nat -> ParseResult (List (Pair Nat Expr)) :=
+  fix parse_ops (fuel : Nat) (toks : List Token) (pos : Nat) : ParseResult (List (Pair Nat Expr)) :=
+    match fuel with
+    | Z => PErr (List (Pair Nat Expr)) pos
+    | S fuel' =>
+        match toks with
+        | Nil => POk (List (Pair Nat Expr)) (Nil (Pair Nat Expr)) toks pos
+        | Cons t rest =>
+            match is_bar t with
+            | True =>
+                match rest with
+                | Nil => POk (List (Pair Nat Expr)) (Nil (Pair Nat Expr)) toks pos
+                | Cons t2 rest2 =>
+                    match tokenIsIdent t2 with
+                    | Nothing => POk (List (Pair Nat Expr)) (Nil (Pair Nat Expr)) toks pos
+                    | Just op =>
+                        bindParseResult Unit (List (Pair Nat Expr)) (expect_colon rest2 (S (S pos)))
+                          (fun (_u : Unit) (toks2 : List Token) (pos2 : Nat) =>
+                            bindParseResult Expr (List (Pair Nat Expr)) (parse_expr parse fuel' toks2 pos2)
+                              (fun (ty : Expr) (toks3 : List Token) (pos3 : Nat) =>
+                                bindParseResult (List (Pair Nat Expr)) (List (Pair Nat Expr)) (parse_ops fuel' toks3 pos3)
+                                  (fun (ops : List (Pair Nat Expr)) (toks4 : List Token) (pos4 : Nat) =>
+                                    POk (List (Pair Nat Expr)) (Cons (Pair Nat Expr) (MkPair Nat Expr op ty) ops) toks4 pos4)))
+                    end
+                end
+            | False =>
+                match tokenIsIdent t with
+                | Nothing => POk (List (Pair Nat Expr)) (Nil (Pair Nat Expr)) toks pos
+                | Just op =>
+                    bindParseResult Unit (List (Pair Nat Expr)) (expect_colon rest (S pos))
+                      (fun (_u : Unit) (toks2 : List Token) (pos2 : Nat) =>
+                        bindParseResult Expr (List (Pair Nat Expr)) (parse_expr parse fuel' toks2 pos2)
+                          (fun (ty : Expr) (toks3 : List Token) (pos3 : Nat) =>
+                            bindParseResult (List (Pair Nat Expr)) (List (Pair Nat Expr)) (parse_ops fuel' toks3 pos3)
+                              (fun (ops : List (Pair Nat Expr)) (toks4 : List Token) (pos4 : Nat) =>
+                                POk (List (Pair Nat Expr)) (Cons (Pair Nat Expr) (MkPair Nat Expr op ty) ops) toks4 pos4)))
+                end
+            end
+        end
+    end;
+
+def parse_representation_decl (toks : List Token) (pos : Nat) : ParseResult Decl :=
+    bindParseResult Unit Decl (expect_keyword kwRepresentation toks pos)
+      (fun (_u : Unit) (toks2 : List Token) (pos2 : Nat) =>
+        bindParseResult Nat Decl (expect_ident toks2 pos2)
+          (fun (target : Nat) (toks3 : List Token) (pos3 : Nat) =>
+            bindParseResult Unit Decl (expect_colon_eq toks3 pos3)
+              (fun (_u2 : Unit) (toks4 : List Token) (pos4 : Nat) =>
+                bindParseResult Nat Decl (expect_string toks4 pos4)
+                  (fun (key : Nat) (toks5 : List Token) (pos5 : Nat) =>
+                    bindParseResult Unit Decl (expect_tag tagSemi toks5 pos5)
+                      (fun (_u3 : Unit) (toks6 : List Token) (pos6 : Nat) =>
+                        POk Decl (DRepresentation target key) toks6 pos6)))));
+
+def parse_extern_strings : Nat -> List Token -> Nat -> ParseResult (List Nat) :=
+  fix parse_extern_strings (count : Nat) (toks : List Token) (pos : Nat)
+      : ParseResult (List Nat) :=
+    match count with
+    | Z => POk (List Nat) (Nil Nat) toks pos
+    | S remaining =>
+        bindParseResult Nat (List Nat) (expect_string toks pos)
+          (fun (value : Nat) (toks2 : List Token) (pos2 : Nat) =>
+            bindParseResult (List Nat) (List Nat)
+              (parse_extern_strings remaining toks2 pos2)
+              (fun (values : List Nat) (toks3 : List Token) (pos3 : Nat) =>
+                POk (List Nat) (Cons Nat value values) toks3 pos3))
+    end;
+
+def parse_intrinsic_value
+    (parse : Nat -> Mode -> List Token -> Nat -> Value -> ParseResult Value)
+    (fuel : Nat) (name : Nat) (ty : Expr) (toks : List Token) (pos : Nat)
+    : ParseResult Decl :=
+    bindParseResult Nat Decl (expect_string toks pos)
+      (fun (key : Nat) (toks2 : List Token) (pos2 : Nat) =>
+        match is_semi (peek toks2) with
+        | True =>
+            bindParseResult Unit Decl (expect_tag tagSemi toks2 pos2)
+              (fun (_u : Unit) (toks3 : List Token) (pos3 : Nat) =>
+                POk Decl (DIntrinsic name ty key (Nothing Expr)) toks3 pos3)
+        | False =>
+            bindParseResult Expr Decl (parse_expr parse fuel toks2 pos2)
+              (fun (specialization : Expr) (toks3 : List Token) (pos3 : Nat) =>
+                bindParseResult Unit Decl (expect_tag tagSemi toks3 pos3)
+                  (fun (_u : Unit) (toks4 : List Token) (pos4 : Nat) =>
+                    POk Decl (DIntrinsic name ty key (Just Expr specialization)) toks4 pos4))
+        end);
+
+def parse_native_decl
+    (parse : Nat -> Mode -> List Token -> Nat -> Value -> ParseResult Value)
+    (fuel : Nat) (kw : Nat) (toks : List Token) (pos : Nat) : ParseResult Decl :=
+    match orb (eqNat kw kwIntrinsic) (eqNat kw kwExtern) with
+    | False => PErr Decl pos
+    | True =>
+        bindParseResult Unit Decl (expect_keyword kw toks pos)
+          (fun (_u : Unit) (toks2 : List Token) (pos2 : Nat) =>
+            bindParseResult Nat Decl (expect_ident toks2 pos2)
+              (fun (name : Nat) (toks3 : List Token) (pos3 : Nat) =>
+                bindParseResult Unit Decl (expect_colon toks3 pos3)
+                  (fun (_u2 : Unit) (toks4 : List Token) (pos4 : Nat) =>
+                    bindParseResult Expr Decl (parse_expr parse fuel toks4 pos4)
+                      (fun (ty : Expr) (toks5 : List Token) (pos5 : Nat) =>
+                        bindParseResult Unit Decl (expect_colon_eq toks5 pos5)
+                          (fun (_u3 : Unit) (toks6 : List Token) (pos6 : Nat) =>
+                            match eqNat kw kwIntrinsic with
+                            | True => parse_intrinsic_value parse fuel name ty toks6 pos6
+                            | False =>
+                                bindParseResult (List Nat) Decl (parse_extern_strings 5 toks6 pos6)
+                                  (fun (metadata : List Nat) (toks7 : List Token) (pos7 : Nat) =>
+                                    bindParseResult Unit Decl (expect_tag tagSemi toks7 pos7)
+                                      (fun (_u4 : Unit) (toks8 : List Token) (pos8 : Nat) =>
+                                        POk Decl (DExtern name ty metadata) toks8 pos8))
+                            end)))))
+    end;
+
+-- @bound(cyclo <= 40)
+def parse_decl (parse : Nat -> Mode -> List Token -> Nat -> Value -> ParseResult Value)
+    (fuel : Nat) (toks : List Token) (pos : Nat) : ParseResult Decl :=
+    match tokenIsKeyword (peek toks) with
+    | Nothing => PErr Decl pos
+    | Just kw =>
+        match eqNat kw kwDef with
+        | True =>
+            bindParseResult Unit Decl (expect_keyword kwDef toks pos)
+              (fun (_u : Unit) (toks2 : List Token) (pos2 : Nat) =>
+                bindParseResult Nat Decl (expect_ident toks2 pos2)
+                  (fun (n : Nat) (toks3 : List Token) (pos3 : Nat) =>
+                    bindParseResult (List (Pair Nat Expr)) Decl (parse_params parse fuel toks3 pos3)
+                      (fun (ps : List (Pair Nat Expr)) (toks4 : List Token) (pos4 : Nat) =>
+                        bindParseResult Unit Decl (expect_colon toks4 pos4)
+                          (fun (_u2 : Unit) (toks5 : List Token) (pos5 : Nat) =>
+                            bindParseResult Expr Decl (parse_expr parse fuel toks5 pos5)
+                              (fun (ret : Expr) (toks6 : List Token) (pos6 : Nat) =>
+                                bindParseResult Unit Decl (expect_colon_eq toks6 pos6)
+                                  (fun (_u3 : Unit) (toks7 : List Token) (pos7 : Nat) =>
+                                    bindParseResult Expr Decl (parse_expr parse fuel toks7 pos7)
+                                      (fun (body : Expr) (toks8 : List Token) (pos8 : Nat) =>
+                                        bindParseResult Unit Decl (skip_optional_semi toks8 pos8)
+                                          (fun (_u4 : Unit) (toks9 : List Token) (pos9 : Nat) =>
+                                            POk Decl (DDef n (mk_pi_chain ps ret) (mk_typed_lam_chain ps body)) toks9 pos9))))))))
+        | False =>
+            match eqNat kw kwAxiom with
+            | True =>
+                bindParseResult Unit Decl (expect_keyword kwAxiom toks pos)
+                  (fun (_u : Unit) (toks2 : List Token) (pos2 : Nat) =>
+                    bindParseResult Nat Decl (expect_ident toks2 pos2)
+                      (fun (n : Nat) (toks3 : List Token) (pos3 : Nat) =>
+                        bindParseResult Unit Decl (expect_colon toks3 pos3)
+                          (fun (_u2 : Unit) (toks4 : List Token) (pos4 : Nat) =>
+                            bindParseResult Expr Decl (parse_expr parse fuel toks4 pos4)
+                              (fun (ty : Expr) (toks5 : List Token) (pos5 : Nat) =>
+                                bindParseResult Unit Decl (skip_optional_semi toks5 pos5)
+                                  (fun (_u3 : Unit) (toks6 : List Token) (pos6 : Nat) =>
+                                    POk Decl (DAxiom n ty) toks6 pos6)))))
+            | False =>
+                match eqNat kw kwInductive with
+                | True =>
+                    bindParseResult Unit Decl (expect_keyword kwInductive toks pos)
+                      (fun (_u : Unit) (toks2 : List Token) (pos2 : Nat) =>
+                        bindParseResult Nat Decl (expect_ident toks2 pos2)
+                          (fun (n : Nat) (toks3 : List Token) (pos3 : Nat) =>
+                            bindParseResult (List (Pair Nat Expr)) Decl (parse_params parse fuel toks3 pos3)
+                              (fun (ps : List (Pair Nat Expr)) (toks4 : List Token) (pos4 : Nat) =>
+                                bindParseResult Unit Decl (expect_colon toks4 pos4)
+                                  (fun (_u2 : Unit) (toks5 : List Token) (pos5 : Nat) =>
+                                    bindParseResult Expr Decl (parse_expr parse fuel toks5 pos5)
+                                      (fun (sort : Expr) (toks6 : List Token) (pos6 : Nat) =>
+                                        bindParseResult Unit Decl (expect_colon_eq toks6 pos6)
+                                          (fun (_u3 : Unit) (toks7 : List Token) (pos7 : Nat) =>
+                                            bindParseResult (List (Pair Nat Expr)) Decl (parse_ctors parse fuel toks7 pos7 False)
+                                              (fun (cs : List (Pair Nat Expr)) (toks8 : List Token) (pos8 : Nat) =>
+                                                bindParseResult Unit Decl (skip_optional_semi toks8 pos8)
+                                                  (fun (_u4 : Unit) (toks9 : List Token) (pos9 : Nat) =>
+                                                    POk Decl (DInductive n ps sort cs) toks9 pos9))))))))
+                | False =>
+                    match eqNat kw kwEffect with
+                    | True =>
+                        bindParseResult Unit Decl (expect_keyword kwEffect toks pos)
+                          (fun (_u : Unit) (toks2 : List Token) (pos2 : Nat) =>
+                            bindParseResult Nat Decl (expect_ident toks2 pos2)
+                              (fun (n : Nat) (toks3 : List Token) (pos3 : Nat) =>
+                                match is_colon (peek toks3) with
+                                | True =>
+                                    -- Colon sugar: effect Ask : String
+                                    -- ≡ effect Ask where | Ask : String
+                                    bindParseResult Unit Decl (expect_colon toks3 pos3)
+                                      (fun (_u2 : Unit) (toks4 : List Token) (pos4 : Nat) =>
+                                        bindParseResult Expr Decl (parse_expr parse fuel toks4 pos4)
+                                          (fun (ty : Expr) (toks5 : List Token) (pos5 : Nat) =>
+                                            bindParseResult Unit Decl (skip_optional_semi toks5 pos5)
+                                              (fun (_u3 : Unit) (toks6 : List Token) (pos6 : Nat) =>
+                                                POk Decl
+                                                  (DEffect n (Nil (Pair Nat Expr))
+                                                    (Cons (Pair Nat Expr)
+                                                      (MkPair Nat Expr n ty)
+                                                      (Nil (Pair Nat Expr))))
+                                                  toks6 pos6)))
+                                | False =>
+                                    bindParseResult Unit Decl (expect_keyword kwWhere toks3 pos3)
+                                      (fun (_u2 : Unit) (toks4 : List Token) (pos4 : Nat) =>
+                                        bindParseResult (List (Pair Nat Expr)) Decl (parse_params parse fuel toks4 pos4)
+                                          (fun (ps : List (Pair Nat Expr)) (toks5 : List Token) (pos5 : Nat) =>
+                                            bindParseResult (List (Pair Nat Expr)) Decl (parse_ops parse fuel toks5 pos5)
+                                              (fun (ops : List (Pair Nat Expr)) (toks6 : List Token) (pos6 : Nat) =>
+                                                bindParseResult Unit Decl (skip_optional_semi toks6 pos6)
+                                                  (fun (_u3 : Unit) (toks7 : List Token) (pos7 : Nat) =>
+                                                    POk Decl (DEffect n ps ops) toks7 pos7))))
+                                end))
+                    | False =>
+                        match eqNat kw kwImport with
+                        | True =>
+                            bindParseResult Unit Decl (expect_keyword kwImport toks pos)
+                              (fun (_u : Unit) (toks2 : List Token) (pos2 : Nat) =>
+                                bindParseResult Nat Decl (expect_string toks2 pos2)
+                                  (fun (s : Nat) (toks3 : List Token) (pos3 : Nat) =>
+                                    bindParseResult Unit Decl (skip_optional_semi toks3 pos3)
+                                      (fun (_u2 : Unit) (toks4 : List Token) (pos4 : Nat) =>
+                                        POk Decl (DImport s) toks4 pos4)))
+                        | False =>
+                            match eqNat kw kwRepresentation with
+                            | True => parse_representation_decl toks pos
+                            | False => parse_native_decl parse fuel kw toks pos
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end;
+
+def parse_file (parse : Nat -> Mode -> List Token -> Nat -> Value -> ParseResult Value)
+    : Nat -> List Token -> Nat -> ParseResult (List Decl) :=
+  fix parse_file (fuel : Nat) (toks : List Token) (pos : Nat) : ParseResult (List Decl) :=
+    match fuel with
+    | Z => PErr (List Decl) pos
+    | S fuel' =>
+        match is_eof (peek toks) with
+        | True => POk (List Decl) (Nil Decl) toks pos
+        | False =>
+            bindParseResult Decl (List Decl) (parse_decl parse fuel' toks pos)
+              (fun (d : Decl) (toks2 : List Token) (pos2 : Nat) =>
+                bindParseResult (List Decl) (List Decl) (parse_file fuel' toks2 pos2)
+                  (fun (ds : List Decl) (toks3 : List Token) (pos3 : Nat) =>
+                    POk (List Decl) (Cons Decl d ds) toks3 pos3))
+        end
+    end;
+
+-- Same partition as the retired C is_core_mode table (Mode tags 0..34).
+def is_core_mode (m : Mode) : Bool :=
+  match m with
+  | MExpr => True
+  | MPipe => True
+  | MPipeTail => True
+  | MPi => True
+  | MApp => True
+  | MAppTail => True
+  | MAtom => True
+  | MParen => True
+  | MFun => False
+  | MLet => False
+  | MMatch => False
+  | MFix => False
+  | MTypedBinder => True
+  | MTypedBinderGroup => True
+  | MTypedBinders => True
+  | MFunBinders => True
+  | MPattern => False
+  | MPatternVars => False
+  | MPatterns => False
+  | MMultiBranches => False
+  | MScrutList => False
+  | MKeywordAtom => True
+  | MEffectAnnotation => True
+  | MEffectRow => True
+  | MCommaList => True
+  | MListElems => True
+  | MListTail => True
+  | MIdentCommaList => True
+  | MDoExprs => False
+  | MPerform => False
+  | MDo => False
+  | MHandle => False
+  | MHandleClauses => False
+  | MPiFromApp => True
+  | MDoStmt => False
+  end;
+
+def close_parse
+  (parse_a : (Nat -> Mode -> List Token -> Nat -> Value -> ParseResult Value) ->
+      Nat -> Mode -> List Token -> Nat -> Value -> ParseResult Value)
+  (parse_b : (Nat -> Mode -> List Token -> Nat -> Value -> ParseResult Value) ->
+      Nat -> Mode -> List Token -> Nat -> Value -> ParseResult Value)
+  : Nat -> Mode -> List Token -> Nat -> Value -> ParseResult Value :=
+  fix parse (fuel : Nat) (mode : Mode) (toks : List Token) (pos : Nat)
+      (extra : Value) : ParseResult Value :=
+    match fuel with
+    | Z => PErr Value pos
+    | S remaining =>
+        let recur : Nat -> Mode -> List Token -> Nat -> Value -> ParseResult Value :=
+          fun (_requested : Nat) (next_mode : Mode) (next_toks : List Token)
+              (next_pos : Nat) (next_extra : Value) =>
+            parse remaining next_mode next_toks next_pos next_extra in
+        match is_core_mode mode with
+        | True => parse_a recur remaining mode toks pos extra
+        | False => parse_b recur remaining mode toks pos extra
+        end
+    end;
+
+def closed_parse_file
+  (parse_a : (Nat -> Mode -> List Token -> Nat -> Value -> ParseResult Value) ->
+      Nat -> Mode -> List Token -> Nat -> Value -> ParseResult Value)
+  (parse_b : (Nat -> Mode -> List Token -> Nat -> Value -> ParseResult Value) ->
+      Nat -> Mode -> List Token -> Nat -> Value -> ParseResult Value)
+  : Nat -> List Token -> Nat -> ParseResult (List Decl) :=
+  parse_file (close_parse parse_a parse_b);

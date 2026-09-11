@@ -1,0 +1,184 @@
+-- Typed probes preserve the checked raw bodies and inspect adapter-owned
+-- pages, exact cleanup order, and real collection before managed allocation.
+import "../compiler/native/managed_source.ouro";
+import "../std/runtime.ouro";
+import "native_startup_fault_calls.ouro";
+import "native_startup_fault_values.ouro";
+
+def kind_fault_names : List String :=
+    ["raw_pages_allocate", "raw_pages_release", "raw_windows_argv_open", "raw_windows_argv_at",
+      "raw_windows_argv_close", "raw_windows_wide_length", "raw_windows_utf8_to_utf16",
+      "raw_windows_utf16_to_utf8", "raw_windows_environment_get", "raw_windows_file_metadata",
+      "windows_exit_process", "managed_collect"];
+
+def kind_fault_symbols (checked : CheckedProgram) : Either NativeLowerError (List Nat) :=
+    (fix resolve (names : List String) : Either NativeLowerError (List Nat) :=
+      match names with | Nil => Right NativeLowerError (List Nat) ([] : List Nat)
+      | Cons name rest => lower_bind Nat (List Nat) (managed_source_symbol checked (prim_string_to_char_codes name))
+          (fun (id : Nat) => lower_map (List Nat) (List Nat) (Cons Nat id) (resolve rest)) end) kind_fault_names;
+
+def kind_fault_allocation_mode (mode : Nat) : Nat :=
+    match andb (leb_nat 1 mode) (leb_nat mode 4) with | True => mode | False => 0 end;
+
+def kind_fault_release_mode (mode : Nat) : Nat :=
+    match orb (eqNat mode 6) (eqNat mode 7) with | True => 11 | False => 0 end;
+
+def kind_fault_fatal (mode : Nat) : Bool :=
+    orb (andb (leb_nat 1 mode) (leb_nat mode 4)) (andb (leb_nat 6 mode) (leb_nat mode 12));
+
+def kind_fault_allocations (mode : Nat) : Nat :=
+    match andb (leb_nat 1 mode) (leb_nat mode 4) with | True => mode | False =>
+      match orb (eqNat mode 8) (eqNat mode 10) with | True => 2 | False =>
+        match orb (eqNat mode 9) (eqNat mode 11) with | True => 3 | False =>
+          match orb (eqNat mode 16) (eqNat mode 18) with | True => 0 | False =>
+            match eqNat mode 17 with | True => 12 | False => 4 end end end end end;
+
+def kind_fault_conversions (mode : Nat) : Nat :=
+    match orb (andb (leb_nat 1 mode) (leb_nat mode 2)) (orb (eqNat mode 16) (eqNat mode 18)) with
+    | True => 0 | False => match orb (eqNat mode 3) (orb (eqNat mode 8) (eqNat mode 10)) with
+      | True => 1 | False => match eqNat mode 17 with | True => 6 | False => 2 end end end;
+
+def kind_fault_queries (mode : Nat) : Nat :=
+    match orb (andb (leb_nat 1 mode) (leb_nat mode 4))
+      (orb (andb (leb_nat 8 mode) (leb_nat mode 11)) (orb (eqNat mode 16) (eqNat mode 18))) with
+    | True => 0 | False => match eqNat mode 17 with | True => 3 | False => 1 end end;
+
+def kind_fault_conversion_result (base : Nat) (mode : Nat) (original : Nat) (state : ManagedState)
+    : Either NativeLowerError ManagedResult :=
+    lower_bind ManagedResult ManagedResult
+      (startup_fault_call MirU32 original ([MirUse 0, MirUse 1, MirUse 2, MirUse 3, MirUse 4] : List MirValue) state)
+      (fun (returned : ManagedResult) => match returned with | ManagedResultOf status next =>
+        match eqNat mode 10 with
+        | True => Right NativeLowerError ManagedResult (ManagedResultOf status
+            (managed_emit (MirStore (MirUse 4) (codegen_disp 0)
+              (MirBits MirU32 (X64Words64 (X64Bytes32 255 255 255 127) codegen_zero))) next))
+        | False => match eqNat mode 11 with
+          | False => Right NativeLowerError ManagedResult (ManagedResultOf status next)
+          | True => lower_bind ManagedResult ManagedResult
+              (managed_compare MirNotEqual (MirUse 2) (managed_bits MirRawPtr 0) next)
+              (fun (tested : ManagedResult) => match tested with | ManagedResultOf fill after =>
+                managed_string_choose MirU32 fill
+                  (fun (written : ManagedState) => Right NativeLowerError ManagedResult
+                    (ManagedResultOf status (managed_emit (MirStore (MirUse 4) (codegen_disp 0) (managed_bits MirU32 0)) written)))
+                  (fun (query : ManagedState) => Right NativeLowerError ManagedResult (ManagedResultOf status query)) after end)
+          end end end);
+
+def kind_fault_conversion (base : Nat) (mode : Nat) (original : Nat) (state : ManagedState)
+    : Either NativeLowerError ManagedResult :=
+    lower_bind ManagedResult ManagedResult (startup_fault_count base 40 state)
+      (fun (counted : ManagedResult) => match counted with | ManagedResultOf attempt next =>
+        lower_bind ManagedResult ManagedResult
+          (managed_compare MirEqual attempt (managed_bits MirUSize (match eqNat mode 9 with | True => 2 | False => 1 end)) next)
+          (fun (tested : ManagedResult) => match tested with | ManagedResultOf selected after =>
+            managed_string_choose MirU32 selected
+              (fun (chosen : ManagedState) => match orb (eqNat mode 8) (eqNat mode 9) with
+                | True => startup_fault_result MirU32 1113 chosen
+                | False => kind_fault_conversion_result base mode original chosen end)
+              (kind_fault_conversion_result base mode original) after end) end);
+
+-- Failed queries poison the attribute word, proving that it is not consumed
+-- as a successful result. Successful synthetic words isolate bit precedence.
+def kind_fault_metadata (base : Nat) (mode : Nat) (original : Nat) (state : ManagedState)
+    : Either NativeLowerError ManagedResult :=
+    lower_bind ManagedResult ManagedResult (startup_fault_count base 56 state)
+      (fun (counted : ManagedResult) => match counted with | ManagedResultOf _ next =>
+        let simulated : Bool := orb (orb (eqNat mode 5) (eqNat mode 7))
+          (andb (leb_nat 12 mode) (leb_nat mode 15)) in
+        match simulated with | False => startup_fault_call MirU32 original ([MirUse 0, MirUse 1, MirUse 2] : List MirValue) next
+        | True =>
+          let attributes : Nat := match eqNat mode 14 with | True => 16 | False =>
+            match eqNat mode 15 with | True => 0 | False => add (mul 4 256) 16 end end in
+          let status : Nat := match eqNat mode 12 with | True => 87 | False =>
+            match orb (eqNat mode 5) (eqNat mode 7) with | True => 5 | False => 0 end end in
+          startup_fault_result MirU32 status
+            (managed_emit (MirStore (MirUse 2) (codegen_disp 0) (managed_bits MirU32 attributes)) next)
+        end end);
+
+def kind_fault_exit_checks (base : Nat) (mode : Nat) (state : ManagedState)
+    : Either NativeLowerError ManagedState :=
+    let allocations : Nat := kind_fault_allocations mode in
+    let releases : Nat := sub allocations (match eqNat (kind_fault_allocation_mode mode) 0 with | True => 0 | False => 1 end) in
+    lower_bind ManagedState ManagedState
+      (managed_require_equal (MirUse 0) (managed_bits MirU32 (match kind_fault_fatal mode with | True => 73 | False => 42 end)) state)
+      (fun (status : ManagedState) => lower_bind ManagedState ManagedState (startup_fault_stat base 64 0 status)
+        (fun (empty : ManagedState) => lower_bind ManagedState ManagedState (startup_fault_stat base 72 0 empty)
+          (fun (owner : ManagedState) => lower_bind ManagedState ManagedState (startup_fault_stat base 0 allocations owner)
+            (fun (allocated : ManagedState) => lower_bind ManagedState ManagedState (startup_fault_stat base 8 releases allocated)
+              (fun (released : ManagedState) => lower_bind ManagedState ManagedState (startup_fault_stat base 40 (kind_fault_conversions mode) released)
+                (fun (converted : ManagedState) => lower_bind ManagedState ManagedState (startup_fault_stat base 56 (kind_fault_queries mode) converted)
+                  (fun (queried : ManagedState) => lower_bind ManagedResult ManagedState (startup_fault_load base 96 MirUSize queried)
+                    (fun (counted : ManagedResult) => match counted with | ManagedResultOf count next =>
+                      lower_bind ManagedResult ManagedState (managed_compare MirGreater count (managed_bits MirUSize 0) next)
+                        (fun (tested : ManagedResult) => match tested with | ManagedResultOf collected after =>
+                          lower_bind ManagedState ManagedState (managed_require_equal collected (managed_bits MirU8 1) after)
+                            (fun (gc : ManagedState) => match eqNat mode 17 with
+                              | False => Right NativeLowerError ManagedState gc
+                              | True => lower_bind ManagedResult ManagedState (startup_fault_load base 104 MirU8 gc)
+                                  (fun (observed : ManagedResult) => match observed with | ManagedResultOf reclaimed final =>
+                                    managed_require_equal reclaimed (managed_bits MirU8 1) final end) end) end) end))))))));
+
+def kind_fault_arguments (index : Nat) : List MirType :=
+    match eqNat index 9 with | True => [MirRawPtr, MirUSize, MirRawPtr] | False =>
+      match eqNat index 10 with | True => [MirU32] | False =>
+        match eqNat index 11 with | True => [MirRawPtr] | False => startup_fault_arguments index end end end;
+
+def kind_fault_result_type (index : Nat) : MirType :=
+    match eqNat index 11 with | True => MirU8 | False => startup_fault_result_type index end;
+
+def kind_fault_body (base : Nat) (mode : Nat) (index : Nat) (original : Nat) (state : ManagedState)
+    : Either NativeLowerError ManagedResult :=
+    match eqNat index 0 with | True => startup_fault_allocate base (kind_fault_allocation_mode mode) original state | False =>
+      match eqNat index 1 with | True => startup_fault_release base (kind_fault_release_mode mode) original state | False =>
+        match eqNat index 6 with | True => kind_fault_conversion base mode original state | False =>
+          match eqNat index 9 with | True => kind_fault_metadata base mode original state | False =>
+            match eqNat index 11 with | True => startup_fault_collector base original state | False =>
+              startup_fault_call (kind_fault_result_type index) original (startup_fault_values (kind_fault_arguments index)) state
+            end end end end end;
+
+def kind_fault_exit_function (base : Nat) (mode : Nat) (original : Nat) : Either NativeLowerError MirFunction :=
+    lower_map ManagedState MirFunction (fun (after : ManagedState) => match managed_flow after with | LowerStateOf _ locals _ _ =>
+      MirFunctionDef (add base 10) (prim_string_to_char_codes "kind_fault") ([MirLocalDef 0 MirU32] : List MirLocal)
+        (reverse MirLocal locals) (Nothing MirType) 0
+        (lower_finish_blocks MirTrap (managed_flow
+          (managed_emit (MirCall MirMayGc (Nothing Nat) (MirDirect original) ([MirUse 0] : List MirValue)) after))) end)
+      (kind_fault_exit_checks base mode
+        (ManagedStateOf 0 ([] : List MirFunction) ([] : List MirData) ([] : List Nat) ([] : List Nat) (lower_empty_state 1)));
+
+def kind_fault_wrappers (base : Nat) (mode : Nat) (symbols : List Nat) : Either NativeLowerError (List MirFunction) :=
+    (fix build (remaining : List Nat) (index : Nat) : Either NativeLowerError (List MirFunction) :=
+      match remaining with | Nil => Right NativeLowerError (List MirFunction) ([] : List MirFunction)
+      | Cons original rest => lower_bind MirFunction (List MirFunction) (match eqNat index 10 with
+          | True => kind_fault_exit_function base mode original
+          | False => native_stdio_fixture_function (add base index) (prim_string_to_char_codes "kind_fault")
+              (startup_fault_locals (kind_fault_arguments index)) (kind_fault_result_type index)
+              (kind_fault_body base mode index original) end)
+          (fun (function : MirFunction) => lower_map (List MirFunction) (List MirFunction)
+            (Cons MirFunction function) (build rest (S index))) end) symbols 0;
+
+def native_fault_release_collect (release : Nat) (collector : Nat) (function : MirFunction) : MirFunction :=
+    match function with | MirFunctionDef id name arguments locals result entry blocks =>
+      match eqNat id release with | False => function | True =>
+        let context : Nat := S (foldr MirLocal Nat (fun (local : MirLocal) (largest : Nat) =>
+          maxNat (mir_local_id local) largest) 0 (append MirLocal arguments locals)) in
+        let status : Nat := S context in
+        let collecting : List MirInstruction :=
+          [MirManagedContext context,
+           MirCall MirMayGc (Just Nat status) (MirDirect collector) ([MirUse context] : List MirValue)] in
+        MirFunctionDef id name arguments
+          (append MirLocal locals ([MirLocalDef context MirRawPtr, MirLocalDef status MirU8] : List MirLocal))
+          result entry (map MirBlock MirBlock (fun (block : MirBlock) => match block with
+            | MirBlockDef label instructions terminator => MirBlockDef label
+                (match eqNat label entry with | False => instructions
+                  | True => append MirInstruction collecting instructions end) terminator end) blocks) end end;
+
+def native_kind_fixture (mode : Nat) (parts : ManagedProgramParts) : Either NativeLowerError MirProgram :=
+    lower_bind Unit MirProgram (lower_require (leb_nat mode 18) (LowerInvalidEntry mode)) (fun (_ : Unit) =>
+      match parts with | ManagedProgramOf checked contracts program =>
+        let base : Nat := S (foldr Nat Nat maxNat 0 (mir_global_ids program)) in
+        lower_bind (List Nat) MirProgram (kind_fault_symbols checked) (fun (symbols : List Nat) =>
+          lower_map (List MirFunction) MirProgram (fun (wrappers : List MirFunction) =>
+            match program with | MirProgramDef functions data libraries entry =>
+              MirProgramDef (append MirFunction wrappers
+                (map MirFunction MirFunction (startup_fault_function base symbols contracts) functions))
+                (Cons MirData (MirDataDef (startup_fault_counter base) True (pe_zeros 192)) data) libraries entry end)
+            (kind_fault_wrappers base mode symbols)) end);

@@ -1,0 +1,45 @@
+-- Private Windows heap storage for the managed runtime. All calls are NoGc;
+-- no managed value, CRT allocation or custom pool is introduced here.
+import "windows_x64.ouro";
+
+extern windows_heap_create : U32 -> USize -> USize -> Runtime (RawPtr U8) :=
+    "windows-x86_64" "win64" "kernel32.dll" "HeapCreate" "nogc";
+extern windows_heap_alloc : RawPtr U8 -> U32 -> USize -> Runtime (RawPtr U8) :=
+    "windows-x86_64" "win64" "kernel32.dll" "HeapAlloc" "nogc";
+extern windows_heap_free : RawPtr U8 -> U32 -> RawPtr U8 -> Runtime U32 :=
+    "windows-x86_64" "win64" "kernel32.dll" "HeapFree" "nogc";
+extern windows_heap_destroy : RawPtr U8 -> Runtime U32 :=
+    "windows-x86_64" "win64" "kernel32.dll" "HeapDestroy" "nogc";
+
+-- A zero maximum makes the heap growable. Keep serialization enabled and
+-- allocation failures nullable; executable storage and exceptions are disabled.
+def raw_heap_create (anchor : USize) : Runtime (RawPtr U8) :=
+    let zero : USize := usize_sub anchor anchor in
+    windows_heap_create (raw_size_to_u32 zero) zero zero;
+
+-- heap is a live private owner and bytes is positive. Windows supplies zeroed,
+-- non-moving storage aligned to 16 bytes on Win64. The exact returned base must
+-- be released to this same heap; raw_pages_release cannot consume it.
+def raw_heap_allocate (heap : RawPtr U8) (bytes : USize) : Runtime (RawPtr U8) :=
+    match u32_from_nat 8 with
+    | Nothing => runtime_pure (RawPtr U8) (raw_null U8)
+    | Just flags => windows_heap_alloc heap flags bytes end;
+
+-- base must be an original, still-owned allocation from heap. This unsafe
+-- helper is not a pointer-membership probe. False retains ownership.
+def raw_heap_release (heap : RawPtr U8) (base : RawPtr U8) : Runtime Bool :=
+    runtime_bind USize Bool (raw_to_bits U8 base) (fun (bits : USize) =>
+      let zero : USize := usize_sub bits bits in
+      match usize_equal bits zero with | True => runtime_pure Bool False | False =>
+        runtime_bind U32 Bool (windows_heap_free heap (raw_size_to_u32 zero) base)
+          (fun (released : U32) => runtime_pure Bool
+            (raw_bool_not (u32_equal released (raw_size_to_u32 zero)))) end);
+
+-- Only an empty private owner may reach this helper. Successful destruction
+-- releases all its pages. False leaves the handle owned and available to retry.
+def raw_heap_destroy (heap : RawPtr U8) : Runtime Bool :=
+    runtime_bind USize Bool (raw_to_bits U8 heap) (fun (bits : USize) =>
+      let zero : USize := usize_sub bits bits in
+      match usize_equal bits zero with | True => runtime_pure Bool False | False =>
+        runtime_bind U32 Bool (windows_heap_destroy heap) (fun (destroyed : U32) =>
+          runtime_pure Bool (raw_bool_not (u32_equal destroyed (raw_size_to_u32 zero)))) end);

@@ -1,0 +1,313 @@
+-- Import aliases and local opens are source rewrites; the flattened module model below this point is unchanged.
+
+-- @entry preprocess_imports
+-- @export empty_imp_reg; @doc docs/syntax.md
+-- @export imports_maybe_needed; @doc docs/syntax.md
+-- @export preprocess_imports; @doc docs/syntax.md
+-- @export preprocess_imports_reg; @doc docs/syntax.md
+
+import "source_text.ouro";
+import "../std/data.ouro";
+import "base.ouro";
+import "pipeline_abi.ouro";
+
+def empty_imp_reg : ImpReg := MkImpReg (Nil (List Nat));
+
+def imp_code_malformed : Nat := S Z;
+def imp_code_dup : Nat := 2;
+def imp_code_unknown : Nat := 3;
+def imp_code_badname : Nat := 4;
+
+def ch_tab_i : Nat := 9;
+def ch_lf_i : Nat := 10;
+def ch_cr_i : Nat := 13;
+def ch_space_i : Nat := 32;
+def ch_dq_i : Nat := 34;
+def ch_dash_i : Nat := 45;
+def ch_dot_i : Nat := 46;
+def ch_zero_i : Nat := 48;
+def ch_nine_i : Nat := 57;
+def ch_semi_i : Nat := 59;
+def ch_A_i : Nat := 65;
+def ch_Z_i : Nat := 90;
+def ch_bs_i : Nat := 92;
+def ch_uscore_i : Nat := 95;
+def ch_a_i : Nat := 97;
+def ch_z_i : Nat := 122;
+def ch_squote_i : Nat := 39;
+
+def n1i (a : Nat) : List Nat := ([a] : List Nat);
+def n2i (a : Nat) (b : Nat) : List Nat := Cons Nat a (n1i b);
+def n3i (a : Nat) (b : Nat) (c : Nat) : List Nat := Cons Nat a (n2i b c);
+def n4i (a : Nat) (b : Nat) (c : Nat) (d : Nat) : List Nat :=
+  Cons Nat a (n3i b c d);
+def n5i (a : Nat) (b : Nat) (c : Nat) (d : Nat) (e : Nat) : List Nat :=
+  Cons Nat a (n4i b c d e);
+def n6i (a : Nat) (b : Nat) (c : Nat) (d : Nat) (e : Nat) (f : Nat)
+    : List Nat := Cons Nat a (n5i b c d e f);
+
+def word_at_i (w : List Nat) (src : List Nat) : Bool :=
+  andb (source_starts w src) (source_word_end (source_drop_prefix w src));
+
+def w_import : List Nat := n6i 105 109 112 111 114 116;
+def w_as : List Nat := n2i 97 115;
+def w_open : List Nat := n4i 111 112 101 110;
+def w_in : List Nat := n2i 105 110;
+def w_def_i : List Nat := n3i 100 101 102;
+def w_let : List Nat := n3i 108 101 116;
+def w_fun : List Nat := n3i 102 117 110;
+def w_end_i : List Nat := n3i 101 110 100;
+def w_Type : List Nat := n4i 84 121 112 101;
+def w_intrinsic_i : List Nat := ([105, 110, 116, 114, 105, 110, 115, 105, 99] : List Nat);
+def w_extern_i : List Nat := n6i 101 120 116 101 114 110;
+def w_representation_i : List Nat :=
+  ([114, 101, 112, 114, 101, 115, 101, 110, 116, 97, 116, 105, 111, 110] : List Nat);
+
+def skip_ws_i (input : List Nat) : List Nat :=
+  (fix skip_ws_i (fuel : Nat) (xs : List Nat) : List Nat :=
+    match fuel with
+    | Z => xs
+    | S remaining =>
+        match xs with
+        | Nil => Nil Nat
+        | Cons c rest =>
+            match source_is_ws c with
+            | True => skip_ws_i remaining rest
+            | False =>
+                match source_is_comment xs with
+                | True => skip_ws_i remaining (source_skip_line rest)
+                | False => xs
+                end
+            end
+        end
+    end) (S (length Nat input)) input;
+
+def reserved_alias (n : List Nat) : Bool :=
+  orb (source_bytes_equal n w_as)
+    (orb (source_bytes_equal n w_open)
+      (orb (source_bytes_equal n w_import)
+        (orb (source_bytes_equal n w_in)
+          (orb (source_bytes_equal n w_def_i)
+            (orb (source_bytes_equal n w_let)
+              (orb (source_bytes_equal n w_fun)
+                (orb (source_bytes_equal n w_end_i)
+                  (orb (source_bytes_equal n w_Type)
+                    (orb (source_bytes_equal n w_intrinsic_i)
+                      (orb (source_bytes_equal n w_extern_i)
+                        (source_bytes_equal n w_representation_i)))))))))));
+
+-- Validate the alias before extending the registry; zero means valid.
+def import_alias_error (alias : List Nat) (aliases : List (List Nat)) : Nat :=
+    match alias with
+    | Nil => imp_code_malformed
+    | Cons _ _ =>
+        match reserved_alias alias with
+        | True => imp_code_badname
+        | False =>
+            match name_in alias aliases with
+            | True => imp_code_dup
+            | False => Z
+            end
+        end
+    end;
+
+def take_string_i (src : List Nat) : Maybe (Pair (List Nat) (List Nat)) :=
+  match src with
+  | Cons c rest =>
+      match eqNat c ch_dq_i with
+      | False => Nothing (Pair (List Nat) (List Nat))
+      | True =>
+          let tail : List Nat := source_skip_string rest in
+          Just (Pair (List Nat) (List Nat))
+            (MkPair (List Nat) (List Nat) (source_prefix_until src tail) tail)
+      end
+  | Nil => Nothing (Pair (List Nat) (List Nat))
+  end;
+
+def copy_ws_i (acc : List Nat) (src : List Nat)
+    : Pair (List Nat) (List Nat) :=
+  (fix go (xs : List Nat) (a : List Nat) : Pair (List Nat) (List Nat) :=
+    match xs with
+    | Nil => MkPair (List Nat) (List Nat) a (Nil Nat)
+    | Cons c rest =>
+        match source_is_ws c with
+        | True => go rest (Cons Nat c a)
+        | False => MkPair (List Nat) (List Nat) a xs
+        end
+    end) src acc;
+
+def imports_maybe_needed (src : List Nat) : Bool :=
+  (fix go (fuel : Nat) (xs : List Nat) : Bool :=
+    match fuel with
+    | Z => True
+    | S remaining =>
+        match xs with
+        | Nil => False
+        | Cons c rest =>
+            match source_is_comment xs with
+            | True => go remaining (source_skip_line rest)
+            | False =>
+                match eqNat c ch_dq_i with
+                | True => go remaining (source_skip_string rest)
+                | False =>
+                    match word_at_i w_open xs with
+                    | True => True
+                    | False =>
+                        match word_at_i w_as xs with
+                        | True => True
+                        | False =>
+                            match source_is_ident_start c with
+                            | True =>
+                                match source_take_ident xs with
+                                | MkPair _ after => go remaining after
+                                end
+                            | False => go remaining rest
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end) (S (length Nat src)) src;
+
+-- @bound(cyclo <= 77)
+def preprocess_imports_reg (reg0 : ImpReg) (src : List Nat)
+    : Pair ImpReg ImpPrep :=
+  match imports_maybe_needed src with
+  | False => MkPair ImpReg ImpPrep reg0 (ImpOk src)
+  | True =>
+      (fix go (fuel : Nat) (aliases : List (List Nat)) (xs : List Nat) (acc : List Nat)
+          : Pair ImpReg ImpPrep :=
+        match fuel with
+        | Z => MkPair ImpReg ImpPrep (MkImpReg aliases) (ImpErr imp_code_malformed Z)
+        | S remaining =>
+            match xs with
+            | Nil =>
+                MkPair ImpReg ImpPrep (MkImpReg aliases) (ImpOk (reverse Nat acc))
+            | Cons c rest =>
+                match source_copy_comment_or_string acc xs with
+                | Just p =>
+                    match p with
+                    | MkPair acc2 xs2 => go remaining aliases xs2 acc2
+                    end
+                | Nothing =>
+                    match word_at_i w_import xs with
+                    | True =>
+                        let after_kw : List Nat := source_drop_prefix w_import xs in
+                        match copy_ws_i (source_emit_reversed acc w_import) after_kw with
+                        | MkPair acc2 xs2 =>
+                            match take_string_i xs2 with
+                            | Nothing =>
+                                MkPair ImpReg ImpPrep (MkImpReg aliases)
+                                  (ImpErr imp_code_malformed Z)
+                            | Just sp =>
+                                match sp with
+                                | MkPair lit xs3 =>
+                                    match copy_ws_i (source_emit_reversed acc2 lit) xs3 with
+                                    | MkPair acc3 xs4 =>
+                                        match word_at_i w_as xs4 with
+                                        | False =>
+                                            go remaining aliases xs4 acc3
+                                        | True =>
+                                            let xs5 : List Nat :=
+                                              skip_ws_i (source_drop_prefix w_as xs4) in
+                                            match source_take_ident xs5 with
+                                            | MkPair alias xs6 =>
+                                                match import_alias_error alias aliases with
+                                                | Z =>
+                                                    go remaining (Cons (List Nat) alias aliases)
+                                                      xs6 acc3
+                                                | S code =>
+                                                    MkPair ImpReg ImpPrep (MkImpReg aliases)
+                                                      (ImpErr (S code) Z)
+                                                end
+                                            end
+                                        end
+                                    end
+                                end
+                            end
+                        end
+                    | False =>
+                        match word_at_i w_open xs with
+                        | True =>
+                            let xs2 : List Nat :=
+                              skip_ws_i (source_drop_prefix w_open xs) in
+                            match source_take_ident xs2 with
+                            | MkPair alias xs3 =>
+                                match alias with
+                                | Nil =>
+                                    MkPair ImpReg ImpPrep (MkImpReg aliases)
+                                      (ImpErr imp_code_malformed Z)
+                                | Cons _ _ =>
+                                    match name_in alias aliases with
+                                    | False =>
+                                        MkPair ImpReg ImpPrep (MkImpReg aliases)
+                                          (ImpErr imp_code_unknown Z)
+                                    | True =>
+                                        let xs4 : List Nat := skip_ws_i xs3 in
+                                        match word_at_i w_in xs4 with
+                                        | True =>
+                                            go remaining aliases
+                                              (skip_ws_i (source_drop_prefix w_in xs4))
+                                              acc
+                                        | False =>
+                                            match xs4 with
+                                            | Cons sc xs5 =>
+                                                match eqNat sc ch_semi_i with
+                                                | True => go remaining aliases xs5 acc
+                                                | False =>
+                                                    MkPair ImpReg ImpPrep
+                                                      (MkImpReg aliases)
+                                                      (ImpErr imp_code_malformed Z)
+                                                end
+                                            | Nil =>
+                                                MkPair ImpReg ImpPrep
+                                                  (MkImpReg aliases)
+                                                  (ImpErr imp_code_malformed Z)
+                                            end
+                                        end
+                                    end
+                                end
+                            end
+                        | False =>
+                            match source_is_ident_start c with
+                            | True =>
+                                match source_take_ident xs with
+                                | MkPair id after =>
+                                    match after with
+                                    | Cons d after2 =>
+                                        match andb (eqNat d ch_dot_i)
+                                              (name_in id aliases) with
+                                        | True =>
+                                            match source_take_ident after2 with
+                                            | MkPair fld after3 =>
+                                                match fld with
+                                                | Nil =>
+                                                    MkPair ImpReg ImpPrep
+                                                      (MkImpReg aliases)
+                                                      (ImpErr imp_code_malformed Z)
+                                                | Cons _ _ =>
+                                                    go remaining aliases after3
+                                                      (source_emit_reversed acc fld)
+                                                end
+                                            end
+                                        | False =>
+                                            go remaining aliases after (source_emit_reversed acc id)
+                                        end
+                                    | Nil =>
+                                        go remaining aliases after (source_emit_reversed acc id)
+                                    end
+                                end
+                            | False => go remaining aliases rest (Cons Nat c acc)
+                            end
+                        end
+                    end
+                end
+            end
+        end) (S (length Nat src)) (match reg0 with | MkImpReg a => a end) src (Nil Nat)
+  end;
+
+def preprocess_imports (src : List Nat) : ImpPrep :=
+  match preprocess_imports_reg empty_imp_reg src with
+  | MkPair _ r => r
+  end;

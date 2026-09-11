@@ -1,0 +1,179 @@
+-- Contract annotations are facts parsed from the comment block above a
+-- definition; unknown or orphan annotations fail closed here. Purity is
+-- checked against the effect operations the AST actually performs.
+
+-- @entry analyze_contracts
+-- @entry ctr_orphan_issues
+
+import "../../std/data.ouro";
+import "../../std/listx.ouro";
+import "../../std/natx.ouro";
+import "../../std/runtime.ouro";
+import "ast.ouro";
+import "runtime_contracts.ouro";
+
+-- contract annotation with no definition below it (line); empty requires,
+-- ensures, modifies (line); @pure definition that performs or calls an
+-- effect operation (op id); repeated annotation (line); unknown tag (line);
+-- public definition without requires/ensures (Z).
+inductive CtrIssue : Type :=
+  | IOrphan : Nat -> CtrIssue
+  | IRequiresEmpty : Nat -> CtrIssue
+  | IPureButPerform : Nat -> CtrIssue
+  | IMissingOnPublic : Nat -> CtrIssue
+  | IDuplicateTag : Nat -> CtrIssue
+  | IUnknownTag : Nat -> CtrIssue
+  | IEnsuresEmpty : Nat -> CtrIssue
+  | IModifiesEmpty : Nat -> CtrIssue;
+
+def ctr_inil : List CtrIssue := [];
+
+def ctr_icons (i : CtrIssue) (is : List CtrIssue) : List CtrIssue :=
+    Cons CtrIssue i is;
+
+def ctr_append (xs : List CtrIssue) (ys : List CtrIssue) : List CtrIssue :=
+    append CtrIssue xs ys;
+
+def ctr_unknown_issues (annos : List CtrAnno) : List CtrIssue :=
+    map CtrAnno CtrIssue (fun (a : CtrAnno) => IUnknownTag (ctr_anno_line a))
+      (filter CtrAnno ctr_is_unknown annos);
+
+-- Contract annotations in a comment block that no definition follows.
+def ctr_orphan_issues (annos : List CtrAnno) : List CtrIssue :=
+    ctr_append (ctr_unknown_issues annos)
+      (map CtrAnno CtrIssue (fun (a : CtrAnno) => IOrphan (ctr_anno_line a))
+        (filter CtrAnno ctr_is_contract annos));
+
+def ctr_empty_issue (a : CtrAnno) : List CtrIssue :=
+    match ctr_nonempty (ctr_anno_text a) with
+    | True => ctr_inil
+    | False =>
+        match eq_nat (ctr_anno_tag a) ctr_tag_requires with
+        | True => ctr_icons (IRequiresEmpty (ctr_anno_line a)) ctr_inil
+        | False =>
+            match eq_nat (ctr_anno_tag a) ctr_tag_ensures with
+            | True => ctr_icons (IEnsuresEmpty (ctr_anno_line a)) ctr_inil
+            | False =>
+                match eq_nat (ctr_anno_tag a) ctr_tag_modifies with
+                | True => ctr_icons (IModifiesEmpty (ctr_anno_line a)) ctr_inil
+                | False => ctr_inil
+                end
+            end
+        end
+    end;
+
+def ctr_same_anno (a : CtrAnno) (b : CtrAnno) : Bool :=
+    andb (eq_nat (ctr_anno_tag a) (ctr_anno_tag b))
+      (orb (orb (ctr_has_tag ctr_tag_pure a) (ctr_has_tag ctr_tag_invariant a))
+        (prim_string_eq (ctr_anno_text a) (ctr_anno_text b)));
+
+-- pure and invariant at most once; requires/ensures/modifies at most once
+-- per text. The later occurrence is reported.
+def ctr_duplicate_issues : List CtrAnno -> List CtrIssue :=
+  fix ctr_duplicate_issues (xs : List CtrAnno) : List CtrIssue :=
+    match xs with
+    | Nil => ctr_inil
+    | Cons a rest =>
+        ctr_append
+          (match andb (ctr_is_contract a) (any CtrAnno (ctr_same_anno a) rest) with
+           | True =>
+               match find CtrAnno (ctr_same_anno a) rest with
+               | Nothing => ctr_inil
+               | Just later => ctr_icons (IDuplicateTag (ctr_anno_line later)) ctr_inil
+               end
+           | False => ctr_inil
+           end)
+          (ctr_duplicate_issues rest)
+    end;
+
+def ctr_has (t : Nat) (annos : List CtrAnno) : Bool :=
+    any CtrAnno (ctr_has_tag t) annos;
+
+-- Performs, handles, and references to known effect operations all count as
+-- effects for a @pure definition.
+def ctr_effect_op (effect_ops : List Nat) (a : Ast) : Maybe Nat :=
+    match a with
+    | APerform op _ => Just Nat op
+    | AVar id =>
+        match mem Nat eq_nat id effect_ops with
+        | True => Just Nat id
+        | False => Nothing Nat
+        end
+    | AHole _ => Nothing Nat
+    | ASort _ => Nothing Nat
+    | ANatLit _ => Nothing Nat
+    | AStr _ => Nothing Nat
+    | AApp _ _ => Nothing Nat
+    | ALam _ _ _ => Nothing Nat
+    | APi _ _ _ => Nothing Nat
+    | ALet _ _ _ _ => Nothing Nat
+    | AAscribe _ _ => Nothing Nat
+    | ABinder _ _ _ => Nothing Nat
+    | ANoBinder => Nothing Nat
+    | AFix _ _ _ _ => Nothing Nat
+    | ABranch _ _ _ _ => Nothing Nat
+    | ANoBranch => Nothing Nat
+    | AMatch _ _ => Nothing Nat
+    | AHandle _ _ => Nothing Nat
+    | AClause _ _ _ _ => Nothing Nat
+    | ANoClause => Nothing Nat
+    | ADo _ => Nothing Nat
+    | AList _ => Nothing Nat
+    end;
+
+def ctr_first_effect (effect_ops : List Nat) : Ast -> Maybe Nat :=
+  fun (root : Ast) =>
+    (fix ctr_first_effect (fuel : Nat) (a : Ast) : Maybe Nat :=
+      match fuel with
+      | Z => Nothing Nat
+      | S remaining =>
+          let descend : Ast -> Maybe Nat :=
+            fun (child : Ast) => ctr_first_effect remaining child in
+          match ctr_effect_op effect_ops a with
+          | Just op => Just Nat op
+          | Nothing =>
+              (fix go (xs : List Ast) : Maybe Nat :=
+                match xs with
+                | Nil => Nothing Nat
+                | Cons x rest =>
+                    match descend x with
+                    | Just op => Just Nat op
+                    | Nothing => go rest
+                    end
+                end) (ast_children a)
+          end
+      end) (ast_size root) root;
+
+def ctr_pure_issue (effect_ops : List Nat) (annos : List CtrAnno) (a : Ast)
+    : List CtrIssue :=
+    match ctr_has ctr_tag_pure annos with
+    | False => ctr_inil
+    | True =>
+        match ctr_first_effect effect_ops a with
+        | Nothing => ctr_inil
+        | Just op => ctr_icons (IPureButPerform op) ctr_inil
+        end
+    end;
+
+-- Only when the unit opted in with a file-level `@property contracts`
+-- directive: every public definition needs a requires or ensures clause.
+def ctr_public_issue (require_public : Bool) (public : Bool) (annos : List CtrAnno)
+    : List CtrIssue :=
+    match andb require_public public with
+    | False => ctr_inil
+    | True =>
+        match orb (ctr_has ctr_tag_requires annos) (ctr_has ctr_tag_ensures annos) with
+        | True => ctr_inil
+        | False => ctr_icons (IMissingOnPublic Z) ctr_inil
+        end
+    end;
+
+-- effect_ops: ids of effect operations and effectful primitives known to the
+-- unit; public: entry or export of the unit.
+def analyze_contracts (effect_ops : List Nat) (require_public : Bool)
+    (public : Bool) (annos : List CtrAnno) (a : Ast) : List CtrIssue :=
+    ctr_append (ctr_unknown_issues annos)
+      (ctr_append (concat_map CtrAnno CtrIssue ctr_empty_issue annos)
+        (ctr_append (ctr_duplicate_issues annos)
+          (ctr_append (ctr_pure_issue effect_ops annos a)
+            (ctr_public_issue require_public public annos))));

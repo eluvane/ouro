@@ -1,0 +1,67 @@
+-- Completed global work must preserve scheduling and typed failures.
+import "../compiler/native/managed_terms.ouro";
+import "../compiler/driver.ouro";
+import "compiler_startup_test_support.ouro";
+
+def managed_phase_force (work : Unit -> Either NativeLowerError ManagedState)
+    : Either NativeLowerError ManagedState := work MkUnit;
+
+def managed_phase_abort (_ : Unit -> Either NativeLowerError ManagedState)
+    : Either NativeLowerError ManagedState :=
+    Left NativeLowerError ManagedState (LowerUnknownGlobal 999);
+
+def managed_phase_state (pending : List Nat) : ManagedState :=
+    ManagedStateOf 77 ([] : List MirFunction) ([] : List MirData) pending [10, 20] (lower_empty_state 9);
+
+def managed_phase_flow (flow : LowerState) : Bool :=
+    match flow with | LowerStateOf local locals instructions blocks =>
+      match blocks with | LowerFlowOf current next finished =>
+        pe_bytes_equal [local, length MirLocal locals, length MirInstruction instructions,
+          current, next, length MirBlock finished] [9, 0, 0, 0, 1, 0] end end;
+
+def managed_phase_empty (state : ManagedState) : Bool :=
+    match state with | ManagedStateOf symbol functions data pending known flow =>
+      andb (pe_bytes_equal [symbol, length MirFunction functions, length MirData data, length Nat pending] [77, 0, 0, 0])
+        (andb (pe_bytes_equal known [10, 20]) (managed_phase_flow flow)) end;
+
+def managed_phase_error (error : NativeLowerError) : String :=
+    match error with
+    | LowerResourceExhausted => "resource"
+    | LowerUnknownGlobal id => match eqNat id 999 with | True => "callback" | False => "other-global" end
+    | LowerMetadataMismatch id => match eqNat id 100 with | True => "first" | False => "other-metadata" end
+    | LowerDeclarationFailure _ _ _ => "declaration"
+    | LowerBodyMismatch _ => "body" | LowerUnsupportedType _ => "type"
+    | LowerUnsupportedTerm _ => "term" | LowerUnsupportedPrimitive _ => "primitive"
+    | LowerUnboundLocal _ => "local" | LowerInvalidCall _ => "call"
+    | LowerEffectMismatch => "effect" | LowerInvalidEntry _ => "entry"
+    | LowerMirFailure _ => "mir" | LowerBackendFailure _ => "backend" end;
+
+def managed_phase_result (value : Either NativeLowerError ManagedState) : String :=
+    match value with | Left error => managed_phase_error error | Right state =>
+      match managed_phase_empty state with | True => "empty-preserved" | False => "state-changed" end end;
+
+def managed_phase_probe (mode : Nat) : String :=
+    match compile_checked_source 500 (prim_string_to_char_codes "inductive PhaseItem : Type := | PhaseOnly : PhaseItem;") with
+    | CErr _ => "source-rejected"
+    | COk program =>
+        let compiler : ManagedCompiler := ManagedCompilerOf program ([] : List Nat) 0 0 0 0 0 0 ([] : List LowerContract)
+          (check_environment_from_entries (checked_program_entries program)) in
+        let pending : List Nat := match ltb_nat mode 2 with | True => [] | False => [100, 200] end in
+        let state : ManagedState := managed_phase_state pending in
+        let fuel : Nat := match eqNat mode 2 with | True => 0 | False => 4 end in
+        managed_phase_result (match eqNat mode 1 with
+          | True => managed_global_functions compiler 500 0 state
+          | False => match eqNat mode 5 with
+            | True => managed_global_functions compiler 500 fuel state
+            | False => managed_global_functions_with
+                (match ltb_nat mode 4 with | True => managed_phase_abort | False => managed_phase_force end)
+                compiler 500 (match eqNat mode 0 with | True => 0 | False => fuel end) state end end) end;
+
+def main : IO Unit :=
+    startup_test_run [
+      startup_test_eq "empty pending state bypasses callback even at zero fuel" (managed_phase_probe 0) "empty-preserved",
+      startup_test_eq "ordinary wrapper preserves complete empty state at zero fuel" (managed_phase_probe 1) "empty-preserved",
+      startup_test_eq "pending global exhausts fuel before invoking callback" (managed_phase_probe 2) "resource",
+      startup_test_eq "callback failure is preserved before global body evaluation" (managed_phase_probe 3) "callback",
+      startup_test_eq "forcing callback preserves first pending metadata failure" (managed_phase_probe 4) "first",
+      startup_test_eq "ordinary wrapper preserves first pending metadata failure" (managed_phase_probe 5) "first"];

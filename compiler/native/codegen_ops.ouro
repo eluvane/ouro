@@ -1,0 +1,367 @@
+-- Instruction selection. Every mutable local remains in its assigned slot;
+-- register values are temporary, so calls cannot destroy a live local.
+import "codegen_roots.ouro";
+
+def codegen_condition (ty : MirType) (comparison : MirComparison) : X64Condition :=
+    let signed : Bool := mir_type_equal ty MirI32 in
+    match comparison with | MirEqual => X64Equal | MirNotEqual => X64NotEqual
+    | MirLess => match signed with | True => X64Less | False => X64Below end
+    | MirLessEqual => match signed with | True => X64LessEqual | False => X64BelowEqual end
+    | MirGreater => match signed with | True => X64Greater | False => X64Above end
+    | MirGreaterEqual => match signed with | True => X64GreaterEqual | False => X64AboveEqual end end;
+
+def codegen_division (ty : MirType) (remainder : Bool) (block : Nat) (site : Nat) : List CodegenAtom :=
+    let width : X64Width := codegen_width ty in
+    let nonzero : CodegenLabel := CodegenSiteLabel block site 0 in
+    let safe : CodegenLabel := CodegenSiteLabel block site 1 in
+    let signed : Bool := mir_type_equal ty MirI32 in
+    codegen_join ([
+      codegen_raw ([X64ArithmeticImm32 width X64Compare X64R10 codegen_zero] : List X64Instruction),
+      ([CodegenJumpIf X64NotEqual nonzero, CodegenInstruction X64Trap, CodegenMark nonzero] : List CodegenAtom),
+      match signed with | False => ([] : List CodegenAtom) | True => codegen_join ([
+        codegen_raw ([X64ArithmeticImm32 X64Bits32 X64Compare X64Rax (X64Bytes32 0 0 0 128)] : List X64Instruction),
+        ([CodegenJumpIf X64NotEqual safe] : List CodegenAtom),
+        codegen_raw ([X64ArithmeticImm32 X64Bits32 X64Compare X64R10 (X64Bytes32 255 255 255 255)] : List X64Instruction),
+        ([CodegenJumpIf X64NotEqual safe, CodegenInstruction X64Trap, CodegenMark safe] : List CodegenAtom)]
+          : List (List CodegenAtom)) end,
+      codegen_raw ([match signed with | True => X64SignExtendDividend width
+        | False => X64ArithmeticReg width X64Xor X64Rdx X64Rdx end,
+        X64Divide width (match signed with | True => X64Signed | False => X64Unsigned end) (X64RegisterOperand X64R10)]
+          : List X64Instruction),
+      match remainder with | False => ([] : List CodegenAtom)
+        | True => codegen_raw ([X64Mov width X64Rax X64Rdx] : List X64Instruction) end] : List (List CodegenAtom));
+
+def codegen_binary_atoms (ty : MirType) (operation : MirBinary) (block : Nat) (site : Nat) : List CodegenAtom :=
+    let width : X64Width := codegen_width ty in
+    match operation with
+    | MirAdd => codegen_raw ([X64ArithmeticReg width X64Add X64Rax X64R10] : List X64Instruction)
+    | MirSub => codegen_raw ([X64ArithmeticReg width X64Subtract X64Rax X64R10] : List X64Instruction)
+    | MirMul => codegen_raw ([X64Multiply width X64Rax (X64RegisterOperand X64R10)] : List X64Instruction)
+    | MirAnd => codegen_raw ([X64ArithmeticReg width X64And X64Rax X64R10] : List X64Instruction)
+    | MirOr => codegen_raw ([X64ArithmeticReg width X64Or X64Rax X64R10] : List X64Instruction)
+    | MirXor => codegen_raw ([X64ArithmeticReg width X64Xor X64Rax X64R10] : List X64Instruction)
+    | MirDiv => codegen_division ty False block site | MirRem => codegen_division ty True block site
+    | MirShl => codegen_raw ([X64ArithmeticImm32 X64Bits32 X64And X64Rcx (pe_word32 (sub (mir_type_bits ty) 1)),
+        X64ShiftCL width X64ShiftLeft X64Rax] : List X64Instruction)
+    | MirShr => codegen_raw ([X64ArithmeticImm32 X64Bits32 X64And X64Rcx (pe_word32 (sub (mir_type_bits ty) 1)),
+        X64ShiftCL width (match mir_type_equal ty MirI32 with | True => X64ShiftArithmeticRight | False => X64ShiftRight end) X64Rax]
+          : List X64Instruction) end;
+
+def codegen_binary (slots : List CodegenSlot) (block : Nat) (site : Nat) (id : Nat)
+    (operation : MirBinary) (left : MirValue) (right : MirValue) : Either NativeCodegenError (List CodegenAtom) :=
+    match codegen_slot id slots with | Left err => Left NativeCodegenError (List CodegenAtom) err
+    | Right slot => match slot with | CodegenSlotAt _ ty _ =>
+      let right_register : X64Register := match operation with | MirShl => X64Rcx | MirShr => X64Rcx
+        | MirAdd => X64R10 | MirSub => X64R10 | MirMul => X64R10 | MirAnd => X64R10
+        | MirOr => X64R10 | MirXor => X64R10 | MirDiv => X64R10 | MirRem => X64R10 end in
+      codegen_parts ([codegen_load_value slots X64Rax left, codegen_load_value slots right_register right,
+        codegen_ready (codegen_binary_atoms ty operation block site), codegen_ready (codegen_save_slot slot X64Rax)]
+          : List (Either NativeCodegenError (List CodegenAtom))) end end;
+
+def codegen_comparison (slots : List CodegenSlot) (block : Nat) (site : Nat) (id : Nat)
+    (operation : MirComparison) (left : MirValue) (right : MirValue) : Either NativeCodegenError (List CodegenAtom) :=
+    match codegen_value_type slots left with | Left err => Left NativeCodegenError (List CodegenAtom) err | Right ty =>
+      let yes : CodegenLabel := CodegenSiteLabel block site 0 in
+      let finish : CodegenLabel := CodegenSiteLabel block site 1 in
+      codegen_parts ([codegen_load_value slots X64Rax left, codegen_load_value slots X64R10 right,
+        codegen_ready (codegen_raw ([X64ArithmeticReg (codegen_width ty) X64Compare X64Rax X64R10,
+          X64MovImm32 X64Rax codegen_zero] : List X64Instruction)),
+        codegen_ready ([CodegenJumpIf (codegen_condition ty operation) yes, CodegenJump finish,
+          CodegenMark yes, CodegenInstruction (X64MovImm32 X64Rax (pe_word32 1)), CodegenMark finish] : List CodegenAtom),
+        codegen_save slots id X64Rax] : List (Either NativeCodegenError (List CodegenAtom))) end;
+
+def codegen_argument_register (index : Nat) : X64Register :=
+    match index with | Z => X64Rcx | S a => match a with | Z => X64Rdx | S b =>
+      match b with | Z => X64R8 | S _ => X64R9 end end end;
+
+def codegen_arguments (slots : List CodegenSlot) : List MirValue -> Nat -> Either NativeCodegenError (List CodegenAtom) :=
+  fix codegen_arguments (args : List MirValue) (index : Nat) : Either NativeCodegenError (List CodegenAtom) :=
+    match args with | Nil => codegen_ready ([] : List CodegenAtom) | Cons value rest =>
+      let place : X64Instruction := match ltb_nat index 4 with
+        | True => X64Mov X64Bits64 (codegen_argument_register index) X64Rax
+        | False => X64Store X64Bits64 (X64Base X64Rsp (codegen_disp (mul index 8))) X64Rax end in
+      codegen_parts ([codegen_load_value slots X64Rax value, codegen_ready (codegen_raw ([place] : List X64Instruction)),
+        codegen_arguments rest (S index)] : List (Either NativeCodegenError (List CodegenAtom))) end;
+
+def codegen_call (program : MirProgram) (slots : List CodegenSlot) (block : Nat) (site : Nat)
+    (dest : Maybe Nat) (target : MirCallTarget) (args : List MirValue) : Either NativeCodegenError (List CodegenAtom) :=
+    let call : Either NativeCodegenError (List CodegenAtom) := match target with
+      | MirIndirect _ address => codegen_parts ([codegen_load_value slots X64R11 address,
+          codegen_ready (codegen_raw ([X64CallIndirect (X64RegisterOperand X64R11)] : List X64Instruction))]
+            : List (Either NativeCodegenError (List CodegenAtom)))
+      | MirDirect id => match program with | MirProgramDef functions _ _ _ =>
+          codegen_ready ([match mir_find_function id functions with
+            | Just _ => CodegenDirectCall id | Nothing => CodegenImportCall id end] : List CodegenAtom) end end in
+    codegen_parts ([codegen_arguments slots args 0, call,
+      codegen_ready ([CodegenBoundary block site] : List CodegenAtom),
+      match dest with | Nothing => codegen_ready ([] : List CodegenAtom) | Just id => codegen_save slots id X64Rax end]
+        : List (Either NativeCodegenError (List CodegenAtom)));
+
+def codegen_memory_load (ty : MirType) (address : X64Address) : X64Instruction :=
+    match ty with
+    | MirU8 => X64Load8Zero X64Rax address
+    | MirU32 => X64Load X64Bits32 X64Rax address
+    | MirI32 => X64Load X64Bits32 X64Rax address
+    | MirU64 => X64Load X64Bits64 X64Rax address
+    | MirUSize => X64Load X64Bits64 X64Rax address
+    | MirRawPtr => X64Load X64Bits64 X64Rax address
+    | MirManagedPtr => X64Load X64Bits64 X64Rax address end;
+
+def codegen_memory_store (ty : MirType) (address : X64Address) : X64Instruction :=
+    match ty with
+    | MirU8 => X64Store8 address X64Rax
+    | MirU32 => X64Store X64Bits32 address X64Rax
+    | MirI32 => X64Store X64Bits32 address X64Rax
+    | MirU64 => X64Store X64Bits64 address X64Rax
+    | MirUSize => X64Store X64Bits64 address X64Rax
+    | MirRawPtr => X64Store X64Bits64 address X64Rax
+    | MirManagedPtr => X64Store X64Bits64 address X64Rax end;
+
+def codegen_load_memory (slots : List CodegenSlot) (id : Nat) (address : MirValue) (disp : X64Displacement)
+    : Either NativeCodegenError (List CodegenAtom) :=
+    match codegen_slot id slots with | Left err => Left NativeCodegenError (List CodegenAtom) err
+    | Right slot => match slot with | CodegenSlotAt _ ty _ =>
+      let instruction : X64Instruction := codegen_memory_load ty (X64Base X64Rax disp) in
+      codegen_parts ([codegen_load_value slots X64Rax address,
+        codegen_ready (codegen_raw ([instruction] : List X64Instruction)), codegen_ready (codegen_save_slot slot X64Rax)]
+          : List (Either NativeCodegenError (List CodegenAtom))) end end;
+
+def codegen_store_memory (slots : List CodegenSlot) (address : MirValue) (disp : X64Displacement) (value : MirValue)
+    : Either NativeCodegenError (List CodegenAtom) :=
+    match codegen_value_type slots value with | Left err => Left NativeCodegenError (List CodegenAtom) err | Right ty =>
+      let instruction : X64Instruction := codegen_memory_store ty (X64Base X64R10 disp) in
+      codegen_parts ([codegen_load_value slots X64R10 address, codegen_load_value slots X64Rax value,
+        codegen_ready (codegen_raw ([instruction] : List X64Instruction))] : List (Either NativeCodegenError (List CodegenAtom))) end;
+
+-- Both inputs are read before the destination slot is written. The SIB
+-- address exists only for this memory access, with no intervening safepoint.
+def codegen_load_indexed_memory (slots : List CodegenSlot) (id : Nat) (address : MirValue) (offset : MirValue)
+    : Either NativeCodegenError (List CodegenAtom) :=
+    match codegen_slot id slots with | Left err => Left NativeCodegenError (List CodegenAtom) err
+    | Right slot => match slot with | CodegenSlotAt _ ty _ =>
+      let instruction : X64Instruction := codegen_memory_load ty (X64Indexed X64Rax X64R10 X64Scale1 (codegen_disp 0)) in
+      codegen_parts ([codegen_load_value slots X64Rax address, codegen_load_value slots X64R10 offset,
+        codegen_ready (codegen_raw ([instruction] : List X64Instruction)), codegen_ready (codegen_save_slot slot X64Rax)]
+          : List (Either NativeCodegenError (List CodegenAtom))) end end;
+
+def codegen_store_indexed_memory (slots : List CodegenSlot) (address : MirValue) (offset : MirValue) (value : MirValue)
+    : Either NativeCodegenError (List CodegenAtom) :=
+    match codegen_value_type slots value with | Left err => Left NativeCodegenError (List CodegenAtom) err | Right ty =>
+      let instruction : X64Instruction := codegen_memory_store ty (X64Indexed X64R10 X64R11 X64Scale1 (codegen_disp 0)) in
+      codegen_parts ([codegen_load_value slots X64R10 address, codegen_load_value slots X64R11 offset,
+        codegen_load_value slots X64Rax value, codegen_ready (codegen_raw ([instruction] : List X64Instruction))]
+          : List (Either NativeCodegenError (List CodegenAtom))) end;
+
+-- Only a registered, aligned, matching header becomes a managed local. Null,
+-- non-owner pointers and malformed allocator results trap before publication.
+-- Normal allocation failure is diagnosed by the raw Ouro allocator itself.
+def codegen_managed_check (condition : X64Condition) (block : Nat) (site : Nat) (step : Nat)
+    : List CodegenAtom :=
+    let valid : CodegenLabel := CodegenSiteLabel block site step in
+    ([CodegenJumpIf condition valid, CodegenInstruction X64Trap, CodegenMark valid] : List CodegenAtom);
+
+def codegen_managed_alloc (program : MirProgram) (slots : List CodegenSlot) (block : Nat) (site : Nat)
+    (id : Nat) (allocator : Nat) (collector : Nat) (descriptor : Nat) (bytes : MirValue)
+    : Either NativeCodegenError (List CodegenAtom) :=
+    let page : Nat := mul 64 64 in
+    let collect : CodegenLabel := CodegenSiteLabel block site 7 in
+    let allocate : CodegenLabel := CodegenSiteLabel block site 8 in
+    codegen_parts ([
+      codegen_ready ([CodegenSymbolAddress (codegen_runtime_id program) False,
+        CodegenInstruction (X64Load X64Bits64 X64R10 (X64Base X64Rax (codegen_disp (codegen_runtime_budget_offset program)))),
+        CodegenInstruction (X64ArithmeticImm32 X64Bits64 X64Compare X64R10 (pe_word32 page)),
+        CodegenJumpIf X64Below collect,
+        CodegenInstruction (X64ArithmeticImm32 X64Bits64 X64Subtract X64R10 (pe_word32 page))] : List CodegenAtom),
+      codegen_load_value slots X64Rax bytes,
+      codegen_ready ([CodegenInstruction (X64ArithmeticReg X64Bits64 X64Compare X64R10 X64Rax),
+        CodegenJumpIf X64Below collect, CodegenJump allocate, CodegenMark collect] : List CodegenAtom),
+      codegen_ready ([CodegenSymbolAddress (codegen_runtime_id program) False,
+        CodegenInstruction (X64Mov X64Bits64 X64Rcx X64Rax), CodegenDirectCall collector,
+        CodegenBoundary block site,
+        CodegenInstruction (X64ArithmeticImm32 X64Bits32 X64Compare X64Rax (pe_word32 1))] : List CodegenAtom),
+      codegen_ready (codegen_managed_check X64Equal block site 6),
+      codegen_ready ([CodegenMark allocate, CodegenSymbolAddress (codegen_runtime_id program) False,
+        CodegenInstruction (X64Mov X64Bits64 X64Rcx X64Rax), CodegenSymbolAddress descriptor False,
+        CodegenInstruction (X64Mov X64Bits64 X64Rdx X64Rax)] : List CodegenAtom),
+      codegen_load_value slots X64R8 bytes,
+      codegen_ready ([CodegenDirectCall allocator, CodegenBoundary block site,
+        CodegenInstruction (X64ArithmeticImm32 X64Bits64 X64Compare X64Rax codegen_zero)] : List CodegenAtom),
+      codegen_ready (codegen_managed_check X64NotEqual block site 0),
+      codegen_ready (codegen_raw ([X64Mov X64Bits64 X64R11 X64Rax,
+        X64ArithmeticImm32 X64Bits64 X64And X64Rax (pe_word32 7),
+        X64ArithmeticImm32 X64Bits64 X64Compare X64Rax codegen_zero] : List X64Instruction)),
+      codegen_ready (codegen_managed_check X64Equal block site 1),
+      codegen_ready ([CodegenSymbolAddress (codegen_runtime_id program) False,
+        CodegenInstruction (X64Load X64Bits64 X64R10 (X64Base X64Rax (codegen_disp 0))),
+        CodegenInstruction (X64ArithmeticReg X64Bits64 X64Compare X64R10 X64R11)] : List CodegenAtom),
+      codegen_ready (codegen_managed_check X64Equal block site 2),
+      codegen_ready ([CodegenSymbolAddress descriptor False,
+        CodegenInstruction (X64Load X64Bits64 X64R10 (X64Base X64R11 (codegen_disp 0))),
+        CodegenInstruction (X64ArithmeticReg X64Bits64 X64Compare X64R10 X64Rax)] : List CodegenAtom),
+      codegen_ready (codegen_managed_check X64Equal block site 3),
+      codegen_load_value slots X64Rax bytes,
+      codegen_ready (codegen_raw ([X64Load X64Bits64 X64R10 (X64Base X64R11 (codegen_disp 8)),
+        X64ArithmeticReg X64Bits64 X64Compare X64R10 X64Rax] : List X64Instruction)),
+      codegen_ready (codegen_managed_check X64Equal block site 4),
+      codegen_ready (codegen_raw ([X64Load X64Bits64 X64R10 (X64Base X64R11 (codegen_disp 24)),
+        X64ArithmeticImm32 X64Bits64 X64Compare X64R10 codegen_zero] : List X64Instruction)),
+      codegen_ready (codegen_managed_check X64Equal block site 5),
+      codegen_save slots id X64R11] : List (Either NativeCodegenError (List CodegenAtom)));
+
+def codegen_instruction (program : MirProgram) (slots : List CodegenSlot) (block : Nat) (site : Nat)
+    (instruction : MirInstruction) : Either NativeCodegenError (List CodegenAtom) :=
+    match instruction with
+    | MirMove id value => codegen_parts ([codegen_load_value slots X64Rax value, codegen_save slots id X64Rax]
+        : List (Either NativeCodegenError (List CodegenAtom)))
+    | MirBinaryOp id operation left right => codegen_binary slots block site id operation left right
+    | MirCompare id operation left right => codegen_comparison slots block site id operation left right
+    | MirConvert id conversion value => codegen_parts ([codegen_load_value slots X64Rax value,
+        codegen_ready (match conversion with
+          | MirSignExtend => codegen_raw ([X64SignExtend32 X64Rax X64Rax] : List X64Instruction)
+          | MirNarrow => ([] : List CodegenAtom) | MirZeroExtend => ([] : List CodegenAtom)
+          | MirReinterpret => ([] : List CodegenAtom) | MirRawToBits => ([] : List CodegenAtom)
+          | MirRawFromBits => ([] : List CodegenAtom) end), codegen_save slots id X64Rax]
+          : List (Either NativeCodegenError (List CodegenAtom)))
+    | MirLoad id address disp => codegen_load_memory slots id address disp
+    | MirStore address disp value => codegen_store_memory slots address disp value
+    | MirLoadAt id address offset => codegen_load_indexed_memory slots id address offset
+    | MirStoreAt address offset value => codegen_store_indexed_memory slots address offset value
+    | MirAddress id symbol => match program with | MirProgramDef _ _ libraries _ =>
+        codegen_parts ([codegen_ready ([CodegenSymbolAddress symbol
+          (match mir_find_extern symbol libraries with | Nothing => False | Just _ => True end)] : List CodegenAtom),
+          codegen_save slots id X64Rax] : List (Either NativeCodegenError (List CodegenAtom))) end
+    | MirPointerAdd id address offset => codegen_parts ([codegen_load_value slots X64Rax address,
+        codegen_load_value slots X64R10 offset,
+        codegen_ready (codegen_raw ([X64ArithmeticReg X64Bits64 X64Add X64Rax X64R10] : List X64Instruction)),
+        codegen_save slots id X64Rax] : List (Either NativeCodegenError (List CodegenAtom)))
+    | MirCall _ dest target args => codegen_call program slots block site dest target args
+    | MirManagedAlloc id allocator collector descriptor bytes => codegen_managed_alloc program slots block site id allocator collector descriptor bytes
+    | MirManagedContext id => codegen_parts ([
+        codegen_ready ([CodegenSymbolAddress (codegen_runtime_id program) False] : List CodegenAtom),
+        codegen_save slots id X64Rax] : List (Either NativeCodegenError (List CodegenAtom))) end;
+
+def codegen_terminator (program : MirProgram) (slots : List CodegenSlot) (allocation : Nat)
+    (block : Nat) (site : Nat) (term : MirTerminator)
+    : Either NativeCodegenError (List CodegenAtom) :=
+    match term with
+    | MirJump target => codegen_ready ([CodegenJump (CodegenBlockLabel target)] : List CodegenAtom)
+    | MirBranch condition yes no => codegen_parts ([codegen_load_value slots X64Rax condition,
+        codegen_ready (codegen_raw ([X64ArithmeticImm32 X64Bits32 X64Compare X64Rax codegen_zero] : List X64Instruction)),
+        codegen_ready ([CodegenJumpIf X64NotEqual (CodegenBlockLabel yes), CodegenJump (CodegenBlockLabel no)] : List CodegenAtom)]
+          : List (Either NativeCodegenError (List CodegenAtom)))
+    | MirReturn result => codegen_parts ([codegen_ready (codegen_shadow_leave program allocation slots block site),
+      match result with | Nothing => codegen_ready ([] : List CodegenAtom)
+        | Just value => codegen_load_value slots X64Rax value end,
+        codegen_ready (codegen_raw ([X64ArithmeticImm32 X64Bits64 X64Add X64Rsp (pe_word32 allocation), X64Return]
+          : List X64Instruction))] : List (Either NativeCodegenError (List CodegenAtom)))
+    | MirTrap => codegen_ready (codegen_raw ([X64Trap] : List X64Instruction)) end;
+
+def codegen_live_instructions (slots : List CodegenSlot) (facts : List MirBlockFact) (block : MirBlock)
+    : Either NativeCodegenError (List (Pair MirInstruction (List Nat))) :=
+    let roots : List Nat := map NativeRootSlot Nat
+      (fun (root : NativeRootSlot) => match root with | NativeRootAt id _ => id end) (codegen_root_slots slots) in
+    match block with | MirBlockDef _ instructions _ => match roots with
+      | Nil => Right NativeCodegenError (List (Pair MirInstruction (List Nat)))
+          (map MirInstruction (Pair MirInstruction (List Nat)) (fun (instruction : MirInstruction) =>
+            MkPair MirInstruction (List Nat) instruction ([] : List Nat)) instructions)
+      | Cons _ _ => match mir_live_after roots facts block with
+        | Left err => Left NativeCodegenError (List (Pair MirInstruction (List Nat))) (NativeMirError err)
+        | Right after => match mir_live_instructions roots instructions after with | MkPair _ annotated =>
+          Right NativeCodegenError (List (Pair MirInstruction (List Nat))) annotated end end end end;
+
+-- A tail continuation only copies the returned local and follows unconditional
+-- joins. Effects, conditional branches, other computations and cycles retain
+-- the ordinary call. This is an optimization of already validated MIR.
+def codegen_tail_move (value : Nat) (instruction : MirInstruction) : Maybe Nat :=
+    match instruction with
+      | MirMove dest source => match source with | MirUse id =>
+          match eq_nat id value with | True => Just Nat dest | False => Nothing Nat end
+        | MirBits _ _ => Nothing Nat end
+      | MirBinaryOp _ _ _ _ => Nothing Nat | MirCompare _ _ _ _ => Nothing Nat
+      | MirConvert _ _ _ => Nothing Nat | MirLoad _ _ _ => Nothing Nat
+      | MirStore _ _ _ => Nothing Nat | MirLoadAt _ _ _ => Nothing Nat
+      | MirStoreAt _ _ _ => Nothing Nat | MirAddress _ _ => Nothing Nat
+      | MirPointerAdd _ _ _ => Nothing Nat | MirCall _ _ _ _ => Nothing Nat
+      | MirManagedAlloc _ _ _ _ _ => Nothing Nat | MirManagedContext _ => Nothing Nat end;
+
+def codegen_tail_moves (value : Nat) (instructions : List MirInstruction) : Maybe Nat :=
+    (fix aliases (rest : List MirInstruction) (current : Nat) : Maybe Nat :=
+      match rest with | Nil => Just Nat current | Cons instruction tail =>
+        match codegen_tail_move current instruction with | Nothing => Nothing Nat
+          | Just copied => aliases tail copied end end) instructions value;
+
+def codegen_tail_return (blocks : List MirBlock) : Nat -> Nat -> MirTerminator -> Bool :=
+  fix follow (fuel : Nat) (value : Nat) (term : MirTerminator) : Bool :=
+    match fuel with | Z => False | S next => match term with
+      | MirReturn result => match result with | Nothing => False
+        | Just returned => match returned with | MirUse id => eq_nat id value | MirBits _ _ => False end end
+      | MirJump target => match find MirBlock (fun (block : MirBlock) => eq_nat target (mir_block_id block)) blocks with
+        | Nothing => False | Just block => match block with | MirBlockDef _ instructions finish =>
+          match codegen_tail_moves value instructions with | Nothing => False
+            | Just copied => follow next copied finish end end end
+      | MirBranch _ _ _ => False | MirTrap => False end end;
+
+def codegen_tail_result (blocks : List MirBlock) (value : Nat) (instructions : List MirInstruction)
+    (term : MirTerminator) : Bool :=
+    match codegen_tail_moves value instructions with | Nothing => False
+      | Just copied => codegen_tail_return blocks (S (length MirBlock blocks)) copied term end;
+
+def codegen_tail_live_result (blocks : List MirBlock) (term : MirTerminator)
+    (value : Nat) (instructions : List (Pair MirInstruction (List Nat))) : Bool :=
+    (fix aliases (rest : List (Pair MirInstruction (List Nat))) (current : Nat) : Bool :=
+      match rest with | Nil => codegen_tail_return blocks (S (length MirBlock blocks)) current term
+      | Cons item tail => match item with | MkPair instruction _ =>
+        match codegen_tail_move current instruction with | Nothing => False
+          | Just copied => aliases tail copied end end end) instructions value;
+
+-- Win64 always supplies four home slots. Save the target in our first home
+-- slot before dropping this frame; argument registers are then loaded without
+-- a safepoint. The final ADD RSP; JMP [R11] is a legal Windows unwind epilog
+-- (memory ModRM.mod=00). A register JMP is not an equivalent unwind encoding.
+-- Calls requiring stack arguments keep the ordinary call/return sequence.
+def codegen_tail_call (program : MirProgram) (slots : List CodegenSlot) (allocation : Nat)
+    (block : Nat) (site : Nat) (target : MirCallTarget) (args : List MirValue)
+    : Either NativeCodegenError (List CodegenAtom) :=
+    let home : X64Address := X64Base X64Rsp (codegen_disp (add allocation 8)) in
+    codegen_parts ([codegen_ready (codegen_shadow_leave program allocation slots block site),
+      match target with
+      | MirIndirect _ address => codegen_load_value slots X64Rax address
+      | MirDirect id => match program with | MirProgramDef functions _ _ _ =>
+          codegen_ready ([CodegenSymbolAddress id
+            (match mir_find_function id functions with | Just _ => False | Nothing => True end)] : List CodegenAtom) end end,
+      codegen_ready (codegen_raw ([X64Store X64Bits64 home X64Rax] : List X64Instruction)),
+      codegen_arguments slots args 0,
+      codegen_ready (codegen_raw ([X64Lea X64R11 home,
+        X64ArithmeticImm32 X64Bits64 X64Add X64Rsp (pe_word32 allocation),
+        X64TailJumpIndirect (X64Base X64R11 (codegen_disp 0))] : List X64Instruction))]
+          : List (Either NativeCodegenError (List CodegenAtom)));
+
+def codegen_block (program : MirProgram) (slots : List CodegenSlot) (allocation : Nat)
+    (facts : List MirBlockFact) (blocks : List MirBlock) (block : MirBlock)
+    : Either NativeCodegenError (List CodegenAtom) :=
+    match block with | MirBlockDef id _ term =>
+      match codegen_live_instructions slots facts block with
+      | Left err => Left NativeCodegenError (List CodegenAtom) err
+      | Right instructions =>
+      let body : Either NativeCodegenError (List CodegenAtom) :=
+        (fix go (rest : List (Pair MirInstruction (List Nat))) (site : Nat) : Either NativeCodegenError (List CodegenAtom) :=
+          match rest with | Nil => codegen_terminator program slots allocation id site term
+          | Cons item tail => match item with | MkPair instruction live =>
+            let ordinary : Unit -> Either NativeCodegenError (List CodegenAtom) := fun (_ : Unit) =>
+              codegen_parts ([codegen_ready (match mir_live_safepoint instruction with
+                  | True => codegen_clear_dead_roots slots live | False => ([] : List CodegenAtom) end),
+                codegen_instruction program slots id site instruction,
+                go tail (S site)] : List (Either NativeCodegenError (List CodegenAtom))) in
+            match instruction with
+            | MirCall _ dest target args => match dest with | Nothing => ordinary MkUnit | Just value =>
+                match andb (leb_nat (length MirValue args) 4) (codegen_tail_live_result blocks term value tail) with
+                | False => ordinary MkUnit
+                | True => codegen_tail_call program slots allocation id site target args end end
+            | MirMove _ _ => ordinary MkUnit | MirBinaryOp _ _ _ _ => ordinary MkUnit
+            | MirCompare _ _ _ _ => ordinary MkUnit | MirConvert _ _ _ => ordinary MkUnit
+            | MirLoad _ _ _ => ordinary MkUnit | MirStore _ _ _ => ordinary MkUnit
+            | MirLoadAt _ _ _ => ordinary MkUnit | MirStoreAt _ _ _ => ordinary MkUnit
+            | MirAddress _ _ => ordinary MkUnit | MirPointerAdd _ _ _ => ordinary MkUnit
+            | MirManagedAlloc _ _ _ _ _ => ordinary MkUnit | MirManagedContext _ => ordinary MkUnit end end end) instructions 0 in
+      mapRight NativeCodegenError (List CodegenAtom) (List CodegenAtom)
+        (fun (atoms : List CodegenAtom) => Cons CodegenAtom (CodegenMark (CodegenBlockLabel id)) atoms) body end end;

@@ -1,0 +1,59 @@
+-- Exact checked Nat definitions keep ordinary global and unary closure ABI.
+import "managed_closures.ouro";
+import "managed_nat_binary.ouro";
+import "managed_nat_shapes.ouro";
+
+def managed_fast_nat_equal (compiler : ManagedCompiler) (family : Nat) (order : MirValue) (state : ManagedState)
+    : Either NativeLowerError ManagedResult :=
+    lower_bind ManagedResult ManagedResult (managed_compare MirNotEqual order (managed_bits MirUSize 1) state)
+      (fun (tested : ManagedResult) => match tested with | ManagedResultOf different next =>
+        lower_bind ManagedResult ManagedResult (managed_convert MirUSize MirZeroExtend different next)
+          (fun (converted : ManagedResult) => match converted with | ManagedResultOf tag after =>
+            managed_constructor compiler family tag ([] : List MirValue) after end) end);
+
+def managed_fast_nat_result (compiler : ManagedCompiler) (operation : ManagedNatOperation)
+    (left : MirValue) (right : MirValue) (state : ManagedState) : Either NativeLowerError ManagedResult :=
+    match operation with
+    | ManagedNatAdd => managed_nat_binary_body compiler False left right state
+    | ManagedNatSubtract => managed_nat_binary_body compiler True left right state
+    | ManagedNatEqual family => lower_bind ManagedResult ManagedResult (managed_nat_compare_body compiler left right state)
+        (fun (compared : ManagedResult) => match compared with | ManagedResultOf order next =>
+          managed_fast_nat_equal compiler family order next end)
+    | ManagedNatCompare family => lower_bind ManagedResult ManagedResult (managed_nat_compare_body compiler left right state)
+        (fun (compared : ManagedResult) => match compared with | ManagedResultOf order next =>
+          managed_constructor compiler family order ([] : List MirValue) next end) end;
+
+def managed_fast_nat_apply (compiler : ManagedCompiler) (operation : ManagedNatOperation)
+    (captures : List MirValue) (state : ManagedState) : Either NativeLowerError ManagedResult :=
+    match captures with
+    | Nil => Left NativeLowerError ManagedResult (LowerInvalidCall 0)
+    | Cons left tail => match tail with
+        | Nil => Left NativeLowerError ManagedResult (LowerInvalidCall 0)
+        | Cons right rest => match rest with
+            | Nil => managed_fast_nat_result compiler operation left right state
+            | Cons _ _ => Left NativeLowerError ManagedResult (LowerInvalidCall 0) end end end;
+
+-- Captures are evaluated values in source order. Both stages are the same
+-- environment/argument closures used by ordinary application and higher order code.
+def managed_fast_nat_value (compiler : ManagedCompiler) (operation : ManagedNatOperation)
+    : Nat -> List MirValue -> ManagedState -> Either NativeLowerError ManagedResult :=
+  fix partial (remaining : Nat) (captures : List MirValue) (state : ManagedState)
+      : Either NativeLowerError ManagedResult :=
+    match remaining with
+    | Z => managed_fast_nat_apply compiler operation captures state
+    | S rest =>
+        let caller : LowerState := managed_flow state in
+        lower_bind (Pair Nat ManagedState) ManagedResult (managed_fresh_symbol state)
+          (fun (fresh : Pair Nat ManagedState) => match fresh with | MkPair symbol reserved =>
+            lower_bind (Pair ManagedScope ManagedState) ManagedResult
+              (managed_capture_scope (map MirValue (Maybe MirValue) (Just MirValue) captures) 0
+                (managed_with_flow reserved (lower_empty_state 2)))
+              (fun (captured : Pair ManagedScope ManagedState) => match captured with | MkPair environment entered =>
+                lower_bind ManagedResult ManagedResult
+                  (partial rest (append MirValue (managed_values environment) ([MirUse 1] : List MirValue)) entered)
+                  (fun (compiled : ManagedResult) => match compiled with | ManagedResultOf value after =>
+                    let function : MirFunction := managed_finish_function symbol
+                      ([111,117,114,111,95,110,97,116,95,98,105,110,97,114,121] : List Nat)
+                      ([MirLocalDef 0 MirManagedPtr, MirLocalDef 1 MirManagedPtr] : List MirLocal) value after in
+                    managed_emit_callable compiler 3 symbol False captures
+                      (managed_with_flow (managed_add_function function after) caller) end) end) end) end;

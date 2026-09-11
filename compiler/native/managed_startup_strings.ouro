@@ -1,0 +1,89 @@
+-- Windows text is copied through owned raw buffers into byte-counted GC
+-- strings. Managed owners are retained by indexed accesses and call roots.
+import "managed_startup_memory.ouro";
+
+def managed_startup_string_copy (compiler : ManagedCompiler) (source : MirValue) (bytes : MirValue)
+    (state : ManagedState) : Either NativeLowerError ManagedResult :=
+    lower_bind ManagedResult ManagedResult (managed_string_allocate compiler bytes state)
+      (fun (allocated : ManagedResult) => match allocated with | ManagedResultOf value next =>
+        lower_map ManagedState ManagedResult (fun (after : ManagedState) => ManagedResultOf value after)
+          (managed_bytes_copy source (managed_bits MirUSize 0) value (managed_bits MirUSize 40) bytes next) end);
+
+def managed_startup_string_fill (compiler : ManagedCompiler) (scope : ManagedStartupScope)
+    (wide : MirValue) (units : MirValue) (count : MirValue) (bytes : MirValue) (buffer : MirValue)
+    (state : ManagedState) : Either NativeLowerError ManagedResult :=
+    lower_bind ManagedResult ManagedResult
+      (managed_startup_call compiler ManagedStartupFromWide ([wide, units, buffer, bytes, count] : List MirValue) state)
+      (fun (converted : ManagedResult) => match converted with | ManagedResultOf status next =>
+        managed_startup_status compiler scope status (fun (entered : ManagedState) =>
+          lower_bind ManagedResult ManagedResult (managed_startup_count count entered)
+            (fun (written : ManagedResult) => match written with | ManagedResultOf actual after =>
+              lower_bind ManagedResult ManagedResult (managed_compare MirEqual actual bytes after)
+                (fun (checked : ManagedResult) => match checked with | ManagedResultOf complete final =>
+                  managed_startup_check compiler scope complete (managed_startup_string_copy compiler buffer bytes) final end) end)) next end);
+
+def managed_startup_string (compiler : ManagedCompiler) (scope : ManagedStartupScope)
+    (wide : MirValue) (units : MirValue) (count : MirValue) (state : ManagedState)
+    : Either NativeLowerError ManagedResult :=
+    lower_bind ManagedResult ManagedResult
+      (managed_startup_call compiler ManagedStartupFromWide
+        ([wide, units, managed_bits MirRawPtr 0, managed_bits MirUSize 0, count] : List MirValue) state)
+      (fun (queried : ManagedResult) => match queried with | ManagedResultOf status next =>
+        managed_startup_status compiler scope status (fun (entered : ManagedState) =>
+          lower_bind ManagedResult ManagedResult (managed_startup_count count entered)
+            (fun (measured : ManagedResult) => match measured with | ManagedResultOf bytes after =>
+              lower_bind ManagedResult ManagedResult (managed_compare MirEqual bytes (managed_bits MirUSize 0) after)
+                (fun (checked : ManagedResult) => match checked with | ManagedResultOf empty final =>
+                  managed_string_choose MirManagedPtr empty (managed_string_allocate compiler (managed_bits MirUSize 0))
+                    (managed_startup_buffer compiler scope bytes
+                      (fun (buffer : MirValue) (owned : ManagedStartupScope) (current : ManagedState) =>
+                        managed_startup_string_fill compiler owned wide units count bytes buffer current)) final end) end)) next end);
+
+-- This is an iteration limit, not a claim about the allocation's capacity.
+-- CommandLineToArgvW owns each terminated WCHAR string. A one-unit probe
+-- reads exactly two live bytes; only a nonzero unit permits the next probe.
+def managed_startup_scan_limit : Nat := mul 128 256;
+
+def managed_startup_scan_step (compiler : ManagedCompiler) (wide : MirValue) (count : MirValue)
+    (index : Nat) (status : Nat) (state : ManagedState) : Either NativeLowerError ManagedState :=
+    lower_bind ManagedResult ManagedState
+      (managed_binary MirUSize MirMul (MirUse index) (managed_bits MirUSize 2) state)
+      (fun (offset : ManagedResult) => match offset with | ManagedResultOf bytes next =>
+        lower_bind ManagedResult ManagedState
+          (managed_fresh MirRawPtr (fun (local : Nat) => MirPointerAdd local wide bytes) next)
+          (fun (cursor : ManagedResult) => match cursor with | ManagedResultOf pointer after =>
+            lower_bind ManagedResult ManagedState
+              (managed_startup_call compiler ManagedStartupWideLength
+                ([pointer, managed_bits MirUSize 1, count] : List MirValue) after)
+              (fun (probed : ManagedResult) => match probed with | ManagedResultOf result finished =>
+                lower_bind ManagedResult ManagedState
+                  (managed_compare MirEqual result (managed_bits MirU32 122) (managed_emit (MirMove status result) finished))
+                  (fun (checked : ManagedResult) => match checked with | ManagedResultOf nonzero tested =>
+                    lower_bind ManagedResult ManagedState (managed_convert MirUSize MirZeroExtend nonzero tested)
+                      (fun (advance : ManagedResult) => match advance with | ManagedResultOf step final =>
+                        Right NativeLowerError ManagedState
+                          (managed_emit (MirBinaryOp index MirAdd (MirUse index) step) final) end) end) end) end) end);
+
+def managed_startup_scan (compiler : ManagedCompiler) (wide : MirValue) (count : MirValue)
+    (state : ManagedState) : Either NativeLowerError ManagedFields :=
+    lower_bind (Pair Nat ManagedState) ManagedFields (managed_fresh_local MirUSize state)
+      (fun (position : Pair Nat ManagedState) => match position with | MkPair index next =>
+        lower_bind (Pair Nat ManagedState) ManagedFields (managed_fresh_local MirU32 next)
+          (fun (code : Pair Nat ManagedState) => match code with | MkPair status after =>
+            let initialized : ManagedState := managed_emit_all
+              ([MirMove index (managed_bits MirUSize 0), MirMove status (managed_bits MirU32 122)] : List MirInstruction) after in
+            lower_bind LowerLoopBlocks ManagedFields (lower_loop_blocks (managed_flow initialized))
+              (fun (labels : LowerLoopBlocks) => match labels with | LowerLoopAt header body finish flow =>
+                lower_bind ManagedResult ManagedFields
+                  (managed_compare MirLess (MirUse index) (managed_bits MirUSize managed_startup_scan_limit)
+                    (managed_with_flow initialized (lower_switch_block header (MirJump header) flow)))
+                  (fun (bounds : ManagedResult) => match bounds with | ManagedResultOf available bounded =>
+                    lower_bind ManagedResult ManagedFields (managed_compare MirEqual (MirUse status) (managed_bits MirU32 122) bounded)
+                      (fun (checked : ManagedResult) => match checked with | ManagedResultOf nonzero tested =>
+                        lower_bind ManagedResult ManagedFields (managed_binary MirU8 MirAnd available nonzero tested)
+                          (fun (condition : ManagedResult) => match condition with | ManagedResultOf running entered =>
+                            lower_map ManagedState ManagedFields (fun (finished : ManagedState) =>
+                              ManagedFieldsOf ([MirUse index, MirUse status] : List MirValue)
+                                (managed_switch_block finish (MirJump header) finished))
+                              (managed_startup_scan_step compiler wide count index status
+                                (managed_switch_block body (MirBranch running body finish) entered)) end) end) end) end) end) end);

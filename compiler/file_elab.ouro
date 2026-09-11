@@ -1,0 +1,510 @@
+-- File-level kernel driver: declarations are checked left-to-right against the environment they extend.
+-- Failure codes are host-facing, so factoring must keep their meanings stable.
+
+-- @entry check_file
+-- @entry check_surf_file
+-- @entry check_cores_with_inds
+
+import "file_refine.ouro";
+import "constructor_closures.ouro";
+import "primitive_roles.ouro";
+
+-- FileItem/FileResult live in file_check_model.ouro so the pipeline can build
+-- an ordered plan and pass it to this checker without an untyped C-side AST walk.
+
+def is_type_checked_indexed (fuel : Nat) (sig : CheckEnvironment) (typ : CoreTerm) : CheckResult Unit :=
+    check_bind CoreTerm Unit (infer_checked_worker fuel sig (Nil CoreTerm) (IGTerm typ))
+      (fun (kind : CoreTerm) =>
+        check_map Nat Unit (fun (_level : Nat) => MkUnit) (check_sort_indexed fuel sig kind));
+
+def ctor_name_exists (name : Nat) : List Ctor -> Bool :=
+  fix ctor_name_exists (ctors : List Ctor) : Bool :=
+    match ctors with
+    | Nil => False
+    | Cons ctor rest =>
+        match ctor with
+        | MkCtor current _ =>
+            orb (eqNat name current) (ctor_name_exists rest)
+        end
+    end;
+
+def entry_name_exists (name : Nat) : List Entry -> Bool :=
+  fix entry_name_exists (sig : List Entry) : Bool :=
+    match sig with
+    | Nil => False
+    | Cons entry rest =>
+        match entry with
+        | MkEntry current _ _ =>
+            orb (eqNat name current) (entry_name_exists rest)
+        | MkBoundEntry current _ _ =>
+            orb (eqNat name current) (entry_name_exists rest)
+        | MkRoleEntry _ => entry_name_exists rest
+        | MkIndEntry current decl =>
+            match decl with
+            | MkIndDecl _ _ _ _ ctors =>
+                orb (eqNat name current)
+                  (orb (ctor_name_exists name ctors) (entry_name_exists rest))
+            end
+        end
+    end;
+
+def ind_family_type (decl : IndDecl) : CoreTerm :=
+    match decl with
+    | MkIndDecl _ params indices sort _ =>
+        mk_pis (params_types params) (mk_pis indices (CSort sort))
+    end;
+
+def ctor_names_fresh_indexed (sig : CheckEnvironment) (ind : Nat) : List Ctor -> Bool :=
+  fix ctor_names_fresh_indexed (ctors : List Ctor) : Bool :=
+    match ctors with
+    | Nil => True
+    | Cons ctor rest =>
+        match ctor with
+        | MkCtor name _ =>
+            andb (notb (orb (eqNat name ind)
+              (orb (check_environment_name_exists name sig) (ctor_name_exists name rest))))
+              (ctor_names_fresh_indexed rest)
+        end
+    end;
+
+def ctor_sort_bounded_checked_indexed (fuel : Nat) (sig : CheckEnvironment) (sort : Nat)
+    : Nat -> List CoreTerm -> CoreTerm -> CheckResult Unit :=
+  fix bounded (nparams : Nat) (ctx : List CoreTerm) (typ : CoreTerm) : CheckResult Unit :=
+    match nparams with
+    | Z =>
+        check_bind CoreTerm Unit (infer_checked_worker fuel sig ctx (IGTerm typ))
+          (fun (kind : CoreTerm) =>
+            check_bind Nat Unit (check_sort_indexed fuel sig kind)
+              (fun (level : Nat) =>
+                check_require (compiler_le_nat level sort) (CheckTypeFailure CheckUniverseBound)))
+    | S remaining =>
+        check_bind PiParts Unit (pi_view_checked_indexed fuel sig typ)
+          (fun (parts : PiParts) =>
+            match parts with
+            | MkPi domain codomain => bounded remaining (extend ctx domain) codomain
+            end)
+    end;
+
+def ctor_types_checked_indexed (fuel : Nat) (sig : CheckEnvironment)
+    : List Ctor -> CheckResult Unit :=
+  fix constructors (ctors : List Ctor) : CheckResult Unit :=
+    match ctors with
+    | Nil => CheckOk Unit MkUnit
+    | Cons ctor rest =>
+        match ctor with
+        | MkCtor _ typ =>
+            check_bind Unit Unit (is_type_checked_indexed fuel sig typ)
+              (fun (_type : Unit) => constructors rest)
+        end
+    end;
+
+def ctor_universes_checked_indexed (fuel : Nat) (sig : CheckEnvironment) (nparams : Nat) (sort : Nat)
+    : List Ctor -> CheckResult Unit :=
+  fix constructors (ctors : List Ctor) : CheckResult Unit :=
+    match ctors with
+    | Nil => CheckOk Unit MkUnit
+    | Cons ctor rest =>
+        match ctor with
+        | MkCtor _ typ =>
+            check_bind Unit Unit (ctor_sort_bounded_checked_indexed fuel sig sort nparams (Nil CoreTerm) typ)
+              (fun (_universe : Unit) => constructors rest)
+        end
+    end;
+
+def check_ind_decl_indexed (fuel : Nat) (sig : CheckEnvironment) (decl : IndDecl) : CheckResult Unit :=
+    match decl with
+    | MkIndDecl name params _ sort ctors =>
+        let with_ind : CheckEnvironment := check_environment_cons (MkIndEntry name decl) sig in
+        check_bind Unit Unit (is_type_checked_indexed fuel sig (ind_family_type decl))
+          (fun (_family : Unit) =>
+            check_bind Unit Unit
+              (check_require (ctor_names_fresh_indexed sig name ctors) (CheckMalformedCore (CheckDuplicateName name)))
+              (fun (_names : Unit) =>
+                check_bind Unit Unit (ctor_types_checked_indexed fuel with_ind ctors)
+                  (fun (_constructors : Unit) =>
+                    check_bind (List PositiveFunctor) Unit (positive_environment_checked fuel (check_environment_entries sig))
+                      (fun (known : List PositiveFunctor) =>
+                        check_bind Unit Unit
+                          (check_require_result (positive_inductive_checked_indexed fuel sig known decl)
+                            (CheckTypeFailure CheckNonPositive))
+                          (fun (_positive : Unit) =>
+                            ctor_universes_checked_indexed fuel with_ind (length Param params) sort ctors)))))
+    end;
+
+def file_item_name (item : FileItem) : Nat :=
+    match item with
+    | FDef name _ _ => name
+    | FAxiom name _ => name
+    | FInd decl => match decl with | MkIndDecl name _ _ _ _ => name end
+    | FIntrinsic name _ _ _ => name
+    | FExtern name _ _ => name
+    | FRepresentation name _ => name
+    end;
+
+def declaration_name_conflict_indexed (item : FileItem) (sig : CheckEnvironment) : Bool :=
+    match item with
+    | FRepresentation _ _ => False
+    | FDef name _ _ => check_environment_name_exists name sig
+    | FAxiom name _ => check_environment_name_exists name sig
+    | FInd decl => match decl with | MkIndDecl name _ _ _ _ => check_environment_name_exists name sig end
+    | FIntrinsic name _ _ _ => check_environment_name_exists name sig
+    | FExtern name _ _ => check_environment_name_exists name sig
+    end;
+
+def close_constructors_checked_indexed (fuel : Nat) (sig : CheckEnvironment) (term : CoreTerm)
+    : CheckResult CoreTerm :=
+    match constructor_close_indexed fuel sig term with
+    | Right closed => CheckOk CoreTerm closed
+    | Left failure =>
+        match failure with
+        | ConstructorClosureExhausted => CheckErr CoreTerm CheckResourceLimit
+        | ConstructorClosureMissing ind index =>
+            CheckErr CoreTerm (CheckMalformedCore (CheckUnknownConstructor ind index))
+        | ConstructorClosureOverapplied _ _ =>
+            CheckErr CoreTerm (CheckTypeFailure CheckExpectedFunction)
+        | ConstructorClosureMalformed ind index =>
+            CheckErr CoreTerm (CheckMalformedCore (CheckUnknownConstructor ind index))
+        end
+    end;
+
+def close_constructors_checked (fuel : Nat) (sig : List Entry) (term : CoreTerm) : CheckResult CoreTerm :=
+    close_constructors_checked_indexed fuel (check_environment_from_entries sig) term;
+
+def declaration_annotation_indexed (mode : CheckMode) (fuel : Nat) (sig : CheckEnvironment)
+    (typ : CoreTerm) : CheckResult CoreTerm :=
+    check_bind CoreTerm CoreTerm
+      (match mode with
+       | CheckExactCore => CheckOk CoreTerm typ
+       | CheckSourceCore =>
+           refine_term_checked_indexed fuel sig (Nil CoreTerm) (Nothing CoreTerm) typ
+       end)
+      (fun (annotation : CoreTerm) =>
+        check_map Unit CoreTerm (fun (_checked : Unit) => annotation)
+          (is_type_checked_indexed fuel sig annotation));
+
+def declaration_body_indexed (mode : CheckMode) (fuel : Nat) (sig : CheckEnvironment)
+    (annotation : CoreTerm) (body : CoreTerm) : CheckResult CoreTerm :=
+    check_bind CoreTerm CoreTerm
+      (match mode with
+       | CheckExactCore => CheckOk CoreTerm body
+       | CheckSourceCore =>
+           check_bind CoreTerm CoreTerm
+             (refine_term_checked_indexed fuel sig (Nil CoreTerm) (Just CoreTerm annotation) body)
+             (fun (refined : CoreTerm) => close_constructors_checked_indexed fuel sig refined)
+       end)
+      (fun (term : CoreTerm) =>
+        check_map Unit CoreTerm (fun (_checked : Unit) => term)
+          (check_term_checked_worker fuel sig (Nil CoreTerm) term annotation));
+
+def declaration_native_type_indexed (mode : CheckMode) (fuel : Nat) (sig : CheckEnvironment)
+    (typ : CoreTerm) : CheckResult CoreTerm :=
+    check_bind CoreTerm CoreTerm (declaration_annotation_indexed mode fuel sig typ)
+      (fun (annotation : CoreTerm) =>
+        check_map CoreTerm CoreTerm (fun (_normal : CoreTerm) => annotation)
+          (check_from_normalize CoreTerm (normalize_checked_worker fuel sig annotation)));
+
+def declaration_specialization_indexed (mode : CheckMode) (fuel : Nat) (sig : CheckEnvironment)
+    (specialization : Maybe CoreTerm) : CheckResult (Maybe CoreTerm) :=
+    match specialization with
+    | Nothing => CheckOk (Maybe CoreTerm) (Nothing CoreTerm)
+    | Just typ => check_map CoreTerm (Maybe CoreTerm) (fun (annotation : CoreTerm) => Just CoreTerm annotation)
+        (declaration_native_type_indexed mode fuel sig typ)
+    end;
+
+def declaration_bound_indexed (name : Nat) (sig : CheckEnvironment) (typ : CoreTerm)
+    (checked : CheckResult PrimitiveBinding) : IndexedDeclarationResult :=
+    match checked with
+    | CheckErr failure => IndexedDeclarationsErr name CheckDeclarationType failure
+    | CheckOk binding => IndexedDeclarationsOk (check_environment_cons (MkBoundEntry name typ binding) sig)
+    end;
+
+-- Both modes check the exact Core that enters the environment. Source mode
+-- first elaborates explicit candidates; it does not relax the strict checker.
+def check_indexed_declaration (mode : CheckMode) (fuel : Nat) (sig : CheckEnvironment)
+    (item : FileItem) : IndexedDeclarationResult :=
+    let name : Nat := file_item_name item in
+    match declaration_name_conflict_indexed item sig with
+    | True => IndexedDeclarationsErr name CheckDeclarationPlan
+        (CheckMalformedCore (CheckDuplicateName name))
+    | False => match check_input_within_limit ([CheckInputItem item] : List CheckInputWork) with
+      | False => IndexedDeclarationsErr name CheckDeclarationPlan CheckResourceLimit
+      | True =>
+        match item with
+        | FDef _ typ body =>
+            let checking_entries : CheckEnvironment := sig in
+            match declaration_annotation_indexed mode fuel checking_entries typ with
+            | CheckErr failure => IndexedDeclarationsErr name CheckDeclarationType failure
+            | CheckOk annotation =>
+                -- The new body sees only earlier accepted declarations.
+                match declaration_body_indexed mode fuel checking_entries annotation body with
+                | CheckErr failure => IndexedDeclarationsErr name CheckDeclarationBody failure
+                | CheckOk term =>
+                    IndexedDeclarationsOk (check_environment_cons (MkEntry name annotation (Just CoreTerm term)) sig)
+                end
+            end
+        | FAxiom _ typ =>
+            match declaration_annotation_indexed mode fuel sig typ with
+            | CheckErr failure => IndexedDeclarationsErr name CheckDeclarationType failure
+            | CheckOk annotation =>
+                IndexedDeclarationsOk (check_environment_cons (MkEntry name annotation (Nothing CoreTerm)) sig)
+            end
+        | FInd decl =>
+            match check_ind_decl_indexed fuel sig decl with
+            | CheckErr failure => IndexedDeclarationsErr name CheckInductiveDeclaration failure
+            | CheckOk _ => IndexedDeclarationsOk (check_environment_cons (MkIndEntry name decl) sig)
+            end
+        | FIntrinsic _ typ key specialization =>
+            match declaration_native_type_indexed mode fuel sig typ with
+            | CheckErr failure => IndexedDeclarationsErr name CheckDeclarationType failure
+            | CheckOk annotation =>
+                declaration_bound_indexed name sig annotation
+                  (check_bind (Maybe CoreTerm) PrimitiveBinding
+                    (declaration_specialization_indexed mode fuel sig specialization)
+                    (fun (specific : Maybe CoreTerm) =>
+                      primitive_checked_intrinsic_indexed fuel sig
+                        (primitive_roles_environment (check_environment_entries sig))
+                        name annotation key specific))
+            end
+        | FExtern _ typ request =>
+            match declaration_native_type_indexed mode fuel sig typ with
+            | CheckErr failure => IndexedDeclarationsErr name CheckDeclarationType failure
+            | CheckOk annotation => declaration_bound_indexed name sig annotation
+                (primitive_checked_extern_indexed fuel sig
+                  (primitive_roles_environment (check_environment_entries sig)) annotation request)
+            end
+        | FRepresentation _ key =>
+            match primitive_checked_role_indexed fuel sig name key with
+            | CheckErr failure => IndexedDeclarationsErr name CheckDeclarationType failure
+            | CheckOk role => IndexedDeclarationsOk (check_environment_cons (MkRoleEntry role) sig)
+            end
+        end
+      end
+    end;
+
+
+def indexed_declaration_result (result : IndexedDeclarationResult) : DeclarationResult :=
+    match result with
+    | IndexedDeclarationsOk environment => DeclarationsOk (check_environment_entries environment)
+    | IndexedDeclarationsErr name phase failure => DeclarationsErr name phase failure
+    end;
+
+def check_declaration (mode : CheckMode) (fuel : Nat) (sig : List Entry)
+    (item : FileItem) : DeclarationResult :=
+    indexed_declaration_result
+      (check_indexed_declaration mode fuel (check_environment_from_entries sig) item);
+
+def remove_selected_name (name : Nat) : List Nat -> List Nat :=
+  fix remove_selected_name (required : List Nat) : List Nat :=
+    match required with
+    | Nil => Nil Nat
+    | Cons current rest =>
+        match eqNat name current with
+        | True => rest
+        | False => Cons Nat current (remove_selected_name rest)
+        end
+    end;
+
+def keep_checking (_ordinal : Nat) : CheckDirective := CheckContinue;
+
+def next_declaration_name (items : List FileItem) : Nat :=
+    match items with
+    | Nil => Z
+    | Cons item _ => file_item_name item
+    end;
+
+-- The callback seam only bounds temporary allocation for one declaration.
+-- Ordering, cancellation, coverage and acceptance live in this traversal.
+-- Polling occurs at declaration boundaries, including before the first item.
+def check_declarations_go
+    (check_one : CheckMode -> Nat -> List Entry -> FileItem -> DeclarationResult)
+    (mode : CheckMode) (poll : Nat -> CheckDirective)
+    : Nat -> Nat -> List Nat -> List Entry -> List FileItem -> DeclarationResult :=
+  fix go (fuel : Nat) (ordinal : Nat) (required : List Nat)
+      (sig : List Entry) (items : List FileItem) : DeclarationResult :=
+    match poll ordinal with
+    | CheckStop => DeclarationsErr (next_declaration_name items)
+        CheckDeclarationPlan CheckCancelled
+    | CheckContinue =>
+        match fuel with
+        | Z => DeclarationsErr (next_declaration_name items)
+            CheckDeclarationPlan CheckResourceLimit
+        | S remaining =>
+            match items with
+            | Nil =>
+                match required with
+                | Nil => DeclarationsOk sig
+                | Cons missing _ => DeclarationsErr missing CheckDeclarationPlan
+                    (CheckMalformedCore (CheckUnboundGlobal missing))
+                end
+            | Cons item rest =>
+                match check_one mode remaining sig item with
+                | DeclarationsErr name phase failure => DeclarationsErr name phase failure
+                | DeclarationsOk checked =>
+                    go remaining (S ordinal)
+                      (remove_selected_name (file_item_name item) required) checked rest
+                end
+            end
+        end
+    end;
+
+def check_declarations_with
+    (check_one : CheckMode -> Nat -> List Entry -> FileItem -> DeclarationResult)
+    (mode : CheckMode) (poll : Nat -> CheckDirective) (fuel : Nat)
+    (required : List Nat) (items : List FileItem) : DeclarationResult :=
+    check_declarations_go check_one mode poll fuel Z required (Nil Entry) items;
+
+def check_indexed_declarations_go
+    (check_one : CheckMode -> Nat -> CheckEnvironment -> FileItem -> IndexedDeclarationResult)
+    (mode : CheckMode) (poll : Nat -> CheckDirective)
+    : Nat -> Nat -> List Nat -> CheckEnvironment -> List FileItem -> IndexedDeclarationResult :=
+  fix go (fuel : Nat) (ordinal : Nat) (required : List Nat)
+      (sig : CheckEnvironment) (items : List FileItem) : IndexedDeclarationResult :=
+    match poll ordinal with
+    | CheckStop => IndexedDeclarationsErr (next_declaration_name items)
+        CheckDeclarationPlan CheckCancelled
+    | CheckContinue =>
+        match fuel with
+        | Z => IndexedDeclarationsErr (next_declaration_name items)
+            CheckDeclarationPlan CheckResourceLimit
+        | S remaining =>
+            match items with
+            | Nil =>
+                match required with
+                | Nil => IndexedDeclarationsOk sig
+                | Cons missing _ => IndexedDeclarationsErr missing CheckDeclarationPlan
+                    (CheckMalformedCore (CheckUnboundGlobal missing))
+                end
+            | Cons item rest =>
+                match check_one mode remaining sig item with
+                | IndexedDeclarationsErr name phase failure => IndexedDeclarationsErr name phase failure
+                | IndexedDeclarationsOk checked =>
+                    go remaining (S ordinal)
+                      (remove_selected_name (file_item_name item) required) checked rest
+                end
+            end
+        end
+    end;
+
+def check_indexed_declarations_with
+    (check_one : CheckMode -> Nat -> CheckEnvironment -> FileItem -> IndexedDeclarationResult)
+    (mode : CheckMode) (poll : Nat -> CheckDirective) (fuel : Nat)
+    (required : List Nat) (items : List FileItem) : DeclarationResult :=
+    indexed_declaration_result
+      (check_indexed_declarations_go check_one mode poll fuel Z required check_environment_empty items);
+
+def check_indexed_module_with
+    (check_one : CheckMode -> Nat -> CheckEnvironment -> FileItem -> IndexedDeclarationResult)
+    (fuel : Nat) (required : List Nat) (items : List FileItem) : DeclarationResult :=
+    check_indexed_declarations_with check_one CheckSourceCore keep_checking fuel required items;
+
+def check_declarations (mode : CheckMode) (poll : Nat -> CheckDirective)
+    (fuel : Nat) (items : List FileItem) : DeclarationResult :=
+    check_indexed_declarations_with check_indexed_declaration mode poll fuel (Nil Nat) items;
+
+def check_module_with
+    (check_one : CheckMode -> Nat -> List Entry -> FileItem -> DeclarationResult)
+    (fuel : Nat) (required : List Nat) (items : List FileItem) : DeclarationResult :=
+    check_declarations_with check_one CheckSourceCore keep_checking fuel required items;
+
+def check_module (fuel : Nat) (required : List Nat)
+    (items : List FileItem) : DeclarationResult :=
+    check_indexed_module_with check_indexed_declaration fuel required items;
+
+-- Compatibility views for existing Core fixtures. They contain no independent
+-- checking traversal; production consumers use the typed declaration result.
+inductive StepResult : Type :=
+  | StepOk : List Entry -> StepResult
+  | StepErr : Nat -> Nat -> StepResult;
+
+def declaration_step_result (mode : CheckMode) (result : DeclarationResult) : StepResult :=
+    match result with
+    | DeclarationsOk entries => StepOk entries
+    | DeclarationsErr name phase failure =>
+        StepErr (declaration_failure_code mode phase failure) name
+    end;
+
+def check_item (fuel : Nat) (sig : List Entry) (item : FileItem) : StepResult :=
+    declaration_step_result CheckExactCore (check_declaration CheckExactCore fuel sig item);
+
+def elaborate_check_item (fuel : Nat) (sig : List Entry) (item : FileItem) : StepResult :=
+    declaration_step_result CheckSourceCore (check_declaration CheckSourceCore fuel sig item);
+
+def check_file (fuel : Nat) (items : List FileItem) : FileResult :=
+    declaration_file_result CheckExactCore
+      (check_declarations CheckExactCore keep_checking fuel items);
+
+def check_file_selected (fuel : Nat) (required : List Nat)
+    (items : List FileItem) : FileResult :=
+    declaration_file_result CheckExactCore
+      (check_indexed_declarations_with check_indexed_declaration CheckExactCore keep_checking fuel required items);
+
+def elaborate_file_selected (fuel : Nat) (required : List Nat)
+    (items : List FileItem) : FileResult :=
+    declaration_file_result CheckSourceCore (check_module fuel required items);
+
+inductive SurfItem : Type :=
+  | SDef : Nat -> Surface -> Surface -> SurfItem
+  | SAxiom : Nat -> Surface -> SurfItem;
+
+def surf_item_fits (fuel : Nat) (it : SurfItem) : Bool :=
+    match it with
+    | SDef _ ty body => andb (surface_fits fuel ty) (surface_fits fuel body)
+    | SAxiom _ ty => surface_fits fuel ty
+    end;
+
+def surf_file_fits (fuel : Nat) : List SurfItem -> Bool :=
+    fix surf_file_fits (items : List SurfItem) : Bool :=
+      match items with
+      | Nil => True
+      | Cons it rest => andb (surf_item_fits fuel it) (surf_file_fits rest)
+      end;
+
+def elab_surf_item (fuel : Nat) (it : SurfItem) : FileItem :=
+    match it with
+    | SDef name ty body =>
+        FDef name (elaborate fuel ty (Nil Nat)) (elaborate fuel body (Nil Nat))
+    | SAxiom name ty =>
+        FAxiom name (elaborate fuel ty (Nil Nat))
+    end;
+
+def elab_file (fuel : Nat) : List SurfItem -> List FileItem :=
+    fix elab_file (xs : List SurfItem) : List FileItem :=
+      match xs with
+      | Nil => Nil FileItem
+      | Cons it xs' => Cons FileItem (elab_surf_item fuel it) (elab_file xs')
+      end;
+
+def check_surf_file (fuel : Nat) (items : List SurfItem) : FileResult :=
+    match surf_file_fits fuel items with
+    | False => FRErr 4 Z
+    | True => elaborate_file_selected fuel (Nil Nat) (elab_file fuel items)
+    end;
+
+def core_defs_to_items :
+  List (Pair Nat (Pair CoreTerm CoreTerm)) -> List FileItem :=
+  fix core_defs_to_items (xs : List (Pair Nat (Pair CoreTerm CoreTerm)))
+    : List FileItem :=
+    match xs with
+    | Nil => Nil FileItem
+    | Cons p xs' =>
+        match p with
+        | MkPair name tb =>
+            match tb with
+            | MkPair ty body =>
+                Cons FileItem (FDef name ty body) (core_defs_to_items xs')
+            end
+        end
+    end;
+
+def inds_to_items : List IndDecl -> List FileItem :=
+  fix inds_to_items (xs : List IndDecl) : List FileItem :=
+    match xs with
+    | Nil => Nil FileItem
+    | Cons d xs' =>
+        Cons FileItem (FInd d) (inds_to_items xs')
+    end;
+
+-- Host entry: inds then defs (no host-side FileItem assembly).
+def check_cores_with_inds (fuel : Nat) (inds : List IndDecl) (defs : List (Pair Nat (Pair CoreTerm CoreTerm))) : FileResult :=
+    check_file fuel
+      (append FileItem (inds_to_items inds) (core_defs_to_items defs));

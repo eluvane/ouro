@@ -1,0 +1,186 @@
+-- Keep checked Core identities through closure conversion and case lowering.
+-- Erased binders use the existing extraction predicates; no checker retry or
+-- unchecked fallback is introduced by this internal managed entry.
+import "managed_primitives.ouro";
+import "managed_fast_nat.ouro";
+import "managed_fast_nat_small.ouro";
+import "managed_terms_common.ouro";
+
+def managed_service_intrinsic_value (compiler : ManagedCompiler) (primitive : PrimitiveId)
+    (state : ManagedState) : Either NativeLowerError ManagedResult :=
+    match primitive_id_equal primitive PrimitiveFileTemp with
+    | True => managed_temp_value compiler False state
+    | False => match primitive_id_equal primitive PrimitiveFileTempIn with
+      | True => managed_temp_value compiler True state
+      | False => match primitive_id_equal primitive PrimitiveProcessCapture with
+        | True => managed_process_value compiler state
+        | False => match primitive_id_equal primitive PrimitiveProcessInherit with
+          | True => managed_process_inherit_value compiler state
+          | False => match primitive_id_equal primitive PrimitiveProcessBounded with
+            | True => managed_process_bounded_value compiler state
+            | False => match primitive_id_equal primitive PrimitiveHttpPost with
+          | True => managed_http_value compiler state
+          | False => managed_file_intrinsic_value compiler primitive state end end end end end end;
+
+def managed_host_intrinsic_value (compiler : ManagedCompiler) (primitive : PrimitiveId)
+    (state : ManagedState) : Either NativeLowerError ManagedResult :=
+    match primitive_id_equal primitive PrimitiveTimeNow with
+    | True => managed_time_action compiler state
+    | False => match managed_stdio_operation primitive with
+      | Just operation => managed_stdio_value compiler operation state
+      | Nothing => match managed_startup_operation primitive with
+        | Just environment => managed_startup_value compiler environment state
+        | Nothing => match managed_stdin_operation primitive with
+          | Just bytes => managed_stdin_value compiler bytes state
+          | Nothing => managed_service_intrinsic_value compiler primitive state end end end end;
+
+def managed_bound_value (compiler : ManagedCompiler) (step : ManagedStep) (fuel : Nat)
+    (id : Nat) (annotation : CoreTerm) (binding : PrimitiveBinding) (state : ManagedState)
+    : Either NativeLowerError ManagedResult :=
+    match binding with
+    | PrimitiveIntrinsicBinding primitive _ _ _ => match string_nf_operation primitive with
+      | Just _ => managed_eta_value compiler step fuel id annotation state
+      | Nothing => match primitive_id_equal primitive PrimitiveFileRename with
+        | True => managed_eta_value compiler step fuel id annotation state
+        | False => managed_host_intrinsic_value compiler primitive state end end
+    | PrimitiveExternBinding _ => match lower_find_contract id (managed_compiler_raw compiler) with
+      | Nothing => Left NativeLowerError ManagedResult (LowerInvalidCall id)
+      | Just contract => match contract with | LowerContractOf _ _ parameters result _ =>
+        match lower_type_action result with
+        | False => Left NativeLowerError ManagedResult (LowerInvalidCall id)
+        | True => managed_external_value compiler contract parameters ([] : List MirValue) state
+        end end end end;
+
+def managed_global_value (compiler : ManagedCompiler) (step : ManagedStep) (fuel : Nat)
+    (id : Nat) (state : ManagedState) : Either NativeLowerError ManagedResult :=
+    match lower_find_entry id (managed_compiler_entries compiler) with
+    | Nothing => Left NativeLowerError ManagedResult (LowerUnknownGlobal id)
+    | Just entry => match entry with
+      | MkEntry _ _ body => match body with
+        | Nothing => Left NativeLowerError ManagedResult (LowerUnknownGlobal id)
+        | Just _ => managed_fresh MirManagedPtr (fun (local : Nat) =>
+            MirCall MirMayGc (Just Nat local) (MirDirect (managed_global_symbol compiler id)) ([] : List MirValue)) (managed_request_global id state) end
+      | MkBoundEntry _ annotation binding => managed_bound_value compiler step fuel id annotation binding state
+      | MkIndEntry _ _ => Left NativeLowerError ManagedResult (LowerUnsupportedTerm 7)
+      | MkRoleEntry _ => Left NativeLowerError ManagedResult (LowerUnsupportedTerm 7) end end;
+
+def managed_spine_global (compiler : ManagedCompiler) (step : ManagedStep) (scope : ManagedScope)
+    (fuel : Nat) (global : Pair Nat (List CoreTerm))
+    (ordinary : Unit -> Either NativeLowerError ManagedResult) (state : ManagedState)
+    : Either NativeLowerError ManagedResult :=
+    let id : Nat := fst Nat (List CoreTerm) global in
+    let arguments : List CoreTerm := snd Nat (List CoreTerm) global in
+    match lower_find_entry id (managed_compiler_entries compiler) with
+      | Nothing => Left NativeLowerError ManagedResult (LowerUnknownGlobal id)
+      | Just entry => match lower_entry_primitive entry with
+        | Nothing => match lower_find_contract id (managed_compiler_raw compiler) with
+          | Nothing => ordinary MkUnit
+          | Just contract => match managed_contract_saturated contract arguments with
+            | False => ordinary MkUnit
+            | True => managed_raw_contract_call compiler step scope contract arguments state end end
+        | Just binding => match binding with
+          | PrimitiveIntrinsicBinding primitive _ _ specialization =>
+              match managed_partial_string_application primitive arguments with
+              | True => ordinary MkUnit
+              | False => managed_primitive compiler step scope fuel primitive specialization arguments state end
+          | PrimitiveExternBinding _ => match lookup_type id (managed_compiler_entries compiler) with
+            | Nothing => Left NativeLowerError ManagedResult (LowerUnknownGlobal id)
+            | Just annotation => managed_external compiler step scope fuel id annotation binding arguments state end end end end;
+
+def managed_apply_spine (compiler : ManagedCompiler) (step : ManagedStep) (scope : ManagedScope) (fuel : Nat)
+    (spine : Pair CoreTerm (List CoreTerm)) (application : Pair CoreTerm CoreTerm)
+    (state : ManagedState) : Either NativeLowerError ManagedResult :=
+    let function : CoreTerm := fst CoreTerm CoreTerm application in
+    let argument : CoreTerm := snd CoreTerm CoreTerm application in
+    let ordinary : Unit -> Either NativeLowerError ManagedResult := fun (_ : Unit) =>
+      match managed_erased_argument compiler scope argument with
+      | True => step scope function state
+      | False => managed_application compiler step scope function argument state end in
+    match spine with | MkPair head arguments => match lower_term_view head with
+    | LowerConstructorTerm family index parameters =>
+        managed_constructor_application compiler step scope fuel family index parameters arguments state
+    | LowerGlobalTerm id => managed_spine_global compiler step scope fuel
+        (MkPair Nat (List CoreTerm) id arguments) ordinary state
+    | LowerLocalTerm _ => ordinary MkUnit | LowerLambdaTerm _ _ => ordinary MkUnit
+    | LowerApplyTerm _ _ => ordinary MkUnit | LowerLetTerm _ _ _ => ordinary MkUnit
+    | LowerCaseTerm _ _ _ _ => ordinary MkUnit | LowerOtherTerm _ => ordinary MkUnit end end;
+
+def managed_expression (compiler : ManagedCompiler) : Nat -> ManagedStep :=
+  fix expression (fuel : Nat) (scope : ManagedScope) (term : CoreTerm) (state : ManagedState)
+      : Either NativeLowerError ManagedResult :=
+    match fuel with | Z => Left NativeLowerError ManagedResult LowerResourceExhausted
+    | S next => let step : ManagedStep := fun (environment : ManagedScope) (body : CoreTerm) (current : ManagedState) =>
+        expression next environment body current in
+      match term with
+      | CRel index => match compiler_nth (Maybe MirValue) scope index with
+        | Nothing => Left NativeLowerError ManagedResult (LowerUnboundLocal index)
+        | Just binding => match binding with | Nothing => Left NativeLowerError ManagedResult (LowerUnsupportedTerm 0)
+          | Just value => Right NativeLowerError ManagedResult (ManagedResultOf value state) end end
+      | CLam annotation body => match is_sort_ann annotation with
+        | True => step (Cons (Maybe MirValue) (Nothing MirValue) scope) body state
+        | False => managed_compile_closure compiler step scope body False state end
+      | CLetIn value annotation body => match is_sort_ann annotation with
+        | True => step (Cons (Maybe MirValue) (Nothing MirValue) scope) body state
+        | False => lower_bind ManagedResult ManagedResult (step scope value state)
+            (fun (bound : ManagedResult) => match bound with | ManagedResultOf actual after =>
+              step (Cons (Maybe MirValue) (Just MirValue actual) scope) body after end) end
+      | CApp function argument => lower_bind (Pair CoreTerm (List CoreTerm)) ManagedResult
+          (lower_spine next term ([] : List CoreTerm)) (fun (spine : Pair CoreTerm (List CoreTerm)) =>
+            managed_apply_spine compiler step scope next spine (MkPair CoreTerm CoreTerm function argument) state)
+      | CConst id => managed_global_value compiler step next id state
+      | CConstruct family index parameters => managed_constructor_application compiler step scope next family index parameters ([] : List CoreTerm) state
+      | CCase info _ scrutinee branches => managed_case_expression compiler step next scope info scrutinee branches state
+      | CFix _ _ _ _ body => managed_fix compiler step next
+          (Cons (Maybe MirValue) (Just MirValue (managed_bits MirManagedPtr 0)) scope) body state
+      | CSort _ => Left NativeLowerError ManagedResult (LowerUnsupportedType term)
+      | CPi _ _ => Left NativeLowerError ManagedResult (LowerUnsupportedType term)
+      | CInd _ => Left NativeLowerError ManagedResult (LowerUnsupportedType term)
+      | CStrLit _ _ => Left NativeLowerError ManagedResult (LowerUnsupportedTerm 11)
+      | CStrBytes bytes _ => managed_string_literal compiler bytes state end end;
+
+def managed_global_expression (compiler : ManagedCompiler) (fuel : Nat) (id : Nat)
+    (body : CoreTerm) (state : ManagedState) : Either NativeLowerError ManagedResult :=
+    match lookup_type id (managed_compiler_entries compiler) with
+    | Nothing => Left NativeLowerError ManagedResult (LowerUnknownGlobal id)
+    | Just annotation => lower_bind (Maybe ManagedNatOperation) ManagedResult
+        (managed_nat_recognize (managed_compiler_entries compiler) fuel id annotation body)
+        (fun (operation : Maybe ManagedNatOperation) => match operation with
+          | Nothing => lower_bind (Maybe ManagedNatSmallOperation) ManagedResult
+              (managed_small_nat_recognize compiler fuel id annotation body)
+              (fun (small : Maybe ManagedNatSmallOperation) => match small with
+                | Nothing => managed_expression compiler fuel ([] : List (Maybe MirValue)) body state
+                | Just scalar => lower_bind ManagedResult ManagedResult
+                    (managed_expression compiler fuel ([] : List (Maybe MirValue)) body state)
+                    (fun (source : ManagedResult) => match source with | ManagedResultOf original after =>
+                      managed_small_nat_value compiler scalar 2 ([original] : List MirValue) after end) end)
+          | Just selected => managed_fast_nat_value compiler selected 2 ([] : List MirValue) state end) end;
+
+def managed_global_function (compiler : ManagedCompiler) (fuel : Nat) (id : Nat) (state : ManagedState)
+    : Either NativeLowerError ManagedState :=
+    lower_bind (List Nat) ManagedState
+      (lower_label (checked_program_intern (managed_compiler_program compiler)) id)
+      (fun (name : List Nat) => lower_bind CoreTerm ManagedState (managed_global_body compiler fuel id)
+        (fun (body : CoreTerm) => lower_map ManagedResult ManagedState (fun (result : ManagedResult) => match result with
+          | ManagedResultOf value after => managed_add_function
+              (managed_finish_function (managed_global_symbol compiler id) name ([] : List MirLocal) value after) after end)
+          (managed_global_expression compiler fuel id body (managed_with_flow state (lower_empty_state 0)))));
+
+-- The caller may reclaim a completed global's temporary work. Pending order,
+-- fuel and checked body compilation remain in this loop.
+def managed_global_functions_with
+    (run_global : (Unit -> Either NativeLowerError ManagedState) -> Either NativeLowerError ManagedState)
+    (compiler : ManagedCompiler) (body_fuel : Nat)
+    : Nat -> ManagedState -> Either NativeLowerError ManagedState :=
+  fix compile_globals (fuel : Nat) (state : ManagedState) : Either NativeLowerError ManagedState :=
+    match state with | ManagedStateOf symbol functions data pending known flow => match pending with
+      | Nil => Right NativeLowerError ManagedState state
+      | Cons id rest => match fuel with | Z => Left NativeLowerError ManagedState LowerResourceExhausted
+        | S next => lower_bind ManagedState ManagedState
+            (run_global (fun (_ : Unit) =>
+              managed_global_function compiler body_fuel id (ManagedStateOf symbol functions data rest known flow)))
+            (fun (after : ManagedState) => compile_globals next after) end end end;
+
+def managed_global_functions (compiler : ManagedCompiler) (body_fuel : Nat)
+    : Nat -> ManagedState -> Either NativeLowerError ManagedState :=
+    managed_global_functions_with
+      (fun (work : Unit -> Either NativeLowerError ManagedState) => work MkUnit) compiler body_fuel;

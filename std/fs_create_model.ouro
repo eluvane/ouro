@@ -1,0 +1,105 @@
+-- Exclusive-directory results retain whether an OS creation already happened.
+import "string.ouro";
+import "natx.ouro";
+
+inductive FsCreateDirError : Type :=
+  | FsCreateDirConstantsFailed : FsCreateDirError
+  | FsCreateDirInvalidPath : FsCreateDirError
+  | FsCreateDirPathTooLong : FsCreateDirError
+  | FsCreateDirAllocationFailed : FsCreateDirError
+  | FsCreateDirConversionFailed : FsCreateDirError
+  | FsCreateDirInvalidCount : FsCreateDirError
+  | FsCreateDirCreateFailed : FsCreateDirError
+  | FsCreateDirCleanupFailed : Bool -> Maybe FsCreateDirError -> FsCreateDirError;
+
+def fs_create_dir_error_code (error : FsCreateDirError) : String :=
+    match error with
+    | FsCreateDirConstantsFailed => "fs_create_dir_constants"
+    | FsCreateDirInvalidPath => "fs_create_dir_invalid_path"
+    | FsCreateDirPathTooLong => "fs_create_dir_path_too_long"
+    | FsCreateDirAllocationFailed => "fs_create_dir_allocation"
+    | FsCreateDirConversionFailed => "fs_create_dir_conversion"
+    | FsCreateDirInvalidCount => "fs_create_dir_count"
+    | FsCreateDirCreateFailed => "fs_create_dir_create"
+    | FsCreateDirCleanupFailed _ _ => "fs_create_dir_cleanup"
+    end;
+
+def fs_create_dir_error_message (error : FsCreateDirError) : String :=
+    match error with
+    | FsCreateDirConstantsFailed => "exclusive directory creation: machine-word constants unavailable"
+    | FsCreateDirInvalidPath => "exclusive directory creation: path is empty or contains NUL"
+    | FsCreateDirPathTooLong => "exclusive directory creation: path exceeds the input buffer"
+    | FsCreateDirAllocationFailed => "exclusive directory creation: buffer allocation failed"
+    | FsCreateDirConversionFailed => "exclusive directory creation: strict UTF-8 conversion failed"
+    | FsCreateDirInvalidCount => "exclusive directory creation: invalid UTF-16 output count"
+    | FsCreateDirCreateFailed => "exclusive directory creation: CreateDirectoryW failed, including an existing target"
+    | FsCreateDirCleanupFailed created previous => str_concat
+        (match created with
+         | True => "exclusive directory creation: directory was created; buffer release failed"
+         | False => "exclusive directory creation: directory was not created; buffer release failed"
+         end)
+        (match previous with
+         | Nothing => ""
+         | Just cause => str_concat " after " (fs_create_dir_error_code cause)
+         end)
+    end;
+
+def fs_create_dir_error_created (error : FsCreateDirError) : Bool :=
+    match error with
+    | FsCreateDirConstantsFailed => False
+    | FsCreateDirInvalidPath => False
+    | FsCreateDirPathTooLong => False
+    | FsCreateDirAllocationFailed => False
+    | FsCreateDirConversionFailed => False
+    | FsCreateDirInvalidCount => False
+    | FsCreateDirCreateFailed => False
+    | FsCreateDirCleanupFailed created _ => created
+    end;
+
+-- Right and a cleanup failure after successful creation both retain the claim.
+-- This reports the operation's result, not an enduring handle to a path name.
+def fs_create_dir_was_created (result : Either FsCreateDirError Unit) : Bool :=
+    match result with
+    | Right _ => True
+    | Left error => fs_create_dir_error_created error
+    end;
+
+-- Byte bounds and NUL rejection precede raw allocation. UTF-8 validity is
+-- checked by the strict platform converter before any directory call.
+def fs_create_dir_path_length (path : String) (capacity : Nat) : Either FsCreateDirError Nat :=
+    let bytes : Nat := str_len path in
+    match eq_nat bytes 0 with
+    | True => Left FsCreateDirError Nat FsCreateDirInvalidPath
+    | False => match leb_nat bytes capacity with
+      | False => Left FsCreateDirError Nat FsCreateDirPathTooLong
+      | True => match elem Nat eq_nat 0 (str_codes path) with
+        | True => Left FsCreateDirError Nat FsCreateDirInvalidPath
+        | False => Right FsCreateDirError Nat bytes
+        end
+      end
+    end;
+
+-- Capacity includes the two-byte terminator, which is written separately.
+def fs_create_dir_wide_count (actual : Nat) (capacity : Nat) : Either FsCreateDirError Nat :=
+    match andb (ltb_nat 0 actual) (ltb_nat actual capacity) with
+    | False => Left FsCreateDirError Nat FsCreateDirInvalidCount
+    | True => Right FsCreateDirError Nat actual
+    end;
+
+def fs_create_dir_result (created : Bool) : Either FsCreateDirError Unit :=
+    match created with
+    | True => Right FsCreateDirError Unit MkUnit
+    | False => Left FsCreateDirError Unit FsCreateDirCreateFailed
+    end;
+
+-- A release failure never becomes Right and never loses an earlier claim/error.
+def fs_create_dir_released (result : Either FsCreateDirError Unit) (released : Bool)
+    : Either FsCreateDirError Unit :=
+    match released with
+    | True => result
+    | False => Left FsCreateDirError Unit (FsCreateDirCleanupFailed (fs_create_dir_was_created result)
+        (match result with
+         | Right _ => Nothing FsCreateDirError
+         | Left error => Just FsCreateDirError error
+         end))
+    end;

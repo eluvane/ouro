@@ -1,0 +1,113 @@
+-- Checked ordinary bodies and complete pointee types authorize raw calls.
+-- Context handles and raw pages are explicit; managed captures remain roots.
+import "managed_files_memory.ouro";
+import "managed_startup_strings.ouro";
+import "managed_runtime_symbols.ouro";
+
+inductive ManagedHttpHelper : Type :=
+  | ManagedHttpOpen : ManagedHttpHelper | ManagedHttpHeader : ManagedHttpHelper
+  | ManagedHttpSend : ManagedHttpHelper | ManagedHttpClose : ManagedHttpHelper;
+inductive ManagedHttpScope : Type :=
+  | ManagedHttpScopeOf : List MirValue -> Maybe MirValue -> ManagedHttpScope;
+
+def managed_http_helper_name (helper : ManagedHttpHelper) : List Nat :=
+    match helper with
+    | ManagedHttpOpen => managed_runtime_symbol "raw_windows_http_open"
+    | ManagedHttpHeader => managed_runtime_symbol "raw_windows_http_header"
+    | ManagedHttpSend => managed_runtime_symbol "raw_windows_http_send"
+    | ManagedHttpClose => managed_runtime_symbol "raw_windows_http_close"
+    end;
+
+def managed_http_expected (compiler : ManagedCompiler) (helper : ManagedHttpHelper) : Either NativeLowerError CoreTerm :=
+    let bindings : List PrimitiveResolved := primitive_environment (managed_compiler_entries compiler) in
+    lower_from_primitive CoreTerm (CSort 0)
+      (primitive_bind CoreTerm CoreTerm (primitive_type_ref PrimitiveRuntimeType bindings) (fun (runtime : CoreTerm) =>
+        primitive_bind CoreTerm CoreTerm (primitive_type_ref PrimitiveRawPtrType bindings) (fun (pointer : CoreTerm) =>
+          primitive_bind CoreTerm CoreTerm (primitive_type_ref PrimitiveU8Type bindings) (fun (byte : CoreTerm) =>
+            primitive_bind CoreTerm CoreTerm (primitive_type_ref PrimitiveUSizeType bindings) (fun (size : CoreTerm) =>
+              primitive_map CoreTerm CoreTerm (fun (word : CoreTerm) =>
+                let buffer : CoreTerm := CApp pointer byte in
+                primitive_arrow (match helper with
+                  | ManagedHttpOpen => ([buffer, buffer, size, size] : List CoreTerm)
+                  | ManagedHttpHeader => ([buffer, buffer, size, buffer, size, size] : List CoreTerm)
+                  | ManagedHttpSend => ([buffer, buffer, size, size] : List CoreTerm)
+                  | ManagedHttpClose => ([buffer, size] : List CoreTerm) end) (CApp runtime word))
+                (primitive_type_ref PrimitiveU32Type bindings))))));
+
+def managed_http_roots (compiler : ManagedCompiler) (fuel : Nat) : Either NativeLowerError (List Nat) :=
+    match managed_stdio_has compiler PrimitiveHttpPost with
+    | False => Right NativeLowerError (List Nat) ([] : List Nat)
+    | True => lower_bind (List Nat) (List Nat)
+        ((fix roots (helpers : List ManagedHttpHelper) : Either NativeLowerError (List Nat) :=
+          match helpers with | Nil => Right NativeLowerError (List Nat) ([] : List Nat)
+          | Cons helper rest => lower_bind CoreTerm (List Nat) (managed_http_expected compiler helper)
+              (fun (expected : CoreTerm) => lower_bind Nat (List Nat)
+                (managed_runtime_definition compiler fuel (managed_http_helper_name helper) expected)
+                (fun (id : Nat) => lower_map (List Nat) (List Nat) (Cons Nat id) (roots rest))) end)
+          ([ManagedHttpOpen, ManagedHttpHeader, ManagedHttpSend, ManagedHttpClose] : List ManagedHttpHelper))
+        (fun (http : List Nat) => (fix roots (helpers : List ManagedFileHelper) : Either NativeLowerError (List Nat) :=
+          match helpers with | Nil => Right NativeLowerError (List Nat) http
+          | Cons helper rest => lower_bind CoreTerm (List Nat) (managed_file_expected compiler helper)
+              (fun (expected : CoreTerm) => lower_bind Nat (List Nat)
+                (managed_runtime_definition compiler fuel (managed_file_helper_name helper) expected)
+                (fun (id : Nat) => lower_map (List Nat) (List Nat) (Cons Nat id) (roots rest))) end)
+          ([ManagedFileAllocate, ManagedFileRelease, ManagedFileToWide] : List ManagedFileHelper)) end;
+
+def managed_http_call (compiler : ManagedCompiler) (helper : ManagedHttpHelper)
+    (arguments : List MirValue) (state : ManagedState) : Either NativeLowerError ManagedResult :=
+    lower_bind CoreTerm ManagedResult (managed_http_expected compiler helper) (fun (expected : CoreTerm) =>
+      lower_bind LowerContract ManagedResult
+        (managed_runtime_contract compiler primitive_default_fuel (managed_http_helper_name helper) expected)
+        (fun (contract : LowerContract) => managed_fresh MirU32 (fun (local : Nat) =>
+          MirCall MirMayGc (Just Nat local) (MirDirect (lower_contract_id contract))
+            (append MirValue arguments ([managed_bits MirUSize 1] : List MirValue))) state));
+
+def managed_http_cleanup (compiler : ManagedCompiler) (scope : ManagedHttpScope) (state : ManagedState)
+    : Either NativeLowerError ManagedResult :=
+    match scope with | ManagedHttpScopeOf buffers context => match context with
+      | Nothing => managed_startup_release_all compiler buffers (managed_bits MirU8 1) state
+      | Just ctx => lower_bind ManagedResult ManagedResult
+          (managed_http_call compiler ManagedHttpClose ([ctx] : List MirValue) state)
+          (fun (closed : ManagedResult) => match closed with | ManagedResultOf status next =>
+            lower_bind ManagedResult ManagedResult (managed_startup_zero status next)
+              (fun (tested : ManagedResult) => match tested with | ManagedResultOf okay after =>
+                managed_startup_release_all compiler buffers okay after end) end) end end;
+
+def managed_http_require (compiler : ManagedCompiler) (scope : ManagedHttpScope) (condition : MirValue)
+    (state : ManagedState) : Either NativeLowerError ManagedState :=
+    lower_bind Nat ManagedState (managed_stdio_exit_symbol compiler) (fun (exit : Nat) =>
+      lower_bind LowerLoopBlocks ManagedState (lower_loop_blocks (managed_flow state))
+        (fun (labels : LowerLoopBlocks) => match labels with | LowerLoopAt valid invalid _ flow =>
+          lower_map ManagedResult ManagedState (fun (cleaned : ManagedResult) => match cleaned with
+            | ManagedResultOf _ after => managed_switch_block valid MirTrap
+                (managed_emit (MirCall MirMayGc (Nothing Nat) (MirDirect exit)
+                  ([managed_bits MirU32 73] : List MirValue)) after) end)
+            (managed_http_cleanup compiler scope
+              (managed_with_flow state (lower_switch_block invalid (MirBranch condition valid invalid) flow))) end));
+
+def managed_http_status (compiler : ManagedCompiler) (scope : ManagedHttpScope) (status : MirValue)
+    (state : ManagedState) : Either NativeLowerError ManagedState :=
+    lower_bind ManagedResult ManagedState (managed_startup_zero status state)
+      (fun (tested : ManagedResult) => match tested with | ManagedResultOf okay next =>
+        managed_http_require compiler scope okay next end);
+
+-- A normal return releases only this page. Failure cleanup sees all live pages
+-- and the HTTP context. Thus loop-local conversion pages never accumulate.
+def managed_http_buffer (compiler : ManagedCompiler) (scope : ManagedHttpScope) (bytes : MirValue)
+    (body : MirValue -> ManagedHttpScope -> ManagedState -> Either NativeLowerError ManagedResult)
+    (state : ManagedState) : Either NativeLowerError ManagedResult :=
+    lower_bind ManagedResult ManagedResult
+      (managed_file_call compiler ManagedFileAllocate ([bytes, managed_bits MirUSize 8] : List MirValue) state)
+      (fun (allocated : ManagedResult) => match allocated with | ManagedResultOf buffer next =>
+        lower_bind ManagedResult ManagedResult (managed_compare MirNotEqual buffer (managed_bits MirRawPtr 0) next)
+          (fun (tested : ManagedResult) => match tested with | ManagedResultOf valid after =>
+            lower_bind ManagedState ManagedResult (managed_http_require compiler scope valid after)
+              (fun (checked : ManagedState) => lower_bind ManagedResult ManagedResult
+                (body buffer (match scope with | ManagedHttpScopeOf buffers ctx =>
+                  ManagedHttpScopeOf (Cons MirValue buffer buffers) ctx end) checked)
+                (fun (finished : ManagedResult) => match finished with | ManagedResultOf value returned =>
+                  lower_bind ManagedResult ManagedResult
+                    (managed_file_call compiler ManagedFileRelease ([buffer] : List MirValue) returned)
+                    (fun (released : ManagedResult) => match released with | ManagedResultOf success final =>
+                      lower_map ManagedState ManagedResult (fun (done : ManagedState) => ManagedResultOf value done)
+                        (managed_http_require compiler scope success final) end) end)) end) end);

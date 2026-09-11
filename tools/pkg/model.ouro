@@ -1,0 +1,263 @@
+-- Pure package model; the registry layout is one directory per package with one selected version.
+
+import "../../std/jsonrpc.ouro";
+import "../../std/semver.ouro";
+import "../../std/fs.ouro";
+import "seal.ouro";
+
+def pkg_manifest_name : String := "Ouro.seal";
+
+def pkg_lock_name : String := "Ouro.lock";
+
+-- A registry holds one directory per package, and that directory holds one
+-- version. Version selection is therefore a range check, not a search: a
+-- registry that needs several versions of one package would need a nested
+-- <name>/<version>/ layout, which nothing here asks for yet.
+inductive Pkg : Type :=
+  | MkPkg : String -> String -> List (Pair String String) -> String -> Pkg;
+
+def pkg_name (p : Pkg) : String :=
+    match p with
+    | MkPkg n _ _ _ => n
+    end;
+
+def pkg_version (p : Pkg) : String :=
+    match p with
+    | MkPkg _ v _ _ => v
+    end;
+
+def pkg_deps (p : Pkg) : List (Pair String String) :=
+    match p with
+    | MkPkg _ _ d _ => d
+    end;
+
+def pkg_registry (p : Pkg) : String :=
+    match p with
+    | MkPkg _ _ _ r => r
+    end;
+
+def pkg_ident_alnum (c : Nat) : Bool := orb (is_alpha c) (is_digit c);
+
+def pkg_ident_char (c : Nat) : Bool :=
+    orb (pkg_ident_alnum c)
+      (orb (eq_nat c 45) (orb (eq_nat c 46) (eq_nat c 95)));
+
+-- One portable path segment.  Requiring alphanumeric edges avoids dot names,
+-- trailing-dot aliases on Windows, separators, drive prefixes, and controls.
+def pkg_ident_ok (name : String) : Bool :=
+    let cs : List Nat := str_codes name in
+    match cs with
+    | Nil => False
+    | Cons first rest =>
+        let lastc : Nat := last Nat first rest in
+        andb (leb_nat (str_len name) 128)
+          (andb (pkg_ident_alnum first)
+            (andb (pkg_ident_alnum lastc) (all Nat pkg_ident_char cs)))
+    end;
+
+def pkg_dep_name_ok (d : Pair String String) : Bool :=
+    match d with
+    | MkPair name _ => pkg_ident_ok name
+    end;
+
+def seal_dep_pair (p : Pair String SealVal) : Pair String String :=
+    match p with
+    | MkPair k v => MkPair String String k (seal_val_text v)
+    end;
+
+def seal_to_pkg (d : SealDoc) : Pkg :=
+    let project : List (Pair String SealVal) := seal_block_named d "project" in
+    let deps : List (Pair String SealVal) := seal_block_named d "deps" in
+    let registry : List (Pair String SealVal) :=
+      seal_block_named d "registry" in
+    MkPkg (seal_field_text project "name" "")
+      (seal_field_text project "version" "0.0.0")
+      (map (Pair String SealVal) (Pair String String) seal_dep_pair deps)
+      (seal_field_text registry "source" "");
+
+def pkg_parse (text : String) : Maybe Pkg :=
+    match seal_parse text with
+    | Nothing => Nothing Pkg
+    | Just d => Just Pkg (seal_to_pkg d)
+    end;
+
+def seal_from_pkg (p : Pkg) : SealDoc :=
+    seal_put_identity (MkSealDoc seal_format_version (Nil SealBlock))
+      (pkg_name p) (pkg_version p) (pkg_deps p) (pkg_registry p);
+
+def pkg_manifest_ok (p : Pkg) : Bool :=
+    andb (pkg_ident_ok (pkg_name p))
+      (andb (all (Pair String String) pkg_dep_name_ok (pkg_deps p))
+        (maybe Semver Bool False (fun (_v : Semver) => True)
+          (sv_parse (pkg_version p))));
+
+def pkg_render (p : Pkg) : String :=
+    seal_render (seal_from_pkg p);
+
+def pkg_new (name : String) (registry : String) : Pkg :=
+    MkPkg name "0.1.0" (Nil (Pair String String)) registry;
+
+-- Adding a dependency twice replaces the range instead of duplicating it.
+def pkg_with_dep (p : Pkg) (name : String) (range : String) : Pkg :=
+    match p with
+    | MkPkg n v ds r =>
+        MkPkg n v (assoc_insert String String str_eq name range ds) r
+    end;
+
+def pkg_without_dep (p : Pkg) (name : String) : Pkg :=
+    match p with
+    | MkPkg n v ds r =>
+        MkPkg n v (assoc_delete String String str_eq name ds) r
+    end;
+
+-- Digest: a drift detector over the files a package installs, not a signature.
+-- It is a rolling mix so file order and content both matter, and the modulus
+-- keeps it inside host Nat range (add/mul/sub are host-accelerated, so the
+-- arithmetic costs nothing, but 31*acc must not overflow).
+-- The modulus is built from 256s rather than written as a numeral: a decimal
+-- literal elaborates to that many S constructors, and extract.ouro gives each
+-- definition 1000 steps, so a literal in the millions exhausts the fuel and
+-- leaves a JErr that only shows up when the program runs.
+def pkg_byte_span : Nat := 256;
+def digest_mod : Nat := sub (mul (mul pkg_byte_span pkg_byte_span) pkg_byte_span) 3;
+
+def digest_mix_codes : List Nat -> Nat -> Nat :=
+  fix digest_mix_codes (cs : List Nat) (acc : Nat) : Nat :=
+    match cs with
+    | Nil => acc
+    | Cons c rest =>
+        digest_mix_codes rest (mod_nat (add (mul acc 31) (S c)) digest_mod)
+    end;
+
+inductive Digest : Type :=
+  | MkDigest : Nat -> Nat -> Nat -> Digest;
+
+def digest_empty : Digest := MkDigest Z Z (S Z);
+
+-- One file contributes its path and its bytes, so a rename is a change too.
+def digest_step (d : Digest) (path : String) (body : String) : Digest :=
+    match d with
+    | MkDigest n b m =>
+        MkDigest (S n) (add b (str_len body))
+          (digest_mix_codes (str_codes body)
+            (digest_mix_codes (str_codes path) m))
+    end;
+
+def digest_show (d : Digest) : String :=
+    match d with
+    | MkDigest n b m =>
+        str_cat3 (str_concat "files=" (show_nat n))
+          (str_concat ",bytes=" (show_nat b))
+          (str_concat ",mix=" (show_nat m))
+    end;
+
+inductive Locked : Type :=
+  | MkLocked : String -> String -> String -> String -> Locked;
+
+def locked_name (l : Locked) : String :=
+    match l with
+    | MkLocked n _ _ _ => n
+    end;
+
+def locked_version (l : Locked) : String :=
+    match l with
+    | MkLocked _ v _ _ => v
+    end;
+
+def locked_digest (l : Locked) : String :=
+    match l with
+    | MkLocked _ _ _ d => d
+    end;
+
+def locked_to_json (l : Locked) : Json :=
+    match l with
+    | MkLocked n v s d =>
+        let fields : List (Pair String Json) :=
+          [ MkPair String Json "name" (JStr n)
+          , MkPair String Json "version" (JStr v)
+          , MkPair String Json "source" (JStr s)
+          , MkPair String Json "digest" (JStr d) ] in
+        JObj fields
+    end;
+
+def lock_render (ls : List Locked) : String :=
+    let fields : List (Pair String Json) :=
+      [ MkPair String Json "packages"
+          (JArr (map Locked Json locked_to_json ls)) ] in
+    str_concat (json_print (JObj fields)) "\n";
+
+def locked_of_json (j : Json) : Locked :=
+    MkLocked (json_field_str j "name" "")
+      (json_field_str j "version" "0.0.0")
+      (json_field_str j "source" "")
+      (json_field_str j "digest" "");
+
+def lock_parse (text : String) : Maybe (List Locked) :=
+    match parse_json text with
+    | Nothing => Nothing (List Locked)
+    | Just j =>
+        match json_obj_get j "packages" with
+        | Nothing => Nothing (List Locked)
+        | Just pkgs =>
+            match pkgs with
+            | JArr xs =>
+                let locked : List Locked := map Json Locked locked_of_json xs in
+                match all Locked
+                    (fun (l : Locked) => pkg_ident_ok (locked_name l)) locked with
+                | True => Just (List Locked) locked
+                | False => Nothing (List Locked)
+                end
+            | JNull => Nothing (List Locked)
+            | JBool _ => Nothing (List Locked)
+            | JNum _ => Nothing (List Locked)
+            | JStr _ => Nothing (List Locked)
+            | JObj _ => Nothing (List Locked)
+            end
+        end
+    end;
+
+def lock_find (ls : List Locked) (name : String) : Maybe Locked :=
+    find Locked (fun (l : Locked) => str_eq (locked_name l) name) ls;
+
+-- Paths. A registry path is relative to the project root, like the imports the
+-- installed sources will use.
+def pkg_src_dir (registry : String) (name : String) : String :=
+    fs_child registry name;
+
+def pkg_manifest_path (dir : String) : String :=
+    fs_child dir pkg_manifest_name;
+
+def pkg_vendor_path (name : String) : String :=
+    fs_child "_ouro_pkgs" name;
+
+-- Resolution outcome per dependency, so the CLI can report every problem in
+-- one pass instead of exiting on the first.
+inductive Resolved : Type :=
+  | ROk : Pkg -> Resolved
+  | RErr : String -> Resolved;
+
+-- The range check is the whole of version selection (see the Pkg comment).
+def resolve_version (name : String) (range : String) (p : Pkg) : Resolved :=
+    match andb (pkg_ident_ok name) (pkg_manifest_ok p) with
+    | False => RErr (str_concat "bad manifest for package " name)
+    | True =>
+        match str_eq name (pkg_name p) with
+        | False =>
+            RErr (str_cat3 "manifest name mismatch: requested " name
+                    (str_concat ", found " (pkg_name p)))
+        | True =>
+            match sv_matches range (pkg_version p) with
+            | True => ROk p
+            | False =>
+                RErr (str_cat3 (str_concat "version mismatch for " name)
+                        (str_concat ": want " range)
+                        (str_concat ", found " (pkg_version p)))
+            end
+        end
+    end;
+
+def resolve_body (name : String) (range : String) (body : String) : Resolved :=
+    match pkg_parse body with
+    | Nothing => RErr (str_concat "bad manifest for package " name)
+    | Just p => resolve_version name range p
+    end;

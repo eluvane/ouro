@@ -1,0 +1,102 @@
+-- Suite policy must reject failed checker processes even if they printed an
+-- acceptance marker, and preserve manifest selection and error ordering.
+
+import "../std/test.ouro";
+import "../tools/test/manifest.ouro";
+import "../tools/test/suites.ouro";
+
+def suite_contract_first : ManifestRow :=
+    MkManifestRow "CASE.first" "tests/first.ouro" "check" "pass" 0 "";
+
+def suite_contract_second : ManifestRow :=
+    MkManifestRow "CASE.second" "tests/second.ouro" "check" "fail" 0 "CErr code=41";
+
+def suite_contract_manifest : String :=
+    "# ignored\nCASE.first\ttests/first.ouro\tcheck\tpass\t0\t\nOTHER.invalid\tonly-two\nCASE.second\ttests/second.ouro\tcheck\tfail\t0\tCErr code=41\r\n";
+
+def suite_contract_rows (rows : List ManifestRow) : String :=
+    str_join "," (map ManifestRow String manifest_row_id rows);
+
+def suite_contract_registered (path : String) : Bool :=
+    any SuiteFixture (fun (fixture : SuiteFixture) =>
+      str_eq path (suite_fixture_path fixture)) compiler_check_suite_fixtures;
+
+def suite_contract_unregistered (names : List String) : String :=
+    str_join "," (filter String (fun (name : String) =>
+      andb (str_starts name "compiler_")
+        (andb (str_ends name "_tests.ouro")
+          (notb (suite_contract_registered (str_concat "tests/" name))))) names);
+
+def suite_contract_laws : List Test :=
+    [ assert_true "checker exit zero and acceptance marker pass"
+        (check_result_ok (MkProcResult 0 "CHECK_OK\n" ""))
+    , assert_true "checker exit one cannot reuse an acceptance marker"
+        (notb (check_result_ok (MkProcResult 1 "CHECK_OK\n" "rejected")))
+    , assert_true "checker usage error cannot reuse an acceptance marker"
+        (notb (check_result_ok (MkProcResult 2 "CHECK_OK\n" "usage")))
+    , assert_true "checker crash cannot reuse an acceptance marker"
+        (notb (check_result_ok (MkProcResult 139 "CHECK_OK\n" "crash")))
+    , assert_true "checker exit zero still requires acceptance evidence"
+        (notb (check_result_ok (MkProcResult 0 "" "")))
+    , assert_true "acceptance marker on stderr retains its supported behavior"
+        (check_result_ok (MkProcResult 0 "" "CHECK_OK\n"))
+    , assert_true "manifest selection retains order and ignores unselected bad rows"
+        (match manifest_parse ["CASE."] suite_contract_manifest with
+         | MkPair rows errors => andb (str_eq (suite_contract_rows rows) "CASE.first,CASE.second")
+             (nullb String errors)
+         end)
+    , assert_eq "manifest parser preserves initial rows and errors"
+        (match manifest_parse_lines_go ["CASE."] 7
+          ["CASE.bad\tonly-two", "CASE.first\ttests/first.ouro\tcheck\tpass\t0\t"]
+          [suite_contract_second] ["earlier issue"] with
+         | MkPair rows errors => str_cat3 (suite_contract_rows rows) "|" (str_join "|" errors)
+         end)
+        "CASE.second,CASE.first|earlier issue|line 7: expected exactly six tab-separated columns"
+    , assert_eq "duplicate checks retain earlier ids and report every duplicate"
+        (str_join "|" (manifest_duplicate_errors_go ["CASE.first"]
+          [suite_contract_first, suite_contract_second, suite_contract_first]))
+        "duplicate id: CASE.first|duplicate id: CASE.first"
+    , assert_eq "selected duplicate rows remain an error"
+        (match manifest_parse ["CASE."]
+          "CASE.first\ttests/a.ouro\tcheck\tpass\t0\t\nCASE.first\ttests/b.ouro\tcheck\tpass\t0\t\n" with
+         | MkPair _ errors => str_join "|" errors
+         end)
+        "duplicate id: CASE.first"
+    , assert_eq "manifest positive row rejects failed checker with marker"
+        (manifest_process_issue suite_contract_first (MkProcResult 1 "CHECK_OK" "") "CHECK_OK")
+        "expected pass"
+    , assert_eq "manifest negative row requires the exact rejection status"
+        (manifest_process_issue suite_contract_second (MkProcResult 2 "CErr code=41" "") "CErr code=41")
+        "expected fail"
+    , assert_eq "manifest negative row requires the diagnostic"
+        (manifest_process_issue suite_contract_second (MkProcResult 1 "CErr code=43" "") "CErr code=43")
+        "missing CErr code=41"
+    , assert_eq "manifest negative row accepts the expected rejection"
+        (manifest_process_issue suite_contract_second (MkProcResult 1 "CErr code=41" "") "CErr code=41")
+        ""
+    , assert_true "constructor closure laws remain registered"
+        (suite_contract_registered "tests/constructor_closure_tests.ouro")
+    , assert_true "option precheck laws remain registered"
+        (suite_contract_registered "tests/args_structural_tests.ouro")
+    ];
+
+-- @entry main
+def main : IO Unit :=
+    (do let! files := fs_list_checked "tests";
+        match files with
+        | Left error => do eprintln (fs_error_message error); exit 1
+        | Right names =>
+            do let! empty_run := manifest_run_rows_go "." "." "UNUSED"
+                 [] 4 2 [MkManifestResult "earlier" "pass" 0 "earlier.out" ""];
+               test_run (append Test suite_contract_laws
+                 [ assert_eq "all compiler test files belong to the required suite"
+                     (suite_contract_unregistered names) ""
+                 , assert_eq "empty manifest execution preserves its initial state"
+                     (str_join ","
+                       [ show_nat (manifest_run_count empty_run)
+                       , show_nat (manifest_run_failures empty_run)
+                       , str_join "|" (map ManifestResult String manifest_result_id
+                           (manifest_run_results empty_run)) ])
+                     "4,2,earlier"
+                 ])
+        end);

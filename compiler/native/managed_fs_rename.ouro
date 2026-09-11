@@ -1,0 +1,71 @@
+-- Same-volume replacement returns the real OS status, so publication callers
+-- can remove their staging file without damaging an already installed image.
+import "managed_fs_copy.ouro";
+
+def managed_rename_name : List Nat :=
+    ([114,97,119,95,119,105,110,100,111,119,115,95,102,105,108,101,95,114,101,110,97,109,101] : List Nat);
+
+def managed_rename_expected (compiler : ManagedCompiler) : Either NativeLowerError CoreTerm :=
+    let entries : List Entry := managed_compiler_entries compiler in
+    let bindings : List PrimitiveResolved := primitive_environment entries in
+    lower_from_primitive CoreTerm (CSort 0)
+      (primitive_bind CoreTerm CoreTerm (primitive_type_ref PrimitiveRuntimeType bindings) (fun (runtime : CoreTerm) =>
+        primitive_bind CoreTerm CoreTerm (primitive_type_ref PrimitiveRawPtrType bindings) (fun (pointer : CoreTerm) =>
+          primitive_bind CoreTerm CoreTerm (primitive_type_ref PrimitiveU8Type bindings) (fun (byte : CoreTerm) =>
+            primitive_bind CoreTerm CoreTerm (primitive_type_ref PrimitiveUSizeType bindings) (fun (size : CoreTerm) =>
+              primitive_bind CoreTerm CoreTerm (primitive_type_ref PrimitiveU32Type bindings) (fun (word : CoreTerm) =>
+                primitive_map CoreTerm CoreTerm (fun (boolean : CoreTerm) =>
+                  let path : CoreTerm := CApp pointer byte in
+                  primitive_arrow ([path, size, path, size, boolean] : List CoreTerm) (CApp runtime word))
+                  (primitive_role_ref PrimitiveBoolRole (primitive_roles_environment entries))))))));
+
+def managed_rename_roots (compiler : ManagedCompiler) (fuel : Nat) : Either NativeLowerError (List Nat) :=
+    match managed_stdio_has compiler PrimitiveFileRename with
+    | False => Right NativeLowerError (List Nat) ([] : List Nat)
+    | True => lower_bind CoreTerm (List Nat) (managed_rename_expected compiler) (fun (expected : CoreTerm) =>
+        lower_bind Nat (List Nat) (managed_runtime_definition compiler fuel managed_rename_name expected)
+          (fun (rename : Nat) =>
+            (fix resolve (pending : List ManagedStartupHelper) : Either NativeLowerError (List Nat) :=
+              match pending with | Nil => Right NativeLowerError (List Nat) ([rename] : List Nat)
+              | Cons helper rest => lower_bind CoreTerm (List Nat) (managed_startup_expected compiler helper)
+                  (fun (signature : CoreTerm) => lower_bind Nat (List Nat)
+                    (managed_runtime_definition compiler fuel (managed_startup_helper_name helper) signature)
+                    (fun (id : Nat) => lower_map (List Nat) (List Nat) (Cons Nat id) (resolve rest))) end)
+              ([ManagedStartupAllocate, ManagedStartupRelease, ManagedStartupToWide] : List ManagedStartupHelper))) end;
+
+def managed_rename_query (compiler : ManagedCompiler) (source : MirValue) (source_units : MirValue)
+    (scope : ManagedStartupScope) (target : MirValue) (target_units : MirValue) (count : MirValue)
+    (state : ManagedState) : Either NativeLowerError ManagedResult :=
+    lower_bind CoreTerm ManagedResult (managed_rename_expected compiler) (fun (expected : CoreTerm) =>
+      lower_bind LowerContract ManagedResult
+        (managed_runtime_contract compiler primitive_default_fuel managed_rename_name expected)
+        (fun (contract : LowerContract) => lower_bind ManagedResult ManagedResult
+          (managed_fresh MirU32 (fun (local : Nat) => MirCall MirMayGc (Just Nat local)
+            (MirDirect (lower_contract_id contract))
+            ([source, source_units, target, target_units, managed_bits MirU8 1] : List MirValue)) state)
+          (fun (renamed : ManagedResult) => match renamed with | ManagedResultOf status next =>
+            managed_nat_from_word compiler PrimitiveWordU32 status next end)));
+
+def managed_rename_target (compiler : ManagedCompiler) (target : MirValue) (scope : ManagedStartupScope)
+    (source : MirValue) (source_units : MirValue) (count : MirValue) (state : ManagedState)
+    : Either NativeLowerError ManagedResult :=
+    managed_copy_path compiler (managed_rename_query compiler source source_units) target scope state;
+
+def managed_rename_action (compiler : ManagedCompiler) (source : MirValue) (target : MirValue)
+    (state : ManagedState) : Either NativeLowerError ManagedResult :=
+    managed_action compiler ([source, target] : List MirValue)
+      (fun (captures : List MirValue) (entered : ManagedState) =>
+        lower_bind (Pair MirValue MirValue) ManagedResult (lower_pair MirValue captures)
+          (fun (pair : Pair MirValue MirValue) => match pair with | MkPair from to =>
+            managed_copy_path compiler (managed_rename_target compiler to) from
+              (ManagedStartupScopeOf ([] : List MirValue) (Nothing MirValue)) entered end)) state;
+
+def managed_rename_primitive (compiler : ManagedCompiler) (step : ManagedStep) (scope : ManagedScope)
+    (arguments : List CoreTerm) (state : ManagedState) : Either NativeLowerError ManagedResult :=
+    lower_bind (Pair CoreTerm CoreTerm) ManagedResult (lower_pair CoreTerm arguments)
+      (fun (pair : Pair CoreTerm CoreTerm) => match pair with | MkPair source target =>
+        lower_bind ManagedResult ManagedResult (step scope source state)
+          (fun (from : ManagedResult) => match from with | ManagedResultOf value next =>
+            lower_bind ManagedResult ManagedResult (step scope target next)
+              (fun (to : ManagedResult) => match to with | ManagedResultOf destination after =>
+                managed_rename_action compiler value destination after end) end) end);

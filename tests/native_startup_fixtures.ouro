@@ -1,0 +1,37 @@
+-- Injection follows complete source checking and replay. Calls in the raw
+-- allocator/runtime retain their real targets. Generated managed calls alone
+-- select the ownership probes; every allocation also observes the real GC.
+import "native_startup_fault_calls.ouro";
+import "../compiler/native/managed_source.ouro";
+
+def startup_fault_instruction (base : Nat) (symbols : List Nat) (managed : Bool)
+    (instruction : MirInstruction) : MirInstruction :=
+    match instruction with
+    | MirCall gc result target arguments => match target with
+      | MirIndirect _ _ => instruction | MirDirect id => match startup_fault_target symbols id with
+        | Nothing => instruction | Just index => match orb managed (orb (eqNat index 9) (eqNat index 10)) with
+          | False => instruction | True => MirCall gc result (MirDirect (add base index)) arguments end end end
+    | MirManagedAlloc local allocator _ descriptor bytes => MirManagedAlloc local allocator (add base 10) descriptor bytes
+    | MirMove _ _ => instruction | MirBinaryOp _ _ _ _ => instruction | MirCompare _ _ _ _ => instruction
+    | MirConvert _ _ _ => instruction | MirLoad _ _ _ => instruction | MirStore _ _ _ => instruction
+    | MirLoadAt _ _ _ => instruction | MirStoreAt _ _ _ => instruction | MirAddress _ _ => instruction
+    | MirPointerAdd _ _ _ => instruction | MirManagedContext _ => instruction end;
+
+def startup_fault_function (base : Nat) (symbols : List Nat) (contracts : List LowerContract)
+    (function : MirFunction) : MirFunction :=
+    match function with | MirFunctionDef id name arguments locals result entry blocks =>
+      let managed : Bool := match lower_find_contract id contracts with | Nothing => True | Just _ => False end in
+      MirFunctionDef id name arguments locals result entry
+        (map MirBlock MirBlock (fun (block : MirBlock) => match block with | MirBlockDef label instructions terminator =>
+          MirBlockDef label (map MirInstruction MirInstruction (startup_fault_instruction base symbols managed) instructions) terminator end) blocks) end;
+
+def native_startup_fixture (mode : Nat) (parts : ManagedProgramParts) : Either NativeLowerError MirProgram :=
+    match parts with | ManagedProgramOf checked contracts program =>
+      let base : Nat := S (foldr Nat Nat maxNat 0 (mir_global_ids program)) in
+      lower_bind (List Nat) MirProgram (startup_fault_symbols checked) (fun (symbols : List Nat) =>
+        lower_map (List MirFunction) MirProgram (fun (wrappers : List MirFunction) =>
+          match program with | MirProgramDef functions data libraries entry =>
+            MirProgramDef (append MirFunction wrappers
+              (map MirFunction MirFunction (startup_fault_function base symbols contracts) functions))
+              (Cons MirData (MirDataDef (startup_fault_counter base) True (pe_zeros 192)) data) libraries entry end)
+          (startup_fault_wrappers base mode symbols)) end;

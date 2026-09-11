@@ -1,0 +1,72 @@
+-- The helper candidate is checked source. Mutated raw-contract tables below
+-- test the internal linker boundary independently of helper name lookup.
+import "../compiler/native/managed_directories_memory.ouro";
+import "../compiler/driver.ouro";
+import "compiler_startup_test_support.ouro";
+
+def directory_helper_prefix : String :=
+    prim_string_concat
+      "intrinsic Effect : Type -> Type := \"ouro.runtime\"; intrinsic Pointer : Type -> Type := \"ouro.raw_ptr\"; intrinsic Byte : Type := \"ouro.u8\"; intrinsic Word : Type := \"ouro.u32\"; intrinsic Size : Type := \"ouro.usize\"; "
+      "inductive Flag : Type := | Yes : Flag | No : Flag; representation Flag := \"ouro.bool\"; intrinsic pure : (A : Type) -> A -> Effect A := \"ouro.runtime.pure\"; axiom zero : Word; def AliasWord : Type := Word; def AliasPointer (A : Type) : Type := Pointer A; def Deferred (A : Type) : Type := Effect A; ";
+
+def directory_helper_source (mode : Nat) : String :=
+    prim_string_concat directory_helper_prefix (match eqNat mode 7 with
+      | True => "axiom raw_windows_directory_first : Pointer Byte -> Size -> Pointer Byte -> Size -> Pointer Size -> Effect Word;"
+      | False => match eqNat mode 9 with
+        | True => "extern raw_windows_directory_first : Pointer Byte -> Size -> Pointer Byte -> Size -> Pointer Size -> Effect Word := \"windows-x86_64\" \"win64\" \"kernel32.dll\" \"GetLastError\" \"nogc\";"
+        | False => match eqNat mode 1 with
+          | True => "def raw_windows_directory_first (pattern : AliasPointer Byte) (units : Size) (buffer : AliasPointer Byte) (capacity : Size) (owner : AliasPointer Size) : Deferred AliasWord := pure Word zero;"
+          | False => "def raw_windows_directory_first (pattern : Pointer Byte) (units : Size) (buffer : Pointer Byte) (capacity : Size) (owner : Pointer Size) : Effect Word := pure Word zero;" end end end);
+
+def directory_helper_compiler (program : CheckedProgram) (contracts : List LowerContract) : ManagedCompiler :=
+    ManagedCompilerOf program ([] : List Nat) 0 0 0 0 0 0 contracts
+      (check_environment_from_entries (checked_program_entries program));
+
+def directory_helper_contracts (mode : Nat) (contract : LowerContract) : List LowerContract :=
+    match contract with | LowerContractOf id annotation arguments result binding =>
+      match eqNat mode 2 with | True => ([] : List LowerContract) | False =>
+        ([LowerContractOf (match eqNat mode 3 with | True => S id | False => id end)
+          (match eqNat mode 4 with | True => CSort 0 | False => annotation end) arguments result
+          (match eqNat mode 5 with
+            | True => Just PrimitiveBinding (PrimitiveIntrinsicBinding PrimitiveDirectoryList PrimitiveRuntimeAction PrimitiveMayGc (Nothing CoreTerm))
+            | False => binding end)] : List LowerContract) end end;
+
+def directory_helper_resolve (mode : Nat) (program : CheckedProgram) : Either NativeLowerError Nat :=
+    let compiler : ManagedCompiler := directory_helper_compiler program ([] : List LowerContract) in
+    let name : List Nat := managed_directory_helper_name ManagedDirectoryFirst in
+    lower_bind Nat Nat (managed_source_symbol program name) (fun (id : Nat) =>
+      match lookup_type id (checked_program_entries program) with
+      | Nothing => Left NativeLowerError Nat (LowerUnknownGlobal id)
+      | Just annotation => lower_bind LowerContract Nat
+          (lower_make_contract primitive_default_fuel (checked_program_entries program) id annotation (Nothing PrimitiveBinding))
+          (fun (contract : LowerContract) => lower_bind CoreTerm Nat
+            (managed_directory_expected compiler ManagedDirectoryFirst) (fun (expected : CoreTerm) =>
+              lower_bind LowerContract Nat
+                (managed_runtime_contract (directory_helper_compiler program (directory_helper_contracts mode contract))
+                  (match eqNat mode 8 with | True => 0 | False => primitive_default_fuel end) name expected)
+                (fun (selected : LowerContract) => lower_map Unit Nat (fun (_ : Unit) => id)
+                  (lower_require (eqNat (lower_contract_id selected) id) (LowerInvalidCall id))))) end);
+
+def directory_helper_probe (mode : Nat) : String :=
+    match compile_checked_source (mul 100 50) (prim_string_to_char_codes (directory_helper_source mode)) with
+    | CErr _ => "source-rejected"
+    | COk program => match directory_helper_resolve mode program with
+      | Right _ => "linked" | Left error => match error with
+        | LowerResourceExhausted => "resource" | LowerMetadataMismatch _ => "metadata"
+        | LowerBodyMismatch _ => "body" | LowerInvalidCall _ => "call"
+        | LowerDeclarationFailure _ _ _ => "declaration" | LowerUnsupportedType _ => "type"
+        | LowerUnsupportedTerm _ => "term" | LowerUnsupportedPrimitive _ => "primitive"
+        | LowerUnknownGlobal _ => "global" | LowerUnboundLocal _ => "local" | LowerEffectMismatch => "effect"
+        | LowerInvalidEntry _ => "entry" | LowerMirFailure _ => "mir" | LowerBackendFailure _ => "backend" end end end;
+
+def main : IO Unit :=
+    startup_test_run
+      [startup_test_eq "checked directory body links the same raw definition" (directory_helper_probe 0) "linked",
+       startup_test_eq "directory helper accepts normalized pointer, word and Runtime aliases" (directory_helper_probe 1) "linked",
+       startup_test_eq "checked body without compiled raw contract is rejected" (directory_helper_probe 2) "call",
+       startup_test_eq "another raw contract ID cannot authorize the helper" (directory_helper_probe 3) "call",
+       startup_test_eq "same raw ID with different Core contract is rejected" (directory_helper_probe 4) "metadata",
+       startup_test_eq "primitive binding cannot replace a compiled helper body" (directory_helper_probe 5) "body",
+       startup_test_eq "a helper axiom cannot supply an implementation" (directory_helper_probe 7) "body",
+       startup_test_eq "helper normalization preserves fuel failure" (directory_helper_probe 8) "resource",
+       startup_test_eq "a foreign declaration cannot masquerade as a checked helper body" (directory_helper_probe 9) "body"];

@@ -1,0 +1,725 @@
+-- Native source compilation and forged checked-input boundary regressions.
+import "native_lower_constant_fixtures.ouro";
+import "../compiler/native/diagnostics.ouro";
+import "compiler_program_lookup.ouro";
+import "native_lower_error_code.ouro";
+
+def lower_test_error_detail (error : NativeLowerError) : Nat :=
+    match error with
+    | LowerResourceExhausted => 0 | LowerDeclarationFailure id _ _ => id
+    | LowerMetadataMismatch id => id | LowerBodyMismatch id => id
+    | LowerUnsupportedType _ => 0 | LowerUnsupportedTerm tag => tag
+    | LowerUnsupportedPrimitive id => primitive_id_code id | LowerUnknownGlobal id => id
+    | LowerUnboundLocal id => id | LowerInvalidCall id => id | LowerEffectMismatch => 0
+    | LowerInvalidEntry id => id | LowerMirFailure _ => 0 | LowerBackendFailure _ => 0 end;
+
+def lower_test_error_text (error : NativeSourceError) : String :=
+    match error with
+    | NativeSourceCheckError failure => match failure with | ErrCode code detail =>
+        lower_fixture_join (["source:", prim_string_of_nat code, ":", prim_string_of_nat detail] : List String) end
+    | NativeSourceLowerError failure =>
+        lower_fixture_join (["lower:", prim_string_of_nat (native_lower_error_code failure), ":",
+          prim_string_of_nat (lower_test_error_detail failure)] : List String) end;
+
+def lower_test_rejected (A : Type) (code : Nat) (value : Either NativeLowerError A) : Bool :=
+    match value with | Right _ => False | Left err => eqNat code (native_lower_error_code err) end;
+
+def lower_test_source_rejected (code : Nat) (source : String) : Bool :=
+    match native_lower_source lower_fixture_fuel mir_default_limits lower_fixture_main (prim_string_to_char_codes source) with
+    | Right _ => False
+    | Left error => match error with | NativeSourceCheckError _ => False
+      | NativeSourceLowerError failure => eqNat code (native_lower_error_code failure) end end;
+
+def lower_test_checker_rejected (source : String) : Bool :=
+    match native_lower_source lower_fixture_fuel mir_default_limits lower_fixture_main (prim_string_to_char_codes source) with
+    | Right _ => False
+    | Left error => match error with | NativeSourceCheckError _ => True | NativeSourceLowerError _ => False end end;
+
+def lower_test_reference : CompResult CheckedProgram :=
+    compile_checked_source lower_fixture_fuel (prim_string_to_char_codes lower_fixture_pid);
+
+def lower_test_with_reference (test : CheckedProgram -> Bool) : Bool :=
+    match lower_test_reference with | CErr _ => False | COk checked => test checked end;
+
+def lower_test_named (program : CheckedProgram) (name : String) (test : Nat -> Bool) : Bool :=
+    match compiler_test_name program name with | Nothing => False | Just id => test id end;
+
+def lower_test_change_entries (program : CheckedProgram) (change : Entry -> Entry) : CheckedProgram :=
+    match program with | CheckedProgramOf state entries bodies =>
+      CheckedProgramOf state (map Entry Entry change entries) bodies end;
+
+def lower_test_replace_body (program : CheckedProgram) (id : Nat) (body : CoreTerm) : CheckedProgram :=
+    lower_test_change_entries program (fun (entry : Entry) => match entry with
+      | MkEntry name typ original => match eqNat id name with
+        | True => MkEntry name typ (Just CoreTerm body) | False => entry end
+      | MkIndEntry _ _ => entry | MkBoundEntry _ _ _ => entry | MkRoleEntry _ => entry end);
+
+def lower_test_replay_body (body : CoreTerm) : Bool :=
+    lower_test_with_reference (fun (program : CheckedProgram) => lower_test_named program "main" (fun (id : Nat) =>
+      lower_test_rejected CheckedProgram 1 (lower_recheck_program lower_fixture_fuel (lower_test_replace_body program id body))));
+
+def lower_test_forced_type : Bool :=
+    lower_test_with_reference (fun (program : CheckedProgram) => lower_test_named program "main" (fun (entry : Nat) =>
+      lower_test_named program "W" (fun (word : Nat) =>
+        let forged : CheckedProgram := lower_test_change_entries program (fun (item : Entry) => match item with
+          | MkEntry id typ body => match eqNat entry id with | False => item | True => MkEntry id (CConst word) body end
+          | MkIndEntry _ _ => item | MkBoundEntry _ _ _ => item | MkRoleEntry _ => item end) in
+        lower_test_rejected CheckedProgram 1 (lower_recheck_program lower_fixture_fuel forged))));
+
+def lower_test_intrinsic_metadata : Bool :=
+    lower_test_with_reference (fun (program : CheckedProgram) =>
+      let forged : CheckedProgram := lower_test_change_entries program (fun (entry : Entry) => match entry with
+        | MkBoundEntry id typ binding => match binding with
+          | PrimitiveIntrinsicBinding primitive execution gc specialization => match primitive_id_equal primitive PrimitiveU32Type with
+            | False => entry | True => MkBoundEntry id typ (PrimitiveIntrinsicBinding primitive execution PrimitiveMayGc specialization) end
+          | PrimitiveExternBinding _ => entry end
+        | MkEntry _ _ _ => entry | MkIndEntry _ _ => entry | MkRoleEntry _ => entry end) in
+      lower_test_rejected CheckedProgram 2 (lower_recheck_program lower_fixture_fuel forged));
+
+def lower_test_extern_metadata : Bool :=
+    lower_test_with_reference (fun (program : CheckedProgram) =>
+      let forged : CheckedProgram := lower_test_change_entries program (fun (entry : Entry) => match entry with
+        | MkBoundEntry id typ binding => match binding with
+          | PrimitiveIntrinsicBinding _ _ _ _ => entry
+          | PrimitiveExternBinding external => match external with | CheckedExternOf target abi dll symbol _ gc =>
+            MkBoundEntry id typ (PrimitiveExternBinding (CheckedExternOf target abi dll symbol
+              (PrimitiveAbiSignatureOf ([] : List PrimitiveAbiValue) (Just PrimitiveAbiValue (PrimitiveAbiWord PrimitiveWordU64))) gc)) end end
+        | MkEntry _ _ _ => entry | MkIndEntry _ _ => entry | MkRoleEntry _ => entry end) in
+      lower_test_rejected CheckedProgram 2 (lower_recheck_program lower_fixture_fuel forged));
+
+def lower_test_specialized_base : String := lower_fixture_join
+    ([lower_fixture_types, lower_fixture_pid_decl,
+      "intrinsic Wide : Type := \"ouro.u64\"; intrinsic Pointer : Type -> Type := \"ouro.raw_ptr\"; intrinsic null : (A : Type) -> Pointer A := \"ouro.raw.null\"; def Alias : Type := W; intrinsic load : Pointer Alias -> Runtime Alias := \"ouro.raw.load\" Alias; "] : List String);
+
+def lower_test_specialized_reference : CompResult CheckedProgram := compile_checked_source lower_fixture_fuel
+    (prim_string_to_char_codes (prim_string_concat lower_test_specialized_base "def main : Runtime W := pid;"));
+
+def lower_test_specialization_retained : Bool :=
+    match lower_test_specialized_reference with | CErr _ => False | COk program =>
+      lower_test_named program "main" (fun (entry : Nat) => match native_lower_checked lower_fixture_fuel mir_default_limits entry program with
+        | Left _ => False | Right lowered => match lowered with | NativeLoweredOf checked _ _ =>
+          lower_test_named checked "W" (fun (word : Nat) =>
+            any Entry (fun (item : Entry) => match item with
+              | MkBoundEntry _ _ binding => match binding with
+                | PrimitiveExternBinding _ => False
+                | PrimitiveIntrinsicBinding id _ _ specialization =>
+                  andb (primitive_id_equal id PrimitiveRawLoad) (match specialization with
+                    | Nothing => False | Just typ => match primitive_shape typ with
+                      | PrimitiveShapeAtom tag name => andb (eqNat tag 2) (eqNat name word)
+                      | PrimitiveShapePair _ _ _ => False | PrimitiveShapeOther => False end end) end
+              | MkEntry _ _ _ => False | MkIndEntry _ _ => False | MkRoleEntry _ => False end)
+              (checked_program_entries checked)) end end) end;
+
+def lower_test_change_specialization (program : CheckedProgram) (specialization : Maybe CoreTerm) : CheckedProgram :=
+    lower_test_change_entries program (fun (entry : Entry) => match entry with
+      | MkBoundEntry name typ binding => match binding with
+        | PrimitiveExternBinding _ => entry
+        | PrimitiveIntrinsicBinding id execution gc _ => match primitive_id_equal id PrimitiveRawLoad with
+          | False => entry | True => MkBoundEntry name typ (PrimitiveIntrinsicBinding id execution gc specialization) end end
+      | MkEntry _ _ _ => entry | MkIndEntry _ _ => entry | MkRoleEntry _ => entry end);
+
+def lower_test_specialization_forged (name : String) (code : Nat) : Bool :=
+    match lower_test_specialized_reference with | CErr _ => False | COk program =>
+      lower_test_named program name (fun (id : Nat) => lower_test_rejected CheckedProgram code
+        (lower_recheck_program lower_fixture_fuel (lower_test_change_specialization program (Just CoreTerm (CConst id))))) end;
+
+def lower_test_specialization_missing : Bool :=
+    match lower_test_specialized_reference with | CErr _ => False | COk program =>
+      lower_test_rejected CheckedProgram 1
+        (lower_recheck_program lower_fixture_fuel (lower_test_change_specialization program (Nothing CoreTerm))) end;
+
+def lower_test_raw_metadata (pure : Bool) : Bool :=
+    match lower_test_specialized_reference with | CErr _ => False | COk program =>
+      let forged : CheckedProgram := lower_test_change_entries program (fun (entry : Entry) => match entry with
+        | MkBoundEntry name typ binding => match binding with
+          | PrimitiveExternBinding _ => entry
+          | PrimitiveIntrinsicBinding id execution gc specialization => match primitive_id_equal id PrimitiveRawLoad with
+            | False => entry | True => MkBoundEntry name typ (PrimitiveIntrinsicBinding id
+                (match pure with | True => PrimitivePureValue | False => execution end)
+                (match pure with | True => gc | False => PrimitiveMayGc end) specialization) end end
+        | MkEntry _ _ _ => entry | MkIndEntry _ _ => entry | MkRoleEntry _ => entry end) in
+      lower_test_rejected CheckedProgram 2 (lower_recheck_program lower_fixture_fuel forged) end;
+
+def lower_test_load_width (locals : List MirLocal) (instruction : MirInstruction) : Bool :=
+    match instruction with
+    | MirLoad id _ _ => match mir_type_of_local locals id with
+        | Left _ => False | Right typ => mir_type_equal typ MirU32 end
+    | MirMove _ _ => False | MirBinaryOp _ _ _ _ => False | MirCompare _ _ _ _ => False
+    | MirConvert _ _ _ => False | MirStore _ _ _ => False | MirAddress _ _ => False
+    | MirLoadAt _ _ _ => False | MirStoreAt _ _ _ => False
+    | MirPointerAdd _ _ _ => False | MirCall _ _ _ _ => False
+    | MirManagedAlloc _ _ _ _ _ => False | MirManagedContext _ => False end;
+
+-- The null-address input is lowered for type inspection, never executed.
+def lower_test_specialized_load : Bool :=
+    match native_lower_source lower_fixture_fuel mir_default_limits lower_fixture_main
+        (prim_string_to_char_codes (prim_string_concat lower_test_specialized_base "def main : Runtime W := load (null W);")) with
+    | Left _ => False | Right lowered => match lowered with | NativeLoweredOf _ _ program => match program with
+      | MirProgramDef functions _ _ _ => any MirFunction (fun (function : MirFunction) => match function with
+        | MirFunctionDef _ _ args locals _ _ blocks => any MirBlock (fun (block : MirBlock) => match block with
+          | MirBlockDef _ instructions _ => any MirInstruction (lower_test_load_width (append MirLocal args locals)) instructions end) blocks end)
+          functions end end end;
+
+def lower_test_emitted_mismatch : Bool :=
+    lower_test_with_reference (fun (program : CheckedProgram) => match program with | CheckedProgramOf state entries bodies =>
+      let replaced : List (Pair Nat CoreTerm) := map (Pair Nat CoreTerm) (Pair Nat CoreTerm)
+        (fun (pair : Pair Nat CoreTerm) => match pair with | MkPair id _ => MkPair Nat CoreTerm id (CSort 0) end) bodies in
+      lower_test_rejected CheckedProgram 3 (lower_recheck_program lower_fixture_fuel (CheckedProgramOf state entries replaced)) end);
+
+def lower_test_emitted_missing : Bool :=
+    lower_test_with_reference (fun (program : CheckedProgram) => match program with | CheckedProgramOf state entries _ =>
+      lower_test_rejected CheckedProgram 3
+        (lower_recheck_program lower_fixture_fuel (CheckedProgramOf state entries ([] : List (Pair Nat CoreTerm)))) end);
+
+def lower_test_emitted_duplicate : Bool :=
+    lower_test_with_reference (fun (program : CheckedProgram) => match program with | CheckedProgramOf state entries bodies =>
+      lower_test_rejected CheckedProgram 3
+        (lower_recheck_program lower_fixture_fuel (CheckedProgramOf state entries (append (Pair Nat CoreTerm) bodies bodies))) end);
+
+def lower_test_duplicate_entry : Bool :=
+    lower_test_with_reference (fun (program : CheckedProgram) => match program with | CheckedProgramOf state entries bodies =>
+      match entries with | Nil => False | Cons entry _ => lower_test_rejected CheckedProgram 1
+        (lower_recheck_program lower_fixture_fuel (CheckedProgramOf state (Cons Entry entry entries) bodies)) end end);
+
+def lower_test_recheck_valid : Bool := lower_test_with_reference (fun (program : CheckedProgram) =>
+    match lower_recheck_program lower_fixture_fuel program with | Left _ => False | Right _ => True end);
+
+def lower_test_metadata_retained : Bool :=
+    match native_lower_source lower_fixture_fuel mir_default_limits lower_fixture_main (prim_string_to_char_codes lower_fixture_pid) with
+    | Left _ => False
+    | Right lowered => match lowered with | NativeLoweredOf checked contracts mir =>
+      andb (eqNat (length Entry (checked_program_entries checked)) 4)
+        (andb (eqNat (length LowerContract contracts) 2)
+          (lower_test_named checked "pid" (fun (id : Nat) => match lower_find_contract id contracts with
+            | Nothing => False | Just contract => match contract with | LowerContractOf _ typ args result binding =>
+              andb (eqNat (length LowerType args) 0)
+                (andb (lower_type_action result) (match binding with
+                  | Nothing => False | Just native => match native with
+                    | PrimitiveIntrinsicBinding _ _ _ _ => False
+                    | PrimitiveExternBinding external => match external with | CheckedExternOf _ _ _ _ signature gc =>
+                      andb (eqNat (lower_gc_code gc) 1)
+                        (match signature with | PrimitiveAbiSignatureOf parameters answer =>
+                          andb (eqNat (length PrimitiveAbiValue parameters) 0)
+                            (match answer with | Nothing => False | Just value => match value with
+                              | PrimitiveAbiWord word => primitive_word_equal word PrimitiveWordU32
+                              | PrimitiveAbiPointer _ => False | PrimitiveAbiFunction _ => False end end) end) end end end)) end end))) end end;
+
+def lower_test_startup : Bool :=
+    match native_lower_source lower_fixture_fuel mir_default_limits lower_fixture_main (prim_string_to_char_codes lower_fixture_pid) with
+    | Left _ => False | Right lowered => match lowered with | NativeLoweredOf _ _ mir =>
+      match mir with | MirProgramDef functions _ libraries entry =>
+        match mir_find_function entry functions with | Nothing => False
+        | Just function => match function with | MirFunctionDef _ _ args _ result _ blocks =>
+          andb (eqNat (length MirLocal args) 0) (andb (match result with | Nothing => True | Just _ => False end)
+            (match blocks with | Nil => False | Cons block rest => match block with | MirBlockDef _ instructions terminator =>
+              andb (eqNat (length MirBlock rest) 0)
+                (andb (eqNat (length MirInstruction instructions) 2)
+                  (match terminator with | MirTrap => True | MirJump _ => False | MirBranch _ _ _ => False | MirReturn _ => False end)) end end)) end end end end end;
+
+def lower_test_resource : Bool := lower_test_with_reference (fun (program : CheckedProgram) =>
+    lower_test_rejected CheckedProgram 0 (lower_recheck_program 0 program));
+
+def lower_test_entry_invalid : Bool := lower_test_with_reference (fun (program : CheckedProgram) =>
+    lower_test_rejected MirProgram 11 (native_lower_program lower_fixture_fuel mir_default_limits (mul 16 256) program));
+
+def lower_test_mir_limits : Bool := lower_test_with_reference (fun (program : CheckedProgram) =>
+    lower_test_named program "main" (fun (id : Nat) =>
+      match native_lower_program lower_fixture_fuel (MirLimitsWith 1 256 1) id program with
+      | Right _ => False | Left err => match err with
+        | LowerMirFailure failure => match failure with
+          | MirResourceExhausted => True | MirDuplicateSymbol _ => False | MirUnknownSymbol _ => False
+          | MirDuplicateLocal _ => False | MirUnknownLocal _ => False | MirDuplicateBlock _ => False | MirUnknownBlock _ => False
+          | MirUninitialized _ _ => False | MirTypeMismatch _ => False | MirInvalidLiteral => False
+          | MirInvalidConversion _ => False | MirInvalidAddress _ => False | MirInvalidCall _ => False
+          | MirInvalidReturn _ => False | MirInvalidEntry _ => False | MirInvalidName _ => False
+          | MirInvalidDisplacement => False | MirInvalidData _ => False | MirUnreachableBlock _ => False
+          | MirGcCallMismatch _ _ => False | MirGcUnsafeRuntime _ => False end
+        | LowerResourceExhausted => False | LowerDeclarationFailure _ _ _ => False | LowerMetadataMismatch _ => False
+        | LowerBodyMismatch _ => False | LowerUnsupportedType _ => False | LowerUnsupportedTerm _ => False
+        | LowerUnsupportedPrimitive _ => False | LowerUnknownGlobal _ => False | LowerUnboundLocal _ => False
+        | LowerInvalidCall _ => False | LowerEffectMismatch => False | LowerInvalidEntry _ => False | LowerBackendFailure _ => False end end));
+
+def lower_test_id_overflow : Bool :=
+    let program : CheckedProgram := CheckedProgramOf empty_intern
+      ([MkEntry pe_max_rva (CSort 0) (Nothing CoreTerm)] : List Entry) ([] : List (Pair Nat CoreTerm)) in
+    lower_test_rejected NativeLoweredProgram 0 (lower_finish mir_default_limits program ([] : List LowerContract)
+      ([] : List MirFunction) ([] : List MirLibrary) 0);
+
+def lower_test_local_failure : Bool :=
+    lower_test_rejected LowerResult 8 (lower_expression check_environment_empty ([] : List LowerContract) 10 ([] : List LowerBinding)
+      (CRel 0) (LowerTypeOf (CSort 0) (Just MirType MirU32) False) (lower_empty_state 0));
+
+def lower_test_case_source : String := prim_string_concat lower_fixture_base
+    "inductive Flag : Type := | On : Flag | Off : Flag; def select (x : W) : W := match On with | On => x | Off => x end; def main : Runtime W := bind W W pid (fun (x : W) => pure W (select x));";
+def lower_test_fix_source : String := prim_string_concat lower_fixture_base
+    "def identity : W -> W := fix identity (x : W) : W := x; def main : Runtime W := bind W W pid (fun (x : W) => pure W (identity x));";
+
+-- Delay each checked compilation until its test runs. Bootstrap drivers can
+-- select individual cases to bound growth of the legacy runtime arena.
+inductive LowerTest : Type := | LowerTestOf : String -> (Unit -> Bool) -> LowerTest;
+
+def lower_tests : List LowerTest :=
+    [ LowerTestOf "strict checked program replay succeeds"
+        (fun (_ : Unit) => lower_test_recheck_valid)
+    , LowerTestOf "canonical types extern ABI and GC metadata are retained"
+        (fun (_ : Unit) => lower_test_metadata_retained)
+    , LowerTestOf "native startup calls main then ExitProcess and traps if it returns"
+        (fun (_ : Unit) => lower_test_startup)
+    , LowerTestOf "forged unbound body is rejected by declaration replay"
+        (fun (_ : Unit) => (lower_test_replay_body (CRel 0)))
+    , LowerTestOf "forged unknown global is rejected by declaration replay"
+        (fun (_ : Unit) => (lower_test_replay_body (CConst (mul 16 256))))
+    , LowerTestOf "forged Runtime to pure annotation fails replay"
+        (fun (_ : Unit) => lower_test_forced_type)
+    , LowerTestOf "forged primitive GC metadata differs from registry"
+        (fun (_ : Unit) => lower_test_intrinsic_metadata)
+    , LowerTestOf "forged foreign scalar ABI differs from checked signature"
+        (fun (_ : Unit) => lower_test_extern_metadata)
+    , LowerTestOf "unused specialized intrinsic retains its canonical scalar type"
+        (fun (_ : Unit) => lower_test_specialization_retained)
+    , LowerTestOf "forged raw storage specialization fails signature replay"
+        (fun (_ : Unit) => (lower_test_specialization_forged "Wide" 1))
+    , LowerTestOf "noncanonical specialization metadata differs from checker output"
+        (fun (_ : Unit) => (lower_test_specialization_forged "Alias" 2))
+    , LowerTestOf "missing raw storage specialization fails replay"
+        (fun (_ : Unit) => lower_test_specialization_missing)
+    , LowerTestOf "specialized raw load emits its checked U32 storage width"
+        (fun (_ : Unit) => lower_test_specialized_load)
+    , LowerTestOf "emitted bodies must equal the checked environment"
+        (fun (_ : Unit) => lower_test_emitted_mismatch)
+    , LowerTestOf "missing emitted bodies fail closed"
+        (fun (_ : Unit) => lower_test_emitted_missing)
+    , LowerTestOf "duplicate emitted bodies fail closed"
+        (fun (_ : Unit) => lower_test_emitted_duplicate)
+    , LowerTestOf "duplicate declarations fail strict replay"
+        (fun (_ : Unit) => lower_test_duplicate_entry)
+    , LowerTestOf "declaration fuel exhaustion is distinct"
+        (fun (_ : Unit) => lower_test_resource)
+    , LowerTestOf "unknown native entry is rejected"
+        (fun (_ : Unit) => lower_test_entry_invalid)
+    , LowerTestOf "native entry cannot require machine arguments"
+        (fun (_ : Unit) => (lower_test_source_rejected 11 (prim_string_concat lower_fixture_types "def main (x : W) : W := x;")))
+    , LowerTestOf "entry width follows registered identity rather than its name"
+        (fun (_ : Unit) => (lower_test_source_rejected 11 "intrinsic U32 : Type := \"ouro.u64\"; intrinsic Runtime : Type -> Type := \"ouro.runtime\"; extern pid : Runtime U32 := \"windows-x86_64\" \"win64\" \"kernel32.dll\" \"GetCurrentProcessId\" \"maygc\"; def main : Runtime U32 := pid;"))
+    , LowerTestOf "MIR resource limits remain mandatory"
+        (fun (_ : Unit) => lower_test_mir_limits)
+    , LowerTestOf "synthetic symbol arithmetic checks the bound before adding"
+        (fun (_ : Unit) => lower_test_id_overflow)
+    , LowerTestOf "unbound local has an explicit lowering error"
+        (fun (_ : Unit) => lower_test_local_failure)
+    , LowerTestOf "ordinary axiom is never interpreted as a native primitive"
+        (fun (_ : Unit) => (lower_test_source_rejected 7 (prim_string_concat lower_fixture_types "axiom missing : W; def main : W := missing;")))
+    , LowerTestOf "same-spelled unregistered U32 is not a machine type"
+        (fun (_ : Unit) => (lower_test_source_rejected 4 "axiom U32 : Type; axiom value : U32; def main : U32 := value;"))
+    , LowerTestOf "registered mathematical Nat has no machine fallback"
+        (fun (_ : Unit) => (lower_test_source_rejected 4 "inductive N : Type := | Zero : N | Next : N -> N; representation N := \"ouro.nat\"; def main : N := Zero;"))
+    , LowerTestOf "first-order subset rejects function-valued parameters"
+        (fun (_ : Unit) => (lower_test_source_rejected 4 (prim_string_concat lower_fixture_base "def apply (f : W -> W) (x : W) : W := f x; def main : Runtime W := pid;")))
+    , LowerTestOf "unregistered inductive case lowering is explicitly unsupported"
+        (fun (_ : Unit) => (lower_test_source_rejected 5 lower_test_case_source))
+    , LowerTestOf "fixpoint lowering is explicitly unsupported"
+        (fun (_ : Unit) => (lower_test_source_rejected 5 lower_test_fix_source))
+    , LowerTestOf "source Runtime action cannot escape into a pure result"
+        (fun (_ : Unit) => (lower_test_checker_rejected (prim_string_concat lower_fixture_base "def main : W := pid;")))
+    , LowerTestOf "source unknown global never reaches native lowering"
+        (fun (_ : Unit) => (lower_test_checker_rejected (prim_string_concat lower_fixture_types "def main : W := missing;")))
+    , LowerTestOf "source unresolved import cannot produce a native image"
+        (fun (_ : Unit) => match lower_fixture_compile
+            (prim_string_concat "import \"definitely-missing.ouro\"; " lower_fixture_pid) with
+          | Right _ => False
+          | Left error => match error with
+            | NativeSourceCheckError failure => match failure with
+              | ErrCode code _ => eqNat code 92 end
+            | NativeSourceLowerError _ => False end end)
+    , LowerTestOf "unannotated intrinsic cannot select a machine representation"
+        (fun (_ : Unit) => (lower_test_checker_rejected "intrinsic W := \"ouro.u32\";"))
+    , LowerTestOf "raw load execution metadata cannot become pure"
+        (fun (_ : Unit) => (lower_test_raw_metadata True))
+    , LowerTestOf "raw load GC metadata remains canonical"
+        (fun (_ : Unit) => (lower_test_raw_metadata False))
+    , LowerTestOf "raw pointer observation cannot escape Runtime"
+        (fun (_ : Unit) => (lower_test_checker_rejected (prim_string_concat lower_raw_common "def main : Size := pointer_bits W (null W);")))
+    , LowerTestOf "raw address addition cannot escape Runtime"
+        (fun (_ : Unit) => (lower_test_checker_rejected (prim_string_concat lower_raw_common "axiom offset : Size; def main : Pointer W := raw_add W (null W) offset;")))
+    , LowerTestOf "raw load rejects a differently typed pointer"
+        (fun (_ : Unit) => (lower_test_checker_rejected (prim_string_concat lower_raw_common "def main : Runtime W := read_word (null Wide);")))
+    , LowerTestOf "raw store rejects a different scalar width"
+        (fun (_ : Unit) => (lower_test_checker_rejected (prim_string_concat lower_raw_common "axiom value : Wide; def main : Runtime Empty := write_word (null W) value;")))
+    , LowerTestOf "raw storage requires an explicit scalar specialization"
+        (fun (_ : Unit) => (lower_test_checker_rejected (prim_string_concat lower_raw_common "intrinsic generic_load : (A : Type) -> Pointer A -> Runtime A := \"ouro.raw.load\"; def main : Runtime W := pid;")))
+    , LowerTestOf "managed constructors cannot specialize raw storage"
+        (fun (_ : Unit) => (lower_test_checker_rejected (prim_string_concat lower_raw_common "inductive Box : Type := | Pack : W -> Box; intrinsic read_box : Pointer Box -> Runtime Box := \"ouro.raw.load\" Box; def main : Runtime W := pid;")))
+    , LowerTestOf "unit has no raw scalar storage width"
+        (fun (_ : Unit) => (lower_test_checker_rejected (prim_string_concat lower_raw_common "intrinsic read_unit : Pointer Empty -> Runtime Empty := \"ouro.raw.load\" Empty; def main : Runtime W := pid;")))
+    , LowerTestOf "Runtime loop conditions require U8"
+        (fun (_ : Unit) => (lower_test_checker_rejected (prim_string_concat lower_raw_common "def main : Runtime W := bind W W pid (fun (x : W) => loop_action W x (fun (value : W) => pure W value) (fun (value : W) => pure W value));")))
+    ];
+
+def lower_test_constant_program (test : CheckedProgram -> Bool) : Bool :=
+    match compile_checked_source lower_fixture_fuel
+      (prim_string_to_char_codes (prim_string_concat lower_constant_base
+        "def main : Runtime W := match Yes with | Yes => pid | No => pid end;")) with
+    | CErr _ => False | COk program => test program end;
+
+def lower_test_constant_case (mode : Nat) : Bool :=
+    lower_test_constant_program (fun (program : CheckedProgram) => lower_test_named program "main" (fun (entry : Nat) =>
+      match lookup_const entry (checked_program_entries program) with | Nothing => False | Just body =>
+        match lower_term_view body with
+        | LowerCaseTerm info motive scrutinee branches => match info with | MkCaseInfo family params arities =>
+            let changed_info : CaseInfo := match eqNat mode 0 with
+              | True => MkCaseInfo family (S params) arities
+              | False => match eqNat mode 1 with | True => MkCaseInfo family params ([1, 0] : List Nat) | False => info end end in
+            let changed_value : CoreTerm := match eqNat mode 3 with | True => CConstruct family 2 0
+              | False => match eqNat mode 4 with | True => CConstruct family 0 1 | False => scrutinee end end in
+            let changed_branches : List CoreTerm := match eqNat mode 2 with
+              | True => take CoreTerm 1 branches | False => branches end in
+            lower_test_rejected NativeLoweredProgram 1 (native_lower_checked lower_fixture_fuel mir_default_limits entry
+              (lower_test_replace_body program entry (CCase changed_info motive changed_value changed_branches))) end
+        | LowerLocalTerm _ => False | LowerGlobalTerm _ => False | LowerLambdaTerm _ _ => False
+        | LowerApplyTerm _ _ => False | LowerLetTerm _ _ _ => False | LowerConstructorTerm _ _ _ => False
+        | LowerOtherTerm _ => False end end));
+
+def lower_test_constant_metadata (execution : Bool) : Bool :=
+    lower_test_constant_program (fun (program : CheckedProgram) =>
+      let forged : CheckedProgram := lower_test_change_entries program (fun (entry : Entry) => match entry with
+        | MkBoundEntry id typ binding => match binding with | PrimitiveExternBinding _ => entry
+          | PrimitiveIntrinsicBinding primitive original_execution gc specialization =>
+            match primitive_id_equal primitive (PrimitiveWordFromNat PrimitiveWordU32) with | False => entry
+            | True => MkBoundEntry id typ (PrimitiveIntrinsicBinding primitive
+                (match execution with | True => PrimitiveRuntimeAction | False => original_execution end)
+                (match execution with | True => gc | False => PrimitiveNoGc end) specialization) end end
+        | MkEntry _ _ _ => entry | MkIndEntry _ _ => entry | MkRoleEntry _ => entry end) in
+      lower_test_rejected CheckedProgram 2 (lower_recheck_program lower_fixture_fuel forged));
+
+def lower_test_constant_role : Bool :=
+    lower_test_constant_program (fun (program : CheckedProgram) =>
+      let forged : CheckedProgram := lower_test_change_entries program (fun (entry : Entry) => match entry with
+        | MkRoleEntry binding => match binding with | PrimitiveRoleOf role shape =>
+          match primitive_role_equal role PrimitiveBoolRole with | False => entry
+          | True => match shape with | PrimitiveInductiveOf id params indices typ constructors =>
+            MkRoleEntry (PrimitiveRoleOf role (PrimitiveInductiveOf id (S params) indices typ constructors)) end end end
+        | MkEntry _ _ _ => entry | MkIndEntry _ _ => entry | MkBoundEntry _ _ _ => entry end) in
+      lower_test_rejected CheckedProgram 2 (lower_recheck_program lower_fixture_fuel forged));
+
+def lower_test_nat_bytes (word : PrimitiveWord) (value : LowerNatValue) (bytes : List Nat) : Bool :=
+    match lower_nat_word word value with | Nothing => False | Just result => match result with
+      | MirUse _ => False | MirBits typ bits => andb (mir_type_equal typ (lower_word word))
+          (match x64_word64_bytes bits with | Left _ => False | Right actual => pe_bytes_equal actual bytes end) end end;
+
+def lower_test_max_byte : Nat := sub (mul 16 16) 1;
+
+def lower_test_nat_carry : Bool :=
+    let largest : LowerNatValue := LowerNatBits (X64Words64 (X64Bytes32 lower_test_max_byte lower_test_max_byte lower_test_max_byte lower_test_max_byte) (X64Bytes32 lower_test_max_byte lower_test_max_byte lower_test_max_byte lower_test_max_byte)) False in
+    match lower_nat_increment largest with | LowerNatBits bits overflow => andb overflow
+      (andb (match x64_word64_bytes bits with | Left _ => False | Right bytes => pe_bytes_equal bytes ([0, 0, 0, 0, 0, 0, 0, 0] : List Nat) end)
+        (notb (lower_nat_fits PrimitiveWordU64 (lower_nat_increment (LowerNatBits bits overflow))))) end;
+
+def lower_test_nat_fuel : Bool :=
+    lower_test_constant_program (fun (program : CheckedProgram) => lower_test_named program "Nat" (fun (family : Nat) =>
+      lower_test_rejected LowerNatValue 0
+        (lower_nat_decode (checked_program_entries program) ([] : List LowerBinding) family 1 (CConstruct family 0 0))));
+
+def lower_constant_tests : List LowerTest :=
+    [LowerTestOf "Bool case parameter metadata is replayed" (fun (_ : Unit) => lower_test_constant_case 0),
+     LowerTestOf "Bool case branch arities are replayed" (fun (_ : Unit) => lower_test_constant_case 1),
+     LowerTestOf "Bool case branch count is replayed" (fun (_ : Unit) => lower_test_constant_case 2),
+     LowerTestOf "Bool constructor ordinal is replayed" (fun (_ : Unit) => lower_test_constant_case 3),
+     LowerTestOf "Bool constructor parameter count is replayed" (fun (_ : Unit) => lower_test_constant_case 4),
+     LowerTestOf "Bool retained role shape remains canonical" (fun (_ : Unit) => lower_test_constant_role),
+     LowerTestOf "from_nat GC metadata remains MayGc" (fun (_ : Unit) => lower_test_constant_metadata False),
+     LowerTestOf "from_nat execution metadata remains pure" (fun (_ : Unit) => lower_test_constant_metadata True),
+     LowerTestOf "Nat constant fuel exhaustion remains an error" (fun (_ : Unit) => lower_test_nat_fuel),
+     LowerTestOf "U8 maximum retains all payload bits" (fun (_ : Unit) => lower_test_nat_bytes PrimitiveWordU8
+       (LowerNatBits (X64Words64 (X64Bytes32 lower_test_max_byte 0 0 0) (X64Bytes32 0 0 0 0)) False) ([lower_test_max_byte, 0, 0, 0, 0, 0, 0, 0] : List Nat)),
+     LowerTestOf "U8 one above maximum produces Nothing" (fun (_ : Unit) => notb (lower_nat_fits PrimitiveWordU8
+       (LowerNatBits (X64Words64 (X64Bytes32 0 1 0 0) (X64Bytes32 0 0 0 0)) False))),
+     LowerTestOf "I32 mathematical maximum is representable" (fun (_ : Unit) => lower_test_nat_bytes PrimitiveWordI32
+       (LowerNatBits (X64Words64 (X64Bytes32 lower_test_max_byte lower_test_max_byte lower_test_max_byte 127) (X64Bytes32 0 0 0 0)) False) ([lower_test_max_byte, lower_test_max_byte, lower_test_max_byte, 127, 0, 0, 0, 0] : List Nat)),
+     LowerTestOf "I32 from_nat rejects its sign bit" (fun (_ : Unit) => notb (lower_nat_fits PrimitiveWordI32
+       (LowerNatBits (X64Words64 (X64Bytes32 0 0 0 128) (X64Bytes32 0 0 0 0)) False))),
+     LowerTestOf "U32 maximum is representable" (fun (_ : Unit) => lower_test_nat_bytes PrimitiveWordU32
+       (LowerNatBits (X64Words64 (X64Bytes32 lower_test_max_byte lower_test_max_byte lower_test_max_byte lower_test_max_byte) (X64Bytes32 0 0 0 0)) False) ([lower_test_max_byte, lower_test_max_byte, lower_test_max_byte, lower_test_max_byte, 0, 0, 0, 0] : List Nat)),
+     LowerTestOf "U32 one above maximum produces Nothing" (fun (_ : Unit) => notb (lower_nat_fits PrimitiveWordU32
+       (LowerNatBits (X64Words64 (X64Bytes32 0 0 0 0) (X64Bytes32 1 0 0 0)) False))),
+     LowerTestOf "U64 maximum preserves the high bit" (fun (_ : Unit) => lower_test_nat_bytes PrimitiveWordU64
+       (LowerNatBits (X64Words64 (X64Bytes32 lower_test_max_byte lower_test_max_byte lower_test_max_byte lower_test_max_byte) (X64Bytes32 lower_test_max_byte lower_test_max_byte lower_test_max_byte lower_test_max_byte)) False) ([lower_test_max_byte, lower_test_max_byte, lower_test_max_byte, lower_test_max_byte, lower_test_max_byte, lower_test_max_byte, lower_test_max_byte, lower_test_max_byte] : List Nat)),
+     LowerTestOf "USize maximum preserves the high bit" (fun (_ : Unit) => lower_test_nat_bytes PrimitiveWordUSize
+       (LowerNatBits (X64Words64 (X64Bytes32 lower_test_max_byte lower_test_max_byte lower_test_max_byte lower_test_max_byte) (X64Bytes32 lower_test_max_byte lower_test_max_byte lower_test_max_byte lower_test_max_byte)) False) ([lower_test_max_byte, lower_test_max_byte, lower_test_max_byte, lower_test_max_byte, lower_test_max_byte, lower_test_max_byte, lower_test_max_byte, lower_test_max_byte] : List Nat)),
+     LowerTestOf "Nat byte carry retains overflow beyond 64 bits" (fun (_ : Unit) => lower_test_nat_carry),
+     LowerTestOf "malformed constant bytes cannot become a word" (fun (_ : Unit) => notb (lower_nat_fits PrimitiveWordU64
+       (LowerNatBits (X64Words64 (X64Bytes32 256 0 0 0) (X64Bytes32 0 0 0 0)) False))),
+     LowerTestOf "from_nat cannot declare an unchecked word result" (fun (_ : Unit) => lower_test_checker_rejected
+       (prim_string_concat lower_constant_base "intrinsic unchecked : Nat -> W := \"ouro.u32.from_nat.checked\"; def main : Runtime W := pid;")),
+     LowerTestOf "same-spelled ordinary from_nat remains unsupported" (fun (_ : Unit) => lower_test_source_rejected 5
+       (prim_string_concat lower_constant_base "axiom from_nat : Nat -> Choice W; def main : Runtime W := match from_nat 0 with | None => pid | Some value => pure W value end;")),
+     LowerTestOf "opaque Nat cannot be treated as a constant" (fun (_ : Unit) => lower_test_source_rejected 5
+       (prim_string_concat lower_constant_base "axiom number : Nat; def main : Runtime W := match from_word number with | None => pid | Some value => pure W value end;")),
+     LowerTestOf "Bool and U8 remain distinct checked types" (fun (_ : Unit) => lower_test_checker_rejected
+       (prim_string_concat lower_constant_base "def fake (value : Byte) : Truth := value; def main : Runtime W := pid;")),
+     LowerTestOf "Maybe parameters have no scalar ABI fallback" (fun (_ : Unit) => lower_test_source_rejected 4
+       (prim_string_concat lower_constant_base "def select (value : Choice W) (fallback : W) : W := match value with | None => fallback | Some payload => payload end; def main : Runtime W := pid;")),
+     LowerTestOf "Runtime Maybe results remain explicitly unsupported" (fun (_ : Unit) => lower_test_source_rejected 4
+       (prim_string_concat lower_constant_base "def result : Runtime (Choice W) := pure (Choice W) (None W); def main : Runtime W := pid;")),
+     LowerTestOf "invalid unselected Bool branches still fail checking" (fun (_ : Unit) => lower_test_checker_rejected
+       (prim_string_concat lower_constant_base "def main : Runtime W := match Yes with | Yes => pid | No => pure Wide (from_wide 0) end;"))];
+
+def lower_test_fixture (fixture : NativeLowerFixture) : LowerTest :=
+    match fixture with | NativeLowerFixtureOf name source _ => LowerTestOf (prim_string_concat "source lowers: " name)
+      (fun (_ : Unit) => match native_lower_source lower_fixture_fuel mir_default_limits lower_fixture_main (prim_string_to_char_codes source) with
+        | Left _ => False | Right _ => True end) end;
+
+def lower_test_normalized_as (expected : CoreTerm) (result : Either NativeLowerError CoreTerm) : Bool :=
+    match result with | Left _ => False | Right actual =>
+      match lower_core_equal 100 0 expected actual with | Left _ => False | Right _ => True end end;
+
+def lower_test_indexed_alias : Bool :=
+    let entries : List Entry :=
+      [MkEntry 7 (CSort 1) (Just CoreTerm (CConst 8)),
+       MkEntry 7 (CSort 1) (Just CoreTerm (CSort 1)),
+       MkEntry 8 (CSort 1) (Just CoreTerm (CSort 0))] in
+    let sig : CheckEnvironment := check_environment_from_entries entries in
+    andb (lower_test_normalized_as (CSort 0)
+      (lower_check CoreTerm 0 (check_from_normalize CoreTerm (normalize_checked 100 entries (CConst 7)))))
+      (andb (lower_test_normalized_as (CSort 0) (lower_normalize 100 sig (CConst 7)))
+        (lower_test_normalized_as (CSort 0) (lower_constant_whnf 100 sig (CConst 7))));
+
+def lower_test_literal_failure (result : Either NativeLowerError CoreTerm) : Bool :=
+    match result with | Right _ => False | Left error => match error with
+      | LowerDeclarationFailure name phase failure => andb (eqNat name 0)
+          (andb (match phase with | CheckDeclarationBody => True | CheckDeclarationPlan => False
+             | CheckDeclarationType => False | CheckInductiveDeclaration => False end)
+            (match failure with | CheckReductionFailure fault => match fault with
+              | NormalizeUnresolvedLiteral => True
+              | NormalizeNonFunction => False | NormalizeCaseBranchCount => False | NormalizeCaseScrutinee => False
+              | NormalizeCaseInductive => False | NormalizeCaseParameters => False | NormalizeCaseConstructor => False
+              | NormalizeCaseArguments => False | NormalizeFixArgument => False | NormalizeFixArity => False
+              | NormalizeUnreducedHead => False | NormalizeStringBytes => False | NormalizeStringArguments => False
+              | NormalizeStringType => False end
+            | CheckTypeFailure _ => False | CheckMalformedCore _ => False | CheckResourceLimit => False
+            | CheckUnsupported _ => False | CheckCancelled => False | CheckInternalFailure _ => False
+            | CheckPrimitiveFailure _ => False end))
+      | LowerResourceExhausted => False | LowerMetadataMismatch _ => False | LowerBodyMismatch _ => False
+      | LowerUnsupportedType _ => False | LowerUnsupportedTerm _ => False | LowerUnsupportedPrimitive _ => False
+      | LowerUnknownGlobal _ => False | LowerUnboundLocal _ => False | LowerInvalidCall _ => False
+      | LowerEffectMismatch => False | LowerInvalidEntry _ => False | LowerMirFailure _ => False
+      | LowerBackendFailure _ => False end end;
+
+def lower_test_indexed_errors : Bool :=
+    let sig : CheckEnvironment := check_environment_empty in
+    let term : CoreTerm := CStrLit 3 4 in
+    andb (lower_test_literal_failure
+      (lower_check CoreTerm 0 (check_from_normalize CoreTerm (normalize_checked 100 ([] : List Entry) term))))
+      (andb (lower_test_literal_failure (lower_normalize 100 sig term))
+        (andb (lower_test_literal_failure (lower_constant_whnf 100 sig term))
+          (andb (lower_test_rejected CoreTerm 0 (lower_normalize 0 sig (CSort 0)))
+            (lower_test_rejected CoreTerm 0 (lower_constant_whnf 0 sig (CSort 0))))));
+
+def lower_test_indexed_primitive_errors : Bool :=
+    let entries : List Entry := [] in
+    let sig : CheckEnvironment := check_environment_from_entries entries in
+    let malformed : CoreTerm := CStrLit 3 4 in
+    andb (lower_test_rejected CoreTerm 4 (lower_from_primitive CoreTerm malformed
+      (primitive_normalizer entries 100 malformed)))
+      (andb (lower_test_rejected CoreTerm 4 (lower_from_primitive CoreTerm malformed
+        (primitive_normalizer_indexed sig 100 malformed)))
+        (andb (lower_test_rejected CoreTerm 0 (lower_from_primitive CoreTerm (CSort 0)
+          (primitive_normalizer entries 0 (CSort 0))))
+          (lower_test_rejected CoreTerm 0 (lower_from_primitive CoreTerm (CSort 0)
+            (primitive_normalizer_indexed sig 0 (CSort 0))))));
+
+def lower_test_contract_order (expected : List Nat) (result : Either NativeLowerError (List LowerContract)) : Bool :=
+    match result with | Left _ => False | Right contracts =>
+      pe_bytes_equal expected (map LowerContract Nat lower_contract_id contracts) end;
+
+def lower_test_function_order (expected : List Nat) (result : Either NativeLowerError (List MirFunction)) : Bool :=
+    match result with | Left _ => False | Right functions =>
+      pe_bytes_equal expected (map MirFunction Nat mir_function_id functions) end;
+
+def lower_test_indexed_order : Bool :=
+    match compile_checked_source lower_fixture_fuel (prim_string_to_char_codes lower_fixture_alias) with
+    | CErr _ => False | COk program =>
+      lower_test_named program "pid" (fun (pid : Nat) =>
+        lower_test_named program "identity" (fun (identity : Nat) =>
+          lower_test_named program "main" (fun (main_id : Nat) =>
+            let entries : List Entry := checked_program_entries program in
+            let sig : CheckEnvironment := check_environment_from_entries entries in
+            let pending : List Entry := reverse Entry entries in
+            let raw : Either NativeLowerError (List LowerContract) := lower_collect_contracts entries lower_fixture_fuel pending in
+            let indexed : Either NativeLowerError (List LowerContract) := lower_collect_contracts_indexed sig lower_fixture_fuel pending in
+            andb (lower_test_contract_order ([pid, identity, main_id] : List Nat) raw)
+              (andb (lower_test_contract_order ([pid, identity, main_id] : List Nat) indexed)
+                (match indexed with | Left _ => False | Right contracts =>
+                  let reversed : List LowerContract := reverse LowerContract contracts in
+                  andb (lower_test_function_order ([main_id, identity] : List Nat)
+                    (lower_functions lower_fixture_fuel program contracts reversed))
+                    (lower_test_function_order ([main_id, identity] : List Nat)
+                      (lower_functions_indexed lower_fixture_fuel program sig contracts reversed)) end))))) end;
+
+def lower_test_unknown_function (expected : Nat) (result : Either NativeLowerError (List MirFunction)) : Bool :=
+    match result with | Right _ => False | Left error =>
+      andb (eqNat (native_lower_error_code error) 7) (eqNat (lower_test_error_detail error) expected) end;
+
+def lower_test_indexed_first_error : Bool := lower_test_with_reference (fun (program : CheckedProgram) =>
+    let typ : LowerType := LowerTypeOf (CSort 0) (Just MirType MirU32) False in
+    let first : LowerContract := LowerContractOf 777 (CSort 0) ([] : List LowerType) typ (Nothing PrimitiveBinding) in
+    let second : LowerContract := LowerContractOf 888 (CSort 0) ([] : List LowerType) typ (Nothing PrimitiveBinding) in
+    let pending : List LowerContract := [first, second] in
+    let sig : CheckEnvironment := check_environment_from_entries (checked_program_entries program) in
+    andb (lower_test_unknown_function 777 (lower_functions 100 program pending pending))
+      (andb (lower_test_unknown_function 777 (lower_functions_indexed 100 program sig pending pending))
+        (andb (lower_test_unknown_function 888 (lower_functions 100 program pending (reverse LowerContract pending)))
+          (lower_test_unknown_function 888 (lower_functions_indexed 100 program sig pending (reverse LowerContract pending))))));
+
+def lower_test_indexed_empty_fuel : Bool := lower_test_with_reference (fun (program : CheckedProgram) =>
+    let entries : List Entry := [] in
+    let contracts : List LowerContract := [] in
+    let sig : CheckEnvironment := check_environment_from_entries entries in
+    andb (lower_test_rejected (List LowerContract) 0 (lower_collect_contracts entries 0 entries))
+      (andb (lower_test_rejected (List LowerContract) 0 (lower_collect_contracts_indexed sig 0 entries))
+        (andb (lower_test_function_order ([] : List Nat) (lower_functions 0 program contracts contracts))
+          (lower_test_function_order ([] : List Nat) (lower_functions_indexed 0 program sig contracts contracts)))));
+
+def lower_test_indexed_single_function : Bool := lower_test_with_reference (fun (program : CheckedProgram) =>
+    lower_test_named program "main" (fun (id : Nat) =>
+      let entries : List Entry := checked_program_entries program in
+      let sig : CheckEnvironment := check_environment_from_entries entries in
+      match lower_collect_contracts entries lower_fixture_fuel (reverse Entry entries) with
+      | Left _ => False | Right contracts => match lower_find_contract id contracts, lookup_const id entries with
+        | Nothing, Nothing => False | Nothing, Just _ => False | Just _, Nothing => False
+        | Just contract, Just body =>
+          let single : MirFunction -> List MirFunction := fun (function : MirFunction) => [function] in
+          andb (lower_test_function_order ([id] : List Nat)
+            (lower_map MirFunction (List MirFunction) single (lower_function lower_fixture_fuel program contracts contract body)))
+            (andb (lower_test_function_order ([id] : List Nat)
+              (lower_map MirFunction (List MirFunction) single
+                (lower_function_indexed lower_fixture_fuel program sig contracts contract body)))
+              (andb (lower_test_rejected MirFunction 0 (lower_function 0 program contracts contract body))
+                (lower_test_rejected MirFunction 0 (lower_function_indexed 0 program sig contracts contract body)))) end end));
+
+def lower_indexed_tests : List LowerTest :=
+    [LowerTestOf "derived lowering index preserves the first raw alias binding" (fun (_ : Unit) => lower_test_indexed_alias),
+     LowerTestOf "indexed normalization retains exact malformed and exhausted errors" (fun (_ : Unit) => lower_test_indexed_errors),
+     LowerTestOf "indexed primitive normalizer retains ABI and resource failures" (fun (_ : Unit) => lower_test_indexed_primitive_errors),
+     LowerTestOf "raw and indexed lowering preserve contract and requested function order" (fun (_ : Unit) => lower_test_indexed_order),
+     LowerTestOf "raw and indexed lowering report the first failing function" (fun (_ : Unit) => lower_test_indexed_first_error),
+     LowerTestOf "single function boundaries share results and fuel failures" (fun (_ : Unit) => lower_test_indexed_single_function),
+     LowerTestOf "empty lowering boundaries preserve their distinct zero fuel outcomes" (fun (_ : Unit) => lower_test_indexed_empty_fuel)];
+
+def lower_case_output (name : String) : String :=
+    prim_string_concat "ok " (prim_string_concat name "\nnative lower assertions complete\n");
+
+def lower_case_succeeded (name : String) (result : ProcResult) : Bool :=
+    match result with | MkProcResult status output errors => andb (eqNat status 0)
+      (andb (prim_string_eq output (lower_case_output name)) (prim_string_eq errors "")) end;
+
+def lower_case_name_absent (name : String) : List LowerTest -> Bool :=
+  fix absent (tests : List LowerTest) : Bool :=
+    match tests with | Nil => True | Cons test rest => match test with | LowerTestOf label _ =>
+      andb (notb (prim_string_eq name label)) (absent rest) end end;
+
+def lower_runner_tests : List LowerTest :=
+    [LowerTestOf "isolated case requires its exact successful output" (fun (_ : Unit) =>
+       lower_case_succeeded "case" (MkProcResult 0 (lower_case_output "case") "")),
+     LowerTestOf "isolated case rejects a failed child" (fun (_ : Unit) =>
+       notb (lower_case_succeeded "case" (MkProcResult 1 (lower_case_output "case") ""))),
+     LowerTestOf "isolated case rejects child diagnostics" (fun (_ : Unit) =>
+       notb (lower_case_succeeded "case" (MkProcResult 0 (lower_case_output "case") "failure"))),
+     LowerTestOf "isolated case rejects missing or mismatched assertions" (fun (_ : Unit) =>
+       andb (notb (lower_case_succeeded "case" (MkProcResult 0 "ok case\n" "")))
+         (notb (lower_case_succeeded "case" (MkProcResult 0 (lower_case_output "another") "")))),
+     LowerTestOf "isolated inventory rejects duplicate case names" (fun (_ : Unit) =>
+       notb (lower_case_name_absent "same" [LowerTestOf "same" (fun (_ : Unit) => False)])),
+     LowerTestOf "isolated inventory preserves distinct case names" (fun (_ : Unit) =>
+       lower_case_name_absent "first" [LowerTestOf "second" (fun (_ : Unit) => False)])];
+
+def lower_all_tests : List LowerTest := append LowerTest lower_runner_tests (append LowerTest lower_indexed_tests (append LowerTest lower_tests
+    (append LowerTest lower_constant_tests
+      (map NativeLowerFixture LowerTest lower_test_fixture
+        (append NativeLowerFixture lower_raw_fixtures (append NativeLowerFixture lower_loop_fixtures lower_constant_fixtures))))));
+
+def lower_test_run : List LowerTest -> IO Unit :=
+  fix run (tests : List LowerTest) : IO Unit :=
+    match tests with | Nil => println "native lower assertions complete"
+    | Cons test rest => match test with | LowerTestOf name evaluate => match evaluate MkUnit with
+      | True => do println (prim_string_concat "ok " name); run rest
+      | False => do println (prim_string_concat "FAIL " name); exit 1 end end end;
+
+-- Each assertion gets its own compiler heap on the transitional C host.
+-- Keep every case and require its actual result before reporting success.
+def lower_test_run_isolated (executable : String) : List LowerTest -> IO Unit :=
+  fix run (tests : List LowerTest) : IO Unit :=
+    match tests with | Nil => println "native lower assertions complete"
+    | Cons test rest => match test with | LowerTestOf name _ =>
+      match lower_case_name_absent name rest with
+      | False => do eprintln (prim_string_concat "duplicate native lower case: " name); exit 1
+      | True => do let! result := proc_exec executable ["--case", name];
+                   match lower_case_succeeded name result with
+                   | True => do println (prim_string_concat "ok " name); run rest
+                   | False => do eprintln (prim_string_concat "failed native lower case: " name);
+                                 print (proc_stdout result); eprint (proc_stderr result); exit 1 end
+      end end end;
+
+def lower_test_list : List LowerTest -> IO Unit :=
+  fix list_cases (tests : List LowerTest) : IO Unit :=
+    match tests with | Nil => io_unit
+    | Cons test rest => match test with | LowerTestOf name _ =>
+        do println name; list_cases rest end end;
+
+def lower_test_selected (name : String) : List LowerTest -> IO Unit :=
+  fix select_case (tests : List LowerTest) : IO Unit :=
+    match tests with | Nil => do eprintln "unknown native lower case"; exit 2
+    | Cons test rest => match test with | LowerTestOf label _ => match prim_string_eq name label with
+      | True => lower_test_run ([test] : List LowerTest)
+      | False => select_case rest end end end;
+
+def lower_fixture_find (name : String) : List NativeLowerFixture -> Maybe NativeLowerFixture :=
+  fix find_fixture (fixtures : List NativeLowerFixture) : Maybe NativeLowerFixture :=
+    match fixtures with | Nil => Nothing NativeLowerFixture
+    | Cons fixture rest => match fixture with | NativeLowerFixtureOf label _ _ => match prim_string_eq name label with
+      | True => Just NativeLowerFixture fixture | False => find_fixture rest end end end;
+
+def lower_emit_bytes : List Nat -> String :=
+  fix bytes_text (bytes : List Nat) : String := match bytes with
+    | Nil => "" | Cons byte rest => match rest with
+      | Nil => prim_string_of_nat byte
+      | Cons _ _ => prim_string_concat (prim_string_of_nat byte) (prim_string_concat "," (bytes_text rest)) end end;
+
+def lower_test_frame_text (frame : NativeFrameInfo) : String :=
+    match frame with | NativeFrameAt id allocation roots calls =>
+      lower_fixture_join ([prim_string_of_nat id, "|", prim_string_of_nat allocation, "|",
+        managed_driver_join "," (map NativeRootSlot String (fun (root : NativeRootSlot) => match root with
+          | NativeRootAt local offset => lower_fixture_join ([prim_string_of_nat local, ":", prim_string_of_nat offset] : List String) end) roots), "|",
+        managed_driver_join "," (map NativeCallSite String (fun (site : NativeCallSite) => match site with
+          | NativeCallAt block instruction pc => lower_fixture_join ([prim_string_of_nat block, ":", prim_string_of_nat instruction, ":", prim_string_of_nat pc] : List String) end) calls)] : List String) end;
+
+def lower_test_image_text (metadata : Bool) (image : NativeImage) : String :=
+    match image with | NativeImageOf pe frames => match metadata with
+      | True => managed_driver_join "\n" (map NativeFrameInfo String lower_test_frame_text frames)
+      | False => match pe with | PeImageFile bytes _ => lower_emit_bytes bytes end end end;
+
+def lower_test_emit (mode : String) (name : String) : IO Unit :=
+    match lower_fixture_find name (append NativeLowerFixture lower_all_fixtures lower_constant_fixtures) with
+    | Nothing => do eprintln "unknown native source fixture"; exit 2
+    | Just fixture => match fixture with | NativeLowerFixtureOf _ source _ => match prim_string_eq mode "--source" with
+      | True => println source
+      | False => match lower_fixture_compile source with
+        | Left error => do eprintln (lower_test_error_text error); exit 2
+        | Right image => println (lower_test_image_text (prim_string_eq mode "--metadata") image) end end end end;
+
+-- @entry main
+def main : IO Unit :=
+    do let! arguments := argv;
+       match arguments with
+       | Nil => exit 2
+       | Cons executable rest => match rest with
+         | Nil => lower_test_run_isolated executable lower_all_tests
+         | Cons mode more => match more with
+           | Nil => match prim_string_eq mode "--list-cases" with
+             | True => lower_test_list lower_all_tests | False => exit 2 end
+           | Cons name extra => match extra with | Cons _ _ => exit 2
+             | Nil => match prim_string_eq mode "--case" with
+               | True => lower_test_selected name lower_all_tests
+               | False => match orb (prim_string_eq mode "--image")
+                 (orb (prim_string_eq mode "--source") (prim_string_eq mode "--metadata")) with
+               | True => lower_test_emit mode name
+               | False => do eprintln "usage: native_lower_tests [--list-cases | --case NAME | --image NAME | --source NAME | --metadata NAME]"; exit 2 end end end end end end

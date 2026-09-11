@@ -1,0 +1,178 @@
+-- Search and order use unsigned bytes, including embedded NUL. Every indexed
+-- access keeps the managed owner; the loops themselves do not allocate.
+import "managed_string_access.ouro";
+
+def managed_string_edge_bytes (input : MirValue) (length : MirValue) (pattern : MirValue)
+    (width : MirValue) (suffix : Bool) (state : ManagedState) : Either NativeLowerError ManagedResult :=
+    lower_bind ManagedResult ManagedResult (match suffix with
+      | True => managed_binary MirUSize MirSub length width state
+      | False => managed_string_value (managed_bits MirUSize 0) state end)
+      (fun (begin : ManagedResult) => match begin with | ManagedResultOf offset next =>
+        lower_bind ManagedResult ManagedResult (managed_binary MirUSize MirAdd offset (managed_bits MirUSize 40) next)
+          (fun (at : ManagedResult) => match at with | ManagedResultOf start after =>
+            managed_bytes_equal input start pattern (managed_bits MirUSize 40) width after end) end);
+
+def managed_string_edge_values (compiler : ManagedCompiler) (input : MirValue) (pattern : MirValue)
+    (suffix : Bool) (state : ManagedState) : Either NativeLowerError ManagedResult :=
+    lower_bind ManagedResult ManagedResult (managed_string_size compiler input state)
+      (fun (first : ManagedResult) => match first with | ManagedResultOf length next =>
+        lower_bind ManagedResult ManagedResult (managed_string_size compiler pattern next)
+          (fun (second : ManagedResult) => match second with | ManagedResultOf width after =>
+            lower_bind ManagedResult ManagedResult (managed_compare MirLessEqual width length after)
+              (fun (tested : ManagedResult) => match tested with | ManagedResultOf fits ready =>
+                lower_bind ManagedResult ManagedResult (managed_string_choose MirU8 fits
+                  (managed_string_edge_bytes input length pattern width suffix)
+                  (managed_string_value (managed_bits MirU8 0)) ready)
+                  (fun (matched : ManagedResult) => match matched with | ManagedResultOf equal finish =>
+                    managed_boolean compiler equal finish end) end) end) end);
+
+def managed_string_starts_values (compiler : ManagedCompiler) (input : MirValue) (pattern : MirValue)
+    (state : ManagedState) : Either NativeLowerError ManagedResult :=
+    managed_string_edge_values compiler input pattern False state;
+
+def managed_string_ends_values (compiler : ManagedCompiler) (input : MirValue) (pattern : MirValue)
+    (state : ManagedState) : Either NativeLowerError ManagedResult :=
+    managed_string_edge_values compiler input pattern True state;
+
+-- The caller proves width <= length. The sentinel is length + 1, which fits
+-- because the checked String allocation also includes its forty-byte header.
+def managed_string_find_loop (input : MirValue) (pattern : MirValue) (width : MirValue)
+    (last : MirValue) (missing : MirValue) (state : ManagedState) : Either NativeLowerError ManagedResult :=
+    lower_bind (Pair Nat ManagedState) ManagedResult (managed_fresh_local MirUSize state)
+      (fun (cell : Pair Nat ManagedState) => match cell with | MkPair index after_cell =>
+        lower_bind (Pair Nat ManagedState) ManagedResult (managed_fresh_local MirUSize after_cell)
+          (fun (result : Pair Nat ManagedState) => match result with | MkPair found after_result =>
+            let initialized : ManagedState := managed_emit_all
+              ([MirMove index (managed_bits MirUSize 0), MirMove found missing] : List MirInstruction) after_result in
+            lower_bind LowerLoopBlocks ManagedResult (lower_loop_blocks (managed_flow initialized))
+              (fun (labels : LowerLoopBlocks) => match labels with | LowerLoopAt header body finish flow =>
+                lower_bind ManagedResult ManagedResult (managed_compare MirLessEqual (MirUse index) last
+                  (managed_with_flow initialized (lower_switch_block header (MirJump header) flow)))
+                  (fun (bound : ManagedResult) => match bound with | ManagedResultOf in_bounds next =>
+                    lower_bind ManagedResult ManagedResult (managed_compare MirEqual (MirUse found) missing next)
+                      (fun (tested : ManagedResult) => match tested with | ManagedResultOf pending after_test =>
+                        lower_bind ManagedResult ManagedResult (managed_binary MirU8 MirAnd in_bounds pending after_test)
+                          (fun (condition : ManagedResult) => match condition with | ManagedResultOf running ready =>
+                            lower_bind ManagedResult ManagedResult
+                              (managed_binary MirUSize MirAdd (MirUse index) (managed_bits MirUSize 40)
+                                (managed_switch_block body (MirBranch running body finish) ready))
+                              (fun (at : ManagedResult) => match at with | ManagedResultOf offset after_offset =>
+                                lower_bind ManagedResult ManagedResult
+                                  (managed_bytes_equal input offset pattern (managed_bits MirUSize 40) width after_offset)
+                                  (fun (matched : ManagedResult) => match matched with | ManagedResultOf equal after_match =>
+                                    lower_bind ManagedResult ManagedResult (managed_string_choose MirUSize equal
+                                      (managed_string_value (MirUse index)) (managed_string_value missing) after_match)
+                                      (fun (selected : ManagedResult) => match selected with | ManagedResultOf position after_select =>
+                                        Right NativeLowerError ManagedResult (ManagedResultOf (MirUse found)
+                                          (managed_switch_block finish (MirJump header) (managed_emit_all
+                                            ([MirMove found position, MirBinaryOp index MirAdd (MirUse index)
+                                              (managed_bits MirUSize 1)] : List MirInstruction) after_select)))
+                                        end) end) end) end) end) end) end) end) end);
+
+def managed_string_find_fitting (input : MirValue) (length : MirValue) (pattern : MirValue)
+    (width : MirValue) (missing : MirValue) (state : ManagedState) : Either NativeLowerError ManagedResult :=
+    lower_bind ManagedResult ManagedResult (managed_binary MirUSize MirSub length width state)
+      (fun (bound : ManagedResult) => match bound with | ManagedResultOf last next =>
+        managed_string_find_loop input pattern width last missing next end);
+
+def managed_string_find_bytes (input : MirValue) (length : MirValue) (pattern : MirValue)
+    (width : MirValue) (state : ManagedState) : Either NativeLowerError ManagedResult :=
+    lower_bind ManagedResult ManagedResult (managed_binary MirUSize MirAdd length (managed_bits MirUSize 1) state)
+      (fun (sentinel : ManagedResult) => match sentinel with | ManagedResultOf missing next =>
+        lower_bind ManagedResult ManagedResult (managed_compare MirLessEqual width length next)
+          (fun (tested : ManagedResult) => match tested with | ManagedResultOf fits after =>
+            managed_string_choose MirUSize fits (managed_string_find_fitting input length pattern width missing)
+              (managed_string_value missing) after end) end);
+
+def managed_string_index_some (compiler : ManagedCompiler) (family : Nat) (index : MirValue) (state : ManagedState)
+    : Either NativeLowerError ManagedResult :=
+    lower_bind ManagedResult ManagedResult (managed_nat_from_word compiler PrimitiveWordUSize index state)
+      (fun (natural : ManagedResult) => match natural with | ManagedResultOf value next =>
+        managed_constructor compiler family (managed_bits MirUSize 1) ([value] : List MirValue) next end);
+
+def managed_string_index_result (compiler : ManagedCompiler) (length : MirValue) (index : MirValue) (state : ManagedState)
+    : Either NativeLowerError ManagedResult :=
+    lower_bind Nat ManagedResult (lower_role_identity (managed_compiler_entries compiler) PrimitiveMaybeRole)
+      (fun (family : Nat) => lower_bind ManagedResult ManagedResult (managed_compare MirLessEqual index length state)
+        (fun (tested : ManagedResult) => match tested with | ManagedResultOf found next =>
+          managed_string_choose MirManagedPtr found (managed_string_index_some compiler family index)
+            (managed_constructor compiler family (managed_bits MirUSize 0) ([] : List MirValue)) next end));
+
+def managed_string_contains_result (compiler : ManagedCompiler) (length : MirValue) (index : MirValue) (state : ManagedState)
+    : Either NativeLowerError ManagedResult :=
+    lower_bind ManagedResult ManagedResult (managed_compare MirLessEqual index length state)
+      (fun (tested : ManagedResult) => match tested with | ManagedResultOf found next =>
+        managed_boolean compiler found next end);
+
+def managed_string_find_values (compiler : ManagedCompiler) (input : MirValue) (pattern : MirValue)
+    (result : MirValue -> MirValue -> ManagedState -> Either NativeLowerError ManagedResult)
+    (state : ManagedState) : Either NativeLowerError ManagedResult :=
+    lower_bind ManagedResult ManagedResult (managed_string_size compiler input state)
+      (fun (first : ManagedResult) => match first with | ManagedResultOf length next =>
+        lower_bind ManagedResult ManagedResult (managed_string_size compiler pattern next)
+          (fun (second : ManagedResult) => match second with | ManagedResultOf width after =>
+            lower_bind ManagedResult ManagedResult (managed_string_find_bytes input length pattern width after)
+              (fun (found : ManagedResult) => match found with | ManagedResultOf index finish =>
+                result length index finish end) end) end);
+
+def managed_string_contains_values (compiler : ManagedCompiler) (input : MirValue) (pattern : MirValue)
+    (state : ManagedState) : Either NativeLowerError ManagedResult :=
+    managed_string_find_values compiler input pattern (managed_string_contains_result compiler) state;
+
+def managed_string_index_values (compiler : ManagedCompiler) (input : MirValue) (pattern : MirValue)
+    (state : ManagedState) : Either NativeLowerError ManagedResult :=
+    managed_string_find_values compiler input pattern (managed_string_index_result compiler) state;
+
+def managed_string_order_step (left : MirValue) (right : MirValue) (index : Nat) (equal : Nat)
+    (ordered : Nat) (state : ManagedState) : Either NativeLowerError ManagedState :=
+    lower_bind ManagedResult ManagedState (managed_string_load_byte left (MirUse index) state)
+      (fun (first : ManagedResult) => match first with | ManagedResultOf left_byte next =>
+        lower_bind ManagedResult ManagedState (managed_string_load_byte right (MirUse index) next)
+          (fun (second : ManagedResult) => match second with | ManagedResultOf right_byte after =>
+            lower_bind ManagedResult ManagedState (managed_compare MirLess left_byte right_byte
+              (managed_emit (MirCompare equal MirEqual left_byte right_byte) after))
+              (fun (tested : ManagedResult) => match tested with | ManagedResultOf smaller ready =>
+                lower_bind ManagedResult ManagedState (managed_binary MirU8 MirAnd (MirUse equal) (MirUse ordered) ready)
+                  (fun (retained : ManagedResult) => match retained with | ManagedResultOf prefix_order finish =>
+                    Right NativeLowerError ManagedState (managed_emit_all
+                      ([MirBinaryOp ordered MirOr smaller prefix_order,
+                        MirBinaryOp index MirAdd (MirUse index) (managed_bits MirUSize 1)] : List MirInstruction) finish)
+                    end) end) end) end);
+
+def managed_string_order_loop (left : MirValue) (left_size : MirValue) (right : MirValue)
+    (right_size : MirValue) (state : ManagedState) : Either NativeLowerError ManagedResult :=
+    lower_bind (Pair Nat ManagedState) ManagedResult (managed_fresh_local MirUSize state)
+      (fun (cell : Pair Nat ManagedState) => match cell with | MkPair index after_cell =>
+        lower_bind (Pair Nat ManagedState) ManagedResult (managed_fresh_local MirU8 after_cell)
+          (fun (flag : Pair Nat ManagedState) => match flag with | MkPair equal after_flag =>
+            lower_bind (Pair Nat ManagedState) ManagedResult (managed_fresh_local MirU8 after_flag)
+              (fun (result : Pair Nat ManagedState) => match result with | MkPair ordered after_result =>
+                let initialized : ManagedState := managed_emit_all
+                  ([MirMove index (managed_bits MirUSize 0), MirMove equal (managed_bits MirU8 1),
+                    MirCompare ordered MirLessEqual left_size right_size] : List MirInstruction) after_result in
+                lower_bind LowerLoopBlocks ManagedResult (lower_loop_blocks (managed_flow initialized))
+                  (fun (labels : LowerLoopBlocks) => match labels with | LowerLoopAt header body finish flow =>
+                    lower_bind ManagedResult ManagedResult (managed_compare MirLess (MirUse index) left_size
+                      (managed_with_flow initialized (lower_switch_block header (MirJump header) flow)))
+                      (fun (first : ManagedResult) => match first with | ManagedResultOf in_left next =>
+                        lower_bind ManagedResult ManagedResult (managed_compare MirLess (MirUse index) right_size next)
+                          (fun (second : ManagedResult) => match second with | ManagedResultOf in_right after =>
+                            lower_bind ManagedResult ManagedResult (managed_binary MirU8 MirAnd in_left in_right after)
+                              (fun (bounds : ManagedResult) => match bounds with | ManagedResultOf in_bounds ready =>
+                                lower_bind ManagedResult ManagedResult (managed_binary MirU8 MirAnd in_bounds (MirUse equal) ready)
+                                  (fun (condition : ManagedResult) => match condition with | ManagedResultOf running after_condition =>
+                                    lower_map ManagedState ManagedResult (fun (finished : ManagedState) =>
+                                      ManagedResultOf (MirUse ordered) (managed_switch_block finish (MirJump header) finished))
+                                      (managed_string_order_step left right index equal ordered
+                                        (managed_switch_block body (MirBranch running body finish) after_condition))
+                                    end) end) end) end) end) end) end) end);
+
+def managed_string_less_equal_values (compiler : ManagedCompiler) (left : MirValue) (right : MirValue)
+    (state : ManagedState) : Either NativeLowerError ManagedResult :=
+    lower_bind ManagedResult ManagedResult (managed_string_size compiler left state)
+      (fun (first : ManagedResult) => match first with | ManagedResultOf left_size next =>
+        lower_bind ManagedResult ManagedResult (managed_string_size compiler right next)
+          (fun (second : ManagedResult) => match second with | ManagedResultOf right_size after =>
+            lower_bind ManagedResult ManagedResult (managed_string_order_loop left left_size right right_size after)
+              (fun (compared : ManagedResult) => match compared with | ManagedResultOf ordered finish =>
+                managed_boolean compiler ordered finish end) end) end);

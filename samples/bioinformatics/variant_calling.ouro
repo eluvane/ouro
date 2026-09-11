@@ -1,0 +1,223 @@
+-- Runnable GRCh38 variant-calling and filtering vertical slice.
+
+import "variant_calling_support.ouro";
+
+inductive VariantOutcome : Type :=
+  | MkVariantOutcome :
+      Vcf Human GRCh38 RawVariants ->
+      ExecutionEvidence
+        (VariantCallingInput Human GRCh38)
+        (Vcf Human GRCh38 RawVariants) ->
+      Vcf Human GRCh38 FilteredVariants ->
+      ExecutionEvidence
+        (Vcf Human GRCh38 RawVariants)
+        (Vcf Human GRCh38 FilteredVariants) ->
+      VariantOutcome;
+
+def runVariantPipeline : IO (Either ExternalToolError VariantOutcome) :=
+  let callInvocation :
+    ToolInvocation
+      (VariantCallingInput Human GRCh38)
+      (Vcf Human GRCh38 RawVariants) :=
+    prepareVariantCalling Human GRCh38
+      fixtureVariantCallSpec hg001Bam hg001Reference in
+  do let! callResult :=
+       runExternalTool
+         (VariantCallingInput Human GRCh38)
+         (Vcf Human GRCh38 RawVariants)
+         callInvocation;
+     match callResult with
+     | Left error =>
+         io_pure (Either ExternalToolError VariantOutcome)
+           (Left ExternalToolError VariantOutcome error)
+     | Right callExecution =>
+         let rawVcf : Vcf Human GRCh38 RawVariants :=
+           callVariants Human GRCh38 callExecution in
+         let callEvidence :
+           ExecutionEvidence
+             (VariantCallingInput Human GRCh38)
+             (Vcf Human GRCh38 RawVariants) :=
+           successfulExecutionEvidence
+             (VariantCallingInput Human GRCh38)
+             (Vcf Human GRCh38 RawVariants)
+             callExecution in
+         let filterInvocation :
+           ToolInvocation
+             (Vcf Human GRCh38 RawVariants)
+             (Vcf Human GRCh38 FilteredVariants) :=
+           prepareVariantFiltering Human GRCh38
+             fixtureVariantFilterSpec rawVcf in
+         do let! filterResult :=
+              runExternalTool
+                (Vcf Human GRCh38 RawVariants)
+                (Vcf Human GRCh38 FilteredVariants)
+                filterInvocation;
+            match filterResult with
+            | Left error =>
+                io_pure (Either ExternalToolError VariantOutcome)
+                  (Left ExternalToolError VariantOutcome error)
+            | Right filterExecution =>
+                let filteredVcf : Vcf Human GRCh38 FilteredVariants :=
+                  filterVariants Human GRCh38 filterExecution in
+                let filterEvidence :
+                  ExecutionEvidence
+                    (Vcf Human GRCh38 RawVariants)
+                    (Vcf Human GRCh38 FilteredVariants) :=
+                  successfulExecutionEvidence
+                    (Vcf Human GRCh38 RawVariants)
+                    (Vcf Human GRCh38 FilteredVariants)
+                    filterExecution in
+                io_pure (Either ExternalToolError VariantOutcome)
+                  (Right ExternalToolError VariantOutcome
+                    (MkVariantOutcome rawVcf callEvidence
+                      filteredVcf filterEvidence))
+            end
+     end
+
+def callEvidenceInputIdentitiesMatch
+  (evidence :
+    ExecutionEvidence
+      (VariantCallingInput Human GRCh38)
+      (Vcf Human GRCh38 RawVariants)) : Bool :=
+  exactTwoInputIdentities
+    (executionEvidenceInputArtifacts
+      (VariantCallingInput Human GRCh38)
+      (Vcf Human GRCh38 RawVariants)
+      evidence)
+    (provenanceArtifactIdentity
+      (bamProvenance Human GRCh38 CoordinateSorted Indexed hg001Bam))
+    (provenanceArtifactIdentity
+      (referenceProvenance Human GRCh38 hg001Reference));
+
+def callProvenanceParentsMatch
+  (rawVcf : Vcf Human GRCh38 RawVariants) : Bool :=
+  exactTwoInputIdentities
+    (provenanceParentArtifactIdentities
+      (vcfProvenance Human GRCh38 RawVariants rawVcf))
+    (provenanceArtifactIdentity
+      (bamProvenance Human GRCh38 CoordinateSorted Indexed hg001Bam))
+    (provenanceArtifactIdentity
+      (referenceProvenance Human GRCh38 hg001Reference));
+
+def callOutputTransformationMatches
+  (evidence :
+    ExecutionEvidence
+      (VariantCallingInput Human GRCh38)
+      (Vcf Human GRCh38 RawVariants)) : Bool :=
+  match artifactIdentityTransformation
+    (executionEvidenceOutputIdentity
+      (VariantCallingInput Human GRCh38)
+      (Vcf Human GRCh38 RawVariants)
+      evidence) with
+  | Nothing => False
+  | Just outputTransformation =>
+      sameTransformationIdentity outputTransformation
+        (executionEvidenceTransformationIdentity
+          (VariantCallingInput Human GRCh38)
+          (Vcf Human GRCh38 RawVariants)
+          evidence)
+  end;
+
+def reportVariantOutcome (outcome : VariantOutcome) : IO Unit :=
+  match outcome with
+  | MkVariantOutcome rawVcf callEvidence filteredVcf filterEvidence =>
+      do println "typed_variant_call=ok";
+         println "typed_variant_filter=ok";
+         println
+           (kv_line "call_tool"
+             (toolIdentityLabel
+               (executionEvidenceTool
+                 (VariantCallingInput Human GRCh38)
+                 (Vcf Human GRCh38 RawVariants)
+                 callEvidence)));
+         println
+           (kv_line "filter_tool"
+             (toolIdentityLabel
+               (executionEvidenceTool
+                 (Vcf Human GRCh38 RawVariants)
+                 (Vcf Human GRCh38 FilteredVariants)
+                 filterEvidence)));
+         println
+           (kv_line "raw_vcf_path"
+             (vcfPath Human GRCh38 RawVariants rawVcf));
+         println
+           (kv_line "filtered_vcf_path"
+             (vcfPath Human GRCh38 FilteredVariants filteredVcf));
+         println
+           (kv_line "call_input_identities"
+             (show_bool (callEvidenceInputIdentitiesMatch callEvidence)));
+         println
+           (kv_line "call_provenance_parents"
+             (show_bool (callProvenanceParentsMatch rawVcf)));
+         println
+           (kv_line "call_source_lineage"
+             (show_nat
+               (length ArtifactIdentity
+                 (provenanceSourceArtifactIdentities
+                   (vcfProvenance Human GRCh38 RawVariants rawVcf)))));
+         println
+           (kv_line "transformation_stable"
+             (show_bool transformationIdentityStable));
+         println
+           (kv_line "parameter_changes_identity"
+             (show_bool parameterChangesTransformationIdentity));
+         println
+           (kv_line "input_changes_identity"
+             (show_bool inputChangesTransformationIdentity));
+         println
+           (kv_line "output_contract_changes_identity"
+             (show_bool outputContractChangesTransformationIdentity));
+         println
+           (kv_line "nondeterministic_metadata_incomplete"
+             (show_bool nondeterministicMetadataIsIncomplete));
+         println
+           (kv_line "output_identity_kind"
+             (artifactIdentityKind
+               (executionEvidenceOutputIdentity
+                 (VariantCallingInput Human GRCh38)
+                 (Vcf Human GRCh38 RawVariants)
+                 callEvidence)));
+         println
+           (kv_line "output_content_identity"
+             (show_bool
+               (artifactHasContentIdentity
+                 (executionEvidenceOutputIdentity
+                   (VariantCallingInput Human GRCh38)
+                   (Vcf Human GRCh38 RawVariants)
+                   callEvidence))));
+         println
+           (kv_line "output_transformation_matches"
+             (show_bool (callOutputTransformationMatches callEvidence)));
+         println
+           (kv_line "call_reproducibility"
+             (reproducibilityCode
+               (executionEvidenceReproducibility
+                 (VariantCallingInput Human GRCh38)
+                 (Vcf Human GRCh38 RawVariants)
+                 callEvidence)));
+         println
+           (kv_line "filter_reproducibility"
+             (reproducibilityCode
+               (executionEvidenceReproducibility
+                 (Vcf Human GRCh38 RawVariants)
+                 (Vcf Human GRCh38 FilteredVariants)
+                 filterEvidence)));
+         println
+           (kv_line "raw_provenance"
+             (provenanceKind
+               (vcfProvenance Human GRCh38 RawVariants rawVcf)));
+         println
+           (kv_line "filtered_provenance"
+             (provenanceKind
+               (vcfProvenance Human GRCh38 FilteredVariants filteredVcf)))
+  end;
+
+-- @entry main
+def main : IO Unit :=
+  do let! result := runVariantPipeline;
+     match result with
+     | Left error =>
+         do println (kv_line "pipeline_error" (externalToolErrorMessage error));
+            exit 1
+     | Right outcome => reportVariantOutcome outcome
+     end

@@ -1,0 +1,126 @@
+-- Output allocation precedes raw ownership. The read loop allocates no
+-- managed objects, so every allocation failure leaves no raw page to release.
+import "managed_stdin_model.ouro";
+
+def managed_stdin_line_limit : Nat := sub (mul 32 256) 1;
+
+def managed_stdin_copy (output : MirValue) (buffer : MirValue) (offset : Nat)
+    (actual : MirValue) (state : ManagedState) : Either NativeLowerError ManagedState :=
+    lower_bind ManagedResult ManagedState
+      (managed_binary MirUSize MirAdd (MirUse offset) (managed_bits MirUSize 40) state)
+      (fun (position : ManagedResult) => match position with | ManagedResultOf at next =>
+        lower_map ManagedState ManagedState
+          (managed_emit (MirBinaryOp offset MirAdd (MirUse offset) actual))
+          (managed_bytes_copy buffer (managed_bits MirUSize 0) output at actual next) end);
+
+-- A line reads one byte at a time: LF is consumed but not copied. No byte
+-- after that LF is fetched, even when a later action reads binary chunks.
+def managed_stdin_line_byte (output : MirValue) (buffer : MirValue) (offset : Nat)
+    (running : Nat) (state : ManagedState) : Either NativeLowerError ManagedState :=
+    lower_bind ManagedResult ManagedState (managed_load MirU8 buffer 0 state)
+      (fun (loaded : ManagedResult) => match loaded with | ManagedResultOf byte next =>
+        lower_bind ManagedResult ManagedState (managed_compare MirNotEqual byte (managed_bits MirU8 10) next)
+          (fun (tested : ManagedResult) => match tested with | ManagedResultOf keep after =>
+            managed_nat_when keep (managed_stdin_copy output buffer offset (managed_bits MirUSize 1))
+              (managed_emit (MirMove running keep) after) end) end);
+
+def managed_stdin_received (line : Bool) (output : MirValue) (buffer : MirValue)
+    (offset : Nat) (running : Nat) (actual : MirValue) (state : ManagedState)
+    : Either NativeLowerError ManagedState :=
+    lower_bind ManagedResult ManagedState (managed_compare MirNotEqual actual (managed_bits MirUSize 0) state)
+      (fun (tested : ManagedResult) => match tested with | ManagedResultOf nonempty next =>
+        managed_nat_when nonempty (match line with
+          | True => managed_stdin_line_byte output buffer offset running
+          | False => managed_stdin_copy output buffer offset actual end)
+          (managed_emit (MirMove running nonempty) next) end);
+
+def managed_stdin_read_chunk (runtime : ManagedStdinRuntime) (line : Bool)
+    (output : MirValue) (capacity : MirValue) (buffer : MirValue) (count : MirValue)
+    (offset : Nat) (running : Nat) (state : ManagedState) : Either NativeLowerError ManagedState :=
+    match runtime with | ManagedStdinRuntimeOf _ _ reader _ =>
+      lower_bind ManagedResult ManagedState (managed_binary MirUSize MirSub capacity (MirUse offset) state)
+        (fun (remaining : ManagedResult) => match remaining with | ManagedResultOf available next =>
+          lower_bind ManagedResult ManagedState (match line with
+            | True => Right NativeLowerError ManagedResult (ManagedResultOf (managed_bits MirUSize 1) next)
+            | False => managed_stdio_chunk available next end)
+            (fun (chunk : ManagedResult) => match chunk with | ManagedResultOf requested after =>
+              lower_bind ManagedResult ManagedState
+                (managed_fresh MirU32 (fun (local : Nat) => MirCall MirMayGc (Just Nat local) (MirDirect reader)
+                  ([buffer, requested, count] : List MirValue))
+                  (managed_emit (MirStore count (codegen_disp 0) (managed_bits MirU32 0)) after))
+                (fun (read : ManagedResult) => match read with | ManagedResultOf status after_read =>
+                  lower_bind ManagedResult ManagedState (managed_compare MirEqual status (managed_bits MirU32 0) after_read)
+                    (fun (checked : ManagedResult) => match checked with | ManagedResultOf okay tested =>
+                      lower_bind ManagedState ManagedState (managed_stdin_require runtime buffer okay tested)
+                        (fun (readable : ManagedState) => lower_bind ManagedResult ManagedState (managed_load MirU32 count 0 readable)
+                          (fun (loaded : ManagedResult) => match loaded with | ManagedResultOf word after_count =>
+                            lower_bind ManagedResult ManagedState (managed_convert MirUSize MirZeroExtend word after_count)
+                              (fun (converted : ManagedResult) => match converted with | ManagedResultOf actual after_actual =>
+                                lower_bind ManagedResult ManagedState (managed_compare MirLessEqual actual requested after_actual)
+                                  (fun (bounded : ManagedResult) => match bounded with | ManagedResultOf valid after_bounds =>
+                                    lower_bind ManagedState ManagedState (managed_stdin_require runtime buffer valid after_bounds)
+                                      (managed_stdin_received line output buffer offset running actual) end) end) end)) end) end) end) end) end;
+
+def managed_stdin_read_loop (runtime : ManagedStdinRuntime) (line : Bool)
+    (output : MirValue) (capacity : MirValue) (buffer : MirValue) (count : MirValue)
+    (state : ManagedState) : Either NativeLowerError ManagedResult :=
+    lower_bind (Pair Nat ManagedState) ManagedResult (managed_fresh_local MirUSize state)
+      (fun (position : Pair Nat ManagedState) => match position with | MkPair offset next =>
+        lower_bind (Pair Nat ManagedState) ManagedResult (managed_fresh_local MirU8 next)
+          (fun (flag : Pair Nat ManagedState) => match flag with | MkPair running after =>
+            let initialized : ManagedState := managed_emit_all
+              ([MirMove offset (managed_bits MirUSize 0), MirMove running (managed_bits MirU8 1)] : List MirInstruction) after in
+            lower_bind LowerLoopBlocks ManagedResult (lower_loop_blocks (managed_flow initialized))
+              (fun (labels : LowerLoopBlocks) => match labels with | LowerLoopAt header body finish flow =>
+                lower_bind ManagedResult ManagedResult
+                  (managed_compare MirLess (MirUse offset) capacity
+                    (managed_with_flow initialized (lower_switch_block header (MirJump header) flow)))
+                  (fun (bounds : ManagedResult) => match bounds with | ManagedResultOf available bounded =>
+                    lower_bind ManagedResult ManagedResult (managed_binary MirU8 MirAnd available (MirUse running) bounded)
+                      (fun (condition : ManagedResult) => match condition with | ManagedResultOf active entered =>
+                        lower_map ManagedState ManagedResult (fun (finished : ManagedState) =>
+                          ManagedResultOf output (managed_emit (MirStore output (codegen_disp 32) (MirUse offset))
+                            (managed_switch_block finish (MirJump header) finished)))
+                          (managed_stdin_read_chunk runtime line output capacity buffer count offset running
+                            (managed_switch_block body (MirBranch active body finish) entered)) end) end) end) end) end);
+
+def managed_stdin_read_allocated (runtime : ManagedStdinRuntime) (line : Bool)
+    (output : MirValue) (capacity : MirValue) (buffer : MirValue) (state : ManagedState)
+    : Either NativeLowerError ManagedResult :=
+    lower_bind ManagedResult ManagedResult
+      (managed_fresh MirRawPtr (fun (local : Nat) => MirPointerAdd local buffer
+        (managed_bits MirUSize managed_stdio_chunk_bytes)) state)
+      (fun (scratch : ManagedResult) => match scratch with | ManagedResultOf count next =>
+        lower_bind ManagedResult ManagedResult (managed_stdin_read_loop runtime line output capacity buffer count next)
+          (fun (read : ManagedResult) => match read with | ManagedResultOf value after =>
+            managed_stdin_close runtime buffer value after end) end);
+
+def managed_stdin_read_nonempty (runtime : ManagedStdinRuntime) (line : Bool)
+    (output : MirValue) (capacity : MirValue) (state : ManagedState) : Either NativeLowerError ManagedResult :=
+    match runtime with | ManagedStdinRuntimeOf allocate _ _ exit =>
+      lower_bind ManagedResult ManagedResult
+        (managed_fresh MirRawPtr (fun (local : Nat) => MirCall MirMayGc (Just Nat local) (MirDirect allocate)
+          ([managed_bits MirUSize managed_stdio_buffer_bytes, managed_bits MirUSize 8] : List MirValue)) state)
+        (fun (allocated : ManagedResult) => match allocated with | ManagedResultOf buffer next =>
+          lower_bind ManagedResult ManagedResult (managed_compare MirNotEqual buffer (managed_bits MirRawPtr 0) next)
+            (fun (tested : ManagedResult) => match tested with | ManagedResultOf present after =>
+              lower_bind ManagedState ManagedResult (managed_stdio_require exit present after)
+                (managed_stdin_read_allocated runtime line output capacity buffer) end) end) end;
+
+-- Reserve the complete result before acquiring raw storage. The final String
+-- length is its actual initialized prefix; unused capacity is never exposed.
+def managed_stdin_read (compiler : ManagedCompiler) (runtime : ManagedStdinRuntime)
+    (line : Bool) (capacity : MirValue) (state : ManagedState) : Either NativeLowerError ManagedResult :=
+    match runtime with | ManagedStdinRuntimeOf _ _ _ exit =>
+      lower_bind ManagedResult ManagedResult (managed_binary MirUSize MirAdd capacity (managed_bits MirUSize 47) state)
+        (fun (added : ManagedResult) => match added with | ManagedResultOf total next =>
+          lower_bind ManagedResult ManagedResult (managed_compare MirGreaterEqual total capacity next)
+            (fun (checked : ManagedResult) => match checked with | ManagedResultOf fits tested =>
+              lower_bind ManagedState ManagedResult (managed_stdio_require exit fits tested)
+                (fun (safe : ManagedState) => lower_bind ManagedResult ManagedResult (managed_string_allocate compiler capacity safe)
+                  (fun (allocated : ManagedResult) => match allocated with | ManagedResultOf output after =>
+                    lower_bind ManagedResult ManagedResult (managed_compare MirEqual capacity (managed_bits MirUSize 0) after)
+                      (fun (empty : ManagedResult) => match empty with | ManagedResultOf zero final =>
+                        managed_string_choose MirManagedPtr zero
+                          (fun (done : ManagedState) => Right NativeLowerError ManagedResult (ManagedResultOf output done))
+                          (managed_stdin_read_nonempty runtime line output capacity) final end) end)) end) end) end;

@@ -1,0 +1,489 @@
+-- Host-side text passes: the strict format subset and the reference and
+-- branch facts for deadcode. Policy families decide in the tools/analyze
+-- cores behind policy.ouro; structured families (cfg, dataflow, effects, ...)
+-- live in ouro-analyze-drive, not here.
+
+import "policy.ouro";
+
+-- Skip to the closing quote of a string literal whose opening quote was
+-- consumed, honouring backslash escapes.
+def skip_string_cs : List Nat -> List Nat :=
+  fix skip_string_cs (xs : List Nat) : List Nat :=
+    match xs with
+    | Nil => Nil Nat
+    | Cons c rest =>
+        match eq_nat c ch_quote with
+        | True => rest
+        | False =>
+            match andb (eq_nat c ch_bslash) (notb (nullb Nat rest)) with
+            | True =>
+                match rest with
+                | Cons _ r2 => skip_string_cs r2
+                | Nil => Nil Nat
+                end
+            | False => skip_string_cs rest
+            end
+        end
+    end;
+
+def last_code (cs : List Nat) : Nat :=
+  last Nat Z cs;
+
+def fmt_tabs (sev : String) (wit : String) (file : Nat) (line : Nat)
+    (codes : List Nat) (acc : List ADiag) : List ADiag :=
+  (fix go (xs : List Nat) (col : Nat) (a : List ADiag) : List ADiag :=
+    match xs with
+    | Nil => a
+    | Cons c rest =>
+        match eq_nat c ch_tab with
+        | False => go rest (S col) a
+        | True =>
+            go rest (S col)
+              (Cons ADiag
+                (mk_diag "OURO-FMT004" sev "format" "tabs"
+                  file line col
+                  "source contains a tab character"
+                  "Replace tabs with two spaces."
+                  wit)
+                a)
+        end
+    end) codes (S Z) acc;
+
+def fmt_scan (sev : String) (crlf_w : String) (trail_w : String)
+    (tab_w : String) (want_final : Bool) (file : Nat)
+    (lines : List (List Nat)) : List ADiag :=
+  (fix go (ls : List (List Nat)) (line : Nat) (saw_crlf : Bool)
+      (acc : List ADiag) : List ADiag :=
+    match ls with
+    | Nil => acc
+    | Cons codes rest =>
+        let has_nl : Bool :=
+          match rest with | Nil => False | Cons _ _ => True end in
+        let last : Nat := last_code codes in
+        let crlf : Bool :=
+          match has_nl with
+          | True => eq_nat last ch_cr
+          | False => False
+          end in
+        let body : List Nat :=
+          match crlf with
+          | True => init Nat codes
+          | False => codes
+          end in
+        let last_body : Nat := last_code body in
+        let acc1 : List ADiag :=
+          match andb (notb saw_crlf) crlf with
+          | False => acc
+          | True =>
+              Cons ADiag
+                (mk_diag "OURO-FMT001" sev "format" "crlf"
+                  file line (length Nat codes)
+                  "source uses CRLF line endings"
+                  "Rewrite the file with LF line endings."
+                  crlf_w)
+                acc
+          end in
+        let acc2 : List ADiag :=
+          match andb has_nl
+            (orb (eq_nat last_body ch_space) (eq_nat last_body ch_tab)) with
+          | False => acc1
+          | True =>
+              Cons ADiag
+                (mk_diag "OURO-FMT005" sev "format"
+                  "trailing-whitespace" file line
+                  (S (length Nat codes))
+                  "line has trailing whitespace"
+                  "Strip spaces and tabs at the end of the line."
+                  trail_w)
+                acc1
+          end in
+        let acc3 : List ADiag :=
+          match codes_has ch_tab codes with
+          | False => acc2
+          | True => fmt_tabs sev tab_w file line codes acc2
+          end in
+        let acc4 : List ADiag :=
+          match andb want_final
+            (andb (notb has_nl)
+              (match codes with | Nil => False | Cons _ _ => True end)) with
+          | False => acc3
+          | True =>
+              Cons ADiag
+                (mk_diag "OURO-FMT002" sev "format"
+                  "final-newline" file line (S Z)
+                  "file does not end with a newline"
+                  "Add a single trailing LF."
+                  "missing final LF")
+                acc3
+          end in
+        go rest (S line) (orb saw_crlf crlf) acc4
+    end) lines (S Z) False (Nil ADiag);
+
+def fmt_enable_scan (file : Nat) (lines : List (List Nat)) : List ADiag :=
+  fmt_scan "warning" "byte is CR LF" "trailing whitespace before newline"
+    "tab at this column" True file lines;
+
+-- Keep every scrutinee and constructor refinement. Binder spellings do not
+-- affect coverage; commas and parentheses retain the pattern's shape.
+def arm_key_scan : List Nat -> Bool -> List String -> Maybe String :=
+  fun (cs0 : List Nat) (head0 : Bool) (acc0 : List String) =>
+    (fix go (fuel : Nat) (cs : List Nat) (head : Bool) (acc : List String)
+        : Maybe String :=
+      match fuel with
+      | Z => Nothing String
+      | S fuel' =>
+          match cs with
+          | Nil => Nothing String
+          | Cons c rest =>
+              match codes_start_pair ch_eq ch_gt c rest with
+              | True =>
+                  match acc with
+                  | Nil => Nothing String
+                  | Cons _ _ => Just String (str_join " " (reverse String acc))
+                  end
+              | False =>
+                  match is_ws c with
+                  | True => go fuel' rest head acc
+                  | False =>
+                      match is_ident_start c with
+                      | True =>
+                          match take_ident_cs cs with
+                          | MkPair after name =>
+                              go fuel' after False (Cons String
+                                (match orb head (is_upper c) with
+                                | True => name
+                                | False => "_"
+                                end) acc)
+                          end
+                      | False =>
+                          go fuel' rest (orb (eq_nat c ch_comma) (eq_nat c ch_lparen))
+                            (Cons String (str_of_codes ([c] : List Nat)) acc)
+                      end
+                  end
+              end
+          end
+      end) (S (length Nat cs0)) cs0 head0 acc0;
+
+def arm_key_cs (after_pipe : List Nat) : Maybe String :=
+    arm_key_scan after_pipe True (Nil String);
+
+-- A wildcard consumes one field, including a parenthesized constructor tree.
+def arm_after_group : Nat -> List String -> Maybe (List String) :=
+  fun (depth : Nat) (tokens : List String) =>
+    (fix go (xs : List String) (d : Nat) : Maybe (List String) :=
+      match xs with
+      | Nil => Nothing (List String)
+      | Cons token rest =>
+          match str_eq token "(" with
+          | True => go rest (S d)
+          | False =>
+              match str_eq token ")" with
+              | False => go rest d
+              | True =>
+                  match d with
+                  | Z => Just (List String) rest
+                  | S remaining => go rest remaining
+                  end
+              end
+          end
+      end) tokens depth;
+
+def arm_after_field (tokens : List String) : Maybe (List String) :=
+    match tokens with
+    | Nil => Nothing (List String)
+    | Cons token rest =>
+        match str_eq token "(" with
+        | True => arm_after_group Z rest
+        | False =>
+            match orb (str_eq token ",") (str_eq token ")") with
+            | True => Nothing (List String)
+            | False => Just (List String) rest
+            end
+        end
+    end;
+
+def arm_covers : List String -> List String -> Bool :=
+  fix arm_covers (earlier : List String) (later : List String) : Bool :=
+    match earlier with
+    | Nil => nullb String later
+    | Cons token rest =>
+        match str_eq token "_" with
+        | True =>
+            match arm_after_field later with
+            | Nothing => False
+            | Just after => arm_covers rest after
+            end
+        | False =>
+            match later with
+            | Nil => False
+            | Cons other after =>
+                match str_eq token other with
+                | False => False
+                | True => arm_covers rest after
+                end
+            end
+        end
+    end;
+
+def match_arms (lines : List (List Nat)) : List (Pair String Nat) :=
+  (fix go (ls : List (List Nat)) (n : Nat) (acc : List (Pair String Nat))
+      : List (Pair String Nat) :=
+    match ls with
+    | Nil => reverse (Pair String Nat) acc
+    | Cons cs rest =>
+        match drop_while Nat is_ws cs with
+        | Cons p after_pipe =>
+            match eq_nat p ch_pipe with
+            | False => go rest (S n) acc
+            | True =>
+                match arm_key_cs after_pipe with
+                | Nothing => go rest (S n) acc
+                | Just key =>
+                    go rest (S n)
+                      (Cons (Pair String Nat)
+                        (MkPair String Nat key n) acc)
+                end
+            end
+        | Nil => go rest (S n) acc
+        end
+    end) lines (S Z) (Nil (Pair String Nat));
+
+def idents_in_cs (codes : List Nat) : List String :=
+  (fix go (fuel : Nat) (cs : List Nat) (acc : List String) : List String :=
+    match fuel with
+    | Z => reverse String acc
+    | S fuel' =>
+        match cs with
+        | Nil => reverse String acc
+        | Cons c rest =>
+            match is_ident_start c with
+            | False => go fuel' rest acc
+            | True =>
+                match take_ident_cs cs with
+                | MkPair nx nm => go fuel' nx (Cons String nm acc)
+                end
+            end
+        end
+    end) (S (length Nat codes)) codes (Nil String);
+
+def kw_tokens : List String :=
+  [ "def"
+  , "axiom"
+  , "inductive"
+  , "record"
+  , "match"
+  , "with"
+  , "end"
+  , "let"
+  , "in"
+  , "fun"
+  , "fix"
+  , "import"
+  , "Type"
+  ];
+
+def kw_token (s : String) : Bool :=
+  name_in s kw_tokens;
+
+def index_decls (keep : ADecl -> Bool) (decls : List ADecl)
+    : List (Pair String Nat) :=
+  (fix go (ds : List ADecl) (i : Nat) (acc : List (Pair String Nat))
+      : List (Pair String Nat) :=
+    match ds with
+    | Nil => reverse (Pair String Nat) acc
+    | Cons d rest =>
+        match keep d with
+        | True =>
+            go rest (S i)
+              (Cons (Pair String Nat) (MkPair String Nat (ADecl_name d) i) acc)
+        | False => go rest (S i) acc
+        end
+    end) decls Z (Nil (Pair String Nat));
+
+def decl_name_index (decls : List ADecl) : List (Pair String Nat) :=
+  index_decls (fun (_d : ADecl) => True) decls;
+
+def file_decl_name_index (file : Nat) (decls : List ADecl)
+    : List (Pair String Nat) :=
+  index_decls (fun (d : ADecl) => eq_nat (ADecl_file d) file) decls;
+
+def indexed_decl (name : String) (entries : List (Pair String Nat)) : Nat :=
+  match lookup String Nat str_eq name entries with
+  | Nothing => no_idx
+  | Just i => i
+  end;
+
+def refs_for_file (file : Nat) (lines : List (List Nat)) (decls : List ADecl)
+    : List ARef :=
+  let globals : List (Pair String Nat) := decl_name_index decls in
+  let locals : List (Pair String Nat) := file_decl_name_index file decls in
+  (fix go (ls : List (List Nat)) (cur : Nat) (acc : List ARef) : List ARef :=
+    match ls with
+    | Nil => acc
+    | Cons cs rest =>
+        let kind : Nat := line_kind (drop_while Nat is_ws cs) in
+        let cur2 : Nat :=
+          match orb (eq_nat kind 2) (eq_nat kind 3) with
+          | False => cur
+          | True =>
+              let parsed : Maybe (Pair String Nat) :=
+                match eq_nat kind 3 with
+                | True => parse_kw_name_cs cs kw_axiom_cs
+                | False => parse_kw_name_cs cs kw_def_cs
+                end in
+              match parsed with
+              | Just p =>
+                  match p with
+                  | MkPair nm _ => indexed_decl nm locals
+                  end
+              | Nothing => cur
+              end
+          end in
+        match eq_nat cur2 no_idx with
+        | True => go rest cur2 acc
+        | False =>
+            let toks : List String := idents_in_cs cs in
+            let acc2 : List ARef :=
+              (fix tk (ts : List String) (a : List ARef) : List ARef :=
+                match ts with
+                | Nil => a
+                | Cons nm ts' =>
+                    let dst : Nat := indexed_decl nm locals in
+                    match orb (kw_token nm) (eq_nat dst cur2) with
+                    | True => tk ts' a
+                    | False =>
+                        match eq_nat dst no_idx with
+                        | True =>
+                            -- also search any file for ctor/def name
+                            let dst2 : Nat := indexed_decl nm globals in
+                            match eq_nat dst2 no_idx with
+                            | True => tk ts' a
+                            | False =>
+                                tk ts' (Cons ARef (MkARef cur2 dst2) a)
+                            end
+                        | False =>
+                            tk ts' (Cons ARef (MkARef cur2 dst) a)
+                        end
+                    end
+                end) toks acc in
+            go rest cur2 acc2
+        end
+    end) lines no_idx (Nil ARef);
+
+def head_seen (stk : List (List String)) : List String :=
+  head (List String) (Nil String) stk;
+
+def push_seen (stk : List (List String)) (nm : String)
+    : List (List String) :=
+  match stk with
+  | Nil => Cons (List String) ([nm] : List String) (Nil (List String))
+  | Cons s rest => Cons (List String) (Cons String nm s) rest
+  end;
+
+def pop_frame (stk : List (List String)) : List (List String) :=
+  tail (List String) stk;
+
+def shadow_result (stk : List (List String)) (acc : List (Pair String Nat))
+    : Pair (List (List String)) (List (Pair String Nat)) :=
+  MkPair (List (List String)) (List (Pair String Nat)) stk acc;
+
+def kw_match_cs : List Nat := [109, 97, 116, 99, 104];
+def kw_end_cs : List Nat := [101, 110, 100];
+
+def shadowed_line (codes : List Nat) (n : Nat) (stk : List (List String))
+    (acc : List (Pair String Nat))
+    : Pair (List (List String)) (List (Pair String Nat)) :=
+  (fix go (fuel : Nat) (xs : List Nat) (stk0 : List (List String))
+      (acc0 : List (Pair String Nat))
+      : Pair (List (List String)) (List (Pair String Nat)) :=
+    match fuel with
+    | Z => shadow_result stk0 acc0
+    | S fuel' =>
+        match xs with
+        | Nil => shadow_result stk0 acc0
+        | Cons c rest =>
+            match codes_start_pair ch_minus ch_minus c rest with
+            | True => shadow_result stk0 acc0
+            | False =>
+                match eq_nat c ch_quote with
+                | True => go fuel' (skip_string_cs rest) stk0 acc0
+                | False =>
+                    match is_ident_start c with
+                    | True =>
+                        let after : List Nat := drop_while Nat is_ident_cont xs in
+                        match codes_start_word kw_match_cs xs with
+                        | True =>
+                            go fuel' after
+                              (Cons (List String) (Nil String) stk0) acc0
+                        | False =>
+                            match codes_start_word kw_end_cs xs with
+                            | True => go fuel' after (pop_frame stk0) acc0
+                            | False => go fuel' after stk0 acc0
+                            end
+                        end
+                    | False =>
+                        match eq_nat c ch_pipe with
+                        | True =>
+                            match arm_key_cs rest with
+                            | Nothing => go fuel' rest stk0 acc0
+                            | Just key =>
+                                match any String
+                                  (fun (seen : String) =>
+                                    arm_covers (str_words seen) (str_words key))
+                                  (head_seen stk0) with
+                                | True =>
+                                    go fuel' rest stk0
+                                      (Cons (Pair String Nat)
+                                        (MkPair String Nat key n) acc0)
+                                | False =>
+                                    go fuel' rest (push_seen stk0 key) acc0
+                                end
+                            end
+                        | False => go fuel' rest stk0 acc0
+                        end
+                    end
+                end
+            end
+        end
+    end) (S (length Nat codes)) codes stk acc;
+
+def shadowed_in (lines : List (List Nat)) : List (Pair String Nat) :=
+  (fix go (ls : List (List Nat)) (n : Nat) (stk : List (List String))
+      (acc : List (Pair String Nat)) : List (Pair String Nat) :=
+    match ls with
+    | Nil => acc
+    | Cons codes rest =>
+        match shadowed_line codes n stk acc with
+        | MkPair stk2 acc2 => go rest (S n) stk2 acc2
+        end
+    end) lines (S Z) (Nil (List String)) (Nil (Pair String Nat));
+
+def module_decl (file : Nat) (path : String) : ADecl :=
+  let base : String := path_basename path in
+  let name : String :=
+    match path_has_ext base ".ouro" with
+    | True => path_stem base
+    | False => base
+    end in
+  MkADecl name file (S Z) (S Z) kind_module False False False False False
+    False (ns_of_path path) "" w64_zero;
+
+def shadow_hit (nm : String) (ln : Nat) (xs : List (Pair String Nat)) : Bool :=
+  any (Pair String Nat)
+    (fun (p : Pair String Nat) =>
+      match p with
+      | MkPair n l => andb (str_eq n nm) (eq_nat l ln)
+      end)
+    xs;
+
+def branch_decls (file : Nat) (owner : String) (lines : List (List Nat))
+    (shadow : List (Pair String Nat)) : List ADecl :=
+  map (Pair String Nat) ADecl
+    (fun (p : Pair String Nat) =>
+      match p with
+      | MkPair nm ln =>
+          MkADecl (str_cat4 "#br:" owner ":" (str_concat nm (str_concat ":" (str_of_nat ln))))
+            file ln (S Z) kind_branch False False False False False
+            (shadow_hit nm ln shadow) "" owner w64_zero
+      end)
+    (match_arms lines);

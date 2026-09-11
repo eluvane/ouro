@@ -1,0 +1,242 @@
+-- Typed-MIR fault probes wrap selected generated adapter calls. Original raw
+-- bodies still allocate and release the OS storage. No production helper is
+-- replaced in source, and these probes are separate from Windows source tests.
+import "native_stdio_fixtures.ouro";
+import "../compiler/native/managed_startup.ouro";
+
+def startup_fault_symbol_names : List String :=
+    ["raw_pages_allocate", "raw_pages_release", "raw_windows_argv_open", "raw_windows_argv_at",
+      "raw_windows_argv_close", "raw_windows_wide_length", "raw_windows_utf8_to_utf16",
+      "raw_windows_utf16_to_utf8", "raw_windows_environment_get", "windows_exit_process", "managed_collect"];
+
+def startup_fault_symbols (checked : CheckedProgram) : Either NativeLowerError (List Nat) :=
+    (fix resolve (names : List String) : Either NativeLowerError (List Nat) :=
+      match names with | Nil => Right NativeLowerError (List Nat) ([] : List Nat)
+      | Cons name rest => lower_bind Nat (List Nat) (managed_source_symbol checked (prim_string_to_char_codes name))
+          (fun (id : Nat) => lower_map (List Nat) (List Nat) (Cons Nat id) (resolve rest)) end) startup_fault_symbol_names;
+
+def startup_fault_target (symbols : List Nat) (wanted : Nat) : Maybe Nat :=
+    (fix find (rest : List Nat) (offset : Nat) : Maybe Nat :=
+      match rest with | Nil => Nothing Nat | Cons id tail =>
+        match eqNat id wanted with | True => Just Nat offset | False => find tail (S offset) end end) symbols 0;
+
+def startup_fault_call (typ : MirType) (id : Nat) (arguments : List MirValue) (state : ManagedState)
+    : Either NativeLowerError ManagedResult :=
+    managed_fresh typ (fun (local : Nat) => MirCall MirMayGc (Just Nat local) (MirDirect id) arguments) state;
+
+def startup_fault_counter (base : Nat) : Nat := add base 32;
+
+def startup_fault_load (base : Nat) (offset : Nat) (typ : MirType) (state : ManagedState)
+    : Either NativeLowerError ManagedResult :=
+    lower_bind ManagedResult ManagedResult (managed_address (startup_fault_counter base) state)
+      (fun (address : ManagedResult) => match address with | ManagedResultOf pointer next =>
+        managed_load typ pointer offset next end);
+
+def startup_fault_store (base : Nat) (offset : Nat) (value : MirValue) (state : ManagedState)
+    : Either NativeLowerError ManagedState :=
+    lower_map ManagedResult ManagedState (fun (address : ManagedResult) => match address with
+      | ManagedResultOf pointer next => managed_emit (MirStore pointer (codegen_disp offset) value) next end)
+      (managed_address (startup_fault_counter base) state);
+
+def startup_fault_count (base : Nat) (offset : Nat) (state : ManagedState)
+    : Either NativeLowerError ManagedResult := native_stdio_fixture_count (startup_fault_counter base) offset state;
+
+def startup_fault_stat (base : Nat) (offset : Nat) (expected : Nat) (state : ManagedState)
+    : Either NativeLowerError ManagedState :=
+    lower_bind ManagedResult ManagedState (startup_fault_load base offset MirUSize state)
+      (fun (loaded : ManagedResult) => match loaded with | ManagedResultOf actual after =>
+        managed_require_equal actual (managed_bits MirUSize expected) after end);
+
+def startup_fault_result (typ : MirType) (value : Nat) (state : ManagedState)
+    : Either NativeLowerError ManagedResult :=
+    Right NativeLowerError ManagedResult (ManagedResultOf (managed_bits typ value) state);
+
+def startup_fault_argv (mode : Nat) : Bool := andb (leb_nat 20 mode) (ltb_nat mode 30);
+
+def startup_fault_fail_allocation (mode : Nat) : Nat :=
+    match andb (leb_nat 1 mode) (leb_nat mode 5) with | True => mode | False =>
+      match eqNat mode 20 with | True => 1 | False => match eqNat mode 24 with | True => 2 | False => 0 end end end;
+
+def startup_fault_fatal (mode : Nat) : Bool := notb (orb (eqNat mode 0) (orb (eqNat mode 30) (eqNat mode 31)));
+
+-- Slots 64/72/80 store the live raw depth, argv-owner flag and owner-cell
+-- pointer. The array at 128 stores exact allocation bases in ownership order.
+def startup_fault_push (base : Nat) (pointer : MirValue) (state : ManagedState)
+    : Either NativeLowerError ManagedResult :=
+    lower_bind ManagedResult ManagedResult (startup_fault_load base 64 MirUSize state)
+      (fun (loaded : ManagedResult) => match loaded with | ManagedResultOf depth next =>
+        lower_bind ManagedResult ManagedResult (managed_compare MirLess depth (managed_bits MirUSize 8) next)
+          (fun (checked : ManagedResult) => match checked with | ManagedResultOf fits after =>
+            lower_bind ManagedState ManagedResult (managed_require_equal fits (managed_bits MirU8 1) after)
+              (fun (valid : ManagedState) => lower_bind ManagedResult ManagedResult
+                (managed_binary MirUSize MirMul depth (managed_bits MirUSize 8) valid)
+                (fun (scaled : ManagedResult) => match scaled with | ManagedResultOf relative entered =>
+                  lower_bind ManagedResult ManagedResult (managed_binary MirUSize MirAdd relative (managed_bits MirUSize 128) entered)
+                    (fun (offset : ManagedResult) => match offset with | ManagedResultOf at final =>
+                      lower_bind ManagedResult ManagedResult (managed_address (startup_fault_counter base) final)
+                        (fun (address : ManagedResult) => match address with | ManagedResultOf counters ready =>
+                          lower_bind ManagedResult ManagedResult (managed_binary MirUSize MirAdd depth (managed_bits MirUSize 1)
+                            (managed_emit (MirStoreAt counters at pointer) ready))
+                            (fun (incremented : ManagedResult) => match incremented with | ManagedResultOf size stored =>
+                              lower_map ManagedState ManagedResult (fun (finished : ManagedState) => ManagedResultOf pointer finished)
+                                (startup_fault_store base 64 size stored) end) end) end) end)) end) end);
+
+def startup_fault_allocate (base : Nat) (mode : Nat) (original : Nat) (state : ManagedState)
+    : Either NativeLowerError ManagedResult :=
+    lower_bind ManagedState ManagedResult (managed_require_equal (MirUse 1) (managed_bits MirUSize 8) state)
+      (fun (aligned : ManagedState) => lower_bind ManagedResult ManagedResult (startup_fault_count base 0 aligned)
+        (fun (counted : ManagedResult) => match counted with | ManagedResultOf attempt next =>
+          lower_bind ManagedResult ManagedResult
+            (managed_compare MirEqual attempt (managed_bits MirUSize (startup_fault_fail_allocation mode)) next)
+            (fun (tested : ManagedResult) => match tested with | ManagedResultOf failed after =>
+              managed_string_choose MirRawPtr failed (startup_fault_result MirRawPtr 0)
+                (fun (entered : ManagedState) => lower_bind ManagedResult ManagedResult
+                  (startup_fault_call MirRawPtr original ([MirUse 0, MirUse 1] : List MirValue) entered)
+                  (fun (allocated : ManagedResult) => match allocated with | ManagedResultOf pointer final =>
+                    lower_bind ManagedResult ManagedResult (managed_compare MirNotEqual pointer (managed_bits MirRawPtr 0) final)
+                      (fun (checked : ManagedResult) => match checked with | ManagedResultOf okay ready =>
+                        lower_bind ManagedState ManagedResult (managed_require_equal okay (managed_bits MirU8 1) ready)
+                          (startup_fault_push base pointer) end) end)) after end) end));
+
+def startup_fault_pop (base : Nat) (pointer : MirValue) (state : ManagedState)
+    : Either NativeLowerError ManagedState :=
+    lower_bind ManagedResult ManagedState (startup_fault_load base 64 MirUSize state)
+      (fun (loaded : ManagedResult) => match loaded with | ManagedResultOf depth next =>
+        lower_bind ManagedResult ManagedState (managed_compare MirGreater depth (managed_bits MirUSize 0) next)
+          (fun (checked : ManagedResult) => match checked with | ManagedResultOf live after =>
+            lower_bind ManagedState ManagedState (managed_require_equal live (managed_bits MirU8 1) after)
+              (fun (valid : ManagedState) => lower_bind ManagedResult ManagedState
+                (managed_binary MirUSize MirSub depth (managed_bits MirUSize 1) valid)
+                (fun (decremented : ManagedResult) => match decremented with | ManagedResultOf size entered =>
+                  lower_bind ManagedResult ManagedState (managed_binary MirUSize MirMul size (managed_bits MirUSize 8) entered)
+                    (fun (scaled : ManagedResult) => match scaled with | ManagedResultOf relative final =>
+                      lower_bind ManagedResult ManagedState (managed_binary MirUSize MirAdd relative (managed_bits MirUSize 128) final)
+                        (fun (offset : ManagedResult) => match offset with | ManagedResultOf at ready =>
+                          lower_bind ManagedResult ManagedState (managed_address (startup_fault_counter base) ready)
+                            (fun (address : ManagedResult) => match address with | ManagedResultOf counters stored =>
+                              lower_bind ManagedResult ManagedState (managed_fresh MirRawPtr
+                                (fun (local : Nat) => MirLoadAt local counters at) stored)
+                                (fun (expected : ManagedResult) => match expected with | ManagedResultOf owned compared =>
+                                  lower_bind ManagedState ManagedState (managed_require_equal pointer owned compared)
+                                    (fun (same : ManagedState) => lower_bind ManagedState ManagedState (startup_fault_store base 64 size same)
+                                      (fun (saved : ManagedState) => lower_bind ManagedResult ManagedState
+                                        (managed_compare MirEqual size (managed_bits MirUSize 0) saved)
+                                        (fun (last : ManagedResult) => match last with | ManagedResultOf final_buffer tested =>
+                                          lower_map ManagedResult ManagedState (fun (result : ManagedResult) => match result with
+                                            | ManagedResultOf _ finished => finished end)
+                                            (managed_string_choose MirU8 final_buffer
+                                              (fun (checking : ManagedState) => lower_map ManagedState ManagedResult
+                                                (fun (finished : ManagedState) => ManagedResultOf (managed_bits MirU8 1) finished)
+                                                (startup_fault_stat base 72 0 checking))
+                                              (startup_fault_result MirU8 1) tested) end))) end) end) end) end) end)) end) end);
+
+def startup_fault_release (base : Nat) (mode : Nat) (original : Nat) (state : ManagedState)
+    : Either NativeLowerError ManagedResult :=
+    lower_bind ManagedState ManagedResult (startup_fault_pop base (MirUse 0) state)
+      (fun (owned : ManagedState) => lower_bind ManagedResult ManagedResult (startup_fault_count base 8 owned)
+        (fun (counted : ManagedResult) => match counted with | ManagedResultOf attempt next =>
+          lower_bind ManagedResult ManagedResult (startup_fault_call MirU8 original ([MirUse 0] : List MirValue) next)
+            (fun (released : ManagedResult) => match released with | ManagedResultOf okay after =>
+              lower_bind ManagedState ManagedResult (managed_require_equal okay (managed_bits MirU8 1) after)
+                (fun (checked : ManagedState) => match orb (eqNat mode 11) (orb (eqNat mode 12) (orb (eqNat mode 26) (eqNat mode 27))) with
+                  | False => startup_fault_result MirU8 1 checked
+                  | True => managed_compare MirNotEqual attempt (managed_bits MirUSize 1) checked end) end) end));
+
+def startup_fault_open (base : Nat) (mode : Nat) (original : Nat) (state : ManagedState)
+    : Either NativeLowerError ManagedResult :=
+    lower_bind ManagedResult ManagedResult (startup_fault_count base 16 state)
+      (fun (counted : ManagedResult) => match counted with | ManagedResultOf _ next =>
+        match eqNat mode 21 with | True => startup_fault_result MirU32 5 next | False =>
+          lower_bind ManagedState ManagedResult (startup_fault_stat base 72 0 next)
+            (fun (clear : ManagedState) => lower_bind ManagedResult ManagedResult
+              (startup_fault_call MirU32 original ([MirUse 0, MirUse 1] : List MirValue) clear)
+              (fun (opened : ManagedResult) => match opened with | ManagedResultOf status after =>
+                lower_bind ManagedState ManagedResult (managed_require_equal status (managed_bits MirU32 0) after)
+                  (fun (okay : ManagedState) => lower_bind ManagedState ManagedResult
+                    (startup_fault_store base 80 (MirUse 0) okay)
+                    (fun (saved : ManagedState) => lower_map ManagedState ManagedResult
+                      (fun (finished : ManagedState) => ManagedResultOf status finished)
+                      (startup_fault_store base 72 (managed_bits MirUSize 1) saved))) end)) end end);
+
+def startup_fault_close (base : Nat) (mode : Nat) (original : Nat) (state : ManagedState)
+    : Either NativeLowerError ManagedResult :=
+    lower_bind ManagedState ManagedResult (startup_fault_stat base 72 1 state)
+      (fun (live : ManagedState) => lower_bind ManagedResult ManagedResult (startup_fault_load base 80 MirRawPtr live)
+        (fun (loaded : ManagedResult) => match loaded with | ManagedResultOf owner next =>
+          lower_bind ManagedState ManagedResult (managed_require_equal (MirUse 0) owner next)
+            (fun (same : ManagedState) => lower_bind ManagedResult ManagedResult (startup_fault_count base 24 same)
+              (fun (counted : ManagedResult) => match counted with | ManagedResultOf _ after =>
+                lower_bind ManagedResult ManagedResult (startup_fault_call MirU32 original ([MirUse 0] : List MirValue) after)
+                  (fun (closed : ManagedResult) => match closed with | ManagedResultOf status final =>
+                    lower_bind ManagedState ManagedResult (managed_require_equal status (managed_bits MirU32 0) final)
+                      (fun (okay : ManagedState) => lower_map ManagedState ManagedResult
+                        (fun (finished : ManagedState) => ManagedResultOf
+                          (managed_bits MirU32 (match orb (eqNat mode 25) (eqNat mode 27) with | True => 5 | False => 0 end)) finished)
+                        (startup_fault_store base 72 (managed_bits MirUSize 0) okay)) end) end)) end));
+
+def startup_fault_collector (base : Nat) (original : Nat) (state : ManagedState)
+    : Either NativeLowerError ManagedResult :=
+    lower_bind ManagedResult ManagedResult (startup_fault_count base 96 state)
+      (fun (counted : ManagedResult) => match counted with | ManagedResultOf _ next =>
+        lower_bind ManagedResult ManagedResult (managed_load MirUSize (MirUse 0) 16 next)
+          (fun (initial : ManagedResult) => match initial with | ManagedResultOf before entered =>
+            lower_bind ManagedResult ManagedResult (startup_fault_call MirU8 original ([MirUse 0] : List MirValue) entered)
+              (fun (collected : ManagedResult) => match collected with | ManagedResultOf success after =>
+                lower_bind ManagedState ManagedResult (managed_require_equal success (managed_bits MirU8 1) after)
+                  (fun (okay : ManagedState) => lower_bind ManagedResult ManagedResult (managed_load MirUSize (MirUse 0) 16 okay)
+                    (fun (remaining : ManagedResult) => match remaining with | ManagedResultOf count final =>
+                      lower_bind ManagedResult ManagedResult (managed_compare MirLess count before final)
+                        (fun (tested : ManagedResult) => match tested with | ManagedResultOf reclaimed ready =>
+                          lower_bind ManagedResult ManagedResult (startup_fault_load base 104 MirU8 ready)
+                            (fun (loaded : ManagedResult) => match loaded with | ManagedResultOf previous stored =>
+                              lower_bind ManagedResult ManagedResult (managed_binary MirU8 MirOr previous reclaimed stored)
+                                (fun (combined : ManagedResult) => match combined with | ManagedResultOf seen combined_state =>
+                                  lower_map ManagedState ManagedResult (fun (finished : ManagedState) => ManagedResultOf success finished)
+                                    (startup_fault_store base 104 seen combined_state) end) end) end) end)) end) end) end);
+
+def startup_fault_locals (types : List MirType) : List MirLocal :=
+    (fix build (remaining : List MirType) (index : Nat) : List MirLocal :=
+      match remaining with | Nil => ([] : List MirLocal) | Cons typ rest =>
+        Cons MirLocal (MirLocalDef index typ) (build rest (S index)) end) types 0;
+
+def startup_fault_values (types : List MirType) : List MirValue :=
+    (fix build (remaining : List MirType) (index : Nat) : List MirValue :=
+      match remaining with | Nil => ([] : List MirValue) | Cons _ rest =>
+        Cons MirValue (MirUse index) (build rest (S index)) end) types 0;
+
+def startup_fault_conversion (base : Nat) (mode : Nat) (original : Nat) (state : ManagedState)
+    : Either NativeLowerError ManagedResult :=
+    lower_bind ManagedResult ManagedResult (startup_fault_count base 40 state)
+      (fun (counted : ManagedResult) => match counted with | ManagedResultOf attempt next =>
+        lower_bind ManagedResult ManagedResult (managed_compare MirEqual attempt (managed_bits MirUSize 1) next)
+          (fun (tested : ManagedResult) => match tested with | ManagedResultOf first after =>
+            managed_string_choose MirU32 first
+              (fun (query : ManagedState) => match eqNat mode 5 with
+                | True => startup_fault_result MirU32 5 query
+                | False => startup_fault_call MirU32 original ([MirUse 0, MirUse 1, MirUse 2, MirUse 3, MirUse 4] : List MirValue) query end)
+              (fun (fill : ManagedState) => match eqNat mode 6 with | True => startup_fault_result MirU32 5 fill | False =>
+                lower_map ManagedResult ManagedResult (fun (result : ManagedResult) => match result with
+                  | ManagedResultOf status final => ManagedResultOf status (match eqNat mode 7 with
+                      | False => final | True => managed_emit (MirStore (MirUse 4) (codegen_disp 0) (managed_bits MirU32 0)) final end) end)
+                  (startup_fault_call MirU32 original ([MirUse 0, MirUse 1, MirUse 2, MirUse 3, MirUse 4] : List MirValue) fill) end) after end) end);
+
+def startup_fault_instruction (base : Nat) (symbols : List Nat) (managed : Bool)
+    (instruction : MirInstruction) : MirInstruction :=
+    match instruction with
+    | MirCall gc result target arguments => match target with
+      | MirIndirect _ _ => instruction | MirDirect id => match startup_fault_target symbols id with
+        | Nothing => instruction | Just index => match orb managed (orb (eqNat index 10) (eqNat index 11)) with
+          | False => instruction | True => MirCall gc result (MirDirect (add base index)) arguments end end end
+    | MirManagedAlloc local allocator _ descriptor bytes => MirManagedAlloc local allocator (add base 11) descriptor bytes
+    | MirMove _ _ => instruction | MirBinaryOp _ _ _ _ => instruction | MirCompare _ _ _ _ => instruction
+    | MirConvert _ _ _ => instruction | MirLoad _ _ _ => instruction | MirStore _ _ _ => instruction
+    | MirLoadAt _ _ _ => instruction | MirStoreAt _ _ _ => instruction | MirAddress _ _ => instruction
+    | MirPointerAdd _ _ _ => instruction | MirManagedContext _ => instruction end;
+
+def startup_fault_function (base : Nat) (symbols : List Nat) (contracts : List LowerContract)
+    (function : MirFunction) : MirFunction :=
+    match function with | MirFunctionDef id name arguments locals result entry blocks =>
+      let managed : Bool := match lower_find_contract id contracts with | Nothing => True | Just _ => False end in
+      MirFunctionDef id name arguments locals result entry
+        (map MirBlock MirBlock (fun (block : MirBlock) => match block with | MirBlockDef label instructions terminator =>
+          MirBlockDef label (map MirInstruction MirInstruction (startup_fault_instruction base symbols managed) instructions) terminator end) blocks) end;

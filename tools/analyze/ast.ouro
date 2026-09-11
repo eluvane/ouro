@@ -1,0 +1,729 @@
+-- Shared analyzer AST plus the traversal helpers every core builds on.
+-- Constructor order is an ABI for expr_adapt and for the tags minimal.ouro
+-- fingerprints with; new constructors go at the end.
+
+-- @entry ast_tag_count
+-- @entry head_id
+-- @entry ast_any
+-- @entry ast_children
+-- @entry ast_exists
+
+import "../../std/data.ouro";
+import "../../std/listx.ouro";
+import "../../std/natx.ouro";
+
+inductive Ast : Type :=
+  | AVar      : Nat -> Ast
+  | AHole     : Nat -> Ast
+  | ASort     : Nat -> Ast
+  | ANatLit   : Nat -> Ast
+  | AApp      : Ast -> Ast -> Ast
+  | ALam      : Nat -> Ast -> Ast -> Ast
+  | APi       : Nat -> Ast -> Ast -> Ast
+  | ALet      : Nat -> Ast -> Ast -> Ast -> Ast
+  | AAscribe  : Ast -> Ast -> Ast
+  | ABinder   : Nat -> Ast -> Ast -> Ast
+  | ANoBinder : Ast
+  | AFix      : Nat -> Ast -> Ast -> Ast -> Ast
+  | ABranch   : Nat -> List Nat -> Ast -> Ast -> Ast
+  | ANoBranch : Ast
+  | AMatch    : Ast -> Ast -> Ast
+  | APerform  : Nat -> List Ast -> Ast
+  | AHandle   : Ast -> Ast -> Ast
+  | AClause   : Nat -> List Nat -> Ast -> Ast -> Ast
+  | ANoClause : Ast
+  | ADo       : List Ast -> Ast
+  | AList     : List Ast -> Ast
+  | AStr      : Nat -> Ast;
+
+-- Shared surface including perform/handle/do and interned string literals.
+def ast_tag_count : Nat :=
+  22;
+
+def tag_var : Nat := Z;
+def tag_hole : Nat := S Z;
+def tag_sort : Nat := 2;
+def tag_nat : Nat := 3;
+def tag_app : Nat := 4;
+def tag_lam : Nat := 5;
+def tag_pi : Nat := 6;
+def tag_let : Nat := 7;
+def tag_ascribe : Nat := 8;
+def tag_binder : Nat := 9;
+def tag_no_binder : Nat := 10;
+def tag_fix : Nat := 11;
+def tag_branch : Nat := 12;
+def tag_no_branch : Nat := 13;
+def tag_match : Nat := 14;
+def tag_perform : Nat := 15;
+def tag_handle : Nat := 16;
+def tag_clause : Nat := 17;
+def tag_no_clause : Nat := 18;
+def tag_do : Nat := 19;
+def tag_list : Nat := 20;
+def tag_str : Nat := 21;
+
+-- Constructor index in declaration order.
+def ast_tag (a : Ast) : Nat :=
+    match a with
+    | AVar _ => tag_var
+    | AHole _ => tag_hole
+    | ASort _ => tag_sort
+    | ANatLit _ => tag_nat
+    | AApp _ _ => tag_app
+    | ALam _ _ _ => tag_lam
+    | APi _ _ _ => tag_pi
+    | ALet _ _ _ _ => tag_let
+    | AAscribe _ _ => tag_ascribe
+    | ABinder _ _ _ => tag_binder
+    | ANoBinder => tag_no_binder
+    | AFix _ _ _ _ => tag_fix
+    | ABranch _ _ _ _ => tag_branch
+    | ANoBranch => tag_no_branch
+    | AMatch _ _ => tag_match
+    | APerform _ _ => tag_perform
+    | AHandle _ _ => tag_handle
+    | AClause _ _ _ _ => tag_clause
+    | ANoClause => tag_no_clause
+    | ADo _ => tag_do
+    | AList _ => tag_list
+    | AStr _ => tag_str
+    end;
+
+def ast_is (tag : Nat) (a : Ast) : Bool := eq_nat (ast_tag a) tag;
+
+-- The interned id or literal a node carries: variable, hole, sort level,
+-- literal, binder name, recursive name, branch or clause constructor, op.
+def ast_payload (a : Ast) : Nat :=
+    match a with
+    | AVar n => n
+    | AHole n => n
+    | ASort n => n
+    | ANatLit n => n
+    | AApp _ _ => Z
+    | ALam n _ _ => n
+    | APi n _ _ => n
+    | ALet n _ _ _ => n
+    | AAscribe _ _ => Z
+    | ABinder n _ _ => n
+    | ANoBinder => Z
+    | AFix n _ _ _ => n
+    | ABranch n _ _ _ => n
+    | ANoBranch => Z
+    | AMatch _ _ => Z
+    | APerform n _ => n
+    | AHandle _ _ => Z
+    | AClause n _ _ _ => n
+    | ANoClause => Z
+    | ADo _ => Z
+    | AList _ => Z
+    | AStr n => n
+    end;
+
+def ast_var_id (a : Ast) : Maybe Nat :=
+    match ast_is tag_var a with
+    | True => Just Nat (ast_payload a)
+    | False => Nothing Nat
+    end;
+
+-- Direct children in source order. Pattern binder lists are ids, not nodes.
+def ast_children (a : Ast) : List Ast :=
+    match a with
+    | AVar _ => Nil Ast
+    | AHole _ => Nil Ast
+    | ASort _ => Nil Ast
+    | ANatLit _ => Nil Ast
+    | AApp f x => ([f, x] : List Ast)
+    | ALam _ ann body => ([ann, body] : List Ast)
+    | APi _ dom cod => ([dom, cod] : List Ast)
+    | ALet _ ann v body => ([ann, v, body] : List Ast)
+    | AAscribe e t => ([e, t] : List Ast)
+    | ABinder _ ty rest => ([ty, rest] : List Ast)
+    | ANoBinder => Nil Ast
+    | AFix _ binders ret body => ([binders, ret, body] : List Ast)
+    | ABranch _ _ body rest => ([body, rest] : List Ast)
+    | ANoBranch => Nil Ast
+    | AMatch s b => ([s, b] : List Ast)
+    | APerform _ args => args
+    | AHandle inner cls => ([inner, cls] : List Ast)
+    | AClause _ _ body rest => ([body, rest] : List Ast)
+    | ANoClause => Nil Ast
+    | ADo xs => xs
+    | AList xs => xs
+    | AStr _ => Nil Ast
+    end;
+
+-- Stops at the first hit: orb evaluates both operands, and the rest of a
+-- search is a walk of everything that follows.
+def ast_any (pred : Ast -> Bool) : List Ast -> Bool :=
+  fix ast_any (xs : List Ast) : Bool :=
+    match xs with
+    | Nil => False
+    | Cons e rest =>
+        match pred e with
+        | True => True
+        | False => ast_any rest
+        end
+    end;
+
+def ast_sum : List Nat -> Nat :=
+  fix ast_sum (xs : List Nat) : Nat :=
+    match xs with
+    | Nil => Z
+    | Cons n rest => add n (ast_sum rest)
+    end;
+
+-- Node count.
+def ast_size : Ast -> Nat :=
+  fix ast_size (a : Ast) : Nat :=
+    match a with
+    | AVar _ => S Z
+    | AHole _ => S Z
+    | ASort _ => S Z
+    | ANatLit _ => S Z
+    | AStr _ => S Z
+    | ANoBinder => S Z
+    | ANoBranch => S Z
+    | ANoClause => S Z
+    | AApp f x => S (add (ast_size f) (ast_size x))
+    | ALam _ ann body => S (add (ast_size ann) (ast_size body))
+    | APi _ dom cod => S (add (ast_size dom) (ast_size cod))
+    | ALet _ ann v body => S (add (ast_size ann) (add (ast_size v) (ast_size body)))
+    | AAscribe e t => S (add (ast_size e) (ast_size t))
+    | ABinder _ ty rest => S (add (ast_size ty) (ast_size rest))
+    | AFix _ binders ret body => S (add (ast_size binders) (add (ast_size ret) (ast_size body)))
+    | ABranch _ _ body rest => S (add (ast_size body) (ast_size rest))
+    | AMatch s b => S (add (ast_size s) (ast_size b))
+    | AHandle inner cls => S (add (ast_size inner) (ast_size cls))
+    | AClause _ _ body rest => S (add (ast_size body) (ast_size rest))
+    | APerform _ args => S ((fix sum (xs : List Ast) : Nat :=
+        match xs with
+        | Nil => Z
+        | Cons child rest => add (ast_size child) (sum rest)
+        end) args)
+    | ADo items => S ((fix sum (xs : List Ast) : Nat :=
+        match xs with
+        | Nil => Z
+        | Cons child rest => add (ast_size child) (sum rest)
+        end) items)
+    | AList items => S ((fix sum (xs : List Ast) : Nat :=
+        match xs with
+        | Nil => Z
+        | Cons child rest => add (ast_size child) (sum rest)
+        end) items)
+    end;
+
+-- Every callback visits a direct child, so the exact node count bounds all
+-- paths. Fuel zero is unreachable on an Ast supplied through this wrapper.
+def ast_exists (pred : Ast -> Bool) (root : Ast) : Bool :=
+    (fix visit (fuel : Nat) (a : Ast) : Bool :=
+      match fuel with
+      | Z => False
+      | S remaining =>
+          match pred a with
+          | True => True
+          | False => ast_any (fun (child : Ast) => visit remaining child) (ast_children a)
+          end
+      end) (ast_size root) root;
+
+-- Variable occurrence anywhere in the tree, shadowing ignored.
+def ast_occurs (target : Nat) : Ast -> Bool :=
+    ast_exists (fun (a : Ast) => andb (ast_is tag_var a) (eq_nat (ast_payload a) target));
+
+-- Head variable of an application spine, looking through ascriptions.
+def ast_app_head : Ast -> Maybe Nat :=
+  fix ast_app_head (a : Ast) : Maybe Nat :=
+    match a with
+    | AVar n => Just Nat n
+    | AApp f _ => ast_app_head f
+    | AAscribe e _ => ast_app_head e
+    | AHole _ => Nothing Nat
+    | ASort _ => Nothing Nat
+    | ANatLit _ => Nothing Nat
+    | ALam _ _ _ => Nothing Nat
+    | APi _ _ _ => Nothing Nat
+    | ALet _ _ _ _ => Nothing Nat
+    | ABinder _ _ _ => Nothing Nat
+    | ANoBinder => Nothing Nat
+    | AFix _ _ _ _ => Nothing Nat
+    | ABranch _ _ _ _ => Nothing Nat
+    | ANoBranch => Nothing Nat
+    | AMatch _ _ => Nothing Nat
+    | APerform _ _ => Nothing Nat
+    | AHandle _ _ => Nothing Nat
+    | AClause _ _ _ _ => Nothing Nat
+    | ANoClause => Nothing Nat
+    | ADo _ => Nothing Nat
+    | AList _ => Nothing Nat
+    | AStr _ => Nothing Nat
+    end;
+
+def ast_head_is (n : Nat) (a : Ast) : Bool :=
+    match ast_app_head a with
+    | Just h => eq_nat h n
+    | Nothing => False
+    end;
+
+-- Some application in the tree has `rec` at the head of its spine. A bare
+-- variable is a reference, not a call.
+def ast_calls (rec : Nat) : Ast -> Bool :=
+    ast_exists (fun (a : Ast) => andb (ast_is tag_app a) (ast_head_is rec a));
+
+-- Head id through applications, ascriptions, performs, fixes, handles,
+-- clauses and do-blocks; the effect and capability cores use this to name
+-- the callee of a spine.
+def head_id : Ast -> Maybe Nat :=
+  fix head_id (a : Ast) : Maybe Nat :=
+    match a with
+    | AVar n => Just Nat n
+    | AApp f _ => head_id f
+    | AAscribe e _ => head_id e
+    | APerform n _ => Just Nat n
+    | AFix n _ _ _ => Just Nat n
+    | AHandle inner _ => head_id inner
+    | AClause _ _ body _ => head_id body
+    | ADo xs =>
+        match xs with
+        | Nil => Nothing Nat
+        | Cons e _ => head_id e
+        end
+    | AHole _ => Nothing Nat
+    | ASort _ => Nothing Nat
+    | ANatLit _ => Nothing Nat
+    | ALam _ _ _ => Nothing Nat
+    | APi _ _ _ => Nothing Nat
+    | ALet _ _ _ _ => Nothing Nat
+    | ABinder _ _ _ => Nothing Nat
+    | ANoBinder => Nothing Nat
+    | ABranch _ _ _ _ => Nothing Nat
+    | ANoBranch => Nothing Nat
+    | AMatch _ _ => Nothing Nat
+    | ANoClause => Nothing Nat
+    | AList _ => Nothing Nat
+    | AStr _ => Nothing Nat
+    end;
+
+-- Ascriptions do not change the shape a core reasons about.
+def ast_peel_ascribe : Ast -> Ast :=
+  fix ast_peel_ascribe (a : Ast) : Ast :=
+    match a with
+    | AAscribe e _ => ast_peel_ascribe e
+    | AVar _ => a
+    | AHole _ => a
+    | ASort _ => a
+    | ANatLit _ => a
+    | AApp _ _ => a
+    | ALam _ _ _ => a
+    | APi _ _ _ => a
+    | ALet _ _ _ _ => a
+    | ABinder _ _ _ => a
+    | ANoBinder => a
+    | AFix _ _ _ _ => a
+    | ABranch _ _ _ _ => a
+    | ANoBranch => a
+    | AMatch _ _ => a
+    | APerform _ _ => a
+    | AHandle _ _ => a
+    | AClause _ _ _ _ => a
+    | ANoClause => a
+    | ADo _ => a
+    | AList _ => a
+    | AStr _ => a
+    end;
+
+-- Parameter ids of a binder telescope; a fix delegates to its telescope.
+def ast_binder_ids : Ast -> List Nat :=
+  fix ast_binder_ids (b : Ast) : List Nat :=
+    match b with
+    | ABinder id _ rest => Cons Nat id (ast_binder_ids rest)
+    | AFix _ binders _ _ => ast_binder_ids binders
+    | ANoBinder => Nil Nat
+    | AVar _ => Nil Nat
+    | AHole _ => Nil Nat
+    | ASort _ => Nil Nat
+    | ANatLit _ => Nil Nat
+    | AApp _ _ => Nil Nat
+    | ALam _ _ _ => Nil Nat
+    | APi _ _ _ => Nil Nat
+    | ALet _ _ _ _ => Nil Nat
+    | AAscribe _ _ => Nil Nat
+    | ABranch _ _ _ _ => Nil Nat
+    | ANoBranch => Nil Nat
+    | AMatch _ _ => Nil Nat
+    | APerform _ _ => Nil Nat
+    | AHandle _ _ => Nil Nat
+    | AClause _ _ _ _ => Nil Nat
+    | ANoClause => Nil Nat
+    | ADo _ => Nil Nat
+    | AList _ => Nil Nat
+    | AStr _ => Nil Nat
+    end;
+
+-- Constructor of every arm of a branch chain, in order.
+def ast_arm_ctors : Ast -> List Nat :=
+  fix ast_arm_ctors (b : Ast) : List Nat :=
+    match b with
+    | ABranch ctor _ _ rest => Cons Nat ctor (ast_arm_ctors rest)
+    | ANoBranch => Nil Nat
+    | AVar _ => Nil Nat
+    | AHole _ => Nil Nat
+    | ASort _ => Nil Nat
+    | ANatLit _ => Nil Nat
+    | AApp _ _ => Nil Nat
+    | ALam _ _ _ => Nil Nat
+    | APi _ _ _ => Nil Nat
+    | ALet _ _ _ _ => Nil Nat
+    | AAscribe _ _ => Nil Nat
+    | ABinder _ _ _ => Nil Nat
+    | ANoBinder => Nil Nat
+    | AFix _ _ _ _ => Nil Nat
+    | AMatch _ _ => Nil Nat
+    | APerform _ _ => Nil Nat
+    | AHandle _ _ => Nil Nat
+    | AClause _ _ _ _ => Nil Nat
+    | ANoClause => Nil Nat
+    | ADo _ => Nil Nat
+    | AList _ => Nil Nat
+    | AStr _ => Nil Nat
+    end;
+
+def ast_arm_count (b : Ast) : Nat := length Nat (ast_arm_ctors b);
+
+-- Scrutinee of a match node; Nothing elsewhere.
+def ast_scrutinee (a : Ast) : Maybe Ast :=
+    match ast_is tag_match a with
+    | False => Nothing Ast
+    | True =>
+        match ast_children a with
+        | Nil => Nothing Ast
+        | Cons s _ => Just Ast s
+        end
+    end;
+
+-- One of `ids` occurs in an application spine, ascription, or multi-scrutinee
+-- row: `f x`, `x : T`, `(g x) y`, `match x, y with`. Lambdas, lets, and nested
+-- matches inside the spine do not count.
+def ast_spine_uses (ids : List Nat) (root : Ast) : Bool :=
+  (fix visit (fuel : Nat) (s : Ast) : Bool :=
+    match fuel with
+    | Z => False
+    | S remaining =>
+    match ast_var_id s with
+    | Just id => mem Nat eq_nat id ids
+    | Nothing =>
+        match orb (ast_is tag_app s) (orb (ast_is tag_ascribe s) (ast_is tag_list s)) with
+        | True => ast_any (fun (child : Ast) => visit remaining child) (ast_children s)
+        | False => False
+        end
+    end
+    end) (ast_size root) root;
+
+-- Some match in the tree scrutinises a spine over one of `ids`, or over a
+-- let-bound name whose value is such a spine: `let t := skip_ws xs in match t`
+-- checks `xs`. The derived name is in scope in the let body only.
+def ast_matches_using (initial_ids : List Nat) (root : Ast) : Bool :=
+  (fix go (fuel : Nat) (ids : List Nat) (a : Ast) : Bool :=
+    match fuel with
+    | Z => False
+    | S remaining =>
+    let here : Bool :=
+      match ast_scrutinee a with
+      | Nothing => False
+      | Just s => ast_spine_uses ids s
+      end in
+    match here with
+    | True => True
+    | False =>
+        match a with
+        | ALet id ann v body =>
+            let inner : List Nat :=
+              match ast_spine_uses ids v with
+              | True => Cons Nat id ids
+              | False => ids
+              end in
+            orb (go remaining ids ann) (orb (go remaining ids v) (go remaining inner body))
+        | AVar _ => False
+        | AHole _ => False
+        | ASort _ => False
+        | ANatLit _ => False
+        | AStr _ => False
+        | ANoBinder => False
+        | ANoBranch => False
+        | ANoClause => False
+        | AApp _ _ => ast_any (fun (child : Ast) => go remaining ids child) (ast_children a)
+        | ALam _ _ _ => ast_any (fun (child : Ast) => go remaining ids child) (ast_children a)
+        | APi _ _ _ => ast_any (fun (child : Ast) => go remaining ids child) (ast_children a)
+        | AAscribe _ _ => ast_any (fun (child : Ast) => go remaining ids child) (ast_children a)
+        | ABinder _ _ _ => ast_any (fun (child : Ast) => go remaining ids child) (ast_children a)
+        | AFix _ _ _ _ => ast_any (fun (child : Ast) => go remaining ids child) (ast_children a)
+        | ABranch _ _ _ _ => ast_any (fun (child : Ast) => go remaining ids child) (ast_children a)
+        | AMatch _ _ => ast_any (fun (child : Ast) => go remaining ids child) (ast_children a)
+        | APerform _ _ => ast_any (fun (child : Ast) => go remaining ids child) (ast_children a)
+        | AHandle _ _ => ast_any (fun (child : Ast) => go remaining ids child) (ast_children a)
+        | AClause _ _ _ _ => ast_any (fun (child : Ast) => go remaining ids child) (ast_children a)
+        | ADo _ => ast_any (fun (child : Ast) => go remaining ids child) (ast_children a)
+        | AList _ => ast_any (fun (child : Ast) => go remaining ids child) (ast_children a)
+        end
+    end
+    end) (ast_size root) initial_ids root;
+
+-- A fix with parameters that calls itself without ever scrutinising one of
+-- them has no structural guard. Shared by cfg, property, and symexec so the
+-- three families agree on the witness.
+def ast_recursion_unguarded (r : Nat) (binders : Ast) (body : Ast) : Bool :=
+    match ast_binder_ids binders with
+    | Nil => False
+    | Cons _ _ =>
+        andb (ast_calls r body)
+          (notb (ast_matches_using (ast_binder_ids binders) body))
+    end;
+
+-- Arguments of an application spine in source order, looking through
+-- ascriptions on the function position; the head is `ast_app_head`.
+def ast_args_rev : Ast -> List Ast :=
+  fix ast_args_rev (a : Ast) : List Ast :=
+    match a with
+    | AApp f x => Cons Ast x (ast_args_rev f)
+    | AAscribe e _ => ast_args_rev e
+    | AVar _ => Nil Ast
+    | AHole _ => Nil Ast
+    | ASort _ => Nil Ast
+    | ANatLit _ => Nil Ast
+    | AStr _ => Nil Ast
+    | ALam _ _ _ => Nil Ast
+    | APi _ _ _ => Nil Ast
+    | ALet _ _ _ _ => Nil Ast
+    | ABinder _ _ _ => Nil Ast
+    | ANoBinder => Nil Ast
+    | AFix _ _ _ _ => Nil Ast
+    | ABranch _ _ _ _ => Nil Ast
+    | ANoBranch => Nil Ast
+    | AMatch _ _ => Nil Ast
+    | APerform _ _ => Nil Ast
+    | AHandle _ _ => Nil Ast
+    | AClause _ _ _ _ => Nil Ast
+    | ANoClause => Nil Ast
+    | ADo _ => Nil Ast
+    | AList _ => Nil Ast
+    end;
+
+def ast_args (a : Ast) : List Ast := reverse Ast (ast_args_rev a);
+
+-- constructor, pattern binders, body of one match arm.
+inductive AstArm : Type :=
+  | MkAstArm : Nat -> List Nat -> Ast -> AstArm;
+
+def ast_arm_ctor (m : AstArm) : Nat := match m with | MkAstArm c _ _ => c end;
+
+def ast_arm_binders (m : AstArm) : List Nat := match m with | MkAstArm _ ids _ => ids end;
+
+def ast_arm_body (m : AstArm) : Ast := match m with | MkAstArm _ _ body => body end;
+
+-- Arms of a branch chain in source order; Nothing when the chain carries a
+-- multi-scrutinee wildcard row or anything that is not a branch.
+def ast_arms : Ast -> Maybe (List AstArm) :=
+  fix ast_arms (b : Ast) : Maybe (List AstArm) :=
+    match b with
+    | ABranch c ids body rest =>
+        match ast_arms rest with
+        | Nothing => Nothing (List AstArm)
+        | Just more => Just (List AstArm) (Cons AstArm (MkAstArm c ids body) more)
+        end
+    | ANoBranch => Just (List AstArm) (Nil AstArm)
+    | AVar _ => Nothing (List AstArm)
+    | AHole _ => Nothing (List AstArm)
+    | ASort _ => Nothing (List AstArm)
+    | ANatLit _ => Nothing (List AstArm)
+    | AStr _ => Nothing (List AstArm)
+    | AApp _ _ => Nothing (List AstArm)
+    | ALam _ _ _ => Nothing (List AstArm)
+    | APi _ _ _ => Nothing (List AstArm)
+    | ALet _ _ _ _ => Nothing (List AstArm)
+    | AAscribe _ _ => Nothing (List AstArm)
+    | ABinder _ _ _ => Nothing (List AstArm)
+    | ANoBinder => Nothing (List AstArm)
+    | AFix _ _ _ _ => Nothing (List AstArm)
+    | AMatch _ _ => Nothing (List AstArm)
+    | APerform _ _ => Nothing (List AstArm)
+    | AHandle _ _ => Nothing (List AstArm)
+    | AClause _ _ _ _ => Nothing (List AstArm)
+    | ANoClause => Nothing (List AstArm)
+    | ADo _ => Nothing (List AstArm)
+    | AList _ => Nothing (List AstArm)
+    end;
+
+-- Definition body behind the root ascription, the leading parameter lambdas,
+-- and a fix telescope: the part a shape rule should inspect.
+def ast_core_body : Ast -> Ast :=
+  fix ast_core_body (a : Ast) : Ast :=
+    match a with
+    | AAscribe e _ => ast_core_body e
+    | ALam _ _ body => ast_core_body body
+    | AFix _ _ _ body => body
+    | AVar _ => a
+    | AHole _ => a
+    | ASort _ => a
+    | ANatLit _ => a
+    | AStr _ => a
+    | AApp _ _ => a
+    | APi _ _ _ => a
+    | ALet _ _ _ _ => a
+    | ABinder _ _ _ => a
+    | ANoBinder => a
+    | ABranch _ _ _ _ => a
+    | ANoBranch => a
+    | AMatch _ _ => a
+    | APerform _ _ => a
+    | AHandle _ _ => a
+    | AClause _ _ _ _ => a
+    | ANoClause => a
+    | ADo _ => a
+    | AList _ => a
+    end;
+
+-- Recursive name of a definition whose core is a fix; Z otherwise.
+def ast_root_fix : Ast -> Nat :=
+  fix ast_root_fix (a : Ast) : Nat :=
+    match a with
+    | AAscribe e _ => ast_root_fix e
+    | ALam _ _ body => ast_root_fix body
+    | AFix r _ _ _ => r
+    | AVar _ => Z
+    | AHole _ => Z
+    | ASort _ => Z
+    | ANatLit _ => Z
+    | AStr _ => Z
+    | AApp _ _ => Z
+    | APi _ _ _ => Z
+    | ALet _ _ _ _ => Z
+    | ABinder _ _ _ => Z
+    | ANoBinder => Z
+    | ABranch _ _ _ _ => Z
+    | ANoBranch => Z
+    | AMatch _ _ => Z
+    | APerform _ _ => Z
+    | AHandle _ _ => Z
+    | AClause _ _ _ _ => Z
+    | ANoClause => Z
+    | ADo _ => Z
+    | AList _ => Z
+    end;
+
+-- Declared type of a definition: the ascription the unit puts at the root.
+def ast_declared_type (a : Ast) : Maybe Ast :=
+    match a with
+    | AAscribe _ t => Just Ast t
+    | AVar _ => Nothing Ast
+    | AHole _ => Nothing Ast
+    | ASort _ => Nothing Ast
+    | ANatLit _ => Nothing Ast
+    | AStr _ => Nothing Ast
+    | AApp _ _ => Nothing Ast
+    | ALam _ _ _ => Nothing Ast
+    | APi _ _ _ => Nothing Ast
+    | ALet _ _ _ _ => Nothing Ast
+    | ABinder _ _ _ => Nothing Ast
+    | ANoBinder => Nothing Ast
+    | AFix _ _ _ _ => Nothing Ast
+    | ABranch _ _ _ _ => Nothing Ast
+    | ANoBranch => Nothing Ast
+    | AMatch _ _ => Nothing Ast
+    | APerform _ _ => Nothing Ast
+    | AHandle _ _ => Nothing Ast
+    | AClause _ _ _ _ => Nothing Ast
+    | ANoClause => Nothing Ast
+    | ADo _ => Nothing Ast
+    | AList _ => Nothing Ast
+    end;
+
+-- Final codomain of a Pi telescope: the type a definition's applications
+-- produce once every parameter is supplied.
+def ast_result_type : Ast -> Ast :=
+  fix ast_result_type (t : Ast) : Ast :=
+    match t with
+    | APi _ _ cod => ast_result_type cod
+    | AVar _ => t
+    | AHole _ => t
+    | ASort _ => t
+    | ANatLit _ => t
+    | AStr _ => t
+    | AApp _ _ => t
+    | ALam _ _ _ => t
+    | ALet _ _ _ _ => t
+    | AAscribe _ _ => t
+    | ABinder _ _ _ => t
+    | ANoBinder => t
+    | AFix _ _ _ _ => t
+    | ABranch _ _ _ _ => t
+    | ANoBranch => t
+    | AMatch _ _ => t
+    | APerform _ _ => t
+    | AHandle _ _ => t
+    | AClause _ _ _ _ => t
+    | ANoClause => t
+    | ADo _ => t
+    | AList _ => t
+    end;
+
+
+def ast_is_fix_body : Ast -> Bool :=
+  fix ast_is_fix_body (a : Ast) : Bool :=
+    match a with
+    | AAscribe e _ => ast_is_fix_body e
+    | ALam _ _ body => ast_is_fix_body body
+    | AFix _ _ _ _ => True
+    | AVar _ => False
+    | AHole _ => False
+    | ASort _ => False
+    | ANatLit _ => False
+    | AStr _ => False
+    | AApp _ _ => False
+    | APi _ _ _ => False
+    | ALet _ _ _ _ => False
+    | ABinder _ _ _ => False
+    | ANoBinder => False
+    | ABranch _ _ _ _ => False
+    | ANoBranch => False
+    | AMatch _ _ => False
+    | APerform _ _ => False
+    | AHandle _ _ => False
+    | AClause _ _ _ _ => False
+    | ANoClause => False
+    | ADo _ => False
+    | AList _ => False
+    end;
+
+
+def ast_params : Ast -> List Nat :=
+  fix ast_params (a : Ast) : List Nat :=
+    match a with
+    | AAscribe e _ => ast_params e
+    | ALam id _ body => Cons Nat id (ast_params body)
+    | AFix _ binders _ _ => ast_binder_ids binders
+    | AVar _ => Nil Nat
+    | AHole _ => Nil Nat
+    | ASort _ => Nil Nat
+    | ANatLit _ => Nil Nat
+    | AStr _ => Nil Nat
+    | AApp _ _ => Nil Nat
+    | APi _ _ _ => Nil Nat
+    | ALet _ _ _ _ => Nil Nat
+    | ABinder _ _ _ => Nil Nat
+    | ANoBinder => Nil Nat
+    | ABranch _ _ _ _ => Nil Nat
+    | ANoBranch => Nil Nat
+    | AMatch _ _ => Nil Nat
+    | APerform _ _ => Nil Nat
+    | AHandle _ _ => Nil Nat
+    | AClause _ _ _ _ => Nil Nat
+    | ANoClause => Nil Nat
+    | ADo _ => Nil Nat
+    | AList _ => Nil Nat
+    end;
+
+
+def ast_var_or_zero (a : Ast) : Nat :=
+    match ast_var_id (ast_peel_ascribe a) with
+    | Just v => v
+    | Nothing => Z
+    end;

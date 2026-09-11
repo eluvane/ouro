@@ -1,0 +1,378 @@
+-- Resolve image-local symbols and IAT slots before serializing the PE image.
+-- Absolute 64-bit address fields produce IMAGE_REL_BASED_DIR64 relocations.
+
+import "pe_imports.ouro";
+
+inductive PePatch : Type :=
+  | PePatchAt : PeSection -> Nat -> List Nat -> Bool -> PePatch;
+
+-- Derived lookup only. Insertions retain the first occurrence, including an
+-- invalid symbol; the existing resolver still owns every typed RVA check.
+inductive PeSymbolIndex : Type :=
+  | PeSymbolIndexEmpty : PeSymbolIndex
+  | PeSymbolIndexNode : Nat -> Nat -> PeSymbol -> PeSymbolIndex -> PeSymbolIndex -> PeSymbolIndex;
+
+def pe_symbol_index_height (tree : PeSymbolIndex) : Nat :=
+    match tree with | PeSymbolIndexEmpty => Z | PeSymbolIndexNode height _ _ _ _ => height end;
+
+def pe_symbol_index_node (key : Nat) (value : PeSymbol) (left : PeSymbolIndex) (right : PeSymbolIndex)
+    : PeSymbolIndex :=
+    PeSymbolIndexNode (S (maxNat (pe_symbol_index_height left) (pe_symbol_index_height right))) key value left right;
+
+def pe_symbol_index_left_heavy (key : Nat) (value : PeSymbol)
+    (left : PeSymbolIndex) (right : PeSymbolIndex) : PeSymbolIndex :=
+    match left with
+    | PeSymbolIndexEmpty => pe_symbol_index_node key value left right
+    | PeSymbolIndexNode _ first first_value outer inner =>
+        match leb_nat (pe_symbol_index_height inner) (pe_symbol_index_height outer) with
+        | True => pe_symbol_index_node first first_value outer (pe_symbol_index_node key value inner right)
+        | False => match inner with
+            | PeSymbolIndexEmpty => pe_symbol_index_node first first_value outer (pe_symbol_index_node key value inner right)
+            | PeSymbolIndexNode _ middle middle_value inner_left inner_right =>
+                pe_symbol_index_node middle middle_value
+                  (pe_symbol_index_node first first_value outer inner_left)
+                  (pe_symbol_index_node key value inner_right right)
+            end
+        end
+    end;
+
+def pe_symbol_index_right_heavy (key : Nat) (value : PeSymbol)
+    (left : PeSymbolIndex) (right : PeSymbolIndex) : PeSymbolIndex :=
+    match right with
+    | PeSymbolIndexEmpty => pe_symbol_index_node key value left right
+    | PeSymbolIndexNode _ last last_value inner outer =>
+        match leb_nat (pe_symbol_index_height inner) (pe_symbol_index_height outer) with
+        | True => pe_symbol_index_node last last_value (pe_symbol_index_node key value left inner) outer
+        | False => match inner with
+            | PeSymbolIndexEmpty => pe_symbol_index_node last last_value (pe_symbol_index_node key value left inner) outer
+            | PeSymbolIndexNode _ middle middle_value inner_left inner_right =>
+                pe_symbol_index_node middle middle_value
+                  (pe_symbol_index_node key value left inner_left)
+                  (pe_symbol_index_node last last_value inner_right outer)
+            end
+        end
+    end;
+
+def pe_symbol_index_balance (key : Nat) (value : PeSymbol)
+    (left : PeSymbolIndex) (right : PeSymbolIndex) : PeSymbolIndex :=
+    match ltb_nat (S (pe_symbol_index_height right)) (pe_symbol_index_height left) with
+    | True => pe_symbol_index_left_heavy key value left right
+    | False => match ltb_nat (S (pe_symbol_index_height left)) (pe_symbol_index_height right) with
+        | True => pe_symbol_index_right_heavy key value left right
+        | False => pe_symbol_index_node key value left right
+        end
+    end;
+
+-- Normalize a possibly Peano-built ID once, so comparisons inside the tree
+-- do not repeatedly decode its unary prefix in the extracted runtime.
+def pe_symbol_index_insert (key : Nat) (value : PeSymbol) : PeSymbolIndex -> PeSymbolIndex :=
+    let canonical_key : Nat := add key Z in
+  fix insert (tree : PeSymbolIndex) : PeSymbolIndex :=
+    match tree with
+    | PeSymbolIndexEmpty => pe_symbol_index_node canonical_key value PeSymbolIndexEmpty PeSymbolIndexEmpty
+    | PeSymbolIndexNode height current stored left right =>
+        match compareNat canonical_key current with
+        | EQ => tree
+        | LT => pe_symbol_index_balance current stored (insert left) right
+        | GT => pe_symbol_index_balance current stored left (insert right)
+        end
+    end;
+
+def pe_symbol_index_lookup (key : Nat) : PeSymbolIndex -> Maybe PeSymbol :=
+    let canonical_key : Nat := add key Z in
+  fix lookup (tree : PeSymbolIndex) : Maybe PeSymbol :=
+    match tree with
+    | PeSymbolIndexEmpty => Nothing PeSymbol
+    | PeSymbolIndexNode _ current value left right =>
+        match compareNat canonical_key current with
+        | EQ => Just PeSymbol value
+        | LT => lookup left
+        | GT => lookup right
+        end
+    end;
+
+def pe_symbol_index_from_symbols (symbols : List PeSymbol) : PeSymbolIndex :=
+    (fix collect (remaining : List PeSymbol) (tree : PeSymbolIndex) : PeSymbolIndex :=
+      match remaining with
+      | Nil => tree
+      | Cons symbol rest => collect rest (pe_symbol_index_insert (pe_symbol_id symbol) symbol tree)
+      end) symbols PeSymbolIndexEmpty;
+
+def pe_target_rva_with (lookup : PeSection -> Maybe (Pair PePlacedSection Nat)) (symbols : List PeSymbol)
+    (imports : List (Pair Nat Nat)) (target : PeTarget) : Either PeError Nat :=
+    match target with
+    | PeSymbolTarget name => pe_symbol_rva_with lookup symbols name
+    | PeImportTarget name => pe_import_rva name imports
+    end;
+
+def pe_patch_bounds_with (lookup : PeSection -> Maybe (Pair PePlacedSection Nat)) (kind : PeSection)
+    (offset : Nat) (width : Nat) : Either PeError (Pair PePlacedSection Nat) :=
+    match pe_input_section kind with
+    | False => Left PeError (Pair PePlacedSection Nat) (PeInvalidFixup offset)
+    | True =>
+      match lookup kind with
+      | Nothing => Left PeError (Pair PePlacedSection Nat) (PeInvalidFixup offset)
+      | Just measured => match measured with | MkPair _ size =>
+          match andb (leb_nat offset size) (leb_nat width (sub size offset)) with
+          | False => Left PeError (Pair PePlacedSection Nat) (PeInvalidFixup offset)
+          | True => Right PeError (Pair PePlacedSection Nat) measured
+          end
+        end
+      end
+    end;
+
+def pe_patch_bounds (sections : List PePlacedSection) (kind : PeSection)
+    (offset : Nat) (width : Nat) : Either PeError PePlacedSection :=
+    mapRight PeError (Pair PePlacedSection Nat) PePlacedSection
+      (fun (measured : Pair PePlacedSection Nat) => match measured with | MkPair section _ => section end)
+      (pe_patch_bounds_with (pe_section_lookup sections) kind offset width);
+
+def pe_patch_slot (sections : List PePlacedSection) (kind : PeSection)
+    (offset : Nat) (width : Nat) : Either PeError PePlacedSection :=
+    match pe_patch_bounds sections kind offset width with
+    | Left error => Left PeError PePlacedSection error
+    | Right section => match section with | PeSectionAt _ _ _ _ bytes =>
+        match pe_bytes_equal (take Nat width (drop Nat offset bytes)) (pe_zeros width) with
+        | False => Left PeError PePlacedSection (PeNonzeroFixup offset)
+        | True => Right PeError PePlacedSection section end end end;
+
+def pe_relative_bytes (offset : Nat) (origin : Nat) (target : Nat) : Either PeError (List Nat) :=
+    let displacement : X64Displacement :=
+      match leb_nat origin target with
+      | True => X64Forward (pe_word32 (sub target origin))
+      | False => X64Backward (pe_word32 (sub origin target))
+      end in
+    mapLeft X64EncodeError (List Nat) PeError
+      (fun (_ : X64EncodeError) => PeRelativeOverflow offset) (x64_displacement_bytes displacement);
+
+def pe_relative_patch_in_with (lookup : PeSection -> Maybe (Pair PePlacedSection Nat)) (symbols : List PeSymbol)
+    (imports : List (Pair Nat Nat)) (kind : PeSection) (offset : Nat)
+    (next_instruction : Nat) (target : PeTarget) (measured : Pair PePlacedSection Nat) : Either PeError PePatch :=
+    match measured with | MkPair section size =>
+      match section with
+      | PeSectionAt _ rva _ _ _ =>
+        match andb (leb_nat (add offset 4) next_instruction) (leb_nat next_instruction size) with
+        | False => Left PeError PePatch (PeInvalidFixup offset)
+        | True =>
+          match pe_target_rva_with lookup symbols imports target with
+          | Left err => Left PeError PePatch err
+          | Right target_rva => mapRight PeError (List Nat) PePatch
+              (fun (encoded : List Nat) => PePatchAt kind offset encoded False)
+              (pe_relative_bytes offset (add rva next_instruction) target_rva)
+          end
+        end
+      end
+    end;
+
+def pe_relative_patch_in (sections : List PePlacedSection) (symbols : List PeSymbol)
+    (imports : List (Pair Nat Nat)) (kind : PeSection) (offset : Nat)
+    (next_instruction : Nat) (target : PeTarget) (section : PePlacedSection) : Either PeError PePatch :=
+    pe_relative_patch_in_with (pe_section_lookup sections) symbols imports kind offset next_instruction target (pe_section_measure section);
+
+def pe_relative_patch (sections : List PePlacedSection) (symbols : List PeSymbol)
+    (imports : List (Pair Nat Nat)) (kind : PeSection) (offset : Nat)
+    (next_instruction : Nat) (target : PeTarget) : Either PeError PePatch :=
+    match pe_patch_slot sections kind offset 4 with
+    | Left error => Left PeError PePatch error
+    | Right section => pe_relative_patch_in sections symbols imports kind offset next_instruction target section end;
+
+def pe_address_patch_in_with (lookup : PeSection -> Maybe (Pair PePlacedSection Nat)) (symbols : List PeSymbol)
+    (imports : List (Pair Nat Nat)) (kind : PeSection) (offset : Nat)
+    (target : PeTarget) (absolute : Bool) : Either PeError PePatch :=
+    match pe_target_rva_with lookup symbols imports target with
+    | Left error => Left PeError PePatch error
+    | Right rva => Right PeError PePatch
+        (PePatchAt kind offset (match absolute with | True => pe_va64 rva | False => pe_le32 rva end) absolute) end;
+
+def pe_address_patch_in (sections : List PePlacedSection) (symbols : List PeSymbol)
+    (imports : List (Pair Nat Nat)) (kind : PeSection) (offset : Nat)
+    (target : PeTarget) (absolute : Bool) : Either PeError PePatch :=
+    pe_address_patch_in_with (pe_section_lookup sections) symbols imports kind offset target absolute;
+
+def pe_address_patch (sections : List PePlacedSection) (symbols : List PeSymbol)
+    (imports : List (Pair Nat Nat)) (kind : PeSection) (offset : Nat)
+    (target : PeTarget) (absolute : Bool) : Either PeError PePatch :=
+    let width : Nat := match absolute with | True => 8 | False => 4 end in
+    match pe_patch_slot sections kind offset width with
+    | Left err => Left PeError PePatch err
+    | Right _ => pe_address_patch_in sections symbols imports kind offset target absolute
+    end;
+
+def pe_fixup_section (fixup : PeFixup) : PeSection :=
+    match fixup with | PeRel32 kind _ _ _ => kind | PeRva32 kind _ _ => kind | PeVa64 kind _ _ => kind end;
+
+def pe_fixup_offset (fixup : PeFixup) : Nat :=
+    match fixup with | PeRel32 _ offset _ _ => offset | PeRva32 _ offset _ => offset | PeVa64 _ offset _ => offset end;
+
+def pe_fixup_width (fixup : PeFixup) : Nat :=
+    match fixup with | PeRel32 _ _ _ _ => 4 | PeRva32 _ _ _ => 4 | PeVa64 _ _ _ => 8 end;
+
+-- The caller has checked the original slot's bounds and zero bytes. Target
+-- resolution and relative-origin validation keep the single-fixup ordering.
+def pe_plan_fixup (sections : List PePlacedSection) (symbols : List PeSymbol)
+    (imports : List (Pair Nat Nat)) (fixup : PeFixup) : Either PeError PePatch :=
+    match fixup with
+    | PeRel32 kind offset next target => pe_relative_patch sections symbols imports kind offset next target
+    | PeRva32 kind offset target => pe_address_patch sections symbols imports kind offset target False
+    | PeVa64 kind offset target => pe_address_patch sections symbols imports kind offset target True
+    end;
+
+-- Cached counts are computed from the original unpadded bytes once. The
+-- lookup still selects the first matching section, including duplicate kinds.
+def pe_cached_section_lookup (sections : List (Pair PePlacedSection Nat)) (kind : PeSection) : Maybe (Pair PePlacedSection Nat) :=
+    (fix go (remaining : List (Pair PePlacedSection Nat)) : Maybe (Pair PePlacedSection Nat) :=
+      match remaining with
+      | Nil => Nothing (Pair PePlacedSection Nat)
+      | Cons measured rest => match measured with | MkPair section _ =>
+        match section with | PeSectionAt tag _ _ _ _ =>
+          match pe_section_equal kind tag with
+          | True => Just (Pair PePlacedSection Nat) measured
+          | False => go rest
+          end
+        end end
+      end) sections;
+
+def pe_resolve_fixup_with (lookup : PeSection -> Maybe (Pair PePlacedSection Nat)) (symbols : List PeSymbol)
+    (imports : List (Pair Nat Nat)) (fixup : PeFixup) (measured : Pair PePlacedSection Nat) : Either PeError PePatch :=
+    match fixup with
+    | PeRel32 kind offset next target => pe_relative_patch_in_with lookup symbols imports kind offset next target measured
+    | PeRva32 kind offset target => pe_address_patch_in_with lookup symbols imports kind offset target False
+    | PeVa64 kind offset target => pe_address_patch_in_with lookup symbols imports kind offset target True end;
+
+-- Select only the first original target symbol, then use the ordinary
+-- resolver. Slot checks already ran; relative-origin, target and ordering
+-- diagnostics retain their existing order. Imports keep their own lookup.
+def pe_resolve_fixup_indexed_with (lookup : PeSection -> Maybe (Pair PePlacedSection Nat))
+    (index : PeSymbolIndex) (imports : List (Pair Nat Nat)) (fixup : PeFixup)
+    (measured : Pair PePlacedSection Nat) : Either PeError PePatch :=
+    let target : PeTarget := match fixup with
+      | PeRel32 _ _ _ value => value | PeRva32 _ _ value => value | PeVa64 _ _ value => value end in
+    let selected : List PeSymbol := match target with
+      | PeImportTarget _ => []
+      | PeSymbolTarget name => match pe_symbol_index_lookup name index with
+          | Nothing => [] | Just symbol => [symbol] end
+      end in
+    pe_resolve_fixup_with lookup selected imports fixup measured;
+
+def pe_plan_fixups (sections : List PePlacedSection) (symbols : List PeSymbol)
+    (imports : List (Pair Nat Nat)) (fixups : List PeFixup) : Either PeError (List PePatch) :=
+    match fixups with
+    | Nil => Right PeError (List PePatch) ([] : List PePatch)
+    | Cons _ _ =>
+    let measured : List (Pair PePlacedSection Nat) := map PePlacedSection (Pair PePlacedSection Nat) pe_section_measure sections in
+    let lookup : PeSection -> Maybe (Pair PePlacedSection Nat) := pe_cached_section_lookup measured in
+    let index : PeSymbolIndex := pe_symbol_index_from_symbols symbols in
+    (fix go (rest : List PeFixup) (last_section : Nat) (last_end : Nat)
+        (available : Bool) (source : List Nat) : Either PeError (List PePatch) :=
+      match rest with
+      | Nil => Right PeError (List PePatch) ([] : List PePatch)
+      | Cons fixup tail =>
+        let kind : PeSection := pe_fixup_section fixup in
+        let offset : Nat := pe_fixup_offset fixup in
+        let width : Nat := pe_fixup_width fixup in
+        let code : Nat := pe_section_code kind in
+        match pe_patch_bounds_with lookup kind offset width with
+        | Left error => Left PeError (List PePatch) error
+        | Right extent => match extent with | MkPair section _ =>
+          match section with | PeSectionAt _ _ _ _ original =>
+          -- Ordered fixups share a forward cursor through each original
+          -- section. Backwards inputs still inspect their own original slot
+          -- before reporting ordering, preserving the first diagnostic.
+          let slot : List Nat := match andb available (andb (eq_nat last_section code) (leb_nat last_end offset)) with
+            | True => drop Nat (sub offset last_end) source
+            | False => drop Nat offset original end in
+          match pe_bytes_equal (take Nat width slot) (pe_zeros width) with
+          | False => Left PeError (List PePatch) (PeNonzeroFixup offset)
+          | True => match pe_resolve_fixup_indexed_with lookup index imports fixup extent with
+        | Left err => Left PeError (List PePatch) err
+        | Right patch =>
+          match patch with
+          | PePatchAt kind offset bytes _ =>
+            match orb (ltb_nat last_section code) (andb (eq_nat last_section code) (leb_nat last_end offset)) with
+            | False => Left PeError (List PePatch) (PeUnorderedFixup offset)
+            | True => mapRight PeError (List PePatch) (List PePatch)
+                (fun (patches : List PePatch) => Cons PePatch patch patches)
+                (go tail code (add offset (length Nat bytes)) True (drop Nat width slot))
+            end
+          end
+        end end end end end
+      end) fixups 0 0 False ([] : List Nat)
+    end;
+
+def pe_apply_section_patches (kind : PeSection) (bytes : List Nat) (patches : List PePatch) : List Nat :=
+    let local_patches : List PePatch := filter PePatch
+      (fun (patch : PePatch) => match patch with | PePatchAt section _ _ _ => pe_section_equal section kind end) patches in
+    (fix go (rest : List PePatch) (source : List Nat) (cursor : Nat) : List Nat :=
+      match rest with
+      | Nil => source
+      | Cons patch tail =>
+        match patch with
+        | PePatchAt _ offset replacement _ =>
+          let prefix_size : Nat := sub offset cursor in
+          let consumed : Nat := add prefix_size (length Nat replacement) in
+          pe_join ([take Nat prefix_size source, replacement,
+            go tail (drop Nat consumed source) (add offset (length Nat replacement))] : List (List Nat))
+        end
+      end) local_patches bytes 0;
+
+def pe_apply_patches (layout : PeLayout) (patches : List PePatch) : PeLayout :=
+    match layout with
+    | PeLayoutAt rva file sections =>
+      PeLayoutAt rva file
+        (map PePlacedSection PePlacedSection
+          (fun (section : PePlacedSection) =>
+            match section with
+            | PeSectionAt kind start raw raw_size bytes => PeSectionAt kind start raw raw_size (pe_apply_section_patches kind bytes patches)
+            end) sections)
+    end;
+
+def pe_relocation_addresses (sections : List PePlacedSection) : List PePatch -> Either PeError (List Nat) :=
+  fix pe_relocation_addresses (patches : List PePatch) : Either PeError (List Nat) :=
+    match patches with
+    | Nil => Right PeError (List Nat) ([] : List Nat)
+    | Cons patch rest =>
+      match patch with
+      | PePatchAt kind offset _ absolute =>
+        match absolute with
+        | False => pe_relocation_addresses rest
+        | True =>
+          match pe_find_section kind sections with
+          | Nothing => Left PeError (List Nat) (PeInvalidFixup offset)
+          | Just section =>
+            match section with
+            | PeSectionAt _ rva _ _ _ => mapRight PeError (List Nat) (List Nat)
+                (fun (tail : List Nat) => Cons Nat (add rva offset) tail) (pe_relocation_addresses rest)
+            end
+          end
+        end
+      end
+    end;
+
+def pe_page_offset (rva : Nat) : Nat :=
+    match pe_word32 rva with | X64Bytes32 low high _ _ => add low (mul 256 (mod_nat high 16)) end;
+
+def pe_relocation_block (page : Nat) (entries : List Nat) : List Nat :=
+    match entries with
+    | Nil => ([] : List Nat)
+    | Cons _ _ =>
+      let data : List Nat := pe_pad 4 (pe_join (map Nat (List Nat) pe_le16 (reverse Nat entries))) in
+      pe_join ([pe_le32 page, pe_le32 (add 8 (length Nat data)), data] : List (List Nat))
+    end;
+
+def pe_encode_relocations (addresses : List Nat) : List Nat :=
+    (fix go (rest : List Nat) (page : Nat) (entries : List Nat) (blocks : List (List Nat)) : List Nat :=
+      match rest with
+      | Nil => pe_join (reverse (List Nat) (Cons (List Nat) (pe_relocation_block page entries) blocks))
+      | Cons rva tail =>
+        let offset : Nat := pe_page_offset rva in
+        let next_page : Nat := sub rva offset in
+        let entry : Nat := add (mul 160 256) offset in
+        match eq_nat page next_page with
+        | True => go tail page (Cons Nat entry entries) blocks
+        | False => go tail next_page ([entry] : List Nat)
+            (Cons (List Nat) (pe_relocation_block page entries) blocks)
+        end
+      end) addresses 0 ([] : List Nat) ([] : List (List Nat));
+
+def pe_build_relocations (sections : List PePlacedSection) (patches : List PePatch) : Either PeError (List Nat) :=
+    mapRight PeError (List Nat) (List Nat) pe_encode_relocations (pe_relocation_addresses sections patches);

@@ -1,0 +1,183 @@
+-- These pre-extraction bodies retain the order of every typed operation.
+import "native_mir_phase_fixtures.ouro";
+import "native_gc_fixtures.ouro";
+
+def mir_callback_flow_reference (fuel : Nat) (entry : Nat) (args : List Nat) (locals : List Nat)
+    (blocks : List MirBlock) : Either MirError Unit :=
+    match mir_reachable fuel entry blocks with | Left err => Left MirError Unit err | Right _ =>
+      match mir_flow_facts_with mir_predecessor_declared fuel entry args locals blocks with
+      | Left err => Left MirError Unit err
+      | Right facts => mir_each MirBlock (mir_check_block_uses facts) blocks end end;
+
+def mir_callback_function_reference (program : MirProgram) (flow : Nat) (function : MirFunction) : Either MirError Unit :=
+    match function with | MirFunctionDef id name args remaining result entry blocks =>
+      let locals : List MirLocal := append MirLocal args remaining in
+      let ids : List Nat := map MirLocal Nat mir_local_id locals in
+      let block_ids : List Nat := map MirBlock Nat mir_block_id blocks in
+      match mir_checks ([mir_require (pe_name_valid name) (MirInvalidName id),
+        mir_unique (fun (key : Nat) => MirDuplicateLocal key) ids,
+        mir_unique (fun (key : Nat) => MirDuplicateBlock key) block_ids,
+        mir_require (mir_has entry block_ids) (MirUnknownBlock entry),
+        mir_each MirBlock (mir_check_block_types program locals id result block_ids) blocks]
+        : List (Either MirError Unit)) with
+      | Left err => Left MirError Unit err
+      | Right _ => mir_callback_flow_reference flow entry (map MirLocal Nat mir_local_id args) ids blocks end end;
+
+def mir_callback_program_reference (limits : MirLimits) (program : MirProgram) : Either MirError Unit :=
+    match mir_check_bounds limits program with | Left err => Left MirError Unit err | Right _ =>
+      match program with | MirProgramDef functions objects libraries _ => match limits with | MirLimitsWith _ _ flow =>
+        match mir_checks ([mir_unique (fun (id : Nat) => MirDuplicateSymbol id) (mir_global_ids program),
+          mir_each Nat (fun (id : Nat) => mir_require (ltb_nat id pe_max_rva) MirResourceExhausted) (mir_global_ids program),
+          mir_each MirData mir_check_data objects, mir_check_libraries libraries,
+          mir_check_entry program, mir_each MirFunction (mir_callback_function_reference program flow) functions]
+          : List (Either MirError Unit)) with
+        | Left err => Left MirError Unit err
+        | Right _ => Right MirError Unit MkUnit end end end end;
+
+def mir_callback_validate_reference (limits : MirLimits) (program : MirProgram) : Either MirError MirCheckedProgram :=
+    match mir_callback_program_reference limits program with | Left err => Left MirError MirCheckedProgram err | Right _ =>
+      match limits with | MirLimitsWith _ _ flow => match mir_gc_infer flow program with
+        | Left err => Left MirError MirCheckedProgram err
+        | Right bodies => match mir_gc_check program bodies with
+          | Left err => Left MirError MirCheckedProgram err
+          | Right _ => Right MirError MirCheckedProgram (MirChecked program) end end end end;
+
+def mir_callback_run_unit (work : Unit -> Either MirError Unit) : Either MirError Unit := work MkUnit;
+
+def mir_callback_flow (fuel : Nat) (entry : Nat) (args : List Nat) (locals : List Nat)
+    (blocks : List MirBlock) : Either MirError Unit :=
+    mir_check_declared_flow_with mir_callback_run_unit mir_predecessor_declared fuel entry args locals blocks;
+
+def mir_callback_function (program : MirProgram) (flow : Nat) (function : MirFunction) : Either MirError Unit :=
+    mir_check_function_with mir_callback_run_unit mir_callback_flow program flow function;
+
+def mir_callback_function_same (name : String) (flow : Nat) (program : MirProgram) : Test :=
+    match program with | MirProgramDef functions _ _ _ =>
+      assert_true name (all MirFunction (fun (function : MirFunction) =>
+        let expected : String := mir_phase_result_text (mir_callback_function_reference program flow function) in
+        andb (str_eq expected (mir_phase_result_text (mir_check_function program flow function)))
+          (str_eq expected (mir_phase_result_text (mir_callback_function program flow function)))) functions) end;
+
+def mir_callback_validate_text (result : Either MirError MirCheckedProgram) : String :=
+    match result with | Left error => mir_test_error_text error | Right _ => "accepted" end;
+
+def mir_callback_validate_same (name : String) (limits : MirLimits) (program : MirProgram) : Test :=
+    let expected : String := mir_callback_validate_text (mir_callback_validate_reference limits program) in
+    assert_true name (andb (str_eq expected (mir_callback_validate_text (mir_validate limits program)))
+      (str_eq expected (mir_callback_validate_text (mir_validate_with mir_callback_function limits program))));
+
+def mir_callback_validate_error (name : String) (expected : MirError) (limits : MirLimits) (program : MirProgram) : Test :=
+    assert_eq name (mir_callback_validate_text (mir_validate_with mir_phase_callback_accept limits program))
+      (mir_test_error_text expected);
+
+def mir_callback_unit_error (_ : Unit -> Either MirError Unit) : Either MirError Unit :=
+    Left MirError Unit (MirInvalidCall 99);
+
+def mir_callback_flow_error (fuel : Nat) (entry : Nat) (args : List Nat) (locals : List Nat)
+    (blocks : List MirBlock) : Either MirError Unit :=
+    Left MirError Unit (MirInvalidCall (add fuel (add entry (add (length Nat args)
+      (add (length Nat locals) (length MirBlock blocks))))));
+
+def mir_callback_predecessor_error (target : Nat) (_ : List MirBlockFact) (_ : List MirBlock) (_ : List Nat)
+    : Either MirError (List Nat) := Left MirError (List Nat) (MirUnknownBlock target);
+
+def mir_callback_foreign_forged : MirProgram :=
+    gc_test_program ([gc_test_body 1 ([gc_test_call MirNoGc 200] : List MirInstruction)] : List MirFunction) MirMayGc;
+
+def mir_callback_payload : Test :=
+    let program : MirProgram := gc_test_program
+      ([gc_test_body 1 ([gc_test_call MirMayGc 200] : List MirInstruction)] : List MirFunction) MirNoGc in
+    match mir_validate_with mir_callback_function mir_default_limits program with
+    | Left error => test_fail "Validation callback retains the original MayGc annotation" (mir_test_error_text error)
+    | Right checked => match checked with | MirChecked verified =>
+      match gc_test_effects verified with
+      | Nil => test_fail "Validation callback retains the original MayGc annotation" "missing instruction payload"
+      | Cons actual_gc rest => match rest with
+        | Nil => assert_true "Validation callback retains the original MayGc annotation" (notb actual_gc)
+        | Cons _ _ => test_fail "Validation callback retains the original MayGc annotation" "extra instruction payload" end end end end;
+
+def mir_callback_public_boundary : Test :=
+    match mir_validate_with mir_phase_callback_accept mir_default_limits mir_phase_two_bad with
+    | Left error => test_fail "A callback carrier cannot bypass public MIR validation" (mir_test_error_text error)
+    | Right checked => match checked with | MirChecked program =>
+      mir_test_bad "A callback carrier cannot bypass public MIR validation" (MirUnknownBlock 71) program end end;
+
+def mir_callback_capture_function : MirFunction :=
+    MirFunctionDef 4 ([102] : List Nat) ([] : List MirLocal)
+      ([MirLocalDef 1 MirU32, MirLocalDef 2 MirU8] : List MirLocal) mir_fixture_void 7
+      ([MirBlockDef 7 ([] : List MirInstruction) MirTrap] : List MirBlock);
+
+def mir_callback_bad_name_function : MirFunction :=
+    MirFunctionDef 4 ([] : List Nat) ([] : List MirLocal) ([] : List MirLocal) mir_fixture_void 0
+      ([MirBlockDef 0 ([] : List MirInstruction) MirTrap] : List MirBlock);
+
+def mir_callback_duplicate_function : MirFunction :=
+    MirFunctionDef 4 ([102] : List Nat) ([] : List MirLocal)
+      ([MirLocalDef 7 MirU32, MirLocalDef 7 MirU8] : List MirLocal) mir_fixture_void 0
+      ([MirBlockDef 0 ([] : List MirInstruction) MirTrap] : List MirBlock);
+
+def mir_callback_unknown_entry_function : MirFunction :=
+    MirFunctionDef 4 ([102] : List Nat) ([] : List MirLocal) ([] : List MirLocal) mir_fixture_void 9
+      ([MirBlockDef 0 ([] : List MirInstruction) MirTrap] : List MirBlock);
+
+def native_mir_callback_tests : List Test :=
+    [mir_callback_function_same "Function callbacks preserve control" 64 mir_fixture_control,
+      mir_callback_function_same "Function callbacks preserve arithmetic" 64 mir_fixture_arithmetic,
+      mir_callback_function_same "Function callbacks preserve memory" 64 mir_fixture_memory,
+      mir_callback_function_same "Function callbacks preserve call signatures" 64 mir_fixture_calls,
+      mir_callback_function_same "Function callbacks preserve large local namespaces" 64 mir_fixture_large,
+      mir_callback_function_same "Function callbacks preserve imported IO" 64 mir_fixture_stdout,
+      mir_callback_function_same "Function callbacks preserve missing predecessor errors" 64 (mir_test_diamond False),
+      mir_callback_function_same "Function callbacks preserve reversed flow errors" 64 (mir_test_reverse_blocks (mir_test_diamond False)),
+      mir_callback_function_same "Function callbacks preserve invalid operand errors" 64 (mir_test_one (MirMove 10 (MirUse 99))),
+      mir_callback_function_same "Function callbacks preserve zero flow fuel" 0 mir_fixture_control,
+      mir_callback_validate_same "Validation callbacks preserve control" mir_default_limits mir_fixture_control,
+      mir_callback_validate_same "Validation callbacks preserve memory" mir_default_limits mir_fixture_memory,
+      mir_callback_validate_same "Validation callbacks preserve call signatures" mir_default_limits mir_fixture_calls,
+      mir_callback_validate_same "Validation callbacks preserve a closed recursive effect graph" mir_default_limits (gc_test_cycle ([] : List MirInstruction)),
+      mir_callback_validate_same "Validation callbacks preserve managed allocation" mir_default_limits (gc_test_heap ([gc_test_allocate] : List MirInstruction) ([] : List MirInstruction) ([] : List MirInstruction) ([] : List MirFunction) MirMayGc),
+      mir_callback_validate_same "Validation callbacks preserve forged NoGc rejection" mir_default_limits mir_callback_foreign_forged,
+      mir_callback_validate_same "Validation callbacks preserve zero flow fuel" (MirLimitsWith 1000 1000 0) mir_fixture_control,
+      mir_callback_validate_same "Validation callbacks preserve GC inference fuel exhaustion" (MirLimitsWith 1000 1000 1) (gc_test_chain MirMayGc ([gc_test_call MirMayGc 200] : List MirInstruction) MirMayGc),
+      mir_callback_validate_error "Validation callback cannot skip zero node bound" MirResourceExhausted (MirLimitsWith 0 1000 1000) mir_phase_two_bad,
+      mir_callback_validate_error "Validation callback cannot skip node hard ceiling" MirResourceExhausted (MirLimitsWith (S mir_limit_node_ceiling) 1000 1000) mir_phase_two_bad,
+      mir_callback_validate_error "Validation callback cannot skip byte hard ceiling" MirResourceExhausted (MirLimitsWith 1000 (S mir_limit_byte_ceiling) 1000) mir_phase_two_bad,
+      mir_callback_validate_error "Validation callback cannot skip flow hard ceiling" MirResourceExhausted (MirLimitsWith 1000 1000 (S mir_limit_flow_ceiling)) mir_phase_two_bad,
+      mir_callback_validate_error "Validation callback cannot skip duplicate symbol priority" (MirDuplicateSymbol 1) mir_default_limits (MirProgramDef ([mir_phase_bad_function 1 71] : List MirFunction) ([MirDataDef 1 False ([] : List Nat)] : List MirData) ([] : List MirLibrary) 999),
+      mir_callback_validate_error "Validation callback cannot skip data error priority" (MirInvalidData 91) mir_default_limits (MirProgramDef ([mir_phase_bad_function 1 71] : List MirFunction) ([MirDataDef 91 False ([] : List Nat)] : List MirData) ([] : List MirLibrary) 999),
+      mir_callback_validate_error "Validation callback cannot skip library error priority" (MirInvalidName 0) mir_default_limits (MirProgramDef ([mir_phase_bad_function 1 71] : List MirFunction) ([] : List MirData) ([MirLibraryDef ([] : List Nat) ([] : List MirExtern)] : List MirLibrary) 999),
+      mir_callback_validate_error "Validation callback cannot skip entry error priority" (MirInvalidEntry 999) mir_default_limits (mir_phase_functions ([mir_phase_bad_function 1 71] : List MirFunction) 999),
+      mir_callback_validate_error "Validation callback cannot skip GC call checking after callback success" (MirGcCallMismatch 1 200) mir_default_limits mir_callback_foreign_forged,
+      mir_callback_validate_error "Validation callback cannot skip allocator effect checking after callback success" (MirGcUnsafeRuntime 10) mir_default_limits (gc_test_heap ([gc_test_allocate] : List MirInstruction) ([gc_test_call MirMayGc 200] : List MirInstruction) ([] : List MirInstruction) ([] : List MirFunction) MirMayGc),
+      mir_phase_expect "Function callback preserves name error priority" (MirInvalidName 4)
+        (mir_check_function_with mir_callback_unit_error mir_callback_flow_error
+          (mir_phase_functions ([mir_callback_bad_name_function] : List MirFunction) 4) 64 mir_callback_bad_name_function),
+      mir_phase_expect "Function callback preserves duplicate local priority" (MirDuplicateLocal 7)
+        (mir_check_function_with mir_callback_unit_error mir_callback_flow_error
+          (mir_phase_functions ([mir_callback_duplicate_function] : List MirFunction) 4) 64 mir_callback_duplicate_function),
+      mir_phase_expect "Function callback preserves entry error priority" (MirUnknownBlock 9)
+        (mir_check_function_with mir_callback_unit_error mir_callback_flow_error
+          (mir_phase_functions ([mir_callback_unknown_entry_function] : List MirFunction) 4) 64 mir_callback_unknown_entry_function),
+      mir_phase_expect "Function callback returns the exact type phase error" (MirInvalidCall 99)
+        (mir_check_function_with mir_callback_unit_error mir_callback_flow_error
+          (mir_phase_functions ([mir_callback_capture_function] : List MirFunction) 4) 5 mir_callback_capture_function),
+      mir_phase_expect "Flow callback receives fuel entry arguments locals and blocks" (MirInvalidCall 15)
+        (mir_check_function_with mir_callback_run_unit mir_callback_flow_error
+          (mir_phase_functions ([mir_callback_capture_function] : List MirFunction) 4) 5 mir_callback_capture_function),
+      mir_phase_expect "Declared flow retains reachability before predecessor errors" (MirUnreachableBlock 1)
+        (mir_check_declared_flow_with mir_callback_run_unit mir_callback_predecessor_error 8 0 ([] : List Nat) ([] : List Nat)
+          ([MirBlockDef 0 ([] : List MirInstruction) MirTrap, MirBlockDef 1 ([] : List MirInstruction) MirTrap] : List MirBlock)),
+      mir_phase_expect "Declared flow returns the exact predecessor error" (MirUnknownBlock 1)
+        (mir_check_declared_flow_with mir_callback_run_unit mir_callback_predecessor_error 8 0 ([] : List Nat) ([] : List Nat)
+          ([MirBlockDef 0 ([] : List MirInstruction) (MirJump 1), MirBlockDef 1 ([] : List MirInstruction) MirTrap] : List MirBlock)),
+      mir_phase_expect "Declared flow returns the exact reachability phase error" (MirInvalidCall 99)
+        (mir_check_declared_flow_with mir_callback_unit_error mir_predecessor_declared 8 0 ([] : List Nat) ([] : List Nat)
+          ([MirBlockDef 0 ([] : List MirInstruction) MirTrap] : List MirBlock)),
+      assert_eq "Validation preserves the first function callback failure"
+        (mir_callback_validate_text (mir_validate_with mir_phase_callback_error (MirLimitsWith 1000 1000 7)
+          (mir_phase_functions ([mir_phase_good_function 4, mir_phase_good_function 5] : List MirFunction) 5))) "call:16",
+      mir_callback_payload,
+      mir_callback_public_boundary];
+
+-- @entry main
+def main : IO Unit := test_run native_mir_callback_tests

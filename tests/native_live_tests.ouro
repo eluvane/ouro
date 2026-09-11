@@ -1,0 +1,62 @@
+import "native_live_summary_tests.ouro";
+
+def live_tests : List Test := [
+    assert_true "Liveness includes managed args and locals only" (mir_set_equal
+      (mir_live_roots (MirFunctionDef 1 [108] [MirLocalDef 0 MirManagedPtr, MirLocalDef 1 MirRawPtr]
+        [MirLocalDef 2 MirUSize, MirLocalDef 3 MirManagedPtr] (Nothing MirType) 0 [])) [0,3]),
+    live_test_instruction "Move kills old destination and retains its input" (MirMove 0 (MirUse 1)) [0,2] [1,2],
+    live_test_instruction "Self move retains the old destination read" (MirMove 0 (MirUse 0)) [0] [0],
+    live_test_instruction "Managed allocation kills a reused destination before collection"
+      (MirManagedAlloc 0 100 101 102 (MirUse 10)) [0,1] [1],
+    live_test_instruction "MayGc call preserves a reused destination when passed as an operand"
+      (MirCall MirMayGc (Just Nat 0) (MirDirect 20) [MirUse 0, MirUse 2]) [0,1] [0,1,2],
+    live_test_instruction "MayGc result becomes live only after the call"
+      (MirCall MirMayGc (Just Nat 0) (MirDirect 20) [MirUse 2]) [0,1] [1,2],
+    live_test_instruction "Indirect call retains every managed environment and argument"
+      (MirCall MirMayGc (Just Nat 0) (MirIndirect
+        (MirSignatureOf [MirManagedPtr,MirManagedPtr,MirManagedPtr] (Just MirType MirManagedPtr)) (MirUse 10))
+        [MirUse 1,MirUse 2,MirUse 3]) [0,4] [1,2,3,4],
+    live_test_instruction "Indirect callee operands cannot be lost by the transfer"
+      (MirCall MirMayGc (Nothing Nat) (MirIndirect (MirSignatureOf [] (Nothing MirType)) (MirUse 0)) []) [] [0],
+    live_test_instruction "A load retains the managed owner while killing its destination"
+      (MirLoad 0 (MirUse 1) (codegen_disp 32)) [0,2] [1,2],
+    live_test_instruction "A store retains both managed owner and stored value"
+      (MirStore (MirUse 0) (codegen_disp 32) (MirUse 1)) [2] [0,1,2],
+    live_test_instruction "Managed pointer comparison retains both operands"
+      (MirCompare 10 MirEqual (MirUse 0) (MirUse 1)) [] [0,1],
+    live_test_instruction "Scalar operands do not become managed roots"
+      (MirBinaryOp 10 MirAdd (MirUse 11) (mir_fixture_nat MirU32 1)) [0] [0],
+    live_test_instruction "Null managed literals need no stack root"
+      (MirMove 0 (mir_fixture_nat MirManagedPtr 0)) [0,1] [1],
+    live_test_facts "Return values stay rooted" [MirBlockDef 0 [] (MirReturn (Just MirValue (MirUse 3)))] [MirFact 0 [3]],
+    live_test_facts "Trap has no successor roots" [MirBlockDef 0 [] MirTrap] [MirFact 0 []],
+    live_test_facts "Branch predecessor retains the union of both paths" live_test_branch live_test_branch_facts,
+    live_test_facts "Branch-specific roots survive reversed block order" (reverse MirBlock live_test_branch) live_test_branch_facts,
+    live_test_facts "A definition stops earlier liveness propagation" live_test_kill [MirFact 0 [], MirFact 1 [], MirFact 2 [0]],
+    live_test_facts "Liveness crosses several backedges within the structural fuel bound"
+      live_test_backedges live_test_backedge_facts,
+    live_test_facts "Several backedges remain correct after reversing block order"
+      (reverse MirBlock live_test_backedges) live_test_backedge_facts,
+    live_test_failure "Zero liveness budget is an exact resource error" 0 live_test_branch MirResourceExhausted,
+    live_test_failure "Unconfirmed backedge convergence is an exact resource error" 8 live_test_backedges MirResourceExhausted,
+    live_test_failure "Reordered backedges cannot hide exhausted convergence" 8
+      (reverse MirBlock live_test_backedges) MirResourceExhausted,
+    live_test_failure "An unknown successor is never treated as an empty root set" 4
+      [MirBlockDef 0 [] (MirJump 99)] (MirUnknownBlock 99),
+    live_test_sequence "Per-instruction live sets preserve self-overwrite and later reads"
+      [MirMove 0 (MirUse 1), MirCall MirMayGc (Just Nat 0) (MirDirect 20) [MirUse 0],
+        MirMove 2 (MirUse 0)] [2] [[1],[0],[0]],
+    live_test_sequence "An unused allocation result is absent from the next safepoint"
+      [MirManagedAlloc 0 100 101 102 (MirUse 10), MirManagedAlloc 1 100 101 102 (MirUse 10)] [] [[],[]],
+    assert_true "Managed allocation is a safepoint" (mir_live_safepoint (MirManagedAlloc 0 100 101 102 (MirUse 10))),
+    assert_true "Foreign or indirect MayGc calls are safepoints" (mir_live_safepoint (gc_test_indirect MirMayGc)),
+    assert_true "A verified NoGc call needs no root clearing" (notb (mir_live_safepoint (gc_test_call MirNoGc 20))),
+    assert_true "Ordinary managed moves are not safepoints" (notb (mir_live_safepoint (MirMove 0 (MirUse 1)))),
+    live_test_clears "Dead managed slots have exact zero-store bytes while raw and live slots are untouched" [2]
+      [184,0,0,0,0,72,137,68,36,32,72,137,68,36,56],
+    live_test_clears "All live roots produce no clear instructions" [0,2,3] [],
+    live_test_clears "A dead raw pointer slot never becomes a collector root" [0,2,3,1] [],
+    live_test_unknown_block_codegen];
+
+-- @entry main
+def main : IO Unit := test_run (append Test live_tests live_summary_tests);

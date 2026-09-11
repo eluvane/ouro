@@ -1,0 +1,702 @@
+-- Lowering builds kernel-facing surface terms; rewrite-only normalization stays in lower_rewrite to keep this cone small.
+
+-- @entry lower_expr
+-- @entry lower_expr_env
+-- @entry lower_expr_env2
+
+import "lower_env.ouro";
+
+def map_bodies : List (Pair Nat Surface) -> List Surface :=
+  fix map_bodies (xs : List (Pair Nat Surface)) : List Surface :=
+    match xs with
+    | Nil => Nil Surface
+    | Cons p xs' =>
+        match p with
+        | MkPair _ b => Cons Surface b (map_bodies xs')
+        end
+    end;
+
+def peel_branch_pack (env : LowerEnv) (vs : List Nat) : Pair (Maybe Nat) (List Nat) :=
+    match vs with
+    | Nil => MkPair (Maybe Nat) (List Nat) (Nothing Nat) (Nil Nat)
+    | Cons h t =>
+        match lookup_ctor h (env_ctors env) with
+        | Just _ =>
+            MkPair (Maybe Nat) (List Nat) (Just Nat h) t
+        | Nothing =>
+            MkPair (Maybe Nat) (List Nat) (Nothing Nat) vs
+        end
+    end;
+
+def map_arities_env (env : LowerEnv) : List (Pair Nat Surface) -> List Nat :=
+    fix go (xs : List (Pair Nat Surface)) : List Nat :=
+      match xs with
+      | Nil => Nil Nat
+      | Cons p xs' =>
+          match p with
+          | MkPair cid _ =>
+              match lookup_ctor cid (env_ctors env) with
+              | Just c => Cons Nat (ctor_arity c) (go xs')
+              | Nothing => Cons Nat cid (go xs')
+              end
+          end
+      end;
+
+def ind_from_branch_pairs (env : LowerEnv) (xs : List (Pair Nat Surface)) : Maybe (Pair Nat Nat) :=
+    match xs with
+    | Nil => Nothing (Pair Nat Nat)
+    | Cons p _ =>
+        match p with
+        | MkPair cid _ =>
+            match lookup_ctor cid (env_ctors env) with
+            | Just c =>
+                Just (Pair Nat Nat)
+                  (MkPair Nat Nat (ctor_indId c)
+                    (ctor_nparams c))
+            | Nothing => Nothing (Pair Nat Nat)
+            end
+        end
+    end;
+
+def from_maybe_expr (m : Maybe Expr) : Expr :=
+    match m with
+    | Nothing => ESort Z
+    | Just t => t
+    end;
+
+def hole_of_maybe (m : Maybe Nat) : Surface :=
+    match m with
+    | Nothing => hole0
+    | Just n => SHole n
+    end;
+
+def count_ctors_ind (indId : Nat) : List CtorInfo -> Nat :=
+    fix go (cs : List CtorInfo) : Nat :=
+      match cs with
+      | Nil => Z
+      | Cons c cs' =>
+          match eqNat (ctor_indId c) indId with
+          | True => S (go cs')
+          | False => go cs'
+          end
+      end;
+
+def arity_at (indId : Nat) (idx : Nat) : List CtorInfo -> Nat :=
+    fix go (cs : List CtorInfo) : Nat :=
+      match cs with
+      | Nil => Z
+      | Cons c cs' =>
+          match eqNat (ctor_indId c) indId with
+          | False => go cs'
+          | True =>
+              match eqNat (ctor_idx c) idx with
+              | True => ctor_arity c
+              | False => go cs'
+              end
+          end
+      end;
+
+def nparams_of_ind (indId : Nat) : List CtorInfo -> Nat :=
+    fix go (cs : List CtorInfo) : Nat :=
+      match cs with
+      | Nil => Z
+      | Cons c cs' =>
+          match eqNat (ctor_indId c) indId with
+          | True => ctor_nparams c
+          | False => go cs'
+          end
+      end;
+
+def find_body_for_ctor_idx (env : LowerEnv) (indId : Nat) (idx : Nat) : List (Pair Nat Surface) -> Surface :=
+    fix go (xs : List (Pair Nat Surface)) : Surface :=
+      match xs with
+      | Nil => hole0
+      | Cons p xs' =>
+          match p with
+          | MkPair cid b =>
+              match lookup_ctor cid (env_ctors env) with
+              | Just c =>
+                  match eqNat (ctor_indId c) indId with
+                  | False => go xs'
+                  | True =>
+                      match eqNat (ctor_idx c) idx with
+                      | True => b
+                      | False => go xs'
+                      end
+                  end
+              | Nothing => go xs'
+              end
+          end
+      end;
+
+-- Bodies in ctor-index order (OCaml elab).
+def bodies_in_ctor_order (env : LowerEnv) (indId : Nat) (pairs : List (Pair Nat Surface)) : List Surface :=
+    let n : Nat := count_ctors_ind indId (env_ctors env) in
+    (fix go (fuel : Nat) (idx : Nat) : List Surface :=
+        match fuel with
+        | Z => Nil Surface
+        | S fuel' =>
+            Cons Surface
+              (find_body_for_ctor_idx env indId idx pairs)
+              (go fuel' (S idx))
+        end) n Z;
+
+def arities_in_ctor_order (env : LowerEnv) (indId : Nat) : List Nat :=
+    let n : Nat := count_ctors_ind indId (env_ctors env) in
+    (fix go (fuel : Nat) (idx : Nat) : List Nat :=
+        match fuel with
+        | Z => Nil Nat
+        | S fuel' =>
+            Cons Nat (arity_at indId idx (env_ctors env)) (go fuel' (S idx))
+        end) n Z;
+
+def arities_match_at (indId : Nat) (ctors : List CtorInfo) : List Nat -> Nat -> Bool :=
+    fix go (ars : List Nat) (idx : Nat) : Bool :=
+      match ars with
+      | Nil => True
+      | Cons a ars' =>
+          match eqNat a (arity_at indId idx ctors) with
+          | False => False
+          | True => go ars' (S idx)
+          end
+      end;
+
+def arities_match_ind (indId : Nat) (brArs : List Nat) (ctors : List CtorInfo) : Bool :=
+    match eqNat (count_ctors_ind indId ctors) (length Nat brArs) with
+    | False => False
+    | True => arities_match_at indId ctors brArs Z
+    end;
+
+def find_matching_ind (brArs : List Nat) (ctors : List CtorInfo) : Maybe (Pair Nat Nat) :=
+    (fix go (cs : List CtorInfo) : Maybe (Pair Nat Nat) :=
+        match cs with
+        | Nil => Nothing (Pair Nat Nat)
+        | Cons c cs' =>
+            let iid : Nat := ctor_indId c in
+            match arities_match_ind iid brArs ctors with
+            | True =>
+                Just (Pair Nat Nat)
+                  (MkPair Nat Nat iid (nparams_of_ind iid ctors))
+            | False => go cs'
+            end
+        end) ctors;
+
+def nat_constructs_env (env : LowerEnv) : Pair Surface Surface :=
+    let natArs : List Nat := ([Z, S Z] : List Nat) in
+    match find_matching_ind natArs (env_ctors env) with
+    | Just p =>
+        match p with
+        | MkPair iid np =>
+            MkPair Surface Surface
+              (SConstruct iid Z np)
+              (SConstruct iid (S Z) np)
+        end
+    | Nothing => MkPair Surface Surface nat_Z nat_S
+    end;
+
+def lower_nat_env (env : LowerEnv) (n0 : Nat) : Surface :=
+    match nat_constructs_env env with
+    | MkPair zSurf sSurf =>
+        (fix go (n : Nat) : Surface :=
+            match n with
+            | Z => zSurf
+            | S n' => SApp sSurf (go n')
+            end) n0
+    end;
+
+def case_ind_nparams (env : LowerEnv) (brArs : List Nat) : Pair Nat Nat :=
+    match find_matching_ind brArs (env_ctors env) with
+    | Just p => p
+    | Nothing => MkPair Nat Nat Z Z
+    end;
+
+-- Prefer scrut local type (arity table alone confuses InternState vs Pair).
+def case_ind_nparams_for (env : LowerEnv) (scrut : Expr) (locals : List (Pair Nat Surface)) (brArs : List Nat) : Pair Nat Nat :=
+    match scrut with
+    | EVar n =>
+        match lookup_local n locals with
+        | Just ty =>
+            match peel_ind_apps ty with
+            | Just ip =>
+                match ip with
+                | MkPair iid _ps =>
+                    MkPair Nat Nat iid
+                      (nparams_of_ind iid (env_ctors env))
+                end
+            | Nothing => case_ind_nparams env brArs
+            end
+        | Nothing => case_ind_nparams env brArs
+        end
+    | EHole _ => case_ind_nparams env brArs
+    | ESort _ => case_ind_nparams env brArs
+    | ENat _ => case_ind_nparams env brArs
+    | EStr _ => case_ind_nparams env brArs
+    | EApp _ _ => case_ind_nparams env brArs
+    | ELam _ _ _ => case_ind_nparams env brArs
+    | EPi _ _ _ => case_ind_nparams env brArs
+    | ELet _ _ _ _ => case_ind_nparams env brArs
+    | EAscribe _ _ => case_ind_nparams env brArs
+    | EMatch _ _ => case_ind_nparams env brArs
+    | EFix _ _ _ _ => case_ind_nparams env brArs
+    | EEffectRow _ _ => case_ind_nparams env brArs
+    | EPerform _ _ => case_ind_nparams env brArs
+    | EDo _ => case_ind_nparams env brArs
+    | EDoBind _ _ => case_ind_nparams env brArs
+    | EList _ => case_ind_nparams env brArs
+    | EHandle _ _ => case_ind_nparams env brArs
+    | EBranch _ _ _ => case_ind_nparams env brArs
+    | ENoBranch => case_ind_nparams env brArs
+    | EBinder _ _ _ => case_ind_nparams env brArs
+    | ENoBinder => case_ind_nparams env brArs
+    | EMultiMatch _ _ => case_ind_nparams env brArs
+    end;
+
+inductive LowerMode : Type :=
+  | LExpr : Expr -> LowerMode
+  | LBranch : List Surface -> Surface -> Expr -> LowerMode
+  | LBinders : Expr -> LowerMode
+  | LArgs : List Expr -> LowerMode;
+
+inductive LowerVal : Type :=
+  | VSurf : Surface -> LowerVal
+  | VBranchPairs : List (Pair Nat Surface) -> LowerVal
+  | VBinderPairs : List (Pair Nat Surface) -> LowerVal
+  | VSurfList : List Surface -> LowerVal;
+
+def vsurf_or_hole (v : LowerVal) : Surface :=
+    match v with
+    | VSurf s => s
+    | VBranchPairs _ => hole0
+    | VBinderPairs _ => hole0
+    | VSurfList _ => hole0
+    end;
+
+def vbranches_or_nil (v : LowerVal) : List (Pair Nat Surface) :=
+    match v with
+    | VSurf _ => Nil (Pair Nat Surface)
+    | VBranchPairs ps => ps
+    | VBinderPairs _ => Nil (Pair Nat Surface)
+    | VSurfList _ => Nil (Pair Nat Surface)
+    end;
+
+def vbinders_or_nil (v : LowerVal) : List (Pair Nat Surface) :=
+    match v with
+    | VSurf _ => Nil (Pair Nat Surface)
+    | VBranchPairs _ => Nil (Pair Nat Surface)
+    | VBinderPairs ps => ps
+    | VSurfList _ => Nil (Pair Nat Surface)
+    end;
+
+def vlist_or_nil (v : LowerVal) : List Surface :=
+    match v with
+    | VSurf _ => Nil Surface
+    | VBranchPairs _ => Nil Surface
+    | VBinderPairs _ => Nil Surface
+    | VSurfList xs => xs
+    end;
+
+-- Local binders and fix-self names force SVar before global lookup.
+def resolve_var_fix
+    (env : LowerEnv)
+    (fixSelf : Maybe Nat)
+    (locals : List (Pair Nat Surface))
+    (nameId : Nat) : Surface :=
+    match lookup_local nameId locals with
+    | Just _ => SVar nameId
+    | Nothing =>
+        match fixSelf with
+        | Just fn =>
+            match eqNat fn nameId with
+            | True => SVar nameId
+            | False => resolve_var env nameId
+            end
+        | Nothing => resolve_var env nameId
+        end
+    end;
+
+def ret_or_ind (er : Maybe Surface) (indId : Nat) : Surface :=
+    match er with
+    | Just r => r
+    | Nothing => SInd indId
+    end;
+
+-- An application's expected result belongs after one more function binder.
+-- The synthetic domain is a lowering hint only; lambda annotations and
+-- application arguments are still checked against the actual inferred type.
+def applied_lambda : Expr -> Bool :=
+  fix applied_lambda (expr : Expr) : Bool :=
+    match expr with
+    | ELam _ _ _ => True
+    | EApp head _ => applied_lambda head
+    | EVar _ => False
+    | EHole _ => False
+    | ESort _ => False
+    | ENat _ => False
+    | EStr _ => False
+    | EPi _ _ _ => False
+    | ELet _ _ _ _ => False
+    | EAscribe _ _ => False
+    | EMatch _ _ => False
+    | EFix _ _ _ _ => False
+    | EEffectRow _ _ => False
+    | EPerform _ _ => False
+    | EDo _ => False
+    | EDoBind _ _ => False
+    | EList _ => False
+    | EHandle _ _ => False
+    | EBranch _ _ _ => False
+    | ENoBranch => False
+    | EBinder _ _ _ => False
+    | ENoBinder => False
+    | EMultiMatch _ _ => False
+    end;
+
+def app_function_expected (function : Expr) (er : Maybe Surface) : Maybe Surface :=
+    match applied_lambda function with
+    | False => er
+    | True =>
+        match er with
+        | Nothing => Nothing Surface
+        | Just result => Just Surface (SPi Z (SInd Z) result)
+        end
+    end;
+
+-- Peel one Pi off expectedRet under matching Lam.
+def peel_er_lam (er : Maybe Surface) : Maybe Surface :=
+    match er with
+    | Nothing => Nothing Surface
+    | Just r =>
+        match r with
+        | SPi _ _ cod => Just Surface cod
+        | SVar _ => Nothing Surface
+        | SSort _ => Nothing Surface
+        | SLam _ _ _ => Nothing Surface
+        | SApp _ _ => Nothing Surface
+        | SLet _ _ _ _ => Nothing Surface
+        | SConst _ => Nothing Surface
+        | SInd _ => Nothing Surface
+        | SConstruct _ _ _ => Nothing Surface
+        | SCase _ _ _ _ => Nothing Surface
+        | SFix _ _ _ _ _ => Nothing Surface
+        | SHole _ => Nothing Surface
+        | SEffectRow _ => Nothing Surface
+        | SPerform _ _ => Nothing Surface
+        | SStr _ _ => Nothing Surface
+        end
+    end;
+
+def match_family_params (indId : Nat) (scrut : Expr) (locals : List (Pair Nat Surface)) : Pair (List Surface) Surface :=
+    match scrut with
+    | EVar n =>
+        match lookup_local n locals with
+        | Just ty =>
+            match peel_ind_apps ty with
+            | Just ip =>
+                match ip with
+                | MkPair iid ps =>
+                    match eqNat iid indId with
+                    | True =>
+                        MkPair (List Surface) Surface ps (apply_params indId ps)
+                    | False =>
+                        MkPair (List Surface) Surface (Nil Surface) (SInd indId)
+                    end
+                end
+            | Nothing =>
+                MkPair (List Surface) Surface (Nil Surface) (SInd indId)
+            end
+        | Nothing =>
+            MkPair (List Surface) Surface (Nil Surface) (SInd indId)
+        end
+    | EHole _ => MkPair (List Surface) Surface (Nil Surface) (SInd indId)
+    | ESort _ => MkPair (List Surface) Surface (Nil Surface) (SInd indId)
+    | ENat _ => MkPair (List Surface) Surface (Nil Surface) (SInd indId)
+    | EApp _ _ => MkPair (List Surface) Surface (Nil Surface) (SInd indId)
+    | ELam _ _ _ => MkPair (List Surface) Surface (Nil Surface) (SInd indId)
+    | EPi _ _ _ => MkPair (List Surface) Surface (Nil Surface) (SInd indId)
+    | ELet _ _ _ _ => MkPair (List Surface) Surface (Nil Surface) (SInd indId)
+    | EAscribe _ _ => MkPair (List Surface) Surface (Nil Surface) (SInd indId)
+    | EMatch _ _ => MkPair (List Surface) Surface (Nil Surface) (SInd indId)
+    | EFix _ _ _ _ => MkPair (List Surface) Surface (Nil Surface) (SInd indId)
+    | EEffectRow _ _ => MkPair (List Surface) Surface (Nil Surface) (SInd indId)
+    | EPerform _ _ => MkPair (List Surface) Surface (Nil Surface) (SInd indId)
+    | EDo _ => MkPair (List Surface) Surface (Nil Surface) (SInd indId)
+    | EDoBind _ _ => MkPair (List Surface) Surface (Nil Surface) (SInd indId)
+    | EList _ => MkPair (List Surface) Surface (Nil Surface) (SInd indId)
+    | EHandle _ _ => MkPair (List Surface) Surface (Nil Surface) (SInd indId)
+    | EBranch _ _ _ => MkPair (List Surface) Surface (Nil Surface) (SInd indId)
+    | ENoBranch => MkPair (List Surface) Surface (Nil Surface) (SInd indId)
+    | EBinder _ _ _ => MkPair (List Surface) Surface (Nil Surface) (SInd indId)
+    | ENoBinder => MkPair (List Surface) Surface (Nil Surface) (SInd indId)
+    | EMultiMatch _ _ => MkPair (List Surface) Surface (Nil Surface) (SInd indId)
+    | EStr _ => MkPair (List Surface) Surface (Nil Surface) (SInd indId)
+    end;
+
+-- Views collapse non-node ctors to one terminator (shallow lower_run).
+inductive ExprView : Type :=
+  | XVVar : Nat -> ExprView
+  | XVHole : Maybe Nat -> ExprView
+  | XVSort : Nat -> ExprView
+  | XVNat : Nat -> ExprView
+  | XVStr : Nat -> ExprView
+  | XVApp : Expr -> Expr -> ExprView
+  | XVLam : Nat -> Maybe Expr -> Expr -> ExprView
+  | XVPi : Nat -> Expr -> Expr -> ExprView
+  | XVLet : Nat -> Maybe Expr -> Expr -> Expr -> ExprView
+  | XVAscribe : Expr -> Expr -> ExprView
+  | XVMatch : Expr -> Expr -> ExprView
+  | XVFix : Nat -> Expr -> Expr -> Expr -> ExprView
+  | XVEffectRow : Expr -> List Nat -> ExprView
+  | XVPerform : Nat -> List Expr -> ExprView
+  | XVDo : List Expr -> ExprView
+  | XVList : List Expr -> ExprView
+  | XVHandle : Expr -> List (Pair Nat (Pair (List Nat) Expr)) -> ExprView
+  | XVUnsupported : ExprView;
+
+def view_expr (e : Expr) : ExprView :=
+    match e with
+    | EVar n => XVVar n
+    | EHole m => XVHole m
+    | ESort u => XVSort u
+    | ENat n => XVNat n
+    | EStr n => XVStr n
+    | EApp f a => XVApp f a
+    | ELam name ann body => XVLam name ann body
+    | EPi name dom cod => XVPi name dom cod
+    | ELet name ann val body => XVLet name ann val body
+    | EAscribe tm ty => XVAscribe tm ty
+    | EMatch scrut branches => XVMatch scrut branches
+    | EFix name binders ret body => XVFix name binders ret body
+    | EEffectRow ty ops => XVEffectRow ty ops
+    | EPerform op args => XVPerform op args
+    | EDo es => XVDo es
+    | EList es => XVList es
+    | EHandle comp clauses => XVHandle comp clauses
+    | EDoBind _ _ => XVUnsupported
+    | EBranch _ _ _ => XVUnsupported
+    | ENoBranch => XVUnsupported
+    | EBinder _ _ _ => XVUnsupported
+    | ENoBinder => XVUnsupported
+    | EMultiMatch _ _ => XVUnsupported
+    end;
+
+inductive BranchView : Type :=
+  | BranchNode : List Nat -> Expr -> Expr -> BranchView
+  | BranchEnd : BranchView;
+
+def view_branch (e : Expr) : BranchView :=
+    match e with
+    | EBranch packed body rest => BranchNode packed body rest
+    | ENoBranch => BranchEnd
+    | EVar _ => BranchEnd
+    | EHole _ => BranchEnd
+    | ESort _ => BranchEnd
+    | ENat _ => BranchEnd
+    | EStr _ => BranchEnd
+    | EApp _ _ => BranchEnd
+    | ELam _ _ _ => BranchEnd
+    | EPi _ _ _ => BranchEnd
+    | ELet _ _ _ _ => BranchEnd
+    | EAscribe _ _ => BranchEnd
+    | EMatch _ _ => BranchEnd
+    | EFix _ _ _ _ => BranchEnd
+    | EEffectRow _ _ => BranchEnd
+    | EPerform _ _ => BranchEnd
+    | EDo _ => BranchEnd
+    | EDoBind _ _ => BranchEnd
+    | EList _ => BranchEnd
+    | EHandle _ _ => BranchEnd
+    | EBinder _ _ _ => BranchEnd
+    | ENoBinder => BranchEnd
+    | EMultiMatch _ _ => BranchEnd
+    end;
+
+inductive BinderView : Type :=
+  | BinderNode : Nat -> Expr -> Expr -> BinderView
+  | BinderEnd : BinderView;
+
+def view_binder (e : Expr) : BinderView :=
+    match e with
+    | EBinder id ty rest => BinderNode id ty rest
+    | ENoBinder => BinderEnd
+    | EVar _ => BinderEnd
+    | EHole _ => BinderEnd
+    | ESort _ => BinderEnd
+    | ENat _ => BinderEnd
+    | EStr _ => BinderEnd
+    | EApp _ _ => BinderEnd
+    | ELam _ _ _ => BinderEnd
+    | EPi _ _ _ => BinderEnd
+    | ELet _ _ _ _ => BinderEnd
+    | EAscribe _ _ => BinderEnd
+    | EMatch _ _ => BinderEnd
+    | EFix _ _ _ _ => BinderEnd
+    | EEffectRow _ _ => BinderEnd
+    | EPerform _ _ => BinderEnd
+    | EDo _ => BinderEnd
+    | EDoBind _ _ => BinderEnd
+    | EList _ => BinderEnd
+    | EHandle _ _ => BinderEnd
+    | EBranch _ _ _ => BinderEnd
+    | ENoBranch => BinderEnd
+    | EMultiMatch _ _ => BinderEnd
+    end;
+
+def empty_lower (mode : LowerMode) : LowerVal :=
+    match mode with
+    | LExpr _ => VSurf hole0
+    | LBranch _ _ _ => VBranchPairs (Nil (Pair Nat Surface))
+    | LBinders _ => VBinderPairs (Nil (Pair Nat Surface))
+    | LArgs _ => VSurfList (Nil Surface)
+    end;
+
+-- Keys only (no body lower — avoids exponential nested-case walk).
+def scan_branch_keys (env : LowerEnv) : Expr -> List (Pair Nat Surface) :=
+    fix scan_branch_keys (branches : Expr) : List (Pair Nat Surface) :=
+      match branches with
+      | EBranch packed _body rest =>
+          match peel_branch_pack env packed with
+          | MkPair ctorOpt pvars =>
+              let key : Nat :=
+                match ctorOpt with
+                | Just cid => cid
+                | Nothing => length Nat pvars
+                end in
+              Cons (Pair Nat Surface)
+                (MkPair Nat Surface key (SInd Z))
+                (scan_branch_keys rest)
+          end
+      | ENoBranch => Nil (Pair Nat Surface)
+      | EVar _ => Nil (Pair Nat Surface)
+      | EHole _ => Nil (Pair Nat Surface)
+      | ESort _ => Nil (Pair Nat Surface)
+      | ENat _ => Nil (Pair Nat Surface)
+      | EStr _ => Nil (Pair Nat Surface)
+      | EApp _ _ => Nil (Pair Nat Surface)
+      | ELam _ _ _ => Nil (Pair Nat Surface)
+      | EPi _ _ _ => Nil (Pair Nat Surface)
+      | ELet _ _ _ _ => Nil (Pair Nat Surface)
+      | EAscribe _ _ => Nil (Pair Nat Surface)
+      | EMatch _ _ => Nil (Pair Nat Surface)
+      | EFix _ _ _ _ => Nil (Pair Nat Surface)
+      | EEffectRow _ _ => Nil (Pair Nat Surface)
+      | EPerform _ _ => Nil (Pair Nat Surface)
+      | EDo _ => Nil (Pair Nat Surface)
+      | EDoBind _ _ => Nil (Pair Nat Surface)
+      | EList _ => Nil (Pair Nat Surface)
+      | EHandle _ _ => Nil (Pair Nat Surface)
+      | EBinder _ _ _ => Nil (Pair Nat Surface)
+      | ENoBinder => Nil (Pair Nat Surface)
+      | EMultiMatch _ _ => Nil (Pair Nat Surface)
+      end;
+
+inductive MatchSetup : Type :=
+  | NoMatchSetup : MatchSetup
+  | ReadyMatch : Nat -> Nat -> List Surface -> Surface -> MatchSetup;
+
+def prepare_match (env : LowerEnv) (scrut : Expr) (locals : List (Pair Nat Surface)) (keys : List (Pair Nat Surface)) : MatchSetup :=
+    match keys with
+    | Nil =>
+        match scrut with
+        | EVar n =>
+            match lookup_local n locals with
+            | Nothing => NoMatchSetup
+            | Just ty =>
+                match peel_ind_apps ty with
+                | Nothing => NoMatchSetup
+                | Just ip =>
+                    match ip with
+                    | MkPair indId _params =>
+                        match match_family_params indId scrut locals with
+                        | MkPair params family =>
+                            ReadyMatch indId (nparams_of_ind indId (env_ctors env)) params family
+                        end
+                    end
+                end
+            end
+        | EHole _ => NoMatchSetup
+        | ESort _ => NoMatchSetup
+        | ENat _ => NoMatchSetup
+        | EStr _ => NoMatchSetup
+        | EApp _ _ => NoMatchSetup
+        | ELam _ _ _ => NoMatchSetup
+        | EPi _ _ _ => NoMatchSetup
+        | ELet _ _ _ _ => NoMatchSetup
+        | EAscribe _ _ => NoMatchSetup
+        | EMatch _ _ => NoMatchSetup
+        | EFix _ _ _ _ => NoMatchSetup
+        | EEffectRow _ _ => NoMatchSetup
+        | EPerform _ _ => NoMatchSetup
+        | EDo _ => NoMatchSetup
+        | EDoBind _ _ => NoMatchSetup
+        | EList _ => NoMatchSetup
+        | EHandle _ _ => NoMatchSetup
+        | EBranch _ _ _ => NoMatchSetup
+        | ENoBranch => NoMatchSetup
+        | EBinder _ _ _ => NoMatchSetup
+        | ENoBinder => NoMatchSetup
+        | EMultiMatch _ _ => NoMatchSetup
+        end
+    | Cons _ _ =>
+        let indNp : Pair Nat Nat :=
+          match ind_from_branch_pairs env keys with
+          | Just p => p
+          | Nothing => case_ind_nparams_for env scrut locals (surface_names keys)
+          end in
+        match indNp with
+        | MkPair indId nparams =>
+            match match_family_params indId scrut locals with
+            | MkPair params family => ReadyMatch indId nparams params family
+            end
+        end
+    end;
+
+def finish_match (env : LowerEnv) (expected : Maybe Surface) (scrut : Surface) (setup : MatchSetup) (pairs : List (Pair Nat Surface)) : Surface :=
+    match setup with
+    | NoMatchSetup => scrut
+    | ReadyMatch indId nparams params _family =>
+        let packed : Bool :=
+          match ind_from_branch_pairs env pairs with
+          | Just _ => True
+          | Nothing => False
+          end in
+        let bodies : List Surface :=
+          match packed with
+          | True => bodies_in_ctor_order env indId pairs
+          | False => map_bodies pairs
+          end in
+        let arities : List Nat :=
+          match packed with
+          | True => arities_in_ctor_order env indId
+          | False => map_arities_env env pairs
+          end in
+        let result : Surface := ret_or_ind expected indId in
+        SCase (MkCaseInfo indId nparams arities)
+          (mk_match_motive indId nparams params result) scrut bodies
+    end;
+
+def peel_do_bind (e : Expr) : Pair (Maybe Nat) Expr :=
+    match e with
+    | EDoBind n action => MkPair (Maybe Nat) Expr (Just Nat n) action
+    | EVar _ => MkPair (Maybe Nat) Expr (Nothing Nat) e
+    | EHole _ => MkPair (Maybe Nat) Expr (Nothing Nat) e
+    | ESort _ => MkPair (Maybe Nat) Expr (Nothing Nat) e
+    | ENat _ => MkPair (Maybe Nat) Expr (Nothing Nat) e
+    | EStr _ => MkPair (Maybe Nat) Expr (Nothing Nat) e
+    | EList _ => MkPair (Maybe Nat) Expr (Nothing Nat) e
+    | EApp _ _ => MkPair (Maybe Nat) Expr (Nothing Nat) e
+    | ELam _ _ _ => MkPair (Maybe Nat) Expr (Nothing Nat) e
+    | EPi _ _ _ => MkPair (Maybe Nat) Expr (Nothing Nat) e
+    | ELet _ _ _ _ => MkPair (Maybe Nat) Expr (Nothing Nat) e
+    | EAscribe _ _ => MkPair (Maybe Nat) Expr (Nothing Nat) e
+    | EMatch _ _ => MkPair (Maybe Nat) Expr (Nothing Nat) e
+    | EFix _ _ _ _ => MkPair (Maybe Nat) Expr (Nothing Nat) e
+    | EEffectRow _ _ => MkPair (Maybe Nat) Expr (Nothing Nat) e
+    | EPerform _ _ => MkPair (Maybe Nat) Expr (Nothing Nat) e
+    | EDo _ => MkPair (Maybe Nat) Expr (Nothing Nat) e
+    | EHandle _ _ => MkPair (Maybe Nat) Expr (Nothing Nat) e
+    | EBranch _ _ _ => MkPair (Maybe Nat) Expr (Nothing Nat) e
+    | ENoBranch => MkPair (Maybe Nat) Expr (Nothing Nat) e
+    | EBinder _ _ _ => MkPair (Maybe Nat) Expr (Nothing Nat) e
+    | ENoBinder => MkPair (Maybe Nat) Expr (Nothing Nat) e
+    | EMultiMatch _ _ => MkPair (Maybe Nat) Expr (Nothing Nat) e
+    end;

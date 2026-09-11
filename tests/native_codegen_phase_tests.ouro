@@ -1,0 +1,125 @@
+-- The retained whole-function preparation is a test oracle for exact output
+-- order. Production generation uses the same bounded continuation entry points.
+import "native_mir_fixtures.ouro";
+import "../std/test.ouro";
+import "native_call_site_words.ouro";
+
+def phase_reference_prepare (program : MirProgram) : Either NativeCodegenError CodegenPrepared :=
+    match program with | MirProgramDef functions objects libraries entry =>
+      match codegen_assemble codegen_probe_atoms 0 0 with
+      | Left err => Left NativeCodegenError CodegenPrepared err
+      | Right probe => match probe with | CodegenEncodedParts probe_bytes _ _ =>
+        let probe_id : Nat := S (foldr Nat Nat maxNat 0 (mir_global_ids program)) in
+        let probe_size : Nat := length Nat probe_bytes in
+        match codegen_functions program functions probe_size with
+        | Left err => Left NativeCodegenError CodegenPrepared err
+        | Right encoded => match encoded with | CodegenFunctionsOf bytes symbols fixups records frames =>
+          match codegen_data (append MirData objects (codegen_runtime_data program)) 0 0 with
+          | CodegenDataOf readonly_data writable_data data_symbols =>
+            let pe : PeProgram := PeProgramParts (append Nat probe_bytes bytes) readonly_data writable_data
+              (Cons PeSymbol (PeNamedSymbol probe_id PeText 0) (append PeSymbol symbols data_symbols))
+              (codegen_libraries libraries) fixups
+              (Cons PeFunction (PeCodeFunction probe_id probe_size
+                ([95, 111, 117, 114, 111, 95, 112, 114, 111, 98, 101] : List Nat) PeLeaf) records) entry in
+            Right NativeCodegenError CodegenPrepared (CodegenPreparedOf pe frames) end end end end end end;
+
+def phase_address_words (address : PeFunctionAddress) : List Nat :=
+    match address with | PeFunctionAt id start finish name => append Nat
+      ([id, start, finish, length Nat name] : List Nat) name end;
+
+def phase_root_words (root : NativeRootSlot) : List Nat :=
+    match root with | NativeRootAt id offset => [id, offset] end;
+
+def phase_frame_words (frame : NativeFrameInfo) : List Nat :=
+    match frame with | NativeFrameAt id allocation roots calls => append Nat
+      ([id, allocation, length NativeRootSlot roots, length NativeCallSite calls] : List Nat)
+      (append Nat (concat_map NativeRootSlot Nat phase_root_words roots)
+        (concat_map NativeCallSite Nat native_call_site_words calls)) end;
+
+def phase_image_equal (left : NativeImage) (right : NativeImage) : Bool :=
+    match left, right with | NativeImageOf left_pe left_frames, NativeImageOf right_pe right_frames =>
+      match left_pe, right_pe with | PeImageFile left_bytes left_addresses, PeImageFile right_bytes right_addresses =>
+        andb (pe_bytes_equal left_bytes right_bytes)
+          (andb (andb (eq_nat (length PeFunctionAddress left_addresses) (length PeFunctionAddress right_addresses))
+            (pe_bytes_equal (concat_map PeFunctionAddress Nat phase_address_words left_addresses)
+              (concat_map PeFunctionAddress Nat phase_address_words right_addresses)))
+            (andb (eq_nat (length NativeFrameInfo left_frames) (length NativeFrameInfo right_frames))
+              (pe_bytes_equal (concat_map NativeFrameInfo Nat phase_frame_words left_frames)
+                (concat_map NativeFrameInfo Nat phase_frame_words right_frames)))) end end;
+
+def phase_reference_image (program : MirProgram) : Either NativeCodegenError NativeImage :=
+    match phase_reference_prepare program with | Left error => Left NativeCodegenError NativeImage error
+    | Right prepared => codegen_write prepared end;
+
+def phase_same_image (name : String) (program : MirProgram) : Test :=
+    match phase_reference_image program with
+    | Left _ => test_fail name "retained preparation failed"
+    | Right expected => match codegen_checked program with
+      | Left _ => test_fail name "incremental preparation failed"
+      | Right actual => assert_true name (phase_image_equal actual expected) end end;
+
+def phase_pending_sizes (state : CodegenBuild) (remaining : Nat) (completed : Nat) : Bool :=
+    match state with | CodegenFinished _ => False
+    | CodegenPending _ pending _ outputs => andb (eq_nat (length MirFunction pending) remaining)
+        (eq_nat (length CodegenFunctions outputs) completed) end;
+
+def phase_one_step : Test :=
+    match mir_fixture_calls with | MirProgramDef functions _ _ _ =>
+      match codegen_prepare_begin mir_fixture_calls with
+      | Left _ => test_fail "One preparation step consumes exactly one complete function" "begin failed"
+      | Right first => match codegen_prepare_step mir_fixture_calls first with
+        | Left _ => test_fail "One preparation step consumes exactly one complete function" "step failed"
+        | Right second => assert_true "One preparation step consumes exactly one complete function"
+            (andb (phase_pending_sizes first (length MirFunction functions) 0)
+              (phase_pending_sizes second (sub (length MirFunction functions) 1) 1)) end end end;
+
+def phase_reject_short_driver : Test :=
+    match codegen_prepare_begin mir_fixture_calls with
+    | Left _ => test_fail "An incomplete preparation cannot return prepared code" "begin failed"
+    | Right first => match codegen_prepare_run mir_fixture_calls ([] : List MirFunction) first with
+      | Right _ => test_fail "An incomplete preparation cannot return prepared code" "partial code escaped"
+      | Left error => assert_true "An incomplete preparation cannot return prepared code"
+          (match error with | NativeCodeTooLarge => True | NativeMirError _ => False
+            | NativeEncodingError _ => False | NativePeError _ => False | NativeMissingSlot _ => False
+            | NativeMissingLabel _ => False end) end end;
+
+def phase_bad_function (id : Nat) (missing : Nat) : MirFunction :=
+    MirFunctionDef id ([98,97,100] : List Nat) ([] : List MirLocal) ([] : List MirLocal)
+      mir_fixture_void 0 ([MirBlockDef 0 ([] : List MirInstruction) (MirJump missing)] : List MirBlock);
+
+def phase_first_failure : Test :=
+    let program : MirProgram := MirProgramDef
+      ([phase_bad_function 1 71, phase_bad_function 2 72] : List MirFunction)
+      ([] : List MirData) ([] : List MirLibrary) 1 in
+    match codegen_prepare program with
+    | Right _ => test_fail "Preparation preserves the first function error" "invalid label accepted"
+    | Left error => assert_true "Preparation preserves the first function error"
+        (match error with | NativeMissingLabel id => eq_nat id 71 | NativeCodeTooLarge => False
+          | NativeMirError _ => False | NativeEncodingError _ => False | NativePeError _ => False
+          | NativeMissingSlot _ => False end) end;
+
+def phase_completed_step : Test :=
+    match codegen_prepare mir_fixture_control with
+    | Left _ => test_fail "Stepping completed preparation preserves its full image" "prepare failed"
+    | Right prepared => match codegen_prepare_step mir_fixture_control (CodegenFinished prepared) with
+      | Left _ => test_fail "Stepping completed preparation preserves its full image" "step failed"
+      | Right final => match final with
+        | CodegenPending _ _ _ _ => test_fail "Stepping completed preparation preserves its full image" "reopened preparation"
+        | CodegenFinished same => match codegen_write prepared, codegen_write same with
+          | Right before, Right after => assert_true "Stepping completed preparation preserves its full image"
+              (phase_image_equal before after)
+          | Left _, Left _ => test_fail "Stepping completed preparation preserves its full image" "write failed"
+          | Left _, Right _ => test_fail "Stepping completed preparation preserves its full image" "original write failed"
+          | Right _, Left _ => test_fail "Stepping completed preparation preserves its full image" "stepped write failed" end end end end;
+
+def native_codegen_phase_tests : List Test :=
+    [phase_same_image "Incremental control code retains every image byte" mir_fixture_control,
+      phase_same_image "Incremental arithmetic retains every image byte" mir_fixture_arithmetic,
+      phase_same_image "Incremental memory code retains every image byte" mir_fixture_memory,
+      phase_same_image "Incremental calls retain fixups, root slots and return PCs" mir_fixture_calls,
+      phase_same_image "Incremental stack probes retain image and unwind metadata" mir_fixture_large,
+      phase_same_image "Incremental imports retain exact PE tables" mir_fixture_stdout,
+      phase_one_step, phase_reject_short_driver, phase_first_failure, phase_completed_step];
+
+-- @entry main
+def main : IO Unit := test_run native_codegen_phase_tests

@@ -1,0 +1,132 @@
+-- Internal exact-base index built only after complete heap validation.
+-- Its zeroed table follows the unchanged eight-word header and N-word worklist.
+-- Word 3 bounds probing; words 6/7 are reused only between the two heap checks.
+import "managed_layout.ouro";
+
+-- Zero means the power-of-two capacity cannot be represented. The loop takes
+-- at most one iteration per USize bit, including for malformed huge counts.
+def managed_gc_index_capacity (count : USize) : Runtime USize :=
+    let zero : USize := usize_sub count count in
+    let one : USize := managed_one count in
+    let two : USize := usize_add one one in
+    match u8_from_nat 1 with | Nothing => runtime_pure USize zero | Just running =>
+      runtime_loop USize two
+        (fun (capacity : USize) => runtime_pure U8 (match raw_bool_and
+          (raw_bool_not (usize_equal capacity zero))
+          (usize_less (managed_shift_right capacity (raw_size_to_u32 one)) count) with
+          | True => running | False => u8_sub running running end))
+        (fun (capacity : USize) => runtime_pure USize (usize_add capacity capacity)) end;
+
+-- Check table load, both additions and the byte multiplication before any
+-- allocation or table access. Pending capacity remains exactly count.
+def managed_gc_index_bytes (count : USize) (capacity : USize) : USize :=
+    let zero : USize := usize_sub count count in
+    let one : USize := managed_one count in
+    let three : USize := usize_add (usize_add one one) one in
+    let start : USize := usize_add count (managed_word_offset one) in
+    let words : USize := usize_add start capacity in
+    let bytes : USize := managed_word_offset words in
+    match raw_bool_and (raw_bool_not (usize_equal capacity zero))
+      (raw_bool_and (usize_equal (usize_and capacity (usize_sub capacity one)) zero)
+        (raw_bool_and (raw_bool_not (usize_less (managed_shift_right capacity (raw_size_to_u32 one)) count))
+          (raw_bool_and (usize_less count start)
+            (raw_bool_and (usize_less start words)
+              (usize_equal (managed_shift_right bytes (raw_size_to_u32 three)) words))))) with
+    | True => bytes | False => zero end;
+
+def managed_gc_index_table (scratch : RawPtr U8) (count : USize) : Runtime (RawPtr U8) :=
+    raw_add U8 scratch (managed_word_offset (usize_add count (managed_word_offset (managed_one count))));
+
+-- Fold the entire USize, including the high address bits of page-aligned
+-- reservations. Keys and comparisons always retain the complete pointer bits.
+def managed_gc_index_hash (wanted : USize) : USize :=
+    let one : USize := managed_one wanted in
+    let two : USize := usize_add one one in
+    let four : USize := usize_add two two in
+    let upper : USize := usize_xor wanted (managed_shift_right wanted (raw_size_to_u32 (managed_word_offset four))) in
+    let middle : USize := usize_xor upper (managed_shift_right upper (raw_size_to_u32 (managed_word_offset two))) in
+    usize_xor middle (managed_shift_right middle (raw_size_to_u32 (managed_word_offset one)));
+
+-- Return the exact key's slot or the first empty slot. A full malformed table
+-- is rejected before reading beyond capacity probes. wanted is never dereferenced.
+def managed_gc_index_slot (table : RawPtr U8) (capacity : USize) (wanted : USize)
+    (scratch : RawPtr U8) : Runtime USize :=
+    let zero : USize := usize_sub wanted wanted in
+    let one : USize := managed_one wanted in
+    let three : USize := usize_add (usize_add one one) one in
+    let mask : USize := usize_sub capacity one in
+    runtime_bind Unit USize (managed_require (raw_bool_and (raw_bool_not (usize_equal capacity zero))
+      (usize_equal (usize_and capacity mask) zero)) wanted) (fun (shape : Unit) =>
+      runtime_bind Unit USize (managed_write_word scratch three capacity) (fun (bounded : Unit) =>
+        match u8_from_nat 1 with | Nothing => runtime_pure USize zero | Just running =>
+          runtime_loop USize (usize_and (managed_gc_index_hash wanted) mask)
+            (fun (index : USize) => runtime_bind USize U8 (managed_read_word scratch three) (fun (remaining : USize) =>
+              runtime_bind Unit U8 (managed_require (raw_bool_not (usize_equal remaining zero)) wanted)
+                (fun (budget : Unit) => runtime_bind USize U8 (managed_read_word table index) (fun (key : USize) =>
+                  runtime_pure U8 (match raw_bool_and (raw_bool_not (usize_equal key zero))
+                    (raw_bool_not (usize_equal key wanted)) with | True => running | False => u8_sub running running end)))))
+            (fun (index : USize) => runtime_bind USize USize (managed_read_word scratch three) (fun (remaining : USize) =>
+              runtime_bind Unit USize (managed_write_word scratch three (usize_sub remaining one))
+                (fun (spent : Unit) => runtime_pure USize (usize_and (usize_add index one) mask)))) end));
+
+def managed_gc_index_insert (table : RawPtr U8) (capacity : USize) (wanted : USize)
+    (scratch : RawPtr U8) : Runtime Unit :=
+    let zero : USize := usize_sub wanted wanted in
+    runtime_bind Unit Unit (managed_require (raw_bool_not (usize_equal wanted zero)) wanted) (fun (nonnull : Unit) =>
+      runtime_bind USize Unit (managed_gc_index_slot table capacity wanted scratch) (fun (index : USize) =>
+        runtime_bind USize Unit (managed_read_word table index) (fun (previous : USize) =>
+          runtime_bind Unit Unit (managed_require (usize_equal previous zero) wanted)
+            (fun (unique : Unit) => managed_write_word table index wanted))));
+
+def managed_gc_index_contains (table : RawPtr U8) (capacity : USize) (wanted : USize)
+    (scratch : RawPtr U8) : Runtime Bool :=
+    match usize_equal wanted (usize_sub wanted wanted) with | True => runtime_pure Bool False | False =>
+      runtime_bind USize Bool (managed_gc_index_slot table capacity wanted scratch) (fun (index : USize) =>
+        runtime_bind USize Bool (managed_read_word table index) (fun (key : USize) =>
+          runtime_pure Bool (usize_equal key wanted))) end;
+
+def managed_gc_index_clear (table : RawPtr U8) (capacity : USize) : Runtime Unit :=
+    let zero : USize := usize_sub capacity capacity in
+    let one : USize := managed_one capacity in
+    match u8_from_nat 1 with | Nothing => managed_panic capacity | Just running =>
+      runtime_bind USize Unit (runtime_loop USize zero
+        (fun (index : USize) => runtime_pure U8 (match usize_less index capacity with
+          | True => running | False => u8_sub running running end))
+        (fun (index : USize) => runtime_bind Unit USize (managed_write_word table index zero)
+          (fun (cleared : Unit) => runtime_pure USize (usize_add index one))))
+        (fun (finished : USize) => runtime_pure Unit MkUnit) end;
+
+-- The caller owns a reservation of managed_gc_index_bytes count capacity and
+-- has completed managed_gc_heap False. Links cannot change until sweep.
+def managed_gc_index_build (context : RawPtr U8) (scratch : RawPtr U8) (capacity : USize) : Runtime Unit :=
+    let zero : USize := usize_sub capacity capacity in
+    let one : USize := managed_one capacity in
+    let two : USize := usize_add one one in
+    let four : USize := usize_add two two in
+    let five : USize := usize_add four one in
+    let six : USize := usize_add four two in
+    let seven : USize := usize_add six one in
+    runtime_bind USize Unit (managed_read_word scratch five) (fun (count : USize) =>
+      runtime_bind USize Unit (managed_read_word context two) (fun (actual : USize) =>
+        runtime_bind Unit Unit (managed_require (raw_bool_and (usize_equal actual count)
+          (raw_bool_not (usize_equal (managed_gc_index_bytes count capacity) zero))) capacity) (fun (sized : Unit) =>
+          runtime_bind (RawPtr U8) Unit (managed_gc_index_table scratch count) (fun (table : RawPtr U8) =>
+            runtime_bind Unit Unit (managed_gc_index_clear table capacity) (fun (cleared : Unit) =>
+              runtime_bind Unit Unit (managed_write_word scratch seven count) (fun (bounded : Unit) =>
+                runtime_bind (RawPtr U8) Unit (managed_read_pointer context zero) (fun (first : RawPtr U8) =>
+                  match u8_from_nat 1 with | Nothing => managed_panic capacity | Just running =>
+                    runtime_bind (RawPtr U8) Unit (runtime_loop (RawPtr U8) first
+                      (fun (base : RawPtr U8) => runtime_bind Bool U8 (managed_pointer_is_null base)
+                        (fun (empty : Bool) => runtime_pure U8 (match empty with
+                          | True => u8_sub running running | False => running end)))
+                      (fun (base : RawPtr U8) => runtime_bind USize (RawPtr U8) (managed_read_word scratch seven)
+                        (fun (remaining : USize) => runtime_bind Unit (RawPtr U8)
+                          (managed_require (raw_bool_not (usize_equal remaining zero)) capacity) (fun (budget : Unit) =>
+                            runtime_bind USize (RawPtr U8) (raw_to_bits U8 base) (fun (bits : USize) =>
+                              runtime_bind Unit (RawPtr U8) (managed_gc_index_insert table capacity bits scratch)
+                                (fun (inserted : Unit) => runtime_bind Unit (RawPtr U8)
+                                  (managed_write_word scratch seven (usize_sub remaining one))
+                                  (fun (spent : Unit) => managed_read_pointer base two)))))))
+                      (fun (finished : RawPtr U8) => runtime_bind USize Unit (managed_read_word scratch seven)
+                        (fun (remaining : USize) => runtime_bind Unit Unit (managed_require (usize_equal remaining zero) capacity)
+                          (fun (complete : Unit) => managed_write_word scratch six capacity))) end)))))));

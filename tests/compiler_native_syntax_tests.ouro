@@ -1,0 +1,371 @@
+-- Explicit native declarations retain syntax and type metadata across the
+-- ordinary frontend passes. These tests do not execute an intrinsic or FFI.
+
+import "../compiler/lexer.ouro";
+import "../compiler/parser.ouro";
+import "../std/listx.ouro";
+import "../compiler/desugar_match.ouro";
+import "../compiler/import_resolve.ouro";
+import "../compiler/preprocess_import.ouro";
+import "../compiler/lower_rewrite.ouro";
+import "../compiler/facts.ouro";
+import "analyze/precision/assertions.ouro";
+
+def native_syntax_intern_text : List (Pair (List Nat) Nat) -> Nat -> String :=
+  fix native_syntax_intern_text (entries : List (Pair (List Nat) Nat)) (id : Nat)
+      : String :=
+    match entries with
+    | Nil => "<missing>"
+    | Cons entry rest =>
+        match entry with
+        | MkPair codes found =>
+            match eqNat id found with
+            | True => prim_string_of_char_codes codes
+            | False => native_syntax_intern_text rest id
+            end
+        end
+    end;
+
+def native_syntax_name (st : InternState) (id : Nat) : String :=
+    native_syntax_intern_text (unit_intern_ids st) id;
+
+def native_syntax_string (st : InternState) (id : Nat) : String :=
+    match st with
+    | MkIntern _ _ strings _ => native_syntax_intern_text strings id
+    end;
+
+def native_syntax_expr : Expr -> InternState -> String :=
+  fix native_syntax_expr (expr : Expr) (st : InternState) : String :=
+    match expr with
+    | EVar id => native_syntax_name st id
+    | EHole _ => "hole"
+    | ESort level => concat "Type" (prim_string_of_nat level)
+    | ENat value => prim_string_of_nat value
+    | EApp fn arg => concat (native_syntax_expr fn st)
+        (concat "(" (concat (native_syntax_expr arg st) ")"))
+    | ELam _ _ _ => "lambda"
+    | EPi _ _ _ => "pi"
+    | ELet _ _ _ _ => "let"
+    | EAscribe _ _ => "ascribe"
+    | EMatch _ _ => "match"
+    | EFix _ _ _ _ => "fix"
+    | EEffectRow _ _ => "effect-row"
+    | EPerform _ _ => "perform"
+    | EDo _ => "do"
+    | EHandle _ _ => "handle"
+    | EBranch _ _ _ => "branch"
+    | ENoBranch => "no-branch"
+    | EBinder _ _ _ => "binder"
+    | ENoBinder => "no-binder"
+    | EMultiMatch _ _ => "multi-match"
+    | EStr id => concat "\"" (concat (native_syntax_string st id) "\"")
+    | EDoBind _ _ => "do-bind"
+    | EList _ => "list"
+    end;
+
+def native_syntax_metadata : List Nat -> InternState -> String :=
+  fix native_syntax_metadata (ids : List Nat) (st : InternState) : String :=
+    match ids with
+    | Nil => ""
+    | Cons id rest =>
+        concat (native_syntax_string st id)
+          (match rest with
+           | Nil => ""
+           | Cons _ _ => concat "|" (native_syntax_metadata rest st)
+           end)
+    end;
+
+def native_syntax_decl (st : InternState) (decl : Decl) : String :=
+    match decl with
+    | DDef name ty body => concat "def:" (concat (native_syntax_name st name)
+        (concat ":" (concat (native_syntax_expr ty st)
+          (concat "=" (native_syntax_expr body st)))))
+    | DAxiom name ty => concat "axiom:" (concat (native_syntax_name st name)
+        (concat ":" (native_syntax_expr ty st)))
+    | DInductive name _ _ _ => concat "inductive:" (native_syntax_name st name)
+    | DEffect name _ _ => concat "effect:" (native_syntax_name st name)
+    | DImport path => concat "import:" (native_syntax_string st path)
+    | DIntrinsic name ty key specialization =>
+        concat "intrinsic:" (concat (native_syntax_name st name)
+          (concat ":" (concat (native_syntax_expr ty st)
+            (concat "=" (concat (native_syntax_string st key)
+              (match specialization with
+               | Nothing => ""
+               | Just value => concat "@" (native_syntax_expr value st)
+               end))))))
+    | DExtern name ty metadata =>
+        concat "extern:" (concat (native_syntax_name st name)
+          (concat ":" (concat (native_syntax_expr ty st)
+            (concat "=" (native_syntax_metadata metadata st)))))
+    | DRepresentation target key =>
+        concat "representation:" (concat (native_syntax_name st target)
+          (concat "=" (native_syntax_string st key)))
+    end;
+
+def native_syntax_decls : List Decl -> InternState -> String :=
+  fix native_syntax_decls (decls : List Decl) (st : InternState) : String :=
+    match decls with
+    | Nil => ""
+    | Cons decl rest => concat (native_syntax_decl st decl)
+        (concat ";" (native_syntax_decls rest st))
+    end;
+
+def native_syntax_render (source : String) (transform : List Decl -> List Decl)
+    : String :=
+    let fuel : Nat := add (prim_string_length source) (mul 64 16) in
+    match lex_all fuel (prim_string_to_char_codes source) with
+    | LexMalformed _ => "lex-malformed"
+    | LexExhausted _ => "lex-exhausted"
+    | LexOk tokens st =>
+        match parse_file parse fuel tokens Z with
+        | PErr position => concat "parse-error@" (prim_string_of_nat position)
+        | POk decls rest _ =>
+            match is_eof (peek rest) with
+            | True => native_syntax_decls (transform decls) st
+            | False => "unconsumed-tokens"
+            end
+        end
+    end;
+
+def native_syntax_expect (name : String) (source : String) (expected : String)
+    : Pair String Bool :=
+    MkPair String Bool name (prim_string_eq
+      (native_syntax_render source (fun (decls : List Decl) => decls)) expected);
+
+def native_syntax_bad (name : String) (source : String) : Pair String Bool :=
+    MkPair String Bool name (prim_string_starts
+      (native_syntax_render source (fun (decls : List Decl) => decls)) "parse-error@");
+
+def native_syntax_import_text (source : String) : String :=
+    match preprocess_imports (prim_string_to_char_codes source) with
+    | ImpErr code _ => concat "import-error@" (prim_string_of_nat code)
+    | ImpOk rewritten => native_syntax_render (prim_string_of_char_codes rewritten)
+        (fun (decls : List Decl) => decls)
+    end;
+
+def native_syntax_keyword (name : String) (expected : Nat) : Bool :=
+    match classify_ident (prim_string_to_char_codes name) with
+    | Nothing => False
+    | Just token =>
+        andb (eqNat (token_tag token) tagKeyword)
+          (match tokenIsKeyword token with
+           | Nothing => False
+           | Just keyword => eqNat keyword expected
+           end)
+    end;
+
+def native_syntax_refs : List Fact -> List Nat :=
+  fix native_syntax_refs (facts : List Fact) : List Nat :=
+    match facts with
+    | Nil => Nil Nat
+    | Cons fact rest =>
+        match fact with
+        | MkFact kind _ target _ _ =>
+            match kind with
+            | FReference => Cons Nat target (native_syntax_refs rest)
+            | FDeclaration => native_syntax_refs rest
+            | FExport => native_syntax_refs rest
+            | FConstructor => native_syntax_refs rest
+            | FModule => native_syntax_refs rest
+            | FBranch => native_syntax_refs rest
+            | FEffect => native_syntax_refs rest
+            end
+        end
+    end;
+
+def native_syntax_opaque_refs (decl : Decl) (expected : List Nat) : Bool :=
+    match facts_of_decl [10] [10] 7 decl with
+    | MkPair facts bodies =>
+        andb (source_bytes_equal (native_syntax_refs facts) expected)
+          (andb (nullb TypedAst bodies)
+            (nullb TypedAst (collect_typed_asts [decl])))
+    end;
+
+def native_syntax_match_source : String :=
+    "intrinsic Pointer : (match Tag with | MkTag => Type end) := \"opaque.key\" (match Tag with | MkTag => Type end);";
+
+def native_syntax_import_order : Bool :=
+    match resolve_imports
+      [ MkSrcUnit 1 [DIntrinsic 10 (ESort 0) 20 (Just Expr (EVar 11))]
+      , MkSrcUnit 2 [DImport 1, DExtern 12 (EVar 10) [21, 22, 23, 24, 25]]
+      ] 2 with
+    | RErr _ _ => False
+    | ROk decls =>
+        source_bytes_equal (concat_map Decl Nat (fun (decl : Decl) =>
+          match decl with
+          | DDef _ _ _ => []
+          | DAxiom _ _ => []
+          | DInductive _ _ _ _ => []
+          | DEffect _ _ _ => []
+          | DImport _ => []
+          | DIntrinsic name _ key _ => [name, key]
+          | DExtern name _ metadata => Cons Nat name metadata
+          | DRepresentation target key => [target, key]
+          end) decls) [10, 20, 12, 21, 22, 23, 24, 25]
+    end;
+
+def native_syntax_representation_import_order : Bool :=
+    let st : InternState := MkIntern
+      [MkPair (List Nat) Nat (prim_string_to_char_codes "Natural") 10] 11
+      [MkPair (List Nat) Nat (prim_string_to_char_codes "ouro.nat") 20] 21 in
+    match resolve_imports
+      [ MkSrcUnit 1 [DInductive 10 [] (ESort 0) []]
+      , MkSrcUnit 2 [DRepresentation 10 20, DImport 1]
+      ] 2 with
+    | RErr _ _ => False
+    | ROk decls => prim_string_eq (native_syntax_decls decls st)
+        "inductive:Natural;representation:Natural=ouro.nat;"
+    end;
+
+def native_syntax_representation_facts : Bool :=
+    match facts_of_decl [10] [10] 7 (DRepresentation 10 20) with
+    | MkPair facts bodies =>
+        andb (nullb TypedAst bodies)
+          (andb (nullb TypedAst (collect_typed_asts [DRepresentation 10 20]))
+            (match facts with
+             | Nil => False
+             | Cons fact rest =>
+                 andb (nullb Fact rest)
+                   (match fact with
+                    | MkFact kind source target flags span =>
+                        match kind with
+                        | FReference => andb (eqNat source 10)
+                            (andb (eqNat target 10)
+                              (andb (eqNat flags flagNone) (eqNat span 7)))
+                        | FDeclaration => False
+                        | FExport => False
+                        | FConstructor => False
+                        | FModule => False
+                        | FBranch => False
+                        | FEffect => False
+                        end
+                    end)
+             end))
+    end;
+
+def native_syntax_laws : List (Pair String Bool) :=
+    [ MkPair String Bool "native-keyword/intrinsic-id-17" (native_syntax_keyword "intrinsic" 17)
+    , MkPair String Bool "native-keyword/extern-id-18" (native_syntax_keyword "extern" 18)
+    , MkPair String Bool "native-keyword/prior-id-unchanged" (native_syntax_keyword "def" 0)
+    , native_syntax_expect "native-parse/intrinsic-type"
+        "intrinsic U32 : Type := \"ouro.u32\";" "intrinsic:U32:Type0=ouro.u32;"
+    , native_syntax_expect "native-parse/intrinsic-specialization"
+        "intrinsic Pointer : Type := \"ouro.ptr\" U32;" "intrinsic:Pointer:Type0=ouro.ptr@U32;"
+    , native_syntax_expect "native-parse/specialization-is-one-expression"
+        "intrinsic Pointer : Type := \"ouro.ptr\" (List U32);"
+        "intrinsic:Pointer:Type0=ouro.ptr@List(U32);"
+    , native_syntax_expect "native-parse/extern-five-ordered-strings"
+        "extern get_pid : Runtime U32 := \"windows-x86_64\" \"win64\" \"kernel32.dll\" \"GetCurrentProcessId\" \"maygc\";"
+        "extern:get_pid:Runtime(U32)=windows-x86_64|win64|kernel32.dll|GetCurrentProcessId|maygc;"
+    , native_syntax_expect "native-parse/unknown-metadata-is-retained"
+        "extern call : Result := \"future-target\" \"future-abi\" \"lib\" \"symbol\" \"future-policy\";"
+        "extern:call:Result=future-target|future-abi|lib|symbol|future-policy;"
+    , native_syntax_expect "native-parse/keywords-in-strings-and-comments"
+        "-- intrinsic extern\ndef text : String := \"intrinsic extern\"; -- extern\n"
+        "def:text:String=\"intrinsic extern\";"
+    , native_syntax_expect "native-parse/prior-declaration-stream"
+        "axiom A : Type; def value : A := seed; inductive Flag : Type := | On : Flag; effect Ask : A; import \"dep.ouro\";"
+        "axiom:A:Type0;def:value:A=seed;inductive:Flag;effect:Ask;import:dep.ouro;"
+    , native_syntax_expect "native-parse/prior-optional-semicolon"
+        "axiom A : Type" "axiom:A:Type0;"
+    , native_syntax_bad "native-parse/missing-intrinsic-name" "intrinsic : Type := \"key\";"
+    , native_syntax_bad "native-parse/missing-intrinsic-type" "intrinsic U32 := \"key\";"
+    , native_syntax_bad "native-parse/missing-intrinsic-key" "intrinsic U32 : Type := ;"
+    , native_syntax_bad "native-parse/unquoted-intrinsic-key" "intrinsic U32 : Type := key;"
+    , native_syntax_expect "native-parse/intrinsic-semicolon-required"
+        "intrinsic U32 : Type := \"key\"" "parse-error@6"
+    , native_syntax_bad "native-parse/specialization-semicolon-required"
+        "intrinsic Pointer : Type := \"key\" U32"
+    , native_syntax_bad "native-parse/second-assignment-is-not-specialization"
+        "intrinsic U32 : Type := \"key\" := Type;"
+    , native_syntax_expect "native-parse/extern-missing-fifth-string-position"
+        "extern call : Runtime U32 := \"target\" \"abi\" \"dll\" \"symbol\";" "parse-error@10"
+    , native_syntax_expect "native-parse/extern-sixth-string-position"
+        "extern call : Runtime U32 := \"target\" \"abi\" \"dll\" \"symbol\" \"policy\" \"extra\";" "parse-error@11"
+    , native_syntax_bad "native-parse/extern-semicolon-required"
+        "extern call : Result := \"target\" \"abi\" \"dll\" \"symbol\" \"policy\""
+    , native_syntax_bad "native-parse/extern-nonstring-metadata"
+        "extern call : Result := \"target\" \"abi\" dll \"symbol\" \"policy\";"
+    , native_syntax_bad "native-parse/extern-no-variadic-syntax"
+        "extern call : Result := \"target\" \"abi\" \"dll\" \"symbol\" \"policy\" variadic;"
+    , native_syntax_bad "native-parse/trailing-input-rejected"
+        "intrinsic U32 : Type := \"key\"; stray"
+    , MkPair String Bool "native-desugar/signature-and-specialization"
+        (prim_string_eq (native_syntax_render native_syntax_match_source desugar_file)
+          "intrinsic:Pointer:match=opaque.key@match;")
+    , MkPair String Bool "native-desugar/extern-metadata-preserved"
+        (prim_string_eq (native_syntax_render
+          "extern call : (match Tag with | MkTag => Type end) := \"a\" \"b\" \"c\" \"d\" \"e\";" desugar_file)
+          "extern:call:match=a|b|c|d|e;")
+    , MkPair String Bool "native-import/dependency-order-and-metadata" native_syntax_import_order
+    , MkPair String Bool "native-facts/signature-and-specialization-references"
+        (native_syntax_opaque_refs
+          (DIntrinsic 10 (EPi 3 (EVar 1) (EVar 3)) 20 (Just Expr (EVar 2))) [1, 2])
+    , MkPair String Bool "native-facts/extern-signature-without-body"
+        (native_syntax_opaque_refs (DExtern 10 (EVar 1) [20, 21, 22, 23, 24]) [1])
+    , MkPair String Bool "native-rewrite/intrinsic-type-metadata-detects-handlers"
+        (decls_need_handler_rewrite [DIntrinsic 10 (ESort 0) 20
+          (Just Expr (EHandle (EVar 1) []))])
+    , MkPair String Bool "native-rewrite/extern-signature-detects-handlers"
+        (decls_need_handler_rewrite [DExtern 10 (EHandle (EVar 1) []) []])
+    , MkPair String Bool "native-rewrite/metadata-preserved-on-handler-path"
+        (prim_string_eq (native_syntax_render
+          "intrinsic Pointer : Type := \"key\" (handle value with end);"
+          (rewrite_declarations 200 empty_env)) "intrinsic:Pointer:Type0=key@handle;")
+    , MkPair String Bool "representation-keyword/id-19"
+        (native_syntax_keyword "representation" 19)
+    , native_syntax_expect "representation-parse/target-and-key"
+        "representation Natural := \"ouro.nat\";" "representation:Natural=ouro.nat;"
+    , native_syntax_expect "representation-parse/unknown-key-is-retained"
+        "representation Natural := \"future.role\";" "representation:Natural=future.role;"
+    , native_syntax_expect "representation-parse/repeated-annotations-remain-for-checker"
+        "representation Natural := \"ouro.nat\"; representation Natural := \"ouro.nat\";"
+        "representation:Natural=ouro.nat;representation:Natural=ouro.nat;"
+    , native_syntax_bad "representation-parse/missing-target"
+        "representation := \"ouro.nat\";"
+    , native_syntax_bad "representation-parse/no-type-declaration"
+        "representation Natural : Type := \"ouro.nat\";"
+    , native_syntax_bad "representation-parse/assignment-required"
+        "representation Natural \"ouro.nat\";"
+    , native_syntax_bad "representation-parse/key-required"
+        "representation Natural := ;"
+    , native_syntax_bad "representation-parse/key-must-be-quoted"
+        "representation Natural := key;"
+    , native_syntax_expect "representation-parse/semicolon-required-position"
+        "representation Natural := \"ouro.nat\"" "parse-error@4"
+    , native_syntax_expect "representation-parse/exactly-one-key-position"
+        "representation Natural := \"ouro.nat\" \"extra\";" "parse-error@4"
+    , native_syntax_bad "representation-parse/no-executable-body"
+        "representation Natural := \"ouro.nat\" value;"
+    , native_syntax_expect "representation-parse/strings-and-comments-stay-ordinary"
+        "-- representation Natural := key\ndef text : String := \"representation\";"
+        "def:text:String=\"representation\";"
+    , native_syntax_expect "representation-parse/keyword-prefix-is-an-identifier"
+        "def representational : Type := Type;" "def:representational:Type0=Type0;"
+    , MkPair String Bool "representation-desugar/target-and-key-preserved"
+        (prim_string_eq (native_syntax_render
+          "representation Natural := \"ouro.nat\";" desugar_file)
+          "representation:Natural=ouro.nat;")
+    , MkPair String Bool "representation-import/target-dependency-precedes-annotation"
+        native_syntax_representation_import_order
+    , MkPair String Bool "representation-import/alias-remaps-target-and-keeps-key"
+        (prim_string_eq (native_syntax_import_text
+          "import \"dep.ouro\" as N; representation N.Natural := \"N.future.role\";")
+          "import:dep.ouro;representation:Natural=N.future.role;")
+    , MkPair String Bool "representation-import/local-open-keeps-target"
+        (prim_string_eq (native_syntax_import_text
+          "import \"dep.ouro\" as N; open N; representation Natural := \"ouro.nat\";")
+          "import:dep.ouro;representation:Natural=ouro.nat;")
+    , MkPair String Bool "representation-facts/reference-without-definition-or-body"
+        native_syntax_representation_facts
+    , MkPair String Bool "representation-rewrite/annotation-does-not-request-handlers"
+        (notb (decls_need_handler_rewrite [DRepresentation 10 20]))
+    , MkPair String Bool "representation-rewrite/annotation-survives-handler-path"
+        (prim_string_eq (native_syntax_render
+          "representation Natural := \"ouro.nat\"; intrinsic Pointer : Type := \"key\" (handle value with end);"
+          (rewrite_declarations 200 empty_env))
+          "representation:Natural=ouro.nat;intrinsic:Pointer:Type0=key@handle;")
+    ];
+
+-- @entry main
+def main : IO Unit := precision_run "compiler-native-syntax" native_syntax_laws;

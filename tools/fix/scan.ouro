@@ -1,0 +1,460 @@
+-- Token-stream helpers shared by the fix rules: edits over byte spans,
+-- declaration segments, a depth-aware body walker, bracket groups, and the
+-- deletion-span policy that removes whole lines only when a construct owns them.
+
+import "../../compiler/base.ouro";
+import "lex.ouro";
+import "../../std/pathx.ouro";
+import "../../std/collections.ouro";
+
+-- start, end, replacement, rule id, line, message
+inductive FxEdit : Type :=
+  | MkFxEdit : Nat -> Nat -> String -> String -> Nat -> String -> FxEdit;
+
+def fx_edit_start (e : FxEdit) : Nat :=
+    match e with | MkFxEdit s _ _ _ _ _ => s end;
+
+def fx_edit_end (e : FxEdit) : Nat :=
+    match e with | MkFxEdit _ x _ _ _ _ => x end;
+
+def fx_edit_rep (e : FxEdit) : String :=
+    match e with | MkFxEdit _ _ r _ _ _ => r end;
+
+def fx_edit_rule (e : FxEdit) : String :=
+    match e with | MkFxEdit _ _ _ r _ _ => r end;
+
+def fx_edit_line (e : FxEdit) : Nat :=
+    match e with | MkFxEdit _ _ _ _ l _ => l end;
+
+def fx_edit_msg (e : FxEdit) : String :=
+    match e with | MkFxEdit _ _ _ _ _ m => m end;
+
+def fx_edit_before (a : FxEdit) (b : FxEdit) : Bool :=
+    leb_nat (fx_edit_start a) (fx_edit_start b);
+
+def fx_sort_edits (es : List FxEdit) : List FxEdit :=
+    sort_insert FxEdit fx_edit_before es;
+
+-- Overlapping proposals keep the earliest start; the loser is retried on the
+-- next fixpoint round against the rewritten source.
+def fx_disjoint : List FxEdit -> Nat -> List FxEdit -> List FxEdit :=
+  fix go (es : List FxEdit) (limit : Nat) (acc : List FxEdit) : List FxEdit :=
+    match es with
+    | Nil => reverse_lin FxEdit acc
+    | Cons e rest =>
+        match leb_nat limit (fx_edit_start e) with
+        | True => go rest (fx_edit_end e) (Cons FxEdit e acc)
+        | False => go rest limit acc
+        end
+    end;
+
+def fx_plan_edits (es : List FxEdit) : List FxEdit :=
+    fx_disjoint (fx_sort_edits es) Z (Nil FxEdit);
+
+def fx_slice (src : String) (from : Nat) (to : Nat) : String :=
+    str_slice src from (sub to from);
+
+def fx_apply_go : List FxEdit -> String -> Nat -> String -> String :=
+  fix go (es : List FxEdit) (src : String) (pos : Nat) (out : String) : String :=
+    match es with
+    | Nil => str_concat out (fx_slice src pos (str_len src))
+    | Cons e rest =>
+        go rest src (fx_edit_end e)
+          (str_concat out
+            (str_concat (fx_slice src pos (fx_edit_start e)) (fx_edit_rep e)))
+    end;
+
+-- Edits must already be sorted and disjoint (fx_plan_edits).
+def fx_apply (src : String) (es : List FxEdit) : String :=
+    fx_apply_go es src Z "";
+
+def fx_decl_words : List String :=
+    [ "def", "inductive", "axiom", "effect", "import", "record", "mutual", "module" ];
+
+def fx_is_decl_start (t : FxTok) : Bool :=
+    match fx_tok_bol t with
+    | False => False
+    | True =>
+        match fx_is_ident t with
+        | False => False
+        | True => elem String str_eq (fx_tok_text t) fx_decl_words
+        end
+    end;
+
+def fx_push_seg (cur : List FxTok) (acc : List (List FxTok)) : List (List FxTok) :=
+    match cur with
+    | Nil => acc
+    | Cons _ _ => Cons (List FxTok) (reverse_lin FxTok cur) acc
+    end;
+
+def fx_segments_go : List FxTok -> List FxTok -> List (List FxTok) -> List (List FxTok) :=
+  fix go (ts : List FxTok) (cur : List FxTok) (acc : List (List FxTok)) : List (List FxTok) :=
+    match ts with
+    | Nil => reverse_lin (List FxTok) (fx_push_seg cur acc)
+    | Cons t rest =>
+        match fx_is_decl_start t with
+        | True => go rest ([t] : List FxTok) (fx_push_seg cur acc)
+        | False => go rest (Cons FxTok t cur) acc
+        end
+    end;
+
+-- Top-level declarations start with a keyword in column zero.
+def fx_segments (ts : List FxTok) : List (List FxTok) :=
+    fx_segments_go ts (Nil FxTok) (Nil (List FxTok));
+
+def fx_opens_bracket (t : FxTok) : Bool :=
+    fx_has_code t fx_c_open;
+
+def fx_closes_bracket (t : FxTok) : Bool :=
+    fx_has_code t fx_c_close;
+
+-- Body walk state: bracket depth, match depth, let depth. FxStop marks the
+-- token that ends the enclosing body.
+inductive FxStep : Type :=
+  | FxStop : FxStep
+  | FxNext : Nat -> Nat -> Nat -> FxStep;
+
+-- A bar or comma at bracket depth zero outside any match ends the body.
+def fx_step_separator (b : Nat) (m : Nat) (l : Nat) : FxStep :=
+    match b with
+    | S _ => FxNext b m l
+    | Z =>
+        match m with
+        | Z => FxStop
+        | S _ => FxNext b m l
+        end
+    end;
+
+-- Step for one token code. Codes are small Peano numerals, so the ladder
+-- matches them structurally: one step per level instead of a comparison call,
+-- with plain (Z) tokens leaving on the first.
+def fx_step_code (c : Nat) (b : Nat) (m : Nat) (l : Nat) : FxStep :=
+    match c with
+    | Z => FxNext b m l
+    | S c1 =>
+    match c1 with
+    | Z => FxNext (S b) m l
+    | S c2 =>
+    match c2 with
+    | Z => match b with | Z => FxStop | S b2 => FxNext b2 m l end
+    | S c3 =>
+    match c3 with
+    | Z => FxNext b (S m) l
+    | S c4 =>
+    match c4 with
+    | Z => match m with | Z => FxStop | S m2 => FxNext b m2 l end
+    | S c5 =>
+    match c5 with
+    | Z => FxNext b m (S l)
+    | S c6 =>
+    match c6 with
+    | Z => match l with | Z => FxStop | S l2 => FxNext b m l2 end
+    | S c7 =>
+    match c7 with
+    | Z => fx_step_separator b m l
+    | S c8 =>
+    match c8 with
+    | Z => fx_step_separator b m l
+    | S _ => FxNext b m l
+    end
+    end
+    end
+    end
+    end
+    end
+    end
+    end
+    end;
+
+-- A dotted access "x.field" counts as a use of x. Only identifier tokens
+-- (kind zero) are compared, so symbols and literals skip both string checks.
+def fx_tok_refers (t : FxTok) (name : String) (dotted : String) : Bool :=
+    match fx_tok_kind t with
+    | S _ => False
+    | Z =>
+        match str_eq (fx_tok_text t) name with
+        | True => True
+        | False => str_starts (fx_tok_text t) dotted
+        end
+    end;
+
+def fx_uses_go (name : String) (dotted : String) : List FxTok -> Nat -> Nat -> Nat -> Bool :=
+  fix go (ts : List FxTok) (b : Nat) (m : Nat) (l : Nat) : Bool :=
+    match ts with
+    | Nil => False
+    | Cons t rest =>
+        match fx_tok_refers t name dotted with
+        | True => True
+        | False =>
+            match fx_tok_code t with
+            | Z => go rest b m l
+            | S _ =>
+                match fx_step_code (fx_tok_code t) b m l with
+                | FxStop => False
+                | FxNext b2 m2 l2 => go rest b2 m2 l2
+                end
+            end
+        end
+    end;
+
+-- Whether name is referenced before the enclosing body ends. Scanning starts
+-- at the given depth so a let binder sees its own "in" as depth zero.
+def fx_uses_name (name : String) (ts : List FxTok) (l : Nat) : Bool :=
+    fx_uses_go name (str_concat name ".") ts Z Z l;
+
+-- Tokens of the enclosing body and the remainder starting at the stop token.
+def fx_body_go : List FxTok -> Nat -> Nat -> Nat -> List FxTok -> Pair (List FxTok) (List FxTok) :=
+  fix go (ts : List FxTok) (b : Nat) (m : Nat) (l : Nat) (acc : List FxTok)
+      : Pair (List FxTok) (List FxTok) :=
+    match ts with
+    | Nil => MkPair (List FxTok) (List FxTok) (reverse_lin FxTok acc) (Nil FxTok)
+    | Cons t rest =>
+        match fx_tok_code t with
+        | Z => go rest b m l (Cons FxTok t acc)
+        | S _ =>
+            match fx_step_code (fx_tok_code t) b m l with
+            | FxStop => MkPair (List FxTok) (List FxTok) (reverse_lin FxTok acc) ts
+            | FxNext b2 m2 l2 => go rest b2 m2 l2 (Cons FxTok t acc)
+            end
+        end
+    end;
+
+def fx_body_split (ts : List FxTok) : Pair (List FxTok) (List FxTok) :=
+    fx_body_go ts Z Z Z (Nil FxTok);
+
+-- Tokens through the bracket matching an already consumed opener, and the rest.
+def fx_group_go : List FxTok -> Nat -> List FxTok -> Maybe (Pair (List FxTok) (List FxTok)) :=
+  fix go (ts : List FxTok) (depth : Nat) (acc : List FxTok)
+      : Maybe (Pair (List FxTok) (List FxTok)) :=
+    match ts with
+    | Nil => Nothing (Pair (List FxTok) (List FxTok))
+    | Cons t rest =>
+        match fx_opens_bracket t with
+        | True => go rest (S depth) (Cons FxTok t acc)
+        | False =>
+            match fx_closes_bracket t with
+            | False => go rest depth (Cons FxTok t acc)
+            | True =>
+                match depth with
+                | Z => Just (Pair (List FxTok) (List FxTok))
+                         (MkPair (List FxTok) (List FxTok)
+                           (reverse_lin FxTok (Cons FxTok t acc)) rest)
+                | S d2 => go rest d2 (Cons FxTok t acc)
+                end
+            end
+        end
+    end;
+
+-- One application atom: an identifier, number, or string token, or a whole
+-- bracketed group. Returns the atom tokens and the remainder.
+def fx_atom (ts : List FxTok) : Maybe (Pair (List FxTok) (List FxTok)) :=
+    match ts with
+    | Nil => Nothing (Pair (List FxTok) (List FxTok))
+    | Cons t rest =>
+        match fx_opens_bracket t with
+        | True => fx_group_go rest Z ([t] : List FxTok)
+        | False =>
+            match fx_is_kind t fx_k_sym with
+            | True => Nothing (Pair (List FxTok) (List FxTok))
+            | False => Just (Pair (List FxTok) (List FxTok))
+                         (MkPair (List FxTok) (List FxTok) ([t] : List FxTok) rest)
+            end
+        end
+    end;
+
+def fx_first_tok (ts : List FxTok) : FxTok :=
+    head FxTok fx_no_tok ts;
+
+def fx_last_tok (ts : List FxTok) : FxTok :=
+    last FxTok fx_no_tok ts;
+
+def fx_toks_start (ts : List FxTok) : Nat :=
+    fx_tok_start (fx_first_tok ts);
+
+def fx_toks_end (ts : List FxTok) : Nat :=
+    fx_tok_end (fx_last_tok ts);
+
+-- Source text covered by a token run, including interior whitespace and comments.
+def fx_toks_text (src : String) (ts : List FxTok) : String :=
+    fx_slice src (fx_toks_start ts) (fx_toks_end ts);
+
+-- Strip one pair of enclosing parentheses from an atom's token list.
+def fx_unparen (ts : List FxTok) : List FxTok :=
+    match ts with
+    | Nil => ts
+    | Cons t rest =>
+        match fx_is_word t "(" with
+        | False => ts
+        | True =>
+            match fx_is_word (fx_last_tok ts) ")" with
+            | True => init FxTok rest
+            | False => ts
+            end
+        end
+    end;
+
+-- A run of identifier, number, string, and nested group tokens with no
+-- operators at depth zero: safe to embed as a list element without parens.
+def fx_simple_app_go : List FxTok -> Nat -> Bool :=
+  fix go (ts : List FxTok) (depth : Nat) : Bool :=
+    match ts with
+    | Nil => eqNat depth Z
+    | Cons t rest =>
+        match fx_opens_bracket t with
+        | True => go rest (S depth)
+        | False =>
+            match fx_closes_bracket t with
+            | True => match depth with | Z => False | S d2 => go rest d2 end
+            | False =>
+                match fx_is_kind t fx_k_sym with
+                | True => match depth with | Z => False | S _ => go rest depth end
+                | False =>
+                    match orb (fx_is_word t "fun") (orb (fx_is_word t "match")
+                          (orb (fx_is_word t "let") (orb (fx_is_word t "fix")
+                          (orb (fx_is_word t "do") (fx_is_word t "handle"))))) with
+                    | True => False
+                    | False => go rest depth
+                    end
+                end
+            end
+        end
+    end;
+
+def fx_simple_app (ts : List FxTok) : Bool :=
+    match ts with
+    | Nil => False
+    | Cons _ _ => fx_simple_app_go ts Z
+    end;
+
+-- Atom rendering: bare tokens as written, groups without the outer parens when
+-- they hold a plain application, otherwise the original text.
+def fx_atom_text (src : String) (atom : List FxTok) : String :=
+    match fx_is_word (fx_first_tok atom) "(" with
+    | False => fx_toks_text src atom
+    | True =>
+        let inner : List FxTok := fx_unparen atom in
+        match fx_simple_app inner with
+        | True => fx_toks_text src inner
+        | False => fx_toks_text src atom
+        end
+    end;
+
+-- Offset just past the first line feed at or after pos (or end of input).
+def fx_lf_after (src : String) (pos : Nat) : Nat :=
+    match str_index (fx_slice src pos (str_len src)) "\n" with
+    | Nothing => str_len src
+    | Just k => add pos (S k)
+    end;
+
+-- Span that deletes a construct spanning first..last: whole lines when the
+-- construct owns them, otherwise the bytes up to the following token.
+def fx_del_span (src : String) (first : FxTok) (last_t : FxTok) (next : Maybe FxTok)
+    : Pair Nat Nat :=
+    let next_line : Nat := match next with
+      | Nothing => S (fx_tok_line last_t)
+      | Just n => fx_tok_line n
+      end in
+    let next_start : Nat := match next with
+      | Nothing => str_len src
+      | Just n => fx_tok_start n
+      end in
+    match andb (fx_tok_bol first) (ltb_nat (fx_tok_line last_t) next_line) with
+    | True => MkPair Nat Nat (fx_tok_line_start first) (fx_lf_after src (fx_tok_end last_t))
+    | False => MkPair Nat Nat (fx_tok_start first) next_start
+    end;
+
+def fx_pair_fst (p : Pair Nat Nat) : Nat :=
+    match p with | MkPair a _ => a end;
+
+def fx_pair_snd (p : Pair Nat Nat) : Nat :=
+    match p with | MkPair _ b => b end;
+
+def fx_delete_edit (src : String) (rule : String) (msg : String) (first : FxTok)
+    (last_t : FxTok) (next : Maybe FxTok) : FxEdit :=
+    let span : Pair Nat Nat := fx_del_span src first last_t next in
+    MkFxEdit (fx_pair_fst span) (fx_pair_snd span) "" rule (fx_tok_line first) msg;
+
+def fx_maybe_head (ts : List FxTok) : Maybe FxTok :=
+    match ts with
+    | Nil => Nothing FxTok
+    | Cons t _ => Just FxTok t
+    end;
+
+-- Constructor-like: starts uppercase or is a known constructor name.
+def fx_ctor_like (ctors : List String) (name : String) : Bool :=
+    match is_upper (str_head name) with
+    | True => True
+    | False => elem String str_eq name ctors
+    end;
+
+def fx_is_discard (name : String) : Bool :=
+    str_starts name "_";
+
+-- Width of a line's indentation (spaces and tabs). Only that prefix is walked,
+-- so the line scanners below stay proportional to indentation, not to line
+-- length the way str_trim is.
+def fx_indent_go : List Nat -> Nat -> Nat :=
+  fix go (cs : List Nat) (n : Nat) : Nat :=
+    match cs with
+    | Nil => n
+    | Cons c rest =>
+        match eqNat c ch_space with
+        | True => go rest (S n)
+        | False =>
+            match eqNat c ch_tab with
+            | True => go rest (S n)
+            | False => n
+            end
+        end
+    end;
+
+def fx_dedent (line : String) : String :=
+    let k : Nat := fx_indent_go (str_codes line) Z in
+    match k with
+    | Z => line
+    | S _ => str_slice line k (sub (str_len line) k)
+    end;
+
+-- Constructor names come from "| Name : Type" lines of inductive and effect
+-- declarations; match arms carry "=>" instead of a signature colon, so their
+-- binders are never harvested.
+def fx_ctor_of_line (line : String) : Maybe String :=
+    let t : String := fx_dedent line in
+    match str_starts t "|" with
+    | False => Nothing String
+    | True =>
+        let words : List String := str_words (str_tail t) in
+        let name : String := head String "" words in
+        let sig : String := nth String "" (S Z) words in
+        match andb (str_eq sig ":")
+              (andb (notb (str_null name)) (is_ident_start (str_head name))) with
+        | False => Nothing String
+        | True => Just String name
+        end
+    end;
+
+def fx_harvest_ctors (src : String) : List String :=
+    filter_map String String fx_ctor_of_line (str_lines src);
+
+-- Import spellings from a file, in source order.
+def fx_import_of_line (line : String) : Maybe String :=
+    let t : String := fx_dedent line in
+    match str_starts t "import \"" with
+    | False => Nothing String
+    | True =>
+        let body : String :=
+          str_slice t fx_import_prefix_len (sub (str_len t) fx_import_prefix_len) in
+        match str_index body "\"" with
+        | Nothing => Nothing String
+        | Just k => Just String (str_slice body Z k)
+        end
+    end;
+
+def fx_harvest_imports (src : String) : List String :=
+    filter_map String String fx_import_of_line (str_lines src);
+
+def fx_resolve_import (from : String) (spell : String) : String :=
+    match path_is_abs spell with
+    | True => path_normalize spell
+    | False => path_normalize (str_cat3 (path_dirname from) "/" spell)
+    end;

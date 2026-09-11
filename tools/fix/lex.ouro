@@ -1,0 +1,565 @@
+-- Positional tokenizer for ouro-fix. Each token keeps its byte span, line,
+-- column, first-on-line flag, and a small code classifying the keywords and
+-- delimiters the rules dispatch on, so scans never compare strings per step.
+-- The native runtime allocates on every call, match, and inline numeral and
+-- never frees, so the per-character path is written as bare compareNat trees
+-- over cached constants, with shared natural-number comparisons.
+
+import "../../std/natx.ouro";
+import "../../std/string.ouro";
+import "../../std/char.ouro";
+
+-- kind, start offset, end offset, line, column, first-on-line, text, code
+inductive FxTok : Type :=
+  | MkFxTok : Nat -> Nat -> Nat -> Nat -> Nat -> Bool -> String -> Nat -> FxTok;
+
+def fx_k_ident : Nat := 0;
+def fx_k_num : Nat := 1;
+def fx_k_str : Nat := 2;
+def fx_k_sym : Nat := 3;
+
+-- Codes 1..8 shape scope scans; higher codes only mark rule triggers.
+def fx_c_plain : Nat := 0;
+def fx_c_open : Nat := 1;
+def fx_c_close : Nat := 2;
+def fx_c_block : Nat := 3;
+def fx_c_end : Nat := 4;
+def fx_c_let : Nat := 5;
+def fx_c_in : Nat := 6;
+def fx_c_bar : Nat := 7;
+def fx_c_comma : Nat := 8;
+def fx_c_def : Nat := 9;
+def fx_c_fix : Nat := 10;
+def fx_c_fun : Nat := 11;
+def fx_c_let_bang : Nat := 12;
+def fx_c_import : Nat := 13;
+def fx_c_as : Nat := 14;
+def fx_c_bind : Nat := 15;
+def fx_c_semi : Nat := 16;
+def fx_c_cons : Nat := 17;
+def fx_c_nil : Nat := 18;
+def fx_c_succ : Nat := 19;
+
+-- Inline numerals compile to Peano chains rebuilt on every evaluation, so
+-- every number the lexer touches per token lives in a cached constant.
+def fx_ch_a : Nat := 97;
+def fx_ch_d : Nat := 100;
+def fx_ch_e : Nat := 101;
+def fx_ch_f : Nat := 102;
+def fx_ch_h : Nat := 104;
+def fx_ch_i : Nat := 105;
+def fx_ch_l : Nat := 108;
+def fx_ch_m : Nat := 109;
+def fx_ch_o : Nat := 111;
+def fx_ch_C : Nat := 67;
+def fx_ch_N : Nat := 78;
+def fx_ch_S : Nat := 83;
+def fx_let_len : Nat := 3;
+def fx_import_prefix_len : Nat := 8;
+def fx_fuel_ident : Nat := 32;
+def fx_fuel_small : Nat := 64;
+def fx_fuel_header : Nat := 128;
+def fx_fuel_arms : Nat := 256;
+def fx_fuel_stmt : Nat := 512;
+
+def fx_no_tok : FxTok := MkFxTok fx_k_sym Z Z Z Z False "" fx_c_plain;
+
+def fx_tok_kind (t : FxTok) : Nat :=
+    match t with | MkFxTok k _ _ _ _ _ _ _ => k end;
+
+def fx_tok_start (t : FxTok) : Nat :=
+    match t with | MkFxTok _ s _ _ _ _ _ _ => s end;
+
+def fx_tok_end (t : FxTok) : Nat :=
+    match t with | MkFxTok _ _ e _ _ _ _ _ => e end;
+
+def fx_tok_line (t : FxTok) : Nat :=
+    match t with | MkFxTok _ _ _ l _ _ _ _ => l end;
+
+def fx_tok_col (t : FxTok) : Nat :=
+    match t with | MkFxTok _ _ _ _ c _ _ _ => c end;
+
+def fx_tok_bol (t : FxTok) : Bool :=
+    match t with | MkFxTok _ _ _ _ _ b _ _ => b end;
+
+def fx_tok_text (t : FxTok) : String :=
+    match t with | MkFxTok _ _ _ _ _ _ x _ => x end;
+
+def fx_tok_code (t : FxTok) : Nat :=
+    match t with | MkFxTok _ _ _ _ _ _ _ c => c end;
+
+def fx_tok_line_start (t : FxTok) : Nat :=
+    sub (fx_tok_start t) (fx_tok_col t);
+
+def fx_is_kind (t : FxTok) (k : Nat) : Bool :=
+    eq_nat (fx_tok_kind t) k;
+
+def fx_is_ident (t : FxTok) : Bool :=
+    fx_is_kind t fx_k_ident;
+
+def fx_has_code (t : FxTok) (c : Nat) : Bool :=
+    eq_nat (fx_tok_code t) c;
+
+-- Token texts are disjoint across kinds (symbols never spell identifiers,
+-- literals keep their quotes), so a text comparison alone identifies a word
+-- or a symbol.
+def fx_is_word (t : FxTok) (s : String) : Bool :=
+    str_eq (fx_tok_text t) s;
+
+-- Range tests read compareNat directly: ltb_nat and leb_nat each add a call
+-- and a match on the per-character path. Lowercase letters come first.
+-- A..Z, then _ ; c is known to be below 'a'.
+def fx_upper_or_under (c : Nat) : Bool :=
+    match compareNat c ch_A with
+    | LT => False
+    | EQ => True
+    | GT =>
+        match compareNat c ch_Z with
+        | GT => eq_nat c ch_under
+        | LT => True
+        | EQ => True
+        end
+    end;
+
+def fx_ident_start (c : Nat) : Bool :=
+    match compareNat c ch_a with
+    | GT => leb_nat c ch_z
+    | EQ => True
+    | LT => fx_upper_or_under c
+    end;
+
+-- Continuation bytes also admit digits and the prime.
+def fx_ident_cont (c : Nat) : Bool :=
+    match compareNat c ch_a with
+    | GT => leb_nat c ch_z
+    | EQ => True
+    | LT =>
+        match compareNat c ch_A with
+        | LT =>
+            match compareNat c ch_zero with
+            | LT => eq_nat c ch_squote
+            | EQ => True
+            | GT => leb_nat c ch_nine
+            end
+        | EQ => True
+        | GT =>
+            match compareNat c ch_Z with
+            | GT => eq_nat c ch_under
+            | LT => True
+            | EQ => True
+            end
+        end
+    end;
+
+def fx_digit (c : Nat) : Bool :=
+    match compareNat c ch_zero with
+    | LT => False
+    | EQ => True
+    | GT => leb_nat c ch_nine
+    end;
+
+-- Remaining input after the scanned piece, and its length in bytes.
+inductive FxPiece : Type :=
+  | MkFxPiece : List Nat -> Nat -> FxPiece;
+
+def fx_piece_rest (p : FxPiece) : List Nat :=
+    match p with | MkFxPiece rest _ => rest end;
+
+def fx_piece_len (p : FxPiece) : Nat :=
+    match p with | MkFxPiece _ n => n end;
+
+def fx_take_while (keep : Nat -> Bool) : List Nat -> Nat -> FxPiece :=
+  fix go (src : List Nat) (n : Nat) : FxPiece :=
+    match src with
+    | Nil => MkFxPiece (Nil Nat) n
+    | Cons c rest =>
+        match keep c with
+        | True => go rest (S n)
+        | False => MkFxPiece src n
+        end
+    end;
+
+def fx_not_lf (c : Nat) : Bool :=
+    notb (eq_nat c ch_lf);
+
+-- Qualified names stay one token: "Mod.name" is a single identifier as long as
+-- each dot is followed by an identifier start.
+def fx_take_ident : Nat -> List Nat -> Nat -> FxPiece :=
+  fix go (fuel : Nat) (src : List Nat) (n : Nat) : FxPiece :=
+    match fuel with
+    | Z => MkFxPiece src n
+    | S fuel2 =>
+        match fx_take_while fx_ident_cont src n with
+        | MkFxPiece rest n2 =>
+            match rest with
+            | Nil => MkFxPiece rest n2
+            | Cons d rest2 =>
+                match eq_nat d ch_dot with
+                | False => MkFxPiece rest n2
+                | True =>
+                    match rest2 with
+                    | Nil => MkFxPiece rest n2
+                    | Cons e _ =>
+                        match fx_ident_start e with
+                        | True => go fuel2 rest2 (S n2)
+                        | False => MkFxPiece rest n2
+                        end
+                    end
+                end
+            end
+        end
+    end;
+
+-- Quoted tokens retain their complete raw text across newlines. An
+-- unterminated tail stays opaque through EOF, never becoming editable code.
+-- The ending line/column also preserve the positions of following tokens.
+inductive FxQuotedPiece : Type :=
+  | MkFxQuotedPiece : List Nat -> Nat -> Nat -> Nat -> FxQuotedPiece;
+
+def fx_take_str : Nat -> List Nat -> Nat -> Nat -> Nat -> FxQuotedPiece :=
+  fix go (fuel : Nat) (src : List Nat) (n : Nat) (line : Nat) (col : Nat) : FxQuotedPiece :=
+    match fuel with
+    | Z => MkFxQuotedPiece src n line col
+    | S fuel2 =>
+        match src with
+        | Nil => MkFxQuotedPiece (Nil Nat) n line col
+        | Cons c rest =>
+            match eq_nat c ch_quote with
+            | True => MkFxQuotedPiece rest (S n) line (S col)
+            | False =>
+                match eq_nat c ch_bslash with
+                | True =>
+                    match rest with
+                    | Nil => MkFxQuotedPiece (Nil Nat) (S n) line (S col)
+                    | Cons escaped rest2 =>
+                        match eq_nat escaped ch_lf with
+                        | True => go fuel2 rest2 (S (S n)) (S line) Z
+                        | False => go fuel2 rest2 (S (S n)) line (S (S col))
+                        end
+                    end
+                | False =>
+                    match eq_nat c ch_lf with
+                    | True => go fuel2 rest (S n) (S line) Z
+                    | False => go fuel2 rest (S n) line (S col)
+                    end
+                end
+            end
+        end
+    end;
+
+-- Two-character symbols: := => -> <- |>
+def fx_two_char (c : Nat) (d : Nat) : Bool :=
+    match eq_nat d ch_gt with
+    | True =>
+        match eq_nat c ch_eq with
+        | True => True
+        | False =>
+            match eq_nat c ch_minus with
+            | True => True
+            | False => eq_nat c ch_pipe
+            end
+        end
+    | False =>
+        match eq_nat d ch_eq with
+        | True => eq_nat c ch_colon
+        | False =>
+            match eq_nat d ch_minus with
+            | True => eq_nat c ch_lt
+            | False => False
+            end
+        end
+    end;
+
+def fx_sym_len (c : Nat) (rest : List Nat) : Nat :=
+    match rest with
+    | Nil => S Z
+    | Cons d _ =>
+        match fx_two_char c d with
+        | True => S (S Z)
+        | False => S Z
+        end
+    end;
+
+-- Symbols below ';' (59): ( ) ,
+def fx_sym_code_low (c : Nat) : Nat :=
+    match eq_nat c ch_lparen with
+    | True => fx_c_open
+    | False =>
+        match eq_nat c ch_rparen with
+        | True => fx_c_close
+        | False =>
+            match eq_nat c ch_comma with
+            | True => fx_c_comma
+            | False => fx_c_plain
+            end
+        end
+    end;
+
+-- Symbols above '[' (91): ] { | }
+def fx_sym_code_high (c : Nat) : Nat :=
+    match eq_nat c ch_rbrack with
+    | True => fx_c_close
+    | False =>
+        match eq_nat c ch_pipe with
+        | True => fx_c_bar
+        | False =>
+            match eq_nat c ch_lbrace with
+            | True => fx_c_open
+            | False =>
+                match eq_nat c ch_rbrace with
+                | True => fx_c_close
+                | False => fx_c_plain
+                end
+            end
+        end
+    end;
+
+-- Code of a one-character symbol, split on its byte value.
+def fx_sym_code1 (c : Nat) : Nat :=
+    match compareNat c ch_semi with
+    | EQ => fx_c_semi
+    | LT => fx_sym_code_low c
+    | GT =>
+        match compareNat c ch_lbrack with
+        | LT => fx_c_plain
+        | EQ => fx_c_open
+        | GT => fx_sym_code_high c
+        end
+    end;
+
+def fx_sym_code (c : Nat) (n : Nat) : Nat :=
+    match n with
+    | Z => fx_c_plain
+    | S n1 =>
+        match n1 with
+        | Z => fx_sym_code1 c
+        | S _ =>
+            match eq_nat c ch_lt with
+            | True => fx_c_bind
+            | False => fx_c_plain
+            end
+        end
+    end;
+
+def fx_pick (text : String) (a : String) (ca : Nat) : Nat :=
+    match str_eq text a with
+    | True => ca
+    | False => fx_c_plain
+    end;
+
+def fx_pick2 (text : String) (a : String) (ca : Nat) (b : String) (cb : Nat) : Nat :=
+    match str_eq text a with
+    | True => ca
+    | False => fx_pick text b cb
+    end;
+
+-- Code of an identifier token, dispatched on its first byte so a token costs
+-- at most two string comparisons.
+def fx_word_code_lower (c : Nat) (text : String) : Nat :=
+    match eq_nat c fx_ch_m with
+    | True => fx_pick text "match" fx_c_block
+    | False =>
+    match eq_nat c fx_ch_e with
+    | True => fx_pick text "end" fx_c_end
+    | False =>
+    match eq_nat c fx_ch_l with
+    | True => fx_pick2 text "let" fx_c_let "let!" fx_c_let_bang
+    | False =>
+    match eq_nat c fx_ch_i with
+    | True => fx_pick2 text "in" fx_c_in "import" fx_c_import
+    | False =>
+    match eq_nat c fx_ch_d with
+    | True => fx_pick text "def" fx_c_def
+    | False =>
+    match eq_nat c fx_ch_f with
+    | True => fx_pick2 text "fix" fx_c_fix "fun" fx_c_fun
+    | False =>
+    match eq_nat c fx_ch_h with
+    | True => fx_pick text "handle" fx_c_block
+    | False =>
+    match eq_nat c fx_ch_o with
+    | True => fx_pick text "open" fx_c_let
+    | False =>
+    match eq_nat c fx_ch_a with
+    | True => fx_pick text "as" fx_c_as
+    | False => fx_c_plain
+    end
+    end
+    end
+    end
+    end
+    end
+    end
+    end
+    end;
+
+def fx_word_code_upper (c : Nat) (text : String) : Nat :=
+    match eq_nat c fx_ch_S with
+    | True => fx_pick text "S" fx_c_succ
+    | False =>
+    match eq_nat c fx_ch_C with
+    | True => fx_pick text "Cons" fx_c_cons
+    | False =>
+    match eq_nat c fx_ch_N with
+    | True => fx_pick text "Nil" fx_c_nil
+    | False => fx_c_plain
+    end
+    end
+    end;
+
+-- Longest coded word is "import"/"handle" (6 bytes).
+def fx_word_max : Nat := 6;
+
+-- Code of an identifier token: words longer than any keyword are plain at
+-- once, the rest dispatch on their first byte to at most two string
+-- comparisons.
+def fx_word_code (c : Nat) (n : Nat) (text : String) : Nat :=
+    match compareNat n fx_word_max with
+    | GT => fx_c_plain
+    | EQ => fx_word_code_lower c text
+    | LT =>
+        match compareNat c fx_ch_a with
+        | LT => fx_word_code_upper c text
+        | EQ => fx_word_code_lower c text
+        | GT => fx_word_code_lower c text
+        end
+    end;
+
+-- "let!" is one token: the bang is glued to the keyword.
+def fx_ident_piece (src : String) (pos : Nat) (c : Nat) (cs : List Nat) : FxPiece :=
+    let p : FxPiece := fx_take_ident fx_fuel_ident cs Z in
+    match eq_nat c fx_ch_l with
+    | False => p
+    | True =>
+        match eq_nat (fx_piece_len p) fx_let_len with
+        | False => p
+        | True =>
+            match fx_piece_rest p with
+            | Nil => p
+            | Cons d rest =>
+                match eq_nat d ch_bang with
+                | False => p
+                | True =>
+                    match str_eq (str_slice src pos fx_let_len) "let" with
+                    | True => MkFxPiece rest (S fx_let_len)
+                    | False => p
+                    end
+                end
+            end
+        end
+    end;
+
+-- Dispatch order follows byte frequency in Ouro source: spaces, identifier
+-- starts, then one split on '0' separates digits and the high symbols
+-- (: ; < = > ? @ [ \ ] ^ ` { | } ~) from newlines, quotes, comments, and the
+-- low symbols (! # $ % & ' ( ) * + , - . /).
+def fx_lex_go (src : String) : Nat -> List Nat -> Nat -> Nat -> Nat -> Bool -> List FxTok -> List FxTok :=
+  fix go (fuel : Nat) (cs : List Nat) (pos : Nat) (line : Nat) (col : Nat) (bol : Bool)
+      (acc : List FxTok) : List FxTok :=
+    match fuel with
+    | Z => reverse_lin FxTok acc
+    | S fuel2 =>
+        match cs with
+        | Nil => reverse_lin FxTok acc
+        | Cons c rest =>
+            match eq_nat c ch_space with
+            | True => go fuel2 rest (S pos) line (S col) bol acc
+            | False =>
+            match fx_ident_start c with
+            | True =>
+                match fx_ident_piece src pos c cs with
+                | MkFxPiece rest2 n =>
+                    let text : String := str_slice src pos n in
+                    let stop : Nat := add pos n in
+                    go fuel2 rest2 stop line (add col n) False
+                      (Cons FxTok (MkFxTok fx_k_ident pos stop line col bol text
+                        (fx_word_code c n text)) acc)
+                end
+            | False =>
+            match compareNat c ch_zero with
+            | LT =>
+                match eq_nat c ch_lf with
+                | True => go fuel2 rest (S pos) (S line) Z True acc
+                | False =>
+                match eq_nat c ch_quote with
+                | True =>
+                    match fx_take_str fuel2 rest (S Z) line (S col) with
+                    | MkFxQuotedPiece rest2 n next_line next_col =>
+                        let stop : Nat := add pos n in
+                        go fuel2 rest2 stop next_line next_col False
+                          (Cons FxTok (MkFxTok fx_k_str pos stop line col bol
+                            (str_slice src pos n) fx_c_plain) acc)
+                    end
+                | False =>
+                match eq_nat c ch_minus with
+                | True =>
+                    match rest with
+                    | Cons d rest2 =>
+                        match eq_nat d ch_minus with
+                        | True =>
+                            match fx_take_while fx_not_lf rest2 (S (S Z)) with
+                            | MkFxPiece rest3 n =>
+                                go fuel2 rest3 (add pos n) line (add col n) bol acc
+                            end
+                        | False =>
+                            let n : Nat := fx_sym_len c rest in
+                            let stop : Nat := add pos n in
+                            go fuel2 (drop Nat n cs) stop line (add col n) False
+                              (Cons FxTok (MkFxTok fx_k_sym pos stop line col bol
+                                (str_slice src pos n) fx_c_plain) acc)
+                        end
+                    | Nil =>
+                        go fuel2 rest (S pos) line (S col) False
+                          (Cons FxTok (MkFxTok fx_k_sym pos (S pos) line col bol
+                            (str_slice src pos (S Z)) fx_c_plain) acc)
+                    end
+                | False =>
+                match eq_nat c ch_tab with
+                | True => go fuel2 rest (S pos) line (S col) bol acc
+                | False =>
+                match eq_nat c ch_cr with
+                | True => go fuel2 rest (S pos) line (S col) bol acc
+                | False =>
+                    let n : Nat := fx_sym_len c rest in
+                    let stop : Nat := add pos n in
+                    go fuel2 (drop Nat n cs) stop line (add col n) False
+                      (Cons FxTok (MkFxTok fx_k_sym pos stop line col bol
+                        (str_slice src pos n) (fx_sym_code c n)) acc)
+                end
+                end
+                end
+                end
+                end
+            | EQ =>
+                match fx_take_while fx_digit rest (S Z) with
+                | MkFxPiece rest2 n =>
+                    let stop : Nat := add pos n in
+                    go fuel2 rest2 stop line (add col n) False
+                      (Cons FxTok (MkFxTok fx_k_num pos stop line col bol
+                        (str_slice src pos n) fx_c_plain) acc)
+                end
+            | GT =>
+                match leb_nat c ch_nine with
+                | True =>
+                    match fx_take_while fx_digit rest (S Z) with
+                    | MkFxPiece rest2 n =>
+                        let stop : Nat := add pos n in
+                        go fuel2 rest2 stop line (add col n) False
+                          (Cons FxTok (MkFxTok fx_k_num pos stop line col bol
+                            (str_slice src pos n) fx_c_plain) acc)
+                    end
+                | False =>
+                    let n : Nat := fx_sym_len c rest in
+                    let stop : Nat := add pos n in
+                    go fuel2 (drop Nat n cs) stop line (add col n) False
+                      (Cons FxTok (MkFxTok fx_k_sym pos stop line col bol
+                        (str_slice src pos n) (fx_sym_code c n)) acc)
+                end
+            end
+            end
+            end
+        end
+    end;
+
+def fx_lex (src : String) : List FxTok :=
+    fx_lex_go src (S (str_len src)) (str_codes src) Z (S Z) Z True (Nil FxTok);

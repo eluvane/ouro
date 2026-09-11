@@ -1,0 +1,234 @@
+-- Shared declaration-checker model. Constructor order and fields are a cross-TU ABI
+-- between the frontend pipeline and file_elab; change only with fe_link parity tests.
+
+import "core.ouro";
+import "primitive_model.ouro";
+
+inductive Ctor : Type :=
+  | MkCtor : Nat -> CoreTerm -> Ctor;
+
+inductive Param : Type :=
+  | MkParam : Nat -> CoreTerm -> Param;
+
+inductive IndDecl : Type :=
+  | MkIndDecl : Nat -> List Param -> List CoreTerm -> Nat -> List Ctor -> IndDecl;
+
+-- Axioms carry a type and no body. Inductive entries preserve their descriptor.
+-- A role entry annotates an earlier checked inductive; it defines no new name.
+inductive Entry : Type :=
+  | MkEntry : Nat -> CoreTerm -> Maybe CoreTerm -> Entry
+  | MkIndEntry : Nat -> IndDecl -> Entry
+  | MkBoundEntry : Nat -> CoreTerm -> PrimitiveBinding -> Entry
+  | MkRoleEntry : PrimitiveRoleBinding -> Entry;
+
+inductive FileItem : Type :=
+  | FDef : Nat -> CoreTerm -> CoreTerm -> FileItem
+  | FAxiom : Nat -> CoreTerm -> FileItem
+  | FInd : IndDecl -> FileItem
+  | FIntrinsic : Nat -> CoreTerm -> List Nat -> Maybe CoreTerm -> FileItem
+  | FExtern : Nat -> CoreTerm -> ExternRequest -> FileItem
+  | FRepresentation : Nat -> List Nat -> FileItem;
+
+-- FRErr codes: 1=check, 2=not-a-type, 3=positivity, 4=fuel,
+-- 5=duplicate declaration, 6=malformed declaration/core plan,
+-- 7=unsupported operation, 8=cancelled, 9=internal failure.
+inductive FileResult : Type :=
+  | FROk : List Entry -> FileResult
+  | FRErr : Nat -> Nat -> FileResult;
+
+inductive NormalizeFault : Type :=
+  | NormalizeNonFunction : NormalizeFault
+  | NormalizeCaseBranchCount : NormalizeFault
+  | NormalizeCaseScrutinee : NormalizeFault
+  | NormalizeCaseInductive : NormalizeFault
+  | NormalizeCaseParameters : NormalizeFault
+  | NormalizeCaseConstructor : NormalizeFault
+  | NormalizeCaseArguments : NormalizeFault
+  | NormalizeFixArgument : NormalizeFault
+  | NormalizeFixArity : NormalizeFault
+  | NormalizeUnreducedHead : NormalizeFault
+  | NormalizeStringBytes : NormalizeFault
+  | NormalizeStringArguments : NormalizeFault
+  | NormalizeUnresolvedLiteral : NormalizeFault
+  | NormalizeStringType : NormalizeFault;
+
+-- One result protocol carries failures through term, spine and branch-list
+-- operations. Exhaustion never contains a partial value that resembles success.
+inductive NormalizeResult (A : Type) : Type :=
+  | Normalized : A -> NormalizeResult A
+  | NormalizeExhausted : NormalizeResult A
+  | NormalizeMalformed : NormalizeFault -> NormalizeResult A;
+
+def normalize_bind (A : Type) (B : Type) (result : NormalizeResult A)
+    (next : A -> NormalizeResult B) : NormalizeResult B :=
+    match result with
+    | Normalized value => next value
+    | NormalizeExhausted => NormalizeExhausted B
+    | NormalizeMalformed fault => NormalizeMalformed B fault
+    end;
+
+inductive CheckTypeFault : Type :=
+  | CheckTypeMismatch : CheckTypeFault
+  | CheckExpectedSort : CheckTypeFault
+  | CheckExpectedFunction : CheckTypeFault
+  | CheckCaseMotive : CheckTypeFault
+  | CheckNonPositive : CheckTypeFault
+  | CheckNonTerminating : CheckTypeFault
+  | CheckUniverseBound : CheckTypeFault;
+
+inductive CheckCoreFault : Type :=
+  | CheckUnboundVariable : Nat -> CheckCoreFault
+  | CheckUnboundGlobal : Nat -> CheckCoreFault
+  | CheckUnknownInductive : Nat -> CheckCoreFault
+  | CheckUnknownConstructor : Nat -> Nat -> CheckCoreFault
+  | CheckConstructorParameters : CheckCoreFault
+  | CheckCaseMetadata : CheckCoreFault
+  | CheckFixMetadata : CheckCoreFault
+  | CheckLiteralType : Nat -> CheckCoreFault
+  | CheckDuplicateName : Nat -> CheckCoreFault
+  | CheckUnresolvedLiteral : Nat -> CheckCoreFault;
+
+inductive CheckFailure : Type :=
+  | CheckTypeFailure : CheckTypeFault -> CheckFailure
+  | CheckMalformedCore : CheckCoreFault -> CheckFailure
+  | CheckReductionFailure : NormalizeFault -> CheckFailure
+  | CheckResourceLimit : CheckFailure
+  | CheckUnsupported : Nat -> CheckFailure
+  | CheckCancelled : CheckFailure
+  | CheckInternalFailure : Nat -> CheckFailure
+  | CheckPrimitiveFailure : PrimitiveError -> CheckFailure;
+
+inductive CheckResult (A : Type) : Type :=
+  | CheckOk : A -> CheckResult A
+  | CheckErr : CheckFailure -> CheckResult A;
+
+inductive CheckMode : Type :=
+  | CheckExactCore : CheckMode
+  | CheckSourceCore : CheckMode;
+
+inductive CheckPhase : Type :=
+  | CheckDeclarationPlan : CheckPhase
+  | CheckDeclarationType : CheckPhase
+  | CheckDeclarationBody : CheckPhase
+  | CheckInductiveDeclaration : CheckPhase;
+
+inductive CheckDirective : Type :=
+  | CheckContinue : CheckDirective
+  | CheckStop : CheckDirective;
+
+-- Success contains only the complete accepted environment. A failed or
+-- cancelled traversal never exposes a prefix as a successful module.
+inductive DeclarationResult : Type :=
+  | DeclarationsOk : List Entry -> DeclarationResult
+  | DeclarationsErr : Nat -> CheckPhase -> CheckFailure -> DeclarationResult;
+
+def primitive_failure_code (type_code : Nat) (failure : PrimitiveError) : Nat :=
+    match failure with
+    | PrimitiveResourceExhausted => 4
+    | PrimitiveUnknownKey => 7
+    | PrimitiveMissingType _ => type_code
+    | PrimitiveDuplicateType _ => 5
+    | PrimitiveDuplicateName _ => 5
+    | PrimitiveInvalidTypeBinding _ => type_code
+    | PrimitiveMissingRole _ => type_code
+    | PrimitiveDuplicateRole _ => 5
+    | PrimitiveInvalidRole _ => type_code
+    | PrimitiveUnsupportedTarget => 7
+    | PrimitiveUnsupportedAbi => 7
+    | PrimitiveInvalidExternName => type_code
+    | PrimitiveVariadicExtern => 7
+    | PrimitiveDependentAbi => type_code
+    | PrimitiveUnsupportedAbiType => type_code
+    | PrimitiveRuntimeResultRequired => type_code
+    | PrimitiveInvalidFunctionPointer => type_code
+    | PrimitiveSpecializationRequired => type_code
+    | PrimitiveUnexpectedSpecialization => type_code
+    | PrimitiveInvalidConversion => type_code
+    | PrimitiveInvalidLayout _ => type_code
+    end;
+
+def check_failure_code (type_code : Nat) (failure : CheckFailure) : Nat :=
+    match failure with
+    | CheckTypeFailure fault =>
+        match fault with
+        | CheckNonPositive => 3
+        | CheckTypeMismatch => type_code
+        | CheckExpectedSort => type_code
+        | CheckExpectedFunction => type_code
+        | CheckCaseMotive => type_code
+        | CheckNonTerminating => type_code
+        | CheckUniverseBound => type_code
+        end
+    | CheckMalformedCore fault =>
+        match fault with
+        | CheckDuplicateName _ => 5
+        | CheckUnboundVariable _ => 6
+        | CheckUnboundGlobal _ => 6
+        | CheckUnknownInductive _ => 6
+        | CheckUnknownConstructor _ _ => 6
+        | CheckConstructorParameters => 6
+        | CheckCaseMetadata => 6
+        | CheckFixMetadata => 6
+        | CheckLiteralType _ => 6
+        | CheckUnresolvedLiteral _ => 6
+        end
+    | CheckReductionFailure _ => 6
+    | CheckResourceLimit => 4
+    | CheckUnsupported _ => 7
+    | CheckCancelled => 8
+    | CheckInternalFailure _ => 9
+    | CheckPrimitiveFailure failure => primitive_failure_code type_code failure
+    end;
+
+def source_failure_code (type_code : Nat) (failure : CheckFailure) : Nat :=
+    match failure with
+    | CheckMalformedCore fault =>
+        match fault with
+        | CheckUnboundVariable _ => type_code
+        | CheckUnboundGlobal _ => type_code
+        | CheckUnknownInductive _ => type_code
+        | CheckUnknownConstructor _ _ => type_code
+        | CheckLiteralType _ => type_code
+        | CheckUnresolvedLiteral _ => check_failure_code type_code failure
+        | CheckConstructorParameters => check_failure_code type_code failure
+        | CheckCaseMetadata => check_failure_code type_code failure
+        | CheckFixMetadata => check_failure_code type_code failure
+        | CheckDuplicateName _ => check_failure_code type_code failure
+        end
+    | CheckTypeFailure _ => check_failure_code type_code failure
+    | CheckReductionFailure _ => check_failure_code type_code failure
+    | CheckResourceLimit => check_failure_code type_code failure
+    | CheckUnsupported _ => check_failure_code type_code failure
+    | CheckCancelled => check_failure_code type_code failure
+    | CheckInternalFailure _ => check_failure_code type_code failure
+    | CheckPrimitiveFailure _ => check_failure_code type_code failure
+    end;
+
+-- Numeric codes are a compatibility projection at the CLI boundary. Typed
+-- callers retain the original phase, declaration identifier and failure.
+def declaration_failure_code (mode : CheckMode) (phase : CheckPhase)
+    (failure : CheckFailure) : Nat :=
+    let fallback : Nat :=
+      match phase with
+      | CheckDeclarationPlan => 6
+      | CheckDeclarationType => 2
+      | CheckDeclarationBody => 1
+      | CheckInductiveDeclaration => 2
+      end in
+    match mode with
+    | CheckExactCore => check_failure_code fallback failure
+    | CheckSourceCore =>
+        match phase with
+        | CheckDeclarationPlan => check_failure_code fallback failure
+        | CheckDeclarationType => source_failure_code fallback failure
+        | CheckDeclarationBody => source_failure_code fallback failure
+        | CheckInductiveDeclaration => check_failure_code fallback failure
+        end
+    end;
+
+def declaration_file_result (mode : CheckMode) (result : DeclarationResult) : FileResult :=
+    match result with
+    | DeclarationsOk entries => FROk entries
+    | DeclarationsErr name phase failure =>
+        FRErr (declaration_failure_code mode phase failure) name
+    end;

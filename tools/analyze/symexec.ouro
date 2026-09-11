@@ -1,0 +1,274 @@
+-- Symbolic execution is bounded; unknown paths widen instead of fabricating
+-- precision. The path condition records which constructor each scrutinised
+-- variable was matched to, so a nested match on the same variable can be
+-- checked arm by arm. A pattern that rebinds the variable clears its entry.
+
+-- @entry analyze_symexec
+-- @entry sym_same_args
+
+import "../../std/data.ouro";
+import "../../std/listx.ouro";
+import "../../std/natx.ouro";
+import "ast.ouro";
+
+-- nested match where no arm can fire on the forced constructor (variable);
+-- arm whose constructor contradicts the path (arm ctor); recursive call that
+-- repeats every parameter unchanged (fix name).
+inductive SymIssue : Type :=
+  | IContradiction : Nat -> SymIssue
+  | IUnsatArm : Nat -> SymIssue
+  | INonterm : Nat -> SymIssue;
+
+def sym_inil : List SymIssue := [];
+
+def sym_icons (i : SymIssue) (is : List SymIssue) : List SymIssue :=
+    Cons SymIssue i is;
+
+def sym_append (xs : List SymIssue) (ys : List SymIssue) : List SymIssue :=
+    append SymIssue xs ys;
+
+def sym_forced (pc : List (Pair Nat Nat)) (var : Nat) : Maybe Nat :=
+    lookup Nat Nat eq_nat var pc;
+
+def sym_forget (ids : List Nat) (pc : List (Pair Nat Nat)) : List (Pair Nat Nat) :=
+    filter (Pair Nat Nat)
+      (fun (p : Pair Nat Nat) => notb (mem Nat eq_nat (fst Nat Nat p) ids)) pc;
+
+-- Constructor-headed arms only; slots the unit cannot classify are ignored.
+def sym_arm_ok (ctor_like : List Nat) (forced : Nat) (ctor : Nat) : Bool :=
+    orb (eq_nat ctor forced) (notb (mem Nat eq_nat ctor ctor_like));
+
+def sym_arm_issues (ctor_like : List Nat) (var : Nat) (forced : Nat)
+    (branches : Ast) : List SymIssue :=
+    let arms : List Nat := ast_arm_ctors branches in
+    match any Nat (sym_arm_ok ctor_like forced) arms with
+    | False =>
+        match arms with
+        | Nil => sym_inil
+        | Cons _ _ => sym_icons (IContradiction var) sym_inil
+        end
+    | True =>
+        map Nat SymIssue (fun (c : Nat) => IUnsatArm c)
+          (filter Nat (fun (c : Nat) => notb (sym_arm_ok ctor_like forced c)) arms)
+    end;
+
+def sym_match_issues (ctor_like : List Nat) (pc : List (Pair Nat Nat))
+    (scrut : Ast) (branches : Ast) : List SymIssue :=
+    match ast_var_id (ast_peel_ascribe scrut) with
+    | Nothing => sym_inil
+    | Just var =>
+        match sym_forced pc var with
+        | Nothing => sym_inil
+        | Just forced => sym_arm_issues ctor_like var forced branches
+        end
+    end;
+
+-- Arms extend the path condition for the scrutinised variable; binders that
+-- shadow a recorded variable drop its entry.
+def sym_arms (explore : Ast -> List (Pair Nat Nat) -> List SymIssue)
+    (pc : List (Pair Nat Nat)) (scrut : Maybe Nat) : Ast -> List SymIssue :=
+  fix sym_arms (b : Ast) : List SymIssue :=
+    match b with
+    | ABranch ctor ids body rest =>
+        let pc1 : List (Pair Nat Nat) := sym_forget ids pc in
+        let pc2 : List (Pair Nat Nat) :=
+          match scrut with
+          | Nothing => pc1
+          | Just var =>
+              match mem Nat eq_nat var ids with
+              | True => pc1
+              | False => Cons (Pair Nat Nat) (MkPair Nat Nat var ctor) pc1
+              end
+          end in
+        sym_append (explore body pc2) (sym_arms rest)
+    | ANoBranch => sym_inil
+    | AVar _ => sym_inil
+    | AHole _ => sym_inil
+    | ASort _ => sym_inil
+    | ANatLit _ => sym_inil
+    | AStr _ => sym_inil
+    | AApp _ _ => sym_inil
+    | ALam _ _ _ => sym_inil
+    | APi _ _ _ => sym_inil
+    | ALet _ _ _ _ => sym_inil
+    | AAscribe _ _ => sym_inil
+    | ABinder _ _ _ => sym_inil
+    | ANoBinder => sym_inil
+    | AFix _ _ _ _ => sym_inil
+    | AMatch _ _ => sym_inil
+    | APerform _ _ => sym_inil
+    | AHandle _ _ => sym_inil
+    | AClause _ _ _ _ => sym_inil
+    | ANoClause => sym_inil
+    | ADo _ => sym_inil
+    | AList _ => sym_inil
+    end;
+
+-- Arguments of an application spine, outermost last.
+def sym_args : Ast -> List Ast :=
+  fix sym_args (a : Ast) : List Ast :=
+    match a with
+    | AApp f x => snoc Ast (sym_args f) x
+    | AAscribe e _ => sym_args e
+    | AVar _ => Nil Ast
+    | AHole _ => Nil Ast
+    | ASort _ => Nil Ast
+    | ANatLit _ => Nil Ast
+    | AStr _ => Nil Ast
+    | ALam _ _ _ => Nil Ast
+    | APi _ _ _ => Nil Ast
+    | ALet _ _ _ _ => Nil Ast
+    | ABinder _ _ _ => Nil Ast
+    | ANoBinder => Nil Ast
+    | AFix _ _ _ _ => Nil Ast
+    | ABranch _ _ _ _ => Nil Ast
+    | ANoBranch => Nil Ast
+    | AMatch _ _ => Nil Ast
+    | APerform _ _ => Nil Ast
+    | AHandle _ _ => Nil Ast
+    | AClause _ _ _ _ => Nil Ast
+    | ANoClause => Nil Ast
+    | ADo _ => Nil Ast
+    | AList _ => Nil Ast
+    end;
+
+-- Every argument is the parameter in the same position; a name rebound on
+-- the way down (`shadowed`) is a different value even when the id matches.
+def sym_same_args (shadowed : List Nat) : List Nat -> List Ast -> Bool :=
+  fix sym_same_args (params : List Nat) (args : List Ast) : Bool :=
+    match params with
+    | Nil => match args with | Nil => True | Cons _ _ => False end
+    | Cons p ps =>
+        match args with
+        | Nil => False
+        | Cons a rest =>
+            match ast_var_id (ast_peel_ascribe a) with
+            | Nothing => False
+            | Just id =>
+                andb (eq_nat id p)
+                  (andb (notb (mem Nat eq_nat id shadowed)) (sym_same_args ps rest))
+            end
+        end
+    end;
+
+-- A recursive call passing all parameters unchanged loops whenever reached.
+-- Binders met on the way down shadow the parameters; an inner fix reusing
+-- the recursion name owns every call to it.
+def sym_repeats (r : Nat) (params : List Nat) (root : Ast) : Bool :=
+    (fix go (steps : Nat) (shadowed : List Nat) (a : Ast) : Bool :=
+      match steps with
+      | Z => False
+      | S remaining =>
+          let descend : List Nat -> Ast -> Bool :=
+            fun (scope : List Nat) (child : Ast) => go remaining scope child in
+          match a with
+          | AApp _ _ =>
+              orb (andb (ast_head_is r a) (sym_same_args shadowed params (sym_args a)))
+                (ast_any (descend shadowed) (ast_children a))
+          | ALam id ann body => orb (descend shadowed ann) (descend (Cons Nat id shadowed) body)
+          | APi id dom cod => orb (descend shadowed dom) (descend (Cons Nat id shadowed) cod)
+          | ALet id ann v body =>
+              orb (descend shadowed ann) (orb (descend shadowed v) (descend (Cons Nat id shadowed) body))
+          | ABinder id ty rest => orb (descend shadowed ty) (descend (Cons Nat id shadowed) rest)
+          | ABranch _ ids body rest =>
+              orb (descend (append Nat ids shadowed) body) (descend shadowed rest)
+          | AClause _ ids body rest =>
+              orb (descend (append Nat ids shadowed) body) (descend shadowed rest)
+          | AFix r2 binders ret body =>
+              match eq_nat r2 r with
+              | True => False
+              | False =>
+                  let inner : List Nat := append Nat (ast_binder_ids binders) shadowed in
+                  orb (descend shadowed binders) (orb (descend inner ret) (descend inner body))
+              end
+          | AVar _ => False
+          | AHole _ => False
+          | ASort _ => False
+          | ANatLit _ => False
+          | AStr _ => False
+          | AAscribe _ _ => ast_any (descend shadowed) (ast_children a)
+          | ANoBinder => False
+          | ANoBranch => False
+          | AMatch _ _ => ast_any (descend shadowed) (ast_children a)
+          | APerform _ _ => ast_any (descend shadowed) (ast_children a)
+          | AHandle _ _ => ast_any (descend shadowed) (ast_children a)
+          | ANoClause => False
+          | ADo _ => ast_any (descend shadowed) (ast_children a)
+          | AList _ => ast_any (descend shadowed) (ast_children a)
+          end
+      end) (ast_size root) (Nil Nat) root;
+
+def sym_fix_issue (r : Nat) (binders : Ast) (body : Ast) : List SymIssue :=
+    match ast_binder_ids binders with
+    | Nil => sym_inil
+    | Cons _ _ =>
+        match sym_repeats r (ast_binder_ids binders) body with
+        | True => sym_icons (INonterm r) sym_inil
+        | False => sym_inil
+        end
+    end;
+
+-- Fuel bounds the number of match forks explored along one path.
+def sym_explore (ctor_like : List Nat) : Nat -> Ast -> List (Pair Nat Nat)
+    -> List SymIssue :=
+  fun (initial_fuel : Nat) (root : Ast) (initial_pc : List (Pair Nat Nat)) =>
+    (fix sym_explore (steps : Nat) (fuel : Nat) (a : Ast) (pc : List (Pair Nat Nat)) : List SymIssue :=
+      match steps with
+      | Z => sym_inil
+      | S remaining =>
+          let descend : Nat -> Ast -> List (Pair Nat Nat) -> List SymIssue :=
+            fun (next_fuel : Nat) (child : Ast) (next_pc : List (Pair Nat Nat)) => sym_explore remaining next_fuel child next_pc in
+          match fuel with
+          | Z => sym_inil
+          | S fuel2 =>
+              match a with
+              | AMatch scrut branches =>
+                  sym_append (sym_match_issues ctor_like pc scrut branches)
+                    (sym_append (descend fuel2 scrut pc)
+                      (sym_arms (descend fuel2) pc
+                        (ast_var_id (ast_peel_ascribe scrut)) branches))
+              | AFix r binders ret body =>
+                  let pc2 : List (Pair Nat Nat) :=
+                    sym_forget (Cons Nat r (ast_binder_ids binders)) pc in
+                  sym_append (sym_fix_issue r binders body)
+                    (sym_append (descend fuel binders pc2)
+                      (sym_append (descend fuel ret pc2) (descend fuel body pc2)))
+              | ALam id ann body =>
+                  sym_append (descend fuel ann pc)
+                    (descend fuel body (sym_forget ([id] : List Nat) pc))
+              | ALet id ann v body =>
+                  sym_append (descend fuel ann pc)
+                    (sym_append (descend fuel v pc)
+                      (descend fuel body (sym_forget ([id] : List Nat) pc)))
+              | AClause _ ids body rest =>
+                  sym_append (descend fuel body (sym_forget ids pc))
+                    (descend fuel rest pc)
+              | AVar _ => sym_inil
+              | AHole _ => sym_inil
+              | ASort _ => sym_inil
+              | ANatLit _ => sym_inil
+              | AStr _ => sym_inil
+              | AApp f x => sym_append (descend fuel f pc) (descend fuel x pc)
+              | APi _ dom cod => sym_append (descend fuel dom pc) (descend fuel cod pc)
+              | AAscribe e t => sym_append (descend fuel e pc) (descend fuel t pc)
+              | ABinder _ ty rest =>
+                  sym_append (descend fuel ty pc) (descend fuel rest pc)
+              | ANoBinder => sym_inil
+              | ABranch _ ids body rest =>
+                  sym_append (descend fuel body (sym_forget ids pc))
+                    (descend fuel rest pc)
+              | ANoBranch => sym_inil
+              | APerform _ args =>
+                  concat_map Ast SymIssue (fun (arg : Ast) => descend fuel arg pc) args
+              | AHandle inner cls =>
+                  sym_append (descend fuel inner pc) (descend fuel cls pc)
+              | ANoClause => sym_inil
+              | ADo xs => concat_map Ast SymIssue (fun (x : Ast) => descend fuel x pc) xs
+              | AList xs => concat_map Ast SymIssue (fun (x : Ast) => descend fuel x pc) xs
+              end
+          end
+      end) (ast_size root) initial_fuel root initial_pc;
+
+-- ctor_like: ids the unit recognises as constructors; fuel: match depth.
+def analyze_symexec (ctor_like : List Nat) (fuel : Nat) (a : Ast) : List SymIssue :=
+    sym_explore ctor_like fuel a (Nil (Pair Nat Nat));

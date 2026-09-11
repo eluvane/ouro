@@ -1,0 +1,592 @@
+-- Packed frontend stitcher: shortcuts here remain untrusted until compile_program/kernel checking succeeds.
+-- Import-alias and record expanders run before lexing so C seams never rescan source.
+
+-- @entry compile_from_decls
+-- @export collect_lower_env_from; @doc docs/tcb.md
+-- @export lower_decls_env; @doc docs/tcb.md
+-- @export compile_from_decls; @doc docs/tcb.md
+-- @export stitch_checked_units; @doc docs/tcb.md
+-- @export stitch_source; @doc docs/tcb.md
+-- @export pipeline_compile_checked_units; @doc docs/tcb.md
+-- @export pipeline_compile_checked_source; @doc docs/tcb.md
+
+import "source_text.ouro";
+import "base.ouro";
+import "pipeline_support.ouro";
+import "checked_program_output.ouro";
+
+inductive UnitParse : Type :=
+  | UOk : SrcUnit -> InternState -> UnitParse
+  | UErr : Nat -> Nat -> InternState -> UnitParse;
+
+def parse_unit
+  (lex_go : Nat -> List Nat -> InternState -> List Token ->
+      LexResult)
+  (intern_string : InternState -> List Nat -> Pair Nat InternState)
+  (parse_file : Nat -> List Token -> Nat -> ParseResult (List Decl))
+  (fuel : Nat) (st : InternState) (path : List Nat) (src : List Nat)
+  : UnitParse :=
+  match intern_string st path with
+  | MkPair pid st1 =>
+      match lex_go fuel src st1 (Nil Token) with
+      | LexMalformed st2 => UErr lex_malformed_err_code Z st2
+      | LexExhausted st2 => UErr lex_exhausted_err_code Z st2
+      | LexOk toks st2 =>
+          match parse_file fuel toks Z with
+          | POk ds _toks _pos =>
+              match canon_imports path intern_string st2 ds with
+              | MkPair ds' st3 =>
+                  UOk (MkSrcUnit pid ds') st3
+              end
+          | PErr p => UErr parse_err_code p st2
+          end
+      end
+  end;
+
+inductive UnitsParse : Type :=
+  | UsOk : List SrcUnit -> InternState -> UnitsParse
+  | UsErr : Nat -> Nat -> InternState -> UnitsParse;
+
+def empty_imp_reg_pl : ImpReg := MkImpReg (Nil (List Nat));
+
+def empty_rec_reg_pl : RecReg :=
+  MkRecReg Z (Nil RecInfo) (Nil (List Nat)) (Nil RecBind);
+
+def seventy : Nat := mul (7) ten;
+def eighty : Nat := mul (8) ten;
+def sixty : Nat := mul (6) ten;
+def ergo_hole_code : Nat := add sixty (S Z);
+def ergo_do_code : Nat := add sixty (S (S Z));
+def ergo_pipe_code : Nat := add sixty (3);
+def ergo_list1_code : Nat := add sixty (4);
+def ergo_list2_code : Nat := add sixty (5);
+
+def ch_tab_e : Nat := 9;
+def ch_lf_e : Nat := 10;
+def ch_sp_e : Nat := 32;
+def ch_bang_e : Nat := 33;
+def ch_dq_e : Nat := 34;
+def ch_rparen_e : Nat := 41;
+def ch_comma_e : Nat := 44;
+def ch_dash_e : Nat := 45;
+def ch_zero_e : Nat := 48;
+def ch_nine_e : Nat := 57;
+def ch_semi_e : Nat := 59;
+def ch_gt_e : Nat := 62;
+def ch_q_e : Nat := 63;
+def ch_A_e : Nat := 65;
+def ch_Z_e : Nat := 90;
+def ch_lbrack_e : Nat := 91;
+def ch_bs_e : Nat := 92;
+def ch_rbrack_e : Nat := 93;
+def ch_uscore_e : Nat := 95;
+def ch_a_e : Nat := 97;
+def ch_z_e : Nat := 122;
+def ch_pipe_e : Nat := 124;
+def ch_squote_e : Nat := 39;
+
+def ident_start_e (c : Nat) : Bool :=
+  orb (eqNat c ch_uscore_e)
+    (orb (andb (compiler_le_nat ch_A_e c) (compiler_le_nat c ch_Z_e))
+      (andb (compiler_le_nat ch_a_e c) (compiler_le_nat c ch_z_e)));
+
+def ident_char_e (c : Nat) : Bool :=
+  orb (ident_start_e c)
+    (orb (eqNat c ch_squote_e)
+      (andb (compiler_le_nat ch_zero_e c) (compiler_le_nat c ch_nine_e)));
+
+def n1e (c : Nat) : List Nat := ([c] : List Nat);
+
+def not_ident_cont_e (xs : List Nat) : Bool :=
+  match xs with
+  | Nil => True
+  | Cons c _ =>
+      notb (ident_char_e c)
+  end;
+
+def word_e (prev_ident : Bool) (w : List Nat) (xs : List Nat) : Bool :=
+  match prev_ident with
+  | True => False
+  | False => andb (source_starts w xs) (not_ident_cont_e (source_drop_prefix w xs))
+  end;
+
+def w_do_e : List Nat := ([100, 111] : List Nat);
+def w_let_e : List Nat := ([108, 101, 116] : List Nat);
+
+def skip_ht_e : List Nat -> List Nat :=
+  fix go (xs : List Nat) : List Nat :=
+    match xs with
+    | Nil => Nil Nat
+    | Cons c rest =>
+        match orb (eqNat c ch_sp_e) (eqNat c ch_tab_e) with
+        | True => go rest
+        | False => xs
+        end
+    end;
+
+def skip_htn_e : List Nat -> List Nat :=
+  fix go (xs : List Nat) : List Nat :=
+    match xs with
+    | Nil => Nil Nat
+    | Cons c rest =>
+        match orb (eqNat c ch_sp_e)
+              (orb (eqNat c ch_tab_e) (eqNat c ch_lf_e)) with
+        | True => go rest
+        | False => xs
+        end
+    end;
+
+def pipe_dangling_e (after_pipe : List Nat) : Bool :=
+  match skip_ht_e after_pipe with
+  | Nil => True
+  | Cons c _ =>
+      orb (eqNat c ch_semi_e)
+        (orb (eqNat c ch_rparen_e)
+          (orb (eqNat c ch_rbrack_e)
+            (orb (eqNat c ch_comma_e) (eqNat c ch_lf_e))))
+  end;
+
+inductive ListScanE : Type :=
+  | LsOk : ListScanE
+  | LsBad : ListScanE;
+
+def scan_list_e (xs : List Nat) : ListScanE :=
+  (fix go (rest0 : List Nat) (depth : Nat) (trail : Bool) : ListScanE :=
+    match depth with
+    | Z =>
+        match trail with
+        | True => LsBad
+        | False => LsOk
+        end
+    | S d =>
+        match rest0 with
+        | Nil => LsBad
+        | Cons c rest =>
+            match eqNat c ch_lbrack_e with
+            | True => go rest (S depth) trail
+            | False =>
+                match eqNat c ch_rbrack_e with
+                | True => go rest d trail
+                | False =>
+                    match andb (eqNat c ch_comma_e) (eqNat depth (S Z)) with
+                    | False => go rest depth trail
+                    | True =>
+                        match skip_htn_e rest with
+                        | Cons c2 _ =>
+                            match eqNat c2 ch_rbrack_e with
+                            | True => go rest depth True
+                            | False => go rest depth trail
+                            end
+                        | Nil => go rest depth trail
+                        end
+                    end
+                end
+            end
+        end
+    end) xs (S Z) False;
+
+def classify_ergo (parse_fail : Bool) (src : List Nat)
+    : Maybe (Pair Nat Nat) :=
+  (fix go (scan_fuel : Nat) (xs : List Nat) (pos : Nat) (do_d : Nat) (prev_id : Bool)
+      : Maybe (Pair Nat Nat) :=
+    match scan_fuel with
+    | Z => Nothing (Pair Nat Nat)
+    | S remaining =>
+        match xs with
+        | Nil => Nothing (Pair Nat Nat)
+        | Cons c rest =>
+            match andb (eqNat c ch_dash_e) (source_starts (n1e ch_dash_e) rest) with
+            | True =>
+                match source_skip_line_pos rest (S pos) with
+                | MkPair xs2 p2 => go remaining xs2 p2 do_d False
+                end
+            | False =>
+                match eqNat c ch_dq_e with
+                | True =>
+                    match source_skip_string_pos rest (S pos) with
+                    | MkPair xs2 p2 => go remaining xs2 p2 do_d False
+                    end
+                | False =>
+                    match word_e prev_id w_do_e xs with
+                    | True => go remaining (source_drop_prefix w_do_e xs) (S (S pos)) (S do_d) True
+                    | False =>
+                        match andb (eqNat c ch_q_e) (ident_start_e
+                              (match rest with | Nil => Z | Cons c2 _ => c2 end)) with
+                        | True =>
+                            Just (Pair Nat Nat)
+                              (MkPair Nat Nat ergo_hole_code pos)
+                        | False =>
+                            match andb (word_e prev_id w_let_e xs)
+                                  (source_starts (n1e ch_bang_e)
+                                    (source_drop_prefix w_let_e xs)) with
+                            | True =>
+                                match do_d with
+                                | Z =>
+                                    Just (Pair Nat Nat)
+                                      (MkPair Nat Nat ergo_do_code pos)
+                                | S _ =>
+                                    go remaining (source_drop_prefix w_let_e xs) (S (S (S pos)))
+                                      do_d True
+                                end
+                            | False =>
+                                match andb (eqNat c ch_pipe_e)
+                                      (source_starts (n1e ch_gt_e) rest) with
+                                | True =>
+                                    match pipe_dangling_e (source_drop_prefix
+                                          (n1e ch_gt_e) rest) with
+                                    | True =>
+                                        Just (Pair Nat Nat)
+                                          (MkPair Nat Nat ergo_pipe_code pos)
+                                    | False => go remaining rest (S pos) do_d False
+                                    end
+                                | False =>
+                                    match eqNat c ch_lbrack_e with
+                                    | True =>
+                                        match scan_list_e rest with
+                                        | LsBad =>
+                                            Just (Pair Nat Nat)
+                                              (MkPair Nat Nat ergo_list2_code pos)
+                                        | LsOk =>
+                                            match parse_fail with
+                                            | False =>
+                                                Just (Pair Nat Nat)
+                                                  (MkPair Nat Nat
+                                                    ergo_list1_code pos)
+                                            | True =>
+                                                go remaining rest (S pos) do_d False
+                                            end
+                                        end
+                                    | False =>
+                                        go remaining rest (S pos) do_d (ident_char_e c)
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end) (S (length Nat src)) src Z Z False;
+
+def classify_files (parse_fail : Bool)
+    (files : List (Pair (List Nat) (List Nat))) : Maybe (Pair Nat Nat) :=
+  (fix go (xs : List (Pair (List Nat) (List Nat))) : Maybe (Pair Nat Nat) :=
+    match xs with
+    | Nil => Nothing (Pair Nat Nat)
+    | Cons f rest =>
+        match f with
+        | MkPair _ src =>
+            match classify_ergo parse_fail src with
+            | Just p => Just (Pair Nat Nat) p
+            | Nothing => go rest
+            end
+        end
+    end) files;
+
+def apply_ergo (hit : Maybe (Pair Nat Nat)) (fallback : CompError)
+    : CompError :=
+  match hit with
+  | Nothing => fallback
+  | Just p =>
+      match p with
+      | MkPair c pos => ErrCode c pos
+      end
+  end;
+
+def frontend_parse_error (files : List (Pair (List Nat) (List Nat)))
+    (code : Nat) (pos : Nat) : CompError :=
+    match eqNat code parse_err_code with
+    | True => apply_ergo (classify_files True files) (ErrCode code pos)
+    | False => ErrCode code pos
+    end;
+
+def parse_units
+  (lex_go : Nat -> List Nat -> InternState -> List Token -> LexResult)
+  (intern_string : InternState -> List Nat -> Pair Nat InternState)
+  (parse_file : Nat -> List Token -> Nat -> ParseResult (List Decl))
+  (fuel : Nat)
+  (initial : InternState) (input : List (Pair (List Nat) (List Nat))) : UnitsParse :=
+  (fix go (files : List (Pair (List Nat) (List Nat))) (st : InternState)
+    : UnitsParse :=
+    match files with
+    | Nil => UsOk (Nil SrcUnit) st
+    | Cons f files' =>
+        match f with
+        | MkPair path src =>
+            match parse_unit lex_go intern_string parse_file fuel st path src with
+            | UErr c p stE =>
+                match frontend_parse_error ([f] : List (Pair (List Nat) (List Nat))) c p with
+                | ErrCode code position => UsErr code position stE
+                end
+            | UOk u st1 =>
+                match go files' st1 with
+                | UsErr c p stE => UsErr c p stE
+                | UsOk us st2 => UsOk (Cons SrcUnit u us) st2
+                end
+            end
+        end
+    end) input initial;
+
+-- Source hints refine only generic parser/lowering failures. A typed checker
+-- error already identifies its phase and declaration; scanning unrelated source
+-- can replace that error and allocate an entire second diagnostic traversal.
+def ergo_reclassifiable (parse_fail : Bool) (error : CompError) : Bool :=
+    match error with | ErrCode code _ =>
+      eqNat code (match parse_fail with | True => parse_err_code | False => 2 end)
+    end;
+
+def remap_comp_src_for (A : Type) (parse_fail : Bool) (src : List Nat)
+    (r : CompResult A) : CompResult A :=
+  match r with
+  | COk x => COk A x
+  | CErr e =>
+      match ergo_reclassifiable parse_fail e with
+      | False => CErr A e
+      | True => CErr A (apply_ergo (classify_ergo parse_fail src) e)
+      end
+  end;
+
+def remap_comp_files_for (A : Type) (parse_fail : Bool)
+    (files : List (Pair (List Nat) (List Nat)))
+    (r : CompResult A) : CompResult A :=
+  match r with
+  | COk x => COk A x
+  | CErr e => match ergo_reclassifiable parse_fail e with
+      | False => CErr A e
+      | True => CErr A (apply_ergo (classify_files parse_fail files) e)
+      end
+  end;
+
+def remap_comp_src (parse_fail : Bool) (src : List Nat)
+    (result : CompResult (List (Pair Nat CoreTerm)))
+    : CompResult (List (Pair Nat CoreTerm)) :=
+    remap_comp_src_for (List (Pair Nat CoreTerm)) parse_fail src result;
+
+def remap_comp_files (parse_fail : Bool)
+    (files : List (Pair (List Nat) (List Nat)))
+    (result : CompResult (List (Pair Nat CoreTerm)))
+    : CompResult (List (Pair Nat CoreTerm)) :=
+    remap_comp_files_for (List (Pair Nat CoreTerm)) parse_fail files result;
+
+inductive SrcPrep : Type :=
+  | SrcPrepErr : Nat -> Nat -> SrcPrep
+  | SrcPrepOk : RecReg -> List Nat -> SrcPrep;
+
+inductive FilesPrep : Type :=
+  | FilesPrepErr : Nat -> Nat -> FilesPrep
+  | FilesPrepOk : List (Pair (List Nat) (List Nat)) -> FilesPrep;
+
+def preprocess_src
+  (preprocess_imports_reg : ImpReg -> List Nat -> Pair ImpReg ImpPrep)
+  (preprocess_records_reg : RecReg -> List Nat -> Pair RecReg PrepResult)
+  (rec_reg : RecReg) (src : List Nat) : SrcPrep :=
+  match preprocess_imports_reg empty_imp_reg_pl src with
+  | MkPair _ imp =>
+      match imp with
+      | ImpErr c p => SrcPrepErr (add eighty c) p
+      | ImpOk src1 =>
+          match preprocess_records_reg rec_reg src1 with
+          | MkPair rec2 recp =>
+              match recp with
+              | PrepErr c p => SrcPrepErr (add seventy c) p
+              | PrepOk src2 => SrcPrepOk rec2 src2
+              end
+          end
+      end
+  end;
+
+-- Same order as the retired C preprocess_files: walk the list reversed
+-- so the last unit is expanded first, then cons results back to the
+-- original file order. RecReg follows that walk.
+def preprocess_file_list
+  (preprocess_imports_reg : ImpReg -> List Nat -> Pair ImpReg ImpPrep)
+  (preprocess_records_reg : RecReg -> List Nat -> Pair RecReg PrepResult)
+  (files : List (Pair (List Nat) (List Nat))) : FilesPrep :=
+  (fix go (xs : List (Pair (List Nat) (List Nat))) (reg : RecReg)
+      (acc : List (Pair (List Nat) (List Nat))) : FilesPrep :=
+    match xs with
+    | Nil => FilesPrepOk acc
+    | Cons f rest =>
+        match f with
+        | MkPair path src =>
+            match preprocess_src preprocess_imports_reg
+                    preprocess_records_reg reg src with
+            | SrcPrepErr c p => FilesPrepErr c p
+            | SrcPrepOk reg2 src2 =>
+                go rest reg2
+                  (Cons (Pair (List Nat) (List Nat))
+                    (MkPair (List Nat) (List Nat) path src2) acc)
+            end
+        end
+    end) (reverse (Pair (List Nat) (List Nat)) files) empty_rec_reg_pl
+      (Nil (Pair (List Nat) (List Nat)));
+
+def import_err (A : Type) (c : Nat) (det : Nat) : CompResult A :=
+  CErr A (ErrCode (add 90 c) det);
+
+-- Packed multi-file stitcher. Returns the intern table beside the
+-- CompResult so the host can recover emit names (ouro_fe_last_intern).
+def stitch_checked_units
+  (lex_go : Nat -> List Nat -> InternState -> List Token ->
+      LexResult)
+  (intern_string : InternState -> List Nat -> Pair Nat InternState)
+  (parse_file : Nat -> List Token -> Nat -> ParseResult (List Decl))
+  (resolve_imports : List SrcUnit -> Nat -> ResolveResult (List Decl))
+  (desugar_file : List Decl -> List Decl)
+  (rewrite_declarations : Nat -> LowerEnv -> List Decl -> List Decl)
+  (lower_expr_env2 : LowerEnv -> Maybe Surface -> Expr -> Surface)
+  (compile_program : List (Pair Nat Surface) -> CompResult (List (Pair Nat CoreTerm)))
+  (elaborate_surfaces : Nat -> List (Pair Nat Surface) -> List (Pair Nat CoreTerm))
+  (elaborate : Nat -> Surface -> List Nat -> CoreTerm)
+  (check_module : Nat -> List Nat -> List FileItem -> DeclarationResult)
+  (preprocess_imports_reg : ImpReg -> List Nat -> Pair ImpReg ImpPrep)
+  (preprocess_records_reg : RecReg -> List Nat -> Pair RecReg PrepResult)
+  (fuel : Nat) (root : List Nat)
+  (files : List (Pair (List Nat) (List Nat)))
+  : Pair (CompResult CheckedProgram) InternState :=
+  match preprocess_file_list preprocess_imports_reg preprocess_records_reg
+          files with
+  | FilesPrepErr c p =>
+      MkPair (CompResult CheckedProgram) InternState
+        (CErr CheckedProgram (ErrCode c p)) empty_intern
+  | FilesPrepOk files1 =>
+      match parse_units lex_go intern_string parse_file fuel empty_intern
+              files1 with
+      | UsErr c p stE =>
+          MkPair (CompResult CheckedProgram) InternState
+            (CErr CheckedProgram (ErrCode c p)) stE
+      | UsOk units st =>
+          match intern_string st root with
+          | MkPair rootId st2 =>
+              match resolve_imports units rootId with
+              | RErr c det =>
+                  MkPair (CompResult CheckedProgram) InternState
+                    (import_err CheckedProgram c det) st2
+              | ROk ds =>
+                  MkPair (CompResult CheckedProgram) InternState
+                    (remap_comp_files_for CheckedProgram False files1
+                      (compile_checked_from_decls desugar_file rewrite_declarations lower_expr_env2
+                        compile_program elaborate_surfaces elaborate check_module
+                        (unit_decl_names units rootId) fuel st2 ds))
+                    st2
+              end
+          end
+      end
+  end;
+
+def stitch_checked_source
+  (lex_go : Nat -> List Nat -> InternState -> List Token ->
+      LexResult)
+  (parse_file : Nat -> List Token -> Nat -> ParseResult (List Decl))
+  (desugar_file : List Decl -> List Decl)
+  (rewrite_declarations : Nat -> LowerEnv -> List Decl -> List Decl)
+  (lower_expr_env2 : LowerEnv -> Maybe Surface -> Expr -> Surface)
+  (compile_program : List (Pair Nat Surface) -> CompResult (List (Pair Nat CoreTerm)))
+  (elaborate_surfaces : Nat -> List (Pair Nat Surface) -> List (Pair Nat CoreTerm))
+  (elaborate : Nat -> Surface -> List Nat -> CoreTerm)
+  (check_module : Nat -> List Nat -> List FileItem -> DeclarationResult)
+  (preprocess_imports_reg : ImpReg -> List Nat -> Pair ImpReg ImpPrep)
+  (preprocess_records_reg : RecReg -> List Nat -> Pair RecReg PrepResult)
+  (fuel : Nat) (src : List Nat)
+  : Pair (CompResult CheckedProgram) InternState :=
+  match preprocess_src preprocess_imports_reg preprocess_records_reg
+          empty_rec_reg_pl src with
+  | SrcPrepErr c p =>
+      MkPair (CompResult CheckedProgram) InternState
+        (CErr CheckedProgram (ErrCode c p)) empty_intern
+  | SrcPrepOk _ src1 =>
+      match lex_go fuel src1 empty_intern (Nil Token) with
+      | LexMalformed st =>
+          MkPair (CompResult CheckedProgram) InternState
+            (CErr CheckedProgram
+              (ErrCode lex_malformed_err_code Z)) st
+      | LexExhausted st =>
+          MkPair (CompResult CheckedProgram) InternState
+            (CErr CheckedProgram
+              (ErrCode lex_exhausted_err_code Z)) st
+      | LexOk toks st =>
+          match parse_file fuel toks Z with
+          | PErr p =>
+              MkPair (CompResult CheckedProgram) InternState
+                (CErr CheckedProgram
+                  (apply_ergo (classify_ergo True src1)
+                    (ErrCode parse_err_code p))) st
+          | POk ds _toks _pos =>
+              MkPair (CompResult CheckedProgram) InternState
+                (remap_comp_src_for CheckedProgram False src1
+                  (compile_checked_from_decls desugar_file rewrite_declarations lower_expr_env2
+                    compile_program elaborate_surfaces elaborate check_module
+                    (decl_check_names ds) fuel st ds))
+                st
+          end
+      end
+  end;
+
+def pipeline_compile_checked_units
+  (lex_go : Nat -> List Nat -> InternState -> List Token ->
+      LexResult)
+  (intern_string : InternState -> List Nat -> Pair Nat InternState)
+  (parse_file : Nat -> List Token -> Nat -> ParseResult (List Decl))
+  (resolve_imports : List SrcUnit -> Nat -> ResolveResult (List Decl))
+  (desugar_file : List Decl -> List Decl)
+  (rewrite_declarations : Nat -> LowerEnv -> List Decl -> List Decl)
+  (lower_expr_env2 : LowerEnv -> Maybe Surface -> Expr -> Surface)
+  (compile_program : List (Pair Nat Surface) -> CompResult (List (Pair Nat CoreTerm)))
+  (elaborate_surfaces : Nat -> List (Pair Nat Surface) -> List (Pair Nat CoreTerm))
+  (elaborate : Nat -> Surface -> List Nat -> CoreTerm)
+  (check_module : Nat -> List Nat -> List FileItem -> DeclarationResult)
+  (preprocess_imports_reg : ImpReg -> List Nat -> Pair ImpReg ImpPrep)
+  (preprocess_records_reg : RecReg -> List Nat -> Pair RecReg PrepResult)
+  (fuel : Nat) (root : List Nat)
+  (files : List (Pair (List Nat) (List Nat)))
+  : CompResult CheckedProgram :=
+  match stitch_checked_units lex_go intern_string parse_file resolve_imports
+          desugar_file rewrite_declarations lower_expr_env2 compile_program elaborate_surfaces
+          elaborate check_module preprocess_imports_reg preprocess_records_reg
+          fuel root files with
+  | MkPair r _st => r
+  end;
+
+def pipeline_compile_checked_source
+  (lex_go : Nat -> List Nat -> InternState -> List Token ->
+      LexResult)
+  (parse_file : Nat -> List Token -> Nat -> ParseResult (List Decl))
+  (desugar_file : List Decl -> List Decl)
+  (rewrite_declarations : Nat -> LowerEnv -> List Decl -> List Decl)
+  (lower_expr_env2 : LowerEnv -> Maybe Surface -> Expr -> Surface)
+  (compile_program : List (Pair Nat Surface) -> CompResult (List (Pair Nat CoreTerm)))
+  (elaborate_surfaces : Nat -> List (Pair Nat Surface) -> List (Pair Nat CoreTerm))
+  (elaborate : Nat -> Surface -> List Nat -> CoreTerm)
+  (check_module : Nat -> List Nat -> List FileItem -> DeclarationResult)
+  (preprocess_imports_reg : ImpReg -> List Nat -> Pair ImpReg ImpPrep)
+  (preprocess_records_reg : RecReg -> List Nat -> Pair RecReg PrepResult)
+  (fuel : Nat) (src : List Nat)
+  : CompResult CheckedProgram :=
+  match stitch_checked_source lex_go parse_file desugar_file rewrite_declarations lower_expr_env2
+          compile_program elaborate_surfaces elaborate check_module
+          preprocess_imports_reg preprocess_records_reg fuel src with
+  | MkPair r _st => r
+  end;
+
+-- The packed C frontend consumes the explicit compatibility projection.
+-- Source-native compilation uses pipeline_compile_checked_source above.
+def stitch_source
+  (lex_go : Nat -> List Nat -> InternState -> List Token -> LexResult)
+  (parse_file : Nat -> List Token -> Nat -> ParseResult (List Decl))
+  (desugar_file : List Decl -> List Decl)
+  (rewrite_declarations : Nat -> LowerEnv -> List Decl -> List Decl)
+  (lower_expr_env2 : LowerEnv -> Maybe Surface -> Expr -> Surface)
+  (compile_program : List (Pair Nat Surface) -> CompResult (List (Pair Nat CoreTerm)))
+  (elaborate_surfaces : Nat -> List (Pair Nat Surface) -> List (Pair Nat CoreTerm))
+  (elaborate : Nat -> Surface -> List Nat -> CoreTerm)
+  (check_module : Nat -> List Nat -> List FileItem -> DeclarationResult)
+  (preprocess_imports_reg : ImpReg -> List Nat -> Pair ImpReg ImpPrep)
+  (preprocess_records_reg : RecReg -> List Nat -> Pair RecReg PrepResult)
+  (fuel : Nat) (src : List Nat)
+  : Pair (CompResult (List (Pair Nat CoreTerm))) InternState :=
+    match stitch_checked_source lex_go parse_file desugar_file rewrite_declarations
+      lower_expr_env2 compile_program elaborate_surfaces elaborate check_module
+      preprocess_imports_reg preprocess_records_reg fuel src with
+    | MkPair result state => MkPair (CompResult (List (Pair Nat CoreTerm))) InternState
+        (checked_program_erase result) state
+    end;

@@ -1,0 +1,633 @@
+-- Analysis unit on the real frontend: preprocess_imports -> preprocess_records
+-- -> lex_all -> parse_file -> expr_adapt. Cores see one shared Ast per
+-- definition plus the lexer intern table, capability ids, constructor/owner
+-- pairs, definition lines, the comment block above each definition, and the
+-- comment-derived marks (public names, taint policy, loose blocks). Imports
+-- are not inlined: a unit is exactly one source file. This cone must stay off
+-- std/char and std/string, whose character vocabulary collides with the
+-- lexer's.
+
+-- @entry unit_of_source
+-- @entry unit_name
+-- @entry unit_marks
+-- @entry layer_of_path
+
+import "../../std/data.ouro";
+import "../../std/listx.ouro";
+import "../../std/runtime.ouro";
+import "../../compiler/lexer.ouro";
+import "../../compiler/parser.ouro";
+import "../../compiler/preprocess_import.ouro";
+import "../../compiler/preprocess_record.ouro";
+import "ast.ouro";
+import "policy_ids.ouro";
+import "expr_adapt.ouro";
+
+-- name id, source line (1-based; Z when the scan found no `def name` line),
+-- comment lines of the block directly above the definition (line, text after
+-- the dashes), body ascribed with its declared type.
+inductive UnitDef : Type :=
+  | MkUnitDef : Nat -> Nat -> List (Pair Nat String) -> Ast -> UnitDef;
+
+-- Comment-derived policy of the unit: public (entry/export) ids, taint
+-- sources, sinks, secrets, effect operation ids declared in the unit, and
+-- comment lines of blocks no definition follows (line, text).
+inductive UnitMarks : Type :=
+  | MkUnitMarks : List Nat -> List Nat -> List Nat -> List Nat -> List Nat
+      -> List (Pair Nat String) -> UnitMarks;
+
+-- Inductive shapes of the unit: constructor/owner pairs, constructors of
+-- indexed families (`Eq (A : Type) (x : A) : A -> Type`), inductives with no
+-- constructors (`Empty`), and the source line of each inductive (Z when the
+-- scan found no `inductive name` line). Matching on the second and third
+-- eliminates, so a one-arm or branchless match there is a proof step, not a
+-- shape smell.
+inductive UnitTypes : Type :=
+  | MkUnitTypes : List (Pair Nat Nat) -> List Nat -> List Nat -> List (Pair Nat Nat)
+      -> UnitTypes;
+
+-- intern table, capability ids, inductive shapes, marks, definitions.
+inductive AnalysisUnit : Type :=
+  | MkAnalysisUnit : InternState -> CapIds -> UnitTypes -> UnitMarks
+      -> List UnitDef -> AnalysisUnit
+  | UnitRejected : String -> AnalysisUnit;
+
+-- name codes, line, comment block above.
+inductive DefLine : Type :=
+  | MkDefLine : List Nat -> Nat -> List (Pair Nat String) -> DefLine;
+
+-- definition lines, loose comment lines, inductive lines (name codes, line).
+inductive UnitScan : Type :=
+  | MkUnitScan : List DefLine -> List (Pair Nat String) -> List (Pair (List Nat) Nat)
+      -> UnitScan;
+
+def unit_def_name (d : UnitDef) : Nat :=
+    match d with | MkUnitDef n _ _ _ => n end;
+
+def unit_def_line (d : UnitDef) : Nat :=
+    match d with | MkUnitDef _ l _ _ => l end;
+
+def unit_def_notes (d : UnitDef) : List (Pair Nat String) :=
+    match d with | MkUnitDef _ _ notes _ => notes end;
+
+def unit_def_ast (d : UnitDef) : Ast :=
+    match d with | MkUnitDef _ _ _ a => a end;
+
+def marks_public (m : UnitMarks) : List Nat :=
+    match m with | MkUnitMarks p _ _ _ _ _ => p end;
+
+def marks_sources (m : UnitMarks) : List Nat :=
+    match m with | MkUnitMarks _ s _ _ _ _ => s end;
+
+def marks_sinks (m : UnitMarks) : List Nat :=
+    match m with | MkUnitMarks _ _ k _ _ _ => k end;
+
+def marks_secrets (m : UnitMarks) : List Nat :=
+    match m with | MkUnitMarks _ _ _ x _ _ => x end;
+
+def marks_effect_ops (m : UnitMarks) : List Nat :=
+    match m with | MkUnitMarks _ _ _ _ ops _ => ops end;
+
+def marks_loose (m : UnitMarks) : List (Pair Nat String) :=
+    match m with | MkUnitMarks _ _ _ _ _ loose => loose end;
+
+def types_ctors (t : UnitTypes) : List (Pair Nat Nat) :=
+    match t with | MkUnitTypes cs _ _ _ => cs end;
+
+def types_dependent (t : UnitTypes) : List Nat :=
+    match t with | MkUnitTypes _ dep _ _ => dep end;
+
+def types_uninhabited (t : UnitTypes) : List Nat :=
+    match t with | MkUnitTypes _ _ empty _ => empty end;
+
+def types_lines (t : UnitTypes) : List (Pair Nat Nat) :=
+    match t with | MkUnitTypes _ _ _ lines => lines end;
+
+-- Source line of an inductive; Z when unknown.
+def types_line_of (t : UnitTypes) (ind : Nat) : Nat :=
+    match lookup Nat Nat eqNat ind (types_lines t) with
+    | Just line => line
+    | Nothing => Z
+    end;
+
+def unit_name_codes (st : InternState) (id : Nat) : List Nat :=
+  (fix go (xs : List (Pair (List Nat) Nat)) : List Nat :=
+    match xs with
+    | Nil => Nil Nat
+    | Cons p rest =>
+        match p with
+        | MkPair codes n =>
+            match eqNat n id with
+            | True => codes
+            | False => go rest
+            end
+        end
+    end) (unit_intern_ids st);
+
+def unit_name (st : InternState) (id : Nat) : String :=
+    prim_string_of_char_codes (unit_name_codes st id);
+
+-- Z when the name never occurs in the unit; lexer ids start at 1, so Z
+-- matches no variable.
+def unit_id_of (st : InternState) (name : String) : Nat :=
+    match source_lookup_id (unit_intern_ids st) (prim_string_to_char_codes name) with
+    | Just n => n
+    | Nothing => Z
+    end;
+
+def unit_ids_of (st : InternState) (names : List String) : List Nat :=
+  foldl String (List Nat)
+    (fun (acc : List Nat) (name : String) =>
+      match source_lookup_id (unit_intern_ids st) (prim_string_to_char_codes name) with
+      | Nothing => acc
+      | Just n => Cons Nat n acc
+      end)
+    (Nil Nat) names;
+
+def fs_prim_names : List String :=
+  [ "prim_fs_read_file", "prim_fs_write_file", "prim_fs_exists",
+    "prim_fs_kind", "prim_fs_realpath", "prim_fs_temp_file",
+    "prim_fs_temp_file_in", "prim_fs_listable",
+    "prim_fs_is_dir", "prim_fs_list_dir", "prim_fs_mkdir", "prim_fs_remove",
+    "prim_fs_copy_file", "prim_fs_rename" ];
+
+def proc_prim_names : List String := [ "prim_proc_exec", "prim_process_capture", "prim_process_capture_bounded", "prim_process_inherit" ];
+
+def http_prim_names : List String := [ "prim_http_post", "prim_http_request" ];
+
+-- Runtime sources and sinks supplement each unit's source/sink annotations.
+def taint_source_prims : List String :=
+  [ "prim_argv", "prim_env_get", "prim_stdin_read_line", "prim_stdin_read_bytes"
+  , "prim_fs_read_file", "prim_process_capture", "prim_process_capture_bounded", "prim_process_inherit", "prim_http_request" ];
+
+def taint_sink_prims : List String :=
+  [ "prim_proc_exec", "prim_process_capture", "prim_process_capture_bounded", "prim_process_inherit", "prim_http_post", "prim_http_request"
+  , "prim_fs_write_file", "prim_fs_remove", "prim_fs_mkdir", "prim_fs_copy_file"
+  , "prim_fs_rename" ];
+
+def host_fast_names : List String :=
+  [ "xor32", "and32", "or32", "not32", "shl32", "shr32", "rotr32", "add32" ];
+
+def kernel_names : List String := [ "typecheck", "kernel" ];
+
+def unit_is_upper (c : Nat) : Bool :=
+    andb (compiler_le_nat 65 c) (compiler_le_nat c 90);
+
+-- Constructors are capitalised by convention. Imported inductives are not in
+-- the unit, so the intern table is the only witness that a pattern slot such
+-- as `True` refines an arm instead of binding a variable.
+def unit_ctor_like_ids (st : InternState) : List Nat :=
+  foldl (Pair (List Nat) Nat) (List Nat)
+    (fun (acc : List Nat) (p : Pair (List Nat) Nat) =>
+      match p with
+      | MkPair codes n =>
+          match codes with
+          | Nil => acc
+          | Cons c _ =>
+              match unit_is_upper c with
+              | True => Cons Nat n acc
+              | False => acc
+              end
+          end
+      end)
+    (Nil Nat) (unit_intern_ids st);
+
+def unit_ch_underscore : Nat := 95;
+
+-- Names spelt with a leading underscore are deliberate discards.
+def unit_discard_ids (st : InternState) : List Nat :=
+  foldl (Pair (List Nat) Nat) (List Nat)
+    (fun (acc : List Nat) (p : Pair (List Nat) Nat) =>
+      match p with
+      | MkPair codes n =>
+          match codes with
+          | Nil => acc
+          | Cons c _ =>
+              match eqNat c unit_ch_underscore with
+              | True => Cons Nat n acc
+              | False => acc
+              end
+          end
+      end)
+    (Nil Nat) (unit_intern_ids st);
+
+-- Anonymous `_` binders are id Z in the parser, so the underscore slot is Z.
+def unit_cap_ids (st : InternState) : CapIds :=
+    MkCap Z (unit_id_of st "pure") (unit_ids_of st proc_prim_names)
+      (unit_ids_of st http_prim_names) (unit_ids_of st fs_prim_names)
+      (unit_ids_of st host_fast_names) (unit_id_of st "IO")
+      (unit_ids_of st kernel_names);
+
+def unit_ctor_pairs (ds : List Decl) : List (Pair Nat Nat) :=
+  concat_map Decl (Pair Nat Nat)
+    (fun (d : Decl) =>
+      match d with
+      | DInductive ind _ _ cs =>
+          map (Pair Nat Expr) (Pair Nat Nat)
+            (fun (c : Pair Nat Expr) =>
+              match c with
+              | MkPair ctor _ => MkPair Nat Nat ctor ind
+              end) cs
+      | DDef _ _ _ => Nil (Pair Nat Nat)
+      | DAxiom _ _ => Nil (Pair Nat Nat)
+      | DEffect _ _ _ => Nil (Pair Nat Nat)
+      | DImport _ => Nil (Pair Nat Nat)
+      | DIntrinsic _ _ _ _ => Nil (Pair Nat Nat)
+      | DExtern _ _ _ => Nil (Pair Nat Nat)
+      | DRepresentation _ _ => Nil (Pair Nat Nat)
+      end) ds;
+
+-- Constructors of inductives whose arity after the parameters is a Pi: the
+-- indices are what a match on them refines.
+def unit_dependent_ctors (ds : List Decl) : List Nat :=
+  concat_map Decl Nat
+    (fun (d : Decl) =>
+      match d with
+      | DInductive _ _ arity cs =>
+          match ast_is tag_pi (adapt arity) with
+          | False => Nil Nat
+          | True =>
+              map (Pair Nat Expr) Nat
+                (fun (c : Pair Nat Expr) => match c with | MkPair ctor _ => ctor end)
+                cs
+          end
+      | DDef _ _ _ => Nil Nat
+      | DAxiom _ _ => Nil Nat
+      | DEffect _ _ _ => Nil Nat
+      | DImport _ => Nil Nat
+      | DIntrinsic _ _ _ _ => Nil Nat
+      | DExtern _ _ _ => Nil Nat
+      | DRepresentation _ _ => Nil Nat
+      end) ds;
+
+def unit_uninhabited (ds : List Decl) : List Nat :=
+  concat_map Decl Nat
+    (fun (d : Decl) =>
+      match d with
+      | DInductive ind _ _ cs =>
+          match cs with
+          | Nil => ([ind] : List Nat)
+          | Cons _ _ => Nil Nat
+          end
+      | DDef _ _ _ => Nil Nat
+      | DAxiom _ _ => Nil Nat
+      | DEffect _ _ _ => Nil Nat
+      | DImport _ => Nil Nat
+      | DIntrinsic _ _ _ _ => Nil Nat
+      | DExtern _ _ _ => Nil Nat
+      | DRepresentation _ _ => Nil Nat
+      end) ds;
+
+-- Line of the inductive spelt `codes`; Z when the scan saw none.
+def unit_inductive_line (codes : List Nat) : List (Pair (List Nat) Nat) -> Nat :=
+  fix go (xs : List (Pair (List Nat) Nat)) : Nat :=
+    match xs with
+    | Nil => Z
+    | Cons p rest =>
+        match p with
+        | MkPair name line =>
+            match source_bytes_equal name codes with
+            | True => line
+            | False => go rest
+            end
+        end
+    end;
+
+def unit_inductive_lines (st : InternState) (inds : List (Pair (List Nat) Nat))
+    (ds : List Decl) : List (Pair Nat Nat) :=
+  concat_map Decl (Pair Nat Nat)
+    (fun (d : Decl) =>
+      match d with
+      | DInductive ind _ _ _ =>
+          ([MkPair Nat Nat ind (unit_inductive_line (unit_name_codes st ind) inds)]
+            : List (Pair Nat Nat))
+      | DDef _ _ _ => Nil (Pair Nat Nat)
+      | DAxiom _ _ => Nil (Pair Nat Nat)
+      | DEffect _ _ _ => Nil (Pair Nat Nat)
+      | DImport _ => Nil (Pair Nat Nat)
+      | DIntrinsic _ _ _ _ => Nil (Pair Nat Nat)
+      | DExtern _ _ _ => Nil (Pair Nat Nat)
+      | DRepresentation _ _ => Nil (Pair Nat Nat)
+      end) ds;
+
+def unit_types (st : InternState) (inds : List (Pair (List Nat) Nat)) (ds : List Decl)
+    : UnitTypes :=
+    MkUnitTypes (unit_ctor_pairs ds) (unit_dependent_ctors ds) (unit_uninhabited ds)
+      (unit_inductive_lines st inds ds);
+
+def unit_is_blank (c : Nat) : Bool :=
+    orb (eqNat c ch_space) (orb (eqNat c ch_tab) (eqNat c ch_cr));
+
+def unit_split_lines (src : List Nat) : List (List Nat) :=
+    (fix scan (cs : List Nat) (line_rev : List Nat) : List (List Nat) :=
+      match cs with
+      | Nil =>
+          match line_rev with
+          | Nil => Nil (List Nat)
+          | Cons _ _ => Cons (List Nat) (reverse Nat line_rev) (Nil (List Nat))
+          end
+      | Cons c rest =>
+          match eqNat c ch_lf with
+          | True => Cons (List Nat) (reverse Nat line_rev) (scan rest (Nil Nat))
+          | False => scan rest (Cons Nat c line_rev)
+          end
+      end) src (Nil Nat);
+
+-- Keyword followed by whitespace.
+def unit_starts_kw : List Nat -> List Nat -> Bool :=
+  fix unit_starts_kw (kw : List Nat) (xs : List Nat) : Bool :=
+    match kw with
+    | Nil =>
+        match xs with
+        | Nil => False
+        | Cons c _ => unit_is_blank c
+        end
+    | Cons k kw' =>
+        match xs with
+        | Nil => False
+        | Cons c xs' => andb (eqNat k c) (unit_starts_kw kw' xs')
+        end
+    end;
+
+def unit_kw_def : List Nat := [100, 101, 102];
+
+def unit_kw_inductive : List Nat := [105, 110, 100, 117, 99, 116, 105, 118, 101];
+
+-- Identifier after the keyword and the blanks that follow it.
+def unit_name_after (kw : List Nat) (t : List Nat) : List Nat :=
+    match span Nat source_is_ident_char (drop_while Nat unit_is_blank (drop Nat (length Nat kw) t)) with
+    | MkPair name _ => name
+    end;
+
+def unit_is_comment (xs : List Nat) : Bool :=
+    match xs with
+    | Nil => False
+    | Cons c rest =>
+        match rest with
+        | Nil => False
+        | Cons c2 _ => andb (eqNat c ch_dash) (eqNat c2 ch_dash)
+        end
+    end;
+
+-- Comment text after the dashes with leading blanks dropped.
+def unit_comment_note (line : Nat) (t : List Nat) : Pair Nat String :=
+    MkPair Nat String line
+      (prim_string_of_char_codes (drop_while Nat unit_is_blank (drop Nat 2 t)));
+
+-- `def name` lines with the comment block directly above each, plus the
+-- comment lines of every block no definition follows, plus the line of every
+-- `inductive name`. A blank or code line between the comment and the
+-- definition breaks the association; an inductive is a code line for that
+-- purpose. Blocks are accumulated newest-first and reversed once at the end.
+def unit_scan_lines (src : List Nat) : UnitScan :=
+  (fix go (ls : List (List Nat)) (line : Nat) (block : List (Pair Nat String))
+      (defs : List DefLine) (loose : List (Pair Nat String))
+      (inds : List (Pair (List Nat) Nat)) : UnitScan :=
+    match ls with
+    | Nil =>
+        MkUnitScan (reverse DefLine defs)
+          (reverse (Pair Nat String) (append (Pair Nat String) block loose))
+          (reverse (Pair (List Nat) Nat) inds)
+    | Cons raw rest =>
+        let t : List Nat := drop_while Nat unit_is_blank raw in
+        match unit_is_comment t with
+        | True =>
+            go rest (S line) (Cons (Pair Nat String) (unit_comment_note line t) block)
+              defs loose inds
+        | False =>
+            match unit_starts_kw unit_kw_def t with
+            | False =>
+                let inds2 : List (Pair (List Nat) Nat) :=
+                  match unit_starts_kw unit_kw_inductive t with
+                  | True =>
+                      Cons (Pair (List Nat) Nat)
+                        (MkPair (List Nat) Nat (unit_name_after unit_kw_inductive t) line)
+                        inds
+                  | False => inds
+                  end in
+                go rest (S line) (Nil (Pair Nat String)) defs
+                  (append (Pair Nat String) block loose) inds2
+            | True =>
+                go rest (S line) (Nil (Pair Nat String))
+                  (Cons DefLine
+                    (MkDefLine (unit_name_after unit_kw_def t) line
+                      (reverse (Pair Nat String) block)) defs)
+                  loose inds
+            end
+        end
+    end) (unit_split_lines src) (S Z) (Nil (Pair Nat String)) (Nil DefLine)
+    (Nil (Pair Nat String)) (Nil (Pair (List Nat) Nat));
+
+def unit_scan_defs (s : UnitScan) : List DefLine :=
+    match s with | MkUnitScan defs _ _ => defs end;
+
+def unit_scan_loose (s : UnitScan) : List (Pair Nat String) :=
+    match s with | MkUnitScan _ loose _ => loose end;
+
+def unit_scan_inductives (s : UnitScan) : List (Pair (List Nat) Nat) :=
+    match s with | MkUnitScan _ _ inds => inds end;
+
+def unit_find_def_line (codes : List Nat) : List DefLine -> DefLine :=
+  fix go (xs : List DefLine) : DefLine :=
+    match xs with
+    | Nil => MkDefLine codes Z (Nil (Pair Nat String))
+    | Cons d rest =>
+        match d with
+        | MkDefLine name _ _ =>
+            match source_bytes_equal name codes with
+            | True => d
+            | False => go rest
+            end
+        end
+    end;
+
+def unit_defs (st : InternState) (lines : List DefLine) (ds : List Decl)
+    : List UnitDef :=
+  concat_map Decl UnitDef
+    (fun (d : Decl) =>
+      match d with
+      | DDef n ty body =>
+          match unit_find_def_line (unit_name_codes st n) lines with
+          | MkDefLine _ line notes =>
+              ([MkUnitDef n line notes (AAscribe (adapt body) (adapt ty))]
+                : List UnitDef)
+          end
+      | DAxiom _ _ => Nil UnitDef
+      | DInductive _ _ _ _ => Nil UnitDef
+      | DEffect _ _ _ => Nil UnitDef
+      | DImport _ => Nil UnitDef
+      | DIntrinsic _ _ _ _ => Nil UnitDef
+      | DExtern _ _ _ => Nil UnitDef
+      | DRepresentation _ _ => Nil UnitDef
+      end) ds;
+
+-- Key is a prefix of the codes.
+def unit_has_prefix : List Nat -> List Nat -> Bool :=
+  fix unit_has_prefix (key : List Nat) (xs : List Nat) : Bool :=
+    match key with
+    | Nil => True
+    | Cons k key' =>
+        match xs with
+        | Nil => False
+        | Cons c xs' => andb (eqNat k c) (unit_has_prefix key' xs')
+        end
+    end;
+
+-- Codes after the first occurrence of `key`; Nothing when absent.
+def unit_after_key (key : List Nat) : List Nat -> Maybe (List Nat) :=
+  fix go (cs : List Nat) : Maybe (List Nat) :=
+    match cs with
+    | Nil => Nothing (List Nat)
+    | Cons _ rest =>
+        match unit_has_prefix key cs with
+        | True => Just (List Nat) (drop Nat (length Nat key) cs)
+        | False => go rest
+        end
+    end;
+
+-- The identifier following `key` in a comment; blanks between them allowed.
+def unit_marked_name (key : List Nat) (note : Pair Nat String) : List (List Nat) :=
+    match note with
+    | MkPair _ text =>
+        match unit_after_key key (prim_string_to_char_codes text) with
+        | Nothing => Nil (List Nat)
+        | Just rest =>
+            match span Nat source_is_ident_char (drop_while Nat unit_is_blank rest) with
+            | MkPair name _ =>
+                match name with
+                | Nil => Nil (List Nat)
+                | Cons _ _ => Cons (List Nat) name (Nil (List Nat))
+                end
+            end
+        end
+    end;
+
+-- Intern ids of the names marked by `key` anywhere in the comments; names
+-- the unit never mentions have no id and are dropped.
+def unit_marked_ids (st : InternState) (key : String) (notes : List (Pair Nat String))
+    : List Nat :=
+  concat_map (List Nat) Nat
+    (fun (name : List Nat) =>
+      match source_lookup_id (unit_intern_ids st) name with
+      | Nothing => Nil Nat
+      | Just n => ([n] : List Nat)
+      end)
+    (concat_map (Pair Nat String) (List Nat)
+      (unit_marked_name (prim_string_to_char_codes key)) notes);
+
+def unit_all_notes (s : UnitScan) : List (Pair Nat String) :=
+    append (Pair Nat String)
+      (concat_map DefLine (Pair Nat String)
+        (fun (d : DefLine) => match d with | MkDefLine _ _ notes => notes end)
+        (unit_scan_defs s))
+      (unit_scan_loose s);
+
+def unit_effect_ops (ds : List Decl) : List Nat :=
+  concat_map Decl Nat
+    (fun (d : Decl) =>
+      match d with
+      | DEffect _ _ ops =>
+          map (Pair Nat Expr) Nat
+            (fun (op : Pair Nat Expr) => match op with | MkPair n _ => n end) ops
+      | DDef _ _ _ => Nil Nat
+      | DAxiom _ _ => Nil Nat
+      | DInductive _ _ _ _ => Nil Nat
+      | DImport _ => Nil Nat
+      | DIntrinsic _ _ _ _ => Nil Nat
+      | DExtern _ _ _ => Nil Nat
+      | DRepresentation _ _ => Nil Nat
+      end) ds;
+
+-- `@entry NAME` and `@export NAME` name the public definitions;
+-- `ouro-analyze:source=NAME`, `sink=NAME`, `secret=NAME` name taint policy.
+def unit_marks (st : InternState) (s : UnitScan) (ds : List Decl) : UnitMarks :=
+    let notes : List (Pair Nat String) := unit_all_notes s in
+    MkUnitMarks
+      (append Nat (unit_marked_ids st "@entry" notes)
+        (unit_marked_ids st "@export" notes))
+      (unit_marked_ids st "ouro-analyze:source=" notes)
+      (unit_marked_ids st "ouro-analyze:sink=" notes)
+      (unit_marked_ids st "ouro-analyze:secret=" notes)
+      (unit_effect_ops ds)
+      (unit_scan_loose s);
+
+-- Extra parse steps only: fuel is a Peano value copied through parser
+-- closures, so it must stay close to the source length.
+def unit_fuel (n : Nat) : Nat := add n (mul 64 16);
+
+def unit_parse (fuel : Nat) (codes : List Nat) (expanded : List Nat)
+    : AnalysisUnit :=
+    match lex_all fuel expanded with
+    | LexMalformed _ => UnitRejected "lex-malformed"
+    | LexExhausted _ => UnitRejected "lex-exhausted"
+    | LexOk toks st =>
+        match parse_file parse fuel toks Z with
+        | PErr _ => UnitRejected "parse-fail"
+        | POk ds _ _ =>
+            let scan : UnitScan := unit_scan_lines codes in
+            MkAnalysisUnit st (unit_cap_ids st) (unit_types st (unit_scan_inductives scan) ds)
+              (unit_marks st scan ds) (unit_defs st (unit_scan_defs scan) ds)
+        end
+    end;
+
+def unit_of_source (src : String) : AnalysisUnit :=
+    let codes : List Nat := prim_string_to_char_codes src in
+    match preprocess_imports codes with
+    | ImpErr _ _ => UnitRejected "preprocess-import"
+    | ImpOk imported =>
+        match preprocess_records imported with
+        | PrepErr _ _ => UnitRejected "preprocess-record"
+        | PrepOk expanded =>
+            unit_parse (unit_fuel (prim_string_length src)) codes expanded
+        end
+    end;
+
+def layer_of_path (p : String) : Layer :=
+    match prim_string_contains p "compiler/kernel.ouro" with
+    | True => LyKernel
+    | False =>
+        match prim_string_contains p "compiler/" with
+        | True => LyCompiler
+        | False =>
+            match orb (prim_string_contains p "tools/analyze/")
+              (prim_string_contains p "tests/analyze/") with
+            | True =>
+                -- These two executable entry points own host IO; sibling
+                -- modules remain pure analyzer policy.
+                match orb (prim_string_eq p "tools/analyze/main.ouro")
+                  (prim_string_eq p "tools/analyze/drive_main.ouro") with
+                | True => LyTools
+                | False => LyAnalyze
+                end
+            | False =>
+                match prim_string_eq p "std/http.ouro" with
+                | True => LyStdHttp
+                | False =>
+                    match orb (prim_string_eq p "std/runtime.ouro")
+                      (orb (prim_string_contains p "std/io.ouro")
+                        (orb (prim_string_contains p "std/fs.ouro")
+                          (prim_string_contains p "std/fs_walk.ouro"))) with
+                    | True => LyStdIo
+                    | False =>
+                        match orb (prim_string_contains p "std/word.ouro")
+                          (prim_string_contains p "std/crypto.ouro") with
+                        | True => LyStdWord
+                        | False =>
+                            match prim_string_starts p "std/" with
+                            | True => LyStd
+                            | False =>
+                                match prim_string_starts p "tools/" with
+                                | True => LyTools
+                                | False =>
+                                    match prim_string_starts p "samples/" with
+                                    | True => LySamples
+                                    | False => LyOther
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end;

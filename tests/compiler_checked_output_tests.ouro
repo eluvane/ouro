@@ -1,0 +1,180 @@
+import "compiler_io_metadata_laws.ouro";
+import "../compiler/checked_program_output.ouro";
+import "../compiler/file_elab.ouro";
+import "../std/io.ouro";
+import "../std/string.ouro";
+
+def output_fixture_names (offset : Nat) : InternState :=
+    let names : List String := ["String", "Count", "Zero", "Next", "value", "opaque",
+      "Alias", "Family", "join", "Word", "Runtime", "host_call", "payload"] in
+    MkIntern
+      ((fix assign (rest : List String) (index : Nat) : List (Pair (List Nat) Nat) :=
+        match rest with | Nil => [] | Cons name tail => Cons (Pair (List Nat) Nat)
+          (MkPair (List Nat) Nat (prim_string_to_char_codes name) index) (assign tail (S index)) end)
+        names (S offset)) (add offset 14) ([] : List (Pair (List Nat) Nat)) 0;
+
+def output_fixture (offset : Nat) (bytes : List Nat) (word : PrimitiveWord) (gc : PrimitiveGc)
+    : CompResult CheckedProgram :=
+    let name : Nat -> Nat := fun (index : Nat) => add offset index in
+    let string_type : CoreTerm := CConst (name 1) in
+    let count : CoreTerm := CInd (name 2) in
+    let payload : CoreTerm := CStrBytes bytes (name 1) in
+    let items : List FileItem :=
+      [FIntrinsic (name 1) (CSort 0) (primitive_key PrimitiveStringType) (Nothing CoreTerm),
+       FInd (MkIndDecl (name 2) ([] : List Param) ([] : List CoreTerm) 0
+         ([MkCtor (name 3) count, MkCtor (name 4) (CPi count count)] : List Ctor)),
+       FRepresentation (name 2) (prim_string_to_char_codes "ouro.nat"),
+       FDef (name 5) count (CConstruct (name 2) 0 0),
+       FAxiom (name 6) (CPi string_type string_type),
+       FDef (name 7) (CSort 0) string_type,
+       FAxiom (name 8) (CPi (CSort 0) (CSort 0)),
+       FIntrinsic (name 9) (CPi string_type (CPi string_type string_type))
+         (primitive_key (PrimitiveStringOperation PrimitiveStringConcat)) (Nothing CoreTerm),
+       FIntrinsic (name 10) (CSort 0) (primitive_key (primitive_word_type word)) (Nothing CoreTerm),
+       FIntrinsic (name 11) (CPi (CSort 0) (CSort 0)) (primitive_key PrimitiveRuntimeType) (Nothing CoreTerm),
+       FExtern (name 12) (CApp (CConst (name 11)) (CConst (name 10)))
+         (ExternRequestOf (prim_string_to_char_codes "windows-x86_64") (prim_string_to_char_codes "win64")
+           (prim_string_to_char_codes "kernel32.dll") (prim_string_to_char_codes "GetCurrentProcessId") False gc),
+       FDef (name 13) (CConst (name 7)) payload] in
+    match check_declarations CheckExactCore keep_checking 1000 items with
+    | DeclarationsErr _ _ _ => CErr CheckedProgram (ErrCode 49 1)
+    | DeclarationsOk entries => COk CheckedProgram (CheckedProgramOf (output_fixture_names offset) entries
+        ([MkPair Nat CoreTerm (name 5) (CConstruct (name 2) 0 0),
+          MkPair Nat CoreTerm (name 7) string_type, MkPair Nat CoreTerm (name 13) payload] : List (Pair Nat CoreTerm)))
+    end;
+
+def output_fixture_base : CompResult CheckedProgram :=
+    output_fixture 0 ([65, 0, 255, 66] : List Nat) PrimitiveWordU32 PrimitiveMayGc;
+
+def output_test_bytes (result : CompResult (List Nat)) (expected : String) : Bool :=
+    match result with | CErr _ => False | COk bytes => primitive_bytes_equal bytes (prim_string_to_char_codes expected) end;
+
+def output_test_error (result : CompResult (List Nat)) (code : Nat) (detail : Nat) : Bool :=
+    match result with
+    | COk _ => False
+    | CErr error => match error with | ErrCode actual at => andb (eqNat actual code) (eqNat at detail) end
+    end;
+
+def output_test_same (left : CompResult CheckedProgram) (right : CompResult CheckedProgram) (expected : Bool) : Bool :=
+    match left with | CErr _ => False | COk first => match right with | CErr _ => False | COk second =>
+      match checked_program_dump 1000 first with | CErr _ => False | COk a =>
+        match checked_program_dump 1000 second with | CErr _ => False | COk b =>
+          match expected with | True => primitive_bytes_equal a b | False => notb (primitive_bytes_equal a b) end
+        end end end end;
+
+def output_test_types (program : CheckedProgram) : Bool :=
+    match checked_program_type_globals whnf_checked 1000 program with
+    | CErr _ => False
+    | COk names => andb (eqNat (length Nat names) 6)
+        (all Nat (fun (name : Nat) => memNat name names) ([1, 2, 7, 8, 10, 11] : List Nat))
+    end;
+
+def output_test_indexed_types (program : CheckedProgram) : Bool :=
+    match checked_program_type_globals whnf_checked 1000 program with | CErr _ => False | COk raw =>
+      match checked_program_type_globals_indexed whnf_checked_indexed 1000 program with
+      | CErr _ => False | COk indexed => primitive_bytes_equal raw indexed end end;
+
+def output_test_wide_types : Bool :=
+    let size : Nat := mul 4 100 in
+    let entries : List Entry :=
+      (fix build (remaining : Nat) : List Entry :=
+        match remaining with
+        | Z => [MkEntry 1 (CSort 1) (Just CoreTerm (CSort 0))]
+        | S next => Cons Entry (MkEntry (add remaining 2) (CPi (CSort 0) (CConst 1)) (Nothing CoreTerm))
+            (build next)
+        end) size in
+    let expected : List Nat :=
+      (fix names (remaining : Nat) : List Nat :=
+        match remaining with | Z => [1] | S next => Cons Nat (add remaining 2) (names next) end) size in
+    let program : CheckedProgram := CheckedProgramOf (output_fixture_names 0) entries
+      ([] : List (Pair Nat CoreTerm)) in
+    match checked_program_type_globals_indexed whnf_checked_indexed 1000 program with
+    | CErr _ => False | COk actual => primitive_bytes_equal actual expected end;
+
+def output_test_changed_type (program : CheckedProgram) : Bool :=
+    match program with | CheckedProgramOf state entries cores =>
+      let changed : List Entry := map Entry Entry (fun (entry : Entry) => match entry with
+        | MkEntry name typ body => match eqNat name 13 with
+            | True => MkEntry name (CConst 1) body | False => entry end
+        | MkIndEntry _ _ => entry | MkBoundEntry _ _ _ => entry | MkRoleEntry _ => entry
+        end) entries in
+      -- String and its transparent alias both check this body. The dump keeps
+      -- the actual checked annotation instead of synthesizing one from it.
+      output_test_same (COk CheckedProgram program)
+        (COk CheckedProgram (CheckedProgramOf state changed cores)) False
+    end;
+
+def output_test_changed_emission (program : CheckedProgram) : Bool :=
+    match program with | CheckedProgramOf state entries cores =>
+      output_test_same (COk CheckedProgram program)
+        (COk CheckedProgram (CheckedProgramOf state entries (reverse (Pair Nat CoreTerm) cores))) False
+    end;
+
+def output_test_changed_role (program : CheckedProgram) : Bool :=
+    match program with | CheckedProgramOf state entries cores =>
+      let changed : List Entry := filter Entry (fun (entry : Entry) => match entry with
+        | MkRoleEntry _ => False | MkEntry _ _ _ => True | MkIndEntry _ _ => True | MkBoundEntry _ _ _ => True
+        end) entries in
+      output_test_same (COk CheckedProgram program)
+        (COk CheckedProgram (CheckedProgramOf state changed cores)) False
+    end;
+
+def output_test_assert (name : String) (passed : Bool) : IO Unit :=
+    match passed with
+    | True => println (str_concat "ok " name)
+    | False => do println (str_concat "FAIL " name); exit 1
+    end;
+
+-- @entry main
+def main : IO Unit :=
+    match output_fixture_base with
+    | CErr _ => do println "FAIL checked output fixture"; exit 1
+    | COk program =>
+        let state : InternState := output_fixture_names 0 in
+        do output_test_assert "literal bytes and nominal type" (output_test_bytes
+             (checked_output_term state 10 (CStrBytes ([65, 0, 255, 66] : List Nat) 1))
+             "12 6 83 116 114 105 110 103 4 65 0 255 66 ");
+           output_test_assert "sort universe" (output_test_bytes (checked_output_term state 10 (CSort 3)) "1 3 ");
+           output_test_assert "local de Bruijn identity" (output_test_bytes
+             (checked_output_term state 10 (CLam (CSort 0) (CRel 0))) "3 1 0 0 0 ");
+           output_test_assert "unresolved literal rejects" (output_test_error (checked_output_term state 10 (CStrLit 99 1)) 46 99);
+           output_test_assert "unknown global rejects" (output_test_error (checked_output_term state 10 (CConst 99)) 46 99);
+           output_test_assert "unknown literal type rejects" (output_test_error (checked_output_term state 10 (CStrBytes [] 99)) 46 99);
+           output_test_assert "term fuel rejects" (output_test_error (checked_output_term state 0 (CSort 0)) 44 0);
+           output_test_assert "program fuel rejects" (output_test_error (checked_program_dump 0 program) 44 0);
+           output_test_assert "type metadata keeps opaque values" (output_test_types program);
+           output_test_assert "type metadata fuel rejects" (output_test_error (checked_program_type_globals whnf_checked 0 program) 44 0);
+           output_test_assert "indexed type metadata preserves exact order" (output_test_indexed_types program);
+           output_test_assert "indexed type metadata shares a wide environment" output_test_wide_types;
+           output_test_assert "indexed type metadata fuel rejects" (output_test_error
+             (checked_program_type_globals_indexed whnf_checked_indexed 0 program) 44 0);
+           output_test_assert "raw type metadata exhaustion propagates" (output_test_error
+             (checked_program_type_globals (fun (_ : Nat) (_ : List Entry) (_ : CoreTerm) => NormalizeExhausted CoreTerm)
+               1000 program) 44 0);
+           output_test_assert "indexed type metadata exhaustion propagates" (output_test_error
+             (checked_program_type_globals_indexed (fun (_ : Nat) (_ : CheckEnvironment) (_ : CoreTerm) => NormalizeExhausted CoreTerm)
+               1000 program) 44 0);
+           output_test_assert "raw type metadata malformed result propagates" (output_test_error
+             (checked_program_type_globals (fun (_ : Nat) (_ : List Entry) (_ : CoreTerm) => NormalizeMalformed CoreTerm NormalizeCaseArguments)
+               1000 program) 49 0);
+           output_test_assert "indexed type metadata malformed result propagates" (output_test_error
+             (checked_program_type_globals_indexed (fun (_ : Nat) (_ : CheckEnvironment) (_ : CoreTerm) => NormalizeMalformed CoreTerm NormalizeCaseArguments)
+               1000 program) 49 0);
+           output_test_assert "renamed String binding uses canonical operation" (output_io_shim program 9 "prim_string_concat");
+           output_test_assert "machine binding cannot impersonate legacy String" (output_io_shim program 10 "ouro.u32");
+           output_test_assert "extern is explicit legacy unsupported" (output_io_shim program 12 "ouro.extern");
+           io_foreach (Pair String Bool)
+             (fun (case : Pair String Bool) => match case with | MkPair name passed => output_test_assert name passed end)
+             output_io_metadata_tests;
+           output_test_assert "identifier allocation does not change output" (output_test_same output_fixture_base
+             (output_fixture 100 ([65, 0, 255, 66] : List Nat) PrimitiveWordU32 PrimitiveMayGc) True);
+           output_test_assert "literal byte change changes output" (output_test_same output_fixture_base
+             (output_fixture 0 ([65, 0, 254, 66] : List Nat) PrimitiveWordU32 PrimitiveMayGc) False);
+           output_test_assert "primitive identity changes output" (output_test_same output_fixture_base
+             (output_fixture 0 ([65, 0, 255, 66] : List Nat) PrimitiveWordU8 PrimitiveMayGc) False);
+           output_test_assert "GC policy changes output" (output_test_same output_fixture_base
+             (output_fixture 0 ([65, 0, 255, 66] : List Nat) PrimitiveWordU32 PrimitiveNoGc) False);
+           output_test_assert "checked annotation is retained" (output_test_changed_type program);
+           output_test_assert "emission order is retained" (output_test_changed_emission program);
+           output_test_assert "representation roles are retained" (output_test_changed_role program)
+    end;

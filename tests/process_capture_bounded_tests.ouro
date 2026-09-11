@@ -1,0 +1,69 @@
+-- Pure contract laws: outputs are byte strings; no process is launched.
+import "../std/processx.ouro";
+import "../std/test.ouro";
+
+def capture_law_reply (kind : Nat) (detail : Nat) (peak : Nat) (output : String) (error : String)
+    : Pair Nat (Pair Nat (Pair Nat (Pair String String))) :=
+    MkPair Nat (Pair Nat (Pair Nat (Pair String String))) kind
+      (MkPair Nat (Pair Nat (Pair String String)) detail
+        (MkPair Nat (Pair String String) peak (MkPair String String output error)));
+
+def capture_law_limits : ProcessCaptureLimits := ProcessCaptureLimitsOf 250 64 1 7 7;
+def capture_law_binary : String := str_of_codes [65, 0, 255, 128, 10, 13, 90];
+
+def capture_law_error (name : String) (kind : Nat) (detail : Nat) (code : String) : Test :=
+    match process_capture_decode_checked capture_law_limits (capture_law_reply kind detail 0 "" "") with
+    | Right _ => test_fail name "infrastructure failure became child exit"
+    | Left error => assert_eq name (process_capture_error_code error) code end;
+
+def capture_law_limit (name : String) (limits : ProcessCaptureLimits) (field : String) : Test :=
+    match process_capture_limits_error limits with
+    | Nothing => test_fail name "invalid limits accepted"
+    | Just actual => assert_eq name (process_capture_limit_name actual) field end;
+
+def capture_law_child (code : Nat) : Test :=
+    match process_capture_decode_checked capture_law_limits
+        (capture_law_reply 0 code 128 capture_law_binary capture_law_binary) with
+    | Left _ => test_fail "child exit retained" "completed child became infrastructure error"
+    | Right result => assert_true (str_concat "child exit " (show_nat code))
+        (andb (eq_nat (proc_code (process_capture_proc_result result)) code)
+          (andb (eq_nat (process_capture_peak_bytes result) 128)
+            (andb (str_eq (proc_stdout (process_capture_proc_result result)) capture_law_binary)
+              (str_eq (proc_stderr (process_capture_proc_result result)) capture_law_binary)))) end;
+
+def capture_law_overflow (stream : Bool) : Test :=
+    let result : Either ProcessCaptureError ProcessCaptureResult := process_capture_decode_checked
+      capture_law_limits (capture_law_reply 0 73 0
+        (match stream with | True => "12345678" | False => "" end)
+        (match stream with | True => "" | False => "12345678" end)) in
+    match result with
+    | Right _ => test_fail "capture cap" "output beyond cap accepted"
+    | Left error => assert_eq "capture cap" (process_capture_error_code error) "process_capture_output_limit" end;
+
+def main : IO Unit := test_run
+    [ capture_law_child 0, capture_law_child 42, capture_law_child 73, capture_law_child (add 256 3)
+    , capture_law_child (sub process_capture_u32_bound 1)
+    , capture_law_error "OS code 259 stays OS error" 1 (add 256 3) "process_capture_os"
+    , capture_law_error "timeout is not child status" 2 73 "process_capture_timeout"
+    , capture_law_error "cleanup timeout is not execution timeout" 3 (add 256 2) "process_capture_cleanup"
+    , capture_law_error "invalid limits are explicit" 4 1 "process_capture_limits"
+    , capture_law_error "process memory event cannot pass expected73" 5 9 "process_capture_resource"
+    , capture_law_error "job memory event cannot pass expected73" 5 10 "process_capture_resource"
+    , capture_law_error "stdout overflow is not truncated success" 6 8 "process_capture_output_limit"
+    , capture_law_error "stderr overflow is not truncated success" 7 8 "process_capture_output_limit"
+    , capture_law_error "unknown outcome fails closed" 8 0 "process_capture_protocol"
+    , capture_law_error "invalid exit width fails closed" 0 process_capture_u32_bound "process_capture_protocol"
+    , capture_law_limit "zero timeout" (ProcessCaptureLimitsOf 0 64 1 0 0) "timeout_ms"
+    , capture_law_limit "INFINITE rejected" (ProcessCaptureLimitsOf (sub process_capture_u32_bound 1) 64 1 0 0) "timeout_ms"
+    , capture_law_limit "zero memory" (ProcessCaptureLimitsOf 1 0 1 0 0) "memory_mib"
+    , capture_law_limit "memory scale overflow" (ProcessCaptureLimitsOf 1 process_capture_u64_bound 1 0 0) "memory_mib"
+    , capture_law_limit "zero CPU" (ProcessCaptureLimitsOf 1 64 0 0 0) "cpu_count"
+    , capture_law_limit "multiple CPUs unsupported" (ProcessCaptureLimitsOf 1 64 2 0 0) "cpu_count"
+    , capture_law_limit "stdout allocation overflow" (ProcessCaptureLimitsOf 1 64 1 process_capture_u64_bound 0) "stdout_bytes"
+    , capture_law_limit "stderr allocation overflow" (ProcessCaptureLimitsOf 1 64 1 0 process_capture_u64_bound) "stderr_bytes"
+    , assert_true "zero stream caps are valid" (match process_capture_limits_error (ProcessCaptureLimitsOf 1 64 1 0 0) with | Nothing => True | Just _ => False end)
+    , capture_law_overflow True, capture_law_overflow False
+    , assert_true "binary stdin request remains exact" (match process_capture_request capture_law_limits capture_law_binary with | MkPair input _ => str_eq input capture_law_binary end)
+    , assert_true "default empty stdin request" (match process_capture_request capture_law_limits "" with | MkPair input _ => eq_nat (str_len input) 0 end)
+    , assert_true "3GiB oneCPU policy remains explicit" (match process_capture_default_limits 250 7 7 with | ProcessCaptureLimitsOf timeout memory cpu out err => andb (eq_nat timeout 250) (andb (eq_nat memory (mul 12 256)) (andb (eq_nat cpu 1) (andb (eq_nat out 7) (eq_nat err 7)))) end)
+    ];

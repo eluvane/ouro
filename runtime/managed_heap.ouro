@@ -1,0 +1,85 @@
+-- One private heap per managed context. The owner footer is raw metadata;
+-- it never participates in the object graph or permits a foreign pointer cast.
+import "managed_layout.ouro";
+import "platform/windows_heap.ouro";
+
+def managed_heap_empty (context : RawPtr U8) : Runtime Bool :=
+    runtime_bind USize Bool (raw_to_bits U8 context) (fun (anchor : USize) =>
+      let zero : USize := usize_sub anchor anchor in
+      let one : USize := managed_one anchor in
+      let two : USize := usize_add one one in
+      let three : USize := usize_add two one in
+      runtime_bind USize Bool (managed_read_word context zero) (fun (head : USize) =>
+        runtime_bind USize Bool (managed_read_word context two) (fun (count : USize) =>
+          runtime_bind USize Bool (managed_read_word context three) (fun (bytes : USize) =>
+            runtime_pure Bool (raw_bool_and (usize_equal head zero)
+              (raw_bool_and (usize_equal count zero) (usize_equal bytes zero)))))));
+
+def managed_heap_acquire (context : RawPtr U8) (anchor : USize) : Runtime (RawPtr U8) :=
+    let zero : USize := usize_sub anchor anchor in
+    let one : USize := managed_one anchor in
+    let four : USize := usize_add (usize_add one one) (usize_add one one) in
+    runtime_bind USize (RawPtr U8) (managed_read_word context four) (fun (count : USize) =>
+      let word : USize := managed_heap_handle_word count in
+      match usize_equal word zero with | True => runtime_pure (RawPtr U8) (raw_null U8) | False =>
+        runtime_bind (RawPtr U8) (RawPtr U8) (managed_read_pointer context word) (fun (heap : RawPtr U8) =>
+          runtime_bind Bool (RawPtr U8) (managed_pointer_is_null heap) (fun (absent : Bool) =>
+            match absent with | False => runtime_pure (RawPtr U8) heap | True =>
+              runtime_bind Bool (RawPtr U8) (managed_heap_empty context) (fun (empty : Bool) =>
+                match empty with | False => runtime_pure (RawPtr U8) (raw_null U8) | True =>
+                  runtime_bind (RawPtr U8) (RawPtr U8) (raw_heap_create anchor) (fun (created : RawPtr U8) =>
+                    runtime_bind Unit (RawPtr U8) (managed_write_pointer context word created)
+                      (fun (owned : Unit) => runtime_pure (RawPtr U8) created)) end) end)) end);
+
+-- Called after descriptor and accounting checks, inside the NoGc allocation
+-- path. A returned block is immediately published by managed_publish_raw;
+-- no collection, callback or other private-heap allocation intervenes.
+def managed_heap_allocate (context : RawPtr U8) (bytes : USize) : Runtime (RawPtr U8) :=
+    runtime_bind (RawPtr U8) (RawPtr U8) (managed_heap_acquire context bytes) (fun (heap : RawPtr U8) =>
+      runtime_bind Bool (RawPtr U8) (managed_pointer_is_null heap) (fun (absent : Bool) =>
+        match absent with | True => runtime_pure (RawPtr U8) (raw_null U8)
+        | False => raw_heap_allocate heap bytes end));
+
+-- Single release boundary for sweep and shutdown. Callers supply an original
+-- allocation base from the checked allocation list, never a foreign/interior
+-- candidate. Neither the list nor its counters change until True is returned.
+def managed_heap_release (context : RawPtr U8) (base : RawPtr U8) : Runtime Bool :=
+    runtime_bind USize Bool (raw_to_bits U8 context) (fun (anchor : USize) =>
+      let zero : USize := usize_sub anchor anchor in
+      let one : USize := managed_one anchor in
+      let four : USize := usize_add (usize_add one one) (usize_add one one) in
+      runtime_bind USize Bool (managed_read_word context four) (fun (count : USize) =>
+        let word : USize := managed_heap_handle_word count in
+        match usize_equal word zero with | True => runtime_pure Bool False | False =>
+          runtime_bind (RawPtr U8) Bool (managed_read_pointer context word) (fun (heap : RawPtr U8) =>
+            runtime_bind Bool Bool (managed_pointer_is_null heap) (fun (absent : Bool) =>
+              match absent with | True => runtime_pure Bool False
+              | False => raw_heap_release heap base end)) end));
+
+-- GC cannot run while an unpublished private-heap block is in flight. Thus
+-- empty list/count/bytes means the owner has no outstanding allocations.
+-- A live context is rejected. Failed destruction retains the footer handle.
+def managed_heap_destroy_empty (context : RawPtr U8) : Runtime Bool :=
+    runtime_bind Bool Bool (managed_heap_empty context) (fun (empty : Bool) =>
+      match empty with | False => runtime_pure Bool False | True =>
+        runtime_bind USize Bool (raw_to_bits U8 context) (fun (anchor : USize) =>
+          let zero : USize := usize_sub anchor anchor in
+          let one : USize := managed_one anchor in
+          let four : USize := usize_add (usize_add one one) (usize_add one one) in
+          runtime_bind USize Bool (managed_read_word context four) (fun (count : USize) =>
+            let word : USize := managed_heap_handle_word count in
+            match usize_equal word zero with | True => runtime_pure Bool False | False =>
+              runtime_bind (RawPtr U8) Bool (managed_read_pointer context word) (fun (heap : RawPtr U8) =>
+                runtime_bind Bool Bool (managed_pointer_is_null heap) (fun (absent : Bool) =>
+                  match absent with | True => runtime_pure Bool True | False =>
+                    runtime_bind Bool Bool (raw_heap_destroy heap) (fun (destroyed : Bool) =>
+                      match destroyed with | False => runtime_pure Bool False | True =>
+                        runtime_bind Unit Bool (managed_write_pointer context word (raw_null U8))
+                          (fun (closed : Unit) => runtime_pure Bool True) end) end)) end)) end);
+
+-- Full heap validation precedes this collection epilog. Live heaps keep their
+-- owner; an empty heap returns its pages before collection grants new credit.
+def managed_heap_retire_empty (context : RawPtr U8) : Runtime Bool :=
+    runtime_bind Bool Bool (managed_heap_empty context) (fun (empty : Bool) =>
+      match empty with | False => runtime_pure Bool True
+      | True => managed_heap_destroy_empty context end);

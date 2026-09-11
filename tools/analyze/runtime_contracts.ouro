@@ -1,0 +1,190 @@
+-- Contract annotations live in the comment block directly above a definition:
+-- `@requires text`, `@ensures text`, `@invariant text`, `@modifies text`,
+-- `@pure`. This module parses annotation lines and classifies tags; runtime
+-- contract policy stays outside the kernel, so violations are diagnostics,
+-- never semantic rewrites.
+
+-- @entry ctr_parse_anno
+-- @entry ctr_classify_tag
+-- @entry runtime_contract_specs
+
+import "../../std/data.ouro";
+import "../../std/listx.ouro";
+import "../../std/natx.ouro";
+import "../../std/runtime.ouro";
+
+-- tag class, tag name, text, source line.
+inductive CtrAnno : Type :=
+  | MkCtrAnno : Nat -> String -> String -> Nat -> CtrAnno;
+
+def ctr_anno_tag (a : CtrAnno) : Nat :=
+    match a with | MkCtrAnno t _ _ _ => t end;
+
+def ctr_anno_name (a : CtrAnno) : String :=
+    match a with | MkCtrAnno _ n _ _ => n end;
+
+def ctr_anno_text (a : CtrAnno) : String :=
+    match a with | MkCtrAnno _ _ x _ => x end;
+
+def ctr_anno_line (a : CtrAnno) : Nat :=
+    match a with | MkCtrAnno _ _ _ l => l end;
+
+def ctr_tag_requires : Nat := Z;
+def ctr_tag_ensures : Nat := S Z;
+def ctr_tag_invariant : Nat := 2;
+def ctr_tag_pure : Nat := 3;
+def ctr_tag_modifies : Nat := 4;
+def ctr_tag_tooling : Nat := 5;
+def ctr_tag_unknown : Nat := 6;
+
+def ctr_contract_tags : List (Pair String Nat) :=
+  [ MkPair String Nat "requires" ctr_tag_requires
+  , MkPair String Nat "ensures" ctr_tag_ensures
+  , MkPair String Nat "invariant" ctr_tag_invariant
+  , MkPair String Nat "pure" ctr_tag_pure
+  , MkPair String Nat "modifies" ctr_tag_modifies
+  ];
+
+-- Annotations other tools own; never contracts, never unknown.
+def ctr_tooling_tags : List String :=
+  [ "entry", "export", "doc", "bound", "minimal", "property", "lint"
+  , "trust-reviewed" ];
+
+def ctr_classify_tag (name : String) : Nat :=
+    match lookup String Nat prim_string_eq name ctr_contract_tags with
+    | Just t => t
+    | Nothing =>
+        match elem String prim_string_eq name ctr_tooling_tags with
+        | True => ctr_tag_tooling
+        | False => ctr_tag_unknown
+        end
+    end;
+
+def ctr_is_contract (a : CtrAnno) : Bool :=
+    ltb_nat (ctr_anno_tag a) ctr_tag_tooling;
+
+def ctr_is_unknown (a : CtrAnno) : Bool :=
+    eq_nat (ctr_anno_tag a) ctr_tag_unknown;
+
+def ctr_has_tag (t : Nat) (a : CtrAnno) : Bool := eq_nat (ctr_anno_tag a) t;
+
+def ctr_ch_at : Nat := 64;
+def ctr_ch_lparen : Nat := 40;
+def ctr_ch_rparen : Nat := 41;
+def ctr_ch_space : Nat := 32;
+def ctr_ch_tab : Nat := 9;
+def ctr_ch_cr : Nat := 13;
+def ctr_ch_dash : Nat := 45;
+def ctr_ch_underscore : Nat := 95;
+
+def ctr_is_blank (c : Nat) : Bool :=
+    orb (eq_nat c ctr_ch_space) (orb (eq_nat c ctr_ch_tab) (eq_nat c ctr_ch_cr));
+
+def ctr_is_lower (c : Nat) : Bool := andb (leb_nat 97 c) (leb_nat c 122);
+
+def ctr_is_upper (c : Nat) : Bool := andb (leb_nat 65 c) (leb_nat c 90);
+
+def ctr_is_digit (c : Nat) : Bool := andb (leb_nat 48 c) (leb_nat c 57);
+
+def ctr_is_tag_char (c : Nat) : Bool :=
+    orb (ctr_is_lower c)
+      (orb (ctr_is_upper c)
+        (orb (ctr_is_digit c)
+          (orb (eq_nat c ctr_ch_dash) (eq_nat c ctr_ch_underscore))));
+
+def ctr_trim_left (cs : List Nat) : List Nat :=
+    drop_while Nat (fun (c : Nat) => orb (ctr_is_blank c) (eq_nat c ctr_ch_lparen)) cs;
+
+def ctr_trim_right (cs : List Nat) : List Nat :=
+    reverse Nat
+      (drop_while Nat (fun (c : Nat) => orb (ctr_is_blank c) (eq_nat c ctr_ch_rparen))
+        (reverse Nat cs));
+
+-- `@tag text`, `@tag(text)`, or a bare `@tag`; Nothing when the line is not
+-- an annotation.
+def ctr_parse_anno (line : Nat) (text : String) : Maybe CtrAnno :=
+    match prim_string_to_char_codes text with
+    | Nil => Nothing CtrAnno
+    | Cons c rest =>
+        match eq_nat c ctr_ch_at with
+        | False => Nothing CtrAnno
+        | True =>
+            match span Nat ctr_is_tag_char rest with
+            | MkPair tag_cs more =>
+                let name : String := prim_string_of_char_codes tag_cs in
+                Just CtrAnno
+                  (MkCtrAnno (ctr_classify_tag name) name
+                    (prim_string_of_char_codes (ctr_trim_right (ctr_trim_left more)))
+                    line)
+            end
+        end
+    end;
+
+-- One chunk per tag on a line: `@bound(nodes <= 9) @bound(cyclo <= 4)
+-- @minimal` is three annotations. An `@` after a blank opens a new chunk.
+-- Chunks are accumulated newest-first and reversed once.
+def ctr_split_go : List Nat -> List Nat -> List (List Nat) -> Bool -> List (List Nat) :=
+  fix go (xs : List Nat) (cur : List Nat) (acc : List (List Nat)) (blank : Bool)
+      : List (List Nat) :=
+    match xs with
+    | Nil =>
+        match cur with
+        | Nil => reverse (List Nat) acc
+        | Cons _ _ => reverse (List Nat) (Cons (List Nat) (reverse Nat cur) acc)
+        end
+    | Cons c rest =>
+        match andb (eq_nat c ctr_ch_at) blank with
+        | False => go rest (Cons Nat c cur) acc (ctr_is_blank c)
+        | True =>
+            match cur with
+            | Nil => go rest ([c] : List Nat) acc False
+            | Cons _ _ =>
+                go rest ([c] : List Nat) (Cons (List Nat) (reverse Nat cur) acc) False
+            end
+        end
+    end;
+
+-- An annotation line opens with `@`; prose that mentions a tag mid-sentence
+-- (`... ; @pure definition that ...`) is documentation, not a claim.
+def ctr_split_tags (cs : List Nat) : List (List Nat) :=
+    match drop_while Nat ctr_is_blank cs with
+    | Nil => Nil (List Nat)
+    | Cons c rest =>
+        match eq_nat c ctr_ch_at with
+        | False => Nil (List Nat)
+        | True => ctr_split_go (Cons Nat c rest) (Nil Nat) (Nil (List Nat)) True
+        end
+    end;
+
+def ctr_parse_line (line : Nat) (text : String) : List CtrAnno :=
+    concat_map (List Nat) CtrAnno
+      (fun (chunk : List Nat) =>
+        match ctr_parse_anno line (prim_string_of_char_codes chunk) with
+        | Nothing => Nil CtrAnno
+        | Just a => ([a] : List CtrAnno)
+        end)
+      (ctr_split_tags (prim_string_to_char_codes text));
+
+def ctr_parse_annos (lines : List (Pair Nat String)) : List CtrAnno :=
+    concat_map (Pair Nat String) CtrAnno
+      (fun (p : Pair Nat String) =>
+        match p with
+        | MkPair line text => ctr_parse_line line text
+        end) lines;
+
+def ctr_nonempty (s : String) : Bool :=
+    match prim_string_length s with
+    | Z => False
+    | S _ => True
+    end;
+
+-- The runtime-checkable contracts of a definition: requires and ensures
+-- clauses with text, as (tag class, text).
+def runtime_contract_specs (annos : List CtrAnno) : List (Pair Nat String) :=
+    map CtrAnno (Pair Nat String)
+      (fun (a : CtrAnno) => MkPair Nat String (ctr_anno_tag a) (ctr_anno_text a))
+      (filter CtrAnno
+        (fun (a : CtrAnno) =>
+          andb (orb (ctr_has_tag ctr_tag_requires a) (ctr_has_tag ctr_tag_ensures a))
+            (ctr_nonempty (ctr_anno_text a)))
+        annos);

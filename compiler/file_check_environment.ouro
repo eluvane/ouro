@@ -1,0 +1,201 @@
+-- Internal derived lookup state. The ordered entries remain the declaration
+-- result; the index only accelerates exact numeric-name lookup and freshness.
+-- Batch checking starts empty and extends both views after a declaration passes.
+-- Raw-list compatibility APIs derive the index themselves. Artifact inputs and
+-- host callbacks never supply an independent index as evidence of acceptance.
+import "base.ouro";
+import "file_check_model.ouro";
+
+inductive EntryIndexValue : Type :=
+  | EntryIndexReserved : EntryIndexValue
+  | EntryIndexActual : Entry -> EntryIndexValue;
+
+inductive EntryIndex : Type :=
+  | EntryIndexEmpty : EntryIndex
+  | EntryIndexNode : Nat -> Nat -> EntryIndexValue -> EntryIndex -> EntryIndex -> EntryIndex;
+
+def entry_index_height (tree : EntryIndex) : Nat :=
+    match tree with | EntryIndexEmpty => Z | EntryIndexNode height _ _ _ _ => height end;
+
+def entry_index_node (key : Nat) (value : EntryIndexValue) (left : EntryIndex) (right : EntryIndex)
+    : EntryIndex :=
+    EntryIndexNode (S (maxNat (entry_index_height left) (entry_index_height right))) key value left right;
+
+def entry_index_left_heavy (key : Nat) (value : EntryIndexValue)
+    (left : EntryIndex) (right : EntryIndex) : EntryIndex :=
+    match left with
+    | EntryIndexEmpty => entry_index_node key value left right
+    | EntryIndexNode _ first first_value outer inner =>
+        match compiler_le_nat (entry_index_height inner) (entry_index_height outer) with
+        | True => entry_index_node first first_value outer (entry_index_node key value inner right)
+        | False => match inner with
+            | EntryIndexEmpty => entry_index_node first first_value outer (entry_index_node key value inner right)
+            | EntryIndexNode _ middle middle_value inner_left inner_right =>
+                entry_index_node middle middle_value
+                  (entry_index_node first first_value outer inner_left)
+                  (entry_index_node key value inner_right right)
+            end
+        end
+    end;
+
+def entry_index_right_heavy (key : Nat) (value : EntryIndexValue)
+    (left : EntryIndex) (right : EntryIndex) : EntryIndex :=
+    match right with
+    | EntryIndexEmpty => entry_index_node key value left right
+    | EntryIndexNode _ last last_value inner outer =>
+        match compiler_le_nat (entry_index_height inner) (entry_index_height outer) with
+        | True => entry_index_node last last_value (entry_index_node key value left inner) outer
+        | False => match inner with
+            | EntryIndexEmpty => entry_index_node last last_value (entry_index_node key value left inner) outer
+            | EntryIndexNode _ middle middle_value inner_left inner_right =>
+                entry_index_node middle middle_value
+                  (entry_index_node key value left inner_left)
+                  (entry_index_node last last_value inner_right outer)
+            end
+        end
+    end;
+
+def entry_index_balance (key : Nat) (value : EntryIndexValue)
+    (left : EntryIndex) (right : EntryIndex) : EntryIndex :=
+    match compiler_lt_nat (S (entry_index_height right)) (entry_index_height left) with
+    | True => entry_index_left_heavy key value left right
+    | False => match compiler_lt_nat (S (entry_index_height left)) (entry_index_height right) with
+        | True => entry_index_right_heavy key value left right
+        | False => entry_index_node key value left right
+        end
+    end;
+
+-- Normalize a possibly Peano-built ID once, so comparisons inside the tree
+-- do not repeatedly decode its unary prefix in the extracted runtime.
+def entry_index_insert (key : Nat) (value : EntryIndexValue) : EntryIndex -> EntryIndex :=
+    let canonical_key : Nat := add key Z in
+  fix insert (tree : EntryIndex) : EntryIndex :=
+    match tree with
+    | EntryIndexEmpty => entry_index_node canonical_key value EntryIndexEmpty EntryIndexEmpty
+    | EntryIndexNode height current stored left right =>
+        match compareNat canonical_key current with
+        | EQ => EntryIndexNode height canonical_key value left right
+        | LT => entry_index_balance current stored (insert left) right
+        | GT => entry_index_balance current stored left (insert right)
+        end
+    end;
+
+def entry_index_lookup (key : Nat) : EntryIndex -> Maybe EntryIndexValue :=
+    let canonical_key : Nat := add key Z in
+  fix lookup (tree : EntryIndex) : Maybe EntryIndexValue :=
+    match tree with
+    | EntryIndexEmpty => Nothing EntryIndexValue
+    | EntryIndexNode _ current value left right =>
+        match compareNat canonical_key current with
+        | EQ => Just EntryIndexValue value
+        | LT => lookup left
+        | GT => lookup right
+        end
+    end;
+
+-- Constructor names participate in freshness but are not standalone globals.
+-- Reserving one must not shadow an actual entry, even in a raw invalid list.
+def entry_index_reserve (name : Nat) (tree : EntryIndex) : EntryIndex :=
+    match entry_index_lookup name tree with
+    | Nothing => entry_index_insert name EntryIndexReserved tree
+    | Just _ => tree
+    end;
+
+def entry_index_constructors : List Ctor -> EntryIndex -> EntryIndex :=
+  fix reserve (constructors : List Ctor) (tree : EntryIndex) : EntryIndex :=
+    match constructors with
+    | Nil => tree
+    | Cons ctor rest => match ctor with
+        | MkCtor name _ => reserve rest (entry_index_reserve name tree)
+        end
+    end;
+
+def entry_index_add (entry : Entry) (tree : EntryIndex) : EntryIndex :=
+    match entry with
+    | MkEntry name _ _ => entry_index_insert name (EntryIndexActual entry) tree
+    | MkBoundEntry name _ _ => entry_index_insert name (EntryIndexActual entry) tree
+    | MkIndEntry name declaration => match declaration with
+        | MkIndDecl _ _ _ _ ctors =>
+            entry_index_constructors ctors (entry_index_insert name (EntryIndexActual entry) tree)
+        end
+    | MkRoleEntry _ => tree
+    end;
+
+inductive CheckEnvironment : Type :=
+  | MkCheckEnvironment : List Entry -> EntryIndex -> CheckEnvironment;
+
+def check_environment_empty : CheckEnvironment := MkCheckEnvironment (Nil Entry) EntryIndexEmpty;
+
+def check_environment_entries (environment : CheckEnvironment) : List Entry :=
+    match environment with | MkCheckEnvironment entries _ => entries end;
+
+def check_environment_cons (entry : Entry) (environment : CheckEnvironment) : CheckEnvironment :=
+    match environment with
+    | MkCheckEnvironment entries tree =>
+        MkCheckEnvironment (Cons Entry entry entries) (entry_index_add entry tree)
+    end;
+
+-- Build oldest first so the raw signature's first matching global still wins.
+-- Occupancy includes constructor IDs from every entry, as the list API did.
+def check_environment_from_entries (entries : List Entry) : CheckEnvironment :=
+    let tree : EntryIndex :=
+      (fix derive (remaining : List Entry) (index : EntryIndex) : EntryIndex :=
+        match remaining with
+        | Nil => index
+        | Cons entry rest => derive rest (entry_index_add entry index)
+        end) (reverse Entry entries) EntryIndexEmpty in
+    MkCheckEnvironment entries tree;
+
+def check_environment_name_exists (name : Nat) (environment : CheckEnvironment) : Bool :=
+    match environment with
+    | MkCheckEnvironment _ tree => match entry_index_lookup name tree with
+        | Nothing => False | Just _ => True end
+    end;
+
+def check_environment_lookup (name : Nat) (environment : CheckEnvironment) : Maybe Entry :=
+    match environment with
+    | MkCheckEnvironment _ tree => match entry_index_lookup name tree with
+        | Nothing => Nothing Entry
+        | Just value => match value with
+            | EntryIndexReserved => Nothing Entry
+            | EntryIndexActual entry => Just Entry entry
+            end
+        end
+    end;
+
+def check_environment_type (name : Nat) (environment : CheckEnvironment) : Maybe CoreTerm :=
+    match check_environment_lookup name environment with
+    | Nothing => Nothing CoreTerm
+    | Just entry => match entry with
+        | MkEntry _ typ _ => Just CoreTerm typ
+        | MkBoundEntry _ typ _ => Just CoreTerm typ
+        | MkIndEntry _ _ => Nothing CoreTerm
+        | MkRoleEntry _ => Nothing CoreTerm
+        end
+    end;
+
+def check_environment_const (name : Nat) (environment : CheckEnvironment) : Maybe CoreTerm :=
+    match check_environment_lookup name environment with
+    | Nothing => Nothing CoreTerm
+    | Just entry => match entry with
+        | MkEntry _ _ body => body
+        | MkBoundEntry _ _ _ => Nothing CoreTerm
+        | MkIndEntry _ _ => Nothing CoreTerm
+        | MkRoleEntry _ => Nothing CoreTerm
+        end
+    end;
+
+def check_environment_ind (name : Nat) (environment : CheckEnvironment) : Maybe IndDecl :=
+    match check_environment_lookup name environment with
+    | Nothing => Nothing IndDecl
+    | Just entry => match entry with
+        | MkIndEntry _ declaration => Just IndDecl declaration
+        | MkEntry _ _ _ => Nothing IndDecl
+        | MkBoundEntry _ _ _ => Nothing IndDecl
+        | MkRoleEntry _ => Nothing IndDecl
+        end
+    end;
+
+inductive IndexedDeclarationResult : Type :=
+  | IndexedDeclarationsOk : CheckEnvironment -> IndexedDeclarationResult
+  | IndexedDeclarationsErr : Nat -> CheckPhase -> CheckFailure -> IndexedDeclarationResult;

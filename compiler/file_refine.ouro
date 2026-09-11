@@ -1,0 +1,199 @@
+-- Bidirectional elaboration of the lowerer's synthetic Core. This module
+-- produces candidates; check_item checks their complete, explicit Core.
+
+import "file_refine_case.ouro";
+
+def infer_dummy_annotation (term : CoreTerm) : Bool :=
+  match term with
+  | CInd name => eqNat name Z
+  | CRel _ => False
+  | CSort _ => False
+  | CPi _ _ => False
+  | CLam _ _ => False
+  | CApp _ _ => False
+  | CLetIn _ _ _ => False
+  | CConst _ => False
+  | CConstruct _ _ _ => False
+  | CCase _ _ _ _ => False
+  | CFix _ _ _ _ _ => False
+  | CStrBytes _ _ => False
+  | CStrLit _ _ => False
+  end;
+
+def refine_expected_lift (expected : Maybe CoreTerm) : Maybe CoreTerm :=
+    match expected with
+    | Nothing => Nothing CoreTerm
+    | Just typ => Just CoreTerm (lift 1 typ)
+    end;
+
+def refine_lambda_body
+    (refine : RefineScope -> Maybe CoreTerm -> CoreTerm -> CheckResult CoreTerm)
+    (ctx : RefineScope) (annotation : CoreTerm) (expected : Maybe CoreTerm)
+    (body : CoreTerm) : CheckResult CoreTerm :=
+    check_map CoreTerm CoreTerm (fun (refined : CoreTerm) => CLam annotation refined)
+      (refine (refine_scope_assume ctx annotation) expected body);
+
+def refine_lambda
+    (refine : RefineScope -> Maybe CoreTerm -> CoreTerm -> CheckResult CoreTerm)
+    (fuel : Nat) (sig : CheckEnvironment) (ctx : RefineScope)
+    (expected : Maybe CoreTerm) (annotation : CoreTerm) (body : CoreTerm)
+    : CheckResult CoreTerm :=
+    match expected with
+    | Nothing =>
+        match infer_dummy_annotation annotation with
+        | True => CheckErr CoreTerm (CheckTypeFailure CheckExpectedFunction)
+        | False =>
+            check_bind CoreTerm CoreTerm (refine ctx (Nothing CoreTerm) annotation)
+              (fun (ann : CoreTerm) => refine_lambda_body refine ctx ann (Nothing CoreTerm) body)
+        end
+    | Just typ =>
+        check_bind PiParts CoreTerm (refine_scope_pi_indexed fuel sig ctx typ)
+          (fun (parts : PiParts) =>
+            match parts with
+            | MkPi domain codomain =>
+                let domain_result : CheckResult CoreTerm :=
+                  match infer_dummy_annotation annotation with
+                  | True => CheckOk CoreTerm domain
+                  | False => refine ctx (Nothing CoreTerm) annotation
+                  end in
+                check_bind CoreTerm CoreTerm domain_result
+                  (fun (ann : CoreTerm) =>
+                    refine_lambda_body refine ctx ann (Just CoreTerm codomain) body)
+            end)
+    end;
+
+def refine_product
+    (refine : RefineScope -> Maybe CoreTerm -> CoreTerm -> CheckResult CoreTerm)
+    (ctx : RefineScope) (domain : CoreTerm) (codomain : CoreTerm) : CheckResult CoreTerm :=
+    check_bind CoreTerm CoreTerm (refine ctx (Nothing CoreTerm) domain)
+      (fun (dom : CoreTerm) =>
+        check_map CoreTerm CoreTerm (fun (cod : CoreTerm) => CPi dom cod)
+          (refine (refine_scope_assume ctx dom) (Nothing CoreTerm) codomain));
+
+def refine_apply
+    (refine : RefineScope -> Maybe CoreTerm -> CoreTerm -> CheckResult CoreTerm)
+    (fuel : Nat) (sig : CheckEnvironment) (ctx : RefineScope)
+    (function : CoreTerm) (argument : CoreTerm) : CheckResult CoreTerm :=
+    check_bind CoreTerm CoreTerm (refine ctx (Nothing CoreTerm) function)
+      (fun (fn : CoreTerm) =>
+        check_bind CoreTerm CoreTerm (refine_scope_infer_indexed fuel sig ctx fn)
+          (fun (fn_type : CoreTerm) =>
+            check_bind PiParts CoreTerm (refine_scope_pi_indexed fuel sig ctx fn_type)
+              (fun (parts : PiParts) =>
+                match parts with
+                | MkPi domain _ =>
+                    check_map CoreTerm CoreTerm (fun (arg : CoreTerm) => CApp fn arg)
+                      (refine ctx (Just CoreTerm domain) argument)
+                end)));
+
+-- An immediately applied unannotated lambda gets its domain from the argument.
+def refine_application
+    (refine : RefineScope -> Maybe CoreTerm -> CoreTerm -> CheckResult CoreTerm)
+    (fuel : Nat) (sig : CheckEnvironment) (ctx : RefineScope)
+    (function : CoreTerm) (argument : CoreTerm) : CheckResult CoreTerm :=
+    match function with
+    | CLam annotation body =>
+        match infer_dummy_annotation annotation with
+        | False => refine_apply refine fuel sig ctx function argument
+        | True =>
+            check_bind CoreTerm CoreTerm (refine ctx (Nothing CoreTerm) argument)
+              (fun (arg : CoreTerm) =>
+                check_bind CoreTerm CoreTerm (refine_scope_infer_indexed fuel sig ctx arg)
+                  (fun (domain : CoreTerm) =>
+                    refine_apply refine fuel sig ctx (CLam domain body) arg))
+        end
+    | CRel _ => refine_apply refine fuel sig ctx function argument
+    | CSort _ => refine_apply refine fuel sig ctx function argument
+    | CPi _ _ => refine_apply refine fuel sig ctx function argument
+    | CApp _ _ => refine_apply refine fuel sig ctx function argument
+    | CLetIn _ _ _ => refine_apply refine fuel sig ctx function argument
+    | CConst _ => refine_apply refine fuel sig ctx function argument
+    | CInd _ => refine_apply refine fuel sig ctx function argument
+    | CConstruct _ _ _ => refine_apply refine fuel sig ctx function argument
+    | CStrBytes _ _ => refine_apply refine fuel sig ctx function argument
+    | CStrLit _ _ => refine_apply refine fuel sig ctx function argument
+    | CCase _ _ _ _ => refine_apply refine fuel sig ctx function argument
+    | CFix _ _ _ _ _ => refine_apply refine fuel sig ctx function argument
+    end;
+
+def refine_let_body
+    (refine : RefineScope -> Maybe CoreTerm -> CoreTerm -> CheckResult CoreTerm)
+    (ctx : RefineScope) (expected : Maybe CoreTerm) (value : CoreTerm)
+    (annotation : CoreTerm) (body : CoreTerm) : CheckResult CoreTerm :=
+    check_map CoreTerm CoreTerm (fun (rest : CoreTerm) => CLetIn value annotation rest)
+      (refine (refine_scope_define ctx annotation value) (refine_expected_lift expected) body);
+
+def refine_let
+    (refine : RefineScope -> Maybe CoreTerm -> CoreTerm -> CheckResult CoreTerm)
+    (fuel : Nat) (sig : CheckEnvironment) (ctx : RefineScope) (expected : Maybe CoreTerm)
+    (value : CoreTerm) (annotation : CoreTerm) (body : CoreTerm) : CheckResult CoreTerm :=
+    match infer_dummy_annotation annotation with
+    | True =>
+        check_bind CoreTerm CoreTerm (refine ctx (Nothing CoreTerm) value)
+          (fun (val : CoreTerm) =>
+            check_bind CoreTerm CoreTerm (refine_scope_infer_indexed fuel sig ctx val)
+              (fun (ann : CoreTerm) => refine_let_body refine ctx expected val ann body))
+    | False =>
+        check_bind CoreTerm CoreTerm (refine ctx (Nothing CoreTerm) annotation)
+          (fun (ann : CoreTerm) =>
+            check_bind CoreTerm CoreTerm (refine ctx (Just CoreTerm ann) value)
+              (fun (val : CoreTerm) => refine_let_body refine ctx expected val ann body))
+    end;
+
+def refine_fix
+    (refine : RefineScope -> Maybe CoreTerm -> CoreTerm -> CheckResult CoreTerm)
+    (ctx : RefineScope) (name : Nat) (rec_arg : Nat) (arity : Nat)
+    (annotation : CoreTerm) (body : CoreTerm) : CheckResult CoreTerm :=
+    check_bind CoreTerm CoreTerm (refine ctx (Nothing CoreTerm) annotation)
+      (fun (typ : CoreTerm) =>
+        check_map CoreTerm CoreTerm
+          (fun (refined : CoreTerm) => CFix name rec_arg arity typ refined)
+          (refine (refine_scope_assume ctx typ) (Just CoreTerm (lift 1 typ)) body));
+
+def refine_term_scoped_indexed
+    : Nat -> CheckEnvironment -> RefineScope -> Maybe CoreTerm -> CoreTerm -> CheckResult CoreTerm :=
+  fix refine_term_scoped_indexed (fuel : Nat) (sig : CheckEnvironment) (ctx : RefineScope)
+      (expected : Maybe CoreTerm) (term : CoreTerm) : CheckResult CoreTerm :=
+    match fuel with
+    | Z => CheckErr CoreTerm CheckResourceLimit
+    | S fuel' =>
+        let refine : RefineScope -> Maybe CoreTerm -> CoreTerm -> CheckResult CoreTerm :=
+          fun (scope : RefineScope) (typ : Maybe CoreTerm) (value : CoreTerm) =>
+            refine_term_scoped_indexed fuel' sig scope typ value in
+        match term with
+        | CRel _ => CheckOk CoreTerm term
+        | CSort _ => CheckOk CoreTerm term
+        | CConst _ => CheckOk CoreTerm term
+        | CInd _ => CheckOk CoreTerm term
+        | CConstruct _ _ _ => CheckOk CoreTerm term
+        | CStrBytes _ _ => CheckOk CoreTerm term
+        | CStrLit _ _ => CheckOk CoreTerm term
+        | CPi domain codomain => refine_product refine ctx domain codomain
+        | CLam annotation body => refine_lambda refine fuel' sig ctx expected annotation body
+        | CApp function argument => refine_application refine fuel' sig ctx function argument
+        | CLetIn value annotation body => refine_let refine fuel' sig ctx expected value annotation body
+        | CFix name rec_arg arity annotation body => refine_fix refine ctx name rec_arg arity annotation body
+        | CCase info _predicate scrutinee bodies =>
+            refine_case refine fuel' sig ctx expected info scrutinee bodies
+        end
+    end;
+
+-- Public callers provide assumptions; local definitions arise only from lets.
+def refine_term_checked_indexed (fuel : Nat) (sig : CheckEnvironment) (ctx : List CoreTerm)
+    (expected : Maybe CoreTerm) (term : CoreTerm) : CheckResult CoreTerm :=
+    refine_term_scoped_indexed fuel sig (refine_scope_from_context ctx) expected term;
+
+def refine_term_indexed (fuel : Nat) (sig : CheckEnvironment) (ctx : List CoreTerm)
+    (expected : Maybe CoreTerm) (term : CoreTerm) : Maybe CoreTerm :=
+    check_to_maybe CoreTerm (refine_term_checked_indexed fuel sig ctx expected term);
+
+def refine_term_checked (fuel : Nat) (sig : List Entry) (ctx : List CoreTerm) (expected : Maybe CoreTerm) (term : CoreTerm)
+    : CheckResult CoreTerm :=
+    check_input_guard CoreTerm (Cons CheckInputWork (CheckInputTerms ctx) (Cons CheckInputWork (CheckInputTerm term)
+      (match expected with | Nothing => ([] : List CheckInputWork) | Just typ => ([CheckInputTerm typ] : List CheckInputWork) end)))
+      (fun (_work : Unit) =>
+        refine_term_checked_indexed fuel (check_environment_from_entries sig) ctx expected term);
+
+def refine_term (fuel : Nat) (sig : List Entry) (ctx : List CoreTerm) (expected : Maybe CoreTerm) (term : CoreTerm)
+    : Maybe CoreTerm :=
+    refine_term_indexed fuel (check_environment_from_entries sig) ctx expected term;

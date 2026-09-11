@@ -1,0 +1,181 @@
+-- Native Smith witnesses use the canonical checker and independent expected data.
+import "compiler_property_model.ouro";
+import "compiler_retained_fixtures.ouro";
+import "compiler_test_phase.ouro";
+import "compiler_test_list_equal.ouro";
+
+def smith_fuel : Nat := mul 32 128;
+
+def smith_case_same (left : CaseInfo) (right : CaseInfo) : Bool :=
+    match left, right with
+    | MkCaseInfo ind params arities, MkCaseInfo other count fields =>
+        andb (eqNat ind other) (andb (eqNat params count) (compiler_test_list_equal Nat eqNat arities fields))
+    end;
+
+-- This test-local view preserves tags, metadata and child order. It does not
+-- call compiler views/encoding. Fix display names are absent from alpha equality.
+inductive SmithCoreView : Type :=
+  | SmithCoreViewOf : Nat -> List Nat -> List CoreTerm -> SmithCoreView;
+
+def smith_core_view (term : CoreTerm) : SmithCoreView :=
+    match term with
+    | CRel index => SmithCoreViewOf 0 ([index] : List Nat) (Nil CoreTerm)
+    | CSort level => SmithCoreViewOf 1 ([level] : List Nat) (Nil CoreTerm)
+    | CPi domain body => SmithCoreViewOf 2 (Nil Nat) ([domain, body] : List CoreTerm)
+    | CLam domain body => SmithCoreViewOf 3 (Nil Nat) ([domain, body] : List CoreTerm)
+    | CApp function argument => SmithCoreViewOf 4 (Nil Nat) ([function, argument] : List CoreTerm)
+    | CLetIn value typ body => SmithCoreViewOf 5 (Nil Nat) ([value, typ, body] : List CoreTerm)
+    | CConst name => SmithCoreViewOf 6 ([name] : List Nat) (Nil CoreTerm)
+    | CInd name => SmithCoreViewOf 7 ([name] : List Nat) (Nil CoreTerm)
+    | CConstruct ind index params => SmithCoreViewOf 8 ([ind, index, params] : List Nat) (Nil CoreTerm)
+    | CCase info motive scrutinee branches => match info with
+        | MkCaseInfo ind params arities => SmithCoreViewOf 9
+            (Cons Nat ind (Cons Nat params arities))
+            (Cons CoreTerm motive (Cons CoreTerm scrutinee branches))
+        end
+    | CFix _ index arity typ body => SmithCoreViewOf 10 ([index, arity] : List Nat) ([typ, body] : List CoreTerm)
+    | CStrLit index typ => SmithCoreViewOf 11 ([index, typ] : List Nat) (Nil CoreTerm)
+    | CStrBytes bytes typ => SmithCoreViewOf 12 (Cons Nat typ bytes) (Nil CoreTerm)
+    end;
+
+-- This is an equality oracle over data, not a normalizer or typechecker.
+def smith_core_same : Nat -> CoreTerm -> CoreTerm -> Bool :=
+  fix same (fuel : Nat) (left : CoreTerm) (right : CoreTerm) : Bool :=
+    match fuel with
+    | Z => False
+    | S rest => match smith_core_view left, smith_core_view right with
+        | SmithCoreViewOf tag fields children, SmithCoreViewOf other metadata nodes =>
+            andb (eqNat tag other) (andb (compiler_test_list_equal Nat eqNat fields metadata)
+              ((fix siblings (left_children : List CoreTerm) (right_children : List CoreTerm) : Bool :=
+                match left_children, right_children with
+                | Nil, Nil => True
+                | Cons first tail, Cons second remaining =>
+                    andb (same rest first second) (siblings tail remaining)
+                | Nil, Cons _ _ => False | Cons _ _, Nil => False
+                end) children nodes))
+        end
+    end;
+
+def smith_same (left : CoreTerm) (right : CoreTerm) : Bool :=
+    smith_core_same smith_fuel left right;
+
+def smith_fault (failure : CheckFailure) : String :=
+    match failure with
+    | CheckTypeFailure fault => match fault with
+        | CheckTypeMismatch => "type-mismatch" | CheckExpectedSort => "sort-expected"
+        | CheckExpectedFunction => "not-function" | CheckCaseMotive => "case-motive"
+        | CheckNonPositive => "positivity" | CheckNonTerminating => "termination"
+        | CheckUniverseBound => "universe-bound"
+        end
+    | CheckMalformedCore fault => match fault with
+        | CheckUnboundVariable index => str_concat "unbound-rel:" (str_of_nat index)
+        | CheckUnboundGlobal name => str_concat "unbound-global:" (str_of_nat name)
+        | CheckUnknownInductive name => str_concat "unknown-inductive:" (str_of_nat name)
+        | CheckUnknownConstructor ind index => str_cat4 "unknown-constructor:" (str_of_nat ind) ":" (str_of_nat index)
+        | CheckConstructorParameters => "constructor-parameters" | CheckCaseMetadata => "case-metadata"
+        | CheckFixMetadata => "fix-metadata" | CheckLiteralType name => str_concat "literal-type:" (str_of_nat name)
+        | CheckDuplicateName name => str_concat "duplicate-name:" (str_of_nat name)
+        | CheckUnresolvedLiteral name => str_concat "unresolved-literal:" (str_of_nat name)
+        end
+    | CheckReductionFailure _ => "reduction-failure" | CheckResourceLimit => "resource-limit"
+    | CheckUnsupported code => str_concat "unsupported:" (str_of_nat code)
+    | CheckCancelled => "cancelled" | CheckInternalFailure code => str_concat "internal:" (str_of_nat code)
+    | CheckPrimitiveFailure _ => "primitive-failure"
+    end;
+
+def smith_from_check (A : Type) (law : String) (result : CheckResult A)
+    (next : A -> Maybe String) : Maybe String :=
+    match result with
+    | CheckOk value => next value
+    | CheckErr failure => Just String (str_cat3 law " actual=" (smith_fault failure))
+    end;
+
+def smith_require (condition : Bool) (law : String) (next : Unit -> Maybe String) : Maybe String :=
+    property_require condition law next;
+
+def smith_normal (law : String) (expected : CoreTerm) (result : NormalizeResult CoreTerm)
+    (next : CoreTerm -> Maybe String) : Maybe String :=
+    property_from_normal law result (fun (actual : CoreTerm) =>
+      smith_require (smith_same actual expected)
+        (str_cat4 law " expected=" (property_show expected) (str_concat " actual=" (property_show actual)))
+        (fun (_same : Unit) => next actual));
+
+def smith_canonical : CoreTerm -> Bool :=
+  fix head (term : CoreTerm) : Bool :=
+    match term with
+    | CApp function _ => head function
+    | CConstruct _ _ _ => True | CStrBytes _ _ => True
+    | CRel _ => False | CSort _ => False | CPi _ _ => False | CLam _ _ => False
+    | CLetIn _ _ _ => False | CConst _ => False | CInd _ => False
+    | CCase _ _ _ _ => False | CFix _ _ _ _ _ => False | CStrLit _ _ => False
+    end;
+
+inductive SmithWitness : Type :=
+  | SmithWitnessOf : Nat -> CoreTerm -> CoreTerm -> CoreTerm -> Bool -> List Nat -> SmithWitness;
+
+def smith_leaf (family : Nat) (typ : CoreTerm) (value : CoreTerm) (canonical : Bool) : SmithWitness :=
+    SmithWitnessOf family typ value value canonical (Nil Nat);
+
+def smith_witness_type (witness : SmithWitness) : CoreTerm :=
+    match witness with | SmithWitnessOf _ typ _ _ _ _ => typ end;
+
+def smith_witness_term (witness : SmithWitness) : CoreTerm :=
+    match witness with | SmithWitnessOf _ _ term _ _ _ => term end;
+
+def smith_witness_normal (witness : SmithWitness) : CoreTerm :=
+    match witness with | SmithWitnessOf _ _ _ normal _ _ => normal end;
+
+def smith_positive (entries : List Entry) (witness : SmithWitness) : Maybe String :=
+    match witness with
+    | SmithWitnessOf _ typ term expected canonical _ =>
+        smith_from_check Unit "check-declared-type"
+          (check_term_checked smith_fuel entries (Nil CoreTerm) term typ)
+          (fun (_checked : Unit) =>
+            smith_from_check CoreTerm "infer-below-declared-type"
+              (infer_checked smith_fuel entries (Nil CoreTerm) (IGTerm term))
+              (fun (inferred : CoreTerm) =>
+                smith_normal "inferred-type-normal-form" typ (normalize_checked smith_fuel entries inferred)
+                  (fun (_type : CoreTerm) =>
+                    smith_normal "normalize-independent" expected (normalize_checked smith_fuel entries term)
+                      (fun (normal : CoreTerm) =>
+                        smith_require (orb (notb canonical) (smith_canonical normal)) "normalize-canonical"
+                          (fun (_canonical : Unit) =>
+                            smith_normal "normalize-idempotent" expected (normalize_checked smith_fuel entries normal)
+                              (fun (_again : CoreTerm) =>
+                                property_from_normal "whnf" (whnf_checked smith_fuel entries term)
+                                  (fun (weak : CoreTerm) =>
+                                    smith_normal "whnf-preserves-normal-form" expected
+                                      (normalize_checked smith_fuel entries weak)
+                                      (fun (_weak : CoreTerm) =>
+                                        property_from_normal "warm-repeat" (normalize_checked smith_fuel entries term)
+                                          (fun (repeat : CoreTerm) =>
+                                            smith_require (smith_same repeat expected) "warm-repeat-independent"
+                                              (fun (_repeat : Unit) =>
+                                                match conv_checked smith_fuel entries term expected with
+                                                | Normalized same => smith_require same "convertible-independent"
+                                                    (fun (_conversion : Unit) => Nothing String)
+                                                | NormalizeExhausted => Just String "conversion-exhausted"
+                                                | NormalizeMalformed _ => Just String "conversion-malformed"
+                                                end))))))))))
+    end;
+
+def smith_numeral : Nat -> CoreTerm :=
+  fix build (value : Nat) : CoreTerm :=
+    match value with | Z => retained_zero | S rest => CApp retained_succ (build rest) end;
+
+def smith_apply2 (function : CoreTerm) (first : CoreTerm) (second : CoreTerm) : CoreTerm :=
+    CApp (CApp function first) second;
+
+def smith_apply3 (function : CoreTerm) (first : CoreTerm) (second : CoreTerm) (third : CoreTerm) : CoreTerm :=
+    CApp (smith_apply2 function first second) third;
+
+def smith_apply4 (function : CoreTerm) (first : CoreTerm) (second : CoreTerm)
+    (third : CoreTerm) (fourth : CoreTerm) : CoreTerm :=
+    CApp (smith_apply3 function first second third) fourth;
+
+def smith_identity (typ : CoreTerm) : CoreTerm := CLam typ (CRel 0);
+
+def smith_choice (seed : Nat) (salt : Nat) (bound : Nat) : Nat :=
+    property_choice (property_seed seed salt) bound;
+
+def smith_choose (seed : Nat) (salt : Nat) : Bool := eqNat (smith_choice seed salt 2) 0;

@@ -1,0 +1,204 @@
+-- Taint facts track policy boundaries, not data secrecy; ambiguous flows
+-- stay tainted. Sources and sinks are name ids: a reference to a source, or
+-- a call whose head is one, is tainted; a tainted argument reaching a call
+-- whose head is a sink is reported once per spine.
+
+-- @entry analyze_taint
+
+import "../../std/data.ouro";
+import "../../std/listx.ouro";
+import "../../std/natx.ouro";
+import "ast.ouro";
+
+-- tainted value reaches a sink (sink id); a hole is passed straight to a sink
+-- (sink id); a secret name is mentioned by a public definition (secret id).
+inductive TaintIssue : Type :=
+  | ITaintToSink : Nat -> TaintIssue
+  | ITaintHoleSink : Nat -> TaintIssue
+  | ITaintSecretInPublic : Nat -> TaintIssue;
+
+-- sources, sinks, secrets.
+inductive TaintIds : Type :=
+  | MkTaintIds : List Nat -> List Nat -> List Nat -> TaintIds;
+
+def taint_sources (t : TaintIds) : List Nat :=
+    match t with | MkTaintIds s _ _ => s end;
+
+def taint_sinks (t : TaintIds) : List Nat :=
+    match t with | MkTaintIds _ k _ => k end;
+
+def taint_secrets (t : TaintIds) : List Nat :=
+    match t with | MkTaintIds _ _ x => x end;
+
+-- tainted, sink already reported on this spine, issues.
+inductive TaintFlow : Type :=
+  | MkFlow : Bool -> Bool -> List TaintIssue -> TaintFlow;
+
+def flow_tainted (f : TaintFlow) : Bool := match f with | MkFlow t _ _ => t end;
+
+def flow_reported (f : TaintFlow) : Bool := match f with | MkFlow _ r _ => r end;
+
+def flow_issues (f : TaintFlow) : List TaintIssue :=
+    match f with | MkFlow _ _ i => i end;
+
+def taint_inil : List TaintIssue := [];
+
+def taint_icons (i : TaintIssue) (is : List TaintIssue) : List TaintIssue :=
+    Cons TaintIssue i is;
+
+def taint_append (xs : List TaintIssue) (ys : List TaintIssue) : List TaintIssue :=
+    append TaintIssue xs ys;
+
+def flow_clean : TaintFlow := MkFlow False False taint_inil;
+
+def flow_tainted_value : TaintFlow := MkFlow True False taint_inil;
+
+def flow_of (tainted : Bool) (issues : List TaintIssue) : TaintFlow :=
+    MkFlow tainted False issues;
+
+def flow_join (a : TaintFlow) (b : TaintFlow) : TaintFlow :=
+    MkFlow (orb (flow_tainted a) (flow_tainted b)) False
+      (taint_append (flow_issues a) (flow_issues b));
+
+def flow_issues_only (a : TaintFlow) : TaintFlow :=
+    MkFlow False False (flow_issues a);
+
+def taint_bind_if_source (t : TaintIds) (id : Nat) (env : List Nat) : List Nat :=
+    match mem Nat eq_nat id (taint_sources t) with
+    | True => Cons Nat id env
+    | False => env
+    end;
+
+def taint_bind_sources (t : TaintIds) (ids : List Nat) (env : List Nat) : List Nat :=
+    foldl Nat (List Nat) (fun (acc : List Nat) (id : Nat) => taint_bind_if_source t id acc)
+      env ids;
+
+def taint_sink_issues (hid : Nat) (x : Ast) : List TaintIssue :=
+    match ast_is tag_hole x with
+    | True => taint_icons (ITaintHoleSink hid) (taint_icons (ITaintToSink hid) taint_inil)
+    | False => taint_icons (ITaintToSink hid) taint_inil
+    end;
+
+def taint_fold (go : Ast -> TaintFlow) (xs : List Ast) : TaintFlow :=
+    foldl Ast TaintFlow (fun (acc : TaintFlow) (x : Ast) => flow_join acc (go x))
+      flow_clean xs;
+
+-- env: tainted binder ids in scope.
+def taint_expr (t : TaintIds) : Ast -> List Nat -> TaintFlow :=
+  fun (root : Ast) (initial_env : List Nat) =>
+    (fix taint_expr (fuel : Nat) (a : Ast) (env : List Nat) : TaintFlow :=
+      match fuel with
+      | Z => flow_clean
+      | S remaining =>
+          let descend : Ast -> List Nat -> TaintFlow :=
+            fun (child : Ast) (next_env : List Nat) => taint_expr remaining child next_env in
+          match a with
+          | AHole _ => flow_tainted_value
+          | AVar id =>
+              match orb (mem Nat eq_nat id env) (mem Nat eq_nat id (taint_sources t)) with
+              | True => flow_tainted_value
+              | False => flow_clean
+              end
+          | ASort _ => flow_clean
+          | ANatLit _ => flow_clean
+          | AStr _ => flow_clean
+          | ANoBinder => flow_clean
+          | ANoBranch => flow_clean
+          | ANoClause => flow_clean
+          | AAscribe e ty =>
+              let re : TaintFlow := descend e env in
+              let rt : TaintFlow := descend ty env in
+              MkFlow (flow_tainted re) (flow_reported re)
+                (taint_append (flow_issues re) (flow_issues rt))
+          | AApp f x =>
+              let rf : TaintFlow := descend f env in
+              let rx : TaintFlow := descend x env in
+              let hit : Bool :=
+                match ast_app_head f with
+                | Nothing => False
+                | Just hid =>
+                    andb (mem Nat eq_nat hid (taint_sinks t))
+                      (andb (flow_tainted rx) (notb (flow_reported rf)))
+                end in
+              let sink_issues : List TaintIssue :=
+                match hit with
+                | False => taint_inil
+                | True =>
+                    match ast_app_head f with
+                    | Nothing => taint_inil
+                    | Just hid => taint_sink_issues hid x
+                    end
+                end in
+              MkFlow (orb (flow_tainted rf) (flow_tainted rx))
+                (orb hit (flow_reported rf))
+                (taint_append (flow_issues rf) (taint_append (flow_issues rx) sink_issues))
+          | ALam id ann body =>
+              let env2 : List Nat := taint_bind_if_source t id env in
+              flow_issues_only (flow_join (descend ann env2) (descend body env2))
+          | APi id dom cod =>
+              let env2 : List Nat := taint_bind_if_source t id env in
+              flow_issues_only (flow_join (descend dom env) (descend cod env2))
+          | ALet id ann v body =>
+              let rann : TaintFlow := descend ann env in
+              let rv : TaintFlow := descend v env in
+              let env2 : List Nat :=
+                match orb (flow_tainted rv) (mem Nat eq_nat id (taint_sources t)) with
+                | True => Cons Nat id env
+                | False => env
+                end in
+              let rbody : TaintFlow := descend body env2 in
+              flow_of (flow_tainted rbody)
+                (taint_append (flow_issues rann)
+                  (taint_append (flow_issues rv) (flow_issues rbody)))
+          | ABinder id ty rest =>
+              let env2 : List Nat := taint_bind_if_source t id env in
+              flow_issues_only (flow_join (descend ty env) (descend rest env2))
+          | AFix r binders ret body =>
+              let env1 : List Nat := taint_bind_if_source t r env in
+              let env2 : List Nat := taint_bind_sources t (ast_binder_ids binders) env1 in
+              flow_issues_only
+                (flow_join (descend binders env1)
+                  (flow_join (descend ret env2) (descend body env2)))
+          | AMatch scrut branches =>
+              flow_join (descend scrut env) (descend branches env)
+          | ABranch _ ids body rest =>
+              flow_join (descend body (taint_bind_sources t ids env)) (descend rest env)
+          | APerform _ args => taint_fold (fun (x : Ast) => descend x env) args
+          | AHandle inner cls => flow_join (descend inner env) (descend cls env)
+          | AClause _ ids body rest =>
+              flow_join (descend body (taint_bind_sources t ids env)) (descend rest env)
+          | ADo xs => taint_fold (fun (x : Ast) => descend x env) xs
+          | AList xs => taint_fold (fun (x : Ast) => descend x env) xs
+          end
+      end) (ast_size root) root initial_env;
+
+def taint_vars : Ast -> List Nat :=
+  fun (root : Ast) =>
+    (fix taint_vars (fuel : Nat) (a : Ast) : List Nat :=
+      match fuel with
+      | Z => Nil Nat
+      | S remaining =>
+          let descend : Ast -> List Nat :=
+            fun (child : Ast) => taint_vars remaining child in
+          match ast_var_id a with
+          | Just id => [id]
+          | Nothing => concat_map Ast Nat descend (ast_children a)
+          end
+      end) (ast_size root) root;
+
+-- Distinct secret ids the tree mentions, in first-occurrence order.
+def taint_secrets_in (t : TaintIds) (a : Ast) : List Nat :=
+    nub Nat eq_nat
+      (filter Nat (fun (id : Nat) => mem Nat eq_nat id (taint_secrets t))
+        (taint_vars a));
+
+-- public: the definition is an entry or export of its unit.
+def analyze_taint (t : TaintIds) (public : Bool) (a : Ast) : List TaintIssue :=
+    let flow : List TaintIssue := flow_issues (taint_expr t a (Nil Nat)) in
+    match public with
+    | False => flow
+    | True =>
+        taint_append flow
+          (map Nat TaintIssue (fun (id : Nat) => ITaintSecretInPublic id)
+            (taint_secrets_in t a))
+    end;

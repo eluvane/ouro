@@ -1,0 +1,164 @@
+-- Extract / runtime leak: Sort used as a value, Sort/proof under IO, kernel
+-- names referenced from std. Typed facts are interned ids, not strings. IO
+-- context comes from ascribed types that mention IO and from do blocks.
+
+-- @entry analyze_extract_leak
+
+import "../../std/data.ouro";
+import "../../std/listx.ouro";
+import "../../std/runtime.ouro";
+import "ast.ouro";
+import "policy_ids.ouro";
+
+inductive XtrIssue : Type :=
+  | ITypeAsValue : Nat -> XtrIssue
+  | IProofInIO : Nat -> XtrIssue
+  | IKernelFromStd : Nat -> XtrIssue;
+
+def xtr_icons (i : XtrIssue) (is : List XtrIssue) : List XtrIssue :=
+    Cons XtrIssue i is;
+def xtr_inil : List XtrIssue := [];
+def xtr_append_issues (xs : List XtrIssue) (ys : List XtrIssue) : List XtrIssue :=
+    append XtrIssue xs ys;
+
+def is_sort : Ast -> Bool :=
+  fix is_sort (a : Ast) : Bool :=
+    match a with
+    | ASort _ => True
+    | AAscribe e _ => is_sort e
+    | AVar _ => False
+    | AHole _ => False
+    | ANatLit _ => False
+    | AApp _ _ => False
+    | ALam _ _ _ => False
+    | APi _ _ _ => False
+    | ALet _ _ _ _ => False
+    | ABinder _ _ _ => False
+    | ANoBinder => False
+    | AFix _ _ _ _ => False
+    | ABranch _ _ _ _ => False
+    | ANoBranch => False
+    | AMatch _ _ => False
+    | APerform _ _ => False
+    | AHandle _ _ => False
+    | AClause _ _ _ _ => False
+    | ANoClause => False
+    | ADo _ => False
+    | AList _ => False
+    | AStr _ => False
+    end;
+
+def mentions_io (io : Nat) : Ast -> Bool :=
+  fun (root : Ast) =>
+    (fix mentions_io (fuel : Nat) (a : Ast) : Bool :=
+      match fuel with
+      | Z => False
+      | S remaining =>
+          let descend : Ast -> Bool :=
+            fun (child : Ast) => mentions_io remaining child in
+          match a with
+          | AVar n => eq_nat n io
+          | AApp f x => orb (descend f) (descend x)
+          | APi _ dom cod => orb (descend dom) (descend cod)
+          | ALam _ ann body => orb (descend ann) (descend body)
+          | AAscribe e t => orb (descend e) (descend t)
+          | ALet _ ann v body =>
+              orb (descend ann) (orb (descend v) (descend body))
+          | ABinder _ ty rest => orb (descend ty) (descend rest)
+          | AHole _ => False
+          | ASort _ => False
+          | ANatLit _ => False
+          | ANoBinder => False
+          | AFix _ _ ret body => orb (descend ret) (descend body)
+          | ABranch _ _ body rest => orb (descend body) (descend rest)
+          | ANoBranch => False
+          | AMatch s b => orb (descend s) (descend b)
+          | APerform _ args => ast_any descend args
+          | AHandle inner cls => orb (descend inner) (descend cls)
+          | AClause _ _ body rest => orb (descend body) (descend rest)
+          | ANoClause => False
+          | ADo xs => ast_any descend xs
+          | AList xs => ast_any descend xs
+          | AStr _ => False
+          end
+      end) (ast_size root) root;
+
+def xtr_walk_list (go : Ast -> List XtrIssue) : List Ast -> List XtrIssue :=
+  concat_map Ast XtrIssue go;
+
+def analyze_xtr_go (ly : Layer) (ids : CapIds)
+    : Bool -> Ast -> List XtrIssue :=
+  fun (initial_in_io : Bool) (root : Ast) =>
+    (fix analyze_xtr_go (fuel : Nat) (in_io : Bool) (a : Ast) : List XtrIssue :=
+      match fuel with
+      | Z => xtr_inil
+      | S remaining =>
+          let descend : Bool -> Ast -> List XtrIssue :=
+            fun (next_in_io : Bool) (child : Ast) => analyze_xtr_go remaining next_in_io child in
+          match a with
+          | AApp f x =>
+              let leak : List XtrIssue :=
+                match is_sort x with
+                | True => xtr_icons (ITypeAsValue Z) xtr_inil
+                | False => xtr_inil
+                end in
+              let ioiss : List XtrIssue :=
+                match andb in_io (is_sort x) with
+                | True => xtr_icons (IProofInIO Z) xtr_inil
+                | False => xtr_inil
+                end in
+              xtr_append_issues leak
+                (xtr_append_issues ioiss
+                  (xtr_append_issues (descend in_io f) (descend in_io x)))
+          | AVar n =>
+              match andb (layer_is_std ly) (mem_id n (cap_kern ids)) with
+              | True => xtr_icons (IKernelFromStd n) xtr_inil
+              | False => xtr_inil
+              end
+          | ALet _ ann v body =>
+              let io2 : Bool := orb in_io (mentions_io (cap_io ids) ann) in
+              let leak : List XtrIssue :=
+                match is_sort v with
+                | True => xtr_icons (ITypeAsValue Z) xtr_inil
+                | False => xtr_inil
+                end in
+              xtr_append_issues leak
+                (xtr_append_issues (descend in_io v)
+                  (xtr_append_issues (descend in_io ann)
+                    (descend io2 body)))
+          | ALam _ ann body =>
+              xtr_append_issues (descend in_io ann) (descend in_io body)
+          | APi _ dom cod =>
+              xtr_append_issues (descend in_io dom) (descend in_io cod)
+          | AAscribe e t =>
+              let io2 : Bool := orb in_io (mentions_io (cap_io ids) t) in
+              xtr_append_issues (descend io2 e) (descend in_io t)
+          | ABinder _ ty rest =>
+              xtr_append_issues (descend in_io ty) (descend in_io rest)
+          | AFix _ binders ret body =>
+              let io2 : Bool := orb in_io (mentions_io (cap_io ids) ret) in
+              xtr_append_issues (descend in_io binders)
+                (xtr_append_issues (descend in_io ret) (descend io2 body))
+          | ABranch _ _ body rest =>
+              xtr_append_issues (descend in_io body) (descend in_io rest)
+          | AMatch s b =>
+              xtr_append_issues (descend in_io s) (descend in_io b)
+          | AHandle inner cls =>
+              xtr_append_issues (descend in_io inner) (descend in_io cls)
+          | AClause _ _ body rest =>
+              xtr_append_issues (descend in_io body) (descend in_io rest)
+          | APerform _ args => xtr_walk_list (descend in_io) args
+          | ADo xs => xtr_walk_list (descend True) xs
+          | AList xs => xtr_walk_list (descend in_io) xs
+          | AStr _ => xtr_inil
+          | AHole _ => xtr_inil
+          | ASort _ => xtr_inil
+          | ANatLit _ => xtr_inil
+          | ANoBinder => xtr_inil
+          | ANoBranch => xtr_inil
+          | ANoClause => xtr_inil
+          end
+      end) (ast_size root) initial_in_io root;
+
+def analyze_extract_leak (a : Ast) (ly : Layer) (ids : CapIds) : List XtrIssue :=
+    analyze_xtr_go ly ids False a;

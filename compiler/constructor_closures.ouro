@@ -1,0 +1,287 @@
+-- Constructor values need closures before their declaration types leave Core.
+-- This pass produces a candidate for the existing strict checker. It changes
+-- neither constructor metadata nor acceptance rules and performs no host IO.
+
+import "file_elab_term.ouro";
+
+inductive ConstructorClosureError : Type :=
+  | ConstructorClosureMissing : Nat -> Nat -> ConstructorClosureError
+  | ConstructorClosureOverapplied : Nat -> Nat -> ConstructorClosureError
+  | ConstructorClosureMalformed : Nat -> Nat -> ConstructorClosureError
+  | ConstructorClosureExhausted : ConstructorClosureError;
+
+def constructor_normal_result (A : Type) (ind : Nat) (index : Nat)
+    (result : NormalizeResult A) : Either ConstructorClosureError A :=
+    match result with
+    | Normalized value => Right ConstructorClosureError A value
+    | NormalizeExhausted => Left ConstructorClosureError A ConstructorClosureExhausted
+    | NormalizeMalformed _ => Left ConstructorClosureError A (ConstructorClosureMalformed ind index)
+    end;
+
+-- Return the result family's argument count beside the constructor telescope.
+def constructor_signature_indexed (sig : CheckEnvironment) (ind : Nat) (index : Nat) (nparams : Nat)
+    : Either ConstructorClosureError (Pair Nat CoreTerm) :=
+    match check_environment_ind ind sig with
+    | Nothing => Left ConstructorClosureError (Pair Nat CoreTerm) (ConstructorClosureMissing ind index)
+    | Just decl =>
+        match decl with
+        | MkIndDecl declared params indices _ ctors =>
+            match andb (eqNat ind declared) (eqNat nparams (length Param params)) with
+            | False => Left ConstructorClosureError (Pair Nat CoreTerm) (ConstructorClosureMalformed ind index)
+            | True =>
+                match compiler_nth Ctor ctors index with
+                | Nothing => Left ConstructorClosureError (Pair Nat CoreTerm) (ConstructorClosureMissing ind index)
+                | Just ctor =>
+                    match ctor with
+                    | MkCtor _ typ => Right ConstructorClosureError (Pair Nat CoreTerm)
+                        (MkPair Nat CoreTerm (add nparams (length CoreTerm indices)) typ)
+                    end
+                end
+            end
+        end
+    end;
+
+def constructor_result_head (ind : Nat) (head : CoreTerm) : Bool :=
+    match head with
+    | CInd name => eqNat name ind
+    | CRel _ => False | CSort _ => False | CPi _ _ => False | CLam _ _ => False
+    | CApp _ _ => False | CLetIn _ _ _ => False | CConst _ => False
+    | CConstruct _ _ _ => False | CCase _ _ _ _ => False
+    | CFix _ _ _ _ _ => False | CStrBytes _ _ => False
+                              | CStrLit _ _ => False
+    end;
+
+def constructor_result_type (fuel : Nat) (ind : Nat) (index : Nat)
+    (family_arity : Nat) (typ : CoreTerm) : Either ConstructorClosureError Unit :=
+    match constructor_normal_result Spine ind index (app_spine_checked fuel typ) with
+    | Left err => Left ConstructorClosureError Unit err
+    | Right spine =>
+        match spine with
+        | MkSpine head arguments =>
+            match andb (constructor_result_head ind head) (eqNat (length CoreTerm arguments) family_arity) with
+            | True => Right ConstructorClosureError Unit MkUnit
+            | False => Left ConstructorClosureError Unit (ConstructorClosureMalformed ind index)
+            end
+        end
+    end;
+
+-- Instantiate supplied arguments first. A residual Pi requires a closure;
+-- a saturated constructor keeps its original application shape.
+def constructor_applied_type_indexed : Nat -> CheckEnvironment -> Nat -> Nat -> Nat
+    -> CoreTerm -> List CoreTerm -> Either ConstructorClosureError CoreTerm :=
+  fix constructor_applied_type_indexed (fuel : Nat) (sig : CheckEnvironment) (ind : Nat)
+      (index : Nat) (family_arity : Nat) (typ : CoreTerm) (arguments : List CoreTerm)
+      : Either ConstructorClosureError CoreTerm :=
+    match fuel with
+    | Z => Left ConstructorClosureError CoreTerm ConstructorClosureExhausted
+    | S fuel' =>
+        match constructor_normal_result CoreTerm ind index (whnf_checked_indexed fuel' sig typ) with
+        | Left err => Left ConstructorClosureError CoreTerm err
+        | Right normalized =>
+            match piViewRaw normalized with
+            | Just product =>
+                match arguments with
+                | Nil => Right ConstructorClosureError CoreTerm normalized
+                | Cons argument rest =>
+                    match product with
+                    | MkPi _ codomain =>
+                        constructor_applied_type_indexed fuel' sig ind index family_arity
+                          (subst argument codomain) rest
+                    end
+                end
+            | Nothing =>
+                match constructor_result_type fuel' ind index family_arity normalized with
+                | Left err => Left ConstructorClosureError CoreTerm err
+                | Right _ =>
+                    match arguments with
+                    | Nil => Right ConstructorClosureError CoreTerm normalized
+                    | Cons _ _ => Left ConstructorClosureError CoreTerm (ConstructorClosureOverapplied ind index)
+                    end
+                end
+            end
+        end
+    end;
+
+def constructor_expand_indexed : Nat -> CheckEnvironment -> Nat -> Nat -> Nat
+    -> CoreTerm -> CoreTerm -> Either ConstructorClosureError CoreTerm :=
+  fix constructor_expand_indexed (fuel : Nat) (sig : CheckEnvironment) (ind : Nat) (index : Nat)
+      (family_arity : Nat) (typ : CoreTerm) (applied : CoreTerm)
+      : Either ConstructorClosureError CoreTerm :=
+    match fuel with
+    | Z => Left ConstructorClosureError CoreTerm ConstructorClosureExhausted
+    | S fuel' =>
+        match constructor_normal_result CoreTerm ind index (whnf_checked_indexed fuel' sig typ) with
+        | Left err => Left ConstructorClosureError CoreTerm err
+        | Right normalized =>
+            match piViewRaw normalized with
+            | Just product =>
+                match product with
+                | MkPi domain codomain =>
+                    mapRight ConstructorClosureError CoreTerm CoreTerm
+                      (fun (body : CoreTerm) => CLam domain body)
+                      (constructor_expand_indexed fuel' sig ind index family_arity codomain
+                        (CApp (lift 1 applied) (CRel 0)))
+                end
+            | Nothing =>
+                match constructor_result_type fuel' ind index family_arity normalized with
+                | Left err => Left ConstructorClosureError CoreTerm err
+                | Right _ => Right ConstructorClosureError CoreTerm applied
+                end
+            end
+        end
+    end;
+
+def constructor_domain_erased_indexed (fuel : Nat) (sig : CheckEnvironment) (ind : Nat)
+    (index : Nat) (remaining_params : Nat) (domain : CoreTerm)
+    : Either ConstructorClosureError Bool :=
+    match remaining_params with
+    | S _ => Right ConstructorClosureError Bool True
+    | Z =>
+        match constructor_normal_result CoreTerm ind index (whnf_checked_indexed fuel sig domain) with
+        | Left err => Left ConstructorClosureError Bool err
+        | Right normalized =>
+            Right ConstructorClosureError Bool
+              (match core_sort_level normalized with | Just _ => True | Nothing => False end)
+        end
+    end;
+
+-- Capture supplied runtime fields outside new lambdas. Reusing the partial
+-- constructor therefore does not evaluate those fields again. Inductive
+-- parameters and sort-valued fields retain the extractor's erasure convention.
+def constructor_capture_indexed : Nat -> CheckEnvironment -> Nat -> Nat -> Nat -> Nat
+    -> CoreTerm -> CoreTerm -> List CoreTerm -> Either ConstructorClosureError CoreTerm :=
+  fix constructor_capture_indexed (fuel : Nat) (sig : CheckEnvironment) (ind : Nat) (index : Nat)
+      (family_arity : Nat) (remaining_params : Nat) (typ : CoreTerm)
+      (applied : CoreTerm) (arguments : List CoreTerm) : Either ConstructorClosureError CoreTerm :=
+    match fuel with
+    | Z => Left ConstructorClosureError CoreTerm ConstructorClosureExhausted
+    | S fuel' =>
+        match arguments with
+        | Nil => constructor_expand_indexed fuel' sig ind index family_arity typ applied
+        | Cons argument rest =>
+            match constructor_normal_result CoreTerm ind index (whnf_checked_indexed fuel' sig typ) with
+            | Left err => Left ConstructorClosureError CoreTerm err
+            | Right normalized =>
+                match piViewRaw normalized with
+                | Nothing => Left ConstructorClosureError CoreTerm (ConstructorClosureOverapplied ind index)
+                | Just product =>
+                    match product with
+                    | MkPi domain codomain =>
+                        let next_params : Nat := core_pred remaining_params in
+                        match constructor_domain_erased_indexed fuel' sig ind index remaining_params domain with
+                        | Left err => Left ConstructorClosureError CoreTerm err
+                        | Right erased =>
+                            match erased with
+                            | True => constructor_capture_indexed fuel' sig ind index family_arity next_params
+                                (subst argument codomain) (CApp applied argument) rest
+                            | False => mapRight ConstructorClosureError CoreTerm CoreTerm
+                                (fun (body : CoreTerm) => CLetIn argument domain body)
+                                (constructor_capture_indexed fuel' sig ind index family_arity next_params
+                                  codomain (CApp (lift 1 applied) (CRel 0))
+                                  (map CoreTerm CoreTerm (fun (value : CoreTerm) => lift 1 value) rest))
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end;
+
+def constructor_close_spine_indexed (fuel : Nat) (sig : CheckEnvironment) (ind : Nat) (index : Nat)
+    (nparams : Nat) (arguments : List CoreTerm) : Either ConstructorClosureError CoreTerm :=
+    match constructor_signature_indexed sig ind index nparams with
+    | Left err => Left ConstructorClosureError CoreTerm err
+    | Right info =>
+        match info with
+        | MkPair family_arity typ =>
+            match constructor_applied_type_indexed fuel sig ind index family_arity typ arguments with
+            | Left err => Left ConstructorClosureError CoreTerm err
+            | Right remaining =>
+                match piViewRaw remaining with
+                | Nothing => Right ConstructorClosureError CoreTerm (mk_app (CConstruct ind index nparams) arguments)
+                | Just _ => constructor_capture_indexed fuel sig ind index family_arity nparams typ
+                    (CConstruct ind index nparams) arguments
+                end
+            end
+        end
+    end;
+
+def constructor_close_list
+    (close : CoreTerm -> Either ConstructorClosureError CoreTerm)
+    : List CoreTerm -> Either ConstructorClosureError (List CoreTerm) :=
+  fix constructor_close_list (terms : List CoreTerm) : Either ConstructorClosureError (List CoreTerm) :=
+    match terms with
+    | Nil => Right ConstructorClosureError (List CoreTerm) (Nil CoreTerm)
+    | Cons term rest =>
+        match close term with
+        | Left err => Left ConstructorClosureError (List CoreTerm) err
+        | Right head =>
+            mapRight ConstructorClosureError (List CoreTerm) (List CoreTerm)
+              (fun (tail : List CoreTerm) => Cons CoreTerm head tail) (constructor_close_list rest)
+        end
+    end;
+
+def constructor_close_application_indexed
+    (close : CoreTerm -> Either ConstructorClosureError CoreTerm)
+    (fuel : Nat) (sig : CheckEnvironment) (term : CoreTerm) : Either ConstructorClosureError CoreTerm :=
+    match constructor_normal_result Spine 0 0 (app_spine_checked fuel term) with
+    | Left err => Left ConstructorClosureError CoreTerm err
+    | Right spine =>
+        match spine with
+        | MkSpine head arguments =>
+            match constructor_close_list close arguments with
+            | Left err => Left ConstructorClosureError CoreTerm err
+            | Right args =>
+                match asCtorHead head with
+                | YesCtor ind index nparams => constructor_close_spine_indexed fuel sig ind index nparams args
+                | NotCtor =>
+                    mapRight ConstructorClosureError CoreTerm CoreTerm
+                      (fun (closed_head : CoreTerm) => mk_app closed_head args) (close head)
+                end
+            end
+        end
+    end;
+
+-- Only computational positions need constructor closures. Existing type
+-- annotations and case motives remain exact; introduced annotations come from
+-- the instantiated constructor declaration. The caller strictly checks output.
+def constructor_close_indexed : Nat -> CheckEnvironment -> CoreTerm -> Either ConstructorClosureError CoreTerm :=
+  fix constructor_close_indexed (fuel : Nat) (sig : CheckEnvironment) (term : CoreTerm)
+      : Either ConstructorClosureError CoreTerm :=
+    match fuel with
+    | Z => Left ConstructorClosureError CoreTerm ConstructorClosureExhausted
+    | S fuel' =>
+        let close : CoreTerm -> Either ConstructorClosureError CoreTerm :=
+          fun (value : CoreTerm) => constructor_close_indexed fuel' sig value in
+        match term with
+        | CRel _ => Right ConstructorClosureError CoreTerm term
+        | CSort _ => Right ConstructorClosureError CoreTerm term
+        | CPi _ _ => Right ConstructorClosureError CoreTerm term
+        | CInd _ => Right ConstructorClosureError CoreTerm term
+        | CConst _ => Right ConstructorClosureError CoreTerm term
+        | CStrBytes _ _ => Right ConstructorClosureError CoreTerm term
+        | CStrLit _ _ => Right ConstructorClosureError CoreTerm term
+        | CConstruct ind index nparams => constructor_close_spine_indexed fuel' sig ind index nparams (Nil CoreTerm)
+        | CApp _ _ => constructor_close_application_indexed close fuel' sig term
+        | CLam annotation body => mapRight ConstructorClosureError CoreTerm CoreTerm
+            (fun (closed : CoreTerm) => CLam annotation closed) (close body)
+        | CLetIn value annotation body =>
+            match close value with
+            | Left err => Left ConstructorClosureError CoreTerm err
+            | Right closed_value => mapRight ConstructorClosureError CoreTerm CoreTerm
+                (fun (closed_body : CoreTerm) => CLetIn closed_value annotation closed_body) (close body)
+            end
+        | CFix name rec_arg arity annotation body => mapRight ConstructorClosureError CoreTerm CoreTerm
+            (fun (closed : CoreTerm) => CFix name rec_arg arity annotation closed) (close body)
+        | CCase info motive scrutinee branches =>
+            match close scrutinee with
+            | Left err => Left ConstructorClosureError CoreTerm err
+            | Right closed_scrutinee => mapRight ConstructorClosureError (List CoreTerm) CoreTerm
+                (fun (closed_branches : List CoreTerm) => CCase info motive closed_scrutinee closed_branches)
+                (constructor_close_list close branches)
+            end
+        end
+    end;
+
+def constructor_close (fuel : Nat) (sig : List Entry) (term : CoreTerm) : Either ConstructorClosureError CoreTerm :=
+    constructor_close_indexed fuel (check_environment_from_entries sig) term;

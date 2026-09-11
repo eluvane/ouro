@@ -1,0 +1,831 @@
+-- Rewrite helpers stay separate so handler sugar does not inflate the core lowering cone.
+
+-- @entry rewrite_handlers
+
+import "lower_uses.ouro";
+
+-- @bound(cyclo <= 82)
+def subst_expr : Nat -> Nat -> Expr -> Expr -> Expr :=
+  fix subst_expr (fuel : Nat) (name : Nat) (replacement : Expr) (e : Expr) : Expr :=
+    match fuel with
+    | Z => e
+    | S fuel' =>
+        match e with
+        | EVar n =>
+            match eqNat n name with
+            | True => replacement
+            | False => EVar n
+            end
+        | EHole h => EHole h
+        | ESort u => ESort u
+        | ENat n => ENat n
+        | EStr s => EStr s
+        | EApp f a =>
+            EApp (subst_expr fuel' name replacement f)
+              (subst_expr fuel' name replacement a)
+        | ELam n ann body =>
+            ELam n
+              (match ann with
+              | Nothing => Nothing Expr
+              | Just ty => Just Expr (subst_expr fuel' name replacement ty)
+              end : Maybe Expr)
+              (match eqNat n name with
+              | True => body
+              | False => subst_expr fuel' name replacement body
+              end)
+        | EPi n dom cod =>
+            EPi n (subst_expr fuel' name replacement dom)
+              (match eqNat n name with
+              | True => cod
+              | False => subst_expr fuel' name replacement cod
+              end)
+        | ELet n ann value body =>
+            ELet n
+              (match ann with
+              | Nothing => Nothing Expr
+              | Just ty => Just Expr (subst_expr fuel' name replacement ty)
+              end : Maybe Expr)
+              (subst_expr fuel' name replacement value)
+              (match eqNat n name with
+              | True => body
+              | False => subst_expr fuel' name replacement body
+              end)
+        | EAscribe e0 ty =>
+            EAscribe (subst_expr fuel' name replacement e0)
+              (subst_expr fuel' name replacement ty)
+        | EMatch scrut branches =>
+            EMatch (subst_expr fuel' name replacement scrut) branches
+        | EFix fn binders ret body =>
+            EFix fn (subst_expr fuel' name replacement binders)
+              (match eqNat fn name with
+              | True => ret
+              | False => subst_expr fuel' name replacement ret
+              end)
+              (match eqNat fn name with
+              | True => body
+              | False => subst_expr fuel' name replacement body
+              end)
+        | EEffectRow ty ops =>
+            EEffectRow (subst_expr fuel' name replacement ty) ops
+        | EPerform op args =>
+            EPerform op
+              ((fix go (xs : List Expr) : List Expr :=
+                match xs with
+                | Nil => Nil Expr
+                | Cons x xs' =>
+                    Cons Expr (subst_expr fuel' name replacement x) (go xs')
+                end) args)
+        | EDo es =>
+            EDo
+              ((fix go (xs : List Expr) : List Expr :=
+                match xs with
+                | Nil => Nil Expr
+                | Cons x xs' =>
+                    Cons Expr (subst_expr fuel' name replacement x) (go xs')
+                end) es)
+        | EDoBind n action =>
+            EDoBind n (subst_expr fuel' name replacement action)
+        | EList elems =>
+            EList
+              ((fix go (xs : List Expr) : List Expr :=
+                match xs with
+                | Nil => Nil Expr
+                | Cons x xs' =>
+                    Cons Expr (subst_expr fuel' name replacement x) (go xs')
+                end) elems)
+        | EHandle comp clauses =>
+            EHandle (subst_expr fuel' name replacement comp)
+              ((fix go (cs : List (Pair Nat (Pair (List Nat) Expr)))
+                  : List (Pair Nat (Pair (List Nat) Expr)) :=
+                match cs with
+                | Nil => Nil (Pair Nat (Pair (List Nat) Expr))
+                | Cons c cs' =>
+                    match c with
+                    | MkPair op payload =>
+                        match payload with
+                        | MkPair binders body =>
+                            let shadowed : Bool :=
+                              (fix has (xs : List Nat) : Bool :=
+                                match xs with
+                                | Nil => False
+                                | Cons x xs' => orb (eqNat x name) (has xs')
+                                end) binders in
+                            Cons (Pair Nat (Pair (List Nat) Expr))
+                              (MkPair Nat (Pair (List Nat) Expr) op
+                                (MkPair (List Nat) Expr binders
+                                  (match shadowed with
+                                  | True => body
+                                  | False => subst_expr fuel' name replacement body
+                                  end)))
+                              (go cs')
+                        end
+                    end
+                end) clauses)
+        | EBranch packed body rest =>
+            EBranch packed (subst_expr fuel' name replacement body)
+              (subst_expr fuel' name replacement rest)
+        | ENoBranch => ENoBranch
+        | EBinder n ty rest =>
+            EBinder n (subst_expr fuel' name replacement ty)
+              (match eqNat n name with
+              | True => rest
+              | False => subst_expr fuel' name replacement rest
+              end)
+        | ENoBinder => ENoBinder
+        | EMultiMatch scruts rows => EMultiMatch scruts rows
+        end
+    end;
+
+def subst_expr_list (fuel : Nat) (name : Nat) (replacement : Expr)
+    : List Expr -> List Expr :=
+  fix subst_expr_list (xs : List Expr) : List Expr :=
+    match xs with
+    | Nil => Nil Expr
+    | Cons x xs' =>
+        Cons Expr (subst_expr fuel name replacement x)
+          (subst_expr_list xs')
+    end;
+
+def same_nat_expr_length (xs : List Nat) (ys : List Expr) : Bool :=
+    eqNat (length Nat xs) (length Expr ys);
+
+def subst_handler_args (fuel : Nat) (names : List Nat) (args : List Expr)
+    (body : Expr) : Expr :=
+  (fix go (ns : List Nat) (as : List Expr) (b : Expr) : Expr :=
+    match ns, as with
+    | Nil, Nil => b
+    | Cons n ns', Cons a as' =>
+        go ns' as' (subst_expr fuel n a b)
+    | Nil, Cons _ _ => b
+    | Cons _ _, Nil => b
+    end) names args body;
+
+def split_last_nat : List Nat -> Maybe (Pair (List Nat) Nat) :=
+  fix split_last_nat (xs : List Nat) : Maybe (Pair (List Nat) Nat) :=
+    match xs with
+    | Nil => Nothing (Pair (List Nat) Nat)
+    | Cons x rest =>
+        match rest with
+        | Nil =>
+            Just (Pair (List Nat) Nat)
+              (MkPair (List Nat) Nat (Nil Nat) x)
+        | Cons _ _ =>
+            match split_last_nat rest with
+            | Nothing => Nothing (Pair (List Nat) Nat)
+            | Just p =>
+                match p with
+                | MkPair init last =>
+                    Just (Pair (List Nat) Nat)
+                      (MkPair (List Nat) Nat (Cons Nat x init) last)
+                end
+            end
+        end
+    end;
+
+def split_last_handler_clause :
+    List (Pair Nat (Pair (List Nat) Expr)) ->
+      Maybe
+        (Pair
+          (List (Pair Nat (Pair (List Nat) Expr)))
+          (Pair Nat (Pair (List Nat) Expr))) :=
+  fix split_last_handler_clause
+    (xs : List (Pair Nat (Pair (List Nat) Expr)))
+    : Maybe
+        (Pair
+          (List (Pair Nat (Pair (List Nat) Expr)))
+          (Pair Nat (Pair (List Nat) Expr))) :=
+    match xs with
+    | Nil =>
+        Nothing
+          (Pair
+            (List (Pair Nat (Pair (List Nat) Expr)))
+            (Pair Nat (Pair (List Nat) Expr)))
+    | Cons x rest =>
+        match rest with
+        | Nil =>
+            Just
+              (Pair
+                (List (Pair Nat (Pair (List Nat) Expr)))
+                (Pair Nat (Pair (List Nat) Expr)))
+              (MkPair
+                (List (Pair Nat (Pair (List Nat) Expr)))
+                (Pair Nat (Pair (List Nat) Expr))
+                (Nil (Pair Nat (Pair (List Nat) Expr))) x)
+        | Cons _ _ =>
+            match split_last_handler_clause rest with
+            | Nothing =>
+                Nothing
+                  (Pair
+                    (List (Pair Nat (Pair (List Nat) Expr)))
+                    (Pair Nat (Pair (List Nat) Expr)))
+            | Just p =>
+                match p with
+                | MkPair init last =>
+                    Just
+                      (Pair
+                        (List (Pair Nat (Pair (List Nat) Expr)))
+                        (Pair Nat (Pair (List Nat) Expr)))
+                      (MkPair
+                        (List (Pair Nat (Pair (List Nat) Expr)))
+                        (Pair Nat (Pair (List Nat) Expr))
+                        (Cons
+                          (Pair Nat (Pair (List Nat) Expr)) x init)
+                        last)
+                end
+            end
+        end
+    end;
+
+def find_handler_clause
+    (op : Nat)
+    (stack : List (List (Pair Nat (Pair (List Nat) Expr))))
+    : Maybe (Pair Nat (Pair (List Nat) Expr)) :=
+  (fix go (ms : List (List (Pair Nat (Pair (List Nat) Expr))))
+    : Maybe (Pair Nat (Pair (List Nat) Expr)) :=
+    match ms with
+    | Nil => Nothing (Pair Nat (Pair (List Nat) Expr))
+    | Cons clauses rest =>
+        (fix find (xs : List (Pair Nat (Pair (List Nat) Expr)))
+          : Maybe (Pair Nat (Pair (List Nat) Expr)) :=
+          match xs with
+          | Nil => go rest
+          | Cons clause xs' =>
+              match clause with
+              | MkPair name _ =>
+                  match eqNat name op with
+                  | True => Just (Pair Nat (Pair (List Nat) Expr)) clause
+                  | False => find xs'
+                  end
+              end
+          end) clauses
+    end) stack;
+
+def expr_as_var (e : Expr) : Maybe Nat :=
+    match e with
+    | EVar n => Just Nat n
+    | EHole _ => Nothing Nat
+    | ESort _ => Nothing Nat
+    | ENat _ => Nothing Nat
+    | EStr _ => Nothing Nat
+    | EApp _ _ => Nothing Nat
+    | ELam _ _ _ => Nothing Nat
+    | EPi _ _ _ => Nothing Nat
+    | ELet _ _ _ _ => Nothing Nat
+    | EAscribe _ _ => Nothing Nat
+    | EMatch _ _ => Nothing Nat
+    | EFix _ _ _ _ => Nothing Nat
+    | EEffectRow _ _ => Nothing Nat
+    | EPerform _ _ => Nothing Nat
+    | EDo _ => Nothing Nat
+    | EDoBind _ _ => Nothing Nat
+    | EList _ => Nothing Nat
+    | EHandle _ _ => Nothing Nat
+    | EBranch _ _ _ => Nothing Nat
+    | ENoBranch => Nothing Nat
+    | EBinder _ _ _ => Nothing Nat
+    | ENoBinder => Nothing Nat
+    | EMultiMatch _ _ => Nothing Nat
+    end;
+
+def resume_value_expr (fuel : Nat) (k : Nat) (body : Expr) : Maybe Expr :=
+    match body with
+    | EApp f value =>
+        match expr_as_var f with
+        | Nothing => Nothing Expr
+        | Just k2 =>
+            match eqNat k k2 with
+            | True =>
+                match expr_uses_var fuel k value with
+                | True => Nothing Expr
+                | False => Just Expr value
+                end
+            | False => Nothing Expr
+            end
+        end
+    | EVar _ => Nothing Expr
+    | EHole _ => Nothing Expr
+    | ESort _ => Nothing Expr
+    | ENat _ => Nothing Expr
+    | EStr _ => Nothing Expr
+    | ELam _ _ _ => Nothing Expr
+    | EPi _ _ _ => Nothing Expr
+    | ELet _ _ _ _ => Nothing Expr
+    | EAscribe _ _ => Nothing Expr
+    | EMatch _ _ => Nothing Expr
+    | EFix _ _ _ _ => Nothing Expr
+    | EEffectRow _ _ => Nothing Expr
+    | EPerform _ _ => Nothing Expr
+    | EDo _ => Nothing Expr
+    | EDoBind _ _ => Nothing Expr
+    | EList _ => Nothing Expr
+    | EHandle _ _ => Nothing Expr
+    | EBranch _ _ _ => Nothing Expr
+    | ENoBranch => Nothing Expr
+    | EBinder _ _ _ => Nothing Expr
+    | ENoBinder => Nothing Expr
+    | EMultiMatch _ _ => Nothing Expr
+    end;
+
+def pure_handler_clause
+    (env : LowerEnv)
+    (clauses : List (Pair Nat (Pair (List Nat) Expr)))
+    : Maybe (Pair Nat (Pair (List Nat) Expr)) :=
+  (fix find (xs : List (Pair Nat (Pair (List Nat) Expr)))
+    : Maybe (Pair Nat (Pair (List Nat) Expr)) :=
+    match xs with
+    | Nil => Nothing (Pair Nat (Pair (List Nat) Expr))
+    | Cons clause rest =>
+        match clause with
+        | MkPair op _ =>
+            match is_pure_handler_op env op with
+            | True => Just (Pair Nat (Pair (List Nat) Expr)) clause
+            | False => find rest
+            end
+        end
+    end) clauses;
+
+def operation_handler_clauses
+    (env : LowerEnv)
+    (clauses : List (Pair Nat (Pair (List Nat) Expr)))
+    : List (Pair Nat (Pair (List Nat) Expr)) :=
+  match split_last_handler_clause clauses with
+  | Nothing => Nil (Pair Nat (Pair (List Nat) Expr))
+  | Just parts =>
+      match parts with
+      | MkPair init last =>
+          match last with
+          | MkPair op _ =>
+              match is_pure_handler_op env op with
+              | True => init
+              | False => clauses
+              end
+          end
+      end
+  end;
+
+def looks_pure_expr : Nat -> Expr -> Bool :=
+  fix looks_pure_expr (fuel : Nat) (e : Expr) : Bool :=
+    match fuel with
+    | Z => False
+    | S fuel' =>
+        match e with
+        | EStr _ => True
+        | ENat _ => True
+        | ESort _ => True
+        | ELam _ _ _ => True
+        | EApp f a => orb (looks_pure_expr fuel' f) (looks_pure_expr fuel' a)
+        | EList elems =>
+            (fix go (xs : List Expr) : Bool :=
+              match xs with
+              | Nil => True
+              | Cons x xs' => andb (looks_pure_expr fuel' x) (go xs')
+              end) elems
+        | ELet _ _ value body =>
+            andb (looks_pure_expr fuel' value) (looks_pure_expr fuel' body)
+        | EVar _ => False
+        | EHole _ => False
+        | EPi _ _ _ => False
+        | EAscribe _ _ => False
+        | EMatch _ _ => False
+        | EFix _ _ _ _ => False
+        | EEffectRow _ _ => False
+        | EPerform _ _ => False
+        | EDo _ => False
+        | EDoBind _ _ => False
+        | EHandle _ _ => False
+        | EBranch _ _ _ => False
+        | ENoBranch => False
+        | EBinder _ _ _ => False
+        | ENoBinder => False
+        | EMultiMatch _ _ => False
+        end
+    end;
+
+def flatten_do_after_rewrite : Nat -> List Expr -> Expr :=
+  fix flatten_do_after_rewrite (fuel : Nat) (stmts : List Expr) : Expr :=
+    match fuel with
+    | Z => EDo stmts
+    | S fuel' =>
+        match stmts with
+        | Nil => EDo (Nil Expr)
+        | Cons first rest =>
+            match first with
+            | EDoBind name value =>
+                match looks_pure_expr fuel' value with
+                | False => EDo stmts
+                | True =>
+                    match rest with
+                    | Nil => value
+                    | Cons _ _ =>
+                        flatten_do_after_rewrite fuel'
+                          (subst_expr_list fuel' name value rest)
+                    end
+                end
+            | EVar _ => EDo stmts
+            | EHole _ => EDo stmts
+            | ESort _ => EDo stmts
+            | ENat _ => EDo stmts
+            | EStr _ => EDo stmts
+            | EList _ => EDo stmts
+            | EApp _ _ => EDo stmts
+            | ELam _ _ _ => EDo stmts
+            | EPi _ _ _ => EDo stmts
+            | ELet _ _ _ _ => EDo stmts
+            | EAscribe _ _ => EDo stmts
+            | EMatch _ _ => EDo stmts
+            | EFix _ _ _ _ => EDo stmts
+            | EEffectRow _ _ => EDo stmts
+            | EPerform _ _ => EDo stmts
+            | EDo _ => EDo stmts
+            | EHandle _ _ => EDo stmts
+            | EBranch _ _ _ => EDo stmts
+            | ENoBranch => EDo stmts
+            | EBinder _ _ _ => EDo stmts
+            | ENoBinder => EDo stmts
+            | EMultiMatch _ _ => EDo stmts
+            end
+        end
+    end;
+
+def rewrite_perform_parts
+    (fuel : Nat)
+    (args : List Expr)
+    (body : Expr)
+    (parts : Pair (List Nat) Nat) : Expr :=
+  match parts with
+  | MkPair arg_names k =>
+      match same_nat_expr_length arg_names args with
+      | False => EHole (Nothing Nat)
+      | True =>
+          match resume_value_expr fuel k
+              (subst_handler_args fuel arg_names args body) with
+          | Nothing => EHole (Nothing Nat)
+          | Just value => value
+          end
+      end
+  end;
+
+def rewrite_perform_clause
+    (fuel : Nat)
+    (args : List Expr)
+    (clause : Pair Nat (Pair (List Nat) Expr)) : Expr :=
+  match clause with
+  | MkPair _ payload =>
+      match payload with
+      | MkPair binders body =>
+          match split_last_nat binders with
+          | Nothing => EHole (Nothing Nat)
+          | Just parts => rewrite_perform_parts fuel args body parts
+          end
+      end
+  end;
+
+def rewrite_perform_result
+    (fuel : Nat)
+    (op : Nat)
+    (args : List Expr)
+    (stack : List (List (Pair Nat (Pair (List Nat) Expr)))) : Expr :=
+  match find_handler_clause op stack with
+  | Nothing => EPerform op args
+  | Just clause => rewrite_perform_clause fuel args clause
+  end;
+
+def rewrite_handle_result
+    (pure_clause : Pair Nat (Pair (List Nat) Expr))
+    (comp : Expr)
+    (pure_body : Expr) : Expr :=
+  match pure_clause with
+  | MkPair pure_op payload =>
+      match payload with
+      | MkPair pure_binders _ =>
+          EHandle comp
+            (Cons (Pair Nat (Pair (List Nat) Expr))
+              (MkPair Nat (Pair (List Nat) Expr) pure_op
+                (MkPair (List Nat) Expr pure_binders pure_body))
+              (Nil (Pair Nat (Pair (List Nat) Expr))))
+      end
+  end;
+
+def handler_rewrite_setup
+    (env : LowerEnv)
+    (stack : List (List (Pair Nat (Pair (List Nat) Expr))))
+    (clauses : List (Pair Nat (Pair (List Nat) Expr)))
+    : Maybe
+        (Pair
+          (List (List (Pair Nat (Pair (List Nat) Expr))))
+          (Pair (Pair Nat (Pair (List Nat) Expr)) Expr)) :=
+  match pure_handler_clause env clauses with
+  | Nothing =>
+      Nothing
+        (Pair
+          (List (List (Pair Nat (Pair (List Nat) Expr))))
+          (Pair (Pair Nat (Pair (List Nat) Expr)) Expr))
+  | Just pure_clause =>
+      match pure_clause with
+      | MkPair _ payload =>
+          match payload with
+          | MkPair _ pure_body =>
+              Just
+                (Pair
+                  (List (List (Pair Nat (Pair (List Nat) Expr))))
+                  (Pair (Pair Nat (Pair (List Nat) Expr)) Expr))
+                (MkPair
+                  (List (List (Pair Nat (Pair (List Nat) Expr))))
+                  (Pair (Pair Nat (Pair (List Nat) Expr)) Expr)
+                  (Cons
+                    (List (Pair Nat (Pair (List Nat) Expr)))
+                    (operation_handler_clauses env clauses)
+                    stack)
+                  (MkPair
+                    (Pair Nat (Pair (List Nat) Expr)) Expr
+                    pure_clause pure_body))
+          end
+      end
+  end;
+
+-- @bound(cyclo <= 78)
+def rewrite_handlers : Nat -> LowerEnv ->
+    List (List (Pair Nat (Pair (List Nat) Expr))) -> Expr -> Expr :=
+  fix rewrite_handlers (fuel : Nat) (env : LowerEnv)
+    (stack : List (List (Pair Nat (Pair (List Nat) Expr)))) (e : Expr) : Expr :=
+    match fuel with
+    | Z => EHole (Nothing Nat)
+    | S fuel' =>
+        match e with
+        | EVar _ => e
+        | EHole _ => e
+        | ESort _ => e
+        | ENat _ => e
+        | EStr _ => e
+        | EApp f a =>
+            EApp (rewrite_handlers fuel' env stack f)
+              (rewrite_handlers fuel' env stack a)
+        | ELam n ann body =>
+            ELam n
+              (match ann with
+              | Nothing => Nothing Expr
+              | Just ty => Just Expr (rewrite_handlers fuel' env stack ty)
+              end : Maybe Expr)
+              (rewrite_handlers fuel' env stack body)
+        | EPi n dom cod =>
+            EPi n (rewrite_handlers fuel' env stack dom)
+              (rewrite_handlers fuel' env stack cod)
+        | ELet n ann value body =>
+            ELet n
+              (match ann with
+              | Nothing => Nothing Expr
+              | Just ty => Just Expr (rewrite_handlers fuel' env stack ty)
+              end : Maybe Expr)
+              (rewrite_handlers fuel' env stack value)
+              (rewrite_handlers fuel' env stack body)
+        | EAscribe e0 ty =>
+            EAscribe (rewrite_handlers fuel' env stack e0)
+              (rewrite_handlers fuel' env stack ty)
+        | EMatch scrut branches =>
+            let branches' : Expr :=
+              (fix go (bs : Expr) : Expr :=
+                match bs with
+                | EBranch packed body rest =>
+                    EBranch packed (rewrite_handlers fuel' env stack body)
+                      (go rest)
+                | ENoBranch => ENoBranch
+                | EVar _ => ENoBranch
+                | EHole _ => ENoBranch
+                | ESort _ => ENoBranch
+                | ENat _ => ENoBranch
+                | EStr _ => ENoBranch
+                | EApp _ _ => ENoBranch
+                | ELam _ _ _ => ENoBranch
+                | EPi _ _ _ => ENoBranch
+                | ELet _ _ _ _ => ENoBranch
+                | EAscribe _ _ => ENoBranch
+                | EMatch _ _ => ENoBranch
+                | EFix _ _ _ _ => ENoBranch
+                | EEffectRow _ _ => ENoBranch
+                | EPerform _ _ => ENoBranch
+                | EDo _ => ENoBranch
+                | EDoBind _ _ => ENoBranch
+                | EList _ => ENoBranch
+                | EHandle _ _ => ENoBranch
+                | EBinder _ _ _ => ENoBranch
+                | ENoBinder => ENoBranch
+                | EMultiMatch _ _ => ENoBranch
+                end) branches in
+            EMatch (rewrite_handlers fuel' env stack scrut) branches'
+        | EFix fn binders ret body =>
+            EFix fn (rewrite_handlers fuel' env stack binders)
+              (rewrite_handlers fuel' env stack ret)
+              (rewrite_handlers fuel' env stack body)
+        | EEffectRow ty ops =>
+            EEffectRow (rewrite_handlers fuel' env stack ty) ops
+        | EPerform op args =>
+            let args' : List Expr :=
+              (fix go (xs : List Expr) : List Expr :=
+                match xs with
+                | Nil => Nil Expr
+                | Cons x xs' =>
+                    Cons Expr (rewrite_handlers fuel' env stack x) (go xs')
+                end) args in
+            rewrite_perform_result fuel' op args' stack
+        | EDo es =>
+            flatten_do_after_rewrite fuel'
+              ((fix go (xs : List Expr) : List Expr :=
+                match xs with
+                | Nil => Nil Expr
+                | Cons x xs' =>
+                    Cons Expr (rewrite_handlers fuel' env stack x) (go xs')
+                end) es)
+        | EDoBind n action =>
+            EDoBind n (rewrite_handlers fuel' env stack action)
+        | EList elems =>
+            EList
+              ((fix go (xs : List Expr) : List Expr :=
+                match xs with
+                | Nil => Nil Expr
+                | Cons x xs' =>
+                    Cons Expr (rewrite_handlers fuel' env stack x) (go xs')
+                end) elems)
+        | EHandle comp clauses =>
+            match handler_rewrite_setup env stack clauses with
+            | Nothing => EHandle comp clauses
+            | Just setup =>
+                match setup with
+                | MkPair next_stack payload =>
+                    match payload with
+                    | MkPair pure_clause pure_body =>
+                        rewrite_handle_result pure_clause
+                          (rewrite_handlers fuel' env next_stack comp)
+                          (rewrite_handlers fuel' env stack pure_body)
+                    end
+                end
+            end
+        | EBranch packed body rest =>
+            EBranch packed (rewrite_handlers fuel' env stack body)
+              (rewrite_handlers fuel' env stack rest)
+        | ENoBranch => ENoBranch
+        | EBinder n ty rest =>
+            EBinder n (rewrite_handlers fuel' env stack ty)
+              (rewrite_handlers fuel' env stack rest)
+        | ENoBinder => ENoBinder
+        | EMultiMatch scruts rows => EMultiMatch scruts rows
+        end
+    end;
+
+def expr_list_needs_handler
+  (scan : Nat -> Expr -> Bool) (fuel : Nat) : List Expr -> Bool :=
+  fix expr_list_needs_handler (items : List Expr) : Bool :=
+    match items with
+    | Nil => False
+    | Cons item rest =>
+        orb (scan fuel item) (expr_list_needs_handler rest)
+    end;
+
+def pair_exprs_need_handler
+  (scan : Nat -> Expr -> Bool) (fuel : Nat)
+  : List (Pair Nat Expr) -> Bool :=
+  fix pair_exprs_need_handler (items : List (Pair Nat Expr)) : Bool :=
+    match items with
+    | Nil => False
+    | Cons item rest =>
+        match item with
+        | MkPair _ expr =>
+            orb (scan fuel expr) (pair_exprs_need_handler rest)
+        end
+    end;
+
+def expr_needs_handler : Nat -> Expr -> Bool :=
+  fix expr_needs_handler (fuel : Nat) (expr : Expr) : Bool :=
+    match fuel with
+    | Z => True
+    | S fuel2 =>
+        match expr with
+        | EVar _ => False
+        | EHole _ => False
+        | ESort _ => False
+        | ENat _ => False
+        | EApp f a =>
+            orb (expr_needs_handler fuel2 f) (expr_needs_handler fuel2 a)
+        | ELam _ ann body =>
+            orb
+              (match ann with
+               | Nothing => False
+               | Just ty => expr_needs_handler fuel2 ty
+               end)
+              (expr_needs_handler fuel2 body)
+        | EPi _ dom cod =>
+            orb (expr_needs_handler fuel2 dom)
+              (expr_needs_handler fuel2 cod)
+        | ELet _ ann value body =>
+            orb
+              (match ann with
+               | Nothing => False
+               | Just ty => expr_needs_handler fuel2 ty
+               end)
+              (orb (expr_needs_handler fuel2 value)
+                (expr_needs_handler fuel2 body))
+        | EAscribe value ty =>
+            orb (expr_needs_handler fuel2 value)
+              (expr_needs_handler fuel2 ty)
+        | EMatch scrut branches =>
+            orb (expr_needs_handler fuel2 scrut)
+              (expr_needs_handler fuel2 branches)
+        | EFix _ binders ret body =>
+            orb (expr_needs_handler fuel2 binders)
+              (orb (expr_needs_handler fuel2 ret)
+                (expr_needs_handler fuel2 body))
+        | EEffectRow ty _ => expr_needs_handler fuel2 ty
+        | EPerform _ _ => True
+        | EDo items => expr_list_needs_handler
+            (fun (_requested : Nat) (item : Expr) => expr_needs_handler fuel2 item)
+            fuel2 items
+        | EHandle _ _ => True
+        | EBranch _ body rest =>
+            orb (expr_needs_handler fuel2 body)
+              (expr_needs_handler fuel2 rest)
+        | ENoBranch => False
+        | EBinder _ ty rest =>
+            orb (expr_needs_handler fuel2 ty)
+              (expr_needs_handler fuel2 rest)
+        | ENoBinder => False
+        | EMultiMatch scruts branches =>
+            orb (expr_list_needs_handler
+                  (fun (_requested : Nat) (item : Expr) => expr_needs_handler fuel2 item)
+                  fuel2 scruts)
+              ((fix go (rows : List (Pair (List (Pair Nat (List Nat))) Expr))
+                    : Bool :=
+                  match rows with
+                  | Nil => False
+                  | Cons row rest =>
+                      match row with
+                      | MkPair _ body =>
+                          orb (expr_needs_handler fuel2 body) (go rest)
+                      end
+                  end) branches)
+        | EStr _ => False
+        | EDoBind _ body => expr_needs_handler fuel2 body
+        | EList items => expr_list_needs_handler
+            (fun (_requested : Nat) (item : Expr) => expr_needs_handler fuel2 item)
+            fuel2 items
+        end
+    end;
+
+def decl_needs_handler (fuel : Nat) (decl : Decl) : Bool :=
+    match decl with
+    | DDef _ ty body =>
+        orb (expr_needs_handler fuel ty) (expr_needs_handler fuel body)
+    | DAxiom _ ty => expr_needs_handler fuel ty
+    | DInductive _ params family ctors =>
+        orb (pair_exprs_need_handler expr_needs_handler fuel params)
+          (orb (expr_needs_handler fuel family)
+            (pair_exprs_need_handler expr_needs_handler fuel ctors))
+    | DEffect _ params ops =>
+        orb (pair_exprs_need_handler expr_needs_handler fuel params)
+          (pair_exprs_need_handler expr_needs_handler fuel ops)
+    | DImport _ => False
+    | DIntrinsic _ ty _ specialization =>
+        orb (expr_needs_handler fuel ty)
+          (match specialization with
+           | Nothing => False
+           | Just value => expr_needs_handler fuel value
+           end)
+    | DExtern _ ty _ => expr_needs_handler fuel ty
+    | DRepresentation _ _ => False
+    end;
+
+def decls_need_handler_rewrite : List Decl -> Bool :=
+  fix decls_need_handler_rewrite (decls : List Decl) : Bool :=
+    match decls with
+    | Nil => False
+    | Cons decl rest =>
+        orb (decl_needs_handler fuel1k decl)
+          (decls_need_handler_rewrite rest)
+    end;
+
+-- Handler lowering belongs to the source pipeline. Inspect parsed declarations
+-- so comments and string contents cannot enable the rewrite on ordinary code.
+def rewrite_declarations (fuel : Nat) (env : LowerEnv)
+    (decls : List Decl) : List Decl :=
+    match decls_need_handler_rewrite decls with
+    | False => decls
+    | True =>
+        (fix go (items : List Decl) : List Decl :=
+          match items with
+          | Nil => Nil Decl
+          | Cons item rest =>
+              Cons Decl
+                (match item with
+                 | DDef name typ body =>
+                     DDef name typ
+                       (rewrite_handlers fuel env
+                         (Nil (List (Pair Nat (Pair (List Nat) Expr)))) body)
+                 | DAxiom _ _ => item
+                 | DInductive _ _ _ _ => item
+                 | DEffect _ _ _ => item
+                 | DImport _ => item
+                 | DIntrinsic _ _ _ _ => item
+                 | DExtern _ _ _ => item
+                 | DRepresentation _ _ => item
+                 end)
+                (go rest)
+          end) decls
+    end;

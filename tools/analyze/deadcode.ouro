@@ -1,0 +1,123 @@
+-- Reachability over host-supplied declaration and reference facts. Roots are
+-- the entry declarations and the public/API declarations, so a public
+-- definition is never dead only because this checkout has no caller. A plain
+-- `@export` is a promise, not a root: an export nothing reaches is reported
+-- as a dead export. A branch declaration is a match arm the host's shadow scan
+-- proved unreachable; it has no incoming edge, so the walk reports it like any
+-- other dead node. Spans are host record ids the caller maps back to source
+-- positions.
+
+-- @entry analyze_deadcode
+-- @entry dead_live
+
+import "../../std/data.ouro";
+import "../../std/listx.ouro";
+import "../../std/natx.ouro";
+
+-- id, kind, public/API root, exported, entry root, span.
+inductive DeadDecl : Type :=
+  | MkDeadDecl : Nat -> Nat -> Bool -> Bool -> Bool -> Nat -> DeadDecl;
+
+-- referencing declaration id, referenced declaration id.
+inductive DeadRef : Type :=
+  | MkDeadRef : Nat -> Nat -> DeadRef;
+
+inductive DeadIssue : Type :=
+  | IDeadDef : Nat -> DeadIssue
+  | IDeadExport : Nat -> DeadIssue
+  | IDeadCtor : Nat -> DeadIssue
+  | IDeadModule : Nat -> DeadIssue
+  | IDeadBranch : Nat -> DeadIssue;
+
+def dead_decl_id (d : DeadDecl) : Nat :=
+    match d with | MkDeadDecl id _ _ _ _ _ => id end;
+
+def dead_decl_kind (d : DeadDecl) : Nat :=
+    match d with | MkDeadDecl _ kind _ _ _ _ => kind end;
+
+def dead_decl_public (d : DeadDecl) : Bool :=
+    match d with | MkDeadDecl _ _ public _ _ _ => public end;
+
+def dead_decl_exported (d : DeadDecl) : Bool :=
+    match d with | MkDeadDecl _ _ _ exported _ _ => exported end;
+
+def dead_decl_entry (d : DeadDecl) : Bool :=
+    match d with | MkDeadDecl _ _ _ _ entry _ => entry end;
+
+def dead_decl_span (d : DeadDecl) : Nat :=
+    match d with | MkDeadDecl _ _ _ _ _ span => span end;
+
+def dead_ref_src (e : DeadRef) : Nat := match e with | MkDeadRef src _ => src end;
+
+def dead_ref_dst (e : DeadRef) : Nat := match e with | MkDeadRef _ dst => dst end;
+
+def dead_issue_span (i : DeadIssue) : Nat :=
+    match i with
+    | IDeadDef span => span
+    | IDeadExport span => span
+    | IDeadCtor span => span
+    | IDeadModule span => span
+    | IDeadBranch span => span
+    end;
+
+def dead_kind_def : Nat := Z;
+def dead_kind_ctor : Nat := S dead_kind_def;
+def dead_kind_module : Nat := S dead_kind_ctor;
+def dead_kind_branch : Nat := S dead_kind_module;
+
+def dead_roots (decls : List DeadDecl) : List Nat :=
+    map DeadDecl Nat dead_decl_id
+      (filter DeadDecl
+        (fun (d : DeadDecl) => orb (dead_decl_entry d) (dead_decl_public d)) decls);
+
+-- Targets of the references leaving `src`, in edge order.
+def dead_targets (src : Nat) (edges : List DeadRef) : List Nat :=
+    map DeadRef Nat dead_ref_dst
+      (filter DeadRef (fun (e : DeadRef) => eq_nat (dead_ref_src e) src) edges);
+
+-- Every id reachable from the roots. One worklist pass over the whole graph;
+-- fuel bounds the pops, so it must exceed roots plus references.
+def dead_live (fuel : Nat) (edges : List DeadRef) (roots : List Nat) : List Nat :=
+  (fix go (left : Nat) (work : List Nat) (seen : List Nat) : List Nat :=
+    match left with
+    | Z => seen
+    | S left' =>
+        match work with
+        | Nil => seen
+        | Cons id rest =>
+            match mem Nat eq_nat id seen with
+            | True => go left' rest seen
+            | False =>
+                go left' (append Nat (dead_targets id edges) rest) (Cons Nat id seen)
+            end
+        end
+    end) fuel roots (Nil Nat);
+
+def dead_issue_for (d : DeadDecl) : DeadIssue :=
+    match eq_nat (dead_decl_kind d) dead_kind_branch with
+    | True => IDeadBranch (dead_decl_span d)
+    | False =>
+        match eq_nat (dead_decl_kind d) dead_kind_module with
+        | True => IDeadModule (dead_decl_span d)
+        | False =>
+            match eq_nat (dead_decl_kind d) dead_kind_ctor with
+            | True => IDeadCtor (dead_decl_span d)
+            | False =>
+                match dead_decl_exported d with
+                | True => IDeadExport (dead_decl_span d)
+                | False => IDeadDef (dead_decl_span d)
+                end
+            end
+        end
+    end;
+
+def analyze_deadcode (fuel : Nat) (decls : List DeadDecl) (edges : List DeadRef)
+    : List DeadIssue :=
+    let live : List Nat := dead_live fuel edges (dead_roots decls) in
+    concat_map DeadDecl DeadIssue
+      (fun (d : DeadDecl) =>
+        match mem Nat eq_nat (dead_decl_id d) live with
+        | True => Nil DeadIssue
+        | False => ([dead_issue_for d] : List DeadIssue)
+        end)
+      decls;

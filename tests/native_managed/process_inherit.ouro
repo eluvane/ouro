@@ -1,0 +1,167 @@
+-- Run from an owned cwd and an executable path containing spaces/Unicode.
+-- The external harness observes inherited binary streams and child handles.
+import "source_file_values.ouro";
+import "source_nat_values.ouro";
+import "../../std/processx.ouro";
+
+extern inherit_test_process_id : Runtime U32 :=
+    "windows-x86_64" "win64" "kernel32.dll" "GetCurrentProcessId" "nogc";
+def inherit_test_sleep (milliseconds : U32) : Runtime Unit :=
+    windows_capture_sleep milliseconds;
+
+def inherit_test_words : List String :=
+    ["space name", "雪😀", "", "quote\"here", "trailing\\", "many\\\\\"quote"];
+
+def inherit_test_status (expected : Nat) (result : Either ProcessRunError Nat) : IO Unit :=
+    match result with
+    | Left _ => exit 91
+    | Right code => file_expect (eq_nat code expected) end;
+
+def inherit_test_unavailable (expected : Nat) (result : Either ProcessRunError Nat) : IO Unit :=
+    match result with
+    | Right _ => exit 91
+    | Left error => match error with
+        | ProcessUnavailable _ status => file_expect (eq_nat status expected)
+        | ProcessExited _ _ => exit 91 end end;
+
+def inherit_test_child (arguments : List String) : IO Unit :=
+    match arguments with | Nil => exit 91 | Cons code rest =>
+      match rest with | Nil => exit 91 | Cons marker words =>
+        do file_expect (source_words_equal words inherit_test_words);
+           let! environment := process_env_or "OURO_INHERIT_TEST" "missing";
+           file_expect (prim_string_eq environment "雪 value");
+           prim_fs_write_file marker "ran";
+           prim_fs_write_file "child-cwd-marker.txt" "inherited cwd";
+           match prim_string_eq code "0" with
+           | True => exit 0
+           | False => match prim_string_eq code "37" with
+               | True => exit 37
+               | False => match prim_string_eq code "259" with
+                   | True => exit 259 | False => exit 91 end end end end end;
+
+def inherit_test_child_command (program : String) (code : String) (marker : String) : CommandSpec :=
+    command_spec program
+      (Cons String "--child" (Cons String code (Cons String marker inherit_test_words)));
+
+def inherit_test_values (program : String) (marker : String) : IO Unit :=
+    let invoke : String -> List String -> IO (Pair Nat Nat) := prim_process_inherit in
+    let partial : List String -> IO (Pair Nat Nat) := invoke program in
+    let action : IO (Pair Nat Nat) := partial (command_args (inherit_test_child_command program "37" marker)) in
+    do let! before := prim_fs_exists marker;
+       file_expect (notb before);
+       let! first := action;
+       match first with | MkPair status code =>
+         do file_expect (eq_nat status 0); file_expect (eq_nat code 37) end;
+       let! written := prim_fs_read_file marker;
+       file_expect (prim_string_eq written "ran");
+       prim_fs_write_file marker "reset";
+       let! second := action;
+       match second with | MkPair status code =>
+         do file_expect (eq_nat status 0); file_expect (eq_nat code 37) end;
+       let! rewritten := prim_fs_read_file marker;
+       file_expect (prim_string_eq rewritten "ran");
+       let! okay := process_run_spec_inherited_checked (inherit_test_child_command program "0" marker);
+       inherit_test_status 0 okay;
+       let! code37 := process_run_spec_inherited (inherit_test_child_command program "37" marker);
+       inherit_test_status 37 code37;
+       let! checked37 := process_run_spec_inherited_checked (inherit_test_child_command program "37" marker);
+       match checked37 with
+       | Right _ => exit 91
+       | Left error => match error with
+           | ProcessUnavailable _ _ => exit 91
+           | ProcessExited command code =>
+               do file_expect (prim_string_eq command program); file_expect (eq_nat code 37) end end;
+       let! code259 := process_run_spec_inherited (inherit_test_child_command program "259" marker);
+       inherit_test_status 259 code259;
+       println "P8_VALUES_OK";
+       exit 42
+
+def inherit_test_stdio_child : IO Unit :=
+    do let! input := prim_stdin_read_bytes 15;
+       file_expect (prim_string_eq input "input 雪 😀\n");
+       let! eof := prim_stdin_read_bytes 1;
+       file_expect (prim_string_eq eof "");
+       print (prim_string_of_char_codes [65, 0, 255, 10]);
+       eprint (prim_string_of_char_codes [69, 0, 255, 10]);
+       exit 0
+
+def inherit_test_stdio (program : String) : IO Unit :=
+    do let! result := process_run_inherited_checked program ["--stdio-child"];
+       inherit_test_status 0 result;
+       println "P8_STDIO_OK";
+       exit 42
+
+def inherit_test_missing (path : String) : IO Unit :=
+    do let! first := process_run_inherited path ["", "雪 space"];
+       inherit_test_unavailable 2 first;
+       let! second := process_run_inherited path ["repeat"];
+       inherit_test_unavailable 2 second;
+       println "P8_MISSING_OK";
+       exit 42
+
+def inherit_test_invalid (program : String) : IO Unit :=
+    do let! nul := process_run_inherited program [prim_string_of_char_codes [65, 0, 66]];
+       inherit_test_unavailable 87 nul;
+       let! utf8 := process_run_inherited program [prim_string_of_char_codes [255]];
+       inherit_test_unavailable 1113 utf8;
+       println "P8_INVALID_OK";
+       exit 42
+
+def inherit_test_deferred (program : String) (marker : String) : IO Unit :=
+    let action : IO (Either ProcessRunError Nat) :=
+      process_run_spec_inherited (inherit_test_child_command program "0" marker) in
+    do let! exists := prim_fs_exists marker;
+       file_expect (notb exists);
+       println "P8_DEFERRED_OK";
+       exit 42
+
+def inherit_test_record_id (marker : String) : IO Unit :=
+    runtime_bind U32 Unit inherit_test_process_id (fun (pid : U32) =>
+      prim_fs_write_file marker (show_nat (nat_u32_to_nat pid)));
+
+def inherit_test_leaf (marker : String) : IO Unit :=
+    do inherit_test_record_id marker;
+       match u32_from_nat (mul 120 1000) with
+       | Nothing => exit 91
+       | Just duration => do inherit_test_sleep duration; exit 91 end
+
+def inherit_test_branch (program : String) (branch : String) (leaf : String) : IO Unit :=
+    do inherit_test_record_id branch;
+       let! result := process_run_inherited program ["--leaf", leaf];
+       inherit_test_status 0 result;
+       exit 91
+
+def inherit_test_tree (program : String) (branch : String) (leaf : String) : IO Unit :=
+    do let! result := process_run_inherited program ["--branch", branch, leaf];
+       inherit_test_status 0 result;
+       exit 91
+
+def inherit_test_main (program : String) (mode : String) (arguments : List String) : IO Unit :=
+    match prim_string_eq mode "--child" with
+    | True => inherit_test_child arguments
+    | False => match prim_string_eq mode "--stdio-child" with
+      | True => inherit_test_stdio_child
+      | False => match prim_string_eq mode "--stdio" with
+        | True => inherit_test_stdio program
+        | False => match prim_string_eq mode "--invalid" with
+          | True => inherit_test_invalid program
+          | False => match arguments with | Nil => exit 91 | Cons first rest =>
+            match prim_string_eq mode "--values" with
+            | True => inherit_test_values program first
+            | False => match prim_string_eq mode "--missing" with
+              | True => inherit_test_missing first
+              | False => match prim_string_eq mode "--deferred" with
+                | True => inherit_test_deferred program first
+                | False => match prim_string_eq mode "--leaf" with
+                  | True => inherit_test_leaf first
+                  | False => match rest with | Nil => exit 91 | Cons second _ =>
+                    match prim_string_eq mode "--branch" with
+                    | True => inherit_test_branch program first second
+                    | False => match prim_string_eq mode "--tree" with
+                      | True => inherit_test_tree program first second
+                      | False => exit 91 end end end end end end end end end end end end;
+
+def main : IO Unit :=
+    do let! arguments := argv;
+       match arguments with | Nil => exit 91 | Cons program rest =>
+         match rest with | Nil => exit 91 | Cons mode tail => inherit_test_main program mode tail end end

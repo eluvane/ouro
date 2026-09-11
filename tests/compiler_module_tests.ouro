@@ -1,0 +1,186 @@
+-- Typed module acceptance, ordered closure checking and cancellation.
+import "../compiler/file_elab.ouro";
+import "../std/io.ouro";
+import "compiler_test_phase.ouro";
+
+inductive ModuleLaw : Type := | MkModuleLaw : String -> Bool -> ModuleLaw;
+
+def module_error (name : Nat) (phase : Nat) (code : Nat)
+    (result : DeclarationResult) : Bool :=
+    match result with
+    | DeclarationsOk _ => False
+    | DeclarationsErr actual at failure =>
+        andb (eqNat actual name)
+          (andb (eqNat (compiler_test_phase_nat at) phase) (eqNat (check_failure_code 1 failure) code))
+    end;
+
+def module_ok (count : Nat) (result : DeclarationResult) : Bool :=
+    match result with
+    | DeclarationsOk entries => eqNat (length Entry entries) count
+    | DeclarationsErr _ _ _ => False
+    end;
+
+def module_valid : List FileItem :=
+    [FDef 90 (CSort 1) (CSort 0), FDef 91 (CSort 1) (CConst 90)];
+
+def module_exact (items : List FileItem) : DeclarationResult :=
+    check_declarations CheckExactCore keep_checking 200 items;
+
+def module_stop_now (_ordinal : Nat) : CheckDirective := CheckStop;
+
+def module_stop_after_one (ordinal : Nat) : CheckDirective :=
+    match ordinal with | Z => CheckContinue | S _ => CheckStop end;
+
+def module_unbound_detail : Bool :=
+    match module_exact [FDef 90 (CSort 0) (CConst 77)] with
+    | DeclarationsOk _ => False
+    | DeclarationsErr name phase failure =>
+        andb (eqNat name 90) (andb (eqNat (compiler_test_phase_nat phase) 2)
+          (match failure with
+           | CheckMalformedCore fault =>
+               match fault with
+               | CheckUnboundGlobal missing => eqNat missing 77
+               | CheckUnboundVariable _ => False
+               | CheckUnknownInductive _ => False
+               | CheckUnknownConstructor _ _ => False
+               | CheckConstructorParameters => False
+               | CheckCaseMetadata => False
+               | CheckFixMetadata => False
+               | CheckLiteralType _ => False
+               | CheckUnresolvedLiteral _ => False
+               | CheckDuplicateName _ => False
+               end
+           | CheckTypeFailure _ => False
+           | CheckReductionFailure _ => False
+           | CheckResourceLimit => False
+           | CheckUnsupported _ => False
+           | CheckCancelled => False
+           | CheckInternalFailure _ => False
+           | CheckPrimitiveFailure _ => False
+           end))
+    end;
+
+-- These injected worker failures exercise the host seam. They must propagate
+-- without exposing a checked prefix or being reclassified as a type mismatch.
+def module_unsupported_worker (_mode : CheckMode) (_fuel : Nat)
+    (_sig : List Entry) (item : FileItem) : DeclarationResult :=
+    DeclarationsErr (file_item_name item) CheckDeclarationBody (CheckUnsupported 73);
+
+def module_internal_worker (_mode : CheckMode) (_fuel : Nat)
+    (_sig : List Entry) (item : FileItem) : DeclarationResult :=
+    DeclarationsErr (file_item_name item) CheckDeclarationBody (CheckInternalFailure 74);
+
+def module_source_unknown : DeclarationResult :=
+    check_module 200 [90] [FDef 90 (CSort 0) (CConst 77)];
+
+def module_projection (mode : CheckMode) (code : Nat)
+    (result : DeclarationResult) : Bool :=
+    match declaration_file_result mode result with
+    | FROk _ => False
+    | FRErr actual name => andb (eqNat code actual) (eqNat name 90)
+    end;
+
+def module_universe_item (name : Nat) (level : Nat) (argument : Nat) : FileItem :=
+    FInd (MkIndDecl name [] [] level
+      [MkCtor (S name) (CPi (CSort argument) (CInd name))]);
+
+-- The old Mutual [High; Low] law used two independent declarations. The
+-- ordered module must reject Low even after accepting High, at every level.
+def module_universe_batch (level : Nat) : Bool :=
+    match module_exact
+      [module_universe_item 60 (S level) level, module_universe_item 80 level level] with
+    | DeclarationsOk _ => False
+    | DeclarationsErr name phase failure =>
+        andb (eqNat name 80) (andb (eqNat (compiler_test_phase_nat phase) 3)
+          (match failure with
+           | CheckTypeFailure fault => match fault with
+               | CheckUniverseBound => True
+               | CheckTypeMismatch => False
+               | CheckExpectedSort => False
+               | CheckExpectedFunction => False
+               | CheckCaseMotive => False
+               | CheckNonPositive => False
+               | CheckNonTerminating => False
+               end
+           | CheckMalformedCore _ => False
+           | CheckReductionFailure _ => False
+           | CheckResourceLimit => False
+           | CheckUnsupported _ => False
+           | CheckCancelled => False
+           | CheckInternalFailure _ => False
+           | CheckPrimitiveFailure _ => False
+           end))
+    end;
+
+def module_laws : List ModuleLaw :=
+    [ MkModuleLaw "empty module succeeds" (module_ok 0 (module_exact []))
+    , MkModuleLaw "ordered definitions retain the complete environment"
+        (module_ok 2 (module_exact module_valid))
+    , MkModuleLaw "source module uses the same acceptance traversal"
+        (module_ok 2 (check_module 200 [90, 91] module_valid))
+    , MkModuleLaw "empty required set still checks every body"
+        (module_error 90 2 6 (check_module 200 [] [FDef 90 (CSort 0) (CConst 77)]))
+    , MkModuleLaw "bad earlier imported body cannot be skipped"
+        (module_error 90 2 1
+          (check_module 200 [91] [FDef 90 (CSort 0) (CSort 0), FAxiom 91 (CSort 0)]))
+    , MkModuleLaw "unknown body retains declaration and missing global" module_unbound_detail
+    , MkModuleLaw "unknown annotation identifies the type phase"
+        (module_error 90 1 6 (module_exact [FDef 90 (CRel 0) (CSort 0)]))
+    , MkModuleLaw "ordinary mismatch identifies the body phase"
+        (module_error 90 2 1 (module_exact [FDef 90 (CSort 0) (CSort 0)]))
+    , MkModuleLaw "invalid assumption type is checked"
+        (module_error 90 1 1 (module_exact [FAxiom 90 (CApp (CSort 0) (CSort 0))]))
+    , MkModuleLaw "self reference is not admitted as an assumption"
+        (module_error 90 2 6 (module_exact [FDef 90 (CSort 0) (CConst 90)]))
+    , MkModuleLaw "forward reference is rejected before later declarations"
+        (module_error 90 2 6
+          (module_exact [FDef 90 (CSort 0) (CConst 91), FAxiom 91 (CSort 0)]))
+    , MkModuleLaw "duplicate declaration is a plan error"
+        (module_error 90 0 5 (module_exact [FAxiom 90 (CSort 0), FAxiom 90 (CSort 0)]))
+    , MkModuleLaw "missing required declaration is malformed"
+        (module_error 92 0 6 (check_module 200 [90, 92] module_valid))
+    , MkModuleLaw "zero traversal budget reports the next declaration"
+        (module_error 90 0 4
+          (check_declarations CheckExactCore keep_checking 0 module_valid))
+    , MkModuleLaw "source refinement exhaustion keeps type phase"
+        (module_error 90 1 4
+          (check_declaration CheckSourceCore 0 [] (FDef 90 (CSort 1) (CSort 0))))
+    , MkModuleLaw "initial cancellation exposes no partial success"
+        (module_error 90 0 8
+          (check_declarations CheckExactCore module_stop_now 200 module_valid))
+    , MkModuleLaw "cancellation between declarations identifies next item"
+        (module_error 91 0 8
+          (check_declarations CheckExactCore module_stop_after_one 200 module_valid))
+    , MkModuleLaw "cancellation takes precedence before entering work"
+        (module_error 90 0 8
+          (check_declarations CheckExactCore module_stop_now 0 module_valid))
+    , MkModuleLaw "worker unsupported result crosses the module seam"
+        (module_error 90 2 7 (check_module_with module_unsupported_worker 200 [] module_valid))
+    , MkModuleLaw "worker internal failure crosses the module seam"
+        (module_error 90 2 9 (check_module_with module_internal_worker 200 [] module_valid))
+    , MkModuleLaw "typed source result retains malformed classification"
+        (module_error 90 2 6 module_source_unknown)
+    , MkModuleLaw "source CLI projection preserves unresolved-name diagnostic"
+        (module_projection CheckSourceCore 1 module_source_unknown)
+    , MkModuleLaw "raw Core projection retains malformed diagnostic"
+        (module_projection CheckExactCore 6 module_source_unknown)
+    , MkModuleLaw "universe batch rejects later member at level 0" (module_universe_batch 0)
+    , MkModuleLaw "universe batch rejects later member at level 1" (module_universe_batch 1)
+    , MkModuleLaw "universe batch rejects later member at level 2" (module_universe_batch 2)
+    , MkModuleLaw "universe batch accepts both members within the ceiling"
+        (module_ok 2 (module_exact [module_universe_item 60 1 0, module_universe_item 80 1 0]))
+    ];
+
+-- @entry main
+def main : IO Unit :=
+    (fix run (laws : List ModuleLaw) (failed : Bool) : IO Unit :=
+      match laws with
+      | Nil => match failed with | True => exit 1 | False => exit 0 end
+      | Cons law rest =>
+          match law with
+          | MkModuleLaw name passed =>
+              do println (prim_string_concat
+                   (match passed with | True => "ok " | False => "FAIL " end) name);
+                 run rest (orb failed (notb passed))
+          end
+      end) module_laws False;

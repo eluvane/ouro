@@ -1,0 +1,243 @@
+-- Static ownership policy for the compiler's pure declaration checker.
+-- Semantic acceptance is exercised separately by compiler checking suites.
+import "report.ouro";
+import "paths.ouro";
+import "../fix/lex.ouro";
+import "../../std/fs_walk.ouro";
+
+def compiler_boundary_modules : List String :=
+    [ "std/types.ouro"
+    , "std/prelude.ouro"
+    , "std/data.ouro"
+    , "compiler/base.ouro"
+    , "compiler/core.ouro"
+    , "compiler/primitive_model.ouro"
+    , "compiler/file_check_model.ouro"
+    , "compiler/file_check_environment.ouro"
+    , "compiler/file_check_work.ouro"
+    , "compiler/string_nf_bytes.ouro"
+    , "compiler/primitive_contracts.ouro"
+    , "compiler/string_nf_values.ouro"
+    , "compiler/string_nf_eval.ouro"
+    , "compiler/file_elab_core.ouro"
+    , "compiler/file_check_result.ouro"
+    , "compiler/file_elab_positive.ouro"
+    , "compiler/file_elab_term.ouro"
+    , "compiler/file_elab_infer.ouro"
+    , "compiler/file_refine_scope.ouro"
+    , "compiler/file_refine_case.ouro"
+    , "compiler/file_refine.ouro"
+    , "compiler/constructor_closures.ouro"
+    , "compiler/primitive_registry.ouro"
+    , "compiler/primitive_check.ouro"
+    , "compiler/primitive_roles.ouro"
+    , "compiler/file_elab.ouro"
+    ];
+
+def compiler_boundary_value_owners : List String :=
+    [ "compiler/checked_program.ouro"
+    , "compiler/checked_program_output.ouro"
+    , "compiler/pipeline_support.ouro"
+    , "compiler/native/lower_boundary.ouro"
+    ];
+
+def compiler_boundary_result_owners : List String :=
+    [ "compiler/file_check_model.ouro"
+    , "compiler/file_elab.ouro"
+    , "compiler/pipeline_support.ouro"
+    , "compiler/native/lower_boundary.ouro"
+    ];
+
+def compiler_boundary_issue (owner : String) (reason : String)
+    (issues : List GateIssue) : List GateIssue :=
+    snoc GateIssue issues (gate_issue reason owner);
+
+-- The fixer lexer keeps quoted tails opaque, including malformed tails.
+-- Reject an unterminated tail instead of letting it hide policy tokens.
+def compiler_boundary_quote_tail : List Nat -> Bool -> Bool :=
+  fix scan (bytes : List Nat) (escaped : Bool) : Bool :=
+    match bytes with
+    | Nil => False
+    | Cons byte rest => match escaped with
+        | True => scan rest False
+        | False => match eqNat byte ch_quote with
+            | True => nullb Nat rest
+            | False => scan rest (eqNat byte ch_bslash)
+            end
+        end
+    end;
+
+def compiler_boundary_quote_valid (text : String) : Bool :=
+    match str_codes text with
+    | Nil => False
+    | Cons first rest => andb (eqNat first ch_quote) (compiler_boundary_quote_tail rest False)
+    end;
+
+def compiler_boundary_token_issues (owner : String) (token : FxTok)
+    (issues : List GateIssue) : List GateIssue :=
+    match fx_is_kind token fx_k_str with
+    | False => issues
+    | True => match compiler_boundary_quote_valid (fx_tok_text token) with
+        | True => issues
+        | False => compiler_boundary_issue owner
+            (str_concat "unterminated checker source string at line " (str_of_nat (fx_tok_line token))) issues
+        end
+    end;
+
+def compiler_boundary_forbidden_words : List String :=
+    [ "axiom", "intrinsic", "extern", "effect", "perform", "handle" ];
+
+def compiler_boundary_import_issues (owner : String) (tokens : List FxTok)
+    (issues : List GateIssue) : List GateIssue :=
+    match tokens with
+    | Nil => compiler_boundary_issue owner "checker import has no quoted path" issues
+    | Cons token _ =>
+        let text : String := fx_tok_text token in
+        match andb (fx_is_kind token fx_k_str) (compiler_boundary_quote_valid text) with
+        | False => compiler_boundary_issue owner "checker import has no valid quoted path" issues
+        | True =>
+            let path : String := str_slice text 1 (sub (str_len text) 2) in
+            let target : String := path_join_normalized [path_dirname owner, path] in
+            match andb (notb (orb (path_is_abs path) (str_contains path "\\")))
+                    (elem String str_eq target compiler_boundary_modules) with
+            | True => issues
+            | False => compiler_boundary_issue owner
+                (str_concat "checker import is outside the documented module allowlist: " path) issues
+            end
+        end
+    end;
+
+def compiler_boundary_source_tokens (owner : String)
+    : List FxTok -> List GateIssue -> List GateIssue :=
+  fix scan (tokens : List FxTok) (issues : List GateIssue) : List GateIssue :=
+    match tokens with
+    | Nil => issues
+    | Cons token rest =>
+        let quoted : List GateIssue := compiler_boundary_token_issues owner token issues in
+        let declaration : List GateIssue :=
+          match andb (fx_is_ident token)
+              (elem String str_eq (fx_tok_text token) compiler_boundary_forbidden_words) with
+          | False => quoted
+          | True => compiler_boundary_issue owner
+              (str_cat3 "checker contains a host or assumed declaration: " (fx_tok_text token)
+                (str_concat " at line " (str_of_nat (fx_tok_line token)))) quoted
+          end in
+        let imports : List GateIssue :=
+          match fx_is_word token "import" with
+          | False => declaration
+          | True => compiler_boundary_import_issues owner rest declaration
+          end in
+        scan rest imports
+    end;
+
+def compiler_boundary_source_issues (owner : String) (source : String) : List GateIssue :=
+    let tokens : List FxTok := fx_lex source in
+    match tokens with
+    | Nil => [gate_issue "checker module has no source tokens" owner]
+    | Cons _ _ => compiler_boundary_source_tokens owner tokens []
+    end;
+
+def compiler_boundary_named (name : String) (token : FxTok) : Bool :=
+    andb (fx_is_ident token)
+      (orb (fx_is_word token name) (str_ends (fx_tok_text token) (str_concat "." name)));
+
+def compiler_boundary_owner_issues (owner : String) (name : String) (allowed : List String)
+    (tokens : List FxTok) (issues : List GateIssue) : List GateIssue :=
+    match andb (notb (elem String str_eq owner allowed))
+        (any FxTok (compiler_boundary_named name) tokens) with
+    | False => issues
+    | True => compiler_boundary_issue owner
+        (str_concat "checked-value representation used outside its documented owners: " name) issues
+    end;
+
+def compiler_boundary_factory_issues (owner : String) (source : String) : List GateIssue :=
+    -- Exact constructor identifiers necessarily contain these bytes. This
+    -- prefilter avoids tokenizing unrelated backend modules and keeps comments
+    -- and literal text subject to the same positional lexer when they match.
+    match orb (str_contains source "CheckedProgramOf") (str_contains source "DeclarationsOk") with
+    | False => []
+    | True =>
+        let tokens : List FxTok := fx_lex source in
+        let quoted : List GateIssue := foldl FxTok (List GateIssue)
+          (fun (issues : List GateIssue) (token : FxTok) => compiler_boundary_token_issues owner token issues) [] tokens in
+        compiler_boundary_owner_issues owner "DeclarationsOk" compiler_boundary_result_owners tokens
+          (compiler_boundary_owner_issues owner "CheckedProgramOf" compiler_boundary_value_owners tokens quoted)
+    end;
+
+def compiler_boundary_read (root : String) (owner : String)
+    (inspect : String -> List GateIssue) : IO (List GateIssue) :=
+    (do let! loaded := fs_read_checked (repo_join root owner);
+       match loaded with
+       | Left error => io_pure (List GateIssue) [gate_issue (fs_error_message error) owner]
+       | Right source => io_pure (List GateIssue) (inspect source)
+       end);
+
+def compiler_boundary_walk_issues (owner : String) (walked : FsWalkResult) : List GateIssue :=
+    match walked with
+    | FsWalkComplete _ => []
+    | FsWalkTruncated _ => [gate_issue (fs_walk_message walked) owner]
+    | FsWalkUnreadable _ => [gate_issue (fs_walk_message walked) owner]
+    | FsWalkUnsafe _ => [gate_issue (fs_walk_message walked) owner]
+    end;
+
+def compiler_boundary_modules_check (root : String) : IO GateCheck :=
+    (do let! inventory := io_fold String (List GateIssue)
+         (fun (previous : List GateIssue) (owner : String) =>
+           do let! walked := fs_walk_checked (repo_join root owner);
+              io_pure (List GateIssue)
+                (append GateIssue previous (compiler_boundary_walk_issues owner walked))) [] ["compiler", "std"];
+       let! issues := match inventory with
+       | Cons _ _ => io_pure (List GateIssue) inventory
+       | Nil => io_fold String (List GateIssue)
+         (fun (previous : List GateIssue) (owner : String) =>
+           do let! current := compiler_boundary_read root owner (compiler_boundary_source_issues owner);
+              io_pure (List GateIssue) (append GateIssue previous current)) [] compiler_boundary_modules
+       end;
+       io_pure GateCheck (MkGateCheck "compiler-checker-dependencies" True
+         [gate_metric "allowlisted_modules" (str_of_nat (length String compiler_boundary_modules))] issues));
+
+def compiler_boundary_factory_files (root : String) (files : List String) : IO GateCheck :=
+    let owners : List String := filter String (fun (path : String) => path_has_ext path ".ouro")
+      (map String String (path_relative root) files) in
+    (do let! issues := io_fold String (List GateIssue)
+         (fun (previous : List GateIssue) (owner : String) =>
+           do let! current := compiler_boundary_read root owner (compiler_boundary_factory_issues owner);
+              io_pure (List GateIssue) (append GateIssue previous current)) [] owners;
+       io_pure GateCheck (MkGateCheck "compiler-checked-value-owners" True
+         [gate_metric "compiler_sources" (str_of_nat (length String owners))] issues));
+
+def compiler_boundary_factories_check (root : String) : IO GateCheck :=
+    (do let! walked := fs_walk_checked (repo_join root "compiler");
+       match walked with
+       | FsWalkComplete files => compiler_boundary_factory_files root files
+       | FsWalkTruncated _ => io_pure GateCheck (MkGateCheck "compiler-checked-value-owners" True []
+           (compiler_boundary_walk_issues "compiler" walked))
+       | FsWalkUnreadable _ => io_pure GateCheck (MkGateCheck "compiler-checked-value-owners" True []
+           (compiler_boundary_walk_issues "compiler" walked))
+       | FsWalkUnsafe _ => io_pure GateCheck (MkGateCheck "compiler-checked-value-owners" True []
+           (compiler_boundary_walk_issues "compiler" walked))
+       end);
+
+def compiler_boundary_doc_issues (source : String) : List GateIssue :=
+    foldl String (List GateIssue)
+      (fun (issues : List GateIssue) (required : String) =>
+        match str_contains source required with
+        | True => issues
+        | False => compiler_boundary_issue "docs/tcb.md"
+            (str_concat "compiler boundary documentation is missing: " required) issues
+        end) [] (append String ["## Compiler checking boundary", "## Checked values"]
+          (append String compiler_boundary_modules
+            (append String compiler_boundary_value_owners compiler_boundary_result_owners)));
+
+def compiler_boundary_docs_check (root : String) : IO GateCheck :=
+    (do let! issues := compiler_boundary_read root "docs/tcb.md" compiler_boundary_doc_issues;
+       io_pure GateCheck (MkGateCheck "compiler-boundary-documentation" True [] issues));
+
+def compiler_boundary_check_names : List String :=
+    ["compiler-checker-dependencies", "compiler-checked-value-owners", "compiler-boundary-documentation"];
+
+def run_compiler_boundary_profile (root : String) : IO (List GateCheck) :=
+    (do let! modules := compiler_boundary_modules_check root;
+       let! factories := compiler_boundary_factories_check root;
+       let! docs := compiler_boundary_docs_check root;
+       io_pure (List GateCheck) [modules, factories, docs]);

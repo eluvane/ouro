@@ -1,0 +1,100 @@
+-- The retained instruction-scanning Jacobi solver is the independent oracle.
+import "native_live_fixtures.ouro";
+
+def live_reference_facts (fuel : Nat) (roots : List Nat) (blocks : List MirBlock)
+    : Either MirError (List MirBlockFact) :=
+    let initial : List MirBlockFact := map MirBlock MirBlockFact
+      (fun (block : MirBlock) => MirFact (mir_block_id block) ([] : List Nat)) blocks in
+    (fix converge (remaining : Nat) (facts : List MirBlockFact) : Either MirError (List MirBlockFact) :=
+      match remaining with | Z => Left MirError (List MirBlockFact) MirResourceExhausted
+      | S next => match mir_live_step roots facts blocks with
+        | Left err => Left MirError (List MirBlockFact) err
+        | Right updated => match mir_facts_equal facts updated with
+          | True => Right MirError (List MirBlockFact) updated
+          | False => converge next updated end end end) fuel initial;
+
+def live_exact_facts : List MirBlockFact -> List MirBlockFact -> Bool :=
+  fix same (actual : List MirBlockFact) (expected : List MirBlockFact) : Bool :=
+    match actual, expected with
+    | Nil, Nil => True | Nil, Cons _ _ => False | Cons _ _, Nil => False
+    | Cons a rest, Cons b more => match a, b with | MirFact id values, MirFact key wanted =>
+      andb (eq_nat id key) (andb (pe_bytes_equal values wanted) (same rest more)) end end;
+
+def live_exact_result (actual : Either MirError (List MirBlockFact))
+    (expected : Either MirError (List MirBlockFact)) : Bool :=
+    match actual, expected with
+    | Left a, Left b => str_eq (mir_test_error_text a) (mir_test_error_text b)
+    | Right a, Right b => live_exact_facts a b
+    | Left _, Right _ => False | Right _, Left _ => False end;
+
+def live_summary_parity (fuel : Nat) (roots : List Nat) (blocks : List MirBlock) : Bool :=
+    live_exact_result (mir_live_facts fuel roots blocks) (live_reference_facts fuel roots blocks);
+
+def live_summary_budgets (blocks : List MirBlock) : Bool :=
+    all Nat (fun (fuel : Nat) => live_summary_parity fuel live_test_roots blocks)
+      ([0,1,2,3,4,5,6,7,8,9,10] : List Nat);
+
+def live_summary_operations : List MirInstruction := [
+    MirMove 0 (MirUse 0), MirMove 0 (MirUse 1), MirMove 1 (MirUse 0),
+    MirMove 0 (mir_fixture_nat MirManagedPtr 0), MirBinaryOp 10 MirAdd (MirUse 1) (MirUse 2),
+    MirCompare 10 MirEqual (MirUse 0) (MirUse 1), MirConvert 10 MirRawToBits (MirUse 11),
+    MirLoad 0 (MirUse 1) (codegen_disp 0), MirStore (MirUse 0) (codegen_disp 0) (MirUse 1),
+    MirLoadAt 0 (MirUse 1) (MirUse 10), MirStoreAt (MirUse 0) (MirUse 10) (MirUse 1),
+    MirAddress 10 100, MirPointerAdd 10 (MirUse 11) (MirUse 12),
+    MirCall MirMayGc (Just Nat 0) (MirDirect 20) [MirUse 0,MirUse 1],
+    MirCall MirNoGc (Nothing Nat) (MirIndirect (MirSignatureOf [] (Nothing MirType)) (MirUse 0)) [MirUse 1],
+    MirManagedAlloc 0 100 101 102 (MirUse 10), MirManagedContext 0];
+
+def live_summary_transfer_family : Bool :=
+    all MirInstruction (fun (first : MirInstruction) =>
+      all MirInstruction (fun (second : MirInstruction) =>
+        all (List Nat) (fun (roots : List Nat) => all (List Nat) (fun (after : List Nat) =>
+          let blocks : List MirBlock := [MirBlockDef 0 [first,second] (MirJump 1)] in
+          let facts : List MirBlockFact := [MirFact 1 after] in
+          live_exact_result
+            (mir_live_summary_step facts (map MirBlock MirLiveSummary (mir_live_summary roots) blocks))
+            (mir_live_step roots facts blocks))
+          ([[],[0,1],[1,0],[0,0,1,10],[10,1,0,10]] : List (List Nat)))
+        ([[],[0,1,2],[2,1,0,0]] : List (List Nat))) live_summary_operations) live_summary_operations;
+
+def live_summary_chain (instructions : List MirInstruction) : Nat -> List MirBlock :=
+  fix chain (count : Nat) : List MirBlock :=
+    match count with | Z => [] | S rest =>
+      Cons MirBlock (MirBlockDef rest instructions (match rest with
+        | Z => MirReturn (Just MirValue (MirUse 0)) | S previous => MirJump previous end)) (chain rest) end;
+
+def live_summary_scale : List MirBlock :=
+    live_summary_chain (replicate MirInstruction (MirMove 10 (MirUse 11)) 24) 40;
+
+def live_summary_tests : List Test := [
+    assert_true "Summarized block transfer preserves exact ordered facts and first unknown edge"
+      (all (List MirBlock) (fun (blocks : List MirBlock) =>
+        let facts : List MirBlockFact := [MirFact 0 [0,2,0], MirFact 1 [2,1], MirFact 2 [1,0]] in
+        live_exact_result
+          (mir_live_summary_step facts (map MirBlock MirLiveSummary (mir_live_summary live_test_roots) blocks))
+          (mir_live_step live_test_roots facts blocks))
+        ([live_test_branch, live_test_kill,
+          [MirBlockDef 0 [MirMove 0 (MirUse 0), MirMove 1 (MirUse 2)] (MirBranch (MirUse 0) 1 2)],
+          [MirBlockDef 0 [] (MirBranch (MirUse 0) 99 98)],
+          [MirBlockDef 7 [] (MirJump 98), MirBlockDef 8 [] (MirJump 99)]] : List (List MirBlock))),
+    assert_true "Every instruction pair preserves exact transfer with ordered duplicate and nonroot inputs"
+      live_summary_transfer_family,
+    assert_true "Jacobi returns identical results or errors for every budget through confirmation"
+      (all (List MirBlock) live_summary_budgets
+        ([[], [MirBlockDef 0 [] MirTrap], [MirBlockDef 0 [] (MirReturn (Just MirValue (MirUse 3)))],
+          live_test_branch, reverse MirBlock live_test_branch, live_test_kill,
+          live_test_backedges, reverse MirBlock live_test_backedges,
+          [MirBlockDef 0 [] (MirBranch (MirUse 0) 99 98)],
+          [MirBlockDef 7 [] (MirJump 98), MirBlockDef 8 [] (MirJump 99)],
+          [MirBlockDef 0 [] (MirBranch (MirUse 0) 1 1), MirBlockDef 1 [] MirTrap],
+          [MirBlockDef 0 [] (MirJump 0), MirBlockDef 7 [] (MirReturn (Just MirValue (MirUse 1)))],
+          [MirBlockDef 0 [] (MirJump 0), MirBlockDef 0 [] (MirReturn (Just MirValue (MirUse 1)))],
+          [MirBlockDef pe_byte2_place [] (MirJump (S pe_byte2_place)),
+            MirBlockDef (S pe_byte2_place) [] (MirReturn (Just MirValue (MirUse 0)))]]
+          : List (List MirBlock))),
+    assert_true "Empty and duplicate root declarations preserve exact complete facts"
+      (andb (live_summary_parity 10 [] live_test_backedges)
+        (live_summary_parity 10 [0,0,1,2,3,4,5] live_test_branch)),
+    assert_true "Scale keeps exact fuel boundary and fact order in both block orders"
+      (all Nat (fun (fuel : Nat) => andb (live_summary_parity fuel live_test_roots live_summary_scale)
+        (live_summary_parity fuel live_test_roots (reverse MirBlock live_summary_scale))) ([0,1,39,40,41,42] : List Nat))];

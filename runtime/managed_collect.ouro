@@ -1,0 +1,229 @@
+-- Exact, single-threaded, non-moving collection over the allocation list.
+-- Collection calls no user code and allocates no managed value. A separate raw
+-- worklist is reserved before any mark changes. Failed OS release preserves
+-- the first failing allocation in the heap and clears all surviving marks.
+import "managed_roots.ouro";
+import "managed_heap.ouro";
+
+-- Requested bytes plus a conservative 4-KiB accounting charge per live
+-- object retains the scheduling policy. This is not an OS allocation size.
+-- Overflow cannot grant a collection budget.
+def managed_collection_budget (count : USize) (bytes : USize) : USize :=
+    let zero : USize := usize_sub count count in
+    let one : USize := managed_one count in
+    let four : USize := usize_add (usize_add one one) (usize_add one one) in
+    let eight : USize := managed_word_offset one in
+    let shift : U32 := raw_size_to_u32 (usize_add eight four) in
+    let pages : USize := usize_shift_left count shift in
+    let pressure : USize := usize_add pages bytes in
+    let minimum : USize := usize_shift_left one (raw_size_to_u32 (usize_add eight (usize_add eight four))) in
+    match raw_bool_and (usize_equal (managed_shift_right pages shift) count)
+      (raw_bool_not (usize_less pressure pages)) with
+    | False => zero | True => match usize_less pressure minimum with
+      | True => minimum | False => pressure end end;
+
+-- Saturating subtraction admits a single large allocation only after the
+-- caller collected. It cannot wrap and silently postpone the next collection.
+def managed_collection_remaining (budget : USize) (bytes : USize) : USize :=
+    let zero : USize := usize_sub budget budget in
+    let one : USize := managed_one budget in
+    let four : USize := usize_add (usize_add one one) (usize_add one one) in
+    let page : USize := usize_shift_left one (raw_size_to_u32 (usize_add (managed_word_offset one) four)) in
+    match usize_less budget page with | True => zero | False =>
+      let remaining : USize := usize_sub budget page in
+      match usize_less remaining bytes with | True => zero | False => usize_sub remaining bytes end end;
+
+def managed_write_collection_budget (context : RawPtr U8) (budget : USize) : Runtime Bool :=
+    let zero : USize := usize_sub budget budget in
+    let one : USize := managed_one budget in
+    let four : USize := usize_add (usize_add one one) (usize_add one one) in
+    runtime_bind USize Bool (managed_read_word context four) (fun (descriptors : USize) =>
+      let word : USize := managed_collection_budget_word descriptors in
+      match usize_equal word zero with | True => runtime_pure Bool False | False =>
+        runtime_bind Unit Bool (managed_write_word context word budget)
+          (fun (stored : Unit) => runtime_pure Bool True) end);
+
+-- Only complete successful collection grants credit, using post-sweep live
+-- sizes. Failed collection or release keeps the prior budget unchanged.
+def managed_reset_collection_budget (context : RawPtr U8) : Runtime Bool :=
+    runtime_bind USize Bool (raw_to_bits U8 context) (fun (anchor : USize) =>
+      let zero : USize := usize_sub anchor anchor in
+      let one : USize := managed_one anchor in
+      let two : USize := usize_add one one in
+      let three : USize := usize_add two one in
+      runtime_bind USize Bool (managed_read_word context two) (fun (count : USize) =>
+        runtime_bind USize Bool (managed_read_word context three) (fun (bytes : USize) =>
+          let budget : USize := managed_collection_budget count bytes in
+          match usize_equal budget zero with | True => runtime_pure Bool False
+          | False => managed_write_collection_budget context budget end)));
+
+-- Publication charges successful allocations. Rejected requests and failed
+-- OS allocations never enter this function or consume credit.
+def managed_consume_collection_budget (context : RawPtr U8) (bytes : USize) : Runtime Unit :=
+    let zero : USize := usize_sub bytes bytes in
+    let one : USize := managed_one bytes in
+    let four : USize := usize_add (usize_add one one) (usize_add one one) in
+    runtime_bind USize Unit (managed_read_word context four) (fun (descriptors : USize) =>
+      let word : USize := managed_collection_budget_word descriptors in
+      runtime_bind Unit Unit (managed_require (raw_bool_not (usize_equal word zero)) bytes) (fun (bounded : Unit) =>
+        runtime_bind USize Unit (managed_read_word context word) (fun (budget : USize) =>
+          managed_write_word context word (managed_collection_remaining budget bytes))));
+
+def managed_gc_mark_state (base : RawPtr U8) (anchor : USize) (clearing : Bool) : Runtime Unit :=
+    let zero : USize := usize_sub anchor anchor in
+    let one : USize := managed_one anchor in
+    let three : USize := usize_add (usize_add one one) one in
+    runtime_bind USize Unit (managed_read_word base three) (fun (mark : USize) =>
+      runtime_bind Unit Unit (managed_require (match clearing with
+        | False => usize_equal mark zero | True => raw_bool_not (usize_less one mark) end) anchor)
+        (fun (valid : Unit) => match clearing with
+          | False => runtime_pure Unit MkUnit | True => managed_write_word base three zero end));
+
+def managed_gc_heap_step (context : RawPtr U8) (base : RawPtr U8) (scratch : RawPtr U8)
+    (clearing : Bool) : Runtime (RawPtr U8) :=
+    runtime_bind USize (RawPtr U8) (raw_to_bits U8 base) (fun (bits : USize) =>
+      let zero : USize := usize_sub bits bits in
+      let one : USize := managed_one bits in
+      let two : USize := usize_add one one in
+      let six : USize := usize_add (usize_add two two) two in
+      let seven : USize := usize_add six one in
+      runtime_bind USize (RawPtr U8) (managed_read_word scratch six) (fun (remaining : USize) =>
+        runtime_bind Unit (RawPtr U8) (managed_require (raw_bool_not (usize_equal remaining zero)) bits)
+          (fun (bounded : Unit) => runtime_bind Unit (RawPtr U8) (managed_check_object context base)
+            (fun (valid : Unit) => runtime_bind Unit (RawPtr U8) (managed_gc_mark_state base bits clearing)
+              (fun (mark : Unit) => runtime_bind USize (RawPtr U8) (managed_read_word base one) (fun (bytes : USize) =>
+                runtime_bind USize (RawPtr U8) (managed_read_word scratch seven) (fun (total : USize) =>
+                  let next : USize := usize_add total bytes in
+                  runtime_bind Unit (RawPtr U8) (managed_require (usize_less total next) bits) (fun (fits : Unit) =>
+                    runtime_bind Unit (RawPtr U8) (managed_write_word scratch seven next) (fun (summed : Unit) =>
+                      runtime_bind Unit (RawPtr U8) (managed_write_word scratch six (usize_sub remaining one))
+                        (fun (spent : Unit) => managed_read_pointer base two))))))))));
+
+-- The list must contain exactly count allocations whose requested sizes sum
+-- to bytes. A cycle, missing node, duplicate visit or stale mark is an error.
+def managed_gc_heap (context : RawPtr U8) (scratch : RawPtr U8) (clearing : Bool) : Runtime Unit :=
+    runtime_bind USize Unit (raw_to_bits U8 context) (fun (bits : USize) =>
+      let zero : USize := usize_sub bits bits in
+      let one : USize := managed_one bits in
+      let two : USize := usize_add one one in
+      let three : USize := usize_add two one in
+      let six : USize := usize_add (usize_add two two) two in
+      let seven : USize := usize_add six one in
+      runtime_bind USize Unit (managed_read_word context two) (fun (count : USize) =>
+        runtime_bind Unit Unit (managed_write_word scratch six count) (fun (budget : Unit) =>
+          runtime_bind Unit Unit (managed_write_word scratch seven zero) (fun (sum : Unit) =>
+            runtime_bind (RawPtr U8) Unit (managed_read_pointer context zero) (fun (first : RawPtr U8) =>
+              match u8_from_nat 1 with | Nothing => managed_panic bits | Just running =>
+                runtime_bind (RawPtr U8) Unit (runtime_loop (RawPtr U8) first
+                  (fun (base : RawPtr U8) => runtime_bind Bool U8 (managed_pointer_is_null base)
+                    (fun (empty : Bool) => runtime_pure U8 (match empty with
+                      | True => u8_sub running running | False => running end)))
+                  (fun (base : RawPtr U8) => managed_gc_heap_step context base scratch clearing))
+                  (fun (finished : RawPtr U8) => runtime_bind USize Unit (managed_read_word scratch six)
+                    (fun (remaining : USize) => runtime_bind USize Unit (managed_read_word scratch seven)
+                      (fun (total : USize) => runtime_bind USize Unit (managed_read_word context three)
+                        (fun (expected : USize) => managed_require (raw_bool_and
+                          (usize_equal remaining zero) (usize_equal total expected)) bits)))) end)))));
+
+-- link addresses context.heap or a surviving object's next field. The object
+-- is unlinked only after HeapFree succeeds. No pointer into a freed object
+-- is returned or dereferenced after that call.
+def managed_sweep_step (context : RawPtr U8) (link : RawPtr U8) : Runtime (RawPtr U8) :=
+    runtime_bind USize (RawPtr U8) (raw_to_bits U8 link) (fun (bits : USize) =>
+      let zero : USize := usize_sub bits bits in
+      let one : USize := managed_one bits in
+      let two : USize := usize_add one one in
+      let three : USize := usize_add two one in
+      runtime_bind (RawPtr U8) (RawPtr U8) (managed_read_pointer link zero) (fun (base : RawPtr U8) =>
+        runtime_bind USize (RawPtr U8) (managed_read_word base three) (fun (mark : USize) =>
+          match usize_equal mark one with
+          | True => raw_add U8 base (managed_word_offset two)
+          | False => runtime_bind Unit (RawPtr U8) (managed_require (usize_equal mark zero) bits) (fun (white : Unit) =>
+              runtime_bind (RawPtr U8) (RawPtr U8) (managed_read_pointer base two) (fun (next : RawPtr U8) =>
+                runtime_bind USize (RawPtr U8) (managed_read_word base one) (fun (bytes : USize) =>
+                  runtime_bind USize (RawPtr U8) (managed_read_word context two) (fun (count : USize) =>
+                    runtime_bind USize (RawPtr U8) (managed_read_word context three) (fun (total : USize) =>
+                      runtime_bind Unit (RawPtr U8) (managed_require (raw_bool_and
+                        (raw_bool_not (usize_equal count zero)) (raw_bool_not (usize_less total bytes))) bits)
+                        (fun (bounded : Unit) => runtime_bind Bool (RawPtr U8) (managed_heap_release context base)
+                          (fun (released : Bool) => match released with
+                            | False => runtime_pure (RawPtr U8) (raw_null U8)
+                            | True => runtime_bind Unit (RawPtr U8) (managed_write_pointer link zero next)
+                                (fun (unlinked : Unit) => runtime_bind Unit (RawPtr U8)
+                                  (managed_write_word context two (usize_sub count one)) (fun (counted : Unit) =>
+                                    runtime_bind Unit (RawPtr U8) (managed_write_word context three (usize_sub total bytes))
+                                      (fun (summed : Unit) => runtime_pure (RawPtr U8) link))) end))))))) end)));
+
+def managed_sweep (context : RawPtr U8) : Runtime Bool :=
+    match u8_from_nat 1 with | Nothing => runtime_pure Bool False | Just running =>
+      runtime_bind (RawPtr U8) Bool (runtime_loop (RawPtr U8) context
+        (fun (link : RawPtr U8) => runtime_bind Bool U8 (managed_pointer_is_null link) (fun (failed : Bool) =>
+          match failed with | True => runtime_pure U8 (u8_sub running running)
+          | False => runtime_bind USize U8 (raw_to_bits U8 link) (fun (bits : USize) =>
+              runtime_bind (RawPtr U8) U8 (managed_read_pointer link (usize_sub bits bits))
+                (fun (base : RawPtr U8) => runtime_bind Bool U8 (managed_pointer_is_null base)
+                  (fun (empty : Bool) => runtime_pure U8 (match empty with
+                    | True => u8_sub running running | False => running end)))) end))
+        (fun (link : RawPtr U8) => managed_sweep_step context link))
+        (fun (last : RawPtr U8) => runtime_bind Bool Bool (managed_pointer_is_null last)
+          (fun (failed : Bool) => runtime_pure Bool (raw_bool_not failed))) end;
+
+-- Successful sweep and post-validation precede owner retirement. Failed
+-- block release or HeapDestroy never grants a new allocation budget.
+def managed_finish_collection (context : RawPtr U8) : Runtime Bool :=
+    runtime_bind Bool Bool (managed_heap_retire_empty context) (fun (retired : Bool) =>
+      match retired with | False => runtime_pure Bool False
+      | True => managed_reset_collection_budget context end);
+
+-- scratch is consumed here. All surviving marks are cleared even when an OS
+-- release failed; the next collection can retry the consistent remaining heap.
+def managed_collect_with_scratch (context : RawPtr U8) (scratch : RawPtr U8) (count : USize) : Runtime Bool :=
+    let one : USize := managed_one count in
+    let five : USize := usize_add (usize_add (usize_add one one) (usize_add one one)) one in
+    runtime_bind Unit Bool (managed_write_word scratch five count) (fun (capacity : Unit) =>
+      runtime_bind Unit Bool (managed_gc_heap context scratch False) (fun (valid : Unit) =>
+        runtime_bind Unit Bool (managed_mark_roots_after_heap context scratch) (fun (roots : Unit) =>
+          runtime_bind Unit Bool (managed_mark_pending_with_heap context scratch True) (fun (traced : Unit) =>
+            runtime_bind Bool Bool (managed_sweep context) (fun (collected : Bool) =>
+              runtime_bind Unit Bool (managed_gc_heap context scratch True) (fun (cleared : Unit) =>
+                runtime_bind Bool Bool (raw_pages_release scratch) (fun (released : Bool) =>
+                  runtime_bind Unit Bool (managed_require released count)
+                    (fun (cleanup : Unit) => match collected with
+                      | False => runtime_pure Bool False | True => managed_finish_collection context end))))))));
+
+-- The same collection phases with an index in the checked reservation tail.
+def managed_collect_indexed_with_scratch (context : RawPtr U8) (scratch : RawPtr U8) (count : USize)
+    (index_capacity : USize) : Runtime Bool :=
+    let one : USize := managed_one count in
+    let five : USize := usize_add (usize_add (usize_add one one) (usize_add one one)) one in
+    runtime_bind Unit Bool (managed_write_word scratch five count) (fun (capacity : Unit) =>
+      runtime_bind Unit Bool (managed_gc_heap context scratch False) (fun (valid : Unit) =>
+        runtime_bind Unit Bool (managed_gc_index_build context scratch index_capacity) (fun (indexed : Unit) =>
+          runtime_bind Unit Bool (managed_mark_roots_after_heap context scratch) (fun (roots : Unit) =>
+          runtime_bind Unit Bool (managed_mark_pending_with_heap context scratch True) (fun (traced : Unit) =>
+            runtime_bind Bool Bool (managed_sweep context) (fun (collected : Bool) =>
+              runtime_bind Unit Bool (managed_gc_heap context scratch True) (fun (cleared : Unit) =>
+                runtime_bind Bool Bool (raw_pages_release scratch) (fun (released : Bool) =>
+                  runtime_bind Unit Bool (managed_require released count)
+                    (fun (cleanup : Unit) => match collected with
+                      | False => runtime_pure Bool False | True => managed_finish_collection context end)))))))));
+
+-- This entry always performs full collection, independent of the budget.
+-- False reports unrepresentable scratch/budget accounting or failed release;
+-- it never means that all unreachable allocations were reclaimed. Before the
+-- scratch reservation succeeds, this function leaves the heap unchanged.
+def managed_collect (context : RawPtr U8) : Runtime Bool :=
+    runtime_bind USize Bool (raw_to_bits U8 context) (fun (bits : USize) =>
+      let zero : USize := usize_sub bits bits in
+      let one : USize := managed_one bits in
+      let two : USize := usize_add one one in
+      let eight : USize := managed_word_offset one in
+      runtime_bind USize Bool (managed_read_word context two) (fun (count : USize) =>
+        runtime_bind USize Bool (managed_gc_index_capacity count) (fun (capacity : USize) =>
+          let bytes : USize := managed_gc_index_bytes count capacity in
+          match usize_equal bytes zero with
+          | True => runtime_pure Bool False
+          | False => runtime_bind (RawPtr U8) Bool (raw_pages_allocate bytes eight) (fun (scratch : RawPtr U8) =>
+              runtime_bind Bool Bool (managed_pointer_is_null scratch) (fun (failed : Bool) => match failed with
+                | True => runtime_pure Bool False
+                | False => managed_collect_indexed_with_scratch context scratch count capacity end)) end)));

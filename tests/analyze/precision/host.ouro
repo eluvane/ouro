@@ -1,0 +1,175 @@
+-- CLI entry points own host IO; pure policy and similarly named files do not.
+-- @entry main
+
+import "../../../tools/analyze/unit.ouro";
+import "../../../tools/analyze/capability.ouro";
+import "../../../tools/analyze/effects.ouro";
+import "../../../tools/analyze/taint.ouro";
+import "assertions.ouro";
+
+def precision_host_opaque_decls (source : String) (expected : List String) : Bool :=
+    match unit_of_source source with
+    | UnitRejected _ => False
+    | MkAnalysisUnit st _ _ _ defs =>
+        precision_strings (map UnitDef String
+          (fun (decl : UnitDef) => unit_name st (unit_def_name decl)) defs) expected
+    end;
+
+def precision_host_cap_name (st : InternState) (issue : CapIssue) : String :=
+    match issue with
+    | IPrimFs n => concat "CAP001:" (unit_name st n)
+    | IPrimProc n => concat "CAP002:" (unit_name st n)
+    | IPrimHttp n => concat "CAP003:" (unit_name st n)
+    | IHostFastPeano n => concat "CAP004:" (unit_name st n)
+    end;
+
+def precision_host_caps (source : String) (path : String) (expected : List String) : Bool :=
+    match unit_of_source source with
+    | UnitRejected _ => False
+    | MkAnalysisUnit st ids _ _ defs =>
+        precision_strings (concat_map UnitDef String
+          (fun (decl : UnitDef) => map CapIssue String (precision_host_cap_name st)
+            (analyze_capability (unit_def_ast decl) (layer_of_path path) ids)) defs) expected
+    end;
+
+def precision_host_eff_name (st : InternState) (issue : EffIssue) : String :=
+    match issue with
+    | IPureHole n => concat "EFF001:" (unit_name st n)
+    | IConstRebind n => concat "EFF002:" (unit_name st n)
+    | IUnhandledPerform n => concat "EFF003:" (unit_name st n)
+    | IHandleMissingOp n => concat "EFF004:" (unit_name st n)
+    | IDiscardedCont n => concat "EFF005:" (unit_name st n)
+    | IPureEffect n => concat "EFF006:" (unit_name st n)
+    end;
+
+def precision_host_effects (source : String) (path : String) (expected : List String) : Bool :=
+    match unit_of_source source with
+    | UnitRejected _ => False
+    | MkAnalysisUnit st ids _ _ defs =>
+        precision_strings (concat_map UnitDef String
+          (fun (decl : UnitDef) => map EffIssue String (precision_host_eff_name st)
+            (analyze_effects (unit_def_ast decl) False ids (layer_of_path path))) defs) expected
+    end;
+
+def precision_host_taint_name (st : InternState) (issue : TaintIssue) : String :=
+    match issue with
+    | ITaintToSink n => concat "TAINT001:" (unit_name st n)
+    | ITaintHoleSink n => concat "TAINT002:" (unit_name st n)
+    | ITaintSecretInPublic n => concat "TAINT003:" (unit_name st n)
+    end;
+
+def precision_host_taint (source : String) (expected : List String) : Bool :=
+    match unit_of_source source with
+    | UnitRejected _ => False
+    | MkAnalysisUnit st _ _ _ defs =>
+        let ids : TaintIds := MkTaintIds (unit_ids_of st taint_source_prims)
+          (unit_ids_of st taint_sink_prims) (Nil Nat) in
+        precision_strings (concat_map UnitDef String
+          (fun (decl : UnitDef) => map TaintIssue String (precision_host_taint_name st)
+            (analyze_taint ids False (unit_def_ast decl))) defs) expected
+    end;
+
+-- Policy consumes parsed source, including the legacy raw names retained in
+-- migration inputs. Checked wrapper names do not acquire raw capabilities.
+def precision_host_raw : String :=
+    "def rename : Nat := prim_fs_rename; def capture : Nat := prim_process_capture; def proc : Nat := prim_proc_exec; def request : Nat := prim_http_request; def http : Nat := prim_http_post;";
+
+def precision_host_wrappers : String :=
+    "def rename : Nat := fs_rename_checked; def run : Nat := process_run_checked; def http : Nat := http_post;";
+
+def precision_host_cases : List (Pair String Bool) :=
+    [ MkPair String Bool "CAP001/good/base-cli"
+        (layer_allows_fs (layer_of_path "tools/analyze/main.ouro"))
+    , MkPair String Bool "CAP001/good/structured-cli"
+        (layer_allows_fs (layer_of_path "tools/analyze/drive_main.ouro"))
+    , MkPair String Bool "CAP001/bad/pure-policy"
+        (notb (layer_allows_fs (layer_of_path "tools/analyze/drive.ouro")))
+    , MkPair String Bool "CAP001/bad/nested-cli-name"
+        (notb (layer_allows_fs (layer_of_path "tools/analyze/nested/drive_main.ouro")))
+    , MkPair String Bool "CAP001/bad/fixture-cli-name"
+        (notb (layer_allows_fs (layer_of_path "tests/analyze/drive_main.ouro")))
+    , MkPair String Bool "CAP003/bad/cli-http"
+        (notb (layer_allows_http (layer_of_path "tools/analyze/drive_main.ouro")))
+    , MkPair String Bool "capability/runtime-and-legacy-primitives"
+        (precision_host_caps precision_host_raw "tools/analyze/drive.ouro"
+          ["CAP001:prim_fs_rename", "CAP002:prim_process_capture", "CAP002:prim_proc_exec",
+           "CAP003:prim_http_request", "CAP003:prim_http_post"])
+    , MkPair String Bool "capability/checked-wrappers"
+        (precision_host_caps precision_host_wrappers "tools/analyze/drive.ouro" [])
+    , MkPair String Bool "CAP001/good/rename-owner"
+        (precision_host_caps "def rename : Nat := prim_fs_rename;" "std/fs.ouro" [])
+    , MkPair String Bool "CAP002/good/capture-owner"
+        (precision_host_caps "def capture : Nat := prim_process_capture;" "std/runtime.ouro" [])
+    , MkPair String Bool "CAP002/bad/capture-owner-lookalike"
+        (precision_host_caps "def capture : Nat := prim_process_capture;"
+          "std/nested/runtime.ouro" ["CAP002:prim_process_capture"])
+    , MkPair String Bool "CAP003/good/http-owner"
+        (precision_host_caps "def request : Nat := prim_http_request;" "std/http.ouro" [])
+    , MkPair String Bool "CAP003/bad/http-owner-lookalike"
+        (precision_host_caps "def request : Nat := prim_http_request;"
+          "std/http.ouro.extra.ouro" ["CAP003:prim_http_request"])
+    , MkPair String Bool "effects/runtime-and-legacy-primitives"
+        (precision_host_effects precision_host_raw "tools/analyze/drive.ouro"
+          ["EFF003:prim_process_capture", "EFF003:prim_proc_exec",
+           "EFF003:prim_http_request", "EFF003:prim_http_post"])
+    , MkPair String Bool "effects/checked-wrappers"
+        (precision_host_effects precision_host_wrappers "tools/analyze/drive.ouro" [])
+    , MkPair String Bool "effects/capture-owner"
+        (precision_host_effects "def capture : Nat := prim_process_capture;" "std/runtime.ouro" [])
+    , MkPair String Bool "effects/http-owner"
+        (precision_host_effects "def request : Nat := prim_http_request;" "std/http.ouro" [])
+    , MkPair String Bool "taint/runtime-sinks-once-per-call"
+        (precision_host_taint
+          "def rename : Nat := prim_fs_rename prim_argv prim_argv; def capture : Nat := prim_process_capture prim_env_get; def request : Nat := prim_http_request prim_stdin_read_line;"
+          ["TAINT001:prim_fs_rename", "TAINT001:prim_process_capture", "TAINT001:prim_http_request"])
+    , MkPair String Bool "taint/runtime-results-are-sources"
+        (precision_host_taint
+          "def capture : Nat := prim_fs_write_file prim_process_capture; def request : Nat := prim_fs_write_file prim_http_request;"
+          ["TAINT001:prim_fs_write_file", "TAINT001:prim_fs_write_file"])
+    , MkPair String Bool "taint/runtime-clean-literals"
+        (precision_host_taint
+          "def rename : Nat := prim_fs_rename \"old\" \"new\"; def capture : Nat := prim_process_capture \"tool\"; def request : Nat := prim_http_request \"url\";" [])
+    , MkPair String Bool "taint/checked-wrappers"
+        (precision_host_taint
+          "def rename : Nat := fs_rename_checked prim_argv; def run : Nat := process_run_checked prim_argv; def http : Nat := http_post prim_argv;" [])
+    , MkPair String Bool "unit/native-declarations-have-no-executable-body"
+        (precision_host_opaque_decls
+          "intrinsic U32 : Type := \"ouro.u32\"; extern call : U32 := \"a\" \"b\" \"c\" \"d\" \"e\";"
+          [])
+    , MkPair String Bool "unit/native-declarations-preserve-ordinary-bodies"
+        (precision_host_opaque_decls
+          "intrinsic U32 : Type := \"ouro.u32\"; def ordinary : U32 := value;"
+          ["ordinary"])
+    , MkPair String Bool "unit/representation-annotation-has-no-executable-body"
+        (precision_host_opaque_decls "representation Natural := \"ouro.nat\";" [])
+    , MkPair String Bool "unit/representation-annotation-preserves-ordinary-body"
+        (precision_host_opaque_decls
+          "representation Natural := \"ouro.nat\"; def ordinary : Natural := value;"
+          ["ordinary"])
+    , MkPair String Bool "CAP002/bad/bounded-pure-policy"
+        (precision_host_caps "def bounded : Nat := prim_process_capture_bounded;" "tools/analyze/drive.ouro" ["CAP002:prim_process_capture_bounded"])
+    , MkPair String Bool "CAP002/good/bounded-owner"
+        (precision_host_caps "def bounded : Nat := prim_process_capture_bounded;" "std/runtime.ouro" [])
+    , MkPair String Bool "CAP002/bad/bounded-owner-lookalike"
+        (precision_host_caps "def bounded : Nat := prim_process_capture_bounded;" "std/nested/runtime.ouro" ["CAP002:prim_process_capture_bounded"])
+    , MkPair String Bool "capability/bounded-checked-wrappers"
+        (precision_host_caps "def bounded : Nat := process_run_captured_bounded; def input : Nat := process_run_captured_bounded_with_input; def spec : Nat := process_run_spec_captured_bounded; def spec_input : Nat := process_run_spec_captured_bounded_with_input;" "tools/analyze/drive.ouro" [])
+    , MkPair String Bool "effects/bounded-pure-policy"
+        (precision_host_effects "def bounded : Nat := prim_process_capture_bounded;" "tools/analyze/drive.ouro" ["EFF003:prim_process_capture_bounded"])
+    , MkPair String Bool "effects/bounded-owner"
+        (precision_host_effects "def bounded : Nat := prim_process_capture_bounded;" "std/runtime.ouro" [])
+    , MkPair String Bool "effects/bounded-checked-wrappers"
+        (precision_host_effects "def bounded : Nat := process_run_captured_bounded; def input : Nat := process_run_captured_bounded_with_input; def spec : Nat := process_run_spec_captured_bounded; def spec_input : Nat := process_run_spec_captured_bounded_with_input;" "tools/analyze/drive.ouro" [])
+    , MkPair String Bool "taint/bounded-sink-once-per-call"
+        (precision_host_taint "def bounded : Nat := prim_process_capture_bounded prim_argv prim_env_get prim_argv;" ["TAINT001:prim_process_capture_bounded"])
+    , MkPair String Bool "taint/bounded-input-sink"
+        (precision_host_taint "def bounded : Nat := prim_process_capture_bounded \"tool\" \"args\" prim_stdin_read_bytes;" ["TAINT001:prim_process_capture_bounded"])
+    , MkPair String Bool "taint/bounded-result-source"
+        (precision_host_taint "def bounded : Nat := prim_fs_write_file prim_process_capture_bounded;" ["TAINT001:prim_fs_write_file"])
+    , MkPair String Bool "taint/bounded-clean-literals"
+        (precision_host_taint "def bounded : Nat := prim_process_capture_bounded \"tool\" \"args\" \"input\";" [])
+    , MkPair String Bool "taint/bounded-checked-wrappers"
+        (precision_host_taint "def bounded : Nat := process_run_captured_bounded prim_argv; def input : Nat := process_run_captured_bounded_with_input prim_argv; def spec : Nat := process_run_spec_captured_bounded prim_argv; def spec_input : Nat := process_run_spec_captured_bounded_with_input prim_argv;" [])
+    ];
+
+def main : IO Unit := precision_run "host" precision_host_cases;
