@@ -80,9 +80,23 @@ weekly snapshot (or in the last eight days if none exists). The snapshot keeps
 the current project version, uses commit subjects as notes, and does not mark
 the release as latest. Empty weeks publish nothing.
 
+During development, write user-visible notes under `[Unreleased]`. Do not append
+new work to a published version section. Weekly snapshots do not cut the
+changelog.
+
+Before tagging a version, bump the shared version files, then cut the log:
+
+```sh
+python3 scripts/release_package.py --cut-changelog
+```
+
+That moves `[Unreleased]` under `## [<version>] - <date>`, leaves `[Unreleased]`
+empty, and rewrites the compare links. An empty `[Unreleased]` section is a
+hard error: there is nothing to publish in the notes.
+
 ## Checklist
 
-1. Update `CHANGELOG.md` for the target version.
+1. Bump the shared version and cut `CHANGELOG.md` with `--cut-changelog`.
 2. Confirm the shared version and `v<version>` tag.
 3. Run the appropriate validation profiles.
 4. Check `docs/generated_artifact_hashes.sha256`.

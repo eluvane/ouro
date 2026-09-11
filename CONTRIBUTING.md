@@ -104,8 +104,10 @@ or resource limit as unavailable; do not describe an unrun check as passing.
 ## Documentation and compatibility
 
 A user-visible change should update the relevant test or fixture, canonical
-documentation, and `CHANGELOG.md` in the same pull request. Breaking changes
-also need a clear migration note, and substantial changes need an RFC.
+documentation, and the `[Unreleased]` section of `CHANGELOG.md` in the same
+pull request. Released version sections stay frozen except to fix a factual
+error. Breaking changes also need a clear migration note, and substantial
+changes need an RFC.
 
 Use the existing canonical page rather than adding a second document for the
 same topic. The [documentation index](docs/README.md) shows where each subject
