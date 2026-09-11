@@ -22,6 +22,8 @@ integration may change.
 - Restored bootstrap input hashing so a clean host can freeze and build `ouro1`.
 - Split oversized checker modules and cleared the release-quality findings that
   were failing the PR firewall.
+- Hosted `PR (smith)` and the other non-`checks` PR groups now build `ouro1`
+  on a cold cache instead of failing closed on a missing `_build/c/ouro1`.
 
 ## [0.1.0] - 2026-09-12
 
