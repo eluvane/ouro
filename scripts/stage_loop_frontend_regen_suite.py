@@ -119,6 +119,20 @@ def count_lines(path: Path) -> int:
 def test_native_stack_limits() -> None:
     if os.name == "nt":
         return
+    import resource
+
+    from repo_support import configure_native_stack
+
+    inherited = resource.getrlimit(resource.RLIMIT_STACK)
+    try:
+        resource.setrlimit(resource.RLIMIT_STACK, inherited)
+    except (OSError, ValueError):
+        before = resource.getrlimit(resource.RLIMIT_STACK)
+        address_space = resource.getrlimit(resource.RLIMIT_AS)
+        configure_native_stack()
+        assert resource.getrlimit(resource.RLIMIT_STACK) == before
+        assert resource.getrlimit(resource.RLIMIT_AS) == address_space
+        return
     # Isolate hard-limit changes from the suite. Native entry points need more
     # than the usual 8 MiB stack, but must preserve stricter host limits and AS.
     code = """
@@ -132,10 +146,9 @@ configure_native_stack()
 assert resource.getrlimit(resource.RLIMIT_STACK) == (expected, hard)
 assert resource.getrlimit(resource.RLIMIT_AS) == address_space
 """
-    import resource
 
     mib = 1024 * 1024
-    _, inherited_hard = resource.getrlimit(resource.RLIMIT_STACK)
+    _, inherited_hard = inherited
     hard = 256 * mib if inherited_hard == resource.RLIM_INFINITY else min(256 * mib, inherited_hard)
     for soft, cap, expected in (
         (min(8 * mib, hard), hard, min(128 * mib, hard)),

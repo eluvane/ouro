@@ -109,6 +109,8 @@ GitHub appends the matrix value: `PR (checks)`, `PR (analysis)`, `PR (tests)`,
 `PR (smith)`, `PR (samples-1)`, `PR (samples-2)`, `Portable (ubuntu-latest)`,
 and `Portable (macos-latest)`. Portable restores the compiler cache when
 present, then builds `ouro1` before `kernel_hardening_suite.py`.
+macOS keeps the inherited Python stack when the host CPython build rejects
+`setrlimit(RLIMIT_STACK)`; the child address-space cap still applies.
 The `analysis`, `tests`, `smith`, `samples-1`, and `samples-2` jobs also
 build `ouro1` after a cache miss; `checks` stays lint/quality-only.
 `scripts/apply_github_settings.py` recommends

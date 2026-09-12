@@ -185,6 +185,9 @@ def chain(work: Path, snapshot: dict, build) -> dict:
         report["phases"][-1]["commands"].append(row)
         save()
         if not result.ok and not (negative and result.status == "ok" and result.returncode == 1):
+            for stream in (result.stdout, result.stderr):
+                if stream:
+                    print(stream, end="" if stream.endswith("\n") else "\n", file=sys.stderr, flush=True)
             fail(f"{phase}/{label}: {result.classify()} exit={result.returncode}; see {out}")
         return result
 

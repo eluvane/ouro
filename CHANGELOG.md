@@ -24,6 +24,12 @@ integration may change.
   were failing the PR firewall.
 - Hosted `PR (smith)` and the other non-`checks` PR groups now build `ouro1`
   on a cold cache instead of failing closed on a missing `_build/c/ouro1`.
+- Hosted Portable macOS no longer aborts bootstrap when CPython pins
+  `RLIMIT_STACK`; POSIX children still clamp address space to the host hard max.
+- Bind the `primitive_roles` singleton list before passing it to `append` so the
+  historical bridge parser can check `file_elab.ouro`.
+- Restore the missing `emit` helper used by record expansion so the historical
+  checker accepts `preprocess_record.ouro`.
 
 ## [0.1.0] - 2026-09-12
 
