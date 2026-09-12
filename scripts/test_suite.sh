@@ -125,9 +125,7 @@ fi
 run_suite() {
 	if [ -n "$NATIVE_TOOLS" ]; then
 		native_status=0
-		if ! "$@"; then
-			native_status=$?
-		fi
+		"$@" || native_status=$?
 		"$PYTHON" "$ROOT/scripts/native_suite_tools.py" --directory "$NATIVE_TOOLS" --suite test \
 			--receipt "$OUT/native-candidates.json" --verify
 		exit "$native_status"

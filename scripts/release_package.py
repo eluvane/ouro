@@ -513,7 +513,9 @@ def compress_file_zstd(src: Path, dest: Path) -> str:
         zstandard = None
     if zstandard is not None:
         with src.open("rb") as inf, dest.open("wb") as outf:
-            zstandard.ZstdCompressor(level=19, threads=1).copy_stream(inf, outf)
+            zstandard.ZstdCompressor(level=19, threads=1).copy_stream(
+                inf, outf, size=src.stat().st_size
+            )
         return "zstandard"
     try:
         from compression import zstd as compression_zstd
@@ -541,7 +543,14 @@ def decompress_zstd_bytes(data: bytes) -> bytes:
     except ImportError:
         zstandard = None
     if zstandard is not None:
-        return zstandard.ZstdDecompressor().decompress(data)
+        decompressor = zstandard.ZstdDecompressor()
+        try:
+            return decompressor.decompress(data)
+        except Exception as exc:
+            if type(exc).__name__ != "ZstdError":
+                raise
+            with decompressor.stream_reader(io.BytesIO(data)) as reader:
+                return reader.read()
     try:
         from compression import zstd as compression_zstd
     except ImportError:
@@ -961,6 +970,18 @@ def toolchain_self_tests() -> None:
             "does not match platform windows",
         )
         pack_toolchain(out, "0.1.0", "linux", compiler, [source], root=root)
+        streamed = out / "stream-without-size.zst"
+        with (out / "stream-without-size.tar").open("wb") as raw:
+            raw.write(b"streamed tar body\n")
+        try:
+            import zstandard as zstd_mod
+        except ImportError:
+            zstd_mod = None
+        if zstd_mod is not None:
+            with (out / "stream-without-size.tar").open("rb") as inf, streamed.open("wb") as outf:
+                zstd_mod.ZstdCompressor(level=3).copy_stream(inf, outf)
+            if decompress_zstd_bytes(streamed.read_bytes()) != b"streamed tar body\n":
+                raise SystemExit("release package self-test: stream zstd decompress failed")
         tar_path = out / "ouro-0.1.0-linux.tar.zst"
         zip_path = out / "ouro-0.1.0-linux.zip"
         raw = decompress_zstd_bytes(tar_path.read_bytes())

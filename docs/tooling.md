@@ -26,7 +26,10 @@ sh scripts/ouro1.sh eval path/to/module.ouro --print name --type TYPE
 sh scripts/ouro1.sh eval path/to/module.ouro --eval 'expression' --type TYPE
 ```
 
-`check` resolves imports and typechecks the complete module closure. `eval`
+`check` resolves imports and typechecks the complete module closure.
+Relative `FILE` arguments stay in the caller's directory: the wrapper looks
+up the compiler from the repository root, but `pkg verify` still typechecks
+`_ouro_pkgs/...` inside the project that invoked it. `eval`
 elaborates and evaluates a declaration or expression in the module's scope.
 The evaluation wrapper defaults to `Nat`; use `--type TYPE` for another result
 type. The declared type is checked before native extraction.
@@ -144,8 +147,10 @@ must provision direct-PE candidates and their siblings before running those
 assertions. A C-host candidate cannot exercise the bounded native process API.
 Hosted C-host suites instead pass `OURO_TEST_CHECK` /
 `OURO_HOSTED_COMPILER_WRAPPER` (`scripts/ouro1.sh`) and, for builds,
-`OURO_TEST_BUILD` (`scripts/build_tool.sh`). Use the retained suites' explicit
-`--native-tools DIR` option as described in
+`OURO_TEST_BUILD` (`scripts/build_tool.sh`). `ouro1 test` and `ouro1 pkg`
+set those variables when they are unset, and C-host test runs launch the
+child with `prim_proc_exec` instead of bounded capture. Use the retained
+suites' explicit `--native-tools DIR` option as described in
 [native tool acceptance](ci.md#local-profiles).
 
 ## Formatter
