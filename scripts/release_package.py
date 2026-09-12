@@ -1,18 +1,25 @@
 #!/usr/bin/env python3
-"""Build deterministic Ouro source release artifacts and checksums.
+"""Build deterministic Ouro release archives, metadata, and checksums.
 
-The current project can reliably package source + committed bootstrap seeds. It
-must not pretend to publish signed binaries or SLSA attestations. This script
-therefore creates source tar/zip archives, a release manifest, release notes, and
-SHA256SUMS after validating the version baseline and generated-artifact hashes.
+Hosted releases publish Lean-style per-host toolchains:
+
+  ouro-<version>-<platform>.tar.zst
+  ouro-<version>-<platform>.zip
+
+for darwin, darwin_aarch64, linux, linux_aarch64, and windows. Each archive
+contains repository sources plus the host `ouro1` built on that runner. The
+script must not invent a missing compiler, claim signed binaries, or claim
+SLSA attestations.
 """
 from __future__ import annotations
 
 import argparse
 import gzip
+import io
 import json
 import os
 import re
+import shutil
 import stat
 import subprocess
 import tarfile
@@ -38,6 +45,31 @@ REPORT_KIND = "ouro.release-package.v1"
 PACKAGE_NAME = "ouro"
 FIXED_MTIME = 0
 ZIP_EPOCH = (1980, 1, 1, 0, 0, 0)
+TOOLCHAIN_PLATFORMS = (
+    "darwin",
+    "darwin_aarch64",
+    "linux",
+    "linux_aarch64",
+    "windows",
+)
+COMPILER_MIN_BYTES = 32768
+ARCHIVE_MIN_BYTES = 32
+ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"
+ZSTD_MAX_RAW_BLOCK = 128 * 1024
+MACHO_MAGICS = {
+    b"\xcf\xfa\xed\xfe",
+    b"\xce\xfa\xed\xfe",
+    b"\xfe\xed\xfa\xcf",
+    b"\xfe\xed\xfa\xce",
+    b"\xca\xfe\xba\xbe",
+    b"\xbe\xba\xfe\xca",
+}
+RESERVED_TOOLCHAIN_PATHS = {
+    "bin/ouro",
+    "bin/ouro.cmd",
+    "bin/ouro1",
+    "bin/ouro1.exe",
+}
 
 EXCLUDE_DIRS = {
     ".git",
@@ -316,33 +348,432 @@ def tar_info(st: os.stat_result, arcname: str) -> tarfile.TarInfo:
     return info
 
 
-def build_tar_gz(
-    out: Path, prefix: str, files: list[Path], *, root: Path = ROOT
+def open_extra_file(path: Path) -> tuple[BinaryIO, os.stat_result]:
+    try:
+        before = path.lstat()
+    except OSError as exc:
+        raise SystemExit(f"release package: cannot stat extra file {path}: {exc}") from exc
+    if is_symlink_or_reparse(before):
+        raise SystemExit(f"release package: refusing symlink or reparse point: {path}")
+    if not stat.S_ISREG(before.st_mode):
+        raise SystemExit(f"release package: extra file is not regular: {path}")
+    handle: BinaryIO | None = None
+    try:
+        handle = path.open("rb")
+        opened = os.fstat(handle.fileno())
+    except OSError as exc:
+        if handle is not None:
+            handle.close()
+        raise SystemExit(f"release package: cannot open extra file {path}: {exc}") from exc
+    if not stat.S_ISREG(opened.st_mode) or file_identity(before) != file_identity(opened):
+        handle.close()
+        raise SystemExit(f"release package: extra file changed while packaging: {path}")
+    return handle, opened
+
+
+def add_tar_entry(
+    tf: tarfile.TarFile,
+    path: Path,
+    arcname: str,
+    *,
+    root: Path,
+    extra: bool,
+    executable: bool,
 ) -> None:
-    members = archive_members(files, root=root)
+    handle, st = open_extra_file(path) if extra else open_selected_file(path, root=root)
+    info = tar_info(st, arcname)
+    if executable:
+        info.mode = 0o755
+    with handle:
+        tf.addfile(info, handle)
+
+
+def add_zip_entry(
+    zf: zipfile.ZipFile,
+    path: Path,
+    arcname: str,
+    *,
+    root: Path,
+    extra: bool,
+    executable: bool,
+) -> None:
+    handle, st = open_extra_file(path) if extra else open_selected_file(path, root=root)
+    zi = zipfile.ZipInfo(arcname, ZIP_EPOCH)
+    mode = 0o755 if executable else stat.S_IMODE(st.st_mode)
+    if not (mode & 0o111):
+        mode = 0o644
+    zi.external_attr = (mode & 0xFFFF) << 16
+    zi.compress_type = zipfile.ZIP_DEFLATED
+    with handle:
+        zf.writestr(zi, handle.read())
+
+
+def write_archive_members(
+    *,
+    prefix: str,
+    files: list[Path],
+    extras: Sequence[tuple[Path, str, bool]] = (),
+    root: Path = ROOT,
+    add,
+) -> None:
+    for path, rp in archive_members(files, root=root):
+        add(path, f"{prefix}/{rp}", extra=False, executable=False)
+    for path, rp, executable in extras:
+        add(path, f"{prefix}/{rp}", extra=True, executable=executable)
+
+
+def build_tar_gz(
+    out: Path,
+    prefix: str,
+    files: list[Path],
+    *,
+    root: Path = ROOT,
+    extras: Sequence[tuple[Path, str, bool]] = (),
+) -> None:
     with out.open("wb") as raw:
         with gzip.GzipFile(filename="", mode="wb", fileobj=raw, mtime=FIXED_MTIME) as gz:
             with tarfile.open(fileobj=gz, mode="w") as tf:
-                for path, rp in members:
-                    f, st = open_selected_file(path, root=root)
-                    info = tar_info(st, f"{prefix}/{rp}")
-                    with f:
-                        tf.addfile(info, f)
+                write_archive_members(
+                    prefix=prefix,
+                    files=files,
+                    extras=extras,
+                    root=root,
+                    add=lambda path, arcname, extra, executable: add_tar_entry(
+                        tf, path, arcname, root=root, extra=extra, executable=executable
+                    ),
+                )
 
 
-def build_zip(out: Path, prefix: str, files: list[Path], *, root: Path = ROOT) -> None:
-    members = archive_members(files, root=root)
+def build_zip(
+    out: Path,
+    prefix: str,
+    files: list[Path],
+    *,
+    root: Path = ROOT,
+    extras: Sequence[tuple[Path, str, bool]] = (),
+) -> None:
     with zipfile.ZipFile(out, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
-        for path, rp in members:
-            zi = zipfile.ZipInfo(f"{prefix}/{rp}", ZIP_EPOCH)
-            f, st = open_selected_file(path, root=root)
-            mode = stat.S_IMODE(st.st_mode)
-            if not (mode & 0o111):
-                mode = 0o644
-            zi.external_attr = (mode & 0xFFFF) << 16
-            zi.compress_type = zipfile.ZIP_DEFLATED
-            with f:
-                zf.writestr(zi, f.read())
+        write_archive_members(
+            prefix=prefix,
+            files=files,
+            extras=extras,
+            root=root,
+            add=lambda path, arcname, extra, executable: add_zip_entry(
+                zf, path, arcname, root=root, extra=extra, executable=executable
+            ),
+        )
+
+
+def zstd_frame_uncompressed(data: bytes) -> bytes:
+    header = bytearray(ZSTD_MAGIC)
+    header.append(0xE0)
+    header += len(data).to_bytes(8, "little")
+    offset = 0
+    empty = not data
+    while offset < len(data) or empty:
+        chunk = data[offset : offset + ZSTD_MAX_RAW_BLOCK]
+        last = offset + len(chunk) >= len(data)
+        block_header = (len(chunk) << 3) | int(last)
+        header += block_header.to_bytes(3, "little")
+        header += chunk
+        offset += len(chunk)
+        empty = False
+        if last:
+            break
+    return bytes(header)
+
+
+def zstd_frame_uncompressed_decode(frame: bytes) -> bytes:
+    if len(frame) < 13 or frame[:4] != ZSTD_MAGIC or frame[4] != 0xE0:
+        raise SystemExit("release package: unsupported uncompressed zstd frame")
+    expected = int.from_bytes(frame[5:13], "little")
+    offset = 13
+    parts: list[bytes] = []
+    while offset + 3 <= len(frame):
+        header = int.from_bytes(frame[offset : offset + 3], "little")
+        offset += 3
+        last = header & 1
+        if ((header >> 1) & 3) != 0:
+            raise SystemExit("release package: expected raw zstd blocks")
+        size = header >> 3
+        parts.append(frame[offset : offset + size])
+        offset += size
+        if last:
+            break
+    data = b"".join(parts)
+    if len(data) != expected:
+        raise SystemExit("release package: zstd frame size mismatch")
+    return data
+
+
+def compress_file_zstd(src: Path, dest: Path) -> str:
+    try:
+        import zstandard
+    except ImportError:
+        zstandard = None
+    if zstandard is not None:
+        with src.open("rb") as inf, dest.open("wb") as outf:
+            zstandard.ZstdCompressor(level=19, threads=1).copy_stream(inf, outf)
+        return "zstandard"
+    try:
+        from compression import zstd as compression_zstd
+    except ImportError:
+        compression_zstd = None
+    if compression_zstd is not None:
+        dest.write_bytes(compression_zstd.compress(src.read_bytes(), level=19))
+        return "compression.zstd"
+    zstd = shutil.which("zstd")
+    if zstd is not None:
+        subprocess.run(
+            [zstd, "-19", "-T1", "-f", "-o", str(dest), "--", str(src)],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        return "zstd-cli"
+    dest.write_bytes(zstd_frame_uncompressed(src.read_bytes()))
+    return "uncompressed-frame"
+
+
+def decompress_zstd_bytes(data: bytes) -> bytes:
+    try:
+        import zstandard
+    except ImportError:
+        zstandard = None
+    if zstandard is not None:
+        return zstandard.ZstdDecompressor().decompress(data)
+    try:
+        from compression import zstd as compression_zstd
+    except ImportError:
+        compression_zstd = None
+    if compression_zstd is not None:
+        return compression_zstd.decompress(data)
+    zstd = shutil.which("zstd")
+    if zstd is not None:
+        return subprocess.run(
+            [zstd, "-d", "-c"],
+            input=data,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        ).stdout
+    return zstd_frame_uncompressed_decode(data)
+
+
+def build_tar_zst(
+    out: Path,
+    prefix: str,
+    files: list[Path],
+    *,
+    root: Path = ROOT,
+    extras: Sequence[tuple[Path, str, bool]] = (),
+) -> None:
+    tmp = out.with_name(out.name + ".tar.tmp")
+    try:
+        with tmp.open("wb") as raw:
+            with tarfile.open(fileobj=raw, mode="w") as tf:
+                write_archive_members(
+                    prefix=prefix,
+                    files=files,
+                    extras=extras,
+                    root=root,
+                    add=lambda path, arcname, extra, executable: add_tar_entry(
+                        tf, path, arcname, root=root, extra=extra, executable=executable
+                    ),
+                )
+        compress_file_zstd(tmp, out)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def validate_platform(platform: Optional[str]) -> str:
+    name = "" if platform is None else platform.strip()
+    if name not in TOOLCHAIN_PLATFORMS:
+        raise SystemExit(
+            "release package: platform must be one of " + ", ".join(TOOLCHAIN_PLATFORMS)
+        )
+    return name
+
+
+def compiler_arcname(platform: str) -> str:
+    return "bin/ouro1.exe" if platform == "windows" else "bin/ouro1"
+
+
+def compiler_magic_ok(head: bytes, platform: str) -> bool:
+    if platform == "windows":
+        return head.startswith(b"MZ")
+    if platform.startswith("linux"):
+        return head.startswith(b"\x7fELF")
+    if platform.startswith("darwin"):
+        return head[:4] in MACHO_MAGICS
+    return False
+
+
+def resolve_compiler(path: Path, platform: str) -> Path:
+    candidate = path if path.is_absolute() else Path.cwd() / path
+    if not candidate.is_file() and platform == "windows":
+        exe = candidate.with_suffix(".exe") if candidate.suffix != ".exe" else candidate
+        if exe.is_file():
+            candidate = exe
+    if not candidate.is_file():
+        raise SystemExit(f"release package: compiler not found: {path}")
+    try:
+        st = candidate.lstat()
+    except OSError as exc:
+        raise SystemExit(f"release package: cannot stat compiler {candidate}: {exc}") from exc
+    if is_symlink_or_reparse(st) or not stat.S_ISREG(st.st_mode):
+        raise SystemExit(f"release package: compiler must be a regular file: {candidate}")
+    if st.st_size < COMPILER_MIN_BYTES:
+        raise SystemExit(
+            f"release package: compiler is too small to be a host toolchain: {candidate}"
+        )
+    with candidate.open("rb") as handle:
+        head = handle.read(4)
+    if not compiler_magic_ok(head, platform):
+        raise SystemExit(
+            f"release package: compiler image does not match platform {platform}: {candidate}"
+        )
+    return candidate.resolve()
+
+
+def posix_wrapper_text() -> str:
+    return (
+        "#!/bin/sh\n"
+        "set -eu\n"
+        'ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)\n'
+        'export OURO_ROOT="$ROOT"\n'
+        'if [ -x "$ROOT/bin/ouro1.exe" ]; then\n'
+        '  export OURO1_COMPILER="$ROOT/bin/ouro1.exe"\n'
+        "else\n"
+        '  export OURO1_COMPILER="$ROOT/bin/ouro1"\n'
+        "fi\n"
+        'if [ -f "$ROOT/scripts/ouro1.sh" ]; then\n'
+        '  exec /bin/sh "$ROOT/scripts/ouro1.sh" "$@"\n'
+        "fi\n"
+        'exec "$OURO1_COMPILER" "$@"\n'
+    )
+
+
+def windows_wrapper_text() -> str:
+    return (
+        "@echo off\r\n"
+        "setlocal\r\n"
+        'set "OURO_ROOT=%~dp0.."\r\n'
+        'set "OURO1_COMPILER=%~dp0ouro1.exe"\r\n'
+        'if exist "%OURO_ROOT%\\scripts\\ouro1.sh" (\r\n'
+        "  where bash >nul 2>&1 && (\r\n"
+        '    bash "%OURO_ROOT%\\scripts\\ouro1.sh" %*\r\n'
+        "    exit /b %ERRORLEVEL%\r\n"
+        "  )\r\n"
+        ")\r\n"
+        '"%OURO1_COMPILER%" %*\r\n'
+    )
+
+
+def toolchain_prefix(version: str, platform: str) -> str:
+    return f"{PACKAGE_NAME}-{version}-{platform}"
+
+
+def toolchain_archive_names(version: str, platform: str) -> tuple[str, str]:
+    prefix = toolchain_prefix(version, platform)
+    return f"{prefix}.tar.zst", f"{prefix}.zip"
+
+
+def required_published_names(version: str) -> list[str]:
+    names: list[str] = []
+    for platform in TOOLCHAIN_PLATFORMS:
+        names.extend(toolchain_archive_names(version, platform))
+    return names
+
+
+def write_sha256sums(out: Path) -> list[tuple[str, str]]:
+    sums: list[tuple[str, str]] = []
+    for path in sorted(out.iterdir(), key=lambda p: p.name):
+        if path.is_file() and path.name != "SHA256SUMS":
+            sums.append((sha256_file(path), path.name))
+    (out / "SHA256SUMS").write_text(
+        "".join(f"{h}  {name}\n" for h, name in sums), encoding="utf-8"
+    )
+    return sums
+
+
+def manifest_version_in(out: Path) -> str:
+    matches = sorted(out.glob(f"{PACKAGE_NAME}-*-release-manifest.json"))
+    if len(matches) != 1:
+        raise SystemExit(
+            f"release package: expected one release manifest in {out}, found {len(matches)}"
+        )
+    data, error = parse_json_value(matches[0].read_text(encoding="utf-8"))
+    if error is not None or not isinstance(data, dict):
+        raise SystemExit(f"release package: invalid release manifest: {matches[0].name}")
+    version = str(data.get("version") or "")
+    if re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", version) is None:
+        raise SystemExit(f"release package: release manifest has no version: {matches[0].name}")
+    return version
+
+
+def verify_published_archives(out: Path, version: str) -> list[str]:
+    names = required_published_names(version)
+    missing = [name for name in names if not (out / name).is_file()]
+    if missing:
+        raise SystemExit("release package: missing toolchain archives: " + ", ".join(missing))
+    small = [
+        name
+        for name in names
+        if (out / name).stat().st_size < ARCHIVE_MIN_BYTES
+    ]
+    if small:
+        raise SystemExit("release package: toolchain archives are empty: " + ", ".join(small))
+    leftovers = sorted(
+        path.name
+        for path in out.iterdir()
+        if path.name.endswith("-source.tar.gz") or path.name.endswith("-source.zip")
+    )
+    if leftovers:
+        raise SystemExit(
+            "release package: source archives are not published toolchain assets: "
+            + ", ".join(leftovers)
+        )
+    return names
+
+
+def pack_toolchain(
+    out: Path,
+    version: str,
+    platform: str,
+    compiler: Path,
+    files: list[Path],
+    *,
+    root: Path = ROOT,
+) -> tuple[Path, Path]:
+    for path in files:
+        rp = archive_rel(path, root=root)
+        if rp in RESERVED_TOOLCHAIN_PATHS:
+            raise SystemExit(f"release package: repository already contains {rp}")
+    prefix = toolchain_prefix(version, platform)
+    tar_name, zip_name = toolchain_archive_names(version, platform)
+    staging = out / f".toolchain-staging-{platform}"
+    if staging.exists():
+        shutil.rmtree(staging)
+    staging.mkdir(parents=True, exist_ok=True)
+    extras: list[tuple[Path, str, bool]] = [
+        (compiler, compiler_arcname(platform), True),
+    ]
+    posix_wrapper = staging / "ouro"
+    posix_wrapper.write_text(posix_wrapper_text(), encoding="utf-8", newline="\n")
+    extras.append((posix_wrapper, "bin/ouro", True))
+    if platform == "windows":
+        cmd_wrapper = staging / "ouro.cmd"
+        cmd_wrapper.write_bytes(windows_wrapper_text().encode("ascii"))
+        extras.append((cmd_wrapper, "bin/ouro.cmd", True))
+    try:
+        tar_path = out / tar_name
+        zip_path = out / zip_name
+        build_tar_zst(tar_path, prefix, files, root=root, extras=extras)
+        build_zip(zip_path, prefix, files, root=root, extras=extras)
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+    return tar_path, zip_path
 
 
 def expect_rejected(action, expected: str) -> None:
@@ -486,7 +917,108 @@ def run_self_tests() -> None:
                 link.unlink()
 
     changelog_cut_self_tests()
-    print("RELEASE_PACKAGE_SELF_TEST: PASS versions=11 tracked_links=5 archive_formats=2 reparse=1 changelog_cut=4")
+    toolchain_self_tests()
+    print(
+        "RELEASE_PACKAGE_SELF_TEST: PASS versions=11 tracked_links=5 "
+        "archive_formats=2 reparse=1 changelog_cut=4 toolchains=6"
+    )
+
+
+def fake_compiler_bytes(platform: str) -> bytes:
+    if platform == "windows":
+        head = b"MZ"
+    elif platform.startswith("linux"):
+        head = b"\x7fELF"
+    else:
+        head = b"\xcf\xfa\xed\xfe"
+    return head + (b"\0" * (COMPILER_MIN_BYTES - len(head)))
+
+
+def toolchain_self_tests() -> None:
+    expect_rejected(lambda: validate_platform("windows_aarch64"), "platform must be one of")
+    expect_rejected(lambda: validate_platform(""), "platform must be one of")
+    self_test_root = ROOT / "_build"
+    self_test_root.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(
+        prefix="ouro-release-toolchain-selftest-", dir=self_test_root
+    ) as d:
+        root = Path(d)
+        out = root / "out"
+        out.mkdir()
+        source = root / "README.md"
+        source.write_bytes(b"readme\n")
+        compiler = root / "ouro1"
+        compiler.write_bytes(fake_compiler_bytes("linux"))
+        expect_rejected(
+            lambda: resolve_compiler(root / "missing", "linux"),
+            "compiler not found",
+        )
+        tiny = root / "tiny"
+        tiny.write_bytes(b"\x7fELF" + b"\0" * 16)
+        expect_rejected(lambda: resolve_compiler(tiny, "linux"), "too small")
+        expect_rejected(
+            lambda: resolve_compiler(compiler, "windows"),
+            "does not match platform windows",
+        )
+        pack_toolchain(out, "0.1.0", "linux", compiler, [source], root=root)
+        tar_path = out / "ouro-0.1.0-linux.tar.zst"
+        zip_path = out / "ouro-0.1.0-linux.zip"
+        raw = decompress_zstd_bytes(tar_path.read_bytes())
+        with tarfile.open(fileobj=io.BytesIO(raw), mode="r") as tf:
+            tar_names = {member.name for member in tf.getmembers() if member.isfile()}
+            ouro1 = tf.extractfile("ouro-0.1.0-linux/bin/ouro1")
+            if ouro1 is None or ouro1.read()[:4] != b"\x7fELF":
+                raise SystemExit("release package self-test: linux tar.zst missing compiler")
+        with zipfile.ZipFile(zip_path) as zf:
+            zip_names = set(zf.namelist())
+            if zf.read("ouro-0.1.0-linux/bin/ouro1")[:4] != b"\x7fELF":
+                raise SystemExit("release package self-test: linux zip missing compiler")
+        expected = {
+            "ouro-0.1.0-linux/README.md",
+            "ouro-0.1.0-linux/bin/ouro1",
+            "ouro-0.1.0-linux/bin/ouro",
+        }
+        if not expected.issubset(tar_names) or not expected.issubset(zip_names):
+            raise SystemExit("release package self-test: toolchain archive layout changed")
+        win_out = root / "win"
+        win_out.mkdir()
+        win_compiler = root / "ouro1.exe"
+        win_compiler.write_bytes(fake_compiler_bytes("windows"))
+        pack_toolchain(win_out, "0.1.0", "windows", win_compiler, [source], root=root)
+        with zipfile.ZipFile(win_out / "ouro-0.1.0-windows.zip") as zf:
+            if "ouro-0.1.0-windows/bin/ouro1.exe" not in zf.namelist():
+                raise SystemExit("release package self-test: windows zip missing ouro1.exe")
+            if "ouro-0.1.0-windows/bin/ouro.cmd" not in zf.namelist():
+                raise SystemExit("release package self-test: windows zip missing ouro.cmd")
+        reserved = root / "bin"
+        reserved.mkdir()
+        clash = reserved / "ouro1"
+        clash.write_bytes(b"clash\n")
+        expect_rejected(
+            lambda: pack_toolchain(out, "0.1.0", "linux", compiler, [clash], root=root),
+            "repository already contains bin/ouro1",
+        )
+        verify_dir = root / "published"
+        verify_dir.mkdir()
+        (verify_dir / "ouro-0.1.0-release-manifest.json").write_text(
+            json.dumps({"version": "0.1.0"}), encoding="utf-8"
+        )
+        expect_rejected(
+            lambda: verify_published_archives(verify_dir, "0.1.0"),
+            "missing toolchain archives",
+        )
+        for name in required_published_names("0.1.0"):
+            (verify_dir / name).write_bytes(b"archive-placeholder-bytes-enough\n")
+        (verify_dir / "ouro-0.1.0-source.zip").write_bytes(b"old-source\n")
+        expect_rejected(
+            lambda: verify_published_archives(verify_dir, "0.1.0"),
+            "source archives are not published",
+        )
+        (verify_dir / "ouro-0.1.0-source.zip").unlink()
+        if verify_published_archives(verify_dir, "0.1.0") != required_published_names("0.1.0"):
+            raise SystemExit("release package self-test: published archive inventory changed")
+        if manifest_version_in(verify_dir) != "0.1.0":
+            raise SystemExit("release package self-test: manifest version lookup failed")
 
 
 CHANGELOG_REPO = "https://github.com/eluvane/ouro"
@@ -615,6 +1147,28 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--check", action="store_true", help="validate release metadata without writing archives")
     ap.add_argument("--self-test", action="store_true", help="run release path and archive regression checks")
     ap.add_argument(
+        "--toolchain",
+        action="store_true",
+        help="write ouro-<version>-<platform>.tar.zst and .zip for one host compiler",
+    )
+    ap.add_argument("--platform", default=None, help="host platform name, matching Lean 4 suffixes")
+    ap.add_argument("--compiler", default=None, help="path to the built host ouro1 for --toolchain")
+    ap.add_argument(
+        "--source",
+        action="store_true",
+        help="also write source-only tar.gz/zip archives; not uploaded to GitHub Releases",
+    )
+    ap.add_argument(
+        "--checksums-only",
+        action="store_true",
+        help="rewrite SHA256SUMS for files already in --out",
+    )
+    ap.add_argument(
+        "--verify-dir",
+        action="store_true",
+        help="require the ten Lean-style toolchain archives in --out",
+    )
+    ap.add_argument(
         "--cut-changelog",
         action="store_true",
         help="move [Unreleased] under the seal version and reset [Unreleased]",
@@ -624,8 +1178,28 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     if args.self_test:
         run_self_tests()
-        if not args.check and not args.cut_changelog:
+        if not args.check and not args.cut_changelog and not args.checksums_only and not args.verify_dir:
             return 0
+
+    out = Path(args.out)
+    if not out.is_absolute():
+        out = ROOT / out
+
+    if args.checksums_only or args.verify_dir:
+        out.mkdir(parents=True, exist_ok=True)
+        version = None
+        if args.verify_dir:
+            version = manifest_version_in(out)
+            verify_published_archives(out, version)
+        sums = write_sha256sums(out)
+        print(
+            "RELEASE_PACKAGE: PASS "
+            f"verify_dir={int(args.verify_dir)} version={version or '-'} "
+            f"out={rel(out)} artifacts={len(sums)}"
+        )
+        for h, name in sums:
+            print(f"RELEASE_SHA256 {h}  {name}")
+        return 0
 
     if args.cut_changelog:
         version = parse_seal_version()
@@ -652,9 +1226,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if missing:
         raise SystemExit("release package: missing required release docs: " + ", ".join(missing))
 
-    out = Path(args.out)
-    if not out.is_absolute():
-        out = ROOT / out
+    platform = None
+    compiler = None
+    if args.toolchain or args.platform or args.compiler:
+        if not args.toolchain:
+            raise SystemExit("release package: --platform and --compiler require --toolchain")
+        platform = validate_platform(args.platform)
+        if not args.compiler:
+            raise SystemExit("release package: --toolchain requires --compiler")
+        compiler = resolve_compiler(Path(args.compiler), platform)
+
     out.mkdir(parents=True, exist_ok=True)
     prefix = f"{PACKAGE_NAME}-{version}"
     manifest = {
@@ -668,27 +1249,40 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "source_epoch": FIXED_MTIME,
         "version_evidence": version_evidence,
         "generated_artifacts": generated,
+        "published_artifacts": required_published_names(version),
         "policy": {
-            "artifacts": "source archives plus checksums; no binary/signing/SLSA claim",
+            "artifacts": (
+                "host toolchain archives ouro-<version>-<platform>.{tar.zst,zip} "
+                "plus checksums; no binary signing or SLSA claim"
+            ),
+            "platforms": list(TOOLCHAIN_PLATFORMS),
+            "host_compiler": (
+                "C-hosted ouro1 built on the named runner; program output remains "
+                "Windows x86-64 PE"
+            ),
             "generated_artifacts": "committed stage0 seeds must match docs/generated_artifact_hashes.sha256 before packaging",
             "reproducibility": "archive member metadata is normalized; package bytes are stable for the same source tree and compression implementation",
         },
         "files": [archive_rel(p) for p in files],
     }
+    if platform is not None and compiler is not None:
+        manifest["toolchain"] = {
+            "platform": platform,
+            "compiler": compiler_arcname(platform),
+            "compiler_sha256": sha256_file(compiler),
+            "compiler_bytes": compiler.stat().st_size,
+        }
     write_json_atomic(out / f"{prefix}-release-manifest.json", manifest)
     write_release_notes(out / "release-notes.md", version)
 
     if not args.check:
-        tar_path = out / f"{prefix}-source.tar.gz"
-        zip_path = out / f"{prefix}-source.zip"
-        build_tar_gz(tar_path, prefix, files)
-        build_zip(zip_path, prefix, files)
+        if args.source:
+            build_tar_gz(out / f"{prefix}-source.tar.gz", prefix, files)
+            build_zip(out / f"{prefix}-source.zip", prefix, files)
+        if platform is not None and compiler is not None:
+            pack_toolchain(out, version, platform, compiler, files)
 
-    sums: list[tuple[str, str]] = []
-    for path in sorted(out.iterdir(), key=lambda p: p.name):
-        if path.is_file() and path.name != "SHA256SUMS":
-            sums.append((sha256_file(path), path.name))
-    (out / "SHA256SUMS").write_text("".join(f"{h}  {name}\n" for h, name in sums), encoding="utf-8")
+    sums = write_sha256sums(out)
 
     report = {
         "kind": REPORT_KIND,
@@ -699,10 +1293,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "tag": "v" + version,
         "dirty": dirty,
         "file_count": len(files),
+        "platform": platform,
         "artifacts": [name for _, name in sums],
     }
     write_json_atomic(out / "release-package-report.json", report)
-    print(f"RELEASE_PACKAGE: PASS version={version} files={len(files)} out={rel(out)} check_only={int(args.check)}")
+    print(
+        f"RELEASE_PACKAGE: PASS version={version} files={len(files)} "
+        f"out={rel(out)} check_only={int(args.check)} platform={platform or '-'}"
+    )
     for h, name in sums:
         print(f"RELEASE_SHA256 {h}  {name}")
     return 0

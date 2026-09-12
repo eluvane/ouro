@@ -8,9 +8,26 @@
 
 # Releasing
 
-Ouro currently produces deterministic source archives containing the repository
-sources and committed bootstrap artifacts. Releases do not yet claim signed
-binaries, SLSA provenance, formal verification, or 1.0 compatibility.
+Ouro publishes Lean-style host toolchain archives. Each GitHub Release carries
+both `.tar.zst` and `.zip` files for:
+
+- `darwin` (macOS x86_64)
+- `darwin_aarch64` (macOS ARM)
+- `linux` (Linux x86_64)
+- `linux_aarch64` (Linux ARM)
+- `windows` (Windows x86_64)
+
+The archive names are `ouro-<version>-<platform>.tar.zst` and
+`ouro-<version>-<platform>.zip`. There is no `windows_aarch64` archive.
+
+Each archive is a relocatable prefix with repository sources plus the host
+`ouro1` built on that runner (`bin/ouro1` or `bin/ouro1.exe`) and a `bin/ouro`
+wrapper that sets `OURO_ROOT`. A missing compiler fails the platform job; the
+packer does not invent a stub image.
+
+Releases do not claim signed binaries, SLSA provenance, formal verification, or
+1.0 compatibility. Host `ouro1` is the C-hosted compiler for that OS; program
+`build` still targets Windows x86-64 PE.
 
 ## Version
 
@@ -49,17 +66,33 @@ python3 scripts/ci_gate.py --profile stage-loop --out _build/ci/release-stage-lo
 
 ## Build release files
 
+Metadata and version checks:
+
 ```sh
 python3 scripts/release_package.py --out _build/release
+```
+
+One host toolchain, after `python3 scripts/ouro_build.py build`:
+
+```sh
+python3 scripts/release_package.py \
+  --toolchain \
+  --platform linux \
+  --compiler _build/c/ouro1 \
+  --out _build/release
 cat _build/release/SHA256SUMS
 ```
 
-The package directory contains source `.tar.gz` and `.zip` archives, a release
-manifest, a package report, generated release notes, and `SHA256SUMS`.
-Repository-local state such as `.git/`, `_build/`, `_cache/`, editor outputs,
-Python bytecode, and `node_modules/` is excluded.
+On Windows the compiler path is `_build/c/ouro1.exe` and `--platform windows`.
+The optional `--source` flag still writes source-only `.tar.gz` / `.zip`
+archives for local inspection; those names are not uploaded to GitHub Releases.
+
+A complete hosted set is the ten toolchain archives, a release manifest,
+generated release notes, and `SHA256SUMS`. Repository-local state such as
+`.git/`, `_build/`, `_cache/`, editor outputs, Python bytecode, and
+`node_modules/` is excluded from the source members.
 Tracked symlinks and selected paths that traverse a symlink or Windows reparse
-point are rejected; source archives contain regular repository files only.
+point are rejected; archive members are regular files only.
 
 Archive timestamps and ownership metadata are normalized so two builds from the
 same inputs can be compared.
@@ -68,7 +101,7 @@ same inputs can be compared.
 
 `.github/workflows/ouro-release.yml` runs on release tags, Monday schedule,
 and manual dispatch.
-A tag run creates a draft GitHub Release and uploads the generated archives,
+A tag run creates a draft GitHub Release and uploads the ten host archives,
 manifest, notes, and checksums.
 
 A maintainer reviews the draft, changelog, checksums, validation reports,
@@ -100,13 +133,13 @@ hard error: there is nothing to publish in the notes.
 2. Confirm the shared version and `v<version>` tag.
 3. Run the appropriate validation profiles.
 4. Check `docs/generated_artifact_hashes.sha256`.
-5. Build and inspect the source archives and `SHA256SUMS`.
+5. Build and inspect the host toolchain archives and `SHA256SUMS`.
 6. Push an annotated tag.
 7. Review the draft release before publishing.
 
-A reproducible source package establishes a reviewable byte baseline. It does
-not prove type-system soundness, compiler correctness, runtime safety, or the truth
-of generated program intent.
+A reproducible host package establishes a reviewable byte baseline for that
+runner. It does not prove type-system soundness, compiler correctness, runtime
+safety, or the truth of generated program intent.
 
 <p align="center">
   <img
