@@ -462,6 +462,13 @@ case "$cmd" in
 			esac
 		done
 		[ -n "$fuel" ] || fuel="${OURO1_CHECK_FUEL:-16000}"
+		# The wrapper already cd'd to ROOT. Relative FILE belongs to the
+		# caller (pkg verify typechecks `_ouro_pkgs/...` in a temp project).
+		case "$file" in
+			/*) ;;
+			[A-Za-z]:*) ;;
+			*) file="$OLDPWD_OURO/$file" ;;
+		esac
 		if [ ! -f "$file" ]; then
 			printf '%s\n' "CHECK_FAIL: missing $file" >&2
 			exit 1
@@ -766,6 +773,10 @@ case "$cmd" in
 		# file. OURO_ROOT (exported above) is how `pkg verify` finds this
 		# script again for its typechecks.
 		shift
+		if [ -z "${OURO_PKG_CHECK:-}" ] && [ -z "${OURO_TEST_CHECK:-}" ]; then
+			OURO_PKG_CHECK="$ROOT/scripts/ouro1.sh"
+			export OURO_PKG_CHECK
+		fi
 		BIN="$C_BUILD_DIR/ouro-pkg"
 		if [ ! -x "$BIN" ] || [ -n "$(find "$ROOT/tools/pkg" -newer "$BIN" \
 			-print -quit 2>/dev/null)" ]; then
@@ -778,6 +789,12 @@ case "$cmd" in
 		# User-level test runner. Discovery stays in shell (like lint);
 		# the Ouro program checks and runs explicit files.
 		shift
+		if [ -z "${OURO_TEST_CHECK:-}" ]; then
+			OURO_TEST_CHECK="$ROOT/scripts/ouro1.sh"
+			OURO_TEST_BUILD="${OURO_TEST_BUILD:-$ROOT/scripts/build_tool.sh}"
+			OURO_HOSTED_COMPILER_WRAPPER="${OURO_HOSTED_COMPILER_WRAPPER:-$OURO_TEST_CHECK}"
+			export OURO_TEST_CHECK OURO_TEST_BUILD OURO_HOSTED_COMPILER_WRAPPER
+		fi
 		BIN="$C_BUILD_DIR/ouro-test"
 		if [ ! -x "$BIN" ] || [ -n "$(find "$ROOT/tools/test" "$ROOT/std/test.ouro" \
 			-newer "$BIN" -print -quit 2>/dev/null)" ]; then

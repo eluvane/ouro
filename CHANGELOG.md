@@ -26,6 +26,12 @@ integration may change.
 
 ### Fixed
 
+- Hosted `ouro1 check` keeps relative paths in the caller directory so
+  `pkg verify` can typecheck `_ouro_pkgs/...` after the wrapper cds to the
+  repository root.
+- C-host `ouro1 test` sets `OURO_TEST_CHECK` and runs sample/test children
+  through `prim_proc_exec`; dash `run_suite` keeps the child's exit status.
+- Release packer decompresses zstd frames that omit a content-size header.
 - Restored bootstrap input hashing so a clean host can freeze and build `ouro1`.
 - Split oversized checker modules and cleared the release-quality findings that
   were failing the PR firewall.
