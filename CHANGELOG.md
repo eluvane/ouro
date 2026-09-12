@@ -25,8 +25,17 @@ integration may change.
 - Hosted `PR (smith)` and the other non-`checks` PR groups now build `ouro1`
   on a cold cache instead of failing closed on a missing `_build/c/ouro1`.
 - Hosted Portable macOS no longer aborts bootstrap when CPython pins
-  `RLIMIT_STACK` or rejects a lowered address-space hard cap; POSIX children
-  still apply a sticky AS cap when the host allows it.
+  `RLIMIT_STACK` or when Darwin rejects a finite address-space cap; POSIX
+  children on Linux still apply a sticky AS cap when the host allows it.
+- Hosted `Kernel` and nightly non-`checks` groups now build `ouro1` on a cold
+  cache instead of failing closed on a missing `_build/c/ouro1`.
+- Restore fixture identifiers after Core-descriptor sharing so retained and
+  smith kernel checks name the shared `checker_test_*` declarations.
+- Give `pe_relocation_block` the `List (List Nat)` encoding list so PE
+  relocation emission typechecks.
+- Hosted C-host test, LSP, package, sample, and Smith suites invoke
+  `scripts/ouro1.sh` through `OURO_TEST_CHECK` / `OURO_HOSTED_COMPILER_WRAPPER`
+  instead of forcing the Windows `coil.exe` sibling path.
 - Bind the `primitive_roles` singleton list before passing it to `append` so the
   historical bridge parser can check `file_elab.ouro`.
 - Restore the missing `emit` helper used by record expansion so the historical

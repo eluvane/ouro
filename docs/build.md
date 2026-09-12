@@ -261,7 +261,8 @@ The repository default is ten workers (`Ouro.seal` `build.jobs`, CI
 
 The transitional compiler bootstrap runs one worker per phase with a 3 GiB
 memory limit and a 900-second timeout per command. Windows limits shared
-process-tree commit; POSIX applies an inherited address-space limit per process.
+process-tree commit; POSIX applies an inherited address-space limit per process
+except on Darwin, which rejects finite `RLIMIT_AS`.
 Tool and stage-loop builds retain their configured worker counts.
 
 ## C bootstrap

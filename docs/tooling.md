@@ -142,7 +142,10 @@ dispatch and automatic tool builds are separate work. The retained shell
 suites still own their fixture preparation and assertions; native acceptance
 must provision direct-PE candidates and their siblings before running those
 assertions. A C-host candidate cannot exercise the bounded native process API.
-Use the retained suites' explicit `--native-tools DIR` option as described in
+Hosted C-host suites instead pass `OURO_TEST_CHECK` /
+`OURO_HOSTED_COMPILER_WRAPPER` (`scripts/ouro1.sh`) and, for builds,
+`OURO_TEST_BUILD` (`scripts/build_tool.sh`). Use the retained suites' explicit
+`--native-tools DIR` option as described in
 [native tool acceptance](ci.md#local-profiles).
 
 ## Formatter

@@ -56,7 +56,11 @@ def environment(*, jobs: int | None = None, build: bool = False) -> dict[str, st
     jobs = job_count() if jobs is None else jobs
     env = clean_env()
     env.update({"OURO_ROOT": ROOT.as_posix(), "OURO_JOBS": str(jobs),
-                "OURO_FRONTEND_JOBS": str(jobs), "OURO_REPRODUCIBLE": "1"})
+                "OURO_FRONTEND_JOBS": str(jobs), "OURO_REPRODUCIBLE": "1",
+                "OURO_TEST_CHECK": (ROOT / "scripts/ouro1.sh").as_posix(),
+                "OURO_TEST_BUILD": (ROOT / "scripts/build_tool.sh").as_posix(),
+                "OURO_HOSTED_COMPILER_WRAPPER": (ROOT / "scripts/ouro1.sh").as_posix(),
+                "OURO_HOSTED_FMT": (build_config().path("c_build_dir") / "ouro-fmt").as_posix()})
     sh = shell()
     env["PATH"] = os.pathsep.join([str(Path(sys.executable).parent), str(sh.parent), env.get("PATH", "")])
     env["OURO_POSIX_SH"] = sh.as_posix()

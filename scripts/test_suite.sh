@@ -111,6 +111,10 @@ if [ -n "$NATIVE_TOOLS" ]; then
 	SUITE="$NATIVE_TOOLS/ouro-test.exe"
 else
 	SUITE="$OUT/ouro-test-suite"
+	OURO_TEST_CHECK="$ROOT/scripts/ouro1.sh"
+	OURO_TEST_BUILD="$ROOT/scripts/build_tool.sh"
+	OURO_HOSTED_COMPILER_WRAPPER="$OURO_TEST_CHECK"
+	export OURO_TEST_CHECK OURO_TEST_BUILD OURO_HOSTED_COMPILER_WRAPPER
 	if ! sh "$ROOT/scripts/build_tool.sh" tools/test/main.ouro "$SUITE" >"$OUT/suite.build" 2>&1; then
 		echo "TEST_SUITE: FAIL native suite build" >&2
 		tail -n 20 "$OUT/suite.build" >&2
