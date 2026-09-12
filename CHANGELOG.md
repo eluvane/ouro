@@ -26,6 +26,11 @@ integration may change.
 
 ### Fixed
 
+- Hosted C static analysis accepts the N1 selftest, IO selftest, heap live-byte
+  walk, and empty frontend prepass.
+- Analyzer cores that only need string primitives import
+  `tools/analyze/string_prims.ouro` instead of `std/runtime.ouro`, so
+  `ANALYZE_CORE` does not load the Windows platform cone.
 - Hosted `ouro1 check` keeps relative paths in the caller directory so
   `pkg verify` can typecheck `_ouro_pkgs/...` after the wrapper cds to the
   repository root.

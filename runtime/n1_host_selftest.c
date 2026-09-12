@@ -5,6 +5,11 @@
 #undef main
 #include <stdint.h>
 
+static ouro_v *codes(const char *s)
+{
+	return ouro_string_codes(s);
+}
+
 static ouro_v *probe_mir(int uninitialized, int bad_return)
 {
 	ouro_v *word = ouro_ctor(1, 0, 0); /* MirU32 */
