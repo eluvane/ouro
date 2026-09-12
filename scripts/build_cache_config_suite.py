@@ -1236,7 +1236,7 @@ def test_collect_build_protocol(tmp: Path) -> None:
     (repo / "scripts/build_tool.sh").write_text(
         "#!/bin/sh\nset -eu\nprintf 'build stdout\\n'\nprintf 'build stderr\\n' >&2\n"
         "[ \"${COLLECT_BUILD_FAIL:-0}\" = 0 ] || exit 23\n"
-        "printf '#!/bin/sh\\nprintf \\\"input.ouro\\\\n\\\"\\n' >\"$2\"\n"
+        "printf '%s\\n' '#!/bin/sh' \"printf '%s\\\\n' 'input.ouro'\" >\"$2\"\n"
         "i=0; while [ \"$i\" -lt 4100 ]; do printf '#' >>\"$2\"; i=$((i + 1)); done\n"
         "printf '\\n' >>\"$2\"\nchmod +x \"$2\"\n", encoding="utf-8")
     env = isolated_env()

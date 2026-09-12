@@ -127,8 +127,10 @@ empty runs, abstentions, and blocking completeness gaps cannot produce PASS.
 Each native command has a timeout, scrubbed environment, and private working
 directory. Windows uses a Job Object to cap committed memory and terminate
 descendants; POSIX uses inherited address-space limits and a process session.
-The POSIX child launcher permits a recursive native stack up to 128 MiB, matching
-the native PE reserve, within the address-space and inherited hard stack limits.
+Darwin does not enforce a finite `RLIMIT_AS`; the launcher leaves that limit
+inherited there. The POSIX child launcher permits a recursive native stack up
+to 128 MiB, matching the native PE reserve, within the address-space and
+inherited hard stack limits.
 These resource controls are not filesystem access controls. The generated
 programs and recipes are repository-owned code.
 

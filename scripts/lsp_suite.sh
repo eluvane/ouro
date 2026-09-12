@@ -59,6 +59,15 @@ else
 		tail -n 20 "$OUT/build.log" >&2
 		exit 1
 	}
+	FMT="$OUT/ouro-fmt"
+	sh "$ROOT/scripts/build_tool.sh" tools/fmt.ouro "$FMT" >"$OUT/fmt.build.log" 2>&1 || {
+		echo "LSP_SUITE: FAIL formatter build" >&2
+		tail -n 20 "$OUT/fmt.build.log" >&2
+		exit 1
+	}
+	OURO_HOSTED_COMPILER_WRAPPER="$ROOT/scripts/ouro1.sh"
+	OURO_HOSTED_FMT="$FMT"
+	export OURO_HOSTED_COMPILER_WRAPPER OURO_HOSTED_FMT
 fi
 
 rows=0

@@ -60,6 +60,7 @@ else
 		exit 1
 	}
 	export OURO_PKG_CHECK="$ROOT/scripts/ouro1.sh"
+	export OURO_HOSTED_COMPILER_WRAPPER="$OURO_PKG_CHECK"
 fi
 
 rows=0

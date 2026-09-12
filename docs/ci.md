@@ -95,7 +95,11 @@ snapshot alone does not establish how the images were built.
 The launchers still use shell/Python for fixture preparation and observation.
 The default C build selection remains available separately, and its results
 must identify that backend. A generated-C candidate cannot exercise bounded
-native capture. Existing suite assertions and required gates remain in place;
+native capture. Hosted C-host suites set `OURO_TEST_CHECK` /
+`OURO_HOSTED_COMPILER_WRAPPER` to `scripts/ouro1.sh` (and `OURO_TEST_BUILD` to
+`scripts/build_tool.sh`) so test, LSP, package, sample, and Smith tool
+processes invoke the current compiler without a Windows `coil.exe` sibling.
+Existing suite assertions and required gates remain in place;
 these explicit invocations do not establish native bootstrap or retire the
 full PR profile.
 
@@ -110,10 +114,14 @@ GitHub appends the matrix value: `PR (checks)`, `PR (analysis)`, `PR (tests)`,
 and `Portable (macos-latest)`. Portable restores the compiler cache when
 present, then builds `ouro1` before `kernel_hardening_suite.py`.
 macOS keeps the inherited Python stack when the host CPython build rejects
-`setrlimit(RLIMIT_STACK)`. Child address space is still capped; if the host
-rejects a lowered hard cap, only the soft AS limit is applied.
-The `analysis`, `tests`, `smith`, `samples-1`, and `samples-2` jobs also
-build `ouro1` after a cache miss; `checks` stays lint/quality-only.
+`setrlimit(RLIMIT_STACK)`. Darwin also rejects finite `RLIMIT_AS` (EINVAL);
+POSIX children on Linux still apply a sticky AS cap when the host allows it,
+and fall back to a soft-only cap when a lowered hard value is rejected.
+The hosted `Kernel` job restores the compiler cache when present, then builds
+`ouro1` before `ci_gate.py --profile kernel`. Nightly non-`checks` groups do
+the same before their profile group. The `analysis`, `tests`, `smith`,
+`samples-1`, and `samples-2` jobs also build `ouro1` after a cache miss;
+`checks` stays lint/quality-only.
 `scripts/apply_github_settings.py` recommends
 those running check names, plus `Paths`, `Kernel`, `Editor`, and `Review`.
 Existing hosted branch rules need the same check-name update when adopting
@@ -390,11 +398,11 @@ error, or an empty diff runs every applicable job. An editor-only change runs
 the VS Code test job while skipping unrelated compiler work.
 A `site/`-only change is treated as a dependency/path change and does not start
 the compiler suites.
-The hosted `Kernel` job runs `python3 scripts/ci_gate.py --profile kernel` and
-uploads its compiler, hardening, boundary, generated-law, scale, and depth
-reports. Its path selector covers the checker and its compiler, runtime,
-standard-library, test, and gate dependencies. Missing required probes fail
-the job.
+The hosted `Kernel` job builds `ouro1`, then runs
+`python3 scripts/ci_gate.py --profile kernel` and uploads its compiler,
+hardening, boundary, generated-law, scale, and depth reports. Its path
+selector covers the checker and its compiler, runtime, standard-library, test,
+and gate dependencies. Missing required probes fail the job.
 The nightly and manual profiles also run `analyze-production`
 (`python3 scripts/analyze_production_suite.py`), which sweeps the production
 scopes with the structured analyzer and fails on any finding from the promoted
