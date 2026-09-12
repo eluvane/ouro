@@ -249,6 +249,7 @@ set -- tools/analyze/architecture.ouro \
 	tools/analyze/unit.ouro \
 	tools/analyze/finding.ouro \
 	tools/analyze/drive_env.ouro \
+	tools/analyze/string_prims.ouro \
 	tools/analyze/drive_smells.ouro \
 	tools/analyze/drive.ouro \
 	tools/analyze/drive_main.ouro \

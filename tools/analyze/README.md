@@ -108,6 +108,7 @@ ANALYZE_FACTS architecture=graph suppressions=parsed deadcode=typed-facts api_su
 | --- | --- | --- | --- |
 | `ast.ouro` | `ast_children`, `ast_any`, `ast_exists`, `ast_arms`, `ast_core_body` | shared surface `Ast` | One 22-constructor inductive shared by every structured core, with the spine, binder, arm (`AstArm`), scrutinee, and declared-type helpers they need. |
 | `expr_adapt.ouro` | `adapt` | Expr → Ast | Total adapter from `compiler/ast.ouro`; the drive runs it per definition. |
+| `string_prims.ouro` | string host primitives | shared by analyzer cores | `String` and `prim_string_*` without `std/runtime.ouro`'s Windows platform cone. |
 | `unit.ouro` | `unit_of_source` | `AnalysisUnit` | Frontend pipeline into defs with name/line, `UnitTypes`, `CapIds`, layer marks. |
 | `finding.ouro` | `show_finding`, `rule_of_code`, `sort_findings`, `dedupe_findings` | `Finding` | Structured diagnostic plus the code → family/rule/message/hint table. |
 | `drive_env.ouro` | `DriveEnv`, `DefInfo`, `finding_at`, `fam_on` | shared by the drive modules | Family names, the per-unit environment, the per-definition record, and the finding constructor the wiring modules share. |

@@ -335,7 +335,7 @@ static unsigned long long heap_bytes(unsigned long *bsizes, unsigned long nblock
 {
 	unsigned long i;
 	unsigned long long n = 0;
-	if (nblocks == 0)
+	if (bsizes == 0 || nblocks == 0)
 		return 0;
 	for (i = 0; i + 1 < nblocks; i++)
 		n += (unsigned long long)bsizes[i];

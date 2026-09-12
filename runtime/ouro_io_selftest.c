@@ -533,7 +533,7 @@ static int process_bounded_unavailable_check(void)
     if (action == 0 || action->tag != OURO_TAG_CLOS)
         return fail("bounded capture is not a stored Runtime action");
     for (iteration = 0; iteration < 2; iteration++) {
-        const unsigned long expected[3] = {1, 120, 0};
+        const int expected[3] = {1, 120, 0};
         ouro_v *result = ouro_apply(action, ouro_ctor(0, 0, 0));
         int field;
         for (field = 0; field < 3; field++) {

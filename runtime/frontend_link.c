@@ -806,32 +806,34 @@ static int unit_prepass_incremental(ouro_v *files, ouro_v **out_files,
 		src = ouro_clone_perm_deep(pair_snd(f));
 		in_items[i] = perm_pair(path, src);
 	}
-	for (i = n - 1; i >= 0; i--) {
-		ouro_v *f = in_items[i];
-		ouro_v *path;
-		ouro_v *src;
-		ouro_v *r;
-		ouro_v *src2;
-		if (f == 0 || f->n < 2) {
-			ok = 0;
-			break;
+	if (n > 0 && out_items != 0) {
+		for (i = n - 1; i >= 0; i--) {
+			ouro_v *f = in_items[i];
+			ouro_v *path;
+			ouro_v *src;
+			ouro_v *r;
+			ouro_v *src2;
+			if (f == 0 || f->n < 2) {
+				ok = 0;
+				break;
+			}
+			path = pair_fst(f);
+			src = pair_snd(f);
+			r = ouro_apply(ouro_apply(preprocess_src, reg), src);
+			if (r == 0 || r->tag != 1 || r->n < 2) {
+				if (r != 0 && r->tag == 0 && r->n >= 2)
+					*out_error = ouro_clone_perm_deep(cerr(
+						as_nat(pair_fst(r)), as_nat(pair_snd(r))));
+				fe_phase_done("frontend-after-preprocess-unit-error");
+				ok = 0;
+				break;
+			}
+			reg = ouro_clone_perm_deep(OURO_F(r, r->n - 2));
+			src2 = ouro_clone_perm_deep(OURO_F(r, r->n - 1));
+			path = ouro_clone_perm_deep(path);
+			out_items[i] = perm_pair(path, src2);
+			fe_phase_done("frontend-after-preprocess-unit");
 		}
-		path = pair_fst(f);
-		src = pair_snd(f);
-		r = ouro_apply(ouro_apply(preprocess_src, reg), src);
-		if (r == 0 || r->tag != 1 || r->n < 2) {
-			if (r != 0 && r->tag == 0 && r->n >= 2)
-				*out_error = ouro_clone_perm_deep(cerr(
-					as_nat(pair_fst(r)), as_nat(pair_snd(r))));
-			fe_phase_done("frontend-after-preprocess-unit-error");
-			ok = 0;
-			break;
-		}
-		reg = ouro_clone_perm_deep(OURO_F(r, r->n - 2));
-		src2 = ouro_clone_perm_deep(OURO_F(r, r->n - 1));
-		path = ouro_clone_perm_deep(path);
-		out_items[i] = perm_pair(path, src2);
-		fe_phase_done("frontend-after-preprocess-unit");
 	}
 	free(in_items);
 	if (!ok) {
