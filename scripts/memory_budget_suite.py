@@ -13,6 +13,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional, Sequence
 
+from ourosmith.host import BUILD_MEMORY_MB
+from ourosmith.limits import run_limited
 from repo_support import bind_relative_path, read_json_value, write_json_atomic
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -210,6 +212,7 @@ CASES: tuple[Case, ...] = (
         # Opt-in families report on production code until the triage pass;
         # the budget measures the process, not the verdict.
         expected_returncode=(0, 1),
+        required_output="ANALYZE_DRIVE ",
     ),
     Case(
         "analyzer-enable-all",
@@ -261,6 +264,49 @@ CASES: tuple[Case, ...] = (
         "representative C bootstrap build smoke instead of full stage-loop",
     ),
 )
+
+
+def prepare_tools(cases: Sequence[Case], out: Path) -> list[dict[str, Any]]:
+    """Keep native compilation outside the existing execution RSS budgets.
+
+    The measured install cases still run unchanged. Preparation checks full
+    source receipts, so an old binary or unrelated cache hit cannot stand in
+    for the selected tool. Build failures are blocking and recorded separately.
+    """
+    labels = {case.label for case in cases}
+    tools: list[tuple[str, str]] = []
+    if labels & {"native-check-fmt", "native-check-analyze", "native-check-analyze-drive",
+                 "import-heavy-batch", "small-source", "medium-selfhost-module"}:
+        tools.append(("tools/collect.ouro", "ouro-collect"))
+    if "formatter-suite" in labels:
+        tools.append(("tools/fmt.ouro", "ouro-fmt"))
+    if any(label.startswith("analyzer-") for label in labels):
+        tools.append(("tools/analyze/main.ouro", "ouro-analyze"))
+    if "analyzer-drive-largest-file" in labels:
+        tools.append(("tools/analyze/drive_main.ouro", "ouro-analyze-drive"))
+    if "docs-examples-gate" in labels:
+        tools.append(("tools/repo_gate/main.ouro", "ouro-repo-gate"))
+    directory = Path(os.environ.get("OURO_C_BUILD_DIR", str(ROOT / "_build/c")))
+    if not directory.is_absolute():
+        directory = ROOT / directory
+    compiler = Path(os.environ.get("OURO1_COMPILER", str(directory / "ouro1")))
+    reports: list[dict[str, Any]] = []
+    for entry, name in tools:
+        command = [sys.executable, "scripts/native_tool_build.py", entry,
+                   str(directory / name), "--compiler", str(compiler)]
+        print(f"MEMORY_PREPARE_START {name}", flush=True)
+        result = run_limited(command, cwd=ROOT, env=os.environ,
+                             timeout_s=900, memory_mb=BUILD_MEMORY_MB)
+        log = out / f"prepare-{name}.log"
+        log.write_text(result.stdout + result.stderr, encoding="utf-8")
+        reports.append({"tool": name, "command": command, "status": result.classify(),
+                        "returncode": result.returncode, "elapsed_s": result.elapsed_s,
+                        "memory_mb": BUILD_MEMORY_MB, "log": rel(log)})
+        write_json_atomic(out / "preparation.json", {"pass": result.ok, "tools": reports})
+        print(f"MEMORY_PREPARE_DONE {name} status={result.classify()} log={rel(log)}", flush=True)
+        if not result.ok:
+            raise SystemExit(f"memory budget: native tool preparation failed: {name}; see {rel(log)}")
+    return reports
 
 
 def load_json_object(path: Path, *, what: str) -> dict[str, Any]:
@@ -469,6 +515,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     out.mkdir(parents=True, exist_ok=True)
 
     started = time.perf_counter()
+    preparation = prepare_tools(selected, out)
     if any(case.label == "analyzer-structured-large-guard" for case in selected):
         write_oversized_structured_fixture()
     results = [run_case(case, out=out, budgets=budgets, sample_interval=max(0.01, args.sample_interval)) for case in selected]
@@ -489,6 +536,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "baseline_file": rel(baseline_path) if baseline_path.exists() else None,
         "out": rel(out),
         "cases": results,
+        "preparation": preparation,
         "blocking_failures": failed,
         "elapsed_s": round(time.perf_counter() - started, 6),
         "policy": {

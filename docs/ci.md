@@ -40,7 +40,7 @@ List the gates in a profile without running them:
 python3 scripts/ci_gate.py --profile pr --list
 ```
 
-GitHub runs the same PR inventory as six isolated groups so the slow suites do
+GitHub runs the same PR inventory as fourteen isolated groups so the slow suites do
 not block one another on a single runner:
 
 ```sh
@@ -50,13 +50,28 @@ python3 scripts/ci_gate.py --profile pr --group tests
 python3 scripts/ci_gate.py --profile pr --group smith
 python3 scripts/ci_gate.py --profile pr --group samples-1
 python3 scripts/ci_gate.py --profile pr --group samples-2
+python3 scripts/ci_gate.py --profile pr --group compiler-1
+python3 scripts/ci_gate.py --profile pr --group compiler-2
+python3 scripts/ci_gate.py --profile pr --group compiler-3
+python3 scripts/ci_gate.py --profile pr --group compiler-4
+python3 scripts/ci_gate.py --profile pr --group compiler-5
+python3 scripts/ci_gate.py --profile pr --group compiler-6
+python3 scripts/ci_gate.py --profile pr --group compiler-7
+python3 scripts/ci_gate.py --profile pr --group compiler-8
 ```
 
-`--group` supports PR and nightly profiles. Use isolated checkouts when running
+`--group` supports PR, nightly, manual, kernel, and stage-loop profiles.
+`--list-groups` prints the selected profile's complete group list as JSON;
+Manual and Release use that inventory to construct their hosted matrices.
+Release metadata and assembly require every validation group to succeed.
+Use isolated checkouts when running
 groups concurrently: several suites own fixed fixture/output paths. The full
 local command runs every gate in registry order. The runner rejects a group
 inventory that omits, duplicates, or invents a gate; its self-test also checks
 that each hosted matrix exactly matches its profile's group inventory.
+OuroSmith compiler evidence requires all eight compiler gate commands and their
+source-bound receipts. The shard runners must agree on the full inventory and
+binary identity; their combined artifacts must cover every fixture exactly once.
 
 Samples use two shards with separate output directories. The native selector
 alternates native builds and check-only cases independently, preserving all
@@ -104,21 +119,29 @@ these explicit invocations do not establish native bootstrap or retire the
 full PR profile.
 
 Nightly uses `checks`, `analysis`, `tests`, `samples-1`, `samples-2`, `kernel`,
-and `trust` groups. The `trust` job runs the stage-loop fixpoint/drift gate and
+`trust`, and `compiler-1` through `compiler-8` groups. The `trust` job runs the stage-loop fixpoint/drift gate and
 then the deeper OuroSmith profile in the same checkout. `Full` runs even after
 a job failure and fails unless every matrix group succeeds. Reports are
 uploaded separately as `nightly-<group>` artifacts. Hosted PR matrix jobs use static names `PR` and `Portable` so a skipped
 matrix does not publish an unevaluated expression. When those jobs run,
 GitHub appends the matrix value: `PR (checks)`, `PR (analysis)`, `PR (tests)`,
-`PR (smith)`, `PR (samples-1)`, `PR (samples-2)`, `Portable (ubuntu-latest)`,
+`PR (smith)`, `PR (samples-1)`, `PR (samples-2)`, `PR (compiler-1)` through
+`PR (compiler-8)`, `Portable (ubuntu-latest)`,
 and `Portable (macos-latest)`. Portable restores the compiler cache when
 present, then builds `ouro1` before `kernel_hardening_suite.py`.
 macOS keeps the inherited Python stack when the host CPython build rejects
 `setrlimit(RLIMIT_STACK)`. Darwin also rejects finite `RLIMIT_AS` (EINVAL);
 POSIX children on Linux still apply a sticky AS cap when the host allows it,
 and fall back to a soft-only cap when a lowered hard value is rejected.
-The hosted `Kernel` job restores the compiler cache when present, then builds
-`ouro1` before `ci_gate.py --profile kernel`. Nightly non-`checks` groups do
+The hosted kernel matrix restores the compiler cache when present, then builds
+`ouro1` before each `ci_gate.py --profile kernel --group` invocation. Its
+`checks` group retains the hardening, scale, depth, boundary, quality, and Smith
+gates; eight compiler groups retain the complete assertion inventory. The
+static `Kernel` check requires every PR group to succeed, including all eight
+compiler shards, and requires the kernel matrix whenever path selection enables
+it. It also runs for other core changes, preserving enforcement through the
+existing required `Kernel` context while branch rules adopt the new shard names.
+Nightly non-`checks` groups do
 the same before their profile group. The `analysis`, `tests`, `smith`,
 `samples-1`, and `samples-2` jobs also build `ouro1` after a cache miss;
 `checks` stays lint/quality-only.
@@ -139,8 +162,8 @@ positive programs, including `compiler/extract.ouro`. Equal rejection statuses
 fail the suite. Generated negative compiler cases keep their separate exact
 diagnostic contracts in OuroSmith.
 
-The `compiler-checking` gate is required in the PR `tests` group, nightly,
-manual, and `kernel` profiles. Its Ouro-owned fixture inventory is in
+The eight `compiler-checking-1` through `compiler-checking-8` gates are required
+in PR, nightly, manual, and `kernel` profiles. Their Ouro-owned fixture inventory is in
 `tools/test/suites.ouro`; it checks, builds, and executes the compiler laws,
 constructor-closure laws, native x86-64 encoding, MIR, PE, lowering, GC metadata,
 liveness assertions, and related runner regressions. Support-only fixture
@@ -157,22 +180,30 @@ enforcement or descendant cleanup.
 ```sh
 sh scripts/test_suite.sh --compiler-checking
 sh scripts/test_suite.sh --compiler-checking --list
+sh scripts/test_suite.sh --compiler-checking --shard=1/8
 ```
 
 The native-lowering fixture runs each assertion in a separate process to bound
 the transitional C host's compiler heap. It retains the full case inventory,
 rejects duplicate names, and requires each child's exact output and zero status.
 
+Each invocation verifies that the eight round-robin shards cover every fixture
+exactly once, have unique fixture names and paths, and differ in size by at
+most one. Missing, duplicated, unknown, or malformed selections fail. Omitting
+`--shard` runs the full inventory. Each hosted shard has its own output directory
+and retains the same checker, build, execution, and failure requirements.
+
 The command uses the configured bootstrap in `OURO_C_BUILD_DIR`, runs builds
 with one worker, and writes logs under `_build/compiler_check_suite` (or
-`TEST_SUITE_OUT`). The same gate is registered in the Ouro-native `suite-native`
+`TEST_SUITE_OUT`). The full unsharded gate remains registered in the Ouro-native `suite-native`
 profile. User-test and stage-loop gates remain separate.
 
 On Windows, the required frontend-security host suite also uses its freshly
 built `n1-host` to emit the 29 bounded-process API laws, runtime fixture, and
-denied-commit child as direct PE32+ images. All 28 host probes
-remain required, including reachability-round fuel, error-payload and nested
-allocation checks. The native section requires all 29 API result lines in
+denied-commit child as direct PE32+ images. All 32 host probes
+remain required, including reachability/flow-round fuel, error-payload and nested
+allocation and PE patch-plan lifetime checks. Default-quiet host progress and
+unchanged failure diagnostics are checked separately. The native section requires all 29 API result lines in
 order, including the two separate `capture cap` laws, 13 runtime cases, and
 5 source-helper rejections after successful source checking and rechecking. The cases cover
 exact captured bytes and binary stdin, deferred/reused actions, child status

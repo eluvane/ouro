@@ -251,6 +251,11 @@ class NativeHarnessTests(unittest.TestCase):
         kernel = strategies["layers"]["kernel"]
         self.assertIn("PrimitiveRawLoad", kernel["external_owners"])
         self.assertNotIn("PrimitiveRawLoad", kernel["primitives"])
+        for primitive, owner in (("PrimitiveStdoutWrite", "compiler_primitive_registry_tests"),
+                                 ("PrimitiveFileRename", "compiler_primitive_registry_tests"),
+                                 ("PrimitiveProcessBounded", "compiler_process_bounded_registry_tests")):
+            self.assertEqual(kernel["external_owners"][primitive], "tests/" + owner + ".ouro")
+            self.assertNotIn(primitive, kernel["primitives"])
 
     def test_retained_protocol_preserves_exact_inventory_and_nonzero_semantics(self):
         from ourosmith.corpus import RETAINED_LAWS, inspect_retained
@@ -368,11 +373,27 @@ class NativeHarnessTests(unittest.TestCase):
                                   memory_mb=100, executable=fixture.executable, log=lambda _line: None)
                 self.assertEqual(execute.call_count, 1)
                 self.assertEqual(execute.call_args.args[0][1:4], ["check", fixture.entry, "999999"])
+                self.assertEqual((execute.call_args.kwargs["memory_mb"], execute.call_args.kwargs["timeout_s"]), (3072, 900))
                 (program.work / "seed.stdout").write_text("stale success", encoding="utf-8")
                 execute.return_value = wire("actual failure", code=2)
                 result = program.run([], "seed", 1)
                 self.assertFalse(result.ok)
+                self.assertEqual((execute.call_args.kwargs["memory_mb"], execute.call_args.kwargs["timeout_s"]), (100, 1))
                 self.assertEqual((program.work / "seed.stdout").read_text(), "actual failure")
+
+    def test_native_build_uses_preparation_budget_and_remains_fatal(self):
+        from ourosmith.native import prepare
+
+        with self.receipt_fixture() as fixture, \
+             patch("ourosmith.native.receipt_for", side_effect=ValueError("missing receipt")), \
+             patch("ourosmith.native.environment", return_value={}), \
+             patch("ourosmith.native.run_limited", side_effect=[wire("CHECK_OK\n"), wire("", status="memory", code=1)]) as execute:
+            with self.assertRaisesRegex(ValueError, "native build failed: memory"):
+                prepare(fixture.entry, fixture.directory / "run", fixture.compiler,
+                        memory_mb=100, log=lambda _line: None)
+            self.assertEqual(len(execute.call_args_list), 2)
+            self.assertTrue(all((call.kwargs["memory_mb"], call.kwargs["timeout_s"]) == (3072, 900)
+                                for call in execute.call_args_list))
 
     def test_failed_strict_source_check_cannot_reuse_a_binary(self):
         from ourosmith.native import prepare

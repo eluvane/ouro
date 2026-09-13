@@ -515,6 +515,9 @@ def host_link_flags() -> List[str]:
     # PE default stack is 1MiB. ouro1 recursion hits STATUS_STACK_OVERFLOW (0xC00000FD).
     if os.name == "nt":
         return ["-Wl,--stack,2147483648"]
+    if sys.platform == "darwin":
+        # Mach-O owns the main-thread reserve; host Python may pin RLIMIT_STACK.
+        return ["-Wl,-stack_size,0x8000000"]
     return []
 
 

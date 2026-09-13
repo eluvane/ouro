@@ -133,6 +133,17 @@ class StructuralContracts(unittest.TestCase):
                       source.replace('!parse(input)', 'platform == 0')]:
             self.assertNotIn('STRUCT_LEGACY_FALLBACK', rules(scan({'a.c': valid})))
 
+    def test_shell_status_capture_preserves_unconditional_verification(self):
+        rule = 'STRUCT_PARALLEL_BACKEND_FALLBACK'
+        for separator in ['\n', '; ']:
+            source = 'native "$@" || native_status=$?' + separator + 'python3 verify.py\nexit "$native_status"\n'
+            with self.subTest(separator=separator):
+                self.assertNotIn(rule, rules(scan({'a.sh': source})))
+        for alternate in ['\npython3 legacy.py', '\\\npython3 legacy.py',
+                          '{\npython3 legacy.py\n}', 'python3 --isolated --verbose legacy.py']:
+            with self.subTest(alternate=alternate):
+                self.assertIn(rule, rules(scan({'a.sh': 'native "$@" || ' + alternate + '\n'})))
+
     def test_inventory_fallback_cannot_hide_missing_inputs(self):
         source = 'def inventory(root):\n    try:\n        return list(os.scandir(root))\n    except OSError:\n        return list(root.glob("*"))\n'
         rule = 'STRUCT_PARALLEL_BACKEND_FALLBACK'

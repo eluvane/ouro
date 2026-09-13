@@ -158,12 +158,13 @@ def run_checks(run, directory, saved=None):
     built = run.command([run.cc, "-O1", "-std=c99", child, "-o", directory / "process helper.exe"], directory, "io-helper-compile")
     run.require(built.ok, "io-helper-compile", "exit 0", run.output(built))
     units = collect_units(path.as_posix())
-    run.accepts(path, artifact=False, units=units)
+    compile_timeout = run.timeout * 3
+    run.accepts(path, artifact=False, units=units, timeout=compile_timeout)
     env = {**run.env, "OURO_SMITH_VALUE": env_value}
     env.pop("OURO_SMITH_ABSENT", None)
     start = time.time_ns() // 1_000_000
     actual = run.native(path, units=units, io=True, env=env,
-                        arguments=arguments, stdin=stdin)
+                        arguments=arguments, stdin=stdin, compile_timeout=compile_timeout)
     end = time.time_ns() // 1_000_000
     run.require(actual.ok and not actual.stderr, "io-run", "exit 0 and empty stderr", run.output(actual))
     observed = {}

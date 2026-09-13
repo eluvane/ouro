@@ -294,6 +294,16 @@ def test_seal_parse() -> None:
     ouro_seal.self_check()
 
 
+def test_host_stack_link_flags() -> None:
+    for system, platform, expected in (
+        ("nt", "win32", ["-Wl,--stack,2147483648"]),
+        ("posix", "darwin", ["-Wl,-stack_size,0x8000000"]),
+        ("posix", "linux", []),
+    ):
+        with patch.object(build_driver.os, "name", system), patch.object(build_driver.sys, "platform", platform):
+            assert build_driver.host_link_flags() == expected, platform
+
+
 def test_native_tool_cache(tmp: Path) -> None:
     repo = tmp / "repo_tools"
     copy_repo(repo)
@@ -322,9 +332,9 @@ print("int main(void) { return 0; }")
     env.update(CC=str(fakecc), FAKE_CC_LOG=str(cc_log), FAKE_EMIT_LOG=str(emit_log),
                OURO_CACHE="1", OURO_CCACHE="disabled", OURO_JOBS="1")
 
-    def invoke(output="_build/tool-test", *, options=(), failure=False):
+    def invoke(output="_build/tool-test", *, source=entry.name, options=(), failure=False):
         result = subprocess.run(
-            [sys.executable, "scripts/native_tool_build.py", entry.name, output,
+            [sys.executable, "scripts/native_tool_build.py", source, output,
              "--compiler", str(compiler), "--verbosity", "quiet", *options],
             cwd=repo, env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False,
         )
@@ -333,12 +343,20 @@ print("int main(void) { return 0; }")
 
     invoke()
     baseline = counts(cc_log)
-    assert baseline == (4, 1), baseline
+    # Generated tool plus runtime, IO, entry point and frontend-link objects.
+    assert baseline == (5, 1), baseline
     binary = repo / ("_build/tool-test.exe" if os.name == "nt" else "_build/tool-test")
     baseline_bytes = binary.read_bytes()
     baseline_time = binary.stat().st_mtime_ns
     invoke()
     invoke(options=("--check",))
+    for spelling in (str(entry), str(repo) + "/./" + entry.name,
+                     str(repo).replace("/", "\\") + "\\.\\" + entry.name):
+        invoke(source=spelling, options=("--check",))
+        invoke(source=spelling)
+    manifest = (repo / "_build/tool-test.sources").read_text().splitlines()
+    assert manifest[:2] == [imported.name, entry.name], manifest
+    assert all(not Path(name).is_absolute() for name in manifest)
     assert counts(cc_log) == baseline and emit_log.read_text().count("emit") == 1
     assert binary.stat().st_mtime_ns == baseline_time
     architecture = {name: env.pop(name) for name in ("PROCESSOR_ARCHITECTURE", "PROCESSOR_ARCHITEW6432") if name in env}
@@ -393,18 +411,18 @@ print("int main(void) { return 0; }")
     before_cc = counts(cc_log)
     fakecc.write_text(fakecc.read_text() + "\n# changed compiler, same version string\n", encoding="utf-8")
     invoke()
-    assert counts(cc_log) == (before_cc[0] + 4, before_cc[1] + 1), "compiler content must invalidate common objects too"
+    assert counts(cc_log) == (before_cc[0] + 5, before_cc[1] + 1), "compiler content must invalidate common objects too"
     before_flags = counts(cc_log)
     invoke(options=("--opt", "O2"))
-    assert counts(cc_log) == (before_flags[0] + 4, before_flags[1] + 1), "flags must invalidate the installed binary"
+    assert counts(cc_log) == (before_flags[0] + 5, before_flags[1] + 1), "flags must invalidate the installed binary"
     invoke(options=("--opt", "O2"))
     invoke()
-    assert counts(cc_log) == (before_flags[0] + 4, before_flags[1] + 1), "both flag variants should remain reusable"
+    assert counts(cc_log) == (before_flags[0] + 5, before_flags[1] + 1), "both flag variants should remain reusable"
 
     before_uncached = counts(cc_log)
     invoke(options=("--no-cache",))
     invoke(options=("--no-cache",))
-    assert counts(cc_log) == (before_uncached[0] + 8, before_uncached[1] + 2)
+    assert counts(cc_log) == (before_uncached[0] + 10, before_uncached[1] + 2)
     entry.write_text(entry.read_text() + "\n-- invalidate\n", encoding="utf-8")
     env["FAKE_EMIT_FAIL"] = "1"
     invoke(failure=True)
@@ -591,13 +609,20 @@ def test_frontend_host_protocol(tmp: Path) -> None:
     from ourosmith.limits import RunResult
 
     cases = {case[1][0]: case for case in host.probe_cases()}
-    expected = ("valid", "uninitialized", "bad-return", "mir-program-context", "mir-flow-context",
-                "codegen-program-context", "mir-phase-errors", "mir-phase-nested", "mir-reachability-rounds", "lower-raw-order", "lower-raw-left", "lower-survivors",
-                "pe-byte-large", "pe-byte-errors", "pe-byte-context", "lower-bad-result",
+    expected = ("valid", "diagnostic-strings", "valid-quiet", "uninitialized", "bad-return", "mir-program-context", "mir-flow-context",
+                "codegen-program-context", "mir-phase-errors", "mir-phase-nested", "mir-reachability-rounds", "mir-flow-rounds", "lower-raw-order", "lower-raw-left", "lower-survivors",
+                "pe-byte-large", "pe-byte-errors", "pe-byte-context", "pe-patch-context", "lower-bad-result", "lower-bad-result-quiet",
                 "lower-bad-chunk", "lower-bad-contracts", "caller-output", "retained-result",
                 "typed-failure", "nested-context", "allocation-context", "recheck-scale",
                 "recheck-retained", "recheck-late-invalid", "recheck-missing-bodies", "recheck-zero-fuel")
-    assert len(cases) == 28 and tuple(case[1][0] for case in host.probe_cases()) == expected
+    assert len(cases) == 33 and tuple(case[1][0] for case in host.probe_cases()) == expected
+    quiet = RunResult("ok", 0, "N1_HOST_MIR: emitted valid-quiet\n",
+                      "n1-host: mir functions=1 live=1\nn1-host: mir-check live=1\n"
+                      "n1-host: gc-infer live=1\nn1-host: annotate live=1\n"
+                      "n1-host: codegen live=1\n", 0, 0)
+    host.verify_probe(quiet, cases["valid-quiet"])
+    quiet_failure = RunResult("ok", 2, "", "n1-host: raw returned an invalid lowering result\n", 0, 0)
+    host.verify_probe(quiet_failure, cases["lower-bad-result-quiet"])
     raw = RunResult("ok", 0, "N1_HOST_LOWER: passed lower-raw-order\n", "", 0, 0)
     host.verify_probe(raw, cases["lower-raw-order"])
     malformed = RunResult("ok", 2, "", "n1-host: raw returned an invalid list\n", 0, 0)
@@ -606,8 +631,10 @@ def test_frontend_host_protocol(tmp: Path) -> None:
     host.verify_probe(context, cases["mir-flow-context"])
     reachability = replace(context, stdout="N1_HOST_CONTEXT: passed mir-reachability-rounds\n")
     host.verify_probe(reachability, cases["mir-reachability-rounds"])
+    flow = replace(context, stdout="N1_HOST_CONTEXT: passed mir-flow-rounds\n")
+    host.verify_probe(flow, cases["mir-flow-rounds"])
     pe = RunResult("ok", 0, "N1_HOST_PE: passed pe-byte-large\n", "", 0, 0)
-    for mode in ("pe-byte-large", "pe-byte-errors", "pe-byte-context"):
+    for mode in ("pe-byte-large", "pe-byte-errors", "pe-byte-context", "pe-patch-context"):
         host.verify_probe(replace(pe, stdout=f"N1_HOST_PE: passed {mode}\n"), cases[mode])
     typed = RunResult("ok", 0, "FRONTEND_LINK_SELFTEST: passed typed-failure\n",
                       "probe.ouro: type mismatch in wrong\n", 0, 0)
@@ -616,7 +643,12 @@ def test_frontend_host_protocol(tmp: Path) -> None:
                          "n1-host: mir-check live=600\nn1-host: mir-check failed tag=0 n=1 live=31704\n"
                          "n1-host: mir:return\n", 0, 0)
     host.verify_probe(rejected, cases["bad-return"])
-    invalid = [(replace(raw, stdout=""), "lower-raw-order"),
+    invalid = [(replace(quiet, stderr=quiet.stderr + "n1-host: gc-check-c functions=1\n"), "valid-quiet"),
+               (replace(quiet, returncode=1), "valid-quiet"),
+               (replace(quiet, stdout=""), "valid-quiet"),
+               (replace(quiet_failure, stderr=""), "lower-bad-result-quiet"),
+               (replace(quiet_failure, returncode=0), "lower-bad-result-quiet"),
+               (replace(raw, stdout=""), "lower-raw-order"),
                (replace(raw, stderr="unexpected\n"), "lower-raw-order"),
                (replace(malformed, returncode=0), "lower-bad-chunk"),
                (replace(malformed, stderr=""), "lower-bad-chunk"),
@@ -628,6 +660,10 @@ def test_frontend_host_protocol(tmp: Path) -> None:
                (replace(reachability, returncode=1), "mir-reachability-rounds"),
                (replace(reachability, stdout=""), "mir-reachability-rounds"),
                (replace(reachability, stderr="unexpected\n"), "mir-reachability-rounds"),
+               (replace(flow, status="timeout"), "mir-flow-rounds"),
+               (replace(flow, returncode=1), "mir-flow-rounds"),
+               (replace(flow, stdout=""), "mir-flow-rounds"),
+               (replace(flow, stderr="unexpected\n"), "mir-flow-rounds"),
                (replace(pe, status="timeout"), "pe-byte-large"),
                (replace(pe, returncode=1), "pe-byte-large"),
                (replace(pe, stdout=""), "pe-byte-large"),
@@ -635,6 +671,10 @@ def test_frontend_host_protocol(tmp: Path) -> None:
                (replace(pe, stderr="unexpected\n"), "pe-byte-large"),
                (pe, "pe-byte-errors"),
                (pe, "pe-byte-context"),
+               (pe, "pe-patch-context"),
+               (replace(pe, stdout="N1_HOST_PE: passed pe-patch-context\n", status="timeout"), "pe-patch-context"),
+               (replace(pe, stdout="N1_HOST_PE: passed pe-patch-context\n", returncode=1), "pe-patch-context"),
+               (replace(pe, stdout="N1_HOST_PE: passed pe-patch-context\n", stderr="unexpected\n"), "pe-patch-context"),
                (replace(typed, stderr=""), "typed-failure"),
                (replace(rejected, returncode=0), "bad-return"),
                (replace(rejected, stdout="N1_HOST_MIR: emitted bad-return\n"), "bad-return"),
@@ -1022,6 +1062,10 @@ def test_native_tool_hooks(tmp: Path) -> None:
     reachability = hook(source(["mir_reachable"]), ["compiler/native/mir_flow.ouro"])
     assert "ouro_wrap_mir_reachable(ouro_clos(" in reachability
     assert "ouro_wrap_mir_check_function" not in reachability
+    liveness = hook(source(["mir_live_facts", "mir_live_summary_step"]),
+                    ["compiler/native/mir_live.ouro"])
+    assert "ouro_wrap_mir_live_summary_step(ouro_clos(" in liveness
+    assert "ouro_wrap_mir_live_facts(ouro_clos(" in liveness
 
     names = ["compile_checked_units", *(name for name, _, _ in native.HOST_HOOKS)]
     owners = ["compiler/driver.ouro", *(owner for _, _, paths in native.HOST_HOOKS for owner in paths)]
@@ -1229,6 +1273,8 @@ def test_collect_build_protocol(tmp: Path) -> None:
     (repo / "tools").mkdir()
     shutil.copyfile(ROOT / "scripts/ouro1.sh", repo / "scripts/ouro1.sh")
     (repo / "tools/collect.ouro").write_text("-- collector input\n", encoding="utf-8")
+    shared = repo / "tools/collect_core.ouro"
+    shared.write_text("-- shared traversal\n", encoding="utf-8")
     (repo / "input.ouro").write_text("def value : Nat := 0;\n", encoding="utf-8")
     compiler = repo / "compiler"
     compiler.write_text("#!/bin/sh\nprintf 'CHECK_OK\\n'\n", encoding="utf-8")
@@ -1258,11 +1304,101 @@ def test_collect_build_protocol(tmp: Path) -> None:
     warm = invoke()
     assert (warm.returncode, warm.stdout, warm.stderr) == (0, "CHECK_OK\n", ""), warm
     assert log.stat().st_mtime_ns == original_time, "warm check rebuilt the collector"
+    changed_time = (repo / "out/ouro-collect").stat().st_mtime_ns + 2_000_000_000
+    os.utime(shared, ns=(changed_time, changed_time))
+    stale = invoke()
+    assert stale.returncode != 0 and stale.stdout == "", "shared collector change reused stale binary"
+    assert stale.stderr == "build stdout\nbuild stderr\n", stale
     (repo / "out/ouro-collect").unlink()
     failure = invoke()
     assert failure.returncode != 0 and failure.stdout == "", failure
     assert failure.stderr == "build stdout\nbuild stderr\n", failure
     assert log.read_text(encoding="utf-8") == failure.stderr
+
+
+def test_build_tool_caller_paths(tmp: Path) -> None:
+    repo = tmp / "build-tool-cwd"
+    scripts = repo / "scripts"
+    scripts.mkdir(parents=True)
+    for name in ("build_tool.sh", "python.sh"):
+        shutil.copyfile(ROOT / "scripts" / name, scripts / name)
+    compiler = repo / "_build/c/ouro1"
+    compiler.parent.mkdir(parents=True)
+    compiler.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    compiler.chmod(0o755)
+    (scripts / "native_tool_build.py").write_text(
+        "import json, os, sys\nfrom pathlib import Path\n"
+        "Path(os.environ['BUILD_ARGV_LOG']).write_text(json.dumps(sys.argv[1:]))\n"
+        "raise SystemExit(int(os.environ['BUILD_STATUS']))\n", encoding="utf-8")
+    caller = repo / "caller space"
+    caller.mkdir()
+    log = tmp / "build-argv.json"
+    env = isolated_env()
+    env.update(PYTHON=sys.executable, BUILD_ARGV_LOG=str(log), OURO_BUILD_TOOL_MODE="native")
+    shell_caller = subprocess.run(["sh", "-c", "pwd"], cwd=caller, env=env,
+                                  capture_output=True, text=True, check=True).stdout.strip()
+    for code in (0, 23):
+        env["BUILD_STATUS"] = str(code)
+        result = subprocess.run(["sh", str(scripts / "build_tool.sh"), "./source.ouro", "out dir/tool"],
+                                cwd=caller, env=env, capture_output=True, text=True, check=False)
+        assert result.returncode == code, result
+        assert json.loads(log.read_text())[:2] == [shell_caller + "/./source.ouro", shell_caller + "/out dir/tool"]
+
+
+def test_runtime_io_host_selection(tmp: Path) -> None:
+    """The C launcher must select its existing wrappers before building tools."""
+    repo = tmp / "runtime-host-selection"
+    scripts = repo / "scripts"
+    scripts.mkdir(parents=True)
+    for name in ("runtime_io_suite.sh", "python.sh"):
+        shutil.copyfile(ROOT / "scripts" / name, scripts / name)
+    fakecc = repo / "fake-cc"
+    fakecc.write_text(
+        '#!/bin/sh\nwhile [ "$1" != -o ]; do shift; done\nshift\n'
+        'printf \'#!/bin/sh\\necho OURO_IO_SELFTEST: PASS\\n\' >"$1"\nchmod +x "$1"\n', encoding="utf-8")
+    fakecc.chmod(0o755)
+    log = repo / "wrapper-env.json"
+    (scripts / "capture.py").write_text(
+        'import json, os\nfrom pathlib import Path\n'
+        'keys = ("OURO_TEST_CHECK", "OURO_TEST_BUILD", "OURO_HOSTED_COMPILER_WRAPPER")\n'
+        'Path(os.environ["WRAPPER_ENV_LOG"]).write_text(json.dumps({key: os.environ.get(key) for key in keys}))\n',
+        encoding="utf-8")
+    (scripts / "build_tool.sh").write_text(
+        '#!/bin/sh\n"$PYTHON" scripts/capture.py\nexit 23\n', encoding="utf-8")
+    env = isolated_env()
+    env.update(PYTHON=sys.executable, CC=fakecc.as_posix(), WRAPPER_ENV_LOG=str(log))
+    result = subprocess.run(["sh", "scripts/runtime_io_suite.sh"], cwd=repo, env=env,
+                            text=True, capture_output=True, timeout=15, check=False)
+    assert result.returncode == 1 and "native suite build" in result.stderr, result
+    shell_root = subprocess.run(["sh", "-c", "pwd"], cwd=repo, env=env,
+                                text=True, capture_output=True, check=True).stdout.strip()
+    assert json.loads(log.read_text()) == {
+        "OURO_TEST_CHECK": shell_root + "/scripts/ouro1.sh",
+        "OURO_TEST_BUILD": shell_root + "/scripts/build_tool.sh",
+        "OURO_HOSTED_COMPILER_WRAPPER": shell_root + "/scripts/ouro1.sh",
+    }
+
+
+def test_memory_preparation_failure(tmp: Path) -> None:
+    import memory_budget_suite as memory
+    from ourosmith.limits import RunResult
+
+    for status, code in (("ok", 1), ("timeout", None), ("oom", None)):
+        out = tmp / ("memory-preparation-" + status)
+        failure = RunResult(status, code, "", "build failed", 1, 1)
+        with patch.object(memory, "run_limited", return_value=failure), \
+             patch.object(memory, "run_case") as measure:
+            try:
+                memory.main(["--case", "native-check-fmt", "--out", str(out)])
+            except SystemExit as error:
+                assert "native tool preparation failed" in str(error)
+            else:
+                raise AssertionError("failed preparation reached memory measurements")
+            measure.assert_not_called()
+        preparation = json.loads((out / "preparation.json").read_text())
+        assert preparation["pass"] is False
+        assert preparation["tools"][0]["status"] == failure.classify()
+        assert not (out / "memory-report.json").exists()
 
 
 def main() -> int:
@@ -1272,9 +1408,13 @@ def main() -> int:
     bootstrap_inputs_test.run()
     bootstrap_compiler_test.run()
     test_seal_parse()
+    test_host_stack_link_flags()
     with tempfile.TemporaryDirectory(prefix="ouro-build-suite-") as d:
         tmp = Path(d)
+        test_memory_preparation_failure(tmp)
         test_collect_build_protocol(tmp)
+        test_build_tool_caller_paths(tmp)
+        test_runtime_io_host_selection(tmp)
         test_frontend_native_async_protocol(tmp)
         test_retired_toolchain_contract(tmp)
         test_incremental_invalidation(tmp)

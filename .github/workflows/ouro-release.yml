@@ -40,8 +40,87 @@ defaults:
     shell: bash
 
 jobs:
+  groups:
+    name: Select groups
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.groups.outputs.matrix }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Select complete profile inventory
+        id: groups
+        env:
+          PROFILE: ${{ inputs.run_profile || 'manual' }}
+        run: |
+          matrix=$(python3 scripts/ci_gate.py --profile "$PROFILE" --list-groups)
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+
+  release-validation:
+    name: Validate (${{ matrix.group }})
+    needs: groups
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        group: ${{ fromJSON(needs.groups.outputs.matrix) }}
+    permissions:
+      contents: read
+    env:
+      OURO_CI: "1"
+      OURO_REPRODUCIBLE: "1"
+      OURO_PACK_STRICT: "1"
+      OURO_JOBS: "10"
+      OURO_CACHE_DIR: _cache/ouro
+      OURO_BUILD_DIR: _build
+      OURO_C_BUILD_DIR: _build/c
+      OURO_CCACHE: disabled
+      OURO_STAGE_MAX: "3"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install check tools
+        run: |
+          python3 -m pip install --disable-pip-version-check --quiet ruff==0.15.21
+          if ! command -v shellcheck >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y shellcheck
+          fi
+          shellcheck --version
+
+      - name: Run checks
+        env:
+          PROFILE: ${{ inputs.run_profile || 'manual' }}
+          GROUP: ${{ matrix.group }}
+        run: python3 scripts/ci_gate.py --profile "$PROFILE" --group "$GROUP" --out "_build/ci/release-$PROFILE-$GROUP"
+
+      - name: Upload validation reports
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-validation-${{ matrix.group }}-${{ github.ref_name }}
+          if-no-files-found: error
+          retention-days: 30
+          path: |
+            _build/**/*.json
+            _build/**/*.log
+            _build/**/*.out
+            _build/**/*.txt
+            _build/**/*.err
+            _build/**/*.sarif
+            _build/**/*.md
+            _build/**/gate.log
+
   release-gates-and-package:
     name: Build
+    needs: release-validation
     runs-on: ubuntu-latest
     timeout-minutes: 120
     permissions:
@@ -78,11 +157,6 @@ jobs:
 
       - name: Check project
         run: python3 scripts/github_project_gate.py --work _build/github_project_gate
-
-      - name: Run checks
-        run: |
-          profile="${{ inputs.run_profile || 'manual' }}"
-          python3 scripts/ci_gate.py --profile "$profile" --out "_build/ci/release-$profile"
 
       - name: Build package metadata
         run: |
@@ -129,7 +203,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: macos-13
+          - os: macos-15-intel
             platform: darwin
           - os: macos-latest
             platform: darwin_aarch64
@@ -336,7 +410,7 @@ jobs:
             fi
             {
               printf '# Weekly snapshot %s\n\n' "$tag"
-              printf 'Automatic host toolchain snapshot of `main` at `%s`.\n' "$(git rev-parse --short HEAD)"
+              printf "Automatic host toolchain snapshot of \`main\` at \`%s\`.\n" "$(git rev-parse --short HEAD)"
               printf 'Project version is unchanged. This is not a semver release.\n\n'
               printf '## Changes since %s\n\n' "$prev"
               git log --pretty=format:'- %s (%h)' "${prev}..HEAD"
@@ -349,7 +423,7 @@ jobs:
             fi
             {
               printf '# Weekly snapshot %s\n\n' "$tag"
-              printf 'Automatic host toolchain snapshot of `main` at `%s`.\n' "$(git rev-parse --short HEAD)"
+              printf "Automatic host toolchain snapshot of \`main\` at \`%s\`.\n" "$(git rev-parse --short HEAD)"
               printf 'Project version is unchanged. This is not a semver release.\n\n'
               printf '## Changes\n\n'
               git log --pretty=format:'- %s (%h)' --since='8 days ago' HEAD

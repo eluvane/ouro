@@ -232,8 +232,7 @@ def user_test_runner(run, directory):
                     "test-runner-" + name, {"exit_code": rc, "message": fragment}, run.output(result))
     discovered = run.command([shell(), ROOT / "scripts/ouro1.sh", "test"], directory,
                              "test-runner-discovery", env=environment(build=True), timeout=180)
-    expected_failure = ("process failed: _build/ouro_test/failure_test exit=1 stderr=\n"
-                        "FAIL run ./failure_test.ouro\ntest: failed\n")
+    expected_failure = "FAIL run ./failure_test.ouro\ntest: failed\n"
     run.require(discovered.returncode == 1 and discovered.stdout == "ok run ./success_test.ouro\n"
                 and discovered.stderr == expected_failure,
                 "test-runner-discovery", "discover and run the passing and intentionally failing local tests", run.output(discovered))

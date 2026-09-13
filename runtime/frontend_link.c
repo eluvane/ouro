@@ -9,6 +9,7 @@
 #include "ouro_host_values.h"
 
 #include <stdio.h>
+#include <limits.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdarg.h>
@@ -769,8 +770,10 @@ static ouro_v *list_from_items(ouro_v **items, int n)
 {
 	ouro_v *xs = perm_nil();
 	int i;
-	for (i = n - 1; i >= 0; i--)
+	for (i = n; i > 0;) {
+		--i;
 		xs = perm_cons(items[i], xs);
+	}
 	return xs;
 }
 
@@ -1134,6 +1137,25 @@ ouro_v *ouro_export_value_fe(int i)
 }
 
 #ifdef OURO_FE_FLAT_EXPORTS
+/* Ordinary generated programs keep stderr for diagnostics. Only the
+   diagnostic N1 executable explicitly enables these progress messages. */
+static int g_fe_progress;
+
+void ouro_fe_set_progress(int enabled)
+{
+	g_fe_progress = enabled != 0;
+}
+
+static void fe_progress(const char *format, ...)
+{
+	va_list args;
+	if (!g_fe_progress)
+		return;
+	va_start(args, format);
+	vfprintf(stderr, format, args);
+	va_end(args);
+}
+
 /* Recheck the full forgeable CheckedProgram using the same generated
    exact-Core traversal. Only each declaration's temporary arena is reset;
    declaration ordering, typed failures, metadata and bodies stay in Ouro. */
@@ -1158,7 +1180,7 @@ static ouro_v *mg_state(ouro_env *env, ouro_v *state)
 
 	g_mg_count++;
 	if ((g_mg_count % 25UL) == 0UL)
-		fprintf(stderr, "n1-host: global %lu live=%llu\n",
+		fe_progress("n1-host: global %lu live=%llu\n",
 			g_mg_count, ouro_heap_live_bytes());
 	ouro_heap_mark();
 	r = ouro_apply(ouro_apply(ouro_apply(ouro_apply(g_raw_managed_global,
@@ -1317,9 +1339,10 @@ ouro_v *ouro_wrap_mir_reachable(ouro_v *raw)
 }
 
 /* The Ouro callbacks retain phase order and exact typed results. A nested
-   heap context releases one unit phase without replacing cf_function's mark
-   or freeing the thunk's captures in the caller's allocation context. */
-static ouro_v *mir_check_unit_phase(ouro_env *env, ouro_v *work)
+   heap context releases one unit phase or complete flow round without
+   replacing cf_function's mark or freeing the thunk's captures. Copying the
+   complete round together preserves sharing between its block facts. */
+static ouro_v *mir_check_phase(ouro_env *env, ouro_v *work)
 {
 	return mir_reachable_ids(env, work);
 }
@@ -1332,13 +1355,13 @@ static ouro_v *cf_function(ouro_env *env, ouro_v *function)
 
 	g_cf_count++;
 	if ((g_cf_count % 25UL) == 0UL)
-		fprintf(stderr, "n1-host: checkfn %lu live=%llu\n",
+		fe_progress("n1-host: checkfn %lu live=%llu\n",
 			g_cf_count, ouro_heap_live_bytes());
 	function = ouro_clone_perm(function);
 	ouro_heap_mark();
-	run_unit = ouro_clos(mir_check_unit_phase, 0);
-	check_flow = ouro_apply(ouro_apply(FIND(lo, "mir_check_declared_flow_with"),
-		run_unit), FIND(lo, "mir_predecessor_declared"));
+	run_unit = ouro_clos(mir_check_phase, 0);
+	check_flow = ouro_apply(ouro_apply(ouro_apply(FIND(lo, "mir_check_declared_flow_with"),
+		run_unit), run_unit), FIND(lo, "mir_predecessor_declared"));
 	r = ouro_apply(ouro_apply(FIND(lo, "mir_check_function_with"), run_unit), check_flow);
 	r = ouro_apply(ouro_apply(ouro_apply(r, ouro_get(env, 1)), ouro_get(env, 0)), function);
 	r = ouro_clone_perm(r);
@@ -1564,7 +1587,7 @@ static ouro_v *cgp_concat_functions(ouro_v *completed)
 	fields[3] = records;
 	fields[4] = frames;
 	free(buf);
-	fprintf(stderr, "n1-host: finish-c functions=%d bytes=%lu\n", n,
+	fe_progress("n1-host: finish-c functions=%d bytes=%lu\n", n,
 		nbytes);
 	fflush(stderr);
 	return ouro_ctor(0, 5, fields);
@@ -1576,7 +1599,7 @@ static ouro_v *ps_state(ouro_env *env, ouro_v *state)
 
 	g_prep_count++;
 	if ((g_prep_count % 25UL) == 0UL) {
-		fprintf(stderr, "n1-host: encode %lu live=%llu\n",
+		fe_progress("n1-host: encode %lu live=%llu\n",
 			g_prep_count, ouro_heap_live_bytes());
 		fflush(stderr);
 	}
@@ -1679,8 +1702,7 @@ static int x64enc_dec_nat(ouro_v *v, unsigned long *out)
 	if (v == 0)
 		return -1;
 	if (v->tag == OURO_TAG_NAT) {
-		*out = (unsigned long)v->n;
-		return 0;
+		return ouro_nat_to_ulong(v, out) ? 0 : -1;
 	}
 	while (v != 0 && v->tag == 1 && v->n == 1) {
 		n++;
@@ -1688,8 +1710,11 @@ static int x64enc_dec_nat(ouro_v *v, unsigned long *out)
 			return -1;
 		v = OURO_F(v, 0);
 	}
-	if (v != 0 && v->tag == OURO_TAG_NAT) {
-		*out = n + (unsigned long)v->n;
+	if (v != 0 && (v->tag == OURO_TAG_NAT || v->tag == OURO_TAG_BIG_NAT)) {
+		unsigned long tail;
+		if (!ouro_nat_to_ulong(v, &tail) || tail > ULONG_MAX - n)
+			return -1;
+		*out = n + tail;
 		return 0;
 	}
 	if (v != 0 && v->tag == 0 && v->n == 0) {
@@ -2396,7 +2421,7 @@ static ouro_v *x64enc_apply(ouro_env *env, ouro_v *instruction)
 	(void)env;
 	g_x64enc_count++;
 	if ((g_x64enc_count % 10000UL) == 0UL)
-		fprintf(stderr, "n1-host: x64enc %lu\n", g_x64enc_count);
+		fe_progress("n1-host: x64enc %lu\n", g_x64enc_count);
 	memset(&encoded, 0, sizeof encoded);
 	if (x64enc_dec_ins(instruction, &decoded) != 0) {
 		g_x64enc_fallback++;
@@ -2930,14 +2955,14 @@ static ouro_v *cgasm_try(ouro_v *atoms, ouro_v *base_v, ouro_v *initial_v)
 	}
 	g_asm_count++;
 	if (g_asm_count == 1UL || (g_asm_count % 25UL) == 0UL)
-		fprintf(stderr, "n1-host: assemble %lu atoms=%d bytes=%d\n",
+		fe_progress("n1-host: assemble %lu atoms=%d bytes=%d\n",
 			g_asm_count, natoms, nbytes);
 	goto done;
 
 fallback:
 	g_asm_fallback++;
 	if (g_asm_fallback <= 3UL)
-		fprintf(stderr, "n1-host: assemble fallback %lu\n",
+		fe_progress("n1-host: assemble fallback %lu\n",
 			g_asm_fallback);
 	out = 0;
 done:
@@ -2981,12 +3006,9 @@ ouro_v *ouro_wrap_codegen_assemble(ouro_v *raw)
 	return ouro_clos(cgasm_atoms, 0);
 }
 
-/* Conservative live-in: every block keeps all managed roots. Intra-block
-   analysis in codegen still clears dead slots before MayGc. Exact Jacobi
-   stays available as fallback if a block shape is unrecognized. */
+/* The canonical Ouro solver owns exact live facts, edge errors and fuel.
+   Retain its complete result before releasing one call's temporary graph. */
 static ouro_v *g_raw_live_facts;
-static unsigned long g_live_count;
-static unsigned long g_live_fallback;
 
 static int host_list_next(ouro_v **stack, int *sp, ouro_v **cur, ouro_v **head)
 {
@@ -3056,65 +3078,37 @@ static int live_fuel_zero(ouro_v *fuel)
 	return 0;
 }
 
-static ouro_v *live_try(ouro_v *fuel, ouro_v *roots, ouro_v *blocks)
+static ouro_v *live_exact(ouro_v *fuel, ouro_v *roots, ouro_v *blocks)
 {
-	ouro_v *stack[64];
-	ouro_v *cur;
-	ouro_v *block;
-	ouro_v **facts = 0;
-	ouro_v *out = 0;
-	int n = 0;
-	int cap = 0;
-	int sp = 0;
-	int step;
+	ouro_heap_context *context = ouro_heap_context_enter();
+	ouro_v *raw = g_raw_live_facts != 0 ? g_raw_live_facts : FIND(lo, "mir_live_facts");
+	ouro_v *result = ouro_apply(ouro_apply(ouro_apply(raw, fuel), roots), blocks);
+	return ouro_heap_context_leave(context, result);
+}
 
-	if (live_fuel_zero(fuel))
-		return cgasm_left(0, 0, 0);
-	cur = blocks;
-	for (;;) {
-		ouro_v *fields[2];
-		unsigned long id;
+/* A Jacobi round reads frozen facts and returns one complete typed result.
+   Its captures remain in the caller while only the round's temporaries die. */
+static ouro_v *live_summary_blocks(ouro_env *env, ouro_v *summaries)
+{
+	ouro_heap_context *context = ouro_heap_context_enter();
+	ouro_v *result = ouro_apply(ouro_apply(ouro_get(env, 1),
+		ouro_get(env, 0)), summaries);
+	return ouro_heap_context_leave(context, result);
+}
 
-		step = host_list_next(stack, &sp, &cur, &block);
-		if (step == 0)
-			break;
-		if (step < 0 || block == 0 || block->tag != 0 || block->n < 1)
-			goto fallback;
-		if (x64enc_dec_nat(OURO_F(block, 0), &id) != 0)
-			goto fallback;
-		if (!cgasm_grow((void **)&facts, &cap, n + 1, sizeof *facts))
-			goto fallback;
-		fields[0] = ouro_nat(id);
-		fields[1] = roots;
-		facts[n++] = ouro_ctor(0, 2, fields);
-	}
-	out = cgasm_list(facts, n);
-	free(facts);
-	g_live_count++;
-	if (g_live_count == 1UL || (g_live_count % 25UL) == 0UL)
-		fprintf(stderr, "n1-host: livefacts %lu blocks=%d\n",
-			g_live_count, n);
-	return ouro_ctor(1, 1, &out);
+static ouro_v *live_summary_facts(ouro_env *env, ouro_v *facts)
+{
+	return ouro_clos(live_summary_blocks, ouro_cons(facts, env));
+}
 
-fallback:
-	g_live_fallback++;
-	if (g_live_fallback <= 3UL)
-		fprintf(stderr, "n1-host: livefacts fallback %lu\n",
-			g_live_fallback);
-	free(facts);
-	return 0;
+ouro_v *ouro_wrap_mir_live_summary_step(ouro_v *raw)
+{
+	return ouro_clos(live_summary_facts, ouro_cons(raw, 0));
 }
 
 static ouro_v *live_blocks(ouro_env *env, ouro_v *blocks)
 {
-	ouro_v *fuel = ouro_get(env, 1);
-	ouro_v *roots = ouro_get(env, 0);
-	ouro_v *fast = live_try(fuel, roots, blocks);
-
-	if (fast != 0)
-		return fast;
-	return ouro_apply(ouro_apply(ouro_apply(g_raw_live_facts, fuel),
-				     roots), blocks);
+	return live_exact(ouro_get(env, 1), ouro_get(env, 0), blocks);
 }
 
 static ouro_v *live_roots(ouro_env *env, ouro_v *roots)
@@ -3131,8 +3125,6 @@ static ouro_v *live_fuel(ouro_env *env, ouro_v *fuel)
 ouro_v *ouro_wrap_mir_live_facts(ouro_v *raw)
 {
 	g_raw_live_facts = raw;
-	g_live_count = 0;
-	g_live_fallback = 0;
 	return ouro_clos(live_fuel, 0);
 }
 
@@ -3192,7 +3184,7 @@ static ouro_v *parts_try(ouro_v *parts)
 fallback:
 	g_parts_fallback++;
 	if (g_parts_fallback <= 3UL)
-		fprintf(stderr, "n1-host: parts fallback %lu\n",
+		fe_progress("n1-host: parts fallback %lu\n",
 			g_parts_fallback);
 	free(rights);
 	return 0;
@@ -3282,7 +3274,7 @@ static ouro_v *cli_try(ouro_v *slots, ouro_v *block)
 	}
 	g_cli_count++;
 	if (g_cli_count == 1UL || (g_cli_count % 1000UL) == 0UL)
-		fprintf(stderr, "n1-host: live-ins-c blocks=%lu ins=%d\n",
+		fe_progress("n1-host: live-ins-c blocks=%lu ins=%d\n",
 			g_cli_count, nins);
 	free(insns);
 	free(pairs);
@@ -3291,7 +3283,7 @@ static ouro_v *cli_try(ouro_v *slots, ouro_v *block)
 fallback:
 	g_cli_fallback++;
 	if (g_cli_fallback <= 3UL)
-		fprintf(stderr, "n1-host: live-ins fallback %lu\n",
+		fe_progress("n1-host: live-ins fallback %lu\n",
 			g_cli_fallback);
 	free(roots);
 	free(ids);
@@ -4716,14 +4708,14 @@ static ouro_v *cgb_ins_atoms(ouro_v *program, ouro_v *slots,
 	if (fast != 0) {
 		g_cgi_count++;
 		if (g_cgi_count == 1UL || (g_cgi_count % 10000UL) == 0UL)
-			fprintf(stderr, "n1-host: ins-c %lu\n", g_cgi_count);
+			fe_progress("n1-host: ins-c %lu\n", g_cgi_count);
 		if (fast->tag != 1 || fast->n < 1)
 			return 0;
 		return OURO_F(fast, 0);
 	}
 	g_cgi_fallback++;
 	if (g_cgi_fallback <= 8UL)
-		fprintf(stderr, "n1-host: ins fallback tag=%d n=%lu\n",
+		fe_progress("n1-host: ins fallback tag=%d n=%lu\n",
 			ins == 0 ? -1 : ins->tag, g_cgi_fallback);
 	if (g_raw_cgi == 0)
 		return 0;
@@ -4826,12 +4818,12 @@ static ouro_v *cgb_block(ouro_env *env, ouro_v *block)
 	if (fast != 0) {
 		g_cgb_count++;
 		if (g_cgb_count == 1UL || (g_cgb_count % 1000UL) == 0UL)
-			fprintf(stderr, "n1-host: blk-c %lu\n", g_cgb_count);
+			fe_progress("n1-host: blk-c %lu\n", g_cgb_count);
 		return fast;
 	}
 	g_cgb_fallback++;
 	if (g_cgb_fallback <= 8UL)
-		fprintf(stderr, "n1-host: blk fallback n=%lu\n", g_cgb_fallback);
+		fe_progress("n1-host: blk fallback n=%lu\n", g_cgb_fallback);
 	return ouro_apply(ouro_apply(ouro_apply(ouro_apply(ouro_apply(
 		g_raw_cgb, ouro_get(env, 3)), ouro_get(env, 2)),
 		ouro_get(env, 1)), ouro_get(env, 0)), block);
@@ -5077,6 +5069,27 @@ static ouro_v *cgb_body_try(ouro_v *program, ouro_v *function, ouro_v *frame)
 	roots = cgn_fn_has_roots(function);
 	if (roots < 0)
 		return 0;
+	if (roots) {
+		ouro_v *analyzed;
+		ouro_v *root_ids;
+		if (host_list_collect(blocks, &blks, &n, &cap) != 0) {
+			free(blks);
+			return 0;
+		}
+		root_ids = ouro_apply(FIND(lo, "mir_live_roots"), function);
+		analyzed = live_exact(ouro_nat((unsigned long)n + 1UL), root_ids, blocks);
+		free(blks);
+		blks = 0;
+		n = 0;
+		cap = 0;
+		if (analyzed != 0 && analyzed->tag == 0 && analyzed->n == 1) {
+			ouro_v *error = OURO_F(analyzed, 0);
+			error = ouro_ctor(0, 1, &error); /* NativeMirError */
+			return ouro_ctor(0, 1, &error);
+		}
+		if (analyzed == 0 || analyzed->tag != 1 || analyzed->n != 1)
+			return 0;
+	}
 	atoms = cgb_zero_roots(slots);
 	part = cgb_spill(slots, allocation, OURO_F(function, 2));
 	if (atoms == 0 || part == 0)
@@ -5119,12 +5132,12 @@ static ouro_v *cbody_frame(ouro_env *env, ouro_v *frame)
 	if (fast != 0) {
 		g_cbody_count++;
 		if (g_cbody_count == 1UL || (g_cbody_count % 25UL) == 0UL)
-			fprintf(stderr, "n1-host: body-c %lu\n", g_cbody_count);
+			fe_progress("n1-host: body-c %lu\n", g_cbody_count);
 		return fast;
 	}
 	g_cbody_fallback++;
 	if (g_cbody_fallback <= 8UL)
-		fprintf(stderr, "n1-host: body fallback n=%lu\n",
+		fe_progress("n1-host: body fallback n=%lu\n",
 			g_cbody_fallback);
 	return ouro_apply(ouro_apply(ouro_apply(g_raw_cbody, ouro_get(env, 1)),
 				     ouro_get(env, 0)), frame);
@@ -5157,12 +5170,12 @@ static ouro_v *cgi_ins(ouro_env *env, ouro_v *ins)
 	if (fast != 0) {
 		g_cgi_count++;
 		if (g_cgi_count == 1UL || (g_cgi_count % 10000UL) == 0UL)
-			fprintf(stderr, "n1-host: ins-c %lu\n", g_cgi_count);
+			fe_progress("n1-host: ins-c %lu\n", g_cgi_count);
 		return fast;
 	}
 	g_cgi_fallback++;
 	if (g_cgi_fallback <= 8UL)
-		fprintf(stderr, "n1-host: ins fallback tag=%d n=%lu\n",
+		fe_progress("n1-host: ins fallback tag=%d n=%lu\n",
 			ins == 0 ? -1 : ins->tag, g_cgi_fallback);
 	return ouro_apply(ouro_apply(ouro_apply(ouro_apply(ouro_apply(
 		g_raw_cgi, ouro_get(env, 3)), ouro_get(env, 2)),
@@ -5524,7 +5537,7 @@ done:
 		out = ouro_ctor(1, 1, &xs);
 	}
 	g_gcinf_count++;
-	fprintf(stderr, "n1-host: gc-infer-c rounds=%lu bodies=%d\n",
+	fe_progress("n1-host: gc-infer-c rounds=%lu bodies=%d\n",
 		round + 1UL, n_keep);
 	goto cleanup;
 
@@ -5550,7 +5563,7 @@ static ouro_v *gcinf_program(ouro_env *env, ouro_v *program)
 
 	if (fast != 0)
 		return fast;
-	fprintf(stderr, "n1-host: gc-infer fallback\n");
+	fe_progress("n1-host: gc-infer fallback\n");
 	return ouro_apply(ouro_apply(g_raw_gc_infer, fuel), program);
 }
 
@@ -5713,7 +5726,7 @@ static ouro_v *gcan_try(ouro_v *program, ouro_v *bodies)
 		out = ouro_ctor(0, 4, pf);
 	}
 	g_gcan_count++;
-	fprintf(stderr, "n1-host: gc-annotate-c functions=%d\n", nfn);
+	fe_progress("n1-host: gc-annotate-c functions=%d\n", nfn);
 	goto cleanup;
 
 fallback:
@@ -5737,7 +5750,7 @@ static ouro_v *gcan_bodies(ouro_env *env, ouro_v *bodies)
 
 	if (fast != 0)
 		return fast;
-	fprintf(stderr, "n1-host: gc-annotate fallback\n");
+	fe_progress("n1-host: gc-annotate fallback\n");
 	return ouro_apply(ouro_apply(g_raw_gc_annotate, program), bodies);
 }
 
@@ -5916,7 +5929,7 @@ static ouro_v *gchk_try(ouro_v *program, ouro_v *bodies)
 	}
 	out = gchk_right();
 	g_gchk_count++;
-	fprintf(stderr, "n1-host: gc-check-c functions=%d\n", nfn);
+	fe_progress("n1-host: gc-check-c functions=%d\n", nfn);
 	goto cleanup;
 
 fallback:
@@ -5937,7 +5950,7 @@ static ouro_v *gchk_bodies(ouro_env *env, ouro_v *bodies)
 
 	if (fast != 0)
 		return fast;
-	fprintf(stderr, "n1-host: gc-check fallback\n");
+	fe_progress("n1-host: gc-check fallback\n");
 	return ouro_apply(ouro_apply(g_raw_gc_check, program), bodies);
 }
 
@@ -5967,6 +5980,40 @@ static ouro_v *pe_byte_check_work(ouro_env *env, ouro_v *work)
 ouro_v *ouro_wrap_pe_run_byte_check(ouro_v *raw)
 {
 	return ouro_clos(pe_byte_check_work, ouro_cons(raw, 0));
+}
+
+/* Retain the complete canonical plan (or typed error), then release symbol
+   index and traversal temporaries before applying patches and writing PE.
+   The curried caller and all four immutable arguments keep their own banks. */
+static ouro_v *pe_plan_fixups_work(ouro_env *env, ouro_v *fixups)
+{
+	ouro_heap_context *context = ouro_heap_context_enter();
+	ouro_v *result = ouro_get(env, 3);
+	int i;
+	for (i = 2; i >= 0; i--)
+		result = ouro_apply(result, ouro_get(env, i));
+	result = ouro_apply(result, fixups);
+	return ouro_heap_context_leave(context, result);
+}
+
+static ouro_v *pe_plan_imports(ouro_env *env, ouro_v *imports)
+{
+	return ouro_clos(pe_plan_fixups_work, ouro_cons(imports, env));
+}
+
+static ouro_v *pe_plan_symbols(ouro_env *env, ouro_v *symbols)
+{
+	return ouro_clos(pe_plan_imports, ouro_cons(symbols, env));
+}
+
+static ouro_v *pe_plan_sections(ouro_env *env, ouro_v *sections)
+{
+	return ouro_clos(pe_plan_symbols, ouro_cons(sections, env));
+}
+
+ouro_v *ouro_wrap_pe_plan_fixups(ouro_v *raw)
+{
+	return ouro_clos(pe_plan_sections, ouro_cons(raw, 0));
 }
 #else
 ouro_v *ouro_wrap_lower_recheck_program(ouro_v *raw)
@@ -6014,6 +6061,11 @@ ouro_v *ouro_wrap_mir_live_facts(ouro_v *raw)
 	return raw;
 }
 
+ouro_v *ouro_wrap_mir_live_summary_step(ouro_v *raw)
+{
+	return raw;
+}
+
 ouro_v *ouro_wrap_codegen_parts(ouro_v *raw)
 {
 	return raw;
@@ -6055,6 +6107,11 @@ ouro_v *ouro_wrap_mir_gc_check(ouro_v *raw)
 }
 
 ouro_v *ouro_wrap_pe_run_byte_check(ouro_v *raw)
+{
+	return raw;
+}
+
+ouro_v *ouro_wrap_pe_plan_fixups(ouro_v *raw)
 {
 	return raw;
 }

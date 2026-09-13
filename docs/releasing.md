@@ -20,6 +20,12 @@ both `.tar.zst` and `.zip` files for:
 The archive names are `ouro-<version>-<platform>.tar.zst` and
 `ouro-<version>-<platform>.zip`. There is no `windows_aarch64` archive.
 
+The packer writes its report before `SHA256SUMS`, which covers all final files
+in the output directory, including the report. Reusing the directory recomputes
+those hashes after replacing its artifacts.
+
+The x86-64 macOS job uses `macos-15-intel`; ARM uses `macos-latest`.
+
 Each archive is a relocatable prefix with repository sources plus the host
 `ouro1` built on that runner (`bin/ouro1` or `bin/ouro1.exe`) and a `bin/ouro`
 wrapper that sets `OURO_ROOT`. A missing compiler fails the platform job; the

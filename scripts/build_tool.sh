@@ -7,6 +7,7 @@ set -eu
 if ! ulimit -s unlimited 2>/dev/null; then
 	echo "BUILD_TOOL: stack limit unchanged" >&2
 fi
+CALLER_DIR=$(pwd)
 ROOT=$(CDPATH='' cd "$(dirname "$0")/.." && pwd)
 cd "$ROOT"
 # shellcheck source=scripts/python.sh
@@ -14,6 +15,14 @@ cd "$ROOT"
 
 ENTRY=${1:?usage: build_tool.sh <entry.ouro> <out-binary> [fuel]}
 OUT=${2:?usage: build_tool.sh <entry.ouro> <out-binary> [fuel]}
+case "$ENTRY" in
+/* | [A-Za-z]:*) ;;
+*) ENTRY="$CALLER_DIR/$ENTRY" ;;
+esac
+case "$OUT" in
+/* | [A-Za-z]:*) ;;
+*) OUT="$CALLER_DIR/$OUT" ;;
+esac
 FUEL=${3:-60000}
 MODE="${OURO_BUILD_TOOL_MODE:-native}"
 PY="${PYTHON:-python3}"

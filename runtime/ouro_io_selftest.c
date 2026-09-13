@@ -5,6 +5,8 @@
 #include "ouro_rt.h"
 
 #include <errno.h>
+#include <limits.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -90,6 +92,117 @@ static ouro_v *string_list_one(const char *text)
 	fields[0] = ouro_str(text);
 	fields[1] = ouro_ctor(0, 0, 0);
 	return ouro_ctor(1, 2, fields);
+}
+
+static unsigned int loop_tests;
+static unsigned int loop_steps;
+
+static ouro_v *loop_condition_run(ouro_env *env, ouro_v *unit)
+{
+	(void)unit;
+	loop_tests++;
+	return ouro_nat(env->v->n > 0 ? 1 : 0);
+}
+
+static ouro_v *loop_condition(ouro_env *env, ouro_v *state)
+{
+	(void)env;
+	return ouro_clos(loop_condition_run, ouro_cons(state, 0));
+}
+
+static ouro_v *loop_step_run(ouro_env *env, ouro_v *unit)
+{
+	(void)unit;
+	loop_steps++;
+	return ouro_nat((unsigned long)env->v->n - 1UL);
+}
+
+static ouro_v *loop_step(ouro_env *env, ouro_v *state)
+{
+	(void)env;
+	return ouro_clos(loop_step_run, ouro_cons(state, 0));
+}
+
+static ouro_v *loop_action(unsigned long initial)
+{
+	ouro_v *action = ouro_apply(ouro_io_prim_req("ouro.runtime.loop"), ouro_nat(initial));
+	action = ouro_apply(action, ouro_clos(loop_condition, 0));
+	return ouro_apply(action, ouro_clos(loop_step, 0));
+}
+
+static ouro_v *runtime_bound_next(ouro_env *env, ouro_v *value)
+{
+	(void)env;
+	return ouro_apply(ouro_io_prim_req("ouro.runtime.pure"), ouro_nat((unsigned long)value->n + 1UL));
+}
+
+static ouro_v *invalid_loop_condition(ouro_env *env, ouro_v *state)
+{
+	(void)env;
+	(void)state;
+	return ouro_apply(ouro_io_prim_req("ouro.runtime.pure"), ouro_nat(256));
+}
+
+static int runtime_operations_check(void)
+{
+	ouro_v *action;
+	ouro_v *result;
+	ouro_v *value;
+	ouro_v *successor;
+	unsigned long n;
+	unsigned long converted;
+	for (n = 0; n <= 257; n++) {
+		result = ouro_apply(ouro_io_prim_req("ouro.u8.from_nat.checked"), ouro_nat(n));
+		if (result->tag != (n <= 255 ? 1 : 0) || result->n != (n <= 255 ? 1 : 0))
+			return fail("checked U8 conversion boundary");
+		if (n <= 255 && (OURO_F(result, 0)->tag != OURO_TAG_NAT || OURO_F(result, 0)->n != (int)n))
+			return fail("checked U8 conversion value");
+	}
+	value = ouro_nat(INT_MAX);
+	successor = ouro_ctor(1, 1, &value);
+	result = ouro_apply(ouro_io_prim_req("ouro.u32.from_nat.checked"), successor);
+	if (result->tag != 1 || result->n != 1 ||
+	    !ouro_nat_to_ulong(OURO_F(result, 0), &converted) || converted != (unsigned long)INT_MAX + 1UL)
+		return fail("checked U32 conversion across signed host boundary");
+	value = ouro_nat(UINT32_MAX);
+	result = ouro_apply(ouro_io_prim_req("ouro.u32.from_nat.checked"), value);
+	if (result->tag != 1 || result->n != 1 ||
+	    !ouro_nat_to_ulong(OURO_F(result, 0), &converted) || converted != UINT32_MAX)
+		return fail("checked U32 maximum");
+	successor = ouro_ctor(1, 1, &value);
+	result = ouro_apply(ouro_io_prim_req("ouro.u32.from_nat.checked"), successor);
+	if (result->tag != 0 || result->n != 0)
+		return fail("checked U32 overflow accepted");
+	result = ouro_apply(ouro_io_prim_req("prim_string_of_nat"), successor);
+	if (!host_bytes_eq(result, "4294967296", 10))
+		return fail("wide Nat string formatting");
+	result = ouro_apply(ouro_io_prim_req("ouro.u32.from_nat.checked"), ouro_str("invalid Nat"));
+	if (result->tag != 0 || result->n != 0)
+		return fail("malformed checked word conversion accepted");
+	result = ouro_apply(ouro_apply(ouro_io_prim_req("ouro.u8.sub.wrap"), ouro_nat(0)), ouro_nat(1));
+	if (result->tag != OURO_TAG_NAT || result->n != 255)
+		return fail("U8 subtraction must wrap");
+	loop_tests = 0;
+	loop_steps = 0;
+	action = loop_action(3);
+	if (loop_tests != 0 || loop_steps != 0)
+		return fail("Runtime loop executed during construction");
+	for (n = 1; n <= 2; n++) {
+		result = ouro_apply(action, ouro_ctor(0, 0, 0));
+		if (result->tag != OURO_TAG_NAT || result->n != 0 || loop_tests != 4 * n || loop_steps != 3 * n)
+			return fail("Runtime loop must recheck, thread state, stop and remain reusable");
+	}
+	action = loop_action(0);
+	result = ouro_apply(action, ouro_ctor(0, 0, 0));
+	if (result->n != 0 || loop_tests != 9 || loop_steps != 6)
+		return fail("zero Runtime loop executed its body");
+	action = ouro_apply(ouro_io_prim_req("ouro.runtime.pure"), ouro_nat(7));
+	action = ouro_apply(ouro_io_prim_req("ouro.runtime.bind"), action);
+	action = ouro_apply(action, ouro_clos(runtime_bound_next, 0));
+	result = ouro_apply(action, ouro_ctor(0, 0, 0));
+	if (result->tag != OURO_TAG_NAT || result->n != 8)
+		return fail("raw Runtime pure/bind result");
+	return 0;
 }
 
 static int json_string_primitive_check(void)
@@ -225,6 +338,86 @@ static int binary_string_equality_check(void)
 	result = ouro_apply(compare, ouro_ctor(OURO_TAG_CAT, 2, chunks));
 	if (result == 0 || result->tag != 0 || result->n != 0)
 		return fail("binary string equality rejected concat representation");
+	return 0;
+}
+
+static int binary_string_concat_check(void)
+{
+	const unsigned char first[] = { 0, 255, 13 };
+	const unsigned char second[] = { 10, 254, 0 };
+	const unsigned char expected[] = { 0, 255, 13, 10, 254, 0 };
+	ouro_v *left[3];
+	ouro_v *right[3];
+	ouro_v *chunks[2];
+	ouro_v *result;
+	int i;
+	int j;
+	left[0] = ouro_packed(first, sizeof first);
+	left[1] = ouro_bytes(first, sizeof first);
+	chunks[0] = ouro_packed(first, 1);
+	chunks[1] = ouro_packed(first + 1, 2);
+	left[2] = ouro_ctor(OURO_TAG_CAT, 2, chunks);
+	right[0] = ouro_packed(second, sizeof second);
+	right[1] = ouro_bytes(second, sizeof second);
+	chunks[0] = ouro_packed(second, 2);
+	chunks[1] = ouro_packed(second + 2, 1);
+	right[2] = ouro_ctor(OURO_TAG_CAT, 2, chunks);
+	for (i = 0; i < 3; i++) {
+		for (j = 0; j < 3; j++) {
+			result = ouro_apply(ouro_apply(ouro_io_prim("prim_string_concat"),
+				left[i]), right[j]);
+			if (!host_bytes_eq(result, (const char *)expected, sizeof expected))
+				return fail("binary string concatenation dropped bytes");
+		}
+		result = ouro_apply(ouro_apply(ouro_io_prim("prim_string_concat"),
+			ouro_str("")), left[i]);
+		if (!host_bytes_eq(result, (const char *)first, sizeof first))
+			return fail("empty left string concatenation dropped bytes");
+		result = ouro_apply(ouro_apply(ouro_io_prim("prim_string_concat"),
+			right[i]), ouro_str(""));
+		if (!host_bytes_eq(result, (const char *)second, sizeof second))
+			return fail("empty right string concatenation dropped bytes");
+	}
+	result = ouro_apply(ouro_apply(ouro_io_prim("prim_string_concat"),
+		ouro_str("hello")), ouro_str(" world"));
+	if (!host_bytes_eq(result, "hello world", 11))
+		return fail("text string concatenation");
+	return 0;
+}
+
+static int binary_string_operations_check(void)
+{
+	const unsigned char payload[] = { 77, 90, 0, 255, 66, 0 };
+	const unsigned char needle[] = { 0, 255 };
+	const unsigned char missing[] = { 0, 128 };
+	ouro_v *text = ouro_packed(payload, sizeof payload);
+	ouro_v *result = ouro_apply(ouro_apply(ouro_io_prim("prim_string_contains"),
+		ouro_str("C:\\bin\\coil.exe")), ouro_packed(payload + 2, 1));
+	if (result == 0 || result->tag != 1 || result->n != 0)
+		return fail("string search confused NUL with an empty pattern");
+	result = ouro_apply(ouro_apply(ouro_io_prim("prim_string_contains"), text),
+		ouro_packed(needle, sizeof needle));
+	if (result == 0 || result->tag != 0 || result->n != 0)
+		return fail("binary string search missed bytes after NUL");
+	result = ouro_apply(ouro_apply(ouro_io_prim("prim_string_contains"), text),
+		ouro_packed(missing, sizeof missing));
+	if (result == 0 || result->tag != 1 || result->n != 0)
+		return fail("binary string search ignored bytes after NUL");
+	result = ouro_apply(ouro_apply(ouro_io_prim("prim_string_contains"), text), ouro_str(""));
+	if (result == 0 || result->tag != 0 || result->n != 0)
+		return fail("empty string search pattern");
+	result = ouro_apply(ouro_apply(ouro_apply(ouro_io_prim("prim_string_slice"), text),
+		ouro_nat(2)), ouro_nat(3));
+	if (!host_bytes_eq(result, (const char *)payload + 2, 3))
+		return fail("binary string slice dropped bytes");
+	result = ouro_apply(ouro_apply(ouro_apply(ouro_io_prim("prim_string_slice"), text),
+		ouro_nat(3)), ouro_nat(99));
+	if (!host_bytes_eq(result, (const char *)payload + 3, 3))
+		return fail("binary string slice did not clamp length");
+	result = ouro_apply(ouro_apply(ouro_apply(ouro_io_prim("prim_string_slice"), text),
+		ouro_nat(sizeof payload)), ouro_nat(1));
+	if (!host_bytes_eq(result, "", 0))
+		return fail("out-of-range string slice");
 	return 0;
 }
 
@@ -490,6 +683,73 @@ static int process_capture_pair_check(const char *executable)
 	return 0;
 }
 
+static int process_arguments_check(void)
+{
+	const char *names[2] = {"prim_proc_exec", "ouro.process.capture"};
+	const char *words[4] = {"%s|%s|%s", "", "arg with spaces", "$()'\";|"};
+	const char *expected = "|arg with spaces|$()'\";|";
+	ouro_v *arguments = ouro_ctor(0, 0, 0);
+	int index;
+	for (index = 3; index >= 0; index--) {
+		ouro_v *parts[2] = {string_list_one(words[index]), arguments};
+		arguments = ouro_ctor(OURO_TAG_CAT, 2, parts);
+	}
+	/* Empty chunks and nesting beyond the string flattener's fixed stack
+	   must neither truncate nor reorder a process argument list. */
+	for (index = 0; index < 160; index++) {
+		ouro_v *parts[2] = {arguments, ouro_ctor(0, 0, 0)};
+		arguments = ouro_ctor(OURO_TAG_CAT, 2, parts);
+	}
+	for (index = 0; index < 2; index++) {
+		ouro_v *action = ouro_apply(ouro_io_prim(names[index]), ouro_str("printf"));
+		ouro_v *result;
+		ouro_v *out;
+		ouro_v *err;
+		action = ouro_apply(action, arguments);
+		result = ouro_apply(action, ouro_ctor(0, 0, 0));
+		if (result == 0 || result->tag != 0 || result->n != (index == 0 ? 3 : 2) ||
+		    OURO_F(result, 0)->tag != OURO_TAG_NAT || OURO_F(result, 0)->n != 0)
+			return fail("concatenated process argument status");
+		out = index == 0 ? OURO_F(result, 1) : OURO_F(OURO_F(result, 1), 0);
+		err = index == 0 ? OURO_F(result, 2) : OURO_F(OURO_F(result, 1), 1);
+		if (!host_bytes_eq(out, expected, strlen(expected)) || !host_bytes_eq(err, "", 0))
+			return fail("concatenated process argument streams");
+		{
+			ouro_v *many = ouro_ctor(0, 0, 0);
+			ouro_v *parts[2];
+			char repeated[65];
+			int word;
+			for (word = 0; word < 64; word++) {
+				parts[0] = ouro_str("x");
+				parts[1] = many;
+				many = ouro_ctor(1, 2, parts);
+				repeated[word] = 'x';
+			}
+			repeated[64] = 0;
+			parts[0] = string_list_one("%s");
+			parts[1] = many;
+			action = ouro_apply(ouro_io_prim(names[index]), ouro_str("printf"));
+			action = ouro_apply(action, ouro_ctor(OURO_TAG_CAT, 2, parts));
+			result = ouro_apply(action, ouro_ctor(0, 0, 0));
+			out = index == 0 ? OURO_F(result, 1) : OURO_F(OURO_F(result, 1), 0);
+			if (OURO_F(result, 0)->tag != OURO_TAG_NAT || OURO_F(result, 0)->n != 0 ||
+			    !host_bytes_eq(out, repeated, 64))
+				return fail("process argument vector growth");
+		}
+		/* A malformed tail must reject the whole launch, even after a valid
+		   printf operand that would otherwise produce output. */
+		{
+			ouro_v *parts[2] = {string_list_one("must-not-run"), ouro_ctor(3, 0, 0)};
+			action = ouro_apply(ouro_io_prim(names[index]), ouro_str("printf"));
+			action = ouro_apply(action, ouro_ctor(OURO_TAG_CAT, 2, parts));
+			result = ouro_apply(action, ouro_ctor(0, 0, 0));
+			if (OURO_F(result, 0)->tag != OURO_TAG_NAT || OURO_F(result, 0)->n != 127)
+				return fail("malformed process arguments launched a child");
+		}
+	}
+	return 0;
+}
+
 static int process_inherit_unavailable_check(void)
 {
 	ouro_v *run = ouro_io_prim("ouro.process.inherit");
@@ -607,6 +867,22 @@ int main(int argc, char **argv)
 		return 7;
 	}
 	ouro_rt_warmup();
+	if (argc == 2 && strcmp(argv[1], "--arguments-only") == 0)
+		return process_arguments_check();
+	if (argc == 2 && strcmp(argv[1], "--runtime-only") == 0)
+		return runtime_operations_check();
+	if (argc == 2 && strcmp(argv[1], "--invalid-u8") == 0) {
+		w = ouro_apply(ouro_io_prim_req("ouro.u8.sub.wrap"), ouro_ctor(0, 0, 0));
+		(void)ouro_apply(w, ouro_nat(1));
+		return fail("invalid U8 subtraction returned");
+	}
+	if (argc == 2 && strcmp(argv[1], "--invalid-loop") == 0) {
+		w = ouro_apply(ouro_io_prim_req("ouro.runtime.loop"), ouro_nat(0));
+		w = ouro_apply(w, ouro_clos(invalid_loop_condition, 0));
+		w = ouro_apply(w, ouro_clos(loop_step, 0));
+		(void)ouro_apply(w, ouro_ctor(0, 0, 0));
+		return fail("invalid Runtime loop condition returned");
+	}
 	if (argc == 2 && strcmp(argv[1], "--bounded-only") == 0)
 		return process_bounded_unavailable_check();
 	if (process_bounded_unavailable_check() != 0)
@@ -620,6 +896,8 @@ int main(int argc, char **argv)
 	if (http_unavailable_check() != 0)
 		return 1;
 	if (process_capture_pair_check(argv[0]) != 0)
+		return 1;
+	if (process_arguments_check() != 0)
 		return 1;
 	if (ouro_io_prim("prim_stdout_write") == 0)
 		return fail("missing prim_stdout_write");
@@ -638,11 +916,17 @@ int main(int argc, char **argv)
 		mkdir(dir, 0777);
 #endif
 	}
+	if (runtime_operations_check() != 0)
+		return 1;
 	if (packed_codes_reverse_check() != 0)
 		return 1;
 	if (binary_file_roundtrip_check() != 0)
 		return 1;
 	if (binary_string_equality_check() != 0)
+		return 1;
+	if (binary_string_concat_check() != 0)
+		return 1;
+	if (binary_string_operations_check() != 0)
 		return 1;
 	if (json_string_primitive_check() != 0)
 		return 1;

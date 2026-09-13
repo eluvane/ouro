@@ -12,6 +12,8 @@ This guide describes the reusable userland capabilities around the core standard
 
 ## Modules
 
+- `std/string_prims.ouro` owns the shared String and string primitive declarations without IO or platform imports. `std/runtime.ouro` imports the same identities, so analyzer and stdlib IO modules can be used together.
+
 - `std/types.ouro` provides the shared `Nat`, `Bool`, `List`, `Pair`, `Maybe`, `Either`, `Ordering`, and `Unit` declarations and their representation identities. `std/prelude.ouro` and `std/data.ouro` retain these types through imports and provide the existing executable helpers.
 - `std/result.ouro` adds Result-style combinators over `Either E A`. `Right` is the success value and `Left` carries a typed error.
 - `std/collections.ouro` adds indexing, filter-map, indexed mapping, chunking, adjacent-pair helpers, deduplication, and collection helpers for `Either` results.
@@ -209,8 +211,8 @@ jsonx_get_string doc "name"
 ```
 
 The base JSON parser caps recursive structure at 128 levels. JSON string
-decoding is a linear, non-recursive runtime primitive, so a large quoted value
-does not build a quadratic chain of slices.
+decoding uses an Ouro byte scanner and a balanced byte builder: work is linear
+and call depth is logarithmic in the string length, including on the C host.
 
 `std/tablex.ouro` adds column validation and reusable transforms:
 

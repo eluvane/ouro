@@ -148,6 +148,7 @@ ensure_collect() {
 		COLLECT="$C_BUILD_DIR/ouro-collect.exe"
 	fi
 	if [ ! -x "$COLLECT" ] || [ -n "$(find "$ROOT/tools/collect.ouro" \
+		"$ROOT/tools/collect_core.ouro" \
 		-newer "$COLLECT" -print -quit 2>/dev/null)" ]; then
 		mkdir -p "$C_BUILD_DIR"
 		# Keep successful bootstrap output out of the check/collect protocol.
@@ -798,7 +799,12 @@ case "$cmd" in
 		BIN="$C_BUILD_DIR/ouro-test"
 		if [ ! -x "$BIN" ] || [ -n "$(find "$ROOT/tools/test" "$ROOT/std/test.ouro" \
 			-newer "$BIN" -print -quit 2>/dev/null)" ]; then
-			sh "$ROOT/scripts/build_tool.sh" tools/test/main.ouro "$BIN" >&2
+			mkdir -p "$C_BUILD_DIR"
+			if ! sh "$ROOT/scripts/build_tool.sh" tools/test/main.ouro "$BIN" \
+				>"$C_BUILD_DIR/ouro-test.build.log" 2>&1; then
+				cat "$C_BUILD_DIR/ouro-test.build.log" >&2
+				exit 1
+			fi
 		fi
 		cd "$OLDPWD_OURO"
 		case "${1:-}" in

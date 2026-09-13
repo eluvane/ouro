@@ -63,9 +63,51 @@ def checker_test_reject (name : String) (items : List FileItem) : CheckerTest :=
     CheckerLaw name (notb (checker_test_accepts result)) (checker_test_verdict result);
 
 def checker_test_infers (sig : List Entry) (term : CoreTerm) : Bool :=
-    match infer checker_test_fuel sig (Nil CoreTerm) term with
-    | Nothing => False
-    | Just _ => True
+    match infer_checked checker_test_fuel sig (Nil CoreTerm) (IGTerm term) with
+    | CheckErr _ => False
+    | CheckOk _ => True
+    end;
+
+-- A failed reduction is not evidence of inequality. Retained boolean laws
+-- now inspect the current checker's typed conversion and cumulativity results.
+def checker_test_conversion (expected : Bool) (fuel : Nat) (sig : List Entry)
+    (left : CoreTerm) (right : CoreTerm) : Bool :=
+    match conv_checked fuel sig left right with
+    | Normalized actual => match expected with | True => actual | False => notb actual end
+    | NormalizeMalformed _ => False
+    | NormalizeExhausted => False
+    end;
+
+def checker_test_cumulative (expected : Bool) (fuel : Nat) (sig : List Entry)
+    (left : CoreTerm) (right : CoreTerm) : Bool :=
+    match cumul_checked fuel sig left right with
+    | CheckOk actual => match expected with | True => actual | False => notb actual end
+    | CheckErr _ => False
+    end;
+
+-- Applying a sort or Pi is malformed, not a successfully normalized
+-- inequality. Require its precise typed fault rather than any failure.
+def checker_test_conversion_nonfunction (fuel : Nat) (sig : List Entry)
+    (left : CoreTerm) (right : CoreTerm) : Bool :=
+    match conv_checked fuel sig left right with
+    | NormalizeMalformed fault => match fault with
+      | NormalizeNonFunction => True
+      | NormalizeCaseBranchCount => False
+      | NormalizeCaseScrutinee => False
+      | NormalizeCaseInductive => False
+      | NormalizeCaseParameters => False
+      | NormalizeCaseConstructor => False
+      | NormalizeCaseArguments => False
+      | NormalizeFixArgument => False
+      | NormalizeFixArity => False
+      | NormalizeUnreducedHead => False
+      | NormalizeStringBytes => False
+      | NormalizeStringArguments => False
+      | NormalizeUnresolvedLiteral => False
+      | NormalizeStringType => False
+      end
+    | Normalized _ => False
+    | NormalizeExhausted => False
     end;
 
 def checker_test_base : List FileItem :=
@@ -251,15 +293,15 @@ def checker_test_recursion_annotation : Bool :=
             ([CLam (CRel 1) (CRel 0)] : List CoreTerm))));
 
 def checker_test_pi_cumulative : Bool :=
-    cumul 100 checker_test_signature
+    checker_test_cumulative True 100 checker_test_signature
       (CPi checker_test_nat (CSort 0)) (CPi checker_test_nat (CSort 1));
 
 def checker_test_pi_domain_invariant : Bool :=
-    notb (cumul 100 checker_test_signature
-      (CPi (CSort 0) (CSort 0)) (CPi (CSort 1) (CSort 0)));
+    checker_test_cumulative False 100 checker_test_signature
+      (CPi (CSort 0) (CSort 0)) (CPi (CSort 1) (CSort 0));
 
 def checker_test_fix_alpha : Bool :=
-    conv 200 checker_test_signature (checker_test_copy 50) (checker_test_copy 51);
+    checker_test_conversion True 200 checker_test_signature (checker_test_copy 50) (checker_test_copy 51);
 
 def checker_test_fix_pair_type : CoreTerm :=
     CPi checker_test_nat (CPi checker_test_nat checker_test_nat);
@@ -272,24 +314,14 @@ def checker_test_fix_pair (name : Nat) (rec_arg : Nat) (arity : Nat) : CoreTerm 
 -- conversion must not count as evidence that two neutral fixpoints differ.
 def checker_test_fix_comparison (expected : Bool) (left : CoreTerm)
     (right : CoreTerm) : Bool :=
-    match conv_checked 200 checker_test_signature left right with
-    | Normalized actual =>
-        match expected, actual with
-        | True, True => True
-        | False, False => True
-        | True, False => False
-        | False, True => False
-        end
-    | NormalizeMalformed _ => False
-    | NormalizeExhausted => False
-    end;
+    checker_test_conversion expected 200 checker_test_signature left right;
 
 def checker_test_eta : Bool :=
     let sig : List Entry :=
       Cons Entry
         (MkEntry 90 (CPi checker_test_nat checker_test_nat) (Nothing CoreTerm))
         checker_test_signature in
-    conv 100 sig (CConst 90)
+    checker_test_conversion True 100 sig (CConst 90)
       (CLam checker_test_nat (CApp (CConst 90) (CRel 0)));
 
 def checker_test_eta_argument : Bool :=
@@ -300,7 +332,7 @@ def checker_test_eta_argument : Bool :=
          ] : List FileItem)) with
     | FRErr _ _ => False
     | FROk sig =>
-        conv 100 sig
+        checker_test_conversion True 100 sig
           (CApp (CConst 91) (CConst 90))
           (CApp (CConst 91)
             (CLam checker_test_nat (CApp (CConst 90) (CRel 0))))
@@ -438,23 +470,27 @@ def checker_core_tests : List CheckerTest :=
     , checker_test_assert "function eta conversion" checker_test_eta
     , checker_test_assert "eta inside a dependent type argument" checker_test_eta_argument
     , checker_test_assert "eta lifts an open neutral under its binder"
-        (conv 100 checker_test_signature (CRel 0)
+        (checker_test_conversion True 100 checker_test_signature (CRel 0)
           (CLam checker_test_nat (CApp (CRel 1) (CRel 0))))
     , checker_test_assert "eta is symmetric for open neutral"
-        (conv 100 checker_test_signature
+        (checker_test_conversion True 100 checker_test_signature
           (CLam checker_test_nat (CApp (CRel 1) (CRel 0))) (CRel 0))
     , checker_test_assert "eta rejects a captured function variable"
-        (notb (conv 100 checker_test_signature (CRel 0)
-          (CLam checker_test_nat (CApp (CRel 0) (CRel 0)))))
+        (checker_test_conversion False 100 checker_test_signature (CRel 0)
+          (CLam checker_test_nat (CApp (CRel 0) (CRel 0))))
     , checker_test_assert "eta rejects sorts as functions"
-        (notb (conv 100 checker_test_signature (CSort 0)
-          (CLam checker_test_nat (CApp (CSort 0) (CRel 0)))))
+        (checker_test_conversion_nonfunction 100 checker_test_signature (CSort 0)
+          (CLam checker_test_nat (CApp (CSort 0) (CRel 0))))
     , checker_test_assert "eta rejects Pi types as functions"
-        (notb (conv 100 checker_test_signature (CPi checker_test_nat checker_test_nat)
+        (checker_test_conversion_nonfunction 100 checker_test_signature (CPi checker_test_nat checker_test_nat)
           (CLam checker_test_nat
-            (CApp (CPi checker_test_nat checker_test_nat) (CRel 0)))))
+            (CApp (CPi checker_test_nat checker_test_nat) (CRel 0))))
     , checker_test_assert "conversion exhaustion rejects"
-        (notb (conv 0 checker_test_signature (CRel 0) (CRel 0)))
+        (match conv_checked 0 checker_test_signature (CRel 0) (CRel 0) with
+         | NormalizeExhausted => True
+         | Normalized _ => False
+         | NormalizeMalformed _ => False
+         end)
     , checker_test_assert "structural equality exhaustion rejects"
         (notb (eqTerm 0 (CRel 0) (CRel 0)))
     , checker_test_assert "lift crosses 200 binders" checker_test_deep_lift

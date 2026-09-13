@@ -3,6 +3,7 @@
 #define OURO_HOST_VALUES_H
 #include "ouro_rt.h"
 #include <string.h>
+#include <stdlib.h>
 
 static inline int list_done(ouro_v *cur)
 {
@@ -20,17 +21,12 @@ static inline int list_done(ouro_v *cur)
 static inline unsigned long as_nat(ouro_v *v)
 {
 	unsigned long n = 0;
-	if (v == 0)
-		return 0;
-	if (v->tag == OURO_TAG_NAT)
+	if (v != 0 && v->tag == OURO_TAG_NAT && v->n >= 0)
 		return (unsigned long)v->n;
-	while (v != 0 && v->tag == 1 && v->n == 1) {
-		n++;
-		v = OURO_F(v, 0);
+	if (v != 0 && !ouro_nat_to_ulong(v, &n)) {
+		fputs("ouro host: Nat does not fit the host operation\n", stderr);
+		exit(1);
 	}
-	/* S over a packed value leaves OURO_TAG_NAT at the end of the chain. */
-	if (v != 0 && v->tag == OURO_TAG_NAT && v->n > 0)
-		n += (unsigned long)v->n;
 	return n;
 }
 

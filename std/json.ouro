@@ -226,9 +226,10 @@ def json_unicode_escape (s : String) (i : Nat) : Pair (Maybe (List Nat)) Nat :=
       match decoded with
       | Nothing => MkPair (Maybe (List Nat)) Nat (Nothing (List Nat)) next
       | Just value =>
-        let high_start : Nat := mul 216 256 in
-        let low_start : Nat := mul 220 256 in
-        let surrogate_end : Nat := mul 224 256 in
+        let byte_base : Nat := mul 16 16 in
+        let high_start : Nat := mul 216 byte_base in
+        let low_start : Nat := mul 220 byte_base in
+        let surrogate_end : Nat := mul 224 byte_base in
         match andb (lebNat high_start value) (ltb_nat value surrogate_end) with
         | False =>
           MkPair (Maybe (List Nat)) Nat (Just (List Nat) (json_scalar_utf8 value)) next
@@ -252,7 +253,7 @@ def json_unicode_escape (s : String) (i : Nat) : Pair (Maybe (List Nat)) Nat :=
                     | False => MkPair (Maybe (List Nat)) Nat (Nothing (List Nat)) low_u
                     | True =>
                       let scalar : Nat :=
-                        add (mul 256 256)
+                        add (mul byte_base byte_base)
                           (add (mul 32 (mul 32 (sub value high_start))) (sub low low_start)) in
                       MkPair (Maybe (List Nat)) Nat
                         (Just (List Nat) (json_scalar_utf8 scalar)) after_low
@@ -266,53 +267,56 @@ def json_unicode_escape (s : String) (i : Nat) : Pair (Maybe (List Nat)) Nat :=
       end
     end;
 
--- Reverse byte accumulation plus one final conversion is linear: no growing
--- concatenations or repeated suffix slicing. Four explicit scanner arguments
--- keep native tail calls eligible even for very large compiler/tool strings.
-def json_string_scan : Nat -> Pair String Nat -> Nat -> List Nat -> Pair (Maybe String) Nat :=
-    fix json_string_scan (fuel : Nat) (input : Pair String Nat) (i : Nat)
-        (acc : List Nat) : Pair (Maybe String) Nat :=
+-- A balanced composition of byte builders keeps both scanning and final list
+-- construction linear without relying on C tail-call optimization.
+-- Arithmetic increments also keep the C host's byte offset compact; repeated
+-- S constructors would make indexed lookup walk a growing Peano chain.
+inductive JsonStringProgress : Type :=
+  | JsonStringMore : Nat -> Nat -> (List Nat -> List Nat) -> JsonStringProgress
+  | JsonStringEnd : Nat -> (List Nat -> List Nat) -> JsonStringProgress
+  | JsonStringError : Nat -> JsonStringProgress;
+
+def json_string_step (fuel : Nat) (input : Pair String Nat) (i : Nat) : JsonStringProgress :=
       match input with
       | MkPair s len =>
         match fuel with
-        | Z => MkPair (Maybe String) Nat (Nothing String) (pred i)
+        | Z => JsonStringError (pred i)
         | S fuel2 =>
           match lebNat len i with
-          | True => MkPair (Maybe String) Nat (Nothing String) (pred i)
+          | True => JsonStringError (pred i)
           | False =>
             let c : Nat := json_ch_at s i in
             match eqNat c 34 with
             | True =>
-              MkPair (Maybe String) Nat
-                (Just String (prim_string_of_char_codes (reverse_lin Nat acc))) (S i)
+              JsonStringEnd (add i 1) (fun (rest : List Nat) => rest)
             | False =>
               match lebNat c 31 with
-              | True => MkPair (Maybe String) Nat (Nothing String) i
+              | True => JsonStringError i
               | False =>
                 match eqNat c 92 with
-                | False => json_string_scan fuel2 input (S i) (Cons Nat c acc)
+                | False => JsonStringMore fuel2 (add i 1) (fun (rest : List Nat) => Cons Nat c rest)
                 | True =>
-                  let escaped : Nat := S i in
+                  let escaped : Nat := add i 1 in
                   match lebNat len escaped with
-                  | True => MkPair (Maybe String) Nat (Nothing String) i
+                  | True => JsonStringError i
                   | False =>
                     match eqNat (json_ch_at s escaped) 117 with
                     | True =>
                       match json_unicode_escape s escaped with
                       | MkPair decoded next =>
                         match decoded with
-                        | Nothing => MkPair (Maybe String) Nat (Nothing String) next
+                        | Nothing => JsonStringError next
                         | Just bytes =>
-                          json_string_scan fuel2 input next (rev_append Nat bytes acc)
+                          JsonStringMore fuel2 next (fun (rest : List Nat) => append Nat bytes rest)
                         end
                       end
                     | False =>
                       match decode_esc s escaped with
-                      | Nothing => MkPair (Maybe String) Nat (Nothing String) escaped
+                      | Nothing => JsonStringError escaped
                       | Just pair =>
                         match pair with
                         | MkPair byte next =>
-                          json_string_scan fuel2 input next (Cons Nat byte acc)
+                          JsonStringMore fuel2 next (fun (rest : List Nat) => Cons Nat byte rest)
                         end
                       end
                     end
@@ -323,6 +327,44 @@ def json_string_scan : Nat -> Pair String Nat -> Nat -> List Nat -> Pair (Maybe 
           end
         end
       end;
+
+def json_string_join (prefix : List Nat -> List Nat) (result : JsonStringProgress) : JsonStringProgress :=
+    match result with
+    | JsonStringError offset => JsonStringError offset
+    | JsonStringEnd next suffix => JsonStringEnd next (fun (rest : List Nat) => prefix (suffix rest))
+    | JsonStringMore fuel next suffix => JsonStringMore fuel next (fun (rest : List Nat) => prefix (suffix rest))
+    end;
+
+def json_string_scan_tree : Nat -> Pair String Nat -> Nat -> Nat -> JsonStringProgress :=
+    fix scan (depth : Nat) (input : Pair String Nat) (fuel : Nat) (i : Nat) : JsonStringProgress :=
+      match depth with
+      | Z => json_string_step fuel input i
+      | S rest =>
+        match scan rest input fuel i with
+        | JsonStringError offset => JsonStringError offset
+        | JsonStringEnd next bytes => JsonStringEnd next bytes
+        | JsonStringMore remaining next prefix => json_string_join prefix (scan rest input remaining next)
+        end
+      end;
+
+def json_string_scan_depth (fuel : Nat) : Nat :=
+    (fix grow (guard : Nat) (span : Nat) (depth : Nat) : Nat :=
+      match guard with
+      | Z => depth
+      | S rest => match lebNat fuel span with
+          | True => depth
+          | False => grow rest (add span span) (S depth)
+          end
+      end) fuel 1 0;
+
+def json_string_scan : Nat -> Pair String Nat -> Nat -> List Nat -> Pair (Maybe String) Nat :=
+    fun (fuel : Nat) => fun (input : Pair String Nat) => fun (i : Nat) => fun (acc : List Nat) =>
+    match json_string_scan_tree (json_string_scan_depth fuel) input fuel i with
+    | JsonStringError offset => MkPair (Maybe String) Nat (Nothing String) offset
+    | JsonStringMore _ next _ => MkPair (Maybe String) Nat (Nothing String) (pred next)
+    | JsonStringEnd next bytes => MkPair (Maybe String) Nat
+        (Just String (prim_string_of_char_codes (rev_append Nat acc (bytes (Nil Nat))))) next
+    end;
 
 -- Entry must point at the opening quote. Success points past the closing
 -- quote. Existing errors retain their byte offsets, including the last

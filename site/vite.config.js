@@ -7,6 +7,9 @@ const base = process.env.SITE_BASE || '/ouro/';
 export default {
   base,
   appType: 'mpa',
+  server: {
+    host: true,
+  },
   plugins: [jqhtml()],
   build: {
     rollupOptions: {

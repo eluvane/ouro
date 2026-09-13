@@ -45,9 +45,10 @@ core typechecks with up to `OURO_JOBS` workers on Windows (at most 10). Per-file
 statuses, and logs are recorded under `_build/analyze_precision/core/`. The
 pool has a 3 GiB Windows Job limit; POSIX keeps sequential checks bounded by
 `rlimit`. Analyzer cores that only need string primitives import
-`tools/analyze/string_prims.ouro` instead of `std/runtime.ouro` so the check
-cone stays off the Windows platform modules. Analyzer runs and golden
-comparisons remain sequential.
+`std/string_prims.ouro` instead of `std/runtime.ouro` so the check
+cone stays off the Windows platform modules. Integration fixtures can also
+import stdlib IO: both paths share the same String declarations. Analyzer runs
+and golden comparisons remain sequential.
 
 `analyze` operates over repository facts and optional deeper families. `lint`
 parses individual modules and applies compiler lint rules without a source-size

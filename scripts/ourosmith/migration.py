@@ -144,7 +144,7 @@ def external_evidence(directory):
                     and row.get("status") == "pass" and type(row.get("returncode")) is int and row["returncode"] == 0
                     and isinstance(row.get("log"), str) and (ROOT / row["log"]).resolve() == log and log.is_file()):
                 result.add("external/ci/" + gate.name)
-        if "external/ci/compiler-checking" in result:
+        if all(f"external/ci/compiler-checking-{index}" in result for index in range(1, 9)):
             result.update(compiler_strategies(directory))
     # Retiring an unrepresentable legacy API is a separate claim from passing
     # semantic laws. Credit requires both its removal and the current owners.

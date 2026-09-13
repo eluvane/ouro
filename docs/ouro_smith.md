@@ -134,6 +134,11 @@ inherited hard stack limits.
 These resource controls are not filesystem access controls. The generated
 programs and recipes are repository-owned code.
 
+Compiler preparation, including the complete strict check and build of native
+law drivers, uses the same 3072 MiB limit as tool preparation. Generated program
+execution retains the configured `--memory-mb` limit; preparation failures
+remain fatal.
+
 Build parallelism follows `OURO_JOBS` (default 10), capped by the runner's
 available CPUs so independent deadlines do not depend on oversubscription.
 Import/cache properties
@@ -144,10 +149,10 @@ in seed or recipe order. Recipes that invoke wrappers with shared build
 outputs run serially after the independent recipes.
 The analyzer line scanner also runs serially so its large dependency graph
 does not compete with other compilation tasks. Its typecheck and compilation
-phases use three times `--timeout` (60 seconds by default) because they import
-the full analyzer/frontend graph. The generated program retains the ordinary
-runtime deadline. Command logs record each phase's deadline, duration, and
-peak memory.
+phases, and those of the stdlib and IO integration recipes, use three times
+`--timeout` (60 seconds by default) for their complete dependency graphs.
+Generated programs retain the ordinary runtime deadline. Command logs record
+each phase's deadline, duration, and peak memory.
 
 The harness self-test exercises actual memory exhaustion and descendant
 termination, protocol validation, saved-input replay, and failure reporting.

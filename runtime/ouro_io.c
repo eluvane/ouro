@@ -214,17 +214,12 @@ static ouro_v *v_just(ouro_v *x)
 static unsigned long nat_u(ouro_v *v)
 {
 	unsigned long n = 0;
-	if (v != 0 && v->tag == OURO_TAG_NAT)
-		return v->n < 0 ? 0UL : (unsigned long)v->n;
-	while (v != 0 && v->tag == 1 && v->n == 1) {
-		n++;
-		v = OURO_F(v, 0);
-		if (n > 1000000UL)
-			break;
+	if (v != 0 && v->tag == OURO_TAG_NAT && v->n >= 0)
+		return (unsigned long)v->n;
+	if (v != 0 && !ouro_nat_to_ulong(v, &n)) {
+		fputs("ouro run: Nat does not fit the host operation\n", stderr);
+		exit(70);
 	}
-	/* S applied to a packed value ends the chain on OURO_TAG_NAT. */
-	if (v != 0 && v->tag == OURO_TAG_NAT && v->n > 0)
-		n += (unsigned long)v->n;
 	return n;
 }
 
@@ -346,7 +341,7 @@ static char *codes_to_cstr(ouro_v *xs, unsigned long *len_out)
 				}
 				buf = grown;
 			}
-			buf[n++] = (char)(nat_u(OURO_F(xs, 0)) & 0xFFUL);
+			buf[n++] = (char)(ouro_nat_low32(OURO_F(xs, 0)) & 0xFFU);
 			xs = OURO_F(xs, 1);
 			continue;
 		}
@@ -412,6 +407,79 @@ static ouro_v *f_io_bind_ma(ouro_env *env, ouro_v *ma)
 {
 	(void)env;
 	return ouro_clos(f_io_bind_f, ouro_cons(ma, 0));
+}
+
+/* Checked word construction for the raw Runtime operations used by the
+   standard library. Words use packed cells; they are not Peano naturals. */
+static ouro_v *word_from_nat(ouro_v *value, uint32_t limit)
+{
+	unsigned long count;
+	if (!ouro_nat_to_ulong(value, &count) || count > limit)
+		return v_nothing();
+	return v_just(ouro_nat(count));
+}
+
+static ouro_v *f_u8_from_nat(ouro_env *env, ouro_v *value)
+{
+	(void)env;
+	return word_from_nat(value, UINT8_MAX);
+}
+
+static ouro_v *f_u32_from_nat(ouro_env *env, ouro_v *value)
+{
+	(void)env;
+	return word_from_nat(value, UINT32_MAX);
+}
+
+static unsigned long word8_value(ouro_v *value)
+{
+	if (value == 0 || value->tag != OURO_TAG_NAT ||
+	    value->n < 0 || value->n > UINT8_MAX) {
+		fputs("ouro run: invalid U8 runtime value\n", stderr);
+		exit(70);
+	}
+	return (unsigned long)value->n;
+}
+
+static ouro_v *f_u8_sub_right(ouro_env *env, ouro_v *right)
+{
+	return ouro_nat((word8_value(env->v) - word8_value(right)) & UINT8_MAX);
+}
+
+static ouro_v *f_u8_sub(ouro_env *env, ouro_v *left)
+{
+	(void)env;
+	return ouro_clos(f_u8_sub_right, ouro_cons(left, 0));
+}
+
+static ouro_v *runtime_loop_run(ouro_env *env, ouro_v *unit)
+{
+	ouro_v *state = ouro_get(env, 2);
+	ouro_v *condition = ouro_get(env, 1);
+	ouro_v *step = ouro_get(env, 0);
+	(void)unit;
+	for (;;) {
+		ouro_v *test = ouro_apply(ouro_apply(condition, state), v_unit());
+		if (word8_value(test) == 0)
+			return state;
+		state = ouro_apply(ouro_apply(step, state), v_unit());
+	}
+}
+
+static ouro_v *f_runtime_loop_step(ouro_env *env, ouro_v *step)
+{
+	return thunk(runtime_loop_run, ouro_cons(step, env));
+}
+
+static ouro_v *f_runtime_loop_condition(ouro_env *env, ouro_v *condition)
+{
+	return ouro_clos(f_runtime_loop_step, ouro_cons(condition, env));
+}
+
+static ouro_v *f_runtime_loop(ouro_env *env, ouro_v *initial)
+{
+	(void)env;
+	return ouro_clos(f_runtime_loop_condition, ouro_cons(initial, 0));
 }
 
 static ouro_v *stream_write_run(FILE *out, ouro_env *env, ouro_v *u)
@@ -885,24 +953,29 @@ static ouro_v *f_time(ouro_env *env, ouro_v *u)
 
 static ouro_v *str_concat(ouro_env *env, ouro_v *b)
 {
-	char *as = cstr_of(env->v);
-	char *bs = cstr_of(b);
-	size_t n;
+	unsigned long an = 0;
+	unsigned long bn = 0;
+	char *as = codes_to_cstr(env->v, &an);
+	char *bs = codes_to_cstr(b, &bn);
 	char *out;
 	ouro_v *r;
-	n = (as ? strlen(as) : 0) + (bs ? strlen(bs) : 0);
-	out = (char *)malloc(n + 1UL);
+	if (as == 0 || bs == 0 || an > (unsigned long)INT_MAX ||
+	    bn > (unsigned long)INT_MAX - an) {
+		free(as);
+		free(bs);
+		fputs("ouro run: string concatenation exceeds host capacity\n", stderr);
+		exit(70);
+	}
+	out = (char *)malloc(an + bn + 1UL);
 	if (out == 0) {
 		free(as);
 		free(bs);
-		return owned_str("");
+		fputs("ouro run: string concatenation allocation failed\n", stderr);
+		exit(70);
 	}
-	out[0] = 0;
-	if (as)
-		strcat(out, as);
-	if (bs)
-		strcat(out, bs);
-	r = owned_str(out);
+	memcpy(out, as, an);
+	memcpy(out + an, bs, bn);
+	r = ouro_packed((const unsigned char *)out, an + bn);
 	free(out);
 	free(as);
 	free(bs);
@@ -1112,9 +1185,28 @@ static ouro_v *f_str_ends(ouro_env *env, ouro_v *s)
 
 static ouro_v *str_contains_run(ouro_env *env, ouro_v *pat_v)
 {
-	char *s = cstr_of(env->v);
-	char *pat = cstr_of(pat_v);
-	int ok = s != 0 && pat != 0 && strstr(s, pat) != 0;
+	unsigned long size = 0;
+	unsigned long width = 0;
+	unsigned long index;
+	char *s = codes_to_cstr(env->v, &size);
+	char *pat = codes_to_cstr(pat_v, &width);
+	int ok = 0;
+	if (s == 0 || pat == 0) {
+		free(s);
+		free(pat);
+		fputs("ouro run: string search allocation failed\n", stderr);
+		exit(70);
+	}
+	if (width == 0)
+		ok = 1;
+	else if (width <= size) {
+		for (index = 0; index <= size - width; index++) {
+			if (memcmp(s + index, pat, width) == 0) {
+				ok = 1;
+				break;
+			}
+		}
+	}
 	free(s);
 	free(pat);
 	return v_bool(ok);
@@ -1309,23 +1401,23 @@ static ouro_v *f_str_tokens(ouro_env *env, ouro_v *s_v)
 
 static ouro_v *str_slice_run(ouro_env *env, ouro_v *len_v)
 {
-	/* env = [start, s]; out-of-range start or length clamps to "". */
-	char *s = cstr_of(ouro_get(env, 1));
+	/* env = [start, s]; an overlong slice ends at the final byte. */
+	unsigned long have = 0;
+	char *s = codes_to_cstr(ouro_get(env, 1), &have);
 	unsigned long start = nat_u(ouro_get(env, 0));
 	unsigned long want = nat_u(len_v);
-	unsigned long have;
 	ouro_v *r;
-	if (s == 0)
-		return owned_str("");
-	have = (unsigned long)strlen(s);
+	if (s == 0) {
+		fputs("ouro run: string slice allocation failed\n", stderr);
+		exit(70);
+	}
 	if (start >= have) {
 		free(s);
 		return owned_str("");
 	}
 	if (want > have - start)
 		want = have - start;
-	s[start + want] = 0;
-	r = owned_str(s + start);
+	r = ouro_packed((const unsigned char *)s + start, want);
 	free(s);
 	return r;
 }
@@ -1343,10 +1435,8 @@ static ouro_v *f_str_slice(ouro_env *env, ouro_v *s)
 
 static ouro_v *f_str_of_nat(ouro_env *env, ouro_v *n)
 {
-	char buf[32];
 	(void)env;
-	snprintf(buf, sizeof buf, "%lu", nat_u(n));
-	return owned_str(buf);
+	return ouro_nat_decimal(n);
 }
 
 static ouro_v *f_str_to_codes(ouro_env *env, ouro_v *s)
@@ -1770,40 +1860,75 @@ static char *copy_string(const char *s)
 
 static char **proc_argv_of(char *cmd, ouro_v *args, size_t *argc_out)
 {
-	ouro_v *scan = args;
-	size_t count = 0;
+	ouro_env *pending = 0;
+	size_t capacity = 16;
 	size_t i = 1;
 	size_t j;
 	char **argv;
 	*argc_out = 0;
 	if (cmd == 0)
 		return 0;
-	while (scan != 0 && scan->tag == 1 && scan->n == 2) {
-		count++;
-		scan = OURO_F(scan, 1);
-	}
-	argv = (char **)calloc(count + 2U, sizeof(char *));
+	argv = (char **)calloc(capacity, sizeof *argv);
 	if (argv == 0) {
 		free(cmd);
 		return 0;
 	}
 	argv[0] = cmd;
-	while (args != 0 && args->tag == 1 && args->n == 2) {
+	/* append is represented by concat nodes for every List element type.
+	   Traverse its complete spine before launching, including concat tails. */
+	for (;;) {
+		if (args == 0)
+			goto fail;
+		if (args->tag == OURO_TAG_CAT && args->n == 2) {
+			ouro_env *node = (ouro_env *)malloc(sizeof *node);
+			if (node == 0)
+				goto fail;
+			node->v = OURO_F(args, 1);
+			node->next = pending;
+			pending = node;
+			args = OURO_F(args, 0);
+			continue;
+		}
+		if (args->tag == 0 && args->n == 0) {
+			ouro_env *node = pending;
+			if (node == 0)
+				break;
+			args = node->v;
+			pending = node->next;
+			free(node);
+			continue;
+		}
+		if (args->tag != 1 || args->n != 2)
+			goto fail;
+		if (i == capacity - 1U) {
+			char **grown;
+			if (capacity > SIZE_MAX / sizeof *argv / 2U)
+				goto fail;
+			capacity *= 2U;
+			grown = (char **)realloc(argv, capacity * sizeof *argv);
+			if (grown == 0)
+				goto fail;
+			argv = grown;
+		}
 		argv[i] = cstr_of(OURO_F(args, 0));
 		if (argv[i] == 0)
-			argv[i] = copy_string("");
-		if (argv[i] == 0) {
-			for (j = 0; j < i; j++)
-				free(argv[j]);
-			free(argv);
-			return 0;
-		}
+			goto fail;
 		i++;
 		args = OURO_F(args, 1);
 	}
 	argv[i] = 0;
 	*argc_out = i;
 	return argv;
+fail:
+	while (pending != 0) {
+		ouro_env *node = pending;
+		pending = node->next;
+		free(node);
+	}
+	for (j = 0; j < i; j++)
+		free(argv[j]);
+	free(argv);
+	return 0;
 }
 
 static void proc_argv_free(char **argv, size_t argc)
@@ -2282,6 +2407,18 @@ ouro_v *ouro_io_prim(const char *name)
 
 static ouro_v *io_prim_new(const char *name)
 {
+	if (strcmp(name, "ouro.runtime.pure") == 0)
+		return ouro_clos(f_io_pure, 0);
+	if (strcmp(name, "ouro.runtime.bind") == 0)
+		return ouro_clos(f_io_bind_ma, 0);
+	if (strcmp(name, "ouro.runtime.loop") == 0)
+		return ouro_clos(f_runtime_loop, 0);
+	if (strcmp(name, "ouro.u8.from_nat.checked") == 0)
+		return ouro_clos(f_u8_from_nat, 0);
+	if (strcmp(name, "ouro.u32.from_nat.checked") == 0)
+		return ouro_clos(f_u32_from_nat, 0);
+	if (strcmp(name, "ouro.u8.sub.wrap") == 0)
+		return ouro_clos(f_u8_sub, 0);
 	if (strcmp(name, "io_pure") == 0)
 		return ouro_clos(f_io_pure, 0);
 	if (strcmp(name, "io_bind") == 0)

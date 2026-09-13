@@ -27,7 +27,7 @@ import tempfile
 import zipfile
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import BinaryIO, Optional, Sequence
+from typing import Any, BinaryIO, Optional, Sequence
 from unittest.mock import patch
 
 import ouro_seal
@@ -706,6 +706,14 @@ def write_sha256sums(out: Path) -> list[tuple[str, str]]:
     return sums
 
 
+def write_package_report(out: Path, report: dict[str, Any]) -> list[tuple[str, str]]:
+    path = out / "release-package-report.json"
+    artifacts = {p.name for p in out.iterdir() if p.is_file() and p.name != "SHA256SUMS"}
+    report["artifacts"] = sorted(artifacts | {path.name})
+    write_json_atomic(path, report)
+    return write_sha256sums(out)
+
+
 def manifest_version_in(out: Path) -> str:
     matches = sorted(out.glob(f"{PACKAGE_NAME}-*-release-manifest.json"))
     if len(matches) != 1:
@@ -824,6 +832,21 @@ def run_self_tests() -> None:
     version_self_tests()
     self_test_root = ROOT / "_build"
     self_test_root.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="ouro-release-report-selftest-", dir=self_test_root) as directory:
+        out = Path(directory)
+        archive = out / "toolchain.zip"
+        (out / "directory").mkdir()
+        for payload in (b"first archive", b"updated archive"):
+            archive.write_bytes(payload)
+            sums = write_package_report(out, {"pass": True, "archive_bytes": len(payload)})
+            names = [name for _, name in sums]
+            if names != ["release-package-report.json", "toolchain.zip"]:
+                raise SystemExit("release package self-test: incomplete report checksum inventory")
+            if any(digest != sha256_file(out / name) for digest, name in sums):
+                raise SystemExit("release package self-test: stale checksum after report publication")
+            expected = "".join(f"{digest}  {name}\n" for digest, name in sums)
+            if (out / "SHA256SUMS").read_text(encoding="utf-8") != expected:
+                raise SystemExit("release package self-test: checksum file differs from final artifacts")
     with tempfile.TemporaryDirectory(
         prefix="ouro-release-file-selftest-", dir=self_test_root
     ) as d:
@@ -929,7 +952,7 @@ def run_self_tests() -> None:
     toolchain_self_tests()
     print(
         "RELEASE_PACKAGE_SELF_TEST: PASS versions=11 tracked_links=5 "
-        "archive_formats=2 reparse=1 changelog_cut=4 toolchains=6"
+        "archive_formats=2 reparse=1 changelog_cut=4 toolchains=6 report_checksums=2"
     )
 
 
@@ -1303,8 +1326,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if platform is not None and compiler is not None:
             pack_toolchain(out, version, platform, compiler, files)
 
-    sums = write_sha256sums(out)
-
     report = {
         "kind": REPORT_KIND,
         "pass": True,
@@ -1315,9 +1336,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "dirty": dirty,
         "file_count": len(files),
         "platform": platform,
-        "artifacts": [name for _, name in sums],
     }
-    write_json_atomic(out / "release-package-report.json", report)
+    sums = write_package_report(out, report)
     print(
         f"RELEASE_PACKAGE: PASS version={version} files={len(files)} "
         f"out={rel(out)} check_only={int(args.check)} platform={platform or '-'}"

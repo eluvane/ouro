@@ -112,6 +112,7 @@ class Symbol:
     tree: ast.AST | None = None
     classifications: list[dict] = field(default_factory=list)
     bindings: tuple[str, ...] = ()
+    token_lines: tuple[int, ...] = ()
 
     @property
     def key(self):
@@ -371,7 +372,7 @@ def lexical_symbols(path, source):
                               language, kind, ts, normalize(ts, name, bound), refs,
                               call_names(body, bound), public, wrapper,
                               tuple(x for x in body if x in CONTROL), classifications=marks,
-                              bindings=tuple(bound)))
+                              bindings=tuple(bound), token_lines=tuple(t.line for t in tokens[start:end])))
         if language in {'c', 'h'}:
             # Declarations and argument names are not call operations.
             symbols[-1].calls = tuple(value for i, value in enumerate(body[:-1])
@@ -817,7 +818,20 @@ def fallback_findings(symbols):
             for i, lexeme in enumerate(values):
                 if lexeme != "||":
                     continue
-                alternate = values[i + 1:i + 9]
+                # A shell newline ends the right-hand command. Do not mistake
+                # unconditional cleanup/verification on the next line for a
+                # backend selected by failure. Braced groups and explicit
+                # continuations still belong to the same alternate.
+                alternate, depth = [], 0
+                for j in range(i + 1, len(values)):
+                    value = values[j]
+                    if alternate and depth == 0 and (
+                            value in {";", "&&", "||", "}"}
+                            or (s.token_lines[j] != s.token_lines[j - 1] and values[j - 1] != "\\")):
+                        break
+                    alternate.append(value)
+                    depth += value in {"{", "${"}
+                    depth -= value == "}"
                 if any(re.search(r"(?:legacy|compat|fallback|\.py)", x) for x in alternate):
                     findings.append(make_finding("STRUCT_PARALLEL_BACKEND_FALLBACK", [s],
                         {"primary": values[max(0, i - 8):i], "alternate": alternate},

@@ -125,29 +125,63 @@ class CompilerEvidenceTests(EvidenceTreeTests):
     def test_ci_credit_requires_its_exact_required_command_and_log(self):
         from ci_gate import REPORT_KIND, gates
 
-        gate = next(row for row in gates() if row.name == 'compiler-checking')
+        required = [gate for gate in gates() if gate.name.startswith('compiler-checking-')]
         out = self.root / 'validation'
         summary_path = out / 'ci/ci-summary.json'
         summary_path.parent.mkdir(parents=True)
-        row = {'name': gate.name, 'blocking': True, 'status': 'pass', 'returncode': 0,
-               'command': gate.cmd, 'log': str(out / 'ci/compiler-checking/gate.log')}
-        summary = {'kind': REPORT_KIND, 'profile': 'pr', 'group': 'all', 'gates': [row]}
+        rows = [{'name': gate.name, 'blocking': True, 'status': 'pass', 'returncode': 0,
+                 'command': gate.cmd, 'log': str(out / 'ci' / gate.name / 'gate.log')} for gate in required]
+        summary = {'kind': REPORT_KIND, 'profile': 'pr', 'group': 'all', 'gates': rows}
+        inventory = ['tests/compiler_suite_contract_tests.ouro', 'tests/compiler_property_tests.ouro',
+                     'tests/compiler_abi_tests.ouro', 'tests/compiler_check_tests.ouro',
+                     'tests/compiler_driver_tests.ouro', 'tests/compiler_fault_tests.ouro',
+                     'tests/compiler_module_tests.ouro', 'tests/compiler_positive_tests.ouro']
+        receipts = {f'{index}/8': {'inventory': inventory.copy(), 'runner_build_key': 'current',
+                                  'runner_sha256': 'current', 'artifacts': [{'entry': entry}]}
+                    for index, entry in enumerate(inventory, 1)}
         with patch('ourosmith.host.binary', return_value=self.root / 'compiler'), \
-             patch.object(evidence, 'suite_receipt', return_value={'artifacts': []}) as observed:
+             patch.object(evidence, 'suite_receipt', side_effect=lambda _log, _compiler, shard: receipts[shard]) as observed:
             summary_path.write_text(json.dumps(summary), encoding='utf-8')
-            self.assertEqual(evidence.ci_compiler_receipt(out)['artifacts'], [])
-            observed.assert_called_once()
-            for key, value in [('blocking', False), ('status', 'skip'), ('returncode', True),
-                               ('returncode', 1), ('command', ['unrelated']), ('log', 'elsewhere')]:
-                changed = deepcopy(summary)
-                changed['gates'][0][key] = value
-                summary_path.write_text(json.dumps(changed), encoding='utf-8')
-                with self.subTest(key=key), self.assertRaises(ValueError):
-                    evidence.ci_compiler_receipt(out)
-            for rows in ([], [row, row], [None]):
-                summary_path.write_text(json.dumps({**summary, 'gates': rows}), encoding='utf-8')
+            self.assertEqual([row['entry'] for row in evidence.ci_compiler_receipt(out)['artifacts']], inventory)
+            self.assertEqual([call.kwargs['shard'] for call in observed.call_args_list], [f'{index}/8' for index in range(1, 9)])
+            for index in range(8):
+                for key, value in [('blocking', False), ('status', 'skip'), ('returncode', True),
+                                   ('returncode', 1), ('command', ['unrelated']), ('log', 'elsewhere'), ('log', None)]:
+                    changed = deepcopy(summary)
+                    changed['gates'][index][key] = value
+                    summary_path.write_text(json.dumps(changed), encoding='utf-8')
+                    with self.subTest(shard=index, key=key), self.assertRaises(ValueError):
+                        evidence.ci_compiler_receipt(out)
+            for changed_rows in ([], rows[:-1], [*rows, rows[0]], [None]):
+                summary_path.write_text(json.dumps({**summary, 'gates': changed_rows}), encoding='utf-8')
                 with self.assertRaises(ValueError):
                     evidence.ci_compiler_receipt(out)
+            summary_path.write_text(json.dumps(summary), encoding='utf-8')
+            for key, value in [('inventory', inventory[:-1]), ('runner_build_key', 'stale'),
+                               ('runner_sha256', 'stale'), ('artifacts', []),
+                               ('artifacts', [{'entry': inventory[0]}])]:
+                original = receipts['8/8'][key]
+                receipts['8/8'][key] = value
+                with self.assertRaises(ValueError):
+                    evidence.ci_compiler_receipt(out)
+                receipts['8/8'][key] = original
+
+    def test_shard_receipt_requires_exact_selection_from_full_current_inventory(self):
+        selected = RunResult('ok', 0, 'tests/compiler_property_tests.ouro\n', '', 0.1, 10)
+        self.log.write_text('COMPILER_CHECK_OK compiler_property-run\n'
+                            'COMPILER_CHECK_SUITE: PASS rows=1 out=' + self.directory.as_posix() + '\n', encoding='utf-8')
+        self.execute.side_effect = [self.listed, selected]
+        receipt = evidence.suite_receipt(self.log, self.root / 'compiler', shard='2/8')
+        self.assertEqual(receipt['inventory'], self.listed.stdout.splitlines())
+        self.assertEqual([row['entry'] for row in receipt['artifacts']], selected.stdout.splitlines())
+        self.assertEqual(self.execute.call_args.args[0][-1], '--shard=2/8')
+        for field, value in [('status', 'timeout'), ('returncode', 1), ('stderr', 'failure'),
+                             ('stdout', ''), ('stdout', self.listed.stdout), ('stdout', selected.stdout * 2)]:
+            changed = deepcopy(selected)
+            setattr(changed, field, value)
+            self.execute.side_effect = [self.listed, changed]
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                evidence.suite_receipt(self.log, self.root / 'compiler', shard='2/8')
 
 
 class ExternalEvidenceTests(EvidenceTreeTests):
@@ -165,7 +199,7 @@ class ExternalEvidenceTests(EvidenceTreeTests):
         self.enterContext(patch('ourosmith.provenance.source_state', return_value={'source': 'current'}))
         self.commands = [('ci', ['ci', '--required']), ('dune', ['dune', '--historical'])]
         self.enterContext(patch('ourosmith.validation.commands', return_value=self.commands))
-        self.gates = [gate for gate in gates() if gate.name in ('compiler-checking', 'compiler-boundary')]
+        self.gates = [gate for gate in gates() if gate.name.startswith('compiler-checking-') or gate.name == 'compiler-boundary']
         self.enterContext(patch.object(migration, 'gates', return_value=self.gates))
         self.owners = {'external/compiler/' + name for name in migration.contracts.CURRENT_COMPILER_OWNERS}
         self.compiler = self.enterContext(patch.object(evidence, 'compiler_strategies', return_value=self.owners))
@@ -253,7 +287,7 @@ class ExternalEvidenceTests(EvidenceTreeTests):
             self.assertNotIn('external/ci/' + gate.name, self.read())
         self.summary = original
         self.write()
-        (self.out / 'ci/compiler-checking/gate.log').unlink()
+        (self.out / 'ci/compiler-checking-1/gate.log').unlink()
         self.assertFalse(self.owners & self.read())
 
     def test_stale_compiler_receipt_cannot_supply_credits(self):

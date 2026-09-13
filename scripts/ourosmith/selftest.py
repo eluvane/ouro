@@ -195,10 +195,14 @@ class HarnessTests(unittest.TestCase):
                 delegate.assert_not_called()
 
     def test_large_recipe_keeps_runtime_deadline(self):
-        from ourosmith.surface.analyzer_lines import program, run_checks
+        from ourosmith.surface.analyzer_lines import program, run_checks as analyzer_checks
+        from ourosmith.surface.library import run_expressions
         from ourosmith.surface.run import StepFailure, SurfaceRunner
 
-        expected = program(1)[1]
+        recipes = ((program(1)[1], analyzer_checks),
+                   ("saved\n", lambda run, directory: run_expressions(
+                       run, directory, "stdlib_protocols", [('"saved"', "saved")], ["std/json.ouro"], "stdlib-protocols")))
+        expected = ""
         hanging = False
         calls = []
 
@@ -218,16 +222,20 @@ class HarnessTests(unittest.TestCase):
              patch("ourosmith.surface.run.run_limited", side_effect=execute):
             runner = SurfaceRunner(report(), Path(directory), [1], timeout=20)
             runner.seed, runner.cc = 1, "cc"
-            run_checks(runner, Path(directory))
-            self.assertEqual(calls, [("check", 60), ("emit-c", 60), ("native-compile", 60), ("native-run", 20)])
-            self.assertEqual(runner.timeout, 20)
-            with self.assertRaises(StepFailure) as ordinary:
-                runner.check(Path(directory) / "main.ouro", artifact=False)
-            self.assertEqual(ordinary.exception.classification, "timeout")
-            hanging = True
-            with self.assertRaises(StepFailure) as runtime:
+            for recipe_expected, run_checks in recipes:
+                expected = recipe_expected
+                calls.clear()
+                hanging = False
                 run_checks(runner, Path(directory))
-            self.assertEqual((runtime.exception.prop, runtime.exception.classification), ("native-run", "timeout"))
+                self.assertEqual(calls, [("check", 60), ("emit-c", 60), ("native-compile", 60), ("native-run", 20)])
+                self.assertEqual(runner.timeout, 20)
+                with self.assertRaises(StepFailure) as ordinary:
+                    runner.check(Path(directory) / "main.ouro", artifact=False)
+                self.assertEqual(ordinary.exception.classification, "timeout")
+                hanging = True
+                with self.assertRaises(StepFailure) as runtime:
+                    run_checks(runner, Path(directory))
+                self.assertEqual((runtime.exception.prop, runtime.exception.classification), ("native-run", "timeout"))
 
     def test_analyzer_core_pool_uses_platform_memory_policy(self):
         import analyze_core_checks as checks
@@ -611,6 +619,8 @@ class HarnessTests(unittest.TestCase):
         self.assertEqual(native.call_args.kwargs["stdin"], saved["stdin"])
         self.assertEqual(native.call_args.kwargs["arguments"], saved["arguments"])
         self.assertEqual(native.call_args.kwargs["env"]["OURO_SMITH_VALUE"], saved["env_value"])
+        self.assertEqual(checked.call_args.kwargs["timeout"], 60)
+        self.assertEqual(native.call_args.kwargs["compile_timeout"], 60)
 
     def test_msvc_environment_is_local_and_fail_closed(self):
         import c_static_analysis_suite as gate

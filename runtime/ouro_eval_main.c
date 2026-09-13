@@ -32,6 +32,10 @@ static void print_nat(ouro_v *v)
 			return;
 		}
 	}
+	if (cur != 0 && cur->tag == OURO_TAG_BIG_NAT) {
+		fputs("<nat-too-large>", stdout);
+		return;
+	}
 	if (cur != 0 && cur->tag == OURO_TAG_NAT) {
 		if (cur->n < 0 || cur->n > 100000 - depth) {
 			fputs("<nat-too-large>", stdout);
@@ -77,7 +81,7 @@ int main(void)
 		fputs("<fun>\n", stdout);
 		return 0;
 	}
-	if (v->tag == OURO_TAG_NAT || is_z(v) || is_s(v)) {
+	if (v->tag == OURO_TAG_NAT || v->tag == OURO_TAG_BIG_NAT || is_z(v) || is_s(v)) {
 		print_nat(v);
 		fputs(" : Nat\n", stdout);
 		return 0;

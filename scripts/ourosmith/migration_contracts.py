@@ -35,7 +35,7 @@ def retained(*names):
 
 CURRENT_COMPILER_OWNERS = (
     "compiler_check_tests", "compiler_module_tests", "compiler_primitive_binding_tests",
-    "compiler_primitive_registry_tests", "compiler_property_tests", "compiler_reduce_tests",
+    "compiler_primitive_registry_tests", "compiler_process_bounded_registry_tests", "compiler_property_tests", "compiler_reduce_tests",
     "compiler_result_tests", "compiler_retained_tests", "compiler_string_auth_tests", "compiler_string_nf_tests",
 )
 

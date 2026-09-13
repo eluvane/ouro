@@ -2,7 +2,7 @@
 
 JSON helpers are prefixed because imports flatten into one namespace.
 
-Declarations: 29.
+Declarations: 34.
 
 ## inductive Json
 
@@ -120,13 +120,43 @@ def json_unicode_escape (s : String) (i : Nat) : Pair (Maybe (List Nat)) Nat
 
 Entry is the u after a backslash. A high surrogate requires an immediately adjacent low-surrogate escape; lone lows and non-low partners are errors.
 
+## inductive JsonStringProgress
+
+```
+inductive JsonStringProgress : Type
+```
+
+A balanced composition of byte builders keeps both scanning and final list construction linear without relying on C tail-call optimization. Arithmetic increments also keep the C host's byte offset compact; repeated S constructors would make indexed lookup walk a growing Peano chain.
+
+## def json_string_step
+
+```
+def json_string_step (fuel : Nat) (input : Pair String Nat) (i : Nat) : JsonStringProgress
+```
+
+## def json_string_join
+
+```
+def json_string_join (prefix : List Nat -> List Nat) (result : JsonStringProgress) : JsonStringProgress
+```
+
+## def json_string_scan_tree
+
+```
+def json_string_scan_tree : Nat -> Pair String Nat -> Nat -> Nat -> JsonStringProgress
+```
+
+## def json_string_scan_depth
+
+```
+def json_string_scan_depth (fuel : Nat) : Nat
+```
+
 ## def json_string_scan
 
 ```
 def json_string_scan : Nat -> Pair String Nat -> Nat -> List Nat -> Pair (Maybe String) Nat
 ```
-
-Reverse byte accumulation plus one final conversion is linear: no growing concatenations or repeated suffix slicing. Four explicit scanner arguments keep native tail calls eligible even for very large compiler/tool strings.
 
 ## def json_string_parse
 

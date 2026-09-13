@@ -10,6 +10,7 @@ from ourosmith import ROOT
 from ourosmith.limits import clean_env, run_limited
 
 TOOLS = ("collect", "fmt", "fix", "lint", "doc", "lsp", "test")
+BUILD_MEMORY_MB = 3072
 
 
 def build_config():
@@ -159,7 +160,7 @@ def prepare_tools(out: Path, compiler: Path) -> tuple[dict[str, Path], dict]:
 
 def build_command(argv: list[str], log: Path, *, timeout_s: float = 600) -> str | None:
     try:
-        proc = run_limited(argv, cwd=ROOT, env=environment(build=True), timeout_s=timeout_s, memory_mb=3072)
+        proc = run_limited(argv, cwd=ROOT, env=environment(build=True), timeout_s=timeout_s, memory_mb=BUILD_MEMORY_MB)
     except OSError as exc:
         return str(exc)
     log.parent.mkdir(parents=True, exist_ok=True)

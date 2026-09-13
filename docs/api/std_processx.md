@@ -2,7 +2,7 @@
 
 Typed command specs, checked execution helpers, and shell-free plan rendering.
 
-Declarations: 22.
+Declarations: 26.
 
 ## inductive CommandSpec
 
@@ -134,4 +134,28 @@ def process_run_specs_checked : List CommandSpec -> IO (Either ProcessError (Lis
 
 ```
 def process_run_plan_checked (plan : ProcessPlan) : IO (Either ProcessError (List ProcResult))
+```
+
+## def process_run_spec_inherited
+
+```
+def process_run_spec_inherited (command : CommandSpec) : IO (Either ProcessRunError Nat)
+```
+
+## def process_run_spec_inherited_checked
+
+```
+def process_run_spec_inherited_checked (command : CommandSpec) : IO (Either ProcessRunError Nat)
+```
+
+## def process_run_spec_captured_bounded
+
+```
+def process_run_spec_captured_bounded (limits : ProcessCaptureLimits) (command : CommandSpec)
+```
+
+## def process_run_spec_captured_bounded_with_input
+
+```
+def process_run_spec_captured_bounded_with_input (limits : ProcessCaptureLimits) (command : CommandSpec) (input : String)
 ```

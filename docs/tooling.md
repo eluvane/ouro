@@ -20,6 +20,9 @@ builder does not provision this group.
 
 ## Check and evaluate
 
+Import collection preserves `OURO-IMP-001` through `OURO-IMP-004` for malformed,
+duplicate, unknown and reserved aliases, with the source path and byte offset.
+
 ```sh
 sh scripts/ouro1.sh check path/to/module.ouro
 sh scripts/ouro1.sh eval path/to/module.ouro --print name --type TYPE
@@ -243,6 +246,10 @@ fallbacks, and cross-language candidates. See
 
 `std/test.ouro` provides the current assertion and test-runner helpers. A
 sibling `.golden` file is compared with program output when present.
+The hosted `ouro1 test` wrapper keeps successful tool-build logs in
+`_build/c/ouro-test.build.log`; failed builds print their complete diagnostics.
+An ordinary failing test reports `FAIL run <path>` and `test: failed`, with
+exit status 1.
 With no input, `ouro-test.exe` discovers `*_test.ouro` below the current
 directory. Directory entries are sorted; input-root order, duplicate roots
 and explicitly named files are preserved. Discovery excludes `_build`,
