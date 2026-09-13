@@ -52,18 +52,25 @@ MIR_VALID = (
 
 def probe_cases():
     cases = [("n1-host-selftest", ["valid"], 0, "N1_HOST_MIR: emitted valid\n", MIR_VALID)]
+    cases.append(("n1-host-selftest", ["diagnostic-strings"], 0, "N1_HOST_DIAGNOSTICS: passed\n",
+                  re.escape("str: text\npacked: lower:entry:123\nlist: text\ncat: lower:body:456\n"
+                            "empty: \nbinary: a\0z\ninvalid: <non-string tag=77 n=0>\n")))
+    cases.append(("n1-host-selftest", ["valid-quiet"], 0, "N1_HOST_MIR: emitted valid-quiet\n",
+                  MIR_START + r"n1-host: gc-infer live=\d+\nn1-host: annotate live=\d+\n"
+                  r"n1-host: codegen live=\d+\n"))
     for mode, diagnostic in (("uninitialized", "uninitialized"), ("bad-return", "return")):
         cases.append(("n1-host-selftest", [mode], 1, "", MIR_START +
                       r"n1-host: mir-check failed tag=0 n=1 live=\d+\n" +
                       "n1-host: mir:" + diagnostic + "\n"))
-    for mode in ("mir-program-context", "mir-flow-context", "codegen-program-context", "mir-phase-errors", "mir-phase-nested", "mir-reachability-rounds"):
+    for mode in ("mir-program-context", "mir-flow-context", "codegen-program-context", "mir-phase-errors", "mir-phase-nested", "mir-reachability-rounds", "mir-flow-rounds"):
         stderr = ASSEMBLE + (r"n1-host: finish-c functions=0 bytes=0\n" * 4) if mode == "codegen-program-context" else ""
         cases.append(("n1-host-selftest", [mode], 0, f"N1_HOST_CONTEXT: passed {mode}\n", stderr))
     for mode in ("lower-raw-order", "lower-raw-left", "lower-survivors"):
         cases.append(("n1-host-selftest", [mode], 0, f"N1_HOST_LOWER: passed {mode}\n", ""))
-    for mode in ("pe-byte-large", "pe-byte-errors", "pe-byte-context"):
+    for mode in ("pe-byte-large", "pe-byte-errors", "pe-byte-context", "pe-patch-context"):
         cases.append(("n1-host-selftest", [mode], 0, f"N1_HOST_PE: passed {mode}\n", ""))
     for mode, diagnostic in (("lower-bad-result", "raw returned an invalid lowering result"),
+                             ("lower-bad-result-quiet", "raw returned an invalid lowering result"),
                              ("lower-bad-chunk", "raw returned an invalid list"),
                              ("lower-bad-contracts", "contracts returned an invalid list")):
         cases.append(("n1-host-selftest", [mode], 2, "", re.escape(f"n1-host: {diagnostic}\n")))

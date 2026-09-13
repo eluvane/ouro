@@ -1,6 +1,11 @@
 #!/usr/bin/env sh
 # Compatibility launcher; ouro-test owns user and compiler suite assertions.
 set -eu
+# Hosted law drivers need the same stack reserve as OuroSmith. The build
+# subprocess's stack setting does not propagate back to this suite runner.
+if ! ulimit -s 131072 2>/dev/null; then
+	echo "TEST_SUITE: stack limit unchanged" >&2
+fi
 ROOT=$(CDPATH='' cd "$(dirname "$0")/.." && pwd)
 cd "$ROOT"
 # shellcheck source=scripts/python.sh
@@ -94,14 +99,14 @@ if [ "$SUITE_MODE" = native-build-collection ]; then
 	tr -d '\r' <"$OUT/collection.raw" >"$OUT/collection.out"
 	cat "$OUT/collection.out"
 	if [ -s "$OUT/collection.err" ] || \
-		[ "$(grep -c '^PRECISION_OK ' "$OUT/collection.out")" -ne 38 ] || \
-		[ "$(wc -l <"$OUT/collection.out")" -ne 39 ] || \
-		! grep -Fxq 'PRECISION_SUITE native-build-collection rows=38' "$OUT/collection.out"; then
+		[ "$(grep -c '^PRECISION_OK ' "$OUT/collection.out")" -ne 44 ] || \
+		[ "$(wc -l <"$OUT/collection.out")" -ne 45 ] || \
+		! grep -Fxq 'PRECISION_SUITE native-build-collection rows=44' "$OUT/collection.out"; then
 		cat "$OUT/collection.err" >&2
 		echo "NATIVE_BUILD_COLLECTION_SUITE: FAIL incomplete assertion protocol" >&2
 		exit 1
 	fi
-	echo "NATIVE_BUILD_COLLECTION_SUITE: PASS cases=38 out=$OUT"
+	echo "NATIVE_BUILD_COLLECTION_SUITE: PASS cases=44 out=$OUT"
 	exit 0
 fi
 

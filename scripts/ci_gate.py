@@ -7,6 +7,7 @@ owns a secret version of the trust policy.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import shlex
@@ -81,12 +82,12 @@ PR_GROUPS: dict[str, tuple[str, ...]] = {
         "frontend-security",
         "runtime-io",
         "test",
-        "compiler-checking",
         "compiler-boundary",
     ),
     "smith": ("ouro-smith",),
     "samples-1": ("samples-1",),
     "samples-2": ("samples-2",),
+    **{f"compiler-{index}": (f"compiler-checking-{index}",) for index in range(1, 9)},
 }
 
 NIGHTLY_GROUPS: dict[str, tuple[str, ...]] = {
@@ -101,8 +102,24 @@ NIGHTLY_GROUPS: dict[str, tuple[str, ...]] = {
     # Keep these in one checkout and preserve registry order. Smith must bind
     # its provenance to the tool binaries installed by the stage loop.
     "trust": ("stage-loop-fixpoint-and-generated-drift", "ouro-smith-nightly"),
+    **{name: gates for name, gates in PR_GROUPS.items() if name.startswith("compiler-")},
 }
-PROFILE_GROUPS = {"pr": PR_GROUPS, "nightly": NIGHTLY_GROUPS}
+KERNEL_GROUPS: dict[str, tuple[str, ...]] = {
+    "checks": (
+        "python-syntax", "kernel-hardening", "compiler-scale", "compiler-depth",
+        "generated-artifact-hashes", "cache-parity-module", "compiler-boundary",
+        "syntax-quality-firewall", "strict-quality-firewall", "hygiene", "ouro-smith-kernel",
+    ),
+    **{name: gates for name, gates in PR_GROUPS.items() if name.startswith("compiler-")},
+}
+STAGE_LOOP_GROUPS = {"trust": (
+    "python-syntax", "parity", "syntax-quality-firewall", "strict-quality-firewall",
+    "structural-quality-suite", "structural-quality", "stage-loop-fixpoint-and-generated-drift",
+)}
+PROFILE_GROUPS = {
+    "pr": PR_GROUPS, "nightly": NIGHTLY_GROUPS, "manual": NIGHTLY_GROUPS,
+    "kernel": KERNEL_GROUPS, "stage-loop": STAGE_LOOP_GROUPS,
+}
 
 SHA40 = re.compile(r"[0-9a-fA-F]{40}\Z")
 EDITOR_PREFIX = "editors/vscode/"
@@ -351,7 +368,7 @@ def gates() -> list[Gate]:
         Gate("lint", ["sh", "scripts/lint_suite.sh"], ("pr", "nightly", "manual"), env=(("LINT_SUITE_OUT", "_build/lint_suite"),)),
         Gate("lsp", ["sh", "scripts/lsp_suite.sh"], ("pr", "nightly", "manual"), env=(("LSP_SUITE_OUT", "_build/lsp_suite"),)),
         Gate("test", ["sh", "scripts/test_suite.sh"], ("pr", "nightly", "manual"), env=(("TEST_SUITE_OUT", "_build/test_suite"),)),
-        Gate("compiler-checking", ["sh", "scripts/test_suite.sh", "--compiler-checking"], ("pr", "nightly", "manual", "kernel"), env=(("TEST_SUITE_OUT", "_build/compiler_check_suite"), ("OURO_JOBS", "1"), ("OURO_FRONTEND_JOBS", "1"))),
+        *(Gate(f"compiler-checking-{index}", ["sh", "scripts/test_suite.sh", "--compiler-checking", f"--shard={index}/8"], ("pr", "nightly", "manual", "kernel"), env=(("TEST_SUITE_OUT", f"_build/compiler_check_suite_{index}"), ("OURO_JOBS", "1"), ("OURO_FRONTEND_JOBS", "1"))) for index in range(1, 9)),
         Gate("compiler-boundary", ["sh", "scripts/ouro_repo_gate.sh", "--profile", "compiler-boundary", "--out", "_build/compiler_boundary"], ("pr", "nightly", "manual", "kernel")),
         Gate("samples-1", ["sh", "scripts/samples_suite.sh", "--shard=1/2"], ("pr", "nightly", "manual"), env=(("SAMPLES_SUITE_OUT", "_build/samples_suite_1"),)),
         Gate("samples-2", ["sh", "scripts/samples_suite.sh", "--shard=2/2"], ("pr", "nightly", "manual"), env=(("SAMPLES_SUITE_OUT", "_build/samples_suite_2"),)),
@@ -430,9 +447,14 @@ def run_self_tests(all_gates: Sequence[Gate]) -> int:
             except ValueError:
                 continue
             failures.append(f"invalid {profile} group partition was accepted")
-        workflow = ROOT / ".github/workflows" / ("ouro-pr.yml" if profile == "pr" else "ouro-nightly-full.yml")
+        if profile not in {"pr", "nightly", "kernel"}:
+            continue
+        workflow = ROOT / ".github/workflows" / ("ouro-nightly-full.yml" if profile == "nightly" else "ouro-pr.yml")
+        job = {"pr": "quick-firewall", "nightly": "validation", "kernel": "kernel-validation"}[profile]
         try:
-            matrix = re.findall(r"^          - group: ([a-z0-9-]+)$", workflow.read_text(encoding="utf-8"), re.MULTILINE)
+            content = workflow.read_text(encoding="utf-8")
+            section = re.search(rf"^  {job}:\n(.*?)(?=^  [a-z0-9-]+:|\Z)", content, re.MULTILINE | re.DOTALL)
+            matrix = re.findall(r"^          - group: ([a-z0-9-]+)$", section.group(1) if section else "", re.MULTILINE)
         except OSError as exc:
             failures.append(f"cannot read {profile} workflow: {exc}")
         else:
@@ -535,9 +557,10 @@ def run_gate(gate: Gate, *, out: Path) -> dict[str, Any]:
 def main(argv: Optional[Sequence[str]] = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--profile", choices=["pr", "nightly", "manual", "kernel", "stage-loop", "bootstrap"], default="pr")
-    ap.add_argument("--group", default=None, help="run one complete PR or nightly partition in an isolated checkout")
+    ap.add_argument("--group", default=None, help="run one complete profile partition in an isolated checkout")
     ap.add_argument("--out", default=None)
     ap.add_argument("--list", action="store_true")
+    ap.add_argument("--list-groups", action="store_true", help="print the complete profile group list as JSON")
     ap.add_argument("--self-test", action="store_true", help="check PR/nightly partitions and hosted path-selection invariants")
     ap.add_argument("--select-paths", action="store_true", help="write fail-closed hosted job selection from a commit diff")
     ap.add_argument("--base", default=None, help="base commit SHA for --select-paths")
@@ -552,7 +575,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     all_gates = gates()
     if args.select_paths:
-        if args.group is not None or args.out or args.list or args.self_test or args.with_bootstrap_evidence:
+        if args.group is not None or args.out or args.list or args.list_groups or args.self_test or args.with_bootstrap_evidence:
             ap.error("--select-paths cannot be combined with execution options")
         if not args.base or not args.head:
             ap.error("--select-paths requires --base and --head")
@@ -564,7 +587,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if args.base or args.head or args.github_output:
         ap.error("--base, --head, and --github-output require --select-paths")
     if args.self_test:
-        if args.group is not None or args.out or args.list or args.with_bootstrap_evidence:
+        if args.group is not None or args.out or args.list or args.list_groups or args.with_bootstrap_evidence:
             ap.error("--self-test cannot be combined with execution options")
         return run_self_tests(all_gates)
     try:
@@ -573,6 +596,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     except ValueError as exc:
         print(f"CI_GATE: FAIL {exc}", file=sys.stderr)
         return 2
+    if args.list_groups:
+        if args.group is not None or args.out or args.list or args.with_bootstrap_evidence:
+            ap.error("--list-groups cannot be combined with execution options")
+        if args.profile not in PROFILE_GROUPS:
+            ap.error(f"profile {args.profile} has no group partition")
+        print(json.dumps(list(PROFILE_GROUPS[args.profile])))
+        return 0
     if args.group is not None and args.group not in PROFILE_GROUPS.get(args.profile, {}):
         ap.error(f"unknown group {args.group!r} for profile {args.profile}")
     if args.group and args.with_bootstrap_evidence:

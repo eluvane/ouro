@@ -43,6 +43,7 @@ HOST_HOOKS = (
     ("x64_encode", "ouro_wrap_x64_encode", ("compiler/native/x64.ouro",)),
     ("codegen_assemble", "ouro_wrap_codegen_assemble", ("compiler/native/codegen_assembly.ouro",)),
     ("mir_live_facts", "ouro_wrap_mir_live_facts", ("compiler/native/mir_live.ouro",)),
+    ("mir_live_summary_step", "ouro_wrap_mir_live_summary_step", ("compiler/native/mir_live.ouro",)),
     ("codegen_parts", "ouro_wrap_codegen_parts", ("compiler/native/codegen_model.ouro",)),
     ("codegen_live_instructions", "ouro_wrap_codegen_live_instructions", ("compiler/native/codegen_ops.ouro",)),
     ("codegen_instruction", "ouro_wrap_codegen_instruction", ("compiler/native/codegen_ops.ouro",)),
@@ -52,11 +53,17 @@ HOST_HOOKS = (
     ("mir_gc_annotate", "ouro_wrap_mir_gc_annotate", ("compiler/native/mir_gc.ouro",)),
     ("mir_gc_check", "ouro_wrap_mir_gc_check", ("compiler/native/mir_gc.ouro",)),
     ("pe_run_byte_check", "ouro_wrap_pe_run_byte_check", ("compiler/native/pe_model.ouro",)),
+    ("pe_plan_fixups", "ouro_wrap_pe_plan_fixups", ("compiler/native/pe_fixups.ouro",)),
 )
 
 
 def tool_inputs(entry: str, compiler: Path, fuel: int, cfg: build.ResolvedConfig) -> tuple[list[str], dict]:
-    units = frontend.collect_units(os.path.normpath(entry).replace("\\", "/"))
+    # Shell callers resolve inputs against their own cwd. Repository inputs
+    # keep one relative identity in content keys and portable source manifests.
+    source = Path(os.path.normpath(entry.replace("\\", "/")))
+    if source.is_absolute() and source.is_relative_to(ROOT):
+        source = source.relative_to(ROOT)
+    units = frontend.collect_units(source.as_posix())
     if not units:
         raise ValueError("empty source collection")
     sources = dict.fromkeys([*units, *BUILD_INPUTS, *RUNTIME,

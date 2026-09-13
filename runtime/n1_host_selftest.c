@@ -293,6 +293,98 @@ static int check_mir_reachability_rounds(void)
 	return !ok;
 }
 
+static ouro_v *flow_probe_program(int reversed, int initialized)
+{
+	ouro_v *program = probe_mir(0, 0);
+	ouro_v *function = OURO_F(OURO_F(program, 0), 0);
+	ouro_v *blocks = nil();
+	unsigned long offset;
+	if (initialized) {
+		ouro_v *locals = OURO_F(function, 3);
+		OURO_F(function, 2) = OURO_F(locals, 1); /* argument 21 */
+		OURO_F(function, 3) = cons(OURO_F(locals, 0), nil());
+	}
+	for (offset = 0; offset < 8; offset++) {
+		unsigned long index = reversed ? offset : 7 - offset;
+		ouro_v *block = reach_probe_block(5000 + index, 5001 + index, index == 7);
+		if (index == 7) {
+			ouro_v *id = ouro_nat(21);
+			ouro_v *fields[2] = {ouro_nat(20), ouro_ctor(0, 1, &id)};
+			OURO_F(block, 1) = cons(ouro_ctor(0, 2, fields), nil());
+		}
+		blocks = cons(block, blocks);
+	}
+	OURO_F(function, 5) = ouro_nat(5000);
+	OURO_F(function, 6) = blocks;
+	return program;
+}
+
+static int flow_probe_same(ouro_v *actual, ouro_v *expected)
+{
+	ouro_v *left;
+	ouro_v *right;
+	int i;
+	if (actual == 0 || expected == 0 || actual->tag != expected->tag ||
+	    actual->n != 1 || expected->n != 1)
+		return 0;
+	left = OURO_F(actual, 0);
+	right = OURO_F(expected, 0);
+	if (left == 0 || right == 0 || left->tag != right->tag || left->n != right->n)
+		return 0;
+	for (i = 0; i < left->n; i++)
+		if (as_nat(OURO_F(left, i)) != as_nat(OURO_F(right, i)))
+			return 0;
+	return 1;
+}
+
+static int check_mir_flow_rounds(void)
+{
+	const unsigned long fuels[4] = {0, 7, 8, 9};
+	ouro_v *caller = codes("flow caller survives");
+	ouro_heap_context *context = ouro_heap_context_enter();
+	ouro_v *check = find_export("mir_check_function");
+	ouro_v *identity = ouro_apply(ouro_apply(find_export("mir_check_function_with"),
+		ouro_clos(reach_probe_identity, 0)), find_export("mir_check_declared_flow"));
+	ouro_v *retained[3] = {0, 0, 0};
+	ouro_v *results;
+	char text[32];
+	int reversed, initialized, budget;
+	int ok = 1;
+	for (reversed = 0; reversed < 2; reversed++) {
+		for (initialized = 0; initialized < 2; initialized++) {
+			ouro_v *program = flow_probe_program(reversed, initialized);
+			ouro_v *function = OURO_F(OURO_F(program, 0), 0);
+			for (budget = 0; budget < 4; budget++) {
+				ouro_v *fuel = ouro_nat(fuels[budget]);
+				ouro_v *expected = ouro_apply(ouro_apply(ouro_apply(identity, program), fuel), function);
+				ouro_v *actual = ouro_apply(ouro_apply(ouro_apply(check, program), fuel), function);
+				ok = flow_probe_same(actual, expected) && ok;
+				if (budget == 3) {
+					ok = expect_check(actual, initialized ? -1 : 7, "flow round convergence") && ok;
+					retained[initialized ? 2 : reversed] = actual;
+				}
+			}
+		}
+	}
+	ouro_fe_reset_mir_pins();
+	results = ouro_heap_context_leave(context, ouro_ctor(0, 3, retained));
+	ouro_heap_mark();
+	memset(ouro_alloc(8UL * 1024UL * 1024UL), 0xA5, 8UL * 1024UL * 1024UL);
+	ouro_heap_reset();
+	for (reversed = 0; reversed < 2; reversed++) {
+		ouro_v *result = OURO_F(results, reversed);
+		ok = expect_check(result, 7, "retained flow error") && ok;
+		if (result != 0 && result->tag == 0 && result->n == 1) {
+			ouro_v *error = OURO_F(result, 0);
+			ok = error != 0 && error->n == 2 && as_nat(OURO_F(error, 0)) == 5007 &&
+				as_nat(OURO_F(error, 1)) == 21 && ok;
+		}
+	}
+	ok = expect_check(OURO_F(results, 2), -1, "retained flow success") && ok;
+	ok = codes_to_buf(caller, text, sizeof(text)) == 20 && memcmp(text, "flow caller survives", 20) == 0 && ok;
+	return !ok;
+}
+
 static ouro_v *data_program(unsigned long entry, const char *bytes)
 {
 	ouro_v *fields[4] = {ouro_nat(30), ouro_ctor(1, 0, 0), codes(bytes), 0};
@@ -693,19 +785,137 @@ static int check_pe_byte_context(void)
 		pe_probe_fail("captured input was released") : 0;
 }
 
+static unsigned long pe_plan_calls;
+static int pe_plan_failed;
+
+/* Synthetic curried inputs exercise storage ownership only. The PE law
+   suite checks the canonical planner's patch bytes and error precedence. */
+static ouro_v *pe_plan_probe_fixups(ouro_env *env, ouro_v *fixups)
+{
+	ouro_v *result;
+	unsigned long id = as_nat(fixups);
+	pe_plan_calls++;
+	if (as_nat(ouro_get(env, 0)) != 26 || as_nat(ouro_get(env, 1)) != 25 ||
+	    !lower_probe_text(ouro_get(env, 2), "borrowed section") ||
+	    !lower_probe_text(ouro_get(env, 3), "captured planner"))
+		pe_plan_failed = 1;
+	memset(ouro_alloc(1024UL * 1024UL), 0xA5, 1024UL * 1024UL);
+	if (id % 2UL == 0) {
+		result = ouro_ctor(0, 4, (ouro_v *[]){nil(), fixups, ouro_get(env, 2), nil()});
+		result = cons(result, nil());
+		return ouro_ctor(1, 1, &result);
+	}
+	result = ouro_ctor(3, 2, (ouro_v *[]){ouro_ctor(1, 0, 0), fixups});
+	result = ouro_ctor(21, 1, &result);
+	return ouro_ctor(0, 1, &result);
+}
+
+static ouro_v *pe_plan_probe_imports(ouro_env *env, ouro_v *imports)
+{
+	return ouro_clos(pe_plan_probe_fixups, ouro_cons(imports, env));
+}
+
+static ouro_v *pe_plan_probe_symbols(ouro_env *env, ouro_v *symbols)
+{
+	return ouro_clos(pe_plan_probe_imports, ouro_cons(symbols, env));
+}
+
+static ouro_v *pe_plan_probe_sections(ouro_env *env, ouro_v *sections)
+{
+	return ouro_clos(pe_plan_probe_symbols, ouro_cons(sections, env));
+}
+
+ouro_v *ouro_wrap_pe_plan_fixups(ouro_v *raw);
+
+static int check_pe_patch_context(void)
+{
+	ouro_v *caller = codes("borrowed section");
+	ouro_v *raw = ouro_clos(pe_plan_probe_sections, ouro_cons(codes("captured planner"), 0));
+	ouro_v *first = ouro_apply(ouro_apply(ouro_apply(ouro_wrap_pe_plan_fixups(raw), caller),
+		ouro_nat(25)), ouro_nat(26));
+	ouro_v *second = ouro_apply(ouro_apply(ouro_apply(ouro_wrap_pe_plan_fixups(raw), caller),
+		ouro_nat(25)), ouro_nat(26));
+	ouro_v *results[8];
+	ouro_v *retained;
+	unsigned long long base = ouro_heap_live_bytes();
+	unsigned long long total = ouro_heap_total_alloc_bytes();
+	ouro_heap_context *context = ouro_heap_context_enter();
+	unsigned long i;
+	for (i = 0; i < 8; i++)
+		results[i] = ouro_apply(i == 5 ? second : first, ouro_nat(4096 + i));
+	retained = ouro_heap_context_leave(context, ouro_ctor(0, 8, results));
+	if (pe_plan_failed || pe_plan_calls != 8 || ouro_heap_live_bytes() > base + 65536ULL ||
+	    ouro_heap_total_alloc_bytes() < total + 8ULL * 1024ULL * 1024ULL)
+		return pe_probe_fail("patch planner arguments, invocation count or temporary bound");
+	ouro_heap_mark();
+	memset(ouro_alloc(8UL * 1024UL * 1024UL), 0x5A, 8UL * 1024UL * 1024UL);
+	ouro_heap_reset();
+	for (i = 0; i < 8; i++) {
+		ouro_v *result = OURO_F(retained, i);
+		ouro_v *payload;
+		if (result == 0 || result->tag != (i % 2UL == 0 ? 1 : 0) || result->n != 1)
+			return pe_probe_fail("patch planner result branch changed");
+		payload = OURO_F(result, 0);
+		if (i % 2UL == 0) {
+			if (payload == 0 || payload->tag != 1 || payload->n != 2 ||
+			    OURO_F(payload, 1)->tag != 0 || OURO_F(payload, 1)->n != 0)
+				return pe_probe_fail("patch planner list changed");
+			payload = OURO_F(payload, 0);
+			if (payload == 0 || payload->tag != 0 || payload->n != 4 ||
+			    as_nat(OURO_F(payload, 1)) != 4096 + i ||
+			    !lower_probe_text(OURO_F(payload, 2), "borrowed section"))
+				return pe_probe_fail("patch planner retained bytes changed");
+		} else {
+			if (payload == 0 || payload->tag != 21 || payload->n != 1)
+				return pe_probe_fail("patch planner error changed");
+			payload = OURO_F(payload, 0);
+			if (payload == 0 || payload->tag != 3 || payload->n != 2 ||
+			    OURO_F(payload, 0)->tag != 1 || OURO_F(payload, 0)->n != 0 ||
+			    as_nat(OURO_F(payload, 1)) != 4096 + i)
+				return pe_probe_fail("patch planner nested error changed");
+		}
+	}
+	return lower_probe_text(caller, "borrowed section") ? 0 : pe_probe_fail("patch planner released caller");
+}
+
 int main(int argc, char **argv)
 {
 	ouro_v *image;
 	int result;
+	const char *mode;
 	if (argc != 2)
 		return 2;
+	mode = argv[1];
+	if (strcmp(mode, "valid-quiet") == 0)
+		mode = "valid";
+	else if (strcmp(mode, "lower-bad-result-quiet") == 0)
+		mode = "lower-bad-result";
+	else
+		ouro_fe_set_progress(1);
 	ouro_rt_warmup();
-	if (strcmp(argv[1], "pe-byte-large") == 0)
+	if (strcmp(mode, "diagnostic-strings") == 0) {
+		ouro_v *parts[2];
+		const unsigned char binary[3] = {'a', 0, 'z'};
+		print_string("str: ", ouro_str("text"));
+		print_string("packed: ", codes("lower:entry:123"));
+		print_string("list: ", ouro_bytes((const unsigned char *)"text", 4));
+		parts[0] = codes("lower:");
+		parts[1] = ouro_bytes((const unsigned char *)"body:456", 8);
+		print_string("cat: ", ouro_ctor(OURO_TAG_CAT, 2, parts));
+		print_string("empty: ", nil());
+		print_string("binary: ", ouro_packed(binary, 3));
+		print_string("invalid: ", ouro_ctor(77, 0, 0));
+		puts("N1_HOST_DIAGNOSTICS: passed");
+		return 0;
+	}
+	if (strcmp(mode, "pe-byte-large") == 0)
 		result = check_pe_large_bytes();
-	else if (strcmp(argv[1], "pe-byte-errors") == 0)
+	else if (strcmp(mode, "pe-byte-errors") == 0)
 		result = check_pe_byte_errors();
-	else if (strcmp(argv[1], "pe-byte-context") == 0)
+	else if (strcmp(mode, "pe-byte-context") == 0)
 		result = check_pe_byte_context();
+	else if (strcmp(mode, "pe-patch-context") == 0)
+		result = check_pe_patch_context();
 	else
 		result = -1;
 	if (result >= 0) {
@@ -713,17 +923,17 @@ int main(int argc, char **argv)
 			printf("N1_HOST_PE: passed %s\n", argv[1]);
 		return result;
 	}
-	if (strcmp(argv[1], "lower-raw-order") == 0)
+	if (strcmp(mode, "lower-raw-order") == 0)
 		result = check_raw_lower(0);
-	else if (strcmp(argv[1], "lower-raw-left") == 0)
+	else if (strcmp(mode, "lower-raw-left") == 0)
 		result = check_raw_lower(1);
-	else if (strcmp(argv[1], "lower-survivors") == 0)
+	else if (strcmp(mode, "lower-survivors") == 0)
 		result = check_lower_survivors();
-	else if (strcmp(argv[1], "lower-bad-result") == 0)
+	else if (strcmp(mode, "lower-bad-result") == 0)
 		result = check_raw_lower(2);
-	else if (strcmp(argv[1], "lower-bad-chunk") == 0)
+	else if (strcmp(mode, "lower-bad-chunk") == 0)
 		result = check_raw_lower(3);
-	else if (strcmp(argv[1], "lower-bad-contracts") == 0)
+	else if (strcmp(mode, "lower-bad-contracts") == 0)
 		result = check_raw_lower(4);
 	else
 		result = -1;
@@ -732,17 +942,19 @@ int main(int argc, char **argv)
 			printf("N1_HOST_LOWER: passed %s\n", argv[1]);
 		return result;
 	}
-	if (strcmp(argv[1], "mir-program-context") == 0)
+	if (strcmp(mode, "mir-program-context") == 0)
 		result = check_program_context();
-	else if (strcmp(argv[1], "mir-flow-context") == 0)
+	else if (strcmp(mode, "mir-flow-context") == 0)
 		result = check_flow_context();
-	else if (strcmp(argv[1], "mir-phase-errors") == 0)
+	else if (strcmp(mode, "mir-phase-errors") == 0)
 		result = check_mir_phase_errors(0);
-	else if (strcmp(argv[1], "mir-phase-nested") == 0)
+	else if (strcmp(mode, "mir-phase-nested") == 0)
 		result = check_mir_phase_errors(1);
-	else if (strcmp(argv[1], "mir-reachability-rounds") == 0)
+	else if (strcmp(mode, "mir-reachability-rounds") == 0)
 		result = check_mir_reachability_rounds();
-	else if (strcmp(argv[1], "codegen-program-context") == 0)
+	else if (strcmp(mode, "mir-flow-rounds") == 0)
+		result = check_mir_flow_rounds();
+	else if (strcmp(mode, "codegen-program-context") == 0)
 		result = check_codegen_context();
 	else
 		result = -1;
@@ -751,11 +963,11 @@ int main(int argc, char **argv)
 			printf("N1_HOST_CONTEXT: passed %s\n", argv[1]);
 		return result;
 	}
-	if (strcmp(argv[1], "valid") != 0 &&
-	    strcmp(argv[1], "uninitialized") != 0 && strcmp(argv[1], "bad-return") != 0)
+	if (strcmp(mode, "valid") != 0 &&
+	    strcmp(mode, "uninitialized") != 0 && strcmp(mode, "bad-return") != 0)
 		return 2;
-	image = emit_mir(probe_mir(strcmp(argv[1], "uninitialized") == 0,
-		strcmp(argv[1], "bad-return") == 0));
+	image = emit_mir(probe_mir(strcmp(mode, "uninitialized") == 0,
+		strcmp(mode, "bad-return") == 0));
 	if (image == 0 || image->n < 1 || OURO_F(image, 0) == 0)
 		return 1;
 	printf("N1_HOST_MIR: emitted %s\n", argv[1]);

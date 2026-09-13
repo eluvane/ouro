@@ -29,6 +29,10 @@ python3 scripts/ouro_build.py config show
 `scripts/ouro1.sh` remains the user-facing wrapper for language and tooling
 commands. `scripts/coil.sh` is the project-facing name for the same toolchain.
 
+macOS host executables reserve a 128 MiB main-thread stack at link time through
+Mach-O's `-stack_size`, including historical bootstrap producers. This reserve
+does not depend on changing the stack of the host Python interpreter.
+
 The standalone Python frontend regenerator and bounded analyzer reserve a
 128 MiB POSIX stack for native compiler processes, capped by the inherited hard
 limit. An already larger or unlimited stack is preserved. Address-space and
@@ -288,7 +292,7 @@ cache miss, not a successful build.
 compiler. A clean source checkout needs no Git history, network download, or
 pre-existing Ouro executable. The driver performs four stages:
 
-1. Compile the committed `compiler/stage0/` C with its pinned historical
+1. Compile the committed `compiler/stage0/` C with its matching pinned
    runtime to obtain C0.
 2. Use C0 to build the historical Ouro bridge and its matching runtime from
    `compiler/bootstrap/c-bootstrap-v1.tar.gz`.
@@ -309,11 +313,14 @@ second handwritten stdlib unit list; missing units remain bootstrap failures.
 
 The [bootstrap input manifest](../compiler/bootstrap/c-bootstrap-v1.json) records
 68 input files: 58 historical Ouro sources and two five-file runtime sets. It
-pins every file's size and SHA-256, the archive's 188,789 bytes, and the historical
-stage0 pair. Its lineage lists the four historical representation omissions and
-all reviewed compatibility edits. These historical inputs stay separate from
-the current source snapshot and its acceptance checks. They remain temporary
-inputs until the native bootstrap can replace this C-hosted chain.
+pins every file's size and SHA-256, the archive's 213,975 bytes, and the
+committed stage0 pair. The C0 runtime matches that seed; the historical bridge
+sources and runtime remain unchanged. The manifest's `seed_refresh` records the
+previous seed hashes, changed C0 runtime members, and source and stage-loop
+evidence. Its lineage retains the four historical representation omissions and
+all reviewed compatibility edits. These pinned inputs stay separate from the
+current source snapshot and its acceptance checks. They remain temporary inputs
+until the native bootstrap can replace this C-hosted chain.
 
 The consumer validates the entire archive inventory before extraction. It
 rejects links, traversal, duplicate, extra, or missing members and size/hash
@@ -527,6 +534,8 @@ process lifetime; the limit covers every production source. The memory suite sel
 current production input for the `analyzer-drive-largest-file` budget in
 `quality/memory_budgets.json`, so a refactor cannot turn it into a tiny-shim test. Split a larger source, or use
 `OURO_ANALYZE_ALLOW_UNBOUNDED=1` only on a dedicated high-memory host.
+The largest-source case requires an `ANALYZE_DRIVE` result; a size rejection
+before structured analysis cannot satisfy it.
 The bounded analyzer wrapper requires the repository Python runner; it fails
 closed when Python is unavailable unless that same override is explicit.
 
@@ -543,6 +552,17 @@ Memory regressions belong in measured reports with the exact command, input,
 host, and peak RSS. Declaration-aware root checking adds a bounded second
 frontend pass to native check cases; its budgets include that measured cost.
 Raising a budget is not a substitute for fixing lifetime or growth bugs.
+The memory suite first builds the selected native tools with the separate
+3 GiB, 900-second preparation limit and records each build in
+`preparation.json`. Compilation failure blocks the suite. Existing execution
+RSS limits and wrapper-install cases then run unchanged; a cold native emitter
+is not charged to a formatter or analyzer execution budget.
+
+The import collector jumps between lexical candidates in ordinary source to
+avoid retaining per-byte traversal temporaries across an entire dependency
+tree. It keeps compiler string decoding and delegates alias/open handling to
+the shared preprocessor. `native_build_collection_tests.ouro --collect-only`
+checks the collection laws on hosted platforms without building a PE image.
 
 Relevant checks include:
 

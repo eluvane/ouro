@@ -6,6 +6,7 @@
 #define OURO_RT_H
 
 #include <stdio.h> /* FILE, for ouro_write_codes */
+#include <stdint.h>
 
 typedef struct ouro_v ouro_v;
 typedef struct ouro_env ouro_env;
@@ -17,12 +18,14 @@ typedef struct ouro_heap_context ouro_heap_context;
 #define OURO_TAG_NAT (-4)
 #define OURO_TAG_BYTES (-5)
 #define OURO_TAG_CAT (-6)
+#define OURO_TAG_BIG_NAT (-7)
 
 /* One 24-byte cell for every value. The payload is variant-specific:
    constructors and OURO_TAG_CAT keep up to two fields inline and larger
    field lists directly after the cell (see ouro_fields), closures and
    thunks keep their code and environment, strings and byte strings keep
-   their bytes, and packed nats use only n. Generated C never reads these
+   their bytes, small packed nats use n, and larger naturals keep n
+   little-endian 32-bit limbs after the cell. Generated C never reads these
    members; it goes through ouro_ctor / ouro_case / ouro_app / ouro_get. */
 struct ouro_v {
 	int tag;
@@ -102,6 +105,10 @@ ouro_v *ouro_str(const char *s);
    Cons=1). Lets a C host feed real input into compiled Ouro without any
    algorithm in C. */
 ouro_v *ouro_nat(unsigned long n);
+/* Checked host-size conversion; no truncation of a large or malformed Nat. */
+int ouro_nat_to_ulong(ouro_v *value, unsigned long *out);
+uint32_t ouro_nat_low32(ouro_v *value);
+ouro_v *ouro_nat_decimal(ouro_v *value);
 ouro_v *ouro_bytes(const unsigned char *b, unsigned long len);
 /* One-cell packed byte string. The lexer matches it as List Nat. */
 ouro_v *ouro_packed(const unsigned char *b, unsigned long len);

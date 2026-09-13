@@ -7,6 +7,7 @@
 #include "ouro_rt.h"
 
 #include <stdio.h>
+#include <limits.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -281,11 +282,121 @@ static void check_packed_clone_lifetime(void)
 	ouro_perm_select(0);
 }
 
-int main(void)
+static ouro_v *nat_binary(const char *name, ouro_v *left, ouro_v *right)
 {
+	return ouro_apply(ouro_apply(ouro_fast(name), left), right);
+}
+
+static void require_nat_equal(ouro_v *left, ouro_v *right, const char *label)
+{
+	ouro_v *equal = nat_binary("eqNat", left, right);
+	if (equal == 0 || equal->tag != 0 || equal->n != 0) {
+		fprintf(stderr, "rt_selftest: wide Nat %s\n", label);
+		exit(1);
+	}
+}
+
+static ouro_v *nat_power_two(unsigned int bits)
+{
+	ouro_v *value = ouro_nat(1);
+	while (bits-- > 0)
+		value = nat_binary("mul", value, ouro_nat(2));
+	return value;
+}
+
+static ouro_v *nat_predecessor(ouro_env *env, ouro_v *value)
+{
+	(void)env;
+	return value;
+}
+
+static void check_wide_naturals(void)
+{
+	unsigned int bits;
+	uint32_t seed = 17;
+	unsigned long number;
+	ouro_v *maximum = ouro_nat(ULONG_MAX);
+	ouro_v *overflow = ouro_ctor(1, 1, &maximum);
+	if (!ouro_nat_to_ulong(maximum, &number) || number != ULONG_MAX ||
+	    ouro_nat_to_ulong(overflow, &number) || ouro_nat_to_ulong(ouro_str("bad"), &number) ||
+	    ouro_nat_to_ulong(0, &number)) {
+		fputs("rt_selftest: checked Nat host conversion\n", stderr);
+		exit(1);
+	}
+	if (strcmp(ouro_nat_decimal(nat_power_two(64))->u.s, "18446744073709551616") != 0 ||
+	    strcmp(ouro_nat_decimal(nat_power_two(128))->u.s, "340282366920938463463374607431768211456") != 0 ||
+	    strcmp(ouro_nat_decimal(ouro_nat(0))->u.s, "0") != 0 ||
+	    ouro_nat_low32(nat_binary("add", nat_power_two(128), ouro_nat(73))) != 73) {
+		fputs("rt_selftest: full Nat decimal or low word\n", stderr);
+		exit(1);
+	}
+	for (bits = 0; bits < 256; bits++) {
+		uint32_t left, right;
+		unsigned int operation;
+		seed = seed * 1664525U + 1013904223U;
+		left = seed;
+		seed = seed * 1664525U + 1013904223U;
+		right = seed;
+		for (operation = 0; operation < 3; operation++) {
+			const char *name = operation == 0 ? "add" : operation == 1 ? "mul" : "sub";
+			uint64_t expected = operation == 0 ? (uint64_t)left + right :
+			                    operation == 1 ? (uint64_t)left * right :
+			                    left > right ? (uint64_t)left - right : 0;
+			char text[32];
+			ouro_v *actual = nat_binary(name, ouro_nat(left), ouro_nat(right));
+			snprintf(text, sizeof text, "%llu", (unsigned long long)expected);
+			if (strcmp(ouro_nat_decimal(actual)->u.s, text) != 0) {
+				fprintf(stderr, "rt_selftest: Nat %s differs from uint64 oracle\n", name);
+				exit(1);
+			}
+		}
+	}
+	for (bits = 31; bits <= 256; bits++) {
+		ouro_v *bound = nat_power_two(bits);
+		ouro_v *previous = nat_binary("sub", bound, ouro_nat(1));
+		ouro_v *ordered = nat_binary("compareNat", bound, previous);
+		ouro_v *successor = ouro_ctor(1, 1, &previous);
+		ouro_v *branches[2];
+		if (ordered == 0 || ordered->tag != 2 || ordered->n != 0) {
+			fprintf(stderr, "rt_selftest: Nat 2^%u overflowed\n", bits);
+			exit(1);
+		}
+		require_nat_equal(nat_binary("add", previous, ouro_nat(1)), bound, "carry");
+		require_nat_equal(successor, bound, "mixed successor");
+		require_nat_equal(nat_binary("sub", previous, bound), ouro_nat(0), "saturating subtraction");
+		require_nat_equal(nat_binary("sub", nat_binary("mul", previous, previous),
+		                    nat_binary("mul", bound, nat_binary("sub", bound, ouro_nat(2)))),
+		                  ouro_nat(1), "multiplication carry");
+		branches[0] = ouro_nat(0);
+		branches[1] = ouro_clos(nat_predecessor, 0);
+		require_nat_equal(ouro_case(bound, 2, branches), previous, "pattern predecessor");
+	}
+	{
+		ouro_heap_context *context = ouro_heap_context_enter();
+		ouro_v *value = nat_power_two(257);
+		ouro_v *retained = ouro_heap_context_leave(context, value);
+		require_nat_equal(retained, nat_power_two(257), "context lifetime");
+		retained = ouro_keep(retained);
+		require_nat_equal(retained, nat_power_two(257), "permanent clone lifetime");
+	}
+}
+
+int main(int argc, char **argv)
+{
+	if (argc == 2) {
+		ouro_v *invalid = strstr(argv[1], "-null") != 0 ? 0 : ouro_nat(0);
+		if (strncmp(argv[1], "app-", 4) == 0)
+			(void)ouro_app(invalid, 0);
+		else if (strncmp(argv[1], "apply-", 6) == 0)
+			(void)ouro_apply(invalid, 0);
+		else
+			return 2;
+		return 0;
+	}
 	ouro_show_line(ouro_g_four());
 	check_phase_apply();
 	check_list_lookup();
 	check_packed_clone_lifetime();
+	check_wide_naturals();
 	return 0;
 }

@@ -6,6 +6,7 @@ import contextlib
 import copy
 import io
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -25,7 +26,7 @@ class ProducerTests(unittest.TestCase):
         work.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(dir=work) as name:
             directory = Path(name)
-            compiler = directory / "ouro1.exe"
+            compiler = directory / ("ouro1.exe" if os.name == "nt" else "ouro1")
             compiler.write_bytes(b"producer fixture\n" * 400)
             tools = {"ouro1": compiler}
 
@@ -55,7 +56,8 @@ class ProducerTests(unittest.TestCase):
         with self.fixture() as fixture:
             config = SimpleNamespace(path=lambda _key: fixture.directory)
             args = argparse.Namespace(compiler=None)
-            with patch.object(host, "build_config", return_value=config):
+            with patch.object(host, "build_config", return_value=config), \
+                 patch.object(host, "ensure_compiler", side_effect=AssertionError("fixture must not bootstrap a compiler")):
                 self.assertEqual(ouro_smith.compiler_for(args), fixture.compiler)
                 config.path = lambda _key: fixture.directory / "changed-default"
                 self.assertEqual(ouro_smith.compiler_for(args), fixture.compiler)

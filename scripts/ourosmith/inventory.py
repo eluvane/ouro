@@ -48,12 +48,19 @@ EXTERNAL = {
     "CheckReductionFailure": "compiler_result_tests", "CheckResourceLimit": "compiler_result_tests",
     "CheckUnsupported": "compiler_module_tests", "CheckCancelled": "compiler_module_tests",
     "CheckInternalFailure": "compiler_module_tests", "CheckPrimitiveFailure": "compiler_primitive_binding_tests",
+    "PrimitiveProcessBounded": "compiler_process_bounded_registry_tests",
 }
 for _name in """PrimitiveU8Type PrimitiveU32Type PrimitiveU64Type PrimitiveI32Type PrimitiveUSizeType
 PrimitiveRawPtrType PrimitiveRuntimeType PrimitiveRawFnType PrimitiveWordOperation PrimitiveWordConversion
 PrimitiveWordFromNat PrimitiveWordToNat PrimitiveRuntimePure PrimitiveRuntimeBind PrimitiveRuntimeLoop
 PrimitiveRawNull PrimitiveRawLoad PrimitiveRawStore PrimitiveRawAddWrap PrimitiveRawCast PrimitiveRawToBits
-PrimitiveRawFromBits PrimitiveFnCall""".split():
+PrimitiveRawFromBits PrimitiveFnCall
+PrimitiveStdoutWrite PrimitiveStderrWrite PrimitiveStdoutFlush PrimitiveProcessExit
+PrimitiveArgv PrimitiveEnvGet PrimitiveTimeNow PrimitiveStdinReadLine PrimitiveStdinReadBytes
+PrimitiveFileRead PrimitiveFileWrite PrimitiveFileKind PrimitiveFileExists PrimitiveFileIsDirectory
+PrimitiveFileRealpath PrimitiveDirectoryList PrimitiveDirectoryListable PrimitiveDirectoryCreate
+PrimitivePathRemove PrimitiveFileCopy PrimitiveFileRename PrimitiveFileTemp PrimitiveFileTempIn
+PrimitiveProcessCapture PrimitiveProcessInherit PrimitiveHttpPost""".split():
     EXTERNAL[_name] = "compiler_primitive_registry_tests"
 for _name in """PrimitiveStringByteAt PrimitiveStringStarts PrimitiveStringEnds PrimitiveStringContains
 PrimitiveStringIndex PrimitiveStringSplit PrimitiveStringReplace PrimitiveStringLessEqual PrimitiveStringTokens""".split():

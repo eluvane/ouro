@@ -6,6 +6,7 @@ unsigned long long ouro_heap_live_bytes(void);
 unsigned long long ouro_heap_total_alloc_bytes(void);
 
 #include <stdint.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -583,6 +584,8 @@ static unsigned long cell_size(const ouro_v *v)
 	unsigned long size = sizeof(ouro_v);
 	if (has_fields(v) && v->n > OURO_INLINE_FIELDS)
 		size += (unsigned long)v->n * sizeof(ouro_v *);
+	if (v->tag == OURO_TAG_BIG_NAT)
+		size += (unsigned long)v->n * sizeof(uint32_t);
 	return size;
 }
 
@@ -604,6 +607,10 @@ static ouro_v *clone_perm_rec(ouro_v *v, clone_tab *tab, int skip_cur_perm)
 	out->tag = v->tag;
 	out->n = v->n;
 	out->u = v->u;
+	if (v->tag == OURO_TAG_BIG_NAT) {
+		memcpy(out + 1, v + 1, (size_t)v->n * sizeof(uint32_t));
+		return out;
+	}
 	if (v->tag == OURO_TAG_CLOS || v->tag == OURO_TAG_THUNK) {
 		out->u.c.env = 0;
 		out->u.c.env = clone_env_rec(v->u.c.env, tab, skip_cur_perm);
@@ -706,6 +713,61 @@ static ouro_v *ouro_new(int tag, int n)
 	v->u.inl[0] = 0;
 	v->u.inl[1] = 0;
 	return v;
+}
+
+static ouro_v *nat_sub(ouro_v *n, ouro_v *m);
+
+static uint32_t nat_limb(const ouro_v *value, int index)
+{
+	if (value->tag == OURO_TAG_NAT)
+		return index == 0 ? (uint32_t)value->n : 0;
+	return index < value->n ? ((const uint32_t *)(value + 1))[index] : 0;
+}
+
+static int nat_limb_count(const ouro_v *value)
+{
+	return value->tag == OURO_TAG_NAT ? (value->n != 0) : value->n;
+}
+
+static ouro_v *nat_allocate(unsigned long count)
+{
+	ouro_v *value;
+	unsigned long bytes;
+	if (count > INT_MAX ||
+	    count > (ULONG_MAX - sizeof(ouro_v) - (OURO_ALIGN - 1UL)) / sizeof(uint32_t))
+		ouro_oom("Nat limbs", count);
+	bytes = sizeof(ouro_v) + count * sizeof(uint32_t);
+	value = (ouro_v *)ouro_alloc(bytes);
+	memset(value, 0, (size_t)bytes);
+	value->tag = OURO_TAG_BIG_NAT;
+	value->n = (int)count;
+	return value;
+}
+
+static ouro_v *nat_finish(ouro_v *value)
+{
+	uint32_t *words = (uint32_t *)(value + 1);
+	while (value->n > 0 && words[value->n - 1] == 0)
+		value->n--;
+	if (value->n == 0)
+		return ouro_nat(0);
+	if (value->n == 1 && words[0] <= INT_MAX)
+		return ouro_nat((unsigned long)words[0]);
+	return value;
+}
+
+static ouro_v *nat_from_u64(uint64_t number)
+{
+	ouro_v *value;
+	uint32_t *words;
+	if (number <= INT_MAX)
+		return ouro_nat((unsigned long)number);
+	value = nat_allocate(number > UINT32_MAX ? 2 : 1);
+	words = (uint32_t *)(value + 1);
+	words[0] = (uint32_t)number;
+	if (value->n == 2)
+		words[1] = (uint32_t)(number >> 32);
+	return value;
 }
 
 static ouro_v *mk_cat(ouro_v *a, ouro_v *b)
@@ -816,7 +878,7 @@ ouro_v *ouro_nat(unsigned long n)
 		}
 		return v;
 	}
-	return ouro_new(OURO_TAG_NAT, (int)n);
+	return n <= INT_MAX ? ouro_new(OURO_TAG_NAT, (int)n) : nat_from_u64((uint64_t)n);
 }
 
 ouro_v *ouro_bytes(const unsigned char *b, unsigned long len)
@@ -907,21 +969,7 @@ void ouro_write_codes(ouro_v *list, FILE *out)
 				list = OURO_F(list, 1);
 				continue;
 			}
-			if (d != 0 && d->tag == OURO_TAG_NAT) {
-				b = (unsigned long)d->n;
-			} else {
-				while (d != 0 && d->tag == 1 && d->n == 1) {
-					b++;
-					d = OURO_F(d, 0);
-				}
-				if (d != 0 && d->tag == OURO_TAG_NAT) {
-					b += (unsigned long)d->n;
-				} else if (d == 0 || d->tag != 0) {
-					fputs("ouro_rt: write_codes: element is not a Nat\n",
-					      stderr);
-					exit(1);
-				}
-			}
+			b = (unsigned long)ouro_nat_low32(d);
 			fputc((int)(b & 0xFFUL), out);
 			list = OURO_F(list, 1);
 			continue;
@@ -992,19 +1040,14 @@ static void phase_pop(unsigned long bytes)
 	ouro_reclaimed_bytes += bytes;
 }
 
-static void app_check(const ouro_v *f)
-{
-	if (f == 0 || f->tag != OURO_TAG_CLOS) {
-		fputs("ouro_rt: apply of non-function\n", stderr);
-		exit(1);
-	}
-}
-
 ouro_v *ouro_app(ouro_v *f, ouro_v *a)
 {
 	ouro_v *(*fn)(ouro_env *, ouro_v *);
 	ouro_env *env;
-	app_check(f);
+	if (f == 0 || f->tag != OURO_TAG_CLOS) {
+		fputs("ouro_rt: apply of non-function\n", stderr);
+		exit(1);
+	}
 	fn = f->u.c.fn;
 	env = f->u.c.env;
 	if (a != f && phase_top(f, sizeof(ouro_v)))
@@ -1014,7 +1057,10 @@ ouro_v *ouro_app(ouro_v *f, ouro_v *a)
 
 ouro_v *ouro_apply(ouro_v *f, ouro_v *a)
 {
-	app_check(f);
+	if (f == 0 || f->tag != OURO_TAG_CLOS) {
+		fputs("ouro_rt: apply of non-function\n", stderr);
+		exit(1);
+	}
 	return f->u.c.fn(f->u.c.env, a);
 }
 
@@ -1122,10 +1168,11 @@ static int stream_step(ouro_v **sp, ouro_v **head, ouro_v **tail)
 					 (unsigned long)s->n - 1UL);
 			return 1;
 		}
-		if (s != 0 && s->tag == OURO_TAG_NAT) {
+		if (s != 0 && (s->tag == OURO_TAG_NAT || s->tag == OURO_TAG_BIG_NAT)) {
 			if (s->n == 0)
 				return 0;
-			*head = ouro_nat((unsigned long)s->n - 1UL);
+			*head = s->tag == OURO_TAG_NAT ? ouro_nat((unsigned long)s->n - 1UL)
+			                                      : nat_sub(s, ouro_nat(1));
 			*tail = 0;
 			return 1;
 		}
@@ -1187,7 +1234,7 @@ ouro_v *ouro_case(ouro_v *s, int n, ouro_v **branches)
 	ouro_v **fields;
 	int i;
 	if (s != 0 && ((s->tag == OURO_TAG_CAT && s->n == 2) ||
-		       s->tag == OURO_TAG_BYTES || s->tag == OURO_TAG_NAT))
+		       s->tag == OURO_TAG_BYTES || s->tag == OURO_TAG_NAT || s->tag == OURO_TAG_BIG_NAT))
 		return case_stream(s, n, branches);
 	if (s == 0 || s->tag < 0 || s->tag >= n) {
 		fprintf(stderr, "ouro_rt: match failure tag=%d n=%d branches=%d\n",
@@ -1337,53 +1384,182 @@ static ouro_v *list_length(ouro_v *xs)
 	}
 }
 
-/* A Nat can mix both shapes: S applied to a packed value builds an S cell
-   whose field is OURO_TAG_NAT, so the chain walk has to add what it lands on
-   instead of treating it as Z. */
-static unsigned long nat_value(ouro_v *n)
+static void nat_failure(void)
 {
-	unsigned long v = 0;
-	if (n == 0)
-		return 0;
-	if (n->tag == OURO_TAG_NAT)
-		return (unsigned long)n->n;
-	while (n != 0 && n->tag == 1 && n->n == 1) {
-		v++;
-		n = OURO_F(n, 0);
+	fputs("ouro_rt: invalid Nat\n", stderr);
+	exit(1);
+}
+
+static ouro_v *nat_add_packed(ouro_v *left, ouro_v *right)
+{
+	int i, count = nat_limb_count(left);
+	int other = nat_limb_count(right);
+	uint64_t carry = 0;
+	ouro_v *value;
+	uint32_t *words;
+	if (left->tag == OURO_TAG_NAT && right->tag == OURO_TAG_NAT)
+		return nat_from_u64((uint64_t)left->n + (uint64_t)right->n);
+	if (other > count)
+		count = other;
+	value = nat_allocate((unsigned long)count + 1UL);
+	words = (uint32_t *)(value + 1);
+	for (i = 0; i < count; i++) {
+		uint64_t sum = (uint64_t)nat_limb(left, i) + nat_limb(right, i) + carry;
+		words[i] = (uint32_t)sum;
+		carry = sum >> 32;
 	}
-	if (n != 0 && n->tag == OURO_TAG_NAT && n->n > 0)
-		v += (unsigned long)n->n;
-	return v;
+	words[count] = (uint32_t)carry;
+	return nat_finish(value);
+}
+
+/* A natural may be a constructor chain ending in either packed form. */
+static ouro_v *nat_pack(ouro_v *value)
+{
+	unsigned long successors = 0;
+	while (value != 0 && value->tag == 1 && value->n == 1) {
+		if (successors == ULONG_MAX)
+			ouro_oom("Nat successor chain", successors);
+		successors++;
+		value = OURO_F(value, 0);
+	}
+	if (value != 0 && value->tag == 0 && value->n == 0)
+		return ouro_nat(successors);
+	if (value == 0 ||
+	    (value->tag == OURO_TAG_NAT ? value->n < 0 :
+	     value->tag != OURO_TAG_BIG_NAT || value->n <= 0))
+		nat_failure();
+	return successors == 0 ? value : nat_add_packed(value, ouro_nat(successors));
+}
+
+int ouro_nat_to_ulong(ouro_v *value, unsigned long *out)
+{
+	unsigned long successors = 0;
+	uint64_t number = 0;
+	int i;
+	while (value != 0 && value->tag == 1 && value->n == 1) {
+		if (successors == ULONG_MAX)
+			return 0;
+		successors++;
+		value = OURO_F(value, 0);
+	}
+	if (value == 0)
+		return 0;
+	if (value->tag == OURO_TAG_NAT && value->n >= 0)
+		number = (uint64_t)value->n;
+	else if (value->tag == OURO_TAG_BIG_NAT && value->n > 0 && value->n <= 2) {
+		for (i = value->n; i-- > 0;)
+			number = (number << 32) | nat_limb(value, i);
+	} else if (value->tag != 0 || value->n != 0)
+		return 0;
+	if (number > ULONG_MAX - successors)
+		return 0;
+	*out = (unsigned long)number + successors;
+	return 1;
+}
+
+uint32_t ouro_nat_low32(ouro_v *value)
+{
+	if (value != 0 && value->tag == OURO_TAG_NAT && value->n >= 0)
+		return (uint32_t)value->n;
+	return nat_limb(nat_pack(value), 0);
+}
+
+ouro_v *ouro_nat_decimal(ouro_v *value)
+{
+	int count, i;
+	unsigned long length = 0, capacity;
+	uint32_t *words;
+	char *text;
+	value = nat_pack(value);
+	count = nat_limb_count(value);
+	if ((unsigned long)count > (INT_MAX - 2UL) / 10UL)
+		ouro_oom("Nat decimal", (unsigned long)count);
+	capacity = (unsigned long)count * 10UL + 2UL;
+	text = (char *)ouro_alloc(capacity);
+	words = (uint32_t *)ouro_alloc(((unsigned long)count + 1UL) * sizeof(uint32_t));
+	for (i = 0; i < count; i++)
+		words[i] = nat_limb(value, i);
+	do {
+		uint64_t remainder = 0;
+		for (i = count; i-- > 0;) {
+			uint64_t dividend = (remainder << 32) | words[i];
+			words[i] = (uint32_t)(dividend / 10);
+			remainder = dividend % 10;
+		}
+		text[length++] = (char)('0' + remainder);
+		while (count > 0 && words[count - 1] == 0)
+			count--;
+	} while (count > 0);
+	for (i = 0; (unsigned long)i < length / 2; i++) {
+		char byte = text[i];
+		text[i] = text[length - 1UL - (unsigned long)i];
+		text[length - 1UL - (unsigned long)i] = byte;
+	}
+	text[length] = 0;
+	return ouro_str(text);
+}
+
+static int nat_compare_packed(ouro_v *left, ouro_v *right)
+{
+	int i = nat_limb_count(left), other = nat_limb_count(right);
+	if (i != other)
+		return i < other ? -1 : 1;
+	while (i-- > 0) {
+		uint32_t a = nat_limb(left, i), b = nat_limb(right, i);
+		if (a != b)
+			return a < b ? -1 : 1;
+	}
+	return 0;
 }
 
 static int nat_eq(ouro_v *a, ouro_v *b)
 {
-	if (a != 0 && b != 0 && a->tag == OURO_TAG_NAT && b->tag == OURO_TAG_NAT)
+	if (a != 0 && b != 0 && a->tag == OURO_TAG_NAT && b->tag == OURO_TAG_NAT &&
+	    a->n >= 0 && b->n >= 0)
 		return a->n == b->n;
-	return nat_value(a) == nat_value(b);
+	return nat_compare_packed(nat_pack(a), nat_pack(b)) == 0;
 }
 
 static ouro_v *nat_add(ouro_v *n, ouro_v *m)
 {
-	return ouro_nat(nat_value(n) + nat_value(m));
+	if (n != 0 && m != 0 && n->tag == OURO_TAG_NAT && m->tag == OURO_TAG_NAT &&
+	    n->n >= 0 && m->n >= 0)
+		return nat_from_u64((uint64_t)n->n + (uint64_t)m->n);
+	return nat_add_packed(nat_pack(n), nat_pack(m));
 }
 
 static ouro_v *nat_sub(ouro_v *n, ouro_v *m)
 {
-	unsigned long a = nat_value(n);
-	unsigned long b = nat_value(m);
-	return ouro_nat(a > b ? a - b : 0UL);
+	int i;
+	uint64_t borrow = 0;
+	ouro_v *value;
+	uint32_t *words;
+	if (n != 0 && m != 0 && n->tag == OURO_TAG_NAT && m->tag == OURO_TAG_NAT &&
+	    n->n >= 0 && m->n >= 0)
+		return ouro_nat(n->n > m->n ? (unsigned long)(n->n - m->n) : 0UL);
+	n = nat_pack(n);
+	m = nat_pack(m);
+	if (nat_compare_packed(n, m) <= 0)
+		return ouro_nat(0);
+	if (n->tag == OURO_TAG_NAT && m->tag == OURO_TAG_NAT)
+		return ouro_nat((unsigned long)(n->n - m->n));
+	value = nat_allocate((unsigned long)nat_limb_count(n));
+	words = (uint32_t *)(value + 1);
+	for (i = 0; i < value->n; i++) {
+		uint64_t a = nat_limb(n, i), b = (uint64_t)nat_limb(m, i) + borrow;
+		words[i] = (uint32_t)(a - b);
+		borrow = a < b;
+	}
+	return nat_finish(value);
 }
 
 static ouro_v *nat_cmp(ouro_v *n, ouro_v *m)
 {
-	unsigned long a = nat_value(n);
-	unsigned long b = nat_value(m);
-	if (a < b)
-		return nullary(0);
-	if (a == b)
-		return nullary(1);
-	return nullary(2);
+	if (n != 0 && m != 0 && n->tag == OURO_TAG_NAT && m->tag == OURO_TAG_NAT &&
+	    n->n >= 0 && m->n >= 0)
+		return nullary(n->n < m->n ? 0 : n->n == m->n ? 1 : 2);
+	int order = nat_compare_packed(nat_pack(n), nat_pack(m));
+	return nullary(order < 0 ? 0 : order == 0 ? 1 : 2);
 }
 
 static ouro_v *mem_nat(ouro_v *x, ouro_v *xs)
@@ -1484,7 +1660,32 @@ static ouro_v *f_mem_x(ouro_env *env, ouro_v *x)
 
 static ouro_v *nat_mul(ouro_v *n, ouro_v *m)
 {
-	return ouro_nat(nat_value(n) * nat_value(m));
+	int i, j, a_count, b_count;
+	ouro_v *value;
+	uint32_t *words;
+	if (n != 0 && m != 0 && n->tag == OURO_TAG_NAT && m->tag == OURO_TAG_NAT &&
+	    n->n >= 0 && m->n >= 0)
+		return nat_from_u64((uint64_t)n->n * (uint64_t)m->n);
+	n = nat_pack(n);
+	m = nat_pack(m);
+	if (n->tag == OURO_TAG_NAT && m->tag == OURO_TAG_NAT)
+		return nat_from_u64((uint64_t)n->n * (uint64_t)m->n);
+	a_count = nat_limb_count(n);
+	b_count = nat_limb_count(m);
+	if (a_count == 0 || b_count == 0)
+		return ouro_nat(0);
+	value = nat_allocate((unsigned long)a_count + (unsigned long)b_count);
+	words = (uint32_t *)(value + 1);
+	for (i = 0; i < a_count; i++) {
+		uint64_t carry = 0;
+		for (j = 0; j < b_count; j++) {
+			uint64_t product = (uint64_t)nat_limb(n, i) * nat_limb(m, j) + words[i + j] + carry;
+			words[i + j] = (uint32_t)product;
+			carry = product >> 32;
+		}
+		words[i + b_count] = (uint32_t)carry;
+	}
+	return nat_finish(value);
 }
 
 static ouro_v *f_mul_m(ouro_env *env, ouro_v *m)
@@ -1498,11 +1699,10 @@ static ouro_v *f_mul_n(ouro_env *env, ouro_v *n)
 	return ouro_clos(f_mul_m, ouro_cons(n, 0));
 }
 
-/* Word32 ops for Ouro std/crypto. Packed Nat stores the bit pattern in
-   v->n; the low 32 bits are the word. Not a kernel/TCB change. */
+/* Word32 operations deliberately retain only the low 32 bits. */
 static uint32_t nat32(ouro_v *n)
 {
-	return (uint32_t)nat_value(n);
+	return ouro_nat_low32(n);
 }
 
 static ouro_v *w32(uint32_t x)
@@ -1613,7 +1813,9 @@ static ouro_v *opt_some(ouro_v *x)
 
 static ouro_v *list_nth(ouro_v *xs, ouro_v *idx)
 {
-	unsigned long k = nat_value(idx);
+	unsigned long k;
+	if (!ouro_nat_to_ulong(nat_pack(idx), &k))
+		return opt_none();
 	for (;;) {
 		ouro_v *head = 0;
 		ouro_v *tail = 0;
@@ -1706,6 +1908,11 @@ void ouro_show(ouro_v *v)
 	}
 	if (v->tag == OURO_TAG_NAT) {
 		printf("{nat:%d}", v->n);
+		return;
+	}
+	if (v->tag == OURO_TAG_BIG_NAT) {
+		ouro_v *decimal = ouro_nat_decimal(v);
+		printf("{nat:%s}", decimal->u.s);
 		return;
 	}
 	if (v->tag == OURO_TAG_BYTES) {

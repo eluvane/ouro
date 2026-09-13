@@ -38,6 +38,10 @@ The wrapper requires the repository Python runner and fails closed without it un
 
 `unit.ouro` builds one `AnalysisUnit` per source with the compiler frontend (`preprocess_records` → `lex_all` → `parse_file`, then `expr_adapt.ouro` per definition). The unit carries definition names and lines, constructor/owner pairs plus the constructors of indexed families and the uninhabited inductives (`UnitTypes`), interned capability ids, layer marks, and the comment annotations parsed by `runtime_contracts.ouro`. Cores never see raw tokens.
 
+`std/process.ouro` belongs to the stdlib IO layer: it owns the checked process
+wrappers over the runtime intrinsics. This exact path classification leaves
+other stdlib modules subject to the pure-layer capability and effect checks.
+
 The exact entry points `tools/analyze/main.ouro` and
 `tools/analyze/drive_main.ouro` use the host-tool layer for filesystem and process
 IO. Other files under `tools/analyze/` keep the pure analyzer layer; a matching

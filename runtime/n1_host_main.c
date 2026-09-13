@@ -12,6 +12,7 @@ int ouro_export_count(void);
 const char *ouro_export_name(int i);
 ouro_v *ouro_export_value(int i);
 void ouro_fe_reset_mir_pins(void);
+void ouro_fe_set_progress(int enabled);
 
 static ouro_v *keep_reset(ouro_v *v)
 {
@@ -122,6 +123,14 @@ static void print_string(const char *prefix, ouro_v *v)
 {
 	if (v != 0 && v->tag == OURO_TAG_STR && v->u.s != 0)
 		fprintf(stderr, "%s%s\n", prefix, v->u.s);
+	else if (v != 0 &&
+		((v->tag == OURO_TAG_BYTES && v->n >= 0 && (v->n == 0 || v->u.s != 0)) ||
+		 (v->tag == 0 && v->n == 0) ||
+		 ((v->tag == 1 || v->tag == OURO_TAG_CAT) && v->n == 2))) {
+		fputs(prefix, stderr);
+		ouro_write_codes(v, stderr);
+		fputc('\n', stderr);
+	}
 	else
 		fprintf(stderr, "%s<non-string tag=%d n=%d>\n", prefix,
 			v == 0 ? -1 : v->tag, v == 0 ? -1 : v->n);
@@ -402,6 +411,7 @@ int main(int argc, char **argv)
 		return 2;
 	}
 	setvbuf(stderr, 0, _IONBF, 0);
+	ouro_fe_set_progress(1);
 	ouro_fe_reset_mir_pins();
 	snprintf(root, sizeof root, "%s", argv[1]);
 	ouro_slash_path(root);

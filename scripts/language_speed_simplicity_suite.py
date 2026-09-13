@@ -160,6 +160,15 @@ def main() -> int:
 
     # Build the hot-path binaries before exercising host behavior.
     run([sys.executable, "scripts/ouro_build.py", "build", "--verbosity", "quiet"])
+    collect_laws = ROOT / "_build/collect-source-laws"
+    collect_env = {**os.environ, "OURO_BUILD_TOOL_MODE": "native"}
+    run(["sh", "scripts/build_tool.sh", "tests/native_build_collection_tests.ouro",
+         str(collect_laws)], env=collect_env)
+    if os.name == "nt":
+        collect_laws = collect_laws.with_suffix(".exe")
+    collection = run([str(collect_laws), "--collect-only"])
+    if "PRECISION_SUITE native-build-collection rows=" not in collection.stdout:
+        raise AssertionError(collection.stdout)
     fixtures = prepare("manifest", ROOT / "_build/smith/speed-inputs", 1)
     fmt_inputs = prepare("fmt", ROOT / "_build/smith/speed-inputs", 1)
     ergo_cmd = [

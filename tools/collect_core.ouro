@@ -59,13 +59,126 @@ def collect_imports_scan (string_fuel : Nat)
       end
     end;
 
-def import_paths (src : String) : Col :=
+def collect_preprocessed_paths (src : String) : Col :=
     match preprocess_imports (str_codes src) with
-    | ImpErr _ _ => ColErr "collect_units: malformed import aliases"
+    | ImpErr code position => ColErr
+        (str_cat4 "collect_units: OURO-IMP-00" (str_of_nat code)
+          " at byte " (str_of_nat position))
     | ImpOk expanded =>
         let fuel : Nat := S (length Nat expanded) in
         collect_imports_scan fuel fuel expanded (Nil String)
     end;
+
+-- Jump between lexical candidates instead of allocating a closure for every
+-- byte in every imported unit. Alias-bearing source still uses the shared
+-- preprocessor, and import operands still use the compiler's string decoder.
+def collect_next_index (src : String) (word : String) (best : Nat) : Nat :=
+    match str_index src word with
+    | Nothing => best
+    | Just index => minNat index best
+    end;
+
+def collect_next_candidate (src : String) : Nat :=
+    collect_next_index src "import"
+      (collect_next_index src "open"
+        (collect_next_index src "as"
+          (collect_next_index src "--"
+            (collect_next_index src "\"" (str_len src)))));
+
+def collect_identifier_before (src : String) : Nat -> Bool :=
+    fix before (position : Nat) : Bool :=
+      match position with
+      | Z => False
+      | S previous =>
+          let byte : Nat := str_head (str_slice src previous 1) in
+          match source_is_ident_start byte with
+          | True => True
+          | False => match source_is_ident_char byte with
+            | True => before previous
+            | False => False
+            end
+          end
+      end;
+
+def collect_word_candidate (src : String) (position : Nat) (word : String) : Bool :=
+    match collect_identifier_before src position with
+    | True => False
+    | False =>
+        let after : Nat := add position (str_len word) in
+        source_word_end (str_codes (str_slice src after 1))
+    end;
+
+def collect_projection_before (src : String) : Nat -> Bool :=
+    fix before (position : Nat) : Bool :=
+      match position with
+      | Z => False
+      | S previous =>
+          let byte : Nat := str_head (str_slice src previous 1) in
+          match eqNat byte ch_dot_i with
+          | True => True
+          | False => match source_is_ident_char byte with
+            | True => before previous
+            | False => False
+            end
+          end
+      end;
+
+def import_paths (original : String) : Col :=
+    (fix scan (fuel : Nat) (src : String) (paths : List String) : Col :=
+      match fuel with
+      | Z => ColErr "collect_units: import scan exhausted"
+      | S remaining =>
+          let index : Nat := collect_next_candidate src in
+          match eqNat index (str_len src) with
+          | True => ColOk (reverse String paths)
+          | False =>
+              let candidate : String := str_slice src index (str_len src) in
+              match str_starts candidate "--" with
+              | True => match str_index candidate "\n" with
+                | Nothing => ColOk (reverse String paths)
+                | Just newline => scan remaining
+                    (str_slice candidate (add newline 1) (str_len candidate)) paths
+                end
+              | False => match str_starts candidate "\"" with
+                | True => scan remaining
+                    (str_of_codes (source_skip_string
+                      (str_codes (str_slice candidate 1 (str_len candidate))))) paths
+                | False =>
+                    let word : String := match str_starts candidate "import" with
+                      | True => "import"
+                      | False => match str_starts candidate "open" with
+                        | True => "open" | False => "as" end
+                      end in
+                    match collect_word_candidate src index word with
+                    | False => match source_take_ident (str_codes candidate) with
+                      | MkPair _ tail => scan remaining (str_of_codes tail) paths
+                      end
+                    | True => match str_eq word "import" with
+                      | False => collect_preprocessed_paths original
+                      | True => match collect_projection_before src index with
+                        | True => scan remaining
+                            (str_slice candidate 6 (str_len candidate)) paths
+                        | False =>
+                            let after : List Nat := skip_ws_i
+                              (str_codes (str_slice candidate 6 (str_len candidate))) in
+                            match after with
+                            | Nil => ColOk (reverse String paths)
+                            | Cons quote body => match eqNat quote ch_dq_i with
+                              | False => scan remaining (str_of_codes after) paths
+                              | True => match take_string fuel body (Nil Nat) with
+                                | StrErr => ColErr "collect_units: malformed import string"
+                                | StrOk path tail => scan remaining (str_of_codes tail)
+                                    (Cons String (str_of_codes path) paths)
+                                end
+                              end
+                            end
+                        end
+                      end
+                    end
+                end
+              end
+          end
+      end) (add (str_len original) 1) original (Nil String);
 
 -- Preserve the UNC prefix in compiler input paths. The shared path helpers
 -- still own separator and dot-segment normalization; package paths are unchanged.

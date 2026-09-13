@@ -100,7 +100,10 @@ def mir_facts_equal : List MirBlockFact -> List MirBlockFact -> Bool :=
       | True => match mir_set_equal values_a values_b with
         | False => False | True => mir_facts_equal rest_a rest_b end end end end;
 
+-- Retain a complete round before releasing its temporaries. This keeps shared
+-- predecessor lists together; convergence and fuel remain outside the callback.
 def mir_flow_facts_with
+    (run_facts : (Unit -> Either MirError (List MirBlockFact)) -> Either MirError (List MirBlockFact))
     (predecessors : Nat -> List MirBlockFact -> List MirBlock -> List Nat -> Either MirError (List Nat))
     (fuel : Nat) (entry : Nat) (args : List Nat) (locals : List Nat)
     (blocks : List MirBlock) : Either MirError (List MirBlockFact) :=
@@ -109,14 +112,15 @@ def mir_flow_facts_with
         (match eq_nat entry (mir_block_id block) with | True => args | False => locals end)) blocks in
     (fix go (remaining : Nat) (facts : List MirBlockFact) : Either MirError (List MirBlockFact) :=
       match remaining with | Z => Left MirError (List MirBlockFact) MirResourceExhausted | S next =>
-        match mir_flow_step_with predecessors entry args locals blocks facts blocks with
+        match run_facts (fun (_ : Unit) => mir_flow_step_with predecessors entry args locals blocks facts blocks) with
         | Left err => Left MirError (List MirBlockFact) err
         | Right updated => match mir_facts_equal facts updated with
           | True => Right MirError (List MirBlockFact) updated | False => go next updated end end end) fuel initial;
 
 def mir_flow_facts (fuel : Nat) (entry : Nat) (args : List Nat) (locals : List Nat)
     (blocks : List MirBlock) : Either MirError (List MirBlockFact) :=
-    mir_flow_facts_with mir_predecessor_values fuel entry args locals blocks;
+    mir_flow_facts_with (fun (work : Unit -> Either MirError (List MirBlockFact)) => work MkUnit)
+      mir_predecessor_values fuel entry args locals blocks;
 
 def mir_check_initialized (block : Nat) (initialized : List Nat) (value : MirValue) : Either MirError Unit :=
     match value with | MirBits _ _ => Right MirError Unit MkUnit
@@ -139,15 +143,17 @@ def mir_check_block_uses (facts : List MirBlockFact) (block : MirBlock) : Either
 -- local/type validation. Public flow helpers keep arbitrary-input semantics.
 def mir_check_declared_flow_with
     (run_unit : (Unit -> Either MirError Unit) -> Either MirError Unit)
+    (run_facts : (Unit -> Either MirError (List MirBlockFact)) -> Either MirError (List MirBlockFact))
     (predecessors : Nat -> List MirBlockFact -> List MirBlock -> List Nat -> Either MirError (List Nat))
     (fuel : Nat) (entry : Nat) (args : List Nat) (locals : List Nat)
     (blocks : List MirBlock) : Either MirError Unit :=
     match run_unit (fun (_ : Unit) => mir_reachable fuel entry blocks) with | Left err => Left MirError Unit err | Right _ =>
-      match mir_flow_facts_with predecessors fuel entry args locals blocks with
+      match mir_flow_facts_with run_facts predecessors fuel entry args locals blocks with
       | Left err => Left MirError Unit err
       | Right facts => run_unit (fun (_ : Unit) => mir_each MirBlock (mir_check_block_uses facts) blocks) end end;
 
 def mir_check_declared_flow (fuel : Nat) (entry : Nat) (args : List Nat) (locals : List Nat)
     (blocks : List MirBlock) : Either MirError Unit :=
     mir_check_declared_flow_with (fun (work : Unit -> Either MirError Unit) => work MkUnit)
+      (fun (work : Unit -> Either MirError (List MirBlockFact)) => work MkUnit)
       mir_predecessor_declared fuel entry args locals blocks;

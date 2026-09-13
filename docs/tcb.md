@@ -32,7 +32,7 @@ The checker has a deliberately small, pure dependency closure:
 | Responsibility | Modules |
 | --- | --- |
 | Data and terms | `std/types.ouro`, `std/prelude.ouro`, `std/data.ouro`, `compiler/base.ouro`, `compiler/core.ouro`, `compiler/file_check_model.ouro` |
-| Primitive contracts | `compiler/primitive_model.ouro`, `compiler/primitive_contracts.ouro`, `compiler/primitive_registry.ouro`, `compiler/primitive_check.ouro`, `compiler/primitive_roles.ouro` |
+| Primitive contracts | `compiler/primitive_model.ouro`, `compiler/primitive_contracts.ouro`, `compiler/primitive_registry_base.ouro`, `compiler/primitive_registry.ouro`, `compiler/primitive_check.ouro`, `compiler/primitive_roles.ouro` |
 | String reduction | `compiler/string_nf_bytes.ouro`, `compiler/string_nf_values.ouro`, `compiler/string_nf_eval.ouro` |
 | Environment and resource accounting | `compiler/file_check_environment.ouro`, `compiler/file_check_work.ouro` |
 | Declaration checking | `compiler/file_elab_core.ouro`, `compiler/file_elab_lookup.ouro`, `compiler/file_check_result.ouro`, `compiler/file_elab_positive.ouro`, `compiler/file_elab_term.ouro`, `compiler/file_elab_infer.ouro`, `compiler/file_elab.ouro` |
@@ -132,6 +132,11 @@ Bulk PE fixup planning derives a symbol index that retains the first original
 symbol for each ID. The existing resolver still checks that symbol's section
 and RVA; slot, target and ordering diagnostics keep their original precedence.
 Complete image validation continues to reject duplicate and malformed symbols.
+The temporary C host evaluates the complete canonical fixup plan in a nested
+allocation context, retaining its full patch list or typed error before freeing
+the symbol-index and traversal temporaries. Curried arguments and the caller
+remain live. The wrapper does not resolve targets, inspect slots or change
+patch bytes, ordering, validation or diagnostic precedence.
 Raising the MIR node/flow hard ceiling to `pe_byte3_place` is a host
 resource bound for compiler-sized images; it does not change typing,
 declaration order, or which MIR errors are accepted. The C wrap around
@@ -152,30 +157,55 @@ round context. The original `foldr`, frozen `seen` set, convergence step,
 fuel consumption and first unreachable-block error remain Ouro-owned.
 This limits temporary lifetime to one round; it does not impose a new
 graph algorithm or promise a fixed memory bound for an individual round.
+Declared-flow analysis similarly runs each complete `mir_flow_step_with`
+through a pure `run_facts` callback. The public runner is identity; the C
+host copies the complete typed result before freeing that round's context,
+preserving shared lists across its block facts. Predecessor intersection,
+immediate fact publication, convergence comparison, fuel and error order
+remain in Ouro. The caller retains prior facts until the comparison finishes.
 Retained MIR and codegen contexts follow each supplied
 argument and are cleared before frontend compilation resets permanent storage.
 Neither successful GC annotation nor executable
 encoding substitutes for MIR validation. The Ouro
 `managed_validate_parts` / `native_emit_image` path retains the same check.
 C wraps around `mir_gc_infer`, `mir_gc_annotate`, `mir_gc_check`,
-`x64_encode`, `codegen_assemble`, `mir_live_facts`, `codegen_parts`,
+`x64_encode`, `codegen_assemble`, `codegen_parts`,
 `codegen_live_instructions`, `codegen_instruction`, `codegen_block`, and
 `codegen_body` substitute
 equivalent host walks for the same Ouro functions so a compiler-sized
-image can finish on the C-hosted producer. The live-instruction wrap
+image can finish on the C-hosted producer. Liveness facts are computed by the
+canonical Ouro solver in a nested allocation context; its complete facts or
+typed error are retained before temporary storage is released. Each
+Jacobi round similarly retains its complete typed result before releasing
+round-local storage; frozen input facts, summary order, convergence and fuel
+remain in the canonical solver. Accelerated
+function emission runs that same liveness check first for managed-root
+functions, preserving unknown-edge and convergence-budget failures.
+The live-instruction wrap
 keeps every managed slot live instead of running the interpreted
 intra-block transfer; that is sound and more conservative. Unrecognized
 instruction shapes fall back to the generated closures. Managed
 allocation and managed-context instructions are included in the
 `codegen_instruction` wrap. The wraps do not change which MIR errors
 are accepted; they are a host lifetime and time seam, not a second
-checker.
+checker. Progress messages from these wraps are disabled for ordinary generated
+programs and explicitly enabled by the diagnostic N1 executable. Failure
+diagnostics and exit status are independent of that progress setting.
 
 Native Nat multiplication, division and remainder specialization requires
 complete checked Core templates, exact source dependencies, and registered Nat
 and Bool shapes. Machine conversions guard the optimized operand ranges;
 zero divisors and wider values call the captured original body. This is an
 execution optimization: checker reduction and program acceptance are unchanged.
+
+The transitional C runtime's existing Nat arithmetic bindings use compact
+small values and arbitrary-length 32-bit limbs for larger naturals. Addition,
+multiplication, comparison, saturating subtraction, constructor matching and
+decimal formatting preserve values beyond the host word width. Heap-context
+copies retain the limbs. Host-size conversions reject overflow; only the
+explicit Word32 operations and byte conversion discard high bits. These remain
+runtime assumptions in the existing C host boundary, exercised by arithmetic,
+conversion and lifetime regressions and the bounded-process API laws.
 
 Native managed startup adapters resolve `ouro.runtime.argv` and
 `ouro.runtime.env_get` through checked primitive identities and normalized
@@ -199,6 +229,10 @@ identities with the existing String/Runtime/Unit types. Their raw helpers use
 the same checked-body, complete-pointee and matching-contract requirements.
 C host filesystem read/write and string `of_char_codes` are length-based
 temporary adapters for native PE emission.
+The temporary C host also executes the checked Runtime pure, bind and loop
+operations, checked Nat-to-U8/U32 conversion and wrapping U8 subtraction.
+These adapters preserve deferred, reusable actions and reject malformed loop
+flags; they do not implement Windows extern calls or authorize programs.
 Windows handle validity, size queries, binary transfers, reparse attributes,
 truncation and close results remain runtime assumptions. The write guard
 inspects the opened final component before truncation. File scopes track raw

@@ -454,6 +454,18 @@ def run_suite(args: argparse.Namespace) -> tuple[dict[str, object], int]:
                 timeout=args.timeout_seconds,
                 env=san_env,
             )
+            for invalid in ("app-null", "app-value", "apply-null", "apply-value"):
+                run_check(
+                    checks,
+                    out=out,
+                    name="sanitizer-runtime-" + invalid,
+                    engine="asan-ubsan",
+                    command=[str(runtime_exe), invalid],
+                    expectation="deny",
+                    markers=("ouro_rt: apply of non-function",),
+                    timeout=args.timeout_seconds,
+                    env=san_env,
+                )
 
         if os.name != "nt":
             io_exe = out / "sanitizers" / "io-selftest"
@@ -485,6 +497,18 @@ def run_suite(args: argparse.Namespace) -> tuple[dict[str, object], int]:
                     timeout=args.timeout_seconds,
                     env=san_env,
                 )
+                for invalid in ("u8", "loop"):
+                    run_check(
+                        checks,
+                        out=out,
+                        name="sanitizer-io-invalid-" + invalid,
+                        engine="asan-ubsan",
+                        command=[str(io_exe), "--invalid-" + invalid],
+                        expectation="deny",
+                        markers=("ouro run: invalid U8 runtime value",),
+                        timeout=args.timeout_seconds,
+                        env=san_env,
+                    )
 
     failed_checks = [check.name for check in checks if check.status != "pass"]
     passed = not issues and not failed_checks
