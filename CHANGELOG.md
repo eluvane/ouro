@@ -86,6 +86,8 @@ integration may change.
   packaging dependencies in a Python 3.12 virtual environment on managed hosts.
 - Set the Clang C parser's bracket-depth limit for generated constructor
   expressions, including historical bootstrap inputs on Intel macOS.
+- Bind Release artifact names to the workflow run ID so uploads and downloads
+  also work from branches containing a slash.
 - Keep C-host native-lowering progress out of ordinary programs' stderr while
   preserving explicit N1 diagnostics and all failure messages.
 - Release temporary C-host allocations after each complete MIR flow round,
