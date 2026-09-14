@@ -17,6 +17,11 @@ integration may change.
 
 ## [Unreleased]
 
+### Fixed
+
+- Set the GitHub repository explicitly for draft publication without a checkout
+  and use the version tag as the release title.
+
 ## [0.1.0] - 2026-09-14
 
 First public release of compiler-owned checking, Windows x86-64 PE program
