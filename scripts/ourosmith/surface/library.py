@@ -10,6 +10,7 @@ import os
 import posixpath
 
 from ourosmith import ROOT
+from ourosmith.host import BUILD_TIMEOUT_S
 from ourosmith.surface.practical import application, workflow
 
 
@@ -248,7 +249,7 @@ def run_expressions(run, directory, recipe, rows, modules, property_name, *, sav
     path.write_text(imports + source, encoding="utf-8", newline="\n")
     units = collect_units(path.as_posix())
     # Integration recipes check and compile their complete stdlib source cone.
-    compile_timeout = run.timeout * 3
+    compile_timeout = BUILD_TIMEOUT_S
     run.accepts(path, artifact=False, units=units, timeout=compile_timeout)
     actual = run.native(path, units=units, io=True, compile_timeout=compile_timeout)
     run.require(actual.ok and actual.stdout == expected and not actual.stderr,

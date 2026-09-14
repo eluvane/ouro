@@ -8,7 +8,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 
 from ourosmith import ROOT
-from ourosmith.host import BUILD_MEMORY_MB, environment
+from ourosmith.host import BUILD_MEMORY_MB, BUILD_TIMEOUT_S, environment
 from ourosmith.limits import run_limited
 from repo_support import hash_json
 
@@ -152,7 +152,7 @@ def prepare(entry, work, compiler, *, memory_mb, executable=None, log=print):
     for unit in units:
         check.extend(("--unit", unit))
     log(f"OURO_SMITH: native strict check {entry}")
-    result = run_limited(check, cwd=ROOT, env=env, timeout_s=900, memory_mb=BUILD_MEMORY_MB)
+    result = run_limited(check, cwd=ROOT, env=env, timeout_s=BUILD_TIMEOUT_S, memory_mb=BUILD_MEMORY_MB)
     save_result(work / "strict-check", result)
     if not result.ok or result.stderr or result.stdout.replace("\r\n", "\n") != "CHECK_OK\n":
         raise ValueError(f"native strict check failed: {result.classify()} exit={result.returncode}; {work / 'strict-check.json'}")
@@ -165,7 +165,7 @@ def prepare(entry, work, compiler, *, memory_mb, executable=None, log=print):
                    "--compiler", str(compiler), "--jobs", "1", "--fuel", "16000", "--opt-level", "O0",
                    "--ccache", "disabled"]
         log(f"OURO_SMITH: native build {entry}")
-        built = run_limited(command, cwd=ROOT, env=env, timeout_s=900, memory_mb=BUILD_MEMORY_MB)
+        built = run_limited(command, cwd=ROOT, env=env, timeout_s=BUILD_TIMEOUT_S, memory_mb=BUILD_MEMORY_MB)
         save_result(work / "build", built)
         if not built.ok:
             raise ValueError(f"native build failed: {built.classify()} exit={built.returncode}; {work / 'build.json'}") from None

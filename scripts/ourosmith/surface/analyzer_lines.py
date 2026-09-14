@@ -5,6 +5,7 @@ import json
 import os
 
 from ourosmith import ROOT
+from ourosmith.host import BUILD_TIMEOUT_S
 
 
 def program(seed):
@@ -44,7 +45,7 @@ def run_checks(run, directory, saved=None):
     units = collect_units(path.as_posix())
     # This integration input imports the analyzer's full frontend graph.
     # Keep its compile budget separate from the generated program's deadline.
-    compile_timeout = run.timeout * 3
+    compile_timeout = BUILD_TIMEOUT_S
     run.accepts(path, artifact=False, units=units, timeout=compile_timeout)
     actual = run.native(path, units=units, io=True, compile_timeout=compile_timeout)
     run.require(actual.ok and actual.stdout == expected and not actual.stderr,

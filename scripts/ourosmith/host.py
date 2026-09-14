@@ -11,6 +11,7 @@ from ourosmith.limits import clean_env, run_limited
 
 TOOLS = ("collect", "fmt", "fix", "lint", "doc", "lsp", "test")
 BUILD_MEMORY_MB = 3072
+BUILD_TIMEOUT_S = 900
 
 
 def build_config():
@@ -148,7 +149,7 @@ def prepare_tools(out: Path, compiler: Path) -> tuple[dict[str, Path], dict]:
         command = [sys.executable, "-B", str(ROOT / "scripts/native_tool_build.py"), tool_entry(tool), str(target),
                    "--compiler", str(compiler), "--jobs", "1", "--ccache", "disabled",
                    "--build-dir", str(directory / "build"), "--cache-dir", str(cfg.path("cache_dir"))]
-        reason = build_command(command, Path(out) / (tool + "-build.log"), timeout_s=900)
+        reason = build_command(command, Path(out) / (tool + "-build.log"), timeout_s=BUILD_TIMEOUT_S)
         if reason:
             raise ValueError(reason)
         overrides["ouro-" + tool] = binary("ouro-" + tool, directory=directory)

@@ -77,6 +77,13 @@ integration may change.
 
 ### Fixed
 
+- Prepare the current compiler before Manual and Release validation groups,
+  including incomplete restored caches. PR and Nightly job deadlines cover
+  cold bootstrap plus full compiler groups. Smith's large integration-source
+  checks and compilation use the native preparation deadline while generated
+  program execution retains its configured limit.
+- Enable Darwin declarations for no-follow C-host writes and install release
+  packaging dependencies in a Python 3.12 virtual environment on managed hosts.
 - Keep C-host native-lowering progress out of ordinary programs' stderr while
   preserving explicit N1 diagnostics and all failure messages.
 - Release temporary C-host allocations after each complete MIR flow round,
