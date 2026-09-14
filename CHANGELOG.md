@@ -84,6 +84,8 @@ integration may change.
   program execution retains its configured limit.
 - Enable Darwin declarations for no-follow C-host writes and install release
   packaging dependencies in a Python 3.12 virtual environment on managed hosts.
+- Set the Clang C parser's bracket-depth limit for generated constructor
+  expressions, including historical bootstrap inputs on Intel macOS.
 - Keep C-host native-lowering progress out of ordinary programs' stderr while
   preserving explicit N1 diagnostics and all failure messages.
 - Release temporary C-host allocations after each complete MIR flow round,

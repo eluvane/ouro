@@ -304,6 +304,24 @@ def test_host_stack_link_flags() -> None:
             assert build_driver.host_link_flags() == expected, platform
 
 
+def test_clang_bracket_depth(tmp: Path) -> None:
+    cc = tmp / "bracket-cc.py"
+    write_fake_cc(cc)
+    source = tmp / "bracket.c"
+    source.write_text("int value(void) { return 1; }\n", encoding="utf-8")
+    cfg = build_driver.ResolvedConfig({**build_driver.DEFAULTS, "ccache": "disabled", "verbosity": "quiet"}, {})
+    for version, expected in (("Apple clang version 17.0.0", True), ("Ubuntu clang version 18.1.3", True),
+                              ("gcc (GCC) 13.3.0", False)):
+        identity = json.dumps({"cc": str(cc), "path": str(cc), "version": [version]})
+        with patch.dict(os.environ, {"FAKE_CC_LOG": str(tmp / "bracket-cc.log")}):
+            args = (cfg, str(cc), identity, "bracket", source, "bracket", [], [], tmp / "bracket-obj")
+            obj, report = build_driver.compile_c_object(*args)
+            assert report["cache"] == "miss", version
+            stamp = json.loads(obj.with_suffix(".cmdhash").read_text(encoding="utf-8"))
+            assert ("-fbracket-depth=1024" in stamp["command"]) is expected, version
+            assert build_driver.compile_c_object(*args)[1]["cache"] == "hit", version
+
+
 def test_native_tool_cache(tmp: Path) -> None:
     repo = tmp / "repo_tools"
     copy_repo(repo)
@@ -1411,6 +1429,7 @@ def main() -> int:
     test_host_stack_link_flags()
     with tempfile.TemporaryDirectory(prefix="ouro-build-suite-") as d:
         tmp = Path(d)
+        test_clang_bracket_depth(tmp)
         test_memory_preparation_failure(tmp)
         test_collect_build_protocol(tmp)
         test_build_tool_caller_paths(tmp)
