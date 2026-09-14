@@ -6,6 +6,7 @@ import os
 import time
 
 from ourosmith import ROOT
+from ourosmith.host import BUILD_TIMEOUT_S
 from ourosmith.surface.library import quote, string_list
 
 FEATURES = ("filesystem", "filesystem-errors", "walk", "walk-limit", "temporary-files",
@@ -158,7 +159,7 @@ def run_checks(run, directory, saved=None):
     built = run.command([run.cc, "-O1", "-std=c99", child, "-o", directory / "process helper.exe"], directory, "io-helper-compile")
     run.require(built.ok, "io-helper-compile", "exit 0", run.output(built))
     units = collect_units(path.as_posix())
-    compile_timeout = run.timeout * 3
+    compile_timeout = BUILD_TIMEOUT_S
     run.accepts(path, artifact=False, units=units, timeout=compile_timeout)
     env = {**run.env, "OURO_SMITH_VALUE": env_value}
     env.pop("OURO_SMITH_ABSENT", None)

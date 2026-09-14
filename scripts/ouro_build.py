@@ -426,6 +426,9 @@ def compile_c_object(
     if not src.exists():
         raise SystemExit(f"BOOTSTRAP: FAIL missing {source_path}")
     base_flags = profile_cflags(cfg)
+    if any("clang" in line.lower() for line in json.loads(cc_id)["version"]):
+        # Generated constructor expressions can exceed Clang's default 256.
+        base_flags.append("-fbracket-depth=1024")
     inc = [f"-I{d if d.is_absolute() else ROOT / d}" for d in include_dirs]
     flags = base_flags + list(extra_cflags) + inc
     display = source_label or path_key(src)

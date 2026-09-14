@@ -149,8 +149,9 @@ in seed or recipe order. Recipes that invoke wrappers with shared build
 outputs run serially after the independent recipes.
 The analyzer line scanner also runs serially so its large dependency graph
 does not compete with other compilation tasks. Its typecheck and compilation
-phases, and those of the stdlib and IO integration recipes, use three times
-`--timeout` (60 seconds by default) for their complete dependency graphs.
+phases, and those of the stdlib and IO integration recipes, use the same
+900-second preparation deadline as native law drivers for their complete
+dependency graphs. Small generated checker cases still use `--timeout`.
 Generated programs retain the ordinary runtime deadline. Command logs record
 each phase's deadline, duration, and peak memory.
 

@@ -204,12 +204,13 @@ class HarnessTests(unittest.TestCase):
                        run, directory, "stdlib_protocols", [('"saved"', "saved")], ["std/json.ouro"], "stdlib-protocols")))
         expected = ""
         hanging = False
+        preparation_hanging = False
         calls = []
 
         def execute(argv, *, timeout_s, **_kwargs):
             phase = "check" if "check" in argv else "emit-c" if argv[0] == "compiler" else "native-compile" if argv[0] == "cc" else "native-run"
             calls.append((phase, timeout_s))
-            duration = 21 if phase != "native-run" or hanging else 1
+            duration = (901 if preparation_hanging else 61) if phase != "native-run" else 21 if hanging else 1
             status = "timeout" if duration > timeout_s else "ok"
             stdout = "CHECK_OK\n" if phase == "check" else expected if phase == "native-run" else ""
             return RunResult(status, 0 if status == "ok" else 1, stdout, "", duration, 64)
@@ -227,7 +228,7 @@ class HarnessTests(unittest.TestCase):
                 calls.clear()
                 hanging = False
                 run_checks(runner, Path(directory))
-                self.assertEqual(calls, [("check", 60), ("emit-c", 60), ("native-compile", 60), ("native-run", 20)])
+                self.assertEqual(calls, [("check", 900), ("emit-c", 900), ("native-compile", 900), ("native-run", 20)])
                 self.assertEqual(runner.timeout, 20)
                 with self.assertRaises(StepFailure) as ordinary:
                     runner.check(Path(directory) / "main.ouro", artifact=False)
@@ -236,6 +237,11 @@ class HarnessTests(unittest.TestCase):
                 with self.assertRaises(StepFailure) as runtime:
                     run_checks(runner, Path(directory))
                 self.assertEqual((runtime.exception.prop, runtime.exception.classification), ("native-run", "timeout"))
+                preparation_hanging = True
+                with self.assertRaises(StepFailure) as preparation:
+                    run_checks(runner, Path(directory))
+                self.assertEqual((preparation.exception.prop, preparation.exception.classification), ("check", "timeout"))
+                preparation_hanging = False
 
     def test_analyzer_core_pool_uses_platform_memory_policy(self):
         import analyze_core_checks as checks
@@ -619,8 +625,8 @@ class HarnessTests(unittest.TestCase):
         self.assertEqual(native.call_args.kwargs["stdin"], saved["stdin"])
         self.assertEqual(native.call_args.kwargs["arguments"], saved["arguments"])
         self.assertEqual(native.call_args.kwargs["env"]["OURO_SMITH_VALUE"], saved["env_value"])
-        self.assertEqual(checked.call_args.kwargs["timeout"], 60)
-        self.assertEqual(native.call_args.kwargs["compile_timeout"], 60)
+        self.assertEqual(checked.call_args.kwargs["timeout"], 900)
+        self.assertEqual(native.call_args.kwargs["compile_timeout"], 900)
 
     def test_msvc_environment_is_local_and_fail_closed(self):
         import c_static_analysis_suite as gate

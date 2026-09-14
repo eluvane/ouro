@@ -2,6 +2,10 @@
    IO a is represented as a thunk: a closure applied to Unit. */
 #define _POSIX_C_SOURCE 200809L
 #define _XOPEN_SOURCE 700
+#ifdef __APPLE__
+/* Darwin keeps O_NOFOLLOW behind its extended interface feature macro. */
+#define _DARWIN_C_SOURCE 1
+#endif
 #include "ouro_rt.h"
 #include "ouro_io.h"
 

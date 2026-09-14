@@ -69,6 +69,12 @@ groups concurrently: several suites own fixed fixture/output paths. The full
 local command runs every gate in registry order. The runner rejects a group
 inventory that omits, duplicates, or invents a gate; its self-test also checks
 that each hosted matrix exactly matches its profile's group inventory.
+Manual and Release prepare the current compiler before running each validation
+group, including when a restored compiler cache lacks its bootstrap evidence.
+PR and Nightly validation jobs allow 120 minutes for cold bootstrap and the
+complete group; per-program execution and memory limits remain separate.
+Release artifacts use the workflow run ID so branch names containing `/` remain
+valid for uploads and downstream downloads.
 OuroSmith compiler evidence requires all eight compiler gate commands and their
 source-bound receipts. The shard runners must agree on the full inventory and
 binary identity; their combined artifacts must cover every fixture exactly once.

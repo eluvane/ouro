@@ -32,6 +32,11 @@ commands. `scripts/coil.sh` is the project-facing name for the same toolchain.
 macOS host executables reserve a 128 MiB main-thread stack at link time through
 Mach-O's `-stack_size`, including historical bootstrap producers. This reserve
 does not depend on changing the stack of the host Python interpreter.
+The C IO host enables Darwin's extended declarations so no-follow file writes
+retain `O_NOFOLLOW` under the POSIX feature flags. Release toolchain packaging
+uses Python 3.12 and installs its dependency in a local virtual environment.
+Clang C compilation allows bracket nesting up to 1024 for generated constructor
+expressions; the selected flag participates in the object-cache command key.
 
 The standalone Python frontend regenerator and bounded analyzer reserve a
 128 MiB POSIX stack for native compiler processes, capped by the inherited hard
