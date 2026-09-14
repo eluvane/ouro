@@ -17,6 +17,16 @@ integration may change.
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-09-14
+
+First public release of compiler-owned checking, Windows x86-64 PE program
+output, runtime garbage collection, the standard library, and repository
+CLI/build tooling.
+
+Host toolchain archives contain the sources and a C-hosted `ouro1` for Linux
+and macOS on x86-64 and ARM, and Windows x86-64. They do not claim signed
+binaries, SLSA provenance, or a formal correctness proof.
+
 ### Changed
 
 - Name native encoding and buffer constants, reuse list counts and simplify
@@ -131,15 +141,6 @@ integration may change.
   historical bridge parser can check `file_elab.ouro`.
 - Restore the missing `emit` helper used by record expansion so the historical
   checker accepts `preprocess_record.ouro`.
-
-## [0.1.0] - 2026-09-12
-
-First public source release of the standalone native Ouro toolchain:
-compiler-owned checker, Windows x86-64 PE output, runtime garbage collection,
-standard library, and repository CLI/build tooling.
-
-This tag is a source archive plus checksums. It does not claim signed binaries,
-SLSA provenance, or a formal correctness proof.
 
 [Unreleased]: https://github.com/eluvane/ouro/compare/v0.1.0...HEAD
 [0.1.0]: https://github.com/eluvane/ouro/releases/tag/v0.1.0
