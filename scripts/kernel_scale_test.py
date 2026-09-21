@@ -17,7 +17,8 @@ class KernelScaleTest(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory(prefix='ouro-kernel-scale-')
         self.addCleanup(temporary.cleanup)
-        self.root = Path(temporary.name)
+        # Match production path resolution, including macOS /var -> /private/var.
+        self.root = Path(temporary.name).resolve()
         self.addCleanup(patch.stopall)
         patch.object(scale, 'ROOT', self.root).start()
         patch.object(scale.frontend_regen, 'collect_units', side_effect=lambda entry: [entry]).start()
