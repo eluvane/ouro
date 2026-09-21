@@ -4,9 +4,18 @@
 -- @entry main
 
 import "fmt_pipeline.ouro";
+import "quality/source_write.ouro";
+import "fix/candidate_check.ouro";
 import "../std/io.ouro";
 import "../std/fs.ouro";
 import "../std/args.ouro";
+import "../std/processx.ouro";
+
+def fmt_show_bool (b : Bool) : String :=
+    match b with
+    | True => "true"
+    | False => "false"
+    end;
 
 -- Exit status is the union over files, so one unformatted file fails the run
 -- but every file still gets reported.
@@ -14,14 +23,21 @@ def fmt_write (path : String) (src : String) (out : String) : IO Bool :=
     match str_eq src out with
     | True => io_pure Bool True
     | False =>
-        do let! written := fs_write_checked path out;
-           match written with
+        do let! accepted := fmt_check_candidate path src out;
+           match accepted with
            | Left e =>
                do eprintln (str_cat3 path ": " (fs_error_message e));
                   io_pure Bool False
            | Right _ =>
-               do println (concat "formatted " path);
-                  io_pure Bool True
+               do let! written := quality_write_source_checked path src out;
+                  match written with
+                  | Left e =>
+                      do eprintln (str_cat3 path ": " (fs_error_message e));
+                         io_pure Bool False
+                  | Right _ =>
+                      do println (concat "formatted " path);
+                         io_pure Bool True
+                  end
            end
     end
 
@@ -270,7 +286,7 @@ def fmt_selftest_tree_row_count (out : String) : IO Nat :=
 def fmt_selftest_result_row (r : FmtSelftestResult) : String :=
     str_join "\t"
       ([ fmt_selftest_result_name r
-       , show_bool (fmt_selftest_result_pass r)
+       , fmt_show_bool (fmt_selftest_result_pass r)
        , fmt_selftest_result_issue r
        ] : List String);
 
@@ -294,14 +310,14 @@ def fmt_selftest_finish (out : String) (display_out : String)
        match eq_nat (fmt_selftest_failure_count results) Z with
        | True => do println
             (str_cat3 "FMT_SUITE: PASS rows="
-              (show_nat (length FmtSelftestResult results))
+              (prim_string_of_nat (length FmtSelftestResult results))
               (str_concat " out=" display_out));
                     exit Z
        | False => do eprintln
             (str_cat3 "FMT_SUITE: FAIL rows="
-              (show_nat (length FmtSelftestResult results))
+              (prim_string_of_nat (length FmtSelftestResult results))
               (str_concat " failures="
-                (show_nat (fmt_selftest_failure_count results))));
+                (prim_string_of_nat (fmt_selftest_failure_count results))));
                      exit (S Z)
        end
 
@@ -336,7 +352,7 @@ def run_fmt_selftest_tree_finalize (a : Args) : IO Unit :=
     do let! tree_rows := fmt_selftest_tree_row_count out;
        match passed with
        | True => println
-           (str_cat3 "FMT_OK tree files=" (show_nat tree_rows) "")
+           (str_cat3 "FMT_OK tree files=" (prim_string_of_nat tree_rows) "")
        | False => eprintln "FMT_FAIL tree unformatted"
        end;
        fmt_selftest_worker_finish out result
@@ -397,7 +413,7 @@ def run_fmt_selftest_plan (a : Args) : IO Unit :=
     let launcher : String := fs_child out ".fmt-selftest-launcher.sh" in
     do fmt_selftest_mkdir out;
        fmt_selftest_write launcher fmt_selftest_orchestrator;
-       println (show_bool (args_flag a "selftest-probe-failure"));
+       println (fmt_show_bool (args_flag a "selftest-probe-failure"));
        exit Z
 
 
@@ -408,10 +424,10 @@ def run_fmt_selftest (exe : String) (a : Args) : IO Unit :=
     do let! display_out := env_or "FMT_SUITE_DISPLAY_OUT" out;
        fmt_selftest_mkdir out;
        fmt_selftest_write launcher fmt_selftest_orchestrator;
-       let! result := proc_exec "sh"
+       let! result := process_run_spec (command_spec "sh"
          ([ launcher, exe, out, display_out
-          , show_bool (args_flag a "selftest-probe-failure"), launcher, fixtures
-          ] : List String);
+          , fmt_show_bool (args_flag a "selftest-probe-failure"), launcher, fixtures
+          ] : List String));
        do print (proc_stdout result);
           eprint (proc_stderr result);
           exit (proc_code result)
@@ -422,10 +438,43 @@ def fmt_switches : List String :=
     , "selftest-tree-prepare", "selftest-tree-finalize", "selftest-plan"
     , "tree-failed" ];
 
-def main : IO Unit :=
-    do let! argv := prim_argv;
-       let a : Args := args_of_argv_bools fmt_switches argv in
-       match args_opt a "selftest-worker" with
+def fmt_selftest_modes : List String :=
+    [ "selftest", "selftest-plan", "selftest-finalize", "selftest-tree-prepare", "selftest-tree-finalize" ];
+
+def fmt_options_valid (a : Args) (names : List String) : Bool :=
+    all String (fun (name : String) => andb (str_set_mem name names)
+      (notb (str_null (args_opt_or a name "")))) (map_keys String (args_opts a));
+
+def fmt_internal_args_valid (a : Args) (mode : String) : Bool :=
+    let flags : List String := match str_eq mode "selftest-worker" with
+      | True => ["selftest-probe-failure"]
+      | False => match str_eq mode "selftest-tree-finalize" with
+        | True => [mode, "tree-failed"]
+        | False => match orb (str_eq mode "selftest") (str_eq mode "selftest-plan") with
+          | True => [mode, "selftest-probe-failure"] | False => [mode] end end end in
+    let options : List String := match str_eq mode "selftest-worker" with
+      | True => ["selftest-worker", "out", "fixtures"]
+      | False => match str_eq mode "selftest-finalize" with
+        | True => ["out", "display-out"]
+        | False => match orb (str_eq mode "selftest") (str_eq mode "selftest-plan") with
+          | True => ["out", "fixtures"] | False => ["out"] end end end in
+    andb (nullb String (args_positional a))
+      (andb (all String (fun (flag : String) => str_set_mem flag flags) (args_flags a))
+        (fmt_options_valid a options));
+
+def fmt_args_valid (a : Args) : Bool :=
+    let modes : List String := filter String (args_flag a) fmt_selftest_modes in
+    let selected : List String := match args_opt a "selftest-worker" with
+      | Nothing => modes | Just _ => Cons String "selftest-worker" modes end in
+    match selected with
+    | Nil => andb (notb (andb (args_flag a "check") (args_flag a "write")))
+        (andb (all String (fun (flag : String) => str_set_mem flag ["check", "write"])
+          (args_flags a)) (fmt_options_valid a []))
+    | Cons mode rest => andb (nullb String rest) (fmt_internal_args_valid a mode)
+    end;
+
+def fmt_cli_dispatch (argv : List String) (a : Args) : IO Unit :=
+    match args_opt a "selftest-worker" with
        | Just name => run_fmt_selftest_worker a name
        | Nothing =>
            match args_flag a "selftest-plan" with
@@ -449,4 +498,14 @@ def main : IO Unit :=
                    end
                end
            end
+       end
+
+def main : IO Unit :=
+    do let! values := prim_argv;
+       let a : Args := args_of_argv_bools fmt_switches values in
+       match andb (args_argv_options_complete fmt_switches values) (fmt_args_valid a) with
+       | False => do eprintln "fmt: invalid arguments";
+                     eprintln "usage: ouro-fmt [--check | --write] FILE...";
+                     exit 2
+       | True => fmt_cli_dispatch values a
        end

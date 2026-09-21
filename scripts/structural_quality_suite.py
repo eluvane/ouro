@@ -6,6 +6,7 @@ import hashlib
 import json
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -203,6 +204,21 @@ class StructuralContracts(unittest.TestCase):
         self.assertIn('STRUCT_UNUSED_DEF', rules(scan({'a.py': source})))
         self.assertTrue(scan({'a.py': 'value = "ouro-structural: garbage"\n'})['complete'])
 
+    def test_encoded_native_symbol_roots(self):
+        helper = 'def raw_helper (value : Nat) : Nat := add value 1;'
+        encoded = ','.join(str(ord(char)) for char in 'raw_helper')
+        files = {'runtime/helper.ouro': helper,
+                 'compiler/names.ouro': f'def selected : List Nat := [{encoded}];'}
+        self.assertFalse(any(f['rule_id'] == 'STRUCT_UNUSED_DEF' and
+                             f['symbol'] == 'raw_helper' for f in scan(files)['findings']))
+        for source in (f'-- [{encoded}]', f'def text : String := "[{encoded}]";',
+                       f'def broken : List Nat := [{encoded},999];',
+                       f'def broken : List Nat := [{encoded}, other];'):
+            files['compiler/names.ouro'] = source
+            findings = scan(files)['findings']
+            self.assertTrue(any(f['rule_id'] == 'STRUCT_UNUSED_DEF' and
+                                f['symbol'] == 'raw_helper' for f in findings), source)
+
     def test_configuration_alias_and_compatibility(self):
         source = 'def config():\n    return os.getenv("BUILD_DIR", os.getenv("OLD_DIR", "out"))\n'
         self.assertIn('STRUCT_CONFIG_ALIAS_CHAIN', rules(scan({'a.py': source})))
@@ -217,6 +233,30 @@ class StructuralContracts(unittest.TestCase):
         self.assertNotIn('STRUCT_REDUNDANT_RUNTIME_PRIMITIVE', rules(scan({'runtime/runtime.c': aliases.replace('"new") == 0) v = ouro_clos(f', '"new") == 0) v = ouro_clos(g')})))
         self.assertIn('STRUCT_POLICY_IN_RUNTIME', rules(scan({'runtime/runtime.c': 'void *read_manifest(void) { return parse("Ouro.seal"); }'})))
         self.assertNotIn('STRUCT_POLICY_IN_RUNTIME', rules(scan({'runtime/runtime.c': 'void *read_file(char *path) { return fopen(path, "r"); }'})))
+
+    def test_classify_indexes_by_rule_and_members(self):
+        finding = {
+            'id': 'dup-1',
+            'rule_id': DUP,
+            'members': ['a.py#first', 'b.py#second'],
+            'classification': None,
+        }
+
+        class Symbol:
+            def __init__(self):
+                self.key = 'a.py#first'
+                self.classifications = [dict(rule=DUP, category='independent-oracle',
+                    related=['b.py#second'],
+                    reason='Independent expected-result computation for differential checking.')]
+
+        issues = sq.classify([finding], [Symbol()])
+        self.assertEqual(issues, [])
+        self.assertEqual(finding['classification']['at'], 'a.py#first')
+        stale = sq.classify(
+            [{'id': 'other', 'rule_id': DUP, 'members': ['a.py#first'], 'classification': None}],
+            [Symbol()],
+        )
+        self.assertEqual(stale, ['a.py#first: stale classification for STRUCT_DUPLICATE_IMPLEMENTATION'])
 
     def test_literal_unreachable_branch(self):
         for expr, expected in [('False', True), ('enabled', False)]:
@@ -252,6 +292,31 @@ class StructuralContracts(unittest.TestCase):
         for path, source in [('a.py', 'def broken('), ('a.c', 'int f(void) {'), ('a.ouro', 'def broken := "unterminated')]:
             self.assertFalse(scan({path: source})['complete'])
 
+    def test_lex_fixture_boundary_checks_negative_contract_and_confinement(self):
+        with tempfile.TemporaryDirectory(prefix='ouro-structural-') as directory:
+            root = Path(directory)
+            subprocess.run(['git', 'init', '-q', str(root)], check=True)
+            corpus = root / 'quality/fixtures/structural_lex'
+            corpus.mkdir(parents=True)
+            fixture = corpus / 'negative.ouro'
+            fixture.write_text('def broken := "unterminated')
+            manifest = corpus / 'manifest.json'
+            case = {'name': 'negative', 'file': fixture.name, 'language': 'ouro', 'error': True}
+            manifest.write_text(json.dumps({'kind': 'ouro.structural-lex-corpus.v1', 'cases': [case]}))
+            report = sq.analyze(root)
+            self.assertTrue(report['pass'], report['issues'])
+            self.assertEqual(report['files'][0]['boundary']['owner'], manifest.relative_to(root).as_posix())
+            fixture.write_text('def accepted : Nat := 0;')
+            self.assertIn('negative lex fixture unexpectedly accepted', '\n'.join(sq.analyze(root)['issues']))
+            fixture.unlink()
+            with self.assertRaisesRegex(ValueError, 'missing'):
+                sq.analyze(root)
+            (root / 'outside.ouro').write_text('def broken := "unterminated')
+            case['file'] = '../../../outside.ouro'
+            manifest.write_text(json.dumps({'kind': 'ouro.structural-lex-corpus.v1', 'cases': [case]}))
+            with self.assertRaisesRegex(ValueError, 'escapes'):
+                sq.analyze(root)
+
     def test_malformed_report_is_rejected(self):
         report = scan({'a.py': declaration('first')})
         sq.validate_report(report)
@@ -263,6 +328,16 @@ class StructuralContracts(unittest.TestCase):
         bad['pass'] = True
         with self.assertRaisesRegex(ValueError, 'count mismatch'):
             sq.validate_report(bad)
+
+
+class StructuralLexParity(unittest.TestCase):
+    def test_native_lex_driver_matches_legacy_oracle(self):
+        script = ROOT / 'scripts' / 'structural_lex_parity.py'
+        result = subprocess.run([sys.executable, '-B', str(script)], cwd=ROOT,
+                                capture_output=True, text=True, timeout=600)
+        if result.returncode == 77:
+            self.skipTest(result.stderr.strip() or 'native lex driver unavailable')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
 
 if __name__ == '__main__':

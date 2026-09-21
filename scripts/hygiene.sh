@@ -1,5 +1,14 @@
 #!/usr/bin/env sh
-# Seed hygiene is fail-closed: blobs, hashes, banners, packer, kernel hardening, and stage evidence must agree.
+# Seed hygiene is fail-closed: generated-hash checksums, generated-shape
+# needles, packer selftest, source presence, and stitch/wiring needles must
+# agree. Logs go under _build/hygiene/.
+#
+# Do not re-run gates that `python3 scripts/ci_gate.py --profile pr` already
+# owns. Required owners (see docs/ci.md and scripts/ci_gate.py):
+#   kernel-hardening, github-workflow-gate, generated-artifact-hashes,
+#   github-project-gate, release-package-check, docs-examples,
+#   strict-quality-firewall.
+# Local `hygiene.sh` is not their required owner.
 
 set -eu
 ROOT=$(CDPATH='' cd "$(dirname "$0")/.." && pwd)
@@ -10,6 +19,9 @@ if [ -z "${PYTHON:-}" ]; then
 	echo "HYGIENE_FAIL no working python (set PYTHON=)" >&2
 	exit 1
 fi
+
+HYGIENE_OUT="${HYGIENE_OUT:-$ROOT/_build/hygiene}"
+mkdir -p "$HYGIENE_OUT"
 
 fail=0
 ok() { echo "HYGIENE_OK  $*"; }
@@ -34,60 +46,11 @@ for f in compiler/stage0/driver_u.c compiler/stage0/backend_u.c; do
 	fi
 done
 
-if "$PYTHON" scripts/pack_frontend.py --selftest >/tmp/pack_selftest.out 2>&1; then
+if "$PYTHON" scripts/pack_frontend.py --selftest >"$HYGIENE_OUT/pack_selftest.out" 2>&1; then
 	ok "packer selftest"
 else
 	bad "packer selftest"
-	cat /tmp/pack_selftest.out >&2 || true
-fi
-
-if "$PYTHON" scripts/kernel_hardening_suite.py >/tmp/kernel_hardening_suite.out 2>&1; then
-	ok "kernel hardening suite"
-else
-	bad "kernel hardening suite"
-	cat /tmp/kernel_hardening_suite.out >&2 || true
-fi
-
-if "$PYTHON" scripts/github_workflow_gate.py >/tmp/github_workflow_gate.out 2>&1; then
-	ok "github workflow gate"
-else
-	bad "github workflow gate"
-	cat /tmp/github_workflow_gate.out >&2 || true
-fi
-
-if "$PYTHON" scripts/generated_artifact_drift_check.py --mode hashes >/tmp/generated_artifact_drift_hashes.out 2>&1; then
-	ok "generated artifact hash drift gate"
-else
-	bad "generated artifact hash drift gate"
-	cat /tmp/generated_artifact_drift_hashes.out >&2 || true
-fi
-
-if "$PYTHON" scripts/github_project_gate.py >/tmp/github_project_gate.out 2>&1; then
-	ok "github project gate"
-else
-	bad "github project gate"
-	cat /tmp/github_project_gate.out >&2 || true
-fi
-
-if "$PYTHON" scripts/release_package.py --check --out _build/release_check >/tmp/release_package_check.out 2>&1; then
-	ok "release package check"
-else
-	bad "release package check"
-	cat /tmp/release_package_check.out >&2 || true
-fi
-
-if "$PYTHON" scripts/docs_examples_gate.py >/tmp/docs_examples_gate.out 2>&1; then
-	ok "docs/examples gate"
-else
-	bad "docs/examples gate"
-	cat /tmp/docs_examples_gate.out >&2 || true
-fi
-
-if "$PYTHON" scripts/strict_quality_firewall.py --profile release --report _build/quality/strict-quality-firewall.json --sarif _build/quality/strict-quality-firewall.sarif --migration-report _build/quality/migration-report.md >/tmp/strict_quality_firewall.out 2>&1; then
-	ok "strict quality firewall"
-else
-	bad "strict quality firewall"
-	cat /tmp/strict_quality_firewall.out >&2 || true
+	cat "$HYGIENE_OUT/pack_selftest.out" >&2 || true
 fi
 
 for f in \

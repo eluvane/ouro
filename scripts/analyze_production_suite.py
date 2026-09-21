@@ -17,13 +17,15 @@ from __future__ import annotations
 
 import argparse
 import os
-import re
 import subprocess
 import sys
 import time
 from pathlib import Path
 from typing import Any, Sequence
 
+from analyze_bounded import DRIVE_FINDING_RE as FINDING_RE
+from analyze_bounded import DRIVE_REJECT_RE as REJECT_RE
+from analyze_bounded import drive_banner, drive_result_error, requested_drive_families, run_native
 from repo_support import bind_relative_path, read_json_value, write_json_atomic
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -32,10 +34,6 @@ REPORT_KIND = "ouro.analyze-production-report.v1"
 POLICY_KIND = "ouro.analyze-production-policy.v1"
 DEFAULT_POLICY = ROOT / "quality" / "analyze_production.json"
 DRIVE_ENTRY = "tools/analyze/drive_main.ouro"
-DRIVE_SOURCE_DIRS = ("tools/analyze",)
-FINDING_RE = re.compile(r"^(\S+?):(\d+):(\d+): (warning|error)\[(OURO-[A-Z]+\d+)\] ([a-z_]+)/", re.MULTILINE)
-BANNER_RE = re.compile(r"^ANALYZE_DRIVE files=(\d+) findings=(\d+) rejected=(\d+) families=(\S*)", re.MULTILINE)
-REJECT_RE = re.compile(r"^(\S+?): structured analyzer could not build the unit: (\S+)", re.MULTILINE)
 SWEEPS = {"strict": "--enable-strict", "all": "--enable-all"}
 # Rule labels printed as `label/rule` that belong to a drive family under a
 # different flag name (drive.ouro fam_metrics covers three rule tables).
@@ -74,21 +72,8 @@ def drive_binary() -> Path:
     return base
 
 
-def newest_source_mtime() -> float:
-    newest = (ROOT / DRIVE_ENTRY).stat().st_mtime
-    for directory in DRIVE_SOURCE_DIRS:
-        for path in (ROOT / directory).rglob("*.ouro"):
-            if "test" in path.relative_to(ROOT / directory).parts:
-                continue
-            newest = max(newest, path.stat().st_mtime)
-    return newest
-
-
 def ensure_drive(binary: Path) -> tuple[Path, str]:
-    """Build the drive binary the way scripts/ouro1.sh does when it is missing
-    or older than a core or its entry."""
-    if binary.is_file() and binary.stat().st_mtime >= newest_source_mtime():
-        return binary, ""
+    """Delegate freshness to the complete native source/compiler/build receipt."""
     env = os.environ.copy()
     env["OURO_BUILD_TOOL_MODE"] = "native"
     target = binary if binary.suffix != ".exe" else binary.with_suffix("")
@@ -117,24 +102,15 @@ def run_sweep(binary: Path, flag: str, scopes: Sequence[str]) -> tuple[subproces
     for scope in scopes:
         cmd.extend(("--scope", scope))
     started = time.perf_counter()
-    proc = subprocess.run(
-        cmd,
-        cwd=ROOT,
-        env=os.environ.copy(),
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        check=False,
-    )
+    proc = run_native(Path(cmd[0]), cmd[1:], ROOT)
     return proc, round(time.perf_counter() - started, 3)
 
 
 def summarize(stdout: str, stderr: str) -> dict[str, Any] | None:
-    banner = BANNER_RE.search(stdout)
-    if banner is None:
+    parsed = drive_banner(stdout)
+    if parsed is None:
         return None
+    counts, families = parsed
     by_family: dict[str, int] = {}
     by_code: dict[str, int] = {}
     for match in FINDING_RE.finditer(stdout):
@@ -144,10 +120,8 @@ def summarize(stdout: str, stderr: str) -> dict[str, Any] | None:
         by_code[code] = by_code.get(code, 0) + 1
     rejects = {path.replace("\\", "/"): reason for path, reason in REJECT_RE.findall(stderr)}
     return {
-        "files": int(banner.group(1)),
-        "findings": int(banner.group(2)),
-        "rejected": int(banner.group(3)),
-        "families": [f for f in banner.group(4).split(",") if f],
+        **counts,
+        "families": families.split(","),
         "by_family": dict(sorted(by_family.items())),
         "by_code": dict(sorted(by_code.items())),
         "rejections": dict(sorted(rejects.items())),
@@ -178,6 +152,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     if not out.is_absolute():
         out = ROOT / out
     out.mkdir(parents=True, exist_ok=True)
+    report_path = out / "report.json"
+    report_path.unlink(missing_ok=True)
     policy_path = Path(args.policy)
     if not policy_path.is_absolute():
         policy_path = ROOT / policy_path
@@ -199,15 +175,19 @@ def main(argv: Sequence[str] | None = None) -> int:
     order = ["strict"] if args.strict_only else ["strict", "all"]
     for name in order:
         flag = SWEEPS[name]
+        families = requested_drive_families(binary, [flag])
+        if families is None:
+            return fail(f"sweep {name}: native family selection unavailable")
         print(f"ANALYZE_PRODUCTION_START sweep={name} flag={flag} scopes={','.join(scopes)}")
         proc, elapsed = run_sweep(binary, flag, scopes)
         (out / f"{name}.out").write_text(proc.stdout, encoding="utf-8", newline="\n")
         (out / f"{name}.err").write_text(proc.stderr, encoding="utf-8", newline="\n")
         summary = summarize(proc.stdout, proc.stderr)
-        if summary is None:
+        protocol_error = drive_result_error(proc, families=families)
+        if summary is None or protocol_error:
             for line in (proc.stdout + proc.stderr).splitlines()[-20:]:
                 print(line, file=sys.stderr)
-            return fail(f"sweep {name} produced no ANALYZE_DRIVE banner (rc={proc.returncode})")
+            return fail(f"sweep {name}: {protocol_error or 'missing completion report'} (rc={proc.returncode})")
         summary["returncode"] = proc.returncode
         summary["elapsed_s"] = elapsed
         sweeps[name] = summary
@@ -250,7 +230,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         "pass": not problems,
         "elapsed_s": round(time.perf_counter() - started, 3),
     }
-    report_path = out / "report.json"
     write_json_atomic(report_path, report)
     if problems:
         for problem in problems:

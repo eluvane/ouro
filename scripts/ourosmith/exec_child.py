@@ -4,6 +4,7 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+from pathlib import Path
 
 
 def apply_rlimit(module, which, candidates):
@@ -24,7 +25,10 @@ def main():
     limit, *command = sys.argv[1:]
     try:
         if os.name == "nt":
-            from windows_job import join
+            # This file is executed by path; expose the repository's scripts
+            # root so the job adapter and its shared host helpers resolve.
+            sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+            from ourosmith.windows_job import join
 
             join(limit)
             return subprocess.call(command, executable=command[0])

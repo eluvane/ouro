@@ -428,7 +428,10 @@ def compile_c_object(
     base_flags = profile_cflags(cfg)
     if any("clang" in line.lower() for line in json.loads(cc_id)["version"]):
         # Generated constructor expressions can exceed Clang's default 256.
-        base_flags.append("-fbracket-depth=1024")
+        # Quality-tool cones that share the fixer worker exceed 1024.
+        # Clippy semantic resource laws still need 4096 after import fuel
+        # is kept out of compile-time unroll.
+        base_flags.append("-fbracket-depth=4096")
     inc = [f"-I{d if d.is_absolute() else ROOT / d}" for d in include_dirs]
     flags = base_flags + list(extra_cflags) + inc
     display = source_label or path_key(src)

@@ -1,0 +1,344 @@
+-- Scheduling/eligibility laws, not wall-clock assertions. The retained eager
+-- projection is a test oracle only; executable semantic decisions stay native.
+-- @entry main
+import "../../tools/clippy/semantic_rules.ouro";
+import "../../std/io.ouro";
+
+-- Freeze the pre-optimization projections in the oracle. Sharing the new
+-- helpers with both sides would let the same dropped/reordered event pass.
+def cp_calls_reference (events : List CmEvent) : List ClippyCallFact :=
+    concat_map CmEvent ClippyCallFact (fun (event : CmEvent) => match event with
+      | CmCallEvent call => [call]
+      | CmBindEvent _ => [] | CmUseEvent _ => [] | CmFlowEvent _ => []
+      | CmTraversalEvent _ => [] | CmRecursionEvent _ => [] | CmWrapperEvent _ => []
+      | CmFinding _ => [] | CmToken _ _ => [] end) events;
+
+def cp_flow_ids_reference (kinds : List Nat) (events : List CmEvent) : List Nat :=
+    quality_sort Nat leb_nat (concat_map CmEvent Nat (fun (event : CmEvent) => match event with
+      | CmFlowEvent flow => match flow with | CmFlow _ kind id =>
+          match elem Nat eq_nat kind kinds with | True => [id] | False => [] end end
+      | CmCallEvent _ => [] | CmBindEvent _ => [] | CmUseEvent _ => []
+      | CmTraversalEvent _ => [] | CmRecursionEvent _ => [] | CmWrapperEvent _ => []
+      | CmFinding _ => [] | CmToken _ _ => [] end) events);
+
+def cp_tokens_reference (exact : Bool) (events : List CmEvent) : List Nat :=
+    concat_map CmEvent Nat (fun (event : CmEvent) => match event with
+      | CmToken alpha spelling => [match exact with | True => spelling | False => alpha end]
+      | CmCallEvent _ => [] | CmBindEvent _ => [] | CmUseEvent _ => [] | CmFlowEvent _ => []
+      | CmTraversalEvent _ => [] | CmRecursionEvent _ => [] | CmWrapperEvent _ => []
+      | CmFinding _ => [] end) events;
+
+def cp_clone_call_known_reference (apis : CmApiIndex) (call : ClippyCallFact) : Bool :=
+    andb (cm_call_pure call) (match cm_api_lookup (cm_call_callee call) apis with
+      | Nothing => False
+      | Just api => orb (eq_nat (sc_decl_kind (cm_api_decl api)) 3)
+          (cs_complete (cm_api_summary api)) end);
+
+def cp_definition_proofs_reference (unit : ClippySemanticUnit) (item : CmDefinition)
+    (calls : List ClippyCallFact) : List CgSProof :=
+    let owner : String := cm_name (cm_intern unit) (sc_decl_name (cm_definition_decl item)) in
+    let events : List CmEvent := cm_definition_events item in
+    append CgSProof (cm_findings (cm_definition_decl item) owner events)
+      (append CgSProof (cm_unobserved (cm_definition_decl item) owner (cp_flow_ids_reference [1] events) (cp_flow_ids_reference [3,4,6,9] events) (Nothing Nat))
+        (append CgSProof (cm_repeated (cm_definition_decl item) owner CmRepeatedWorkProof
+          "the same registered pure conversion/parse/normalization consumes the same value in one effect-free region"
+          cm_work_key (filter ClippyCallFact cm_work_eligible calls))
+          (cm_repeated (cm_definition_decl item) owner CmRepeatedTraversalProof
+            "the same registered pure traversal is repeated with identical callee and all argument identities in one effect-free region"
+            cm_work_key (filter ClippyCallFact cm_traversal_eligible calls))));
+
+def cp_call : ClippyCallFact := CmCall 7 9 0 0 15 True 1 [] False;
+
+def cp_events : Nat -> List CmEvent :=
+  fix go (count : Nat) : List CmEvent :=
+    match count with
+    | Z => [CmUseEvent 9, CmFlowEvent (CmFlow 1 2 3)]
+    | S less => Cons CmEvent (CmUseEvent 9)
+        (Cons CmEvent (CmToken count (add count 1))
+          (Cons CmEvent (CmCallEvent cp_call) (go less)))
+    end;
+
+def cp_threshold (count : Nat) (needed : Nat) : Bool :=
+    let events : List CmEvent := cp_events count in
+    compiler_bool_equal (cm_has_tokens needed events)
+      (leb_nat needed (length Nat (cp_tokens_reference False events)));
+
+def cp_thresholds : Bool :=
+    all Nat (fun (count : Nat) =>
+      all Nat (fun (needed : Nat) => cp_threshold count needed)
+        ([0, 1, 2, 119, 120, 121, 256] : List Nat))
+      ([0, 1, 2, 119, 120, 121, 256] : List Nat);
+
+def cp_calls_bound : Bool :=
+    andb (notb (cm_has_two_calls []))
+      (andb (notb (cm_has_two_calls [cp_call]))
+        (andb (cm_has_two_calls [cp_call, cp_call])
+          (cm_has_two_calls [cp_call, cp_call, cp_call])));
+
+def cp_proof_eq (left : CgSProof) (right : CgSProof) : Bool :=
+    match left with | MkCgSProof lc lo ln le => match right with
+      | MkCgSProof rc ro rn re => andb (prim_string_eq lc rc)
+          (andb (prim_string_eq lo ro) (andb (eq_nat ln rn) (prim_string_eq le re)))
+      end end;
+
+def cp_proofs_eq : List CgSProof -> List CgSProof -> Bool :=
+  fix go (left : List CgSProof) (right : List CgSProof) : Bool :=
+    match left with
+    | Nil => nullb CgSProof right
+    | Cons first rest => match right with
+      | Nil => False
+      | Cons other tail => andb (cp_proof_eq first other) (go rest tail)
+      end
+    end;
+
+-- Original eager eligibility order, including full stream allocation. This
+-- deliberately does not delegate to cm_clone_candidate or cm_has_tokens.
+def cp_eager_clones (unit : ClippySemanticUnit) (apis : CmApiIndex)
+    (definitions : List CmDefinition) : List CmClone :=
+    quality_sort CmClone cm_clone_le
+      (concat_map CmDefinition CmClone (fun (item : CmDefinition) =>
+        let alpha : List Nat := cp_tokens_reference False (cm_definition_events item) in
+        let decl : ScDecl := cm_definition_decl item in
+        let calls : List ClippyCallFact := cp_calls_reference (cm_definition_events item) in
+        let boundary : Bool := orb (cm_contract_policy (cm_contract_for unit decl))
+          (orb (cm_boundary unit decl 1) (cm_boundary unit decl 3)) in
+        match orb boundary (orb (ltb_nat (length Nat alpha) 120)
+            (orb (ltb_nat (length ClippyCallFact calls) 2)
+              (notb (all ClippyCallFact (cp_clone_call_known_reference apis) calls)))) with
+        | True => []
+        | False => [CmCloneOf (cm_hash alpha) decl alpha
+            (cp_tokens_reference True (cm_definition_events item))] end) definitions);
+
+def cp_reference (unit : ClippySemanticUnit) (apis : CmApiIndex)
+    : Either QualityInputError (List CgSProof) :=
+    match cm_build_definitions unit apis (cm_declarations unit) with
+    | Left error => Left QualityInputError (List CgSProof) error
+    | Right definitions => Right QualityInputError (List CgSProof)
+        (append CgSProof
+          (concat_map CmDefinition CgSProof (fun (item : CmDefinition) =>
+            cp_definition_proofs_reference unit item
+              (cp_calls_reference (cm_definition_events item))) definitions)
+          (cm_duplicate_proofs unit (cp_eager_clones unit apis definitions)))
+    end;
+
+-- The compiler parser and declaration index own this import-free test unit.
+def cp_unit (source : String) : Either QualityInputError ClippySemanticUnit :=
+    match cm_parse source empty_intern with
+    | Left error => Left QualityInputError ClippySemanticUnit error
+    | Right parsed => match parsed with | MkPair decls intern =>
+      match load_intern_string intern (prim_string_to_char_codes
+          "tests/clippy_semantic/performance_subject.ouro") with
+      | MkPair entry keyed => match cm_after_parse
+          "tests/clippy_semantic/performance_subject.ouro" entry True decls keyed with
+        | MkHarvest updated symbols _ canonical =>
+            match sc_index_sorted (quality_sort ScDecl
+                (fun (a : ScDecl) (b : ScDecl) =>
+                  leb_nat (sc_decl_name a) (sc_decl_name b)) symbols) with
+            | Left error => Left QualityInputError ClippySemanticUnit
+                (QualityInvalidInput (sc_error_message error))
+            | Right index => Right QualityInputError ClippySemanticUnit
+                (CmUnit updated entry source [MkSrcUnit entry canonical]
+                  symbols index canonical 1)
+            end
+        end
+      end end
+    end;
+
+def cp_wrap : Nat -> String -> String :=
+  fix go (count : Nat) (value : String) : String :=
+    match count with
+    | Z => value
+    | S less => prim_string_concat "(BoxNext "
+        (prim_string_concat (go less value) ")")
+    end;
+
+def cp_source (size : Nat) : String :=
+    prim_string_concat
+      "inductive Box : Type := | BoxEnd : Box | BoxNext : Box -> Box;\n"
+      (prim_string_concat "def first (x : Box) : Box := "
+        (prim_string_concat (cp_wrap size "x")
+          (prim_string_concat ";\ndef second (x : Box) : Box := "
+            (prim_string_concat (cp_wrap size "x")
+              (prim_string_concat ";\ndef third (y : Box) : Box := "
+                (prim_string_concat (cp_wrap size "y") ";\n"))))));
+
+def cp_parity (source : String) (minimum : Nat) (expect_error : Bool) : Bool :=
+    match cp_unit source with
+    | Left _ => False
+    | Right unit => match cm_build_apis unit (cm_index unit) with
+      | Left _ => False
+      | Right initial =>
+          let apis : CmApiIndex := cs_cache
+            (cs_analyze unit initial cm_visit_fuel cm_analyze_depth) in
+          match cp_reference unit apis with
+          | Left before => match cm_fold_definition_proofs unit apis
+              (cm_declarations unit) [] [] with
+            | Left after => andb expect_error
+                (prim_string_eq (quality_input_message before) (quality_input_message after))
+            | Right _ => False end
+          | Right before => match cm_fold_definition_proofs unit apis
+              (cm_declarations unit) [] [] with
+            | Left _ => False
+            | Right after => andb (notb expect_error)
+                (andb (leb_nat minimum (length CgSProof before))
+                  (cp_proofs_eq before after)) end
+          end
+      end
+    end;
+
+-- Exact field equality: argument taint/constant/IO flags are not collapsed
+-- into a textual value key when checking the projection contract.
+def cp_list_eq (A : Type) (same : A -> A -> Bool) : List A -> List A -> Bool :=
+  fix go (left : List A) (right : List A) : Bool :=
+    match left with
+    | Nil => nullb A right
+    | Cons value rest => match right with
+      | Nil => False
+      | Cons other tail => andb (same value other) (go rest tail)
+      end
+    end;
+
+def cp_value_eq (left : CmValue) (right : CmValue) : Bool :=
+    all Bool (fun (same : Bool) => same)
+      [ eq_nat (cm_value_kind left) (cm_value_kind right)
+      , eq_nat (cm_value_id left) (cm_value_id right)
+      , eq_nat (cm_value_result left) (cm_value_result right)
+      , compiler_bool_equal (cm_value_io left) (cm_value_io right)
+      , compiler_bool_equal (cm_value_taint left) (cm_value_taint right)
+      , compiler_bool_equal (cm_value_constant left) (cm_value_constant right)
+      ];
+
+def cp_call_eq (left : ClippyCallFact) (right : ClippyCallFact) : Bool :=
+    all Bool (fun (same : Bool) => same)
+      [ eq_nat (cm_call_node left) (cm_call_node right)
+      , eq_nat (cm_call_callee left) (cm_call_callee right)
+      , eq_nat (cm_call_branch left) (cm_call_branch right)
+      , eq_nat (cm_call_epoch left) (cm_call_epoch right)
+      , eq_nat (cm_call_role left) (cm_call_role right)
+      , compiler_bool_equal (cm_call_pure left) (cm_call_pure right)
+      , eq_nat (cm_call_cost left) (cm_call_cost right)
+      , cp_list_eq CmValue cp_value_eq (cm_call_args left) (cm_call_args right)
+      , compiler_bool_equal (cm_call_recursive left) (cm_call_recursive right)
+      ];
+
+def cp_other_call : ClippyCallFact :=
+    CmCall 8 10 3 4 19 False 2
+      [CmValueOf 1 2 3 True False True, CmValueOf 1 2 3 False True False] True;
+
+-- Every event constructor participates, including an invalid proof that must
+-- not enter these projections. Flow IDs, calls and tokens deliberately repeat.
+def cp_mixed_events : List CmEvent :=
+    [ CmCallEvent cp_call
+    , CmFlowEvent (CmFlow 1 1 7)
+    , CmToken 3 103
+    , CmBindEvent (CmBinding 1 2 (cm_unknown 3))
+    , CmUseEvent 4
+    , CmFlowEvent (CmFlow 1 3 2)
+    , CmTraversalEvent (CmTraversal 1 2 3 "projection")
+    , CmRecursionEvent (CmRecursion 1 2 [cm_unknown 3])
+    , CmWrapperEvent (CmWrapper 1 2 [3, 4] False)
+    , CmFinding (CmSemanticProofOf CmIgnoredResultProof 1 2 3 4 5
+        (Nothing (Pair Nat Nat)) [] "invalid projection fixture proof")
+    , CmCallEvent cp_other_call
+    , CmToken 1 101
+    , CmFlowEvent (CmFlow 2 1 2)
+    , CmFlowEvent (CmFlow 3 1 7)
+    , CmFlowEvent (CmFlow 4 9 7)
+    , CmToken 3 103
+    , CmFlowEvent (CmFlow 5 1 0)
+    , CmFlowEvent (CmFlow 6 0 99)
+    , CmFlowEvent (CmFlow 7 2 98)
+    , CmFlowEvent (CmFlow 8 4 4)
+    , CmFlowEvent (CmFlow 9 5 97)
+    , CmFlowEvent (CmFlow 10 6 6)
+    , CmFlowEvent (CmFlow 11 7 96)
+    , CmFlowEvent (CmFlow 12 8 95)
+    , CmFlowEvent (CmFlow 13 10 94)
+    , CmCallEvent cp_call
+    ];
+
+def cp_projection_parity (events : List CmEvent) : Bool :=
+    andb (cp_list_eq ClippyCallFact cp_call_eq
+        (cm_calls events) (cp_calls_reference events))
+      (andb (cp_list_eq Nat eq_nat (cm_tokens False events) (cp_tokens_reference False events))
+        (andb (cp_list_eq Nat eq_nat (cm_tokens True events) (cp_tokens_reference True events))
+          (all (List Nat) (fun (kinds : List Nat) =>
+            cp_list_eq Nat eq_nat (cm_flow_ids kinds events) (cp_flow_ids_reference kinds events))
+            [[], [1], [3, 4, 6, 9], [1, 1, 3, 9], [0, 10], [2, 5, 7, 8]])));
+
+def cp_projection_expected : Bool :=
+    all Bool (fun (same : Bool) => same)
+      [ cp_list_eq ClippyCallFact cp_call_eq (cm_calls cp_mixed_events)
+          [cp_call, cp_other_call, cp_call]
+      , cp_list_eq Nat eq_nat (cm_tokens False cp_mixed_events) [3, 1, 3]
+      , cp_list_eq Nat eq_nat (cm_tokens True cp_mixed_events) [103, 101, 103]
+      , cp_list_eq Nat eq_nat (cm_flow_ids [1] cp_mixed_events) [0, 2, 7, 7]
+      , cp_list_eq Nat eq_nat (cm_flow_ids [3, 4, 6, 9] cp_mixed_events) [2, 4, 6, 7]
+      ];
+
+def cp_gate_parity (apis : CmApiIndex) (calls : List ClippyCallFact) : Bool :=
+    compiler_bool_equal (cm_clone_calls_known apis calls)
+      (all ClippyCallFact (cp_clone_call_known_reference apis) calls);
+
+def cp_definition_gate_parity (apis : CmApiIndex) (item : CmDefinition) : Bool :=
+    let calls : List ClippyCallFact := cp_calls_reference (cm_definition_events item) in
+    let first_bad : List ClippyCallFact := Cons ClippyCallFact cp_other_call calls in
+    let last_bad : List ClippyCallFact := append ClippyCallFact calls [cp_other_call] in
+    all Bool (fun (same : Bool) => same)
+      [ cm_has_two_calls calls
+      , cm_clone_calls_known apis calls
+      , notb (cm_clone_calls_known apis first_bad)
+      , notb (cm_clone_calls_known apis last_bad)
+      , cp_gate_parity apis calls
+      , cp_gate_parity apis first_bad
+      , cp_gate_parity apis last_bad
+      ];
+
+def cp_known_gate_parity : Bool :=
+    match cp_unit (cp_source 2) with
+    | Left _ => False
+    | Right unit => match cm_build_apis unit (cm_index unit) with
+      | Left _ => False
+      | Right initial =>
+          let apis : CmApiIndex := cs_cache
+            (cs_analyze unit initial cm_visit_fuel cm_analyze_depth) in
+          match cm_build_definitions unit apis (cm_declarations unit) with
+          | Left _ => False
+          | Right definitions => andb (eq_nat (length CmDefinition definitions) 3)
+              (all CmDefinition (cp_definition_gate_parity apis) definitions)
+          end
+      end
+    end;
+
+def cp_laws : List (Pair String Bool) :=
+    [ MkPair String Bool "token-threshold-equals-full-projection" cp_thresholds
+    , MkPair String Bool "two-call-bound-keeps-duplicate-calls" cp_calls_bound
+    , MkPair String Bool "empty-event-projection-parity" (cp_projection_parity [])
+    , MkPair String Bool "all-event-kinds-projection-parity"
+        (andb (cp_projection_parity cp_mixed_events)
+          (cp_projection_parity (reverse_lin CmEvent cp_mixed_events)))
+    , MkPair String Bool "projection-preserves-payload-order-and-duplicates" cp_projection_expected
+    , MkPair String Bool "sparse-event-projection-parity"
+        (all Nat (fun (count : Nat) => cp_projection_parity (cp_events count))
+          [0, 1, 2, 119, 120, 121, 256, 512])
+    , MkPair String Bool "unknown-clone-calls-remain-ineligible"
+        (andb (cm_clone_calls_known CmApiEmpty [])
+          (andb (notb (cm_clone_calls_known CmApiEmpty [cp_call, cp_call]))
+            (cp_gate_parity CmApiEmpty [cp_call, cp_other_call])))
+    , MkPair String Bool "clone-gate-known-and-early-late-rejection-parity" cp_known_gate_parity
+    , MkPair String Bool "small-definitions-eager-fold-parity"
+        (cp_parity (cp_source 1) 0 False)
+    , MkPair String Bool "exact-alpha-clone-order-and-evidence-parity"
+        (cp_parity (cp_source 48) 2 False)
+    , MkPair String Bool "late-error-does-not-return-earlier-proofs"
+        (cp_parity (prim_string_concat (cp_source 48)
+          "def invalid (x : Box) : Box := not_bound;\n") 0 True)
+    ];
+
+def main : IO Unit :=
+    do io_foreach (Pair String Bool) (fun (law : Pair String Bool) => match law with
+         | MkPair name passed => println (prim_string_concat
+             (match passed with | True => "PASS " | False => "FAIL " end) name) end) cp_laws;
+       exit (match all (Pair String Bool)
+         (fun (law : Pair String Bool) => snd String Bool law) cp_laws with
+         | True => 0 | False => 1 end)

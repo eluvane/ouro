@@ -422,6 +422,27 @@ static int ptr_is_current_perm(const void *p)
 	                     ouro_perm_nblocks);
 }
 
+static int ptr_in_bank_state(const void *p, const ouro_bank_state *bank)
+{
+	return ptr_in_blocks(p, bank->blocks, bank->bsizes, bank->nblocks);
+}
+
+static int ptr_in_heap_context(const void *p, const ouro_heap_context *context)
+{
+	return ptr_in_bank_state(p, &context->phase)
+		|| ptr_in_bank_state(p, &context->perm[0])
+		|| ptr_in_bank_state(p, &context->perm[1]);
+}
+
+/* Leave() shares caller-owned nodes and copies only the released context.
+   NULL disables the exception and keeps the existing clone modes. */
+static const ouro_heap_context *ouro_clone_outside;
+
+static int clone_share_outside(const void *p)
+{
+	return ouro_clone_outside != 0 && !ptr_in_heap_context(p, ouro_clone_outside);
+}
+
 typedef struct {
 	const void **k;
 	void **v;
@@ -535,7 +556,7 @@ static int clone_share_env(const ouro_env *e, int skip_cur_perm)
 {
 	if (e == 0)
 		return 1;
-	if (ptr_is_static(e))
+	if (ptr_is_static(e) || clone_share_outside(e))
 		return 1;
 	return skip_cur_perm && ptr_is_current_perm(e);
 }
@@ -544,7 +565,7 @@ static int clone_share_val(const ouro_v *v, int skip_cur_perm)
 {
 	if (v == 0)
 		return 1;
-	if (ptr_is_static(v))
+	if (ptr_is_static(v) || clone_share_outside(v))
 		return 1;
 	return skip_cur_perm && ptr_is_current_perm(v);
 }
@@ -621,7 +642,8 @@ static ouro_v *clone_perm_rec(ouro_v *v, clone_tab *tab, int skip_cur_perm)
 		   Their backing buffer may already have the clone's lifetime. Copying
 		   it for every token otherwise retains quadratic source bytes. Deep
 		   clones still copy buffers in the current bank before its reset. */
-		if (ptr_is_static(v->u.s) || (skip_cur_perm && ptr_is_current_perm(v->u.s)))
+		if (ptr_is_static(v->u.s) || clone_share_outside(v->u.s)
+		    || (skip_cur_perm && ptr_is_current_perm(v->u.s)))
 			return out;
 		unsigned long n = v->tag == OURO_TAG_STR ? (unsigned long)strlen(v->u.s)
 		                                      : (unsigned long)v->n;
@@ -677,11 +699,13 @@ ouro_v *ouro_heap_context_leave(ouro_heap_context *context, ouro_v *survivor)
 		fputs("ouro_rt: heap contexts must leave in reverse entry order\n", stderr);
 		exit(1);
 	}
-	/* The work banks stay allocated but are no longer current. Deep cloning
-	   therefore copies their byte buffers instead of borrowing freed storage.
-	   The caller's depths also restore static getter and permanent ownership. */
+	/* The work banks stay allocated but are no longer current. Copy only
+	   nodes allocated there; caller intern/AST identities already live in
+	   the restored domain and must not be recopied on every leave. */
 	exchange_heap_context(context);
+	ouro_clone_outside = context;
 	retained = clone_mode(survivor, 0, ouro_alloc);
+	ouro_clone_outside = 0;
 	free_context_bank(&context->phase);
 	free_context_bank(&context->perm[0]);
 	free_context_bank(&context->perm[1]);
@@ -879,6 +903,11 @@ ouro_v *ouro_nat(unsigned long n)
 		return v;
 	}
 	return n <= INT_MAX ? ouro_new(OURO_TAG_NAT, (int)n) : nat_from_u64((uint64_t)n);
+}
+
+ouro_v *ouro_nat_u64(uint64_t number)
+{
+	return nat_from_u64(number);
 }
 
 ouro_v *ouro_bytes(const unsigned char *b, unsigned long len)

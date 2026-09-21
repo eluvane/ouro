@@ -7,16 +7,43 @@
 
 #include <stdio.h>
 #include <string.h>
+#ifndef _WIN32
+#include <sys/resource.h>
+#endif
 
 int ouro_export_count(void);
 const char *ouro_export_name(int i);
 ouro_v *ouro_export_value(int i);
+
+/* ELF has no link-time stack reserve (PE and Mach-O do). Apply the documented
+   128 MiB POSIX cap here so a worker launched from an 8 MiB shell does not
+   SIGSEGV on a legal large source. Do not raise the inherited hard limit. */
+static void ouro_reserve_native_stack(void)
+{
+#ifndef _WIN32
+	struct rlimit limit;
+	rlim_t target;
+
+	if (getrlimit(RLIMIT_STACK, &limit) != 0)
+		return;
+	if (limit.rlim_cur == RLIM_INFINITY)
+		return;
+	target = (rlim_t)128 * 1024 * 1024;
+	if (limit.rlim_max != RLIM_INFINITY && limit.rlim_max < target)
+		target = limit.rlim_max;
+	if (target <= limit.rlim_cur)
+		return;
+	limit.rlim_cur = target;
+	(void)setrlimit(RLIMIT_STACK, &limit);
+#endif
+}
 
 int main(int argc, char **argv)
 {
 	int i;
 	int n = ouro_export_count();
 	ouro_v *entry = 0;
+	ouro_reserve_native_stack();
 	ouro_io_set_argv(argc, argv);
 	for (i = 0; i < n; i++) {
 		if (strcmp(ouro_export_name(i), "main") == 0)

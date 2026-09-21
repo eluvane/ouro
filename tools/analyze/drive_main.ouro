@@ -7,6 +7,7 @@
 
 import "../../std/io.ouro";
 import "drive.ouro";
+import "../quality/source.ouro";
 
 -- flags without the leading dashes, scopes.
 inductive DriveArgs : Type :=
@@ -21,25 +22,36 @@ def drive_scopes (a : DriveArgs) : List String :=
 def strip_dashes (s : String) : String :=
     prim_string_slice s 2 (sub (prim_string_length s) 2);
 
--- `--scope P` and positional arguments are scopes; `--api-baseline P` is a
--- base-runner option the bounded wrapper forwards, so its value is skipped.
-def parse_drive_args : List String -> List String -> List String -> DriveArgs :=
+-- Values are consumed verbatim, including paths beginning with --. Missing
+-- values are errors, never an instruction to fall back to the default scopes.
+inductive DriveArgError : Type :=
+  | DriveMissingValue : String -> DriveArgError
+  | DriveUnknownFlag : String -> DriveArgError;
+
+def drive_arg_message (e : DriveArgError) : String :=
+    match e with
+    | DriveMissingValue flag => concat "missing value for " flag
+    | DriveUnknownFlag flag => concat "unknown analyzer option: --" flag
+    end;
+
+def parse_drive_args : List String -> List String -> List String
+    -> Either DriveArgError DriveArgs :=
   fix go (xs : List String) (flags : List String) (scopes : List String)
-      : DriveArgs :=
+      : Either DriveArgError DriveArgs :=
     match xs with
-    | Nil => MkDriveArgs flags scopes
+    | Nil => Right DriveArgError DriveArgs (MkDriveArgs flags scopes)
     | Cons a rest =>
         match prim_string_eq a "--scope" with
         | True =>
             match rest with
-            | Nil => MkDriveArgs flags scopes
+            | Nil => Left DriveArgError DriveArgs (DriveMissingValue a)
             | Cons p more => go more flags (snoc String scopes p)
             end
         | False =>
             match prim_string_eq a "--api-baseline" with
             | True =>
                 match rest with
-                | Nil => MkDriveArgs flags scopes
+                | Nil => Left DriveArgError DriveArgs (DriveMissingValue a)
                 | Cons _ more => go more flags scopes
                 end
             | False =>
@@ -93,6 +105,35 @@ def flag_families (flag : String) : List String :=
         end
     end;
 
+-- Base-runner options are accepted but do not create structured families.
+-- A requested structured family must exist in the same inventory used to run
+-- it; misspellings cannot be filtered into an empty successful invocation.
+def drive_passive_flags : List String :=
+    [ "strict", "include-fixtures", "dump-facts", "enable-deadcode"
+    , "enable-format", "local-only", "architecture-only", "print-families" ];
+
+def drive_union_flags : List String :=
+    [ "enable-all", "enable-light", "enable-heavy", "enable-strict", "enable-style" ];
+
+def drive_flag_known (flag : String) : Bool :=
+    match elem String prim_string_eq flag drive_passive_flags with
+    | True => True
+    | False =>
+        match elem String prim_string_eq flag drive_union_flags with
+        | True => True
+        | False =>
+            match flag_families flag with
+            | Nil => False
+            | Cons family rest =>
+                all String (fun (f : String) => elem String prim_string_eq f all_families)
+                  (Cons String family rest)
+            end
+        end
+    end;
+
+def drive_unknown_flag (a : DriveArgs) : Maybe String :=
+    find String (fun (flag : String) => notb (drive_flag_known flag)) (drive_flags a);
+
 -- Enabled families in the canonical banner order.
 def families_of (a : DriveArgs) : List String :=
     let wanted : List String :=
@@ -112,19 +153,6 @@ def join_comma : List String -> String :=
         | Cons _ _ => concat x (concat "," (join_comma rest))
         end
     end;
-
-def ch_slash_code : Nat := 47;
-def ch_backslash_code : Nat := 92;
-
-def norm_path (p : String) : String :=
-    prim_string_of_char_codes
-      (map Nat Nat
-        (fun (c : Nat) =>
-          match eqNat c ch_backslash_code with
-          | True => ch_slash_code
-          | False => c
-          end)
-        (prim_string_to_char_codes p));
 
 def fixture_prefixes : List String :=
   [ "test/"
@@ -152,72 +180,6 @@ def keep_path (inc : Bool) (p : String) : Bool :=
     | False => notb (is_fixture p)
     end;
 
-def skip_dir_names : List String :=
-    [ ".", "..", "_build", "_cache", "_opam", "_tools", ".git", "node_modules" ];
-
-def skip_dir (name : String) : Bool :=
-    elem String prim_string_eq name skip_dir_names;
-
-def child (dir : String) (name : String) : String :=
-    match prim_string_length dir with
-    | Z => name
-    | S _ =>
-        match prim_string_eq dir "." with
-        | True => name
-        | False => concat dir (concat "/" name)
-        end
-    end;
-
-def walk_go : Nat -> Bool -> List String -> List String -> IO (List String) :=
-  fix walk_go (fuel : Nat) (inc : Bool) (pending : List String)
-      (acc : List String) : IO (List String) :=
-    match fuel with
-    | Z => io_pure (List String) acc
-    | S fuel2 =>
-        match pending with
-        | Nil => io_pure (List String) acc
-        | Cons p rest =>
-            io_bind Bool (List String) (prim_fs_is_dir p)
-              (fun (isdir : Bool) =>
-                match isdir with
-                | False =>
-                    match andb (prim_string_ends p ".ouro") (keep_path inc p) with
-                    | True => walk_go fuel2 inc rest (Cons String p acc)
-                    | False => walk_go fuel2 inc rest acc
-                    end
-                | True =>
-                    io_bind (List String) (List String) (prim_fs_list_dir p)
-                      (fun (names : List String) =>
-                        let kids : List String :=
-                          map String String (child p)
-                            (filter String
-                              (fun (n : String) => notb (skip_dir n)) names) in
-                        walk_go fuel2 inc (append String kids rest) acc)
-                end)
-        end
-    end;
-
-def scan_root (inc : Bool) (root : String) : IO (List String) :=
-    walk_go (mul 128 128) inc (singleton String (norm_path root)) (Nil String);
-
-def root_missing (root : String) : IO Nat :=
-    io_bind Bool Nat (prim_fs_exists root)
-      (fun (ex : Bool) =>
-        match ex with
-        | True => io_pure Nat Z
-        | False =>
-            io_bind Unit Nat
-              (eprintln (concat "ANALYZE_FAIL: missing scope " root))
-              (fun (_ : Unit) => io_pure Nat (S Z))
-        end);
-
-def missing_roots (roots : List String) : IO Nat :=
-    io_fold String Nat
-      (fun (n : Nat) (root : String) =>
-        io_bind Nat Nat (root_missing root)
-          (fun (m : Nat) => io_pure Nat (add n m)))
-      Z roots;
-
 def default_scopes : List String :=
     ["std", "compiler", "tools/analyze", "samples"];
 
@@ -227,16 +189,9 @@ def scopes_of (a : DriveArgs) : List String :=
     | Cons x xs => Cons String x xs
     end;
 
-def gather_paths (inc : Bool) (scopes : List String) : IO (List String) :=
-    io_bind (List String) (List String)
-      (io_fold String (List String)
-        (fun (acc : List String) (root : String) =>
-          io_bind (List String) (List String) (scan_root inc root)
-            (fun (more : List String) =>
-              io_pure (List String) (append String acc more)))
-        (Nil String) scopes)
-      (fun (paths : List String) =>
-        io_pure (List String) (sort_insert String prim_string_le paths));
+def gather_paths (inc : Bool) (scopes : List String)
+    : IO (Either QualityInputError (List String)) :=
+    quality_inventory quality_skip_dir (keep_path inc) scopes;
 
 -- findings, rejected units.
 inductive DriveTally : Type :=
@@ -270,17 +225,13 @@ def emit_source (fams : List String) (path : String) (src : String)
     end;
 
 def emit_file (fams : List String) (path : String) : IO DriveTally :=
-    io_bind Bool DriveTally (prim_fs_exists path)
-      (fun (ex : Bool) =>
-        match ex with
-        | False =>
-            io_bind Unit DriveTally
-              (eprintln (concat path ": path not found"))
-              (fun (_ : Unit) => io_pure DriveTally (MkTally Z (S Z)))
-        | True =>
-            io_bind String DriveTally (prim_fs_read_file path)
-              (fun (src : String) => emit_source fams path src)
-        end);
+    do let! loaded := quality_read_file path;
+       match loaded with
+       | Left e =>
+           do eprintln (quality_input_message e);
+              io_pure DriveTally (MkTally Z (S Z))
+       | Right src => emit_source fams path src
+       end
 
 def run_scopes (fams : List String) (paths : List String) : IO DriveTally :=
     io_fold String DriveTally
@@ -306,24 +257,40 @@ def finish (fams : List String) (files : Nat) (t : DriveTally) : IO Unit :=
         end);
 
 def run_families (a : DriveArgs) (fams : List String) : IO Unit :=
-    io_bind Nat Unit (missing_roots (scopes_of a))
-      (fun (missing : Nat) =>
-        match missing with
-        | S _ => exit 2
-        | Z =>
-            io_bind (List String) Unit
-              (gather_paths (include_fix a) (scopes_of a))
-              (fun (paths : List String) =>
-                io_bind DriveTally Unit (run_scopes fams paths)
-                  (fun (t : DriveTally) => finish fams (length String paths) t))
-        end);
+    do let! gathered := gather_paths (include_fix a) (scopes_of a);
+       match gathered with
+       | Left e =>
+           do eprintln (concat "ANALYZE_FAIL: " (quality_input_message e));
+              exit 2
+       | Right paths =>
+           do let! tally := run_scopes fams paths;
+              finish fams (length String paths) tally
+       end
 
 def start (argv : List String) : IO Unit :=
-    let a : DriveArgs :=
-      parse_drive_args (tail String argv) (Nil String) (Nil String) in
-    match families_of a with
-    | Nil => exit Z
-    | Cons f more => run_families a (Cons String f more)
+    match parse_drive_args (tail String argv) (Nil String) (Nil String) with
+    | Left e =>
+        do eprintln (concat "ANALYZE_FAIL: " (drive_arg_message e));
+           exit 2
+    | Right a =>
+        match drive_unknown_flag a with
+        | Just flag =>
+            do eprintln (concat "ANALYZE_FAIL: "
+                 (drive_arg_message (DriveUnknownFlag flag)));
+               exit 2
+        | Nothing =>
+            let fams : List String := families_of a in
+            match has_flag a "print-families" with
+            | True =>
+                do println (concat "ANALYZE_FAMILIES families=" (join_comma fams));
+                   exit Z
+            | False =>
+                match fams with
+                | Nil => exit Z
+                | Cons f more => run_families a (Cons String f more)
+                end
+            end
+        end
     end;
 
 def main : IO Unit :=

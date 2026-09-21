@@ -10,22 +10,7 @@
 
 Describe the problem and the change.
 
-## Validation
-
-List the commands you ran and any checks that were unavailable.
-
-```text
-
-```
-
-## Compatibility and trust
-
-Note any user-visible compatibility change, generated artifact, runtime impact,
-or trusted-boundary change. Write `None` when this does not apply.
-
-- [ ] Relevant tests or fixtures and documentation were updated.
-- [ ] `CHANGELOG.md` was updated for a user-visible change.
-- [ ] Generated files were produced through their documented generator.
+<!-- Mention material risks, compatibility or trust impact, and limitations only when they apply. -->
 
 <p align="center">
   <img

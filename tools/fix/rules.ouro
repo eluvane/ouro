@@ -63,7 +63,7 @@ def fx_params : Nat -> Bool -> List FxTok -> List (Pair FxTok (List FxTok)) -> L
         | Cons t rest =>
             match fx_is_word t "(" with
             | True =>
-                match fx_group_go rest Z ([t] : List FxTok) with
+                match st_group_go rest Z ([t] : List FxTok) with
                 | Nothing => reverse_lin (Pair FxTok (List FxTok)) acc
                 | Just grp_at =>
                     match grp_at with
@@ -159,12 +159,116 @@ def fx_find_sym (s : String) (fuel : Nat) (ts : List FxTok) (depth : Nat) : Mayb
     | Just found => match found with | MkPair _ after => Just (List FxTok) after end
     end;
 
-def fx_has_effect (ts : List FxTok) : Bool :=
-    any FxTok (fun (t : FxTok) =>
-      orb (fx_is_word t "perform") (orb (fx_is_word t "?") (fx_is_word t "do"))) ts;
+-- Absence of perform/do/? is not evidence that a call terminates or is pure.
+-- Only a closed literal is discardable without resolved effect/totality facts.
+-- Constructor-looking identifiers can be shadowed and are deliberately absent.
+def fx_discardable_value (ts : List FxTok) : Bool :=
+    match ts with
+    | Nil => False
+    | Cons value rest => match rest with
+      | Cons _ _ => False
+      | Nil => orb (fx_is_kind value fx_k_num) (fx_is_kind value fx_k_str)
+      end
+    end;
 
--- let x [: T] := rhs in body with x unused: drop the binding, or rename it when
--- the right-hand side may have effects or holes.
+def fx_whitespace_gap (src : String) (start : Nat) (stop : Nat) : Bool :=
+    andb (leb_nat start stop) (str_null (str_trim (fx_slice src start stop)));
+
+-- Check only inter-token trivia through the first retained body token. This
+-- does not confuse comment-looking bytes inside a string with a comment, and
+-- refuses to erase rationale/directives while removing a dead literal binding.
+def fx_plain_until (src : String) (stop : Nat) (previous : FxTok) (remaining : List FxTok) : Bool :=
+  (fix go (tokens : List FxTok) (prev : FxTok) : Bool :=
+    match tokens with
+    | Nil => False
+    | Cons next rest =>
+        match fx_whitespace_gap src (fx_tok_end prev) (fx_tok_start next) with
+        | False => False
+        | True => match eqNat (fx_tok_start next) stop with
+          | True => True
+          | False => match ltb_nat (fx_tok_start next) stop with
+            | True => go rest next
+            | False => False
+            end
+          end
+        end
+    end) remaining previous;
+
+-- Do not mistake a returned function's next argument, an annotation or a
+-- tuple/sequence continuation for the end of the let body. A semicolon is
+-- accepted only at the declaration tail; bracket/match/let delimiters close
+-- the current expression unambiguously.
+def fx_identity_boundary (rest : List FxTok) : Bool :=
+    match rest with
+    | Nil => True
+    | Cons next more =>
+        let code : Nat := fx_tok_code next in
+        match eqNat code fx_c_semi with
+        | True => match more with | Nil => True | Cons _ _ => False end
+        | False => orb (eqNat code fx_c_close)
+            (orb (eqNat code fx_c_end) (orb (eqNat code fx_c_bar) (eqNat code fx_c_in)))
+        end
+    end;
+
+-- let x := rhs in x -> rhs, without substitution. Keep rhs byte-for-byte and
+-- evaluate it exactly once at the original position. Typed lets are excluded:
+-- their annotation can constrain elaboration or a dependent signature.
+-- Parenthesize non-atoms rather than changing application/operator precedence.
+def fx_identity_let (src : String) (first : FxTok) (name : FxTok)
+    (after_name : List FxTok) : List FxEdit :=
+    match after_name with
+    | Nil => []
+    | Cons assign after_assign => match fx_is_word assign ":=" with
+      | False => []
+      | True => match fx_body_split after_assign with
+        | MkPair rhs stop_rest => match rhs with
+          | Nil => []
+          | Cons rhs_first _ => match stop_rest with
+            | Nil => []
+            | Cons in_tok body => match body with
+              | Nil => []
+              | Cons returned after_return =>
+                  let shape : Bool := andb (fx_is_word in_tok "in")
+                    (andb (fx_is_word returned (fx_tok_text name))
+                      (fx_identity_boundary after_return)) in
+                  let header : Bool := andb
+                    (fx_whitespace_gap src (fx_tok_end first) (fx_tok_start name))
+                    (andb (fx_whitespace_gap src (fx_tok_end name) (fx_tok_start assign))
+                      (fx_whitespace_gap src (fx_tok_end assign) (fx_tok_start rhs_first))) in
+                  let footer : Bool := andb
+                    (fx_whitespace_gap src (fx_toks_end rhs) (fx_tok_start in_tok))
+                    (fx_whitespace_gap src (fx_tok_end in_tok) (fx_tok_start returned)) in
+                  match andb shape (andb header footer) with
+                  | False => []
+                  | True =>
+                      let atom : Bool := match st_atom rhs with
+                        | Nothing => False
+                        | Just parsed => match parsed with
+                          | MkPair _ remaining => match remaining with
+                            | Nil => True
+                            | Cons _ _ => False
+                            end
+                          end
+                        end in
+                      let message : String := str_cat3 "identity binding "
+                        (fx_quote (fx_tok_text name))
+                        " removed; initializer and its evaluation are preserved" in
+                      [ MkFxEdit (fx_tok_start first) (fx_tok_start rhs_first)
+                          (match atom with | True => "" | False => "(" end)
+                          "identity-let" (fx_tok_line first) message
+                      , MkFxEdit (fx_toks_end rhs) (fx_tok_end returned)
+                          (match atom with | True => "" | False => ")" end)
+                          "identity-let" (fx_tok_line in_tok) message ]
+                  end
+              end
+            end
+          end
+        end
+      end
+    end;
+
+-- The local let owner handles both unused and identity bindings. Unknown
+-- evaluation is retained under an explicit discard, not deleted speculatively.
 def fx_let_edits (src : String) (seg : List FxTok) (t : FxTok) (rest : List FxTok) : List FxEdit :=
     match rest with
     | Nil => Nil FxEdit
@@ -173,7 +277,7 @@ def fx_let_edits (src : String) (seg : List FxTok) (t : FxTok) (rest : List FxTo
         | False => Nil FxEdit
         | True =>
             match fx_uses_name (fx_tok_text name) rest2 (S Z) with
-            | True => Nil FxEdit
+            | True => fx_identity_let src t name rest2
             | False =>
                 match fx_find_sym ":=" fx_fuel_stmt rest2 Z with
                 | Nothing => Nil FxEdit
@@ -186,11 +290,17 @@ def fx_let_edits (src : String) (seg : List FxTok) (t : FxTok) (rest : List FxTo
                             match fx_is_word in_tok "in" with
                             | False => Nil FxEdit
                             | True =>
-                                match fx_has_effect rhs with
-                                | True => fx_rename_edit seg name rest2 (S Z)
-                                | False =>
+                                let disposable : Bool := andb (fx_discardable_value rhs)
+                                  (match body with
+                                   | Nil => False
+                                   | Cons first_body _ => fx_plain_until src
+                                       (fx_tok_start first_body) t rest
+                                   end) in
+                                match disposable with
+                                | False => fx_rename_edit seg name rest2 (S Z)
+                                | True =>
                                     fx_edit1 (fx_delete_edit src fx_rule_dead_let
-                                      (str_cat3 "unused binding " (fx_quote (str_concat "let " (fx_tok_text name))) " removed")
+                                      (str_cat3 "unused literal binding " (fx_quote (str_concat "let " (fx_tok_text name))) " removed")
                                       t in_tok (fx_maybe_head body))
                                 end
                             end
@@ -516,7 +626,7 @@ def fx_fix_header : Nat -> List FxTok -> Maybe (Pair FxTok FxTok) :=
         | Cons t rest =>
             match fx_is_word t "(" with
             | True =>
-                match fx_group_go rest Z ([t] : List FxTok) with
+                match st_group_go rest Z ([t] : List FxTok) with
                 | Nothing => Nothing (Pair FxTok FxTok)
                 | Just grp_at => match grp_at with | MkPair _ after => go fuel2 after end
                 end
@@ -650,3 +760,49 @@ def fx_segment_rules (src : String) (ctors : List String) (seg : List FxTok) : L
 def fx_all_rules (src : String) (ctors : List String) (ts : List FxTok) : List FxEdit :=
     append FxEdit (fx_simple_rules src ts)
       (concat_map (List FxTok) FxEdit (fx_segment_rules src ctors) (fx_segments ts));
+
+-- Literal spelling is not evidence that a locally bound name denotes the
+-- built-in constructor. Reuse the fixer's telescope reader; do not repair an
+-- ambiguous source by first erasing its uses and then renaming its binder.
+def fx_literal_name (t : FxTok) : Bool :=
+    elem String str_eq (fx_tok_text t)
+      (["S", "Z", "Nat", "Cons", "Nil", "List"] : List String);
+
+def fx_literal_parameter (p : Pair FxTok (List FxTok)) : Bool :=
+    match p with | MkPair name _ => fx_literal_name name end;
+
+def fx_literal_binding : List FxTok -> Bool :=
+  fix go (ts : List FxTok) : Bool :=
+    match ts with
+    | Nil => False
+    | Cons t rest =>
+        let next : FxTok := fx_first_tok rest in
+        let named : Bool := andb (fx_literal_name next)
+          (elem String str_eq (fx_tok_text t)
+            (["def", "axiom", "inductive", "record", "effect", "let", "let!", "fix", "as"] : List String)) in
+        let typed : Bool := andb (fx_literal_name t) (fx_is_word next ":") in
+        match orb named typed with
+        | True => True
+        | False =>
+            match fx_is_word t "fun" with
+            | True =>
+                match any (Pair FxTok (List FxTok)) fx_literal_parameter
+                    (fx_params (length FxTok rest) True rest (Nil (Pair FxTok (List FxTok)))) with
+                | True => True
+                | False => go rest
+                end
+            | False => go rest
+            end
+        end
+    end;
+
+def fx_literal_edit (edit : FxEdit) : Bool :=
+    orb (str_eq (fx_edit_rule edit) fx_rule_list)
+        (str_eq (fx_edit_rule edit) fx_rule_peano);
+
+def fx_ambiguous_literal (src : String) : Bool :=
+    let tokens : List FxTok := fx_lex src in
+    match fx_literal_binding tokens with
+    | False => False
+    | True => any FxEdit fx_literal_edit (fx_simple_rules src tokens)
+    end;

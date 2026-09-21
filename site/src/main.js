@@ -4,6 +4,8 @@ import $ from 'jquery/dist/jquery.slim.js';
 import { boot, init, register } from '@jqhtml/core';
 
 import './styles.css';
+import './fonts.css';
+import './icons.css';
 import './docs.css';
 import './docs-layout.css';
 import './docs-content.css';

@@ -10,6 +10,8 @@ import ctypes
 import uuid
 from ctypes import wintypes as W
 
+from repo_support import checked_windows_result as checked
+
 
 class BasicLimits(ctypes.Structure):
     _fields_ = [("process_time", ctypes.c_int64), ("job_time", ctypes.c_int64),
@@ -33,12 +35,6 @@ def api(name, result, args):
     fn = getattr(ctypes.WinDLL("kernel32", use_last_error=True), name)
     fn.restype, fn.argtypes = result, args
     return fn
-
-
-def checked(value):
-    if not value:
-        raise ctypes.WinError(ctypes.get_last_error())
-    return value
 
 
 close_handle = api("CloseHandle", W.BOOL, [W.HANDLE])

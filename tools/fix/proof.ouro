@@ -1,0 +1,123 @@
+-- Structured certificates for the automatic syntax-only subset. Semantic
+-- rewrites need compiler-owned binder/span/effect certificates and stay review
+-- required. A rule ID and replacement string alone cannot authorize a round.
+import "plan.ouro";
+import "basic_rules.ouro";
+
+inductive FxSyntaxProof : Type :=
+  | FxDuplicateImportProof : String -> FxSyntaxProof
+  | FxLegacyBindProof : String -> FxSyntaxProof
+  | FxRedundantSeparatorProof : Nat -> FxSyntaxProof;
+inductive FxCertifiedEdit : Type :=
+  | FxCertified : FxSyntaxProof -> FxEdit -> FxCertifiedEdit;
+def fx_certified_edit (proof : FxCertifiedEdit) : FxEdit :=
+    match proof with | FxCertified _ edit => edit end;
+
+def fx_certificates_for (proof : FxSyntaxProof) (edits : List FxEdit) : List FxCertifiedEdit :=
+    map FxEdit FxCertifiedEdit (fun (edit : FxEdit) => FxCertified proof edit) edits;
+
+-- The token walker creates a certificate only at the corresponding grammar
+-- pattern. Literal/comment bytes cannot be mistaken for syntax. Whole-fragment
+-- trivia safety is independently checked by the planner before publication.
+def fx_syntax_certificates (src : String) (tokens : List FxTok) : List FxCertifiedEdit :=
+    (fix go (remaining : List FxTok) (previous : List FxTok) (imports : List String)
+        (rev : List FxCertifiedEdit) : List FxCertifiedEdit :=
+      match remaining with
+      | Nil => reverse_lin FxCertifiedEdit rev
+      | Cons token rest =>
+          let imported : FxHit := match fx_is_word token "import" with
+            | True => fx_import_hit src token rest imports
+            | False => fx_no_hit imports end in
+          match imported with | MkFxHit import_edits seen =>
+            let imports_proven : List FxCertifiedEdit := fx_certificates_for
+              (FxDuplicateImportProof (fx_tok_text (fx_first_tok rest))) import_edits in
+            let binds_proven : List FxCertifiedEdit := match fx_is_word token "<-" with
+              | True => fx_certificates_for
+                  (FxLegacyBindProof (fx_tok_text (fx_first_tok previous))) (fx_do_bind_hit token previous)
+              | False => [] end in
+            let separators_proven : List FxCertifiedEdit := match fx_is_word token ";" with
+              | True => fx_certificates_for
+                  (FxRedundantSeparatorProof (fx_tok_start (fx_first_tok previous))) (fx_semi_hit token previous)
+              | False => [] end in
+            go rest (Cons FxTok token previous) seen
+              (append FxCertifiedEdit (reverse_lin FxCertifiedEdit
+                (append FxCertifiedEdit imports_proven
+                  (append FxCertifiedEdit binds_proven separators_proven))) rev)
+          end
+      end) tokens [] [] [];
+
+-- Linear merge of sorted planned spans and freshly derived certificates.
+-- Equal spans with another rule/replacement are NOT interchangeable proofs.
+def fx_certificate_at (edit : FxEdit) : List FxCertifiedEdit -> List FxCertifiedEdit :=
+  fix go (certificates : List FxCertifiedEdit) : List FxCertifiedEdit :=
+    match certificates with
+    | Nil => []
+    | Cons certificate rest => match ltb_nat (fx_edit_start (fx_certified_edit certificate)) (fx_edit_start edit) with
+      | True => go rest | False => certificates end
+    end;
+
+def fx_select_certificates : List FxEdit -> List FxCertifiedEdit -> Either FxPlanError (List FxCertifiedEdit) :=
+  fix go (edits : List FxEdit) (certificates : List FxCertifiedEdit)
+      : Either FxPlanError (List FxCertifiedEdit) :=
+    match edits with
+    | Nil => Right FxPlanError (List FxCertifiedEdit) []
+    | Cons edit rest => match fx_certificate_at edit certificates with
+      | Nil => Left FxPlanError (List FxCertifiedEdit) FxPlanNoSyntaxProof
+      | Cons certificate more =>
+          let proven : FxEdit := fx_certified_edit certificate in
+          match andb (fx_same_edit edit proven) (str_eq (fx_edit_rule edit) (fx_edit_rule proven)) with
+          | False => Left FxPlanError (List FxCertifiedEdit) FxPlanProofDisagree
+          | True => match go rest more with
+            | Left error => Left FxPlanError (List FxCertifiedEdit) error
+            | Right tail => Right FxPlanError (List FxCertifiedEdit) (Cons FxCertifiedEdit certificate tail)
+            end
+          end
+      end
+    end;
+
+-- The transaction retains ONE source snapshot, not one copy per edit. No disk
+-- mutation happens here. The caller must still compiler-check before publish.
+inductive FxTransactionProof : Type :=
+  | FxTransaction : String -> String -> List FxCertifiedEdit -> FxTransactionProof;
+def fx_transaction_source (proof : FxTransactionProof) : String :=
+    match proof with | FxTransaction value _ _ => value end;
+def fx_transaction_output (proof : FxTransactionProof) : String :=
+    match proof with | FxTransaction _ value _ => value end;
+def fx_transaction_edits (proof : FxTransactionProof) : List FxEdit :=
+    match proof with | FxTransaction _ _ edits => map FxCertifiedEdit FxEdit fx_certified_edit edits end;
+
+def fx_certify_disjoint_transaction (src : String) (edits : List FxEdit) : Either FxPlanError FxTransactionProof :=
+    let certificates : List FxCertifiedEdit := fx_syntax_certificates src (fx_lex src) in
+    let sorted : List FxCertifiedEdit := quality_sort FxCertifiedEdit
+      (fun (a : FxCertifiedEdit) (b : FxCertifiedEdit) =>
+        fx_edit_before (fx_certified_edit a) (fx_certified_edit b)) certificates in
+    match fx_select_certificates edits sorted with
+    | Left error => Left FxPlanError FxTransactionProof error
+    | Right selected => match all FxEdit (fun (edit : FxEdit) =>
+        andb (fx_valid_edit src edit) (fx_edit_preserves_trivia src edit)) edits with
+      | False => Left FxPlanError FxTransactionProof FxPlanTriviaLost
+      | True =>
+          let out : String := fx_apply src edits in
+          let before : Nat := length FxCertifiedEdit certificates in
+          let after : Nat := length FxCertifiedEdit (fx_syntax_certificates out (fx_lex out)) in
+          match orb (nullb FxEdit edits) (ltb_nat after before) with
+          | False => Left FxPlanError FxTransactionProof FxPlanProofNotDecreasing
+          | True => Right FxPlanError FxTransactionProof (FxTransaction src out selected)
+          end
+      end
+    end;
+
+-- Disjointness is rechecked at the proof boundary, not merely assumed from
+-- the caller's planner. Input must already be normalized and ordered.
+def fx_certify_transaction (src : String) (edits : List FxEdit) : Either FxPlanError FxTransactionProof :=
+    match fx_disjoint_checked edits (Nothing FxEdit) [] with
+    | Left error => Left FxPlanError FxTransactionProof error
+    | Right checked => match eq_nat (length FxEdit edits) (length FxEdit checked) with
+      | False => Left FxPlanError FxTransactionProof FxPlanDuplicateEdits
+      | True => fx_certify_disjoint_transaction src checked end
+    end;
+
+-- Stale source cannot reuse a certificate. Each fix round reparses/re-resolves
+-- via the compiler companion and derives new certificates from its own snapshot.
+def fx_transaction_matches (source : String) (proof : FxTransactionProof) : Bool :=
+    str_eq source (fx_transaction_source proof);

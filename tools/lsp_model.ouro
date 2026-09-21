@@ -2,7 +2,9 @@
 -- Formatting is delegated to the CLI to avoid namespace collisions and keep editor output identical.
 
 import "doc_model.ouro";
+import "../std/json_types.ouro";
 import "../std/jsonrpc.ouro";
+import "../std/pathx.ouro";
 
 -- Documents the client has open, their aggregate byte size, the canonical
 -- workspace root authorized by the launcher, and whether shutdown was
@@ -35,7 +37,7 @@ def lsp_empty : Lsp := MkLsp (map_empty String) Z "" False;
 def lsp_with_root (s : Lsp) (root : String) : Lsp :=
     MkLsp (lsp_docs s) (lsp_docs_bytes s) root (lsp_down s);
 
--- Frames have their own larger cap in main.ouro.  Keeping an individual
+-- Frames have their own larger cap in lsp.ouro.  Keeping an individual
 -- source buffer below 512 KiB and all open buffers below 2 MiB prevents a
 -- normal full-sync client from retaining attacker-selected memory forever.
 def lsp_kib : Nat := mul 32 32;
@@ -157,9 +159,6 @@ def uri_file_path (uri : String) : Maybe String :=
         end
     end;
 
-def uri_to_path (uri : String) : String :=
-    fromMaybe String "" (uri_file_path uri);
-
 def path_to_uri (path : String) : String :=
     match str_starts path "/" with
     | True => str_concat "file://" path
@@ -249,7 +248,7 @@ def prefix_at (text : String) (line : Nat) (col : Nat) : String :=
     prefix_in_line (nth String "" line (str_lines text)) col;
 
 -- Hover and definition both answer from the declarations of the document and
--- the files it imports, which main.ouro collects. A declaration keeps the file
+-- the files it imports, which lsp.ouro collects. A declaration keeps the file
 -- it came from so definition can point at another module.
 inductive Sym : Type :=
   | MkSym : String -> Decl -> Sym;
@@ -278,7 +277,7 @@ def hover_markup (s : Sym) : String :=
       str_cat4 "```ouro" "\n" (decl_sig d) (str_concat "\n" "```") in
     let prose : String := str_join " " (decl_docs d) in
     let origin : String :=
-      str_cat3 "_" (str_cat3 (sym_path s) ":" (show_nat (decl_line d))) "_" in
+      str_cat3 "_" (str_cat3 (sym_path s) ":" (prim_string_of_nat (decl_line d))) "_" in
     match str_null prose with
     | True => str_cat3 code "\n\n" origin
     | False => str_cat4 code "\n\n" prose (str_concat "\n\n" origin)
@@ -333,31 +332,21 @@ def location_result (s : Sym) : Json :=
 -- SymbolInformation-shaped so document and workspace symbol share one item.
 def document_symbol_item (s : Sym) : Json :=
     let d : Decl := sym_decl s in
-    let line : Nat := sub (decl_line d) (S Z) in
-    let loc : List (Pair String Json) :=
-      [ MkPair String Json "uri" (JStr (path_to_uri (sym_path s)))
-      , MkPair String Json "range" (lsp_range line Z line Z) ] in
     let fields : List (Pair String Json) :=
       [ MkPair String Json "name" (JStr (decl_name d))
       , MkPair String Json "kind" (json_num (completion_kind_num (decl_kind d)))
-      , MkPair String Json "location" (JObj loc) ] in
+      , MkPair String Json "location" (location_result s) ] in
     JObj fields;
 
 def document_symbol_here (path : String) (s : Sym) : Bool :=
-    let p : String := sym_path s in
-    orb (str_eq p path) (str_ends p path);
+    str_ends (sym_path s) path;
 
 def document_symbol_result (path : String) (syms : List Sym) : Json :=
     JArr (map Sym Json document_symbol_item
       (filter Sym (fun (s : Sym) => document_symbol_here path s) syms));
 
 def workspace_symbol_match (query : String) (s : Sym) : Bool :=
-    match str_null query with
-    | True => True
-    | False =>
-        let n : String := decl_name (sym_decl s) in
-        orb (str_starts n query) (str_contains n query)
-    end;
+    str_contains (decl_name (sym_decl s)) query;
 
 def workspace_symbol_result (query : String) (syms : List Sym) : Json :=
     JArr (map Sym Json document_symbol_item
@@ -415,37 +404,13 @@ def rename_in_line (line : String) (from : String) (to : String) : String :=
         rename_in_line_go (S (length Nat cs)) line cs Z from to
     end;
 
--- str_lines keeps a trailing empty segment when the source ends in `\n`, so
--- join already preserves that newline; only add one when it would otherwise
--- disappear.
+-- str_lines retains a trailing empty segment, so joining preserves newlines.
 def rename_text (text : String) (from : String) (to : String) : String :=
-    let body : String :=
-      str_join "\n"
-        (map String String (fun (ln : String) => rename_in_line ln from to)
-          (str_lines text)) in
-    match str_ends text "\n" with
-    | True =>
-        match str_ends body "\n" with
-        | True => body
-        | False => str_concat body "\n"
-        end
-    | False => body
-    end;
+    str_join "\n"
+      (map String String (fun (ln : String) => rename_in_line ln from to)
+        (str_lines text));
 
-def rename_result (uri : String) (old_text : String) (new_text : String) : Json :=
-    let lines : Nat := length String (str_lines old_text) in
-    let edit : List (Pair String Json) :=
-      [ MkPair String Json "range" (lsp_range Z Z (S lines) Z)
-      , MkPair String Json "newText" (JStr new_text) ] in
-    let edits : List Json := [ JObj edit ] in
-    let changes : List (Pair String Json) :=
-      [ MkPair String Json uri (JArr edits) ] in
-    let fields : List (Pair String Json) :=
-      [ MkPair String Json "changes" (JObj changes) ] in
-    JObj fields;
-
--- Formatting replies with one edit that replaces the whole document. The end
--- position is one past the last line, which is how LSP spells "everything".
+-- Formatting and rename share the existing whole-document replacement range.
 def format_edits (text : String) (out : String) : Json :=
     let lines : Nat := length String (str_lines text) in
     let fields : List (Pair String Json) :=
@@ -453,6 +418,13 @@ def format_edits (text : String) (out : String) : Json :=
       , MkPair String Json "newText" (JStr out) ] in
     let edits : List Json := [ JObj fields ] in
     JArr edits;
+
+def rename_result (uri : String) (old_text : String) (new_text : String) : Json :=
+    let changes : List (Pair String Json) :=
+      [ MkPair String Json uri (format_edits old_text new_text) ] in
+    let fields : List (Pair String Json) :=
+      [ MkPair String Json "changes" (JObj changes) ] in
+    JObj fields;
 
 -- Capabilities: full document sync (1), hover, definition, completion,
 -- formatting, document/workspace symbols, and textual rename.
@@ -563,8 +535,9 @@ def diag_of_line (line : String) : Maybe (Pair Loc Json) :=
     end;
 
 -- Keep only what belongs to the file being checked: LSP publishes per URI, and
--- a diagnostic in an imported module is not this document's problem. An
+-- a diagnostic in an imported module is not attached to this document. An
 -- unpositioned CHECK_FAIL has no path and belongs to the file that was checked.
+-- Failed checks with no remaining local diagnostic still publish CHECK_FAIL.
 def diag_here (path : String) (l : Loc) : Bool :=
     match l with
     | MkLoc p _ _ =>
@@ -598,7 +571,7 @@ def publish_params (uri : String) (ds : List Json) : Json :=
       , MkPair String Json "diagnostics" (JArr ds) ] in
     JObj fields;
 
--- Import lines, so main.ouro can read the cone a document depends on. Same
+-- Import lines, so lsp.ouro can read the cone a document depends on. Same
 -- spelling rule as the compiler's unit collector: `import "path";`.
 def import_of_line (line : String) : List String :=
     match str_strip_prefix (str_trim line) "import \"" with

@@ -1,0 +1,274 @@
+-- Read-only name-resolution facts over the compiler's nominal Expr/Decl ABI.
+-- This does not accept programs or bypass declaration checking. Signatures and
+-- optional bodies below are references to parsed declarations, never AST copies.
+-- A local identity always wins over a global spelling. Ambiguous or missing
+-- globals are errors; a caller cannot substitute textual guesses.
+
+import "ast.ouro";
+import "pipeline_abi.ouro";
+import "../std/string_prims.ouro";
+import "../std/natx.ouro";
+import "../std/listx.ouro";
+
+inductive ScDecl : Type :=
+  | ScDeclOf : Nat -> Nat -> Nat -> Nat -> Expr -> Maybe Expr -> Maybe Nat -> ScDecl;
+
+def sc_decl_name (item : ScDecl) : Nat :=
+    match item with | ScDeclOf value _ _ _ _ _ _ => value end;
+
+def sc_decl_module (item : ScDecl) : Nat :=
+    match item with | ScDeclOf _ value _ _ _ _ _ => value end;
+
+def sc_decl_kind (item : ScDecl) : Nat :=
+    match item with | ScDeclOf _ _ value _ _ _ _ => value end;
+
+def sc_decl_type (item : ScDecl) : Expr :=
+    match item with | ScDeclOf _ _ _ _ value _ _ => value end;
+
+def sc_decl_body (item : ScDecl) : Maybe Expr :=
+    match item with | ScDeclOf _ _ _ _ _ value _ => value end;
+
+def sc_decl_intrinsic (item : ScDecl) : Maybe Nat :=
+    match item with | ScDeclOf _ _ _ _ _ _ value => value end;
+
+-- Declaration kinds: definition, axiom, family, constructor, intrinsic,
+-- extern, effect operation, effect family. Constructor parents are resolved
+-- family names in the same complete shared-intern namespace.
+def sc_declarations (module_id : Nat) (decls : List Decl) : List ScDecl :=
+    concat_map Decl ScDecl (fun (decl : Decl) => match decl with
+      | DDef name signature body =>
+          [ScDeclOf name module_id 0 0 signature (Just Expr body) (Nothing Nat)]
+      | DAxiom name signature =>
+          [ScDeclOf name module_id 1 0 signature (Nothing Expr) (Nothing Nat)]
+      | DInductive name params kind constructors =>
+          Cons ScDecl (ScDeclOf name module_id 2 0 (mk_pi_chain params kind)
+            (Nothing Expr) (Nothing Nat))
+            (map (Pair Nat Expr) ScDecl (fun (ctor : Pair Nat Expr) => match ctor with
+              | MkPair ctor_name signature => ScDeclOf ctor_name module_id 3 name
+                  (mk_pi_chain params signature) (Nothing Expr) (Nothing Nat)
+              end) constructors)
+      | DIntrinsic name signature primitive implementation =>
+          [ScDeclOf name module_id 4 0 signature implementation (Just Nat primitive)]
+      | DExtern name signature _ =>
+          [ScDeclOf name module_id 5 0 signature (Nothing Expr) (Nothing Nat)]
+      | DEffect name params operations =>
+          let ops : List ScDecl :=
+            map (Pair Nat Expr) ScDecl (fun (operation : Pair Nat Expr) => match operation with
+              | MkPair op_name signature => ScDeclOf op_name module_id 6 name
+                  (mk_pi_chain params signature) (Nothing Expr) (Nothing Nat)
+              end) operations in
+          -- `effect AskName : String` uses the family name as the operation.
+          -- The unique name index cannot hold both rows; keep the operation.
+          let same_name : Bool :=
+            (fix go (rows : List (Pair Nat Expr)) : Bool :=
+              match rows with
+              | Nil => False
+              | Cons row rest => match row with
+                | MkPair op_name _ =>
+                    match eq_nat op_name name with
+                    | True => True
+                    | False => go rest
+                    end
+                end
+              end) operations in
+          match same_name with
+          | True => ops
+          | False =>
+              Cons ScDecl (ScDeclOf name module_id 7 0 (mk_pi_chain params (ESort 0))
+                (Nothing Expr) (Nothing Nat)) ops
+          end
+      | DImport _ => Nil ScDecl
+      | DRepresentation _ _ => Nil ScDecl
+      end) decls;
+
+-- Immutable balanced index: O(log declarations) lookup after one sorted build.
+inductive ScIndex : Type :=
+  | ScEmpty : ScIndex
+  | ScNode : ScDecl -> ScIndex -> ScIndex -> ScIndex;
+
+-- Typed index/resolution failures. Callers that still use a String host
+-- channel render these with sc_error_message.
+inductive ScError : Type :=
+  | ScIndexExhausted : ScError
+  | ScIndexIncomplete : ScError
+  | ScIndexAmbiguous : ScError
+  | ScIndexPartial : ScError
+  | ScUnresolved : Nat -> ScError
+  | ScSignatureExhausted : ScError;
+
+def sc_error_message (error : ScError) : String :=
+    match error with
+    | ScIndexExhausted => "semantic index traversal exhausted"
+    | ScIndexIncomplete => "incomplete semantic declaration index"
+    | ScIndexAmbiguous => "ambiguous or unsorted semantic declarations"
+    | ScIndexPartial => "partial semantic declaration index"
+    | ScUnresolved name =>
+        prim_string_concat "unresolved compiler declaration #" (prim_string_of_nat name)
+    | ScSignatureExhausted => "semantic signature traversal exhausted"
+    end;
+
+def sc_sorted_unique : List ScDecl -> Bool :=
+  fix go (decls : List ScDecl) : Bool :=
+    match decls with
+    | Nil => True
+    | Cons first rest => match rest with
+      | Nil => True
+      | Cons second _ => andb (ltb_nat (sc_decl_name first) (sc_decl_name second)) (go rest)
+      end
+    end;
+
+def sc_index_take : Nat -> Nat -> List ScDecl -> Either ScError (Pair ScIndex (List ScDecl)) :=
+  fix go (fuel : Nat) (count : Nat) (decls : List ScDecl) : Either ScError (Pair ScIndex (List ScDecl)) :=
+    match fuel with
+    | Z => Left ScError (Pair ScIndex (List ScDecl)) ScIndexExhausted
+    | S remaining_fuel => match count with
+    | Z => Right ScError (Pair ScIndex (List ScDecl))
+        (MkPair ScIndex (List ScDecl) ScEmpty decls)
+    | S rest_count =>
+        let left_count : Nat := div_nat rest_count 2 in
+        match go remaining_fuel left_count decls with
+        | Left error => Left ScError (Pair ScIndex (List ScDecl)) error
+        | Right left_result => match left_result with
+          | MkPair left remaining => match remaining with
+            | Nil => Left ScError (Pair ScIndex (List ScDecl)) ScIndexIncomplete
+            | Cons pivot more => match go remaining_fuel (sub rest_count left_count) more with
+              | Left error => Left ScError (Pair ScIndex (List ScDecl)) error
+              | Right right_result => match right_result with
+                | MkPair right tail_decls => Right ScError (Pair ScIndex (List ScDecl))
+                    (MkPair ScIndex (List ScDecl) (ScNode pivot left right) tail_decls)
+                end
+              end
+            end
+          end
+        end
+      end
+    end;
+
+def sc_index_sorted (decls : List ScDecl) : Either ScError ScIndex :=
+    match sc_sorted_unique decls with
+    | False => Left ScError ScIndex ScIndexAmbiguous
+    | True =>
+        let count : Nat := length ScDecl decls in
+        match sc_index_take (S count) count decls with
+      | Left error => Left ScError ScIndex error
+      | Right result => match result with
+        | MkPair index remaining => match remaining with
+          | Nil => Right ScError ScIndex index
+          | Cons _ _ => Left ScError ScIndex ScIndexPartial
+          end
+        end
+      end
+    end;
+
+def sc_lookup_global (name : Nat) : ScIndex -> Maybe ScDecl :=
+  fix go (index : ScIndex) : Maybe ScDecl :=
+    match index with
+    | ScEmpty => Nothing ScDecl
+    | ScNode decl left right => match compareNat name (sc_decl_name decl) with
+      | EQ => Just ScDecl decl
+      | LT => go left
+      | GT => go right
+      end
+    end;
+
+def sc_lookup_local (name : Nat) : List (Pair Nat Nat) -> Maybe Nat :=
+  fix go (scope : List (Pair Nat Nat)) : Maybe Nat :=
+    match scope with
+    | Nil => Nothing Nat
+    | Cons binding rest => match binding with
+      | MkPair spelling identity => match eq_nat name spelling with
+        | True => Just Nat identity
+        | False => go rest
+        end
+      end
+    end;
+
+-- A spine view borrows the existing children, preserving argument order.
+def sc_spine : Expr -> List Expr -> Pair Expr (List Expr) :=
+  fix go (term : Expr) (arguments : List Expr) : Pair Expr (List Expr) :=
+    match term with
+    | EApp callee argument => go callee (Cons Expr argument arguments)
+    | EVar _ => MkPair Expr (List Expr) term arguments
+    | EHole _ => MkPair Expr (List Expr) term arguments
+    | ESort _ => MkPair Expr (List Expr) term arguments
+    | ENat _ => MkPair Expr (List Expr) term arguments
+    | ELam _ _ _ => MkPair Expr (List Expr) term arguments
+    | EPi _ _ _ => MkPair Expr (List Expr) term arguments
+    | ELet _ _ _ _ => MkPair Expr (List Expr) term arguments
+    | EAscribe _ _ => MkPair Expr (List Expr) term arguments
+    | EMatch _ _ => MkPair Expr (List Expr) term arguments
+    | EFix _ _ _ _ => MkPair Expr (List Expr) term arguments
+    | EEffectRow _ _ => MkPair Expr (List Expr) term arguments
+    | EPerform _ _ => MkPair Expr (List Expr) term arguments
+    | EDo _ => MkPair Expr (List Expr) term arguments
+    | EHandle _ _ => MkPair Expr (List Expr) term arguments
+    | EBranch _ _ _ => MkPair Expr (List Expr) term arguments
+    | ENoBranch => MkPair Expr (List Expr) term arguments
+    | EBinder _ _ _ => MkPair Expr (List Expr) term arguments
+    | ENoBinder => MkPair Expr (List Expr) term arguments
+    | EMultiMatch _ _ => MkPair Expr (List Expr) term arguments
+    | EStr _ => MkPair Expr (List Expr) term arguments
+    | EDoBind _ _ => MkPair Expr (List Expr) term arguments
+    | EList _ => MkPair Expr (List Expr) term arguments
+    end;
+
+def sc_type_result : Nat -> Expr -> Either ScError Expr :=
+  fix go (fuel : Nat) (signature : Expr) : Either ScError Expr :=
+    match fuel with
+    | Z => Left ScError Expr ScSignatureExhausted
+    | S remaining => match signature with
+      | EPi _ _ result => go remaining result
+      | EEffectRow result _ => go remaining result
+      | EVar _ => Right ScError Expr signature
+      | EHole _ => Right ScError Expr signature
+      | ESort _ => Right ScError Expr signature
+      | ENat _ => Right ScError Expr signature
+      | EApp _ _ => Right ScError Expr signature
+      | ELam _ _ _ => Right ScError Expr signature
+      | ELet _ _ _ _ => Right ScError Expr signature
+      | EAscribe _ _ => Right ScError Expr signature
+      | EMatch _ _ => Right ScError Expr signature
+      | EFix _ _ _ _ => Right ScError Expr signature
+      | EPerform _ _ => Right ScError Expr signature
+      | EDo _ => Right ScError Expr signature
+      | EHandle _ _ => Right ScError Expr signature
+      | EBranch _ _ _ => Right ScError Expr signature
+      | ENoBranch => Right ScError Expr signature
+      | EBinder _ _ _ => Right ScError Expr signature
+      | ENoBinder => Right ScError Expr signature
+      | EMultiMatch _ _ => Right ScError Expr signature
+      | EStr _ => Right ScError Expr signature
+      | EDoBind _ _ => Right ScError Expr signature
+      | EList _ => Right ScError Expr signature
+      end
+    end;
+
+-- Finite parser-owned signatures are traversed structurally, never truncated
+-- to a fabricated arity. Type classification independently enforces a budget.
+def sc_pi_arity : Expr -> Nat :=
+  fix go (term : Expr) : Nat :=
+    match term with
+    | EPi _ _ rest => add 1 (go rest)
+    | EVar _ => 0
+    | EHole _ => 0
+    | ESort _ => 0
+    | ENat _ => 0
+    | EApp _ _ => 0
+    | ELam _ _ _ => 0
+    | ELet _ _ _ _ => 0
+    | EAscribe _ _ => 0
+    | EMatch _ _ => 0
+    | EFix _ _ _ _ => 0
+    | EEffectRow _ _ => 0
+    | EPerform _ _ => 0
+    | EDo _ => 0
+    | EHandle _ _ => 0
+    | EBranch _ _ _ => 0
+    | ENoBranch => 0
+    | EBinder _ _ _ => 0
+    | ENoBinder => 0
+    | EMultiMatch _ _ => 0
+    | EStr _ => 0
+    | EDoBind _ _ => 0
+    | EList _ => 0
+    end;

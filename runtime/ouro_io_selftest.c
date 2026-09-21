@@ -14,6 +14,8 @@
 
 #ifdef _WIN32
 #include <direct.h>
+#include <fcntl.h>
+#include <io.h>
 #include <process.h>
 #include <wchar.h>
 #include <windows.h>
@@ -461,6 +463,68 @@ static ouro_v *rename_action(ouro_v *source, ouro_v *target)
 	return ouro_apply(action, target);
 }
 
+static ouro_v *replace_action(ouro_v *source, ouro_v *stage, ouro_v *backup)
+{
+	ouro_v *action = ouro_apply(ouro_io_prim_req("prim_fs_replace_file"), source);
+	action = ouro_apply(action, stage);
+	return ouro_apply(action, backup);
+}
+
+static int file_replace_check(void)
+{
+	char source[256], stage[256], backup[256];
+	ouro_v *action;
+	struct stat info;
+	const char *error = NULL;
+	int status;
+	snprintf(source, sizeof source, "_build/c/io_replace_%d.src", ouro_test_getpid());
+	snprintf(stage, sizeof stage, "_build/c/io_replace_%d.stage", ouro_test_getpid());
+	snprintf(backup, sizeof backup, "_build/c/io_replace_%d.backup", ouro_test_getpid());
+	if (!write_text(source, "original\n") || !write_text(stage, "candidate\n") || !write_text(backup, "")) {
+		error = "replace setup";
+		goto done;
+	}
+	status = rename_result_status(replace_action(ouro_str(source), ouro_str(source), ouro_str(backup)));
+	if (status <= 0 || !file_text_eq(source, "original\n") || !file_text_eq(stage, "candidate\n")) {
+		error = "replace accepted alias or modified original";
+		goto done;
+	}
+	if (!write_text(backup, "reserved elsewhere\n")) {
+		error = "replace occupied backup setup";
+		goto done;
+	}
+	status = rename_result_status(replace_action(ouro_str(source), ouro_str(stage), ouro_str(backup)));
+	if (status <= 0 || !file_text_eq(source, "original\n") || !file_text_eq(backup, "reserved elsewhere\n")) {
+		error = "replace accepted occupied recovery file";
+		goto done;
+	}
+	if (!write_text(backup, "")) {
+		error = "replace reserve empty backup";
+		goto done;
+	}
+	action = replace_action(ouro_str(source), ouro_str(stage), ouro_str(backup));
+	if (!file_text_eq(source, "original\n") || !file_text_eq(stage, "candidate\n")) {
+		error = "replace action was not deferred";
+		goto done;
+	}
+	if (rename_result_status(action) != 0 || !file_text_eq(source, "candidate\n") ||
+	    !file_text_eq(backup, "original\n") || stat(stage, &info) == 0) {
+		error = "replace publication/recovery contents";
+		goto done;
+	}
+	if (rename_result_status(action) <= 0 || !file_text_eq(source, "candidate\n") ||
+	    !file_text_eq(backup, "original\n"))
+		error = "replace reused action changed files or returned success";
+done:
+	if (remove(source) != 0 && errno != ENOENT && error == NULL)
+		error = "replace source cleanup";
+	if (remove(stage) != 0 && errno != ENOENT && error == NULL)
+		error = "replace stage cleanup";
+	if (remove(backup) != 0 && errno != ENOENT && error == NULL)
+		error = "replace backup cleanup";
+	return error == NULL ? 0 : fail(error);
+}
+
 static int file_rename_check(void)
 {
 	char source[256];
@@ -775,41 +839,224 @@ static int process_inherit_unavailable_check(void)
 	return 0;
 }
 
-static int process_bounded_unavailable_check(void)
+static ouro_v *bounded_pair2(ouro_v *a, ouro_v *b)
 {
-    ouro_v *run = ouro_io_prim("ouro.process.capture_bounded");
-    ouro_v *partial;
-    ouro_v *action;
-    int iteration;
-    if (run == 0 || run->tag != OURO_TAG_CLOS)
-        return fail("missing bounded capture primitive");
-    partial = ouro_apply(run, ouro_str("no-child-may-be-launched"));
-    if (partial == 0 || partial->tag != OURO_TAG_CLOS)
-        return fail("bounded capture command application is not deferred");
-    partial = ouro_apply(partial, ouro_ctor(0, 0, 0));
-    if (partial == 0 || partial->tag != OURO_TAG_CLOS)
-        return fail("bounded capture argv application is not deferred");
-    action = ouro_apply(partial, ouro_ctor(0, 0, 0));
-    if (action == 0 || action->tag != OURO_TAG_CLOS)
-        return fail("bounded capture is not a stored Runtime action");
-    for (iteration = 0; iteration < 2; iteration++) {
-        const int expected[3] = {1, 120, 0};
-        ouro_v *result = ouro_apply(action, ouro_ctor(0, 0, 0));
-        int field;
-        for (field = 0; field < 3; field++) {
-            if (result == 0 || result->tag != 0 || result->n != 2 ||
-                OURO_F(result, 0) == 0 || OURO_F(result, 0)->tag != OURO_TAG_NAT ||
-                OURO_F(result, 0)->n != expected[field])
-                return fail("bounded capture host unavailability outcome");
-            result = OURO_F(result, 1);
-        }
-        if (result == 0 || result->tag != 0 || result->n != 2 ||
-            OURO_F(result, 0) == 0 || OURO_F(result, 1) == 0 ||
-            !host_bytes_eq(OURO_F(result, 0), "", 0) ||
-            !host_bytes_eq(OURO_F(result, 1), "", 0))
-            return fail("unavailable bounded capture streams must be empty");
-    }
-    return 0;
+	ouro_v *fields[2];
+	fields[0] = a;
+	fields[1] = b;
+	return ouro_ctor(0, 2, fields);
+}
+
+static ouro_v *bounded_request(ouro_v *stdin_v, unsigned long timeout_ms,
+	unsigned long memory_mb, unsigned long cpu,
+	unsigned long long out_cap, unsigned long long err_cap)
+{
+	return bounded_pair2(stdin_v,
+		bounded_pair2(ouro_nat(timeout_ms),
+		bounded_pair2(ouro_nat(memory_mb),
+		bounded_pair2(ouro_nat(cpu),
+		bounded_pair2(ouro_nat_u64(out_cap), ouro_nat_u64(err_cap))))));
+}
+
+static int bounded_nat_eq(ouro_v *v, unsigned long long want)
+{
+	unsigned long got = 0;
+	if (v == 0)
+		return 0;
+	if (want <= (unsigned long)INT_MAX && v->tag == OURO_TAG_NAT)
+		return v->n == (int)want;
+	if (!ouro_nat_to_ulong(v, &got))
+		return 0;
+	return (unsigned long long)got == want;
+}
+
+/* Unpack kind/detail/peak/stdout/stderr; 1 on well-formed reply. */
+static int bounded_unpack(ouro_v *result, ouro_v **kind, ouro_v **detail,
+	ouro_v **peak, ouro_v **out, ouro_v **err)
+{
+	ouro_v *r1;
+	ouro_v *r2;
+	ouro_v *streams;
+	if (result == 0 || result->tag != 0 || result->n != 2)
+		return 0;
+	*kind = OURO_F(result, 0);
+	r1 = OURO_F(result, 1);
+	if (r1 == 0 || r1->tag != 0 || r1->n != 2)
+		return 0;
+	*detail = OURO_F(r1, 0);
+	r2 = OURO_F(r1, 1);
+	if (r2 == 0 || r2->tag != 0 || r2->n != 2)
+		return 0;
+	*peak = OURO_F(r2, 0);
+	streams = OURO_F(r2, 1);
+	if (streams == 0 || streams->tag != 0 || streams->n != 2)
+		return 0;
+	*out = OURO_F(streams, 0);
+	*err = OURO_F(streams, 1);
+	return 1;
+}
+
+static ouro_v *bounded_action(const char *executable, const char *mode, ouro_v *request)
+{
+	ouro_v *run = ouro_io_prim("ouro.process.capture_bounded");
+	ouro_v *partial;
+	if (run == 0 || run->tag != OURO_TAG_CLOS)
+		return 0;
+	partial = ouro_apply(run, ouro_str(executable));
+	if (partial == 0 || partial->tag != OURO_TAG_CLOS)
+		return 0;
+	partial = ouro_apply(partial, mode != 0 ? string_list_one(mode) : ouro_ctor(0, 0, 0));
+	if (partial == 0 || partial->tag != OURO_TAG_CLOS)
+		return 0;
+	return ouro_apply(partial, request);
+}
+
+static int process_bounded_check(const char *executable)
+{
+	ouro_v *kind;
+	ouro_v *detail;
+	ouro_v *peak;
+	ouro_v *out;
+	ouro_v *err;
+	ouro_v *action;
+	ouro_v *result;
+#ifdef _WIN32
+	int iteration;
+	static const unsigned char binary[] = {65, 0, 255, 128, 10, 13, 90};
+	/* Deferred construction launches nothing, twice reusable. */
+	action = bounded_action("no-child-may-be-launched", 0,
+		bounded_request(ouro_str(""), 5000, 64, 1, 0, 0));
+	if (action == 0 || action->tag != OURO_TAG_CLOS)
+		return fail("bounded capture is not a stored Runtime action");
+	/* Basic completion with exact binary streams and nonzero exit. */
+	action = bounded_action(executable, "--capture-child",
+		bounded_request(ouro_str(""), 10000, 64, 1, 64, 64));
+	if (action == 0)
+		return fail("bounded capture basic action");
+	for (iteration = 0; iteration < 2; iteration++) {
+		unsigned long peak_bytes = 0;
+		result = ouro_apply(action, ouro_ctor(0, 0, 0));
+		if (!bounded_unpack(result, &kind, &detail, &peak, &out, &err) ||
+		    !bounded_nat_eq(kind, 0) || !bounded_nat_eq(detail, 7) ||
+		    !host_bytes_eq(out, "capture-out", 11) ||
+		    !host_bytes_eq(err, "capture-err", 11) ||
+		    !ouro_nat_to_ulong(peak, &peak_bytes) || peak_bytes == 0)
+			return fail("bounded capture basic completion");
+	}
+	/* Binary stdin round-trips exactly, including interior NUL. */
+	action = bounded_action(executable, "--bounded-echo",
+		bounded_request(ouro_packed(binary, sizeof binary), 10000, 64, 1, 64, 0));
+	if (action == 0)
+		return fail("bounded capture stdin action");
+	result = ouro_apply(action, ouro_ctor(0, 0, 0));
+	if (!bounded_unpack(result, &kind, &detail, &peak, &out, &err) ||
+	    !bounded_nat_eq(kind, 0) || !bounded_nat_eq(detail, 0) ||
+	    !host_bytes_eq(out, (const char *)binary, sizeof binary) ||
+	    !host_bytes_eq(err, "", 0))
+		return fail("bounded capture stdin echo");
+	/* Exit 73 stays a completed child status, not host failure. */
+	action = bounded_action(executable, "--bounded-child73",
+		bounded_request(ouro_str(""), 10000, 64, 1, 0, 0));
+	if (action == 0)
+		return fail("bounded capture exit73 action");
+	result = ouro_apply(action, ouro_ctor(0, 0, 0));
+	if (!bounded_unpack(result, &kind, &detail, &peak, &out, &err) ||
+	    !bounded_nat_eq(kind, 0) || !bounded_nat_eq(detail, 73))
+		return fail("bounded capture exit 73");
+	/* Timeout kills the child and keeps the kind distinct from exit. */
+	action = bounded_action(executable, "--bounded-sleep",
+		bounded_request(ouro_str(""), 250, 64, 1, 64, 64));
+	if (action == 0)
+		return fail("bounded capture timeout action");
+	result = ouro_apply(action, ouro_ctor(0, 0, 0));
+	if (!bounded_unpack(result, &kind, &detail, &peak, &out, &err) ||
+	    !bounded_nat_eq(kind, 2))
+		return fail("bounded capture timeout kind");
+	/* Stream caps report actual lengths without truncated success. */
+	action = bounded_action(executable, "--capture-child",
+		bounded_request(ouro_str(""), 10000, 64, 1, 5, 64));
+	if (action == 0)
+		return fail("bounded capture stdout-cap action");
+	result = ouro_apply(action, ouro_ctor(0, 0, 0));
+	if (!bounded_unpack(result, &kind, &detail, &peak, &out, &err) ||
+	    !bounded_nat_eq(kind, 6) || !bounded_nat_eq(detail, 11) ||
+	    !host_bytes_eq(out, "", 0) || !host_bytes_eq(err, "", 0))
+		return fail("bounded capture stdout cap");
+	action = bounded_action(executable, "--capture-child",
+		bounded_request(ouro_str(""), 10000, 64, 1, 64, 5));
+	if (action == 0)
+		return fail("bounded capture stderr-cap action");
+	result = ouro_apply(action, ouro_ctor(0, 0, 0));
+	if (!bounded_unpack(result, &kind, &detail, &peak, &out, &err) ||
+	    !bounded_nat_eq(kind, 7) || !bounded_nat_eq(detail, 11))
+		return fail("bounded capture stderr cap");
+	/* Missing binaries are OS errors, never child exits. */
+	action = bounded_action("./__ouro_absent_bounded_5f79d__.exe", 0,
+		bounded_request(ouro_str(""), 5000, 64, 1, 0, 0));
+	if (action == 0)
+		return fail("bounded capture missing action");
+	result = ouro_apply(action, ouro_ctor(0, 0, 0));
+	if (!bounded_unpack(result, &kind, &detail, &peak, &out, &err) ||
+	    !bounded_nat_eq(kind, 1) || bounded_nat_eq(detail, 0))
+		return fail("bounded capture missing binary");
+#else
+	(void)executable;
+	(void)kind;
+	(void)detail;
+	(void)peak;
+	(void)out;
+	(void)err;
+	action = bounded_action("no-child-may-be-launched", 0,
+		bounded_request(ouro_str(""), 5000, 64, 1, 0, 0));
+	if (action == 0 || action->tag != OURO_TAG_CLOS)
+		return fail("bounded capture is not a stored Runtime action");
+	result = ouro_apply(action, ouro_ctor(0, 0, 0));
+	if (!bounded_unpack(result, &kind, &detail, &peak, &out, &err) ||
+	    !bounded_nat_eq(kind, 1) || !bounded_nat_eq(detail, 120))
+		return fail("bounded capture POSIX unavailability");
+	return 0;
+#endif
+	/* Invalid limits name their field without launching. */
+	{
+		struct {
+			unsigned long timeout;
+			unsigned long memory;
+			unsigned long cpu;
+			unsigned long long out_cap;
+			unsigned long long err_cap;
+			unsigned long long field;
+			const char *name;
+		} cases[] = {
+			{0, 64, 1, 0, 0, 1, "zero timeout"},
+			{5000, 0, 1, 0, 0, 2, "zero memory"},
+			{5000, 64, 2, 0, 0, 3, "cpu count"},
+			{5000, 64, 1, 0xFFFFFFFFFFFFFFFFULL, 0, 4, "stdout cap"},
+			{5000, 64, 1, 0, 0xFFFFFFFFFFFFFFFFULL, 5, "stderr cap"},
+		};
+		size_t i;
+		for (i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+			action = bounded_action(executable, "--capture-child",
+				bounded_request(ouro_str(""), cases[i].timeout,
+					cases[i].memory, cases[i].cpu,
+					cases[i].out_cap, cases[i].err_cap));
+			if (action == 0)
+				return fail("bounded capture invalid action");
+			result = ouro_apply(action, ouro_ctor(0, 0, 0));
+			if (!bounded_unpack(result, &kind, &detail, &peak, &out, &err) ||
+			    !bounded_nat_eq(kind, 4) ||
+			    !bounded_nat_eq(detail, cases[i].field))
+				return fail(cases[i].name);
+		}
+	}
+	/* Malformed shapes fail closed as OS parameter errors. */
+	action = bounded_action(executable, "--capture-child", ouro_ctor(0, 0, 0));
+	if (action == 0)
+		return fail("bounded capture malformed action");
+	result = ouro_apply(action, ouro_ctor(0, 0, 0));
+	if (!bounded_unpack(result, &kind, &detail, &peak, &out, &err) ||
+	    !bounded_nat_eq(kind, 1) || !bounded_nat_eq(detail, 87))
+		return fail("bounded capture malformed request");
+	return 0;
 }
 
 static int http_unavailable_check(void)
@@ -866,7 +1113,50 @@ int main(int argc, char **argv)
 		fputs("capture-err", stderr);
 		return 7;
 	}
+	if (argc == 2 && strcmp(argv[1], "--bounded-echo") == 0) {
+		char chunk[4096];
+		size_t got;
+#ifdef _WIN32
+		_setmode(_fileno(stdin), _O_BINARY);
+		_setmode(_fileno(stdout), _O_BINARY);
+#endif
+		while ((got = fread(chunk, 1, sizeof chunk, stdin)) > 0) {
+			if (fwrite(chunk, 1, got, stdout) != got)
+				return 11;
+		}
+		return ferror(stdin) ? 11 : 0;
+	}
+	if (argc == 2 && strcmp(argv[1], "--bounded-sleep") == 0) {
+#ifdef _WIN32
+		Sleep(10000);
+#else
+		sleep(10);
+#endif
+		return 91;
+	}
+	if (argc == 2 && strcmp(argv[1], "--bounded-child73") == 0)
+		return 73;
 	ouro_rt_warmup();
+	if (argc == 3 && (strcmp(argv[1], "--read-file") == 0 || strcmp(argv[1], "--read-nul-path") == 0)) {
+		ouro_v *name = ouro_str(argv[2]);
+		ouro_io_set_argv(argc, argv);
+		if (strcmp(argv[1], "--read-nul-path") == 0) {
+			static const unsigned char suffix[] = { 0, 'x' };
+			name = ouro_apply(ouro_apply(ouro_io_prim_req("prim_string_concat"), name),
+			    ouro_packed(suffix, sizeof suffix));
+		}
+		r = ouro_apply(ouro_apply(ouro_io_prim_req("prim_fs_read_file"), name), ouro_ctor(0, 0, 0));
+		if (r == 0 || r->tag != OURO_TAG_BYTES || r->n < 0)
+			return fail("read did not return packed bytes");
+		if (fwrite(r->u.s, 1, (size_t)r->n, stdout) != (size_t)r->n)
+			return fail("read observer output failed");
+		return 0;
+	}
+	if (argc == 5 && strcmp(argv[1], "--replace-files") == 0) {
+		int status = rename_result_status(replace_action(ouro_str(argv[2]), ouro_str(argv[3]), ouro_str(argv[4])));
+		printf("%d\n", status);
+		return status == 0 ? 0 : 1;
+	}
 	if (argc == 2 && strcmp(argv[1], "--arguments-only") == 0)
 		return process_arguments_check();
 	if (argc == 2 && strcmp(argv[1], "--runtime-only") == 0)
@@ -884,8 +1174,8 @@ int main(int argc, char **argv)
 		return fail("invalid Runtime loop condition returned");
 	}
 	if (argc == 2 && strcmp(argv[1], "--bounded-only") == 0)
-		return process_bounded_unavailable_check();
-	if (process_bounded_unavailable_check() != 0)
+		return process_bounded_check(argv[0]);
+	if (process_bounded_check(argv[0]) != 0)
 		return 1;
 	if (argc == 2 && strcmp(argv[1], "--inherit-only") == 0)
 		return process_inherit_unavailable_check();
@@ -933,6 +1223,8 @@ int main(int argc, char **argv)
 	if (private_temp_check() != 0)
 		return 1;
 	if (file_rename_check() != 0)
+		return 1;
+	if (file_replace_check() != 0)
 		return 1;
 	if (private_process_capture_check() != 0)
 		return 1;

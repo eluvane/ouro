@@ -38,7 +38,8 @@ def _ouro1_python_script(ouro1: Path) -> bool:
     if ouro1.suffix.lower() == ".py":
         return True
     try:
-        head = ouro1.read_bytes()[:80]
+        with ouro1.open("rb") as handle:
+            head = handle.read(80)
     except OSError:
         return False
     line = head.split(b"\n", 1)[0].lower()
@@ -134,9 +135,34 @@ def import_targets(path: str) -> List[str]:
     return SMC.quoted_import_targets(read_required_text(p, "FRONTEND_REGEN"), path)
 
 
+def collect_units_many(roots: Sequence[str]) -> Dict[str, List[str]]:
+    """Collect ordered closures with one import read per path in this call.
+
+    This is preparation-local adjacency, not semantic facts or a persistent
+    cache. It dies before a child runs; every later preparation rereads inputs.
+    Keep root-local DFS state and errors owned by the existing collector.
+    """
+    imports: Dict[str, Tuple[str, ...]] = {}
+
+    def read_imports(path: str) -> Tuple[str, ...]:
+        if path not in imports:
+            imports[path] = tuple(import_targets(path))
+        return imports[path]
+
+    groups: Dict[str, List[str]] = {}
+    for root in roots:
+        if root not in groups:
+            groups[root] = SMC.collect_units(
+                root, imports=read_imports,
+                normalize=lambda path: path.replace("\\", "/"),
+                cycle_error=lambda norm, root=root:
+                    f"FRONTEND_REGEN: FAIL import cycle while collecting {root}: {norm}",
+            )
+    return groups
+
+
 def collect_units(root: str) -> List[str]:
-    return SMC.collect_units(root, imports=import_targets, normalize=lambda path: path.replace("\\", "/"), cycle_error=lambda norm:
-        f"FRONTEND_REGEN: FAIL import cycle while collecting {root}: {norm}")
+    return collect_units_many([root])[root]
 
 
 def digest(path: Path) -> FileDigest:
@@ -145,7 +171,7 @@ def digest(path: Path) -> FileDigest:
 
 
 def all_frontend_inputs(ouro1: Path, fuel: str) -> Tuple[Dict[str, List[str]], Dict[str, FileDigest], str]:
-    unit_graph: Dict[str, List[str]] = {}
+    unit_graph = collect_units_many([root for _tag, _mod, root, _file in FRONTEND_TUS])
     paths: Dict[str, Path] = {
         "seed": ouro1,
         "frontend_regen": ROOT / "scripts/frontend_regen.py",
@@ -154,9 +180,7 @@ def all_frontend_inputs(ouro1: Path, fuel: str) -> Tuple[Dict[str, List[str]], D
         "packer": ROOT / "scripts/pack_frontend.py",
     }
     for _tag, _mod, root, _file in FRONTEND_TUS:
-        units = collect_units(root)
-        unit_graph[root] = units
-        for u in units:
+        for u in unit_graph[root]:
             paths.setdefault(u, ROOT / u)
     digests = {name: digest(path) for name, path in sorted(paths.items())}
     signature = hash_json(

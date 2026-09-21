@@ -14,6 +14,33 @@
 #include <string.h>
 #include <stdarg.h>
 
+/* Quality tooling uses the same compiler-owned parser repeatedly without the
+   driver's compile-unit phase seam. Scope only its temporary allocations;
+   source, intern identities, grammar and typed error results stay in Ouro.
+   The hooked harvest (`cm_load_file`) keeps imported function bodies in this
+   nested arena so leave() copies signatures, intern deltas and the selected
+   file. Caller intern identities are shared across the seam.
+   No retry, alternate parser, process-global source cache or semantic
+   decision lives here. This two-argument hook also applies in the flat
+   native quality tool build. */
+static ouro_v *quality_parse_intern(ouro_env *env, ouro_v *intern)
+{
+	ouro_heap_context *scope = ouro_heap_context_enter();
+	ouro_v *result = ouro_apply(ouro_apply(ouro_get(env, 1),
+		ouro_get(env, 0)), intern);
+	return ouro_heap_context_leave(scope, result);
+}
+
+static ouro_v *quality_parse_source(ouro_env *env, ouro_v *source)
+{
+	return ouro_clos(quality_parse_intern, ouro_cons(source, env));
+}
+
+ouro_v *ouro_wrap_quality_parse(ouro_v *raw)
+{
+	return ouro_clos(quality_parse_source, ouro_cons(raw, 0));
+}
+
 #define MAX_PATH 4096
 #define FE_PARSE_ERR 10UL
 

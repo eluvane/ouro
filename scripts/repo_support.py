@@ -530,3 +530,12 @@ def read_required_text(path: Path, label: str) -> str:
         return path.read_text(encoding="utf-8")
     except (OSError, UnicodeError) as exc:
         raise SystemExit(f"{label}: FAIL unreadable {path}: {exc}") from exc
+
+
+def checked_windows_result(value):
+    """Preserve the thread-local Win32 error before another host API call."""
+    import ctypes
+
+    if not value:
+        raise ctypes.WinError(ctypes.get_last_error())
+    return value

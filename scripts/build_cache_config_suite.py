@@ -23,7 +23,8 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def copy_repo(dst: Path) -> None:
-    ignore = shutil.ignore_patterns("_build", "_cache", ".git", "*.pyc", "__pycache__")
+    ignore = shutil.ignore_patterns("_build", "_cache", ".git", "*.pyc", "__pycache__",
+                                   "_tmp_ci_linux", "_tmp_portable_macos")
     shutil.copytree(ROOT, dst, ignore=ignore)
 
 
@@ -318,7 +319,7 @@ def test_clang_bracket_depth(tmp: Path) -> None:
             obj, report = build_driver.compile_c_object(*args)
             assert report["cache"] == "miss", version
             stamp = json.loads(obj.with_suffix(".cmdhash").read_text(encoding="utf-8"))
-            assert ("-fbracket-depth=1024" in stamp["command"]) is expected, version
+            assert ("-fbracket-depth=4096" in stamp["command"]) is expected, version
             assert build_driver.compile_c_object(*args)[1]["cache"] == "hit", version
 
 
@@ -360,6 +361,10 @@ print("int main(void) { return 0; }")
         return result
 
     invoke()
+    from ourosmith.native import INPUT_FIELDS
+
+    first_receipt = json.loads((repo / "_build/tool-test.build.json").read_text(encoding="utf-8"))
+    assert set(first_receipt["inputs"]) == INPUT_FIELDS, "native tool build and its strict receipt consumer disagree"
     baseline = counts(cc_log)
     # Generated tool plus runtime, IO, entry point and frontend-link objects.
     assert baseline == (5, 1), baseline
@@ -389,6 +394,19 @@ print("int main(void) { return 0; }")
         assert not shadow.exists() and binary.is_file(), "a stale host wrapper must not shadow the native exe"
     invoke("_build/another-suite/tool-test")
     assert counts(cc_log) == baseline, "same entry in another suite must reuse the complete tool"
+
+    if os.name == "nt":
+        # A fake linker emits a shell script, not a PE resource image. Quality
+        # publication must fail before replacing a previously installed tool.
+        quality_entry = repo / "tools/fmt.ouro"
+        quality_entry.write_text("def main : Nat := 1;\n", encoding="utf-8")
+        installed_receipt = repo / "_build/tool-test.build.json"
+        saved_receipt = installed_receipt.read_bytes()
+        failed = invoke(source="tools/fmt.ouro", failure=True)
+        assert "BUILD_TOOL: FAIL" in failed.stdout, failed.stdout
+        assert binary.read_bytes() == baseline_bytes, "resource failure replaced the installed binary"
+        assert installed_receipt.read_bytes() == saved_receipt, "resource failure published a success receipt"
+        baseline = counts(cc_log)
 
     old_time = imported.stat().st_mtime_ns
     os.utime(imported, ns=(old_time, old_time + 10_000_000_000))
@@ -445,6 +463,126 @@ print("int main(void) { return 0; }")
     env["FAKE_EMIT_FAIL"] = "1"
     invoke(failure=True)
     invoke(options=("--check",), failure=True)
+
+
+def test_native_tool_companion(tmp: Path) -> None:
+    repo = tmp / "repo_companion"
+    copy_repo(repo)
+    fakecc = tmp / "companion-cc.py"
+    write_fake_cc(fakecc)
+    compiler = repo / "_build/c/ouro1.py"
+    compiler.parent.mkdir(parents=True)
+    # The fix closure requires every host seam hook; stub the same getter and
+    # export ceremony the hook tests accept so the companion current/rebuild
+    # logic runs through the real emit path.
+    compiler.write_text('''import hashlib, os, sys
+sys.path.insert(0, "scripts")
+import native_tool_build as native
+from pathlib import Path
+with Path(os.environ["FAKE_EMIT_LOG"]).open("a") as log:
+    log.write("emit\\n")
+source = "".join(Path(p).read_text() for p in sys.argv if p.endswith(".ouro"))
+names = ["compile_checked_units", *(name for name, _, _ in native.HOST_HOOKS)]
+getters = []
+exports = []
+values = []
+for index, name in enumerate(names):
+    gid = index + 10
+    getters.append(
+        f"static ouro_v *ouro_g{gid}(void){{ouro_env *env=0;(void)env;"
+        f"if(ouro_c{gid}==0){{ouro_static_begin();"
+        f"ouro_c{gid}=ouro_clos(ouro_f{gid}_,env);"
+        f"ouro_static_end();}}return ouro_c{gid};}}")
+    exports.append(f'case {index}: return "{name}";')
+    values.append(f"case {index}: return ouro_g{gid}();")
+print('#include "ouro_rt.h"')
+print("/* " + hashlib.sha256(source.encode()).hexdigest() + " */")
+print("int main(void) { return 0; }")
+print("\\n".join([*getters,
+      'const char *ouro_export_name(int i){switch(i){', *exports,
+      'default: return "";}}',
+      'ouro_v *ouro_export_value(int i){switch(i){', *values,
+      'default: return 0;}}']))
+''', encoding="utf-8")
+    # Manifest embedding needs a real PE linker; the companion current/rebuild
+    # logic is orthogonal and is covered here with plain binaries.
+    driver = repo / "companion_driver.py"
+    driver.write_text('''import argparse
+import subprocess
+import sys
+from pathlib import Path
+
+sys.path.insert(0, "scripts")
+import ouro_build as build
+import native_tool_build as native
+from repo_support import configure_native_stack
+
+native.WINDOWS_UTF8_ENTRIES = frozenset()
+parser = argparse.ArgumentParser()
+parser.add_argument("entry")
+parser.add_argument("output", type=Path)
+parser.add_argument("--compiler", type=Path, required=True)
+parser.add_argument("--fuel", type=int, default=60000)
+parser.add_argument("--check", action="store_true")
+build.add_common(parser)
+args = parser.parse_args()
+try:
+    configure_native_stack()
+    report = native.build_tool(args)
+except (OSError, ValueError, RuntimeError, subprocess.CalledProcessError) as exc:
+    print(f"BUILD_TOOL: FAIL {exc}", file=sys.stderr)
+    raise SystemExit(1)
+raise SystemExit(int(args.check and not report["current"]))
+''', encoding="utf-8")
+    env = isolated_env()
+    env.update(CC=str(fakecc), FAKE_CC_LOG=str(tmp / "companion-cc.log"),
+               FAKE_EMIT_LOG=str(tmp / "companion-emit.log"),
+               OURO_CACHE="1", OURO_CCACHE="disabled", OURO_JOBS="1")
+    suffix = ".exe" if os.name == "nt" else ""
+    parent_out = "_build/companion-fix"
+    parent_bin = repo / (parent_out + suffix)
+    # Receipts and manifests bind to the pre-suffix output spelling.
+    parent_receipt = repo / (parent_out + ".build.json")
+    companion_bin = repo / ("_build/ouro-fix-check" + suffix)
+    companion_receipt = repo / "_build/ouro-fix-check.build.json"
+
+    def invoke(*options, failure=False):
+        result = subprocess.run(
+            [sys.executable, "companion_driver.py", "tools/fix/main.ouro", parent_out,
+             "--compiler", str(compiler), "--verbosity", "quiet", *options],
+            cwd=repo, env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False,
+        )
+        assert (result.returncode != 0) == failure, result.stdout
+        return result
+
+    invoke()
+    assert parent_bin.is_file() and companion_bin.is_file()
+    assert parent_receipt.is_file() and companion_receipt.is_file()
+    parent_inputs = json.loads(parent_receipt.read_text(encoding="utf-8"))["inputs"]
+    assert "tools/fix/check_main.ouro" in parent_inputs["sources"], \
+        "parent receipt must cover the companion closure"
+    invoke("--check")
+
+    def expect_rebuild():
+        invoke("--check", failure=True)
+        invoke()
+        assert companion_bin.is_file() and companion_receipt.is_file()
+        invoke("--check")
+
+    companion_bin.unlink()
+    expect_rebuild()
+    companion_receipt.write_text("malformed", encoding="utf-8")
+    expect_rebuild()
+    companion_bin.write_bytes(b"corrupt companion")
+    expect_rebuild()
+    companion_receipt.unlink()
+    expect_rebuild()
+
+    worker = repo / "tools/fix/check_main.ouro"
+    worker.write_text(worker.read_text(encoding="utf-8") + "\n-- companion change\n", encoding="utf-8")
+    invoke("--check", failure=True)
+    invoke()
+    invoke("--check")
 
 
 def test_frontend_native_fs_create_protocol(tmp: Path) -> None:
@@ -631,9 +769,9 @@ def test_frontend_host_protocol(tmp: Path) -> None:
                 "codegen-program-context", "mir-phase-errors", "mir-phase-nested", "mir-reachability-rounds", "mir-flow-rounds", "lower-raw-order", "lower-raw-left", "lower-survivors",
                 "pe-byte-large", "pe-byte-errors", "pe-byte-context", "pe-patch-context", "lower-bad-result", "lower-bad-result-quiet",
                 "lower-bad-chunk", "lower-bad-contracts", "caller-output", "retained-result",
-                "typed-failure", "nested-context", "allocation-context", "recheck-scale",
+                "typed-failure", "nested-context", "allocation-context", "shared-parent-spine", "recheck-scale",
                 "recheck-retained", "recheck-late-invalid", "recheck-missing-bodies", "recheck-zero-fuel")
-    assert len(cases) == 33 and tuple(case[1][0] for case in host.probe_cases()) == expected
+    assert len(cases) == 34 and tuple(case[1][0] for case in host.probe_cases()) == expected
     quiet = RunResult("ok", 0, "N1_HOST_MIR: emitted valid-quiet\n",
                       "n1-host: mir functions=1 live=1\nn1-host: mir-check live=1\n"
                       "n1-host: gc-infer live=1\nn1-host: annotate live=1\n"
@@ -657,6 +795,8 @@ def test_frontend_host_protocol(tmp: Path) -> None:
     typed = RunResult("ok", 0, "FRONTEND_LINK_SELFTEST: passed typed-failure\n",
                       "probe.ouro: type mismatch in wrong\n", 0, 0)
     host.verify_probe(typed, cases["typed-failure"])
+    shared = replace(typed, stdout="FRONTEND_LINK_SELFTEST: passed shared-parent-spine\n", stderr="")
+    host.verify_probe(shared, cases["shared-parent-spine"])
     rejected = RunResult("ok", 1, "", "n1-host: mir functions=1 live=600\n"
                          "n1-host: mir-check live=600\nn1-host: mir-check failed tag=0 n=1 live=31704\n"
                          "n1-host: mir:return\n", 0, 0)
@@ -694,6 +834,9 @@ def test_frontend_host_protocol(tmp: Path) -> None:
                (replace(pe, stdout="N1_HOST_PE: passed pe-patch-context\n", returncode=1), "pe-patch-context"),
                (replace(pe, stdout="N1_HOST_PE: passed pe-patch-context\n", stderr="unexpected\n"), "pe-patch-context"),
                (replace(typed, stderr=""), "typed-failure"),
+               (replace(shared, stdout=""), "shared-parent-spine"),
+               (replace(shared, returncode=1), "shared-parent-spine"),
+               (replace(shared, status="timeout"), "shared-parent-spine"),
                (replace(rejected, returncode=0), "bad-return"),
                (replace(rejected, stdout="N1_HOST_MIR: emitted bad-return\n"), "bad-return"),
                (replace(rejected, stderr=rejected.stderr + "n1-host: gc-infer live=1\n"), "bad-return")]
@@ -1074,6 +1217,10 @@ def test_native_tool_hooks(tmp: Path) -> None:
     checker = hook(source(["compile_checked_units"]), ["compiler/driver.ouro"])
     assert "ouro_fe_compile_checked_units_clos();" in checker
     assert "ouro_wrap_" not in checker, "checker-only tools must not require a backend"
+    parser = hook(source(["cm_load_file"]), ["tools/clippy/semantic_unit.ouro"])
+    assert "ouro_wrap_quality_parse(ouro_clos(" in parser
+    assert "ouro_fe_compile_checked_units_clos" not in parser
+    assert "ouro_wrap_x64_encode" not in parser
     encoder = hook(source(["x64_encode"]), ["compiler/native/x64.ouro"])
     assert "ouro_wrap_x64_encode(ouro_clos(" in encoder
     assert "ouro_fe_compile_checked_units_clos" not in encoder
@@ -1089,8 +1236,11 @@ def test_native_tool_hooks(tmp: Path) -> None:
     owners = ["compiler/driver.ouro", *(owner for _, _, paths in native.HOST_HOOKS for owner in paths)]
     complete = hook(source(names), owners)
     assert "ouro_fe_compile_checked_units_clos();" in complete
-    for _, wrapper, _ in native.HOST_HOOKS:
-        assert complete.count(f"{wrapper}(ouro_clos(") == 1, wrapper
+    for index, (name, wrapper, _) in enumerate(native.HOST_HOOKS, start=11):
+        # Several exports share a lifetime wrapper; each getter is hooked once.
+        assignment = f"ouro_c{index}={wrapper}(ouro_clos(ouro_f{index}_,env));"
+        assert complete.count(assignment) == 1, name
+    assert complete.count('#include "ouro_quality_scope.h"') == 1
 
     def rejected(text, units, expected):
         generated.write_text(text, encoding="utf-8")
@@ -1104,6 +1254,10 @@ def test_native_tool_hooks(tmp: Path) -> None:
 
     for name in names:
         rejected(source([item for item in names if item != name]), owners, name)
+    rejected(source(["cm_load_file"]).replace("case 0: return ouro_g10();", ""), (),
+             "cm_load_file export value")
+    rejected(source(["cm_load_file"]).replace("ouro_c10=ouro_clos(ouro_f10_,env);", "ouro_c10=0;"), (),
+             "could not hook cm_load_file getter")
     rejected(source(["x64_encode"]).replace("case 0: return ouro_g10();", ""), (),
              "x64_encode export value")
     rejected(source(["x64_encode"]).replace("ouro_c10=ouro_clos(ouro_f10_,env);", "ouro_c10=0;"), (),
@@ -1113,11 +1267,83 @@ def test_native_tool_hooks(tmp: Path) -> None:
     rejected(source(["compile_checked_units"]).replace("ouro_c10=ouro_clos(ouro_f10_,env);", "ouro_c10=0;"), (),
              "could not hook compile_checked_units getter")
 
-    # Every injected symbol must be provided by the normal tool link inputs,
+    # Every injected symbol must be provided by normal tool sources or headers,
     # not only by the separate N1 producer executable's main translation unit.
-    runtime = "\n".join((ROOT / path).read_text(encoding="utf-8") for path in native.RUNTIME)
+    runtime = "\n".join((ROOT / path).read_text(encoding="utf-8")
+                        for path in (*native.RUNTIME, "runtime/ouro_quality_scope.h"))
     for _, wrapper, _ in native.HOST_HOOKS:
         assert re.search(rf"ouro_v\s*\*\s*{re.escape(wrapper)}\s*\(ouro_v\s*\*raw\)\s*\{{", runtime), wrapper
+
+
+def test_windows_quality_manifest_protocol(tmp: Path) -> None:
+    """Resource failure/cleanup protocol only; native suites test Unicode argv."""
+    import ctypes
+    from unittest.mock import Mock, call
+
+    import native_tool_build as native
+
+    manifest = native.WINDOWS_UTF8_MANIFEST
+    data = ctypes.create_string_buffer(manifest.encode("utf-8"))
+    api = Mock()
+    api.LoadLibraryExW.return_value = 10
+    api.FindResourceW.return_value = 0
+    api.FreeLibrary.return_value = True
+    api.BeginUpdateResourceW.return_value = 20
+    api.UpdateResourceW.return_value = True
+    api.EndUpdateResourceW.return_value = True
+    binary = tmp / "candidate.exe"
+    with patch.object(ctypes, "WinDLL", return_value=api, create=True), \
+         patch.object(ctypes, "get_last_error", return_value=1813, create=True) as last_error, \
+         patch.object(ctypes, "WinError", side_effect=lambda code: OSError(code, "resource failure"), create=True):
+        native.embed_windows_manifest(binary, manifest)
+        api.LoadLibraryExW.assert_called_once_with(str(binary.resolve()), None, 0x60)
+        api.FreeLibrary.assert_called_once_with(10)
+        api.BeginUpdateResourceW.assert_called_once_with(str(binary.resolve()), False)
+        assert api.UpdateResourceW.call_args.args[1].value == 24
+        assert api.UpdateResourceW.call_args.args[2].value == 1
+        assert api.UpdateResourceW.call_args.args[3] == 0
+        assert api.UpdateResourceW.call_args.args[5] == len(manifest.encode("utf-8"))
+        api.EndUpdateResourceW.assert_called_once_with(20, False)
+
+        def refused(expected):
+            try:
+                native.embed_windows_manifest(binary, manifest)
+            except (OSError, RuntimeError) as error:
+                assert expected in str(error), str(error)
+            else:
+                raise AssertionError("invalid resource transition accepted")
+
+        api.reset_mock()
+        api.FindResourceW.return_value = 30
+        api.SizeofResource.return_value = len(manifest.encode("utf-8"))
+        api.LoadResource.return_value = 40
+        api.LockResource.return_value = ctypes.addressof(data)
+        native.embed_windows_manifest(binary, manifest)
+        api.BeginUpdateResourceW.assert_not_called()
+        api.FreeLibrary.assert_called_once_with(10)
+        api.SizeofResource.return_value = 1
+        refused("conflicting executable manifest")
+        api.BeginUpdateResourceW.assert_not_called()
+
+        api.reset_mock()
+        api.FindResourceW.return_value = 0
+        last_error.return_value = 5
+        refused("resource failure")
+        api.BeginUpdateResourceW.assert_not_called()
+        api.FreeLibrary.assert_called_once_with(10)
+        last_error.return_value = 1813
+        api.BeginUpdateResourceW.return_value = 0
+        refused("resource failure")
+        api.UpdateResourceW.assert_not_called()
+        api.BeginUpdateResourceW.return_value = 20
+        api.UpdateResourceW.return_value = False
+        refused("resource failure")
+        api.EndUpdateResourceW.assert_called_once_with(20, True)
+        api.EndUpdateResourceW.return_value = False
+        refused("discard also failed")
+        api.UpdateResourceW.return_value = True
+        refused("resource failure")
+        assert api.EndUpdateResourceW.call_args_list[-1] == call(20, False)
 
 
 def test_frontend_native_async_protocol(tmp: Path) -> None:
@@ -1126,6 +1352,14 @@ def test_frontend_native_async_protocol(tmp: Path) -> None:
     import hashlib
 
     import frontend_native_async as native
+
+    # The synthetic protocol fixture must track the live runtime mutation sites.
+    live = native.source_snapshot()
+    for variant in native.FAULTS:
+        mutated = native.variant_bytes(live, variant)
+        changed = [unit for unit, body in mutated.items()
+                   if hashlib.sha256(body).hexdigest() != live["sources"][unit]]
+        assert changed == [native.SLEEP], variant
 
     def rejected(action):
         try:
@@ -1222,7 +1456,7 @@ def test_frontend_native_async_protocol(tmp: Path) -> None:
     entry = root / native.ENTRY
     sleep.parent.mkdir(parents=True)
     entry.parent.mkdir(parents=True)
-    sleep.write_text("u32_from_nat 1000\nu8_from_nat 1\n", encoding="utf-8")
+    sleep.write_text("u32_from_nat windows_sleep_milliseconds_per_second\nu8_from_nat 1\n", encoding="utf-8")
     entry.write_text('import "../runtime/platform/windows_sleep.ouro";\n', encoding="utf-8")
     units = [native.SLEEP, native.ENTRY]
     with patch.object(native, "ROOT", root), patch.object(native, "collect_units", return_value=units):
@@ -1353,14 +1587,17 @@ def test_build_tool_caller_paths(tmp: Path) -> None:
     log = tmp / "build-argv.json"
     env = isolated_env()
     env.update(PYTHON=sys.executable, BUILD_ARGV_LOG=str(log), OURO_BUILD_TOOL_MODE="native")
-    shell_caller = subprocess.run(["sh", "-c", "pwd"], cwd=caller, env=env,
-                                  capture_output=True, text=True, check=True).stdout.strip()
     for code in (0, 23):
         env["BUILD_STATUS"] = str(code)
         result = subprocess.run(["sh", str(scripts / "build_tool.sh"), "./source.ouro", "out dir/tool"],
                                 cwd=caller, env=env, capture_output=True, text=True, check=False)
         assert result.returncode == code, result
-        assert json.loads(log.read_text())[:2] == [shell_caller + "/./source.ouro", shell_caller + "/out dir/tool"]
+        # MSYS converts shell paths before invoking the native Python receiver.
+        # Both inputs must still bind to the caller, including the spaced output.
+        forwarded = json.loads(log.read_text())[:2]
+        assert all(Path(arg).is_absolute() for arg in forwarded), forwarded
+        assert [Path(arg).resolve() for arg in forwarded] == [
+            (caller / "source.ouro").resolve(), (caller / "out dir/tool").resolve()]
 
 
 def test_runtime_io_host_selection(tmp: Path) -> None:
@@ -1383,17 +1620,21 @@ def test_runtime_io_host_selection(tmp: Path) -> None:
         encoding="utf-8")
     (scripts / "build_tool.sh").write_text(
         '#!/bin/sh\n"$PYTHON" scripts/capture.py\nexit 23\n', encoding="utf-8")
+    # This test observes launcher environment only; filesystem behavior is
+    # exercised with real binaries by runtime_io_suite and frontend_host_suite.
+    (scripts / "fs_replace_suite.py").write_text("pass\n", encoding="utf-8")
+    (scripts / "fs_read_suite.py").write_text("pass\n", encoding="utf-8")
     env = isolated_env()
     env.update(PYTHON=sys.executable, CC=fakecc.as_posix(), WRAPPER_ENV_LOG=str(log))
     result = subprocess.run(["sh", "scripts/runtime_io_suite.sh"], cwd=repo, env=env,
                             text=True, capture_output=True, timeout=15, check=False)
     assert result.returncode == 1 and "native suite build" in result.stderr, result
-    shell_root = subprocess.run(["sh", "-c", "pwd"], cwd=repo, env=env,
-                                text=True, capture_output=True, check=True).stdout.strip()
-    assert json.loads(log.read_text()) == {
-        "OURO_TEST_CHECK": shell_root + "/scripts/ouro1.sh",
-        "OURO_TEST_BUILD": shell_root + "/scripts/build_tool.sh",
-        "OURO_HOSTED_COMPILER_WRAPPER": shell_root + "/scripts/ouro1.sh",
+    forwarded = json.loads(log.read_text())
+    assert all(Path(value).is_absolute() for value in forwarded.values()), forwarded
+    assert {key: Path(value).resolve() for key, value in forwarded.items()} == {
+        "OURO_TEST_CHECK": (repo / "scripts/ouro1.sh").resolve(),
+        "OURO_TEST_BUILD": (repo / "scripts/build_tool.sh").resolve(),
+        "OURO_HOSTED_COMPILER_WRAPPER": (repo / "scripts/ouro1.sh").resolve(),
     }
 
 
@@ -1419,12 +1660,50 @@ def test_memory_preparation_failure(tmp: Path) -> None:
         assert not (out / "memory-report.json").exists()
 
 
+def test_source_replace_report_protocol(tmp: Path) -> None:
+    import fs_replace_suite as native
+
+    image_hash = "a" * 64
+    valid = dict(kind="ouro.fs-replace.v1", complete=True, driver_sha256=image_hash,
+                 checks=[dict(name=name, status="pass") for name in native.NATIVE_CASES])
+    native.verify_native_report(valid, image_hash)
+    invalid = [dict(valid, complete=value) for value in (False, 1, "true", None)]
+    invalid += [dict(valid, kind="other"), dict(valid, driver_sha256="b" * 64)]
+    invalid += [dict(valid, checks=rows) for rows in ([], valid["checks"][:-1],
+                list(reversed(valid["checks"])), valid["checks"] + valid["checks"][:1],
+                [dict(row, status="skip") for row in valid["checks"]])]
+    for report in invalid:
+        try:
+            native.verify_native_report(report, image_hash)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("accepted incomplete or damaged source replacement report")
+    entry = tmp / "source-replace-probe.ouro"
+    entry.write_text("-- closure protocol fixture\n", encoding="utf-8")
+    with patch.object(native, "ROOT", tmp), patch.object(native, "ENTRY", entry.name):
+        for units in ([], [entry.name, entry.name], ["../outside.ouro", entry.name]):
+            with patch("frontend_regen.collect_units", return_value=units):
+                try:
+                    native.source_snapshot()
+                except ValueError:
+                    pass
+                else:
+                    raise AssertionError("accepted incomplete or escaping source replacement closure")
+        with patch("frontend_regen.collect_units", return_value=[entry.name]):
+            before = native.source_snapshot()
+            entry.write_text("-- changed source\n", encoding="utf-8")
+            assert native.source_snapshot() != before
+
+
 def main() -> int:
     import bootstrap_compiler_test
     import bootstrap_inputs_test
+    import test_selfhost_bootstrap_evidence
 
     bootstrap_inputs_test.run()
     bootstrap_compiler_test.run()
+    test_selfhost_bootstrap_evidence.run()
     test_seal_parse()
     test_host_stack_link_flags()
     with tempfile.TemporaryDirectory(prefix="ouro-build-suite-") as d:
@@ -1434,6 +1713,7 @@ def main() -> int:
         test_collect_build_protocol(tmp)
         test_build_tool_caller_paths(tmp)
         test_runtime_io_host_selection(tmp)
+        test_source_replace_report_protocol(tmp)
         test_frontend_native_async_protocol(tmp)
         test_retired_toolchain_contract(tmp)
         test_incremental_invalidation(tmp)
@@ -1441,11 +1721,13 @@ def main() -> int:
         test_frontend_native_fs_create_protocol(tmp)
         test_destructive_path_policy(tmp)
         test_native_tool_hooks(tmp)
+        test_windows_quality_manifest_protocol(tmp)
         test_frontend_host_protocol(tmp)
         test_frontend_native_process_protocol(tmp)
         test_native_suite_tools_protocol(tmp)
         test_native_sleep_imports()
         test_native_tool_cache(tmp)
+        test_native_tool_companion(tmp)
     print("BUILD_CACHE_CONFIG_SUITE: PASS")
     return 0
 

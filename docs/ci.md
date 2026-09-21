@@ -69,6 +69,11 @@ groups concurrently: several suites own fixed fixture/output paths. The full
 local command runs every gate in registry order. The runner rejects a group
 inventory that omits, duplicates, or invents a gate; its self-test also checks
 that each hosted matrix exactly matches its profile's group inventory.
+Execution removes the previous `ci-summary.json` before starting gates, so an
+interrupted run leaves no old successful aggregate at the current report path.
+The native CI runner also invalidates selected gate reports and the delegated
+host-inventory report. Failure to remove a report stops execution; a directory
+at a report path is never removed. Listing profiles does not change reports.
 Manual and Release prepare the current compiler before running each validation
 group, including when a restored compiler cache lacks its bootstrap evidence.
 PR and Nightly validation jobs allow 120 minutes for cold bootstrap and the
@@ -177,7 +182,14 @@ modules are checked through their imports. These assertions currently execute
 through the transitional C bootstrap; they do not run the emitted Windows
 executables. A failed checker process cannot pass
 by printing `CHECK_OK`. Missing C tools and any check, build, or assertion
-failure block this suite; it does not require OCaml. Bounded capture adds
+failure block this suite; it does not require OCaml. The property executable
+runs its scoped and typed domains in sequential children when both are
+requested, using the existing native/hosted test-process boundary. The hosted
+suite provides `OURO_TEST_CHECK` and an outer process-tree budget. The default
+retains all 400 + 400 cases, 12 fixed shapes, every-reference mutations and its
+six-line report. Child failure or incomplete coverage cannot produce the
+combined success report. This isolates the transitional C host's arenas without
+changing checker laws or memory budgets. Bounded capture adds
 29 pure API laws alongside the 9 compiler binding and 4 primitive registry
 laws. These check byte preservation, tagged failures, exact child status,
 limit validation, and primitive identity; they do not prove Windows Job
@@ -273,8 +285,12 @@ negative report-policy tests. The profile strictly checks the retained law
 program, builds it without a cache, with a fresh cache, and from that cache,
 then executes all 55 laws in each mode. Every complete executable run must
 finish within 500 ms, including process startup and supervision. Checking and
-compilation have separate bounded phases. The native-tool cache receipts bind
-the exact sources, producer, and executable; each mode still executes the laws.
+compilation have separate bounded phases. The retained executable uses `O1`
+in all three modes to reduce generated C code and cold startup cost. Receipts
+verify the optimization flag and bind the exact sources, producer, and executable;
+each mode still executes the laws without a warmup. The optimization level is
+part of the baseline context, so previous `O0` timings are not compared as the
+same build configuration.
 The profile also requires all three blocking `compiler-boundary` checks.
 
 ```sh
@@ -326,6 +342,8 @@ written under `_build/c_static_analysis/`. Clang's version-dependent
 `unix.Stream` and `unix.Errno` state models are excluded when present because
 they flag ordinary checked `fread`/`ftell` flows; compiler diagnostics and the
 core, bounds, security, allocation, and lifetime checkers remain blocking.
+On Windows, the gate also fault-injects the bounded capture reader's allocation:
+empty output must succeed normally and return an OS error when allocation fails.
 
 ### Host Python lint
 
@@ -363,22 +381,25 @@ Leftover findings are errors.
 The preferred path for supported repository-owned checks is now Ouro-native:
 
 ```sh
-sh scripts/ouro_repo_gate.sh --profile docs --out _build/ouro_repo_gate/docs
-sh scripts/ouro_repo_gate.sh --profile project --out _build/ouro_repo_gate/project
-sh scripts/ouro_repo_gate.sh --profile workflow --out _build/ouro_repo_gate/workflow
+sh scripts/ouro_repo_gate.sh --profile docs-native --out _build/ouro_repo_gate/docs-native
+sh scripts/ouro_repo_gate.sh --profile project-native --out _build/ouro_repo_gate/project-native
+sh scripts/ouro_repo_gate.sh --profile workflow-native --out _build/ouro_repo_gate/workflow-native
 sh scripts/ouro_repo_gate.sh --profile control-plane-native --out _build/ouro_repo_gate/control-plane-native
 sh scripts/ouro_repo_gate.sh --profile retirement --out _build/ouro_repo_gate/retirement
 sh scripts/ouro_repo_gate.sh --profile pr-native --out _build/ouro_repo_gate/pr-native
 ```
+
+The Python PR profile invokes those `*-native` names; the short names `docs`,
+`project`, and `workflow` are aliases.
 
 The Ouro-native CI runner can list or run grouped profiles without Python
 composition:
 
 ```sh
 sh scripts/ouro_ci_gate.sh --profile smoke --out _build/ouro_ci/smoke
-sh scripts/ouro_ci_gate.sh --profile docs --out _build/ouro_ci/docs
-sh scripts/ouro_ci_gate.sh --profile project --out _build/ouro_ci/project
-sh scripts/ouro_ci_gate.sh --profile repo --out _build/ouro_ci/repo
+sh scripts/ouro_ci_gate.sh --profile docs-native --out _build/ouro_ci/docs-native
+sh scripts/ouro_ci_gate.sh --profile project-native --out _build/ouro_ci/project-native
+sh scripts/ouro_ci_gate.sh --profile repo-native --out _build/ouro_ci/repo-native
 sh scripts/ouro_ci_gate.sh --profile quickstart-native --out _build/ouro_ci/quickstart-native
 sh scripts/ouro_ci_gate.sh --profile suite-native --out _build/ouro_ci/suite-native
 sh scripts/ouro_ci_gate.sh --profile control-plane-native --out _build/ouro_ci/control-plane-native
@@ -410,8 +431,11 @@ for stale metadata and rejects any remaining `migration_status=migrate` row.
 Repository suites for manifests, formatting, documentation, lines, native lint
 fixtures, runtime IO, user tests, samples, and quickstart now keep their cases
 and assertions in Ouro. Their documented shell commands are compiler/bootstrap
-compatibility launchers; `lint_suite.sh` additionally sequences the host-bound
-regex/SARIF Clippy-grade reference, and `scripts/process_stdin.sh` is the minimal
+compatibility launchers; `lint_suite.sh` compiler-checks
+`tools/clippy/core.ouro`, `tools/clippy/scan.ouro`,
+`tools/clippy/structural_main.ouro`, and `tools/clippy/main.ouro`, then runs the
+host-bound Python Clippy-grade fixture suite. `scripts/process_stdin.sh` is the
+minimal
 stdin adapter until `proc_exec` grows a typed stdin argument.
 
 Python and shell scripts remain only as bootstrap, reference, suite, or
@@ -466,6 +490,20 @@ The public site source lives in `site/`. Hosted Pages use
 with `SITE_BASE=/` and add the hostname to `site/public/CNAME`. GitHub Pages
 must be set to GitHub Actions as the source.
 
+The site overrides `@jqhtml/core`'s Terser plugin to `1.0.0` so its serializer
+can receive the security fixes in `serialize-javascript` 7. The plugin requires
+Node 20, already covered by the site's Node 20.19 minimum. Keep the override
+until upstream updates that dependency; verify lockfile changes with
+`npm ci`, `npm audit`, `npm test`, `npm run lint`, and `npm run build` in `site/`.
+
+Site controls use regular-weight SVGs from [Phosphor Icons](https://github.com/phosphor-icons/core),
+revision `2b75f3ad12b420c9504ef05df8d2564a28f8500e`. The files in
+`site/src/assets/phosphor/` come from upstream `assets/regular/`: `github-logo.svg`,
+`magnifying-glass.svg`, `list.svg`, `x.svg`, `copy.svg`, and `link.svg`.
+Only descriptive SVG titles were added; the paths are unchanged.
+`site/src/icons.css` applies the theme color through CSS masks. The MIT
+license and upstream attribution ship in `site/public/licenses/phosphor-LICENSE.txt`.
+
 Hosted repository reachability is separate from local project-surface policy.
 `scripts/github_project_hosted_probe.py` records `gh repo view` reachability for
 manual or hosted contexts, but `scripts/github_project_gate.py` does not depend
@@ -476,8 +514,19 @@ Policy notes that must stay visible in this page: cache is not trusted;
 `pull_request_target`; `workflow_dispatch`; nightly; local reproduction; release
 candidate; `github_project_gate.py`; `release_package.py`;
 `strict_quality_firewall.py`; Strict-quality SARIF policy.
+`scripts/hygiene.sh` keeps presence, generated-shape, packer-selftest, and
+stitch needles. It does not re-run those PR-owned gates;
+`python3 scripts/ci_gate.py --profile pr` remains their required owner.
 
 ## Reports and failures
+
+The strict firewall releases source-reading and scan temporaries per file through
+the existing native quality arena adapter, and declaration checks release their
+intermediates after each declaration. Configuration loading, registry checks,
+and fixture validation also release their intermediates after returning results.
+Memory limits remain blocking. Suppression directives are recognized in comments,
+while quoted examples remain ordinary source data. On Linux, the memory monitor
+terminates measured descendants even when a nested runner creates a new session.
 
 The `structural-quality-suite` and `structural-quality` gates run in the PR
 checks group, nightly, manual, and stage-loop profiles. Run

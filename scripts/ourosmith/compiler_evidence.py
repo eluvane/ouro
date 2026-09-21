@@ -10,15 +10,12 @@ import re
 import sys
 from pathlib import Path
 
+from repo_support import sha256_file as sha
 from ourosmith import ROOT
 from ourosmith.native import receipt_for
 
 SUITE_ENTRY = 'tools/test/main.ouro'
 PROPERTY_ENTRY = 'tests/compiler_property_tests.ouro'
-
-
-def sha(path):
-    return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 def property_protocol(text):

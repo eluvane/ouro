@@ -1,0 +1,294 @@
+-- Root-local evaluation with reusable, bounded multi-epoch dependency state.
+import "semantic_rules.ouro";
+import "structural_frontend.ouro";
+import "session_policy.ouro";
+import "../../std/io.ouro";
+import "../../std/listx.ouro";
+import "../quality/source.ouro";
+import "../quality/input_error.ouro";
+
+def cg_s_protocol : String := "ouro.clippy-semantic.v2";
+
+def cg_s_one_line (s : String) : String :=
+    prim_string_replace (prim_string_replace s "\r" " ") "\n" " ";
+
+def cg_s_print_proofs : List CgSProof -> IO Unit :=
+  fix go (xs : List CgSProof) : IO Unit :=
+    match xs with
+    | Nil => io_pure Unit MkUnit
+    | Cons proof rest => match proof with
+      | MkCgSProof code owner node evidence =>
+          do let! _c := println code;
+             let! _o := println owner;
+             let! _n := println (prim_string_of_nat node);
+             let! _e := println (cg_s_one_line evidence);
+             go rest
+      end
+    end;
+
+def cg_s_emit_error (message : String) : IO Unit :=
+    do let! _h := println cg_s_protocol;
+       let! _s := println "error";
+       println (cg_s_one_line message)
+
+def cg_s_emit_ok (source : String) (proofs : List CgSProof) : IO Unit :=
+    do let! _h := println cg_s_protocol;
+       let! _s := println "ok";
+       let! _l := println (prim_string_of_nat (prim_string_length source));
+       let! _t := print source;
+       let! _d := println "";
+       let! _n := println (prim_string_of_nat (length CgSProof proofs));
+       cg_s_print_proofs proofs
+
+def cg_s_unit_snapshot (unit : ClippySemanticUnit)
+    : Either QualityInputError (Pair String (List CgSProof)) :=
+    match cm_semantic_proofs unit with
+    | Left error => Left QualityInputError (Pair String (List CgSProof)) error
+    | Right semantic => match cg_s_build cg_s_build_fuel (cm_root_decls unit) with
+      | Left error => Left QualityInputError (Pair String (List CgSProof)) error
+      | Right facts => match cg_s_proofs (MkCgSUnit (cm_intern unit) 0 facts) with
+        | Left error => Left QualityInputError (Pair String (List CgSProof)) error
+        | Right structural => Right QualityInputError (Pair String (List CgSProof))
+            (MkPair String (List CgSProof) (cm_source unit)
+              (append CgSProof structural semantic))
+        end
+      end
+    end;
+
+def cg_s_run_unit (unit : ClippySemanticUnit) : IO Unit :=
+    match cg_s_unit_snapshot unit with
+    | Left error => cg_s_emit_error (quality_input_message error)
+    | Right snapshot => match snapshot with
+      | MkPair source proofs => cg_s_emit_ok source proofs
+      end
+    end;
+
+-- Retained only for the established two-file batch wire API.
+def cg_s_emit_ok_frames : List (Pair String (List CgSProof)) -> IO Unit :=
+  fix go (rows : List (Pair String (List CgSProof))) : IO Unit :=
+    match rows with
+    | Nil => io_pure Unit MkUnit
+    | Cons row rest => match row with
+      | MkPair source proofs =>
+          do let! _ok := cg_s_emit_ok source proofs;
+             go rest
+      end
+    end;
+
+def cg_s_emit_batch (rows : List (Pair String (List CgSProof))) : IO Unit :=
+    do let! _h := println cg_s_protocol;
+       let! _s := println "batch";
+       let! _n := println (prim_string_of_nat
+         (length (Pair String (List CgSProof)) rows));
+       cg_s_emit_ok_frames rows
+
+-- Shared analysis action. Its callers provide the appropriate lifetime seam.
+def cg_s_snapshot_raw (request : Pair String String)
+    (state : Pair InternState CmParseCache)
+    : IO (Either QualityInputError
+        (Pair (Pair String (List CgSProof)) (Pair InternState CmParseCache))) :=
+    match request with
+    | MkPair root path => match state with
+      | MkPair intern cache =>
+          do let! loaded := cm_load_cached root path intern cache;
+             io_pure (Either QualityInputError
+               (Pair (Pair String (List CgSProof)) (Pair InternState CmParseCache)))
+               (match loaded with
+                | Left error => Left QualityInputError
+                    (Pair (Pair String (List CgSProof)) (Pair InternState CmParseCache)) error
+                | Right pair => match pair with
+                  | MkPair unit next => match cg_s_unit_snapshot unit with
+                    | Left error => Left QualityInputError
+                        (Pair (Pair String (List CgSProof)) (Pair InternState CmParseCache)) error
+                    | Right snapshot => Right QualityInputError
+                        (Pair (Pair String (List CgSProof)) (Pair InternState CmParseCache))
+                        (MkPair (Pair String (List CgSProof))
+                          (Pair InternState CmParseCache) snapshot next)
+                    end
+                  end
+                end)
+      end
+    end;
+
+-- Compatibility callers retain one bounded snapshot; production emits inside
+-- cg_s_emit_request and returns no source/proof data to the epoch.
+-- ouro-structural: {"rule":"STRUCT_PASS_THROUGH_WRAPPER","category":"performance-specialization","related":["tools/clippy/session.ouro#cg_s_snapshot_raw"],"reason":"native_tool_build attaches ouro_wrap_quality_io only to this entry; internal epoch calls to the raw worker must remain in their existing arena to avoid recopying the shared intern state."}
+def cg_s_snapshot_request (request : Pair String String)
+    (state : Pair InternState CmParseCache)
+    : IO (Either QualityInputError
+        (Pair (Pair String (List CgSProof)) (Pair InternState CmParseCache))) :=
+    cg_s_snapshot_raw request state;
+
+def cg_s_emit_request (request : Pair String String)
+    (state : Pair InternState CmParseCache)
+    : IO (Either QualityInputError (Pair (Pair InternState CmParseCache) Nat)) :=
+    do let! result := cg_s_snapshot_raw request state;
+       match result with
+       | Left error => io_pure (Either QualityInputError (Pair (Pair InternState CmParseCache) Nat))
+           (Left QualityInputError (Pair (Pair InternState CmParseCache) Nat) error)
+       | Right pair => match pair with
+         | MkPair snapshot next => match snapshot with
+           | MkPair source proofs =>
+               do let! _s := cg_s_emit_ok source proofs;
+                  let! _f := flush;
+                  io_pure (Either QualityInputError (Pair (Pair InternState CmParseCache) Nat))
+                    (Right QualityInputError (Pair (Pair InternState CmParseCache) Nat)
+                      (MkPair (Pair InternState CmParseCache) Nat next (prim_string_length source)))
+           end
+         end
+       end
+
+def cg_s_batch_limit : Nat := cg_session_epoch_roots;
+
+def cg_s_epoch_budget : Nat :=
+    match cg_s_batch_limit with | Z => 0 | S remaining => remaining end;
+
+def cg_s_epoch_fits : Nat -> List (Pair Nat String) -> Bool :=
+  fix go (remaining : Nat) (requests : List (Pair Nat String)) : Bool :=
+    match requests with
+    | Nil => True
+    | Cons _ rest => match remaining with
+      | Z => False
+      | S count => go count rest
+      end
+    end;
+
+def cg_s_session_protocol : String := cg_session_version;
+
+inductive CgSessionState : Type :=
+  | MkCgSessionState : InternState -> CmParseCache -> Nat -> Bool -> Bool -> CgSessionState;
+
+def cg_s_state0 : CgSessionState :=
+    MkCgSessionState empty_intern cm_cache0 0 True False;
+
+def cg_s_completed (state : CgSessionState) : Nat :=
+    match state with | MkCgSessionState _ _ count _ _ => count end;
+
+def cg_s_passed (state : CgSessionState) : Bool :=
+    match state with | MkCgSessionState _ _ _ passed _ => passed end;
+
+-- There is no portable zero-valued fallback for the host's live-byte API.
+-- The native builder requires the matching observer hook before publication.
+def cg_s_sample_heap (_request : Unit) (_state : Unit) : IO Nat :=
+    do let! _e := eprintln "CLIPPY_SESSION: native heap observer is unavailable";
+       let! _x := exit 1;
+       io_pure Nat 0
+
+def cg_s_request_header (request : Pair Nat String) : IO Unit :=
+    match request with
+    | MkPair id path =>
+        do let! _r := println "root";
+           let! _i := println (prim_string_of_nat id);
+           let! _n := println (prim_string_of_nat (prim_string_length path));
+           let! _p := print path;
+           println ""
+    end;
+
+def cg_s_epoch_roots (root : String)
+    : List (Pair Nat String) -> CgSessionState -> IO CgSessionState :=
+  fix go (requests : List (Pair Nat String)) (state : CgSessionState)
+      : IO CgSessionState :=
+    match requests with
+    | Nil => io_pure CgSessionState state
+    | Cons request rest => match request with
+      | MkPair _ path => match state with
+        | MkCgSessionState intern cache count passed large =>
+            do let! _h := cg_s_request_header request;
+               let! result := cg_s_emit_request (MkPair String String root path)
+                 (MkPair InternState CmParseCache intern cache);
+               match result with
+               | Left error =>
+                   do let! _e := cg_s_emit_error (quality_input_message error);
+                      let! _f := flush;
+                      go rest (MkCgSessionState intern cache (S count) False large)
+               | Right pair => match pair with
+                 | MkPair next source_bytes => match next with
+                   | MkPair next_intern next_cache =>
+                       go rest (MkCgSessionState next_intern next_cache (S count)
+                         passed (orb large (notb (ltb_nat source_bytes cg_session_large_root_bytes))))
+                   end
+                 end
+               end
+        end
+      end
+    end;
+
+-- A required two-argument arena seam. Intermediate state spines die here;
+-- current dependency facts and intern IDs survive into the next epoch.
+def cg_s_epoch_request (request : Pair String (List (Pair Nat String)))
+    (state : CgSessionState) : IO CgSessionState :=
+    match request with
+    | MkPair root requests => match cg_s_epoch_fits cg_s_batch_limit requests with
+      | True => cg_s_epoch_roots root requests state
+      | False =>
+          do let! _e := eprintln "CLIPPY_SESSION: epoch exceeds retained-root bound";
+             io_pure CgSessionState (match state with
+               | MkCgSessionState intern cache count _ large =>
+                   MkCgSessionState intern cache count False large
+               end)
+      end
+    end;
+
+def cg_s_number_requests : List String -> Nat -> List (Pair Nat String) :=
+  fix go (paths : List String) (next : Nat) : List (Pair Nat String) :=
+    match paths with
+    | Nil => Nil (Pair Nat String)
+    | Cons path rest => Cons (Pair Nat String) (MkPair Nat String next path)
+        (go rest (S next))
+    end;
+
+def cg_s_epoch_groups : List (Pair Nat String) -> Nat -> List (Pair Nat String)
+    -> List (List (Pair Nat String)) :=
+  fix go (requests : List (Pair Nat String)) (remaining : Nat)
+      (acc : List (Pair Nat String)) : List (List (Pair Nat String)) :=
+    match requests with
+    | Nil => match acc with
+      | Nil => Nil (List (Pair Nat String))
+      | Cons _ _ => [reverse_lin (Pair Nat String) acc]
+      end
+    | Cons request rest =>
+        let next : List (Pair Nat String) := Cons (Pair Nat String) request acc in
+        match remaining with
+        | Z => Cons (List (Pair Nat String)) (reverse_lin (Pair Nat String) next)
+            (go rest cg_s_epoch_budget (Nil (Pair Nat String)))
+        | S count => go rest count next
+        end
+    end;
+
+def cg_s_session_epochs (root : String)
+    : List (List (Pair Nat String)) -> CgSessionState -> IO CgSessionState :=
+  fix go (epochs : List (List (Pair Nat String))) (state : CgSessionState)
+      : IO CgSessionState :=
+    match epochs with
+    | Nil => io_pure CgSessionState state
+    | Cons epoch rest =>
+        do let! next := cg_s_epoch_request
+             (MkPair String (List (Pair Nat String)) root epoch) state;
+           let! heap := cg_s_sample_heap MkUnit MkUnit;
+           match next with
+           | MkCgSessionState _ cache count _ large =>
+               match cg_session_recycle count (cm_cache_bytes cache) large heap with
+               | True => io_pure CgSessionState next
+               | False => go rest next
+               end
+           end
+    end;
+
+def cg_s_run_session (root : String) (paths : List String) : IO Unit :=
+    let count : Nat := length String paths in
+    let epochs : List (List (Pair Nat String)) := cg_s_epoch_groups
+      (cg_s_number_requests paths 0) cg_s_epoch_budget (Nil (Pair Nat String)) in
+    do let! _h := println cg_s_session_protocol;
+       let! _n := println (prim_string_of_nat count);
+       let! state := cg_s_session_epochs root epochs cg_s_state0;
+       let! _d := println "done";
+       let! _c := println (prim_string_of_nat (cg_s_completed state));
+       let! _s := println (match cg_s_passed state with
+         | False => "error"
+         | True => match eq_nat count (cg_s_completed state) with
+           | True => "ok"
+           | False => "recycle"
+           end
+         end);
+       let! _f := flush;
+       exit (match cg_s_passed state with | True => 0 | False => 1 end)

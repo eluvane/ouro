@@ -25,7 +25,7 @@ usage() {
 		"  ouro1 check FILE [fuel] [--emit-checked-program FILE]" "  ouro1 collect FILE" \
 		"  ouro1 eval FILE (--eval EXPR | --print NAME) [--type TYPE]" \
 		"  ouro1 rebuild" "  ouro1 analyze [--strict] [--dump-facts] [--enable-FAMILY|--enable-style|--enable-light|--enable-heavy|--enable-all] [--scope PATH]..." \
-		"  ouro1 lint [PATH...]" \
+		"  ouro1 lint [--deny] [--profile project|strict|release] [--family language|style|semantic] [PATH...]" \
 		"  ouro1 fmt [--check | --write] FILE..." \
 		"  ouro1 fix [--check | --write] FILE..." \
 		"  ouro1 pkg (init | add NAME | remove NAME | install | lock | update | list | verify)" \
@@ -565,14 +565,13 @@ case "$cmd" in
 			"$ROOT/tools/analyze/deadcode.ouro" \
 			"$ROOT/tools/analyze/suppressions.ouro" \
 			"$ROOT/tools/analyze/api_surface.ouro" \
-			"$ROOT/tools/analyze/trust.ouro" \
-			-type f -name '*.ouro' \
+			"$ROOT/tools/analyze/trust.ouro" "$ROOT/scripts/ouro1.sh" \
+			-type f \( -name '*.ouro' -o -name 'ouro1.sh' \) \
 			! -name 'drive_main.ouro' \
 			-newer "$BIN" -print -quit 2>/dev/null)" ]; then
-			# Native only: the host shim reprints a bounded-memory
-			# placeholder. The cone is tools/analyze plus the five fact
-			# cores policy.ouro imports; the structured cores live in
-			# ouro-analyze-drive, so editing them must not rebuild this.
+			# Native only. The cone is tools/analyze plus the five fact cores
+			# policy.ouro imports; structured cores stay in ouro-analyze-drive.
+			# Launcher changes also retire any previously installed host shim.
 			OURO_BUILD_TOOL_MODE=native \
 				sh "$ROOT/scripts/build_tool.sh" tools/analyze/main.ouro "$BIN" >&2
 		fi
@@ -621,7 +620,7 @@ case "$cmd" in
 		st2=0
 		if [ "$want_drive" -eq 1 ] && [ "$st" -ne 2 ]; then
 			if [ ! -x "$DRIVE" ] || [ -n "$(find "$ROOT/tools/analyze" \
-				"$ROOT/tools/analyze/drive_main.ouro" \
+				"$ROOT/tools/analyze/drive_main.ouro" "$ROOT/tools/quality" \
 				-type f -name '*.ouro' ! -path '*/test/*' \
 				-newer "$DRIVE" -print -quit 2>/dev/null)" ]; then
 				# Build the structured cone only after the base safety preflight.
@@ -643,12 +642,12 @@ case "$cmd" in
 		fi
 		# A dropped exit thunk is not proof of a clean structured run. Require
 		# complete zero-count banners as well as rc=0, and reject diagnostics
-		# from either binary. The bounded runner may aggregate an empty scope.
+		# from either binary. An enabled family must process at least one file.
 		if [ "$want_drive" -eq 1 ] && [ "$st" -ne 2 ] && [ "$st2" -eq 0 ]; then
 			drive_report=$(tr -d '\r' <"$drive_tmp" | grep '^ANALYZE_DRIVE ')
-			if [ -z "$drive_report" ] ||
+			if [ "$(printf '%s\n' "$drive_report" | grep -c '^ANALYZE_DRIVE ')" -ne 1 ] ||
 				printf '%s\n' "$drive_report" | grep -Ev \
-					'^ANALYZE_DRIVE files=[0-9]+ findings=0 rejected=0 families=([a-z]+(,[a-z]+)*)?$' >/dev/null ||
+					'^ANALYZE_DRIVE files=[1-9][0-9]* findings=0 rejected=0 families=[a-z]+(,[a-z]+)*$' >/dev/null ||
 				grep -F "OURO-" "$drive_tmp" >/dev/null; then
 				echo "ANALYZE_FAIL: structured runner did not provide a consistent clean report" >&2
 				st2=1
@@ -671,67 +670,114 @@ case "$cmd" in
 	lint)
 		shift
 		BIN="$C_BUILD_DIR/ouro-lint"
-		if [ ! -x "$BIN" ] || [ -n "$(find "$ROOT/tools/lint.ouro" "$ROOT/tools/lint_host.ouro" "$ROOT/tools/lint_names.ouro" \
-			"$ROOT/compiler/lint.ouro" -newer "$BIN" -print -quit 2>/dev/null)" ]; then
-			# Native only: a host-shim cannot call lintCtx, and analyze cannot
-			# host this cone (char/lexer flatten + parser RSS).
-			OURO_BUILD_TOOL_MODE=native \
-				sh "$ROOT/scripts/build_tool.sh" tools/lint.ouro "$BIN" >&2
+		lint_stub=0
+		if [ -f "$BIN" ] && [ "$(wc -c <"$BIN")" -lt 4096 ]; then
+			case "$(head -n 1 "$BIN" 2>/dev/null)" in
+			'#!'*) lint_stub=1 ;;
+			esac
 		fi
-		cd "$OLDPWD_OURO"
-		# One OS process per file bounds the process-lifetime parse/lint heap.
-		# Retain the host memory cap when available and propagate failures.
-		lint_one() {
-			f=$1
-			err=$(mktemp)
-			set +e
-			if command -v prlimit >/dev/null 2>&1; then
-				prlimit --as=8589934592 -- "$BIN" "$f" 2>"$err"
-			else
-				"$BIN" "$f" 2>"$err"
+		# Retain the existing freshness boundary for injected shell test workers.
+		# A stale worker or a Windows native image must enter receipt validation.
+		if [ "$lint_stub" -eq 1 ]; then
+			if [ -x "${BIN}.exe" ] || [ -n "$(find "$ROOT/tools/lint.ouro" \
+				"$ROOT/tools/lint_worker.ouro" "$ROOT/tools/lint_host.ouro" "$ROOT/tools/lint_names.ouro" \
+				"$ROOT/tools/quality" "$ROOT/compiler/lint.ouro" \
+				"$ROOT/tools/clippy/session_policy.ouro" "$ROOT/scripts/native_tool_build.py" \
+				-newer "$BIN" -print -quit 2>/dev/null)" ]; then
+				lint_stub=0
 			fi
-			ec=$?
-			set -e
-			cat "$err" >&2
-			rm -f "$err"
-			return "$ec"
-		}
-		if [ "$#" -eq 1 ] && [ -f "$1" ]; then
-			lint_one "$1"
-			exit $?
 		fi
-		if [ "$#" -eq 0 ]; then
-			set -- std compiler tools/analyze samples tools
-		fi
-		list=$(mktemp)
-		trap 'rm -f "$list"' EXIT
-		for p in "$@"; do
-			if [ -f "$p" ]; then
-				printf '%s\n' "$p" >>"$list"
-			elif [ -d "$p" ]; then
-				# Prune before descent so local outputs cannot flood discovery.
-				# Explicit file arguments still reach lint_one above.
-				if ! find "$p" \( -type d ! -path "$p" \( \
-					-name _build -o -name _cache -o -name _opam -o -name _tools -o \
-					-name .git -o -name node_modules -o -name test -o -name tests -o \
-					-name fixtures -o -name bench -o -name future \) -prune \) -o \
-					\( -type f -name '*.ouro' ! -name bad_undeclared_perform.ouro \
-					! -name 04_holes.ouro -print \) >>"$list"; then
-					echo "LINT_FAIL: could not enumerate $p" >&2
+		if [ "$lint_stub" -eq 0 ]; then
+			# shellcheck source=scripts/python.sh
+			. "$ROOT/scripts/python.sh"
+			if [ -z "${PYTHON:-}" ]; then
+				echo "LINT_FAIL: native build receipt verification requires Python" >&2
+				exit 127
+			fi
+			# Check the complete content receipt, including every companion.
+			# Successful preparation must preserve lint's quiet-success protocol.
+			if ! "$PYTHON" "$ROOT/scripts/native_tool_build.py" tools/lint.ouro "$BIN" \
+				--compiler "$COMPILER" --check >/dev/null 2>&1; then
+				mkdir -p "$C_BUILD_DIR"
+				if ! OURO_BUILD_TOOL_MODE=native \
+					sh "$ROOT/scripts/build_tool.sh" tools/lint.ouro "$BIN" \
+					>"$C_BUILD_DIR/ouro-lint.build.log" 2>&1; then
+					cat "$C_BUILD_DIR/ouro-lint.build.log" >&2
 					exit 1
 				fi
-			else
-				printf '%s\n' "$p" >>"$list"
 			fi
+			if [ -x "${BIN}.exe" ]; then BIN="${BIN}.exe"; fi
+		fi
+		need_style=1
+		need_semantic=1
+		families_explicit=0
+		prev=""
+		for arg do
+			case "$prev" in
+			--family)
+				if [ "$families_explicit" -eq 0 ]; then
+					need_style=0
+					need_semantic=0
+					families_explicit=1
+				fi
+				case "$arg" in
+				style) need_style=1 ;;
+				semantic) need_semantic=1 ;;
+				esac
+				prev=""
+				continue
+				;;
+			--profile)
+				prev=""
+				continue
+				;;
+			esac
+			case "$arg" in
+			--) break ;;
+			--family|--profile) prev=$arg ;;
+			esac
 		done
-		sort -u "$list" -o "$list"
-		st=0
-		while IFS= read -r f; do
-			[ -n "$f" ] || continue
-			if ! lint_one "$f"; then
-				st=1
+		if [ "$lint_stub" -eq 0 ]; then
+			# MSYS may resolve a suffixless -e test to .exe. Native companion
+			# validation still needs the actual filename in its environment.
+			if [ "$need_style" -eq 1 ]; then
+				STYLE="$C_BUILD_DIR/ouro-lint-style"
+				if [ -x "${STYLE}.exe" ]; then
+					STYLE="${STYLE}.exe"
+				fi
+				OURO_LINT_STYLE_EXE="$STYLE"
+				export OURO_LINT_STYLE_EXE
 			fi
-		done <"$list"
+			if [ "$need_semantic" -eq 1 ]; then
+				SEMANTIC="$C_BUILD_DIR/ouro-clippy-grade-firewall"
+				if [ -x "${SEMANTIC}.exe" ]; then
+					SEMANTIC="${SEMANTIC}.exe"
+				fi
+				OURO_LINT_SEMANTIC_EXE="$SEMANTIC"
+				export OURO_LINT_SEMANTIC_EXE
+			fi
+		fi
+		cd "$OLDPWD_OURO"
+		# Ouro owns selection, exclusions, import discovery and per-file child
+		# execution. The host only supplies a memory cap and checks the quiet
+		# success protocol; it never chooses which source files to analyze.
+		out=$(mktemp)
+		err=$(mktemp) || { rm -f "$out"; exit 1; }
+		trap 'rm -f "$out" "$err"' EXIT
+		set +e
+		if command -v prlimit >/dev/null 2>&1; then
+			prlimit --as=8589934592 -- "$BIN" "$@" >"$out" 2>"$err"
+		else
+			"$BIN" "$@" >"$out" 2>"$err"
+		fi
+		st=$?
+		set -e
+		cat "$out"
+		cat "$err" >&2
+		if [ "$st" -eq 0 ] && { [ -s "$out" ] || [ -s "$err" ]; }; then
+			echo "LINT_FAIL: native runner returned success with diagnostic output" >&2
+			st=1
+		fi
 		exit "$st"
 		;;
 	fmt)
@@ -741,10 +787,11 @@ case "$cmd" in
 		BIN="$C_BUILD_DIR/ouro-fmt"
 		if [ ! -x "$BIN" ] || [ -n "$(find "$ROOT/tools/fmt.ouro" "$ROOT/tools/fmt_pipeline.ouro" \
 			"$ROOT/tools/analyze/format.ouro" \
-			"$ROOT/scripts/host_tools.py" "$ROOT/scripts/python.sh" \
+			"$ROOT/scripts/ouro1.sh" \
 			-newer "$BIN" \
 			-print -quit 2>/dev/null)" ]; then
-			sh "$ROOT/scripts/build_tool.sh" tools/fmt.ouro "$BIN" >&2
+			OURO_BUILD_TOOL_MODE=native \
+				sh "$ROOT/scripts/build_tool.sh" tools/fmt.ouro "$BIN" >&2
 		fi
 		exec "$BIN" "$@"
 		;;
@@ -752,10 +799,7 @@ case "$cmd" in
 		# Autofixer, same build-on-demand rule as fmt.
 		shift
 		BIN="$C_BUILD_DIR/ouro-fix"
-		if [ ! -x "$BIN" ] || [ -n "$(find "$ROOT/tools/fix" -newer "$BIN" \
-			-print -quit 2>/dev/null)" ]; then
-			sh "$ROOT/scripts/build_tool.sh" tools/fix/main.ouro "$BIN" >&2
-		fi
+		sh "$ROOT/scripts/build_tool.sh" tools/fix/main.ouro "$BIN" >&2
 		exec "$BIN" "$@"
 		;;
 	doc)
@@ -787,7 +831,7 @@ case "$cmd" in
 		exec "$BIN" "$@"
 		;;
 	test)
-		# User-level test runner. Discovery stays in shell (like lint);
+		# User-level test runner. Its discovery still stays in shell;
 		# the Ouro program checks and runs explicit files.
 		shift
 		if [ -z "${OURO_TEST_CHECK:-}" ]; then

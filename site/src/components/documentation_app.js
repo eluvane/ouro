@@ -11,6 +11,7 @@ import '../docs-mobile.css';
 import { site_config } from '../site.config.js';
 import { highlight_search } from '../docs-enhancements.js';
 import { DocumentationDetails } from '../docs-details.js';
+import { DocumentationNavigation } from '../docs-navigation.js';
 import DocumentationAppTemplate from './documentation_app.jqhtml';
 import FeatureReferenceTemplate from './feature_reference.jqhtml';
 import ProjectIntroductionTemplate from './project_introduction.jqhtml';
@@ -28,7 +29,6 @@ class DocumentationApp extends Jqhtml_Component {
     this.args.site = site_config;
     this.observer = null;
     this.current_active_hash = '';
-    this.search_pointer = false;
   }
 
   on_ready() {
@@ -38,13 +38,14 @@ class DocumentationApp extends Jqhtml_Component {
     this.sync_active_link();
     this.setup_scrollspy();
     this.details = new DocumentationDetails(this.$);
+    this.navigation = new DocumentationNavigation(this.$[0], this.$sid('menu_toggle')[0]);
 
     $(document).on('keydown.docs', (event) => this.handle_shortcut(event));
     $(globalThis).on('hashchange.docs', () => this.sync_active_link());
   }
 
   on_stop() {
-    this.$.removeClass('navigation-open');
+    this.navigation?.stop();
     if (this.observer) {
       this.observer.disconnect();
       this.observer = null;
@@ -132,17 +133,14 @@ class DocumentationApp extends Jqhtml_Component {
   }
 
   toggle_navigation() {
-    const is_open = !this.$.hasClass('navigation-open');
-    if (is_open) {
+    if (!this.navigation.is_open()) {
       this.close_search();
     }
-    this.$.toggleClass('navigation-open', is_open);
-    this.$sid('menu_toggle').attr('aria-expanded', String(is_open));
+    this.navigation.toggle();
   }
 
-  close_navigation() {
-    this.$.removeClass('navigation-open');
-    this.$sid('menu_toggle').attr('aria-expanded', 'false');
+  close_navigation(event) {
+    this.navigation.close(event);
   }
 
   open_search() {
@@ -170,30 +168,6 @@ class DocumentationApp extends Jqhtml_Component {
   clear_search() {
     this.$sid('search_input').val('');
     this.apply_search('');
-  }
-
-  set_search_origin(event) {
-    if (event.button !== 0) {
-      return;
-    }
-    const field = event.currentTarget.closest('.docs-header__search');
-    const bounds = field.getBoundingClientRect();
-    field.style.setProperty('--focus-x', `${event.clientX - bounds.left}px`);
-    field.style.setProperty('--focus-y', `${event.clientY - bounds.top}px`);
-    this.search_pointer = true;
-  }
-
-  focus_search(event) {
-    if (!this.search_pointer) {
-      const field = event.currentTarget.closest('.docs-header__search');
-      field.style.removeProperty('--focus-x');
-      field.style.removeProperty('--focus-y');
-    }
-    this.search_pointer = false;
-  }
-
-  blur_search() {
-    this.search_pointer = false;
   }
 
   search_docs(event) {

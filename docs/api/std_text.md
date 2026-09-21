@@ -2,7 +2,7 @@
 
 Text-processing helpers for CLI and data programs.
 
-Declarations: 19.
+Declarations: 18.
 
 ## def str_split_last
 
@@ -26,12 +26,6 @@ def str_drop_suffix_or (s : String) (suf : String) : String
 
 ```
 def str_chomp (s : String) : String
-```
-
-## def text_split_ws_codes
-
-```
-def text_split_ws_codes : List Nat -> List (List Nat)
 ```
 
 ## def str_tokens

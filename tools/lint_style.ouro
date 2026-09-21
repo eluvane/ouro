@@ -1,0 +1,296 @@
+-- Internal proven-style companion for ouro1 lint.
+-- Token/AST/fixer-backed syntax only. No registry/debt/fixture policy,
+-- no STRUCT_* / --structural, and no hole/unused/shadow scanners.
+-- This unit stays on the quality/json cone. It must not import the
+-- compiler frontend; language analysis stays in ouro-lint children.
+
+-- @entry main
+
+import "../std/io.ouro";
+import "strict/scan_more.ouro";
+import "quality/registry.ouro";
+import "quality/input_error.ouro";
+
+def ls_profiles : List String :=
+    [ "project", "strict", "release" ];
+
+def ls_cfg_path (root : String) : String :=
+    qr_child root "quality/diagnostics.json";
+
+def ls_fail (msg : String) : IO Unit :=
+    do eprintln (prim_string_concat "LINT_FAIL: " msg);
+       exit 1
+
+def ls_usage (msg : String) : IO Unit :=
+    do eprintln (prim_string_concat "LINT_FAIL: " msg);
+       exit 2
+
+def ls_known_profile (name : String) : Bool :=
+    elem String prim_string_eq name ls_profiles;
+
+def ls_emit_ok (f : QrFinding) : Bool :=
+    match qr_find_mark f with
+    | Just _ => False
+    | Nothing => notb (prim_string_eq (qr_find_level f) "allow")
+    end;
+
+def ls_print_findings : List QrFinding -> IO Unit :=
+  fix go (xs : List QrFinding) : IO Unit :=
+    match xs with
+    | Nil => io_pure Unit MkUnit
+    | Cons f rest =>
+        match ls_emit_ok f with
+        | False => go rest
+        | True =>
+            do io_foreach String println (qr_print_finding_lines f "replacement");
+               go rest
+        end
+    end;
+
+-- Reuse the existing `;;` and typed-list checks from st_scan_def_span
+-- without running the hole/unused/shadow scanners language already owns.
+def ls_scan_def_style (mp : List (Pair String QrDiag)) (profile : String)
+    (path : String) (lines : List String) (start : Nat) (finish : Nat)
+    (acc : List QrFinding) : List QrFinding :=
+    (fix go (fuel : Nat) (ix : Nat) (out : List QrFinding) : List QrFinding :=
+      match fuel with
+      | Z => out
+      | S fuel2 => match ltb_nat ix finish with
+        | False => out
+        | True =>
+            let raw : String := nth String "" ix lines in
+            let code : String := qt_code_before_comment raw in
+            let out2 : List QrFinding := match qt_find_unquoted code ";;" with
+              | Nothing => out
+              | Just i => st_add out
+                  (qr_mk_finding mp profile "OURO-LINT042"
+                    (st_place path (add ix 1) (add i 1))
+                    "redundant separator `;;` is rejected; one declaration separator is canonical"
+                    (qt_strip raw))
+              end in
+            let out3 : List QrFinding := match qt_find code ":=" with
+              | Nothing => out2
+              | Just _ => match st_split_asg code with
+                | MkPair before after =>
+                    match andb (st_starts_binding before)
+                        (notb (st_has_list_type before)) with
+                    | False => out2
+                    | True =>
+                        let after_s : String := qt_strip after in
+                        let lit_ix : Nat := match prim_string_starts after_s "[" with
+                          | True => ix
+                          | False => match andb (st_at_top before "def")
+                              (eq_nat (prim_string_length after_s) 0) with
+                            | False => st_nlines_sentinel
+                            | True =>
+                                (fix look (lfuel : Nat) (j : Nat) : Nat :=
+                                  match lfuel with
+                                  | Z => st_nlines_sentinel
+                                  | S l2 => match ltb_nat j finish with
+                                    | False => st_nlines_sentinel
+                                    | True =>
+                                        let look_code : String := qt_strip
+                                          (qt_code_before_comment (nth String "" j lines)) in
+                                        match prim_string_length look_code with
+                                        | Z => look l2 (add j 1)
+                                        | S _ => match prim_string_starts look_code "[" with
+                                          | True => j
+                                          | False => st_nlines_sentinel
+                                          end
+                                        end
+                                    end
+                                  end) (add (sub finish ix) 1) (add ix 1)
+                            end
+                          end in
+                        match eq_nat lit_ix st_nlines_sentinel with
+                        | True => out2
+                        | False =>
+                            let lit_raw : String := nth String "" lit_ix lines in
+                            let col : Nat := match qt_find lit_raw "[" with
+                              | Nothing => 1
+                              | Just i => add i 1
+                              end in
+                            st_add out2 (qr_mk_finding mp profile "OURO-LINT041"
+                              (st_place path (add lit_ix 1) col)
+                              "list literal has no explicit expected `List` type at the binding boundary"
+                              (qt_strip lit_raw))
+                        end
+                    end
+                end
+              end in
+            go fuel2 (add ix 1) out3
+        end
+      end) (add (sub finish start) 1) start acc;
+
+def ls_scan_defs_style (mp : List (Pair String QrDiag)) (profile : String)
+    (path : String) (lines : List String) (acc : List QrFinding)
+    : List QrFinding :=
+    (fix go (fuel : Nat) (xs : List (Pair Nat Nat)) (out : List QrFinding)
+        : List QrFinding :=
+      match fuel with
+      | Z => out
+      | S fuel2 => match xs with
+        | Nil => out
+        | Cons span rest => match span with
+          | MkPair start finish => go fuel2 rest
+              (ls_scan_def_style mp profile path lines start finish out)
+          end
+        end
+      end) (add (length (Pair Nat Nat) (st_def_spans lines)) 1)
+      (st_def_spans lines) acc;
+
+def ls_scan_proven (mp : List (Pair String QrDiag)) (profile : String)
+    (path : String) (text : String) : List QrFinding :=
+    let lines : List String := qt_split_lines text in
+    let acc0 : List QrFinding := st_scan_literals mp profile path text lines [] in
+    let acc1 : List QrFinding := st_scan_lines mp profile path lines acc0 in
+    let acc2 : List QrFinding := st_scan_imports mp profile path lines acc1 in
+    qr_sort_findings (ls_scan_defs_style mp profile path lines acc2);
+
+def ls_scan_file (mp : List (Pair String QrDiag)) (profile : String)
+    (path : String) : IO (Either QualityInputError (List QrFinding)) :=
+    do let! loaded := quality_read_file path;
+       io_pure (Either QualityInputError (List QrFinding))
+         (match loaded with
+          | Left e => Left QualityInputError (List QrFinding) e
+          | Right text => Right QualityInputError (List QrFinding)
+              (ls_scan_proven mp profile (quality_normalize_path path) text)
+          end)
+
+def ls_scan_files (mp : List (Pair String QrDiag)) (profile : String)
+    : List String -> List QrFinding -> IO (Either QualityInputError (List QrFinding)) :=
+  fix go (paths : List String) (acc : List QrFinding)
+      : IO (Either QualityInputError (List QrFinding)) :=
+    match paths with
+    | Nil => io_pure (Either QualityInputError (List QrFinding))
+        (Right QualityInputError (List QrFinding) (qr_sort_findings acc))
+    | Cons path rest =>
+        do let! got := ls_scan_file mp profile path;
+           match got with
+           | Left e => io_pure (Either QualityInputError (List QrFinding))
+               (Left QualityInputError (List QrFinding) e)
+           | Right found => go rest (append QrFinding found acc)
+           end
+    end;
+
+inductive LsArgError : Type :=
+  | LsUnknownOption : String -> LsArgError
+  | LsMissingValue : String -> LsArgError
+  | LsUnknownProfile : String -> LsArgError
+  | LsSingleFile : LsArgError
+  | LsBatchFiles : LsArgError;
+
+def ls_arg_message (e : LsArgError) : String :=
+    match e with
+    | LsUnknownOption option => prim_string_concat "unknown lint option: " option
+    | LsMissingValue option => prim_string_concat "missing value for " option
+    | LsUnknownProfile name => prim_string_concat "unknown lint profile: " name
+    | LsSingleFile => "--single-file requires exactly one path"
+    | LsBatchFiles => "--batch-files requires at least one path"
+    end;
+
+inductive LsRequest : Type :=
+  | MkLsRequest : String -> List String -> LsRequest;
+
+def ls_req_profile (r : LsRequest) : String :=
+    match r with | MkLsRequest p _ => p end;
+
+def ls_req_paths (r : LsRequest) : List String :=
+    match r with | MkLsRequest _ xs => xs end;
+
+def ls_parse : List String -> String -> List String
+    -> Either LsArgError LsRequest :=
+  fix go (args : List String) (profile : String) (rev : List String)
+      : Either LsArgError LsRequest :=
+    match args with
+    | Nil => Right LsArgError LsRequest
+        (MkLsRequest profile (reverse_lin String rev))
+    | Cons arg rest =>
+        match prim_string_eq arg "--" with
+        | True => Right LsArgError LsRequest
+            (MkLsRequest profile (append String (reverse_lin String rev) rest))
+        | False =>
+            match prim_string_eq arg "--deny" with
+            | True => go rest profile rev
+            | False =>
+                match prim_string_eq arg "--profile" with
+                | True => match rest with
+                  | Nil => Left LsArgError LsRequest (LsMissingValue arg)
+                  | Cons value more =>
+                      match prim_string_length value with
+                      | Z => Left LsArgError LsRequest (LsMissingValue arg)
+                      | S _ => match ls_known_profile value with
+                        | False => Left LsArgError LsRequest (LsUnknownProfile value)
+                        | True => go more value rev
+                        end
+                      end
+                  end
+                | False =>
+                    match prim_string_eq arg "--single-file" with
+                    | True => match rest with
+                      | Cons path tail => match tail with
+                        | Nil => Right LsArgError LsRequest (MkLsRequest profile [path])
+                        | Cons _ _ => Left LsArgError LsRequest LsSingleFile
+                        end
+                      | Nil => Left LsArgError LsRequest LsSingleFile
+                      end
+                    | False =>
+                        match prim_string_eq arg "--batch-files" with
+                        | True => match rest with
+                          | Nil => Left LsArgError LsRequest LsBatchFiles
+                          | Cons _ _ => Right LsArgError LsRequest
+                              (MkLsRequest profile rest)
+                          end
+                        | False =>
+                            match prim_string_starts arg "--" with
+                            | True => Left LsArgError LsRequest (LsUnknownOption arg)
+                            | False => go rest profile (Cons String arg rev)
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end;
+
+def ls_load_map (root : String) : IO (Either String (List (Pair String QrDiag))) :=
+    do let! loaded := qr_read_object (ls_cfg_path root);
+       io_pure (Either String (List (Pair String QrDiag)))
+         (match loaded with
+          | Left err => Left String (List (Pair String QrDiag)) err
+          | Right obj => Right String (List (Pair String QrDiag))
+              (qr_cfg_map (qr_load_config obj))
+          end)
+
+def ls_run (profile : String) (paths : List String) : IO Unit :=
+    match paths with
+    | Nil => ls_usage "style companion requires at least one path"
+    | Cons _ _ =>
+        do let! root := quality_repo_root;
+           match root with
+           | Left e => ls_fail (quality_input_message e)
+           | Right canonical =>
+               do let! loaded := ls_load_map canonical;
+                  match loaded with
+                  | Left err => ls_fail (prim_string_concat "unreadable diagnostics inventory: " err)
+                  | Right mp =>
+                      do let! scanned := ls_scan_files mp profile paths [];
+                         match scanned with
+                         | Left e => ls_fail (quality_input_message e)
+                         | Right findings =>
+                             do ls_print_findings findings;
+                                match filter QrFinding ls_emit_ok findings with
+                                | Nil => exit Z
+                                | Cons _ _ => exit (S Z)
+                                end
+                         end
+                  end
+           end
+    end;
+
+def main : IO Unit :=
+    do let! argv := prim_argv;
+       match ls_parse (tail String argv) "project" (Nil String) with
+       | Left e => ls_usage (ls_arg_message e)
+       | Right req => ls_run (ls_req_profile req) (ls_req_paths req)
+       end

@@ -77,10 +77,77 @@ def arch_flag (b : Bool) (i : ArchIssue) : List ArchIssue :=
     | False => Nil ArchIssue
     end;
 
+-- The index is shared by every cycle query in an analysis. Neighbor order
+-- matches the original edge stream, including duplicate edges.
+inductive ArchGraph : Type :=
+  | MkArchGraph : Nat -> List (Pair Nat (List Nat)) -> ArchGraph;
+
+def arch_graph_add (source : Nat) (target : Nat)
+    : List (Pair Nat (List Nat)) -> List (Pair Nat (List Nat)) :=
+  fix go (rows : List (Pair Nat (List Nat))) : List (Pair Nat (List Nat)) :=
+    match rows with
+    | Nil => [MkPair Nat (List Nat) source ([target] : List Nat)]
+    | Cons row rest =>
+        match row with
+        | MkPair key targets =>
+            match eq_nat key source with
+            | True => Cons (Pair Nat (List Nat))
+                (MkPair Nat (List Nat) source (Cons Nat target targets)) rest
+            | False => Cons (Pair Nat (List Nat)) row (go rest)
+            end
+        end
+    end;
+
+def arch_graph (edges : List ArchEdge) : ArchGraph :=
+    MkArchGraph (S (length ArchEdge edges))
+      (foldr ArchEdge (List (Pair Nat (List Nat)))
+        (fun (edge : ArchEdge) (rows : List (Pair Nat (List Nat))) =>
+          arch_graph_add (arch_edge_src edge) (arch_edge_dst edge) rows)
+        (Nil (Pair Nat (List Nat))) edges);
+
+def arch_graph_budget (graph : ArchGraph) : Nat :=
+    match graph with | MkArchGraph budget _ => budget end;
+
+def arch_graph_targets (graph : ArchGraph) (source : Nat) : List Nat :=
+    match graph with
+    | MkArchGraph _ rows =>
+        fromMaybe (List Nat) (Nil Nat) (lookup Nat (List Nat) eq_nat source rows)
+    end;
+
+-- A shared descendant in a DAG must not make the witness walk enumerate all
+-- paths to that descendant. This worklist proves reachability with one visit
+-- per module, excluding the witness's existing ancestors. Each visited module
+-- enqueues its outgoing edges once, so one root plus the edge count bounds the
+-- number of work items, including repeats. The target may close the path even
+-- if it is an ancestor, as in the depth-first walk below.
+-- An exhausted proof is unknown; it never suppresses the witness walk.
+def arch_reachable (graph : ArchGraph) (source : Nat) (target : Nat)
+    (ancestors : List Nat) : Maybe Bool :=
+  (fix go (fuel : Nat) (work : List Nat) (seen : List Nat) : Maybe Bool :=
+    match work with
+    | Nil => Just Bool False
+    | Cons current rest =>
+        match fuel with
+        | Z => Nothing Bool
+        | S fuel' =>
+            match eq_nat current target with
+            | True => Just Bool True
+            | False =>
+                match mem Nat eq_nat current seen with
+                | True => go fuel' rest seen
+                | False =>
+                    go fuel' (append Nat (arch_graph_targets graph current) rest)
+                      (Cons Nat current seen)
+                end
+            end
+        end
+    end) (arch_graph_budget graph) ([source] : List Nat) ancestors;
+
 -- Depth-first walk from `from` to `target` along edge order; `path` holds the
--- module ids visited so far, newest first. Fuel bounds the depth; one unit
--- per module suffices because a module is never entered twice.
-def arch_path_to (edges : List ArchEdge)
+-- module ids visited so far, newest first. Fuel still bounds the depth. The
+-- reachability proof prunes only branches that cannot complete any path, so
+-- reachable witnesses and even insufficient depth budgets keep their order.
+def arch_path_to_graph (graph : ArchGraph)
     : Nat -> Nat -> Nat -> List Nat -> List Nat -> Maybe (List Nat) :=
   fix go (fuel : Nat) (from : Nat) (target : Nat) (seen : List Nat)
       (path : List Nat) : Maybe (List Nat) :=
@@ -93,35 +160,38 @@ def arch_path_to (edges : List ArchEdge)
             match mem Nat eq_nat from seen with
             | True => Nothing (List Nat)
             | False =>
-                let seen' : List Nat := Cons Nat from seen in
-                (fix scan (es : List ArchEdge) : Maybe (List Nat) :=
-                  match es with
-                  | Nil => Nothing (List Nat)
-                  | Cons e rest =>
-                      match eq_nat (arch_edge_src e) from with
-                      | False => scan rest
-                      | True =>
-                          match go fuel' (arch_edge_dst e) target seen'
-                            (Cons Nat (arch_edge_dst e) path) with
+                match fromMaybe Bool True (arch_reachable graph from target seen) with
+                | False => Nothing (List Nat)
+                | True =>
+                    let seen' : List Nat := Cons Nat from seen in
+                    (fix scan (targets : List Nat) : Maybe (List Nat) :=
+                      match targets with
+                      | Nil => Nothing (List Nat)
+                      | Cons next rest =>
+                          match go fuel' next target seen' (Cons Nat next path) with
                           | Just w => Just (List Nat) w
                           | Nothing => scan rest
                           end
-                      end
-                  end) edges
+                      end) (arch_graph_targets graph from)
+                end
             end
         end
     end;
 
 -- Module ids from the edge source, through its target, back to the source
 -- when the edge closes a cycle.
-def arch_cycle_path (fuel : Nat) (edges : List ArchEdge) (e : ArchEdge)
+def arch_cycle_path_graph (fuel : Nat) (graph : ArchGraph) (e : ArchEdge)
     : Maybe (List Nat) :=
-    arch_path_to edges fuel (arch_edge_dst e) (arch_edge_src e) (Nil Nat)
+    arch_path_to_graph graph fuel (arch_edge_dst e) (arch_edge_src e) (Nil Nat)
       ([arch_edge_dst e, arch_edge_src e] : List Nat);
 
-def arch_cycle_issue (fuel : Nat) (edges : List ArchEdge) (e : ArchEdge)
+def arch_cycle_path (fuel : Nat) (edges : List ArchEdge) (e : ArchEdge)
+    : Maybe (List Nat) :=
+    arch_cycle_path_graph fuel (arch_graph edges) e;
+
+def arch_cycle_issue_graph (fuel : Nat) (graph : ArchGraph) (e : ArchEdge)
     : List ArchIssue :=
-    match arch_cycle_path fuel edges e with
+    match arch_cycle_path_graph fuel graph e with
     | Nothing => Nil ArchIssue
     | Just path => ([IArchCycle (arch_edge_span e) path] : List ArchIssue)
     end;
@@ -171,13 +241,14 @@ def arch_trust_issue (nodes : List ArchNode) (e : ArchEdge) : List ArchIssue :=
             (IArchTCBBoundary (arch_edge_span e)))
     end;
 
-def arch_edge_issues (fuel : Nat) (nodes : List ArchNode) (edges : List ArchEdge)
+def arch_edge_issues_graph (fuel : Nat) (nodes : List ArchNode) (graph : ArchGraph)
     (e : ArchEdge) : List ArchIssue :=
-    append ArchIssue (arch_cycle_issue fuel edges e)
+    append ArchIssue (arch_cycle_issue_graph fuel graph e)
       (append ArchIssue (arch_direction_issue nodes e)
         (append ArchIssue (arch_std_runtime_issue nodes e)
           (append ArchIssue (arch_boundary_issue nodes e) (arch_trust_issue nodes e))));
 
 def analyze_architecture (fuel : Nat) (nodes : List ArchNode) (edges : List ArchEdge)
     : List ArchIssue :=
-    concat_map ArchEdge ArchIssue (arch_edge_issues fuel nodes edges) edges;
+    let graph : ArchGraph := arch_graph edges in
+    concat_map ArchEdge ArchIssue (arch_edge_issues_graph fuel nodes graph) edges;

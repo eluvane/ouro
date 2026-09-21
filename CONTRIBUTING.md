@@ -59,21 +59,24 @@ before opening a pull request.
 
 | Area | Focused validation |
 | --- | --- |
-| Documentation and examples | `python3 scripts/docs_examples_gate.py` or `sh scripts/ouro_repo_gate.sh --profile docs` |
-| Repository project surface | `sh scripts/ouro_repo_gate.sh --profile project` |
-| Workflow policy subset | `sh scripts/ouro_repo_gate.sh --profile workflow` |
+| Documentation and examples | `python3 scripts/docs_examples_gate.py` or `sh scripts/ouro_repo_gate.sh --profile docs-native` |
+| Repository project surface | `sh scripts/ouro_repo_gate.sh --profile project-native` |
+| Workflow policy subset | `sh scripts/ouro_repo_gate.sh --profile workflow-native` |
 | Formatter | `sh scripts/fmt_suite.sh` |
 | Autofixer | `sh scripts/fix_suite.sh` |
 | Linter | `sh scripts/lint_suite.sh` |
 | Analyzer | `sh scripts/analyze_precision_suite.sh` |
 | Handwritten C host | `python3 scripts/c_static_analysis_suite.py` |
 | Host Python | `ruff check --config quality/ruff.toml scripts` |
-| Host shell | `shellcheck --rcfile quality/shellcheckrc --severity=style scripts/*.sh samples/bioinformatics/fixture_tool.sh` |
+| Host shell | `shellcheck --severity=style scripts/*.sh samples/bioinformatics/fixture_tool.sh` |
 | Packages | `sh scripts/pkg_suite.sh` |
 | LSP | `sh scripts/lsp_suite.sh` |
 | Runtime and IO | `sh scripts/runtime_io_suite.sh` |
 | Compiler checking | `sh scripts/test_suite.sh --compiler-checking` and `python3 scripts/ci_gate.py --profile kernel --out _build/ci/kernel` |
 | Build/cache/bootstrap | the relevant suite listed in [Build and bootstrap](docs/build.md) |
+
+The Python PR profile invokes `docs-native`, `project-native`, and
+`workflow-native`; the short names `docs`, `project`, and `workflow` are aliases.
 
 The normal pull-request profile is:
 
@@ -149,13 +152,10 @@ Read [Architecture](docs/architecture.md),
 
 ## Opening a pull request
 
-Keep the change focused. The pull request should explain:
-
-- what problem it solves;
-- what user-visible or internal behavior changed;
-- which commands were run;
-- which checks were unavailable;
-- whether compatibility, generated artifacts, or the trusted boundary changed.
+Keep the change focused and the description short: explain what changed and
+why. Mention material risks, compatibility or trust impact, and remaining
+limitations only when they apply. Omit empty sections and checklists; validation
+results are available through CI.
 
 Do not include generated build output, local benchmark numbers without a
 reproduction command, or broad cleanup unrelated to the stated change.

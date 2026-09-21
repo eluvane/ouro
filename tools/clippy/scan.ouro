@@ -1,0 +1,526 @@
+-- File scan, suppressions, and rule-inventory checks.
+-- This unit stays on the core/registry/json cone. Compiler-frontend proofs
+-- arrive already built over the structural worker protocol.
+
+import "core.ouro";
+import "scan_types.ouro";
+import "../../std/json_types.ouro";
+import "../quality/input_error.ouro";
+import "../../std/collections.ouro";
+
+def cg_rules_path (root : String) : String :=
+    qr_child root "quality/clippy_grade_rules.json";
+
+def cg_load_rules (root : Json) : List (Pair String QrClippy) :=
+    qr_load_clip_rules (qr_arr root "rules");
+
+def cg_disable_id (raw : String) : String :=
+    match qt_find raw "disable=" with
+    | Nothing => ""
+    | Just i =>
+        let start : Nat := add i 8 in
+        let tok : String :=
+          (fix take (tf : Nat) (j : Nat) : String :=
+            match tf with
+            | Z => prim_string_slice raw start (sub j start)
+            | S t2 => match ltb_nat j (prim_string_length raw) with
+              | False => prim_string_slice raw start (sub j start)
+              | True => match byte_is_space (prim_string_byte_at raw j) with
+                | True => prim_string_slice raw start (sub j start)
+                | False => take t2 (add j 1)
+                end
+              end
+            end) (add (prim_string_length raw) 1) start in
+        let t : String := qt_strip tok in
+        let t2 : String := match prim_string_ends t "," with
+          | True => prim_string_slice t 0 (sub (prim_string_length t) 1)
+          | False => t
+          end in
+        let t3 : String := match prim_string_ends t2 ")" with
+          | True => prim_string_slice t2 0 (sub (prim_string_length t2) 1)
+          | False => t2
+          end in
+        match prim_string_ends t3 ";" with
+        | True => prim_string_slice t3 0 (sub (prim_string_length t3) 1)
+        | False => t3
+        end
+    end;
+
+-- Only a directive at the start of an actual line comment can grant an
+-- exception. A string literal or explanatory prose is not policy authority.
+def cg_directive (raw : String) : String :=
+    let start : Nat := prim_string_length (cg_code raw) in
+    match ltb_nat start (prim_string_length raw) with
+    | False => ""
+    | True => qt_strip (prim_string_slice raw (add start 2)
+        (sub (prim_string_length raw) (add start 2)))
+    end;
+
+def cg_has_reason (directive : String) : Bool :=
+    match qt_find directive "reason=" with
+    | Nothing => False
+    | Just start =>
+        let boundary : Bool := match start with
+          | Z => True
+          | S previous => byte_is_space (prim_string_byte_at directive previous)
+          end in
+        let reason : String := qt_strip (prim_string_slice directive (add start 7)
+          (sub (prim_string_length directive) (add start 7))) in
+        let empty_reasons : List String := [ "", "\"\"", "''" ] in
+        andb boundary (notb (elem String prim_string_eq reason empty_reasons))
+    end;
+
+def cg_add_sup (xs : List (Pair Nat (List String))) (line : Nat)
+    (rid : String) : List (Pair Nat (List String)) :=
+    match lookup Nat (List String) eq_nat line xs with
+    | Nothing => Cons (Pair Nat (List String))
+        (MkPair Nat (List String) line ([rid] : List String)) xs
+    | Just cur =>
+        map (Pair Nat (List String)) (Pair Nat (List String))
+          (fun (p : Pair Nat (List String)) =>
+            match p with
+            | MkPair n _ => match eq_nat n line with
+              | True => MkPair Nat (List String) n (Cons String rid cur)
+              | False => p
+              end
+            end) xs
+    end;
+
+def cg_scan_suppress (mp : List (Pair String QrClippy)) (profile : String)
+    (path : String) (lines : List String) (acc : List QrFinding)
+    : Pair (List QrFinding) (List (Pair Nat (List String))) :=
+    (fix go (fuel : Nat) (xs : List String) (n : Nat) (out : List QrFinding)
+        (sup : List (Pair Nat (List String)))
+        : Pair (List QrFinding) (List (Pair Nat (List String))) :=
+      match fuel with
+      | Z => MkPair (List QrFinding) (List (Pair Nat (List String))) out sup
+      | S fuel2 => match xs with
+        | Nil => MkPair (List QrFinding) (List (Pair Nat (List String))) out sup
+        | Cons raw rest =>
+            let directive : String := cg_directive raw in
+            match prim_string_starts directive "ouro-clippy:disable" with
+            | False => go fuel2 rest (add n 1) out sup
+            | True =>
+                match orb (qt_contains directive "disable-all")
+                    (qt_contains directive "disable=*") with
+                | True =>
+                    go fuel2 rest (add n 1)
+                      (cg_add out (cg_hit mp profile
+                        "OURO-CLIPPY-SUPPRESS-001" path n
+                        (cg_word_col raw "ouro-clippy") raw ""))
+                      sup
+                | False =>
+                    let rid : String := cg_disable_id directive in
+                    match qr_lookup_clip mp rid with
+                    | Nothing =>
+                        go fuel2 rest (add n 1)
+                          (cg_add out (cg_hit mp profile
+                            "OURO-CLIPPY-SUPPRESS-003" path n
+                            (cg_word_col raw rid) raw
+                            (qt_cat3 "Unknown rule: " rid ".")))
+                          sup
+                    | Just _ =>
+                        match cg_has_reason directive with
+                        | False =>
+                            go fuel2 rest (add n 1)
+                              (cg_add out (cg_hit mp profile
+                                "OURO-CLIPPY-SUPPRESS-002" path n
+                                (cg_word_col raw "ouro-clippy") raw
+                                (qt_cat3 "Rule: " rid
+                                  ". Supply a nonempty reason; this directive does not suppress a finding.")))
+                              sup
+                        | True =>
+                            go fuel2 rest (add n 1) out
+                              (cg_add_sup (cg_add_sup sup n rid) (add n 1) rid)
+                        end
+                    end
+                end
+            end
+        end
+      end) (add (length String lines) 1) lines 1 acc (Nil (Pair Nat (List String)));
+
+def cg_line_rules (sup : List (Pair Nat (List String))) (line : Nat)
+    : List String :=
+    match lookup Nat (List String) eq_nat line sup with
+    | Nothing => Nil String
+    | Just xs => xs
+    end;
+
+def cg_apply_sup (findings : List QrFinding)
+    (sup : List (Pair Nat (List String))) : List QrFinding :=
+    map QrFinding QrFinding (fun (f : QrFinding) =>
+      match prim_string_eq (qr_find_level f) "fatal" with
+      | True => f
+      | False =>
+          match elem String prim_string_eq (qr_find_code f)
+              (cg_line_rules sup (qr_find_line f)) with
+          | False => f
+          | True => qr_with_mark f (Just String
+              (prim_string_concat "line:"
+                (prim_string_of_nat (qr_find_line f))))
+          end
+      end) findings;
+
+-- Finding attachment stays in the core/defs cone. The structural worker cannot
+-- name CgDef/QrFinding without importing core into the compiler-AST unit.
+
+def cg_s_protocol : String :=
+    "ouro.clippy-semantic.v2";
+
+def cg_s_drop_empty : List String -> List String :=
+  fix go (xs : List String) : List String :=
+    match xs with
+    | Nil => Nil String
+    | Cons line rest => match prim_string_length line with
+      | Z => go rest
+      | S _ => Cons String line rest
+      end
+    end;
+
+-- Wire numbers must have one canonical representation. No signs, leading
+-- zeroes, whitespace, partial parses or unbounded proof inventories.
+def cg_s_nat (text : String) : Maybe Nat :=
+    match qt_parse_nat text with
+    | Nothing => Nothing Nat
+    | Just value => match prim_string_eq text (prim_string_of_nat value) with
+      | False => Nothing Nat
+      | True => Just Nat value
+      end
+    end;
+
+-- Keep large runtime limits compact in the checked core (no Peano tower).
+def cg_s_proof_budget : Nat := mul (mul 5 100) (mul 10 100);
+
+def cg_s_take_proofs : Nat -> List String -> List CgSProof
+    -> Either QualityInputError (List CgSProof) :=
+  fix go (n : Nat) (rows : List String) (rev : List CgSProof)
+      : Either QualityInputError (List CgSProof) :=
+    match n with
+    | Z => match cg_s_drop_empty rows with
+      | Nil => Right QualityInputError (List CgSProof) (reverse_lin CgSProof rev)
+      | Cons _ _ => Left QualityInputError (List CgSProof)
+          (QualityInvalidInput "structural worker returned extra proof rows")
+      end
+    | S n2 => match rows with
+      | Nil => Left QualityInputError (List CgSProof)
+          (QualityInvalidInput "structural worker returned an incomplete proof record")
+      | Cons code rows1 => match rows1 with
+        | Nil => Left QualityInputError (List CgSProof)
+            (QualityInvalidInput "structural worker returned an incomplete proof record")
+        | Cons owner rows2 => match rows2 with
+          | Nil => Left QualityInputError (List CgSProof)
+              (QualityInvalidInput "structural worker returned an incomplete proof record")
+          | Cons node_s rows3 => match rows3 with
+            | Nil => Left QualityInputError (List CgSProof)
+                (QualityInvalidInput "structural worker returned an incomplete proof record")
+            | Cons evidence rest =>
+                match cg_s_nat node_s with
+                | Nothing => Left QualityInputError (List CgSProof)
+                    (QualityInvalidInput "structural worker returned a non-numeric expression ordinal")
+                | Just node => match orb (notb (leb_nat node cg_s_proof_budget))
+                      (orb (eq_nat (prim_string_length (qt_strip code)) 0)
+                        (orb (eq_nat (prim_string_length (qt_strip owner)) 0)
+                          (eq_nat (prim_string_length (qt_strip evidence)) 0))) with
+                  | True => Left QualityInputError (List CgSProof)
+                      (QualityInvalidInput "structural worker returned an empty proof field")
+                  | False => go n2 rest (Cons CgSProof
+                      (MkCgSProof code owner node evidence) rev)
+                  end
+                end
+            end
+          end
+        end
+      end
+    end;
+
+-- A length-framed snapshot avoids a second file read and preserves CRLF,
+-- Unicode and a missing final newline exactly. Protocol lines themselves use LF.
+def cg_s_reply_line (text : String) : Either QualityInputError (Pair String String) :=
+    match qt_find text "\n" with
+    | Nothing => Left QualityInputError (Pair String String) (QualityInvalidInput "unterminated semantic protocol line")
+    | Just position => Right QualityInputError (Pair String String) (MkPair String String
+        (prim_string_slice text 0 position)
+        (prim_string_slice text (add position 1) (sub (prim_string_length text) (add position 1))))
+    end;
+
+def cg_s_snapshot_reply (text : String) : Either QualityInputError (Pair String (List CgSProof)) :=
+    match cg_s_reply_line text with
+    | Left error => Left QualityInputError (Pair String (List CgSProof)) error
+    | Right framed => match framed with
+      | MkPair size_text payload => match cg_s_nat size_text with
+        | Nothing => Left QualityInputError (Pair String (List CgSProof))
+            (QualityInvalidInput "invalid semantic snapshot byte count")
+        | Just size => match andb (ltb_nat size (prim_string_length payload))
+            (eq_nat (prim_string_byte_at payload size) 10) with
+          | False => Left QualityInputError (Pair String (List CgSProof))
+              (QualityInvalidInput "incomplete semantic source snapshot")
+          | True => match cg_s_reply_line (prim_string_slice payload (add size 1)
+              (sub (prim_string_length payload) (add size 1))) with
+            | Left error => Left QualityInputError (Pair String (List CgSProof)) error
+            | Right proof_rows => match proof_rows with
+              | MkPair count_text rows => match cg_s_nat count_text with
+                | Nothing => Left QualityInputError (Pair String (List CgSProof))
+                    (QualityInvalidInput "invalid semantic proof count")
+                | Just count => match notb (leb_nat count cg_s_proof_budget) with
+                  | True => Left QualityInputError (Pair String (List CgSProof))
+                      (QualityInvalidInput "semantic proof inventory exhausted")
+                  | False => match cg_s_take_proofs count (qt_split_lines rows) [] with
+                    | Left error => Left QualityInputError (Pair String (List CgSProof)) error
+                    | Right proofs => Right QualityInputError (Pair String (List CgSProof))
+                        (MkPair String (List CgSProof) (prim_string_slice payload 0 size) proofs)
+                    end
+                  end
+                end
+              end
+            end
+          end
+        end
+      end
+    end;
+
+def cg_s_parse_reply (text : String) : Either QualityInputError (Pair String (List CgSProof)) :=
+    match cg_s_reply_line text with
+    | Left error => Left QualityInputError (Pair String (List CgSProof)) error
+    | Right header => match header with
+      | MkPair magic rest => match prim_string_eq magic cg_s_protocol with
+        | False => Left QualityInputError (Pair String (List CgSProof))
+            (QualityInvalidInput "unknown semantic worker protocol")
+        | True => match cg_s_reply_line rest with
+          | Left error => Left QualityInputError (Pair String (List CgSProof)) error
+          | Right status_row => match status_row with
+            | MkPair status payload => match prim_string_eq status "ok" with
+              | True => cg_s_snapshot_reply payload
+              | False => match prim_string_eq status "error" with
+                | False => Left QualityInputError (Pair String (List CgSProof))
+                    (QualityInvalidInput "unknown semantic worker status")
+                | True => Left QualityInputError (Pair String (List CgSProof))
+                    (QualityInvalidInput (prim_string_concat "semantic worker rejected input: " (qt_strip payload)))
+                end
+              end
+            end
+          end
+        end
+      end
+    end;
+
+-- The compiler Expr has no expression spans. Keep the existing declaration
+-- anchor when present; explicitly report the node ordinal instead of inventing
+-- an expression column or a MachineApplicable byte edit.
+def cg_s_anchor (name : String) : List CgDef -> Nat :=
+  fix go (defs : List CgDef) : Nat :=
+    match defs with
+    | Nil => 1
+    | Cons d rest => match prim_string_eq name (cg_def_name_of d) with
+      | True => cg_def_line d
+      | False => go rest
+      end
+    end;
+
+def cg_s_attach (mp : List (Pair String QrClippy)) (profile : String) (path : String)
+    (defs : List CgDef) (proofs : List CgSProof) : List QrFinding :=
+    map CgSProof QrFinding (fun (proof : CgSProof) => match proof with
+      | MkCgSProof code owner node evidence => cg_hit mp profile code path (cg_s_anchor owner defs) 1
+          (prim_string_concat "definition `"
+            (prim_string_concat owner
+              (prim_string_concat "`, expression #"
+                (prim_string_concat (prim_string_of_nat node)
+                  (prim_string_concat ": " evidence)))))
+          (prim_string_concat evidence
+            ". Manual: review the local expression; retain public declarations, signatures, and evaluation order. No exact expression span or automatic edit is claimed.")
+      end) proofs;
+
+-- Input/fact failure is an unsuppressible fatal condition in every profile,
+-- including project --warn-only. A permissive registry must not make it clean.
+def cg_s_incomplete (mp : List (Pair String QrClippy)) (profile : String)
+    (path : String) (error : String) : QrFinding :=
+    match cg_hit mp profile "OURO-CLIPPY-FRONTEND-001" path 1 1 error "" with
+    | MkQrFinding code _ place _ _ owner rule witness _ =>
+        MkQrFinding code "fatal" place
+          (prim_string_concat "Native Clippy analysis is incomplete: " error)
+          "Correct the frontend/fact failure and rerun the complete scan; no suppression or lexical fallback is valid."
+          owner rule witness (Nothing String)
+    end;
+
+-- Consume already-built structural proofs. Failure never falls back to
+-- lexical findings or a successful partial structural scan. Legacy rules
+-- still consume their existing views; migrated rules have exactly one
+-- emitter in the structural companion. Declaration anchors are indexed here.
+def cg_scan_file (mp : List (Pair String QrClippy)) (profile : String)
+    (root : String) (_source_root : String) (abs_path : String) (text : String)
+    (proofs : Either QualityInputError (List CgSProof)) : List QrFinding :=
+    let path : String := qr_rel root abs_path in
+    match proofs with
+    | Left error => ([cg_s_incomplete mp profile path (quality_input_message error)] : List QrFinding)
+    | Right built =>
+        let lines : List String := qt_split_lines text in
+        let defs : List CgDef := cg_iter_defs lines in
+        match cg_scan_suppress mp profile path lines (Nil QrFinding) with
+        | MkPair acc0 sup =>
+            qr_sort_findings (cg_apply_sup
+              (append QrFinding (cg_s_attach mp profile path defs built) acc0) sup)
+        end
+    end;
+
+def cg_expected_profiles : List String :=
+    ["baseline", "project", "strict", "release"];
+
+def cg_expected_levels : List String :=
+    ["allow", "info", "warn", "deny", "fatal"];
+
+def cg_families (mp : List (Pair String QrClippy)) : List String :=
+    cg_unique (map (Pair String QrClippy) String
+      (fun (p : Pair String QrClippy) => qr_clip_family (snd String QrClippy p))
+      mp);
+
+def cg_validate_levels (rid : String) (item : QrClippy) (acc : List String)
+    : List String :=
+    (fix lv (ps : List String) (out : List String) : List String :=
+      match ps with
+      | Nil => out
+      | Cons profile more =>
+          let lvl : String := qr_assoc_or (qr_clip_levels item) profile "" in
+          match qr_clip_level_ok lvl with
+          | True => lv more out
+          | False => lv more (Cons String
+              (prim_string_concat rid
+                (prim_string_concat ": missing/invalid "
+                  (prim_string_concat profile " level"))) out)
+          end
+      end) cg_expected_profiles acc;
+
+-- Release cannot silently weaken a strict diagnostic. Infrastructure failures
+-- are not advisory policy, even when a custom registry supplies valid levels.
+def cg_validate_rule_policy (rid : String) (item : QrClippy) (acc : List String)
+    : List String :=
+    let levels : List (Pair String String) := qr_clip_levels item in
+    let strict_rank : Nat := qr_clip_rank (qr_assoc_or levels "strict" "") in
+    let release_rank : Nat := qr_clip_rank (qr_assoc_or levels "release" "") in
+    let ordered : List String := match ltb_nat release_rank strict_rank with
+      | False => acc
+      | True => Cons String (prim_string_concat rid ": release level is weaker than strict") acc
+      end in
+    match prim_string_eq rid "OURO-CLIPPY-FRONTEND-001" with
+    | False => ordered
+    | True => match all String (fun (p : String) =>
+        prim_string_eq (qr_assoc_or levels p "") "fatal") cg_expected_profiles with
+      | True => ordered
+      | False => Cons String
+          (prim_string_concat rid ": incomplete frontend analysis must be fatal in every profile") ordered
+      end
+    end;
+
+def cg_validate_one_rule (rid : String) (item : QrClippy) (acc : List String)
+    : List String :=
+    let acc1 : List String := match qr_clip_id_ok rid with
+      | True => acc
+      | False => Cons String (prim_string_concat rid ": invalid rule id") acc
+      end in
+    let acc2 : List String := cg_validate_rule_policy rid item
+      (cg_validate_levels rid item acc1) in
+    let required : List (Pair String String) :=
+      [ MkPair String String "family" (qr_clip_family item)
+      , MkPair String String "title" (qr_clip_title item)
+      , MkPair String String "message" (qr_clip_message item)
+      , MkPair String String "fix" (qr_clip_fix item) ] in
+    (fix fields (remaining : List (Pair String String)) (out : List String)
+        : List String :=
+      match remaining with
+      | Nil => out
+      | Cons field rest => match field with
+        | MkPair name value =>
+            match prim_string_length (qt_strip value) with
+            | Z => fields rest (Cons String
+                (qt_cat3 rid ": missing or empty " name) out)
+            | S _ => fields rest out
+            end
+        end
+      end) required acc2;
+
+-- Sorting makes duplicate validation O(n log n), including damaged registries
+-- with many repeated keys. Do not silently choose the first duplicate row.
+def cg_duplicate_names (names : List String) : List String :=
+    let sorted : List String := quality_sort String prim_string_le names in
+    dedup_adjacent String prim_string_eq
+      ((fix go (xs : List String) : List String :=
+        match xs with
+        | Nil => Nil String
+        | Cons first rest => match rest with
+          | Nil => Nil String
+          | Cons second _ => match prim_string_eq first second with
+            | True => Cons String first (go rest)
+            | False => go rest
+            end
+          end
+        end) sorted);
+
+def cg_validate_json_keys (context : String) (value : Json) : List String :=
+    map String String (fun (name : String) => qt_cat3 context ": duplicate key " name)
+      (cg_duplicate_names
+        (map (Pair String Json) String (fst String Json) (qr_pairs value)));
+
+def cg_validate_raw_rule (value : Json) : List String :=
+    let rid : String := qr_str_or value "id" "<missing-id>" in
+    let levels : Json := qr_get_or value "levels" JNull in
+    let unknown : List String := filter String
+      (fun (name : String) => notb (elem String prim_string_eq name cg_expected_profiles))
+      (map (Pair String Json) String (fst String Json) (qr_pairs levels)) in
+    append String (cg_validate_json_keys rid value)
+      (append String (cg_validate_json_keys (prim_string_concat rid ": levels") levels)
+        (map String String (fun (name : String) =>
+          qt_cat3 rid ": unknown profile in levels: " name) unknown));
+
+-- Inventory size is not a quality criterion. Reject an empty registry, not a
+-- small high-signal registry. Unknown emitted ids remain fatal in cg_hit.
+def cg_validate_rules (mp : List (Pair String QrClippy)) : List String :=
+    quality_sort String prim_string_le
+      ((fix go (xs : List (Pair String QrClippy)) (out : List String)
+          : List String :=
+        match xs with
+        | Nil => out
+        | Cons pair rest => match pair with
+          | MkPair rid item => go rest (cg_validate_one_rule rid item out)
+          end
+        end) mp (append String
+          (map String String (prim_string_concat "duplicate rule id: ")
+            (cg_duplicate_names
+              (map (Pair String QrClippy) String (fst String QrClippy) mp)))
+          (match mp with
+           | Nil => ([ "rule inventory is empty" ] : List String)
+           | Cons _ _ => Nil String
+           end)));
+
+def cg_validate_vocabulary (label : String) (expected : List String)
+    (values : List Json) : List String :=
+    let names : List String := qr_string_list values in
+    let expected_count : Nat := length String expected in
+    match andb (eq_nat (length Json values) expected_count)
+        (andb (eq_nat (length String names) expected_count)
+          (all String (fun (name : String) => elem String prim_string_eq name names) expected)) with
+    | True => Nil String
+    | False => ([prim_string_concat "invalid rule inventory " label]
+      : List String)
+    end;
+
+-- Validate the raw rows as well as the normalized model. Shared JSON defaults
+-- must not hide malformed rows, duplicate keys, or misspelled profile names.
+def cg_validate_registry (value : Json) (mp : List (Pair String QrClippy)) : List String :=
+    let rows : List Json := qr_arr value "rules" in
+    let complete : List String :=
+      match eq_nat (length Json rows) (length (Pair String QrClippy) mp) with
+      | True => Nil String
+      | False => ([ "rule inventory contains malformed rows; analysis cannot use a partial registry" ]
+        : List String)
+      end in
+    let schema : List String := match prim_string_eq (qr_str_or value "kind" "")
+        "ouro.clippy-grade-rule-inventory.v1" with
+      | True => Nil String
+      | False => ([ "invalid rule inventory kind" ] : List String)
+      end in
+    quality_sort String prim_string_le
+      (append String (cg_validate_rules mp)
+        (append String (cg_validate_json_keys "rule inventory" value)
+          (append String complete
+            (append String schema
+              (append String (cg_validate_vocabulary "levels" cg_expected_levels (qr_arr value "levels"))
+                (append String (cg_validate_vocabulary "profiles" cg_expected_profiles (qr_arr value "profiles"))
+                  (concat_map Json String cg_validate_raw_rule rows)))))));

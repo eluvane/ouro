@@ -2,7 +2,7 @@
 
 String operations delegate byte semantics to trusted runtime primitives.
 
-Declarations: 37.
+Declarations: 36.
 
 ## def str_len
 
@@ -152,12 +152,6 @@ def str_lower (s : String) : String
 
 ```
 def str_upper (s : String) : String
-```
-
-## def is_ws_or
-
-```
-def is_ws_or (c : Nat) : Bool
 ```
 
 ## def str_ltrim

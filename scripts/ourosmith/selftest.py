@@ -1006,6 +1006,19 @@ class HarnessTests(unittest.TestCase):
         self.assertLessEqual(attempts, 6)
         self.assertLess(len(json.dumps(small.json())), len(json.dumps(ast.json())))
 
+    def test_clean_surface_conditionals_have_distinct_results(self):
+        from ourosmith.surface import gen
+
+        pending = [gen.generate(seed, 4) for seed in range(200)]
+        conditionals = 0
+        while pending:
+            expr = pending.pop()
+            pending.extend(expr.args)
+            if expr.tag == "if":
+                conditionals += 1
+                self.assertNotEqual(gen.evaluate(expr.args[1]), gen.evaluate(expr.args[2]))
+        self.assertGreater(conditionals, 100)
+
     def test_ci_shell_environment_uses_portable_paths(self):
         from ci_gate import Gate, env_for
 

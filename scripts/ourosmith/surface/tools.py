@@ -112,19 +112,42 @@ def language_server(run, directory):
 
 
 def fixer(run, directory):
-    # An unused pure let is dead by construction; the result is known before
-    # running the fixer, whose preservation is also checked via native output.
+    # Semantic proposals require a preservation certificate before publication.
+    # Keep the proposal visible while preview/write preserve the exact source.
     original = PRELUDE + f"def result : Nat := let unused : Nat := {run.seed % 5} in S Z;\n"
     path = write(directory / "fixable.ouro", original)
     run.accepts(path)
     checked = run.command([run.tool("ouro-fix"), "--check", path], directory, "fix-check-dirty")
     run.require(checked.returncode == 1, "fix-check-dirty", "exit 1", run.output(checked))
     fixed = run.command([run.tool("ouro-fix"), path], directory, "fix-output")
-    run.require(fixed.ok and "let unused" not in fixed.stdout, "fix-dead-let", "unused pure let removed", run.output(fixed))
+    review = "review-required suggestions (not applied)"
+    run.require(fixed.ok and fixed.stdout == original and review in fixed.stderr
+                and "dead-let:" in fixed.stderr, "fix-dead-let", "unchanged source and reviewed dead-let proposal", run.output(fixed))
+    written = run.command([run.tool("ouro-fix"), "--write", path], directory, "fix-review-write")
+    run.require(written.ok and not written.stdout and path.read_text(encoding="utf-8") == original
+                and review in written.stderr, "fix-review-write", "review-only write preserves source", run.output(written))
+    checked = run.command([run.tool("ouro-fix"), "--check", path], directory, "fix-review-retained")
+    run.require(checked.returncode == 1 and review in checked.stderr,
+                "fix-review-retained", "review remains blocking", run.output(checked))
+
+    # Certified syntax edits still have to change the file, become clean and
+    # preserve a result known independently of both the compiler and fixer.
+    expected = PRELUDE + "def result : Nat := S Z;\n"
+    write(path, PRELUDE + "def result : Nat := S Z;;\n")
+    rejected, _ = run.check(path, artifact=False)
+    run.require(rejected.returncode == 1 and "CErr code=10 det=102" in rejected.stderr,
+                "fix-syntax-rejected", "parser rejects the extra separator", run.output(rejected))
+    checked = run.command([run.tool("ouro-fix"), "--check", path], directory, "fix-check-dirty")
+    run.require(checked.returncode == 1, "fix-check-dirty", "exit 1", run.output(checked))
+    fixed = run.command([run.tool("ouro-fix"), path], directory, "fix-certified-syntax")
+    run.require(fixed.ok and fixed.stdout == expected, "fix-certified-syntax", expected, run.output(fixed))
     write(path, fixed.stdout)
     run.accepts(path)
     again = run.command([run.tool("ouro-fix"), path], directory, "fix-idempotent")
     run.require(again.ok and again.stdout == fixed.stdout, "fix-idempotent", fixed.stdout, run.output(again))
+    checked = run.command([run.tool("ouro-fix"), "--check", path], directory, "fix-check-clean")
+    run.require(checked.ok and not checked.stdout and not checked.stderr,
+                "fix-check-clean", "clean certified result", run.output(checked))
     lint = run.command([run.tool("ouro-lint"), path], directory, "fix-lint-clean")
     run.require(lint.ok and not lint.stdout.strip(), "fix-lint-clean", "no lint diagnostics", run.output(lint))
     result = run.native(path)

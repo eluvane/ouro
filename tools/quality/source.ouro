@@ -1,0 +1,190 @@
+-- Shared input boundary for native quality commands. This module must remain
+-- usable in the compiler lexer cone: no std/char, parser, or analyzer imports.
+-- Error constructors live in input_error.ouro so frontend units can name
+-- them without importing this IO inventory.
+
+import "../../std/io.ouro";
+import "../../std/collections.ouro";
+import "order.ouro";
+import "input_error.ouro";
+
+def quality_normalize_path (path : String) : String :=
+    prim_string_replace path "\\" "/";
+
+def quality_child (dir : String) (name : String) : String :=
+    match prim_string_length dir with
+    | Z => name
+    | S _ =>
+        match prim_string_eq dir "." with
+        | True => name
+        | False => concat dir (concat "/" name)
+        end
+    end;
+
+def quality_skip_names : List String :=
+    [ ".", "..", "_build", "_cache", "_opam", "_tools", ".git", "node_modules" ];
+
+def quality_skip_dir (name : String) : Bool :=
+    elem String prim_string_eq name quality_skip_names;
+
+def quality_walk_budget : Nat := mul 128 128;
+
+-- Check the pending work before the budget. An exactly exhausted, completed
+-- inventory is valid; an exhausted inventory with any pending path is not.
+-- No error constructor carries a partial file list.
+def quality_walk_go (skip : String -> Bool) (keep : String -> Bool)
+    : Nat -> List String -> List String
+    -> IO (Either QualityInputError (List String)) :=
+  fix go (fuel : Nat) (pending : List String) (rev : List String)
+      : IO (Either QualityInputError (List String)) :=
+    match pending with
+    | Nil => io_pure (Either QualityInputError (List String))
+        (Right QualityInputError (List String) (reverse_lin String rev))
+    | Cons path rest =>
+        match fuel with
+        | Z => io_pure (Either QualityInputError (List String))
+            (Left QualityInputError (List String) (QualityWalkExhausted path))
+        | S fuel2 =>
+            do let! kind := prim_fs_kind path;
+               match eq_nat kind (S Z) with
+               | True =>
+                   match andb (prim_string_ends path ".ouro") (keep path) with
+                   | True => go fuel2 rest (Cons String path rev)
+                   | False => go fuel2 rest rev
+                   end
+               | False =>
+                   match eq_nat kind (S (S Z)) with
+                   | False => io_pure (Either QualityInputError (List String))
+                       (Left QualityInputError (List String) (QualityInvalidInput path))
+                   | True =>
+                       do let! listable := prim_fs_listable path;
+                          match listable with
+                          | False => io_pure (Either QualityInputError (List String))
+                              (Left QualityInputError (List String)
+                                (QualityUnreadableDirectory path))
+                          | True =>
+                              do let! names := prim_fs_list_dir path;
+                                 let children : List String :=
+                                   map String String (quality_child path)
+                                     (quality_sort String prim_string_le
+                                       (filter String
+                                         (fun (name : String) => notb (skip name)) names)) in
+                                 go fuel2 (append String children rest) rev
+                          end
+                   end
+               end
+        end
+    end;
+
+-- Keep the original sequence number while grouping canonical identities.
+-- Stable sorting retains the first spelling and restores the caller's order
+-- without a membership scan over every previously selected file.
+inductive QualitySourceIdentity : Type :=
+  | MkQualitySourceIdentity : String -> String -> Nat -> QualitySourceIdentity;
+
+def quality_identity_path (value : QualitySourceIdentity) : String :=
+    match value with | MkQualitySourceIdentity _ path _ => path end;
+
+def quality_identity_key (value : QualitySourceIdentity) : String :=
+    match value with | MkQualitySourceIdentity canonical _ _ => canonical end;
+
+def quality_identity_index (value : QualitySourceIdentity) : Nat :=
+    match value with | MkQualitySourceIdentity _ _ index => index end;
+
+def quality_source_identities (files : List String)
+    : IO (Either QualityInputError (List QualitySourceIdentity)) :=
+  (fix go (remaining : List String) (index : Nat) (rev : List QualitySourceIdentity)
+      : IO (Either QualityInputError (List QualitySourceIdentity)) :=
+    match remaining with
+    | Nil => io_pure (Either QualityInputError (List QualitySourceIdentity))
+        (Right QualityInputError (List QualitySourceIdentity) (reverse_lin QualitySourceIdentity rev))
+    | Cons path rest =>
+        do let! canonical := prim_fs_realpath path;
+           match prim_string_length canonical with
+           | Z => io_pure (Either QualityInputError (List QualitySourceIdentity))
+               (Left QualityInputError (List QualitySourceIdentity) (QualityInvalidInput path))
+           | S _ => go rest (S index)
+               (Cons QualitySourceIdentity (MkQualitySourceIdentity canonical path index) rev)
+           end
+    end) files Z [];
+
+def quality_unique_identities (values : List QualitySourceIdentity) : List String :=
+    let grouped : List QualitySourceIdentity := quality_sort QualitySourceIdentity
+      (fun (a : QualitySourceIdentity) (b : QualitySourceIdentity) =>
+        prim_string_le (quality_identity_key a) (quality_identity_key b)) values in
+    let unique : List QualitySourceIdentity := dedup_adjacent QualitySourceIdentity
+      (fun (a : QualitySourceIdentity) (b : QualitySourceIdentity) =>
+        prim_string_eq (quality_identity_key a) (quality_identity_key b)) grouped in
+    map QualitySourceIdentity String quality_identity_path
+      (quality_sort QualitySourceIdentity
+        (fun (a : QualitySourceIdentity) (b : QualitySourceIdentity) =>
+          leb_nat (quality_identity_index a) (quality_identity_index b)) unique);
+
+-- Lexical aliases such as ./ and ../ must not duplicate findings. Failed
+-- canonicalization cannot publish partial input.
+def quality_unique_files (files : List String)
+    : IO (Either QualityInputError (List String)) :=
+    do let! identities := quality_source_identities files;
+       match identities with
+       | Left error => io_pure (Either QualityInputError (List String))
+           (Left QualityInputError (List String) error)
+       | Right values => io_pure (Either QualityInputError (List String))
+           (Right QualityInputError (List String) (quality_unique_identities values))
+       end
+
+-- Sort and deduplicate before any source is read. Explicit files are not
+-- hidden by directory-name exclusions, including files inside _build.
+def quality_inventory (skip : String -> Bool) (keep : String -> Bool)
+    (roots : List String) : IO (Either QualityInputError (List String)) :=
+    do let! walked := quality_walk_go skip keep quality_walk_budget
+         (map String String quality_normalize_path roots) (Nil String);
+       match walked with
+       | Left e => io_pure (Either QualityInputError (List String))
+           (Left QualityInputError (List String) e)
+       | Right files =>
+           match files with
+           | Nil => io_pure (Either QualityInputError (List String))
+               (Left QualityInputError (List String) QualityNoSources)
+           | Cons _ _ => quality_unique_files
+               (dedup_adjacent String prim_string_eq
+                 (quality_sort String prim_string_le files))
+           end
+       end
+
+-- Runtime read failures terminate with a nonzero host status. Missing files,
+-- directories and final-component links are rejected before the read; none is
+-- translated into an empty source or an empty constructor inventory.
+def quality_read_file (path : String) : IO (Either QualityInputError String) :=
+    do let! kind := prim_fs_kind path;
+       match eq_nat kind (S Z) with
+       | False => io_pure (Either QualityInputError String)
+           (Left QualityInputError String (QualityExpectedFile path))
+       | True =>
+           do let! text := prim_fs_read_file path;
+              io_pure (Either QualityInputError String)
+                (Right QualityInputError String text)
+       end
+
+def quality_repo_root : IO (Either QualityInputError String) :=
+    do let! env := prim_env_get "OURO_ROOT";
+       let path : String := match env with | Just value => value | Nothing => "." end in
+       do let! kind := prim_fs_kind path;
+          match eq_nat kind 2 with
+          | False => io_pure (Either QualityInputError String)
+              (Left QualityInputError String (QualityInvalidInput (prim_string_concat "repository root is not a directory: " path)))
+          | True =>
+              do let! resolved := prim_fs_realpath path;
+                 io_pure (Either QualityInputError String) (match prim_string_length resolved with
+                   | Z => Left QualityInputError String (QualityInvalidInput (prim_string_concat "cannot resolve repository root: " path))
+                   | S _ => Right QualityInputError String (quality_normalize_path resolved)
+                   end)
+          end
+
+def quality_print_lines : List String -> IO Unit :=
+  fix go (xs : List String) : IO Unit :=
+    match xs with
+    | Nil => io_pure Unit MkUnit
+    | Cons line rest =>
+        do println line;
+           go rest
+    end;

@@ -101,24 +101,29 @@ def source_skip_line : List Nat -> List Nat :=
         end
     end;
 
-def source_skip_string : List Nat -> List Nat :=
-  fix source_skip_string (xs : List Nat) : List Nat :=
+def source_skip_string_pos : List Nat -> Nat -> Pair (List Nat) Nat :=
+  fix go (xs : List Nat) (pos : Nat) : Pair (List Nat) Nat :=
     match xs with
-    | Nil => Nil Nat
-    | Cons c rest =>
-        match eqNat c source_ch_double_quote with
-        | True => rest
+    | Nil => MkPair (List Nat) Nat (Nil Nat) pos
+    | Cons byte rest =>
+        match eqNat byte source_ch_double_quote with
+        | True => MkPair (List Nat) Nat rest (S pos)
         | False =>
-            match eqNat c source_ch_backslash with
+            match eqNat byte source_ch_backslash with
             | True =>
                 match rest with
-                | Nil => Nil Nat
-                | Cons _ rest2 => source_skip_string rest2
+                | Nil => MkPair (List Nat) Nat (Nil Nat) (S pos)
+                | Cons _ rest2 => go rest2 (S (S pos))
                 end
-            | False => source_skip_string rest
+            | False => go rest (S pos)
             end
         end
     end;
+
+def source_skip_string (xs : List Nat) : List Nat :=
+  match source_skip_string_pos xs Z with
+  | MkPair rest _ => rest
+  end;
 
 def source_is_comment (src : List Nat) : Bool :=
   match src with
@@ -134,16 +139,27 @@ def source_is_comment (src : List Nat) : Bool :=
       end
   end;
 
-def source_prefix_until (src : List Nat) (tail : List Nat) : List Nat :=
-  (fix go (xs : List Nat) : List Nat :=
-    match xs with
-    | Nil => Nil Nat
-    | Cons x xs' =>
-        match source_bytes_equal xs tail with
-        | True => Nil Nat
-        | False => Cons Nat x (go xs')
+def source_word_at (w : List Nat) (src : List Nat) : Bool :=
+  andb (source_starts w src) (source_word_end (source_drop_prefix w src));
+
+def source_skip_ws (src : List Nat) : List Nat :=
+  (fix go (fuel : Nat) (xs : List Nat) : List Nat :=
+    match fuel with
+    | Z => xs
+    | S fuel2 =>
+        match xs with
+        | Nil => Nil Nat
+        | Cons c rest =>
+            match source_is_ws c with
+            | True => go fuel2 rest
+            | False =>
+                match source_is_comment xs with
+                | True => go fuel2 (source_skip_line rest)
+                | False => xs
+                end
+            end
         end
-    end) src;
+    end) (length Nat src) src;
 
 def source_take_ident (src : List Nat) : Pair (List Nat) (List Nat) :=
   (fix go (xs : List Nat) (acc : List Nat) : Pair (List Nat) (List Nat) :=
@@ -182,25 +198,6 @@ def source_skip_line_pos : List Nat -> Nat -> Pair (List Nat) Nat :=
         end
     end;
 
-def source_skip_string_pos : List Nat -> Nat -> Pair (List Nat) Nat :=
-  fix go (xs : List Nat) (pos : Nat) : Pair (List Nat) Nat :=
-    match xs with
-    | Nil => MkPair (List Nat) Nat (Nil Nat) pos
-    | Cons byte rest =>
-        match eqNat byte source_ch_double_quote with
-        | True => MkPair (List Nat) Nat rest (S pos)
-        | False =>
-            match eqNat byte source_ch_backslash with
-            | True =>
-                match rest with
-                | Nil => MkPair (List Nat) Nat (Nil Nat) (S pos)
-                | Cons _ rest2 => go rest2 (S (S pos))
-                end
-            | False => go rest (S pos)
-            end
-        end
-    end;
-
 def source_emit_reversed (initial : List Nat) (input : List Nat) : List Nat :=
   (fix source_emit_reversed (xs : List Nat) (acc : List Nat) : List Nat :=
     match xs with
@@ -215,25 +212,60 @@ def name_in (n : List Nat) : List (List Nat) -> Bool :=
     | Cons y ys => orb (source_bytes_equal n y) (name_in ys)
     end;
 
-def source_copy_comment_or_string (acc : List Nat) (src : List Nat)
+-- Emit onto a shared reversed accumulator in one walk. Do not allocate a
+-- prefix list or compare the remaining file against the tail at each byte.
+def source_emit_until_lf (initial : List Nat) (input : List Nat)
+    : Pair (List Nat) (List Nat) :=
+  (fix go (xs : List Nat) (acc : List Nat) : Pair (List Nat) (List Nat) :=
+    match xs with
+    | Nil => MkPair (List Nat) (List Nat) acc (Nil Nat)
+    | Cons c rest =>
+        match eqNat c source_ch_lf with
+        | True => MkPair (List Nat) (List Nat) acc xs
+        | False => go rest (Cons Nat c acc)
+        end
+    end) input initial;
+
+def source_emit_quoted_body (initial : List Nat) (input : List Nat)
+    : Pair (List Nat) (List Nat) :=
+  (fix go (xs : List Nat) (acc : List Nat) : Pair (List Nat) (List Nat) :=
+    match xs with
+    | Nil => MkPair (List Nat) (List Nat) acc (Nil Nat)
+    | Cons c rest =>
+        match eqNat c source_ch_double_quote with
+        | True => MkPair (List Nat) (List Nat) (Cons Nat c acc) rest
+        | False =>
+            match eqNat c source_ch_backslash with
+            | True =>
+                match rest with
+                | Nil => MkPair (List Nat) (List Nat) (Cons Nat c acc) (Nil Nat)
+                | Cons e rest2 => go rest2 (Cons Nat e (Cons Nat c acc))
+                end
+            | False => go rest (Cons Nat c acc)
+            end
+        end
+    end) input initial;
+
+def source_copy_quoted (acc : List Nat) (src : List Nat)
     : Maybe (Pair (List Nat) (List Nat)) :=
   match src with
   | Nil => Nothing (Pair (List Nat) (List Nat))
   | Cons c rest =>
-      match source_is_comment src with
+      match eqNat c source_ch_double_quote with
+      | False => Nothing (Pair (List Nat) (List Nat))
       | True =>
-          let tail : List Nat := source_skip_line rest in
           Just (Pair (List Nat) (List Nat))
-            (MkPair (List Nat) (List Nat)
-              (source_emit_reversed acc (source_prefix_until src tail)) tail)
-      | False =>
-          match eqNat c source_ch_double_quote with
-          | True =>
-              let tail : List Nat := source_skip_string rest in
-              Just (Pair (List Nat) (List Nat))
-                (MkPair (List Nat) (List Nat)
-                  (source_emit_reversed acc (source_prefix_until src tail)) tail)
-          | False => Nothing (Pair (List Nat) (List Nat))
-          end
+            (source_emit_quoted_body (Cons Nat c acc) rest)
+      end
+  end;
+
+def source_copy_comment_or_string (acc : List Nat) (src : List Nat)
+    : Maybe (Pair (List Nat) (List Nat)) :=
+  match src with
+  | Nil => Nothing (Pair (List Nat) (List Nat))
+  | Cons _ _ =>
+      match source_is_comment src with
+      | True => Just (Pair (List Nat) (List Nat)) (source_emit_until_lf acc src)
+      | False => source_copy_quoted acc src
       end
   end;

@@ -15,6 +15,15 @@ class TextCase:
     source: str
     expected: str
     dependencies: tuple[tuple[str, str], ...] = ()
+    applied: str | None = None
+
+    @property
+    def automatic(self):
+        if self.applied is not None:
+            return self.applied
+        if self.tool == "fmt" or self.name in {"fix-duplicate-import", "fix-separator", "fix-legacy-bind"}:
+            return self.expected
+        return self.source
 
 
 def cases(seed):
@@ -74,7 +83,7 @@ def echo{seed} : IO Unit :=
     before = f"def {name} (p : Pair Nat Nat) : Nat := match p with | MkPair a b => a end;"
     yield fix("fix-pattern-binder", before, before.replace("MkPair a b", "MkPair a _b"))
     yield fix("fix-dead-let", f"def {name} (x : Nat) : Nat := let unused : Nat := add x x in let kept : Nat := x in kept;",
-              f"def {name} (x : Nat) : Nat := let kept : Nat := x in kept;")
+              f"def {name} (x : Nat) : Nat := let _unused : Nat := add x x in let kept : Nat := x in kept;")
     yield fix("fix-unused-bind", f"def {name} (x : Nat) : IO Nat := do let! r := io_pure Nat x; let! s := io_pure Nat x; io_pure Nat s;",
               f"def {name} (x : Nat) : IO Nat := do io_pure Nat x; let! s := io_pure Nat x; io_pure Nat s;")
     for label, expression in (("effect-let", "perform Tick"), ("hole-let", "?todo")):
@@ -171,7 +180,8 @@ def syntax_cases(seed):
     yield from selected
     yield TextCase("combined", "fix", "".join(case.source for case in selected),
                    "".join(case.expected for case in selected),
-                   tuple(dict(dependency for case in selected for dependency in case.dependencies).items()))
+                   tuple(dict(dependency for case in selected for dependency in case.dependencies).items()),
+                   "".join(case.automatic for case in selected))
 
 
 def run_checks(run, directory, saved=None):
@@ -199,6 +209,20 @@ def run_checks(run, directory, saved=None):
         run.summary.cases += 1
         run.count("features", prop)
         try:
+            if case.tool == "fix":
+                # These are incomplete editor fragments, not compiler-accepted
+                # programs. The native selftest owns byte rewrites/idempotence;
+                # syntax_quality_suite exercises checked CLI publication.
+                (work / "input.in").write_text(case.source, encoding="utf-8", newline="")
+                (work / "input.golden").write_text(case.expected, encoding="utf-8", newline="")
+                actual = run.command([*command, "--selftest", "--fixtures=" + str(work),
+                                      "--out=" + str(work / "results")], work, prop)
+                run.require(actual.ok and "FIX_OK input" in actual.stdout and
+                            "FIX_SUITE: PASS rows=1" in actual.stdout,
+                            prop, case.expected, run.output(actual))
+                run.require(path.read_text(encoding="utf-8") == case.source,
+                            prop + "-preserved", case.source, path.read_text(encoding="utf-8"))
+                continue
             actual = run.command([*command, path], work, prop)
             run.require(actual.ok and actual.stdout == case.expected, prop, case.expected, run.output(actual))
             checked = run.command([*command, "--check", path], work, prop + "-check")

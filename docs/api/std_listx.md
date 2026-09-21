@@ -2,7 +2,7 @@
 
 Extra list algorithms stay outside prelude to keep bootstrap cones small.
 
-Declarations: 42.
+Declarations: 34.
 
 ## def concat_map
 
@@ -84,12 +84,6 @@ def lookup (A : Type) (B : Type) (eq : A -> A -> Bool) (k : A) : List (Pair A B)
 def span (A : Type) (p : A -> Bool) : List A -> Pair (List A) (List A)
 ```
 
-## def break_list
-
-```
-def break_list (A : Type) (p : A -> Bool) : List A -> Pair (List A) (List A)
-```
-
 ## def take_while
 
 ```
@@ -120,18 +114,6 @@ def replicate (A : Type) (x : A) : Nat -> List A
 def count_if (A : Type) (p : A -> Bool) : List A -> Nat
 ```
 
-## def partition
-
-```
-def partition (A : Type) (p : A -> Bool) : List A -> Pair (List A) (List A)
-```
-
-## def unzip
-
-```
-def unzip (A : Type) (B : Type) : List (Pair A B) -> Pair (List A) (List B)
-```
-
 ## def nub
 
 ```
@@ -150,46 +132,16 @@ def insert_sorted (A : Type) (le : A -> A -> Bool) (x : A) : List A -> List A
 def sort_insert (A : Type) (le : A -> A -> Bool) : List A -> List A
 ```
 
-## def sort_nat
-
-```
-def sort_nat (xs : List Nat) : List Nat
-```
-
-## def inits
-
-```
-def inits (A : Type) : List A -> List (List A)
-```
-
-## def tails
-
-```
-def tails (A : Type) : List A -> List (List A)
-```
-
 ## def is_prefix
 
 ```
 def is_prefix (A : Type) (eq : A -> A -> Bool) : List A -> List A -> Bool
 ```
 
-## def is_suffix
-
-```
-def is_suffix (A : Type) (eq : A -> A -> Bool) (suf : List A) (xs : List A) : Bool
-```
-
 ## def index_of
 
 ```
 def index_of (A : Type) (eq : A -> A -> Bool) (x : A)
-```
-
-## def update_nth
-
-```
-def update_nth (A : Type) (n : Nat) (x : A) : List A -> List A
 ```
 
 ## def zip_with

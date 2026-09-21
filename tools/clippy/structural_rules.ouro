@@ -1,0 +1,126 @@
+-- Rule decisions consume an already-built unit. No source scan, lexer,
+-- resolver, or AST traversal is performed per rule.
+
+import "structural_frontend.ouro";
+import "../../std/string_prims.ouro";
+import "../../compiler/pipeline_abi.ouro";
+
+inductive CgSProof : Type :=
+  | MkCgSProof : String -> String -> Nat -> String -> CgSProof;
+
+def cg_s_rule (fact : CgSFact) : Maybe String :=
+    match fact with
+    | CgSLet _ _ _ _ annotated returned => match andb (notb annotated) returned with
+      | True => Just String "OURO-CLIPPY-REDUNDANT-001"
+      | False => Nothing String
+      end
+    | CgSMatch _ _ _ _ atom certified => match certified with
+      | False => Nothing String
+      | True => match atom with
+        | Nothing => Nothing String
+        | Just _ => Just String "OURO-CLIPPY-REDUNDANT-004"
+        end
+      end
+    end;
+
+def cg_s_owner (fact : CgSFact) : Nat :=
+    match fact with
+    | CgSLet owner _ _ _ _ _ => owner
+    | CgSMatch owner _ _ _ _ _ => owner
+    end;
+
+def cg_s_node (fact : CgSFact) : Nat :=
+    match fact with
+    | CgSLet _ node _ _ _ _ => node
+    | CgSMatch _ node _ _ _ _ => node
+    end;
+
+def cg_s_names (intern : InternState) : List (Pair Nat String) :=
+    match intern with
+    | MkIntern ids _ _ _ =>
+        map (Pair (List Nat) Nat) (Pair Nat String)
+          (fun (p : Pair (List Nat) Nat) => match p with
+            | MkPair bytes id => MkPair Nat String id (prim_string_of_char_codes bytes)
+            end) ids
+    end;
+
+def cg_s_name (names : List (Pair Nat String)) (id : Nat) : Either QualityInputError String :=
+    match lookup Nat String eq_nat id names with
+    | Nothing => Left QualityInputError String (QualityInvalidInput (prim_string_concat
+        "missing compiler-interned name in structural evidence: " (prim_string_of_nat id)))
+    | Just name => Right QualityInputError String name
+    end;
+
+def cg_s_atom_text (names : List (Pair Nat String)) (atom : CgSAtom) : Either QualityInputError String :=
+    match atom with
+    | CgSLocal name identity => match cg_s_name names name with
+      | Left error => Left QualityInputError String error
+      | Right text => Right QualityInputError String (prim_string_concat "local `"
+          (prim_string_concat text
+            (prim_string_concat "` (lexical binder #"
+              (prim_string_concat (prim_string_of_nat identity) ")"))))
+      end
+    | CgSNat n => Right QualityInputError String (prim_string_concat "Nat literal " (prim_string_of_nat n))
+    | CgSString id => Right QualityInputError String (prim_string_concat "decoded string literal #"
+        (prim_string_concat (prim_string_of_nat id)
+          " (exact bytes, within this compiler unit)"))
+    | CgSConstructor enum_id ctor => match cg_s_name names enum_id with
+      | Left error => Left QualityInputError String error
+      | Right type_name => match cg_s_name names ctor with
+        | Left error => Left QualityInputError String error
+        | Right ctor_name => Right QualityInputError String
+            (prim_string_concat "constructor `"
+              (prim_string_concat ctor_name
+                (prim_string_concat "` of `" (prim_string_concat type_name "`"))))
+        end
+      end
+    end;
+
+def cg_s_evidence (names : List (Pair Nat String)) (fact : CgSFact) : Either QualityInputError String :=
+    match fact with
+    | CgSLet _ _ name identity _ _ => match cg_s_name names name with
+      | Left error => Left QualityInputError String error
+      | Right text => Right QualityInputError String (prim_string_concat "unannotated local `"
+          (prim_string_concat text
+            (prim_string_concat "` is immediately returned through its own lexical binder #"
+              (prim_string_concat (prim_string_of_nat identity)
+                "; the initializer is not evaluated again and no intervening expression exists"))))
+      end
+    | CgSMatch _ _ enum_id count atom _ => match cg_s_name names enum_id with
+      | Left error => Left QualityInputError String error
+      | Right type_name => match atom with
+        | Nothing => Left QualityInputError String (QualityInvalidInput "uniform-match evidence has no proven expression")
+        | Just value => match cg_s_atom_text names value with
+          | Left error => Left QualityInputError String error
+          | Right text => Right QualityInputError String
+              (prim_string_concat "all " (prim_string_concat (prim_string_of_nat count)
+                (prim_string_concat " distinct arms of closed local enum `"
+                  (prim_string_concat type_name
+                    (prim_string_concat "` return the same "
+                      (prim_string_concat text
+                        "; the constructor inventory is complete, the scrutinee is a value, and no arm evaluates a call"))))))
+          end
+        end
+      end
+    end;
+
+def cg_s_proofs (unit : CgSUnit) : Either QualityInputError (List CgSProof) :=
+    match unit with
+    | MkCgSUnit intern _ state =>
+        let names : List (Pair Nat String) := cg_s_names intern in
+        (fix go (facts : List CgSFact) (rev : List CgSProof) : Either QualityInputError (List CgSProof) :=
+          match facts with
+          | Nil => Right QualityInputError (List CgSProof) (reverse_lin CgSProof rev)
+          | Cons fact rest => match cg_s_rule fact with
+            | Nothing => go rest rev
+            | Just code => match cg_s_name names (cg_s_owner fact) with
+              | Left error => Left QualityInputError (List CgSProof) error
+              | Right owner => match cg_s_evidence names fact with
+                | Left error => Left QualityInputError (List CgSProof) error
+                | Right evidence => go rest (Cons CgSProof
+                    (MkCgSProof code owner (cg_s_node fact) evidence) rev)
+                end
+              end
+            end
+          end) (cg_s_facts state) (Nil CgSProof)
+    end;

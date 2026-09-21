@@ -8,11 +8,12 @@ import "host_bound.ouro";
 import "report.ouro";
 import "../../std/args.ouro";
 import "../../std/fs.ouro";
-import "../../std/format.ouro";
+import "../../std/fsx.ouro";
 import "../../std/io.ouro";
-import "../../std/jsonx.ouro";
-import "../../std/pathx.ouro";
+import "../../std/json_types.ouro";
+import "../../std/processx.ouro";
 import "../../std/text.ouro";
+import "../quality/json_surface.ouro";
 
 
 def ci_gate_switches : List String :=
@@ -71,7 +72,7 @@ def time_now_nat_or_zero : IO Nat :=
 
 
 def default_ci_out (profile : String) : String :=
-    path_join (["_build", "ouro_ci", profile] : List String);
+    prim_string_concat "_build/ouro_ci/" profile;
 
 
 def gate_log_path (out : String) (gate : CiGate) : String :=
@@ -93,6 +94,22 @@ def ci_root_check (root : String) : IO Unit :=
 
 def write_ci_result_report (profile : String) (result : CiResult) : IO Unit :=
     repo_write (ci_result_gate_report result) (ci_result_report_string profile result)
+
+
+-- Invalidate public results before starting children. A failed or interrupted
+-- run cannot lend a previous success report to a consumer. Never remove a
+-- directory supplied in place of a report file.
+def ci_forget_report (path : String) : IO Unit :=
+    do let! directory := fs_is_dir path;
+       match directory with
+       | True => do eprintln (str_concat "CI report is a directory: " path); exit 1
+       | False =>
+           do let! removed := fsx_remove_if_exists path;
+              match removed with
+              | Left error => do eprintln (fs_error_message error); exit 1
+              | Right _ => io_unit
+              end
+       end
 
 
 def ci_print_unless_quiet (quiet : Bool) (line : String) : IO Unit :=
@@ -127,7 +144,7 @@ def unavailable_result (profile : String) (root : String) (out : String) (gate :
 def process_log (root : String) (out : String) (gate : CiGate) (r : ProcResult) : String :=
     str_unlines
       ([ str_concat "command=" (ci_gate_command_text root out gate)
-      , str_concat "returncode=" (show_nat (proc_code r))
+      , str_concat "returncode=" (prim_string_of_nat (proc_code r))
       , "stdout:"
       , proc_stdout r
       , "stderr:"
@@ -139,10 +156,10 @@ def process_failure_issues (r : ProcResult) : List String :=
     match proc_ok r with
     | True => Nil String
     | False =>
-        match str_eq (show_nat (proc_code r)) "127" with
+        match str_eq (prim_string_of_nat (proc_code r)) "127" with
         | True =>
             [ "command unavailable, could not start, or returned reserved status 127" ]
-        | False => [ str_concat "command exited " (show_nat (proc_code r)) ]
+        | False => [ str_concat "command exited " (prim_string_of_nat (proc_code r)) ]
         end
     end;
 
@@ -156,7 +173,7 @@ def run_process_gate (profile : String) (root : String) (out : String) (gate : C
        ci_print_unless_quiet quiet
          (str_cat4 "CI_GATE_START " (ci_gate_name gate) " cmd="
            (ci_gate_command_text root out gate));
-       let! r := proc_exec (ci_gate_program gate) args;
+       let! r := process_run_spec (command_spec (ci_gate_program gate) args);
        let! finish := time_now_nat_or_zero;
        let elapsed : Nat := sub finish start in
        let status : String := match proc_ok r with | True => "pass" | False => "fail" end in
@@ -260,19 +277,19 @@ def host_bound_result (passed : Bool) (code : Nat) (log_path : String)
 
 
 def json_string_field_eq (doc : Json) (key : String) (want : String) : Bool :=
-    match jsonx_get_string doc key with
+    match gate_jsonx_get_string doc key with
     | Nothing => False
     | Just got => str_eq got want
     end;
 
 def host_bound_validation_report_text_ok (text : String) : Bool :=
-    match parse_json text with
+    match gate_parse_json text with
     | Nothing => False
     | Just doc =>
-      match jsonx_get_bool doc "pass" with
+      match gate_jsonx_get_bool doc "pass" with
       | Nothing => False
       | Just passed =>
-        match jsonx_get_array doc "gates" with
+        match gate_jsonx_get_array doc "gates" with
         | Nothing => False
         | Just gates =>
           andb passed
@@ -339,7 +356,10 @@ def run_host_bound_profile (profile : String) (root : String) (out : String) : I
     let validation_report : String := fs_child validation_out "repo-gate.json" in
     do ci_root_check root;
        repo_mkdir out;
-       let! checked := proc_exec "sh" (host_bound_validation_argv root validation_out);
+       io_foreach String ci_forget_report
+         ([ fs_child out "ci-summary.json", report_path,
+            fs_child out "host-bound-report.json", validation_report ] : List String);
+       let! checked := process_run_spec (command_spec "sh" (host_bound_validation_argv root validation_out));
        let! report_ok := host_bound_validation_report_ok validation_report;
        finish_host_bound_profile profile out report_path validation_report
          (proc_ok checked) report_ok (proc_code checked)
@@ -376,6 +396,9 @@ def run_ci_gate_cli (a : Args) : IO Unit :=
             | False =>
                 do ci_root_check root;
                    repo_mkdir out;
+                   ci_forget_report (fs_child out "ci-summary.json");
+                   io_foreach CiGate
+                     (fun (gate : CiGate) => ci_forget_report (gate_json_path out gate)) selected;
                    let! results := run_ci_gates profile root out
                      (args_flag a "fail-fast") (args_flag a "quiet")
                      (args_flag a "echo-output") selected;

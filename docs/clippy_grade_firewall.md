@@ -8,217 +8,266 @@
 
 # Clippy-grade deny firewall
 
-The Clippy-grade firewall is a deterministic, source-level quality gate for Ouro code. It is intentionally conservative: it catches bad-code shapes that are visible without full type inference and leaves lower-confidence semantic questions to the existing analyzer suite.
+Semantic proofs in this page are the `semantic` family of `ouro1 lint`.
+They use the compiler lexer/parser, canonical import resolver and a
+read-only declaration index. Language and proven style stay in the other
+lint families. `analyze` retains repository-graph and heavy structured
+cores. The Python command is an adapter for that family plus fixture and
+query flags. The separation is not yet complete: expensive clone analysis
+still lives in this family.
 
 ## Run it
 
 ```sh
+sh scripts/ouro1.sh lint --deny --family semantic --profile project std
 python3 scripts/clippy_grade_firewall.py --profile strict --scope std
-python3 scripts/clippy_grade_firewall.py --profile strict --scope path/to/file.ouro
-python3 scripts/clippy_grade_firewall.py --profile project --warn-only --scope std --scope tools
+python3 scripts/clippy_grade_firewall.py --print-files --scope compiler
 python3 scripts/clippy_grade_firewall.py --list-rules
 python3 scripts/clippy_grade_firewall.py --validate-rules
 python3 scripts/clippy_grade_suite.py
+python3 scripts/clippy_grade_suite.py --precision-only
 ```
 
-`strict` and `release` profiles return nonzero when an unsuppressed `deny` or `fatal` finding is emitted. `project --warn-only` is for migration discovery and CI visibility; it writes JSON/SARIF but does not fail the command.
+The user-facing production command is `ouro1 lint`. The Python adapter still
+builds the native Clippy worker, writes JSON/SARIF, and serves fixture/query
+flags (`--list-rules`, `--validate-rules`, `--print-files`). `strict` and
+`release` reject `--warn-only` and fail on deny/fatal findings.
+`project --warn-only` may report ordinary debt without a failing exit, but cannot
+hide a fatal error, malformed registry, missing rule, or incomplete inventory.
+The existing narrow suppression language remains for compatibility. Routing
+through the unified lint driver adds no production suppressions, baselines,
+or path-based debt exceptions.
 
-## Severity model
+## Semantic boundary
 
-| Level | Meaning |
-| --- | --- |
-| `allow` | Disabled in the selected profile |
-| `info` | Informational report only |
-| `warn` | Human-visible warning; does not block |
-| `deny` | Blocks strict/release gates unless narrowly suppressed |
-| `fatal` | Blocks strict/release gates and is reserved for policy failures such as invalid suppressions |
+`semantic_unit.ouro` reads imported sources for each requested root and shares
+an intern table inside a worker. Its existing harvest cache uses canonical
+relative path, source byte length and content hash; a hit avoids parsing and
+harvesting that dependency again. It resolves the import graph and builds
+`compiler/semantic_scope.ouro` identities. A multi-file worker invocation
+reuses that intern table and cache across at most two roots and
+emits the existing `ouro.clippy-semantic.v2` batch protocol. Hits never skip proofs. `semantic_registry.ouro` associates
+contracts with canonical module/declaration or intrinsic ABI identity. A local
+same-spelled function does not inherit a standard-library contract. Unknown
+calls are effect barriers, not assumed pure. This is not a full compiler type
+check of the analyzed program and does not replace `ouro check`.
 
-The output order is stable: files are sorted by repository path and findings are sorted by path, line, column, and rule id. Reports are written to `_build/quality/clippy-grade-firewall.json` and `_build/quality/clippy-grade-firewall.sarif` by default.
+The worker produces `ouro.clippy-semantic.v2`: exact byte-framed root source,
+complete proof count, rule, owner, node ordinal, and explanation. The reporting
+cone rejects incomplete/noncanonical frames and unknown emitted IDs. A node
+ordinal is **not** an exact editable expression span. Semantic Clippy findings
+remain manual suggestions, not automatic transformations.
 
-## Suppressions
+Each definition is traversed once into shared call/value/binder/flow facts.
+Repeated-work rules compare all argument identities, resolved callee, branch,
+effect epoch, registered purity and relevant cost. Higher-order arguments are
+part of the key. Constant inputs do not establish expensive repeated work.
+Result obligations come only from explicitly registered checked APIs and only
+when an IO action is executed. Aliases preserve producer identity; a match,
+return or escape can discharge observation. Generic Either/Maybe values do not
+acquire a must-observe contract from their type or spelling alone.
 
-Suppress only a specific rule and include a reason. The suppression applies to the comment line and the following line only.
+Failure-to-success diagnostics require a checked failure arm and no intervening
+effect/recovery boundary. Literal error codes and rendering are not success
+constructors. Explicit registered default policies and successful checked retry
+branches invalidate the unrecovered-failure proof. This is conservative local
+reasoning, not path-complete validation or interprocedural error tracking.
 
-```ouro
--- ouro-clippy:disable=OURO-CLIPPY-MAINT-005 reason=protocol constant from wire format
-def protocol_magic : Nat := 1000;
+Clone detection uses bounded compiler hashing, sorted buckets, then full
+structural token comparison. Hash equality alone never proves a clone. Only
+local binders may be alpha-renamed; global identities, literals and constructors
+remain significant. Small, unknown-purity, effectful and registered-boundary
+implementations are excluded. There is no general near-clone or wrapper-removal
+proof, and no automatic public API deletion.
+
+## Active rules
+
+`quality/clippy_grade_rules.json` is authoritative. Retired rules and reasons
+are recorded in `quality/clippy_rule_audit.json`; retirement is not a severity
+downgrade. Name length, `_checked` spelling, function size, parameter counts,
+stdout text, basename/layer guesses and apparent overwrite intent no longer
+produce Clippy diagnostics. Existing lint duplicate-import checks remain.
+
+| Rule | Strict | Evidence |
+| --- | --- | --- |
+| `OURO-CLIPPY-FRONTEND-001` | `fatal` | The compiler frontend or structural fact build did not complete; Clippy cannot publish a successful analysis. |
+| `OURO-CLIPPY-SUPPRESS-001` | `fatal` | Blanket clippy-grade suppressions hide quality debt across unrelated findings. |
+| `OURO-CLIPPY-SUPPRESS-002` | `fatal` | A clippy-grade suppression without a reason is not reviewable. |
+| `OURO-CLIPPY-SUPPRESS-003` | `fatal` | A suppression references a rule id that is not in the clippy-grade inventory. |
+| `OURO-CLIPPY-REDUNDANT-001` | `deny` | An unannotated local is immediately returned through the same lexical binder, with no intervening expression. |
+| `OURO-CLIPPY-REDUNDANT-004` | `deny` | Every distinct arm of a complete closed local enum match returns the same proven value; the scrutinee is a value and the arms contain no calls. |
+| `OURO-CLIPPY-CHECKED-001` | `deny` | User-facing code bypasses checked filesystem reading. |
+| `OURO-CLIPPY-CHECKED-002` | `deny` | User-facing code bypasses checked filesystem writing. |
+| `OURO-CLIPPY-CHECKED-003` | `deny` | User-facing code invokes a process through an unchecked primitive. |
+| `OURO-CLIPPY-CHECKED-006` | `deny` | An executed, registered must-observe checked result has no observation or escape through any alias. |
+| `OURO-CLIPPY-ERROR-001` | `deny` | A known error branch exits or returns success status. |
+| `OURO-CLIPPY-ERROR-003` | `deny` | A failure arm of a registered must-observe checked result returns the resolved success constructor. |
+| `OURO-CLIPPY-MAINT-007` | `deny` | Two nontrivial declarations have identical tokens apart from their own names and trivia, retaining signatures, binders, callees and literal values. |
+| `OURO-CLIPPY-PERF-001` | `deny` | Repeated registered pure conversion, parse or normalization with identical value identities. |
+| `OURO-CLIPPY-PERF-002` | `deny` | Repeated identical registered pure traversal, including callback and all argument identities. |
+| `OURO-CLIPPY-LOGIC-001` | `deny` | Registered reflexive Nat/String equality compares one semantic value with itself. |
+| `OURO-CLIPPY-LOGIC-002` | `deny` | Registered strict Nat ordering compares one semantic value with itself. |
+
+## Fix publication and convergence
+
+`tools/fix/plan.ouro` distinguishes mechanical, review-required, and unsupported
+proposals. Automatic classes are existing syntax repairs and narrow local
+redundancy; literal/provider, binder renaming, unreachable-arm, import-alias,
+list-type and nonrecursive-fix rewrites require review. Unsupported IDs fail.
+Comments/directives in deletion spans prevent automatic application; compound
+same-rule edits cannot be half-applied when one touches trivia.
+
+The planner sorts deterministically, coalesces identical edits, rejects unequal
+overlaps/same-point insertions, and applies one priority class before reparsing.
+Bounded source history rejects cycles and unfinished fixed points. Formatting
+must preserve tokens and must not reopen an automatic rewrite. The public CLI
+checks the original and each candidate class with the compiler worker before a
+final atomic source transaction; preview/check also require verification.
+Review suggestions are printed but not silently applied. `fix --check` remains
+nonzero while review-required proposals remain.
+
+A successful type check alone is not equivalence proof. Full post-fix
+lint/Clippy/analyze severity-delta verification and production-wide canonical
+convergence remain unfinished. Raw `fx_fix` helpers are legacy golden-test
+mechanisms, not publication authority.
+
+## Regression coverage and current limits
+
+The suite retains the original fixture names, uses actual dependency closures,
+turns retired heuristic positives into negative cases, and tests malformed
+registries, strict/release policy, source-root movement, intrinsic identity and
+local shadowing. Native laws additionally cover alias flow, branch/effect
+mutations, edit conflicts, trivia, cycles and second-pass no-ops. Added coverage
+is not a claim that every test passed; see the pass-specific validation report.
+
+The structural `cm_load_file` harvest shares the caller intern table and keeps
+imported function bodies inside the nested parse arena. The selected file
+still keeps its bodies; imports keep signatures only. A content-addressed
+harvest cache reuses those facts across roots inside one worker; the worker
+recycles after a bounded number of roots and drops the cache. A hit never
+skips Clippy proofs. Large compiler and tool cones still need a rebuilt
+structural companion before that harvest is live; do not treat an older
+leftover scan as cleared without that binary.
+The structural companion keeps crash/OOM isolation fail-closed by recycling
+the process. The Python launcher lists the clippy inventory (same
+keep/skip rules as `tools/strict/walk.ouro`) and may split a directory scan
+across `OURO_CLIPPY_JOBS` workers (default 2, maximum 3) with the existing
+3072 MiB `run_limited` cap and a 7200s host timeout; those limits are a safety envelope,
+not a substitute for making the worker faster. `--print-files` prints that
+launcher inventory and exits.
+`build_tool.sh` validates the structural companion's source/compiler/config
+receipt and binary digest even when the parent is current. The legacy
+`OURO_REUSE_EXISTING_COMPANION` environment variable does not bypass those
+checks. A valid installed companion is reused without emission/linking;
+a stale, incomplete or corrupt companion must be rebuilt successfully.
+A failed rebuild is an error, not permission to run an older image.
+
+## Prepare tools together
+
+After bootstrap, repeated `--tool ENTRY OUTPUT` arguments prepare tools in
+one host process using the existing content-addressed builder:
+
+```sh
+python3 scripts/native_tool_build.py --compiler _build/c/ouro1 \
+  --tool tools/lint.ouro _build/c/ouro-lint \
+  --tool tools/clippy/main.ouro _build/c/ouro-clippy-grade-firewall \
+  --batch-report _build/tool-preparation.json
 ```
 
-Blanket, reasonless, and unknown-rule suppressions are themselves strict failures.
+Preparation is sequential; batching does not increase compiler workers or
+reuse diagnostics. Each tool retains full content validation. Identical
+requests are coalesced; conflicting outputs, receipts and companion targets
+are rejected before building. `--check` checks every requested tool without
+building and returns nonzero if any tool or companion is stale. The JSON
+report records per-tool cache results and elapsed preparation time; it is
+not a diagnostic-parity or native throughput benchmark.
 
-## Rule families
+The frontend preparation collector shares import adjacency only within one
+collection call, then releases it. Later calls reread source contents; no
+mtime-only import cache is introduced. Run host preparation contracts with
+`python3 scripts/tool_preparation_suite.py`; these mock emission/linking and
+do not replace native lint, Clippy, formatter, fixer or compiler suites.
 
-### api-naming
+## Experimental session lifetime boundary
 
-| Rule | Strict level | What it catches | Fix direction |
-| --- | --- | --- | --- |
-| `OURO-CLIPPY-NAMING-001` | `deny` | one-letter public name | Use a descriptive public name and reserve short names for local binders. |
-| `OURO-CLIPPY-NAMING-002` | `deny` | checked helper returns raw string | Return a typed error/result and provide render/message helpers. |
-| `OURO-CLIPPY-NAMING-003` | `deny` | error type without renderer | Add `domain_error_message` and/or `domain_error_code` helpers. |
+The internal structural worker accepts `--session SOURCE_ROOT PATH...`.
+It is not enabled in the production lint/grade/analyze launchers. Build the
+worker through `native_tool_build.py`: plain C emission without its required
+lifetime hooks is not a session-enabled tool build. The legacy single-root
+and at-most-two-root v2 batch paths keep their existing dispatch and errors.
 
-### checked-api
+`tools/clippy/session.ouro` evaluates one root to its exact source/proof
+snapshot before moving on. `cg_s_snapshot_request` returns that snapshot and
+only the next intern/import-signature state, not a `ClippySemanticUnit`.
+The C host enters an arena when the IO thunk executes, not when it is
+constructed, and copies its result back through the existing runtime API.
+Parsing, registry validation, dataflow, proofs and typed errors stay in Ouro.
+The host does not implement an alternative analyzer or acceptance path.
 
-| Rule | Strict level | What it catches | Fix direction |
-| --- | --- | --- | --- |
-| `OURO-CLIPPY-CHECKED-001` | `deny` | raw fs read | Use fs_read_checked, fsx_read_text, or another typed FsError-returning wrapper. |
-| `OURO-CLIPPY-CHECKED-002` | `deny` | raw fs write | Use fs_write_checked, fsx_write_text, or a checked overwrite policy wrapper. |
-| `OURO-CLIPPY-CHECKED-003` | `deny` | raw process execution | Use process_run_checked/processx helpers so failures become typed ProcessError values. |
-| `OURO-CLIPPY-CHECKED-004` | `deny` | manual argv parsing | Parse arguments through std/args or std/cli and report missing/bad values. |
-| `OURO-CLIPPY-CHECKED-005` | `deny` | manual csv splitting | Use std/csv or table helpers and surface typed parse errors. |
-| `OURO-CLIPPY-CHECKED-006` | `deny` | ignored checked result | Match or bind the Either/Result/Validation and report or propagate failures. |
-| `OURO-CLIPPY-CHECKED-007` | `deny` | unchecked overwrite | Use checked write options or require an explicit validated overwrite flag. |
+A second IO lifetime surrounds an epoch of at most two roots, using the same
+bound as the legacy batch. It emits completed frames inside that scope and
+returns only completion status. This is intended to discard epoch-owned
+intern deltas, cached signatures, snapshots and temporary graphs before the
+next epoch while retaining the process and immutable compiled infrastructure.
+A malformed oversized epoch fails explicitly. The limit has not been raised
+without measurements, and allocation epochs are not an RSS watermark or an
+OS process-recycling policy.
 
-### cli-workflow
+The source root, compiled frontend and semantic options are fixed for the
+entire invocation. Mutable state is not serialized across processes or reused
+with another source root. Root source and proofs are recomputed on every
+request; dependency contents are still reread and checked against the existing
+cache key. Cache state is dropped between epochs and after a root error.
+Dependency parsing reuse therefore extends only across a compatible epoch,
+not across the whole long-lived process. This does not establish a new
+cross-run cache, dependency snapshot protocol or full semantic-unit reuse.
 
-| Rule | Strict level | What it catches | Fix direction |
-| --- | --- | --- | --- |
-| `OURO-CLIPPY-CLI-001` | `deny` | CLI main without usage path | Add usage text and show it for missing or malformed arguments. |
-| `OURO-CLIPPY-CLI-002` | `deny` | required argument without missing report | Report CliMissing/CliUsage or propagate the typed CliError. |
-| `OURO-CLIPPY-CLI-003` | `deny` | command string concatenation | Pass argv-style command parts to processx/process_run helpers. |
-
-### error-handling
-
-| Rule | Strict level | What it catches | Fix direction |
-| --- | --- | --- | --- |
-| `OURO-CLIPPY-ERROR-001` | `deny` | success exit after error | Return a nonzero exit status after printing or propagating the error. |
-| `OURO-CLIPPY-ERROR-002` | `deny` | error printed to stdout | Print human-readable errors to stderr and reserve stdout for machine output. |
-| `OURO-CLIPPY-ERROR-003` | `deny` | obvious Left success | Use Right for success and Left for typed errors. |
-
-### import
-
-| Rule | Strict level | What it catches | Fix direction |
-| --- | --- | --- | --- |
-| `OURO-CLIPPY-IMPORT-001` | `deny` | duplicate import | Keep a single import and put aliases at the use site. |
-| `OURO-CLIPPY-IMPORT-002` | `deny` | wrong-layer import | Move shared code into std or a production support module. |
-| `OURO-CLIPPY-IMPORT-003` | `deny` | TCB umbrella import | Import only the explicit small modules required by the kernel or checker. |
-| `OURO-CLIPPY-IMPORT-004` | `deny` | private/generated/demo import | Depend on a stable public module or move the dependency behind a generated boundary. |
-
-### logic
-
-| Rule | Strict level | What it catches | Fix direction |
-| --- | --- | --- | --- |
-| `OURO-CLIPPY-LOGIC-001` | `deny` | self equality predicate | Remove the comparison or compare against the intended second value. |
-| `OURO-CLIPPY-LOGIC-002` | `deny` | impossible self comparison | Remove the comparison or fix the bound variable. |
-| `OURO-CLIPPY-LOGIC-003` | `deny` | literal condition | Delete the unreachable branch or replace the literal with the real predicate. |
-| `OURO-CLIPPY-LOGIC-004` | `deny` | double negation | Use the original condition directly. |
-| `OURO-CLIPPY-LOGIC-005` | `deny` | nested boolean match | Use and/or/not helpers or a single match with the meaningful cases. |
-| `OURO-CLIPPY-LOGIC-006` | `deny` | missing error branch | Handle Left/Err/Invalid explicitly and render or propagate the typed error. |
-
-### maintainability
-
-| Rule | Strict level | What it catches | Fix direction |
-| --- | --- | --- | --- |
-| `OURO-CLIPPY-MAINT-001` | `deny` | too many parameters | Group related inputs in a record/config object or split the operation. |
-| `OURO-CLIPPY-MAINT-002` | `deny` | too many local lets | Extract named helper functions or split the workflow into stages. |
-| `OURO-CLIPPY-MAINT-003` | `deny` | deeply nested match | Flatten with small helpers, early returns, or staged validation. |
-| `OURO-CLIPPY-MAINT-004` | `deny` | repeated string literal | Name the string once as a constant or typed error constructor. |
-| `OURO-CLIPPY-MAINT-005` | `deny` | magic large Nat literal | Move it to a named constant with a domain-specific name. |
-| `OURO-CLIPPY-MAINT-006` | `deny` | duplicated local helper name | Promote the helper or give each local helper a precise distinct role. |
-| `OURO-CLIPPY-MAINT-007` | `deny` | near-duplicate function body | Extract the shared logic or justify why the variants must stay separate. Single-constructor field projections are not near-duplicates. |
-| `OURO-CLIPPY-MAINT-008` | `deny` | large definition span | Split the function into smaller checked stages. |
-
-### redundant
-
-| Rule | Strict level | What it catches | Fix direction |
-| --- | --- | --- | --- |
-| `OURO-CLIPPY-REDUNDANT-001` | `deny` | pointless let binding | Inline the expression or give the binding a name that is used later. |
-| `OURO-CLIPPY-REDUNDANT-002` | `deny` | manual bool identity match | Return the original Bool expression directly. |
-| `OURO-CLIPPY-REDUNDANT-003` | `deny` | manual bool negation match | Use the bool negation helper or a direct if-not form. |
-| `OURO-CLIPPY-REDUNDANT-004` | `deny` | same branch expression | Remove the conditional or make the distinct branch behavior explicit. A `match` is flagged only when every sibling arm of that `match` computes the same expression, including nested matches. |
-| `OURO-CLIPPY-REDUNDANT-005` | `deny` | empty append/concat no-op | Return the non-empty operand directly. |
-| `OURO-CLIPPY-REDUNDANT-006` | `deny` | identity collection transform | Remove the transform or replace it with the intended predicate/function. |
-| `OURO-CLIPPY-REDUNDANT-007` | `deny` | discarded pure result | Remove the expression or use its result. |
-
-### suppression
-
-| Rule | Strict level | What it catches | Fix direction |
-| --- | --- | --- | --- |
-| `OURO-CLIPPY-SUPPRESS-001` | `fatal` | blanket suppression | Suppress one rule id on one line and include a concrete reason. |
-| `OURO-CLIPPY-SUPPRESS-002` | `fatal` | reasonless suppression | Add reason=<why this exact finding is intentional> or remove the suppression. |
-| `OURO-CLIPPY-SUPPRESS-003` | `fatal` | unknown suppression rule | Use a registered rule id from --list-rules or delete the stale suppression. |
-
-## Examples
-
-### Redundant code
-
-Bad:
-
-```ouro
-def same (y : Nat) : Nat := let x := y in x;
-```
-
-Diagnostic:
+The `ouro.clippy-session.v1` wire format is separate from the legacy v2 batch:
 
 ```text
-OURO-CLIPPY-REDUNDANT-001 deny: pointless let binding
+ouro.clippy-session.v1
+REQUEST_COUNT
+root
+ZERO_BASED_REQUEST_ID
+PATH_BYTE_LENGTH
+EXACT_REQUESTED_PATH_BYTES followed by LF
+one complete ouro.clippy-semantic.v2 ok/error frame
+... remaining requests in input order ...
+done
+COMPLETED_COUNT
+ok or error
 ```
 
-Fixed:
+Paths preserve the requested spelling; `SOURCE_ROOT` supplies their common
+context and the loader still owns canonicalization. Repeated paths receive
+different request IDs. A handled root error emits its frame, clears reusable
+state and continues with the remaining requests. Failure is sticky: any error
+requires the final `error` status and exit 1. An all-success session exits 0.
+A crash, unexpected stderr, missing trailer, duplicate ID, wrong count,
+identity mismatch or trailing output is not a clean session. Completed frames
+may be retained for inspection, but no production retry/partial-report path
+is implemented by this experiment.
 
-```ouro
-def same (y : Nat) : Nat := y;
-```
+`tests/clippy_semantic/session_protocol.py --selftest` checks synthetic
+transport boundaries without Ouro. The lint suite also builds the native
+scheduling laws and captures six roots, including shared imports, duplicate
+paths and a parse failure, in ten sessions under the existing 3072 MiB tree
+limit. It compares every source/proof/error frame byte-for-byte against legacy
+single-root responses and writes `ouro.clippy-session-parity.v1` JSON. The
+observer redirects bytes before the host limiter's text normalization; it
+does not parse Ouro or approve findings. This is snapshot transport parity,
+not complete reporter fields, fix applicability or analyzer-report parity.
 
-### Checked API discipline
+`tests/clippy_semantic/session_scope.c` is a standalone real-runtime fixture
+for deferred IO, surviving closures/errors, ancestor identity sharing and
+100 nested epoch resets. Its allocation workload is synthetic, not a native
+Clippy RSS or throughput benchmark. Native compilation and execution are
+required before any memory-bound claim. Source/protocol tests alone do not
+establish that the experiment is production-ready.
 
-Bad:
-
-```ouro
-def load (p : String) : String := fs_read p;
-```
-
-Diagnostic:
-
-```text
-OURO-CLIPPY-CHECKED-001 deny: raw fs read
-```
-
-Fixed:
-
-```ouro
-def load (p : String) : Either FsError String :=
-  match fs_read_checked p with
-  | Left e => Left FsError String e
-  | Right text => Right FsError String text
-  end;
-```
-
-### CLI workflow
-
-Bad:
-
-```ouro
-def main (args : Args) : Either CliError String := cli_required args "path";
-```
-
-Diagnostic:
-
-```text
-OURO-CLIPPY-CLI-002 deny: required argument without missing report
-```
-
-Fixed:
-
-```ouro
-def main (args : Args) : Either CliError String :=
-  match cli_required args "path" with
-  | Left e => Left CliError String (CliUsage (cli_error_message e))
-  | Right p => Right CliError String p
-  end;
-```
-
-## False-positive policy
-
-A rule should become strict only when it is deterministic, low-noise, and has a clear fix. Low-level wrapper modules are exempted for checked-API primitive usage because those modules implement the safe surface. Production project discovery currently runs as `project --warn-only` from `scripts/lint_suite.sh`; fixture denial is blocking, so rule regressions fail CI without immediately converting every existing production finding into release debt.
-
-## Limitations
-
-This firewall is syntactic. It does not prove type soundness, effect safety, semantic equivalence, or full dataflow. It complements `ouro lint`, `ouro analyze`, `scripts/strict_quality_firewall.py`, and the existing architecture/dead-code/duplication/API analyzers.
-
-<p align="center">
-  <img
-    width="100%"
-    src="https://capsule-render.vercel.app/api?type=waving&amp;height=220&amp;color=0:0B1220,50:1E1B4B,100:4F46E5&amp;section=footer"
-    alt=""
-  />
-</p>
+Production integration, measured process/frontend/parse/registry counters,
+long-run RSS and safe process recycling, dependency-change tests inside a
+running session, registry reuse beyond the existing constant infrastructure,
+full diagnostic/analyzer/fix parity and the mandatory native suites remain
+rollout requirements. No repo-wide speedup or single-file latency claim is
+made for this experimental path.

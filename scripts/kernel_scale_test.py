@@ -58,11 +58,11 @@ class KernelScaleTest(unittest.TestCase):
         executable.write_bytes(b'physical probe fixture')
         sources = scale.expected_sources(entry)
         inputs = {'kind': scale.native_tool_build.KIND, 'entry': entry, 'sources': sources,
-                  'compiler_sha256': scale.sha(self.compiler), 'fuel': 16000,
+                  'compiler_sha256': scale.sha256_path(self.compiler), 'fuel': 16000,
                   'cflags': ['-O0', '-std=c99', '-D_POSIX_C_SOURCE=200809L',
                              '-fdebug-prefix-map=.=/ouro', '-fmacro-prefix-map=.=/ouro']}
         receipt = {'kind': scale.native_tool_build.KIND, 'inputs': inputs, 'cache': 'miss',
-                   'key': scale.hash_json(inputs), 'binary_sha256': scale.sha(executable)}
+                   'key': scale.hash_json(inputs), 'binary_sha256': scale.sha256_path(executable)}
         receipt_path = Path(str(executable) + '.build.json')
         receipt_path.write_text(json.dumps(receipt), encoding='utf-8')
         state = scale.input_state(entry, self.compiler)
@@ -72,11 +72,11 @@ class KernelScaleTest(unittest.TestCase):
                   'entry': entry, 'compiler': scale.relative(self.compiler), 'run_directory': scale.relative(directory),
                   'workers': 1, 'memory_limit_mib': scale.MEMORY_MIB, 'work_limit': scale.WORK_LIMIT,
                   'scale_budget_s': scale.SCALE_BUDGET, 'cpu_affinity': [0],
-                  'producer_sha256': scale.sha(self.compiler), 'sources': sources,
+                  'producer_sha256': scale.sha256_path(self.compiler), 'sources': sources,
                   'inputs_before': state, 'inputs_after': state, 'inputs_unchanged': True,
                   'check': self.process(command, 'CHECK_OK\n', scale.CHECK_TIMEOUT),
                   'build': {'executable': scale.relative(executable), 'receipt': receipt,
-                            'receipt_sha256': scale.sha(receipt_path),
+                            'receipt_sha256': scale.sha256_path(receipt_path),
                             'process': self.process(build_command, 'BUILD_TOOL: OK fixture\n', scale.BUILD_TIMEOUT)},
                   'rows': [], 'constant_inventory': None, 'pass': True}
         for name, depth in scale.expected_cases(profile):
@@ -232,7 +232,7 @@ class KernelScaleTest(unittest.TestCase):
             receipt['key'] = scale.hash_json(receipt['inputs'])
             path = Path(str(scale.resolve(report['build']['executable'])) + '.build.json')
             path.write_text(json.dumps(receipt), encoding='utf-8')
-            report['build']['receipt_sha256'] = scale.sha(path)
+            report['build']['receipt_sha256'] = scale.sha256_path(path)
             self.assertFalse(self.evidence(report, 'scale')['pass'])
 
     def test_missing_producer_runs_no_child(self):

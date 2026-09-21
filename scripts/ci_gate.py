@@ -139,6 +139,7 @@ KERNEL_PATHS = {
     "scripts/kernel_profile.py",
     "scripts/kernel_profile_test.py",
     "scripts/kernel_scale.py",
+    "scripts/kernel_scale_test.py",
     "scripts/test_suite.sh",
     "tools/test/suites.ouro",
     "tools/repo_gate/compiler_boundary.ouro",
@@ -423,6 +424,7 @@ def select_group(all_gates: Sequence[Gate], profile: str, group: str) -> list[Ga
 
 def run_self_tests(all_gates: Sequence[Gate]) -> int:
     failures: list[str] = []
+    failures.extend(summary_contract_failures())
     for profile, groups in PROFILE_GROUPS.items():
         try:
             validate_groups(all_gates, profile, groups)
@@ -498,6 +500,70 @@ def run_self_tests(all_gates: Sequence[Gate]) -> int:
         f"nightly_gates={sum(len(names) for names in NIGHTLY_GROUPS.values())} path_cases={len(cases)}"
     )
     return 0
+
+
+def summary_contract_failures() -> list[str]:
+    """Exercise aggregate publication, independently of the gate implementations."""
+    import contextlib
+    import io
+    import tempfile
+    from unittest.mock import patch
+
+    failures: list[str] = []
+    parent = ROOT / "_build" / "ci"
+    parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="summary-contract-", dir=parent) as temporary:
+        out = Path(temporary)
+        summary = out / "ci-summary.json"
+        gate = Gate("summary-protocol", ["unexecuted-protocol-command"], ("pr",))
+        row = {"name": gate.name, "blocking": True, "status": "pass", "returncode": 0}
+        args = ["--profile", "pr", "--out", str(out)]
+        with (patch(__name__ + ".gates", return_value=[gate]),
+              patch(__name__ + ".validate_groups"),
+              contextlib.redirect_stdout(io.StringIO())):
+            for interruption in (OSError("cannot start"), KeyboardInterrupt(),
+                                 subprocess.TimeoutExpired(gate.cmd, 1)):
+                summary.write_text('{"pass":true}\n', encoding="utf-8")
+                with patch(__name__ + ".run_gate", side_effect=interruption):
+                    try:
+                        main(args)
+                    except (OSError, KeyboardInterrupt, subprocess.TimeoutExpired):
+                        pass
+                    else:
+                        failures.append("interrupted gate completed an aggregate")
+                if summary.exists():
+                    failures.append("interrupted gate retained a stale success summary")
+                    summary.unlink()
+            with patch(__name__ + ".run_gate", return_value=row):
+                if main(args) != 0:
+                    failures.append("completed positive gate failed")
+            report = json.loads(summary.read_text(encoding="utf-8"))
+            if report.get("pass") is not True or report.get("gates") != [row]:
+                failures.append("completed gate omitted the current result")
+            failed_row = dict(row, status="fail", returncode=1)
+            with patch(__name__ + ".run_gate", return_value=failed_row):
+                if main(args) != 1:
+                    failures.append("blocking failure became a successful aggregate")
+            report = json.loads(summary.read_text(encoding="utf-8"))
+            if report.get("pass") is not False or report.get("gates") != [failed_row]:
+                failures.append("failed aggregate did not replace previous success")
+            previous = summary.read_bytes()
+            with patch(__name__ + ".run_gate") as run:
+                main([*args, "--list"])
+                if run.called or summary.read_bytes() != previous:
+                    failures.append("listing gates changed execution evidence")
+            summary.unlink()
+            summary.mkdir()
+            with patch(__name__ + ".run_gate") as run:
+                try:
+                    main(args)
+                except OSError:
+                    pass
+                else:
+                    failures.append("unremovable prior summary did not fail")
+                if run.called or not summary.is_dir():
+                    failures.append("summary cleanup failure started gates or removed a directory")
+    return failures
 
 
 def env_for(gate: Gate, out: Path) -> dict[str, str]:
@@ -624,6 +690,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if not out.is_absolute():
         out = ROOT / out
     out.mkdir(parents=True, exist_ok=True)
+    # An interrupted or unstartable run must not leave a previous successful
+    # aggregate at the public result path. Listing and validation above are read-only.
+    summary_path = out / "ci-summary.json"
+    summary_path.unlink(missing_ok=True)
     started = time.perf_counter()
     results: list[dict[str, Any]] = []
     failed = False
@@ -649,7 +719,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "cache": "restored build/cache data is a speed hint only and is followed by regeneration/recheck/parity gates",
         },
     }
-    write_json_atomic(out / "ci-summary.json", report)
+    write_json_atomic(summary_path, report)
     print(
         f"CI_GATE_SUMMARY profile={args.profile} group={args.group or 'all'} "
         f"pass={int(not failed)} gates={len(results)} report={rel(out / 'ci-summary.json')}"

@@ -3,6 +3,19 @@
 import "lower.ouro";
 import "../erasure.ouro";
 import "../source_text.ouro";
+import "mir_model.ouro";
+import "lower_model.ouro";
+import "x64.ouro";
+import "pe_model.ouro";
+import "codegen_model.ouro";
+import "../primitive_model.ouro";
+import "../file_check_model.ouro";
+import "../file_check_environment.ouro";
+import "lower_boundary.ouro";
+import "lower_loop.ouro";
+import "lower_constants.ouro";
+import "lower_types.ouro";
+import "../primitive_roles.ouro";
 
 -- Construction is a distinct stage, not evidence of MIR acceptance. The
 -- managed source entry validates these parts before returning them.
@@ -281,3 +294,85 @@ def managed_unbox_boolean (compiler : ManagedCompiler) (value : MirValue) (state
                                 (managed_binary MirUSize MirSub (managed_bits MirUSize 1) tag tag_checked)
                                 (fun (boolean : ManagedResult) => match boolean with | ManagedResultOf bits after =>
                                   managed_convert MirU8 MirNarrow bits after end)) end) end)) end)) end)));
+
+def managed_capture_scope : ManagedScope -> Nat -> ManagedState
+    -> Either NativeLowerError (Pair ManagedScope ManagedState) :=
+  fix capture (scope : ManagedScope) (index : Nat) (state : ManagedState)
+      : Either NativeLowerError (Pair ManagedScope ManagedState) :=
+    match scope with
+    | Nil => Right NativeLowerError (Pair ManagedScope ManagedState)
+        (MkPair ManagedScope ManagedState ([] : List (Maybe MirValue)) state)
+    | Cons binding rest => match binding with
+      | Nothing => lower_map (Pair ManagedScope ManagedState) (Pair ManagedScope ManagedState)
+          (fun (tail : Pair ManagedScope ManagedState) => match tail with | MkPair values after =>
+            MkPair ManagedScope ManagedState (Cons (Maybe MirValue) (Nothing MirValue) values) after end)
+          (capture rest index state)
+      | Just _ => lower_bind ManagedResult (Pair ManagedScope ManagedState)
+          (managed_load MirManagedPtr (MirUse 0) (add 40 (mul 8 index)) state)
+          (fun (loaded : ManagedResult) => match loaded with | ManagedResultOf value next =>
+            lower_map (Pair ManagedScope ManagedState) (Pair ManagedScope ManagedState)
+              (fun (tail : Pair ManagedScope ManagedState) => match tail with | MkPair values after =>
+                MkPair ManagedScope ManagedState (Cons (Maybe MirValue) (Just MirValue value) values) after end)
+              (capture rest (S index) next) end) end end;
+
+def managed_emit_callable (compiler : ManagedCompiler) (kind : Nat) (code : Nat) (recursive : Bool)
+    (captures : List MirValue) (state : ManagedState) : Either NativeLowerError ManagedResult :=
+    let capture_count : Nat := length MirValue captures in
+    lower_bind ManagedResult ManagedResult (managed_allocate_value compiler 2 (add 40 (mul 8 capture_count)) state)
+      (fun (allocated_env : ManagedResult) => match allocated_env with | ManagedResultOf environment next =>
+        let saved : ManagedState := managed_store_fields environment captures 40
+          (managed_emit (MirStore environment (codegen_disp 32) (managed_bits MirUSize capture_count)) next) in
+        lower_bind ManagedResult ManagedResult (managed_allocate_value compiler kind 48 saved)
+          (fun (allocated_closure : ManagedResult) => match allocated_closure with | ManagedResultOf closure after =>
+            lower_map ManagedResult ManagedResult (fun (address : ManagedResult) => match address with
+              | ManagedResultOf pointer ready =>
+                let complete : ManagedState := managed_emit_all
+                  ([MirStore closure (codegen_disp 32) pointer, MirStore closure (codegen_disp 40) environment] : List MirInstruction) ready in
+                ManagedResultOf closure (match recursive with | False => complete
+                  | True => managed_emit (MirStore environment (codegen_disp 40) closure) complete end) end)
+              (managed_address code after) end) end);
+
+def managed_invoke (compiler : ManagedCompiler) (kind : Nat) (closure : MirValue) (argument : MirValue)
+    (state : ManagedState) : Either NativeLowerError ManagedResult :=
+    lower_bind ManagedState ManagedResult (managed_expect_descriptor compiler kind closure state)
+      (fun (checked : ManagedState) => lower_bind ManagedResult ManagedResult (managed_load MirRawPtr closure 32 checked)
+        (fun (code : ManagedResult) => match code with | ManagedResultOf pointer next =>
+          lower_bind ManagedResult ManagedResult (managed_load MirManagedPtr closure 40 next)
+            (fun (capture : ManagedResult) => match capture with | ManagedResultOf environment ready =>
+              managed_fresh MirManagedPtr (fun (local : Nat) => MirCall MirMayGc (Just Nat local)
+                (MirIndirect (MirSignatureOf ([MirManagedPtr, MirManagedPtr] : List MirType) (Just MirType MirManagedPtr)) pointer)
+                ([environment, argument] : List MirValue)) ready end) end));
+
+def ManagedActionBody : Type := List MirValue -> ManagedState -> Either NativeLowerError ManagedResult;
+
+def managed_action (compiler : ManagedCompiler) (captures : List MirValue)
+    (body : ManagedActionBody) (state : ManagedState) : Either NativeLowerError ManagedResult :=
+    let caller : LowerState := managed_flow state in
+    lower_bind (Pair Nat ManagedState) ManagedResult (managed_fresh_symbol state)
+      (fun (fresh : Pair Nat ManagedState) => match fresh with | MkPair symbol reserved =>
+        lower_bind (Pair ManagedScope ManagedState) ManagedResult
+          (managed_capture_scope (map MirValue (Maybe MirValue) (Just MirValue) captures) 0
+            (managed_with_flow reserved (lower_empty_state 2)))
+          (fun (captured : Pair ManagedScope ManagedState) => match captured with | MkPair environment entered =>
+            lower_bind ManagedResult ManagedResult (body (managed_values environment) entered)
+              (fun (compiled : ManagedResult) => match compiled with | ManagedResultOf value after =>
+                let function : MirFunction := managed_finish_function symbol
+                  ([111,117,114,111,95,109,97,110,97,103,101,100,95,97,99,116,105,111,110] : List Nat)
+                  ([MirLocalDef 0 MirManagedPtr, MirLocalDef 1 MirManagedPtr] : List MirLocal) value after in
+                managed_emit_callable compiler 5 symbol False captures
+                  (managed_with_flow (managed_add_function function after) caller) end) end) end);
+
+def managed_action_pure (compiler : ManagedCompiler) (value : MirValue) (state : ManagedState)
+    : Either NativeLowerError ManagedResult :=
+    managed_action compiler ([value] : List MirValue) (fun (captures : List MirValue) (entered : ManagedState) =>
+      match captures with
+      | Nil => Left NativeLowerError ManagedResult (LowerInvalidCall 0)
+      | Cons saved rest => match rest with
+        | Nil => Right NativeLowerError ManagedResult (ManagedResultOf saved entered)
+        | Cons _ _ => Left NativeLowerError ManagedResult (LowerInvalidCall 0)
+        end
+      end) state;
+
+def managed_unit_value (compiler : ManagedCompiler) (state : ManagedState) : Either NativeLowerError ManagedResult :=
+    lower_bind Nat ManagedResult (lower_role_identity (managed_compiler_entries compiler) PrimitiveUnitRole)
+      (fun (unit : Nat) => managed_constructor compiler unit (managed_bits MirUSize 0) ([] : List MirValue) state);

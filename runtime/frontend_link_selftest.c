@@ -195,6 +195,60 @@ static int allocation_context_check(void)
 	return 0;
 }
 
+/* cm_parse threads one intern table through every imported module. Leave must
+   share that caller-owned spine; recopying it on each file is the 4 GiB OOM. */
+static int shared_parent_spine_check(void)
+{
+	const unsigned long size = 1024UL * 1024UL;
+	unsigned char *bytes;
+	ouro_v *parent;
+	ouro_v *result;
+	ouro_v *inner;
+	unsigned long long after_parent;
+	unsigned long long after_wraps;
+	int i;
+	bytes = (unsigned char *)malloc(size);
+	if (bytes == 0)
+		return fail("could not allocate parent spine payload");
+	memset(bytes, 0x5A, size);
+	parent = ouro_packed(bytes, size);
+	if (!packed_eq(parent, bytes, size)) {
+		free(bytes);
+		return fail("parent spine payload was not retained");
+	}
+	after_parent = ouro_heap_live_bytes();
+	result = parent;
+	for (i = 0; i < 32; i++) {
+		ouro_v *fields[2];
+		ouro_heap_context *context = ouro_heap_context_enter();
+		fields[0] = result;
+		fields[1] = ouro_string_codes("nested-wrap");
+		result = ouro_heap_context_leave(context, ouro_ctor(0, 2, fields));
+	}
+	inner = result;
+	for (i = 0; i < 32; i++) {
+		if (inner == 0 || inner->tag != 0 || inner->n != 2) {
+			free(bytes);
+			return fail("shared-parent wrapper chain was damaged");
+		}
+		inner = OURO_F(inner, 0);
+	}
+	if (inner != parent) {
+		free(bytes);
+		return fail("leave recopied a caller-owned intern/AST spine");
+	}
+	if (!packed_eq(inner, bytes, size)) {
+		free(bytes);
+		return fail("shared parent payload was not readable after leave");
+	}
+	free(bytes);
+	after_wraps = ouro_heap_live_bytes();
+	/* Quadratic recopy of the 1 MiB parent would add tens of MiB. */
+	if (after_wraps > after_parent + 4ULL * 1024ULL * 1024ULL)
+		return fail("leave recopied the caller-owned spine into the parent heap");
+	return 0;
+}
+
 static ouro_v *recheck_node1(int tag, ouro_v *value)
 {
 	ouro_v *fields[1] = {value};
@@ -328,6 +382,8 @@ int main(int argc, char **argv)
 		result = nested_context_check();
 	else if (argc == 2 && strcmp(argv[1], "allocation-context") == 0)
 		result = allocation_context_check();
+	else if (argc == 2 && strcmp(argv[1], "shared-parent-spine") == 0)
+		result = shared_parent_spine_check();
 	else if (argc == 2 && (strcmp(argv[1], "recheck-scale") == 0 ||
 		strcmp(argv[1], "recheck-retained") == 0 || strcmp(argv[1], "recheck-late-invalid") == 0 ||
 		strcmp(argv[1], "recheck-missing-bodies") == 0 || strcmp(argv[1], "recheck-zero-fuel") == 0))

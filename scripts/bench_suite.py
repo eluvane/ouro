@@ -5,6 +5,24 @@ This is a local timing seed, not a headline performance claim. Numeric
 thresholds are recorded only after two local runs; this suite does not
 enforce them. Exit 1 only when a non-skipped command fails (unexpected
 return code). Missing ``sh`` writes a SKIP report and exits 0.
+
+Opt-in quality benchmarks use prebuilt executables and an immutable corpus:
+  python scripts/bench_suite.py --quality-manifest quality/linter_bench.json \
+    --corpus /fixed/corpus --bin-dir /before/bin --label BASE --out _build/perf-before
+Repeat with --bin-dir /after/bin --label HEAD --out _build/perf-after
+and --before _build/perf-before/report.json. Prepare package dependencies before
+fingerprinting the corpus. No builds, cache flushing or fixture mutation occur
+inside a timed command. The output directory must not already exist.
+
+Every case uses one warmup and five fresh-process measurements by default.
+The JSON report retains all samples and median wall/CPU/peak memory, with
+unavailable counters represented as null. POSIX RSS is the maximum descendant
+high-water mark, NOT simultaneous process-tree RSS; Windows records Job commit,
+NOT RSS. Wall/CPU include the bounded process launcher. Captured text parity
+normalizes UTF-8 errors and CRLF exactly as the existing bounded runner does;
+it is not raw-byte, fixer-output, rule-coverage or semantic-correctness proof.
+Timeout/OOM/spawn failures and changed ordered output are never valid speedups.
+Run --quality-selftest for host protocol tests without running Ouro.
 """
 from __future__ import annotations
 
@@ -203,5 +221,326 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     return 1 if failed else 0
 
 
+# Quality measurement is opt-in; the packaged check/fmt/help seed above keeps
+# its existing report ABI. Prebuild both revisions, then use the SAME corpus,
+# manifest and budgets, changing only --bin-dir and --label. This runner never
+# builds, changes rules, updates expected output or caches diagnostic results.
+QUALITY_KIND = "ouro.quality-bench.v1"
+
+
+def quality_manifest(data: Any) -> dict[str, Any]:
+    if not isinstance(data, dict) or set(data) != {"kind", "inputs", "cases"}:
+        raise ValueError("manifest requires exactly kind, inputs and cases")
+    if data["kind"] != QUALITY_KIND or not isinstance(data["inputs"], list) or not data["inputs"]:
+        raise ValueError("wrong manifest kind or empty inputs")
+    for path in data["inputs"]:
+        if not isinstance(path, str) or not path or Path(path).is_absolute() or ".." in Path(path).parts:
+            raise ValueError("inputs must be nonempty corpus-relative paths")
+    if not isinstance(data["cases"], list) or not data["cases"]:
+        raise ValueError("manifest has no cases")
+    names: set[str] = set()
+    for case in data["cases"]:
+        if not isinstance(case, dict) or set(case) != {"name", "argv", "expected_returncode"}:
+            raise ValueError("each case requires exactly name, argv, expected_returncode")
+        name = case["name"]
+        if not isinstance(name, str) or not name or any(c not in "abcdefghijklmnopqrstuvwxyz0123456789-_" for c in name) or name in names:
+            raise ValueError("case names must be unique lowercase slugs")
+        names.add(name)
+        if not isinstance(case["argv"], list) or not case["argv"] or not all(isinstance(a, str) and a and "\0" not in a for a in case["argv"]):
+            raise ValueError("argv must be a nonempty array of literal arguments")
+        if type(case["expected_returncode"]) is not int or case["expected_returncode"] != 0:
+            raise ValueError("timed quality commands must complete successfully (0); failed runs are not speedups")
+    return data
+
+
+def quality_digest(data: Any) -> str:
+    import hashlib
+    import json
+
+    return hashlib.sha256(json.dumps(data, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def quality_inputs(corpus: Path, inputs: list[str]) -> str:
+    """Fingerprint explicit fixed inputs, not an authority to reuse facts."""
+    import hashlib
+
+    files: set[Path] = set()
+    pending = [corpus / path for path in inputs]
+    while pending:
+        path = pending.pop()
+        if path.is_symlink():
+            raise ValueError(f"benchmark input is a symlink: {path}")
+        path.resolve(strict=True).relative_to(corpus)
+        if path.is_dir():
+            pending.extend(p for p in path.iterdir() if p.name not in {".git", "_build", "_cache"})
+        elif path.is_file():
+            files.add(path)
+        else:
+            raise ValueError(f"not a regular input: {path}")
+    if not files:
+        raise ValueError("empty benchmark input inventory")
+    rows = []
+    for path in sorted(files):
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        rows.append([path.relative_to(corpus).as_posix(), digest.hexdigest()])
+    return quality_digest(rows)
+
+
+def quality_sample(request: dict[str, Any], out: Path) -> None:
+    """One fresh supervisor per sample avoids cumulative ru_maxrss history."""
+    import hashlib
+    from dataclasses import asdict
+    from ourosmith.limits import clean_env, run_limited
+
+    env = clean_env()
+    env["OURO_ROOT"] = request["corpus"]
+    result = run_limited(request["argv"], cwd=Path(request["corpus"]), env=env,
+                         timeout_s=request["timeout"], memory_mb=request["memory_mib"])
+    row = asdict(result)
+    row["peak_commit_mib"] = row.pop("peak_rss_mb") if os.name == "nt" else None
+    row.pop("peak_rss_mb", None)
+    row.update(cpu_s=None, peak_rss_mib=None)
+    if os.name == "posix":
+        import resource
+
+        usage = resource.getrusage(resource.RUSAGE_CHILDREN)
+        row["cpu_s"] = usage.ru_utime + usage.ru_stime
+        # Maximum descendant high-water mark, not simultaneous tree RSS.
+        scale = 1024 * 1024 if platform.system() == "Darwin" else 1024
+        row["peak_rss_mib"] = usage.ru_maxrss / scale if usage.ru_maxrss > 0 else None
+    for stream in ("stdout", "stderr"):
+        text = row.pop(stream)
+        out.with_suffix(f".{stream}").write_text(text, encoding="utf-8")
+        row[f"{stream}_sha256"] = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    # The worker currently normalizes UTF-8/CRLF. These hashes are ordered text
+    # parity, not raw byte parity, fix parity, diagnostic counts or acceptance.
+    row["counters"] = dict.fromkeys(("diagnostics", "parsed_files", "semantic_units",
+        "duplicate_traversals", "cache_hits", "cache_misses", "definitions", "calls", "binders"))
+    write_json_atomic(out, row)
+
+
+def quality_signature(row: dict[str, Any]) -> tuple[Any, ...]:
+    return row["returncode"], row["stdout_sha256"], row["stderr_sha256"]
+
+
+def quality_summary(case: dict[str, Any], rows: list[dict[str, Any]], warmups: int) -> dict[str, Any]:
+    import statistics
+
+    if warmups < 1 or len(rows) - warmups < 3:
+        raise ValueError("at least one warmup and three measured samples are required")
+    expected = case["expected_returncode"]
+    ok = all(row["status"] == "ok" and row["returncode"] == expected for row in rows)
+    deterministic = all(quality_signature(row) == quality_signature(rows[0]) for row in rows)
+    samples = rows[warmups:]
+    result: dict[str, Any] = {"name": case["name"], "ok": ok and deterministic,
+        "deterministic": deterministic, "signature": list(quality_signature(rows[0])), "samples": rows}
+    for key in ("elapsed_s", "cpu_s", "peak_rss_mib", "peak_commit_mib"):
+        values = [row[key] for row in samples]
+        result[key] = statistics.median(values) if all(value is not None for value in values) else None
+    result["max_peak_rss_mib"] = max(row["peak_rss_mib"] for row in samples) if result["peak_rss_mib"] is not None else None
+    result["diagnostics"] = None
+    return result
+
+
+def quality_compare(before: dict[str, Any], after: dict[str, Any]) -> list[dict[str, Any]]:
+    import math
+
+    for key in ("kind", "manifest_sha256", "inputs_sha256", "host", "settings"):
+        if before.get(key) != after.get(key) or key not in before:
+            raise ValueError(f"incomparable benchmark reports: {key}")
+    if before["kind"] != QUALITY_KIND or before.get("pass") is not True or after.get("pass") is not True:
+        raise ValueError("failed/incomplete reports are not performance evidence")
+    if [r["name"] for r in before["cases"]] != [r["name"] for r in after["cases"]] or not before["cases"]:
+        raise ValueError("benchmark case inventory changed")
+    changes = []
+    for old, new in zip(before["cases"], after["cases"], strict=True):
+        if old["signature"] != new["signature"] or not old["ok"] or not new["ok"]:
+            raise ValueError(f"diagnostic/status parity failed: {new['name']}")
+        row: dict[str, Any] = {"name": new["name"], "diagnostics_before": None, "diagnostics_after": None}
+        for key in ("elapsed_s", "peak_rss_mib", "peak_commit_mib"):
+            a, b = old[key], new[key]
+            for value in (a, b):
+                if value is not None and (type(value) not in {int, float} or not math.isfinite(value) or value < 0):
+                    raise ValueError("invalid measurement")
+            row[key] = {"before": a, "after": b, "delta_percent": (b / a - 1) * 100 if a and b is not None else None}
+        changes.append(row)
+    return changes
+
+
+def quality_main(argv: Sequence[str]) -> int:
+    import json
+    import math
+
+    parser = argparse.ArgumentParser(description="Repeated prebuilt quality commands; see bench_suite.py docstring")
+    parser.add_argument("--quality-manifest", type=Path, required=True)
+    parser.add_argument("--corpus", type=Path, required=True)
+    parser.add_argument("--bin-dir", type=Path, required=True)
+    parser.add_argument("--label", required=True)
+    parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument("--before", type=Path)
+    parser.add_argument("--repeats", type=int, default=5)
+    parser.add_argument("--warmups", type=int, default=1)
+    parser.add_argument("--timeout", type=float, default=300)
+    parser.add_argument("--memory-mib", type=int, default=3072)
+    args = parser.parse_args(argv)
+    try:
+        if args.repeats < 3 or args.warmups < 1 or not math.isfinite(args.timeout) or args.timeout <= 0 or args.memory_mib <= 0:
+            raise ValueError("need >=3 repeats, >=1 warmup and positive finite resource budgets")
+        manifest = quality_manifest(json.loads(args.quality_manifest.read_text(encoding="utf-8")))
+        corpus, binary = args.corpus.resolve(strict=True), args.bin_dir.resolve(strict=True)
+        before_inputs = quality_inputs(corpus, manifest["inputs"])
+        # Refuse reused output directories instead of reading stale samples.
+        args.out.mkdir(parents=True, exist_ok=False)
+        report: dict[str, Any] = {"kind": QUALITY_KIND, "label": args.label, "pass": False,
+            "manifest_sha256": quality_digest(manifest), "inputs_sha256": before_inputs,
+            "host": {**host_meta(), "node": platform.node(), "release": platform.release(), "cpus": os.cpu_count()},
+            "settings": {"repeats": args.repeats, "warmups": args.warmups,
+                "timeout": args.timeout, "memory_mib": args.memory_mib,
+                "memory_metric": "job-commit" if os.name == "nt" else "max-descendant-rss",
+                "output_metric": "ordered-utf8-replacement-lf-text"}, "cases": []}
+        write_json_atomic(args.out / "report.json", report)
+        for case in manifest["cases"]:
+            command = [arg.format(bin=str(binary), corpus=str(corpus), exe=".exe" if os.name == "nt" else "") for arg in case["argv"]]
+            request = {"argv": command, "corpus": str(corpus), "timeout": args.timeout, "memory_mib": args.memory_mib}
+            request_file = (args.out / "request.json").resolve()
+            write_json_atomic(request_file, request)
+            rows = []
+            for index in range(args.warmups + args.repeats):
+                output = (args.out / f"{case['name']}-{index}.json").resolve()
+                # This supervisor executes only the bounded runner. The runner
+                # owns the command tree and its timeout/cleanup on every host.
+                subprocess.run([sys.executable, str(Path(__file__).resolve()), "--quality-sample", str(request_file), str(output)], check=True)
+                rows.append(json.loads(output.read_text(encoding="utf-8")))
+            report["cases"].append(quality_summary(case, rows, args.warmups))
+            write_json_atomic(args.out / "report.json", report)
+        if quality_inputs(corpus, manifest["inputs"]) != before_inputs:
+            raise ValueError("benchmark inputs changed during measurement")
+        report["pass"] = all(case["ok"] for case in report["cases"])
+        if args.before:
+            report["comparison"] = quality_compare(json.loads(args.before.read_text(encoding="utf-8")), report)
+        write_json_atomic(args.out / "report.json", report)
+        print(f"QUALITY_BENCH: {'PASS' if report['pass'] else 'FAIL'} report={args.out / 'report.json'}")
+        return 0 if report["pass"] else 1
+    except (OSError, ValueError, KeyError, TypeError, subprocess.CalledProcessError) as error:
+        print(f"QUALITY_BENCH: FAIL {error}", file=sys.stderr)
+        return 1
+
+
+def quality_selftest() -> int:
+    """Host protocol assertions only; never native performance evidence."""
+    import copy
+    import unittest
+
+    class QualityBenchTests(unittest.TestCase):
+        def sample(self):
+            return dict(status="ok", returncode=0, stdout_sha256="a", stderr_sha256="b",
+                        elapsed_s=2.0, cpu_s=1.0, peak_rss_mib=30.0, peak_commit_mib=None)
+
+        def report(self):
+            case = quality_summary(dict(name="small", expected_returncode=0), [self.sample() for _ in range(4)], 1)
+            return dict(kind=QUALITY_KIND, manifest_sha256="m", inputs_sha256="i", host={}, settings={},
+                        **{"pass": True}, cases=[case])
+
+        def test_repeated_median_and_unavailable_metrics(self):
+            rows = [self.sample() for _ in range(4)]
+            rows[0]["elapsed_s"] = 999
+            rows[2]["elapsed_s"] = 3
+            result = quality_summary(dict(name="small", expected_returncode=0), rows, 1)
+            self.assertTrue(result["ok"])
+            self.assertEqual(result["elapsed_s"], 2)
+            self.assertIsNone(result["peak_commit_mib"])
+            self.assertIsNone(result["diagnostics"])
+
+        def test_warmup_output_must_match(self):
+            rows = [self.sample() for _ in range(4)]
+            rows[0]["stdout_sha256"] = "different"
+            self.assertFalse(quality_summary(dict(name="small", expected_returncode=0), rows, 1)["ok"])
+
+        def test_resources_fail_even_with_expected_exit(self):
+            for status in ("memory", "timeout", "spawn-error"):
+                rows = [dict(self.sample(), status=status) for _ in range(4)]
+                self.assertFalse(quality_summary(dict(name="small", expected_returncode=0), rows, 1)["ok"])
+
+        def test_single_run_rejected(self):
+            with self.assertRaises(ValueError):
+                quality_summary(dict(name="small", expected_returncode=0), [self.sample()], 0)
+
+        def test_parity_and_input_changes_rejected(self):
+            before = self.report()
+            for key in ("kind", "manifest_sha256", "inputs_sha256", "host", "settings", "pass"):
+                after = copy.deepcopy(before)
+                after[key] = "changed"
+                with self.assertRaises(ValueError):
+                    quality_compare(before, after)
+            after = copy.deepcopy(before)
+            after["cases"][0]["signature"][1] = "changed"
+            with self.assertRaises(ValueError):
+                quality_compare(before, after)
+
+        def test_comparison_and_null(self):
+            before, after = self.report(), self.report()
+            after["cases"][0]["elapsed_s"] = 1
+            result = quality_compare(before, after)[0]
+            self.assertEqual(result["elapsed_s"]["delta_percent"], -50)
+            self.assertIsNone(result["peak_commit_mib"]["delta_percent"])
+
+        def test_invalid_numbers_rejected(self):
+            before = self.report()
+            for value in (float("nan"), float("inf"), -1, True):
+                after = copy.deepcopy(before)
+                after["cases"][0]["elapsed_s"] = value
+                with self.assertRaises(ValueError):
+                    quality_compare(before, after)
+
+        def test_content_fingerprint_rejects_source_and_dependency_changes(self):
+            import tempfile
+
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory).resolve()
+                (root / "source.ouro").write_text("first")
+                (root / "dep.ouro").write_text("first")
+                initial = quality_inputs(root, ["source.ouro", "dep.ouro"])
+                self.assertEqual(initial, quality_inputs(root, ["dep.ouro", "source.ouro"]))
+                (root / "dep.ouro").write_text("other")
+                self.assertNotEqual(initial, quality_inputs(root, ["source.ouro", "dep.ouro"]))
+                (root / "dep.ouro").write_text("first")
+                (root / "source.ouro").write_text("other")
+                self.assertNotEqual(initial, quality_inputs(root, ["source.ouro", "dep.ouro"]))
+                with self.assertRaises(FileNotFoundError):
+                    quality_inputs(root, ["missing.ouro"])
+
+        def test_manifest_rejects_duplicate_crash_and_empty(self):
+            case = dict(name="small", argv=["{bin}/ouro-lint{exe}", "std/io.ouro"], expected_returncode=0)
+            valid = dict(kind=QUALITY_KIND, inputs=["std"], cases=[case])
+            self.assertEqual(quality_manifest(valid), valid)
+            for invalid in (dict(valid, cases=[]), dict(valid, cases=[case, case]),
+                            dict(valid, cases=[dict(case, expected_returncode=137)]),
+                            dict(valid, cases=[dict(case, expected_returncode=1)]),
+                            dict(valid, inputs=["../escape"]), dict(valid, cases=[dict(case, argv="sh command")])):
+                with self.assertRaises(ValueError):
+                    quality_manifest(invalid)
+
+    result = unittest.TextTestRunner(verbosity=2).run(unittest.defaultTestLoader.loadTestsFromTestCase(QualityBenchTests))
+    return 0 if result.wasSuccessful() else 1
+
+
+def dispatch(argv: Sequence[str]) -> int:
+    if argv and argv[0] == "--quality-sample":
+        import json
+
+        if len(argv) != 3:
+            return 2
+        quality_sample(json.loads(Path(argv[1]).read_text(encoding="utf-8")), Path(argv[2]))
+        return 0
+    if argv == ["--quality-selftest"]:
+        return quality_selftest()
+    if any(arg == "--quality-manifest" or arg.startswith("--quality-manifest=") for arg in argv):
+        return quality_main(argv)
+    return main(argv)
+
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(dispatch(sys.argv[1:]))

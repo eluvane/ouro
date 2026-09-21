@@ -161,7 +161,13 @@ def generate(seed: int, depth: int = 4) -> Expr:
         if tag == "add":
             return Expr(tag, (term(fuel - 1), term(fuel - 1)))
         if tag == "if":
-            return Expr(tag, (Expr("literal", value=bool(rng.below(2)), ty="Bool"), term(fuel - 1), term(fuel - 1)))
+            condition = Expr("literal", value=bool(rng.below(2)), ty="Bool")
+            yes, no = term(fuel - 1), term(fuel - 1)
+            # This strategy promises clean lint. Equal pure branches belong
+            # to the redundant-match negative fixtures, not this inventory.
+            if evaluate(yes) == evaluate(no):
+                no = Expr("succ", (no,))
+            return Expr(tag, (condition, yes, no))
         name = f"v{counter}"
         counter += 1
         used = Expr("add", (Expr("var", name=name), term(fuel - 1)))

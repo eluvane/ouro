@@ -229,6 +229,14 @@ def terminate_process_tree(process: subprocess.Popen[Any]) -> None:
             terminate_pid_win(pid)
         terminate_pid_win(process.pid)
         return
+    # Nested bounded runners start their own sessions. Killing only the outer
+    # process group leaves those measured descendants running after a failure.
+    for pid in reversed(process_tree(process.pid)):
+        if pid != process.pid:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
     try:
         os.killpg(process.pid, signal.SIGKILL)
     except ProcessLookupError:

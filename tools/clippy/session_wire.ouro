@@ -1,0 +1,274 @@
+-- Production decoder. Cursor offsets, never magic-string searches, delimit
+-- snapshots. Only findings survive the root-local decode/report seam.
+import "scan.ouro";
+import "session_policy.ouro";
+
+inductive CgWireCursor : Type :=
+  | CgWireAt : String -> Nat -> CgWireCursor;
+
+inductive CgWireConfig : Type :=
+  | MkCgWireConfig : List (Pair String QrClippy) -> String -> String -> String -> CgWireConfig;
+
+inductive CgWireRootResult : Type :=
+  | MkCgWireRootResult : CgWireCursor -> List QrFinding -> Bool -> CgWireRootResult;
+
+inductive CgWireResult : Type :=
+  | MkCgWireResult : List QrFinding -> Nat -> Bool -> CgWireResult;
+
+def cg_wire_error : QualityInputError :=
+    QualityInvalidInput "incomplete or inconsistent semantic session protocol";
+
+def cg_wire_left (cursor : CgWireCursor) : Nat :=
+    match cursor with | CgWireAt text offset => sub (prim_string_length text) offset end;
+
+def cg_wire_line (cursor : CgWireCursor)
+    : Either QualityInputError (Pair String CgWireCursor) :=
+    match cursor with
+    | CgWireAt text start =>
+        (fix go (fuel : Nat) (offset : Nat)
+            : Either QualityInputError (Pair String CgWireCursor) :=
+          match fuel with
+          | Z => Left QualityInputError (Pair String CgWireCursor) cg_wire_error
+          | S remaining => match eq_nat (prim_string_byte_at text offset) 10 with
+            | True => Right QualityInputError (Pair String CgWireCursor)
+                (MkPair String CgWireCursor (prim_string_slice text start (sub offset start))
+                  (CgWireAt text (S offset)))
+            | False => go remaining (S offset)
+            end
+          end) (cg_wire_left cursor) start
+    end;
+
+def cg_wire_expect (expected : String) (cursor : CgWireCursor)
+    : Either QualityInputError CgWireCursor :=
+    match cg_wire_line cursor with
+    | Left error => Left QualityInputError CgWireCursor error
+    | Right row => match row with
+      | MkPair value next => match prim_string_eq value expected with
+        | True => Right QualityInputError CgWireCursor next
+        | False => Left QualityInputError CgWireCursor cg_wire_error
+        end
+      end
+    end;
+
+def cg_wire_number (limit : Nat) (cursor : CgWireCursor)
+    : Either QualityInputError (Pair Nat CgWireCursor) :=
+    match cg_wire_line cursor with
+    | Left error => Left QualityInputError (Pair Nat CgWireCursor) error
+    | Right row => match row with
+      | MkPair text next => match leb_nat (prim_string_length text)
+          (prim_string_length (prim_string_of_nat limit)) with
+        | False => Left QualityInputError (Pair Nat CgWireCursor) cg_wire_error
+        | True => match cg_s_nat text with
+          | Nothing => Left QualityInputError (Pair Nat CgWireCursor) cg_wire_error
+          | Just count => match leb_nat count limit with
+            | False => Left QualityInputError (Pair Nat CgWireCursor) cg_wire_error
+            | True => Right QualityInputError (Pair Nat CgWireCursor)
+                (MkPair Nat CgWireCursor count next)
+            end
+          end
+        end
+      end
+    end;
+
+def cg_wire_blob (cursor : CgWireCursor)
+    : Either QualityInputError (Pair String CgWireCursor) :=
+    match cg_wire_number (cg_wire_left cursor) cursor with
+    | Left error => Left QualityInputError (Pair String CgWireCursor) error
+    | Right row => match row with
+      | MkPair size next => match next with
+        | CgWireAt text offset =>
+            let finish : Nat := add offset size in
+            match andb (ltb_nat finish (prim_string_length text))
+                (eq_nat (prim_string_byte_at text finish) 10) with
+            | False => Left QualityInputError (Pair String CgWireCursor) cg_wire_error
+            | True => Right QualityInputError (Pair String CgWireCursor)
+                (MkPair String CgWireCursor (prim_string_slice text offset size)
+                  (CgWireAt text (S finish)))
+            end
+        end
+      end
+    end;
+
+def cg_wire_skip_lines : Nat -> CgWireCursor -> Either QualityInputError CgWireCursor :=
+  fix go (count : Nat) (cursor : CgWireCursor) : Either QualityInputError CgWireCursor :=
+    match count with
+    | Z => Right QualityInputError CgWireCursor cursor
+    | S remaining => match cg_wire_line cursor with
+      | Left error => Left QualityInputError CgWireCursor error
+      | Right row => match row with | MkPair _ next => go remaining next end
+      end
+    end;
+
+-- Determine the end of one frame using byte and record counts. Validation of
+-- the source/proof payload remains owned by the existing single-root decoder.
+def cg_wire_snapshot_end (cursor : CgWireCursor)
+    : Either QualityInputError (Pair Bool CgWireCursor) :=
+    match cg_wire_expect cg_s_protocol cursor with
+    | Left error => Left QualityInputError (Pair Bool CgWireCursor) error
+    | Right status => match cg_wire_line status with
+      | Left error => Left QualityInputError (Pair Bool CgWireCursor) error
+      | Right row => match row with
+        | MkPair value body => match prim_string_eq value "error" with
+          | True => match cg_wire_line body with
+            | Left error => Left QualityInputError (Pair Bool CgWireCursor) error
+            | Right failure => match failure with
+              | MkPair message next => match ltb_nat 0 (prim_string_length message) with
+                | False => Left QualityInputError (Pair Bool CgWireCursor) cg_wire_error
+                | True => Right QualityInputError (Pair Bool CgWireCursor)
+                    (MkPair Bool CgWireCursor False next)
+                end
+              end
+            end
+          | False => match prim_string_eq value "ok" with
+            | False => Left QualityInputError (Pair Bool CgWireCursor) cg_wire_error
+            | True => match cg_wire_blob body with
+              | Left error => Left QualityInputError (Pair Bool CgWireCursor) error
+              | Right snapshot => match snapshot with
+                | MkPair _ proofs => match cg_wire_number cg_s_proof_budget proofs with
+                  | Left error => Left QualityInputError (Pair Bool CgWireCursor) error
+                  | Right counted => match counted with
+                    | MkPair count records => match cg_wire_skip_lines (mul count 4) records with
+                      | Left error => Left QualityInputError (Pair Bool CgWireCursor) error
+                      | Right next => Right QualityInputError (Pair Bool CgWireCursor)
+                          (MkPair Bool CgWireCursor True next)
+                      end
+                    end
+                  end
+                end
+              end
+            end
+          end
+        end
+      end
+    end;
+
+def cg_wire_findings (config : CgWireConfig) (path : String) (source : String)
+    (proofs : Either QualityInputError (List CgSProof)) : List QrFinding :=
+    match config with
+    | MkCgWireConfig mp profile root source_root =>
+        cg_scan_file mp profile root source_root (qr_child source_root path) source proofs
+    end;
+
+-- Required pure two-argument arena seam: no source/proof array survives.
+def cg_wire_scan_request (request : Pair String CgWireCursor) (config : CgWireConfig)
+    : Either QualityInputError CgWireRootResult :=
+    match request with
+    | MkPair path cursor => match cg_wire_snapshot_end cursor with
+      | Left error => Left QualityInputError CgWireRootResult error
+      | Right framed => match framed with
+        | MkPair passed next => match cursor with
+          | CgWireAt text start => match next with
+            | CgWireAt _ finish => match cg_s_parse_reply
+                (prim_string_slice text start (sub finish start)) with
+              | Left error => match passed with
+                | True => Left QualityInputError CgWireRootResult error
+                | False => Right QualityInputError CgWireRootResult
+                    (MkCgWireRootResult next (cg_wire_findings config path ""
+                      (Left QualityInputError (List CgSProof) error)) False)
+                end
+              | Right snapshot => match passed with
+                | False => Left QualityInputError CgWireRootResult cg_wire_error
+                | True => match snapshot with
+                  | MkPair source proofs => Right QualityInputError CgWireRootResult
+                      (MkCgWireRootResult next (cg_wire_findings config path source
+                        (Right QualityInputError (List CgSProof) proofs)) True)
+                  end
+                end
+              end
+            end
+          end
+        end
+      end
+    end;
+
+def cg_wire_trailer (cursor : CgWireCursor) (completed : Nat)
+    (pending : List String) (passed : Bool) : Either QualityInputError Unit :=
+    let status : String := match pending with
+      | Nil => match passed with | True => "ok" | False => "error" end
+      | Cons _ _ => "recycle"
+      end in
+    match andb (ltb_nat 0 completed)
+        (orb passed (nullb String pending)) with
+    | False => Left QualityInputError Unit cg_wire_error
+    | True => match cg_wire_number completed cursor with
+      | Left error => Left QualityInputError Unit error
+      | Right row => match row with
+        | MkPair reported next => match eq_nat reported completed with
+          | False => Left QualityInputError Unit cg_wire_error
+          | True => match cg_wire_expect status next with
+            | Left error => Left QualityInputError Unit error
+            | Right final => match eq_nat (cg_wire_left final) 0 with
+              | False => Left QualityInputError Unit cg_wire_error
+              | True => Right QualityInputError Unit MkUnit
+              end
+            end
+          end
+        end
+      end
+    end;
+
+def cg_wire_roots (config : CgWireConfig)
+    : List String -> Nat -> CgWireCursor -> List QrFinding -> Bool
+    -> Either QualityInputError CgWireResult :=
+  fix go (paths : List String) (completed : Nat) (cursor : CgWireCursor)
+      (acc : List QrFinding) (passed : Bool) : Either QualityInputError CgWireResult :=
+    match cg_wire_line cursor with
+    | Left error => Left QualityInputError CgWireResult error
+    | Right row => match row with
+      | MkPair marker next => match prim_string_eq marker "done" with
+        | True => match cg_wire_trailer next completed paths passed with
+          | Left error => Left QualityInputError CgWireResult error
+          | Right _ => Right QualityInputError CgWireResult
+              (MkCgWireResult acc completed passed)
+          end
+        | False => match prim_string_eq marker "root" with
+          | False => Left QualityInputError CgWireResult cg_wire_error
+          | True => match paths with
+            | Nil => Left QualityInputError CgWireResult cg_wire_error
+            | Cons path rest => match cg_wire_number completed next with
+              | Left error => Left QualityInputError CgWireResult error
+              | Right numbered => match numbered with
+                | MkPair id named => match eq_nat id completed with
+                  | False => Left QualityInputError CgWireResult cg_wire_error
+                  | True => match cg_wire_blob named with
+                    | Left error => Left QualityInputError CgWireResult error
+                    | Right identified => match identified with
+                      | MkPair actual body => match prim_string_eq actual path with
+                        | False => Left QualityInputError CgWireResult cg_wire_error
+                        | True => match cg_wire_scan_request (MkPair String CgWireCursor path body) config with
+                          | Left error => Left QualityInputError CgWireResult error
+                          | Right scanned => match scanned with
+                            | MkCgWireRootResult after found valid => go rest (S completed) after
+                                (append QrFinding found acc) (andb passed valid)
+                            end
+                          end
+                        end
+                      end
+                    end
+                  end
+                end
+              end
+            end
+          end
+        end
+      end
+    end;
+
+def cg_wire_session (config : CgWireConfig) (paths : List String) (text : String)
+    (acc : List QrFinding) : Either QualityInputError CgWireResult :=
+    match paths with
+    | Nil => Left QualityInputError CgWireResult cg_wire_error
+    | Cons _ _ => match cg_wire_expect cg_session_version (CgWireAt text 0) with
+      | Left error => Left QualityInputError CgWireResult error
+      | Right cursor => let path_count : Nat := length String paths in
+        match cg_wire_number path_count cursor with
+        | Left error => Left QualityInputError CgWireResult error
+        | Right row => match row with
+          | MkPair count next => match eq_nat count path_count with
+            | False => Left QualityInputError CgWireResult cg_wire_error
+            | True => cg_wire_roots config paths 0 next acc True
+            end
+          end
+        end
+      end
+    end;
