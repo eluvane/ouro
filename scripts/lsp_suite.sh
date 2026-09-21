@@ -333,10 +333,13 @@ fi
 # it did not check didChange of a live document, aggregate 2 MiB refusal,
 # or close/reopen releasing that ledger. Exact-limit documents are the
 # valid controls: 524288 bytes is accepted (leb inclusive).
+# Do not create $STATE_ROOT/_build. publish_buf then skips the sibling
+# checker, so the ledger session does not compile megabytes of padding.
 STATE_ROOT="$OUT/state-root"
-mkdir -p "$STATE_ROOT/_build"
+mkdir -p "$STATE_ROOT"
 STATE_ROOT=$(CDPATH='' cd "$STATE_ROOT" && pwd -P)
 STATE_BUILD="$STATE_ROOT/_build"
+rm -rf "$STATE_BUILD"
 KEEP_DOC="$STATE_ROOT/keep_me.ouro"
 printf -- 'def keep_me : Nat := Z;\n' >"$KEEP_DOC"
 KEEP_URI=$(uri_of_path "$KEEP_DOC")
@@ -369,16 +372,17 @@ THREE_URI=$(uri_of_path "$STATE_ROOT/agg_three.ouro")
 FOUR_URI=$(uri_of_path "$STATE_ROOT/agg_four.ouro")
 FIVE_URI=$(uri_of_path "$STATE_ROOT/agg_five.ouro")
 SPILL_URI=$(uri_of_path "$SPILL_DOC")
-KEEP_SYMBOL='"id":201,"result":[{"name":"keep_me","kind":3,"location":{"uri":"'"$KEEP_URI"'","range":{"start":{"line":0,"character":0},"end":{"line":0,"character":0}}}]'
-KEEP_SYMBOL_AFTER='"id":202,"result":[{"name":"keep_me","kind":3,"location":{"uri":"'"$KEEP_URI"'","range":{"start":{"line":0,"character":0},"end":{"line":0,"character":0}}}]'
+# Observed framed replies close location, item, array, then the message.
+KEEP_SYMBOL='"id":201,"result":[{"name":"keep_me","kind":3,"location":{"uri":"'"$KEEP_URI"'","range":{"start":{"line":0,"character":0},"end":{"line":0,"character":0}}}}]'
+KEEP_SYMBOL_AFTER='"id":202,"result":[{"name":"keep_me","kind":3,"location":{"uri":"'"$KEEP_URI"'","range":{"start":{"line":0,"character":0},"end":{"line":0,"character":0}}}}]'
 KEEP_HOVER='"id":203,"result":{"contents":{"kind":"markdown","value":"```ouro\ndef keep_me : Nat\n```'
-ONE_SYMBOL='"id":204,"result":[{"name":"agg_one","kind":3,"location":{"uri":"'"$ONE_URI"'","range":{"start":{"line":0,"character":0},"end":{"line":0,"character":0}}}]'
-TWO_SYMBOL='"id":205,"result":[{"name":"agg_two","kind":3,"location":{"uri":"'"$TWO_URI"'","range":{"start":{"line":0,"character":0},"end":{"line":0,"character":0}}}]'
-THREE_SYMBOL='"id":206,"result":[{"name":"agg_three","kind":3,"location":{"uri":"'"$THREE_URI"'","range":{"start":{"line":0,"character":0},"end":{"line":0,"character":0}}}]'
-FOUR_SYMBOL='"id":207,"result":[{"name":"agg_four","kind":3,"location":{"uri":"'"$FOUR_URI"'","range":{"start":{"line":0,"character":0},"end":{"line":0,"character":0}}}]'
+ONE_SYMBOL='"id":204,"result":[{"name":"agg_one","kind":3,"location":{"uri":"'"$ONE_URI"'","range":{"start":{"line":0,"character":0},"end":{"line":0,"character":0}}}}]'
+TWO_SYMBOL='"id":205,"result":[{"name":"agg_two","kind":3,"location":{"uri":"'"$TWO_URI"'","range":{"start":{"line":0,"character":0},"end":{"line":0,"character":0}}}}]'
+THREE_SYMBOL='"id":206,"result":[{"name":"agg_three","kind":3,"location":{"uri":"'"$THREE_URI"'","range":{"start":{"line":0,"character":0},"end":{"line":0,"character":0}}}}]'
+FOUR_SYMBOL='"id":207,"result":[{"name":"agg_four","kind":3,"location":{"uri":"'"$FOUR_URI"'","range":{"start":{"line":0,"character":0},"end":{"line":0,"character":0}}}}]'
 SPILL_EMPTY='"id":208,"result":[]'
-ONE_STILL='"id":209,"result":[{"name":"agg_one","kind":3,"location":{"uri":"'"$ONE_URI"'","range":{"start":{"line":0,"character":0},"end":{"line":0,"character":0}}}]'
-FIVE_SYMBOL='"id":210,"result":[{"name":"agg_five","kind":3,"location":{"uri":"'"$FIVE_URI"'","range":{"start":{"line":0,"character":0},"end":{"line":0,"character":0}}}]'
+ONE_STILL='"id":209,"result":[{"name":"agg_one","kind":3,"location":{"uri":"'"$ONE_URI"'","range":{"start":{"line":0,"character":0},"end":{"line":0,"character":0}}}}]'
+FIVE_SYMBOL='"id":210,"result":[{"name":"agg_five","kind":3,"location":{"uri":"'"$FIVE_URI"'","range":{"start":{"line":0,"character":0},"end":{"line":0,"character":0}}}}]'
 {
 	frame '{"jsonrpc":"2.0","id":200,"method":"initialize","params":{"capabilities":{}}}'
 	frame '{"jsonrpc":"2.0","method":"initialized","params":{}}'
@@ -406,8 +410,7 @@ FIVE_SYMBOL='"id":210,"result":[{"name":"agg_five","kind":3,"location":{"uri":"'
 	frame '{"jsonrpc":"2.0","method":"exit"}'
 } >"$OUT/state.in"
 set +e
-OURO_ROOT="$STATE_ROOT" OURO_LSP_OURO1=/dev/null \
-	"$LSP" <"$OUT/state.in" >"$OUT/state.out" 2>"$OUT/state.err"
+OURO_ROOT="$STATE_ROOT" "$LSP" <"$OUT/state.in" >"$OUT/state.out" 2>"$OUT/state.err"
 state_status=$?
 set -e
 tr '\r' '\n' <"$OUT/state.out" | grep '^{' >"$OUT/state.jsonl" || true
@@ -434,14 +437,18 @@ want_state aggregate-fifth-rejected "$SPILL_EMPTY"
 want_state aggregate-reject-preserves-open "$ONE_STILL"
 want_state close-reopen-releases-bytes "$FIVE_SYMBOL"
 want_state rejected-update-shutdown '"id":211,"result":null'
-if grep -q '"id":202,"result":\[\]' "$OUT/state.jsonl"; then
+if grep -Fq '"id":202,"result":[]' "$OUT/state.jsonl"; then
 	bad rejected-change-empty-symbols "oversized replacement discarded the prior buffer"
 fi
-if grep -q '"name":"agg_spill"' "$OUT/state.jsonl"; then
+if grep -Fq '"name":"agg_spill"' "$OUT/state.jsonl"; then
 	bad aggregate-spill-stored "over-aggregate open was retained"
 fi
 
-if find "$ROOT/_build" "$ATTACK_BUILD" "$STATE_BUILD" -maxdepth 1 -type f -name 'ouro_tmp_*' -print -quit | grep -q .; then
+state_scratch_root="$ATTACK_BUILD"
+if [ -d "$STATE_BUILD" ]; then
+	state_scratch_root="$STATE_BUILD"
+fi
+if find "$ROOT/_build" "$ATTACK_BUILD" "$state_scratch_root" -maxdepth 1 -type f -name 'ouro_tmp_*' -print -quit | grep -q .; then
 	bad scratch-cleanup "unique LSP scratch remains"
 else
 	ok "unique LSP scratch cleaned after success and failure"
