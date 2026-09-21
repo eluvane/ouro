@@ -268,8 +268,9 @@ Snapshot checked **2026-09-21** on `eluvane/ouro`, main
 PRs. The ten reservations below were admitted from that empty board; sibling
 reservations apply even before a PR appears. Recheck paginated file lists and
 heads before writing. This overview does not replace `locks.tsv`. Live
-`eluvane/ouro` numbers such as #35 and #36 are this wave's checked-native and
-LSP PRs; they are not the historical `ouro-dev` owners with the same digits.
+`eluvane/ouro` numbers such as #35, #36, and #37 are this wave's checked-native,
+LSP, and docs PRs; they are not the historical `ouro-dev` owners with the same
+digits.
 
 | Surface | Current owner | Scheduling consequence |
 | --- | --- | --- |
@@ -282,7 +283,7 @@ LSP PRs; they are not the historical `ouro-dev` owners with the same digits.
 | `tools/pkg/main.ouro`, `tools/pkg/model.ouro`, `tools/pkg/security.ouro`, `scripts/pkg_suite.sh`, `docs/pkg.md` | reservation; live [#32](https://github.com/eluvane/ouro/pull/32) | RESERVED. `tools/pkg/model.ouro` remains reserved even if a live PR has not edited it yet. |
 | `tools/lsp_model.ouro`, `tools/lsp_process_model.ouro`, `scripts/lsp_suite.sh` | reservation; live [#36](https://github.com/eluvane/ouro/pull/36) | RESERVED. This is the current `eluvane/ouro` #36, not historical `ouro-dev` #36. Editor dependency manifests stay outside this write set. The LSP model files remain reserved even if a live PR has edited only the suite. |
 | `samples/examples/practical_cli_file.ouro`, `samples/examples/README.md` | reservation; live [#33](https://github.com/eluvane/ouro/pull/33) | RESERVED. The sample source remains reserved even if a live PR has edited only the recipe. |
-| `docs/agent_parallel.md`, `docs/README.md`, `CHANGELOG.md` | `wave-docs` reservation | RESERVED by this docs coordinator. Other wave writers supply proposed changelog text and leave shared metadata unedited. |
+| `docs/agent_parallel.md`, `docs/README.md`, `CHANGELOG.md` | reservation; live [#37](https://github.com/eluvane/ouro/pull/37) | RESERVED by this docs coordinator. This is the current `eluvane/ouro` #37, not historical `ouro-dev` #37. Other wave writers supply proposed changelog text and leave shared metadata unedited. |
 
 This wave has no quality-engine reservation and no live analyzer, Clippy,
 lint-unification, or rule-ID owner. Do not add a second quality product while
@@ -348,7 +349,7 @@ are not recorded passes.
 | `packages` **RESERVED [#32](https://github.com/eluvane/ouro/pull/32)** | Make one existing local-registry/vendor/verify workflow reliably usable. | `tools/pkg/main.ouro`, `tools/pkg/model.ouro`, `tools/pkg/security.ouro`, `scripts/pkg_suite.sh`, `docs/pkg.md`. | LSP/import compiler ownership, `scripts/coil.sh`, other package docs/samples, legacy paths, invented `pkg:` imports. | `sh scripts/pkg_suite.sh`; `sh scripts/pkg_suite.sh --native-tools _build/native` on Windows. | Use current package docs, not unmerged distribution promises. |
 | `lsp` **RESERVED [#36](https://github.com/eluvane/ouro/pull/36)** | Fix one user-visible diagnostic or request-state contract through the existing server. | `tools/lsp_model.ouro`, `tools/lsp_process_model.ouro`, `scripts/lsp_suite.sh`. | Checker, formatter, package resolver, `tools/lsp.ouro` unless later reserved, editor dependency manifests, a second server. | `sh scripts/lsp_suite.sh`; `sh scripts/lsp_suite.sh --native-tools _build/native` on Windows. | Compiler/formatter dependencies must be merged before their consumer changes. Current `eluvane/ouro` #36 is this LSP reservation, not historical `ouro-dev` #36. |
 | `native-samples` **RESERVED [#33](https://github.com/eluvane/ouro/pull/33)** | Turn the existing CLI/file sample into an explicitly demonstrated native success/error recipe. | `samples/examples/practical_cli_file.ouro`, `samples/examples/README.md`. | Other samples, sample/test inventories, stdlib/compiler/runtime, unsupported sample-harness options. | `sh scripts/ouro1.sh check samples/examples/practical_cli_file.ouro`; run the exact native-sample block below; `sh scripts/samples_suite.sh --native-tools _build/native`. | Working native Windows toolchain; fix only a reproduced sample-local defect, otherwise improve the verified recipe. Linux PE execution is unavailable. |
-| `wave-docs` **RESERVED** | Keep one operable playbook and index aligned with current `eluvane/ouro` locks. | `docs/agent_parallel.md`, `docs/README.md`, `CHANGELOG.md`. | Other docs, AGENTS policy, all implementation files, generated reference, shared inventories. | `python3 scripts/docs_examples_gate.py`; `python3 scripts/github_project_gate.py`; required Unreleased bullet included before readiness. | Singleton docs coordinator for this wave. Other lanes propose changelog text and remain draft until serialized metadata is applied. Do not launch another writer when this page already has an open PR. |
+| `wave-docs` **RESERVED [#37](https://github.com/eluvane/ouro/pull/37)** | Keep one operable playbook and index aligned with current `eluvane/ouro` locks. | `docs/agent_parallel.md`, `docs/README.md`, `CHANGELOG.md`. | Other docs, AGENTS policy, all implementation files, generated reference, shared inventories. | `python3 scripts/docs_examples_gate.py`; `python3 scripts/github_project_gate.py`; required Unreleased bullet included before readiness. | Singleton docs coordinator for this wave. Current `eluvane/ouro` #37 is this page, not historical `ouro-dev` #37. Other lanes propose changelog text and remain draft until serialized metadata is applied. Do not launch another writer when this page already has an open PR. |
 
 The code paths above come from the current tree, not a proposed directory
 layout: formatter and LSP owners are files, while package and test-discovery
