@@ -34,9 +34,53 @@ sh scripts/ouro1.sh eval samples/examples/nat.ouro --print four
 - `csv_demo.ouro` — CSV parsing and output.
 - `json_demo.ouro` — JSON parsing and output.
 - `cli_argv_env.ouro` — arguments and environment variables.
-- `practical_cli_file.ouro` — CLI args, checked file read, text transform, stdout/stderr, and exit code.
+- `practical_cli_file.ouro` — CLI args, checked file read, text transform, stdout/stderr, and exit code. The sample-suite inventory is check-only; use the native recipe below for runtime proof.
 - `practical_stdin_aggregate.ouro` — stdin parsing and Nat aggregations.
 - `practical_config_report.ouro` — checked config-file read and typed config report.
+
+### Native CLI file recipe
+
+`practical_cli_file.ouro` accepts `[--upper] <input-file>`. The maintained
+sample inventory checks the source only and does not pass argv, compare
+stdout, or treat `--native-tools` as runtime proof of the cases below.
+
+```sh
+sh scripts/ouro1.sh check samples/examples/practical_cli_file.ouro
+```
+
+On Windows x86-64, compile a fresh PE with the [documented native
+toolchain](../../docs/tooling.md), then run this block from the repository
+root. Do not copy an arbitrary executable into `_build/native`. The hosted
+`build_tool.sh` path is a different backend and is not this recipe.
+
+`--upper` must write exact `OURO` plus newline to stdout, exit 0, and leave
+stderr empty. Missing arguments exit 2. A missing file exits 1. Both error
+cases keep stdout empty and write the diagnostic on stderr only.
+
+```sh
+set -eu
+mkdir -p _build/parallel/sample
+sh scripts/ouro1.sh build samples/examples/practical_cli_file.ouro
+printf 'ouro\n' > _build/parallel/sample/input.txt
+printf 'OURO\n' > _build/parallel/sample/expected
+./_build/native/practical_cli_file.exe --upper _build/parallel/sample/input.txt \
+  > _build/parallel/sample/out 2> _build/parallel/sample/err
+cmp _build/parallel/sample/expected _build/parallel/sample/out
+test ! -s _build/parallel/sample/err
+status=0
+./_build/native/practical_cli_file.exe > _build/parallel/sample/out \
+  2> _build/parallel/sample/err || status=$?
+test "$status" -eq 2
+test ! -s _build/parallel/sample/out
+test -s _build/parallel/sample/err
+test ! -e _build/parallel/sample/must-not-exist
+status=0
+./_build/native/practical_cli_file.exe _build/parallel/sample/must-not-exist \
+  > _build/parallel/sample/out 2> _build/parallel/sample/err || status=$?
+test "$status" -eq 1
+test ! -s _build/parallel/sample/out
+test -s _build/parallel/sample/err
+```
 
 ## Workflow acceptance programs
 
