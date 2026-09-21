@@ -328,7 +328,120 @@ else
 	bad document-limit "status=$big_status"
 fi
 
-if find "$ROOT/_build" "$ATTACK_BUILD" -maxdepth 1 -type f -name 'ouro_tmp_*' -print -quit | grep -q .; then
+# Rejected full-sync replacements must keep the prior buffer and byte
+# ledger. The suite already proves a first open over 512 KiB is dropped;
+# it did not check didChange of a live document, aggregate 2 MiB refusal,
+# or close/reopen releasing that ledger. Exact-limit documents are the
+# valid controls: 524288 bytes is accepted (leb inclusive).
+STATE_ROOT="$OUT/state-root"
+mkdir -p "$STATE_ROOT/_build"
+STATE_ROOT=$(CDPATH='' cd "$STATE_ROOT" && pwd -P)
+STATE_BUILD="$STATE_ROOT/_build"
+KEEP_DOC="$STATE_ROOT/keep_me.ouro"
+printf -- 'def keep_me : Nat := Z;\n' >"$KEEP_DOC"
+KEEP_URI=$(uri_of_path "$KEEP_DOC")
+write_exact_doc() {
+	# $1 path, $2 declaration line. json_text appends one escaped newline
+	# per file line, so decl + NL + pad + NL == lsp_max_document_bytes.
+	decl="$2"
+	decl_len=$(printf '%s' "$decl" | wc -c)
+	pad=$((524286 - decl_len))
+	{
+		printf '%s\n' "$decl"
+		dd if=/dev/zero bs="$pad" count=1 2>/dev/null | tr '\0' 'x'
+		printf '\n'
+	} >"$1"
+	got=$(wc -c <"$1" | tr -d ' ')
+	if [ "$got" -ne 524288 ]; then
+		bad exact-doc-bytes "$1 size=$got want=524288"
+	fi
+}
+write_exact_doc "$STATE_ROOT/agg_one.ouro" 'def agg_one : Nat := Z;'
+write_exact_doc "$STATE_ROOT/agg_two.ouro" 'def agg_two : Nat := Z;'
+write_exact_doc "$STATE_ROOT/agg_three.ouro" 'def agg_three : Nat := Z;'
+write_exact_doc "$STATE_ROOT/agg_four.ouro" 'def agg_four : Nat := Z;'
+write_exact_doc "$STATE_ROOT/agg_five.ouro" 'def agg_five : Nat := Z;'
+SPILL_DOC="$STATE_ROOT/agg_spill.ouro"
+printf -- 'def agg_spill : Nat := Z;\n' >"$SPILL_DOC"
+ONE_URI=$(uri_of_path "$STATE_ROOT/agg_one.ouro")
+TWO_URI=$(uri_of_path "$STATE_ROOT/agg_two.ouro")
+THREE_URI=$(uri_of_path "$STATE_ROOT/agg_three.ouro")
+FOUR_URI=$(uri_of_path "$STATE_ROOT/agg_four.ouro")
+FIVE_URI=$(uri_of_path "$STATE_ROOT/agg_five.ouro")
+SPILL_URI=$(uri_of_path "$SPILL_DOC")
+KEEP_SYMBOL='"id":201,"result":[{"name":"keep_me","kind":3,"location":{"uri":"'"$KEEP_URI"'","range":{"start":{"line":0,"character":0},"end":{"line":0,"character":0}}}]'
+KEEP_SYMBOL_AFTER='"id":202,"result":[{"name":"keep_me","kind":3,"location":{"uri":"'"$KEEP_URI"'","range":{"start":{"line":0,"character":0},"end":{"line":0,"character":0}}}]'
+KEEP_HOVER='"id":203,"result":{"contents":{"kind":"markdown","value":"```ouro\ndef keep_me : Nat\n```'
+ONE_SYMBOL='"id":204,"result":[{"name":"agg_one","kind":3,"location":{"uri":"'"$ONE_URI"'","range":{"start":{"line":0,"character":0},"end":{"line":0,"character":0}}}]'
+TWO_SYMBOL='"id":205,"result":[{"name":"agg_two","kind":3,"location":{"uri":"'"$TWO_URI"'","range":{"start":{"line":0,"character":0},"end":{"line":0,"character":0}}}]'
+THREE_SYMBOL='"id":206,"result":[{"name":"agg_three","kind":3,"location":{"uri":"'"$THREE_URI"'","range":{"start":{"line":0,"character":0},"end":{"line":0,"character":0}}}]'
+FOUR_SYMBOL='"id":207,"result":[{"name":"agg_four","kind":3,"location":{"uri":"'"$FOUR_URI"'","range":{"start":{"line":0,"character":0},"end":{"line":0,"character":0}}}]'
+SPILL_EMPTY='"id":208,"result":[]'
+ONE_STILL='"id":209,"result":[{"name":"agg_one","kind":3,"location":{"uri":"'"$ONE_URI"'","range":{"start":{"line":0,"character":0},"end":{"line":0,"character":0}}}]'
+FIVE_SYMBOL='"id":210,"result":[{"name":"agg_five","kind":3,"location":{"uri":"'"$FIVE_URI"'","range":{"start":{"line":0,"character":0},"end":{"line":0,"character":0}}}]'
+{
+	frame '{"jsonrpc":"2.0","id":200,"method":"initialize","params":{"capabilities":{}}}'
+	frame '{"jsonrpc":"2.0","method":"initialized","params":{}}'
+	frame "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":{\"uri\":\"$KEEP_URI\",\"languageId\":\"ouro\",\"version\":1,\"text\":\"$(json_text "$KEEP_DOC")\"}}}"
+	frame "{\"jsonrpc\":\"2.0\",\"id\":201,\"method\":\"textDocument/documentSymbol\",\"params\":{\"textDocument\":{\"uri\":\"$KEEP_URI\"}}}"
+	frame "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didChange\",\"params\":{\"textDocument\":{\"uri\":\"$KEEP_URI\",\"version\":2},\"contentChanges\":[{\"text\":\"$(json_text "$BIG_DOC")\"}]}}"
+	frame "{\"jsonrpc\":\"2.0\",\"id\":202,\"method\":\"textDocument/documentSymbol\",\"params\":{\"textDocument\":{\"uri\":\"$KEEP_URI\"}}}"
+	frame "{\"jsonrpc\":\"2.0\",\"id\":203,\"method\":\"textDocument/hover\",\"params\":{\"textDocument\":{\"uri\":\"$KEEP_URI\"},\"position\":{\"line\":0,\"character\":4}}}"
+	frame "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didClose\",\"params\":{\"textDocument\":{\"uri\":\"$KEEP_URI\"}}}"
+	frame "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":{\"uri\":\"$ONE_URI\",\"languageId\":\"ouro\",\"version\":1,\"text\":\"$(json_text "$STATE_ROOT/agg_one.ouro")\"}}}"
+	frame "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":{\"uri\":\"$TWO_URI\",\"languageId\":\"ouro\",\"version\":1,\"text\":\"$(json_text "$STATE_ROOT/agg_two.ouro")\"}}}"
+	frame "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":{\"uri\":\"$THREE_URI\",\"languageId\":\"ouro\",\"version\":1,\"text\":\"$(json_text "$STATE_ROOT/agg_three.ouro")\"}}}"
+	frame "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":{\"uri\":\"$FOUR_URI\",\"languageId\":\"ouro\",\"version\":1,\"text\":\"$(json_text "$STATE_ROOT/agg_four.ouro")\"}}}"
+	frame "{\"jsonrpc\":\"2.0\",\"id\":204,\"method\":\"textDocument/documentSymbol\",\"params\":{\"textDocument\":{\"uri\":\"$ONE_URI\"}}}"
+	frame "{\"jsonrpc\":\"2.0\",\"id\":205,\"method\":\"textDocument/documentSymbol\",\"params\":{\"textDocument\":{\"uri\":\"$TWO_URI\"}}}"
+	frame "{\"jsonrpc\":\"2.0\",\"id\":206,\"method\":\"textDocument/documentSymbol\",\"params\":{\"textDocument\":{\"uri\":\"$THREE_URI\"}}}"
+	frame "{\"jsonrpc\":\"2.0\",\"id\":207,\"method\":\"textDocument/documentSymbol\",\"params\":{\"textDocument\":{\"uri\":\"$FOUR_URI\"}}}"
+	frame "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":{\"uri\":\"$SPILL_URI\",\"languageId\":\"ouro\",\"version\":1,\"text\":\"$(json_text "$SPILL_DOC")\"}}}"
+	frame "{\"jsonrpc\":\"2.0\",\"id\":208,\"method\":\"textDocument/documentSymbol\",\"params\":{\"textDocument\":{\"uri\":\"$SPILL_URI\"}}}"
+	frame "{\"jsonrpc\":\"2.0\",\"id\":209,\"method\":\"textDocument/documentSymbol\",\"params\":{\"textDocument\":{\"uri\":\"$ONE_URI\"}}}"
+	frame "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didClose\",\"params\":{\"textDocument\":{\"uri\":\"$FOUR_URI\"}}}"
+	frame "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":{\"uri\":\"$FIVE_URI\",\"languageId\":\"ouro\",\"version\":1,\"text\":\"$(json_text "$STATE_ROOT/agg_five.ouro")\"}}}"
+	frame "{\"jsonrpc\":\"2.0\",\"id\":210,\"method\":\"textDocument/documentSymbol\",\"params\":{\"textDocument\":{\"uri\":\"$FIVE_URI\"}}}"
+	frame '{"jsonrpc":"2.0","id":211,"method":"shutdown","params":{}}'
+	frame '{"jsonrpc":"2.0","method":"exit"}'
+} >"$OUT/state.in"
+set +e
+OURO_ROOT="$STATE_ROOT" OURO_LSP_OURO1=/dev/null \
+	"$LSP" <"$OUT/state.in" >"$OUT/state.out" 2>"$OUT/state.err"
+state_status=$?
+set -e
+tr '\r' '\n' <"$OUT/state.out" | grep '^{' >"$OUT/state.jsonl" || true
+want_state() {
+	if grep -Fq -- "$2" "$OUT/state.jsonl"; then
+		ok "$1"
+	else
+		bad "$1" "missing: $2"
+	fi
+}
+if [ "$state_status" -eq 0 ]; then
+	ok "rejected-update session exits after shutdown"
+else
+	bad rejected-update-exit "status=$state_status"
+fi
+want_state keep-control-symbol "$KEEP_SYMBOL"
+want_state rejected-change-keeps-buffer "$KEEP_SYMBOL_AFTER"
+want_state rejected-change-keeps-hover "$KEEP_HOVER"
+want_state exact-limit-one "$ONE_SYMBOL"
+want_state exact-limit-two "$TWO_SYMBOL"
+want_state exact-limit-three "$THREE_SYMBOL"
+want_state exact-limit-four "$FOUR_SYMBOL"
+want_state aggregate-fifth-rejected "$SPILL_EMPTY"
+want_state aggregate-reject-preserves-open "$ONE_STILL"
+want_state close-reopen-releases-bytes "$FIVE_SYMBOL"
+want_state rejected-update-shutdown '"id":211,"result":null'
+if grep -q '"id":202,"result":\[\]' "$OUT/state.jsonl"; then
+	bad rejected-change-empty-symbols "oversized replacement discarded the prior buffer"
+fi
+if grep -q '"name":"agg_spill"' "$OUT/state.jsonl"; then
+	bad aggregate-spill-stored "over-aggregate open was retained"
+fi
+
+if find "$ROOT/_build" "$ATTACK_BUILD" "$STATE_BUILD" -maxdepth 1 -type f -name 'ouro_tmp_*' -print -quit | grep -q .; then
 	bad scratch-cleanup "unique LSP scratch remains"
 else
 	ok "unique LSP scratch cleaned after success and failure"
