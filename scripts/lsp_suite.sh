@@ -363,7 +363,10 @@ write_exact_doc "$STATE_ROOT/agg_one.ouro" 'def agg_one : Nat := Z;'
 write_exact_doc "$STATE_ROOT/agg_two.ouro" 'def agg_two : Nat := Z;'
 write_exact_doc "$STATE_ROOT/agg_three.ouro" 'def agg_three : Nat := Z;'
 write_exact_doc "$STATE_ROOT/agg_four.ouro" 'def agg_four : Nat := Z;'
-write_exact_doc "$STATE_ROOT/agg_five.ouro" 'def agg_five : Nat := Z;'
+# Reopen after close is a small document: that still fails if the 512 KiB
+# close did not release the ledger, without parsing a fifth max-size body
+# while three exact-limit buffers remain.
+printf -- 'def agg_five : Nat := Z;\n' >"$STATE_ROOT/agg_five.ouro"
 SPILL_DOC="$STATE_ROOT/agg_spill.ouro"
 printf -- 'def agg_spill : Nat := Z;\n' >"$SPILL_DOC"
 ONE_URI=$(uri_of_path "$STATE_ROOT/agg_one.ouro")
