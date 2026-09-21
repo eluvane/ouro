@@ -198,6 +198,26 @@ else
 	cat "$OUT/last.err" >&2
 fi
 
+# A deleted vendor tree is missing source, not an empty matching digest.
+rm -rf _ouro_pkgs/hello
+if status "$PKG" verify; then
+	bad verify-missing-vendor "expected nonzero"
+else
+	if grep -q 'missing vendored source for hello' "$OUT/last.err"; then
+		ok verify-missing-vendor
+	else
+		bad verify-missing-vendor "no missing-source report"
+		cat "$OUT/last.err" >&2
+	fi
+fi
+"$PKG" install >>"$OUT/install.log" 2>&1
+if status "$PKG" verify; then
+	ok reinstall-missing-vendor
+else
+	bad reinstall-missing-vendor "expected zero"
+	cat "$OUT/last.err" >&2
+fi
+
 # A dependency the registry does not have is a resolution error, not a crash.
 "$PKG" add nosuch --range '^1.0.0' >>"$OUT/add.log" 2>&1
 if status "$PKG" install; then

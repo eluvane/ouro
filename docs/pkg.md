@@ -149,8 +149,11 @@ then reinstall; do not maintain the vendored copy by hand.
 deterministic digest of the vendored files. The current lock body is generated
 JSON. `list` and `verify` reject an unreadable lockfile instead of treating it
 as empty. `verify` recomputes that digest and typechecks every installed
-`.ouro` file through sibling `coil.exe check`. Verification requires exit
-0 and `CHECK_OK` without `CHECK_FAIL`; process errors remain failures.
+`.ouro` file through sibling `coil.exe check`. A local edit under
+`_ouro_pkgs/` is digest drift. A missing `_ouro_pkgs/<name>/` tree is
+reported as missing vendored source for that locked package. Verification
+requires exit 0 and `CHECK_OK` without `CHECK_FAIL`; process errors remain
+failures.
 `OURO_PKG_CHECK` no longer selects a checker. Each source has a provisional
 120-second, one-CPU, 3072-MiB child-tree limit and 16 MiB per captured stream.
 
