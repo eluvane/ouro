@@ -23,6 +23,12 @@ def module_ok (count : Nat) (result : DeclarationResult) : Bool :=
 def module_valid : List FileItem :=
     [FDef 90 (CSort 1) (CSort 0), FDef 91 (CSort 1) (CConst 90)];
 
+def module_prefix : List FileItem :=
+    [FDef 90 (CSort 1) (CSort 0)];
+
+def module_late_unbound : List FileItem :=
+    [FDef 90 (CSort 1) (CSort 0), FDef 91 (CSort 0) (CConst 77)];
+
 def module_exact (items : List FileItem) : DeclarationResult :=
     check_declarations CheckExactCore keep_checking 200 items;
 
@@ -112,6 +118,70 @@ def module_universe_batch (level : Nat) : Bool :=
            end))
     end;
 
+def module_typed (name : Nat) (phase : Nat)
+    (accept : CheckFailure -> Bool) (result : DeclarationResult) : Bool :=
+    match result with
+    | DeclarationsOk _ => False
+    | DeclarationsErr actual at failure =>
+        andb (eqNat actual name)
+          (andb (eqNat (compiler_test_phase_nat at) phase) (accept failure))
+    end;
+
+def module_expect_unbound (missing : Nat) (failure : CheckFailure) : Bool :=
+    match failure with
+    | CheckMalformedCore fault =>
+        match fault with
+        | CheckUnboundGlobal actual => eqNat actual missing
+        | CheckUnboundVariable _ => False
+        | CheckUnknownInductive _ => False
+        | CheckUnknownConstructor _ _ => False
+        | CheckConstructorParameters => False
+        | CheckCaseMetadata => False
+        | CheckFixMetadata => False
+        | CheckLiteralType _ => False
+        | CheckUnresolvedLiteral _ => False
+        | CheckDuplicateName _ => False
+        end
+    | CheckTypeFailure _ => False
+    | CheckReductionFailure _ => False
+    | CheckResourceLimit => False
+    | CheckUnsupported _ => False
+    | CheckCancelled => False
+    | CheckInternalFailure _ => False
+    | CheckPrimitiveFailure _ => False
+    end;
+
+def module_expect_cancelled (failure : CheckFailure) : Bool :=
+    match failure with
+    | CheckCancelled => True
+    | CheckTypeFailure _ => False
+    | CheckMalformedCore _ => False
+    | CheckReductionFailure _ => False
+    | CheckResourceLimit => False
+    | CheckUnsupported _ => False
+    | CheckInternalFailure _ => False
+    | CheckPrimitiveFailure _ => False
+    end;
+
+def module_expect_resource (failure : CheckFailure) : Bool :=
+    match failure with
+    | CheckResourceLimit => True
+    | CheckTypeFailure _ => False
+    | CheckMalformedCore _ => False
+    | CheckReductionFailure _ => False
+    | CheckUnsupported _ => False
+    | CheckCancelled => False
+    | CheckInternalFailure _ => False
+    | CheckPrimitiveFailure _ => False
+    end;
+
+-- Accepts every item so the remaining traversal budget, not term fuel, decides
+-- the next declaration boundary. A failed remainder must not return the prefix.
+def module_keep_item (_mode : CheckMode) (_fuel : Nat)
+    (sig : List Entry) (item : FileItem) : DeclarationResult :=
+    DeclarationsOk
+      (Cons Entry (MkEntry (file_item_name item) (CSort 1) (Just CoreTerm (CSort 0))) sig);
+
 def module_laws : List ModuleLaw :=
     [ MkModuleLaw "empty module succeeds" (module_ok 0 (module_exact []))
     , MkModuleLaw "ordered definitions retain the complete environment"
@@ -169,6 +239,35 @@ def module_laws : List ModuleLaw :=
     , MkModuleLaw "universe batch rejects later member at level 2" (module_universe_batch 2)
     , MkModuleLaw "universe batch accepts both members within the ceiling"
         (module_ok 2 (module_exact [module_universe_item 60 1 0, module_universe_item 80 1 0]))
+    , MkModuleLaw "late malformed prefix alone is accepted"
+        (module_ok 1 (module_exact module_prefix))
+    , MkModuleLaw "source module accepts the same isolated prefix"
+        (module_ok 1 (check_module 200 [90] module_prefix))
+    , MkModuleLaw "late malformed body rejects after a valid prefix"
+        (module_typed 91 2
+          (fun (failure : CheckFailure) => module_expect_unbound 77 failure)
+          (module_exact module_late_unbound))
+    , MkModuleLaw "source module late malformed body stays fail-closed"
+        (module_typed 91 2
+          (fun (failure : CheckFailure) => module_expect_unbound 77 failure)
+          (check_module 200 [90, 91] module_late_unbound))
+    , MkModuleLaw "source cancellation after a valid prefix exposes no partial success"
+        (module_typed 91 0 module_expect_cancelled
+          (check_declarations CheckSourceCore module_stop_after_one 200 module_valid))
+    , MkModuleLaw "cancellation after a prefix precedes a late malformed body"
+        (module_typed 91 0 module_expect_cancelled
+          (check_declarations CheckExactCore module_stop_after_one 200 module_late_unbound))
+    , MkModuleLaw "exhausted traversal after a valid prefix reports the next declaration"
+        (module_typed 91 0 module_expect_resource
+          (check_declarations_with module_keep_item CheckSourceCore keep_checking 1 []
+            module_valid))
+    , MkModuleLaw "traversal budget still accepts the complete module after the prefix"
+        (module_ok 2
+          (check_declarations_with module_keep_item CheckSourceCore keep_checking 2 []
+            module_valid))
+    , MkModuleLaw "later declaration exhaustion keeps the failing name"
+        (module_typed 91 2 module_expect_resource
+          (check_declarations CheckExactCore keep_checking 4 module_valid))
     ];
 
 -- @entry main
