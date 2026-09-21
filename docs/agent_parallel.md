@@ -3,7 +3,10 @@
 Use this page to run a **rolling queue of up to about ten focused engineering
 PRs**, from task selection through review, merge, and immediate replenishment.
 [AGENTS.md](../AGENTS.md) remains authoritative; this page allocates work, not
-exceptions to repository policy.
+exceptions to repository policy. Live-lock lookup and admission apply only to
+[`eluvane/ouro`](https://github.com/eluvane/ouro). A dated snapshot, including
+historical `eluvane/ouro-dev` TAKEN rows, is evidence at that SHA. It is not
+dispatch authority and does not authorize unrelated edits.
 
 A good hour buys **one reason, one file lock, one measurable done, and an honest
 T0 on a warm tree**. Ten agents editing one compiler cone, remapping the same
@@ -41,10 +44,11 @@ its files. Replacing a stalled agent on the same PR is a writer handoff, not a
 second slot or a second PR.
 
 Count distinct admitted engineering tasks, including existing relevant open PRs
-and reservations that have no PR yet. Do not count catalog rows as PRs: #35
-occupies several areas but is one PR. Dependency bots have a separate maintenance
-queue; their file locks, CI load, and review cost still constrain admissions.
-Do not hide blocked drafts outside the count to start ten more writers.
+and reservations that have no PR yet. Do not count catalog rows as PRs: one PR
+that touches several areas still occupies one slot. Dependency bots have a
+separate maintenance queue; their file locks, CI load, and review cost still
+constrain admissions. Do not hide blocked drafts outside the count to start ten
+more writers. Sibling reservations apply even before their PR appears.
 
 | Task state | Slot / file reservation | Maintainer action |
 | --- | --- | --- |
@@ -106,9 +110,11 @@ work. Tie larger work to the existing [roadmap](roadmap.md), never invented stag
 At least half the admitted tasks should improve compiler/language/stdlib/native
 runtime or the actual check/eval/run/package/test/editor user path. Performance
 and diagnostics are work on those paths, not separate product quotas. Keep at
-most one quality-engine task; while #35 owns it, admit no second analyzer,
-Clippy, lint-unification, or rule-ID project. A sample task needs execution/error
-acceptance evidence, not another demo instead of an underlying capability.
+most one quality-engine task. While any live `eluvane/ouro` PR owns analyzer,
+Clippy, lint-unification, or rule-ID work, admit no second quality product.
+Historical `ouro-dev` #35 is not a current lock here. A sample task needs
+execution/error acceptance evidence, not another demo instead of an underlying
+capability.
 
 Use this task card in the existing issue or PR body; fill it before dispatch:
 
@@ -138,7 +144,10 @@ checker, fixture, or CI budgets.
 
 ### Refresh authority and capture live locks
 
-Run from a clean checkout of `eluvane/ouro-dev`, with authenticated GitHub CLI:
+Run from a clean checkout of `eluvane/ouro`, with authenticated GitHub CLI.
+Scope every live-lock lookup to this repository. Historical PR numbers from
+`eluvane/ouro-dev` are not current locks here; the same number in this
+repository is a different pull request.
 
 ```sh
 set -eu
@@ -149,8 +158,9 @@ gh pr list --state open --json number,title,headRefName,files
 gh pr list --state merged --limit 20 --json number,title,mergedAt,files
 ```
 
-Verify the repository and default branch before creating branches from
-`origin/main`. A cloud workspace's initial commit is not authority. Read
+Verify `nameWithOwner` is `eluvane/ouro` and the default branch is `main`
+before creating branches from `origin/main`. A cloud workspace's initial
+commit is not authority. Read
 [contributing](../CONTRIBUTING.md), the [index](README.md), [design](design.md),
 [roadmap](roadmap.md), [architecture](architecture.md), [TCB](tcb.md),
 [syntax](syntax.md), [tooling](tooling.md), [build](build.md), [CI](ci.md),
@@ -184,7 +194,7 @@ base = (out / 'base.txt').read_text().strip()
 prs = json.loads((out / 'open.json').read_text())
 if len(prs) >= 1000:
     raise SystemExit('PR listing may be incomplete; paginate before launching')
-repo = 'repos/eluvane/ouro-dev'
+repo = 'repos/eluvane/ouro'
 def api(endpoint, *flags):
     return json.loads(subprocess.check_output(['gh', 'api', *flags, endpoint], text=True))
 locks = collections.defaultdict(set)
@@ -244,69 +254,108 @@ through a reviewed split, merge, or explicit abandonment before reassignment.
 A handoff within the same PR keeps one branch and one task. Read-only review
 and reproductions on unchanged source can continue while a lane waits.
 
-### Current lock table
+### Dated snapshots are not dispatch authority
 
-Snapshot checked **2026-09-19**, main
-`d7c3e1a1f9892da6420d266d4c558d1f08a82994`. Refresh the commands above for every
-admission or merge; neither this date nor an old PR body grants a permanent
-reservation.
-The following is a grouped overview of the live file lists, not their replacement.
+A dated lock table is working evidence at a recorded SHA. It is **not**
+dispatch authority. Refresh the `eluvane/ouro` commands above before every
+admission, scope expansion, or merge. Do not treat an embedded 2026-09-19
+`ouro-dev` TAKEN row, an old PR body, or a copied table as a live reservation.
 
-| Surface | Existing owner | Scheduling consequence |
+### Current admissions
+
+Snapshot checked **2026-09-21** on `eluvane/ouro`, main
+`0d07dd5e61b3c283f7039a1c6b4c428fe5b65152`. Dispatch preflight had zero open
+PRs. The ten reservations below were admitted from that empty board; sibling
+reservations apply even before a PR appears. Recheck paginated file lists and
+heads before writing. This overview does not replace `locks.tsv`. Live
+`eluvane/ouro` numbers such as #35 and #36 are this wave's checked-native and
+LSP PRs; they are not the historical `ouro-dev` owners with the same digits.
+
+| Surface | Current owner | Scheduling consequence |
 | --- | --- | --- |
-| `compiler/file_elab*.ouro`, refinement/checking/lowering, `compiler/native/managed_*`, MIR/codegen | [#35](https://github.com/eluvane/ouro-dev/pull/35) | TAKEN. No second checker/lowering or managed-backend writer in this cone. |
-| `compiler/parse_a.ouro`, `parse_b.ouro`, `parser_file.ouro`, `parser_parse.ouro` | #35 | TAKEN. An untouched lexer file does not make a parser-wide assignment safe. |
-| `compiler/native/pe.ouro`, `pe_fixups.ouro`, `pe_imports.ouro`, `pe_model.ouro`, `pe_unwind.ouro` | #35 | TAKEN. There is no free PE-writer lane hidden inside `compiler/native/`. |
-| `tools/fmt.ouro`, `tools/fix/`, analyzer/Clippy/lint/shared-quality files; `docs/quality.md`, `docs/tooling.md`, `docs/clippy_grade_firewall.md` | #35 | Existing quality owner only; do not commission another quality product or ID migration. |
-| `tools/pkg/main.ouro`, `tools/pkg/model.ouro`, `scripts/coil.sh`, root `README.md` | [#11](https://github.com/eluvane/ouro-dev/pull/11), #35 | Already overlapping. Package work waits for an explicit owner and rebased file list. |
-| `tools/lsp_model.ouro` | [#23](https://github.com/eluvane/ouro-dev/pull/23), #35 | Already overlapping; the remaining LSP entry/process files also occur in #35. |
-| `docs/agent_parallel.md`, `docs/README.md` | [#37](https://github.com/eluvane/ouro-dev/pull/37) | TAKEN by this docs PR; update this owner rather than opening another playbook. |
-| `CHANGELOG.md` | #35 | Singleton metadata lock, including docs bullets. No concurrent edit exemption. |
-| Selected `std/` and `samples/` files | #35 | Do not assign either whole tree. In particular JSON, path, filesystem-walk, semver, workflow, and several runnable samples are taken. |
-| `std/collections.ouro`, `std/listx.ouro`, `std/string.ouro`, `std/stringx.ouro`, `std/lines.ouro`, `std/num.ouro`, `std/text.ouro`, `tests/practical_stdlib_tests.ouro`, and their generated API pages | [#36](https://github.com/eluvane/ouro-dev/pull/36) | TAKEN. The collections slot is no longer free; do not dispatch its writer or hand-edit generated reference. |
-| `site/package.json`, `site/package-lock.json` | #6, #25, #26, #27 | Serialize dependency updates; these are not language-development slots. |
-| `editors/vscode/package.json`, `editors/vscode/package-lock.json` | #1, #5, #19, #20, #21 | Serialize dependency updates separately from LSP source work. |
-| `.github/workflows/ouro-pages.yml` | #18 | Existing workflow lock; outside this language wave. |
+| `std/collections.ouro`, `tests/practical_stdlib_tests.ouro` | `stdlib-collections` reservation | RESERVED. No second collections writer; do not hand-edit generated API pages or baselines. |
+| `tools/test/discovery.ouro`, `tests/native_test_discovery_tests.ouro` | reservation; live [#29](https://github.com/eluvane/ouro/pull/29) | RESERVED. The discovery source remains reserved even if a live PR has edited only the test. |
+| `runtime/platform/windows_process_bounded.ouro`, `tests/native_managed/process_bounded.ouro` | reservation; live [#30](https://github.com/eluvane/ouro/pull/30) | RESERVED. The runtime owner remains reserved even if a live PR has edited only the test. |
+| `tests/compiler_native_syntax_tests.ouro` | reservation; live [#31](https://github.com/eluvane/ouro/pull/31) | RESERVED. Parser and lexer files are not in this write set. |
+| `tests/compiler_module_tests.ouro` | reservation; live [#35](https://github.com/eluvane/ouro/pull/35) | RESERVED. This is the current `eluvane/ouro` #35, not historical `ouro-dev` #35. Compiler and native source are not reserved by this task. |
+| `tools/fmt.ouro`, `tools/fmt_pipeline.ouro`, `tests/analyze/precision/format_fix.ouro` | reservation; live [#34](https://github.com/eluvane/ouro/pull/34) | RESERVED. No second formatter or shared-quality writer. |
+| `tools/pkg/main.ouro`, `tools/pkg/model.ouro`, `tools/pkg/security.ouro`, `scripts/pkg_suite.sh`, `docs/pkg.md` | reservation; live [#32](https://github.com/eluvane/ouro/pull/32) | RESERVED. `tools/pkg/model.ouro` remains reserved even if a live PR has not edited it yet. |
+| `tools/lsp_model.ouro`, `tools/lsp_process_model.ouro`, `scripts/lsp_suite.sh` | reservation; live [#36](https://github.com/eluvane/ouro/pull/36) | RESERVED. This is the current `eluvane/ouro` #36, not historical `ouro-dev` #36. Editor dependency manifests stay outside this write set. The LSP model files remain reserved even if a live PR has edited only the suite. |
+| `samples/examples/practical_cli_file.ouro`, `samples/examples/README.md` | reservation; live [#33](https://github.com/eluvane/ouro/pull/33) | RESERVED. The sample source remains reserved even if a live PR has edited only the recipe. |
+| `docs/agent_parallel.md`, `docs/README.md`, `CHANGELOG.md` | `wave-docs` reservation | RESERVED by this docs coordinator. Other wave writers supply proposed changelog text and leave shared metadata unedited. |
+
+This wave has no quality-engine reservation and no live analyzer, Clippy,
+lint-unification, or rule-ID owner. Do not add a second quality product while
+finishing these ten tasks. Compiler, parser, PE, and managed-backend source are
+not reserved here; that is not pre-authorization to start a broad cone. Admit
+those files only with a new exact write set after a refreshed live-lock check.
+No open dependency-bot PRs were present in this snapshot; their locks still
+constrain admissions when they appear.
 
 Older package branches used nested collector and self-hosted paths. The current
 [architecture](architecture.md) has flattened tool entry points, including
 `tools/collect.ouro`. Do not restore retired paths during a blind rebase.
 Re-establish the current owner and supported package contract first.
 
+### Historical evidence, not current locks
+
+The 2026-09-19 snapshot below was taken on `eluvane/ouro-dev` at
+`d7c3e1a1f9892da6420d266d4c558d1f08a82994`. Its #35/#36/#37 TAKEN rows
+describe historical work in that other repository. They do not lock files in
+`eluvane/ouro`. The same numbers here are unrelated pull requests. Do not
+dispatch, wait, or refuse work from this table.
+
+| Surface | Historical `ouro-dev` owner | Historical note only |
+| --- | --- | --- |
+| `compiler/file_elab*.ouro`, refinement/checking/lowering, `compiler/native/managed_*`, MIR/codegen | [ouro-dev #35](https://github.com/eluvane/ouro-dev/pull/35) | Historical checker/lowering cone in `ouro-dev`, not a current `eluvane/ouro` lock. |
+| `compiler/parse_a.ouro`, `parse_b.ouro`, `parser_file.ouro`, `parser_parse.ouro` | ouro-dev #35 | Historical parser ownership in `ouro-dev`. |
+| `compiler/native/pe.ouro`, `pe_fixups.ouro`, `pe_imports.ouro`, `pe_model.ouro`, `pe_unwind.ouro` | ouro-dev #35 | Historical PE ownership in `ouro-dev`. |
+| `tools/fmt.ouro`, `tools/fix/`, analyzer/Clippy/lint/shared-quality files; `docs/quality.md`, `docs/tooling.md`, `docs/clippy_grade_firewall.md` | ouro-dev #35 | Historical quality owner in `ouro-dev`. |
+| `tools/pkg/main.ouro`, `tools/pkg/model.ouro`, `scripts/coil.sh`, root `README.md` | [ouro-dev #11](https://github.com/eluvane/ouro-dev/pull/11), ouro-dev #35 | Historical overlap in `ouro-dev`. |
+| `tools/lsp_model.ouro` | [ouro-dev #23](https://github.com/eluvane/ouro-dev/pull/23), ouro-dev #35 | Historical overlap in `ouro-dev`. |
+| `docs/agent_parallel.md`, `docs/README.md` | [ouro-dev #37](https://github.com/eluvane/ouro-dev/pull/37) | Historical docs owner in `ouro-dev`. |
+| `CHANGELOG.md` | ouro-dev #35 | Historical metadata lock in `ouro-dev`. |
+| Selected `std/` and `samples/` files | ouro-dev #35 | Historical partial-tree locks in `ouro-dev`. |
+| `std/collections.ouro`, `std/listx.ouro`, `std/string.ouro`, `std/stringx.ouro`, `std/lines.ouro`, `std/num.ouro`, `std/text.ouro`, `tests/practical_stdlib_tests.ouro`, and their generated API pages | [ouro-dev #36](https://github.com/eluvane/ouro-dev/pull/36) | Historical collections owner in `ouro-dev`. |
+| `site/package.json`, `site/package-lock.json` | ouro-dev #6, #25, #26, #27 | Historical dependency-bot locks in `ouro-dev`. |
+| `editors/vscode/package.json`, `editors/vscode/package-lock.json` | ouro-dev #1, #5, #19, #20, #21 | Historical editor-manifest locks in `ouro-dev`. |
+| `.github/workflows/ouro-pages.yml` | ouro-dev #18 | Historical workflow lock in `ouro-dev`. |
+
 ## 2. Lane catalog
 
-These are **ten area slots, not ten new writable PRs today**. Seven rows
-are TAKEN, including the existing docs PR #37. Three implementation/acceptance
-rows remain reservable after the live check; docs metadata still waits on #35.
-Count distinct admitted tasks rather than held rows against the concurrency cap.
-When locks clear, split the released cone into smaller exact write sets before
-using the rest of the capacity. Do not meet a concurrency target by weakening
-ownership.
+These are **ten reserved area slots on current `eluvane/ouro`**, not ten new
+writable PRs and not leftover `ouro-dev` TAKEN rows. Count distinct admitted
+tasks rather than held rows against the concurrency cap. When locks clear,
+split the released cone into smaller exact write sets before using the rest of
+the capacity. Do not meet a concurrency target by weakening ownership.
 
-`FREE` means reservable after the live snapshot, not pre-authorized, known-broken,
-or already validated. `TAKEN` rows describe held areas and acceptance direction;
-they are not instructions to start another agent. All rows must preserve
-[AGENTS.md](../AGENTS.md), existing failures, generated policy, and final review
-requirements. Commands are to run from repository root and are not recorded passes.
+`RESERVED` means the exact write set is held by this wave, whether or not a PR
+exists yet. `FREE` would mean reservable after a refreshed live snapshot, not
+pre-authorized, known-broken, or already validated. Historical `TAKEN` labels
+from `ouro-dev` are not instructions to start or block an agent here. All rows
+must preserve [AGENTS.md](../AGENTS.md), existing failures, generated policy,
+and final review requirements. Commands are to run from repository root and
+are not recorded passes.
 
-| id / status | Goal in one line | Owns (dirs/globs or exact files) | Must not touch | Done when (exact commands) | Depends on |
+| id / status | Goal in one line | Owns (exact reserved files) | Must not touch | Done when (exact commands) | Depends on |
 | --- | --- | --- | --- | --- | --- |
-| `checked-native` **TAKEN #35** | Close one checked-program-to-native acceptance or diagnostic gap, with positive and rejection evidence. | Held: `compiler/file_elab*.ouro`, `compiler/kernel*.ouro`, `compiler/file_refine*.ouro`, `compiler/lower*.ouro`, `compiler/native/`; focused tests may be reserved only after handoff. | Lexer/parser lane, C hosts, stage0, other tools, broad cleanup. | `sh scripts/test_suite.sh --compiler-checking`; `sh scripts/frontend_security_suite.sh`; `sh scripts/ouro_repo_gate.sh --profile compiler-boundary`; reproduce the selected check/eval/run case as well. | #35 merge or explicit narrowed handoff; trust/RFC review when required. PE is included here, not a second lane. |
-| `source-syntax` **TAKEN #35** | Improve one existing-syntax parse/rejection location without inventing syntax. | `compiler/lexer.ouro`, `compiler/parser*.ouro`, `compiler/parse_a.ouro`, `compiler/parse_b.ouro`, `tests/compiler_native_syntax_tests.ouro`. | `file_elab*`, `compiler/native/`, formatter/fixer, diagnostic ID remaps. | `sh scripts/ouro1.sh test tests/compiler_native_syntax_tests.ouro`; `sh scripts/frontend_security_suite.sh`; `sh scripts/test_suite.sh --compiler-checking`. | #35 release of parser paths; an accepted RFC before any syntax/acceptance-contract change. |
-| `stdlib-collections` **TAKEN #36** | Make `split_at` one traversal while preserving its existing API and results. | `std/collections.ouro`, `tests/practical_stdlib_tests.ouro`. | All other `std/`, compiler/runtime/tools, shared docs/API baselines. | `sh scripts/ouro1.sh check std/collections.ouro`; `sh scripts/ouro1.sh test tests/practical_stdlib_tests.ouro`; `python3 scripts/api_baseline_regen.py --check`; warm T0/T1 below. | #36 merge/handoff; re-read its API changes, freeze the resulting API, and reserve generated outputs separately if needed. |
-| `native-capture` **FREE** | Prove a reused bounded capture cannot leak a previous failure's state into the next result. | `runtime/platform/windows_process_bounded.ouro`, `tests/native_managed/process_bounded.ouro`. | `compiler/native/managed_*`, other platform helpers, `std/process*.ouro`, C/H, limits or ABI layouts. | `sh scripts/ouro1.sh build tests/native_managed/process_bounded.ouro`; run the exact native-capture acceptance block below; `sh scripts/runtime_io_suite.sh`. | Working native Windows x86-64 slice and frozen capture ABI. Compiler failure on a #35 path blocks this lane, not a C workaround. |
-| `test-discovery` **FREE** | Exercise late discovery failure and exact-budget completion without partial successful inventories. | `tools/test/discovery.ouro`, `tests/native_test_discovery_tests.ouro`. | `tools/test/suites.ouro`, `sample_cases.ouro`, shared assertion helpers, quality tools, discovery policy changes. | `sh scripts/ouro1.sh test tests/native_test_discovery_tests.ouro`; `sh scripts/test_suite.sh`; `sh scripts/test_suite.sh --native-tools _build/native` on Windows. | Preserve explicit literal paths, ordered roots, repeated roots, and existing fixture selection. |
-| `format` **TAKEN #35** | Preserve source bytes and checked write refusal for one concrete formatting case. | `tools/fmt.ouro`, `tools/fmt_pipeline.ouro`; fixture ownership must be resolved after #35. | Parser, checker, shared fixer paths without handoff, new formatting policy or lint IDs. | `sh scripts/fmt_suite.sh`; `sh scripts/fix_suite.sh`; original/candidate rejection and repeat-write evidence for the chosen case. | #35 merge/handoff; syntax RFC first if formatting a new construct. |
-| `packages` **TAKEN #11 / #35** | Make one existing local-registry/vendor/verify workflow reliably usable. | `tools/pkg/`, `docs/pkg.md`, `samples/pkg/`, `scripts/pkg_suite.sh` after resolving both owners. | LSP/import compiler ownership, `scripts/coil.sh` without its separate lock, legacy paths, invented `pkg:` imports. | `sh scripts/pkg_suite.sh`; `sh scripts/pkg_suite.sh --native-tools _build/native` on Windows. | Resolve #11/#35 overlap and stale paths; use current package docs, not unmerged distribution promises. |
-| `lsp` **TAKEN #23 / #35** | Fix one user-visible diagnostic or request-state contract through the existing server. | `tools/lsp.ouro`, `tools/lsp_model.ouro`, `tools/lsp_process_model.ouro`, `scripts/lsp_suite.sh` after handoff. | Checker, formatter, package resolver, editor dependency manifests, a second server. | `sh scripts/lsp_suite.sh`; `sh scripts/lsp_suite.sh --native-tools _build/native` on Windows. | Resolve both LSP owners; compiler/formatter dependencies must be merged before their consumer changes. |
-| `native-samples` **FREE** | Turn the existing CLI/file sample into an explicitly demonstrated native success/error recipe. | `samples/examples/practical_cli_file.ouro`, `samples/examples/README.md`. | Other samples, sample/test inventories, stdlib/compiler/runtime, unsupported sample-harness options. | `sh scripts/ouro1.sh check samples/examples/practical_cli_file.ouro`; run the exact native-sample block below; `sh scripts/samples_suite.sh --native-tools _build/native`. | Working native Windows toolchain; fix only a reproduced sample-local defect, otherwise improve the verified recipe. |
-| `wave-docs` **TAKEN #37 / WAIT metadata** | Keep one operable playbook and index aligned with the current lock/command inventory. | `docs/agent_parallel.md`, `docs/README.md`; `CHANGELOG.md` only after #35 releases it. | Other docs, AGENTS policy, all implementation files, generated reference. | `python3 scripts/docs_examples_gate.py`; `python3 scripts/github_project_gate.py`; required Unreleased bullet included before readiness. | Singleton docs coordinator; CHANGELOG handoff/merge. Do not launch another writer when this page already has an open PR. |
+| `checked-native` **RESERVED [#35](https://github.com/eluvane/ouro/pull/35)** | Close one checked-program-to-native acceptance or diagnostic gap, with positive and rejection evidence. | `tests/compiler_module_tests.ouro`. | Compiler/native source, lexer/parser, C hosts, stage0, other tools, broad cleanup. | `sh scripts/test_suite.sh --compiler-checking`; `sh scripts/frontend_security_suite.sh`; `sh scripts/ouro_repo_gate.sh --profile compiler-boundary`; reproduce the selected check/eval/run case as well. | Trust/RFC review when required. Missing Windows PE execution is not a pass. Do not expand into compiler/native without a new exact write set. Current `eluvane/ouro` #35 is this test reservation, not historical `ouro-dev` #35. |
+| `source-syntax` **RESERVED [#31](https://github.com/eluvane/ouro/pull/31)** | Improve one existing-syntax parse/rejection location without inventing syntax. | `tests/compiler_native_syntax_tests.ouro`. | Lexer/parser source, `file_elab*`, `compiler/native/`, formatter/fixer, diagnostic ID remaps. | `sh scripts/ouro1.sh test tests/compiler_native_syntax_tests.ouro`; `sh scripts/frontend_security_suite.sh`; `sh scripts/test_suite.sh --compiler-checking`. | An accepted RFC before any syntax/acceptance-contract change. Parser files are not reserved here. |
+| `stdlib-collections` **RESERVED** | Make `split_at` one traversal while preserving its existing API and results. | `std/collections.ouro`, `tests/practical_stdlib_tests.ouro`. | All other `std/`, compiler/runtime/tools, shared docs/API baselines, generated API pages. | `sh scripts/ouro1.sh check std/collections.ouro`; `sh scripts/ouro1.sh test tests/practical_stdlib_tests.ouro`; `python3 scripts/api_baseline_regen.py --check`; warm T0/T1 below. | Freeze the current public API; reserve generated outputs separately if they must change. |
+| `native-capture` **RESERVED [#30](https://github.com/eluvane/ouro/pull/30)** | Prove a reused bounded capture cannot leak a previous failure's state into the next result. | `runtime/platform/windows_process_bounded.ouro`, `tests/native_managed/process_bounded.ouro`. | `compiler/native/managed_*`, other platform helpers, `std/process*.ouro`, C/H, limits or ABI layouts. | `sh scripts/ouro1.sh build tests/native_managed/process_bounded.ouro`; run the exact native-capture acceptance block below; `sh scripts/runtime_io_suite.sh`. | Working native Windows x86-64 slice and frozen capture ABI. A compiler failure is a blocker, not a C workaround. Linux cannot execute the PE probe. |
+| `test-discovery` **RESERVED [#29](https://github.com/eluvane/ouro/pull/29)** | Exercise late discovery failure and exact-budget completion without partial successful inventories. | `tools/test/discovery.ouro`, `tests/native_test_discovery_tests.ouro`. | `tools/test/suites.ouro`, `tools/test/sample_cases.ouro`, shared assertion helpers, quality tools, discovery policy changes. | `sh scripts/ouro1.sh test tests/native_test_discovery_tests.ouro`; `sh scripts/test_suite.sh`; `sh scripts/test_suite.sh --native-tools _build/native` on Windows. | Preserve explicit literal paths, ordered roots, repeated roots, and existing fixture selection. |
+| `format` **RESERVED [#34](https://github.com/eluvane/ouro/pull/34)** | Preserve source bytes and checked write refusal for one concrete formatting case. | `tools/fmt.ouro`, `tools/fmt_pipeline.ouro`, `tests/analyze/precision/format_fix.ouro`. | Parser, checker, shared fixer paths, new formatting policy or lint IDs. | `sh scripts/fmt_suite.sh`; `sh scripts/fix_suite.sh`; original/candidate rejection and repeat-write evidence for the chosen case. | Syntax RFC first if formatting a new construct. |
+| `packages` **RESERVED [#32](https://github.com/eluvane/ouro/pull/32)** | Make one existing local-registry/vendor/verify workflow reliably usable. | `tools/pkg/main.ouro`, `tools/pkg/model.ouro`, `tools/pkg/security.ouro`, `scripts/pkg_suite.sh`, `docs/pkg.md`. | LSP/import compiler ownership, `scripts/coil.sh`, other package docs/samples, legacy paths, invented `pkg:` imports. | `sh scripts/pkg_suite.sh`; `sh scripts/pkg_suite.sh --native-tools _build/native` on Windows. | Use current package docs, not unmerged distribution promises. |
+| `lsp` **RESERVED [#36](https://github.com/eluvane/ouro/pull/36)** | Fix one user-visible diagnostic or request-state contract through the existing server. | `tools/lsp_model.ouro`, `tools/lsp_process_model.ouro`, `scripts/lsp_suite.sh`. | Checker, formatter, package resolver, `tools/lsp.ouro` unless later reserved, editor dependency manifests, a second server. | `sh scripts/lsp_suite.sh`; `sh scripts/lsp_suite.sh --native-tools _build/native` on Windows. | Compiler/formatter dependencies must be merged before their consumer changes. Current `eluvane/ouro` #36 is this LSP reservation, not historical `ouro-dev` #36. |
+| `native-samples` **RESERVED [#33](https://github.com/eluvane/ouro/pull/33)** | Turn the existing CLI/file sample into an explicitly demonstrated native success/error recipe. | `samples/examples/practical_cli_file.ouro`, `samples/examples/README.md`. | Other samples, sample/test inventories, stdlib/compiler/runtime, unsupported sample-harness options. | `sh scripts/ouro1.sh check samples/examples/practical_cli_file.ouro`; run the exact native-sample block below; `sh scripts/samples_suite.sh --native-tools _build/native`. | Working native Windows toolchain; fix only a reproduced sample-local defect, otherwise improve the verified recipe. Linux PE execution is unavailable. |
+| `wave-docs` **RESERVED** | Keep one operable playbook and index aligned with current `eluvane/ouro` locks. | `docs/agent_parallel.md`, `docs/README.md`, `CHANGELOG.md`. | Other docs, AGENTS policy, all implementation files, generated reference, shared inventories. | `python3 scripts/docs_examples_gate.py`; `python3 scripts/github_project_gate.py`; required Unreleased bullet included before readiness. | Singleton docs coordinator for this wave. Other lanes propose changelog text and remain draft until serialized metadata is applied. Do not launch another writer when this page already has an open PR. |
 
 The code paths above come from the current tree, not a proposed directory
-layout: formatter and LSP are files, while `tools/test/` and `tools/pkg/` remain
-directories. There is **no additional analyzer/Clippy/lint lane** while #35 owns
-that work. Nine slots address a language or language-user path; one coordinates
-docs. Existing quality checks constrain every slot without becoming its product.
+layout: formatter and LSP owners are files, while package and test-discovery
+owners are the exact reserved files in those directories. There is **no
+additional analyzer/Clippy/lint lane** in this wave. Nine slots address a
+language or language-user path; one coordinates docs. Existing quality checks
+constrain every slot without becoming its product.
 
 ### Focused native acceptance
 
@@ -374,13 +423,14 @@ test -s _build/parallel/sample/err
 
 ## 3. Task briefs
 
-Paste only the selected FREE lane's brief, together with its completed task
-card, refreshed lock table, and base SHA. Do not dispatch TAKEN rows; the
-`wave-docs` brief below is for continuing its existing owner, not a new writer. Each brief is a bounded
-assignment, not permission to claim a defect before reproducing one. Shared
-metadata is supplied to the coordinator as proposed text, not edited by every
-agent. The coordinator adds required entries to each owning PR sequentially
-once that path is available; omission remains a readiness blocker.
+Paste only the selected reserved lane's brief, together with its completed
+task card, refreshed `eluvane/ouro` lock table, and base SHA. Do not dispatch
+a second writer onto a reserved row; reuse the current owner and PR. Each
+brief is a bounded assignment, not permission to claim a defect before
+reproducing one. Shared metadata is supplied to the `wave-docs` coordinator as
+proposed text, not edited by every lane. The coordinator adds required
+entries to each owning PR sequentially once that path is available; omission
+remains a readiness blocker.
 
 The branch names below identify the first task in each lane. For a later task,
 choose a new descriptive lane/task name under `cursor/` ending in `-40de`;
@@ -389,12 +439,56 @@ explicit maintainer-provided branch name. Every writer finishes with evidence
 and stops; it must not self-merge, release its own lock, or silently launch a
 successor. The coordinator admits the successor after integration.
 
+### stdlib-collections
+
+```text
+Work only in eluvane/ouro; follow AGENTS.md and docs/agent_parallel.md.
+Fetch origin/main and recheck paginated eluvane/ouro locks; sibling reservations apply before a PR exists.
+Create branch cursor/stdlib-collections-20260921-40de from the recorded origin/main SHA, or reuse the reserved owner.
+Reason: make split_at one traversal while preserving its existing API and results.
+Write lock: std/collections.ouro.
+Write lock: tests/practical_stdlib_tests.ouro; no other tracked files.
+Read the current take/drop composition and existing collection tests first.
+Fix only a reproduced owner defect or add the missing one-traversal coverage; do not invent a bug.
+Win: sh scripts/ouro1.sh check std/collections.ouro
+Win: sh scripts/ouro1.sh test tests/practical_stdlib_tests.ouro
+Also run python3 scripts/api_baseline_regen.py --check; do not hand-edit generated API pages.
+Warm T0/T1 is a measurement recipe, not a speed claim from a failed bootstrap.
+Do not touch other std modules, compiler, runtime, tools, or shared inventories.
+C is out: no C/H, stage0, clang flags, or host replacement.
+Send proposed changelog text to wave-docs; leave CHANGELOG.md unedited.
+Open one focused PR, or continue the reserved owner if it already exists.
+```
+
+### test-discovery
+
+```text
+Work only in eluvane/ouro; follow AGENTS.md and docs/agent_parallel.md.
+Fetch origin/main and recheck live eluvane/ouro PR file locks before writing.
+Reuse the reserved owner and current PR when present; otherwise create cursor/test-discovery-20260921-40de.
+Reason: prove exact-budget completion and refusal after a late inventory error.
+Write lock: tools/test/discovery.ouro.
+Write lock: tests/native_test_discovery_tests.ouro; no other tracked files.
+Read both owners and the existing discovery assertions before changing behavior.
+Preserve root order, repeated roots, literal explicit paths, and current pruning.
+Test a failure after earlier files were collected; require error, not partial success.
+Test completion exactly at the walk budget without increasing that budget.
+Fix the owner only if the new regression demonstrates a defect; retain every old case.
+Win: sh scripts/ouro1.sh test tests/native_test_discovery_tests.ouro
+Then run sh scripts/test_suite.sh.
+On Windows also run sh scripts/test_suite.sh --native-tools _build/native.
+Do not touch tools/test/suites.ouro, tools/test/sample_cases.ouro, shared assertions, policies, or compiler files.
+C is out: no C/H, stage0, host traversal replacement, clang flags, or arena work.
+Keep the existing runner; do not add a new gate, linter, or parallel discovery product.
+Send proposed changelog text to wave-docs; stop on any new path collision.
+```
+
 ### native-capture
 
 ```text
-Work only in eluvane/ouro-dev; follow AGENTS.md and docs/agent_parallel.md.
-Fetch origin/main and recheck live locks; compiler/native remains TAKEN by #35.
-Create branch cursor/native-capture-40de from the recorded origin/main SHA.
+Work only in eluvane/ouro; follow AGENTS.md and docs/agent_parallel.md.
+Fetch origin/main and recheck live eluvane/ouro locks; do not treat historical ouro-dev numbers as owners.
+Reuse the reserved owner and current PR when present; otherwise create cursor/native-capture-20260921-40de.
 Reason: failure-then-success reuse must not retain stale capture state or output.
 Write lock: runtime/platform/windows_process_bounded.ouro.
 Write lock: tests/native_managed/process_bounded.ouro; no other tracked files.
@@ -406,47 +500,108 @@ Win: run the native-capture acceptance block in docs/agent_parallel.md on Window
 Require exit 42, exact CAPTURE_OK markers, empty stderr, and unchanged existing caps.
 Also run sh scripts/runtime_io_suite.sh; keep broader required process coverage.
 A missing Windows run or compiler failure is a blocker, never native acceptance.
+Linux hosts cannot execute the PE probe; that absence is Not run, not a pass.
 Do not touch compiler/native/managed_*, other platform helpers, std/process*, or budgets.
 C is out: no runtime C/H, stage0, clang flags, C arenas, or alternate host path.
-AGENTS hard bans: no suppressed findings, warn-only/debt success, weakened tests, or fixture deletion.
-If claiming performance, compare successful warm T0/T1 with identical inputs and caps.
-Stop and report when an ABI change or another owner's file is necessary.
-Send proposed changelog text to the coordinator; leave its current lock untouched.
-Open one focused PR describing the capture behavior and regression coverage.
+Send proposed changelog text to wave-docs; leave CHANGELOG.md unedited.
 ```
 
-### test-discovery
+### source-syntax
 
 ```text
-Work only in eluvane/ouro-dev; follow AGENTS.md and docs/agent_parallel.md.
-Fetch origin/main and recheck live PR file locks before reserving this lane.
-Create branch cursor/test-discovery-40de from the recorded origin/main SHA.
-Reason: prove exact-budget completion and refusal after a late inventory error.
-Write lock: tools/test/discovery.ouro.
-Write lock: tests/native_test_discovery_tests.ouro; no other tracked files.
-Read both owners and the six existing discovery assertions before changing behavior.
-Preserve root order, repeated roots, literal explicit paths, and current pruning.
-Test a failure after earlier files were collected; require error, not partial success.
-Test completion exactly at the walk budget without increasing that budget.
-Fix the owner only if the new regression demonstrates a defect; retain every old case.
-Win: sh scripts/ouro1.sh test tests/native_test_discovery_tests.ouro
-Then run sh scripts/test_suite.sh.
-On Windows also run sh scripts/test_suite.sh --native-tools _build/native.
-Do not touch suites.ouro, sample_cases.ouro, shared assertions, policies, or compiler files.
-C is out: no C/H, stage0, host traversal replacement, clang flags, or arena work.
-AGENTS hard bans: no gates weakened, fixtures deleted, suppressions, debt, or allow-to-green.
-Keep the existing runner; do not add a new gate, linter, or parallel discovery product.
-For a performance claim record comparable successful warm T0/T1; otherwise claim only behavior.
-Send proposed changelog text to the coordinator; stop on any new path collision.
-Open one PR describing the new assertions.
+Work only in eluvane/ouro; follow AGENTS.md and docs/agent_parallel.md.
+Fetch origin/main and recheck paginated eluvane/ouro locks before writing.
+Reuse the reserved owner and current PR when present; otherwise create cursor/source-syntax-20260921-40de.
+Reason: add or tighten one existing-syntax parse/rejection regression without inventing syntax.
+Write lock: tests/compiler_native_syntax_tests.ouro; no other tracked files.
+Read the existing native syntax tests and nearby parser contract first.
+Do not edit lexer/parser source, file_elab*, compiler/native, formatter, or diagnostic IDs.
+Fix only a reproduced test-local gap; an accepted RFC is required before any syntax change.
+Win: sh scripts/ouro1.sh test tests/compiler_native_syntax_tests.ouro
+Also run sh scripts/frontend_security_suite.sh and sh scripts/test_suite.sh --compiler-checking.
+C is out: no C/H, stage0, clang flags, or host parser replacement.
+Send proposed changelog text to wave-docs; leave shared metadata unedited.
+```
+
+### checked-native
+
+```text
+Work only in eluvane/ouro; follow AGENTS.md and docs/agent_parallel.md.
+Fetch origin/main and recheck paginated eluvane/ouro locks; compiler source is not reserved here.
+Create branch cursor/checked-native-20260921-40de from the recorded origin/main SHA, or reuse the reserved owner.
+Reason: close one checked-program-to-native acceptance or diagnostic gap with positive and rejection evidence.
+Write lock: tests/compiler_module_tests.ouro; no other tracked files.
+Read the existing module tests and the selected check/eval/run contract first.
+Do not edit compiler/native source, lexer/parser, stage0, or C hosts.
+If the gap requires a compiler-source change, stop and report that blocker.
+Win: sh scripts/test_suite.sh --compiler-checking
+Also run sh scripts/frontend_security_suite.sh and sh scripts/ouro_repo_gate.sh --profile compiler-boundary.
+Reproduce the selected case; Windows PE execution unavailable on Linux is Not run, not a pass.
+Send proposed changelog text to wave-docs; leave CHANGELOG.md unedited.
+```
+
+### format
+
+```text
+Work only in eluvane/ouro; follow AGENTS.md and docs/agent_parallel.md.
+Fetch origin/main and recheck live eluvane/ouro locks before writing.
+Reuse the reserved owner and current PR when present; otherwise create cursor/format-20260921-40de.
+Reason: preserve source bytes and checked write refusal for one concrete formatting case.
+Write lock: tools/fmt.ouro.
+Write lock: tools/fmt_pipeline.ouro.
+Write lock: tests/analyze/precision/format_fix.ouro; no other tracked files.
+Read the formatter, pipeline, and precision fixture before changing behavior.
+Do not touch parser, checker, shared fixer paths, lint IDs, or formatting policy.
+Win: sh scripts/fmt_suite.sh
+Also run sh scripts/fix_suite.sh and keep original/candidate rejection plus repeat-write evidence.
+C is out: no C/H, stage0, clang flags, or host formatter replacement.
+Send proposed changelog text to wave-docs; leave CHANGELOG.md unedited.
+```
+
+### packages
+
+```text
+Work only in eluvane/ouro; follow AGENTS.md and docs/agent_parallel.md.
+Fetch origin/main and recheck paginated eluvane/ouro locks; historical ouro-dev package PRs are not owners here.
+Reuse the reserved owner and current PR when present; otherwise create cursor/packages-20260921-40de.
+Reason: make one existing local-registry/vendor/verify workflow reliably usable.
+Write lock: tools/pkg/main.ouro.
+Write lock: tools/pkg/model.ouro.
+Write lock: tools/pkg/security.ouro.
+Write lock: scripts/pkg_suite.sh.
+Write lock: docs/pkg.md; no other tracked files.
+Read the current package contract and suite first; do not restore retired collector or selfhost paths.
+Win: sh scripts/pkg_suite.sh
+On Windows also run sh scripts/pkg_suite.sh --native-tools _build/native.
+Do not touch LSP, compiler imports, scripts/coil.sh, other docs, or invented pkg: imports.
+C is out: no C/H, stage0, clang flags, or host package replacement.
+Send proposed changelog text to wave-docs; leave CHANGELOG.md unedited.
+```
+
+### lsp
+
+```text
+Work only in eluvane/ouro; follow AGENTS.md and docs/agent_parallel.md.
+Fetch origin/main and recheck paginated eluvane/ouro locks; sibling reservations apply before a PR exists.
+Create branch cursor/lsp-20260921-40de from the recorded origin/main SHA, or reuse the reserved owner.
+Reason: fix one user-visible diagnostic or request-state contract through the existing server.
+Write lock: tools/lsp_model.ouro.
+Write lock: tools/lsp_process_model.ouro.
+Write lock: scripts/lsp_suite.sh; no other tracked files.
+Read the model, process model, and suite first; do not add a second server.
+Do not touch checker, formatter, package resolver, tools/lsp.ouro, or editor manifests.
+Win: sh scripts/lsp_suite.sh
+On Windows also run sh scripts/lsp_suite.sh --native-tools _build/native.
+C is out: no C/H, stage0, clang flags, or host language-server replacement.
+Send proposed changelog text to wave-docs; leave CHANGELOG.md unedited.
 ```
 
 ### native-samples
 
 ```text
-Work only in eluvane/ouro-dev; follow AGENTS.md and docs/agent_parallel.md.
-Fetch origin/main and refresh locks; do not reserve all of samples/.
-Create branch cursor/native-samples-40de from the recorded origin/main SHA.
+Work only in eluvane/ouro; follow AGENTS.md and docs/agent_parallel.md.
+Fetch origin/main and refresh eluvane/ouro locks; do not reserve all of samples/.
+Reuse the reserved owner and current PR when present; otherwise create cursor/native-samples-20260921-40de.
 Reason: make the existing CLI/file example reproducible as a native user workflow.
 Write lock: samples/examples/practical_cli_file.ouro.
 Write lock: samples/examples/README.md; no other tracked files.
@@ -457,38 +612,33 @@ Win: sh scripts/ouro1.sh check samples/examples/practical_cli_file.ouro
 Win: run the native-sample acceptance block in docs/agent_parallel.md on Windows.
 Also run sh scripts/samples_suite.sh --native-tools _build/native.
 Document only commands actually observed; a check-only inventory is not a runtime pass.
+Linux PE execution is unavailable and is Not run, not a pass.
 Change sample code only for a reproduced sample-local problem, not cosmetic churn.
 Do not touch other samples, sample/test inventories, std, compiler, runtime, or docs/README.md.
 C is out: no C/H, stage0, clang flags, host executable fallback, or C arenas.
-AGENTS hard bans: no weakened expectations, fixture deletion, suppressed failures, or allow/debt green.
-If the native backend fails, stop at the owning TAKEN path rather than repair it here.
-No performance claim without matching successful warm T0/T1; bootstrap failures are not baselines.
-Send proposed changelog text to the coordinator and keep shared metadata read-only.
-Open one focused PR describing the sample workflow change.
+If the native backend fails, stop rather than repair an unreserved compiler path.
+Send proposed changelog text to wave-docs and keep shared metadata read-only.
 ```
 
 ### wave-docs
 
 ```text
-Work only in eluvane/ouro-dev; follow AGENTS.md and docs/agent_parallel.md.
-Fetch origin/main, capture paginated live locks, and inspect the latest merged PRs.
+Work only in eluvane/ouro; follow AGENTS.md and docs/agent_parallel.md.
+Fetch origin/main, capture paginated live locks scoped to eluvane/ouro, and inspect recent merges.
 Reuse the current docs PR when this page is already owned; do not open a duplicate.
-Otherwise create branch cursor/wave-docs-40de from the recorded origin/main SHA.
-Reason: keep one current, operable language-work allocation page.
-Write lock: docs/agent_parallel.md and its link in docs/README.md.
-Reserve CHANGELOG.md separately only after its current owner releases it.
-Read current architecture, native direction, actual commands, and lane source owners.
+Otherwise create branch cursor/wave-docs-20260921-40de from the recorded origin/main SHA.
+Reason: keep one current, operable language-work allocation page for this repository.
+Write lock: docs/agent_parallel.md, docs/README.md, and CHANGELOG.md.
+Read current architecture, native direction, actual commands, and live eluvane/ouro owners.
 Maintain rolling refill, WIP limits, review/merge/handoff, and current locks; no pass history.
-Keep TAKEN lanes unavailable, with exact narrow FREE write sets and measurable outcomes.
-Keep shared docs/quality.md, AGENTS policy, and generated docs read-only.
+Separate dated evidence from current admissions; stale snapshots are not dispatch authority.
+Keep reserved lanes unavailable, with exact narrow write sets and measurable outcomes.
+Keep shared docs/quality.md, AGENTS policy, generated docs, and other lane files read-only.
 Win: python3 scripts/docs_examples_gate.py
 Win: python3 scripts/github_project_gate.py
-Add the required short Unreleased docs bullet before readiness, after its lock clears.
-If that lock remains, record the proposed bullet in the PR body and leave the PR draft.
+Add the required short Unreleased docs bullet in this wave; other lanes propose text only.
 Do not touch compiler, runtime, tools, scripts, tests, or additional documentation files.
 C is out: do not recommend C hosts, stage0 edits, clang tuning, or C-arena investment.
-AGENTS hard bans remain; no allow/warn-only/debt routes to a green result.
-Review brief line counts, local links, disjoint write sets, and all claimed command paths.
 Do not claim validation or performance that was not executed on the reported tree.
 Open one docs PR explaining what changed and why; mention remaining blockers
 only when they affect the change. Keep exact base/head in the coordination handoff.
@@ -517,12 +667,14 @@ Use these distinctions to reject vague “polish the entire language” assignme
 ### Make metadata a serialized resource
 
 Give the rolling coordinator scheduling ownership of `CHANGELOG.md`,
-`docs/quality.md`, and `docs/README.md`. Other agents return proposed text, not edits. The coordinator
-owns the *right to schedule* those writes, not a simultaneous exception to live
-PR locks. Add required metadata to the owning PR only after its predecessor
-merges or a recorded handoff releases the path. Rebase before adding it. A
-missing required changelog entry keeps the PR draft; it does not become an
-allowed omission because the code lane is otherwise done.
+`docs/quality.md`, and `docs/README.md`. During this wave, `wave-docs` is the
+only writer of shared `CHANGELOG.md`; other lanes return proposed text and
+leave that path unedited. The coordinator owns the *right to schedule* those
+writes, not a simultaneous exception to live PR locks. Add required metadata
+to the owning PR only after its predecessor merges or a recorded handoff
+releases the path. Rebase before adding it. A missing required changelog entry
+keeps the PR draft; it does not become an allowed omission because the code
+lane is otherwise done.
 
 Generated API pages, API baselines, diagnostic registries, fixture manifests,
 and shared test inventories need the same single-owner treatment when a change
@@ -569,8 +721,8 @@ candidate binary, so compare source-bound base/head builds with the same declare
 build inputs except the intended change. Do not demand identical compiler bytes
 while claiming to measure a changed compiler. Run at least three
 successful warm samples at T0 and T1. The existing measurement wrapper can record
-a focused stdlib run; this is a measurement recipe, not a dispatch of the
-TAKEN #36 slot. Reserve that work only after its lock clears. Use separate
+a focused stdlib run; this is a measurement recipe, not a second writer on
+the reserved `stdlib-collections` slot. Use separate
 directories for baseline and candidate:
 
 ```sh
@@ -606,7 +758,7 @@ and keep one integrator for the branch. Terminate a sub-agent's writing task as
 soon as it tries to add suppressions, baseline debt, allowlists, warn-only
 success, or severity downgrades to clear a gate.
 
-Stop a lane when it needs a TAKEN path, a public/API/ABI or syntax change beyond
+Stop a lane when it needs a reserved path, a public/API/ABI or syntax change beyond
 its agreement, an OOM “fix” that raises a budget, a fixture deletion, a stale or
 mixed-binary baseline, a new Python/C semantic owner, or unavailable mandatory
 execution. Save the reproduction and exact blocker; do not spend the remaining
@@ -628,13 +780,13 @@ Never merge an unverified broad PR merely to release its file locks.
 
 | Area | What can proceed independently | What must wait |
 | --- | --- | --- |
-| Test discovery, native sample recipe | Their exact disjoint content and unchanged interfaces. | Their own required checks and serialized metadata; a #35 compiler failure blocks the affected task. |
-| Native capture | Its small runtime/fixture pair with unchanged capture ABI and real Windows execution. | Managed-lowering or helper-contract changes owned by #35; no C workaround. |
-| Collections | Its own review, independently of #35. | #36 release and a fresh read of its public API/generated-reference changes before a successor. |
-| Checker/native/PE and parser | Small separately reserved tasks after the broad owner releases them. | #35, then shared checker/representation/ID contracts before dependent consumers. |
-| Formatter and LSP | Independent fixes that preserve their interface. | #35 and the #23 overlap; formatter contract before an LSP task relying on changed edits. |
-| Packages | A local workflow that does not require an unmerged compiler change. | #11/#35 conflict resolution and current paths; no resurrection of retired `selfhost` owners. |
-| This docs page | Continue #37; keep the procedure usable while other tasks run. | Its required changelog entry and docs gates; no second playbook PR. |
+| Test discovery, native sample recipe | Their exact reserved files and unchanged interfaces. | Their own required checks and serialized metadata; a compiler-source failure is a blocker, not a C workaround. |
+| Native capture | Its reserved runtime/fixture pair with unchanged capture ABI and real Windows execution. | Managed-lowering or helper-contract changes outside this write set; Linux PE execution is Not run. |
+| Collections | Its reserved collections/test pair and unchanged public API. | Generated API pages and shared baselines if they must change; those stay separately reserved. |
+| Checker/native/PE and parser | Only a later exact write set after a refreshed live-lock check. | Shared checker/representation/ID contracts before dependent consumers. This wave reserves tests, not those source cones. |
+| Formatter and LSP | Their reserved files when interfaces stay unchanged. | Formatter contract before an LSP task relying on changed edits. |
+| Packages | The reserved package files for a local workflow that does not require an unmerged compiler change. | Current paths and docs; no resurrection of retired `selfhost` owners. |
+| This docs page | Continue the reserved `wave-docs` owner; keep the procedure usable while other tasks run. | Its required changelog entry and docs gates; no second playbook PR. |
 | New syntax or acceptance semantics | Read-only investigation and the required design discussion. | Accepted RFC/maintainer decision and coordinated parser, checker, formatter, and editor ownership. |
 
 ### Prepare one reviewable candidate
@@ -812,6 +964,7 @@ an autonomous background service:
 
 ```text
 Coordinate the current Ouro queue; follow AGENTS.md and docs/agent_parallel.md.
+Scope every live-lock lookup to eluvane/ouro. Historical ouro-dev PR numbers are not current locks.
 Read current main, every open PR file list, and unpublished task reservations.
 Do not trust the previous chat's locks, completion claims, or cached green reports.
 Count unfinished engineering tasks from reservation through integration, normally <=10.
@@ -844,18 +997,19 @@ writers occupied at any cost.
 ## 6. Anti-patterns seen in this repository
 
 Use the linked evidence to recognize scheduling and measurement failures, not
-to assign blame. Old PR bodies are observations at their stated revisions, not
-the current status of the branch.
+to assign blame. The pull-request numbers in this table are historical
+`eluvane/ouro-dev` observations at their stated revisions. They are not
+current `eluvane/ouro` pull requests and do not lock files here.
 
-| Do not do this | Evidence to inspect | Use this instead |
+| Do not do this | Historical `ouro-dev` evidence to inspect | Use this instead |
 | --- | --- | --- |
-| Launch another “unify/harden quality” pass over the same core and remap the same IDs. | [#28](https://github.com/eluvane/ouro-dev/pull/28), [#30](https://github.com/eluvane/ouro-dev/pull/30), [#31](https://github.com/eluvane/ouro-dev/pull/31), and the live #35 file list repeatedly address shared quality/frontend owners. #35 also collides with #11 and #23 on exact files. | One existing quality owner; spend free hours on the disjoint language/user paths above. |
-| Treat `--warn-only` project output as a deny-profile success. | [#32](https://github.com/eluvane/ouro-dev/pull/32) describes advisory scans and OOM; [#34](https://github.com/eluvane/ouro-dev/pull/34) distinguishes real `warn_only=false` evidence from failing wider scans. | Correct source or the responsible rule without suppressions; require the intended complete blocking profile and counts. |
-| Build a 15 GiB Clippy cone, then buy apparent progress with larger limits or wider host flags. | [#29](https://github.com/eluvane/ouro-dev/pull/29) records approximately 15.6 GiB for the old monolithic cone. | Measure a bounded warm cone, reduce unnecessary dependencies in the existing owner, and preserve limits. No new C-host investment. |
-| Describe recycle-after-1 as an in-process reset or sustained-memory solution. | [#34](https://github.com/eluvane/ouro-dev/pull/34) explicitly recycles lint children after each file; its per-child cache dies too. | Call it containment. Prove bounded lifetime/reset in the authorized native-Ouro owner before claiming reuse or removing isolation. |
-| Report a speedup from T0 bootstrap failure to T1 warm lint. | #34's table labels T0 as failed cold parallel bootstrap and T1 as warm; the broader lint path still has failures. | Same successful command, same input/caps, warm T0/T1, status and RSS scope reported separately. |
-| Let one PR consume the entire native backend, then pretend its PE or managed subtrees are free. | #35's actual file list includes elaboration, lowering, managed operations, MIR/codegen, and PE writers. | Mark TAKEN, finish or explicitly narrow the existing owner, then dispatch disjoint follow-ups after a new snapshot. |
-| Call a mixed installed-binary/source run full-tree validation. | [#33](https://github.com/eluvane/ouro-dev/pull/33) records existing binaries plus a local relink and explicitly unconfirmed full post-change strict coverage. | Tie every result to one source/build identity. Missing or pre-step CI execution remains Not run, never green. |
+| Launch another “unify/harden quality” pass over the same core and remap the same IDs. | [ouro-dev #28](https://github.com/eluvane/ouro-dev/pull/28), [ouro-dev #30](https://github.com/eluvane/ouro-dev/pull/30), [ouro-dev #31](https://github.com/eluvane/ouro-dev/pull/31), and historical ouro-dev #35 repeatedly address shared quality/frontend owners. That #35 also collided with ouro-dev #11 and #23 on exact files. | One existing quality owner; spend free hours on the disjoint language/user paths above. |
+| Treat `--warn-only` project output as a deny-profile success. | [ouro-dev #32](https://github.com/eluvane/ouro-dev/pull/32) describes advisory scans and OOM; [ouro-dev #34](https://github.com/eluvane/ouro-dev/pull/34) distinguishes real `warn_only=false` evidence from failing wider scans. | Correct source or the responsible rule without suppressions; require the intended complete blocking profile and counts. |
+| Build a 15 GiB Clippy cone, then buy apparent progress with larger limits or wider host flags. | [ouro-dev #29](https://github.com/eluvane/ouro-dev/pull/29) records approximately 15.6 GiB for the old monolithic cone. | Measure a bounded warm cone, reduce unnecessary dependencies in the existing owner, and preserve limits. No new C-host investment. |
+| Describe recycle-after-1 as an in-process reset or sustained-memory solution. | [ouro-dev #34](https://github.com/eluvane/ouro-dev/pull/34) explicitly recycles lint children after each file; its per-child cache dies too. | Call it containment. Prove bounded lifetime/reset in the authorized native-Ouro owner before claiming reuse or removing isolation. |
+| Report a speedup from T0 bootstrap failure to T1 warm lint. | Historical ouro-dev #34's table labels T0 as failed cold parallel bootstrap and T1 as warm; the broader lint path still has failures. | Same successful command, same input/caps, warm T0/T1, status and RSS scope reported separately. |
+| Let one PR consume the entire native backend, then pretend its PE or managed subtrees are free. | Historical ouro-dev #35's file list includes elaboration, lowering, managed operations, MIR/codegen, and PE writers. | Mark the live owner reserved, finish or explicitly narrow it, then dispatch disjoint follow-ups after a new `eluvane/ouro` snapshot. |
+| Call a mixed installed-binary/source run full-tree validation. | [ouro-dev #33](https://github.com/eluvane/ouro-dev/pull/33) records existing binaries plus a local relink and explicitly unconfirmed full post-change strict coverage. | Tie every result to one source/build identity. Missing or pre-step CI execution remains Not run, never green. |
 
 The rolling queue must also avoid a batch barrier, a successor launched when
 its predecessor is merely "agent done", ten blocked drafts hidden outside the

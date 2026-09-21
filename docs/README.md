@@ -75,8 +75,9 @@ you are trying to do.
 
 - [Contributing](../CONTRIBUTING.md) — first build, focused tests, RFCs,
   generated artifacts, and pull requests.
-- [Parallel agent lanes](agent_parallel.md) — live file locks, focused language
-  work, validation, and merge order.
+- [Parallel agent lanes](agent_parallel.md) — rolling language-work queue and
+  exact-file reservations for `eluvane/ouro`; a planning reference, not a
+  stale lock snapshot or an exception to repository policy.
 - [Continuous integration](ci.md) — local profiles and hosted workflow roles.
 - [OuroSmith](ouro_smith.md) — generated tests, independent oracles, replay,
   and migration of the manual corpus.

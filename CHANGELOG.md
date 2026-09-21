@@ -57,6 +57,9 @@ integration may change.
   highlight.
 - Document rolling parallel agent development with live file locks, focused
   acceptance checks, review and merge handoffs, and immediate slot replenishment.
+- Refresh the parallel-agent allocation page for current `eluvane/ouro` main
+  and live PR ownership, keep historical `ouro-dev` snapshots from being used
+  as dispatch authority, and record this wave's exact reserved write sets.
 - Build `str_join` and `str_repeat` with one output-sized byte-list assembly;
   avoid whole-string byte-list copies in `str_head`, `str_cons`, and `str_snoc`.
   Remove unused pre-1.0 list helpers `break_list`, `partition`, `unzip`,
