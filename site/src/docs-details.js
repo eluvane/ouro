@@ -43,7 +43,8 @@ class DocumentationDetails {
       }
       $('<span class="docs-code__label"></span>').text(label).appendTo(toolbar);
       const copy_btn = $(
-        '<button type="button" class="docs-code__copy" aria-label="Copy code" title="Copy code">#</button>',
+        '<button type="button" class="docs-code__copy" aria-label="Copy code" title="Copy code">' +
+        '<span class="site-icon site-icon--copy" aria-hidden="true"></span></button>',
       );
       toolbar.append(copy_btn);
       pre_block.before(toolbar);
@@ -93,7 +94,10 @@ class DocumentationDetails {
       link.className = 'heading-anchor';
       link.href = `#${section.id}`;
       link.dataset.searchIgnore = '';
-      link.textContent = '#';
+      const icon = document.createElement('span');
+      icon.className = 'site-icon site-icon--link';
+      icon.setAttribute('aria-hidden', 'true');
+      link.append(icon);
       const title = heading.textContent.trim();
       link.setAttribute('aria-label', `Copy link to ${title}`);
       link.title = 'Copy section link';

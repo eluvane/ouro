@@ -23,7 +23,7 @@ usage() {
 		"  coil fmt [--check | --write] FILE..." \
 		"  coil fix [--check | --write] FILE..." \
 		"  coil analyze [ARGS...]" \
-		"  coil lint [PATH...]" \
+		"  coil lint [--deny] [--profile project|strict|release] [--family language|style|semantic] [PATH...]" \
 		"  coil test [PATH...]" \
 		"  coil doc [--check] [--out DIR] FILE..." \
 		"  coil build FILE.ouro [--backend native] [--target x86_64-windows] [--out FILE]" \

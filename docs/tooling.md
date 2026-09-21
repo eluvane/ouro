@@ -142,6 +142,9 @@ provisional deadlines are 30 seconds for LSP checks, 10 seconds for formatting,
 120 seconds per package source, 1800 seconds for a test check/build, 300 seconds
 per test executable and 4000 seconds for the recursive runner probe. These
 limits still need measurements with native tool workloads.
+The native test policy laws check the exact deadlines and all resource fields.
+Large deadlines use small Nat factors so C-host builds avoid deeply nested
+constant constructors without changing those limits.
 
 Native `coil` currently exposes `doctor`, `check`, `build` and `run`. Tool
 dispatch and automatic tool builds are separate work. The retained shell
@@ -168,6 +171,8 @@ The formatter normalizes line endings, tabs, trailing whitespace, match-arm
 spacing, and the final newline. It is intentionally a conservative text
 formatter rather than a complete AST pretty-printer, so it preserves comments
 and hand-aligned continuation lines.
+Unknown options, conflicting write/check modes and mixed file/selftest modes
+exit `2` before reading or changing source files.
 
 ## Autofixer
 
@@ -184,28 +189,54 @@ Without a mode flag it prints the fixed text; `--check` exits `1` and lists the
 pending edits on stderr as `path:line: rule: message`; `--write` saves the file
 and prints the applied edits. Every rule is conservative: when a construct does
 not match the expected shape exactly, the fixer leaves it alone.
+Unknown options, conflicting `--check`/`--write`, and mixed selftest/file modes
+exit `2` before reading or changing source files. Use `--` before a filename
+that starts with a dash.
 
-| Rule | Rewrite |
+A prepared `ouro-fix` executable runs its rewrite rules directly.
+There is no Python rewrite fallback and no Python CLI wrapper: the former
+`scripts/syntax_quality_fix.py` command is removed, and suites invoke the
+native binary with `--check`, `--write`, and file arguments.
+
+The publication planner applies only machine-safe syntax and local-redundancy
+classes. Every preview/check and each transformation class requires candidate
+compiler verification; a successful token rewrite alone is not permission to
+publish. Both `fmt --write` and `fix --write` use checked staging,
+metadata-preserving replacement and explicit recovery. Candidate compiler
+checking uses `ouro-fix-check` with stdin framing or `SOURCE file PATH`; POSIX
+C-host bounded capture (OS status 120) uses the existing file transport. See
+[safe-rewrite boundaries](quality.md#precision-and-safe-rewrites).
+Read-only and hard-linked sources are refused without reporting a successful
+write; an unchanged candidate remains a no-op.
+
+| Rule | Publication applicability |
 | --- | --- |
-| `dup-import` | drops a repeated `import "path.ouro"` with the same alias |
-| `do-bind` | `do x <- action;` becomes `do let! x := action;` |
-| `double-semi` | `;;` becomes `;` |
-| `list-literal` | closed `Cons T e (... (Nil T))` chains become `[e, ...]`, ascribed as `([...] : List T)` when no `: List T :=` annotation or enclosing literal supplies the type |
-| `peano-literal` | `S (S (S Z))` becomes `3`; `S (S (S n))` becomes `n \|> S \|> S \|> S` (three or more successors) |
-| `unused-binder` | unused `def`/`fix`/`fun` parameters and match-arm slots become `_name` unless that name already appears in the declaration |
-| `dead-let` | an unused pure `let x := e in` disappears; an unused `let! x := action;` becomes `action;`; a binding whose right-hand side performs, holes, or nests `do` is renamed instead |
-| `unreachable-arm` | a match arm covered by an earlier arm (same constructor with binder-only slots, or a used or discarded catch-all binder) is removed |
+| `dup-import` | automatic only for the identical path and alias, with trivia preserved |
+| `do-bind` | automatic syntax canonicalization to `do let! x := action;` |
+| `double-semi` | automatic removal of a redundant separator |
+| `dead-let` | automatic only for the rule's literal/dead-value proof or retention of the same executed IO action |
+| `identity-let` | automatic only for an unannotated local immediately returned through the same binder |
+| `list-literal`, `peano-literal` | review required; constructor/provider identity is not a textual proof |
+| `unused-binder`, `unreachable-arm` | review required; no automatic renaming or arm removal |
+| `import-alias`, `list-type`, `nonrec-fix` | review required; no automatic API/resolution-affecting rewrite |
 
-Constructor names are read from `| Name : Type` lines of the file and its
-import cone, so lowercase constructors are not mistaken for binders. Use
-`git diff` after `--write`; the rewrite is textual and the checker remains the
-authority on the result.
+Review proposals remain visible without changing source. Unknown rule IDs,
+conflicting automatic edits, invalid spans, cycles and reopened formatting fail
+instead of silently selecting a transformation. A comment-bearing edit cohort
+is retained for review rather than partially applied. The legacy raw rewrite
+helper remains a fixture oracle, not the publication path.
+
+The native planner laws cover conflict ordering, trivia, cycles and fixture
+idempotence. Whole-production `fix -> fmt -> fix` convergence is not yet
+established; the compiler companion build and large import-cone memory pressure
+remain validation blockers. See [Clippy and fix boundaries](clippy_grade_firewall.md).
 
 ## Analyzer and linter
 
 ```sh
 sh scripts/ouro1.sh analyze --strict
-sh scripts/ouro1.sh lint std samples
+sh scripts/ouro1.sh lint --deny --profile project std samples
+sh scripts/ouro1.sh lint --family language path/to/file.ouro
 ```
 
 `analyze` runs repository-wide analyzer families such as architecture, dead
@@ -219,7 +250,9 @@ Enable them per family (`--enable-cfg`, `--enable-taint`, ...) or as sets
 its own bounded process, and structured families refuse a single source larger
 than 40 KiB; see [Build](build.md#memory-behavior).
 
-`lint` parses individual Ouro files and applies compiler lint rules. It is
+`lint` is the only user-facing Ouro source linter. It parses individual
+files and runs language, proven style, and compiler-proved semantic
+families as separate processes. It is
 separate from the repository analyzer so each tool keeps a smaller dependency
 and memory footprint. Directory scans have no file-size cutoff. The launcher
 runs each source in its own process and returns nonzero if a child fails;
@@ -294,11 +327,14 @@ wrappers: they build the Ouro binary and pass arguments through, while policy,
 profiles, report schemas, and gate selection live in Ouro code.
 
 ```sh
-sh scripts/ouro_repo_gate.sh --profile docs --out _build/ouro_repo_gate/docs
-sh scripts/ouro_repo_gate.sh --profile project --out _build/ouro_repo_gate/project
-sh scripts/ouro_repo_gate.sh --profile workflow --out _build/ouro_repo_gate/workflow
+sh scripts/ouro_repo_gate.sh --profile docs-native --out _build/ouro_repo_gate/docs-native
+sh scripts/ouro_repo_gate.sh --profile project-native --out _build/ouro_repo_gate/project-native
+sh scripts/ouro_repo_gate.sh --profile workflow-native --out _build/ouro_repo_gate/workflow-native
 sh scripts/ouro_repo_gate.sh --profile pr-native --out _build/ouro_repo_gate/pr-native
 ```
+
+The Python PR profile invokes those `*-native` names; the short names `docs`,
+`project`, and `workflow` are aliases.
 
 The CI runner supports grouped profiles, selected gate execution, deterministic
 listing, required versus optional gates, blocking versus informational gates,
@@ -306,8 +342,10 @@ exact argv reporting, per-gate JSON, profile summary JSON, optional host-tool
 unavailability reporting, and complete `.py`/`.sh` inventory coverage. Native
 selftest modes own the formatter, documentation, lines, native lint fixtures,
 runtime, user-test, sample, quickstart, and control-plane fixture policies. Their
-shell commands retain bootstrap only, except that `lint_suite.sh` also sequences
-the explicitly host-bound regex/SARIF Clippy-grade reference.
+shell commands retain bootstrap only, except that `lint_suite.sh` also
+compiler-checks the split Clippy entry points listed in
+[CI](ci.md#ouro-native-control-plane-displacement) and runs the Clippy-grade
+fixture suite.
 
 ```sh
 sh scripts/ouro_ci_gate.sh --profile pr-native --list

@@ -115,10 +115,51 @@ exhaustion is process-terminal and is not intercepted by these local scopes.
 
 The transitional C file host preserves file-content bytes by length, and
 String equality compares the full byte sequence, including bytes after NUL.
-Its failure behavior remains different: failed opens and incomplete `fread`
-calls return an empty String, write failures can return Unit, and close status
-is ignored. Callers that publish artifacts must verify staged bytes before
-replacing an existing output.
+Reads reject empty or NUL-containing paths, nonregular files, failed opens,
+sizes beyond the packed String limit, seeks, allocation, incomplete reads and
+failed closes with status 73. An empty String therefore denotes a successful
+empty read. C-host write failures can still return Unit; callers that publish
+artifacts must verify staged bytes before replacing an existing output.
+
+`ouro.fs.replace_file source stage backup` is a separate deferred three-path
+operation. It returns zero only after publication; nonzero retains the OS
+error. Native path conversion, allocation and cleanup retain the fatal status
+73 contract. The checked `fs_replace_file` wrapper rejects empty paths with
+`FsReplaceFailed 87` before conversion on both backends. All paths must
+designate distinct ordinary, single-link files on one
+volume, and backup must be an empty private reservation. It flushes and closes
+the candidate before replacement. It never falls back to copying into the
+source or deleting the source first.
+
+On Windows, `ReplaceFileW` runs with neither ACL nor merge errors ignored. The
+adapter checks source/stage owner and primary-group equality, and prepares the
+source attributes on the stage. Creation time, the DACL and its inheritance
+protection, and existing named streams follow the Windows replacement contract.
+Supported attribute bits are hidden, system, archive, normal, temporary and
+not-content-indexed. Read-only, reparse, sparse, compressed, encrypted, offline
+and other unsupported attribute modes are refused. The DACL's auto-inherited
+descriptor flag can be normalized by Windows while its ACEs and protection
+remain unchanged. Owner/group descriptors are bounded to 256 bytes each;
+unavailable or larger descriptors fail before publication.
+The observer checks owner, primary group and DACL; SACL preservation is not
+established by this contract and is not inferred from those checks.
+
+With an explicit backup, Windows errors 1175/1176 retain the original source
+name; error 1177 can leave it under the backup name. The Ouro source writer
+checks the observed state and restores that backup only when the source is
+absent or still contains the candidate. An unexpected or unreadable current
+source is preserved, and the error names the retained recovery files. POSIX
+host publication copies mode, owner, group and extended attributes, retaining
+the original inode under a hard-link backup before rename. Metadata-copy or
+precommit close failures leave the original path unchanged. Other platforms
+without that implementation return an unsupported-operation error.
+
+These operations do not lock out concurrent editors or provide an atomic
+metadata/content snapshot. Candidate flush is not a directory durability
+guarantee, and process termination can leave private stage/recovery files.
+Callers must distinguish a completed replacement, a refused operation and a
+state requiring recovery; ordinary artifact rename does not provide this
+source-publication contract.
 
 Native `fs_exists` and `fs_is_dir` query Win32 path attributes each time their
 action executes. Empty paths, missing entries and ordinary query errors return

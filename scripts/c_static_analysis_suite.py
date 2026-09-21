@@ -311,8 +311,10 @@ def run_suite(args: argparse.Namespace) -> tuple[dict[str, object], int]:
 
     good = FIXTURES / "good.c"
     bad = FIXTURES / "bad_use_after_free.c"
+    allocation_fixture = FIXTURES / "bounded_capture_allocation.c"
+    fixtures = [good, bad, *([allocation_fixture] if os.name == "nt" else [])]
     sources = sorted((ROOT / "runtime").glob("*.c"), key=lambda path: path.name)
-    for fixture in (good, bad):
+    for fixture in fixtures:
         if not fixture.is_file():
             issues.append(f"missing fixture: {rel(fixture)}")
     if not sources:
@@ -346,6 +348,22 @@ def run_suite(args: argparse.Namespace) -> tuple[dict[str, object], int]:
                 engine="gcc-fanalyzer",
                 command=gcc_command(gcc, source, out / "objects" / "gcc" / f"{source.stem}.o"),
                 expectation="pass",
+                timeout=args.timeout_seconds,
+            )
+
+    if gcc is not None and os.name == "nt":
+        allocation_exe = out / "bounded-capture-allocation.exe"
+        allocation_built = run_check(
+            checks, out=out, name="bounded-capture-allocation-build", engine="gcc-runtime",
+            command=[gcc, *COMMON_FLAGS, "-O1", "runtime/ouro_rt.c",
+                     rel(allocation_fixture), "-o", rel(allocation_exe)],
+            expectation="pass", timeout=args.timeout_seconds,
+        )
+        if allocation_built:
+            run_check(
+                checks, out=out, name="bounded-capture-allocation-run", engine="gcc-runtime",
+                command=[str(allocation_exe), str(out / "empty-capture")],
+                expectation="pass", markers=("BOUNDED_CAPTURE_ALLOCATION: PASS",),
                 timeout=args.timeout_seconds,
             )
 
@@ -525,7 +543,7 @@ def run_suite(args: argparse.Namespace) -> tuple[dict[str, object], int]:
         },
         "tools": tools,
         "sources": [rel(source) for source in sources],
-        "fixtures": [rel(good), rel(bad)],
+        "fixtures": [rel(fixture) for fixture in fixtures],
         "checks": [asdict(check) for check in checks],
         "issues": issues,
         "failed_checks": failed_checks,

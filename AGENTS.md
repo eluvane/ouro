@@ -45,9 +45,11 @@ this accepted direction.
 
 ## First steps for every agent
 
-Before editing any file:
+For each task:
 
-1. Confirm the requested task, base branch, target branch, PR title, and scope.
+1. Establish the requested task, repository, current branch, and scope from
+   available context. Resolve a PR's base, target, and title only when a PR is
+   requested; ask only for missing information that affects the work.
 2. Read this file.
 3. Read the canonical documentation for the affected area.
 4. Inspect the existing code, tests, fixtures, and generated-artifact policy
@@ -59,7 +61,7 @@ Before editing any file:
 8. Run `python3 scripts/ci_gate.py --profile pr --out _build/ci/pr` when
    feasible before opening a PR.
 9. Report exactly which commands ran, which did not run, and why.
-10. Open one focused PR with a complete description.
+10. Open a focused PR only when requested. Local edits do not require a PR.
 
 If the user already gave a branch name, PR title, base revision, or scope,
 preserve it exactly unless it is unsafe or impossible. Do not silently rename the
@@ -192,28 +194,8 @@ Do not:
 - add broad suppressions;
 - claim root cause without evidence.
 
-Bug-fix checklist for the PR description:
-
-```text
-Reproduction:
-- command/input:
-- observed failure:
-
-Root cause:
-- owning layer:
-- explanation:
-
-Fix:
-- changed files:
-- compatibility impact:
-
-Regression coverage:
-- added/updated fixture:
-- focused command:
-
-Not run:
-- command -> reason:
-```
+For a bug-fix PR, briefly explain the incorrect behavior and how the change
+corrects it. Use a concrete example when it helps the reviewer.
 
 ## Changing Ouro code
 
@@ -384,8 +366,8 @@ Do not:
   kernel acceptance.
 
 Kernel and compiler-owned checker work need focused negative tests for rejected
-cases. The PR description must include a trust-boundary impact section even when
-the answer is `None`.
+cases. Describe trust-boundary impact in the PR when the change affects that
+boundary.
 
 ## Generated artifacts policy
 
@@ -461,7 +443,7 @@ find a host tool, report that exact result. Do not convert it to a pass.
 
 ## Reporting validation honestly
 
-Use this format in task reports and PR descriptions:
+Use this format in task reports:
 
 ```text
 Ran:
@@ -492,9 +474,9 @@ Prefer precise statements such as `Ran sh scripts/lint_suite.sh -> passed` or
 
 ## Pull request policy
 
-- Use one branch per task.
+- Create branches and PRs only when requested; use one task branch for a PR.
 - Use the branch name exactly as requested when one is provided.
-- Open one coherent PR.
+- When requested, open one coherent PR.
 - Use the PR title exactly as requested when one is provided.
 - Do not merge your own PR unless explicitly asked.
 - Do not close, reopen, relabel, or retarget unrelated PRs.
@@ -502,42 +484,10 @@ Prefer precise statements such as `Ran sh scripts/lint_suite.sh -> passed` or
 - Do not claim broad completion beyond the implemented diff.
 - Do not hide limitations.
 
-The PR description must state:
-
-- what changed;
-- why the change belongs in this PR;
-- which tests, fixtures, docs, or generated artifacts changed;
-- which commands ran and their result;
-- which checks did not run and why;
-- compatibility impact;
-- generated-artifact impact;
-- kernel or TCB impact;
-- runtime, performance, or workflow impact when relevant;
-- remaining limitations.
-
-PR description checklist:
-
-```text
-Summary:
-- 
-
-Validation:
-- Ran:
-- Not run:
-
-Compatibility and trust:
-- User-visible compatibility:
-- Generated artifacts:
-- Kernel/TCB:
-- Runtime/process/IO:
-- Performance/resource risk:
-
-Docs/tests/fixtures:
-- 
-
-Limitations:
-- 
-```
+Keep the PR description short: explain what changed and why. Mention material
+risks, compatibility or trust impact, and remaining limitations only when they
+apply. Do not add empty sections, `None` entries, checklists, or validation
+inventories. Keep validation evidence in task reports and CI results.
 
 ## Things agents must never claim
 

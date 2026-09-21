@@ -1,0 +1,638 @@
+-- Clippy's single-read, single-parse compilation-unit loader. The compiler's
+-- lexer, parser, canonical import paths and graph resolver own the input ABI.
+-- No failed frontend stage can be replaced by a textual approximation.
+
+import "structural_frontend.ouro";
+import "intern_surface.ouro";
+import "session_policy.ouro";
+import "../../compiler/pipeline_abi.ouro";
+import "../../compiler/parser_file.ouro";
+import "../../compiler/parser_parse.ouro";
+import "../../compiler/semantic_scope.ouro";
+import "../../compiler/import_resolve.ouro";
+import "../../compiler/canonical_hash.ouro";
+import "../quality/source.ouro";
+import "../quality/input_error.ouro";
+
+def cm_pool_text (pool : List (Pair (List Nat) Nat)) (id : Nat) : String :=
+    (fix go (xs : List (Pair (List Nat) Nat)) : String :=
+      match xs with
+      | Nil => ""
+      | Cons p rest => match p with
+        | MkPair bytes key => match eq_nat id key with
+          | True => prim_string_of_char_codes bytes
+          | False => go rest
+          end
+        end
+      end) pool;
+
+def cm_name (intern : InternState) (id : Nat) : String :=
+    match intern with | MkIntern ids _ _ _ => cm_pool_text ids id end;
+
+def cm_string (intern : InternState) (id : Nat) : String :=
+    match intern with | MkIntern _ _ strings _ => cm_pool_text strings id end;
+
+-- Import IDs become canonical identities in the same shared string pool.
+def cm_canon_imports (path : String) : List Decl -> InternState
+    -> Pair (List Decl) InternState :=
+  let path_codes : List Nat := prim_string_to_char_codes path in
+  fix go (decls : List Decl) (intern : InternState)
+      : Pair (List Decl) InternState :=
+    match decls with
+    | Nil => MkPair (List Decl) InternState (Nil Decl) intern
+    | Cons decl rest =>
+        let transformed : Pair Decl InternState := match decl with
+          | DImport spelling =>
+              match load_intern_string intern (load_canon_path path_codes
+              (prim_string_to_char_codes (cm_string intern spelling))) with
+            | MkPair canonical updated => MkPair Decl InternState (DImport canonical) updated
+            end
+          | DDef _ _ _ => MkPair Decl InternState decl intern
+          | DAxiom _ _ => MkPair Decl InternState decl intern
+          | DInductive _ _ _ _ => MkPair Decl InternState decl intern
+          | DEffect _ _ _ => MkPair Decl InternState decl intern
+          | DIntrinsic _ _ _ _ => MkPair Decl InternState decl intern
+          | DExtern _ _ _ => MkPair Decl InternState decl intern
+          | DRepresentation _ _ => MkPair Decl InternState decl intern
+          end in
+        match transformed with
+        | MkPair head updated => match go rest updated with
+          | MkPair tail_decls final => MkPair (List Decl) InternState
+              (Cons Decl head tail_decls) final
+          end
+        end
+    end;
+
+def cm_import_ids (decls : List Decl) : List Nat :=
+    concat_map Decl Nat (fun (decl : Decl) => match decl with
+      | DImport id => [id]
+      | DDef _ _ _ => Nil Nat
+      | DAxiom _ _ => Nil Nat
+      | DInductive _ _ _ _ => Nil Nat
+      | DEffect _ _ _ => Nil Nat
+      | DIntrinsic _ _ _ _ => Nil Nat
+      | DExtern _ _ _ => Nil Nat
+      | DRepresentation _ _ => Nil Nat
+      end) decls;
+
+-- Validate only the import projection with the compiler-owned resolver. Its
+-- normal compilation API also flattens every local declaration into one list;
+-- semantic units already retain indexed declarations and never use that list.
+-- Passing imports alone preserves missing-module/cycle errors without repeatedly
+-- copying the growing declaration accumulator on every module completion.
+def cm_graph_units (units : List SrcUnit) : List SrcUnit :=
+    map SrcUnit SrcUnit (fun (unit : SrcUnit) => match unit with
+      | MkSrcUnit name decls => MkSrcUnit name
+          (map Nat Decl (fun (id : Nat) => DImport id) (cm_import_ids decls))
+      end) units;
+
+inductive ClippySemanticUnit : Type :=
+  | CmUnit : InternState -> Nat -> String -> List SrcUnit -> List ScDecl -> ScIndex -> List Decl -> Nat -> ClippySemanticUnit;
+
+def cm_intern (item : ClippySemanticUnit) : InternState :=
+    match item with | CmUnit value _ _ _ _ _ _ _ => value end;
+
+def cm_entry (item : ClippySemanticUnit) : Nat :=
+    match item with | CmUnit _ value _ _ _ _ _ _ => value end;
+
+def cm_source (item : ClippySemanticUnit) : String :=
+    match item with | CmUnit _ _ value _ _ _ _ _ => value end;
+
+def cm_units (item : ClippySemanticUnit) : List SrcUnit :=
+    match item with | CmUnit _ _ _ value _ _ _ _ => value end;
+
+def cm_declarations (item : ClippySemanticUnit) : List ScDecl :=
+    match item with | CmUnit _ _ _ _ value _ _ _ => value end;
+
+def cm_index (item : ClippySemanticUnit) : ScIndex :=
+    match item with | CmUnit _ _ _ _ _ value _ _ => value end;
+
+def cm_root_decls (item : ClippySemanticUnit) : List Decl :=
+    match item with | CmUnit _ _ _ _ _ _ value _ => value end;
+
+def cm_import_stubs (ids : List Nat) : List Decl :=
+    map Nat Decl (fun (id : Nat) => DImport id) ids;
+
+def cm_strip_symbol (item : ScDecl) : ScDecl :=
+    match item with
+    | ScDeclOf name owner kind parent signature _ prim =>
+        ScDeclOf name owner kind parent signature (Nothing Expr) prim
+    end;
+
+def cm_import_symbols (decls : List ScDecl) : List ScDecl :=
+    map ScDecl ScDecl cm_strip_symbol decls;
+
+inductive CmHarvest : Type :=
+  | MkHarvest : InternState -> List ScDecl -> List Nat -> List Decl -> CmHarvest;
+
+-- Finish one parsed file. Imports keep signatures only; the selected file
+-- keeps bodies. This helper is unwrapped. The host arena seam wraps
+-- cm_load_file below so leave() drops imported function graphs.
+def cm_after_parse (path : String) (module_id : Nat) (keep_bodies : Bool)
+    (decls : List Decl) (intern : InternState) : CmHarvest :=
+    match cm_canon_imports path decls intern with
+    | MkPair canonical updated =>
+        let imports : List Nat := cm_import_ids canonical in
+        let raw : List ScDecl := sc_declarations module_id canonical in
+        match keep_bodies with
+        | True => MkHarvest updated raw imports canonical
+        | False => MkHarvest updated (cm_import_symbols raw) imports
+            (cm_import_stubs imports)
+        end
+    end;
+
+-- Dependency identity includes the frontend mode, canonical path, length and
+-- exact-byte hash. Immutable dependency bytes verify equality even on a hash
+-- collision; root snapshots never enter this bounded cache. Hits reuse harvest facts only; the
+-- selected file is still parsed and rules still run. Intern ids stay valid
+-- only inside one worker process that grows one intern table.
+inductive CmCachedFile : Type :=
+  | MkCmCachedFile : String -> Nat -> List Nat -> String -> CmHarvest -> CmCachedFile;
+
+inductive CmParseCache : Type :=
+  | MkCmParseCache : List CmCachedFile -> CmParseCache;
+
+inductive CmCacheLookup : Type :=
+  | CmCacheHit : CmHarvest -> CmCacheLookup
+  | CmCacheMiss : CmCacheLookup
+  | CmCacheStale : CmCacheLookup;
+
+def cm_cache0 : CmParseCache :=
+    MkCmParseCache (Nil CmCachedFile);
+
+def cm_cache_reset (cache : CmParseCache) : CmParseCache :=
+    match cache with
+    | MkCmParseCache _ => cm_cache0
+    end;
+
+def cm_content_hash (src : String) : List Nat :=
+    canonical_hash_bytes (canonical_hash_codes (prim_string_to_char_codes src));
+
+def cm_hash_eq (left : List Nat) (right : List Nat) : Bool :=
+    (fix go (xs : List Nat) (ys : List Nat) : Bool :=
+      match xs with
+      | Nil => match ys with | Nil => True | Cons _ _ => False end
+      | Cons x xr => match ys with
+        | Nil => False
+        | Cons y yr => match eq_nat x y with
+          | False => False
+          | True => go xr yr
+          end
+        end
+      end) left right;
+
+def cm_cache_row_ok (row : CmCachedFile) : Bool :=
+    match row with
+    | MkCmCachedFile canonical _ hash _ _ =>
+        andb (ltb_nat 0 (prim_string_length canonical))
+          (eq_nat (length Nat hash) 8)
+    end;
+
+def cm_cache_identity (canonical : String) : String :=
+    prim_string_concat "ouro.clippy.harvest.v2/compiler-parser/signatures:" canonical;
+
+def cm_cache_get (cache : CmParseCache) (canonical : String) : Maybe CmCachedFile :=
+    (fix go (rows : List CmCachedFile) : Maybe CmCachedFile :=
+      match rows with
+      | Nil => Nothing CmCachedFile
+      | Cons row rest => match row with
+        | MkCmCachedFile key _ _ _ _ => match prim_string_eq key (cm_cache_identity canonical) with
+          | True => Just CmCachedFile row
+          | False => go rest
+          end
+        end
+      end) (match cache with | MkCmParseCache rows => rows end);
+
+def cm_cache_lookup (cache : CmParseCache) (canonical : String) (src : String)
+    : CmCacheLookup :=
+    match cm_cache_get cache canonical with
+    | Nothing => CmCacheMiss
+    | Just row => match cm_cache_row_ok row with
+      | False => CmCacheStale
+      | True => match row with
+        | MkCmCachedFile _ stored_len stored_hash stored_source harvest =>
+            match andb (eq_nat stored_len (prim_string_length src))
+                (andb (cm_hash_eq stored_hash (cm_content_hash src))
+                  (prim_string_eq stored_source src)) with
+            | True => CmCacheHit harvest
+            | False => CmCacheStale
+            end
+        end
+      end
+    end;
+
+-- Cached facts never retain historical intern spines or imported bodies.
+-- The current session's intern table is attached again on a cache hit.
+def cm_cache_harvest (harvest : CmHarvest) : CmHarvest :=
+    match harvest with
+    | MkHarvest _ symbols imports _ => MkHarvest empty_intern
+        (cm_import_symbols symbols) imports (cm_import_stubs imports)
+    end;
+
+def cm_cache_bytes (cache : CmParseCache) : Nat :=
+    (fix go (rows : List CmCachedFile) : Nat :=
+      match rows with
+      | Nil => 0
+      | Cons row rest => match row with
+        | MkCmCachedFile _ size _ _ _ => add size (go rest)
+        end
+      end) (match cache with | MkCmParseCache rows => rows end);
+
+def cm_cache_without (canonical : String) (rows : List CmCachedFile)
+    : List CmCachedFile :=
+    filter CmCachedFile (fun (row : CmCachedFile) => match row with
+      | MkCmCachedFile key _ _ _ _ => notb (prim_string_eq key (cm_cache_identity canonical))
+      end) rows;
+
+def cm_cache_trim : Nat -> Nat -> List CmCachedFile -> List CmCachedFile :=
+  fix go (slots : Nat) (bytes : Nat) (rows : List CmCachedFile)
+      : List CmCachedFile :=
+    match slots with
+    | Z => Nil CmCachedFile
+    | S remaining => match rows with
+      | Nil => Nil CmCachedFile
+      | Cons row rest => match row with
+        | MkCmCachedFile _ size _ _ _ => match leb_nat size bytes with
+          | False => go remaining bytes rest
+          | True => Cons CmCachedFile row (go remaining (sub bytes size) rest)
+          end
+        end
+      end
+    end;
+
+def cm_cache_put (cache : CmParseCache) (canonical : String) (src : String)
+    (harvest : CmHarvest) : CmParseCache :=
+    match cache with
+    | MkCmParseCache rows =>
+        let current : List CmCachedFile := cm_cache_without canonical rows in
+        let size : Nat := prim_string_length src in
+        match leb_nat size cg_session_cache_bytes with
+        | False => MkCmParseCache current
+        | True => MkCmParseCache (cm_cache_trim cg_session_cache_rows
+            cg_session_cache_bytes (Cons CmCachedFile
+              (MkCmCachedFile (cm_cache_identity canonical) size (cm_content_hash src) src
+                (cm_cache_harvest harvest)) current))
+        end
+    end;
+
+-- Runtime platform sources are the Windows/IO implementation. Transitive
+-- `compiler/` is the same class of cone: selected roots still parse in
+-- full and direct imports still harvest signatures. A small type-module
+-- allowlist (`base`, `pipeline_abi`, `core`, `kernel_core`, `checked_program`,
+-- `image_types`) stays harvestable when enqueued. Keep-importing
+-- `compiler/driver.ouro` without this skip harvests lexer/parser/elab
+-- and exceeds 7 GiB. Exact `std/process.ouro` is the process
+-- implementation cone (not a `std/process` prefix: `processx` stays
+-- harvestable). Direct importers still keep-harvest it. This does not
+-- widen the platform skip.
+def cm_keep_import_path (path : String) : Bool :=
+    orb (prim_string_eq path "compiler/kernel_core.ouro")
+      (orb (prim_string_eq path "compiler/base.ouro")
+        (orb (prim_string_eq path "compiler/pipeline_abi.ouro")
+          (orb (prim_string_eq path "compiler/core.ouro")
+            (orb (prim_string_eq path "compiler/checked_program.ouro")
+              (orb (prim_string_eq path "compiler/native/image_types.ouro")
+                (orb (prim_string_eq path "compiler/source_text.ouro")
+                  (orb (prim_string_eq path "compiler/ast.ouro")
+                    (orb (prim_string_eq path "compiler/parser_file.ouro")
+                      (prim_string_eq path "compiler/parser_parse.ouro")))))))));
+
+-- Family cores only. Wiring, unit/finding, hash/extract and the
+-- analyze CLI stay harvestable. Exact `tools/analyze/model.ouro` is the
+-- extract fact-core; selected extract still keep-imports it. drive.ouro
+-- keep-imports drive_light/drive_heavy, not these cores.
+def cm_skip_analyze_family (path : String) : Bool :=
+    orb (prim_string_eq path "tools/analyze/effects.ouro")
+      (orb (prim_string_eq path "tools/analyze/capability.ouro")
+        (orb (prim_string_eq path "tools/analyze/extract_leak.ouro")
+          (orb (prim_string_eq path "tools/analyze/match_cover.ouro")
+            (orb (prim_string_eq path "tools/analyze/cfg.ouro")
+              (orb (prim_string_eq path "tools/analyze/dataflow.ouro")
+                (orb (prim_string_eq path "tools/analyze/semantic.ouro")
+                  (orb (prim_string_eq path "tools/analyze/property.ouro")
+                    (orb (prim_string_eq path "tools/analyze/absint.ouro")
+                      (orb (prim_string_eq path "tools/analyze/symexec.ouro")
+                        (orb (prim_string_eq path "tools/analyze/taint.ouro")
+                          (orb (prim_string_eq path "tools/analyze/contracts.ouro")
+                            (orb (prim_string_eq path "tools/analyze/complexity.ouro")
+                              (orb (prim_string_eq path "tools/analyze/bounds.ouro")
+                                (orb (prim_string_eq path "tools/analyze/minimal.ouro")
+                                  (orb (prim_string_eq path "tools/analyze/duplication.ouro")
+                                    (orb (prim_string_eq path "tools/analyze/trust.ouro")
+                                      (orb (prim_string_eq path "tools/analyze/simplify.ouro")
+                                        (orb (prim_string_eq path "tools/analyze/perf.ouro")
+                                          (orb (prim_string_eq path "tools/analyze/naming.ouro")
+                                            (prim_string_eq path "tools/analyze/errors.ouro"))))))))))))))))))));
+
+-- Implementation cones that are not type modules. Selected files that name
+-- these paths still keep-harvest them. Transitive importers get stubs.
+def cm_skip_impl_path (path : String) : Bool :=
+    (fix go (rows : List String) : Bool :=
+      match rows with
+      | Nil => False
+      | Cons row rest =>
+          match prim_string_eq path row with
+          | True => True
+          | False => go rest
+          end
+      end)
+      ([ "tools/analyze/model.ouro"
+       , "std/json.ouro"
+       , "std/jsonx.ouro"
+       , "std/format.ouro"
+       , "tools/native_build_output.ouro"
+       , "tools/repo_gate/workflow_checks.ouro"
+       , "tools/repo_gate/policy.ouro"
+       , "tools/analyze/architecture.ouro"
+       , "tools/analyze/deadcode.ouro"
+       , "tools/analyze/suppressions.ouro"
+       , "tools/analyze/api_surface.ouro"
+       , "tools/analyze/format.ouro"
+       , "tools/fix/basic_rules.ouro"
+       , "tools/fix/rules.ouro"
+       , "tools/clippy/structural_frontend.ouro"
+       , "tools/repo_gate/checks.ouro"
+       , "tools/repo_gate/parity_closure.ouro"
+       , "tools/ci_gate/host_bound.ouro"
+       , "tools/analyze/drive_light.ouro"
+       , "tools/analyze/drive_heavy.ouro"
+       , "tools/analyze/drive_smells.ouro"
+       , "tools/analyze/unit.ouro"
+       , "tools/analyze/drive.ouro"
+       , "tools/clippy/scan.ouro"
+       ] : List String);
+
+def cm_skip_import_path (path : String) : Bool :=
+    match cm_keep_import_path path with
+    | True => False
+    | False =>
+        orb (prim_string_starts path "runtime/platform/")
+          (orb (prim_string_starts path "compiler/")
+            (orb (prim_string_eq path "std/process.ouro")
+              (orb (prim_string_eq path "std/collections.ouro")
+                (orb (prim_string_eq path "std/pathx.ouro")
+                  (orb (cm_skip_analyze_family path)
+                    (cm_skip_impl_path path))))))
+    end;
+
+def cm_cache_contracts : Bool :=
+    let src : String := "def n : Nat := Z;" in
+    let other : String := "def n : Nat := S Z;" in
+    let canonical : String := "std/cache_contract.ouro" in
+    let harvest : CmHarvest :=
+      MkHarvest empty_intern (Nil ScDecl) (Nil Nat) (Nil Decl) in
+    let cache : CmParseCache :=
+      cm_cache_put cm_cache0 canonical src harvest in
+    let hit : Bool := match cm_cache_lookup cache canonical src with
+      | CmCacheHit _ => True
+      | CmCacheMiss => False
+      | CmCacheStale => False
+      end in
+    let miss : Bool := match cm_cache_lookup cm_cache0 canonical src with
+      | CmCacheMiss => True
+      | CmCacheHit _ => False
+      | CmCacheStale => False
+      end in
+    let stale : Bool := match cm_cache_lookup cache canonical other with
+      | CmCacheStale => True
+      | CmCacheHit _ => False
+      | CmCacheMiss => False
+      end in
+    let reset : Bool := match cm_cache_lookup (cm_cache_reset cache) canonical src with
+      | CmCacheMiss => True
+      | CmCacheHit _ => False
+      | CmCacheStale => False
+      end in
+    let skip_row : Bool -> Bool -> Bool :=
+      fun (acc : Bool) (row : Bool) => andb acc row in
+    let skip : Bool :=
+      (fix go (rows : List Bool) (acc : Bool) : Bool :=
+        match rows with
+        | Nil => acc
+        | Cons row rest => go rest (skip_row acc row)
+        end)
+        [ cm_skip_import_path "runtime/platform/windows_fs.ouro"
+        , cm_skip_import_path "compiler/native/managed_files.ouro"
+        , cm_skip_import_path "compiler/lexer.ouro"
+        , cm_skip_import_path "std/process.ouro"
+        , cm_skip_import_path "std/collections.ouro"
+        , cm_skip_import_path "std/pathx.ouro"
+        , cm_skip_import_path "tools/analyze/effects.ouro"
+        , cm_skip_import_path "tools/analyze/model.ouro"
+        , cm_skip_import_path "std/json.ouro"
+        , cm_skip_import_path "std/jsonx.ouro"
+        , notb (cm_skip_import_path "std/text.ouro")
+        , cm_skip_import_path "tools/fix/rules.ouro"
+        , cm_skip_import_path "tools/ci_gate/host_bound.ouro"
+        , cm_skip_import_path "std/format.ouro"
+        , cm_skip_import_path "tools/native_build_output.ouro"
+        , cm_skip_import_path "tools/repo_gate/workflow_checks.ouro"
+        , cm_skip_import_path "tools/fix/basic_rules.ouro"
+        , cm_skip_import_path "tools/clippy/structural_frontend.ouro"
+        , cm_skip_import_path "tools/repo_gate/checks.ouro"
+        , cm_skip_import_path "tools/repo_gate/parity_closure.ouro"
+        , cm_skip_import_path "tools/analyze/drive_light.ouro"
+        , cm_skip_import_path "tools/analyze/drive_heavy.ouro"
+        , cm_skip_import_path "tools/analyze/drive_smells.ouro"
+        , cm_skip_import_path "tools/analyze/unit.ouro"
+        , cm_skip_import_path "tools/analyze/drive.ouro"
+        , cm_skip_import_path "tools/clippy/scan.ouro"
+        , notb (cm_skip_import_path "tools/analyze/drive_light_run.ouro")
+        , notb (cm_skip_import_path "tools/clippy/scan_types.ouro")
+        , notb (cm_skip_import_path "tools/analyze/model_types.ouro")
+        , notb (cm_skip_analyze_family "tools/analyze/hash.ouro")
+        , notb (cm_skip_import_path "std/processx.ouro")
+        , notb (cm_skip_import_path "std/listx.ouro")
+        , notb (cm_skip_import_path "compiler/pipeline_abi.ouro")
+        , notb (cm_skip_import_path "runtime/native_types.ouro")
+        , notb (cm_skip_import_path "std/fs.ouro")
+        , notb (cm_skip_import_path "tools/lint.ouro")
+        , notb (cm_skip_import_path "compiler/base.ouro")
+        , notb (cm_skip_import_path "compiler/source_text.ouro")
+        , notb (cm_skip_import_path "compiler/parser_file.ouro")
+        , notb (cm_skip_import_path "tools/analyze/drive_env.ouro")
+        , notb (cm_skip_import_path "tools/repo_gate/policy_types.ouro")
+        , notb (cm_skip_import_path "tools/clippy/intern_surface.ouro")
+        , notb (cm_skip_import_path "tools/repo_gate/policy_names.ouro")
+        ]
+        True in
+    andb hit (andb miss (andb stale (andb reset skip)));
+
+-- Native-tool build metadata scopes this two-argument import harvest.
+-- Type-alias following on imports stays unknown.
+def cm_load_file (req : Pair String String) (intern : InternState)
+    : Either QualityInputError CmHarvest :=
+    match req with
+    | MkPair path source =>
+        match cm_parse source intern with
+        | Left error => Left QualityInputError CmHarvest error
+        | Right parsed => match parsed with
+          | MkPair decls lexed => match load_intern_string lexed
+              (prim_string_to_char_codes path) with
+            | MkPair module_id updated =>
+                Right QualityInputError CmHarvest
+                  (cm_after_parse path module_id False decls updated)
+            end
+          end
+        end
+    end;
+
+def cm_load_file_cached (req : Pair String String) (intern : InternState)
+    (cache : CmParseCache) : Either QualityInputError (Pair CmHarvest CmParseCache) :=
+    match req with
+    | MkPair path source =>
+        match cm_cache_lookup cache path source with
+        | CmCacheHit harvest =>
+            match harvest with
+            | MkHarvest _ symbols imports decls =>
+                Right QualityInputError (Pair CmHarvest CmParseCache)
+                  (MkPair CmHarvest CmParseCache
+                    (MkHarvest intern symbols imports decls) cache)
+            end
+        | CmCacheMiss =>
+            match cm_load_file req intern with
+            | Left error => Left QualityInputError (Pair CmHarvest CmParseCache) error
+            | Right harvest =>
+                Right QualityInputError (Pair CmHarvest CmParseCache)
+                  (MkPair CmHarvest CmParseCache harvest
+                    (cm_cache_put cache path source harvest))
+            end
+        | CmCacheStale =>
+            match cm_load_file req intern with
+            | Left error => Left QualityInputError (Pair CmHarvest CmParseCache) error
+            | Right harvest =>
+                Right QualityInputError (Pair CmHarvest CmParseCache)
+                  (MkPair CmHarvest CmParseCache harvest
+                    (cm_cache_put cache path source harvest))
+            end
+        end
+    end;
+
+-- Paths are repository-relative compiler canonical paths. The caller anchors
+-- disk reads to an already resolved repository root. Source text is retained
+-- only for the selected file, to give the reporting process that SAME snapshot.
+def cm_load_pending (root : String) (entry : Nat) : Nat -> Nat -> List Nat -> List Nat
+    -> InternState -> List SrcUnit -> List ScDecl -> String -> List Decl
+    -> CmParseCache -> List Nat
+    -> IO (Either QualityInputError
+        (Pair ClippySemanticUnit (Pair InternState CmParseCache))) :=
+  fix go (fuel : Nat) (file_budget : Nat) (pending : List Nat) (loaded : List Nat)
+      (intern : InternState) (units : List SrcUnit) (symbols : List ScDecl)
+      (source : String) (root_decls : List Decl) (cache : CmParseCache)
+      (keep : List Nat)
+      : IO (Either QualityInputError
+        (Pair ClippySemanticUnit (Pair InternState CmParseCache))) :=
+    match pending with
+    | Nil => io_pure (Either QualityInputError
+        (Pair ClippySemanticUnit (Pair InternState CmParseCache)))
+        (match resolve_imports_fuel cm_import_graph_fuel (cm_graph_units units) entry with
+         | RErr code detail => Left QualityInputError
+             (Pair ClippySemanticUnit (Pair InternState CmParseCache))
+             (QualityInvalidInput (prim_string_concat "compiler import graph failed: "
+               (prim_string_concat (prim_string_of_nat code)
+                 (prim_string_concat " at " (cm_string intern detail)))))
+         | ROk _ => match sc_index_sorted (quality_sort ScDecl
+             (fun (a : ScDecl) (b : ScDecl) => leb_nat (sc_decl_name a) (sc_decl_name b)) symbols) with
+           | Left error => Left QualityInputError
+               (Pair ClippySemanticUnit (Pair InternState CmParseCache))
+               (QualityInvalidInput (sc_error_message error))
+           | Right index => Right QualityInputError
+               (Pair ClippySemanticUnit (Pair InternState CmParseCache))
+               (MkPair ClippySemanticUnit (Pair InternState CmParseCache)
+                 (CmUnit intern entry source units symbols index root_decls (length Nat loaded))
+                 (MkPair InternState CmParseCache intern cache))
+           end
+         end)
+    | Cons id rest => match fuel with
+      | Z => io_pure (Either QualityInputError
+          (Pair ClippySemanticUnit (Pair InternState CmParseCache)))
+          (Left QualityInputError (Pair ClippySemanticUnit (Pair InternState CmParseCache))
+            (QualityInvalidInput "semantic source queue traversal exhausted"))
+      | S remaining => match elem Nat eq_nat id loaded with
+      | True => go remaining file_budget rest loaded intern units symbols source root_decls cache keep
+      | False => match file_budget with
+        | Z => io_pure (Either QualityInputError
+            (Pair ClippySemanticUnit (Pair InternState CmParseCache)))
+            (Left QualityInputError (Pair ClippySemanticUnit (Pair InternState CmParseCache))
+              (QualityInvalidInput "semantic source inventory exhausted"))
+        | S files_remaining =>
+            let path : String := cm_string intern id in
+            match andb (notb (eq_nat id entry))
+                (andb (cm_skip_import_path path)
+                  (notb (elem Nat eq_nat id keep))) with
+            | True =>
+                go remaining file_budget rest (Cons Nat id loaded) intern
+                  (Cons SrcUnit (MkSrcUnit id (Nil Decl)) units)
+                  symbols source root_decls cache keep
+            | False =>
+            do let! input := quality_read_file (quality_child root path);
+               match input with
+               | Left error => io_pure (Either QualityInputError
+                   (Pair ClippySemanticUnit (Pair InternState CmParseCache)))
+                   (Left QualityInputError (Pair ClippySemanticUnit (Pair InternState CmParseCache)) error)
+               | Right text =>
+                   match eq_nat id entry with
+                   | True => match cm_parse text intern with
+                     | Left error => io_pure (Either QualityInputError
+                         (Pair ClippySemanticUnit (Pair InternState CmParseCache)))
+                         (Left QualityInputError (Pair ClippySemanticUnit (Pair InternState CmParseCache))
+                           (QualityInvalidInput (prim_string_concat path
+                             (prim_string_concat ": " (quality_input_message error)))))
+                     | Right parsed => match parsed with
+                       | MkPair decls lexed => match cm_after_parse path id True decls lexed with
+                         | MkHarvest updated file_symbols imports canonical =>
+                             go remaining files_remaining
+                               (append Nat imports rest) (Cons Nat id loaded)
+                               updated (Cons SrcUnit (MkSrcUnit id (cm_import_stubs imports)) units)
+                               (append ScDecl file_symbols symbols)
+                               text canonical
+                               cache
+                               imports
+                         end
+                       end
+                     end
+                   | False => match cm_load_file_cached (MkPair String String path text) intern cache with
+                     | Left error => io_pure (Either QualityInputError
+                         (Pair ClippySemanticUnit (Pair InternState CmParseCache)))
+                         (Left QualityInputError (Pair ClippySemanticUnit (Pair InternState CmParseCache))
+                           (QualityInvalidInput (prim_string_concat path
+                             (prim_string_concat ": " (quality_input_message error)))))
+                     | Right loaded_file => match loaded_file with
+                       | MkPair harvested next_cache => match harvested with
+                         | MkHarvest updated file_symbols imports _ =>
+                             go remaining files_remaining
+                               (append Nat imports rest) (Cons Nat id loaded)
+                               updated (Cons SrcUnit (MkSrcUnit id (cm_import_stubs imports)) units)
+                               (append ScDecl file_symbols symbols)
+                               source root_decls next_cache keep
+                         end
+                       end
+                     end
+                   end
+               end
+            end
+        end
+      end
+      end
+    end;
+
+def cm_load_cached (root : String) (relative : String) (intern : InternState)
+    (cache : CmParseCache)
+    : IO (Either QualityInputError
+        (Pair ClippySemanticUnit (Pair InternState CmParseCache))) :=
+    match load_intern_string intern (load_canon_path (Nil Nat)
+        (prim_string_to_char_codes relative)) with
+    | MkPair entry next => cm_load_pending root entry cm_load_queue_fuel cm_file_budget
+        ([entry] : List Nat) (Nil Nat) next (Nil SrcUnit) (Nil ScDecl) "" (Nil Decl) cache
+        (Nil Nat)
+    end;
+
+def cm_load (root : String) (relative : String) : IO (Either QualityInputError ClippySemanticUnit) :=
+    do let! loaded := cm_load_cached root relative empty_intern cm_cache0;
+       io_pure (Either QualityInputError ClippySemanticUnit)
+         (match loaded with
+          | Left error => Left QualityInputError ClippySemanticUnit error
+          | Right pair => match pair with
+            | MkPair unit _ => Right QualityInputError ClippySemanticUnit unit
+            end
+          end)

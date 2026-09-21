@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Apply docs/github_repository_settings.md via the GitHub API.
+"""Apply the hosted GitHub settings recorded in docs/ci.md via the GitHub API.
 
 This does not rewrite history and does not claim a setting is on unless the
 follow-up GET succeeds. Host-plan limits are recorded as SKIP/BLOCKED.

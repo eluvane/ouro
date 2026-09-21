@@ -126,7 +126,7 @@ def fx_ascribed_literal (src : String) (h : FxTok) (args : List FxTok) : Maybe S
     match fx_is_word h "[" with
     | False => Nothing String
     | True =>
-        match fx_group_go args Z ([h] : List FxTok) with
+        match st_group_go args Z ([h] : List FxTok) with
         | Nothing => Nothing String
         | Just grp_at =>
             match grp_at with
@@ -143,7 +143,7 @@ def fx_ascribed_literal (src : String) (h : FxTok) (args : List FxTok) : Maybe S
 -- so an element that is exactly "Nil T" drops to [] and an element that
 -- carries its own ascription loses it.
 def fx_elem_text (src : String) (atom : List FxTok) : String :=
-    let inner : List FxTok := fx_unparen atom in
+    let inner : List FxTok := st_unparen atom in
     match inner with
     | Nil => fx_atom_text src atom
     | Cons h args =>
@@ -153,7 +153,7 @@ def fx_elem_text (src : String) (atom : List FxTok) : String :=
             match fx_is_word h "Nil" with
             | False => fx_atom_text src atom
             | True =>
-                match fx_atom args with
+                match st_atom args with
                 | Nothing => fx_atom_text src atom
                 | Just ty_at =>
                     match ty_at with
@@ -168,47 +168,76 @@ def fx_elem_text (src : String) (atom : List FxTok) : String :=
         end
     end;
 
--- Elements of a Cons/Nil chain whose every type argument spells ty.
-def fx_chain_elems (src : String) (ty : String) : Nat -> List FxTok -> List String -> Maybe (List String) :=
-  fix go (fuel : Nat) (ts : List FxTok) (acc : List String) : Maybe (List String) :=
+-- Elements, end byte and remaining tokens of a constructor chain. Diagnostics
+-- retain the syntax check for a bare tail; edits require atom-shaped tails.
+inductive FxChain : Type :=
+  | MkFxChain : List String -> Nat -> List FxTok -> FxChain;
+
+def fx_chain_prepend (src : String) (elem : List FxTok) (tail : FxChain) : FxChain :=
+    match tail with
+    | MkFxChain elems stop after =>
+        MkFxChain (Cons String (fx_elem_text src elem) elems) stop after
+    end;
+
+-- One Cons/Nil recognizer serves edits and diagnostic spans. The mode changes
+-- applicability, never the meaning or shape of an automatically applied edit.
+def fx_chain_parse (bare_tail : Bool) (src : String) (ty : String)
+    : Nat -> List FxTok -> Maybe FxChain :=
+  fix go (fuel : Nat) (ts : List FxTok) : Maybe FxChain :=
     match fuel with
-    | Z => Nothing (List String)
+    | Z => Nothing FxChain
     | S fuel2 =>
         match ts with
-        | Nil => Nothing (List String)
+        | Nil => Nothing FxChain
         | Cons h rest =>
-            match fx_atom rest with
-            | Nothing => Nothing (List String)
+            match st_atom rest with
+            | Nothing => Nothing FxChain
             | Just ty_at =>
                 match ty_at with
                 | MkPair ty_atom rest2 =>
                     match str_eq (fx_toks_text src ty_atom) ty with
-                    | False => Nothing (List String)
+                    | False => Nothing FxChain
                     | True =>
                         match fx_is_word h "Nil" with
-                        | True =>
-                            match rest2 with
-                            | Nil => Just (List String) (reverse_lin String acc)
-                            | Cons _ _ => Nothing (List String)
-                            end
+                        | True => Just FxChain (MkFxChain (Nil String) (fx_toks_end ty_atom) rest2)
                         | False =>
                             match fx_is_word h "Cons" with
-                            | False => Nothing (List String)
+                            | False => Nothing FxChain
                             | True =>
-                                match fx_atom rest2 with
-                                | Nothing => Nothing (List String)
+                                match st_atom rest2 with
+                                | Nothing => Nothing FxChain
                                 | Just el_at =>
                                     match el_at with
                                     | MkPair el_atom rest3 =>
-                                        match fx_atom rest3 with
-                                        | Nothing => Nothing (List String)
-                                        | Just tl_at =>
-                                            match tl_at with
-                                            | MkPair tl_atom rest4 =>
-                                                match rest4 with
-                                                | Cons _ _ => Nothing (List String)
-                                                | Nil => go fuel2 (fx_unparen tl_atom)
-                                                    (Cons String (fx_elem_text src el_atom) acc)
+                                        match fx_is_word (fx_first_tok rest3) "(" with
+                                        | False =>
+                                            match bare_tail with
+                                            | False => Nothing FxChain
+                                            | True =>
+                                                match go fuel2 rest3 with
+                                                | Nothing => Nothing FxChain
+                                                | Just tail => Just FxChain (fx_chain_prepend src el_atom tail)
+                                                end
+                                            end
+                                        | True =>
+                                            match st_atom rest3 with
+                                            | Nothing => Nothing FxChain
+                                            | Just tl_at =>
+                                                match tl_at with
+                                                | MkPair tl_atom rest4 =>
+                                                    match go fuel2 (st_unparen tl_atom) with
+                                                    | Nothing => Nothing FxChain
+                                                    | Just tail =>
+                                                        match tail with
+                                                        | MkFxChain elems _ after =>
+                                                            match after with
+                                                            | Cons _ _ => Nothing FxChain
+                                                            | Nil => Just FxChain (MkFxChain
+                                                                (Cons String (fx_elem_text src el_atom) elems)
+                                                                (fx_toks_end tl_atom) rest4)
+                                                            end
+                                                        end
+                                                    end
                                                 end
                                             end
                                         end
@@ -218,6 +247,20 @@ def fx_chain_elems (src : String) (ty : String) : Nat -> List FxTok -> List Stri
                         end
                     end
                 end
+            end
+        end
+    end;
+
+def fx_chain_elems (src : String) (ty : String) (fuel : Nat) (ts : List FxTok)
+    (acc : List String) : Maybe (List String) :=
+    match fx_chain_parse False src ty fuel ts with
+    | Nothing => Nothing (List String)
+    | Just chain =>
+        match chain with
+        | MkFxChain elems _ after =>
+            match after with
+            | Cons _ _ => Nothing (List String)
+            | Nil => Just (List String) (append String (reverse_lin String acc) elems)
             end
         end
     end;
@@ -325,24 +368,24 @@ def fx_list_edit (src : String) (t : FxTok) (prev : List FxTok) (after : List Fx
     end;
 
 -- Cons T e1 (Cons T e2 (Nil T))  ->  [e1, e2]  (ascribed when no annotation)
-def fx_cons_hit (src : String) (t : FxTok) (rest : List FxTok) (prev : List FxTok) : List FxEdit :=
-    match fx_atom rest with
+def fx_cons_hit_fuel (fuel : Nat) (src : String) (t : FxTok) (rest : List FxTok) (prev : List FxTok) : List FxEdit :=
+    match st_atom rest with
     | Nothing => Nil FxEdit
     | Just ty_at =>
         match ty_at with
         | MkPair ty_atom rest2 =>
-            match fx_atom rest2 with
+            match st_atom rest2 with
             | Nothing => Nil FxEdit
             | Just el_at =>
                 match el_at with
                 | MkPair el_atom rest3 =>
-                    match fx_atom rest3 with
+                    match st_atom rest3 with
                     | Nothing => Nil FxEdit
                     | Just tl_at =>
                         match tl_at with
                         | MkPair tl_atom rest4 =>
-                            match fx_chain_elems src (fx_toks_text src ty_atom) fx_byte_mod
-                                    (fx_unparen tl_atom)
+                            match fx_chain_elems src (fx_toks_text src ty_atom) fuel
+                                    (st_unparen tl_atom)
                                     ([fx_elem_text src el_atom] : List String) with
                             | Nothing => Nil FxEdit
                             | Just elems =>
@@ -355,11 +398,14 @@ def fx_cons_hit (src : String) (t : FxTok) (rest : List FxTok) (prev : List FxTo
         end
     end;
 
+def fx_cons_hit (src : String) (t : FxTok) (rest : List FxTok) (prev : List FxTok) : List FxEdit :=
+    fx_cons_hit_fuel fx_byte_mod src t rest prev;
+
 -- Nil T bound by an annotated or untyped let binding  ->  []
 -- A bare Nil inside a user-written literal is left alone: the literal may be
 -- the only thing that fixes its element type.
 def fx_nil_hit (src : String) (t : FxTok) (rest : List FxTok) (prev : List FxTok) : List FxEdit :=
-    match fx_atom rest with
+    match st_atom rest with
     | Nothing => Nil FxEdit
     | Just ty_at =>
         match ty_at with
@@ -386,13 +432,13 @@ def fx_tower_leaf : Nat -> List FxTok -> Nat -> Maybe (Pair Nat FxTok) :=
         | Cons h rest =>
             match fx_is_word h "S" with
             | True =>
-                match fx_atom rest with
+                match st_atom rest with
                 | Nothing => Nothing (Pair Nat FxTok)
                 | Just arg_at =>
                     match arg_at with
                     | MkPair arg after =>
                         match after with
-                        | Nil => go fuel2 (fx_unparen arg) (S depth)
+                        | Nil => go fuel2 (st_unparen arg) (S depth)
                         | Cons _ _ => Nothing (Pair Nat FxTok)
                         end
                     end
@@ -437,12 +483,12 @@ def fx_peano_edit (t : FxTok) (prev : List FxTok) (after : List FxTok) (stop : N
 
 -- S (S (S Z)) -> 3;  S (S (S n)) -> n |> S |> S |> S
 def fx_succ_hit (t : FxTok) (rest : List FxTok) (prev : List FxTok) : List FxEdit :=
-    match fx_atom rest with
+    match st_atom rest with
     | Nothing => Nil FxEdit
     | Just arg_at =>
         match arg_at with
         | MkPair arg after =>
-            match fx_tower_leaf fx_fuel_small (fx_unparen arg) (S Z) with
+            match fx_tower_leaf fx_fuel_small (st_unparen arg) (S Z) with
             | Nothing => Nil FxEdit
             | Just leaf_at =>
                 match leaf_at with
@@ -591,7 +637,7 @@ def fx_bracket_hit (t : FxTok) (rest : List FxTok) (prev : List FxTok) : List Fx
     match fx_let_untyped prev with
     | Nothing => Nil FxEdit
     | Just name =>
-        match fx_group_go rest Z ([t] : List FxTok) with
+        match st_group_go rest Z ([t] : List FxTok) with
         | Nothing => Nil FxEdit
         | Just grp_at =>
             match grp_at with

@@ -1,0 +1,533 @@
+-- Ouro native lint CLI: shared checked inventory, compiler lint, and IO.
+
+import "../std/io.ouro";
+import "../std/fs.ouro";
+import "../std/processx.ouro";
+import "../std/collections.ouro";
+import "../compiler/canonical_hash.ouro";
+import "lint_host.ouro";
+import "quality/source.ouro";
+import "quality/input_error.ouro";
+import "clippy/session_policy.ouro";
+
+def lint_path_basename (path : String) : String :=
+    let codes : List Nat := ncodes path in
+    match last_slash codes with
+    | Nothing => path
+    | Just i => nstr (drop Nat (S i) codes)
+    end;
+
+def lint_path_stem (path : String) : String :=
+    let base : String := lint_path_basename path in
+    match prim_string_ends base ".ouro" with
+    | True => prim_string_slice base Z (sub (prim_string_length base) 5)
+    | False => base
+    end;
+
+def lint_cat4 (a : String) (b : String) (c : String) (d : String) : String :=
+    concat a (concat b (concat c d));
+
+def lint_fixture_dirs : List String :=
+    [ "test", "tests", "fixtures", "bench", "future" ];
+
+def skip_dir (name : String) : Bool :=
+    orb (quality_skip_dir name) (elem String prim_string_eq name lint_fixture_dirs);
+
+-- These two negative/tutorial fixtures were already excluded by the public
+-- shell launcher. An explicit file argument still overrides discovery policy.
+def lint_fixture_names : List String :=
+    [ "bad_undeclared_perform.ouro", "04_holes.ouro" ];
+
+def lint_keep_discovered (roots : List String) (path : String) : Bool :=
+    orb (elem String prim_string_eq path roots)
+      (notb (elem String prim_string_eq (lint_path_basename path) lint_fixture_names));
+
+def gather (roots : List String) : IO (Either QualityInputError (List String)) :=
+    let normalized : List String := map String String quality_normalize_path roots in
+    quality_inventory skip_dir (lint_keep_discovered normalized) normalized;
+
+-- tools already contains tools/analyze. Do not walk and lint that subtree twice.
+def defaults : List String := [ "std", "compiler", "samples", "tools" ];
+
+def emit_lines (xs : List String) : IO Nat :=
+    io_bind Unit Nat (io_foreach String println xs)
+      (fun (_ : Unit) => io_pure Nat (length String xs));
+
+def lint_input_fail (e : QualityInputError) : IO Nat :=
+    do eprintln (quality_input_message e);
+       io_pure Nat (S Z)
+
+def snoc_resolved (from : String) (xs : List String) (acc : List String)
+    : List String :=
+    foldl String (List String)
+      (fun (a : List String) (n : String) => snoc_str a (resolve_import from n))
+      acc xs;
+
+def known_pair (names : List String) (ctors : List String)
+    : Pair (List String) (List String) :=
+    MkPair (List String) (List String) names ctors;
+
+-- Import discovery has one result: the whole harvested cone or a typed error.
+-- Missing imports, directories, links and exhausted work are not unknown-name
+-- evidence and must never turn into a successful partial constructor inventory.
+def known_go : Nat -> List String -> List String -> List String -> List String
+    -> IO (Either QualityInputError (Pair (List String) (List String))) :=
+  fix known_go (fuel : Nat) (pending : List String) (seen : List String)
+      (names : List String) (ctors : List String)
+      : IO (Either QualityInputError (Pair (List String) (List String))) :=
+    match pending with
+    | Nil => io_pure (Either QualityInputError (Pair (List String) (List String)))
+        (Right QualityInputError (Pair (List String) (List String))
+          (known_pair names ctors))
+    | Cons path rest =>
+        match fuel with
+        | Z => io_pure (Either QualityInputError (Pair (List String) (List String)))
+            (Left QualityInputError (Pair (List String) (List String))
+              (QualityImportExhausted path))
+        | S fuel2 =>
+            match mem_str path seen with
+            | True => known_go fuel2 rest seen names ctors
+            | False =>
+                do let! loaded := quality_read_file path;
+                   match loaded with
+                   | Left e =>
+                       io_pure (Either QualityInputError (Pair (List String) (List String)))
+                         (Left QualityInputError (Pair (List String) (List String)) e)
+                   | Right src =>
+                       known_go fuel2
+                         (snoc_resolved path (harvest_imports src) rest)
+                         (Cons String path seen)
+                         (append String (harvest_names src) names)
+                         (append String (harvest_ctor_names src) ctors)
+                   end
+            end
+        end
+    end;
+
+-- Reuse the source already loaded by lint_path instead of reading the root a
+-- second time just to seed its imports. Each imported path is read once per cone.
+def collect_known (path : String) (src : String)
+    : IO (Either QualityInputError (Pair (List String) (List String))) :=
+    known_go quality_walk_budget
+      (snoc_resolved path (harvest_imports src) (Nil String))
+      (singleton String path) (Nil String) (Nil String);
+
+-- Harvest cache is per worker, not a second semantic authority. A file's
+-- known names are still exactly the names in its own import closure.
+-- Rows are content-addressed: canonical path + byte length + FNV-1a 64 of
+-- the exact quality_read_file bytes. Path-only matches are stale. A hit
+-- never skips lint_lines.
+inductive LintCachedFile : Type :=
+  | MkLintCachedFile : String -> Nat -> List Nat -> List String -> List String
+      -> List String -> LintCachedFile;
+
+inductive LintHarvestCache : Type :=
+  | MkLintHarvestCache : List (Pair String LintCachedFile) -> LintHarvestCache;
+
+inductive LintCacheLookup : Type :=
+  | LintCacheHit : LintCachedFile -> LintCacheLookup
+  | LintCacheMiss : LintCacheLookup
+  | LintCacheStale : LintCacheLookup;
+
+def lint_facts_kind : String :=
+    "ouro.quality-facts.v1";
+
+def lint_cache0 : LintHarvestCache :=
+    MkLintHarvestCache (Nil (Pair String LintCachedFile));
+
+def lint_cache_reset (cache : LintHarvestCache) : LintHarvestCache :=
+    match cache with
+    | MkLintHarvestCache _ => lint_cache0
+    end;
+
+def lint_content_hash (src : String) : List Nat :=
+    canonical_hash_bytes (canonical_hash_codes (prim_string_to_char_codes src));
+
+def lint_hash_eq (left : List Nat) (right : List Nat) : Bool :=
+    (fix go (xs : List Nat) (ys : List Nat) : Bool :=
+      match xs with
+      | Nil => match ys with | Nil => True | Cons _ _ => False end
+      | Cons x xr => match ys with
+        | Nil => False
+        | Cons y yr => match eqNat x y with
+          | False => False
+          | True => go xr yr
+          end
+        end
+      end) left right;
+
+def lint_cache_row_ok (cached : LintCachedFile) : Bool :=
+    match cached with
+    | MkLintCachedFile canonical _ hash _ _ _ =>
+        andb (ltb_nat 0 (prim_string_length canonical))
+          (eqNat (length Nat hash) 8)
+    end;
+
+def lint_cache_get (cache : LintHarvestCache) (canonical : String)
+    : Maybe LintCachedFile :=
+    match cache with
+    | MkLintHarvestCache rows =>
+        lookup String LintCachedFile prim_string_eq canonical rows
+    end;
+
+def lint_cache_lookup (cache : LintHarvestCache) (canonical : String)
+    (src : String) : LintCacheLookup :=
+    match lint_cache_get cache canonical with
+    | Nothing => LintCacheMiss
+    | Just cached =>
+        match lint_cache_row_ok cached with
+        | False => LintCacheStale
+        | True => match cached with
+          | MkLintCachedFile _ stored_len stored_hash _ _ _ =>
+              match andb (eqNat stored_len (prim_string_length src))
+                  (lint_hash_eq stored_hash (lint_content_hash src)) with
+              | True => LintCacheHit cached
+              | False => LintCacheStale
+              end
+          end
+        end
+    end;
+
+def lint_cache_put (cache : LintHarvestCache) (canonical : String)
+    (cached : LintCachedFile) : LintHarvestCache :=
+    match cache with
+    | MkLintHarvestCache rows =>
+        match compareNat (length (Pair String LintCachedFile) rows)
+            quality_walk_budget with
+        | GT => cache
+        | LT =>
+            MkLintHarvestCache (Cons (Pair String LintCachedFile)
+              (MkPair String LintCachedFile canonical cached) rows)
+        | EQ => cache
+        end
+    end;
+
+def lint_make_cached (canonical : String) (src : String) (imports : List String)
+    (names : List String) (ctors : List String) : LintCachedFile :=
+    MkLintCachedFile canonical (prim_string_length src) (lint_content_hash src)
+      imports names ctors;
+
+def lint_canonical_path (path : String) : IO (Either QualityInputError String) :=
+    do let! canonical := prim_fs_realpath path;
+       match prim_string_length canonical with
+       | Z => io_pure (Either QualityInputError String)
+           (Left QualityInputError String (QualityInvalidInput path))
+       | S _ => io_pure (Either QualityInputError String)
+           (Right QualityInputError String (quality_normalize_path canonical))
+       end
+
+def lint_cache_facts (canonical : String) (src : String)
+    (cache : LintHarvestCache) : Either QualityInputError
+      (Pair (Pair (List String) (List String)) LintHarvestCache) :=
+    match lint_cache_lookup cache canonical src with
+    | LintCacheHit cached =>
+        match lint_cache_row_ok cached with
+        | False => Left QualityInputError
+            (Pair (Pair (List String) (List String)) LintHarvestCache)
+            (QualityInvalidInput (concat "truncated quality fact row: " canonical))
+        | True => match cached with
+          | MkLintCachedFile _ _ _ _ harvested ctors2 =>
+              Right QualityInputError
+                (Pair (Pair (List String) (List String)) LintHarvestCache)
+                (MkPair (Pair (List String) (List String)) LintHarvestCache
+                  (known_pair harvested ctors2) cache)
+          end
+        end
+    | LintCacheMiss =>
+        let imports : List String := harvest_imports src in
+        let harvested : List String := harvest_names src in
+        let ctors2 : List String := harvest_ctor_names src in
+        Right QualityInputError
+          (Pair (Pair (List String) (List String)) LintHarvestCache)
+          (MkPair (Pair (List String) (List String)) LintHarvestCache
+            (known_pair harvested ctors2)
+            (lint_cache_put cache canonical
+              (lint_make_cached canonical src imports harvested ctors2)))
+    | LintCacheStale =>
+        let imports : List String := harvest_imports src in
+        let harvested : List String := harvest_names src in
+        let ctors2 : List String := harvest_ctor_names src in
+        Right QualityInputError
+          (Pair (Pair (List String) (List String)) LintHarvestCache)
+          (MkPair (Pair (List String) (List String)) LintHarvestCache
+            (known_pair harvested ctors2)
+            (lint_cache_put cache canonical
+              (lint_make_cached canonical src imports harvested ctors2)))
+    end;
+
+def lint_cached_imports (cache : LintHarvestCache) (canonical : String)
+    (src : String) : List String :=
+    match lint_cache_get cache canonical with
+    | Just cached =>
+        match cached with
+        | MkLintCachedFile _ _ _ imports _ _ => imports
+        end
+    | Nothing => harvest_imports src
+    end;
+
+def lint_known_left (e : QualityInputError)
+    : IO (Either QualityInputError
+        (Pair (Pair (List String) (List String)) LintHarvestCache)) :=
+    io_pure (Either QualityInputError
+      (Pair (Pair (List String) (List String)) LintHarvestCache))
+      (Left QualityInputError
+        (Pair (Pair (List String) (List String)) LintHarvestCache) e);
+
+def known_go_cached : Nat -> List String -> List String -> List String
+    -> List String -> LintHarvestCache
+    -> IO (Either QualityInputError
+        (Pair (Pair (List String) (List String)) LintHarvestCache)) :=
+  fix known_go_cached (fuel : Nat) (pending : List String) (seen : List String)
+      (names : List String) (ctors : List String) (cache : LintHarvestCache)
+      : IO (Either QualityInputError
+        (Pair (Pair (List String) (List String)) LintHarvestCache)) :=
+    match pending with
+    | Nil => io_pure (Either QualityInputError
+        (Pair (Pair (List String) (List String)) LintHarvestCache))
+        (Right QualityInputError
+          (Pair (Pair (List String) (List String)) LintHarvestCache)
+          (MkPair (Pair (List String) (List String)) LintHarvestCache
+            (known_pair names ctors) cache))
+    | Cons path rest =>
+        match fuel with
+        | Z => lint_known_left (QualityImportExhausted path)
+        | S fuel2 =>
+            match mem_str path seen with
+            | True => known_go_cached fuel2 rest seen names ctors cache
+            | False =>
+                do let! loaded := quality_read_file path;
+                   match loaded with
+                   | Left e => lint_known_left e
+                   | Right src =>
+                       do let! keyed := lint_canonical_path path;
+                          match keyed with
+                          | Left e => lint_known_left e
+                          | Right canonical =>
+                              match lint_cache_facts canonical src cache with
+                              | Left e => lint_known_left e
+                              | Right facts => match facts with
+                                | MkPair harvested next => match harvested with
+                                  | MkPair names2 ctors2 =>
+                                      known_go_cached fuel2
+                                        (snoc_resolved path
+                                          (lint_cached_imports next canonical src)
+                                          rest)
+                                        (Cons String path seen)
+                                        (append String names2 names)
+                                        (append String ctors2 ctors) next
+                                end
+                              end
+                              end
+                          end
+                   end
+            end
+        end
+    end;
+
+def collect_known_into (path : String) (src : String) (cache : LintHarvestCache)
+    : IO (Either QualityInputError
+        (Pair (Pair (List String) (List String)) LintHarvestCache)) :=
+    do let! keyed := lint_canonical_path path;
+       match keyed with
+       | Left e => lint_known_left e
+       | Right canonical =>
+           match lint_cache_facts canonical src cache with
+           | Left e => lint_known_left e
+           | Right facts => match facts with
+             | MkPair _ next =>
+                 known_go_cached quality_walk_budget
+                   (snoc_resolved path
+                     (lint_cached_imports next canonical src)
+                     (Nil String))
+                   (singleton String path) (Nil String) (Nil String) next
+             end
+           end
+       end
+
+def lint_src (path : String) (src : String) : IO Nat :=
+    match prep_codes (ncodes src) with
+    | LintPrepErr kind => emit_lines (str1 (concat path (concat ": " kind)))
+    | LintPrepOk codes =>
+        do let! loaded := collect_known path src;
+           match loaded with
+           | Left e => lint_input_fail e
+           | Right known =>
+               match known with
+               | MkPair names ctors =>
+                   emit_lines (lint_lines path src names ctors codes)
+               end
+           end
+    end;
+
+def lint_path (path : String) : IO Nat :=
+    do let! loaded := quality_read_file path;
+       match loaded with
+       | Left e => lint_input_fail e
+       | Right src => lint_src path src
+       end
+
+def lint_src_cached (path : String) (src : String) (cache : LintHarvestCache)
+    : IO (Pair Nat LintHarvestCache) :=
+    match prep_codes (ncodes src) with
+    | LintPrepErr kind =>
+        do let! count := emit_lines (str1 (concat path (concat ": " kind)));
+           io_pure (Pair Nat LintHarvestCache)
+             (MkPair Nat LintHarvestCache count cache)
+    | LintPrepOk codes =>
+        do let! loaded := collect_known_into path src cache;
+           match loaded with
+           | Left e =>
+               do let! count := lint_input_fail e;
+                  io_pure (Pair Nat LintHarvestCache)
+                    (MkPair Nat LintHarvestCache count cache)
+           | Right known => match known with
+             | MkPair pair next => match pair with
+               | MkPair names ctors =>
+                   do let! count := emit_lines
+                        (lint_lines path src names ctors codes);
+                      io_pure (Pair Nat LintHarvestCache)
+                        (MkPair Nat LintHarvestCache count next)
+               end
+             end
+           end
+    end;
+
+def lint_path_cached (path : String) (cache : LintHarvestCache)
+    : IO (Pair Nat LintHarvestCache) :=
+    do let! loaded := quality_read_file path;
+       match loaded with
+       | Left e =>
+           do let! count := lint_input_fail e;
+              io_pure (Pair Nat LintHarvestCache)
+                (MkPair Nat LintHarvestCache count cache)
+       | Right src => lint_src_cached path src cache
+       end
+
+-- Preserve the first fatal child status even when an earlier file only had
+-- findings. Continue visiting the selected files without converting a crash
+-- into a clean or warn-only aggregate.
+def lint_join_status (previous : Nat) (next : Nat) : Nat :=
+    match compareNat previous (S Z) with
+    | GT => previous
+    | LT => next
+    | EQ =>
+        match next with
+        | Z => previous
+        | S code => S code
+        end
+    end;
+
+def lint_batch_inprocess : List String -> LintHarvestCache -> Nat -> IO Nat :=
+  fix go (paths : List String) (cache : LintHarvestCache) (status : Nat)
+      : IO Nat :=
+    match paths with
+    | Nil => io_pure Nat status
+    | Cons path rest =>
+        do let! got := lint_path_cached (quality_normalize_path path) cache;
+           match got with
+           | MkPair count next =>
+               go rest next (lint_join_status status
+                 (match count with | Z => Z | S _ => S Z end))
+           end
+    end;
+
+-- A successful lint child is silent. Nonempty output with rc=0 is not proof
+-- of a clean analysis, even if an extracted exit thunk was lost by the host.
+def lint_child_status (result : ProcResult) : Nat :=
+    match proc_code result with
+    | Z =>
+        match andb (prim_string_eq (proc_stdout result) "")
+            (prim_string_eq (proc_stderr result) "") with
+        | True => Z
+        | False => S Z
+        end
+    | S code => S code
+    end;
+
+def lint_process_file (exe : String) (path : String) : IO Nat :=
+    do let! result := process_run_spec (command_spec exe (["--single-file", path] : List String));
+       print (proc_stdout result);
+       eprint (proc_stderr result);
+       io_pure Nat (lint_child_status result)
+
+-- Recycle the child after this many files. Process death drops the
+-- in-process fact cache; a larger batch reuses harvest work across roots
+-- without keeping a process-lifetime arena forever.
+-- The C runtime bump arena is process-lifetime. Two heavy std files
+-- already sample ~6 GiB; the ouro1 lint wrapper caps AS at 8 GiB.
+-- Recycle every file so a child cannot retain lint_lines garbage.
+-- --batch-files still shares harvest facts when the caller stays small.
+-- Production recycle is one path per child, so lint_paths maps each
+-- path to a singleton chunk instead of harvesting std/collections.
+def lint_batch_size : Nat := 1;
+
+def lint_crash_status (status : Nat) : Bool :=
+    ltb_nat (S Z) status;
+
+-- One-file children remain the crash-isolation fallback. The parent still
+-- owns inventory and protocol aggregation without shell discovery.
+def lint_paths_isolated (exe : String) (paths : List String) : IO Nat :=
+    io_fold String Nat
+      (fun (status : Nat) (path : String) =>
+        io_bind Nat Nat (lint_process_file exe path)
+          (fun (next : Nat) => io_pure Nat (lint_join_status status next)))
+      Z paths;
+
+def lint_process_batch (exe : String) (paths : List String) : IO Nat :=
+    match paths with
+    | Nil => io_pure Nat Z
+    | Cons path rest => match rest with
+      | Nil => lint_process_file exe path
+      | Cons _ _ =>
+          do let! result := process_run_spec
+               (command_spec exe (Cons String "--batch-files" paths));
+             print (proc_stdout result);
+             eprint (proc_stderr result);
+             let status : Nat := lint_child_status result in
+             match lint_crash_status status with
+             | False => io_pure Nat status
+             | True => lint_paths_isolated exe paths
+             end
+      end
+    end;
+
+def lint_paths (exe : String) (paths : List String) : IO Nat :=
+    io_fold (List String) Nat
+      (fun (status : Nat) (chunk : List String) =>
+        io_bind Nat Nat (lint_process_batch exe chunk)
+          (fun (next : Nat) => io_pure Nat (lint_join_status status next)))
+      Z (match lint_batch_size with
+         | Z => Nil (List String)
+         | S _ =>
+             map String (List String)
+               (fun (path : String) => ([path] : List String)) paths
+         end);
+
+def lint_single_file (args : List String) : IO Unit :=
+    match args with
+    | Nil =>
+        do eprintln "LINT_FAIL: --single-file requires exactly one path";
+           exit 2
+    | Cons path rest =>
+        match rest with
+        | Cons _ _ =>
+            do eprintln "LINT_FAIL: --single-file requires exactly one path";
+               exit 2
+        | Nil =>
+            do let! count := lint_path (quality_normalize_path path);
+               match count with
+               | Z => exit Z
+               | S _ => exit (S Z)
+               end
+        end
+    end;
+
+def lint_batch_files (args : List String) : IO Unit :=
+    match args with
+    | Nil =>
+        do eprintln "LINT_FAIL: --batch-files requires at least one path";
+           exit 2
+    | Cons _ _ =>
+        do let! status := lint_batch_inprocess args lint_cache0 Z;
+           exit status
+    end;

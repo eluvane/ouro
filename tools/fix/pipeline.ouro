@@ -3,7 +3,10 @@
 -- and the applied edits are kept for reporting.
 
 import "rules.ouro";
+import "basic_rules.ouro";
+import "proof.ouro";
 import "../fmt_pipeline.ouro";
+import "../quality/diagnostic.ouro";
 
 -- final text, applied edits in application order
 inductive FxOutcome : Type :=
@@ -19,12 +22,12 @@ def fx_round (ctors : List String) (src : String) : Pair String (List FxEdit) :=
     let edits : List FxEdit := fx_plan_edits (fx_all_rules src ctors (fx_lex src)) in
     MkPair String (List FxEdit) (fx_apply src edits) edits;
 
-def fx_fixpoint (ctors : List String) : Nat -> String -> List FxEdit -> FxOutcome :=
+def fx_fixpoint_with (round : String -> Pair String (List FxEdit)) : Nat -> String -> List FxEdit -> FxOutcome :=
   fix go (fuel : Nat) (src : String) (applied : List FxEdit) : FxOutcome :=
     match fuel with
     | Z => MkFxOutcome src applied
     | S fuel2 =>
-        match fx_round ctors src with
+        match round src with
         | MkPair out edits =>
             match edits with
             | Nil => MkFxOutcome src applied
@@ -33,7 +36,25 @@ def fx_fixpoint (ctors : List String) : Nat -> String -> List FxEdit -> FxOutcom
         end
     end;
 
+def fx_fixpoint (ctors : List String) : Nat -> String -> List FxEdit -> FxOutcome :=
+    fx_fixpoint_with (fx_round ctors);
+
 def fx_rounds : Nat := 8;
+
+-- These existing lexical repairs make legacy input parseable without
+-- deleting expressions, changing binders or inferring types. The compiler
+-- checks this source before the full candidate, so semantic errors cannot be
+-- hidden by a dead-expression or unreachable-arm rewrite.
+def fx_check_syntax_edit (edit : FxEdit) : Bool :=
+    elem String str_eq (fx_edit_rule edit) [fx_rule_dup_import, fx_rule_do_bind, fx_rule_semi];
+
+def fx_check_syntax_round (src : String) : Pair String (List FxEdit) :=
+    let edits : List FxEdit := fx_plan_edits
+      (filter FxEdit fx_check_syntax_edit (fx_simple_rules src (fx_lex src))) in
+    MkPair String (List FxEdit) (fx_apply src edits) edits;
+
+def fx_check_source (src : String) : String :=
+    fx_outcome_text (fx_fixpoint_with fx_check_syntax_round fx_rounds src []);
 
 -- Constructors visible without the import cone: the file's own declarations.
 def fx_local_ctors (src : String) : List String :=
@@ -50,19 +71,25 @@ def fx_fix_string (ctors : List String) (src : String) : String :=
 inductive FxPrepareError : Type :=
   | FxNotConverged : FxPrepareError
   | FxFormatError : FmtError -> FxPrepareError
-  | FxFormatReopensFix : FxPrepareError;
+  | FxFormatReopensFix : FxPrepareError
+  | FxLiteralBinding : FxPrepareError
+  | FxInvalidPlan : String -> FxPrepareError
+  | FxCycle : FxPrepareError;
 
 def fx_prepare_error_message (e : FxPrepareError) : String :=
     match e with
     | FxNotConverged => "fix refused: rewrite budget exhausted before reaching a fixpoint"
     | FxFormatError cause => fmt_error_message cause
     | FxFormatReopensFix => "fix refused: formatting would reopen a rewrite"
+    | FxLiteralBinding => "fix refused: literal rewrite requires unbound built-in constructor names"
+    | FxInvalidPlan cause => str_concat "fix refused: " cause
+    | FxCycle => "fix refused: rewrite cycle detected"
     end;
 
 -- Use the same rule intents as fx_round; do not maintain a second list of
 -- checks or declare a fuel-exhausted result clean.
 def fx_pending (ctors : List String) (src : String) : Bool :=
-    match fx_all_rules src ctors (fx_lex src) with
+    match fx_automatic_proposals src (fx_all_rules src ctors (fx_lex src)) with
     | Nil => False
     | Cons _ _ => True
     end;
@@ -85,15 +112,70 @@ def fx_finish (ctors : List String) (o : FxOutcome) : Either FxPrepareError FxOu
         end
     end;
 
+def fx_checked_round (ctors : List String) (src : String) : Either FxPrepareError (Pair String (List FxEdit)) :=
+    match fx_checked_plan src (fx_all_rules src ctors (fx_lex src)) with
+    | Left cause => Left FxPrepareError (Pair String (List FxEdit))
+        (FxInvalidPlan (fx_plan_error_message cause))
+    | Right edits => match fx_certify_transaction src edits with
+      | Left cause => Left FxPrepareError (Pair String (List FxEdit))
+          (FxInvalidPlan (fx_plan_error_message cause))
+      | Right proof => Right FxPrepareError (Pair String (List FxEdit))
+          (MkPair String (List FxEdit) (fx_transaction_output proof) (fx_transaction_edits proof))
+      end
+    end;
+
+-- Exact source snapshots are bounded by the round limit, so cycles cannot be
+-- hidden by hashes or by an A -> B -> A return to the initial source.
+def fx_checked_fixpoint_with
+    (round : String -> Either FxPrepareError (Pair String (List FxEdit)))
+    : Nat -> String -> List String -> List FxEdit -> Either FxPrepareError FxOutcome :=
+  fix go (fuel : Nat) (src : String) (seen : List String) (applied : List FxEdit)
+      : Either FxPrepareError FxOutcome :=
+    match elem String str_eq src seen with
+    | True => Left FxPrepareError FxOutcome FxCycle
+    | False => match round src with
+      | Left cause => Left FxPrepareError FxOutcome cause
+      | Right result => match result with
+        | MkPair out edits => match edits with
+          | Nil => Right FxPrepareError FxOutcome (MkFxOutcome src applied)
+          | Cons _ _ => match fuel with
+            | Z => Left FxPrepareError FxOutcome FxNotConverged
+            | S remaining => go remaining out (Cons String src seen) (append FxEdit applied edits)
+            end
+          end
+        end
+      end
+    end;
+
 def fx_prepare (ctors : List String) (src : String) : Either FxPrepareError FxOutcome :=
-    fx_finish (append String (fx_local_ctors src) ctors) (fx_fix ctors src);
+    let visible : List String := append String (fx_local_ctors src) ctors in
+    match fx_ambiguous_literal src with
+    | True => Left FxPrepareError FxOutcome FxLiteralBinding
+    | False => match fx_checked_fixpoint_with (fx_checked_round visible) fx_rounds src [] [] with
+      | Left cause => Left FxPrepareError FxOutcome cause
+      | Right outcome => fx_finish visible outcome
+      end
+    end;
 
 -- path:line: rule: message. Lines refer to the text the rule saw, which is the
 -- original source for first-round edits.
+def fx_diagnostic (path : String) (edit : FxEdit) : QualityDiagnostic :=
+    MkQualityDiagnostic (MkQualityRule (fx_edit_rule edit) "fix" (fx_edit_rule edit))
+      QualityWarn (MkQualityLocation path (fx_edit_line edit) 0)
+      (MkQualityAdvice (fx_edit_msg edit)
+        (str_cat4 "bytes " (prim_string_of_nat (fx_edit_start edit)) ":" (prim_string_of_nat (fx_edit_end edit)))
+        "Review-required unless the native planner proves applicability, trivia safety, convergence and candidate validation."
+        QualitySuggestedEdit
+        [MkQualityEdit (fx_edit_start edit) (fx_edit_end edit) (fx_edit_rep edit)])
+      False;
+
 def fx_report_line (path : String) (e : FxEdit) : String :=
-    str_cat3 path ":"
-      (str_cat3 (show_nat (fx_edit_line e)) ": "
-        (str_cat3 (fx_edit_rule e) ": " (fx_edit_msg e)));
+    let diagnostic : QualityDiagnostic := fx_diagnostic path e in
+    let location : QualityLocation := quality_diagnostic_location diagnostic in
+    str_cat3 (quality_location_path location) ":"
+      (str_cat3 (prim_string_of_nat (quality_location_line location)) ": "
+        (str_cat3 (quality_rule_id (quality_diagnostic_rule diagnostic)) ": "
+          (quality_advice_message (quality_diagnostic_advice diagnostic))));
 
 def fx_report (path : String) (edits : List FxEdit) : List String :=
     map FxEdit String (fx_report_line path) edits;

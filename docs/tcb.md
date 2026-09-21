@@ -249,6 +249,17 @@ Raw pages, probe handles and search handles have explicit lifetimes; managed
 paths, names and list tails stay rooted across calls. The separate probe and
 search do not establish a snapshot or a no-follow property.
 
+Source publication adds the closed `ouro.fs.replace_file` identity with three
+String arguments and a deferred Runtime Nat status. Existing primitive codes
+are unchanged. Its native helper uses the same checked-body, signature,
+complete-pointee and GC-root contracts as rename. Windows file identities,
+link counts, security descriptors, flush/close and `ReplaceFileW` are additional
+runtime IO assumptions; none can authorize a declaration. The temporary C
+host mirrors this filesystem operation for bootstrap-built tools. Ouro owns
+staging, content verification, recovery and cleanup. An IO success is not a
+compiler acceptance result, an atomic snapshot against concurrent editors, or
+a power-loss durability guarantee.
+
 Native `ouro.fs.realpath` retains String/Runtime identity and the same checked
 ordinary-body and complete-pointer-type helper boundary. Windows
 GetFinalPathNameByHandleW resolves the opened target with a bounded sizing
@@ -330,6 +341,16 @@ limitation is retained explicitly; the API does not claim stronger attribution
 or change the runtime's terminal allocation-failure semantics. No compiler
 program-acceptance rule, external replay owner, or C production process engine
 is added by this primitive.
+
+The transitional C host mirrors this bounded identity on Windows only, with the
+same typed reply contract: creation-time Job assignment with kill-on-close,
+completion-port termination events, private capture files, and peak-commit
+observation. It validates CPU count 1 without affinity pinning, reports
+resource events only from observed port events, and keeps the POSIX stub
+returning OS status 120. Windows Job behavior, event delivery, and capture-file
+IO remain runtime assumptions; the adapter cannot authorize a declaration and
+does not change checker acceptance. The C IO selftest and the fix compiler-check
+suite cover this adapter boundary.
 
 ## Guardrails
 

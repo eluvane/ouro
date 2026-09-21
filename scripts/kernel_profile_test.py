@@ -207,6 +207,15 @@ class KernelProfileTests(unittest.TestCase):
                 changed['key'] = hash_json(changed['inputs'])
                 self.assertFalse(check(changed))
             self.assertFalse(check({}))
+            for flags, accepted in ((['-O1', '-std=c99'], True), (['-O0'], False),
+                                    (['-O1', '-O0'], False), (['-O1', '-O1'], False),
+                                    ([], False), ('-O1', False), ([1], False), (None, False)):
+                with self.subTest(flags=flags):
+                    changed = deepcopy(receipt)
+                    changed['inputs']['cflags'] = flags
+                    changed['key'] = hash_json(changed['inputs'])
+                    self.assertEqual(profile.receipt_valid(changed, executable, sources,
+                        'producer-sha', 'law.ouro', {'miss'}, opt_level=profile.RETAINED_OPT_LEVEL), accepted)
         finally:
             self.assertTrue(work.resolve().is_relative_to(parent.resolve()))
             shutil.rmtree(work)
@@ -257,6 +266,10 @@ class KernelProfileTests(unittest.TestCase):
                     'context': current['context'], 'max_elapsed_ms': 290.0}
         self.assertEqual(profile.compare_baseline(baseline, current), {'comparable': True, 'delta_ms': 10.0})
         self.assertFalse(profile.compare_baseline({**baseline, 'context': {}}, current)['comparable'])
+        optimized = {**current, 'context': {**current['context'], 'retained_opt_level': 'O1'}}
+        self.assertFalse(profile.compare_baseline(baseline, optimized)['comparable'])
+        unoptimized = {**baseline, 'context': {**current['context'], 'retained_opt_level': 'O0'}}
+        self.assertFalse(profile.compare_baseline(unoptimized, optimized)['comparable'])
         for value in (None, True, float('nan'), float('inf')):
             self.assertFalse(profile.compare_baseline({**baseline, 'max_elapsed_ms': value}, current)['comparable'])
 

@@ -8,6 +8,7 @@ cd "$ROOT"
 
 OUT_DIR="${OUT_DIR:-_build/analyze_precision}"
 mkdir -p "$OUT_DIR"
+OUT_DIR=$(CDPATH='' cd "$OUT_DIR" && pwd)
 GOLDEN_DIR="tests/analyze/golden"
 
 REGEN=0
@@ -204,7 +205,9 @@ DRIVE
 	drive_text=$(printf '%s\r\n' "$drive_clean")
 	launcher_run launcher_drive_crlf 0 --enable-style
 	drive_text='ANALYZE_DRIVE files=0 findings=0 rejected=0 families='
-	launcher_run launcher_empty_scope 0 --enable-style
+	launcher_run launcher_empty_scope 1 --enable-style
+	drive_text=$(printf '%s\n%s\n' "$drive_clean" "$drive_clean")
+	launcher_run launcher_repeated_clean_report 1 --enable-style
 	drive_text=$drive_clean
 	base_text=$(printf '%s\n%s\n' "$base_clean" 'test:1:1: warning[OURO-FMT005] format')
 	launcher_run launcher_base_zero_with_diagnostic 1 --enable-style
@@ -250,6 +253,7 @@ set -- tools/analyze/architecture.ouro \
 	tools/analyze/finding.ouro \
 	tools/analyze/drive_env.ouro \
 	std/string_prims.ouro \
+	tools/quality/diagnostic.ouro \
 	tools/analyze/drive_smells.ouro \
 	tools/analyze/drive.ouro \
 	tools/analyze/drive_main.ouro \
@@ -264,6 +268,7 @@ set -- tools/analyze/architecture.ouro \
 	tools/analyze/perf.ouro \
 	tools/analyze/naming.ouro \
 	tools/analyze/errors.ouro \
+	tools/analyze/bounded_text.ouro \
 	tests/analyze/precision/absint.ouro \
 	tests/analyze/precision/lint.ouro \
 	tests/analyze/precision/format_fix.ouro \
@@ -271,17 +276,254 @@ set -- tools/analyze/architecture.ouro \
 	tests/analyze/precision/style.ouro \
 	tests/analyze/precision/kernel_mirror.ouro \
 	tests/analyze/precision/frontend_helpers.ouro \
-	tests/analyze/precision/deadcode_patterns.ouro
+	tests/analyze/precision/deadcode_patterns.ouro \
+	tests/analyze/precision/architecture.ouro
 # shellcheck source=scripts/python.sh
 . "$ROOT/scripts/python.sh"
 [ -n "${PYTHON:-}" ] || { echo "ANALYZE_SUITE_FAIL no working Python" >&2; exit 127; }
 "$PYTHON" "$ROOT/scripts/analyze_bounded.py" --self-test
 "$PYTHON" "$ROOT/scripts/analyze_core_checks.py" --out "$OUT_DIR/core" "$@"
 
+# Exercise the standalone parser and inventory with a freshly prepared native
+# drive. Launcher stand-ins above cover only the separate process protocol.
+check_native_drive_args() (
+	native_dir=$(mktemp -d "$OUT_DIR/native-drive-argv.XXXXXX")
+	native_dir=$(CDPATH='' cd "$native_dir" && pwd)
+	native_bin="$native_dir/ouro-analyze-drive"
+	run_case native_argv_build env OURO_BUILD_TOOL_MODE=native \
+		sh scripts/build_tool.sh tools/analyze/drive_main.ouro "$native_bin"
+	[ "$st" -eq 0 ] || fail_case native_argv_build "native drive build failed, exit=$st"
+	[ -x "$native_bin" ] || fail_case native_argv_build "native drive binary is missing"
+	if [ -f "$native_bin.exe" ]; then native_bin="$native_bin.exe"; fi
+	"$PYTHON" "$ROOT/scripts/fs_read_suite.py" --driver "$native_bin" --mode drive \
+		--out "$native_dir/source-reading"
+	mkdir -p "$native_dir/sources/каталог с пробелами" "$native_dir/renamed" \
+		"$native_dir/empty" "$native_dir/--enable-style"
+	printf '%s\n' 'inductive Nat : Type := | Z : Nat;' \
+		'def argv_unused (unused : Nat) : Nat := Z;' >"$native_dir/sources/one.ouro"
+	cp "$native_dir/sources/one.ouro" "$native_dir/sources/каталог с пробелами/второй файл.ouro"
+	cp "$native_dir/sources/one.ouro" "$native_dir/漢字 file.ouro"
+	cp "$native_dir/sources/one.ouro" "$native_dir/renamed/bad_переименовано.ouro"
+	printf '%s\n' 'inductive Nat : Type := | Z : Nat;' \
+		'def argv_keep (value : Nat) : Nat := value;' >"$native_dir/--enable-style/clean.ouro"
+	cd "$native_dir"
+	native_rows=0
+	for native_case in unknown_family unknown_option scope_without_value baseline_without_value \
+		missing_scope missing_after_source empty_scope empty_scope_value; do
+		case "$native_case" in
+		unknown_family)
+			set -- --enable-no-such-family
+			native_error='unknown analyzer option: --enable-no-such-family' ;;
+		unknown_option)
+			set -- --no-such-option
+			native_error='unknown analyzer option: --no-such-option' ;;
+		scope_without_value)
+			set -- --scope
+			native_error='missing value for --scope' ;;
+		baseline_without_value)
+			set -- --api-baseline
+			native_error='missing value for --api-baseline' ;;
+		missing_scope)
+			set -- --scope nonexistent.ouro
+			native_error='missing or unsafe quality input: nonexistent.ouro' ;;
+		missing_after_source)
+			set -- --scope sources/one.ouro --scope nonexistent.ouro
+			native_error='missing or unsafe quality input: nonexistent.ouro' ;;
+		empty_scope)
+			set -- --scope empty
+			native_error='quality scope contains no selected source files' ;;
+		empty_scope_value)
+			set -- --scope ''
+			native_error='missing or unsafe quality input: ' ;;
+		esac
+		run_case "native_argv_$native_case" "$native_bin" --enable-dataflow --include-fixtures "$@"
+		[ "$st" -eq 2 ] || fail_case "native_argv_$native_case" "expected input failure, exit=$st"
+		[ ! -s "$OUT_DIR/native_argv_$native_case.out" ] || \
+			fail_case "native_argv_$native_case" "incomplete input produced analysis output"
+		grep -Fq "ANALYZE_FAIL: $native_error" "$OUT_DIR/native_argv_$native_case.err" || \
+			fail_case "native_argv_$native_case" "missing precise input diagnostic"
+		native_rows=$((native_rows + 1))
+	done
+
+	native_drive_case() {
+		native_case=$1
+		native_status=$2
+		native_files=$3
+		native_findings=$4
+		native_families=$5
+		shift 5
+		run_case "$native_case" "$native_bin" --include-fixtures "$@"
+		[ "$st" -eq "$native_status" ] || fail_case "$native_case" "expected exit=$native_status, got $st"
+		[ ! -s "$OUT_DIR/$native_case.err" ] || fail_case "$native_case" "unexpected rejection or error"
+		[ "$(grep -c '^ANALYZE_DRIVE ' "$OUT_DIR/$native_case.out")" -eq 1 ] || \
+			fail_case "$native_case" "expected one completion report"
+		grep -Fxq "ANALYZE_DRIVE files=$native_files findings=$native_findings rejected=0 families=$native_families" \
+			"$OUT_DIR/$native_case.out" || fail_case "$native_case" "incorrect coverage or families"
+		native_count=$(grep -Ec ': (warning|error)\[OURO-[A-Z]+[0-9]+\]' "$OUT_DIR/$native_case.out" || true)
+		[ "$native_count" -eq "$native_findings" ] || fail_case "$native_case" "finding count disagrees with report"
+		native_rows=$((native_rows + 1))
+	}
+
+	native_style='dataflow,metrics,simplify,perf,naming'
+	native_all='effects,capability,extract,match,cfg,dataflow,semantic,property,absint,symexec,taint,contracts,metrics,duplication,trust,simplify,perf,naming,errors'
+	for native_profile in --enable-style --enable-all --enable-strict; do
+		case "$native_profile" in
+		--enable-style) expected_families=$native_style ;;
+		*) expected_families=$native_all ;;
+		esac
+		run_case "native_families_$native_profile" "$native_bin" --print-families "$native_profile" "$native_profile"
+		[ "$st" -eq 0 ] || fail_case native_families "native family query failed"
+		printf 'ANALYZE_FAMILIES families=%s\n' "$expected_families" >"$OUT_DIR/native_families.expected"
+		cmp -s "$OUT_DIR/native_families.expected" "$OUT_DIR/native_families_$native_profile.out" || \
+			fail_case native_families "profile metadata differs from actual run families"
+		[ ! -s "$OUT_DIR/native_families_$native_profile.err" ] || fail_case native_families "unexpected query error"
+		native_rows=$((native_rows + 1))
+	done
+	native_drive_case native_argv_explicit 1 1 1 "$native_style" --scope sources/one.ouro \
+		--enable-dataflow --enable-metrics --enable-simplify --enable-perf --enable-naming
+	grep -Fq '[OURO-DF001]' "$OUT_DIR/native_argv_explicit.out" || \
+		fail_case native_argv_explicit "unused parameter was not analyzed"
+	native_drive_case native_argv_repeated 1 1 1 "$native_style" --scope sources/one.ouro \
+		--enable-style --enable-dataflow --enable-style --enable-dataflow --enable-naming
+	cmp -s "$OUT_DIR/native_argv_explicit.out" "$OUT_DIR/native_argv_repeated.out" || \
+		fail_case native_argv_repeated "repeated profiles or families changed findings"
+	native_drive_case native_argv_all 1 1 1 "$native_all" --enable-all --scope sources/one.ouro
+	native_drive_case native_argv_union 1 1 1 "$native_all" --scope sources/one.ouro \
+		--enable-light --enable-heavy --enable-style --enable-light
+	cmp -s "$OUT_DIR/native_argv_all.out" "$OUT_DIR/native_argv_union.out" || \
+		fail_case native_argv_union "profile union differs from all families"
+	native_drive_case native_argv_strict 1 1 1 "$native_all" --scope sources/one.ouro \
+		--enable-strict --enable-strict --enable-all
+	cmp -s "$OUT_DIR/native_argv_all.out" "$OUT_DIR/native_argv_strict.out" || \
+		fail_case native_argv_strict "repeated strict/all profiles changed findings"
+	native_drive_case native_argv_literal_values 0 1 0 dataflow --enable-dataflow \
+		--scope --enable-style --api-baseline --enable-simplify
+	native_drive_case native_argv_unknown_value 0 1 0 dataflow --enable-dataflow \
+		--scope --enable-style --api-baseline --no-such-option
+	native_drive_case native_argv_aliases 1 1 1 "$native_style" --enable-style \
+		--scope sources/one.ouro --scope ./sources/one.ouro --scope sources/../sources/one.ouro
+	native_drive_case native_argv_aliases_reordered 1 1 1 "$native_style" --enable-style \
+		--scope sources/../sources/one.ouro --scope sources/one.ouro --scope ./sources/one.ouro
+	cmp -s "$OUT_DIR/native_argv_aliases.out" "$OUT_DIR/native_argv_aliases_reordered.out" || \
+		fail_case native_argv_aliases_reordered "scope aliases changed deterministic findings"
+	native_drive_case native_argv_unicode 1 1 1 "$native_style" --enable-style \
+		--scope 'sources/каталог с пробелами/второй файл.ouro'
+	grep -Fq 'sources/каталог с пробелами/второй файл.ouro:2:1: warning[OURO-DF001]' \
+		"$OUT_DIR/native_argv_unicode.out" || fail_case native_argv_unicode "Unicode source location changed"
+	native_drive_case native_argv_cjk 1 1 1 "$native_style" --enable-style --scope '漢字 file.ouro'
+	grep -Fq '漢字 file.ouro:2:1: warning[OURO-DF001]' "$OUT_DIR/native_argv_cjk.out" || \
+		fail_case native_argv_cjk "CJK source location changed"
+	native_drive_case native_argv_inventory 1 2 2 "$native_style" --enable-style --scope sources
+	native_drive_case native_argv_overlap 1 2 2 "$native_style" --enable-style \
+		--scope 'sources/каталог с пробелами' --scope sources/one.ouro --scope sources --scope sources/one.ouro
+	cmp -s "$OUT_DIR/native_argv_inventory.out" "$OUT_DIR/native_argv_overlap.out" || \
+		fail_case native_argv_overlap "overlapping or repeated scopes lost or duplicated files"
+	native_drive_case native_argv_renamed 1 1 1 "$native_style" --enable-style \
+		--scope renamed/bad_переименовано.ouro
+	for native_case in explicit unicode cjk renamed; do
+		LC_ALL=C sed 's/^[^:]*:\([0-9][0-9]*:[0-9][0-9]*: \)/SOURCE:\1/' \
+			"$OUT_DIR/native_argv_$native_case.out" >"$OUT_DIR/native_argv_$native_case.normalized"
+	done
+	for native_case in unicode cjk renamed; do
+		cmp -s "$OUT_DIR/native_argv_explicit.normalized" "$OUT_DIR/native_argv_$native_case.normalized" || \
+			fail_case "native_argv_$native_case" "moving identical source changed semantic findings"
+	done
+	echo "ANALYZE_NATIVE_ARGV_SUITE rows=$native_rows"
+)
+check_native_drive_args
+
+# Base facts retain their own fixture policy while sharing checked inventory.
+check_native_base_inputs() (
+	native_dir=$(mktemp -d "$OUT_DIR/native-base-input.XXXXXX")
+	native_bin="$native_dir/ouro-analyze"
+	run_case native_base_build env OURO_BUILD_TOOL_MODE=native \
+		sh scripts/build_tool.sh tools/analyze/main.ouro "$native_bin"
+	[ "$st" -eq 0 ] || fail_case native_base_build "native base build failed, exit=$st"
+	[ -x "$native_bin" ] || fail_case native_base_build "native base binary is missing"
+	mkdir -p "$native_dir/empty" "$native_dir/tests" "$native_dir/каталог с пробелами"
+	for native_subdir in _build _cache .git node_modules; do
+		mkdir -p "$native_dir/walk/$native_subdir"
+		printf '%s\n' 'def main : Nat := 0;' >"$native_dir/walk/$native_subdir/hidden.ouro"
+	done
+	for native_path in one.ouro two.ouro walk/main.ouro tests/fixture.ouro \
+		'каталог с пробелами/имя.ouro' '漢字 file.ouro'; do
+		printf '%s\n' 'def main : Nat := 0;' >"$native_dir/$native_path"
+	done
+	cd "$native_dir"
+	native_rows=0
+	for native_case in empty excluded_fixture missing missing_then_valid; do
+		case "$native_case" in
+		empty) set -- --scope empty ;;
+		excluded_fixture) set -- --scope tests ;;
+		missing) set -- --scope nonexistent.ouro ;;
+		missing_then_valid) set -- --scope nonexistent.ouro --scope one.ouro ;;
+		esac
+		run_case "native_base_$native_case" "$native_bin" --strict --local-only --dump-facts "$@"
+		[ "$st" -eq 2 ] || fail_case "native_base_$native_case" "expected inventory failure, exit=$st"
+		[ ! -s "$OUT_DIR/native_base_$native_case.out" ] || \
+			fail_case "native_base_$native_case" "incomplete input produced facts or a success report"
+		grep -q '^ANALYZE_FAIL: ' "$OUT_DIR/native_base_$native_case.err" || \
+			fail_case "native_base_$native_case" "missing inventory diagnostic"
+		native_rows=$((native_rows + 1))
+	done
+	for native_case in repeated reordered equals mixed terminator overlap duplicate aliases aliases_reordered empty_and_valid walk include_fixtures unicode \
+		cjk explicit_build explicit_cache explicit_git explicit_dependencies; do
+		native_files=1
+		case "$native_case" in
+		repeated | reordered | equals | mixed | terminator)
+			native_files=2
+			native_paths=$(printf '%s\n' one.ouro two.ouro)
+			case "$native_case" in
+			repeated) set -- --scope one.ouro --scope two.ouro ;;
+			reordered) set -- --scope two.ouro --scope one.ouro ;;
+			equals) set -- --scope=one.ouro --scope=two.ouro ;;
+			mixed) set -- --scope=one.ouro --scope two.ouro ;;
+			terminator) set -- --scope one.ouro -- two.ouro ;;
+			esac ;;
+		overlap) native_paths=walk/main.ouro; set -- --scope walk/main.ouro --scope walk ;;
+		duplicate) native_paths=one.ouro; set -- --scope one.ouro --scope one.ouro ;;
+		aliases) native_paths=./one.ouro; set -- --scope one.ouro --scope ./one.ouro --scope empty/../one.ouro ;;
+		aliases_reordered) native_paths=./one.ouro; set -- --scope empty/../one.ouro --scope one.ouro --scope ./one.ouro ;;
+		empty_and_valid) native_paths=one.ouro; set -- --scope empty --scope one.ouro ;;
+		walk) native_paths=walk/main.ouro; set -- --scope walk ;;
+		include_fixtures) native_paths=tests/fixture.ouro; set -- --include-fixtures --scope tests ;;
+		unicode) native_paths='каталог с пробелами/имя.ouro'; set -- --scope 'каталог с пробелами' ;;
+		cjk) native_paths='漢字 file.ouro'; set -- --scope "$native_paths" ;;
+		explicit_build) native_paths=walk/_build/hidden.ouro; set -- --scope "$native_paths" ;;
+		explicit_cache) native_paths=walk/_cache/hidden.ouro; set -- --scope "$native_paths" ;;
+		explicit_git) native_paths=walk/.git/hidden.ouro; set -- --scope "$native_paths" ;;
+		explicit_dependencies) native_paths=walk/node_modules/hidden.ouro; set -- --scope "$native_paths" ;;
+		esac
+		expect_ok "native_base_$native_case" "$native_bin" --strict --local-only --dump-facts "$@"
+		[ ! -s "$OUT_DIR/native_base_$native_case.err" ] || fail_case "native_base_$native_case" "unexpected error"
+		# --dump-facts adds one module declaration beside each source definition.
+		native_decls=$((native_files * 2))
+		grep -Eq "^ANALYZE_OK profile=strict files=$native_files imports=0 decls=$native_decls " \
+			"$OUT_DIR/native_base_$native_case.out" || fail_case "native_base_$native_case" "incorrect file coverage"
+		[ "$(grep -c '^FACT declaration ' "$OUT_DIR/native_base_$native_case.out")" -eq "$native_files" ] || \
+			fail_case "native_base_$native_case" "declaration coverage disagrees with selected sources"
+		printf '%s\n' "$native_paths" | while IFS= read -r native_path; do
+			grep -Fq "FACT declaration $native_path:" "$OUT_DIR/native_base_$native_case.out" || \
+				fail_case "native_base_$native_case" "source was not processed: $native_path"
+		done
+		native_rows=$((native_rows + 1))
+	done
+	for native_case in reordered equals mixed terminator; do
+		cmp -s "$OUT_DIR/native_base_repeated.out" "$OUT_DIR/native_base_$native_case.out" || \
+			fail_case "native_base_$native_case" "scope syntax or order changed facts"
+	done
+	cmp -s "$OUT_DIR/native_base_walk.out" "$OUT_DIR/native_base_overlap.out" || \
+		fail_case native_base_overlap "overlapping scopes changed facts"
+	cmp -s "$OUT_DIR/native_base_aliases.out" "$OUT_DIR/native_base_aliases_reordered.out" || \
+		fail_case native_base_aliases_reordered "scope aliases changed deterministic facts"
+	echo "ANALYZE_NATIVE_BASE_INPUT_SUITE rows=$native_rows"
+)
+check_native_base_inputs
+
 # The assertions run in Ouro. This launcher only builds, executes and retains
 # logs; failed builds, missing binaries and empty/missing reports fail closed.
 # The deadcode root exercises the host fact extractors through their native ABI.
-for precision_core in absint lint format_fix host style kernel_mirror frontend_helpers deadcode_patterns; do
+for precision_core in absint lint format_fix host style kernel_mirror frontend_helpers deadcode_patterns architecture; do
 	precision_bin="$OUT_DIR/precision-$precision_core"
 	run_case "precision_build_$precision_core" env OURO_BUILD_TOOL_MODE=native \
 		sh scripts/build_tool.sh "tests/analyze/precision/$precision_core.ouro" "$precision_bin"
@@ -416,7 +658,7 @@ golden_codes perf_bad "OURO-PERF001 OURO-PERF002 OURO-PERF003 OURO-PERF004 OURO-
 	analyze --enable-perf --scope "$FIX/perf_bad"
 golden_ok perf_good analyze --enable-perf --scope "$FIX/perf_good"
 
-golden_codes naming_bad "OURO-NAME001 OURO-NAME002 OURO-NAME003 OURO-NAME004" \
+golden_codes naming_bad "OURO-NAME001 OURO-NAME003 OURO-NAME004" \
 	analyze --enable-naming --scope "$FIX/naming_bad"
 golden_ok naming_good analyze --enable-naming --scope "$FIX/naming_good"
 
@@ -457,7 +699,8 @@ run_case style_baseline_without_value analyze --enable-style --api-baseline
 run_case style_missing analyze --enable-style --scope "$OUT_DIR/nonexistent-style-scope"
 [ "$st" -ne 0 ] || fail_case style_missing "missing scope was accepted"
 
-# Exercise the existing native safe unused-binder fix, not a second rewriter.
+# Semantic binder suggestions stay review-only; an explicit reviewed edit must
+# converge through the native formatter, fixer and style analyzer.
 # A stable-depth workspace keeps the import valid for custom OUT_DIR values.
 mkdir -p "$ROOT/_build"
 style_dir=$(mktemp -d "$ROOT/_build/style-roundtrip.XXXXXX")
@@ -475,8 +718,20 @@ for style_tool in fix fmt; do
 		sh scripts/build_tool.sh "$style_root" "$OUT_DIR/style-$style_tool"
 	[ "$st" -eq 0 ] || fail_case "style_build_$style_tool" "native tool build failed, exit=$st"
 done
+cp "$style_source" "$OUT_DIR/style_review_original.ouro"
 run_case style_fix_write "$OUT_DIR/style-fix" --write "$style_source"
 [ "$st" -eq 0 ] || fail_case style_fix_write "safe fix failed, exit=$st"
+cmp -s "$style_source" "$OUT_DIR/style_review_original.ouro" || \
+	fail_case style_fix_write "review-only source bytes changed"
+grep -q '(unused : Nat)' "$style_source" || fail_case style_fix_write "review-only binder was changed"
+grep -q 'review-required suggestions (not applied)' "$OUT_DIR/style_fix_write.err" || \
+	fail_case style_fix_write "missing binder review diagnostic"
+expect_codes style_review_retained OURO-DF001 analyze --enable-style --scope "$style_source"
+run_case style_review_check "$OUT_DIR/style-fix" --check "$style_source"
+[ "$st" -eq 1 ] || fail_case style_review_check "review-only suggestion was accepted as clean"
+# Apply the reviewed discard explicitly; automatic publication cannot certify it.
+printf '%s\n' 'import "../../std/data.ouro";' \
+	'def style_unused (_unused : Nat) : Nat := 0;' >"$style_source"
 run_case style_fmt_write "$OUT_DIR/style-fmt" --write "$style_source"
 [ "$st" -eq 0 ] || fail_case style_fmt_write "format failed, exit=$st"
 grep -q '(_unused : Nat)' "$style_source" || fail_case style_fix_write "discard convention not applied"

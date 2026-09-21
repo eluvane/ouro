@@ -17,6 +17,7 @@ import native_tool_build as native
 import frontend_native_process as direct_process
 import frontend_native_fs_create as direct_fs_create
 import frontend_native_async as direct_async
+import fs_replace_suite as direct_fs_replace
 import ouro_build as build
 from kernel_scale import pin_one_cpu
 from ourosmith.limits import run_limited
@@ -32,7 +33,7 @@ HOST_MAINS = {
 }
 SUPERVISOR_INPUTS = (
     "scripts/frontend_host_suite.py", "scripts/frontend_native_process.py", "scripts/frontend_native_fs_create.py",
-    "scripts/frontend_native_async.py", "scripts/frontend_security_suite.sh",
+    "scripts/frontend_native_async.py", "scripts/fs_replace_suite.py", "scripts/frontend_security_suite.sh",
     "scripts/kernel_scale.py", "scripts/ourosmith/host.py", "scripts/ourosmith/limits.py",
     "scripts/ourosmith/exec_child.py", "scripts/ourosmith/windows_job.py",
     "scripts/ourosmith/__init__.py", *HOST_MAINS.values(),
@@ -75,6 +76,7 @@ def probe_cases():
                              ("lower-bad-contracts", "contracts returned an invalid list")):
         cases.append(("n1-host-selftest", [mode], 2, "", re.escape(f"n1-host: {diagnostic}\n")))
     for mode in ("caller-output", "retained-result", "typed-failure", "nested-context", "allocation-context",
+                 "shared-parent-spine",
                  "recheck-scale", "recheck-retained", "recheck-late-invalid", "recheck-missing-bodies", "recheck-zero-fuel"):
         argv = [mode, "retained output.exe"] if mode == "caller-output" else [mode]
         stderr = re.escape("probe.ouro: type mismatch in wrong\n") if mode == "typed-failure" else ""
@@ -96,7 +98,8 @@ def snapshot(args, cfg) -> dict:
     config = (args.config or ROOT / "Ouro.seal").resolve()
     inputs["sources"][str(config)] = sha256_file(config)
     return {"units": units, "inputs": inputs, "native_process": direct_process.source_snapshot(),
-            "native_fs_create": direct_fs_create.source_snapshot(), "native_async": direct_async.source_snapshot()}
+            "native_fs_create": direct_fs_create.source_snapshot(), "native_async": direct_async.source_snapshot(),
+            "native_fs_replace": direct_fs_replace.source_snapshot()}
 
 
 def require_snapshot(args, cfg, before: dict) -> dict:
@@ -214,6 +217,8 @@ def run_suite(args, cfg, argv: list[str]) -> int:
             args.build_timeout, args.probe_timeout, verify_native_inputs)
         report["native_async"] = direct_async.run_section(executable(work, "n1-host"), work, run,
             args.build_timeout, args.probe_timeout, verify_native_inputs)
+        report["native_fs_replace"] = direct_fs_replace.run_native_section(executable(work, "n1-host"), work, run,
+            args.build_timeout, verify_native_inputs)
         report["pass"] = True
     except (OSError, ValueError, RuntimeError, KeyError, TypeError, SystemExit) as error:
         report["error"] = str(error)
@@ -238,8 +243,9 @@ def run_suite(args, cfg, argv: list[str]) -> int:
         native_status = report["native_process"]["status"]
         fs_status = report["native_fs_create"]["status"]
         async_status = report["native_async"]["status"]
+        replace_status = report["native_fs_replace"]["status"]
         print(f"FRONTEND_HOST_SUITE: PASS cases={len(probe_cases())} native_process={native_status} "
-              f"native_fs_create={fs_status} native_async={async_status} out={work}", flush=True)
+              f"native_fs_create={fs_status} native_async={async_status} native_fs_replace={replace_status} out={work}", flush=True)
         return 0
     print(f"FRONTEND_HOST_SUITE: FAIL {report.get('error', report.get('integrity_error'))}; see {work}", file=sys.stderr, flush=True)
     return 1

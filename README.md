@@ -101,7 +101,7 @@ sh scripts/ouro1.sh check path/to/module.ouro
 sh scripts/ouro1.sh eval path/to/module.ouro --print name --type TYPE
 sh scripts/ouro1.sh fmt --check path/to/module.ouro
 sh scripts/ouro1.sh analyze --strict
-sh scripts/ouro1.sh lint std samples
+sh scripts/ouro1.sh lint --deny std compiler tools samples
 sh scripts/ouro1.sh test path/to/test.ouro
 sh scripts/coil.sh install
 sh scripts/ouro1.sh pkg install

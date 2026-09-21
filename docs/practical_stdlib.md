@@ -27,13 +27,23 @@ This guide describes the reusable userland capabilities around the core standard
 - `std/validation.ouro` adds accumulated validation over `Either (List E) A` for config/args/data checks that should report multiple errors together.
 - `std/report.ouro` adds small report builders, duration wrappers, elapsed timing, and key/value or section rendering.
 - `std/configx.ouro` adds schema-lite config validation and environment override helpers on top of `std/config.ouro`.
+- `std/json.ouro` is the bounded JSON parser and printer. It imports
+  `string_prims` and `char`, not `std/runtime.ouro`, so a JSON-only cone
+  stays off Windows platform modules.
 - `std/jsonx.ouro` adds practical JSON constructors, typed getters, object/array access, and path lookup on top of the bounded JSON parser.
 - `std/tablex.ouro` adds table projection/selection helpers with validation for required columns.
 - `std/processx.ouro` adds shell-free command specs, checked command execution, stdout capture helpers, and simple process-plan rendering/execution.
+  `process_run_expected_codes` accepts an explicit list of exit statuses and
+  preserves stdout and stderr for each accepted status; an empty list rejects all statuses.
 - `std/executable.ouro` queries the current Windows image path with typed allocation, query, conversion and cleanup errors.
 - `std/workspace.ouro` adds workspace-root helpers, temp path helpers, backup-before-overwrite, transform-write, filtered listing, copy-tree, and checked cleanup wrappers.
 - `std/workflow.ouro` adds a small command workflow abstraction: context, errors, result/report rendering, exit codes, and typed lifting from FS/config/process errors.
 - `std/practical.ouro` imports the practical helper modules as a convenience umbrella.
+
+The pre-1.0 collection surface uses `map_indexed`, `chunks_of`,
+`adjacent_pairs`, `dedup_adjacent`, and `nat_range_count`; their former public
+`_go` helpers have been removed. The unused list helpers removed in this update
+and their available replacements are listed in [the changelog](../CHANGELOG.md).
 
 The small language examples also use supported source syntax:
 `std/module_demo.ouro` qualifies imported constructors through `as Util`, and
@@ -143,6 +153,17 @@ exist, and the target must not be a directory. Target parents must already
 exist. OS refusal is an error; the operation does not fall back to copying or
 deleting files. `prim_fs_rename` exposes the underlying status (`0` for success).
 See [the runtime contract](effects_design.md#runtime-surface) for host differences.
+
+`std/fs_replace.ouro` provides `fs_replace_file source stage backup`, returning
+`FsReplaced` or `FsReplaceFailed os_status`. It requires distinct single-link
+ordinary files on one volume and an empty, privately owned backup reservation.
+Empty paths return `FsReplaceFailed 87` on both supported backends.
+Success installs the stage and retains the previous source at backup. The
+caller must verify the result before deleting that recovery file; a failed
+operation can require recovery. This is the low-level metadata-preserving IO
+boundary used by `tools/quality/source_write.ouro`, not a rewrite validator.
+See [the runtime contract](effects_design.md#runtime-surface) for supported
+metadata, refusals and partial failure states.
 
 Native `prim_fs_realpath` resolves Unicode files and directories, follows
 links, and returns normalized UTF-8 with forward slashes. Its stored action
@@ -305,7 +326,11 @@ Windows Job memory events always fail, including a child's expected exit 73.
 Windows does not guarantee delivery of those events; a denied allocation can
 therefore lack a resource attribution event. Consumers requiring complete
 attribution must retain that limitation in their acceptance policy. This API
-does not add a streaming pipeline. Its temporary C-host action returns typed
+does not add a streaming pipeline. On Windows the transitional C host now executes this bounded API
+through a narrow adapter with the same typed reply contract: Job containment with kill-on-close,
+completion-port termination events, private capture files, exact stdin framing, stream caps, and
+measured peak Job commit. The adapter validates CPU count 1 without affinity pinning and reports
+resource events only from observed port events. On POSIX the C-host action still returns typed
 OS status 120 without launching a process.
 
 The transitional C process host uses per-request private capture files. On

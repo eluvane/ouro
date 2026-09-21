@@ -3,7 +3,9 @@
 -- @entry main
 
 import "families.ouro";
+import "model_types.ouro";
 import "../../std/args.ouro";
+import "../quality/source.ouro";
 
 -- Structured-family flags are parsed so the shared command line stays valid;
 -- ouro-analyze-drive acts on them.
@@ -72,48 +74,30 @@ def opts_from_args (a : Args) : AOpts :=
     end in
   foldl String AOpts add_flag o0 (args_flags a);
 
+def analyze_path_from_host (p : String) : String :=
+  str_replace p "\\" "/";
+
 def keep_path (o : AOpts) (p : String) : Bool :=
   match (o_fix o) with
   | True => True
-  | False => notb (is_fixture (path_from_host p))
+  | False => notb (is_fixture (analyze_path_from_host p))
   end;
 
-def scan_root (o : AOpts) (root : String) : IO (List String) :=
-  do let! ex := fs_exists root;
-     match ex with
-     | False =>
-         do eprintln (str_concat "ANALYZE_FAIL: missing scope " root);
-            exit 2;
-            io_pure (List String) (Nil String)
-     | True =>
-         do let! isdir := fs_is_dir root;
-            match isdir with
-            | True =>
-                do let! fs := fs_walk_ouro root;
-                   io_pure (List String)
-                     (filter String (keep_path o)
-                       (map String String path_from_host fs))
-            | False =>
-                match andb (path_ends_ouro root) (keep_path o root) with
-                | True =>
-                    io_pure (List String)
-                      ([path_from_host root] : List String)
-                | False => io_pure (List String) (Nil String)
-                end
-            end
-     end
+def analyze_input_fail (e : QualityInputError) : IO Unit :=
+  do eprintln (str_concat "ANALYZE_FAIL: " (quality_input_message e));
+     exit 2
 
 def analyze_read_fail (path : String) (e : FsError) : IO Unit :=
   do eprintln (str_cat3 path ": " (fs_error_message e));
      exit 1
 
-def load_acc (path : String) : IO FileAcc :=
-  do let! src := fs_read_checked path;
+def load_acc (path : String) : IO (Either QualityInputError FileAcc) :=
+  do let! src := quality_read_file path;
      match src with
-     | Left e =>
-         do analyze_read_fail path e;
-            io_pure FileAcc (extract_file path "")
-     | Right text => io_pure FileAcc (extract_file path text)
+     | Left e => io_pure (Either QualityInputError FileAcc)
+         (Left QualityInputError FileAcc e)
+     | Right text => io_pure (Either QualityInputError FileAcc)
+         (Right QualityInputError FileAcc (extract_file path text))
      end
 
 def stamp_acc (i : Nat) (acc : FileAcc) : FileAcc :=
@@ -239,12 +223,11 @@ def sort_diags (files : List AFile) : List ADiag -> List ADiag :=
 
 def show_diag (files : List AFile) (d : ADiag) : String :=
   let p : String := AFile_path (file_at (ADiag_file d) files) in
-  str_cat4 p ":" (str_of_nat (ADiag_line d))
-    (str_cat4 ":" (str_of_nat (ADiag_col d)) ": "
-      (str_cat4 (ADiag_severity d) "[" (ADiag_code d)
-        (str_cat4 "] " (ADiag_analyzer d) "/"
-          (str_cat4 (ADiag_rule d) ": " (ADiag_message d)
-            (str_cat4 "\n  hint: " (ADiag_hint d) "\n  witness: " (ADiag_witness d))))));
+  match ADiag_quality p d with
+  | Just diagnostic => quality_text_analyzer (ADiag_severity d) diagnostic
+  | Nothing => str_cat4 p ": invalid diagnostic level for " (ADiag_code d)
+      (str_concat ": " (ADiag_severity d))
+  end;
 
 def kind_label_rows : List (Pair Nat String) :=
   [ MkPair Nat String kind_ctor "constructor"
@@ -377,14 +360,14 @@ def emit_ok (o : AOpts) (files : List AFile) (edges : List AEdge)
 def emit_diags (files : List AFile) : List ADiag -> IO Unit :=
   io_foreach ADiag
     (fun (d : ADiag) =>
-      match orb (ADiag_suppressed d) (skip_info d) with
+      match ADiag_hidden d with
       | True => io_unit
       | False => println (show_diag files d)
       end);
 
 def count_shown (xs : List ADiag) : Nat :=
   count_if ADiag
-    (fun (d : ADiag) => notb (orb (ADiag_suppressed d) (skip_info d)))
+    (fun (d : ADiag) => notb (ADiag_hidden d))
     xs;
 
 def stamp_all (accs0 : List FileAcc) : List FileAcc :=
@@ -554,26 +537,26 @@ def accs_need_base (accs : List FileAcc) : Bool :=
   any FileAcc (fun (acc : FileAcc) => decls_need_base (FileAcc_decls acc))
     accs;
 
-def gather_paths (o : AOpts) (scopes : List String) : IO (List String) :=
-  (fix go (remaining : List String) (paths : List String) : IO (List String) :=
-    match remaining with
-    | Nil => io_pure (List String) paths
-    | Cons root rest =>
-      do let! more := scan_root o root;
-         go rest (append String paths more)
-    end) scopes (Nil String);
+def gather_paths (o : AOpts) (scopes : List String)
+    : IO (Either QualityInputError (List String)) :=
+  quality_inventory quality_skip_dir (keep_path o) scopes;
 
 def load_accs (paths : List String) (acc : List FileAcc)
-    : IO (List FileAcc) :=
+    : IO (Either QualityInputError (List FileAcc)) :=
   (fix go (remaining : List String) (rev : List FileAcc)
-      : IO (List FileAcc) :=
+      : IO (Either QualityInputError (List FileAcc)) :=
     match remaining with
     | Nil =>
-        io_pure (List FileAcc)
-          (append FileAcc acc (reverse FileAcc rev))
+        io_pure (Either QualityInputError (List FileAcc))
+          (Right QualityInputError (List FileAcc)
+            (append FileAcc acc (reverse FileAcc rev)))
     | Cons path rest =>
       do let! next := load_acc path;
-         go rest (Cons FileAcc next rev)
+         match next with
+         | Left e => io_pure (Either QualityInputError (List FileAcc))
+             (Left QualityInputError (List FileAcc) e)
+         | Right file_acc => go rest (Cons FileAcc file_acc rev)
+         end
     end) paths (Nil FileAcc);
 
 def load_analysis_base (o : AOpts) (accs : List FileAcc)
@@ -600,20 +583,56 @@ def load_analysis_base (o : AOpts) (accs : List FileAcc)
   end;
 
 def run_scopes (o : AOpts) (scopes : List String) : IO Unit :=
-  do let! paths0 := gather_paths o scopes;
-     let paths : List String := str_sort_uniq paths0 in
-     do let! accs := load_accs paths (Nil FileAcc);
-        let! base := load_analysis_base o accs;
-        run_db o paths accs base
+  do let! selected := gather_paths o scopes;
+     match selected with
+     | Left e => analyze_input_fail e
+     | Right paths =>
+         do let! loaded := load_accs paths (Nil FileAcc);
+            match loaded with
+            | Left e => analyze_input_fail e
+            | Right accs =>
+                do let! base := load_analysis_base o accs;
+                   run_db o paths accs base
+            end
+     end
 
-def scopes_of (a : Args) : List String :=
-  match args_opt a "scope" with
-  | Nothing =>
-      match args_positional a with
-      | Nil => default_scopes
-      | Cons x xs => Cons String x xs
-      end
-  | Just p => Cons String p (args_positional a)
+-- Args validates the command line and owns flags/single-value options. Its
+-- option map retains only one value, so collect every validated scope here.
+def analyze_scope_values : List String -> List String :=
+  fix go (words : List String) : List String :=
+    match words with
+    | Nil => Nil String
+    | Cons word rest =>
+        match str_eq word "--" with
+        | True => Nil String
+        | False =>
+            match str_eq word "--scope" with
+            | True =>
+                match rest with
+                | Nil => Nil String
+                | Cons scope more => Cons String scope (go more)
+                end
+            | False =>
+                match str_strip_prefix word "--scope=" with
+                | Just scope => Cons String scope (go rest)
+                | Nothing =>
+                    match str_eq word "--api-baseline" with
+                    | True =>
+                        match rest with
+                        | Nil => Nil String
+                        | Cons _ more => go more
+                        end
+                    | False => go rest
+                    end
+                end
+            end
+        end
+    end;
+
+def scopes_of (a : Args) (argv : List String) : List String :=
+  match append String (analyze_scope_values (tail String argv)) (args_positional a) with
+  | Nil => default_scopes
+  | Cons scope rest => Cons String scope rest
   end;
 
 def finalize_opts (o : AOpts) : AOpts :=
@@ -625,7 +644,7 @@ def finalize_opts (o : AOpts) : AOpts :=
 def start (argv : List String) : IO Unit :=
   let a : Args := args_of_argv_bools analyze_bools argv in
   match analyze_args_valid argv a with
-  | True => run_scopes (finalize_opts (opts_from_args a)) (scopes_of a)
+  | True => run_scopes (finalize_opts (opts_from_args a)) (scopes_of a argv)
   | False =>
       do eprintln "ANALYZE_FAIL: unknown option or missing option value";
          exit 2

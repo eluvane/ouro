@@ -28,6 +28,8 @@ fi
 
 OUT="${LSP_SUITE_OUT:-$ROOT/_build/lsp_suite}"
 mkdir -p "$OUT"
+# file:// URIs sent to the server must be absolute; uri_file_path drops relative paths.
+OUT=$(CDPATH='' cd "$OUT" && pwd)
 
 if [ -n "$NATIVE_TOOLS" ]; then
 	"$PYTHON" "$ROOT/scripts/native_suite_tools.py" --directory "$NATIVE_TOOLS" --suite lsp \

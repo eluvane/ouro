@@ -1,0 +1,132 @@
+-- Parser lifetime seam laws: the complete result, intern identities and typed
+-- failures survive later calls. No allocation count or wall-clock assertions.
+-- @entry main
+import "../../tools/clippy/semantic_unit.ouro";
+import "../../tools/clippy/structural_frontend.ouro";
+import "../../std/io.ouro";
+
+def cl_name (decls : List Decl) (intern : InternState) (expected : String) : Bool :=
+    match decls with
+    | Nil => False
+    | Cons decl rest => andb (nullb Decl rest) (match decl with
+      | DDef name _ _ => prim_string_eq (cm_name intern name) expected
+      | DImport _ => False
+      | DAxiom _ _ => False
+      | DInductive _ _ _ _ => False
+      | DEffect _ _ _ => False
+      | DIntrinsic _ _ _ _ => False
+      | DExtern _ _ _ => False
+      | DRepresentation _ _ => False end)
+    end;
+
+def cl_survivors : Bool :=
+    match cm_parse "def retained (x : Nat) : Nat := x;" empty_intern with
+    | Left _ => False
+    | Right first => match first with | MkPair decls intern =>
+      match cm_parse "def next (y : Nat) : Nat := y;" intern with
+      | Left _ => False
+      | Right second => match second with | MkPair next updated =>
+        andb (cl_name decls intern "retained")
+          (andb (cl_name next updated "next") (cl_name decls updated "retained")) end
+      end end
+    end;
+
+def cl_repeated : Nat -> InternState -> Bool :=
+  fix go (count : Nat) (intern : InternState) : Bool :=
+    match count with
+    | Z => True
+    | S less => match cm_parse "def same (value : Nat) : Nat := value;" intern with
+      | Left _ => False
+      | Right parsed => match parsed with | MkPair decls updated =>
+        andb (cl_name decls updated "same") (go less updated) end
+      end
+    end;
+
+def cl_rejected (source : String) : Bool :=
+    match cm_parse source empty_intern with | Left _ => True | Right _ => False end;
+
+def cl_cache_row_count (cache : CmParseCache) : Nat :=
+    match cache with | MkCmParseCache rows => length CmCachedFile rows end;
+
+def cl_cache_hit_reuses_row : Bool :=
+    let src : String := "def n : Nat := Z;" in
+    let req : Pair String String := MkPair String String "std/cache_reuse.ouro" src in
+    match cm_load_file_cached req empty_intern cm_cache0 with
+    | Left _ => False
+    | Right first => match first with
+      | MkPair _ cache =>
+          match cm_load_file_cached req empty_intern cache with
+          | Left _ => False
+          | Right second => match second with
+            | MkPair _ reused =>
+                andb (eq_nat (cl_cache_row_count cache) (S Z))
+                  (eq_nat (cl_cache_row_count reused) (S Z))
+            end
+          end
+      end
+    end;
+
+def cl_cache_stale_replaces_row : Bool :=
+    let src : String := "def n : Nat := Z;" in
+    let other : String := "def n : Nat := S Z;" in
+    let path : String := "std/cache_stale.ouro" in
+    match cm_load_file_cached (MkPair String String path src) empty_intern cm_cache0 with
+    | Left _ => False
+    | Right first => match first with
+      | MkPair _ cache =>
+          match cm_cache_lookup cache path other with
+          | CmCacheStale =>
+              match cm_load_file_cached (MkPair String String path other)
+                  empty_intern cache with
+              | Left _ => False
+              | Right second => match second with
+                | MkPair _ next => andb (eq_nat (cl_cache_row_count next) (S Z))
+                    (andb (match cm_cache_lookup next path other with
+                      | CmCacheHit _ => True
+                      | CmCacheMiss => False
+                      | CmCacheStale => False end)
+                      (match cm_cache_lookup next path src with
+                      | CmCacheStale => True
+                      | CmCacheHit _ => False
+                      | CmCacheMiss => False end))
+                end
+              end
+          | CmCacheHit _ => False
+          | CmCacheMiss => False
+          end
+      end
+    end;
+
+def cl_cache_reset_is_miss : Bool :=
+    let src : String := "def n : Nat := Z;" in
+    let path : String := "std/cache_reset.ouro" in
+    match cm_load_file_cached (MkPair String String path src) empty_intern cm_cache0 with
+    | Left _ => False
+    | Right first => match first with
+      | MkPair _ cache =>
+          match cm_cache_lookup (cm_cache_reset cache) path src with
+          | CmCacheMiss => True
+          | CmCacheHit _ => False
+          | CmCacheStale => False
+          end
+      end
+    end;
+
+def cl_laws : List (Pair String Bool) :=
+    [ MkPair String Bool "earlier-ast-and-intern-survive-later-parse" cl_survivors
+    , MkPair String Bool "32-nested-calls-preserve-identities" (cl_repeated 32 empty_intern)
+    , MkPair String Bool "parse-error-remains-error" (cl_rejected "def broken : Nat := ;")
+    , MkPair String Bool "unterminated-string-remains-error" (cl_rejected "def broken : String := \"")
+    , MkPair String Bool "malformed-import-remains-error" (cl_rejected "import ;")
+    , MkPair String Bool "success-after-error-remains-success"
+        (andb (cl_rejected "def broken : Nat := ;") cl_survivors)
+    , MkPair String Bool "content-addressed-cache-hit-reuses-row" cl_cache_hit_reuses_row
+    , MkPair String Bool "content-addressed-cache-stale-replaces-row" cl_cache_stale_replaces_row
+    , MkPair String Bool "content-addressed-cache-reset-is-miss" cl_cache_reset_is_miss
+    ];
+def main : IO Unit :=
+    do io_foreach (Pair String Bool) (fun (law : Pair String Bool) => match law with
+         | MkPair name passed => println (prim_string_concat
+             (match passed with | True => "PASS " | False => "FAIL " end) name) end) cl_laws;
+       exit (match all (Pair String Bool) (fun (law : Pair String Bool) => snd String Bool law) cl_laws with
+         | True => 0 | False => 1 end)

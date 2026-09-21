@@ -22,6 +22,7 @@ REPORT_KIND = 'ouro.kernel-profile-report.v2'
 BASELINE_KIND = 'ouro.kernel-baseline.v2'
 BUDGET_KIND = 'ouro.kernel-budgets.v2'
 TIMING_DOMAIN = 'canonical-retained-executable-process-wall.v1'
+RETAINED_OPT_LEVEL = 'O1'
 LAW_ENTRY = 'tests/compiler_retained_tests.ouro'
 BOUNDARY_ENTRY = 'tools/repo_gate/main.ouro'
 BOUNDARY_CHECKS = ('compiler-checker-dependencies', 'compiler-checked-value-owners', 'compiler-boundary-documentation')
@@ -109,9 +110,14 @@ def validate_budgets(budgets: dict) -> None:
 
 
 def receipt_valid(receipt: dict, executable: Path, expected_sources: dict, producer_sha: str,
-                  entry: str, modes: set[str]) -> bool:
+                  entry: str, modes: set[str], *, opt_level: str | None = None) -> bool:
     try:
         inputs = receipt['inputs']
+        if opt_level is not None:
+            flags = inputs.get('cflags')
+            if (not isinstance(flags, list) or not all(isinstance(flag, str) for flag in flags)
+                    or [flag for flag in flags if flag.startswith('-O')] != ['-' + opt_level]):
+                return False
         return (receipt['kind'] == native_tool_build.KIND and inputs['kind'] == native_tool_build.KIND
                 and receipt['cache'] in modes and receipt['binary_sha256'] == sha256_path(executable)
                 and receipt['key'] == hash_json(inputs) and inputs['sources'] == expected_sources
@@ -241,7 +247,7 @@ def run_profile(*, compiler: Path, boundary: Path, out: Path, budget_path: Path,
             command = [sys.executable, '-B', str(ROOT / 'scripts/native_tool_build.py'), LAW_ENTRY, str(executable),
                        '--compiler', str(compiler), '--fuel', '16000', '--jobs', '1', '--build-dir', str(work / 'b'),
                        '--cache-dir', str(work / 'c'), '--no-cache' if mode == 'off' else '--cache',
-                       '--opt-level', 'O0', '--ccache', 'disabled']
+                       '--opt-level', RETAINED_OPT_LEVEL, '--ccache', 'disabled']
             built = execute(command, work, mode + '-build', env, limits['build_timeout_s'], limits['memory_limit_mib'])
             try:
                 receipt = read_json_object(Path(str(executable) + '.build.json'))
@@ -249,7 +255,8 @@ def run_profile(*, compiler: Path, boundary: Path, out: Path, budget_path: Path,
                 receipt = {}
             cache = 'hit' if mode == 'hit' else 'miss'
             valid = (process_ok(built) and 'BUILD_TOOL_CACHE: ' + cache + ' ' in built['stdout']
-                     and receipt_valid(receipt, executable, sources, producer_sha, LAW_ENTRY, {cache}))
+                     and receipt_valid(receipt, executable, sources, producer_sha, LAW_ENTRY, {cache},
+                                       opt_level=RETAINED_OPT_LEVEL))
             row = {'mode': mode, 'build': built, 'receipt': receipt, 'receipt_valid': valid,
                    'binary_sha256': sha256_path(executable) if executable.is_file() else None}
             if valid:
@@ -264,7 +271,8 @@ def run_profile(*, compiler: Path, boundary: Path, out: Path, budget_path: Path,
               'timing_note': 'Full bounded process wall time including launch, output and supervision; strict checking and builds are separate phases.',
               'memory_note': 'Windows measures Job peak commit; POSIX measures process-tree RSS with an inherited per-process address-space limit.',
               'fixtures': len(LAW_NAMES), 'required_laws': list(LAW_NAMES), 'max_elapsed_ms': maximum,
-              'context': {'producer_sha256': producer_sha, 'retained_law_sha256': sources[LAW_ENTRY],
+              'context': {'producer_sha256': producer_sha, 'retained_opt_level': RETAINED_OPT_LEVEL,
+                          'retained_law_sha256': sources[LAW_ENTRY],
                           'retained_fixture_sha256': sources['tests/compiler_retained_fixtures.ouro'],
                           'runtime': {name: value for name, value in sources.items() if name.startswith('runtime/')}},
               'budgets': budgets, 'budget_status': status, 'strict_check': checked,

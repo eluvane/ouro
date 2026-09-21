@@ -1,0 +1,491 @@
+-- Shared byte/text facts for native quality owners. Recognition stays
+-- Python-compatible: UTF-8 bytes, ensure_ascii escapes, splitlines, strip.
+
+import "byte_space.ouro";
+import "../../std/string_prims.ouro";
+import "../../std/char.ouro";
+import "../../std/collections.ouro";
+
+def qt_cat3 (a : String) (b : String) (c : String) : String :=
+    prim_string_concat a (prim_string_concat b c);
+
+def qt_cat4 (a : String) (b : String) (c : String) (d : String) : String :=
+    prim_string_concat (qt_cat3 a b c) d;
+
+def qt_n16 : Nat := 16;
+def qt_n32 : Nat := 32;
+def qt_n64 : Nat := 64;
+def qt_n128 : Nat := 128;
+def qt_n256 : Nat := mul qt_n16 qt_n16;
+def qt_n1024 : Nat := mul qt_n32 qt_n32;
+def qt_n4096 : Nat := mul qt_n64 qt_n64;
+def qt_n64k : Nat := mul qt_n256 qt_n256;
+def qt_hi_surrogate : Nat := mul 216 qt_n256;
+def qt_lo_surrogate : Nat := mul 220 qt_n256;
+
+def qt_is_word (c : Nat) : Bool :=
+    orb (is_alnum c) (orb (eq_nat c ch_under) (eq_nat c ch_squote));
+
+def qt_is_ident_start (c : Nat) : Bool :=
+    orb (is_alpha c) (eq_nat c ch_under);
+
+def qt_is_ident_cont (c : Nat) : Bool :=
+    orb (qt_is_ident_start c) (orb (is_digit c) (eq_nat c ch_squote));
+
+def qt_starts_at (s : String) (pos : Nat) (pat : String) : Bool :=
+    let plen : Nat := prim_string_length pat in
+    match leb_nat (add pos plen) (prim_string_length s) with
+    | False => False
+    | True =>
+        (fix go (fuel : Nat) (i : Nat) : Bool :=
+          match fuel with
+          | Z => True
+          | S fuel2 =>
+              match eq_nat (prim_string_byte_at s (add pos i)) (prim_string_byte_at pat i) with
+              | True => go fuel2 (add i 1)
+              | False => False
+              end
+          end) plen 0
+    end;
+
+def qt_word_bound (s : String) (pos : Nat) : Bool :=
+    match pos with
+    | Z => True
+    | S prev => notb (qt_is_word (prim_string_byte_at s prev))
+    end;
+
+def qt_word_end (s : String) (pos : Nat) : Bool :=
+    match ltb_nat pos (prim_string_length s) with
+    | False => True
+    | True => notb (qt_is_word (prim_string_byte_at s pos))
+    end;
+
+def qt_at_word (s : String) (pos : Nat) (word : String) : Bool :=
+    let stop : Nat := add pos (prim_string_length word) in
+    match qt_starts_at s pos word with
+    | False => False
+    | True => andb (qt_word_bound s pos) (qt_word_end s stop)
+    end;
+
+-- An apostrophe continuing an identifier is not a character-literal opener.
+-- Call only outside a quoted region; quote bodies are consumed by the shared
+-- skipper below. This also handles repeated primes and qualified names.
+def qt_starts_quote (s : String) (pos : Nat) : Bool :=
+    match ltb_nat pos (prim_string_length s) with
+    | False => False
+    | True =>
+        let c : Nat := prim_string_byte_at s pos in
+        match eq_nat c 34 with
+        | True => True
+        | False => match eq_nat c 39 with
+          | False => False
+          | True => match pos with
+            | Z => True
+            | S previous => notb (qt_is_ident_cont (prim_string_byte_at s previous))
+            end
+          end
+        end
+    end;
+
+-- Caller must pass pos at the opening quote. The previous byte is not read.
+
+def qt_code_before_comment (line : String) : String :=
+    match prim_string_contains line "--" with
+    | False => line
+    | True =>
+    let len : Nat := prim_string_length line in
+    (fix go (fuel : Nat) (i : Nat) (quote : Nat) (esc : Bool) : String :=
+      match fuel with
+      | Z => line
+      | S fuel2 =>
+          match ltb_nat i len with
+          | False => line
+          | True =>
+              let c : Nat := prim_string_byte_at line i in
+              match ltb_nat 0 quote with
+              | True =>
+                  match esc with
+                  | True => go fuel2 (add i 1) quote False
+                  | False => match eq_nat c 92 with
+                    | True => go fuel2 (add i 1) quote True
+                    | False => match eq_nat c quote with
+                      | True => go fuel2 (add i 1) 0 False
+                      | False => go fuel2 (add i 1) quote False
+                      end
+                    end
+                  end
+              | False =>
+                  match qt_starts_quote line i with
+                  | True => go fuel2 (add i 1) c False
+                  | False =>
+                      match andb (eq_nat c 45)
+                          (andb (ltb_nat (add i 1) len)
+                            (eq_nat (prim_string_byte_at line (add i 1)) 45)) with
+                      | True => prim_string_slice line 0 i
+                      | False => go fuel2 (add i 1) 0 False
+                      end
+                  end
+              end
+          end
+      end) (add len 1) 0 0 False
+    end;
+
+def qt_utf8_len (lead : Nat) : Nat :=
+    match ltb_nat lead qt_n128 with
+    | True => 1
+    | False => match andb (leb_nat 194 lead) (leb_nat lead 223) with
+      | True => 2
+      | False => match andb (leb_nat 224 lead) (leb_nat lead 239) with
+        | True => 3
+        | False => match andb (leb_nat 240 lead) (leb_nat lead 244) with
+          | True => 4
+          | False => 0
+          end
+        end
+      end
+    end;
+
+def qt_utf8_decode_at (s : String) (pos : Nat) : Nat :=
+    let b0 : Nat := prim_string_byte_at s pos in
+    let len : Nat := qt_utf8_len b0 in
+    match eq_nat len 1 with
+    | True => b0
+    | False => match eq_nat len 2 with
+      | True => add (mul (sub b0 192) qt_n64) (sub (prim_string_byte_at s (add pos 1)) qt_n128)
+      | False => match eq_nat len 3 with
+        | True =>
+            let b1 : Nat := sub (prim_string_byte_at s (add pos 1)) qt_n128 in
+            let b2 : Nat := sub (prim_string_byte_at s (add pos 2)) qt_n128 in
+            add (mul (add (mul (sub b0 224) qt_n64) b1) qt_n64) b2
+        | False => match eq_nat len 4 with
+          | True =>
+              let b1 : Nat := sub (prim_string_byte_at s (add pos 1)) qt_n128 in
+              let b2 : Nat := sub (prim_string_byte_at s (add pos 2)) qt_n128 in
+              let b3 : Nat := sub (prim_string_byte_at s (add pos 3)) qt_n128 in
+              add (mul (add (mul (add (mul (sub b0 240) qt_n64) b1) qt_n64) b2) qt_n64) b3
+          | False => b0
+          end
+        end
+      end
+    end;
+
+def qt_hex4_bytes (cp : Nat) : List Nat :=
+    [ hex_digit (div_nat cp qt_n4096)
+    , hex_digit (div_nat (mod_nat cp qt_n4096) qt_n256)
+    , hex_digit (div_nat (mod_nat cp qt_n256) qt_n16)
+    , hex_digit (mod_nat cp qt_n16)
+    ];
+
+def qt_py_escape_cp (cp : Nat) : List Nat :=
+    match eq_nat cp 34 with
+    | True => [92, 34]
+    | False => match eq_nat cp 92 with
+      | True => [92, 92]
+      | False => match eq_nat cp 10 with
+        | True => [92, 110]
+        | False => match eq_nat cp 13 with
+          | True => [92, 114]
+          | False => match eq_nat cp 9 with
+            | True => [92, 116]
+            | False => match eq_nat cp 8 with
+              | True => [92, 98]
+              | False => match eq_nat cp 12 with
+                | True => [92, 102]
+                | False => match orb (ltb_nat cp qt_n32) (eq_nat cp 127) with
+                  | True => Cons Nat 92 (Cons Nat 117 (qt_hex4_bytes cp))
+                  | False => match ltb_nat cp qt_n128 with
+                    | True => [cp]
+                    | False => match ltb_nat cp qt_n64k with
+                      | True => Cons Nat 92 (Cons Nat 117 (qt_hex4_bytes cp))
+                      | False =>
+                          let rest : Nat := sub cp qt_n64k in
+                          let hi : Nat := add (div_nat rest qt_n1024) qt_hi_surrogate in
+                          let lo : Nat := add (mod_nat rest qt_n1024) qt_lo_surrogate in
+                          append Nat (Cons Nat 92 (Cons Nat 117 (qt_hex4_bytes hi)))
+                            (Cons Nat 92 (Cons Nat 117 (qt_hex4_bytes lo)))
+                      end
+                    end
+                  end
+                end
+              end
+            end
+          end
+        end
+      end
+    end;
+
+def qt_py_escape (s : String) : String :=
+    prim_string_of_char_codes
+      (Cons Nat 34
+        (append Nat
+          ((fix go (fuel : Nat) (pos : Nat) (rev : List Nat) : List Nat :=
+            match fuel with
+            | Z => reverse_lin Nat rev
+            | S fuel2 => match ltb_nat pos (prim_string_length s) with
+              | False => reverse_lin Nat rev
+              | True =>
+                  let b0 : Nat := prim_string_byte_at s pos in
+                  match ltb_nat b0 qt_n128 with
+                  | True => go fuel2 (add pos 1)
+                      (append Nat (reverse_lin Nat (qt_py_escape_cp b0)) rev)
+                  | False =>
+                      let len : Nat := qt_utf8_len b0 in
+                      let step : Nat := match eq_nat len 0 with
+                        | True => 1
+                        | False => len
+                        end in
+                      go fuel2 (add pos step)
+                        (append Nat (reverse_lin Nat
+                          (qt_py_escape_cp (qt_utf8_decode_at s pos))) rev)
+                  end
+              end
+            end) (add (prim_string_length s) 1) 0 []) [34]));
+
+def qt_split_lines (s : String) : List String :=
+    reverse_lin String
+      ((fix go (fuel : Nat) (pos : Nat) (start : Nat) (rev : List String) : List String :=
+        match fuel with
+        | Z => Cons String (prim_string_slice s start (sub pos start)) rev
+        | S fuel2 => match ltb_nat pos (prim_string_length s) with
+          | False => Cons String (prim_string_slice s start (sub pos start)) rev
+          | True =>
+              let c : Nat := prim_string_byte_at s pos in
+              match eq_nat c 10 with
+              | True => go fuel2 (add pos 1) (add pos 1)
+                  (Cons String (prim_string_slice s start (sub pos start)) rev)
+              | False => match eq_nat c 13 with
+                | True =>
+                    let after : Nat := add pos 1 in
+                    let next : Nat := match eq_nat (prim_string_byte_at s after) 10 with
+                      | True => add after 1
+                      | False => after
+                      end in
+                    go fuel2 next next
+                      (Cons String (prim_string_slice s start (sub pos start)) rev)
+                | False => go fuel2 (add pos 1) start rev
+                end
+              end
+          end
+        end) (add (prim_string_length s) 1) 0 0 []);
+
+def qt_strip (s : String) : String :=
+    let len : Nat := prim_string_length s in
+    let start : Nat := byte_skip_space s (add len 1) 0 in
+    let stop : Nat :=
+      (fix back (fuel : Nat) (p : Nat) : Nat :=
+        match fuel with
+        | Z => p
+        | S fuel2 => match leb_nat p start with
+          | True => p
+          | False => match byte_is_space (prim_string_byte_at s (sub p 1)) with
+            | True => back fuel2 (sub p 1)
+            | False => p
+            end
+          end
+        end) (add len 1) len in
+    prim_string_slice s start (sub stop start);
+
+def qt_find_from (s : String) (pat : String) (start : Nat) : Maybe Nat :=
+    let slen : Nat := prim_string_length s in
+    let plen : Nat := prim_string_length pat in
+    match plen with
+    | Z => Just Nat start
+    | S _ =>
+        (fix go (fuel : Nat) (i : Nat) : Maybe Nat :=
+          match fuel with
+          | Z => Nothing Nat
+          | S fuel2 => match leb_nat (add i plen) slen with
+            | False => Nothing Nat
+            | True => match qt_starts_at s i pat with
+              | True => Just Nat i
+              | False => go fuel2 (add i 1)
+              end
+            end
+          end) (add slen 1) start
+    end;
+
+def qt_find (s : String) (pat : String) : Maybe Nat :=
+    qt_find_from s pat 0;
+
+-- Same search as qt_find, but skip double-quoted and character-literal
+-- regions. Used for token-shaped style needles such as `;;`.
+def qt_find_unquoted (s : String) (pat : String) : Maybe Nat :=
+    let slen : Nat := prim_string_length s in
+    let plen : Nat := prim_string_length pat in
+    match plen with
+    | Z => Just Nat 0
+    | S _ => match prim_string_contains s pat with
+      | False => Nothing Nat
+      | True =>
+        (fix go (fuel : Nat) (i : Nat) (quote : Nat) (esc : Bool) : Maybe Nat :=
+          match fuel with
+          | Z => Nothing Nat
+          | S fuel2 =>
+              match ltb_nat i slen with
+              | False => Nothing Nat
+              | True =>
+                  let c : Nat := prim_string_byte_at s i in
+                  match ltb_nat 0 quote with
+                  | True =>
+                      match esc with
+                      | True => go fuel2 (add i 1) quote False
+                      | False => match eq_nat c 92 with
+                        | True => go fuel2 (add i 1) quote True
+                        | False => match eq_nat c quote with
+                          | True => go fuel2 (add i 1) 0 False
+                          | False => go fuel2 (add i 1) quote False
+                          end
+                        end
+                      end
+                  | False =>
+                      match qt_starts_quote s i with
+                      | True => go fuel2 (add i 1) c False
+                      | False =>
+                          match andb (leb_nat (add i plen) slen)
+                              (qt_starts_at s i pat) with
+                          | True => Just Nat i
+                          | False => go fuel2 (add i 1) 0 False
+                          end
+                      end
+                  end
+              end
+          end) (add slen 1) 0 0 False
+      end
+    end;
+
+def qt_contains (s : String) (pat : String) : Bool :=
+    match qt_find s pat with
+    | Nothing => False
+    | Just _ => True
+    end;
+
+def qt_count_char (s : String) (c : Nat) (stop : Nat) : Nat :=
+    (fix go (fuel : Nat) (i : Nat) (acc : Nat) : Nat :=
+      match fuel with
+      | Z => acc
+      | S fuel2 => match ltb_nat i stop with
+        | False => acc
+        | True =>
+            let next : Nat := match eq_nat (prim_string_byte_at s i) c with
+              | True => add acc 1
+              | False => acc
+              end in
+            go fuel2 (add i 1) next
+        end
+      end) (add stop 1) 0 0;
+
+def qt_rfind_char (s : String) (c : Nat) (stop : Nat) : Maybe Nat :=
+    (fix go (fuel : Nat) (i : Nat) : Maybe Nat :=
+      match fuel with
+      | Z => Nothing Nat
+      | S fuel2 => match i with
+        | Z => Nothing Nat
+        | S prev => match eq_nat (prim_string_byte_at s prev) c with
+          | True => Just Nat prev
+          | False => go fuel2 prev
+          end
+        end
+      end) (add stop 1) stop;
+
+def qt_line_col (s : String) (index : Nat) : Pair Nat Nat :=
+    let line : Nat := add (qt_count_char s 10 index) 1 in
+    match qt_rfind_char s 10 index with
+    | Nothing => MkPair Nat Nat line (add index 1)
+    | Just bol => MkPair Nat Nat line (sub index bol)
+    end;
+
+def qt_ident_end (s : String) (start : Nat) : Nat :=
+    (fix go (fuel : Nat) (i : Nat) : Nat :=
+      match fuel with
+      | Z => i
+      | S fuel2 => match ltb_nat i (prim_string_length s) with
+        | False => i
+        | True => match qt_is_ident_cont (prim_string_byte_at s i) with
+          | True => go fuel2 (add i 1)
+          | False => i
+          end
+        end
+      end) (add (prim_string_length s) 1) start;
+
+def qt_ident_at (s : String) (pos : Nat) : Maybe String :=
+    match ltb_nat pos (prim_string_length s) with
+    | False => Nothing String
+    | True => match qt_is_ident_start (prim_string_byte_at s pos) with
+      | False => Nothing String
+      | True =>
+          let stop : Nat := qt_ident_end s (add pos 1) in
+          Just String (prim_string_slice s pos (sub stop pos))
+      end
+    end;
+
+def qt_skip_ws (s : String) (pos : Nat) : Nat :=
+    byte_skip_space s (add (prim_string_length s) 1) pos;
+
+def qt_drop_prefix (s : String) (pre : String) : String :=
+    match prim_string_starts s pre with
+    | False => s
+    | True => prim_string_slice s (prim_string_length pre)
+        (sub (prim_string_length s) (prim_string_length pre))
+    end;
+
+def qt_to_lower (s : String) : String :=
+    prim_string_of_char_codes
+      (map Nat Nat to_lower (prim_string_to_char_codes s));
+
+def qt_max (a : Nat) (b : Nat) : Nat :=
+    match ltb_nat a b with
+    | True => b
+    | False => a
+    end;
+
+def qt_min1 (n : Nat) : Nat :=
+    qt_max n 1;
+
+def qt_cps_before (s : String) (byte_pos : Nat) : Nat :=
+    (fix go (fuel : Nat) (pos : Nat) (acc : Nat) : Nat :=
+      match fuel with
+      | Z => acc
+      | S fuel2 => match ltb_nat pos byte_pos with
+        | False => acc
+        | True =>
+            let len : Nat := qt_utf8_len (prim_string_byte_at s pos) in
+            let step : Nat := match eq_nat len 0 with
+              | True => 1
+              | False => len
+              end in
+            go fuel2 (add pos step) (add acc 1)
+        end
+      end) (add byte_pos 1) 0 0;
+
+def qt_chars_all (p : Nat -> Bool) (s : String) : Bool :=
+    (fix go (fuel : Nat) (i : Nat) : Bool :=
+      match fuel with
+      | Z => True
+      | S fuel2 => match ltb_nat i (prim_string_length s) with
+        | False => True
+        | True => match p (prim_string_byte_at s i) with
+          | False => False
+          | True => go fuel2 (add i 1)
+          end
+        end
+      end) (add (prim_string_length s) 1) 0;
+
+def qt_parse_nat (s : String) : Maybe Nat :=
+    let len : Nat := prim_string_length s in
+    match len with
+    | Z => Nothing Nat
+    | S _ =>
+        (fix go (fuel : Nat) (i : Nat) (acc : Nat) : Maybe Nat :=
+          match fuel with
+          | Z => Just Nat acc
+          | S fuel2 => match eq_nat i len with
+            | True => Just Nat acc
+            | False =>
+                let c : Nat := prim_string_byte_at s i in
+                match is_digit c with
+                | False => Nothing Nat
+                | True => go fuel2 (add i 1) (add (mul acc 10) (sub c 48))
+                end
+            end
+          end) (add len 1) 0 0
+    end;

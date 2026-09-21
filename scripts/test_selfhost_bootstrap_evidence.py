@@ -158,5 +158,13 @@ class SelfhostBootstrapEvidenceTests(unittest.TestCase):
             self.assertLessEqual(len(record["stdout_excerpt"].encode("utf-8", errors="replace")), limit)
 
 
+def run() -> None:
+    result = unittest.TextTestRunner(verbosity=1).run(
+        unittest.defaultTestLoader.loadTestsFromTestCase(SelfhostBootstrapEvidenceTests)
+    )
+    if not result.wasSuccessful():
+        raise AssertionError("selfhost bootstrap evidence contract tests failed")
+
+
 if __name__ == "__main__":
     raise SystemExit(unittest.main())

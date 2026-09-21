@@ -53,6 +53,11 @@ you are trying to do.
 - [Native repository gates](native_repo_gates.md) — Ouro-owned policy,
   script inventory, parity evidence, and retirement checks.
 
+## Quality
+
+- [Clippy-grade firewall](clippy_grade_firewall.md) — high-signal syntactic
+  deny rules for project-owned Ouro source.
+
 ## Compiler and trust
 
 - [Architecture](architecture.md) — repository layers and the main compilation
@@ -70,6 +75,8 @@ you are trying to do.
 
 - [Contributing](../CONTRIBUTING.md) — first build, focused tests, RFCs,
   generated artifacts, and pull requests.
+- [Parallel agent lanes](agent_parallel.md) — live file locks, focused language
+  work, validation, and merge order.
 - [Continuous integration](ci.md) — local profiles and hosted workflow roles.
 - [OuroSmith](ouro_smith.md) — generated tests, independent oracles, replay,
   and migration of the manual corpus.

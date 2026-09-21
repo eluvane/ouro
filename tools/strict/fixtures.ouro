@@ -1,0 +1,359 @@
+-- Fixture-manifest and remaining IO checks for the strict firewall.
+
+import "validate.ouro";
+import "../../std/json_types.ouro";
+
+def st_join_nl (xs : List String) : String :=
+    str_join "\n" xs;
+
+def st_blocking (xs : List QrFinding) : List QrFinding :=
+    filter QrFinding qr_strict_blocks xs;
+
+def st_codes_of (xs : List QrFinding) : List String :=
+    map QrFinding String qr_find_code xs;
+
+def st_read_text (path : String) : IO (Either String String) :=
+    do let! loaded := quality_read_file path;
+       match loaded with
+       | Left e => io_pure (Either String String)
+           (Left String String (quality_input_message e))
+       | Right text => io_pure (Either String String)
+           (Right String String text)
+       end
+
+-- The host arena includes source loading and scanning; only typed results leave.
+def st_scan_request (request : Pair (List (Pair String QrDiag)) String)
+    (source : Pair String String) : IO (Either String (List QrFinding)) :=
+    match request, source with
+    | MkPair mp profile, MkPair root path =>
+        do let! loaded := st_read_text path;
+           io_pure (Either String (List QrFinding))
+             (match loaded with
+              | Left err => Left String (List QrFinding) err
+              | Right text => Right String (List QrFinding)
+                  (st_scan_source mp profile (qr_rel root path) text)
+              end)
+    end;
+
+def st_scan_abs (mp : List (Pair String QrDiag)) (profile : String)
+    (root : String) (abs_path : String) : IO (List QrFinding) :=
+    do let! scanned := st_scan_request
+         (MkPair (List (Pair String QrDiag)) String mp profile)
+         (MkPair String String root abs_path);
+       io_pure (List QrFinding) (match scanned with
+         | Left _ => Nil QrFinding
+         | Right findings => findings
+         end)
+
+def st_known_issues (root : String) (mp : List (Pair String QrDiag))
+    : IO (List QrIssue) :=
+    let model : String := st_model_path root in
+    do let! exists := qr_is_file model;
+       match exists with
+       | False => io_pure (List QrIssue) (Nil QrIssue)
+       | True =>
+           do let! loaded := st_read_text model;
+              match loaded with
+              | Left err => io_pure (List QrIssue)
+                  [st_issue (prim_string_concat "unreadable analyzer model: " err)
+                    (qr_rel root model)]
+              | Right text => io_pure (List QrIssue)
+                  (st_validate_known_codes root mp text)
+              end
+       end
+
+def st_docs_combined (root : String) : IO (Pair String (List QrIssue)) :=
+    io_fold String (Pair String (List QrIssue))
+      (fun (st : Pair String (List QrIssue)) (name : String) =>
+        match st with
+        | MkPair acc issues =>
+            let path : String := qr_child (qr_child root "docs") name in
+            do let! exists := qr_is_file path;
+               match exists with
+               | False => io_pure (Pair String (List QrIssue)) st
+               | True =>
+                   do let! loaded := st_read_text path;
+                      match loaded with
+                      | Left err =>
+                          io_pure (Pair String (List QrIssue))
+                            (MkPair String (List QrIssue) acc
+                              (st_add_issue issues
+                                (st_issue (prim_string_concat
+                                  "unreadable quality doc: " err)
+                                  (qr_rel root path))))
+                      | Right text =>
+                          let next : String := match prim_string_length acc with
+                            | Z => text
+                            | S _ => str_cat3 acc "\n" text
+                            end in
+                          io_pure (Pair String (List QrIssue))
+                            (MkPair String (List QrIssue) next issues)
+                      end
+               end
+        end)
+      (MkPair String (List QrIssue) "" (Nil QrIssue))
+      st_doc_names;
+
+def st_registry_issues (root : String) (cfg : QrConfig)
+    : IO (List QrIssue) :=
+    do let! rows := st_validate_registry_rows root cfg;
+       let! known := st_known_issues root (qr_cfg_map cfg);
+       let! docs := st_docs_combined root;
+       match docs with
+       | MkPair combined extra =>
+           io_pure (List QrIssue)
+             (append QrIssue rows
+               (append QrIssue known
+                 (append QrIssue extra
+                   (st_validate_docs_mentions root (qr_cfg_map cfg) combined))))
+       end
+
+def st_has_max (item : Json) : Bool :=
+    match qr_get item "max_count" with
+    | Nothing => False
+    | Just _ => True
+    end;
+
+def st_debt_json_issues (root : String) (items : List Json) (usage : List Nat)
+    : List QrIssue :=
+    let path : String := qr_rel root (st_debt_path root) in
+    reverse_lin QrIssue
+      ((fix go (xs : List Json) (idx : Nat) (acc : List QrIssue)
+          : List QrIssue :=
+        match xs with
+        | Nil => acc
+        | Cons item rest =>
+            let eid : String := match qr_as_str (qr_get_or item "id" JNull) with
+              | Just s => s
+              | Nothing => prim_string_concat "debt["
+                  (prim_string_concat (prim_string_of_nat idx) "]")
+              end in
+            let actual : Nat := st_nth_usage usage idx in
+            let acc1 : List QrIssue := match st_has_max item with
+              | False => st_add_issue acc
+                  (st_issue (str_cat3 "debt entry " eid " lacks max_count") path)
+              | True =>
+                  let maxc : Nat := match qr_parse_nat_field item "max_count" with
+                    | Nothing => 0
+                    | Just n => n
+                    end in
+                  let minc : Maybe Nat := match qr_get item "min_count" with
+                    | Nothing => Just Nat maxc
+                    | Just _ => qr_parse_nat_field item "min_count"
+                    end in
+                  let acc2 : List QrIssue := match ltb_nat maxc actual with
+                    | False => acc
+                    | True => st_add_issue acc
+                        (st_issue (str_cat3 "debt entry " eid
+                          (str_cat3 " exceeded cap actual="
+                            (prim_string_of_nat actual)
+                            (prim_string_concat " max="
+                              (prim_string_of_nat maxc)))) path)
+                    end in
+                  match minc with
+                  | Nothing => acc2
+                  | Just want => match ltb_nat actual want with
+                    | False => acc2
+                    | True => st_add_issue acc2
+                        (st_issue (str_cat3 "debt entry " eid
+                          (str_cat3 " is stale actual="
+                            (prim_string_of_nat actual)
+                            (prim_string_concat " expected="
+                              (prim_string_of_nat want)))) path)
+                    end
+                  end
+              end in
+            let acc2 : List QrIssue :=
+              (fix fields (ks : List String) (out : List QrIssue)
+                  : List QrIssue :=
+                match ks with
+                | Nil => out
+                | Cons key more =>
+                    match ltb_nat 0 (prim_string_length (qr_str_or item key "")) with
+                    | True => fields more out
+                    | False => fields more (st_add_issue out
+                        (st_issue (str_cat3 "debt entry " eid
+                          (prim_string_concat " missing " key)) path))
+                    end
+                end) ["reason", "replacement", "tracking"] acc1 in
+            go rest (add idx 1) acc2
+        end) items 0 []);
+
+def st_load_debt (root : String) : IO (Pair (List QrDebt) (List Json)) :=
+    let path : String := st_debt_path root in
+    do let! exists := qr_is_file path;
+       match exists with
+       | False => io_pure (Pair (List QrDebt) (List Json))
+           (MkPair (List QrDebt) (List Json) (Nil QrDebt) (Nil Json))
+       | True =>
+           do let! loaded := qr_read_object path;
+              match loaded with
+              | Left _ => io_pure (Pair (List QrDebt) (List Json))
+                  (MkPair (List QrDebt) (List Json) (Nil QrDebt) (Nil Json))
+              | Right obj =>
+                  let items : List Json := qr_arr obj "entries" in
+                  io_pure (Pair (List QrDebt) (List Json))
+                    (MkPair (List QrDebt) (List Json)
+                      (qr_load_debt_entries items) items)
+              end
+       end
+
+def st_obj_path (item : Json) : String :=
+    qr_str_or item "path" "";
+
+def st_obj_profile (item : Json) : String :=
+    qr_str_or item "profile" "strict";
+
+def st_obj_codes (item : Json) : List String :=
+    qr_string_list (qr_arr item "codes");
+
+def st_obj_must_not (item : Json) : List String :=
+    qr_string_list (qr_arr item "must_not");
+
+def st_good_issues (root : String) (mp : List (Pair String QrDiag))
+    (items : List Json) : IO (List QrIssue) :=
+    io_fold Json (List QrIssue)
+      (fun (acc : List QrIssue) (item : Json) =>
+        let rel : String := st_obj_path item in
+        let abs : String := qr_child root rel in
+        do let! exists := qr_is_file abs;
+           match exists with
+           | False => io_pure (List QrIssue)
+               (st_add_issue acc (st_issue "missing good fixture" rel))
+           | True =>
+               do let! found := st_scan_abs mp (st_obj_profile item) root abs;
+                  match st_blocking found with
+                  | Nil => io_pure (List QrIssue) acc
+                  | Cons _ _ =>
+                      io_pure (List QrIssue)
+                        (st_add_issue acc
+                          (st_issue_codes
+                            "good fixture produced blocking strict-quality diagnostics"
+                            rel (st_codes_of (st_blocking found))))
+                  end
+           end)
+      (Nil QrIssue) items;
+
+def st_bad_issues (root : String) (mp : List (Pair String QrDiag))
+    (items : List Json) : IO (Pair (List QrIssue) (List String)) :=
+    io_fold Json (Pair (List QrIssue) (List String))
+      (fun (st : Pair (List QrIssue) (List String)) (item : Json) =>
+        match st with
+        | MkPair acc covered =>
+            let rel : String := st_obj_path item in
+            let abs : String := qr_child root rel in
+            let expected : List String := st_obj_codes item in
+            let must_not : List String := st_obj_must_not item in
+            do let! exists := qr_is_file abs;
+               match exists with
+               | False => io_pure (Pair (List QrIssue) (List String))
+                   (MkPair (List QrIssue) (List String)
+                     (st_add_issue acc (st_issue "missing bad fixture" rel))
+                     (append String covered (append String expected must_not)))
+               | True =>
+                   do let! found := st_scan_abs mp (st_obj_profile item) root abs;
+                      let got : List String := st_codes_of found in
+                      let missing : List String :=
+                        quality_sort String prim_string_le
+                          (st_missing_sorted got expected) in
+                      let acc2 : List QrIssue := match missing with
+                        | Nil => acc
+                        | Cons _ _ => st_add_issue acc
+                            (st_issue_codes
+                              "bad fixture missing expected diagnostic codes"
+                              rel missing)
+                        end in
+                      let retired_hits : List String :=
+                        quality_sort String prim_string_le
+                          (filter String (fun (c : String) =>
+                            elem String prim_string_eq c got) must_not) in
+                      let acc3 : List QrIssue := match retired_hits with
+                        | Nil => acc2
+                        | Cons _ _ => st_add_issue acc2
+                            (st_issue_codes
+                              "retired rule must not fire on this fixture"
+                              rel retired_hits)
+                        end in
+                      io_pure (Pair (List QrIssue) (List String))
+                        (MkPair (List QrIssue) (List String) acc3
+                          (append String covered
+                            (append String expected must_not)))
+               end
+        end)
+      (MkPair (List QrIssue) (List String) (Nil QrIssue) (Nil String))
+      items;
+
+def st_analyzer_fix_issues (root : String) (code : String)
+    (fixtures : List String) (acc : List QrIssue) : IO (List QrIssue) :=
+    io_fold String (List QrIssue)
+      (fun (out : List QrIssue) (fixture : String) =>
+        match prim_string_starts fixture st_analyzer_prefix with
+        | False => io_pure (List QrIssue) out
+        | True =>
+            do let! exists := qr_is_file (qr_child root fixture);
+               match exists with
+               | True => io_pure (List QrIssue) out
+               | False => io_pure (List QrIssue)
+                   (st_add_issue out
+                     (st_issue (prim_string_concat
+                       "missing analyzer fixture for " code) fixture))
+               end
+        end)
+      acc fixtures;
+
+def st_firewall_codes (item : QrDiag) : List String :=
+    filter String (fun (f : String) =>
+      notb (prim_string_starts f st_analyzer_prefix)) (qr_diag_fixtures item);
+
+def st_coverage_issues (root : String) (diags : List QrDiag)
+    (covered : List String) (acc : List QrIssue) : List QrIssue :=
+    let manifest : String := qr_rel root (st_manifest_path root) in
+    (fix go (xs : List QrDiag) (out : List QrIssue) : List QrIssue :=
+      match xs with
+      | Nil => out
+      | Cons item rest =>
+          let code : String := qr_diag_code item in
+          let fw : List String := st_firewall_codes item in
+          match fw with
+          | Nil => go rest out
+          | Cons _ _ =>
+              match elem String prim_string_eq code covered with
+              | True => go rest out
+              | False => go rest (st_add_issue out
+                  (st_issue (prim_string_concat
+                    "registered fixture diagnostic " (prim_string_concat
+                      code " missing from fixture manifest coverage"))
+                    manifest))
+              end
+          end
+      end) diags acc;
+
+def st_fixture_issues (root : String) (cfg : QrConfig) : IO (List QrIssue) :=
+    let mp : List (Pair String QrDiag) := qr_cfg_map cfg in
+    let diags : List QrDiag := qr_cfg_diags cfg in
+    let manifest : String := st_manifest_path root in
+    do let! exists := qr_is_file manifest;
+       match exists with
+       | False => io_pure (List QrIssue)
+           [st_issue "missing quality fixture manifest" (qr_rel root manifest)]
+       | True =>
+           do let! loaded := qr_read_object manifest;
+              match loaded with
+              | Left _ => io_pure (List QrIssue)
+                  [st_issue "missing quality fixture manifest" (qr_rel root manifest)]
+              | Right obj =>
+                  do let! good := st_good_issues root mp (qr_arr obj "good");
+                     let! bad := st_bad_issues root mp (qr_arr obj "bad");
+                     match bad with
+                     | MkPair bad_issues covered =>
+                         do let! extra :=
+                              io_fold QrDiag (List QrIssue)
+                                (fun (out : List QrIssue) (item : QrDiag) =>
+                                  st_analyzer_fix_issues root (qr_diag_code item)
+                                    (qr_diag_fixtures item) out)
+                                (append QrIssue good bad_issues) diags;
+                            io_pure (List QrIssue)
+                              (st_coverage_issues root diags covered extra)
+                     end
+              end
+       end

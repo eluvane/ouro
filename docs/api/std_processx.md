@@ -2,7 +2,7 @@
 
 Typed command specs, checked execution helpers, and shell-free plan rendering.
 
-Declarations: 26.
+Declarations: 27.
 
 ## inductive CommandSpec
 
@@ -76,11 +76,13 @@ def process_run_spec (cmd : CommandSpec) : IO ProcResult
 def process_run_spec_checked (cmd : CommandSpec) : IO (Either ProcessError ProcResult)
 ```
 
-## def process_run_expected
+## def process_run_expected_codes
 
 ```
-def process_run_expected (cmd : CommandSpec) (expected : Nat) : IO (Either ProcessError ProcResult)
+def process_run_expected_codes (cmd : CommandSpec) (expected : List Nat) : IO (Either ProcessError ProcResult)
 ```
+
+Preserve both captured streams for any explicitly accepted exit status. An empty list rejects every result, including exit status zero.
 
 ## def process_stdout_checked
 
@@ -92,6 +94,12 @@ def process_stdout_checked (cmd : CommandSpec) : IO (Either ProcessError String)
 
 ```
 def process_require_empty_stderr (cmd : CommandSpec) (result : ProcResult) : Either ProcessError ProcResult
+```
+
+## def process_run_expected
+
+```
+def process_run_expected (cmd : CommandSpec) (expected : Nat) : IO (Either ProcessError ProcResult)
 ```
 
 ## def process_run_quiet_checked

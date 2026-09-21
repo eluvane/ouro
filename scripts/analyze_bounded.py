@@ -8,7 +8,6 @@ import re
 import shutil
 import subprocess
 import sys
-import time
 from pathlib import Path
 from typing import Sequence
 
@@ -17,8 +16,9 @@ from repo_support import configure_native_stack
 
 ROOT = Path(__file__).resolve().parents[1]
 TRACE = os.environ.get("OURO_ANALYZE_BATCH_TRACE") == "1"
-INTER_FILE_PAUSE_SECONDS = 0.025
 DEFAULT_API_BASELINE = ROOT / "quality" / "api_surface.tsv"
+# Parsed (comments, data) rows keyed by resolved baseline path.
+_BASELINE_ROWS: dict[Path, tuple[list[str], list[str]]] = {}
 BASELINE_SENTINEL = "__ouro__/baseline.ouro\t__sentinel\t0\tinternal\tinternal"
 MAX_GLOBAL_FILES = 8
 MAX_GLOBAL_BYTES = 65536
@@ -78,8 +78,18 @@ BASE_TEXT_FLAGS = {"--enable-format", "--enable-light", "--enable-all"}
 SUPPRESSION_RE = re.compile(r"(?m)^\s*--\s*ouro-lint:")
 BANNER_RE = re.compile(r"^ANALYZE_OK\s+profile=(\S+)\s+(.*)$", re.MULTILINE)
 DRIVE_BANNER_RE = re.compile(
-    r"^ANALYZE_DRIVE\s+((?:[a-z]+=\d+\s+)*)families=(\S*)[ \t]*\r?\n?", re.MULTILINE
+    r"^ANALYZE_DRIVE files=(\d+) findings=(\d+) rejected=(\d+) families=([a-z_]+(?:,[a-z_]+)*)\r?$",
+    re.MULTILINE,
 )
+DRIVE_FAMILIES_RE = re.compile(r"ANALYZE_FAMILIES families=([a-z_]+(?:,[a-z_]+)*)\r?\n?")
+DRIVE_FINDING_RE = re.compile(
+    r"^(.+?):(\d+):(\d+): (warning|error)\[(OURO-[A-Z]+\d+)\] ([a-z_]+)/", re.MULTILINE,
+)
+DRIVE_RECORD_RE = re.compile(
+    DRIVE_FINDING_RE.pattern + r"[^\n]*\n"
+    r"  hint: [^\n]*\n  witness: [^\n]*(?:\n|$)", re.MULTILINE,
+)
+DRIVE_REJECT_RE = re.compile(r"^(.+?): structured analyzer could not build the unit: (\S+)\r?$", re.MULTILINE)
 DRIVE_COUNT_ORDER = ("files", "findings", "rejected")
 COUNT_ORDER = (
     "files",
@@ -198,18 +208,22 @@ def parse_analyzer_args(argv: Sequence[str], caller: Path) -> tuple[list[str], l
 
 
 def run_native(binary: Path, argv: Sequence[str], cwd: Path) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
+    proc = subprocess.run(
         [str(binary), *argv],
         cwd=cwd,
         env=os.environ.copy(),
-        text=True,
-        encoding="utf-8",
-        errors="replace",
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         check=False,
         creationflags=LOW_PRIORITY_FLAGS,
     )
+    # Windows subprocess text readers decode in background threads. Capture
+    # bytes so invalid UTF-8 raises in the caller, never leaves a missing stream.
+    def report_text(data: bytes) -> str:
+        return data.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n")
+
+    return subprocess.CompletedProcess(proc.args, proc.returncode,
+                                       report_text(proc.stdout), report_text(proc.stderr))
 
 
 def emit_process(proc: subprocess.CompletedProcess[str]) -> None:
@@ -217,10 +231,6 @@ def emit_process(proc: subprocess.CompletedProcess[str]) -> None:
         sys.stdout.write(proc.stdout)
     if proc.stderr:
         sys.stderr.write(proc.stderr)
-
-
-def pace() -> None:
-    time.sleep(INTER_FILE_PAUSE_SECONDS)
 
 
 def run_direct(binary: Path, argv: Sequence[str], cwd: Path) -> int:
@@ -235,15 +245,53 @@ def run_direct(binary: Path, argv: Sequence[str], cwd: Path) -> int:
 
 
 def drive_banner(output: str) -> tuple[dict[str, int], str] | None:
-    match = DRIVE_BANNER_RE.search(output)
-    if match is None:
+    matches = list(DRIVE_BANNER_RE.finditer(output))
+    if len(matches) != 1:
         return None
-    counts: dict[str, int] = {}
-    for key, raw in re.findall(r"([a-z]+)=(\d+)", match.group(1)):
-        counts[key] = int(raw)
-    if any(key not in counts for key in DRIVE_COUNT_ORDER):
+    match = matches[0]
+    families = match.group(4)
+    if len(families.split(",")) != len(set(families.split(","))):
         return None
-    return counts, match.group(2)
+    return dict(zip(DRIVE_COUNT_ORDER, map(int, match.groups()[:3]), strict=True)), families
+
+
+def requested_drive_families(binary: Path, passthrough: Sequence[str]) -> str | None:
+    """Ask the native profile owner; do not duplicate its family unions here."""
+    proc = run_native(binary, [*passthrough, "--print-families"], ROOT)
+    match = DRIVE_FAMILIES_RE.fullmatch(proc.stdout)
+    if proc.returncode != 0 or proc.stderr or match is None:
+        return None
+    families = match.group(1)
+    return families if len(families.split(",")) == len(set(families.split(","))) else None
+
+
+def drive_result_error(proc: subprocess.CompletedProcess[str], *, files: int | None = None,
+                       families: str | None = None, path: str | None = None) -> str:
+    parsed = drive_banner(proc.stdout)
+    if parsed is None:
+        return "missing, malformed or repeated structured completion report"
+    counts, actual_families = parsed
+    if counts["files"] == 0 or (files is not None and counts["files"] != files):
+        return "structured report omitted or duplicated requested files"
+    if families is not None and actual_families != families:
+        return "structured report did not run the requested families"
+    findings = list(DRIVE_FINDING_RE.finditer(proc.stdout))
+    rejections = list(DRIVE_REJECT_RE.finditer(proc.stderr))
+    if len(findings) != counts["findings"] or len(rejections) != counts["rejected"]:
+        return "structured diagnostic counts disagree with the completion report"
+    if counts["rejected"] > counts["files"] or len({r.group(1) for r in rejections}) != len(rejections):
+        return "structured report has duplicate or excess rejected files"
+    if path is not None and any(m.group(1) != path for m in [*findings, *rejections]):
+        return "structured diagnostic names an unrequested file"
+    if DRIVE_REJECT_RE.sub("", proc.stderr).strip():
+        return "structured worker emitted an unexpected error"
+    body = DRIVE_RECORD_RE.sub("", DRIVE_BANNER_RE.sub("", proc.stdout))
+    if body.strip():
+        return "structured worker emitted unreported output"
+    expected_exit = int(counts["findings"] != 0 or counts["rejected"] != 0)
+    if proc.returncode != expected_exit:
+        return "structured exit code disagrees with the completion report"
+    return ""
 
 
 def run_drive_bounded(
@@ -252,7 +300,10 @@ def run_drive_bounded(
     """One native drive process per file; findings from every file are shown
     and a single aggregate banner replaces the per-process ones."""
     totals = {key: 0 for key in DRIVE_COUNT_ORDER}
-    families = ""
+    families = requested_drive_families(binary, passthrough)
+    if not files or families is None:
+        print("ANALYZE_FAIL: empty input or unavailable native family selection", file=sys.stderr)
+        return 2
     failed = False
     for path in files:
         rel = repo_relative(path)
@@ -263,11 +314,12 @@ def run_drive_bounded(
         if proc.stderr:
             sys.stderr.write(proc.stderr)
         parsed = drive_banner(proc.stdout)
-        if parsed is None:
+        error = drive_result_error(proc, files=1, families=families, path=rel)
+        if error or parsed is None:
             sys.stdout.write(proc.stdout)
-            print(f"ANALYZE_FAIL: structured analyzer produced no banner for {rel}")
+            print(f"ANALYZE_FAIL: {rel}: {error}", file=sys.stderr)
             return 2
-        counts, families = parsed
+        counts, _ = parsed
         for key in DRIVE_COUNT_ORDER:
             totals[key] += counts[key]
         body = DRIVE_BANNER_RE.sub("", proc.stdout).strip("\r\n")
@@ -275,7 +327,6 @@ def run_drive_bounded(
             print(body)
         if proc.returncode != 0:
             failed = True
-        pace()
     fields = " ".join(f"{key}={totals[key]}" for key in DRIVE_COUNT_ORDER)
     print(f"ANALYZE_DRIVE {fields} families={families}")
     return 1 if failed else 0
@@ -301,18 +352,35 @@ def without_baseline_flag(passthrough: Sequence[str]) -> list[str]:
     return result
 
 
+def load_baseline_rows(source: Path) -> tuple[list[str], list[str]] | None:
+    try:
+        key = source.resolve()
+    except OSError:
+        key = source
+    cached = _BASELINE_ROWS.get(key)
+    if cached is not None:
+        return cached
+    if not source.is_file():
+        return None
+    try:
+        lines = source.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeError):
+        return None
+    comments = [line for line in lines if line.startswith("#")]
+    data = [line for line in lines if line and not line.startswith("#")]
+    rows = (comments, data)
+    _BASELINE_ROWS[key] = rows
+    return rows
+
+
 def filtered_baseline_flags(
     passthrough: Sequence[str], rel: str, scratch: Path
 ) -> list[str]:
     source = baseline_path(passthrough)
-    if not source.is_file():
+    loaded = load_baseline_rows(source)
+    if loaded is None:
         return list(passthrough)
-    try:
-        lines = source.read_text(encoding="utf-8").splitlines()
-    except (OSError, UnicodeError):
-        return list(passthrough)
-    comments = [line for line in lines if line.startswith("#")]
-    data = [line for line in lines if line and not line.startswith("#")]
+    comments, data = loaded
     rows = [line for line in data if line.startswith(f"{rel}\t")]
     if data and not rows:
         rows.append(BASELINE_SENTINEL)
@@ -515,7 +583,6 @@ def run_bounded(binary: Path, passthrough: Sequence[str], files: Sequence[Path])
                     if line.startswith("ANALYZE_FACTS "):
                         if not facts_line or "api_surface=baseline " in line:
                             facts_line = line
-            pace()
 
             if strict_enabled:
                 trace(f"phase=strict-format file={rel}")
@@ -536,7 +603,6 @@ def run_bounded(binary: Path, passthrough: Sequence[str], files: Sequence[Path])
                 if fmt.returncode != 0 or "OURO-" in fmt.stdout:
                     failed = True
                     failed_outputs.append(fmt.stdout)
-                pace()
 
         scopes = write_architecture_skeleton(scratch, files)
         trace(f"phase=architecture files={len(files)}")
@@ -601,6 +667,13 @@ def self_test() -> int:
                     pass
                 else:
                     raise AssertionError("unreadable source tree was accepted")
+    cache: dict[Path, tuple[list[str], list[str]]] = {}
+    baseline = ROOT / "quality" / "api_surface.tsv"
+    with patch.object(sys.modules[__name__], "_BASELINE_ROWS", cache):
+        first = load_baseline_rows(baseline)
+        second = load_baseline_rows(baseline)
+        assert first is not None and first is second
+        assert len(cache) == 1
     print("ANALYZE_DISCOVERY_SUITE rows=6")
     return 0
 

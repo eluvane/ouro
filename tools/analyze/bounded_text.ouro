@@ -1,0 +1,210 @@
+-- Pure bounded-analyzer-runner policy: fixture keep, batch-versus-direct,
+-- and scope-guard messages. No IO and no process spawning; the process
+-- supervisor in bounded_run.ouro is not present yet. Banner, skeleton and
+-- drive-record text policy stay in scripts/analyze_bounded.py until that
+-- supervisor consumes them.
+--
+-- Every decision here mirrors scripts/analyze_bounded.py scope ordering,
+-- guard messages and the batch-versus-direct policy.
+
+import "../../std/data.ouro";
+import "../../std/listx.ouro";
+import "../../std/collections.ouro";
+import "../../std/string.ouro";
+import "../../std/stringx.ouro";
+import "model.ouro";
+
+-- Scope safety limits shared with scripts/analyze_bounded.py.
+def bounded_byte_unit : Nat := 256;
+def bounded_drive_file_units : Nat := 160;
+def bounded_max_global_files : Nat := 8;
+def bounded_max_global_bytes : Nat := mul bounded_byte_unit bounded_byte_unit;
+def bounded_max_drive_file_bytes : Nat := mul bounded_drive_file_units bounded_byte_unit;
+
+-- Families of ouro-analyze-drive; one flag per family plus the unions.
+-- --enable-style is expanded by the shell wrapper before the runner sees it.
+def bounded_drive_flags : List String :=
+  [ "--enable-effects", "--enable-capability", "--enable-extract", "--enable-match"
+  , "--enable-cfg", "--enable-dataflow", "--enable-semantic", "--enable-property"
+  , "--enable-absint", "--enable-symexec", "--enable-taint", "--enable-contracts"
+  , "--enable-metrics", "--enable-duplication", "--enable-trust", "--enable-simplify"
+  , "--enable-perf", "--enable-naming", "--enable-errors", "--enable-light"
+  , "--enable-heavy", "--enable-strict", "--enable-all" ];
+
+-- Base-runner flags that hold every file in one process and need the
+-- global-scope guard.
+def bounded_global_flags : List String :=
+  [ "--dump-facts", "--enable-deadcode", "--enable-heavy", "--enable-all"
+  , "--enable-trust", "--architecture-only" ];
+
+-- True when any forwarded flag is in the given table.
+def bounded_has_flag (table : List String) : List String -> Bool :=
+  fix has (flags : List String) : Bool :=
+    match flags with
+    | Nil => False
+    | Cons f rest =>
+        match elem String str_eq f table with
+        | True => True
+        | False => has rest
+        end
+    end;
+
+-- Sorted unique table members of the forwarded flags, for guard messages.
+def bounded_flags_of (table : List String) (flags : List String) : List String :=
+  dedup_adjacent String str_eq
+    (sort_insert String prim_string_le
+      (filter String (fun (f : String) => elem String str_eq f table) flags));
+
+-- One in-scope source: repo-relative spelling, canonical absolute path,
+-- byte size, UTF-8 validity and suppression presence.
+inductive BoundedFile : Type :=
+  | MkBoundedFile : String -> String -> Nat -> Bool -> Bool -> BoundedFile;
+
+def bounded_file_rel (f : BoundedFile) : String :=
+  match f with | MkBoundedFile rel _ _ _ _ => rel end;
+
+def bounded_file_size (f : BoundedFile) : Nat :=
+  match f with | MkBoundedFile _ _ size _ _ => size end;
+
+def bounded_file_valid (f : BoundedFile) : Bool :=
+  match f with | MkBoundedFile _ _ _ valid _ => valid end;
+
+def bounded_file_suppressed (f : BoundedFile) : Bool :=
+  match f with | MkBoundedFile _ _ _ _ supp => supp end;
+
+def bounded_files_bytes : List BoundedFile -> Nat :=
+  fix go (files : List BoundedFile) : Nat :=
+    match files with
+    | Nil => Z
+    | Cons f rest => add (bounded_file_size f) (go rest)
+    end;
+
+-- Batching policy: global flags, tiny scopes and suppression-bearing scopes
+-- run the worker directly; anything else runs the bounded per-file passes.
+def bounded_should_batch (flags : List String)
+    (files : List BoundedFile) : Bool :=
+  match bounded_has_flag bounded_global_flags flags with
+  | True => False
+  | False =>
+      let shards : Bool :=
+        any BoundedFile
+          (fun (f : BoundedFile) => str_starts (bounded_file_rel f) "std/")
+          files in
+      let file_count : Nat := length BoundedFile files in
+      match andb (ltb_nat file_count 2) (notb shards) with
+      | True => False
+      | False =>
+          match andb (andb (leb_nat file_count 8)
+              (leb_nat (bounded_files_bytes files) bounded_max_global_bytes))
+              (notb shards) with
+          | True => False
+          | False =>
+              match any BoundedFile
+                  (fun (f : BoundedFile) => notb (bounded_file_valid f))
+                  files with
+              | True => False
+              | False =>
+                  notb
+                    (any BoundedFile bounded_file_suppressed files)
+              end
+          end
+      end
+  end;
+
+-- Guard messages are byte-exact with the Python runner.
+def bounded_global_scope_error (flags : List String) (allow_unbounded : Bool)
+    (nfiles : Nat) (nbytes : Nat) : Maybe String :=
+  let triggering : List String := bounded_flags_of bounded_global_flags flags in
+  match triggering with
+  | Nil => Nothing String
+  | Cons _ _ =>
+      match allow_unbounded with
+      | True => Nothing String
+      | False =>
+          match andb (leb_nat nfiles bounded_max_global_files)
+              (leb_nat nbytes bounded_max_global_bytes) with
+          | True => Nothing String
+          | False =>
+              Just String
+                (str_concat "ANALYZE_FAIL: global analyzer flags require a bounded scope (files="
+                  (str_concat (str_of_nat nfiles)
+                    (str_concat " bytes=" (str_concat (str_of_nat nbytes)
+                      (str_concat " limit-files="
+                        (str_concat (str_of_nat bounded_max_global_files)
+                          (str_concat " limit-bytes="
+                            (str_concat (str_of_nat bounded_max_global_bytes)
+                              (str_concat " flags="
+                                (str_concat (str_join "," triggering)
+                                  "); narrow --scope or set OURO_ANALYZE_ALLOW_UNBOUNDED=1 on a dedicated host"))))))))))
+          end
+      end
+  end;
+
+def bounded_drive_scope_error_go : List BoundedFile -> List String
+    -> Maybe String :=
+  fix go (files : List BoundedFile) (triggering : List String)
+      : Maybe String :=
+    match files with
+    | Nil => Nothing String
+    | Cons f rest =>
+        match ltb_nat bounded_max_drive_file_bytes (bounded_file_size f) with
+        | False => go rest triggering
+        | True =>
+            Just String
+              (str_concat "ANALYZE_FAIL: structured analyzer file exceeds the local safety limit (file="
+                (str_concat (bounded_file_rel f)
+                  (str_concat " bytes="
+                    (str_concat (str_of_nat (bounded_file_size f))
+                      (str_concat " limit-bytes="
+                        (str_concat (str_of_nat bounded_max_drive_file_bytes)
+                          (str_concat " flags="
+                            (str_concat (str_join "," triggering)
+                              "); split the source or set OURO_ANALYZE_ALLOW_UNBOUNDED=1 on a dedicated host"))))))))
+        end
+    end;
+
+def bounded_drive_scope_error (flags : List String) (allow_unbounded : Bool)
+    (files : List BoundedFile) : Maybe String :=
+  let triggering : List String := bounded_flags_of bounded_drive_flags flags in
+  match triggering with
+  | Nil => Nothing String
+  | Cons _ _ =>
+      match allow_unbounded with
+      | True => Nothing String
+      | False => bounded_drive_scope_error_go files triggering
+      end
+  end;
+
+def bounded_empty_input_message : String :=
+  "ANALYZE_FAIL: empty input or unavailable native family selection";
+
+-- Fixture policy reuses the analyzer model so the runner excludes exactly
+-- the sources the workers would exclude.
+def bounded_keep (include_fixtures : Bool) (rel : String) : Bool :=
+  match include_fixtures with
+  | True => True
+  | False => notb (is_fixture rel)
+  end;
+
+-- Documented public policy root for the future bounded_run supervisor.
+-- Python scripts/analyze_bounded.py still owns process IO. This entry
+-- applies keep, both scope guards, then the batch-versus-direct decision.
+def bounded_run (include_fixtures : Bool) (flags : List String)
+    (files : List BoundedFile) (allow_unbounded : Bool)
+    (rel : String) : Pair (Maybe String) Bool :=
+  match bounded_keep include_fixtures rel with
+  | False =>
+      MkPair (Maybe String) Bool (Just String bounded_empty_input_message) False
+  | True =>
+      match bounded_global_scope_error flags allow_unbounded
+          (length BoundedFile files) (bounded_files_bytes files) with
+      | Just err => MkPair (Maybe String) Bool (Just String err) False
+      | Nothing =>
+          match bounded_drive_scope_error flags allow_unbounded files with
+          | Just err => MkPair (Maybe String) Bool (Just String err) False
+          | Nothing =>
+              MkPair (Maybe String) Bool (Nothing String)
+                (bounded_should_batch flags files)
+          end
+      end
+  end;

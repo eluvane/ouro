@@ -26,6 +26,9 @@ if ! "$CC_BIN" -O1 -std=c99 -D_POSIX_C_SOURCE=200809L \
 	echo "RUNTIME_IO_SUITE: FAIL C IO self-test build" >&2
 	exit 1
 fi
+if [ -f "$IO_SELFTEST.exe" ]; then
+	IO_SELFTEST="$IO_SELFTEST.exe"
+fi
 if ! "$IO_SELFTEST" >"$OUT/io-selftest.out" 2>"$OUT/io-selftest.err"; then
 	cat "$OUT/io-selftest.out" >&2
 	cat "$OUT/io-selftest.err" >&2
@@ -38,6 +41,8 @@ if ! grep -q 'OURO_IO_SELFTEST: PASS' "$OUT/io-selftest.out"; then
 	exit 1
 fi
 echo "RUNTIME_IO_C_SELFTEST: PASS"
+"$PYTHON" scripts/fs_replace_suite.py --driver "$IO_SELFTEST" --out "$OUT/source-replacement"
+"$PYTHON" scripts/fs_read_suite.py --driver "$IO_SELFTEST" --mode raw --out "$OUT/source-reading"
 
 SUITE="$OUT/ouro-test-suite"
 OURO_TEST_CHECK="$ROOT/scripts/ouro1.sh"

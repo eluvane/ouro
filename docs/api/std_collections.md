@@ -2,7 +2,7 @@
 
 Practical collection helpers layered over the small prelude/listx core.
 
-Declarations: 22.
+Declarations: 18.
 
 ## def nth_maybe
 
@@ -20,12 +20,6 @@ def list_get_or (A : Type) (fallback : A) (i : Nat) (xs : List A) : A
 
 ```
 def filter_map (A : Type) (B : Type) (f : A -> Maybe B) : List A -> List B
-```
-
-## def map_indexed_go
-
-```
-def map_indexed_go (A : Type) (B : Type) (f : Nat -> A -> B)
 ```
 
 ## def map_indexed
@@ -50,12 +44,6 @@ def find_index (A : Type) (p : A -> Bool) (xs : List A) : Maybe Nat
 
 ```
 def split_at (A : Type) (n : Nat) (xs : List A) : Pair (List A) (List A)
-```
-
-## def chunks_of_go
-
-```
-def chunks_of_go (A : Type) (n : Nat) : Nat -> List A -> List (List A)
 ```
 
 ## def chunks_of
@@ -94,22 +82,10 @@ def list_take_last (A : Type) (n : Nat) (xs : List A) : List A
 def list_drop_last (A : Type) (n : Nat) (xs : List A) : List A
 ```
 
-## def adjacent_pairs_go
-
-```
-def adjacent_pairs_go (A : Type) (prev : A) : List A -> List (Pair A A)
-```
-
 ## def adjacent_pairs
 
 ```
 def adjacent_pairs (A : Type) : List A -> List (Pair A A)
-```
-
-## def dedup_adjacent_go
-
-```
-def dedup_adjacent_go (A : Type) (eq : A -> A -> Bool)
 ```
 
 ## def dedup_adjacent

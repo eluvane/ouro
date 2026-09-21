@@ -5,10 +5,16 @@
 -- @entry main
 
 import "pipeline.ouro";
+import "literal_spans.ouro";
+import "scan.ouro";
+import "all_rules.ouro";
+import "candidate_check.ouro";
+import "../quality/source_write.ouro";
 import "../../std/io.ouro";
 import "../../std/fs.ouro";
 import "../../std/args.ouro";
 import "../../std/stringx.ouro";
+import "../../std/pathx.ouro";
 
 -- Bounded import traversal steps, including already-seen queue entries.
 -- Exhaustion is an error, never permission to rewrite with partial facts.
@@ -67,7 +73,7 @@ def fx_cone_ctors (path : String) (src : String) : IO (Either FxConeError (List 
 
 def fx_count_text (edits : List FxEdit) : String :=
     let n : Nat := length FxEdit edits in
-    str_cat3 (show_nat n) " edit" (match eqNat n (S Z) with | True => "" | False => "s" end);
+    str_cat3 (prim_string_of_nat n) " edit" (match eqNat n (S Z) with | True => "" | False => "s" end);
 
 def fx_change_text (edits : List FxEdit) : String :=
     match edits with
@@ -75,8 +81,8 @@ def fx_change_text (edits : List FxEdit) : String :=
     | Cons _ _ => str_cat3 "fixes (" (fx_count_text edits) ")"
     end;
 
-def fx_write (path : String) (out : String) (edits : List FxEdit) : IO Bool :=
-    do let! written := fs_write_checked path out;
+def fx_write (path : String) (original : String) (out : String) (edits : List FxEdit) : IO Bool :=
+    do let! written := quality_write_source_checked path original out;
        match written with
        | Left e =>
            do eprintln (str_cat3 path ": " (fs_error_message e));
@@ -87,7 +93,7 @@ def fx_write (path : String) (out : String) (edits : List FxEdit) : IO Bool :=
               io_pure Bool True
        end
 
-def fx_changed (a : Args) (path : String) (out : String) (edits : List FxEdit) : IO Bool :=
+def fx_changed (a : Args) (path : String) (original : String) (out : String) (edits : List FxEdit) : IO Bool :=
     match args_flag a "check" with
     | True =>
         do eprintln (str_cat3 path ": needs " (fx_change_text edits));
@@ -95,12 +101,54 @@ def fx_changed (a : Args) (path : String) (out : String) (edits : List FxEdit) :
            io_pure Bool False
     | False =>
         match args_flag a "write" with
-        | True => fx_write path out edits
+        | True => fx_write path original out edits
         | False =>
             do print out;
                io_pure Bool True
         end
     end
+
+def fx_checked_outcome (a : Args) (path : String) (src : String) (outcome : FxOutcome) : IO Bool :=
+    match outcome with
+    | MkFxOutcome out edits =>
+        do let! accepted := fx_check_candidate path (fx_check_source src) out;
+           match accepted with
+           | Left error =>
+               do eprintln (fs_error_message error);
+                  io_pure Bool False
+           | Right _ => match str_eq src out with
+             | True =>
+                 match orb (args_flag a "check") (args_flag a "write") with
+                 | True => io_pure Bool True
+                 | False => do print out; io_pure Bool True
+                 end
+             | False => fx_changed a path src out edits
+             end
+           end
+    end;
+
+-- No class of edits can become a published candidate without a fresh
+-- compiler-worker parse/resolve/type check. Verification uses the in-memory
+-- snapshot; writes remain atomic and guarded by original-file identity.
+def fx_verify_classes (path : String) (ctors : List String)
+    : Nat -> String -> IO (Either FsError Unit) :=
+  fix go (fuel : Nat) (src : String) : IO (Either FsError Unit) :=
+    match fx_checked_round ctors src with
+    | Left cause => fs_err Unit (FsOperationFailed (fx_prepare_error_message cause) path)
+    | Right round => match round with
+      | MkPair out edits => match edits with
+        | Nil => fs_ok Unit MkUnit
+        | Cons _ _ => match fuel with
+          | Z => fs_err Unit (FsOperationFailed "fix class verification exhausted its budget" path)
+          | S remaining => do let! checked := fx_check_candidate path (fx_check_source src) out;
+              match checked with
+              | Left error => io_pure (Either FsError Unit) (Left FsError Unit error)
+              | Right _ => go remaining out
+              end
+          end
+        end
+      end
+    end;
 
 def fx_loaded (a : Args) (path : String) (src : String) : IO Bool :=
     do let! visibility := fx_cone_ctors path src;
@@ -114,19 +162,20 @@ def fx_loaded (a : Args) (path : String) (src : String) : IO Bool :=
                do eprintln (str_cat3 path ": " (fx_prepare_error_message e));
                   io_pure Bool False
            | Right outcome =>
-               match outcome with
-               | MkFxOutcome out edits =>
-                   match str_eq src out with
-                   | True =>
-                       match orb (args_flag a "check") (args_flag a "write") with
-                       | True => io_pure Bool True
-                       | False =>
-                           do print out;
-                              io_pure Bool True
-                       end
-                   | False => fx_changed a path out edits
-                   end
-               end
+               let final : String := fx_outcome_text outcome in
+               let review : List FxEdit := fx_review_proposals final
+                 (fx_apply_all_rules final (append String (fx_local_ctors final) ctors) (fx_lex final)) in
+               do match review with
+                  | Nil => io_pure Unit MkUnit
+                  | Cons _ _ => do eprintln (str_cat3 path ": review-required suggestions (not applied): " (fx_count_text review));
+                                   eprintln (str_unlines (fx_report path review))
+                  end;
+                  let! verified := fx_verify_classes path (append String (fx_local_ctors src) ctors) fx_rounds src;
+                  match verified with
+                  | Left error => do eprintln (fs_error_message error); io_pure Bool False
+                  | Right _ => do let! changed := fx_checked_outcome a path src outcome;
+                      io_pure Bool (andb changed (notb (andb (args_flag a "check") (notb (nullb FxEdit review)))))
+                  end
            end
        end
 
@@ -168,9 +217,20 @@ def fx_fixture_name (entry : String) : Maybe String :=
     | True => Just String (str_slice entry Z (sub (str_len entry) 3))
     end;
 
+def fx_filter_map_string (f : String -> Maybe String) : List String -> List String :=
+  fix go (xs : List String) : List String :=
+    match xs with
+    | Nil => Nil String
+    | Cons x rest =>
+        match f x with
+        | Nothing => go rest
+        | Just y => Cons String y (go rest)
+        end
+    end;
+
 def fx_fixture_names (fixtures : String) : IO (List String) :=
     do let! entries := fs_list fixtures;
-       io_pure (List String) (str_sort (filter_map String String fx_fixture_name entries))
+       io_pure (List String) (str_sort (fx_filter_map_string fx_fixture_name entries))
 
 def fx_selftest_lf (text : String) : String :=
     str_replace text "\r" "";
@@ -292,10 +352,10 @@ def run_fix_selftest (a : Args) : IO Unit :=
               match andb safe
                   (andb ok (match names with | Nil => False | Cons _ _ => True end)) with
               | True => do println (str_cat3 "FIX_SUITE: PASS rows="
-                            (show_nat (length String names)) (str_concat " out=" out));
+                            (prim_string_of_nat (length String names)) (str_concat " out=" out));
                            exit Z
               | False => do eprintln (str_cat3 "FIX_SUITE: FAIL rows="
-                            (show_nat (length String names)) "");
+                            (prim_string_of_nat (length String names)) "");
                             exit (S Z)
               end
        end
@@ -303,10 +363,46 @@ def run_fix_selftest (a : Args) : IO Unit :=
 def fx_switches : List String :=
     [ "check", "write", "selftest" ];
 
+def fx_selftest_option_valid (a : Args) (name : String) : Bool :=
+    andb (str_set_mem name (["out", "fixtures"] : List String))
+      (notb (str_null (args_opt_or a name "")));
+
+def fx_mode_args_valid (a : Args) : Bool :=
+    match args_flag a "selftest" with
+    | True =>
+        andb (all String (fun (name : String) => str_eq name "selftest")
+          (args_flags a))
+          (andb (all String (fx_selftest_option_valid a)
+            (map_keys String (args_opts a)))
+            (match args_positional a with | Nil => True | Cons _ _ => False end))
+    | False =>
+        andb (notb (andb (args_flag a "check") (args_flag a "write")))
+          (andb (all String
+            (fun (name : String) => str_set_mem name (["check", "write"] : List String))
+            (args_flags a))
+            (match map_keys String (args_opts a) with
+             | Nil => True
+             | Cons _ _ => False
+             end))
+    end;
+
+def fx_cli (argv : List String) : IO Unit :=
+    let a : Args := args_of_argv_bools fx_switches argv in
+    match andb (args_argv_options_complete fx_switches argv) (fx_mode_args_valid a) with
+    | False =>
+        do eprintln "fix: invalid arguments";
+           eprintln "usage: ouro-fix [--check | --write] FILE...";
+           exit 2
+    | True =>
+        match args_flag a "selftest" with
+        | True => run_fix_selftest a
+        | False => fx_run a
+        end
+    end;
+
 def main : IO Unit :=
     do let! argv := prim_argv;
-       let a : Args := args_of_argv_bools fx_switches argv in
-       match args_flag a "selftest" with
-       | True => run_fix_selftest a
-       | False => fx_run a
+       match str_eq (nth String "" (S Z) argv) "--literal-spans" with
+       | True => fx_literal_run (tail String (tail String argv))
+       | False => fx_cli argv
        end

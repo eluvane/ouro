@@ -2,24 +2,18 @@
 -- 40, padded allocation size. Indexed accesses retain the managed owner in
 -- MIR; no interior raw pointer can outlive its object or cross a safepoint.
 import "managed_raw.ouro";
-
-def managed_string_size (compiler : ManagedCompiler) (value : MirValue) (state : ManagedState)
-    : Either NativeLowerError ManagedResult :=
-    lower_bind ManagedState ManagedResult (managed_expect_descriptor compiler 6 value state)
-      (fun (checked : ManagedState) => lower_bind ManagedResult ManagedResult (managed_load MirUSize value 8 checked)
-        (fun (allocated : ManagedResult) => match allocated with | ManagedResultOf bytes next =>
-          lower_bind ManagedResult ManagedResult (managed_compare MirGreaterEqual bytes (managed_bits MirUSize 40) next)
-            (fun (tested : ManagedResult) => match tested with | ManagedResultOf valid after_test =>
-              lower_bind ManagedState ManagedResult (managed_guard valid after_test)
-                (fun (bounded : ManagedState) => lower_bind ManagedResult ManagedResult
-                  (managed_binary MirUSize MirSub bytes (managed_bits MirUSize 40) bounded)
-                  (fun (capacity : ManagedResult) => match capacity with | ManagedResultOf available after_capacity =>
-                    lower_bind ManagedResult ManagedResult (managed_load MirUSize value 32 after_capacity)
-                      (fun (loaded : ManagedResult) => match loaded with | ManagedResultOf length after_length =>
-                        lower_bind ManagedResult ManagedResult (managed_compare MirLessEqual length available after_length)
-                          (fun (fit : ManagedResult) => match fit with | ManagedResultOf valid_length after_fit =>
-                            lower_map ManagedState ManagedResult (fun (finished : ManagedState) => ManagedResultOf length finished)
-                              (managed_guard valid_length after_fit) end) end) end)) end) end));
+import "managed_string_ops.ouro";
+import "managed_model.ouro";
+import "mir_model.ouro";
+import "x64.ouro";
+import "pe_model.ouro";
+import "lower_model.ouro";
+import "codegen_model.ouro";
+import "../primitive_model.ouro";
+import "../file_check_model.ouro";
+import "../pipeline_abi.ouro";
+import "lower_loop.ouro";
+import "lower_ops.ouro";
 
 def managed_string_allocate (compiler : ManagedCompiler) (length : MirValue) (state : ManagedState)
     : Either NativeLowerError ManagedResult :=
@@ -38,33 +32,6 @@ def managed_string_allocate (compiler : ManagedCompiler) (length : MirValue) (st
                             (managed_emit (MirStore value (codegen_disp 32) length) after) end)
                         (managed_allocate_sized compiler 6 bytes after_size) end) end)) end) end);
 
--- This loop contains no allocation or call. Every access mentions its owner,
--- so allocation before the loop keeps source and destination live.
-def managed_bytes_copy (source : MirValue) (source_offset : MirValue) (target : MirValue)
-    (target_offset : MirValue) (count : MirValue) (state : ManagedState) : Either NativeLowerError ManagedState :=
-    lower_bind (Pair Nat ManagedState) ManagedState (managed_fresh_local MirUSize state)
-      (fun (cell : Pair Nat ManagedState) => match cell with | MkPair index after_cell =>
-        lower_bind LowerLoopBlocks ManagedState
-          (lower_loop_blocks (managed_flow (managed_emit (MirMove index (managed_bits MirUSize 0)) after_cell)))
-          (fun (labels : LowerLoopBlocks) => match labels with | LowerLoopAt header body finish flow =>
-            lower_bind ManagedResult ManagedState (managed_compare MirLess (MirUse index) count
-              (managed_with_flow after_cell (lower_switch_block header (MirJump header) flow)))
-              (fun (tested : ManagedResult) => match tested with | ManagedResultOf running after_test =>
-                lower_bind ManagedResult ManagedState
-                  (managed_binary MirUSize MirAdd source_offset (MirUse index)
-                    (managed_switch_block body (MirBranch running body finish) after_test))
-                  (fun (at_source : ManagedResult) => match at_source with | ManagedResultOf read_offset next =>
-                    lower_bind ManagedResult ManagedState
-                      (managed_fresh MirU8 (fun (local : Nat) => MirLoadAt local source read_offset) next)
-                      (fun (loaded : ManagedResult) => match loaded with | ManagedResultOf byte after_load =>
-                        lower_bind ManagedResult ManagedState
-                          (managed_binary MirUSize MirAdd target_offset (MirUse index) after_load)
-                          (fun (at_target : ManagedResult) => match at_target with | ManagedResultOf write_offset after_target =>
-                            Right NativeLowerError ManagedState (managed_switch_block finish (MirJump header)
-                              (managed_emit_all ([MirStoreAt target write_offset byte,
-                                MirBinaryOp index MirAdd (MirUse index) (managed_bits MirUSize 1)] : List MirInstruction) after_target))
-                            end) end) end) end) end) end);
-
 def managed_string_literal (compiler : ManagedCompiler) (bytes : List Nat) (state : ManagedState)
     : Either NativeLowerError ManagedResult :=
     let count : Nat := length Nat bytes in
@@ -81,25 +48,6 @@ def managed_string_literal (compiler : ManagedCompiler) (bytes : List Nat) (stat
                   lower_map ManagedState ManagedResult (fun (finished : ManagedState) => ManagedResultOf value finished)
                     (managed_bytes_copy source (managed_bits MirUSize 0) value (managed_bits MirUSize 40)
                       (managed_bits MirUSize count) after_address) end) end) end));
-
--- Both alternatives assign one typed result before joining their control flow.
-def managed_string_choose (typ : MirType) (condition : MirValue)
-    (yes : ManagedState -> Either NativeLowerError ManagedResult)
-    (no : ManagedState -> Either NativeLowerError ManagedResult) (state : ManagedState)
-    : Either NativeLowerError ManagedResult :=
-    lower_bind (Pair Nat ManagedState) ManagedResult (managed_fresh_local typ state)
-      (fun (cell : Pair Nat ManagedState) => match cell with | MkPair result after_cell =>
-        lower_bind LowerLoopBlocks ManagedResult (lower_loop_blocks (managed_flow after_cell))
-          (fun (labels : LowerLoopBlocks) => match labels with | LowerLoopAt selected rejected finish flow =>
-            lower_bind ManagedResult ManagedResult
-              (yes (managed_with_flow after_cell (lower_switch_block selected (MirBranch condition selected rejected) flow)))
-              (fun (first : ManagedResult) => match first with | ManagedResultOf value after_first =>
-                lower_bind ManagedResult ManagedResult
-                  (no (managed_switch_block rejected (MirJump finish) (managed_emit (MirMove result value) after_first)))
-                  (fun (second : ManagedResult) => match second with | ManagedResultOf other after_second =>
-                    Right NativeLowerError ManagedResult (ManagedResultOf (MirUse result)
-                      (managed_switch_block finish (MirJump finish) (managed_emit (MirMove result other) after_second)))
-                    end) end) end) end);
 
 def managed_bytes_equal (left : MirValue) (left_offset : MirValue) (right : MirValue)
     (right_offset : MirValue) (count : MirValue) (state : ManagedState) : Either NativeLowerError ManagedResult :=

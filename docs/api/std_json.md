@@ -2,13 +2,7 @@
 
 JSON helpers are prefixed because imports flatten into one namespace.
 
-Declarations: 34.
-
-## inductive Json
-
-```
-inductive Json : Type
-```
+Declarations: 33.
 
 ## inductive ParseR
 

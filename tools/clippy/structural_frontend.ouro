@@ -1,0 +1,236 @@
+-- One compiler-owned source preparation, lex, parse, and fact build per file.
+-- There is no textual fallback and no Python semantic decision at this boundary.
+-- Import/type inference outside the local structural slice is not claimed here.
+
+import "structural_walk.ouro";
+import "../../compiler/lexer.ouro";
+import "../../compiler/token.ouro";
+import "../../compiler/parser.ouro";
+import "../../compiler/preprocess_import.ouro";
+import "../../compiler/preprocess_record.ouro";
+
+inductive CgSUnit : Type :=
+  | MkCgSUnit : InternState -> Nat -> CgSState -> CgSUnit;
+
+def cg_s_parse_expanded (codes : List Nat) : Either QualityInputError CgSUnit :=
+    let fuel : Nat := add (length Nat codes) cg_s_lex_fuel_pad in
+    match lex_all fuel codes with
+    | LexMalformed _ => Left QualityInputError CgSUnit (QualityInvalidInput "compiler lexer rejected malformed source")
+    | LexExhausted _ => Left QualityInputError CgSUnit (QualityInvalidInput "compiler lexer exhausted its traversal budget")
+    | LexOk tokens intern =>
+        let token_count : Nat := length Token tokens in
+        match parse_file parse fuel tokens 0 with
+        | PErr position => Left QualityInputError CgSUnit
+            (QualityInvalidInput (prim_string_concat "compiler parser failed at preprocessed token "
+              (prim_string_of_nat position)))
+        | POk decls remaining _ =>
+          let complete : Bool := match remaining with
+            | Nil => True
+            | Cons tok _ => match tok with
+              | TEof => True
+              | TIdent _ => False
+              | TNat _ => False
+              | TKeyword _ => False
+              | TType _ => False
+              | TColon => False
+              | TColonEq => False
+              | TArrow => False
+              | TFatArrow => False
+              | TBar => False
+              | TLparen => False
+              | TRparen => False
+              | TSemi => False
+              | THole _ => False
+              | TString _ => False
+              | TComma => False
+              | TBraceL => False
+              | TBraceR => False
+              | TExclam => False
+              | TBind => False
+              | TPipe => False
+              | TBracketL => False
+              | TBracketR => False
+              end
+            end in
+          match complete with
+          | False => Left QualityInputError CgSUnit (QualityInvalidInput "compiler parser left an incomplete source unit")
+          | True => match cg_s_build fuel decls with
+            | Left error => Left QualityInputError CgSUnit
+                (QualityInvalidInput (prim_string_concat "structural facts incomplete: "
+                  (quality_input_message error)))
+            | Right facts => Right QualityInputError CgSUnit (MkCgSUnit intern token_count facts)
+            end
+          end
+        end
+    end;
+
+-- The compiler parser does not accept `_` as a binder. Discard-let fixtures
+-- and the lexical REDUNDANT-007 / CHECKED-006 rules still use `let _ :=`.
+-- Rewrite only that binder so the companion can return proofs; real parse
+-- failures stay FRONTEND-001. Lexical scanners keep the original source.
+def cg_s_rewrite_discard_binders (source : String) : String :=
+    prim_string_replace
+      (prim_string_replace source "let _ :=" "let cg_s_discard :=")
+      "let _:=" "let cg_s_discard :=";
+
+def cg_s_frontend_source (source : String) : Either QualityInputError CgSUnit :=
+    match preprocess_imports (prim_string_to_char_codes source) with
+    | ImpErr code position => Left QualityInputError CgSUnit
+        (QualityInvalidInput (prim_string_concat "compiler import preprocessing failed: code "
+          (prim_string_concat (prim_string_of_nat code)
+            (prim_string_concat "; detail " (prim_string_of_nat position)))))
+    | ImpOk imported => match preprocess_records imported with
+      | PrepErr code position => Left QualityInputError CgSUnit
+          (QualityInvalidInput (prim_string_concat "compiler record preprocessing failed: code "
+            (prim_string_concat (prim_string_of_nat code)
+              (prim_string_concat "; detail " (prim_string_of_nat position)))))
+      | PrepOk expanded => cg_s_parse_expanded expanded
+      end
+    end;
+
+def cg_s_frontend (source : String) : Either QualityInputError CgSUnit :=
+    match cg_s_frontend_source source with
+    | Right unit => Right QualityInputError CgSUnit unit
+    | Left error =>
+        let rewritten : String := cg_s_rewrite_discard_binders source in
+        match prim_string_eq rewritten source with
+        | True => Left QualityInputError CgSUnit error
+        | False => cg_s_frontend_source rewritten
+        end
+    end;
+
+-- Clippy semantic-unit parse. Lives here so semantic_unit.ouro does not
+-- keep-import lexer/preprocess when it is the selected file.
+def cm_discard_tokens : List Token -> Bool -> InternState
+    -> Pair (List Token) InternState :=
+  fix go (tokens : List Token) (after_let : Bool) (intern : InternState)
+      : Pair (List Token) InternState :=
+    match tokens with
+    | Nil => MkPair (List Token) InternState (Nil Token) intern
+    | Cons token rest =>
+        let next : Bool := match token with
+          | TKeyword k => eq_nat k kwLet
+          | TIdent _ => False
+          | TNat _ => False
+          | TType _ => False
+          | TColon => False
+          | TColonEq => False
+          | TArrow => False
+          | TFatArrow => False
+          | TBar => False
+          | TLparen => False
+          | TRparen => False
+          | TSemi => False
+          | THole _ => False
+          | TString _ => False
+          | TComma => False
+          | TBraceL => False
+          | TBraceR => False
+          | TExclam => after_let
+          | TEof => False
+          | TBind => False
+          | TPipe => False
+          | TBracketL => False
+          | TBracketR => False
+          end in
+        let rewritten : Pair Token InternState := match token with
+          | THole hole => match after_let with
+            | False => MkPair Token InternState token intern
+            | True => match hole with
+              | Just _ => MkPair Token InternState token intern
+              | Nothing => match intern with
+              | MkIntern _ fresh _ _ => match intern_ident intern
+                  (prim_string_to_char_codes (prim_string_concat "$clippy-discard#"
+                    (prim_string_of_nat fresh))) with
+                | MkPair id updated => MkPair Token InternState (TIdent id) updated
+                end
+              end
+              end
+            end
+          | TIdent _ => MkPair Token InternState token intern
+          | TNat _ => MkPair Token InternState token intern
+          | TKeyword _ => MkPair Token InternState token intern
+          | TType _ => MkPair Token InternState token intern
+          | TColon => MkPair Token InternState token intern
+          | TColonEq => MkPair Token InternState token intern
+          | TArrow => MkPair Token InternState token intern
+          | TFatArrow => MkPair Token InternState token intern
+          | TBar => MkPair Token InternState token intern
+          | TLparen => MkPair Token InternState token intern
+          | TRparen => MkPair Token InternState token intern
+          | TSemi => MkPair Token InternState token intern
+          | TString _ => MkPair Token InternState token intern
+          | TComma => MkPair Token InternState token intern
+          | TBraceL => MkPair Token InternState token intern
+          | TBraceR => MkPair Token InternState token intern
+          | TExclam => MkPair Token InternState token intern
+          | TEof => MkPair Token InternState token intern
+          | TBind => MkPair Token InternState token intern
+          | TPipe => MkPair Token InternState token intern
+          | TBracketL => MkPair Token InternState token intern
+          | TBracketR => MkPair Token InternState token intern
+          end in
+        match rewritten with
+        | MkPair head updated => match go rest next updated with
+          | MkPair tail_tokens final => MkPair (List Token) InternState
+              (Cons Token head tail_tokens) final
+          end
+        end
+    end;
+
+def cm_parse (source : String) (intern : InternState)
+    : Either QualityInputError (Pair (List Decl) InternState) :=
+    match preprocess_imports (prim_string_to_char_codes source) with
+    | ImpErr _code position => Left QualityInputError (Pair (List Decl) InternState)
+        (QualityInvalidInput (prim_string_concat "import preprocessing failed: " (prim_string_of_nat position)))
+    | ImpOk imported => match preprocess_records imported with
+      | PrepErr _code position => Left QualityInputError (Pair (List Decl) InternState)
+          (QualityInvalidInput (prim_string_concat "record preprocessing failed: " (prim_string_of_nat position)))
+      | PrepOk expanded =>
+          let fuel : Nat := add (length Nat expanded) cg_s_lex_fuel_pad in
+          match lex_go fuel expanded intern (Nil Token) with
+          | LexMalformed _ => Left QualityInputError (Pair (List Decl) InternState) (QualityInvalidInput "compiler lexer rejected source")
+          | LexExhausted _ => Left QualityInputError (Pair (List Decl) InternState) (QualityInvalidInput "compiler lexer exhausted")
+          | LexOk raw lexed => match cm_discard_tokens raw False lexed with
+            | MkPair tokens updated => match parse_file parse fuel tokens 0 with
+              | PErr position => Left QualityInputError (Pair (List Decl) InternState)
+                  (QualityInvalidInput (prim_string_concat "compiler parser failed at token " (prim_string_of_nat position)))
+              | POk decls remaining _ =>
+                  let complete : Bool := match remaining with
+                    | Nil => True
+                    | Cons tok _ => match tok with
+                      | TEof => True
+                      | TIdent _ => False
+                      | TNat _ => False
+                      | TKeyword _ => False
+                      | TType _ => False
+                      | TColon => False
+                      | TColonEq => False
+                      | TArrow => False
+                      | TFatArrow => False
+                      | TBar => False
+                      | TLparen => False
+                      | TRparen => False
+                      | TSemi => False
+                      | THole _ => False
+                      | TString _ => False
+                      | TComma => False
+                      | TBraceL => False
+                      | TBraceR => False
+                      | TExclam => False
+                      | TBind => False
+                      | TPipe => False
+                      | TBracketL => False
+                      | TBracketR => False
+                      end
+                    end in
+                  match complete with
+                | False => Left QualityInputError (Pair (List Decl) InternState) (QualityInvalidInput "incomplete parsed source")
+                | True => Right QualityInputError (Pair (List Decl) InternState)
+                    (MkPair (List Decl) InternState decls updated)
+                end
+              end
+            end
+          end
+      end
+    end;

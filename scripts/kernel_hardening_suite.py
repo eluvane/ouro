@@ -50,6 +50,7 @@ def main() -> int:
                 raise ValueError(f'{name}: status={result["status"]} exit={result["returncode"]}')
 
         run([sys.executable, '-B', 'scripts/kernel_profile_test.py'], 'profile-policy-tests')
+        run([sys.executable, '-B', 'scripts/kernel_scale_test.py'], 'scale-policy-tests')
 
         repo_gate = args.repo_gate.resolve() if args.repo_gate else work / ('ouro-repo-gate.exe' if sys.platform == 'win32' else 'ouro-repo-gate')
         if args.repo_gate is None:

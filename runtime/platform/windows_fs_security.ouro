@@ -1,0 +1,101 @@
+-- Source replacement keeps the original owner and primary group. ReplaceFileW
+-- merges DACLs, but does not promise to copy these identities from the source.
+-- Compare them before publication; an unavailable identity is a refusal.
+import "windows_file.ouro";
+
+extern windows_file_security : RawPtr U8 -> U32 -> RawPtr U8 -> U32 -> RawPtr U32 -> Runtime U32 :=
+    "windows-x86_64" "win64" "advapi32.dll" "GetFileSecurityW" "nogc";
+extern windows_security_owner : RawPtr U8 -> RawPtr USize -> RawPtr U32 -> Runtime U32 :=
+    "windows-x86_64" "win64" "advapi32.dll" "GetSecurityDescriptorOwner" "nogc";
+extern windows_security_group : RawPtr U8 -> RawPtr USize -> RawPtr U32 -> Runtime U32 :=
+    "windows-x86_64" "win64" "advapi32.dll" "GetSecurityDescriptorGroup" "nogc";
+extern windows_equal_sid : RawPtr U8 -> RawPtr U8 -> Runtime U32 :=
+    "windows-x86_64" "win64" "advapi32.dll" "EqualSid" "nogc";
+
+def raw_windows_security_denied (one : USize) : U32 :=
+    raw_size_to_u32 (usize_add (usize_add (usize_add one one) (usize_add one one)) one);
+
+def raw_windows_security_sid (owner : Bool) (descriptor : RawPtr U8)
+    (cell : RawPtr USize) (defaulted : RawPtr U32) : Runtime U32 :=
+    match owner with
+    | True => windows_security_owner descriptor cell defaulted
+    | False => windows_security_group descriptor cell defaulted
+    end;
+
+def raw_windows_security_equal (first : RawPtr USize) (second : RawPtr USize) (one : USize) : Runtime U32 :=
+    runtime_bind USize U32 (raw_load_usize first) (fun (left : USize) =>
+      runtime_bind USize U32 (raw_load_usize second) (fun (right : USize) =>
+        let zero : USize := usize_sub one one in
+        match raw_bool_and (raw_bool_not (usize_equal left zero)) (raw_bool_not (usize_equal right zero)) with
+        | False => runtime_pure U32 (raw_windows_security_denied one)
+        | True => runtime_bind (RawPtr U8) U32 (raw_from_bits U8 left) (fun (a : RawPtr U8) =>
+            runtime_bind (RawPtr U8) U32 (raw_from_bits U8 right) (fun (b : RawPtr U8) =>
+              runtime_bind U32 U32 (windows_equal_sid a b) (fun (equal : U32) =>
+                runtime_pure U32 (match u32_equal equal (raw_size_to_u32 zero) with
+                  | True => raw_windows_security_denied one | False => raw_size_to_u32 zero end))))
+        end));
+
+def raw_windows_security_identity (owner : Bool) (source : RawPtr U8) (stage : RawPtr U8)
+    (first : RawPtr USize) (second : RawPtr USize) (defaulted : RawPtr U32) (one : USize) : Runtime U32 :=
+    runtime_bind U32 U32 (raw_windows_security_sid owner source first defaulted) (fun (loaded : U32) =>
+      match u32_equal loaded (u32_sub loaded loaded) with
+      | True => raw_windows_last_failure one
+      | False => runtime_bind U32 U32 (raw_windows_security_sid owner stage second defaulted) (fun (next : U32) =>
+          match u32_equal next (u32_sub next next) with
+          | True => raw_windows_last_failure one
+          | False => raw_windows_security_equal first second one
+          end)
+      end);
+
+def raw_windows_security_identities (source : RawPtr U8) (stage : RawPtr U8)
+    (first : RawPtr USize) (second : RawPtr USize) (count : RawPtr U32) (one : USize) : Runtime U32 :=
+    runtime_bind U32 U32 (raw_windows_security_identity True source stage first second count one)
+      (fun (owner : U32) => match u32_equal owner (u32_sub owner owner) with
+        | False => runtime_pure U32 owner
+        | True => raw_windows_security_identity False source stage first second count one
+        end);
+
+def raw_windows_security_read (source : RawPtr U8) (stage : RawPtr U8)
+    (source_sd : RawPtr U8) (stage_sd : RawPtr U8) (capacity : U32)
+    (first : RawPtr USize) (second : RawPtr USize) (count : RawPtr U32) (one : USize) : Runtime U32 :=
+    let flags : U32 := raw_size_to_u32 (usize_add (usize_add one one) one) in
+    runtime_bind U32 U32 (windows_file_security source flags source_sd capacity count) (fun (loaded : U32) =>
+      match u32_equal loaded (u32_sub loaded loaded) with
+      | True => raw_windows_last_failure one
+      | False => runtime_bind U32 U32 (windows_file_security stage flags stage_sd capacity count) (fun (copied : U32) =>
+          match u32_equal copied (u32_sub copied copied) with
+          | True => raw_windows_last_failure one
+          | False => raw_windows_security_identities source_sd stage_sd first second count one
+          end)
+      end);
+
+-- Two bounded self-relative descriptors of 256 bytes each, two aligned
+-- pointer cells, and one DWORD count/defaulted cell. Oversized or unavailable
+-- descriptors return their OS error rather than truncating identity data.
+def raw_windows_security_storage (source : RawPtr U8) (stage : RawPtr U8)
+    (base : RawPtr U8) (capacity : USize) (eight : USize) (one : USize) : Runtime U32 :=
+    runtime_bind (RawPtr U8) U32 (raw_add U8 base capacity) (fun (stage_sd : RawPtr U8) =>
+      runtime_bind (RawPtr U8) U32 (raw_add U8 stage_sd capacity) (fun (first_bytes : RawPtr U8) =>
+        runtime_bind (RawPtr U8) U32 (raw_add U8 first_bytes eight) (fun (second_bytes : RawPtr U8) =>
+          runtime_bind (RawPtr U8) U32 (raw_add U8 second_bytes eight) (fun (count_bytes : RawPtr U8) =>
+            runtime_bind (RawPtr USize) U32 (raw_cast U8 USize first_bytes) (fun (first : RawPtr USize) =>
+              runtime_bind (RawPtr USize) U32 (raw_cast U8 USize second_bytes) (fun (second : RawPtr USize) =>
+                runtime_bind (RawPtr U32) U32 (raw_cast U8 U32 count_bytes) (fun (count : RawPtr U32) =>
+                  raw_windows_security_read source stage base stage_sd (raw_size_to_u32 capacity)
+                    first second count one)))))));
+
+def raw_windows_file_same_security_owner (source : RawPtr U8) (stage : RawPtr U8) (one : USize) : Runtime U32 :=
+    let two : USize := usize_add one one in
+    let four : USize := usize_add two two in
+    let eight : USize := usize_add four four in
+    let capacity : USize := usize_shift_left one (raw_size_to_u32 eight) in
+    let bytes : USize := usize_add (usize_add capacity capacity) (usize_add eight (usize_add eight four)) in
+    runtime_bind (RawPtr U8) U32 (raw_pages_allocate bytes eight) (fun (base : RawPtr U8) =>
+      runtime_bind USize U32 (raw_to_bits U8 base) (fun (address : USize) =>
+        match usize_equal address (usize_sub one one) with
+        | True => runtime_pure U32 (raw_size_to_u32 eight)
+        | False => runtime_bind U32 U32 (raw_windows_security_storage source stage base capacity eight one)
+            (fun (result : U32) => runtime_bind Bool U32 (raw_pages_release base) (fun (released : Bool) =>
+              runtime_pure U32 (match released with
+                | True => result | False => raw_windows_general_error one end)))
+        end));

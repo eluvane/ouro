@@ -24,12 +24,14 @@ def digest(path):
 
 def source_inputs(entry):
     from frontend_regen import collect_units
-    from native_tool_build import BUILD_INPUTS, RUNTIME
+    from native_tool_build import BUILD_INPUTS, RUNTIME, tool_roots
 
     units = collect_units(entry)
     if not units or units[-1] != entry or len(set(units)) != len(units):
         raise ValueError("native driver source collection is empty, duplicated, or has the wrong entry")
     names = set(units) | set(BUILD_INPUTS) | set(RUNTIME)
+    for companion in tool_roots(entry)[1:]:
+        names.update(collect_units(companion))
     names.update(path.relative_to(ROOT).as_posix() for path in (ROOT / "runtime").glob("*.h"))
     if any(not (ROOT / name).resolve().is_relative_to(ROOT) for name in names):
         raise ValueError("native driver input escapes the repository")
@@ -56,7 +58,12 @@ def receipt_for(executable, entry, compiler):
                     and inputs["entry"] == entry and inputs["sources"] == sources
                     and inputs["compiler_sha256"] == digest(compiler)
                     and data["binary_sha256"] == digest(executable)
-                    and data["key"] == hash_json(inputs)):
+                and data["key"] == hash_json(inputs)):
+                from native_tool_build import tool_companions
+
+                for companion in tool_companions(entry):
+                    filename = companion[1] + (".exe" if sys.platform == "win32" else "")
+                    receipt_for(executable.parent / filename, companion[0], compiler)
                 return data, units, sources
         except (OSError, ValueError, KeyError, TypeError):
             continue

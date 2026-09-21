@@ -1,0 +1,159 @@
+-- Remaining strict scanners: suppressions and Cons/Nil literal spans.
+
+import "scan.ouro";
+import "literals.ouro";
+
+def st_suppress_token : String := "ouro-lint:disable";
+
+def st_code_trim (raw : String) : String :=
+    let s : String := qt_strip raw in
+    let s2 : String := match prim_string_ends s "," with
+      | True => prim_string_slice s 0 (sub (prim_string_length s) 1)
+      | False => s
+      end in
+    let s3 : String := match prim_string_ends s2 ")" with
+      | True => prim_string_slice s2 0 (sub (prim_string_length s2) 1)
+      | False => s2
+      end in
+    match prim_string_ends s3 ";" with
+    | True => prim_string_slice s3 0 (sub (prim_string_length s3) 1)
+    | False => s3
+    end;
+
+def st_scan_suppress (mp : List (Pair String QrDiag)) (profile : String)
+    (path : String) (text : String) (acc : List QrFinding) : List QrFinding :=
+    let lines : List String := qt_split_lines text in
+    (fix go (fuel : Nat) (xs : List String) (n : Nat) (out : List QrFinding)
+        : List QrFinding :=
+      match fuel with
+      | Z => out
+      | S fuel2 => match xs with
+        | Nil => out
+        | Cons line rest =>
+            match prim_string_contains line st_suppress_token with
+            | False => go fuel2 rest (add n 1) out
+            | True =>
+            let offset : Nat := prim_string_length (qt_code_before_comment line) in
+            let raw : String := prim_string_slice line offset
+              (sub (prim_string_length line) offset) in
+            match qt_contains raw st_suppress_token with
+            | False => go fuel2 rest (add n 1) out
+            | True =>
+                let col : Nat := match qt_find raw st_suppress_token with
+                  | Nothing => 1
+                  | Just i => add offset (add i 1)
+                  end in
+                let out2 : List QrFinding :=
+                  match orb (qt_contains raw "ouro-lint:disable-all")
+                      (qt_contains raw "ouro-lint:disable=*") with
+                  | False => out
+                  | True => st_add out
+                      (qr_mk_finding mp profile "OURO-SUP001"
+                        (st_place path n col)
+                        "blanket diagnostic suppression is forbidden" (qt_strip raw))
+                  end in
+                match qt_find raw "ouro-lint:disable=" with
+                | Nothing => go fuel2 rest (add n 1) out2
+                | Just eqp =>
+                    let start : Nat := add eqp 18 in
+                    let tok : String :=
+                      (fix take (tf : Nat) (i : Nat) : String :=
+                        match tf with
+                        | Z => prim_string_slice raw start (sub i start)
+                        | S t2 => match ltb_nat i (prim_string_length raw) with
+                          | False => prim_string_slice raw start (sub i start)
+                          | True => match byte_is_space (prim_string_byte_at raw i) with
+                            | True => prim_string_slice raw start (sub i start)
+                            | False => take t2 (add i 1)
+                            end
+                          end
+                        end) (add (prim_string_length raw) 1) start in
+                    let code : String := st_code_trim tok in
+                    let out3 : List QrFinding := match qr_lookup_diag mp code with
+                      | Just _ => out2
+                      | Nothing => st_add out2
+                          (qr_mk_finding mp profile "OURO-SUP003"
+                            (st_place path n col)
+                            (prim_string_concat "suppression references unknown diagnostic " code)
+                            code)
+                      end in
+                    let out4 : List QrFinding := match qt_contains raw "reason=" with
+                      | True => out3
+                      | False => st_add out3
+                          (qr_mk_finding mp profile "OURO-SUP002"
+                            (st_place path n col)
+                            (prim_string_concat "suppression for " (prim_string_concat code " has no reason"))
+                            (qt_strip raw))
+                      end in
+                    let wide : Bool := orb (qt_contains raw "scope=file")
+                      (orb (qt_contains raw "scope=all")
+                        (orb (qt_contains raw "scope=global")
+                          (orb (qt_contains raw "scope = file")
+                            (orb (qt_contains raw "scope = all")
+                              (qt_contains raw "scope = global"))))) in
+                    let out5 : List QrFinding := match wide with
+                      | False => out4
+                      | True => st_add out4
+                          (qr_mk_finding mp profile "OURO-SUP006"
+                            (st_place path n col)
+                            (prim_string_concat "suppression for " (prim_string_concat code " uses too-wide scope"))
+                            (qt_strip raw))
+                      end in
+                    let forbid : Bool := orb (prim_string_starts code "OURO-TRUST")
+                      (prim_string_eq code "OURO-ARCH005") in
+                    let out6 : List QrFinding := match forbid with
+                      | False => out5
+                      | True => st_add out5
+                          (qr_mk_finding mp profile "OURO-SUP005"
+                            (st_place path n col)
+                            (prim_string_concat code " is forbid-level and cannot be source-suppressed")
+                            code)
+                      end in
+                    go fuel2 rest (add n 1) out6
+                end
+            end
+            end
+        end
+      end) (add (length String lines) 1) lines 1 acc;
+
+def st_scan_literals (mp : List (Pair String QrDiag)) (profile : String)
+    (path : String) (text : String) (lines : List String) (acc : List QrFinding)
+    : List QrFinding :=
+    let spans : List (Pair Nat Nat) := st_closed_literal_spans text in
+    let line_count : Nat := length String lines in
+    (fix go (fuel : Nat) (xs : List (Pair Nat Nat)) (out : List QrFinding)
+        : List QrFinding :=
+      match fuel with
+      | Z => out
+      | S fuel2 => match xs with
+        | Nil => out
+        | Cons span rest => match span with
+          | MkPair start _ =>
+              let idx : Nat := qt_cps_before text start in
+              let loc : Pair Nat Nat := qt_line_col text idx in
+              match loc with
+              | MkPair line_no col =>
+                  let witness : String := match andb (ltb_nat 0 line_no)
+                      (leb_nat line_no line_count) with
+                    | False => ""
+                    | True => qt_strip (nth String "" (sub line_no 1) lines)
+                    end in
+                  go fuel2 rest (st_add out
+                    (qr_mk_finding mp profile "OURO-LINT029"
+                      (st_place path line_no col)
+                      "verbose literal-style list construction is legacy where list literals are available"
+                      witness))
+              end
+          end
+        end
+      end) (add (length (Pair Nat Nat) spans) 1) spans acc;
+
+def st_scan_source (mp : List (Pair String QrDiag)) (profile : String)
+    (path : String) (text : String) : List QrFinding :=
+    let lines : List String := qt_split_lines text in
+    let acc0 : List QrFinding := st_scan_literals mp profile path text lines [] in
+    let acc1 : List QrFinding := st_scan_lines mp profile path lines acc0 in
+    let acc2 : List QrFinding := st_scan_imports mp profile path lines acc1 in
+    let acc3 : List QrFinding := st_scan_defs mp profile path lines acc2 in
+    let acc4 : List QrFinding := st_scan_suppress mp profile path text acc3 in
+    qr_sort_findings acc4;

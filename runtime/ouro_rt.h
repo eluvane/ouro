@@ -87,7 +87,8 @@ void ouro_heap_reset(void);
 void ouro_heap_discard_phase(void);
 /* Suspend the caller's phase/permanent banks while a bounded host operation
    uses fresh banks. Leave restores the caller's allocation domain and copies
-   one survivor graph there before releasing the operation's storage. */
+   only the survivor nodes allocated in the nested banks. Caller-owned intern
+   and AST identities are shared so repeated parses do not recopy the table. */
 ouro_heap_context *ouro_heap_context_enter(void);
 ouro_v *ouro_heap_context_leave(ouro_heap_context *context, ouro_v *survivor);
 void ouro_rt_warmup(void);
@@ -105,6 +106,8 @@ ouro_v *ouro_str(const char *s);
    Cons=1). Lets a C host feed real input into compiled Ouro without any
    algorithm in C. */
 ouro_v *ouro_nat(unsigned long n);
+/* Full 64-bit Nat construction for byte counts and peaks. */
+ouro_v *ouro_nat_u64(uint64_t number);
 /* Checked host-size conversion; no truncation of a large or malformed Nat. */
 int ouro_nat_to_ulong(ouro_v *value, unsigned long *out);
 uint32_t ouro_nat_low32(ouro_v *value);

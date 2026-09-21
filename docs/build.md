@@ -38,10 +38,12 @@ uses Python 3.12 and installs its dependency in a local virtual environment.
 Clang C compilation allows bracket nesting up to 1024 for generated constructor
 expressions; the selected flag participates in the object-cache command key.
 
-The standalone Python frontend regenerator and bounded analyzer reserve a
-128 MiB POSIX stack for native compiler processes, capped by the inherited hard
-limit. An already larger or unlimited stack is preserved. Address-space and
-memory-budget limits still apply; failure to configure the stack is an error.
+The standalone Python frontend regenerator, bounded analyzer, and fix-check
+observer reserve a 128 MiB POSIX stack for native compiler processes, capped
+by the inherited hard limit. An already larger or unlimited stack is preserved.
+Standalone C IO programs apply the same reserve at startup because ELF cannot
+encode a link-time stack size. Address-space and memory-budget limits still
+apply; failure to configure the stack is an error.
 
 ## Native transition baseline
 
@@ -318,7 +320,7 @@ second handwritten stdlib unit list; missing units remain bootstrap failures.
 
 The [bootstrap input manifest](../compiler/bootstrap/c-bootstrap-v1.json) records
 68 input files: 58 historical Ouro sources and two five-file runtime sets. It
-pins every file's size and SHA-256, the archive's 213,975 bytes, and the
+pins every file's size and SHA-256, the archive's 214,587 bytes, and the
 committed stage0 pair. The C0 runtime matches that seed; the historical bridge
 sources and runtime remain unchanged. The manifest's `seed_refresh` records the
 previous seed hashes, changed C0 runtime members, and source and stage-loop
@@ -402,11 +404,28 @@ checks a completion record and the binary hash before reuse, including reuse
 at another output path. Source timestamps are only launcher startup hints.
 Changing content with a preserved timestamp invalidates the build-tool key;
 changing only a timestamp does not require recompilation.
+The lint suite always invokes this receipt check before running its binary,
+including when only a build helper or a transitive import has changed.
+The builder also prepares every required companion beside the parent tool.
+Lint requires the style and Clippy workers, including Clippy's structural worker;
+their transitive sources and individual binary receipts must all remain current.
+The lint launcher keeps successful preparation output in its build log, preserving
+the empty stdout/stderr contract for a clean invocation; build failures print that log.
 
 Each installed tool has a `.sources` manifest and a `.build.json` receipt with
 its cache decision, input hashes, and elapsed time. `OURO_CACHE=0` or the
 driver's `--no-cache` forces fresh emission, compilation, and linking. Native
 tool builds use at most two C workers, bounded further by `OURO_JOBS`.
+
+On Windows, C-host builds of lint, both analyzers, fmt, fix, Clippy and the quality
+inventory worker embed a process-local UTF-8 application manifest. They require Windows 10 version 1903
+or later, so command-line paths and filesystem calls use the same UTF-8 bytes
+as Ouro strings. The build driver uses Windows resource APIs; no SDK tool or
+system code-page change is required. It preserves other linker resources and
+rejects a conflicting executable manifest. The raw linked image and the final
+manifested image have separate hashes, and a failed resource update cannot
+publish an installed tool or success receipt. Compiler seeds, runtime sources,
+and direct-PE output are outside this tool-specific build step.
 
 Gate launchers select the physical executable name before locating its
 `.sources` manifest, including `.exe` names under MSYS. An executable without

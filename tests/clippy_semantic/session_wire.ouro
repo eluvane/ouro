@@ -1,0 +1,123 @@
+-- Native production-decoder laws; separate from the compiler/frontend cone.
+-- @entry main
+import "../../tools/clippy/session_wire.ouro";
+import "../../std/io.ouro";
+
+def cw_text (parts : List String) : String :=
+    foldl String String (fun (acc : String) (part : String) =>
+      prim_string_concat acc part) "" parts;
+
+def cw_config : CgWireConfig :=
+    MkCgWireConfig (Nil (Pair String QrClippy)) "project" "." ".";
+
+def cw_snapshot (source : String) : String :=
+    cw_text [cg_s_protocol, "\nok\n", prim_string_of_nat (prim_string_length source),
+      "\n", source, "\n0\n"];
+
+def cw_error : String :=
+    cw_text [cg_s_protocol, "\nerror\nparse failed\n"];
+
+def cw_root (id : Nat) (path : String) (snapshot : String) : String :=
+    cw_text ["root\n", prim_string_of_nat id, "\n",
+      prim_string_of_nat (prim_string_length path), "\n", path, "\n", snapshot];
+
+def cw_wire (requested : Nat) (frames : String) (completed : Nat) (status : String) : String :=
+    cw_text [cg_session_version, "\n", prim_string_of_nat requested, "\n", frames,
+      "done\n", prim_string_of_nat completed, "\n", status, "\n"];
+
+def cw_accept (paths : List String) (wire : String) (count : Nat) (ok : Bool) : Bool :=
+    match cg_wire_session cw_config paths wire (Nil QrFinding) with
+    | Left _ => False
+    | Right reply => match reply with
+      | MkCgWireResult findings completed passed => andb (eq_nat count completed)
+          (match ok with
+           | True => passed
+           | False => andb (notb passed)
+               (any QrFinding (fun (finding : QrFinding) =>
+                 prim_string_eq (qr_find_level finding) "fatal") findings)
+           end)
+      end
+    end;
+
+def cw_reject (paths : List String) (wire : String) : Bool :=
+    match cg_wire_session cw_config paths wire (Nil QrFinding) with
+    | Left _ => True
+    | Right _ => False
+    end;
+
+def cw_repeat : Nat -> List String :=
+  fix go (count : Nat) : List String :=
+    match count with
+    | Z => Nil String
+    | S remaining => Cons String "a.ouro" (go remaining)
+    end;
+
+def cw_frames : Nat -> Nat -> String :=
+  fix go (count : Nat) (id : Nat) : String :=
+    match count with
+    | Z => ""
+    | S remaining => prim_string_concat (cw_root id "a.ouro" (cw_snapshot ""))
+        (go remaining (S id))
+    end;
+
+def cw_truncations : Nat -> String -> Bool :=
+  fix go (count : Nat) (wire : String) : Bool :=
+    match count with
+    | Z => cw_reject ["a.ouro"] ""
+    | S remaining => andb (cw_reject ["a.ouro"]
+        (prim_string_slice wire 0 remaining)) (go remaining wire)
+    end;
+
+def cw_good : String := cw_wire 1 (cw_root 0 "a.ouro" (cw_snapshot "")) 1 "ok";
+
+def cw_laws : List (Pair String Bool) :=
+    [ MkPair String Bool "native-session-complete" (cw_accept ["a.ouro"] cw_good 1 True)
+    , MkPair String Bool "native-session-hundred-ordered-roots"
+        (cw_accept (cw_repeat 100) (cw_wire 100 (cw_frames 100 0) 100 "ok") 100 True)
+    , MkPair String Bool "native-session-embedded-magic"
+        (cw_accept ["a.ouro"] (cw_wire 1 (cw_root 0 "a.ouro"
+          (cw_snapshot "ouro.clippy-semantic.v2\nroot\n0\ndone\n1\nok\n")) 1 "ok") 1 True)
+    , MkPair String Bool "native-session-unicode-path"
+        (cw_accept ["данные/漢字.ouro"] (cw_wire 1
+          (cw_root 0 "данные/漢字.ouro" (cw_snapshot "")) 1 "ok") 1 True)
+    , MkPair String Bool "native-session-wrong-version"
+        (cw_reject ["a.ouro"] (prim_string_replace cw_good cg_session_version "ouro.clippy-session.v1"))
+    , MkPair String Bool "native-session-every-truncation"
+        (cw_truncations (prim_string_length cw_good) cw_good)
+    , MkPair String Bool "native-session-wrong-count"
+        (cw_reject ["a.ouro"] (cw_wire 0 (cw_root 0 "a.ouro" (cw_snapshot "")) 1 "ok"))
+    , MkPair String Bool "native-session-wrong-root"
+        (cw_reject ["a.ouro"] (cw_wire 1 (cw_root 0 "b.ouro" (cw_snapshot "")) 1 "ok"))
+    , MkPair String Bool "native-session-wrong-id"
+        (cw_reject ["a.ouro"] (cw_wire 1 (cw_root 1 "a.ouro" (cw_snapshot "")) 1 "ok"))
+    , MkPair String Bool "native-session-duplicate-id"
+        (cw_reject (cw_repeat 2) (cw_wire 2 (cw_text
+          [cw_root 0 "a.ouro" (cw_snapshot ""), cw_root 0 "a.ouro" (cw_snapshot "")]) 2 "ok"))
+    , MkPair String Bool "native-session-partial-ok-is-not-clean"
+        (cw_reject (cw_repeat 2) (cw_wire 2 (cw_frames 1 0) 1 "ok"))
+    , MkPair String Bool "native-session-confirmed-recycle"
+        (cw_accept (cw_repeat 2) (cw_wire 2 (cw_frames 1 0) 1 "recycle") 1 True)
+    , MkPair String Bool "native-session-empty-recycle-rejected"
+        (cw_reject (cw_repeat 2) (cw_wire 2 "" 0 "recycle"))
+    , MkPair String Bool "native-session-complete-recycle-rejected"
+        (cw_reject ["a.ouro"] (cw_wire 1 (cw_frames 1 0) 1 "recycle"))
+    , MkPair String Bool "native-session-error-then-valid"
+        (cw_accept (cw_repeat 2) (cw_wire 2
+          (cw_text [cw_root 0 "a.ouro" cw_error, cw_root 1 "a.ouro" (cw_snapshot "")]) 2 "error") 2 False)
+    , MkPair String Bool "native-session-valid-error-valid"
+        (cw_accept (cw_repeat 3) (cw_wire 3 (cw_text [cw_root 0 "a.ouro" (cw_snapshot ""),
+          cw_root 1 "a.ouro" cw_error, cw_root 2 "a.ouro" (cw_snapshot "")]) 3 "error") 3 False)
+    , MkPair String Bool "native-session-error-cannot-recycle"
+        (cw_reject (cw_repeat 2) (cw_wire 2 (cw_root 0 "a.ouro" cw_error) 1 "recycle"))
+    , MkPair String Bool "native-session-extra-output-rejected"
+        (cw_reject ["a.ouro"] (prim_string_concat cw_good "\n"))
+    ];
+
+def main : IO Unit :=
+    do let! _p := io_foreach (Pair String Bool) (fun (law : Pair String Bool) =>
+         match law with
+         | MkPair name passed => println (prim_string_concat
+             (match passed with | True => "PASS " | False => "FAIL " end) name)
+         end) cw_laws;
+       exit (match all (Pair String Bool) (fun (law : Pair String Bool) =>
+         snd String Bool law) cw_laws with | True => 0 | False => 1 end)

@@ -1,0 +1,331 @@
+-- Source scanners ported from scripts/strict_quality_firewall.py.
+
+import "lexlike.ouro";
+import "../../std/listx.ouro";
+
+def st_nlines_sentinel : Nat := mul 64 64;
+
+def st_add (xs : List QrFinding) (f : QrFinding) : List QrFinding :=
+    Cons QrFinding f xs;
+
+def st_scan_old_do (mp : List (Pair String QrDiag)) (profile : String)
+    (path : String) (line_no : Nat) (raw : String) (acc : List QrFinding)
+    : List QrFinding :=
+    match st_old_do_col raw with
+    | Nothing => acc
+    | Just col => st_add acc
+        (qr_mk_finding mp profile "OURO-LINT030"
+          (st_place path line_no (add col 1))
+          "legacy do-bind should use let! notation" (qt_strip raw))
+    end;
+
+def st_scan_lines (mp : List (Pair String QrDiag)) (profile : String)
+    (path : String) (lines : List String) (acc : List QrFinding) : List QrFinding :=
+    (fix go (fuel : Nat) (xs : List String) (n : Nat) (out : List QrFinding)
+        : List QrFinding :=
+      match fuel with
+      | Z => out
+      | S fuel2 => match xs with
+        | Nil => out
+        | Cons raw rest => go fuel2 rest (add n 1)
+            (st_scan_old_do mp profile path n raw out)
+        end
+      end) (add (length String lines) 1) lines 1 acc;
+
+def st_seen_get (xs : List (Pair String Nat)) (k : String) : Maybe Nat :=
+    lookup String Nat prim_string_eq k xs;
+
+def st_scan_imports (mp : List (Pair String QrDiag)) (profile : String)
+    (path : String) (lines : List String) (acc : List QrFinding) : List QrFinding :=
+    (fix go (fuel : Nat) (xs : List String) (n : Nat)
+        (imps : List (Pair String Nat)) (aliases : List (Pair String Nat))
+        (out : List QrFinding) : List QrFinding :=
+      match fuel with
+      | Z => out
+      | S fuel2 => match xs with
+        | Nil => out
+        | Cons raw rest =>
+            let code : String := qt_strip (qt_code_before_comment raw) in
+            match prim_string_length code with
+            | Z => go fuel2 rest (add n 1) imps aliases out
+            | S _ => match st_import_line code with
+              | Just pair => match pair with
+                | MkPair target alias =>
+                    let col : Nat := match qt_find raw "import" with
+                      | Nothing => 1
+                      | Just i => add i 1
+                      end in
+                    let out2 : List QrFinding := match st_seen_get imps target with
+                      | Nothing => out
+                      | Just first => st_add out
+                          (qr_mk_finding mp profile "OURO-LINT037"
+                            (st_place path n col)
+                            (qt_cat4 "duplicate import of '" target
+                              "' repeats line " (prim_string_of_nat first))
+                            (qt_strip raw))
+                      end in
+                    let imps2 : List (Pair String Nat) := match st_seen_get imps target with
+                      | Just _ => imps
+                      | Nothing => Cons (Pair String Nat)
+                          (MkPair String Nat target n) imps
+                      end in
+                    match alias with
+                    | Nothing => go fuel2 rest (add n 1) imps2 aliases out2
+                    | Just name =>
+                        let acol : Nat := match qt_find raw name with
+                          | Nothing => 1
+                          | Just i => add i 1
+                          end in
+                        let bad_case : Bool := orb
+                          (elem String prim_string_eq name st_reserved)
+                          (notb (st_pascal_ident name)) in
+                        let out3 : List QrFinding := match bad_case with
+                          | False => out2
+                          | True => st_add out2
+                              (qr_mk_finding mp profile "OURO-LINT043"
+                                (st_place path n acol)
+                                (qt_cat3 "import alias '" name
+                                  "' is not canonical PascalCase or shadows a built-in name")
+                                (qt_strip raw))
+                          end in
+                        match st_seen_get aliases name with
+                        | Just first => go fuel2 rest (add n 1) imps2 aliases
+                            (st_add out3 (qr_mk_finding mp profile "OURO-LINT043"
+                              (st_place path n acol)
+                              (qt_cat4 "import alias '" name
+                                "' repeats earlier alias on line "
+                                (prim_string_of_nat first))
+                              (qt_strip raw)))
+                        | Nothing => go fuel2 rest (add n 1) imps2
+                            (Cons (Pair String Nat) (MkPair String Nat name n) aliases)
+                            out3
+                        end
+                    end
+                end
+              | Nothing => match st_open_alias code with
+                | Nothing => go fuel2 rest (add n 1) imps aliases out
+                | Just name =>
+                    let col : Nat := match qt_find raw "open" with
+                      | Nothing => 1
+                      | Just i => add i 1
+                      end in
+                    go fuel2 rest (add n 1) imps aliases
+                      (st_add out (qr_mk_finding mp profile "OURO-LINT044"
+                        (st_place path n col)
+                        (qt_cat3 "top-level open of alias '" name
+                          "' leaks names across the file")
+                        (qt_strip raw)))
+                end
+              end
+            end
+        end
+      end) (add (length String lines) 1) lines 1 [] [] acc;
+
+def st_top_starts (lines : List String) : List Nat :=
+    reverse_lin Nat
+      ((fix go (fuel : Nat) (xs : List String) (i : Nat) (acc : List Nat) : List Nat :=
+        match fuel with
+        | Z => acc
+        | S fuel2 => match xs with
+          | Nil => acc
+          | Cons raw rest =>
+              let acc2 : List Nat := match st_is_top_form raw with
+                | True => Cons Nat i acc
+                | False => acc
+                end in
+              go fuel2 rest (add i 1) acc2
+          end
+        end) (add (length String lines) 1) lines 0 []);
+
+def st_def_spans (lines : List String) : List (Pair Nat Nat) :=
+    let starts : List Nat := st_top_starts lines in
+    let nlines : Nat := length String lines in
+    reverse_lin (Pair Nat Nat)
+      ((fix go (fuel : Nat) (xs : List Nat) (acc : List (Pair Nat Nat))
+          : List (Pair Nat Nat) :=
+        match fuel with
+        | Z => acc
+        | S fuel2 => match xs with
+          | Nil => acc
+          | Cons start rest =>
+              let raw : String := nth String "" start lines in
+              match st_at_top raw "def" with
+              | False => go fuel2 rest acc
+              | True =>
+                  let finish : Nat := match rest with
+                    | Nil => nlines
+                    | Cons nxt _ => nxt
+                    end in
+                  go fuel2 rest (Cons (Pair Nat Nat)
+                    (MkPair Nat Nat start finish) acc)
+              end
+          end
+        end) (add (length Nat starts) 1) starts []);
+
+def st_split_asg (s : String) : Pair String String :=
+    match qt_find s ":=" with
+    | Nothing => MkPair String String s ""
+    | Just i => MkPair String String
+        (prim_string_slice s 0 i)
+        (prim_string_slice s (add i 2) (sub (prim_string_length s) (add i 2)))
+    end;
+
+def st_starts_binding (before : String) : Bool :=
+    orb (st_at_top before "def")
+      (match st_word_search before "let" with
+       | Nothing => False
+       | Just i =>
+           match qt_ident_at before (qt_skip_ws before (add i 3)) with
+           | Nothing => False
+           | Just _ => True
+           end
+       end);
+
+def st_public_near (lines : List String) (start : Nat) : Bool :=
+    let from : Nat := match ltb_nat start 4 with
+      | True => 0
+      | False => sub start 4
+      end in
+    (fix go (fuel : Nat) (i : Nat) : Bool :=
+      match fuel with
+      | Z => False
+      | S fuel2 => match leb_nat i start with
+        | False => False
+        | True => match st_is_export_line (nth String "" i lines) with
+          | True => True
+          | False => go fuel2 (add i 1)
+          end
+        end
+      end) 6 from;
+
+def st_wildcard_col (code : String) : Maybe Nat :=
+    match qt_find code "|" with
+    | Nothing => Nothing Nat
+    | Just p =>
+        let i : Nat := qt_skip_ws code (add p 1) in
+        match qt_ident_at code i with
+        | Nothing => Nothing Nat
+        | Just name =>
+            match qr_is_az (prim_string_byte_at name 0) with
+            | False => Nothing Nat
+            | True =>
+                match qt_find code "=>" with
+                | Nothing => Nothing Nat
+                | Just _ =>
+                    let tail : String := prim_string_slice code i
+                      (sub (prim_string_length code) i) in
+                    match st_word_search tail "_" with
+                    | Nothing => Nothing Nat
+                    | Just _ => Just Nat p
+                    end
+                end
+            end
+        end
+    end;
+
+-- Each declaration is a bounded host arena; the shared source stays in its parent.
+inductive StDefScan : Type :=
+  | StDefScanOf : List (Pair String QrDiag) -> String -> String -> List String
+      -> Nat -> Nat -> StDefScan;
+
+def st_scan_def_span (request : StDefScan) (acc : List QrFinding) : List QrFinding :=
+    match request with
+    | StDefScanOf mp profile path lines start finish =>
+    let public_def : Bool := st_public_near lines start in
+    (fix go (fuel : Nat) (ix : Nat) (out : List QrFinding) : List QrFinding :=
+      match fuel with
+      | Z => out
+      | S fuel2 => match ltb_nat ix finish with
+        | False => out
+        | True =>
+            let raw : String := nth String "" ix lines in
+            let code : String := qt_code_before_comment raw in
+            let out2 : List QrFinding := match qt_find_unquoted code ";;" with
+              | Nothing => out
+              | Just i => st_add out
+                  (qr_mk_finding mp profile "OURO-LINT042"
+                    (st_place path (add ix 1) (add i 1))
+                    "redundant separator `;;` is rejected; one declaration separator is canonical"
+                    (qt_strip raw))
+              end in
+            let out3 : List QrFinding := match qt_find code ":=" with
+              | Nothing => out2
+              | Just _ => match st_split_asg code with
+                | MkPair before after =>
+                    match andb (st_starts_binding before)
+                        (notb (st_has_list_type before)) with
+                    | False => out2
+                    | True =>
+                        let after_s : String := qt_strip after in
+                        let lit_ix : Nat := match prim_string_starts after_s "[" with
+                          | True => ix
+                          | False => match andb (st_at_top before "def")
+                              (eq_nat (prim_string_length after_s) 0) with
+                            | False => st_nlines_sentinel
+                            | True =>
+                                (fix look (lfuel : Nat) (j : Nat) : Nat :=
+                                  match lfuel with
+                                  | Z => st_nlines_sentinel
+                                  | S l2 => match ltb_nat j finish with
+                                    | False => st_nlines_sentinel
+                                    | True =>
+                                        let look_code : String := qt_strip
+                                          (qt_code_before_comment (nth String "" j lines)) in
+                                        match prim_string_length look_code with
+                                        | Z => look l2 (add j 1)
+                                        | S _ => match prim_string_starts look_code "[" with
+                                          | True => j
+                                          | False => st_nlines_sentinel
+                                          end
+                                        end
+                                    end
+                                  end) (add (sub finish ix) 1) (add ix 1)
+                            end
+                          end in
+                        match eq_nat lit_ix st_nlines_sentinel with
+                        | True => out2
+                        | False =>
+                            let lit_raw : String := nth String "" lit_ix lines in
+                            let col : Nat := match qt_find lit_raw "[" with
+                              | Nothing => 1
+                              | Just i => add i 1
+                              end in
+                            st_add out2 (qr_mk_finding mp profile "OURO-LINT041"
+                              (st_place path (add lit_ix 1) col)
+                              "list literal has no explicit expected `List` type at the binding boundary"
+                              (qt_strip lit_raw))
+                        end
+                    end
+                end
+              end in
+            let out4 : List QrFinding := match public_def with
+              | False => out3
+              | True => match st_wildcard_col code with
+                | Nothing => out3
+                | Just col => st_add out3
+                    (qr_mk_finding mp profile "OURO-LINT040"
+                      (st_place path (add ix 1) (add col 1))
+                      "public definition discards constructor payloads with `_` in a branch"
+                      (qt_strip raw))
+                end
+              end in
+            go fuel2 (add ix 1) out4
+        end
+      end) (add (sub finish start) 1) start acc
+    end;
+
+def st_scan_defs (mp : List (Pair String QrDiag)) (profile : String)
+    (path : String) (lines : List String) (acc : List QrFinding) : List QrFinding :=
+    let spans : List (Pair Nat Nat) := st_def_spans lines in
+    (fix go (fuel : Nat) (xs : List (Pair Nat Nat)) (out : List QrFinding)
+        : List QrFinding :=
+      match fuel with
+      | Z => out
+      | S fuel2 => match xs with
+        | Nil => out
+        | Cons span rest => match span with
+          | MkPair start finish => go fuel2 rest
+              (st_scan_def_span (StDefScanOf mp profile path lines start finish) out)
+          end
+        end
+      end) (add (length (Pair Nat Nat) spans) 1) spans acc;

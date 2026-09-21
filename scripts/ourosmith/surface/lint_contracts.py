@@ -24,7 +24,6 @@ def headOrZero (xs : List Nat) : Nat := match xs with
 inductive List (A : Type) : Type := | Nil : List A | Cons : A -> List A -> List A;
 ''')]
     yield 'import-alias-open', f'''import "numbers.ouro" as Numbers;
-open Numbers;
 def value{seed} : Nat := Numbers.one;
 def locallyOpened{seed} : Nat := open Numbers in one;
 ''', [('numbers.ouro', 'inductive Nat : Type := | Z : Nat | S : Nat -> Nat;\ndef one : Nat := S Z;\n')]

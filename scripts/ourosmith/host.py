@@ -88,6 +88,20 @@ def binary(name: str, *, directory: Path | None = None) -> Path:
     raise FileNotFoundError(f"native binary unavailable: {directory / name}")
 
 
+def prepare_entry(entry: str, name: str) -> Path:
+    """Prepare a source-bound native entry through the existing build boundary."""
+    target_dir = build_config().path("c_build_dir")
+    env = dict(os.environ, OURO_BUILD_TOOL_MODE="native", PYTHON=sys.executable)
+    prepared = run_limited(
+        [str(shell()), str(ROOT / "scripts/build_tool.sh"), entry, str(target_dir / name)],
+        cwd=ROOT, env=env, timeout_s=BUILD_TIMEOUT_S, memory_mb=BUILD_MEMORY_MB,
+    )
+    if not prepared.ok:
+        raise ValueError(f"native build failed status={prepared.status} exit={prepared.returncode}\n"
+                         + prepared.stdout + prepared.stderr)
+    return binary(name, directory=target_dir)
+
+
 def compiler_path(value: Path | str | None = None) -> Path:
     path = Path(value).resolve() if value is not None else binary("ouro1")
     if not path.is_relative_to(ROOT) or not path.is_file() or path.stat().st_size <= 4096:

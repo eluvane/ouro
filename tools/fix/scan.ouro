@@ -2,10 +2,12 @@
 -- declaration segments, a depth-aware body walker, bracket groups, and the
 -- deletion-span policy that removes whole lines only when a construct owns them.
 
+import "../strict/literals.ouro";
 import "../../compiler/base.ouro";
 import "lex.ouro";
 import "../../std/pathx.ouro";
 import "../../std/collections.ouro";
+import "../quality/order.ouro";
 
 -- start, end, replacement, rule id, line, message
 inductive FxEdit : Type :=
@@ -30,13 +32,28 @@ def fx_edit_msg (e : FxEdit) : String :=
     match e with | MkFxEdit _ _ _ _ _ m => m end;
 
 def fx_edit_before (a : FxEdit) (b : FxEdit) : Bool :=
-    leb_nat (fx_edit_start a) (fx_edit_start b);
+    match compareNat (fx_edit_start a) (fx_edit_start b) with
+    | LT => True | GT => False
+    | EQ => match compareNat (fx_edit_end a) (fx_edit_end b) with
+      | LT => True | GT => False
+      | EQ => match str_eq (fx_edit_rule a) (fx_edit_rule b) with
+        | False => prim_string_le (fx_edit_rule a) (fx_edit_rule b)
+        | True => match str_eq (fx_edit_rep a) (fx_edit_rep b) with
+          | False => prim_string_le (fx_edit_rep a) (fx_edit_rep b)
+          | True => match eq_nat (fx_edit_line a) (fx_edit_line b) with
+            | False => leb_nat (fx_edit_line a) (fx_edit_line b)
+            | True => prim_string_le (fx_edit_msg a) (fx_edit_msg b)
+            end
+          end
+        end
+      end
+    end;
 
 def fx_sort_edits (es : List FxEdit) : List FxEdit :=
-    sort_insert FxEdit fx_edit_before es;
+    quality_sort FxEdit fx_edit_before es;
 
--- Overlapping proposals keep the earliest start; the loser is retried on the
--- next fixpoint round against the rewritten source.
+-- Legacy proposal/golden planner only. Production uses fx_checked_plan and
+-- refuses unresolved overlaps rather than dropping proposals here.
 def fx_disjoint : List FxEdit -> Nat -> List FxEdit -> List FxEdit :=
   fix go (es : List FxEdit) (limit : Nat) (acc : List FxEdit) : List FxEdit :=
     match es with
@@ -223,44 +240,9 @@ def fx_body_split (ts : List FxTok) : Pair (List FxTok) (List FxTok) :=
     fx_body_go ts Z Z Z (Nil FxTok);
 
 -- Tokens through the bracket matching an already consumed opener, and the rest.
-def fx_group_go : List FxTok -> Nat -> List FxTok -> Maybe (Pair (List FxTok) (List FxTok)) :=
-  fix go (ts : List FxTok) (depth : Nat) (acc : List FxTok)
-      : Maybe (Pair (List FxTok) (List FxTok)) :=
-    match ts with
-    | Nil => Nothing (Pair (List FxTok) (List FxTok))
-    | Cons t rest =>
-        match fx_opens_bracket t with
-        | True => go rest (S depth) (Cons FxTok t acc)
-        | False =>
-            match fx_closes_bracket t with
-            | False => go rest depth (Cons FxTok t acc)
-            | True =>
-                match depth with
-                | Z => Just (Pair (List FxTok) (List FxTok))
-                         (MkPair (List FxTok) (List FxTok)
-                           (reverse_lin FxTok (Cons FxTok t acc)) rest)
-                | S d2 => go rest d2 (Cons FxTok t acc)
-                end
-            end
-        end
-    end;
 
 -- One application atom: an identifier, number, or string token, or a whole
 -- bracketed group. Returns the atom tokens and the remainder.
-def fx_atom (ts : List FxTok) : Maybe (Pair (List FxTok) (List FxTok)) :=
-    match ts with
-    | Nil => Nothing (Pair (List FxTok) (List FxTok))
-    | Cons t rest =>
-        match fx_opens_bracket t with
-        | True => fx_group_go rest Z ([t] : List FxTok)
-        | False =>
-            match fx_is_kind t fx_k_sym with
-            | True => Nothing (Pair (List FxTok) (List FxTok))
-            | False => Just (Pair (List FxTok) (List FxTok))
-                         (MkPair (List FxTok) (List FxTok) ([t] : List FxTok) rest)
-            end
-        end
-    end;
 
 def fx_first_tok (ts : List FxTok) : FxTok :=
     head FxTok fx_no_tok ts;
@@ -279,19 +261,6 @@ def fx_toks_text (src : String) (ts : List FxTok) : String :=
     fx_slice src (fx_toks_start ts) (fx_toks_end ts);
 
 -- Strip one pair of enclosing parentheses from an atom's token list.
-def fx_unparen (ts : List FxTok) : List FxTok :=
-    match ts with
-    | Nil => ts
-    | Cons t rest =>
-        match fx_is_word t "(" with
-        | False => ts
-        | True =>
-            match fx_is_word (fx_last_tok ts) ")" with
-            | True => init FxTok rest
-            | False => ts
-            end
-        end
-    end;
 
 -- A run of identifier, number, string, and nested group tokens with no
 -- operators at depth zero: safe to embed as a list element without parens.
@@ -332,7 +301,7 @@ def fx_atom_text (src : String) (atom : List FxTok) : String :=
     match fx_is_word (fx_first_tok atom) "(" with
     | False => fx_toks_text src atom
     | True =>
-        let inner : List FxTok := fx_unparen atom in
+        let inner : List FxTok := st_unparen atom in
         match fx_simple_app inner with
         | True => fx_toks_text src inner
         | False => fx_toks_text src atom

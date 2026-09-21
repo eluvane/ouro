@@ -3,13 +3,13 @@
 import "../repo_gate/paths.ouro";
 import "gates.ouro";
 import "report.ouro";
-import "../repo_gate/checks.ouro";
-import "../repo_gate/parity_closure.ouro";
+import "../repo_gate/selftest_checks.ouro";
+import "../repo_gate/selftest_parity.ouro";
 import "../repo_gate/report.ouro";
-import "../../std/workspace.ouro";
-import "../../std/json.ouro";
 import "../../std/io.ouro";
 import "../../std/args.ouro";
+import "../../std/processx.ouro";
+import "../../std/pathx.ouro";
 
 
 inductive NativeRepoSelftestState : Type :=
@@ -78,9 +78,9 @@ def nrs_repo_copy (root : String) (dst : String) : IO Unit :=
        match made with
        | Left e => do eprintln (fs_error_message e); exit 1
        | Right _ =>
-         do let! listed := proc_exec "git"
+         do let! listed := process_run_spec (command_spec "git"
               ([ "-C", root, "ls-files", "--cached", "--others", "--exclude-standard" ]
-                : List String);
+                : List String));
             match proc_ok listed with
             | False => do eprintln "native selftest: git ls-files failed"; exit 1
             | True => io_foreach String (nrs_copy_visible_repo_file root dst)
@@ -112,8 +112,8 @@ def native_make_fixture (root : String) : IO Unit :=
 
 
 def native_profile_pass (profile : String) (root : String) : IO Bool :=
-    do let! base := run_profile_checks profile root;
-       let! extra := run_profile_extra_checks profile root;
+    do let! base := selftest_profile_checks profile root;
+       let! extra := selftest_extra_checks profile root;
        io_pure Bool (checks_pass (append GateCheck base extra))
 
 
@@ -128,9 +128,9 @@ def native_env_assignment (name : String) (value : String) : String :=
 
 def native_wrapper_run (python : String) (root : String) (script : String)
     (work : String) (report : String) : IO ProcResult :=
-    proc_exec "env"
+    process_run_spec (command_spec "env"
       ([ native_env_assignment "OURO_REPO_GATE_ROOT" root, python, script,
-         "--work", work, "--report", report ] : List String)
+         "--work", work, "--report", report ] : List String))
 
 
 def native_wrapper_expected (python : String) (root : String) (script : String)
@@ -315,7 +315,7 @@ def native_project_suite_rows (state : NativeRepoSelftestState) (out : String) (
        native_selftest_row s13 "legacy-wrapper-native-parity" (andb wrapper_missing native_missing)
 
 def native_proc_expected (program : String) (args : List String) (expected : Bool) : IO Bool :=
-    do let! result := proc_exec program args;
+    do let! result := process_run_spec (command_spec program args);
        io_pure Bool (native_bool_eq (proc_ok result) expected)
 
 
@@ -447,12 +447,30 @@ def native_host_report_rows (state : NativeRepoSelftestState)
          (native_host_fail_schema failed_report)
 
 
+-- Force a real public CLI to fail while writing its first gate log. The
+-- previous aggregate must already be gone when no new summary can be written.
+def native_ci_interrupted_report_row (state : NativeRepoSelftestState)
+    (root : String) (out : String) : IO NativeRepoSelftestState :=
+    let work : String := fs_child out "ci-interrupted" in
+    let summary : String := fs_child work "ci-summary.json" in
+    do repo_mkdir work;
+       repo_write summary "{\"pass\":true}\n";
+       repo_mkdir (fs_child work "optional-host-unavailable.log");
+       let! stopped := native_proc_expected "sh"
+         ([ "scripts/ouro_ci_gate.sh", "--profile", "selftest-unavailable",
+            "--root", root, "--out", work ] : List String) False;
+       let! retained := fs_exists summary;
+       native_selftest_row state "ci-interrupted-run-removes-stale-summary"
+         (andb stopped (notb retained))
+
+
 def native_ci_selection_rows (state : NativeRepoSelftestState)
     (root : String) (out : String) (fixtures : String) : IO NativeRepoSelftestState :=
     do let! s35 := native_ci_list_rows state;
        let! s40 := native_run_proc_cases (native_ci_process_cases root out fixtures) s35;
        let! s41 := native_selftest_row s40 "ci-json-schema" native_ci_report_schema_ok;
-       native_host_report_rows s41 out
+       let! s42 := native_ci_interrupted_report_row s41 root out;
+       native_host_report_rows s42 out
 
 
 def native_docs_wrapper_report_rows (state : NativeRepoSelftestState)
@@ -558,8 +576,8 @@ def native_text_contains_all (text : String) (tokens : List String) : Bool :=
 
 def native_python_route_rows (state : NativeRepoSelftestState)
     (python : String) : IO NativeRepoSelftestState :=
-    do let! listed := proc_exec python
-         ([ "scripts/ci_gate.py", "--profile", "pr", "--list" ] : List String);
+    do let! listed := process_run_spec (command_spec python
+         ([ "scripts/ci_gate.py", "--profile", "pr", "--list" ] : List String));
        let! s53 := native_selftest_row state
          "python-ci-docs-project-workflow-native-route"
          (andb (proc_ok listed)
@@ -576,9 +594,9 @@ def native_smith_registry_contract : Bool :=
       , "{\"layers\":{\"surface\":{\"generator_features\":[\"form:list\",\"form:record\"]}}}"
       , "{\"unrelated\":[\"form:list\",\"form:record\",\"parity:imports\"]}"
       ] in
-    andb (nullb GateIssue (smith_strategy_issues valid))
+    andb (nullb GateIssue (selftest_smith_issues valid))
       (all String (fun (text : String) =>
-        notb (nullb GateIssue (smith_strategy_issues text))) invalid);
+        notb (nullb GateIssue (selftest_smith_issues text))) invalid);
 
 
 def native_policy_route_rows (state : NativeRepoSelftestState)
@@ -641,8 +659,8 @@ def native_run_manifest_cases (fixtures : String) : List NativeManifestCase -> S
         match c with
         | MkNativeManifestCase name fixture prefix expected_code
             expected_stdout expected_stderr =>
-            do let! result := proc_exec "sh"
-                 (native_manifest_case_args out name fixture prefix fixtures);
+            do let! result := process_run_spec (command_spec "sh"
+                 (native_manifest_case_args out name fixture prefix fixtures));
                let! next := native_selftest_row state name
                  (native_manifest_case_ok result expected_code
                    expected_stdout expected_stderr);
@@ -659,13 +677,13 @@ def native_manifest_rows (state : NativeRepoSelftestState) (out : String)
 
 def native_finish_pass_text (state : NativeRepoSelftestState) (out : String) : String :=
     str_cat4 "OURO_NATIVE_REPO_CI_SUITE: PASS rows="
-      (show_nat (native_selftest_rows state)) " out=" out;
+      (prim_string_of_nat (native_selftest_rows state)) " out=" out;
 
 
 def native_finish_fail_text (state : NativeRepoSelftestState) (out : String) : String :=
     str_cat4 "OURO_NATIVE_REPO_CI_SUITE: FAIL rows="
-      (show_nat (native_selftest_rows state)) " failures="
-      (str_cat3 (show_nat (native_selftest_failures state)) " out=" out);
+      (prim_string_of_nat (native_selftest_rows state)) " failures="
+      (str_cat3 (prim_string_of_nat (native_selftest_failures state)) " out=" out);
 
 
 def native_finish_selftest (state : NativeRepoSelftestState) (out : String) : IO Unit :=

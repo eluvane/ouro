@@ -280,12 +280,15 @@ def prepare_tools(cases: Sequence[Case], out: Path) -> list[dict[str, Any]]:
         tools.append(("tools/collect.ouro", "ouro-collect"))
     if "formatter-suite" in labels:
         tools.append(("tools/fmt.ouro", "ouro-fmt"))
+        tools.append(("tests/quality_source_write_driver.ouro", "quality-source-write"))
     if any(label.startswith("analyzer-") for label in labels):
         tools.append(("tools/analyze/main.ouro", "ouro-analyze"))
     if "analyzer-drive-largest-file" in labels:
         tools.append(("tools/analyze/drive_main.ouro", "ouro-analyze-drive"))
     if "docs-examples-gate" in labels:
         tools.append(("tools/repo_gate/main.ouro", "ouro-repo-gate"))
+    if "strict-quality-gate" in labels:
+        tools.append(("tools/strict/main.ouro", "ouro-strict-quality-firewall"))
     directory = Path(os.environ.get("OURO_C_BUILD_DIR", str(ROOT / "_build/c")))
     if not directory.is_absolute():
         directory = ROOT / directory

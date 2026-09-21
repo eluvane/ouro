@@ -594,12 +594,15 @@ static ouro_v *f_env(ouro_env *env, ouro_v *name)
 	return thunk(env_run, ouro_cons(name, 0));
 }
 
-static ouro_v *read_fail(FILE *f, char *buf)
+static char *rename_path_text(ouro_v *value);
+
+static ouro_v *read_fail(FILE *f, char *buf, const char *phase)
 {
 	free(buf);
 	if (f)
 		fclose(f);
-	return owned_str("");
+	fprintf(stderr, "ouro run: fs_read_file: %s failed\n", phase);
+	exit(73);
 }
 
 static ouro_v *fs_read_run(ouro_env *env, ouro_v *u)
@@ -608,26 +611,31 @@ static ouro_v *fs_read_run(ouro_env *env, ouro_v *u)
 	FILE *f;
 	long len;
 	char *buf;
+	struct stat info;
 	ouro_v *r;
 	(void)u;
 	sandbox_die("fs_read_file");
-	path = cstr_of(env->v);
+	path = rename_path_text(env->v);
 	if (path == 0)
-		return owned_str("");
+		return read_fail(0, 0, "path");
 	f = fopen(path, "rb");
 	free(path);
 	if (f == 0)
-		return owned_str("");
-	if (fseek(f, 0L, SEEK_END) != 0 || (len = ftell(f)) < 0)
-		return read_fail(f, 0);
-	rewind(f);
+		return read_fail(0, 0, "open");
+	if (fstat(fileno(f), &info) != 0 || !S_ISREG(info.st_mode))
+		return read_fail(f, 0, "regular file");
+	if (fseek(f, 0L, SEEK_END) != 0 || (len = ftell(f)) < 0 || len > INT_MAX)
+		return read_fail(f, 0, "size");
+	if (fseek(f, 0L, SEEK_SET) != 0)
+		return read_fail(f, 0, "seek");
 	buf = (char *)malloc((unsigned long)len + 1UL);
 	if (buf == 0)
-		return read_fail(f, 0);
+		return read_fail(f, 0, "allocation");
 	if (len > 0 && fread(buf, 1, (unsigned long)len, f) != (unsigned long)len)
-		return read_fail(f, buf);
+		return read_fail(f, buf, "complete read");
 	buf[len] = 0;
-	fclose(f);
+	if (fclose(f) != 0)
+		return read_fail(0, buf, "close");
 	r = ouro_packed((const unsigned char *)buf, (unsigned long)len);
 	free(buf);
 	return r;
@@ -1809,6 +1817,8 @@ static ouro_v *f_fs_rename(ouro_env *env, ouro_v *src)
 	return ouro_clos(f_fs_rename_dst, ouro_cons(src, 0));
 }
 
+#include "ouro_fs_replace.h"
+
 static ouro_v *stdin_bytes_run(ouro_env *env, ouro_v *u)
 {
 	unsigned long want = nat_u(env->v);
@@ -2288,37 +2298,758 @@ static ouro_v *f_proc_inherit(ouro_env *env, ouro_v *command)
 
 /* The transitional C host has no HTTP transport. Preserve the checked
    three-argument interface and report unavailability only when IO runs. */
-/* Bounded capture is unavailable in the temporary C host. No child is
-   launched; construction and partial application remain pure capture. */
-static ouro_v *proc_bounded_unavailable_run(ouro_env *env, ouro_v *unit)
+/* Narrow Windows adapter for ouro.process.capture_bounded (transitional C
+   host only). The Direct-PE Ouro owner under runtime/platform/ remains the
+   reference; this adapter mirrors its reply contract from std/process.ouro:
+   kinds 0 child exit, 1 OS error, 2 timeout, 3 cleanup failure, 4 invalid
+   limits (field 1..5), 5 memory event, 6 stdout cap, 7 stderr cap. No child
+   runs until the IO thunk runs; partial application stays pure and reusable.
+   Scope: Windows Job with kill-on-close and a job-memory cap, completion-port
+   memory events 9/10, creation-time job assignment (no uncontained retry),
+   private temp capture files, finite waits only. CPU policy is validated as
+   exactly 1 without additional affinity pinning. POSIX keeps reporting host
+   unavailability (kind 1/detail 120). Malformed request shapes fail closed
+   as OS error 87. See docs/tcb.md for the retained runtime assumptions. */
+static ouro_v *bounded_reply(uint64_t kind, uint64_t detail, uint64_t peak,
+	const unsigned char *out, unsigned long out_len,
+	const unsigned char *err, unsigned long err_len)
 {
-    ouro_v *fields[2];
-    ouro_v *result;
-    (void)env;
-    (void)unit;
-    fields[0] = owned_str(""); fields[1] = owned_str("");
-    result = ouro_ctor(0, 2, fields);
-    fields[0] = ouro_nat(0); fields[1] = result;
-    result = ouro_ctor(0, 2, fields);
-    fields[0] = ouro_nat(120); fields[1] = result;
-    result = ouro_ctor(0, 2, fields);
-    fields[0] = ouro_nat(1); fields[1] = result;
-    return ouro_ctor(0, 2, fields);
+	ouro_v *fields[2];
+	ouro_v *result;
+	fields[0] = ouro_packed(out, out_len);
+	fields[1] = ouro_packed(err, err_len);
+	result = ouro_ctor(0, 2, fields);
+	fields[0] = ouro_nat_u64(peak);
+	fields[1] = result;
+	result = ouro_ctor(0, 2, fields);
+	fields[0] = ouro_nat_u64(detail);
+	fields[1] = result;
+	result = ouro_ctor(0, 2, fields);
+	fields[0] = ouro_nat((unsigned long)kind);
+	fields[1] = result;
+	return ouro_ctor(0, 2, fields);
 }
+
+static ouro_v *bounded_empty(uint64_t kind, uint64_t detail)
+{
+	return bounded_reply(kind, detail, 0, 0, 0, 0, 0);
+}
+
+#ifdef _WIN32
+#ifndef PROC_THREAD_ATTRIBUTE_JOB_LIST
+#define PROC_THREAD_ATTRIBUTE_JOB_LIST 0x2000D
+#endif
+/* Non-fatal Nat to u64. Peano spines, packed cells and up to two limbs are
+   accepted; larger or malformed values fail closed without exiting. */
+static int bounded_nat_u64(ouro_v *v, uint64_t *out)
+{
+	uint64_t successors = 0;
+	uint64_t number = 0;
+	int i;
+	while (v != 0 && v->tag == 1 && v->n == 1) {
+		if (successors == UINT64_MAX)
+			return 0;
+		successors++;
+		v = OURO_F(v, 0);
+	}
+	if (v == 0)
+		return 0;
+	if (v->tag == OURO_TAG_NAT && v->n >= 0) {
+		number = (uint64_t)v->n;
+	} else if (v->tag == OURO_TAG_BIG_NAT && v->n > 0 && v->n <= 2) {
+		uint32_t *limbs = (uint32_t *)(v + 1);
+		for (i = v->n; i-- > 0;)
+			number = (number << 32) | limbs[i];
+	} else if (v->tag == 0 && v->n == 0) {
+		number = 0;
+	} else {
+		return 0;
+	}
+	if (number > UINT64_MAX - successors)
+		return 0;
+	*out = number + successors;
+	return 1;
+}
+
+static int bounded_pair(ouro_v *v, ouro_v **a, ouro_v **b)
+{
+	if (v == 0 || v->tag != 0 || v->n != 2)
+		return 0;
+	*a = OURO_F(v, 0);
+	*b = OURO_F(v, 1);
+	return 1;
+}
+
+static int bounded_utf16(const char *bytes, unsigned long len, wchar_t **out, DWORD *err)
+{
+	int need;
+	wchar_t *wide;
+	*out = 0;
+	need = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, bytes, (int)len, NULL, 0);
+	if (need <= 0) {
+		*err = GetLastError();
+		return 0;
+	}
+	wide = (wchar_t *)malloc(((size_t)need + 1U) * sizeof(wchar_t));
+	if (wide == 0) {
+		*err = 14;
+		return 0;
+	}
+	if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, bytes, (int)len, wide, need) != need) {
+		*err = GetLastError();
+		free(wide);
+		return 0;
+	}
+	wide[need] = 0;
+	*out = wide;
+	return 1;
+}
+
+/* MSVC-style quoting so CommandLineToArgvW recovers each argument exactly. */
+static int bounded_quote(const char *arg, char **out)
+{
+	size_t cap = strlen(arg) * 2U + 3U;
+	size_t at = 0;
+	size_t slashes = 0;
+	const char *p;
+	char *buf = (char *)malloc(cap);
+	if (buf == 0)
+		return 0;
+	buf[at++] = '"';
+	for (p = arg; ; p++) {
+		if (*p == '\\') {
+			slashes++;
+			continue;
+		}
+		if (*p == '"') {
+			size_t i;
+			for (i = 0; i < slashes * 2U + 1U; i++)
+				buf[at++] = '\\';
+			buf[at++] = '"';
+			slashes = 0;
+			continue;
+		}
+		{
+			size_t i;
+			for (i = 0; i < slashes; i++)
+				buf[at++] = '\\';
+			slashes = 0;
+		}
+		if (*p == 0)
+			break;
+		buf[at++] = *p;
+	}
+	{
+		size_t i;
+		for (i = 0; i < slashes * 2U; i++)
+			buf[at++] = '\\';
+	}
+	buf[at++] = '"';
+	buf[at] = 0;
+	*out = buf;
+	return 1;
+}
+
+static int bounded_cmd_append(char **line, size_t *used, size_t *cap, const char *piece, int spaced)
+{
+	size_t n = strlen(piece);
+	size_t extra = n + (spaced ? 1U : 0U);
+	char *grown;
+	if (*used + extra + 1U > *cap) {
+		size_t next = *cap * 2U + extra + 1U;
+		if (next < *cap)
+			return 0;
+		grown = (char *)realloc(*line, next);
+		if (grown == 0)
+			return 0;
+		*line = grown;
+		*cap = next;
+	}
+	if (spaced)
+		(*line)[(*used)++] = ' ';
+	memcpy(*line + *used, piece, n + 1U);
+	*used += n;
+	return 1;
+}
+
+/* Terminate the private job, then wait for ActiveProcesses=0 with a finite
+   budget. Success means no descendant survives; failure is kind 3. */
+static int bounded_quiesce(HANDLE job, DWORD *err)
+{
+	ULONGLONG start = GetTickCount64();
+	if (!TerminateJobObject(job, 1)) {
+		*err = GetLastError();
+		return 0;
+	}
+	for (;;) {
+		JOBOBJECT_BASIC_ACCOUNTING_INFORMATION acct;
+		if (!QueryInformationJobObject(job, JobObjectBasicAccountingInformation,
+		    &acct, sizeof acct, NULL)) {
+			*err = GetLastError();
+			return 0;
+		}
+		if (acct.ActiveProcesses == 0)
+			return 1;
+		if (GetTickCount64() - start > 5000) {
+			*err = 258;
+			return 0;
+		}
+		Sleep(10);
+	}
+}
+
+static void bounded_drain_port(HANDLE port, int *saw9, int *saw10)
+{
+	for (;;) {
+		DWORD code = 0;
+		ULONG_PTR key = 0;
+		LPOVERLAPPED ov = NULL;
+		if (!GetQueuedCompletionStatus(port, &code, &key, &ov, 0))
+			return;
+		if (code == 9)
+			*saw9 = 1;
+		if (code == 10)
+			*saw10 = 1;
+	}
+}
+
+/* 0 ok, 1 over cap (actual set, no allocation), 2 OS error. */
+static int bounded_read_file(const char *path, uint64_t cap,
+	unsigned char **buf, unsigned long *len, uint64_t *actual, DWORD *err)
+{
+	HANDLE h = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+		NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+	LARGE_INTEGER size;
+	unsigned char *p;
+	uint64_t off = 0;
+	*buf = 0;
+	*len = 0;
+	if (h == INVALID_HANDLE_VALUE) {
+		*err = GetLastError();
+		return 2;
+	}
+	if (!GetFileSizeEx(h, &size) || size.QuadPart < 0) {
+		*err = GetLastError();
+		CloseHandle(h);
+		return 2;
+	}
+	*actual = (uint64_t)size.QuadPart;
+	if (*actual > cap) {
+		CloseHandle(h);
+		return 1;
+	}
+	if (*actual > (uint64_t)INT_MAX) {
+		CloseHandle(h);
+		*err = 14;
+		return 2;
+	}
+	p = (unsigned char *)malloc((size_t)*actual + 1U);
+	if (p == 0) {
+		CloseHandle(h);
+		*err = 14;
+		return 2;
+	}
+	if (*actual > 0) {
+		while (off < *actual) {
+			DWORD chunk = (*actual - off) > 0x1000000ULL ?
+				0x1000000 : (DWORD)(*actual - off);
+			DWORD got = 0;
+			if (!ReadFile(h, p + off, chunk, &got, NULL) || got == 0) {
+				*err = GetLastError();
+				free(p);
+				CloseHandle(h);
+				return 2;
+			}
+			off += got;
+		}
+	}
+	CloseHandle(h);
+	p[*actual] = 0;
+	*buf = p;
+	*len = (unsigned long)*actual;
+	return 0;
+}
+
+static ouro_v *proc_bounded_run(ouro_env *env, ouro_v *unit)
+{
+	ouro_v *request;
+	ouro_v *args;
+	ouro_v *command_v;
+	ouro_v *stdin_v;
+	ouro_v *r1;
+	ouro_v *timeout_v;
+	ouro_v *r2;
+	ouro_v *memory_v;
+	ouro_v *r3;
+	ouro_v *cpu_v;
+	ouro_v *r4;
+	ouro_v *out_cap_v;
+	ouro_v *err_cap_v;
+	uint64_t timeout_ms;
+	uint64_t memory_mb;
+	uint64_t cpu;
+	uint64_t out_cap;
+	uint64_t err_cap;
+	char *stdin_bytes = 0;
+	unsigned long stdin_len = 0;
+	char *cmd_bytes = 0;
+	unsigned long cmd_len = 0;
+	char *cmdline = 0;
+	size_t cmd_used = 0;
+	size_t cmd_cap = 0;
+	wchar_t *exe_w = 0;
+	wchar_t *cmdline_w = 0;
+	char dir[4096];
+	char stdin_path[4096];
+	char out_path[4096];
+	char err_path[4096];
+	HANDLE job = NULL;
+	HANDLE port = NULL;
+	HANDLE h_stdin = INVALID_HANDLE_VALUE;
+	HANDLE h_stdout = INVALID_HANDLE_VALUE;
+	HANDLE h_stderr = INVALID_HANDLE_VALUE;
+	HANDLE h_process = NULL;
+	LPPROC_THREAD_ATTRIBUTE_LIST attrs = 0;
+	ouro_v *reply = 0;
+	ouro_env *pending = 0;
+	ouro_v *rest = 0;
+	int dir_ready = 0;
+	int stdin_ready = 0;
+	int out_ready = 0;
+	int err_ready = 0;
+	DWORD err = 0;
+	(void)unit;
+	sandbox_die("proc_bounded");
+	if (env == 0 || env->next == 0 || env->next->next == 0)
+		return bounded_empty(1, 87);
+	request = env->v;
+	args = env->next->v;
+	command_v = env->next->next->v;
+	if (!bounded_pair(request, &stdin_v, &r1) ||
+	    !bounded_pair(r1, &timeout_v, &r2) ||
+	    !bounded_pair(r2, &memory_v, &r3) ||
+	    !bounded_pair(r3, &cpu_v, &r4) ||
+	    !bounded_pair(r4, &out_cap_v, &err_cap_v))
+		return bounded_empty(1, 87);
+	if (!bounded_nat_u64(timeout_v, &timeout_ms) ||
+	    timeout_ms == 0 || timeout_ms >= 0xFFFFFFFFULL)
+		return bounded_empty(4, 1);
+	if (!bounded_nat_u64(memory_v, &memory_mb) ||
+	    memory_mb == 0 || memory_mb >= 0x100000000000ULL)
+		return bounded_empty(4, 2);
+	if (!bounded_nat_u64(cpu_v, &cpu) || cpu != 1)
+		return bounded_empty(4, 3);
+	if (!bounded_nat_u64(out_cap_v, &out_cap) ||
+	    out_cap >= 0xFFFFFFFFFFFFFFD1ULL)
+		return bounded_empty(4, 4);
+	if (!bounded_nat_u64(err_cap_v, &err_cap) ||
+	    err_cap >= 0xFFFFFFFFFFFFFFD1ULL)
+		return bounded_empty(4, 5);
+	stdin_bytes = codes_to_cstr(stdin_v, &stdin_len);
+	if (stdin_bytes == 0)
+		return bounded_empty(1, 14);
+	cmd_bytes = codes_to_cstr(command_v, &cmd_len);
+	if (cmd_bytes == 0) {
+		free(stdin_bytes);
+		return bounded_empty(1, 14);
+	}
+	if (cmd_len == 0 || memchr(cmd_bytes, 0, cmd_len) != 0) {
+		free(stdin_bytes);
+		free(cmd_bytes);
+		return bounded_empty(1, 87);
+	}
+	cmdline = (char *)malloc(256);
+	if (cmdline == 0) {
+		free(stdin_bytes);
+		free(cmd_bytes);
+		return bounded_empty(1, 14);
+	}
+	cmd_cap = 256;
+	{
+		char *quoted = 0;
+		if (!bounded_quote(cmd_bytes, &quoted) ||
+		    !bounded_cmd_append(&cmdline, &cmd_used, &cmd_cap, quoted, 0)) {
+			free(quoted);
+			free(stdin_bytes);
+			free(cmd_bytes);
+			free(cmdline);
+			return bounded_empty(1, 14);
+		}
+		free(quoted);
+	}
+	rest = args;
+	for (;;) {
+		char *text = 0;
+		unsigned long text_len = 0;
+		char *quoted = 0;
+		int ok = 1;
+		if (rest == 0) {
+			reply = bounded_empty(1, 87);
+			goto cleanup;
+		}
+		if (rest->tag == OURO_TAG_CAT && rest->n == 2) {
+			ouro_env *node = (ouro_env *)malloc(sizeof *node);
+			if (node == 0) {
+				reply = bounded_empty(1, 14);
+				goto cleanup;
+			}
+			node->v = OURO_F(rest, 1);
+			node->next = pending;
+			pending = node;
+			rest = OURO_F(rest, 0);
+			continue;
+		}
+		if (rest->tag == 0 && rest->n == 0) {
+			ouro_env *node = pending;
+			if (node == 0)
+				break;
+			rest = node->v;
+			pending = node->next;
+			free(node);
+			continue;
+		}
+		if (rest->tag != 1 || rest->n != 2) {
+			reply = bounded_empty(1, 87);
+			goto cleanup;
+		}
+		text = codes_to_cstr(OURO_F(rest, 0), &text_len);
+		if (text == 0) {
+			reply = bounded_empty(1, 14);
+			goto cleanup;
+		}
+		if (memchr(text, 0, text_len) != 0)
+			ok = 0;
+		else if (!bounded_quote(text, &quoted))
+			ok = 0;
+		else if (!bounded_cmd_append(&cmdline, &cmd_used, &cmd_cap, quoted, 1))
+			ok = 0;
+		free(quoted);
+		free(text);
+		if (!ok) {
+			reply = bounded_empty(1, 87);
+			goto cleanup;
+		}
+		rest = OURO_F(rest, 1);
+	}
+	if (!bounded_utf16(cmd_bytes, cmd_len, &exe_w, &err) ||
+	    !bounded_utf16(cmdline, (unsigned long)cmd_used, &cmdline_w, &err)) {
+		reply = bounded_empty(1, err);
+		goto cleanup;
+	}
+	if (wcslen(cmdline_w) >= 32767) {
+		reply = bounded_empty(1, 87);
+		goto cleanup;
+	}
+	if (!create_private_capture_dir(dir, sizeof dir)) {
+		reply = bounded_empty(1, GetLastError());
+		goto cleanup;
+	}
+	dir_ready = 1;
+	if (snprintf(stdin_path, sizeof stdin_path, "%s/stdin", dir) < 0 ||
+	    snprintf(out_path, sizeof out_path, "%s/out", dir) < 0 ||
+	    snprintf(err_path, sizeof err_path, "%s/err", dir) < 0) {
+		reply = bounded_empty(1, 87);
+		goto cleanup;
+	}
+	if (!create_empty_private_file(stdin_path) ||
+	    !create_empty_private_file(out_path) ||
+	    !create_empty_private_file(err_path)) {
+		reply = bounded_empty(1, GetLastError());
+		goto cleanup;
+	}
+	stdin_ready = out_ready = err_ready = 1;
+	{
+		FILE *f = fopen(stdin_path, "wb");
+		if (f == 0) {
+			reply = bounded_empty(1, GetLastError());
+			goto cleanup;
+		}
+		if (stdin_len > 0 && fwrite(stdin_bytes, 1, stdin_len, f) != stdin_len) {
+			err = GetLastError();
+			fclose(f);
+			reply = bounded_empty(1, err);
+			goto cleanup;
+		}
+		if (fclose(f) != 0) {
+			reply = bounded_empty(1, GetLastError());
+			goto cleanup;
+		}
+	}
+	job = CreateJobObjectW(NULL, NULL);
+	if (job == NULL) {
+		reply = bounded_empty(1, GetLastError());
+		goto cleanup;
+	}
+	{
+		JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits;
+		ULONGLONG job_bytes = memory_mb * 1024ULL * 1024ULL;
+		ZeroMemory(&limits, sizeof limits);
+		limits.BasicLimitInformation.LimitFlags =
+			JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE |
+			JOB_OBJECT_LIMIT_JOB_MEMORY |
+			JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION;
+		limits.JobMemoryLimit = (SIZE_T)job_bytes;
+		if (!SetInformationJobObject(job, JobObjectExtendedLimitInformation,
+		    &limits, sizeof limits)) {
+			reply = bounded_empty(1, GetLastError());
+			goto cleanup;
+		}
+	}
+	port = CreateIoCompletionPort(INVALID_HANDLE_VALUE, NULL, 0, 1);
+	if (port == NULL) {
+		reply = bounded_empty(1, GetLastError());
+		goto cleanup;
+	}
+	{
+		JOBOBJECT_ASSOCIATE_COMPLETION_PORT assoc;
+		assoc.CompletionKey = (PVOID)(ULONG_PTR)1;
+		assoc.CompletionPort = port;
+		if (!SetInformationJobObject(job, JobObjectAssociateCompletionPortInformation,
+		    &assoc, sizeof assoc)) {
+			reply = bounded_empty(1, GetLastError());
+			goto cleanup;
+		}
+	}
+	{
+		SECURITY_ATTRIBUTES sa;
+		sa.nLength = sizeof sa;
+		sa.lpSecurityDescriptor = NULL;
+		sa.bInheritHandle = TRUE;
+		h_stdin = CreateFileA(stdin_path, GENERIC_READ, FILE_SHARE_READ,
+			&sa, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+		h_stdout = CreateFileA(out_path, GENERIC_WRITE, FILE_SHARE_READ,
+			&sa, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+		h_stderr = CreateFileA(err_path, GENERIC_WRITE, FILE_SHARE_READ,
+			&sa, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+		if (h_stdin == INVALID_HANDLE_VALUE ||
+		    h_stdout == INVALID_HANDLE_VALUE ||
+		    h_stderr == INVALID_HANDLE_VALUE) {
+			reply = bounded_empty(1, GetLastError());
+			goto cleanup;
+		}
+	}
+	{
+		SIZE_T need = 0;
+		HANDLE handles[3];
+		HANDLE jobs[1];
+		STARTUPINFOEXW siex;
+		PROCESS_INFORMATION pi;
+		InitializeProcThreadAttributeList(NULL, 2, 0, &need);
+		if (need == 0) {
+			reply = bounded_empty(1, GetLastError());
+			goto cleanup;
+		}
+		attrs = (LPPROC_THREAD_ATTRIBUTE_LIST)malloc(need);
+		if (attrs == 0) {
+			reply = bounded_empty(1, 14);
+			goto cleanup;
+		}
+		if (!InitializeProcThreadAttributeList(attrs, 2, 0, &need)) {
+			reply = bounded_empty(1, GetLastError());
+			goto cleanup;
+		}
+		handles[0] = h_stdin;
+		handles[1] = h_stdout;
+		handles[2] = h_stderr;
+		if (!UpdateProcThreadAttribute(attrs, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+		    handles, sizeof handles, NULL, NULL)) {
+			reply = bounded_empty(1, GetLastError());
+			goto cleanup;
+		}
+		jobs[0] = job;
+		if (!UpdateProcThreadAttribute(attrs, 0, PROC_THREAD_ATTRIBUTE_JOB_LIST,
+		    jobs, sizeof jobs, NULL, NULL)) {
+			reply = bounded_empty(1, GetLastError());
+			goto cleanup;
+		}
+		ZeroMemory(&siex, sizeof siex);
+		siex.StartupInfo.cb = sizeof siex;
+		siex.StartupInfo.dwFlags |= STARTF_USESTDHANDLES;
+		siex.StartupInfo.hStdInput = h_stdin;
+		siex.StartupInfo.hStdOutput = h_stdout;
+		siex.StartupInfo.hStdError = h_stderr;
+		siex.lpAttributeList = attrs;
+		ZeroMemory(&pi, sizeof pi);
+		if (!CreateProcessW(exe_w, cmdline_w, NULL, NULL, TRUE,
+		    EXTENDED_STARTUPINFO_PRESENT | CREATE_NO_WINDOW |
+		    BELOW_NORMAL_PRIORITY_CLASS,
+		    NULL, NULL, &siex.StartupInfo, &pi)) {
+			reply = bounded_empty(1, GetLastError());
+			goto cleanup;
+		}
+		CloseHandle(pi.hThread);
+		h_process = pi.hProcess;
+	}
+	CloseHandle(h_stdin);
+	CloseHandle(h_stdout);
+	CloseHandle(h_stderr);
+	h_stdin = h_stdout = h_stderr = INVALID_HANDLE_VALUE;
+	{
+		DWORD status = WaitForSingleObject(h_process, (DWORD)timeout_ms);
+		DWORD exit_code = 0;
+		uint64_t kind = 0;
+		uint64_t detail = 0;
+		uint64_t peak = 0;
+		int saw9 = 0;
+		int saw10 = 0;
+		unsigned char *out_buf = 0;
+		unsigned long out_len = 0;
+		unsigned char *err_buf = 0;
+		unsigned long err_len = 0;
+		uint64_t out_actual = 0;
+		uint64_t err_actual = 0;
+		int close_ok = 1;
+		if (status == WAIT_OBJECT_0) {
+			if (!GetExitCodeProcess(h_process, &exit_code)) {
+				DWORD qerr = GetLastError();
+				bounded_quiesce(job, &qerr);
+				reply = bounded_empty(1, qerr);
+				goto cleanup;
+			}
+			kind = 0;
+			detail = exit_code;
+		} else if (status == WAIT_TIMEOUT) {
+			kind = 2;
+			detail = timeout_ms;
+		} else {
+			DWORD werr = GetLastError();
+			DWORD qerr = 0;
+			bounded_quiesce(job, &qerr);
+			reply = bounded_empty(1, werr);
+			goto cleanup;
+		}
+		if (!bounded_quiesce(job, &err)) {
+			reply = bounded_empty(3, err);
+			goto cleanup;
+		}
+		bounded_drain_port(port, &saw9, &saw10);
+		{
+			JOBOBJECT_EXTENDED_LIMIT_INFORMATION ex;
+			if (!QueryInformationJobObject(job,
+			    JobObjectExtendedLimitInformation, &ex, sizeof ex, NULL)) {
+				reply = bounded_empty(1, GetLastError());
+				goto cleanup;
+			}
+			peak = (uint64_t)ex.PeakJobMemoryUsed;
+		}
+		if (saw9 || saw10) {
+			kind = 5;
+			detail = saw10 ? 10 : 9;
+		}
+		if (kind == 0 || kind == 2 || kind == 5) {
+			int out_rc = bounded_read_file(out_path, out_cap,
+				&out_buf, &out_len, &out_actual, &err);
+			int err_rc = 0;
+			if (out_rc == 2) {
+				reply = bounded_empty(1, err);
+				goto cleanup;
+			}
+			err_rc = bounded_read_file(err_path, err_cap,
+				&err_buf, &err_len, &err_actual, &err);
+			if (err_rc == 2) {
+				free(out_buf);
+				reply = bounded_empty(1, err);
+				goto cleanup;
+			}
+			if ((out_rc == 1 || err_rc == 1) && kind != 5) {
+				if (out_rc == 1) {
+					kind = 6;
+					detail = out_actual;
+				} else {
+					kind = 7;
+					detail = err_actual;
+				}
+				free(out_buf);
+				free(err_buf);
+				out_buf = err_buf = 0;
+				out_len = err_len = 0;
+			} else if (out_rc == 1 || err_rc == 1) {
+				free(out_buf);
+				free(err_buf);
+				out_buf = err_buf = 0;
+				out_len = err_len = 0;
+			}
+			reply = bounded_reply(kind, detail, peak, out_buf, out_len,
+				err_buf, err_len);
+			free(out_buf);
+			free(err_buf);
+		} else {
+			reply = bounded_empty(kind, detail);
+		}
+		if (h_process != NULL && !CloseHandle(h_process))
+			close_ok = 0;
+		h_process = NULL;
+		if (!CloseHandle(job))
+			close_ok = 0;
+		job = NULL;
+		if (!CloseHandle(port))
+			close_ok = 0;
+		port = NULL;
+		if (!close_ok) {
+			reply = bounded_empty(3, GetLastError());
+			goto cleanup;
+		}
+		goto cleanup;
+	}
+cleanup:
+	while (pending != 0) {
+		ouro_env *node = pending;
+		pending = node->next;
+		free(node);
+	}
+	free(stdin_bytes);
+	free(cmd_bytes);
+	free(cmdline);
+	free(exe_w);
+	free(cmdline_w);
+	if (attrs != 0) {
+		DeleteProcThreadAttributeList(attrs);
+		free(attrs);
+	}
+	if (h_stdin != INVALID_HANDLE_VALUE)
+		CloseHandle(h_stdin);
+	if (h_stdout != INVALID_HANDLE_VALUE)
+		CloseHandle(h_stdout);
+	if (h_stderr != INVALID_HANDLE_VALUE)
+		CloseHandle(h_stderr);
+	if (h_process != NULL)
+		CloseHandle(h_process);
+	if (job != NULL)
+		CloseHandle(job);
+	if (port != NULL)
+		CloseHandle(port);
+	if (stdin_ready)
+		remove(stdin_path);
+	if (out_ready)
+		remove(out_path);
+	if (err_ready)
+		remove(err_path);
+	if (dir_ready)
+		RemoveDirectoryA(dir);
+	if (reply == 0)
+		reply = bounded_empty(1, 14);
+	return reply;
+}
+#else
+static ouro_v *proc_bounded_run(ouro_env *env, ouro_v *unit)
+{
+	(void)env;
+	(void)unit;
+	return bounded_empty(1, 120);
+}
+#endif
 static ouro_v *f_proc_bounded_limits(ouro_env *env, ouro_v *limits)
 {
-    (void)env; (void)limits;
-    return thunk(proc_bounded_unavailable_run, 0);
+	return thunk(proc_bounded_run, ouro_cons(limits, env));
 }
 static ouro_v *f_proc_bounded_args(ouro_env *env, ouro_v *args)
 {
-    (void)env; (void)args;
-    return ouro_clos(f_proc_bounded_limits, 0);
+	return ouro_clos(f_proc_bounded_limits, ouro_cons(args, env));
 }
 static ouro_v *f_proc_bounded(ouro_env *env, ouro_v *command)
 {
-    (void)env; (void)command;
-    return ouro_clos(f_proc_bounded_args, 0);
+	(void)env;
+	return ouro_clos(f_proc_bounded_args, ouro_cons(command, 0));
 }
 
 static ouro_v *http_unavailable_run(ouro_env *env, ouro_v *unit)
@@ -2503,6 +3234,8 @@ static ouro_v *io_prim_new(const char *name)
 		return ouro_clos(f_fs_copy, 0);
 	if (strcmp(name, "prim_fs_rename") == 0)
 		return ouro_clos(f_fs_rename, 0);
+	if (strcmp(name, "prim_fs_replace_file") == 0)
+		return ouro_clos(f_fs_replace, 0);
 	if (strcmp(name, "prim_stdin_read_bytes") == 0)
 		return ouro_clos(f_stdin_bytes, 0);
 	if (strcmp(name, "prim_stdout_flush") == 0)

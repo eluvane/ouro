@@ -253,6 +253,7 @@ class NativeHarnessTests(unittest.TestCase):
         self.assertNotIn("PrimitiveRawLoad", kernel["primitives"])
         for primitive, owner in (("PrimitiveStdoutWrite", "compiler_primitive_registry_tests"),
                                  ("PrimitiveFileRename", "compiler_primitive_registry_tests"),
+                                 ("PrimitiveFileReplace", "compiler_primitive_registry_tests"),
                                  ("PrimitiveProcessBounded", "compiler_process_bounded_registry_tests")):
             self.assertEqual(kernel["external_owners"][primitive], "tests/" + owner + ".ouro")
             self.assertNotIn(primitive, kernel["primitives"])

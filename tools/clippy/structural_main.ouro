@@ -1,0 +1,103 @@
+-- Shared compiler-frontend/semantic Clippy worker. Keep the compiler AST
+-- cone separate from the JSON reporting cone; all decisions here are Ouro.
+
+-- @entry main
+
+import "session.ouro";
+
+-- Compatibility batch snapshots are evaluated through the same root seam.
+-- Never retain a list of full semantic units, even for this bounded API.
+def cg_s_collect_snapshots (root : String)
+    : List String -> Pair InternState CmParseCache
+    -> List (Pair String (List CgSProof))
+    -> IO (Either QualityInputError (List (Pair String (List CgSProof)))) :=
+  fix go (paths : List String) (state : Pair InternState CmParseCache)
+      (acc : List (Pair String (List CgSProof)))
+      : IO (Either QualityInputError (List (Pair String (List CgSProof)))) :=
+    match paths with
+    | Nil => io_pure (Either QualityInputError (List (Pair String (List CgSProof))))
+        (Right QualityInputError (List (Pair String (List CgSProof)))
+          (reverse_lin (Pair String (List CgSProof)) acc))
+    | Cons path rest =>
+        do let! loaded := cg_s_snapshot_request (MkPair String String root path) state;
+           match loaded with
+           | Left error => io_pure (Either QualityInputError (List (Pair String (List CgSProof))))
+               (Left QualityInputError (List (Pair String (List CgSProof))) error)
+           | Right pair => match pair with
+             | MkPair snapshot next => go rest next
+                 (Cons (Pair String (List CgSProof)) snapshot acc)
+             end
+           end
+    end;
+
+def cg_s_exceeds : Nat -> List String -> Bool :=
+  fix go (n : Nat) (xs : List String) : Bool :=
+    match n with
+    | Z => match xs with | Nil => False | Cons _ _ => True end
+    | S n2 => match xs with
+      | Nil => False
+      | Cons _ rest => go n2 rest
+      end
+    end;
+
+def cg_s_run_batch (root : String) (paths : List String) : IO Unit :=
+    match cg_s_exceeds cg_s_batch_limit paths with
+    | True => cg_s_emit_error
+        "structural batch exceeds recycle bound of 2 files"
+    | False =>
+        do let! loaded := cg_s_collect_snapshots root paths
+             (MkPair InternState CmParseCache empty_intern cm_cache0)
+             (Nil (Pair String (List CgSProof)));
+           match loaded with
+           | Left error => cg_s_emit_error (quality_input_message error)
+           | Right rows => cg_s_emit_batch rows
+           end
+    end;
+
+def cg_s_usage : IO Unit :=
+    do let! _e := eprintln
+         "usage: ouro-clippy-structural [--session] SOURCE_ROOT RELATIVE_PATH [RELATIVE_PATH...]";
+       exit 1
+
+def main : IO Unit :=
+    do let! argv := prim_argv;
+       match tail String argv with
+       | Nil => cg_s_usage
+       | Cons first rest =>
+           match prim_string_eq first "--cache-selftest" with
+           | True =>
+               let bound_ok : Bool :=
+                 andb (notb (cg_s_exceeds cg_s_batch_limit
+                   (["a", "b"] : List String)))
+                   (cg_s_exceeds cg_s_batch_limit
+                     (["a", "b", "c"] : List String)) in
+               match andb cm_cache_contracts bound_ok with
+               | True => exit 0
+               | False =>
+                   do let! _e := eprintln
+                        "CLIPPY_STRUCTURAL: FAIL cache hit/miss/stale/reset or batch bound";
+                      exit 1
+               end
+           | False => match prim_string_eq first "--session" with
+             | True => match rest with
+               | Nil => cg_s_usage
+               | Cons root paths => match paths with
+                 | Nil => cg_s_usage
+                 | Cons _ _ => cg_s_run_session root paths
+                 end
+               end
+             | False => match rest with
+             | Nil => cg_s_usage
+             | Cons path extra => match extra with
+               | Nil =>
+                   do let! loaded := cm_load first path;
+                      match loaded with
+                      | Left error => cg_s_emit_error (quality_input_message error)
+                      | Right unit => cg_s_run_unit unit
+                      end
+               | Cons _ _ => cg_s_run_batch first (Cons String path extra)
+               end
+             end
+             end
+           end
+       end

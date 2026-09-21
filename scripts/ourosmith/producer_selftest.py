@@ -5,6 +5,7 @@ import argparse
 import contextlib
 import copy
 import io
+import itertools
 import json
 import os
 import tempfile
@@ -30,10 +31,15 @@ class ProducerTests(unittest.TestCase):
             compiler.write_bytes(b"producer fixture\n" * 400)
             tools = {"ouro1": compiler}
 
-            def installed(tool, path):
+            def installed(tool, path, entry=None):
+                from native_tool_build import tool_companions
+
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_bytes((tool + " binary fixture\n").encode() * 400)
-                entry = host.tool_entry(tool)
+                entry = host.tool_entry(tool) if entry is None else entry
+                for companion in tool_companions(entry):
+                    companion_path = path.parent / (companion[1] + (".exe" if os.name == "nt" else ""))
+                    installed(companion[1], companion_path, companion[0])
                 _units, sources = source_inputs(entry)
                 inputs = {"kind": "ouro.native-tool-build.v1", "entry": entry, "fuel": 16000,
                           "compiler_sha256": digest(compiler), "sources": sources, "cc": "fixture",
@@ -94,6 +100,21 @@ class ProducerTests(unittest.TestCase):
             evidence["tools"]["fmt"]["build_key"] = saved["key"]
             with self.assertRaisesRegex(ValueError, "receipt"):
                 host.toolchain_paths(evidence, compiler=fixture.compiler)
+
+    def test_missing_or_changed_companion_rejects_complete_parent_receipt(self):
+        names = ("ouro-fix-check", "ouro-lint-style", "ouro-clippy-grade-firewall", "ouro-clippy-structural")
+        for name, mutation in itertools.product(names, ("missing-binary", "missing-receipt", "changed-binary")):
+            with self.subTest(name=name, mutation=mutation), self.fixture() as fixture:
+                evidence = host.toolchain_evidence(fixture.compiler, fixture.tools)
+                companion = fixture.directory / (name + (".exe" if os.name == "nt" else ""))
+                if mutation == "missing-binary":
+                    companion.unlink()
+                elif mutation == "missing-receipt":
+                    Path(str(companion) + ".build.json").unlink()
+                else:
+                    companion.write_bytes(b"changed companion\n" * 400)
+                with self.assertRaisesRegex(ValueError, "receipt"):
+                    host.toolchain_paths(evidence, compiler=fixture.compiler)
 
     def test_tool_builds_use_explicit_producer_and_stable_scoped_paths(self):
         with self.fixture() as fixture:

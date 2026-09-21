@@ -2,7 +2,7 @@
 
 Numeric helpers for small data-processing programs.
 
-Declarations: 22.
+Declarations: 21.
 
 ## def nat_eq
 
@@ -80,12 +80,6 @@ def nat_div_checked (n : Nat) (m : Nat) : Either String Nat
 
 ```
 def nat_mod_checked (n : Nat) (m : Nat) : Either String Nat
-```
-
-## def nat_range_count_go
-
-```
-def nat_range_count_go (start : Nat) (count : Nat) : List Nat
 ```
 
 ## def nat_range_count

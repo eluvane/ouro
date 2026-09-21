@@ -24,7 +24,7 @@ KIND = "ouro.frontend-native-async.v1"
 ENTRY = "tests/native_async_sleep_probe.ouro"
 SLEEP = "runtime/platform/windows_sleep.ouro"
 VARIANTS = ("original", "milliseconds", "flag")
-FAULTS = {"milliseconds": ("u32_from_nat 1000", "Nothing U32"),
+FAULTS = {"milliseconds": ("u32_from_nat windows_sleep_milliseconds_per_second", "Nothing U32"),
           "flag": ("u8_from_nat 1", "Nothing U8")}
 IMPORTS = ("advapi32.dll", "bcrypt.dll", "kernel32.dll", "shell32.dll")
 VALUES = ("millisecond-constant", "loop-flag-constant", "last-finite-word",
