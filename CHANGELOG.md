@@ -19,6 +19,10 @@ integration may change.
 
 ### Changed
 
+- Select affected PR suites and dependent compiler shards for mapped tool
+  changes, retain complete validation for shared or unknown inputs, and expose
+  the selected gates in the GitHub summary. Keep main pushes, merge queues and
+  manual CI runs complete; stop PR jobs after blocking failures.
 - Share verified Linux compiler bootstrap artifacts across PR jobs, retain
   kernel coverage without duplicate PR gates, balance compiler shards by
   measured build cost, and give documentation changes a focused CI route.

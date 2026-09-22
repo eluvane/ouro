@@ -40,8 +40,9 @@ List the gates in a profile without running them:
 python3 scripts/ci_gate.py --profile pr --list
 ```
 
-GitHub runs the same PR inventory as seventeen isolated groups so the slow suites do
-not block one another on a single runner:
+The complete PR inventory has seventeen isolated groups. GitHub selects affected
+groups and gates for reviewed tool paths; main-branch pushes, merge queues and
+manual CI runs use the complete inventory:
 
 ```sh
 python3 scripts/ci_gate.py --profile pr --group checks
@@ -71,7 +72,7 @@ Use isolated checkouts when running
 groups concurrently: several suites own fixed fixture/output paths. The full
 local command runs every gate in registry order. The runner rejects a group
 inventory that omits, duplicates, or invents a gate; its self-test also checks
-that each hosted matrix exactly matches its profile's group inventory. The
+complete matrix coverage and the affected-path routing contracts. The
 `analysis` group owns memory budgets, C analysis, and LSP; `checker` owns
 hardening, scale, and depth; analyzer precision and lint run independently.
 Execution removes the previous `ci-summary.json` before starting gates, so an
@@ -160,7 +161,8 @@ The hosted `Compiler kernel` job runs `--profile kernel-extra`: only the
 kernel OuroSmith gate, which is absent from PR. The complete standalone
 `--profile kernel` remains unchanged. A runner self-test requires the union
 of PR and kernel-extra to cover every kernel gate, with no duplicated gates
-in kernel-extra. All eight compiler shards still run in PR.
+in kernel-extra. All eight compiler shards run for compiler, runtime, standard
+library, bootstrap, build infrastructure and unclassified changes.
 
 The static `Kernel` check always runs and requires successful path selection,
 compiler preparation, every selected PR or docs group, selected kernel checks,
@@ -177,13 +179,66 @@ Markdown under `docs/` use the `docs` profile: workflow/project policy, API
 baseline drift, documentation suite, and documentation examples. Editor and
 site changes keep their own checks when combined with docs. Generated API
 pages, generated hashes, executable examples, trust/build/CI/release/design
-documents, code, scripts, workflows, and unknown paths retain full PR
-validation. Empty or unavailable diffs select full validation. A docs-and-code
-change runs the full PR inventory, which already includes all docs gates.
+documents and unknown paths retain full PR validation. Empty or unavailable
+diffs select full validation. A docs-and-code change includes all docs gates.
 
 ```sh
 python3 scripts/ci_gate.py --profile docs --out _build/ci/docs
 ```
+
+### Affected PR checks
+
+`Paths` first runs the CI runner's self-tests, before compiler builds. It then
+compares the PR base with GitHub's tested merge commit. The NUL-delimited local
+Git diff has no API file-list limit; rename detection is disabled so both the
+old and new path contribute to selection. Missing revisions, Git errors,
+timeouts, oversized output, or an empty diff select complete validation.
+
+The explicit routing table in `scripts/ci_gate.py` currently covers these inputs:
+
+| Changed area | Additional checks |
+| --- | --- |
+| Formatter, fixer, analyzer, analyzer fixtures and their suite launchers | Formatter, fixer, analyzer precision, memory budgets, LSP and language/tool integration |
+| Package manager, scanner fixtures and package suite launcher | Package suite and applicable release packaging checks |
+| LSP implementation and suite launcher | LSP protocol suite |
+| Documentation generator and suite launcher | Documentation and LSP suites, which share the document model |
+
+Every code route retains repository policy, Python/shell lint, API drift,
+generated hashes, compiler boundary, strict and structural quality, documentation
+examples, hygiene, and the test/Smith/sample/lint integration suites. The table
+selects existing gates; it does not change their assertions or profiles.
+Unlisted files select the complete PR inventory and portable checks. Changes
+to compiler, runtime and standard library inputs also retain kernel-extra.
+
+For narrowed routes, the planner follows transitive imports from the canonical
+compiler fixture inventory, using the build system's import reader and checking
+its import count against the existing source tokenizer. A tool
+dependency of a compiler fixture adds that fixture's existing round-robin shard.
+An unreadable dependency, unsupported import layout or inventory shape selects
+full validation.
+New tool families remain full-validation inputs until their consumers are mapped.
+
+The job outputs contain the changed paths, a dynamic matrix and a digest of the
+complete selection. Each consumer recomputes the decision from its checkout and
+requires the same digest. Invalid JSON, an empty selected group, or disagreement
+with the producer is an error. `Kernel` still requires every selected job to
+succeed; a skipped required job or failed/cancelled matrix cannot satisfy it.
+Do not require individual dynamic matrix names in branch protection.
+
+The GitHub job summary lists selected groups and gates. Full runs enqueue the
+long compiler shards first. PR matrix jobs cancel remaining siblings after a
+failure, and each group stops at its first blocking failure while recording
+unexecuted gates as `not_run`. Nightly and ordinary local profiles still gather
+all failures. Obsolete runs are cancelled by the existing concurrency group.
+The already-compressed compiler archive uploads with `compression-level: 0`.
+
+`merge_group` and manual dispatch use the complete inventory, as do pushes to
+`main`/`master`; this also refreshes trusted caches after a merge. Supporting
+the event does not enable a repository merge queue or change branch protection.
+
+GitHub references: [dynamic matrices](https://docs.github.com/en/actions/how-tos/write-workflows/choose-what-workflows-do/run-job-variations),
+[required checks and skipped workflows](https://docs.github.com/en/pull-requests/how-tos/merge-and-close-pull-requests/troubleshooting-required-status-checks),
+and [artifact compression](https://github.com/actions/upload-artifact#altering-compressions-level-speed-v-size).
 
 Focused suites remain the fastest way to iterate. The Python PR profile is still
 the final local composition before review until `pr-native` parity is explicitly

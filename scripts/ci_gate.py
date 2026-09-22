@@ -16,7 +16,7 @@ import subprocess
 import sys
 import tarfile
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Optional, Sequence
 
@@ -168,6 +168,44 @@ DEPENDENCY_PATHS = {
     "site/package-lock.json",
 }
 
+# These gates inspect repository-wide policy, not just a tool's own fixtures.
+# Keep them on every code route. Unlisted inputs deliberately select the full PR.
+PR_BASE_GATES = (
+    "python-syntax", "python-lint", "shell-lint", "ci-runner-selftest",
+    "github-workflow-gate", "github-project-gate", "api-baseline-drift",
+    "generated-artifact-hashes", "docs-examples", "compiler-boundary",
+    "syntax-quality-firewall", "strict-quality-firewall",
+    "structural-quality-suite", "structural-quality", "hygiene",
+)
+TOOL_INTEGRATION_GATES = ("test", "ouro-smith", "samples-1", "samples-2", "lint")
+TEXT_TOOL_GATES = (
+    "fmt", "fix", "analyze-precision", "memory-budget", "lsp",
+    "language-speed-simplicity",
+)
+PR_PATH_GATES = {
+    "tools/fmt.ouro": TEXT_TOOL_GATES,
+    "tools/fmt_pipeline.ouro": TEXT_TOOL_GATES,
+    "tools/fix/": TEXT_TOOL_GATES,
+    "tools/analyze/": TEXT_TOOL_GATES,
+    "tests/analyze/": TEXT_TOOL_GATES,
+    "tests/fix_precision.ouro": TEXT_TOOL_GATES,
+    "tests/fix_proofs.ouro": TEXT_TOOL_GATES,
+    "tests/quality_diagnostic_tests.ouro": TEXT_TOOL_GATES,
+    "tools/pkg/": ("pkg", "release-package-check"),
+    "tests/pkg_scanner_tests.ouro": ("pkg",),
+    "tools/lsp.ouro": ("lsp",),
+    "tools/lsp_model.ouro": ("lsp",),
+    "tools/lsp_process_model.ouro": ("lsp",),
+    "tools/doc.ouro": ("doc", "lsp"),
+    "tools/doc_model.ouro": ("doc", "lsp"),
+    "scripts/fmt_suite.sh": TEXT_TOOL_GATES,
+    "scripts/fix_suite.sh": TEXT_TOOL_GATES,
+    "scripts/analyze_precision_suite.sh": TEXT_TOOL_GATES,
+    "scripts/pkg_suite.sh": ("pkg", "release-package-check"),
+    "scripts/lsp_suite.sh": ("lsp",),
+    "scripts/doc_suite.sh": ("doc", "lsp"),
+}
+
 
 @dataclass(frozen=True)
 class PathSelection:
@@ -179,6 +217,8 @@ class PathSelection:
     dependency: bool
     paths: tuple[str, ...]
     reason: str = ""
+    gates: tuple[str, ...] = ()
+    portable: bool = False
 
 
 def normalize_changed_path(value: str) -> str:
@@ -226,6 +266,8 @@ def full_path_selection(reason: str) -> PathSelection:
         dependency=True,
         paths=(),
         reason=reason,
+        gates=tuple(name for names in PR_GROUPS.values() for name in names),
+        portable=True,
     )
 
 
@@ -233,18 +275,112 @@ def classify_paths(paths: Sequence[str]) -> PathSelection:
     normalized = tuple(normalize_changed_path(path) for path in paths if path)
     if not normalized:
         return full_path_selection("empty diff")
+    selected: set[str] = set()
+    full = False
+    for path in normalized:
+        if path.startswith("/") or ":" in path or ".." in path.split("/"):
+            return full_path_selection("invalid changed path")
+        if is_editor_path(path) or is_site_path(path) or is_docs_path(path):
+            continue
+        matches = [names for pattern, names in PR_PATH_GATES.items()
+                   if path == pattern or (pattern.endswith("/") and path.startswith(pattern))]
+        if not matches:
+            full = True
+            break
+        selected.update(PR_BASE_GATES)
+        selected.update(TOOL_INTEGRATION_GATES)
+        for names in matches:
+            selected.update(names)
+    if full:
+        selected = {name for names in PR_GROUPS.values() for name in names}
+    elif selected and any(is_docs_path(path) for path in normalized):
+        selected.update(DOCS_GROUPS["docs"])
     return PathSelection(
         mode="changed",
-        core=any(
-            not is_editor_path(path) and not is_site_path(path) and not is_docs_path(path)
-            for path in normalized
-        ),
+        core=bool(selected),
         docs=any(is_docs_path(path) for path in normalized),
         kernel=any(is_kernel_path(path) for path in normalized),
         editor=any(is_editor_path(path) for path in normalized),
         dependency=any(is_dependency_path(path) for path in normalized),
         paths=normalized,
+        gates=tuple(name for names in PR_GROUPS.values() for name in names if name in selected),
+        portable=full,
+        reason="full PR: shared or unclassified input" if full else "affected suites and policy gates",
     )
+
+
+def compiler_fixture_roots(root: Path) -> list[str]:
+    """Read the literal inventory; refuse a shape we cannot prove complete."""
+    source = (root / "tools/test/suites.ouro").read_text(encoding="utf-8")
+    marker = "def compiler_check_suite_fixtures : List SuiteFixture :="
+    if source.count(marker) != 1:
+        raise ValueError("compiler fixture inventory marker changed")
+    body = source.split(marker)[1].strip()
+    rows = re.findall(r'MkSuiteFixture "[a-z0-9_]+" "(tests/[^"\n]+\.ouro)" Z SuiteGoldenNone', body)
+    remainder = re.sub(r'MkSuiteFixture "[a-z0-9_]+" "tests/[^"\n]+\.ouro" Z SuiteGoldenNone', "", body)
+    if not rows or len(set(rows)) != len(rows) or re.sub(r"[\s\[\],;]", "", remainder):
+        raise ValueError("compiler fixture inventory is not a complete literal list")
+    return rows
+
+
+def affected_compiler_gates(paths: Sequence[str], root: Path = ROOT) -> set[str]:
+    # Reuse the build system's import reader, including aliases and relative paths.
+    # Cache file reads across the 94 roots, not across revisions or invocations.
+    from selfhost_module_cache import collect_units, quoted_import_targets
+    from structural_quality_legacy import lex
+
+    imports: dict[str, list[str]] = {}
+
+    def read_imports(path: str) -> list[str]:
+        if path not in imports:
+            source_path = (root / path).resolve()
+            if not source_path.is_relative_to(root.resolve()):
+                raise ValueError("compiler fixture import escapes the repository")
+            source = source_path.read_text(encoding="utf-8")
+            imports[path] = quoted_import_targets(source, path)
+            tokens, _comments = lex(source, "ouro")
+            if sum(token.value == "import" for token in tokens) != len(imports[path]):
+                raise ValueError(f"unsupported import layout in {path}")
+        return imports[path]
+
+    changed = set(paths)
+    selected: set[str] = set()
+    for index, fixture in enumerate(compiler_fixture_roots(root)):
+        if changed.intersection(collect_units(fixture, imports=read_imports)):
+            selected.add(f"compiler-checking-{index % 8 + 1}")
+    return selected
+
+
+def plan_paths(paths: Sequence[str]) -> PathSelection:
+    selection = classify_paths(paths)
+    if not selection.core or selection.portable:
+        return selection
+    try:
+        affected = affected_compiler_gates(selection.paths)
+    except (OSError, ValueError, SystemExit, RecursionError) as exc:
+        return full_path_selection(f"compiler dependency inventory unavailable: {exc}")
+    names = set(selection.gates) | affected
+    return replace(selection, gates=tuple(name for group in PR_GROUPS.values() for name in group if name in names))
+
+
+def selection_matrix(selection: PathSelection) -> dict[str, list[dict[str, str]]]:
+    selected = set(selection.gates)
+    # Start the long compiler shards first when runner concurrency is saturated.
+    groups = sorted(PR_GROUPS, key=lambda name: not name.startswith("compiler-"))
+    return {"include": [{"group": group} for group in groups if selected.intersection(PR_GROUPS[group])]}
+
+
+def selection_from_json(value: str) -> PathSelection:
+    paths = json.loads(value)
+    if not isinstance(paths, list) or any(not isinstance(path, str) or not path for path in paths):
+        raise ValueError("changed paths must be a JSON array of nonempty strings")
+    return plan_paths(paths)
+
+
+def selection_key(selection: PathSelection) -> str:
+    return hash_json({name: getattr(selection, name) for name in (
+        "core", "docs", "kernel", "editor", "portable", "gates",
+    )})
 
 
 def changed_paths(base: str, head: str) -> tuple[Optional[list[str]], str]:
@@ -254,13 +390,14 @@ def changed_paths(base: str, head: str) -> tuple[Optional[list[str]], str]:
         return None, "base SHA is unavailable"
     try:
         proc = subprocess.run(
-            ["git", "diff", "--name-only", "-z", base, head, "--"],
+            ["git", "diff", "--no-renames", "--name-only", "-z", base, head, "--"],
             cwd=ROOT,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             check=False,
+            timeout=60,
         )
-    except OSError as exc:
+    except (OSError, subprocess.TimeoutExpired) as exc:
         return None, f"git diff unavailable: {exc}"
     if proc.returncode != 0:
         detail = proc.stderr.decode("utf-8", errors="replace").strip().splitlines()
@@ -279,18 +416,25 @@ def bool_text(value: bool) -> str:
 
 def write_github_output(path: Path, selection: PathSelection) -> None:
     with path.open("a", encoding="utf-8") as output:
-        for name in ("core", "docs", "kernel", "editor", "dependency"):
+        for name in ("core", "docs", "kernel", "editor", "dependency", "portable"):
             output.write(f"{name}={bool_text(getattr(selection, name))}\n")
         output.write(f"mode={selection.mode}\n")
+        output.write("matrix=" + json.dumps(selection_matrix(selection), separators=(",", ":")) + "\n")
+        output.write("changed_paths=" + json.dumps(selection.paths, separators=(",", ":")) + "\n")
+        output.write(f"selection_key={selection_key(selection)}\n")
 
 
-def run_path_selection(base: str, head: str, github_output: str) -> int:
-    paths, reason = changed_paths(base, head)
-    selection = full_path_selection(reason) if paths is None else classify_paths(paths)
+def run_path_selection(base: str, head: str, github_output: str, *, full: bool = False) -> int:
+    paths, reason = (None, "complete validation requested") if full else changed_paths(base, head)
+    # Stay comfortably below GitHub's UTF-16 job-output budget. Never truncate a diff.
+    if paths is not None and len(json.dumps(paths)) > 32768:
+        paths, reason = None, "changed path output would exceed the routing budget"
+    selection = full_path_selection(reason) if paths is None else plan_paths(paths)
     details = (
         f"mode={selection.mode} core={bool_text(selection.core)} docs={bool_text(selection.docs)} "
         f"kernel={bool_text(selection.kernel)} editor={bool_text(selection.editor)} "
-        f"dependency={bool_text(selection.dependency)} paths={len(selection.paths)}"
+        f"dependency={bool_text(selection.dependency)} paths={len(selection.paths)} "
+        f"gates={len(selection.gates)} groups={len(selection_matrix(selection)['include'])}"
     )
     if selection.reason:
         details += f" reason={selection.reason}"
@@ -301,6 +445,16 @@ def run_path_selection(base: str, head: str, github_output: str) -> int:
         except OSError as exc:
             print(f"CI_PATHS: FAIL cannot write GitHub output: {exc}", file=sys.stderr)
             return 1
+    summary = os.environ.get("GITHUB_STEP_SUMMARY")
+    if summary:
+        with Path(summary).open("a", encoding="utf-8") as output:
+            output.write("### CI selection\n\n")
+            output.write(f"Selected {len(selection.gates)} PR gates in {len(selection_matrix(selection)['include'])} groups.\n\n")
+            for item in selection_matrix(selection)["include"]:
+                names = [name for name in PR_GROUPS[item["group"]] if name in selection.gates]
+                output.write(f"- **{item['group']}**: {', '.join(names)}\n")
+            output.write(f"\nDocs: {bool_text(selection.docs)}; portable: {bool_text(selection.portable)}; "
+                         f"kernel extra: {bool_text(selection.kernel)}; editor: {bool_text(selection.editor)}.\n")
     return 0
 
 
@@ -531,6 +685,7 @@ def select_group(all_gates: Sequence[Gate], profile: str, group: str) -> list[Ga
 def run_self_tests(all_gates: Sequence[Gate]) -> int:
     failures: list[str] = []
     failures.extend(summary_contract_failures())
+    failures.extend(routing_contract_failures())
     for profile, groups in PROFILE_GROUPS.items():
         try:
             validate_groups(all_gates, profile, groups)
@@ -566,7 +721,16 @@ def run_self_tests(all_gates: Sequence[Gate]) -> int:
         except OSError as exc:
             failures.append(f"cannot read {profile} workflow: {exc}")
         else:
-            if matrix != list(groups):
+            if profile == "pr":
+                dynamic = "matrix: ${{ fromJSON(needs.paths.outputs.matrix) }}"
+                if not section or any(required not in section.group(1) for required in (
+                    dynamic, "--changed-paths-json", "--selection-key",
+                )):
+                    failures.append("PR matrix must consume the routing plan and recompute affected gates")
+                planned = [row["group"] for row in selection_matrix(full_path_selection("selftest"))["include"]]
+                if len(planned) != len(groups) or set(planned) != set(groups):
+                    failures.append("full PR routing omits or duplicates a group")
+            elif matrix != list(groups):
                 failures.append(f"hosted {profile} matrix differs from complete group inventory: {matrix}")
     trust = [gate.name for gate in select_group(all_gates, "nightly", "trust")]
     if trust != ["stage-loop-fixpoint-and-generated-drift", "ouro-smith-nightly"]:
@@ -611,7 +775,7 @@ def run_self_tests(all_gates: Sequence[Gate]) -> int:
         (("docs/generated_artifact_hashes.sha256",), (True, False)),
         (("docs/examples/example.ouro",), (True, False)),
         (("unknown/path",), (True, False)),
-        (("docs/../compiler/input.md",), (True, False)),
+        (("docs/../compiler/input.md",), (True, True)),
         (("site/src/main.ts",), (False, False)),
         (("./docs\\getting_started.md",), (False, True)),
         *((((path,), (True, False))) for path in sorted(FULL_DOCS_PATHS)),
@@ -633,6 +797,114 @@ def run_self_tests(all_gates: Sequence[Gate]) -> int:
         f"nightly_gates={sum(len(names) for names in NIGHTLY_GROUPS.values())} path_cases={len(cases) + len(docs_cases)}"
     )
     return 0
+
+
+def routing_contract_failures() -> list[str]:
+    import contextlib
+    import io
+    import tempfile
+    from unittest.mock import patch
+
+    failures: list[str] = []
+    full = set(full_path_selection("selftest").gates)
+    for pattern, expected in PR_PATH_GATES.items():
+        path = pattern + "fixture.ouro" if pattern.endswith("/") else pattern
+        selected = classify_paths([path])
+        required = set(PR_BASE_GATES) | set(TOOL_INTEGRATION_GATES) | set(expected)
+        if not required <= set(selected.gates) < full or selected.portable:
+            failures.append(f"invalid affected route: {pattern}")
+        if not set(selected.gates) <= full:
+            failures.append(f"route names an unregistered gate: {pattern}")
+        # Mixed changes must form a union, never let a narrow file mask a broad one.
+        for broad in ("compiler/new.ouro", "runtime/new.c", "std/new.ouro", "scripts/unknown.py",
+                      "tools/native_build_core.ouro", "tools/test/suites.ouro", "unknown/file"):
+            mixed = classify_paths([path, broad])
+            if set(mixed.gates) != full or not mixed.portable:
+                failures.append(f"mixed route omitted full coverage: {path}, {broad}")
+    combined = classify_paths(["tools/pkg/main.ouro", "tools/lsp.ouro", "README.md"])
+    if not {"pkg", "lsp", *DOCS_GROUPS["docs"]} <= set(combined.gates):
+        failures.append("mixed tools/docs route lost required gates")
+    for invalid in ('{}', 'null', '"README.md"', '[false]', '[""]', '['):
+        try:
+            selection_from_json(invalid)
+        except ValueError:
+            continue
+        failures.append(f"malformed changed paths accepted: {invalid}")
+    if set(selection_from_json("[]").gates) != full:
+        failures.append("empty diff does not select complete validation")
+    with patch(__name__ + ".affected_compiler_gates", side_effect=OSError("missing import")):
+        if set(plan_paths(["tools/lsp.ouro"]).gates) != full:
+            failures.append("unreadable dependency graph skipped compiler coverage")
+    with patch(__name__ + ".affected_compiler_gates", return_value={"compiler-checking-3"}):
+        selected = plan_paths(["tools/lsp_model.ouro"])
+        compiler = {name for name in selected.gates if name.startswith("compiler-checking-")}
+        if compiler != {"compiler-checking-3"}:
+            failures.append("dependent compiler shard was omitted or expanded incorrectly")
+    selected = classify_paths(["tools/lsp.ouro"])
+    arguments = ["--profile", "pr", "--group", "analysis", "--changed-paths-json", '["tools/lsp.ouro"]',
+                 "--selection-key", selection_key(selected), "--list"]
+    printed = io.StringIO()
+    with (patch(__name__ + ".plan_paths", return_value=selected),
+          contextlib.redirect_stdout(printed), contextlib.redirect_stderr(io.StringIO())):
+        if main(arguments) != 0 or "BLOCKING lsp " not in printed.getvalue() or "memory-budget" in printed.getvalue():
+            failures.append("affected group did not filter its unrelated gates")
+        for mutated in (
+            [*arguments[:-3], "--selection-key", "wrong-digest", "--list"],
+            [*arguments[:3], "compiler-2", *arguments[4:]],
+        ):
+            try:
+                main(mutated)
+            except SystemExit as exc:
+                if exc.code != 2:
+                    failures.append("invalid selection did not report a usage error")
+            else:
+                failures.append("mismatched or empty selected group was accepted")
+    with tempfile.TemporaryDirectory(prefix="ouro-ci-routing-") as temporary:
+        root = Path(temporary)
+        (root / "tools/test").mkdir(parents=True)
+        (root / "tests").mkdir()
+        (root / "tools/lsp_model.ouro").write_text("def value : Nat := 0;\n", encoding="utf-8")
+        (root / "tests/shared.ouro").write_text('import "../tools/lsp_model.ouro" as Model;\n', encoding="utf-8")
+        inventory = root / "tools/test/suites.ouro"
+        rows = [f'MkSuiteFixture "case_{i}" "tests/case_{i}.ouro" Z SuiteGoldenNone' for i in range(9)]
+        inventory.write_text("def compiler_check_suite_fixtures : List SuiteFixture :=\n[" + ",\n".join(rows) + "];\n", encoding="utf-8")
+        for i in range(9):
+            source = 'import "shared.ouro";\n' if i in {0, 8} else "def value : Nat := 0;\n"
+            (root / f"tests/case_{i}.ouro").write_text(source, encoding="utf-8")
+        if affected_compiler_gates(["tools/lsp_model.ouro"], root) != {"compiler-checking-1"}:
+            failures.append("transitive alias import or round-robin shard ownership was lost")
+        if affected_compiler_gates(["tools/unused.ouro"], root):
+            failures.append("unrelated tool selected compiler shards")
+        (root / "tests/shared.ouro").write_text('import\n "../tools/lsp_model.ouro";\n', encoding="utf-8")
+        try:
+            affected_compiler_gates(["tools/lsp_model.ouro"], root)
+        except ValueError:
+            pass
+        else:
+            failures.append("unsupported multiline import silently lost a dependency")
+        inventory.write_text(inventory.read_text(encoding="utf-8") + "unknown_inventory_expression", encoding="utf-8")
+        try:
+            compiler_fixture_roots(root)
+        except ValueError:
+            pass
+        else:
+            failures.append("unsupported compiler inventory accepted")
+        # A rename must expose both deletion and addition, including the old scope.
+        diff = subprocess.CompletedProcess([], 0, b"compiler/old.ouro\0docs/new.md\0", b"")
+        with patch(__name__ + ".subprocess.run", return_value=diff) as run:
+            paths, reason = changed_paths("a" * 40, "b" * 40)
+            if paths != ["compiler/old.ouro", "docs/new.md"] or reason or "--no-renames" not in run.call_args.args[0]:
+                failures.append("rename diff lost the old path")
+        with patch(__name__ + ".subprocess.run", side_effect=subprocess.TimeoutExpired("git", 60)):
+            if changed_paths("a" * 40, "b" * 40)[0] is not None:
+                failures.append("timed-out diff did not request full validation")
+        output = root / "outputs"
+        selected = classify_paths(['site/a\ncore=true.ts'])
+        write_github_output(output, selected)
+        values = dict(line.split("=", 1) for line in output.read_text(encoding="utf-8").splitlines())
+        if values["core"] != "false" or json.loads(values["changed_paths"]) != list(selected.paths):
+            failures.append("filename escaped the GitHub output record")
+    return failures
 
 
 def summary_contract_failures() -> list[str]:
@@ -680,6 +952,13 @@ def summary_contract_failures() -> list[str]:
             report = json.loads(summary.read_text(encoding="utf-8"))
             if report.get("pass") is not False or report.get("gates") != [failed_row]:
                 failures.append("failed aggregate did not replace previous success")
+            with (patch(__name__ + ".gates", return_value=[gate, replace(gate, name="later")]),
+                  patch(__name__ + ".run_gate", return_value=failed_row) as run):
+                if main([*args, "--fail-fast"]) != 1 or run.call_count != 1:
+                    failures.append("fail-fast ran later gates or returned success")
+            report = json.loads(summary.read_text(encoding="utf-8"))
+            if report.get("pass") is not False or report.get("not_run") != ["later"]:
+                failures.append("fail-fast hid the unexecuted gate")
             previous = summary.read_bytes()
             with patch(__name__ + ".run_gate") as run:
                 main([*args, "--list"])
@@ -762,6 +1041,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--list-groups", action="store_true", help="print the complete profile group list as JSON")
     ap.add_argument("--self-test", action="store_true", help="check PR/nightly partitions and hosted path-selection invariants")
     ap.add_argument("--select-paths", action="store_true", help="write fail-closed hosted job selection from a commit diff")
+    ap.add_argument("--full", action="store_true", help="select all jobs for push, merge queue, or manual validation")
+    ap.add_argument("--changed-paths-json", default=None, help="recompute affected PR gates from the Paths job output")
+    ap.add_argument("--selection-key", default=None, help="require exactly the producer's complete routing decision")
+    ap.add_argument("--fail-fast", action="store_true", help="stop a group after its first blocking failure")
     ap.add_argument("--base", default=None, help="base commit SHA for --select-paths")
     ap.add_argument("--head", default=None, help="head commit SHA for --select-paths")
     ap.add_argument("--github-output", default=None, help="GitHub output file for --select-paths")
@@ -776,7 +1059,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     args = ap.parse_args(argv)
 
     if args.compiler_artifact:
-        if args.group or args.out or args.list or args.list_groups or args.self_test or args.select_paths or args.base or args.head or args.github_output or args.with_bootstrap_evidence:
+        if args.group or args.out or args.list or args.list_groups or args.self_test or args.select_paths or args.base or args.head or args.github_output or args.with_bootstrap_evidence or args.full or args.changed_paths_json is not None or args.selection_key or args.fail_fast:
             ap.error("--compiler-artifact cannot be combined with gate or path-selection options")
         if (args.compiler_artifact == "import") != bool(args.compiler_sha256):
             ap.error("--compiler-sha256 is required exactly for compiler import")
@@ -785,7 +1068,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         ap.error("--compiler-sha256 requires --compiler-artifact import")
     all_gates = gates()
     if args.select_paths:
-        if args.group is not None or args.out or args.list or args.list_groups or args.self_test or args.with_bootstrap_evidence:
+        if args.group is not None or args.out or args.list or args.list_groups or args.self_test or args.with_bootstrap_evidence or args.changed_paths_json is not None or args.selection_key or args.fail_fast:
             ap.error("--select-paths cannot be combined with execution options")
         if not args.base or not args.head:
             ap.error("--select-paths requires --base and --head")
@@ -793,9 +1076,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             args.base,
             args.head,
             args.github_output or os.environ.get("GITHUB_OUTPUT", ""),
+            full=args.full,
         )
-    if args.base or args.head or args.github_output:
-        ap.error("--base, --head, and --github-output require --select-paths")
+    if args.base or args.head or args.github_output or args.full:
+        ap.error("--base, --head, --full, and --github-output require --select-paths")
+    if args.changed_paths_json is not None and (args.profile != "pr" or not args.group or args.self_test or args.list_groups or args.with_bootstrap_evidence):
+        ap.error("--changed-paths-json requires --profile pr --group and cannot change other profiles")
+    if (args.changed_paths_json is not None) != bool(args.selection_key):
+        ap.error("--changed-paths-json and --selection-key must be supplied together")
     if args.self_test:
         if args.group is not None or args.out or args.list or args.list_groups or args.with_bootstrap_evidence:
             ap.error("--self-test cannot be combined with execution options")
@@ -820,6 +1108,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     selected = [g for g in all_gates if args.profile in g.profiles]
     if args.group:
         selected = select_group(all_gates, args.profile, args.group)
+    if args.changed_paths_json is not None:
+        try:
+            selection = selection_from_json(args.changed_paths_json)
+        except (ValueError, TypeError) as exc:
+            ap.error(f"invalid changed paths: {exc}")
+        if selection_key(selection) != args.selection_key:
+            ap.error("routing decision differs from the Paths job; refusing incomplete matrix coverage")
+        selected = [gate for gate in selected if gate.name in selection.gates]
+        if not selected:
+            ap.error("selected PR group has no affected gates; refusing an empty green job")
     if args.with_bootstrap_evidence and not any(g.name == "selfhost-bootstrap-evidence" for g in selected):
         selected.extend(g for g in all_gates if g.name == "selfhost-bootstrap-evidence")
     if args.list:
@@ -846,6 +1144,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         results.append(result)
         if result["status"] == "fail" and gate.blocking:
             failed = True
+            if args.fail_fast:
+                break
             # Continue running remaining gates so the artifact bundle explains as
             # many independent regressions as possible.
     report = {
@@ -854,6 +1154,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "group": args.group or "all",
         "pass": not failed,
         "gates": results,
+        "not_run": [gate.name for gate in selected[len(results):]],
         "blocking_failures": [r for r in results if r.get("blocking") and r.get("status") == "fail"],
         "informational_skips": [r for r in results if r.get("status") == "skip"],
         "elapsed_s": round(time.perf_counter() - started, 6),
