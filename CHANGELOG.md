@@ -200,6 +200,8 @@ integration may change.
 
 ### Fixed
 
+- Reject incomplete `ouro-pkg` option values, unreadable `add` ranges, and
+  removal of names that are not dependencies; `--help` now exits 0.
 - Keep unsaved language-server diagnostics when another `.ouro` file changes
   on disk.
 - Accept directory paths in `fmt` and `fix`, selecting sorted `.ouro` files
