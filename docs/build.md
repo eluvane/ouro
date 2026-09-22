@@ -397,6 +397,16 @@ complete C comparisons must still match their hashes. A miss or `--no-cache`
 runs the complete bootstrap chain in fresh output directories; this transitional
 path does not reuse individual stages after a source change.
 
+Hosted PR jobs share one Linux compiler build through a workflow artifact.
+`scripts/ci_gate.py --compiler-artifact export` packages the installed binary,
+its receipt, input manifest, completion report, and both complete generated C
+comparisons. Consumers import the producer's archive with
+`--compiler-artifact import --compiler-sha256 HASH`; they require its exact
+SHA-256, file inventory, current source and host identity, and the existing
+bootstrap verifier. Missing or changed evidence fails the job. This transport
+retains the current C-hosted bootstrap contract and does not grant program
+acceptance authority to an artifact or cache. macOS builds its own compiler.
+
 `scripts/native_tool_build.py` keys a native tool by its transitive source
 contents, seed compiler and C compiler hashes, runtime sources/headers, build
 helpers, fuel, flags, platform, and compiler include/library environment. It

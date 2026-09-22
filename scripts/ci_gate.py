@@ -14,12 +14,13 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tarfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional, Sequence
 
-from repo_support import bind_relative_path, write_json_atomic
+from repo_support import bind_relative_path, hash_json, sha256_file, write_json_atomic
 
 ROOT = Path(__file__).resolve().parents[1]
 rel = bind_relative_path(ROOT, resolve=True)
@@ -68,14 +69,16 @@ PR_GROUPS: dict[str, tuple[str, ...]] = {
     ),
     "analysis": (
         "memory-budget",
+        "c-static-analysis",
+        "lsp",
+    ),
+    "checker": (
         "kernel-hardening",
         "compiler-scale",
         "compiler-depth",
-        "analyze-precision",
-        "c-static-analysis",
-        "lint",
-        "lsp",
     ),
+    "analyzer": ("analyze-precision",),
+    "lint": ("lint",),
     "tests": (
         "ergonomics",
         "imports",
@@ -93,12 +96,13 @@ PR_GROUPS: dict[str, tuple[str, ...]] = {
 NIGHTLY_GROUPS: dict[str, tuple[str, ...]] = {
     "checks": tuple("cache-parity-full" if name == "cache-parity-module" else name
                     for name in PR_GROUPS["checks"]),
-    "analysis": (*(name for name in PR_GROUPS["analysis"]
-                   if name not in {"compiler-scale", "compiler-depth"}), "analyze-production"),
+    "analysis": PR_GROUPS["analysis"],
+    "analyzer": (*PR_GROUPS["analyzer"], "analyze-production"),
+    "lint": PR_GROUPS["lint"],
     "tests": (*PR_GROUPS["tests"], "quickstart-smoke"),
     "samples-1": PR_GROUPS["samples-1"],
     "samples-2": PR_GROUPS["samples-2"],
-    "kernel": ("compiler-scale", "compiler-depth", "ouro-smith-kernel"),
+    "kernel": (*PR_GROUPS["checker"], "ouro-smith-kernel"),
     # Keep these in one checkout and preserve registry order. Smith must bind
     # its provenance to the tool binaries installed by the stage loop.
     "trust": ("stage-loop-fixpoint-and-generated-drift", "ouro-smith-nightly"),
@@ -116,14 +120,25 @@ STAGE_LOOP_GROUPS = {"trust": (
     "python-syntax", "parity", "syntax-quality-firewall", "strict-quality-firewall",
     "structural-quality-suite", "structural-quality", "stage-loop-fixpoint-and-generated-drift",
 )}
+DOCS_GROUPS = {"docs": (
+    "github-workflow-gate", "github-project-gate", "api-baseline-drift", "doc", "docs-examples",
+)}
+# The hosted PR runs the common gates once. Standalone kernel stays complete.
+KERNEL_EXTRA_GROUPS = {"checks": ("ouro-smith-kernel",)}
 PROFILE_GROUPS = {
     "pr": PR_GROUPS, "nightly": NIGHTLY_GROUPS, "manual": NIGHTLY_GROUPS,
     "kernel": KERNEL_GROUPS, "stage-loop": STAGE_LOOP_GROUPS,
+    "docs": DOCS_GROUPS, "kernel-extra": KERNEL_EXTRA_GROUPS,
 }
 
 SHA40 = re.compile(r"[0-9a-fA-F]{40}\Z")
 EDITOR_PREFIX = "editors/vscode/"
 SITE_PREFIX = "site/"
+DOCS_PATHS = {"README.md", "CHANGELOG.md", "CONTRIBUTING.md"}
+FULL_DOCS_PATHS = {
+    "docs/architecture.md", "docs/build.md", "docs/ci.md", "docs/design.md",
+    "docs/kernel_design.md", "docs/releasing.md", "docs/roadmap.md", "docs/tcb.md",
+}
 KERNEL_PREFIXES = (
     "compiler/", "runtime/", "std/", "tests/compiler_", "tests/string_nf_",
     "tests/constructor_", "quality/smith/", "scripts/ourosmith/",
@@ -158,6 +173,7 @@ DEPENDENCY_PATHS = {
 class PathSelection:
     mode: str
     core: bool
+    docs: bool
     kernel: bool
     editor: bool
     dependency: bool
@@ -180,6 +196,14 @@ def is_site_path(path: str) -> bool:
     return path.startswith(SITE_PREFIX)
 
 
+def is_docs_path(path: str) -> bool:
+    return path in DOCS_PATHS or (
+        path.startswith("docs/") and path.endswith(".md")
+        and not path.startswith("docs/api/") and path not in FULL_DOCS_PATHS
+        and ".." not in path.split("/")
+    )
+
+
 def is_kernel_path(path: str) -> bool:
     return path in KERNEL_PATHS or path.startswith(KERNEL_PREFIXES)
 
@@ -196,6 +220,7 @@ def full_path_selection(reason: str) -> PathSelection:
     return PathSelection(
         mode="full",
         core=True,
+        docs=True,
         kernel=True,
         editor=True,
         dependency=True,
@@ -211,9 +236,10 @@ def classify_paths(paths: Sequence[str]) -> PathSelection:
     return PathSelection(
         mode="changed",
         core=any(
-            not is_editor_path(path) and not is_site_path(path)
+            not is_editor_path(path) and not is_site_path(path) and not is_docs_path(path)
             for path in normalized
         ),
+        docs=any(is_docs_path(path) for path in normalized),
         kernel=any(is_kernel_path(path) for path in normalized),
         editor=any(is_editor_path(path) for path in normalized),
         dependency=any(is_dependency_path(path) for path in normalized),
@@ -253,7 +279,7 @@ def bool_text(value: bool) -> str:
 
 def write_github_output(path: Path, selection: PathSelection) -> None:
     with path.open("a", encoding="utf-8") as output:
-        for name in ("core", "kernel", "editor", "dependency"):
+        for name in ("core", "docs", "kernel", "editor", "dependency"):
             output.write(f"{name}={bool_text(getattr(selection, name))}\n")
         output.write(f"mode={selection.mode}\n")
 
@@ -262,7 +288,7 @@ def run_path_selection(base: str, head: str, github_output: str) -> int:
     paths, reason = changed_paths(base, head)
     selection = full_path_selection(reason) if paths is None else classify_paths(paths)
     details = (
-        f"mode={selection.mode} core={bool_text(selection.core)} "
+        f"mode={selection.mode} core={bool_text(selection.core)} docs={bool_text(selection.docs)} "
         f"kernel={bool_text(selection.kernel)} editor={bool_text(selection.editor)} "
         f"dependency={bool_text(selection.dependency)} paths={len(selection.paths)}"
     )
@@ -275,6 +301,86 @@ def run_path_selection(base: str, head: str, github_output: str) -> int:
         except OSError as exc:
             print(f"CI_PATHS: FAIL cannot write GitHub output: {exc}", file=sys.stderr)
             return 1
+    return 0
+
+
+def compiler_evidence_paths(root: Path, binary: Path, receipt: dict) -> list[Path]:
+    """Only the installed compiler and the evidence its verifier consumes travel."""
+    work = Path(receipt["work"])
+    if work.parent != root / "_build/bootstrap":
+        raise ValueError("compiler evidence must be in this checkout's _build/bootstrap")
+    paths = [binary, binary.with_name("ouro1.bootstrap.json"), work / "report.json", work / "inputs.json",
+             *(work / "out" / phase / name for phase in ("p1", "p2") for name in ("driver_u.c", "backend_u.c"))]
+    for path in paths:
+        relative = path.relative_to(root)
+        if ".." in relative.parts or any(parent.is_symlink() for parent in (path, *path.parents) if parent != root):
+            raise ValueError("compiler evidence must use regular checkout paths")
+    return paths
+
+
+def export_compiler(root: Path, binary: Path, selected: dict, archive: Path) -> None:
+    import bootstrap_compiler as bootstrap
+
+    receipt = binary.with_name("ouro1.bootstrap.json")
+    if not bootstrap.installed_current(binary, receipt, selected):
+        raise ValueError("compiler or bootstrap evidence does not match current inputs")
+    paths = compiler_evidence_paths(root, binary, json.loads(receipt.read_text(encoding="utf-8")))
+    archive.parent.mkdir(parents=True, exist_ok=True)
+    with tarfile.open(archive, "w:gz") as bundle:
+        for path in paths:
+            bundle.add(path, arcname=path.relative_to(root).as_posix(), recursive=False)
+
+
+def import_compiler(root: Path, binary: Path, selected: dict, archive: Path, expected_sha256: str) -> None:
+    import bootstrap_compiler as bootstrap
+
+    if not re.fullmatch(r"[0-9a-f]{64}", expected_sha256) or sha256_file(archive) != expected_sha256:
+        raise ValueError("compiler artifact SHA-256 differs from this workflow's producer output")
+    with tarfile.open(archive, "r:gz") as bundle:
+        members = bundle.getmembers()
+        receipt_name = binary.with_name("ouro1.bootstrap.json").relative_to(root).as_posix()
+        receipt_member = bundle.getmember(receipt_name)
+        if not receipt_member.isfile():
+            raise ValueError("compiler receipt is not a regular file")
+        with bundle.extractfile(receipt_member) as stream:
+            data = json.load(stream)
+        paths = compiler_evidence_paths(root, binary, data)
+        expected = {path.relative_to(root).as_posix() for path in paths}
+        if len(members) != len(expected) or {member.name for member in members} != expected or any(not member.isfile() for member in members):
+            raise ValueError("compiler artifact has missing, duplicate or unexpected files")
+        # Do not let tar interpret paths, links, ownership or special file modes.
+        for member in members:
+            target = root / member.name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with bundle.extractfile(member) as source, target.open("wb") as destination:
+                shutil.copyfileobj(source, destination)
+            target.chmod(member.mode & 0o777)
+    if not bootstrap.installed_current(binary, binary.with_name("ouro1.bootstrap.json"), selected):
+        raise ValueError("downloaded compiler or bootstrap evidence does not match current inputs")
+
+
+def run_compiler_artifact(action: str, archive: Path, expected_sha256: str) -> int:
+    import bootstrap_compiler as bootstrap
+    import bootstrap_inputs
+    import ouro_build as build
+
+    try:
+        cfg = build.load_config(argparse.Namespace())
+        manifest, _contents = bootstrap_inputs.read_bundle(ROOT)
+        bootstrap_inputs.verify_stage0(ROOT, manifest)
+        selected = bootstrap.current_inputs(ROOT, cfg, build)
+        binary = cfg.path("c_build_dir") / "ouro1"
+        if action == "key":
+            print("key=" + hash_json(selected))
+        elif action == "export":
+            export_compiler(ROOT, binary, selected, archive)
+            print("sha256=" + sha256_file(archive))
+        else:
+            import_compiler(ROOT, binary, selected, archive, expected_sha256)
+            print("CI_COMPILER: PASS current source, host compiler, binary and bootstrap evidence")
+    except (OSError, RuntimeError, ValueError, KeyError, TypeError, tarfile.TarError) as exc:
+        print(f"CI_COMPILER: FAIL {exc}", file=sys.stderr)
+        return 1
     return 0
 
 
@@ -336,9 +442,9 @@ def gates() -> list[Gate]:
         Gate("python-lint", ruff_check_command(), ("pr", "nightly", "manual")),
         Gate("shell-lint", shellcheck_command(), ("pr", "nightly", "manual")),
         Gate("ci-runner-selftest", [sys.executable, "scripts/ci_gate.py", "--self-test"], ("pr", "nightly", "manual")),
-        Gate("github-workflow-gate", ["sh", "scripts/ouro_repo_gate.sh", "--profile", "workflow-native", "--out", "_build/github_workflow_gate/native-workflow"], ("pr", "nightly", "manual")),
-        Gate("github-project-gate", ["sh", "scripts/ouro_repo_gate.sh", "--profile", "project-native", "--out", "_build/github_project_gate/native-project"], ("pr", "nightly", "manual")),
-        Gate("api-baseline-drift", [sys.executable, "scripts/api_baseline_regen.py", "--check", "--report", "_build/api_baseline/api-baseline.json"], ("pr", "nightly", "manual")),
+        Gate("github-workflow-gate", ["sh", "scripts/ouro_repo_gate.sh", "--profile", "workflow-native", "--out", "_build/github_workflow_gate/native-workflow"], ("pr", "nightly", "manual", "docs")),
+        Gate("github-project-gate", ["sh", "scripts/ouro_repo_gate.sh", "--profile", "project-native", "--out", "_build/github_project_gate/native-project"], ("pr", "nightly", "manual", "docs")),
+        Gate("api-baseline-drift", [sys.executable, "scripts/api_baseline_regen.py", "--check", "--report", "_build/api_baseline/api-baseline.json"], ("pr", "nightly", "manual", "docs")),
         Gate("release-package-check", [sys.executable, "scripts/release_package.py", "--self-test", "--check", "--out", "_build/release_check"], ("pr", "nightly", "manual")),
         Gate("config-show", [sys.executable, "scripts/ouro_build.py", "config", "show"], ("pr", "nightly", "manual")),
         Gate("build-cache-config", [sys.executable, "scripts/build_cache_config_suite.py"], ("pr", "nightly", "manual")),
@@ -365,7 +471,7 @@ def gates() -> list[Gate]:
         Gate("fmt", ["sh", "scripts/fmt_suite.sh"], ("pr", "nightly", "manual"), env=(("FMT_SUITE_OUT", "_build/fmt_suite"),)),
         Gate("fix", ["sh", "scripts/fix_suite.sh"], ("pr", "nightly", "manual"), env=(("FIX_SUITE_OUT", "_build/fix_suite"),)),
         Gate("pkg", ["sh", "scripts/pkg_suite.sh"], ("pr", "nightly", "manual"), env=(("PKG_SUITE_OUT", "_build/pkg_suite"),)),
-        Gate("doc", ["sh", "scripts/doc_suite.sh"], ("pr", "nightly", "manual"), env=(("DOC_SUITE_OUT", "_build/doc_suite"),)),
+        Gate("doc", ["sh", "scripts/doc_suite.sh"], ("pr", "nightly", "manual", "docs"), env=(("DOC_SUITE_OUT", "_build/doc_suite"),)),
         Gate("lint", ["sh", "scripts/lint_suite.sh"], ("pr", "nightly", "manual"), env=(("LINT_SUITE_OUT", "_build/lint_suite"),)),
         Gate("lsp", ["sh", "scripts/lsp_suite.sh"], ("pr", "nightly", "manual"), env=(("LSP_SUITE_OUT", "_build/lsp_suite"),)),
         Gate("test", ["sh", "scripts/test_suite.sh"], ("pr", "nightly", "manual"), env=(("TEST_SUITE_OUT", "_build/test_suite"),)),
@@ -373,7 +479,7 @@ def gates() -> list[Gate]:
         Gate("compiler-boundary", ["sh", "scripts/ouro_repo_gate.sh", "--profile", "compiler-boundary", "--out", "_build/compiler_boundary"], ("pr", "nightly", "manual", "kernel")),
         Gate("samples-1", ["sh", "scripts/samples_suite.sh", "--shard=1/2"], ("pr", "nightly", "manual"), env=(("SAMPLES_SUITE_OUT", "_build/samples_suite_1"),)),
         Gate("samples-2", ["sh", "scripts/samples_suite.sh", "--shard=2/2"], ("pr", "nightly", "manual"), env=(("SAMPLES_SUITE_OUT", "_build/samples_suite_2"),)),
-        Gate("docs-examples", ["sh", "scripts/ouro_repo_gate.sh", "--profile", "docs-native", "--out", "_build/docs_examples_gate/native-docs"], ("pr", "nightly", "manual")),
+        Gate("docs-examples", ["sh", "scripts/ouro_repo_gate.sh", "--profile", "docs-native", "--out", "_build/docs_examples_gate/native-docs"], ("pr", "nightly", "manual", "docs")),
         Gate("syntax-quality-firewall", [sys.executable, "scripts/syntax_quality_suite.py"], ("pr", "nightly", "manual", "kernel", "stage-loop")),
         Gate("strict-quality-firewall", [sys.executable, "scripts/strict_quality_firewall.py", "--profile", "release", "--report", "_build/quality/strict-quality-firewall.json", "--sarif", "_build/quality/strict-quality-firewall.sarif", "--migration-report", "_build/quality/migration-report.md"], ("pr", "nightly", "manual", "kernel", "stage-loop")),
         Gate("structural-quality-suite", [sys.executable, "scripts/structural_quality_suite.py"], ("pr", "nightly", "manual", "stage-loop")),
@@ -383,7 +489,7 @@ def gates() -> list[Gate]:
         # final installed binaries so validation can reuse this complete run.
         Gate("ouro-smith", [sys.executable, "scripts/ouro_smith.py", "--profile", "pr", "--out", "_build/ci/smith-pr"], ("pr",)),
         Gate("quickstart-smoke", ["sh", "scripts/quickstart_smoke.sh"], ("nightly", "manual")),
-        Gate("ouro-smith-kernel", [sys.executable, "scripts/ouro_smith.py", "--profile", "kernel", "--out", "_build/ci/smith-kernel"], ("nightly", "manual", "kernel")),
+        Gate("ouro-smith-kernel", [sys.executable, "scripts/ouro_smith.py", "--profile", "kernel", "--out", "_build/ci/smith-kernel"], ("nightly", "manual", "kernel", "kernel-extra")),
         Gate("stage-loop-fixpoint-and-generated-drift", [sys.executable, "scripts/generated_artifact_drift_check.py", "--mode", "stage-loop", "--work", "_build/generated_artifact_drift_stage_loop"], ("nightly", "manual", "stage-loop")),
         Gate("ouro-smith-nightly", [sys.executable, "scripts/ouro_smith.py", "--profile", "nightly", "--out", "_build/ci/smith-nightly"], ("nightly", "manual")),
         Gate("selfhost-bootstrap-evidence", [sys.executable, "scripts/selfhost_bootstrap_evidence.py", "--out", "_build/bootstrap/evidence.json"], ("bootstrap",)),
@@ -449,10 +555,10 @@ def run_self_tests(all_gates: Sequence[Gate]) -> int:
             except ValueError:
                 continue
             failures.append(f"invalid {profile} group partition was accepted")
-        if profile not in {"pr", "nightly", "kernel"}:
+        if profile not in {"pr", "nightly"}:
             continue
         workflow = ROOT / ".github/workflows" / ("ouro-nightly-full.yml" if profile == "nightly" else "ouro-pr.yml")
-        job = {"pr": "quick-firewall", "nightly": "validation", "kernel": "kernel-validation"}[profile]
+        job = {"pr": "quick-firewall", "nightly": "validation"}[profile]
         try:
             content = workflow.read_text(encoding="utf-8")
             section = re.search(rf"^  {job}:\n(.*?)(?=^  [a-z0-9-]+:|\Z)", content, re.MULTILINE | re.DOTALL)
@@ -465,6 +571,12 @@ def run_self_tests(all_gates: Sequence[Gate]) -> int:
     trust = [gate.name for gate in select_group(all_gates, "nightly", "trust")]
     if trust != ["stage-loop-fixpoint-and-generated-drift", "ouro-smith-nightly"]:
         failures.append("nightly must run stage-loop before OuroSmith in the same group")
+    profile_names = {profile: {gate.name for gate in all_gates if profile in gate.profiles}
+                     for profile in ("pr", "kernel", "kernel-extra", "docs")}
+    if profile_names["kernel-extra"] != profile_names["kernel"] - profile_names["pr"]:
+        failures.append("hosted kernel extra must be exactly the kernel gates absent from PR")
+    if not profile_names["docs"] <= profile_names["pr"]:
+        failures.append("docs route must reuse canonical PR gates")
 
     cases = (
         (("editors/vscode/package-lock.json",), (False, False, True, True)),
@@ -479,7 +591,7 @@ def run_self_tests(all_gates: Sequence[Gate]) -> int:
         (("quality/smith/strategies.json",), (True, True, False, False)),
         (("tools/fmt.ouro",), (True, False, False, False)),
         (("tests/analyze/architecture_bad/a.ouro",), (True, False, False, False)),
-        (("editors/vscode/src/extension.ts", "README.md"), (True, False, True, False)),
+        (("editors/vscode/src/extension.ts", "README.md"), (False, False, True, False)),
         ((".github/workflows/ouro-pr.yml",), (True, True, False, True)),
         ((), (True, True, True, True)),
     )
@@ -489,6 +601,27 @@ def run_self_tests(all_gates: Sequence[Gate]) -> int:
         if actual != expected:
             failures.append(f"path selection mismatch for {paths}: expected={expected} actual={actual}")
 
+    docs_cases = (
+        (("README.md",), (False, True)),
+        (("CHANGELOG.md", "CONTRIBUTING.md"), (False, True)),
+        (("docs/getting_started.md",), (False, True)),
+        (("docs/getting_started.md", "tools/fmt.ouro"), (True, True)),
+        (("docs/getting_started.md", "editors/vscode/src/extension.ts", "site/src/main.ts"), (False, True)),
+        (("docs/api/std.md",), (True, False)),
+        (("docs/generated_artifact_hashes.sha256",), (True, False)),
+        (("docs/examples/example.ouro",), (True, False)),
+        (("unknown/path",), (True, False)),
+        (("docs/../compiler/input.md",), (True, False)),
+        (("site/src/main.ts",), (False, False)),
+        (("./docs\\getting_started.md",), (False, True)),
+        *((((path,), (True, False))) for path in sorted(FULL_DOCS_PATHS)),
+        ((), (True, True)),
+    )
+    for paths, expected in docs_cases:
+        selection = classify_paths(paths)
+        if (selection.core, selection.docs) != expected:
+            failures.append(f"docs selection mismatch for {paths}")
+
     if failures:
         for failure in failures:
             print(f"CI_GATE_SELFTEST: FAIL {failure}", file=sys.stderr)
@@ -497,7 +630,7 @@ def run_self_tests(all_gates: Sequence[Gate]) -> int:
         f"CI_GATE_SELFTEST: PASS groups={len(PR_GROUPS)} "
         f"pr_gates={sum(len(names) for names in PR_GROUPS.values())} "
         f"nightly_groups={len(NIGHTLY_GROUPS)} "
-        f"nightly_gates={sum(len(names) for names in NIGHTLY_GROUPS.values())} path_cases={len(cases)}"
+        f"nightly_gates={sum(len(names) for names in NIGHTLY_GROUPS.values())} path_cases={len(cases) + len(docs_cases)}"
     )
     return 0
 
@@ -622,7 +755,7 @@ def run_gate(gate: Gate, *, out: Path) -> dict[str, Any]:
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--profile", choices=["pr", "nightly", "manual", "kernel", "stage-loop", "bootstrap"], default="pr")
+    ap.add_argument("--profile", choices=[*PROFILE_GROUPS, "bootstrap"], default="pr")
     ap.add_argument("--group", default=None, help="run one complete profile partition in an isolated checkout")
     ap.add_argument("--out", default=None)
     ap.add_argument("--list", action="store_true")
@@ -632,6 +765,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--base", default=None, help="base commit SHA for --select-paths")
     ap.add_argument("--head", default=None, help="head commit SHA for --select-paths")
     ap.add_argument("--github-output", default=None, help="GitHub output file for --select-paths")
+    ap.add_argument("--compiler-artifact", choices=("key", "export", "import"), help="transfer a verified compiler within one workflow")
+    ap.add_argument("--artifact", type=Path, default=Path("_build/ci/host-compiler.tar.gz"))
+    ap.add_argument("--compiler-sha256", default="", help="required producer digest for compiler import")
     ap.add_argument(
         "--with-bootstrap-evidence",
         action="store_true",
@@ -639,6 +775,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     args = ap.parse_args(argv)
 
+    if args.compiler_artifact:
+        if args.group or args.out or args.list or args.list_groups or args.self_test or args.select_paths or args.base or args.head or args.github_output or args.with_bootstrap_evidence:
+            ap.error("--compiler-artifact cannot be combined with gate or path-selection options")
+        if (args.compiler_artifact == "import") != bool(args.compiler_sha256):
+            ap.error("--compiler-sha256 is required exactly for compiler import")
+        return run_compiler_artifact(args.compiler_artifact, args.artifact, args.compiler_sha256)
+    if args.compiler_sha256:
+        ap.error("--compiler-sha256 requires --compiler-artifact import")
     all_gates = gates()
     if args.select_paths:
         if args.group is not None or args.out or args.list or args.list_groups or args.self_test or args.with_bootstrap_evidence:

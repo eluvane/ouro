@@ -3,17 +3,20 @@
 from __future__ import annotations
 
 import copy
+import io
 import json
 import os
 from pathlib import Path
 import shutil
 import subprocess
 import tempfile
+import tarfile
 import unittest
 from unittest.mock import patch
 
 import bootstrap_compiler as bootstrap
 import bootstrap_inputs as inputs
+import ci_gate
 import ouro_build as build
 from ourosmith.limits import RunResult
 from repo_support import hash_json, sha256_file, write_json_atomic
@@ -270,6 +273,90 @@ class BootstrapCompilerTests(unittest.TestCase):
                     build.main([operation, "--frontend"])
                 self.assertEqual(error.exception.code, 2)
         self.assertEqual({name: (build.ROOT / name).read_bytes() for name in inputs.STAGE0}, before)
+
+    def compiler_artifact_fixture(self):
+        self.work = self.root / "_build/bootstrap/artifact-contract"
+        self.work.mkdir(parents=True)
+        snapshot = self.fixture()
+        with patch.object(bootstrap, "run_limited", side_effect=self.fake_run):
+            report = bootstrap.chain(self.work, snapshot, build)
+        output = self.root / "_build/c/ouro1"
+        output.parent.mkdir(parents=True)
+        shutil.copyfile(self.work / report["binary"], output)
+        output.chmod(0o755)
+        receipt = {"kind": bootstrap.KIND, "key": snapshot["key"], "selected": snapshot["selected"],
+                   "work": str(self.work), "binary_sha256": sha256_file(output), "report_sha256": sha256_file(self.work / "report.json")}
+        write_json_atomic(output.with_name("ouro1.bootstrap.json"), receipt)
+        archive = self.root / "compiler.tar.gz"
+        ci_gate.export_compiler(self.root, output, snapshot["selected"], archive)
+        return output, snapshot["selected"], archive
+
+    def test_compiler_artifact_roundtrip_preserves_complete_verification(self):
+        output, selected, archive = self.compiler_artifact_fixture()
+        with tarfile.open(archive) as bundle:
+            paths = [self.root / member.name for member in bundle.getmembers()]
+        self.assertEqual(len(paths), 8)
+        before = {path: path.read_bytes() for path in paths}
+        for path in paths:
+            path.unlink()
+        ci_gate.import_compiler(self.root, output, selected, archive, sha256_file(archive))
+        self.assertEqual({path: path.read_bytes() for path in paths}, before)
+        self.assertTrue(bootstrap.installed_current(output, output.with_name("ouro1.bootstrap.json"), selected))
+        if os.name != "nt":
+            self.assertEqual(output.stat().st_mode & 0o777, 0o755)
+        for path in paths:
+            with self.subTest(missing=path):
+                path.unlink()
+                with self.assertRaisesRegex(ValueError, "does not match"):
+                    ci_gate.export_compiler(self.root, output, selected, self.root / "invalid.tar.gz")
+                path.write_bytes(before[path])
+
+    def test_compiler_artifact_rejects_wrong_digest_inputs_and_binary(self):
+        output, selected, archive = self.compiler_artifact_fixture()
+        before = output.read_bytes()
+        with self.assertRaisesRegex(ValueError, "SHA-256"):
+            ci_gate.import_compiler(self.root, output, selected, archive, "0" * 64)
+        self.assertEqual(output.read_bytes(), before)
+        with self.assertRaisesRegex(ValueError, "does not match"):
+            ci_gate.import_compiler(self.root, output, {**selected, "changed": True}, archive, sha256_file(archive))
+        output.write_bytes(b"foreign binary" * 400)
+        with self.assertRaisesRegex(ValueError, "does not match"):
+            ci_gate.export_compiler(self.root, output, selected, self.root / "invalid.tar.gz")
+
+    def test_compiler_artifact_rejects_missing_extra_duplicate_links_and_corruption(self):
+        output, selected, archive = self.compiler_artifact_fixture()
+        with tarfile.open(archive) as bundle:
+            members = [(member, bundle.extractfile(member).read()) for member in bundle.getmembers()]
+        for mutation in ("missing", "extra", "duplicate", "link", "binary", "outside"):
+            with self.subTest(mutation=mutation):
+                changed = copy.deepcopy(members)
+                if mutation == "missing":
+                    changed.pop()
+                elif mutation == "extra":
+                    changed.append((tarfile.TarInfo("../outside"), b""))
+                elif mutation == "duplicate":
+                    changed.append(changed[0])
+                elif mutation == "link":
+                    changed[0][0].type = tarfile.SYMTYPE
+                    changed[0][0].linkname = "../outside"
+                    changed[0][0].size = 0
+                    changed[0] = (changed[0][0], b"")
+                elif mutation == "binary":
+                    member, data = changed[0]
+                    changed[0] = (member, b"x" * len(data))
+                else:
+                    member, data = changed[1]
+                    receipt = json.loads(data)
+                    receipt["work"] = str(self.root.parent / "outside")
+                    data = json.dumps(receipt).encode()
+                    member.size = len(data)
+                    changed[1] = (member, data)
+                invalid = self.root / "invalid.tar.gz"
+                with tarfile.open(invalid, "w:gz") as bundle:
+                    for member, data in changed:
+                        bundle.addfile(member, io.BytesIO(data))
+                with self.assertRaises(ValueError):
+                    ci_gate.import_compiler(self.root, output, selected, invalid, sha256_file(invalid))
 
     def test_missing_python_stops_shell_bootstrap_before_compilation(self):
         shell = shutil.which("sh")
