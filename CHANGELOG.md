@@ -200,6 +200,8 @@ integration may change.
 
 ### Fixed
 
+- Accept directory paths in `fmt` and `fix`, selecting sorted `.ouro` files
+  while skipping build and dependency trees and rejecting empty scopes.
 - Reject unknown or incomplete `ouro-test` options, honor `--out DIR` on the
   everyday path, and report `test: no tests found` with exit 1 for empty discovery.
 - Keep the later value when `map_from_pairs`, `config_from_pairs`, or
