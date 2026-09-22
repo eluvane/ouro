@@ -200,6 +200,14 @@ integration may change.
 
 ### Fixed
 
+- Keep unsaved language-server diagnostics when another `.ouro` file changes
+  on disk.
+- Accept directory paths in `fmt` and `fix`, selecting sorted `.ouro` files
+  while skipping build and dependency trees and rejecting empty scopes.
+- Reject unknown or incomplete `ouro-test` options, honor `--out DIR` on the
+  everyday path, and report `test: no tests found` with exit 1 for empty discovery.
+- Keep the later value when `map_from_pairs`, `config_from_pairs`, or
+  `map_union` sees a repeated key, matching config-file parsing.
 - Clippy's structural `cm_parse` seam no longer recopies the caller intern
   table on every imported file. `ouro_heap_context_leave` shares caller-owned
   nodes and copies only the nested lexer/parser graph.

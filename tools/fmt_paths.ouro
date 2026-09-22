@@ -1,0 +1,97 @@
+-- Shared path expansion for fmt/fix: directories select .ouro files, explicit
+-- files stay literal, and a failed inventory is never a silent empty success.
+
+import "quality/source.ouro";
+import "quality/input_error.ouro";
+import "../std/io.ouro";
+import "../std/fs.ouro";
+
+def tool_path_keep (_path : String) : Bool := True;
+
+inductive ToolPathSet : Type :=
+  | MkToolPathSet : Bool -> List String -> ToolPathSet;
+
+def tool_path_set_ok (selected : ToolPathSet) : Bool :=
+    match selected with
+    | MkToolPathSet ok _ => ok
+    end;
+
+def tool_path_set_files (selected : ToolPathSet) : List String :=
+    match selected with
+    | MkToolPathSet _ files => files
+    end;
+
+def tool_dir_error (path : String) (e : QualityInputError) : String :=
+    match e with
+    | QualityNoSources => concat path ": no .ouro files"
+    | QualityInvalidInput _ => concat path (concat ": " (quality_input_message e))
+    | QualityExpectedFile _ => concat path (concat ": " (quality_input_message e))
+    | QualityUnreadableDirectory _ => concat path (concat ": " (quality_input_message e))
+    | QualityWalkExhausted _ => concat path (concat ": " (quality_input_message e))
+    | QualityImportExhausted _ => concat path (concat ": " (quality_input_message e))
+    end;
+
+-- A missing path keeps the existing file diagnostic. A directory is expanded
+-- with the quality skip set; an explicit file is kept even when it is not
+-- `.ouro` or lives under a skipped name such as `_build`.
+def tool_expand_one (path : String) : IO (Either String (List String)) :=
+    do let! present := fs_exists path;
+       match present with
+       | False =>
+           io_pure (Either String (List String))
+             (Left String (List String) (concat path ": no such file"))
+       | True =>
+           do let! directory := fs_is_dir path;
+              match directory with
+              | False =>
+                  io_pure (Either String (List String))
+                    (Right String (List String) ([path] : List String))
+              | True =>
+                  do let! selected := quality_inventory quality_skip_dir
+                       tool_path_keep ([path] : List String);
+                     match selected with
+                     | Left e =>
+                         io_pure (Either String (List String))
+                           (Left String (List String) (tool_dir_error path e))
+                     | Right files =>
+                         io_pure (Either String (List String))
+                           (Right String (List String) files)
+                     end
+              end
+       end
+
+def tool_collect_acc (acc : ToolPathSet) (path : String) : IO ToolPathSet :=
+    do let! one := tool_expand_one path;
+       match one with
+       | Left err =>
+           do eprintln err;
+              io_pure ToolPathSet
+                (MkToolPathSet False (tool_path_set_files acc))
+       | Right files =>
+           io_pure ToolPathSet
+             (MkToolPathSet (tool_path_set_ok acc)
+               (append String (tool_path_set_files acc) files))
+       end
+
+def tool_collect_paths (paths : List String) : IO ToolPathSet :=
+    io_fold String ToolPathSet tool_collect_acc
+      (MkToolPathSet True (Nil String)) paths;
+
+-- Dedup after every root has been expanded. A canonicalization failure refuses
+-- the whole list instead of publishing a partial path set.
+def tool_resolve_paths (paths : List String) : IO ToolPathSet :=
+    do let! collected := tool_collect_paths paths;
+       match tool_path_set_files collected with
+       | Nil => io_pure ToolPathSet collected
+       | Cons _ _ =>
+           do let! unique := quality_unique_files (tool_path_set_files collected);
+              match unique with
+              | Left e =>
+                  do eprintln (quality_input_message e);
+                     io_pure ToolPathSet
+                       (MkToolPathSet False (Nil String))
+              | Right files =>
+                  io_pure ToolPathSet
+                    (MkToolPathSet (tool_path_set_ok collected) files)
+              end
+       end

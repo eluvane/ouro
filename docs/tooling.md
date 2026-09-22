@@ -167,6 +167,13 @@ sh scripts/ouro1.sh fmt --check path/to/module.ouro
 sh scripts/ouro1.sh fmt --write path/to/module.ouro
 ```
 
+For both `fmt` and `fix`, a directory argument selects the sorted `.ouro`
+files beneath it. Discovery skips `_build`, `_cache`, `_opam`, `_tools`,
+`.git`, and `node_modules`. Explicit files remain accepted regardless of
+extension or skipped directory names. A directory with no selected sources
+exits 1 with `path: no .ouro files` and does not write. Missing paths report
+`path: no such file`; other valid roots are processed and the command exits 1.
+
 The formatter normalizes line endings, tabs, trailing whitespace, match-arm
 spacing, and the final newline. It is intentionally a conservative text
 formatter rather than a complete AST pretty-printer, so it preserves comments
@@ -181,6 +188,8 @@ sh scripts/ouro1.sh fix path/to/module.ouro
 sh scripts/ouro1.sh fix --check path/to/module.ouro
 sh scripts/ouro1.sh fix --write path/to/module.ouro
 ```
+
+Directory selection follows the [formatter](#formatter) rules above.
 
 `fix` rewrites the mechanical part of what the linter reports. It works on a
 positional token stream of the original text, so comments, string bodies, and
@@ -287,6 +296,10 @@ With no input, `ouro-test.exe` discovers `*_test.ouro` below the current
 directory. Directory entries are sorted; input-root order, duplicate roots
 and explicitly named files are preserved. Discovery excludes `_build`,
 `_cache`, `_opam`, `_tools`, `.git`, `bad`, `future`, `fixtures` and `bench`.
+Unknown or incomplete long options, including `--out` without a directory,
+print usage and exit 2. `--out DIR` selects the native binary directory;
+`OURO_TEST_OUT` remains the default when `--out` is omitted. An empty discovery
+result prints `test: no tests found` and exits 1.
 An unreadable or exhausted inventory fails explicitly. Checks and native
 builds use sibling `coil.exe`; fixture stdin is captured as exact bytes.
 Repository-owned check batches use the same native tool in strict manifest
@@ -417,6 +430,8 @@ The experimental language server communicates over standard input/output and
 currently provides:
 
 - diagnostics;
+- watched-file refresh of open buffers, preserving unsaved text while imports
+  continue to come from disk;
 - hover and definition lookup;
 - completion and document/workspace symbols;
 - whole-buffer rename;

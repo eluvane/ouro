@@ -95,6 +95,86 @@ test ! -s "$OUT/unicode-repeat.out"
 test ! -s "$OUT/unicode-repeat.err"
 cmp "$OUT/unicode.expected" "$unicode_file"
 
+# Directories select sorted .ouro files. Build/cache trees stay skipped unless
+# a file under them is named explicitly. Empty scopes stay fail-closed.
+dir_root="$OUT/dir-case"
+mkdir -p "$dir_root/sub" "$dir_root/_build" "$OUT/empty-dir" "$OUT/notes-only"
+printf '%s\n' 'inductive Nat : Type := | Z : Nat | S : Nat -> Nat;' 'def dirty_value : Nat :=0;' >"$dir_root/dirty.ouro"
+printf '%s\n' 'inductive Nat : Type := | Z : Nat | S : Nat -> Nat;' 'def clean_value : Nat := 0;' >"$dir_root/clean.ouro"
+printf '%s\n' 'inductive Nat : Type := | Z : Nat | S : Nat -> Nat;' 'def nested_value : Nat :=0;;' >"$dir_root/sub/nested.ouro"
+printf '%s\n' 'inductive Nat : Type := | Z : Nat | S : Nat -> Nat;' 'def ignored_value : Nat :=0;;' >"$dir_root/_build/ignored.ouro"
+printf '%s\n' 'inductive Nat : Type := | Z : Nat | S : Nat -> Nat;' 'def note_value : Nat :=0;;' >"$dir_root/note.txt"
+cp "$dir_root/_build/ignored.ouro" "$OUT/ignored.original"
+cp "$dir_root/note.txt" "$OUT/note.original"
+printf '%s\n' 'inductive Nat : Type := | Z : Nat | S : Nat -> Nat;' 'def notes_only : Nat :=0;;' >"$OUT/notes-only/readme.txt"
+cp "$dir_root/clean.ouro" "$OUT/dir-clean.original"
+printf '%s\n' 'inductive Nat : Type := | Z : Nat | S : Nat -> Nat;' 'def dirty_value : Nat := 0;' >"$OUT/dir-dirty.expected"
+printf '%s\n' 'inductive Nat : Type := | Z : Nat | S : Nat -> Nat;' 'def nested_value : Nat := 0;' >"$OUT/dir-nested.expected"
+set +e
+"$FIX" --check "$dir_root" >"$OUT/dir-check.out" 2>"$OUT/dir-check.err"
+dir_check_status=$?
+set -e
+test "$dir_check_status" -eq 1
+test ! -s "$OUT/dir-check.out"
+grep -F 'dirty.ouro: needs formatting' "$OUT/dir-check.err" >/dev/null
+grep -F 'nested.ouro: needs' "$OUT/dir-check.err" >/dev/null
+if grep -F 'clean.ouro' "$OUT/dir-check.err" >/dev/null; then
+	echo "FIX_SUITE: FAIL clean directory member reported" >&2
+	exit 1
+fi
+if grep -F 'ignored.ouro' "$OUT/dir-check.err" >/dev/null; then
+	echo "FIX_SUITE: FAIL skipped _build member reported" >&2
+	exit 1
+fi
+if grep -F 'note.txt' "$OUT/dir-check.err" >/dev/null; then
+	echo "FIX_SUITE: FAIL non-ouro directory member reported" >&2
+	exit 1
+fi
+cmp "$OUT/ignored.original" "$dir_root/_build/ignored.ouro"
+cmp "$OUT/note.original" "$dir_root/note.txt"
+"$FIX" --write "$dir_root" >"$OUT/dir-write.out" 2>"$OUT/dir-write.err"
+cmp "$OUT/dir-dirty.expected" "$dir_root/dirty.ouro"
+cmp "$OUT/dir-nested.expected" "$dir_root/sub/nested.ouro"
+cmp "$OUT/dir-clean.original" "$dir_root/clean.ouro"
+cmp "$OUT/ignored.original" "$dir_root/_build/ignored.ouro"
+cmp "$OUT/note.original" "$dir_root/note.txt"
+grep -F 'fixed ' "$OUT/dir-write.out" >/dev/null
+grep -F 'dirty.ouro' "$OUT/dir-write.out" >/dev/null
+grep -F 'nested.ouro' "$OUT/dir-write.out" >/dev/null
+if grep -F 'ignored.ouro' "$OUT/dir-write.out" >/dev/null; then
+	echo "FIX_SUITE: FAIL skipped _build member written" >&2
+	exit 1
+fi
+"$FIX" --check "$dir_root"
+"$FIX" --write "$dir_root" >"$OUT/dir-repeat.out" 2>"$OUT/dir-repeat.err"
+test ! -s "$OUT/dir-repeat.out"
+test ! -s "$OUT/dir-repeat.err"
+set +e
+"$FIX" --check "$dir_root/_build/ignored.ouro" >"$OUT/dir-explicit.out" 2>"$OUT/dir-explicit.err"
+explicit_status=$?
+set -e
+test "$explicit_status" -eq 1
+grep -F 'ignored.ouro: needs' "$OUT/dir-explicit.err" >/dev/null
+set +e
+"$FIX" --write "$OUT/empty-dir" >"$OUT/empty-dir.out" 2>"$OUT/empty-dir.err"
+empty_status=$?
+"$FIX" --check "$OUT/notes-only" >"$OUT/notes-only.out" 2>"$OUT/notes-only.err"
+notes_status=$?
+"$FIX" --check "$OUT/missing-dir.ouro" "$dir_root/clean.ouro" >"$OUT/mixed-missing.out" 2>"$OUT/mixed-missing.err"
+mixed_status=$?
+set -e
+test "$empty_status" -eq 1
+test ! -s "$OUT/empty-dir.out"
+grep -F 'empty-dir: no .ouro files' "$OUT/empty-dir.err" >/dev/null
+test "$notes_status" -eq 1
+grep -F 'notes-only: no .ouro files' "$OUT/notes-only.err" >/dev/null
+test "$mixed_status" -eq 1
+grep -F 'missing-dir.ouro: no such file' "$OUT/mixed-missing.err" >/dev/null
+if grep -F 'clean.ouro: needs' "$OUT/mixed-missing.err" >/dev/null; then
+	echo "FIX_SUITE: FAIL clean sibling reported after missing path" >&2
+	exit 1
+fi
+
 # Ambiguous constructor spellings must not be erased and then renamed as
 # unused binders. Exercise both public refusal paths and preserve exact bytes.
 binding_refusal() {
