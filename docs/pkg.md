@@ -34,6 +34,12 @@ C:\path\to\ouro\_build\native\ouro-pkg.exe list
 C:\path\to\ouro\_build\native\ouro-pkg.exe verify
 ```
 
+`--help` and `help` print usage and exit 0. A missing `--name`, `--registry`,
+or `--range` value is rejected instead of falling back to the default. `add`
+rejects an unreadable range before `Ouro.seal` changes, and prints `updated`
+when it replaces an existing dependency range. `remove` fails if the name is
+not a current direct dependency.
+
 The compatibility `scripts/coil.sh` wrapper retains `resolve` and `seal`
 aliases for `lock`. Native `coil.exe` has no package dispatch yet; run
 `ouro-pkg.exe` directly. Keep `coil.exe` beside it for verification.
@@ -94,7 +100,8 @@ an older project configuration.
 acceptance. See [Trusted computing base](tcb.md).
 
 Supported ranges include `*`, exact versions, `^x.y.z`, `~x.y.z`, and the
-ordinary comparison operators. A relative registry path is resolved from the
+ordinary comparison operators. `add` rejects a range that does not parse as
+one of those forms. A relative registry path is resolved from the
 project directory.
 
 Package and dependency names are single portable path segments of at most 128

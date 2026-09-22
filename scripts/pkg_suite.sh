@@ -103,14 +103,57 @@ else
 	ok init-twice
 fi
 
+# --help is a successful usage page, not an unknown-command failure.
+if status "$PKG" --help; then
+	if grep -q 'usage: ouro-pkg' "$OUT/last.out"; then
+		ok help
+	else
+		bad help "no usage"
+		cat "$OUT/last.out" >&2
+	fi
+else
+	bad help "expected zero"
+	cat "$OUT/last.err" >&2
+fi
+
 "$PKG" add greet --range '^0.1.0' >"$OUT/add.log" 2>&1
 "$PKG" add greet --range '>=0.1.0' >>"$OUT/add.log" 2>&1
 if [ "$(grep -c 'greet' Ouro.seal)" = 1 ] &&
-	grep -q '">=0.1.0"' Ouro.seal; then
+	grep -q '">=0.1.0"' Ouro.seal &&
+	grep -q 'updated greet >=0.1.0' "$OUT/add.log"; then
 	ok add
 else
 	bad add manifest
 	cat Ouro.seal >&2
+	cat "$OUT/add.log" >&2
+fi
+
+# A dangling --range must not default to "*" and persist a new dependency.
+if status "$PKG" add hello --range; then
+	bad add-incomplete-range "expected nonzero"
+else
+	if ! grep -q 'hello' Ouro.seal &&
+		grep -q 'missing option value' "$OUT/last.err"; then
+		ok add-incomplete-range
+	else
+		bad add-incomplete-range "persisted or diagnostic missing"
+		cat "$OUT/last.err" >&2
+		cat Ouro.seal >&2
+	fi
+fi
+
+# Unreadable ranges stay out of the manifest.
+if status "$PKG" add greet --range latest; then
+	bad add-invalid-range "expected nonzero"
+else
+	if ! grep -q latest Ouro.seal &&
+		grep -q 'invalid version range' "$OUT/last.err"; then
+		ok add-invalid-range
+	else
+		bad add-invalid-range "persisted or diagnostic missing"
+		cat "$OUT/last.err" >&2
+		cat Ouro.seal >&2
+	fi
 fi
 
 # install vendors greet plus its transitive dependency hello, and locks both.
@@ -174,6 +217,20 @@ if status "$PKG" remove; then
 	bad remove-no-name "expected nonzero"
 else
 	ok remove-no-name
+fi
+
+# remove of a name that is not a current dependency must not rewrite the seal.
+if status "$PKG" remove not-installed; then
+	bad remove-unknown "expected nonzero"
+else
+	if grep -q 'greet' Ouro.seal &&
+		grep -q 'not a dependency' "$OUT/last.err"; then
+		ok remove-unknown
+	else
+		bad remove-unknown "seal changed or diagnostic missing"
+		cat "$OUT/last.err" >&2
+		cat Ouro.seal >&2
+	fi
 fi
 
 # A local edit under _ouro_pkgs/ is drift, and verify has to say so.
