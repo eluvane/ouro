@@ -192,7 +192,7 @@ import "../std/fsx.ouro";
 fsx_read_config "tool.conf"
 ```
 
-A config file is parsed as line-based `key=value`. Blank lines and `#` comments are ignored. `config_get_nat` and `config_get_bool` return typed errors when a value is missing or malformed.
+A config file is parsed as line-based `key=value`. Blank lines and `#` comments are ignored. A repeated key keeps the later value. `config_from_pairs` and `map_from_pairs` apply entries from left to right with that same later-entry override, and `map_union` lets later entries of the second map replace earlier ones. `config_get_nat` and `config_get_bool` return typed errors when a value is missing or malformed.
 
 `std/configx.ouro` adds schema-lite validation where multiple fields can be checked in one pass:
 
