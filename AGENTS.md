@@ -223,6 +223,20 @@ Follow `docs/syntax.md` for accepted syntax. Follow `docs/quality.md` for the
 repository's stricter project-owned style. Do not invent a new style guide that
 conflicts with those documents.
 
+## Code comments
+
+- Keep comments sparse and concise. Add one only when it conveys useful context
+  that names, types, contracts, or the surrounding code do not make clear.
+- Explain non-obvious design decisions, invariants, proof strategy, or constraints.
+  Do not narrate obvious operations or paraphrase a declaration.
+- Prefer clear names and small definitions. Avoid boilerplate comments on every
+  definition, decorative separators, editing notes, and change history.
+- Keep API and module documentation focused on purpose, assumptions, and usage.
+  Include enough detail to use an interface or understand a proof correctly.
+- Place comments beside the code they explain and update them with that code.
+  Preserve required annotations, suppression reasons, license notices, and
+  explanations of trust boundaries.
+
 ## Changing Markdown docs
 
 Documentation should be concise, task-oriented, and current-state focused.

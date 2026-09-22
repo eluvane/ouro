@@ -1,6 +1,4 @@
 #!/usr/bin/env sh
-# Run the core toolchain performance evidence collector.
-
 set -eu
 ROOT=$(CDPATH='' cd "$(dirname "$0")/.." && pwd)
 cd "$ROOT"

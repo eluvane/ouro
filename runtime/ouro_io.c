@@ -1492,7 +1492,6 @@ static int mkdir_one(const char *path)
 #endif
 }
 
-/* mkdir -p: existing components are not an error. */
 static void mkdir_p(const char *path)
 {
 	char buf[4096];
