@@ -430,6 +430,8 @@ The experimental language server communicates over standard input/output and
 currently provides:
 
 - diagnostics;
+- watched-file refresh of open buffers, preserving unsaved text while imports
+  continue to come from disk;
 - hover and definition lookup;
 - completion and document/workspace symbols;
 - whole-buffer rename;
