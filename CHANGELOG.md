@@ -19,6 +19,12 @@ integration may change.
 
 ### Changed
 
+- Share verified Linux compiler bootstrap artifacts across PR jobs, retain
+  kernel coverage without duplicate PR gates, balance compiler shards by
+  measured build cost, and give documentation changes a focused CI route.
+- Check site changes with tests, lint, and a production build on pull requests.
+- Honor package-only release dispatches and bind weekly tags to the workflow's
+  source commit.
 - Build and verify all required lint companions, including the transitive
   structural worker, when preparing an isolated native tool installation;
   preserve quiet success when the launcher prepares a cached tool.

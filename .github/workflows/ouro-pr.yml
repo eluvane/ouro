@@ -17,6 +17,16 @@ defaults:
   run:
     shell: bash
 
+env:
+  OURO_CI: "1"
+  OURO_REPRODUCIBLE: "1"
+  OURO_PACK_STRICT: "1"
+  OURO_JOBS: "2"
+  OURO_CACHE_DIR: _cache/ouro
+  OURO_BUILD_DIR: _build
+  OURO_C_BUILD_DIR: _build/c
+  OURO_CCACHE: disabled
+
 jobs:
   paths:
     name: Paths
@@ -26,6 +36,7 @@ jobs:
       contents: read
     outputs:
       core: ${{ steps.changes.outputs.core }}
+      docs: ${{ steps.changes.outputs.docs }}
       kernel: ${{ steps.changes.outputs.kernel }}
       editor: ${{ steps.changes.outputs.editor }}
     steps:
@@ -42,9 +53,82 @@ jobs:
           HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: python3 scripts/ci_gate.py --select-paths --base "$BASE_SHA" --head "$HEAD_SHA"
 
+  host-compiler:
+    name: Host compiler
+    needs: paths
+    if: ${{ needs.paths.outputs.core == 'true' || needs.paths.outputs.docs == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    outputs:
+      sha256: ${{ steps.bundle.outputs.sha256 }}
+      artifact: ${{ steps.bundle.outputs.artifact }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Identify compiler inputs
+        id: inputs
+        run: python3 scripts/ci_gate.py --compiler-artifact key >> "$GITHUB_OUTPUT"
+
+      - name: Restore compiler and bootstrap evidence
+        id: compiler-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            _build/c/ouro1
+            _build/c/ouro1.bootstrap.json
+            _build/bootstrap/*/report.json
+            _build/bootstrap/*/inputs.json
+            _build/bootstrap/*/out/p1/*.c
+            _build/bootstrap/*/out/p2/*.c
+          key: ouro-host-compiler-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.inputs.outputs.key }}
+
+      - name: Build and verify host compiler
+        run: python3 scripts/ouro_build.py build --verbosity quiet
+
+      - name: Export compiler with bootstrap evidence
+        id: bundle
+        run: |
+          python3 scripts/ci_gate.py --compiler-artifact export >> "$GITHUB_OUTPUT"
+          echo "artifact=host-compiler-${{ github.run_id }}-${{ github.run_attempt }}" >> "$GITHUB_OUTPUT"
+
+      - name: Save compiler and bootstrap evidence
+        if: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master') && steps.compiler-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            _build/c/ouro1
+            _build/c/ouro1.bootstrap.json
+            _build/bootstrap/*/report.json
+            _build/bootstrap/*/inputs.json
+            _build/bootstrap/*/out/p1/*.c
+            _build/bootstrap/*/out/p2/*.c
+          key: ${{ steps.compiler-cache.outputs.cache-primary-key }}
+
+      - name: Upload verified compiler
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: host-compiler-${{ github.run_id }}-${{ github.run_attempt }}
+          path: _build/ci/host-compiler.tar.gz
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload bootstrap reports
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: host-compiler-reports-${{ github.run_attempt }}
+          path: |
+            _build/bootstrap/**/*.json
+            _build/bootstrap/**/*.log
+          if-no-files-found: ignore
+          retention-days: 14
+
   quick-firewall:
     name: PR
-    needs: paths
+    needs: [ paths, host-compiler ]
     if: ${{ needs.paths.outputs.core == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 120
@@ -54,6 +138,9 @@ jobs:
         include:
           - group: checks
           - group: analysis
+          - group: checker
+          - group: analyzer
+          - group: lint
           - group: tests
           - group: smith
           - group: samples-1
@@ -68,15 +155,6 @@ jobs:
           - group: compiler-8
     permissions:
       contents: read
-    env:
-      OURO_CI: "1"
-      OURO_REPRODUCIBLE: "1"
-      OURO_PACK_STRICT: "1"
-      OURO_JOBS: "10"
-      OURO_CACHE_DIR: _cache/ouro
-      OURO_BUILD_DIR: _build
-      OURO_C_BUILD_DIR: _build/c
-      OURO_CCACHE: disabled
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -110,9 +188,16 @@ jobs:
           fi
           shellcheck --version
 
-      - name: Build host compiler
-        if: ${{ matrix.group != 'checks' }}
-        run: python3 scripts/ouro_build.py build --verbosity quiet
+      - name: Download host compiler
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ needs.host-compiler.outputs.artifact }}
+          path: _build/ci
+
+      - name: Verify and install host compiler
+        env:
+          COMPILER_SHA256: ${{ needs.host-compiler.outputs.sha256 }}
+        run: python3 scripts/ci_gate.py --compiler-artifact import --compiler-sha256 "$COMPILER_SHA256"
 
       - name: Run checks
         run: python3 scripts/ci_gate.py --profile pr --group "${{ matrix.group }}" --out "_build/ci/pr-${{ matrix.group }}"
@@ -147,33 +232,12 @@ jobs:
 
   kernel-validation:
     name: Compiler kernel
-    needs: paths
+    needs: [ paths, host-compiler ]
     if: ${{ needs.paths.outputs.kernel == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 120
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - group: checks
-          - group: compiler-1
-          - group: compiler-2
-          - group: compiler-3
-          - group: compiler-4
-          - group: compiler-5
-          - group: compiler-6
-          - group: compiler-7
-          - group: compiler-8
     permissions:
       contents: read
-    env:
-      OURO_CI: "1"
-      OURO_REPRODUCIBLE: "1"
-      OURO_JOBS: "10"
-      OURO_CACHE_DIR: _cache/ouro
-      OURO_BUILD_DIR: _build
-      OURO_C_BUILD_DIR: _build/c
-      OURO_CCACHE: disabled
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -187,16 +251,24 @@ jobs:
           path: |
             _cache/ouro
             _build/c
-          key: ouro-pr-kernel-${{ matrix.group }}-${{ runner.os }}-${{ hashFiles('Ouro.seal', 'scripts/**', 'compiler/**', 'runtime/**', 'tools/**', 'tests/**', 'std/**', 'quality/smith/**', 'docs/generated_artifact_hashes.sha256') }}
+          key: ouro-pr-kernel-checks-${{ runner.os }}-${{ hashFiles('Ouro.seal', 'scripts/**', 'compiler/**', 'runtime/**', 'tools/**', 'tests/**', 'std/**', 'quality/smith/**', 'docs/generated_artifact_hashes.sha256') }}
           restore-keys: |
-            ouro-pr-portable-${{ runner.os }}-
+            ouro-pr-kernel-checks-${{ runner.os }}-
             ouro-pr-${{ runner.os }}-
 
-      - name: Build host compiler
-        run: python3 scripts/ouro_build.py build --verbosity quiet
+      - name: Download host compiler
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ needs.host-compiler.outputs.artifact }}
+          path: _build/ci
 
-      - name: Run canonical compiler checks
-        run: python3 scripts/ci_gate.py --profile kernel --group "${{ matrix.group }}" --out "_build/ci/kernel-${{ matrix.group }}"
+      - name: Verify and install host compiler
+        env:
+          COMPILER_SHA256: ${{ needs.host-compiler.outputs.sha256 }}
+        run: python3 scripts/ci_gate.py --compiler-artifact import --compiler-sha256 "$COMPILER_SHA256"
+
+      - name: Run additional compiler checks
+        run: python3 scripts/ci_gate.py --profile kernel-extra --out _build/ci/kernel-extra
 
       - name: Save cache
         if: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master') && steps.ouro-cache.outputs.cache-hit != 'true' }}
@@ -211,7 +283,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: compiler-kernel-${{ matrix.group }}
+          name: compiler-kernel-extra
           if-no-files-found: error
           retention-days: 14
           path: |
@@ -222,26 +294,95 @@ jobs:
             _build/**/*.stdout
             _build/**/*.stderr
 
+  docs:
+    name: Docs
+    needs: [ paths, host-compiler ]
+    if: ${{ needs.paths.outputs.core != 'true' && needs.paths.outputs.docs == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Restore docs tools
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            _cache/ouro
+            _build/c
+          key: ouro-pr-checks-${{ runner.os }}-${{ hashFiles('Ouro.seal', 'scripts/**', 'compiler/**', 'runtime/**', 'tools/**', 'tests/**', 'std/**', 'quality/smith/**', 'docs/generated_artifact_hashes.sha256') }}
+          restore-keys: |
+            ouro-pr-checks-${{ runner.os }}-
+
+      - name: Download host compiler
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ needs.host-compiler.outputs.artifact }}
+          path: _build/ci
+
+      - name: Verify and install host compiler
+        env:
+          COMPILER_SHA256: ${{ needs.host-compiler.outputs.sha256 }}
+        run: python3 scripts/ci_gate.py --compiler-artifact import --compiler-sha256 "$COMPILER_SHA256"
+
+      - name: Check documentation, examples and API drift
+        run: python3 scripts/ci_gate.py --profile docs --out _build/ci/docs
+
+      - name: Upload docs reports
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: docs
+          path: |
+            _build/**/*.json
+            _build/**/*.log
+            _build/**/*.out
+            _build/**/*.err
+          if-no-files-found: error
+          retention-days: 14
+
   native-kernel-regressions:
     name: Kernel
-    needs: [ paths, quick-firewall, kernel-validation ]
-    if: ${{ always() && needs.paths.outputs.core == 'true' }}
+    needs: [ paths, host-compiler, quick-firewall, kernel-validation, docs, portable-kernel-smoke, editor ]
+    if: ${{ always() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
       contents: read
     steps:
-      - name: Require every PR and selected compiler group
+      - name: Require every selected validation job
         env:
+          PATHS_RESULT: ${{ needs.paths.result }}
+          CORE_REQUIRED: ${{ needs.paths.outputs.core }}
+          DOCS_CHANGED: ${{ needs.paths.outputs.docs }}
+          COMPILER_RESULT: ${{ needs.host-compiler.result }}
           PR_RESULT: ${{ needs.quick-firewall.result }}
           KERNEL_REQUIRED: ${{ needs.paths.outputs.kernel }}
           VALIDATION_RESULT: ${{ needs.kernel-validation.result }}
+          DOCS_RESULT: ${{ needs.docs.result }}
+          PORTABLE_RESULT: ${{ needs.portable-kernel-smoke.result }}
+          EDITOR_REQUIRED: ${{ needs.paths.outputs.editor }}
+          EDITOR_RESULT: ${{ needs.editor.result }}
         run: |
-          test "$PR_RESULT" = success
-          if [ "$KERNEL_REQUIRED" = true ]; then
-            test "$VALIDATION_RESULT" = success
+          test "$PATHS_RESULT" = success
+          require_result() {
+            if [ "$1" = true ]; then test "$2" = success; else test "$2" = skipped; fi
+          }
+          require_result "$CORE_REQUIRED" "$PR_RESULT"
+          require_result "$CORE_REQUIRED" "$PORTABLE_RESULT"
+          require_result "$KERNEL_REQUIRED" "$VALIDATION_RESULT"
+          require_result "$EDITOR_REQUIRED" "$EDITOR_RESULT"
+          if [ "$CORE_REQUIRED" = true ] || [ "$DOCS_CHANGED" = true ]; then
+            test "$COMPILER_RESULT" = success
           else
-            test "$VALIDATION_RESULT" = skipped
+            test "$COMPILER_RESULT" = skipped
+          fi
+          if [ "$CORE_REQUIRED" != true ] && [ "$DOCS_CHANGED" = true ]; then
+            test "$DOCS_RESULT" = success
+          else
+            test "$DOCS_RESULT" = skipped
           fi
 
   editor:
@@ -284,7 +425,7 @@ jobs:
 
   portable-kernel-smoke:
     name: Portable
-    needs: paths
+    needs: [ paths, host-compiler ]
     if: ${{ needs.paths.outputs.core == 'true' }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
@@ -294,14 +435,6 @@ jobs:
         os: [ ubuntu-latest, macos-latest ]
     permissions:
       contents: read
-    env:
-      OURO_CI: "1"
-      OURO_REPRODUCIBLE: "1"
-      OURO_JOBS: "10"
-      OURO_CACHE_DIR: _cache/ouro
-      OURO_BUILD_DIR: _build
-      OURO_C_BUILD_DIR: _build/c
-      OURO_CCACHE: disabled
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -309,15 +442,34 @@ jobs:
           persist-credentials: false
 
       - name: Restore cache
+        id: ouro-cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             _cache/ouro
             _build/c
+            _build/bootstrap/*/report.json
+            _build/bootstrap/*/inputs.json
+            _build/bootstrap/*/out/p1/*.c
+            _build/bootstrap/*/out/p2/*.c
           key: ouro-pr-portable-${{ runner.os }}-${{ hashFiles('Ouro.seal', 'scripts/**', 'compiler/**', 'runtime/**', 'tools/**', 'tests/**', 'std/**', 'quality/smith/**', 'docs/generated_artifact_hashes.sha256') }}
           restore-keys: |
+            ouro-pr-portable-${{ runner.os }}-
             ouro-pr-checks-${{ runner.os }}-
             ouro-pr-${{ runner.os }}-
+
+      - name: Download host compiler
+        if: ${{ runner.os == 'Linux' }}
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ needs.host-compiler.outputs.artifact }}
+          path: _build/ci
+
+      - name: Verify and install host compiler
+        if: ${{ runner.os == 'Linux' }}
+        env:
+          COMPILER_SHA256: ${{ needs.host-compiler.outputs.sha256 }}
+        run: python3 scripts/ci_gate.py --compiler-artifact import --compiler-sha256 "$COMPILER_SHA256"
 
       - name: Run checks
         run: |
@@ -325,6 +477,19 @@ jobs:
           python3 -m py_compile scripts/kernel_scale.py scripts/kernel_profile.py scripts/kernel_hardening_suite.py scripts/github_workflow_gate.py scripts/generated_artifact_drift_check.py scripts/cache_parity_suite.py scripts/ci_gate.py scripts/strict_quality_firewall.py
           python3 scripts/ouro_build.py build --verbosity quiet
           python3 scripts/kernel_hardening_suite.py --out _build/portable_compiler
+
+      - name: Save portable cache and bootstrap evidence
+        if: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master') && steps.ouro-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            _cache/ouro
+            _build/c
+            _build/bootstrap/*/report.json
+            _build/bootstrap/*/inputs.json
+            _build/bootstrap/*/out/p1/*.c
+            _build/bootstrap/*/out/p2/*.c
+          key: ${{ steps.ouro-cache.outputs.cache-primary-key }}
 
       - name: Upload reports
         if: always()

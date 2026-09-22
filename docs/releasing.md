@@ -113,11 +113,15 @@ manifest, notes, and checksums.
 A maintainer reviews the draft, changelog, checksums, validation reports,
 security status, and generated-artifact hashes before publication.
 
-A Monday schedule on `main`, or a dispatch with `weekly_snapshot`, publishes a
-dated `weekly-YYYYMMDD` GitHub Release when `main` has commits since the last
-weekly snapshot (or in the last eight days if none exists). The snapshot keeps
-the current project version, uses commit subjects as notes, and does not mark
-the release as latest. Empty weeks publish nothing.
+A Monday schedule on `main`, or a dispatch on `main` with
+`weekly_snapshot=true` and `package_only=false`, publishes a dated
+`weekly-YYYYMMDD` GitHub Release when the checked-out commit has changes since
+the last weekly snapshot (or in the last eight days if none exists).
+`package_only=true`, the dispatch default, prevents publication even when
+`weekly_snapshot` is selected. The weekly tag points to the workflow's source
+commit, matching its built archives. The snapshot keeps the current project
+version, uses commit subjects as notes, and does not mark the release as latest.
+Empty weeks publish nothing.
 
 During development, write user-visible notes under `[Unreleased]`. Do not append
 new work to a published version section. Weekly snapshots do not cut the

@@ -40,12 +40,15 @@ List the gates in a profile without running them:
 python3 scripts/ci_gate.py --profile pr --list
 ```
 
-GitHub runs the same PR inventory as fourteen isolated groups so the slow suites do
+GitHub runs the same PR inventory as seventeen isolated groups so the slow suites do
 not block one another on a single runner:
 
 ```sh
 python3 scripts/ci_gate.py --profile pr --group checks
 python3 scripts/ci_gate.py --profile pr --group analysis
+python3 scripts/ci_gate.py --profile pr --group checker
+python3 scripts/ci_gate.py --profile pr --group analyzer
+python3 scripts/ci_gate.py --profile pr --group lint
 python3 scripts/ci_gate.py --profile pr --group tests
 python3 scripts/ci_gate.py --profile pr --group smith
 python3 scripts/ci_gate.py --profile pr --group samples-1
@@ -60,7 +63,7 @@ python3 scripts/ci_gate.py --profile pr --group compiler-7
 python3 scripts/ci_gate.py --profile pr --group compiler-8
 ```
 
-`--group` supports PR, nightly, manual, kernel, and stage-loop profiles.
+`--group` supports PR, nightly, manual, kernel, stage-loop, docs, and kernel-extra profiles.
 `--list-groups` prints the selected profile's complete group list as JSON;
 Manual and Release use that inventory to construct their hosted matrices.
 Release metadata and assembly require every validation group to succeed.
@@ -68,7 +71,9 @@ Use isolated checkouts when running
 groups concurrently: several suites own fixed fixture/output paths. The full
 local command runs every gate in registry order. The runner rejects a group
 inventory that omits, duplicates, or invents a gate; its self-test also checks
-that each hosted matrix exactly matches its profile's group inventory.
+that each hosted matrix exactly matches its profile's group inventory. The
+`analysis` group owns memory budgets, C analysis, and LSP; `checker` owns
+hardening, scale, and depth; analyzer precision and lint run independently.
 Execution removes the previous `ci-summary.json` before starting gates, so an
 interrupted run leaves no old successful aggregate at the current report path.
 The native CI runner also invalidates selected gate reports and the delegated
@@ -76,8 +81,13 @@ host-inventory report. Failure to remove a report stops execution; a directory
 at a report path is never removed. Listing profiles does not change reports.
 Manual and Release prepare the current compiler before running each validation
 group, including when a restored compiler cache lacks its bootstrap evidence.
-PR and Nightly validation jobs allow 120 minutes for cold bootstrap and the
-complete group; per-program execution and memory limits remain separate.
+PR and Nightly validation jobs allow 120 minutes for the complete group;
+per-program execution and memory limits remain separate. PR Linux jobs depend
+on one `Host compiler` job, which restores or builds the compiler with its
+complete bootstrap evidence and publishes a workflow-local artifact. Each
+consumer checks the producer's SHA-256 and verifies the binary, current inputs,
+host toolchain, and bootstrap evidence before running gates. Partial job retries
+use the successful producer's artifact name, including its original attempt.
 Release artifacts use the workflow run ID so branch names containing `/` remain
 valid for uploads and downstream downloads.
 OuroSmith compiler evidence requires all eight compiler gate commands and their
@@ -129,37 +139,51 @@ Existing suite assertions and required gates remain in place;
 these explicit invocations do not establish native bootstrap or retire the
 full PR profile.
 
-Nightly uses `checks`, `analysis`, `tests`, `samples-1`, `samples-2`, `kernel`,
+Nightly uses `checks`, `analysis`, `analyzer`, `lint`, `tests`, `samples-1`, `samples-2`, `kernel`,
 `trust`, and `compiler-1` through `compiler-8` groups. The `trust` job runs the stage-loop fixpoint/drift gate and
 then the deeper OuroSmith profile in the same checkout. `Full` runs even after
 a job failure and fails unless every matrix group succeeds. Reports are
 uploaded separately as `nightly-<group>` artifacts. Hosted PR matrix jobs use static names `PR` and `Portable` so a skipped
 matrix does not publish an unevaluated expression. When those jobs run,
-GitHub appends the matrix value: `PR (checks)`, `PR (analysis)`, `PR (tests)`,
+GitHub appends the matrix value: `PR (checks)`, `PR (analysis)`, `PR (checker)`,
+`PR (analyzer)`, `PR (lint)`, `PR (tests)`,
 `PR (smith)`, `PR (samples-1)`, `PR (samples-2)`, `PR (compiler-1)` through
 `PR (compiler-8)`, `Portable (ubuntu-latest)`,
-and `Portable (macos-latest)`. Portable restores the compiler cache when
-present, then builds `ouro1` before `kernel_hardening_suite.py`.
+and `Portable (macos-latest)`. Linux Portable uses the shared compiler;
+macOS Portable restores its own cache and bootstrap evidence, then builds or
+verifies `ouro1` before `kernel_hardening_suite.py`.
 macOS keeps the inherited Python stack when the host CPython build rejects
 `setrlimit(RLIMIT_STACK)`. Darwin also rejects finite `RLIMIT_AS` (EINVAL);
 POSIX children on Linux still apply a sticky AS cap when the host allows it,
 and fall back to a soft-only cap when a lowered hard value is rejected.
-The hosted kernel matrix restores the compiler cache when present, then builds
-`ouro1` before each `ci_gate.py --profile kernel --group` invocation. Its
-`checks` group retains the hardening, scale, depth, boundary, quality, and Smith
-gates; eight compiler groups retain the complete assertion inventory. The
-static `Kernel` check requires every PR group to succeed, including all eight
-compiler shards, and requires the kernel matrix whenever path selection enables
-it. It also runs for other core changes, preserving enforcement through the
-existing required `Kernel` context while branch rules adopt the new shard names.
-Nightly non-`checks` groups do
-the same before their profile group. The `analysis`, `tests`, `smith`,
-`samples-1`, and `samples-2` jobs also build `ouro1` after a cache miss;
-`checks` stays lint/quality-only.
-`scripts/apply_github_settings.py` recommends
-those running check names, plus `Paths`, `Kernel`, `Editor`, and `Review`.
-Existing hosted branch rules need the same check-name update when adopting
-the split workflow.
+The hosted `Compiler kernel` job runs `--profile kernel-extra`: only the
+kernel OuroSmith gate, which is absent from PR. The complete standalone
+`--profile kernel` remains unchanged. A runner self-test requires the union
+of PR and kernel-extra to cover every kernel gate, with no duplicated gates
+in kernel-extra. All eight compiler shards still run in PR.
+
+The static `Kernel` check always runs and requires successful path selection,
+compiler preparation, every selected PR or docs group, selected kernel checks,
+Portable, and Editor. A failed, cancelled, or unexpectedly skipped selected
+job fails this aggregate. Nightly prepares its compiler independently per group.
+`scripts/apply_github_settings.py` recommends the stable required contexts
+`Paths`, `Kernel`, `Editor`, and `Review`. When adopting the docs route, replace
+required individual `PR (...)` and `Portable (...)` contexts in hosted branch
+rules with `Kernel`; those matrix contexts do not exist when the matrix is
+skipped. Editing the script does not apply hosted settings.
+
+Changes confined to `README.md`, `CHANGELOG.md`, `CONTRIBUTING.md`, or ordinary
+Markdown under `docs/` use the `docs` profile: workflow/project policy, API
+baseline drift, documentation suite, and documentation examples. Editor and
+site changes keep their own checks when combined with docs. Generated API
+pages, generated hashes, executable examples, trust/build/CI/release/design
+documents, code, scripts, workflows, and unknown paths retain full PR
+validation. Empty or unavailable diffs select full validation. A docs-and-code
+change runs the full PR inventory, which already includes all docs gates.
+
+```sh
+python3 scripts/ci_gate.py --profile docs --out _build/ci/docs
+```
 
 Focused suites remain the fastest way to iterate. The Python PR profile is still
 the final local composition before review until `pr-native` parity is explicitly
@@ -210,6 +234,9 @@ exactly once, have unique fixture names and paths, and differ in size by at
 most one. Missing, duplicated, unknown, or malformed selections fail. Omitting
 `--shard` runs the full inventory. Each hosted shard has its own output directory
 and retains the same checker, build, execution, and failure requirements.
+The inventory interleaves fixtures by measured native build cost so expensive
+fixtures fall in different shards. Timing estimates affect ordering only;
+they never select which assertions run or relax a timeout.
 
 The command uses the configured bootstrap in `OURO_C_BUILD_DIR`, runs builds
 with one worker, and writes logs under `_build/compiler_check_suite` (or
@@ -452,7 +479,7 @@ evidence, updated docs, no active references, and no bootstrap dependency.
 | `ouro-manual-trust.yml` | On-demand check profiles |
 | `dependency-review.yml` | Changed dependency and workflow checks |
 | `ouro-release.yml` | Build host toolchains and publish tag drafts and weekly snapshots |
-| `ouro-pages.yml` | Build `site/` and publish GitHub Pages |
+| `ouro-pages.yml` | Test, lint, and build `site/` on PRs and pushes; publish GitHub Pages from `main` |
 
 The release workflow builds host `ouro1` on macOS x86_64 (`darwin`), macOS ARM
 (`darwin_aarch64`), Linux x86_64 (`linux`), Linux ARM (`linux_aarch64`), and
@@ -464,7 +491,10 @@ Hosted path selection is fail-closed for validation: missing revisions, a Git
 error, or an empty diff runs every applicable job. An editor-only change runs
 the VS Code test job while skipping unrelated compiler work.
 A `site/`-only change is treated as a dependency/path change and does not start
-the compiler suites.
+the compiler suites. Pages runs `npm run lint`, `npm test`, and `npm run build`
+for pull requests to and pushes on `main` or `master` that change `site/`,
+`quality/biome.json`, or its workflow. Pull requests only restore the npm cache
+and cannot deploy the site.
 The hosted `Kernel` job builds `ouro1`, then runs
 `python3 scripts/ci_gate.py --profile kernel` and uploads its compiler,
 hardening, boundary, generated-law, scale, and depth reports. Its path
@@ -576,6 +606,13 @@ without reading large successful logs back into memory.
 Hosted and local caches may accelerate C objects, native tool binaries,
 frontend regeneration, self-hosted modules, and generated-C shards. Pull requests use restore-only
 cache policy; trusted branch or scheduled workflows may save accelerator state.
+
+The shared PR compiler cache is keyed by the bootstrap driver's full current
+input identity, including the host C compiler and flags. It includes the
+completion report, input manifest, and both generated C comparisons referenced
+by `ouro1.bootstrap.json`; `_build/c` alone cannot establish a reusable compiler.
+Suite caches remain separate. Kernel and Portable restores try their own cache
+prefix first. Only trusted branch pushes save PR caches.
 
 Restored data is followed by the relevant parity, hash, regeneration, or
 compiler-checking validation. Cache state does not establish program acceptance
