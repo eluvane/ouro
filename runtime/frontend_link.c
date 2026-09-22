@@ -241,11 +241,9 @@ static char *src_from_codes(ouro_v *xs, size_t *out_n)
 	return buf;
 }
 
-/* ---- import / record post-fail mapping --------------------------------
-   Expansion itself runs inside packed stitch_* (pi then pr). These
-   helpers only print OURO-IMP-* / OURO-REC-* from CErr codes 81-84 /
-   71-77.
-   ------------------------------------------------------------------- */
+/* Import and record failure source mapping. Expansion runs in packed
+   stitch_* (pi then pr); these helpers print OURO-IMP-* / OURO-REC-* from
+   CErr codes 81-84 and 71-77. */
 
 static void imp_print_err(const char *path, ouro_v *src_codes,
 			  unsigned long pos, unsigned long code)

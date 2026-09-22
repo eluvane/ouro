@@ -282,9 +282,6 @@ def write_text(path: Path, text: str) -> None:
     path.write_text(text, encoding="utf-8", newline="\n")
 
 
-# Scratch copies ------------------------------------------------------------
-
-
 def remove_scratch(path: Path) -> None:
     resolved = path.resolve()
     allowed = (ROOT / "_build/smith").resolve()
@@ -294,16 +291,13 @@ def remove_scratch(path: Path) -> None:
     def writable_retry(function, filename, error):
         if not isinstance(error[1], PermissionError):
             raise error[1]
-        # Dune action stamps can be read-only on Windows. Changes stay inside
-        # our resolved scratch root.
+        # Scratch files can be read-only on Windows. Permission changes stay
+        # inside the resolved scratch root.
         os.chmod(filename, stat.S_IWRITE | stat.S_IREAD)
         function(filename)
 
     if path.exists():
         shutil.rmtree(path, onerror=writable_retry)
-
-
-# Running -------------------------------------------------------------------
 
 
 def caught_by(report: Report) -> list[str]:
