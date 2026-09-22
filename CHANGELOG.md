@@ -200,6 +200,8 @@ integration may change.
 
 ### Fixed
 
+- Reject unknown or incomplete `ouro-test` options, honor `--out DIR` on the
+  everyday path, and report `test: no tests found` with exit 1 for empty discovery.
 - Keep the later value when `map_from_pairs`, `config_from_pairs`, or
   `map_union` sees a repeated key, matching config-file parsing.
 - Clippy's structural `cm_parse` seam no longer recopies the caller intern
