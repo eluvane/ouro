@@ -275,6 +275,59 @@ want_attack traversal-completion-empty '"id":101,"result":\[\]'
 want_attack absolute-completion-empty '"id":102,"result":\[\]'
 want_attack non-file-uri-empty '"id":103,"result":\[\]'
 
+# A dirty buffer must keep its diagnostics when some other .ouro file
+# changes. The editor sends didChangeWatchedFiles for sibling saves; the
+# server used to recheck the saved path and clear the unsaved error.
+WATCH_DIR="$OUT/watch-root"
+mkdir -p "$WATCH_DIR"
+WATCH_CLEAN="$WATCH_DIR/dirty.ouro"
+WATCH_BROKEN="$WATCH_DIR/watch-broken.ouro"
+WATCH_OTHER="$WATCH_DIR/other.ouro"
+printf -- 'inductive Nat : Type := | Z : Nat | S : Nat -> Nat;\n\ndef ok : Nat := Z;\n' >"$WATCH_CLEAN"
+printf -- '-- @entry broken\n\ndef broken : Nat := no_such_name Z;\n' >"$WATCH_BROKEN"
+printf -- 'inductive Nat : Type := | Z : Nat | S : Nat -> Nat;\n\ndef other : Nat := Z;\n' >"$WATCH_OTHER"
+WATCH_URI=$(uri_of_path "$WATCH_CLEAN")
+WATCH_OTHER_URI=$(uri_of_path "$WATCH_OTHER")
+{
+	frame '{"jsonrpc":"2.0","id":300,"method":"initialize","params":{"capabilities":{}}}'
+	frame '{"jsonrpc":"2.0","method":"initialized","params":{}}'
+	frame "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":{\"uri\":\"$WATCH_URI\",\"languageId\":\"ouro\",\"version\":1,\"text\":\"$(json_text "$WATCH_CLEAN")\"}}}"
+	frame "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didChange\",\"params\":{\"textDocument\":{\"uri\":\"$WATCH_URI\",\"version\":2},\"contentChanges\":[{\"text\":\"$(json_text "$WATCH_BROKEN")\"}]}}"
+	frame "{\"jsonrpc\":\"2.0\",\"method\":\"workspace/didChangeWatchedFiles\",\"params\":{\"changes\":[{\"uri\":\"$WATCH_OTHER_URI\",\"type\":2}]}}"
+	frame '{"jsonrpc":"2.0","id":301,"method":"shutdown","params":{}}'
+	frame '{"jsonrpc":"2.0","method":"exit"}'
+} >"$OUT/watch.in"
+set +e
+OURO_ROOT="$ROOT" "$LSP" <"$OUT/watch.in" >"$OUT/watch.out" 2>"$OUT/watch.err"
+watch_status=$?
+set -e
+tr '\r' '\n' <"$OUT/watch.out" | grep '^{' >"$OUT/watch.jsonl" || true
+if [ "$watch_status" -eq 0 ]; then
+	ok "watch session exits after shutdown"
+else
+	bad watch-exit "status=$watch_status"
+fi
+watch_fail=$(grep -c -- "\"uri\":\"$WATCH_URI\",\"diagnostics\":\[{\"range\"" "$OUT/watch.jsonl" || true)
+if [ "$watch_fail" -ge 2 ]; then
+	ok "diagnostics-on-watch-keep-unsaved"
+else
+	bad "diagnostics-on-watch-keep-unsaved" "CHECK_FAIL publishes=$watch_fail want>=2"
+fi
+# The last publish for the dirty URI must still be the buffer error, not
+# a disk-clean wipe.
+watch_last=$(grep -- "\"uri\":\"$WATCH_URI\",\"diagnostics\":" "$OUT/watch.jsonl" | tail -n 1 || true)
+case "$watch_last" in
+*"\"diagnostics\":[]"*)
+	bad "diagnostics-on-watch-last" "final publish cleared unsaved CHECK_FAIL"
+	;;
+*"\"diagnostics\":[{\"range\""*)
+	ok "diagnostics-on-watch-last"
+	;;
+*)
+	bad "diagnostics-on-watch-last" "missing final publish"
+	;;
+esac
+
 # Oversized framing is rejected from the header, and a valid value one level
 # beyond the JSON nesting budget receives a parse error without killing the
 # subsequent shutdown handshake.
