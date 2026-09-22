@@ -722,16 +722,26 @@ def run_self_tests(all_gates: Sequence[Gate]) -> int:
             failures.append(f"cannot read {profile} workflow: {exc}")
         else:
             if profile == "pr":
-                dynamic = "matrix: ${{ fromJSON(needs.paths.outputs.matrix) }}"
+                dynamic = "group: ${{ fromJSON(needs.paths.outputs.matrix).include.*.group }}"
                 if not section or any(required not in section.group(1) for required in (
-                    dynamic, "--changed-paths-json", "--selection-key",
+                    dynamic, "        exclude:\n          - group: lint\n",
+                    "--changed-paths-json", "--selection-key",
                 )):
                     failures.append("PR matrix must consume the routing plan and recompute affected gates")
                 planned = [row["group"] for row in selection_matrix(full_path_selection("selftest"))["include"]]
                 if len(planned) != len(groups) or set(planned) != set(groups):
                     failures.append("full PR routing omits or duplicates a group")
-            elif matrix != list(groups):
-                failures.append(f"hosted {profile} matrix differs from complete group inventory: {matrix}")
+            elif matrix != [group for group in groups if group != "lint"]:
+                failures.append(f"hosted {profile} matrix differs from automatic group inventory: {matrix}")
+    lint_workflow = (ROOT / ".github/workflows/ouro-lint.yml").read_text(encoding="utf-8")
+    triggers = re.search(r"^on:\n(.*?)(?=^\S|\Z)", lint_workflow, re.MULTILINE | re.DOTALL)
+    if not triggers or triggers.group(1).strip() != "workflow_dispatch:":
+        failures.append("standalone lint workflow must only run manually")
+    if "--profile pr --group lint" not in lint_workflow:
+        failures.append("manual lint must run the complete local lint group")
+    release_workflow = (ROOT / ".github/workflows/ouro-release.yml").read_text(encoding="utf-8")
+    if "        exclude:\n          - group: lint\n" not in release_workflow:
+        failures.append("release validation must exclude manual-only lint")
     trust = [gate.name for gate in select_group(all_gates, "nightly", "trust")]
     if trust != ["stage-loop-fixpoint-and-generated-drift", "ouro-smith-nightly"]:
         failures.append("nightly must run stage-loop before OuroSmith in the same group")
