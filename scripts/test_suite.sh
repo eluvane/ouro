@@ -142,6 +142,29 @@ OURO_TEST_SUITE_DISPLAY_OUT="$OUT"
 LINES_SUITE_OUT="$OUT/lines"
 MSYS2_ENV_CONV_EXCL="${MSYS2_ENV_CONV_EXCL:+$MSYS2_ENV_CONV_EXCL;}OURO_TEST_SUITE_DISPLAY_OUT;LINES_SUITE_OUT"
 export OURO_TEST_SUITE_DISPLAY_OUT LINES_SUITE_OUT MSYS2_ENV_CONV_EXCL
+
+cli_probe() {
+	probe_name=$1
+	probe_want=$2
+	probe_needle=$3
+	shift 3
+	probe_status=0
+	"$@" >"$OUT/cli-$probe_name.out" 2>"$OUT/cli-$probe_name.err" || probe_status=$?
+	if [ "$probe_status" -ne "$probe_want" ] ||
+		! grep -F -q "$probe_needle" "$OUT/cli-$probe_name.out" "$OUT/cli-$probe_name.err"; then
+		echo "TEST_SUITE: FAIL cli probe $probe_name exit=$probe_status want=$probe_want" >&2
+		cat "$OUT/cli-$probe_name.out"
+		cat "$OUT/cli-$probe_name.err" >&2
+		exit 1
+	fi
+}
+
+mkdir -p "$OUT/cli-empty"
+cli_probe help 0 "usage: ouro-test" "$SUITE" --help
+cli_probe incomplete-out 2 "usage: ouro-test" "$SUITE" --out
+cli_probe unknown-option 2 "usage: ouro-test" "$SUITE" --verbose "$OUT/cli-empty"
+cli_probe empty-discovery 1 "test: no tests found" "$SUITE" --out "$OUT/cli-empty-out" "$OUT/cli-empty"
+
 if [ "$SUITE_MODE" = compiler-checking ]; then
 	run_suite "$SUITE" --native-suite=compiler-checking "--out=$OUT" "$@"
 fi
