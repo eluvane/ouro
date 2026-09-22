@@ -5,6 +5,9 @@ on:
     branches: [ main, master ]
   push:
     branches: [ main, master ]
+  merge_group:
+    types: [ checks_requested ]
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -39,6 +42,10 @@ jobs:
       docs: ${{ steps.changes.outputs.docs }}
       kernel: ${{ steps.changes.outputs.kernel }}
       editor: ${{ steps.changes.outputs.editor }}
+      portable: ${{ steps.changes.outputs.portable }}
+      matrix: ${{ steps.changes.outputs.matrix }}
+      changed_paths: ${{ steps.changes.outputs.changed_paths }}
+      selection_key: ${{ steps.changes.outputs.selection_key }}
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -46,12 +53,21 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
+      - name: Validate CI routing before starting builds
+        run: python3 scripts/ci_gate.py --self-test
+
       - name: Select jobs
         id: changes
         env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
-        run: python3 scripts/ci_gate.py --select-paths --base "$BASE_SHA" --head "$HEAD_SHA"
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before || github.sha }}
+          HEAD_SHA: ${{ github.sha }}
+          FULL_VALIDATION: ${{ github.event_name != 'pull_request' }}
+        run: |
+          if [ "$FULL_VALIDATION" = true ]; then
+            python3 scripts/ci_gate.py --select-paths --base "$BASE_SHA" --head "$HEAD_SHA" --full
+          else
+            python3 scripts/ci_gate.py --select-paths --base "$BASE_SHA" --head "$HEAD_SHA"
+          fi
 
   host-compiler:
     name: Host compiler
@@ -112,6 +128,7 @@ jobs:
         with:
           name: host-compiler-${{ github.run_id }}-${{ github.run_attempt }}
           path: _build/ci/host-compiler.tar.gz
+          compression-level: 0
           if-no-files-found: error
           retention-days: 14
 
@@ -133,26 +150,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 120
     strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - group: checks
-          - group: analysis
-          - group: checker
-          - group: analyzer
-          - group: lint
-          - group: tests
-          - group: smith
-          - group: samples-1
-          - group: samples-2
-          - group: compiler-1
-          - group: compiler-2
-          - group: compiler-3
-          - group: compiler-4
-          - group: compiler-5
-          - group: compiler-6
-          - group: compiler-7
-          - group: compiler-8
+      fail-fast: true
+      matrix: ${{ fromJSON(needs.paths.outputs.matrix) }}
     permissions:
       contents: read
     steps:
@@ -200,7 +199,11 @@ jobs:
         run: python3 scripts/ci_gate.py --compiler-artifact import --compiler-sha256 "$COMPILER_SHA256"
 
       - name: Run checks
-        run: python3 scripts/ci_gate.py --profile pr --group "${{ matrix.group }}" --out "_build/ci/pr-${{ matrix.group }}"
+        env:
+          CHANGED_PATHS: ${{ needs.paths.outputs.changed_paths }}
+          SELECTION_KEY: ${{ needs.paths.outputs.selection_key }}
+          CI_GROUP: ${{ matrix.group }}
+        run: python3 scripts/ci_gate.py --profile pr --group "$CI_GROUP" --changed-paths-json "$CHANGED_PATHS" --selection-key "$SELECTION_KEY" --fail-fast --out "_build/ci/pr-$CI_GROUP"
 
       - name: Save cache
         if: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master') && steps.ouro-cache.outputs.cache-hit != 'true' }}
@@ -356,6 +359,7 @@ jobs:
         env:
           PATHS_RESULT: ${{ needs.paths.result }}
           CORE_REQUIRED: ${{ needs.paths.outputs.core }}
+          PORTABLE_REQUIRED: ${{ needs.paths.outputs.portable }}
           DOCS_CHANGED: ${{ needs.paths.outputs.docs }}
           COMPILER_RESULT: ${{ needs.host-compiler.result }}
           PR_RESULT: ${{ needs.quick-firewall.result }}
@@ -371,7 +375,7 @@ jobs:
             if [ "$1" = true ]; then test "$2" = success; else test "$2" = skipped; fi
           }
           require_result "$CORE_REQUIRED" "$PR_RESULT"
-          require_result "$CORE_REQUIRED" "$PORTABLE_RESULT"
+          require_result "$PORTABLE_REQUIRED" "$PORTABLE_RESULT"
           require_result "$KERNEL_REQUIRED" "$VALIDATION_RESULT"
           require_result "$EDITOR_REQUIRED" "$EDITOR_RESULT"
           if [ "$CORE_REQUIRED" = true ] || [ "$DOCS_CHANGED" = true ]; then
@@ -426,11 +430,11 @@ jobs:
   portable-kernel-smoke:
     name: Portable
     needs: [ paths, host-compiler ]
-    if: ${{ needs.paths.outputs.core == 'true' }}
+    if: ${{ needs.paths.outputs.portable == 'true' }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
     strategy:
-      fail-fast: false
+      fail-fast: true
       matrix:
         os: [ ubuntu-latest, macos-latest ]
     permissions:
