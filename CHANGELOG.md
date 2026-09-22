@@ -200,6 +200,8 @@ integration may change.
 
 ### Fixed
 
+- Keep unsaved language-server diagnostics when another `.ouro` file changes
+  on disk.
 - Accept directory paths in `fmt` and `fix`, selecting sorted `.ouro` files
   while skipping build and dependency trees and rejecting empty scopes.
 - Reject unknown or incomplete `ouro-test` options, honor `--out DIR` on the
