@@ -200,6 +200,8 @@ integration may change.
 
 ### Fixed
 
+- Keep the later value when `map_from_pairs`, `config_from_pairs`, or
+  `map_union` sees a repeated key, matching config-file parsing.
 - Clippy's structural `cm_parse` seam no longer recopies the caller intern
   table on every imported file. `ouro_heap_context_leave` shares caller-owned
   nodes and copies only the nested lexer/parser graph.

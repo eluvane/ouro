@@ -84,7 +84,7 @@ def map_pairs (V : Type) (m : Map V) : List (Pair String V)
 def map_union (V : Type) (a : Map V) (b : Map V) : Map V
 ```
 
-Later entries of the second map win, matching JSON-object override order.
+Later entries of the second map win, matching JSON-object override order. Insert from the front of the override: foldr would apply the earliest duplicate last and keep that stale value.
 
 ## def map_from_pairs
 
