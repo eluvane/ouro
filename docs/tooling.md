@@ -287,6 +287,10 @@ With no input, `ouro-test.exe` discovers `*_test.ouro` below the current
 directory. Directory entries are sorted; input-root order, duplicate roots
 and explicitly named files are preserved. Discovery excludes `_build`,
 `_cache`, `_opam`, `_tools`, `.git`, `bad`, `future`, `fixtures` and `bench`.
+Unknown or incomplete long options, including `--out` without a directory,
+print usage and exit 2. `--out DIR` selects the native binary directory;
+`OURO_TEST_OUT` remains the default when `--out` is omitted. An empty discovery
+result prints `test: no tests found` and exits 1.
 An unreadable or exhausted inventory fails explicitly. Checks and native
 builds use sibling `coil.exe`; fixture stdin is captured as exact bytes.
 Repository-owned check batches use the same native tool in strict manifest

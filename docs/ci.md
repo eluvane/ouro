@@ -40,9 +40,10 @@ List the gates in a profile without running them:
 python3 scripts/ci_gate.py --profile pr --list
 ```
 
-The complete PR inventory has seventeen isolated groups. GitHub selects affected
-groups and gates for reviewed tool paths; main-branch pushes, merge queues and
-manual CI runs use the complete inventory:
+The complete local PR inventory has seventeen isolated groups. GitHub selects
+affected groups and gates for reviewed tool paths; main-branch pushes, merge
+queues and manual CI runs select the complete inventory except the manual-only
+`lint` group:
 
 ```sh
 python3 scripts/ci_gate.py --profile pr --group checks
@@ -74,7 +75,11 @@ local command runs every gate in registry order. The runner rejects a group
 inventory that omits, duplicates, or invents a gate; its self-test also checks
 complete matrix coverage and the affected-path routing contracts. The
 `analysis` group owns memory budgets, C analysis, and LSP; `checker` owns
-hardening, scale, and depth; analyzer precision and lint run independently.
+hardening, scale, and depth; analyzer precision runs independently. The full
+Ouro lint suite runs in GitHub only through **Lint → Run workflow** or the full
+**Manual** workflow. PR, push, merge-queue, Nightly and Release jobs exclude its
+group. Local profiles and `sh scripts/lint_suite.sh` retain the complete suite;
+Python/shell lint and the other quality gates keep their existing schedules.
 Execution removes the previous `ci-summary.json` before starting gates, so an
 interrupted run leaves no old successful aggregate at the current report path.
 The native CI runner also invalidates selected gate reports and the delegated
@@ -140,14 +145,14 @@ Existing suite assertions and required gates remain in place;
 these explicit invocations do not establish native bootstrap or retire the
 full PR profile.
 
-Nightly uses `checks`, `analysis`, `analyzer`, `lint`, `tests`, `samples-1`, `samples-2`, `kernel`,
+Nightly uses `checks`, `analysis`, `analyzer`, `tests`, `samples-1`, `samples-2`, `kernel`,
 `trust`, and `compiler-1` through `compiler-8` groups. The `trust` job runs the stage-loop fixpoint/drift gate and
 then the deeper OuroSmith profile in the same checkout. `Full` runs even after
 a job failure and fails unless every matrix group succeeds. Reports are
 uploaded separately as `nightly-<group>` artifacts. Hosted PR matrix jobs use static names `PR` and `Portable` so a skipped
 matrix does not publish an unevaluated expression. When those jobs run,
 GitHub appends the matrix value: `PR (checks)`, `PR (analysis)`, `PR (checker)`,
-`PR (analyzer)`, `PR (lint)`, `PR (tests)`,
+`PR (analyzer)`, `PR (tests)`,
 `PR (smith)`, `PR (samples-1)`, `PR (samples-2)`, `PR (compiler-1)` through
 `PR (compiler-8)`, `Portable (ubuntu-latest)`,
 and `Portable (macos-latest)`. Linux Portable uses the shared compiler;
@@ -205,7 +210,8 @@ The explicit routing table in `scripts/ci_gate.py` currently covers these inputs
 
 Every code route retains repository policy, Python/shell lint, API drift,
 generated hashes, compiler boundary, strict and structural quality, documentation
-examples, hygiene, and the test/Smith/sample/lint integration suites. The table
+examples, hygiene, and the test/Smith/sample integration suites. The local plan
+also retains lint, which the hosted matrix excludes for manual execution. The table
 selects existing gates; it does not change their assertions or profiles.
 Unlisted files select the complete PR inventory and portable checks. Changes
 to compiler, runtime and standard library inputs also retain kernel-extra.
@@ -533,6 +539,7 @@ evidence, updated docs, no active references, and no bootstrap dependency.
 | `ouro-nightly-full.yml` | Scheduled full checks |
 | `ouro-manual-trust.yml` | On-demand check profiles |
 | `dependency-review.yml` | Changed dependency and workflow checks |
+| `ouro-lint.yml` | Full Ouro lint suite, manual dispatch only |
 | `ouro-release.yml` | Build host toolchains and publish tag drafts and weekly snapshots |
 | `ouro-pages.yml` | Test, lint, and build `site/` on PRs and pushes; publish GitHub Pages from `main` |
 
