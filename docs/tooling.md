@@ -1,11 +1,3 @@
-<p align="center">
-  <img
-    width="100%"
-    src="https://capsule-render.vercel.app/api?type=waving&amp;height=220&amp;color=0:0B1220,50:1E1B4B,100:4F46E5&amp;text=TOOLING&amp;fontColor=E2E8F0&amp;fontSize=54&amp;fontAlignY=50"
-    alt="TOOLING banner"
-  />
-</p>
-
 # Tooling
 
 The maintained command entry point is `scripts/ouro1.sh`. `scripts/coil.sh` is
@@ -19,9 +11,6 @@ tests use the PE binaries described below; the transitional C-host tool
 builder does not provision this group.
 
 ## Check and evaluate
-
-Import collection preserves `OURO-IMP-001` through `OURO-IMP-004` for malformed,
-duplicate, unknown and reserved aliases, with the source path and byte offset.
 
 ```sh
 sh scripts/ouro1.sh check path/to/module.ouro
@@ -44,15 +33,10 @@ checked program:
 sh scripts/ouro1.sh check path/to/module.ouro --emit-checked-program _build/module.checked
 ```
 
-The output begins with `ouro.checked-program.v1` and contains a deterministic
-ASCII stream of tagged, length-prefixed natural-number tokens. It preserves
-declaration types and bodies, inductive metadata, checked intrinsic and extern
-bindings, representation roles, exact string bytes, and emission order. Global
-references use names rather than allocation-dependent IDs; local binders keep
-de Bruijn identity. `compiler/checked_program_output.ouro` owns the format.
-Serialization errors return nonzero before opening the output file. This internal
-pre-1.0 diagnostic format replaces the incomplete `--emit-core-artifact` export;
-the [legacy JSON replay format](kernel_core_artifact.md) is archived.
+The internal `ouro.checked-program.v1` output is a deterministic, byte-preserving
+diagnostic stream; serialization errors fail before opening the file.
+`compiler/checked_program_output.ouro` owns its format. The
+[legacy JSON replay format](kernel_core_artifact.md) is archived.
 
 `collect` exposes the dependency order used by `check`:
 
@@ -62,23 +46,12 @@ sh scripts/ouro1.sh collect path/to/module.ouro
 
 ## Native program compile
 
-`ouro1 build FILE.ouro` compiles a Windows PE through the checked-source
-native lowerer. The driver resolves and reads the import closure itself;
-direct `ouro-native-build ROOT.ouro OUT.exe` uses the same path. Import
-collection handles line breaks and optional semicolons, uses the compiler's
-string and alias processing, and preserves Windows UNC path prefixes. Program
-acceptance checks the complete closure before lowering. Managed lowering
-runs first; scalar lowering is tried only for an unsupported type or unknown
-global. `legacy-c` is rejected;
-there is no C fallback. That is a different command from the toolchain cache
-driver `ouro1 build --profile`:
+`ouro1 build FILE.ouro` compiles the checked import closure to a Windows PE.
+`ouro1 build --profile` invokes the toolchain cache driver instead:
 
 ```sh
-# Program compile: native x86-64 Windows PE, no C fallback
 sh scripts/ouro1.sh build FILE.ouro --target x86_64-windows
 sh scripts/ouro1.sh build FILE.ouro --backend native --out _build/native/app.exe
-
-# Toolchain/cache profile (Python build driver)
 sh scripts/ouro1.sh build --profile dev
 sh scripts/ouro1.sh build --profile release
 ```
@@ -88,18 +61,8 @@ sh scripts/ouro1.sh build --profile release
 forwards to the toolchain driver. `ouro1 run FILE.ouro` compiles to
 `_build/native/run/<stem>.exe` and executes that image.
 
-Build output is staged beside the destination and checked byte for byte
-before replacement. The driver prints the output path only after publication
-succeeds. A locked or otherwise refused destination produces a nonzero exit
-and retains its previous contents. See [Build](build.md#host-bound-build-boundary)
-for cleanup and durability limits.
-
-The current native PE surface includes stdio, stdin, argv, env, time, files,
-filesystem predicates, mkdir/remove, copy, rename, directory listing, and
-realpath. Temp files, process capture, and HTTP use the shared managed
-lowerer's runtime implementations. The `ouro-native-build` driver itself is
-still produced by the C host; this wiring does not establish native
-self-rebuilding or isolated-host acceptance.
+[Build](build.md#host-bound-build-boundary) owns output publication and host
+limits; [Design](design.md#native-toolchain-contract) owns the native target.
 
 `tools/coil.ouro` provides the native CLI entry for `doctor`, `check`, program
 `build`, and `run FILE.ouro [PROGRAM_ARG ...]`. Its check command collects the
@@ -207,16 +170,9 @@ There is no Python rewrite fallback and no Python CLI wrapper: the former
 `scripts/syntax_quality_fix.py` command is removed, and suites invoke the
 native binary with `--check`, `--write`, and file arguments.
 
-The publication planner applies only machine-safe syntax and local-redundancy
-classes. Every preview/check and each transformation class requires candidate
-compiler verification; a successful token rewrite alone is not permission to
-publish. Both `fmt --write` and `fix --write` use checked staging,
-metadata-preserving replacement and explicit recovery. Candidate compiler
-checking uses `ouro-fix-check` with stdin framing or `SOURCE file PATH`; POSIX
-C-host bounded capture (OS status 120) uses the existing file transport. See
-[safe-rewrite boundaries](quality.md#precision-and-safe-rewrites).
-Read-only and hard-linked sources are refused without reporting a successful
-write; an unchanged candidate remains a no-op.
+Every preview/check and each automatic transformation class requires compiler
+verification. [Safe rewrites](quality.md#precision-and-safe-rewrites) own
+staging, replacement, recovery, and refusal conditions.
 
 | Rule | Publication applicability |
 | --- | --- |
@@ -229,16 +185,10 @@ write; an unchanged candidate remains a no-op.
 | `unused-binder`, `unreachable-arm` | review required; no automatic renaming or arm removal |
 | `import-alias`, `list-type`, `nonrec-fix` | review required; no automatic API/resolution-affecting rewrite |
 
-Review proposals remain visible without changing source. Unknown rule IDs,
-conflicting automatic edits, invalid spans, cycles and reopened formatting fail
-instead of silently selecting a transformation. A comment-bearing edit cohort
-is retained for review rather than partially applied. The legacy raw rewrite
-helper remains a fixture oracle, not the publication path.
-
-The native planner laws cover conflict ordering, trivia, cycles and fixture
-idempotence. Whole-production `fix -> fmt -> fix` convergence is not yet
-established; the compiler companion build and large import-cone memory pressure
-remain validation blockers. See [Clippy and fix boundaries](clippy_grade_firewall.md).
+Review proposals remain visible without changing source. Unknown rules,
+conflicting edits, cycles, and reopened formatting fail. The
+[Clippy boundary](clippy_grade_firewall.md#fix-publication-and-convergence)
+records remaining convergence limits.
 
 ## Analyzer and linter
 
@@ -331,93 +281,25 @@ sh scripts/ouro1.sh doc --check --out docs/api --files-from std.list
 Markdown page per module plus an index. `docs/api/` is the committed generated
 reference for the standard library. `--check` reports drift without modifying
 files. A missing source or an unreadable `--files-from` list is an error.
+[Build](build.md#generated-artifacts-and-stage-loop) owns committed API
+regeneration.
 
 ## Repository gates and CI runner
 
-Ouro-native repository gates live under `tools/repo_gate/`; the data-driven
-runner lives under `tools/ci_gate/`. The shell entry points are compatibility
-wrappers: they build the Ouro binary and pass arguments through, while policy,
-profiles, report schemas, and gate selection live in Ouro code.
-
-```sh
-sh scripts/ouro_repo_gate.sh --profile docs-native --out _build/ouro_repo_gate/docs-native
-sh scripts/ouro_repo_gate.sh --profile project-native --out _build/ouro_repo_gate/project-native
-sh scripts/ouro_repo_gate.sh --profile workflow-native --out _build/ouro_repo_gate/workflow-native
-sh scripts/ouro_repo_gate.sh --profile pr-native --out _build/ouro_repo_gate/pr-native
-```
-
-The Python PR profile invokes those `*-native` names; the short names `docs`,
-`project`, and `workflow` are aliases.
-
-The CI runner supports grouped profiles, selected gate execution, deterministic
-listing, required versus optional gates, blocking versus informational gates,
-exact argv reporting, per-gate JSON, profile summary JSON, optional host-tool
-unavailability reporting, and complete `.py`/`.sh` inventory coverage. Native
-selftest modes own the formatter, documentation, lines, native lint fixtures,
-runtime, user-test, sample, quickstart, and control-plane fixture policies. Their
-shell commands retain bootstrap only, except that `lint_suite.sh` also
-compiler-checks the split Clippy entry points listed in
-[CI](ci.md#ouro-native-control-plane-displacement) and runs the Clippy-grade
-fixture suite.
-
-```sh
-sh scripts/ouro_ci_gate.sh --profile pr-native --list
-sh scripts/ouro_ci_gate.sh --profile quickstart-native --out _build/ouro_ci/quickstart-native
-sh scripts/ouro_ci_gate.sh --profile pr-native --gate repo-gate-workflow --out _build/ouro_ci/workflow
-sh scripts/ouro_ci_gate.sh --profile host-bound --out _build/ouro_ci/host-bound
-```
-
-Use `python3 scripts/ci_gate.py --profile pr --out _build/ci/pr` for full PR
-readiness until the narrower `pr-native` profile is explicitly sufficient for
-the change. Do not remove a Python or shell control-plane script without parity
-evidence and an updated `host-bound` report.
+[CI](ci.md#local-profiles) owns the repository gate commands, profiles,
+required checks, and report contracts. The native gate inventory and migration
+boundary are documented in [native repository gates](native_repo_gates.md).
 
 ## Core toolchain performance evidence
 
-Use the core toolchain timing runner when changing startup, formatter, checker,
-native gate, wrapper, cache, report, or process paths:
-
-```sh
-sh scripts/perf_core_toolchain.sh --repeat 3 --out _build/perf/core-toolchain-current.json
-```
-
-For before/after work, keep the first report and compare the next run against it:
-
-```sh
-sh scripts/perf_core_toolchain.sh --repeat 3 --out _build/perf/core-toolchain-before.json
-sh scripts/perf_core_toolchain.sh --repeat 3 \
-  --baseline _build/perf/core-toolchain-before.json \
-  --out _build/perf/core-toolchain-after.json
-```
-
-The report records the exact command, wall-clock milliseconds, exit code,
-stdout/stderr byte counts, repeat count, min/median/max timing, environment
-summary, and cache note for commands such as help, single-file format-check,
-single-file check, native gate listing, and the Python PR profile listing.
-Missing commands are recorded as unavailable rather than success. Comparing to a
-baseline prints a warning for command medians that exceed twice the baseline;
-maintainers may opt into a blocking local check with `--fail-on-regression`.
-
-Native tool wrappers also use source manifests emitted by `scripts/build_tool.sh`.
-After a native binary has been built, the wrapper can check the manifest instead
-of walking broad source trees on every `--list` or startup command. This is a
-freshness accelerator only: a missing manifest, missing source, or newer source
-falls back to rebuilding or the older directory scan, and the manifest is never
-accepted as proof that a gate passed.
+The timing runner, before/after comparison, and report interpretation live in
+[CI performance evidence](ci.md#performance-evidence). Build receipts and cache
+freshness are documented in [Build and bootstrap](build.md#cache-model).
 
 ## Packages
 
-```sh
-sh scripts/coil.sh init
-sh scripts/coil.sh add NAME --range '^0.1.0'
-sh scripts/coil.sh install
-sh scripts/coil.sh verify
-```
-
-`sh scripts/ouro1.sh pkg ...` is the same tool.
-
-The package tool uses local registries and vendors ordinary source files into a
-project. It does not use a public network registry. See [Packages](pkg.md).
+Use the [package guide](pkg.md#commands) for `coil`/`ouro1 pkg` commands,
+local registries, installation, locks, and verification.
 
 ## Language server
 
@@ -456,50 +338,15 @@ and remove them after the child command completes.
 
 ## VS Code
 
-The extension under `editors/vscode/` contains a TextMate grammar and an LSP
-client. Build it with:
-
-```sh
-cd editors/vscode
-npm install
-npm run lint
-npm run compile
-```
-
-`npm run lint` runs Biome in deny-all (`preset: all`, every group error,
-`--error-on-warnings`) on `editors/vscode/src` and `editors/vscode/test`
-using `quality/biome.json`. The same linter covers `site/src` and
-`site/vite.config.js` via `cd site && npm run lint`. Host
-Python uses Ruff:
-
-```sh
-ruff check --config quality/ruff.toml scripts
-shellcheck --severity=style scripts/*.sh samples/bioinformatics/fixture_tool.sh
-```
-
-The extension does not execute a workspace-provided script by default and stays
-disabled in Restricted Mode. Configure a trusted, machine-scoped
-`ouro.server.command` after building the server. Configuration and development
-instructions are in
-[`editors/vscode/README.md`](../editors/vscode/README.md).
+The extension's installation, build, and settings are in the
+[VS Code guide](../editors/vscode/README.md). The server protocol and
+capabilities are described [above](#language-server).
 
 ## Building standalone tools
 
-Repository contributors can run [OuroSmith](ouro_smith.md) to generate and replay
-compiler, runtime, formatter, lint, fix, doc, LSP, import, and cache properties.
-Its reports include concrete inputs and replay commands. The `ouro1 test`
-command continues to run user-authored tests and the native repository suites.
-
-A module that exports `main : IO Unit` can be emitted and linked as a native
-program:
-
-```sh
-sh scripts/build_tool.sh tools/fmt.ouro _build/tools/ouro-fmt
-```
-
-The current runtime uses a process-lifetime allocator and is designed around
-short-lived command-line programs. Long-running tool behavior, including LSP
-memory growth, remains an experimental area.
+[Build and bootstrap](build.md#entry-points) owns tool emission and host
+requirements. [OuroSmith](ouro_smith.md) owns generated tool properties and
+replay commands.
 
 ## Text-file statistics
 
@@ -507,11 +354,3 @@ memory growth, remains an experimental area.
 Build it with `sh scripts/build_tool.sh tools/lines.ouro _build/tools/ouro-lines`.
 The command accepts `--summary`, `--ext EXT`, `--contains TEXT`, and input paths;
 `sh scripts/lines_suite.sh` exercises its maintained behavior.
-
-<p align="center">
-  <img
-    width="100%"
-    src="https://capsule-render.vercel.app/api?type=waving&amp;height=220&amp;color=0:0B1220,50:1E1B4B,100:4F46E5&amp;section=footer"
-    alt=""
-  />
-</p>

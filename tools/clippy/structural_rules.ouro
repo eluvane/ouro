@@ -1,16 +1,41 @@
 -- Rule decisions consume an already-built unit. No source scan, lexer,
 -- resolver, or AST traversal is performed per rule.
 
-import "structural_frontend.ouro";
-import "../../std/string_prims.ouro";
-import "../../compiler/pipeline_abi.ouro";
+import "structural_frontend.ouro",
+  "../../compiler/source_spans.ouro",
+  "../../std/string_prims.ouro",
+  "../../compiler/pipeline_abi.ouro";
 
+-- Rule, owner, node ordinal, byte range of the node in the analyzed source,
+-- evidence. The range is absent when that source was rewritten before lexing.
 inductive CgSProof : Type :=
-  | MkCgSProof : String -> String -> Nat -> String -> CgSProof;
+  | MkCgSProof : String -> String -> Nat -> Maybe (Pair Nat Nat) -> String -> CgSProof;
+
+def cg_s_node_range (spans : Maybe TokenSpans) (table : List (Pair Nat (Pair Nat Nat))) (node : Nat)
+    : Maybe (Pair Nat Nat) :=
+    match spans with
+    | Nothing => Nothing (Pair Nat Nat)
+    | Just tokens =>
+        match lookup Nat (Pair Nat Nat) eq_nat node table with
+        | Nothing => Nothing (Pair Nat Nat)
+        | Just range => match range with | MkPair first past => token_span_bytes tokens first past end
+        end
+    end;
+
+-- Fill each proof's byte range from the innermost token span recorded for its
+-- node during the traversal that produced it.
+def cg_s_locate (spans : Maybe TokenSpans) (table : List (Pair Nat (Pair Nat Nat)))
+    (proofs : List CgSProof) : List CgSProof :=
+    map CgSProof CgSProof (fun (proof : CgSProof) => match proof with
+      | MkCgSProof code owner node range evidence => match range with
+        | Just _ => proof
+        | Nothing => MkCgSProof code owner node (cg_s_node_range spans table node) evidence
+        end
+      end) proofs;
 
 def cg_s_rule (fact : CgSFact) : Maybe String :=
     match fact with
-    | CgSLet _ _ _ _ annotated returned => match andb (notb annotated) returned with
+    | CgSLet _ _ _ _ annotated returned => match andb(notb annotated, returned) with
       | True => Just String "OURO-CLIPPY-REDUNDANT-001"
       | False => Nothing String
       end
@@ -29,16 +54,10 @@ def cg_s_owner (fact : CgSFact) : Nat :=
     | CgSMatch owner _ _ _ _ _ => owner
     end;
 
-def cg_s_node (fact : CgSFact) : Nat :=
-    match fact with
-    | CgSLet _ node _ _ _ _ => node
-    | CgSMatch _ node _ _ _ _ => node
-    end;
-
 def cg_s_names (intern : InternState) : List (Pair Nat String) :=
     match intern with
     | MkIntern ids _ _ _ =>
-        map (Pair (List Nat) Nat) (Pair Nat String)
+        map (Pair(List Nat, Nat)) (Pair Nat String)
           (fun (p : Pair (List Nat) Nat) => match p with
             | MkPair bytes id => MkPair Nat String id (prim_string_of_char_codes bytes)
             end) ids
@@ -58,9 +77,9 @@ def cg_s_atom_text (names : List (Pair Nat String)) (atom : CgSAtom) : Either Qu
       | Right text => Right QualityInputError String (prim_string_concat "local `"
           (prim_string_concat text
             (prim_string_concat "` (lexical binder #"
-              (prim_string_concat (prim_string_of_nat identity) ")"))))
+              (prim_string_concat(prim_string_of_nat identity, ")")))))
       end
-    | CgSNat n => Right QualityInputError String (prim_string_concat "Nat literal " (prim_string_of_nat n))
+    | CgSNat n => Right QualityInputError String (prim_string_concat("Nat literal ", prim_string_of_nat n))
     | CgSString id => Right QualityInputError String (prim_string_concat "decoded string literal #"
         (prim_string_concat (prim_string_of_nat id)
           " (exact bytes, within this compiler unit)"))
@@ -71,7 +90,7 @@ def cg_s_atom_text (names : List (Pair Nat String)) (atom : CgSAtom) : Either Qu
         | Right ctor_name => Right QualityInputError String
             (prim_string_concat "constructor `"
               (prim_string_concat ctor_name
-                (prim_string_concat "` of `" (prim_string_concat type_name "`"))))
+                (prim_string_concat("` of `", prim_string_concat type_name "`"))))
         end
       end
     end;
@@ -106,19 +125,20 @@ def cg_s_evidence (names : List (Pair Nat String)) (fact : CgSFact) : Either Qua
 
 def cg_s_proofs (unit : CgSUnit) : Either QualityInputError (List CgSProof) :=
     match unit with
-    | MkCgSUnit intern _ state =>
+    | MkCgSUnit intern _ state spans =>
         let names : List (Pair Nat String) := cg_s_names intern in
         (fix go (facts : List CgSFact) (rev : List CgSProof) : Either QualityInputError (List CgSProof) :=
           match facts with
-          | Nil => Right QualityInputError (List CgSProof) (reverse_lin CgSProof rev)
+          | Nil => Right QualityInputError (List CgSProof)
+              (cg_s_locate(spans, cg_s_spans state, reverse_lin CgSProof rev))
           | Cons fact rest => match cg_s_rule fact with
             | Nothing => go rest rev
-            | Just code => match cg_s_name names (cg_s_owner fact) with
+            | Just code => match cg_s_name(names, cg_s_owner fact) with
               | Left error => Left QualityInputError (List CgSProof) error
               | Right owner => match cg_s_evidence names fact with
                 | Left error => Left QualityInputError (List CgSProof) error
                 | Right evidence => go rest (Cons CgSProof
-                    (MkCgSProof code owner (cg_s_node fact) evidence) rev)
+                    (MkCgSProof code owner (cg_s_node fact) (Nothing (Pair Nat Nat)) evidence) rev)
                 end
               end
             end

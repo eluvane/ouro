@@ -36,6 +36,15 @@ fix eq{seed} (n : Nat) (m : Nat) : Bool := match n, m with
 def result (n : Nat) : Nat := let {n} : Nat := identity Nat n in
 (fun (next : Nat) => next) {n};
 ''', []
+    yield 'typed-local-helpers', PRELUDE + '''def localIdentity : Nat :=
+let helper (value : Nat) : Nat := value in helper Z;
+def localDependent : Nat :=
+let helper (A : Type) (value : A) : A := value in helper Nat Z;
+def localNested : Nat :=
+let outer (value : Nat) : Nat :=
+  let inner (next : Nat) : Nat := next in inner value
+in outer Z;
+''', []
     yield 'handler-scopes', PRELUDE + f'''effect Counter where | tick : Nat -> Nat
 def result : Nat := handle perform tick ({seed % 7}) with
 | tick (input) resume => resume (S input) | pure output => output end;

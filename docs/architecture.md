@@ -1,11 +1,3 @@
-<p align="center">
-  <img
-    width="100%"
-    src="https://capsule-render.vercel.app/api?type=waving&amp;height=220&amp;color=0:0B1220,50:1E1B4B,100:4F46E5&amp;text=ARCHITECTURE&amp;fontColor=E2E8F0&amp;fontSize=46&amp;fontAlignY=50"
-    alt="ARCHITECTURE banner"
-  />
-</p>
-
 # Architecture
 
 Ouro has one compiler-owned declaration checker. Source compilation and
@@ -39,19 +31,15 @@ lives in `lexer.ouro`, `parser.ouro`, `source_text.ouro`, and
 declaration checking live in `import_resolve.ouro`, `elab.ouro`, `lower.ouro`,
 and `file_elab.ouro`. `driver.ouro` and `pipeline.ouro` compose the stages.
 
-The production frontend preprocesses import aliases and records, runs the
-lexer, builds a `CanonicalSourceUnit`, and passes its tokens to the parser.
-Ordinary trivia stays outside that boundary; `-- @...` directives are retained
-as metadata. The optional compact serialization supports diagnostics,
-measurement, and cache identity. Source-aware tools still read original text
-when comments, positions, or layout matter.
+The production frontend preprocesses import aliases and records, then passes a
+`CanonicalSourceUnit` token stream to the parser. [Canonical source](canonical_source.md)
+owns trivia, directive metadata, source mapping, and hash contracts.
 
 The parser uses the same `parse_a.ouro` / `parse_b.ouro` mode helpers and
 `parser_min.ouro` ABI as split bootstrap compilation. Its dispatcher owns the
 recursive fuel boundary. Imported modules currently flatten into a shared
-namespace after dependency ordering. The complete declaration plan preserves
-types, bodies, assumptions, inductives, and primitive contracts. Imported
-bodies and effect roots pass the same checker as the requested root.
+namespace after dependency ordering. [Compiler checking](kernel_design.md)
+defines the complete declaration plan and import-closure checks.
 
 `scripts/ouro1.sh` is the maintained command wrapper; `scripts/coil.sh` exposes
 the project-facing verbs. Project defaults and package identity live in
@@ -60,17 +48,13 @@ the project-facing verbs. Project defaults and package identity live in
 ## Checking and checked data
 
 `compiler/file_elab.ouro` checks ordered declarations into an environment built
-only from accepted predecessors. Reduction, conversion, positivity, cases,
-structural recursion, and primitive identities belong to its Ouro dependency
-closure. Typed failures distinguish rejection, malformed input, unsupported
-features, resource limits, cancellation, and internal failures.
+from accepted predecessors. [Compiler checking](kernel_design.md) owns the rules
+and typed failures; [TCB](tcb.md#compiler-checking-boundary) owns its pure
+dependency boundary.
 
-`CheckedProgram` retains the checked declarations and emission metadata. Its
-diagnostic `ouro.checked-program.v1` serialization supports complete
-transformation comparisons. The former JSON artifact and independent OCaml and
-Python replay implementations are retired; the old schema and corpus remain
-historical data. See [Compiler checking](kernel_design.md),
-[Core artifacts](kernel_core_artifact.md), and [TCB](tcb.md).
+`CheckedProgram` carries declarations and emission metadata to both backends.
+[Core artifacts](kernel_core_artifact.md) defines its diagnostic snapshot and
+the archived JSON replay format.
 
 ## Backends and runtime
 
@@ -190,15 +174,9 @@ evidence.
 
 ## Bootstrap and generated artifacts
 
-Committed generated C under `compiler/stage0/` remains the historical starting
-point for the current producer. It is never hand-maintained source. The
-documented regeneration and stage comparison must succeed before promotion
-changes those artifacts and their hashes.
-
-The final native bootstrap will use a published previous Ouro executable.
-That transition is not established by compiling a PE fixture or by reusing a
-development compiler. [Build and bootstrap](build.md) records the current
-commands, dependencies, and recovery boundary.
+[Build and bootstrap](build.md#generated-artifacts-and-stage-loop) owns the
+current generated C seed, regeneration, stage comparison, and promotion. The
+native seed acceptance criteria are in [Roadmap](roadmap.md#acceptance-and-compatibility).
 
 ## Tools and validation
 
@@ -215,10 +193,7 @@ are Ouro programs; its Python harness supplies process supervision,
 source-bound receipts, and independent surface/runtime expectations. C runtime
 selftests remain beside the runtime they exercise.
 
-Required compiler suites test acceptance and rejection, while execution tests
-check the backends and runtime. Boundary policy, cache parity, source hashes,
-and generated-artifact comparisons each protect their own layer. No single
-report substitutes for these other checks.
+[CI](ci.md#validation-matrix) owns the required checks for these layers.
 
 ## Repository map
 
@@ -238,11 +213,3 @@ report substitutes for these other checks.
 | `site/` and `editors/` | Website and editor integrations |
 | `.github/` | Hosted workflows and contribution forms |
 | `_build/` and `_cache/` | Ignored local outputs |
-
-<p align="center">
-  <img
-    width="100%"
-    src="https://capsule-render.vercel.app/api?type=waving&amp;height=220&amp;color=0:0B1220,50:1E1B4B,100:4F46E5&amp;section=footer"
-    alt=""
-  />
-</p>

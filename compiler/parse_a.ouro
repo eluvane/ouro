@@ -1,7 +1,7 @@
 -- First split parser shard; keep shared parser types in parser_min to avoid duplicate generated symbols.
 
-import "parser_min.ouro";
-import "token.ouro";
+import "parser_min.ouro",
+  "token.ouro";
 
 -- One arm per Mode, so the branch count is the size of the mode table.
 -- @bound(cyclo <= 132)
@@ -30,8 +30,7 @@ def parse_a_pi
     -- (x y : A) is Pi only if '->' follows; else reparse as app/ascribe.
     match is_binder_ahead toks with
     | True =>
-        let cont12 : List (Pair Nat Expr) -> List Token -> Nat -> ParseResult Value :=
-            fun (group : List (Pair Nat Expr)) (toks2 : List Token) (pos2 : Nat) =>
+        let cont12 (group : List (Pair Nat Expr)) (toks2 : List Token) (pos2 : Nat) : ParseResult Value :=
             bindValue (List (Pair Nat Expr)) asListPairNatExpr (parse fuel' MTypedBinders toks2 pos2 extra)
             (fun (bs : List (Pair Nat Expr)) (toks3 : List Token) (pos3 : Nat) =>
             match is_arrow (peek toks3) with
@@ -42,7 +41,7 @@ def parse_a_pi
             (fun (rhs : Expr) (toks5 : List Token) (pos5 : Nat) =>
             bindValue Expr asExpr (parse fuel' MEffectAnnotation toks5 pos5 (VExpr rhs))
             (fun (rhs' : Expr) (toks6 : List Token) (pos6 : Nat) =>
-            okExpr (mk_pi_chain (append (Pair Nat Expr) group bs) rhs') toks6 pos6)))
+            okExpr (mk_pi_chain(append (Pair Nat Expr) group bs, rhs')) toks6 pos6)))
             | False =>
             parse fuel' MPiFromApp toks pos extra
             end)
@@ -55,8 +54,7 @@ def parse_a_pi
 def parse_a_pifromapp
   (parse : Nat -> Mode -> List Token -> Nat -> Value -> ParseResult Value)
   (fuel' : Nat) (toks : List Token) (pos : Nat) (extra : Value) : ParseResult Value :=
-    let cont10 : Expr -> List Token -> Nat -> ParseResult Value :=
-        fun (head : Expr) (toks2 : List Token) (pos2 : Nat) =>
+    let cont10 (head : Expr) (toks2 : List Token) (pos2 : Nat) : ParseResult Value :=
         match is_arrow (peek toks2) with
         | True =>
         bindParseResult Unit Value (expect_arrow toks2 pos2)
@@ -74,6 +72,53 @@ def parse_a_pifromapp
       in bindValue Expr asExpr (parse fuel' MApp toks pos extra)
       cont10;
 
+-- A call group is a sequence of ordinary applications, never a tuple or a
+-- receiver lookup. Parse each argument with the shared expression callback.
+def parse_a_call_argument
+  (parse : Nat -> Mode -> List Token -> Nat -> Value -> ParseResult Value)
+  (fuel : Nat) (toks : List Token) (pos : Nat) (extra : Value) : ParseResult Value :=
+    bindValue Expr asExpr (parse fuel MExpr toks pos extra)
+      (fun (arg : Expr) (tail : List Token) (position : Nat) =>
+        match is_colon (peek tail) with
+        | False => okExpr arg tail position
+        | True =>
+            bindParseResult Unit Value (expect_colon tail position)
+              (fun (_u : Unit) (after : List Token) (next : Nat) =>
+                bindValue Expr asExpr (parse fuel MExpr after next extra)
+                  (fun (ty : Expr) (rest : List Token) (end_pos : Nat) =>
+                    okExpr (EAscribe arg ty) rest end_pos))
+        end);
+
+def parse_a_call_arguments
+  (parse : Nat -> Mode -> List Token -> Nat -> Value -> ParseResult Value)
+  : Nat -> Expr -> List Token -> Nat -> Value -> ParseResult Value :=
+  fix arguments (fuel : Nat) (head : Expr) (toks : List Token) (pos : Nat)
+      (extra : Value) : ParseResult Value :=
+    match fuel with
+    | Z => PErr Value pos
+    | S remaining =>
+        bindValue Expr asExpr (parse_a_call_argument parse remaining toks pos extra)
+          (fun (arg : Expr) (tail : List Token) (position : Nat) =>
+            let applied : Expr := EApp head arg in
+            match is_comma (peek tail) with
+            | False =>
+                bindParseResult Unit Value (expect_rparen tail position)
+                  (fun (_u : Unit) (after : List Token) (next : Nat) =>
+                    okExpr applied after next)
+            | True =>
+                match bump tail position with
+                | MkPair after next =>
+                    match eqNat(token_tag (peek after), tagRparen) with
+                    | True =>
+                        bindParseResult Unit Value (expect_rparen after next)
+                          (fun (_u : Unit) (rest : List Token) (end_pos : Nat) =>
+                            okExpr applied rest end_pos)
+                    | False => arguments remaining applied after next extra
+                    end
+                end
+            end)
+    end;
+
 def parse_a_apptail
   (parse : Nat -> Mode -> List Token -> Nat -> Value -> ParseResult Value)
   (fuel' : Nat) (toks : List Token) (pos : Nat) (extra : Value) : ParseResult Value :=
@@ -83,9 +128,19 @@ def parse_a_apptail
         match is_atom_start (peek toks) with
         | False => okExpr head toks pos
         | True =>
-            bindValue Expr asExpr (parse fuel' MAtom toks pos extra)
-              (fun (a : Expr) (toks3 : List Token) (pos3 : Nat) =>
-                parse fuel' MAppTail toks3 pos3 (VExpr (EApp head a)))
+            match is_lparen (peek toks) with
+            | True =>
+                bindParseResult Unit Value (expect_lparen toks pos)
+                  (fun (_u : Unit) (tail : List Token) (position : Nat) =>
+                    bindValue Expr asExpr
+                      (parse_a_call_arguments parse fuel' head tail position extra)
+                      (fun (applied : Expr) (after : List Token) (next : Nat) =>
+                        parse fuel' MAppTail after next (VExpr applied)))
+            | False =>
+                bindValue Expr asExpr (parse fuel' MAtom toks pos extra)
+                  (fun (a : Expr) (toks3 : List Token) (pos3 : Nat) =>
+                    parse fuel' MAppTail toks3 pos3 (VExpr (EApp head a)))
+            end
         end
     end;
 
@@ -96,24 +151,24 @@ def parse_a_atom
     | Nil => PErr Value pos
     | Cons t rest =>
         match tokenIsIdent t with
-        | Just n => okExpr (EVar n) rest (S pos)
+        | Just n => okExpr(EVar n, rest, S pos)
         | Nothing =>
             match tokenIsNat t with
-            | Just n => okExpr (ENat n) rest (S pos)
+            | Just n => okExpr(ENat n, rest, S pos)
             | Nothing =>
                 match tokenIsString t with
-                | Just n => okExpr (EStr n) rest (S pos)
+                | Just n => okExpr(EStr n, rest, S pos)
                 | Nothing =>
                 match tokenIsType t with
-                | Just u => okExpr (ESort u) rest (S pos)
+                | Just u => okExpr(ESort u, rest, S pos)
                 | Nothing =>
                     match tokenIsHole t with
-                    | Just m => okExpr (EHole m) rest (S pos)
+                    | Just m => okExpr(EHole m, rest, S pos)
                     | Nothing =>
                         match is_lparen t with
                         | True => parse fuel' MParen rest (S pos) extra
                         | False =>
-                            match eqNat (token_tag t) tagBracketL with
+                            match eqNat(token_tag t, tagBracketL) with
                             | True => parse fuel' MListElems rest (S pos) extra
                             | False =>
                                 match tokenIsKeyword t with
@@ -132,8 +187,7 @@ def parse_a_atom
 def parse_a_paren
   (parse : Nat -> Mode -> List Token -> Nat -> Value -> ParseResult Value)
   (fuel' : Nat) (toks : List Token) (pos : Nat) (extra : Value) : ParseResult Value :=
-    let cont8 : Expr -> List Token -> Nat -> ParseResult Value :=
-        fun (e : Expr) (toks2 : List Token) (pos2 : Nat) =>
+    let cont8 (e : Expr) (toks2 : List Token) (pos2 : Nat) : ParseResult Value :=
         match is_colon (peek toks2) with
         | True =>
         bindParseResult Unit Value (expect_colon toks2 pos2)
@@ -234,11 +288,10 @@ def parse_a_funbinders
   (fuel' : Nat) (toks : List Token) (pos : Nat) (extra : Value) : ParseResult Value :=
     match is_binder_ahead toks with
     | True =>
-        let cont2 : List (Pair Nat Expr) -> List Token -> Nat -> ParseResult Value :=
-            fun (group : List (Pair Nat Expr)) (toks2 : List Token) (pos2 : Nat) =>
-            bindValue (List (Pair Nat (Maybe Expr))) asListPairNatMaybeExpr (parse fuel' MFunBinders toks2 pos2 extra)
+        let cont2 (group : List (Pair Nat Expr)) (toks2 : List Token) (pos2 : Nat) : ParseResult Value :=
+            bindValue (List (Pair(Nat, Maybe Expr))) asListPairNatMaybeExpr (parse fuel' MFunBinders toks2 pos2 extra)
             (fun (bs : List (Pair Nat (Maybe Expr))) (toks3 : List Token) (pos3 : Nat) =>
-            okListPairNatMaybeExpr (append (Pair Nat (Maybe Expr)) (mk_typed_maybe_binders group) bs) toks3 pos3)
+            okListPairNatMaybeExpr (append(Pair(Nat, Maybe Expr), mk_typed_maybe_binders group, bs)) toks3 pos3)
           in bindValue (List (Pair Nat Expr)) asListPairNatExpr (parse fuel' MTypedBinderGroup toks pos extra)
           cont2
     | False =>
@@ -246,10 +299,10 @@ def parse_a_funbinders
         | Just _ni =>
             bindParseResult Nat Value (expect_ident toks pos)
               (fun (n : Nat) (toks2 : List Token) (pos2 : Nat) =>
-                bindValue (List (Pair Nat (Maybe Expr))) asListPairNatMaybeExpr (parse fuel' MFunBinders toks2 pos2 extra)
+                bindValue (List (Pair(Nat, Maybe Expr))) asListPairNatMaybeExpr (parse fuel' MFunBinders toks2 pos2 extra)
                   (fun (bs : List (Pair Nat (Maybe Expr))) (toks3 : List Token) (pos3 : Nat) =>
-                    okListPairNatMaybeExpr (Cons (Pair Nat (Maybe Expr)) (MkPair Nat (Maybe Expr) n (Nothing Expr)) bs) toks3 pos3))
-        | Nothing => okListPairNatMaybeExpr (Nil (Pair Nat (Maybe Expr))) toks pos
+                    okListPairNatMaybeExpr (Cons(Pair(Nat, Maybe Expr), MkPair(Nat, Maybe Expr, n, Nothing Expr), bs)) toks3 pos3))
+        | Nothing => okListPairNatMaybeExpr (Nil (Pair(Nat, Maybe Expr))) toks pos
         end
     end;
 
@@ -277,8 +330,7 @@ def parse_a_effectannotation
 def parse_a_effectrow
   (parse : Nat -> Mode -> List Token -> Nat -> Value -> ParseResult Value)
   (fuel' : Nat) (toks : List Token) (pos : Nat) (extra : Value) : ParseResult Value :=
-    let cont9 : Nat -> List Token -> Nat -> ParseResult Value :=
-        fun (n : Nat) (toks2 : List Token) (pos2 : Nat) =>
+    let cont9 (n : Nat) (toks2 : List Token) (pos2 : Nat) : ParseResult Value :=
         match is_comma (peek toks2) with
         | True =>
         match toks2 with
@@ -308,8 +360,7 @@ def parse_a_commalist
     match is_comma_list_start (peek toks) with
     | False => okListExpr (Nil Expr) toks pos
     | True =>
-        let cont6 : Expr -> List Token -> Nat -> ParseResult Value :=
-            fun (e : Expr) (toks2 : List Token) (pos2 : Nat) =>
+        let cont6 (e : Expr) (toks2 : List Token) (pos2 : Nat) : ParseResult Value :=
             match is_comma (peek toks2) with
             | True =>
             match toks2 with
@@ -371,8 +422,7 @@ def parse_a_identcommalist
     match tokenIsBinderName (peek toks) with
     | Nothing => okListNat (Nil Nat) toks pos
     | Just _ =>
-        let cont3 : Nat -> List Token -> Nat -> ParseResult Value :=
-            fun (n : Nat) (toks2 : List Token) (pos2 : Nat) =>
+        let cont3 (n : Nat) (toks2 : List Token) (pos2 : Nat) : ParseResult Value :=
             match is_comma (peek toks2) with
             | True =>
             match toks2 with

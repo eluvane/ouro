@@ -1,0 +1,590 @@
+-- The spanned lexer and parser agree with the production ones, and every
+-- recorded token range selects exactly the source bytes of its expression.
+
+import "../compiler/source_spans.ouro",
+  "../compiler/parser.ouro",
+  "../compiler/preprocess_import.ouro",
+  "../compiler/preprocess_record.ouro",
+  "../std/listx.ouro",
+  "../std/fs.ouro",
+  "analyze/precision/assertions.ouro";
+
+-- Tagged, length-prefixed codes: equal code lists mean equal trees. ESpan keeps
+-- its own tag, so a wrapper left behind by strip_spans changes the codes.
+def ss_nats (xs : List Nat) (acc : List Nat) : List Nat :=
+    Cons(Nat, length Nat xs, append Nat xs acc);
+
+def ss_maybe_nat (m : Maybe Nat) (acc : List Nat) : List Nat :=
+    match m with
+    | Nothing => Cons Nat 0 acc
+    | Just n => Cons Nat 1 (Cons Nat n acc)
+    end;
+
+def ss_patterns : List (Pair Nat (List Nat)) -> List Nat -> List Nat :=
+  fix ss_patterns (pats : List (Pair Nat (List Nat))) (acc : List Nat) : List Nat :=
+    match pats with
+    | Nil => Cons Nat 0 acc
+    | Cons pat rest =>
+        match pat with
+        | MkPair ctor names => Cons Nat 1 (Cons Nat ctor (ss_nats(names, ss_patterns rest acc)))
+        end
+    end;
+
+def ss_expr : Expr -> List Nat -> List Nat :=
+  fix ss_expr (e : Expr) (acc : List Nat) : List Nat :=
+    match e with
+    | EVar n => Cons Nat 1 (Cons Nat n acc)
+    | EHole h => Cons Nat 2 (ss_maybe_nat h acc)
+    | ESort u => Cons Nat 3 (Cons Nat u acc)
+    | ENat n => Cons Nat 4 (Cons Nat n acc)
+    | EApp f a => Cons Nat 5 (ss_expr(f, ss_expr a acc))
+    | ELam n ann body =>
+        Cons Nat 6 (Cons Nat n
+          (match ann with
+           | Nothing => Cons Nat 0 (ss_expr body acc)
+           | Just ty => Cons Nat 1 (ss_expr(ty, ss_expr body acc))
+           end))
+    | EPi n dom cod => Cons Nat 7 (Cons Nat n (ss_expr(dom, ss_expr cod acc)))
+    | ELet n ann value body =>
+        Cons Nat 8 (Cons Nat n
+          (match ann with
+           | Nothing => Cons Nat 0 (ss_expr(value, ss_expr body acc))
+           | Just ty => Cons Nat 1 (ss_expr(ty, ss_expr(value, ss_expr body acc)))
+           end))
+    | EAscribe term ty => Cons Nat 9 (ss_expr(term, ss_expr ty acc))
+    | EMatch scrut branches => Cons Nat 10 (ss_expr(scrut, ss_expr branches acc))
+    | EFix n binders ret body =>
+        Cons Nat 11 (Cons Nat n (ss_expr(binders, ss_expr(ret, ss_expr body acc))))
+    | EEffectRow ty ops => Cons Nat 12 (ss_expr(ty, ss_nats ops acc))
+    | EPerform op args =>
+        Cons Nat 13 (Cons Nat op
+          ((fix go (xs : List Expr) (tail : List Nat) : List Nat :=
+              match xs with
+              | Nil => Cons Nat 0 tail
+              | Cons x rest => Cons Nat 1 (ss_expr(x, go rest tail))
+              end) args acc))
+    | EDo statements =>
+        Cons Nat 14
+          ((fix go (xs : List Expr) (tail : List Nat) : List Nat :=
+              match xs with
+              | Nil => Cons Nat 0 tail
+              | Cons x rest => Cons Nat 1 (ss_expr(x, go rest tail))
+              end) statements acc)
+    | EHandle comp clauses =>
+        Cons Nat 15 (ss_expr comp
+          ((fix go (cs : List (Pair Nat (Pair (List Nat) Expr))) (tail : List Nat) : List Nat :=
+              match cs with
+              | Nil => Cons Nat 0 tail
+              | Cons clause rest =>
+                  match clause with
+                  | MkPair op payload =>
+                      match payload with
+                      | MkPair names body =>
+                          Cons Nat 1 (Cons Nat op (ss_nats(names, ss_expr(body, go rest tail))))
+                      end
+                  end
+              end) clauses acc))
+    | EBranch pats body rest => Cons Nat 16 (ss_nats(pats, ss_expr(body, ss_expr rest acc)))
+    | ENoBranch => Cons Nat 17 acc
+    | EBinder n ty rest => Cons Nat 18 (Cons Nat n (ss_expr(ty, ss_expr rest acc)))
+    | ENoBinder => Cons Nat 19 acc
+    | EMultiMatch scruts rows =>
+        Cons Nat 20
+          ((fix go (xs : List Expr) (tail : List Nat) : List Nat :=
+              match xs with
+              | Nil => Cons Nat 0 tail
+              | Cons x rest => Cons Nat 1 (ss_expr(x, go rest tail))
+              end) scruts
+            ((fix go (rs : List (Pair (List (Pair Nat (List Nat))) Expr)) (tail : List Nat) : List Nat :=
+                match rs with
+                | Nil => Cons Nat 0 tail
+                | Cons row rest =>
+                    match row with
+                    | MkPair pats body => Cons Nat 1 (ss_patterns(pats, ss_expr(body, go rest tail)))
+                    end
+                end) rows acc))
+    | EStr s => Cons Nat 21 (Cons Nat s acc)
+    | EDoBind n rhs => Cons Nat 22 (Cons Nat n (ss_expr rhs acc))
+    | EList elements =>
+        Cons Nat 23
+          ((fix go (xs : List Expr) (tail : List Nat) : List Nat :=
+              match xs with
+              | Nil => Cons Nat 0 tail
+              | Cons x rest => Cons Nat 1 (ss_expr(x, go rest tail))
+              end) elements acc)
+    | ESpan first past inner => Cons Nat 24 (Cons Nat first (Cons Nat past (ss_expr inner acc)))
+    end;
+
+def ss_pairs : List (Pair Nat Expr) -> List Nat -> List Nat :=
+  fix ss_pairs (items : List (Pair Nat Expr)) (acc : List Nat) : List Nat :=
+    match items with
+    | Nil => Cons Nat 0 acc
+    | Cons item rest =>
+        match item with
+        | MkPair name e => Cons Nat 1 (Cons Nat name (ss_expr(e, ss_pairs rest acc)))
+        end
+    end;
+
+def ss_decl (d : Decl) (acc : List Nat) : List Nat :=
+    match d with
+    | DDef n ty body => Cons Nat 1 (Cons Nat n (ss_expr(ty, ss_expr body acc)))
+    | DAxiom n ty => Cons Nat 2 (Cons Nat n (ss_expr ty acc))
+    | DInductive n params ty ctors =>
+        Cons Nat 3 (Cons Nat n (ss_pairs(params, ss_expr(ty, ss_pairs ctors acc))))
+    | DEffect n ops handlers => Cons Nat 4 (Cons Nat n (ss_pairs(ops, ss_pairs handlers acc)))
+    | DImport n => Cons Nat 5 (Cons Nat n acc)
+    | DIntrinsic n ty key specialization =>
+        Cons Nat 6 (Cons Nat n (ss_expr ty (Cons Nat key
+          (match specialization with
+           | Nothing => Cons Nat 0 acc
+           | Just value => Cons Nat 1 (ss_expr value acc)
+           end))))
+    | DExtern n ty metadata => Cons Nat 7 (Cons Nat n (ss_expr(ty, ss_nats metadata acc)))
+    | DRepresentation target key => Cons Nat 8 (Cons Nat target (Cons Nat key acc))
+    end;
+
+def ss_decls : List Decl -> List Nat -> List Nat :=
+  fix ss_decls (ds : List Decl) (acc : List Nat) : List Nat :=
+    match ds with
+    | Nil => Cons Nat 0 acc
+    | Cons d rest => Cons Nat 1 (ss_decl(d, ss_decls rest acc))
+    end;
+
+def ss_token (t : Token) (acc : List Nat) : List Nat :=
+    Cons Nat (token_tag t)
+      (match t with
+       | TIdent n => Cons Nat n acc
+       | TNat n => Cons Nat n acc
+       | TKeyword n => Cons Nat n acc
+       | TType n => Cons Nat n acc
+       | THole h => ss_maybe_nat h acc
+       | TString n => Cons Nat n acc
+       | TColon => acc
+       | TColonEq => acc
+       | TArrow => acc
+       | TFatArrow => acc
+       | TBar => acc
+       | TLparen => acc
+       | TRparen => acc
+       | TSemi => acc
+       | TComma => acc
+       | TBraceL => acc
+       | TBraceR => acc
+       | TExclam => acc
+       | TEof => acc
+       | TBind => acc
+       | TPipe => acc
+       | TBracketL => acc
+       | TBracketR => acc
+       end);
+
+def ss_tokens : List Token -> List Nat -> List Nat :=
+  fix ss_tokens (tokens : List Token) (acc : List Nat) : List Nat :=
+    match tokens with
+    | Nil => Cons Nat 0 acc
+    | Cons t rest => Cons Nat 1 (ss_token(t, ss_tokens rest acc))
+    end;
+
+def ss_interned : List (Pair (List Nat) Nat) -> List Nat -> List Nat :=
+  fix ss_interned (entries : List (Pair (List Nat) Nat)) (acc : List Nat) : List Nat :=
+    match entries with
+    | Nil => Cons Nat 0 acc
+    | Cons entry rest =>
+        match entry with
+        | MkPair name id => Cons Nat 1 (ss_nats(name, Cons Nat id (ss_interned rest acc)))
+        end
+    end;
+
+def ss_fuel (codes : List Nat) : Nat := add(length Nat codes, 1024);
+
+inductive SsParse : Type :=
+  | SsParsed : List Decl -> Nat -> Nat -> SsParse
+  | SsParseError : Nat -> SsParse;
+
+def ss_parse_with (parser : Nat -> Mode -> List Token -> Nat -> Value -> ParseResult Value)
+    (fuel : Nat) (tokens : List Token) : SsParse :=
+    match parse_file parser fuel tokens 0 with
+    | PErr position => SsParseError position
+    | POk decls remaining past => SsParsed decls (length Token remaining) past
+    end;
+
+-- Same declarations after stripping, same unconsumed tokens and end position,
+-- or the same failing token position.
+def ss_parse_agrees (fuel : Nat) (tokens : List Token) : Bool :=
+    match ss_parse_with parse fuel tokens with
+    | SsParseError position =>
+        match ss_parse_with parse_spanned fuel tokens with
+        | SsParseError other => eqNat position other
+        | SsParsed _ _ _ => False
+        end
+    | SsParsed decls remaining past =>
+        match ss_parse_with parse_spanned fuel tokens with
+        | SsParseError _ => False
+        | SsParsed spanned remaining2 past2 =>
+            andb (andb(eqNat remaining remaining2, eqNat past past2))
+              (source_bytes_equal (ss_decls(decls, Nil Nat))
+                (ss_decls(map Decl Decl strip_decl_spans spanned, Nil Nat)))
+        end
+    end;
+
+def ss_agrees_codes (codes : List Nat) : Bool :=
+    let fuel : Nat := ss_fuel codes in
+    let spanned : LexResult := lex_spanned_result (lex_spanned fuel codes empty_intern) in
+    match lex_all fuel codes with
+    | LexOk tokens st =>
+        match spanned with
+        | LexOk tokens2 st2 =>
+            andb (andb (source_bytes_equal(ss_tokens(tokens, Nil Nat), ss_tokens(tokens2, Nil Nat)))
+                (source_bytes_equal (ss_interned(unit_intern_ids st, Nil Nat))
+                  (ss_interned(unit_intern_ids st2, Nil Nat))))
+              (ss_parse_agrees fuel tokens)
+        | LexMalformed _ => False
+        | LexExhausted _ => False
+        end
+    | LexMalformed _ => match spanned with | LexMalformed _ => True | LexOk _ _ => False | LexExhausted _ => False end
+    | LexExhausted _ => match spanned with | LexExhausted _ => True | LexOk _ _ => False | LexMalformed _ => False end
+    end;
+
+def ss_agrees (text : String) : Bool := ss_agrees_codes (prim_string_to_char_codes text);
+
+-- Every span in preorder with its wrapped expression and whether it lies
+-- within its enclosing span.
+inductive SsRange : Type :=
+  | MkSsRange : Nat -> Nat -> Bool -> Expr -> SsRange;
+
+def ss_within (first : Nat) (past : Nat) (outer_first : Nat) (outer_past : Nat) : Bool :=
+    andb(ltb_nat first past, andb(leb_nat outer_first first, leb_nat past outer_past));
+
+def ss_ranges : Expr -> Nat -> Nat -> List SsRange -> List SsRange :=
+  fix ss_ranges (e : Expr) (outer_first : Nat) (outer_past : Nat) (acc : List SsRange) : List SsRange :=
+    match e with
+    | ESpan first past inner =>
+        Cons SsRange (MkSsRange first past (ss_within first past outer_first outer_past) inner)
+          (ss_ranges inner first past acc)
+    | EVar _ => acc
+    | EHole _ => acc
+    | ESort _ => acc
+    | ENat _ => acc
+    | EStr _ => acc
+    | ENoBranch => acc
+    | ENoBinder => acc
+    | EApp f a => ss_ranges f outer_first outer_past (ss_ranges a outer_first outer_past acc)
+    | ELam _ ann body =>
+        (match ann with
+         | Nothing => ss_ranges body outer_first outer_past acc
+         | Just ty => ss_ranges ty outer_first outer_past (ss_ranges body outer_first outer_past acc)
+         end)
+    | EPi _ dom cod => ss_ranges dom outer_first outer_past (ss_ranges cod outer_first outer_past acc)
+    | ELet _ ann value body =>
+        (match ann with
+         | Nothing => ss_ranges value outer_first outer_past (ss_ranges body outer_first outer_past acc)
+         | Just ty => ss_ranges ty outer_first outer_past
+             (ss_ranges value outer_first outer_past (ss_ranges body outer_first outer_past acc))
+         end)
+    | EAscribe term ty => ss_ranges term outer_first outer_past (ss_ranges ty outer_first outer_past acc)
+    | EMatch scrut branches =>
+        ss_ranges scrut outer_first outer_past (ss_ranges branches outer_first outer_past acc)
+    | EFix _ binders ret body =>
+        ss_ranges binders outer_first outer_past
+          (ss_ranges ret outer_first outer_past (ss_ranges body outer_first outer_past acc))
+    | EEffectRow ty _ => ss_ranges ty outer_first outer_past acc
+    | EPerform _ args =>
+        (fix go (xs : List Expr) (tail : List SsRange) : List SsRange :=
+          match xs with
+          | Nil => tail
+          | Cons x rest => ss_ranges x outer_first outer_past (go rest tail)
+          end) args acc
+    | EDo statements =>
+        (fix go (xs : List Expr) (tail : List SsRange) : List SsRange :=
+          match xs with
+          | Nil => tail
+          | Cons x rest => ss_ranges x outer_first outer_past (go rest tail)
+          end) statements acc
+    | EHandle comp clauses =>
+        ss_ranges comp outer_first outer_past
+          ((fix go (cs : List (Pair Nat (Pair (List Nat) Expr))) (tail : List SsRange) : List SsRange :=
+              match cs with
+              | Nil => tail
+              | Cons clause rest =>
+                  match clause with
+                  | MkPair _ payload =>
+                      match payload with
+                      | MkPair _ body => ss_ranges body outer_first outer_past (go rest tail)
+                      end
+                  end
+              end) clauses acc)
+    | EBranch _ body rest => ss_ranges body outer_first outer_past (ss_ranges rest outer_first outer_past acc)
+    | EBinder _ ty rest => ss_ranges ty outer_first outer_past (ss_ranges rest outer_first outer_past acc)
+    | EMultiMatch scruts rows =>
+        (fix go (xs : List Expr) (tail : List SsRange) : List SsRange :=
+          match xs with
+          | Nil => tail
+          | Cons x rest => ss_ranges x outer_first outer_past (go rest tail)
+          end) scruts
+          ((fix go (rs : List (Pair (List (Pair Nat (List Nat))) Expr)) (tail : List SsRange) : List SsRange :=
+              match rs with
+              | Nil => tail
+              | Cons row rest =>
+                  match row with
+                  | MkPair _ body => ss_ranges body outer_first outer_past (go rest tail)
+                  end
+              end) rows acc)
+    | EDoBind _ rhs => ss_ranges rhs outer_first outer_past acc
+    | EList elements =>
+        (fix go (xs : List Expr) (tail : List SsRange) : List SsRange :=
+          match xs with
+          | Nil => tail
+          | Cons x rest => ss_ranges x outer_first outer_past (go rest tail)
+          end) elements acc
+    end;
+
+def ss_pair_ranges (outer : Nat) : List (Pair Nat Expr) -> List SsRange -> List SsRange :=
+  fix ss_pair_ranges (items : List (Pair Nat Expr)) (acc : List SsRange) : List SsRange :=
+    match items with
+    | Nil => acc
+    | Cons item rest =>
+        match item with
+        | MkPair _ e => ss_ranges e 0 outer (ss_pair_ranges rest acc)
+        end
+    end;
+
+def ss_decl_ranges (outer : Nat) (d : Decl) (acc : List SsRange) : List SsRange :=
+    match d with
+    | DDef _ ty body => ss_ranges ty 0 outer (ss_ranges body 0 outer acc)
+    | DAxiom _ ty => ss_ranges ty 0 outer acc
+    | DInductive _ params ty ctors =>
+        ss_pair_ranges outer params (ss_ranges ty 0 outer (ss_pair_ranges outer ctors acc))
+    | DEffect _ ops handlers => ss_pair_ranges outer ops (ss_pair_ranges outer handlers acc)
+    | DImport _ => acc
+    | DIntrinsic _ ty _ specialization =>
+        ss_ranges ty 0 outer
+          (match specialization with
+           | Nothing => acc
+           | Just value => ss_ranges value 0 outer acc
+           end)
+    | DExtern _ ty _ => ss_ranges ty 0 outer acc
+    | DRepresentation _ _ => acc
+    end;
+
+def ss_trimmed (text : String) : Bool :=
+    match prim_string_length text with
+    | Z => False
+    | S last =>
+        andb (notb (source_is_ws (prim_string_byte_at text 0)))
+          (notb (source_is_ws (prim_string_byte_at text last)))
+    end;
+
+def ss_tags (tokens : List Token) : List Nat := map Token Nat token_tag tokens;
+
+-- A slice is exact when lexing it alone yields the tokens [first, past) of the
+-- whole source, with nothing before or after them.
+def ss_exact_slice (tokens : List Token) (first : Nat) (past : Nat) (slice : List Nat) : Bool :=
+    match lex_all(ss_fuel slice, slice) with
+    | LexOk own _ =>
+        source_bytes_equal (ss_tags own)
+          (append Nat (ss_tags (take(Token, sub past first, drop Token first tokens))) [token_tag TEof])
+    | LexMalformed _ => False
+    | LexExhausted _ => False
+    end;
+
+-- The recorded token range, parsed alone as an expression, consumes every
+-- token and yields exactly the wrapped expression.
+def ss_reparses (fuel : Nat) (tokens : List Token) (first : Nat) (past : Nat) (inner : Expr) : Bool :=
+    match parse_expr parse fuel
+        (append Token (take(Token, sub past first, drop Token first tokens)) [TEof]) 0 with
+    | PErr _ => False
+    | POk e rest _ =>
+        andb (eqNat(length Token rest, 1))
+          (source_bytes_equal(ss_expr(e, Nil Nat), ss_expr(strip_spans inner, Nil Nat)))
+    end;
+
+-- Byte slices of all spans, or Nothing when lexing or parsing fails, or a
+-- range is not nested in its parent, has no byte position, is not exact, or
+-- does not reparse to its expression.
+def ss_slices_codes (codes : List Nat) : Maybe (List String) :=
+    let fuel : Nat := ss_fuel codes in
+    let text : String := prim_string_of_char_codes codes in
+    let lexed : LexSpanned := lex_spanned fuel codes empty_intern in
+    match lex_spanned_result lexed with
+    | LexMalformed _ => Nothing (List String)
+    | LexExhausted _ => Nothing (List String)
+    | LexOk tokens _ =>
+        match parse_file parse_spanned fuel tokens 0 with
+        | PErr _ => Nothing (List String)
+        | POk decls _ _ =>
+            let count : Nat := length Token tokens in
+            let ranges : List SsRange :=
+              foldl Decl (List SsRange) (fun (acc : List SsRange) (d : Decl) => ss_decl_ranges count d acc)
+                (Nil SsRange) decls in
+            (fix go (rs : List SsRange) : Maybe (List String) :=
+              match rs with
+              | Nil => Just(List String, Nil String)
+              | Cons r rest =>
+                  match r with
+                  | MkSsRange first past nested inner =>
+                      match andb(andb(nested, ltb_nat past count), ss_reparses fuel tokens first past inner) with
+                      | False => Nothing (List String)
+                      | True =>
+                          match token_span_bytes (lex_spanned_tokens lexed) first past with
+                          | Nothing => Nothing (List String)
+                          | Just bytes =>
+                              match bytes with
+                              | MkPair start stop =>
+                                  match ss_exact_slice tokens first past
+                                      (take(Nat, sub stop start, drop Nat start codes)) with
+                                  | False => Nothing (List String)
+                                  | True =>
+                                      match go rest with
+                                      | Nothing => Nothing (List String)
+                                      | Just more => Just (List String)
+                                          (Cons String (prim_string_slice text start (sub stop start)) more)
+                                      end
+                                  end
+                              end
+                          end
+                      end
+                  end
+              end) ranges
+        end
+    end;
+
+def ss_slices (text : String) : Maybe (List String) :=
+    ss_slices_codes (prim_string_to_char_codes text);
+
+def ss_well_formed_codes (codes : List Nat) : Bool :=
+    match ss_slices_codes codes with
+    | Nothing => False
+    | Just slices => all String ss_trimmed slices
+    end;
+
+-- Well-formed spans that include every expected slice and none of the absent ones.
+def ss_spans_expect (text : String) (present : List String) (absent : List String) : Bool :=
+    match ss_slices text with
+    | Nothing => False
+    | Just slices =>
+        andb (all String ss_trimmed slices)
+          (andb (all String (fun (s : String) => elem String prim_string_eq s slices) present)
+            (notb (any String (fun (s : String) => elem String prim_string_eq s slices) absent)))
+    end;
+
+def ss_parses (text : String) : Bool :=
+    let codes : List Nat := prim_string_to_char_codes text in
+    let fuel : Nat := ss_fuel codes in
+    match lex_all fuel codes with
+    | LexOk tokens _ =>
+        match ss_parse_with parse fuel tokens with
+        | SsParsed _ remaining _ => eqNat remaining 1
+        | SsParseError _ => False
+        end
+    | LexMalformed _ => False
+    | LexExhausted _ => False
+    end;
+
+def ss_samples : List String :=
+    [ "def f : Nat := g (h x) |> k;"
+    , "def s : String := \"a\\\"b -- c\"; -- trailing"
+    , "def a : Nat := one;\r\ndef b : Nat := a;\r\n"
+    , "-- комментарий\ndef u : String := \"привет\";\ndef v : Nat := w;"
+    , "def h : Type1 := ?goal;"
+    , "def pending : Nat := _;"
+    , "def main : IO Unit :=\n  do let! line := readLine;\n     println (let y := line in y)"
+    , "def xs : List Nat := [one, two];"
+    , "def app (A : Type) (B : A -> Type) (f : (x : A) -> B x) (x : A) : B x := f x;"
+    , "def pick (flag : Bool) : Nat := match flag with | True => add one two | False => zero end;"
+    , "inductive Vec (A : Type) : Nat -> Type := | VNil : Vec A Z | VCons : (n : Nat) -> A -> Vec A n -> Vec A (S n);"
+    , "def add : Nat -> Nat -> Nat := fix add (n : Nat) (m : Nat) : Nat := match n with | Z => m | S k => S (add k m) end;"
+    , "def ident : Nat -> Nat := fun (x : Nat) => x;"
+    , "def one : Nat := (S Z : Nat);"
+    , "import \"../std/list.ouro\";\naxiom external : Nat;"
+    , "intrinsic U32 : Type := \"ouro.u32\";"
+    , "extern get_pid : Runtime U32 := \"windows-x86_64\" \"win64\" \"kernel32.dll\" \"GetCurrentProcessId\" \"maygc\";"
+    , "representation Natural := \"ouro.nat\";"
+    , "def bad : Nat := ;"
+    , "def bad : Nat := (a b;"
+    , "def bad : String := \"open"
+    ];
+
+def ss_laws : List (Pair String Bool) :=
+    [ MkPair String Bool "agree/samples" (all String ss_agrees ss_samples)
+    , MkPair String Bool "parse/valid-samples-parse"
+        (all String ss_parses (take String 18 ss_samples))
+    , MkPair String Bool "parse/malformed-samples-fail"
+        (notb (any String ss_parses (drop String 18 ss_samples)))
+    , MkPair String Bool "spans/pipe-application-and-parens"
+        (ss_spans_expect "def f : Nat := g (h x) |> k;"
+          ["g (h x) |> k", "g (h x)", "(h x)", "h x", "g", "h", "x", "k", "Nat"] [])
+    , MkPair String Bool "spans/escaped-string-literal"
+        (ss_spans_expect "def s : String := \"a\\\"b -- c\"; -- trailing" ["\"a\\\"b -- c\"", "String"] [])
+    , MkPair String Bool "spans/crlf-lines"
+        (ss_spans_expect "def a : Nat := one;\r\ndef b : Nat := a;\r\n" ["one", "a", "Nat"] [])
+    , MkPair String Bool "spans/utf8-bytes"
+        (ss_spans_expect "-- комментарий\ndef u : String := \"привет\";\ndef v : Nat := w;" ["\"привет\"", "w"] [])
+    , MkPair String Bool "spans/sorts-and-holes"
+        (ss_spans_expect "def h : Type1 := ?goal;" ["Type1", "?goal"] [])
+    , MkPair String Bool "spans/do-binds-stay-unwrapped"
+        (ss_spans_expect "def main : IO Unit :=\n  do let! line := readLine;\n     println (let y := line in y)"
+          ["IO Unit", "readLine", "println (let y := line in y)", "(let y := line in y)",
+           "let y := line in y", "line", "y"]
+          ["let! line := readLine"])
+    , MkPair String Bool "spans/list-literal"
+        (ss_spans_expect "def xs : List Nat := [one, two];" ["[one, two]", "one", "two", "List Nat"] [])
+    , MkPair String Bool "spans/dependent-functions"
+        (ss_spans_expect "def app (A : Type) (B : A -> Type) (f : (x : A) -> B x) (x : A) : B x := f x;"
+          ["A -> Type", "(x : A) -> B x", "B x", "f x", "Type"] [])
+    , MkPair String Bool "spans/match-arms"
+        (ss_spans_expect "def pick (flag : Bool) : Nat := match flag with | True => add one two | False => zero end;"
+          ["match flag with | True => add one two | False => zero end", "add one two", "flag", "zero"] [])
+    , MkPair String Bool "tokens/empty-and-unknown-ranges-have-no-position"
+        (match lex_spanned_result (lex_spanned 64 (prim_string_to_char_codes "def x : Nat := y;") empty_intern) with
+         | LexOk _ _ =>
+             let spans : TokenSpans :=
+               lex_spanned_tokens (lex_spanned 64 (prim_string_to_char_codes "def x : Nat := y;") empty_intern) in
+             andb (match token_span_bytes spans 3 3 with | Nothing => True | Just _ => False end)
+               (match token_span_bytes spans 7 99 with | Nothing => True | Just _ => False end)
+         | LexMalformed _ => False
+         | LexExhausted _ => False
+         end)
+    ];
+
+-- Repository sources after the same import and record preprocessing that
+-- tools apply before lexing.
+def ss_files : List String :=
+    [ "std/prelude.ouro", "std/data.ouro", "std/io.ouro", "std/string.ouro", "std/collections.ouro"
+    , "std/record_demo.ouro", "std/import_alias_demo.ouro", "std/io_hype_inline.ouro"
+    , "compiler/lexer.ouro", "compiler/parse_b.ouro", "compiler/desugar_match.ouro"
+    , "samples/examples/handler_demo.ouro", "samples/tutorial/06_effects.ouro", "samples/examples/nat.ouro"
+    ];
+
+def ss_expanded (text : String) : Maybe (List Nat) :=
+    match preprocess_imports (prim_string_to_char_codes text) with
+    | ImpErr _ _ => Nothing (List Nat)
+    | ImpOk imported =>
+        match preprocess_records imported with
+        | PrepErr _ _ => Nothing (List Nat)
+        | PrepOk expanded => Just(List Nat, expanded)
+        end
+    end;
+
+def ss_file_rows (path : String) : IO (List (Pair String Bool)) :=
+    do let! loaded := fs_read_checked path;
+       match loaded with
+       | Left _ => io_pure(List (Pair String Bool), [MkPair String Bool (concat "file/read " path) False])
+       | Right text =>
+           match ss_expanded text with
+           | Nothing => io_pure(List (Pair String Bool), [MkPair String Bool (concat "file/preprocess " path) False])
+           | Just codes => io_pure (List (Pair String Bool))
+               [ MkPair(String, Bool, concat "file/agree " path, ss_agrees_codes codes)
+               , MkPair(String, Bool, concat "file/spans " path, ss_well_formed_codes codes)
+               ]
+           end
+       end
+
+-- @entry main
+def main : IO Unit :=
+    do let! file_rows := io_fold String (List (Pair String Bool))
+         (fun (rows : List (Pair String Bool)) (path : String) =>
+           io_bind (List (Pair String Bool)) (List (Pair String Bool)) (ss_file_rows path)
+             (fun (more : List (Pair String Bool)) =>
+               io_pure(List (Pair String Bool), append (Pair String Bool) rows more)))
+         (Nil (Pair String Bool)) ss_files;
+       precision_run("source-spans", append (Pair String Bool) ss_laws file_rows)

@@ -1,23 +1,14 @@
-<p align="center">
-  <img
-    width="100%"
-    src="https://capsule-render.vercel.app/api?type=waving&amp;height=220&amp;color=0:0B1220,50:1E1B4B,100:4F46E5&amp;text=BUILD&amp;fontColor=E2E8F0&amp;fontSize=54&amp;fontAlignY=50"
-    alt="BUILD banner"
-  />
-</p>
-
 # Build and bootstrap
 
 Ouro has a Python build driver, a transitional C bootstrap path, and
 content-addressed caches. The compiler-owned checker runs as an Ouro program;
-OCaml, opam, and Dune are retired from active builds and validation. The normal user path starts with
-`scripts/bootstrap.sh`; this page is for contributors who need to understand
-configuration, generated artifacts, or incremental behavior.
+OCaml, opam, and Dune are retired from active builds and validation. Follow
+[Getting started](getting_started.md#build-the-bootstrap-toolchain) for the
+first build; this page covers configuration, generated artifacts, and caches.
 
 ## Entry points
 
 ```sh
-sh scripts/bootstrap.sh
 python3 scripts/ouro_build.py build
 python3 scripts/ouro_build.py rebuild
 python3 scripts/ouro_build.py clean
@@ -28,6 +19,14 @@ python3 scripts/ouro_build.py config show
 
 `scripts/ouro1.sh` remains the user-facing wrapper for language and tooling
 commands. `scripts/coil.sh` is the project-facing name for the same toolchain.
+
+On Windows, the C bootstrap and C-hosted tools read arguments from the wide
+command line and convert them to UTF-8. Bootstrap file opens, checked file reads,
+and file/directory probes convert UTF-8 paths to Windows wide paths, including
+Unicode source filenames and imports. Invalid encoding is rejected; checked
+path inputs also reject embedded NUL bytes. The compatibility wrapper forwards
+each collected path as one literal argument, preserving spaces and wildcard
+characters. POSIX retains byte paths and argv.
 
 macOS host executables reserve a 128 MiB main-thread stack at link time through
 Mach-O's `-stack_size`, including historical bootstrap producers. This reserve
@@ -118,13 +117,14 @@ sh ./scripts/dune.sh runtest
 python ./scripts/kernel_differential_gate.py \
   --work _build/native-transition/baseline/kernel-differential \
   --report _build/native-transition/baseline/kernel-differential.json
-
-OURO_BUILD_DIR=_build/native-transition/baseline/build \
-OURO_C_BUILD_DIR=_build/native-transition/baseline/c \
-OURO_CACHE_DIR=_build/native-transition/baseline/cache \
-OURO_JOBS=2 OURO_FRONTEND_JOBS=1 \
-sh scripts/stage_loop.sh
 ```
+
+For the historical non-promoting
+[stage-loop invocation](#generated-artifacts-and-stage-loop), set
+`OURO_BUILD_DIR=_build/native-transition/baseline/build`,
+`OURO_C_BUILD_DIR=_build/native-transition/baseline/c`,
+`OURO_CACHE_DIR=_build/native-transition/baseline/cache`, `OURO_JOBS=2`, and
+`OURO_FRONTEND_JOBS=1` in that archived checkout.
 
 The stage-loop report is
 `_build/native-transition/baseline/build/stage_loop/result.json`. The compared
@@ -220,19 +220,12 @@ Readback requires a full image buffer. This path does not provide power-loss
 durability, native cache transactions, or isolated-host bootstrap evidence.
 See [the runtime contract](effects_design.md#runtime-surface) for rename errors.
 
-Repository-control-plane and ordinary suite policy move first because they can
-be displaced without changing bootstrap semantics:
-
-```sh
-sh scripts/ouro_ci_gate.sh --profile host-bound --out _build/ouro_ci/host-bound
-```
-
-That report covers every repository-visible Python and shell path, recording
-its migration status, native replacement, concrete blocker, and evidence. Build,
-cache, stage-loop, compiler-measurement, hosted-network, memory-observer, and release
-paths remain host-bound until their exact capabilities and trust evidence exist
-natively. Do not hand-delete a build script merely because a downstream native
-gate exists.
+The [host-bound inventory](native_repo_gates.md#compatibility-and-host-reference-boundaries)
+records each Python and shell path's migration status, replacement, blocker,
+and evidence. Build, cache, stage-loop, compiler-measurement, hosted-network,
+memory-observer, and release paths remain host-bound until their exact
+capabilities and trust evidence exist natively. Do not delete a build script
+merely because a downstream native gate exists.
 
 ### Native transition dependency owners
 
@@ -255,12 +248,17 @@ checking may still be required by release validation.
 
 ## Configuration
 
-Project defaults live in `Ouro.seal` under the `build` and `cache` blocks.
+Project defaults live in [Ouro.seal](../Ouro.seal) under the `build` and `cache` blocks.
 See [Packages](pkg.md) for the seal syntax. Configuration precedence is:
 
 ```text
 command line > environment > project configuration > built-in defaults
 ```
+
+The parser accepts `project`, `build`, `cache`, `deps`, `registry`, and `trust`
+blocks and rejects unknown blocks or keys. Remove the retired `build.dune`
+and `cache.dune` keys from older projects. Trust-key migration and the meaning
+of declared trust are covered by [TCB](tcb.md).
 
 The build driver configures the profile, parallelism, C compiler, optimization,
 build and cache directories, optional `ccache`, verbosity, and reproducibility
@@ -314,19 +312,23 @@ pre-existing Ouro executable. The driver performs four stages:
    also pass the positive and exact negative String-index checks before it is
    published as the current compiler.
 
+Release builds use `--compact-sources` to emit P2 from a separately checked
+compact copy while retaining P1's original inputs. The transformation, equality
+checks, and evidence are specified in [Canonical source](canonical_source.md#materialization).
+
 The String-index probes use the frozen, ordered import closure of
 `std/data.ouro`, including its transitive dependencies. They do not maintain a
 second handwritten stdlib unit list; missing units remain bootstrap failures.
 
 The [bootstrap input manifest](../compiler/bootstrap/c-bootstrap-v1.json) records
 68 input files: 58 historical Ouro sources and two five-file runtime sets. It
-pins every file's size and SHA-256, the archive's 214,587 bytes, and the
-committed stage0 pair. The C0 runtime matches that seed; the historical bridge
-sources and runtime remain unchanged. The manifest's `seed_refresh` records the
-previous seed hashes, changed C0 runtime members, and source and stage-loop
-evidence. Its lineage retains the four historical representation omissions and
-all reviewed compatibility edits. These pinned inputs stay separate from the
-current source snapshot and its acceptance checks. They remain temporary inputs
+pins every file's size and SHA-256, the archive, and the committed stage0 pair.
+The C0 runtime matches that seed. The manifest's `syntax_refresh` records the
+reviewed parser backport that lets the bridge read current
+[ergonomic syntax](language/ergonomic-syntax.md), with its patch and member hashes.
+The historical checker, runtime, and stage0 pair retain their previous bytes.
+The lineage also records earlier seed and compatibility changes. These pinned
+inputs stay separate from the current source snapshot and its acceptance checks
 until the native bootstrap can replace this C-hosted chain.
 
 The consumer validates the entire archive inventory before extraction. It
@@ -464,28 +466,24 @@ promotion writer normalizes it to LF, so drift checks compare promotion-normaliz
 bytes as well as raw staging hashes. Hand editing a generated stage0 file breaks
 the reproducibility model.
 
-The heavier CI profile is:
+[CI](ci.md#local-profiles) owns the heavier stage-loop profile for compiler,
+frontend, extraction, backend, or promotion changes.
+
+Committed standard-library API pages under `docs/api/` are generated from Ouro
+source. Regenerate them with:
 
 ```sh
-python3 scripts/ci_gate.py --profile stage-loop --out _build/ci/stage-loop
+sh scripts/doc_suite.sh --regen
 ```
 
-Use it for compiler, frontend, extraction, backend, or promotion changes on a
-host with sufficient resources.
+Review the resulting diff, then run `sh scripts/doc_suite.sh`; do not hand-edit
+generated API pages.
 
 ## Compiler checking
 
-The checker is built and tested through the current Ouro producer:
-
-```sh
-sh scripts/test_suite.sh --compiler-checking
-python3 scripts/ci_gate.py --profile kernel --out _build/ci/kernel
-```
-
-The profile retains its command name and requires canonical compiler laws,
-boundary policy, hardening, generated Core cases, and scale/depth probes.
-Missing required tools or failed probes block the profile. See
-[Compiler checking](kernel_design.md) and [CI](ci.md).
+[Compiler checking](kernel_design.md) defines the declaration contract;
+[CI](ci.md#local-profiles) owns its required commands and profiles. Missing
+required tools or failed probes block the profile.
 
 ## Memory behavior
 
@@ -616,11 +614,3 @@ python3 scripts/bench_suite.py --out _build/bench
 
 The benchmark harness records local cold and warm timings. Results are evidence
 for a specified host and command, not a repository-wide performance claim.
-
-<p align="center">
-  <img
-    width="100%"
-    src="https://capsule-render.vercel.app/api?type=waving&amp;height=220&amp;color=0:0B1220,50:1E1B4B,100:4F46E5&amp;section=footer"
-    alt=""
-  />
-</p>

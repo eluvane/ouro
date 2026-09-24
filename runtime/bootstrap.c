@@ -39,7 +39,7 @@ static ouro_v *find_in(const char *name, int n, const char *(*nm)(int),
 
 static ouro_v *file_codes(const char *path)
 {
-	FILE *f = fopen(path, "rb");
+	FILE *f = ouro_host_fopen(path, "rb");
 	unsigned char *buf;
 	long len;
 	ouro_v *v;
@@ -707,7 +707,7 @@ static int write_checked_program(const char *path, unsigned long fuel)
 		report_checked_error(result);
 		return 1;
 	}
-	file = fopen(path, "wb");
+	file = ouro_host_fopen(path, "wb");
 	if (file == 0) {
 		fprintf(stderr, "ouro1: cannot write checked program %s\n", path);
 		return 1;
@@ -753,6 +753,10 @@ int main(int argc, char **argv)
 	int nunits = 0;
 	int i;
 
+	if (!ouro_host_utf8_argv(&argc, &argv)) {
+		fputs("ouro1: invalid Windows command line\n", stderr);
+		return 73;
+	}
 	i = 1;
 	if (argc >= 2 && strcmp(argv[1], "check") == 0) {
 		check_only = 1;

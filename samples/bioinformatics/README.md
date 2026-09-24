@@ -1,11 +1,3 @@
-<p align="center">
-  <img
-    width="100%"
-    src="https://capsule-render.vercel.app/api?type=waving&amp;height=220&amp;color=0:0B1220,50:1E1B4B,100:4F46E5&amp;text=BIO&amp;fontColor=E2E8F0&amp;fontSize=54&amp;fontAlignY=50"
-    alt="BIO banner"
-  />
-</p>
-
 # Typed bioinformatics examples
 
 These examples use the generic external-tool layer in
@@ -63,31 +55,18 @@ from the wrong process stage.
 
 ## What the examples establish
 
-For values built through the demonstrated adapters, the types check represented
-workflow compatibility and stage identity. The process layer also requires a
-successful exit and expected output file before constructing the supported
-typed result.
+The [process boundary](../scientific/README.md#process-boundary) controls
+construction of successful stage evidence; the indices above check domain
+compatibility.
 
 The examples do not parse FASTQ, BAM, VCF, GTF, reference, or matrix contents.
-They do not verify biological assumptions, sample identity, executable
-versions, environments, bit reproducibility, or scientific correctness.
+They do not verify biological assumptions, sample identity, or scientific
+correctness. Process and reproducibility limits are defined in the
+[reusable layer](../scientific/README.md#identity-and-reproducibility).
 
 ## Run the suite
 
-```sh
-sh scripts/ouro1.sh check samples/bioinformatics/bio.ouro
-sh scripts/ouro1.sh check samples/bioinformatics/hela_rnaseq.ouro
-sh scripts/ouro1.sh check samples/bioinformatics/variant_calling.ouro
-sh scripts/samples_suite.sh
-```
-
-The suite checks the reusable layer, both vertical slices, their executable
-fixtures, golden output, and the negative type-error cases.
-
-<p align="center">
-  <img
-    width="100%"
-    src="https://capsule-render.vercel.app/api?type=waving&amp;height=220&amp;color=0:0B1220,50:1E1B4B,100:4F46E5&amp;section=footer"
-    alt=""
-  />
-</p>
+Use the samples suite from [CI](../../docs/ci.md). It checks the reusable layer,
+both vertical slices, executable fixtures, golden output, and negative
+type-error cases. Individual modules use the
+[module checker](../../docs/tooling.md#check-and-evaluate).

@@ -118,6 +118,14 @@ def write_strategies(data, path=None):
         CONTRACT_PATH.write_text(json.dumps({"kind": "ouro.smith-diagnostic-contract.v1", "mutations": data["layers"]["surface"]["negative_strategies"]}, indent=1, sort_keys=True) + "\n", encoding="utf-8", newline="\n")
 
 
+def native_negative_labels(source):
+    trivia = r"(?:\s|--[^\n]*)*"
+    calls = (r"(?<![\w'.])(?:smith_negative_(?:body|one|nested)|SmithNegativeOf)"
+             + trivia + r"(?:\(" + trivia + r")?\"(?P<label>[a-z0-9-]+)\"")
+    pattern = r'--[^\n]*|"(?:\\.|[^"\\])*"|' + calls
+    return {match["label"] for match in re.finditer(pattern, source) if match["label"] is not None}
+
+
 def compare(inventory, strategies, *, coverage=None):
     problems = []
     kernel = strategies.get("layers", {}).get("kernel", {})
@@ -152,7 +160,7 @@ def compare(inventory, strategies, *, coverage=None):
     # Labels come from actual native law inputs; a changed label cannot silently
     # retain a formerly recorded strategy under the host protocol.
     source = (ROOT / "tests/compiler_smith_negative.ouro").read_text(encoding="utf-8")
-    labels = set(re.findall(r'(?:smith_negative_(?:body|one|nested)|SmithNegativeOf)\s+"([a-z0-9-]+)"', source))
+    labels = native_negative_labels(source)
     if not set(NEGATIVES).issubset(labels):
         problems.append("native negative protocol differs from the typed source fixtures")
     if coverage is not None:

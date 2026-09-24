@@ -1,11 +1,3 @@
-<p align="center">
-  <img
-    width="100%"
-    src="https://capsule-render.vercel.app/api?type=waving&amp;height=220&amp;color=0:0B1220,50:1E1B4B,100:4F46E5&amp;text=PACKAGES&amp;fontColor=E2E8F0&amp;fontSize=54&amp;fontAlignY=50"
-    alt="PACKAGES banner"
-  />
-</p>
-
 # Packages
 
 `ouro-pkg.exe` resolves, vendors, locks and verifies packages. It reads
@@ -58,22 +50,6 @@ project {
   version = "0.1.0"
 }
 
-build {
-  profile = "dev"
-  jobs = 10
-  cc = "cc"
-  opt = "O1"
-  out = "_build"
-  c_out = "_build/c"
-}
-
-cache {
-  enabled = true
-  dir = "_cache/ouro"
-  size = "2048mb"
-  cleanup = "lru"
-}
-
 deps {
   greet = "^0.1.0"
 }
@@ -82,22 +58,11 @@ registry {
   source = "../registry"
 }
 
-trust {
-  compiler = "required"
-  generated = "checked"
-  effects = "outside-checker"
-}
 ```
 
-The build configuration parser recognizes `project`, `build`, `cache`, `deps`,
-`registry`, and `trust`, and rejects unknown blocks and keys. The package tool
-reads `project`, `deps`, and `registry` while preserving other blocks.
-The retired `build.dune`, `cache.dune`, and `trust.kernel` keys are rejected by
-the build parser; remove the Dune keys and use `trust.compiler` when migrating
-an older project configuration.
-
-`trust` is declared intent. It does not enlarge the checker or attest program
-acceptance. See [Trusted computing base](tcb.md).
+The package tool reads `project`, `deps`, and `registry` while preserving
+other blocks. [Build configuration](build.md#configuration) owns `build` and
+`cache`; [Trusted computing base](tcb.md) explains the `trust` declaration.
 
 Supported ranges include `*`, exact versions, `^x.y.z`, `~x.y.z`, and the
 ordinary comparison operators. `add` rejects a range that does not parse as
@@ -125,8 +90,7 @@ registry/
     src/lib.ouro
 ```
 
-The current layout stores one version of each package name. It does not resolve
-multiple versions or fetch packages from a network service.
+The current layout stores one directory per package name.
 
 Registry package directories and copied files must be canonical regular
 directories/files beneath the configured registry root. Symlinks, Windows
@@ -161,34 +125,19 @@ as empty. `verify` recomputes that digest and typechecks every installed
 `OURO_PKG_CHECK` no longer selects a checker. Each source has a provisional
 120-second, one-CPU, 3072-MiB child-tree limit and 16 MiB per captured stream.
 
-The current digest detects drift but is not a cryptographic signature and does
-not authenticate a package. The seal and lock formats remain experimental
-before 1.0.
+The digest detects drift; [current limits](#current-limits) describe what it
+does not authenticate. The seal and lock formats remain experimental before 1.0.
 
 ## Current limits
 
-The package tool does not yet provide:
+Packages use one version per name from a local registry. There is no public or
+network registry, authenticated source or cryptographic content hash, `pkg:`
+import scheme, or `coil publish` command. The seal and lock formats follow the
+[pre-1.0 compatibility policy](stability.md#experimental-areas).
 
-- a public or network registry (`ouro.land` / `rings/` is a name, not a service);
-- authenticated package sources;
-- cryptographic content hashes;
-- multiple installed versions of one package;
-- a `pkg:` import scheme;
-- a `coil publish` command;
-- a stable compatibility promise for the seal or lock format.
-
-The retained package regression suite owns the installation, lock and
-verification assertions. Its candidate provisioning must supply the
-direct-PE package executable and sibling checker for native acceptance:
+Native acceptance must provision a direct-PE package executable and its
+sibling checker before running the retained package suite:
 
 ```sh
 sh scripts/pkg_suite.sh
 ```
-
-<p align="center">
-  <img
-    width="100%"
-    src="https://capsule-render.vercel.app/api?type=waving&amp;height=220&amp;color=0:0B1220,50:1E1B4B,100:4F46E5&amp;section=footer"
-    alt=""
-  />
-</p>

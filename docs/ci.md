@@ -1,16 +1,29 @@
-<p align="center">
-  <img
-    width="100%"
-    src="https://capsule-render.vercel.app/api?type=waving&amp;height=220&amp;color=0:0B1220,50:1E1B4B,100:4F46E5&amp;text=CI&amp;fontColor=E2E8F0&amp;fontSize=54&amp;fontAlignY=50"
-    alt="CI banner"
-  />
-</p>
-
 # Continuous integration
 
 Ouro keeps the authoritative validation commands in repository scripts. GitHub
 Actions invokes the same profiles that contributors can run locally and uploads
 reports from `_build/`.
+
+## Validation matrix
+
+Start with the suite for the changed layer. The PR profile is the broader local
+check before review when feasible; a focused pass does not establish full PR
+readiness. Missing host tools, timeouts, skipped probes, and incomplete reports
+are not passes.
+
+| Change | Focused command |
+| --- | --- |
+| Documentation and examples | `python3 scripts/docs_examples_gate.py` |
+| Public repository metadata | `python3 scripts/github_project_gate.py` |
+| Workflow policy | `python3 scripts/github_workflow_gate.py` |
+| Formatter / fixer | `sh scripts/fmt_suite.sh` / `sh scripts/fix_suite.sh` |
+| Linter / analyzer | `sh scripts/lint_suite.sh` / `sh scripts/analyze_precision_suite.sh` |
+| Packages / LSP | `sh scripts/pkg_suite.sh` / `sh scripts/lsp_suite.sh` |
+| Runtime and IO / samples | `sh scripts/runtime_io_suite.sh` / `sh scripts/samples_suite.sh` |
+| User test runner | `sh scripts/test_suite.sh` |
+| Compiler checking | `sh scripts/test_suite.sh --compiler-checking` and `python3 scripts/ci_gate.py --profile kernel --out _build/ci/kernel` |
+| Generated API reference | Regenerate through [Build](build.md#generated-artifacts-and-stage-loop), then `sh scripts/doc_suite.sh` |
+| Bootstrap or stage0 | [Stage-loop profile](#local-profiles); see [promotion](build.md#generated-artifacts-and-stage-loop) |
 
 ## Local profiles
 
@@ -42,28 +55,16 @@ python3 scripts/ci_gate.py --profile pr --list
 
 The complete local PR inventory has seventeen isolated groups. GitHub selects
 affected groups and gates for reviewed tool paths; main-branch pushes, merge
-queues and manual CI runs select the complete inventory except the manual-only
-`lint` group:
+queues and manual CI runs select the complete inventory except `lint`, which
+runs in Nightly and on demand. Run one group with:
 
 ```sh
 python3 scripts/ci_gate.py --profile pr --group checks
-python3 scripts/ci_gate.py --profile pr --group analysis
-python3 scripts/ci_gate.py --profile pr --group checker
-python3 scripts/ci_gate.py --profile pr --group analyzer
-python3 scripts/ci_gate.py --profile pr --group lint
-python3 scripts/ci_gate.py --profile pr --group tests
-python3 scripts/ci_gate.py --profile pr --group smith
-python3 scripts/ci_gate.py --profile pr --group samples-1
-python3 scripts/ci_gate.py --profile pr --group samples-2
-python3 scripts/ci_gate.py --profile pr --group compiler-1
-python3 scripts/ci_gate.py --profile pr --group compiler-2
-python3 scripts/ci_gate.py --profile pr --group compiler-3
-python3 scripts/ci_gate.py --profile pr --group compiler-4
-python3 scripts/ci_gate.py --profile pr --group compiler-5
-python3 scripts/ci_gate.py --profile pr --group compiler-6
-python3 scripts/ci_gate.py --profile pr --group compiler-7
-python3 scripts/ci_gate.py --profile pr --group compiler-8
 ```
+
+The group names are `checks`, `analysis`, `checker`, `analyzer`, `lint`,
+`tests`, `smith`, `samples-1`, `samples-2`, and `compiler-1` through
+`compiler-8`. Substitute the selected name after `--group`.
 
 `--group` supports PR, nightly, manual, kernel, stage-loop, docs, and kernel-extra profiles.
 `--list-groups` prints the selected profile's complete group list as JSON;
@@ -75,11 +76,20 @@ local command runs every gate in registry order. The runner rejects a group
 inventory that omits, duplicates, or invents a gate; its self-test also checks
 complete matrix coverage and the affected-path routing contracts. The
 `analysis` group owns memory budgets, C analysis, and LSP; `checker` owns
-hardening, scale, and depth; analyzer precision runs independently. The full
-Ouro lint suite runs in GitHub only through **Lint → Run workflow** or the full
-**Manual** workflow. PR, push, merge-queue, Nightly and Release jobs exclude its
-group. Local profiles and `sh scripts/lint_suite.sh` retain the complete suite;
-Python/shell lint and the other quality gates keep their existing schedules.
+hardening, scale, and depth; `analyzer` owns analyzer precision and
+`lint-changed`. The complete Ouro lint suite runs in Nightly, the full
+**Manual** workflow, and **Lint → Run workflow**; PR, push, merge-queue and
+Release jobs exclude its group. A pull request instead runs `lint-changed`:
+`ouro1 lint --deny` over the changed `.ouro` files that the complete suite's
+production sweep would select from `std/`, `compiler/`, `tools/`, and
+`samples/`. It reads the directory and file exclusions from
+`tools/lint_worker.ouro` and `tools/quality/source.ouro`; the package sample
+stays with the complete suite because it needs a vendored snapshot. Findings
+that a change causes in unchanged files are left to Nightly. Without a routing
+plan, as in local, Manual and Release runs, `lint-changed` is reported as
+skipped and the complete `lint` group owns coverage. Local profiles and
+`sh scripts/lint_suite.sh` retain the complete suite; Python/shell lint and the
+other quality gates keep their existing schedules.
 Execution removes the previous `ci-summary.json` before starting gates, so an
 interrupted run leaves no old successful aggregate at the current report path.
 The native CI runner also invalidates selected gate reports and the delegated
@@ -145,7 +155,7 @@ Existing suite assertions and required gates remain in place;
 these explicit invocations do not establish native bootstrap or retire the
 full PR profile.
 
-Nightly uses `checks`, `analysis`, `analyzer`, `tests`, `samples-1`, `samples-2`, `kernel`,
+Nightly uses `checks`, `analysis`, `analyzer`, `lint`, `tests`, `samples-1`, `samples-2`, `kernel`,
 `trust`, and `compiler-1` through `compiler-8` groups. The `trust` job runs the stage-loop fixpoint/drift gate and
 then the deeper OuroSmith profile in the same checkout. `Full` runs even after
 a job failure and fails unless every matrix group succeeds. Reports are
@@ -211,7 +221,8 @@ The explicit routing table in `scripts/ci_gate.py` currently covers these inputs
 Every code route retains repository policy, Python/shell lint, API drift,
 generated hashes, compiler boundary, strict and structural quality, documentation
 examples, hygiene, and the test/Smith/sample integration suites. The local plan
-also retains lint, which the hosted matrix excludes for manual execution. The table
+also retains the complete lint gate, which the hosted matrix excludes; a route
+that changes production `.ouro` sources selects `lint-changed`. The table
 selects existing gates; it does not change their assertions or profiles.
 Unlisted files select the complete PR inventory and portable checks. Changes
 to compiler, runtime and standard library inputs also retain kernel-extra.
@@ -497,24 +508,15 @@ sh scripts/ouro_ci_gate.sh --profile pr-native --out _build/ouro_ci/pr-native
 sh scripts/ouro_ci_gate.sh --profile host-bound --out _build/ouro_ci/host-bound
 ```
 
-The native launchers select their backend explicitly and print
-`EXECUTION_BACKEND=ouro-native-repo-gate` or
-`EXECUTION_BACKEND=ouro-native-ci-gate`. Unknown options, profiles, and gate
-names, missing option values, positional arguments, and zero selected gates are
-usage errors with exit status 2. The special `host-bound` profile rejects
-`--gate` because it has one fixed inventory operation.
+[Native repository gates](native_repo_gates.md#explicit-execution-paths)
+defines backend markers, strict CLI selection, report evidence, and retirement
+conditions.
 
 `pr-native` runs the Ouro-native docs, project-surface, and workflow gate subset.
 It is useful for repository-control-plane changes, but it is not full parity
 with `python3 scripts/ci_gate.py --profile pr`. The Python PR profile remains the
 compatibility/reference full PR readiness path for broad suites, bootstrap
 evidence, cache parity, release packaging, and specialized analyzer checks.
-
-`control-plane-native` adds complete Python/shell inventory coverage,
-wrapper/reference consistency checks, host-bound report generation, and the
-Ouro-owned 64-row displacement, checker-regression, fail-closed inventory, and
-manifest-validation fixture suite. `retirement` adds stricter failure behavior
-for stale metadata and rejects any remaining `migration_status=migrate` row.
 
 Repository suites for manifests, formatting, documentation, lines, native lint
 fixtures, runtime IO, user tests, samples, and quickstart now keep their cases
@@ -526,10 +528,8 @@ host-bound Python Clippy-grade fixture suite. `scripts/process_stdin.sh` is the
 minimal
 stdin adapter until `proc_exec` grows a typed stdin argument.
 
-Python and shell scripts remain only as bootstrap, reference, suite, or
-compatibility layers where parity is incomplete. Do not delete a host script
-unless the Ouro-native replacement has matching behavior, focused parity
-evidence, updated docs, no active references, and no bootstrap dependency.
+Host-script retirement follows the evidence rules in
+[Native repository gates](native_repo_gates.md#compatibility-and-host-reference-boundaries).
 
 ## Hosted workflows
 
@@ -540,14 +540,11 @@ evidence, updated docs, no active references, and no bootstrap dependency.
 | `ouro-manual-trust.yml` | On-demand check profiles |
 | `dependency-review.yml` | Changed dependency and workflow checks |
 | `ouro-lint.yml` | Full Ouro lint suite, manual dispatch only |
-| `ouro-release.yml` | Build host toolchains and publish tag drafts and weekly snapshots |
+| `ouro-release.yml` | Build host toolchains and publish tag drafts and snapshots every three days |
 | `ouro-pages.yml` | Test, lint, and build `site/` on PRs and pushes; publish GitHub Pages from `main` |
 
-The release workflow builds host `ouro1` on macOS x86_64 (`darwin`), macOS ARM
-(`darwin_aarch64`), Linux x86_64 (`linux`), Linux ARM (`linux_aarch64`), and
-Windows x86_64 (`windows`). It publishes `ouro-<version>-<platform>.tar.zst`
-and `.zip` for each of those names. Those build and assemble jobs stay
-read-only.
+The release workflow builds the host toolchains described in
+[Releasing](releasing.md). Its build and assemble jobs stay read-only.
 
 Hosted path selection is fail-closed for validation: missing revisions, a Git
 error, or an empty diff runs every applicable job. An editor-only change runs
@@ -573,7 +570,7 @@ paths changed.
 
 Workflow permissions are explicit. Validation jobs are read-only; release
 publication requests write access only in the tag-gated draft job and the
-guarded weekly snapshot job. The public
+guarded snapshot job. The public
 site workflow requests `pages` and `id-token` write only in the main-branch
 publish job. External actions are pinned to a full commit SHA.
 
@@ -726,20 +723,11 @@ they are very conservative.
 
 ## Documentation and repository checks
 
-The public repository surface keeps compatibility entry points for callers that
-still use the old command names:
-
-```sh
-python3 scripts/docs_examples_gate.py
-python3 scripts/github_project_gate.py
-python3 scripts/github_workflow_gate.py
-```
-
-These wrappers remove any previous native report before delegation and require a
-fresh `ouro.repo-gate-report.v1` for the requested profile. Missing, malformed,
-stale, empty-gate, backend-mismatched, or return-code-inconsistent evidence is
-blocking. Their legacy reports record `mode=compatibility-wrapper`, the delegated
-backend, native and effective return codes, and native report validity.
+The [validation matrix](#validation-matrix) lists the documentation, project,
+and workflow compatibility entry points. Their wrappers delegate to native
+profiles and require a fresh, passing native report.
+[Native repository gates](native_repo_gates.md#compatibility-and-host-reference-boundaries)
+defines the fail-closed report contract.
 
 The Ouro-native `docs` profile covers canonical docs, Markdown inventory metrics
 including base-ref comparison when available, docs index links, relative links,
@@ -755,18 +743,9 @@ preserves the legacy report kind and path while delegating local project policy
 to this native profile. Hosted GitHub/API reachability remains host-bound and is
 recorded by `scripts/github_project_hosted_probe.py` when explicitly run.
 
-The Ouro-native `workflow` profile parses the supported repository-owned YAML
-mapping structure instead of searching raw text. Comments and block-scalar text
-cannot satisfy required triggers, permissions, concurrency, jobs, or artifact
-steps. Duplicate keys and unsupported anchors, aliases, merge keys, tags, flow
-mappings, quoted/complex keys, or tab indentation fail closed. Privileged
-triggers, `continue-on-error`, broad write permissions, and mutable external
-action refs are rejected structurally. Write exceptions are the exact
-draft-publish job with its tag guard and draft release command, the exact
-weekly snapshot job with its main-branch schedule or dispatch guard, and the
-exact pages publish job with its main-branch push guard and official
-deploy-pages action. `scripts/github_workflow_gate.py` preserves the legacy CLI/report path while
-delegating policy to this native profile.
+The Ouro-native `workflow` profile applies the structured, fail-closed YAML
+policy in [Native repository gates](native_repo_gates.md#compatibility-and-host-reference-boundaries).
+`scripts/github_workflow_gate.py` preserves the legacy CLI and report path.
 
 `sh scripts/frontend_security_suite.sh` is a blocking PR check for malformed and
 fuel-exhausted lexer results plus safe `--module` C-symbol suffix handling.
@@ -785,11 +764,3 @@ triggers, or hosted-only services require an explicit security review.
 A new Ouro-native gate can be added under `tools/repo_gate/` or
 `tools/ci_gate/` when it has focused coverage, deterministic listing, stable
 reports, and clear parity boundaries with the Python or shell reference path.
-
-<p align="center">
-  <img
-    width="100%"
-    src="https://capsule-render.vercel.app/api?type=waving&amp;height=220&amp;color=0:0B1220,50:1E1B4B,100:4F46E5&amp;section=footer"
-    alt=""
-  />
-</p>

@@ -229,6 +229,7 @@ ATTACK_BUILD="$ATTACK_ROOT/_build"
 mkdir -p "$ATTACK_BUILD"
 OUTSIDE="$OUT/outside.ouro"
 ATTACK_DOC="$ATTACK_ROOT/main.ouro"
+printf -- 'def allowed_name : Nat := Z;\n' >"$ATTACK_ROOT/allowed.ouro"
 printf -- 'def secret_outside : Nat := Z;\n' >"$OUTSIDE"
 printf -- 'import "../outside.ouro";\n\ndef local : Nat := secret\n' >"$ATTACK_DOC"
 ATTACK_URI=$(uri_of_path "$ATTACK_DOC")
@@ -243,6 +244,10 @@ esac
 	frame "{\"jsonrpc\":\"2.0\",\"id\":101,\"method\":\"textDocument/completion\",\"params\":{\"textDocument\":{\"uri\":\"$ATTACK_URI\"},\"position\":{\"line\":2,\"character\":25}}}"
 	frame "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didChange\",\"params\":{\"textDocument\":{\"uri\":\"$ATTACK_URI\",\"version\":2},\"contentChanges\":[{\"text\":\"import \\\"$OUTSIDE_HOST\\\";\\n\\ndef local : Nat := secret\\n\"}]}}"
 	frame "{\"jsonrpc\":\"2.0\",\"id\":102,\"method\":\"textDocument/completion\",\"params\":{\"textDocument\":{\"uri\":\"$ATTACK_URI\"},\"position\":{\"line\":2,\"character\":25}}}"
+	frame "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didChange\",\"params\":{\"textDocument\":{\"uri\":\"$ATTACK_URI\",\"version\":3},\"contentChanges\":[{\"text\":\"import \\\"allowed.ouro\\\", -- second path\\n \\\"../outside.ouro\\\",;\\n\\ndef local : Nat := secret\\n\"}]}}"
+	frame "{\"jsonrpc\":\"2.0\",\"id\":109,\"method\":\"textDocument/completion\",\"params\":{\"textDocument\":{\"uri\":\"$ATTACK_URI\"},\"position\":{\"line\":3,\"character\":25}}}"
+	frame "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didChange\",\"params\":{\"textDocument\":{\"uri\":\"$ATTACK_URI\",\"version\":4},\"contentChanges\":[{\"text\":\"import \\\"allowed.ouro\\\", \\\"$OUTSIDE_HOST\\\";\\n\\ndef local : Nat := secret\\n\"}]}}"
+	frame "{\"jsonrpc\":\"2.0\",\"id\":110,\"method\":\"textDocument/completion\",\"params\":{\"textDocument\":{\"uri\":\"$ATTACK_URI\"},\"position\":{\"line\":2,\"character\":25}}}"
 	frame '{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"untitled:outside","languageId":"ouro","version":1,"text":"secret"}}}'
 	frame '{"jsonrpc":"2.0","id":103,"method":"textDocument/completion","params":{"textDocument":{"uri":"untitled:outside"},"position":{"line":0,"character":6}}}'
 	frame '{"jsonrpc":"2.0","id":104,"method":"shutdown","params":{}}'
@@ -274,6 +279,55 @@ want_attack() {
 want_attack traversal-completion-empty '"id":101,"result":\[\]'
 want_attack absolute-completion-empty '"id":102,"result":\[\]'
 want_attack non-file-uri-empty '"id":103,"result":\[\]'
+want_attack grouped-traversal-completion-empty '"id":109,"result":\[\]'
+want_attack grouped-absolute-completion-empty '"id":110,"result":\[\]'
+
+# Group operands all enter the index, and unsaved multiline groups retain
+# every authorized path when relocated to the private checker scratch file.
+GROUP_DIR="$OUT/group-imports"
+mkdir -p "$GROUP_DIR"
+GROUP_LEFT="$GROUP_DIR/left.ouro"
+GROUP_RIGHT="$GROUP_DIR/right.ouro"
+GROUP_DOC="$GROUP_DIR/main.ouro"
+GROUP_BUFFER="$GROUP_DIR/buffer.ouro"
+printf -- 'inductive LspGroupNat : Type := | LspGroupZero : LspGroupNat;\n' >"$GROUP_LEFT"
+printf -- 'import "left.ouro";\ndef lsp_group_right : LspGroupNat := LspGroupZero;\n' >"$GROUP_RIGHT"
+printf -- 'import "left.ouro", "right.ouro";\n\ndef use_group : LspGroupNat := lsp_group_right;\n' >"$GROUP_DOC"
+printf -- 'import -- first operand\n "left.ouro", -- second operand\n "right.ouro",;\n\ndef use_group : LspGroupNat := lsp_group_right;\n' >"$GROUP_BUFFER"
+GROUP_URI=$(uri_of_path "$GROUP_DOC")
+GROUP_RIGHT_URI=$(uri_of_path "$GROUP_RIGHT")
+{
+	frame '{"jsonrpc":"2.0","id":200,"method":"initialize","params":{"capabilities":{}}}'
+	frame '{"jsonrpc":"2.0","method":"initialized","params":{}}'
+	frame "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":{\"uri\":\"$GROUP_URI\",\"languageId\":\"ouro\",\"version\":1,\"text\":\"$(json_text "$GROUP_DOC")\"}}}"
+	frame "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didChange\",\"params\":{\"textDocument\":{\"uri\":\"$GROUP_URI\",\"version\":2},\"contentChanges\":[{\"text\":\"$(json_text "$GROUP_BUFFER")\"}]}}"
+	frame "{\"jsonrpc\":\"2.0\",\"id\":201,\"method\":\"textDocument/hover\",\"params\":{\"textDocument\":{\"uri\":\"$GROUP_URI\"},\"position\":{\"line\":4,\"character\":34}}}"
+	frame "{\"jsonrpc\":\"2.0\",\"id\":202,\"method\":\"textDocument/definition\",\"params\":{\"textDocument\":{\"uri\":\"$GROUP_URI\"},\"position\":{\"line\":4,\"character\":34}}}"
+	frame '{"jsonrpc":"2.0","id":203,"method":"shutdown","params":{}}'
+	frame '{"jsonrpc":"2.0","method":"exit"}'
+} >"$OUT/group-imports.in"
+set +e
+OURO_ROOT="$ROOT" "$LSP" <"$OUT/group-imports.in" >"$OUT/group-imports.out" 2>"$OUT/group-imports.err"
+group_status=$?
+set -e
+tr '\r' '\n' <"$OUT/group-imports.out" | grep '^{' >"$OUT/group-imports.jsonl" || true
+if [ "$group_status" -eq 0 ] && [ ! -s "$OUT/group-imports.err" ]; then
+	ok "group import session exits cleanly"
+else
+	bad group-import-session "status=$group_status"
+fi
+group_clean=$(grep -c -- "\"uri\":\"$GROUP_URI\",\"diagnostics\":\[\]" "$OUT/group-imports.jsonl" || true)
+if [ "$group_clean" -eq 2 ]; then
+	ok "inline and unsaved multiline group diagnostics are clean"
+else
+	bad group-import-diagnostics "clean publishes=$group_clean want=2"
+fi
+if grep -q '"id":201,"result":{"contents".*def lsp_group_right' "$OUT/group-imports.jsonl" &&
+	grep -q "\"id\":202,\"result\":{\"uri\":\"$GROUP_RIGHT_URI\"" "$OUT/group-imports.jsonl"; then
+	ok "second group operand supplies hover and definition"
+else
+	bad group-import-index "second dependency missing from hover or definition"
+fi
 
 # A dirty buffer must keep its diagnostics when some other .ouro file
 # changes. The editor sends didChangeWatchedFiles for sibling saves; the

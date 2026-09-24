@@ -6,9 +6,10 @@
 -- process-lifetime, so a per-character Ouro loop over every file of an import
 -- cone costs gigabytes before the first warning prints.
 
-import "../std/io.ouro";
-import "../std/listx.ouro";
-import "../compiler/lexer.ouro";
+import "../std/io.ouro",
+  "../std/listx.ouro",
+  "../compiler/lexer.ouro",
+  "quality/import_scan.ouro";
 
 def ncodes (s : String) : List Nat := prim_string_to_char_codes s;
 def nstr (cs : List Nat) : String := prim_string_of_char_codes cs;
@@ -35,10 +36,10 @@ def skip_ws_n (xs : List Nat) : List Nat :=
 
 def take_ident_n (xs : List Nat) : Pair (List Nat) (List Nat) :=
     match xs with
-    | Nil => MkPair (List Nat) (List Nat) (Nil Nat) (Nil Nat)
+    | Nil => MkPair(List Nat, List Nat, Nil Nat, Nil Nat)
     | Cons c _ =>
         match source_is_ident_start c with
-        | False => MkPair (List Nat) (List Nat) (Nil Nat) xs
+        | False => MkPair(List Nat, List Nat, Nil Nat, xs)
         | True => span Nat source_is_ident_char xs
         end
     end;
@@ -75,7 +76,6 @@ def kw_intrinsic : List Nat := ncodes "intrinsic";
 def kw_extern : List Nat := ncodes "extern";
 def kw_ind : List Nat := ncodes "inductive";
 def kw_rec : List Nat := ncodes "record";
-def kw_imp : List Nat := ncodes "import";
 def kw_mod : List Nat := ncodes "module";
 def kw_where : List Nat := ncodes "where";
 def kw_end : List Nat := ncodes "end";
@@ -114,7 +114,7 @@ def harvest_ctor (t : List Nat) (acc : List String) : List String :=
   match t with
   | Cons c rest =>
       match eqNat c ch_bar with
-      | True => harvest_colon_name (skip_ws_n rest) acc
+      | True => harvest_colon_name(skip_ws_n rest, acc)
       | False => acc
       end
   | Nil => acc
@@ -127,24 +127,24 @@ def harvest_bars : List Nat -> List String -> List String :=
     | Nil => acc
     | Cons c rest =>
         match eqNat c ch_bar with
-        | True => harvest_bars rest (harvest_colon_name (skip_ws_n rest) acc)
+        | True => harvest_bars(rest, harvest_colon_name(skip_ws_n rest, acc))
         | False => harvest_bars rest acc
         end
     end;
 
 def harvest_kw_line (t : List Nat) (acc : List String) : List String :=
   match find (List Nat) (fun (kw : List Nat) =>
-    andb (starts_n kw t) (source_word_end (drop_n kw t))) harvest_kws with
+    andb(starts_n kw t, source_word_end (drop_n kw t))) harvest_kws with
   | Nothing => harvest_ctor t acc
   | Just kw =>
       match starts_n kw_ind t with
-      | True => harvest_bars t (harvest_from_kw t kw acc)
+      | True => harvest_bars(t, harvest_from_kw t kw acc)
       | False => harvest_from_kw t kw acc
       end
   end;
 
 def harvest_line (ln : String) (acc : List String) : List String :=
-  harvest_kw_line (skip_ws_n (line_codes ln)) acc;
+  harvest_kw_line(skip_ws_n (line_codes ln), acc);
 
 def harvest_names (src : String) : List String :=
   foldl String (List String)
@@ -157,10 +157,10 @@ def has_semi (t : List Nat) : Bool := elem Nat eqNat ch_semi t;
 -- and record fields also use `| name :` / `name :` lines and must stay out.
 def harvest_ctor_step (t : List Nat) (in_ind : Bool) (acc : List String)
     : Pair Bool (List String) :=
-    match orb in_ind (starts_n kw_ind t) with
+    match orb(in_ind, starts_n kw_ind t) with
     | False => MkPair Bool (List String) False acc
     | True =>
-        MkPair Bool (List String) (notb (has_semi t)) (harvest_bars t acc)
+        MkPair(Bool, List String, notb (has_semi t), harvest_bars t acc)
     end;
 
 -- Constructor names only, one-line and multi-line inductives alike.
@@ -180,12 +180,12 @@ def harvest_rec_step (t : List Nat) (in_rec : Bool) (acc : List String)
     match starts_n kw_rec t with
     | True => MkPair Bool (List String) True acc
     | False =>
-        match andb in_rec (starts_n kw_end t) with
+        match andb(in_rec, starts_n kw_end t) with
         | True => MkPair Bool (List String) False acc
         | False =>
             match in_rec with
             | False => MkPair Bool (List String) False acc
-            | True => MkPair Bool (List String) True (harvest_colon_name t acc)
+            | True => MkPair(Bool, List String, True, harvest_colon_name t acc)
             end
         end
     end;
@@ -204,45 +204,25 @@ def harvest_record_fields (src : String) : List String :=
         end
     end) (src_lines src) False (Nil String);
 
-def harvest_import_line (ln : String) : Maybe String :=
-    let t : List Nat := skip_ws_n (line_codes ln) in
-    match starts_n kw_imp t with
-    | False => Nothing String
-    | True =>
-        let after : List Nat := skip_ws_n (drop_n kw_imp t) in
-        match after with
-        | Cons c rest =>
-            match eqNat c ch_dq with
-            | False => Nothing String
-            | True =>
-                match span Nat (fun (d : Nat) => notb (eqNat d ch_dq)) rest with
-                | MkPair acc tail =>
-                    match tail with
-                    | Nil => Nothing String
-                    | Cons _ _ => Just String (nstr acc)
-                    end
-                end
-            end
-        | Nil => Nothing String
-        end
-    end;
-
-def harvest_imports (src : String) : List String :=
-  foldl String (List String)
-    (fun (acc : List String) (ln : String) =>
-      match harvest_import_line ln with
-      | Nothing => acc
-      | Just p => snoc_str acc p
-      end)
-    (Nil String) (src_lines src);
+def harvest_imports (src : String) : Either ImportScanError (List String) :=
+  match scan_source_imports src with
+  | Left e => Left ImportScanError (List String) e
+  | Right rows => Right ImportScanError (List String)
+      (foldl ScannedImport (List String)
+        (fun (acc : List String) (row : ScannedImport) =>
+          match row with
+          | MkScannedImport path _ _ _ _ _ => snoc_str acc path
+          end)
+        (Nil String) rows)
+  end;
 
 def last_slash (cs : List Nat) : Maybe Nat :=
   (fix go (xs : List Nat) (i : Nat) (hit : Maybe Nat) : Maybe Nat :=
     match xs with
     | Nil => hit
     | Cons c rest =>
-        match orb (eqNat c ch_slash) (eqNat c ch_bs) with
-        | True => go rest (S i) (Just Nat i)
+        match orb(eqNat c ch_slash, eqNat c ch_bs) with
+        | True => go(rest, S i, Just Nat i)
         | False => go rest (S i) hit
         end
     end) cs Z (Nothing Nat);
@@ -261,19 +241,19 @@ def dirname (p : String) : String :=
 def resolve_import (from_file : String) (spell : String) : String :=
     match ncodes spell with
     | Cons c rest =>
-        match orb (orb (eqNat c ch_slash) (eqNat c ch_bs))
+        match orb (orb(eqNat c ch_slash, eqNat c ch_bs))
           (match rest with
            | Cons d _ => eqNat d ch_colon
            | Nil => False
            end) with
         | True => spell
-        | False => concat (dirname from_file) (concat "/" spell)
+        | False => concat(dirname from_file, concat "/" spell)
         end
     | Nil => spell
     end;
 
 def indent_of (cs : List Nat) : List Nat :=
-  take_while Nat (fun (c : Nat) => orb (eqNat c ch_space) (eqNat c ch_tab)) cs;
+  take_while Nat (fun (c : Nat) => orb(eqNat c ch_space, eqNat c ch_tab)) cs;
 
 def rewrite_mod_def (pref : List Nat) (ln : List Nat) : List Nat :=
     let ind : List Nat := indent_of ln in
@@ -309,7 +289,7 @@ def expand_module_lines : List String -> List Nat -> List (List Nat)
             | MkPair name after =>
                 match andb
                   (match name with | Nil => False | Cons _ _ => True end)
-                  (starts_n kw_where (skip_ws_n after)) with
+                  (starts_n(kw_where, skip_ws_n after)) with
                 | True => go rest name acc
                 | False => go rest pref (Cons (List Nat) raw acc)
                 end
@@ -320,10 +300,10 @@ def expand_module_lines : List String -> List Nat -> List (List Nat)
             | True => go rest (Nil Nat) acc
             | False =>
                 match andb
-                  (orb (starts_n kw_def t) (starts_n kw_axiom t))
+                  (orb(starts_n kw_def t, starts_n kw_axiom t))
                   (match pref with | Nil => False | Cons _ _ => True end) with
                 | True =>
-                    go rest pref (Cons (List Nat) (rewrite_mod_def pref raw) acc)
+                    go rest pref (Cons(List Nat, rewrite_mod_def pref raw, acc))
                 | False => go rest pref (Cons (List Nat) raw acc)
                 end
             end
@@ -344,7 +324,7 @@ def join_lines (rev_lines : List (List Nat)) : List Nat :=
     end in
   concat_map (List Nat) Nat
     (fun (ln : List Nat) => append Nat ln (nat1 ch_lf))
-    (reverse (List Nat) body);
+    (reverse(List Nat, body));
 
 -- module Name where ... end;  -> prefix inner def/axiom names with Name_
 -- Files without the keyword anywhere (the common case) pass through untouched.
@@ -353,5 +333,5 @@ def expand_modules (src : List Nat) : List Nat :=
     match prim_string_contains text module_kw_text with
     | False => src
     | True =>
-        join_lines (expand_module_lines (src_lines text) (Nil Nat) (Nil (List Nat)))
+        join_lines (expand_module_lines(src_lines text, Nil Nat, Nil (List Nat)))
     end;

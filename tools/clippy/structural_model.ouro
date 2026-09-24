@@ -4,11 +4,11 @@
 -- This first slice deliberately does not infer imported types, call purity,
 -- indexed elimination, public ownership, or permission to edit an API.
 
-import "../quality/order.ouro";
-import "../quality/input_error.ouro";
-import "../../compiler/ast.ouro";
-import "../../std/string_prims.ouro";
-import "../../std/listx.ouro";
+import "../quality/order.ouro",
+  "../quality/input_error.ouro",
+  "../../compiler/ast.ouro",
+  "../../std/string_prims.ouro",
+  "../../std/listx.ouro";
 
 -- Named budgets used by the structural/semantic companion. Products of
 -- small literals keep C emit below clang's compound-literal nest limit;
@@ -19,7 +19,7 @@ def cg_s_build_fuel : Nat := mul 100 cg_s_k;
 def cm_type_alias_fuel : Nat := 256;
 def cm_visit_fuel : Nat := mul 64 64;
 def cm_analyze_depth : Nat := 16;
-def cm_node_inventory_limit : Nat := mul (mul 5 100) cg_s_k;
+def cm_node_inventory_limit : Nat := mul(mul 5 100, cg_s_k);
 def cm_body_tag : Nat := 300;
 def cm_import_graph_fuel : Nat := mul cg_s_k cg_s_k;
 def cm_load_queue_fuel : Nat := mul 100 cg_s_k;
@@ -43,24 +43,49 @@ inductive CgSFact : Type :=
   | CgSLet : Nat -> Nat -> Nat -> Nat -> Bool -> Bool -> CgSFact
   | CgSMatch : Nat -> Nat -> Nat -> Nat -> Maybe CgSAtom -> Bool -> CgSFact;
 
+def cg_s_node (fact : CgSFact) : Nat :=
+    match fact with
+    | CgSLet _ node _ _ _ _ => node
+    | CgSMatch _ node _ _ _ _ => node
+    end;
+
+-- The last two fields are the innermost enclosing token span and the span
+-- recorded for each fact node.
 inductive CgSState : Type :=
-  | MkCgSState : Nat -> Nat -> List CgSFact -> CgSState;
+  | MkCgSState : Nat -> Nat -> List CgSFact -> Maybe (Pair Nat Nat)
+      -> List (Pair Nat (Pair Nat Nat)) -> CgSState;
+
+def cg_s_walk0 : CgSState :=
+    MkCgSState(1, 0, Nil CgSFact, Nothing (Pair Nat Nat), Nil (Pair(Nat, Pair Nat Nat)));
 
 def cg_s_fresh (s : CgSState) : Nat :=
-    match s with | MkCgSState n _ _ => n end;
+    match s with | MkCgSState n _ _ _ _ => n end;
 
 def cg_s_nodes (s : CgSState) : Nat :=
-    match s with | MkCgSState _ n _ => n end;
+    match s with | MkCgSState _ n _ _ _ => n end;
 
 def cg_s_facts (s : CgSState) : List CgSFact :=
-    match s with | MkCgSState _ _ fs => reverse_lin CgSFact fs end;
+    match s with | MkCgSState _ _ fs _ _ => reverse_lin CgSFact fs end;
+
+def cg_s_span (s : CgSState) : Maybe (Pair Nat Nat) :=
+    match s with | MkCgSState _ _ _ span _ => span end;
+
+def cg_s_spans (s : CgSState) : List (Pair Nat (Pair Nat Nat)) :=
+    match s with | MkCgSState _ _ _ _ table => table end;
+
+def cg_s_with_span (span : Maybe (Pair Nat Nat)) (s : CgSState) : CgSState :=
+    match s with | MkCgSState n visited fs _ table => MkCgSState n visited fs span table end;
 
 def cg_s_tick (s : CgSState) : CgSState :=
-    match s with | MkCgSState n visited fs => MkCgSState n (add visited 1) fs end;
+    match s with | MkCgSState n visited fs span table => MkCgSState n (add visited 1) fs span table end;
 
 def cg_s_record (s : CgSState) (f : CgSFact) : CgSState :=
-    match s with | MkCgSState n visited fs =>
-      MkCgSState n visited (Cons CgSFact f fs) end;
+    match s with | MkCgSState n visited fs span table =>
+      MkCgSState n visited (Cons CgSFact f fs) span
+        (match span with
+         | Nothing => table
+         | Just range => Cons(Pair(Nat, Pair Nat Nat), MkPair(Nat, Pair Nat Nat, cg_s_node f, range), table)
+         end) end;
 
 def cg_s_lookup (name : Nat) : List CgSBinding -> Maybe CgSBinding :=
   fix go (env : List CgSBinding) : Maybe CgSBinding :=
@@ -77,10 +102,10 @@ def cg_s_lookup (name : Nat) : List CgSBinding -> Maybe CgSBinding :=
 def cg_s_bind (name : Nat) (kind : Maybe Nat) (env : List CgSBinding)
     (s : CgSState) : Pair (List CgSBinding) CgSState :=
     match s with
-    | MkCgSState next visited fs =>
+    | MkCgSState next visited fs span table =>
         MkPair (List CgSBinding) CgSState
           (Cons CgSBinding (MkCgSBinding name next kind) env)
-          (MkCgSState (add next 1) visited fs)
+          (MkCgSState (add next 1) visited fs span table)
     end;
 
 def cg_s_bind_names : List Nat -> List CgSBinding -> CgSState
@@ -118,7 +143,7 @@ def cg_s_atom_equal (a : CgSAtom) (b : CgSAtom) : Bool :=
       | CgSLocal _ _ => False
       | CgSNat _ => False
       | CgSString _ => False
-      | CgSConstructor u y => andb (eq_nat t u) (eq_nat x y)
+      | CgSConstructor u y => andb(eq_nat t u, eq_nat x y)
       end
     end;
 
@@ -143,22 +168,24 @@ def cg_s_var_atom (c : CgSCatalog) (env : List CgSBinding) (n : Nat)
     : Maybe CgSAtom :=
     match cg_s_lookup n env with
     | Just b => match b with
-      | MkCgSBinding _ identity _ => Just CgSAtom (CgSLocal n identity)
+      | MkCgSBinding _ identity _ => Just(CgSAtom, CgSLocal n identity)
       end
     | Nothing => match lookup Nat Nat eq_nat n (cg_s_ctors c) with
       | Nothing => Nothing CgSAtom
-      | Just enum_id => Just CgSAtom (CgSConstructor enum_id n)
+      | Just enum_id => Just(CgSAtom, CgSConstructor enum_id n)
       end
     end;
 
 -- No application, effect, ascription, or unknown global is called pure.
-def cg_s_atom (c : CgSCatalog) (env : List CgSBinding) (e : Expr)
-    : Maybe CgSAtom :=
+def cg_s_atom (c : CgSCatalog) (env : List CgSBinding)
+    : Expr -> Maybe CgSAtom :=
+  fix cg_s_atom (e : Expr) : Maybe CgSAtom :=
     match e with
+    | ESpan _ _ inner => cg_s_atom inner
     | EVar n => cg_s_var_atom c env n
     | EHole _ => Nothing CgSAtom
     | ESort _ => Nothing CgSAtom
-    | ENat n => Just CgSAtom (CgSNat n)
+    | ENat n => Just(CgSAtom, CgSNat n)
     | EApp _ _ => Nothing CgSAtom
     | ELam _ _ _ => Nothing CgSAtom
     | EPi _ _ _ => Nothing CgSAtom
@@ -175,7 +202,7 @@ def cg_s_atom (c : CgSCatalog) (env : List CgSBinding) (e : Expr)
     | EBinder _ _ _ => Nothing CgSAtom
     | ENoBinder => Nothing CgSAtom
     | EMultiMatch _ _ => Nothing CgSAtom
-    | EStr n => Just CgSAtom (CgSString n)
+    | EStr n => Just(CgSAtom, CgSString n)
     | EDoBind _ _ => Nothing CgSAtom
     | EList _ => Nothing CgSAtom
     end;
@@ -189,8 +216,10 @@ def cg_s_type_name (c : CgSCatalog) (env : List CgSBinding) (n : Nat) : Maybe Na
       end
     end;
 
-def cg_s_type_enum (c : CgSCatalog) (env : List CgSBinding) (ty : Expr) : Maybe Nat :=
+def cg_s_type_enum (c : CgSCatalog) (env : List CgSBinding) : Expr -> Maybe Nat :=
+  fix cg_s_type_enum (ty : Expr) : Maybe Nat :=
     match ty with
+    | ESpan _ _ inner => cg_s_type_enum inner
     | EVar n => cg_s_type_name c env n
     | EHole _ => Nothing Nat
     | ESort _ => Nothing Nat
@@ -223,8 +252,10 @@ def cg_s_annotation (c : CgSCatalog) (env : List CgSBinding) (ann : Maybe Expr)
     | Just ty => cg_s_type_enum c env ty
     end;
 
-def cg_s_value_enum (c : CgSCatalog) (env : List CgSBinding) (e : Expr) : Maybe Nat :=
+def cg_s_value_enum (c : CgSCatalog) (env : List CgSBinding) : Expr -> Maybe Nat :=
+  fix cg_s_value_enum (e : Expr) : Maybe Nat :=
     match e with
+    | ESpan _ _ inner => cg_s_value_enum inner
     | EVar n => match cg_s_lookup n env with
       | Just b => match b with | MkCgSBinding _ _ kind => kind end
       | Nothing => lookup Nat Nat eq_nat n (cg_s_ctors c)
@@ -253,8 +284,10 @@ def cg_s_value_enum (c : CgSCatalog) (env : List CgSBinding) (e : Expr) : Maybe 
     | EList _ => Nothing Nat
     end;
 
-def cg_s_returns (name : Nat) (e : Expr) : Bool :=
+def cg_s_returns (name : Nat) : Expr -> Bool :=
+  fix cg_s_returns (e : Expr) : Bool :=
     match e with
+    | ESpan _ _ inner => cg_s_returns inner
     | EVar n => eq_nat name n
     | EHole _ => False
     | ESort _ => False
@@ -281,7 +314,7 @@ def cg_s_returns (name : Nat) (e : Expr) : Bool :=
     end;
 
 def cg_s_nullary_ctor (name : Nat) (p : Pair Nat Expr) : Bool :=
-    cg_s_returns name (snd Nat Expr p);
+    cg_s_returns(name, snd Nat Expr p);
 
 -- Count spelling identities once. Ambiguous local declarations never supply
 -- a constructor/type identity, even when their textual names look familiar.
@@ -289,8 +322,8 @@ def cg_s_decl_ids (d : Decl) : List Nat :=
     match d with
     | DDef n _ _ => [n]
     | DAxiom n _ => [n]
-    | DInductive n _ _ cs => Cons Nat n (map (Pair Nat Expr) Nat (fst Nat Expr) cs)
-    | DEffect n _ ops => Cons Nat n (map (Pair Nat Expr) Nat (fst Nat Expr) ops)
+    | DInductive n _ _ cs => Cons Nat n (map(Pair Nat Expr, Nat, fst Nat Expr, cs))
+    | DEffect n _ ops => Cons Nat n (map(Pair Nat Expr, Nat, fst Nat Expr, ops))
     | DImport _ => ([] : List Nat)
     | DIntrinsic n _ _ _ => [n]
     | DExtern n _ _ => [n]
@@ -310,8 +343,10 @@ def cg_s_duplicate_ids : List Nat -> List Nat :=
       end
     end;
 
-def cg_s_closed_sort (e : Expr) : Bool :=
+def cg_s_closed_sort : Expr -> Bool :=
+  fix cg_s_closed_sort (e : Expr) : Bool :=
     match e with
+    | ESpan _ _ inner => cg_s_closed_sort inner
     | EVar _ => False
     | EHole _ => False
     | ESort _ => True
@@ -341,31 +376,31 @@ def cg_s_catalog (ds : List Decl) : CgSCatalog :=
     let ambiguous : List Nat := cg_s_duplicate_ids
       (quality_sort Nat leb_nat (concat_map Decl Nat cg_s_decl_ids ds)) in
     let enums : List (Pair Nat (List Nat)) :=
-      concat_map Decl (Pair Nat (List Nat)) (fun (d : Decl) =>
+      concat_map Decl (Pair(Nat, List Nat)) (fun (d : Decl) =>
         match d with
         | DInductive n params kind ctors =>
             match params with
-            | Cons _ _ => Nil (Pair Nat (List Nat))
-            | Nil => match andb (andb (cg_s_closed_sort kind) (notb (elem Nat eq_nat n ambiguous)))
+            | Cons _ _ => Nil (Pair(Nat, List Nat))
+            | Nil => match andb (andb(cg_s_closed_sort kind, notb (elem Nat eq_nat n ambiguous)))
                 (all (Pair Nat Expr) (fun (ctor : Pair Nat Expr) =>
                   andb (cg_s_nullary_ctor n ctor)
                     (notb (elem Nat eq_nat (fst Nat Expr ctor) ambiguous))) ctors) with
-              | False => Nil (Pair Nat (List Nat))
-              | True => Cons (Pair Nat (List Nat)) (MkPair Nat (List Nat) n
-                  (map (Pair Nat Expr) Nat (fst Nat Expr) ctors))
-                  (Nil (Pair Nat (List Nat)))
+              | False => Nil (Pair(Nat, List Nat))
+              | True => Cons (Pair(Nat, List Nat)) (MkPair Nat (List Nat) n
+                  (map(Pair Nat Expr, Nat, fst Nat Expr, ctors)))
+                  (Nil (Pair(Nat, List Nat)))
               end
             end
-        | DDef _ _ _ => Nil (Pair Nat (List Nat))
-        | DAxiom _ _ => Nil (Pair Nat (List Nat))
-        | DEffect _ _ _ => Nil (Pair Nat (List Nat))
-        | DImport _ => Nil (Pair Nat (List Nat))
-        | DIntrinsic _ _ _ _ => Nil (Pair Nat (List Nat))
-        | DExtern _ _ _ => Nil (Pair Nat (List Nat))
-        | DRepresentation _ _ => Nil (Pair Nat (List Nat))
+        | DDef _ _ _ => Nil (Pair(Nat, List Nat))
+        | DAxiom _ _ => Nil (Pair(Nat, List Nat))
+        | DEffect _ _ _ => Nil (Pair(Nat, List Nat))
+        | DImport _ => Nil (Pair(Nat, List Nat))
+        | DIntrinsic _ _ _ _ => Nil (Pair(Nat, List Nat))
+        | DExtern _ _ _ => Nil (Pair(Nat, List Nat))
+        | DRepresentation _ _ => Nil (Pair(Nat, List Nat))
         end) ds in
     MkCgSCatalog enums
-      (concat_map (Pair Nat (List Nat)) (Pair Nat Nat)
+      (concat_map (Pair(Nat, List Nat)) (Pair Nat Nat)
         (fun (p : Pair Nat (List Nat)) => match p with
           | MkPair name ctors => map Nat (Pair Nat Nat)
               (fun (ctor : Nat) => MkPair Nat Nat ctor name) ctors

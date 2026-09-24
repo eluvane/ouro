@@ -1,30 +1,10 @@
-<p align="center">
-  <img
-    width="100%"
-    src="https://capsule-render.vercel.app/api?type=waving&amp;height=220&amp;color=0:0B1220,50:1E1B4B,100:4F46E5&amp;text=VS%20CODE&amp;fontColor=E2E8F0&amp;fontSize=54&amp;fontAlignY=50"
-    alt="VS CODE banner"
-  />
-</p>
-
 # Ouro for VS Code
 
 This extension provides syntax highlighting and starts Ouro's experimental
 language server.
 
-## Features
-
-- diagnostics on open, full-document change, and save;
-- hover information;
-- go to definition;
-- completion;
-- document and workspace symbols;
-- whole-buffer rename;
-- document formatting;
-- Ouro syntax highlighting.
-
-The language server uses the same checker and formatter as the command line. It
-is not an incremental typechecker; document changes are synchronized as complete
-buffers and several requests rebuild an index from the open file and imports.
+The [language-server reference](../../docs/tooling.md#language-server)
+describes supported requests and limitations.
 
 ## Build
 
@@ -70,19 +50,4 @@ Use **Ouro: Restart Language Server** after rebuilding the toolchain. Set
 `ouro.trace.server` to `verbose` and inspect the **Ouro** output channel for
 protocol and server errors.
 
-The protocol regression suite runs without VS Code:
-
-```sh
-sh scripts/lsp_suite.sh
-```
-
-See [`docs/tooling.md`](../../docs/tooling.md) for the current language-server
-capabilities and limitations.
-
-<p align="center">
-  <img
-    width="100%"
-    src="https://capsule-render.vercel.app/api?type=waving&amp;height=220&amp;color=0:0B1220,50:1E1B4B,100:4F46E5&amp;section=footer"
-    alt=""
-  />
-</p>
+The protocol suite listed in [CI](../../docs/ci.md) runs without VS Code.

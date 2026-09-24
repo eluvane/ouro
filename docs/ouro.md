@@ -1,11 +1,3 @@
-<p align="center">
-  <img
-    width="100%"
-    src="https://capsule-render.vercel.app/api?type=waving&amp;height=220&amp;color=0:0B1220,50:1E1B4B,100:4F46E5&amp;text=OURO&amp;fontColor=E2E8F0&amp;fontSize=54&amp;fontAlignY=50"
-    alt="OURO banner"
-  />
-</p>
-
 # Ouro concept and native transition
 
 > **A language that helps write itself.**
@@ -13,37 +5,14 @@
 **Document status:** current direction followed by a historical research concept;
 neither is a language specification or a product-readiness promise.
 
-**Audience:** the project author, potential contributors, programming-language
-researchers, and technical reviewers.  
 **Comparative claims last externally checked:** 2026-07-27.
 
 ## Current direction: standalone native Ouro
 
-The accepted product direction is a programming language whose compiler,
-typechecker, native code generator, executable writer, runtime, and required
-build/CLI tools are implemented in Ouro. Dependent types, analysis, generation,
-and metaprogramming remain useful language capabilities. A separate proof
-assistant or permanent independent OCaml checker is not required.
-
-One compiler-owned checker must validate the entire supported module and import
-closure before checked Core is used for compilation or evaluation. Generated
-input follows the same checks. This preserves typechecking, explicit failures,
-and semantic regression tests while changing implementation ownership.
-
-The first native target is Windows x86-64 with direct PE32+ output and an Ouro
-runtime using exact non-moving mark-and-sweep collection. A published native
-seed must build subsequent stages. At completion, ordinary use and reproducible
-rebuilding require no C/OCaml implementation, external assembler/linker, CRT
-startup, Python, or shell. Operating-system APIs remain platform dependencies.
-
-This transition is not complete. The generated C bootstrap, C runtime, and
-host build scripts remain active until their required functions have working
-replacements. Independent OCaml and Python Core replay implementations are
-retired; retained semantic contracts run through the compiler-owned checker.
-[Design goals](design.md) define the current contract;
-[Roadmap](roadmap.md) defines the staged acceptance criteria;
-[Architecture](architecture.md), [Build](build.md), and [TCB](tcb.md) describe
-the implementation that exists today.
+The accepted native product target is in [Design](design.md); staged acceptance
+is in [Roadmap](roadmap.md). [Architecture](architecture.md), [Build](build.md),
+and [TCB](tcb.md) describe current implementation and host assumptions. The
+research proposal below predates that decision and does not supersede it.
 
 ## Historical research concept
 
@@ -64,8 +33,6 @@ behavior. The research labels below apply only within this historical proposal:
   first version.
 - **Fallback** — an intentionally allowed simplification or move to an existing
   platform.
-
----
 
 ## 1. Executive summary
 
@@ -119,8 +86,6 @@ experiment whose negative result the project is willing to accept.
 | Hybrid AI | **Long-term optional layer** | AI proposes candidates but is not a source of truth and is not part of the kernel. |
 | Product adoption | **Not a research-success criterion** | The research track succeeds if it produces a reproducible answer to the central question, including a negative answer. |
 
----
-
 ## 2. Central research question
 
 > **Can a dependently typed language with a fixed hand-written kernel and
@@ -142,8 +107,6 @@ project:
   Ouro;
 - success is evaluated by development cost, proof cost, debugging,
   reproducibility, and TCB impact, not by the number of announced features.
-
----
 
 ## 3. Main hypothesis and falsification criteria
 
@@ -205,8 +168,6 @@ when the following are published and reproducible:
 - a comparative capability report against existing systems;
 - documented pivots and reasons for rejecting architectural paths.
 
----
-
 ## 4. What Ouro is
 
 Ouro is an experimental dependently typed programming system for studying four
@@ -238,8 +199,6 @@ state**, not the initial implementation. Seed parsers, elaborators, CLIs, and
 some tooling may be written in OCaml at first. They are replaced component by
 component after the language exists.
 
----
-
 ## 5. What Ouro is not trying to do
 
 The first Ouro version does not try to:
@@ -258,8 +217,6 @@ The first Ouro version does not try to:
 - treat differential testing as extraction-correctness proof;
 - guarantee absence of runtime errors outside explicitly modeled invariants,
   runtime, FFI, and backend assumptions.
-
----
 
 ## 6. Design principles
 
@@ -324,8 +281,6 @@ host-language prototype.
 
 **Fixed.** Mass ecosystem, market, and production deployment belong to the
 product track. They are not conditions for completing the research experiment.
-
----
 
 ## 7. Architectural boundaries
 
@@ -393,8 +348,6 @@ these dependencies or call them untrusted for claims where they are required.
 The move to Ouro implementations is componentwise. A simultaneous rewrite of the
 whole compiler stack is forbidden as a roadmap strategy because it increases
 bootstrap risk and delays generation payoff.
-
----
 
 ## 8. Core language and kernel
 
@@ -560,8 +513,6 @@ Conversion must have:
 Optimized normalization-by-evaluation, caching, or native conversion is added
 only after a simple reference path exists.
 
----
-
 ## 9. Elaborator, holes, totality, and synthesis
 
 ### 9.1. Elaborator
@@ -664,8 +615,6 @@ Accepting `partial` code must not allow construction of an inhabitant of every
 proposition. Release profiles distinguish verified pure code from runtime-only
 partial computations.
 
----
-
 ## 10. Verified generation: guarantee levels
 
 The word `verified` is not used without qualification in design documents or
@@ -698,8 +647,6 @@ generator, and it does not solve specification correctness.
 A DSL extension is `kernel-checked` if its expansion passes the kernel. That does
 not prove the expansion matches the intended DSL semantics. That claim requires
 proof-producing translation or formal DSL semantics.
-
----
 
 ## 11. Trust model and full TCB
 
@@ -795,8 +742,6 @@ Before a formal kernel proof, trust is improved by a combination of:
 - code review and mutation testing;
 - reproducible kernel builds;
 - versioned semantics document.
-
----
 
 ## 12. Progressive disclosure
 
@@ -911,8 +856,6 @@ needed. Metrics include:
 Numeric pass/fail thresholds are set before the experiment from pilot data, not
 after obtaining a desired result.
 
----
-
 ## 13. Effects and runtime
 
 ### 13.1. Effects are not one preselected feature
@@ -962,8 +905,6 @@ The choice is evaluated by:
 If the effect design blocks Core-1, destabilizes conversion, or requires broad
 runtime/kernel change, Ouro fixes an explicit `IO`/indexed-monad profile and
 moves advanced effects into a separate research branch.
-
----
 
 ## 14. Extraction
 
@@ -1021,8 +962,6 @@ arbitrary effectful higher-order foreign code. The FFI contract must define
 representations, ownership, exceptions, callbacks, nontermination, and trusted
 wrappers.
 
----
-
 ## 15. Self-hosting and self-generation levels
 
 ### 15.1. Terms
@@ -1077,8 +1016,6 @@ The acceptance authority of a concrete release remains a separate fixed artifact
 A self-hosted compiler depends on seed artifacts and runtime. Trusting-trust risk
 requires its own bootstrap protocol. Self-hosting is valuable for dogfooding,
 expressiveness, and self-application experiments, but it is not a soundness proof.
-
----
 
 ## 16. Tooling, provenance, and reproducibility
 
@@ -1174,8 +1111,6 @@ Provenance must support:
 
 Usefulness is measured by bug-localization time on the benchmark set.
 
----
-
 ## 17. Hybrid AI
 
 Hybrid AI remains an external optional proposal layer.
@@ -1198,8 +1133,6 @@ Hybrid AI remains an external optional proposal layer.
 
 AI is not part of early roadmap phases. Its value is evaluated only after stable
 holes, benchmarks, and provenance exist.
-
----
 
 ## 18. Differences from existing systems
 
@@ -1308,8 +1241,6 @@ Compare effort, TCB, diagnostics, performance, and reproducibility. Without this
 prototype, the claim that "generation as an axis requires a custom kernel" stays
 a working hypothesis.
 
----
-
 ## 19. Research scenarios and benchmarks
 
 A benchmark must be small enough for one research prototype but contain repeated
@@ -1402,8 +1333,6 @@ Every scenario predefines:
 - failure and timeout policy;
 - artifact publication format.
 
----
-
 ## 20. Must-haves, prototype goals, research goals, and product horizon
 
 ### 20.1. Necessary for the first vertical slice
@@ -1461,8 +1390,6 @@ Every scenario predefines:
 - broad adoption.
 
 These do not define the early architecture scope.
-
----
 
 ## 21. Roadmap
 
@@ -1703,8 +1630,6 @@ default pivot is to continue the research layer on an existing kernel. This is
 not a failure of verified generation as a central idea; it is a negative result
 for a specific implementation strategy.
 
----
-
 ## 22. Success metrics and falsifiability
 
 ### 22.1. Generation payoff
@@ -1824,8 +1749,6 @@ Small LOC with complex implicit invariants is not success.
 
 Acceptance criteria for every experiment are pre-registered before results.
 
----
-
 ## 23. Risks, pivots, and fallbacks
 
 Probability and damage are qualitative and revisited at every checkpoint.
@@ -1860,8 +1783,6 @@ Probability and damage are qualitative and revisited at every checkpoint.
 | Incorrect specification | High | Critical by domain | Well-typed program fails domain tests | Domain review, executable specs, property tests, model validation | Claims exceed modeled properties | Narrow claim; add assumptions and validation layer |
 | Performance optimization destabilizes semantics | Medium | High | Fast path disagrees with reference checker | Differential checks, release recheck by reference path | Repeated semantic divergence | Disable optimization; slower trusted path |
 
----
-
 ## 24. Open questions
 
 | Question | Options | Selection criterion | Decide no later than |
@@ -1886,8 +1807,6 @@ Probability and damage are qualitative and revisited at every checkpoint.
 | Generated artifact storage | Commit source; commit core; build-only | Bootstrap, review, reproducibility | Phase 4 |
 | FFI contract | Minimal C ABI; target-native; capability wrappers | Runtime TCB and portability | Phase 5 |
 | Metaprogram security/resource model | Process sandbox; interpreter quotas; capabilities | DoS resistance and portability | Phase 4 |
-
----
 
 ## 25. Claims requiring further evidence
 
@@ -1920,8 +1839,6 @@ Each claim needs one or more evidence types:
 - proof or independent checker;
 - architecture experiment.
 
----
-
 ## 26. Final project formulation
 
 Ouro studies whether a small fixed kernel can act as a stable trust point for a
@@ -1943,8 +1860,6 @@ success is defined by experiment quality, artifact reproducibility, and an hones
 answer to the central question.
 
 **Ouro. A language that helps write itself.**
-
----
 
 ## 27. Historical language-ergonomics increment: pipe, list literals, `let!`
 
@@ -1977,8 +1892,6 @@ truth and typechecks through the changed self-host modules, but it is not
 declared active in the packaged `ouro1` binary until a separate frontend
 regeneration/parity pass. This is an intentional trust-boundary choice: generated
 artifacts are not edited by hand.
-
----
 
 ## Appendix A. External cross-check and sources
 
@@ -2031,8 +1944,6 @@ Additional orientation:
 - Danel Ahman, Neil Ghani, Gordon Plotkin, [Dependent Types and Fibred Computational Effects](https://homepages.inf.ed.ac.uk/gdp/publications/dep_types_effects.pdf).
 - Gabriel Ebner et al., [A Metaprogramming Framework for Formal Verification](https://doi.org/10.1145/3110278).
 
----
-
 ## Appendix B. Glossary
 
 - **Kernel** — small hand-written checker for the versioned core language.
@@ -2058,11 +1969,3 @@ Additional orientation:
   in release.
 - **Release profile** — build policy with no unresolved assumptions or unsafe
   bypasses, plus clean kernel recheck.
-
-<p align="center">
-  <img
-    width="100%"
-    src="https://capsule-render.vercel.app/api?type=waving&amp;height=220&amp;color=0:0B1220,50:1E1B4B,100:4F46E5&amp;section=footer"
-    alt=""
-  />
-</p>

@@ -1,45 +1,16 @@
-<p align="center">
-  <img
-    width="100%"
-    src="https://capsule-render.vercel.app/api?type=waving&amp;height=220&amp;color=0:0B1220,50:1E1B4B,100:4F46E5&amp;text=GATES&amp;fontColor=E2E8F0&amp;fontSize=54&amp;fontAlignY=50"
-    alt="GATES banner"
-  />
-</p>
-
 # Native repository gates
 
-Ouro-native repository gates are the preferred checks for supported repository-owned documentation, project metadata, GitHub Actions workflow policy, and control-plane retirement evidence.
-
-Run the focused profiles with:
-
-```sh
-sh scripts/ouro_repo_gate.sh --profile docs-native --out _build/ouro_repo_gate/docs-native
-sh scripts/ouro_repo_gate.sh --profile project-native --out _build/ouro_repo_gate/project-native
-sh scripts/ouro_repo_gate.sh --profile workflow-native --out _build/ouro_repo_gate/workflow-native
-sh scripts/ouro_repo_gate.sh --profile control-plane-native --out _build/ouro_repo_gate/control-plane-native
-sh scripts/ouro_repo_gate.sh --profile retirement --out _build/ouro_repo_gate/retirement
-sh scripts/ouro_ci_gate.sh --profile pr-native --out _build/ouro_ci/pr-native
-sh scripts/ouro_ci_gate.sh --profile control-plane-native --out _build/ouro_ci/control-plane-native
-sh scripts/ouro_ci_gate.sh --profile retirement --out _build/ouro_ci/retirement
-sh scripts/ouro_ci_gate.sh --profile host-bound --out _build/ouro_ci/host-bound
-```
-
-The native repo gates validate repository-owned files and policies. They do not replace bootstrap, full hosted CI orchestration, release packaging, quality analyzer composition, or hosted GitHub API probes by themselves.
+Ouro-native repository gates own supported documentation, project metadata,
+workflow policy, and host-script retirement checks. [CI](ci.md#ouro-native-control-plane-displacement)
+lists their commands and profile coverage. These gates alone do not establish
+full PR readiness or hosted GitHub API reachability.
 
 ## Explicit execution paths
 
 The repository and CI launchers now select the native backend explicitly. Their stderr includes `EXECUTION_BACKEND=ouro-native-repo-gate` or `EXECUTION_BACKEND=ouro-native-ci-gate`, and their JSON reports include `execution_backend` plus `execution_mode`. A native profile never obtains a passing result from a Python compatibility implementation.
 
-`scripts/build_tool.sh` defaults to `OURO_BUILD_TOOL_MODE=native`. The remaining host adapter is available only through an explicit mode:
-
-```sh
-OURO_BUILD_TOOL_MODE=host-wrapper sh scripts/build_tool.sh tools/collect.ouro _build/compat/ouro-collect
-OURO_BUILD_TOOL_MODE=auto sh scripts/build_tool.sh tools/collect.ouro _build/compat/ouro-collect
-```
-
-`host-wrapper` rejects unsupported entries instead of starting a native build. `auto` is retained only as a named compatibility mode and prints the selected backend and the reason for it. It is not the default. Bootstrap-required native builds print `BOOTSTRAP_BUILD_REQUIRED`; successful rebuilds print `NATIVE_TOOL_REBUILT`; failed rebuilds print `NATIVE_TOOL_REBUILD_FAILED`, and an older executable is reported as `STALE_BINARY_REJECTED` rather than executed.
-
-Native tool source manifests are mandatory provenance for wrapper freshness checks. A missing, empty, escaping, or malformed `<tool>.sources` manifest causes an explicit rebuild. The launchers no longer hide a missing manifest by falling back to a broad directory scan. A failed rebuild cannot reuse the previously discovered executable.
+The [build cache contract](build.md#cache-model) owns `OURO_BUILD_TOOL_MODE`,
+source manifests, rebuild receipts, and stale-binary refusal.
 
 CLI selection is strict. Unknown options, unknown profiles, unknown gate names, missing option values, positional arguments, and zero selected gates exit with status 2. `--gate` is rejected for the special `host-bound` inventory profile because that profile has one fixed internal operation.
 
@@ -63,14 +34,9 @@ instead of being guessed. Structured checks reject privileged triggers, broad
 write permissions, `continue-on-error`, mutable external action refs, missing
 job timeouts, duplicate display names, unsafe cache save paths, and unsupported
 `scripts/ci_gate.py` invocations. Release write access is accepted only in the
-exact guarded draft-publication job and the exact guarded weekly snapshot job.
+exact draft-publication job with its tag guard and draft-release command, or
+the exact snapshot job with its main-branch schedule or dispatch guard.
+`pages` and `id-token` write access is accepted only in the exact Pages publish
+job with its main-branch push guard and official `deploy-pages` action.
 
-Full PR readiness still uses `python3 scripts/ci_gate.py --profile pr` unless a workflow explicitly selects the native profile and its parity coverage is sufficient for that context. The Python PR profile routes the supported docs, project, and workflow policy rows through `sh scripts/ouro_repo_gate.sh --profile docs-native`, `project-native`, and `workflow-native`; the legacy Python entry points remain compatibility commands for direct callers.
-
-<p align="center">
-  <img
-    width="100%"
-    src="https://capsule-render.vercel.app/api?type=waving&amp;height=220&amp;color=0:0B1220,50:1E1B4B,100:4F46E5&amp;section=footer"
-    alt=""
-  />
-</p>
+Full PR readiness and profile composition are defined in [CI](ci.md#local-profiles).

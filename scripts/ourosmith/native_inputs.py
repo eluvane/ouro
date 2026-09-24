@@ -98,6 +98,7 @@ def main : IO Unit :=
 
 
 def prepare_manifest(root, seed):
+    from ourosmith.ergonomics_inputs import prepare_manifest as add_ergonomics
     from ourosmith.surface.forms import programs
     from ourosmith.surface.parity import inputs
 
@@ -120,6 +121,7 @@ def prepare_manifest(root, seed):
             continue
         prefix = "IMP." if mutation.name.startswith("import-") else "REC." if mutation.name.startswith("record-") else "ERGO." if mutation.name.startswith(("pipe-", "list-", "do-", "named-hole")) else "CHECK."
         add(prefix + mutation.name, mutation.source, "fail", mutation.diagnostics[0], mutation.dependencies)
+    add_ergonomics(root, add)
     write(root / "manifest.tsv", "".join(rows))
     # The native control-plane selftest retains malformed table contracts and
     # points their safe relative paths at generated programs.

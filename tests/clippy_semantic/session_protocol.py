@@ -59,7 +59,7 @@ class Reader:
 
     def snapshot(self) -> tuple[bytes, bool]:
         start = self.offset
-        self.expect(b"ouro.clippy-semantic.v2")
+        self.expect(b"ouro.clippy-semantic.v3")
         status = self.line()
         if status == b"error":
             if not self.line():
@@ -70,6 +70,16 @@ class Reader:
             for _ in range(count):
                 code, owner = self.line(), self.line()
                 self.number(PROOF_BUDGET)
+                range_start, range_end = self.line(), self.line()
+                if range_start == b"-" or range_end == b"-":
+                    if range_start != b"-" or range_end != b"-":
+                        raise ValueError("partial proof range")
+                else:
+                    for raw in (range_start, range_end):
+                        if (not raw or not raw.isdigit() or (raw != b"0" and raw.startswith(b"0"))):
+                            raise ValueError("noncanonical proof range")
+                    if int(range_start) > int(range_end):
+                        raise ValueError("inverted proof range")
                 evidence = self.line()
                 if not code.strip() or not owner.strip() or not evidence.strip():
                     raise ValueError("malformed proof record")
@@ -131,10 +141,8 @@ def session_prefix(data: bytes, paths: list[str], returncode: int,
         status = reader.line()
         reader.finish()
         recycled = len(completed) < len(paths)
-        if recycled:
-            if not passed or status != b"recycle":
-                raise ValueError("partial completion is not an authorized recycle")
-        elif status != (b"ok" if passed else b"error"):
+        expected_status = b"error" if not passed else (b"recycle" if recycled else b"ok")
+        if status != expected_status:
             raise ValueError("inconsistent final status")
         if stderr or returncode != (0 if passed else 1):
             raise ValueError("worker crash, unexpected stderr or inconsistent exit status")
@@ -174,10 +182,10 @@ def compare_captures(directory: Path) -> dict:
 def selftest() -> int:
     def ok(source: bytes = b"source\n\x00\xff", proofs: bytes = b"") -> bytes:
         count = 1 if proofs else 0
-        return (b"ouro.clippy-semantic.v2\nok\n" + str(len(source)).encode() + b"\n"
+        return (b"ouro.clippy-semantic.v3\nok\n" + str(len(source)).encode() + b"\n"
                 + source + b"\n" + str(count).encode() + b"\n" + proofs)
 
-    error = b"ouro.clippy-semantic.v2\nerror\nparse failed\n"
+    error = b"ouro.clippy-semantic.v3\nerror\nparse failed\n"
 
     def wire(paths: list[str], frames: list[bytes], status: bytes | None = None) -> bytes:
         result = MAGIC + b"\n" + str(len(paths)).encode() + b"\n"
@@ -192,7 +200,7 @@ def selftest() -> int:
     class SessionProtocolTests(unittest.TestCase):
         def test_exact_bytes_unicode_paths_and_embedded_frames(self):
             paths = ["каталог/漢字\nfile.ouro", "same.ouro", "same.ouro"]
-            frames = [ok(b"\r\n\x00\xffdone\n3\nok\nouro.clippy-semantic.v2\n"), ok(), ok()]
+            frames = [ok(b"\r\n\x00\xffdone\n3\nok\nouro.clippy-semantic.v3\n"), ok(), ok()]
             self.assertEqual(session(wire(paths, frames), paths, 0), frames)
 
         def test_error_is_sticky_and_next_success_survives(self):
@@ -252,7 +260,7 @@ def selftest() -> int:
                 session(data.replace(b"ok\n1\nx\n", b"ok\n2\nx\n"), ["a"], 0)
 
         def test_full_proof_record_and_no_trailing_bytes(self):
-            frame = ok(b"x", b"CODE\nowner\n3\nevidence\n")
+            frame = ok(b"x", b"CODE\nowner\n3\n-\n-\nevidence\n")
             self.assertEqual(single(frame), frame)
             for bad in (frame + b"\n", frame.replace(b"owner\n3", b"owner\n-3"),
                         frame.replace(b"owner\n3", b"owner\n500001"),
@@ -290,6 +298,33 @@ def selftest() -> int:
             for frames, status in (([], b"recycle"), ([ok()], b"ok"), ([error], b"recycle")):
                 with self.assertRaises(SessionFailure):
                     session_prefix(wire(["a", "b"], frames, status), ["a", "b"], 0)
+
+        def test_error_prefix_resumes_exact_suffix_and_keeps_error(self):
+            paths = ["a", "b", "c", "d"]
+            frames = [ok(b"first"), error, ok(b"third"), ok(b"last")]
+            first = session_prefix(wire(paths, frames[:3]), paths, 1)
+            self.assertTrue(first.recycled)
+            self.assertEqual(first.completed, 3)
+            remaining = paths[first.completed:]
+            second = session_prefix(wire(remaining, frames[3:]), remaining, 0)
+            self.assertFalse(second.recycled)
+            self.assertEqual(first.frames + second.frames, tuple(frames))
+            with self.assertRaises(SessionFailure):
+                session(wire(paths, frames[:3]), paths, 1)
+
+        def test_error_prefix_requires_error_footer_exit_and_silent_stderr(self):
+            paths = ["a", "b", "c"]
+            data = wire(paths, [error, ok()])
+            for code, stderr in ((0, b""), (137, b""), (-9, b""), (1, b"OOM")):
+                with self.subTest(code=code, stderr=stderr), self.assertRaises(SessionFailure):
+                    session_prefix(data, paths, code, stderr)
+            for frames, status in (([], b"error"), ([ok()], b"error"),
+                                   ([error], b"ok"), ([error], b"recycle")):
+                with self.subTest(status=status), self.assertRaises(SessionFailure):
+                    session_prefix(wire(paths, frames, status), paths, 1)
+            for end in range(len(data)):
+                with self.subTest(end=end), self.assertRaises(SessionFailure):
+                    session_prefix(data[:end], paths, 1)
 
         def test_recycle_requires_successful_exit_and_silent_stderr(self):
             data = wire(["a", "b"], [ok()])
@@ -333,6 +368,49 @@ def capture(arguments: list[str], *, child: bool) -> int:
     return 0
 
 
+def vocabulary_stress(directory: Path, worker: str) -> None:
+    """Distinct compiler identities must recycle without losing a root or frame."""
+    base = directory.resolve()
+    sources = base / "vocabulary"
+    sources.mkdir(parents=True, exist_ok=True)
+    paths = [f"root-{index}.ouro" for index in range(24)]
+    for index, path in enumerate(paths):
+        source = "".join(
+            f"def distinct_{index}_{item} (A : Type) (value : A) : A := value;\n"
+            for item in range(96)
+        )
+        (sources / path).write_text(source, encoding="utf-8", newline="\n")
+
+    def run(stem: str, selected: list[str]) -> SessionPrefix:
+        command = [str(Path(worker).resolve()), "--session", str(sources), *selected]
+        if capture([str(base), stem, *command], child=False):
+            raise ValueError(f"vocabulary capture failed: {stem}")
+        status = int((base / f"{stem}.status").read_text())
+        if status != 0:
+            raise ValueError(f"valid vocabulary root failed: {stem}, exit {status}")
+        return session_prefix((base / f"{stem}.out").read_bytes(), selected,
+                              status,
+                              (base / f"{stem}.err").read_bytes())
+
+    cold = [run(f"vocabulary-cold-{index}", [path]).frames[0]
+            for index, path in enumerate(paths)]
+    frames: list[bytes] = []
+    prefixes: list[int] = []
+    while len(frames) < len(paths):
+        result = run(f"vocabulary-warm-{len(frames)}", paths[len(frames):])
+        frames.extend(result.frames)
+        prefixes.append(result.completed)
+    if frames != cold:
+        raise ValueError("distinct-root recycling lost, repeated or changed a cold source/proof frame")
+    if len(prefixes) < 2 or not any(count % 2 for count in prefixes[:-1]):
+        raise ValueError("vocabulary limit must stop before the second root of an allocation epoch")
+    (base / "vocabulary.json").write_text(json.dumps({
+        "pass": True, "roots": len(paths), "prefixes": prefixes,
+        "exact_frame_parity": True, "memory_mb": 3072,
+    }, indent=2) + "\n", encoding="utf-8")
+    print("SESSION_STRESS: PASS distinct-root vocabulary, early epoch recycle and cold frame parity")
+
+
 def stress(directory: Path, worker: str) -> None:
     """Run real native roots under the same limiter used by parity captures."""
     base = directory.resolve()
@@ -360,11 +438,13 @@ def stress(directory: Path, worker: str) -> None:
     if second.recycled or first.frames + second.frames != (baseline,) * len(paths):
         raise ValueError("recycle must resume only the confirmed unprocessed suffix")
     print("SESSION_STRESS: PASS 100 roots, 50 epochs, 128-root recycle and exact suffix")
+    vocabulary_stress(base, executable)
 
     # Real import fan-in exposes parser/registry temporaries that tiny roots
     # cannot exercise. Keep the existing 3072 MiB capture limit for every run.
     root = Path(__file__).resolve().parents[2]
     paths = ["tools/repo_gate/checks.ouro", "compiler/native/managed_source.ouro"] * 2
+    paths.extend(["tools/repo_gate/hardening.ouro"] * 2)
     pending = paths
     frames: list[bytes] = []
     while pending:
@@ -373,13 +453,13 @@ def stress(directory: Path, worker: str) -> None:
         pending = pending[result.completed:]
     for path, frame in zip(paths, frames, strict=True):
         reader = Reader(frame)
-        reader.expect(b"ouro.clippy-semantic.v2")
+        reader.expect(b"ouro.clippy-semantic.v3")
         reader.expect(b"ok")
         if reader.blob() != (root / path).read_bytes():
             raise ValueError("production session changed the selected source bytes")
-    if frames[:2] != frames[2:]:
+    if frames[:2] != frames[2:4] or frames[4] != frames[5]:
         raise ValueError("production snapshot changed across retained or recycled epochs")
-    print("SESSION_STRESS: PASS 4 production roots within 3072 MiB with exact frame parity")
+    print("SESSION_STRESS: PASS 6 production roots within 3072 MiB with exact frame parity")
 
 
 def main() -> int:

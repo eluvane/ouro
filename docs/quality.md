@@ -1,11 +1,3 @@
-<p align="center">
-  <img
-    width="100%"
-    src="https://capsule-render.vercel.app/api?type=waving&amp;height=220&amp;color=0:0B1220,50:1E1B4B,100:4F46E5&amp;text=QUALITY&amp;fontColor=E2E8F0&amp;fontSize=54&amp;fontAlignY=50"
-    alt="QUALITY banner"
-  />
-</p>
-
 # Quality tools
 
 Ouro has two complementary quality layers:
@@ -22,219 +14,38 @@ participate in kernel acceptance.
 
 ## Commands
 
+Use `ouro1 lint` for Ouro source, `ouro1 analyze` for repository and
+structured analysis, and the strict firewall for repository policy:
+
 ```sh
-sh scripts/ouro1.sh analyze --strict
-sh scripts/ouro1.sh analyze --enable-style --scope path/to/project
 sh scripts/ouro1.sh lint --deny --profile project std compiler tools samples
-sh scripts/ouro1.sh lint --deny --family language tools/lint.ouro
 python3 scripts/strict_quality_firewall.py --profile release
-python3 scripts/clippy_grade_firewall.py --profile project --scope std
-python3 scripts/clippy_grade_suite.py
-sh scripts/analyze_precision_suite.sh
-python3 scripts/analyze_production_suite.py --out _build/analyze_production
-sh scripts/lint_suite.sh
-sh scripts/ouro1.sh fmt --check path/to/file.ouro
-sh scripts/fmt_suite.sh
-sh scripts/ouro1.sh fix --check path/to/file.ouro
-sh scripts/fix_suite.sh
-sh scripts/ouro_repo_gate.sh --profile pr-native --out _build/ouro_repo_gate/pr-native
-sh scripts/ouro_ci_gate.sh --profile pr-native --out _build/ouro_ci/pr-native
-sh scripts/ouro_ci_gate.sh --profile host-bound --out _build/ouro_ci/host-bound
 ```
 
-The precision suite warms the compiler and collector before running independent
-core typechecks with up to `OURO_JOBS` workers on Windows (at most 10). Per-file commands,
-statuses, and logs are recorded under `_build/analyze_precision/core/`. The
-pool has a 3 GiB Windows Job limit; POSIX keeps sequential checks bounded by
-`rlimit`. Analyzer cores that only need string primitives import
-`std/string_prims.ouro` instead of `std/runtime.ouro` so the check
-cone stays off the Windows platform modules. `std/json.ouro`, quality
-text, and Clippy `core.ouro` / `scan.ouro` follow the same cut: they
-name findings without importing `std/string.ouro` or registry file IO.
-Integration fixtures can also
-import stdlib IO: both paths share the same String declarations. Analyzer runs
-and golden comparisons remain sequential.
-
-`analyze` operates over repository facts and optional deeper families. `lint`
-parses individual modules and applies compiler lint rules without a source-size
-cutoff. Language children stay one file per process because the C bump arena
-is process-lifetime and two heavy std units already sample ~6 GiB. Style and
-semantic companions stay one inventory file per child except for
-consecutive measured-light `std/` files, which share one two-file
-worker. When a companion
-already holds two `--scope` roots, the structural worker reuses one
-intern table and the content-addressed harvest cache and emits the existing
-batch protocol. A third root in the same worker is rejected. Child failures, including memory exhaustion, still fail the run. A directory walk skips intentional
-fixture directories and the hole and unbound samples
-`samples/tutorial/04_holes.ouro` and
-`tests/bad_undeclared_perform.ouro`. Parser rejections are failures, including
-unsupported `mutual` syntax. `lint_suite.sh` lints the live production trees after
-preparing the package sample's local registry dependencies in a writable `_build`
-snapshot, in addition to positive and negative fixtures. The strict quality
-firewall validates policy, diagnostics, fixtures, suppressions, and migration
-debt. Semantic Clippy proofs (checked APIs, must-observe, success-after-error,
-identical arms, self-compare) run as the `semantic` family of `ouro1 lint`.
-
-`fix` is the Ouro-native autofixer for the mechanical subset of lint findings:
-duplicate imports, legacy `<-` binds, `;;`, closed `Cons`/`Nil` chains, Peano
-towers, unused binders, dead `let`/`let!` bindings, and unreachable match arms.
-It never runs as a gate over the tree; `sh scripts/fix_suite.sh` only checks the
-fixer's own fixtures. See [Tooling](tooling.md#autofixer) for the rule table.
-
-The Ouro-native repository gates are quality gates for the repository control
-plane. They validate the supported docs, project-surface, and workflow subset
-without Python composition, but the Python gates remain the reference path where
-parity is still incomplete.
+[Tooling](tooling.md#analyzer-and-linter) owns analyzer/lint CLI flags and behavior;
+[Analyzer internals](../tools/analyze/README.md) own the family inventory;
+[Clippy-grade rules](clippy_grade_firewall.md) own semantic rule evidence.
+[CI](ci.md#local-profiles) owns focused suites, profiles, and gate commands.
+Formatter and fixer usage is in [Tooling](tooling.md#formatter).
 
 ## Native input boundary and host adapter retirement
 
-`tools/quality/source.ouro` owns the checked source inventory used by native
-lint and both analyzer runners. It does not parse source or introduce a
-second semantic authority. It shares path normalization, deterministic source
-selection, regular-file reads, and typed inventory failures without importing
-`std/char` into the compiler lexer cone. A walk that runs out of budget, cannot
-list a directory, encounters an unsafe input, or selects no source files does
-not return an apparently clean partial inventory. Explicit file arguments remain
-available even beneath a directory excluded from recursive discovery.
-Canonical host paths deduplicate lexical aliases such as `file.ouro` and
-`./file.ouro`; diagnostics retain the first sorted supplied spelling.
+`tools/quality/source.ouro` provides checked source selection and reads for
+native lint and analyzer runners. Canonical paths deduplicate lexical aliases,
+while diagnostics retain the first supplied spelling. An unreadable, unsafe,
+truncated, or empty inventory is an error; explicit source files remain
+selectable beneath directories skipped by recursive discovery. A cache hit
+requires canonical path and exact bytes, and never substitutes for checking.
 
-The base analyzer retains every repeated `--scope` value, including
-`--scope=PATH`, alongside positional scopes. Its defaults remain `std`,
-`compiler`, `tools/analyze`, and `samples`; lint additionally scans all of
-`tools`. Fixture inclusion remains a caller policy. Failed reads do not create
-empty file facts, and an empty or entirely excluded inventory is an error.
-The C-host read primitive exits 73 on open, size, seek, allocation, incomplete
-read or close failure. `scripts/fs_read_suite.py` observes real binaries: an
-unreadable file must not produce a successful structured completion report;
-an ordinary empty file remains valid. The runtime and precision suites run
-these checks independently of launcher stand-ins.
-
-Lint owns directory selection and process isolation in Ouro. The lint sources
-share one in-process content-addressed import harvest cache across a batch
-and retry file by file after a crash. A hit is canonical path plus exact
-bytes; a path-only match is stale and is harvested again. The shell launcher retains host preparation and the optional
-POSIX memory cap, not a second file inventory. Missing imported files and exhausted import traversal are errors.
-A successful lint child must return zero with empty output on both streams;
-findings and fatal child statuses remain blocking. `lint --deny` names that
-existing all-findings-block contract explicitly. The same driver can also
-dispatch internal style and semantic companions after the shared inventory;
-those processes stay split from the compiler-frontend language child. It is
-**not** a new public linter product, a replacement for registry/debt/SARIF
-firewall launchers, or proof of whole-program semantic correctness. Import name harvesting is not imported-module typechecking.
-Import syntax is preprocessed before dependency collection, preserving
-`OURO-IMP-001` through `OURO-IMP-004` even when the referenced file is absent.
-The resulting preprocessed source is reused for lint parsing.
-
-The standalone structured drive rejects unknown options, unknown `--enable-*`
-families, and missing `--scope` or `--api-baseline` values. Values are consumed
-literally, including names beginning with `--`. It continues to use the existing
-compiler frontend and analyzer family implementations.
-Its `--print-families` query returns the canonical selected family list without
-scanning sources. The bounded runner uses that native selection to validate each
-worker's coverage and report. Missing or repeated banners, zero or duplicate
-file counts, mismatched families, damaged diagnostic records, unexpected errors,
-and inconsistent exit codes fail the run. The production sweep checks the full
-build receipt and discards stale success reports before starting.
-
-`scripts/host_tools.py` now provides only the explicit bootstrap collector and
-its wrapper installer. Python formatting, synthetic fixture-path diagnostics,
-truncated analyzer facts, and the alternative strict-quality dispatch have been
-removed from that adapter. Attempts to install fmt/analyze host wrappers return
-status 3 before modifying the output; direct retired commands return status 2.
-The public formatter forces the existing native formatter. This retirement does
-not claim output parity with the deleted synthetic analyzer behavior.
-
-`tests/quality_input_tests.ouro` contains 22 input-boundary cases and is invoked
-by the lint suite. Native lint selftests also check child-status aggregation.
-The lint suite exercises deny bad/good inputs, an import-looking comment near
-miss, a missing import, an empty scope, and an unknown option. Host-only adapter
-and launcher protocol checks can run without building Ouro:
-
-```sh
-python3 scripts/language_speed_simplicity_suite.py --host-quality-only
-```
-
-These host checks use stand-in processes for argv/status contracts; they do not
-validate native parsing, findings, precision, or performance. The native suites,
-production scans, formatter/fixer goldens, and full PR profile remain required.
-
-The precision suite also invokes freshly prepared base and drive binaries
-directly for scope coverage, profile unions, repeated flags, literal option
-values, Unicode paths, and findings preserved across source renaming.
-Windows C-host quality builds embed a process-local UTF-8 manifest so narrow
-startup arguments and filesystem calls preserve Unicode paths. These builds
-require Windows 10 version 1903 or later; see [build metadata](build.md#cache-model).
-The native CLI checks compare findings and locations for spaces, Cyrillic,
-and CJK paths without changing the host system code page.
-
-The quality-engine migration is incomplete. Native owners hold Clippy, strict,
-and fix rules; Python adapters remain the public CLI, process budget, and
-JSON/SARIF launch path. `structural_quality.py` is the public launcher and
-re-exports; `structural_quality_legacy.py` still owns symbols, findings,
-and reports. `lint_suite.sh` compiler-checks the split Clippy modules
-(`core`, `scan`, `structural_main`, `main`) so one unit never imports both
-the core/json cone and the compiler frontend. `structural_model.ouro` names
-`QualityInputError` through `tools/quality/input_error.ouro` and does not
-import the IO inventory. `main.ouro` typechecks on the grade cone and
-invokes the structural companion, which reuses harvest facts across a
-bounded batch of roots and recycles the worker afterwards.
-The checks do not claim byte-identical parity with the retired regex owner.
-`syntax_quality_fix.py` keeps only checked transport (native preparation plus
-literal/inventory wire validation) for the remaining Python owners and suites;
-its CLI wrapper is removed and suites invoke `ouro-fix` directly. LINT029 uses the fixer's shared
-Cons/Nil recognizer through the exact-length, checked
-`ouro.fix-literal-spans.v2` JSON protocol. Ordered, disjoint `spans` include
-closed Cons chains and same-line plain-type Nil assignments; `closed_lines`
-retains the separate line-local Cons query. The old Python Nil regex is
-removed: comments and strings containing `:= Nil T` produce no finding.
-The consumer rejects v1 rather than silently omitting the added Nil coverage.
-These are syntax facts, not compiler type or import-checking results. The
-Python adapter still builds, launches and validates this worker, so its host
-inventory row remains `migrate` along with the other owners. The bounded
-Python runner also still owns source selection, skeleton construction, and
-report aggregation. `tools/analyze/bounded_text.ouro` is the checked pure
-scope/batch/keep policy core; `bounded_run` is its documented public root.
-`bounded_run.ouro` / `bounded_main.ouro` (process supervisor) are not present yet. Rule/diagnostic models, profile levels, suppressions,
-JSON/SARIF reporting, and fixer suggestions are not unified by the shared
-input boundary.
-No migration debt or baseline exception is added.
-
-Native text renderers now consume `QualityDiagnostic` from
-`tools/quality/diagnostic.ouro`. The existing compiler lint, structured
-`Finding`, base `ADiag`, and `FxEdit` owners adapt their results at the report
-boundary. The shared record carries the stable ID, owner/rule, location,
-level, message, evidence, hint, applicability and related byte edits. Existing
-text layouts and IDs remain compatibility contracts. Fix proposals retain
-their legacy IDs and the input positions of their owning rewrite round;
-they are marked suggested, not independently validated publication plans.
-
-Canonical levels are `allow`, `warn`, `deny`, and `forbid`. The compatibility
-mapping is `info`/`warning` to nonblocking `warn`, `error` to `deny`, and
-`fatal` to `forbid`; legacy display labels are preserved. The base runner
-retains its hidden-info policy. Forbid/fatal and invalid-level records cannot
-be hidden by a suppression flag. This transport contract does not yet replace
-the Python-owned profile selection, registry validation, or JSON/SARIF reports.
-`lint_suite.sh` runs the native contract and base-adapter laws; the precision
-suite checks the fix adapter against an actual rewrite plan.
-
-Strict and Clippy source selection use `tools/quality/inventory.ouro` and the
-shared checked inventory. Their fixture and generated-source policies remain
-distinct. Missing roots, links, files outside the repository and empty final
-selections fail before scanning. Explicit fixture directories under `_build`
-can be scanned with `--include-fixtures`; build directories found beneath a
-strict scope remain excluded. Canonical paths deduplicate overlapping scopes.
-Successful inventory stdout is one complete `ouro.quality-inputs.v1` JSON
-object containing the requested scopes and selected files. Failed inventory
-produces no successful report and never falls back to Python traversal.
-Directory and final-file ordering use stable merges; canonical paths are
-grouped without scanning all previously seen paths. The first diagnostic
-spelling and original order are retained when aliases refer to one file.
-The inventory streams its JSON array after collection completes, using the
-existing JSON string encoder. The consumer still requires a successful worker
-exit and a complete, valid report. Input laws exhaust 1,093 small sort cases;
-the syntax suite checks exact, repeatable coverage of 4,096 real files under
-the existing process memory limit.
+Lint isolates language, style, and semantic companions in bounded processes.
+A child failure, malformed result, or memory exhaustion fails the run. The
+native shared diagnostic record carries code, owner, location, level, evidence,
+hint, and edit applicability; text compatibility remains stable while Python
+still owns parts of profile selection and JSON/SARIF reporting. The host
+adapter retains bootstrap and reporting responsibilities until parity evidence
+supports retirement. See [Analyzer internals](../tools/analyze/README.md#bounded-execution)
+and [Clippy semantic boundary](clippy_grade_firewall.md#semantic-boundary)
+for their distinct workers and resource limits.
 
 ## Precision and safe rewrites
 
@@ -417,43 +228,14 @@ token stream once, including here-document bodies.
 
 ## Analyzer families
 
-`ouro1 analyze` is two native programs. The base runner (`ouro-analyze`)
-extracts repository facts and applies the policy cores: architecture and
-dependency direction, dead-code reachability, public API surface, trust-boundary
-imports, suppression correctness, and the strict formatting subset. The
-structured drive (`ouro-analyze-drive`) parses each source with the compiler
-frontend and runs the structured cores on the shared `Ast`: effects,
-capabilities, extraction leaks, match coverage, control flow, dataflow, semantic
-smells, property claims, abstract interpretation, symbolic execution, taint,
-contracts, complexity/bounds/minimality metrics, duplication, trust policy,
-rewrite smells (`simplify`), runtime cost smells (`perf`), naming conventions
-the tooling relies on (`naming`), and error-handling hygiene (`errors`).
-
-Not every family runs by default. `sh scripts/ouro1.sh analyze --strict` runs
-the base runner alone. Structured families are enabled per family
-(`--enable-cfg`, `--enable-taint`, ...) or as sets: `--enable-light`,
-`--enable-heavy`, `--enable-all`, `--enable-style`, and `--enable-strict`
-(the promoted structured families). The nightly gate
-`python3 scripts/analyze_production_suite.py` sweeps the production scopes from
-`quality/analyze_production.json` and fails on any finding from
-`--enable-strict` (every structured family after the production tree went
-to zero findings), on an unlisted frontend rejection, or on a stale rejection
-allowance; the all-family sweep is counted per code for triage.
-The current production policy has no frontend rejection allowances.
-`tools/analyze/README.md` lists every family, flag, and status.
-
-Directory discovery prunes `.git`, `_build`, `_cache`, `_opam`, `_tools`, and
-`node_modules` before descent. Diagnostic fixtures under `test/`, `tests/`, and
-`quality/fixtures/` are excluded by default; use `--include-fixtures` when
-checking them. Explicit build-directory scopes remain available for focused
-checks. The root style scan therefore uses the same production inventory as
-the named source scopes and keeps one native process per file.
-
-Deadcode entry annotations accept several names, for example
-`-- @entry main helper`, including `/`, `,`, and `|` separators. An `@export`
-annotation remains a promise to check, not a reachability root. Branch coverage
-retains every match scrutinee and constructor refinement; a repeated constructor
-head alone does not prove that an arm is unreachable.
+The base analyzer checks repository graph, public API, trust imports,
+suppressions, and a strict format subset. Optional structured families parse
+each source through the compiler frontend. The canonical
+[family/flag inventory](../tools/analyze/README.md#analyzer-families) and
+[bounded execution contract](../tools/analyze/README.md#bounded-execution)
+live with the analyzer. `--enable-strict` selects promoted structured families;
+ordinary `analyze --strict` remains the base runner. The
+[nightly sweep](ci.md#local-profiles) checks the promoted set.
 
 ## Code-review profile
 
@@ -569,23 +351,11 @@ and migration path are demonstrated.
 
 ## Repository-control-plane migration
 
-The `tools/repo_gate/` and `tools/ci_gate/` checks are part of the quality
-surface because they protect repository-owned documentation, project metadata,
-workflow files, report schemas, and gate composition. Their current displacement
-profiles are:
-
-| Profile | Scope |
-| --- | --- |
-| `docs` | canonical docs, Markdown inventory metrics, links, README example drift, syntax docs, manifest prefixes, sample pairs, generated API presence |
-| `project` | required files, retired paths, public phrases, public wording, README shape, PR template shape, issue-form shape |
-| `workflow` | required workflows, dangerous patterns, permissions sanity, report-artifact presence |
-| `pr-native` | the supported Ouro-native docs/project/workflow subset |
-| `host-bound` | complete machine-readable Python/sh disposition, parity, blocker, and evidence inventory |
-
-`pr-native` is not a replacement for `python3 scripts/ci_gate.py --profile pr`.
-Every remaining Python/sh path must be a concrete host/bootstrap/reference
-boundary or a thin compatibility adapter. Missing inventory rows and unresolved
-`migrate` rows fail the control-plane and retirement checks respectively.
+[Native repository gates](native_repo_gates.md) own the Ouro policy and
+migration inventory; [CI](ci.md#ouro-native-control-plane-displacement)
+owns profile composition, parity evidence, and host-bound reports.
+`pr-native` covers the supported docs/project/workflow subset and does not
+replace the full Python PR profile.
 
 ## Suppressions
 
@@ -598,9 +368,12 @@ Clippy-grade suppressions use this form and apply only to the comment line and
 the following line:
 
 ```ouro
--- ouro-clippy:disable=OURO-CLIPPY-MAINT-005 reason=protocol constant from wire format
-def protocol_magic : Nat := 1000;
+-- ouro-clippy:disable=OURO-CLIPPY-REDUNDANT-001 reason=explicit local identity example
+def retain (x : Nat) : Nat := let y := x in y;
 ```
+
+The identifier must name an active rule in `quality/clippy_grade_rules.json`;
+a retired identifier is reported as `OURO-CLIPPY-SUPPRESS-003`.
 
 Suppressions are exceptions for a specific finding, not an alternative policy
 system.
@@ -700,66 +473,9 @@ rule guide.
 
 ### Semantic proof and contract boundary
 
-The semantic Clippy worker uses `tools/clippy/semantic_proof.ouro` for typed
-proof kinds and required evidence. Missing, false, unknown, duplicate or
-contradictory evidence blocks publication; the declaration owner is checked
-again when rendering. Node ordinals are not byte spans and do not authorize
-semantic source edits. The existing v2 worker protocol remains unchanged.
-
-`semantic_contracts.ouro` composes snapshot-local declaration summaries through
-resolved, arity-exact, ordered pass-through delegations. Identity/literal returns
-and harmless parameter aliases are supported. Branches, transformed arguments,
-annotations requiring adaptation, recursive cycles and unknown callees remain
-unknown. This is not a whole-program CFG or a wrapper-removal proof. Required
-checked-result lineage survives supported helper chains; returning or ignoring
-an argument is not itself an observation of its failure.
-
-Contract limits are 16 call levels, 4096 summaries shared by a unit, and 256 local
-origin steps. Positive and unavailable summaries are memoized in the immutable
-API index. Tests inspect computed summaries, cache hits, expansions and
-unavailable demands, not wall-clock thresholds. A fresh semantic unit invalidates
-the entire cache. The import resolver receives the same graph projected to
-imports, avoiding an unused flattened declaration list without replacing the
-compiler's missing-module/cycle decisions.
-
-Automatic fixes currently require `FxSyntaxProof` certificates for duplicate
-imports, legacy bind spelling, or redundant separators. The transaction binds
-one source snapshot, exact replacement/spans, disjoint edits and retained trivia;
-the remaining syntax-repair count must decrease. The public fixer still checks
-candidates through its compiler companion before atomic per-file publication.
-`dead-let` and `identity-let` are review-required until binder/effect/span
-preservation can be proved. This does not establish workspace-wide atomicity or
-semantic equivalence for arbitrary rewrites.
-
-Smith's incomplete text fragments exercise the native fixer's byte-level
-selftests. `syntax_quality_suite.py` separately checks complete programs through
-the public preview/check/write boundary, including refusal to publish incomplete
-sources and nonzero check status for review-required suggestions.
-
-Run the native laws with `python3 scripts/clippy_grade_suite.py --laws-only` and
-the source mutation matrix with `--precision-only`. `scripts/fix_suite.sh` also
-runs `tests/fix_proofs.ouro`. Host launchers do not decide semantic outcomes.
-
-The transitional C-host native-tool builder attaches the existing nested-arena
-lifetime boundary to `cm_load_file`. The harvest keeps the selected file's
-typed declarations and imported signatures; imported function bodies stay in
-the nested arena and are released with lexer/parser temporaries. Imported
-type-alias bodies are not retained.
-Caller-owned intern identities are shared across that seam so a large import
-cone does not recopy the growing table on every file.
-The hook contains no parser, resolver, registry, fallback, or analysis logic;
-all such decisions remain in Ouro. Missing required exports fail the build.
-Do not remove that lifetime seam merely because small import-free fixtures pass.
-Root parsing, contract lookup and validation, and API-index construction also use
-the existing pure arena seam. Their temporary graphs are released before the
-next phase; parsed declarations, typed errors, and API facts survive unchanged.
-Session stress coverage repeats a production import cone under the same
-3072 MiB limit and compares complete source/proof frames across epochs.
-
-<p align="center">
-  <img
-    width="100%"
-    src="https://capsule-render.vercel.app/api?type=waving&amp;height=220&amp;color=0:0B1220,50:1E1B4B,100:4F46E5&amp;section=footer"
-    alt=""
-  />
-</p>
+Semantic lint publishes a finding only with the required typed proof evidence.
+Unknown, false, missing, duplicate, or contradictory evidence blocks
+publication. [Clippy-grade rules](clippy_grade_firewall.md#semantic-boundary)
+own contract inference, proof frames, scope, and resource limits;
+[Tooling](tooling.md#autofixer) and [safe rewrites](#precision-and-safe-rewrites)
+own edit applicability and source publication.

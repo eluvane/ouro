@@ -1,0 +1,96 @@
+-- Result/Maybe descriptors consumed by the existing sorted producer join.
+-- No AST, source text, event scan, alternate renderer or autofix lives here.
+import "semantic_calls.ouro";
+
+inductive CmResultLaw : Type :=
+  | CmResultLawOf : CmProofKind -> Nat -> Nat -> List CmEvidence -> String -> CmResultLaw;
+
+-- role, kind, accepted constructor roles, exact outer arity, Maybe input,
+-- error-type position, payload-type position, skipped callback, explanation.
+-- mapLeft and result_map_err have different type-argument orders.
+inductive CmResultPattern : Type :=
+  | CmResultPatternOf : Nat -> CmProofKind -> List Nat -> Nat -> Bool
+      -> Nat -> Nat -> Bool -> String -> CmResultPattern;
+
+def cm_result_patterns : List CmResultPattern :=
+    [CmResultPatternOf 201 CmResultMapFailureProof [10] 5 False 0 1 True
+       "the resolved success map consumes a proven Left and cannot invoke its callback; propagate the error at the output payload type while preserving evaluation",
+     CmResultPatternOf 202 CmResultMapErrorSuccessProof [11] 5 False 0 2 True
+       "the resolved error map consumes a proven Right and cannot invoke its error callback; retain the successful payload at the output error type and preserve evaluation",
+     CmResultPatternOf 203 CmResultMapErrorSuccessProof [11] 5 False 0 1 True
+       "the resolved mapLeft consumes a proven Right and cannot invoke its left callback; retain the right payload at the output left type and preserve evaluation",
+     CmResultPatternOf 204 CmResultBindFailureProof [10] 5 False 0 1 True
+       "the resolved Result bind consumes a proven Left and cannot invoke its continuation; propagate that error at the output payload type and preserve evaluation",
+     CmResultPatternOf 205 CmResultBindFailureProof [10] 5 False 0 1 True
+       "the resolved Result and_then consumes a proven Left and cannot invoke its continuation; propagate that error at the output payload type and preserve evaluation",
+     CmResultPatternOf 206 CmResultRecoverySuccessProof [11] 4 False 0 1 True
+       "the resolved Result recovery consumes a proven Right, so its recovery callback cannot run; retain the successful result and preserve callback-argument evaluation",
+     CmResultPatternOf 207 CmResultFoldKnownProof [10,11] 6 False 0 1 True
+       "the resolved Either/Result fold consumes a proven constructor and selects exactly one handler; review invoking only that handler while preserving all argument evaluation",
+     CmResultPatternOf 212 CmMaybeMapNothingProof [200] 4 True 0 0 True
+       "the resolved Maybe map consumes a proven Nothing and cannot invoke its callback; retain Nothing at the output payload type and preserve evaluation",
+     CmResultPatternOf 213 CmMaybeFoldKnownProof [54,200] 5 True 0 0 False
+       "the resolved Maybe fold consumes a proven constructor and has a fixed handler/default selection; preserve eager default evaluation even when Just selects the handler",
+     CmResultPatternOf 208 CmResultToMaybeKnownProof [10,11] 3 False 0 1 False
+       "the resolved Result-to-Maybe conversion consumes a proven constructor; construct the corresponding Nothing/Just directly after reviewing evaluation; explicit conversion policy is not accidental error loss",
+     CmResultPatternOf 209 CmResultFromMaybeKnownProof [54,200] 4 True 0 1 False
+       "the resolved Maybe-to-Result conversion consumes a proven constructor; its error/success selection is fixed, but eager error-argument evaluation must be preserved",
+     CmResultPatternOf 52 CmResultDefaultFailureProof [10] 4 False 0 1 False
+       "the resolved Result default consumes a proven Left and always selects its fallback; this is explicit fallback policy, not silent error loss; preserve discarded payload evaluation",
+     CmResultPatternOf 53 CmMaybeDefaultNothingProof [200] 3 True 0 0 False
+       "the resolved Maybe default consumes a proven Nothing and always selects its fallback; review returning the fallback while preserving evaluation",
+     CmResultPatternOf 210 CmResultMap2FailureProof [10] 7 False 0 1 True
+       "the first input of the resolved left-biased Result map2 is a proven Left, so its callback cannot run and that error wins; the second result is still eagerly evaluated and must not be deleted blindly",
+     CmResultPatternOf 211 CmResultUnitFailureProof [10] 3 False 0 1 False
+       "the resolved Result-to-unit conversion consumes a proven Left and only propagates its error at payload type Unit; preserve evaluation and failure propagation"];
+
+def cm_result_type_edge (outer_position : Nat) (inner_position : Nat)
+    (outer : ClippyCallFact) (inner : ClippyCallFact) : Bool :=
+    cm_law_same (cm_arg_at(outer_position, cm_call_args outer))
+      (cm_arg_at(inner_position, cm_call_args inner));
+
+def cm_result_fixed_law (outer : ClippyCallFact) (inner : ClippyCallFact)
+    : Maybe CmResultLaw :=
+    (fix choose (rows : List CmResultPattern) : Maybe CmResultLaw :=
+      match rows with
+      | Nil => Nothing CmResultLaw
+      | Cons row rest => match row with
+        | CmResultPatternOf role kind constructors arity optional error_pos payload_pos callback message =>
+            match eq_nat(role, cm_call_role outer) with
+            | False => choose rest
+            | True =>
+                let producer : Nat := cm_call_role inner in
+                let fixed : Bool := elem Nat eq_nat producer constructors in
+                let types : Bool := andb
+                    (cm_result_type_edge payload_pos (match optional with | True => 0 | False => 1 end) outer inner)
+                    (orb(optional, cm_result_type_edge error_pos 0 outer inner)) in
+                let producer_arity : Nat := match eq_nat producer 200 with
+                  | True => 1 | False => match eq_nat producer 54 with | True => 2 | False => 3 end end in
+                let facts : List CmEvidence :=
+                    [cm_known_fact CmFixedConstructor fixed,
+                     cm_known_fact CmTypeArgumentsAgree types] in
+                Just CmResultLaw (CmResultLawOf kind arity producer_arity
+                  (match callback with
+                   | True => Cons CmEvidence (cm_known_fact CmCallbackSkipped fixed) facts
+                   | False => facts end) message)
+            end
+        end
+      end) cm_result_patterns;
+
+def cm_result_composition_law (outer : ClippyCallFact) (inner : ClippyCallFact)
+    : Maybe CmResultLaw :=
+    match andb(eq_nat(cm_call_role outer, 211), eq_nat(cm_call_role inner, 211)) with
+    | True => Just CmResultLaw (CmResultLawOf CmResultUnitIdempotentProof 3 3
+        [cm_known_fact CmIdempotence True,
+         cm_known_fact CmTypeArgumentsAgree
+           (andb(cm_result_type_edge 0 0 outer inner, cm_result_type_edge 1 1 outer inner))]
+        "the resolved Result-to-unit operation consumes its own result with matching type identities; the second conversion cannot change the error or Unit payload; retain the inner result and its evaluation")
+    | False => match andb(eq_nat(cm_call_role outer, 208), eq_nat(cm_call_role inner, 209)) with
+      | True => Just CmResultLaw (CmResultLawOf CmMaybeResultRoundTripProof 3 4
+          [cm_known_fact CmResultRoundTrip True,
+           cm_known_fact CmTypeArgumentsAgree
+             (andb(cm_result_type_edge 0 0 outer inner, cm_result_type_edge 1 1 outer inner))]
+          "a resolved Maybe-to-Result-to-Maybe chain restores the original Maybe with matching type identities; preserve eager error-argument evaluation when removing the round trip; this says nothing about the opposite error-losing round trip")
+      | False => cm_result_fixed_law outer inner
+      end
+    end;

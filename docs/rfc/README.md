@@ -1,11 +1,3 @@
-<p align="center">
-  <img
-    width="100%"
-    src="https://capsule-render.vercel.app/api?type=waving&amp;height=220&amp;color=0:0B1220,50:1E1B4B,100:4F46E5&amp;text=RFCS&amp;fontColor=E2E8F0&amp;fontSize=54&amp;fontAlignY=50"
-    alt="RFCS banner"
-  />
-</p>
-
 # Ouro RFCs
 
 RFCs record substantial design decisions that affect the language, kernel,
@@ -40,11 +32,3 @@ already fixed by an accepted contract do not need an RFC.
 The current implemented behavior remains defined by source, tests, and
 canonical documentation. An RFC explains a decision; it is not automatically a
 release guarantee.
-
-<p align="center">
-  <img
-    width="100%"
-    src="https://capsule-render.vercel.app/api?type=waving&amp;height=220&amp;color=0:0B1220,50:1E1B4B,100:4F46E5&amp;section=footer"
-    alt=""
-  />
-</p>

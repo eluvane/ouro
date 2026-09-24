@@ -6,10 +6,120 @@ unsigned long long ouro_heap_live_bytes(void);
 unsigned long long ouro_heap_total_alloc_bytes(void);
 
 #include <stdint.h>
+#include <errno.h>
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
+#include <windows.h>
+#include <shellapi.h>
+#ifdef _MSC_VER
+#pragma comment(lib, "shell32.lib")
+#endif
+
+unsigned long ouro_host_wide_path(const char *path, wchar_t **output)
+{
+	int count;
+	wchar_t *wide;
+	DWORD error;
+	*output = 0;
+	if (path == 0)
+		return ERROR_INVALID_PARAMETER;
+	count = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, NULL, 0);
+	if (count == 0)
+		return GetLastError();
+	wide = (wchar_t *)malloc((size_t)count * sizeof *wide);
+	if (wide == 0)
+		return ERROR_NOT_ENOUGH_MEMORY;
+	if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, wide, count) != count) {
+		error = GetLastError();
+		free(wide);
+		return error;
+	}
+	*output = wide;
+	return ERROR_SUCCESS;
+}
+
+static int host_argc;
+static char **host_argv;
+
+static void free_host_argv(void)
+{
+	int i;
+	for (i = 0; i < host_argc; i++)
+		free(host_argv[i]);
+	free(host_argv);
+	host_argc = 0;
+	host_argv = 0;
+}
+#endif
+
+int ouro_host_utf8_argv(int *argc, char ***argv)
+{
+#ifdef _WIN32
+	wchar_t **wide;
+	int count;
+	int i;
+	if (host_argv == 0) {
+		wide = CommandLineToArgvW(GetCommandLineW(), &count);
+		if (wide == 0)
+			return 0;
+		if (count <= 0) {
+			LocalFree(wide);
+			return 0;
+		}
+		host_argv = (char **)calloc((size_t)count + 1U, sizeof *host_argv);
+		if (host_argv == 0) {
+			LocalFree(wide);
+			return 0;
+		}
+		host_argc = count;
+		for (i = 0; i < count; i++) {
+			int length = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS,
+				wide[i], -1, NULL, 0, NULL, NULL);
+			if (length == 0 || (host_argv[i] = (char *)malloc((size_t)length)) == 0 ||
+			    WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, wide[i], -1,
+				host_argv[i], length, NULL, NULL) != length) {
+				LocalFree(wide);
+				free_host_argv();
+				return 0;
+			}
+		}
+		if (LocalFree(wide) != NULL || atexit(free_host_argv) != 0) {
+			free_host_argv();
+			return 0;
+		}
+	}
+	*argc = host_argc;
+	*argv = host_argv;
+#else
+	(void)argc;
+	(void)argv;
+#endif
+	return 1;
+}
+
+FILE *ouro_host_fopen(const char *path, const char *mode)
+{
+#ifdef _WIN32
+	wchar_t *wide_path = 0;
+	wchar_t *wide_mode = 0;
+	FILE *file = 0;
+	unsigned long error = ouro_host_wide_path(path, &wide_path);
+	if (error == ERROR_SUCCESS)
+		error = ouro_host_wide_path(mode, &wide_mode);
+	if (error == ERROR_SUCCESS)
+		file = _wfopen(wide_path, wide_mode);
+	else
+		errno = error == ERROR_NOT_ENOUGH_MEMORY ? ENOMEM : EINVAL;
+	free(wide_mode);
+	free(wide_path);
+	return file;
+#else
+	return fopen(path, mode);
+#endif
+}
 
 #define OURO_BLOCK (1024UL * 1024UL)
 /* Cells hold ints and pointers only, so pointer alignment is enough. The

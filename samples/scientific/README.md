@@ -1,11 +1,3 @@
-<p align="center">
-  <img
-    width="100%"
-    src="https://capsule-render.vercel.app/api?type=waving&amp;height=220&amp;color=0:0B1220,50:1E1B4B,100:4F46E5&amp;text=SCIENTIFIC&amp;fontColor=E2E8F0&amp;fontSize=46&amp;fontAlignY=50"
-    alt="SCIENTIFIC banner"
-  />
-</p>
-
 # Typed external-tool execution
 
 This directory contains a small reusable example for connecting typed inputs to
@@ -70,20 +62,9 @@ security boundary.
 It is not a scheduler, workflow DSL, container runtime, cache, provenance
 database, or distributed executor.
 
-Check the reusable layer with:
-
-```sh
-sh scripts/ouro1.sh check samples/scientific/external_tool.ouro
-sh scripts/samples_suite.sh
-```
+Check `samples/scientific/external_tool.ouro` with the
+[module checker](../../docs/tooling.md#check-and-evaluate).
+Suite selection is documented in [CI](../../docs/ci.md).
 
 The domain-specific examples are in
 [`samples/bioinformatics/`](../bioinformatics/README.md).
-
-<p align="center">
-  <img
-    width="100%"
-    src="https://capsule-render.vercel.app/api?type=waving&amp;height=220&amp;color=0:0B1220,50:1E1B4B,100:4F46E5&amp;section=footer"
-    alt=""
-  />
-</p>

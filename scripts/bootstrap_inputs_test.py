@@ -151,6 +151,24 @@ class BootstrapInputTests(unittest.TestCase):
         self.assertEqual(sum(len(row["blank_declarations"]) for row in projection), 4)
         self.assertTrue(provenance["transformations_are_provenance_only"])
 
+    def test_syntax_refresh_preserves_the_historical_seed_and_tracks_every_patch(self):
+        provenance = self.manifest["provenance"]
+        refresh = provenance["syntax_refresh"]
+        self.assertEqual(inputs.digest(refresh["reviewed_patch"].encode()),
+                         refresh["reviewed_patch_sha256"])
+        expected = {"bridge/compiler/" + name for name in
+                    ("parse_a.ouro", "parse_b.ouro", "parser_file.ouro", "preprocess_import.ouro")}
+        self.assertEqual(set(refresh["files"]), expected)
+        for name, row in refresh["files"].items():
+            with self.subTest(member=name):
+                actual = inputs.digest(self.contents[name])
+                self.assertEqual(actual, row["sha256"])
+                self.assertEqual(actual, provenance["source_origins"][name]["syntax_refresh_sha256"])
+                self.assertNotEqual(actual, row["previous_sha256"])
+                self.assertIn("--- a/" + name + "\n", refresh["reviewed_patch"])
+                self.assertIn("+++ b/" + name + "\n", refresh["reviewed_patch"])
+        inputs.verify_stage0(inputs.ROOT, self.manifest)
+
 
 def run() -> None:
     result = unittest.TextTestRunner(verbosity=1).run(unittest.defaultTestLoader.loadTestsFromTestCase(BootstrapInputTests))

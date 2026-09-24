@@ -1,55 +1,25 @@
-<p align="center">
-  <img
-    width="100%"
-    src="https://capsule-render.vercel.app/api?type=waving&amp;height=220&amp;color=0:0B1220,50:1E1B4B,100:4F46E5&amp;text=STDLIB&amp;fontColor=E2E8F0&amp;fontSize=54&amp;fontAlignY=50"
-    alt="STDLIB banner"
-  />
-</p>
-
 # Practical standard library surface
 
 This guide describes the reusable userland capabilities around the core standard library. The goal is to make small Ouro programs less dependent on one-off helpers in each source file.
 
 ## Modules
 
-- `std/string_prims.ouro` owns the shared String and string primitive declarations without IO or platform imports. `std/runtime.ouro` imports the same identities, so analyzer and stdlib IO modules can be used together.
+Choose a module by task; the generated [API reference](api/README.md) owns declaration signatures.
 
-- `std/types.ouro` provides the shared `Nat`, `Bool`, `List`, `Pair`, `Maybe`, `Either`, `Ordering`, and `Unit` declarations and their representation identities. `std/prelude.ouro` and `std/data.ouro` retain these types through imports and provide the existing executable helpers.
-- `std/result.ouro` adds Result-style combinators over `Either E A`. `Right` is the success value and `Left` carries a typed error.
-- `std/collections.ouro` adds indexing, filter-map, indexed mapping, chunking, adjacent-pair helpers, deduplication, and collection helpers for `Either` results.
-- `std/num.ouro` adds comparison aliases, checked division/modulo, range construction, and basic aggregations for `Nat` lists.
-- `std/text.ouro` adds practical string/token helpers, line helpers, character predicates over strings, and typed parsing for natural numbers and booleans.
-- `std/cli.ouro` adds typed command-line lookup over `std/args.ouro`, including required options, positional arguments, `Nat` parsing, boolean parsing, and usage/error text.
-- `std/config.ouro` adds bounded `key=value` config parsing, typed getters, rendering, merge helpers, and `ConfigError` values.
-- `std/fsx.ouro` adds higher-level checked filesystem helpers for text files, line files, config files, filtered listing, remove-if-exists, and non-empty reads.
-- `std/table.ouro` adds header-aware helpers over the CSV parser: named cells, records, named columns, projections, and record maps.
-- `std/lines.ouro` adds bounded line-oriented processing over in-memory stdin/file text: filtering, numbering, field extraction, chunks, transforms, and reports.
-- `std/validation.ouro` adds accumulated validation over `Either (List E) A` for config/args/data checks that should report multiple errors together.
-- `std/report.ouro` adds small report builders, duration wrappers, elapsed timing, and key/value or section rendering.
-- `std/configx.ouro` adds schema-lite config validation and environment override helpers on top of `std/config.ouro`.
-- `std/json.ouro` is the bounded JSON parser and printer. It imports
-  `string_prims` and `char`, not `std/runtime.ouro`, so a JSON-only cone
-  stays off Windows platform modules.
-- `std/jsonx.ouro` adds practical JSON constructors, typed getters, object/array access, and path lookup on top of the bounded JSON parser.
-- `std/tablex.ouro` adds table projection/selection helpers with validation for required columns.
-- `std/processx.ouro` adds shell-free command specs, checked command execution, stdout capture helpers, and simple process-plan rendering/execution.
-  `process_run_expected_codes` accepts an explicit list of exit statuses and
-  preserves stdout and stderr for each accepted status; an empty list rejects all statuses.
-- `std/executable.ouro` queries the current Windows image path with typed allocation, query, conversion and cleanup errors.
-- `std/workspace.ouro` adds workspace-root helpers, temp path helpers, backup-before-overwrite, transform-write, filtered listing, copy-tree, and checked cleanup wrappers.
-- `std/workflow.ouro` adds a small command workflow abstraction: context, errors, result/report rendering, exit codes, and typed lifting from FS/config/process errors.
-- `std/practical.ouro` imports the practical helper modules as a convenience umbrella.
+| Task | Modules |
+| --- | --- |
+| Shared types and results | `std/types.ouro`, `std/prelude.ouro`, `std/data.ouro`, `std/result.ouro` |
+| Text and numbers | `std/string.ouro`, `std/text.ouro`, `std/collections.ouro`, `std/num.ouro` |
+| CLI and configuration | `std/args.ouro`, `std/cli.ouro`, `std/config.ouro`, `std/configx.ouro` |
+| Files and workspace | `std/fs.ouro`, `std/fsx.ouro`, `std/fs_walk.ouro`, `std/fs_replace.ouro`, `std/workspace.ouro` |
+| Data | `std/lines.ouro`, `std/json.ouro`, `std/jsonx.ouro`, `std/csv.ouro`, `std/table.ouro`, `std/tablex.ouro` |
+| Process and reports | `std/process.ouro`, `std/processx.ouro`, `std/validation.ouro`, `std/report.ouro`, `std/workflow.ouro` |
 
-The pre-1.0 collection surface uses `map_indexed`, `chunks_of`,
-`adjacent_pairs`, `dedup_adjacent`, and `nat_range_count`; their former public
-`_go` helpers have been removed. The unused list helpers removed in this update
-and their available replacements are listed in [the changelog](../CHANGELOG.md).
-
-The small language examples also use supported source syntax:
-`std/module_demo.ouro` qualifies imported constructors through `as Util`, and
-`std/mutual_demo.ouro` represents even/odd evidence with one indexed
-`ParityEvidence` family. Its `Even` and `Odd` type aliases retain the example
-value types; constructors are `EvenZero`, `EvenSucc`, and `OddSucc`.
+`std/practical.ouro` imports the practical helpers as a convenience umbrella.
+`std/string_prims.ouro` shares String primitive declarations with the runtime
+without importing platform IO; `std/executable.ouro` supplies the current
+image-path query. The pre-1.0 collection names and removed `_go` helpers are
+recorded in the [changelog](../CHANGELOG.md).
 
 ## CLI arguments
 
@@ -96,8 +66,7 @@ intrinsics. Existing imports and helper signatures stay the same. Programs
 with a standalone prelude must use the registered `ouro.string` type instead
 of an opaque `axiom String : Type;`; import `std/string.ouro` for the standard
 declarations. String lengths and offsets count bytes. See
-[the syntax contract](syntax.md#numbers-and-strings) for literal checking and
-the transitional C runtime's embedded-NUL limitation.
+[the syntax contract](syntax.md#numbers-and-strings) for literal checking.
 
 The experimental Windows native backend implements these pure String
 intrinsics with byte-preserving managed storage, including embedded NUL.
@@ -119,72 +88,23 @@ Use `std/num.ouro` for practical `Nat` helpers: `nat_eq`, `nat_lt`, `nat_le`, `n
 
 ## Filesystem, workspace, and config
 
-`std/fs.ouro` remains the low-level checked filesystem layer. `std/fsx.ouro` adds convenience wrappers that compose those checked operations with common data shapes.
+Use `std/fsx.ouro` for checked text/config reads and writes, filtered listings,
+and remove-if-exists. Use `std/fs.ouro` when the lower-level checked operation
+is needed. The [runtime contract](effects_design.md#runtime-surface) owns native
+path, reparse-point, byte, failure, and host differences.
 
-The experimental Windows native `fs_exists` and `fs_is_dir` actions use strict
-Unicode path attributes and preserve directory bits on junctions. Empty paths
-and ordinary query errors return `False`; the [runtime contract](effects_design.md#runtime-surface)
-describes invalid encoding, cleanup and trailing-separator behavior.
+`fs_rename_checked source target` returns `Either FsError Unit` for same-volume
+replacement. It requires an existing source and target parent and rejects a
+directory target. `std/fs_replace.ouro` provides
+`fs_replace_file source stage backup`, returning `FsReplaced` or
+`FsReplaceFailed os_status`; the caller retains the backup until the result
+and installed bytes are verified. See the [replacement contract](effects_design.md#runtime-surface)
+for metadata, refusal, and recovery conditions.
 
-The experimental Windows native backend supports `fs_read`, `fs_write`,
-`fs_list`, and `prim_fs_listable`, with strict UTF-8 paths. File contents retain
-all bytes. Listing returns Unicode entry names in the unspecified host order;
-it drops `.` and `..` and does not sort. Stored actions reopen or enumerate
-again when run. Listability returns False when its directory/access probe
-fails; malformed arguments and resource/cleanup errors terminate with status
-73. Listing failures also terminate with 73 instead of returning partial names.
-Writing checks the opened final-component reparse point before truncation.
-See [the IO contract](effects_design.md#runtime-surface) for concurrent changes,
-cleanup and the transitional C differences.
-
-Native `fs_mkdir_p` attempts parent creation; `fs_remove` removes files or
-empty directories without recursive deletion. Their Unit result does not
-confirm success, so use the checked wrappers when the postcondition matters.
-Native `fs_copy` preserves binary contents and overwrites through Windows;
-`fs_copy_checked` also creates missing target parents. Invalid paths and
-copy/resource failures terminate with status 73. These actions defer work
-until execution and may be reused. They provide no atomicity or rollback;
-see [the runtime contract](effects_design.md#runtime-surface) for error and
-reparse behavior.
-
-`fs_rename_checked source target` replaces a file on the same volume and
-returns `Either FsError Unit`. Both paths must be nonempty, the source must
-exist, and the target must not be a directory. Target parents must already
-exist. OS refusal is an error; the operation does not fall back to copying or
-deleting files. `prim_fs_rename` exposes the underlying status (`0` for success).
-See [the runtime contract](effects_design.md#runtime-surface) for host differences.
-
-`std/fs_replace.ouro` provides `fs_replace_file source stage backup`, returning
-`FsReplaced` or `FsReplaceFailed os_status`. It requires distinct single-link
-ordinary files on one volume and an empty, privately owned backup reservation.
-Empty paths return `FsReplaceFailed 87` on both supported backends.
-Success installs the stage and retains the previous source at backup. The
-caller must verify the result before deleting that recovery file; a failed
-operation can require recovery. This is the low-level metadata-preserving IO
-boundary used by `tools/quality/source_write.ouro`, not a rewrite validator.
-See [the runtime contract](effects_design.md#runtime-surface) for supported
-metadata, refusals and partial failure states.
-
-Native `prim_fs_realpath` resolves Unicode files and directories, follows
-links, and returns normalized UTF-8 with forward slashes. Its stored action
-resolves again on each execution. Empty paths and OS unavailability return
-an empty String; malformed paths, conversion, raw storage and cleanup
-failures exit 73. See [the runtime contract](effects_design.md#runtime-surface)
-for resource ownership and concurrent changes.
-
-In the experimental Windows native path, `prim_fs_kind` queries a strict UTF-8
-path when its action runs. Reusing the action queries the path again. It returns
-`0` for an empty path or OS query failure, `1` for a file, `2` for a directory,
-and `3` for a reparse point, without following its target. Embedded NUL, invalid
-UTF-8, allocation and cleanup failures terminate with status 73.
-
-Security-sensitive inventory code should import `std/fs_walk.ouro` and use
-`fs_walk_checked`. It returns
-`FsWalkComplete`, `FsWalkTruncated`, `FsWalkUnreadable`, or `FsWalkUnsafe`, sorts
-children deterministically, rejects links/reparse points and canonical escapes,
-and bounds the total visited entries. The compatibility `fs_walk` helper returns
-an empty list for every non-complete result; it never exposes a partial list as
-success.
+For security-sensitive inventory, use `fs_walk_checked` from `std/fs_walk.ouro`.
+It sorts children and distinguishes complete, truncated, unreadable, and unsafe
+walks. The compatibility `fs_walk` returns an empty list for every non-complete
+result and must not be used to infer that a directory is empty.
 
 ```ouro
 import "../std/fsx.ouro";
@@ -192,9 +112,10 @@ import "../std/fsx.ouro";
 fsx_read_config "tool.conf"
 ```
 
-A config file is parsed as line-based `key=value`. Blank lines and `#` comments are ignored. A repeated key keeps the later value. `config_from_pairs` and `map_from_pairs` apply entries from left to right with that same later-entry override, and `map_union` lets later entries of the second map replace earlier ones. `config_get_nat` and `config_get_bool` return typed errors when a value is missing or malformed.
-
-`std/configx.ouro` adds schema-lite validation where multiple fields can be checked in one pass:
+`std/config.ouro` parses line-based `key=value`, ignoring blank lines and `#`
+comments; later duplicate keys win. `config_get_nat` and `config_get_bool`
+return typed errors for missing or malformed values. `std/configx.ouro` can
+collect field errors in one pass:
 
 ```ouro
 configx_validate_schema cfg
@@ -204,7 +125,7 @@ configx_validate_schema cfg
   ]
 ```
 
-`std/workspace.ouro` gives file tools one root object and consistent path helpers:
+`std/workspace.ouro` groups checked paths beneath one root:
 
 ```ouro
 match workspace_make "_build/my_tool" with
@@ -213,7 +134,8 @@ match workspace_make "_build/my_tool" with
 end
 ```
 
-The backup/temp helpers are intentionally conservative: they provide checked userland behavior on top of the existing runtime, but they do not promise POSIX-grade atomic replacement or cryptographically unique temp files.
+Temp and backup helpers do not promise atomic replacement or unpredictable
+temporary names.
 
 ## JSON, CSV, and tables
 
@@ -269,92 +191,32 @@ identity or verify executable bytes when those properties matter. See
 
 ## Process runners and command workflows
 
-Use `std/processx.ouro` to avoid shell strings by default. A command is represented as a program plus argv list:
+Use `std/processx.ouro` for program-plus-argv command specs:
 
 ```ouro
 let cmd : CommandSpec := command_spec "echo" ["ouro"] in
 process_stdout_checked cmd
 ```
 
-`command_render` and `process_plan_render` are for display/dry-run output. They are not shell-escaping APIs and should not be fed back into a shell.
+`command_render` and `process_plan_render` produce display text, not shell
+commands. `process_run_inherited` and `process_run_spec_inherited` preserve a
+completed child's exit code in `Either ProcessRunError Nat`; their `_checked`
+variants turn a nonzero exit into `ProcessExited`. Use the captured-bounded
+variants to set explicit timeout, memory, and stream limits; their `_with_input`
+forms provide exact binary stdin. A nonzero child exit is still a completed
+capture. Timeout, stream overflow, observed memory violation, OS refusal, and
+incomplete cleanup are typed errors. The [runtime contract](effects_design.md#runtime-surface)
+owns process containment and host limitations.
 
-`prim_process_capture` returns `Pair Nat (Pair String String)`: exit status,
-stdout, and stderr. `std/types.ouro` registers the required `ouro.pair`
-representation. `prim_proc_exec` adapts this checked intrinsic to the
-existing `ProcResult` shape, so `proc_exec`, `process_run`, and their checked
-wrappers keep their result types. A stored action runs the command again each
-time it is executed.
-
-`process_run_inherited` and `process_run_spec_inherited` run a foreground
-child with the caller's stdin, stdout, stderr, current directory and environment.
-They return `Either ProcessRunError Nat`, preserving every completed child exit
-code, including 259. The `_checked` variants report nonzero child exits as
-`ProcessExited`; setup and wait failures use `ProcessUnavailable` with the OS
-status. Arguments stay separate from the executable and are never shell text.
-
-The native Windows adapter owns a job for the child and its descendants.
-Closing the foreground scope or terminating its parent closes that job; the
-adapter does not detach background descendants. Children share the console
-and ordinary Ctrl+C handling. This API has no separate timeout/cancel token.
-Job assignment occurs during creation, requires Windows 10 / Server 2016 or
-newer, and fails explicitly when enclosing job restrictions prevent it.
-The temporary C host reports OS status 120 (not implemented) for this API.
-
-`process_run_captured_bounded` and `process_run_spec_captured_bounded`
-return `Either ProcessCaptureError ProcessCaptureResult`. Their `_with_input`
-variants take an exact binary stdin String; the default input is empty with
-immediate EOF. `process_capture_proc_result` exposes the completed exit and
-exact stdout/stderr bytes, while `process_capture_peak_bytes` exposes measured
-peak Job commit. A nonzero child exit, including 259, remains a completed result.
-
-`ProcessCaptureLimitsOf timeout_ms memory_mib cpu_count stdout_bytes stderr_bytes`
-requires a positive finite timeout, positive memory cap, and CPU count 1.
-Zero byte caps require empty streams. `process_capture_default_limits` supplies
-one CPU and 3 GiB while keeping timeout and each stream cap explicit. Timeout,
-OS failure, incomplete cleanup, observed memory violation, and stream overflow
-are typed failures. Overflow never returns truncated success. The owner waits
-for the contained tree to stop before reading either capture file, with a
-separate 5-second cleanup budget. Cleanup waits for the process handle,
-not only job accounting, and may stop the direct child with a finite
-`TerminateProcess` when the job did not contain it. Capture files are
-`DELETE_ON_CLOSE` and are flushed before their length is measured, so a
-killed writer cannot hide bytes it already wrote. The execution timeout starts at launch;
-argument/input preparation and filesystem IO are not separately time-bounded.
-
-The memory cap is aggregate committed Job memory, not resident memory. Observed
-Windows Job memory events always fail, including a child's expected exit 73.
-Windows does not guarantee delivery of those events; a denied allocation can
-therefore lack a resource attribution event. Consumers requiring complete
-attribution must retain that limitation in their acceptance policy. This API
-does not add a streaming pipeline. On Windows the transitional C host now executes this bounded API
-through a narrow adapter with the same typed reply contract: Job containment with kill-on-close,
-completion-port termination events, private capture files, exact stdin framing, stream caps, and
-measured peak Job commit. The adapter validates CPU count 1 without affinity pinning and reports
-resource events only from observed port events. On POSIX the C-host action still returns typed
-OS status 120 without launching a process.
-
-The transitional C process host uses per-request private capture files. On
-POSIX it executes the supplied argv directly; the Windows compatibility path
-keeps command and capture files inside a unique private directory and removes
-them after collection. Native process lowering uses the Windows runtime;
-the bounded native API provides the separately documented timeout and tree
-cleanup contract.
-
-`std/workflow.ouro` provides a small layer for tools that parse args/config, validate, run actions, and print a report or error with a conventional exit code. It is not a task runner, scheduler, shell, or package-manager layer.
+`std/workflow.ouro` composes parsed arguments, config, validation, execution,
+and report/error rendering with conventional exit codes. It does not implement
+a scheduler or streaming pipeline.
 
 ## HTTP messages and requests
 
 `std/http.ouro` provides HTTP message parsing and `http_post url headers body`.
-Its checked `prim_http_request` intrinsic uses WinHTTP on the experimental
-native Windows path, with OS-owned TLS certificate verification. It does not
-invoke `curl` or stage request bodies in temporary files.
-
-`http_status` and `http_body` preserve server error responses as well as
-successful ones. A transport failure has status `0` and an explicit
-`http_reason`. `http_resp_headers` is currently empty for these requests.
-The transitional C host has no HTTP transport. Its deferred action returns
-status `0`, an empty body, and `HTTP transport unavailable in C host` as the
-reason. Native execution and isolated-host acceptance remain separate checks.
+The [runtime contract](effects_design.md#networking) defines Windows transport,
+response/error fields, and C-host behavior.
 
 ## Validation and reports
 
@@ -393,50 +255,20 @@ It requires the Windows native backend and launches no external `sleep` command.
 
 ## Acceptance programs
 
-The acceptance programs exercise reusable APIs together rather than acting as standalone demos:
-
-- `tests/practical_stdlib_tests.ouro` combines text, ranges, config, CLI parsing, table records, and user-level tests.
-- `samples/examples/practical_cli_file.ouro` combines CLI args, checked file read, text transform, stdout/stderr, and exit codes.
-- `samples/examples/practical_stdin_aggregate.ouro` combines stdin, line parsing, filtering, numeric aggregation, and formatted reports.
-- `samples/examples/practical_config_report.ouro` combines CLI args, checked config-file read, typed config getters, and report rendering.
-- `tests/workflow_stdlib_tests.ouro` checks the reusable workflow modules together.
-- `samples/examples/workflow_stdin_report.ouro` reads stdin, filters comments/blanks, parses Nat fields, aggregates, and renders a report.
-- `samples/examples/workflow_json_table_transform.ouro` combines bounded JSON getters, table selection, validation-shaped data, and report output.
-- `samples/examples/workflow_process_runner.ouro` builds a shell-free command spec, runs it checked, captures stdout, and reports it.
-- `samples/examples/workflow_validation_report.ouro` accumulates multiple validation failures and renders all errors.
-- `samples/examples/workflow_workspace_tool.ouro` creates a workspace, writes/copies files, and reports outputs.
-- `samples/examples/workflow_config_transform.ouro` combines checked workspace IO, config, line filtering, transform, write, and report.
+The [practical programs](practical_programs.md) and
+[application surface](practical_application_surface.md) show these modules in
+small executable tools.
 
 ## Running checks
 
-Typical commands:
-
-```sh
-sh scripts/ouro1.sh check tests/workflow_stdlib_tests.ouro
-sh scripts/build_tool.sh samples/examples/workflow_stdin_report.ouro _build/tools/workflow_stdin_report
-sh scripts/build_tool.sh samples/examples/workflow_process_runner.ouro _build/tools/workflow_process_runner
-sh scripts/samples_suite.sh
-python3 scripts/api_baseline_regen.py --check
-sh scripts/doc_suite.sh
-```
-
-OuroSmith generates typed helper compositions and compares their values and
-error paths with Python contracts:
-
-```sh
-python3 scripts/ouro_smith.py replay --layer surface --seed 1 --case stdlib_workflow
-python3 scripts/ouro_smith.py replay --layer surface --seed 1 --case stdlib_tables
-python3 scripts/ouro_smith.py replay --layer surface --seed 1 --case runtime_io
-```
+The focused standard-library and sample checks are listed in
+[CI](ci.md#local-profiles); [OuroSmith](ouro_smith.md) owns generated workflow
+and runtime compositions.
 
 ## Current limits
 
-The practical standard-library surface does not change kernel semantics, typechecker semantics, core syntax, generated C artifacts, package-manager architecture, formatter behavior, or the trust boundary. Filesystem operations still use the existing runtime primitives and therefore keep the same host/runtime limits. Line processing is bounded/in-memory. Bounded native capture can pass a complete binary stdin String; process helpers do not build streaming stdout-to-stdin pipelines. Config, JSON, CSV, and table helpers are intentionally small and bounded; they are meant for practical small tools, not full TOML/YAML/SQL/serde replacement.
-
-<p align="center">
-  <img
-    width="100%"
-    src="https://capsule-render.vercel.app/api?type=waving&amp;height=220&amp;color=0:0B1220,50:1E1B4B,100:4F46E5&amp;section=footer"
-    alt=""
-  />
-</p>
+Line processing remains bounded and in memory. Config, JSON, CSV, and table
+helpers target small tools; process helpers do not provide a streaming pipeline.
+The [runtime contract](effects_design.md#runtime-surface) and
+[stability policy](stability.md#experimental-areas) describe host and pre-1.0
+limits.

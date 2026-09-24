@@ -1108,6 +1108,17 @@ int main(int argc, char **argv)
 	FILE *f;
 	char buf[64];
 
+	if (!ouro_host_utf8_argv(&argc, &argv))
+		return fail("invalid Windows command line");
+	if (argc >= 2 && strcmp(argv[1], "--host-arguments") == 0) {
+		int i;
+		ouro_io_set_argv(argc, argv);
+		for (i = 2; i < argc; i++) {
+			if (fwrite(argv[i], 1, strlen(argv[i]) + 1U, stdout) != strlen(argv[i]) + 1U)
+				return fail("argv observer output");
+		}
+		return 0;
+	}
 	if (argc == 2 && strcmp(argv[1], "--capture-child") == 0) {
 		fputs("capture-out", stdout);
 		fputs("capture-err", stderr);
@@ -1137,7 +1148,8 @@ int main(int argc, char **argv)
 	if (argc == 2 && strcmp(argv[1], "--bounded-child73") == 0)
 		return 73;
 	ouro_rt_warmup();
-	if (argc == 3 && (strcmp(argv[1], "--read-file") == 0 || strcmp(argv[1], "--read-nul-path") == 0)) {
+	if (argc == 3 && (strcmp(argv[1], "--read-file") == 0 || strcmp(argv[1], "--read-nul-path") == 0 ||
+	    strcmp(argv[1], "--read-invalid-utf8-path") == 0)) {
 		ouro_v *name = ouro_str(argv[2]);
 		ouro_io_set_argv(argc, argv);
 		if (strcmp(argv[1], "--read-nul-path") == 0) {
@@ -1145,11 +1157,33 @@ int main(int argc, char **argv)
 			name = ouro_apply(ouro_apply(ouro_io_prim_req("prim_string_concat"), name),
 			    ouro_packed(suffix, sizeof suffix));
 		}
+		if (strcmp(argv[1], "--read-invalid-utf8-path") == 0)
+			name = ouro_apply(ouro_apply(ouro_io_prim_req("prim_string_concat"), name), ouro_str("\xC0\xAF"));
 		r = ouro_apply(ouro_apply(ouro_io_prim_req("prim_fs_read_file"), name), ouro_ctor(0, 0, 0));
 		if (r == 0 || r->tag != OURO_TAG_BYTES || r->n < 0)
 			return fail("read did not return packed bytes");
 		if (fwrite(r->u.s, 1, (size_t)r->n, stdout) != (size_t)r->n)
 			return fail("read observer output failed");
+		return 0;
+	}
+	if (argc == 3 && (strcmp(argv[1], "--path-info") == 0 || strcmp(argv[1], "--path-info-nul") == 0 ||
+	    strcmp(argv[1], "--path-info-invalid-utf8") == 0)) {
+		ouro_v *name = ouro_str(argv[2]);
+		ouro_v *exists;
+		ouro_v *directory;
+		if (strcmp(argv[1], "--path-info-nul") == 0) {
+			static const unsigned char suffix[] = { 0, 'x' };
+			name = ouro_apply(ouro_apply(ouro_io_prim_req("prim_string_concat"), name),
+			    ouro_packed(suffix, sizeof suffix));
+		}
+		if (strcmp(argv[1], "--path-info-invalid-utf8") == 0)
+			name = ouro_apply(ouro_apply(ouro_io_prim_req("prim_string_concat"), name), ouro_str("\xC0\xAF"));
+		exists = ouro_apply(ouro_apply(ouro_io_prim_req("prim_fs_exists"), name), ouro_ctor(0, 0, 0));
+		directory = ouro_apply(ouro_apply(ouro_io_prim_req("prim_fs_is_dir"), name), ouro_ctor(0, 0, 0));
+		if (exists == 0 || directory == 0 || exists->n != 0 || directory->n != 0 ||
+		    exists->tag < 0 || exists->tag > 1 || directory->tag < 0 || directory->tag > 1)
+			return fail("path predicate result");
+		printf("exists=%d directory=%d\n", exists->tag == 0, directory->tag == 0);
 		return 0;
 	}
 	if (argc == 5 && strcmp(argv[1], "--replace-files") == 0) {

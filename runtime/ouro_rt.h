@@ -7,6 +7,9 @@
 
 #include <stdio.h> /* FILE, for ouro_write_codes */
 #include <stdint.h>
+#ifdef _WIN32
+#include <wchar.h>
+#endif
 
 typedef struct ouro_v ouro_v;
 typedef struct ouro_env ouro_env;
@@ -118,6 +121,13 @@ ouro_v *ouro_packed(const unsigned char *b, unsigned long len);
 ouro_v *ouro_string_codes(const char *s);
 void ouro_slash_path(char *p);
 void ouro_write_codes(ouro_v *list, FILE *out);
+
+/* Host text boundaries; POSIX retains its native byte paths and argv. */
+int ouro_host_utf8_argv(int *argc, char ***argv);
+FILE *ouro_host_fopen(const char *path, const char *mode);
+#ifdef _WIN32
+unsigned long ouro_host_wide_path(const char *path, wchar_t **output);
+#endif
 
 ouro_env *ouro_cons(ouro_v *v, ouro_env *next);
 ouro_v *ouro_get(ouro_env *env, int k);

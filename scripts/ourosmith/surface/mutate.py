@@ -139,6 +139,8 @@ extern {name} : HostAction NativeWord :=
         ("lint-hole", f"def {name} : Nat := _;", "hole:"),
         ("lint-unbound", f"def {name} : Nat := missing{seed};", "unbound:"),
         ("lint-unused", f"def {name} (unused : Nat) : Nat := Z;", "unused:"),
+        ("lint-helper-unused", f"def {name} : Nat := let helper (unused : Nat) : Nat := Z in helper Z;", "OURO-LINT003"),
+        ("lint-helper-shadow", f"def {name} (value : Nat) : Nat := let helper (value : Nat) : Nat := value in helper value;", "OURO-LINT004"),
         ("lint-shadow", f"def {name} (x : Nat) : Nat := let x : Nat := x in x;", "shadow:"),
         ("lint-arity", f"def {name} (n : Nat) : Nat := match n with | Z => Z | S => Z end;", "ctor-arity:"),
         ("lint-redundant", f"def {name} (n : Nat) : Nat := match n with | Z => Z | Z => Z | S k => k end;", "redundant-branch:"),

@@ -1,11 +1,3 @@
-<p align="center">
-  <img
-    width="100%"
-    src="https://capsule-render.vercel.app/api?type=waving&amp;height=220&amp;color=0:0B1220,50:1E1B4B,100:4F46E5&amp;text=STABILITY&amp;fontColor=E2E8F0&amp;fontSize=46&amp;fontAlignY=50"
-    alt="STABILITY banner"
-  />
-</p>
-
 # Stability and compatibility
 
 Ouro is pre-1.0 research software. The project is still refining the language,
@@ -14,7 +6,7 @@ narrower than it will be for a stable release.
 
 ## Versioning
 
-The repository version is currently `0.1.0`. Release tags use `v<version>`.
+Release tags and shared version files are defined in [Releasing](releasing.md#version).
 
 During the `0.x` series, breaking changes are allowed. A breaking user-visible
 change must be documented in `CHANGELOG.md`, covered by tests or fixtures, and
@@ -37,17 +29,9 @@ change also needs an RFC.
 ## What counts as breaking
 
 A change is breaking when existing Ouro code or automation can be accepted,
-rejected, evaluated, imported, packaged, or invoked differently.
-
-Examples include:
-
-- syntax removal or precedence changes;
-- new or changed typechecking behavior;
-- standard-library path or signature changes;
-- CLI flag, output, or exit-status changes;
-- package manifest or lockfile changes;
-- diagnostic code changes used by tools;
-- a new trusted component or core-artifact version.
+rejected, evaluated, imported, packaged, or invoked differently. That includes
+the surfaces in the table above, including diagnostic codes and trusted
+components.
 
 ## Experimental areas
 
@@ -63,18 +47,6 @@ The following areas are especially likely to change before 1.0:
 
 ## Assurance is separate from compatibility
 
-Compatibility describes whether an interface stays the same. It does not make
-that interface trusted.
-
-Kernel checking establishes well-typed core declarations under the implemented
-rules. It does not prove runtime safety, external process behavior, package
-authenticity, scientific correctness, or the truth of an axiom. Those claims
-require separate evidence.
-
-<p align="center">
-  <img
-    width="100%"
-    src="https://capsule-render.vercel.app/api?type=waving&amp;height=220&amp;color=0:0B1220,50:1E1B4B,100:4F46E5&amp;section=footer"
-    alt=""
-  />
-</p>
+Compatibility describes whether an interface stays the same. The
+[trusted computing base](tcb.md#assurance-limits) states what compiler checking
+does and does not establish.

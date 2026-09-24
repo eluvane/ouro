@@ -238,7 +238,7 @@ def test_retired_toolchain_contract(tmp: Path) -> None:
          patch.object(build_driver, "trim_cache") as cache, \
          patch.object(build_driver.shutil, "which", side_effect=AssertionError("unexpected toolchain discovery")):
         build_driver.run_build(argparse.Namespace())
-    current_stage.assert_called_once_with(config, build_driver, build_driver.ROOT)
+    current_stage.assert_called_once_with(config, build_driver, build_driver.ROOT, compact_sources=False)
     cache.assert_called_once_with(config)
 
     for args in (["build", "--c-only"], ["rebuild", "--c-only"],
@@ -1568,6 +1568,62 @@ def test_collect_build_protocol(tmp: Path) -> None:
     assert log.read_text(encoding="utf-8") == failure.stderr
 
 
+def test_collected_unit_arguments(tmp: Path) -> None:
+    """The public wrapper preserves each collector line as one literal argv."""
+    repo = tmp / "collect-arguments"
+    (repo / "scripts").mkdir(parents=True)
+    (repo / "tools").mkdir()
+    (repo / "out").mkdir()
+    shutil.copyfile(ROOT / "scripts/ouro1.sh", repo / "scripts/ouro1.sh")
+    for name in ("collect.ouro", "collect_core.ouro"):
+        (repo / "tools" / name).write_text("-- fixture\n", encoding="utf-8")
+    entry = "корень 漢字.ouro"
+    (repo / entry).write_text("def value : Nat := 0;\n", encoding="utf-8")
+    (repo / "literala.ouro").touch()
+    collector = repo / "out/ouro-collect"
+    collector.write_text('#!/bin/sh\nprintf "%s\\n" "$COLLECT_UNITS"\n#' + "x" * 4100 + "\n",
+                         encoding="utf-8")
+    collector.chmod(0o755)
+    compiler = repo / "compiler"
+    compiler.write_text(
+        '#!/bin/sh\nprintf "%s\\0" "$@" >"$COLLECT_ARGV_LOG"\n'
+        'if [ "$1" = check ]; then printf "CHECK_OK\\n"; exit 0; fi\n'
+        'echo "argv observer stopped before emission" >&2\nexit 23\n', encoding="utf-8")
+    compiler.chmod(0o755)
+    log = repo / "compiler-argv"
+    env = isolated_env()
+    env.update(OURO_ROOT=repo.as_posix(), OURO1_COMPILER=compiler.as_posix(),
+               OURO_C_BUILD_DIR=(repo / "out").as_posix(), COLLECT_ARGV_LOG=log.as_posix())
+    shell = shutil.which("sh")
+    assert shell, "collector argv tests require the supported POSIX shell"
+    units = ["with space.ouro", "путь 漢字.ouro", "tab\tname.ouro", "literal[ab].ouro",
+             "literal?.ouro", "literal*.ouro", "back\\slash.ouro", "  padded.ouro  ", entry]
+
+    def invoke(command, selected):
+        log.unlink(missing_ok=True)
+        env["COLLECT_UNITS"] = "\n".join(selected)
+        arguments = [shell, "scripts/ouro1.sh", command, entry]
+        if command == "eval":
+            arguments += ["--eval", "value"]
+        result = subprocess.run(arguments, cwd=repo, env=env, capture_output=True,
+                                text=True, encoding="utf-8", timeout=30, check=False)
+        forwarded = log.read_bytes().decode("utf-8").split("\0")[:-1] if log.exists() else None
+        return result, forwarded
+
+    expected = [argument for unit in units for argument in ("--unit", unit)]
+    result, forwarded = invoke("check", units)
+    assert (result.returncode, result.stdout, result.stderr) == (0, "CHECK_OK\n", ""), result
+    assert forwarded == ["check", entry, "16000", *expected], forwarded
+    result, forwarded = invoke("eval", units)
+    assert result.returncode == 1 and "argv observer stopped before emission" in result.stderr, result
+    assert forwarded[0].endswith(".ouro") and ".ouro_eval_wrap_" in forwarded[0], forwarded
+    assert forwarded[1:] == ["2000", *expected], forwarded
+    result, forwarded = invoke("check", [entry])
+    assert result.returncode == 0 and forwarded == ["check", entry, "16000"], (result, forwarded)
+    result, forwarded = invoke("check", [])
+    assert result.returncode == 1 and "empty source closure" in result.stderr and forwarded is None, result
+
+
 def test_build_tool_caller_paths(tmp: Path) -> None:
     repo = tmp / "build-tool-cwd"
     scripts = repo / "scripts"
@@ -1711,6 +1767,7 @@ def main() -> int:
         test_clang_bracket_depth(tmp)
         test_memory_preparation_failure(tmp)
         test_collect_build_protocol(tmp)
+        test_collected_unit_arguments(tmp)
         test_build_tool_caller_paths(tmp)
         test_runtime_io_host_selection(tmp)
         test_source_replace_report_protocol(tmp)

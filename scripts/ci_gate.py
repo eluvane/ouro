@@ -77,7 +77,7 @@ PR_GROUPS: dict[str, tuple[str, ...]] = {
         "compiler-scale",
         "compiler-depth",
     ),
-    "analyzer": ("analyze-precision",),
+    "analyzer": ("analyze-precision", "lint-changed"),
     "lint": ("lint",),
     "tests": (
         "ergonomics",
@@ -97,7 +97,7 @@ NIGHTLY_GROUPS: dict[str, tuple[str, ...]] = {
     "checks": tuple("cache-parity-full" if name == "cache-parity-module" else name
                     for name in PR_GROUPS["checks"]),
     "analysis": PR_GROUPS["analysis"],
-    "analyzer": (*PR_GROUPS["analyzer"], "analyze-production"),
+    "analyzer": ("analyze-precision", "analyze-production"),
     "lint": PR_GROUPS["lint"],
     "tests": (*PR_GROUPS["tests"], "quickstart-smoke"),
     "samples-1": PR_GROUPS["samples-1"],
@@ -178,6 +178,14 @@ PR_BASE_GATES = (
     "structural-quality-suite", "structural-quality", "hygiene",
 )
 TOOL_INTEGRATION_GATES = ("test", "ouro-smith", "samples-1", "samples-2", "lint")
+# These gates take the changed paths as input. A selection without a routing
+# plan cannot run them; the complete lint gate owns those runs.
+PATH_INPUT_GATES = ("lint-changed",)
+# Mirrors the production sweep in scripts/lint_suite.sh. The package sample
+# needs the vendored snapshot that suite prepares, so only the complete lint
+# covers it.
+LINT_CHANGED_EXCLUDED_PREFIXES = ("samples/pkg/",)
+LINT_CHANGED_EXPLICIT = frozenset({"samples/bench/core_suite.ouro"})
 TEXT_TOOL_GATES = (
     "fmt", "fix", "analyze-precision", "memory-budget", "lsp",
     "language-speed-simplicity",
@@ -266,7 +274,7 @@ def full_path_selection(reason: str) -> PathSelection:
         dependency=True,
         paths=(),
         reason=reason,
-        gates=tuple(name for names in PR_GROUPS.values() for name in names),
+        gates=tuple(name for names in PR_GROUPS.values() for name in names if name not in PATH_INPUT_GATES),
         portable=True,
     )
 
@@ -292,7 +300,7 @@ def classify_paths(paths: Sequence[str]) -> PathSelection:
         for names in matches:
             selected.update(names)
     if full:
-        selected = {name for names in PR_GROUPS.values() for name in names}
+        selected = {name for names in PR_GROUPS.values() for name in names if name not in PATH_INPUT_GATES}
     elif selected and any(is_docs_path(path) for path in normalized):
         selected.update(DOCS_GROUPS["docs"])
     return PathSelection(
@@ -339,7 +347,9 @@ def affected_compiler_gates(paths: Sequence[str], root: Path = ROOT) -> set[str]
             source = source_path.read_text(encoding="utf-8")
             imports[path] = quoted_import_targets(source, path)
             tokens, _comments = lex(source, "ouro")
-            if sum(token.value == "import" for token in tokens) != len(imports[path]):
+            # Groups have several dependencies per import; the reader rejects
+            # missing/malformed members before this declaration-coverage check.
+            if sum(token.value == "import" for token in tokens) > len(imports[path]):
                 raise ValueError(f"unsupported import layout in {path}")
         return imports[path]
 
@@ -351,15 +361,53 @@ def affected_compiler_gates(paths: Sequence[str], root: Path = ROOT) -> set[str]
     return selected
 
 
+def ouro_string_list(source: str, name: str) -> tuple[str, ...]:
+    """Read one literal `def NAME : List String := [...]` inventory."""
+    match = re.search(rf"^def {re.escape(name)} : List String :=\s*\[([^\]]*)\];", source, re.MULTILINE)
+    body = match.group(1) if match else ""
+    items = tuple(re.findall(r'"([^"\\\n]*)"', body))
+    if source.count(f"def {name} ") != 1 or not items or re.sub(r'"[^"\\\n]*"|[\s,]', "", body):
+        raise ValueError(f"{name} is not a single literal String list")
+    return items
+
+
+def lint_changed_sources(paths: Sequence[str], root: Path = ROOT) -> list[str]:
+    """Changed files that the complete production lint would select."""
+    worker = (root / "tools/lint_worker.ouro").read_text(encoding="utf-8")
+    source = (root / "tools/quality/source.ouro").read_text(encoding="utf-8")
+    roots = ouro_string_list(worker, "defaults")
+    skipped = {*ouro_string_list(source, "quality_skip_names"), *ouro_string_list(worker, "lint_fixture_dirs")}
+    fixture_names = set(ouro_string_list(worker, "lint_fixture_names"))
+    selected: set[str] = set()
+    for path in paths:
+        parts = path.split("/")
+        if not path.endswith(".ouro") or not (root / path).is_file():
+            continue
+        if path in LINT_CHANGED_EXPLICIT or (
+            len(parts) > 1 and parts[0] in roots
+            and not path.startswith(LINT_CHANGED_EXCLUDED_PREFIXES)
+            and not skipped.intersection(parts[1:-1])
+            and parts[-1] not in fixture_names
+        ):
+            selected.add(path)
+    return sorted(selected)
+
+
 def plan_paths(paths: Sequence[str]) -> PathSelection:
     selection = classify_paths(paths)
-    if not selection.core or selection.portable:
+    if not selection.core:
         return selection
+    affected: set[str] = set()
+    if not selection.portable:
+        try:
+            affected = affected_compiler_gates(selection.paths)
+        except (OSError, ValueError, SystemExit, RecursionError) as exc:
+            return full_path_selection(f"compiler dependency inventory unavailable: {exc}")
     try:
-        affected = affected_compiler_gates(selection.paths)
-    except (OSError, ValueError, SystemExit, RecursionError) as exc:
-        return full_path_selection(f"compiler dependency inventory unavailable: {exc}")
-    names = set(selection.gates) | affected
+        lint_sources = lint_changed_sources(selection.paths)
+    except (OSError, ValueError) as exc:
+        return full_path_selection(f"lint source inventory unavailable: {exc}")
+    names = set(selection.gates) | affected | (set(PATH_INPUT_GATES) if lint_sources else set())
     return replace(selection, gates=tuple(name for group in PR_GROUPS.values() for name in group if name in names))
 
 
@@ -627,6 +675,8 @@ def gates() -> list[Gate]:
         Gate("pkg", ["sh", "scripts/pkg_suite.sh"], ("pr", "nightly", "manual"), env=(("PKG_SUITE_OUT", "_build/pkg_suite"),)),
         Gate("doc", ["sh", "scripts/doc_suite.sh"], ("pr", "nightly", "manual", "docs"), env=(("DOC_SUITE_OUT", "_build/doc_suite"),)),
         Gate("lint", ["sh", "scripts/lint_suite.sh"], ("pr", "nightly", "manual"), env=(("LINT_SUITE_OUT", "_build/lint_suite"),)),
+        # main() appends the changed production sources from the routing plan.
+        Gate("lint-changed", ["sh", "scripts/ouro1.sh", "lint", "--deny", "--"], ("pr",)),
         Gate("lsp", ["sh", "scripts/lsp_suite.sh"], ("pr", "nightly", "manual"), env=(("LSP_SUITE_OUT", "_build/lsp_suite"),)),
         Gate("test", ["sh", "scripts/test_suite.sh"], ("pr", "nightly", "manual"), env=(("TEST_SUITE_OUT", "_build/test_suite"),)),
         *(Gate(f"compiler-checking-{index}", ["sh", "scripts/test_suite.sh", "--compiler-checking", f"--shard={index}/8"], ("pr", "nightly", "manual", "kernel"), env=(("TEST_SUITE_OUT", f"_build/compiler_check_suite_{index}"), ("OURO_JOBS", "1"), ("OURO_FRONTEND_JOBS", "1"))) for index in range(1, 9)),
@@ -731,7 +781,7 @@ def run_self_tests(all_gates: Sequence[Gate]) -> int:
                 planned = [row["group"] for row in selection_matrix(full_path_selection("selftest"))["include"]]
                 if len(planned) != len(groups) or set(planned) != set(groups):
                     failures.append("full PR routing omits or duplicates a group")
-            elif matrix != [group for group in groups if group != "lint"]:
+            elif matrix != list(groups):
                 failures.append(f"hosted {profile} matrix differs from automatic group inventory: {matrix}")
     lint_workflow = (ROOT / ".github/workflows/ouro-lint.yml").read_text(encoding="utf-8")
     triggers = re.search(r"^on:\n(.*?)(?=^\S|\Z)", lint_workflow, re.MULTILINE | re.DOTALL)
@@ -886,12 +936,22 @@ def routing_contract_failures() -> list[str]:
         if affected_compiler_gates(["tools/unused.ouro"], root):
             failures.append("unrelated tool selected compiler shards")
         (root / "tests/shared.ouro").write_text('import\n "../tools/lsp_model.ouro";\n', encoding="utf-8")
+        if affected_compiler_gates(["tools/lsp_model.ouro"], root) != {"compiler-checking-1"}:
+            failures.append("multiline import lost its dependent compiler shard")
+        (root / "tools/group_first.ouro").write_text("def first : Nat := 0;\n", encoding="utf-8")
+        (root / "tests/shared.ouro").write_text(
+            'import "../tools/group_first.ouro", -- second dependency\n "../tools/lsp_model.ouro",;\n',
+            encoding="utf-8")
+        for dependency in ("tools/group_first.ouro", "tools/lsp_model.ouro"):
+            if affected_compiler_gates([dependency], root) != {"compiler-checking-1"}:
+                failures.append("grouped import lost its dependent compiler shard: " + dependency)
+        (root / "tests/shared.ouro").write_text('import "../tools/group_first.ouro", missing;\n', encoding="utf-8")
         try:
             affected_compiler_gates(["tools/lsp_model.ouro"], root)
         except ValueError:
             pass
         else:
-            failures.append("unsupported multiline import silently lost a dependency")
+            failures.append("malformed grouped import silently lost a dependency")
         inventory.write_text(inventory.read_text(encoding="utf-8") + "unknown_inventory_expression", encoding="utf-8")
         try:
             compiler_fixture_roots(root)
@@ -914,6 +974,70 @@ def routing_contract_failures() -> list[str]:
         values = dict(line.split("=", 1) for line in output.read_text(encoding="utf-8").splitlines())
         if values["core"] != "false" or json.loads(values["changed_paths"]) != list(selected.paths):
             failures.append("filename escaped the GitHub output record")
+    failures.extend(lint_changed_contract_failures())
+    return failures
+
+
+def lint_changed_contract_failures() -> list[str]:
+    import contextlib
+    import io
+    import tempfile
+    from unittest.mock import patch
+
+    def listed(arguments: list[str]) -> tuple[object, str]:
+        printed = io.StringIO()
+        with contextlib.redirect_stdout(printed), contextlib.redirect_stderr(io.StringIO()):
+            try:
+                status: object = main(arguments)
+            except SystemExit as exc:
+                status = exc.code
+        return status, printed.getvalue()
+
+    failures: list[str] = []
+    with tempfile.TemporaryDirectory(prefix="ouro-ci-lint-changed-") as temporary:
+        root = Path(temporary)
+        for policy in ("tools/lint_worker.ouro", "tools/quality/source.ouro"):
+            (root / policy).parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(ROOT / policy, root / policy)
+        production = ("samples/bench/core_suite.ouro", "samples/examples/demo.ouro", "std/io.ouro", "tools/lsp.ouro")
+        excluded = ("samples/bench/synthesis/hole.ouro", "samples/pkg/app/main.ouro", "samples/tutorial/04_holes.ouro",
+                    "tools/test/suites.ouro", "compiler/fixtures/case.ouro", "compiler/_build/case.ouro",
+                    "tests/case.ouro", "runtime/managed.ouro", "std/notes.md")
+        for name in (*production, *excluded):
+            (root / name).parent.mkdir(parents=True, exist_ok=True)
+            (root / name).write_text("def value : Nat := 0;\n", encoding="utf-8")
+        changed = [*reversed(production), *excluded, "compiler/deleted.ouro", "std/io.ouro"]
+        if lint_changed_sources(changed, root) != list(production):
+            failures.append("changed lint sources differ from the production lint inventory")
+        worker = root / "tools/lint_worker.ouro"
+        worker.write_text(worker.read_text(encoding="utf-8").replace('"future"', "future_names", 1), encoding="utf-8")
+        try:
+            lint_changed_sources(changed, root)
+        except ValueError:
+            pass
+        else:
+            failures.append("non-literal lint inventory was accepted")
+    if "lint-changed" in full_path_selection("selftest").gates:
+        failures.append("selection without changed paths requested lint-changed")
+    with patch(__name__ + ".affected_compiler_gates", return_value=set()):
+        route = plan_paths(["tools/lsp.ouro"])
+        if "lint-changed" not in route.gates:
+            failures.append("changed production source did not select lint-changed")
+        if "lint-changed" in plan_paths(["tests/compiler_retained_tests.ouro", "docs/ci.md"]).gates:
+            failures.append("fixture-only change selected lint-changed")
+        if "lint-changed" not in plan_paths(["tools/lsp.ouro", "compiler/new.ouro"]).gates:
+            failures.append("full route dropped changed production lint sources")
+        with patch(__name__ + ".lint_changed_sources", side_effect=OSError("unreadable")):
+            if set(plan_paths(["tools/lsp.ouro"]).gates) != set(full_path_selection("selftest").gates):
+                failures.append("unreadable lint inventory did not select complete validation")
+        status, printed = listed(["--profile", "pr", "--group", "analyzer", "--changed-paths-json",
+                                  '["tools/lsp.ouro"]', "--selection-key", selection_key(route), "--list"])
+        if status != 0 or "BLOCKING lint-changed sh scripts/ouro1.sh lint --deny -- tools/lsp.ouro\n" not in printed:
+            failures.append("PR lint-changed did not receive its changed production source")
+    status, printed = listed(["--profile", "pr", "--group", "analyzer", "--list"])
+    if status != 0 or "SKIP lint-changed requires --changed-paths-json\n" not in printed \
+            or "BLOCKING lint-changed" in printed:
+        failures.append("lint-changed without a routing plan was not reported as skipped")
     return failures
 
 
@@ -1128,11 +1252,25 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         selected = [gate for gate in selected if gate.name in selection.gates]
         if not selected:
             ap.error("selected PR group has no affected gates; refusing an empty green job")
+        if any(gate.name in PATH_INPUT_GATES for gate in selected):
+            sources = lint_changed_sources(selection.paths)
+            if not sources:
+                ap.error("lint-changed was selected without changed production Ouro sources")
+            selected = [replace(gate, cmd=[*gate.cmd, *sources]) if gate.name in PATH_INPUT_GATES else gate
+                        for gate in selected]
+        skipped: list[Gate] = []
+    else:
+        skipped = [gate for gate in selected if gate.name in PATH_INPUT_GATES]
+        selected = [gate for gate in selected if gate.name not in PATH_INPUT_GATES]
+        if skipped and not selected:
+            ap.error("lint-changed requires --changed-paths-json; the lint group owns complete coverage")
     if args.with_bootstrap_evidence and not any(g.name == "selfhost-bootstrap-evidence" for g in selected):
         selected.extend(g for g in all_gates if g.name == "selfhost-bootstrap-evidence")
     if args.list:
         for g in selected:
             print(("BLOCKING" if g.blocking else "INFO") + " " + g.name + " " + shlex.join(g.cmd))
+        for g in skipped:
+            print(f"SKIP {g.name} requires --changed-paths-json")
         return 0
 
     default_out = ROOT / "_build" / "ci" / args.profile
@@ -1148,6 +1286,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     summary_path.unlink(missing_ok=True)
     started = time.perf_counter()
     results: list[dict[str, Any]] = []
+    skips = [{"name": gate.name, "blocking": gate.blocking, "status": "skip",
+              "reason": "requires --changed-paths-json"} for gate in skipped]
+    for skip in skips:
+        print(f"CI_GATE_SKIP {skip['name']} reason={skip['reason']}")
     failed = False
     for gate in selected:
         result = run_gate(gate, out=out)
@@ -1166,7 +1308,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "gates": results,
         "not_run": [gate.name for gate in selected[len(results):]],
         "blocking_failures": [r for r in results if r.get("blocking") and r.get("status") == "fail"],
-        "informational_skips": [r for r in results if r.get("status") == "skip"],
+        "informational_skips": [*skips, *(r for r in results if r.get("status") == "skip")],
         "elapsed_s": round(time.perf_counter() - started, 6),
         "policy": {
             "blocking": "every registered gate is required; missing tools and nonzero exits fail",

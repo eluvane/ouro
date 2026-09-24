@@ -1,19 +1,19 @@
 # Canonical compact source pipeline
 
-Ouro keeps human-authored `.ouro` files unchanged. Semantic compilation now has
-an explicit internal source boundary after preprocessing and lexing:
+Ouro keeps human-authored `.ouro` files unchanged. The checked compiler pipeline
+feeds the lexer tokens directly to the parser after preprocessing:
 
 ```text
 original source bytes
+  -> import / record preprocessing
   -> existing lexer rules
   -> Token stream
-  -> CanonicalSourceUnit
   -> parser / elaborator / lowerer / checker / extraction
 ```
 
-`CanonicalSourceUnit` is a compiler artifact, not a new source format. The hot
-path does not write a minified file, reopen it, or lex it again. The parser keeps
-consuming the token stream that the lexer already produced.
+`compiler/driver.ouro`'s `lex_then_parse` helper also wraps tokens in
+`CanonicalSourceUnit` for metadata and position mapping. This artifact is not a
+new source format. Neither path requires serializing and reopening token bytes.
 
 ## Removed trivia
 
@@ -41,15 +41,25 @@ of the boundary.
 
 ## Source mapping
 
-The parser reports positions in token-space. Compilation errors now flow through
-`CanonicalSourceUnit` instead of optional compact bytes, so diagnostics do not
-refer to the serialized compact form. The current self-hosted lexer ABI does not
+The parser reports positions in token-space. The `lex_then_parse` helper maps
+these positions through `CanonicalSourceUnit`, not the optional serialized bytes.
+The current self-hosted lexer ABI does not
 yet expose byte start/end spans for each token; until that ABI grows spans, the
 map stores stable original token-index spans and maps EOF/out-of-range positions
 to the original source length.
 
-This is intentionally a fail-closed migration seam: there is no silent fallback
-from canonical compilation back to a separate original-source parse.
+Tools that need byte positions use `compiler/source_spans.ouro`, which the
+compiler pipeline does not import. `lex_spanned` steps the production lexer and
+records where each token starts and ends; `token_span_bytes` maps a token range
+to byte offsets. `parse_spanned` is the production parser dispatcher with
+`ESpan` token ranges around expressions. Every other `Expr` consumer treats
+`ESpan` as transparent, and `strip_spans` returns the production tree. Positions
+refer to the lexed text, so a tool must not report them against the original
+file when import-alias or record preprocessing rewrote it. Clippy reports a
+proof's range only in that unchanged case.
+`tests/source_span_tests.ouro` checks agreement with the production lexer and
+parser on inline cases and repository sources, and that each range parsed alone
+yields its expression.
 
 ## Hashes and cache identity
 
@@ -60,21 +70,44 @@ from canonical compilation back to a separate original-source parse.
 - tooling bytes: semantic bytes plus preserved `SourceDirective` metadata.
 
 The hash is an identity/cache key, not a cryptographic trust boundary. A future
-cache can use the semantic hash for compilation work that is proven independent
-of ordinary comments and formatting, while tooling caches should include the
-metadata-bearing hash or the raw source hash as needed. This PR deliberately does
-not collapse those cache policies into one key.
+cache can use the semantic hash only for work proven independent of ordinary
+comments and formatting; tooling caches need the metadata-bearing or raw-source
+hash as appropriate. These policies remain distinct.
 
 ## Materialization
 
-No compact source tree is required by the compiler path. If a host command later
-adds materialization, it must write only under the controlled build directory
-such as `_build/canonical/`, preserve relative module structure safely, validate
-hashes, and never treat stale files as fresh compiler input.
+Release toolchains select a compact final bootstrap stage:
+
+```sh
+python3 scripts/ouro_build.py build --compact-sources
+```
+
+The [bootstrap driver](build.md#c-bootstrap) keeps its original snapshot `o/`
+and writes a separate `compact/` tree inside the private build attempt.
+`scripts/compact_source.py` removes ordinary comments, blank lines, indentation,
+and repeated whitespace. It preserves literal bytes, `-- @...` directives,
+token separators, relative module paths, and line breaks between surviving source
+lines. It does not use the token serializer, whose output omits directives.
+
+The bridge builds P1 from original sources. P1 strictly checks both original and
+compact compiler and acceptance roots, runs the ABI laws on compact sources, and
+emits P2 from the compact tree. The complete generated frontend and backend C must
+match P1; the existing P2 positive and exact negative behavior checks still run.
+Compaction adds no program-acceptance authority to the host script.
+
+The build key includes the compaction mode and helper contents. `inputs.json`
+records both trees' hashes and per-file byte counts; frozen inputs are rechecked
+before each bootstrap command. Release jobs upload it with `report.json` and
+the installed compiler receipt as `bootstrap-evidence-<platform>` artifacts.
+Archives retain the original readable sources. Diagnostics during the compact
+stage refer to that private copy, whose line numbers can differ from the original.
+Plain `build` and `rebuild` keep the original-source path; both accept the flag.
 
 ## Regression checks
 
-Focused Ouro-native checks live in `tests/canonical.ouro` and cover
+Host materialization and bootstrap ordering regressions run through
+`python3 scripts/bootstrap_compiler_test.py`. Focused Ouro-native checks live in
+`tests/canonical.ouro` and cover
 compact byte serialization, token-boundary separators, string content containing
 `--`, directive preservation, deterministic hashing, original-position mapping,
 and removed-byte metrics on a small fixture.
