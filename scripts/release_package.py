@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Build deterministic Ouro release archives, metadata, and checksums.
 
-Hosted releases publish Lean-style per-host toolchains:
+Hosted releases publish toolchain archives for each supported host platform:
 
   ouro-<version>-<platform>.tar.zst
   ouro-<version>-<platform>.zip
@@ -25,7 +25,8 @@ import subprocess
 import tarfile
 import tempfile
 import zipfile
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime, timedelta
+from itertools import pairwise
 from pathlib import Path
 from typing import Any, BinaryIO, Optional, Sequence
 from unittest.mock import patch
@@ -828,8 +829,47 @@ def version_self_tests() -> None:
         expect_rejected(lambda: validate_versions(None), "version drift")
 
 
+def snapshot_due(on_date: str) -> bool:
+    try:
+        day = date.fromisoformat(on_date)
+    except ValueError as exc:
+        raise SystemExit(f"release package: invalid snapshot date {on_date!r}") from exc
+    if day.isoformat() != on_date:
+        raise SystemExit(f"release package: invalid snapshot date {on_date!r}")
+    return (day - date(1970, 1, 1)).days % 3 == 0
+
+
+def snapshot_schedule_self_tests() -> None:
+    for on_date, expected in (
+        ("1970-01-01", True), ("1970-01-02", False), ("1970-01-03", False),
+        ("1970-01-31", True), ("1970-02-01", False), ("1970-02-03", True),
+        ("1970-12-30", True), ("1971-01-01", False), ("1971-01-02", True),
+        ("1972-02-29", True), ("1972-03-01", False), ("1972-03-03", True),
+    ):
+        if snapshot_due(on_date) != expected:
+            raise SystemExit(f"release package self-test: wrong snapshot cadence for {on_date}")
+        with patch("sys.stdout", new_callable=io.StringIO) as output:
+            status = main(["--snapshot-due", "--date", on_date])
+        if status != 0 or output.getvalue() != ("true\n" if expected else "false\n"):
+            raise SystemExit(f"release package self-test: wrong snapshot CLI result for {on_date}")
+    start = date(2023, 12, 27)
+    scheduled = [
+        day for offset in range(380)
+        if snapshot_due((day := start + timedelta(days=offset)).isoformat())
+    ]
+    if any((right - left).days != 3 for left, right in pairwise(scheduled)):
+        raise SystemExit("release package self-test: snapshot interval changed across calendar boundaries")
+    for invalid in ("", "2026-02-29", "2026-13-01", "2026-1-1", "20260924", "2026-W39-4", "2026-09-24T00:00:00"):
+        expect_rejected(lambda value=invalid: snapshot_due(value), "invalid snapshot date")
+        expect_rejected(
+            lambda value=invalid: main(["--snapshot-due", "--date", value]),
+            "invalid snapshot date",
+        )
+
+
 def run_self_tests() -> None:
     version_self_tests()
+    snapshot_schedule_self_tests()
     self_test_root = ROOT / "_build"
     self_test_root.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="ouro-release-report-selftest-", dir=self_test_root) as directory:
@@ -952,7 +992,8 @@ def run_self_tests() -> None:
     toolchain_self_tests()
     print(
         "RELEASE_PACKAGE_SELF_TEST: PASS versions=11 tracked_links=5 "
-        "archive_formats=2 reparse=1 changelog_cut=4 toolchains=6 report_checksums=2"
+        "archive_formats=2 reparse=1 changelog_cut=4 toolchains=6 report_checksums=2 "
+        "snapshot_schedule=pass"
     )
 
 
@@ -1191,11 +1232,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--check", action="store_true", help="validate release metadata without writing archives")
     ap.add_argument("--self-test", action="store_true", help="run release path and archive regression checks")
     ap.add_argument(
+        "--snapshot-due", action="store_true",
+        help="print whether the UTC date falls on the three-day snapshot cycle from 1970-01-01",
+    )
+    ap.add_argument(
         "--toolchain",
         action="store_true",
         help="write ouro-<version>-<platform>.tar.zst and .zip for one host compiler",
     )
-    ap.add_argument("--platform", default=None, help="host platform name, matching Lean 4 suffixes")
+    ap.add_argument(
+        "--platform", default=None,
+        help="host platform name: " + ", ".join(TOOLCHAIN_PLATFORMS),
+    )
     ap.add_argument("--compiler", default=None, help="path to the built host ouro1 for --toolchain")
     ap.add_argument(
         "--source",
@@ -1210,15 +1258,23 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument(
         "--verify-dir",
         action="store_true",
-        help="require the ten Lean-style toolchain archives in --out",
+        help="require all ten host toolchain archives in --out",
     )
     ap.add_argument(
         "--cut-changelog",
         action="store_true",
         help="move [Unreleased] under the seal version and reset [Unreleased]",
     )
-    ap.add_argument("--date", default=None, help="YYYY-MM-DD for --cut-changelog; default is UTC today")
+    ap.add_argument(
+        "--date", default=None,
+        help="YYYY-MM-DD for --cut-changelog or --snapshot-due; default is UTC today",
+    )
     args = ap.parse_args(argv)
+
+    if args.snapshot_due:
+        on_date = args.date if args.date is not None else datetime.now(UTC).date().isoformat()
+        print("true" if snapshot_due(on_date) else "false")
+        return 0
 
     if args.self_test:
         run_self_tests()

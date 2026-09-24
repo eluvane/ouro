@@ -1,11 +1,3 @@
-<p align="center">
-  <img
-    width="100%"
-    src="https://capsule-render.vercel.app/api?type=waving&amp;height=220&amp;color=0:0B1220,50:1E1B4B,100:4F46E5&amp;text=KERNEL&amp;fontColor=E2E8F0&amp;fontSize=54&amp;fontAlignY=50"
-    alt="KERNEL banner"
-  />
-</p>
-
 # Compiler checking
 
 `compiler/file_elab.ouro` owns Ouro's declaration checker. The frontend,
@@ -120,15 +112,6 @@ semantic tests.
 
 ## Regression commands
 
-```sh
-sh scripts/test_suite.sh --compiler-checking
-sh scripts/ouro_repo_gate.sh --profile compiler-boundary
-python3 scripts/kernel_hardening_suite.py
-python3 scripts/kernel_scale.py --profile scale --out _build/kernel_scale/scale
-python3 scripts/kernel_scale.py --profile depth --out _build/kernel_scale/depth
-python3 scripts/ouro_smith.py --profile kernel --out _build/smith/kernel
-```
-
 The retained laws cover the previous kernel corpus's useful semantic contracts.
 Typed generated properties exercise substitutions, scopes, reduction, checking,
 and rejection classes. OuroSmith rebuilds source mutants and requires the
@@ -136,18 +119,11 @@ designated law to reject each fault after a clean baseline.
 
 The hardening suite executes retained laws in three cache modes. Scale and
 checked-API depth probes enforce their own complete input and resource
-contracts. [CI](ci.md) describes required profiles and report validation.
+contracts. [CI](ci.md#local-profiles) owns the required commands, profiles,
+and report validation.
 [Core artifacts](kernel_core_artifact.md) distinguishes the current checked
 snapshot from the archived JSON corpus.
 
 These checks are executable regression evidence. The checker has no complete
 machine-checked proof of soundness, normalization, substitution, positivity, or
 structural recursion.
-
-<p align="center">
-  <img
-    width="100%"
-    src="https://capsule-render.vercel.app/api?type=waving&amp;height=220&amp;color=0:0B1220,50:1E1B4B,100:4F46E5&amp;section=footer"
-    alt=""
-  />
-</p>

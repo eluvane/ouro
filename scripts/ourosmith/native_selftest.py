@@ -235,6 +235,28 @@ class NativeHarnessTests(unittest.TestCase):
         expected = {"pr": (1, 40, 4, 4), "kernel": (1, 100, 5, 5), "nightly": (100000, 400, 6, 6)}
         self.assertEqual({name: tuple(profiles[name][key] for key in ("seed_base", "seeds", "depth", "max_defs")) for name in expected}, expected)
 
+    def test_native_negative_labels_preserve_legacy_and_grouped_calls(self):
+        from ourosmith.inventory import native_negative_labels
+
+        source = '''smith_negative_body "legacy" typ body fault
+smith_negative_body("grouped", typ, body, fault)
+smith_negative_one ("spaced", item, phase, fault)
+smith_negative_nested -- helper comment
+  ( -- argument comment
+    "multiline", body)
+SmithNegativeOf("constructor", items, name, phase, fault)
+-- smith_negative_body("comment", typ, body, fault)
+other_smith_negative_body "prefixed" typ body fault
+smith_negative_body' "primed" typ body fault
+Other.smith_negative_body "qualified" typ body fault
+'''
+        source += 'def example : String := ' + json.dumps('smith_negative_body("quoted", typ, body, fault)') + ';\n'
+        self.assertEqual(native_negative_labels(source), {"legacy", "grouped", "spaced", "multiline", "constructor"})
+        current = (ROOT / "tests/compiler_smith_negative.ouro").read_text(encoding="utf-8")
+        self.assertEqual(native_negative_labels(current), set(NEGATIVES))
+        changed = current.replace('"ctor-index"', '"changed-label"')
+        self.assertNotIn("ctor-index", native_negative_labels(changed))
+
     def test_native_inventory_retains_new_source_items_and_separate_owners(self):
         from ourosmith.inventory import code_strategies, compare, source_inventory
 

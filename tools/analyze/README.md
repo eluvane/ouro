@@ -1,11 +1,3 @@
-<p align="center">
-  <img
-    width="100%"
-    src="https://capsule-render.vercel.app/api?type=waving&amp;height=220&amp;color=0:0B1220,50:1E1B4B,100:4F46E5&amp;text=ANALYZE&amp;fontColor=E2E8F0&amp;fontSize=54&amp;fontAlignY=50"
-    alt="ANALYZE banner"
-  />
-</p>
-
 # tools/analyze
 
 This directory contains project-owned analyzer cores written in Ouro. The analyzer sources are outside the logical kernel TCB; they may reject bad project code or guide cleanup, but they cannot change kernel checking rules.
@@ -16,7 +8,6 @@ Packaged `ouro1 analyze` is two native Ouro IO programs:
 - `tools/analyze/drive_main.ouro` (`_build/c/ouro-analyze-drive`), the structured drive: it parses each source with the real compiler frontend and runs the nineteen structured families listed below. The frontend and shared `Ast` cone are linked only into the drive, so editing a core rebuilds the drive and not `ouro-analyze`.
 
 ```sh
-sh scripts/ouro1.sh analyze --strict
 sh scripts/ouro1.sh analyze --strict --enable-strict
 sh scripts/ouro1.sh analyze --strict --enable-cfg --scope tools/analyze/cfg.ouro
 sh scripts/ouro1.sh analyze --strict --include-fixtures --enable-taint --scope tests/analyze/taint_bad
@@ -86,43 +77,24 @@ One flag per family: `--enable-effects`, `--enable-capability`, `--enable-extrac
 
 `--enable-trust`, `--enable-heavy`, and `--enable-all` also switch on the base runner's import-graph trust pass (`OURO-TRUST001`) over the same scope, and `--enable-all` its dead-code pass, which is why those flags are bounded like the other global modes.
 
-### Production status
-
-Each family was run over `std/`, `compiler/`, `tools/analyze/`, `tools/`, and `samples/`. A family is promoted into `--enable-strict` (`drive.ouro` `strict_families`) only when that sweep reports nothing and no false positive is known.
-
-| Family | Status | Reason |
-| --- | --- | --- |
-| effects, capability, extract, match, cfg, dataflow, semantic, property, absint, symexec, taint, contracts, metrics, duplication, trust, simplify, perf, naming, errors | **Promoted** (`--enable-strict`) | Zero findings on production after the triage below. |
-
-The triage fixed these false positives in the cores, each with a `good` fixture guarding it: multi-scrutinee matches (`match a, b with`), recursion guarded through a `let`-bound scrutinee, pattern-bound names shadowing a parameter (symexec), several `@bound` claims on one comment line, `@tag` prose inside a comment sentence, dependent eliminations (`refl` arms of indexed families are not trivial matches, a branchless match on an uninhabited type is `ex_falso`), type parameters read only by the declared return type, `OURO-SEM005` on parameters whose source name starts with `_`, `OURO-NAME003` on `Type_field` accessors (the record sugar's projection convention), `OURO-SEM001` decimal literals at or below 255 (bytes and ASCII), `OURO-SEM003` / `OURO-CX001` / `OURO-CX002` only on definitions marked `@complexity`, `OURO-DUP002` near-clones without a `fix` (character tables and keyword lists), `OURO-SIMP004` sections and constructor eta (`fun x => add one x`, `fun x => S x`), `OURO-NAME003`/`004` on the type-theory spellings `J`, `J_id`, `refl`, `tt`, `acc`, `leaf`, `node`, `vnil`, `vcons`, `OURO-ERR001` on `IO (Either String _)` and on std/samples, `OURO-PERF001` literals at or below 255 inside a fix, `OURO-PERF002` on a parameter appended into a different slot of the recursive call, `OURO-PERF005` on `andb`/`orb` with the recursive call second or in both operands, and `OURO-PERF004` on a conversion in the arm that ends the loop.
-
-Default `--strict` stays on the base runner: the drive's frontend needs about 2 GiB for the largest production source, far above the `analyzer-bounded-tree` budget every strict run is held to. The promoted set is enforced nightly instead:
-
-```sh
-python3 scripts/analyze_production_suite.py --out _build/analyze_production
-```
-
-The suite reads `quality/analyze_production.json` (scopes and the sources the frontend is known to reject, with reasons), validates the complete native build receipt, and runs two sweeps: `--enable-strict`, where any finding fails, and `--enable-all`, whose findings are counted per family and per code in `report.json` for triage. An unlisted rejection or a listed source that parses again fails as well. Failed runs discard any stale success report. `scripts/ci_gate.py` runs it as `analyze-production` in the `nightly` and `manual` profiles; the PR profile stays on the fixture suite.
-
 ## Strict quality-gate status
 
-`sh scripts/ouro1.sh analyze --strict` covers project-owned production source under `std/`, `compiler/`, `tools/analyze/`, and `samples/`. It excludes fixture directories such as `tests/analyze/` from the production gate because they contain intentionally bad inputs and diagnostic examples. Fixtures can be analyzed explicitly with `--include-fixtures --scope ...`.
+`analyze --strict` runs the base policy cores over the production source
+scope. Architecture, suppressions, and the strict format subset are blocking;
+API surface uses the explicit baseline `quality/api_surface.tsv`. Dead code
+remains an opt-in bounded pass because host-wired helpers may appear unreachable.
+The structured families are selected with `--enable-strict` and checked by the
+nightly production sweep. Intentionally bad fixtures require
+`--include-fixtures` and an explicit scope.
 
-| Analyzer | Strict status in native runner | Notes |
-| --- | --- | --- |
-| `architecture.ouro` | **Strict** | Graph-based import cycles, direction, std/runtime→compiler-internal imports, layer escapes, and unreviewed TCB-boundary imports. Each diagnostic includes the import span and graph witness. |
-| `suppressions.ouro` | **Strict** | Parses source suppressions with source spans; rejects broad, unknown, unused, forbidden, missing-reason, and file/module-wide suppressions. |
-| `api_surface.ouro` | **Strict subset** | Uses explicit baseline `quality/api_surface.tsv` for current `std/` public definitions. Checks unexpected new public exports, duplicate public names, signature drift, internal-only public definitions, and surface growth. |
-| `format.ouro` | **Strict subset** | CRLF, tabs, and trailing whitespace are default-strict (zero known FP on production). Full style pass is `--enable-format`. |
-| `deadcode.ouro` | **Bounded opt-in** | `--enable-deadcode` uses typed declaration/reference/export/constructor/module/branch facts. Project `--strict` stays opt-in (C-wired helpers would look dead). |
-| Promoted structured families | **`--enable-strict`, nightly gate** | Every drive family, including duplication. See the production status table. |
+The nightly sweep reads `quality/analyze_production.json`, rejects unlisted
+frontend failures and stale allowances, and counts the all-family sweep for
+triage. Default `analyze --strict` stays on the smaller base runner because
+the structured drive needs a larger memory budget. [CI](../../docs/ci.md#local-profiles)
+owns the current gate schedule and result.
 
-A clean production run of the base runner prints:
-
-```text
-ANALYZE_OK profile=strict files=126 imports=149 decls=13204 refs=34215 exports=43 constructors=946 modules=126 branches=9572 suppressions=0 strict-diagnostics=0
-ANALYZE_FACTS architecture=graph suppressions=parsed deadcode=typed-facts api_surface=baseline format=strict-subset trust=effects-taint-required structured=ouro-analyze-drive
-```
+A clean base run prints `ANALYZE_OK` with coverage counts. Any finding, rejected
+source, missing worker result, or inconsistent count fails the bounded runner.
 
 ## Analyzer families
 
@@ -154,13 +126,18 @@ ANALYZE_FACTS architecture=graph suppressions=parsed deadcode=typed-facts api_su
 | `perf.ouro` | `analyze_perf` | `OURO-PERF001`–`005` | Cost smells of the extracted runtime: literal at or above `perf_literal_threshold` inside a fix body, `append`/`snoc`/`concat` on an accumulator parameter fed back into the recursion, `length` compared with 0/1 or scrutinised without reading the count, the same conversion of the same parameter twice on one path, `andb`/`orb` operand that nests control flow or a recursive call. |
 | `naming.ouro` | `analyze_naming`, `nm_ctor_misspelt` | `OURO-NAME001`–`004` | Conventions the other cores depend on: a `_`-spelt binder that is read (shadowing-aware), one-character definition names, a capital initial on a value definition (type-level results are exempt), and lowercase or underscore constructors, anchored at the owning `inductive` line. |
 | `errors.ouro` | `analyze_errors` | `OURO-ERR001`–`003` | Declared `Either String` result (also under `IO`), a failure arm (`Left`, `Fail`) that drops its payload and returns the paired success constructor through lets, `do`, or `io_pure`, and `io_bind` over an `Either` whose result is bound to a discard. |
-| `trust.ouro` | `analyze_trust` | `OURO-TRUST001`–`005` | TCB policy over layer marks plus the unit's effect and taint facts; no second taint engine. |
-| `architecture.ouro` | `analyze_architecture` | `OURO-ARCH001`–`005` | Import/dependency policy from base-runner graph facts. |
-| `deadcode.ouro` | `analyze_deadcode` | `OURO-DEAD001`–`005` | Reachability from entry and public/API roots over base-runner declaration/reference facts. |
-| `api_surface.ouro` | `analyze_api_surface` | `OURO-API001`–`005` | API/ABI growth policy over baseline/export/use facts. |
-| `suppressions.ouro` | `analyze_suppressions` | `OURO-SUP001`–`006` | Strict suppression policy over parsed suppression facts. |
 | `format.ouro` | `analyze`, `format` | `OURO-FMT*` | Local text formatter/checker shared with `tools/fmt.ouro`. |
 | `policy_ids.ouro`, `host.ouro` | layer predicates, exit codes | — | Layer policy shared by the cores; profile and exit-code names for the base runner. |
+
+## Themes shared with Clippy
+
+`OURO-SIMP003`, `OURO-PERF004`, `OURO-ERR002`, `OURO-ERR003`, `OURO-DUP001`,
+and `OURO-DUP002` stay in this analyzer. The matching Clippy proofs
+(`OURO-CLIPPY-REDUNDANT-004`, `OURO-CLIPPY-PERF-001`, `OURO-CLIPPY-ERROR-003`,
+`OURO-CLIPPY-CHECKED-006`, `OURO-CLIPPY-MAINT-007`) require registered
+contracts, closed enums, or token identity, and they leave the syntactic
+cases above to these warnings. The two IDs use different suppression syntax.
+See [Quality](../../docs/quality.md).
 
 ## Diagnostic contract
 
@@ -252,35 +229,13 @@ The production tree is an expectation, not a golden: `project_no_fp` requires `A
 
 ## Removed surfaces
 
-- `surface.ouro` (token walker) is replaced by `unit.ouro` on the real frontend; a walker that never built `AApp`/`ALam`/`ALet` and skipped `match` bodies could not feed the cores.
-- The old fact-smoke fixtures and their `golden/hole.txt`, and the `Fact`/`Norm` emitters `emit_facts.ouro`, `match_facts.ouro`, and `fact_model.ouro`: nothing executed them, and the cores now read the frontend `Ast` directly. Every family is covered by a pipeline fixture with a golden instead.
-- The twelve per-core copies of `Ast`; every core imports `ast.ouro`.
-- The text heuristics for cfg, dataflow, effects, property, taint, and contracts in `tools/analyze/families.ouro`, plus `families_holes.ouro`; the cores replace them.
-- The host implementations of architecture, dead code, suppressions, API surface, and trust in `tools/analyze/policy.ouro`; the file now only adapts facts for the cores.
-- `abi.ouro` duplicated `OURO-API003` signature-hash drift from `api_surface.ouro`.
-- `pcc.ouro`, `demo/`, and every `*.ouro.pcc.json` were removed together with the PCC contract: the certificate generator no longer exists and all but one certificate were stale against their sources.
-- `--enable-lint` was removed from `analyze`; `OURO-LINT001` is owned by `ouro1 lint` (`compiler/lint.ouro`).
+The former `--enable-lint` flag is retired; use `ouro1 lint` for source lint.
+The old PCC certificate surface has no active generator. The current structured
+families parse compiler `Ast` through `unit.ouro`; they do not use the retired
+text-token walker. `OURO-NAME002` is retired because a one-character name alone
+is not evidence of a defect.
 
 ## Useful validation commands
 
-From the repository root:
-
-```sh
-sh scripts/bootstrap.sh
-sh scripts/ouro1.sh analyze --strict
-sh scripts/analyze_precision_suite.sh
-python3 scripts/analyze_production_suite.py --out _build/analyze_production
-for f in tools/analyze/*.ouro; do sh scripts/ouro1.sh check "$f" 200000; done
-python3 scripts/memory_budget_suite.py --case analyzer-drive-largest-file
-python3 scripts/strict_quality_firewall.py --profile release
-```
-
-<p align="center">
-  <img
-    width="100%"
-    src="https://capsule-render.vercel.app/api?type=waving&amp;height=220&amp;color=0:0B1220,50:1E1B4B,100:4F46E5&amp;section=footer"
-    alt=""
-  />
-</p>
-
-`OURO-NAME002` (one-character definition names) is retired: name length alone is not a semantic defect. Short names remain covered as negative precision fixtures.
+[CI](../../docs/ci.md#local-profiles) owns analyzer precision, production,
+resource-budget, and strict policy validation commands.

@@ -1,11 +1,3 @@
-<p align="center">
-  <img
-    width="100%"
-    src="https://capsule-render.vercel.app/api?type=waving&amp;height=220&amp;color=0:0B1220,50:1E1B4B,100:4F46E5&amp;text=RFC%200001&amp;fontColor=E2E8F0&amp;fontSize=54&amp;fontAlignY=50"
-    alt="RFC 0001 banner"
-  />
-</p>
-
 # RFC 0001: Strict project syntax and quality policy
 
 - Status: accepted
@@ -69,11 +61,3 @@ change kernel semantics.
 The decision is covered by the quality fixture manifest, strict firewall,
 analyzer and lint suites, [Quality tools](../quality.md),
 [Surface syntax](../syntax.md), and the changelog.
-
-<p align="center">
-  <img
-    width="100%"
-    src="https://capsule-render.vercel.app/api?type=waving&amp;height=220&amp;color=0:0B1220,50:1E1B4B,100:4F46E5&amp;section=footer"
-    alt=""
-  />
-</p>

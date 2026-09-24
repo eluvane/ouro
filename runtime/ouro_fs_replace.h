@@ -309,11 +309,11 @@ static ouro_v *fs_replace_run(ouro_env *env, ouro_v *unit)
 #endif
 	} else {
 #ifdef _WIN32
-		status = rename_wide_path(source, &wide_source);
+		status = ouro_host_wide_path(source, &wide_source);
 		if (status == ERROR_SUCCESS)
-			status = rename_wide_path(stage, &wide_stage);
+			status = ouro_host_wide_path(stage, &wide_stage);
 		if (status == ERROR_SUCCESS)
-			status = rename_wide_path(backup, &wide_backup);
+			status = ouro_host_wide_path(backup, &wide_backup);
 		if (status == ERROR_SUCCESS)
 			status = source_replace_windows(wide_source, wide_stage, wide_backup);
 #else

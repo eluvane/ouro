@@ -62,6 +62,7 @@ HOST_HOOKS = (
     ("cm_validate_contract_bindings", "ouro_wrap_quality_pure", ("tools/clippy/semantic_registry.ouro",)),
     ("cm_build_apis", "ouro_wrap_quality_pure", ("tools/clippy/semantic_registry.ouro",)),
     ("cg_wire_scan_request", "ouro_wrap_quality_pure", ("tools/clippy/session_wire.ouro",)),
+    ("cg_load_inventory", "ouro_wrap_quality_io", ("tools/clippy/main.ouro",)),
     ("cg_scan_chunk_request", "ouro_wrap_quality_io", ("tools/clippy/main.ouro",)),
     ("st_scan_request", "ouro_wrap_quality_io", ("tools/strict/fixtures.ouro",)),
     ("st_scan_def_span", "ouro_wrap_quality_pure", ("tools/strict/scan.ouro",)),

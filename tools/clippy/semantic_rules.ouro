@@ -1,29 +1,36 @@
 -- Consumers of the one shared fact build. No rule receives source text or
 -- reparses expressions. Sort/merge replaces global pairwise clone searches.
-import "semantic_walk.ouro";
-import "structural_model.ouro";
-import "../../compiler/semantic_scope.ouro";
+import "semantic_walk.ouro",
+  "semantic_result_laws.ouro",
+  "semantic_result_paths.ouro",
+  "semantic_collections.ouro",
+  "semantic_quality.ouro",
+  "structural_model.ouro",
+  "structural_frontend.ouro",
+  "../../compiler/semantic_scope.ouro";
 
 inductive CmDefinition : Type :=
-  | CmDefinitionOf : ScDecl -> List CmEvent -> CmDefinition;
+  | CmDefinitionOf : ScDecl -> List CmEvent -> List (Pair Nat (Pair Nat Nat)) -> CmDefinition;
 
 def cm_definition_decl (item : CmDefinition) : ScDecl :=
-    match item with | CmDefinitionOf decl _ => decl end;
+    match item with | CmDefinitionOf decl _ _ => decl end;
 def cm_definition_events (item : CmDefinition) : List CmEvent :=
-    match item with | CmDefinitionOf _ events => events end;
+    match item with | CmDefinitionOf _ events _ => events end;
+def cm_definition_spans (item : CmDefinition) : List (Pair Nat (Pair Nat Nat)) :=
+    match item with | CmDefinitionOf _ _ spans => spans end;
 
 -- A definition's events are owned by its consumer, not by a module-wide
 -- list. Keep the same visits, fuel, error context and observation boundary.
 def cm_build_definition (unit : ClippySemanticUnit) (apis : CmApiIndex)
     (decl : ScDecl) : Either QualityInputError (Maybe CmDefinition) :=
-    match eq_nat (sc_decl_module decl) (cm_entry unit) with
-    | False => Right QualityInputError (Maybe CmDefinition) (Nothing CmDefinition)
+    match eq_nat(sc_decl_module decl, cm_entry unit) with
+    | False => Right(QualityInputError, Maybe CmDefinition, Nothing CmDefinition)
     | True => match sc_decl_body decl with
-      | Nothing => Right QualityInputError (Maybe CmDefinition) (Nothing CmDefinition)
+      | Nothing => Right(QualityInputError, Maybe CmDefinition, Nothing CmDefinition)
       | Just body =>
           let ctx : CmContext := CmContextOf decl [] 0 False (Nothing Nat)
             (cm_contract_policy (cm_contract_for unit decl)) False 0 in
-          match cm_visit unit apis cm_visit_fuel ctx True False (sc_decl_type decl) (CmStateOf 1 0 []) with
+          match cm_visit unit apis cm_visit_fuel ctx True False (sc_decl_type decl) cm_state0 with
           | Left error => Left QualityInputError (Maybe CmDefinition)
               (QualityInvalidInput (prim_string_concat (cm_name (cm_intern unit)
                 (sc_decl_name decl)) (prim_string_concat ": signature: "
@@ -35,9 +42,11 @@ def cm_build_definition (unit : ClippySemanticUnit) (apis : CmApiIndex)
                     (sc_decl_name decl)) (prim_string_concat ": "
                       (quality_input_message error))))
               | Right built => match built with
-                | MkPair value state => Right QualityInputError (Maybe CmDefinition)
+                | MkPair value state =>
+                    let finished : CmState := cm_observe 4 0 value state in
+                    Right QualityInputError (Maybe CmDefinition)
                     (Just CmDefinition (CmDefinitionOf decl (reverse_lin CmEvent
-                      (cm_events (cm_observe 4 0 value state)))))
+                      (cm_events finished)) (cm_node_spans finished)))
                 end
               end
             end
@@ -122,10 +131,20 @@ def cm_observations_at (id : Nat) : List Nat -> List Nat :=
     end;
 
 def cm_render_proof (decl : ScDecl) (owner : String) (proof : CmSemanticProof) : List CgSProof :=
-    match andb (cm_proof_valid proof) (cm_proof_owned decl proof) with
+    match andb(cm_proof_valid proof, cm_proof_owned decl proof) with
     | False => []
     | True => [MkCgSProof (cm_proof_rule (cm_proof_kind proof)) owner
-        (cm_proof_node proof) (cm_proof_message proof)] end;
+        (cm_proof_node proof) (Nothing (Pair Nat Nat)) (cm_proof_message proof)] end;
+
+-- Fill proof ranges from the traversal that produced them. A rewritten source
+-- has no token map, so those proofs keep the declaration anchor.
+def cm_with_locations (unit : ClippySemanticUnit) (item : CmDefinition)
+    (proofs : List CgSProof) : List CgSProof :=
+    match proofs with
+    | Nil => []
+    | Cons _ _ => cg_s_locate (cg_s_source_spans (cm_source unit))
+        (cm_definition_spans item) proofs
+    end;
 
 def cm_unobserved (decl : ScDecl) (owner : String) : List Nat -> List Nat -> Maybe Nat -> List CgSProof :=
   fix go (created : List Nat) (observed : List Nat) (previous : Maybe Nat) : List CgSProof :=
@@ -141,7 +160,7 @@ def cm_unobserved (decl : ScDecl) (owner : String) : List Nat -> List Nat -> May
             let proof : CmSemanticProof := cm_proof_for CmIgnoredResultProof decl id 0 0
               [cm_known_fact CmCheckedProducer True, cm_known_fact CmNoObservation True]
               "executed checked result has no observation through any alias or helper return; propagate or handle its failure" in
-            append CgSProof (cm_render_proof decl owner proof) (go rest remaining (Just Nat id))
+            append(CgSProof, cm_render_proof decl owner proof, go rest remaining (Just Nat id))
         end
     end;
 
@@ -154,7 +173,7 @@ def cm_findings (decl : ScDecl) (owner : String) (events : List CmEvent) : List 
 
 def cm_region_key (call : ClippyCallFact) : String :=
     prim_string_concat (prim_string_of_nat (cm_call_branch call))
-      (prim_string_concat "/" (prim_string_concat (prim_string_of_nat (cm_call_epoch call)) "/"));
+      (prim_string_concat("/", prim_string_concat(prim_string_of_nat (cm_call_epoch call), "/")));
 
 def cm_work_key (call : ClippyCallFact) : String :=
     prim_string_concat (cm_region_key call) (prim_string_concat
@@ -162,12 +181,12 @@ def cm_work_key (call : ClippyCallFact) : String :=
 
 def cm_work_eligible (call : ClippyCallFact) : Bool :=
     andb (all CmValue cm_value_known (cm_call_args call)) (andb (cm_call_pure call) (andb (cm_args_dynamic (cm_call_args call))
-      (andb (eq_nat (cm_call_cost call) 1) (elem Nat eq_nat (cm_call_role call) [15,16,17]))));
+      (andb(eq_nat(cm_call_cost call, 1), elem Nat eq_nat (cm_call_role call) [15,16,17,42,47,50]))));
 
 def cm_traversal_eligible (call : ClippyCallFact) : Bool :=
-    andb (all CmValue cm_value_known (cm_call_args call)) (andb (cm_call_pure call) (andb (eq_nat (cm_call_cost call) 1)
+    andb (all CmValue cm_value_known (cm_call_args call)) (andb (cm_call_pure call) (andb (eq_nat(cm_call_cost call, 1))
       (andb (notb (cm_value_constant (cm_last_value (cm_call_args call))))
-        (elem Nat eq_nat (cm_call_role call) [18,19,20,22]))));
+        (elem Nat eq_nat (cm_call_role call) [18,19,20,22,43,48]))));
 
 -- Adjacent equal keys establish equal declaration, argument identities and
 -- execution region. Calls separated by effects/branches have different keys.
@@ -178,7 +197,7 @@ def cm_repeated (decl : ScDecl) (owner : String) (kind : CmProofKind) (evidence 
     let sorted : List (Pair String ClippyCallFact) := quality_sort (Pair String ClippyCallFact)
       (fun (a : Pair String ClippyCallFact) (b : Pair String ClippyCallFact) => match a with
         | MkPair ka ca => match b with | MkPair kb cb => match prim_string_eq ka kb with
-          | True => leb_nat (cm_call_node ca) (cm_call_node cb)
+          | True => leb_nat(cm_call_node ca, cm_call_node cb)
           | False => prim_string_le ka kb end end end) keyed in
     (fix go (calls : List (Pair String ClippyCallFact)) : List CgSProof :=
       match calls with
@@ -192,31 +211,441 @@ def cm_repeated (decl : ScDecl) (owner : String) (kind : CmProofKind) (evidence 
                 let proof : CmSemanticProof := cm_proof_for kind decl (cm_call_node b)
                   (cm_call_branch b) (cm_call_epoch b)
                   [cm_known_fact CmCalleeResolved True,
-                   cm_known_fact CmPureExpression (andb (cm_call_pure a) (cm_call_pure b)),
-                   cm_known_fact CmMeaningfulCost (andb (eq_nat (cm_call_cost a) 1) (eq_nat (cm_call_cost b) 1)),
-                   cm_known_fact CmSameArguments (prim_string_eq (cm_args_key (cm_call_args a)) (cm_args_key (cm_call_args b))),
-                   cm_known_fact CmSameRegion (andb (eq_nat (cm_call_branch a) (cm_call_branch b))
-                     (eq_nat (cm_call_epoch a) (cm_call_epoch b))),
+                   cm_known_fact(CmPureExpression, andb(cm_call_pure a, cm_call_pure b)),
+                   cm_known_fact(CmMeaningfulCost, andb(eq_nat(cm_call_cost a, 1), eq_nat(cm_call_cost b, 1))),
+                   cm_known_fact(CmSameArguments, prim_string_eq(cm_args_key (cm_call_args a), cm_args_key (cm_call_args b))),
+                   cm_known_fact CmSameRegion (andb (eq_nat(cm_call_branch a, cm_call_branch b))
+                     (eq_nat(cm_call_epoch a, cm_call_epoch b))),
                    cm_known_fact CmKnownArguments (andb (all CmValue cm_value_known (cm_call_args a))
                      (all CmValue cm_value_known (cm_call_args b)))] evidence in
-                append CgSProof (cm_render_proof decl owner proof) (go rest)
+                append(CgSProof, cm_render_proof decl owner proof, go rest)
             end
           end end
         end
       end) sorted;
 
-def cm_definition_proofs_using_calls (unit : ClippySemanticUnit) (item : CmDefinition)
-    (calls : List ClippyCallFact) : List CgSProof :=
-    let owner : String := cm_name (cm_intern unit) (sc_decl_name (cm_definition_decl item)) in
+-- Join producer ordinals with outer call arguments; no expression re-walk and
+-- no per-call scan of the entire event stream. Both cursors are sorted once.
+def cm_nested_kind (role : Nat) : Maybe CmProofKind :=
+    match eq_nat role 37 with
+    | True => Just CmProofKind CmDoubleNotProof
+    | False => match eq_nat role 42 with
+      | True => Just CmProofKind CmIdempotentNormalizeProof
+      | False => match eq_nat role 43 with
+        | True => Just CmProofKind CmDoubleReverseProof
+        | False => Nothing CmProofKind
+        end
+      end
+    end;
+
+def cm_nested_message (role : Nat) : String :=
+    match eq_nat role 37 with
+    | True => "two resolved Boolean negations cancel on the same producer lineage; preserve evaluation when using the original Boolean"
+    | False => match eq_nat role 42 with
+      | True => "the same registered idempotent string normalization is applied to its own result in one effect-free region; retain one normalization"
+      | False => "the same registered list reversal consumes its own result with the same element type in one effect-free region; retain the original list and its evaluation"
+      end
+    end;
+
+def cm_nested_pair (decl : ScDecl) (owner : String) (outer : ClippyCallFact)
+    (inner : ClippyCallFact) : List CgSProof :=
+    let role : Nat := cm_call_role outer in
+    match cm_nested_kind role with
+    | Nothing => []
+    | Just kind =>
+        let list_operation : Bool := eq_nat role 43 in
+        let arity : Nat := match list_operation with | True => 2 | False => 1 end in
+        let consumed : CmValue := cm_last_value (cm_call_args outer) in
+        let same_operation : Bool := andb (eq_nat(cm_call_callee inner, cm_call_callee outer))
+            (andb (eq_nat(cm_call_role inner, role))
+              (orb (notb list_operation)
+                (cm_law_same(cm_arg_at(0, cm_call_args inner), cm_arg_at(0, cm_call_args outer))))) in
+        let law : CmRequirement := match eq_nat role 42 with
+          | True => CmIdempotence | False => CmInvolution end in
+        let cost_facts : List CmEvidence := match eq_nat role 37 with
+          | True => []
+          | False => [cm_known_fact CmMeaningfulCost
+              (andb (eq_nat(cm_call_cost inner, 1))
+                (andb (eq_nat(cm_call_cost outer, 1))
+                  (notb (cm_value_constant (cm_last_value (cm_call_args inner))))))]
+          end in
+        let proof : CmSemanticProof := cm_proof_for kind decl (cm_call_node outer)
+            (cm_call_branch outer) (cm_call_epoch outer)
+            (append CmEvidence cost_facts [cm_known_fact(CmCalleeResolved, notb (eq_nat(cm_call_role inner, 0))),
+             cm_known_fact CmKnownArguments
+               (andb (all(CmValue, fun (value : CmValue) => andb(cm_value_known value, notb (cm_value_io value)), cm_call_args inner))
+                 (all(CmValue, fun (value : CmValue) => andb(cm_value_known value, notb (cm_value_io value)), cm_call_args outer))),
+             cm_known_fact CmExactArity
+               (andb (eq_nat(length(CmValue, cm_call_args inner), arity))
+                 (eq_nat(length(CmValue, cm_call_args outer), arity))),
+             cm_known_fact(CmPureExpression, andb(cm_call_pure inner, cm_call_pure outer)),
+             cm_known_fact CmSameOperation same_operation,
+             cm_known_fact CmProducerLineage
+               (andb (eq_nat(cm_value_kind consumed, 6))
+                 (andb(notb (cm_value_io consumed), eq_nat(cm_value_id consumed, cm_call_node inner)))),
+             cm_known_fact CmSameRegion
+               (andb (eq_nat(cm_call_branch inner, cm_call_branch outer))
+                 (eq_nat(cm_call_epoch inner, cm_call_epoch outer))),
+             cm_known_fact law True]) (cm_nested_message role) in
+        cm_render_proof decl owner proof
+    end;
+
+-- A request names one producer edge. Boolean complements also accept a
+-- negation in the first slot when the second slot is not a call result.
+-- Result continuations and append use their exact subject slots.
+-- Ordinals identify nodes; their numeric order is not evaluation order.
+def cm_nested_value (call : ClippyCallFact) : CmValue :=
+    match cm_result_contract_role (cm_call_role call) with
+    | True => cm_arg_at(cm_result_subject_slot (cm_call_role call), cm_call_args call)
+    | False =>
+        let last : CmValue := cm_last_value (cm_call_args call) in
+        match andb (eq_nat(cm_call_role call, 21))
+            (eq_nat(length(CmValue, cm_call_args call), 3)) with
+        | True => cm_arg_at(1, cm_call_args call)
+        | False => match andb (elem Nat eq_nat (cm_call_role call) [35,36])
+            (notb (eq_nat(cm_value_kind last, 6))) with
+          | True => cm_arg_at(0, cm_call_args call)
+          | False => last
+          end
+        end
+    end;
+
+def cm_composition_proof (kind : CmProofKind) (decl : ScDecl) (owner : String)
+    (outer : ClippyCallFact) (inner : ClippyCallFact)
+    (outer_arity : Nat) (inner_arity : Nat) (facts : List CmEvidence)
+    (message : String) : List CgSProof :=
+    let consumed : CmValue := cm_nested_value outer in
+    let known (value : CmValue) : Bool :=
+        andb(cm_value_known value, notb (cm_value_io value)) in
+    cm_render_proof decl owner
+      (cm_proof_for kind decl (cm_call_node outer) (cm_call_branch outer) (cm_call_epoch outer)
+        (append CmEvidence
+          [cm_known_fact CmCalleeResolved
+             (andb(notb (eq_nat(cm_call_role inner, 0)), notb (eq_nat(cm_call_role outer, 0)))),
+           cm_known_fact CmKnownArguments
+             (andb(all CmValue known (cm_call_args inner), all CmValue known (cm_call_args outer))),
+           cm_known_fact(CmPureExpression, andb(cm_call_pure inner, cm_call_pure outer)),
+           cm_known_fact CmExactArity
+             (andb (eq_nat(length(CmValue, cm_call_args inner), inner_arity))
+               (eq_nat(length(CmValue, cm_call_args outer), outer_arity))),
+           cm_known_fact CmProducerLineage
+             (andb (elem Nat eq_nat (cm_value_kind consumed) [6,7,8])
+               (andb(notb (cm_value_io consumed), eq_nat(cm_value_id consumed, cm_call_node inner)))),
+           cm_known_fact CmSameRegion
+             (andb (eq_nat(cm_call_branch inner, cm_call_branch outer))
+               (eq_nat(cm_call_epoch inner, cm_call_epoch outer)))] facts) message);
+
+def cm_result_composition_pair (decl : ScDecl) (owner : String)
+    (outer : ClippyCallFact) (inner : ClippyCallFact) : List CgSProof :=
+    match cm_result_composition_law outer inner with
+    | Nothing => []
+    | Just law => match law with
+      | CmResultLawOf kind outer_arity inner_arity facts message =>
+          cm_composition_proof kind decl owner outer inner outer_arity inner_arity facts message
+      end
+    end;
+
+def cm_composition_type (position : Nat) (outer : ClippyCallFact) (inner : ClippyCallFact) : Bool :=
+    cm_law_same(cm_arg_at(position, cm_call_args outer), cm_arg_at(position, cm_call_args inner));
+
+def cm_length_pair (decl : ScDecl) (owner : String) (outer : ClippyCallFact)
+    (inner : ClippyCallFact) (temporary : Bool) : List CgSProof :=
+    match eq_nat(cm_call_role inner, 43) with
+    | True => cm_composition_proof CmLengthReverseProof decl owner outer inner 2 2
+        [cm_known_fact CmLengthPreserved True,
+         cm_known_fact CmAllocationAvoided temporary,
+         cm_known_fact(CmTypeArgumentsAgree, cm_composition_type 0 outer inner),
+         cm_known_fact CmMeaningfulCost
+           (andb (andb(eq_nat(cm_call_cost outer, 1), eq_nat(cm_call_cost inner, 1)))
+             (notb (cm_value_constant (cm_last_value (cm_call_args inner)))))]
+        "the resolved list length consumes an unbound reversed nonconstant list of the same element type; reversal preserves length, so measure the original list without allocating the reversal; preserve evaluation"
+    | False => match eq_nat(cm_call_role inner, 21) with
+      | False => []
+      | True => cm_composition_proof CmLengthAppendProof decl owner outer inner 2 3
+          [cm_known_fact CmAllocationAvoided temporary,
+           cm_known_fact(CmTypeArgumentsAgree, cm_composition_type 0 outer inner),
+           cm_known_fact CmMeaningfulCost
+             (andb (andb(eq_nat(cm_call_cost outer, 1), eq_nat(cm_call_cost inner, 1)))
+               (notb (cm_value_constant (cm_arg_at(1, cm_call_args inner)))))]
+          "the resolved list length consumes an unbound list append with a nonconstant left input of the same element type; add the two lengths instead of allocating the appended list after reviewing evaluation order"
+      end
+    end;
+
+def cm_count_pair (decl : ScDecl) (owner : String) (outer : ClippyCallFact)
+    (inner : ClippyCallFact) : List CgSProof :=
+    match eq_nat(cm_call_role inner, 40) with
+    | False => []
+    | True =>
+        let before : CmValue := cm_arg_at(1, cm_call_args inner) in
+        let after : CmValue := cm_arg_at(1, cm_call_args outer) in
+        let dominates : Bool := andb (cm_law_nat_le before after)
+            (andb(notb (cm_law_nat 0 before), notb (cm_law_nat 0 after))) in
+        let facts : List CmEvidence :=
+            [cm_known_fact CmCountDominance dominates,
+             cm_known_fact(CmTypeArgumentsAgree, cm_composition_type 0 outer inner)] in
+        match eq_nat(cm_call_role outer, 40) with
+        | True => cm_composition_proof CmDominatedTakeProof decl owner outer inner 3 3
+            (Cons CmEvidence (cm_known_fact CmMeaningfulCost
+              (andb (eq_nat(cm_call_cost outer, 1))
+                (notb (cm_value_constant (cm_last_value (cm_call_args inner)))))) facts)
+            "the outer list take has a proven positive count at least as large as the inner take's bound and cannot shorten that result; retain the inner result and preserve evaluation"
+        | False => cm_composition_proof CmDropAfterTakeProof decl owner outer inner 3 3 facts
+            "the resolved list drop count is at least the positive bound of its producer take, so the result is empty; review the counts and preserve input evaluation"
+        end
+    end;
+
+def cm_interval_pair (decl : ScDecl) (owner : String) (outer : ClippyCallFact)
+    (inner : ClippyCallFact) : List CgSProof :=
+    match eq_nat(cm_call_role inner, 33) with
+    | False => []
+    | True =>
+        let lo : CmValue := cm_arg_at(0, cm_call_args outer) in
+        let hi : CmValue := cm_arg_at(1, cm_call_args outer) in
+        let lower : CmValue := cm_arg_at(0, cm_call_args inner) in
+        let upper : CmValue := cm_arg_at(1, cm_call_args inner) in
+        let ordered : Bool := andb(cm_law_nat_le lo hi, cm_law_nat_le lower upper) in
+        let contains : Bool := andb ordered
+            (andb(cm_law_nat_le lo lower, cm_law_nat_le upper hi)) in
+        let disjoint : Bool := andb ordered
+            (orb (ltb_nat(cm_value_id hi, cm_value_id lower))
+              (ltb_nat(cm_value_id upper, cm_value_id lo))) in
+        match eq_nat(cm_call_role outer, 33) with
+        | True => cm_composition_proof CmContainedClampProof decl owner outer inner 3 3
+            [cm_known_fact(CmBoundsContainment, andb(contains, notb (cm_law_same lo hi)))]
+            "the outer resolved clamp interval contains the producer clamp's entire ordered literal interval and cannot change that result; retain the inner clamp after reviewing evaluation"
+        | False => cm_composition_proof CmClampedRangeProof decl owner outer inner 3 3
+            [cm_known_fact(CmBoundsContainment, orb contains disjoint)]
+            (match contains with
+             | True => "the resolved range predicate contains the producer clamp's entire ordered literal interval and is always true; review the condition while preserving evaluation"
+             | False => "the resolved range predicate is disjoint from the producer clamp's ordered literal interval and is always false; review the condition while preserving evaluation"
+             end)
+        end
+    end;
+
+def cm_constructor_pair (decl : ScDecl) (owner : String) (outer : ClippyCallFact)
+    (inner : ClippyCallFact) : List CgSProof :=
+    let role : Nat := cm_call_role outer in
+    let producer : Nat := cm_call_role inner in
+    let type_agrees : Bool := cm_composition_type 0 outer inner in
+    match eq_nat role 53 with
+    | True => cm_composition_proof CmKnownMaybeDefaultProof decl owner outer inner 3 2
+        [cm_known_fact(CmFixedConstructor, eq_nat producer 54),
+         cm_known_fact CmTypeArgumentsAgree type_agrees]
+        "the resolved Maybe default consumes a known Just constructor with the same payload type; its fallback cannot be selected, but eager fallback evaluation must still be preserved"
+    | False =>
+        let types : Bool := andb(type_agrees, cm_composition_type 1 outer inner) in
+        match eq_nat role 51 with
+        | True => cm_composition_proof CmKnownResultTestProof decl owner outer inner 3 3
+            [cm_known_fact(CmFixedConstructor, elem Nat eq_nat producer [10,11]),
+             cm_known_fact CmTypeArgumentsAgree types]
+            "the resolved Result predicate consumes a known Left/Right constructor with matching error and payload types; the outcome is fixed, not an unchecked result test; preserve evaluation"
+        | False => cm_composition_proof CmKnownResultDefaultProof decl owner outer inner 4 3
+            [cm_known_fact(CmFixedConstructor, eq_nat producer 11),
+             cm_known_fact CmTypeArgumentsAgree types]
+            "the resolved Result default consumes a known Right constructor with matching types; its fallback cannot be selected, but eager fallback evaluation must still be preserved"
+        end
+    end;
+
+def cm_extremum_pair (decl : ScDecl) (owner : String) (outer : ClippyCallFact)
+    (inner : ClippyCallFact) : List CgSProof :=
+    let opposite : Bool := orb
+        (andb(eq_nat(cm_call_role outer, 44), eq_nat(cm_call_role inner, 45)))
+        (andb(eq_nat(cm_call_role outer, 45), eq_nat(cm_call_role inner, 44))) in
+    let operand : CmValue := cm_arg_at(0, cm_call_args outer) in
+    match opposite with
+    | False => []
+    | True => cm_composition_proof CmExtremumAbsorptionProof decl owner outer inner 2 2
+        [cm_known_fact CmSameValue
+          (orb (cm_law_same(operand, cm_arg_at(0, cm_call_args inner)))
+            (cm_law_same(operand, cm_arg_at(1, cm_call_args inner))))]
+        "opposite resolved Nat extrema share the outer operand: min x (max x y) and max x (min x y) return x; review the operands and preserve evaluation"
+    end;
+
+def cm_complement_pair (decl : ScDecl) (owner : String) (outer : ClippyCallFact)
+    (inner : ClippyCallFact) : List CgSProof :=
+    match eq_nat(cm_call_role inner, 37) with
+    | False => []
+    | True =>
+        let first : CmValue := cm_arg_at(0, cm_call_args outer) in
+        let last : CmValue := cm_arg_at(1, cm_call_args outer) in
+        let other : CmValue := match cm_law_same(first, cm_nested_value outer) with
+          | True => last | False => first end in
+        cm_composition_proof CmBooleanComplementProof decl owner outer inner 2 1
+          [cm_known_fact(CmComplementaryOperands, cm_law_same(other, cm_arg_at(0, cm_call_args inner)))]
+          (match eq_nat(cm_call_role outer, 35) with
+           | True => "the resolved conjunction combines one Boolean value with its proven negation and is always false; review the condition and preserve argument evaluation"
+           | False => "the resolved disjunction combines one Boolean value with its proven negation and is always true; review the condition and preserve argument evaluation"
+           end)
+    end;
+
+-- These consumers run at the existing sorted producer join, not in a second
+-- AST walk or a per-call scan of the definition. Unknown roles stay silent.
+def cm_composition_pair (decl : ScDecl) (owner : String) (outer : ClippyCallFact)
+    (inner : ClippyCallFact) (temporary : Bool) : List CgSProof :=
+    let role : Nat := cm_call_role outer in
+    append CgSProof (cm_result_composition_pair decl owner outer inner)
+    (match eq_nat role 18 with
+    | True => cm_length_pair decl owner outer inner temporary
+    | False => match elem Nat eq_nat role [40,41] with
+      | True => cm_count_pair decl owner outer inner
+      | False => match elem Nat eq_nat role [33,34] with
+        | True => cm_interval_pair decl owner outer inner
+        | False => match elem Nat eq_nat role [51,52,53] with
+          | True => cm_constructor_pair decl owner outer inner
+          | False => match elem Nat eq_nat role [44,45] with
+            | True => cm_extremum_pair decl owner outer inner
+            | False => match elem Nat eq_nat role [35,36] with
+              | True => cm_complement_pair decl owner outer inner
+              | False => []
+              end
+            end
+          end
+        end
+      end
+    end);
+
+def cm_nested_source (call : ClippyCallFact) : Nat :=
+    cm_value_id (cm_nested_value call);
+
+def cm_nested_request (call : ClippyCallFact) : Bool :=
+    andb (orb (cm_result_contract_role (cm_call_role call))
+        (elem Nat eq_nat (cm_call_role call) [18,20,21,33,34,35,36,37,40,41,42,43,44,45,51,52,53,55,56,57,61,62]))
+      (andb (elem Nat eq_nat (cm_value_kind (cm_nested_value call)) [6,7,8])
+        (notb (cm_value_io (cm_nested_value call))));
+
+def cm_producers_at (id : Nat) : List ClippyCallFact -> List ClippyCallFact :=
+  fix advance (calls : List ClippyCallFact) : List ClippyCallFact :=
+    match calls with
+    | Nil => []
+    | Cons call rest => match ltb_nat(cm_call_node call, id) with
+      | True => advance rest | False => calls end
+    end;
+
+-- A bound list may have another consumer. Do not claim that measuring it
+-- made its allocation unnecessary. This conservative exclusion consumes
+-- existing binder facts, including aliases, and needs no expression walk.
+def cm_bound_producers (events : List CmEvent) : List Nat :=
+    quality_sort Nat leb_nat
+      ((fix go (remaining : List CmEvent) : List Nat :=
+        match remaining with
+        | Nil => []
+        | Cons event rest => match event with
+          | CmBindEvent binding =>
+              let value : CmValue := cm_binding_value binding in
+              match eq_nat(cm_value_kind value, 6) with
+              | True => Cons(Nat, cm_value_id value, go rest)
+              | False => go rest
+              end
+          | CmCallEvent _ => go rest
+          | CmUseEvent _ => go rest
+          | CmFlowEvent _ => go rest
+          | CmTraversalEvent _ => go rest
+          | CmRecursionEvent _ => go rest
+          | CmWrapperEvent _ => go rest
+          | CmFinding _ => go rest
+          | CmToken _ _ => go rest
+          end
+        end) events);
+
+-- One sorted join serves old and collection-specific proof consumers.
+-- The optional consumer never receives expressions or an event stream.
+def cm_nested_laws_using (decl : ScDecl) (owner : String)
+    (calls : List ClippyCallFact) (bound : List Nat)
+    (extra : ClippyCallFact -> ClippyCallFact -> Bool -> List CgSProof) : List CgSProof :=
+    let selected : List ClippyCallFact := filter ClippyCallFact cm_nested_request calls in
+    match selected with
+    | Nil => []
+    | Cons _ _ =>
+        let requests : List ClippyCallFact := quality_sort ClippyCallFact
+            (fun (a : ClippyCallFact) (b : ClippyCallFact) =>
+              match eq_nat(cm_nested_source a, cm_nested_source b) with
+              | True => leb_nat(cm_call_node a, cm_call_node b)
+              | False => leb_nat(cm_nested_source a, cm_nested_source b) end) selected in
+        let producers : List ClippyCallFact := quality_sort ClippyCallFact
+            (fun (a : ClippyCallFact) (b : ClippyCallFact) => leb_nat(cm_call_node a, cm_call_node b)) calls in
+        (fix join (pending : List ClippyCallFact) (available : List ClippyCallFact)
+            (bindings : List Nat) : List CgSProof :=
+          match pending with
+          | Nil => []
+          | Cons outer rest =>
+              let source : Nat := cm_nested_source outer in
+              let remaining : List ClippyCallFact := cm_producers_at source available in
+              let bound_tail : List Nat := cm_observations_at source bindings in
+              let temporary : Bool := match bound_tail with
+                | Nil => True | Cons id _ => notb (eq_nat id source) end in
+              let proofs : List CgSProof := match remaining with
+                | Nil => []
+                | Cons inner _ => match eq_nat(cm_call_node inner, source) with
+                  | True =>
+                      let additional : List CgSProof := extra outer inner temporary in
+                      let quality : List CgSProof := cm_quality_pair
+                          (fun (kind : CmProofKind) (outer_arity : Nat) (inner_arity : Nat)
+                              (facts : List CmEvidence) (message : String) =>
+                            cm_composition_proof kind decl owner outer inner
+                              outer_arity inner_arity facts message)
+                          outer inner temporary in
+                      -- Prefer the direct-contract proof only after publication.
+                      -- The role-based law remains available for other pairs.
+                      let narrow_take : Bool := any CgSProof (fun (proof : CgSProof) =>
+                          match proof with | MkCgSProof code _ _ _ _ =>
+                            prim_string_eq(code, cc_rule CcNarrowTake) end) additional in
+                      let retained : List CgSProof := match narrow_take with
+                        | False => quality
+                        | True => filter CgSProof (fun (proof : CgSProof) =>
+                            match proof with | MkCgSProof code _ _ _ _ =>
+                              notb (prim_string_eq(code, cm_quality_rule CmTightenTake)) end) quality
+                        end in
+                      append CgSProof (cm_nested_pair decl owner outer inner)
+                        (append CgSProof (cm_composition_pair decl owner outer inner temporary)
+                          (append CgSProof additional retained))
+                  | False => [] end
+                end in
+              append CgSProof proofs (join rest remaining bound_tail)
+          end) requests producers bound
+    end;
+
+def cm_nested_laws_with_bindings (decl : ScDecl) (owner : String)
+    (calls : List ClippyCallFact) (bound : List Nat) : List CgSProof :=
+    cm_nested_laws_using decl owner calls bound
+      (fun (_ : ClippyCallFact) (_ : ClippyCallFact) (_ : Bool) => []);
+
+def cm_collection_laws_with_bindings (apis : CmApiIndex) (decl : ScDecl)
+    (owner : String) (calls : List ClippyCallFact) (bound : List Nat) : List CgSProof :=
+    cm_nested_laws_using decl owner calls bound
+      (fun (outer : ClippyCallFact) (inner : ClippyCallFact) (temporary : Bool) =>
+        concat_map CmSemanticProof CgSProof (cm_render_proof decl owner)
+          (cm_collection_pair apis decl outer inner temporary));
+
+-- Fact-only consumers can supply a graph with no bindings. Production always
+-- calls the binding-aware entry with facts from the completed definition.
+def cm_nested_laws (decl : ScDecl) (owner : String) (calls : List ClippyCallFact) : List CgSProof :=
+    cm_nested_laws_with_bindings decl owner calls [];
+
+
+def cm_definition_proofs_using_join (unit : ClippySemanticUnit) (item : CmDefinition)
+    (calls : List ClippyCallFact)
+    (nested : ScDecl -> String -> List ClippyCallFact -> List Nat -> List CgSProof) : List CgSProof :=
+    let owner : String := cm_name(cm_intern unit, sc_decl_name (cm_definition_decl item)) in
     let events : List CmEvent := cm_definition_events item in
-    append CgSProof (cm_findings (cm_definition_decl item) owner events)
-      (append CgSProof (cm_unobserved (cm_definition_decl item) owner (cm_flow_ids [1] events) (cm_flow_ids [3,4,6,9] events) (Nothing Nat))
+    let paths : List CgSProof := cm_result_path_proofs
+        (cm_render_proof(cm_definition_decl item, owner)) (cm_definition_decl item) events calls in
+    cm_with_locations unit item
+      (append CgSProof (append CgSProof
+        (cm_findings (cm_definition_decl item) owner events)
+        (append CgSProof paths
+          (nested(cm_definition_decl item, owner, calls, cm_bound_producers events))))
+      (append CgSProof (cm_unobserved(cm_definition_decl item, owner, cm_flow_ids [1] events, cm_flow_ids [3,4,6,9] events, Nothing Nat))
         (append CgSProof (cm_repeated (cm_definition_decl item) owner CmRepeatedWorkProof
           "the same registered pure conversion/parse/normalization consumes the same value in one effect-free region"
           cm_work_key (filter ClippyCallFact cm_work_eligible calls))
           (cm_repeated (cm_definition_decl item) owner CmRepeatedTraversalProof
             "the same registered pure traversal is repeated with identical callee and all argument identities in one effect-free region"
-            cm_work_key (filter ClippyCallFact cm_traversal_eligible calls))));
+            cm_work_key (filter ClippyCallFact cm_traversal_eligible calls)))));
+
+-- Preserve the fact-only API for callers without a resolved API index.
+def cm_definition_proofs_using_calls (unit : ClippySemanticUnit) (item : CmDefinition)
+    (calls : List ClippyCallFact) : List CgSProof :=
+    cm_definition_proofs_using_join unit item calls cm_nested_laws_with_bindings;
 
 -- Structural streams include signature and body. Only binder declarations
 -- and binder uses differ between exact and alpha streams.
@@ -241,7 +670,7 @@ def cm_tokens (exact : Bool) (events : List CmEvent) : List Nat :=
 def cm_hash (tokens : List Nat) : Nat :=
     -- Local bucket key only. Decimal token framing is unambiguous, and full
     -- structural comparison is still mandatory after the bucket hits.
-    foldl Nat Nat (fun (acc : Nat) (token : Nat) => add (mul acc 131) token) Z tokens;
+    foldl Nat Nat (fun (acc : Nat) (token : Nat) => add(mul acc 131, token)) Z tokens;
 
 def cm_sequence_compare : List Nat -> List Nat -> Ordering :=
   fix go (left : List Nat) (right : List Nat) : Ordering :=
@@ -263,9 +692,9 @@ def cm_clone_alpha (item : CmClone) : List Nat := match item with | CmCloneOf _ 
 def cm_clone_exact (item : CmClone) : List Nat := match item with | CmCloneOf _ _ _ exact => exact end;
 
 def cm_clone_le (a : CmClone) (b : CmClone) : Bool :=
-    match compareNat (cm_clone_hash a) (cm_clone_hash b) with
+    match compareNat(cm_clone_hash a, cm_clone_hash b) with
     | LT => True | GT => False
-    | EQ => match cm_sequence_compare (cm_clone_alpha a) (cm_clone_alpha b) with
+    | EQ => match cm_sequence_compare(cm_clone_alpha a, cm_clone_alpha b) with
       | LT => True | EQ => True | GT => False end
     end;
 
@@ -276,9 +705,9 @@ def cm_clone_le (a : CmClone) (b : CmClone) : Bool :=
 def cm_clone_call_known (apis : CmApiIndex) (call : ClippyCallFact) : Bool :=
     match cm_call_pure call with
     | False => False
-    | True => match cm_api_lookup (cm_call_callee call) apis with
+    | True => match cm_api_lookup(cm_call_callee call, apis) with
       | Nothing => False
-      | Just api => orb (eq_nat (sc_decl_kind (cm_api_decl api)) 3)
+      | Just api => orb (eq_nat(sc_decl_kind (cm_api_decl api), 3))
           (cs_complete (cm_api_summary api)) end
     end;
 
@@ -323,25 +752,23 @@ def cm_has_tokens (needed : Nat) (events : List CmEvent) : Bool :=
       end
     end) events needed;
 
--- Match arms are intentional: eager Boolean arguments would still construct
--- the expensive streams for boundary, small, impure or unknown candidates.
 def cm_clone_candidate (unit : ClippySemanticUnit) (apis : CmApiIndex)
     (item : CmDefinition) (calls : List ClippyCallFact) : List CmClone :=
     let decl : ScDecl := cm_definition_decl item in
     let boundary : Bool := orb (cm_contract_policy (cm_contract_for unit decl))
-      (orb (cm_boundary unit decl 1) (cm_boundary unit decl 3)) in
+      (orb(cm_boundary unit decl 1, cm_boundary unit decl 3)) in
     match boundary with
     | True => []
     | False => match cm_has_two_calls calls with
       | False => []
       | True => match cm_clone_calls_known apis calls with
         | False => []
-        | True => match cm_has_tokens 120 (cm_definition_events item) with
+        | True => match cm_has_tokens(120, cm_definition_events item) with
           | False => []
           | True =>
-              let alpha : List Nat := cm_tokens False (cm_definition_events item) in
+              let alpha : List Nat := cm_tokens(False, cm_definition_events item) in
               [CmCloneOf (cm_hash alpha) decl alpha
-                (cm_tokens True (cm_definition_events item))]
+                (cm_tokens(True, cm_definition_events item))]
           end
         end
       end
@@ -356,21 +783,21 @@ def cm_duplicate_proofs (unit : ClippySemanticUnit) : List CmClone -> List CgSPr
     | Nil => []
     | Cons first rest => match rest with
       | Nil => []
-      | Cons second _ => match eq_nat (cm_clone_hash first) (cm_clone_hash second) with
+      | Cons second _ => match eq_nat(cm_clone_hash first, cm_clone_hash second) with
         | False => go rest
-        | True => match cm_sequence_compare (cm_clone_alpha first) (cm_clone_alpha second) with
+        | True => match cm_sequence_compare(cm_clone_alpha first, cm_clone_alpha second) with
           | LT => go rest | GT => go rest
           | EQ =>
-              let kind : String := match cm_sequence_compare (cm_clone_exact first) (cm_clone_exact second) with
+              let kind : String := match cm_sequence_compare(cm_clone_exact first, cm_clone_exact second) with
                 | EQ => "exact structural" | LT => "alpha-equivalent" | GT => "alpha-equivalent" end in
               let proof : CmSemanticProof := cm_proof_for CmDuplicateProof
                 (cm_clone_decl second) 0 0 0
                 [cm_known_fact CmSameStructure True, cm_known_fact CmContractAgreement True]
                 (prim_string_concat kind (prim_string_concat " duplicate of "
-                  (prim_string_concat (cm_name (cm_intern unit) (cm_clone_owner first))
+                  (prim_string_concat (cm_name(cm_intern unit, cm_clone_owner first))
                     "; signatures, resolved contracts, constructors, literals and flow agree; review shared implementation while preserving public/boundary APIs; no removal is authorized"))) in
               append CgSProof (cm_render_proof (cm_clone_decl second)
-                (cm_name (cm_intern unit) (cm_clone_owner second)) proof) (go rest)
+                (cm_name(cm_intern unit, cm_clone_owner second)) proof) (go rest)
           end
         end
       end
@@ -389,7 +816,7 @@ def cm_fold_definition_proofs (unit : ClippySemanticUnit) (apis : CmApiIndex)
     | Nil => Right QualityInputError (List CgSProof)
         (append CgSProof
           (concat_map (List CgSProof) CgSProof (fun (chunk : List CgSProof) => chunk)
-            (reverse_lin (List CgSProof) chunks))
+            (reverse_lin(List CgSProof, chunks)))
           (cm_duplicate_proofs unit (quality_sort CmClone cm_clone_le
             (reverse_lin CmClone clones))))
     | Cons decl rest => match cm_build_definition unit apis decl with
@@ -398,7 +825,8 @@ def cm_fold_definition_proofs (unit : ClippySemanticUnit) (apis : CmApiIndex)
         | Nothing => go rest chunks clones
         | Just item =>
             let calls : List ClippyCallFact := cm_calls (cm_definition_events item) in
-            let proofs : List CgSProof := cm_definition_proofs_using_calls unit item calls in
+            let proofs : List CgSProof := cm_definition_proofs_using_join unit item calls
+                (cm_collection_laws_with_bindings apis) in
             let candidates : List CmClone := cm_clone_candidate unit apis item calls in
             let next_chunks : List (List CgSProof) := match proofs with
               | Nil => chunks
@@ -420,7 +848,7 @@ def cm_semantic_proofs (unit : ClippySemanticUnit) : Either QualityInputError (L
     | Left error => Left QualityInputError (List CgSProof) error
     | Right _ => match cm_validate_contract_bindings unit cm_contracts with
       | Left error => Left QualityInputError (List CgSProof) error
-      | Right _ => match cm_build_apis unit (cm_index unit) with
+      | Right _ => match cm_build_apis(unit, cm_index unit) with
       | Left error => Left QualityInputError (List CgSProof) error
       | Right initial_apis =>
         let summaries : CsAnalysis := cs_analyze unit initial_apis cm_visit_fuel cm_analyze_depth in

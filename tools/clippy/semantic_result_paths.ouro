@@ -1,0 +1,149 @@
+-- Path witnesses are emitted by the existing visitor as CmFlow records:
+-- 20: match-node -> checked producer; 21: arm-node -> owning match-node;
+-- 22: arm-node -> resolved Left/Right role; 23: arm-node -> entry effect epoch.
+-- Missing or duplicate fields cannot produce a witness. Sorted joins below
+-- consume facts only; sibling arms, effects, lambdas and handlers never share
+-- a witness by spelling, textual nesting or ordinal ordering.
+import "semantic_calls.ouro",
+  "../../compiler/semantic_scope.ouro";
+
+inductive CmResultPath : Type :=
+  | CmResultPathOf : Nat -> Nat -> Nat -> Nat -> CmResultPath;
+
+def cm_result_pair_order (A : Type) (left : Pair Nat A) (right : Pair Nat A) : Bool :=
+    match left with | MkPair a _ => match right with | MkPair b _ => leb_nat a b end end;
+
+def cm_result_pairs_at (A : Type) (key : Nat) : List (Pair Nat A) -> List (Pair Nat A) :=
+  fix advance (rows : List (Pair Nat A)) : List (Pair Nat A) :=
+    match rows with
+    | Nil => []
+    | Cons row rest => match row with | MkPair id _ =>
+        match ltb_nat id key with | True => advance rest | False => rows end end
+    end;
+
+-- The left cursor decreases structurally; advancing the right cursor is an
+-- independent structurally decreasing helper. Repeated request keys are legal.
+def cm_result_join (A : Type) (B : Type)
+    : List (Pair Nat A) -> List (Pair Nat B) -> List (Pair Nat (Pair A B)) :=
+  fix join (requests : List (Pair Nat A)) (values : List (Pair Nat B))
+      : List (Pair Nat (Pair A B)) :=
+    match requests with
+    | Nil => []
+    | Cons request rest => match request with | MkPair key payload =>
+        let remaining : List (Pair Nat B) := cm_result_pairs_at B key values in
+        let more : List (Pair Nat (Pair A B)) := join rest remaining in
+        match remaining with
+        | Nil => more
+        | Cons value _ => match value with | MkPair id found =>
+            match eq_nat id key with
+            | False => more
+            | True => Cons (Pair(Nat, Pair A B))
+                (MkPair(Nat, Pair A B, key, MkPair A B payload found)) more
+            end end
+        end
+      end
+    end;
+
+-- Remove every occurrence of a duplicated field, including equal duplicates.
+-- Choosing the first/last conflicting constructor would manufacture a proof.
+def cm_result_unique_fields : List (Pair Nat Nat) -> Maybe Nat -> List (Pair Nat Nat) :=
+  fix unique (rows : List (Pair Nat Nat)) (previous : Maybe Nat) : List (Pair Nat Nat) :=
+    match rows with
+    | Nil => []
+    | Cons row rest => match row with | MkPair key _ =>
+        let before : Bool := match previous with | Nothing => False | Just id => eq_nat id key end in
+        let after : Bool := match rest with
+          | Nil => False | Cons next _ => match next with | MkPair id _ => eq_nat id key end end in
+        match orb before after with
+        | True => unique(rest, Just Nat key)
+        | False => Cons(Pair Nat Nat, row, unique(rest, Just Nat key))
+        end end
+    end;
+
+def cm_result_flow_fields (selected : Nat) (events : List CmEvent) : List (Pair Nat Nat) :=
+    cm_result_unique_fields (quality_sort (Pair Nat Nat) (cm_result_pair_order Nat)
+      (concat_map CmEvent (Pair Nat Nat) (fun (event : CmEvent) => match event with
+        | CmFlowEvent flow => match flow with | CmFlow node kind value =>
+            match eq_nat kind selected with
+            | True => [MkPair Nat Nat node value] | False => [] end end
+        | CmCallEvent _ => [] | CmBindEvent _ => [] | CmUseEvent _ => []
+        | CmTraversalEvent _ => [] | CmRecursionEvent _ => []
+        | CmWrapperEvent _ => [] | CmFinding _ => [] | CmToken _ _ => []
+        end) events)) (Nothing Nat);
+
+def cm_result_path_witnesses (events : List CmEvent) : List (Pair Nat CmResultPath) :=
+    let matches : List (Pair Nat Nat) := cm_result_flow_fields 20 events in
+    match matches with
+    | Nil => []
+    | Cons _ _ =>
+        let arms : List (Pair Nat (Pair (Pair Nat Nat) Nat)) :=
+            cm_result_join (Pair Nat Nat) Nat
+              (cm_result_join(Nat, Nat, cm_result_flow_fields 21 events, cm_result_flow_fields 22 events))
+              (cm_result_flow_fields 23 events) in
+        let requests : List (Pair Nat (Pair Nat (Pair Nat Nat))) :=
+            quality_sort (Pair(Nat, Pair(Nat, Pair Nat Nat))) (cm_result_pair_order (Pair(Nat, Pair Nat Nat)))
+              (concat_map (Pair(Nat, Pair(Pair Nat Nat, Nat))) (Pair(Nat, Pair(Nat, Pair Nat Nat)))
+                (fun (row : Pair Nat (Pair (Pair Nat Nat) Nat)) => match row with
+                  | MkPair branch fields => match fields with | MkPair linked epoch =>
+                    match linked with | MkPair parent variant =>
+                      match andb(notb (eq_nat branch parent), elem Nat eq_nat variant [10,11]) with
+                      | False => []
+                      | True => [MkPair Nat (Pair(Nat, Pair Nat Nat)) parent
+                          (MkPair(Nat, Pair Nat Nat, branch, MkPair Nat Nat variant epoch))]
+                      end end end end) arms) in
+        let selected : List (Pair Nat (Pair (Pair Nat (Pair Nat Nat)) Nat)) :=
+            cm_result_join (Pair(Nat, Pair Nat Nat)) Nat requests matches in
+        quality_sort (Pair Nat CmResultPath) (cm_result_pair_order CmResultPath)
+          (map (Pair(Nat, Pair(Pair(Nat, Pair Nat Nat), Nat))) (Pair Nat CmResultPath)
+            (fun (row : Pair Nat (Pair (Pair Nat (Pair Nat Nat)) Nat)) => match row with
+              | MkPair _ fields => match fields with | MkPair arm producer =>
+                match arm with | MkPair branch selected_arm => match selected_arm with | MkPair variant epoch =>
+                  MkPair Nat CmResultPath branch (CmResultPathOf branch epoch producer variant)
+                end end end end) selected)
+    end;
+
+def cm_result_path_proof (decl : ScDecl) (call : ClippyCallFact) (path : CmResultPath) : CmSemanticProof :=
+    match path with | CmResultPathOf branch epoch producer variant =>
+      let test : Bool := eq_nat(cm_call_role call, 51) in
+      let subject : CmValue := cm_last_value (cm_call_args call) in
+      cm_proof_for (match test with | True => CmResultPathTestProof | False => CmResultPathDefaultProof end)
+        decl (cm_call_node call) (cm_call_branch call) (cm_call_epoch call)
+        [cm_known_fact(CmCalleeResolved, elem Nat eq_nat (cm_call_role call) [51,52]),
+         cm_known_fact CmKnownArguments (all CmValue (fun (value : CmValue) =>
+           andb(cm_value_known value, notb (cm_value_io value))) (cm_call_args call)),
+         cm_known_fact(CmPureExpression, cm_call_pure call),
+         cm_known_fact CmExactArity
+           (eq_nat(length(CmValue, cm_call_args call), match test with | True => 3 | False => 4 end)),
+         cm_known_fact(CmCheckedProducer, cm_checked subject),
+         cm_known_fact CmProducerLineage
+           (andb(notb (eq_nat producer 0), eq_nat(cm_value_id subject, producer))),
+         cm_known_fact CmSameRegion
+           (andb(eq_nat(branch, cm_call_branch call), eq_nat(epoch, cm_call_epoch call))),
+         cm_known_fact CmMatchDominates True,
+         cm_known_fact CmFixedConstructor
+           (andb(elem Nat eq_nat variant [10,11], orb(test, eq_nat variant 11)))]
+        (match test with
+         | True => "this resolved Result predicate inspects the same executed checked producer whose Left/Right arm is already selected in the current effect epoch; its outcome is fixed by that arm; preserve evaluation when removing the redundant inspection"
+         | False => "this resolved Result default consumes the same executed checked producer on its selected Right arm in the current effect epoch; its fallback cannot be selected, but eager fallback evaluation must be preserved"
+         end)
+    end;
+
+def cm_result_path_proofs (render : CmSemanticProof -> List CgSProof) (decl : ScDecl)
+    (events : List CmEvent) (calls : List ClippyCallFact) : List CgSProof :=
+    let witnesses : List (Pair Nat CmResultPath) := cm_result_path_witnesses events in
+    match witnesses with
+    | Nil => []
+    | Cons _ _ =>
+        let requests : List (Pair Nat ClippyCallFact) :=
+            quality_sort (Pair Nat ClippyCallFact) (cm_result_pair_order ClippyCallFact)
+              (concat_map ClippyCallFact (Pair Nat ClippyCallFact) (fun (call : ClippyCallFact) =>
+                match andb (elem Nat eq_nat (cm_call_role call) [51,52])
+                    (cm_checked (cm_last_value (cm_call_args call))) with
+                | True => [MkPair Nat ClippyCallFact (cm_call_branch call) call]
+                | False => [] end) calls) in
+        concat_map (Pair(Nat, Pair ClippyCallFact CmResultPath)) CgSProof
+          (fun (row : Pair Nat (Pair ClippyCallFact CmResultPath)) => match row with
+            | MkPair _ joined => match joined with | MkPair call path =>
+                render (cm_result_path_proof decl call path) end end)
+          (cm_result_join ClippyCallFact CmResultPath requests witnesses)
+    end;

@@ -79,6 +79,40 @@ class StructuralContracts(unittest.TestCase):
         source = 'int first(int x) { int y = x + 2; if (y < 3) return x; return y * 4; }'
         self.assertIn(DUP, rules(scan({'a.c': source, 'b.c': source.replace('first', 'second').replace('x', 'input').replace('y', 'result')})))
 
+    def test_grouped_import_nominal_owners(self):
+        body = 'def choose (x : Item) : Item := match x with | One => One end;\n'
+        common = 'def common : Type := Type;\n'
+        nominal = 'inductive Item : Type := | One : Item;\n'
+        layouts = [
+            'import "common.ouro";\nimport "{owner}";\n',
+            'import "common.ouro", "{owner}";\n',
+            'import "common.ouro", -- the nominal dependency is second\n  "{owner}",\n;\n',
+        ]
+        for layout in layouts:
+            with self.subTest(layout=layout):
+                files = {'common.ouro': common, 'left.ouro': nominal, 'right.ouro': nominal,
+                         'a.ouro': layout.format(owner='left.ouro') + body,
+                         'b.ouro': layout.format(owner='right.ouro') + body}
+                symbols = [symbol for path, text in files.items() for symbol in sq.lexical_symbols(path, text)[0]]
+                fingerprints = sq.owned_fingerprints(symbols, files)
+                self.assertNotEqual(fingerprints['a.ouro#choose'], fingerprints['b.ouro#choose'])
+                files['b.ouro'] = layout.format(owner='left.ouro') + body
+                symbols = [symbol for path, text in files.items() for symbol in sq.lexical_symbols(path, text)[0]]
+                fingerprints = sq.owned_fingerprints(symbols, files)
+                self.assertEqual(fingerprints['a.ouro#choose'], fingerprints['b.ouro#choose'])
+
+    def test_grouped_import_escaped_owner_and_malformed_tail(self):
+        nominal = 'inductive Item : Type := | One : Item;\n'
+        body = 'def choose (x : Item) : Item := match x with | One => One end;\n'
+        files = {'common.ouro': '', 'a"b.ouro': nominal,
+                 'a.ouro': 'import "common.ouro", "a\\"b.ouro";\n' + body,
+                 'b.ouro': 'import "a\\"b.ouro";\n' + body}
+        symbols = [symbol for path, text in files.items() for symbol in sq.lexical_symbols(path, text)[0]]
+        fingerprints = sq.owned_fingerprints(symbols, files)
+        self.assertEqual(fingerprints['a.ouro#choose'], fingerprints['b.ouro#choose'])
+        with self.assertRaisesRegex(ValueError, 'malformed quoted import'):
+            sq.owned_fingerprints([], {'a.ouro': 'import "first.ouro", missing;\n'})
+
     def test_wrapper_chain_and_validation_boundary(self):
         source = 'def _a(x):\n    return _b(x)\ndef _b(x):\n    return work(x)\ndef work(x):\n    return x + 1\n_a(1)\n'
         self.assertIn('STRUCT_WRAPPER_CHAIN', rules(scan({'tools/a.py': source})))

@@ -1,7 +1,8 @@
 -- Source scanners ported from scripts/strict_quality_firewall.py.
 
-import "lexlike.ouro";
-import "../../std/listx.ouro";
+import "lexlike.ouro",
+  "../quality/import_scan.ouro",
+  "../../std/listx.ouro";
 
 def st_nlines_sentinel : Nat := mul 64 64;
 
@@ -30,15 +31,14 @@ def st_scan_lines (mp : List (Pair String QrDiag)) (profile : String)
         | Cons raw rest => go fuel2 rest (add n 1)
             (st_scan_old_do mp profile path n raw out)
         end
-      end) (add (length String lines) 1) lines 1 acc;
+      end) (add(length String lines, 1)) lines 1 acc;
 
 def st_seen_get (xs : List (Pair String Nat)) (k : String) : Maybe Nat :=
     lookup String Nat prim_string_eq k xs;
 
-def st_scan_imports (mp : List (Pair String QrDiag)) (profile : String)
+def st_scan_opens (mp : List (Pair String QrDiag)) (profile : String)
     (path : String) (lines : List String) (acc : List QrFinding) : List QrFinding :=
     (fix go (fuel : Nat) (xs : List String) (n : Nat)
-        (imps : List (Pair String Nat)) (aliases : List (Pair String Nat))
         (out : List QrFinding) : List QrFinding :=
       match fuel with
       | Z => out
@@ -46,80 +46,103 @@ def st_scan_imports (mp : List (Pair String QrDiag)) (profile : String)
         | Nil => out
         | Cons raw rest =>
             let code : String := qt_strip (qt_code_before_comment raw) in
-            match prim_string_length code with
-            | Z => go fuel2 rest (add n 1) imps aliases out
-            | S _ => match st_import_line code with
-              | Just pair => match pair with
-                | MkPair target alias =>
-                    let col : Nat := match qt_find raw "import" with
-                      | Nothing => 1
-                      | Just i => add i 1
-                      end in
+            match st_open_alias code with
+            | Nothing => go fuel2 rest (add n 1) out
+            | Just name =>
+                let col : Nat := match qt_find raw "open" with
+                  | Nothing => 1
+                  | Just i => add i 1
+                  end in
+                go fuel2 rest (add n 1)
+                  (st_add out (qr_mk_finding mp profile "OURO-LINT044"
+                    (st_place path n col)
+                    (qt_cat3 "top-level open of alias '" name
+                      "' leaks names across the file")
+                    (qt_strip raw)))
+            end
+        end
+      end) (add(length String lines, 1)) lines 1 acc;
+
+def st_import_failure (path : String) (line : Nat) (col : Nat) : String :=
+    prim_string_concat
+      (qt_cat4 path ":" (prim_string_of_nat line) ":")
+      (prim_string_concat(prim_string_of_nat col, ": malformed import declaration"));
+
+def st_import_error_message (path : String) (text : String) (error : ImportScanError)
+    : String :=
+    match error with
+    | ImportScanFailure offset => match import_scan_place text offset with
+      | MkPair line col => st_import_failure path line col
+      end
+    end;
+
+def st_scan_imports (mp : List (Pair String QrDiag)) (profile : String)
+    (path : String) (text : String) (lines : List String) (acc : List QrFinding)
+    : Either ImportScanError (List QrFinding) :=
+    match scan_source_imports text with
+    | Left error => Left ImportScanError (List QrFinding) error
+    | Right imports =>
+        (fix go (xs : List ScannedImport) (imps : List (Pair String Nat))
+            (aliases : List (Pair String Nat)) (out : List QrFinding)
+            : Either ImportScanError (List QrFinding) :=
+          match xs with
+          | Nil => Right ImportScanError (List QrFinding)
+              (st_scan_opens mp profile path lines out)
+          | Cons item rest => match item with
+            | MkScannedImport target alias _ start _ alias_start =>
+                match import_scan_place text start with
+                | MkPair line col =>
+                    let witness : String := qt_strip (nth String "" (sub line 1) lines) in
                     let out2 : List QrFinding := match st_seen_get imps target with
                       | Nothing => out
                       | Just first => st_add out
                           (qr_mk_finding mp profile "OURO-LINT037"
-                            (st_place path n col)
+                            (st_place path line col)
                             (qt_cat4 "duplicate import of '" target
-                              "' repeats line " (prim_string_of_nat first))
-                            (qt_strip raw))
+                              "' repeats line " (prim_string_of_nat first)) witness)
                       end in
                     let imps2 : List (Pair String Nat) := match st_seen_get imps target with
                       | Just _ => imps
                       | Nothing => Cons (Pair String Nat)
-                          (MkPair String Nat target n) imps
+                          (MkPair String Nat target line) imps
                       end in
-                    match alias with
-                    | Nothing => go fuel2 rest (add n 1) imps2 aliases out2
-                    | Just name =>
-                        let acol : Nat := match qt_find raw name with
-                          | Nothing => 1
-                          | Just i => add i 1
-                          end in
-                        let bad_case : Bool := orb
-                          (elem String prim_string_eq name st_reserved)
-                          (notb (st_pascal_ident name)) in
-                        let out3 : List QrFinding := match bad_case with
-                          | False => out2
-                          | True => st_add out2
-                              (qr_mk_finding mp profile "OURO-LINT043"
-                                (st_place path n acol)
-                                (qt_cat3 "import alias '" name
-                                  "' is not canonical PascalCase or shadows a built-in name")
-                                (qt_strip raw))
-                          end in
-                        match st_seen_get aliases name with
-                        | Just first => go fuel2 rest (add n 1) imps2 aliases
-                            (st_add out3 (qr_mk_finding mp profile "OURO-LINT043"
-                              (st_place path n acol)
-                              (qt_cat4 "import alias '" name
-                                "' repeats earlier alias on line "
-                                (prim_string_of_nat first))
-                              (qt_strip raw)))
-                        | Nothing => go fuel2 rest (add n 1) imps2
-                            (Cons (Pair String Nat) (MkPair String Nat name n) aliases)
-                            out3
-                        end
+                    match alias, alias_start with
+                    | Nothing, Nothing => go rest imps2 aliases out2
+                    | Just name, Just offset => match import_scan_place text offset with
+                      | MkPair alias_line alias_col =>
+                          let alias_witness : String := qt_strip
+                            (nth String "" (sub alias_line 1) lines) in
+                          let bad_case : Bool := orb
+                            (elem String prim_string_eq name st_reserved)
+                            (notb (st_pascal_ident name)) in
+                          let out3 : List QrFinding := match bad_case with
+                            | False => out2
+                            | True => st_add out2
+                                (qr_mk_finding mp profile "OURO-LINT043"
+                                  (st_place path alias_line alias_col)
+                                  (qt_cat3 "import alias '" name
+                                    "' is not canonical PascalCase or shadows a built-in name")
+                                  alias_witness)
+                            end in
+                          match st_seen_get aliases name with
+                          | Just first => go rest imps2 aliases
+                              (st_add out3 (qr_mk_finding mp profile "OURO-LINT043"
+                                (st_place path alias_line alias_col)
+                                (qt_cat4 "import alias '" name
+                                  "' repeats earlier alias on line "
+                                  (prim_string_of_nat first)) alias_witness))
+                          | Nothing => go rest imps2
+                              (Cons (Pair String Nat)
+                                (MkPair String Nat name alias_line) aliases) out3
+                          end
+                      end
+                    | Nothing, Just _ => Left(ImportScanError, List QrFinding, ImportScanFailure start)
+                    | Just _, Nothing => Left(ImportScanError, List QrFinding, ImportScanFailure start)
                     end
                 end
-              | Nothing => match st_open_alias code with
-                | Nothing => go fuel2 rest (add n 1) imps aliases out
-                | Just name =>
-                    let col : Nat := match qt_find raw "open" with
-                      | Nothing => 1
-                      | Just i => add i 1
-                      end in
-                    go fuel2 rest (add n 1) imps aliases
-                      (st_add out (qr_mk_finding mp profile "OURO-LINT044"
-                        (st_place path n col)
-                        (qt_cat3 "top-level open of alias '" name
-                          "' leaks names across the file")
-                        (qt_strip raw)))
-                end
-              end
             end
-        end
-      end) (add (length String lines) 1) lines 1 [] [] acc;
+          end) imports [] [] acc
+    end;
 
 def st_top_starts (lines : List String) : List Nat :=
     reverse_lin Nat
@@ -135,7 +158,7 @@ def st_top_starts (lines : List String) : List Nat :=
                 end in
               go fuel2 rest (add i 1) acc2
           end
-        end) (add (length String lines) 1) lines 0 []);
+        end) (add(length String lines, 1)) lines 0 []);
 
 def st_def_spans (lines : List String) : List (Pair Nat Nat) :=
     let starts : List Nat := st_top_starts lines in
@@ -160,14 +183,14 @@ def st_def_spans (lines : List String) : List (Pair Nat Nat) :=
                     (MkPair Nat Nat start finish) acc)
               end
           end
-        end) (add (length Nat starts) 1) starts []);
+        end) (add(length Nat starts, 1)) starts []);
 
 def st_split_asg (s : String) : Pair String String :=
     match qt_find s ":=" with
     | Nothing => MkPair String String s ""
     | Just i => MkPair String String
         (prim_string_slice s 0 i)
-        (prim_string_slice s (add i 2) (sub (prim_string_length s) (add i 2)))
+        (prim_string_slice(s, add i 2, sub(prim_string_length s, add i 2)))
     end;
 
 def st_starts_binding (before : String) : Bool :=
@@ -175,7 +198,7 @@ def st_starts_binding (before : String) : Bool :=
       (match st_word_search before "let" with
        | Nothing => False
        | Just i =>
-           match qt_ident_at before (qt_skip_ws before (add i 3)) with
+           match qt_ident_at(before, qt_skip_ws(before, add i 3)) with
            | Nothing => False
            | Just _ => True
            end
@@ -193,7 +216,7 @@ def st_public_near (lines : List String) (start : Nat) : Bool :=
         | False => False
         | True => match st_is_export_line (nth String "" i lines) with
           | True => True
-          | False => go fuel2 (add i 1)
+          | False => go(fuel2, add i 1)
           end
         end
       end) 6 from;
@@ -202,7 +225,7 @@ def st_wildcard_col (code : String) : Maybe Nat :=
     match qt_find code "|" with
     | Nothing => Nothing Nat
     | Just p =>
-        let i : Nat := qt_skip_ws code (add p 1) in
+        let i : Nat := qt_skip_ws(code, add p 1) in
         match qt_ident_at code i with
         | Nothing => Nothing Nat
         | Just name =>
@@ -213,7 +236,7 @@ def st_wildcard_col (code : String) : Maybe Nat :=
                 | Nothing => Nothing Nat
                 | Just _ =>
                     let tail : String := prim_string_slice code i
-                      (sub (prim_string_length code) i) in
+                      (sub(prim_string_length code, i)) in
                     match st_word_search tail "_" with
                     | Nothing => Nothing Nat
                     | Just _ => Just Nat p
@@ -244,7 +267,7 @@ def st_scan_def_span (request : StDefScan) (acc : List QrFinding) : List QrFindi
               | Nothing => out
               | Just i => st_add out
                   (qr_mk_finding mp profile "OURO-LINT042"
-                    (st_place path (add ix 1) (add i 1))
+                    (st_place(path, add ix 1, add i 1))
                     "redundant separator `;;` is rejected; one declaration separator is canonical"
                     (qt_strip raw))
               end in
@@ -260,7 +283,7 @@ def st_scan_def_span (request : StDefScan) (acc : List QrFinding) : List QrFindi
                         let lit_ix : Nat := match prim_string_starts after_s "[" with
                           | True => ix
                           | False => match andb (st_at_top before "def")
-                              (eq_nat (prim_string_length after_s) 0) with
+                              (eq_nat(prim_string_length after_s, 0)) with
                             | False => st_nlines_sentinel
                             | True =>
                                 (fix look (lfuel : Nat) (j : Nat) : Nat :=
@@ -272,14 +295,14 @@ def st_scan_def_span (request : StDefScan) (acc : List QrFinding) : List QrFindi
                                         let look_code : String := qt_strip
                                           (qt_code_before_comment (nth String "" j lines)) in
                                         match prim_string_length look_code with
-                                        | Z => look l2 (add j 1)
+                                        | Z => look(l2, add j 1)
                                         | S _ => match prim_string_starts look_code "[" with
                                           | True => j
                                           | False => st_nlines_sentinel
                                           end
                                         end
                                     end
-                                  end) (add (sub finish ix) 1) (add ix 1)
+                                  end) (add(sub finish ix, 1)) (add ix 1)
                             end
                           end in
                         match eq_nat lit_ix st_nlines_sentinel with
@@ -304,14 +327,14 @@ def st_scan_def_span (request : StDefScan) (acc : List QrFinding) : List QrFindi
                 | Nothing => out3
                 | Just col => st_add out3
                     (qr_mk_finding mp profile "OURO-LINT040"
-                      (st_place path (add ix 1) (add col 1))
+                      (st_place(path, add ix 1, add col 1))
                       "public definition discards constructor payloads with `_` in a branch"
                       (qt_strip raw))
                 end
               end in
             go fuel2 (add ix 1) out4
         end
-      end) (add (sub finish start) 1) start acc
+      end) (add(sub finish start, 1)) start acc
     end;
 
 def st_scan_defs (mp : List (Pair String QrDiag)) (profile : String)
@@ -325,7 +348,7 @@ def st_scan_defs (mp : List (Pair String QrDiag)) (profile : String)
         | Nil => out
         | Cons span rest => match span with
           | MkPair start finish => go fuel2 rest
-              (st_scan_def_span (StDefScanOf mp profile path lines start finish) out)
+              (st_scan_def_span(StDefScanOf mp profile path lines start finish, out))
           end
         end
-      end) (add (length (Pair Nat Nat) spans) 1) spans acc;
+      end) (add(length(Pair Nat Nat, spans), 1)) spans acc;

@@ -1,0 +1,370 @@
+-- Token and expression source positions for tools. The compiler pipeline does
+-- not import this module; its lexer and parser entry points stay unchanged.
+
+import "lexer.ouro",
+  "parse_a.ouro",
+  "parse_b.ouro",
+  "parser_min.ouro",
+  "token.ouro",
+  "ast.ouro",
+  "../std/natx.ouro";
+
+-- For every token, the source suffix at its first byte and after its last
+-- byte. Suffixes share the original byte list; offsets are computed on demand.
+inductive TokenSpans : Type :=
+  | MkTokenSpans : Nat -> List (Pair (List Nat) (List Nat)) -> TokenSpans;
+
+inductive LexSpanned : Type :=
+  | MkLexSpanned : LexResult -> TokenSpans -> LexSpanned;
+
+def lex_spanned_result (lexed : LexSpanned) : LexResult :=
+    match lexed with | MkLexSpanned result _ => result end;
+
+def lex_spanned_tokens (lexed : LexSpanned) : TokenSpans :=
+    match lexed with | MkLexSpanned _ spans => spans end;
+
+def token_spans_none (total : Nat) : TokenSpans :=
+    MkTokenSpans(total, Nil (Pair(List Nat, List Nat)));
+
+def token_spans_eof (total : Nat) (marks : List (Pair (List Nat) (List Nat))) : TokenSpans :=
+    MkTokenSpans total (reverse (Pair(List Nat, List Nat))
+      (Cons(Pair(List Nat, List Nat), MkPair(List Nat, List Nat, Nil Nat, Nil Nat), marks)));
+
+-- Steps through next_token exactly as lex_go_with does, so the tokens and
+-- intern state are the production lexer's. The start mark repeats the
+-- skip_ws call that next_token makes with the same fuel.
+def lex_spanned_go (total : Nat)
+    : Nat -> List Nat -> InternState -> List Token -> List (Pair (List Nat) (List Nat)) -> LexSpanned :=
+  fix go (fuel : Nat) (src : List Nat) (st : InternState) (acc : List Token)
+      (marks : List (Pair (List Nat) (List Nat))) : LexSpanned :=
+    match fuel with
+    | Z =>
+        match src with
+        | Nil => MkLexSpanned(LexOk(reverse(Token, Cons Token TEof acc), st), token_spans_eof total marks)
+        | Cons _ _ => MkLexSpanned(LexExhausted st, token_spans_none total)
+        end
+    | S fuel' =>
+        match next_token fuel' src st with
+        | StepEof st' =>
+            MkLexSpanned(LexOk(reverse(Token, Cons Token TEof acc), st'), token_spans_eof total marks)
+        | LexStepErr st' => MkLexSpanned(LexMalformed st', token_spans_none total)
+        | StepTok tok rest st' =>
+            let start : List Nat := match fuel' with
+              | Z => src
+              | S skip => skip_ws skip src
+              end in
+            go fuel' rest st' (Cons Token tok acc)
+              (Cons(Pair(List Nat, List Nat), MkPair(List Nat, List Nat, start, rest), marks))
+        end
+    end;
+
+def lex_spanned (fuel : Nat) (src : List Nat) (st : InternState) : LexSpanned :=
+    lex_spanned_go(length Nat src, fuel, src, st, Nil Token, Nil (Pair(List Nat, List Nat)));
+
+def token_mark : Nat -> List (Pair (List Nat) (List Nat)) -> Maybe (Pair (List Nat) (List Nat)) :=
+  fix token_mark (index : Nat) (marks : List (Pair (List Nat) (List Nat)))
+      : Maybe (Pair (List Nat) (List Nat)) :=
+    match marks with
+    | Nil => Nothing (Pair(List Nat, List Nat))
+    | Cons mark rest =>
+        match index with
+        | Z => Just(Pair(List Nat, List Nat), mark)
+        | S next => token_mark next rest
+        end
+    end;
+
+-- Byte offsets [start, end) of the source covered by tokens [first, past).
+-- An empty range or a token index outside the stream has no position.
+def token_span_bytes (spans : TokenSpans) (first : Nat) (past : Nat) : Maybe (Pair Nat Nat) :=
+    match spans with
+    | MkTokenSpans total marks =>
+        match ltb_nat first past with
+        | False => Nothing (Pair Nat Nat)
+        | True =>
+            match token_mark first marks with
+            | Nothing => Nothing (Pair Nat Nat)
+            | Just opening =>
+                match token_mark(sub past 1, marks) with
+                | Nothing => Nothing (Pair Nat Nat)
+                | Just closing =>
+                    Just (Pair Nat Nat) (MkPair Nat Nat
+                      (sub(total, length(Nat, fst(List Nat, List Nat, opening))))
+                      (sub(total, length(Nat, snd(List Nat, List Nat, closing)))))
+                end
+            end
+        end
+    end;
+
+def expr_span_is (first : Nat) (past : Nat) (e : Expr) : Bool :=
+    match e with
+    | ESpan a b _ => andb(eqNat a first, eqNat b past)
+    | EVar _ => False
+    | EHole _ => False
+    | ESort _ => False
+    | ENat _ => False
+    | EApp _ _ => False
+    | ELam _ _ _ => False
+    | EPi _ _ _ => False
+    | ELet _ _ _ _ => False
+    | EAscribe _ _ => False
+    | EMatch _ _ => False
+    | EFix _ _ _ _ => False
+    | EEffectRow _ _ => False
+    | EPerform _ _ => False
+    | EDo _ => False
+    | EHandle _ _ => False
+    | EBranch _ _ _ => False
+    | ENoBranch => False
+    | EBinder _ _ _ => False
+    | ENoBinder => False
+    | EMultiMatch _ _ => False
+    | EStr _ => False
+    | EDoBind _ _ => False
+    | EList _ => False
+    end;
+
+-- The token range of a span wrapper, for tools that must not spend a visit
+-- on each nested wrapper.
+def expr_unwrap_span (e : Expr) : Maybe (Pair (Pair Nat Nat) Expr) :=
+    match e with
+    | ESpan first past inner => Just (Pair(Pair Nat Nat, Expr))
+        (MkPair(Pair Nat Nat, Expr, MkPair Nat Nat first past, inner))
+    | EVar _ => Nothing (Pair(Pair Nat Nat, Expr))
+    | EHole _ => Nothing (Pair(Pair Nat Nat, Expr))
+    | ESort _ => Nothing (Pair(Pair Nat Nat, Expr))
+    | ENat _ => Nothing (Pair(Pair Nat Nat, Expr))
+    | EApp _ _ => Nothing (Pair(Pair Nat Nat, Expr))
+    | ELam _ _ _ => Nothing (Pair(Pair Nat Nat, Expr))
+    | EPi _ _ _ => Nothing (Pair(Pair Nat Nat, Expr))
+    | ELet _ _ _ _ => Nothing (Pair(Pair Nat Nat, Expr))
+    | EAscribe _ _ => Nothing (Pair(Pair Nat Nat, Expr))
+    | EMatch _ _ => Nothing (Pair(Pair Nat Nat, Expr))
+    | EFix _ _ _ _ => Nothing (Pair(Pair Nat Nat, Expr))
+    | EEffectRow _ _ => Nothing (Pair(Pair Nat Nat, Expr))
+    | EPerform _ _ => Nothing (Pair(Pair Nat Nat, Expr))
+    | EDo _ => Nothing (Pair(Pair Nat Nat, Expr))
+    | EHandle _ _ => Nothing (Pair(Pair Nat Nat, Expr))
+    | EBranch _ _ _ => Nothing (Pair(Pair Nat Nat, Expr))
+    | ENoBranch => Nothing (Pair(Pair Nat Nat, Expr))
+    | EBinder _ _ _ => Nothing (Pair(Pair Nat Nat, Expr))
+    | ENoBinder => Nothing (Pair(Pair Nat Nat, Expr))
+    | EMultiMatch _ _ => Nothing (Pair(Pair Nat Nat, Expr))
+    | EStr _ => Nothing (Pair(Pair Nat Nat, Expr))
+    | EDoBind _ _ => Nothing (Pair(Pair Nat Nat, Expr))
+    | EList _ => Nothing (Pair(Pair Nat Nat, Expr))
+    end;
+
+-- Innermost token range under a chain of wrappers, then the unwrapped expression.
+def span_peel : Nat -> Maybe (Pair Nat Nat) -> Expr -> Pair (Maybe (Pair Nat Nat)) Expr :=
+  fix go (left : Nat) (current : Maybe (Pair Nat Nat)) (e : Expr)
+      : Pair (Maybe (Pair Nat Nat)) Expr :=
+    match left with
+    | Z => MkPair (Maybe (Pair Nat Nat)) Expr current e
+    | S less => match expr_unwrap_span e with
+      | Nothing => MkPair (Maybe (Pair Nat Nat)) Expr current e
+      | Just wrapped => match wrapped with
+        | MkPair range inner => go less (Just(Pair Nat Nat, range)) inner
+        end
+      end
+    end;
+
+-- One wrapper per distinct token range; a mode that ends where its child
+-- ends does not repeat the child's range.
+def span_expr (first : Nat) (past : Nat) (e : Expr) : Expr :=
+    match expr_span_is first past e with
+    | True => e
+    | False => ESpan first past e
+    end;
+
+def span_result (first : Nat) (result : ParseResult Value) : ParseResult Value :=
+    match result with
+    | PErr position => PErr Value position
+    | POk value toks past =>
+        match asExpr value with
+        | Nothing => result
+        | Just e => POk Value (VExpr (span_expr first past e)) toks past
+        end
+    end;
+
+-- The production dispatcher from parser_parse.ouro with span_result around
+-- the modes that start at an expression's first token. Keyword, paren and
+-- list modes start after their opening token, so MAtom records those ranges.
+-- Do statements stay unwrapped: consumers match EDoBind directly.
+def parse_spanned : Nat -> Mode -> List Token -> Nat -> Value -> ParseResult Value :=
+  fix parse (fuel : Nat) (mode : Mode) (toks : List Token) (pos : Nat) (extra : Value) : ParseResult Value :=
+    match fuel with
+    | Z => PErr Value pos
+    | S fuel' =>
+        let recur (_requested : Nat) (next_mode : Mode) (tokens : List Token)
+              (position : Nat) (value : Value) : ParseResult Value :=
+            parse fuel' next_mode tokens position value in
+        match mode with
+        | MExpr => parse fuel' MPipe toks pos extra
+        | MPipe =>
+            span_result pos (bindValue Expr asExpr (parse fuel' MPi toks pos extra)
+              (fun (lhs : Expr) (toks2 : List Token) (pos2 : Nat) =>
+                parse fuel' MPipeTail toks2 pos2 (VExpr lhs)))
+        | MPipeTail => parse_a_pipetail recur fuel' toks pos extra
+        | MPi => span_result(pos, parse_a_pi recur fuel' toks pos extra)
+        | MPiFromApp => parse_a_pifromapp recur fuel' toks pos extra
+        | MApp =>
+            span_result pos (bindValue Expr asExpr (parse fuel' MAtom toks pos extra)
+              (fun (head : Expr) (toks2 : List Token) (pos2 : Nat) =>
+                parse fuel' MAppTail toks2 pos2 (VExpr head)))
+        | MAppTail => parse_a_apptail recur fuel' toks pos extra
+        | MAtom => span_result(pos, parse_a_atom recur fuel' toks pos extra)
+        | MParen => parse_a_paren recur fuel' toks pos extra
+        | MKeywordAtom => parse_a_keywordatom recur fuel' toks pos extra
+        | MFun => parse_b_fun recur fuel' toks pos extra
+        | MLet => parse_b_let recur fuel' toks pos extra
+        | MMatch => parse_b_match recur fuel' toks pos extra
+        | MFix => parse_b_fix recur fuel' toks pos extra
+        | MTypedBinder => parse_a_typedbinder recur fuel' toks pos extra
+        | MTypedBinderGroup => parse_a_typedbindergroup recur fuel' toks pos extra
+        | MTypedBinders => parse_a_typedbinders recur fuel' toks pos extra
+        | MFunBinders => parse_a_funbinders recur fuel' toks pos extra
+        | MPattern => parse_b_pattern recur fuel' toks pos extra
+        | MPatternVars => parse_b_pattern_vars recur fuel' toks pos extra
+        | MPatterns => parse_b_patterns recur fuel' toks pos extra
+        | MMultiBranches => parse_b_multi_branches recur fuel' toks pos extra
+        | MScrutList => parse_b_scrut_list recur fuel' toks pos extra
+        | MEffectAnnotation => parse_a_effectannotation recur fuel' toks pos extra
+        | MEffectRow => parse_a_effectrow recur fuel' toks pos extra
+        | MCommaList => parse_a_commalist recur fuel' toks pos extra
+        | MListElems => parse_a_listelems recur fuel' toks pos extra
+        | MListTail => parse_a_listtail recur fuel' toks pos extra
+        | MIdentCommaList => parse_a_identcommalist recur fuel' toks pos extra
+        | MDoStmt => parse_b_do_stmt recur fuel' toks pos extra
+        | MDoExprs => parse_b_do_exprs recur fuel' toks pos extra
+        | MPerform => parse_b_perform recur fuel' toks pos extra
+        | MDo =>
+            bindValue (List Expr) asListExpr (parse fuel' MDoExprs toks pos extra)
+              (fun (es : List Expr) (toks2 : List Token) (pos2 : Nat) =>
+                okExpr (EDo es) toks2 pos2)
+        | MHandle => parse_b_handle recur fuel' toks pos extra
+        | MHandleClauses => parse_b_handle_clauses recur fuel' toks pos extra
+        end
+    end;
+
+def strip_spans : Expr -> Expr :=
+  fix strip_spans (e : Expr) : Expr :=
+    match e with
+    | ESpan _ _ inner => strip_spans inner
+    | EVar n => EVar n
+    | EHole h => EHole h
+    | ESort u => ESort u
+    | ENat n => ENat n
+    | EStr s => EStr s
+    | EApp f a => EApp(strip_spans f, strip_spans a)
+    | ELam n ann body =>
+        ELam n
+          (match ann with
+           | Nothing => Nothing Expr
+           | Just ty => Just(Expr, strip_spans ty)
+           end : Maybe Expr)
+          (strip_spans body)
+    | EPi n dom cod => EPi(n, strip_spans dom, strip_spans cod)
+    | ELet n ann value body =>
+        ELet n
+          (match ann with
+           | Nothing => Nothing Expr
+           | Just ty => Just(Expr, strip_spans ty)
+           end : Maybe Expr)
+          (strip_spans value) (strip_spans body)
+    | EAscribe term ty => EAscribe(strip_spans term, strip_spans ty)
+    | EMatch scrut branches => EMatch(strip_spans scrut, strip_spans branches)
+    | EFix n binders ret body => EFix(n, strip_spans binders, strip_spans ret, strip_spans body)
+    | EEffectRow ty ops => EEffectRow(strip_spans ty, ops)
+    | EPerform op args =>
+        EPerform op
+          ((fix go (xs : List Expr) : List Expr :=
+              match xs with
+              | Nil => Nil Expr
+              | Cons x rest => Cons(Expr, strip_spans x, go rest)
+              end) args)
+    | EDo statements =>
+        EDo
+          ((fix go (xs : List Expr) : List Expr :=
+              match xs with
+              | Nil => Nil Expr
+              | Cons x rest => Cons(Expr, strip_spans x, go rest)
+              end) statements)
+    | EHandle comp clauses =>
+        EHandle (strip_spans comp)
+          ((fix go (cs : List (Pair Nat (Pair (List Nat) Expr)))
+              : List (Pair Nat (Pair (List Nat) Expr)) :=
+              match cs with
+              | Nil => Nil (Pair(Nat, Pair(List Nat, Expr)))
+              | Cons clause rest =>
+                  match clause with
+                  | MkPair op payload =>
+                      match payload with
+                      | MkPair names body =>
+                          Cons (Pair(Nat, Pair(List Nat, Expr)))
+                            (MkPair Nat (Pair(List Nat, Expr)) op
+                              (MkPair(List Nat, Expr, names, strip_spans body)))
+                            (go rest)
+                      end
+                  end
+              end) clauses)
+    | EBranch pats body rest => EBranch(pats, strip_spans body, strip_spans rest)
+    | ENoBranch => ENoBranch
+    | EBinder n ty rest => EBinder(n, strip_spans ty, strip_spans rest)
+    | ENoBinder => ENoBinder
+    | EMultiMatch scruts rows =>
+        EMultiMatch
+          ((fix go (xs : List Expr) : List Expr :=
+              match xs with
+              | Nil => Nil Expr
+              | Cons x rest => Cons(Expr, strip_spans x, go rest)
+              end) scruts)
+          ((fix go (rs : List (Pair (List (Pair Nat (List Nat))) Expr))
+              : List (Pair (List (Pair Nat (List Nat))) Expr) :=
+              match rs with
+              | Nil => Nil (Pair(List (Pair(Nat, List Nat)), Expr))
+              | Cons row rest =>
+                  match row with
+                  | MkPair pats body =>
+                      Cons (Pair(List (Pair(Nat, List Nat)), Expr))
+                        (MkPair(List (Pair(Nat, List Nat)), Expr, pats, strip_spans body))
+                        (go rest)
+                  end
+              end) rows)
+    | EDoBind n rhs => EDoBind(n, strip_spans rhs)
+    | EList elements =>
+        EList
+          ((fix go (xs : List Expr) : List Expr :=
+              match xs with
+              | Nil => Nil Expr
+              | Cons x rest => Cons(Expr, strip_spans x, go rest)
+              end) elements)
+    end;
+
+def strip_pair_spans : List (Pair Nat Expr) -> List (Pair Nat Expr) :=
+  fix strip_pair_spans (items : List (Pair Nat Expr)) : List (Pair Nat Expr) :=
+    match items with
+    | Nil => Nil (Pair Nat Expr)
+    | Cons item rest =>
+        match item with
+        | MkPair name e =>
+            Cons(Pair Nat Expr, MkPair Nat Expr name (strip_spans e), strip_pair_spans rest)
+        end
+    end;
+
+def strip_decl_spans (d : Decl) : Decl :=
+    match d with
+    | DDef n ty body => DDef(n, strip_spans ty, strip_spans body)
+    | DAxiom n ty => DAxiom(n, strip_spans ty)
+    | DInductive n params ty ctors =>
+        DInductive(n, strip_pair_spans params, strip_spans ty, strip_pair_spans ctors)
+    | DEffect n ops handlers => DEffect(n, strip_pair_spans ops, strip_pair_spans handlers)
+    | DImport n => DImport n
+    | DIntrinsic n ty key specialization =>
+        DIntrinsic n (strip_spans ty) key
+          (match specialization with
+           | Nothing => Nothing Expr
+           | Just value => Just(Expr, strip_spans value)
+           end)
+    | DExtern n ty metadata => DExtern n (strip_spans ty) metadata
+    | DRepresentation target key => DRepresentation target key
+    end;

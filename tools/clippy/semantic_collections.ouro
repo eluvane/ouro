@@ -1,0 +1,267 @@
+-- Fact-only consumers for the existing sorted producer join. No Expr/source
+-- input, AST traversal, new dataflow graph, or per-call event-stream search.
+import "semantic_calls.ouro",
+  "../../compiler/semantic_scope.ouro";
+
+-- These local discriminators refine EXISTING canonical contracts whose work
+-- roles intentionally group several APIs. They do not change contract roles.
+-- Keys come from compiler-resolved CmApi contracts, never from call spelling.
+-- A wrapper with only an inferred work role has no direct key and stays silent.
+def cc_api_tag (api : CmApi) : Nat :=
+    let key : String := cm_contract_key (cm_api_contract api) in
+    (fix go (entries : List (Pair String Nat)) : Nat :=
+      match entries with
+      | Nil => 0
+      | Cons entry rest => match entry with | MkPair expected tag =>
+          match prim_string_eq key expected with
+          | True => tag | False => go rest end
+          end
+      end)
+      [MkPair String Nat "std/prelude.ouro#map" 1,
+       MkPair String Nat "std/data.ouro#filter" 2,
+       MkPair String Nat "std/prelude.ouro#length" 3,
+       MkPair String Nat "std/data.ouro#take" 4,
+       MkPair String Nat "std/data.ouro#drop" 5,
+       MkPair String Nat "std/data.ouro#reverse" 6,
+       MkPair String Nat "std/listx.ouro#reverse_lin" 6,
+       MkPair String Nat "std/prelude.ouro#append" 7,
+       MkPair String Nat "std/string.ouro#str_trim" 8,
+       MkPair String Nat "std/string.ouro#str_ltrim" 9,
+       MkPair String Nat "std/string.ouro#str_rtrim" 10,
+       MkPair String Nat "std/string.ouro#str_lower" 11,
+       MkPair String Nat "std/string.ouro#str_upper" 12,
+       MkPair String Nat "std/prelude.ouro#notb" 14,
+       MkPair String Nat "std/string.ouro#str_len" 15];
+
+def cc_call_tag (apis : CmApiIndex) (call : ClippyCallFact) : Nat :=
+    match cm_api_lookup(cm_call_callee call, apis) with
+    | Nothing => 0
+    | Just api => match andb
+        (eq_nat(sc_decl_name (cm_api_decl api), cm_call_callee call))
+        (andb (eq_nat(cm_contract_role (cm_api_contract api), cm_call_role call))
+          (andb (eq_nat(cm_contract_cost (cm_api_contract api), cm_call_cost call))
+            (eq_nat(cm_api_arity api, length(CmValue, cm_call_args call))))) with
+      | True => cc_api_tag api | False => 0 end
+    end;
+
+-- Purity alone does not prove termination or permit skipping callback calls.
+-- Only these already-registered, unary, total std functions are admitted.
+-- Lambdas, partial applications, same-spelled globals and inferred wrappers
+-- remain unknown even when another analysis can prove them effect-free.
+def cc_total_callback (apis : CmApiIndex) (value : CmValue) : Bool :=
+    match andb(eq_nat(cm_value_kind value, 2), notb (cm_value_io value)) with
+    | False => False
+    | True => match cm_api_lookup(cm_value_id value, apis) with
+      | Nothing => False
+      | Just api => andb (eq_nat(cm_api_arity api, 1))
+          (andb (cm_contract_pure (cm_api_contract api))
+            (elem Nat eq_nat (cc_api_tag api) [8,9,10,11,12,14,15]))
+      end
+    end;
+
+def cc_callbacks (apis : CmApiIndex) (tag : Nat) (call : ClippyCallFact) : Bool :=
+    match eq_nat tag 1 with
+    | True => cc_total_callback(apis, cm_arg_at(2, cm_call_args call))
+    | False => match eq_nat tag 2 with
+      | False => True
+      | True =>
+          let predicate : CmValue := cm_arg_at(1, cm_call_args call) in
+          andb (cc_total_callback apis predicate)
+            (match cm_api_lookup(cm_value_id predicate, apis) with
+             | Nothing => False | Just api => eq_nat(cc_api_tag api, 14) end)
+      end
+    end;
+
+def cc_shape (law : CmCollectionLaw) (outer : Nat) (inner : Nat) : Bool :=
+    match law with
+    | CcLengthMap => andb(eq_nat outer 3, eq_nat inner 1)
+    | CcLengthFilter => andb(eq_nat outer 3, eq_nat inner 2)
+    | CcMapMap => andb(eq_nat outer 1, eq_nat inner 1)
+    | CcLengthTake => andb(eq_nat outer 3, eq_nat inner 4)
+    | CcMapFilter => andb(eq_nat outer 1, eq_nat inner 2)
+    | CcFilterMap => andb(eq_nat outer 2, eq_nat inner 1)
+    | CcTakeMap => andb(eq_nat outer 4, eq_nat inner 1)
+    | CcDropMap => andb(eq_nat outer 5, eq_nat inner 1)
+    | CcNarrowTake => andb(eq_nat outer 4, eq_nat inner 4)
+    | CcDropTakeWindow => andb(eq_nat outer 5, eq_nat inner 4)
+    | CcReverseAppend => andb(eq_nat outer 6, eq_nat inner 7)
+    | CcLeftAppend => andb(eq_nat outer 7, eq_nat inner 7)
+    | CcMapReverse => andb(eq_nat outer 1, eq_nat inner 6)
+    | CcFilterReverse => andb(eq_nat outer 2, eq_nat inner 6)
+    | CcReverseMap => andb(eq_nat outer 6, eq_nat inner 1)
+    | CcReverseFilter => andb(eq_nat outer 6, eq_nat inner 2)
+    | CcFilterFilter => andb(eq_nat outer 2, eq_nat inner 2)
+    | CcTrimSide => andb(eq_nat outer 8, elem Nat eq_nat inner [9,10])
+    | CcSideTrim => andb(elem Nat eq_nat outer [9,10], eq_nat inner 8)
+    | CcCaseAbsorption => orb
+        (andb(eq_nat outer 11, eq_nat inner 12))
+        (andb(eq_nat outer 12, eq_nat inner 11))
+    end;
+
+def cc_arity (tag : Nat) : Nat :=
+    match eq_nat tag 1 with
+    | True => 4
+    | False => match elem Nat eq_nat tag [2,4,5,7] with
+      | True => 3
+      | False => match elem Nat eq_nat tag [3,6] with
+        | True => 2 | False => 1 end
+      end
+    end;
+
+def cc_consumed (law : CmCollectionLaw) (outer : ClippyCallFact) : CmValue :=
+    match law with
+    | CcLeftAppend => cm_arg_at(1, cm_call_args outer)
+    | CcLengthMap => cm_last_value (cm_call_args outer)
+    | CcLengthFilter => cm_last_value (cm_call_args outer)
+    | CcMapMap => cm_last_value (cm_call_args outer)
+    | CcLengthTake => cm_last_value (cm_call_args outer)
+    | CcMapFilter => cm_last_value (cm_call_args outer)
+    | CcFilterMap => cm_last_value (cm_call_args outer)
+    | CcTakeMap => cm_last_value (cm_call_args outer)
+    | CcDropMap => cm_last_value (cm_call_args outer)
+    | CcNarrowTake => cm_last_value (cm_call_args outer)
+    | CcDropTakeWindow => cm_last_value (cm_call_args outer)
+    | CcReverseAppend => cm_last_value (cm_call_args outer)
+    | CcMapReverse => cm_last_value (cm_call_args outer)
+    | CcFilterReverse => cm_last_value (cm_call_args outer)
+    | CcReverseMap => cm_last_value (cm_call_args outer)
+    | CcReverseFilter => cm_last_value (cm_call_args outer)
+    | CcFilterFilter => cm_last_value (cm_call_args outer)
+    | CcTrimSide => cm_last_value (cm_call_args outer)
+    | CcSideTrim => cm_last_value (cm_call_args outer)
+    | CcCaseAbsorption => cm_last_value (cm_call_args outer)
+    end;
+
+-- Deliberately do not infer nonconstancy from an arbitrary call result.
+-- A source must retain a nonconstant lexical value identity. Constants,
+-- constructed lists and unknown/changing producers do not establish cost.
+def cc_dynamic_source (tag : Nat) (inner : ClippyCallFact) : Bool :=
+    let source : CmValue := match eq_nat tag 7 with
+        | True => cm_arg_at(1, cm_call_args inner)
+        | False => cm_last_value (cm_call_args inner) end in
+    andb (eq_nat(cm_value_kind source, 1))
+      (andb(notb (cm_value_constant source), notb (cm_value_io source)));
+
+def cc_types (outer_tag : Nat) (inner_tag : Nat)
+    (outer : ClippyCallFact) (inner : ClippyCallFact) : Bool :=
+    match leb_nat 8 outer_tag with
+    | True => elem Nat eq_nat inner_tag [8,9,10,11,12]
+    | False => cm_law_same (cm_arg_at(0, cm_call_args outer))
+        (cm_arg_at (match eq_nat inner_tag 1 with | True => 1 | False => 0 end)
+          (cm_call_args inner))
+    end;
+
+def cc_positive (value : CmValue) : Bool :=
+    andb (eq_nat(cm_value_kind value, 3))
+      (andb(notb (cm_value_io value), ltb_nat(0, cm_value_id value)));
+
+def cc_smaller_count (outer : ClippyCallFact) (inner : ClippyCallFact) : Bool :=
+    let after : CmValue := cm_arg_at(1, cm_call_args outer) in
+    let before : CmValue := cm_arg_at(1, cm_call_args inner) in
+    andb (andb(cc_positive after, cc_positive before))
+      (ltb_nat(cm_value_id after, cm_value_id before));
+
+def cc_condition (law : CmCollectionLaw) (outer : ClippyCallFact)
+    (inner : ClippyCallFact) : Bool :=
+    match law with
+    | CcLengthTake => cc_positive (cm_arg_at(1, cm_call_args inner))
+    | CcTakeMap => cc_positive (cm_arg_at(1, cm_call_args outer))
+    | CcDropMap => cc_positive (cm_arg_at(1, cm_call_args outer))
+    | CcNarrowTake => cc_smaller_count outer inner
+    | CcDropTakeWindow => cc_smaller_count outer inner
+    | CcFilterFilter => cm_law_same (cm_arg_at(1, cm_call_args outer))
+        (cm_arg_at(1, cm_call_args inner))
+    | CcLengthMap => True
+    | CcLengthFilter => True
+    | CcMapMap => True
+    | CcMapFilter => True
+    | CcFilterMap => True
+    | CcReverseAppend => True
+    | CcLeftAppend => True
+    | CcMapReverse => True
+    | CcFilterReverse => True
+    | CcReverseMap => True
+    | CcReverseFilter => True
+    | CcTrimSide => True
+    | CcSideTrim => True
+    | CcCaseAbsorption => True
+    end;
+
+def cc_allocation (law : CmCollectionLaw) (temporary : Bool) : Bool :=
+    match law with
+    | CcFilterFilter => True
+    | CcSideTrim => True
+    | CcLengthMap => temporary
+    | CcLengthFilter => temporary
+    | CcMapMap => temporary
+    | CcLengthTake => temporary
+    | CcMapFilter => temporary
+    | CcFilterMap => temporary
+    | CcTakeMap => temporary
+    | CcDropMap => temporary
+    | CcNarrowTake => temporary
+    | CcDropTakeWindow => temporary
+    | CcReverseAppend => temporary
+    | CcLeftAppend => temporary
+    | CcMapReverse => temporary
+    | CcFilterReverse => temporary
+    | CcReverseMap => temporary
+    | CcReverseFilter => temporary
+    | CcTrimSide => temporary
+    | CcCaseAbsorption => temporary
+    end;
+
+def cc_proof (apis : CmApiIndex) (decl : ScDecl) (law : CmCollectionLaw)
+    (outer_tag : Nat) (inner_tag : Nat) (outer : ClippyCallFact)
+    (inner : ClippyCallFact) (temporary : Bool) : CmSemanticProof :=
+    let consumed : CmValue := cc_consumed law outer in
+    let known (value : CmValue) : Bool :=
+        andb(cm_value_known value, notb (cm_value_io value)) in
+    cm_proof_for (CmCollectionProof law) decl (cm_call_node outer)
+      (cm_call_branch outer) (cm_call_epoch outer)
+      [cm_known_fact CmCalleeResolved
+         (andb(notb (eq_nat outer_tag 0), notb (eq_nat inner_tag 0))),
+       cm_known_fact CmKnownArguments
+         (andb (all CmValue known (cm_call_args outer))
+           (all CmValue known (cm_call_args inner))),
+       cm_known_fact(CmPureExpression, andb(cm_call_pure outer, cm_call_pure inner)),
+       cm_known_fact CmExactArity
+         (andb (eq_nat(length(CmValue, cm_call_args outer), cc_arity outer_tag))
+           (eq_nat(length(CmValue, cm_call_args inner), cc_arity inner_tag))),
+       cm_known_fact CmProducerLineage
+         (andb (eq_nat(cm_value_kind consumed, 6))
+           (andb (notb (cm_value_io consumed))
+             (eq_nat(cm_value_id consumed, cm_call_node inner)))),
+       cm_known_fact CmSameRegion
+         (andb (eq_nat(cm_call_branch outer, cm_call_branch inner))
+           (eq_nat(cm_call_epoch outer, cm_call_epoch inner))),
+       cm_known_fact CmContractAgreement
+         (andb (eq_nat(cc_call_tag apis outer, outer_tag))
+           (eq_nat(cc_call_tag apis inner, inner_tag))),
+       cm_known_fact(CmTypeArgumentsAgree, cc_types outer_tag inner_tag outer inner),
+       cm_known_fact CmMeaningfulCost
+         (andb (cc_dynamic_source inner_tag inner)
+           (andb(eq_nat(cm_call_cost outer, 1), eq_nat(cm_call_cost inner, 1)))),
+       cm_known_fact(CmAllocationAvoided, cc_allocation law temporary),
+       cm_known_fact CmTotalCallbacks
+         (andb(cc_callbacks apis outer_tag outer, cc_callbacks apis inner_tag inner)),
+       cm_known_fact CmCollectionEquivalence
+         (andb(cc_shape law outer_tag inner_tag, cc_condition law outer inner))]
+      (prim_string_concat (cc_message law)
+        "; review evaluation order and ownership before rewriting; no automatic edit is authorized");
+
+-- This function is called ONLY at the existing producer join. The bounded
+-- closed law table does not scan expressions or search for producers.
+def cm_collection_pair (apis : CmApiIndex) (decl : ScDecl)
+    (outer : ClippyCallFact) (inner : ClippyCallFact)
+    (temporary : Bool) : List CmSemanticProof :=
+    let outer_tag : Nat := cc_call_tag apis outer in
+    let inner_tag : Nat := cc_call_tag apis inner in
+    match orb(eq_nat outer_tag 0, eq_nat inner_tag 0) with
+    | True => []
+    | False => concat_map CmCollectionLaw CmSemanticProof (fun (law : CmCollectionLaw) =>
+        match cc_shape law outer_tag inner_tag with
+        | False => []
+        | True => [cc_proof apis decl law outer_tag inner_tag outer inner temporary]
+        end) cc_laws
+    end;

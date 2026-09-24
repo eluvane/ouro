@@ -1,11 +1,3 @@
-<p align="center">
-  <img
-    width="100%"
-    src="https://capsule-render.vercel.app/api?type=waving&amp;height=220&amp;color=0:0B1220,50:1E1B4B,100:4F46E5&amp;text=EFFECTS&amp;fontColor=E2E8F0&amp;fontSize=54&amp;fontAlignY=50"
-    alt="EFFECTS banner"
-  />
-</p>
-
 # Effects and IO
 
 Ouro represents effects as checked Core. The compiler checks the complete
@@ -14,27 +6,10 @@ host behavior are implemented by the standard library and runtime adapters.
 
 ## IO programs
 
-Runnable programs export `main : IO Unit`:
-
-```ouro
-import "../../std/io.ouro";
-
--- @entry main
-def main : IO Unit :=
-  do println "hello";
-     exit 0
-```
-
-The current `do` subset supports sequencing and `let!`:
-
-```ouro
-def echo : IO Unit :=
-  do let! line := readLine;
-     println line
-```
-
-These forms lower through the existing IO representation. They do not add
-effectful computation to the pure typechecker.
+The [getting-started program](getting_started.md#run-a-native-program) shows
+`main : IO Unit`; the [syntax reference](syntax.md#io-and-do) owns `do` and
+`let!` spelling. These forms lower through the existing IO representation and
+do not add effectful computation to the pure typechecker.
 
 ## Runtime surface
 
@@ -173,8 +148,10 @@ storage, allocation and cleanup failures terminate with status 73. Captured
 paths and managed Bool results remain rooted across raw calls; all owned raw
 pages are released. Following Win32, `file/` and `file\` return `False`, while
 trailing separators on directories remain accepted. This differs from the
-transitional C CRT's trailing-separator and NUL behavior. The native
-`prim_fs_kind` classification is described in the [practical surface](practical_stdlib.md).
+transitional C CRT's trailing-separator and NUL behavior. `prim_fs_kind` is the
+no-follow classification: `0` for an empty path or OS query failure, `1` for a
+file, `2` for a directory, and `3` for a reparse point. Malformed UTF-8,
+embedded NUL, allocation and cleanup failures exit 73.
 
 Native `fs_list` returns entry names, excluding only `.` and `..`. Names are
 converted from bounded, terminated UTF-16 to UTF-8 without replacement. It
@@ -287,6 +264,25 @@ The adapter closes the owned job and raw argument storage before returning.
 The temporary C host returns `(120, 0)` when this action executes. Construction
 and partial application do not create a child.
 
+Bounded captured processes use a native Windows Job for the child tree. The
+capture limits require a positive finite timeout, a positive memory cap, one
+CPU, and explicit stdout/stderr byte caps; zero byte caps require empty
+streams. The `_with_input` actions send an exact binary stdin String. A
+completed nonzero child exit is a result, while timeout, OS or cleanup failure,
+observed memory violation, and overflow are typed failures. Overflow never
+returns truncated success.
+
+The owner waits for the contained tree to stop before reading private capture
+files, with a separate five-second cleanup budget. Captures are flushed before
+measuring their length and removed on close. The execution timeout begins at
+launch; argument/input preparation and filesystem IO are not separately
+bounded. The cap measures aggregate committed Job memory rather than resident
+memory. Windows may not deliver a memory event for every denied allocation,
+so absence of an event is not complete resource attribution. The Windows C
+host uses a narrow adapter with the same typed reply contract; the POSIX C
+host returns OS status 120 without launching a child. There is no streaming
+pipeline or separate cancellation token.
+
 ## Experimental handlers
 
 The repository includes a narrow one-shot handler subset using `effect`,
@@ -329,16 +325,5 @@ does not establish native execution, portability, or isolated-host bootstrap.
 
 ## Trust boundary
 
-Runtime primitives, host processes, files, clocks, and network transports are
-outside the pure checker. Compiler checking establishes that the elaborated
-Core is well-typed under the implemented rules and assumptions; it does not
-prove that a host operation is available, deterministic, memory-safe, or
-faithful to an external specification.
-
-<p align="center">
-  <img
-    width="100%"
-    src="https://capsule-render.vercel.app/api?type=waving&amp;height=220&amp;color=0:0B1220,50:1E1B4B,100:4F46E5&amp;section=footer"
-    alt=""
-  />
-</p>
+The [trusted computing base](tcb.md#outside-the-checker) defines what checking
+establishes and which host operations remain outside it.

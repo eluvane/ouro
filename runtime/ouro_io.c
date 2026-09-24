@@ -618,7 +618,7 @@ static ouro_v *fs_read_run(ouro_env *env, ouro_v *u)
 	path = rename_path_text(env->v);
 	if (path == 0)
 		return read_fail(0, 0, "path");
-	f = fopen(path, "rb");
+	f = ouro_host_fopen(path, "rb");
 	free(path);
 	if (f == 0)
 		return read_fail(0, 0, "open");
@@ -727,6 +727,19 @@ static ouro_v *f_fs_write_p(ouro_env *env, ouro_v *p)
 	return ouro_clos(f_fs_write_c, ouro_cons(p, 0));
 }
 
+#ifdef _WIN32
+static DWORD path_attributes(ouro_v *value)
+{
+	char *path = rename_path_text(value);
+	wchar_t *wide = 0;
+	DWORD attributes = INVALID_FILE_ATTRIBUTES;
+	if (path != 0 && ouro_host_wide_path(path, &wide) == ERROR_SUCCESS)
+		attributes = GetFileAttributesW(wide);
+	free(wide);
+	free(path);
+	return attributes;
+}
+#else
 static int path_stat(ouro_env *env, struct stat *st)
 {
 	char *path = cstr_of(env->v);
@@ -734,13 +747,20 @@ static int path_stat(ouro_env *env, struct stat *st)
 	free(path);
 	return ok;
 }
+#endif
 
 static ouro_v *fs_exists_run(ouro_env *env, ouro_v *u)
 {
+#ifndef _WIN32
 	struct stat st;
+#endif
 	(void)u;
 	sandbox_die("fs_exists");
+#ifdef _WIN32
+	return v_bool(path_attributes(env->v) != INVALID_FILE_ATTRIBUTES);
+#else
 	return v_bool(path_stat(env, &st));
+#endif
 }
 
 static ouro_v *f_fs_exists(ouro_env *env, ouro_v *p)
@@ -751,10 +771,20 @@ static ouro_v *f_fs_exists(ouro_env *env, ouro_v *p)
 
 static ouro_v *fs_is_dir_run(ouro_env *env, ouro_v *u)
 {
+#ifdef _WIN32
+	DWORD attributes;
+#else
 	struct stat st;
+#endif
 	(void)u;
 	sandbox_die("fs_is_dir");
+#ifdef _WIN32
+	attributes = path_attributes(env->v);
+	return v_bool(attributes != INVALID_FILE_ATTRIBUTES &&
+	    (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0);
+#else
 	return v_bool(path_stat(env, &st) && S_ISDIR(st.st_mode));
+#endif
 }
 
 static ouro_v *f_fs_is_dir(ouro_env *env, ouro_v *p)
@@ -1749,21 +1779,6 @@ static char *rename_path_text(ouro_v *value)
 	return text;
 }
 
-#ifdef _WIN32
-static DWORD rename_wide_path(const char *text, wchar_t **output)
-{
-	int count = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, text, -1, NULL, 0);
-	if (count == 0)
-		return GetLastError();
-	*output = (wchar_t *)malloc((size_t)count * sizeof **output);
-	if (*output == 0)
-		return ERROR_NOT_ENOUGH_MEMORY;
-	if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, text, -1, *output, count) == 0)
-		return GetLastError();
-	return ERROR_SUCCESS;
-}
-#endif
-
 static ouro_v *fs_rename_run(ouro_env *env, ouro_v *unit)
 {
 	char *source = 0;
@@ -1786,9 +1801,9 @@ static ouro_v *fs_rename_run(ouro_env *env, ouro_v *unit)
 #endif
 	} else {
 #ifdef _WIN32
-		status = rename_wide_path(source, &wide_source);
+		status = ouro_host_wide_path(source, &wide_source);
 		if (status == ERROR_SUCCESS)
-			status = rename_wide_path(target, &wide_target);
+			status = ouro_host_wide_path(target, &wide_target);
 		if (status == ERROR_SUCCESS &&
 		    !MoveFileExW(wide_source, wide_target, MOVEFILE_REPLACE_EXISTING))
 			status = GetLastError();

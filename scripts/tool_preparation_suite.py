@@ -55,6 +55,45 @@ class SourceContracts(unittest.TestCase):
         self.assertEqual(frontend.collect_units("root.ouro"),
                          ["base.ouro", "a.ouro", "b.ouro", "root.ouro"])
 
+    def test_grouped_imports_preserve_all_edges_and_order(self):
+        for name, text in {"base.ouro": "", "left/a.ouro": 'import "../base.ouro";',
+                           "right/a.ouro": 'import "../base.ouro";',
+                           "root.ouro": 'import -- first\n "left/a.ouro", -- second\n'
+                                        ' "right/a.ouro", "left/a.ouro",;\n'}.items():
+            self.source(name, text)
+        self.assertEqual(frontend.collect_units("root.ouro"),
+                         ["base.ouro", "left/a.ouro", "right/a.ouro", "root.ouro"])
+
+    def test_grouped_second_edge_cycle_and_missing_file_fail(self):
+        self.source("base.ouro", "")
+        root = self.source("root.ouro", 'import "base.ouro", "missing.ouro";')
+        with self.assertRaisesRegex(SystemExit, "missing missing.ouro"):
+            frontend.collect_units("root.ouro")
+        root.write_text('import "base.ouro", "cycle.ouro";', encoding="utf-8")
+        self.source("cycle.ouro", 'import "root.ouro";')
+        with self.assertRaisesRegex(SystemExit, "import cycle"):
+            frontend.collect_units("root.ouro")
+
+    def test_import_tokens_keep_literals_comments_aliases_and_escapes_distinct(self):
+        source = ('-- import "comment.ouro";\n'
+                  'def text := "import \\"literal.ouro\\";";\n'
+                  'import "left.ouro" as Left; import "path\\\\part.ouro", "путь 漢字.ouro";\n'
+                  'import "last.ouro"\nimport "next.ouro";')
+        self.assertEqual(frontend.SMC.quoted_import_targets(source, "root.ouro"),
+                         ["left.ouro", "path/part.ouro", "путь 漢字.ouro", "last.ouro", "next.ouro"])
+
+    def test_projection_named_import_does_not_add_dependencies(self):
+        source = ('def field (p : Packet) : Nat := p.import "fake.ouro";\n'
+                  'def call (p : Packet) : Nat := p.import("also-fake.ouro");\n'
+                  'import "real.ouro";')
+        self.assertEqual(frontend.SMC.quoted_import_targets(source, "root.ouro"), ["real.ouro"])
+
+    def test_malformed_import_group_is_not_an_incomplete_closure(self):
+        for source in ('import "first.ouro",', 'import "first.ouro",, "second.ouro";',
+                       'import "first.ouro", missing;', 'import "first.ouro", "unfinished'):
+            with self.subTest(source=source), self.assertRaisesRegex(ValueError, "malformed quoted import"):
+                frontend.SMC.quoted_import_targets(source, "root.ouro")
+
     def test_later_call_observes_same_mtime_import_change(self):
         root = self.source("root.ouro", 'import "one.ouro";\n')
         self.source("one.ouro", "")

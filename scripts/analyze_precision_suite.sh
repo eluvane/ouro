@@ -277,7 +277,8 @@ set -- tools/analyze/architecture.ouro \
 	tests/analyze/precision/kernel_mirror.ouro \
 	tests/analyze/precision/frontend_helpers.ouro \
 	tests/analyze/precision/deadcode_patterns.ouro \
-	tests/analyze/precision/architecture.ouro
+	tests/analyze/precision/architecture.ouro \
+	tests/analyze/precision/imports.ouro
 # shellcheck source=scripts/python.sh
 . "$ROOT/scripts/python.sh"
 [ -n "${PYTHON:-}" ] || { echo "ANALYZE_SUITE_FAIL no working Python" >&2; exit 127; }
@@ -523,7 +524,7 @@ check_native_base_inputs
 # The assertions run in Ouro. This launcher only builds, executes and retains
 # logs; failed builds, missing binaries and empty/missing reports fail closed.
 # The deadcode root exercises the host fact extractors through their native ABI.
-for precision_core in absint lint format_fix host style kernel_mirror frontend_helpers deadcode_patterns architecture; do
+for precision_core in absint lint format_fix host style kernel_mirror frontend_helpers deadcode_patterns architecture imports; do
 	precision_bin="$OUT_DIR/precision-$precision_core"
 	run_case "precision_build_$precision_core" env OURO_BUILD_TOOL_MODE=native \
 		sh scripts/build_tool.sh "tests/analyze/precision/$precision_core.ouro" "$precision_bin"
@@ -545,6 +546,8 @@ expect_ok project_no_fp sh scripts/ouro1.sh analyze --strict
 
 golden_codes architecture_bad "OURO-ARCH001 OURO-ARCH002 OURO-ARCH003 OURO-ARCH004 OURO-ARCH005" \
 	analyze --scope "$FIX/architecture_bad"
+golden_codes grouped_imports_bad "OURO-ARCH001 OURO-ARCH002 OURO-ARCH003 OURO-ARCH004 OURO-ARCH005" \
+	analyze --scope "$FIX/grouped_imports_bad"
 golden_ok architecture_good analyze --scope "$FIX/architecture_good"
 
 golden_codes deadcode_bad "OURO-DEAD001 OURO-DEAD002" \

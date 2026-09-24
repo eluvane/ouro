@@ -816,7 +816,8 @@ def run_build(args: argparse.Namespace) -> None:
     cfg = load_config(args)
     start = time.perf_counter()
     try:
-        bootstrap_compiler.ensure_current_compiler(cfg, sys.modules[__name__], ROOT)
+        bootstrap_compiler.ensure_current_compiler(cfg, sys.modules[__name__], ROOT,
+                                                  compact_sources=getattr(args, "compact_sources", False))
     except (OSError, RuntimeError, ValueError) as error:
         raise SystemExit(str(error)) from error
     trim_cache(cfg)
@@ -962,10 +963,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     build = sub.add_parser("build", help="build the current compiler from verified bootstrap inputs")
     add_common(build)
+    build.add_argument("--compact-sources", action="store_true", help="emit the final stage from a checked compact source copy")
     build.set_defaults(func=run_build)
 
     rebuild = sub.add_parser("rebuild", help="remove build artifacts, keep caches, then build")
     add_common(rebuild)
+    rebuild.add_argument("--compact-sources", action="store_true", help="emit the final stage from a checked compact source copy")
     rebuild.set_defaults(func=run_rebuild)
 
     clean = sub.add_parser("clean", help="remove build directory only; caches are kept")

@@ -17,6 +17,7 @@ import sysconfig
 import tempfile
 
 import bootstrap_inputs
+import compact_source
 import frontend_regen as frontend
 from ourosmith.limits import clean_env, run_limited
 from repo_support import configure_native_stack, hash_json, read_json_object_or_none, sha256_file, write_json_atomic
@@ -27,7 +28,7 @@ FUEL = "999999"
 MEMORY_MIB = 3072
 TIMEOUT_S = 900
 HELPERS = (
-    "scripts/bootstrap_compiler.py", "scripts/bootstrap_inputs.py", "scripts/ouro_build.py",
+    "scripts/bootstrap_compiler.py", "scripts/bootstrap_inputs.py", "scripts/compact_source.py", "scripts/ouro_build.py",
     "scripts/generated_c_shards.py", "scripts/frontend_regen.py", "scripts/selfhost_module_cache.py",
     "scripts/pack_frontend.py", "scripts/emit_frontend.sh", "scripts/stage_loop.py", "scripts/stage_loop.sh",
     "scripts/repo_support.py", "scripts/ouro_seal.py", "scripts/native_tool_build.py", "scripts/build_tool.sh",
@@ -67,7 +68,7 @@ def fail(message: str):
     raise RuntimeError("BOOTSTRAP: FAIL " + message)
 
 
-def current_inputs(root: Path, cfg, build) -> dict:
+def current_inputs(root: Path, cfg, build, *, compact_sources: bool = False) -> dict:
     roots = [source for _tag, _module, source, _file in frontend.FRONTEND_TUS] + ["compiler/backend.ouro"]
     graph = {source: frontend.collect_units(source) for source in [*roots, *ACCEPTANCE_ROOTS]}
     if len(roots) != 15 or any(not units or units[-1] != source for source, units in graph.items()):
@@ -78,6 +79,7 @@ def current_inputs(root: Path, cfg, build) -> dict:
     cc_path = Path(shutil.which(cc) or cc).resolve()
     sources = {name: sha256_file(root / name) for name in sorted(paths)}
     return {"kind": KIND, "roots": roots, "unit_graph": graph, "sources": sources,
+        "source_form": compact_source.KIND if compact_sources else "original",
         "archive_sha256": sha256_file(root / bootstrap_inputs.ARCHIVE),
         "manifest_sha256": sha256_file(root / bootstrap_inputs.MANIFEST),
         "stage0": {name: sha256_file(root / name) for name in bootstrap_inputs.STAGE0},
@@ -124,20 +126,47 @@ def freeze(root: Path, work: Path, selected: dict, cfg) -> dict:
         fail("current source changed or historical stage0 entered current O")
     for name, value in (("good", "1"), ("bad", "2")):
         (original / ("bootstrap-" + name + ".ouro")).write_text(PROBE.replace("INDEX", value), encoding="utf-8", newline="\n")
+    directories = [work / "historical", original]
+    compaction = None
+    if selected.get("source_form") == compact_source.KIND:
+        compact = work / "compact"
+        rows = {}
+        for name, digest in selected["sources"].items():
+            if not name.endswith(".ouro"):
+                copy_input(original / name, compact / name, digest)
+                continue
+            source = (original / name).read_bytes()
+            if bootstrap_inputs.digest(source) != digest:
+                fail("original source changed before compaction: " + name)
+            try:
+                data = compact_source.compact_source(source)
+            except ValueError as error:
+                fail(name + ": " + str(error))
+            destination = compact / name
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            with destination.open("xb") as stream:
+                stream.write(data)
+            rows[name] = {"original_sha256": digest, "compact_sha256": bootstrap_inputs.digest(data),
+                          "original_bytes": len(source), "compact_bytes": len(data)}
+        directories.append(compact)
+        compaction = {"kind": compact_source.KIND, "files": rows,
+                      "original_bytes": sum(row["original_bytes"] for row in rows.values()),
+                      "compact_bytes": sum(row["compact_bytes"] for row in rows.values())}
     files = {path.relative_to(work).as_posix(): sha256_file(path)
-             for directory in (work / "historical", original) for path in sorted(directory.rglob("*")) if path.is_file()}
+             for directory in directories for path in sorted(directory.rglob("*")) if path.is_file()}
     snapshot = {"kind": KIND + ".inputs", "key": hash_json(selected), "selected": selected,
         "inputs": files, "config": cfg.values, "bridge_graph": manifest["ordered_unit_graph"],
-        "roots": {"c0": "historical/c0", "bridge": "historical/bridge", "p1": "o", "p2": "o"},
+        "roots": {"c0": "historical/c0", "bridge": "historical/bridge", "p1": "o", "p2": "compact" if compaction else "o"},
+        "compaction": compaction,
         "current_o_projection": "None; every current source is copied byte for byte."}
     write_json_atomic(work / "inputs.json", snapshot)
     return snapshot
 
 
-def strict_roots(producer: Path, root: Path, roots: list[str], graph: dict, run) -> None:
+def strict_roots(producer: Path, root: Path, roots: list[str], graph: dict, run, *, label: str = "check") -> None:
     for index, source in enumerate(roots):
         units = [part for unit in graph[source] for part in ("--unit", unit)]
-        result = run(f"check-{index:02}", [str(producer), "check", source, FUEL, *units], root)
+        result = run(f"{label}-{index:02}", [str(producer), "check", source, FUEL, *units], root)
         if result.stdout != "CHECK_OK\n" or result.stderr:
             fail("strict check did not return clean CHECK_OK for " + source)
 
@@ -215,10 +244,15 @@ def chain(work: Path, snapshot: dict, build) -> dict:
                 row.update(producer=str(producer), producer_sha256=producer_hash)
                 graph = snapshot["bridge_graph"] if phase == "bridge" else selected["unit_graph"]
                 if phase in {"p1", "p2"}:
-                    strict_roots(producer, root, selected["roots"], graph, run)
+                    strict_roots(producer, work / "o", selected["roots"], graph, run)
                     row["all_current_roots_strictly_checked_before_emission"] = True
+                    if root != work / "o":
+                        strict_roots(producer, root, selected["roots"], graph, run, label="check-compact")
+                        row["all_compact_roots_strictly_checked_before_emission"] = True
                 if phase == "p2":
                     # The current P1 must also check the stdlib/tool/law inputs.
+                    if root != work / "o":
+                        strict_roots(producer, work / "o", ACCEPTANCE_ROOTS, graph, run, label="accept-original")
                     for source in ACCEPTANCE_ROOTS:
                         units = [part for unit in graph[source] for part in ("--unit", unit)]
                         result = run("accept-" + Path(source).stem, [str(producer), "check", source, FUEL, *units], root)
@@ -291,10 +325,10 @@ def installed_current(binary: Path, receipt: Path, selected: dict) -> bool:
         return False
 
 
-def ensure_current_compiler(cfg, build, root: Path = ROOT) -> dict:
+def ensure_current_compiler(cfg, build, root: Path = ROOT, *, compact_sources: bool = False) -> dict:
     manifest, _contents = bootstrap_inputs.read_bundle(root)
     bootstrap_inputs.verify_stage0(root, manifest)
-    selected = current_inputs(root, cfg, build)
+    selected = current_inputs(root, cfg, build, compact_sources=compact_sources)
     output = cfg.path("c_build_dir") / "ouro1"
     receipt = output.with_name("ouro1.bootstrap.json")
     if cfg.get_bool("cache_enabled") and installed_current(output, receipt, selected):

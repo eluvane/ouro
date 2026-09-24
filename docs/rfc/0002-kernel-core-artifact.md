@@ -1,11 +1,3 @@
-<p align="center">
-  <img
-    width="100%"
-    src="https://capsule-render.vercel.app/api?type=waving&amp;height=220&amp;color=0:0B1220,50:1E1B4B,100:4F46E5&amp;text=RFC%200002&amp;fontColor=E2E8F0&amp;fontSize=54&amp;fontAlignY=50"
-    alt="RFC 0002 banner"
-  />
-</p>
-
 # RFC 0002: Versioned kernel core-artifact schema
 
 - Status: superseded by the compiler-owned checking transition
@@ -36,7 +28,8 @@ tests, compiler emitters, and replay one fail-closed contract.
 
 - The machine schema is
   `docs/spec/ouro.kernel-core-artifact.v1.schema.json`.
-- The human contract is `docs/kernel_core_artifact.md`.
+- [Core artifacts](../kernel_core_artifact.md) now distinguishes this archived
+  format from the current checked snapshot.
 - The top-level `kind` is exactly `ouro.kernel-core-artifact.v1`.
 - Terms use tagged arrays for the current core constructors.
 - Declarations are definitions, explicit axioms, or inductive declarations.
@@ -63,11 +56,3 @@ and kernel checking from a fresh environment.
 The schema, host validator, emitted-artifact path, valid/bad corpus, kernel
 replay, [Kernel design](../kernel_design.md), and
 [Trusted computing base](../tcb.md) move together.
-
-<p align="center">
-  <img
-    width="100%"
-    src="https://capsule-render.vercel.app/api?type=waving&amp;height=220&amp;color=0:0B1220,50:1E1B4B,100:4F46E5&amp;section=footer"
-    alt=""
-  />
-</p>

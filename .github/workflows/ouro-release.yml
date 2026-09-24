@@ -2,7 +2,7 @@ name: Release
 
 on:
   schedule:
-    - cron: '17 3 * * 1'
+    - cron: '17 3 * * *'
   push:
     tags:
       - 'v*.*.*'
@@ -22,8 +22,8 @@ on:
         required: true
         type: boolean
         default: true
-      weekly_snapshot:
-        description: Publish a weekly main snapshot (requires package_only=false)
+      snapshot:
+        description: Publish a main snapshot (requires package_only=false)
         required: true
         type: boolean
         default: false
@@ -46,11 +46,22 @@ jobs:
     timeout-minutes: 5
     outputs:
       matrix: ${{ steps.groups.outputs.matrix }}
+      due: ${{ steps.cadence.outputs.due }}
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Check snapshot cadence
+        id: cadence
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          due=true
+          if [ "$EVENT_NAME" = schedule ]; then
+            due=$(python3 scripts/release_package.py --snapshot-due)
+          fi
+          echo "due=$due" >> "$GITHUB_OUTPUT"
       - name: Select complete profile inventory
         id: groups
         env:
@@ -62,6 +73,7 @@ jobs:
   release-validation:
     name: Validate (${{ matrix.group }})
     needs: groups
+    if: ${{ needs.groups.outputs.due == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 120
     strategy:
@@ -200,6 +212,8 @@ jobs:
 
   toolchain:
     name: Toolchain
+    needs: groups
+    if: ${{ needs.groups.outputs.due == 'true' }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
     permissions:
@@ -274,7 +288,7 @@ jobs:
           "$PYTHON" -m pip install --disable-pip-version-check --quiet zstandard==0.23.0
           "$PYTHON" --version
           cc --version || gcc --version
-          "$PYTHON" scripts/ouro_build.py build --verbosity quiet
+          "$PYTHON" scripts/ouro_build.py build --compact-sources --verbosity quiet
           compiler="_build/c/ouro1"
           if [ ! -f "$compiler" ] && [ -f "${compiler}.exe" ]; then
             compiler="${compiler}.exe"
@@ -288,6 +302,18 @@ jobs:
             --platform "${{ matrix.platform }}" \
             --compiler "$compiler" \
             --out _build/release
+
+      - name: Upload bootstrap evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: bootstrap-evidence-${{ matrix.platform }}
+          if-no-files-found: error
+          retention-days: 30
+          path: |
+            _build/bootstrap/**/inputs.json
+            _build/bootstrap/**/report.json
+            _build/c/ouro1.bootstrap.json
 
       - name: Upload toolchain archives
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -375,12 +401,12 @@ jobs:
             --title "$GITHUB_REF_NAME" \
             --notes-file _build/release_bundle/release-notes.md
 
-  publish-weekly-release:
-    name: Weekly
+  publish-snapshot-release:
+    name: Snapshot
     runs-on: ubuntu-latest
     needs:
       - assemble-release-files
-    if: ${{ github.ref == 'refs/heads/main' && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.weekly_snapshot && !inputs.package_only)) }}
+    if: ${{ github.ref == 'refs/heads/main' && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.snapshot && !inputs.package_only)) }}
     timeout-minutes: 15
     permissions:
       contents: write
@@ -397,7 +423,7 @@ jobs:
           name: release-files-${{ github.run_id }}
           path: _build/release_bundle
 
-      - name: Publish weekly snapshot
+      - name: Publish snapshot
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -406,13 +432,13 @@ jobs:
           test -f _build/release_bundle/SHA256SUMS
           mapfile -t archives < <(find _build/release_bundle -maxdepth 1 -type f \( -name 'ouro-*.tar.zst' -o -name 'ouro-*.zip' \) | sort)
           test "${#archives[@]}" -eq 10
-          tag="weekly-$(date -u +%Y%m%d)"
+          tag="snapshot-$(date -u +%Y%m%d)"
           if gh release view "$tag" >/dev/null 2>&1; then
-            printf 'weekly snapshot already published: %s\n' "$tag"
+            printf 'snapshot already published: %s\n' "$tag"
             exit 0
           fi
-          prev="$(gh release list --limit 200 --json tagName,createdAt --jq '[.[] | select(.tagName | startswith("weekly-"))] | sort_by(.createdAt) | reverse | .[0].tagName // empty')"
-          notes="_build/weekly-notes.md"
+          prev="$(gh release list --limit 200 --json tagName,createdAt --jq '[.[] | select(.tagName | startswith("snapshot-") or startswith("weekly-"))] | sort_by(.createdAt) | reverse | .[0].tagName // empty')"
+          notes="_build/snapshot-notes.md"
           mkdir -p _build
           if [ -n "$prev" ]; then
             git fetch origin "refs/tags/${prev}:refs/tags/${prev}"
@@ -421,7 +447,7 @@ jobs:
               exit 0
             fi
             {
-              printf '# Weekly snapshot %s\n\n' "$tag"
+              printf '# Snapshot %s\n\n' "$tag"
               printf "Automatic host toolchain snapshot of \`main\` at \`%s\`.\n" "$(git rev-parse --short HEAD)"
               printf 'Project version is unchanged. This is not a semver release.\n\n'
               printf '## Changes since %s\n\n' "$prev"
@@ -429,16 +455,16 @@ jobs:
               printf '\n'
             } > "$notes"
           else
-            if [ "$(git rev-list --count --since='8 days ago' HEAD)" = "0" ]; then
-              printf 'no commits in the last 8 days\n'
+            if [ "$(git rev-list --count --since='3 days ago' HEAD)" = "0" ]; then
+              printf 'no commits in the last 3 days\n'
               exit 0
             fi
             {
-              printf '# Weekly snapshot %s\n\n' "$tag"
+              printf '# Snapshot %s\n\n' "$tag"
               printf "Automatic host toolchain snapshot of \`main\` at \`%s\`.\n" "$(git rev-parse --short HEAD)"
               printf 'Project version is unchanged. This is not a semver release.\n\n'
               printf '## Changes\n\n'
-              git log --pretty=format:'- %s (%h)' --since='8 days ago' HEAD
+              git log --pretty=format:'- %s (%h)' --since='3 days ago' HEAD
               printf '\n'
             } > "$notes"
           fi
@@ -448,5 +474,5 @@ jobs:
             _build/release_bundle/SHA256SUMS \
             --target "$GITHUB_SHA" \
             --latest=false \
-            --title "Weekly $tag" \
+            --title "Snapshot $tag" \
             --notes-file "$notes"

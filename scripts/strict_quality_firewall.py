@@ -70,7 +70,7 @@ def load_registry() -> tuple[dict[str, Any], dict[str, dict[str, Any]]]:
     return cfg, reg
 
 
-def _native_env() -> dict[str, str]:
+def native_env() -> dict[str, str]:
     env = dict(os.environ)
     env["OURO_ROOT"] = ROOT.as_posix()
     env["OURO_REPRODUCIBLE"] = "1"
@@ -107,7 +107,7 @@ def scan_source(path: Path, text: str, registry: dict[str, dict[str, Any]], prof
 
     result = run_limited(
         [str(_strict_binary()), "--scan-source", str(path), "--profile", profile],
-        cwd=ROOT, env=_native_env(), timeout_s=1800, memory_mb=3072, stdin_text=text,
+        cwd=ROOT, env=native_env(), timeout_s=1800, memory_mb=3072, stdin_text=text,
     )
     if not result.ok:
         raise ValueError(
@@ -146,7 +146,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     result = run_limited(
         [str(_strict_binary()), *raw],
-        cwd=ROOT, env=_native_env(), timeout_s=1800, memory_mb=3072,
+        cwd=ROOT, env=native_env(), timeout_s=1800, memory_mb=3072,
     )
     sys.stdout.write(result.stdout)
     sys.stderr.write(result.stderr)

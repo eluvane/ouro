@@ -116,25 +116,56 @@ def skip_import_alias(after: str) -> str:
 
 
 def quoted_import_targets(source_text: str, source_path: str) -> list[str]:
-    """Collect canonical paths from `import "..." [as Name];` lines.
+    """Discover quoted dependencies; source acceptance remains compiler-owned."""
+    tokens: list[tuple[str, str]] = []
+    index = 0
+    while index < len(source_text):
+        char = source_text[index]
+        if char.isspace():
+            index += 1
+        elif source_text.startswith("--", index):
+            end = source_text.find("\n", index)
+            index = len(source_text) if end < 0 else end + 1
+        elif char == '"':
+            index += 1
+            value: list[str] = []
+            while index < len(source_text) and source_text[index] != '"':
+                char = source_text[index]
+                index += 1
+                if char == "\\" and index < len(source_text):
+                    escaped = source_text[index]
+                    index += 1
+                    value.append({"n": "\n", "r": "\r", "t": "\t", '"': '"', "\\": "\\"}
+                                 .get(escaped, "\\" + escaped))
+                else:
+                    value.append(char)
+            closed = index < len(source_text)
+            tokens.append(("string" if closed else "unterminated", "".join(value)))
+            index += int(closed)
+        else:
+            ident = re.match(r"[A-Za-z_][A-Za-z0-9_']*", source_text[index:])
+            value = ident.group(0) if ident else char
+            tokens.append(("word", value))
+            index += len(value)
 
-    Aliases are not separate dependencies. The parser stays fail-closed: a line
-    is recorded only when the quoted path is closed and the remainder is `;`.
-    """
     imports: list[str] = []
-    for line in source_text.splitlines():
-        stripped = line.lstrip()
-        if not stripped.startswith("import"):
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        index += 1
+        if token != ("word", "import") or (index > 1 and tokens[index - 2] == ("word", ".")):
             continue
-        rest = stripped[6:].lstrip()
-        if not rest.startswith('"'):
-            continue
-        end = rest.find('"', 1)
-        if end < 0:
-            continue
-        after = skip_import_alias(rest[end + 1 :].lstrip())
-        if after.startswith(";"):
-            imports.append(canon_import(source_path, rest[1:end]))
+        while True:
+            if index >= len(tokens) or tokens[index][0] != "string":
+                raise ValueError(f"malformed quoted import in {source_path}")
+            imports.append(canon_import(source_path, tokens[index][1]))
+            index += 1
+            if index >= len(tokens) or tokens[index] != ("word", ","):
+                break
+            index += 1
+            if index < len(tokens) and tokens[index] == ("word", ";"):
+                index += 1
+                break
     return imports
 
 

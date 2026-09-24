@@ -1,11 +1,3 @@
-<p align="center">
-  <img
-    width="100%"
-    src="https://capsule-render.vercel.app/api?type=waving&amp;height=220&amp;color=0:0B1220,50:1E1B4B,100:4F46E5&amp;text=TCB&amp;fontColor=E2E8F0&amp;fontSize=54&amp;fontAlignY=50"
-    alt="TCB banner"
-  />
-</p>
-
 # Trusted computing base
 
 Ouro's program-checking authority belongs to its compiler, written in Ouro.
@@ -84,6 +76,10 @@ be checked and emitted without `STATUS_STACK_OVERFLOW`; that reserve is a host
 limit, not an acceptance judgment. The C printer walk budget (`print_c`
 `big_fuel`) is the same kind of host emission limit and does not change
 checker acceptance.
+The Windows C host converts command-line arguments and file paths strictly
+between UTF-16 and UTF-8 using the existing Windows command-line and file APIs.
+This host encoding boundary does not decide program acceptance or add authority
+to the Ouro checker.
 The Windows native backend and Ouro raw runtime have a separate, limited
 execution path. A native PE fixture does not establish a native compiler
 bootstrap or garbage collection; those require their own end-to-end checks.
@@ -354,19 +350,12 @@ suite cover this adapter boundary.
 
 ## Guardrails
 
-```sh
-sh scripts/ouro_repo_gate.sh --profile compiler-boundary --out _build/compiler_boundary
-sh scripts/test_suite.sh --compiler-checking
-python3 scripts/kernel_hardening_suite.py
-python3 scripts/kernel_scale.py --profile scale --out _build/kernel_scale/scale
-python3 scripts/kernel_scale.py --profile depth --out _build/kernel_scale/depth
-```
-
 Hardening requires all retained laws across uncached, fresh cached, and reused
 cached executables, with source and producer receipts and a per-run budget.
 The scale and depth profiles require complete probe protocols, current inputs,
 and exact typed results. Crashes, timeouts, missing rows, and stale receipts
-cannot satisfy these contracts. [CI](ci.md) describes the required gates.
+cannot satisfy these contracts. [CI](ci.md#local-profiles) owns their commands
+and required profiles.
 
 ## Assurance limits
 
@@ -376,11 +365,3 @@ behavior, foreign-code safety, GC correctness, or a formal proof of the
 compiler's metatheory. Native self-hosting and matching stage bytes establish
 rebuild behavior only when those stages actually run; they do not prove
 compiler correctness.
-
-<p align="center">
-  <img
-    width="100%"
-    src="https://capsule-render.vercel.app/api?type=waving&amp;height=220&amp;color=0:0B1220,50:1E1B4B,100:4F46E5&amp;section=footer"
-    alt=""
-  />
-</p>

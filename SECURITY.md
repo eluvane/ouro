@@ -1,17 +1,9 @@
-<p align="center">
-  <img
-    width="100%"
-    src="https://capsule-render.vercel.app/api?type=waving&amp;height=220&amp;color=0:0B1220,50:1E1B4B,100:4F46E5&amp;text=SECURITY&amp;fontColor=E2E8F0&amp;fontSize=54&amp;fontAlignY=50"
-    alt="SECURITY banner"
-  />
-</p>
-
 # Security policy
 
 ## Supported versions
 
-Ouro is pre-1.0 research software. Until tagged release support is announced,
-security fixes target the current `main` branch.
+Until tagged release support is announced, security fixes target the current
+`main` branch. See [Stability](docs/stability.md) for pre-1.0 compatibility.
 
 A future security advisory will identify affected tags and state whether a
 backport is available. No compatibility or patch-support window should be
@@ -48,11 +40,3 @@ packaging, or other repository-owned tooling.
 Ordinary language bugs, confusing diagnostics, performance regressions, and
 documentation errors can use the public issue forms unless they create a
 security impact.
-
-<p align="center">
-  <img
-    width="100%"
-    src="https://capsule-render.vercel.app/api?type=waving&amp;height=220&amp;color=0:0B1220,50:1E1B4B,100:4F46E5&amp;section=footer"
-    alt=""
-  />
-</p>

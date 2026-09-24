@@ -438,7 +438,9 @@ def fail_closed_cases(out: Path) -> list[str]:
     return failures
 
 
-def semantic_precision_cases(out: Path, worker: Optional[Path] = None) -> list[str]:
+def semantic_precision_cases(out: Path, worker: Optional[Path] = None, *,
+                             cases: Optional[Sequence[dict[str, Any]]] = None,
+                             source_root: Path = ROOT) -> list[str]:
     """Compare native proofs with identity-mutation fixtures, never infer them in Python."""
     work = out / "semantic-precision"
     work.mkdir(parents=True, exist_ok=True)
@@ -453,24 +455,24 @@ def semantic_precision_cases(out: Path, worker: Optional[Path] = None) -> list[s
             return ["semantic precision worker build failed"]
     if not executable.is_file():
         return ["semantic precision worker is unavailable: " + str(executable)]
-    inventory = load_manifest(ROOT / "tests/clippy_semantic/cases.json")
+    selected = cases if cases is not None else load_manifest(ROOT / "tests/clippy_semantic/cases.json")["cases"]
     active = {row["id"] for row in load_manifest(ROOT / "quality/clippy_grade_rules.json")["rules"]}
     rows: list[dict[str, Any]] = []
-    for case in inventory["cases"]:
-        source = ROOT / case["path"]
+    for case in selected:
+        source = source_root / case["path"]
         name = source.stem
         found: list[str] = []
         failure = ""
         try:
             from ourosmith.limits import run_limited
-            result = run_limited([str(executable.resolve()), str(ROOT), case["path"]], cwd=ROOT,
+            result = run_limited([str(executable.resolve()), str(source_root), case["path"]], cwd=ROOT,
                                  timeout_s=60, memory_mb=2048)
             (work / (name + ".stdout")).write_text(result.stdout, encoding="utf-8")
             (work / (name + ".stderr")).write_text(result.stderr, encoding="utf-8")
             if not result.ok or result.stderr:
                 raise ValueError("worker failed, status=" + result.classify() + ", exit=" + str(result.returncode))
             magic, status, payload = result.stdout.encode("utf-8").split(b"\n", 2)
-            if magic != b"ouro.clippy-semantic.v2":
+            if magic != b"ouro.clippy-semantic.v3":
                 raise ValueError("wrong protocol")
             if "error_contains" in case:
                 if status != b"error" or not payload.strip():
@@ -491,14 +493,20 @@ def semantic_precision_cases(out: Path, worker: Optional[Path] = None) -> list[s
                 if count_raw != str(count).encode() or not 0 <= count <= 500000:
                     raise ValueError("invalid proof count")
                 fields = proof_text.decode("utf-8").splitlines()
-                if len(fields) != count * 4:
+                if len(fields) != count * 6:
                     raise ValueError("incomplete proof inventory")
                 for i in range(count):
-                    code, owner, ordinal, evidence = fields[i * 4:i * 4 + 4]
+                    code, owner, ordinal, start, end, evidence = fields[i * 6:i * 6 + 6]
                     if code not in active or not owner.strip() or not evidence.strip():
                         raise ValueError("unregistered or evidence-free proof")
                     if str(int(ordinal)) != ordinal or not 0 <= int(ordinal) <= 500000:
                         raise ValueError("noncanonical proof ordinal")
+                    if start == "-" or end == "-":
+                        if start != "-" or end != "-":
+                            raise ValueError("partial proof range")
+                    elif (str(int(start)) != start or str(int(end)) != end
+                          or int(start) > int(end) or int(end) > size):
+                        raise ValueError("noncanonical proof range")
                     found.append(code)
                 if sorted(found) != sorted(case["codes"]):
                     raise ValueError("expected=" + repr(case["codes"]) + " found=" + repr(found))
@@ -509,6 +517,25 @@ def semantic_precision_cases(out: Path, worker: Optional[Path] = None) -> list[s
         print("SEMANTIC_PRECISION " + name + (": FAIL " + failure if failure else ": OK"), flush=True)
     (work / "results.json").write_text(json.dumps({"pass": not failures, "cases": rows}, indent=2) + "\n",
                                        encoding="utf-8")
+    return failures
+
+
+def semantic_runtime_import_cases(out: Path, worker: Optional[Path] = None) -> list[str]:
+    """Exercise the runtime root's transitive platform harvest and fatal inputs."""
+    work = out / "runtime-imports"
+    failures = semantic_precision_cases(work / "actual", worker, cases=[
+        {"path": "runtime/managed.ouro", "codes": []},
+        {"path": "runtime/platform/windows_clock.ouro", "codes": []},
+    ])
+    executable = worker or ROOT / "_build/c" / ("ouro-clippy-structural" + (".exe" if os.name == "nt" else ""))
+    failures.extend(semantic_precision_cases(work / "fixtures", executable,
+        source_root=ROOT / "tests/clippy_semantic/runtime_imports", cases=[
+            {"path": "runtime/valid.ouro", "codes": []},
+            {"path": "runtime/unresolved.ouro", "codes": [],
+             "error_contains": "unresolved executable declaration: missing_runtime_value"},
+            {"path": "runtime/missing.ouro", "codes": [],
+             "error_contains": "expected a regular quality source file"},
+        ]))
     return failures
 
 
@@ -523,14 +550,29 @@ def semantic_law_cases(out: Path) -> list[str]:
     for name in ("proofs", "contracts", "resources", "lifetime", "precision", "process_status"):
         entry = "tests/clippy_semantic/" + name + ".ouro"
         executable = prepare_entry(entry, "ouro-clippy-laws-" + name)
-        result = run_limited([str(executable)], cwd=ROOT, env=_native_env(),
-                             timeout_s=180, memory_mb=2048)
-        (out / (name + "-laws.stdout")).write_text(result.stdout, encoding="utf-8")
-        (out / (name + "-laws.stderr")).write_text(result.stderr, encoding="utf-8")
-        passed = result.ok and not result.stderr and "PASS " in result.stdout and "FAIL " not in result.stdout
-        rows.append({"entry": entry, "pass": passed, "exit_code": result.returncode})
-        if not passed:
-            failures.append("native semantic laws failed: " + name)
+        groups = [""]
+        if name == "proofs":
+            listing = run_limited([str(executable), "--list-groups"], cwd=ROOT, env=_native_env(),
+                                  timeout_s=180, memory_mb=2048)
+            (out / "proofs-groups.stdout").write_text(listing.stdout, encoding="utf-8")
+            (out / "proofs-groups.stderr").write_text(listing.stderr, encoding="utf-8")
+            groups = listing.stdout.splitlines()
+            if (not listing.ok or listing.stderr or not groups or len(groups) != len(set(groups))
+                    or any(not group or any(c not in "abcdefghijklmnopqrstuvwxyz0123456789-" for c in group)
+                           for group in groups)):
+                rows.append({"entry": entry, "pass": False, "exit_code": listing.returncode})
+                failures.append("native semantic proof group inventory failed")
+                continue
+        for group in groups:
+            label = name + ("-" + group if group else "")
+            command = [str(executable), "--group", group] if group else [str(executable)]
+            result = run_limited(command, cwd=ROOT, env=_native_env(), timeout_s=180, memory_mb=2048)
+            (out / (label + "-laws.stdout")).write_text(result.stdout, encoding="utf-8")
+            (out / (label + "-laws.stderr")).write_text(result.stderr, encoding="utf-8")
+            passed = result.ok and not result.stderr and "PASS " in result.stdout and "FAIL " not in result.stdout
+            rows.append({"entry": entry, "group": group, "pass": passed, "exit_code": result.returncode})
+            if not passed:
+                failures.append("native semantic laws failed: " + label)
     (out / "semantic-laws.json").write_text(json.dumps({"pass": not failures, "cases": rows}, indent=2) + "\n",
                                              encoding="utf-8")
     return failures
@@ -540,6 +582,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--out", default="_build/quality/clippy-grade-suite")
     ap.add_argument("--precision-only", action="store_true", help="run native semantic identity-mutation fixtures only")
+    ap.add_argument("--runtime-imports-only", action="store_true", help="run native runtime import-harvest regressions only")
     ap.add_argument("--laws-only", action="store_true", help="run native proof, contract, budget and precision laws")
     ap.add_argument("--worker", type=Path, help="use this already-built semantic worker for the focused suite")
     args = ap.parse_args(argv)
@@ -550,11 +593,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     out.mkdir(parents=True, exist_ok=True)
 
     if args.laws_only:
-        if args.precision_only or args.worker is not None:
-            ap.error("--laws-only cannot be combined with --precision-only or --worker")
+        if args.precision_only or args.runtime_imports_only or args.worker is not None:
+            ap.error("--laws-only cannot be combined with --precision-only, --runtime-imports-only or --worker")
         failures = semantic_law_cases(out)
         for failure in failures:
             print("CLIPPY_LAWS_FAIL " + failure, file=sys.stderr)
+        return 1 if failures else 0
+    if args.runtime_imports_only:
+        if args.precision_only:
+            ap.error("--runtime-imports-only cannot be combined with --precision-only")
+        failures = semantic_runtime_import_cases(out, args.worker)
+        for failure in failures:
+            print("CLIPPY_RUNTIME_IMPORTS_FAIL " + failure, file=sys.stderr)
         return 1 if failures else 0
     if args.precision_only:
         failures = semantic_precision_cases(out, args.worker)
@@ -562,7 +612,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             print("CLIPPY_PRECISION_FAIL " + failure, file=sys.stderr)
         return 1 if failures else 0
     if args.worker is not None:
-        ap.error("--worker requires --precision-only")
+        ap.error("--worker requires --precision-only or --runtime-imports-only")
 
     try:
         manifest = load_manifest(MANIFEST)
@@ -573,6 +623,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     failures: list[str] = structural_fact_cases(out)
     failures.extend(semantic_law_cases(out))
     failures.extend(semantic_precision_cases(out))
+    failures.extend(semantic_runtime_import_cases(out,
+        ROOT / "_build/c" / ("ouro-clippy-structural" + (".exe" if os.name == "nt" else ""))))
     failures.extend(suppression_policy_cases(out))
     failures.extend(frontend_policy_cases(out))
     failures.extend(source_policy_cases(out))

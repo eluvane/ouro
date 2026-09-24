@@ -1,16 +1,7 @@
-<p align="center">
-  <img
-    width="100%"
-    src="https://capsule-render.vercel.app/api?type=waving&amp;height=220&amp;color=0:0B1220,50:1E1B4B,100:4F46E5&amp;text=SYNTAX&amp;fontColor=E2E8F0&amp;fontSize=54&amp;fontAlignY=50"
-    alt="SYNTAX banner"
-  />
-</p>
-
 # Surface syntax
 
-This page is the maintained reference for the source forms accepted by the
-current toolchain. Ouro is pre-1.0, so syntax may change with an RFC, migration
-notes, fixtures, and formatter support.
+This page describes the source forms accepted by the current toolchain.
+[Stability](stability.md) owns the pre-1.0 compatibility policy.
 
 ## Modules and imports
 
@@ -20,6 +11,17 @@ Source files are modules. Imports use paths relative to the importing file:
 import "../std/list.ouro";
 import "nat_lib.ouro" as N;
 ```
+
+Multiple plain paths can share a declaration, with an optional final comma
+before `;`:
+
+```ouro
+import "../std/string.ouro", "../std/list.ouro",;
+```
+
+The parser expands the group into ordered imports. Aliases remain on separate
+single-path declarations. [Ergonomic syntax](language/ergonomic-syntax.md#grouped-imports)
+explains the desugaring and rejected forms.
 
 An import alias qualifies names from the imported file:
 
@@ -39,11 +41,7 @@ module declarations are not supported.
 
 ## Definitions and dependent functions
 
-A definition names a term and its type. `check` validates the complete ordered
-module closure, including imported types and bodies, parameterized and indexed
-inductives, cases, and structural recursion. Effect-declaring roots use the
-same checker after supported handler lowering; an unsupported combination
-returns an error:
+A definition names a term and its type:
 
 ```ouro
 def id (A : Type) (x : A) : A := x;
@@ -65,6 +63,16 @@ Lambdas and local bindings use:
 fun (x : A) => body
 let x : A := value in body
 ```
+
+A local helper can put its typed parameters next to its name:
+
+```ouro
+let twice (x : Nat) : Nat := add x x in twice 2
+```
+
+This is a non-recursive lambda-binding. Parameterized local helpers require an
+explicit result annotation; [Ergonomic syntax](language/ergonomic-syntax.md#typed-local-helper-declarations)
+explains their scope and desugaring.
 
 ## Inductive data and pattern matching
 
@@ -223,9 +231,8 @@ bindings select its Nat, Bool, List, and Maybe results. Transparent aliases keep
 those identities. Ordinary axioms, externs, and Runtime operations stay neutral
 during conversion.
 
-The transitional C runtime still uses NUL-terminated strings. Core byte
-preservation does not establish embedded-NUL round trips through that runtime's
-text IO.
+The [runtime contract](effects_design.md#runtime-surface) covers host IO and
+embedded-NUL limits.
 
 ## Lists
 
@@ -275,6 +282,17 @@ Application is whitespace-separated:
 f x y
 ```
 
+Positional arguments may also be comma-separated inside parentheses:
+
+```ouro
+f(x, y,)
+```
+
+This is left-associated application; a trailing comma is optional.
+`f (x y)` still passes one argument, while `f()` is rejected. See
+[Ergonomic syntax](language/ergonomic-syntax.md#positional-parenthesized-calls)
+for desugaring and compatibility details.
+
 The forward pipe appends its left-hand value as the final argument of the
 application on the right:
 
@@ -296,12 +314,6 @@ sequencing and `let!` binding:
 def echo : IO Unit :=
   do let! line := readLine;
      println line
-```
-
-```ouro
-def main : IO Unit :=
-  do println "hello";
-     exit 0
 ```
 
 `do let!` is valid only inside a `do` expression. The older `<-` binding
@@ -333,16 +345,7 @@ declaration do not require a trailing semicolon per arm.
 
 ## Current limits
 
-The current surface does not include implicit arguments, type classes, a mature
-module system, general record updates, unrestricted recursion, macros with
-checker authority, or a stable general effects system. Refer to
-[Design goals](design.md) for direction and [Stability](stability.md) for the
-pre-1.0 compatibility policy.
-
-<p align="center">
-  <img
-    width="100%"
-    src="https://capsule-render.vercel.app/api?type=waving&amp;height=220&amp;color=0:0B1220,50:1E1B4B,100:4F46E5&amp;section=footer"
-    alt=""
-  />
-</p>
+The [design goals](design.md#language-direction) and
+[stability policy](stability.md#experimental-areas) describe planned and
+experimental language areas. Record updates, unrestricted recursion, implicit
+arguments, and type classes are outside this surface.

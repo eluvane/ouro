@@ -16,6 +16,7 @@ from unittest.mock import patch
 
 import bootstrap_compiler as bootstrap
 import bootstrap_inputs as inputs
+import compact_source
 import ci_gate
 import ouro_build as build
 from ourosmith.limits import RunResult
@@ -31,13 +32,15 @@ class BootstrapCompilerTests(unittest.TestCase):
         self.work.mkdir()
         self.events = []
         self.rejected_root = None
+        self.rejected_source_form = None
         self.different_c = False
         self.abi_stdout = bootstrap.ABI_STDOUT
 
-    def fixture(self):
+    def fixture(self, *, compact_sources=False):
         roots = [f"compiler/source-{index}.ouro" for index in range(14)] + ["compiler/backend.ouro"]
         graph = {name: [name] for name in [*roots, *bootstrap.ACCEPTANCE_ROOTS]}
-        for role in ("historical/c0", "historical/bridge", "o"):
+        roles = ["historical/c0", "historical/bridge", "o"] + (["compact"] if compact_sources else [])
+        for role in roles:
             for name in {*graph, "scripts/bootstrap_compiler.py"}:
                 path = self.work / role / name
                 path.parent.mkdir(parents=True, exist_ok=True)
@@ -45,10 +48,11 @@ class BootstrapCompilerTests(unittest.TestCase):
         cc = self.root / "host-compiler-fixture"
         cc.write_bytes(b"fixed host compiler fixture")
         selected = {"roots": roots, "unit_graph": graph, "environment": {}, "sources": {},
+                    "source_form": compact_source.KIND if compact_sources else "original",
                     "cc_executable": str(cc), "cc_sha256": sha256_file(cc)}
         snapshot = {"kind": bootstrap.KIND + ".inputs", "key": hash_json(selected), "selected": selected,
             "config": {**build.DEFAULTS, "verbosity": "quiet"}, "bridge_graph": graph,
-            "roots": {"c0": "historical/c0", "bridge": "historical/bridge", "p1": "o", "p2": "o"},
+            "roots": {"c0": "historical/c0", "bridge": "historical/bridge", "p1": "o", "p2": "compact" if compact_sources else "o"},
             "inputs": {path.relative_to(self.work).as_posix(): sha256_file(path)
                        for path in self.work.rglob("*") if path.is_file()}}
         write_json_atomic(self.work / "inputs.json", snapshot)
@@ -85,13 +89,42 @@ class BootstrapCompilerTests(unittest.TestCase):
                 code = 1
                 stderr = ("bootstrap-bad.ouro: type mismatch in exact_index\nCHECK_FAIL: front end rejected the input\n"
                           "ouro1: CErr tag=0 n=1\nouro1: CErr code=41 det=78\n")
-            elif source == self.rejected_root:
+            elif source == self.rejected_root and (self.rejected_source_form is None or cwd.name == self.rejected_source_form):
                 code, stderr = 1, "current root rejected\n"
             else:
                 stdout = "CHECK_OK\n"
         else:
             self.fail(f"unexpected host fixture command: {argv}")
         return RunResult("ok", code, stdout, stderr, 0.01, 1.0, list(argv))
+
+    def test_compaction_preserves_literal_bytes_directives_and_line_boundaries(self):
+        literal = '"  -- @entry other\\n\\\"\\\\\t\r\nЮник\u043eд  "'.encode()
+        source = (b'  -- ordinary comment with "\r\n\r\n  -- @entry main\r\n'
+                  b"def foo'   :  String := " + literal + b'; -- trailing comment\r\n'
+                  b"  -- \t@export foo'; @doc docs/build.md\n\n  def main : Nat :=  1;\n")
+        expected = (b"-- @entry main\r\ndef foo' : String := " + literal + b";\n"
+                    b"-- \t@export foo'; @doc docs/build.md\ndef main : Nat := 1;\n")
+        result = compact_source.compact_source(source)
+        self.assertEqual(result, expected)
+        self.assertEqual(compact_source.compact_source(result), result)
+        self.assertLess(len(result), len(source))
+
+    def test_compaction_keeps_token_separators_and_does_not_repair_invalid_bytes(self):
+        source = b"  f' -  - g'  : =  x; -- removed\n\tfoo\vbar\xc2\xa0baz\n"
+        self.assertEqual(compact_source.compact_source(source), b"f' - - g' : = x;\nfoo\vbar\xc2\xa0baz\n")
+        self.assertEqual(compact_source.compact_source(b' -- comment "\n\t'), b"")
+        for invalid in (b'"missing', b'"trailing\\', b'"escaped\\"'):
+            with self.subTest(source=invalid), self.assertRaisesRegex(ValueError, "unterminated string"):
+                compact_source.compact_source(invalid)
+
+    def test_compaction_preserves_grouped_and_aliased_imports(self):
+        from selfhost_module_cache import quoted_import_targets
+        source = (b'import  "../std/data.ouro", -- first import\n "../std/list.ouro", ;\n'
+                  b'import "../std/text.ouro" as Text;\n'
+                  b'def fake : String := "import \\\"not-a-module.ouro\\\";";\n')
+        original = quoted_import_targets(source.decode(), "compiler/probe.ouro")
+        self.assertEqual(original, ["std/data.ouro", "std/list.ouro", "std/text.ouro"])
+        self.assertEqual(quoted_import_targets(compact_source.compact_source(source).decode(), "compiler/probe.ouro"), original)
 
     def test_current_o_snapshot_is_independent_of_historical_projection(self):
         root = self.root / "repo"
@@ -113,12 +146,30 @@ class BootstrapCompilerTests(unittest.TestCase):
             "archive_sha256": sha256_file(root / inputs.ARCHIVE), "manifest_sha256": sha256_file(root / inputs.MANIFEST)}
         cfg = build.ResolvedConfig(dict(build.DEFAULTS), {})
         before = (root / "std/prelude.ouro").read_bytes()
-        snapshot = bootstrap.freeze(root, self.work, selected, cfg)
-        self.assertEqual((self.work / "o/std/prelude.ouro").read_bytes(), before)
-        self.assertEqual((root / "std/prelude.ouro").read_bytes(), before)
-        self.assertNotEqual((self.work / "historical/bridge/std/prelude.ouro").read_bytes(), before)
-        self.assertFalse((self.work / "o/compiler/stage0").exists())
-        self.assertEqual(bootstrap.changed_inputs(self.work, snapshot), [])
+        for form in ("original", compact_source.KIND):
+            with self.subTest(source_form=form):
+                selected["source_form"] = form
+                work = self.work / form
+                work.mkdir()
+                snapshot = bootstrap.freeze(root, work, selected, cfg)
+                self.assertEqual((work / "o/std/prelude.ouro").read_bytes(), before)
+                self.assertEqual((root / "std/prelude.ouro").read_bytes(), before)
+                self.assertNotEqual((work / "historical/bridge/std/prelude.ouro").read_bytes(), before)
+                self.assertFalse((work / "o/compiler/stage0").exists())
+                self.assertEqual(bootstrap.changed_inputs(work, snapshot), [])
+                self.assertEqual(snapshot["roots"]["p1"], "o")
+                if form == "original":
+                    self.assertEqual(snapshot["roots"]["p2"], "o")
+                    self.assertIsNone(snapshot["compaction"])
+                else:
+                    self.assertEqual(snapshot["roots"]["p2"], "compact")
+                    compact = work / "compact/std/prelude.ouro"
+                    self.assertEqual(compact.read_bytes(), compact_source.compact_source(before))
+                    self.assertEqual(snapshot["compaction"]["files"]["std/prelude.ouro"]["compact_sha256"], sha256_file(compact))
+                    self.assertEqual(snapshot["inputs"]["compact/std/prelude.ouro"], sha256_file(compact))
+                    self.assertFalse((work / "compact/compiler/stage0").exists())
+                    for name in bootstrap.HELPERS:
+                        self.assertEqual((work / "compact" / name).read_bytes(), (root / name).read_bytes())
 
     def test_current_key_tracks_content_and_host_inputs_without_using_timestamps(self):
         root = self.root / "key-fixture"
@@ -139,8 +190,10 @@ class BootstrapCompilerTests(unittest.TestCase):
              patch.object(build, "compiler_id", return_value="fixed fixture version"):
             selected = bootstrap.current_inputs(root, cfg, build)
             key = hash_json(selected)
+            compact = bootstrap.current_inputs(root, cfg, build, compact_sources=True)
+            self.assertNotEqual(hash_json(compact), key)
             for name in ("std/prelude.ouro", "runtime/host-key-extra.h", "scripts/bootstrap_compiler.py",
-                         inputs.STAGE0[0], inputs.MANIFEST, inputs.ARCHIVE):
+                         "scripts/compact_source.py", inputs.STAGE0[0], inputs.MANIFEST, inputs.ARCHIVE):
                 with self.subTest(input=name):
                     path = root / name
                     original, timestamp = path.read_bytes(), path.stat()
@@ -153,6 +206,54 @@ class BootstrapCompilerTests(unittest.TestCase):
                 self.assertNotEqual(hash_json(bootstrap.current_inputs(root, cfg, build)), key)
             compiler.write_bytes(b"changed compiler with identical version output")
             self.assertNotEqual(hash_json(bootstrap.current_inputs(root, cfg, build)), key)
+
+    def test_compact_stage_checks_both_forms_before_emitting_from_compact_sources(self):
+        snapshot = self.fixture(compact_sources=True)
+        with patch.object(bootstrap, "run_limited", side_effect=self.fake_run):
+            report = bootstrap.chain(self.work, snapshot, build)
+        expected = set(snapshot["selected"]["roots"]) | set(bootstrap.ACCEPTANCE_ROOTS)
+        for form in ("o", "compact"):
+            checked = {argv[2] for argv, root in self.events if len(argv) > 2 and argv[1] == "check"
+                       and argv[0] == str(self.work / "out/p1/ouro1") and root == self.work / form}
+            self.assertEqual(checked, expected)
+        emitted = [(argv, root) for argv, root in self.events if "worker" in argv and "p2" in argv
+                   and any(action in argv for action in ("frontend", "abi-build", "link"))]
+        self.assertEqual(len(emitted), 3)
+        self.assertTrue(all(root == self.work / "compact" for _argv, root in emitted))
+        self.assertTrue(report["phases"][-1]["all_compact_roots_strictly_checked_before_emission"])
+        self.assertEqual(set(report["complete_generated_c_comparison"]), {"driver_u.c", "backend_u.c"})
+        self.assertTrue(report["pass"])
+
+    def test_compact_source_rejection_stops_before_p2_emission(self):
+        snapshot = self.fixture(compact_sources=True)
+        self.rejected_root = snapshot["selected"]["roots"][-1]
+        self.rejected_source_form = "compact"
+        with patch.object(bootstrap, "run_limited", side_effect=self.fake_run):
+            with self.assertRaisesRegex(RuntimeError, "p2/check-compact-14"):
+                bootstrap.chain(self.work, snapshot, build)
+        self.assertTrue((self.work / "out/p1/driver_u.c").exists())
+        self.assertFalse((self.work / "out/p2/driver_u.c").exists())
+
+    def test_compact_generated_c_mismatch_rejects_successor(self):
+        snapshot = self.fixture(compact_sources=True)
+        self.different_c = True
+        with patch.object(bootstrap, "run_limited", side_effect=self.fake_run):
+            with self.assertRaisesRegex(RuntimeError, "complete generated frontend/backend C differs"):
+                bootstrap.chain(self.work, snapshot, build)
+        self.assertFalse(json.loads((self.work / "report.json").read_text())["pass"])
+
+    def test_compact_input_tampering_stops_before_any_subprocess(self):
+        snapshot = self.fixture(compact_sources=True)
+        (self.work / "compact/compiler/backend.ouro").write_text("changed after freeze")
+        with patch.object(bootstrap, "run_limited", side_effect=self.fake_run):
+            with self.assertRaisesRegex(RuntimeError, "frozen bootstrap inputs changed"):
+                bootstrap.chain(self.work, snapshot, build)
+        self.assertEqual(self.events, [])
+
+    def test_build_flag_selects_compact_bootstrap(self):
+        with patch.object(bootstrap, "ensure_current_compiler") as ensure, patch.object(build, "trim_cache"):
+            build.main(["build", "--compact-sources", "--verbosity", "quiet"])
+        self.assertEqual(ensure.call_args.kwargs, {"compact_sources": True})
 
     def test_last_current_root_rejection_stops_before_p1_emission(self):
         snapshot = self.fixture()

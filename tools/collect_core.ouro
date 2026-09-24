@@ -1,11 +1,11 @@
 -- Shared bounded import traversal for the collector and native build driver.
-import "../std/io.ouro";
-import "../std/fs.ouro";
-import "../std/string.ouro";
-import "../std/pathx.ouro";
-import "../std/data.ouro";
-import "../compiler/lexer.ouro";
-import "../compiler/preprocess_import.ouro";
+import "../std/io.ouro",
+  "../std/fs.ouro",
+  "../std/string.ouro",
+  "../std/pathx.ouro",
+  "../std/data.ouro",
+  "../compiler/lexer.ouro",
+  "../compiler/preprocess_import.ouro";
 
 def collect_byte_span : Nat := 256;
 def collect_fuel : Nat := add collect_byte_span collect_byte_span;
@@ -13,6 +13,64 @@ def collect_fuel : Nat := add collect_byte_span collect_byte_span;
 inductive Col : Type :=
   | ColOk : List String -> Col
   | ColErr : String -> Col;
+
+inductive CollectImportError : Type :=
+  | CollectImportExhausted : CollectImportError
+  | CollectImportMissingPath : CollectImportError
+  | CollectImportMalformedString : CollectImportError;
+
+def collect_import_error_message (error : CollectImportError) : String :=
+    match error with
+    | CollectImportExhausted => "collect_units: import group scan exhausted"
+    | CollectImportMissingPath =>
+        "collect_units: expected import path after comma or ';' after trailing comma"
+    | CollectImportMalformedString => "collect_units: malformed import string"
+    end;
+
+-- Dependency discovery only: the declaration parser remains the acceptance
+-- authority. Preserve the compiler string decoder and the reverse path order.
+def collect_import_tail : Nat -> List Nat -> List String ->
+    Either CollectImportError (Pair (List Nat) (List String)) :=
+  fix tail (fuel : Nat) (source : List Nat) (paths : List String)
+      : Either CollectImportError (Pair (List Nat) (List String)) :=
+    match fuel with
+    | Z => Left CollectImportError (Pair(List Nat, List String))
+        CollectImportExhausted
+    | S remaining =>
+        let done : Either CollectImportError (Pair (List Nat) (List String)) :=
+          Right CollectImportError (Pair(List Nat, List String))
+            (MkPair(List Nat, List String, source, paths)) in
+        match skip_ws_i source with
+        | Nil => done
+        | Cons separator after =>
+            match eqNat separator 44 with
+            | False => done
+            | True =>
+                let missing : Either CollectImportError (Pair (List Nat) (List String)) :=
+                  Left CollectImportError (Pair(List Nat, List String))
+                    CollectImportMissingPath in
+                match skip_ws_i after with
+                | Nil => missing
+                | Cons quote body =>
+                    match eqNat quote ch_semi_i with
+                    | True => Right CollectImportError (Pair(List Nat, List String))
+                        (MkPair(List Nat, List String, body, paths))
+                    | False =>
+                        match eqNat quote ch_dq_i with
+                        | False => missing
+                        | True =>
+                            match take_string fuel body (Nil Nat) with
+                            | StrErr => Left CollectImportError (Pair(List Nat, List String))
+                                CollectImportMalformedString
+                            | StrOk path rest =>
+                                tail remaining rest (Cons String (str_of_codes path) paths)
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end;
 
 -- Locate dependencies with the shared source helpers. Only quoted import
 -- operands are decoded, by the compiler lexer; record syntax stays opaque
@@ -46,8 +104,14 @@ def collect_imports_scan (string_fuel : Nat)
                     | False => scan remaining after paths
                     | True => match take_string string_fuel body (Nil Nat) with
                       | StrErr => ColErr "collect_units: malformed import string"
-                      | StrOk path tail => scan remaining tail
-                          (Cons String (str_of_codes path) paths)
+                      | StrOk path tail =>
+                          match collect_import_tail string_fuel tail
+                              (Cons String (str_of_codes path) paths) with
+                          | Left error => ColErr (collect_import_error_message error)
+                          | Right group => match group with
+                            | MkPair group_rest imports => scan remaining group_rest imports
+                            end
+                          end
                       end
                     end
                   end
@@ -104,7 +168,7 @@ def collect_word_candidate (src : String) (position : Nat) (word : String) : Boo
     match collect_identifier_before src position with
     | True => False
     | False =>
-        let after : Nat := add position (str_len word) in
+        let after : Nat := add(position, str_len word) in
         source_word_end (str_codes (str_slice src after 1))
     end;
 
@@ -129,7 +193,7 @@ def import_paths (original : String) : Col :=
       | Z => ColErr "collect_units: import scan exhausted"
       | S remaining =>
           let index : Nat := collect_next_candidate src in
-          match eqNat index (str_len src) with
+          match eqNat(index, str_len src) with
           | True => ColOk (reverse String paths)
           | False =>
               let candidate : String := str_slice src index (str_len src) in
@@ -137,7 +201,7 @@ def import_paths (original : String) : Col :=
               | True => match str_index candidate "\n" with
                 | Nothing => ColOk (reverse String paths)
                 | Just newline => scan remaining
-                    (str_slice candidate (add newline 1) (str_len candidate)) paths
+                    (str_slice(candidate, add newline 1, str_len candidate)) paths
                 end
               | False => match str_starts candidate "\"" with
                 | True => scan remaining
@@ -167,8 +231,15 @@ def import_paths (original : String) : Col :=
                               | False => scan remaining (str_of_codes after) paths
                               | True => match take_string fuel body (Nil Nat) with
                                 | StrErr => ColErr "collect_units: malformed import string"
-                                | StrOk path tail => scan remaining (str_of_codes tail)
-                                    (Cons String (str_of_codes path) paths)
+                                | StrOk path tail =>
+                                    match collect_import_tail fuel tail
+                                        (Cons String (str_of_codes path) paths) with
+                                    | Left error => ColErr (collect_import_error_message error)
+                                    | Right group => match group with
+                                      | MkPair group_rest imports =>
+                                          scan remaining (str_of_codes group_rest) imports
+                                      end
+                                    end
                                 end
                               end
                             end
@@ -178,7 +249,7 @@ def import_paths (original : String) : Col :=
                 end
               end
           end
-      end) (add (str_len original) 1) original (Nil String);
+      end) (add(str_len original, 1)) original (Nil String);
 
 -- Preserve the UNC prefix in compiler input paths. The shared path helpers
 -- still own separator and dot-segment normalization; package paths are unchanged.
@@ -195,7 +266,7 @@ def collect_path_resolve (base : String) (spelling : String) : String :=
     | True => collect_path_normalize spelling
     | False =>
         let directory : String := path_dirname base in
-        let preserved : String := match str_starts (path_from_host base) "//" with
+        let preserved : String := match str_starts(path_from_host base, "//") with
           | True => str_concat "/" directory
           | False => directory end in
         collect_path_normalize (str_cat3 preserved "/" spelling)
@@ -212,20 +283,20 @@ def collect_after
   (seen : List String) (vis : List String) (path : String) (src : String)
   : IO Col :=
   match import_paths src with
-  | ColErr error => io_pure Col (ColErr (str_cat3 error " in " path))
+  | ColErr error => io_pure(Col, ColErr (str_cat3 error " in " path))
   | ColOk imports =>
     do let! acc :=
          io_fold String Col
            (fun (st : Col) (i : String) =>
              match st with
-             | ColErr e => io_pure Col (ColErr e)
+             | ColErr e => io_pure(Col, ColErr e)
              | ColOk seen2 => walk seen2 vis i
              end)
            (ColOk seen)
            (map String String (collect_path_resolve path) imports);
        match acc with
-       | ColErr e => io_pure Col (ColErr e)
-       | ColOk seen2 => io_pure Col (ColOk (add_unit path seen2))
+       | ColErr e => io_pure(Col, ColErr e)
+       | ColOk seen2 => io_pure(Col, ColOk (add_unit path seen2))
        end
   end
 
@@ -235,14 +306,14 @@ def collect_file
   do let! ex := fs_exists path;
      match ex with
      | False =>
-         io_pure Col (ColErr (str_concat "collect_units: missing " path))
+         io_pure(Col, ColErr (str_concat "collect_units: missing " path))
      | True =>
          do let! loaded := fs_read_checked path;
             match loaded with
             | Left e =>
                 io_pure Col
                   (ColErr (str_cat3 "collect_units: could not read " path
-                    (str_concat ": " (fs_error_message e))))
+                    (str_concat(": ", fs_error_message e))))
             | Right src => collect_after walk seen vis path src
             end
      end
@@ -251,11 +322,11 @@ def collect_walk : Nat -> List String -> List String -> String -> IO Col :=
   fix collect_walk (fuel : Nat) (seen : List String) (vis : List String)
       (path0 : String) : IO Col :=
     match fuel with
-    | Z => io_pure Col (ColErr "collect_units: too many units")
+    | Z => io_pure(Col, ColErr "collect_units: too many units")
     | S fuel' =>
         let path : String := collect_path_normalize path0 in
         match elem String str_eq path seen with
-        | True => io_pure Col (ColOk seen)
+        | True => io_pure(Col, ColOk seen)
         | False =>
             match elem String str_eq path vis with
             | True =>

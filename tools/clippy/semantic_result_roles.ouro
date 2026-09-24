@@ -1,0 +1,130 @@
+-- Result transfer helpers consume resolved APIs and snapshot-local summaries.
+-- Roles 200..213 are reserved for Result/Maybe APIs; no spelling is a proof.
+import "semantic_model.ouro",
+  "../../compiler/semantic_scope.ouro";
+
+def cm_result_role (api : CmApi) : Nat :=
+    let direct : Nat := cm_contract_role (cm_api_contract api) in
+    match eq_nat direct 0 with
+    | False => direct
+    | True => match cs_complete (cm_api_summary api) with
+      | True => cs_work_role (cm_api_summary api) | False => 0 end
+    end;
+
+def cm_result_arity (role : Nat) : Nat :=
+    match eq_nat role 200 with
+    | True => 1
+    | False => match elem Nat eq_nat role [201,202,203,204,205,213] with
+      | True => 5
+      | False => match elem Nat eq_nat role [206,209,212] with
+        | True => 4
+        | False => match eq_nat role 207 with
+          | True => 6
+          | False => match elem Nat eq_nat role [208,211] with
+            | True => 3
+            | False => match eq_nat role 210 with | True => 7 | False => 0 end
+            end
+          end
+        end
+      end
+    end;
+
+def cm_result_subject_slot (role : Nat) : Nat :=
+    match elem Nat eq_nat role [201,202,203,205,213] with
+    | True => 4
+    | False => match elem Nat eq_nat role [204,209,212] with
+      | True => 3
+      | False => match elem Nat eq_nat role [206,208,211] with
+        | True => 2
+        | False => match elem Nat eq_nat role [207,210] with
+          | True => 5 | False => 0 end
+        end
+      end
+    end;
+
+def cm_result_callback_slots (role : Nat) : List Nat :=
+    match elem Nat eq_nat role [201,202,203,205,206,213] with
+    | True => [3]
+    | False => match elem Nat eq_nat role [204,210] with
+      | True => [4]
+      | False => match eq_nat role 207 with
+        | True => [3,4]
+        | False => match eq_nat role 212 with | True => [2] | False => [] end
+        end
+      end
+    end;
+
+def cm_result_summary_owned (api : CmApi) : Bool :=
+    match cm_api_summary api with
+    | CsContract module_id declaration _ _ _ _ _ _ _ _ =>
+        andb (eq_nat(module_id, sc_decl_module (cm_api_decl api)))
+          (eq_nat(declaration, sc_decl_name (cm_api_decl api)))
+    end;
+
+def cm_result_callback_pure (apis : CmApiIndex) (arity : Nat) (value : CmValue) : Bool :=
+    match andb(eq_nat(cm_value_kind value, 2), notb (cm_value_io value)) with
+    | False => False
+    | True => match cm_api_lookup(cm_value_id value, apis) with
+      | Nothing => False
+      | Just api => andb (eq_nat(cm_api_arity api, arity))
+          (orb (cm_contract_pure (cm_api_contract api))
+            (andb(cm_result_summary_owned api, cs_pure (cm_api_summary api))))
+      end
+    end;
+
+-- Kind 7/8 is established only by a resolved failure/success constructor.
+-- This does not mark the callback pure: it proves that this call cannot invoke
+-- that slot. Evaluation of the callback expression and other arguments already
+-- happened in the shared visitor, with its normal effect barriers.
+def cm_result_callback_skipped (role : Nat) (position : Nat) (args : List CmValue) : Bool :=
+    let subject : CmValue := nth(CmValue, cm_unknown 0, cm_result_subject_slot role, args) in
+    andb (notb (cm_value_io subject))
+      (orb (andb (eq_nat(cm_value_kind subject, 7))
+          (orb (elem Nat eq_nat role [201,204,205,210])
+            (andb(eq_nat role 207, eq_nat position 4))))
+        (andb (eq_nat(cm_value_kind subject, 8))
+          (orb (elem Nat eq_nat role [202,203,206])
+            (andb(eq_nat role 207, eq_nat position 3)))));
+
+def cm_result_call_pure (apis : CmApiIndex) (role : Nat) (args : List CmValue) : Bool :=
+    andb (notb (eq_nat(cm_result_arity role, 0)))
+      (andb (eq_nat(length CmValue args, cm_result_arity role))
+        (all Nat (fun (position : Nat) =>
+          orb (cm_result_callback_skipped role position args)
+            (cm_result_callback_pure apis (match eq_nat role 210 with | True => 2 | False => 1 end)
+              (nth CmValue (cm_unknown 0) position args))) (cm_result_callback_slots role)));
+
+def cm_result_identity_callback (apis : CmApiIndex) (value : CmValue) : Bool :=
+    match andb(eq_nat(cm_value_kind value, 2), notb (cm_value_io value)) with
+    | False => False
+    | True => match cm_api_lookup(cm_value_id value, apis) with
+      | Nothing => False
+      | Just api => andb (eq_nat(cm_api_arity api, 1))
+          (andb (cm_result_summary_owned api) (andb (cs_pure (cm_api_summary api))
+            (match cs_result (cm_api_summary api) with
+             | CsArgumentResult position => eq_nat position 0
+             | CsUnknownResult => False | CsRequiredResult => False
+             | CsSourceResult => False | CsSuccessResult => False
+             | CsFailureResult => False | CsPolicyResult => False end)))
+      end
+    end;
+
+-- Identity mapping is aliasing, not observation. Only an unchanged type and a
+-- complete unary return-argument summary may retain the checked producer ID.
+def cm_result_identity_transfer (apis : CmApiIndex) (role : Nat) (args : List CmValue)
+    : Maybe CmValue :=
+    let at (position : Nat) : CmValue := nth CmValue (cm_unknown 0) position args in
+    let mapped : Bool := elem Nat eq_nat role [201,202,203,212] in
+    let before : Nat := match eq_nat role 201 with | True => 1 | False => 0 end in
+    let after : Nat := match elem Nat eq_nat role [202,212] with | True => 1 | False => 2 end in
+    let callback : Nat := match eq_nat role 212 with | True => 2 | False => 3 end in
+    let same_type : Bool := andb (cm_value_known (at before))
+        (andb (cm_value_known (at after))
+          (prim_string_eq(cm_value_key (at before), cm_value_key (at after)))) in
+    match andb mapped (andb (eq_nat(length CmValue args, cm_result_arity role))
+        (andb same_type (andb (cm_result_identity_callback(apis, at callback))
+          (all CmValue (fun (value : CmValue) =>
+            andb(cm_value_known value, notb (cm_value_io value))) args)))) with
+    | False => Nothing CmValue
+    | True => Just(CmValue, at (cm_result_subject_slot role))
+    end;

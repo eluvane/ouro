@@ -1,11 +1,3 @@
-<p align="center">
-  <img
-    width="100%"
-    src="https://capsule-render.vercel.app/api?type=waving&amp;height=220&amp;color=0:0B1220,50:1E1B4B,100:4F46E5&amp;text=RFC%200003&amp;fontColor=E2E8F0&amp;fontSize=54&amp;fontAlignY=50"
-    alt="RFC 0003 banner"
-  />
-</p>
-
 # RFC 0003: Word, crypto, HTTP-message, and sequential sleep library slice
 
 - Status: accepted
@@ -36,9 +28,10 @@ higher-level algorithms and codecs in Ouro.
 | `std/http.ouro` | HTTP/1.0 request/response codec and host-command-backed POST | No native socket or TLS stack |
 | `std/async.ouro` | Sequential sleep and delay helper | No scheduler, race, or green threads |
 
-`prim_http_post` remains unwired. The current request helper delegates to host
-`curl` through the process API. Word operations are accelerated by the runtime
-while retaining ordinary Ouro definitions for checking.
+At this decision's acceptance, `prim_http_post` was unwired and the request
+helper delegated to host `curl` through the process API. Word operations used
+runtime acceleration with ordinary Ouro definitions for checking. For current
+transport behavior, see [Effects and IO](../effects_design.md).
 
 ## Compatibility
 
@@ -55,11 +48,3 @@ processes remain outside the logical trusted computing base.
 The crypto runtime fixture, example program, generated API pages,
 [Effects and IO](../effects_design.md), and changelog cover the implemented
 slice.
-
-<p align="center">
-  <img
-    width="100%"
-    src="https://capsule-render.vercel.app/api?type=waving&amp;height=220&amp;color=0:0B1220,50:1E1B4B,100:4F46E5&amp;section=footer"
-    alt=""
-  />
-</p>

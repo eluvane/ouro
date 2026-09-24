@@ -392,10 +392,7 @@ def filtered_baseline_flags(
 
 def skeleton_line(line: str) -> str:
     stripped = line.lstrip()
-    keep = stripped.startswith("import ") or (
-        stripped.startswith("--")
-        and ("ouro-analyze:" in stripped or "ouro-lint:" in stripped)
-    )
+    keep = stripped.startswith("--") and ("ouro-analyze:" in stripped or "ouro-lint:" in stripped)
     if keep:
         return line
     if line.endswith("\r\n"):
@@ -410,7 +407,7 @@ def skeleton_line(line: str) -> str:
 def local_skeleton_line(line: str) -> str:
     stripped = line.lstrip()
     declaration = re.match(
-        r"(?:import|def|axiom|inductive|record|effect)(?:\s|$)|\|", stripped
+        r"(?:def|axiom|inductive|record|effect)(?:\s|$)|\|", stripped
     )
     marker = stripped.startswith("--") and any(
         tag in stripped
@@ -440,12 +437,33 @@ def format_skeleton_line(line: str) -> str:
     return ""
 
 
+def source_skeleton(text: str, line_filter) -> str:
+    import_lines: set[int] = set()
+    if line_filter in (skeleton_line, local_skeleton_line):
+        from structural_quality import lex
+
+        tokens, _comments = lex(text, "ouro")
+        forms = {"import", "def", "axiom", "inductive", "record", "effect", "open"}
+        starts = [index for index, token in enumerate(tokens)
+                  if token.value in forms and (index == 0 or tokens[index - 1].value != ".")]
+        ends = [*starts[1:], len(tokens)] if starts else []
+        for start, past in zip(starts, ends, strict=True):
+            if tokens[start].value == "import":
+                # Keep the entire declaration region, including comments and
+                # malformed tails; the analyzer still owns its syntax errors.
+                first, last = tokens[start], tokens[past - 1]
+                finish_line = first.line + text.count("\n", first.start, last.end)
+                import_lines.update(range(first.line, finish_line + 1))
+    return "".join(line if index in import_lines else line_filter(line)
+                   for index, line in enumerate(text.splitlines(keepends=True), 1))
+
+
 def write_skeleton_file(source: Path, target: Path, line_filter) -> None:
     target.parent.mkdir(parents=True, exist_ok=True)
     with source.open("r", encoding="utf-8", newline="") as handle:
         text = handle.read()
     with target.open("w", encoding="utf-8", newline="") as handle:
-        handle.write("".join(line_filter(line) for line in text.splitlines(keepends=True)))
+        handle.write(source_skeleton(text, line_filter))
 
 
 def write_architecture_skeleton(root: Path, files: Sequence[Path]) -> list[str]:
@@ -632,6 +650,38 @@ def run_bounded(binary: Path, passthrough: Sequence[str], files: Sequence[Path])
     return 0
 
 
+def import_skeleton_self_test() -> None:
+    imports = [
+        'import "a.ouro";\n',
+        'import "a.ouro", "b.ouro";\n',
+        'import "a.ouro",\n  "b.ouro",\n;\n',
+        'import\n  "a.ouro", -- keep both dependencies\n  "b\\"c--d.ouro",\n;\n',
+        'import "a.ouro"\n  as Alias;\n',
+        'import "a.ouro",\n  "b.ouro"\n',
+        'import "a.ouro",\n  missing;\n',
+    ]
+    for prefix in imports:
+        for newline in ("\n", "\r\n"):
+            normalized_prefix = prefix.replace("\n", newline)
+            definition = f"def result : Nat :={newline}  0;{newline}"
+            source = normalized_prefix + definition
+            assert source_skeleton(source, skeleton_line) == normalized_prefix + newline * 2
+            assert source_skeleton(source, local_skeleton_line) == normalized_prefix + f"def result : Nat :={newline}{newline}"
+            assert source_skeleton(source, format_skeleton_line) == "".join(
+                format_skeleton_line(line) for line in source.splitlines(keepends=True))
+    literal = 'def text : String := "\\\"import \\\"ghost.ouro\\\";";\n'
+    fake = '-- import "comment.ouro";\n' + literal
+    assert source_skeleton(fake, skeleton_line) == "\n\n"
+    assert source_skeleton(fake, local_skeleton_line) == "\n" + literal
+    assert source_skeleton("-- comment only\n", skeleton_line) == "\n"
+    try:
+        source_skeleton('import "unterminated', skeleton_line)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("skeleton accepted an unterminated import literal")
+
+
 def self_test() -> int:
     import tempfile
     from unittest.mock import patch
@@ -674,7 +724,8 @@ def self_test() -> int:
         second = load_baseline_rows(baseline)
         assert first is not None and first is second
         assert len(cache) == 1
-    print("ANALYZE_DISCOVERY_SUITE rows=6")
+    import_skeleton_self_test()
+    print("ANALYZE_DISCOVERY_SUITE rows=6 import-skeletons=18")
     return 0
 
 

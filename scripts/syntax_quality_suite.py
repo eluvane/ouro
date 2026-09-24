@@ -635,6 +635,93 @@ def check_suppression_comments() -> Check:
     return Check("suppression-comments", "pass", "literal preservation, quoted comment markers, trailing directive location")
 
 
+def check_grouped_imports() -> list[Check]:
+    registry = strict_quality.load_registry()[1]
+    fixtures = ROOT / "quality/fixtures"
+    bad = fixtures / "bad/grouped_imports.ouro"
+    good = fixtures / "good/grouped_imports.ouro"
+    cases = [
+        ("legacy-duplicate", 'import "a.ouro";\nimport "a.ouro";\n', [("OURO-LINT037", 2, 8)]),
+        ("same-line", 'import "a.ouro", "a.ouro";\n', [("OURO-LINT037", 1, 18)]),
+        ("comment-period", '-- preceding comment ends.\nimport "a.ouro", "a.ouro";\n', [("OURO-LINT037", 2, 18)]),
+        ("multiple-declarations", 'import "a.ouro"; import "a.ouro";\n', [("OURO-LINT037", 1, 25)]),
+        ("multiline", 'import "a.ouro",\n  "b.ouro",\n  "a.ouro",\n;\n', [("OURO-LINT037", 3, 3)]),
+        ("later-import", 'import "a.ouro", "b.ouro";\nimport "b.ouro";\n', [("OURO-LINT037", 2, 8)]),
+        ("escaped-quote", 'import "a\\"b.ouro", "a\\"b.ouro";\n', [("OURO-LINT037", 1, 21)]),
+        ("comment-marker", 'import "a--b.ouro", -- "ignored.ouro"\n  "a--b.ouro",;\n', [("OURO-LINT037", 2, 3)]),
+        ("alias-token", 'import "lower.ouro" as lower;\n', [("OURO-LINT043", 1, 24)]),
+        ("multiline-alias", 'import "a.ouro"\n as Good;\nimport "b.ouro"\n as Good;\n', [("OURO-LINT043", 4, 5)]),
+        ("bad-fixture", bad.read_text(encoding="utf-8"), [
+            ("OURO-LINT037", 4, 3), ("OURO-LINT037", 5, 3),
+            ("OURO-LINT043", 6, 24), ("OURO-LINT043", 8, 28),
+        ]),
+        ("good-fixture", good.read_text(encoding="utf-8"), []),
+        ("unknown-escape", 'import "a\\q.ouro", "aq.ouro";\n', []),
+        ("legacy-aliases", 'import "a.ouro" as Alpha;\nimport "b.ouro" as Beta;\n', []),
+        ("semicolonless", 'import "a.ouro",\n "b.ouro"\ndef value : Nat := 0;\n', []),
+    ]
+    unicode_source = 'import "漢字.ouro", "a.ouro"; import "a.ouro";\n'
+    duplicate_column = len(unicode_source[:unicode_source.rindex('"a.ouro"')].encode("utf-8")) + 1
+    cases.append(("unicode-column", unicode_source, [("OURO-LINT037", 1, duplicate_column)]))
+    for name, source, expected in cases:
+        path = OUT / f"grouped-{name}.ouro"
+        findings = strict_quality.scan_source(path, source, registry, "release")
+        actual = [(finding.code, finding.line, finding.column) for finding in findings]
+        if actual != expected:
+            raise AssertionError(f"grouped import scan {name}: {actual} != {expected}")
+        for finding in findings:
+            if finding.witness != source.splitlines()[finding.line - 1].strip():
+                raise AssertionError(f"grouped import scan {name} has the wrong source witness")
+        if name == "escaped-quote" and "a\"b.ouro" not in findings[0].message:
+            raise AssertionError("grouped import path was not decoded like a source string")
+        if name == "multiline" and "repeats line 1" not in findings[0].message:
+            raise AssertionError("grouped import diagnostic lost its first operand location")
+    malformed = [
+        'import "a.ouro",', 'import "a.ouro", missing;',
+        'import "a.ouro" as A, "b.ouro";', 'import "a.ouro", "b.ouro" as B;',
+        'import "a.ouro" as;', 'import "unterminated',
+    ]
+    for index, source in enumerate(malformed):
+        try:
+            strict_quality.scan_source(OUT / f"malformed-import-{index}.ouro", source, registry, "release")
+        except ValueError as error:
+            if "malformed import declaration" not in str(error):
+                raise AssertionError(f"malformed import lost its explicit scan failure: {error}") from error
+        else:
+            raise AssertionError(f"strict scanner accepted malformed import: {source!r}")
+    return [Check("grouped-imports", "pass", f"{len(cases)} exact code/position cases, {len(malformed)} explicit failures")]
+
+
+def check_style_grouped_imports() -> Check:
+    from ourosmith.host import prepare_entry
+    from ourosmith.limits import run_limited
+
+    native = prepare_entry("tools/lint_style.ouro", "ouro-lint-style")
+    malformed = OUT / "style-malformed-import.ouro"
+    malformed.write_text('import "a.ouro", missing;\n', encoding="utf-8")
+    fixtures = ROOT / "quality/fixtures"
+    for path, expected in ((fixtures / "good/grouped_imports.ouro", 0),
+                           (fixtures / "bad/grouped_imports.ouro", 1), (malformed, 1)):
+        result = run_limited([str(native), "--profile", "release", "--single-file", str(path)],
+                             cwd=ROOT, env=strict_quality.native_env(), timeout_s=60, memory_mb=3072)
+        if result.returncode != expected:
+            raise AssertionError(f"style grouped imports {path}: exit {result.returncode}, {result.stderr}")
+        if path == malformed:
+            if result.stdout or "malformed import declaration" not in result.stderr:
+                raise AssertionError("style companion hid its malformed-import failure")
+        elif result.stderr or (expected == 0 and result.stdout):
+            raise AssertionError(f"unexpected grouped style diagnostics: {result.stdout}{result.stderr}")
+        elif expected == 1:
+            locations = [(4, 3, "OURO-LINT037"), (5, 3, "OURO-LINT037"),
+                         (6, 24, "OURO-LINT043"), (8, 28, "OURO-LINT043")]
+            for line, column, code in locations:
+                if f":{line}:{column}: deny[{code}]" not in result.stdout:
+                    raise AssertionError(f"style grouped import diagnostic lost {line}:{column}:{code}")
+            if result.stdout.count(": deny[") != len(locations):
+                raise AssertionError("style grouped import fixture emitted unexpected extra findings")
+    return Check("style-grouped-imports", "pass", "clean/duplicate/malformed native CLI cases")
+
+
 def check_release_firewall() -> Check:
     report = OUT / "release.json"
     sarif = OUT / "release.sarif"
@@ -673,6 +760,8 @@ def main() -> int:
         checks.extend(check_native_inventory())
         checks.extend(check_inventory_scale())
         checks.extend(check_syntax_fixtures())
+        checks.extend(check_grouped_imports())
+        checks.append(check_style_grouped_imports())
         checks.append(check_suppression_comments())
         checks.append(check_release_firewall())
     except (AssertionError, OSError, UnicodeError, ValueError) as exc:

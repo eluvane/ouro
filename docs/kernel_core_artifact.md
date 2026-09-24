@@ -1,11 +1,3 @@
-<p align="center">
-  <img
-    width="100%"
-    src="https://capsule-render.vercel.app/api?type=waving&amp;height=220&amp;color=0:0B1220,50:1E1B4B,100:4F46E5&amp;text=ARTIFACT&amp;fontColor=E2E8F0&amp;fontSize=54&amp;fontAlignY=50"
-    alt="ARTIFACT banner"
-  />
-</p>
-
 # Core artifacts and checked snapshots
 
 The compiler's current diagnostic format is `ouro.checked-program.v1`.
@@ -56,11 +48,3 @@ replay APIs retired with their implementations. They are not counted as
 ported language capabilities. Compiler inputs retain their own explicit
 shape, type, and failure checks. [Compiler checking](kernel_design.md) and
 [OuroSmith](ouro_smith.md) describe the active commands and evidence rules.
-
-<p align="center">
-  <img
-    width="100%"
-    src="https://capsule-render.vercel.app/api?type=waving&amp;height=220&amp;color=0:0B1220,50:1E1B4B,100:4F46E5&amp;section=footer"
-    alt=""
-  />
-</p>

@@ -1,15 +1,7 @@
-<p align="center">
-  <img
-    width="100%"
-    src="https://capsule-render.vercel.app/api?type=waving&amp;height=220&amp;color=0:0B1220,50:1E1B4B,100:4F46E5&amp;text=RELEASING&amp;fontColor=E2E8F0&amp;fontSize=46&amp;fontAlignY=50"
-    alt="RELEASING banner"
-  />
-</p>
-
 # Releasing
 
-Ouro publishes Lean-style host toolchain archives. Each GitHub Release carries
-both `.tar.zst` and `.zip` files for:
+Ouro releases provide toolchain archives for each supported host platform.
+Each GitHub Release includes both `.tar.zst` and `.zip` archives for:
 
 - `darwin` (macOS x86_64)
 - `darwin_aarch64` (macOS ARM)
@@ -48,11 +40,10 @@ does not match the project version.
 
 ## Release-candidate checks
 
-Before tagging:
+Run the public project and workflow policy checks from the
+[CI validation matrix](ci.md#validation-matrix). Before tagging, also run:
 
 ```sh
-python3 scripts/github_project_gate.py
-python3 scripts/github_workflow_gate.py
 python3 scripts/release_package.py --check --out _build/release_check
 python3 scripts/ci_gate.py --profile manual --out _build/ci/release-manual
 ```
@@ -78,7 +69,8 @@ Metadata and version checks:
 python3 scripts/release_package.py --out _build/release
 ```
 
-One host toolchain, after `python3 scripts/ouro_build.py build`:
+One host toolchain, after the
+[compact-source compiler build](canonical_source.md#materialization) used by CI:
 
 ```sh
 python3 scripts/release_package.py \
@@ -105,26 +97,40 @@ same inputs can be compared.
 
 ## GitHub release
 
-`.github/workflows/ouro-release.yml` runs on release tags, Monday schedule,
-and manual dispatch.
-A tag run creates a draft GitHub Release and uploads the ten host archives,
-manifest, notes, and checksums.
+`.github/workflows/ouro-release.yml` runs on release tags, a daily schedule,
+and manual dispatch. Scheduled runs check the date at 03:17 UTC and build a
+snapshot every three days, counting UTC days from 1970-01-01. Other scheduled
+runs skip validation, packaging, and publication. This cycle continues across
+month and year boundaries. Push an annotated `v<version>` tag after the candidate
+checks and package review. A tag run creates a draft GitHub Release and uploads
+the ten host archives, manifest, notes, and checksums.
 
 A maintainer reviews the draft, changelog, checksums, validation reports,
 security status, and generated-artifact hashes before publication.
 
-A Monday schedule on `main`, or a dispatch on `main` with
-`weekly_snapshot=true` and `package_only=false`, publishes a dated
-`weekly-YYYYMMDD` GitHub Release when the checked-out commit has changes since
-the last weekly snapshot (or in the last eight days if none exists).
+A scheduled snapshot on `main`, or a dispatch on `main` with
+`snapshot=true` and `package_only=false`, publishes a dated
+`snapshot-YYYYMMDD` GitHub Release when the checked-out commit has changes since
+the last snapshot (or in the last three days if none exists). Existing
+`weekly-*` releases remain valid comparison points during the transition.
 `package_only=true`, the dispatch default, prevents publication even when
-`weekly_snapshot` is selected. The weekly tag points to the workflow's source
+`snapshot` is selected. Manual dispatch is independent of the scheduled cycle.
+The snapshot tag points to the workflow's source
 commit, matching its built archives. The snapshot keeps the current project
 version, uses commit subjects as notes, and does not mark the release as latest.
-Empty weeks publish nothing.
+Intervals without new commits publish nothing. Dispatch callers must replace
+the former `weekly_snapshot` input with `snapshot`.
+
+Check whether a UTC date is scheduled without building or publishing:
+
+```sh
+python3 scripts/release_package.py --snapshot-due --date 2026-09-25
+```
+
+This prints `true`; the next two dates print `false`.
 
 During development, write user-visible notes under `[Unreleased]`. Do not append
-new work to a published version section. Weekly snapshots do not cut the
+new work to a published version section. Scheduled snapshots do not cut the
 changelog.
 
 Before tagging a version, bump the shared version files, then cut the log:
@@ -137,24 +143,6 @@ That moves `[Unreleased]` under `## [<version>] - <date>`, leaves `[Unreleased]`
 empty, and rewrites the compare links. An empty `[Unreleased]` section is a
 hard error: there is nothing to publish in the notes.
 
-## Checklist
-
-1. Bump the shared version and cut `CHANGELOG.md` with `--cut-changelog`.
-2. Confirm the shared version and `v<version>` tag.
-3. Run the appropriate validation profiles.
-4. Check `docs/generated_artifact_hashes.sha256`.
-5. Build and inspect the host toolchain archives and `SHA256SUMS`.
-6. Push an annotated tag.
-7. Review the draft release before publishing.
-
 A reproducible host package establishes a reviewable byte baseline for that
 runner. It does not prove type-system soundness, compiler correctness, runtime
 safety, or the truth of generated program intent.
-
-<p align="center">
-  <img
-    width="100%"
-    src="https://capsule-render.vercel.app/api?type=waving&amp;height=220&amp;color=0:0B1220,50:1E1B4B,100:4F46E5&amp;section=footer"
-    alt=""
-  />
-</p>

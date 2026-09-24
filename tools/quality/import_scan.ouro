@@ -1,0 +1,267 @@
+-- Ordered import operands for source-oriented quality tools.
+-- The declaration parser remains the acceptance authority.
+
+import "text.ouro";
+
+inductive ImportScanError : Type :=
+  | ImportScanFailure : Nat -> ImportScanError;
+
+-- Decoded path, optional alias, declaration start, literal [first, past),
+-- and optional alias start. Offsets are UTF-8 byte offsets.
+inductive ScannedImport : Type :=
+  | MkScannedImport : String -> Maybe String -> Nat -> Nat -> Nat -> Maybe Nat
+      -> ScannedImport;
+
+inductive ImportScanStep : Type :=
+  | ImportScanOk : Nat -> List ScannedImport -> ImportScanStep
+  | ImportScanBad : Nat -> ImportScanStep;
+
+def import_scan_place (source : String) (offset : Nat) : Pair Nat Nat :=
+  qt_line_col(source, offset);
+
+def import_scan_ws (byte : Nat) : Bool :=
+  orb(eq_nat byte 32, orb(eq_nat byte 9, orb(eq_nat byte 10, eq_nat byte 13)));
+
+def import_scan_slice_from (source : String) (start : Nat) : String :=
+  prim_string_slice(source, start, sub(prim_string_length source, start));
+
+def import_scan_comment_past (source : String) (start : Nat) : Nat :=
+  match prim_string_index(import_scan_slice_from(source, start), "\n") with
+  | Nothing => prim_string_length source
+  | Just relative => add(start, add(relative, 1))
+  end;
+
+def import_scan_trivia (source : String) (start : Nat) : Nat :=
+  (fix go (fuel : Nat) (pos : Nat) : Nat :=
+    match fuel with
+    | Z => pos
+    | S remaining =>
+        match ltb_nat(pos, prim_string_length source) with
+        | False => pos
+        | True =>
+            match import_scan_ws (prim_string_byte_at source pos) with
+            | True => go(remaining, add pos 1)
+            | False => match qt_starts_at source pos "--" with
+              | True => go(remaining, import_scan_comment_past source pos)
+              | False => pos
+              end
+            end
+        end
+    end) (add(prim_string_length source, 1)) start;
+
+-- Skip a complete quoted region, including escaped quotes. This is also used
+-- for character-like source regions so `import` inside one is never harvested.
+def import_scan_quote_past (source : String) (start : Nat) : Maybe Nat :=
+  let quote : Nat := prim_string_byte_at source start in
+  (fix go (fuel : Nat) (pos : Nat) : Maybe Nat :=
+    match fuel with
+    | Z => Nothing Nat
+    | S remaining =>
+        match ltb_nat(pos, prim_string_length source) with
+        | False => Nothing Nat
+        | True =>
+            let byte : Nat := prim_string_byte_at source pos in
+            match eq_nat byte 92 with
+            | True => match ltb_nat(add pos 1, prim_string_length source) with
+              | True => go(remaining, add pos 2)
+              | False => Nothing Nat
+              end
+            | False => match eq_nat byte quote with
+              | True => Just(Nat, add pos 1)
+              | False => go(remaining, add pos 1)
+              end
+            end
+        end
+    end) (add(prim_string_length source, 1)) (add start 1);
+
+-- Escape handling matches compiler/lexer.take_string: unknown escapes retain
+-- their slash, while the five supported escapes decode to one byte.
+def import_scan_escaped (byte : Nat) (acc : List Nat) : List Nat :=
+  match eq_nat byte 110 with
+  | True => Cons Nat 10 acc
+  | False => match eq_nat byte 116 with
+    | True => Cons Nat 9 acc
+    | False => match eq_nat byte 114 with
+      | True => Cons Nat 13 acc
+      | False => match eq_nat byte 34 with
+        | True => Cons Nat 34 acc
+        | False => match eq_nat byte 92 with
+          | True => Cons Nat 92 acc
+          | False => Cons Nat byte (Cons Nat 92 acc)
+          end
+        end
+      end
+    end
+  end;
+
+def import_scan_decoded (source : String) (first : Nat) (past : Nat)
+    : Maybe String :=
+  let close : Nat := sub(past, 1) in
+  (fix go (fuel : Nat) (pos : Nat) (acc : List Nat) : Maybe String :=
+    match fuel with
+    | Z => Nothing String
+    | S remaining =>
+        match ltb_nat pos close with
+        | False => Just(String, prim_string_of_char_codes(reverse Nat acc))
+        | True =>
+            let byte : Nat := prim_string_byte_at source pos in
+            match eq_nat byte 92 with
+            | False => go(remaining, add pos 1, Cons Nat byte acc)
+            | True => match ltb_nat(add pos 1, close) with
+              | False => Nothing String
+              | True =>
+                  let escaped : Nat := prim_string_byte_at(source, add pos 1) in
+                  go(remaining, add pos 2, import_scan_escaped escaped acc)
+              end
+            end
+        end
+    end) (add(sub past first, 1)) (add first 1) (Nil Nat);
+
+def import_scan_at_byte (source : String) (pos : Nat) (byte : Nat) : Bool :=
+  andb(ltb_nat(pos, prim_string_length source),
+    eq_nat(prim_string_byte_at source pos, byte));
+
+def import_scan_group (source : String) (declaration : Nat) (first : Nat)
+    (collected : List ScannedImport) : ImportScanStep :=
+  (fix go (fuel : Nat) (quote : Nat) (first_path : Bool)
+      (acc : List ScannedImport) : ImportScanStep :=
+    match fuel with
+    | Z => ImportScanBad quote
+    | S remaining =>
+        match import_scan_quote_past source quote with
+        | Nothing => ImportScanBad quote
+        | Just past => match import_scan_decoded source quote past with
+          | Nothing => ImportScanBad quote
+          | Just path =>
+              let after : Nat := import_scan_trivia source past in
+              let plain : ScannedImport :=
+                MkScannedImport(path, Nothing String, declaration, quote, past,
+                  Nothing Nat) in
+              match import_scan_at_byte source after 44 with
+              | True =>
+                  let next : Nat := import_scan_trivia(source, add after 1) in
+                  match import_scan_at_byte source next 59 with
+                  | True => ImportScanOk(add next 1, Cons ScannedImport plain acc)
+                  | False => match import_scan_at_byte source next 34 with
+                    | True => go remaining next False (Cons ScannedImport plain acc)
+                    | False => ImportScanBad next
+                    end
+                  end
+              | False => match qt_at_word source after "as" with
+                | True => match first_path with
+                  | False => ImportScanBad after
+                  | True =>
+                      let alias_start : Nat := import_scan_trivia(source, add after 2) in
+                      match qt_ident_at source alias_start with
+                      | Nothing => ImportScanBad alias_start
+                      | Just alias =>
+                          let alias_past : Nat := qt_ident_end source alias_start in
+                          let next : Nat := import_scan_trivia source alias_past in
+                          match import_scan_at_byte source next 44 with
+                          | True => ImportScanBad next
+                          | False =>
+                              let row : ScannedImport :=
+                                MkScannedImport(path, Just(String, alias), declaration,
+                                  quote, past, Just(Nat, alias_start)) in
+                              match import_scan_at_byte source next 59 with
+                              | True => ImportScanOk(add next 1, Cons ScannedImport row acc)
+                              | False => ImportScanOk(next, Cons ScannedImport row acc)
+                              end
+                          end
+                      end
+                  end
+                | False => match import_scan_at_byte source after 59 with
+                  | True => ImportScanOk(add after 1, Cons ScannedImport plain acc)
+                  | False => ImportScanOk(after, Cons ScannedImport plain acc)
+                  end
+                end
+              end
+          end
+        end
+    end) (add(prim_string_length source, 1)) first True collected;
+
+def import_scan_min_index (source : String) (needle : String) (best : Nat) : Nat :=
+  match prim_string_index source needle with
+  | Nothing => best
+  | Just index => minNat index best
+  end;
+
+def import_scan_next_index (source : String) : Nat :=
+  import_scan_min_index source "import"
+    (import_scan_min_index source "--"
+      (import_scan_min_index source "\""
+        (import_scan_min_index source "'" (prim_string_length source))));
+
+-- The gap has no quotes or comments: the forward walk consumed those first.
+-- Carry the previous code byte across comments so their punctuation cannot
+-- become a projection, while `N. -- comment\n import` remains qualified.
+def import_scan_after_projection (source : String) (cursor : Nat) (start : Nat)
+    (prior_dot : Bool) : Bool :=
+  (fix before (fuel : Nat) (pos : Nat) : Bool :=
+    match fuel with
+    | Z => prior_dot
+    | S remaining => match ltb_nat cursor pos with
+      | False => prior_dot
+      | True =>
+          let previous : Nat := sub(pos, 1) in
+          let byte : Nat := prim_string_byte_at source previous in
+          match import_scan_ws byte with
+          | True => before remaining previous
+          | False => eq_nat byte 46
+          end
+      end
+    end) (add(sub start cursor, 1)) start;
+
+def scan_source_imports (source : String)
+    : Either ImportScanError (List ScannedImport) :=
+  (fix walk (fuel : Nat) (cursor : Nat) (prior_dot : Bool)
+      (acc : List ScannedImport)
+      : Either ImportScanError (List ScannedImport) :=
+    match fuel with
+    | Z => Left ImportScanError (List ScannedImport)
+        (ImportScanFailure cursor)
+    | S remaining =>
+        match ltb_nat(cursor, prim_string_length source) with
+        | False => Right ImportScanError (List ScannedImport)
+            (reverse ScannedImport acc)
+        | True =>
+            let tail : String := import_scan_slice_from source cursor in
+            let relative : Nat := import_scan_next_index tail in
+            match eq_nat(relative, prim_string_length tail) with
+            | True => Right ImportScanError (List ScannedImport)
+                (reverse ScannedImport acc)
+            | False =>
+                let pos : Nat := add cursor relative in
+                let projected : Bool :=
+                  import_scan_after_projection source cursor pos prior_dot in
+                match qt_starts_at source pos "--" with
+                | True => walk remaining (import_scan_comment_past source pos)
+                    projected acc
+                | False => match qt_starts_quote source pos with
+                  | True => match import_scan_quote_past source pos with
+                    | Nothing => Left ImportScanError (List ScannedImport)
+                        (ImportScanFailure pos)
+                    | Just past => walk remaining past False acc
+                    end
+                  | False =>
+                      match andb(qt_at_word source pos "import",
+                          notb projected) with
+                      | False => walk remaining (add pos 1) False acc
+                      | True =>
+                          let quote : Nat := import_scan_trivia(source, add pos 6) in
+                          match import_scan_at_byte source quote 34 with
+                          | False => Left ImportScanError (List ScannedImport)
+                              (ImportScanFailure quote)
+                          | True => match import_scan_group source pos quote acc with
+                            | ImportScanBad at => Left ImportScanError (List ScannedImport)
+                                (ImportScanFailure at)
+                            | ImportScanOk past gathered =>
+                                walk remaining past False gathered
+                            end
+                          end
+                      end
+                  end
+                end
+            end
+        end
+    end) (add(prim_string_length source, 1)) 0 False (Nil ScannedImport);

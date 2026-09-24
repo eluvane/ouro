@@ -167,6 +167,19 @@ grep -F 'no selected source files' "$out/empty-scope.err" >/dev/null
 test "$unknown_status" -eq 2
 grep -F 'unknown lint option' "$out/unknown-option.err" >/dev/null
 
+# Import scanning must preserve the root lexer diagnostic in both worker modes.
+printf '%s\n' 'def text : String := "unterminated' >"$boundary/lex-malformed.ouro"
+for mode in single-file batch-files; do
+	set +e
+	"$BIN" "--$mode" "$boundary/lex-malformed.ouro" \
+		>"$out/lex-$mode.out" 2>"$out/lex-$mode.err"
+	lex_status=$?
+	set -e
+	test "$lex_status" -eq 1
+	test ! -s "$out/lex-$mode.err"
+	test "$(tr -d '\r' <"$out/lex-$mode.out")" = "$boundary/lex-malformed.ouro: lex-malformed"
+done
+
 # Directory inventory, child argv and diagnostic locations must all retain
 # UTF-8; renaming the same source cannot erase an unbound-name finding.
 unicode_dir="$boundary/каталог с пробелами"
@@ -202,7 +215,7 @@ fi
 session_lifetime=$(mktemp -d "$out/session-lifetime.XXXXXX")
 "$semantic_session" "$session_lifetime" >"$out/session-laws.out" 2>"$out/session-laws.err"
 test ! -s "$out/session-laws.err"
-test "$(grep -c '^PASS ' "$out/session-laws.out")" -eq 22
+test "$(grep -c '^PASS ' "$out/session-laws.out")" -eq 26
 if grep -q '^FAIL ' "$out/session-laws.out"; then
 	exit 1
 fi
@@ -211,7 +224,7 @@ if [ -x "${semantic_wire}.exe" ]; then
 fi
 "$semantic_wire" >"$out/session-wire-laws.out" 2>"$out/session-wire-laws.err"
 test ! -s "$out/session-wire-laws.err"
-test "$(grep -c '^PASS ' "$out/session-wire-laws.out")" -eq 18
+test "$(grep -c '^PASS ' "$out/session-wire-laws.out")" -eq 25
 if grep -q '^FAIL ' "$out/session-wire-laws.out"; then
 	exit 1
 fi

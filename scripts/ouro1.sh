@@ -303,9 +303,12 @@ case "$cmd" in
 			exit 1
 		}
 		set --
-		for u in $units; do
+		while IFS= read -r u; do
+			[ -n "$u" ] || continue
 			set -- "$@" --unit "$u"
-		done
+		done <<EOF
+$units
+EOF
 		mkdir -p "$ROOT/_build/eval"
 		emitted="$ROOT/_build/eval/wrapped.c"
 		exe="$ROOT/_build/eval/wrapped.exe"
@@ -493,15 +496,20 @@ case "$cmd" in
 		set --
 		nunits=0
 		first_unit=""
-		for u in $units; do
+		last_unit=""
+		while IFS= read -r u; do
+			[ -n "$u" ] || continue
 			nunits=$((nunits + 1))
 			[ -n "$first_unit" ] || first_unit=$u
+			last_unit=$u
 			set -- "$@" --unit "$u"
-		done
+		done <<EOF
+$units
+EOF
 		[ "$nunits" -gt 0 ] || { echo "CHECK_FAIL: empty source closure" >&2; exit 1; }
 		# The collector owns path normalization and emits the entry last.
 		# Use that spelling for root identity, including inputs with ./ segments.
-		file=$u
+		file=$last_unit
 		# Seed compile_units still turns some surface diagnostics
 		# (OURO-LIST-001) into CErr 2. A singleton closure is the
 		# compile_to_cores path and keeps the stable code.

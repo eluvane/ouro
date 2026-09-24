@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Frozen Python reference for structural quality (import-only, no CLI).
+"""Python structural-quality owner with a frozen lex/extraction oracle.
 
-This module is the pre-migration implementation of scripts/structural_quality.py,
-kept verbatim as the lex/extraction oracle for scripts/structural_lex_parity.py.
+The lex/extraction routines retain the pre-migration implementation compared by
+scripts/structural_lex_parity.py. Dependency discovery shares the host collector.
 The public entry scripts/structural_quality.py is a thin launcher plus
 compatibility re-exports; scripts/structural_quality_suite.py exercises this
 reference through those re-exports without modification.
@@ -30,6 +30,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from repo_support import write_json_atomic
+from selfhost_module_cache import quoted_import_targets
 
 KIND = "ouro.structural-quality.v1"
 SOURCE_SUFFIXES = {".ouro", ".py", ".sh", ".c", ".h", ".ml", ".mli"}
@@ -540,9 +541,7 @@ def owned_fingerprints(symbols, sources):
     imports, python_owners = {}, {}
     for path, source in sources.items():
         if path.endswith(".ouro"):
-            tokens, _ = lex(source, "ouro")
-            imports[path] = [posixpath.normpath(posixpath.join(posixpath.dirname(path), tokens[i + 1].value[1:-1]))
-                             for i, t in enumerate(tokens[:-1]) if t.value == "import" and tokens[i + 1].value.startswith('"')]
+            imports[path] = quoted_import_targets(source, path)
         elif path.endswith('.py'):
             owners = {s.name: s.key for s in by_path.get(path, {}).values()}
             for node in ast.parse(source).body:

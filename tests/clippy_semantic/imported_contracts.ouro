@@ -1,0 +1,123 @@
+-- Real compiler harvests cross nested parse arenas; summaries are rebuilt per root.
+import "../../tools/clippy/semantic_contracts.ouro",
+  "../../tools/clippy/semantic_unit.ouro",
+  "../../compiler/semantic_scope.ouro";
+
+inductive CiSnapshot : Type :=
+  | CiSnapshotOf : InternState -> CmParseCache -> CsFunctionContract -> Bool -> CiSnapshot;
+
+def ci_wrapper_source : String :=
+    "import \"target.ouro\"; def bridge (A : Type) (x : A) : A := target A x;\n";
+
+def ci_target_before : String := "def target (A : Type) (x : A) : A := x;                  \n";
+def ci_target_after : String := "def target (A : Type) (x : A) : A := let y : A := x in y;\n";
+
+def ci_empty_intern (intern : InternState) : Bool :=
+    match intern with | MkIntern names next_name strings next_string =>
+      andb (andb(nullb(Pair(List Nat, Nat), names), eq_nat next_name 1))
+        (andb(nullb(Pair(List Nat, Nat), strings), eq_nat next_string 0)) end;
+
+def ci_compact (harvest : CmHarvest) : Bool :=
+    match harvest with | MkHarvest intern symbols _ decls origins =>
+      andb (ci_empty_intern intern)
+        (andb (all ScDecl (fun (decl : ScDecl) => match sc_decl_body decl with
+          | Nothing => True | Just _ => False end) symbols)
+          (andb (nullb Decl decls)
+            (match origins with
+             | Cons fact rest => andb (nullb CsOriginFact rest) (match fact with
+               | CsOriginOf owner name origin =>
+                   andb (all ScDecl (fun (decl : ScDecl) =>
+                     andb(eq_nat(owner, sc_decl_module decl), eq_nat(name, sc_decl_name decl))) symbols)
+                     (match origin with | CsArgumentOrigin arg => eq_nat arg 1
+                      | CsUnknownOrigin => False | CsLiteralOrigin _ _ => False
+                      | CsDelegateOrigin _ _ => False end)
+               end)
+             | Nil => False end)))
+    end;
+
+def ci_cache_hit (cache : CmParseCache) (path : String) (source : String) : Bool :=
+    match cm_cache_lookup cache path source with
+    | CmCacheHit _ => True | CmCacheMiss => False | CmCacheStale => False end;
+
+def ci_analyze (intern : InternState) (cache : CmParseCache) (symbols : List ScDecl)
+    (origins : List CsOriginFact) (name : Nat) (compact : Bool) : Maybe CiSnapshot :=
+    match sc_index_sorted (quality_sort ScDecl
+        (fun (a : ScDecl) (b : ScDecl) => leb_nat(sc_decl_name a, sc_decl_name b)) symbols) with
+    | Left _ => Nothing CiSnapshot
+    | Right index => match load_intern_string(intern, prim_string_to_char_codes "caller.ouro") with
+      | MkPair entry keyed =>
+          let unit : ClippySemanticUnit := CmUnit keyed entry "" [] symbols index [] 2 origins in
+          match cm_build_apis unit index with
+          | Left _ => Nothing CiSnapshot
+          | Right apis => match cm_api_lookup name
+              (cs_cache (cs_analyze unit apis 16 8)) with
+            | Nothing => Nothing CiSnapshot
+            | Just api => Just(CiSnapshot, CiSnapshotOf keyed cache (cm_api_summary api) compact)
+            end
+          end
+      end
+    end;
+
+def ci_request (source : String) (intern : InternState) (cache : CmParseCache) : Maybe CiSnapshot :=
+    match cm_load_file_cached (MkPair String String "wrapper.ouro" ci_wrapper_source) intern cache with
+    | Left _ => Nothing CiSnapshot
+    | Right wrapper => match wrapper with | MkPair wh wc => match wh with
+      | MkHarvest wi ws _ _ wo => match ws with
+        | Nil => Nothing CiSnapshot
+        | Cons decl _ => match cm_load_file_cached (MkPair String String "target.ouro" source) wi wc with
+          | Left _ => Nothing CiSnapshot
+          | Right target => match target with | MkPair th tc => match th with
+            | MkHarvest ti ts _ _ target_origins =>
+                ci_analyze ti tc (append ScDecl ws ts) (append CsOriginFact wo target_origins)
+                  (sc_decl_name decl)
+                  (andb (all ScDecl (fun (item : ScDecl) => match sc_decl_body item with
+                    | Nothing => True | Just _ => False end) (append ScDecl ws ts))
+                    (match cm_cache_lookup tc "target.ouro" ci_target_before with
+                     | CmCacheHit stored => ci_compact stored
+                     | CmCacheMiss => False | CmCacheStale => False end))
+            end end
+          end
+        end
+      end end
+    end;
+
+def ci_identity_summary (summary : CsFunctionContract) : Bool :=
+    andb (cs_pure summary) (match cs_result summary with
+      | CsArgumentResult position => eq_nat position 1
+      | CsUnknownResult => False | CsRequiredResult => False | CsSourceResult => False
+      | CsSuccessResult => False | CsFailureResult => False | CsPolicyResult => False end);
+
+-- The wrapper's bytes and delegate ID stay unchanged. Only its callee changes,
+-- with equal source length, so a cached completed contract would be unsound.
+def ci_cache_law : Bool :=
+    match ci_request ci_target_before empty_intern cm_cache0 with
+    | Nothing => False
+    | Just cold => match cold with | CiSnapshotOf intern cache summary compact =>
+      andb (andb(compact, ci_identity_summary summary))
+        (match cm_load_file (MkPair String String "unrelated.ouro"
+            "def unrelated (B : Type) (fresh : B) : B := fresh;\n") intern with
+         | Left _ => False
+         | Right unrelated => match unrelated with | MkHarvest grown _ _ _ _ =>
+           andb (ci_cache_hit cache "wrapper.ouro" ci_wrapper_source)
+             (match ci_request ci_target_before grown cache with
+              | Nothing => False
+              | Just warm => match warm with | CiSnapshotOf updated reused completed kept =>
+                andb (andb(kept, ci_identity_summary completed))
+                  (andb (ci_cache_hit reused "wrapper.ouro" ci_wrapper_source)
+                    (match ci_request ci_target_after updated reused with
+                     | Nothing => False
+                     | Just edited => match edited with | CiSnapshotOf _ next rejected _ =>
+                       andb (notb (cs_complete rejected))
+                         (andb (notb (cs_pure rejected))
+                           (andb (ci_cache_hit next "wrapper.ouro" ci_wrapper_source)
+                             (andb (ci_cache_hit next "target.ouro" ci_target_after)
+                               (eq_nat (prim_string_length ci_target_before)
+                                 (prim_string_length ci_target_after)))))
+                       end
+                     end))
+                end
+              end)
+           end
+         end)
+      end
+    end;

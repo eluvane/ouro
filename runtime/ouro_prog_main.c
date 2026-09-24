@@ -43,6 +43,10 @@ int main(int argc, char **argv)
 	int i;
 	int n = ouro_export_count();
 	ouro_v *entry = 0;
+	if (!ouro_host_utf8_argv(&argc, &argv)) {
+		fputs("ouro run: invalid Windows command line\n", stderr);
+		return 73;
+	}
 	ouro_reserve_native_stack();
 	ouro_io_set_argv(argc, argv);
 	for (i = 0; i < n; i++) {

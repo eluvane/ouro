@@ -31,8 +31,9 @@ def run_suite(driver: Path, output: Path, mode: str):
         families = matched.group(1)
         assert len(families.split(b",")) == len(set(families.split(b","))), "duplicate families"
 
-    def run(name, path, *, content=None, invalid_nul=False):
-        arguments = (["--read-nul-path" if invalid_nul else "--read-file", str(path)] if mode == "raw"
+    def run(name, path, *, content=None, invalid_nul=False, invalid_utf8=False):
+        command = "--read-invalid-utf8-path" if invalid_utf8 else "--read-nul-path" if invalid_nul else "--read-file"
+        arguments = ([command, str(path)] if mode == "raw"
                      else ["--strict", "--enable-all", "--scope", str(path)])
         result = subprocess.run([str(driver), *arguments], cwd=ROOT, env=environment,
                                 capture_output=True, timeout=90)
@@ -67,6 +68,32 @@ def run_suite(driver: Path, output: Path, mode: str):
         run("empty-path", "")
         if mode == "raw":
             run("nul-path", source, invalid_nul=True)
+            arguments = ["", "plain", "two words", 'quote"inside', "back\\slash", "ends\\", "путь 漢字 🧪"]
+            result = subprocess.run([str(driver), "--host-arguments", *arguments], cwd=ROOT,
+                                    env=environment, capture_output=True, timeout=30)
+            assert result.returncode == 0 and not result.stderr, result
+            assert result.stdout == b"".join(value.encode("utf-8") + b"\0" for value in arguments), result
+            rows.append(dict(name="host-arguments", exit=0, status="pass"))
+            unicode_directory = directory / "каталог 漢字 🧪"
+            unicode_directory.mkdir()
+            unicode_source = unicode_directory / "путь \u0441 пробелами.ouro"
+            unicode_content = b"unicode source\0bytes\xff\n"
+            unicode_source.write_bytes(unicode_content)
+            run("unicode-path", unicode_source, content=unicode_content)
+            if os.name == "nt":
+                run("malformed-utf8-path", unicode_source, invalid_utf8=True)
+                for name, path, command, expected in (
+                    ("unicode-file-info", unicode_source, "--path-info", b"exists=1 directory=0\n"),
+                    ("unicode-directory-info", unicode_directory, "--path-info", b"exists=1 directory=1\n"),
+                    ("unicode-missing-info", unicode_directory / "absent", "--path-info", b"exists=0 directory=0\n"),
+                    ("nul-path-info", unicode_source, "--path-info-nul", b"exists=0 directory=0\n"),
+                    ("malformed-utf8-info", unicode_source, "--path-info-invalid-utf8", b"exists=0 directory=0\n"),
+                ):
+                    result = subprocess.run([str(driver), command, str(path)], cwd=ROOT, env=environment,
+                                            capture_output=True, timeout=30)
+                    assert result.returncode == 0 and not result.stderr, (name, result)
+                    assert result.stdout.replace(b"\r\n", b"\n") == expected, (name, result)
+                    rows.append(dict(name=name, exit=0, status="pass"))
         if os.name == "nt":
             windows = WindowsMetadata()
             lock = windows.open(str(source), 0x80000000, 0, None, 3, 0x80, None)

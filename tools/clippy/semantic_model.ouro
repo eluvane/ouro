@@ -1,36 +1,42 @@
 -- Compact shared semantic facts. No source strings, Expr clones or ASTs are
 -- stored in facts. Value aliases share an identity; lexical binders do not.
-import "semantic_contracts.ouro";
-import "semantic_proof.ouro";
-import "structural_rules.ouro";
-import "structural_model.ouro";
-import "../../std/natx.ouro";
-import "../../compiler/semantic_scope.ouro";
+import "semantic_contracts.ouro",
+  "semantic_proof.ouro",
+  "structural_rules.ouro",
+  "structural_model.ouro",
+  "../../std/natx.ouro",
+  "../../compiler/semantic_scope.ouro";
 
 -- Values: 0 unknown, 1 local value, 2 global value, 3 Nat, 4 String,
 -- 5 small list, 6 call result, 7 failure, 8 success, 9 lambda, 10 recursion.
 -- 14 must-observe checked result. Its ID is the producer, shared by aliases.
 -- An IO wrapper is not an executed result; obligations activate on execution.
 inductive CmValue : Type :=
-  | CmValueOf : Nat -> Nat -> Nat -> Bool -> Bool -> Bool -> CmValue;
+  | CmValueOf : Nat -> Nat -> Nat -> Bool -> Bool -> Bool -> CmValue
+  | CmPureIO : CmValue -> CmValue;
 
-def cm_value_kind (item : CmValue) : Nat :=
-    match item with | CmValueOf value _ _ _ _ _ => value end;
+def cm_value_kind : CmValue -> Nat :=
+  fix go (item : CmValue) : Nat :=
+    match item with | CmValueOf value _ _ _ _ _ => value | CmPureIO payload => go payload end;
 
-def cm_value_id (item : CmValue) : Nat :=
-    match item with | CmValueOf _ value _ _ _ _ => value end;
+def cm_value_id : CmValue -> Nat :=
+  fix go (item : CmValue) : Nat :=
+    match item with | CmValueOf _ value _ _ _ _ => value | CmPureIO payload => go payload end;
 
-def cm_value_result (item : CmValue) : Nat :=
-    match item with | CmValueOf _ _ value _ _ _ => value end;
+def cm_value_result : CmValue -> Nat :=
+  fix go (item : CmValue) : Nat :=
+    match item with | CmValueOf _ _ value _ _ _ => value | CmPureIO payload => go payload end;
 
 def cm_value_io (item : CmValue) : Bool :=
-    match item with | CmValueOf _ _ _ value _ _ => value end;
+    match item with | CmValueOf _ _ _ value _ _ => value | CmPureIO _ => True end;
 
-def cm_value_taint (item : CmValue) : Bool :=
-    match item with | CmValueOf _ _ _ _ value _ => value end;
+def cm_value_taint : CmValue -> Bool :=
+  fix go (item : CmValue) : Bool :=
+    match item with | CmValueOf _ _ _ _ value _ => value | CmPureIO payload => go payload end;
 
-def cm_value_constant (item : CmValue) : Bool :=
-    match item with | CmValueOf _ _ _ _ _ value => value end;
+def cm_value_constant : CmValue -> Bool :=
+  fix go (item : CmValue) : Bool :=
+    match item with | CmValueOf _ _ _ _ _ value => value | CmPureIO payload => go payload end;
 
 def cm_unknown (id : Nat) : CmValue := CmValueOf 0 id 0 False False False;
 def cm_local_value (id : Nat) (result : Nat) : CmValue :=
@@ -40,13 +46,17 @@ def cm_value_key (value : CmValue) : String :=
       (prim_string_concat ":" (prim_string_concat (prim_string_of_nat (cm_value_id value))
         (prim_string_concat ":" (prim_string_concat (prim_string_of_nat (cm_value_result value))
           (match cm_value_io value with | True => ":io" | False => ":value" end)))));
-def cm_unwrap_io (value : CmValue) : CmValue :=
-    match value with | CmValueOf kind id result _ taint constant =>
-      CmValueOf kind id result False taint constant end;
+-- Only a proven io_pure preserves its payload. Replaying an opaque action
+-- produces a fresh value and, when checked, a separate observation obligation.
+def cm_unwrap_io (node : Nat) (value : CmValue) : CmValue :=
+    match value with
+    | CmPureIO payload => payload
+    | CmValueOf kind _ result _ taint _ =>
+        CmValueOf (match eq_nat kind 14 with | True => 14 | False => 1 end)
+          node result False taint False
+    end;
 
-def cm_as_io (value : CmValue) : CmValue :=
-    match value with | CmValueOf kind id result _ taint constant =>
-      CmValueOf kind id result True taint constant end;
+def cm_as_io (value : CmValue) : CmValue := CmPureIO value;
 
 inductive ClippyBindingFact : Type :=
   | CmBinding : Nat -> Nat -> CmValue -> ClippyBindingFact;
@@ -113,31 +123,53 @@ inductive CmEvent : Type :=
   | CmFinding : CmSemanticProof -> CmEvent
   | CmToken : Nat -> Nat -> CmEvent;
 
+-- The last two fields are the innermost enclosing token span and the span
+-- recorded for each ordinal allocated inside one.
 inductive CmState : Type :=
-  | CmStateOf : Nat -> Nat -> List CmEvent -> CmState;
+  | CmStateOf : Nat -> Nat -> List CmEvent -> Maybe (Pair Nat Nat)
+      -> List (Pair Nat (Pair Nat Nat)) -> CmState;
+
+def cm_state0 : CmState :=
+    CmStateOf(1, 0, Nil CmEvent, Nothing (Pair Nat Nat), Nil (Pair(Nat, Pair Nat Nat)));
 
 def cm_fresh (item : CmState) : Nat :=
-    match item with | CmStateOf value _ _ => value end;
+    match item with | CmStateOf value _ _ _ _ => value end;
 
 def cm_epoch (item : CmState) : Nat :=
-    match item with | CmStateOf _ value _ => value end;
+    match item with | CmStateOf _ value _ _ _ => value end;
 
 def cm_events (item : CmState) : List CmEvent :=
-    match item with | CmStateOf _ _ value => value end;
+    match item with | CmStateOf _ _ value _ _ => value end;
+
+def cm_span (item : CmState) : Maybe (Pair Nat Nat) :=
+    match item with | CmStateOf _ _ _ value _ => value end;
+
+def cm_node_spans (item : CmState) : List (Pair Nat (Pair Nat Nat)) :=
+    match item with | CmStateOf _ _ _ _ value => value end;
+
+def cm_with_span (span : Maybe (Pair Nat Nat)) (state : CmState) : CmState :=
+    match state with | CmStateOf fresh epoch events _ table => CmStateOf fresh epoch events span table end;
 
 def cm_event (event : CmEvent) (state : CmState) : CmState :=
-    match state with | CmStateOf fresh epoch events =>
-      CmStateOf fresh epoch (Cons CmEvent event events) end;
+    match state with | CmStateOf fresh epoch events span table =>
+      CmStateOf fresh epoch (Cons CmEvent event events) span table end;
 def cm_next (state : CmState) : CmState :=
-    match state with | CmStateOf fresh epoch events => CmStateOf (add fresh 1) epoch events end;
+    match state with | CmStateOf fresh epoch events span table =>
+      CmStateOf (add fresh 1) epoch events span
+        (match span with
+         | Nothing => table
+         | Just range => Cons(Pair(Nat, Pair Nat Nat), MkPair Nat (Pair Nat Nat) fresh range, table)
+         end) end;
 def cm_barrier (state : CmState) : CmState :=
-    match state with | CmStateOf fresh epoch events => CmStateOf fresh (add epoch 1) events end;
+    match state with | CmStateOf fresh epoch events span table => CmStateOf fresh (add epoch 1) events span table end;
+def cm_io_barrier (value : CmValue) (state : CmState) : CmState :=
+    match value with | CmPureIO _ => state | CmValueOf _ _ _ _ _ _ => cm_barrier state end;
 def cm_token (alpha : Nat) (exact : Nat) (state : CmState) : CmState :=
-    cm_event (CmToken alpha exact) state;
+    cm_event(CmToken alpha exact, state);
 def cm_tag (tag : Nat) (state : CmState) : CmState := cm_token tag tag state;
 def cm_finding (proof : CmSemanticProof) (state : CmState) : CmState :=
     match cm_proof_valid proof with
-    | True => cm_event (CmFinding proof) state | False => state end;
+    | True => cm_event(CmFinding proof, state) | False => state end;
 
 inductive CmContext : Type :=
   | CmContextOf : ScDecl -> List ClippyBindingFact -> Nat -> Bool -> Maybe Nat -> Bool -> Bool -> Nat -> CmContext;
@@ -174,7 +206,7 @@ def cm_binding_lookup (name : Nat) : List ClippyBindingFact -> Maybe ClippyBindi
   fix go (env : List ClippyBindingFact) : Maybe ClippyBindingFact :=
     match env with
     | Nil => Nothing ClippyBindingFact
-    | Cons binding rest => match eq_nat name (cm_binding_name binding) with
+    | Cons binding rest => match eq_nat(name, cm_binding_name binding) with
       | True => Just ClippyBindingFact binding
       | False => go rest
       end
@@ -187,8 +219,8 @@ def cm_bind (name : Nat) (value : CmValue) (ctx : CmContext) (state : CmState)
     let id : Nat := cm_fresh state in
     let binding : ClippyBindingFact := CmBinding name id value in
     MkPair CmContext CmState
-      (cm_context_env ctx (Cons ClippyBindingFact binding (cm_env ctx)))
-      (cm_event (CmBindEvent binding) (cm_token id name (cm_next state)));
+      (cm_context_env(ctx, Cons ClippyBindingFact binding (cm_env ctx)))
+      (cm_event(CmBindEvent binding, cm_token id name (cm_next state)));
 
 def cm_bind_names : List Nat -> Bool -> CmContext -> CmState -> Pair CmContext CmState :=
   fix go (names : List Nat) (taint : Bool) (ctx : CmContext) (state : CmState)
@@ -203,15 +235,15 @@ def cm_bind_names : List Nat -> Bool -> CmContext -> CmState -> Pair CmContext C
     end;
 
 def cm_checked (value : CmValue) : Bool :=
-    andb (eq_nat (cm_value_kind value) 14)
-      (andb (eq_nat (cm_value_result value) 1) (notb (cm_value_io value)));
+    andb (eq_nat(cm_value_kind value, 14))
+      (andb(eq_nat(cm_value_result value, 1), notb (cm_value_io value)));
 
 def cm_args_key (arguments : List CmValue) : String :=
     (fix go (args : List CmValue) (out : String) : String :=
       match args with
       | Nil => out
       | Cons value rest => go rest (prim_string_concat out
-          (prim_string_concat ";" (cm_value_key value)))
+          (prim_string_concat(";", cm_value_key value)))
       end) arguments "";
 
 def cm_args_dynamic (arguments : List CmValue) : Bool :=
@@ -237,21 +269,21 @@ def cm_type_annotation (unit : ClippySemanticUnit) (ctx : CmContext) (ty : Maybe
 def cm_variable (unit : ClippySemanticUnit) (apis : CmApiIndex)
     (ctx : CmContext) (name : Nat) (state : CmState)
     : Either QualityInputError (Pair CmValue CmState) :=
-    match cm_binding_lookup name (cm_env ctx) with
+    match cm_binding_lookup(name, cm_env ctx) with
     | Just binding => Right QualityInputError (Pair CmValue CmState)
         (MkPair CmValue CmState (cm_binding_value binding)
           (cm_event (CmUseEvent (cm_binding_id binding))
-            (cm_token (cm_binding_id binding) name (cm_tag 101 state))))
+            (cm_token(cm_binding_id binding, name, cm_tag 101 state))))
     | Nothing => match cm_api_lookup name apis with
       | Nothing => Left QualityInputError (Pair CmValue CmState)
-          (QualityInvalidInput (prim_string_concat "unresolved executable declaration: " (cm_name (cm_intern unit) name)))
+          (QualityInvalidInput (prim_string_concat("unresolved executable declaration: ", cm_name(cm_intern unit, name))))
       | Just api => Right QualityInputError (Pair CmValue CmState)
           (MkPair CmValue CmState
             (CmValueOf 2 name
-              (match eq_nat (cm_api_arity api) 0 with
-               | True => mod_nat (cm_api_result api) 10 | False => 0 end)
-              (andb (eq_nat (cm_api_arity api) 0) (leb_nat 10 (cm_api_result api))) False True)
-            (cm_tag name (cm_tag 102 state)))
+              (match eq_nat(cm_api_arity api, 0) with
+               | True => mod_nat(cm_api_result api, 10) | False => 0 end)
+              (andb(eq_nat(cm_api_arity api, 0), leb_nat(10, cm_api_result api))) False True)
+            (cm_tag(name, cm_tag 102 state)))
       end
     end;
 
@@ -273,15 +305,15 @@ def cm_context_subject (ctx : CmContext) (value : CmValue) : CmContext :=
 def cm_context_pattern (ctx : CmContext) (role : Nat) : CmContext :=
     match ctx with | CmContextOf owner env branch outer self policy subject epoch =>
       CmContextOf owner env branch
-        (match andb subject (eq_nat role 11) with
-         | True => False | False => orb outer (andb subject (eq_nat role 10)) end)
+        (match andb(subject, eq_nat role 11) with
+         | True => False | False => orb(outer, andb(subject, eq_nat role 10)) end)
         self policy False epoch end;
 
 -- Observation/escape belongs to VALUE identity, never to a binder spelling.
 def cm_observe (kind : Nat) (node : Nat) (value : CmValue) (state : CmState) : CmState :=
-    match eq_nat (cm_value_kind value) 14 with
+    match eq_nat(cm_value_kind value, 14) with
     | False => state
-    | True => cm_event (CmFlowEvent (CmFlow node kind (cm_value_id value))) state
+    | True => cm_event(CmFlowEvent (CmFlow node kind (cm_value_id value)), state)
     end;
 
 def cm_execute (node : Nat) (value : CmValue) (state : CmState) : CmState :=
@@ -300,8 +332,8 @@ def cm_context_failure_epoch (ctx : CmContext) (epoch : Nat) : CmContext :=
       CmContextOf owner env branch error self policy subject epoch end;
 
 def cm_unrecovered_error (ctx : CmContext) (state : CmState) : Bool :=
-    andb (cm_error_arm ctx) (eq_nat (cm_error_epoch ctx) (cm_epoch state));
+    andb(cm_error_arm ctx, eq_nat(cm_error_epoch ctx, cm_epoch state));
 
 -- An identity for an unavailable value is not an equivalence proof.
 def cm_value_known (value : CmValue) : Bool :=
-    notb (eq_nat (cm_value_kind value) 0);
+    notb (eq_nat(cm_value_kind value, 0));

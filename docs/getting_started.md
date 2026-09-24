@@ -1,11 +1,3 @@
-<p align="center">
-  <img
-    width="100%"
-    src="https://capsule-render.vercel.app/api?type=waving&amp;height=220&amp;color=0:0B1220,50:1E1B4B,100:4F46E5&amp;text=START&amp;fontColor=E2E8F0&amp;fontSize=54&amp;fontAlignY=50"
-    alt="START banner"
-  />
-</p>
-
 # Getting started
 
 This guide takes a fresh checkout to a checked module, an evaluated expression,
@@ -31,19 +23,9 @@ From the repository root:
 sh scripts/bootstrap.sh
 ```
 
-This builds the committed C bootstrap path into `_build/c/`.
-`scripts/ouro1.sh` selects and rebuilds the required binaries for each command,
-so use it instead of invoking files under `_build/` directly.
-
-The Python build driver exposes the same project configuration. Defaults live
-in `Ouro.seal` under the `build` and `cache` blocks; CLI and environment
-overrides still win. See [Packages](pkg.md) for the seal form.
-
-```sh
-python3 scripts/ouro_build.py config show
-python3 scripts/ouro_build.py build
-sh scripts/coil.sh config show
-```
+The command builds the current bootstrap toolchain. Use `scripts/ouro1.sh` for
+the steps below; [Build and bootstrap](build.md#entry-points) owns the build
+driver, configuration, cache, and host requirements.
 
 ## Check a module
 
@@ -88,59 +70,30 @@ sh scripts/ouro1.sh build samples/demo/01_hello.ouro
 sh scripts/ouro1.sh run samples/demo/01_hello.ouro
 ```
 
-`ouro1 build` / `ouro1 run` lower through the compiler-owned checker and the
-native PE backend. `legacy-c` is rejected. The other `samples/demo/` programs
-(`02_io_echo`, `03_do_bind`, `04_pure_handler`, `05_effect_handler`) use the
-same command; echo-style samples read one stdin line. File, argv, and
-environment programs use the same native PE path. The C-hosted
-`scripts/build_tool.sh` path still exists for emitting repository tools; it is
-not the program compile command.
+The other programs in `samples/demo/` use the same command; echo-style samples
+read one stdin line. [Tooling](tooling.md#native-program-compile) documents
+build options and the native target.
 
 ## Format, test, and document code
 
 ```sh
 sh scripts/ouro1.sh fmt --check samples/demo/01_hello.ouro
 sh scripts/ouro1.sh test samples/examples/test_demo.ouro
-sh scripts/ouro1.sh doc --out _build/api std/io.ouro
 ```
 
 The repository also provides analyzers, a linter, a local package manager, an
 experimental language server, and a VS Code extension. See
-[Tooling](tooling.md) and [Packages](pkg.md).
+[Tooling](tooling.md), including the [documentation generator](tooling.md#documentation-generator),
+and [Packages](pkg.md).
 
 ## Learn the language
 
-The tutorial sequence is:
-
-1. `samples/tutorial/01_hello.ouro`
-2. `samples/tutorial/02_nat.ouro`
-3. `samples/tutorial/03_list.ouro`
-4. `samples/tutorial/04_holes.ouro`
-5. `samples/tutorial/05_fix.ouro`
-6. `samples/tutorial/06_effects.ouro`
-
-Continue with the [syntax reference](syntax.md), the
+Continue with the [tutorial sequence](../samples/tutorial/README.md),
+[syntax reference](syntax.md), the
 [example gallery](../samples/examples/README.md), and the generated
 [standard-library API](api/README.md).
 
 ## Compiler checking development
 
-Run the complete compiler laws and focused checking profile:
-
-```sh
-sh scripts/test_suite.sh --compiler-checking
-python3 scripts/ci_gate.py --profile kernel --out _build/ci/kernel
-```
-
-The profile name is retained for command compatibility. Its required checks
-exercise the compiler-owned Ouro implementation. Read
-[Compiler checking](kernel_design.md) and [Contributing](../CONTRIBUTING.md)
-before changing its rules.
-
-<p align="center">
-  <img
-    width="100%"
-    src="https://capsule-render.vercel.app/api?type=waving&amp;height=220&amp;color=0:0B1220,50:1E1B4B,100:4F46E5&amp;section=footer"
-    alt=""
-  />
-</p>
+For compiler work, read [Compiler checking](kernel_design.md) and use the
+focused checks in [CI](ci.md#local-profiles).
