@@ -144,6 +144,25 @@ class HarnessTests(unittest.TestCase):
             self.assertEqual(collect_units(entry.relative_to(ROOT).as_posix()),
                              [dependency.relative_to(ROOT).as_posix(), entry.relative_to(ROOT).as_posix()])
 
+    def test_constructor_inventory_ignores_comment_and_string_delimiters(self):
+        from ourosmith.surface import inventory
+
+        source = ('-- inductive Expr : Type := | CommentFake : Expr;\n'
+                  'def text : String := "inductive Expr : Type := | StringFake : Expr;";\n'
+                  'inductive Expr : Type :=\n'
+                  '  | EVar : Nat -> Expr\n'
+                  '  -- a delimiter inside a comment; | Fake : Expr;\n'
+                  '  | ESpan : Nat -> Nat -> Expr -> Expr;\n'
+                  'inductive Other : Type := | OtherValue : Other;\n')
+        with tempfile.TemporaryDirectory(dir=ROOT / "_build") as directory:
+            root = Path(directory)
+            (root / "ast.ouro").write_text(source, encoding="utf-8")
+            with patch.object(inventory, "ROOT", root):
+                self.assertEqual(inventory.constructors("ast.ouro", "Expr"), ["EVar", "ESpan"])
+                self.assertEqual(inventory.constructors("ast.ouro", "Other"), ["OtherValue"])
+                with self.assertRaisesRegex(ValueError, "cannot extract Missing"):
+                    inventory.constructors("ast.ouro", "Missing")
+
     def test_source_parser_uses_bootstrap_components(self):
         from frontend_regen import collect_units
         from ourosmith.surface.inventory import constructors

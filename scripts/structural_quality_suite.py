@@ -351,6 +351,49 @@ class StructuralContracts(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'escapes'):
                 sq.analyze(root)
 
+    def test_semantic_fixture_manifest_preserves_production_and_unlisted_checks(self):
+        with tempfile.TemporaryDirectory(prefix='ouro-structural-') as directory:
+            root = Path(directory)
+            subprocess.run(['git', 'init', '-q', str(root)], check=True)
+            corpus = root / 'tests/clippy_semantic'
+            (corpus / 'fixtures').mkdir(parents=True)
+            (root / 'tools').mkdir()
+            selected = 'tests/clippy_semantic/fixtures/selected.ouro'
+            others = ['tools/owner.ouro', 'tests/clippy_semantic/laws.ouro',
+                      'tests/clippy_semantic/fixtures/unlisted.ouro']
+            source = ('def compute (value : Nat) : Nat := match value with '
+                      '| Z => 0 | S smaller => add smaller 4 end;\n')
+            for path in [selected, *others]:
+                (root / path).write_text(source)
+            manifest = corpus / 'cases.json'
+            data = {'kind': 'ouro.clippy-semantic-precision.v1',
+                    'cases': [{'path': selected, 'codes': []}]}
+            manifest.write_text(json.dumps(data))
+
+            report = sq.analyze(root)
+            self.assertTrue(report['complete'], report['issues'])
+            rows = {row['path']: row for row in report['files']}
+            self.assertEqual(rows[selected]['boundary'],
+                             {'kind': 'fixture-input', 'owner': 'tests/clippy_semantic/cases.json'})
+            self.assertGreater(rows[selected]['symbols'], 0)
+            for path in others:
+                self.assertIsNone(rows[path]['boundary'])
+            clones = [finding for finding in report['findings'] if finding['rule_id'] == DUP]
+            self.assertEqual(len(clones), 1)
+            self.assertEqual(set(clones[0]['members']), {path + '#compute' for path in others})
+            self.assertFalse(report['pass'])
+
+            (root / selected).write_text('def broken := "unterminated')
+            self.assertFalse(sq.analyze(root)['complete'])
+            (root / selected).write_text(source)
+            for path, error in [('tests/clippy_semantic/fixtures/missing.ouro', 'missing'),
+                                ('tools/owner.ouro', 'escapes'), (None, 'invalid fixture path')]:
+                with self.subTest(path=path):
+                    data['cases'][0]['path'] = path
+                    manifest.write_text(json.dumps(data))
+                    with self.assertRaisesRegex(ValueError, error):
+                        sq.analyze(root)
+
     def test_malformed_report_is_rejected(self):
         report = scan({'a.py': declaration('first')})
         sq.validate_report(report)

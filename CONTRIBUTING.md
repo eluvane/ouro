@@ -49,7 +49,7 @@ schemas need review against the applicable [architecture](docs/architecture.md),
 
 ## Opening a pull request
 
-Use the official [eluvane/ouro-dev repository](https://github.com/eluvane/ouro-dev).
+Use the official [eluvane/ouro repository](https://github.com/eluvane/ouro).
 Explain the change and reason, give concrete reproduction and validation
 results, and identify material compatibility, trust, or release impact. Keep
 unrelated cleanup and local build output out of the diff. [CI](docs/ci.md)

@@ -83,6 +83,12 @@ Development changes; see the [compatibility policy](docs/stability.md).
 
 ### Fixed
 
+- Recognize manifest-owned Clippy precision fixtures in the structural gate,
+  retaining extraction, path confinement, and checks on unlisted sources.
+- Cover `ESpan` in OuroSmith parser observations and keep comment delimiters
+  from truncating the constructor inventory.
+- Repair identical duplicate import aliases before collecting a fixer's root
+  dependencies; retain compiler verification and reject conflicting aliases.
 - Recompute composed Clippy contracts against each root's dependencies and
   retain imported-wrapper origins across cache hits.
 - Resolve transitive runtime platform imports with explicit missing-file and

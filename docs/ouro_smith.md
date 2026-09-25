@@ -46,7 +46,9 @@ nested-recursion witness. String signatures also exercise concatenation with
 distinct, nonempty operands, independently of random term selection.
 
 The source inventory is extracted from constructor tables, tokens, diagnostics,
-and canonical checker error classes. `quality/smith/strategies.json` maps these items to
+and canonical checker error classes. Constructor extraction ignores comments and
+string literals, including embedded declaration delimiters.
+`quality/smith/strategies.json` maps these items to
 generators, negative cases, properties, or explicit exceptions. A full-profile
 run checks both the registry and executed coverage. Regenerate the registry
 after implementing a strategy:
