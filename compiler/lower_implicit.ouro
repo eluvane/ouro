@@ -1,0 +1,140 @@
+-- Opt-in constructor arguments are inserted before ordinary checked applications.
+
+import "lower_support.ouro";
+
+inductive ImplicitCtorResult : Type :=
+  | NoMarkedCtor : ImplicitCtorResult
+  | MarkedCtorWithoutHint : ImplicitCtorResult
+  | InferredCtor : Surface -> ImplicitCtorResult;
+
+-- Collect the whole left-associated application before deciding whether an
+-- argument is explicit or an omitted parameter's value.
+def implicit_app_head (fuel : Nat) (term : Expr)
+    : Maybe (Pair Nat (List Expr)) :=
+  (fix go (remaining : Nat) (part : Expr) (args : List Expr)
+      : Maybe (Pair Nat (List Expr)) :=
+    match remaining with
+    | Z => Nothing (Pair Nat (List Expr))
+    | S next =>
+        match part with
+        | ESpan _ _ inner => go next inner args
+        | EApp function argument => go next function (Cons Expr argument args)
+        | EVar name => Just (Pair Nat (List Expr)) (MkPair Nat (List Expr) name args)
+        | _ => Nothing (Pair Nat (List Expr))
+        end
+    end) fuel term (Nil Expr);
+
+def implicit_ctor_head (fuel : Nat) (env : LowerEnv) (fixSelf : Maybe Nat)
+    (locals : List (Pair Nat Surface)) (term : Expr)
+    : Maybe (Pair CtorInfo (List Expr)) :=
+  match implicit_app_head fuel term with
+  | Nothing => Nothing (Pair CtorInfo (List Expr))
+  | Just spine =>
+      match spine with
+      | MkPair name args =>
+          match resolve_var_fix env fixSelf locals name with
+          | SConstruct family index nparams =>
+              match lookup_ctor(name, env_ctors env) with
+              | Nothing => Nothing (Pair CtorInfo (List Expr))
+              | Just ctor =>
+                  match andb(eqNat family (ctor_indId ctor),
+                        andb(eqNat index (ctor_idx ctor),
+                          eqNat nparams (ctor_nparams ctor))) with
+                  | False => Nothing (Pair CtorInfo (List Expr))
+                  | True => Just (Pair CtorInfo (List Expr))
+                      (MkPair CtorInfo (List Expr) ctor args)
+                  end
+              end
+          | _ => Nothing (Pair CtorInfo (List Expr))
+          end
+      end
+  end;
+
+def implicit_expected_prefix (locals : List (Pair Nat Surface)) (er : Maybe Surface)
+    (ctor : CtorInfo) : Maybe (List Surface) :=
+  match er with
+  | Nothing => Nothing (List Surface)
+  | Just expected =>
+      match surface_hint_has_placeholder locals fuel1k expected with
+      | True => Nothing (List Surface)
+      | False =>
+          match peel_ind_apps expected with
+          | Nothing => Nothing (List Surface)
+          | Just family_args =>
+              match family_args with
+              | MkPair family args =>
+                  match andb(eqNat family (ctor_indId ctor),
+                        eqNat(length Surface args, ctor_nparams ctor)) with
+                  | False => Nothing (List Surface)
+                  | True => Just (List Surface)
+                      (take Surface (ctor_implicit_prefix ctor) args)
+                  end
+              end
+          end
+      end
+  end;
+
+def implicit_apply_surfaces (head : Surface) (args : List Surface) : Surface :=
+  (fix go (rest : List Surface) (term : Surface) : Surface :=
+    match rest with
+    | Nil => term
+    | Cons argument tail => go tail (SApp term argument)
+    end) args head;
+
+def implicit_apply_exprs
+    (lower_run : Nat -> LowerEnv -> Maybe Surface -> Maybe Nat ->
+      List (Pair Nat Surface) -> LowerMode -> LowerVal)
+    (fuel : Nat) (env : LowerEnv) (fixSelf : Maybe Nat)
+    (locals : List (Pair Nat Surface))
+    (head : Surface) (args : List Expr) : Surface :=
+  (fix go (rest : List Expr) (function : Surface) : Surface :=
+    match rest with
+    | Nil => function
+    | Cons argument tail =>
+        let expected : Maybe Surface :=
+          surface_argument_expected env locals function in
+        let value : Surface :=
+          vsurf_or_hole
+            (lower_run fuel env expected fixSelf locals (LExpr argument)) in
+        go tail (SApp function value)
+    end) args head;
+
+def lower_implicit_constructor
+    (lower_run : Nat -> LowerEnv -> Maybe Surface -> Maybe Nat ->
+      List (Pair Nat Surface) -> LowerMode -> LowerVal)
+    (fuel : Nat) (env : LowerEnv) (er : Maybe Surface)
+    (fixSelf : Maybe Nat) (locals : List (Pair Nat Surface))
+    (term : Expr) : ImplicitCtorResult :=
+  match er with
+  | Nothing => NoMarkedCtor
+  | Just _ =>
+      match implicit_ctor_head fuel env fixSelf locals term with
+      | Nothing => NoMarkedCtor
+      | Just head =>
+          match head with
+          | MkPair ctor args =>
+              let marked : Nat := ctor_implicit_prefix ctor in
+              match orb(eqNat marked Z, ltb_nat(ctor_nparams ctor, marked)) with
+              | True => NoMarkedCtor
+              | False =>
+                  match implicit_expected_prefix locals er ctor with
+                  | Nothing => MarkedCtorWithoutHint
+                  | Just prefix =>
+                      let explicit_arity : Nat :=
+                        sub(add(ctor_nparams ctor, ctor_arity ctor), marked) in
+                      match eqNat(length Expr args, explicit_arity) with
+                      | False => MarkedCtorWithoutHint
+                      | True =>
+                          let start : Surface :=
+                            implicit_apply_surfaces
+                              (SConstruct(ctor_indId ctor, ctor_idx ctor,
+                                ctor_nparams ctor)) prefix in
+                          InferredCtor
+                            (implicit_apply_exprs lower_run fuel env fixSelf locals
+                              start args)
+                      end
+                  end
+              end
+          end
+      end
+  end;
