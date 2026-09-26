@@ -75,6 +75,10 @@ Development changes; see the [compatibility policy](docs/stability.md).
 
 ### Changed
 
+- Imported record updates resolve simple field type annotations in the record
+  declaration's import scope, including local type aliases, selected renames,
+  and qualified imported types. Caller aliases cannot rebind those annotations;
+  hidden record members remain inaccessible.
 - A selective import hides unlisted bare, qualified, opened, and record-generated
   names while the compiler still checks every imported declaration and body.
   Repeating one canonical import with conflicting selectors is an error.

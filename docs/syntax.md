@@ -507,13 +507,18 @@ literal ascription such as `({ x := Z, y := Z } : Point)` supplies the expected
 nominal type for its own value. That type does not flow into unrelated function
 arguments. Updates without a known nominal result type and dependent record
 fields remain unsupported.
-For an imported record, an updated field's temporary type annotation must be
-a nominal record type declared in that record's own file. The compiler resolves
-each nested field against its actual record owner. Field types that depend on
-the imported file's own aliases, or name a type from another file, are rejected
-until owner-local import bindings can be carried into the caller. Other imported
-field types are also rejected because their type provenance cannot yet be
-carried into the generated annotation.
+For an imported record, a changed field with a single-name type gets its
+temporary annotation from the record declaration's import scope. This includes
+a type declared there, a unique plain import, a selected local rename, and an
+original member qualified by that file's own alias. A same-spelled alias or
+type in the updating file cannot change the annotation. The generated name is
+limited to that field annotation; it does not expose a hidden constructor,
+accessor, or type name to source code. Each nested record field is resolved
+against its declaring record's owner, and reconstruction still requires the
+necessary record members to be visible to the updating file. Compound and
+dependent field types remain unsupported for generated imported annotations.
+Nested paths through a type alias that reduces to a record still need a direct
+nominal record field type. An ambiguous or hidden owner binding is rejected.
 
 Record pattern matching, anonymous records, row polymorphism, subtyping, and
 overloaded field resolution are not implemented.
