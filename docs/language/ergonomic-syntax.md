@@ -1,7 +1,8 @@
 # Ergonomic syntax
 
-Grouped imports, positional calls, and typed local helpers lower to existing
-syntax nodes. The maintained [syntax reference](../syntax.md) states accepted
+Grouped imports, positional calls, typed local helpers, and list trailing
+commas lower to existing syntax nodes. The maintained
+[syntax reference](../syntax.md) states accepted
 forms; this page records desugaring and compatibility boundaries.
 
 ## Grouped imports
@@ -119,16 +120,17 @@ same nested `EApp` tree as ordinary application.
 ## Typed local helper declarations
 
 ```text
-let double (x : Nat) : Nat := add x x in
+let double (x : Nat) := add x x in
   double value
 
 let identity (A : Type) (x : A) : A := x in
   identity Nat value
 ```
 
-A parameterized local binding requires typed parameters and an explicit result
-type. It uses the existing declaration telescope grammar, including grouped
-binders such as `(x y : Nat)`. Its desugaring is:
+A parameterized local binding requires typed parameters. Its result type may
+be omitted when the checker can infer it from the helper value. It uses the
+existing declaration telescope grammar, including grouped binders such as
+`(x y : Nat)`. An explicitly annotated helper desugars as:
 
 ```text
 let f (x : A) (y : B x) : C x y := value in body
@@ -138,9 +140,15 @@ let f : (x : A) -> (y : B x) -> C x y :=
 in body
 ```
 
-The parser uses `mk_pi_chain` and `mk_typed_lam_chain`, then constructs an
-ordinary `ELet`. Earlier parameters scope over later parameter types, the
-result type, and the helper value. Parameters do not escape into `body`.
+Without a result annotation, `let f (x : A) := value in body` desugars to
+`let f := fun (x : A) => value in body`. The existing local-binding inference
+must infer the complete function type from the typed lambda. A body whose type
+cannot be inferred still needs an annotation.
+
+The parser uses `mk_pi_chain` for annotated helpers and
+`mk_typed_lam_chain` for both forms, then constructs an ordinary `ELet`.
+Earlier parameters scope over later parameter types, the optional result type,
+and the helper value. Parameters do not escape into `body`.
 The helper name scopes over `body`, not its own value. An identically spelled
 outer binding remains available in that value, exactly as with ordinary `let`.
 Recursion still requires explicit `fix` and the existing structural checks.
@@ -149,20 +157,33 @@ Invalid examples:
 
 ```text
 let f x : Nat := x in f value
-let f (x : Nat) := x in f value
-let f (hidden : Nat) : Nat := hidden in hidden
+let f (x : Nat) := fun y => y in f value
+let f (hidden : Nat) := hidden in hidden
 ```
 
-The first lacks a parameter annotation; the second lacks the required result
-annotation; the third attempts to use an out-of-scope parameter. These are not
-invitations for heuristic type inference. Existing unparameterized `let`
-syntax and its inference behavior are unchanged.
+The first lacks a parameter annotation; the second has an unannotated nested
+lambda with no expected function type; the third uses an out-of-scope parameter.
+Existing unparameterized `let` syntax and its inference behavior are unchanged.
+
+## List literal trailing commas
+
+```text
+[x, y,] == [x, y]
+[x,]    == [x]
+```
+
+After at least one element, a comma immediately before `]` is accepted,
+including across whitespace and line comments. The parser builds the same
+`EList` elements in the same order. `[,]`, `[x,,]`, and a missing `]` remain
+parse errors. Empty lists keep the spelling `[]` and still need an expected
+`List A` type.
 
 ## Integration and fixtures
 
-All three forms reuse existing `DImport`, `EApp`, `EAscribe`, `ELam`, `EPi`,
-and `ELet` nodes. The formatter retains grouped imports, call spelling, and
-compact local helpers without expanding them in source. The fixture inventory
+These forms reuse existing `DImport`, `EApp`, `EAscribe`, `ELam`, `EPi`,
+`ELet`, and `EList` nodes. The formatter retains grouped imports, call spelling,
+compact local helpers, and list commas without expanding them in source. The
+fixture inventory
 is `tests/language_ergonomics/cases.json`; it includes desugaring pairs,
 rejected forms, import graph/diagnostic cases, and formatter round trips.
 [CI](../ci.md#local-profiles) owns validation commands and gate status.
@@ -179,12 +200,14 @@ compatibility, see [Design](../design.md#language-direction) and
 
 Lint, strict quality, and analyzer import inventories read every operand,
 including multiline groups. Malformed import scans return an input error.
-The [bootstrap bridge](../build.md#c-bootstrap) supports these forms without
-rewriting the current source snapshot.
+The [bootstrap bridge](../build.md#c-bootstrap) supports grouped imports,
+calls, and helpers without rewriting the current source snapshot. Compiler
+bootstrap inputs do not use list trailing commas; the new parser accepts them
+after bootstrapping.
 
 `f (a b)` remains one argument; `f (a, b)` denotes two applications, regardless
-of whitespace. Grouped imports cannot carry aliases. List trailing commas,
-empty `f()` calls, named arguments, and recursive local helpers remain
+of whitespace. Grouped imports cannot carry aliases. Empty `f()` calls,
+named arguments, and recursive local helpers remain
 unsupported. Live LSP range/navigation behavior requires its own verification;
 AST reuse alone does not establish editor behavior. The dedicated parser,
 formatter, frontend/security, Clippy, bootstrap, and PR gates remain required
