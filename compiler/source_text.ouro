@@ -20,6 +20,8 @@ def source_ch_under : Nat := 95;
 def source_ch_quote : Nat := 39;
 def source_ch_double_quote : Nat := 34;
 def source_ch_backslash : Nat := 92;
+def source_ch_hash : Nat := 35;
+def source_ch_raw_r : Nat := 114;
 def source_ch_dash : Nat := 45;
 
 def source_is_ws (c : Nat) : Bool :=
@@ -138,6 +140,119 @@ def source_drop_prefix : List Nat -> List Nat -> List Nat :=
         end
     end;
 
+def source_raw_prefix : List Nat :=
+  [source_ch_raw_r, source_ch_hash, source_ch_double_quote];
+
+def source_is_raw_start (src : List Nat) : Bool :=
+  source_starts source_raw_prefix src;
+
+-- The only raw delimiter is r#"..."#. Backslashes and inner quotes are bytes.
+def source_take_raw (src : List Nat)
+    : Maybe (Pair (List Nat) (List Nat)) :=
+  match source_is_raw_start src with
+  | False => Nothing (Pair(List Nat, List Nat))
+  | True =>
+      (fix body (xs : List Nat) (acc : List Nat)
+          : Maybe (Pair (List Nat) (List Nat)) :=
+        match xs with
+        | Nil => Nothing (Pair(List Nat, List Nat))
+        | Cons c rest =>
+            match andb(eqNat c source_ch_double_quote,
+                source_starts ([source_ch_hash] : List Nat) rest) with
+            | True => Just(Pair(List Nat, List Nat),
+                MkPair(List Nat, List Nat, reverse Nat acc,
+                  source_drop_prefix ([source_ch_hash] : List Nat) rest))
+            | False => body rest (Cons Nat c acc)
+            end
+        end) (source_drop_prefix source_raw_prefix src) (Nil Nat)
+  end;
+
+-- Keep comment bytes and physical line breaks, but hide literal bytes before
+-- line-based policy scans. Each output byte keeps its source offset.
+def source_is_comment (src : List Nat) : Bool :=
+  match src with
+  | Nil => False
+  | Cons c rest =>
+      match eqNat c source_ch_dash with
+      | False => False
+      | True =>
+          match rest with
+          | Nil => False
+          | Cons c2 _ => eqNat c2 source_ch_dash
+          end
+      end
+  end;
+
+def source_mask_literal_byte (byte : Nat) : Nat :=
+  match orb(eqNat byte source_ch_lf, eqNat byte source_ch_cr) with
+  | True => byte
+  | False => source_ch_space
+  end;
+
+def source_mask_literals (src : List Nat) : List Nat :=
+  reverse Nat
+    ((fix scan (fuel : Nat) (xs : List Nat) (previous : Nat)
+        (quote : Nat) (raw : Bool) (comment : Bool) (escaped : Bool)
+        (acc : List Nat) : List Nat :=
+      match fuel with
+      | Z => acc
+      | S remaining => match xs with
+        | Nil => acc
+        | Cons byte rest =>
+            match comment with
+            | True => scan remaining rest byte Z False
+                (notb(eqNat byte source_ch_lf)) False (Cons Nat byte acc)
+            | False => match raw with
+              | True =>
+                  match andb(eqNat byte source_ch_double_quote,
+                      source_starts ([source_ch_hash] : List Nat) rest) with
+                  | True => scan remaining
+                      (source_drop_prefix ([source_ch_hash] : List Nat) rest)
+                      source_ch_hash Z False False False
+                      (Cons Nat source_ch_space (Cons Nat source_ch_space acc))
+                  | False => scan remaining rest byte Z True False False
+                      (Cons Nat (source_mask_literal_byte byte) acc)
+                  end
+              | False =>
+                  match eqNat quote Z with
+                  | False =>
+                      let closing : Bool := andb(notb escaped, eqNat byte quote) in
+                      let next_escape : Bool := andb(notb escaped,
+                        eqNat byte source_ch_backslash) in
+                      scan remaining rest byte
+                        (match closing with | True => Z | False => quote end)
+                        False False next_escape
+                        (Cons Nat (source_mask_literal_byte byte) acc)
+                  | True =>
+                      match source_is_comment xs with
+                      | True => scan remaining rest byte Z False True False
+                          (Cons Nat byte acc)
+                      | False => match source_is_raw_start xs with
+                        | True => scan remaining
+                            (source_drop_prefix source_raw_prefix xs)
+                            source_ch_double_quote Z True False False
+                            (Cons Nat source_ch_space
+                              (Cons Nat source_ch_space
+                                (Cons Nat source_ch_space acc)))
+                        | False =>
+                            let starts_quote : Bool := orb
+                              (eqNat byte source_ch_double_quote)
+                              (andb(eqNat byte source_ch_quote,
+                                notb(source_is_ident_char previous))) in
+                            match starts_quote with
+                            | True => scan remaining rest byte byte False False False
+                                (Cons Nat source_ch_space acc)
+                            | False => scan remaining rest byte Z False False False
+                                (Cons Nat byte acc)
+                            end
+                        end
+                      end
+                  end
+              end
+            end
+        end
+      end) (S (length Nat src)) src Z Z False False False (Nil Nat));
+
 def source_word_end (src : List Nat) : Bool :=
   match src with
   | Nil => True
@@ -180,18 +295,34 @@ def source_skip_string (xs : List Nat) : List Nat :=
   | MkPair rest _ => rest
   end;
 
-def source_is_comment (src : List Nat) : Bool :=
+-- Return the tail after either spelling. Malformed raw input remains opaque
+-- to source rewrites and is rejected by the production lexer.
+def source_skip_literal (src : List Nat) : List Nat :=
   match src with
-  | Nil => False
+  | Nil => Nil Nat
   | Cons c rest =>
-      match eqNat c source_ch_dash with
-      | False => False
-      | True =>
-          match rest with
-          | Nil => False
-          | Cons c2 _ => eqNat c2 source_ch_dash
+      match eqNat c source_ch_double_quote with
+      | True => source_skip_string rest
+      | False =>
+          match source_is_raw_start src with
+          | False => src
+          | True => match source_take_raw src with
+            | Nothing => Nil Nat
+            | Just parsed => match parsed with | MkPair _ tail => tail end
+            end
           end
       end
+  end;
+
+def source_skip_raw_pos (src : List Nat) (pos : Nat)
+    : Maybe (Pair (List Nat) Nat) :=
+  match source_take_raw src with
+  | Nothing => Nothing (Pair(List Nat, Nat))
+  | Just parsed => match parsed with
+    | MkPair bytes tail => Just(Pair(List Nat, Nat),
+        MkPair(List Nat, Nat, tail,
+          add pos (add(length Nat bytes, 5))))
+    end
   end;
 
 def source_word_at (w : List Nat) (src : List Nat) : Bool :=
@@ -260,6 +391,19 @@ def source_emit_reversed (initial : List Nat) (input : List Nat) : List Nat :=
     | Cons c cs => source_emit_reversed(cs, Cons Nat c acc)
     end) input initial;
 
+def source_copy_raw (acc : List Nat) (src : List Nat)
+    : Maybe (Pair (List Nat) (List Nat)) :=
+  match source_take_raw src with
+  | Nothing => Nothing (Pair(List Nat, List Nat))
+  | Just parsed => match parsed with
+    | MkPair bytes tail =>
+        Just(Pair(List Nat, List Nat),
+          MkPair(List Nat, List Nat,
+            source_emit_reversed acc
+              (take Nat (add(length Nat bytes, 5)) src), tail))
+    end
+  end;
+
 def name_in (n : List Nat) : List (List Nat) -> Bool :=
   fix name_in (xs : List (List Nat)) : Bool :=
     match xs with
@@ -314,6 +458,19 @@ def source_copy_quoted (acc : List Nat) (src : List Nat)
       end
   end;
 
+def source_copy_literal (acc : List Nat) (src : List Nat)
+    : Maybe (Pair (List Nat) (List Nat)) :=
+  match source_is_raw_start src with
+  | False => source_copy_quoted acc src
+  | True =>
+      match source_copy_raw acc src with
+      | Just copied => Just(Pair(List Nat, List Nat), copied)
+      | Nothing => Just(Pair(List Nat, List Nat),
+          MkPair(List Nat, List Nat,
+            source_emit_reversed acc src, Nil Nat))
+      end
+  end;
+
 def source_copy_comment_or_string (acc : List Nat) (src : List Nat)
     : Maybe (Pair (List Nat) (List Nat)) :=
   match src with
@@ -321,6 +478,6 @@ def source_copy_comment_or_string (acc : List Nat) (src : List Nat)
   | Cons _ _ =>
       match source_is_comment src with
       | True => Just(Pair(List Nat, List Nat), source_emit_until_lf acc src)
-      | False => source_copy_quoted acc src
+      | False => source_copy_literal acc src
       end
   end;
