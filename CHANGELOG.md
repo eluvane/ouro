@@ -6,6 +6,10 @@ Development changes; see the [compatibility policy](docs/stability.md).
 
 ### Added
 
+- Pure bounded pull iterators with lazy map/filter/take adapters and explicit
+  typed failure or pull-limit results when collecting a list.
+- Overlapping list windows, state scans, state-threading maps, stable grouping
+  by key, and first-failure `Either`/`Maybe` folds in `std/collections.ouro`.
 - Lazy error-aware fallback for `Either` and ordered `Maybe` list traversal in
   the practical standard library.
 - Leading `{A : Type}` inductive parameters opt constructors in to bounded
@@ -139,6 +143,8 @@ Development changes; see the [compatibility policy](docs/stability.md).
 
 ### Fixed
 
+- `adjacent_pairs` now advances its left element; `list_traverse_result` evaluates
+  conversions in input order and stops when one returns `Left`.
 - Recognize manifest-owned Clippy precision fixtures in the structural gate,
   retaining extraction, path confinement, and checks on unlisted sources.
 - Cover `ESpan` in OuroSmith parser observations and keep comment delimiters
