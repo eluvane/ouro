@@ -40,6 +40,128 @@ def parse_params (parse : Nat -> Mode -> List Token -> Nat -> Value -> ParseResu
         end
     end;
 
+def def_params_of_pairs : List (Pair Nat Expr) -> List DefParam :=
+  fix go (items : List (Pair Nat Expr)) : List DefParam :=
+    match items with
+    | Nil => Nil DefParam
+    | Cons pair rest =>
+        match pair with
+        | MkPair name _ =>
+            Cons DefParam (DefParamOf name name (Nothing Expr)) (go rest)
+        end
+    end;
+
+-- `=>` is contextual inside a definition's typed binder group. Other
+-- binder groups retain the shared parser and their existing spelling.
+def parse_def_labeled_group
+    (parse : Nat -> Mode -> List Token -> Nat -> Value -> ParseResult Value)
+    (fuel : Nat) (toks : List Token) (pos : Nat)
+    : ParseResult (Pair (List (Pair Nat Expr)) (List DefParam)) :=
+  bindParseResult Unit (Pair (List (Pair Nat Expr)) (List DefParam))
+    (expect_lparen toks pos)
+    (fun (_open : Unit) (after_open : List Token) (label_pos : Nat) =>
+      bindParseResult Nat (Pair (List (Pair Nat Expr)) (List DefParam))
+        (expect_ident after_open label_pos)
+        (fun (label : Nat) (after_label : List Token) (arrow_pos : Nat) =>
+          bindParseResult Unit (Pair (List (Pair Nat Expr)) (List DefParam))
+            (expect_fat_arrow after_label arrow_pos)
+            (fun (_arrow : Unit) (after_arrow : List Token) (binder_pos : Nat) =>
+              bindParseResult Nat (Pair (List (Pair Nat Expr)) (List DefParam))
+                (expect_ident after_arrow binder_pos)
+                (fun (binder : Nat) (after_binder : List Token) (colon_pos : Nat) =>
+                  bindParseResult Unit (Pair (List (Pair Nat Expr)) (List DefParam))
+                    (expect_colon after_binder colon_pos)
+                    (fun (_colon : Unit) (after_colon : List Token) (type_pos : Nat) =>
+                      bindParseResult Expr (Pair (List (Pair Nat Expr)) (List DefParam))
+                        (parse_expr parse fuel after_colon type_pos)
+                        (fun (ty : Expr) (after_ty : List Token) (close_pos : Nat) =>
+                          bindParseResult Unit (Pair (List (Pair Nat Expr)) (List DefParam))
+                            (expect_rparen after_ty close_pos)
+                            (fun (_close : Unit) (rest : List Token) (end_pos : Nat) =>
+                              POk (Pair (List (Pair Nat Expr)) (List DefParam))
+                                (MkPair (List (Pair Nat Expr)) (List DefParam)
+                                  [MkPair Nat Expr binder ty]
+                                  [DefParamOf label binder (Nothing Expr)])
+                                rest end_pos)))))));
+
+def def_labeled_group_ahead (toks : List Token) : Bool :=
+  match toks with
+  | Nil => False
+  | Cons open tail =>
+      match is_lparen open with
+      | False => False
+      | True =>
+          match tail with
+          | Nil => False
+          | Cons label rest =>
+              match tokenIsIdent label with
+              | Nothing => False
+              | Just _ =>
+                  match rest with
+                  | Nil => False
+                  | Cons arrow _ => eqNat (token_tag arrow) tagFatArrow
+                  end
+              end
+          end
+      end
+  end;
+
+def parse_def_params
+    (parse : Nat -> Mode -> List Token -> Nat -> Value -> ParseResult Value)
+    : Nat -> List Token -> Nat
+      -> ParseResult (Pair (List (Pair Nat Expr)) (List DefParam)) :=
+  fix go (fuel : Nat) (toks : List Token) (pos : Nat)
+      : ParseResult (Pair (List (Pair Nat Expr)) (List DefParam)) :=
+    match fuel with
+    | Z => PErr (Pair (List (Pair Nat Expr)) (List DefParam)) pos
+    | S next =>
+        match orb (def_labeled_group_ahead toks) (is_binder_ahead toks) with
+        | False =>
+            POk (Pair (List (Pair Nat Expr)) (List DefParam))
+              (MkPair (List (Pair Nat Expr)) (List DefParam)
+                (Nil (Pair Nat Expr)) (Nil DefParam)) toks pos
+        | True =>
+            let parsed : ParseResult (Pair (List (Pair Nat Expr)) (List DefParam)) :=
+              match def_labeled_group_ahead toks with
+              | True => parse_def_labeled_group parse next toks pos
+              | False =>
+                  match parse next MTypedBinderGroup toks pos (VNat Z) with
+                  | PErr error_pos =>
+                      PErr (Pair (List (Pair Nat Expr)) (List DefParam)) error_pos
+                  | POk value rest end_pos =>
+                      match asListPairNatExpr value with
+                      | Nothing =>
+                          PErr (Pair (List (Pair Nat Expr)) (List DefParam)) end_pos
+                      | Just group =>
+                          POk (Pair (List (Pair Nat Expr)) (List DefParam))
+                            (MkPair (List (Pair Nat Expr)) (List DefParam)
+                              group (def_params_of_pairs group)) rest end_pos
+                      end
+                  end
+              end in
+            bindParseResult (Pair (List (Pair Nat Expr)) (List DefParam))
+              (Pair (List (Pair Nat Expr)) (List DefParam)) parsed
+              (fun (group : Pair (List (Pair Nat Expr)) (List DefParam))
+                  (rest : List Token) (end_pos : Nat) =>
+                bindParseResult (Pair (List (Pair Nat Expr)) (List DefParam))
+                  (Pair (List (Pair Nat Expr)) (List DefParam))
+                  (go next rest end_pos)
+                  (fun (more : Pair (List (Pair Nat Expr)) (List DefParam))
+                      (tail : List Token) (tail_pos : Nat) =>
+                    match group with
+                    | MkPair group_pairs group_meta =>
+                        match more with
+                        | MkPair more_pairs more_meta =>
+                            POk (Pair (List (Pair Nat Expr)) (List DefParam))
+                              (MkPair (List (Pair Nat Expr)) (List DefParam)
+                                (append (Pair Nat Expr) group_pairs more_pairs)
+                                (append DefParam group_meta more_meta))
+                              tail tail_pos
+                        end
+                    end))
+        end
+    end;
+
 -- Only leading level-zero Type groups opt in to parameter inference.
 def parse_implicit_params
     (fuel : Nat) (toks : List Token) (pos : Nat)
@@ -278,7 +400,8 @@ def parse_inductive_decl
 def parse_def_after_params
     (parse : Nat -> Mode -> List Token -> Nat -> Value -> ParseResult Value)
     (fuel : Nat) (name : Nat) (marked : Nat)
-    (params : List (Pair Nat Expr)) (toks : List Token) (pos : Nat)
+    (params : List (Pair Nat Expr)) (metadata : List DefParam)
+    (toks : List Token) (pos : Nat)
     : ParseResult Decl :=
   bindParseResult Unit Decl (expect_colon toks pos)
     (fun (_colon : Unit) (after_colon : List Token) (type_pos : Nat) =>
@@ -293,7 +416,7 @@ def parse_def_after_params
                       POk Decl
                         (DDef name (mk_pi_chain params result)
                           (mk_typed_lam_chain params body)
-                          marked (length (Pair Nat Expr) params))
+                          marked metadata)
                         rest end_pos)))));
 
 def parse_def_decl
@@ -309,13 +432,18 @@ def parse_def_decl
                 (after_prefix : List Token) (params_pos : Nat) =>
               match prefix with
               | MkPair marked marked_params =>
-                  bindParseResult (List (Pair Nat Expr)) Decl
-                    (parse_params parse fuel after_prefix params_pos)
-                    (fun (explicit : List (Pair Nat Expr))
+                  bindParseResult (Pair (List (Pair Nat Expr)) (List DefParam)) Decl
+                    (parse_def_params parse fuel after_prefix params_pos)
+                    (fun (explicit : Pair (List (Pair Nat Expr)) (List DefParam))
                         (after_params : List Token) (colon_pos : Nat) =>
-                      parse_def_after_params parse fuel name marked
-                        (append (Pair Nat Expr) marked_params explicit)
-                        after_params colon_pos)
+                      match explicit with
+                      | MkPair pairs metadata =>
+                          parse_def_after_params parse fuel name marked
+                            (append (Pair Nat Expr) marked_params pairs)
+                            (append DefParam
+                              (def_params_of_pairs marked_params) metadata)
+                            after_params colon_pos
+                      end)
               end)));
 
 -- @bound(cyclo <= 40)

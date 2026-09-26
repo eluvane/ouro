@@ -113,7 +113,7 @@ Invalid examples:
 f()               -- no implicit Unit argument
 f(, a)            -- missing first argument
 f(a,, b)          -- missing middle argument
-f(host = value)   -- named arguments are not enabled
+f(host = value)   -- `=` is not a named-argument marker
 ```
 
 A non-function callee, a wrong argument type, an unresolved hole, or a missing
@@ -121,6 +121,44 @@ required argument still fails ordinary checking. The form `f(a b)` deliberately
 remains one argument: changing that would break existing application syntax.
 No new binders are introduced, and argument evaluation/effects follow the
 same nested `EApp` tree as ordinary application.
+
+## Named calls and public labels
+
+A top-level definition can give a parameter a public call label distinct from
+its internal binder. The `=>` in a typed binder group is contextual; ordinary
+identifiers, including `as`, retain their existing meaning:
+
+```ouro
+def choose (front => first : Nat) (back : Nat) : Nat := first;
+
+choose(back := 2, front := 1)
+let front : Nat := 1 in choose(front :=, back := 2)
+```
+
+`host :=` is shorthand for `host := host` in the caller's lexical scope.
+Unlabeled parameters use their binder spelling as the public label. A named
+call may start with positional arguments, followed by labeled arguments in any
+order. It must supply every declared parameter exactly once. The compiler
+rejects missing, duplicate, unknown, or ambiguous labels and positional
+arguments after a named argument. Ordinary positional full and partial calls
+retain their meaning, including for definitions with public labels or marked
+type parameters.
+
+This first form applies only to direct, resolved top-level definitions with no
+marked parameters and independent parameter domains. A local or higher-order
+callee, a parameter domain depending on an earlier parameter, or an ambiguous
+domain needs a positional call. Declaration-site defaults are not accepted.
+Argument values are lowered once in source order into fresh local lets; the
+final ordinary application uses declaration order. The existing checker proves
+every argument and the result. A call label has no binding effect on the value
+expression, and a local value shadowing the definition does not inherit its
+labels. Unqualified label spelling remains stable when the definition is
+referred to through a module alias.
+
+Quality analysis reads only argument values as expressions. Clippy retains
+known-callee effect and checked-result obligations for named calls while
+using unknown positional facts for argument-specific proofs; exact
+argument-position precision requires declaration metadata in that analyzer.
 
 ## Typed local helper declarations
 
@@ -421,9 +459,8 @@ rejected forms, import graph/diagnostic cases, and formatter round trips.
 
 ## Scope
 
-These forms add no selective imports, private exports, tuple or named call
-syntax, implicit type argument inference, early return, or general effect
-handling. For language direction and
+These forms add no selective imports, private exports, tuple allocation,
+declaration-site defaults, early return, or general effect handling. For language direction and
 compatibility, see [Design](../design.md#language-direction) and
 [Stability](../stability.md#experimental-areas).
 
@@ -437,8 +474,8 @@ bootstrap inputs do not use list trailing commas; the new parser accepts them
 after bootstrapping.
 
 `f (a b)` remains one argument; `f (a, b)` denotes two applications, regardless
-of whitespace. Grouped imports cannot carry aliases. Empty `f()` calls,
-named arguments, and recursive local helpers remain
+of whitespace. Grouped imports cannot carry aliases. Empty `f()` calls and
+recursive local helpers remain
 unsupported. Live LSP range/navigation behavior requires its own verification;
 AST reuse alone does not establish editor behavior. The dedicated parser,
 formatter, frontend/security, Clippy, bootstrap, and PR gates remain required

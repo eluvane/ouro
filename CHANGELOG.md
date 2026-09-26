@@ -6,6 +6,10 @@ Development changes; see the [compatibility policy](docs/stability.md).
 
 ### Added
 
+- Direct top-level definitions can declare public parameter labels with
+  `(label => binder : Type)` and accept checked named calls, argument punning,
+  and source-order evaluation for reordered arguments. Positional calls stay
+  valid; declaration-site defaults remain unsupported.
 - Lazy error-aware fallback for `Either` and ordered `Maybe` list traversal in
   the practical standard library.
 - Leading `{A : Type}` inductive parameters opt constructors in to bounded

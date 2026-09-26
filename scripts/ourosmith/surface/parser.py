@@ -26,6 +26,7 @@ EXPRS = {
     "EStr": ["Nat"], "EDoBind": ["Nat", "Expr"], "EList": ["List Expr"],
     "ESpan": ["Nat", "Nat", "Expr"], "EOpen": ["Nat", "Expr"],
     "EFallible": ["Expr", "Nat", "Nat", "Expr"],
+    "ENamedCall": ["Expr", "List (Pair Nat Expr)"],
 }
 
 

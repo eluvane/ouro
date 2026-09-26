@@ -47,6 +47,7 @@ EXPR = {
     "EStr": "feature:string-length", "EDoBind": "property:test-known-counts", "EList": "feature:form:list",
     "ESpan": "feature:parser:abi-and-grammar", "EOpen": "feature:parity:imports-open-local",
     "EFallible": "feature:form:fallible-block",
+    "ENamedCall": "feature:form:named-call",
 }
 DECL = {"DDef": "feature:prelude", "DAxiom": "negative:effect-root-assumption-type", "DInductive": "feature:prelude",
         "DEffect": "feature:form:handler", "DImport": "property:import-dependency-order",
