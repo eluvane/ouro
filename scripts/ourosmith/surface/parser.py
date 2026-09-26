@@ -25,6 +25,7 @@ EXPRS = {
     "EMultiMatch": ["List Expr", "List (Pair (List (Pair Nat (List Nat))) Expr)"],
     "EStr": ["Nat"], "EDoBind": ["Nat", "Expr"], "EList": ["List Expr"],
     "ESpan": ["Nat", "Nat", "Expr"], "EOpen": ["Nat", "Expr"],
+    "EFallible": ["Expr", "Nat", "Nat", "Expr"],
 }
 
 
@@ -131,6 +132,8 @@ def rows(seed):
         'str_concat (show_nat mapped) (str_concat "/" (show_nat at)) end '
         '| COk _ => "accepted" end | ROk _ => "accepted" end',
         "97/0"))
+    observations.append((f"observe_expr 40 (EFallible (EVar {n}) {n + 1} {n + 2} (ENat {n}))",
+                         f"EFallible(EVar({n}),{n + 1},{n + 2},ENat({n}))"))
     return observations
 
 

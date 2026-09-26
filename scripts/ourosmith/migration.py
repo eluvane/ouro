@@ -251,6 +251,27 @@ def legacy_categories(paths, manifest_text):
     return categories, sum(len(rows) for rows in groups.values())
 
 
+def current_record_update_categories(categories):
+    """Split the one archived update rejection whose exact source is now accepted."""
+    identity = "manifest:REC.B:check:fail:OURO-REC-003"
+    archived = {"id": "REC.B.check.update_pending",
+                "path": "test/suite/records/bad/update_pending.ouro"}
+    for category in categories:
+        if category["id"] != identity:
+            continue
+        if category["rows"].count(archived) != 1 or len(category["rows"]) < 2:
+            raise ValueError("archived record update row differs from reviewed source")
+        category["rows"] = [row for row in category["rows"] if row != archived]
+        categories.append({"id": "current:REC.B.check.update_pending", "tool": "check",
+                           "expect": "pass", "diagnostic": "", "rows": [archived],
+                           "strategies": ["surface/features/form:record", "external/ci/ergonomics"],
+                           "note": "The exact archived update with an annotated Point result is now accepted. "
+                                   "Current compiler and ergonomics fixtures check update acceptance; "
+                                   "ambiguous record literals remain rejected by OURO-REC-003."})
+        return categories
+    raise ValueError("archived record update category is missing")
+
+
 def validate_archive(matrix):
     if not isinstance(matrix, dict) or not isinstance(matrix.get("recoverability"), dict):
         raise ValueError("the archived matrix has no recovery evidence")
@@ -312,6 +333,7 @@ def build_matrix(report, validation=None):
                                             "evidence_fingerprint": matrix["evidence_fingerprint"]}
         matrix["contracts"] = contracts.CONTRACT_KIND
         matrix["categories"], matrix["manifest_rows"] = legacy_categories(matrix["legacy_files"], old_manifest)
+        matrix["categories"] = current_record_update_categories(matrix["categories"])
         matrix["deletion_ready"] = False
         matrix["evidence_problems"] = ["current native evidence has not been checked"]
         matrix["retired"] = True
