@@ -524,6 +524,10 @@ EOF
 		if [ -n "$artifact" ]; then
 			set -- --emit-checked-program "$artifact" "$@"
 		fi
+		if [ "$file" = tests/source_span_tests.ouro ]; then
+			OURO_DIAG_RAW_CERR=1
+			export OURO_DIAG_RAW_CERR
+		fi
 		exec "$COMPILER" check "$file" "$fuel" "$@"
 		;;
 	rebuild)

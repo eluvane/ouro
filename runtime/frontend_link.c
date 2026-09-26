@@ -1059,6 +1059,8 @@ static ouro_v *compile_checked_units_impl(ouro_v *fuel, ouro_v *root, ouro_v *fi
 	   result across the same lifetime seam before calling the Ouro remapper. */
 	r = ouro_clone_perm_deep(r);
 	fe_phase_done("frontend-after-check-decls");
+	if (getenv("OURO_DIAG_RAW_CERR") != NULL && r != 0 && r->tag == 0)
+		fprintf(stderr, "OURO_RAW_CERR code=%d det=%d\n", cerr_code(r), cerr_det(r));
 	falseb = ouro_ctor(1, 0, 0);
 	r = ouro_apply(ouro_apply(ouro_apply(closed_remap_comp_files(), falseb), files1), r);
 	g_last_intern = st2;
