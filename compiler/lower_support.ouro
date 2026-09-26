@@ -214,6 +214,7 @@ def case_ind_nparams_for (env : LowerEnv) (scrut : Expr) (locals : List (Pair Na
   (fix go (subject : Expr) : Pair Nat Nat :=
     match subject with
     | ESpan _ _ inner => go inner
+    | EFallible _ _ _ _ => case_ind_nparams env brArs
     | EVar n =>
         match lookup_local n locals with
         | Just ty =>
@@ -351,6 +352,7 @@ def applied_lambda : Expr -> Bool :=
     | ENoBinder => False
     | EMultiMatch _ _ => False
     | ESpan _ _ inner => applied_lambda inner
+    | EFallible _ _ _ _ => False
     end;
 
 def app_function_expected (function : Expr) (er : Maybe Surface) : Maybe Surface :=
@@ -360,6 +362,107 @@ def app_function_expected (function : Expr) (er : Maybe Surface) : Maybe Surface
         match er with
         | Nothing => Nothing Surface
         | Just result => Just(Surface, SPi Z (SInd Z) result)
+        end
+    end;
+
+-- Names in the expected codomain must not capture the replacement lambda name.
+-- Exhaustion is treated as a collision, so lowering can request an annotation.
+def surface_mentions_name (fuel : Nat) (name : Nat) (term : Surface) : Bool :=
+  (fix visit (remaining : Nat) (part : Surface) : Bool :=
+    match remaining with
+    | Z => True
+    | S next =>
+        match part with
+        | SVar current => eqNat current name
+        | SSort _ => False
+        | SPi binder domain codomain =>
+            orb(eqNat binder name,
+              orb(visit next domain, visit next codomain))
+        | SLam binder annotation body =>
+            orb(eqNat binder name,
+              orb(visit next annotation, visit next body))
+        | SApp function argument =>
+            orb(visit next function, visit next argument)
+        | SLet binder value annotation body =>
+            orb(eqNat binder name,
+              orb(visit next value,
+                orb(visit next annotation, visit next body)))
+        | SConst _ => False
+        | SInd _ => False
+        | SConstruct _ _ _ => False
+        | SCase _ predicate scrutinee branches =>
+            orb(visit next predicate,
+              orb(visit next scrutinee,
+                (fix any_branch (rest : List Surface) : Bool :=
+                    match rest with
+                    | Nil => False
+                    | Cons branch tail =>
+                        orb(visit next branch, any_branch tail)
+                    end) branches))
+        | SFix binder _ _ annotation body =>
+            orb(eqNat binder name,
+              orb(visit next annotation, visit next body))
+        | SHole _ => False
+        | SEffectRow ty => visit next ty
+        | SPerform _ arguments =>
+            (fix any_argument (rest : List Surface) : Bool :=
+                match rest with
+                | Nil => False
+                | Cons argument tail =>
+                    orb(visit next argument, any_argument tail)
+                end) arguments
+        | SStr _ _ => False
+        end
+    end) fuel term;
+
+def lambda_domain_hint (locals : List (Pair Nat Surface))
+    (er : Maybe Surface) : Maybe Surface :=
+    match er with
+    | Nothing => Nothing Surface
+    | Just expected =>
+        match surface_pi_domain expected with
+        | Nothing => Nothing Surface
+        | Just domain =>
+            match surface_hint_has_placeholder locals fuel1k domain with
+            | True => Nothing Surface
+            | False => Just Surface domain
+            end
+        end
+    end;
+
+def lambda_body_expected (er : Maybe Surface) (name : Nat) : Maybe Surface :=
+    match er with
+    | Nothing => Nothing Surface
+    | Just expected =>
+        match expected with
+        | SPi binder _ codomain =>
+            match orb(eqNat binder name, eqNat binder Z) with
+            | True => Just Surface codomain
+            | False =>
+                match surface_mentions_name fuel1k binder codomain with
+                | False => Just Surface codomain
+                | True =>
+                    match surface_mentions_name fuel1k name codomain with
+                    | True => Nothing Surface
+                    | False =>
+                        Just(Surface, surface_subst_name binder (SVar name) codomain)
+                    end
+                end
+            end
+        | SVar _ => Nothing Surface
+        | SSort _ => Nothing Surface
+        | SLam _ _ _ => Nothing Surface
+        | SApp _ _ => Nothing Surface
+        | SLet _ _ _ _ => Nothing Surface
+        | SConst _ => Nothing Surface
+        | SInd _ => Nothing Surface
+        | SConstruct _ _ _ => Nothing Surface
+        | SCase _ _ _ _ => Nothing Surface
+        | SFix _ _ _ _ _ => Nothing Surface
+        | SHole _ => Nothing Surface
+        | SEffectRow _ => Nothing Surface
+        | SPerform _ _ => Nothing Surface
+        | SStr _ _ => Nothing Surface
         end
     end;
 
@@ -391,6 +494,7 @@ def match_family_params (indId : Nat) (scrut : Expr) (locals : List (Pair Nat Su
   (fix go (subject : Expr) : Pair (List Surface) Surface :=
     match subject with
     | ESpan _ _ inner => go inner
+    | EFallible _ _ _ _ => MkPair(List Surface, Surface, Nil Surface, SInd indId)
     | EVar n =>
         match lookup_local n locals with
         | Just ty =>
@@ -454,6 +558,7 @@ inductive ExprView : Type :=
   | XVDo : List Expr -> ExprView
   | XVList : List Expr -> ExprView
   | XVHandle : Expr -> List (Pair Nat (Pair (List Nat) Expr)) -> ExprView
+  | XVFallible : Expr -> Nat -> Nat -> Expr -> ExprView
   | XVUnsupported : ExprView;
 
 def view_expr : Expr -> ExprView :=
@@ -477,6 +582,8 @@ def view_expr : Expr -> ExprView :=
     | EDo es => XVDo es
     | EList es => XVList es
     | EHandle comp clauses => XVHandle comp clauses
+    | EFallible container failure success body =>
+        XVFallible container failure success body
     | EDoBind _ _ => XVUnsupported
     | EBranch _ _ _ => XVUnsupported
     | ENoBranch => XVUnsupported
@@ -493,6 +600,7 @@ def view_branch : Expr -> BranchView :=
   fix view_branch (e : Expr) : BranchView :=
     match e with
     | ESpan _ _ inner => view_branch inner
+    | EFallible _ _ _ _ => BranchEnd
     | EBranch packed body rest => BranchNode packed body rest
     | ENoBranch => BranchEnd
     | EVar _ => BranchEnd
@@ -526,6 +634,7 @@ def view_binder : Expr -> BinderView :=
   fix view_binder (e : Expr) : BinderView :=
     match e with
     | ESpan _ _ inner => view_binder inner
+    | EFallible _ _ _ _ => BinderEnd
     | EBinder id ty rest => BinderNode id ty rest
     | ENoBinder => BinderEnd
     | EVar _ => BinderEnd
@@ -598,6 +707,7 @@ def scan_branch_keys (env : LowerEnv) : Expr -> List (Pair Nat Surface) :=
       | ENoBinder => Nil (Pair Nat Surface)
       | EMultiMatch _ _ => Nil (Pair Nat Surface)
       | ESpan _ _ inner => scan_branch_keys inner
+      | EFallible _ _ _ _ => Nil (Pair Nat Surface)
       end;
 
 inductive MatchSetup : Type :=
@@ -610,6 +720,7 @@ def prepare_match (env : LowerEnv) (scrut : Expr) (locals : List (Pair Nat Surfa
       (fix go (subject : Expr) : MatchSetup :=
         match subject with
         | ESpan _ _ inner => go inner
+        | EFallible _ _ _ _ => NoMatchSetup
         | EVar n =>
             match lookup_local n locals with
             | Nothing => NoMatchSetup
@@ -691,6 +802,7 @@ def peel_do_bind : Expr -> Pair (Maybe Nat) Expr :=
   fix peel_do_bind (e : Expr) : Pair (Maybe Nat) Expr :=
     match e with
     | ESpan _ _ inner => peel_do_bind inner
+    | EFallible _ _ _ _ => MkPair(Maybe Nat, Expr, Nothing Nat, e)
     | EDoBind n action => MkPair(Maybe Nat, Expr, Just Nat n, action)
     | EVar _ => MkPair(Maybe Nat, Expr, Nothing Nat, e)
     | EHole _ => MkPair(Maybe Nat, Expr, Nothing Nat, e)
