@@ -165,6 +165,29 @@ The first lacks a parameter annotation; the second has an unannotated nested
 lambda with no expected function type; the third uses an out-of-scope parameter.
 Existing unparameterized `let` syntax and its inference behavior are unchanged.
 
+## Expected types in short lambdas
+
+The existing `fun x => body` and `fun x y => body` forms use an expected
+function type when one is available, for example from a definition, an
+annotated local value, or a typed function argument. Lowering also uses each
+known parameter type inside the body, so a callback through an unannotated
+parameter can retain the type needed by a nested callback or parameterized
+match:
+
+```ouro
+let apply : ((Nat -> List Nat) -> List Nat) -> List Nat :=
+  fun consume => consume (fun value => [value])
+in apply (fun (callback : Nat -> List Nat) => callback 0)
+```
+
+The checker still validates the complete function and every application.
+For dependent function types, the expected codomain follows the lambda's
+actual binder name. If renaming could capture another binder, or a domain
+contains a hole, an unresolved name, or a shadowed local type name, lowering
+does not use that hint; annotate the relevant lambda parameter. An
+unannotated lambda without an expected function type still needs an
+annotation. Parameterized local helpers still require typed parameters.
+
 ## Pure expression blocks
 
 ```ouro
