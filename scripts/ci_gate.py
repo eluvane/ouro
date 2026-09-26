@@ -332,6 +332,17 @@ def compiler_fixture_roots(root: Path) -> list[str]:
     return rows
 
 
+def compiler_shard_entries(inventory: Sequence[str], shard: int) -> list[str]:
+    if (not inventory or inventory[-1] != "tests/source_span_tests.ouro"
+            or inventory.count("tests/source_span_tests.ouro") != 1):
+        raise ValueError("source-spans fixture must be last in the compiler inventory")
+    if shard == COMPILER_SHARDS:
+        return [inventory[-1]]
+    if 1 <= shard < COMPILER_SHARDS:
+        return list(inventory[:-1][shard - 1::COMPILER_SHARDS - 1])
+    raise ValueError("unknown compiler shard")
+
+
 def affected_compiler_gates(paths: Sequence[str], root: Path = ROOT) -> set[str]:
     # Reuse the build system's import reader, including aliases and relative paths.
     # Cache file reads across the 94 roots, not across revisions or invocations.
@@ -356,9 +367,12 @@ def affected_compiler_gates(paths: Sequence[str], root: Path = ROOT) -> set[str]
 
     changed = set(paths)
     selected: set[str] = set()
-    for index, fixture in enumerate(compiler_fixture_roots(root)):
+    inventory = compiler_fixture_roots(root)
+    compiler_shard_entries(inventory, COMPILER_SHARDS)
+    for index, fixture in enumerate(inventory):
         if changed.intersection(collect_units(fixture, imports=read_imports)):
-            selected.add(f"compiler-checking-{index % COMPILER_SHARDS + 1}")
+            shard = COMPILER_SHARDS if index == len(inventory) - 1 else index % (COMPILER_SHARDS - 1) + 1
+            selected.add(f"compiler-checking-{shard}")
     return selected
 
 
@@ -932,13 +946,18 @@ def routing_contract_failures() -> list[str]:
         inventory = root / "tools/test/suites.ouro"
         rows = [f'MkSuiteFixture "case_{i}" "tests/case_{i}.ouro" Z SuiteGoldenNone'
                 for i in range(COMPILER_SHARDS + 1)]
+        rows.append('MkSuiteFixture "source_spans" "tests/source_span_tests.ouro" Z SuiteGoldenNone')
         inventory.write_text("def compiler_check_suite_fixtures : List SuiteFixture :=\n[" + ",\n".join(rows) + "];\n", encoding="utf-8")
         for i in range(COMPILER_SHARDS + 1):
-            source = ('import "shared.ouro";\n' if i in {0, COMPILER_SHARDS}
+            source = ('import "shared.ouro";\n' if i in {0, COMPILER_SHARDS - 1}
                       else "def value : Nat := 0;\n")
             (root / f"tests/case_{i}.ouro").write_text(source, encoding="utf-8")
+        (root / "tools/isolated.ouro").write_text("def isolated : Nat := 0;\n", encoding="utf-8")
+        (root / "tests/source_span_tests.ouro").write_text('import "../tools/isolated.ouro";\n', encoding="utf-8")
         if affected_compiler_gates(["tools/lsp_model.ouro"], root) != {"compiler-checking-1"}:
             failures.append("transitive alias import or round-robin shard ownership was lost")
+        if affected_compiler_gates(["tools/isolated.ouro"], root) != {f"compiler-checking-{COMPILER_SHARDS}"}:
+            failures.append("isolated compiler fixture lost its shard ownership")
         if affected_compiler_gates(["tools/unused.ouro"], root):
             failures.append("unrelated tool selected compiler shards")
         (root / "tests/shared.ouro").write_text('import\n "../tools/lsp_model.ouro";\n', encoding="utf-8")

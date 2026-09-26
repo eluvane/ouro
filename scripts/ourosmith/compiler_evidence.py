@@ -10,13 +10,20 @@ import re
 import sys
 from pathlib import Path
 
-from ci_gate import COMPILER_SHARDS
+from ci_gate import COMPILER_SHARDS, compiler_shard_entries
 from repo_support import sha256_file as sha
 from ourosmith import ROOT
 from ourosmith.native import receipt_for
 
 SUITE_ENTRY = 'tools/test/main.ouro'
 PROPERTY_ENTRY = 'tests/compiler_property_tests.ouro'
+SOURCE_SPANS_ENTRY = 'tests/source_span_tests.ouro'
+
+
+def fixture_name(entry):
+    if entry == SOURCE_SPANS_ENTRY:
+        return 'source_spans'
+    return Path(entry).stem.removesuffix('_tests')
 
 
 def property_protocol(text):
@@ -76,9 +83,9 @@ def suite_receipt(log, compiler, shard='all'):
                                timeout_s=30, memory_mb=3072)
         entries = selected.stdout.splitlines()
         if (not selected.ok or selected.stderr or not entries
-                or entries != inventory[int(shard.split('/')[0]) - 1::COMPILER_SHARDS]):
+                or entries != compiler_shard_entries(inventory, int(shard.split('/')[0]))):
             raise ValueError('compiler shard differs from its complete inventory partition')
-    if names != [Path(entry).stem.removesuffix('_tests') for entry in entries]:
+    if names != [fixture_name(entry) for entry in entries]:
         raise ValueError('executed compiler rows differ from the current Ouro suite inventory')
     artifacts = []
     for name, entry in zip(names, entries, strict=True):

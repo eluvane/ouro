@@ -231,7 +231,7 @@ to compiler, runtime and standard library inputs also retain kernel-extra.
 For narrowed routes, the planner follows transitive imports from the canonical
 compiler fixture inventory, using the build system's import reader and checking
 its import count against the existing source tokenizer. A tool
-dependency of a compiler fixture adds that fixture's existing round-robin shard.
+dependency of a compiler fixture adds that fixture's assigned shard.
 An unreadable dependency, unsupported import layout or inventory shape selects
 full validation.
 New tool families remain full-validation inputs until their consumers are mapped.
@@ -302,9 +302,11 @@ The native-lowering fixture runs each assertion in a separate process to bound
 the transitional C host's compiler heap. It retains the full case inventory,
 rejects duplicate names, and requires each child's exact output and zero status.
 
-Each invocation verifies that the sixteen round-robin shards cover every fixture
-exactly once, have unique fixture names and paths, and differ in size by at
-most one. Missing, duplicated, unknown, or malformed selections fail. Omitting
+Each invocation verifies that the sixteen shards cover every fixture exactly
+once and have unique fixture names and paths. The first fifteen shards contain
+the remaining fixtures in round-robin order and differ in size by at most one;
+the sixteenth runs `source_spans` alone so its cost is separate. Missing,
+duplicated, unknown, or malformed selections fail. Omitting
 `--shard` runs the full inventory. Each hosted shard has its own output directory
 and retains the same checker, build, execution, and failure requirements.
 The inventory interleaves fixtures by measured native build cost so expensive

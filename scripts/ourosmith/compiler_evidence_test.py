@@ -36,15 +36,17 @@ class CompilerEvidenceTests(EvidenceTreeTests):
         self.native_receipt = {'binary_sha256': 'a' * 64, 'key': 'b' * 64}
         self.receipt = self.enterContext(patch.object(evidence, 'receipt_for',
             return_value=(self.native_receipt, [], {})))
-        entries = ['tests/compiler_suite_contract_tests.ouro', 'tests/compiler_property_tests.ouro']
+        entries = ['tests/compiler_suite_contract_tests.ouro', 'tests/compiler_property_tests.ouro',
+                   'tests/source_span_tests.ouro']
         self.listed = RunResult('ok', 0, '\n'.join(entries) + '\n', '', 0.1, 10)
         self.execute = self.enterContext(patch('ourosmith.limits.run_limited', return_value=self.listed))
         self.log = self.root / 'gate.log'
         self.log_text = ('COMPILER_CHECK_OK compiler_suite_contract-run\n'
                          'COMPILER_CHECK_OK compiler_property-run\n'
-                         'COMPILER_CHECK_SUITE: PASS rows=2 out=' + self.directory.as_posix() + '\n')
+                         'COMPILER_CHECK_OK source_spans-run\n'
+                         'COMPILER_CHECK_SUITE: PASS rows=3 out=' + self.directory.as_posix() + '\n')
         self.log.write_text(self.log_text, encoding='utf-8')
-        for name in ('compiler_suite_contract', 'compiler_property'):
+        for name in ('compiler_suite_contract', 'compiler_property', 'source_spans'):
             (self.directory / (name + '.check')).write_text('CHECK_OK\n', encoding='utf-8')
             (self.directory / (name + '.err')).write_bytes(b'')
             (self.directory / (name + '.out')).write_text(
@@ -58,15 +60,16 @@ class CompilerEvidenceTests(EvidenceTreeTests):
         self.assertEqual([row['entry'] for row in receipt['artifacts']], self.listed.stdout.splitlines())
         self.assertTrue(receipt['artifacts'][1]['default_properties'])
         self.assertEqual(receipt['log_sha256'], evidence.sha(self.log))
-        self.assertEqual(self.receipt.call_count, 4)
+        self.assertEqual(self.receipt.call_count, 5)
         self.assertEqual(self.execute.call_args.args[0][-2:], ['--native-suite=compiler-checking', '--list'])
 
     def test_partial_reordered_duplicate_unknown_and_failed_logs_reject(self):
         lines = self.log_text.splitlines()
-        candidates = [[], lines[:-1], [*lines, 'extra'], [lines[1], lines[0], lines[2]],
-                      [lines[0], lines[0], lines[2]], [lines[0], lines[2].replace('rows=2', 'rows=1')],
-                      [lines[0], lines[1].replace('_OK', '_FAIL'), lines[2]],
-                      [lines[0], lines[1].replace('compiler_property-run', 'unknown-run'), lines[2]]]
+        candidates = [[], lines[:-1], [*lines, 'extra'], [lines[1], lines[0], lines[2], lines[3]],
+                      [lines[0], lines[0], lines[2], lines[3]],
+                      [lines[0], lines[1], lines[2], lines[3].replace('rows=3', 'rows=2')],
+                      [lines[0], lines[1].replace('_OK', '_FAIL'), lines[2], lines[3]],
+                      [lines[0], lines[1].replace('compiler_property-run', 'unknown-run'), lines[2], lines[3]]]
         for candidate in candidates:
             self.log.write_text('\n'.join(candidate) + '\n', encoding='utf-8')
             with self.subTest(candidate=candidate), self.assertRaises(ValueError):
@@ -93,7 +96,7 @@ class CompilerEvidenceTests(EvidenceTreeTests):
         with self.assertRaisesRegex(ValueError, 'stale'):
             self.read()
         good = (self.native_receipt, [], {})
-        self.receipt.side_effect = [good, good, good, ({**self.native_receipt, 'key': 'changed'}, [], {})]
+        self.receipt.side_effect = [good, good, good, good, ({**self.native_receipt, 'key': 'changed'}, [], {})]
         with self.assertRaisesRegex(ValueError, 'changed'):
             self.read()
 
@@ -139,7 +142,7 @@ class CompilerEvidenceTests(EvidenceTreeTests):
                      'tests/compiler_plan_tests.ouro', 'tests/compiler_refine_tests.ouro',
                      'tests/compiler_result_tests.ouro', 'tests/compiler_structural_tests.ouro',
                      'tests/compiler_fixture_13_tests.ouro', 'tests/compiler_fixture_14_tests.ouro',
-                     'tests/compiler_fixture_15_tests.ouro', 'tests/compiler_fixture_16_tests.ouro']
+                     'tests/compiler_fixture_15_tests.ouro', 'tests/source_span_tests.ouro']
         receipts = {f'{index}/16': {'inventory': inventory.copy(), 'runner_build_key': 'current',
                                   'runner_sha256': 'current', 'artifacts': [{'entry': entry}]}
                     for index, entry in enumerate(inventory, 1)}
@@ -187,11 +190,25 @@ class CompilerEvidenceTests(EvidenceTreeTests):
             with self.subTest(field=field), self.assertRaises(ValueError):
                 evidence.suite_receipt(self.log, self.root / 'compiler', shard='2/16')
 
+    def test_source_spans_receipt_is_isolated_in_last_shard(self):
+        selected = RunResult('ok', 0, 'tests/source_span_tests.ouro\n', '', 0.1, 10)
+        self.log.write_text('COMPILER_CHECK_OK source_spans-run\n'
+                            'COMPILER_CHECK_SUITE: PASS rows=1 out=' + self.directory.as_posix() + '\n',
+                            encoding='utf-8')
+        self.execute.side_effect = [self.listed, selected]
+        receipt = evidence.suite_receipt(self.log, self.root / 'compiler', shard='16/16')
+        self.assertEqual([row['entry'] for row in receipt['artifacts']], ['tests/source_span_tests.ouro'])
+        self.execute.side_effect = [self.listed, RunResult('ok', 0,
+            'tests/compiler_property_tests.ouro\n', '', 0.1, 10)]
+        with self.assertRaisesRegex(ValueError, 'partition'):
+            evidence.suite_receipt(self.log, self.root / 'compiler', shard='16/16')
+
     def test_tenth_shard_uses_the_complete_multidigit_index(self):
         inventory = [f'tests/compiler_fixture_{index}_tests.ouro' for index in range(9)]
         inventory[0] = 'tests/compiler_suite_contract_tests.ouro'
         inventory += ['tests/compiler_property_tests.ouro']
         inventory += [f'tests/compiler_fixture_{index}_tests.ouro' for index in range(10, 12)]
+        inventory += ['tests/source_span_tests.ouro']
         listed = RunResult('ok', 0, '\n'.join(inventory) + '\n', '', 0.1, 10)
         selected = RunResult('ok', 0, 'tests/compiler_property_tests.ouro\n', '', 0.1, 10)
         self.log.write_text('COMPILER_CHECK_OK compiler_property-run\n'
