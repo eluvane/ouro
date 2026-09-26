@@ -50,6 +50,7 @@ EXPR = {
     "EListSpread": "feature:form:list-spread",
     "ERange": "feature:form:range-literal",
     "ENamedCall": "feature:form:named-call",
+    "EIf": "feature:form:if-expression",
 }
 DECL = {"DDef": "feature:prelude", "DAxiom": "negative:effect-root-assumption-type", "DInductive": "feature:prelude",
         "DEffect": "feature:form:handler", "DImport": "property:import-dependency-order",
@@ -66,7 +67,9 @@ KEYWORD.update({"kwImport": "property:import-dependency-order", "kwEffect": "fea
                 "kwWhere": "feature:form:handler", "kwDo": "property:test-known-counts",
                 "kwPerform": "feature:form:handler", "kwHandle": "feature:form:handler", "kwRecord": "feature:form:record",
                 "kwAxiom": "negative:effect-root-assumption-type", "kwExtern": "feature:form:extern-declaration",
-                "kwOpen": "feature:parity:imports-open-local"})
+                "kwOpen": "feature:parity:imports-open-local",
+                "kwIf": "feature:form:if-expression", "kwThen": "feature:form:if-expression",
+                "kwElse": "feature:form:if-expression"})
 
 # Each exception names an actual missing oracle, rather than accepting new
 # source inventory items automatically. Migration checks treat these as gaps.
