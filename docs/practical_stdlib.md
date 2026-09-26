@@ -103,7 +103,12 @@ preserves the complete Nat value, including values beyond machine-word range.
 
 ## Lists and data
 
-Use `std/collections.ouro` when a program needs common list operations that are intentionally outside the small prelude: `nth_maybe`, `filter_map`, `map_indexed`, `indexed`, `find_index`, `split_at`, `chunks_of`, `list_take_last`, `list_drop_last`, `adjacent_pairs`, `dedup_adjacent`, `partition_map`, and `list_collect_results`.
+Use `std/collections.ouro` when a program needs common list operations that are intentionally outside the small prelude: `nth_maybe`, `filter_map`, `map_indexed`, `indexed`, `find_index`, `split_at`, `chunks_of`, `list_take_last`, `list_drop_last`, `adjacent_pairs`, `dedup_adjacent`, `partition_map`, `list_partition`, and `list_collect_results`.
+
+`list_partition A p xs` calls `p : A -> Bool` once per element in input order.
+It returns `(accepted, rejected)`, putting `True` elements on the left and
+`False` elements on the right. Both lists keep their input order; an empty
+input returns `([], [])`.
 
 `list_windows A width xs` returns overlapping, complete windows. Width zero,
 an empty input, and a width larger than the input return `[]`; for example,
