@@ -380,8 +380,9 @@ A local type ascription can provide the expected element type:
 def count : Nat := (([Z, S Z] : List Nat) |> length Nat);
 ```
 
-Untyped `[]` still requires context. If the first element has no inferable
-type, annotate the literal or binding; later elements do not resolve it.
+Untyped `[]` and ambiguous list literals still require context. If the first
+element has no inferable type, annotate the literal or binding; later elements
+do not resolve it.
 This is a bounded first-element hint, not general type unification. A free
 local type name shadowed by a later binding also needs an explicit `List A`
 annotation so the earlier type is not rebound under the later name.
