@@ -30,7 +30,7 @@ def programs(seed):
         yield {"name": name, "source": imports + declarations, "expected": n + m,
                "dependencies": [["leaf.ouro", PRELUDE + f"def value : Nat := {n};\n"]]}
     for name, source, expected, units in form_programs(seed):
-        if name in {"record", "list", "do-case-binding", "handler"}:
+        if name in {"record", "list", "list-spread", "do-case-binding", "handler"}:
             yield {"name": name, "source": source, "expected": expected, "dependencies": [], "units_needed": units}
     for mutation in mutations(seed):
         if mutation.name in {"pipe-missing-rhs", "list-context", "import-unknown"}:

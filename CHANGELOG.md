@@ -6,6 +6,9 @@ Development changes; see the [compatibility policy](docs/stability.md).
 
 ### Added
 
+- Final-tail list spreads `[first, ..rest]` build checked `List A` constructor
+  spines with once-bound prefix values and tail; a complete tail type can guide
+  an unannotated local list. See [Lists](docs/syntax.md#lists).
 - Lazy error-aware fallback for `Either` and ordered `Maybe` list traversal in
   the practical standard library.
 - Leading `{A : Type}` inductive parameters opt constructors in to bounded

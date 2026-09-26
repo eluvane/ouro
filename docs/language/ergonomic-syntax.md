@@ -1,7 +1,8 @@
 # Ergonomic syntax
 
 Grouped imports, positional calls, typed local helpers, pure expression
-blocks, and list trailing commas lower to existing syntax nodes. The
+blocks, list trailing commas, and final-tail list spreads lower to existing
+checked constructors. The
 maintained [syntax reference](../syntax.md) states accepted forms; this page
 records desugaring and compatibility boundaries.
 
@@ -330,6 +331,24 @@ including across whitespace and line comments. The parser builds the same
 parse errors. Empty lists keep the spelling `[]` and still need an expected
 `List A` type.
 
+## List spreads
+
+```text
+[first, second, ..rest]  ==  Cons A first (Cons A second rest)
+[..rest,]                ==  rest
+```
+
+The only spread marker is `..` before one final list tail. The parser makes
+an `EListSpread` rather than inserting a call to a user-defined `append`.
+Lowering requires the registered nominal `List A` constructor family and
+checks every prefix value and the tail at that exact type. When no expected
+type is present, a complete type hint from the tail may establish `List A`.
+Each prefix value and the tail receive a fresh typed local binding in source
+order; fresh IDs exceed the source tree and lowered terms, including IDs in
+direct AST inputs. The resulting constructor spine reuses the original tail.
+No spread is accepted outside list brackets, and extra elements after the
+tail, a second spread, or a second trailing comma are rejected.
+
 ## Record field punning
 
 ```ouro
@@ -434,8 +453,8 @@ Lint, strict quality, and analyzer import inventories read every operand,
 including multiline groups. Malformed import scans return an input error.
 The [bootstrap bridge](../build.md#c-bootstrap) supports grouped imports,
 calls, and helpers without rewriting the current source snapshot. Compiler
-bootstrap inputs do not use list trailing commas; the new parser accepts them
-after bootstrapping.
+bootstrap inputs do not use list trailing commas or spreads; the new parser
+accepts them after bootstrapping.
 
 `f (a b)` remains one argument; `f (a, b)` denotes two applications, regardless
 of whitespace. Grouped imports cannot carry aliases. Empty `f()` calls,
