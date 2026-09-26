@@ -67,11 +67,12 @@ let x : A := value in body
 A local helper can put its typed parameters next to its name:
 
 ```ouro
-let twice (x : Nat) : Nat := add x x in twice 2
+let twice (x : Nat) := add x x in twice 2
 ```
 
-This is a non-recursive lambda-binding. Parameterized local helpers require an
-explicit result annotation; [Ergonomic syntax](language/ergonomic-syntax.md#typed-local-helper-declarations)
+This is a non-recursive lambda-binding. Parameterized local helpers require
+typed parameters; the result annotation may be omitted when the body type can
+be inferred. [Ergonomic syntax](language/ergonomic-syntax.md#typed-local-helper-declarations)
 explains their scope and desugaring.
 
 ## Inductive data and pattern matching
@@ -268,6 +269,7 @@ def origin : Point := { x := Z, y := Z };
 def x : Nat := Z;
 def y : Nat := Z;
 def sameOrigin : Point := { y, x };
+def moved : Point := { origin with x := S Z };
 def originX : Nat := origin.x;
 ```
 
@@ -280,8 +282,23 @@ source does not change the constructor's declared field order. Unknown,
 duplicate, and missing fields remain errors; an unbound punned value is a
 compiler error.
 
-Functional record update, record pattern matching, anonymous records, row polymorphism,
-subtyping, and overloaded field resolution are not implemented.
+`{ origin with x := S Z }` creates a new `Point`, copying every unchanged field.
+The expected annotation supplies the nominal record type and the compiler checks
+both the base and changed field values against it. Multiple changed fields are
+bound in source order; constructor arguments follow declaration order. An
+unknown or repeated field is rejected. A path such as
+`{ user with address.city := next_city, address.zip := next_zip }` updates
+fields inside a nominal record field. Sibling paths are allowed; repeated paths
+and a path paired with its ancestor are rejected. The base and changed values
+are bound once in source order, while reconstructed constructor fields follow
+declaration order. A typed local binding, a record-valued field, or an explicit
+literal ascription such as `({ x := Z, y := Z } : Point)` supplies the expected
+nominal type for its own value. That type does not flow into unrelated function
+arguments. Updates without a known nominal result type and dependent record
+fields remain unsupported.
+
+Record pattern matching, anonymous records, row polymorphism, subtyping, and
+overloaded field resolution are not implemented.
 
 ## Application and the pipe operator
 
@@ -356,5 +373,5 @@ declaration do not require a trailing semicolon per arm.
 
 The [design goals](design.md#language-direction) and
 [stability policy](stability.md#experimental-areas) describe planned and
-experimental language areas. Record updates, unrestricted recursion, implicit
-arguments, and type classes are outside this surface.
+experimental language areas. Unrestricted recursion, implicit arguments, and
+type classes are outside this surface.
