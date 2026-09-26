@@ -95,6 +95,11 @@ def manifest_strategy(prefix, tool, expected, diagnostic):
                    "G.parse": TYPED,
                    "G.check": TYPED + properties("stdlib-workflow", "stdlib-application", "stdlib-tables")}
         return mapping.get(prefix, []), "Typed construction, independent values, and complete checked-program equality cover the historical construct family."
+    if prefix == "ERGO.B" and tool == "check" and expected == "fail" and diagnostic == "OURO-LIST-002":
+        return features("form:list") + ["external/ci/ergonomics"], (
+            "The archived trailing-comma rejection is superseded by accepted list syntax. "
+            "Generated nonempty lists and the ergonomics manifest check the accepted form; "
+            "double commas retain the OURO-LIST-002 rejection.")
     if diagnostic in OLD_DIAGNOSTICS:
         return negatives(OLD_DIAGNOSTICS[diagnostic]), "Historical prose is replaced by the current exact diagnostic-class contract."
     for name, row in contract().items():

@@ -76,8 +76,8 @@ def result : Nat := value;
         Mutation("named-hole", prefix + f"def {name} : Nat := ?goal{seed};", ("OURO-HOLE-001",)),
         Mutation("pipe-missing-rhs", prefix + f"def {name} : Nat := Z |>;", ("OURO-PIPE-001",)),
         Mutation("list-context", prefix + f"def {name} : Nat := [];", ("OURO-LIST-001",)),
-        Mutation("list-trailing-comma", prefix + "inductive List (A : Type) : Type := | Nil : List A | Cons : A -> List A -> List A;\n"
-                 + f"def {name} : List Nat := [Z,];", ("OURO-LIST-002",)),
+        Mutation("list-double-comma", prefix + "inductive List (A : Type) : Type := | Nil : List A | Cons : A -> List A -> List A;\n"
+                 + f"def {name} : List Nat := [Z,,];", ("OURO-LIST-002",)),
         Mutation("do-outside", prefix + f"def {name} : Nat := let! x := Z; x;", ("OURO-DO-001",)),
         Mutation("record-malformed", prefix + "record Point : Type where x Nat; end;", ("OURO-REC-001",)),
         Mutation("record-duplicate", prefix + "record Point : Type where x : Nat; x : Nat; end;", ("OURO-REC-002",)),
