@@ -103,20 +103,136 @@ def known_import_left (e : QualityInputError)
     io_pure (Either(QualityInputError, Pair(List String, List String)))
       (Left QualityInputError (Pair(List String, List String)) e);
 
+inductive LintSelectFact : Type :=
+  | MkLintSelectFact : String -> List ImportSelector -> LintSelectFact;
+
+inductive LintNameFact : Type :=
+  | MkLintNameFact : String -> List String -> List String -> LintNameFact;
+
+def lint_select_rules (from : String) (src : String)
+    : Either QualityInputError (List LintSelectFact) :=
+  match preprocess_imports_reg empty_imp_reg (ncodes src) with
+  | MkPair reg prepared => match prepared with
+    | ImpErr _ _ => Left QualityInputError (List LintSelectFact)
+        (QualityInvalidInput (concat from ": malformed import selection"))
+    | ImpOk _ => match reg with
+      | MkImpReg _ _ rules =>
+          Right QualityInputError (List LintSelectFact)
+            (concat_map ImpRule LintSelectFact
+              (fun (rule : ImpRule) => match rule with
+                | ImpSelected target selectors =>
+                    [MkLintSelectFact (resolve_import from (nstr target)) selectors]
+                | ImpPlain _ => Nil LintSelectFact
+                | ImpRecordGrant _ _ _ => Nil LintSelectFact
+                end) rules)
+      end
+    end
+  end;
+
+def lint_select_for (path : String)
+    : List LintSelectFact -> Maybe (List ImportSelector) :=
+  fix find (facts : List LintSelectFact) : Maybe (List ImportSelector) :=
+    match facts with
+    | Nil => Nothing (List ImportSelector)
+    | Cons fact rest => match fact with
+      | MkLintSelectFact target selectors =>
+          match prim_string_eq target path with
+          | True => Just (List ImportSelector) selectors
+          | False => find rest
+          end
+      end
+    end;
+
+def lint_selector_original (original : String)
+    : List ImportSelector -> Bool :=
+  fix find (selectors : List ImportSelector) : Bool :=
+    match selectors with
+    | Nil => False
+    | Cons selector rest => match selector with
+      | MkImportSelector old _ =>
+          match prim_string_eq (nstr old) original with
+          | True => True | False => find rest end
+      end
+    end;
+
+def lint_qualified_selected_for_path (path : String)
+    (aliases : List (Pair String String)) (root_rules : List LintSelectFact)
+    (names : List String) : List String :=
+  match lint_select_for path root_rules with
+  | Nothing => lint_qualified_for_path path aliases names
+  | Just selectors => lint_qualified_for_path path aliases
+      (filter String (fun (name : String) =>
+        lint_selector_original name selectors) names)
+  end;
+
+def lint_name_fact_for (path : String)
+    : List LintNameFact -> Maybe (Pair (List String) (List String)) :=
+  fix find (facts : List LintNameFact)
+      : Maybe (Pair (List String) (List String)) :=
+    match facts with
+    | Nil => Nothing (Pair (List String) (List String))
+    | Cons fact rest => match fact with
+      | MkLintNameFact target names ctors =>
+          match prim_string_eq target path with
+          | True => Just (Pair (List String) (List String))
+              (known_pair names ctors)
+          | False => find rest
+          end
+      end
+    end;
+
+def lint_selected_inventory (selected : List LintSelectFact)
+    (facts : List LintNameFact)
+    : Pair (List String) (List String) :=
+  foldl LintSelectFact (Pair (List String) (List String))
+    (fun (acc : Pair (List String) (List String))
+        (selection : LintSelectFact) =>
+      match acc with | MkPair names ctors => match selection with
+        | MkLintSelectFact target selectors =>
+            match lint_name_fact_for target facts with
+            | Nothing => acc
+            | Just pair => match pair with
+              | MkPair source_names source_ctors =>
+                  foldl ImportSelector (Pair (List String) (List String))
+                    (fun (current : Pair (List String) (List String))
+                        (selector : ImportSelector) =>
+                      match current with | MkPair ns cs => match selector with
+                        | MkImportSelector original local =>
+                            let old : String := nstr original in
+                            let new : String := nstr local in
+                            known_pair
+                              (match mem_str old source_names with
+                               | True => Cons String new ns | False => ns end)
+                              (match mem_str old source_ctors with
+                               | True => Cons String new cs | False => cs end)
+                        end end)
+                    (known_pair names ctors) selectors
+              end
+            end
+        end end)
+    (known_pair (Nil String) (Nil String)) selected;
+
 -- Import discovery has one result: the whole harvested cone or a typed error.
 -- Missing imports, directories, links and exhausted work are not unknown-name
 -- evidence and must never turn into a successful partial constructor inventory.
-def known_go : Nat -> List (Pair String String) -> List String -> List String
-    -> List String -> List String
+def known_go : Nat -> List (Pair String String) -> List LintSelectFact
+    -> List LintSelectFact -> List LintNameFact
+    -> List String -> List String -> List String -> List String
     -> IO (Either QualityInputError (Pair (List String) (List String))) :=
   fix known_go (fuel : Nat) (aliases : List (Pair String String))
+      (root_rules : List LintSelectFact) (selected : List LintSelectFact)
+      (facts : List LintNameFact)
       (pending : List String) (seen : List String)
       (names : List String) (ctors : List String)
       : IO (Either QualityInputError (Pair (List String) (List String))) :=
     match pending with
-    | Nil => io_pure (Either(QualityInputError, Pair(List String, List String)))
-        (Right QualityInputError (Pair(List String, List String))
-          (known_pair names ctors))
+    | Nil => match lint_selected_inventory selected facts with
+      | MkPair picked picked_ctors =>
+          io_pure (Either(QualityInputError, Pair(List String, List String)))
+            (Right QualityInputError (Pair(List String, List String))
+              (known_pair (append String picked names)
+                (append String picked_ctors ctors)))
+      end
     | Cons path rest =>
         match fuel with
         | Z => io_pure (Either(QualityInputError, Pair(List String, List String)))
@@ -124,7 +240,8 @@ def known_go : Nat -> List (Pair String String) -> List String -> List String
               (QualityImportExhausted path))
         | S fuel2 =>
             match mem_str path seen with
-            | True => known_go fuel2 aliases rest seen names ctors
+            | True => known_go fuel2 aliases root_rules selected facts
+                rest seen names ctors
             | False =>
                 do let! loaded := quality_read_file path;
                    match loaded with
@@ -135,15 +252,26 @@ def known_go : Nat -> List (Pair String String) -> List String -> List String
                        match harvest_imports src with
                        | Left e => known_import_left (lint_scan_failure path src e)
                        | Right imports =>
-                           let names2 : List String := harvest_names src in
-                           let ctors2 : List String := harvest_ctor_names src in
-                           known_go fuel2 aliases
-                             (snoc_resolved path imports rest)
-                             (Cons String path seen)
-                             (append String (lint_qualified_for_path path aliases names2)
-                               (append String names2 names))
-                             (append String (lint_qualified_for_path path aliases ctors2)
-                               (append String ctors2 ctors))
+                           match lint_select_rules path src with
+                           | Left e => known_import_left e
+                           | Right local_rules =>
+                               let names2 : List String := harvest_names src in
+                               let ctors2 : List String := harvest_ctor_names src in
+                               known_go fuel2 aliases root_rules
+                                 (append LintSelectFact local_rules selected)
+                                 (Cons LintNameFact
+                                   (MkLintNameFact path names2 ctors2) facts)
+                                 (snoc_resolved path imports rest)
+                                 (Cons String path seen)
+                                 (append String
+                                   (lint_qualified_selected_for_path path aliases
+                                     root_rules names2)
+                                   (append String names2 names))
+                                 (append String
+                                   (lint_qualified_selected_for_path path aliases
+                                     root_rules ctors2)
+                                   (append String ctors2 ctors))
+                           end
                        end
                    end
             end
@@ -157,9 +285,14 @@ def collect_known (path : String) (src : String)
     match scan_source_imports src with
     | Left e => known_import_left (lint_scan_failure path src e)
     | Right rows =>
-        known_go quality_walk_budget (lint_alias_targets path rows)
-          (snoc_resolved(path, harvest_import_paths rows, Nil String))
-          (singleton String path) (Nil String) (Nil String)
+        match lint_select_rules path src with
+        | Left e => known_import_left e
+        | Right root_rules =>
+            known_go quality_walk_budget (lint_alias_targets path rows)
+              root_rules root_rules (Nil LintNameFact)
+              (snoc_resolved(path, harvest_import_paths rows, Nil String))
+              (singleton String path) (Nil String) (Nil String)
+        end
     end;
 
 -- Harvest cache is per worker, not a second semantic authority. A file's
@@ -309,28 +442,36 @@ def lint_known_left (e : QualityInputError)
       (Left QualityInputError
         (Pair(Pair(List String, List String), LintHarvestCache)) e);
 
-def known_go_cached : Nat -> List (Pair String String) -> List String
-    -> List String -> List String -> List String -> LintHarvestCache
+def known_go_cached : Nat -> List (Pair String String) -> List LintSelectFact
+    -> List LintSelectFact -> List LintNameFact
+    -> List String -> List String -> List String -> List String -> LintHarvestCache
     -> IO (Either QualityInputError
         (Pair (Pair (List String) (List String)) LintHarvestCache)) :=
   fix known_go_cached (fuel : Nat) (aliases : List (Pair String String))
+      (root_rules : List LintSelectFact) (selected : List LintSelectFact)
+      (name_facts : List LintNameFact)
       (pending : List String) (seen : List String)
       (names : List String) (ctors : List String) (cache : LintHarvestCache)
       : IO (Either QualityInputError
         (Pair (Pair (List String) (List String)) LintHarvestCache)) :=
     match pending with
-    | Nil => io_pure (Either QualityInputError
-        (Pair(Pair(List String, List String), LintHarvestCache)))
-        (Right QualityInputError
-          (Pair(Pair(List String, List String), LintHarvestCache))
-          (MkPair (Pair(List String, List String)) LintHarvestCache
-            (known_pair names ctors) cache))
+    | Nil => match lint_selected_inventory selected name_facts with
+      | MkPair picked picked_ctors =>
+          io_pure (Either QualityInputError
+            (Pair(Pair(List String, List String), LintHarvestCache)))
+            (Right QualityInputError
+              (Pair(Pair(List String, List String), LintHarvestCache))
+              (MkPair (Pair(List String, List String)) LintHarvestCache
+                (known_pair (append String picked names)
+                  (append String picked_ctors ctors)) cache))
+      end
     | Cons path rest =>
         match fuel with
         | Z => lint_known_left (QualityImportExhausted path)
         | S fuel2 =>
             match mem_str path seen with
-            | True => known_go_cached fuel2 aliases rest seen names ctors cache
+            | True => known_go_cached fuel2 aliases root_rules selected
+                name_facts rest seen names ctors cache
             | False =>
                 do let! loaded := quality_read_file path;
                    match loaded with
@@ -344,15 +485,25 @@ def known_go_cached : Nat -> List (Pair String String) -> List String
                               | Left e => lint_known_left e
                               | Right facts => match facts with
                                 | MkLintFileFacts imports names2 ctors2 next =>
-                                    known_go_cached fuel2 aliases
-                                      (snoc_resolved path imports rest)
-                                      (Cons String path seen)
-                                      (append String
-                                        (lint_qualified_for_path path aliases names2)
-                                        (append String names2 names))
-                                      (append String
-                                        (lint_qualified_for_path path aliases ctors2)
-                                        (append String ctors2 ctors)) next
+                                    match lint_select_rules path src with
+                                    | Left e => lint_known_left e
+                                    | Right local_rules =>
+                                        known_go_cached fuel2 aliases root_rules
+                                          (append LintSelectFact local_rules selected)
+                                          (Cons LintNameFact
+                                            (MkLintNameFact path names2 ctors2)
+                                            name_facts)
+                                          (snoc_resolved path imports rest)
+                                          (Cons String path seen)
+                                          (append String
+                                            (lint_qualified_selected_for_path path
+                                              aliases root_rules names2)
+                                            (append String names2 names))
+                                          (append String
+                                            (lint_qualified_selected_for_path path
+                                              aliases root_rules ctors2)
+                                            (append String ctors2 ctors)) next
+                                    end
                                 end
                               end
                           end
@@ -375,10 +526,16 @@ def collect_known_into (path : String) (src : String) (cache : LintHarvestCache)
                  match scan_source_imports src with
                  | Left e => lint_known_left (lint_scan_failure path src e)
                  | Right rows =>
-                     known_go_cached quality_walk_budget
-                       (lint_alias_targets path rows)
-                       (snoc_resolved path imports (Nil String))
-                       (singleton String path) (Nil String) (Nil String) next
+                     match lint_select_rules path src with
+                     | Left e => lint_known_left e
+                     | Right root_rules =>
+                         known_go_cached quality_walk_budget
+                           (lint_alias_targets path rows)
+                           root_rules root_rules (Nil LintNameFact)
+                           (snoc_resolved path imports (Nil String))
+                           (singleton String path) (Nil String) (Nil String)
+                           next
+                     end
                  end
              end
            end

@@ -23,13 +23,14 @@ checker allowlist dependency or host IO authority.
 Record preprocessing uses canonical source paths and local import bindings to
 select the shape of a qualified literal or projection. It preserves the
 qualified type and base, and fails when the aliased file does not own the
-record accessor. For unqualified bases, an imported record's generated
-constructor or accessor uses its direct alias when present; without one, a
-same-spelled bare atom in the source makes the compiler generate a fresh,
-file-local internal alias bound to the canonical record owner. Raw source
-cannot spell the marker separator, and each generated reference still passes
-through module resolution and the complete declaration checker. The text-only
-record preprocessor rejects output that would require alias metadata.
+record accessor. Generated constructor and accessor references carry exact
+marker, owner, and member grants for atoms actually emitted by record sugar.
+The module resolver validates those grants against the file's effective
+import scope, so a selective edge cannot expose a hidden accessor through
+record syntax. Raw source cannot spell the marker separator, and each
+generated reference still passes through module resolution and the complete
+declaration checker. The text-only record preprocessor rejects output that
+would require this metadata.
 When a qualified reference resolves to a global name also used by a lexical
 binder, the module pass interns a distinct binder ID before lowering. It
 rewrites bound uses with that ID and keeps the qualified reference attached to
