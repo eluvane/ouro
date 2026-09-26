@@ -5,6 +5,9 @@
 -- @entry lower_expr_env2
 
 import "lower_support.ouro",
+  "lower_fallible.ouro",
+  "lower_implicit.ouro",
+  "lower_implicit_function.ouro",
   "../std/types.ouro",
   "pipeline_abi.ouro",
   "lower_env.ouro";
@@ -18,7 +21,18 @@ def lower_xvvar
   (fixSelf : Maybe Nat)
   (locals : List (Pair Nat Surface))
   (n : Nat) : LowerVal :=
-VSurf (resolve_var_fix env fixSelf locals n);
+    match lower_implicit_constructor _lower_run _fuel' env _er fixSelf locals
+        (EVar n) with
+    | InferredCtor term => VSurf term
+    | NoMarkedCtor =>
+        match lower_implicit_function _lower_run _fuel' env _er fixSelf locals
+            (EVar n) with
+        | InferredDef term => VSurf term
+        | NoMarkedDef => VSurf (resolve_var_fix env fixSelf locals n)
+        | MarkedDefWithoutHint => VSurf (resolve_var_fix env fixSelf locals n)
+        end
+    | MarkedCtorWithoutHint => VSurf (resolve_var_fix env fixSelf locals n)
+    end;
 
 def lower_xvhole
   (_lower_run : Nat -> LowerEnv -> Maybe Surface -> Maybe Nat -> List (Pair Nat Surface) -> LowerMode -> LowerVal)
@@ -112,14 +126,27 @@ def lower_xvapp
   (locals : List (Pair Nat Surface))
   (f : Expr)
   (a : Expr) : LowerVal :=
-    let fs : Surface :=
-      vsurf_or_hole
-        (lower_run fuel' env (app_function_expected f er) fixSelf locals (LExpr f)) in
-    let aa : Surface :=
-      vsurf_or_hole
-        (lower_run fuel' env (surface_argument_expected env locals fs)
-          fixSelf locals (LExpr a)) in
-    VSurf (SApp fs aa);
+    let ordinary_app (function_expected : Maybe Surface) : LowerVal :=
+      let function : Surface :=
+        vsurf_or_hole
+          (lower_run fuel' env function_expected fixSelf locals (LExpr f)) in
+      let argument : Surface :=
+        vsurf_or_hole
+          (lower_run fuel' env (surface_argument_expected env locals function)
+            fixSelf locals (LExpr a)) in
+      VSurf (SApp function argument) in
+    match lower_implicit_constructor lower_run fuel' env er fixSelf locals
+        (EApp f a) with
+    | InferredCtor term => VSurf term
+    | NoMarkedCtor =>
+        match lower_implicit_function lower_run fuel' env er fixSelf locals
+            (EApp f a) with
+        | InferredDef term => VSurf term
+        | NoMarkedDef => ordinary_app (app_function_expected f er)
+        | MarkedDefWithoutHint => ordinary_app (Nothing Surface)
+        end
+    | MarkedCtorWithoutHint => ordinary_app (Nothing Surface)
+    end;
 
 def lower_xvlam
   (lower_run : Nat -> LowerEnv -> Maybe Surface -> Maybe Nat -> List (Pair Nat Surface) -> LowerMode -> LowerVal)
@@ -132,16 +159,33 @@ def lower_xvlam
   (ann : Maybe Expr)
   (body : Expr) : LowerVal :=
     let annE : Expr := from_maybe_expr ann in
+    let expectedDomain : Maybe Surface :=
+      match ann with
+      | Nothing => lambda_domain_hint locals er
+      | Just _ => Nothing Surface
+      end in
     let annS : Surface :=
       match ann with
-      | Nothing => SInd Z
+      | Nothing =>
+          match expectedDomain with
+          | Nothing => SInd Z
+          | Just domain => domain
+          end
       | Just _ =>
           vsurf_or_hole
             (lower_run fuel' env er fixSelf locals (LExpr annE))
       end in
     let locals' : List (Pair Nat Surface) :=
       cons_local name annS locals in
-    let erBody : Maybe Surface := peel_er_lam er in
+    let erBody : Maybe Surface :=
+      match ann with
+      | Just _ => peel_er_lam er
+      | Nothing =>
+          match expectedDomain with
+          | Nothing => peel_er_lam er
+          | Just _ => lambda_body_expected er name
+          end
+      end in
     let bodyS : Surface :=
       vsurf_or_hole
         (lower_run fuel' env erBody fixSelf locals' (LExpr body)) in
@@ -492,6 +536,9 @@ def lower_run : Nat -> LowerEnv -> Maybe Surface -> Maybe Nat -> List (Pair Nat 
             | XVPerform op args => lower_xvperform recur fuel' env er fixSelf locals op args
             | XVHandle comp clauses => lower_xvhandle recur fuel' env er fixSelf locals comp clauses
             | XVDo stmts => lower_xvdo recur fuel' env er fixSelf locals stmts
+            | XVFallible container failure success body =>
+                lower_xvfallible recur fuel' env fixSelf locals
+                  container failure success body
             | XVUnsupported => lower_xvunsupported recur fuel' env er fixSelf locals
             end
         | LBranch params family br => lower_lbranch recur fuel' env er fixSelf locals params family br

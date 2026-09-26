@@ -365,6 +365,19 @@ class HarnessTests(unittest.TestCase):
                 run_manifest(SimpleNamespace(seed=-1, out=out))
             self.assertEqual(before, sorted(path.relative_to(out).as_posix() for path in out.rglob("*")))
 
+    def test_ergonomics_setup_comment_cannot_consume_candidate_or_lint_variant(self):
+        from ourosmith.ergonomics_inputs import render
+
+        case = {"type": "ErgNat", "sugar": "ErgZero", "canonical": "ErgZero",
+                "setup": "def setup : ErgNat := ErgZero; -- final comment"}
+        regular = render(case, Path("fixture"))
+        lint = render(dict(case, source="def ergo_expansion_candidate : ErgNat := ErgZero;"),
+                      Path("fixture"))
+        self.assertIn("-- final comment\ndef ergo_expansion_candidate", regular)
+        self.assertIn("\ndef ergo_expansion_reference", regular)
+        self.assertIn("-- final comment\ndef ergo_expansion_candidate", lint)
+        self.assertEqual(lint.count("def setup : ErgNat"), 1)
+
     def test_migration_requires_exact_executed_categories(self):
         from ourosmith import migration_contracts as mapping
         from ourosmith.migration import exercised, refresh

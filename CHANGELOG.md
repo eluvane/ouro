@@ -6,6 +6,19 @@ Development changes; see the [compatibility policy](docs/stability.md).
 
 ### Added
 
+- Leading `{A : Type}` inductive parameters opt constructors in to bounded
+  inference from a direct expected family or direct value-field type hints on
+  saturated calls; explicit calls remain valid. See
+  [Marked constructor parameters](docs/language/ergonomic-syntax.md#marked-constructor-parameters).
+- Leading `{A : Type}` definition parameters opt calls in to bounded value
+  and expected type inference, including nondependent callback and collection
+  type shapes. Explicit full and partial calls remain valid. See
+  [Marked definition parameters](docs/language/ergonomic-syntax.md#marked-definition-parameters).
+- Typed `let?` blocks propagate `Either`- or `Maybe`-shaped failures through
+  explicit constructor roles and lower to checked cases; see
+  [Ergonomic syntax](docs/language/ergonomic-syntax.md#typed-fallible-blocks).
+- Pure `let { ... }` expression blocks accept sequential local bindings and a
+  mandatory final expression; see [Ergonomic syntax](docs/language/ergonomic-syntax.md#pure-expression-blocks).
 - Nonempty list literals can infer an element type from their first element
   without an expected `List A` context; empty and ambiguous literals still
   require an annotation.
@@ -17,6 +30,7 @@ Development changes; see the [compatibility policy](docs/stability.md).
   [Clippy reference](docs/clippy_grade_firewall.md).
 - [Grouped imports, positional call groups, and typed local helpers](docs/language/ergonomic-syntax.md),
   including the migration from `f (a, b)` as one grouped expression to two arguments.
+- Trailing commas in nonempty list literals, including multiline lists with comments.
 - Local and pinned-Git package dependencies with deterministic manifests and
   locks, rejection fixtures, a reusable-library sample, and a consuming
   application; see [Packages](docs/pkg.md).
@@ -26,6 +40,8 @@ Development changes; see the [compatibility policy](docs/stability.md).
 
 ### Changed
 
+- Expected function domains now guide nested callbacks and parameterized
+  matches inside short lambdas when the domain is unambiguous and complete.
 - Run PR parity and syntax-quality gates in separate required jobs to shorten
   the serial `checks` group; nightly retains both gates in its `checks` group.
 - Split compiler-checking fixtures across sixteen PR and nightly jobs, with
