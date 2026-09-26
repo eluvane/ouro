@@ -10,9 +10,10 @@ def st_add (xs : List QrFinding) (f : QrFinding) : List QrFinding :=
     Cons QrFinding f xs;
 
 def st_scan_old_do (mp : List (Pair String QrDiag)) (profile : String)
-    (path : String) (line_no : Nat) (raw : String) (acc : List QrFinding)
+    (path : String) (line_no : Nat) (raw : String) (code : String)
+    (acc : List QrFinding)
     : List QrFinding :=
-    match st_old_do_col raw with
+    match st_old_do_col code with
     | Nothing => acc
     | Just col => st_add acc
         (qr_mk_finding mp profile "OURO-LINT030"
@@ -21,47 +22,56 @@ def st_scan_old_do (mp : List (Pair String QrDiag)) (profile : String)
     end;
 
 def st_scan_lines (mp : List (Pair String QrDiag)) (profile : String)
-    (path : String) (lines : List String) (acc : List QrFinding) : List QrFinding :=
-    (fix go (fuel : Nat) (xs : List String) (n : Nat) (out : List QrFinding)
+    (path : String) (lines : List String) (code_lines : List String)
+    (acc : List QrFinding) : List QrFinding :=
+    (fix go (fuel : Nat) (xs : List String) (codes : List String)
+        (n : Nat) (out : List QrFinding)
         : List QrFinding :=
       match fuel with
       | Z => out
       | S fuel2 => match xs with
         | Nil => out
-        | Cons raw rest => go fuel2 rest (add n 1)
-            (st_scan_old_do mp profile path n raw out)
+        | Cons raw rest => match codes with
+          | Nil => out
+          | Cons code remaining => go fuel2 rest remaining (add n 1)
+              (st_scan_old_do mp profile path n raw code out)
+          end
         end
-      end) (add(length String lines, 1)) lines 1 acc;
+      end) (add(length String lines, 1)) lines code_lines 1 acc;
 
 def st_seen_get (xs : List (Pair String Nat)) (k : String) : Maybe Nat :=
     lookup String Nat prim_string_eq k xs;
 
 def st_scan_opens (mp : List (Pair String QrDiag)) (profile : String)
-    (path : String) (lines : List String) (acc : List QrFinding) : List QrFinding :=
-    (fix go (fuel : Nat) (xs : List String) (n : Nat)
+    (path : String) (lines : List String) (code_lines : List String)
+    (acc : List QrFinding) : List QrFinding :=
+    (fix go (fuel : Nat) (xs : List String) (codes : List String) (n : Nat)
         (out : List QrFinding) : List QrFinding :=
       match fuel with
       | Z => out
       | S fuel2 => match xs with
         | Nil => out
-        | Cons raw rest =>
-            let code : String := qt_strip (qt_code_before_comment raw) in
+        | Cons raw rest => match codes with
+          | Nil => out
+          | Cons code_line remaining =>
+            let code : String := qt_strip (qt_code_before_comment code_line) in
             match st_open_alias code with
-            | Nothing => go fuel2 rest (add n 1) out
+            | Nothing => go fuel2 rest remaining (add n 1) out
             | Just name =>
                 let col : Nat := match qt_find raw "open" with
                   | Nothing => 1
                   | Just i => add i 1
                   end in
-                go fuel2 rest (add n 1)
+                go fuel2 rest remaining (add n 1)
                   (st_add out (qr_mk_finding mp profile "OURO-LINT044"
                     (st_place path n col)
                     (qt_cat3 "top-level open of alias '" name
                       "' leaks names across the file")
                     (qt_strip raw)))
             end
+          end
         end
-      end) (add(length String lines, 1)) lines 1 acc;
+      end) (add(length String lines, 1)) lines code_lines 1 acc;
 
 def st_import_failure (path : String) (line : Nat) (col : Nat) : String :=
     prim_string_concat
@@ -77,7 +87,8 @@ def st_import_error_message (path : String) (text : String) (error : ImportScanE
     end;
 
 def st_scan_imports (mp : List (Pair String QrDiag)) (profile : String)
-    (path : String) (text : String) (lines : List String) (acc : List QrFinding)
+    (path : String) (text : String) (lines : List String)
+    (code_lines : List String) (acc : List QrFinding)
     : Either ImportScanError (List QrFinding) :=
     match scan_source_imports text with
     | Left error => Left ImportScanError (List QrFinding) error
@@ -87,7 +98,7 @@ def st_scan_imports (mp : List (Pair String QrDiag)) (profile : String)
             : Either ImportScanError (List QrFinding) :=
           match xs with
           | Nil => Right ImportScanError (List QrFinding)
-              (st_scan_opens mp profile path lines out)
+              (st_scan_opens mp profile path lines code_lines out)
           | Cons item rest => match item with
             | MkScannedImport target alias _ start _ alias_start =>
                 match import_scan_place text start with
@@ -249,12 +260,12 @@ def st_wildcard_col (code : String) : Maybe Nat :=
 -- Each declaration is a bounded host arena; the shared source stays in its parent.
 inductive StDefScan : Type :=
   | StDefScanOf : List (Pair String QrDiag) -> String -> String -> List String
-      -> Nat -> Nat -> StDefScan;
+      -> List String -> Nat -> Nat -> StDefScan;
 
 def st_scan_def_span (request : StDefScan) (acc : List QrFinding) : List QrFinding :=
     match request with
-    | StDefScanOf mp profile path lines start finish =>
-    let public_def : Bool := st_public_near lines start in
+    | StDefScanOf mp profile path lines code_lines start finish =>
+    let public_def : Bool := st_public_near code_lines start in
     (fix go (fuel : Nat) (ix : Nat) (out : List QrFinding) : List QrFinding :=
       match fuel with
       | Z => out
@@ -262,7 +273,8 @@ def st_scan_def_span (request : StDefScan) (acc : List QrFinding) : List QrFindi
         | False => out
         | True =>
             let raw : String := nth String "" ix lines in
-            let code : String := qt_code_before_comment raw in
+            let code : String := qt_code_before_comment
+              (nth String "" ix code_lines) in
             let out2 : List QrFinding := match qt_find_unquoted code ";;" with
               | Nothing => out
               | Just i => st_add out
@@ -293,7 +305,7 @@ def st_scan_def_span (request : StDefScan) (acc : List QrFinding) : List QrFindi
                                     | False => st_nlines_sentinel
                                     | True =>
                                         let look_code : String := qt_strip
-                                          (qt_code_before_comment (nth String "" j lines)) in
+                                          (qt_code_before_comment (nth String "" j code_lines)) in
                                         match prim_string_length look_code with
                                         | Z => look(l2, add j 1)
                                         | S _ => match prim_string_starts look_code "[" with
@@ -338,8 +350,9 @@ def st_scan_def_span (request : StDefScan) (acc : List QrFinding) : List QrFindi
     end;
 
 def st_scan_defs (mp : List (Pair String QrDiag)) (profile : String)
-    (path : String) (lines : List String) (acc : List QrFinding) : List QrFinding :=
-    let spans : List (Pair Nat Nat) := st_def_spans lines in
+    (path : String) (lines : List String) (code_lines : List String)
+    (acc : List QrFinding) : List QrFinding :=
+    let spans : List (Pair Nat Nat) := st_def_spans code_lines in
     (fix go (fuel : Nat) (xs : List (Pair Nat Nat)) (out : List QrFinding)
         : List QrFinding :=
       match fuel with
@@ -348,7 +361,7 @@ def st_scan_defs (mp : List (Pair String QrDiag)) (profile : String)
         | Nil => out
         | Cons span rest => match span with
           | MkPair start finish => go fuel2 rest
-              (st_scan_def_span(StDefScanOf mp profile path lines start finish, out))
+              (st_scan_def_span(StDefScanOf mp profile path lines code_lines start finish, out))
           end
         end
       end) (add(length(Pair Nat Nat, spans), 1)) spans acc;

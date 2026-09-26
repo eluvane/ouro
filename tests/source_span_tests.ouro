@@ -118,6 +118,7 @@ def ss_expr : Expr -> List Nat -> List Nat :=
     | EFallible container failure success body =>
         Cons Nat 25 (ss_expr container
           (Cons Nat failure (Cons Nat success (ss_expr body acc))))
+    | EOpen alias inner => Cons Nat 26 (Cons Nat alias (ss_expr inner acc))
     end;
 
 def ss_pairs : List (Pair Nat Expr) -> List Nat -> List Nat :=
@@ -235,8 +236,8 @@ def ss_parse_agrees (fuel : Nat) (tokens : List Token) : Bool :=
 
 def ss_agrees_codes (codes : List Nat) : Bool :=
     let fuel : Nat := ss_fuel codes in
-    let spanned : LexResult := lex_spanned_result (lex_spanned fuel codes empty_intern) in
-    match lex_all fuel codes with
+    let spanned : LexResult := lex_spanned_result (lex_spanned_import fuel codes empty_intern) in
+    match lex_all_import fuel codes with
     | LexOk tokens st =>
         match spanned with
         | LexOk tokens2 st2 =>
@@ -267,6 +268,7 @@ def ss_ranges : Expr -> Nat -> Nat -> List SsRange -> List SsRange :=
     | ESpan first past inner =>
         Cons SsRange (MkSsRange first past (ss_within first past outer_first outer_past) inner)
           (ss_ranges inner first past acc)
+    | EOpen _ inner => ss_ranges inner outer_first outer_past acc
     | EVar _ => acc
     | EHole _ => acc
     | ESort _ => acc
@@ -388,7 +390,7 @@ def ss_tags (tokens : List Token) : List Nat := map Token Nat token_tag tokens;
 -- A slice is exact when lexing it alone yields the tokens [first, past) of the
 -- whole source, with nothing before or after them.
 def ss_exact_slice (tokens : List Token) (first : Nat) (past : Nat) (slice : List Nat) : Bool :=
-    match lex_all(ss_fuel slice, slice) with
+    match lex_all_import(ss_fuel slice, slice) with
     | LexOk own _ =>
         source_bytes_equal (ss_tags own)
           (append Nat (ss_tags (take(Token, sub past first, drop Token first tokens))) [token_tag TEof])
@@ -416,7 +418,7 @@ def ss_fold_slices_codes_part (A : Type) (codes : List Nat) (part : Nat) (parts 
     | True =>
     let fuel : Nat := ss_fuel codes in
     let text : String := prim_string_of_char_codes codes in
-    let lexed : LexSpanned := lex_spanned fuel codes empty_intern in
+    let lexed : LexSpanned := lex_spanned_import fuel codes empty_intern in
     match lex_spanned_result lexed with
     | LexMalformed _ => Nothing A
     | LexExhausted _ => Nothing A
@@ -527,6 +529,39 @@ def ss_parses (text : String) : Bool :=
     | LexExhausted _ => False
     end;
 
+def ss_lowfuel_numeric : Bool :=
+    let malformed : List Nat := prim_string_to_char_codes "0xFFG" in
+    let accepted : List Nat := prim_string_to_char_codes "0xFF" in
+    match lex_all 6 malformed with
+    | LexMalformed _ =>
+        match lex_spanned_result (lex_spanned 6 malformed empty_intern) with
+        | LexMalformed _ =>
+            match lex_all 6 accepted with
+            | LexOk tokens _ =>
+                match tokens with
+                | Nil => False
+                | Cons first rest =>
+                    match tokenIsNat first with
+                    | Nothing => False
+                    | Just value =>
+                        match rest with
+                        | Nil => False
+                        | Cons last tail =>
+                            andb (eqNat value 255)
+                              (andb (nullb Token tail) (is_eof last))
+                        end
+                    end
+                end
+            | LexMalformed _ => False
+            | LexExhausted _ => False
+            end
+        | LexOk _ _ => False
+        | LexExhausted _ => False
+        end
+    | LexOk _ _ => False
+    | LexExhausted _ => False
+    end;
+
 def ss_samples : List String :=
     [ "def f : Nat := g (h x) |> k;"
     , "def s : String := \"a\\\"b -- c\"; -- trailing"
@@ -548,24 +583,36 @@ def ss_samples : List String :=
     , "extern get_pid : Runtime U32 := \"windows-x86_64\" \"win64\" \"kernel32.dll\" \"GetCurrentProcessId\" \"maygc\";"
     , "representation Natural := \"ouro.nat\";"
     , "def checked : Maybe Nat := let? (Nothing, Just) : Maybe Nat do let x : Nat := source?; x end;"
+    , "def raw : String := r#\"first\n-- import \"fake.ouro\"\nlast\"#;"
     , "def bad : Nat := ;"
     , "def bad : Nat := (a b;"
     , "def bad : String := \"open"
+    , "def bad : String := r#\"open"
     ];
 
 def ss_laws : List (Pair String Bool) :=
     [ MkPair String Bool "agree/samples" (all String ss_agrees ss_samples)
+    , MkPair String Bool "agree/scoped-open"
+        (ss_agrees "def chosen : Type := open A in Shared;")
     , MkPair String Bool "spans/stream-equals-collected" (all String ss_stream_agrees_with_slices ss_samples)
     , MkPair String Bool "spans/partition-equals-whole" (all String ss_parts_agree_with_whole ss_samples)
     , MkPair String Bool "parse/valid-samples-parse"
-        (all String ss_parses (take String 20 ss_samples))
+        (all String ss_parses (take String 21 ss_samples))
     , MkPair String Bool "parse/malformed-samples-fail"
-        (notb (any String ss_parses (drop String 20 ss_samples)))
+        (notb (any String ss_parses (drop String 21 ss_samples)))
     , MkPair String Bool "spans/pipe-application-and-parens"
         (ss_spans_expect "def f : Nat := g ((h x)) |> k;"
           ["g ((h x)) |> k", "g ((h x))", "(h x)", "h x", "g", "h", "x", "k", "Nat"] [])
     , MkPair String Bool "spans/escaped-string-literal"
         (ss_spans_expect "def s : String := \"a\\\"b -- c\"; -- trailing" ["\"a\\\"b -- c\"", "String"] [])
+    , MkPair String Bool "spans/braced-unicode-preserves-raw-source"
+        (ss_spans_expect "def s : String := \"\\u{1F600}\";"
+          ["\"\\u{1F600}\"", "String"] [])
+    , MkPair String Bool "spans/raw-source-bytes-and-following-position"
+        (ss_spans_expect "def s : String := r#\"A\\n\n-- fake\nB\"#; def n : Nat := 42;"
+          ["r#\"A\\n\n-- fake\nB\"#", "42", "Nat"] [])
+    , MkPair String Bool "spans/malformed-unicode-agrees-with-lexer"
+        (ss_agrees "def s : String := \"\\u{D800}\";")
     , MkPair String Bool "spans/crlf-lines"
         (ss_spans_expect "def a : Nat := one;\r\ndef b : Nat := a;\r\n" ["one", "a", "Nat"] [])
     , MkPair String Bool "spans/utf8-bytes"
@@ -584,8 +631,49 @@ def ss_laws : List (Pair String Bool) :=
     , MkPair String Bool "spans/pure-expression-block"
         (ss_spans_expect "def id : Nat := let { let x : Nat := one; x };"
           ["let { let x : Nat := one; x }", "one", "x", "Nat"] [])
+    , MkPair String Bool "spans/hex-numeric-raw-bytes"
+        (ss_spans_expect "def mask : Nat := 0xF_F;" ["0xF_F", "Nat"] [])
+    , MkPair String Bool "spans/binary-numeric-raw-bytes"
+        (ss_spans_expect "def bits : Nat := 0b10_01;" ["0b10_01", "Nat"] [])
+    , MkPair String Bool "spans/lowfuel-number-never-truncates-to-valid-token"
+        ss_lowfuel_numeric
+    , MkPair String Bool "spans/number-stream-agreement"
+        (ss_stream_agrees_with_slices "def count : Nat := 1_024;")
     , MkPair String Bool "spans/list-literal"
         (ss_spans_expect "def xs : List Nat := [one, two];" ["[one, two]", "one", "two", "List Nat"] [])
+    , MkPair String Bool "spans/preprocessed-record-update"
+        (match preprocess_imports (prim_string_to_char_codes
+            "record Point : Type where x : Nat; y : Nat; end; def x : Nat := Z; def y : Nat := S Z; def p : Point := {x,y}; def q : Point := {p with y := Z -- field\n, x := S Z};") with
+         | ImpErr _ _ => False
+         | ImpOk imported =>
+             match preprocess_records imported with
+             | PrepErr _ _ => False
+             | PrepOk expanded =>
+                 andb (ss_agrees_codes expanded) (ss_well_formed_codes_part expanded 0 1)
+             end
+         end)
+    , MkPair String Bool "spans/preprocessed-nested-record-update"
+        (match preprocess_imports (prim_string_to_char_codes
+            "record Address : Type where city : Nat; zip : Nat; end; record User : Type where address : Address; age : Nat; end; def home : Address := {city := Z, zip := Z}; def user : User := {address := home, age := Z}; def next : User := {user with address.city := S Z -- first\n, address.zip := Z};") with
+         | ImpErr _ _ => False
+         | ImpOk imported =>
+             match preprocess_records imported with
+             | PrepErr _ _ => False
+             | PrepOk expanded =>
+                 andb (ss_agrees_codes expanded) (ss_well_formed_codes_part expanded 0 1)
+             end
+         end)
+    , MkPair String Bool "spans/preprocessed-record-pun"
+        (match preprocess_imports (prim_string_to_char_codes
+            "record Point : Type where x : Nat; y : Nat; end; def x : Nat := Z; def y : Nat := S Z; def p : Point := { y, -- field\n x };") with
+         | ImpErr _ _ => False
+         | ImpOk imported =>
+             match preprocess_records imported with
+             | PrepErr _ _ => False
+             | PrepOk expanded =>
+                 andb (ss_agrees_codes expanded) (ss_well_formed_codes_part expanded 0 1)
+             end
+         end)
     , MkPair String Bool "spans/dependent-functions"
         (ss_spans_expect "def app (A : Type) (B : A -> Type) (f : (x : A) -> B x) (x : A) : B x := f x;"
           ["A -> Type", "(x : A) -> B x", "B x", "f x", "Type"] [])
@@ -614,12 +702,20 @@ def ss_files : List String :=
     ];
 
 def ss_expanded (text : String) : Maybe (List Nat) :=
-    match preprocess_imports (prim_string_to_char_codes text) with
-    | ImpErr _ _ => Nothing (List Nat)
-    | ImpOk imported =>
-        match preprocess_records imported with
-        | PrepErr _ _ => Nothing (List Nat)
-        | PrepOk expanded => Just(List Nat, expanded)
+    match preprocess_imports_reg empty_imp_reg
+        (prim_string_to_char_codes text) with
+    | MkPair aliases imported => match imported with
+      | ImpErr _ _ => Nothing (List Nat)
+      | ImpOk prepared =>
+          match preprocess_records_reg (Nil Nat) aliases
+              empty_rec_reg prepared with
+          | MkPair _ tagged => match tagged with
+            | MkPair _ result => match result with
+              | PrepErr _ _ => Nothing (List Nat)
+              | PrepOk expanded => Just(List Nat, expanded)
+              end
+            end
+          end
         end
     end;
 

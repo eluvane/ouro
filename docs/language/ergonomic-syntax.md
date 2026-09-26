@@ -2,8 +2,8 @@
 
 Grouped imports, positional calls, typed local helpers, pure expression
 blocks, and list trailing commas lower to existing syntax nodes. The
-maintained [syntax reference](../syntax.md) states accepted forms; this
-page records desugaring and compatibility boundaries.
+maintained [syntax reference](../syntax.md) states accepted forms; this page
+records desugaring and compatibility boundaries.
 
 ## Grouped imports
 
@@ -37,8 +37,8 @@ Duplicate paths remain present in the parsed declarations; dependency traversal
 continues to load each canonical path once. Both fast and preprocessed dependency
 collection paths discover every operand, including the second edge of a cycle.
 
-The existing alias implementation is a source rewrite over a flattened
-namespace, not compiler-owned module identity. Aliases therefore remain on
+Aliases bind the directly imported source unit. Qualification is resolved by
+the compiler before the complete import closure is checked. Aliases remain on
 separate single-path declarations:
 
 ```text
@@ -57,12 +57,16 @@ import "a.ouro" as A, "b.ouro";
 import "a.ouro" as A,;
 ```
 
-The legacy alias boundary now explicitly rejects a comma after an alias,
+The alias boundary explicitly rejects a comma after an alias,
 including across comments, with the existing `OURO-IMP-001` diagnostic. Without
 that rejection, erasing `as A` could accidentally grant meaning to a mixed
 group. This guard is not the implementation of grouped imports: acceptance of
-plain groups belongs to the declaration parser. Compiler-owned alias scoping,
-qualification, and shadowing are not provided by this syntax.
+plain groups belongs to the declaration parser. An alias selects direct
+declarations of its file; a transitive dependency needs its own direct import.
+When imported short names collide in a reached graph using aliases, a bare use
+without a local binder or current-file declaration requires qualification. A
+plain-only graph still rejects duplicate declarations. Local
+opens still erase their prefix and cannot resolve such a collision.
 
 Dependency-tail diagnostics distinguish missing paths from malformed quoted
 strings. The direct parser retains its existing positional `PErr` protocol;
@@ -313,6 +317,52 @@ and `maybe` keep their meanings. Comments and multiline layout are allowed
 between tokens. Record literals inside a block still need the same supported
 type context as record literals elsewhere.
 
+## List literal trailing commas
+
+```text
+[x, y,] == [x, y]
+[x,]    == [x]
+```
+
+After at least one element, a comma immediately before `]` is accepted,
+including across whitespace and line comments. The parser builds the same
+`EList` elements in the same order. `[,]`, `[x,,]`, and a missing `]` remain
+parse errors. Empty lists keep the spelling `[]` and still need an expected
+`List A` type.
+
+## Record field punning
+
+```ouro
+{ x, y := next }  -- the x field uses the variable x
+```
+
+A record literal still needs a known nominal record type. A bare field name
+uses the value with that name in the enclosing lexical scope; it does not
+introduce a binder. The record preprocessor expands it to the same constructor
+argument as `x := x`, preserving declaration field order. Missing, duplicate,
+and unknown fields remain errors.
+
+## Functional record update
+
+```ouro
+{ person with age := next_age, active := True }
+```
+
+With a known nominal result type, update checks the base as that record type,
+binds it once, then binds changed values in source order. It constructs the new
+record in declaration field order, reading omitted fields from the bound base.
+Unknown and repeated fields are errors. A bare update name without `:=` is not
+an assignment. Paths through nominal record fields, such as
+`{ person with address.city := next_city, address.zip := next_zip }`, rebuild
+each affected nested record. Sibling paths are accepted; exact duplicates and
+ancestor/descendant overlaps are errors. Changed right-hand sides are bound
+once in source order. A typed local binding, record-valued field, or explicit
+literal ascription `({ city := next_city, zip := saved_zip } : Address)` supplies a nominal
+expected type for that value. It does not infer a type for arbitrary call
+arguments. Updates without nominal context and dependent record fields remain
+unsupported.
+Imported record updates have an [annotation provenance limit](../syntax.md#records).
+
 ## Typed fallible blocks
 
 ```ouro
@@ -358,36 +408,23 @@ expressions, and trailing semicolons are rejected. The block lowers to
 ordinary checked `case`, constructor applications, and local lets; it adds no
 new kernel form or effect handler.
 
-## List literal trailing commas
-
-```text
-[x, y,] == [x, y]
-[x,]    == [x]
-```
-
-After at least one element, a comma immediately before `]` is accepted,
-including across whitespace and line comments. The parser builds the same
-`EList` elements in the same order. `[,]`, `[x,,]`, and a missing `]` remain
-parse errors. Empty lists keep the spelling `[]` and still need an expected
-`List A` type.
-
 ## Integration and fixtures
 
-Grouped imports, calls, local helpers, and pure expression blocks reuse
-existing `DImport`, `EApp`, `EAscribe`, `ELam`, `EPi`, and `ELet` nodes.
-Typed fallible blocks retain a frontend node until lowering verifies their
-constructor roles. The formatter retains their source spelling.
-List commas preserve the same `EList` elements and source spelling.
-The fixture inventory
+Grouped imports, calls, local helpers, pure expression blocks, and list syntax
+reuse existing `DImport`, `EApp`, `EAscribe`, `ELam`, `EPi`, `ELet`, and `EList`
+nodes. Typed fallible blocks retain a frontend node until lowering verifies
+their constructor roles. The formatter retains grouped imports, call spelling,
+compact local helpers, expression blocks, and list commas without expanding
+them in source. The fixture inventory
 is `tests/language_ergonomics/cases.json`; it includes desugaring pairs,
 rejected forms, import graph/diagnostic cases, and formatter round trips.
 [CI](../ci.md#local-profiles) owns validation commands and gate status.
 
 ## Scope
 
-These forms add no module identity, tuple or named call syntax, general implicit
-argument inference, or general effect handling. Aliases remain the existing
-flattened-namespace source rewrite. For language direction and
+These forms add no selective imports, private exports, tuple or named call
+syntax, implicit type argument inference, early return, or general effect
+handling. For language direction and
 compatibility, see [Design](../design.md#language-direction) and
 [Stability](../stability.md#experimental-areas).
 

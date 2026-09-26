@@ -126,6 +126,23 @@ class BootstrapCompilerTests(unittest.TestCase):
         self.assertEqual(original, ["std/data.ouro", "std/list.ouro", "std/text.ouro"])
         self.assertEqual(quoted_import_targets(compact_source.compact_source(source).decode(), "compiler/probe.ouro"), original)
 
+    def test_compaction_preserves_raw_multiline_bytes_and_real_directives(self):
+        from selfhost_module_cache import quoted_import_targets
+
+        literal = b'r#"  -- @export fake\nimport "fake.ouro";\\n\n"#'
+        source = (b'def text : String := ' + literal + b'; -- trailing\n'
+                  b'-- @export real\nimport r#"real.ouro"#;\n')
+        compacted = compact_source.compact_source(source)
+        self.assertIn(literal, compacted)
+        self.assertIn(b'-- @export real\n', compacted)
+        self.assertEqual(quoted_import_targets(compacted.decode(), "compiler/probe.ouro"),
+                         ["compiler/real.ouro"])
+        self.assertEqual(compact_source.compact_source(compacted), compacted)
+
+    def test_compaction_rejects_unclosed_raw_literal(self):
+        with self.assertRaisesRegex(ValueError, "unterminated raw string"):
+            compact_source.compact_source(b'def text : String := r#"unfinished";')
+
     def test_current_o_snapshot_is_independent_of_historical_projection(self):
         root = self.root / "repo"
         (root / "compiler/bootstrap").mkdir(parents=True)
