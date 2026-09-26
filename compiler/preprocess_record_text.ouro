@@ -14,12 +14,15 @@ def record_generated_aliases (aliases : ImpReg)
               match record_fresh_alias index bare_atoms aliases with
               | Nothing => result
               | Just alias => match info with
-                | MkRecInfo owner _ _ _ => match result with
+                | MkRecInfo owner _ _ _ _ => match result with
                   | MkImpReg names bindings rules =>
                       MkImpReg names bindings
                         (append ImpRule
                           (record_grants_for alias owner
-                            (record_grant_members info) rewritten) rules)
+                            (record_grant_members info) rewritten)
+                          (append ImpRule
+                            (record_field_type_grants reg aliases bare_atoms
+                              index info rewritten) rules))
                   end
                 end
               end in
@@ -59,7 +62,7 @@ def record_owned_type (reg : RecReg) (current : List Nat)
   | MkRecReg _ recs _ _ => match nth_rec recs index with
     | Nothing => Nothing (List Nat)
     | Just info => match info with
-      | MkRecInfo _ name _ _ =>
+      | MkRecInfo _ name _ _ _ =>
           record_generated_name reg current aliases bare_atoms index name
       end
     end
@@ -71,7 +74,7 @@ def owned_rec_idx (owner : List Nat) (name : List Nat)
     match rest with
     | Nil => Nothing Nat
     | Cons info tail => match info with
-      | MkRecInfo path short _ _ =>
+      | MkRecInfo path short _ _ _ =>
           match andb(source_bytes_equal path owner,
               source_bytes_equal short name) with
           | True => Just Nat index
@@ -223,31 +226,159 @@ def type_to_rec (reg : RecReg) (current : List Nat)
         end
     end) (S (length Nat ty)) ty;
 
--- Field types are written in the record owner's source, not the caller's.
--- Without that owner's import bindings, only its own nominal records are safe
--- to recognize from an imported field declaration.
-def record_field_type_to_rec (reg : RecReg) (current : List Nat)
-    (aliases : ImpReg) (owner : List Nat) (ty : List Nat) : Maybe Nat :=
-  match source_bytes_equal owner current with
-  | True => type_to_rec reg current aliases ty
-  | False =>
-      match type_to_rec reg owner
-          (MkImpReg (Nil (List Nat)) (Nil (Pair (List Nat) (List Nat)))
-            (Nil ImpRule)) ty with
-      | Nothing => Nothing Nat
-      | Just index => match reg with
-        | MkRecReg _ recs _ _ => match nth_rec recs index with
-          | Nothing => Nothing Nat
-          | Just info => match info with
-            | MkRecInfo actual_owner _ _ _ =>
-                match source_bytes_equal owner actual_owner with
-                | True => Just Nat index
-                | False => Nothing Nat
+inductive RecordTypeChoice : Type :=
+  | RecordTypeAbsent : RecordTypeChoice
+  | RecordTypeFound : Nat -> RecordTypeChoice
+  | RecordTypeAmbiguous : RecordTypeChoice;
+
+def record_merge_choice (left : RecordTypeChoice)
+    (right : RecordTypeChoice) : RecordTypeChoice :=
+  match left with
+  | RecordTypeAbsent => right
+  | RecordTypeAmbiguous => RecordTypeAmbiguous
+  | RecordTypeFound first => match right with
+    | RecordTypeAbsent => left
+    | RecordTypeAmbiguous => RecordTypeAmbiguous
+    | RecordTypeFound second => match eqNat first second with
+      | True => left
+      | False => RecordTypeAmbiguous
+      end
+    end
+  end;
+
+def record_selected_choice (reg : RecReg) (target : List Nat)
+    (local : List Nat) : List ImportSelector -> RecordTypeChoice :=
+  fix go (selectors : List ImportSelector) : RecordTypeChoice :=
+    match selectors with
+    | Nil => RecordTypeAbsent
+    | Cons selector rest => match selector with
+      | MkImportSelector original renamed =>
+          let found : RecordTypeChoice :=
+            match source_bytes_equal renamed local with
+            | False => RecordTypeAbsent
+            | True => match reg with
+              | MkRecReg _ records _ _ =>
+                  match owned_rec_idx target original records with
+                  | Nothing => RecordTypeAbsent
+                  | Just index => RecordTypeFound index
+                  end
+              end
+            end in
+          record_merge_choice found (go rest)
+      end
+    end;
+
+def record_imported_choice (reg : RecReg) (owner : List Nat)
+    (imports : ImpReg) (local : List Nat) : RecordTypeChoice :=
+  match imports with
+  | MkImpReg _ _ rules =>
+      (fix go (remaining : List ImpRule) : RecordTypeChoice :=
+        match remaining with
+        | Nil => RecordTypeAbsent
+        | Cons rule rest =>
+            let found : RecordTypeChoice := match rule with
+              | ImpPlain spelling => match reg with
+                | MkRecReg _ records _ _ =>
+                    match owned_rec_idx (canon_path owner spelling) local records with
+                    | Nothing => RecordTypeAbsent
+                    | Just index => RecordTypeFound index
+                    end
                 end
+              | ImpSelected spelling selectors =>
+                  record_selected_choice reg (canon_path owner spelling)
+                    local selectors
+              | ImpRecordGrant _ _ _ => RecordTypeAbsent
+              | ImpFieldTypeGrant _ _ _ => RecordTypeAbsent
+              end in
+            record_merge_choice found (go rest)
+        end) rules
+  end;
+
+def record_selector_has (member : List Nat)
+    : List ImportSelector -> Bool :=
+  fix go (selectors : List ImportSelector) : Bool :=
+    match selectors with
+    | Nil => False
+    | Cons selector rest => match selector with
+      | MkImportSelector original _ =>
+          orb(source_bytes_equal original member, go rest)
+      end
+    end;
+
+def record_owner_edge_allows (owner : List Nat) (imports : ImpReg)
+    (target : List Nat) (member : List Nat) : Bool :=
+  match imports with
+  | MkImpReg _ _ rules =>
+      (fix go (remaining : List ImpRule) : Bool :=
+        match remaining with
+        | Nil => False
+        | Cons rule rest => match rule with
+          | ImpPlain spelling =>
+              orb(source_bytes_equal (canon_path owner spelling) target,
+                go rest)
+          | ImpSelected spelling selectors =>
+              orb(andb(source_bytes_equal (canon_path owner spelling) target,
+                record_selector_has member selectors), go rest)
+          | ImpRecordGrant _ _ _ => go rest
+          | ImpFieldTypeGrant _ _ _ => go rest
+          end
+        end) rules
+  end;
+
+-- A field's nominal type is resolved in the declaring record's import scope.
+def record_field_type_to_rec (reg : RecReg) (parent : RecInfo)
+    (ty : List Nat) : Maybe Nat :=
+  match parent with
+  | MkRecInfo owner _ _ _ owner_scope => match owner_scope with
+    | MkRecOwnerScope owner_imports owner_names =>
+      match record_atomic_type ty with
+      | Nothing => match type_to_rec reg owner owner_imports ty with
+        | Nothing => Nothing Nat
+        | Just index => match reg with
+          | MkRecReg _ recs _ _ => match nth_rec recs index with
+            | Nothing => Nothing Nat
+            | Just info => match info with
+              | MkRecInfo actual_owner _ _ _ _ =>
+                  match source_bytes_equal owner actual_owner with
+                  | True => Just Nat index
+                  | False => Nothing Nat
+                  end
+              end
             end
           end
         end
+      | Just atom => match record_marker_parts atom with
+        | Just parts => match parts with
+          | MkPair alias member =>
+              match record_alias_target owner owner_imports alias with
+              | Nothing => Nothing Nat
+              | Just target =>
+                  match record_owner_edge_allows owner owner_imports
+                      target member with
+                  | False => Nothing Nat
+                  | True => match reg with
+                    | MkRecReg _ recs _ _ => owned_rec_idx target member recs
+                    end
+                  end
+              end
+          end
+        | Nothing => match reg with
+          | MkRecReg _ recs _ _ =>
+              match owned_rec_idx owner atom recs with
+              | Just index => Just Nat index
+              | Nothing => match name_in atom owner_names with
+                | True => Nothing Nat
+                | False => match record_imported_choice reg owner owner_imports atom with
+                  | RecordTypeFound index => Just Nat index
+                  | RecordTypeAbsent => Nothing Nat
+                  | RecordTypeAmbiguous => Nothing Nat
+                  end
+                end
+              end
+          end
+        end
       end
+    end
   end;
 
 def type_record_hint (reg : RecReg) (current : List Nat)
@@ -679,7 +810,7 @@ def emit (acc : List Nat) (chunk : List Nat) : List Nat :=
 
 def emit_record (acc : List Nat) (ri : RecInfo) (sort : List Nat) : List Nat :=
   match ri with
-  | MkRecInfo _ name ctor fs =>
+  | MkRecInfo _ name ctor fs _ =>
       let a1 : List Nat := Cons Nat ch_lf_p acc in
       let a2 : List Nat := source_emit_reversed a1 s_inductive in
       let a3 : List Nat := source_emit_reversed a2 name in
