@@ -27,6 +27,28 @@ def collect_import_error_message (error : CollectImportError) : String :=
     | CollectImportMalformedString => "collect_units: malformed import string"
     end;
 
+-- Both literal spellings produce the same compiler string-table bytes.
+def collect_take_literal (fuel : Nat) (src : List Nat) : StrLex :=
+  match src with
+  | Nil => StrErr
+  | Cons c body =>
+      match eqNat c source_ch_double_quote with
+      | True => take_string fuel body (Nil Nat)
+      | False =>
+          match source_take_raw src with
+          | Nothing => StrErr
+          | Just parsed => match parsed with
+            | MkPair bytes tail =>
+                match compiler_le_nat
+                    (add(length Nat bytes, 5)) fuel with
+                | False => StrErr
+                | True => StrOk bytes tail
+                end
+            end
+          end
+      end
+  end;
+
 -- Dependency discovery only: the declaration parser remains the acceptance
 -- authority. Preserve the compiler string decoder and the reverse path order.
 def collect_import_tail : Nat -> List Nat -> List String ->
@@ -56,10 +78,11 @@ def collect_import_tail : Nat -> List Nat -> List String ->
                     | True => Right CollectImportError (Pair(List Nat, List String))
                         (MkPair(List Nat, List String, body, paths))
                     | False =>
-                        match eqNat quote ch_dq_i with
+                        match orb(eqNat quote ch_dq_i,
+                            source_is_raw_start (Cons Nat quote body)) with
                         | False => missing
                         | True =>
-                            match take_string fuel body (Nil Nat) with
+                            match collect_take_literal fuel (Cons Nat quote body) with
                             | StrErr => Left CollectImportError (Pair(List Nat, List String))
                                 CollectImportMalformedString
                             | StrOk path rest =>
@@ -72,8 +95,8 @@ def collect_import_tail : Nat -> List Nat -> List String ->
         end
     end;
 
--- Locate dependencies with the shared source helpers. Only quoted import
--- operands are decoded, by the compiler lexer; record syntax stays opaque
+-- Locate dependencies with the shared source helpers. Both import literal
+-- spellings are decoded by the compiler lexer; record syntax stays opaque
 -- until the complete source closure reaches the compiler-owned frontend.
 def collect_imports_scan (string_fuel : Nat)
     : Nat -> List Nat -> List String -> Col :=
@@ -84,8 +107,9 @@ def collect_imports_scan (string_fuel : Nat)
       | Nil => ColOk (reverse String paths)
       | Cons c rest => match source_is_comment source with
         | True => scan remaining (source_skip_line rest) paths
-        | False => match eqNat c source_ch_double_quote with
-          | True => scan remaining (source_skip_string rest) paths
+        | False => match orb(eqNat c source_ch_double_quote,
+            source_is_raw_start source) with
+          | True => scan remaining (source_skip_literal source) paths
           | False => match source_is_ident_start c with
             | False => match eqNat c ch_dot_i with
               | False => scan remaining rest paths
@@ -98,11 +122,12 @@ def collect_imports_scan (string_fuel : Nat)
                 | False => scan remaining after paths
                 | True => match skip_ws_i after with
                   | Nil => scan remaining after paths
-                  | Cons quote body => match eqNat quote source_ch_double_quote with
+                  | Cons quote body => match orb(eqNat quote source_ch_double_quote,
+                      source_is_raw_start (Cons Nat quote body)) with
                     -- Other uses, including a record field named import, are
                     -- checked by the frontend after dependencies are loaded.
                     | False => scan remaining after paths
-                    | True => match take_string string_fuel body (Nil Nat) with
+                    | True => match collect_take_literal string_fuel (Cons Nat quote body) with
                       | StrErr => ColErr "collect_units: malformed import string"
                       | StrOk path tail =>
                           match collect_import_tail string_fuel tail
@@ -125,9 +150,13 @@ def collect_imports_scan (string_fuel : Nat)
 
 def collect_preprocessed_paths (src : String) : Col :=
     match preprocess_imports (str_codes src) with
-    | ImpErr code position => ColErr
-        (str_cat4 "collect_units: OURO-IMP-00" (str_of_nat code)
-          " at byte " (str_of_nat position))
+    | ImpErr code position =>
+        match eqNat code imp_code_raw_marker with
+        | True => ColErr "collect_units: malformed token"
+        | False => ColErr
+            (str_cat4 "collect_units: OURO-IMP-00" (str_of_nat code)
+              " at byte " (str_of_nat position))
+        end
     | ImpOk expanded =>
         let fuel : Nat := S (length Nat expanded) in
         collect_imports_scan fuel fuel expanded (Nil String)
@@ -147,7 +176,8 @@ def collect_next_candidate (src : String) : Nat :=
       (collect_next_index src "open"
         (collect_next_index src "as"
           (collect_next_index src "--"
-            (collect_next_index src "\"" (str_len src)))));
+            (collect_next_index src "r#\""
+              (collect_next_index src "\"" (str_len src))))));
 
 def collect_identifier_before (src : String) : Nat -> Bool :=
     fix before (position : Nat) : Bool :=
@@ -203,10 +233,13 @@ def import_paths (original : String) : Col :=
                 | Just newline => scan remaining
                     (str_slice(candidate, add newline 1, str_len candidate)) paths
                 end
-              | False => match str_starts candidate "\"" with
-                | True => scan remaining
-                    (str_of_codes (source_skip_string
-                      (str_codes (str_slice candidate 1 (str_len candidate))))) paths
+              | False => match orb(str_starts candidate "\"",
+                  str_starts candidate "r#\"") with
+                | True =>
+                    match collect_take_literal fuel (str_codes candidate) with
+                    | StrErr => ColErr "collect_units: malformed import string"
+                    | StrOk _ tail => scan remaining (str_of_codes tail) paths
+                    end
                 | False =>
                     let word : String := match str_starts candidate "import" with
                       | True => "import"
@@ -227,9 +260,10 @@ def import_paths (original : String) : Col :=
                               (str_codes (str_slice candidate 6 (str_len candidate))) in
                             match after with
                             | Nil => ColOk (reverse String paths)
-                            | Cons quote body => match eqNat quote ch_dq_i with
+                            | Cons quote body => match orb(eqNat quote ch_dq_i,
+                            source_is_raw_start (Cons Nat quote body)) with
                               | False => scan remaining (str_of_codes after) paths
-                              | True => match take_string fuel body (Nil Nat) with
+                              | True => match collect_take_literal fuel (Cons Nat quote body) with
                                 | StrErr => ColErr "collect_units: malformed import string"
                                 | StrOk path tail =>
                                     match collect_import_tail fuel tail

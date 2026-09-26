@@ -62,12 +62,12 @@ def render(case, directory):
         spelling = os.path.relpath(ROOT / module, directory).replace("\\", "/")
         header += "import " + json.dumps(spelling, ensure_ascii=False) + ";\n"
     header += 'import "support.ouro";\n'
-    if "source" in case:
-        return header + case["source"] + "\n"
-    ty = "(" + case["type"] + ")"
     setup = case.get("setup", "")
     if setup and not setup.endswith("\n"):
         setup += "\n"
+    if "source" in case:
+        return header + setup + case["source"] + "\n"
+    ty = "(" + case["type"] + ")"
     return header + setup + (
         f'def ergo_expansion_candidate : {ty} := {case["sugar"]};\n'
         f'def ergo_expansion_reference : {ty} := {case["canonical"]};\n'

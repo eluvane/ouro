@@ -1,11 +1,12 @@
 import "preprocess_record_expr.ouro";
 
-def parse_param_env (reg : RecReg) (env : RecEnv) (seg : List Nat) : RecEnv :=
+def parse_param_env (reg : RecReg) (env : RecEnv)
+    (current : List Nat) (aliases : ImpReg) (seg : List Nat) : RecEnv :=
   match take_until_char ch_colon_p seg with
   | MkPair before after =>
       match after with
       | Cons _ ty0 =>
-          match type_to_rec reg ty0 with
+          match type_to_rec reg current aliases ty0 with
           | Nothing => env
           | Just ri =>
               (fix go (scan_fuel : Nat) (xs : List Nat) (e : RecEnv) : RecEnv :=
@@ -30,7 +31,9 @@ def parse_param_env (reg : RecReg) (env : RecEnv) (seg : List Nat) : RecEnv :=
       end
   end;
 
-def parse_def_header (reg : RecReg) (src : List Nat) : DefHead :=
+def parse_def_header (reg : RecReg) (current : List Nat)
+    (aliases : ImpReg)
+    (src : List Nat) : DefHead :=
   match source_take_ident (skip_ws_p (source_drop_prefix w_def src)) with
   | MkPair name rest =>
       match name with
@@ -48,7 +51,8 @@ def parse_def_header (reg : RecReg) (src : List Nat) : DefHead :=
                     | True =>
                         match take_until_char ch_rparen_p rest2 with
                         | MkPair inside afterp =>
-                            let env2 : RecEnv := parse_param_env reg env inside in
+                            let env2 : RecEnv :=
+                              parse_param_env reg env current aliases inside in
                             match afterp with
                             | Cons _ r => go remaining r env2
                             | Nil => NoHead
@@ -65,7 +69,9 @@ def parse_def_header (reg : RecReg) (src : List Nat) : DefHead :=
                                     | Cons _ body0 =>
                                         match take_until_char ch_semi_p body0 with
                                         | MkPair body tail =>
-                                            MkHead name env (type_to_rec reg ret)
+                                            MkHead name env
+                                              (type_record_hint reg current
+                                                aliases ret)
                                               body tail
                                         end
                                     | Nil => NoHead
@@ -81,10 +87,12 @@ def parse_def_header (reg : RecReg) (src : List Nat) : DefHead :=
       end
   end;
 
-def register_global (reg : RecReg) (name : List Nat) (ri : Nat) : RecReg :=
+def register_global (reg : RecReg) (owner : List Nat)
+    (name : List Nat) (ri : Nat) : RecReg :=
   match reg with
   | MkRecReg _ recs names gs =>
-      MkRecReg Z recs names (Cons RecBind (MkRecBind name ri) gs)
+      MkRecReg Z recs names
+        (Cons RecBind (MkRecBind name ri owner) gs)
   end;
 
 def cut_prefix (a : List Nat) (b : List Nat) : List Nat :=
@@ -98,7 +106,9 @@ def cut_prefix (a : List Nat) (b : List Nat) : List Nat :=
         end
     end) a (Nil Nat);
 
-def rewrite_defs (reg0 : RecReg) (src : List Nat) : Pair RecReg PrepResult :=
+def rewrite_defs (reg0 : RecReg) (owner : List Nat)
+    (aliases : ImpReg) (bare_atoms : List (List Nat))
+    (src : List Nat) : Pair RecReg PrepResult :=
   (fix go (scan_fuel : Nat) (reg : RecReg) (xs : List Nat) (acc : List Nat)
       : Pair RecReg PrepResult :=
     match scan_fuel with
@@ -119,10 +129,11 @@ def rewrite_defs (reg0 : RecReg) (src : List Nat) : Pair RecReg PrepResult :=
                     | MkPair id after =>
                         match source_bytes_equal id w_def with
                         | True =>
-                            match parse_def_header reg xs with
+                            match parse_def_header reg owner aliases xs with
                             | NoHead => go remaining reg after (emit acc id)
                             | MkHead name env mrec body tail =>
-                                match rewrite_expr reg env mrec body with
+                                match rewrite_expr reg env owner aliases bare_atoms
+                                        mrec body with
                                 | RwErr e =>
                                     MkPair RecReg PrepResult reg (PrepErr e Z)
                                 | RwOk body2 _ =>
@@ -148,7 +159,9 @@ def rewrite_defs (reg0 : RecReg) (src : List Nat) : Pair RecReg PrepResult :=
                                       end in
                                     let reg2 : RecReg :=
                                       match mrec with
-                                      | Just ri => register_global reg name ri
+                                      | Just hint => match hint with
+                                        | MkPair ri _ => register_global reg owner name ri
+                                        end
                                       | Nothing => reg
                                       end in
                                     go remaining reg2 tail2 a3
@@ -164,22 +177,36 @@ def rewrite_defs (reg0 : RecReg) (src : List Nat) : Pair RecReg PrepResult :=
     end) (S (length Nat src)) reg0 src (Nil Nat);
 
 -- @export preprocess_records_reg; @doc docs/syntax.md
-def preprocess_records_reg (reg0 : RecReg) (src : List Nat)
-    : Pair RecReg PrepResult :=
+def preprocess_records_reg (owner : List Nat) (aliases : ImpReg)
+    (reg0 : RecReg) (src : List Nat)
+    : Pair RecReg (Pair ImpReg PrepResult) :=
   match orb(src_has_record_keyword src, rec_reg_has_recs reg0) with
-  | False => MkPair RecReg PrepResult reg0 (PrepOk src)
+  | False => MkPair RecReg (Pair ImpReg PrepResult) reg0
+      (MkPair ImpReg PrepResult aliases (PrepOk src))
   | True =>
       let names : List (List Nat) := collect_decl_names src in
+      let bare_atoms : List (List Nat) := record_bare_atoms src in
       let reg1 : RecReg :=
         match reg0 with
         | MkRecReg _tag recs old gs =>
             MkRecReg Z recs (append (List Nat) names old) gs
         end in
-      match expand_record_decls reg1 src with
+      match expand_record_decls reg1 owner src with
       | MkPair reg2 r1 =>
           match r1 with
-          | PrepErr c d => MkPair RecReg PrepResult reg2 (PrepErr c d)
-          | PrepOk mid => rewrite_defs reg2 mid
+          | PrepErr c d => MkPair RecReg (Pair ImpReg PrepResult) reg2
+              (MkPair ImpReg PrepResult aliases (PrepErr c d))
+          | PrepOk mid =>
+              match rewrite_defs reg2 owner aliases bare_atoms mid with
+              | MkPair reg3 result => match result with
+                | PrepErr c d => MkPair RecReg (Pair ImpReg PrepResult) reg3
+                    (MkPair ImpReg PrepResult aliases (PrepErr c d))
+                | PrepOk output => MkPair RecReg (Pair ImpReg PrepResult) reg3
+                    (MkPair ImpReg PrepResult
+                      (record_generated_aliases owner aliases reg3 bare_atoms
+                        output) (PrepOk output))
+                end
+              end
           end
       end
   end;
@@ -187,6 +214,15 @@ def preprocess_records_reg (reg0 : RecReg) (src : List Nat)
 -- @entry preprocess_records
 -- @export preprocess_records; @doc docs/syntax.md
 def preprocess_records (src : List Nat) : PrepResult :=
-  match preprocess_records_reg empty_rec_reg src with
-  | MkPair _reg r => r
+  match preprocess_records_reg (Nil Nat)
+      (MkImpReg (Nil (List Nat)) (Nil (Pair(List Nat, List Nat))))
+      empty_rec_reg src with
+  | MkPair _reg tagged => match tagged with
+    | MkPair aliases result => match aliases with
+      | MkImpReg names _bindings => match names with
+        | Nil => result
+        | Cons _first_alias _remaining_aliases => PrepErr rec_code_need_ty Z
+        end
+      end
+    end
   end;

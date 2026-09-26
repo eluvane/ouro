@@ -49,7 +49,11 @@ PASS compiler result retains named core
 PASS compiler error retains code and detail
 PASS lower environment preserves constructor and hint fields
 PASS import preprocessing retains registry values
+PASS alias masking preserves byte offsets and qualified markers
+PASS raw import alias preserves bytes and decoded module path
 PASS record callback retains nested record model values
+PASS record callback carries compiler-owned alias metadata
+PASS text-only record wrapper cannot drop required alias metadata
 PASS preprocessors share successful source value
 PASS preprocessor error crosses pipeline callback
 COMPILER_ABI: PASS

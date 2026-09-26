@@ -2,7 +2,8 @@ import "preprocess_record_update.ouro";
 
 inductive RecLocalParse : Type :=
   | RecLocalNone : RecLocalParse
-  | RecLocalOk : List Nat -> List Nat -> Maybe Nat -> List Nat -> List Nat -> List Nat -> RecLocalParse;
+  | RecLocalOk : List Nat -> List Nat -> Maybe (Pair Nat (List Nat)) ->
+      List Nat -> List Nat -> List Nat -> RecLocalParse;
 
 def source_prefix_before_tail (whole : List Nat) (tail : List Nat) : List Nat :=
   (fix go (xs : List Nat) (acc : List Nat) : List Nat :=
@@ -171,7 +172,8 @@ def take_local_boundary (input : List Nat) : RecLocalBoundary :=
         end
     end) (S (length Nat input)) input (Nil Nat) Z Z Z;
 
-def parse_scoped_local (reg : RecReg) (input : List Nat) : RecLocalParse :=
+def parse_scoped_local (reg : RecReg) (current : List Nat)
+    (aliases : ImpReg) (input : List Nat) : RecLocalParse :=
   match source_take_ident (skip_ws_p input) with
   | MkPair keyword after_let =>
       match source_bytes_equal keyword w_let_p with
@@ -193,14 +195,14 @@ def parse_scoped_local (reg : RecReg) (input : List Nat) : RecLocalParse :=
                               match andb(eqNat colon ch_colon_p, eqNat equals ch_eq_p) with
                               | False => RecLocalNone
                               | True =>
-                                  let expected : Maybe Nat :=
+                                  let expected : Maybe (Pair Nat (List Nat)) :=
                                     match skip_ws_p header with
                                     | Cons first ty =>
                                         match eqNat first ch_colon_p with
-                                        | True => type_to_rec reg ty
-                                        | False => Nothing Nat
+                                        | True => type_record_hint reg current aliases ty
+                                        | False => Nothing (Pair Nat (List Nat))
                                         end
-                                    | Nil => Nothing Nat
+                                    | Nil => Nothing (Pair Nat (List Nat))
                                     end in
                                   match take_local_boundary rhs with
                                   | RecLocalBoundaryNone => RecLocalNone
@@ -220,9 +222,11 @@ def parse_scoped_local (reg : RecReg) (input : List Nat) : RecLocalParse :=
 
 inductive RecAscription : Type :=
   | RecAscriptionNone : RecAscription
-  | RecAscriptionOk : List Nat -> List Nat -> Nat -> List Nat -> List Nat -> RecAscription;
+  | RecAscriptionOk : List Nat -> List Nat -> Pair Nat (List Nat) ->
+      List Nat -> List Nat -> RecAscription;
 
-def parse_direct_record_ascription (reg : RecReg) (input : List Nat)
+def parse_direct_record_ascription (reg : RecReg) (current : List Nat)
+    (aliases : ImpReg) (input : List Nat)
     : RecAscription :=
   match skip_ws_p input with
   | Cons opening _ =>
@@ -255,7 +259,7 @@ def parse_direct_record_ascription (reg : RecReg) (input : List Nat)
                                                   match skip_ws_p after_brace with
                                                   | Cons _ _ => RecAscriptionNone
                                                   | Nil =>
-                                                      match type_to_rec reg ty with
+                                                      match type_record_hint reg current aliases ty with
                                                       | Nothing => RecAscriptionNone
                                                       | Just ri =>
                                                           RecAscriptionOk
@@ -320,22 +324,76 @@ def grouped_local_body (input : List Nat)
       end
   end;
 
+def projection_record_hint (reg : RecReg) (env : RecEnv)
+    (current : List Nat) (aliases : ImpReg)
+    (bare_atoms : List (List Nat)) (base : List Nat) (field : List Nat)
+    : Maybe (Pair Nat (List Nat)) :=
+  match record_marker_parts base with
+  | Nothing => match env_lookup env reg base with
+    | Nothing => Nothing (Pair Nat (List Nat))
+    | Just index => match reg with
+      | MkRecReg _ recs _ _ => match nth_rec recs index with
+        | Nothing => Nothing (Pair Nat (List Nat))
+        | Just info => match info with
+          | MkRecInfo _ record_name _ _ =>
+              match record_owner_qualifier reg current aliases bare_atoms
+                      index (acc_name record_name field) with
+              | Nothing => Nothing (Pair Nat (List Nat))
+              | Just qualifier => Just (Pair Nat (List Nat))
+                  (MkPair Nat (List Nat) index qualifier)
+              end
+          end
+        end
+      end
+    end
+  | Just parts => match parts with
+    | MkPair alias name =>
+        match record_alias_target current aliases alias with
+        | Nothing => Nothing (Pair Nat (List Nat))
+        | Just owner =>
+            match owned_global_rec reg owner name with
+            | Nothing => Nothing (Pair Nat (List Nat))
+            | Just index => match reg with
+              | MkRecReg _ recs _ _ =>
+                  match nth_rec recs index with
+                  | Nothing => Nothing (Pair Nat (List Nat))
+                  | Just info => match info with
+                    | MkRecInfo record_owner _ _ _ =>
+                        match source_bytes_equal record_owner owner with
+                        | False => Nothing (Pair Nat (List Nat))
+                        | True => Just (Pair Nat (List Nat))
+                            (MkPair Nat (List Nat) index
+                              (append Nat alias ([64] : List Nat)))
+                        end
+                    end
+                  end
+              end
+            end
+        end
+    end
+  end;
+
 -- Nested expansion and suffix scans each consume an explicit input-sized bound.
-def rewrite_expr (reg : RecReg) (env : RecEnv) (initial_expected : Maybe Nat)
+def rewrite_expr (reg : RecReg) (env : RecEnv)
+    (current : List Nat) (aliases : ImpReg)
+    (bare_atoms : List (List Nat))
+    (initial_expected : Maybe (Pair Nat (List Nat)))
     (input : List Nat) : RewriteR :=
   (fix rewrite_expr (depth_fuel : Nat) (current_env : RecEnv)
-      (expected : Maybe Nat) (xs0 : List Nat) : RewriteR :=
+      (expected : Maybe (Pair Nat (List Nat))) (xs0 : List Nat) : RewriteR :=
     match depth_fuel with
     | Z => RwErr rec_code_malformed
     | S depth_left =>
-        match parse_scoped_local reg xs0 with
+        match parse_scoped_local reg current aliases xs0 with
         | RecLocalOk binder prefix binding_expected rhs separator body =>
             match rewrite_expr depth_left current_env binding_expected rhs with
             | RwErr code => RwErr code
             | RwOk rewritten_rhs _ =>
                 let body_env : RecEnv :=
                   match binding_expected with
-                  | Just ri => env_add current_env binder ri
+                  | Just hint => match hint with
+                    | MkPair ri _ => env_add current_env binder ri
+                    end
                   | Nothing => env_mask current_env reg binder
                   end in
                 match rewrite_expr depth_left body_env expected body with
@@ -369,19 +427,21 @@ def rewrite_expr (reg : RecReg) (env : RecEnv) (initial_expected : Maybe Nat)
                               | MkPair body tail =>
                                   match top_has_with (strip_braces body) with
                                   | True =>
-                                      let brace_expected : Maybe Nat :=
+                                      let brace_expected : Maybe (Pair Nat (List Nat)) :=
                                         match skip_ws_p (reverse Nat acc) with
                                         | Nil => expected
-                                        | Cons _ _ => Nothing Nat
+                                        | Cons _ _ => Nothing (Pair Nat (List Nat))
                                         end in
-                                      match expand_record_update reg brace_expected
+                                      match expand_record_update reg current aliases bare_atoms
+                                              (record_hint_index brace_expected)
                                               (strip_braces body) xs0
                                               (fun (m : Maybe Nat) (value : List Nat) =>
-                                                rewrite_expr depth_left current_env m value) with
+                                                rewrite_expr depth_left current_env
+                                                  (record_index_hint m) value) with
                                       | RwErr code => RwErr code
                                       | RwOk update _ =>
                                           match rewrite_expr depth_left current_env
-                                                  (Nothing Nat) update with
+                                                  (Nothing (Pair Nat (List Nat))) update with
                                           | RwErr code => RwErr code
                                           | RwOk expanded _ =>
                                               go scan_left tail (emit acc expanded)
@@ -392,43 +452,49 @@ def rewrite_expr (reg : RecReg) (env : RecEnv) (initial_expected : Maybe Nat)
                                           top_starts_pun (strip_braces body)) with
                                       | False => go scan_left tail (emit acc body)
                                       | True =>
-                                          let brace_expected : Maybe Nat :=
+                                          let brace_expected : Maybe (Pair Nat (List Nat)) :=
                                             match skip_ws_p (reverse Nat acc) with
                                             | Nil => expected
-                                            | Cons _ _ => Nothing Nat
+                                            | Cons _ _ => Nothing (Pair Nat (List Nat))
                                             end in
                                           match brace_expected with
                                           | Nothing => RwErr rec_code_need_ty
-                                          | Just ri =>
+                                          | Just hint => match hint with
+                                            | MkPair ri qualifier =>
                                               match reg with
                                               | MkRecReg _ recs _ _ =>
                                                   match nth_rec recs ri with
                                                   | Nothing => RwErr rec_code_need_ty
                                                   | Just info =>
                                                       match info with
-                                                      | MkRecInfo _ _ ctor fs =>
-                                                          match fill_literal fs ctor
-                                                                  (strip_braces body)
+                                                      | MkRecInfo record_owner _ ctor fs =>
+                                                          match record_generated_name reg current aliases
+                                                                  bare_atoms ri ctor with
+                                                          | Nothing => RwErr rec_code_need_ty
+                                                          | Just owned_ctor => match fill_literal fs
+                                                                  owned_ctor (strip_braces body)
                                                                   (fun (idx : Nat) (value : List Nat) =>
                                                                     match update_field_type fs idx with
                                                                     | Nothing => RwErr rec_code_unknown
                                                                     | Just ty =>
-                                                                        rewrite_expr depth_left
-                                                                          current_env (type_to_rec reg ty)
-                                                                          value
+                                                                        rewrite_expr depth_left current_env
+                                                                          (type_record_hint reg record_owner
+                                                                            aliases ty) value
                                                                     end) with
                                                           | RwErr e => RwErr e
                                                           | RwOk lit _ =>
                                                               match rewrite_expr depth_left current_env
-                                                                      (Nothing Nat) lit with
+                                                                      (Nothing (Pair Nat (List Nat))) lit with
                                                               | RwErr e => RwErr e
                                                               | RwOk lit2 _ =>
                                                                   go scan_left tail (emit acc lit2)
                                                               end
                                                           end
+                                                          end
                                                       end
                                                   end
                                               end
+                                            end
                                           end
                                       end
                                   end
@@ -437,9 +503,10 @@ def rewrite_expr (reg : RecReg) (env : RecEnv) (initial_expected : Maybe Nat)
                       | False =>
                           match eqNat c ch_lparen_p with
                           | True =>
-                              match parse_direct_record_ascription reg xs with
-                              | RecAscriptionOk prefix value ri annotation tail =>
-                                  match rewrite_expr depth_left current_env (Just Nat ri) value with
+                              match parse_direct_record_ascription reg current aliases xs with
+                              | RecAscriptionOk prefix value hint annotation tail =>
+                                  match rewrite_expr depth_left current_env
+                                          (Just (Pair Nat (List Nat)) hint) value with
                                   | RwErr code => RwErr code
                                   | RwOk rewritten _ =>
                                       go scan_left tail
@@ -453,10 +520,10 @@ def rewrite_expr (reg : RecReg) (env : RecEnv) (initial_expected : Maybe Nat)
                                   | Just grouped =>
                                       match grouped with
                                       | MkPair content tail =>
-                                          let group_expected : Maybe Nat :=
+                                          let group_expected : Maybe (Pair Nat (List Nat)) :=
                                             match skip_ws_p (reverse Nat acc) with
                                             | Nil => expected
-                                            | Cons _ _ => Nothing Nat
+                                            | Cons _ _ => Nothing (Pair Nat (List Nat))
                                             end in
                                           match rewrite_expr depth_left current_env
                                                 group_expected content with
@@ -473,7 +540,7 @@ def rewrite_expr (reg : RecReg) (env : RecEnv) (initial_expected : Maybe Nat)
                           | False =>
                           match source_is_ident_start c with
                           | True =>
-                              match source_take_ident xs with
+                              match record_take_atom xs with
                               | MkPair id after =>
                                   match source_bytes_equal id w_let_p with
                                   | True =>
@@ -488,10 +555,10 @@ def rewrite_expr (reg : RecReg) (env : RecEnv) (initial_expected : Maybe Nat)
                                                   | Just block =>
                                                       match block with
                                                       | MkPair body tail =>
-                                                          let block_expected : Maybe Nat :=
+                                                          let block_expected : Maybe (Pair Nat (List Nat)) :=
                                                             match skip_ws_p (reverse Nat acc) with
                                                             | Nil => expected
-                                                            | Cons _ _ => Nothing Nat
+                                                            | Cons _ _ => Nothing (Pair Nat (List Nat))
                                                             end in
                                                           match rewrite_expr depth_left current_env block_expected
                                                                   (strip_braces body) with
@@ -520,9 +587,11 @@ def rewrite_expr (reg : RecReg) (env : RecEnv) (initial_expected : Maybe Nat)
                                               match fld with
                                               | Nil => RwErr rec_code_proj
                                               | Cons _ _ =>
-                                                  match env_lookup current_env reg id with
+                                                  match projection_record_hint reg current_env
+                                                      current aliases bare_atoms id fld with
                                                   | Nothing => RwErr rec_code_proj
-                                                  | Just ri =>
+                                                  | Just hint => match hint with
+                                                    | MkPair ri qualifier =>
                                                       match reg with
                                                       | MkRecReg _ recs _ _ =>
                                                           match nth_rec recs ri with
@@ -537,13 +606,15 @@ def rewrite_expr (reg : RecReg) (env : RecEnv) (initial_expected : Maybe Nat)
                                                                   | Just _ =>
                                                                       let a1 : List Nat :=
                                                                         emit acc
-                                                                          (acc_name rname fld) in
+                                                                          (append Nat qualifier
+                                                                            (acc_name rname fld)) in
                                                                       go scan_left after3
                                                                         (emit(Cons Nat ch_space_p a1, id))
                                                                   end
                                                               end
                                                           end
                                                       end
+                                                    end
                                                   end
                                               end
                                           end
