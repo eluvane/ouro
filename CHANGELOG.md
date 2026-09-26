@@ -6,6 +6,8 @@ Development changes; see the [compatibility policy](docs/stability.md).
 
 ### Added
 
+- Typed local helpers may omit the result annotation when their body type is
+  inferable; see [Ergonomic syntax](docs/language/ergonomic-syntax.md#typed-local-helper-declarations).
 - Review-only Clippy proofs for Result/Maybe error flow, collection and string
   composition, List producer/consumer laws, arithmetic, literal bounds, Boolean
   identities, and normalization. Rule contracts and exclusions live in the
