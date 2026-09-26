@@ -307,7 +307,7 @@ embedded-NUL limits.
 List literals use an expected `List A` type when one is available:
 
 ```ouro
-def values : List Nat := [Z, S Z, S (S Z)];
+def values : List Nat := [Z, S Z, S (S Z),];
 def empty : List Nat := [];
 ```
 
@@ -330,7 +330,8 @@ type, annotate the literal or binding; later elements do not resolve it.
 This is a bounded first-element hint, not general type unification. A free
 local type name shadowed by a later binding also needs an explicit `List A`
 annotation so the earlier type is not rebound under the later name.
-Heterogeneous lists and trailing commas are rejected. List literals lower to
+Heterogeneous lists are rejected. A nonempty list may end with a comma;
+`[]` remains the empty spelling. List literals lower to
 the standard `Nil` and `Cons` constructors, and the compiler checks every
 element against the selected type.
 

@@ -1,9 +1,9 @@
 # Ergonomic syntax
 
-Grouped imports, positional calls, typed local helpers, and pure expression
-blocks lower to existing syntax nodes. The maintained
-[syntax reference](../syntax.md) states accepted forms; this page records
-desugaring and compatibility boundaries.
+Grouped imports, positional calls, typed local helpers, pure expression
+blocks, and list trailing commas lower to existing syntax nodes. The
+maintained [syntax reference](../syntax.md) states accepted forms; this
+page records desugaring and compatibility boundaries.
 
 ## Grouped imports
 
@@ -358,12 +358,26 @@ expressions, and trailing semicolons are rejected. The block lowers to
 ordinary checked `case`, constructor applications, and local lets; it adds no
 new kernel form or effect handler.
 
+## List literal trailing commas
+
+```text
+[x, y,] == [x, y]
+[x,]    == [x]
+```
+
+After at least one element, a comma immediately before `]` is accepted,
+including across whitespace and line comments. The parser builds the same
+`EList` elements in the same order. `[,]`, `[x,,]`, and a missing `]` remain
+parse errors. Empty lists keep the spelling `[]` and still need an expected
+`List A` type.
+
 ## Integration and fixtures
 
 Grouped imports, calls, local helpers, and pure expression blocks reuse
 existing `DImport`, `EApp`, `EAscribe`, `ELam`, `EPi`, and `ELet` nodes.
 Typed fallible blocks retain a frontend node until lowering verifies their
 constructor roles. The formatter retains their source spelling.
+List commas preserve the same `EList` elements and source spelling.
 The fixture inventory
 is `tests/language_ergonomics/cases.json`; it includes desugaring pairs,
 rejected forms, import graph/diagnostic cases, and formatter round trips.
@@ -381,12 +395,14 @@ compatibility, see [Design](../design.md#language-direction) and
 
 Lint, strict quality, and analyzer import inventories read every operand,
 including multiline groups. Malformed import scans return an input error.
-The [bootstrap bridge](../build.md#c-bootstrap) supports these forms without
-rewriting the current source snapshot.
+The [bootstrap bridge](../build.md#c-bootstrap) supports grouped imports,
+calls, and helpers without rewriting the current source snapshot. Compiler
+bootstrap inputs do not use list trailing commas; the new parser accepts them
+after bootstrapping.
 
 `f (a b)` remains one argument; `f (a, b)` denotes two applications, regardless
-of whitespace. Grouped imports cannot carry aliases. List trailing commas,
-empty `f()` calls, named arguments, and recursive local helpers remain
+of whitespace. Grouped imports cannot carry aliases. Empty `f()` calls,
+named arguments, and recursive local helpers remain
 unsupported. Live LSP range/navigation behavior requires its own verification;
 AST reuse alone does not establish editor behavior. The dedicated parser,
 formatter, frontend/security, Clippy, bootstrap, and PR gates remain required
