@@ -126,9 +126,11 @@ is quadratic in the input length.
 
 `std/iter.ouro` provides a pure pull iterator with explicit state, item, and
 error types. `iter_from_list` wraps an existing list without building another
-list. `iter_map`, `iter_filter`, and `iter_take` defer work until a pull;
-filtering a rejected item returns a skip step, so one pull never searches an
-unbounded prefix. `iter_take` counts emitted items, not skipped source steps.
+list. `iter_map`, `iter_filter`, `iter_indexed`, and `iter_take` defer work until a
+pull; filtering a rejected item returns a skip step, so one pull never searches
+an unbounded prefix. `iter_take` counts emitted items, not skipped source steps.
+`iter_indexed` pairs each emitted value with a zero-based index; skips leave
+that index unchanged, and source failures pass through.
 
 ```ouro
 let source : Iterator (List Nat) String Nat :=
@@ -136,13 +138,15 @@ let source : Iterator (List Nat) String Nat :=
 let selected : Iterator (List Nat) String Nat :=
   iter_filter (List Nat) String Nat
   (fun (value : Nat) => eq_nat value 2) source in
-collect_list (List Nat) String Nat 4 selected
+let numbered : Iterator (Pair Nat (List Nat)) String (Pair Nat Nat) :=
+  iter_indexed (List Nat) String Nat selected in
+collect_list (Pair Nat (List Nat)) String (Pair Nat Nat) 4 numbered
 ```
 
-This returns `Right [2]`. `collect_list` requires an explicit maximum number
-of pulls and returns `Either (IterCollectError E) (List A)`. Each yield, skip,
-failure, or end observation costs one pull. Zero pulls always gives
-`IterPullLimit`, even for an empty source; a list of `n` items needs `n + 1`
+This returns `Right [MkPair Nat Nat 0 2]`. `collect_list` requires an explicit
+maximum number of pulls and returns `Either (IterCollectError E) (List A)`.
+Each yield, skip, failure, or end observation costs one pull. Zero pulls always
+gives `IterPullLimit`, even for an empty source; a list of `n` items needs `n + 1`
 pulls to observe its end. A source failure returns `IterSourceFailure` and
 stops; a pull limit returns `IterPullLimit`. Neither returns a partial list as
 success. `iter_take 0` does not pull its upstream source, though collecting
