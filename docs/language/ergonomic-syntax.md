@@ -208,20 +208,35 @@ constructor lookup. Several leading groups may be marked; later ordinary
 ordinary parameters and have universe level zero (`Type` or `Type0`). Indexed families
 cannot use the marker in this first slice.
 
-For a marked constructor, the omitted prefix is inserted only when the
-expected result is a direct application of its own family with every family
+With an expected result, the omitted prefix is inserted when that result
+is a direct application of the constructor's own family with every family
 parameter supplied, and the source supplies exactly the remaining family
 parameters and constructor fields. For example, `MkBox Z` at expected
-`Box Nat` becomes the ordinary checked call `MkBox Nat Z`. The result and
-each argument are checked by the existing compiler checker. Explicit calls
-still work. A local binding without an expected type, a partial call, a
-different family, an unresolved type, or a source hole cannot provide an
-inference hint. Local binders shadow global constructor names.
+`Box Nat` becomes the ordinary checked call `MkBox Nat Z`.
 
-This rule does not infer parameters of ordinary definitions, infer marked
-parameters from value arguments, search for instances, or convert between
-families. Annotate the result or supply the constructor parameter explicitly
-when the expected family is unavailable.
+Without an expected result, a saturated `MkBox Z` can also infer `A` from
+the type of `Z`, including in an unannotated local binding. This narrower
+rule requires **all** family parameters to be marked, at least one constructor
+field, a reliable `Type0` hint for the first value, and one usable
+value-type hint for each marked parameter. The first value cannot borrow a
+hint from a later field; annotate it or supply the constructor parameters
+when its type is unknown. A field contributes a hint only when its declared
+type is directly that parameter;
+`List A` does not trigger inference of `A`. Repeated direct fields must give
+the same finite structural hint. Bound type names must have a known `Type0`
+kind in scope; inductive applications and function types need a known `Type0`
+shape. Holes, escaped or shadowed names, incomplete hints, and exhausted
+scans provide no hint. A type-valued first argument is kept as an explicit
+partial call.
+Indexed, mixed marked/ordinary, and nullary constructors still need an
+expected result or explicit parameters for omission.
+
+Both paths insert ordinary constructor applications, and the compiler checker
+checks the result and every argument. Explicit full and partial calls remain
+valid. Local binders shadow global constructor names. This does not infer
+parameters of ordinary definitions, search for instances, or solve arbitrary
+type equations. Annotate the result or supply constructor parameters when
+the bounded hints are unavailable.
 
 ## Pure expression blocks
 

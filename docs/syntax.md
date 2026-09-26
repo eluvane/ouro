@@ -138,6 +138,8 @@ def explicit : Box Nat := MkBox Nat Z;
 Only leading `{A : Type}` groups on a non-indexed inductive family are marked.
 When the expected result is a direct, fully applied `Box Nat`, the compiler
 inserts its marked parameter before checking the ordinary constructor call.
+A saturated call without that context can also use direct constructor field
+value types when every family parameter is marked and reliably witnessed.
 Explicit arguments remain valid; unmarked constructors and generic functions
 keep their existing explicit-argument rules. See
 [Marked constructor parameters](language/ergonomic-syntax.md#marked-constructor-parameters)

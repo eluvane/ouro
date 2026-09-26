@@ -133,6 +133,367 @@ def implicit_apply_exprs
         go tail (SApp function value)
     end) args head;
 
+-- Only type shapes with a stable, finite spelling participate in repeated
+-- field constraints. This is structural agreement, not type unification.
+def implicit_hint_key (fuel : Nat) (ty : Surface) : Maybe (List Nat) :=
+  (fix encode (remaining : Nat) (part : Surface) : Maybe (List Nat) :=
+    match remaining with
+    | Z => Nothing (List Nat)
+    | S next =>
+        match part with
+        | SVar name => Just (List Nat) ([1, name] : List Nat)
+        | SSort level => Just (List Nat) ([2, level] : List Nat)
+        | SInd name => Just (List Nat) ([3, name] : List Nat)
+        | SConst name => Just (List Nat) ([4, name] : List Nat)
+        | SApp function argument =>
+            match encode next function with
+            | Nothing => Nothing (List Nat)
+            | Just head =>
+                match encode next argument with
+                | Nothing => Nothing (List Nat)
+                | Just tail =>
+                    Just (List Nat) (Cons Nat 5 (append Nat head tail))
+                end
+            end
+        | SPi binder domain codomain =>
+            match encode next domain with
+            | Nothing => Nothing (List Nat)
+            | Just head =>
+                match encode next codomain with
+                | Nothing => Nothing (List Nat)
+                | Just tail =>
+                    Just (List Nat)
+                      (Cons Nat 6 (Cons Nat binder (append Nat head tail)))
+                end
+            end
+        | SLam _ _ _ => Nothing (List Nat)
+        | SLet _ _ _ _ => Nothing (List Nat)
+        | SConstruct _ _ _ => Nothing (List Nat)
+        | SCase _ _ _ _ => Nothing (List Nat)
+        | SFix _ _ _ _ _ => Nothing (List Nat)
+        | SHole _ => Nothing (List Nat)
+        | SEffectRow _ => Nothing (List Nat)
+        | SPerform _ _ => Nothing (List Nat)
+        | SStr _ _ => Nothing (List Nat)
+        end
+    end) fuel ty;
+
+def implicit_nat_keys_equal (left : List Nat) (right : List Nat) : Bool :=
+  (fix same (xs : List Nat) (ys : List Nat) : Bool :=
+    match xs, ys with
+    | Nil, Nil => True
+    | Nil, Cons _ _ => False
+    | Cons _ _, Nil => False
+    | Cons x rest, Cons y tail => andb(eqNat x y, same rest tail)
+    end) left right;
+
+def implicit_hints_agree (left : Surface) (right : Surface) : Bool :=
+  match implicit_hint_key fuel1k left with
+  | Nothing => False
+  | Just a =>
+      match implicit_hint_key fuel1k right with
+      | Nothing => False
+      | Just b => implicit_nat_keys_equal a b
+      end
+  end;
+
+def implicit_sort_zero (term : Surface) : Bool :=
+  match term with
+  | SSort level => eqNat level Z
+  | SVar _ => False
+  | SPi _ _ _ => False
+  | SLam _ _ _ => False
+  | SApp _ _ => False
+  | SLet _ _ _ _ => False
+  | SConst _ => False
+  | SInd _ => False
+  | SConstruct _ _ _ => False
+  | SCase _ _ _ _ => False
+  | SFix _ _ _ _ _ => False
+  | SHole _ => False
+  | SEffectRow _ => False
+  | SPerform _ _ => False
+  | SStr _ _ => False
+  end;
+
+-- A candidate must itself be a known Type0, not just a scoped spelling.
+-- Pi types need their domain and codomain checked under the binder.
+def implicit_type0_hint (env : LowerEnv)
+    (locals : List (Pair Nat Surface)) (fuel : Nat) (ty : Surface) : Bool :=
+  (fix go (remaining : Nat) (scope : List (Pair Nat Surface))
+      (part : Surface) : Bool :=
+    match remaining with
+    | Z => False
+    | S next =>
+        match part with
+        | SPi binder domain codomain =>
+            andb(go next scope domain,
+              go next (cons_local binder domain scope) codomain)
+        | SVar _ =>
+            match surface_type_hint env scope remaining part with
+            | Nothing => False
+            | Just kind => implicit_sort_zero kind
+            end
+        | SInd _ =>
+            match surface_type_hint env scope remaining part with
+            | Nothing => False
+            | Just kind => implicit_sort_zero kind
+            end
+        | SConst _ =>
+            match surface_type_hint env scope remaining part with
+            | Nothing => False
+            | Just kind => implicit_sort_zero kind
+            end
+        | SApp _ _ =>
+            match surface_type_hint env scope remaining part with
+            | Nothing => False
+            | Just kind => implicit_sort_zero kind
+            end
+        | SSort _ => False
+        | SLam _ _ _ => False
+        | SLet _ _ _ _ => False
+        | SConstruct _ _ _ => False
+        | SCase _ _ _ _ => False
+        | SFix _ _ _ _ _ => False
+        | SHole _ => False
+        | SEffectRow _ => False
+        | SPerform _ _ => False
+        | SStr _ _ => False
+        end
+    end) fuel locals ty;
+
+def implicit_candidate_reliable (env : LowerEnv)
+    (locals : List (Pair Nat Surface)) (hint : Surface) : Bool :=
+  match surface_hint_has_placeholder locals fuel1k hint with
+  | True => False
+  | False =>
+      match implicit_hint_key fuel1k hint with
+      | Nothing => False
+      | Just _ => implicit_type0_hint env locals fuel1k hint
+      end
+  end;
+
+inductive ImplicitPiView : Type :=
+  | NoImplicitPi : ImplicitPiView
+  | ImplicitPi : Nat -> Surface -> Surface -> ImplicitPiView;
+
+def implicit_pi_view (ty : Surface) : ImplicitPiView :=
+  match ty with
+  | SPi binder domain codomain => ImplicitPi binder domain codomain
+  | SVar _ => NoImplicitPi
+  | SSort _ => NoImplicitPi
+  | SLam _ _ _ => NoImplicitPi
+  | SApp _ _ => NoImplicitPi
+  | SLet _ _ _ _ => NoImplicitPi
+  | SConst _ => NoImplicitPi
+  | SInd _ => NoImplicitPi
+  | SConstruct _ _ _ => NoImplicitPi
+  | SCase _ _ _ _ => NoImplicitPi
+  | SFix _ _ _ _ _ => NoImplicitPi
+  | SHole _ => NoImplicitPi
+  | SEffectRow _ => NoImplicitPi
+  | SPerform _ _ => NoImplicitPi
+  | SStr _ _ => NoImplicitPi
+  end;
+
+def implicit_marked_binders (count : Nat) (signature : Surface)
+    : Maybe (Pair (List Nat) Surface) :=
+  (fix go (remaining : Nat) (ty : Surface) (seen : List Nat)
+      : Maybe (Pair (List Nat) Surface) :=
+    match remaining with
+    | Z =>
+        Just (Pair (List Nat) Surface)
+          (MkPair (List Nat) Surface (reverse Nat seen) ty)
+    | S next =>
+        match implicit_pi_view ty with
+        | NoImplicitPi => Nothing (Pair (List Nat) Surface)
+        | ImplicitPi binder _ codomain =>
+            match orb(eqNat binder Z, memNat(binder, seen)) with
+            | True => Nothing (Pair (List Nat) Surface)
+            | False => go next codomain (Cons Nat binder seen)
+            end
+        end
+    end) count signature (Nil Nat);
+
+def implicit_field_direct_name (domain : Surface) : Maybe Nat :=
+  match domain with
+  | SVar name => Just Nat name
+  | SSort _ => Nothing Nat
+  | SPi _ _ _ => Nothing Nat
+  | SLam _ _ _ => Nothing Nat
+  | SApp _ _ => Nothing Nat
+  | SLet _ _ _ _ => Nothing Nat
+  | SConst _ => Nothing Nat
+  | SInd _ => Nothing Nat
+  | SConstruct _ _ _ => Nothing Nat
+  | SCase _ _ _ _ => Nothing Nat
+  | SFix _ _ _ _ _ => Nothing Nat
+  | SHole _ => Nothing Nat
+  | SEffectRow _ => Nothing Nat
+  | SPerform _ _ => Nothing Nat
+  | SStr _ _ => Nothing Nat
+  end;
+
+def implicit_result_args_match (names : List Nat)
+    (arguments : List Surface) : Bool :=
+  (fix go (rest : List Nat) (args : List Surface) : Bool :=
+    match rest, args with
+    | Nil, Nil => True
+    | Nil, Cons _ _ => False
+    | Cons _ _, Nil => False
+    | Cons name tail, Cons argument more =>
+        match implicit_field_direct_name argument with
+        | Nothing => False
+        | Just actual => andb(eqNat name actual, go tail more)
+        end
+    end) names arguments;
+
+def implicit_result_matches (ctor : CtorInfo) (names : List Nat)
+    (result : Surface) : Bool :=
+  match peel_ind_apps result with
+  | Nothing => False
+  | Just family_args =>
+      match family_args with
+      | MkPair family args =>
+          andb(eqNat family (ctor_indId ctor),
+            implicit_result_args_match names args)
+      end
+  end;
+
+def implicit_arg_hints
+    (lower_run : Nat -> LowerEnv -> Maybe Surface -> Maybe Nat ->
+      List (Pair Nat Surface) -> LowerMode -> LowerVal)
+    (fuel : Nat) (env : LowerEnv) (fixSelf : Maybe Nat)
+    (locals : List (Pair Nat Surface)) (args : List Expr)
+    : List (Maybe Surface) :=
+  (fix go (rest : List Expr) : List (Maybe Surface) :=
+    match rest with
+    | Nil => Nil (Maybe Surface)
+    | Cons argument tail =>
+        let value : Surface :=
+          vsurf_or_hole
+            (lower_run fuel env (Nothing Surface) fixSelf locals
+              (LExpr argument)) in
+        Cons (Maybe Surface)
+          (surface_type_hint env locals fuel1k value) (go tail)
+    end) args;
+
+def implicit_record_field_hint
+    (env : LowerEnv) (locals : List (Pair Nat Surface)) (names : List Nat)
+    (known : List (Pair Nat Surface)) (domain : Surface)
+    (hint : Surface) : Maybe (List (Pair Nat Surface)) :=
+  match implicit_field_direct_name domain with
+  | Nothing => Just (List (Pair Nat Surface)) known
+  | Just param =>
+      match memNat(param, names) with
+      | False => Just (List (Pair Nat Surface)) known
+      | True =>
+          match implicit_candidate_reliable env locals hint with
+          | False => Just (List (Pair Nat Surface)) known
+          | True =>
+              match lookup_local param known with
+              | Nothing =>
+                  Just (List (Pair Nat Surface))
+                    (cons_local param hint known)
+              | Just prior =>
+                  match implicit_hints_agree prior hint with
+                  | True => Just (List (Pair Nat Surface)) known
+                  | False => Nothing (List (Pair Nat Surface))
+                  end
+              end
+          end
+      end
+  end;
+
+def implicit_collect_field_hints
+    (env : LowerEnv) (locals : List (Pair Nat Surface)) (ctor : CtorInfo)
+    (names : List Nat) (signature : Surface)
+    (hints : List (Maybe Surface))
+    : Maybe (List (Pair Nat Surface)) :=
+  (fix go (rest : List (Maybe Surface)) (ty : Surface)
+      (known : List (Pair Nat Surface)) (first : Bool)
+      : Maybe (List (Pair Nat Surface)) :=
+    match rest with
+    | Nil =>
+        match implicit_result_matches ctor names ty with
+        | True => Just (List (Pair Nat Surface)) known
+        | False => Nothing (List (Pair Nat Surface))
+        end
+    | Cons hint tail =>
+        match implicit_pi_view ty with
+        | NoImplicitPi => Nothing (List (Pair Nat Surface))
+        | ImplicitPi binder domain codomain =>
+            match memNat(binder, names) with
+            | True => Nothing (List (Pair Nat Surface))
+            | False =>
+                match hint with
+                | Nothing =>
+                    match first with
+                    | True => Nothing (List (Pair Nat Surface))
+                    | False => go tail codomain known False
+                    end
+                | Just candidate =>
+                    match andb(first,
+                        notb(implicit_candidate_reliable env locals candidate)) with
+                    | True => Nothing (List (Pair Nat Surface))
+                    | False =>
+                        match implicit_record_field_hint
+                            env locals names known domain candidate with
+                        | Nothing => Nothing (List (Pair Nat Surface))
+                        | Just updated => go tail codomain updated False
+                        end
+                    end
+                end
+            end
+        end
+    end) hints signature (Nil (Pair Nat Surface)) True;
+
+def implicit_prefix_from_known (names : List Nat)
+    (known : List (Pair Nat Surface)) : Maybe (List Surface) :=
+  (fix go (rest : List Nat) : Maybe (List Surface) :=
+    match rest with
+    | Nil => Just (List Surface) (Nil Surface)
+    | Cons name tail =>
+        match lookup_local name known with
+        | Nothing => Nothing (List Surface)
+        | Just hint =>
+            match go tail with
+            | Nothing => Nothing (List Surface)
+            | Just later => Just (List Surface) (Cons Surface hint later)
+            end
+        end
+    end) names;
+
+def implicit_value_prefix
+    (lower_run : Nat -> LowerEnv -> Maybe Surface -> Maybe Nat ->
+      List (Pair Nat Surface) -> LowerMode -> LowerVal)
+    (fuel : Nat) (env : LowerEnv) (fixSelf : Maybe Nat)
+    (locals : List (Pair Nat Surface)) (ctor : CtorInfo)
+    (args : List Expr) : Maybe (List Surface) :=
+  match andb(ltb_nat Z (ctor_implicit_prefix ctor),
+      andb(eqNat(ctor_implicit_prefix ctor, ctor_nparams ctor),
+        andb(ltb_nat Z (ctor_arity ctor),
+          eqNat(length Expr args, ctor_arity ctor)))) with
+  | False => Nothing (List Surface)
+  | True =>
+      match lookup_ctor_type env (ctor_indId ctor) (ctor_idx ctor) with
+      | Nothing => Nothing (List Surface)
+      | Just signature =>
+          match implicit_marked_binders (ctor_nparams ctor) signature with
+          | Nothing => Nothing (List Surface)
+          | Just split =>
+              match split with
+              | MkPair names fields =>
+                  match implicit_collect_field_hints env locals ctor names fields
+                      (implicit_arg_hints lower_run fuel env fixSelf locals args) with
+                  | Nothing => Nothing (List Surface)
+                  | Just known => implicit_prefix_from_known names known
+                  end
+              end
+          end
+      end
+  end;
+
 def lower_implicit_constructor
     (lower_run : Nat -> LowerEnv -> Maybe Surface -> Maybe Nat ->
       List (Pair Nat Surface) -> LowerMode -> LowerVal)
@@ -140,7 +501,26 @@ def lower_implicit_constructor
     (fixSelf : Maybe Nat) (locals : List (Pair Nat Surface))
     (term : Expr) : ImplicitCtorResult :=
   match er with
-  | Nothing => NoMarkedCtor
+  | Nothing =>
+      match implicit_ctor_head fuel env fixSelf locals term with
+      | Nothing => NoMarkedCtor
+      | Just head =>
+          match head with
+          | MkPair ctor args =>
+              match implicit_value_prefix lower_run fuel env fixSelf locals
+                  ctor args with
+              | Nothing => NoMarkedCtor
+              | Just prefix =>
+                  let start : Surface :=
+                    implicit_apply_surfaces
+                      (SConstruct(ctor_indId ctor, ctor_idx ctor,
+                        ctor_nparams ctor)) prefix in
+                  InferredCtor
+                    (implicit_apply_exprs lower_run fuel env fixSelf locals
+                      start args)
+              end
+          end
+      end
   | Just _ =>
       match implicit_ctor_head fuel env fixSelf locals term with
       | Nothing => NoMarkedCtor
