@@ -48,6 +48,7 @@ EXPR = {
     "ESpan": "feature:parser:abi-and-grammar", "EOpen": "feature:parity:imports-open-local",
     "EFallible": "feature:form:fallible-block",
     "EListSpread": "feature:form:list-spread",
+    "ENamedCall": "feature:form:named-call",
 }
 DECL = {"DDef": "feature:prelude", "DAxiom": "negative:effect-root-assumption-type", "DInductive": "feature:prelude",
         "DEffect": "feature:form:handler", "DImport": "property:import-dependency-order",

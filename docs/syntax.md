@@ -122,6 +122,12 @@ typed parameters; the result annotation may be omitted when the body type can
 be inferred. [Ergonomic syntax](language/ergonomic-syntax.md#typed-local-helper-declarations)
 explains their scope and desugaring.
 
+Top-level definitions may use `(public => internal : Type)` to expose a call
+label distinct from the binder used in the body. A direct call can then write
+`f(public := value)` or `f(public :=)` to use an identically named local value.
+See [Named calls and public labels](language/ergonomic-syntax.md#named-calls-and-public-labels)
+for the bounded call rule and compatibility with positional arguments.
+
 An expression block groups sequential pure bindings with a final expression:
 
 ```ouro

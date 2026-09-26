@@ -27,6 +27,7 @@ EXPRS = {
     "ESpan": ["Nat", "Nat", "Expr"], "EOpen": ["Nat", "Expr"],
     "EFallible": ["Expr", "Nat", "Nat", "Expr"],
     "EListSpread": ["List Expr", "Expr"],
+    "ENamedCall": ["Expr", "List (Pair Nat Expr)"],
 }
 
 
