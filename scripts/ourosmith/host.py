@@ -163,7 +163,8 @@ def prepare_tools(out: Path, compiler: Path) -> tuple[dict[str, Path], dict]:
         command = [sys.executable, "-B", str(ROOT / "scripts/native_tool_build.py"), tool_entry(tool), str(target),
                    "--compiler", str(compiler), "--jobs", "1", "--ccache", "disabled",
                    "--build-dir", str(directory / "build"), "--cache-dir", str(cfg.path("cache_dir"))]
-        reason = build_command(command, Path(out) / (tool + "-build.log"), timeout_s=BUILD_TIMEOUT_S)
+        reason = build_command(command, Path(out) / (tool + "-build.log"),
+                               timeout_s=BUILD_TIMEOUT_S, trace=(tool == "lint"))
         if reason:
             raise ValueError(reason)
         overrides["ouro-" + tool] = binary("ouro-" + tool, directory=directory)
@@ -173,9 +174,12 @@ def prepare_tools(out: Path, compiler: Path) -> tuple[dict[str, Path], dict]:
     return overrides, evidence
 
 
-def build_command(argv: list[str], log: Path, *, timeout_s: float = 600) -> str | None:
+def build_command(argv: list[str], log: Path, *, timeout_s: float = 600, trace: bool = False) -> str | None:
     try:
-        proc = run_limited(argv, cwd=ROOT, env=environment(build=True), timeout_s=timeout_s, memory_mb=BUILD_MEMORY_MB)
+        env = environment(build=True)
+        if trace:
+            env["OURO_MEM_TRACE"] = "1"
+        proc = run_limited(argv, cwd=ROOT, env=env, timeout_s=timeout_s, memory_mb=BUILD_MEMORY_MB)
     except OSError as exc:
         return str(exc)
     log.parent.mkdir(parents=True, exist_ok=True)
