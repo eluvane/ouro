@@ -39,6 +39,24 @@ def twice_then_increment : Nat -> Nat :=
   compose Nat Nat Nat (add 1) (mul 2);
 ```
 
+
+## Callback sections
+
+`std/logic.ouro` provides `flip A B C f right left`, which calls an ordinary
+binary function as `f left right`. Partially applying `flip A B C f right`
+produces a typed `A -> C` callback with the right argument fixed:
+
+```ouro
+import "../std/logic.ouro", "../std/natx.ouro", "../std/data.ouro";
+
+def only_three : List Nat :=
+  let is_three : Nat -> Bool := flip Nat Nat Bool eq_nat 3 in
+  filter Nat is_three ([1, 3, 4] : List Nat);
+```
+
+This uses ordinary partial application; the parameter types remain explicit
+and no placeholder syntax is introduced.
+
 ## Fallible values
 
 `std/result.ouro` treats `Either E A` as a result: `Left` carries the error
