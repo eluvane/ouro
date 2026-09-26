@@ -9,6 +9,7 @@ from ourosmith.surface import forms, gen, mutate
 
 def constructors(path, name):
     text = (ROOT / path).read_text(encoding="utf-8")
+    text = re.sub(r'--[^\r\n]*|"(?:\\.|[^"\\])*"', " ", text)
     block = re.search(r"inductive " + name + r"\b[^;]+;", text)
     if block is None:
         raise ValueError(f"cannot extract {name} from {path}")
@@ -44,6 +45,7 @@ EXPR = {
     "EBranch": "feature:match", "ENoBranch": "feature:match", "EBinder": "feature:prelude",
     "ENoBinder": "feature:prelude", "EMultiMatch": "feature:form:multi-match",
     "EStr": "feature:string-length", "EDoBind": "property:test-known-counts", "EList": "feature:form:list",
+    "ESpan": "feature:parser:abi-and-grammar",
 }
 DECL = {"DDef": "feature:prelude", "DAxiom": "negative:effect-root-assumption-type", "DInductive": "feature:prelude",
         "DEffect": "feature:form:handler", "DImport": "property:import-dependency-order",

@@ -11,7 +11,7 @@ import sys
 from collections import defaultdict
 from pathlib import Path
 
-from ci_gate import gates
+from ci_gate import COMPILER_SHARDS, gates
 from ourosmith import ROOT
 from ourosmith import migration_contracts as contracts
 from ourosmith.report import load_report
@@ -144,7 +144,7 @@ def external_evidence(directory):
                     and row.get("status") == "pass" and type(row.get("returncode")) is int and row["returncode"] == 0
                     and isinstance(row.get("log"), str) and (ROOT / row["log"]).resolve() == log and log.is_file()):
                 result.add("external/ci/" + gate.name)
-        if all(f"external/ci/compiler-checking-{index}" in result for index in range(1, 9)):
+        if all(f"external/ci/compiler-checking-{index}" in result for index in range(1, COMPILER_SHARDS + 1)):
             result.update(compiler_strategies(directory))
     # Retiring an unrepresentable legacy API is a separate claim from passing
     # semantic laws. Credit requires both its removal and the current owners.

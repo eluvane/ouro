@@ -1070,7 +1070,8 @@ def boundaries(root, paths):
             if path not in paths or hashlib.sha256((root / path).read_bytes()).hexdigest() != expected:
                 raise ValueError(f"generated source missing or stale: {path}")
             result[path] = {"kind": "generated-artifact", "owner": "docs/generated_artifact_hashes.sha256"}
-    for manifest_path in ("tests/analyze/manifest.json", "quality/fixtures/manifest.json"):
+    for manifest_path in ("tests/analyze/manifest.json", "quality/fixtures/manifest.json",
+                          "tests/clippy_semantic/cases.json"):
         file = root / manifest_path
         if not file.is_file():
             continue
@@ -1084,10 +1085,15 @@ def boundaries(root, paths):
                     for path in paths:
                         if path == scope or path.startswith(scope + "/"):
                             result[path] = {"kind": "fixture-input", "owner": manifest_path}
-                if "path" in value and value["path"] in paths:
-                    if not (root / value['path']).resolve().is_relative_to(file.parent.resolve()):
+                if "path" in value:
+                    path = value["path"]
+                    if not isinstance(path, str) or not path:
+                        raise ValueError('invalid fixture path: ' + manifest_path)
+                    if not (root / path).resolve().is_relative_to(file.parent.resolve()):
                         raise ValueError('fixture path escapes its harness: ' + manifest_path)
-                    result[value["path"]] = {"kind": "fixture-input", "owner": manifest_path}
+                    if path not in paths:
+                        raise ValueError('required fixture missing from inventory: ' + path)
+                    result[path] = {"kind": "fixture-input", "owner": manifest_path}
                 for child in value.values():
                     visit(child)
             elif isinstance(value, list):

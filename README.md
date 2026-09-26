@@ -44,7 +44,7 @@ Copyright © 2026 Eluvane. Ouro is source-available under the
 repository revision containing this licensing notice. Earlier published releases
 and revisions remain governed by their original licenses.
 
-Official repository: [eluvane/ouro-dev](https://github.com/eluvane/ouro-dev).
+Official repository: [eluvane/ouro](https://github.com/eluvane/ouro).
 Licensing contact: [keiko1337@proton.me](mailto:keiko1337@proton.me).
 
 Third-party dependencies retain their own licenses. Phosphor icons in

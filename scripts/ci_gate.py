@@ -25,6 +25,7 @@ from repo_support import bind_relative_path, hash_json, sha256_file, write_json_
 ROOT = Path(__file__).resolve().parents[1]
 rel = bind_relative_path(ROOT, resolve=True)
 REPORT_KIND = "ouro.ci-gate-report.v1"
+COMPILER_SHARDS = 16
 
 
 @dataclass(frozen=True)
@@ -55,18 +56,18 @@ PR_GROUPS: dict[str, tuple[str, ...]] = {
         "stage-loop-c-object-cache",
         "stage-loop-frontend-regeneration",
         "language-speed-simplicity",
-        "parity",
         "fmt",
         "fix",
         "pkg",
         "doc",
         "docs-examples",
-        "syntax-quality-firewall",
         "strict-quality-firewall",
         "structural-quality-suite",
         "structural-quality",
         "hygiene",
     ),
+    "checks-parity": ("parity",),
+    "checks-quality": ("syntax-quality-firewall",),
     "analysis": (
         "memory-budget",
         "c-static-analysis",
@@ -90,12 +91,12 @@ PR_GROUPS: dict[str, tuple[str, ...]] = {
     "smith": ("ouro-smith",),
     "samples-1": ("samples-1",),
     "samples-2": ("samples-2",),
-    **{f"compiler-{index}": (f"compiler-checking-{index}",) for index in range(1, 9)},
+    **{f"compiler-{index}": (f"compiler-checking-{index}",) for index in range(1, COMPILER_SHARDS + 1)},
 }
 
 NIGHTLY_GROUPS: dict[str, tuple[str, ...]] = {
-    "checks": tuple("cache-parity-full" if name == "cache-parity-module" else name
-                    for name in PR_GROUPS["checks"]),
+    "checks": (*tuple("cache-parity-full" if name == "cache-parity-module" else name
+                      for name in PR_GROUPS["checks"]), "parity", "syntax-quality-firewall"),
     "analysis": PR_GROUPS["analysis"],
     "analyzer": ("analyze-precision", "analyze-production"),
     "lint": PR_GROUPS["lint"],
@@ -317,18 +318,35 @@ def classify_paths(paths: Sequence[str]) -> PathSelection:
     )
 
 
-def compiler_fixture_roots(root: Path) -> list[str]:
+def compiler_fixture_rows(root: Path) -> list[tuple[str, str]]:
     """Read the literal inventory; refuse a shape we cannot prove complete."""
     source = (root / "tools/test/suites.ouro").read_text(encoding="utf-8")
     marker = "def compiler_check_suite_fixtures : List SuiteFixture :="
     if source.count(marker) != 1:
         raise ValueError("compiler fixture inventory marker changed")
     body = source.split(marker)[1].strip()
-    rows = re.findall(r'MkSuiteFixture "[a-z0-9_]+" "(tests/[^"\n]+\.ouro)" Z SuiteGoldenNone', body)
+    rows = re.findall(r'MkSuiteFixture "([a-z0-9_]+)" "(tests/[^"\n]+\.ouro)" Z SuiteGoldenNone', body)
     remainder = re.sub(r'MkSuiteFixture "[a-z0-9_]+" "tests/[^"\n]+\.ouro" Z SuiteGoldenNone', "", body)
-    if not rows or len(set(rows)) != len(rows) or re.sub(r"[\s\[\],;]", "", remainder):
+    if (not rows or len({name for name, _ in rows}) != len(rows)
+            or len({path for _, path in rows}) != len(rows)
+            or re.sub(r"[\s\[\],;]", "", remainder)):
         raise ValueError("compiler fixture inventory is not a complete literal list")
     return rows
+
+
+def compiler_fixture_roots(root: Path) -> list[str]:
+    return [path for _, path in compiler_fixture_rows(root)]
+
+
+def compiler_shard_entries(inventory: Sequence[str], shard: int) -> list[str]:
+    if (not inventory or inventory[-1] != "tests/source_span_tests.ouro"
+            or inventory.count("tests/source_span_tests.ouro") != 1):
+        raise ValueError("source-spans fixture must be last in the compiler inventory")
+    if shard == COMPILER_SHARDS:
+        return [inventory[-1]]
+    if 1 <= shard < COMPILER_SHARDS:
+        return list(inventory[:-1][shard - 1::COMPILER_SHARDS - 1])
+    raise ValueError("unknown compiler shard")
 
 
 def affected_compiler_gates(paths: Sequence[str], root: Path = ROOT) -> set[str]:
@@ -355,9 +373,12 @@ def affected_compiler_gates(paths: Sequence[str], root: Path = ROOT) -> set[str]
 
     changed = set(paths)
     selected: set[str] = set()
-    for index, fixture in enumerate(compiler_fixture_roots(root)):
+    inventory = compiler_fixture_roots(root)
+    compiler_shard_entries(inventory, COMPILER_SHARDS)
+    for index, fixture in enumerate(inventory):
         if changed.intersection(collect_units(fixture, imports=read_imports)):
-            selected.add(f"compiler-checking-{index % 8 + 1}")
+            shard = COMPILER_SHARDS if index == len(inventory) - 1 else index % (COMPILER_SHARDS - 1) + 1
+            selected.add(f"compiler-checking-{shard}")
     return selected
 
 
@@ -413,8 +434,12 @@ def plan_paths(paths: Sequence[str]) -> PathSelection:
 
 def selection_matrix(selection: PathSelection) -> dict[str, list[dict[str, str]]]:
     selected = set(selection.gates)
-    # Start the long compiler shards first when runner concurrency is saturated.
-    groups = sorted(PR_GROUPS, key=lambda name: not name.startswith("compiler-"))
+    # Start critical-path checks and the isolated source-spans shard before runner slots fill.
+    priority = {"checks": 0, "checks-parity": 0, "checks-quality": 0}
+    groups = sorted(PR_GROUPS, key=lambda name: (
+        priority.get(name, 1 if name.startswith("compiler-") else 2),
+        0 if name == f"compiler-{COMPILER_SHARDS}" else 1,
+    ))
     return {"include": [{"group": group} for group in groups if selected.intersection(PR_GROUPS[group])]}
 
 
@@ -679,7 +704,7 @@ def gates() -> list[Gate]:
         Gate("lint-changed", ["sh", "scripts/ouro1.sh", "lint", "--deny", "--"], ("pr",)),
         Gate("lsp", ["sh", "scripts/lsp_suite.sh"], ("pr", "nightly", "manual"), env=(("LSP_SUITE_OUT", "_build/lsp_suite"),)),
         Gate("test", ["sh", "scripts/test_suite.sh"], ("pr", "nightly", "manual"), env=(("TEST_SUITE_OUT", "_build/test_suite"),)),
-        *(Gate(f"compiler-checking-{index}", ["sh", "scripts/test_suite.sh", "--compiler-checking", f"--shard={index}/8"], ("pr", "nightly", "manual", "kernel"), env=(("TEST_SUITE_OUT", f"_build/compiler_check_suite_{index}"), ("OURO_JOBS", "1"), ("OURO_FRONTEND_JOBS", "1"))) for index in range(1, 9)),
+        *(Gate(f"compiler-checking-{index}", ["sh", "scripts/test_suite.sh", "--compiler-checking", f"--shard={index}/{COMPILER_SHARDS}"], ("pr", "nightly", "manual", "kernel"), env=(("TEST_SUITE_OUT", f"_build/compiler_check_suite_{index}"), ("OURO_JOBS", "1"), ("OURO_FRONTEND_JOBS", "1"))) for index in range(1, COMPILER_SHARDS + 1)),
         Gate("compiler-boundary", ["sh", "scripts/ouro_repo_gate.sh", "--profile", "compiler-boundary", "--out", "_build/compiler_boundary"], ("pr", "nightly", "manual", "kernel")),
         Gate("samples-1", ["sh", "scripts/samples_suite.sh", "--shard=1/2"], ("pr", "nightly", "manual"), env=(("SAMPLES_SUITE_OUT", "_build/samples_suite_1"),)),
         Gate("samples-2", ["sh", "scripts/samples_suite.sh", "--shard=2/2"], ("pr", "nightly", "manual"), env=(("SAMPLES_SUITE_OUT", "_build/samples_suite_2"),)),
@@ -781,6 +806,10 @@ def run_self_tests(all_gates: Sequence[Gate]) -> int:
                 planned = [row["group"] for row in selection_matrix(full_path_selection("selftest"))["include"]]
                 if len(planned) != len(groups) or set(planned) != set(groups):
                     failures.append("full PR routing omits or duplicates a group")
+                if planned[:3] != ["checks", "checks-parity", "checks-quality"]:
+                    failures.append("long PR checks must start before compiler shards")
+                if planned[3] != f"compiler-{COMPILER_SHARDS}":
+                    failures.append("isolated source-spans shard must start before other compiler shards")
             elif matrix != list(groups):
                 failures.append(f"hosted {profile} matrix differs from automatic group inventory: {matrix}")
     lint_workflow = (ROOT / ".github/workflows/ouro-lint.yml").read_text(encoding="utf-8")
@@ -926,13 +955,20 @@ def routing_contract_failures() -> list[str]:
         (root / "tools/lsp_model.ouro").write_text("def value : Nat := 0;\n", encoding="utf-8")
         (root / "tests/shared.ouro").write_text('import "../tools/lsp_model.ouro" as Model;\n', encoding="utf-8")
         inventory = root / "tools/test/suites.ouro"
-        rows = [f'MkSuiteFixture "case_{i}" "tests/case_{i}.ouro" Z SuiteGoldenNone' for i in range(9)]
+        rows = [f'MkSuiteFixture "case_{i}" "tests/case_{i}.ouro" Z SuiteGoldenNone'
+                for i in range(COMPILER_SHARDS + 1)]
+        rows.append('MkSuiteFixture "source_spans" "tests/source_span_tests.ouro" Z SuiteGoldenNone')
         inventory.write_text("def compiler_check_suite_fixtures : List SuiteFixture :=\n[" + ",\n".join(rows) + "];\n", encoding="utf-8")
-        for i in range(9):
-            source = 'import "shared.ouro";\n' if i in {0, 8} else "def value : Nat := 0;\n"
+        for i in range(COMPILER_SHARDS + 1):
+            source = ('import "shared.ouro";\n' if i in {0, COMPILER_SHARDS - 1}
+                      else "def value : Nat := 0;\n")
             (root / f"tests/case_{i}.ouro").write_text(source, encoding="utf-8")
+        (root / "tools/isolated.ouro").write_text("def isolated : Nat := 0;\n", encoding="utf-8")
+        (root / "tests/source_span_tests.ouro").write_text('import "../tools/isolated.ouro";\n', encoding="utf-8")
         if affected_compiler_gates(["tools/lsp_model.ouro"], root) != {"compiler-checking-1"}:
             failures.append("transitive alias import or round-robin shard ownership was lost")
+        if affected_compiler_gates(["tools/isolated.ouro"], root) != {f"compiler-checking-{COMPILER_SHARDS}"}:
+            failures.append("isolated compiler fixture lost its shard ownership")
         if affected_compiler_gates(["tools/unused.ouro"], root):
             failures.append("unrelated tool selected compiler shards")
         (root / "tests/shared.ouro").write_text('import\n "../tools/lsp_model.ouro";\n', encoding="utf-8")
@@ -1136,14 +1172,37 @@ def run_gate(gate: Gate, *, out: Path) -> dict[str, Any]:
     gate_dir.mkdir(parents=True, exist_ok=True)
     log = gate_dir / "gate.log"
     env = env_for(gate, out)
-    print(f"CI_GATE_START {gate.name} cmd={shlex.join(gate.cmd)}")
+    print(f"CI_GATE_START {gate.name} cmd={shlex.join(gate.cmd)}", flush=True)
     with log.open("w", encoding="utf-8") as f:
         p = subprocess.Popen(gate.cmd, cwd=ROOT, env=env, text=True, stdout=f, stderr=subprocess.STDOUT)
         last_heartbeat = time.perf_counter()
+        last_fixture_progress: tuple[tuple[str, ...], tuple[str, ...]] | None = None
+        last_source_phase: str | None = None
+        last_phase_check = started
         while p.poll() is None:
             now = time.perf_counter()
+            if gate.name == f"compiler-checking-{COMPILER_SHARDS}" and now - last_phase_check >= 2.0:
+                marker = ROOT / "_build/source_spans.progress"
+                try:
+                    phase = marker.read_text(encoding="utf-8").strip()
+                except FileNotFoundError:
+                    phase = ""
+                if phase and phase != last_source_phase:
+                    print(f"CI_GATE_SOURCE_SPANS_PHASE {phase}", flush=True)
+                    last_source_phase = phase
+                last_phase_check = now
             if now - last_heartbeat >= 30.0:
-                print(f"CI_GATE_PROGRESS {gate.name} elapsed_s={now - started:.1f} log={rel(log)}")
+                print(f"CI_GATE_PROGRESS {gate.name} elapsed_s={now - started:.1f} log={rel(log)}", flush=True)
+                if gate.name.startswith("compiler-checking-"):
+                    suite_out = Path(env["TEST_SUITE_OUT"])
+                    built = tuple(sorted(path.name.removesuffix(".exe.build.json")
+                                         for path in suite_out.glob("*.exe.build.json")))
+                    completed = tuple(sorted(path.stem for path in suite_out.glob("*.out")
+                                             if not path.name.startswith("cli-")))
+                    progress = (built, completed)
+                    if progress != last_fixture_progress:
+                        print(f"CI_GATE_FIXTURE_PROGRESS {gate.name} built={','.join(built)} completed={','.join(completed)}", flush=True)
+                        last_fixture_progress = progress
                 last_heartbeat = now
             time.sleep(0.25)
         rc = int(p.returncode or 0)
@@ -1154,7 +1213,7 @@ def run_gate(gate: Gate, *, out: Path) -> dict[str, Any]:
         print(f"CI_GATE_LOG_TAIL {gate.name} lines={len(tail)}")
         for line in tail:
             print(line)
-    print(f"CI_GATE_DONE {gate.name} status={status} rc={rc} elapsed_s={time.perf_counter() - started:.3f} log={rel(log)}")
+    print(f"CI_GATE_DONE {gate.name} status={status} rc={rc} elapsed_s={time.perf_counter() - started:.3f} log={rel(log)}", flush=True)
     return {
         "name": gate.name,
         "blocking": gate.blocking,

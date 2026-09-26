@@ -79,7 +79,9 @@ formatting, and no reopened rewrite after formatting. Missing imports and
 exhausted import or rewrite budgets are errors, not partial success. A
 formatting-only change is reported as such. Existing `FxEdit` rule intents drive
 both rewriting and convergence checks; ambiguous diagnostics such as a zero
-divisor do not acquire a guessed replacement. `fmt_string` and `fx_fix` remain
+divisor do not acquire a guessed replacement. Root import discovery uses the same
+syntax-normalized snapshot as compiler preflight, so identical duplicate aliases
+can be repaired; imported files are read unchanged. `fmt_string` and `fx_fix` remain
 raw candidate APIs for existing goldens, not permission for a CLI to write.
 
 Formatter and fixer writes use `tools/quality/source_write.ouro`: reserve private stage and
@@ -170,6 +172,9 @@ inputs, extraction errors, malformed classifications, and inconsistent reports
 fail the gate. Hash-verified generated artifacts and manifest-owned fixture inputs
 have explicit boundary records. Fixture scopes cannot escape their harnesses.
 Generated hashes do not replace the regeneration/stage-loop drift gate.
+Clippy precision inputs come from `tests/clippy_semantic/cases.json`; only its
+listed files receive fixture boundaries. Unlisted sources and law harnesses
+remain in the ownership graph. Missing or escaping fixture paths fail the gate.
 
 Native symbol names written as ASCII `List Nat` literals count as explicit
 references, just like quoted names. Comments and malformed byte lists do not

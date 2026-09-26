@@ -87,7 +87,7 @@ def run_suite(fixer: Path, out: Path) -> None:
         print("FIX_CHECK_OK", name, flush=True)
         return result
 
-    def refusal(name, source, *, dependencies=(), mode="--write"):
+    def refusal(name, source, *, dependencies=(), mode="--write", contains=""):
         directory = out / name
         directory.mkdir(exist_ok=True)
         for filename, content in dependencies:
@@ -96,7 +96,7 @@ def run_suite(fixer: Path, out: Path) -> None:
         path.write_text(source, encoding="utf-8", newline="")
         original = path.read_bytes()
         files = sorted(p.name for p in directory.iterdir())
-        invoke(name, [fixer, mode, path], success=False)
+        invoke(name, [fixer, mode, path], success=False, contains=contains)
         assert path.read_bytes() == original
         assert sorted(p.name for p in directory.iterdir()) == files, "refusal left transaction files"
 
@@ -114,6 +114,34 @@ def run_suite(fixer: Path, out: Path) -> None:
                 dependencies=[("dep.ouro", 'import "source.ouro";\n' + UNIT)])
         refusal("dead-error-is-not-repaired", UNIT +
                 "def main : Unit := let discarded : Unit := missing_name in UnitValue;\n")
+
+        alias = 'import "dep.ouro" as A;\n'
+        body = "def main : Unit := UnitValue;\n"
+        refusal("conflicting-import-alias", alias + 'import "other.ouro" as A;\n' + body,
+                dependencies=[("dep.ouro", UNIT), ("other.ouro", "inductive Other : Type := | OtherValue : Other;\n")],
+                contains="OURO-IMP-002")
+        refusal("duplicate-import-invalid-root", alias * 2 + "def main : Unit := missing_name;\n",
+                dependencies=[("dep.ouro", UNIT)], contains="compiler rejected source")
+        refusal("transitive-duplicate-import-alias", 'import "bridge.ouro";\n' + body,
+                dependencies=[("bridge.ouro", alias * 2), ("dep.ouro", UNIT)], contains="OURO-IMP-002")
+
+        directory = out / "duplicate-import-alias"
+        directory.mkdir(exist_ok=True)
+        (directory / "dep.ouro").write_text(UNIT, encoding="utf-8", newline="")
+        path = directory / "source.ouro"
+        source = alias * 2 + body
+        expected = alias + body
+        path.write_text(source, encoding="utf-8", newline="")
+        result = invoke("duplicate-alias-preview", [fixer, path])
+        assert result.stdout.decode().replace("\r\n", "\n") == expected
+        assert path.read_bytes() == source.encode()
+        result = invoke("duplicate-alias-check", [fixer, "--check", path], success=False, contains="dup-import")
+        assert result.returncode == 1 and path.read_bytes() == source.encode()
+        invoke("duplicate-alias-write", [fixer, "--write", path], contains="dup-import")
+        assert path.read_bytes() == expected.encode()
+        invoke("duplicate-alias-clean-check", [fixer, "--check", path])
+        result = invoke("duplicate-alias-repeat", [fixer, "--write", path])
+        assert not result.stdout and not result.stderr and path.read_bytes() == expected.encode()
 
         directory = out / ("каталог \u0441 пробелами")
         directory.mkdir(exist_ok=True)

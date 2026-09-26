@@ -53,7 +53,7 @@ List the gates in a profile without running them:
 python3 scripts/ci_gate.py --profile pr --list
 ```
 
-The complete local PR inventory has seventeen isolated groups. GitHub selects
+The complete local PR inventory has twenty-seven isolated groups. GitHub selects
 affected groups and gates for reviewed tool paths; main-branch pushes, merge
 queues and manual CI runs select the complete inventory except `lint`, which
 runs in Nightly and on demand. Run one group with:
@@ -62,9 +62,9 @@ runs in Nightly and on demand. Run one group with:
 python3 scripts/ci_gate.py --profile pr --group checks
 ```
 
-The group names are `checks`, `analysis`, `checker`, `analyzer`, `lint`,
+The group names are `checks`, `checks-parity`, `checks-quality`, `analysis`, `checker`, `analyzer`, `lint`,
 `tests`, `smith`, `samples-1`, `samples-2`, and `compiler-1` through
-`compiler-8`. Substitute the selected name after `--group`.
+`compiler-16`. Substitute the selected name after `--group`.
 
 `--group` supports PR, nightly, manual, kernel, stage-loop, docs, and kernel-extra profiles.
 `--list-groups` prints the selected profile's complete group list as JSON;
@@ -106,7 +106,7 @@ host toolchain, and bootstrap evidence before running gates. Partial job retries
 use the successful producer's artifact name, including its original attempt.
 Release artifacts use the workflow run ID so branch names containing `/` remain
 valid for uploads and downstream downloads.
-OuroSmith compiler evidence requires all eight compiler gate commands and their
+OuroSmith compiler evidence requires all sixteen compiler gate commands and their
 source-bound receipts. The shard runners must agree on the full inventory and
 binary identity; their combined artifacts must cover every fixture exactly once.
 
@@ -156,15 +156,16 @@ these explicit invocations do not establish native bootstrap or retire the
 full PR profile.
 
 Nightly uses `checks`, `analysis`, `analyzer`, `lint`, `tests`, `samples-1`, `samples-2`, `kernel`,
-`trust`, and `compiler-1` through `compiler-8` groups. The `trust` job runs the stage-loop fixpoint/drift gate and
+`trust`, and `compiler-1` through `compiler-16` groups. The `trust` job runs the stage-loop fixpoint/drift gate and
 then the deeper OuroSmith profile in the same checkout. `Full` runs even after
 a job failure and fails unless every matrix group succeeds. Reports are
 uploaded separately as `nightly-<group>` artifacts. Hosted PR matrix jobs use static names `PR` and `Portable` so a skipped
 matrix does not publish an unevaluated expression. When those jobs run,
-GitHub appends the matrix value: `PR (checks)`, `PR (analysis)`, `PR (checker)`,
+GitHub appends the matrix value: `PR (checks)`, `PR (checks-parity)`,
+`PR (checks-quality)`, `PR (analysis)`, `PR (checker)`,
 `PR (analyzer)`, `PR (tests)`,
 `PR (smith)`, `PR (samples-1)`, `PR (samples-2)`, `PR (compiler-1)` through
-`PR (compiler-8)`, `Portable (ubuntu-latest)`,
+`PR (compiler-16)`, `Portable (ubuntu-latest)`,
 and `Portable (macos-latest)`. Linux Portable uses the shared compiler;
 macOS Portable restores its own cache and bootstrap evidence, then builds or
 verifies `ouro1` before `kernel_hardening_suite.py`.
@@ -176,7 +177,7 @@ The hosted `Compiler kernel` job runs `--profile kernel-extra`: only the
 kernel OuroSmith gate, which is absent from PR. The complete standalone
 `--profile kernel` remains unchanged. A runner self-test requires the union
 of PR and kernel-extra to cover every kernel gate, with no duplicated gates
-in kernel-extra. All eight compiler shards run for compiler, runtime, standard
+in kernel-extra. All sixteen compiler shards run for compiler, runtime, standard
 library, bootstrap, build infrastructure and unclassified changes.
 
 The static `Kernel` check always runs and requires successful path selection,
@@ -230,7 +231,7 @@ to compiler, runtime and standard library inputs also retain kernel-extra.
 For narrowed routes, the planner follows transitive imports from the canonical
 compiler fixture inventory, using the build system's import reader and checking
 its import count against the existing source tokenizer. A tool
-dependency of a compiler fixture adds that fixture's existing round-robin shard.
+dependency of a compiler fixture adds that fixture's assigned shard.
 An unreadable dependency, unsupported import layout or inventory shape selects
 full validation.
 New tool families remain full-validation inputs until their consumers are mapped.
@@ -243,7 +244,8 @@ succeed; a skipped required job or failed/cancelled matrix cannot satisfy it.
 Do not require individual dynamic matrix names in branch protection.
 
 The GitHub job summary lists selected groups and gates. Full runs enqueue the
-long compiler shards first. PR matrix jobs cancel remaining siblings after a
+three long check groups and isolated `source_spans` shard before the other compiler shards.
+PR matrix jobs cancel remaining siblings after a
 failure, and each group stops at its first blocking failure while recording
 unexecuted gates as `not_run`. Nightly and ordinary local profiles still gather
 all failures. Obsolete runs are cancelled by the existing concurrency group.
@@ -269,7 +271,7 @@ positive programs, including `compiler/extract.ouro`. Equal rejection statuses
 fail the suite. Generated negative compiler cases keep their separate exact
 diagnostic contracts in OuroSmith.
 
-The eight `compiler-checking-1` through `compiler-checking-8` gates are required
+The sixteen `compiler-checking-1` through `compiler-checking-16` gates are required
 in PR, nightly, manual, and `kernel` profiles. Their Ouro-owned fixture inventory is in
 `tools/test/suites.ouro`; it checks, builds, and executes the compiler laws,
 constructor-closure laws, native x86-64 encoding, MIR, PE, lowering, GC metadata,
@@ -294,16 +296,18 @@ enforcement or descendant cleanup.
 ```sh
 sh scripts/test_suite.sh --compiler-checking
 sh scripts/test_suite.sh --compiler-checking --list
-sh scripts/test_suite.sh --compiler-checking --shard=1/8
+sh scripts/test_suite.sh --compiler-checking --shard=1/16
 ```
 
 The native-lowering fixture runs each assertion in a separate process to bound
 the transitional C host's compiler heap. It retains the full case inventory,
 rejects duplicate names, and requires each child's exact output and zero status.
 
-Each invocation verifies that the eight round-robin shards cover every fixture
-exactly once, have unique fixture names and paths, and differ in size by at
-most one. Missing, duplicated, unknown, or malformed selections fail. Omitting
+Each invocation verifies that the sixteen shards cover every fixture exactly
+once and have unique fixture names and paths. The first fifteen shards contain
+the remaining fixtures in round-robin order and differ in size by at most one;
+the sixteenth runs `source_spans` alone so its cost is separate. Missing,
+duplicated, unknown, or malformed selections fail. Omitting
 `--shard` runs the full inventory. Each hosted shard has its own output directory
 and retains the same checker, build, execution, and failure requirements.
 The inventory interleaves fixtures by measured native build cost so expensive

@@ -21,6 +21,11 @@ Development changes; see the [compatibility policy](docs/stability.md).
 
 ### Changed
 
+- Run PR parity and syntax-quality gates in separate required jobs to shorten
+  the serial `checks` group; nightly retains both gates in its `checks` group.
+- Split compiler-checking fixtures across sixteen PR and nightly jobs, with
+  `source_spans` isolated in one job and complete source-bound suite coverage;
+  see [CI](docs/ci.md#local-profiles).
 - Build release toolchains from a [checked compact source copy](docs/canonical_source.md#materialization),
   retaining original-source checks and full generated C equality.
 - Publish automatic snapshots every three days instead of weekly, using
@@ -83,6 +88,12 @@ Development changes; see the [compatibility policy](docs/stability.md).
 
 ### Fixed
 
+- Recognize manifest-owned Clippy precision fixtures in the structural gate,
+  retaining extraction, path confinement, and checks on unlisted sources.
+- Cover `ESpan` in OuroSmith parser observations and keep comment delimiters
+  from truncating the constructor inventory.
+- Repair identical duplicate import aliases before collecting a fixer's root
+  dependencies; retain compiler verification and reject conflicting aliases.
 - Recompute composed Clippy contracts against each root's dependencies and
   retain imported-wrapper origins across cache hits.
 - Resolve transitive runtime platform imports with explicit missing-file and

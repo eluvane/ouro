@@ -7,6 +7,8 @@ import "../compiler/source_spans.ouro",
   "../compiler/preprocess_record.ouro",
   "../std/listx.ouro",
   "../std/fs.ouro",
+  "../std/processx.ouro",
+  "../std/text.ouro",
   "analyze/precision/assertions.ouro";
 
 -- Tagged, length-prefixed codes: equal code lists mean equal trees. ESpan keeps
@@ -398,63 +400,101 @@ def ss_reparses (fuel : Nat) (tokens : List Token) (first : Nat) (past : Nat) (i
           (source_bytes_equal(ss_expr(e, Nil Nat), ss_expr(strip_spans inner, Nil Nat)))
     end;
 
--- Byte slices of all spans, or Nothing when lexing or parsing fails, or a
--- range is not nested in its parent, has no byte position, is not exact, or
--- does not reparse to its expression.
-def ss_slices_codes (codes : List Nat) : Maybe (List String) :=
+-- Check each span before folding its exact byte slice. A partition runs in a
+-- separate process so the runtime can release its arena between partitions.
+def ss_fold_slices_codes_part (A : Type) (codes : List Nat) (part : Nat) (parts : Nat)
+    (step : String -> A -> A) (initial : A) : Maybe A :=
+    match ltb_nat part parts with
+    | False => Nothing A
+    | True =>
     let fuel : Nat := ss_fuel codes in
     let text : String := prim_string_of_char_codes codes in
     let lexed : LexSpanned := lex_spanned fuel codes empty_intern in
     match lex_spanned_result lexed with
-    | LexMalformed _ => Nothing (List String)
-    | LexExhausted _ => Nothing (List String)
+    | LexMalformed _ => Nothing A
+    | LexExhausted _ => Nothing A
     | LexOk tokens _ =>
         match parse_file parse_spanned fuel tokens 0 with
-        | PErr _ => Nothing (List String)
+        | PErr _ => Nothing A
         | POk decls _ _ =>
             let count : Nat := length Token tokens in
             let ranges : List SsRange :=
               foldl Decl (List SsRange) (fun (acc : List SsRange) (d : Decl) => ss_decl_ranges count d acc)
                 (Nil SsRange) decls in
-            (fix go (rs : List SsRange) : Maybe (List String) :=
+            (fix go (rs : List SsRange) (acc : A) (slot : Nat) : Maybe A :=
               match rs with
-              | Nil => Just(List String, Nil String)
+              | Nil => Just(A, acc)
               | Cons r rest =>
+                  let next : Nat := match eqNat (S slot) parts with
+                    | True => Z | False => S slot end in
+                  match eqNat slot part with
+                  | False => go rest acc next
+                  | True =>
                   match r with
                   | MkSsRange first past nested inner =>
                       match andb(andb(nested, ltb_nat past count), ss_reparses fuel tokens first past inner) with
-                      | False => Nothing (List String)
+                      | False => Nothing A
                       | True =>
                           match token_span_bytes (lex_spanned_tokens lexed) first past with
-                          | Nothing => Nothing (List String)
+                          | Nothing => Nothing A
                           | Just bytes =>
                               match bytes with
-                              | MkPair start stop =>
+                              | MkPair first_byte past_byte =>
                                   match ss_exact_slice tokens first past
-                                      (take(Nat, sub stop start, drop Nat start codes)) with
-                                  | False => Nothing (List String)
-                                  | True =>
-                                      match go rest with
-                                      | Nothing => Nothing (List String)
-                                      | Just more => Just (List String)
-                                          (Cons String (prim_string_slice text start (sub stop start)) more)
-                                      end
+                                      (take(Nat, sub past_byte first_byte, drop Nat first_byte codes)) with
+                                  | False => Nothing A
+                                  | True => go rest
+                                      (step (prim_string_slice text first_byte (sub past_byte first_byte)) acc) next
                                   end
                               end
                           end
                       end
                   end
-              end) ranges
+                  end
+              end) ranges initial Z
         end
+    end
+    end;
+
+-- Byte slices of all spans, or Nothing when any check above fails.
+def ss_slices_codes (codes : List Nat) : Maybe (List String) :=
+    match ss_fold_slices_codes_part (List String) codes Z 1
+        (fun (slice : String) (rev : List String) => Cons String slice rev) (Nil String) with
+    | Nothing => Nothing (List String)
+    | Just rev => Just(List String, reverse String rev)
     end;
 
 def ss_slices (text : String) : Maybe (List String) :=
     ss_slices_codes (prim_string_to_char_codes text);
 
-def ss_well_formed_codes (codes : List Nat) : Bool :=
-    match ss_slices_codes codes with
+def ss_well_formed_codes_part (codes : List Nat) (part : Nat) (parts : Nat) : Bool :=
+    match ss_fold_slices_codes_part Bool codes part parts
+        (fun (slice : String) (ok : Bool) => andb(ss_trimmed slice, ok)) True with
     | Nothing => False
-    | Just slices => all String ss_trimmed slices
+    | Just ok => ok
+    end;
+
+def ss_well_formed_codes (codes : List Nat) : Bool :=
+    ss_well_formed_codes_part codes Z 1;
+
+def ss_stream_agrees_with_slices (text : String) : Bool :=
+    let codes : List Nat := prim_string_to_char_codes text in
+    let collected : Bool := match ss_slices_codes codes with
+      | Nothing => False
+      | Just slices => all String ss_trimmed slices
+      end in
+    match ss_well_formed_codes codes with
+    | True => collected
+    | False => notb collected
+    end;
+
+def ss_parts_agree_with_whole (text : String) : Bool :=
+    let codes : List Nat := prim_string_to_char_codes text in
+    let parts : Bool := all Nat
+      (fun (part : Nat) => ss_well_formed_codes_part codes part 4) [0, 1, 2, 3] in
+    match ss_well_formed_codes codes with
+    | True => parts
+    | False => notb parts
     end;
 
 -- Well-formed spans that include every expected slice and none of the absent ones.
@@ -506,13 +546,15 @@ def ss_samples : List String :=
 
 def ss_laws : List (Pair String Bool) :=
     [ MkPair String Bool "agree/samples" (all String ss_agrees ss_samples)
+    , MkPair String Bool "spans/stream-equals-collected" (all String ss_stream_agrees_with_slices ss_samples)
+    , MkPair String Bool "spans/partition-equals-whole" (all String ss_parts_agree_with_whole ss_samples)
     , MkPair String Bool "parse/valid-samples-parse"
         (all String ss_parses (take String 18 ss_samples))
     , MkPair String Bool "parse/malformed-samples-fail"
         (notb (any String ss_parses (drop String 18 ss_samples)))
     , MkPair String Bool "spans/pipe-application-and-parens"
-        (ss_spans_expect "def f : Nat := g (h x) |> k;"
-          ["g (h x) |> k", "g (h x)", "(h x)", "h x", "g", "h", "x", "k", "Nat"] [])
+        (ss_spans_expect "def f : Nat := g ((h x)) |> k;"
+          ["g ((h x)) |> k", "g ((h x))", "(h x)", "h x", "g", "h", "x", "k", "Nat"] [])
     , MkPair String Bool "spans/escaped-string-literal"
         (ss_spans_expect "def s : String := \"a\\\"b -- c\"; -- trailing" ["\"a\\\"b -- c\"", "String"] [])
     , MkPair String Bool "spans/crlf-lines"
@@ -522,8 +564,8 @@ def ss_laws : List (Pair String Bool) :=
     , MkPair String Bool "spans/sorts-and-holes"
         (ss_spans_expect "def h : Type1 := ?goal;" ["Type1", "?goal"] [])
     , MkPair String Bool "spans/do-binds-stay-unwrapped"
-        (ss_spans_expect "def main : IO Unit :=\n  do let! line := readLine;\n     println (let y := line in y)"
-          ["IO Unit", "readLine", "println (let y := line in y)", "(let y := line in y)",
+        (ss_spans_expect "def main : IO Unit :=\n  do let! line := readLine;\n     println ((let y := line in y))"
+          ["IO Unit", "readLine", "println ((let y := line in y))", "(let y := line in y)",
            "let y := line in y", "line", "y"]
           ["let! line := readLine"])
     , MkPair String Bool "spans/list-literal"
@@ -565,26 +607,110 @@ def ss_expanded (text : String) : Maybe (List Nat) :=
         end
     end;
 
-def ss_file_rows (path : String) : IO (List (Pair String Bool)) :=
-    do let! loaded := fs_read_checked path;
+def ss_progress (phase : String) : IO Unit :=
+    do let! written := fs_write_checked "_build/source_spans.progress" phase;
+       match written with
+       | Left error => do eprintln (fs_error_message error); exit 1
+       | Right _ => io_unit
+       end
+
+def ss_file_rows_part (path : String) (part : Nat) (parts : Nat)
+    : IO (List (Pair String Bool)) :=
+    let label : String := str_cat4 path "#" (show_nat part) (str_concat "/" (show_nat parts)) in
+    do ss_progress (str_concat "file " label);
+       let! loaded := fs_read_checked path;
        match loaded with
        | Left _ => io_pure(List (Pair String Bool), [MkPair String Bool (concat "file/read " path) False])
        | Right text =>
            match ss_expanded text with
            | Nothing => io_pure(List (Pair String Bool), [MkPair String Bool (concat "file/preprocess " path) False])
-           | Just codes => io_pure (List (Pair String Bool))
-               [ MkPair(String, Bool, concat "file/agree " path, ss_agrees_codes codes)
-               , MkPair(String, Bool, concat "file/spans " path, ss_well_formed_codes codes)
-               ]
+           | Just codes =>
+               do let! agree_rows := match eqNat part Z with
+                    | True => do ss_progress (str_concat "agree " label);
+                                 let! agrees := io_pure Bool (ss_agrees_codes codes);
+                                 io_pure(List (Pair String Bool),
+                                   [MkPair String Bool (concat "file/agree " path) agrees])
+                    | False => io_pure(List (Pair String Bool), Nil (Pair String Bool))
+                    end;
+                  ss_progress (str_concat "spans " label);
+                  let! spans := io_pure Bool (ss_well_formed_codes_part codes part parts);
+                  ss_progress (str_concat "done " label);
+                  io_pure (List (Pair String Bool))
+                    (append (Pair String Bool) agree_rows
+                      [MkPair String Bool (concat "file/spans " label) spans])
            end
        end
 
+def ss_file_parts (path : String) : List Nat :=
+    match str_eq path "compiler/desugar_match.ouro" with
+    | True => [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+    | False => [0]
+    end;
+
+def ss_run_child (program : String) (args : List String) (label : String) : IO Unit :=
+    do let! result := process_run_spec_checked (command_spec program args);
+       match result with
+       | Left error => do eprintln (str_concat label (process_error_message error)); exit 1
+       | Right child => do print (proc_stdout child); eprint (proc_stderr child)
+       end
+
+def ss_run_part (program : String) (path : String) (parts : Nat) (part : Nat) : IO Unit :=
+    ss_run_child program ["--source-span-part", path, show_nat part, show_nat parts]
+      (str_cat4 "source-spans: failed " path " part " (str_concat (show_nat part) ": "));
+
+def ss_run_file (program : String) (path : String) : IO Unit :=
+    let parts : List Nat := ss_file_parts path in
+    io_foreach Nat (ss_run_part program path (length Nat parts)) parts;
+
+def ss_run_laws (program : String) : IO Unit :=
+    ss_run_child program ["--source-span-laws"] "source-spans: laws failed: ";
+
 -- @entry main
 def main : IO Unit :=
-    do let! file_rows := io_fold String (List (Pair String Bool))
-         (fun (rows : List (Pair String Bool)) (path : String) =>
-           io_bind (List (Pair String Bool)) (List (Pair String Bool)) (ss_file_rows path)
-             (fun (more : List (Pair String Bool)) =>
-               io_pure(List (Pair String Bool), append (Pair String Bool) rows more)))
-         (Nil (Pair String Bool)) ss_files;
-       precision_run("source-spans", append (Pair String Bool) ss_laws file_rows)
+    do let! argv := prim_argv;
+       match argv with
+       | Nil => do eprintln "source-spans: missing executable path"; exit 2
+       | Cons program rest =>
+           match rest with
+           | Nil => do ss_run_laws program;
+                       io_foreach String (ss_run_file program) ss_files
+           | Cons mode args =>
+               match args with
+               | Nil => match str_eq mode "--source-span-laws" with
+                   | True => precision_run("source-spans", ss_laws)
+                   | False => do eprintln "source-spans: invalid arguments"; exit 2
+                   end
+               | Cons path tail =>
+                   match tail with
+                   | Cons part_text tail2 =>
+                       match tail2 with
+                       | Cons parts_text final =>
+                           match final with
+                           | Nil =>
+                               match andb(str_eq mode "--source-span-part",
+                                 elem String prim_string_eq path ss_files) with
+                               | False => do eprintln "source-spans: invalid part request"; exit 2
+                               | True =>
+                                   match str_parse_nat part_text with
+                                   | Nothing => do eprintln "source-spans: invalid partition number"; exit 2
+                                   | Just part =>
+                                       match str_parse_nat parts_text with
+                                       | Nothing => do eprintln "source-spans: invalid partition number"; exit 2
+                                       | Just parts =>
+                                           match andb(eqNat parts (length Nat (ss_file_parts path)), ltb_nat part parts) with
+                                           | False => do eprintln "source-spans: invalid partition"; exit 2
+                                           | True => do let! rows := ss_file_rows_part path part parts;
+                                                        precision_run("source-spans", rows)
+                                           end
+                                       end
+                                   end
+                               end
+                           | Cons _ _ => do eprintln "source-spans: invalid arguments"; exit 2
+                           end
+                       | Nil => do eprintln "source-spans: invalid arguments"; exit 2
+                       end
+                   | Nil => do eprintln "source-spans: invalid arguments"; exit 2
+                   end
+               end
+           end
+       end

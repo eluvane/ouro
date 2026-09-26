@@ -24,6 +24,7 @@ EXPRS = {
     "EBinder": ["Nat", "Expr", "Expr"], "ENoBinder": [],
     "EMultiMatch": ["List Expr", "List (Pair (List (Pair Nat (List Nat))) Expr)"],
     "EStr": ["Nat"], "EDoBind": ["Nat", "Expr"], "EList": ["List Expr"],
+    "ESpan": ["Nat", "Nat", "Expr"],
 }
 
 
@@ -118,6 +119,8 @@ def rows(seed):
     for body in ([], ["TNat 1", "TArrow"], ["TLparen", "TNat 1"], ["TKeyword kwFun"]):
         token_list = "([" + ", ".join(f"({token})" for token in body) + "] : List Token)"
         observations.append((f"observe_parse (parse 300 MExpr {token_list} {n} (VNat 0))", f"error:{n + len(body)}"))
+    observations.append((f"observe_expr 40 (ESpan {n} {n + 3} (ESpan {n + 1} {n + 2} (ENat {n})))",
+                         f"ESpan({n},{n + 3},ESpan({n + 1},{n + 2},ENat({n})))"))
     return observations
 
 
