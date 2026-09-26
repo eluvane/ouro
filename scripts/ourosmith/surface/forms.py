@@ -130,6 +130,38 @@ def length (A : Type) : List A -> Nat :=
 def values : List Nat := [{', '.join(map(str, values))}{',' if values else ''}];
 def result : Nat := values |> length Nat;
 """, len(values), False
+    yield "list-spread", PRELUDE + f"""inductive List (A : Type) : Type := | Nil : List A | Cons : A -> List A -> List A;
+def eight (value : Nat) : Nat :=
+  let two : Nat := add value value in
+  let four : Nat := add two two in
+  add four four;
+def score : List Nat -> Nat :=
+  fix score (items : List Nat) : Nat :=
+    match items with
+    | Nil => Z
+    | Cons head rest => add head (eight (score rest))
+    end;
+def rest : List Nat := [2];
+def values : List Nat := [{n}, {m}, ..rest];
+def result : Nat := score values;
+""", n + 8 * m + 128, False
+    yield "range-literal", PRELUDE + f"""inductive NatRangeBound : Type :=
+  | RangeExclusive : NatRangeBound | RangeInclusive : NatRangeBound;
+representation NatRangeBound := "ouro.range-bound";
+inductive NatRange : Type :=
+  | MkNatRange : Nat -> Nat -> Nat -> NatRangeBound -> NatRange;
+representation NatRange := "ouro.range";
+def double (value : Nat) : Nat := add value value;
+def quadruple (value : Nat) : Nat := double (double value);
+def score (range : NatRange) : Nat :=
+  match range with
+  | MkNatRange first last step bound =>
+      let weighted : Nat := add first (add (double last) (quadruple step)) in
+      match bound with
+      | RangeExclusive => weighted | RangeInclusive => S weighted end
+  end;
+def result : Nat := add (score ({n}..{m})) (score ({m}..={n}));
+""", 3 * n + 3 * m + 9, False
     yield "record", PRELUDE + f"""record Point : Type where
   x : Nat;
   y : Nat;

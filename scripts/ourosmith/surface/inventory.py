@@ -47,6 +47,8 @@ EXPR = {
     "EStr": "feature:string-length", "EDoBind": "property:test-known-counts", "EList": "feature:form:list",
     "ESpan": "feature:parser:abi-and-grammar", "EOpen": "feature:parity:imports-open-local",
     "EFallible": "feature:form:fallible-block",
+    "EListSpread": "feature:form:list-spread",
+    "ERange": "feature:form:range-literal",
     "ENamedCall": "feature:form:named-call",
 }
 DECL = {"DDef": "feature:prelude", "DAxiom": "negative:effect-root-assumption-type", "DInductive": "feature:prelude",
@@ -56,7 +58,8 @@ TOKEN = dict.fromkeys(("TIdent", "TNat", "TKeyword", "TType", "TColon", "TColonE
                        "TBar", "TLparen", "TRparen", "TSemi", "TEof"), "feature:prelude")
 TOKEN.update({"THole": "negative:named-hole", "TString": "feature:string-length", "TComma": "feature:form:list",
               "TBraceL": "feature:form:record", "TBraceR": "feature:form:record", "TBind": "property:test-known-counts",
-              "TPipe": "feature:pipe", "TBracketL": "feature:form:list", "TBracketR": "feature:form:list"})
+              "TPipe": "feature:pipe", "TBracketL": "feature:form:list", "TBracketR": "feature:form:list",
+              "TDotDot": "feature:form:list-spread", "TDotDotEq": "feature:form:range-literal"})
 KEYWORD = dict.fromkeys(("kwDef", "kwInductive", "kwFun", "kwMatch", "kwWith", "kwEnd", "kwLet", "kwIn", "kwFix",
                         "kwIntrinsic", "kwRepresentation"), "feature:prelude")
 KEYWORD.update({"kwImport": "property:import-dependency-order", "kwEffect": "feature:form:handler",

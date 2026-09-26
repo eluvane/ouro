@@ -64,6 +64,16 @@ class SourceContracts(unittest.TestCase):
         self.assertEqual(frontend.collect_units("root.ouro"),
                          ["base.ouro", "left/a.ouro", "right/a.ouro", "root.ouro"])
 
+    def test_selective_imports_keep_the_full_dependency_closure(self):
+        for name, text in {
+            "leaf.ouro": "axiom Visible : Type; axiom Hidden : Type;",
+            "middle.ouro": 'import "leaf.ouro" exposing (Visible as Pick);',
+            "root.ouro": 'import "middle.ouro"; def value : Type := Pick;',
+        }.items():
+            self.source(name, text)
+        self.assertEqual(frontend.collect_units("root.ouro"),
+                         ["leaf.ouro", "middle.ouro", "root.ouro"])
+
     def test_grouped_second_edge_cycle_and_missing_file_fail(self):
         self.source("base.ouro", "")
         root = self.source("root.ouro", 'import "base.ouro", "missing.ouro";')

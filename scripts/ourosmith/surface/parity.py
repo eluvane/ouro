@@ -25,12 +25,19 @@ def programs(seed):
         ("imports-open-decl", 'import "leaf.ouro" as L;\nopen L;\n', f"def result : Nat := add value {m};\n"),
         ("imports-open-local", 'import "leaf.ouro" as L;\n', f"def result : Nat := open L in add value {m};\n"),
         ("imports-plain-alias", 'import "leaf.ouro" as L;\nimport "leaf.ouro";\n', f"def result : Nat := L.add value {m};\n"),
+        ("imports-selective", 'import "leaf.ouro" as L exposing (Nat, Z, S, add, value as chosen);\n',
+         f"def result : L.Nat := L.add chosen {m};\n"),
         ("imports-record", 'import "leaf.ouro" as L;\n', f"record Point : Type where x : L.Nat; y : L.Nat; end;\ndef point : Point := {{x := L.value, y := {m}}};\ndef result : L.Nat := L.add (point.x) (point.y);\n"),
     ):
         yield {"name": name, "source": imports + declarations, "expected": n + m,
                "dependencies": [["leaf.ouro", PRELUDE + f"def value : Nat := {n};\n"]]}
+    yield {"name": "imports-selective-transitive",
+           "source": f'import "middle.ouro";\ndef result : Number := plus chosen {m};\n',
+           "expected": n + m, "type_name": "Number", "successor": "S",
+           "dependencies": [["leaf.ouro", PRELUDE + f"def value : Nat := {n};\n"],
+                            ["middle.ouro", 'import "leaf.ouro" exposing (Nat as Number, S, add as plus, value as chosen);\n']]}
     for name, source, expected, units in form_programs(seed):
-        if name in {"record", "list", "do-case-binding", "handler"}:
+        if name in {"record", "list", "list-spread", "do-case-binding", "handler"}:
             yield {"name": name, "source": source, "expected": expected, "dependencies": [], "units_needed": units}
     for mutation in mutations(seed):
         if mutation.name in {"pipe-missing-rhs", "list-context", "import-unknown"}:
@@ -41,8 +48,8 @@ def programs(seed):
 def inputs(seed):
     for case in programs(seed):
         if "expected" in case:
-            case["type_name"] = "L.Nat" if case["name"].startswith("imports") else "Nat"
-            case["successor"] = "L.S" if case["name"].startswith("imports") else "S"
+            case.setdefault("type_name", "L.Nat" if case["name"].startswith("imports") else "Nat")
+            case.setdefault("successor", "L.S" if case["name"].startswith("imports") else "S")
         yield case
 
 

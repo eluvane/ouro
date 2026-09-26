@@ -33,7 +33,7 @@ references with lexical binder scope. Elaboration, lowering, and declaration
 checking live in `elab.ouro`, `lower.ouro`, and `file_elab.ouro`.
 `driver.ouro` and `pipeline.ouro` compose the stages.
 
-The production frontend preprocesses import aliases and records, then passes a
+The production frontend preprocesses import aliases, exposing clauses, and records, then passes a
 `CanonicalSourceUnit` token stream to the parser. Import qualification retains
 an internal marker that the module resolver binds to the directly imported
 unit after parsing; raw source cannot spell that marker. [Canonical source](canonical_source.md)
@@ -42,8 +42,11 @@ owns trivia, directive metadata, source mapping, and hash contracts.
 The parser uses the same `parse_a.ouro` / `parse_b.ouro` mode helpers and
 `parser_min.ouro` ABI as split bootstrap compilation. Its dispatcher owns the
 recursive fuel boundary. The module resolver gives colliding declarations
-distinct identities before the ordered import closure is flattened. The
-checker still receives every reached imported declaration and body.
+distinct identities, and isolates all imported declarations when a selective
+edge is reached. It computes visible names from each file's import edges;
+selective edges filter direct declarations while plain edges inherit the
+target's visible names. This scope does not shrink the ordered import closure.
+The checker still receives every reached imported declaration and body.
 [Compiler checking](kernel_design.md) defines the complete declaration plan
 and import-closure checks.
 

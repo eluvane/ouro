@@ -1,0 +1,114 @@
+-- Pure pull iterators with explicit failure and bounded materialization.
+
+import "listx.ouro";
+
+inductive IterStep (State : Type) (Error : Type) (Item : Type) : Type :=
+  | IterDone : IterStep State Error Item
+  | IterSkip : State -> IterStep State Error Item
+  | IterYield : Item -> State -> IterStep State Error Item
+  | IterFail : Error -> IterStep State Error Item;
+
+inductive Iterator (State : Type) (Error : Type) (Item : Type) : Type :=
+  | MkIterator : State -> (State -> IterStep State Error Item) -> Iterator State Error Item;
+
+inductive IterCollectError (Error : Type) : Type :=
+  | IterSourceFailure : Error -> IterCollectError Error
+  | IterPullLimit : IterCollectError Error;
+
+def iter_from_list (Error : Type) (Item : Type) (xs : List Item)
+    : Iterator (List Item) Error Item :=
+    MkIterator (List Item) Error Item xs
+      (fun (remaining : List Item) =>
+        match remaining with
+        | Nil => IterDone (List Item) Error Item
+        | Cons value rest => IterYield (List Item) Error Item value rest
+        end);
+
+def iter_map (State : Type) (Error : Type) (Item : Type) (Mapped : Type)
+    (convert : Item -> Mapped) (source : Iterator State Error Item)
+    : Iterator State Error Mapped :=
+    match source with
+    | MkIterator initial pull =>
+        MkIterator State Error Mapped initial
+          (fun (current : State) =>
+            match pull current with
+            | IterDone => IterDone State Error Mapped
+            | IterSkip next => IterSkip State Error Mapped next
+            | IterYield value next =>
+                IterYield State Error Mapped (convert value) next
+            | IterFail failure => IterFail State Error Mapped failure
+            end)
+    end;
+
+def iter_filter (State : Type) (Error : Type) (Item : Type)
+    (accept : Item -> Bool) (source : Iterator State Error Item)
+    : Iterator State Error Item :=
+    match source with
+    | MkIterator initial pull =>
+        MkIterator State Error Item initial
+          (fun (current : State) =>
+            match pull current with
+            | IterDone => IterDone State Error Item
+            | IterSkip next => IterSkip State Error Item next
+            | IterYield value next =>
+                match accept value with
+                | True => IterYield State Error Item value next
+                | False => IterSkip State Error Item next
+                end
+            | IterFail failure => IterFail State Error Item failure
+            end)
+    end;
+
+def iter_take (State : Type) (Error : Type) (Item : Type)
+    (count : Nat) (source : Iterator State Error Item)
+    : Iterator (Pair Nat State) Error Item :=
+    match source with
+    | MkIterator initial pull =>
+        MkIterator (Pair Nat State) Error Item
+          (MkPair Nat State count initial)
+          (fun (current : Pair Nat State) =>
+            match current with
+            | MkPair remaining upstream =>
+                match remaining with
+                | Z => IterDone (Pair Nat State) Error Item
+                | S left =>
+                    match pull upstream with
+                    | IterDone => IterDone (Pair Nat State) Error Item
+                    | IterSkip next =>
+                        IterSkip (Pair Nat State) Error Item
+                          (MkPair Nat State remaining next)
+                    | IterYield value next =>
+                        IterYield (Pair Nat State) Error Item value
+                          (MkPair Nat State left next)
+                    | IterFail failure =>
+                        IterFail (Pair Nat State) Error Item failure
+                    end
+                end
+            end)
+    end;
+
+def collect_list (State : Type) (Error : Type) (Item : Type)
+    (max_pulls : Nat) (source : Iterator State Error Item)
+    : Either (IterCollectError Error) (List Item) :=
+    match source with
+    | MkIterator initial pull =>
+        (fix go (fuel : Nat) (current : State) (reversed : List Item)
+            : Either (IterCollectError Error) (List Item) :=
+          match fuel with
+          | Z =>
+              Left (IterCollectError Error) (List Item)
+                (IterPullLimit Error)
+          | S rest =>
+              match pull current with
+              | IterDone =>
+                  Right (IterCollectError Error) (List Item)
+                    (reverse_lin Item reversed)
+              | IterSkip next => go rest next reversed
+              | IterYield value next =>
+                  go rest next (Cons Item value reversed)
+              | IterFail failure =>
+                  Left (IterCollectError Error) (List Item)
+                    (IterSourceFailure Error failure)
+              end
+          end) max_pulls initial (Nil Item)
+    end;
