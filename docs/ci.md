@@ -244,7 +244,8 @@ succeed; a skipped required job or failed/cancelled matrix cannot satisfy it.
 Do not require individual dynamic matrix names in branch protection.
 
 The GitHub job summary lists selected groups and gates. Full runs enqueue the
-three long check groups and compiler shards first. PR matrix jobs cancel remaining siblings after a
+three long check groups and isolated `source_spans` shard before the other compiler shards.
+PR matrix jobs cancel remaining siblings after a
 failure, and each group stops at its first blocking failure while recording
 unexecuted gates as `not_run`. Nightly and ordinary local profiles still gather
 all failures. Obsolete runs are cancelled by the existing concurrency group.

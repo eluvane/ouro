@@ -434,9 +434,12 @@ def plan_paths(paths: Sequence[str]) -> PathSelection:
 
 def selection_matrix(selection: PathSelection) -> dict[str, list[dict[str, str]]]:
     selected = set(selection.gates)
-    # Start critical-path checks and compiler shards when runner concurrency is saturated.
+    # Start critical-path checks and the isolated source-spans shard before runner slots fill.
     priority = {"checks": 0, "checks-parity": 0, "checks-quality": 0}
-    groups = sorted(PR_GROUPS, key=lambda name: priority.get(name, 1 if name.startswith("compiler-") else 2))
+    groups = sorted(PR_GROUPS, key=lambda name: (
+        priority.get(name, 1 if name.startswith("compiler-") else 2),
+        0 if name == f"compiler-{COMPILER_SHARDS}" else 1,
+    ))
     return {"include": [{"group": group} for group in groups if selected.intersection(PR_GROUPS[group])]}
 
 
@@ -805,6 +808,8 @@ def run_self_tests(all_gates: Sequence[Gate]) -> int:
                     failures.append("full PR routing omits or duplicates a group")
                 if planned[:3] != ["checks", "checks-parity", "checks-quality"]:
                     failures.append("long PR checks must start before compiler shards")
+                if planned[3] != f"compiler-{COMPILER_SHARDS}":
+                    failures.append("isolated source-spans shard must start before other compiler shards")
             elif matrix != list(groups):
                 failures.append(f"hosted {profile} matrix differs from automatic group inventory: {matrix}")
     lint_workflow = (ROOT / ".github/workflows/ouro-lint.yml").read_text(encoding="utf-8")
