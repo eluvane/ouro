@@ -124,6 +124,25 @@ def pred (n : Nat) : Nat :=
   end;
 ```
 
+A family can opt in to omitting a leading universe parameter on saturated
+constructor calls:
+
+```ouro
+inductive Box {A : Type} : Type :=
+  | MkBox : A -> Box A;
+
+def boxed : Box Nat := MkBox Z;      -- inserts Nat
+def explicit : Box Nat := MkBox Nat Z;
+```
+
+Only leading `{A : Type}` groups on a non-indexed inductive family are marked.
+When the expected result is a direct, fully applied `Box Nat`, the compiler
+inserts its marked parameter before checking the ordinary constructor call.
+Explicit arguments remain valid; unmarked constructors and generic functions
+keep their existing explicit-argument rules. See
+[Marked constructor parameters](language/ergonomic-syntax.md#marked-constructor-parameters)
+for the bounded inference rule.
+
 Matches are constructor-based. The current implementation does not provide the
 full pattern language of a mature functional language; advanced patterns,
 or-patterns, and general wildcard exhaustiveness are outside the maintained
@@ -397,5 +416,5 @@ declaration do not require a trailing semicolon per arm.
 
 The [design goals](design.md#language-direction) and
 [stability policy](stability.md#experimental-areas) describe planned and
-experimental language areas. Record updates, unrestricted recursion, implicit
+experimental language areas. Unrestricted recursion, general implicit
 arguments, and type classes are outside this surface.

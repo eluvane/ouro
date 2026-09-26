@@ -91,9 +91,10 @@ x |> f(a,)  == (f a) x
 
 The callee is an ordinary expression, including a local or higher-order value.
 There is no method search, overload search, declaration-name lookup, tuple
-allocation, implicit type argument, hidden conversion, or effect handler.
+allocation, implicit argument for ordinary functions, hidden conversion, or effect handler.
 Each application node is checked by the existing dependent-function checker.
-Type parameters remain ordinary explicit arguments, for example
+Except for opt-in marked constructors described below, type parameters remain
+ordinary explicit arguments, for example
 `map(Nat, String, f, xs)` when that is the function's existing signature.
 
 Existing `f (a)` and `f (a : T)` retain their meanings. Whitespace before the
@@ -187,6 +188,40 @@ contains a hole, an unresolved name, or a shadowed local type name, lowering
 does not use that hint; annotate the relevant lambda parameter. An
 unannotated lambda without an expected function type still needs an
 annotation. Parameterized local helpers still require typed parameters.
+
+## Marked constructor parameters
+
+An inductive family may mark a **leading** prefix of its universe parameters:
+
+```ouro
+inductive Box {A : Type} : Type :=
+  | MkBox : A -> Box A;
+
+def value : Box Nat := MkBox Z;
+def explicit : Box Nat := MkBox Nat Z;
+```
+
+The `{A : Type}` group is an opt-in declaration marker. It binds `A` just
+like an ordinary parameter and is retained as metadata through parsing and
+constructor lookup. Several leading groups may be marked; later ordinary
+`(B : Type)` parameters remain explicit. Marked groups must precede all
+ordinary parameters and have universe level zero (`Type` or `Type0`). Indexed families
+cannot use the marker in this first slice.
+
+For a marked constructor, the omitted prefix is inserted only when the
+expected result is a direct application of its own family with every family
+parameter supplied, and the source supplies exactly the remaining family
+parameters and constructor fields. For example, `MkBox Z` at expected
+`Box Nat` becomes the ordinary checked call `MkBox Nat Z`. The result and
+each argument are checked by the existing compiler checker. Explicit calls
+still work. A local binding without an expected type, a partial call, a
+different family, an unresolved type, or a source hole cannot provide an
+inference hint. Local binders shadow global constructor names.
+
+This rule does not infer parameters of ordinary definitions, infer marked
+parameters from value arguments, search for instances, or convert between
+families. Annotate the result or supply the constructor parameter explicitly
+when the expected family is unavailable.
 
 ## Pure expression blocks
 
@@ -283,7 +318,7 @@ rejected forms, import graph/diagnostic cases, and formatter round trips.
 
 ## Scope
 
-These forms add no module identity, tuple or named call syntax, implicit type
+These forms add no module identity, tuple or named call syntax, general implicit
 argument inference, or general effect handling. Aliases remain the existing
 flattened-namespace source rewrite. For language direction and
 compatibility, see [Design](../design.md#language-direction) and
