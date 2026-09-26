@@ -276,9 +276,13 @@ representation Natural := "ouro.nat";
 
 The target uses ordinary import alias and local-open resolution. The checker
 checks the inductive's shape and rejects duplicate role assignments. The
-initial role keys are `ouro.nat`, `ouro.bool`, `ouro.unit`, `ouro.list`,
-`ouro.maybe`, and `ouro.pair`. Parsing retains unknown keys for checker
-diagnostics. Exactly one quoted key and a final `;` are required; a type
+role keys are `ouro.nat`, `ouro.bool`, `ouro.unit`, `ouro.list`,
+`ouro.maybe`, `ouro.pair`, `ouro.range-bound`, and `ouro.range`. The bound
+role requires a zero-parameter, zero-index inductive with two nullary
+constructors. The range role requires a zero-parameter, zero-index inductive
+with one constructor of type `Nat -> Nat -> Nat -> RangeBound -> Range`. Its `Nat` and
+bound fields must use the registered nominal families. Parsing retains
+unknown keys for checker diagnostics. Exactly one quoted key and a final `;` are required; a type
 signature or expression body is not part of this annotation. `representation`
 is a reserved keyword, and the target remains a reference for facts and lint.
 
@@ -308,6 +312,19 @@ tokens; for example `1__0`, `0x_F`, `0b2`, and `12u32`. The spelling `_1`
 remains an identifier under the existing identifier grammar. These literals do
 not select a machine integer type or perform a narrowing conversion. Typed
 numeric suffixes are not supported.
+
+With the nominal `Nat`, `NatRangeBound`, and `NatRange` representations from
+`std/range.ouro`, `0..10` constructs an exclusive range and `0..=10` an
+inclusive range. The two endpoints must be `Nat` literals in this syntax;
+variables and explicit step magnitudes use `nat_range_exclusive`,
+`nat_range_inclusive`, and `nat_range_by`. Both literal forms construct a
+step-one `NatRange`, including descending or equal endpoints. Whitespace may
+surround the separator; `..=` is one token. A missing endpoint, a nonliteral
+endpoint, or a chained separator is rejected. The compiler resolves the
+registered nominal roles and ordinary constructor types, so same-spelled
+unregistered declarations cannot receive a range literal. See
+[finite Nat ranges](practical_stdlib.md#finite-nat-ranges) for iteration and
+bounded collection.
 
 String literals support `\n`, `\t`, `\r`, `\"`, `\\`, and braced Unicode
 scalar escapes:

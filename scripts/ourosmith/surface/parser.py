@@ -27,12 +27,15 @@ EXPRS = {
     "ESpan": ["Nat", "Nat", "Expr"], "EOpen": ["Nat", "Expr"],
     "EFallible": ["Expr", "Nat", "Nat", "Expr"],
     "EListSpread": ["List Expr", "Expr"],
+    "ERange": ["Nat", "Nat", "Bool"],
 }
 
 
 def printer(type_name):
     if type_name == "Nat":
         return "show_nat"
+    if type_name == "Bool":
+        return "show_bool"
     if type_name == "Expr":
         return "(fun (child : Expr) => observe_expr remaining child)"
     # Compound payloads not constructed by this recipe still need exhaustive
@@ -78,7 +81,7 @@ def rows(seed):
     tokens = [f"TIdent {n}", f"TNat {n}", f"TKeyword {n}", f"TType {n}",
               "TColon", "TColonEq", "TArrow", "TFatArrow", "TBar", "TLparen", "TRparen", "TSemi",
               "THole (Nothing Nat)", f"TString {n}", "TComma", "TBraceL", "TBraceR", "TExclam",
-              "TEof", "TBind", "TPipe", "TBracketL", "TBracketR", "TDotDot"]
+              "TEof", "TBind", "TPipe", "TBracketL", "TBracketR", "TDotDot", "TDotDotEq"]
     observations = []
     accessors = []
     expected_tokens = []
@@ -105,6 +108,8 @@ def rows(seed):
                          "[" + ", ".join(f"error:{n}" for _ in MODES) + "]"))
     cases = [
         ([f"TNat {n}"], f"ENat({n})"), ([f"TIdent {n}"], f"EVar({n})"),
+        (["TNat 1", "TDotDot", "TNat 2"], "ERange(1,2,false)"),
+        (["TNat 1", "TDotDotEq", "TNat 2"], "ERange(1,2,true)"),
         (["TType 2"], "ESort(2)"), ([tokens[12]], "EHole(none)"),
         ([f"THole (Just Nat {n})"], f"EHole(just({n}))"), ([f"TString {n}"], f"EStr({n})"),
         ([f"TIdent {n}", "TNat 2"], f"EApp(EVar({n}),ENat(2))"),
@@ -123,7 +128,8 @@ def rows(seed):
     for body, expected in cases:
         token_list = "([" + ", ".join(f"({token})" for token in [*body, "TSemi"]) + "] : List Token)"
         observations.append((f"observe_parse (parse 300 MExpr {token_list} {n} (VNat 0))", f"{expected}:{n + len(body)}:[11]"))
-    for body in ([], ["TNat 1", "TArrow"], ["TLparen", "TNat 1"], ["TKeyword kwFun"]):
+    for body in ([], ["TNat 1", "TDotDot"], ["TNat 1", "TDotDotEq"],
+                 ["TNat 1", "TArrow"], ["TLparen", "TNat 1"], ["TKeyword kwFun"]):
         token_list = "([" + ", ".join(f"({token})" for token in body) + "] : List Token)"
         observations.append((f"observe_parse (parse 300 MExpr {token_list} {n} (VNat 0))", f"error:{n + len(body)}"))
     observations.append((f"observe_expr 40 (ESpan {n} {n + 3} (ESpan {n + 1} {n + 2} (ENat {n})))",
