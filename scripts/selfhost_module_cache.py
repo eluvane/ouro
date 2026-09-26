@@ -126,6 +126,14 @@ def quoted_import_targets(source_text: str, source_path: str) -> list[str]:
         elif source_text.startswith("--", index):
             end = source_text.find("\n", index)
             index = len(source_text) if end < 0 else end + 1
+        elif source_text.startswith('r#"', index):
+            close = source_text.find('"#', index + 3)
+            if close < 0:
+                tokens.append(("unterminated", ""))
+                index = len(source_text)
+            else:
+                tokens.append(("string", source_text[index + 3:close]))
+                index = close + 2
         elif char == '"':
             index += 1
             value: list[str] = []

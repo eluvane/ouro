@@ -87,6 +87,17 @@ class SourceContracts(unittest.TestCase):
         self.assertEqual(frontend.SMC.quoted_import_targets(source, "root.ouro"),
                          ["café.ouro", "😀.ouro"])
 
+    def test_raw_imports_preserve_bytes_and_hide_multiline_code(self):
+        source = ('def text : String := r#"import "fake.ouro";\n'
+                  '-- @export fake\n"#;\n'
+                  'import r#"dir\\leaf.ouro"#, r#"café.ouro"#;')
+        self.assertEqual(frontend.SMC.quoted_import_targets(source, "root.ouro"),
+                         ["dir/leaf.ouro", "café.ouro"])
+
+    def test_unterminated_raw_import_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "malformed quoted import"):
+            frontend.SMC.quoted_import_targets('import r#"unfinished.ouro";', "root.ouro")
+
     def test_malformed_braced_unicode_imports_fail_closed(self):
         for spelling in (r'\u{}', r'\u{12G}', r'\u{0000041}',
                          r'\u{D800}', r'\u{110000}', r'\u{41'):
