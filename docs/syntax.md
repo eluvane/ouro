@@ -557,17 +557,24 @@ argument convention is obvious.
 
 ## IO and `do`
 
-Runnable programs export `main : IO Unit`. The maintained `do` subset supports
-sequencing and `let!` binding:
+Runnable programs export `main : IO Unit`. A `do` expression sequences actions,
+uses `let!` for an action's result, and uses ordinary `let` for a pure value:
 
 ```ouro
 def echo : IO Unit :=
-  do let! line := readLine;
+  do let prompt : String := "Name: ";
+     print prompt;
+     let! line := readLine;
      println line
 ```
 
-`do let!` is valid only inside a `do` expression. The older `<-` binding
-spelling is not accepted by the strict project profile.
+The pure binding requires a semicolon and a following statement. It scopes
+over the remaining statements, not its own value. Binding an `IO A` value
+leaves that action deferred; use `let!` to run it and bind its result.
+The final statement supplies the `do` expression's result. For `IO A`, make it
+an action of type `IO A`, such as `io_pure A value` for a pure result.
+`let!` is valid only inside a `do` expression. The older `<-` binding spelling
+is not accepted by the strict project profile.
 
 ## Effects and handlers
 
