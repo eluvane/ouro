@@ -34,6 +34,14 @@ def load_cases():
                 raise ValueError("positive case must use checked equivalence: " + name)
             if "setup" in case and (group != "positive" or not isinstance(case["setup"], str)):
                 raise ValueError("invalid equivalence setup: " + name)
+            if ("law_type" in case) != ("law_args" in case):
+                raise ValueError("incomplete pointwise equivalence: " + name)
+            if "law_type" in case and (group != "positive" or any(
+                    not isinstance(case[key], str) or not case[key] for key in ("law_type", "law_args"))):
+                raise ValueError("invalid pointwise equivalence: " + name)
+            if "diagnostic" in case and (group != "negative" or not isinstance(case["diagnostic"], str)
+                                         or not case["diagnostic"]):
+                raise ValueError("invalid rejection diagnostic: " + name)
             if "lint" in case:
                 expected = case["lint"]
                 if group != "positive" or not isinstance(expected, dict) or set(expected) != {"language", "semantic"}:
@@ -68,11 +76,16 @@ def render(case, directory):
     if "source" in case:
         return header + setup + case["source"] + "\n"
     ty = "(" + case["type"] + ")"
+    law_ty = "(" + case.get("law_type", case["type"]) + ")"
+    candidate = ("(ergo_expansion_candidate " + case["law_args"] + ")"
+                 if "law_args" in case else "ergo_expansion_candidate")
+    reference = ("(ergo_expansion_reference " + case["law_args"] + ")"
+                 if "law_args" in case else "ergo_expansion_reference")
     return header + setup + (
         f'def ergo_expansion_candidate : {ty} := {case["sugar"]};\n'
         f'def ergo_expansion_reference : {ty} := {case["canonical"]};\n'
-        f'def ergo_expansion_law : ErgEq {ty} ergo_expansion_candidate '
-        f'ergo_expansion_reference := ErgRefl {ty} ergo_expansion_reference;\n'
+        f'def ergo_expansion_law : ErgEq {law_ty} {candidate} '
+        f'{reference} := ErgRefl {law_ty} {reference};\n'
     )
 
 
@@ -130,6 +143,6 @@ def prepare_manifest(root, add):
             name = "ERGO.expansion-" + case["name"]
             passed = group == "positive"
             add(name, render(case, root / name), "pass" if passed else "fail",
-                "CHECK_OK" if passed else "CHECK_FAIL", dependency)
+                "CHECK_OK" if passed else case.get("diagnostic", "CHECK_FAIL"), dependency)
     for name, source, verdict, diagnostic, dependencies in import_cases():
         add("IMP.expansion-" + name, source, verdict, diagnostic, dependencies)
