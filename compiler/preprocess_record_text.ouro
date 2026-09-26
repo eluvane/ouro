@@ -2,7 +2,9 @@
 
 import "source_text.ouro",
   "../std/data.ouro",
+  "../std/natx.ouro",
   "base.ouro",
+  "path.ouro",
   "pipeline_abi.ouro";
 
 inductive RecEnv : Type :=
@@ -18,7 +20,8 @@ inductive RewriteR : Type :=
 
 inductive DefHead : Type :=
   | NoHead : DefHead
-  | MkHead : List Nat -> RecEnv -> Maybe Nat -> List Nat -> List Nat -> DefHead;
+  | MkHead : List Nat -> RecEnv -> Maybe (Pair Nat (List Nat)) ->
+      List Nat -> List Nat -> DefHead;
 
 -- @export empty_rec_reg; @doc docs/syntax.md
 def empty_rec_reg : RecReg :=
@@ -165,7 +168,7 @@ def env_lookup (env : RecEnv) (reg : RecReg) (n : List Nat) : Maybe Nat :=
                   | Nil => Nothing Nat
                   | Cons b rest =>
                       match b with
-                      | MkRecBind bn bi =>
+                      | MkRecBind bn bi _ =>
                           match source_bytes_equal n bn with
                           | True => Just Nat bi
                           | False => go2 rest
@@ -175,7 +178,7 @@ def env_lookup (env : RecEnv) (reg : RecReg) (n : List Nat) : Maybe Nat :=
             end
         | Cons b rest =>
             match b with
-            | MkRecBind bn bi =>
+            | MkRecBind bn bi _ =>
                 match source_bytes_equal n bn with
                 | True =>
                     match reg with
@@ -193,7 +196,7 @@ def env_lookup (env : RecEnv) (reg : RecReg) (n : List Nat) : Maybe Nat :=
 
 def env_add (env : RecEnv) (n : List Nat) (i : Nat) : RecEnv :=
   match env with
-  | MkRecEnv bs => MkRecEnv (Cons RecBind (MkRecBind n i) bs)
+  | MkRecEnv bs => MkRecEnv (Cons RecBind (MkRecBind n i (Nil Nat)) bs)
   end;
 
 def env_mask (env : RecEnv) (reg : RecReg) (n : List Nat) : RecEnv :=
@@ -233,6 +236,346 @@ def trim_left_bytes : List Nat -> List Nat :=
         | False => xs
         end
     end;
+
+-- Import preprocessing creates this separator only for a declared alias.
+-- Keep the whole atom for emitted references; the short member is only a
+-- record-shape hint and module resolution still checks its owner.
+def record_marker_parts (atom : List Nat)
+    : Maybe (Pair (List Nat) (List Nat)) :=
+  match source_take_ident atom with
+  | MkPair alias after =>
+      match after with
+      | Cons mark suffix =>
+          match eqNat mark 64 with
+          | False => Nothing (Pair (List Nat) (List Nat))
+          | True => match source_take_ident suffix with
+            | MkPair member tail =>
+                match member with
+                | Nil => Nothing (Pair (List Nat) (List Nat))
+                | Cons _ _ => match tail with
+                  | Nil => Just (Pair (List Nat) (List Nat))
+                      (MkPair (List Nat) (List Nat) alias member)
+                  | Cons _ _ => Nothing (Pair (List Nat) (List Nat))
+                  end
+                end
+            end
+          end
+      | Nil => Nothing (Pair (List Nat) (List Nat))
+      end
+  end;
+
+def record_take_atom (src : List Nat) : Pair (List Nat) (List Nat) :=
+  match source_take_ident src with
+  | MkPair id after => match after with
+    | Cons mark suffix => match eqNat mark 64 with
+      | False => MkPair (List Nat) (List Nat) id after
+      | True => match source_take_ident suffix with
+        | MkPair member tail =>
+            MkPair (List Nat) (List Nat)
+              (append Nat id (Cons Nat mark member)) tail
+        end
+      end
+    | Nil => MkPair (List Nat) (List Nat) id after
+    end
+  end;
+
+-- A bare generated name may bind a local parameter or a declaration. Such
+-- names make record sugar emit a compiler-owned alias for its actual owner.
+def record_bare_atoms (src : List Nat) : List (List Nat) :=
+  (fix go (fuel : Nat) (xs : List Nat) (in_record : Bool)
+      (acc : List (List Nat))
+      : List (List Nat) :=
+    match fuel with
+    | Z => acc
+    | S remaining => match xs with
+      | Nil => acc
+      | Cons c rest =>
+          match source_is_comment xs with
+          | True => go remaining (source_skip_line rest) in_record acc
+          | False => match eqNat c ch_dq_p with
+            | True => go remaining (source_skip_string rest) in_record acc
+            | False => match source_is_ident_start c with
+              | False => go remaining rest in_record acc
+              | True => match record_take_atom xs with
+                | MkPair atom after =>
+                    let next_record : Bool :=
+                      match source_bytes_equal atom w_record with
+                      | True => True
+                      | False => match source_bytes_equal atom w_end with
+                        | True => False
+                        | False => in_record
+                        end
+                      end in
+                    let next : List Nat :=
+                      match andb(in_record,
+                          source_bytes_equal atom w_constructor) with
+                      | False => after
+                      | True => match source_take_ident (skip_ws_p after) with
+                        | MkPair _ tail => tail
+                        end
+                      end in
+                    match record_marker_parts atom with
+                    | Just _ => go remaining next next_record acc
+                    | Nothing => go remaining next next_record
+                        (Cons (List Nat) atom acc)
+                    end
+                end
+              end
+            end
+          end
+      end
+    end) (S (length Nat src)) src False (Nil (List Nat));
+
+def record_qualifier (name : List Nat) : List Nat :=
+  match record_marker_parts (trim_bytes name) with
+  | Nothing => Nil Nat
+  | Just parts => match parts with
+    | MkPair alias _ => append Nat alias ([64] : List Nat)
+    end
+  end;
+
+def record_alias_target (current : List Nat) (aliases : ImpReg)
+    (alias : List Nat) : Maybe (List Nat) :=
+  match aliases with
+  | MkImpReg _ bindings =>
+      (fix find (rest : List (Pair (List Nat) (List Nat)))
+          : Maybe (List Nat) :=
+        match rest with
+        | Nil => Nothing (List Nat)
+        | Cons binding tail => match binding with
+          | MkPair name spelling =>
+              match source_bytes_equal name alias with
+              | True => Just (List Nat) (canon_path current spelling)
+              | False => find tail
+              end
+          end
+        end) bindings
+  end;
+
+def record_alias_for_owner (current : List Nat) (aliases : ImpReg)
+    (owner : List Nat) : Maybe (List Nat) :=
+  match aliases with
+  | MkImpReg _ bindings =>
+      (fix find (rest : List (Pair (List Nat) (List Nat)))
+          : Maybe (List Nat) :=
+        match rest with
+        | Nil => Nothing (List Nat)
+        | Cons binding tail => match binding with
+          | MkPair alias spelling =>
+              match source_bytes_equal (canon_path current spelling) owner with
+              | True => Just (List Nat)
+                  (append Nat alias ([64] : List Nat))
+              | False => find tail
+              end
+          end
+        end) bindings
+  end;
+
+def record_owner_prefix (reg : RecReg) (current : List Nat)
+    (aliases : ImpReg) (index : Nat) : Maybe (List Nat) :=
+  match reg with
+  | MkRecReg _ recs _ _ => match nth_rec recs index with
+    | Nothing => Nothing (List Nat)
+    | Just info => match info with
+      | MkRecInfo owner _ _ _ =>
+          match source_bytes_equal owner current with
+          | True => Just (List Nat) (Nil Nat)
+          | False => match record_alias_for_owner current aliases owner with
+            | Just qualifier => Just (List Nat) qualifier
+            | Nothing => Just (List Nat) (Nil Nat)
+            end
+          end
+      end
+    end
+  end;
+
+def record_internal_alias (index : Nat) (suffix : Nat) : List Nat :=
+  append Nat ([95, 111, 117, 114, 111, 95, 114, 95] : List Nat)
+    (append Nat
+      (map Nat Nat (fun (digit : Nat) => add 48 digit) (to_digits index))
+      (Cons Nat 95
+        (map Nat Nat (fun (digit : Nat) => add 48 digit)
+          (to_digits suffix))));
+
+def record_fresh_alias (index : Nat) (bare_atoms : List (List Nat))
+    (aliases : ImpReg) : Maybe (List Nat) :=
+  match aliases with
+  | MkImpReg names _ =>
+      (fix choose (fuel : Nat) (suffix : Nat) : Maybe (List Nat) :=
+        match fuel with
+        | Z => Nothing (List Nat)
+        | S remaining =>
+            let candidate : List Nat := record_internal_alias index suffix in
+            match orb(name_in candidate bare_atoms, name_in candidate names) with
+            | True => choose remaining (S suffix)
+            | False => Just (List Nat) candidate
+            end
+        end) (S (add (length (List Nat) bare_atoms)
+          (length (List Nat) names))) Z
+  end;
+
+def record_path_suffix (dirs : List (List Nat))
+    (target : List (List Nat))
+    : Pair (List (List Nat)) (List (List Nat)) :=
+  (fix go (left : List (List Nat)) (right : List (List Nat))
+      : Pair (List (List Nat)) (List (List Nat)) :=
+    match left with
+    | Nil => MkPair (List (List Nat)) (List (List Nat)) left right
+    | Cons segment more => match right with
+      | Nil => MkPair (List (List Nat)) (List (List Nat)) left right
+      | Cons other tail =>
+          match source_bytes_equal segment other with
+          | True => go more tail
+          | False => MkPair (List (List Nat)) (List (List Nat)) left right
+          end
+      end
+    end) dirs target;
+
+def record_parent_segments : List (List Nat) -> List (List Nat) :=
+  fix go (dirs : List (List Nat)) : List (List Nat) :=
+    match dirs with
+    | Nil => Nil (List Nat)
+    | Cons _ rest => Cons (List Nat) ([46, 46] : List Nat) (go rest)
+    end;
+
+def record_relative_path (current : List Nat) (target : List Nat)
+    : List Nat :=
+  match record_path_suffix (drop_last (split_segs current))
+      (split_segs target) with
+  | MkPair parents suffix =>
+      join_segs (append (List Nat) (record_parent_segments parents) suffix)
+  end;
+
+def record_marker_present (alias : List Nat) (src : List Nat) : Bool :=
+  (fix go (fuel : Nat) (xs : List Nat) : Bool :=
+    match fuel with
+    | Z => False
+    | S remaining => match xs with
+      | Nil => False
+      | Cons c rest =>
+          match source_is_comment xs with
+          | True => go remaining (source_skip_line rest)
+          | False => match eqNat c ch_dq_p with
+            | True => go remaining (source_skip_string rest)
+            | False => match source_is_ident_start c with
+              | False => go remaining rest
+              | True => match record_take_atom xs with
+                | MkPair atom after => match record_marker_parts atom with
+                  | Nothing => go remaining after
+                  | Just parts => match parts with
+                    | MkPair prefix _ => match source_bytes_equal prefix alias with
+                      | True => True
+                      | False => go remaining after
+                      end
+                    end
+                  end
+                end
+              end
+            end
+          end
+      end
+    end) (S (length Nat src)) src;
+
+def record_generated_aliases (current : List Nat) (aliases : ImpReg)
+    (reg : RecReg) (bare_atoms : List (List Nat)) (rewritten : List Nat)
+    : ImpReg :=
+  match reg with
+  | MkRecReg _ recs _ _ =>
+      (fix go (items : List RecInfo) (index : Nat) (result : ImpReg)
+          : ImpReg :=
+        match items with
+        | Nil => result
+        | Cons info rest =>
+            let result1 : ImpReg :=
+              match record_fresh_alias index bare_atoms aliases with
+              | Nothing => result
+              | Just alias => match record_marker_present alias rewritten with
+                | False => result
+                | True => match info with
+                  | MkRecInfo owner _ _ _ => match result with
+                    | MkImpReg names bindings =>
+                        MkImpReg (Cons (List Nat) alias names)
+                          (Cons (Pair (List Nat) (List Nat))
+                            (MkPair (List Nat) (List Nat) alias
+                              (record_relative_path current owner)) bindings)
+                    end
+                  end
+                end
+              end in
+            go rest (S index) result1
+        end) recs Z aliases
+  end;
+
+def record_owner_qualifier (reg : RecReg) (current : List Nat)
+    (aliases : ImpReg) (bare_atoms : List (List Nat))
+    (index : Nat) (generated : List Nat) : Maybe (List Nat) :=
+  match record_owner_prefix reg current aliases index with
+  | Nothing => Nothing (List Nat)
+  | Just prefix => match prefix with
+    | Cons _ _ => Just (List Nat) prefix
+    | Nil => match name_in generated bare_atoms with
+      | True => match record_fresh_alias index bare_atoms aliases with
+        | Nothing => Nothing (List Nat)
+        | Just alias => Just (List Nat) (append Nat alias ([64] : List Nat))
+        end
+      | False => Just (List Nat) prefix
+      end
+    end
+  end;
+
+def record_generated_name (reg : RecReg) (current : List Nat)
+    (aliases : ImpReg) (bare_atoms : List (List Nat))
+    (index : Nat) (name : List Nat) : Maybe (List Nat) :=
+  match record_owner_qualifier reg current aliases bare_atoms index name with
+  | Nothing => Nothing (List Nat)
+  | Just prefix => Just (List Nat) (append Nat prefix name)
+  end;
+
+def record_owned_type (reg : RecReg) (current : List Nat)
+    (aliases : ImpReg) (bare_atoms : List (List Nat))
+    (index : Nat) : Maybe (List Nat) :=
+  match reg with
+  | MkRecReg _ recs _ _ => match nth_rec recs index with
+    | Nothing => Nothing (List Nat)
+    | Just info => match info with
+      | MkRecInfo _ name _ _ =>
+          record_generated_name reg current aliases bare_atoms index name
+      end
+    end
+  end;
+
+def owned_rec_idx (owner : List Nat) (name : List Nat)
+    (recs : List RecInfo) : Maybe Nat :=
+  (fix find (rest : List RecInfo) (index : Nat) : Maybe Nat :=
+    match rest with
+    | Nil => Nothing Nat
+    | Cons info tail => match info with
+      | MkRecInfo path short _ _ =>
+          match andb(source_bytes_equal path owner,
+              source_bytes_equal short name) with
+          | True => Just Nat index
+          | False => find tail (S index)
+          end
+      end
+    end) recs Z;
+
+def owned_global_rec (reg : RecReg) (owner : List Nat)
+    (name : List Nat) : Maybe Nat :=
+  match reg with
+  | MkRecReg _ _ _ globals =>
+      (fix find (rest : List RecBind) : Maybe Nat :=
+        match rest with
+        | Nil => Nothing Nat
+        | Cons binding tail => match binding with
+          | MkRecBind short index path =>
+              match andb(source_bytes_equal short name,
+                  source_bytes_equal path owner) with
+              | True => Just Nat index
+              | False => find tail
+              end
+          end
+        end) globals
+  end;
 
 def bump_depth (c : Nat) (depth : Nat) : Nat :=
   match orb (eqNat c ch_lparen_p)
@@ -299,7 +642,8 @@ def take_until_char (stop : Nat) (xs0 : List Nat)
         end
     end) (length Nat xs0) xs0 (Nil Nat) Z;
 
-def type_to_rec (reg : RecReg) (ty : List Nat) : Maybe Nat :=
+def type_to_rec (reg : RecReg) (current : List Nat)
+    (aliases : ImpReg) (ty : List Nat) : Maybe Nat :=
   (fix go (fuel : Nat) (xs : List Nat) : Maybe Nat :=
     match fuel with
     | Z => Nothing Nat
@@ -325,7 +669,7 @@ def type_to_rec (reg : RecReg) (ty : List Nat) : Maybe Nat :=
                     end
                 end
             | False =>
-                match source_take_ident (Cons Nat c rest) with
+                match record_take_atom (Cons Nat c rest) with
                 | MkPair name after =>
                     match name with
                     | Nil => Nothing Nat
@@ -333,8 +677,23 @@ def type_to_rec (reg : RecReg) (ty : List Nat) : Maybe Nat :=
                         match skip_ws_p after with
                         | Cons _ _ => Nothing Nat
                         | Nil =>
-                            match reg with
-                            | MkRecReg _ recs _ _ => find_rec_idx name recs
+                            match record_marker_parts name with
+                            | Nothing => match reg with
+                              | MkRecReg _ recs _ _ =>
+                                  match owned_rec_idx current name recs with
+                                  | Just index => Just Nat index
+                                  | Nothing => find_rec_idx name recs
+                                  end
+                              end
+                            | Just parts => match parts with
+                              | MkPair alias member =>
+                                  match record_alias_target current aliases alias with
+                                  | Nothing => Nothing Nat
+                                  | Just owner => match reg with
+                                    | MkRecReg _ recs _ _ => owned_rec_idx owner member recs
+                                    end
+                                  end
+                              end
                             end
                         end
                     end
@@ -342,6 +701,64 @@ def type_to_rec (reg : RecReg) (ty : List Nat) : Maybe Nat :=
             end
         end
     end) (S (length Nat ty)) ty;
+
+-- Field types are written in the record owner's source, not the caller's.
+-- Without that owner's import bindings, only its own nominal records are safe
+-- to recognize from an imported field declaration.
+def record_field_type_to_rec (reg : RecReg) (current : List Nat)
+    (aliases : ImpReg) (owner : List Nat) (ty : List Nat) : Maybe Nat :=
+  match source_bytes_equal owner current with
+  | True => type_to_rec reg current aliases ty
+  | False =>
+      match type_to_rec reg owner
+          (MkImpReg (Nil (List Nat)) (Nil (Pair (List Nat) (List Nat)))) ty with
+      | Nothing => Nothing Nat
+      | Just index => match reg with
+        | MkRecReg _ recs _ _ => match nth_rec recs index with
+          | Nothing => Nothing Nat
+          | Just info => match info with
+            | MkRecInfo actual_owner _ _ _ =>
+                match source_bytes_equal owner actual_owner with
+                | True => Just Nat index
+                | False => Nothing Nat
+                end
+            end
+          end
+        end
+      end
+  end;
+
+def type_record_hint (reg : RecReg) (current : List Nat)
+    (aliases : ImpReg)
+    (ty : List Nat) : Maybe (Pair Nat (List Nat)) :=
+  match type_to_rec reg current aliases ty with
+  | Nothing => Nothing (Pair Nat (List Nat))
+  | Just index => match record_marker_parts (trim_bytes ty) with
+    | Just _ => Just (Pair Nat (List Nat))
+        (MkPair Nat (List Nat) index (record_qualifier ty))
+    | Nothing => match record_owner_prefix reg current aliases index with
+      | Nothing => Nothing (Pair Nat (List Nat))
+      | Just qualifier => Just (Pair Nat (List Nat))
+          (MkPair Nat (List Nat) index qualifier)
+      end
+    end
+  end;
+
+def record_hint_index (hint : Maybe (Pair Nat (List Nat))) : Maybe Nat :=
+  match hint with
+  | Nothing => Nothing Nat
+  | Just pair => match pair with
+    | MkPair index _ => Just Nat index
+    end
+  end;
+
+def record_index_hint (index : Maybe Nat)
+    : Maybe (Pair Nat (List Nat)) :=
+  match index with
+  | Nothing => Nothing (Pair Nat (List Nat))
+  | Just value => Just (Pair Nat (List Nat))
+      (MkPair Nat (List Nat) value (Nil Nat))
+  end;
 
 def take_until_coloneq (xs0 : List Nat) : Pair (List Nat) (List Nat) :=
   (fix go (fuel : Nat) (xs : List Nat) (acc : List Nat) (depth : Nat)

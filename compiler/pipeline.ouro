@@ -13,6 +13,7 @@
 import "source_text.ouro",
   "base.ouro",
   "pipeline_support.ouro",
+  "module_registry.ouro",
   "checked_program_output.ouro",
   "token.ouro",
   "file_check_model.ouro";
@@ -28,7 +29,8 @@ def parse_unit
   (parse_file : Nat -> List Token -> Nat -> ParseResult (List Decl))
   (fuel : Nat) (st : InternState) (path : List Nat) (src : List Nat)
   : UnitParse :=
-  match intern_string st path with
+  let canonical : List Nat := canon_path (Nil Nat) path in
+  match intern_string st canonical with
   | MkPair pid st1 =>
       match lex_go fuel src st1 (Nil Token) with
       | LexMalformed st2 => UErr lex_malformed_err_code Z st2
@@ -36,7 +38,7 @@ def parse_unit
       | LexOk toks st2 =>
           match parse_file fuel toks Z with
           | POk ds _toks _pos =>
-              match canon_imports path intern_string st2 ds with
+              match canon_imports canonical intern_string st2 ds with
               | MkPair ds' st3 =>
                   UOk(MkSrcUnit pid ds', st3)
               end
@@ -49,7 +51,8 @@ inductive UnitsParse : Type :=
   | UsOk : List SrcUnit -> InternState -> UnitsParse
   | UsErr : Nat -> Nat -> InternState -> UnitsParse;
 
-def empty_imp_reg_pl : ImpReg := MkImpReg (Nil (List Nat));
+def empty_imp_reg_pl : ImpReg :=
+  MkImpReg (Nil (List Nat)) (Nil (Pair(List Nat, List Nat)));
 
 def empty_rec_reg_pl : RecReg :=
   MkRecReg(Z, Nil RecInfo, Nil (List Nat), Nil RecBind);
@@ -395,26 +398,34 @@ def remap_comp_files (parse_fail : Bool)
 
 inductive SrcPrep : Type :=
   | SrcPrepErr : Nat -> Nat -> SrcPrep
-  | SrcPrepOk : RecReg -> List Nat -> SrcPrep;
+  | SrcPrepOk : RecReg -> ImpReg -> List Nat -> SrcPrep;
 
 inductive FilesPrep : Type :=
   | FilesPrepErr : Nat -> Nat -> FilesPrep
-  | FilesPrepOk : List (Pair (List Nat) (List Nat)) -> FilesPrep;
+  | FilesPrepOk : List (Pair (List Nat) (List Nat)) ->
+      List (Pair (List Nat) ImpReg) -> FilesPrep;
 
 def preprocess_src
   (preprocess_imports_reg : ImpReg -> List Nat -> Pair ImpReg ImpPrep)
-  (preprocess_records_reg : RecReg -> List Nat -> Pair RecReg PrepResult)
-  (rec_reg : RecReg) (src : List Nat) : SrcPrep :=
+  (preprocess_records_reg : List Nat -> ImpReg -> RecReg -> List Nat ->
+      Pair RecReg (Pair ImpReg PrepResult))
+  (path : List Nat) (rec_reg : RecReg) (src : List Nat) : SrcPrep :=
   match preprocess_imports_reg empty_imp_reg_pl src with
-  | MkPair _ imp =>
+  | MkPair imp_reg imp =>
       match imp with
-      | ImpErr c p => SrcPrepErr(add eighty c, p)
+      | ImpErr c p =>
+          match eqNat c 5 with
+          | True => SrcPrepErr(lex_malformed_err_code, p)
+          | False => SrcPrepErr(add eighty c, p)
+          end
       | ImpOk src1 =>
-          match preprocess_records_reg rec_reg src1 with
-          | MkPair rec2 recp =>
-              match recp with
-              | PrepErr c p => SrcPrepErr(add seventy c, p)
-              | PrepOk src2 => SrcPrepOk rec2 src2
+          match preprocess_records_reg (canon_path (Nil Nat) path)
+              imp_reg rec_reg src1 with
+          | MkPair rec2 tagged => match tagged with
+              | MkPair aliases recp => match recp with
+                | PrepErr c p => SrcPrepErr(add seventy c, p)
+                | PrepOk src2 => SrcPrepOk rec2 aliases src2
+                end
               end
           end
       end
@@ -425,26 +436,30 @@ def preprocess_src
 -- original file order. RecReg follows that walk.
 def preprocess_file_list
   (preprocess_imports_reg : ImpReg -> List Nat -> Pair ImpReg ImpPrep)
-  (preprocess_records_reg : RecReg -> List Nat -> Pair RecReg PrepResult)
+  (preprocess_records_reg : List Nat -> ImpReg -> RecReg -> List Nat ->
+      Pair RecReg (Pair ImpReg PrepResult))
   (files : List (Pair (List Nat) (List Nat))) : FilesPrep :=
   (fix go (xs : List (Pair (List Nat) (List Nat))) (reg : RecReg)
-      (acc : List (Pair (List Nat) (List Nat))) : FilesPrep :=
+      (acc : List (Pair (List Nat) (List Nat)))
+      (alias_acc : List (Pair (List Nat) ImpReg)) : FilesPrep :=
     match xs with
-    | Nil => FilesPrepOk acc
+    | Nil => FilesPrepOk acc alias_acc
     | Cons f rest =>
         match f with
         | MkPair path src =>
             match preprocess_src preprocess_imports_reg
-                    preprocess_records_reg reg src with
+                    preprocess_records_reg path reg src with
             | SrcPrepErr c p => FilesPrepErr c p
-            | SrcPrepOk reg2 src2 =>
+            | SrcPrepOk reg2 aliases src2 =>
                 go rest reg2
                   (Cons (Pair(List Nat, List Nat))
                     (MkPair(List Nat, List Nat, path, src2)) acc)
+                  (Cons (Pair(List Nat, ImpReg))
+                    (MkPair(List Nat, ImpReg, path, aliases)) alias_acc)
             end
         end
     end) (reverse(Pair(List Nat, List Nat), files)) empty_rec_reg_pl
-      (Nil (Pair(List Nat, List Nat)));
+      (Nil (Pair(List Nat, List Nat))) (Nil (Pair(List Nat, ImpReg)));
 
 def import_err (A : Type) (c : Nat) (det : Nat) : CompResult A :=
   CErr(A, ErrCode(add 90 c, det));
@@ -465,7 +480,8 @@ def stitch_checked_units
   (elaborate : Nat -> Surface -> List Nat -> CoreTerm)
   (check_module : Nat -> List Nat -> List FileItem -> DeclarationResult)
   (preprocess_imports_reg : ImpReg -> List Nat -> Pair ImpReg ImpPrep)
-  (preprocess_records_reg : RecReg -> List Nat -> Pair RecReg PrepResult)
+  (preprocess_records_reg : List Nat -> ImpReg -> RecReg -> List Nat ->
+      Pair RecReg (Pair ImpReg PrepResult))
   (fuel : Nat) (root : List Nat)
   (files : List (Pair (List Nat) (List Nat)))
   : Pair (CompResult CheckedProgram) InternState :=
@@ -474,26 +490,35 @@ def stitch_checked_units
   | FilesPrepErr c p =>
       MkPair (CompResult CheckedProgram) InternState
         (CErr(CheckedProgram, ErrCode c p)) empty_intern
-  | FilesPrepOk files1 =>
+  | FilesPrepOk files1 alias_files =>
       match parse_units lex_go intern_string parse_file fuel empty_intern
               files1 with
       | UsErr c p stE =>
           MkPair (CompResult CheckedProgram) InternState
             (CErr(CheckedProgram, ErrCode c p)) stE
       | UsOk units st =>
-          match intern_string st root with
+          match intern_string st (canon_path (Nil Nat) root) with
           | MkPair rootId st2 =>
-              match resolve_imports units rootId with
+              match module_resolve_units fuel units alias_files rootId st2 with
               | RErr c det =>
                   MkPair (CompResult CheckedProgram) InternState
                     (import_err CheckedProgram c det) st2
-              | ROk ds =>
-                  MkPair (CompResult CheckedProgram) InternState
-                    (remap_comp_files_for CheckedProgram False files1
-                      (compile_checked_from_decls desugar_file rewrite_declarations lower_expr_env2
-                        compile_program elaborate_surfaces elaborate check_module
-                        (unit_decl_names units rootId) fuel st2 ds))
-                    st2
+              | ROk plan =>
+                  match plan with
+                  | MkPair scoped st3 =>
+                      match resolve_imports scoped rootId with
+                      | RErr c det =>
+                          MkPair (CompResult CheckedProgram) InternState
+                            (import_err CheckedProgram c det) st3
+                      | ROk ds =>
+                          MkPair (CompResult CheckedProgram) InternState
+                            (remap_comp_files_for CheckedProgram False files1
+                              (compile_checked_from_decls desugar_file rewrite_declarations lower_expr_env2
+                                compile_program elaborate_surfaces elaborate check_module
+                                (unit_decl_names scoped rootId) fuel st3 ds))
+                            st3
+                      end
+                  end
               end
           end
       end
@@ -511,15 +536,16 @@ def stitch_checked_source
   (elaborate : Nat -> Surface -> List Nat -> CoreTerm)
   (check_module : Nat -> List Nat -> List FileItem -> DeclarationResult)
   (preprocess_imports_reg : ImpReg -> List Nat -> Pair ImpReg ImpPrep)
-  (preprocess_records_reg : RecReg -> List Nat -> Pair RecReg PrepResult)
+  (preprocess_records_reg : List Nat -> ImpReg -> RecReg -> List Nat ->
+      Pair RecReg (Pair ImpReg PrepResult))
   (fuel : Nat) (src : List Nat)
   : Pair (CompResult CheckedProgram) InternState :=
   match preprocess_src preprocess_imports_reg preprocess_records_reg
-          empty_rec_reg_pl src with
+          (Nil Nat) empty_rec_reg_pl src with
   | SrcPrepErr c p =>
       MkPair (CompResult CheckedProgram) InternState
         (CErr(CheckedProgram, ErrCode c p)) empty_intern
-  | SrcPrepOk _ src1 =>
+  | SrcPrepOk _ aliases src1 =>
       match lex_go fuel src1 empty_intern (Nil Token) with
       | LexMalformed st =>
           MkPair (CompResult CheckedProgram) InternState
@@ -537,12 +563,54 @@ def stitch_checked_source
                   (apply_ergo (classify_ergo True src1)
                     (ErrCode parse_err_code p))) st
           | POk ds _toks _pos =>
-              MkPair (CompResult CheckedProgram) InternState
-                (remap_comp_src_for CheckedProgram False src1
-                  (compile_checked_from_decls desugar_file rewrite_declarations lower_expr_env2
-                    compile_program elaborate_surfaces elaborate check_module
-                    (decl_check_names ds) fuel st ds))
-                st
+              match module_source_guard fuel aliases st ds with
+              | RErr code detail =>
+                  MkPair (CompResult CheckedProgram) InternState
+                    (import_err CheckedProgram code detail) st
+              | ROk guarded =>
+                  match aliases with
+                  | MkImpReg names _ => match names with
+                    | Nil => MkPair (CompResult CheckedProgram) InternState
+                        (remap_comp_src_for CheckedProgram False src1
+                          (compile_checked_from_decls desugar_file
+                            rewrite_declarations lower_expr_env2
+                            compile_program elaborate_surfaces elaborate check_module
+                            (decl_check_names guarded) fuel st guarded)) st
+                    | Cons _ _ =>
+                        match intern_string st (Nil Nat) with
+                        | MkPair owner st2 =>
+                            match canon_imports (Nil Nat) intern_string st2 guarded with
+                            | MkPair canonical st3 =>
+                                match module_resolve_units fuel
+                                    ([MkSrcUnit owner canonical] : List SrcUnit)
+                                    ([MkPair (List Nat) ImpReg (Nil Nat) aliases]
+                                      : List (Pair (List Nat) ImpReg)) owner st3 with
+                                | RErr code detail =>
+                                    MkPair (CompResult CheckedProgram) InternState
+                                      (import_err CheckedProgram code detail) st3
+                                | ROk plan => match plan with
+                                  | MkPair scoped st4 =>
+                                      match resolve_imports scoped owner with
+                                      | RErr code detail =>
+                                          MkPair (CompResult CheckedProgram) InternState
+                                            (import_err CheckedProgram code detail) st4
+                                      | ROk decls =>
+                                          MkPair (CompResult CheckedProgram) InternState
+                                            (remap_comp_src_for CheckedProgram False src1
+                                              (compile_checked_from_decls desugar_file
+                                                rewrite_declarations lower_expr_env2
+                                                compile_program elaborate_surfaces
+                                                elaborate check_module
+                                                (unit_decl_names scoped owner) fuel st4 decls))
+                                            st4
+                                      end
+                                  end
+                                end
+                            end
+                        end
+                    end
+                  end
+              end
           end
       end
   end;
@@ -561,7 +629,8 @@ def pipeline_compile_checked_units
   (elaborate : Nat -> Surface -> List Nat -> CoreTerm)
   (check_module : Nat -> List Nat -> List FileItem -> DeclarationResult)
   (preprocess_imports_reg : ImpReg -> List Nat -> Pair ImpReg ImpPrep)
-  (preprocess_records_reg : RecReg -> List Nat -> Pair RecReg PrepResult)
+  (preprocess_records_reg : List Nat -> ImpReg -> RecReg -> List Nat ->
+      Pair RecReg (Pair ImpReg PrepResult))
   (fuel : Nat) (root : List Nat)
   (files : List (Pair (List Nat) (List Nat)))
   : CompResult CheckedProgram :=
@@ -584,7 +653,8 @@ def pipeline_compile_checked_source
   (elaborate : Nat -> Surface -> List Nat -> CoreTerm)
   (check_module : Nat -> List Nat -> List FileItem -> DeclarationResult)
   (preprocess_imports_reg : ImpReg -> List Nat -> Pair ImpReg ImpPrep)
-  (preprocess_records_reg : RecReg -> List Nat -> Pair RecReg PrepResult)
+  (preprocess_records_reg : List Nat -> ImpReg -> RecReg -> List Nat ->
+      Pair RecReg (Pair ImpReg PrepResult))
   (fuel : Nat) (src : List Nat)
   : CompResult CheckedProgram :=
   match stitch_checked_source lex_go parse_file desugar_file rewrite_declarations lower_expr_env2
@@ -606,7 +676,8 @@ def stitch_source
   (elaborate : Nat -> Surface -> List Nat -> CoreTerm)
   (check_module : Nat -> List Nat -> List FileItem -> DeclarationResult)
   (preprocess_imports_reg : ImpReg -> List Nat -> Pair ImpReg ImpPrep)
-  (preprocess_records_reg : RecReg -> List Nat -> Pair RecReg PrepResult)
+  (preprocess_records_reg : List Nat -> ImpReg -> RecReg -> List Nat ->
+      Pair RecReg (Pair ImpReg PrepResult))
   (fuel : Nat) (src : List Nat)
   : Pair (CompResult (List (Pair Nat CoreTerm))) InternState :=
     match stitch_checked_source lex_go parse_file desugar_file rewrite_declarations

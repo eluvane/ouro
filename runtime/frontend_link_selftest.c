@@ -37,6 +37,26 @@ static ouro_v *compile_one(const char *source)
 		ouro_ctor(1, 2, files));
 }
 
+static ouro_v *source_unit(const char *path, const char *source, ouro_v *rest)
+{
+	ouro_v *pair_fields[2] = {ouro_string_codes(path), ouro_string_codes(source)};
+	ouro_v *list_fields[2] = {ouro_ctor(0, 2, pair_fields), rest};
+	return ouro_ctor(1, 2, list_fields);
+}
+
+static ouro_v *compile_qualified_collision(void)
+{
+	ouro_v *files = ouro_ctor(0, 0, 0);
+	ouro_v *check = export_value("compile_checked_units");
+	files = source_unit("probe.ouro",
+		"import \"a.ouro\" as A; import \"b.ouro\" as B; "
+		"def left : Type := A.Shared; def right : Type := B.Shared;", files);
+	files = source_unit("b.ouro", "axiom Shared : Type;", files);
+	files = source_unit("a.ouro", "axiom Shared : Type;", files);
+	return ouro_apply(ouro_apply(ouro_apply(check, ouro_nat(5000)),
+		ouro_string_codes("probe.ouro")), files);
+}
+
 static int intern_has_name(ouro_v *intern, const char *name)
 {
 	ouro_v *found;
@@ -88,6 +108,7 @@ static int retained_result_check(void)
 {
 	ouro_v *first = compile_one("axiom First : Type;");
 	ouro_v *second;
+	ouro_v *qualified;
 	if (!has_name(first, "First"))
 		return fail("initial checked result");
 	second = compile_one("axiom Second : Type;");
@@ -95,6 +116,12 @@ static int retained_result_check(void)
 		return fail("second checked result");
 	if (!has_name(first, "First") || has_name(first, "Second"))
 		return fail("first checked result did not survive second compilation");
+	qualified = compile_qualified_collision();
+	if (!has_name(qualified, "_ouro_m_0_Shared") ||
+	    !has_name(qualified, "_ouro_m_1_Shared") ||
+	    !has_name(qualified, "left") || !has_name(qualified, "right") ||
+	    !has_name(first, "First"))
+		return fail("split frontend lost qualified module identity or retained result");
 	return 0;
 }
 

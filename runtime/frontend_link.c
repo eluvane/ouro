@@ -387,6 +387,22 @@ static int print_prep_diag(const char *path, ouro_v *src, int code, int det)
 			      (unsigned long)(code - 80));
 		return 1;
 	}
+	if (code >= 95 && code <= 98) {
+		const char *msg = "invalid imported name mapping";
+		char namebuf[256];
+		int have_name = (code == 95 || code == 96) && det != 0
+			? decl_name_from_intern(det, namebuf, (int)sizeof namebuf) : 0;
+		switch (code) {
+		case 95: msg = "name is not declared by the aliased module"; break;
+		case 96: msg = "ambiguous module name"; break;
+		case 97: msg = "module name resolution fuel exhausted"; break;
+		case 98: msg = "invalid module name mapping"; break;
+		}
+		fprintf(stderr, "%s: %s%s%s\n",
+			path != 0 && path[0] != 0 ? path : "<input>", msg,
+			have_name > 0 ? " in " : "", have_name > 0 ? namebuf : "");
+		return 1;
+	}
 	if (code >= 71 && code <= 77) {
 		rec_print_err(path, src, (unsigned long)(code - 70),
 			      (unsigned long)det);
@@ -493,7 +509,7 @@ static ouro_v *packed_stitch_source(void)
 		return g_stitch_source;
 	ouro_static_begin();
 	fn = FIND(pl, "stitch_checked_source");
-	fn = ouro_apply(fn, FIND(lx, "lex_go"));
+	fn = ouro_apply(fn, FIND(lx, "lex_go_import"));
 	fn = ouro_apply(fn, closed_parse_file());
 	fn = ouro_apply(fn, FIND(ds, "desugar_file"));
 	fn = ouro_apply(fn, FIND(lr, "rewrite_declarations"));
@@ -565,7 +581,7 @@ static ouro_v *bounded_call(ouro_v *fn, int count, ouro_v **args,
 
 static ouro_v *bounded_token_state(ouro_env *env, ouro_v *st)
 {
-	return bounded_call(FIND(lx, "next_token"), 3,
+	return bounded_call(FIND(lx, "next_import_token"), 3,
 		(ouro_v *[]){ouro_get(env, 1), ouro_get(env, 0), st},
 		ouro_clone_perm);
 }
@@ -803,12 +819,13 @@ static ouro_v *list_from_items(ouro_v **items, int n)
 }
 
 static int unit_prepass_incremental(ouro_v *files, ouro_v **out_files,
-				   ouro_v **out_error)
+				   ouro_v **out_alias_files, ouro_v **out_error)
 {
 	ouro_v *preprocess_src = closed_preprocess_src();
 	ouro_v *reg = FIND(pl, "empty_rec_reg_pl");
 	ouro_v **in_items = 0;
 	ouro_v **out_items = 0;
+	ouro_v **alias_items = 0;
 	int n = 0;
 	int i;
 	int ok = 1;
@@ -816,8 +833,11 @@ static int unit_prepass_incremental(ouro_v *files, ouro_v **out_files,
 		return 0;
 	if (n > 0) {
 		out_items = (ouro_v **)calloc((unsigned long)n, sizeof(ouro_v *));
-		if (out_items == 0) {
+		alias_items = (ouro_v **)calloc((unsigned long)n, sizeof(ouro_v *));
+		if (out_items == 0 || alias_items == 0) {
 			free(in_items);
+			free(out_items);
+			free(alias_items);
 			return 0;
 		}
 	}
@@ -828,6 +848,7 @@ static int unit_prepass_incremental(ouro_v *files, ouro_v **out_files,
 		if (f == 0 || f->n < 2) {
 			free(in_items);
 			free(out_items);
+			free(alias_items);
 			return 0;
 		}
 		path = ouro_clone_perm_deep(pair_fst(f));
@@ -841,14 +862,15 @@ static int unit_prepass_incremental(ouro_v *files, ouro_v **out_files,
 			ouro_v *src;
 			ouro_v *r;
 			ouro_v *src2;
+			ouro_v *aliases;
 			if (f == 0 || f->n < 2) {
 				ok = 0;
 				break;
 			}
 			path = pair_fst(f);
 			src = pair_snd(f);
-			r = ouro_apply(ouro_apply(preprocess_src, reg), src);
-			if (r == 0 || r->tag != 1 || r->n < 2) {
+			r = ouro_apply(ouro_apply(ouro_apply(preprocess_src, path), reg), src);
+			if (r == 0 || r->tag != 1 || r->n < 3) {
 				if (r != 0 && r->tag == 0 && r->n >= 2)
 					*out_error = ouro_clone_perm_deep(cerr(
 						as_nat(pair_fst(r)), as_nat(pair_snd(r))));
@@ -856,20 +878,25 @@ static int unit_prepass_incremental(ouro_v *files, ouro_v **out_files,
 				ok = 0;
 				break;
 			}
-			reg = ouro_clone_perm_deep(OURO_F(r, r->n - 2));
+			reg = ouro_clone_perm_deep(OURO_F(r, r->n - 3));
+			aliases = ouro_clone_perm_deep(OURO_F(r, r->n - 2));
 			src2 = ouro_clone_perm_deep(OURO_F(r, r->n - 1));
 			path = ouro_clone_perm_deep(path);
 			out_items[i] = perm_pair(path, src2);
+			alias_items[i] = perm_pair(path, aliases);
 			fe_phase_done("frontend-after-preprocess-unit");
 		}
 	}
 	free(in_items);
 	if (!ok) {
 		free(out_items);
+		free(alias_items);
 		return 0;
 	}
 	*out_files = list_from_items(out_items, n);
+	*out_alias_files = list_from_items(alias_items, n);
 	free(out_items);
+	free(alias_items);
 	return 1;
 }
 
@@ -946,13 +973,17 @@ static void fe_phase_done(const char *label)
 static ouro_v *compile_checked_units_impl(ouro_v *fuel, ouro_v *root, ouro_v *files)
 {
 	ouro_v *files1 = 0;
+	ouro_v *alias_files = 0;
 	ouro_v *units = 0;
+	ouro_v *scoped = 0;
 	ouro_v *st = 0;
 	ouro_v *pair = 0;
 	ouro_v *root_id = 0;
 	ouro_v *selected = 0;
 	ouro_v *st2 = 0;
 	ouro_v *resolved = 0;
+	ouro_v *module_plan = 0;
+	ouro_v *canonical_root = 0;
 	ouro_v *ds = 0;
 	ouro_v *fn = 0;
 	ouro_v *r = 0;
@@ -973,7 +1004,7 @@ static ouro_v *compile_checked_units_impl(ouro_v *fuel, ouro_v *root, ouro_v *fi
 	g_last_intern = FIND(lx, "empty_intern");
 	g_last_checked_program = 0;
 
-	if (!unit_prepass_incremental(files, &files1, &r))
+	if (!unit_prepass_incremental(files, &files1, &alias_files, &r))
 		goto failed;
 	fe_phase_done("frontend-after-preprocess");
 
@@ -988,11 +1019,25 @@ static ouro_v *compile_checked_units_impl(ouro_v *fuel, ouro_v *root, ouro_v *fi
 	intern_fn = FIND(lx, "intern_string");
 	resolve_fn = FIND(ir, "resolve_imports");
 	ouro_perm_select(0);
-	pair = ouro_apply(ouro_apply(intern_fn, st), root);
+	canonical_root = ouro_apply(ouro_apply(FIND(pl, "canon_path"), perm_nil()), root);
+	pair = ouro_apply(ouro_apply(intern_fn, st), canonical_root);
 	root_id = pair_fst(pair);
 	st2 = pair_snd(pair);
-	selected = ouro_apply(ouro_apply(FIND(pl, "unit_decl_names"), units), root_id);
-	resolved = ouro_apply(ouro_apply(resolve_fn, units), root_id);
+	module_plan = ouro_apply(ouro_apply(ouro_apply(ouro_apply(
+		FIND(pl, "module_resolve_units"), fuel), units), alias_files), root_id);
+	module_plan = ouro_apply(module_plan, st2);
+	if (module_plan == 0 || module_plan->tag != 0) {
+		g_last_intern = ouro_clone_perm_deep(st2);
+		if (module_plan != 0 && module_plan->tag == 1 && module_plan->n >= 2)
+			r = ouro_clone_perm_deep(ouro_apply(ouro_apply(
+			FIND(pl, "import_err"), pair_fst(module_plan)), pair_snd(module_plan)));
+		fe_phase_done("frontend-after-module-resolve-error");
+		goto failed;
+	}
+	scoped = pair_fst(OURO_F(module_plan, 0));
+	st2 = pair_snd(OURO_F(module_plan, 0));
+	selected = ouro_apply(ouro_apply(FIND(pl, "unit_decl_names"), scoped), root_id);
+	resolved = ouro_apply(ouro_apply(resolve_fn, scoped), root_id);
 	if (resolved == 0 || resolved->tag != 0) {
 		g_last_intern = ouro_clone_perm_deep(st2);
 		if (resolved != 0 && resolved->tag == 1 && resolved->n >= 2)
