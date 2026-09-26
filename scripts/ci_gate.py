@@ -1177,8 +1177,20 @@ def run_gate(gate: Gate, *, out: Path) -> dict[str, Any]:
         p = subprocess.Popen(gate.cmd, cwd=ROOT, env=env, text=True, stdout=f, stderr=subprocess.STDOUT)
         last_heartbeat = time.perf_counter()
         last_fixture_progress: tuple[tuple[str, ...], tuple[str, ...]] | None = None
+        last_source_phase: str | None = None
+        last_phase_check = started
         while p.poll() is None:
             now = time.perf_counter()
+            if gate.name == f"compiler-checking-{COMPILER_SHARDS}" and now - last_phase_check >= 2.0:
+                marker = ROOT / "_build/source_spans.progress"
+                try:
+                    phase = marker.read_text(encoding="utf-8").strip()
+                except FileNotFoundError:
+                    phase = ""
+                if phase and phase != last_source_phase:
+                    print(f"CI_GATE_SOURCE_SPANS_PHASE {phase}", flush=True)
+                    last_source_phase = phase
+                last_phase_check = now
             if now - last_heartbeat >= 30.0:
                 print(f"CI_GATE_PROGRESS {gate.name} elapsed_s={now - started:.1f} log={rel(log)}", flush=True)
                 if gate.name.startswith("compiler-checking-"):
