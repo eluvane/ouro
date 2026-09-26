@@ -471,6 +471,7 @@ def y : Nat := Z;
 def sameOrigin : Point := { y, x };
 def moved : Point := { origin with x := S Z };
 def originX : Nat := origin.x;
+def originY : Nat := let { y } : Point := origin in y;
 ```
 
 The default constructor is `MkPoint`; generated accessor names use
@@ -481,6 +482,17 @@ fields may be mixed, with comments and a trailing comma. Field order in the
 source does not change the constructor's declared field order. Unknown,
 duplicate, and missing fields remain errors; an unbound punned value is a
 compiler error.
+
+`let { x, y } : Point := value in body` binds selected fields of a local
+nominal record in `body`. The annotation is a direct record name, fields are
+distinct, and `in` is mandatory. The subject is checked as that record type and
+evaluated once; generated accessor calls are checked before the selected names
+enter scope. A field binder can shadow an outer name without changing the
+subject or another accessor. Comments and a trailing comma are allowed in the
+field list. Unknown or repeated fields, a missing nominal annotation, and a
+subject of the wrong type are rejected. This form does not infer a record type
+from the subject, bind renamed fields, or support imported records.
+
 With an import alias, a literal annotated `A.Point` uses the record declared
 by `A`, and `A.point.x` retains `A.point` as its base. Qualified projection
 requires the value and record declaration to belong directly to that aliased
@@ -521,7 +533,7 @@ dependent field types remain unsupported for generated imported annotations.
 Nested paths through a type alias that reduces to a record still need a direct
 nominal record field type. An ambiguous or hidden owner binding is rejected.
 
-Record pattern matching, anonymous records, row polymorphism, subtyping, and
+General record patterns, anonymous records, row polymorphism, subtyping, and
 overloaded field resolution are not implemented.
 
 ## Application and the pipe operator
