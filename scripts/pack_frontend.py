@@ -331,6 +331,19 @@ def _export_gmap(src: str) -> dict[str, str]:
     return out
 
 
+def _strict_location(src: str, pos: int) -> str:
+    owner = "-"
+    for match in STATIC_DEF.finditer(src):
+        if match.start() > pos:
+            break
+        owner = match.group(1)
+    exported = next(
+        (name for name, symbol in _export_gmap(src).items() if symbol == owner),
+        "-",
+    )
+    return f"owner={owner} export={exported} line={src.count(chr(10), 0, pos) + 1}"
+
+
 def _collect_app_spine(src: str, gpos: int, gname: str) -> tuple[int, int, list[str]] | None:
     """Return (spine_start, spine_end, args) for ouro_app*(gname(), args...)."""
     if src[gpos : gpos + len(gname)] != gname:
@@ -413,9 +426,9 @@ def strip_poly_type_apps(
             hits.append((s0, s1, rebuilt))
             stripped += len(args) - keep
             if details is not None and len(details) < 8:
-                snippet = " ".join(src[s0:s1].split())[:180]
                 details.append(
-                    f"poly {name}: {len(args)} args, {keep} value args: {snippet}"
+                    f"poly {name}: {_strict_location(src, s0)}; "
+                    f"args={len(args)} value_args={keep}"
                 )
 
     hits.sort(key=lambda h: h[0], reverse=True)
@@ -574,8 +587,10 @@ def strip_ctor_type_fields(
         hits.append((pos, end, _rebuild_ctor(tag, new_fields)))
         stripped += dropped
         if details is not None and len(details) < 8:
-            snippet = " ".join(src[pos:end].split())[:180]
-            details.append(f"ctor tag={tag}, dropped={dropped}: {snippet}")
+            details.append(
+                f"ctor {_strict_location(src, pos)}; "
+                f"tag={tag} fields={len(fields)} dropped={dropped}"
+            )
 
     hits.sort(key=lambda h: h[0], reverse=True)
     out = src
@@ -785,7 +800,7 @@ def main() -> int:
             dropped_total += dropped + dropped_c
             if dropped or dropped_c:
                 strict_details.append(
-                    f"module={suf} poly={dropped} ctor={dropped_c} source={path}"
+                    f"module={suf} poly={dropped} ctor={dropped_c}"
                 )
                 strict_details.extend(piece_details)
         chunks.append(f"\n/* ---- frontend TU module={suf} ---- */\n")
