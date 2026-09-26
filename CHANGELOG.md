@@ -9,7 +9,8 @@ Development changes; see the [compatibility policy](docs/stability.md).
 - Lazy error-aware fallback for `Either` and ordered `Maybe` list traversal in
   the practical standard library.
 - Leading `{A : Type}` inductive parameters opt constructors in to bounded
-  inference from a direct expected family; explicit calls remain valid. See
+  inference from a direct expected family or direct value-field type hints on
+  saturated calls; explicit calls remain valid. See
   [Marked constructor parameters](docs/language/ergonomic-syntax.md#marked-constructor-parameters).
 - Typed `let?` blocks propagate `Either`- or `Maybe`-shaped failures through
   explicit constructor roles and lower to checked cases; see
