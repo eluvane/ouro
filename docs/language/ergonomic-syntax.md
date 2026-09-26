@@ -1,9 +1,9 @@
 # Ergonomic syntax
 
-Grouped imports, positional calls, typed local helpers, and pure expression
-blocks lower to existing syntax nodes. The maintained
-[syntax reference](../syntax.md) states accepted forms; this page records
-desugaring and compatibility boundaries.
+Grouped imports, positional calls, typed local helpers, pure expression
+blocks, and list trailing commas lower to existing syntax nodes. The
+maintained [syntax reference](../syntax.md) states accepted forms; this
+page records desugaring and compatibility boundaries.
 
 ## Grouped imports
 
@@ -208,20 +208,73 @@ constructor lookup. Several leading groups may be marked; later ordinary
 ordinary parameters and have universe level zero (`Type` or `Type0`). Indexed families
 cannot use the marker in this first slice.
 
-For a marked constructor, the omitted prefix is inserted only when the
-expected result is a direct application of its own family with every family
+With an expected result, the omitted prefix is inserted when that result
+is a direct application of the constructor's own family with every family
 parameter supplied, and the source supplies exactly the remaining family
 parameters and constructor fields. For example, `MkBox Z` at expected
-`Box Nat` becomes the ordinary checked call `MkBox Nat Z`. The result and
-each argument are checked by the existing compiler checker. Explicit calls
-still work. A local binding without an expected type, a partial call, a
-different family, an unresolved type, or a source hole cannot provide an
-inference hint. Local binders shadow global constructor names.
+`Box Nat` becomes the ordinary checked call `MkBox Nat Z`.
 
-This rule does not infer parameters of ordinary definitions, infer marked
-parameters from value arguments, search for instances, or convert between
-families. Annotate the result or supply the constructor parameter explicitly
-when the expected family is unavailable.
+Without an expected result, a saturated `MkBox Z` can also infer `A` from
+the type of `Z`, including in an unannotated local binding. This narrower
+rule requires **all** family parameters to be marked, at least one constructor
+field, a reliable `Type0` hint for the first value, and one usable
+value-type hint for each marked parameter. The first value cannot borrow a
+hint from a later field; annotate it or supply the constructor parameters
+when its type is unknown. A field contributes a hint only when its declared
+type is directly that parameter;
+`List A` does not trigger inference of `A`. Repeated direct fields must give
+the same finite structural hint. Bound type names must have a known `Type0`
+kind in scope; inductive applications and function types need a known `Type0`
+shape. Holes, escaped or shadowed names, incomplete hints, and exhausted
+scans provide no hint. A type-valued first argument is kept as an explicit
+partial call.
+Indexed, mixed marked/ordinary, and nullary constructors still need an
+expected result or explicit parameters for omission.
+
+Both paths insert ordinary constructor applications, and the compiler checker
+checks the result and every argument. Explicit full and partial calls remain
+valid. Local binders shadow global constructor names. This does not infer
+parameters of ordinary definitions, search for instances, or solve arbitrary
+type equations. Annotate the result or supply constructor parameters when
+the bounded hints are unavailable.
+
+## Marked definition parameters
+
+A definition may opt in by marking a leading prefix of its source parameters:
+
+```ouro
+def apply {A : Type} {B : Type} (f : A -> B) (x : A) : B := f x;
+def example : Nat := apply (fun (n : Nat) => n) Z;
+def explicit : Nat := apply Nat Nat (fun (n : Nat) => n) Z;
+```
+
+Only leading `{A : Type}` groups are marked. Their domains must be `Type0`;
+ordinary `(A : Type)` parameters stay explicit. The compiler stores both the
+marked count and the number of declared parameter binders, so a function type
+returned by the definition does not become another inferred source argument.
+
+For an omitted prefix, the call must supply exactly the remaining declared
+arguments. A known, non-universe type for its first value is required even
+when an expected result exists; this keeps an explicit partial call such as
+`apply Nat Nat` explicit. A definition with no remaining source arguments may
+instead use a known expected result. Later argument types and the expected
+result can contribute constraints for the marked parameters.
+
+The bounded matcher recognizes direct marked type variables, known inductive
+or constant heads, their applications, and nondependent function types.
+For example, a callback of type `Nat -> Bool` and a `List Nat` argument can
+determine `A = Nat` and `B = Bool` in a marked map-like definition. Different
+names for unused callback binders are accepted. Dependent callback types,
+unknown or shadowed hints, holes, conflicting constraints, and partially
+supplied value arguments need explicit type arguments or an annotation. This
+does not infer omitted parameters of unmarked definitions or invent a type
+parameter from an unknown name.
+
+Lowering inserts ordinary applications in source argument order. The compiler
+checker validates the resulting function call and every source argument;
+source values occur once in the emitted term. Existing explicit full and
+partial calls remain valid. The standard definitions and constructors that
+still use ordinary `(A : Type)` declarations retain explicit arguments.
 
 ## Pure expression blocks
 
@@ -305,12 +358,26 @@ expressions, and trailing semicolons are rejected. The block lowers to
 ordinary checked `case`, constructor applications, and local lets; it adds no
 new kernel form or effect handler.
 
+## List literal trailing commas
+
+```text
+[x, y,] == [x, y]
+[x,]    == [x]
+```
+
+After at least one element, a comma immediately before `]` is accepted,
+including across whitespace and line comments. The parser builds the same
+`EList` elements in the same order. `[,]`, `[x,,]`, and a missing `]` remain
+parse errors. Empty lists keep the spelling `[]` and still need an expected
+`List A` type.
+
 ## Integration and fixtures
 
 Grouped imports, calls, local helpers, and pure expression blocks reuse
 existing `DImport`, `EApp`, `EAscribe`, `ELam`, `EPi`, and `ELet` nodes.
 Typed fallible blocks retain a frontend node until lowering verifies their
 constructor roles. The formatter retains their source spelling.
+List commas preserve the same `EList` elements and source spelling.
 The fixture inventory
 is `tests/language_ergonomics/cases.json`; it includes desugaring pairs,
 rejected forms, import graph/diagnostic cases, and formatter round trips.
@@ -328,12 +395,14 @@ compatibility, see [Design](../design.md#language-direction) and
 
 Lint, strict quality, and analyzer import inventories read every operand,
 including multiline groups. Malformed import scans return an input error.
-The [bootstrap bridge](../build.md#c-bootstrap) supports these forms without
-rewriting the current source snapshot.
+The [bootstrap bridge](../build.md#c-bootstrap) supports grouped imports,
+calls, and helpers without rewriting the current source snapshot. Compiler
+bootstrap inputs do not use list trailing commas; the new parser accepts them
+after bootstrapping.
 
 `f (a b)` remains one argument; `f (a, b)` denotes two applications, regardless
-of whitespace. Grouped imports cannot carry aliases. List trailing commas,
-empty `f()` calls, named arguments, and recursive local helpers remain
+of whitespace. Grouped imports cannot carry aliases. Empty `f()` calls,
+named arguments, and recursive local helpers remain
 unsupported. Live LSP range/navigation behavior requires its own verification;
 AST reuse alone does not establish editor behavior. The dedicated parser,
 formatter, frontend/security, Clippy, bootstrap, and PR gates remain required
