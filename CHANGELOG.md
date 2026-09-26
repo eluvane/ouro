@@ -75,6 +75,8 @@ Development changes; see the [compatibility policy](docs/stability.md).
 
 ### Changed
 
+- The formatter normalizes spaces around `|>` in code while preserving
+  comments, quoted text, and existing pipeline line breaks.
 - Imported record updates resolve simple field type annotations in the record
   declaration's import scope, including local type aliases, selected renames,
   and qualified imported types. Caller aliases cannot rebind those annotations;
