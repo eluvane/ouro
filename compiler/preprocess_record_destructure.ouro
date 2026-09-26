@@ -1,0 +1,267 @@
+import "preprocess_record_update.ouro";
+
+inductive RecDestructureFields : Type :=
+  | RecDestructureFieldsErr : Nat -> RecDestructureFields
+  | RecDestructureFieldsOk : List (List Nat) -> RecDestructureFields;
+
+inductive RecDestructureParse : Type :=
+  | RecDestructureNone : RecDestructureParse
+  | RecDestructureErr : Nat -> RecDestructureParse
+  | RecDestructureOk : Nat -> List Nat -> List (List Nat) ->
+      List Nat -> RecDestructureParse;
+
+def parse_destructure_fields (fields : List RecField) (input : List Nat)
+    : RecDestructureFields :=
+  (fix go (fuel : Nat) (xs : List Nat) (seen : List (List Nat))
+      : RecDestructureFields :=
+    match fuel with
+    | Z => RecDestructureFieldsErr rec_code_malformed
+    | S remaining =>
+        match source_take_ident (skip_ws_p xs) with
+        | MkPair name after_name =>
+            match name with
+            | Nil => RecDestructureFieldsErr rec_code_malformed
+            | Cons _ _ =>
+                match name_in name seen with
+                | True => RecDestructureFieldsErr rec_code_dup
+                | False =>
+                    match find_field_idx name fields with
+                    | Nothing => RecDestructureFieldsErr rec_code_unknown
+                    | Just _ =>
+                        let next : List (List Nat) := Cons (List Nat) name seen in
+                        match skip_ws_p after_name with
+                        | Nil => RecDestructureFieldsOk (reverse (List Nat) next)
+                        | Cons comma tail =>
+                            match eqNat comma ch_comma_p with
+                            | False => RecDestructureFieldsErr rec_code_malformed
+                            | True =>
+                                match skip_ws_p tail with
+                                | Nil => RecDestructureFieldsOk (reverse (List Nat) next)
+                                | Cons _ _ => go remaining tail next
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end) (S (length Nat input)) input (Nil (List Nat));
+
+def parse_record_destructure_typed (reg : RecReg) (current : List Nat)
+    (aliases : ImpReg) (pattern : List Nat) (ty : List Nat)
+    (subject : List Nat) : RecDestructureParse :=
+  match type_record_hint reg current aliases ty with
+  | Nothing => RecDestructureErr rec_code_need_ty
+  | Just hint => match hint with
+    | MkPair ri _ => match reg with
+      | MkRecReg _ recs _ _ =>
+          match nth_rec recs ri with
+          | Nothing => RecDestructureErr rec_code_need_ty
+          | Just info => match info with
+            | MkRecInfo owner _ _ fields _ =>
+                match source_bytes_equal owner current with
+                | False => RecDestructureErr rec_code_need_ty
+                | True =>
+                    match parse_destructure_fields fields (strip_braces pattern) with
+                    | RecDestructureFieldsErr code => RecDestructureErr code
+                    | RecDestructureFieldsOk selected =>
+                        RecDestructureOk ri ty selected subject
+                    end
+                end
+            end
+          end
+      end
+    end
+  end;
+
+def parse_record_destructure (reg : RecReg) (current : List Nat)
+    (aliases : ImpReg) (input : List Nat) : RecDestructureParse :=
+  match source_take_ident (skip_ws_p input) with
+  | MkPair keyword after_let =>
+      match source_bytes_equal keyword w_let_p with
+      | False => RecDestructureNone
+      | True =>
+          match skip_ws_p after_let with
+          | Cons opening _ =>
+              match eqNat opening ch_lbrace_p with
+              | False => RecDestructureNone
+              | True =>
+                  match matching_brace (skip_ws_p after_let) with
+                  | Nothing => RecDestructureErr rec_code_malformed
+                  | Just braced => match braced with
+                    | MkPair pattern tail =>
+                        match skip_ws_p tail with
+                        | Cons colon after_colon =>
+                            match eqNat colon ch_colon_p with
+                            | False => RecDestructureNone
+                            | True =>
+                                match skip_ws_p after_colon with
+                                | Cons equals _ =>
+                                    match eqNat equals ch_eq_p with
+                                    | True => RecDestructureErr rec_code_need_ty
+                                    | False =>
+                                        match source_take_ident
+                                            (skip_ws_p after_colon) with
+                                        | MkPair ty after_type =>
+                                            match skip_ws_p after_type with
+                                            | Cons c rest => match rest with
+                                              | Cons assignment subject =>
+                                                  match andb(eqNat c ch_colon_p,
+                                                      eqNat assignment ch_eq_p) with
+                                                  | False => RecDestructureNone
+                                                  | True => parse_record_destructure_typed
+                                                      reg current aliases pattern ty subject
+                                                  end
+                                              | Nil => RecDestructureNone
+                                              end
+                                            | Nil => RecDestructureNone
+                                            end
+                                        end
+                                    end
+                                | Nil => RecDestructureNone
+                                end
+                            end
+                        | Nil => RecDestructureNone
+                        end
+                    end
+                  end
+              end
+          | Nil => RecDestructureNone
+          end
+      end
+  end;
+
+def wrap_destructure_let (binder : List Nat) (value : List Nat)
+    (body : List Nat) : List Nat :=
+  append Nat ([108, 101, 116, 32] : List Nat)
+    (append Nat binder
+      (append Nat ([32, 58, 61, 32] : List Nat)
+        (append Nat value
+          (append Nat ([32, 105, 110, 32] : List Nat) body))));
+
+def wrap_destructure_users (values : List (Pair (List Nat) (List Nat)))
+    (body : List Nat) : List Nat :=
+  fix go (xs : List (Pair (List Nat) (List Nat))) : List Nat :=
+    match xs with
+    | Nil => body
+    | Cons entry rest => match entry with
+      | MkPair name projection =>
+          wrap_destructure_let name projection (go rest)
+      end
+    end;
+
+def destructure_body_env (reg : RecReg) (current : List Nat)
+    (aliases : ImpReg) (info : RecInfo) (fields : List RecField)
+    (selected : List (List Nat)) (env : RecEnv) : RecEnv :=
+  (fix go (names : List (List Nat)) (scope : RecEnv) : RecEnv :=
+    match names with
+    | Nil => scope
+    | Cons name rest =>
+        let next : RecEnv :=
+          match find_field_idx name fields with
+          | Nothing => env_mask scope reg name
+          | Just index =>
+              match update_field_type fields index with
+              | Nothing => env_mask scope reg name
+              | Just ty =>
+                  match record_field_type_hint reg current aliases info ty with
+                  | Nothing => env_mask scope reg name
+                  | Just hint => match hint with
+                    | MkPair ri _ => env_add scope name ri
+                    end
+                  end
+              end
+          end in
+        go rest next
+    end) selected env;
+
+def destructure_accessors (reg : RecReg) (current : List Nat)
+    (aliases : ImpReg) (bare_atoms : List (List Nat))
+    (ri : Nat) (record_name : List Nat) (selected : List (List Nat))
+    : Maybe (List (Pair (List Nat) (List Nat))) :=
+  (fix go (names : List (List Nat))
+      : Maybe (List (Pair (List Nat) (List Nat))) :=
+    match names with
+    | Nil => Just (List (Pair (List Nat) (List Nat)))
+        (Nil (Pair (List Nat) (List Nat)))
+    | Cons name rest =>
+        match record_generated_name reg current aliases bare_atoms ri
+            (acc_name record_name name) with
+        | Nothing => Nothing (List (Pair (List Nat) (List Nat)))
+        | Just accessor =>
+            match go rest with
+            | Nothing => Nothing (List (Pair (List Nat) (List Nat)))
+            | Just tail => Just (List (Pair (List Nat) (List Nat)))
+                (Cons (Pair (List Nat) (List Nat))
+                  (MkPair (List Nat) (List Nat) name accessor) tail)
+            end
+        end
+    end) selected;
+
+def destructure_accessor_names
+    : List (Pair (List Nat) (List Nat)) -> List (List Nat) :=
+  fix go (items : List (Pair (List Nat) (List Nat)))
+      : List (List Nat) :=
+    match items with
+    | Nil => Nil (List Nat)
+    | Cons entry rest => match entry with
+      | MkPair _ accessor => Cons (List Nat) accessor (go rest)
+      end
+    end;
+
+def build_destructure_projections (source : List Nat)
+    (subject_name : List Nat)
+    (accessors : List (Pair (List Nat) (List Nat)))
+    (initial_used : List (List Nat))
+    (body : List Nat) : RewriteR :=
+  (fix go (items : List (Pair (List Nat) (List Nat)))
+      (used : List (List Nat))
+      (users : List (Pair (List Nat) (List Nat))) : RewriteR :=
+    match items with
+    | Nil => RwOk (wrap_destructure_users
+        (reverse (Pair (List Nat) (List Nat)) users) body, Nil Nat)
+    | Cons entry rest => match entry with
+      | MkPair name accessor =>
+          match fresh_update_name source used with
+          | Nothing => RwErr rec_code_malformed
+          | Just projection =>
+              let value : List Nat := append Nat accessor
+                (Cons Nat ch_space_p subject_name) in
+              match go rest (Cons (List Nat) projection used)
+                  (Cons (Pair (List Nat) (List Nat))
+                    (MkPair (List Nat) (List Nat) name projection) users) with
+              | RwErr code => RwErr code
+              | RwOk tail _ =>
+                  RwOk (wrap_destructure_let projection value tail, Nil Nat)
+              end
+          end
+      end
+    end) accessors initial_used
+      (Nil (Pair (List Nat) (List Nat)));
+
+def build_record_destructure (reg : RecReg) (current : List Nat)
+    (aliases : ImpReg) (bare_atoms : List (List Nat))
+    (info : RecInfo) (ri : Nat) (source : List Nat)
+    (ty : List Nat) (selected : List (List Nat))
+    (subject : List Nat) (body : List Nat) : RewriteR :=
+  match info with
+  | MkRecInfo _ record_name _ _ _ =>
+      match destructure_accessors reg current aliases bare_atoms ri
+          record_name selected with
+      | Nothing => RwErr rec_code_need_ty
+      | Just accessors =>
+          let occupied : List (List Nat) :=
+            destructure_accessor_names accessors in
+          let freshness_source : List Nat := append Nat source body in
+          match fresh_update_name freshness_source occupied with
+          | Nothing => RwErr rec_code_malformed
+          | Just subject_name =>
+              match build_destructure_projections freshness_source subject_name accessors
+                  (Cons (List Nat) subject_name occupied) body with
+              | RwErr code => RwErr code
+              | RwOk tail _ =>
+                  RwOk (wrap_update_let subject_name ty subject tail, Nil Nat)
+              end
+          end
+      end
+  end;

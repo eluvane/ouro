@@ -451,6 +451,21 @@ introduce a binder. The record preprocessor expands it to the same constructor
 argument as `x := x`, preserving declaration field order. Missing, duplicate,
 and unknown fields remain errors.
 
+## Record field destructuring
+
+```ouro
+let { host, port } : Config := loadConfig in host
+```
+
+This local expression form selects distinct fields of a directly named local
+nominal record. The annotated subject is evaluated once, then checked accessors
+read the selected fields before their names enter the body scope. The selected
+names may shadow outer bindings. Unknown and duplicate fields, missing type
+context, and a subject of the wrong record type are errors. An `in` body is
+required; imported records, renaming, and block-statement destructuring are
+outside this form. See [Records](../syntax.md#records) for the full syntax
+boundary.
+
 ## Functional record update
 
 ```ouro
