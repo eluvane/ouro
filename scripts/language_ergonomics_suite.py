@@ -102,6 +102,15 @@ def main() -> int:
     if "ERGO_PARSER_OK" not in result.stdout:
         raise AssertionError("native parser laws did not report success")
 
+    runtime = work / "coalesce-runtime"
+    run(["sh", "scripts/build_tool.sh", "tests/language_ergonomics/coalesce_runtime.ouro",
+         str(runtime), "60000"])
+    if runtime.with_suffix(".exe").exists():
+        runtime = runtime.with_suffix(".exe")
+    result = run([str(runtime)])
+    if result.stdout != "selected\nfallback\n":
+        raise AssertionError("coalesce selected the wrong runtime branch: " + repr(result.stdout))
+
     support = (("support.ouro", support_source()),)
     canary = fixture("canary", 'import "support.ouro";\ndef valid : ErgNat := ErgZero;\n', support)
     checked(canary)
