@@ -1,7 +1,8 @@
 # Ergonomic syntax
 
 Grouped imports, positional calls, typed local helpers, pure expression
-blocks, and list trailing commas lower to existing syntax nodes. The
+blocks, list trailing commas, and final-tail list spreads lower to existing
+checked constructors. The
 maintained [syntax reference](../syntax.md) states accepted forms; this page
 records desugaring and compatibility boundaries.
 
@@ -63,10 +64,11 @@ that rejection, erasing `as A` could accidentally grant meaning to a mixed
 group. This guard is not the implementation of grouped imports: acceptance of
 plain groups belongs to the declaration parser. An alias selects direct
 declarations of its file; a transitive dependency needs its own direct import.
-When imported short names collide in a reached graph using aliases, a bare use
-without a local binder or current-file declaration requires qualification. A
-plain-only graph still rejects duplicate declarations. Local
-opens still erase their prefix and cannot resolve such a collision.
+When imported short names collide in a reached graph using aliases or
+selective imports, a bare use without a local binder, current-file declaration,
+or local open requires qualification. A plain-only graph still rejects
+duplicate declarations. [Module syntax](../syntax.md#modules-and-imports)
+defines exposing clauses, local names, and scoped opens.
 
 Dependency-tail diagnostics distinguish missing paths from malformed quoted
 strings. The direct parser retains its existing positional `PErr` protocol;
@@ -113,7 +115,7 @@ Invalid examples:
 f()               -- no implicit Unit argument
 f(, a)            -- missing first argument
 f(a,, b)          -- missing middle argument
-f(host = value)   -- named arguments are not enabled
+f(host = value)   -- `=` is not a named-argument marker
 ```
 
 A non-function callee, a wrong argument type, an unresolved hole, or a missing
@@ -121,6 +123,44 @@ required argument still fails ordinary checking. The form `f(a b)` deliberately
 remains one argument: changing that would break existing application syntax.
 No new binders are introduced, and argument evaluation/effects follow the
 same nested `EApp` tree as ordinary application.
+
+## Named calls and public labels
+
+A top-level definition can give a parameter a public call label distinct from
+its internal binder. The `=>` in a typed binder group is contextual; ordinary
+identifiers, including `as`, retain their existing meaning:
+
+```ouro
+def choose (front => first : Nat) (back : Nat) : Nat := first;
+
+choose(back := 2, front := 1)
+let front : Nat := 1 in choose(front :=, back := 2)
+```
+
+`host :=` is shorthand for `host := host` in the caller's lexical scope.
+Unlabeled parameters use their binder spelling as the public label. A named
+call may start with positional arguments, followed by labeled arguments in any
+order. It must supply every declared parameter exactly once. The compiler
+rejects missing, duplicate, unknown, or ambiguous labels and positional
+arguments after a named argument. Ordinary positional full and partial calls
+retain their meaning, including for definitions with public labels or marked
+type parameters.
+
+This first form applies only to direct, resolved top-level definitions with no
+marked parameters and independent parameter domains. A local or higher-order
+callee, a parameter domain depending on an earlier parameter, or an ambiguous
+domain needs a positional call. Declaration-site defaults are not accepted.
+Argument values are lowered once in source order into fresh local lets; the
+final ordinary application uses declaration order. The existing checker proves
+every argument and the result. A call label has no binding effect on the value
+expression, and a local value shadowing the definition does not inherit its
+labels. Unqualified label spelling remains stable when the definition is
+referred to through a module alias.
+
+Quality analysis reads only argument values as expressions. Clippy retains
+known-callee effect and checked-result obligations for named calls while
+using unknown positional facts for argument-specific proofs; exact
+argument-position precision requires declaration metadata in that analyzer.
 
 ## Typed local helper declarations
 
@@ -330,6 +370,24 @@ including across whitespace and line comments. The parser builds the same
 parse errors. Empty lists keep the spelling `[]` and still need an expected
 `List A` type.
 
+## List spreads
+
+```text
+[first, second, ..rest]  ==  Cons A first (Cons A second rest)
+[..rest,]                ==  rest
+```
+
+The only spread marker is `..` before one final list tail. The parser makes
+an `EListSpread` rather than inserting a call to a user-defined `append`.
+Lowering requires the registered nominal `List A` constructor family and
+checks every prefix value and the tail at that exact type. When no expected
+type is present, a complete type hint from the tail may establish `List A`.
+Each prefix value and the tail receive a fresh typed local binding in source
+order; fresh IDs exceed the source tree and lowered terms, including IDs in
+direct AST inputs. The resulting constructor spine reuses the original tail.
+No spread is accepted outside list brackets, and extra elements after the
+tail, a second spread, or a second trailing comma are rejected.
+
 ## Record field punning
 
 ```ouro
@@ -413,18 +471,16 @@ new kernel form or effect handler.
 Grouped imports, calls, local helpers, pure expression blocks, and list syntax
 reuse existing `DImport`, `EApp`, `EAscribe`, `ELam`, `EPi`, `ELet`, and `EList`
 nodes. Typed fallible blocks retain a frontend node until lowering verifies
-their constructor roles. The formatter retains grouped imports, call spelling,
-compact local helpers, expression blocks, and list commas without expanding
-them in source. The fixture inventory
-is `tests/language_ergonomics/cases.json`; it includes desugaring pairs,
+their constructor roles. The formatter retains the source spelling of these
+forms. The fixture inventory is
+`tests/language_ergonomics/cases.json`; it includes desugaring pairs,
 rejected forms, import graph/diagnostic cases, and formatter round trips.
 [CI](../ci.md#local-profiles) owns validation commands and gate status.
 
 ## Scope
 
-These forms add no selective imports, private exports, tuple or named call
-syntax, implicit type argument inference, early return, or general effect
-handling. For language direction and
+These forms add no private exports, re-exports, tuple allocation,
+declaration-site defaults, early return, or general effect handling. For language direction and
 compatibility, see [Design](../design.md#language-direction) and
 [Stability](../stability.md#experimental-areas).
 
@@ -434,12 +490,12 @@ Lint, strict quality, and analyzer import inventories read every operand,
 including multiline groups. Malformed import scans return an input error.
 The [bootstrap bridge](../build.md#c-bootstrap) supports grouped imports,
 calls, and helpers without rewriting the current source snapshot. Compiler
-bootstrap inputs do not use list trailing commas; the new parser accepts them
-after bootstrapping.
+bootstrap inputs do not use list trailing commas or spreads; the new parser
+accepts them after bootstrapping.
 
 `f (a b)` remains one argument; `f (a, b)` denotes two applications, regardless
-of whitespace. Grouped imports cannot carry aliases. Empty `f()` calls,
-named arguments, and recursive local helpers remain
+of whitespace. Grouped imports cannot carry aliases. Empty `f()` calls and
+recursive local helpers remain
 unsupported. Live LSP range/navigation behavior requires its own verification;
 AST reuse alone does not establish editor behavior. The dedicated parser,
 formatter, frontend/security, Clippy, bootstrap, and PR gates remain required

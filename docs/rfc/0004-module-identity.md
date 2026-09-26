@@ -47,22 +47,39 @@ binder and a current-file declaration still take precedence over an open;
 among opens, the innermost selection wins.
 A direct import is required to qualify a transitive dependency.
 
+`import "a.ouro" as A exposing (value as chosen, TypeName,)` selects direct
+declarations of that file. The optional `as` in an item changes only its
+unqualified and local-open name: `chosen` and `open A in chosen` resolve to
+the selected declaration, while `A.value` keeps its original member name.
+`A.chosen` is not introduced. `exposing ()` grants no names. Repeated imports
+of one canonical file must use the same selector clause. A selected original
+name must be directly declared by the target; selection cannot import a
+transitive name. Plain import edges inherit the target file's effective
+exported bindings, including renamed names from a selective edge. Selectors
+belong to each importing file and never form a graph-wide union. An
+independent unrestricted path can expose a declaration hidden on another path.
+
+Lookup remains lexical binder, current-file declaration, innermost open,
+outer opens, then unique imported name. A local open uses the selected local
+names of its direct alias target; qualified references use selected original
+names. Ambiguous visible bindings are rejected before selecting any by import
+order. Every imported declaration receives its own internal identity when a
+selective edge is reached, so a hidden bare name cannot keep a flattened
+identifier accidentally. Generated record references require an exact
+compiler-issued marker, record owner, and member grant; the grant only resolves
+when that symbol is visible through the importing file's effective scope.
+
 Name resolution runs before lowering and emits unique internal identities for
 distinct declarations. It does not discard imports, declarations, or bodies.
 The existing compiler-owned declaration checker still receives the complete
 ordered import closure and decides acceptance. Missing units, cycles, name
 resolution exhaustion, and malformed source remain typed failures.
 
-The initial implementation activates identity rewriting when the reached graph has an
-alias. Plain-only graphs retain the existing duplicate-declaration error for
-collisions. This avoids a new registry traversal in the bootstrap's common
-plain-import path while keeping collisions explicit in both paths.
-
-Selective imports, private declarations, re-exports, and
-two same-named record declarations are subsequent contracts. Record generation
-currently uses a shared registry before declaration ownership is assigned.
-Future visibility syntax must use the same module ownership registry and must
-not let filtered declarations escape complete checking.
+Identity rewriting activates when the reached graph has an alias or selective
+edge. Plain-only graphs retain the existing duplicate-declaration error for
+collisions. Private declarations, re-exports, and two same-named record
+declarations remain subsequent contracts; record generation still uses a
+shared registry before declaration ownership is assigned.
 
 ## Compatibility and migration
 
@@ -71,6 +88,11 @@ relied on `A.member` to find a declaration from another imported file must
 import that file directly and use its own alias. A new colliding import turns an
 unqualified reference with no current-unit declaration into an ambiguity
 diagnostic; qualify the reference.
+Selective imports restrict names, including constructor and accessor names;
+select all needed direct members or use an unrestricted import. An alias can
+still qualify only selected members under their original spelling. The full
+import closure remains checked. Tooling that merely harvests import paths does
+not become an acceptance authority for selector semantics.
 Colliding `IO`, `io_bind`, or `pure` wrapper names currently report ambiguity
 even when qualified. Their lowering uses a single legacy operation slot; this
 implementation does not choose one imported wrapper by spelling. String and
@@ -104,7 +126,10 @@ selection of both, rejected ambiguous bare use, rejected unknown alias and
 member, direct versus transitive qualification, and path normalization.
 Fixtures must cover local binder and record-projection collisions, file-local
 alias scope, generated record declarations, cycles, and an invalid imported
-body that remains rejected when unused. Parser/source-span, formatter,
+body that remains rejected when unused. Selective fixtures need local renames,
+empty clauses, hidden bare/qualified/open/constructor/accessor references,
+cross-file selectors, transitive plain inheritance, and an independent plain
+path. Parser/source-span, formatter,
 dependency-tool, package, and checker suites must preserve their existing
 gates. Stage-loop evidence is required before any generated bootstrap update.
 
@@ -119,5 +144,5 @@ The first implementation uses errors 95 for a missing direct member, 96 for
 an ambiguous imported short name, 97 for resolution fuel exhaustion, and 98
 for a malformed name mapping or a qualified marker in a declaration or binder.
 Raw marker input is a lexical error 11; an unknown dotted prefix follows the
-existing record-projection error 77. The AST form for scoped `open`, selective
-imports, and visibility remains proposed, not maintainer-accepted.
+existing record-projection error 77. The broader privacy and re-export
+contract remains proposed, not maintainer-accepted.
