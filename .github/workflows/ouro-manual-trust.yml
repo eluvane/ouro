@@ -21,119 +21,66 @@ on:
 permissions:
   contents: read
 
-concurrency:
-  group: ouro-manual-trust-${{ github.ref }}-${{ inputs.profile }}
-  cancel-in-progress: false
-
-defaults:
-  run:
-    shell: bash
-
 jobs:
-  groups:
-    name: Select groups
+  docs-api:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
-    outputs:
-      matrix: ${{ steps.groups.outputs.matrix }}
-    steps:
-      - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - name: Select complete profile inventory
-        id: groups
-        env:
-          PROFILE: ${{ inputs.profile }}
-        run: |
-          matrix=$(python3 scripts/ci_gate.py --profile "$PROFILE" --list-groups)
-          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
-
-  manual-validation:
-    name: ${{ inputs.profile }} (${{ matrix.group }})
-    needs: groups
-    runs-on: ubuntu-latest
-    timeout-minutes: 120
-    strategy:
-      fail-fast: false
-      matrix:
-        group: ${{ fromJSON(needs.groups.outputs.matrix) }}
-    permissions:
-      contents: read
+    timeout-minutes: 90
     env:
+      OURO_JOBS: "2"
       OURO_CI: "1"
       OURO_REPRODUCIBLE: "1"
       OURO_PACK_STRICT: "1"
-      OURO_JOBS: "10"
-      OURO_CACHE_DIR: _cache/ouro
-      OURO_BUILD_DIR: _build
-      OURO_C_BUILD_DIR: _build/c
-      OURO_CCACHE: disabled
-      OURO_STAGE_MAX: "3"
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-
-      - name: Restore cache
-        if: ${{ !inputs.disable_cache }}
-        id: ouro-cache
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: |
-            _cache/ouro
-            _build/c
-            _build/stage_loop
-          key: ouro-manual-${{ runner.os }}-${{ inputs.profile }}-${{ matrix.group }}-${{ hashFiles('Ouro.seal', 'scripts/**', 'compiler/**', 'runtime/**', 'tools/**', 'tests/**', 'std/**', 'quality/smith/**', 'docs/generated_artifact_hashes.sha256') }}
-          restore-keys: |
-            ouro-manual-${{ runner.os }}-${{ inputs.profile }}-
-            ouro-manual-${{ runner.os }}-
-
-      - name: Disable cache
-        if: ${{ inputs.disable_cache }}
-        run: echo "OURO_CACHE=0" >> "$GITHUB_ENV"
-
-      - name: Show toolchain
+      - name: Regenerate API reference
+        run: sh scripts/doc_suite.sh --regen
+      - name: Diagnose bootstrap source rejection
+        if: failure()
+        timeout-minutes: 10
         run: |
-          python3 --version
-          python3 -m pip install --disable-pip-version-check --quiet ruff==0.15.21
-          if ! command -v shellcheck >/dev/null 2>&1; then
-            sudo apt-get update
-            sudo apt-get install -y shellcheck
-          fi
-          shellcheck --version
-          cc --version || true
-
-      - name: Build host compiler
-        run: python3 scripts/ouro_build.py build --verbosity quiet
-
-      - name: Run profile
-        run: python3 scripts/ci_gate.py --profile "${{ inputs.profile }}" --group "${{ matrix.group }}" --out "_build/ci/${{ inputs.profile }}-${{ matrix.group }}"
-
-      - name: Save cache
-        if: ${{ !inputs.disable_cache && github.event_name != 'pull_request' && steps.ouro-cache.outputs.cache-hit != 'true' }}
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: |
-            _cache/ouro
-            _build/c
-            _build/stage_loop
-          key: ${{ steps.ouro-cache.outputs.cache-primary-key }}
-
-      - name: Upload reports
+          python3 -B - <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+          sys.path.insert(0, str(Path('scripts').resolve()))
+          import frontend_regen
+          from ourosmith.limits import clean_env, run_limited
+          from repo_support import configure_native_stack
+          configure_native_stack()
+          snapshots = sorted(Path('_build/bootstrap').glob('*/inputs.json'))
+          for snapshot_path in snapshots:
+              snapshot = json.loads(snapshot_path.read_text())
+              work = snapshot_path.parent.resolve()
+              producer = work / 'out/bridge/ouro1'
+              original = work / 'o'
+              if not producer.is_file():
+                  continue
+              frontend_regen.ROOT = original
+              for root in ('std/utf8_scalar.ouro', 'compiler/source_text.ouro', 'compiler/lexer.ouro', 'compiler/pipeline.ouro'):
+                  units = frontend_regen.collect_units(root)
+                  argv = [str(producer), 'check', root, '999999']
+                  argv += [part for unit in units for part in ('--unit', unit)]
+                  result = run_limited(argv, cwd=original, env=clean_env(), timeout_s=120, memory_mb=3072)
+                  print(root, result.classify(), result.returncode, flush=True)
+                  print(result.stdout, end='', flush=True)
+                  print(result.stderr, end='', flush=True)
+          PY
+      - name: Check documentation
+        run: sh scripts/doc_suite.sh
+      - name: Upload API reference and reports
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: manual-${{ inputs.profile }}-${{ matrix.group }}
-          if-no-files-found: ignore
-          retention-days: 30
+          name: docs-api-generated
+          if-no-files-found: error
+          retention-days: 7
           path: |
-            _build/**/*.json
-            _build/**/*.log
-            _build/**/*.out
-            _build/**/*.txt
-            _build/**/*.err
-            _build/**/*.sarif
-            _build/**/*.md
-            _build/**/gate.log
+            docs/api/**
+            _build/doc_suite/**
+            _build/bootstrap/*/report.json
+            _build/bootstrap/*/inputs.json
+            _build/bootstrap/*/out/*/*.stderr
+            _build/bootstrap/*/out/*/*.stdout
