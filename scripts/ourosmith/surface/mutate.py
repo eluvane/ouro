@@ -67,6 +67,10 @@ def result : Nat := value;
         Mutation("applied-lambda-branch", prefix + f"def {name} : Nat := (fun (value : Nat) => match False with | True => value | False => True end) {number};", ("CErr code=41",)),
         Mutation("lambda-argument-domain", prefix + "def apply (f : Nat -> Nat) : Nat := f Z;\n"
                  + f"def {name} : Nat := apply (fun (n : Bool) => n);", ("CErr code=41",)),
+        Mutation("trailing-lambda-wrong-body", prefix
+                 + "def apply_last (value : Nat) (callback : Nat -> Nat) : Nat := callback value;\n"
+                 + f"def {name} : Nat := apply_last({number}) {{ value -> add value True }};",
+                 ("CErr code=41",)),
         Mutation("case-branch-type", prefix + f"def {name} (n : Nat) : Nat := match n with | Z => True | S k => k end;", ("CErr code=41",)),
         Mutation("case-lambda-domain", prefix + f"def {name} (n : Nat) : Nat -> Nat := match n with | Z => fun (b : Bool) => b | S k => fun (x : Nat) => add k x end;", ("CErr code=41",)),
         Mutation("termination-escape", prefix + "def call (f : Nat -> Nat) (n : Nat) : Nat := f n;\n"

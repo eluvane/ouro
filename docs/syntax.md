@@ -640,6 +640,11 @@ This is left-associated application; a trailing comma is optional.
 [Ergonomic syntax](language/ergonomic-syntax.md#positional-parenthesized-calls)
 for desugaring and compatibility details.
 
+A nonempty positional call may put its last callback in a trailing block:
+`with_value(2) { value -> add value 1 }`. This is an ordinary final lambda
+argument with one inferred binder. See
+[Trailing lambda calls](language/ergonomic-syntax.md#trailing-lambda-calls).
+
 The forward pipe appends its left-hand value as the final argument of the
 application on the right:
 

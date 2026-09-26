@@ -28,6 +28,9 @@ Development changes; see the [compatibility policy](docs/stability.md).
   patterns, lowered to a complete checked case with branch-local fields.
 - Total `if condition then expr else expr` expressions for the registered
   `Bool` type, with both arms checked at the result type.
+- Trailing `{ value -> body }` callbacks after nonempty positional call groups,
+  checked as ordinary final lambda arguments. See
+  [Trailing lambda calls](docs/language/ergonomic-syntax.md#trailing-lambda-calls).
 - Exclusive `0..10` and inclusive `0..=10` literal-endpoint `NatRange` values,
   checked through nominal Nat, bound, and range representation roles.
 - Final-tail list spreads `[first, ..rest]` build checked `List A` constructor
