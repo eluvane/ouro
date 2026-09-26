@@ -579,6 +579,23 @@ static ouro_v *bounded_call(ouro_v *fn, int count, ouro_v **args,
 	return result;
 }
 
+static int trace_callback_milestone(unsigned long ordinal)
+{
+	return ordinal == 1 || (ordinal & (ordinal - 1)) == 0 ||
+		ordinal % 128 == 0;
+}
+
+static void trace_callback(const char *label, unsigned long ordinal)
+{
+	const char *enabled = getenv("OURO_MEM_TRACE");
+	if (enabled == 0 || enabled[0] == 0 ||
+		(enabled[0] == '0' && enabled[1] == 0) ||
+		!trace_callback_milestone(ordinal))
+		return;
+	fprintf(stderr, "OURO_MEM_CALLBACK label=%s ordinal=%lu\n", label, ordinal);
+	ouro_heap_report(label);
+}
+
 static ouro_v *bounded_token_state(ouro_env *env, ouro_v *st)
 {
 	return bounded_call(FIND(lx, "next_import_token"), 3,
@@ -618,9 +635,15 @@ static ouro_v *closed_parse_unit(void)
    recursion inside lower_expr_env2 stays in the generated lowerer. */
 static ouro_v *bounded_lower_expr(ouro_env *env, ouro_v *expr)
 {
-	return bounded_call(FIND(lo, "lower_expr_env2"), 3,
+	static unsigned long calls;
+	ouro_v *result;
+	unsigned long ordinal = ++calls;
+	trace_callback("lower-expr-enter", ordinal);
+	result = bounded_call(FIND(lo, "lower_expr_env2"), 3,
 		(ouro_v *[]){ouro_get(env, 1), ouro_get(env, 0), expr},
 		ouro_clone_perm_deep);
+	trace_callback("lower-expr-exit", ordinal);
+	return result;
 }
 
 static ouro_v *bounded_lower_expected(ouro_env *env, ouro_v *expected)
@@ -639,15 +662,23 @@ static ouro_v *bounded_lower_environment(ouro_env *env, ouro_v *lower_env)
    so each mark belongs to one complete, non-reentrant pure pass. */
 static ouro_v *bounded_compile_program(ouro_env *env, ouro_v *surfaces)
 {
+	ouro_v *result;
 	(void)env;
-	return bounded_call(FIND(co, "compile_program"), 1,
+	trace_callback("compile-program-enter", 1);
+	result = bounded_call(FIND(co, "compile_program"), 1,
 		(ouro_v *[]){surfaces}, ouro_clone_perm);
+	trace_callback("compile-program-exit", 1);
+	return result;
 }
 
 static ouro_v *bounded_elaborate_surfaces(ouro_env *env, ouro_v *surfaces)
 {
-	return bounded_call(FIND(el, "elaborate_surfaces"), 2,
+	ouro_v *result;
+	trace_callback("elaborate-surfaces-enter", 1);
+	result = bounded_call(FIND(el, "elaborate_surfaces"), 2,
 		(ouro_v *[]){ouro_get(env, 0), surfaces}, ouro_clone_perm);
+	trace_callback("elaborate-surfaces-exit", 1);
+	return result;
 }
 
 static ouro_v *bounded_elaborate_surfaces_fuel(ouro_env *env, ouro_v *fuel)
@@ -681,9 +712,15 @@ static ouro_v *bounded_elaborate_fuel(ouro_env *env, ouro_v *fuel)
    re-entered by check_indexed_declaration's recursive term checks. */
 static ouro_v *bounded_check_item(ouro_env *env, ouro_v *item)
 {
-	return bounded_call(FIND(fc, "check_indexed_declaration"), 4,
+	static unsigned long calls;
+	ouro_v *result;
+	unsigned long ordinal = ++calls;
+	trace_callback("check-item-enter", ordinal);
+	result = bounded_call(FIND(fc, "check_indexed_declaration"), 4,
 		(ouro_v *[]){ouro_get(env, 2), ouro_get(env, 1), ouro_get(env, 0), item},
 		ouro_clone_perm);
+	trace_callback("check-item-exit", ordinal);
+	return result;
 }
 
 static ouro_v *bounded_check_signature(ouro_env *env, ouro_v *sig)
