@@ -124,6 +124,38 @@ def pred (n : Nat) : Nat :=
   end;
 ```
 
+A family can opt in to omitting a leading universe parameter on saturated
+constructor calls:
+
+```ouro
+inductive Box {A : Type} : Type :=
+  | MkBox : A -> Box A;
+
+def boxed : Box Nat := MkBox Z;      -- inserts Nat
+def explicit : Box Nat := MkBox Nat Z;
+```
+
+Only leading `{A : Type}` groups on a non-indexed inductive family are marked.
+When the expected result is a direct, fully applied `Box Nat`, the compiler
+inserts its marked parameter before checking the ordinary constructor call.
+A saturated call without that context can also use direct constructor field
+value types when every family parameter is marked and reliably witnessed.
+Explicit arguments remain valid; unmarked constructors and generic functions
+keep their existing explicit-argument rules. See
+[Marked constructor parameters](language/ergonomic-syntax.md#marked-constructor-parameters)
+for the bounded inference rule.
+
+Definitions can also opt in with leading `{A : Type}` parameters:
+
+```ouro
+def identity {A : Type} (value : A) : A := value;
+def one : Nat := identity Z;
+def explicit : Nat := identity Nat Z;
+```
+
+Only exact saturated source calls use bounded value and expected type hints;
+explicit calls remain valid. See [Marked definition parameters](language/ergonomic-syntax.md#marked-definition-parameters).
+
 Matches are constructor-based. The current implementation does not provide the
 full pattern language of a mature functional language; advanced patterns,
 or-patterns, and general wildcard exhaustiveness are outside the maintained
@@ -275,7 +307,7 @@ embedded-NUL limits.
 List literals use an expected `List A` type when one is available:
 
 ```ouro
-def values : List Nat := [Z, S Z, S (S Z)];
+def values : List Nat := [Z, S Z, S (S Z),];
 def empty : List Nat := [];
 ```
 
@@ -298,7 +330,8 @@ type, annotate the literal or binding; later elements do not resolve it.
 This is a bounded first-element hint, not general type unification. A free
 local type name shadowed by a later binding also needs an explicit `List A`
 annotation so the earlier type is not rebound under the later name.
-Heterogeneous lists and trailing commas are rejected. List literals lower to
+Heterogeneous lists are rejected. A nonempty list may end with a comma;
+`[]` remains the empty spelling. List literals lower to
 the standard `Nil` and `Cons` constructors, and the compiler checks every
 element against the selected type.
 
@@ -397,5 +430,5 @@ declaration do not require a trailing semicolon per arm.
 
 The [design goals](design.md#language-direction) and
 [stability policy](stability.md#experimental-areas) describe planned and
-experimental language areas. Record updates, unrestricted recursion, implicit
+experimental language areas. Unrestricted recursion, general implicit
 arguments, and type classes are outside this surface.
