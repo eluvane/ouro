@@ -15,6 +15,9 @@ Development changes; see the [compatibility policy](docs/stability.md).
   name-prefix suggestions.
 - Pure `let name := value;` bindings in `do` expressions use ordinary lexical
   scope between actions; `let!` continues to bind an action's result.
+- Total `let (Ctor fields) := subject in body` and block `let (Ctor fields) :=
+  subject; tail` destructuring use checked constructor matches; result types
+  that cannot be inferred from the subject need an expected context.
 - Exclusive `0..10` and inclusive `0..=10` literal-endpoint `NatRange` values,
   checked through nominal Nat, bound, and range representation roles.
 - Final-tail list spreads `[first, ..rest]` build checked `List A` constructor

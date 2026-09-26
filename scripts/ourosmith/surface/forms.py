@@ -182,6 +182,19 @@ def select (pair : Pair Nat Bool) : Nat :=
   match pair with | MkPair value flag => match flag with | True => value | False => S value end end;
 def result : Nat := select (MkPair Nat Bool {n} {'True' if m % 2 else 'False'});
 """, n if m % 2 else n + 1, False
+    yield "destructure-pair", PRELUDE + f"""inductive Pair (A : Type) (B : Type) : Type := | MkPair : A -> B -> Pair A B;
+def result : Nat :=
+  let pair : Pair Nat Nat := MkPair Nat Nat {n} {m} in
+  let (MkPair left right) := pair in add left right;
+""", n + m, False
+    yield "destructure-effectful-subject", PRELUDE + f"""inductive Unit : Type := | MkUnit : Unit;
+effect Tick where | tick : Nat -> Unit
+def result : Nat :=
+  handle let (MkUnit) := perform tick({n}) in {m} with
+  | tick (seed) resume => add (S seed) (resume MkUnit)
+  | pure value => value
+  end;
+""", n + m + 1, True
     yield "inferred-lambda", PRELUDE + f"""def identity : Nat -> Nat := fun n => n;
 def result : Nat := identity {n};
 """, n, False
