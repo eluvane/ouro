@@ -517,6 +517,31 @@ expressions, and trailing semicolons are rejected. The block lowers to
 ordinary checked `case`, constructor applications, and local lets; it adds no
 new kernel form or effect handler.
 
+## Maybe fallback operator
+
+```ouro
+import "std/types.ouro";
+def choose (value : Maybe Nat) (compute_fallback : Unit -> Nat) : Nat :=
+  value ?? compute_fallback MkUnit;
+```
+
+For the registered `ouro.maybe` family, `value` must have type `Maybe A` and
+the fallback must have type `A`. `Just payload` returns the payload;
+`Nothing` evaluates and returns the fallback. The compiler lowers this to one
+checked case over `value`, with the fallback in the `Nothing` branch, so the
+source operand occurs once in the emitted term. Both branches are type checked
+even when `value` is a known constructor. The spelling of local bindings named
+`Nothing` or `Just` does not select the constructor roles; the checked
+representation and its ordered constructors do.
+
+`??` associates to the right and binds less tightly than application and
+`|>`: `a ?? b ?? c` is `a ?? (b ?? c)`, and `a ?? b |> f` is
+`a ?? (b |> f)`. Use `(a ?? b) |> f` to pipe the selected value. A complete
+type hint from `value` or an expected result type must determine `A`; an
+ambiguous payload needs an annotation. A similarly shaped unrepresented type,
+a missing fallback, or a fallback of the wrong type is rejected. This operator
+does not propagate failure like the postfix `?` in a typed fallible block.
+
 ## Integration and fixtures
 
 Grouped imports, calls, local helpers, pure expression blocks, and list syntax

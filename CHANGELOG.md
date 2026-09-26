@@ -31,6 +31,8 @@ Development changes; see the [compatibility policy](docs/stability.md).
 - Trailing `{ value -> body }` callbacks after nonempty positional call groups,
   checked as ordinary final lambda arguments. See
   [Trailing lambda calls](docs/language/ergonomic-syntax.md#trailing-lambda-calls).
+- `Maybe A` values accept lazy `value ?? fallback` expressions, checked through
+  the registered nominal family; see [Maybe fallback](docs/language/ergonomic-syntax.md#maybe-fallback-operator).
 - Exclusive `0..10` and inclusive `0..=10` literal-endpoint `NatRange` values,
   checked through nominal Nat, bound, and range representation roles.
 - Final-tail list spreads `[first, ..rest]` build checked `List A` constructor
