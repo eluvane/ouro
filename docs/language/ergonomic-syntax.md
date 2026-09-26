@@ -120,16 +120,17 @@ same nested `EApp` tree as ordinary application.
 ## Typed local helper declarations
 
 ```text
-let double (x : Nat) : Nat := add x x in
+let double (x : Nat) := add x x in
   double value
 
 let identity (A : Type) (x : A) : A := x in
   identity Nat value
 ```
 
-A parameterized local binding requires typed parameters and an explicit result
-type. It uses the existing declaration telescope grammar, including grouped
-binders such as `(x y : Nat)`. Its desugaring is:
+A parameterized local binding requires typed parameters. Its result type may
+be omitted when the checker can infer it from the helper value. It uses the
+existing declaration telescope grammar, including grouped binders such as
+`(x y : Nat)`. An explicitly annotated helper desugars as:
 
 ```text
 let f (x : A) (y : B x) : C x y := value in body
@@ -139,9 +140,15 @@ let f : (x : A) -> (y : B x) -> C x y :=
 in body
 ```
 
-The parser uses `mk_pi_chain` and `mk_typed_lam_chain`, then constructs an
-ordinary `ELet`. Earlier parameters scope over later parameter types, the
-result type, and the helper value. Parameters do not escape into `body`.
+Without a result annotation, `let f (x : A) := value in body` desugars to
+`let f := fun (x : A) => value in body`. The existing local-binding inference
+must infer the complete function type from the typed lambda. A body whose type
+cannot be inferred still needs an annotation.
+
+The parser uses `mk_pi_chain` for annotated helpers and
+`mk_typed_lam_chain` for both forms, then constructs an ordinary `ELet`.
+Earlier parameters scope over later parameter types, the optional result type,
+and the helper value. Parameters do not escape into `body`.
 The helper name scopes over `body`, not its own value. An identically spelled
 outer binding remains available in that value, exactly as with ordinary `let`.
 Recursion still requires explicit `fix` and the existing structural checks.
@@ -150,14 +157,13 @@ Invalid examples:
 
 ```text
 let f x : Nat := x in f value
-let f (x : Nat) := x in f value
-let f (hidden : Nat) : Nat := hidden in hidden
+let f (x : Nat) := fun y => y in f value
+let f (hidden : Nat) := hidden in hidden
 ```
 
-The first lacks a parameter annotation; the second lacks the required result
-annotation; the third attempts to use an out-of-scope parameter. These are not
-invitations for heuristic type inference. Existing unparameterized `let`
-syntax and its inference behavior are unchanged.
+The first lacks a parameter annotation; the second has an unannotated nested
+lambda with no expected function type; the third uses an out-of-scope parameter.
+Existing unparameterized `let` syntax and its inference behavior are unchanged.
 
 ## List literal trailing commas
 
@@ -194,8 +200,15 @@ With a known nominal result type, update checks the base as that record type,
 binds it once, then binds changed values in source order. It constructs the new
 record in declaration field order, reading omitted fields from the bound base.
 Unknown and repeated fields are errors. A bare update name without `:=` is not
-an assignment. Nested field paths and update without an annotated nominal
-result type are not implemented yet.
+an assignment. Paths through nominal record fields, such as
+`{ person with address.city := next_city, address.zip := next_zip }`, rebuild
+each affected nested record. Sibling paths are accepted; exact duplicates and
+ancestor/descendant overlaps are errors. Changed right-hand sides are bound
+once in source order. A typed local binding, record-valued field, or explicit
+literal ascription `({ city := next_city, zip := saved_zip } : Address)` supplies a nominal
+expected type for that value. It does not infer a type for arbitrary call
+arguments. Updates without nominal context and dependent record fields remain
+unsupported.
 
 ## Integration and fixtures
 

@@ -68,6 +68,83 @@ def record_test_registry : RecReg := MkRecReg(0,
   [MkRecInfo(0, str_codes "Point", str_codes "MkPoint", record_test_fields)],
   [], []);
 
+def record_test_nested_registry : RecReg := MkRecReg(0,
+  [ MkRecInfo(0, str_codes "Address", str_codes "MkAddress",
+      [MkRecField(str_codes "city", str_codes "Nat"),
+       MkRecField(str_codes "zip", str_codes "Nat")])
+  , MkRecInfo(0, str_codes "User", str_codes "MkUser",
+      [MkRecField(str_codes "address", str_codes "Address -- type\n"),
+       MkRecField(str_codes "age", str_codes "Nat")])
+  , MkRecInfo(0, str_codes "Other", str_codes "MkOther",
+      [MkRecField(str_codes "city", str_codes "Nat")])
+  ], [], []);
+
+def record_test_nested_lowering : Bool :=
+  match preprocess_records_reg record_test_nested_registry (str_codes
+      "def result : User := { make_user Z with address.city := rhs_city -- first\n, address.zip := rhs_zip };") with
+  | MkPair _ result =>
+      match result with
+      | PrepErr _ _ => False
+      | PrepOk source =>
+          andb(eqNat(record_test_count (str_codes "make_user Z") source, S Z),
+            andb(eqNat(record_test_count (str_codes "rhs_city") source, S Z),
+              andb(eqNat(record_test_count (str_codes "rhs_zip") source, S Z),
+                andb(record_test_before (str_codes "rhs_city") (str_codes "rhs_zip") source,
+                  eqNat(record_test_count (str_codes "User_address") source, S Z)))))
+      end
+  end;
+
+def record_test_nested_overlap (fields : String) : Bool :=
+  match preprocess_records_reg record_test_nested_registry
+      (str_codes (str_cat3("def result : User := { user with ", fields, " };"))) with
+  | MkPair _ result =>
+      match result with
+      | PrepErr code _ => eqNat code rec_code_dup
+      | PrepOk _ => False
+      end
+  end;
+
+def record_test_local_shadow : Bool :=
+  match preprocess_records_reg record_test_nested_registry (str_codes
+      "def result : Nat := let item : Address := address in let item : Other := { city := Z } in item.city;") with
+  | MkPair _ result =>
+      match result with
+      | PrepErr _ _ => False
+      | PrepOk source =>
+          andb(eqNat(record_test_count (str_codes "Other_city item") source, S Z),
+            eqNat(record_test_count (str_codes "Address_city item") source, Z))
+      end
+  end;
+
+def record_test_block_local_context : Bool :=
+  match preprocess_records_reg record_test_nested_registry (str_codes
+      "def result : Nat := let { let count : Nat := Z; let item : Address := { city := count, zip := Z }; item.city };") with
+  | MkPair _ result =>
+      match result with
+      | PrepErr _ _ => False
+      | PrepOk source =>
+          andb(eqNat(record_test_count (str_codes "MkAddress") source, S Z),
+            eqNat(record_test_count (str_codes "Address_city item") source, S Z))
+      end
+  end;
+
+def record_test_group_scope : Bool :=
+  let registry : RecReg :=
+    match record_test_nested_registry with
+    | MkRecReg _ records names _ =>
+        MkRecReg Z records names [MkRecBind(str_codes "item", Z)]
+    end in
+  match preprocess_records_reg registry (str_codes
+      "def result : Nat := pair (let item : Other := { city := Z } in item.city) item.city;") with
+  | MkPair _ result =>
+      match result with
+      | PrepErr _ _ => False
+      | PrepOk source =>
+          andb(eqNat(record_test_count (str_codes "Other_city item") source, S Z),
+            eqNat(record_test_count (str_codes "Address_city item") source, S Z))
+      end
+  end;
+
 def record_test_block_passthrough : Bool :=
   let source : List Nat := str_codes
     "def value : Nat := let -- trivia\n{ let count : Nat := Z; count };" in
@@ -145,6 +222,72 @@ def record_test_scanners : List Test :=
           "let { let count : Nat := Z; count }")))
     , assert_true "record update binds base once and RHS in source order"
         record_test_update_lowering
+    , assert_true "nested update binds sibling RHS once in source order"
+        record_test_nested_lowering
+    , assert_true "nested update rejects parent then child"
+        (record_test_nested_overlap "address := home, address.city := Z")
+    , assert_true "nested update rejects child then parent"
+        (record_test_nested_overlap "address.city := Z, address := home")
+    , assert_eq "local delimiter skips nested let-in before the outer in"
+        (match take_local_boundary (str_codes
+            "let inner : Address := home in inner in item.city") with
+         | RecLocalBoundaryNone => "<none>"
+         | RecLocalBoundaryAt value separator body =>
+             str_cat3(str_of_codes value, "|", str_of_codes
+               (append Nat separator body))
+         end)
+        "let inner : Address := home in inner |in item.city"
+    , assert_eq "local delimiter skips expression-level open alias in"
+        (match take_local_boundary (str_codes "open A in value in body") with
+         | RecLocalBoundaryNone => "<none>"
+         | RecLocalBoundaryAt value separator body =>
+             str_cat3(str_of_codes value, "|", str_of_codes
+               (append Nat separator body))
+         end)
+        "open A in value |in body"
+    , assert_eq "local delimiter skips fallible do and nested match ends"
+        (match take_local_boundary (str_codes
+            "let? (Bad, Good) : Result do let x : Nat := Z; match x with | Z => Z end; x end in body") with
+         | RecLocalBoundaryNone => "<none>"
+         | RecLocalBoundaryAt value separator body =>
+             str_cat3(str_of_codes value, "|", str_of_codes
+               (append Nat separator body))
+         end)
+        "let? (Bad, Good) : Result do let x : Nat := Z; match x with | Z => Z end; x end |in body"
+    , assert_eq "local delimiter skips a handler end before outer in"
+        (match take_local_boundary (str_codes
+            "handle action with | Choice => Z end in body") with
+         | RecLocalBoundaryNone => "<none>"
+         | RecLocalBoundaryAt value separator body =>
+             str_cat3(str_of_codes value, "|", str_of_codes
+               (append Nat separator body))
+         end)
+        "handle action with | Choice => Z end |in body"
+    , assert_eq "local delimiter skips a nested fallible block"
+        (match take_local_boundary (str_codes
+            "let? (Bad, Good) : Result do let? (Bad, Good) : Result do Z end; Z end in body") with
+         | RecLocalBoundaryNone => "<none>"
+         | RecLocalBoundaryAt value separator body =>
+             str_cat3(str_of_codes value, "|", str_of_codes
+               (append Nat separator body))
+         end)
+        "let? (Bad, Good) : Result do let? (Bad, Good) : Result do Z end; Z end |in body"
+    , assert_true "block prepass crosses an ordinary local before record local"
+        record_test_block_local_context
+    , assert_true "parenthesized local scope does not hide an outer record"
+        record_test_group_scope
+    , assert_true "typed local shadow selects the inner nominal accessor"
+        record_test_local_shadow
+    , assert_true "nominal metadata ignores a trailing type comment"
+        (match type_to_rec record_test_nested_registry (str_codes "Address -- type\n") with
+         | Nothing => False
+         | Just index => eqNat index Z
+         end)
+    , assert_true "compound type is not a nominal record"
+        (match type_to_rec record_test_nested_registry (str_codes "Address -> Address") with
+         | Nothing => True
+         | Just _ => False
+         end)
     , assert_true "grouped nominal type resolves through nested parentheses"
         (match type_to_rec record_test_registry (str_codes "((Point))") with
          | Nothing => False
