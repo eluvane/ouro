@@ -255,7 +255,7 @@ embedded-NUL limits.
 List literals use an expected `List A` type when one is available:
 
 ```ouro
-def values : List Nat := [Z, S Z, S (S Z)];
+def values : List Nat := [Z, S Z, S (S Z),];
 def empty : List Nat := [];
 ```
 
@@ -278,9 +278,10 @@ type, annotate the literal or binding; later elements do not resolve it.
 This is a bounded first-element hint, not general type unification. A free
 local type name shadowed by a later binding also needs an explicit `List A`
 annotation so the earlier type is not rebound under the later name.
-Heterogeneous lists and trailing commas are rejected. List literals lower to
-the standard `Nil` and `Cons` constructors, and the compiler checks every
-element against the selected type.
+Heterogeneous lists are rejected. A nonempty list may end with a comma;
+`[]` remains the empty spelling. List literals lower to the standard `Nil`
+and `Cons` constructors, and the compiler checks every element against the
+selected type.
 
 ## Records
 
@@ -294,15 +295,31 @@ record Point : Type where
 end;
 
 def origin : Point := { x := Z, y := Z };
+def x : Nat := Z;
+def y : Nat := Z;
+def sameOrigin : Point := { y, x };
+def moved : Point := { origin with x := S Z };
 def originX : Nat := origin.x;
 ```
 
 The default constructor is `MkPoint`; generated accessor names use
 `Point_x`, `Point_y`, and so on. Record literals require a known record type,
-and every field must appear exactly once.
+and every field must appear exactly once. A bare field name such as `x` means
+`x := x`; the value resolves in the ordinary lexical scope. Punned and explicit
+fields may be mixed, with comments and a trailing comma. Field order in the
+source does not change the constructor's declared field order. Unknown,
+duplicate, and missing fields remain errors; an unbound punned value is a
+compiler error.
 
-Record update, record pattern matching, anonymous records, row polymorphism,
-subtyping, and overloaded field resolution are not implemented.
+`{ origin with x := S Z }` creates a new `Point`, copying every unchanged field.
+The expected annotation supplies the nominal record type and the compiler checks
+both the base and changed field values against it. Multiple changed fields are
+bound in source order; constructor arguments follow declaration order. An
+unknown or repeated field is rejected. Nested field paths and update without a
+known annotated result type are not implemented.
+
+Record pattern matching, anonymous records, row polymorphism, subtyping, and
+overloaded field resolution are not implemented.
 
 ## Application and the pipe operator
 
@@ -377,5 +394,5 @@ declaration do not require a trailing semicolon per arm.
 
 The [design goals](design.md#language-direction) and
 [stability policy](stability.md#experimental-areas) describe planned and
-experimental language areas. Record updates, unrestricted recursion, implicit
-arguments, and type classes are outside this surface.
+experimental language areas. Nested record updates, unrestricted recursion,
+implicit arguments, and type classes are outside this surface.

@@ -1,9 +1,9 @@
 # Ergonomic syntax
 
-Grouped imports, positional calls, typed local helpers, and pure expression
-blocks lower to existing syntax nodes. The maintained
-[syntax reference](../syntax.md) states accepted forms; this page records
-desugaring and compatibility boundaries.
+Grouped imports, positional calls, typed local helpers, pure expression
+blocks, and list trailing commas lower to existing syntax nodes. The
+maintained [syntax reference](../syntax.md) states accepted forms; this page
+records desugaring and compatibility boundaries.
 
 ## Grouped imports
 
@@ -202,12 +202,50 @@ and `maybe` keep their meanings. Comments and multiline layout are allowed
 between tokens. Record literals inside a block still need the same supported
 type context as record literals elsewhere.
 
+## List literal trailing commas
+
+```text
+[x, y,] == [x, y]
+[x,]    == [x]
+```
+
+After at least one element, a comma immediately before `]` is accepted,
+including across whitespace and line comments. The parser builds the same
+`EList` elements in the same order. `[,]`, `[x,,]`, and a missing `]` remain
+parse errors. Empty lists keep the spelling `[]` and still need an expected
+`List A` type.
+
+## Record field punning
+
+```ouro
+{ x, y := next }  -- the x field uses the variable x
+```
+
+A record literal still needs a known nominal record type. A bare field name
+uses the value with that name in the enclosing lexical scope; it does not
+introduce a binder. The record preprocessor expands it to the same constructor
+argument as `x := x`, preserving declaration field order. Missing, duplicate,
+and unknown fields remain errors.
+
+## Functional record update
+
+```ouro
+{ person with age := next_age, active := True }
+```
+
+With a known nominal result type, update checks the base as that record type,
+binds it once, then binds changed values in source order. It constructs the new
+record in declaration field order, reading omitted fields from the bound base.
+Unknown and repeated fields are errors. A bare update name without `:=` is not
+an assignment. Nested field paths and update without an annotated nominal
+result type are not implemented yet.
+
 ## Integration and fixtures
 
 These forms reuse existing `DImport`, `EApp`, `EAscribe`, `ELam`, `EPi`,
-and `ELet` nodes. The formatter retains grouped imports, call spelling,
-compact local helpers, and block spelling without expanding them in source.
-The fixture inventory
+`ELet`, and `EList` nodes. The formatter retains grouped imports, call
+spelling, compact local helpers, block spelling, and list commas without
+expanding them in source. The fixture inventory
 is `tests/language_ergonomics/cases.json`; it includes desugaring pairs,
 rejected forms, import graph/diagnostic cases, and formatter round trips.
 [CI](../ci.md#local-profiles) owns validation commands and gate status.
@@ -224,12 +262,14 @@ compatibility, see [Design](../design.md#language-direction) and
 
 Lint, strict quality, and analyzer import inventories read every operand,
 including multiline groups. Malformed import scans return an input error.
-The [bootstrap bridge](../build.md#c-bootstrap) supports these forms without
-rewriting the current source snapshot.
+The [bootstrap bridge](../build.md#c-bootstrap) supports grouped imports,
+calls, and helpers without rewriting the current source snapshot. Compiler
+bootstrap inputs do not use list trailing commas; the new parser accepts them
+after bootstrapping.
 
 `f (a b)` remains one argument; `f (a, b)` denotes two applications, regardless
-of whitespace. Grouped imports cannot carry aliases. List trailing commas,
-empty `f()` calls, named arguments, and recursive local helpers remain
+of whitespace. Grouped imports cannot carry aliases. Empty `f()` calls,
+named arguments, and recursive local helpers remain
 unsupported. Live LSP range/navigation behavior requires its own verification;
 AST reuse alone does not establish editor behavior. The dedicated parser,
 formatter, frontend/security, Clippy, bootstrap, and PR gates remain required
