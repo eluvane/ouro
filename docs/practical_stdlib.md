@@ -28,6 +28,17 @@ conversion that rejects surrogates and out-of-range values. Its
 
 ## Fallible values
 
+`std/data.ouro` provides `maybe_unwrap_or_else A fallback value` for a
+`Maybe A`. The fallback has type `Unit -> A` and is called only for `Nothing`;
+`Just x` returns `x`. Use `fromMaybe` when the default is already a value.
+
+```ouro
+import "../std/data.ouro";
+
+def port (parsed : Maybe Nat) : Nat :=
+    maybe_unwrap_or_else Nat (fun (_ : Unit) => add 8000 80) parsed;
+```
+
 `std/result.ouro` treats `Either E A` as a result: `Left` carries the error
 and `Right` carries the value. `result_unwrap_or_else E A fallback value`
 returns the value on `Right`; on `Left` it calls `fallback : E -> A` with the
