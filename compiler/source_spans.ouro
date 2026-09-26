@@ -30,10 +30,11 @@ def token_spans_eof (total : Nat) (marks : List (Pair (List Nat) (List Nat))) : 
     MkTokenSpans total (reverse (Pair(List Nat, List Nat))
       (Cons(Pair(List Nat, List Nat), MkPair(List Nat, List Nat, Nil Nat, Nil Nat), marks)));
 
--- Steps through next_token exactly as lex_go_with does, so the tokens and
+-- Steps through the supplied lexer step exactly as lex_go_with does, so the tokens and
 -- intern state are the production lexer's. The start mark repeats the
 -- skip_ws call that next_token makes with the same fuel.
-def lex_spanned_go (total : Nat)
+def lex_spanned_go_with
+    (next : Nat -> List Nat -> InternState -> Step) (total : Nat)
     : Nat -> List Nat -> InternState -> List Token -> List (Pair (List Nat) (List Nat)) -> LexSpanned :=
   fix go (fuel : Nat) (src : List Nat) (st : InternState) (acc : List Token)
       (marks : List (Pair (List Nat) (List Nat))) : LexSpanned :=
@@ -44,7 +45,7 @@ def lex_spanned_go (total : Nat)
         | Cons _ _ => MkLexSpanned(LexExhausted st, token_spans_none total)
         end
     | S fuel' =>
-        match next_token fuel' src st with
+        match next fuel' src st with
         | StepEof st' =>
             MkLexSpanned(LexOk(reverse(Token, Cons Token TEof acc), st'), token_spans_eof total marks)
         | LexStepErr st' => MkLexSpanned(LexMalformed st', token_spans_none total)
@@ -58,8 +59,17 @@ def lex_spanned_go (total : Nat)
         end
     end;
 
+def lex_spanned_go (total : Nat)
+    : Nat -> List Nat -> InternState -> List Token ->
+      List (Pair (List Nat) (List Nat)) -> LexSpanned :=
+    lex_spanned_go_with next_token total;
+
 def lex_spanned (fuel : Nat) (src : List Nat) (st : InternState) : LexSpanned :=
     lex_spanned_go(length Nat src, fuel, src, st, Nil Token, Nil (Pair(List Nat, List Nat)));
+
+def lex_spanned_import (fuel : Nat) (src : List Nat) (st : InternState) : LexSpanned :=
+    lex_spanned_go_with next_import_token
+      (length Nat src) fuel src st (Nil Token) (Nil (Pair(List Nat, List Nat)));
 
 def token_mark : Nat -> List (Pair (List Nat) (List Nat)) -> Maybe (Pair (List Nat) (List Nat)) :=
   fix token_mark (index : Nat) (marks : List (Pair (List Nat) (List Nat)))
@@ -98,6 +108,7 @@ def token_span_bytes (spans : TokenSpans) (first : Nat) (past : Nat) : Maybe (Pa
 def expr_span_is (first : Nat) (past : Nat) (e : Expr) : Bool :=
     match e with
     | ESpan a b _ => andb(eqNat a first, eqNat b past)
+    | EOpen _ _ => False
     | EVar _ => False
     | EHole _ => False
     | ESort _ => False
@@ -121,6 +132,7 @@ def expr_span_is (first : Nat) (past : Nat) (e : Expr) : Bool :=
     | EStr _ => False
     | EDoBind _ _ => False
     | EList _ => False
+    | EFallible _ _ _ _ => False
     end;
 
 -- The token range of a span wrapper, for tools that must not spend a visit
@@ -129,6 +141,7 @@ def expr_unwrap_span (e : Expr) : Maybe (Pair (Pair Nat Nat) Expr) :=
     match e with
     | ESpan first past inner => Just (Pair(Pair Nat Nat, Expr))
         (MkPair(Pair Nat Nat, Expr, MkPair Nat Nat first past, inner))
+    | EOpen _ _ => Nothing (Pair(Pair Nat Nat, Expr))
     | EVar _ => Nothing (Pair(Pair Nat Nat, Expr))
     | EHole _ => Nothing (Pair(Pair Nat Nat, Expr))
     | ESort _ => Nothing (Pair(Pair Nat Nat, Expr))
@@ -152,6 +165,7 @@ def expr_unwrap_span (e : Expr) : Maybe (Pair (Pair Nat Nat) Expr) :=
     | EStr _ => Nothing (Pair(Pair Nat Nat, Expr))
     | EDoBind _ _ => Nothing (Pair(Pair Nat Nat, Expr))
     | EList _ => Nothing (Pair(Pair Nat Nat, Expr))
+    | EFallible _ _ _ _ => Nothing (Pair(Pair Nat Nat, Expr))
     end;
 
 -- Innermost token range under a chain of wrappers, then the unwrapped expression.
@@ -250,6 +264,7 @@ def strip_spans : Expr -> Expr :=
   fix strip_spans (e : Expr) : Expr :=
     match e with
     | ESpan _ _ inner => strip_spans inner
+    | EOpen alias inner => EOpen alias (strip_spans inner)
     | EVar n => EVar n
     | EHole h => EHole h
     | ESort u => ESort u
@@ -338,6 +353,8 @@ def strip_spans : Expr -> Expr :=
               | Nil => Nil Expr
               | Cons x rest => Cons(Expr, strip_spans x, go rest)
               end) elements)
+    | EFallible container failure success body =>
+        EFallible (strip_spans container) failure success (strip_spans body)
     end;
 
 def strip_pair_spans : List (Pair Nat Expr) -> List (Pair Nat Expr) :=
@@ -353,10 +370,11 @@ def strip_pair_spans : List (Pair Nat Expr) -> List (Pair Nat Expr) :=
 
 def strip_decl_spans (d : Decl) : Decl :=
     match d with
-    | DDef n ty body => DDef(n, strip_spans ty, strip_spans body)
+    | DDef n ty body marked declared =>
+        DDef(n, strip_spans ty, strip_spans body, marked, declared)
     | DAxiom n ty => DAxiom(n, strip_spans ty)
-    | DInductive n params ty ctors =>
-        DInductive(n, strip_pair_spans params, strip_spans ty, strip_pair_spans ctors)
+    | DInductive n params ty ctors marked =>
+        DInductive(n, strip_pair_spans params, strip_spans ty, strip_pair_spans ctors, marked)
     | DEffect n ops handlers => DEffect(n, strip_pair_spans ops, strip_pair_spans handlers)
     | DImport n => DImport n
     | DIntrinsic n ty key specialization =>

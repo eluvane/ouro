@@ -1,7 +1,22 @@
 -- Byte-scanner boundaries and record emission must survive structural checks.
 
 import "../std/test.ouro",
-  "../compiler/preprocess_record_text.ouro";
+  "../compiler/preprocess_record.ouro";
+
+def record_test_preprocess (reg : RecReg) (source : List Nat)
+    : Pair RecReg PrepResult :=
+  match preprocess_records_reg (Nil Nat)
+      (MkImpReg (Nil (List Nat)) (Nil (Pair (List Nat) (List Nat))))
+      reg source with
+  | MkPair next tagged => match tagged with
+    | MkPair _ result => MkPair RecReg PrepResult next result
+    end
+  end;
+
+def record_test_type_to_rec (reg : RecReg) (source : List Nat) : Maybe Nat :=
+  type_to_rec reg (Nil Nat)
+    (MkImpReg (Nil (List Nat)) (Nil (Pair (List Nat) (List Nat))))
+    source;
 
 def record_test_split (parts : Pair (List Nat) (List Nat)) : String :=
     match parts with
@@ -18,6 +33,287 @@ def record_test_fields : List RecField :=
     [ MkRecField(str_codes "x", str_codes "Nat")
     , MkRecField(str_codes "flag", str_codes "Bool")
     ];
+
+def record_test_count (needle : List Nat) : List Nat -> Nat :=
+  fix record_test_count (xs : List Nat) : Nat :=
+    match xs with
+    | Nil => Z
+    | Cons _ rest =>
+        match source_starts needle xs with
+        | True => S (record_test_count rest)
+        | False => record_test_count rest
+        end
+    end;
+
+def record_test_before (first : List Nat) (second : List Nat) : List Nat -> Bool :=
+  fix record_test_before (xs : List Nat) : Bool :=
+    match xs with
+    | Nil => False
+    | Cons _ rest =>
+        match source_starts first xs with
+        | True => True
+        | False =>
+            match source_starts second xs with
+            | True => False
+            | False => record_test_before rest
+            end
+        end
+    end;
+
+def record_test_comment_metadata : Bool :=
+  match parse_record (str_codes
+      "record R : Type -- sort\n where x : Nat -- field\n; end;") with
+  | RecPErr _ => False
+  | RecPOk info sort _ =>
+      match info with
+      | MkRecInfo _ _ _ fields =>
+          match fields with
+          | Nil => False
+          | Cons field _ =>
+              match field with
+              | MkRecField _ ty =>
+                  andb(source_bytes_equal sort (str_codes "Type -- sort\n "),
+                    source_bytes_equal ty (str_codes "Nat -- field\n"))
+              end
+          end
+      end
+  end;
+
+def record_test_registry : RecReg := MkRecReg(0,
+  [MkRecInfo(Nil Nat, str_codes "Point", str_codes "MkPoint", record_test_fields)],
+  [], []);
+
+def record_test_nested_registry : RecReg := MkRecReg(0,
+  [ MkRecInfo(Nil Nat, str_codes "Address", str_codes "MkAddress",
+      [MkRecField(str_codes "city", str_codes "Nat"),
+       MkRecField(str_codes "zip", str_codes "Nat")])
+  , MkRecInfo(Nil Nat, str_codes "User", str_codes "MkUser",
+      [MkRecField(str_codes "address", str_codes "Address -- type\n"),
+       MkRecField(str_codes "age", str_codes "Nat")])
+  , MkRecInfo(Nil Nat, str_codes "Other", str_codes "MkOther",
+      [MkRecField(str_codes "city", str_codes "Nat")])
+  ], [], []);
+
+def record_test_nested_lowering : Bool :=
+  match record_test_preprocess record_test_nested_registry (str_codes
+      "def result : User := { make_user Z with address.city := rhs_city -- first\n, address.zip := rhs_zip };") with
+  | MkPair _ result =>
+      match result with
+      | PrepErr _ _ => False
+      | PrepOk source =>
+          andb(eqNat(record_test_count (str_codes "make_user Z") source, S Z),
+            andb(eqNat(record_test_count (str_codes "rhs_city") source, S Z),
+              andb(eqNat(record_test_count (str_codes "rhs_zip") source, S Z),
+                andb(record_test_before (str_codes "rhs_city") (str_codes "rhs_zip") source,
+                  eqNat(record_test_count (str_codes "User_address") source, S Z)))))
+      end
+  end;
+
+def record_test_nested_overlap (fields : String) : Bool :=
+  match record_test_preprocess record_test_nested_registry
+      (str_codes (str_cat3("def result : User := { user with ", fields, " };"))) with
+  | MkPair _ result =>
+      match result with
+      | PrepErr code _ => eqNat code rec_code_dup
+      | PrepOk _ => False
+      end
+  end;
+
+def record_test_local_shadow : Bool :=
+  match record_test_preprocess record_test_nested_registry (str_codes
+      "def result : Nat := let item : Address := address in let item : Other := { city := Z } in item.city;") with
+  | MkPair _ result =>
+      match result with
+      | PrepErr _ _ => False
+      | PrepOk source =>
+          andb(eqNat(record_test_count (str_codes "Other_city item") source, S Z),
+            eqNat(record_test_count (str_codes "Address_city item") source, Z))
+      end
+  end;
+
+def record_test_block_local_context : Bool :=
+  match record_test_preprocess record_test_nested_registry (str_codes
+      "def result : Nat := let { let count : Nat := Z; let item : Address := { city := count, zip := Z }; item.city };") with
+  | MkPair _ result =>
+      match result with
+      | PrepErr _ _ => False
+      | PrepOk source =>
+          andb(eqNat(record_test_count (str_codes "MkAddress") source, S Z),
+            eqNat(record_test_count (str_codes "Address_city item") source, S Z))
+      end
+  end;
+
+def record_test_group_scope : Bool :=
+  let registry : RecReg :=
+    match record_test_nested_registry with
+    | MkRecReg _ records names _ =>
+        MkRecReg Z records names [MkRecBind(str_codes "item", Z, Nil Nat)]
+    end in
+  match record_test_preprocess registry (str_codes
+      "def result : Nat := pair (let item : Other := { city := Z } in item.city) item.city;") with
+  | MkPair _ result =>
+      match result with
+      | PrepErr _ _ => False
+      | PrepOk source =>
+          andb(eqNat(record_test_count (str_codes "Other_city item") source, S Z),
+            eqNat(record_test_count (str_codes "Address_city item") source, S Z))
+      end
+  end;
+
+def record_test_block_passthrough : Bool :=
+  let source : List Nat := str_codes
+    "def value : Nat := let -- trivia\n{ let count : Nat := Z; count };" in
+  match record_test_preprocess record_test_registry source with
+  | MkPair _ result =>
+      match result with
+      | PrepErr _ _ => False
+      | PrepOk output => source_bytes_equal source output
+      end
+  end;
+
+def record_test_block_nested_text : Bool :=
+  let source : List Nat := str_codes
+    "def value : String := let -- opener\n{ let part : String := \"a}b\"; -- }\n part };" in
+  match record_test_preprocess record_test_registry source with
+  | MkPair _ result =>
+      match result with
+      | PrepErr _ _ => False
+      | PrepOk output => source_bytes_equal source output
+      end
+  end;
+
+def record_test_update_lowering : Bool :=
+  match record_test_preprocess record_test_registry (str_codes
+      "def result : Point := { make_point Z with flag := rhs_flag, x := rhs_x };") with
+  | MkPair _ result =>
+      match result with
+      | PrepErr _ _ => False
+      | PrepOk source =>
+          andb(eqNat(record_test_count (str_codes "make_point Z") source, S Z),
+            andb(eqNat(record_test_count (str_codes "rhs_flag") source, S Z),
+              andb(eqNat(record_test_count (str_codes "rhs_x") source, S Z),
+                record_test_before (str_codes "rhs_flag") (str_codes "rhs_x") source)))
+      end
+  end;
+
+def record_test_imported_updates : Bool :=
+  let owner : List Nat := str_codes "a.ouro" in
+  let aliases : ImpReg := MkImpReg [str_codes "A"]
+    [MkPair (List Nat) (List Nat) (str_codes "A") owner] in
+  let registry : RecReg := MkRecReg 0
+    [ MkRecInfo owner (str_codes "Inner") (str_codes "MkInner")
+        [MkRecField (str_codes "x") (str_codes "Nat")]
+    , MkRecInfo owner (str_codes "Outer") (str_codes "MkOuter")
+        [MkRecField (str_codes "inner") (str_codes "Inner")]
+    ] [] [MkRecBind (str_codes "outer") 1 owner,
+      MkRecBind (str_codes "inner") 0 owner] in
+  let accepted : Bool :=
+    match preprocess_records_reg (str_codes "main.ouro") aliases registry
+        (str_codes "def result : A@Outer := { A@outer with inner := rhs };") with
+    | MkPair _ tagged => match tagged with
+      | MkPair _ result => match result with
+        | PrepErr _ _ => False
+        | PrepOk output => andb
+            (notb (eqNat (record_test_count (str_codes "A@Inner") output) Z))
+            (notb (eqNat (record_test_count (str_codes "A@MkOuter") output) Z))
+        end
+      end
+    end in
+  let rejected : Bool :=
+    match preprocess_records_reg (str_codes "main.ouro") aliases registry
+        (str_codes "def result : A@Inner := { A@inner with x := rhs };") with
+    | MkPair _ tagged => match tagged with
+      | MkPair _ result => match result with
+        | PrepErr code _ => eqNat code rec_code_need_ty
+        | PrepOk _ => False
+        end
+      end
+    end in
+  andb accepted rejected;
+
+def record_test_foreign_field_alias : Bool :=
+  let root : List Nat := str_codes "main.ouro" in
+  let owner : List Nat := str_codes "b.ouro" in
+  let aliases : ImpReg := MkImpReg [str_codes "B", str_codes "C"]
+    [MkPair (List Nat) (List Nat) (str_codes "B") owner,
+     MkPair (List Nat) (List Nat) (str_codes "C") (str_codes "wrong.ouro")] in
+  let registry : RecReg := MkRecReg 0
+    [ MkRecInfo (str_codes "right.ouro") (str_codes "Inner")
+        (str_codes "MkInner") [MkRecField (str_codes "x") (str_codes "Nat")]
+    , MkRecInfo (str_codes "wrong.ouro") (str_codes "Inner")
+        (str_codes "MkInner") [MkRecField (str_codes "x") (str_codes "Nat")]
+    , MkRecInfo owner (str_codes "Outer") (str_codes "MkOuter")
+        [MkRecField (str_codes "inner") (str_codes "C@Inner")]
+    ] [] [MkRecBind (str_codes "outer") 2 owner] in
+  let direct : Bool :=
+    match preprocess_records_reg root aliases registry (str_codes
+        "def result : B@Outer := { B@outer with inner := rhs };") with
+    | MkPair _ tagged => match tagged with
+      | MkPair _ result => match result with
+        | PrepErr code _ => eqNat code rec_code_need_ty
+        | PrepOk _ => False
+        end
+      end
+    end in
+  let nested : Bool :=
+    match preprocess_records_reg root aliases registry (str_codes
+        "def result : B@Outer := { B@outer with inner.x := rhs };") with
+    | MkPair _ tagged => match tagged with
+      | MkPair _ result => match result with
+        | PrepErr code _ => eqNat code rec_code_unknown
+        | PrepOk _ => False
+        end
+      end
+    end in
+  andb direct nested;
+
+def record_test_nested_leaf_owner_valid : Bool :=
+  let root : List Nat := str_codes "main.ouro" in
+  let owner : List Nat := str_codes "b.ouro" in
+  let aliases : ImpReg := MkImpReg [str_codes "B"]
+    [MkPair (List Nat) (List Nat) (str_codes "B") owner] in
+  let registry : RecReg := MkRecReg 0
+    [ MkRecInfo owner (str_codes "Shadow") (str_codes "MkShadow")
+        [MkRecField (str_codes "x") (str_codes "Nat")]
+    , MkRecInfo owner (str_codes "Inner") (str_codes "MkInner")
+        [MkRecField (str_codes "leaf") (str_codes "Shadow")]
+    , MkRecInfo root (str_codes "Outer") (str_codes "MkOuter")
+        [MkRecField (str_codes "inner") (str_codes "B@Inner")]
+    ] [] [MkRecBind (str_codes "outer") 2 root] in
+  match preprocess_records_reg root aliases registry (str_codes
+      "axiom Shadow : Type; def result : Outer := { outer with inner.leaf := rhs };") with
+  | MkPair _ tagged => match tagged with
+    | MkPair _ result => match result with
+      | PrepErr _ _ => False
+      | PrepOk output => andb
+          (notb (eqNat (record_test_count (str_codes "B@Shadow") output) Z))
+          (notb (eqNat (record_test_count (str_codes "B@MkInner") output) Z))
+      end
+    end
+  end;
+
+def record_test_nested_leaf_owner : Bool :=
+  let root : List Nat := str_codes "main.ouro" in
+  let owner : List Nat := str_codes "b.ouro" in
+  let aliases : ImpReg := MkImpReg [str_codes "B"]
+    [MkPair (List Nat) (List Nat) (str_codes "B") owner] in
+  let registry : RecReg := MkRecReg 0
+    [ MkRecInfo root (str_codes "Shadow") (str_codes "MkShadow")
+        [MkRecField (str_codes "x") (str_codes "Nat")]
+    , MkRecInfo owner (str_codes "Inner") (str_codes "MkInner")
+        [MkRecField (str_codes "leaf") (str_codes "Shadow")]
+    , MkRecInfo root (str_codes "Outer") (str_codes "MkOuter")
+        [MkRecField (str_codes "inner") (str_codes "B@Inner")]
+    ] [] [MkRecBind (str_codes "outer") 2 root] in
+  match preprocess_records_reg root aliases registry (str_codes
+      "def result : Outer := { outer with inner.leaf := rhs };") with
+  | MkPair _ tagged => match tagged with
+    | MkPair _ result => match result with
+      | PrepErr code _ => eqNat code rec_code_need_ty
+      | PrepOk _ => False
+      end
+    end
+  end;
 
 def record_test_scanners : List Test :=
     [ assert_eq "whitespace scanner accepts empty source"
@@ -36,21 +332,152 @@ def record_test_scanners : List Test :=
     , assert_eq "word delimiter ignores nesting, comments and escaped quotes"
         (record_test_split (take_until_word w_end
           (str_codes "(end) -- end\n\"end\\\" still\" end;")))
-        "(end) -\n\" |end;"
+        "(end) -- end\n\"end\\\" still\" |end;"
+    , assert_eq "word delimiter requires a keyword boundary on both sides"
+        (record_test_split (take_until_word w_with
+          (str_codes "somewith with x")))
+        "somewith |with x"
+    , assert_true "record update keyword requires a boundary on both sides"
+        (andb(notb (top_has_with (str_codes "somewith, x := Z")),
+          top_has_with (str_codes "point with x := Z")))
     , assert_eq "character delimiter ignores nesting, comments and strings"
         (record_test_split (take_until_char ch_semi_p
           (str_codes "(;) -- ;\n\";\" ;tail")))
-        "(;) -\n\" |;tail"
+        "(;) -- ;\n\";\" |;tail"
     , assert_eq "assignment delimiter ignores nested and quoted assignments"
         (record_test_split (take_until_coloneq
           (str_codes "(a := b) -- :=\n\":=\" := tail")))
-        "(a := b) -\n\" |:= tail"
+        "(a := b) -- :=\n\":=\" |:= tail"
+    , assert_eq "assignment delimiter ignores raw punctuation"
+        (record_test_split (take_until_coloneq
+          (str_codes "r#\"x := y\"# := tail")))
+        "r#\"x := y\"# |:= tail"
+    , assert_eq "update value scan ignores raw nested paths and commas"
+        (record_test_split (take_until_comma_or_end
+          (str_codes "r#\"address.city := Z, address.zip := Z\"#, next")))
+        "r#\"address.city := Z, address.zip := Z\"#|, next"
     , assert_eq "assignment scan keeps a final single byte"
         (record_test_split (take_until_coloneq (str_codes ":"))) ":|"
     , assert_eq "absent word delimiter returns the complete ordinary prefix"
         (record_test_split (take_until_word(w_end, str_codes "x"))) "x|"
     , assert_eq "brace scan ignores quoted and commented closing braces"
-        (record_test_brace "{a {b} -- }\n\"}\" c}tail") "{a {b} -\n\" c}|tail"
+        (record_test_brace "{a {b} -- }\n\"}\" c}tail") "{a {b} -- }\n\"}\" c}|tail"
+    , assert_true "record sort and field type retain comment line terminators"
+        record_test_comment_metadata
+    , assert_eq "function-valued field stays one constructor argument"
+        (str_of_codes (reverse Nat
+          (emit_fields_ty [] [MkRecField(str_codes "run", str_codes "Nat -> Nat")])))
+        "(Nat -> Nat)"
+    , assert_true "record prepass preserves a pure let block with trivia"
+        record_test_block_passthrough
+    , assert_true "record candidate scan skips a pure let block"
+        (notb (records_maybe_needed (str_codes
+          "let { let count : Nat := Z; count }")))
+    , assert_true "record update binds base once and RHS in source order"
+        record_test_update_lowering
+    , assert_true "imported update carries record type or rejects unowned field type"
+        record_test_imported_updates
+    , assert_true "foreign field alias is not rebound in the caller"
+        record_test_foreign_field_alias
+    , assert_true "nested update retains the leaf record owner"
+        record_test_nested_leaf_owner
+    , assert_true "nested update uses the foreign leaf record type"
+        record_test_nested_leaf_owner_valid
+    , assert_true "nested update binds sibling RHS once in source order"
+        record_test_nested_lowering
+    , assert_true "nested update rejects parent then child"
+        (record_test_nested_overlap "address := home, address.city := Z")
+    , assert_true "nested update rejects child then parent"
+        (record_test_nested_overlap "address.city := Z, address := home")
+    , assert_eq "local delimiter skips nested let-in before the outer in"
+        (match take_local_boundary (str_codes
+            "let inner : Address := home in inner in item.city") with
+         | RecLocalBoundaryNone => "<none>"
+         | RecLocalBoundaryAt value separator body =>
+             str_cat3(str_of_codes value, "|", str_of_codes
+               (append Nat separator body))
+         end)
+        "let inner : Address := home in inner |in item.city"
+    , assert_eq "local delimiter skips expression-level open alias in"
+        (match take_local_boundary (str_codes "open A in value in body") with
+         | RecLocalBoundaryNone => "<none>"
+         | RecLocalBoundaryAt value separator body =>
+             str_cat3(str_of_codes value, "|", str_of_codes
+               (append Nat separator body))
+         end)
+        "open A in value |in body"
+    , assert_eq "local delimiter skips fallible do and nested match ends"
+        (match take_local_boundary (str_codes
+            "let? (Bad, Good) : Result do let x : Nat := Z; match x with | Z => Z end; x end in body") with
+         | RecLocalBoundaryNone => "<none>"
+         | RecLocalBoundaryAt value separator body =>
+             str_cat3(str_of_codes value, "|", str_of_codes
+               (append Nat separator body))
+         end)
+        "let? (Bad, Good) : Result do let x : Nat := Z; match x with | Z => Z end; x end |in body"
+    , assert_eq "local delimiter skips a handler end before outer in"
+        (match take_local_boundary (str_codes
+            "handle action with | Choice => Z end in body") with
+         | RecLocalBoundaryNone => "<none>"
+         | RecLocalBoundaryAt value separator body =>
+             str_cat3(str_of_codes value, "|", str_of_codes
+               (append Nat separator body))
+         end)
+        "handle action with | Choice => Z end |in body"
+    , assert_eq "local delimiter skips a nested fallible block"
+        (match take_local_boundary (str_codes
+            "let? (Bad, Good) : Result do let? (Bad, Good) : Result do Z end; Z end in body") with
+         | RecLocalBoundaryNone => "<none>"
+         | RecLocalBoundaryAt value separator body =>
+             str_cat3(str_of_codes value, "|", str_of_codes
+               (append Nat separator body))
+         end)
+        "let? (Bad, Good) : Result do let? (Bad, Good) : Result do Z end; Z end |in body"
+    , assert_true "block prepass crosses an ordinary local before record local"
+        record_test_block_local_context
+    , assert_true "parenthesized local scope does not hide an outer record"
+        record_test_group_scope
+    , assert_true "typed local shadow selects the inner nominal accessor"
+        record_test_local_shadow
+    , assert_true "nominal metadata ignores a trailing type comment"
+        (match record_test_type_to_rec record_test_nested_registry (str_codes "Address -- type\n") with
+         | Nothing => False
+         | Just index => eqNat index Z
+         end)
+    , assert_true "compound type is not a nominal record"
+        (match record_test_type_to_rec record_test_nested_registry (str_codes "Address -> Address") with
+         | Nothing => True
+         | Just _ => False
+         end)
+    , assert_true "grouped nominal type resolves through nested parentheses"
+        (match record_test_type_to_rec record_test_registry (str_codes "((Point))") with
+         | Nothing => False
+         | Just index => eqNat index Z
+         end)
+    , assert_true "grouped nominal type accepts comments and whitespace"
+        (match record_test_type_to_rec record_test_registry
+            (str_codes " ( -- before\n ( Point -- inside\n ) ) -- after\n") with
+         | Nothing => False
+         | Just index => eqNat index Z
+         end)
+    , assert_true "grouped type rejects tokens after the closing parenthesis"
+        (match record_test_type_to_rec record_test_registry (str_codes "(Point) Other") with
+         | Nothing => True
+         | Just _ => False
+         end)
+    , assert_true "grouped type rejects compound inner expressions"
+        (match record_test_type_to_rec record_test_registry (str_codes "(Point -> Point)") with
+         | Nothing => True
+         | Just _ => False
+         end)
+    , assert_eq "record value scan keeps comment newline before comma"
+        (record_test_split (take_until_comma_or_end (str_codes " Z -- kept\n, y")))
+        " Z -- kept\n|, y"
+    , assert_eq "record value scan keeps comment newline before closing brace"
+        (record_test_split (take_until_comma_or_end (str_codes " Z -- kept\n}")))
+        " Z -- kept\n|}"
+    , assert_eq "brace scan ignores raw closing braces"
+        (record_test_brace "{r#\"}\"# x}tail") "{r#\"}\"# x}|tail"
     , assert_eq "unmatched opening brace is rejected"
         (record_test_brace "{x") "<none>"
     , assert_eq "unmatched closing brace is rejected"
@@ -61,6 +488,18 @@ def record_test_scanners : List Test :=
         (top_has_assign (str_codes "(x := y) \"a := b\" -- :=\n x := y"))
     , assert_true "nested and hidden assignments do not count"
         (notb (top_has_assign (str_codes "(x := y) \"a := b\" -- :=")))
+    , assert_true "pure punned field list is detected"
+        (top_starts_pun (str_codes " x, -- comment\n y "))
+    , assert_true "single punned field is detected"
+        (top_starts_pun (str_codes " x -- comment"))
+    , assert_true "assignment is not mistaken for punning"
+        (notb (top_starts_pun (str_codes "x := value")))
+    , assert_true "nested field list is not a top-level pun"
+        (notb (top_starts_pun (str_codes "(x, y)")))
+    , assert_true "raw assignments do not count"
+        (notb (top_has_assign (str_codes "r#\"x := y\"#")))
+    , assert_true "raw update words do not count"
+        (notb (top_has_with (str_codes "r#\"point with x := Z\"#")))
     , assert_true "top-level with is found after ignored regions"
         (top_has_with (str_codes "(with) \"with\" -- with\n with x"))
     , assert_true "nested, hidden and longer with spellings do not count"
@@ -78,14 +517,26 @@ def record_test_scanners : List Test :=
         (records_maybe_needed (str_codes "point.x"))
     , assert_true "record detection accepts field assignments"
         (records_maybe_needed (str_codes "{x := 1}"))
+    , assert_true "record detection accepts punned fields"
+        (records_maybe_needed (str_codes "{x, y}"))
     , assert_true "record detection accepts an update"
         (records_maybe_needed (str_codes "{point with x := 1}"))
+    , assert_true "record candidate scan finds a literal inside a let block"
+        (records_maybe_needed (str_codes
+          "let { let point : Point := {x := Z}; point }"))
+    , assert_true "record candidate scan resumes after a let block"
+        (records_maybe_needed (str_codes "let { Z } point.x"))
+    , assert_true "record prepass preserves nested string and comment braces"
+        record_test_block_nested_text
     , assert_true "record detection resumes after an ordinary brace body"
         (records_maybe_needed (str_codes "{plain} point.x"))
     , assert_true "empty and nested ordinary braces do not require records"
         (notb (records_maybe_needed (str_codes "{} {(x := y)}")))
     , assert_true "record detection excludes comments and quoted punctuation"
         (notb (records_maybe_needed (str_codes "\"record . {x := 1}\" -- point.x")))
+    , assert_true "record detection excludes raw multiline punctuation"
+        (notb (records_maybe_needed
+          (str_codes "r#\"record . {x := 1}\npoint.x\"#")))
     , assert_true "unterminated ordinary brace does not invent a record"
         (notb (records_maybe_needed (str_codes "{plain")))
     , assert_eq "declaration names preserve order and skip hidden declarations"
@@ -95,6 +546,43 @@ def record_test_scanners : List Test :=
         "a,b,R,E,I"
     , assert_eq "empty declaration source has no names"
         (str_join(",", map(List Nat, String, str_of_codes, collect_decl_names []))) ""
+    , assert_true "qualified and hidden accessor spellings are not bare binders"
+        (notb (name_in (str_codes "Point_x")
+          (record_bare_atoms
+            (str_codes "A@Point_x -- Point_x\n\"Point_x\""))))
+    , assert_true "raw accessor and constructor spellings are not bare binders"
+        (andb (notb (name_in (str_codes "Point_x")
+            (record_bare_atoms (str_codes "r#\"Point_x MkPoint\"#"))))
+          (notb (name_in (str_codes "MkPoint")
+            (record_bare_atoms (str_codes "r#\"Point_x MkPoint\"#")))))
+    , assert_true "a source binder can capture a bare generated accessor"
+        (name_in (str_codes "Point_x")
+          (record_bare_atoms (str_codes "fun (Point_x : Type) => Point_x")))
+    , assert_true "record declaration is not a constructor-name collision"
+        (notb (name_in (str_codes "BuildPoint")
+          (record_bare_atoms (str_codes
+            "record Point : Type where constructor BuildPoint; x : Nat; end; def made : Point := {x := Z};"))))
+    , assert_eq "record owner binding uses a relative path once"
+        (str_of_codes (record_relative_path
+          (str_codes "app/main.ouro") (str_codes "lib/point.ouro")))
+        "../lib/point.ouro"
+    , assert_true "internal record alias avoids a source identifier"
+        (match record_fresh_alias 0
+            (record_bare_atoms (str_codes "def _ouro_r_0_0 : Type := Type;"))
+            (MkImpReg [] []) with
+         | Nothing => False
+         | Just alias => source_bytes_equal alias (str_codes "_ouro_r_0_1")
+         end)
+    , assert_true "internal alias discovery requires an exact code atom"
+        (andb (record_marker_present (str_codes "_ouro_r_0_0")
+            (str_codes "_ouro_r_0_0@Point_x"))
+          (notb (record_marker_present (str_codes "_ouro_r_0_0")
+            (str_codes "prefix_ouro_r_0_0@Point_x -- _ouro_r_0_0@Point_x\n\"_ouro_r_0_0@Point_x\""))))
+    , assert_true "raw aliases and temporary names do not claim authority"
+        (andb (notb (record_marker_present (str_codes "_ouro_r_0_0")
+            (str_codes "r#\"_ouro_r_0_0@Point_x\"#")))
+          (notb (source_ident_used (str_codes "_ouro_update_0")
+            (str_codes "r#\"_ouro_update_0\"#"))))
     ];
 
 def record_test_emission : List Test :=
@@ -109,12 +597,12 @@ def record_test_emission : List Test :=
         " x flag"
     , assert_eq "record emission produces constructor and typed accessors"
         (str_of_codes (reverse Nat (emit_record []
-          (MkRecInfo(0, str_codes "Point", str_codes "MkPoint", record_test_fields))
+          (MkRecInfo([], str_codes "Point", str_codes "MkPoint", record_test_fields))
           (str_codes "Type"))))
         "\ninductive Point : Type :=\n  |  MkPoint : Nat -> Bool -> Point;\ndef Point_x (p : Point) : Nat := match p with | MkPoint x flag => x end;\ndef Point_flag (p : Point) : Bool := match p with | MkPoint x flag => flag end;\n"
     , assert_eq "empty record emits a nullary constructor"
         (str_of_codes (reverse Nat (emit_record []
-          (MkRecInfo(0, str_codes "Empty", str_codes "MkEmpty", []))
+          (MkRecInfo([], str_codes "Empty", str_codes "MkEmpty", []))
           (str_codes "Type"))))
         "\ninductive Empty : Type :=\n  |  MkEmpty : Empty;\n"
     ];

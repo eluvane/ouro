@@ -36,7 +36,12 @@ def compact_source(source: bytes) -> bytes:
         pending = b""
         start = index
         index += 1
-        if byte == 34:
+        if source.startswith(b'r#"', start):
+            close = source.find(b'"#', start + 3)
+            if close < 0:
+                raise ValueError(f"COMPACT_SOURCE: unterminated raw string at byte {start}")
+            index = close + 2
+        elif byte == 34:
             while index < len(source) and source[index] != 34:
                 index += 2 if source[index] == 92 else 1
             if index >= len(source):

@@ -24,7 +24,8 @@ EXPRS = {
     "EBinder": ["Nat", "Expr", "Expr"], "ENoBinder": [],
     "EMultiMatch": ["List Expr", "List (Pair (List (Pair Nat (List Nat))) Expr)"],
     "EStr": ["Nat"], "EDoBind": ["Nat", "Expr"], "EList": ["List Expr"],
-    "ESpan": ["Nat", "Nat", "Expr"],
+    "ESpan": ["Nat", "Nat", "Expr"], "EOpen": ["Nat", "Expr"],
+    "EFallible": ["Expr", "Nat", "Nat", "Expr"],
 }
 
 
@@ -111,6 +112,7 @@ def rows(seed):
         (["TLparen", "TNat 1", "TRparen"], "ENat(1)"),
         (["TKeyword kwFun", f"TIdent {n}", "TFatArrow", f"TIdent {n}"], f"ELam({n},none,EVar({n}))"),
         (["TKeyword kwLet", f"TIdent {n}", "TColonEq", "TNat 2", "TKeyword kwIn", f"TIdent {n}"], f"ELet({n},none,ENat(2),EVar({n}))"),
+        (["TKeyword kwOpen", f"TIdent {n}", "TKeyword kwIn", f"TIdent {n}"], f"EOpen({n},EVar({n}))"),
         (["TBracketL", "TNat 1", "TComma", "TNat 2", "TBracketR"], "EList([ENat(1), ENat(2)])"),
     ]
     for body, expected in cases:
@@ -121,11 +123,24 @@ def rows(seed):
         observations.append((f"observe_parse (parse 300 MExpr {token_list} {n} (VNat 0))", f"error:{n + len(body)}"))
     observations.append((f"observe_expr 40 (ESpan {n} {n + 3} (ESpan {n + 1} {n + 2} (ENat {n})))",
                          f"ESpan({n},{n + 3},ESpan({n + 1},{n + 2},ENat({n})))"))
+    # The public source fuel also bounds lexing. Exercise the resolver's own
+    # exhaustion branch directly and map its result through the public error.
+    observations.append((
+        'match module_rewrite_decls 0 [] [] [] [] [] [] with '
+        '| RErr code detail => match import_err Nat code detail with '
+        '| CErr error => match error with | ErrCode mapped at => '
+        'str_concat (show_nat mapped) (str_concat "/" (show_nat at)) end '
+        '| COk _ => "accepted" end | ROk _ => "accepted" end',
+        "97/0"))
+    observations.append((f"observe_expr 40 (EFallible (EVar {n}) {n + 1} {n + 2} (ENat {n}))",
+                         f"EFallible(EVar({n}),{n + 1},{n + 2},ENat({n}))"))
     return observations
 
 
 def run_checks(run, directory, saved=None):
     run_expressions(run, directory, "parser_contract", rows(run.seed),
-                    ("compiler/parser_parse.ouro",), "parser-contract",
+                    ("compiler/parser_parse.ouro", "compiler/pipeline.ouro"), "parser-contract",
                     saved=saved, definitions=definitions())
     run.count("features", "parser:abi-and-grammar")
+    if saved is None or "module_rewrite_decls 0" in saved.get("source", ""):
+        run.count("features", "module-resolution-fuel")

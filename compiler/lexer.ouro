@@ -84,6 +84,7 @@ def kw_chars_intrinsic : List Nat := n9 105 110 116 114 105 110 115 105 99;
 def kw_chars_extern : List Nat := n6 101 120 116 101 114 110;
 def kw_chars_representation : List Nat :=
   ([114, 101, 112, 114, 101, 115, 101, 110, 116, 97, 116, 105, 111, 110] : List Nat);
+def kw_chars_open : List Nat := n4 111 112 101 110;
 def kw_chars_uscore : List Nat := n1 95;
 
 def kp (cs : List Nat) (k : Nat) (tl : List (Pair (List Nat) Nat)) : List (Pair (List Nat) Nat) :=
@@ -240,6 +241,95 @@ def take_ident : Nat -> List Nat -> List Nat -> Pair (List Nat) (List Nat) :=
         end
     end;
 
+-- A number must consume the whole identifier-shaped word. Otherwise 0xG or
+-- 12abc could be accepted as a shorter Nat followed by a separate identifier.
+def number_digit (base : Nat) (c : Nat) : Maybe Nat :=
+    let value : Maybe Nat :=
+      match source_is_digit c with
+      | True => Just Nat (sub c ch_zero)
+      | False =>
+          match andb(compiler_le_nat 65 c, compiler_le_nat c 70) with
+          | True => Just Nat (add(sub c 65, 10))
+          | False =>
+              match andb(compiler_le_nat 97 c, compiler_le_nat c 102) with
+              | True => Just Nat (add(sub c 97, 10))
+              | False => Nothing Nat
+              end
+          end
+      end in
+    match value with
+    | Nothing => Nothing Nat
+    | Just digit =>
+        match compiler_lt_nat digit base with
+        | True => Just Nat digit
+        | False => Nothing Nat
+        end
+    end;
+
+def number_digits : List Nat -> Nat -> Nat -> Bool -> Maybe Nat :=
+  fix number_digits (chars : List Nat) (base : Nat) (acc : Nat) (after_digit : Bool)
+      : Maybe Nat :=
+    match chars with
+    | Nil =>
+        match after_digit with
+        | True => Just Nat acc
+        | False => Nothing Nat
+        end
+    | Cons c rest =>
+        match eqNat c ch_under with
+        | True =>
+            match after_digit with
+            | True => number_digits rest base acc False
+            | False => Nothing Nat
+            end
+        | False =>
+            match number_digit base c with
+            | Nothing => Nothing Nat
+            | Just digit => number_digits rest base (add(mul acc base, digit)) True
+            end
+        end
+    end;
+
+def parse_number (chars : List Nat) : Maybe Nat :=
+    match chars with
+    | Nil => Nothing Nat
+    | Cons first rest =>
+        match eqNat first ch_zero with
+        | False => number_digits chars 10 Z False
+        | True =>
+            match rest with
+            | Nil => Just Nat Z
+            | Cons marker digits =>
+                match orb(eqNat marker 120, eqNat marker 88) with
+                | True => number_digits digits 16 Z False
+                | False =>
+                    match orb(eqNat marker 98, eqNat marker 66) with
+                    | True => number_digits digits 2 Z False
+                    | False => number_digits chars 10 Z False
+                    end
+                end
+            end
+        end
+    end;
+
+-- The checked-source import prepass is the only producer of `alias@member`.
+-- Raw lexer entry points keep the ordinary identifier grammar.
+def take_import_ident : Nat -> List Nat -> List Nat -> Pair (List Nat) (List Nat) :=
+  fix go (fuel : Nat) (src : List Nat) (acc : List Nat)
+    : Pair (List Nat) (List Nat) :=
+    match fuel with
+    | Z => MkPair(List Nat, List Nat, reverse Nat acc, src)
+    | S remaining =>
+        match src with
+        | Nil => MkPair(List Nat, List Nat, reverse Nat acc, Nil Nat)
+        | Cons c rest =>
+            match orb(source_is_ident_char c, eqNat c 64) with
+            | True => go remaining rest (Cons Nat c acc)
+            | False => MkPair(List Nat, List Nat, reverse Nat acc, src)
+            end
+        end
+    end;
+
 def take_digits : Nat -> List Nat -> List Nat -> Pair (List Nat) (List Nat) :=
   fix take_digits (fuel : Nat) (src : List Nat) (acc : List Nat)
     : Pair (List Nat) (List Nat) :=
@@ -297,9 +387,31 @@ def take_string : Nat -> List Nat -> List Nat -> StrLex :=
                                             take_string fuel' rest2
                                               (Cons Nat ch_bs acc)
                                         | False =>
-                                            -- keep \ + char (Windows paths)
-                                            take_string fuel' rest2
-                                              (Cons Nat e (Cons Nat ch_bs acc))
+                                            match eqNat e 117 with
+                                            | True =>
+                                                match rest2 with
+                                                | Cons brace _ =>
+                                                    match eqNat brace 123 with
+                                                    | True =>
+                                                        match source_unicode_braced rest2 with
+                                                        | Nothing => StrErr
+                                                        | Just parsed => match parsed with
+                                                          | MkPair bytes after =>
+                                                              take_string fuel' after
+                                                                (append Nat (reverse Nat bytes) acc)
+                                                          end
+                                                        end
+                                                    | False => take_string fuel' rest2
+                                                        (Cons Nat e (Cons Nat ch_bs acc))
+                                                    end
+                                                | Nil => take_string fuel' rest2
+                                                    (Cons Nat e (Cons Nat ch_bs acc))
+                                                end
+                                            | False =>
+                                                -- keep \ + char (Windows paths)
+                                                take_string fuel' rest2
+                                                  (Cons Nat e (Cons Nat ch_bs acc))
+                                            end
                                         end
                                     end
                                 end
@@ -375,10 +487,10 @@ def tok_simple2 (c : Nat) (rest : List Nat) (st : InternState) : Maybe Step :=
 
 def tok_hole (fuel' : Nat) (rest : List Nat) (st : InternState) : Step :=
     match rest with
-    | Nil => StepTok(THole (Nothing Nat), Nil Nat, st)
+    | Nil => StepTok(THole (Just Nat Z), Nil Nat, st)
     | Cons c2 rest2 =>
         match source_is_ident_start c2 with
-        | False => StepTok (THole (Nothing Nat)) rest st
+        | False => StepTok (THole (Just Nat Z)) rest st
         | True =>
             match take_ident(fuel', Cons Nat c2 rest2, Nil Nat) with
             | MkPair name src' =>
@@ -449,8 +561,16 @@ def tok_arrowish (c : Nat) (rest : List Nat) (st : InternState) : Step :=
 def tok_nat_or_ident (fuel' : Nat) (c : Nat) (rest : List Nat) (st : InternState) : Step :=
     match source_is_digit c with
     | True =>
-        match take_digits(fuel', Cons Nat c rest, Nil Nat) with
-        | MkPair digs src' => StepTok (TNat (parse_nat_ltr digs)) src' st
+        match take_ident(fuel', Cons Nat c rest, Nil Nat) with
+        | MkPair chars src' =>
+            match source_word_end src' with
+            | False => LexStepErr st
+            | True =>
+                match parse_number chars with
+                | Nothing => LexStepErr st
+                | Just value => StepTok (TNat value) src' st
+                end
+            end
         end
     | False =>
         match source_is_ident_start c with
@@ -473,6 +593,26 @@ def tok_nat_or_ident (fuel' : Nat) (c : Nat) (rest : List Nat) (st : InternState
         end
     end;
 
+def tok_import_ident (fuel' : Nat) (c : Nat) (rest : List Nat)
+    (st : InternState) : Step :=
+  match take_import_ident(fuel', Cons Nat c rest, Nil Nat) with
+  | MkPair name src' =>
+      match source_bytes_equal name kw_chars_open with
+      | True => StepTok (TKeyword kwOpen) src' st
+      | False => match classify_ident name with
+      | Just tok => StepTok tok src' st
+      | Nothing =>
+          match try_type_token name with
+          | Just tok => StepTok tok src' st
+          | Nothing =>
+              match intern_ident st name with
+              | MkPair id st' => StepTok (TIdent id) src' st'
+              end
+          end
+      end
+      end
+  end;
+
 def next_token_char (fuel' : Nat) (c : Nat) (rest : List Nat) (st : InternState) : Step :=
     match tok_simple1 c rest st with
     | Just s => s
@@ -486,6 +626,18 @@ def next_token_char (fuel' : Nat) (c : Nat) (rest : List Nat) (st : InternState)
                 match eqNat c ch_dq with
                 | True => tok_string fuel' rest st
                 | False =>
+                    match source_is_raw_start (Cons Nat c rest) with
+                    | True =>
+                        match source_take_raw_bounded (S fuel') (Cons Nat c rest) with
+                        | Nothing => LexStepErr st
+                        | Just parsed => match parsed with
+                          | MkPair content tail =>
+                              match intern_string st content with
+                                | MkPair id st' => StepTok (TString id) tail st'
+                                end
+                          end
+                        end
+                    | False =>
                     match eqNat c ch_colon with
                     | True => tok_colon rest st
                     | False =>
@@ -493,6 +645,7 @@ def next_token_char (fuel' : Nat) (c : Nat) (rest : List Nat) (st : InternState)
                         | True => tok_arrowish c rest st
                         | False => tok_nat_or_ident fuel' c rest st
                         end
+                    end
                     end
                 end
             end
@@ -508,6 +661,20 @@ def next_token (fuel : Nat) (src0 : List Nat) (st : InternState) : Step :=
         | Cons c rest => next_token_char fuel' c rest st
         end
     end;
+
+def next_import_token (fuel : Nat) (src0 : List Nat) (st : InternState) : Step :=
+  match fuel with
+  | Z => LexStepErr st
+  | S remaining =>
+      match skip_ws remaining src0 with
+      | Nil => StepEof st
+      | Cons c rest =>
+          match source_is_ident_start c with
+          | True => tok_import_ident remaining c rest st
+          | False => next_token_char remaining c rest st
+          end
+      end
+  end;
 
 -- The native host may reclaim one token step's lookup temporaries. Token
 -- semantics and this fuel/accumulator traversal stay in the canonical lexer.
@@ -536,8 +703,14 @@ def lex_go_with
 def lex_go : Nat -> List Nat -> InternState -> List Token -> LexResult :=
     lex_go_with next_token;
 
+def lex_go_import : Nat -> List Nat -> InternState -> List Token -> LexResult :=
+    lex_go_with next_import_token;
+
 def lex_all (fuel : Nat) (src : List Nat) : LexResult :=
     lex_go fuel src empty_intern (Nil Token);
+
+def lex_all_import (fuel : Nat) (src : List Nat) : LexResult :=
+    lex_go_import fuel src empty_intern (Nil Token);
 
 
 def unit_intern_ids (st : InternState) : List (Pair (List Nat) Nat) :=

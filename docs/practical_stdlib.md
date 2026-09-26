@@ -9,7 +9,7 @@ Choose a module by task; the generated [API reference](api/README.md) owns decla
 | Task | Modules |
 | --- | --- |
 | Shared types and results | `std/types.ouro`, `std/prelude.ouro`, `std/data.ouro`, `std/result.ouro` |
-| Text and numbers | `std/string.ouro`, `std/text.ouro`, `std/collections.ouro`, `std/num.ouro` |
+| Text and numbers | `std/string.ouro`, `std/text.ouro`, `std/collections.ouro`, `std/num.ouro`, `std/utf8_scalar.ouro` |
 | CLI and configuration | `std/args.ouro`, `std/cli.ouro`, `std/config.ouro`, `std/configx.ouro` |
 | Files and workspace | `std/fs.ouro`, `std/fsx.ouro`, `std/fs_walk.ouro`, `std/fs_replace.ouro`, `std/workspace.ouro` |
 | Data | `std/lines.ouro`, `std/json.ouro`, `std/jsonx.ouro`, `std/csv.ouro`, `std/table.ouro`, `std/tablex.ouro` |
@@ -20,6 +20,25 @@ Choose a module by task; the generated [API reference](api/README.md) owns decla
 without importing platform IO; `std/executable.ouro` supplies the current
 image-path query. The pre-1.0 collection names and removed `_go` helpers are
 recorded in the [changelog](../CHANGELOG.md).
+
+`std/utf8_scalar.ouro` provides `utf8_scalar_checked` for a scalar-to-UTF-8
+conversion that rejects surrogates and out-of-range values. Its
+`utf8_scalar_bytes` encoder requires an already validated scalar.
+
+## Fallible values
+
+`std/result.ouro` treats `Either E A` as a result: `Left` carries the error
+and `Right` carries the value. `result_unwrap_or_else E A fallback value`
+returns the value on `Right`; on `Left` it calls `fallback : E -> A` with the
+original error. The fallback is called only for `Left`. Use `result_bind` to
+continue with another fallible operation and `result_map_err` to change an
+error type while retaining the result.
+
+`std/collections.ouro` provides `list_traverse_maybe A B f xs` for an ordered
+list of fallible conversions. It returns `Just []` for an empty list, `Just`
+with all converted values when every call succeeds, or `Nothing` at the first
+failure. `list_traverse_result` preserves a typed error; `filter_map` drops
+missing values when that is the intended behavior.
 
 ## CLI arguments
 

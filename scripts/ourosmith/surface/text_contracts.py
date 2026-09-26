@@ -55,6 +55,7 @@ def echo{seed} : IO Unit :=
 
 def {name} : Nat := Z |> S |> S;
 def items{seed} : List Nat := [Z, S Z];
+def checked{seed} : Maybe Nat := let? (Nothing, Just) : Maybe Nat do let x : Nat := source?; S x end;
 def echo{seed} : IO Unit :=
   do let! n := readNat;
      writeNat (n |> S)
