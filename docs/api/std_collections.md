@@ -2,7 +2,7 @@
 
 Practical collection helpers layered over the small prelude/listx core.
 
-Declarations: 19.
+Declarations: 25.
 
 ## def nth_maybe
 
@@ -52,6 +52,28 @@ def split_at (A : Type) (n : Nat) (xs : List A) : Pair (List A) (List A)
 def chunks_of (A : Type) (n : Nat) (xs : List A) : List (List A)
 ```
 
+## def list_windows
+
+```
+def list_windows (A : Type) (width : Nat) (xs : List A) : List (List A)
+```
+
+Complete overlapping windows; width zero has no windows.
+
+## def list_scan
+
+```
+def list_scan (A : Type) (S : Type) (step : S -> A -> S)
+```
+
+The initial state is the first result, even for an empty input.
+
+## def list_map_accum
+
+```
+def list_map_accum (A : Type) (S : Type) (B : Type)
+```
+
 ## def list_eq
 
 ```
@@ -94,6 +116,14 @@ def adjacent_pairs (A : Type) : List A -> List (Pair A A)
 def dedup_adjacent (A : Type) (eq : A -> A -> Bool) : List A -> List A
 ```
 
+## def list_group_by
+
+```
+def list_group_by (A : Type) (K : Type) (eq : K -> K -> Bool)
+```
+
+Keys and elements retain first-seen order; eq must identify equivalent keys.
+
 ## def partition_map
 
 ```
@@ -110,6 +140,18 @@ def list_collect_results (E : Type) (A : Type)
 
 ```
 def list_traverse_result (E : Type) (A : Type) (B : Type)
+```
+
+## def list_try_fold_result
+
+```
+def list_try_fold_result (E : Type) (A : Type) (S : Type)
+```
+
+## def list_try_fold_maybe
+
+```
+def list_try_fold_maybe (A : Type) (S : Type)
 ```
 
 ## def list_traverse_maybe
