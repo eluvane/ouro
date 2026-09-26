@@ -2,7 +2,7 @@
 
 Practical collection helpers layered over the small prelude/listx core.
 
-Declarations: 18.
+Declarations: 19.
 
 ## def nth_maybe
 
@@ -110,4 +110,10 @@ def list_collect_results (E : Type) (A : Type)
 
 ```
 def list_traverse_result (E : Type) (A : Type) (B : Type)
+```
+
+## def list_traverse_maybe
+
+```
+def list_traverse_maybe (A : Type) (B : Type) (f : A -> Maybe B) : List A -> Maybe (List B)
 ```

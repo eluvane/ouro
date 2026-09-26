@@ -6,6 +6,8 @@ Development changes; see the [compatibility policy](docs/stability.md).
 
 ### Added
 
+- Lazy error-aware fallback for `Either` and ordered `Maybe` list traversal in
+  the practical standard library.
 - Review-only Clippy proofs for Result/Maybe error flow, collection and string
   composition, List producer/consumer laws, arithmetic, literal bounds, Boolean
   identities, and normalization. Rule contracts and exclusions live in the
