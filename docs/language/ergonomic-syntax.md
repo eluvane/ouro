@@ -245,6 +245,11 @@ def value : Box Nat := MkBox Z;
 def explicit : Box Nat := MkBox Nat Z;
 ```
 
+The standard `Maybe` family uses this marker. After importing `std/types.ouro`,
+`Just Z` can infer `A = Nat` from the payload, and `Nothing` can omit `A` only
+when the expected result is a known `Maybe A`. Explicit `Just Nat Z` and
+`Nothing Nat` remain valid.
+
 The `{A : Type}` group is an opt-in declaration marker. It binds `A` just
 like an ordinary parameter and is retained as metadata through parsing and
 constructor lookup. Several leading groups may be marked; later ordinary

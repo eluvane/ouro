@@ -203,6 +203,11 @@ def explicit : Nat := identity Nat Z;
 Only exact saturated source calls use bounded value and expected type hints;
 explicit calls remain valid. See [Marked definition parameters](language/ergonomic-syntax.md#marked-definition-parameters).
 
+`Maybe` marks its type parameter for the same bounded constructor inference:
+`Just Z` infers `Nat` from its payload, while `Nothing` needs an expected
+`Maybe A` type. Explicit calls such as `Just Nat Z` remain valid. See
+[Marked constructor parameters](language/ergonomic-syntax.md#marked-constructor-parameters).
+
 Matches are constructor-based. The current implementation does not provide the
 full pattern language of a mature functional language; advanced patterns,
 or-patterns, and general wildcard exhaustiveness are outside the maintained

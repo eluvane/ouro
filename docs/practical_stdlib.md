@@ -44,6 +44,18 @@ and `list_try_fold_maybe A S step initial xs` likewise stop at the first failure
 an empty list returns `Right initial` or `Just initial`. `filter_map` drops
 missing values when that is the intended behavior.
 
+The standard `Maybe` constructors accept a short form when their type is known:
+
+```ouro
+import "../std/types.ouro";
+
+def present : Maybe Nat := Just Z;
+def absent : Maybe Nat := Nothing;
+def explicit : Maybe Nat := Just Nat Z;
+```
+
+`Nothing` without an expected `Maybe A` type still requires its type argument.
+
 ## CLI arguments
 
 Use `cli_from_argv` when a native program reads `argv`, and pass the option names that should behave as boolean flags.

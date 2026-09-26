@@ -6,6 +6,9 @@ Development changes; see the [compatibility policy](docs/stability.md).
 
 ### Added
 
+- The standard `Maybe` type opts `Just` and `Nothing` into bounded marked-constructor
+  inference. Explicit type arguments remain valid; a bare `Nothing` needs an
+  expected `Maybe A` type.
 - Exclusive `0..10` and inclusive `0..=10` literal-endpoint `NatRange` values,
   checked through nominal Nat, bound, and range representation roles.
 - Final-tail list spreads `[first, ..rest]` build checked `List A` constructor
