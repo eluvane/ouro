@@ -112,6 +112,13 @@ class SourceContracts(unittest.TestCase):
                          ["real.ouro"])
         with self.assertRaisesRegex(ValueError, "malformed quoted import"):
             frontend.SMC.quoted_import_targets('import """\n  path.ouro\n  """;', "root.ouro")
+    def test_byte_literal_does_not_add_import_edges(self):
+        source = (r'def bytes : List Nat := b"import \"fake.ouro\"; -- \x00";'
+                  '\nimport "real.ouro";')
+        self.assertEqual(frontend.SMC.quoted_import_targets(source, "root.ouro"),
+                         ["real.ouro"])
+        with self.assertRaisesRegex(ValueError, "malformed quoted import"):
+            frontend.SMC.quoted_import_targets('import b"invalid.ouro";', "root.ouro")
 
     def test_unterminated_raw_import_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "malformed quoted import"):

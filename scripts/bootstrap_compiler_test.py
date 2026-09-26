@@ -154,6 +154,18 @@ class BootstrapCompilerTests(unittest.TestCase):
                     ValueError, "multiline string"):
                 compact_source.compact_source(source)
 
+    def test_compaction_preserves_byte_literal_and_import_closure(self):
+        from selfhost_module_cache import quoted_import_targets
+
+        literal = b'b"-- import \\"fake.ouro\\"; \\x00\\xFF"'
+        source = (b'def bytes : List Nat :=  ' + literal + b'; -- trailing\n'
+                  b'import "real.ouro";\n')
+        compacted = compact_source.compact_source(source)
+        self.assertIn(literal, compacted)
+        self.assertEqual(quoted_import_targets(compacted.decode(), "compiler/probe.ouro"),
+                         ["compiler/real.ouro"])
+        self.assertEqual(compact_source.compact_source(compacted), compacted)
+
     def test_compaction_rejects_unclosed_raw_literal(self):
         with self.assertRaisesRegex(ValueError, "unterminated raw string"):
             compact_source.compact_source(b'def text : String := r#"unfinished";')
