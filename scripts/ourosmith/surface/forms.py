@@ -123,6 +123,14 @@ def result : Nat := size (Node (Cons Tree (Node children) (Cons Tree Leaf (Nil T
      io_pure Nat value
 def result : Nat := add (choose True) (choose False);
 """, n + m, False
+    yield "do-pure-let", PRELUDE + IDENTITY_IO + f"""def choose : IO Nat :=
+  do let first : Nat := {n};
+     io_pure Unit MkUnit;
+     let second : Nat := add first {m};
+     let! chosen := io_pure Nat second;
+     io_pure Nat (S chosen)
+def result : Nat := choose;
+""", n + m + 1, False
     yield "list", PRELUDE + f"""inductive List (A : Type) : Type := | Nil : List A | Cons : A -> List A -> List A;
 def length (A : Type) : List A -> Nat :=
   fix length (xs : List A) : Nat :=
