@@ -6,6 +6,8 @@ Development changes; see the [compatibility policy](docs/stability.md).
 
 ### Added
 
+- [Braced Unicode scalar escapes in strings and quoted imports](docs/syntax.md#numbers-and-strings),
+  decoded to UTF-8 bytes with malformed scalar rejection.
 - [Decimal digit separators and hexadecimal/binary `Nat` literals](docs/syntax.md#numbers-and-strings)
   with strict malformed-token rejection and no implicit machine-integer conversion.
 - Review-only Clippy proofs for Result/Maybe error flow, collection and string
