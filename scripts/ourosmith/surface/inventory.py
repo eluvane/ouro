@@ -98,6 +98,7 @@ def strategies():
                 match = re.fullmatch(r"OURO-([A-Z]+)-(\d+)", code)
                 if match and match[1] in numeric:
                     diagnostics[f"CErr code={numeric[match[1]] + int(match[2])}"] = "negative:" + name
+    diagnostics["CErr code=97"] = "feature:module-resolution-fuel"
     return {"items": {"expr": EXPR, "analyzer_ast": {tag: "feature:analyzer:" + tag for tag in AST_TAGS},
                        "decl": DECL, "token": TOKEN, "keyword": KEYWORD,
                        "diagnostic": diagnostics, "lint": lint},
@@ -107,7 +108,7 @@ def strategies():
                                    *("io:" + name for name in IO_FEATURES), *("text-" + name for name in TEXT_FEATURES),
                                    *("lint-clean:" + name for name in LINT_FEATURES), "analyzer:line-splitting",
                                    *("parity:" + case["name"] for case in parity_inputs(1) if "expected" in case),
-                                   "backend:non-tail-depth", "manifest:integrity"],
+                                   "backend:non-tail-depth", "manifest:integrity", "module-resolution-fuel"],
             "negative_strategies": contract}
 
 

@@ -6,6 +6,9 @@ Development changes; see the [compatibility policy](docs/stability.md).
 
 ### Added
 
+- Compiler-owned identities for declarations in aliased source modules.
+  `A.member` selects a direct declaration of `A`'s canonical imported file;
+  colliding short names require qualification. See [module syntax](docs/syntax.md#modules-and-imports).
 - Review-only Clippy proofs for Result/Maybe error flow, collection and string
   composition, List producer/consumer laws, arithmetic, literal bounds, Boolean
   identities, and normalization. Rule contracts and exclusions live in the
@@ -21,6 +24,20 @@ Development changes; see the [compatibility policy](docs/stability.md).
 
 ### Changed
 
+- Qualified record literals and projections retain the aliased record owner;
+  a projection through a transitive record type is rejected instead of
+  selecting a same-named local value or accessor. Bare record sugar preserves
+  its declaring record's constructor or accessor when an explicit call or
+  local binder uses the same short name. Qualified module references likewise
+  keep their global target under a same-named local binder.
+- A qualified reference no longer borrows a same-named declaration from a
+  different imported file. Add a direct import and use that file's alias.
+  In an aliased import graph, a bare use made ambiguous by a new import now
+  reports error 96; qualify it. Plain-only import graphs retain error 45 for
+  duplicate declarations.
+- Alias collisions involving `IO`, `io_bind`, or `pure` report error 96 until
+  their lowering uses module-local operation metadata. `std/module_demo.ouro`
+  imports its declaration owner directly.
 - Run PR parity and syntax-quality gates in separate required jobs to shorten
   the serial `checks` group; nightly retains both gates in its `checks` group.
 - Split compiler-checking fixtures across sixteen PR and nightly jobs, with

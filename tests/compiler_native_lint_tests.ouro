@@ -117,6 +117,98 @@ def native_import_alias : Bool :=
       end
     end;
 
+def native_lint_qualified_collision : Bool :=
+    let source : String :=
+      "import \"a.ouro\" as A; import \"b.ouro\" as B; def left : Type := A.Shared; def right : Type := B.Shared;" in
+    match prep_codes (ncodes source) with
+    | LintPrepErr _ => False
+    | LintPrepOk codes =>
+        let lines : List String := lint_lines "main.ouro" source
+          ["A@Shared", "B@Shared"] [] codes in
+        let short_only : List String := lint_lines "main.ouro" source
+          ["Shared"] [] codes in
+        andb(all String (fun (line : String) =>
+            notb (orb (prim_string_contains line "lex-malformed")
+              (orb (prim_string_contains line "parse-fail")
+                (prim_string_contains line "OURO-LINT002")))) lines,
+          any String (fun (line : String) =>
+            prim_string_contains line "OURO-LINT002") short_only)
+    end;
+
+def native_lint_record_owner_marker : Bool :=
+    let source : String :=
+      "inductive Nat : Type := | Z : Nat; record Point : Type where x : Nat; end; def point : Point := MkPoint Z; def explicit : Nat := Point_x point; def get : Nat := point.x;" in
+    let bad_source : String :=
+      "inductive Nat : Type := | Z : Nat; record Point : Type where x : Nat; end; def point : Point := MkPoint Z; def get : Nat := point.x; def bad : Nat := Missing;" in
+    match prep_codes (ncodes source) with
+    | LintPrepErr _ => False
+    | LintPrepOk codes =>
+        let clean : List String :=
+          lint_lines "main.ouro" source [] [] codes in
+        match prep_codes (ncodes bad_source) with
+        | LintPrepErr _ => False
+        | LintPrepOk bad_codes =>
+            let warned : List String :=
+              lint_lines "main.ouro" bad_source [] [] bad_codes in
+            andb
+              (all String (fun (line : String) =>
+                notb (orb (prim_string_contains line "OURO-LINT002")
+                  (orb (prim_string_contains line "lex-malformed")
+                    (prim_string_contains line "parse-fail")))) clean)
+              (any String (fun (line : String) =>
+                andb (prim_string_contains line "OURO-LINT002")
+                  (prim_string_contains line "Missing")) warned)
+        end
+    end;
+
+def native_lint_alias_ctor_identity : Bool :=
+    let source : String :=
+      "import \"a.ouro\" as A; import \"b.ouro\" as B; def left : Type := A.Ctor; def right : Type := B.Ctor;" in
+    match scan_source_imports source with
+    | Left _ => False
+    | Right rows =>
+        let aliases : List (Pair String String) :=
+          lint_alias_targets "main.ouro" rows in
+        let a_names : List String := lint_qualified_for_path
+          (resolve_import "main.ouro" "a.ouro") aliases
+          (harvest_names "def Ctor : Type := Nat;") in
+        let b_ctors : List String := lint_qualified_for_path
+          (resolve_import "main.ouro" "b.ouro") aliases
+          (harvest_ctor_names "inductive B : Type := | Ctor : B;") in
+        match prep_codes (ncodes source) with
+        | LintPrepErr _ => False
+        | LintPrepOk codes =>
+            match lex_all_import (lint_fuel (prim_string_length source)) codes with
+            | LexMalformed _ => False
+            | LexExhausted _ => False
+            | LexOk _ st =>
+                let identifiers : List (Pair (List Nat) Nat) :=
+                  unit_intern_ids st in
+                let found : List String := map (Pair (List Nat) Nat) String
+                  (fun (p : Pair (List Nat) Nat) =>
+                    match p with | MkPair cs _ => nstr cs end) identifiers in
+                let ctor_ids : List Nat := imported_ctor_ids st b_ctors in
+                andb(precision_strings a_names ["A@Ctor"],
+                  andb(precision_strings b_ctors ["B@Ctor"],
+                    andb(mem_str "A@Ctor" found,
+                      andb(mem_str "B@Ctor" found,
+                        all (Pair (List Nat) Nat)
+                          (fun (p : Pair (List Nat) Nat) =>
+                            match p with
+                            | MkPair cs id =>
+                                match prim_string_eq (nstr cs) "A@Ctor" with
+                                | True => andb(notb (elem Nat eqNat id ctor_ids),
+                                    notb (keep_warn st [] a_names [] (WUnbound id)))
+                                | False => match prim_string_eq (nstr cs) "B@Ctor" with
+                                  | True => elem Nat eqNat id ctor_ids
+                                  | False => True
+                                  end
+                                end
+                            end) identifiers)))))
+            end
+        end
+    end;
+
 def native_lint_laws : List (Pair String Bool) :=
     [ MkPair String Bool "native-lint/module-rewrite-retains-underscore-and-indent"
         (prim_string_eq (nstr (rewrite_mod_def (ncodes "Sample")
@@ -189,6 +281,12 @@ def native_lint_laws : List (Pair String Bool) :=
           ["real.ouro"])
     , MkPair String Bool "native-import/aliases-stay-single-path"
         native_import_alias
+    , MkPair String Bool "native-lint/qualified-colliding-references-remain-parseable"
+        native_lint_qualified_collision
+    , MkPair String Bool "native-lint/record-owner-marker-keeps-unknown-precision"
+        native_lint_record_owner_marker
+    , MkPair String Bool "native-lint/direct-alias-constructor-identity"
+        native_lint_alias_ctor_identity
     , MkPair String Bool "native-import/operand-byte-locations"
         native_import_offsets
     , MkPair String Bool "native-import/rejects-missing-path"

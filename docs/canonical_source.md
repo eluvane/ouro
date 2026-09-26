@@ -57,6 +57,11 @@ to byte offsets. `parse_spanned` is the production parser dispatcher with
 refer to the lexed text, so a tool must not report them against the original
 file when import-alias or record preprocessing rewrote it. Clippy reports a
 proof's range only in that unchanged case.
+Alias qualification keeps the same source byte length when replacing `.` with
+the internal marker, and masked `as` / `open` syntax keeps line endings. This
+does not by itself provide original byte spans for rewritten tokens; tools
+still follow the mapping limit above. Raw source containing the internal
+marker is rejected before the checked parser can consume it.
 `tests/source_span_tests.ouro` checks agreement with the production lexer and
 parser on inline cases and repository sources, and that each range parsed alone
 yields its expression.

@@ -38,7 +38,7 @@ for Unicode path checks and the Windows C-host UTF-8 process manifest.
 
 ## Structured drive
 
-`unit.ouro` builds one `AnalysisUnit` per source with the compiler frontend (`preprocess_records` → `lex_all` → `parse_file`, then `expr_adapt.ouro` per definition). The unit carries definition names and lines, constructor/owner pairs plus the constructors of indexed families and the uninhabited inductives (`UnitTypes`), interned capability ids, layer marks, and the comment annotations parsed by `runtime_contracts.ouro`. Cores never see raw tokens.
+`unit.ouro` builds one `AnalysisUnit` per source with the compiler frontend (`preprocess_imports_reg` → `preprocess_records_reg` → `lex_all_import` → `parse_file`, then `expr_adapt.ouro` per definition). The unit carries definition names and lines, constructor/owner pairs plus the constructors of indexed families and the uninhabited inductives (`UnitTypes`), interned capability ids, layer marks, and the comment annotations parsed by `runtime_contracts.ouro`. Cores never see raw tokens.
 
 `std/process.ouro` belongs to the stdlib IO layer: it owns the checked process
 wrappers over the runtime intrinsics. This exact path classification leaves
