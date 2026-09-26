@@ -24,7 +24,7 @@ EXPRS = {
     "EBinder": ["Nat", "Expr", "Expr"], "ENoBinder": [],
     "EMultiMatch": ["List Expr", "List (Pair (List (Pair Nat (List Nat))) Expr)"],
     "EStr": ["Nat"], "EDoBind": ["Nat", "Expr"], "EList": ["List Expr"],
-    "ESpan": ["Nat", "Nat", "Expr"],
+    "ESpan": ["Nat", "Nat", "Expr"], "EOpen": ["Nat", "Expr"],
 }
 
 
@@ -111,6 +111,7 @@ def rows(seed):
         (["TLparen", "TNat 1", "TRparen"], "ENat(1)"),
         (["TKeyword kwFun", f"TIdent {n}", "TFatArrow", f"TIdent {n}"], f"ELam({n},none,EVar({n}))"),
         (["TKeyword kwLet", f"TIdent {n}", "TColonEq", "TNat 2", "TKeyword kwIn", f"TIdent {n}"], f"ELet({n},none,ENat(2),EVar({n}))"),
+        (["TKeyword kwOpen", f"TIdent {n}", "TKeyword kwIn", f"TIdent {n}"], f"EOpen({n},EVar({n}))"),
         (["TBracketL", "TNat 1", "TComma", "TNat 2", "TBracketR"], "EList([ENat(1), ENat(2)])"),
     ]
     for body, expected in cases:

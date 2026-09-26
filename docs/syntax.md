@@ -31,9 +31,10 @@ def two : N.Nat := N.S N.one;
 
 Plain imports keep unique short names available. A local term binder takes
 precedence over a bare module name, followed by a declaration owned by the
-current file. With aliases in the reached import graph, a bare name with no
-current-file declaration is ambiguous when two imported files own it; use
-their aliases to select the intended declaration. A graph of plain imports
+current file, an innermost local open, and then a unique imported short name.
+With aliases in the reached import graph, a bare name not selected by these
+scopes is ambiguous when two imported files own it; use their aliases or a
+local open to select the intended declaration. A graph of plain imports
 without aliases retains the existing duplicate-declaration error for a
 collision. An alias cannot select a declaration only imported transitively by
 its file. Aliases are local to the importing file, and a local term binder does
@@ -45,15 +46,18 @@ Collisions of the legacy `IO`, `io_bind`, and `pure` lowering names report
 ambiguity even for qualified uses until those forms carry module-local
 operation metadata. Unambiguous `do` programs keep their current behavior.
 
-Local opens retain their existing bounded source form:
+An expression can open an alias for its own subtree:
 
 ```ouro
 def three : Nat := open N in add two one;
 ```
 
-`open N in` currently removes the qualifier only; it does not disambiguate
-colliding short names. Top-level `open` declarations, selective imports, hidden
-exports, and nested module declarations are not supported.
+`open N in` selects declarations owned directly by `N` when their short names
+would otherwise be ambiguous. An inner open wins over an outer one; a local
+term binder or current-file declaration still takes precedence. The opened
+names do not escape the expression. Unknown aliases are rejected, and every
+imported body remains checked. Top-level `open` declarations, selective
+imports, hidden exports, and nested module declarations are not supported.
 
 ## Definitions and dependent functions
 
@@ -83,11 +87,12 @@ let x : A := value in body
 A local helper can put its typed parameters next to its name:
 
 ```ouro
-let twice (x : Nat) : Nat := add x x in twice 2
+let twice (x : Nat) := add x x in twice 2
 ```
 
-This is a non-recursive lambda-binding. Parameterized local helpers require an
-explicit result annotation; [Ergonomic syntax](language/ergonomic-syntax.md#typed-local-helper-declarations)
+This is a non-recursive lambda-binding. Parameterized local helpers require
+typed parameters; the result annotation may be omitted when the body type can
+be inferred. [Ergonomic syntax](language/ergonomic-syntax.md#typed-local-helper-declarations)
 explains their scope and desugaring.
 
 ## Inductive data and pattern matching
@@ -255,7 +260,7 @@ embedded-NUL limits.
 List literals require an expected `List A` type:
 
 ```ouro
-def values : List Nat := [Z, S Z, S (S Z)];
+def values : List Nat := [Z, S Z, S (S Z),];
 def empty : List Nat := [];
 ```
 
@@ -265,8 +270,9 @@ A local type ascription can provide the expected element type:
 def count : Nat := (([Z, S Z] : List Nat) |> length Nat);
 ```
 
-Untyped `[]`, ambiguous list literals, and trailing commas are rejected. List
-literals lower to the standard `Nil` and `Cons` constructors.
+Untyped `[]` and ambiguous list literals are rejected. A nonempty list may
+end with a comma; `[]` remains the empty spelling. List literals lower to the
+standard `Nil` and `Cons` constructors.
 
 ## Records
 

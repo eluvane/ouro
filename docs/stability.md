@@ -49,8 +49,8 @@ Import aliases identify the directly imported file. If a new import makes a
 bare name ambiguous in an aliased graph, qualify the use with an alias. A
 plain-only graph still rejects duplicate declarations. Code that used one alias
 to reach another file's transitive declaration needs a direct import of that
-file. Scoped local opens, selective imports, and visibility remain experimental
-design work; see [module syntax](syntax.md#modules-and-imports).
+file. Scoped local opens are supported in expressions; selective imports and
+visibility remain experimental design work; see [module syntax](syntax.md#modules-and-imports).
 
 ## Assurance is separate from compatibility
 

@@ -45,7 +45,7 @@ EXPR = {
     "EBranch": "feature:match", "ENoBranch": "feature:match", "EBinder": "feature:prelude",
     "ENoBinder": "feature:prelude", "EMultiMatch": "feature:form:multi-match",
     "EStr": "feature:string-length", "EDoBind": "property:test-known-counts", "EList": "feature:form:list",
-    "ESpan": "feature:parser:abi-and-grammar",
+    "ESpan": "feature:parser:abi-and-grammar", "EOpen": "feature:parity:imports-open-local",
 }
 DECL = {"DDef": "feature:prelude", "DAxiom": "negative:effect-root-assumption-type", "DInductive": "feature:prelude",
         "DEffect": "feature:form:handler", "DImport": "property:import-dependency-order",
@@ -60,7 +60,8 @@ KEYWORD = dict.fromkeys(("kwDef", "kwInductive", "kwFun", "kwMatch", "kwWith", "
 KEYWORD.update({"kwImport": "property:import-dependency-order", "kwEffect": "feature:form:handler",
                 "kwWhere": "feature:form:handler", "kwDo": "property:test-known-counts",
                 "kwPerform": "feature:form:handler", "kwHandle": "feature:form:handler", "kwRecord": "feature:form:record",
-                "kwAxiom": "negative:effect-root-assumption-type", "kwExtern": "feature:form:extern-declaration"})
+                "kwAxiom": "negative:effect-root-assumption-type", "kwExtern": "feature:form:extern-declaration",
+                "kwOpen": "feature:parity:imports-open-local"})
 
 # Each exception names an actual missing oracle, rather than accepting new
 # source inventory items automatically. Migration checks treat these as gaps.

@@ -432,7 +432,7 @@ static int print_prep_diag(const char *path, ouro_v *src, int code, int det)
 		case 65:
 			cname = "OURO-LIST-002";
 			msg = "invalid list literal syntax";
-			hint = "Remove the trailing comma or close the list.";
+			hint = "Remove the extra comma or close the list.";
 			break;
 		default:
 			break;

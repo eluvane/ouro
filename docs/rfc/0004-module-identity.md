@@ -41,8 +41,10 @@ the current unit. Otherwise, a unique declaration in the imported closure is
 available by its short name; distinct imported owners make that name ambiguous.
 In `A.member`, the alias is a
 qualification token; a same-spelled local binder does not redirect that
-reference. Existing `open A in expression` continues to erase its prefix and
-cannot disambiguate colliding short names in this first implementation step.
+reference. The scoped-open implementation resolves `open A in expression` against
+the same direct-owner registry inside its expression subtree. A lexical term
+binder and a current-file declaration still take precedence over an open;
+among opens, the innermost selection wins.
 A direct import is required to qualify a transitive dependency.
 
 Name resolution runs before lowering and emits unique internal identities for
@@ -56,7 +58,7 @@ alias. Plain-only graphs retain the existing duplicate-declaration error for
 collisions. This avoids a new registry traversal in the bootstrap's common
 plain-import path while keeping collisions explicit in both paths.
 
-Selective imports, scoped local opens, private declarations, re-exports, and
+Selective imports, private declarations, re-exports, and
 two same-named record declarations are subsequent contracts. Record generation
 currently uses a shared registry before declaration ownership is assigned.
 Future visibility syntax must use the same module ownership registry and must
