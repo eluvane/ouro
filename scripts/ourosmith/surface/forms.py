@@ -130,6 +130,13 @@ def length (A : Type) : List A -> Nat :=
 def values : List Nat := [{', '.join(map(str, values))}{',' if values else ''}];
 def result : Nat := values |> length Nat;
 """, len(values), False
+    payload = "A" * (seed % 4 + 1)
+    yield "byte-string", PRELUDE + f"""inductive List (A : Type) : Type := | Nil : List A | Cons : A -> List A -> List A;
+def length (A : Type) : List A -> Nat :=
+  fix length (xs : List A) : Nat :=
+    match xs with | Nil => Z | Cons _ tail => S (length tail) end;
+def result : Nat := length Nat b"{payload}\\x00\\xFF";
+""", len(payload) + 2, False
     yield "list-spread", PRELUDE + f"""inductive List (A : Type) : Type := | Nil : List A | Cons : A -> List A -> List A;
 def eight (value : Nat) : Nat :=
   let two : Nat := add value value in

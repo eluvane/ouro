@@ -82,7 +82,8 @@ def rows(seed):
     tokens = [f"TIdent {n}", f"TNat {n}", f"TKeyword {n}", f"TType {n}",
               "TColon", "TColonEq", "TArrow", "TFatArrow", "TBar", "TLparen", "TRparen", "TSemi",
               "THole (Nothing Nat)", f"TString {n}", "TComma", "TBraceL", "TBraceR", "TExclam",
-              "TEof", "TBind", "TPipe", "TBracketL", "TBracketR", "TDotDot", "TDotDotEq"]
+              "TEof", "TBind", "TPipe", "TBracketL", "TBracketR", "TDotDot", "TDotDotEq",
+              f"TByteString ([{n}] : List Nat)"]
     observations = []
     accessors = []
     expected_tokens = []
@@ -113,6 +114,7 @@ def rows(seed):
         (["TNat 1", "TDotDotEq", "TNat 2"], "ERange(1,2,true)"),
         (["TType 2"], "ESort(2)"), ([tokens[12]], "EHole(none)"),
         ([f"THole (Just Nat {n})"], f"EHole(just({n}))"), ([f"TString {n}"], f"EStr({n})"),
+        ([f"TByteString ([{n}] : List Nat)"], f"EList([ENat({n})])"),
         ([f"TIdent {n}", "TNat 2"], f"EApp(EVar({n}),ENat(2))"),
         (["TNat 1", "TPipe", f"TIdent {n}"], f"EApp(EVar({n}),ENat(1))"),
         (["TType 0", "TArrow", "TType 1"], "EPi(0,ESort(0),ESort(1))"),
