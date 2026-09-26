@@ -74,6 +74,7 @@ def w_end : List Nat := n3p 101 110 100;
 def w_constructor : List Nat :=
   Cons Nat 99 (Cons Nat 111 (n9p 110 115 116 114 117 99 116 111 114));
 def w_def : List Nat := n3p 100 101 102;
+def w_let_p : List Nat := n3p 108 101 116;
 def w_axiom : List Nat := n5p 97 120 105 111 109;
 def w_inductive : List Nat := n9p 105 110 100 117 99 116 105 118 101;
 def w_effect : List Nat := n6p 101 102 102 101 99 116;
@@ -210,6 +211,17 @@ def trim_bytes (xs : List Nat) : List Nat :=
           end
       end) (reverse Nat drop_l));
 
+def trim_left_bytes : List Nat -> List Nat :=
+  fix trim_left_bytes (xs : List Nat) : List Nat :=
+    match xs with
+    | Nil => Nil Nat
+    | Cons c rest =>
+        match source_is_ws c with
+        | True => trim_left_bytes rest
+        | False => xs
+        end
+    end;
+
 def type_to_rec (reg : RecReg) (ty : List Nat) : Maybe Nat :=
   match reg with
   | MkRecReg _ recs _ _ => find_rec_idx(trim_bytes ty, recs)
@@ -234,26 +246,27 @@ def bump_depth (c : Nat) (depth : Nat) : Nat :=
 def take_until_word (w : List Nat) (xs0 : List Nat)
     : Pair (List Nat) (List Nat) :=
   (fix go (fuel : Nat) (xs : List Nat) (acc : List Nat) (depth : Nat)
-      : Pair (List Nat) (List Nat) :=
+      (prior_ident : Bool) : Pair (List Nat) (List Nat) :=
     match fuel with
     | Z => MkPair(List Nat, List Nat, reverse Nat acc, Nil Nat)
     | S fuel2 =>
         match xs with
         | Nil => MkPair(List Nat, List Nat, reverse Nat acc, Nil Nat)
         | Cons c rest =>
-            match andb(eqNat depth Z, word_at w xs) with
+            match andb(eqNat depth Z, andb(notb prior_ident, word_at w xs)) with
             | True => MkPair(List Nat, List Nat, reverse Nat acc, xs)
             | False =>
                 match source_copy_comment_or_string acc xs with
                 | Just copied =>
                     match copied with
-                    | MkPair acc2 tail => go fuel2 tail acc2 depth
+                    | MkPair acc2 tail => go fuel2 tail acc2 depth False
                     end
-                | Nothing => go(fuel2, rest, Cons Nat c acc, bump_depth c depth)
+                | Nothing => go(fuel2, rest, Cons Nat c acc,
+                    bump_depth c depth, source_is_ident_char c)
                 end
             end
         end
-    end) (length Nat xs0) xs0 (Nil Nat) Z;
+    end) (length Nat xs0) xs0 (Nil Nat) Z False;
 
 def take_until_char (stop : Nat) (xs0 : List Nat)
     : Pair (List Nat) (List Nat) :=
@@ -400,27 +413,28 @@ def top_starts_pun (src : List Nat) : Bool :=
   end;
 
 def top_has_with (src : List Nat) : Bool :=
-  (fix go (fuel : Nat) (xs : List Nat) (depth : Nat) : Bool :=
+  (fix go (fuel : Nat) (xs : List Nat) (depth : Nat)
+      (prior_ident : Bool) : Bool :=
     match fuel with
     | Z => False
     | S fuel2 =>
         match xs with
         | Nil => False
         | Cons c rest =>
-            match andb(eqNat depth Z, word_at w_with xs) with
+            match andb(eqNat depth Z, andb(notb prior_ident, word_at w_with xs)) with
             | True => True
             | False =>
                 match source_is_comment xs with
-                | True => go fuel2 (source_skip_line rest) depth
+                | True => go fuel2 (source_skip_line rest) depth False
                 | False =>
                     match eqNat c ch_dq_p with
-                    | True => go fuel2 (source_skip_string rest) depth
-                    | False => go fuel2 rest (bump_depth c depth)
+                    | True => go fuel2 (source_skip_string rest) depth False
+                    | False => go fuel2 rest (bump_depth c depth) (source_is_ident_char c)
                     end
                 end
             end
         end
-    end) (length Nat src) src Z;
+    end) (length Nat src) src Z False;
 
 def rec_reg_has_recs (reg : RecReg) : Bool :=
   match reg with
@@ -483,7 +497,27 @@ def records_maybe_needed (src : List Nat) : Bool :=
                         | MkPair id after =>
                             match source_bytes_equal id w_record with
                             | True => True
-                            | False => go fuel2 after
+                            | False =>
+                                match source_bytes_equal id w_let_p with
+                                | False => go fuel2 after
+                                | True =>
+                                    match skip_ws_p after with
+                                    | Cons brace _ =>
+                                        match eqNat brace ch_lbrace_p with
+                                        | False => go fuel2 after
+                                        | True =>
+                                            match matching_brace (skip_ws_p after) with
+                                            | Nothing => go fuel2 after
+                                            | Just block =>
+                                                match block with
+                                                | MkPair body tail =>
+                                                    orb(go fuel2 (strip_braces body), go fuel2 tail)
+                                                end
+                                            end
+                                        end
+                                    | Nil => go fuel2 after
+                                    end
+                                end
                             end
                         end
                     | False =>
@@ -563,6 +597,42 @@ def collect_decl_names (src : List Nat) : List (List Nat) :=
 def acc_name (recN : List Nat) (fld : List Nat) : List Nat :=
   append Nat recN (append Nat s_uscore fld);
 
+def field_type_has_top_arrow (input : List Nat) : Bool :=
+  (fix go (fuel : Nat) (xs : List Nat) (depth : Nat) : Bool :=
+    match fuel with
+    | Z => False
+    | S remaining =>
+        match xs with
+        | Nil => False
+        | Cons c rest =>
+            match source_is_comment xs with
+            | True => go remaining (source_skip_line rest) depth
+            | False =>
+                match eqNat c ch_dq_p with
+                | True => go remaining (source_skip_string rest) depth
+                | False =>
+                    match rest with
+                    | Nil => False
+                    | Cons next _ =>
+                        match andb(eqNat depth Z,
+                              andb(eqNat c 45, eqNat next 62)) with
+                        | True => True
+                        | False => go remaining rest (bump_depth c depth)
+                        end
+                    end
+                end
+            end
+        end
+    end) (S (length Nat input)) input Z;
+
+def emit_ctor_field_type (acc : List Nat) (ty : List Nat) : List Nat :=
+  match field_type_has_top_arrow ty with
+  | False => source_emit_reversed acc ty
+  | True => source_emit_reversed
+      (source_emit_reversed (Cons Nat ch_lparen_p acc) ty)
+      (n1p ch_rparen_p)
+  end;
+
 def emit_fields_ty (initial : List Nat) (fields : List RecField) : List Nat :=
   (fix go (fs : List RecField) (acc : List Nat) : List Nat :=
     match fs with
@@ -571,8 +641,8 @@ def emit_fields_ty (initial : List Nat) (fields : List RecField) : List Nat :=
         match f with
         | MkRecField _ ty =>
             match rest with
-            | Nil => source_emit_reversed acc ty
-            | Cons _ _ => go(rest, source_emit_reversed(source_emit_reversed acc ty, s_arrow))
+            | Nil => emit_ctor_field_type acc ty
+            | Cons _ _ => go(rest, source_emit_reversed(emit_ctor_field_type acc ty, s_arrow))
             end
         end
     end) fields initial;

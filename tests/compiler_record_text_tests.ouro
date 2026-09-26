@@ -19,6 +19,80 @@ def record_test_fields : List RecField :=
     , MkRecField(str_codes "flag", str_codes "Bool")
     ];
 
+def record_test_count (needle : List Nat) : List Nat -> Nat :=
+  fix record_test_count (xs : List Nat) : Nat :=
+    match xs with
+    | Nil => Z
+    | Cons _ rest =>
+        match source_starts needle xs with
+        | True => S (record_test_count rest)
+        | False => record_test_count rest
+        end
+    end;
+
+def record_test_before (first : List Nat) (second : List Nat) : List Nat -> Bool :=
+  fix record_test_before (xs : List Nat) : Bool :=
+    match xs with
+    | Nil => False
+    | Cons _ rest =>
+        match source_starts first xs with
+        | True => True
+        | False =>
+            match source_starts second xs with
+            | True => False
+            | False => record_test_before rest
+            end
+        end
+    end;
+
+def record_test_comment_metadata : Bool :=
+  match parse_record (str_codes
+      "record R : Type -- sort\n where x : Nat -- field\n; end;") with
+  | RecPErr _ => False
+  | RecPOk info sort _ =>
+      match info with
+      | MkRecInfo _ _ _ fields =>
+          match fields with
+          | Nil => False
+          | Cons field _ =>
+              match field with
+              | MkRecField _ ty =>
+                  andb(source_bytes_equal sort (str_codes "Type -- sort\n "),
+                    source_bytes_equal ty (str_codes "Nat -- field\n"))
+              end
+          end
+      end
+  end;
+
+def record_test_registry : RecReg := MkRecReg(0,
+  [MkRecInfo(0, str_codes "Point", str_codes "MkPoint", record_test_fields)],
+  [], []);
+
+def record_test_block_passthrough : Bool :=
+  let source : List Nat := str_codes
+    "def value : Nat := let -- trivia\n{ let count : Nat := Z; count };" in
+  match preprocess_records_reg record_test_registry source with
+  | MkPair _ result =>
+      match result with
+      | PrepErr _ _ => False
+      | PrepOk output => source_bytes_equal source output
+      end
+  end;
+
+def record_test_update_lowering : Bool :=
+  match preprocess_records_reg record_test_registry (str_codes
+      "def result : Point := { make_point Z with flag := rhs_flag, x := rhs_x };") with
+  | MkPair _ result =>
+      match result with
+      | PrepErr _ _ => False
+      | PrepOk source =>
+          andb(eqNat(record_test_count (str_codes "make_point Z") source, S Z),
+            andb(eqNat(record_test_count (str_codes "rhs_flag") source, S Z),
+              andb(eqNat(record_test_count (str_codes "rhs_x") source, S Z),
+                record_test_before (str_codes "rhs_flag") (str_codes "rhs_x") source)))
+      end
+  end;
+
 def record_test_scanners : List Test :=
     [ assert_eq "whitespace scanner accepts empty source"
         (str_of_codes (skip_ws_p [])) ""
@@ -37,6 +111,13 @@ def record_test_scanners : List Test :=
         (record_test_split (take_until_word w_end
           (str_codes "(end) -- end\n\"end\\\" still\" end;")))
         "(end) -- end\n\"end\\\" still\" |end;"
+    , assert_eq "word delimiter requires a keyword boundary on both sides"
+        (record_test_split (take_until_word w_with
+          (str_codes "somewith with x")))
+        "somewith |with x"
+    , assert_true "record update keyword requires a boundary on both sides"
+        (andb(notb (top_has_with (str_codes "somewith, x := Z")),
+          top_has_with (str_codes "point with x := Z")))
     , assert_eq "character delimiter ignores nesting, comments and strings"
         (record_test_split (take_until_char ch_semi_p
           (str_codes "(;) -- ;\n\";\" ;tail")))
@@ -51,6 +132,19 @@ def record_test_scanners : List Test :=
         (record_test_split (take_until_word(w_end, str_codes "x"))) "x|"
     , assert_eq "brace scan ignores quoted and commented closing braces"
         (record_test_brace "{a {b} -- }\n\"}\" c}tail") "{a {b} -- }\n\"}\" c}|tail"
+    , assert_true "record sort and field type retain comment line terminators"
+        record_test_comment_metadata
+    , assert_eq "function-valued field stays one constructor argument"
+        (str_of_codes (reverse Nat
+          (emit_fields_ty [] [MkRecField(str_codes "run", str_codes "Nat -> Nat")])))
+        "(Nat -> Nat)"
+    , assert_true "record prepass preserves a pure let block with trivia"
+        record_test_block_passthrough
+    , assert_true "record candidate scan skips a pure let block"
+        (notb (records_maybe_needed (str_codes
+          "let { let count : Nat := Z; count }")))
+    , assert_true "record update binds base once and RHS in source order"
+        record_test_update_lowering
     , assert_eq "record value scan keeps comment newline before comma"
         (record_test_split (take_until_comma_or_end (str_codes " Z -- kept\n, y")))
         " Z -- kept\n|, y"

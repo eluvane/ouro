@@ -14,6 +14,7 @@ Development changes; see the [compatibility policy](docs/stability.md).
   including the migration from `f (a, b)` as one grouped expression to two arguments.
 - Trailing commas in nonempty list literals, including multiline lists with comments.
 - Record literal field punning with known nominal type and checked field coverage.
+- Functional updates of annotated nominal records with checked changed fields and once-bound base expressions.
 - Local and pinned-Git package dependencies with deterministic manifests and
   locks, rejection fixtures, a reusable-library sample, and a consuming
   application; see [Packages](docs/pkg.md).

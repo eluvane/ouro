@@ -182,8 +182,20 @@ A record literal still needs a known nominal record type. A bare field name
 uses the value with that name in the enclosing lexical scope; it does not
 introduce a binder. The record preprocessor expands it to the same constructor
 argument as `x := x`, preserving declaration field order. Missing, duplicate,
-and unknown fields remain errors. Functional record update and nested update
-are not supported by this form.
+and unknown fields remain errors.
+
+## Functional record update
+
+```ouro
+{ person with age := next_age, active := True }
+```
+
+With a known nominal result type, update checks the base as that record type,
+binds it once, then binds changed values in source order. It constructs the new
+record in declaration field order, reading omitted fields from the bound base.
+Unknown and repeated fields are errors. A bare update name without `:=` is not
+an assignment. Nested field paths and update without an annotated nominal
+result type are not implemented yet.
 
 ## Integration and fixtures
 
