@@ -14,6 +14,10 @@ def programs(seed):
 def result : Nat := match identity Bool {flag} with
   | True => identity Nat {n} | False => identity Nat {m} end;
 """, n if seed % 2 else m, False
+    yield "if-expression", PRELUDE + f"""representation Bool := "ouro.bool";
+def branch (flag : Bool) : Nat := if flag then {n} else {m};
+def result : Nat := add (branch True) (add (branch False) (branch False));
+""", n + 2 * m, False
     text = f'handle perform ?goal{seed}\\"\n'
     yield "text-keywords", PRELUDE + f"""-- handle perform ?unresolved must remain comment text
 def message : String := {json.dumps(text)};
