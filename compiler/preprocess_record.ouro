@@ -15,14 +15,17 @@ def parse_record_fields (input : List Nat) (initial : List RecField) : RecParse 
             | Cons c rest =>
                 match eqNat c ch_semi_p with
                 | True =>
-                    RecPOk (MkRecInfo(Nil Nat, Nil Nat, Nil Nat, reverse RecField fs))
+                    RecPOk (MkRecInfo(Nil Nat, Nil Nat, Nil Nat, reverse RecField fs,
+                      empty_rec_owner_scope))
                       (Nil Nat) rest
                 | False =>
-                    RecPOk (MkRecInfo(Nil Nat, Nil Nat, Nil Nat, reverse RecField fs))
+                    RecPOk (MkRecInfo(Nil Nat, Nil Nat, Nil Nat, reverse RecField fs,
+                      empty_rec_owner_scope))
                       (Nil Nat) after
                 end
             | Nil =>
-                RecPOk (MkRecInfo(Nil Nat, Nil Nat, Nil Nat, reverse RecField fs))
+                RecPOk (MkRecInfo(Nil Nat, Nil Nat, Nil Nat, reverse RecField fs,
+                  empty_rec_owner_scope))
                   (Nil Nat) (Nil Nat)
             end
         | False =>
@@ -41,8 +44,8 @@ def parse_record_fields (input : List Nat) (initial : List RecField) : RecParse 
                                 | RecPErr e => RecPErr e
                                 | RecPOk ri sort tail =>
                                     match ri with
-                                    | MkRecInfo _ n _ fs2 =>
-                                        RecPOk (MkRecInfo (Nil Nat) n ctor fs2) sort tail
+                                    | MkRecInfo _ n _ fs2 imports =>
+                                        RecPOk (MkRecInfo (Nil Nat) n ctor fs2 imports) sort tail
                                     end
                                 end
                             | False => RecPErr rec_code_malformed
@@ -111,13 +114,13 @@ def parse_record (src : List Nat) : RecParse :=
                           | RecPErr e => RecPErr e
                           | RecPOk ri _ tail =>
                               match ri with
-                              | MkRecInfo _ _ ctor0 fs =>
+                              | MkRecInfo _ _ ctor0 fs imports =>
                                   let ctor : List Nat :=
                                     match ctor0 with
                                     | Nil => append Nat w_Mk name
                                     | Cons _ _ => ctor0
                                     end in
-                                  RecPOk (MkRecInfo (Nil Nat) name ctor fs)
+                                  RecPOk (MkRecInfo (Nil Nat) name ctor fs imports)
                                     (trim_left_bytes sort) tail
                               end
                           end
@@ -134,7 +137,7 @@ def collide_record (reg : RecReg) (ri : RecInfo) : Bool :=
   match reg with
   | MkRecReg _ _ names _ =>
       match ri with
-      | MkRecInfo _ name ctor fs =>
+      | MkRecInfo _ name ctor fs _ =>
           orb (name_in ctor names)
             ((fix go (xs : List RecField) : Bool :=
               match xs with
@@ -148,12 +151,13 @@ def collide_record (reg : RecReg) (ri : RecInfo) : Bool :=
       end
   end;
 
-def register_record (reg : RecReg) (owner : List Nat)
+def register_record (reg : RecReg) (owner : List Nat) (aliases : ImpReg)
+    (owner_names : List (List Nat))
     (ri : RecInfo) : RecReg :=
   match reg with
   | MkRecReg _ recs names gs =>
       match ri with
-      | MkRecInfo _ name ctor fs =>
+      | MkRecInfo _ name ctor fs _ =>
           let names1 : List (List Nat) :=
             Cons (List Nat) ctor
               ((fix go (xs : List RecField) (acc : List (List Nat))
@@ -167,12 +171,14 @@ def register_record (reg : RecReg) (owner : List Nat)
                     end
                 end) fs names) in
           MkRecReg Z (append RecInfo recs
-            (list1_recinfo (MkRecInfo owner name ctor fs)))
+            (list1_recinfo (MkRecInfo owner name ctor fs
+              (MkRecOwnerScope aliases owner_names))))
             names1 gs
       end
   end;
 
-def expand_record_decls (reg0 : RecReg) (owner : List Nat)
+def expand_record_decls (reg0 : RecReg) (owner : List Nat) (aliases : ImpReg)
+    (owner_names : List (List Nat))
     (src : List Nat)
     : Pair RecReg PrepResult :=
   (fix go (scan_fuel : Nat) (reg : RecReg) (xs : List Nat) (acc : List Nat)
@@ -203,7 +209,8 @@ def expand_record_decls (reg0 : RecReg) (owner : List Nat)
                                     MkPair RecReg PrepResult reg
                                       (PrepErr rec_code_collide Z)
                                 | False =>
-                                    go remaining (register_record reg owner ri) tail
+                                    go remaining
+                                      (register_record reg owner aliases owner_names ri) tail
                                       (emit_record acc ri sort)
                                 end
                             end
@@ -463,21 +470,45 @@ def update_path_conflicts (path : List (List Nat))
         orb(update_path_prefix old path, update_path_conflicts rest))
   end;
 
-def record_leaf_owner (reg : RecReg) (ri : Nat) : Maybe (List Nat) :=
+def record_leaf_info (reg : RecReg) (ri : Nat) : Maybe RecInfo :=
   match reg with
   | MkRecReg _ records _ _ => match nth_rec records ri with
-    | Nothing => Nothing (List Nat)
-    | Just info => match info with
-      | MkRecInfo owner _ _ _ => Just (List Nat) owner
-      end
+    | Nothing => Nothing RecInfo
+    | Just info => Just RecInfo info
+    end
+  end;
+
+def record_context_type_to_rec (reg : RecReg) (current : List Nat)
+    (aliases : ImpReg) (info : RecInfo) (ty : List Nat) : Maybe Nat :=
+  match info with
+  | MkRecInfo owner _ _ _ _ => match source_bytes_equal owner current with
+    | True => type_to_rec reg current aliases ty
+    | False => record_field_type_to_rec reg info ty
     end
   end;
 
 def record_leaf_type_to_rec (reg : RecReg) (current : List Nat)
     (aliases : ImpReg) (ri : Nat) (ty : List Nat) : Maybe Nat :=
-  match record_leaf_owner reg ri with
+  match record_leaf_info reg ri with
   | Nothing => Nothing Nat
-  | Just owner => record_field_type_to_rec reg current aliases owner ty
+  | Just info => record_context_type_to_rec reg current aliases info ty
+  end;
+
+def record_field_type_hint (reg : RecReg) (current : List Nat)
+    (aliases : ImpReg) (info : RecInfo) (ty : List Nat)
+    : Maybe (Pair Nat (List Nat)) :=
+  match info with
+  | MkRecInfo owner _ _ _ _ => match source_bytes_equal owner current with
+    | True => type_record_hint reg current aliases ty
+    | False => match record_field_type_to_rec reg info ty with
+      | Nothing => Nothing (Pair Nat (List Nat))
+      | Just index => match record_owner_prefix reg current aliases index with
+        | Nothing => Nothing (Pair Nat (List Nat))
+        | Just qualifier => Just (Pair Nat (List Nat))
+            (MkPair Nat (List Nat) index qualifier)
+        end
+      end
+    end
   end;
 
 def resolve_update_path (reg : RecReg) (current : List Nat)
@@ -494,7 +525,7 @@ def resolve_update_path (reg : RecReg) (current : List Nat)
             | Nothing => Nothing (Pair Nat (List Nat))
             | Just info =>
                 match info with
-                | MkRecInfo record_owner _ _ fields =>
+                | MkRecInfo _ _ _ fields _ =>
                     match find_field_idx field fields with
                     | Nothing => Nothing (Pair Nat (List Nat))
                     | Just idx =>
@@ -505,8 +536,8 @@ def resolve_update_path (reg : RecReg) (current : List Nat)
                             | Nil => Just (Pair Nat (List Nat))
                                 (MkPair Nat (List Nat) ri ty)
                             | Cons _ _ =>
-                                match record_field_type_to_rec reg current aliases
-                                    record_owner ty with
+                                match record_context_type_to_rec reg current aliases
+                                    info ty with
                                 | Nothing => Nothing (Pair Nat (List Nat))
                                 | Just child => go rest child
                                 end
@@ -668,8 +699,7 @@ def update_bound_names : List RecUpdateBound -> List (List Nat) :=
       end
   end;
 
--- Each generated annotation uses its leaf record's owner. An imported field
--- without a same-owner nominal record type has no safe annotation here.
+-- Each generated annotation uses the declaring record's stored import scope.
 def update_bound_types (reg : RecReg) (current : List Nat)
     (aliases : ImpReg) (bare_atoms : List (List Nat))
     : List RecUpdateBound -> RecUpdateBind :=
@@ -679,14 +709,21 @@ def update_bound_types (reg : RecReg) (current : List Nat)
     | Cons value rest => match value with
       | MkRecUpdateBound path binder parent_ri ty rhs =>
           let annotation : Maybe (List Nat) :=
-            match record_leaf_owner reg parent_ri with
+            match record_leaf_info reg parent_ri with
             | Nothing => Nothing (List Nat)
-            | Just owner => match source_bytes_equal owner current with
-              | True => Just (List Nat) ty
-              | False => match record_field_type_to_rec reg current aliases owner ty with
-                | Nothing => Nothing (List Nat)
-                | Just index => record_owned_type reg current aliases bare_atoms index
-                end
+            | Just info => match info with
+              | MkRecInfo owner _ _ _ _ =>
+                  match source_bytes_equal owner current with
+                  | True => Just (List Nat) ty
+                  | False => match record_type_marker reg aliases bare_atoms parent_ri ty with
+                    | Just marker => Just (List Nat) marker
+                    | Nothing => match record_field_type_to_rec reg info ty with
+                      | Just index =>
+                          record_owned_type reg current aliases bare_atoms index
+                      | Nothing => Nothing (List Nat)
+                      end
+                    end
+                  end
               end
             end in
           match annotation with
@@ -786,7 +823,7 @@ def build_updated_record (reg : RecReg) (current : List Nat)
             | Nothing => RecUpdateBuildErr rec_code_unknown
             | Just info =>
                 match info with
-                | MkRecInfo record_owner rec_name ctor fields =>
+                | MkRecInfo _ rec_name ctor fields _ =>
                     match record_generated_name reg current aliases bare_atoms ri ctor with
                     | Nothing => RecUpdateBuildErr rec_code_need_ty
                     | Just owned_ctor =>
@@ -815,8 +852,8 @@ def build_updated_record (reg : RecReg) (current : List Nat)
                                       match nested with
                                       | Nil => RecUpdateBuildOk accessor current_used
                                       | Cons _ _ =>
-                                          match record_field_type_to_rec reg current aliases
-                                              record_owner field_ty with
+                                          match record_context_type_to_rec reg current aliases
+                                              info field_ty with
                                           | Nothing => RecUpdateBuildErr rec_code_unknown
                                           | Just child_ri =>
                                               match fresh_update_name source current_used with
@@ -877,7 +914,7 @@ def expand_record_update (reg : RecReg) (current : List Nat)
           | Nothing => RwErr rec_code_need_ty
           | Just info =>
               match info with
-              | MkRecInfo _ _ _ _ =>
+              | MkRecInfo _ _ _ _ _ =>
                   match record_owned_type reg current aliases bare_atoms ri with
                   | Nothing => RwErr rec_code_need_ty
                   | Just owned_type =>
@@ -1275,7 +1312,7 @@ def projection_record_hint (reg : RecReg) (env : RecEnv)
       | MkRecReg _ recs _ _ => match nth_rec recs index with
         | Nothing => Nothing (Pair Nat (List Nat))
         | Just info => match info with
-          | MkRecInfo _ record_name _ _ =>
+          | MkRecInfo _ record_name _ _ _ =>
               match record_owner_qualifier reg current aliases bare_atoms
                       index (acc_name record_name field) with
               | Nothing => Nothing (Pair Nat (List Nat))
@@ -1298,7 +1335,7 @@ def projection_record_hint (reg : RecReg) (env : RecEnv)
                   match nth_rec recs index with
                   | Nothing => Nothing (Pair Nat (List Nat))
                   | Just info => match info with
-                    | MkRecInfo record_owner _ _ _ =>
+                    | MkRecInfo record_owner _ _ _ _ =>
                         match source_bytes_equal record_owner owner with
                         | False => Nothing (Pair Nat (List Nat))
                         | True => Just (Pair Nat (List Nat))
@@ -1407,7 +1444,7 @@ def rewrite_expr (reg : RecReg) (env : RecEnv)
                                                   | Nothing => RwErr rec_code_need_ty
                                                   | Just info =>
                                                       match info with
-                                                      | MkRecInfo record_owner _ ctor fs =>
+                                                      | MkRecInfo _ _ ctor fs _ =>
                                                           match record_generated_name reg current aliases
                                                                   bare_atoms ri ctor with
                                                           | Nothing => RwErr rec_code_need_ty
@@ -1418,8 +1455,8 @@ def rewrite_expr (reg : RecReg) (env : RecEnv)
                                                                     | Nothing => RwErr rec_code_unknown
                                                                     | Just ty =>
                                                                         rewrite_expr depth_left current_env
-                                                                          (type_record_hint reg record_owner
-                                                                            aliases ty) value
+                                                                          (record_field_type_hint reg current
+                                                                            aliases info ty) value
                                                                     end) with
                                                           | RwErr e => RwErr e
                                                           | RwOk lit _ =>
@@ -1538,7 +1575,7 @@ def rewrite_expr (reg : RecReg) (env : RecEnv)
                                                           | Nothing => RwErr rec_code_proj
                                                           | Just info =>
                                                               match info with
-                                                              | MkRecInfo _ rname _ rfs =>
+                                                              | MkRecInfo _ rname _ rfs _ =>
                                                                   match find_field_idx
                                                                           fld rfs with
                                                                   | Nothing =>
@@ -1765,7 +1802,7 @@ def preprocess_records_reg (owner : List Nat) (aliases : ImpReg)
         | MkRecReg _tag recs old gs =>
             MkRecReg Z recs (append (List Nat) names old) gs
         end in
-      match expand_record_decls reg1 owner src with
+      match expand_record_decls reg1 owner aliases names src with
       | MkPair reg2 r1 =>
           match r1 with
           | PrepErr c d => MkPair RecReg (Pair ImpReg PrepResult) reg2
