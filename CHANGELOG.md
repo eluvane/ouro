@@ -6,6 +6,8 @@ Development changes; see the [compatibility policy](docs/stability.md).
 
 ### Added
 
+- `if let Constructor fields := value then expr else expr` for flat constructor
+  patterns, lowered to a complete checked case with branch-local fields.
 - Total `if condition then expr else expr` expressions for the registered
   `Bool` type, with both arms checked at the result type.
 - Exclusive `0..10` and inclusive `0..=10` literal-endpoint `NatRange` values,

@@ -18,6 +18,25 @@ def result : Nat := match identity Bool {flag} with
 def branch (flag : Bool) : Nat := if flag then {n} else {m};
 def result : Nat := add (branch True) (add (branch False) (branch False));
 """, n + 2 * m, False
+    yield "if-let-expression", PRELUDE + f"""inductive Choice : Type :=
+  | Empty : Choice
+  | Full : Nat -> Choice;
+def branch (choice : Choice) : Nat :=
+  if let Full value := choice then value else {m};
+def result : Nat := add (branch (Full {n})) (branch Empty);
+""", n + m, False
+    yield "if-let-effectful-once", PRELUDE + f"""inductive Choice : Type :=
+  | Empty : Choice
+  | Full : Nat -> Choice;
+effect Probe where
+  | fetch : Nat -> Choice
+def result : Nat :=
+  handle if let Full value := (perform fetch ({n}) : Choice)
+    then value else {m} with
+  | fetch (value) resume => resume (Full (S value))
+  | pure value => value
+  end;
+""", n + 1, True
     text = f'handle perform ?goal{seed}\\"\n'
     yield "text-keywords", PRELUDE + f"""-- handle perform ?unresolved must remain comment text
 def message : String := {json.dumps(text)};
