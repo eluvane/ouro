@@ -2,6 +2,25 @@
 
 import "lower_spread.ouro";
 
+def iflet_is_hole (term : Surface) : Bool :=
+  match term with
+  | SHole _ => True
+  | SVar _ => False
+  | SSort _ => False
+  | SLam _ _ _ => False
+  | SApp _ _ => False
+  | SLet _ _ _ _ => False
+  | SConst _ => False
+  | SInd _ => False
+  | SConstruct _ _ _ => False
+  | SCase _ _ _ _ => False
+  | SFix _ _ _ _ _ => False
+  | SEffectRow _ => False
+  | SPerform _ _ => False
+  | SStr _ _ => False
+  | SPi _ _ _ => False
+  end;
+
 inductive IfLetPi : Type :=
   | IfLetNoPi : IfLetPi
   | IfLetHasPi : Nat -> Surface -> Surface -> IfLetPi;
@@ -200,11 +219,11 @@ def iflet_finish
   (names : List Nat) (params : List Surface) (fields : Surface)
   (input : Surface) (fallback : Surface) (result_type : Surface)
   (fresh : Nat) (yes : Expr) : LowerVal :=
-  match input with
-  | SHole _ => VSurf hole0
-  | _ => match fallback with
-    | SHole _ => VSurf hole0
-    | _ =>
+  match iflet_is_hole input with
+  | True => VSurf hole0
+  | False => match iflet_is_hole fallback with
+    | True => VSurf hole0
+    | False =>
       match iflet_bindings names fields fresh with
       | Nothing => VSurf hole0
       | Just binders =>
@@ -218,9 +237,9 @@ def iflet_finish
               match lower_run fuel env (Just Surface result_type)
                   fixSelf branch_locals (LExpr yes) with
               | VSurf success =>
-                  match success with
-                  | SHole _ => VSurf hole0
-                  | _ =>
+                  match iflet_is_hole success with
+                  | True => VSurf hole0
+                  | False =>
                       let family : Nat := ctor_indId ctor in
                       let nparams : Nat := ctor_nparams ctor in
                       match iflet_motive env family nparams result_type fresh,
@@ -250,7 +269,9 @@ def iflet_finish
                       | Nothing, Nothing => VSurf hole0
                       end
                   end
-              | _ => VSurf hole0
+              | VBranchPairs _ => VSurf hole0
+              | VBinderPairs _ => VSurf hole0
+              | VSurfList _ => VSurf hole0
               end
           end
       end
@@ -263,42 +284,38 @@ def iflet_lower_typed
   (fuel : Nat) (env : LowerEnv) (expected : Maybe Surface)
   (fixSelf : Maybe Nat) (locals : List (Pair Nat Surface))
   (ctor : CtorInfo) (names : List Nat) (params : List Surface)
-  (input : Surface) (input_type : Surface) (whole : Expr) : LowerVal :=
-  match whole with
-  | EIfLet _ _ yes no =>
-      let family : Nat := ctor_indId ctor in
-      match lookup_ctor_type env family (ctor_idx ctor) with
+  (input : Surface) (input_type : Surface) (whole yes no : Expr) : LowerVal :=
+  let family : Nat := ctor_indId ctor in
+  match lookup_ctor_type env family (ctor_idx ctor) with
+  | Nothing => VSurf hole0
+  | Just ctor_type =>
+      match iflet_instantiate_params ctor_type params with
       | Nothing => VSurf hole0
-      | Just ctor_type =>
-          match iflet_instantiate_params ctor_type params with
+      | Just fields =>
+          let fallback : Surface := vsurf_or_hole
+            (lower_run fuel env expected fixSelf locals (LExpr no)) in
+          let result : Maybe Surface :=
+            match expected with
+            | Just typ => Just Surface typ
+            | Nothing => surface_type_hint env locals fuel1k fallback
+            end in
+          match result with
           | Nothing => VSurf hole0
-          | Just fields =>
-              let fallback : Surface := vsurf_or_hole
-                (lower_run fuel env expected fixSelf locals (LExpr no)) in
-              let result : Maybe Surface :=
-                match expected with
-                | Just typ => Just Surface typ
-                | Nothing => surface_type_hint env locals fuel1k fallback
-                end in
-              match result with
+          | Just result_type =>
+              match spread_max_expr fuel1k whole with
               | Nothing => VSurf hole0
-              | Just result_type =>
-                  match spread_max_expr fuel1k whole with
-                  | Nothing => VSurf hole0
-                  | Just source_max =>
-                      let fresh : Nat := S (maxNat source_max
-                        (maxNat (fallible_max_var input)
-                          (maxNat (fallible_max_var input_type)
-                            (maxNat (fallible_max_var fallback)
-                              (maxNat (fallible_max_var result_type)
-                                (fallible_max_var ctor_type)))))) in
-                      iflet_finish lower_run fuel env fixSelf locals ctor
-                        names params fields input fallback result_type fresh yes
-                  end
+              | Just source_max =>
+                  let fresh : Nat := S (maxNat source_max
+                    (maxNat (fallible_max_var input)
+                      (maxNat (fallible_max_var input_type)
+                        (maxNat (fallible_max_var fallback)
+                          (maxNat (fallible_max_var result_type)
+                            (fallible_max_var ctor_type)))))) in
+                  iflet_finish lower_run fuel env fixSelf locals ctor
+                    names params fields input fallback result_type fresh yes
               end
           end
       end
-  | _ => VSurf hole0
   end;
 
 def lower_xviflet
@@ -319,13 +336,40 @@ def lower_xviflet
           let input : Surface := vsurf_or_hole
             (lower_run fuel env (Nothing Surface) fixSelf locals
               (LExpr subject)) in
-          let input_hint : Maybe Surface :=
+          let input_annotation : Maybe Expr :=
             match view_expr subject with
-            | XVAscribe _ annotation =>
+            | XVAscribe _ annotation => Just Expr annotation
+            | XVVar _ => Nothing Expr
+            | XVHole _ => Nothing Expr
+            | XVSort _ => Nothing Expr
+            | XVNat _ => Nothing Expr
+            | XVStr _ => Nothing Expr
+            | XVApp _ _ => Nothing Expr
+            | XVLam _ _ _ => Nothing Expr
+            | XVPi _ _ _ => Nothing Expr
+            | XVLet _ _ _ _ => Nothing Expr
+            | XVMatch _ _ => Nothing Expr
+            | XVFix _ _ _ _ => Nothing Expr
+            | XVEffectRow _ _ => Nothing Expr
+            | XVPerform _ _ => Nothing Expr
+            | XVDo _ => Nothing Expr
+            | XVList _ => Nothing Expr
+            | XVListSpread _ _ => Nothing Expr
+            | XVRange _ _ _ => Nothing Expr
+            | XVHandle _ _ => Nothing Expr
+            | XVFallible _ _ _ _ => Nothing Expr
+            | XVNamedCall _ _ => Nothing Expr
+            | XVUnsupported => Nothing Expr
+            | XVIf _ _ _ => Nothing Expr
+            | XVIfLet _ _ _ _ => Nothing Expr
+            end in
+          let input_hint : Maybe Surface :=
+            match input_annotation with
+            | Just annotation =>
                 Just Surface (vsurf_or_hole
                   (lower_run fuel env (Nothing Surface) fixSelf locals
                     (LExpr annotation)))
-            | _ => surface_type_hint env locals fuel1k input
+            | Nothing => surface_type_hint env locals fuel1k input
             end in
           match input_hint with
           | Nothing => VSurf hole0
@@ -347,7 +391,7 @@ def lower_xviflet
                       | True =>
                           iflet_lower_typed lower_run fuel env expected fixSelf
                             locals ctor names params input input_type
-                            (EIfLet pattern subject yes no)
+                            (EIfLet pattern subject yes no) yes no
                       end
                   end
               end
