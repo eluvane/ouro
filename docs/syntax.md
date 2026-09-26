@@ -145,6 +145,17 @@ keep their existing explicit-argument rules. See
 [Marked constructor parameters](language/ergonomic-syntax.md#marked-constructor-parameters)
 for the bounded inference rule.
 
+Definitions can also opt in with leading `{A : Type}` parameters:
+
+```ouro
+def identity {A : Type} (value : A) : A := value;
+def one : Nat := identity Z;
+def explicit : Nat := identity Nat Z;
+```
+
+Only exact saturated source calls use bounded value and expected type hints;
+explicit calls remain valid. See [Marked definition parameters](language/ergonomic-syntax.md#marked-definition-parameters).
+
 Matches are constructor-based. The current implementation does not provide the
 full pattern language of a mature functional language; advanced patterns,
 or-patterns, and general wildcard exhaustiveness are outside the maintained

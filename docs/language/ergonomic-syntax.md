@@ -238,6 +238,44 @@ parameters of ordinary definitions, search for instances, or solve arbitrary
 type equations. Annotate the result or supply constructor parameters when
 the bounded hints are unavailable.
 
+## Marked definition parameters
+
+A definition may opt in by marking a leading prefix of its source parameters:
+
+```ouro
+def apply {A : Type} {B : Type} (f : A -> B) (x : A) : B := f x;
+def example : Nat := apply (fun (n : Nat) => n) Z;
+def explicit : Nat := apply Nat Nat (fun (n : Nat) => n) Z;
+```
+
+Only leading `{A : Type}` groups are marked. Their domains must be `Type0`;
+ordinary `(A : Type)` parameters stay explicit. The compiler stores both the
+marked count and the number of declared parameter binders, so a function type
+returned by the definition does not become another inferred source argument.
+
+For an omitted prefix, the call must supply exactly the remaining declared
+arguments. A known, non-universe type for its first value is required even
+when an expected result exists; this keeps an explicit partial call such as
+`apply Nat Nat` explicit. A definition with no remaining source arguments may
+instead use a known expected result. Later argument types and the expected
+result can contribute constraints for the marked parameters.
+
+The bounded matcher recognizes direct marked type variables, known inductive
+or constant heads, their applications, and nondependent function types.
+For example, a callback of type `Nat -> Bool` and a `List Nat` argument can
+determine `A = Nat` and `B = Bool` in a marked map-like definition. Different
+names for unused callback binders are accepted. Dependent callback types,
+unknown or shadowed hints, holes, conflicting constraints, and partially
+supplied value arguments need explicit type arguments or an annotation. This
+does not infer omitted parameters of unmarked definitions or invent a type
+parameter from an unknown name.
+
+Lowering inserts ordinary applications in source argument order. The compiler
+checker validates the resulting function call and every source argument;
+source values occur once in the emitted term. Existing explicit full and
+partial calls remain valid. The standard definitions and constructors that
+still use ordinary `(A : Type)` declarations retain explicit arguments.
+
 ## Pure expression blocks
 
 ```ouro
