@@ -9,7 +9,8 @@ Choose a module by task; the generated [API reference](api/README.md) owns decla
 | Task | Modules |
 | --- | --- |
 | Shared types and results | `std/types.ouro`, `std/prelude.ouro`, `std/data.ouro`, `std/result.ouro` |
-| Text and numbers | `std/string.ouro`, `std/text.ouro`, `std/collections.ouro`, `std/num.ouro`, `std/utf8_scalar.ouro` |
+| Lists and iterators | `std/collections.ouro`, `std/iter.ouro`, `std/range.ouro` |
+| Text and numbers | `std/string.ouro`, `std/text.ouro`, `std/num.ouro`, `std/utf8_scalar.ouro` |
 | CLI and configuration | `std/args.ouro`, `std/cli.ouro`, `std/config.ouro`, `std/configx.ouro` |
 | Files and workspace | `std/fs.ouro`, `std/fsx.ouro`, `std/fs_walk.ouro`, `std/fs_replace.ouro`, `std/workspace.ouro` |
 | Data | `std/lines.ouro`, `std/json.ouro`, `std/jsonx.ouro`, `std/csv.ouro`, `std/table.ouro`, `std/tablex.ouro` |
@@ -37,7 +38,10 @@ error type while retaining the result.
 `std/collections.ouro` provides `list_traverse_maybe A B f xs` for an ordered
 list of fallible conversions. It returns `Just []` for an empty list, `Just`
 with all converted values when every call succeeds, or `Nothing` at the first
-failure. `list_traverse_result` preserves a typed error; `filter_map` drops
+failure. `list_traverse_result E A B f xs` preserves the first typed error and
+does not call `f` on later elements. `list_try_fold_result E A S step initial xs`
+and `list_try_fold_maybe A S step initial xs` likewise stop at the first failure;
+an empty list returns `Right initial` or `Just initial`. `filter_map` drops
 missing values when that is the intended behavior.
 
 ## CLI arguments
@@ -100,6 +104,97 @@ preserves the complete Nat value, including values beyond machine-word range.
 ## Lists and data
 
 Use `std/collections.ouro` when a program needs common list operations that are intentionally outside the small prelude: `nth_maybe`, `filter_map`, `map_indexed`, `indexed`, `find_index`, `split_at`, `chunks_of`, `list_take_last`, `list_drop_last`, `adjacent_pairs`, `dedup_adjacent`, `partition_map`, and `list_collect_results`.
+
+`list_windows A width xs` returns overlapping, complete windows. Width zero,
+an empty input, and a width larger than the input return `[]`; for example,
+width two on `[1, 2, 3]` returns `[[1, 2], [2, 3]]`. `adjacent_pairs` returns
+the successive pairs `(1, 2)` and `(2, 3)` for that input.
+
+`list_scan A S step initial xs` includes the initial state and every successive
+state, so an empty input returns `[initial]`. `list_map_accum A S B step initial xs`
+calls `step : S -> A -> Pair S B` once per element in source order and returns
+the final state with the output values in that order. On an empty input it
+returns `(initial, [])`.
+
+`list_group_by A K eq key xs` puts all equal keys in one group, including
+nonadjacent occurrences. Groups follow the first appearance of each key, and
+members retain input order. `eq` must be an equivalence relation. This list
+implementation searches existing groups for each element, so worst-case work
+is quadratic in the input length.
+
+## Lazy iterators
+
+`std/iter.ouro` provides a pure pull iterator with explicit state, item, and
+error types. `iter_from_list` wraps an existing list without building another
+list. `iter_map`, `iter_filter`, and `iter_take` defer work until a pull;
+filtering a rejected item returns a skip step, so one pull never searches an
+unbounded prefix. `iter_take` counts emitted items, not skipped source steps.
+
+```ouro
+let source : Iterator (List Nat) String Nat :=
+  iter_from_list String Nat ([1, 2, 3] : List Nat) in
+let selected : Iterator (List Nat) String Nat :=
+  iter_filter (List Nat) String Nat
+  (fun (value : Nat) => eq_nat value 2) source in
+collect_list (List Nat) String Nat 4 selected
+```
+
+This returns `Right [2]`. `collect_list` requires an explicit maximum number
+of pulls and returns `Either (IterCollectError E) (List A)`. Each yield, skip,
+failure, or end observation costs one pull. Zero pulls always gives
+`IterPullLimit`, even for an empty source; a list of `n` items needs `n + 1`
+pulls to observe its end. A source failure returns `IterSourceFailure` and
+stops; a pull limit returns `IterPullLimit`. Neither returns a partial list as
+success. `iter_take 0` does not pull its upstream source, though collecting
+its own end still costs one pull. Iterators built from lists are finite, while
+a custom iterator need not be; the pull limit bounds calls to its step
+function, not the work performed inside each step.
+
+Adapters do not build intermediate lists. Materialization builds a reversed
+list and allocates another list when reversing it at completion; iterator
+wrappers and step results also allocate. Pull traversal is bounded by
+`max_pulls`, with callback and source-step costs in addition. No
+constant-allocation or automatically fused pipeline is promised.
+
+## Finite Nat ranges
+
+`std/range.ouro` builds finite `Nat` range values for the pull iterator API.
+`nat_range_exclusive start stop` omits `stop`; `nat_range_inclusive start stop`
+includes it when the step lands exactly on it. Both start with step one. The
+original endpoints determine direction: `start < stop` ascends, `start > stop`
+descends, equal endpoints give an empty exclusive range or one inclusive item.
+`nat_range_by step range` replaces the step magnitude and returns
+`Either NatRangeError NatRange`; step zero returns `RangeZeroStep`. The public
+`MkNatRange` constructor is checked again by `iter_from_nat_range`, and a
+forged zero-step cursor returns `IterFail RangeZeroStep` when pulled.
+A directly constructed cursor holds a resume position: the pull checks both
+interval bounds, but does not require the position to align with the step.
+`iter_from_nat_range` starts its cursor at the declared `start`.
+
+```ouro
+import "../std/practical.ouro";
+
+def descending_range_example : Bool :=
+  match iter_from_nat_range (nat_range_inclusive 5 0) with
+  | Left _ => False
+  | Right source =>
+      match collect_list NatRangeCursor NatRangeError Nat 7 source with
+      | Left _ => False
+      | Right values =>
+          list_eq Nat eq_nat values ([5, 4, 3, 2, 1, 0] : List Nat)
+      end
+  end;
+```
+
+`nat_range_by 3 (nat_range_inclusive 10 0)` yields `10, 7, 4, 1`; it does not
+fabricate zero when the step passes the endpoint. An exclusive range `0` to
+`10` by `3` yields `0, 3, 6, 9`. The source itself does not materialize a
+list. `collect_list` returns a typed pull-limit error when its budget is
+exhausted: an empty range needs one pull to observe `IterDone`, and `n`
+yields need `n + 1` pulls. Each pull does constant work apart from Nat
+arithmetic on the values; collecting allocates the final list as described
+above. This lazy, directional API is separate from the eager
+`nat_range_count` and `nat_range_closed` helpers in `std/num.ouro`.
 
 ## Numbers
 
