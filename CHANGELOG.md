@@ -8,6 +8,13 @@ Development changes; see the [compatibility policy](docs/stability.md).
 
 - Lazy error-aware fallback for `Either` and ordered `Maybe` list traversal in
   the practical standard library.
+- Pure `let { ... }` expression blocks accept sequential local bindings and a
+  mandatory final expression; see [Ergonomic syntax](docs/language/ergonomic-syntax.md#pure-expression-blocks).
+- Nonempty list literals can infer an element type from their first element
+  without an expected `List A` context; empty and ambiguous literals still
+  require an annotation.
+- Typed local helpers may omit the result annotation when their body type is
+  inferable; see [Ergonomic syntax](docs/language/ergonomic-syntax.md#typed-local-helper-declarations).
 - Review-only Clippy proofs for Result/Maybe error flow, collection and string
   composition, List producer/consumer laws, arithmetic, literal bounds, Boolean
   identities, and normalization. Rule contracts and exclusions live in the

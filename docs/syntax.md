@@ -67,12 +67,28 @@ let x : A := value in body
 A local helper can put its typed parameters next to its name:
 
 ```ouro
-let twice (x : Nat) : Nat := add x x in twice 2
+let twice (x : Nat) := add x x in twice 2
 ```
 
-This is a non-recursive lambda-binding. Parameterized local helpers require an
-explicit result annotation; [Ergonomic syntax](language/ergonomic-syntax.md#typed-local-helper-declarations)
+This is a non-recursive lambda-binding. Parameterized local helpers require
+typed parameters; the result annotation may be omitted when the body type can
+be inferred. [Ergonomic syntax](language/ergonomic-syntax.md#typed-local-helper-declarations)
 explains their scope and desugaring.
+
+An expression block groups sequential pure bindings with a final expression:
+
+```ouro
+let {
+  let first : Nat := value;
+  let second (x : Nat) := add first x;
+  second 2
+}
+```
+
+Each binding ends with `;`; the final expression has no trailing semicolon.
+The block lowers to nested local `let ... in` expressions. See
+[Pure expression blocks](language/ergonomic-syntax.md#pure-expression-blocks)
+for scope and rejection rules.
 
 ## Inductive data and pattern matching
 
@@ -236,11 +252,19 @@ embedded-NUL limits.
 
 ## Lists
 
-List literals require an expected `List A` type:
+List literals use an expected `List A` type when one is available:
 
 ```ouro
 def values : List Nat := [Z, S Z, S (S Z)];
 def empty : List Nat := [];
+```
+
+A nonempty literal without an expected type can infer its element type from
+its first element. Later elements must have that type:
+
+```ouro
+def inferred : List Nat := let values := [Z, S Z] in values;
+def nested : List (List Nat) := let rows := [[Z], []] in rows;
 ```
 
 A local type ascription can provide the expected element type:
@@ -249,8 +273,14 @@ A local type ascription can provide the expected element type:
 def count : Nat := (([Z, S Z] : List Nat) |> length Nat);
 ```
 
-Untyped `[]`, ambiguous list literals, and trailing commas are rejected. List
-literals lower to the standard `Nil` and `Cons` constructors.
+Untyped `[]` still requires context. If the first element has no inferable
+type, annotate the literal or binding; later elements do not resolve it.
+This is a bounded first-element hint, not general type unification. A free
+local type name shadowed by a later binding also needs an explicit `List A`
+annotation so the earlier type is not rebound under the later name.
+Heterogeneous lists and trailing commas are rejected. List literals lower to
+the standard `Nil` and `Cons` constructors, and the compiler checks every
+element against the selected type.
 
 ## Records
 
