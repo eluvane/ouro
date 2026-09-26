@@ -46,6 +46,7 @@ EXPR = {
     "ENoBinder": "feature:prelude", "EMultiMatch": "feature:form:multi-match",
     "EStr": "feature:string-length", "EDoBind": "property:test-known-counts", "EList": "feature:form:list",
     "ESpan": "feature:parser:abi-and-grammar", "EOpen": "feature:parity:imports-open-local",
+    "EFallible": "feature:form:fallible-block",
 }
 DECL = {"DDef": "feature:prelude", "DAxiom": "negative:effect-root-assumption-type", "DInductive": "feature:prelude",
         "DEffect": "feature:form:handler", "DImport": "property:import-dependency-order",

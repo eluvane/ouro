@@ -58,6 +58,30 @@ def value (e : Either Nat Bool) : Nat :=
   match e with | LeftE x => x | RightE b => match b with | True => {n} | False => {m} end end;
 def result : Nat := add (value (LeftE Nat Bool {m})) (value (RightE Nat Bool True));
 """, n + m, False
+    yield "fallible-block", PRELUDE + f"""inductive Outcome (E : Type) (A : Type) : Type :=
+  | Failed : E -> Outcome E A | Passed : A -> Outcome E A;
+def success : Outcome Nat Nat :=
+  let? (Failed, Passed) : Outcome Nat Nat do
+    let value : Nat := (Passed Nat Nat {n})?;
+    S value
+  end;
+def failure : Outcome Nat Nat :=
+  let? (Failed, Passed) : Outcome Nat Nat do
+    let value : Nat := (Failed Nat Nat {m})?;
+    S value
+  end;
+def boundary : Outcome Nat Nat :=
+  let? (Failed, Passed) : Outcome Nat Nat do
+    let inner : Outcome Nat Nat := let? (Failed, Passed) : Outcome Nat Nat do
+      let value : Nat := (Failed Nat Nat {m})?;
+      S value
+    end;
+    match inner with | Failed error => S error | Passed value => value end
+  end;
+def score (outcome : Outcome Nat Nat) : Nat :=
+  match outcome with | Failed error => add 100 error | Passed value => value end;
+def result : Nat := add (add (score success) (score failure)) (score boundary);
+""", n + 2 * m + 102, False
     phase = "Ready" if seed % 2 else "Raw"
     yield "indexed-phase-param", PRELUDE + f"""inductive Phase : Type := | Raw : Phase | Ready : Phase;
 inductive Box (phase : Phase) : Type := | MkBox : Nat -> Box phase;
