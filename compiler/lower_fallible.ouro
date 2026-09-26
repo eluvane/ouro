@@ -1,0 +1,399 @@
+-- Typed fallible blocks lower to ordinary cases, constructors, and lets.
+
+import "lower_support.ouro",
+  "lower_uses.ouro";
+
+inductive FallibleSpec : Type :=
+  | InvalidFallible : FallibleSpec
+  | ResultFallible : Nat -> Nat -> Nat -> Surface -> Surface -> Surface -> FallibleSpec
+  | MaybeFallible : Nat -> Nat -> Nat -> Surface -> Surface -> FallibleSpec;
+
+def fallible_ctor_shape (env : LowerEnv) (family : Nat)
+    (failure : Nat) (success : Nat) (params : Nat)
+    (failure_arity : Nat) : Bool :=
+  match lookup_ctor(failure, env_ctors env), lookup_ctor(success, env_ctors env) with
+  | Just bad, Just good =>
+      andb(notb(eqNat failure success),
+        andb(eqNat(ctor_indId bad, family),
+          andb(eqNat(ctor_indId good, family),
+            andb(eqNat(ctor_nparams bad, params),
+              andb(eqNat(ctor_nparams good, params),
+                andb(eqNat(ctor_arity bad, failure_arity),
+                  andb(eqNat(ctor_arity good, S Z),
+                    eqNat(count_ctors_ind family (env_ctors env), 2))))))))
+  | _, _ => False
+  end;
+
+def fallible_spec (env : LowerEnv) (locals : List (Pair Nat Surface))
+    (container : Surface) (failure : Nat) (success : Nat) : FallibleSpec :=
+  match surface_hint_has_placeholder locals fuel1k container with
+  | True => InvalidFallible
+  | False =>
+      match peel_ind_apps container with
+      | Nothing => InvalidFallible
+      | Just head =>
+          match head with
+          | MkPair family args =>
+              match args with
+              | Cons first rest =>
+                  match rest with
+                  | Nil =>
+                      match fallible_ctor_shape env family failure success 1 0 with
+                      | True => MaybeFallible family failure success first container
+                      | False => InvalidFallible
+                      end
+                  | Cons second tail =>
+                      match tail with
+                      | Nil =>
+                          match fallible_ctor_shape env family failure success 2 1 with
+                          | True => ResultFallible family failure success first second container
+                          | False => InvalidFallible
+                          end
+                      | Cons _ _ => InvalidFallible
+                      end
+                  end
+              | Nil => InvalidFallible
+              end
+          end
+      end
+  end;
+
+def fallible_container (spec : FallibleSpec) (payload : Surface) : Surface :=
+  match spec with
+  | ResultFallible family _ _ errorTy _ _ =>
+      apply_params family [errorTy, payload]
+  | MaybeFallible family _ _ _ _ => apply_params family [payload]
+  | InvalidFallible => hole0
+  end;
+
+def fallible_output (spec : FallibleSpec) : Surface :=
+  match spec with
+  | ResultFallible _ _ _ _ _ container => container
+  | MaybeFallible _ _ _ _ container => container
+  | InvalidFallible => hole0
+  end;
+
+def fallible_value_type (spec : FallibleSpec) : Surface :=
+  match spec with
+  | ResultFallible _ _ _ _ valueTy _ => valueTy
+  | MaybeFallible _ _ _ valueTy _ => valueTy
+  | InvalidFallible => hole0
+  end;
+
+def fallible_apply (head : Surface) (args : List Surface) : Surface :=
+  (fix go (rest : List Surface) (term : Surface) : Surface :=
+    match rest with
+    | Nil => term
+    | Cons arg tail => go tail (SApp term arg)
+    end) args head;
+
+def fallible_success_env (env : LowerEnv) (spec : FallibleSpec)
+    (value : Surface) : Surface :=
+  match spec with
+  | ResultFallible _ _ success errorTy valueTy _ =>
+      SApp(fallible_apply
+        (ctor_surface_by_name env success) [errorTy, valueTy], value)
+  | MaybeFallible _ _ success valueTy _ =>
+      SApp(fallible_apply
+        (ctor_surface_by_name env success) [valueTy], value)
+  | InvalidFallible => hole0
+  end;
+
+def fallible_failure (env : LowerEnv) (spec : FallibleSpec) : Surface :=
+  match spec with
+  | ResultFallible _ failure _ errorTy valueTy _ =>
+      SLam Z errorTy
+        (SApp(fallible_apply
+          (ctor_surface_by_name env failure) [errorTy, valueTy], SVar Z))
+  | MaybeFallible _ failure _ valueTy _ =>
+      fallible_apply (ctor_surface_by_name env failure) [valueTy]
+  | InvalidFallible => hole0
+  end;
+
+def fallible_max_var : Surface -> Nat :=
+  fix visit (term : Surface) : Nat :=
+    match term with
+    | SVar name => name
+    | SSort _ => Z
+    | SPi binder domain codomain =>
+        maxNat binder (maxNat (visit domain) (visit codomain))
+    | SLam binder annotation body =>
+        maxNat binder (maxNat (visit annotation) (visit body))
+    | SApp function argument => maxNat (visit function) (visit argument)
+    | SLet binder value annotation body =>
+        maxNat binder
+          (maxNat (visit value) (maxNat (visit annotation) (visit body)))
+    | SConst _ => Z
+    | SInd _ => Z
+    | SConstruct _ _ _ => Z
+    | SCase _ predicate scrutinee branches =>
+        maxNat (visit predicate)
+          (maxNat (visit scrutinee)
+            ((fix branch_max (items : List Surface) : Nat :=
+                match items with
+                | Nil => Z
+                | Cons branch rest => maxNat (visit branch) (branch_max rest)
+                end) branches))
+    | SFix binder _ _ annotation body =>
+        maxNat binder (maxNat (visit annotation) (visit body))
+    | SHole _ => Z
+    | SEffectRow ty => visit ty
+    | SPerform _ arguments =>
+        (fix argument_max (items : List Surface) : Nat :=
+          match items with
+          | Nil => Z
+          | Cons argument rest => maxNat (visit argument) (argument_max rest)
+          end) arguments
+    | SStr _ _ => Z
+    end;
+
+-- The shared motive uses fixed binder IDs. Here the result may mention an
+-- enclosing type variable, so choose parameter binders above its used IDs.
+def fallible_motive (family : Nat) (params : Nat) (output : Surface) : Surface :=
+  let names : List Nat :=
+    (fix make (remaining : Nat) (next : Nat) : List Nat :=
+      match remaining with
+      | Z => Nil Nat
+      | S count => Cons Nat next (make count (S next))
+      end) params (S (fallible_max_var output)) in
+  let familyTy : Surface :=
+    apply_params family (map Nat Surface (fun (name : Nat) => SVar name) names) in
+  let core : Surface := SLam Z familyTy output in
+  (fix wrap (remaining : List Nat) (body : Surface) : Surface :=
+    match remaining with
+    | Nil => body
+    | Cons name rest =>
+        let annotation : Surface :=
+          match length Nat remaining with
+          | Z => SSort Z
+          | S index =>
+              match index with
+              | Z => SSort Z
+              | S _ => SInd Z
+              end
+          end in
+        wrap rest (SLam name annotation body)
+    end) (reverse Nat names) core;
+
+def fallible_spec_motive (spec : FallibleSpec) : Surface :=
+  match spec with
+  | ResultFallible family _ _ _ _ output => fallible_motive family 2 output
+  | MaybeFallible family _ _ _ output => fallible_motive family 1 output
+  | InvalidFallible => hole0
+  end;
+
+def fallible_case (env : LowerEnv) (spec : FallibleSpec)
+    (motive : Surface) (payloadTy : Surface) (operand : Surface) (binder : Nat)
+    (tail : Surface) : Surface :=
+  match spec with
+  | ResultFallible family failure success _ _ _ =>
+      let branches : List (Pair Nat Surface) :=
+        [MkPair Nat Surface failure (fallible_failure env spec),
+         MkPair Nat Surface success (SLam binder payloadTy tail)] in
+      SCase (MkCaseInfo family 2 (arities_in_ctor_order env family))
+        motive operand
+        (bodies_in_ctor_order env family branches)
+  | MaybeFallible family failure success _ _ =>
+      let branches : List (Pair Nat Surface) :=
+        [MkPair Nat Surface failure (fallible_failure env spec),
+         MkPair Nat Surface success (SLam binder payloadTy tail)] in
+      SCase (MkCaseInfo family 1 (arities_in_ctor_order env family))
+        motive operand
+        (bodies_in_ctor_order env family branches)
+  | InvalidFallible => hole0
+  end;
+
+def fallible_hint_payload (env : LowerEnv)
+    (locals : List (Pair Nat Surface)) (spec : FallibleSpec)
+    (operand : Surface) : Maybe Surface :=
+  match surface_type_hint env locals fuel1k operand with
+  | Nothing => Nothing Surface
+  | Just hint =>
+      match surface_hint_has_placeholder locals fuel1k hint with
+      | True => Nothing Surface
+      | False =>
+          match peel_ind_apps hint with
+          | Nothing => Nothing Surface
+          | Just head =>
+              match head with
+              | MkPair family args =>
+                  match spec with
+                  | ResultFallible expected _ _ _ _ _ =>
+                      match eqNat family expected with
+                      | False => Nothing Surface
+                      | True =>
+                          match args with
+                          | Nil => Nothing Surface
+                          | Cons _ rest =>
+                              match rest with
+                              | Nil => Nothing Surface
+                              | Cons payload tail =>
+                                  match tail with
+                                  | Nil => Just Surface payload
+                                  | Cons _ _ => Nothing Surface
+                                  end
+                              end
+                          end
+                      end
+                  | MaybeFallible expected _ _ _ _ =>
+                      match eqNat family expected with
+                      | False => Nothing Surface
+                      | True =>
+                          match args with
+                          | Nil => Nothing Surface
+                          | Cons payload tail =>
+                              match tail with
+                              | Nil => Just Surface payload
+                              | Cons _ _ => Nothing Surface
+                              end
+                          end
+                      end
+                  | InvalidFallible => Nothing Surface
+                  end
+              end
+          end
+      end
+  end;
+
+def fallible_shadows_header (name : Nat)
+    (context : List (Pair Nat Surface)) (container_expr : Expr) : Bool :=
+  match lookup_local name context with
+  | Nothing => False
+  | Just _ => expr_uses_var fuel1k name container_expr
+  end;
+
+def lower_fallible_propagate
+    (lower_run : Nat -> LowerEnv -> Maybe Surface -> Maybe Nat ->
+      List (Pair Nat Surface) -> LowerMode -> LowerVal)
+    (continue : List (Pair Nat Surface) -> Expr -> Surface)
+    (fuel : Nat) (env : LowerEnv) (fixSelf : Maybe Nat)
+    (context : List (Pair Nat Surface)) (spec : FallibleSpec)
+    (motive : Surface)
+    (name : Nat) (ann : Maybe Expr)
+    (operand : Expr) (rest : Expr) : Surface :=
+  let payload : Maybe Surface :=
+    match ann with
+    | Just annotation =>
+        Just Surface
+          (vsurf_or_hole
+            (lower_run fuel env (Nothing Surface) fixSelf context
+              (LExpr annotation)))
+    | Nothing =>
+        fallible_hint_payload env context spec
+          (vsurf_or_hole
+            (lower_run fuel env (Nothing Surface) fixSelf context
+              (LExpr operand)))
+    end in
+  match payload with
+  | Nothing => hole0
+  | Just payloadTy =>
+      match surface_hint_has_placeholder context fuel1k payloadTy with
+      | True => hole0
+      | False =>
+          let inputTy : Surface := fallible_container spec payloadTy in
+          let input : Surface :=
+            vsurf_or_hole
+              (lower_run fuel env (Just Surface inputTy) fixSelf context
+                (LExpr operand)) in
+          let tail_context : List (Pair Nat Surface) :=
+            match name with
+            | Z => context
+            | S _ => cons_local name payloadTy context
+            end in
+          fallible_case env spec motive payloadTy input name
+            (continue tail_context rest)
+      end
+  end;
+
+def lower_fallible_body
+    (lower_run : Nat -> LowerEnv -> Maybe Surface -> Maybe Nat ->
+      List (Pair Nat Surface) -> LowerMode -> LowerVal)
+    (fuel : Nat) (env : LowerEnv) (fixSelf : Maybe Nat)
+    (locals : List (Pair Nat Surface)) (spec : FallibleSpec)
+    (container_expr : Expr)
+    (body : Expr) : Surface :=
+  let motive : Surface := fallible_spec_motive spec in
+  (fix go (remaining : Nat) (context : List (Pair Nat Surface))
+      (term : Expr) : Surface :=
+    match remaining with
+    | Z => hole0
+    | S next =>
+        match view_expr term with
+        | XVLet name ann value rest =>
+            match fallible_shadows_header name context container_expr with
+            | True => hole0
+            | False =>
+                match fallible_postfix value with
+                | Just operand =>
+                    lower_fallible_propagate lower_run (go next) next env
+                      fixSelf context spec motive name ann operand rest
+                | Nothing =>
+                    let annTy : Surface :=
+                      match ann with
+                      | Nothing => SInd Z
+                      | Just annotation =>
+                          vsurf_or_hole
+                            (lower_run next env (Nothing Surface) fixSelf context
+                              (LExpr annotation))
+                      end in
+                    let valueTy : Maybe Surface :=
+                      match ann with
+                      | Nothing => Nothing Surface
+                      | Just _ => Just Surface annTy
+                      end in
+                    let valueS : Surface :=
+                      vsurf_or_hole
+                        (lower_run next env valueTy fixSelf context (LExpr value)) in
+                    let localTy : Surface :=
+                      match ann with
+                      | Just _ => annTy
+                      | Nothing =>
+                          match surface_type_hint env context fuel1k valueS with
+                          | Nothing => annTy
+                          | Just hint =>
+                              match surface_hint_has_placeholder context fuel1k hint with
+                              | True => annTy
+                              | False => hint
+                              end
+                          end
+                      end in
+                    SLet name valueS annTy
+                      (go next (cons_local name localTy context) rest)
+                end
+            end
+        | _ =>
+            match fallible_postfix term with
+            | Just operand =>
+                vsurf_or_hole
+                  (lower_run next env (Just Surface (fallible_output spec))
+                    fixSelf context (LExpr operand))
+            | Nothing =>
+                fallible_success_env env spec
+                  (vsurf_or_hole
+                    (lower_run next env
+                      (Just Surface (fallible_value_type spec))
+                      fixSelf context (LExpr term)))
+            end
+        end
+    end) fuel locals body;
+
+def lower_xvfallible
+    (lower_run : Nat -> LowerEnv -> Maybe Surface -> Maybe Nat ->
+      List (Pair Nat Surface) -> LowerMode -> LowerVal)
+    (fuel : Nat) (env : LowerEnv) (fixSelf : Maybe Nat)
+    (locals : List (Pair Nat Surface)) (container : Expr)
+    (failure : Nat) (success : Nat) (body : Expr) : LowerVal :=
+  let containerTy : Surface :=
+    vsurf_or_hole
+      (lower_run fuel env (Nothing Surface) fixSelf locals (LExpr container)) in
+  let spec : FallibleSpec :=
+    fallible_spec env locals containerTy failure success in
+  match spec with
+  | InvalidFallible => VSurf hole0
+  | ResultFallible _ _ _ _ _ _ =>
+      VSurf (lower_fallible_body lower_run fuel env fixSelf locals
+        spec container body)
+  | MaybeFallible _ _ _ _ _ =>
+      VSurf (lower_fallible_body lower_run fuel env fixSelf locals
+        spec container body)
+  end;
