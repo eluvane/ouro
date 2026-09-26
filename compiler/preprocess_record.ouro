@@ -316,6 +316,7 @@ def parse_literal_field_value (field : List Nat) (after : List Nat)
   end;
 
 def fill_literal_go (fs : List RecField) (ctor : List Nat) (n : Nat)
+    (rewrite_value : Nat -> List Nat -> RewriteR)
     (input : List Nat) (initial_seen : List Nat) (initial_vals : List (Pair Nat (List Nat))) : RewriteR :=
   (fix fill_literal_go (fuel : Nat) (xs : List Nat) (seen : List Nat)
       (vals : List (Pair Nat (List Nat))) : RewriteR :=
@@ -353,9 +354,13 @@ def fill_literal_go (fs : List RecField) (ctor : List Nat) (n : Nat)
                                     match memNat idx seen with
                                     | True => RwErr rec_code_dup
                                     | False =>
-                                        fill_literal_go remaining tail (Cons Nat idx seen)
-                                          (Cons (Pair(Nat, List Nat))
-                                            (MkPair Nat (List Nat) idx value) vals)
+                                        match rewrite_value idx value with
+                                        | RwErr code => RwErr code
+                                        | RwOk rewritten _ =>
+                                            fill_literal_go remaining tail (Cons Nat idx seen)
+                                              (Cons (Pair(Nat, List Nat))
+                                                (MkPair Nat (List Nat) idx rewritten) vals)
+                                        end
                                     end
                                 end
                             end
@@ -367,20 +372,132 @@ def fill_literal_go (fs : List RecField) (ctor : List Nat) (n : Nat)
     end) (S (length Nat input)) input initial_seen initial_vals;
 
 def fill_literal (fs : List RecField) (ctor : List Nat) (inner : List Nat)
-    : RewriteR :=
-  fill_literal_go fs ctor (length RecField fs) inner (Nil Nat)
+    (rewrite_value : Nat -> List Nat -> RewriteR) : RewriteR :=
+  fill_literal_go fs ctor (length RecField fs) rewrite_value inner (Nil Nat)
     (Nil (Pair(Nat, List Nat)));
+
+inductive RecUpdateValue : Type :=
+  | MkRecUpdateValue : List (List Nat) -> List Nat -> List Nat -> RecUpdateValue;
 
 inductive RecUpdateParse : Type :=
   | RecUpdateErr : Nat -> RecUpdateParse
-  | RecUpdateOk : List (Pair Nat (List Nat)) -> RecUpdateParse;
+  | RecUpdateOk : List RecUpdateValue -> RecUpdateParse;
 
 inductive RecUpdateBound : Type :=
-  | MkRecUpdateBound : Nat -> List Nat -> List Nat -> List Nat -> RecUpdateBound;
+  | MkRecUpdateBound : List (List Nat) -> List Nat -> List Nat -> List Nat -> RecUpdateBound;
 
-def parse_update_fields (fs : List RecField) (input : List Nat) : RecUpdateParse :=
-  (fix go (fuel : Nat) (xs : List Nat) (seen : List Nat)
-      (values : List (Pair Nat (List Nat))) : RecUpdateParse :=
+inductive RecUpdateBind : Type :=
+  | RecUpdateBindErr : Nat -> RecUpdateBind
+  | RecUpdateBindOk : List RecUpdateBound -> RecUpdateBind;
+
+inductive RecUpdateBuild : Type :=
+  | RecUpdateBuildErr : Nat -> RecUpdateBuild
+  | RecUpdateBuildOk : List Nat -> List (List Nat) -> RecUpdateBuild;
+
+inductive RecUpdateFields : Type :=
+  | RecUpdateFieldsErr : Nat -> RecUpdateFields
+  | RecUpdateFieldsOk : List (Pair Nat (List Nat)) -> List (List Nat) -> RecUpdateFields;
+
+def update_field_type : List RecField -> Nat -> Maybe (List Nat) :=
+  fix update_field_type (fields : List RecField) (idx : Nat) : Maybe (List Nat) :=
+  match fields with
+  | Nil => Nothing (List Nat)
+  | Cons f rest =>
+      match idx with
+      | Z => match f with | MkRecField _ ty => Just (List Nat) ty end
+      | S next => update_field_type rest next
+      end
+  end;
+
+def parse_update_path (input : List Nat)
+    : Maybe (Pair (List (List Nat)) (List Nat)) :=
+  (fix go (fuel : Nat) (xs : List Nat) (rev : List (List Nat))
+      : Maybe (Pair (List (List Nat)) (List Nat)) :=
+    match fuel with
+    | Z => Nothing (Pair (List (List Nat)) (List Nat))
+    | S remaining =>
+        match source_take_ident (skip_ws_p xs) with
+        | MkPair name rest =>
+            match name with
+            | Nil => Nothing (Pair (List (List Nat)) (List Nat))
+            | Cons _ _ =>
+                let path : List (List Nat) := Cons (List Nat) name rev in
+                match skip_ws_p rest with
+                | Cons dot after_dot =>
+                    match eqNat dot ch_dot_p with
+                    | True => go remaining after_dot path
+                    | False => Just (Pair (List (List Nat)) (List Nat))
+                        (MkPair (List (List Nat)) (List Nat)
+                          (reverse (List Nat) path) (skip_ws_p rest))
+                    end
+                | Nil => Just (Pair (List (List Nat)) (List Nat))
+                    (MkPair (List (List Nat)) (List Nat)
+                      (reverse (List Nat) path) (Nil Nat))
+                end
+            end
+        end
+    end) (S (length Nat input)) input (Nil (List Nat));
+
+def update_path_prefix : List (List Nat) -> List (List Nat) -> Bool :=
+  fix update_path_prefix (prefix : List (List Nat)) (path : List (List Nat)) : Bool :=
+  match prefix with
+  | Nil => True
+  | Cons head rest =>
+      match path with
+      | Nil => False
+      | Cons current tail =>
+          andb(source_bytes_equal head current, update_path_prefix rest tail)
+      end
+  end;
+
+def update_path_conflicts (path : List (List Nat))
+    : List (List (List Nat)) -> Bool :=
+  fix update_path_conflicts (seen : List (List (List Nat))) : Bool :=
+  match seen with
+  | Nil => False
+  | Cons old rest =>
+      orb(update_path_prefix path old,
+        orb(update_path_prefix old path, update_path_conflicts rest))
+  end;
+
+def resolve_update_path (reg : RecReg) (initial_ri : Nat)
+    (path : List (List Nat)) : Maybe (List Nat) :=
+  (fix go (ri : Nat) (segments : List (List Nat)) : Maybe (List Nat) :=
+    match segments with
+    | Nil => Nothing (List Nat)
+    | Cons field rest =>
+        match reg with
+        | MkRecReg _ records _ _ =>
+            match nth_rec records ri with
+            | Nothing => Nothing (List Nat)
+            | Just info =>
+                match info with
+                | MkRecInfo _ _ _ fields =>
+                    match find_field_idx field fields with
+                    | Nothing => Nothing (List Nat)
+                    | Just idx =>
+                        match update_field_type fields idx with
+                        | Nothing => Nothing (List Nat)
+                        | Just ty =>
+                            match rest with
+                            | Nil => Just (List Nat) ty
+                            | Cons _ _ =>
+                                match type_to_rec reg ty with
+                                | Nothing => Nothing (List Nat)
+                                | Just child => go child rest
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end) initial_ri path;
+
+def parse_update_fields (reg : RecReg) (ri : Nat)
+    (input : List Nat) : RecUpdateParse :=
+  (fix go (fuel : Nat) (xs : List Nat) (seen : List (List (List Nat)))
+      (values : List RecUpdateValue) : RecUpdateParse :=
     match fuel with
     | Z => RecUpdateErr rec_code_malformed
     | S remaining =>
@@ -388,15 +505,15 @@ def parse_update_fields (fs : List RecField) (input : List Nat) : RecUpdateParse
         | Nil =>
             match seen with
             | Nil => RecUpdateErr rec_code_malformed
-            | Cons _ _ => RecUpdateOk(reverse (Pair Nat (List Nat)) values)
+            | Cons _ _ => RecUpdateOk(reverse RecUpdateValue values)
             end
         | Cons _ _ =>
-            match source_take_ident (skip_ws_p xs) with
-            | MkPair field rest =>
-                match field with
-                | Nil => RecUpdateErr rec_code_malformed
-                | Cons _ _ =>
-                    match skip_ws_p rest with
+            match parse_update_path xs with
+            | Nothing => RecUpdateErr rec_code_malformed
+            | Just parsed =>
+                match parsed with
+                | MkPair path rest =>
+                    match rest with
                     | Cons colon after_colon =>
                         match after_colon with
                         | Cons equals rhs =>
@@ -408,32 +525,23 @@ def parse_update_fields (fs : List RecField) (input : List Nat) : RecUpdateParse
                                     match skip_ws_p raw with
                                     | Nil => RecUpdateErr rec_code_malformed
                                     | Cons _ _ =>
-                                        match skip_ws_p tail with
-                                        | Nil =>
-                                            match find_field_idx field fs with
-                                            | Nothing => RecUpdateErr rec_code_unknown
-                                            | Just idx =>
-                                                match memNat idx seen with
-                                                | True => RecUpdateErr rec_code_dup
-                                                | False => go remaining (Nil Nat)
-                                                    (Cons Nat idx seen)
-                                                    (Cons (Pair Nat (List Nat))
-                                                      (MkPair Nat (List Nat) idx raw) values)
-                                                end
-                                            end
-                                        | Cons comma after_comma =>
-                                            match eqNat comma ch_comma_p with
-                                            | False => RecUpdateErr rec_code_malformed
-                                            | True =>
-                                                match find_field_idx field fs with
-                                                | Nothing => RecUpdateErr rec_code_unknown
-                                                | Just idx =>
-                                                    match memNat idx seen with
-                                                    | True => RecUpdateErr rec_code_dup
-                                                    | False => go remaining after_comma
-                                                        (Cons Nat idx seen)
-                                                        (Cons (Pair Nat (List Nat))
-                                                          (MkPair Nat (List Nat) idx raw) values)
+                                        match resolve_update_path reg ri path with
+                                        | Nothing => RecUpdateErr rec_code_unknown
+                                        | Just ty =>
+                                            match update_path_conflicts path seen with
+                                            | True => RecUpdateErr rec_code_dup
+                                            | False =>
+                                                let more : List RecUpdateValue :=
+                                                  Cons RecUpdateValue
+                                                    (MkRecUpdateValue path ty raw) values in
+                                                let seen2 : List (List (List Nat)) :=
+                                                  Cons (List (List Nat)) path seen in
+                                                match skip_ws_p tail with
+                                                | Nil => RecUpdateOk(reverse RecUpdateValue more)
+                                                | Cons comma after_comma =>
+                                                    match eqNat comma ch_comma_p with
+                                                    | True => go remaining after_comma seen2 more
+                                                    | False => RecUpdateErr rec_code_malformed
                                                     end
                                                 end
                                             end
@@ -448,7 +556,8 @@ def parse_update_fields (fs : List RecField) (input : List Nat) : RecUpdateParse
                 end
             end
         end
-    end) (S (length Nat input)) input (Nil Nat) (Nil (Pair Nat (List Nat)));
+    end) (S (length Nat input)) input
+      (Nil (List (List Nat))) (Nil RecUpdateValue);
 
 def source_ident_used (name : List Nat) (input : List Nat) : Bool :=
   (fix go (fuel : Nat) (xs : List Nat) : Bool :=
@@ -493,77 +602,90 @@ def fresh_update_name (input : List Nat) (used : List (List Nat))
     end) (S (add (length Nat input) (length (List Nat) used)))
       ([95, 95, 111, 117, 114, 111, 95, 117, 112, 100, 97, 116, 101] : List Nat);
 
-def update_field_type : List RecField -> Nat -> Maybe (List Nat) :=
-  fix update_field_type (fields : List RecField) (idx : Nat) : Maybe (List Nat) :=
-  match fields with
-  | Nil => Nothing (List Nat)
-  | Cons f rest =>
-      match idx with
-      | Z => match f with | MkRecField _ ty => Just (List Nat) ty end
-      | S next => update_field_type rest next
-      end
-  end;
-
-def bind_update_fields (input : List Nat) (fields : List RecField)
-    (initial_used : List (List Nat)) (values : List (Pair Nat (List Nat)))
-    : Maybe (List RecUpdateBound) :=
-  (fix go (remaining : List (Pair Nat (List Nat))) (used : List (List Nat))
-      : Maybe (List RecUpdateBound) :=
+def bind_update_fields (input : List Nat) (initial_used : List (List Nat))
+    (values : List RecUpdateValue)
+    (rewrite_value : List Nat -> List Nat -> RewriteR) : RecUpdateBind :=
+  (fix go (remaining : List RecUpdateValue) (used : List (List Nat))
+      : RecUpdateBind :=
     match remaining with
-    | Nil => Just (List RecUpdateBound) (Nil RecUpdateBound)
+    | Nil => RecUpdateBindOk (Nil RecUpdateBound)
     | Cons value rest =>
         match value with
-        | MkPair idx rhs =>
-            match update_field_type fields idx with
-            | Nothing => Nothing (List RecUpdateBound)
-            | Just ty =>
-                match fresh_update_name input used with
-                | Nothing => Nothing (List RecUpdateBound)
-                | Just binder =>
+        | MkRecUpdateValue path ty rhs =>
+            match fresh_update_name input used with
+            | Nothing => RecUpdateBindErr rec_code_malformed
+            | Just binder =>
+                match rewrite_value ty rhs with
+                | RwErr code => RecUpdateBindErr code
+                | RwOk rewritten _ =>
                     match go rest (Cons (List Nat) binder used) with
-                    | Nothing => Nothing (List RecUpdateBound)
-                    | Just tail => Just (List RecUpdateBound)
-                        (Cons RecUpdateBound (MkRecUpdateBound idx binder ty rhs) tail)
+                    | RecUpdateBindErr code => RecUpdateBindErr code
+                    | RecUpdateBindOk tail =>
+                        RecUpdateBindOk
+                          (Cons RecUpdateBound
+                            (MkRecUpdateBound path binder ty rewritten) tail)
                     end
                 end
             end
         end
     end) values initial_used;
 
-def update_bound_value : Nat -> List RecUpdateBound -> Maybe (List Nat) :=
-  fix update_bound_value (idx : Nat) (values : List RecUpdateBound) : Maybe (List Nat) :=
-  match values with
+def update_bound_names : List RecUpdateBound -> List (List Nat) :=
+  fix update_bound_names (updates : List RecUpdateBound) : List (List Nat) :=
+  match updates with
+  | Nil => Nil (List Nat)
+  | Cons value rest =>
+      match value with
+      | MkRecUpdateBound _ binder _ _ =>
+          Cons (List Nat) binder (update_bound_names rest)
+      end
+  end;
+
+def update_direct_value (field : List Nat)
+    : List RecUpdateBound -> Maybe (List Nat) :=
+  fix update_direct_value (updates : List RecUpdateBound) : Maybe (List Nat) :=
+  match updates with
   | Nil => Nothing (List Nat)
   | Cons value rest =>
       match value with
-      | MkRecUpdateBound field binder _ _ =>
-          match eqNat field idx with
-          | True => Just (List Nat) binder
-          | False => update_bound_value idx rest
+      | MkRecUpdateBound path binder _ _ =>
+          match path with
+          | Nil => update_direct_value rest
+          | Cons head tail =>
+              match andb(source_bytes_equal head field,
+                    match tail with | Nil => True | Cons _ _ => False end) with
+              | True => Just (List Nat) binder
+              | False => update_direct_value rest
+              end
           end
       end
   end;
 
-def complete_update_values (rec_name : List Nat) (base : List Nat)
-    (fields : List RecField) (updates : List RecUpdateBound)
-    : List (Pair Nat (List Nat)) :=
-  (fix go (remaining : List RecField) (idx : Nat)
-      : List (Pair Nat (List Nat)) :=
-    match remaining with
-    | Nil => Nil (Pair Nat (List Nat))
-    | Cons field rest =>
-        match field with
-        | MkRecField field_name _ =>
-            let value : List Nat :=
-                match update_bound_value idx updates with
-                | Just binder => binder
-                | Nothing => append Nat (acc_name rec_name field_name)
-                    (Cons Nat ch_space_p base)
-                end in
-            Cons (Pair Nat (List Nat)) (MkPair Nat (List Nat) idx value)
-              (go rest (S idx))
-        end
-    end) fields Z;
+def update_nested_values (field : List Nat)
+    : List RecUpdateBound -> List RecUpdateBound :=
+  fix update_nested_values (updates : List RecUpdateBound) : List RecUpdateBound :=
+  match updates with
+  | Nil => Nil RecUpdateBound
+  | Cons value rest =>
+      match value with
+      | MkRecUpdateBound path binder ty rhs =>
+          match path with
+          | Nil => update_nested_values rest
+          | Cons head tail =>
+              match tail with
+              | Nil => update_nested_values rest
+              | Cons _ _ =>
+                  match source_bytes_equal head field with
+                  | False => update_nested_values rest
+                  | True =>
+                      Cons RecUpdateBound
+                        (MkRecUpdateBound tail binder ty rhs)
+                        (update_nested_values rest)
+                  end
+              end
+          end
+      end
+  end;
 
 def wrap_update_let (binder : List Nat) (ty : List Nat)
     (value : List Nat) (body : List Nat) : List Nat :=
@@ -587,8 +709,89 @@ def wrap_update_values : List RecUpdateBound -> List Nat -> List Nat :=
       end
   end;
 
+def build_updated_record (reg : RecReg) (source : List Nat)
+    (initial_ri : Nat) (initial_base : List Nat)
+    (initial_updates : List RecUpdateBound) (initial_used : List (List Nat))
+    : RecUpdateBuild :=
+  (fix build (fuel : Nat) (ri : Nat) (base : List Nat)
+      (updates : List RecUpdateBound) (used : List (List Nat))
+      : RecUpdateBuild :=
+    match fuel with
+    | Z => RecUpdateBuildErr rec_code_malformed
+    | S remaining =>
+        match reg with
+        | MkRecReg _ records _ _ =>
+            match nth_rec records ri with
+            | Nothing => RecUpdateBuildErr rec_code_unknown
+            | Just info =>
+                match info with
+                | MkRecInfo _ rec_name ctor fields =>
+                    let results : RecUpdateFields :=
+                      (fix fields_go (todo : List RecField) (idx : Nat)
+                          (current_used : List (List Nat)) : RecUpdateFields :=
+                        match todo with
+                        | Nil => RecUpdateFieldsOk
+                            (Nil (Pair Nat (List Nat))) current_used
+                        | Cons field rest =>
+                            match field with
+                            | MkRecField field_name field_ty =>
+                                let accessor : List Nat :=
+                                  append Nat (acc_name rec_name field_name)
+                                    (Cons Nat ch_space_p base) in
+                                let nested : List RecUpdateBound :=
+                                  update_nested_values field_name updates in
+                                let chosen : RecUpdateBuild :=
+                                  match update_direct_value field_name updates with
+                                  | Just binder => RecUpdateBuildOk binder current_used
+                                  | Nothing =>
+                                      match nested with
+                                      | Nil => RecUpdateBuildOk accessor current_used
+                                      | Cons _ _ =>
+                                          match type_to_rec reg field_ty with
+                                          | Nothing => RecUpdateBuildErr rec_code_unknown
+                                          | Just child_ri =>
+                                              match fresh_update_name source current_used with
+                                              | Nothing => RecUpdateBuildErr rec_code_malformed
+                                              | Just child_name =>
+                                                  match build remaining child_ri child_name nested
+                                                        (Cons (List Nat) child_name current_used) with
+                                                  | RecUpdateBuildErr code => RecUpdateBuildErr code
+                                                  | RecUpdateBuildOk constructed next_used =>
+                                                      RecUpdateBuildOk
+                                                        (wrap_update_let child_name field_ty
+                                                          accessor constructed) next_used
+                                                  end
+                                              end
+                                          end
+                                      end
+                                  end in
+                                match chosen with
+                                | RecUpdateBuildErr code => RecUpdateFieldsErr code
+                                | RecUpdateBuildOk value next_used =>
+                                    match fields_go rest (S idx) next_used with
+                                    | RecUpdateFieldsErr code => RecUpdateFieldsErr code
+                                    | RecUpdateFieldsOk tail used_after =>
+                                        RecUpdateFieldsOk
+                                          (Cons (Pair Nat (List Nat))
+                                            (MkPair Nat (List Nat) idx value) tail)
+                                          used_after
+                                    end
+                                end
+                            end
+                        end) fields Z used in
+                    match results with
+                    | RecUpdateFieldsErr code => RecUpdateBuildErr code
+                    | RecUpdateFieldsOk values final_used =>
+                        RecUpdateBuildOk (build_ctor_app ctor fields values) final_used
+                    end
+                end
+            end
+        end
+    end) (S (length Nat source)) initial_ri initial_base initial_updates initial_used;
+
 def expand_record_update (reg : RecReg) (expected : Maybe Nat)
-    (inner : List Nat) (source : List Nat) : RewriteR :=
+    (inner : List Nat) (source : List Nat)
+    (rewrite_value : Maybe Nat -> List Nat -> RewriteR) : RewriteR :=
   match expected with
   | Nothing => RwErr rec_code_need_ty
   | Just ri =>
@@ -598,7 +801,7 @@ def expand_record_update (reg : RecReg) (expected : Maybe Nat)
           | Nothing => RwErr rec_code_need_ty
           | Just info =>
               match info with
-              | MkRecInfo _ rec_name ctor fields =>
+              | MkRecInfo _ rec_name _ _ =>
                   match take_until_word w_with inner with
                   | MkPair base after =>
                       match word_at w_with after with
@@ -607,27 +810,357 @@ def expand_record_update (reg : RecReg) (expected : Maybe Nat)
                           match skip_ws_p base with
                           | Nil => RwErr rec_code_malformed
                           | Cons _ _ =>
-                              match parse_update_fields fields
+                              match parse_update_fields reg ri
                                       (source_drop_prefix w_with after) with
                               | RecUpdateErr code => RwErr code
                               | RecUpdateOk values =>
                                   match fresh_update_name source names with
                                   | Nothing => RwErr rec_code_malformed
                                   | Just base_name =>
-                                      match bind_update_fields source fields
-                                              (Cons (List Nat) base_name names) values with
-                                      | Nothing => RwErr rec_code_malformed
-                                      | Just bound =>
-                                          let filled : List (Pair Nat (List Nat)) :=
-                                            complete_update_values rec_name base_name fields bound in
-                                          let constructed : List Nat :=
-                                            build_ctor_app ctor fields filled in
-                                          let lowered : List Nat :=
-                                            wrap_update_let base_name rec_name base
-                                              (wrap_update_values bound constructed) in
-                                          RwOk(Cons Nat ch_lparen_p
-                                            (append Nat lowered (n1p ch_rparen_p)), Nil Nat)
+                                      match rewrite_value (Just Nat ri) base with
+                                      | RwErr code => RwErr code
+                                      | RwOk rewritten_base _ =>
+                                          match bind_update_fields source
+                                                (Cons (List Nat) base_name names) values
+                                                (fun (ty : List Nat) (rhs : List Nat) =>
+                                                  rewrite_value (type_to_rec reg ty) rhs) with
+                                          | RecUpdateBindErr code => RwErr code
+                                          | RecUpdateBindOk bound =>
+                                              let used : List (List Nat) :=
+                                                append (List Nat) (update_bound_names bound)
+                                                  (Cons (List Nat) base_name names) in
+                                              match build_updated_record reg source ri base_name
+                                                    bound used with
+                                              | RecUpdateBuildErr code => RwErr code
+                                              | RecUpdateBuildOk constructed _ =>
+                                                  let lowered : List Nat :=
+                                                    wrap_update_let base_name rec_name rewritten_base
+                                                      (wrap_update_values bound constructed) in
+                                                  RwOk(Cons Nat ch_lparen_p
+                                                    (append Nat lowered (n1p ch_rparen_p)), Nil Nat)
+                                              end
+                                          end
                                       end
+                                  end
+                              end
+                          end
+                      end
+                  end
+              end
+          end
+      end
+  end;
+
+inductive RecLocalParse : Type :=
+  | RecLocalNone : RecLocalParse
+  | RecLocalOk : List Nat -> List Nat -> Maybe Nat -> List Nat -> List Nat -> List Nat -> RecLocalParse;
+
+def source_prefix_before_tail (whole : List Nat) (tail : List Nat) : List Nat :=
+  (fix go (xs : List Nat) (acc : List Nat) : List Nat :=
+    match eqNat (length Nat xs) (length Nat tail) with
+    | True => reverse Nat acc
+    | False =>
+        match xs with
+        | Nil => reverse Nat acc
+        | Cons c rest => go rest (Cons Nat c acc)
+        end
+    end) whole (Nil Nat);
+
+inductive RecLocalBoundary : Type :=
+  | RecLocalBoundaryNone : RecLocalBoundary
+  | RecLocalBoundaryAt : List Nat -> List Nat -> List Nat -> RecLocalBoundary;
+
+def open_in_tail (after_open : List Nat) : Maybe (List Nat) :=
+  match source_take_ident (skip_ws_p after_open) with
+  | MkPair alias after_alias =>
+      match alias with
+      | Nil => Nothing (List Nat)
+      | Cons _ _ =>
+          match source_take_ident (skip_ws_p after_alias) with
+          | MkPair keyword after_in =>
+              match source_bytes_equal keyword (n2p 105 110) with
+              | True => Just (List Nat) after_in
+              | False => Nothing (List Nat)
+              end
+          end
+      end
+  end;
+
+def local_end_opener (name : List Nat) : Bool :=
+  orb(source_bytes_equal name (n2p 100 111),
+    orb(source_bytes_equal name (n5p 109 97 116 99 104),
+      source_bytes_equal name (n6p 104 97 110 100 108 101)));
+
+def local_fallible_after (after_let : List Nat) : Bool :=
+  match skip_ws_p after_let with
+  | Nil => False
+  | Cons marker rest =>
+      match eqNat marker 63 with
+      | False => False
+      | True =>
+          match skip_ws_p rest with
+          | Nil => False
+          | Cons opening _ => eqNat opening ch_lparen_p
+          end
+      end
+  end;
+
+def take_local_boundary (input : List Nat) : RecLocalBoundary :=
+  (fix go (fuel : Nat) (xs : List Nat) (acc : List Nat)
+      (depth : Nat) (nested_lets : Nat) (end_depth : Nat) : RecLocalBoundary :=
+    match fuel with
+    | Z => RecLocalBoundaryNone
+    | S remaining =>
+        match xs with
+        | Nil => RecLocalBoundaryNone
+        | Cons c rest =>
+            match source_copy_comment_or_string acc xs with
+            | Just copied =>
+                match copied with
+                | MkPair next_acc next =>
+                    go remaining next next_acc depth nested_lets end_depth
+                end
+            | Nothing =>
+                match andb(eqNat depth Z,
+                      andb(eqNat end_depth Z, eqNat c ch_semi_p)) with
+                | True =>
+                    match nested_lets with
+                    | Z =>
+                        RecLocalBoundaryAt (reverse Nat acc) (n1p ch_semi_p) rest
+                    | S _ =>
+                        go remaining rest (Cons Nat c acc) depth nested_lets end_depth
+                    end
+                | False =>
+                    match source_is_ident_start c with
+                    | False =>
+                        go remaining rest (Cons Nat c acc) (bump_depth c depth)
+                          nested_lets end_depth
+                    | True =>
+                        match source_take_ident xs with
+                        | MkPair name after =>
+                            let next_acc : List Nat := emit acc name in
+                            match eqNat depth Z with
+                            | False =>
+                                go remaining after next_acc depth nested_lets end_depth
+                            | True =>
+                                match end_depth with
+                                | S previous =>
+                                    match local_end_opener name with
+                                    | True =>
+                                        go remaining after next_acc depth nested_lets
+                                          (S end_depth)
+                                    | False =>
+                                        match source_bytes_equal name w_end with
+                                        | True =>
+                                            go remaining after next_acc depth nested_lets
+                                              previous
+                                        | False =>
+                                            go remaining after next_acc depth nested_lets
+                                              end_depth
+                                        end
+                                    end
+                                | Z =>
+                                    match local_end_opener name with
+                                    | True =>
+                                        go remaining after next_acc depth nested_lets (S Z)
+                                    | False =>
+                                        match source_bytes_equal name (n2p 105 110) with
+                                        | True =>
+                                            match nested_lets with
+                                            | Z => RecLocalBoundaryAt (reverse Nat acc)
+                                                (n2p 105 110) after
+                                            | S previous =>
+                                                go remaining after next_acc depth previous Z
+                                            end
+                                        | False =>
+                                            match source_bytes_equal name
+                                                  (n4p 111 112 101 110) with
+                                            | True =>
+                                                match open_in_tail after with
+                                                | Just after_in =>
+                                                    go remaining after_in
+                                                      (emit acc
+                                                        (source_prefix_before_tail xs after_in))
+                                                      depth nested_lets Z
+                                                | Nothing =>
+                                                    go remaining after next_acc depth nested_lets Z
+                                                end
+                                            | False =>
+                                                match source_bytes_equal name w_let_p with
+                                                | False =>
+                                                    go remaining after next_acc depth nested_lets Z
+                                                | True =>
+                                                    match local_fallible_after after with
+                                                    | True =>
+                                                        go remaining after next_acc depth nested_lets Z
+                                                    | False =>
+                                                        match skip_ws_p after with
+                                                        | Cons brace _ =>
+                                                            match eqNat brace ch_lbrace_p with
+                                                            | True =>
+                                                                go remaining after next_acc depth
+                                                                  nested_lets Z
+                                                            | False =>
+                                                                go remaining after next_acc depth
+                                                                  (S nested_lets) Z
+                                                            end
+                                                        | Nil =>
+                                                            go remaining after next_acc depth
+                                                              (S nested_lets) Z
+                                                        end
+                                                    end
+                                                end
+                                            end
+                                        end
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end) (S (length Nat input)) input (Nil Nat) Z Z Z;
+
+def parse_scoped_local (reg : RecReg) (input : List Nat) : RecLocalParse :=
+  match source_take_ident (skip_ws_p input) with
+  | MkPair keyword after_let =>
+      match source_bytes_equal keyword w_let_p with
+      | False => RecLocalNone
+      | True =>
+          match source_take_ident (skip_ws_p after_let) with
+          | MkPair binder after_binder =>
+              match binder with
+              | Nil => RecLocalNone
+              | Cons _ _ =>
+                  match take_until_coloneq after_binder with
+                  | MkPair header assignment =>
+                      match assignment with
+                      | Nil => RecLocalNone
+                      | Cons colon after_colon =>
+                          match after_colon with
+                          | Nil => RecLocalNone
+                          | Cons equals rhs =>
+                              match andb(eqNat colon ch_colon_p, eqNat equals ch_eq_p) with
+                              | False => RecLocalNone
+                              | True =>
+                                  let expected : Maybe Nat :=
+                                    match skip_ws_p header with
+                                    | Cons first ty =>
+                                        match eqNat first ch_colon_p with
+                                        | True => type_to_rec reg ty
+                                        | False => Nothing Nat
+                                        end
+                                    | Nil => Nothing Nat
+                                    end in
+                                  match take_local_boundary rhs with
+                                  | RecLocalBoundaryNone => RecLocalNone
+                                  | RecLocalBoundaryAt value separator body =>
+                                      RecLocalOk binder
+                                        (source_prefix_before_tail input rhs)
+                                        expected value separator body
+                                  end
+                              end
+                          end
+                      end
+                  end
+              end
+          end
+      end
+  end;
+
+inductive RecAscription : Type :=
+  | RecAscriptionNone : RecAscription
+  | RecAscriptionOk : List Nat -> List Nat -> Nat -> List Nat -> List Nat -> RecAscription;
+
+def parse_direct_record_ascription (reg : RecReg) (input : List Nat)
+    : RecAscription :=
+  match skip_ws_p input with
+  | Cons opening _ =>
+      match eqNat opening ch_lparen_p with
+      | False => RecAscriptionNone
+      | True =>
+          match take_until_char ch_lparen_p input with
+          | MkPair before opening_source =>
+              match opening_source with
+              | Cons _ inside =>
+                  match take_until_char ch_rparen_p inside with
+                  | MkPair content closing =>
+                      match closing with
+                      | Cons paren _ =>
+                          match eqNat paren ch_rparen_p with
+                          | False => RecAscriptionNone
+                          | True =>
+                              match take_until_char ch_colon_p content with
+                              | MkPair value annotation =>
+                                  match annotation with
+                                  | Cons colon ty =>
+                                      match eqNat colon ch_colon_p with
+                                      | False => RecAscriptionNone
+                                      | True =>
+                                          match matching_brace (skip_ws_p value) with
+                                          | Nothing => RecAscriptionNone
+                                          | Just braced =>
+                                              match braced with
+                                              | MkPair _ after_brace =>
+                                                  match skip_ws_p after_brace with
+                                                  | Cons _ _ => RecAscriptionNone
+                                                  | Nil =>
+                                                      match type_to_rec reg ty with
+                                                      | Nothing => RecAscriptionNone
+                                                      | Just ri =>
+                                                          RecAscriptionOk
+                                                            (append Nat before (n1p ch_lparen_p))
+                                                            value ri
+                                                            (append Nat annotation (n1p ch_rparen_p))
+                                                            (source_drop_prefix (n1p ch_rparen_p) closing)
+                                                      end
+                                                  end
+                                              end
+                                          end
+                                      end
+                                  | Nil => RecAscriptionNone
+                                  end
+                              end
+                          end
+                      | Nil => RecAscriptionNone
+                      end
+                  end
+              | Nil => RecAscriptionNone
+              end
+          end
+      end
+  | Nil => RecAscriptionNone
+  end;
+
+def grouped_local_body (input : List Nat)
+    : Maybe (Pair (List Nat) (List Nat)) :=
+  match input with
+  | Nil => Nothing (Pair (List Nat) (List Nat))
+  | Cons opening rest =>
+      match eqNat opening ch_lparen_p with
+      | False => Nothing (Pair (List Nat) (List Nat))
+      | True =>
+          match take_until_char ch_rparen_p rest with
+          | MkPair content closing =>
+              match closing with
+              | Nil => Nothing (Pair (List Nat) (List Nat))
+              | Cons closer tail =>
+                  match eqNat closer ch_rparen_p with
+                  | False => Nothing (Pair (List Nat) (List Nat))
+                  | True =>
+                      match source_take_ident (skip_ws_p content) with
+                      | MkPair keyword _ =>
+                          match source_bytes_equal keyword w_let_p with
+                          | False => Nothing (Pair (List Nat) (List Nat))
+                          | True =>
+                              match take_until_char ch_comma_p content with
+                              | MkPair _ after_comma =>
+                                  match after_comma with
+                                  | Nil =>
+                                      Just (Pair (List Nat) (List Nat))
+                                        (MkPair (List Nat) (List Nat) content tail)
+                                  | Cons _ _ => Nothing (Pair (List Nat) (List Nat))
                                   end
                               end
                           end
@@ -641,10 +1174,30 @@ def expand_record_update (reg : RecReg) (expected : Maybe Nat)
 -- Nested expansion and suffix scans each consume an explicit input-sized bound.
 def rewrite_expr (reg : RecReg) (env : RecEnv) (initial_expected : Maybe Nat)
     (input : List Nat) : RewriteR :=
-  (fix rewrite_expr (depth_fuel : Nat) (expected : Maybe Nat) (xs0 : List Nat) : RewriteR :=
+  (fix rewrite_expr (depth_fuel : Nat) (current_env : RecEnv)
+      (expected : Maybe Nat) (xs0 : List Nat) : RewriteR :=
     match depth_fuel with
     | Z => RwErr rec_code_malformed
     | S depth_left =>
+        match parse_scoped_local reg xs0 with
+        | RecLocalOk binder prefix binding_expected rhs separator body =>
+            match rewrite_expr depth_left current_env binding_expected rhs with
+            | RwErr code => RwErr code
+            | RwOk rewritten_rhs _ =>
+                let body_env : RecEnv :=
+                  match binding_expected with
+                  | Just ri => env_add current_env binder ri
+                  | Nothing => env_mask current_env reg binder
+                  end in
+                match rewrite_expr depth_left body_env expected body with
+                | RwErr code => RwErr code
+                | RwOk rewritten_body _ =>
+                    RwOk(append Nat prefix
+                      (append Nat rewritten_rhs
+                        (append Nat separator rewritten_body)), Nil Nat)
+                end
+            end
+        | RecLocalNone =>
         (fix go (scan_fuel : Nat) (xs : List Nat) (acc : List Nat) : RewriteR :=
           match scan_fuel with
           | Z => RwErr rec_code_malformed
@@ -667,11 +1220,18 @@ def rewrite_expr (reg : RecReg) (env : RecEnv) (initial_expected : Maybe Nat)
                               | MkPair body tail =>
                                   match top_has_with (strip_braces body) with
                                   | True =>
-                                      match expand_record_update reg expected
-                                              (strip_braces body) xs0 with
+                                      let brace_expected : Maybe Nat :=
+                                        match skip_ws_p (reverse Nat acc) with
+                                        | Nil => expected
+                                        | Cons _ _ => Nothing Nat
+                                        end in
+                                      match expand_record_update reg brace_expected
+                                              (strip_braces body) xs0
+                                              (fun (m : Maybe Nat) (value : List Nat) =>
+                                                rewrite_expr depth_left current_env m value) with
                                       | RwErr code => RwErr code
                                       | RwOk update _ =>
-                                          match rewrite_expr depth_left
+                                          match rewrite_expr depth_left current_env
                                                   (Nothing Nat) update with
                                           | RwErr code => RwErr code
                                           | RwOk expanded _ =>
@@ -683,7 +1243,12 @@ def rewrite_expr (reg : RecReg) (env : RecEnv) (initial_expected : Maybe Nat)
                                           top_starts_pun (strip_braces body)) with
                                       | False => go scan_left tail (emit acc body)
                                       | True =>
-                                          match expected with
+                                          let brace_expected : Maybe Nat :=
+                                            match skip_ws_p (reverse Nat acc) with
+                                            | Nil => expected
+                                            | Cons _ _ => Nothing Nat
+                                            end in
+                                          match brace_expected with
                                           | Nothing => RwErr rec_code_need_ty
                                           | Just ri =>
                                               match reg with
@@ -694,10 +1259,18 @@ def rewrite_expr (reg : RecReg) (env : RecEnv) (initial_expected : Maybe Nat)
                                                       match info with
                                                       | MkRecInfo _ _ ctor fs =>
                                                           match fill_literal fs ctor
-                                                                  (strip_braces body) with
+                                                                  (strip_braces body)
+                                                                  (fun (idx : Nat) (value : List Nat) =>
+                                                                    match update_field_type fs idx with
+                                                                    | Nothing => RwErr rec_code_unknown
+                                                                    | Just ty =>
+                                                                        rewrite_expr depth_left
+                                                                          current_env (type_to_rec reg ty)
+                                                                          value
+                                                                    end) with
                                                           | RwErr e => RwErr e
                                                           | RwOk lit _ =>
-                                                              match rewrite_expr depth_left
+                                                              match rewrite_expr depth_left current_env
                                                                       (Nothing Nat) lit with
                                                               | RwErr e => RwErr e
                                                               | RwOk lit2 _ =>
@@ -713,6 +1286,42 @@ def rewrite_expr (reg : RecReg) (env : RecEnv) (initial_expected : Maybe Nat)
                               end
                           end
                       | False =>
+                          match eqNat c ch_lparen_p with
+                          | True =>
+                              match parse_direct_record_ascription reg xs with
+                              | RecAscriptionOk prefix value ri annotation tail =>
+                                  match rewrite_expr depth_left current_env (Just Nat ri) value with
+                                  | RwErr code => RwErr code
+                                  | RwOk rewritten _ =>
+                                      go scan_left tail
+                                        (emit acc
+                                          (append Nat prefix
+                                            (append Nat rewritten annotation)))
+                                  end
+                              | RecAscriptionNone =>
+                                  match grouped_local_body xs with
+                                  | Nothing => go scan_left rest (Cons Nat c acc)
+                                  | Just grouped =>
+                                      match grouped with
+                                      | MkPair content tail =>
+                                          let group_expected : Maybe Nat :=
+                                            match skip_ws_p (reverse Nat acc) with
+                                            | Nil => expected
+                                            | Cons _ _ => Nothing Nat
+                                            end in
+                                          match rewrite_expr depth_left current_env
+                                                group_expected content with
+                                          | RwErr code => RwErr code
+                                          | RwOk rewritten _ =>
+                                              let wrapped : List Nat :=
+                                                Cons Nat ch_lparen_p
+                                                  (append Nat rewritten (n1p ch_rparen_p)) in
+                                              go scan_left tail (emit acc wrapped)
+                                          end
+                                      end
+                                  end
+                              end
+                          | False =>
                           match source_is_ident_start c with
                           | True =>
                               match source_take_ident xs with
@@ -730,7 +1339,12 @@ def rewrite_expr (reg : RecReg) (env : RecEnv) (initial_expected : Maybe Nat)
                                                   | Just block =>
                                                       match block with
                                                       | MkPair body tail =>
-                                                          match rewrite_expr depth_left expected
+                                                          let block_expected : Maybe Nat :=
+                                                            match skip_ws_p (reverse Nat acc) with
+                                                            | Nil => expected
+                                                            | Cons _ _ => Nothing Nat
+                                                            end in
+                                                          match rewrite_expr depth_left current_env block_expected
                                                                   (strip_braces body) with
                                                           | RwErr code => RwErr code
                                                           | RwOk inner _ =>
@@ -757,7 +1371,7 @@ def rewrite_expr (reg : RecReg) (env : RecEnv) (initial_expected : Maybe Nat)
                                               match fld with
                                               | Nil => RwErr rec_code_proj
                                               | Cons _ _ =>
-                                                  match env_lookup env reg id with
+                                                  match env_lookup current_env reg id with
                                                   | Nothing => RwErr rec_code_proj
                                                   | Just ri =>
                                                       match reg with
@@ -792,11 +1406,13 @@ def rewrite_expr (reg : RecReg) (env : RecEnv) (initial_expected : Maybe Nat)
                               end
                           | False => go scan_left rest (Cons Nat c acc)
                           end
+                          end
                       end
                   end
               end
           end) (S (length Nat xs0)) xs0 (Nil Nat)
-    end) (S (length Nat input)) initial_expected input;
+        end
+    end) (S (length Nat input)) env initial_expected input;
 
 def parse_param_env (reg : RecReg) (env : RecEnv) (seg : List Nat) : RecEnv :=
   match take_until_char ch_colon_p seg with
