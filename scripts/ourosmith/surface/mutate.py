@@ -134,6 +134,19 @@ extern {name} : HostAction NativeWord :=
         rows.append(Mutation(kind, text, ("OURO-IMP-" + code,), dependencies=dep))
         if kind != "import-malformed":
             rows.append(Mutation("lint-" + kind, text, ("OURO-IMP-" + code,), tool="lint", dependencies=dep))
+    rows.extend((
+        Mutation("module-unknown-direct-member",
+                 'import "dep.ouro" as D;\ndef bad : Type := D.Missing;',
+                 ("CErr code=95",), dependencies=(("dep.ouro", "axiom Present : Type;"),)),
+        Mutation("module-ambiguous-short-name",
+                 'import "left.ouro" as L;\nimport "right.ouro" as R;\ndef bad : Type := Shared;',
+                 ("CErr code=96",),
+                 dependencies=(("left.ouro", "axiom Shared : Type;"),
+                               ("right.ouro", "axiom Shared : Type;"))),
+        Mutation("module-qualified-declaration-head",
+                 'import "dep.ouro" as D;\ndef D.Forged : Type := Type;',
+                 ("CErr code=98",), dependencies=(("dep.ouro", "axiom Present : Type;"),)),
+    ))
     for kind, text, rule in (
         ("lint-import-malformed", f'import "missing{seed}.ouro" as;\ndef {name} : Nat := Z;', "OURO-IMP-001"),
         ("lint-hole", f"def {name} : Nat := _;", "hole:"),
