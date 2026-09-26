@@ -44,6 +44,18 @@ and `list_try_fold_maybe A S step initial xs` likewise stop at the first failure
 an empty list returns `Right initial` or `Just initial`. `filter_map` drops
 missing values when that is the intended behavior.
 
+Use `list_collect_maybe A xs` to sequence values that are already `Maybe A`.
+It preserves their order, returns `Nothing` at the first missing value, and
+returns `Just []` for an empty list:
+
+```ouro
+import "../std/collections.ouro";
+
+def values : Maybe (List Nat) :=
+  list_collect_maybe Nat
+    ([Just Nat 1, Just Nat 2] : List (Maybe Nat));
+```
+
 ## CLI arguments
 
 Use `cli_from_argv` when a native program reads `argv`, and pass the option names that should behave as boolean flags.
