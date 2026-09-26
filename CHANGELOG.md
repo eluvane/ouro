@@ -6,6 +6,8 @@ Development changes; see the [compatibility policy](docs/stability.md).
 
 ### Added
 
+- Pure bounded pull iterators with lazy map/filter/take adapters and explicit
+  typed failure or pull-limit results when collecting a list.
 - Overlapping list windows, state scans, state-threading maps, stable grouping
   by key, and first-failure `Either`/`Maybe` folds in `std/collections.ouro`.
 - Lazy error-aware fallback for `Either` and ordered `Maybe` list traversal in
