@@ -104,6 +104,15 @@ class SourceContracts(unittest.TestCase):
         self.assertEqual(frontend.SMC.quoted_import_targets(source, "root.ouro"),
                          ["dir/leaf.ouro", "café.ouro"])
 
+    def test_dedented_multiline_hides_imports_and_rejects_import_path(self):
+        source = ('def text : String := """\r\n'
+                  '  import "fake.ouro";\r\n'
+                  '  """; import "real.ouro";')
+        self.assertEqual(frontend.SMC.quoted_import_targets(source, "root.ouro"),
+                         ["real.ouro"])
+        with self.assertRaisesRegex(ValueError, "malformed quoted import"):
+            frontend.SMC.quoted_import_targets('import """\n  path.ouro\n  """;', "root.ouro")
+
     def test_unterminated_raw_import_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "malformed quoted import"):
             frontend.SMC.quoted_import_targets('import r#"unfinished.ouro";', "root.ouro")

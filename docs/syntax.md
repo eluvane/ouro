@@ -385,6 +385,32 @@ def path : String := r#"C:\temp\data"#;
 def quote : String := r#"say "hello""#;
 ```
 
+An opt-in multiline `String` starts with `"""` followed immediately by LF or
+CRLF. Its closing `"""` begins on a new line after zero or more ASCII spaces
+or tabs; source code may follow the closing delimiter on that line. The
+opening line break and the one immediately before the closing line are not
+part of the value. The exact space/tab prefix before the closing delimiter is
+removed from every nonempty content line. A nonempty line without that exact
+prefix is a lexical error; an entirely empty line remains empty. Spaces and
+tabs are compared as bytes, without converting tab widths. Interior LF and
+CRLF sequences and all other bytes survive unchanged.
+
+```ouro
+def note : String := """
+  first line
+
+  second line
+  """;
+```
+
+`note` contains `first line`, an empty line, and `second line`, separated by
+LF bytes. Backslashes do not introduce escapes in this form, so `\n` is two
+bytes. Three quotes in the middle of a content line are data; only a triple
+quote at the start of a line after its space/tab prefix closes the literal.
+An unclosed delimiter, missing initial line break, or inconsistent indentation
+is a lexical error. Ordinary strings and `r#"..."#` keep their existing rules.
+Multiline literals are not accepted as import paths.
+
 Import `std/string.ouro` to use the standard `String` type and helpers. A
 standalone prelude must declare `intrinsic String : Type := "ouro.string";`.
 An opaque `axiom String : Type;` does not authenticate string literals, even
