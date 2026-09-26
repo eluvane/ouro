@@ -6,6 +6,8 @@ Development changes; see the [compatibility policy](docs/stability.md).
 
 ### Added
 
+- Finite directional `Nat` range values with exclusive/inclusive endpoints,
+  checked step magnitude, and bounded pull-iterator consumption.
 - Pure bounded pull iterators with lazy map/filter/take adapters and explicit
   typed failure or pull-limit results when collecting a list.
 - Overlapping list windows, state scans, state-threading maps, stable grouping
