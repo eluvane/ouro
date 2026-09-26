@@ -122,6 +122,12 @@ typed parameters; the result annotation may be omitted when the body type can
 be inferred. [Ergonomic syntax](language/ergonomic-syntax.md#typed-local-helper-declarations)
 explains their scope and desugaring.
 
+Top-level definitions may use `(public => internal : Type)` to expose a call
+label distinct from the binder used in the body. A direct call can then write
+`f(public := value)` or `f(public :=)` to use an identically named local value.
+See [Named calls and public labels](language/ergonomic-syntax.md#named-calls-and-public-labels)
+for the bounded call rule and compatibility with positional arguments.
+
 An expression block groups sequential pure bindings with a final expression:
 
 ```ouro
@@ -297,9 +303,13 @@ representation Natural := "ouro.nat";
 
 The target uses ordinary import alias and local-open resolution. The checker
 checks the inductive's shape and rejects duplicate role assignments. The
-initial role keys are `ouro.nat`, `ouro.bool`, `ouro.unit`, `ouro.list`,
-`ouro.maybe`, and `ouro.pair`. Parsing retains unknown keys for checker
-diagnostics. Exactly one quoted key and a final `;` are required; a type
+role keys are `ouro.nat`, `ouro.bool`, `ouro.unit`, `ouro.list`,
+`ouro.maybe`, `ouro.pair`, `ouro.range-bound`, and `ouro.range`. The bound
+role requires a zero-parameter, zero-index inductive with two nullary
+constructors. The range role requires a zero-parameter, zero-index inductive
+with one constructor of type `Nat -> Nat -> Nat -> RangeBound -> Range`. Its `Nat` and
+bound fields must use the registered nominal families. Parsing retains
+unknown keys for checker diagnostics. Exactly one quoted key and a final `;` are required; a type
 signature or expression body is not part of this annotation. `representation`
 is a reserved keyword, and the target remains a reference for facts and lint.
 
@@ -329,6 +339,19 @@ tokens; for example `1__0`, `0x_F`, `0b2`, and `12u32`. The spelling `_1`
 remains an identifier under the existing identifier grammar. These literals do
 not select a machine integer type or perform a narrowing conversion. Typed
 numeric suffixes are not supported.
+
+With the nominal `Nat`, `NatRangeBound`, and `NatRange` representations from
+`std/range.ouro`, `0..10` constructs an exclusive range and `0..=10` an
+inclusive range. The two endpoints must be `Nat` literals in this syntax;
+variables and explicit step magnitudes use `nat_range_exclusive`,
+`nat_range_inclusive`, and `nat_range_by`. Both literal forms construct a
+step-one `NatRange`, including descending or equal endpoints. Whitespace may
+surround the separator; `..=` is one token. A missing endpoint, a nonliteral
+endpoint, or a chained separator is rejected. The compiler resolves the
+registered nominal roles and ordinary constructor types, so same-spelled
+unregistered declarations cannot receive a range literal. See
+[finite Nat ranges](practical_stdlib.md#finite-nat-ranges) for iteration and
+bounded collection.
 
 String literals support `\n`, `\t`, `\r`, `\"`, `\\`, and braced Unicode
 scalar escapes:
@@ -411,6 +434,25 @@ Heterogeneous lists are rejected. A nonempty list may end with a comma;
 `[]` remains the empty spelling. List literals lower to the standard `Nil`
 and `Cons` constructors, and the compiler checks every element against the
 selected type.
+
+A final `..` can reuse an existing list as the tail:
+
+```ouro
+def rest : List Nat := [S Z];
+def joined : List Nat := [Z, ..rest];
+def copy : List Nat := [..rest,];
+```
+
+The tail must have the same exact nominal `List A` type. With no expected
+type, a direct, unambiguous `List A` type hint from the tail suffices, as in
+`let copy := [..rest] in copy`; an untyped empty tail does not. The compiler
+binds each prefix value in source order and then the tail once before
+constructing the `Cons` spine. It allocates a new cell for each prefix value
+and reuses the tail list. A spread must be the sole final tail; it is not an
+expression outside `[...]`. One comma before `]` is optional. Nonfinal,
+multiple, or doubled-comma spreads are syntax errors. See
+[Ergonomic syntax](language/ergonomic-syntax.md#list-spreads) for the
+lowering boundary.
 
 ## Records
 
