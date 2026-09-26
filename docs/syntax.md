@@ -313,6 +313,19 @@ are lexical errors. Other unknown backslash pairs retain their backslash and
 following character. Quoted import paths use the same decoding. Ordinary
 quoted strings can contain physical line breaks; they do not strip indentation.
 
+For text containing backslashes or quotes, `r#"..."#` is a raw `String`
+literal. It preserves every byte between the delimiters, including physical
+line breaks, UTF-8 bytes, and backslashes; `\n` is two bytes rather than a
+newline. The first `"#` closes it even when preceded by a backslash. Exactly
+one `#` is supported, and an unclosed raw literal is a lexical error. Raw
+quoted imports use the same spelling and preserve their path bytes before the
+usual path normalization.
+
+```ouro
+def path : String := r#"C:\temp\data"#;
+def quote : String := r#"say "hello""#;
+```
+
 Import `std/string.ouro` to use the standard `String` type and helpers. A
 standalone prelude must declare `intrinsic String : Type := "ouro.string";`.
 An opaque `axiom String : Type;` does not authenticate string literals, even
