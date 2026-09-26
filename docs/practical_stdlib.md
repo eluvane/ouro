@@ -159,6 +159,15 @@ constant-allocation or automatically fused pipeline is promised.
 ## Finite Nat ranges
 
 `std/range.ouro` builds finite `Nat` range values for the pull iterator API.
+The literal `0..10` calls the represented four-field `NatRange` constructor
+with step one and `RangeExclusive`; `0..=10` uses `RangeInclusive`. Literal
+endpoints are required in this syntax. These are values, not eagerly
+materialized lists; consuming them requires `iter_from_nat_range` and an
+explicit pull budget. The compiler validates the nominal Nat, bound, and
+range representation roles before checked construction. An alias to the
+registered `NatRange` keeps that identity; an unrelated same-shaped type
+does not. Use the functions below when endpoints are computed or a different
+step is needed.
 `nat_range_exclusive start stop` omits `stop`; `nat_range_inclusive start stop`
 includes it when the step lands exactly on it. Both start with step one. The
 original endpoints determine direction: `start < stop` ascends, `start > stop`
