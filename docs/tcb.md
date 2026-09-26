@@ -15,6 +15,29 @@ primitive contracts. Rejected, exhausted, cancelled, and malformed operations
 remain errors. Parser success and a successful lowering traversal do not
 establish declaration acceptance.
 
+`compiler/module_registry.ouro` and `compiler/module_names.ouro` resolve
+source-module names before the ordered declaration plan reaches the checker.
+They cannot authorize an unchecked import: each reached declaration and body
+still enters the same compiler-owned checking path. The module pass adds no
+checker allowlist dependency or host IO authority.
+Record preprocessing uses canonical source paths and local import bindings to
+select the shape of a qualified literal or projection. It preserves the
+qualified type and base, and fails when the aliased file does not own the
+record accessor. Generated constructor and accessor references carry exact
+marker, owner, and member grants for atoms actually emitted by record sugar.
+The module resolver validates those grants against the file's effective
+import scope, so a selective edge cannot expose a hidden accessor through
+record syntax. Raw source cannot spell the marker separator, and each
+generated reference still passes through module resolution and the complete
+declaration checker. The text-only record preprocessor rejects output that
+would require this metadata.
+When a qualified reference resolves to a global name also used by a lexical
+binder, the module pass interns a distinct binder ID before lowering. It
+rewrites bound uses with that ID and keeps the qualified reference attached to
+the global declaration.
+The direct declaration compiler rejects any residual expression-level `open`
+before desugaring or lowering; only module resolution may erase that scope.
+
 The declaration plan derives definition membership from its supplied name
 list using the existing numeric-name index. Filtering retains core order,
 duplicate bodies, and complete terms; the index does not replace checking.

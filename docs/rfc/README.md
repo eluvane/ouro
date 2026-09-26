@@ -28,6 +28,7 @@ already fixed by an accepted contract do not need an RFC.
 | [0001](0001-strict-syntax-cleanup.md) | Accepted | Strict project syntax and quality policy |
 | [0002](0002-kernel-core-artifact.md) | Superseded | Archived kernel core-artifact schema |
 | [0003](0003-ouro-std-http-async-crypto.md) | Accepted | Word, crypto, HTTP-message, and sequential sleep library slice |
+| [0004](0004-module-identity.md) | Proposed | Source module identity and import names |
 
 The current implemented behavior remains defined by source, tests, and
 canonical documentation. An RFC explains a decision; it is not automatically a

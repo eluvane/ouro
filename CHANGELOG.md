@@ -6,8 +6,57 @@ Development changes; see the [compatibility policy](docs/stability.md).
 
 ### Added
 
+- Exclusive `0..10` and inclusive `0..=10` literal-endpoint `NatRange` values,
+  checked through nominal Nat, bound, and range representation roles.
+- Final-tail list spreads `[first, ..rest]` build checked `List A` constructor
+  spines with once-bound prefix values and tail; a complete tail type can guide
+  an unannotated local list. See [Lists](docs/syntax.md#lists).
+- Finite directional `Nat` range values with exclusive/inclusive endpoints,
+  checked step magnitude, and bounded pull-iterator consumption.
+- Pure bounded pull iterators with lazy map/filter/take adapters and explicit
+  typed failure or pull-limit results when collecting a list.
+- Overlapping list windows, state scans, state-threading maps, stable grouping
+  by key, and first-failure `Either`/`Maybe` folds in `std/collections.ouro`.
+- Single-path `exposing (...)` imports select direct declarations and can give
+  them local names. Plain imports inherit the selected names through their
+  dependency edges; aliases retain original qualified member names and local
+  opens use the selected names. See [module syntax](docs/syntax.md#modules-and-imports).
+- Direct top-level definitions can declare public parameter labels with
+  `(label => binder : Type)` and accept checked named calls, argument punning,
+  and source-order evaluation for reordered arguments. Positional calls stay
+  valid; declaration-site defaults remain unsupported.
+- Lazy error-aware fallback for `Either` and ordered `Maybe` list traversal in
+  the practical standard library.
+- Leading `{A : Type}` inductive parameters opt constructors in to bounded
+  inference from a direct expected family or direct value-field type hints on
+  saturated calls; explicit calls remain valid. See
+  [Marked constructor parameters](docs/language/ergonomic-syntax.md#marked-constructor-parameters).
+- Leading `{A : Type}` definition parameters opt calls in to bounded value
+  and expected type inference, including nondependent callback and collection
+  type shapes. Explicit full and partial calls remain valid. See
+  [Marked definition parameters](docs/language/ergonomic-syntax.md#marked-definition-parameters).
+- Typed `let?` blocks propagate `Either`- or `Maybe`-shaped failures through
+  explicit constructor roles and lower to checked cases; see
+  [Ergonomic syntax](docs/language/ergonomic-syntax.md#typed-fallible-blocks).
+- Pure `let { ... }` expression blocks accept sequential local bindings and a
+  mandatory final expression; see [Ergonomic syntax](docs/language/ergonomic-syntax.md#pure-expression-blocks).
+- Nonempty list literals can infer an element type from their first element
+  without an expected `List A` context; empty and ambiguous literals still
+  require an annotation.
 - Typed local helpers may omit the result annotation when their body type is
   inferable; see [Ergonomic syntax](docs/language/ergonomic-syntax.md#typed-local-helper-declarations).
+- [Raw `String` literals and quoted imports](docs/syntax.md#numbers-and-strings)
+  with `r#"..."#`, preserving backslashes and physical line breaks.
+- [Braced Unicode scalar escapes in strings and quoted imports](docs/syntax.md#numbers-and-strings),
+  decoded to UTF-8 bytes with malformed scalar rejection.
+- [Decimal digit separators and hexadecimal/binary `Nat` literals](docs/syntax.md#numbers-and-strings)
+  with strict malformed-token rejection and no implicit machine-integer conversion.
+- Expression-scoped `open A in body` now selects `A`'s direct declarations in
+  ambiguous import graphs. Nested opens use the innermost selection, while
+  local binders and current-file declarations retain priority.
+- Compiler-owned identities for declarations in aliased source modules.
+  `A.member` selects a direct declaration of `A`'s canonical imported file;
+  colliding short names require qualification. See [module syntax](docs/syntax.md#modules-and-imports).
 - Review-only Clippy proofs for Result/Maybe error flow, collection and string
   composition, List producer/consumer laws, arithmetic, literal bounds, Boolean
   identities, and normalization. Rule contracts and exclusions live in the
@@ -15,6 +64,8 @@ Development changes; see the [compatibility policy](docs/stability.md).
 - [Grouped imports, positional call groups, and typed local helpers](docs/language/ergonomic-syntax.md),
   including the migration from `f (a, b)` as one grouped expression to two arguments.
 - Trailing commas in nonempty list literals, including multiline lists with comments.
+- Record literal field punning with known nominal type and checked field coverage.
+- Functional updates of annotated nominal records, including nested field paths, checked changed fields, once-bound base expressions, and typed local/record-field context.
 - Local and pinned-Git package dependencies with deterministic manifests and
   locks, rejection fixtures, a reusable-library sample, and a consuming
   application; see [Packages](docs/pkg.md).
@@ -24,6 +75,29 @@ Development changes; see the [compatibility policy](docs/stability.md).
 
 ### Changed
 
+- Imported record updates resolve simple field type annotations in the record
+  declaration's import scope, including local type aliases, selected renames,
+  and qualified imported types. Caller aliases cannot rebind those annotations;
+  hidden record members remain inaccessible.
+- A selective import hides unlisted bare, qualified, opened, and record-generated
+  names while the compiler still checks every imported declaration and body.
+  Repeating one canonical import with conflicting selectors is an error.
+- Expected function domains now guide nested callbacks and parameterized
+  matches inside short lambdas when the domain is unambiguous and complete.
+- Qualified record literals and projections retain the aliased record owner;
+  a projection through a transitive record type is rejected instead of
+  selecting a same-named local value or accessor. Bare record sugar preserves
+  its declaring record's constructor or accessor when an explicit call or
+  local binder uses the same short name. Qualified module references likewise
+  keep their global target under a same-named local binder.
+- A qualified reference no longer borrows a same-named declaration from a
+  different imported file. Add a direct import and use that file's alias.
+  In an aliased import graph, a bare use made ambiguous by a new import now
+  reports error 96; qualify it. Plain-only import graphs retain error 45 for
+  duplicate declarations.
+- Alias collisions involving `IO`, `io_bind`, or `pure` report error 96 until
+  their lowering uses module-local operation metadata. `std/module_demo.ouro`
+  imports its declaration owner directly.
 - Run PR parity and syntax-quality gates in separate required jobs to shorten
   the serial `checks` group; nightly retains both gates in its `checks` group.
 - Split compiler-checking fixtures across sixteen PR and nightly jobs, with
@@ -91,6 +165,8 @@ Development changes; see the [compatibility policy](docs/stability.md).
 
 ### Fixed
 
+- `adjacent_pairs` now advances its left element; `list_traverse_result` evaluates
+  conversions in input order and stops when one returns `Left`.
 - Recognize manifest-owned Clippy precision fixtures in the structural gate,
   retaining extraction, path confinement, and checks on unlisted sources.
 - Cover `ESpan` in OuroSmith parser observations and keep comment delimiters

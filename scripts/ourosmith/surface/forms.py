@@ -34,6 +34,11 @@ def result : Nat := {n};
   (fun (left : Nat) => fun (right : Nat) =>
     add left (match {flag} with | True => right | False => S right end)) {n} {m};
 """, n + m + (0 if seed % 2 else 1), False
+    yield "named-call", PRELUDE + f"""def combine (front => first : Nat) (back => second : Nat) : Nat := add first second;
+def front : Nat := {n};
+def back : Nat := {m};
+def result : Nat := combine(back :=, front :=);
+""", n + m, False
     yield "large-elimination", PRELUDE + f"""def resultType (n : Nat) : Type :=
   match n with | Z => Nat | S _ => Nat end;
 def value : resultType Z := {n};
@@ -58,6 +63,30 @@ def value (e : Either Nat Bool) : Nat :=
   match e with | LeftE x => x | RightE b => match b with | True => {n} | False => {m} end end;
 def result : Nat := add (value (LeftE Nat Bool {m})) (value (RightE Nat Bool True));
 """, n + m, False
+    yield "fallible-block", PRELUDE + f"""inductive Outcome (E : Type) (A : Type) : Type :=
+  | Failed : E -> Outcome E A | Passed : A -> Outcome E A;
+def success : Outcome Nat Nat :=
+  let? (Failed, Passed) : Outcome Nat Nat do
+    let value : Nat := (Passed Nat Nat {n})?;
+    S value
+  end;
+def failure : Outcome Nat Nat :=
+  let? (Failed, Passed) : Outcome Nat Nat do
+    let value : Nat := (Failed Nat Nat {m})?;
+    S value
+  end;
+def boundary : Outcome Nat Nat :=
+  let? (Failed, Passed) : Outcome Nat Nat do
+    let inner : Outcome Nat Nat := let? (Failed, Passed) : Outcome Nat Nat do
+      let value : Nat := (Failed Nat Nat {m})?;
+      S value
+    end;
+    match inner with | Failed error => S error | Passed value => value end
+  end;
+def score (outcome : Outcome Nat Nat) : Nat :=
+  match outcome with | Failed error => add 100 error | Passed value => value end;
+def result : Nat := add (add (score success) (score failure)) (score boundary);
+""", n + 2 * m + 102, False
     phase = "Ready" if seed % 2 else "Raw"
     yield "indexed-phase-param", PRELUDE + f"""inductive Phase : Type := | Raw : Phase | Ready : Phase;
 inductive Box (phase : Phase) : Type := | MkBox : Nat -> Box phase;
@@ -101,6 +130,38 @@ def length (A : Type) : List A -> Nat :=
 def values : List Nat := [{', '.join(map(str, values))}{',' if values else ''}];
 def result : Nat := values |> length Nat;
 """, len(values), False
+    yield "list-spread", PRELUDE + f"""inductive List (A : Type) : Type := | Nil : List A | Cons : A -> List A -> List A;
+def eight (value : Nat) : Nat :=
+  let two : Nat := add value value in
+  let four : Nat := add two two in
+  add four four;
+def score : List Nat -> Nat :=
+  fix score (items : List Nat) : Nat :=
+    match items with
+    | Nil => Z
+    | Cons head rest => add head (eight (score rest))
+    end;
+def rest : List Nat := [2];
+def values : List Nat := [{n}, {m}, ..rest];
+def result : Nat := score values;
+""", n + 8 * m + 128, False
+    yield "range-literal", PRELUDE + f"""inductive NatRangeBound : Type :=
+  | RangeExclusive : NatRangeBound | RangeInclusive : NatRangeBound;
+representation NatRangeBound := "ouro.range-bound";
+inductive NatRange : Type :=
+  | MkNatRange : Nat -> Nat -> Nat -> NatRangeBound -> NatRange;
+representation NatRange := "ouro.range";
+def double (value : Nat) : Nat := add value value;
+def quadruple (value : Nat) : Nat := double (double value);
+def score (range : NatRange) : Nat :=
+  match range with
+  | MkNatRange first last step bound =>
+      let weighted : Nat := add first (add (double last) (quadruple step)) in
+      match bound with
+      | RangeExclusive => weighted | RangeInclusive => S weighted end
+  end;
+def result : Nat := add (score ({n}..{m})) (score ({m}..={n}));
+""", 3 * n + 3 * m + 9, False
     yield "record", PRELUDE + f"""record Point : Type where
   x : Nat;
   y : Nat;

@@ -192,6 +192,14 @@ def lex(source, language):
             line += source[start:i].count("\n")
             continue
         char = source[i]
+        if language == "ouro" and source.startswith('r#"', i):
+            close = source.find('"#', i + 3)
+            if close < 0:
+                raise ValueError(f"unclosed raw string at line {line}")
+            i = close + 2
+            result.append(Token(source[start:i], start, i, first_line))
+            line += source[start:i].count("\n")
+            continue
         # A quote inside an Ouro/OCaml identifier is not a string delimiter.
         is_quote = char == '"' or (char == "'" and language in {"c", "h", "sh"})
         if language in {"ml", "mli"} and char == "'":

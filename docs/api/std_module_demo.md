@@ -1,6 +1,6 @@
 # std/module_demo.ouro
 
-Import aliases qualify names in the flat source-module model.
+An alias qualifies declarations owned by its directly imported file.
 
 Declarations: 3.
 

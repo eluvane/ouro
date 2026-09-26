@@ -214,6 +214,9 @@ def case_ind_nparams_for (env : LowerEnv) (scrut : Expr) (locals : List (Pair Na
   (fix go (subject : Expr) : Pair Nat Nat :=
     match subject with
     | ESpan _ _ inner => go inner
+    | EFallible _ _ _ _ => case_ind_nparams env brArs
+    | EOpen _ inner => go inner
+    | ENamedCall _ _ => case_ind_nparams env brArs
     | EVar n =>
         match lookup_local n locals with
         | Just ty =>
@@ -231,6 +234,7 @@ def case_ind_nparams_for (env : LowerEnv) (scrut : Expr) (locals : List (Pair Na
     | EHole _ => case_ind_nparams env brArs
     | ESort _ => case_ind_nparams env brArs
     | ENat _ => case_ind_nparams env brArs
+    | ERange _ _ _ => case_ind_nparams env brArs
     | EStr _ => case_ind_nparams env brArs
     | EApp _ _ => case_ind_nparams env brArs
     | ELam _ _ _ => case_ind_nparams env brArs
@@ -244,6 +248,7 @@ def case_ind_nparams_for (env : LowerEnv) (scrut : Expr) (locals : List (Pair Na
     | EDo _ => case_ind_nparams env brArs
     | EDoBind _ _ => case_ind_nparams env brArs
     | EList _ => case_ind_nparams env brArs
+    | EListSpread _ _ => case_ind_nparams env brArs
     | EHandle _ _ => case_ind_nparams env brArs
     | EBranch _ _ _ => case_ind_nparams env brArs
     | ENoBranch => case_ind_nparams env brArs
@@ -333,6 +338,7 @@ def applied_lambda : Expr -> Bool :=
     | EHole _ => False
     | ESort _ => False
     | ENat _ => False
+    | ERange _ _ _ => False
     | EStr _ => False
     | EPi _ _ _ => False
     | ELet _ _ _ _ => False
@@ -344,6 +350,7 @@ def applied_lambda : Expr -> Bool :=
     | EDo _ => False
     | EDoBind _ _ => False
     | EList _ => False
+    | EListSpread _ _ => False
     | EHandle _ _ => False
     | EBranch _ _ _ => False
     | ENoBranch => False
@@ -351,6 +358,9 @@ def applied_lambda : Expr -> Bool :=
     | ENoBinder => False
     | EMultiMatch _ _ => False
     | ESpan _ _ inner => applied_lambda inner
+    | EFallible _ _ _ _ => False
+    | EOpen _ inner => applied_lambda inner
+    | ENamedCall _ _ => False
     end;
 
 def app_function_expected (function : Expr) (er : Maybe Surface) : Maybe Surface :=
@@ -360,6 +370,107 @@ def app_function_expected (function : Expr) (er : Maybe Surface) : Maybe Surface
         match er with
         | Nothing => Nothing Surface
         | Just result => Just(Surface, SPi Z (SInd Z) result)
+        end
+    end;
+
+-- Names in the expected codomain must not capture the replacement lambda name.
+-- Exhaustion is treated as a collision, so lowering can request an annotation.
+def surface_mentions_name (fuel : Nat) (name : Nat) (term : Surface) : Bool :=
+  (fix visit (remaining : Nat) (part : Surface) : Bool :=
+    match remaining with
+    | Z => True
+    | S next =>
+        match part with
+        | SVar current => eqNat current name
+        | SSort _ => False
+        | SPi binder domain codomain =>
+            orb(eqNat binder name,
+              orb(visit next domain, visit next codomain))
+        | SLam binder annotation body =>
+            orb(eqNat binder name,
+              orb(visit next annotation, visit next body))
+        | SApp function argument =>
+            orb(visit next function, visit next argument)
+        | SLet binder value annotation body =>
+            orb(eqNat binder name,
+              orb(visit next value,
+                orb(visit next annotation, visit next body)))
+        | SConst _ => False
+        | SInd _ => False
+        | SConstruct _ _ _ => False
+        | SCase _ predicate scrutinee branches =>
+            orb(visit next predicate,
+              orb(visit next scrutinee,
+                (fix any_branch (rest : List Surface) : Bool :=
+                    match rest with
+                    | Nil => False
+                    | Cons branch tail =>
+                        orb(visit next branch, any_branch tail)
+                    end) branches))
+        | SFix binder _ _ annotation body =>
+            orb(eqNat binder name,
+              orb(visit next annotation, visit next body))
+        | SHole _ => False
+        | SEffectRow ty => visit next ty
+        | SPerform _ arguments =>
+            (fix any_argument (rest : List Surface) : Bool :=
+                match rest with
+                | Nil => False
+                | Cons argument tail =>
+                    orb(visit next argument, any_argument tail)
+                end) arguments
+        | SStr _ _ => False
+        end
+    end) fuel term;
+
+def lambda_domain_hint (locals : List (Pair Nat Surface))
+    (er : Maybe Surface) : Maybe Surface :=
+    match er with
+    | Nothing => Nothing Surface
+    | Just expected =>
+        match surface_pi_domain expected with
+        | Nothing => Nothing Surface
+        | Just domain =>
+            match surface_hint_has_placeholder locals fuel1k domain with
+            | True => Nothing Surface
+            | False => Just Surface domain
+            end
+        end
+    end;
+
+def lambda_body_expected (er : Maybe Surface) (name : Nat) : Maybe Surface :=
+    match er with
+    | Nothing => Nothing Surface
+    | Just expected =>
+        match expected with
+        | SPi binder _ codomain =>
+            match orb(eqNat binder name, eqNat binder Z) with
+            | True => Just Surface codomain
+            | False =>
+                match surface_mentions_name fuel1k binder codomain with
+                | False => Just Surface codomain
+                | True =>
+                    match surface_mentions_name fuel1k name codomain with
+                    | True => Nothing Surface
+                    | False =>
+                        Just(Surface, surface_subst_name binder (SVar name) codomain)
+                    end
+                end
+            end
+        | SVar _ => Nothing Surface
+        | SSort _ => Nothing Surface
+        | SLam _ _ _ => Nothing Surface
+        | SApp _ _ => Nothing Surface
+        | SLet _ _ _ _ => Nothing Surface
+        | SConst _ => Nothing Surface
+        | SInd _ => Nothing Surface
+        | SConstruct _ _ _ => Nothing Surface
+        | SCase _ _ _ _ => Nothing Surface
+        | SFix _ _ _ _ _ => Nothing Surface
+        | SHole _ => Nothing Surface
+        | SEffectRow _ => Nothing Surface
+        | SPerform _ _ => Nothing Surface
+        | SStr _ _ => Nothing Surface
         end
     end;
 
@@ -391,6 +502,10 @@ def match_family_params (indId : Nat) (scrut : Expr) (locals : List (Pair Nat Su
   (fix go (subject : Expr) : Pair (List Surface) Surface :=
     match subject with
     | ESpan _ _ inner => go inner
+    | EFallible _ _ _ _ => MkPair(List Surface, Surface, Nil Surface, SInd indId)
+    | EOpen _ inner => go inner
+    | ENamedCall _ _ =>
+        MkPair(List Surface, Surface, Nil Surface, SInd indId)
     | EVar n =>
         match lookup_local n locals with
         | Just ty =>
@@ -414,6 +529,7 @@ def match_family_params (indId : Nat) (scrut : Expr) (locals : List (Pair Nat Su
     | EHole _ => MkPair(List Surface, Surface, Nil Surface, SInd indId)
     | ESort _ => MkPair(List Surface, Surface, Nil Surface, SInd indId)
     | ENat _ => MkPair(List Surface, Surface, Nil Surface, SInd indId)
+    | ERange _ _ _ => MkPair(List Surface, Surface, Nil Surface, SInd indId)
     | EApp _ _ => MkPair(List Surface, Surface, Nil Surface, SInd indId)
     | ELam _ _ _ => MkPair(List Surface, Surface, Nil Surface, SInd indId)
     | EPi _ _ _ => MkPair(List Surface, Surface, Nil Surface, SInd indId)
@@ -426,6 +542,7 @@ def match_family_params (indId : Nat) (scrut : Expr) (locals : List (Pair Nat Su
     | EDo _ => MkPair(List Surface, Surface, Nil Surface, SInd indId)
     | EDoBind _ _ => MkPair(List Surface, Surface, Nil Surface, SInd indId)
     | EList _ => MkPair(List Surface, Surface, Nil Surface, SInd indId)
+    | EListSpread _ _ => MkPair(List Surface, Surface, Nil Surface, SInd indId)
     | EHandle _ _ => MkPair(List Surface, Surface, Nil Surface, SInd indId)
     | EBranch _ _ _ => MkPair(List Surface, Surface, Nil Surface, SInd indId)
     | ENoBranch => MkPair(List Surface, Surface, Nil Surface, SInd indId)
@@ -453,17 +570,24 @@ inductive ExprView : Type :=
   | XVPerform : Nat -> List Expr -> ExprView
   | XVDo : List Expr -> ExprView
   | XVList : List Expr -> ExprView
+  | XVListSpread : List Expr -> Expr -> ExprView
+  | XVRange : Nat -> Nat -> Bool -> ExprView
   | XVHandle : Expr -> List (Pair Nat (Pair (List Nat) Expr)) -> ExprView
+  | XVFallible : Expr -> Nat -> Nat -> Expr -> ExprView
+  | XVNamedCall : Expr -> List (Pair Nat Expr) -> ExprView
   | XVUnsupported : ExprView;
 
 def view_expr : Expr -> ExprView :=
   fix view_expr (e : Expr) : ExprView :=
     match e with
     | ESpan _ _ inner => view_expr inner
+    | EOpen _ _ => XVUnsupported
+    | ENamedCall head rows => XVNamedCall head rows
     | EVar n => XVVar n
     | EHole m => XVHole m
     | ESort u => XVSort u
     | ENat n => XVNat n
+    | ERange start stop inclusive => XVRange start stop inclusive
     | EStr n => XVStr n
     | EApp f a => XVApp f a
     | ELam name ann body => XVLam name ann body
@@ -476,7 +600,10 @@ def view_expr : Expr -> ExprView :=
     | EPerform op args => XVPerform op args
     | EDo es => XVDo es
     | EList es => XVList es
+    | EListSpread es tail => XVListSpread es tail
     | EHandle comp clauses => XVHandle comp clauses
+    | EFallible container failure success body =>
+        XVFallible container failure success body
     | EDoBind _ _ => XVUnsupported
     | EBranch _ _ _ => XVUnsupported
     | ENoBranch => XVUnsupported
@@ -493,12 +620,16 @@ def view_branch : Expr -> BranchView :=
   fix view_branch (e : Expr) : BranchView :=
     match e with
     | ESpan _ _ inner => view_branch inner
+    | EFallible _ _ _ _ => BranchEnd
+    | EOpen _ inner => view_branch inner
+    | ENamedCall _ _ => BranchEnd
     | EBranch packed body rest => BranchNode packed body rest
     | ENoBranch => BranchEnd
     | EVar _ => BranchEnd
     | EHole _ => BranchEnd
     | ESort _ => BranchEnd
     | ENat _ => BranchEnd
+    | ERange _ _ _ => BranchEnd
     | EStr _ => BranchEnd
     | EApp _ _ => BranchEnd
     | ELam _ _ _ => BranchEnd
@@ -512,6 +643,7 @@ def view_branch : Expr -> BranchView :=
     | EDo _ => BranchEnd
     | EDoBind _ _ => BranchEnd
     | EList _ => BranchEnd
+    | EListSpread _ _ => BranchEnd
     | EHandle _ _ => BranchEnd
     | EBinder _ _ _ => BranchEnd
     | ENoBinder => BranchEnd
@@ -526,12 +658,16 @@ def view_binder : Expr -> BinderView :=
   fix view_binder (e : Expr) : BinderView :=
     match e with
     | ESpan _ _ inner => view_binder inner
+    | EFallible _ _ _ _ => BinderEnd
+    | EOpen _ inner => view_binder inner
+    | ENamedCall _ _ => BinderEnd
     | EBinder id ty rest => BinderNode id ty rest
     | ENoBinder => BinderEnd
     | EVar _ => BinderEnd
     | EHole _ => BinderEnd
     | ESort _ => BinderEnd
     | ENat _ => BinderEnd
+    | ERange _ _ _ => BinderEnd
     | EStr _ => BinderEnd
     | EApp _ _ => BinderEnd
     | ELam _ _ _ => BinderEnd
@@ -545,6 +681,7 @@ def view_binder : Expr -> BinderView :=
     | EDo _ => BinderEnd
     | EDoBind _ _ => BinderEnd
     | EList _ => BinderEnd
+    | EListSpread _ _ => BinderEnd
     | EHandle _ _ => BinderEnd
     | EBranch _ _ _ => BinderEnd
     | ENoBranch => BinderEnd
@@ -580,6 +717,7 @@ def scan_branch_keys (env : LowerEnv) : Expr -> List (Pair Nat Surface) :=
       | EHole _ => Nil (Pair Nat Surface)
       | ESort _ => Nil (Pair Nat Surface)
       | ENat _ => Nil (Pair Nat Surface)
+      | ERange _ _ _ => Nil (Pair Nat Surface)
       | EStr _ => Nil (Pair Nat Surface)
       | EApp _ _ => Nil (Pair Nat Surface)
       | ELam _ _ _ => Nil (Pair Nat Surface)
@@ -593,11 +731,15 @@ def scan_branch_keys (env : LowerEnv) : Expr -> List (Pair Nat Surface) :=
       | EDo _ => Nil (Pair Nat Surface)
       | EDoBind _ _ => Nil (Pair Nat Surface)
       | EList _ => Nil (Pair Nat Surface)
+      | EListSpread _ _ => Nil (Pair Nat Surface)
       | EHandle _ _ => Nil (Pair Nat Surface)
       | EBinder _ _ _ => Nil (Pair Nat Surface)
       | ENoBinder => Nil (Pair Nat Surface)
       | EMultiMatch _ _ => Nil (Pair Nat Surface)
       | ESpan _ _ inner => scan_branch_keys inner
+      | EFallible _ _ _ _ => Nil (Pair Nat Surface)
+      | EOpen _ inner => scan_branch_keys inner
+      | ENamedCall _ _ => Nil (Pair Nat Surface)
       end;
 
 inductive MatchSetup : Type :=
@@ -610,6 +752,9 @@ def prepare_match (env : LowerEnv) (scrut : Expr) (locals : List (Pair Nat Surfa
       (fix go (subject : Expr) : MatchSetup :=
         match subject with
         | ESpan _ _ inner => go inner
+        | EFallible _ _ _ _ => NoMatchSetup
+        | EOpen _ inner => go inner
+        | ENamedCall _ _ => NoMatchSetup
         | EVar n =>
             match lookup_local n locals with
             | Nothing => NoMatchSetup
@@ -629,6 +774,7 @@ def prepare_match (env : LowerEnv) (scrut : Expr) (locals : List (Pair Nat Surfa
         | EHole _ => NoMatchSetup
         | ESort _ => NoMatchSetup
         | ENat _ => NoMatchSetup
+        | ERange _ _ _ => NoMatchSetup
         | EStr _ => NoMatchSetup
         | EApp _ _ => NoMatchSetup
         | ELam _ _ _ => NoMatchSetup
@@ -642,6 +788,7 @@ def prepare_match (env : LowerEnv) (scrut : Expr) (locals : List (Pair Nat Surfa
         | EDo _ => NoMatchSetup
         | EDoBind _ _ => NoMatchSetup
         | EList _ => NoMatchSetup
+        | EListSpread _ _ => NoMatchSetup
         | EHandle _ _ => NoMatchSetup
         | EBranch _ _ _ => NoMatchSetup
         | ENoBranch => NoMatchSetup
@@ -691,13 +838,18 @@ def peel_do_bind : Expr -> Pair (Maybe Nat) Expr :=
   fix peel_do_bind (e : Expr) : Pair (Maybe Nat) Expr :=
     match e with
     | ESpan _ _ inner => peel_do_bind inner
+    | EFallible _ _ _ _ => MkPair(Maybe Nat, Expr, Nothing Nat, e)
+    | EOpen _ inner => peel_do_bind inner
+    | ENamedCall _ _ => MkPair(Maybe Nat, Expr, Nothing Nat, e)
     | EDoBind n action => MkPair(Maybe Nat, Expr, Just Nat n, action)
     | EVar _ => MkPair(Maybe Nat, Expr, Nothing Nat, e)
     | EHole _ => MkPair(Maybe Nat, Expr, Nothing Nat, e)
     | ESort _ => MkPair(Maybe Nat, Expr, Nothing Nat, e)
     | ENat _ => MkPair(Maybe Nat, Expr, Nothing Nat, e)
+    | ERange _ _ _ => MkPair(Maybe Nat, Expr, Nothing Nat, e)
     | EStr _ => MkPair(Maybe Nat, Expr, Nothing Nat, e)
     | EList _ => MkPair(Maybe Nat, Expr, Nothing Nat, e)
+    | EListSpread _ _ => MkPair(Maybe Nat, Expr, Nothing Nat, e)
     | EApp _ _ => MkPair(Maybe Nat, Expr, Nothing Nat, e)
     | ELam _ _ _ => MkPair(Maybe Nat, Expr, Nothing Nat, e)
     | EPi _ _ _ => MkPair(Maybe Nat, Expr, Nothing Nat, e)
