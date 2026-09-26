@@ -6,6 +6,8 @@ Development changes; see the [compatibility policy](docs/stability.md).
 
 ### Added
 
+- Total `if condition then expr else expr` expressions for the registered
+  `Bool` type, with both arms checked at the result type.
 - Exclusive `0..10` and inclusive `0..=10` literal-endpoint `NatRange` values,
   checked through nominal Nat, bound, and range representation roles.
 - Final-tail list spreads `[first, ..rest]` build checked `List A` constructor
@@ -75,6 +77,8 @@ Development changes; see the [compatibility policy](docs/stability.md).
 
 ### Changed
 
+- `if`, `then`, and `else` are reserved keywords. Rename existing identifiers
+  or import aliases with those names before using this compiler.
 - Imported record updates resolve simple field type annotations in the record
   declaration's import scope, including local type aliases, selected renames,
   and qualified imported types. Caller aliases cannot rebind those annotations;
