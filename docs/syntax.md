@@ -87,11 +87,12 @@ let x : A := value in body
 A local helper can put its typed parameters next to its name:
 
 ```ouro
-let twice (x : Nat) : Nat := add x x in twice 2
+let twice (x : Nat) := add x x in twice 2
 ```
 
-This is a non-recursive lambda-binding. Parameterized local helpers require an
-explicit result annotation; [Ergonomic syntax](language/ergonomic-syntax.md#typed-local-helper-declarations)
+This is a non-recursive lambda-binding. Parameterized local helpers require
+typed parameters; the result annotation may be omitted when the body type can
+be inferred. [Ergonomic syntax](language/ergonomic-syntax.md#typed-local-helper-declarations)
 explains their scope and desugaring.
 
 ## Inductive data and pattern matching
@@ -259,7 +260,7 @@ embedded-NUL limits.
 List literals require an expected `List A` type:
 
 ```ouro
-def values : List Nat := [Z, S Z, S (S Z)];
+def values : List Nat := [Z, S Z, S (S Z),];
 def empty : List Nat := [];
 ```
 
@@ -269,8 +270,9 @@ A local type ascription can provide the expected element type:
 def count : Nat := (([Z, S Z] : List Nat) |> length Nat);
 ```
 
-Untyped `[]`, ambiguous list literals, and trailing commas are rejected. List
-literals lower to the standard `Nil` and `Cons` constructors.
+Untyped `[]` and ambiguous list literals are rejected. A nonempty list may
+end with a comma; `[]` remains the empty spelling. List literals lower to the
+standard `Nil` and `Cons` constructors.
 
 ## Records
 
