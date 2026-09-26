@@ -34,6 +34,11 @@ def result : Nat := {n};
   (fun (left : Nat) => fun (right : Nat) =>
     add left (match {flag} with | True => right | False => S right end)) {n} {m};
 """, n + m + (0 if seed % 2 else 1), False
+    yield "named-call", PRELUDE + f"""def combine (front => first : Nat) (back => second : Nat) : Nat := add first second;
+def front : Nat := {n};
+def back : Nat := {m};
+def result : Nat := combine(back :=, front :=);
+""", n + m, False
     yield "large-elimination", PRELUDE + f"""def resultType (n : Nat) : Type :=
   match n with | Z => Nat | S _ => Nat end;
 def value : resultType Z := {n};

@@ -17,6 +17,14 @@ Development changes; see the [compatibility policy](docs/stability.md).
   typed failure or pull-limit results when collecting a list.
 - Overlapping list windows, state scans, state-threading maps, stable grouping
   by key, and first-failure `Either`/`Maybe` folds in `std/collections.ouro`.
+- Single-path `exposing (...)` imports select direct declarations and can give
+  them local names. Plain imports inherit the selected names through their
+  dependency edges; aliases retain original qualified member names and local
+  opens use the selected names. See [module syntax](docs/syntax.md#modules-and-imports).
+- Direct top-level definitions can declare public parameter labels with
+  `(label => binder : Type)` and accept checked named calls, argument punning,
+  and source-order evaluation for reordered arguments. Positional calls stay
+  valid; declaration-site defaults remain unsupported.
 - Lazy error-aware fallback for `Either` and ordered `Maybe` list traversal in
   the practical standard library.
 - Leading `{A : Type}` inductive parameters opt constructors in to bounded
@@ -67,6 +75,9 @@ Development changes; see the [compatibility policy](docs/stability.md).
 
 ### Changed
 
+- A selective import hides unlisted bare, qualified, opened, and record-generated
+  names while the compiler still checks every imported declaration and body.
+  Repeating one canonical import with conflicting selectors is an error.
 - Expected function domains now guide nested callbacks and parameterized
   matches inside short lambdas when the domain is unambiguous and complete.
 - Qualified record literals and projections retain the aliased record owner;

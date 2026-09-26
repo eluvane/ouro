@@ -265,6 +265,9 @@ def module_pattern_head_with_binders (refs : List (Pair Nat Nat))
     (constructors : List Nat) (binders : List (Pair Nat Nat))
     (head : Nat) (vars : List Nat)
     : ResolveResult (Pair Nat (List Nat)) :=
+    match module_lookup head errors with
+    | Just code => RErr (Pair Nat (List Nat)) code head
+    | Nothing =>
     let known_ctor : Bool := memNat head constructors in
     match andb(memNat head markers, notb known_ctor) with
     | True => RErr (Pair Nat (List Nat)) 8 head
@@ -284,6 +287,7 @@ def module_pattern_head_with_binders (refs : List (Pair Nat Nat))
                 MkPair Nat (List Nat) head (Cons Nat head vars))
               (module_check_names markers (Cons Nat head vars))
         end
+    end
     end;
 
 def module_pattern_head (refs : List (Pair Nat Nat))
@@ -355,6 +359,7 @@ def module_rewrite_do
 
 def module_rewrite_handlers
     (refs : List (Pair Nat Nat)) (errors : List (Pair Nat Nat))
+    (pure_label : Nat)
     (markers : List Nat) (binders : List (Pair Nat Nat))
     (rewrite : List Nat -> Expr -> ResolveResult Expr) (bound : List Nat)
     : List (Pair Nat (Pair (List Nat) Expr)) ->
@@ -371,7 +376,11 @@ def module_rewrite_handlers
             | MkPair vars body =>
                 module_result_bind Nat
                   (List (Pair Nat (Pair (List Nat) Expr)))
-                  (module_ref_with_binders refs errors binders (Nil Nat) op)
+                  (match andb(notb(eqNat pure_label 0), eqNat op pure_label) with
+                   | True => ROk Nat op
+                   | False => module_ref_with_binders refs errors binders
+                       (Nil Nat) op
+                   end)
                   (fun (qualified : Nat) =>
                     module_result_bind Expr
                       (List (Pair Nat (Pair (List Nat) Expr)))
@@ -576,11 +585,13 @@ def module_rewrite_binders (markers : List Nat)
         | EListSpread _ _ => module_binder_other rewrite bound pending
         | EOpen _ _ => module_binder_other rewrite bound pending
         | EFallible _ _ _ _ => module_binder_other rewrite bound pending
+        | ENamedCall _ _ => module_binder_other rewrite bound pending
         end
     end;
 
 def module_rewrite_expr_scoped (opens : List ModuleOpen)
     (markers : List Nat) (binders : List (Pair Nat Nat))
+    (pure_label : Nat)
     : Nat -> List (Pair Nat Nat) -> List (Pair Nat Nat) ->
       List Nat -> List Nat -> Expr -> ResolveResult Expr :=
   fix go (fuel : Nat) (refs : List (Pair Nat Nat))
@@ -604,6 +615,16 @@ def module_rewrite_expr_scoped (opens : List ModuleOpen)
         | EApp function argument =>
             module_result_pair Expr Expr Expr EApp
               (descend bound function) (descend bound argument)
+        | ENamedCall function rows =>
+            module_result_pair Expr (List (Pair Nat Expr)) Expr ENamedCall
+              (descend bound function)
+              (module_result_list (Pair Nat Expr) (Pair Nat Expr)
+                (fun (row : Pair Nat Expr) =>
+                  match row with
+                  | MkPair label argument =>
+                      module_result_map Expr (Pair Nat Expr)
+                        (MkPair Nat Expr label) (descend bound argument)
+                  end) rows)
         | ELam name annotation body =>
             module_result_bind (Maybe Expr) Expr
               (module_guard (Maybe Expr) markers name
@@ -671,7 +692,7 @@ def module_rewrite_expr_scoped (opens : List ModuleOpen)
             module_result_pair Expr
               (List (Pair Nat (Pair (List Nat) Expr))) Expr EHandle
               (descend bound computation)
-              (module_rewrite_handlers refs errors markers binders
+              (module_rewrite_handlers refs errors pure_label markers binders
                 (fun (scope : List Nat) (value : Expr) => descend scope value)
                 bound clauses)
         | EBranch packed body rest =>
@@ -747,14 +768,24 @@ def module_rewrite_expr_scoped (opens : List ModuleOpen)
         end
     end;
 
+def module_rewrite_expr_with_opens_pure
+    (refs : List (Pair Nat Nat)) (errors : List (Pair Nat Nat))
+    (opens : List ModuleOpen) (markers : List Nat)
+    (constructors : List Nat) (binders : List (Pair Nat Nat))
+    (pure_label : Nat)
+    (fuel : Nat) (bound : List Nat) (expr : Expr)
+    : ResolveResult Expr :=
+    module_rewrite_expr_scoped opens markers binders pure_label
+      fuel refs errors constructors bound expr;
+
 def module_rewrite_expr_with_opens
     (refs : List (Pair Nat Nat)) (errors : List (Pair Nat Nat))
     (opens : List ModuleOpen) (markers : List Nat)
     (constructors : List Nat) (binders : List (Pair Nat Nat))
     (fuel : Nat) (bound : List Nat) (expr : Expr)
     : ResolveResult Expr :=
-    module_rewrite_expr_scoped opens markers binders
-      fuel refs errors constructors bound expr;
+    module_rewrite_expr_with_opens_pure refs errors opens markers
+      constructors binders 0 fuel bound expr;
 
 def module_rewrite_expr_with_binders (refs : List (Pair Nat Nat))
     (errors : List (Pair Nat Nat)) (markers : List Nat)
@@ -791,11 +822,38 @@ def module_rewrite_named_types (heads : List (Pair Nat Nat))
         end
     end;
 
-def module_rewrite_decl (fuel : Nat) (heads : List (Pair Nat Nat))
+def module_rewrite_def_params (markers : List Nat)
+    (binders : List (Pair Nat Nat))
+    : List DefParam -> ResolveResult (List DefParam) :=
+  fix go (items : List DefParam) : ResolveResult (List DefParam) :=
+    match items with
+    | Nil => ROk (List DefParam) (Nil DefParam)
+    | Cons param rest =>
+        match param with
+        | DefParamOf label binder default =>
+            module_result_bind Unit (List DefParam)
+              (module_check_name markers label)
+              (fun (_label : Unit) =>
+                module_result_bind Unit (List DefParam)
+                  (module_check_name markers binder)
+                  (fun (_binder : Unit) =>
+                    match default with
+                    | Just _ => RErr (List DefParam) 8 binder
+                    | Nothing =>
+                        module_result_map (List DefParam) (List DefParam)
+                          (Cons DefParam
+                            (DefParamOf label
+                              (module_binder_name binders binder)
+                              (Nothing Expr))) (go rest)
+                    end))
+        end
+    end;
+
+def module_rewrite_decl_pure (fuel : Nat) (heads : List (Pair Nat Nat))
     (refs : List (Pair Nat Nat)) (errors : List (Pair Nat Nat))
     (opens : List ModuleOpen) (markers : List Nat)
     (constructors : List Nat)
-    (binders : List (Pair Nat Nat))
+    (binders : List (Pair Nat Nat)) (pure_label : Nat)
     (decl : Decl) : ResolveResult Decl :=
     module_result_bind Unit Decl (module_check_decl_head markers decl)
       (fun (_ : Unit) => match fuel with
@@ -803,14 +861,18 @@ def module_rewrite_decl (fuel : Nat) (heads : List (Pair Nat Nat))
     | S _ =>
         let rewrite : List Nat -> Expr -> ResolveResult Expr :=
           fun (bound : List Nat) (expr : Expr) =>
-            module_rewrite_expr_with_opens refs errors opens markers
-              constructors binders fuel bound expr in
+            module_rewrite_expr_with_opens_pure refs errors opens markers
+              constructors binders pure_label fuel bound expr in
         match decl with
-        | DDef name typ body marked declared =>
-            module_result_pair Expr Expr Decl
-              (fun (out_type : Expr) (out_body : Expr) =>
-                DDef (module_head heads name) out_type out_body marked declared)
-              (rewrite (Nil Nat) typ) (rewrite (Nil Nat) body)
+        | DDef name typ body marked params =>
+            module_result_bind (List DefParam) Decl
+              (module_rewrite_def_params markers binders params)
+              (fun (mapped : List DefParam) =>
+                module_result_pair Expr Expr Decl
+                  (fun (out_type : Expr) (out_body : Expr) =>
+                    DDef (module_head heads name) out_type out_body
+                      marked mapped)
+                  (rewrite (Nil Nat) typ) (rewrite (Nil Nat) body))
         | DAxiom name typ =>
             module_result_map Expr Decl
               (DAxiom (module_head heads name))
@@ -866,12 +928,12 @@ def module_rewrite_decl (fuel : Nat) (heads : List (Pair Nat Nat))
 -- Map validation is performed once, before any declaration is rewritten.
 -- RErr 5/6 comes from an unresolved/ambiguous free reference, 7 from fuel,
 -- and 8 from malformed maps or a marker used as a declaration/binder.
-def module_rewrite_decls_with_opens
+def module_rewrite_decls_with_opens_pure
     (fuel : Nat) (heads : List (Pair Nat Nat))
     (refs : List (Pair Nat Nat)) (errors : List (Pair Nat Nat))
     (opens : List ModuleOpen) (markers : List Nat)
     (constructors : List Nat)
-    (binders : List (Pair Nat Nat))
+    (binders : List (Pair Nat Nat)) (pure_label : Nat)
     (decls : List Decl) : ResolveResult (List Decl) :=
     match fuel with
     | Z => RErr (List Decl) 7 0
@@ -879,10 +941,20 @@ def module_rewrite_decls_with_opens
         match module_invalid_maps heads refs errors with
         | Just key => RErr (List Decl) 8 key
         | Nothing => module_result_list Decl Decl
-            (module_rewrite_decl fuel heads refs errors opens markers
-              constructors binders) decls
+            (module_rewrite_decl_pure fuel heads refs errors opens markers
+              constructors binders pure_label) decls
         end
     end;
+
+def module_rewrite_decls_with_opens
+    (fuel : Nat) (heads : List (Pair Nat Nat))
+    (refs : List (Pair Nat Nat)) (errors : List (Pair Nat Nat))
+    (opens : List ModuleOpen) (markers : List Nat)
+    (constructors : List Nat)
+    (binders : List (Pair Nat Nat))
+    (decls : List Decl) : ResolveResult (List Decl) :=
+    module_rewrite_decls_with_opens_pure fuel heads refs errors opens
+      markers constructors binders 0 decls;
 
 def module_rewrite_decls_with_binders
     (fuel : Nat) (heads : List (Pair Nat Nat))

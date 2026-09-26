@@ -49,6 +49,7 @@ EXPR = {
     "EFallible": "feature:form:fallible-block",
     "EListSpread": "feature:form:list-spread",
     "ERange": "feature:form:range-literal",
+    "ENamedCall": "feature:form:named-call",
 }
 DECL = {"DDef": "feature:prelude", "DAxiom": "negative:effect-root-assumption-type", "DInductive": "feature:prelude",
         "DEffect": "feature:form:handler", "DImport": "property:import-dependency-order",

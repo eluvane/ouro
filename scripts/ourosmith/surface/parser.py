@@ -28,6 +28,7 @@ EXPRS = {
     "EFallible": ["Expr", "Nat", "Nat", "Expr"],
     "EListSpread": ["List Expr", "Expr"],
     "ERange": ["Nat", "Nat", "Bool"],
+    "ENamedCall": ["Expr", "List (Pair Nat Expr)"],
 }
 
 
