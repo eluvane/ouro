@@ -8,6 +8,8 @@ Development changes; see the [compatibility policy](docs/stability.md).
 
 - `list_partition` divides a list by a `Bool` predicate while preserving the
   order of accepted and rejected elements.
+- `list_collect_maybe` sequences existing `Maybe` values into one ordered list,
+  returning `Nothing` at the first missing value.
 - Exclusive `0..10` and inclusive `0..=10` literal-endpoint `NatRange` values,
   checked through nominal Nat, bound, and range representation roles.
 - Final-tail list spreads `[first, ..rest]` build checked `List A` constructor
