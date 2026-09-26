@@ -24,7 +24,7 @@ EXPRS = {
     "EBinder": ["Nat", "Expr", "Expr"], "ENoBinder": [],
     "EMultiMatch": ["List Expr", "List (Pair (List (Pair Nat (List Nat))) Expr)"],
     "EStr": ["Nat"], "EDoBind": ["Nat", "Expr"], "EList": ["List Expr"],
-    "ESpan": ["Nat", "Nat", "Expr"],
+    "ESpan": ["Nat", "Nat", "Expr"], "EFallible": ["Expr", "Nat", "Nat", "Expr"],
 }
 
 
@@ -121,6 +121,8 @@ def rows(seed):
         observations.append((f"observe_parse (parse 300 MExpr {token_list} {n} (VNat 0))", f"error:{n + len(body)}"))
     observations.append((f"observe_expr 40 (ESpan {n} {n + 3} (ESpan {n + 1} {n + 2} (ENat {n})))",
                          f"ESpan({n},{n + 3},ESpan({n + 1},{n + 2},ENat({n})))"))
+    observations.append((f"observe_expr 40 (EFallible (EVar {n}) {n + 1} {n + 2} (ENat {n}))",
+                         f"EFallible(EVar({n}),{n + 1},{n + 2},ENat({n}))"))
     return observations
 
 
