@@ -126,6 +126,14 @@ def quoted_import_targets(source_text: str, source_path: str) -> list[str]:
         elif source_text.startswith("--", index):
             end = source_text.find("\n", index)
             index = len(source_text) if end < 0 else end + 1
+        elif source_text.startswith('r#"', index):
+            close = source_text.find('"#', index + 3)
+            if close < 0:
+                tokens.append(("unterminated", ""))
+                index = len(source_text)
+            else:
+                tokens.append(("string", source_text[index + 3:close]))
+                index = close + 2
         elif char == '"':
             index += 1
             value: list[str] = []
@@ -135,8 +143,20 @@ def quoted_import_targets(source_text: str, source_path: str) -> list[str]:
                 if char == "\\" and index < len(source_text):
                     escaped = source_text[index]
                     index += 1
-                    value.append({"n": "\n", "r": "\r", "t": "\t", '"': '"', "\\": "\\"}
-                                 .get(escaped, "\\" + escaped))
+                    if escaped == "u" and index < len(source_text) and source_text[index] == "{":
+                        close = source_text.find("}", index + 1)
+                        digits = source_text[index + 1:close] if close >= 0 else ""
+                        if (not 1 <= len(digits) <= 6
+                                or any(digit not in "0123456789abcdefABCDEF" for digit in digits)):
+                            raise ValueError(f"malformed Unicode escape in {source_path}")
+                        scalar = int(digits, 16)
+                        if scalar > 0x10FFFF or 0xD800 <= scalar <= 0xDFFF:
+                            raise ValueError(f"malformed Unicode escape in {source_path}")
+                        value.append(chr(scalar))
+                        index = close + 1
+                    else:
+                        value.append({"n": "\n", "r": "\r", "t": "\t", '"': '"', "\\": "\\"}
+                                     .get(escaped, "\\" + escaped))
                 else:
                     value.append(char)
             closed = index < len(source_text)

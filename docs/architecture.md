@@ -27,19 +27,25 @@ typechecking.
 
 User programs, compiler modules, and tools are `.ouro` files. Source handling
 lives in `lexer.ouro`, `parser.ouro`, `source_text.ouro`, and
-`canonical_source.ouro`. Import resolution, elaboration, lowering, and
-declaration checking live in `import_resolve.ouro`, `elab.ouro`, `lower.ouro`,
-and `file_elab.ouro`. `driver.ouro` and `pipeline.ouro` compose the stages.
+`canonical_source.ouro`. Import collection and declaration ownership live in
+`import_resolve.ouro` and `module_registry.ouro`; `module_names.ouro` resolves
+references with lexical binder scope. Elaboration, lowering, and declaration
+checking live in `elab.ouro`, `lower.ouro`, and `file_elab.ouro`.
+`driver.ouro` and `pipeline.ouro` compose the stages.
 
 The production frontend preprocesses import aliases and records, then passes a
-`CanonicalSourceUnit` token stream to the parser. [Canonical source](canonical_source.md)
+`CanonicalSourceUnit` token stream to the parser. Import qualification retains
+an internal marker that the module resolver binds to the directly imported
+unit after parsing; raw source cannot spell that marker. [Canonical source](canonical_source.md)
 owns trivia, directive metadata, source mapping, and hash contracts.
 
 The parser uses the same `parse_a.ouro` / `parse_b.ouro` mode helpers and
 `parser_min.ouro` ABI as split bootstrap compilation. Its dispatcher owns the
-recursive fuel boundary. Imported modules currently flatten into a shared
-namespace after dependency ordering. [Compiler checking](kernel_design.md)
-defines the complete declaration plan and import-closure checks.
+recursive fuel boundary. The module resolver gives colliding declarations
+distinct identities before the ordered import closure is flattened. The
+checker still receives every reached imported declaration and body.
+[Compiler checking](kernel_design.md) defines the complete declaration plan
+and import-closure checks.
 
 `scripts/ouro1.sh` is the maintained command wrapper; `scripts/coil.sh` exposes
 the project-facing verbs. Project defaults and package identity live in

@@ -9,6 +9,7 @@
 
 import "source_text.ouro",
   "../std/data.ouro",
+  "../std/listx.ouro",
   "ast.ouro",
   "token.ouro",
   "core.ouro",
@@ -43,7 +44,7 @@ def maxNat2 (a : Nat) (b : Nat) : Nat :=
   | False => b
   end;
 
-def ctor_infos_of (indId : Nat) (nparams : Nat) (idx : Nat)
+def ctor_infos_of (indId : Nat) (nparams : Nat) (marked : Nat) (idx : Nat)
     (cs : List (Pair Nat Expr)) : List CtorInfo :=
     (fix go (rest : List (Pair Nat Expr)) (index : Nat) : List CtorInfo :=
       match rest with
@@ -52,7 +53,7 @@ def ctor_infos_of (indId : Nat) (nparams : Nat) (idx : Nat)
           match ctor with
           | MkPair nameId ty =>
               Cons CtorInfo
-                (MkCtorInfo nameId indId index nparams (expr_pi_arity pipeline_thousand ty))
+                (MkCtorInfo nameId indId index nparams (expr_pi_arity pipeline_thousand ty) marked)
                 (go(tail, S index))
           end
       end) cs idx;
@@ -75,41 +76,193 @@ def name_List : List Nat := ([76, 105, 115, 116] : List Nat);
 def name_Nil : List Nat := ([78, 105, 108] : List Nat);
 def name_Cons : List Nat := ([67, 111, 110, 115] : List Nat);
 
-def collect_lower_env_from (st : InternState) : List Decl -> LowerEnv :=
-  fix go (ds : List Decl) : LowerEnv :=
+inductive PipelineRoleChoice : Type :=
+  | PipelineNoRole : PipelineRoleChoice
+  | PipelineOneRole : Nat -> PipelineRoleChoice
+  | PipelineDuplicateRole : PipelineRoleChoice;
+
+def pipeline_literal_id (st : InternState) (bytes : List Nat) : Maybe Nat :=
+  match st with
+  | MkIntern _ _ strings _ => source_lookup_id strings bytes
+  end;
+
+def pipeline_add_role (choice : PipelineRoleChoice) (name : Nat)
+    : PipelineRoleChoice :=
+  match choice with
+  | PipelineNoRole => PipelineOneRole name
+  | PipelineOneRole _ => PipelineDuplicateRole
+  | PipelineDuplicateRole => PipelineDuplicateRole
+  end;
+
+-- These are only lowering hints. Every intrinsic and representation is still
+-- validated by the declaration checker after lowering.
+def pipeline_role_choice (st : InternState) (key : List Nat)
+    (is_intrinsic : Bool) (decls : List Decl) : PipelineRoleChoice :=
+  match pipeline_literal_id st key with
+  | Nothing => PipelineNoRole
+  | Just label =>
+      foldl Decl PipelineRoleChoice
+        (fun (choice : PipelineRoleChoice) (decl : Decl) =>
+          match decl with
+          | DIntrinsic name _ current _ =>
+              match andb(is_intrinsic, eqNat current label) with
+              | True => pipeline_add_role choice name
+              | False => choice
+              end
+          | DRepresentation name current =>
+              match andb(notb is_intrinsic, eqNat current label) with
+              | True => pipeline_add_role choice name
+              | False => choice
+              end
+          | DDef _ _ _ _ _ => choice
+          | DAxiom _ _ => choice
+          | DInductive _ _ _ _ _ => choice
+          | DEffect _ _ _ => choice
+          | DExtern _ _ _ => choice
+          | DImport _ => choice
+          end) PipelineNoRole decls
+  end;
+
+def pipeline_role_or_name (st : InternState) (name : List Nat)
+    (choice : PipelineRoleChoice) : Nat :=
+  match choice with
+  | PipelineNoRole => id_of_name st name
+  | PipelineOneRole selected => selected
+  | PipelineDuplicateRole => Z
+  end;
+
+def pipeline_declares_const (name : Nat) : List Decl -> Bool :=
+  fix find (decls : List Decl) : Bool :=
+    match decls with
+    | Nil => False
+    | Cons decl rest =>
+        match decl with
+        | DDef current _ _ _ _ => orb(eqNat current name, find rest)
+        | DAxiom current _ => orb(eqNat current name, find rest)
+        | DIntrinsic current _ _ _ => orb(eqNat current name, find rest)
+        | DExtern current _ _ => orb(eqNat current name, find rest)
+        | DInductive _ _ _ _ _ => find rest
+        | DEffect _ _ _ => find rest
+        | DRepresentation _ _ => find rest
+        | DImport _ => find rest
+        end
+    end;
+
+-- Keep a checked local wrapper for legacy `do` syntax when it exists. If an
+-- alias collision removed its bare name, use the intrinsic role instead.
+def pipeline_runtime_hint (st : InternState) (name : List Nat)
+    (choice : PipelineRoleChoice) (decls : List Decl) : Nat :=
+  let ordinary : Nat := id_of_name st name in
+  match choice with
+  | PipelineNoRole => ordinary
+  | PipelineDuplicateRole => Z
+  | PipelineOneRole role_name =>
+      match pipeline_declares_const ordinary decls with
+      | True => ordinary
+      | False => role_name
+      end
+  end;
+
+def pipeline_role_ctors (name : Nat) : List Decl -> Pair Nat Nat :=
+  fix find (decls : List Decl) : Pair Nat Nat :=
+    match decls with
+    | Nil => MkPair Nat Nat Z Z
+    | Cons decl rest =>
+        match decl with
+        | DInductive current _ _ ctors _ =>
+            match eqNat current name with
+            | False => find rest
+            | True => match ctors with
+              | Cons first tail => match first with
+                | MkPair nil_id _ => match tail with
+                  | Cons second _ => match second with
+                    | MkPair cons_id _ => MkPair Nat Nat nil_id cons_id
+                    end
+                  | Nil => MkPair Nat Nat Z Z
+                  end
+                end
+              | Nil => MkPair Nat Nat Z Z
+              end
+            end
+        | DDef _ _ _ _ _ => find rest
+        | DAxiom _ _ => find rest
+        | DEffect _ _ _ => find rest
+        | DIntrinsic _ _ _ _ => find rest
+        | DExtern _ _ _ => find rest
+        | DRepresentation _ _ => find rest
+        | DImport _ => find rest
+        end
+    end;
+
+def collect_lower_env_from (st : InternState) (decls : List Decl) : LowerEnv :=
+    let string_role : PipelineRoleChoice := pipeline_role_choice st
+      ([111, 117, 114, 111, 46, 115, 116, 114, 105, 110, 103] : List Nat)
+      True decls in
+    let unit_role : PipelineRoleChoice := pipeline_role_choice st
+      ([111, 117, 114, 111, 46, 117, 110, 105, 116] : List Nat)
+      False decls in
+    let list_role : PipelineRoleChoice := pipeline_role_choice st
+      ([111, 117, 114, 111, 46, 108, 105, 115, 116] : List Nat)
+      False decls in
+    let runtime_role : PipelineRoleChoice := pipeline_role_choice st
+      ([111, 117, 114, 111, 46, 114, 117, 110, 116, 105, 109, 101] : List Nat)
+      True decls in
+    let runtime_bind_role : PipelineRoleChoice := pipeline_role_choice st
+      ([111, 117, 114, 111, 46, 114, 117, 110, 116, 105, 109, 101,
+        46, 98, 105, 110, 100] : List Nat) True decls in
+    let list_name : Nat := pipeline_role_or_name st name_List list_role in
+    let list_ctors : Pair Nat Nat := match list_role with
+      | PipelineNoRole => MkPair Nat Nat
+          (id_of_name st name_Nil) (id_of_name st name_Cons)
+      | PipelineOneRole selected => pipeline_role_ctors selected decls
+      | PipelineDuplicateRole => MkPair Nat Nat Z Z
+      end in
+    let specials : List Nat := match list_ctors with
+      | MkPair nil_id cons_id =>
+          ([pipeline_role_or_name st name_String string_role,
+            pipeline_role_or_name st name_Unit unit_role,
+            pipeline_runtime_hint st name_IO runtime_role decls,
+            pipeline_runtime_hint st name_io_bind runtime_bind_role decls,
+            id_of_name st name_pure, list_name, nil_id, cons_id] : List Nat)
+      end in
+  (fix go (ds : List Decl) : LowerEnv :=
     match ds with
     | Nil =>
-        let specials : List Nat :=
-          ([id_of_name st name_String, id_of_name st name_Unit, id_of_name st name_IO, id_of_name st name_io_bind, id_of_name st name_pure, id_of_name st name_List, id_of_name st name_Nil, id_of_name st name_Cons] : List Nat) in
         MkLowerEnv (Nil Nat) (Nil Nat) (Nil CtorInfo)
           specials
           (Nil (Pair Nat Surface)) (Nil (Pair Nat Surface))
+          (Nil MarkedDefInfo)
     | Cons d ds' =>
         match go ds' with
-        | MkLowerEnv cids iids ctors specials pays types =>
+        | MkLowerEnv cids iids ctors specials pays types defs =>
             match d with
-            | DDef n _ _ =>
+            | DDef n _ _ marked declared =>
                 MkLowerEnv (Cons Nat n cids) iids ctors specials pays types
+                  (match marked with
+                   | Z => defs
+                   | S _ => Cons MarkedDefInfo
+                       (MkMarkedDefInfo n marked declared) defs
+                   end)
             | DAxiom n _ =>
-                MkLowerEnv (Cons Nat n cids) iids ctors specials pays types
+                MkLowerEnv (Cons Nat n cids) iids ctors specials pays types defs
             | DIntrinsic n _ _ _ =>
-                MkLowerEnv (Cons Nat n cids) iids ctors specials pays types
+                MkLowerEnv (Cons Nat n cids) iids ctors specials pays types defs
             | DExtern n _ _ =>
-                MkLowerEnv (Cons Nat n cids) iids ctors specials pays types
+                MkLowerEnv (Cons Nat n cids) iids ctors specials pays types defs
             | DRepresentation _ _ =>
-                MkLowerEnv cids iids ctors specials pays types
-            | DInductive n ps _fam cs =>
+                MkLowerEnv cids iids ctors specials pays types defs
+            | DInductive n ps _fam cs marked =>
                 MkLowerEnv cids (Cons Nat n iids)
                   (append CtorInfo
-                    (ctor_infos_of n (length(Pair Nat Expr, ps)) Z cs) ctors)
-                  specials pays types
+                    (ctor_infos_of n (length(Pair Nat Expr, ps)) marked Z cs) ctors)
+                  specials pays types defs
             | DEffect _ _ _ =>
-                MkLowerEnv cids iids ctors specials pays types
+                MkLowerEnv cids iids ctors specials pays types defs
             | DImport _ =>
-                MkLowerEnv cids iids ctors specials pays types
+                MkLowerEnv cids iids ctors specials pays types defs
             end
         end
-    end;
+    end) decls;
 
 def lower_decls_env
   (lower_expr_env2 : LowerEnv -> Maybe Surface -> Expr -> Surface)
@@ -119,7 +272,7 @@ def lower_decls_env
     | Nil => Nil (Pair Nat Surface)
     | Cons d rest' =>
         match d with
-        | DDef n ty body =>
+        | DDef n ty body _ _ =>
             let tyS : Surface := lower_expr_env2 env (Nothing Surface) ty in
             Cons (Pair Nat Surface)
               (MkPair Nat Surface n
@@ -129,7 +282,7 @@ def lower_decls_env
         | DIntrinsic _ _ _ _ => go rest'
         | DExtern _ _ _ => go rest'
         | DRepresentation _ _ => go rest'
-        | DInductive _ _ _ _ => go rest'
+        | DInductive _ _ _ _ _ => go rest'
         | DEffect _ _ _ => go rest'
         | DImport _ => go rest'
         end
@@ -153,7 +306,7 @@ def rewrite_surface_pairs : List (Pair Nat Surface) -> List (Pair Nat Surface) :
 
 def pipeline_env_io_id (env : LowerEnv) : Nat :=
     match env with
-    | MkLowerEnv _ _ _ specials _ _ => compiler_nth_nat 2 specials
+    | MkLowerEnv _ _ _ specials _ _ _ => compiler_nth_nat 2 specials
     end;
 
 def pipeline_surface_result : Surface -> Surface :=
@@ -225,7 +378,7 @@ def collect_io_payloads
     | Cons decl rest =>
         let tail : List (Pair Nat Surface) := collect_io_payloads rest in
         match decl with
-        | DDef name ty _ =>
+        | DDef name ty _ _ _ =>
             match pipeline_io_payload env
               (rewrite_dummy_anns
                 (lower_expr_env2 env (Nothing Surface) ty)) with
@@ -241,7 +394,7 @@ def collect_io_payloads
             | Just payload =>
                 Cons(Pair Nat Surface, MkPair Nat Surface name payload, tail)
             end
-        | DInductive _ _ _ _ => tail
+        | DInductive _ _ _ _ _ => tail
         | DEffect _ _ _ => tail
         | DImport _ => tail
         | DIntrinsic _ _ _ _ => tail
@@ -254,15 +407,15 @@ def populate_decl_types
   (lower_expr_env2 : LowerEnv -> Maybe Surface -> Expr -> Surface)
   (env : LowerEnv) (decls : List Decl) : LowerEnv :=
     match env with
-    | MkLowerEnv constants inductives ctors specials payloads _ =>
+    | MkLowerEnv constants inductives ctors specials payloads _ defs =>
         MkLowerEnv constants inductives ctors specials payloads
           (collect_decl_types
             (fun (known : List (Pair Nat Surface)) (ty : Expr) =>
               rewrite_dummy_anns
                 (lower_expr_env2
-                  (MkLowerEnv constants inductives ctors specials payloads known)
+                  (MkLowerEnv constants inductives ctors specials payloads known defs)
                   (Nothing Surface) ty))
-            decls)
+            decls) defs
     end;
 
 def populate_io_payloads
@@ -270,9 +423,9 @@ def populate_io_payloads
   (env : LowerEnv) (decls : List Decl) : LowerEnv :=
     let typed_env : LowerEnv := populate_decl_types lower_expr_env2 env decls in
     match typed_env with
-    | MkLowerEnv constants inductives ctors specials _ types =>
+    | MkLowerEnv constants inductives ctors specials _ types defs =>
         MkLowerEnv constants inductives ctors specials
-          (collect_io_payloads lower_expr_env2 typed_env decls) types
+          (collect_io_payloads lower_expr_env2 typed_env decls) types defs
     end;
 
 def surface_depth : Surface -> Nat :=
@@ -463,12 +616,12 @@ def decl_check_names : List Decl -> List Nat :=
     | Cons decl rest =>
         let tail : List Nat := decl_check_names rest in
         match decl with
-        | DDef name _ _ => Cons Nat name tail
+        | DDef name _ _ _ _ => Cons Nat name tail
         | DAxiom name _ => Cons Nat name tail
         | DIntrinsic name _ _ _ => Cons Nat name tail
         | DExtern name _ _ => Cons Nat name tail
         | DRepresentation _ _ => tail
-        | DInductive name _ _ _ => Cons Nat name tail
+        | DInductive name _ _ _ _ => Cons Nat name tail
         | DEffect _ _ ops => append Nat (rec_field_names ops) tail
         | DImport _ => tail
         end
@@ -481,12 +634,12 @@ def decls_have_effect : List Decl -> Bool :=
     | Cons decl rest =>
         match decl with
         | DEffect _ _ _ => True
-        | DDef _ _ _ => decls_have_effect rest
+        | DDef _ _ _ _ _ => decls_have_effect rest
         | DAxiom _ _ => decls_have_effect rest
         | DIntrinsic _ _ _ _ => decls_have_effect rest
         | DExtern _ _ _ => decls_have_effect rest
         | DRepresentation _ _ => decls_have_effect rest
-        | DInductive _ _ _ _ => decls_have_effect rest
+        | DInductive _ _ _ _ _ => decls_have_effect rest
         | DImport _ => decls_have_effect rest
         end
     end;
@@ -574,10 +727,148 @@ def first_unresolved_import : List Decl -> Maybe Nat :=
     | Nil => Nothing Nat
     | Cons decl rest => match decl with
       | DImport path => Just Nat path
-      | DDef _ _ _ => scan rest | DAxiom _ _ => scan rest
-      | DInductive _ _ _ _ => scan rest | DEffect _ _ _ => scan rest
+      | DDef _ _ _ _ _ => scan rest | DAxiom _ _ => scan rest
+      | DInductive _ _ _ _ _ => scan rest | DEffect _ _ _ => scan rest
       | DIntrinsic _ _ _ _ => scan rest | DExtern _ _ _ => scan rest
       | DRepresentation _ _ => scan rest end end;
+
+def first_residual_open (left : Maybe Nat) (right : Maybe Nat)
+    : Maybe Nat :=
+  match left with
+  | Just alias => Just Nat alias
+  | Nothing => right
+  end;
+
+def first_residual_open_expr : Expr -> Maybe Nat :=
+  fix go (expr : Expr) : Maybe Nat :=
+    match expr with
+    | EOpen alias _ => Just Nat alias
+    | EVar _ => Nothing Nat
+    | EHole _ => Nothing Nat
+    | ESort _ => Nothing Nat
+    | ENat _ => Nothing Nat
+    | EStr _ => Nothing Nat
+    | ENoBranch => Nothing Nat
+    | ENoBinder => Nothing Nat
+    | EApp function argument =>
+        first_residual_open (go function) (go argument)
+    | ELam _ annotation body =>
+        first_residual_open
+          (match annotation with
+           | Nothing => Nothing Nat
+           | Just typ => go typ
+           end) (go body)
+    | EPi _ domain codomain =>
+        first_residual_open (go domain) (go codomain)
+    | ELet _ annotation value body =>
+        first_residual_open
+          (match annotation with
+           | Nothing => Nothing Nat
+           | Just typ => go typ
+           end)
+          (first_residual_open (go value) (go body))
+    | EAscribe value typ =>
+        first_residual_open (go value) (go typ)
+    | EMatch scrutinee branches =>
+        first_residual_open (go scrutinee) (go branches)
+    | EFix _ binders result body =>
+        first_residual_open (go binders)
+          (first_residual_open (go result) (go body))
+    | EEffectRow typ _ => go typ
+    | EPerform _ arguments =>
+        (fix scan (items : List Expr) : Maybe Nat :=
+          match items with
+          | Nil => Nothing Nat
+          | Cons item rest => first_residual_open (go item) (scan rest)
+          end) arguments
+    | EDo items =>
+        (fix scan (pending : List Expr) : Maybe Nat :=
+          match pending with
+          | Nil => Nothing Nat
+          | Cons item rest => first_residual_open (go item) (scan rest)
+          end) items
+    | EList items =>
+        (fix scan (pending : List Expr) : Maybe Nat :=
+          match pending with
+          | Nil => Nothing Nat
+          | Cons item rest => first_residual_open (go item) (scan rest)
+          end) items
+    | EHandle computation clauses =>
+        first_residual_open (go computation)
+          ((fix scan (pending : List (Pair Nat (Pair (List Nat) Expr)))
+              : Maybe Nat :=
+            match pending with
+            | Nil => Nothing Nat
+            | Cons clause rest => match clause with
+              | MkPair _ payload => match payload with
+                | MkPair _ body => first_residual_open (go body) (scan rest)
+                end
+              end
+            end) clauses)
+    | EBranch _ body rest =>
+        first_residual_open (go body) (go rest)
+    | EBinder _ typ rest =>
+        first_residual_open (go typ) (go rest)
+    | EMultiMatch scrutinees rows =>
+        first_residual_open
+          ((fix scan (pending : List Expr) : Maybe Nat :=
+            match pending with
+            | Nil => Nothing Nat
+            | Cons item rest => first_residual_open (go item) (scan rest)
+            end) scrutinees)
+          ((fix scan (pending : List (Pair (List (Pair Nat (List Nat))) Expr))
+              : Maybe Nat :=
+            match pending with
+            | Nil => Nothing Nat
+            | Cons row rest => match row with
+              | MkPair _ body => first_residual_open (go body) (scan rest)
+              end
+            end) rows)
+    | EDoBind _ action => go action
+    | ESpan _ _ inner => go inner
+    | EFallible container _ _ body =>
+        first_residual_open (go container) (go body)
+    end;
+
+def first_residual_open_fields : List (Pair Nat Expr) -> Maybe Nat :=
+  fix scan (fields : List (Pair Nat Expr)) : Maybe Nat :=
+    match fields with
+    | Nil => Nothing Nat
+    | Cons field rest => match field with
+      | MkPair _ typ =>
+          first_residual_open (first_residual_open_expr typ) (scan rest)
+      end
+    end;
+
+def first_residual_open_decls : List Decl -> Maybe Nat :=
+  fix scan (decls : List Decl) : Maybe Nat :=
+    match decls with
+    | Nil => Nothing Nat
+    | Cons decl rest =>
+        let here : Maybe Nat := match decl with
+          | DDef _ typ body _ _ =>
+              first_residual_open (first_residual_open_expr typ)
+                (first_residual_open_expr body)
+          | DAxiom _ typ => first_residual_open_expr typ
+          | DInductive _ params family constructors _ =>
+              first_residual_open (first_residual_open_fields params)
+                (first_residual_open (first_residual_open_expr family)
+                  (first_residual_open_fields constructors))
+          | DEffect _ params operations =>
+              first_residual_open (first_residual_open_fields params)
+                (first_residual_open_fields operations)
+          | DIntrinsic _ typ _ implementation =>
+              first_residual_open (first_residual_open_expr typ)
+                (match implementation with
+                 | Nothing => Nothing Nat
+                 | Just body => first_residual_open_expr body
+                 end)
+          | DExtern _ typ _ => first_residual_open_expr typ
+          | DImport _ => Nothing Nat
+          | DRepresentation _ _ => Nothing Nat
+          end in
+        first_residual_open here (scan rest)
+    end;
 
 -- Canonical stitch: desugar matches, collect env, lower, rewrite dummy
 -- anns, compile_program, fuel32 fallback to elaborate_surfaces, then check the
@@ -595,6 +886,9 @@ def compile_checked_from_decls
     match first_unresolved_import ds with
     | Just path => CErr(CheckedProgram, ErrCode 92 path)
     | Nothing =>
+        match first_residual_open_decls ds with
+        | Just alias => CErr(CheckedProgram, ErrCode 98 alias)
+        | Nothing =>
         let ds1 : List Decl := desugar_file ds in
         let base_env : LowerEnv := collect_lower_env_from st ds1 in
         let ds2 : List Decl := rewrite_declarations fuel base_env ds1 in
@@ -606,6 +900,7 @@ def compile_checked_from_decls
         | COk cores =>
             check_emitted_decls check_module lower_expr_env2 elaborate
               selected fuel st env ds2 cores
+        end
         end
     end;
 
@@ -675,7 +970,7 @@ def canon_imports (base : List Nat)
                       (Cons Decl (DImport cid) rest) st2
                 end
             end
-        | DDef _ _ _ =>
+        | DDef _ _ _ _ _ =>
             match go ds' st with
             | MkPair rest st2 =>
                 MkPair(List Decl, InternState, Cons Decl d rest, st2)
@@ -685,7 +980,7 @@ def canon_imports (base : List Nat)
             | MkPair rest st2 =>
                 MkPair(List Decl, InternState, Cons Decl d rest, st2)
             end
-        | DInductive _ _ _ _ =>
+        | DInductive _ _ _ _ _ =>
             match go ds' st with
             | MkPair rest st2 =>
                 MkPair(List Decl, InternState, Cons Decl d rest, st2)

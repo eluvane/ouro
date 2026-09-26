@@ -6,7 +6,7 @@ import "../std/data.ouro",
   "pipeline_abi.ouro";
 
 -- LowerEnv: constIds, indIds, ctors, stringTyId, unitId, ioId, ioBindId,
--- pureId, listId, nilId, consId, ioPayloads, declTypes. The extra ids/hints are used
+-- pureId, listId, nilId, consId, ioPayloads, declTypes, markedDefs. The extra ids/hints are used
 -- only by the selfhost lowerer's bounded IO/list-literal ergonomics paths;
 -- they do not add kernel/runtime primitives.
 -- Special ids are ordered as String, Unit, IO, io_bind, pure, List, Nil, Cons.
@@ -14,26 +14,26 @@ def empty_special_ids : List Nat := ([Z, Z, Z, Z, Z, Z, Z, Z] : List Nat);
 
 def empty_env : LowerEnv :=
   MkLowerEnv (Nil Nat) (Nil Nat) (Nil CtorInfo) empty_special_ids
-    (Nil (Pair Nat Surface)) (Nil (Pair Nat Surface));
+    (Nil (Pair Nat Surface)) (Nil (Pair Nat Surface)) (Nil MarkedDefInfo);
 
 def env_constIds (env : LowerEnv) : List Nat :=
     match env with
-    | MkLowerEnv cs _ _ _ _ _ => cs
+    | MkLowerEnv cs _ _ _ _ _ _ => cs
     end;
 
 def env_indIds (env : LowerEnv) : List Nat :=
     match env with
-    | MkLowerEnv _ is _ _ _ _ => is
+    | MkLowerEnv _ is _ _ _ _ _ => is
     end;
 
 def env_ctors (env : LowerEnv) : List CtorInfo :=
     match env with
-    | MkLowerEnv _ _ cs _ _ _ => cs
+    | MkLowerEnv _ _ cs _ _ _ _ => cs
     end;
 
 def env_specialIds (env : LowerEnv) : List Nat :=
     match env with
-    | MkLowerEnv _ _ _ sp _ _ => sp
+    | MkLowerEnv _ _ _ sp _ _ _ => sp
     end;
 
 def nth_nat_or_zero (xs : List Nat) (idx : Nat) : Nat :=
@@ -73,37 +73,74 @@ def env_consId (env : LowerEnv) : Nat :=
 
 def env_ioPayloads (env : LowerEnv) : List (Pair Nat Surface) :=
     match env with
-    | MkLowerEnv _ _ _ _ payloads _ => payloads
+    | MkLowerEnv _ _ _ _ payloads _ _ => payloads
     end;
 
 def env_declTypes (env : LowerEnv) : List (Pair Nat Surface) :=
     match env with
-    | MkLowerEnv _ _ _ _ _ types => types
+    | MkLowerEnv _ _ _ _ _ types _ => types
     end;
+
+def env_markedDefs (env : LowerEnv) : List MarkedDefInfo :=
+    match env with
+    | MkLowerEnv _ _ _ _ _ _ defs => defs
+    end;
+
+def marked_def_name (info : MarkedDefInfo) : Nat :=
+    match info with
+    | MkMarkedDefInfo name _ _ => name
+    end;
+
+def marked_def_prefix (info : MarkedDefInfo) : Nat :=
+    match info with
+    | MkMarkedDefInfo _ marked _ => marked
+    end;
+
+def marked_def_declared (info : MarkedDefInfo) : Nat :=
+    match info with
+    | MkMarkedDefInfo _ _ declared => declared
+    end;
+
+def lookup_marked_def (name : Nat) (defs : List MarkedDefInfo)
+    : Maybe MarkedDefInfo :=
+    (fix go (rest : List MarkedDefInfo) : Maybe MarkedDefInfo :=
+      match rest with
+      | Nil => Nothing MarkedDefInfo
+      | Cons info tail =>
+          match eqNat name (marked_def_name info) with
+          | True => Just MarkedDefInfo info
+          | False => go tail
+          end
+      end) defs;
 
 def ctor_nameId (c : CtorInfo) : Nat :=
     match c with
-    | MkCtorInfo n _ _ _ _ => n
+    | MkCtorInfo n _ _ _ _ _ => n
     end;
 
 def ctor_indId (c : CtorInfo) : Nat :=
     match c with
-    | MkCtorInfo _ i _ _ _ => i
+    | MkCtorInfo _ i _ _ _ _ => i
     end;
 
 def ctor_idx (c : CtorInfo) : Nat :=
     match c with
-    | MkCtorInfo _ _ j _ _ => j
+    | MkCtorInfo _ _ j _ _ _ => j
     end;
 
 def ctor_nparams (c : CtorInfo) : Nat :=
     match c with
-    | MkCtorInfo _ _ _ p _ => p
+    | MkCtorInfo _ _ _ p _ _ => p
     end;
 
 def ctor_arity (c : CtorInfo) : Nat :=
     match c with
-    | MkCtorInfo _ _ _ _ a => a
+    | MkCtorInfo _ _ _ _ a _ => a
+    end;
+
+def ctor_implicit_prefix (c : CtorInfo) : Nat :=
+    match c with
+    | MkCtorInfo _ _ _ _ _ marked => marked
     end;
 
 def lookup_ctor (nameId : Nat) : List CtorInfo -> Maybe CtorInfo :=
@@ -526,6 +563,8 @@ def expr_io_payload_hint (env : LowerEnv) (locals : List (Pair Nat Surface)) (e 
     | ENoBinder => Nothing Surface
     | EMultiMatch _ _ => Nothing Surface
     | ESpan _ _ inner => go inner
+    | EFallible _ _ _ _ => Nothing Surface
+    | EOpen _ inner => go inner
     end) e;
 
 def expr_io_payload_or_unit (env : LowerEnv) (locals : List (Pair Nat Surface))
@@ -614,6 +653,90 @@ def surface_branch_body : Surface -> Surface :=
     | SPerform _ _ => term
     | SStr _ _ => term
     end;
+
+-- A repeated local name makes a free type variable ambiguous after shadowing.
+def local_name_shadowed (name : Nat) : List (Pair Nat Surface) -> Bool :=
+  fix go (locals : List (Pair Nat Surface)) : Bool :=
+    match locals with
+    | Nil => False
+    | Cons pair rest =>
+        match pair with
+        | MkPair current _ =>
+            match eqNat current name with
+            | False => go rest
+            | True =>
+                match lookup_local name rest with
+                | Just _ => True
+                | Nothing => False
+                end
+            end
+        end
+    end;
+
+-- Reject obvious unusable hints: holes, zero-id sentinels, absent free
+-- names, and names shadowed in this context. Names alone cannot prove binder
+-- origin; exhaustion is unavailable and the checker owns final acceptance.
+def surface_hint_has_placeholder (locals : List (Pair Nat Surface))
+    (fuel : Nat) (term : Surface) : Bool :=
+  (fix visit (remaining : Nat) (bound : List Nat) (part : Surface) : Bool :=
+    match remaining with
+    | Z => True
+    | S next =>
+        match part with
+        | SVar name =>
+            match eqNat name Z with
+            | True => True
+            | False =>
+                match memNat(name, bound) with
+                | True => False
+                | False =>
+                    match lookup_local name locals with
+                    | Just _ => local_name_shadowed name locals
+                    | Nothing => True
+                    end
+                end
+            end
+        | SSort _ => False
+        | SPi binder domain codomain =>
+            orb(visit next bound domain,
+              visit next (Cons Nat binder bound) codomain)
+        | SLam binder annotation body =>
+            orb(visit next bound annotation,
+              visit next (Cons Nat binder bound) body)
+        | SApp function argument =>
+            orb(visit next bound function, visit next bound argument)
+        | SLet binder value annotation body =>
+            orb(visit next bound value,
+              orb(visit next bound annotation,
+                visit next (Cons Nat binder bound) body))
+        | SConst name => eqNat name Z
+        | SInd name => eqNat name Z
+        | SConstruct ind _ _ => eqNat ind Z
+        | SCase _ predicate scrutinee branches =>
+            orb(visit next bound predicate,
+              orb(visit next bound scrutinee,
+                (fix any_branch (xs : List Surface) : Bool :=
+                    match xs with
+                    | Nil => False
+                    | Cons branch rest =>
+                        orb(visit next bound branch, any_branch rest)
+                    end) branches))
+        | SFix binder _ _ annotation body =>
+            orb(visit next bound annotation,
+              visit next (Cons Nat binder bound) body)
+        | SHole _ => True
+        | SEffectRow ty => visit next bound ty
+        | SPerform op arguments =>
+            orb(eqNat op Z,
+              (fix any_argument (xs : List Surface) : Bool :=
+                  match xs with
+                  | Nil => False
+                  | Cons argument rest =>
+                      orb(visit next bound argument, any_argument rest)
+                  end) arguments)
+        | SStr _ typeId => eqNat typeId Z
+        end
+    end) fuel (Nil Nat) term;
 
 def surface_type_hint (env : LowerEnv) (locals : List (Pair Nat Surface))
     (fuel : Nat) (surface : Surface) : Maybe Surface :=

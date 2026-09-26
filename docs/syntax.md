@@ -23,21 +23,41 @@ The parser expands the group into ordered imports. Aliases remain on separate
 single-path declarations. [Ergonomic syntax](language/ergonomic-syntax.md#grouped-imports)
 explains the desugaring and rejected forms.
 
-An import alias qualifies names from the imported file:
+An import alias qualifies declarations owned by that imported file:
 
 ```ouro
 def two : N.Nat := N.S N.one;
 ```
 
-Ouro currently uses a flat imported namespace. Import aliases and local opens
-are bounded conveniences, not a full module system:
+Plain imports keep unique short names available. A local term binder takes
+precedence over a bare module name, followed by a declaration owned by the
+current file, an innermost local open, and then a unique imported short name.
+With aliases in the reached import graph, a bare name not selected by these
+scopes is ambiguous when two imported files own it; use their aliases or a
+local open to select the intended declaration. A graph of plain imports
+without aliases retains the existing duplicate-declaration error for a
+collision. An alias cannot select a declaration only imported transitively by
+its file. Aliases are local to the importing file, and a local term binder does
+not change the meaning of `N.member`.
+Two supplied source units with the same normalized path are rejected, even
+when their path spellings differ; importing one unit through both spellings
+still selects the same module.
+Collisions of the legacy `IO`, `io_bind`, and `pure` lowering names report
+ambiguity even for qualified uses until those forms carry module-local
+operation metadata. Unambiguous `do` programs keep their current behavior.
+
+An expression can open an alias for its own subtree:
 
 ```ouro
 def three : Nat := open N in add two one;
 ```
 
-Top-level `open` declarations, selective imports, hidden exports, and nested
-module declarations are not supported.
+`open N in` selects declarations owned directly by `N` when their short names
+would otherwise be ambiguous. An inner open wins over an outer one; a local
+term binder or current-file declaration still takes precedence. The opened
+names do not escape the expression. Unknown aliases are rejected, and every
+imported body remains checked. Top-level `open` declarations, selective
+imports, hidden exports, and nested module declarations are not supported.
 
 ## Definitions and dependent functions
 
@@ -64,6 +84,12 @@ fun (x : A) => body
 let x : A := value in body
 ```
 
+Short lambdas such as `fun x => body` and `fun x y => body` use an expected
+function type when available. Its parameter types can also guide nested
+callbacks and matches in the lambda body; ambiguous or missing context still
+requires an annotation. [Ergonomic syntax](language/ergonomic-syntax.md#expected-types-in-short-lambdas)
+describes the bounded rule.
+
 A local helper can put its typed parameters next to its name:
 
 ```ouro
@@ -74,6 +100,35 @@ This is a non-recursive lambda-binding. Parameterized local helpers require
 typed parameters; the result annotation may be omitted when the body type can
 be inferred. [Ergonomic syntax](language/ergonomic-syntax.md#typed-local-helper-declarations)
 explains their scope and desugaring.
+
+An expression block groups sequential pure bindings with a final expression:
+
+```ouro
+let {
+  let first : Nat := value;
+  let second (x : Nat) := add first x;
+  second 2
+}
+```
+
+Each binding ends with `;`; the final expression has no trailing semicolon.
+The block lowers to nested local `let ... in` expressions. See
+[Pure expression blocks](language/ergonomic-syntax.md#pure-expression-blocks)
+for scope and rejection rules.
+
+For a checked `Either E A` or `Maybe A` family, a typed fallible block can
+propagate a failed value while binding successful payloads:
+
+```ouro
+let? (Left, Right) : Either Error Nat do
+  let n : Nat := operation?;
+  S n
+end
+```
+
+The header identifies the actual failure and success constructors. See
+[Typed fallible blocks](language/ergonomic-syntax.md#typed-fallible-blocks)
+for payload inference, boundaries, and rejection rules.
 
 ## Inductive data and pattern matching
 
@@ -88,6 +143,38 @@ def pred (n : Nat) : Nat :=
   | S k => k
   end;
 ```
+
+A family can opt in to omitting a leading universe parameter on saturated
+constructor calls:
+
+```ouro
+inductive Box {A : Type} : Type :=
+  | MkBox : A -> Box A;
+
+def boxed : Box Nat := MkBox Z;      -- inserts Nat
+def explicit : Box Nat := MkBox Nat Z;
+```
+
+Only leading `{A : Type}` groups on a non-indexed inductive family are marked.
+When the expected result is a direct, fully applied `Box Nat`, the compiler
+inserts its marked parameter before checking the ordinary constructor call.
+A saturated call without that context can also use direct constructor field
+value types when every family parameter is marked and reliably witnessed.
+Explicit arguments remain valid; unmarked constructors and generic functions
+keep their existing explicit-argument rules. See
+[Marked constructor parameters](language/ergonomic-syntax.md#marked-constructor-parameters)
+for the bounded inference rule.
+
+Definitions can also opt in with leading `{A : Type}` parameters:
+
+```ouro
+def identity {A : Type} (value : A) : A := value;
+def one : Nat := identity Z;
+def explicit : Nat := identity Nat Z;
+```
+
+Only exact saturated source calls use bounded value and expected type hints;
+explicit calls remain valid. See [Marked definition parameters](language/ergonomic-syntax.md#marked-definition-parameters).
 
 Matches are constructor-based. The current implementation does not provide the
 full pattern language of a mature functional language; advanced patterns,
@@ -207,12 +294,47 @@ Natural-number literals elaborate to the current `Nat` representation:
 
 ```ouro
 def two : Nat := 2;
+def thousand : Nat := 1_000;
+def mask : Nat := 0xFF_FF;
+def bits : Nat := 0b1010_0011;
 ```
 
-String literals support `\n`, `\t`, `\r`, `\"`, and `\\` escapes:
+Decimal digits may contain a single `_` between digits. Hexadecimal `0x`/`0X`
+and binary `0b`/`0B` use the same `Nat` representation, and their digits may
+also be separated by single interior underscores. A base prefix requires at
+least one digit. A leading, doubled, or trailing underscore, a digit outside
+the selected base, and an identifier suffix are rejected as malformed numeric
+tokens; for example `1__0`, `0x_F`, `0b2`, and `12u32`. The spelling `_1`
+remains an identifier under the existing identifier grammar. These literals do
+not select a machine integer type or perform a narrowing conversion. Typed
+numeric suffixes are not supported.
+
+String literals support `\n`, `\t`, `\r`, `\"`, `\\`, and braced Unicode
+scalar escapes:
 
 ```ouro
-def message : String := "hello\n";
+def message : String := "hello\n\u{1F600}";
+```
+
+`\u{...}` requires 1–6 ASCII hexadecimal digits (either case) and a value
+at most `10FFFF` outside the surrogate range `D800..DFFF`. It contributes the
+scalar's UTF-8 bytes to the existing byte-based `String`; `\u{0}` contributes
+one NUL byte. An unclosed braced escape, invalid digits, and invalid scalars
+are lexical errors. Other unknown backslash pairs retain their backslash and
+following character. Quoted import paths use the same decoding. Ordinary
+quoted strings can contain physical line breaks; they do not strip indentation.
+
+For text containing backslashes or quotes, `r#"..."#` is a raw `String`
+literal. It preserves every byte between the delimiters, including physical
+line breaks, UTF-8 bytes, and backslashes; `\n` is two bytes rather than a
+newline. The first `"#` closes it even when preceded by a backslash. Exactly
+one `#` is supported, and an unclosed raw literal is a lexical error. Raw
+quoted imports use the same spelling and preserve their path bytes before the
+usual path normalization.
+
+```ouro
+def path : String := r#"C:\temp\data"#;
+def quote : String := r#"say "hello""#;
 ```
 
 Import `std/string.ouro` to use the standard `String` type and helpers. A
@@ -237,11 +359,19 @@ embedded-NUL limits.
 
 ## Lists
 
-List literals require an expected `List A` type:
+List literals use an expected `List A` type when one is available:
 
 ```ouro
 def values : List Nat := [Z, S Z, S (S Z),];
 def empty : List Nat := [];
+```
+
+A nonempty literal without an expected type can infer its element type from
+its first element. Later elements must have that type:
+
+```ouro
+def inferred : List Nat := let values := [Z, S Z] in values;
+def nested : List (List Nat) := let rows := [[Z], []] in rows;
 ```
 
 A local type ascription can provide the expected element type:
@@ -250,9 +380,16 @@ A local type ascription can provide the expected element type:
 def count : Nat := (([Z, S Z] : List Nat) |> length Nat);
 ```
 
-Untyped `[]` and ambiguous list literals are rejected. A nonempty list may
-end with a comma; `[]` remains the empty spelling. List literals lower to the
-standard `Nil` and `Cons` constructors.
+Untyped `[]` and ambiguous list literals still require context. If the first
+element has no inferable type, annotate the literal or binding; later elements
+do not resolve it.
+This is a bounded first-element hint, not general type unification. A free
+local type name shadowed by a later binding also needs an explicit `List A`
+annotation so the earlier type is not rebound under the later name.
+Heterogeneous lists are rejected. A nonempty list may end with a comma;
+`[]` remains the empty spelling. List literals lower to the standard `Nil`
+and `Cons` constructors, and the compiler checks every element against the
+selected type.
 
 ## Records
 
@@ -266,15 +403,58 @@ record Point : Type where
 end;
 
 def origin : Point := { x := Z, y := Z };
+def x : Nat := Z;
+def y : Nat := Z;
+def sameOrigin : Point := { y, x };
+def moved : Point := { origin with x := S Z };
 def originX : Nat := origin.x;
 ```
 
 The default constructor is `MkPoint`; generated accessor names use
 `Point_x`, `Point_y`, and so on. Record literals require a known record type,
-and every field must appear exactly once.
+and every field must appear exactly once. A bare field name such as `x` means
+`x := x`; the value resolves in the ordinary lexical scope. Punned and explicit
+fields may be mixed, with comments and a trailing comma. Field order in the
+source does not change the constructor's declared field order. Unknown,
+duplicate, and missing fields remain errors; an unbound punned value is a
+compiler error.
+With an import alias, a literal annotated `A.Point` uses the record declared
+by `A`, and `A.point.x` retains `A.point` as its base. Qualified projection
+requires the value and record declaration to belong directly to that aliased
+file. A value re-exported with a record type from another file needs an
+explicit accessor call from the record's owner. An unqualified local value or
+bare record type backed by an imported record also uses that record's alias
+when available. Without an alias, record sugar retains the existing short
+name when unambiguous. If a local binder or explicit use has the same short
+name, the compiler attaches an internal record-owner reference to the generated
+constructor or accessor. The ordinary `preprocess_records` text-only helper
+rejects an expansion that requires this metadata; compile through the checked
+source or unit entry point instead.
 
-Record update, record pattern matching, anonymous records, row polymorphism,
-subtyping, and overloaded field resolution are not implemented.
+`{ origin with x := S Z }` creates a new `Point`, copying every unchanged field.
+The expected annotation supplies the nominal record type and the compiler checks
+both the base and changed field values against it. Multiple changed fields are
+bound in source order; constructor arguments follow declaration order. An
+unknown or repeated field is rejected. A path such as
+`{ user with address.city := next_city, address.zip := next_zip }` updates
+fields inside a nominal record field. Sibling paths are allowed; repeated paths
+and a path paired with its ancestor are rejected. The base and changed values
+are bound once in source order, while reconstructed constructor fields follow
+declaration order. A typed local binding, a record-valued field, or an explicit
+literal ascription such as `({ x := Z, y := Z } : Point)` supplies the expected
+nominal type for its own value. That type does not flow into unrelated function
+arguments. Updates without a known nominal result type and dependent record
+fields remain unsupported.
+For an imported record, an updated field's temporary type annotation must be
+a nominal record type declared in that record's own file. The compiler resolves
+each nested field against its actual record owner. Field types that depend on
+the imported file's own aliases, or name a type from another file, are rejected
+until owner-local import bindings can be carried into the caller. Other imported
+field types are also rejected because their type provenance cannot yet be
+carried into the generated annotation.
+
+Record pattern matching, anonymous records, row polymorphism, subtyping, and
+overloaded field resolution are not implemented.
 
 ## Application and the pipe operator
 
@@ -349,5 +529,5 @@ declaration do not require a trailing semicolon per arm.
 
 The [design goals](design.md#language-direction) and
 [stability policy](stability.md#experimental-areas) describe planned and
-experimental language areas. Record updates, unrestricted recursion, implicit
+experimental language areas. Unrestricted recursion, general implicit
 arguments, and type classes are outside this surface.

@@ -365,6 +365,43 @@ class HarnessTests(unittest.TestCase):
                 run_manifest(SimpleNamespace(seed=-1, out=out))
             self.assertEqual(before, sorted(path.relative_to(out).as_posix() for path in out.rglob("*")))
 
+    def test_ergonomics_setup_comment_cannot_consume_candidate_or_lint_variant(self):
+        from ourosmith.ergonomics_inputs import render
+
+        case = {"type": "ErgNat", "sugar": "ErgZero", "canonical": "ErgZero",
+                "setup": "def setup : ErgNat := ErgZero; -- final comment"}
+        regular = render(case, Path("fixture"))
+        lint = render(dict(case, source="def ergo_expansion_candidate : ErgNat := ErgZero;"),
+                      Path("fixture"))
+        self.assertIn("-- final comment\ndef ergo_expansion_candidate", regular)
+        self.assertIn("\ndef ergo_expansion_reference", regular)
+        self.assertIn("-- final comment\ndef ergo_expansion_candidate", lint)
+        self.assertEqual(lint.count("def setup : ErgNat"), 1)
+
+    def test_current_record_update_mapping_keeps_archived_rejection(self):
+        from ourosmith.migration import current_record_update_categories, legacy_categories
+
+        manifest = ("REC.B.check.ambiguous_literal\trecords/bad/ambiguous_literal.ouro\tcheck\tfail\t1\tOURO-REC-003\n"
+                    "REC.B.check.update_pending\trecords/bad/update_pending.ouro\tcheck\tfail\t1\tOURO-REC-003\n")
+        archived, count = legacy_categories([], manifest)
+        self.assertEqual(count, 2)
+        archived_record = next(row for row in archived if row["id"] ==
+                               "manifest:REC.B:check:fail:OURO-REC-003")
+        self.assertEqual(len(archived_record["rows"]), 2)
+        current = current_record_update_categories(legacy_categories([], manifest)[0])
+        current_record = next(row for row in current if row["id"] ==
+                              "manifest:REC.B:check:fail:OURO-REC-003")
+        accepted = next(row for row in current if row["id"] ==
+                        "current:REC.B.check.update_pending")
+        self.assertEqual(len(archived_record["rows"]), 2)
+        self.assertEqual([row["id"] for row in current_record["rows"]],
+                         ["REC.B.check.ambiguous_literal"])
+        self.assertEqual(current_record["strategies"], ["surface/negative_kinds/record-no-context"])
+        self.assertEqual([row["id"] for row in accepted["rows"]],
+                         ["REC.B.check.update_pending"])
+        self.assertEqual(accepted["expect"], "pass")
+        self.assertIn("external/ci/ergonomics", accepted["strategies"])
+
     def test_migration_requires_exact_executed_categories(self):
         from ourosmith import migration_contracts as mapping
         from ourosmith.migration import exercised, refresh
