@@ -554,6 +554,86 @@ def lower_lbranch
         end
     end;
 
+def coalesce_payload_hint (env : LowerEnv)
+    (locals : List (Pair Nat Surface)) (family : Nat)
+    (operand : Surface) : Maybe Surface :=
+  match surface_type_hint env locals fuel1k operand with
+  | Nothing => Nothing Surface
+  | Just hint =>
+      match peel_ind_apps hint with
+      | Nothing => Nothing Surface
+      | Just head => match head with
+        | MkPair selected params =>
+            match eqNat selected family with
+            | False => Nothing Surface
+            | True => match params with
+              | Cons payload tail =>
+                  match tail with
+                  | Nil => Just Surface payload
+                  | Cons _ _ => Nothing Surface
+                  end
+              | Nil => Nothing Surface
+              end
+            end
+        end
+      end
+  end;
+
+def coalesce_motive (family : Nat) (payloadTy : Surface) : Surface :=
+  let param : Nat := S (fallible_max_var payloadTy) in
+  let scrutinee : Nat := S param in
+  SLam param (SSort Z)
+    (SLam scrutinee (SApp(SInd family, SVar param)) payloadTy);
+
+def lower_xvcoalesce
+  (lower_run : Nat -> LowerEnv -> Maybe Surface -> Maybe Nat -> List (Pair Nat Surface) -> LowerMode -> LowerVal)
+  (fuel' : Nat) (env : LowerEnv) (er : Maybe Surface)
+  (fixSelf : Maybe Nat) (locals : List (Pair Nat Surface))
+  (operand : Expr) (fallback : Expr) : LowerVal :=
+    let family : Nat := env_maybeId env in
+    let missing : Nat := env_nothingId env in
+    let present : Nat := env_justId env in
+    match andb(notb(eqNat family Z),
+      andb(notb(eqNat missing Z),
+        andb(notb(eqNat present Z),
+          andb(fallible_ctor_shape env family missing present 1 0,
+            match lookup_ctor(missing, env_ctors env),
+                  lookup_ctor(present, env_ctors env) with
+            | Just first, Just second =>
+                andb(eqNat(ctor_idx first, Z), eqNat(ctor_idx second, 1))
+            | _, _ => False
+            end)))) with
+    | False => VSurf hole0
+    | True =>
+        let probe : Surface := vsurf_or_hole
+          (lower_run fuel' env (Nothing Surface) fixSelf locals
+            (LExpr operand)) in
+        let payload : Maybe Surface :=
+          match coalesce_payload_hint env locals family probe with
+          | Just inferred => Just Surface inferred
+          | Nothing => er
+          end in
+        match payload with
+        | Nothing => VSurf hole0
+        | Just payloadTy =>
+            match surface_hint_has_placeholder locals fuel1k payloadTy with
+            | True => VSurf hole0
+            | False =>
+                let inputTy : Surface := SApp(SInd family, payloadTy) in
+                let input : Surface := vsurf_or_hole
+                  (lower_run fuel' env (Just Surface inputTy) fixSelf locals
+                    (LExpr operand)) in
+                let alternative : Surface := vsurf_or_hole
+                  (lower_run fuel' env (Just Surface payloadTy) fixSelf locals
+                    (LExpr fallback)) in
+                let binder : Nat := S (fallible_max_var payloadTy) in
+                VSurf (SCase (MkCaseInfo family 1 [0, 1])
+                  (coalesce_motive family payloadTy) input
+                  [alternative, SLam binder payloadTy (SVar binder)])
+            end
+        end
+    end;
+
 def lower_run : Nat -> LowerEnv -> Maybe Surface -> Maybe Nat -> List (Pair Nat Surface) -> LowerMode -> LowerVal :=
   fix lower_run (fuel : Nat) (env : LowerEnv) (er : Maybe Surface) (fixSelf : Maybe Nat) (locals : List (Pair Nat Surface)) (mode : LowerMode) : LowerVal :=
     match fuel with
@@ -580,6 +660,8 @@ def lower_run : Nat -> LowerEnv -> Maybe Surface -> Maybe Nat -> List (Pair Nat 
             | XVLet name ann val body => lower_xvlet recur fuel' env er fixSelf locals name ann val body
             | XVAscribe tm ty => lower_xvascribe recur fuel' env er fixSelf locals tm ty
             | XVMatch scrut branches => lower_xvmatch recur fuel' env er fixSelf locals scrut branches
+            | XVCoalesce operand fallback =>
+                lower_xvcoalesce recur fuel' env er fixSelf locals operand fallback
             | XVFix name binders ret body => lower_xvfix recur fuel' env er fixSelf locals name binders ret body
             | XVEffectRow ty ops => lower_xveffectrow recur fuel' env er fixSelf locals ty ops
             | XVPerform op args => lower_xvperform recur fuel' env er fixSelf locals op args

@@ -157,6 +157,11 @@ The header identifies the actual failure and success constructors. See
 [Typed fallible blocks](language/ergonomic-syntax.md#typed-fallible-blocks)
 for payload inference, boundaries, and rejection rules.
 
+For a registered `Maybe A`, `value ?? fallback` selects the payload of
+`Just` or evaluates `fallback` on `Nothing`. It binds less tightly than `|>`
+and associates to the right. See [Maybe fallback operator](language/ergonomic-syntax.md#maybe-fallback-operator)
+for typing and precedence.
+
 ## Inductive data and pattern matching
 
 ```ouro
