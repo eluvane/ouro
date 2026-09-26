@@ -6,6 +6,9 @@ Development changes; see the [compatibility policy](docs/stability.md).
 
 ### Added
 
+- `private` declaration visibility keeps internal helpers, constructors,
+  effect operations, and record accessors available to their owner while
+  excluding them from imports and re-exports; imported bodies are still checked.
 - Exclusive `0..10` and inclusive `0..=10` literal-endpoint `NatRange` values,
   checked through nominal Nat, bound, and range representation roles.
 - Final-tail list spreads `[first, ..rest]` build checked `List A` constructor
