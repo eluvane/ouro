@@ -41,6 +41,9 @@ RUNTIME = (
 )
 ACCEPTANCE_ROOTS = ("std/prelude.ouro", "std/data.ouro", "tools/collect.ouro", "tests/compiler_abi_tests.ouro")
 ABI_STDOUT = """PASS lexer/parser/resolver share declarations and intern state
+PASS closed checked parser retains private metadata and AST projection
+PASS private declaration metadata keeps its parsed member identity
+PASS private effect metadata includes its operation
 PASS lexer malformed result crosses parser callback
 PASS lexer exhaustion crosses parser callback
 PASS parser error crosses unit callback
