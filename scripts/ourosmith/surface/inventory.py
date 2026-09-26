@@ -56,7 +56,7 @@ DECL = {"DDef": "feature:prelude", "DAxiom": "negative:effect-root-assumption-ty
         "DIntrinsic": "feature:prelude", "DRepresentation": "feature:prelude", "DExtern": "feature:form:extern-declaration"}
 TOKEN = dict.fromkeys(("TIdent", "TNat", "TKeyword", "TType", "TColon", "TColonEq", "TArrow", "TFatArrow",
                        "TBar", "TLparen", "TRparen", "TSemi", "TEof"), "feature:prelude")
-TOKEN.update({"THole": "negative:named-hole", "TString": "feature:string-length", "TComma": "feature:form:list",
+TOKEN.update({"THole": "negative:named-hole", "TString": "feature:string-length", "TByteString": "feature:form:byte-string", "TComma": "feature:form:list",
               "TBraceL": "feature:form:record", "TBraceR": "feature:form:record", "TBind": "property:test-known-counts",
               "TPipe": "feature:pipe", "TBracketL": "feature:form:list", "TBracketR": "feature:form:list",
               "TDotDot": "feature:form:list-spread", "TDotDotEq": "feature:form:range-literal"})

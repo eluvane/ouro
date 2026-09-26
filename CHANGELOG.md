@@ -6,6 +6,8 @@ Development changes; see the [compatibility policy](docs/stability.md).
 
 ### Added
 
+- Byte-list literals `b"..." : List Nat` with strict ASCII source and `\xHH`
+  escapes for arbitrary bytes; malformed escapes and raw non-ASCII are rejected.
 - Exclusive `0..10` and inclusive `0..=10` literal-endpoint `NatRange` values,
   checked through nominal Nat, bound, and range representation roles.
 - Final-tail list spreads `[first, ..rest]` build checked `List A` constructor

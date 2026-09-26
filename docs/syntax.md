@@ -385,6 +385,19 @@ def path : String := r#"C:\temp\data"#;
 def quote : String := r#"say "hello""#;
 ```
 
+`b"..."` is a byte-list literal with type `List Nat`. Printable ASCII bytes
+`0x20..0x7E` may appear directly, except `"` and `\`, which must be escaped.
+It accepts `\n`, `\t`, `\r`, `\"`, `\\`, and exactly two hexadecimal digits
+after `\x` (either case). Each `\xHH` contributes one byte, including NUL or
+bytes above ASCII. Raw non-ASCII and control bytes, physical line breaks,
+unknown escapes, and incomplete hex escapes are lexical errors. An empty byte
+literal needs an expected `List Nat` type. Import paths remain `String`
+literals; `import b"..."` is rejected.
+
+```ouro
+def packet : List Nat := b"OK\x00\xFF";
+```
+
 Import `std/string.ouro` to use the standard `String` type and helpers. A
 standalone prelude must declare `intrinsic String : Type := "ouro.string";`.
 An opaque `axiom String : Type;` does not authenticate string literals, even
