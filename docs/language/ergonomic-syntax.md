@@ -472,8 +472,8 @@ Grouped imports, calls, local helpers, pure expression blocks, and list syntax
 reuse existing `DImport`, `EApp`, `EAscribe`, `ELam`, `EPi`, `ELet`, and `EList`
 nodes. Typed fallible blocks retain a frontend node until lowering verifies
 their constructor roles. The formatter retains the source spelling of these
-forms. The fixture inventory
-is `tests/language_ergonomics/cases.json`; it includes desugaring pairs,
+forms. The fixture inventory is
+`tests/language_ergonomics/cases.json`; it includes desugaring pairs,
 rejected forms, import graph/diagnostic cases, and formatter round trips.
 [CI](../ci.md#local-profiles) owns validation commands and gate status.
 
