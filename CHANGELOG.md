@@ -6,6 +6,9 @@ Development changes; see the [compatibility policy](docs/stability.md).
 
 ### Added
 
+- Nonempty list literals can infer an element type from their first element
+  without an expected `List A` context; empty and ambiguous literals still
+  require an annotation.
 - Typed local helpers may omit the result annotation when their body type is
   inferable; see [Ergonomic syntax](docs/language/ergonomic-syntax.md#typed-local-helper-declarations).
 - Review-only Clippy proofs for Result/Maybe error flow, collection and string

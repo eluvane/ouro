@@ -237,11 +237,19 @@ embedded-NUL limits.
 
 ## Lists
 
-List literals require an expected `List A` type:
+List literals use an expected `List A` type when one is available:
 
 ```ouro
 def values : List Nat := [Z, S Z, S (S Z)];
 def empty : List Nat := [];
+```
+
+A nonempty literal without an expected type can infer its element type from
+its first element. Later elements must have that type:
+
+```ouro
+def inferred : List Nat := let values := [Z, S Z] in values;
+def nested : List (List Nat) := let rows := [[Z], []] in rows;
 ```
 
 A local type ascription can provide the expected element type:
@@ -250,8 +258,14 @@ A local type ascription can provide the expected element type:
 def count : Nat := (([Z, S Z] : List Nat) |> length Nat);
 ```
 
-Untyped `[]`, ambiguous list literals, and trailing commas are rejected. List
-literals lower to the standard `Nil` and `Cons` constructors.
+Untyped `[]` still requires context. If the first element has no inferable
+type, annotate the literal or binding; later elements do not resolve it.
+This is a bounded first-element hint, not general type unification. A free
+local type name shadowed by a later binding also needs an explicit `List A`
+annotation so the earlier type is not rebound under the later name.
+Heterogeneous lists and trailing commas are rejected. List literals lower to
+the standard `Nil` and `Cons` constructors, and the compiler checks every
+element against the selected type.
 
 ## Records
 
