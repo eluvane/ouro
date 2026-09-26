@@ -13,6 +13,8 @@ Development changes; see the [compatibility policy](docs/stability.md).
 - Language-server completion suggests local nullary constructors for direct
   definitions with an explicit, simple expected type while retaining ordinary
   name-prefix suggestions.
+- Pure `let name := value;` bindings in `do` expressions use ordinary lexical
+  scope between actions; `let!` continues to bind an action's result.
 - Exclusive `0..10` and inclusive `0..=10` literal-endpoint `NatRange` values,
   checked through nominal Nat, bound, and range representation roles.
 - Final-tail list spreads `[first, ..rest]` build checked `List A` constructor
