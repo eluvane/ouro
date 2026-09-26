@@ -122,7 +122,7 @@ def result : Nat := add (choose True) (choose False);
 def length (A : Type) : List A -> Nat :=
   fix length (xs : List A) : Nat :=
     match xs with | Nil => Z | Cons _ tail => S (length tail) end;
-def values : List Nat := [{', '.join(map(str, values))}];
+def values : List Nat := [{', '.join(map(str, values))}{',' if values else ''}];
 def result : Nat := values |> length Nat;
 """, len(values), False
     yield "record", PRELUDE + f"""record Point : Type where
