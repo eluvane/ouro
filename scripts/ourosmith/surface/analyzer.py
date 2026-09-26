@@ -51,6 +51,7 @@ def ast_trees(seed):
         yield Node(tag)
     for tag in ("AApp", "AAscribe", "AMatch", "AHandle"):
         yield Node(tag, (pair, leaf))
+    yield Node("AIf", (pair, leaf, pair))
     for tag in ("ALam", "APi", "ABinder"):
         yield Node(tag, (1, pair, leaf))
     for tag in ("ALet", "AFix"):
@@ -108,6 +109,7 @@ def rows(seed):
         ("EHandle (EVar 1) ([MkPair Nat (Pair (List Nat) Expr) 2 (MkPair (List Nat) Expr (Nil Nat) (EVar 3))] : List (Pair Nat (Pair (List Nat) Expr)))", 3, 5),
         ("EMultiMatch ([EVar 1, EVar 2] : List Expr) ([MkPair (List (Pair Nat (List Nat))) Expr ([MkPair Nat (List Nat) 3 (Nil Nat)] : List (Pair Nat (List Nat))) (EVar 4)] : List (Pair (List (Pair Nat (List Nat))) Expr))", 4, 7),
         ("ENamedCall (EVar 1) ([MkPair Nat Expr 5 (ENat 2)] : List (Pair Nat Expr))", 3, 3),
+        ("EIf (EVar 1) (ENat 2) (ENat 3)", 4, 4),
     ):
         yield f"show_nat (adapt_size ({expression}))", str(size)
         yield f"show_nat (ast_size (adapt ({expression})))", str(adapted_size)
