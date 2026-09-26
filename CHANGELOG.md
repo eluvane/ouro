@@ -21,6 +21,8 @@ Development changes; see the [compatibility policy](docs/stability.md).
 
 ### Changed
 
+- Split compiler-checking fixtures across twelve PR and nightly jobs while
+  retaining complete, source-bound suite coverage; see [CI](docs/ci.md#local-profiles).
 - Build release toolchains from a [checked compact source copy](docs/canonical_source.md#materialization),
   retaining original-source checks and full generated C equality.
 - Publish automatic snapshots every three days instead of weekly, using

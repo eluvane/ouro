@@ -25,6 +25,7 @@ from repo_support import bind_relative_path, hash_json, sha256_file, write_json_
 ROOT = Path(__file__).resolve().parents[1]
 rel = bind_relative_path(ROOT, resolve=True)
 REPORT_KIND = "ouro.ci-gate-report.v1"
+COMPILER_SHARDS = 12
 
 
 @dataclass(frozen=True)
@@ -90,7 +91,7 @@ PR_GROUPS: dict[str, tuple[str, ...]] = {
     "smith": ("ouro-smith",),
     "samples-1": ("samples-1",),
     "samples-2": ("samples-2",),
-    **{f"compiler-{index}": (f"compiler-checking-{index}",) for index in range(1, 9)},
+    **{f"compiler-{index}": (f"compiler-checking-{index}",) for index in range(1, COMPILER_SHARDS + 1)},
 }
 
 NIGHTLY_GROUPS: dict[str, tuple[str, ...]] = {
@@ -357,7 +358,7 @@ def affected_compiler_gates(paths: Sequence[str], root: Path = ROOT) -> set[str]
     selected: set[str] = set()
     for index, fixture in enumerate(compiler_fixture_roots(root)):
         if changed.intersection(collect_units(fixture, imports=read_imports)):
-            selected.add(f"compiler-checking-{index % 8 + 1}")
+            selected.add(f"compiler-checking-{index % COMPILER_SHARDS + 1}")
     return selected
 
 
@@ -679,7 +680,7 @@ def gates() -> list[Gate]:
         Gate("lint-changed", ["sh", "scripts/ouro1.sh", "lint", "--deny", "--"], ("pr",)),
         Gate("lsp", ["sh", "scripts/lsp_suite.sh"], ("pr", "nightly", "manual"), env=(("LSP_SUITE_OUT", "_build/lsp_suite"),)),
         Gate("test", ["sh", "scripts/test_suite.sh"], ("pr", "nightly", "manual"), env=(("TEST_SUITE_OUT", "_build/test_suite"),)),
-        *(Gate(f"compiler-checking-{index}", ["sh", "scripts/test_suite.sh", "--compiler-checking", f"--shard={index}/8"], ("pr", "nightly", "manual", "kernel"), env=(("TEST_SUITE_OUT", f"_build/compiler_check_suite_{index}"), ("OURO_JOBS", "1"), ("OURO_FRONTEND_JOBS", "1"))) for index in range(1, 9)),
+        *(Gate(f"compiler-checking-{index}", ["sh", "scripts/test_suite.sh", "--compiler-checking", f"--shard={index}/{COMPILER_SHARDS}"], ("pr", "nightly", "manual", "kernel"), env=(("TEST_SUITE_OUT", f"_build/compiler_check_suite_{index}"), ("OURO_JOBS", "1"), ("OURO_FRONTEND_JOBS", "1"))) for index in range(1, COMPILER_SHARDS + 1)),
         Gate("compiler-boundary", ["sh", "scripts/ouro_repo_gate.sh", "--profile", "compiler-boundary", "--out", "_build/compiler_boundary"], ("pr", "nightly", "manual", "kernel")),
         Gate("samples-1", ["sh", "scripts/samples_suite.sh", "--shard=1/2"], ("pr", "nightly", "manual"), env=(("SAMPLES_SUITE_OUT", "_build/samples_suite_1"),)),
         Gate("samples-2", ["sh", "scripts/samples_suite.sh", "--shard=2/2"], ("pr", "nightly", "manual"), env=(("SAMPLES_SUITE_OUT", "_build/samples_suite_2"),)),
@@ -926,10 +927,12 @@ def routing_contract_failures() -> list[str]:
         (root / "tools/lsp_model.ouro").write_text("def value : Nat := 0;\n", encoding="utf-8")
         (root / "tests/shared.ouro").write_text('import "../tools/lsp_model.ouro" as Model;\n', encoding="utf-8")
         inventory = root / "tools/test/suites.ouro"
-        rows = [f'MkSuiteFixture "case_{i}" "tests/case_{i}.ouro" Z SuiteGoldenNone' for i in range(9)]
+        rows = [f'MkSuiteFixture "case_{i}" "tests/case_{i}.ouro" Z SuiteGoldenNone'
+                for i in range(COMPILER_SHARDS + 1)]
         inventory.write_text("def compiler_check_suite_fixtures : List SuiteFixture :=\n[" + ",\n".join(rows) + "];\n", encoding="utf-8")
-        for i in range(9):
-            source = 'import "shared.ouro";\n' if i in {0, 8} else "def value : Nat := 0;\n"
+        for i in range(COMPILER_SHARDS + 1):
+            source = ('import "shared.ouro";\n' if i in {0, COMPILER_SHARDS}
+                      else "def value : Nat := 0;\n")
             (root / f"tests/case_{i}.ouro").write_text(source, encoding="utf-8")
         if affected_compiler_gates(["tools/lsp_model.ouro"], root) != {"compiler-checking-1"}:
             failures.append("transitive alias import or round-robin shard ownership was lost")

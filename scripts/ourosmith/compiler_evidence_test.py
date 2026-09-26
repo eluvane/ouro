@@ -135,16 +135,18 @@ class CompilerEvidenceTests(EvidenceTreeTests):
         inventory = ['tests/compiler_suite_contract_tests.ouro', 'tests/compiler_property_tests.ouro',
                      'tests/compiler_abi_tests.ouro', 'tests/compiler_check_tests.ouro',
                      'tests/compiler_driver_tests.ouro', 'tests/compiler_fault_tests.ouro',
-                     'tests/compiler_module_tests.ouro', 'tests/compiler_positive_tests.ouro']
-        receipts = {f'{index}/8': {'inventory': inventory.copy(), 'runner_build_key': 'current',
+                     'tests/compiler_module_tests.ouro', 'tests/compiler_positive_tests.ouro',
+                     'tests/compiler_plan_tests.ouro', 'tests/compiler_refine_tests.ouro',
+                     'tests/compiler_result_tests.ouro', 'tests/compiler_structural_tests.ouro']
+        receipts = {f'{index}/12': {'inventory': inventory.copy(), 'runner_build_key': 'current',
                                   'runner_sha256': 'current', 'artifacts': [{'entry': entry}]}
                     for index, entry in enumerate(inventory, 1)}
         with patch('ourosmith.host.binary', return_value=self.root / 'compiler'), \
              patch.object(evidence, 'suite_receipt', side_effect=lambda _log, _compiler, shard: receipts[shard]) as observed:
             summary_path.write_text(json.dumps(summary), encoding='utf-8')
             self.assertEqual([row['entry'] for row in evidence.ci_compiler_receipt(out)['artifacts']], inventory)
-            self.assertEqual([call.kwargs['shard'] for call in observed.call_args_list], [f'{index}/8' for index in range(1, 9)])
-            for index in range(8):
+            self.assertEqual([call.kwargs['shard'] for call in observed.call_args_list], [f'{index}/12' for index in range(1, 13)])
+            for index in range(12):
                 for key, value in [('blocking', False), ('status', 'skip'), ('returncode', True),
                                    ('returncode', 1), ('command', ['unrelated']), ('log', 'elsewhere'), ('log', None)]:
                     changed = deepcopy(summary)
@@ -160,28 +162,42 @@ class CompilerEvidenceTests(EvidenceTreeTests):
             for key, value in [('inventory', inventory[:-1]), ('runner_build_key', 'stale'),
                                ('runner_sha256', 'stale'), ('artifacts', []),
                                ('artifacts', [{'entry': inventory[0]}])]:
-                original = receipts['8/8'][key]
-                receipts['8/8'][key] = value
+                original = receipts['12/12'][key]
+                receipts['12/12'][key] = value
                 with self.assertRaises(ValueError):
                     evidence.ci_compiler_receipt(out)
-                receipts['8/8'][key] = original
+                receipts['12/12'][key] = original
 
     def test_shard_receipt_requires_exact_selection_from_full_current_inventory(self):
         selected = RunResult('ok', 0, 'tests/compiler_property_tests.ouro\n', '', 0.1, 10)
         self.log.write_text('COMPILER_CHECK_OK compiler_property-run\n'
                             'COMPILER_CHECK_SUITE: PASS rows=1 out=' + self.directory.as_posix() + '\n', encoding='utf-8')
         self.execute.side_effect = [self.listed, selected]
-        receipt = evidence.suite_receipt(self.log, self.root / 'compiler', shard='2/8')
+        receipt = evidence.suite_receipt(self.log, self.root / 'compiler', shard='2/12')
         self.assertEqual(receipt['inventory'], self.listed.stdout.splitlines())
         self.assertEqual([row['entry'] for row in receipt['artifacts']], selected.stdout.splitlines())
-        self.assertEqual(self.execute.call_args.args[0][-1], '--shard=2/8')
+        self.assertEqual(self.execute.call_args.args[0][-1], '--shard=2/12')
         for field, value in [('status', 'timeout'), ('returncode', 1), ('stderr', 'failure'),
                              ('stdout', ''), ('stdout', self.listed.stdout), ('stdout', selected.stdout * 2)]:
             changed = deepcopy(selected)
             setattr(changed, field, value)
             self.execute.side_effect = [self.listed, changed]
             with self.subTest(field=field), self.assertRaises(ValueError):
-                evidence.suite_receipt(self.log, self.root / 'compiler', shard='2/8')
+                evidence.suite_receipt(self.log, self.root / 'compiler', shard='2/12')
+
+    def test_tenth_shard_uses_the_complete_multidigit_index(self):
+        inventory = [f'tests/compiler_fixture_{index}_tests.ouro' for index in range(9)]
+        inventory[0] = 'tests/compiler_suite_contract_tests.ouro'
+        inventory += ['tests/compiler_property_tests.ouro']
+        inventory += [f'tests/compiler_fixture_{index}_tests.ouro' for index in range(10, 12)]
+        listed = RunResult('ok', 0, '\n'.join(inventory) + '\n', '', 0.1, 10)
+        selected = RunResult('ok', 0, 'tests/compiler_property_tests.ouro\n', '', 0.1, 10)
+        self.log.write_text('COMPILER_CHECK_OK compiler_property-run\n'
+                            'COMPILER_CHECK_SUITE: PASS rows=1 out=' + self.directory.as_posix() + '\n', encoding='utf-8')
+        self.execute.side_effect = [listed, selected]
+        receipt = evidence.suite_receipt(self.log, self.root / 'compiler', shard='10/12')
+        self.assertEqual([row['entry'] for row in receipt['artifacts']], selected.stdout.splitlines())
+        self.assertEqual(self.execute.call_args.args[0][-1], '--shard=10/12')
 
 
 class ExternalEvidenceTests(EvidenceTreeTests):

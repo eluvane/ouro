@@ -10,6 +10,7 @@ import re
 import sys
 from pathlib import Path
 
+from ci_gate import COMPILER_SHARDS
 from repo_support import sha256_file as sha
 from ourosmith import ROOT
 from ourosmith.native import receipt_for
@@ -60,7 +61,7 @@ def suite_receipt(log, compiler, shard='all'):
     from ourosmith.host import environment
     from ourosmith.limits import run_limited
 
-    if shard not in ('all', *(f'{index}/8' for index in range(1, 9))):
+    if shard not in ('all', *(f'{index}/{COMPILER_SHARDS}' for index in range(1, COMPILER_SHARDS + 1))):
         raise ValueError('unknown compiler evidence shard')
     command = [str(runner), '--native-suite=compiler-checking', '--list']
     listed = run_limited(command,
@@ -74,7 +75,8 @@ def suite_receipt(log, compiler, shard='all'):
         selected = run_limited([*command, '--shard=' + shard], cwd=ROOT, env=environment(jobs=1),
                                timeout_s=30, memory_mb=3072)
         entries = selected.stdout.splitlines()
-        if not selected.ok or selected.stderr or not entries or entries != inventory[int(shard[0]) - 1::8]:
+        if (not selected.ok or selected.stderr or not entries
+                or entries != inventory[int(shard.split('/')[0]) - 1::COMPILER_SHARDS]):
             raise ValueError('compiler shard differs from its complete inventory partition')
     if names != [Path(entry).stem.removesuffix('_tests') for entry in entries]:
         raise ValueError('executed compiler rows differ from the current Ouro suite inventory')
@@ -116,7 +118,7 @@ def ci_compiler_receipt(directory):
             or summary.get('profile') != 'pr' or summary.get('group') != 'all'):
         raise ValueError('full PR aggregate is missing from compiler evidence')
     expected = [next(gate for gate in gates() if gate.name == f'compiler-checking-{index}'
-                     and 'pr' in gate.profiles) for index in range(1, 9)]
+                     and 'pr' in gate.profiles) for index in range(1, COMPILER_SHARDS + 1)]
     rows = summary.get('gates')
     if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
         raise ValueError('compiler CI gate rows are malformed')
@@ -132,7 +134,7 @@ def ci_compiler_receipt(directory):
         log = directory / 'ci' / gate.name / 'gate.log'
         if not isinstance(row.get('log'), str) or (ROOT / row['log']).resolve() != log:
             raise ValueError('compiler CI gate log path differs')
-        receipts.append(suite_receipt(log, binary('ouro1'), shard=f'{index}/8'))
+        receipts.append(suite_receipt(log, binary('ouro1'), shard=f'{index}/{COMPILER_SHARDS}'))
     inventory = receipts[0]['inventory']
     if any(receipt['inventory'] != inventory or receipt['runner_build_key'] != receipts[0]['runner_build_key']
            or receipt['runner_sha256'] != receipts[0]['runner_sha256'] for receipt in receipts):
