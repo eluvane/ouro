@@ -302,6 +302,70 @@ def module_symbol_bytes (ordinal : Nat) (spelling : List Nat)
       (map Nat Nat (fun (digit : Nat) => add 48 digit) (to_digits ordinal))
       (Cons Nat 95 spelling));
 
+def module_binder_bytes (name : Nat) (suffix : Nat) : List Nat :=
+  append Nat ([95, 111, 117, 114, 111, 95, 98, 95] : List Nat)
+    (append Nat
+      (map Nat Nat (fun (digit : Nat) => add 48 digit) (to_digits name))
+      (Cons Nat 95
+        (map Nat Nat (fun (digit : Nat) => add 48 digit)
+          (to_digits suffix))));
+
+def module_fresh_binder (st : InternState) (name : Nat)
+    : ResolveResult (Pair Nat InternState) :=
+  match st with
+  | MkIntern identifiers _ _ _ =>
+      (fix go (remaining : Nat) (suffix : Nat)
+          : ResolveResult (Pair Nat InternState) :=
+        match remaining with
+        | Z => RErr (Pair Nat InternState) 8 name
+        | S next =>
+            let spelling : List Nat := module_binder_bytes name suffix in
+            match source_lookup_id identifiers spelling with
+            | Just _ => go next (S suffix)
+            | Nothing => ROk (Pair Nat InternState)
+                (intern_ident st spelling)
+            end
+        end) (S (length (Pair(List Nat, Nat)) identifiers)) Z
+  end;
+
+-- Only global identities reached through a qualified marker need a distinct
+-- lexical ID. This keeps ordinary unqualified names and declaration heads
+-- unchanged while preventing a local binder from capturing a qualified ref.
+def module_binder_maps (st : InternState) (markers : List Nat)
+    (refs : List (Pair Nat Nat))
+    : ResolveResult (Pair (List (Pair Nat Nat)) InternState) :=
+  (fix go (remaining : List (Pair Nat Nat)) (current : InternState)
+      (done : List (Pair Nat Nat))
+      : ResolveResult (Pair (List (Pair Nat Nat)) InternState) :=
+    match remaining with
+    | Nil => ROk (Pair (List (Pair Nat Nat)) InternState)
+        (MkPair (List (Pair Nat Nat)) InternState done current)
+    | Cons item rest =>
+        match item with
+        | MkPair key target =>
+            match andb(memNat key markers, notb(eqNat target 0)) with
+            | False => go rest current done
+            | True =>
+                match module_lookup target done with
+                | Just _ => go rest current done
+                | Nothing =>
+                    match module_fresh_binder current target with
+                    | RErr code detail =>
+                        RErr (Pair (List (Pair Nat Nat)) InternState)
+                          code detail
+                    | ROk generated =>
+                        match generated with
+                        | MkPair fresh next_st =>
+                            go rest next_st
+                              (Cons (Pair Nat Nat)
+                                (MkPair Nat Nat target fresh) done)
+                        end
+                    end
+                end
+            end
+        end
+    end) refs st (Nil (Pair Nat Nat));
+
 def module_members (st0 : InternState) (root : Nat) (reached : List Nat)
     (conflicts : List Nat) (seeds : List (Pair Nat Nat))
     : ResolveResult (Pair (List ModuleMember) InternState) :=
@@ -653,36 +717,67 @@ def module_rewrite_units (fuel : Nat) (units : List SrcUnit)
     (members : List ModuleMember) (conflicts : List Nat)
     (markers : List (Pair (List Nat) Nat)) (marker_ids : List Nat)
     (st : InternState)
-    : ResolveResult (List SrcUnit) :=
-  (fix go (remaining : List SrcUnit) : ResolveResult (List SrcUnit) :=
+    : ResolveResult (Pair (List SrcUnit) InternState) :=
+  (fix go (remaining : List SrcUnit) (current : InternState)
+      : ResolveResult (Pair (List SrcUnit) InternState) :=
     match remaining with
-    | Nil => ROk (List SrcUnit) (Nil SrcUnit)
+    | Nil => ROk (Pair (List SrcUnit) InternState)
+        (MkPair (List SrcUnit) InternState (Nil SrcUnit) current)
     | Cons unit rest =>
         match unit with
         | MkSrcUnit owner decls =>
             match memNat owner reached with
             | False =>
-                match go rest with
-                | RErr code detail => RErr (List SrcUnit) code detail
-                | ROk tail => ROk (List SrcUnit) (Cons SrcUnit unit tail)
+                match go rest current with
+                | RErr code detail =>
+                    RErr (Pair (List SrcUnit) InternState) code detail
+                | ROk tail => match tail with
+                    | MkPair rewritten final_st =>
+                        ROk (Pair (List SrcUnit) InternState)
+                          (MkPair (List SrcUnit) InternState
+                            (Cons SrcUnit unit rewritten) final_st)
+                    end
                 end
             | True =>
-                match module_maps_for units aliases members conflicts markers st owner with
-                | RErr code detail => RErr (List SrcUnit) code detail
+                match module_maps_for units aliases members conflicts
+                    markers current owner with
+                | RErr code detail =>
+                    RErr (Pair (List SrcUnit) InternState) code detail
                 | ROk scoped_maps =>
                     match scoped_maps with
                     | MkPair maps constructors =>
                       match maps with
                       | MkModuleMaps heads refs errors =>
-                        match module_rewrite_decls fuel heads refs errors
-                            marker_ids constructors decls with
-                        | RErr code detail => RErr (List SrcUnit) code detail
-                        | ROk updated =>
-                            match go rest with
-                            | RErr code detail => RErr (List SrcUnit) code detail
-                            | ROk tail =>
-                                ROk (List SrcUnit)
-                                  (Cons SrcUnit (MkSrcUnit owner updated) tail)
+                        match module_binder_maps current marker_ids refs with
+                        | RErr code detail =>
+                            RErr (Pair (List SrcUnit) InternState) code detail
+                        | ROk allocation =>
+                            match allocation with
+                            | MkPair binders next_st =>
+                                match module_rewrite_decls_with_binders fuel
+                                    heads refs errors marker_ids constructors
+                                    binders decls with
+                                | RErr code detail =>
+                                    RErr (Pair (List SrcUnit) InternState)
+                                      code detail
+                                | ROk updated =>
+                                    match go rest next_st with
+                                    | RErr code detail =>
+                                        RErr (Pair (List SrcUnit) InternState)
+                                          code detail
+                                    | ROk tail =>
+                                        match tail with
+                                        | MkPair rewritten final_st =>
+                                            ROk (Pair (List SrcUnit) InternState)
+                                              (MkPair (List SrcUnit)
+                                                InternState
+                                                (Cons SrcUnit
+                                                  (MkSrcUnit owner updated)
+                                                  rewritten)
+                                                final_st)
+                                        end
+                                    end
+                                end
                             end
                         end
                       end
@@ -690,7 +785,7 @@ def module_rewrite_units (fuel : Nat) (units : List SrcUnit)
                 end
             end
         end
-    end) units;
+    end) units st;
 
 def module_resolve_units (fuel : Nat) (units : List SrcUnit)
     (alias_files : List (Pair (List Nat) ImpReg))
@@ -731,9 +826,7 @@ def module_resolve_units (fuel : Nat) (units : List SrcUnit)
                       conflicts markers marker_ids st2 with
                   | RErr code detail =>
                       RErr (Pair (List SrcUnit) InternState) code detail
-                  | ROk updated =>
-                      ROk (Pair (List SrcUnit) InternState)
-                        (MkPair (List SrcUnit) InternState updated st2)
+                  | ROk updated => ROk (Pair (List SrcUnit) InternState) updated
                   end
               end
           end

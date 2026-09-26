@@ -24,6 +24,12 @@ Development changes; see the [compatibility policy](docs/stability.md).
 
 ### Changed
 
+- Qualified record literals and projections retain the aliased record owner;
+  a projection through a transitive record type is rejected instead of
+  selecting a same-named local value or accessor. Bare record sugar preserves
+  its declaring record's constructor or accessor when an explicit call or
+  local binder uses the same short name. Qualified module references likewise
+  keep their global target under a same-named local binder.
 - A qualified reference no longer borrows a same-named declaration from a
   different imported file. Add a direct import and use that file's alias.
   In an aliased import graph, a bare use made ambiguous by a new import now

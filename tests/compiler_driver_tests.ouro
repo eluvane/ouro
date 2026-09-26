@@ -145,6 +145,159 @@ def driver_test_module_pair (root : String) (left : String) (right : String)
        , compiler_test_unit "b.ouro" right
        ] : List (Pair(List Nat, List Nat)));
 
+def driver_test_core_for (program : CheckedProgram) (spelling : String)
+    : Maybe CoreTerm :=
+  match compiler_test_name program spelling with
+  | Nothing => Nothing CoreTerm
+  | Just name =>
+      (fix find (cores : List (Pair Nat CoreTerm)) : Maybe CoreTerm :=
+        match cores with
+        | Nil => Nothing CoreTerm
+        | Cons entry rest => match entry with
+          | MkPair id body =>
+              match eqNat id name with
+              | True => Just CoreTerm body
+              | False => find rest
+              end
+          end
+        end) (checked_program_cores program)
+  end;
+
+def driver_test_qualified_record_projection : DriverLaw :=
+  let result : CompResult CheckedProgram :=
+    compile_checked_units driver_test_fuel
+      (prim_string_to_char_codes "main.ouro")
+      ([ compiler_test_unit "main.ouro"
+           "import \"a.ouro\" as A; import \"b.ouro\" as B; def Point_x (p : A.Point) : A.Nat := A.S A.Z; def MkPoint (x : A.Nat) : A.Point := A.MkPoint (A.S x); def point : B.OtherPoint := B.MkOtherPoint B.Marker; def projected : A.Nat := A.point.x; def explicit : A.Nat := A.Point_x A.point; def local : A.Point := A.MkPoint A.Z; def localProjected : A.Nat := local.x; def localExplicit : A.Nat := A.Point_x local; def made : A.Point := {x := A.Z}; def madeBare : Point := {x := A.Z}; def madeExplicit : A.Point := A.MkPoint A.Z;"
+       , compiler_test_unit "a.ouro"
+           "inductive Nat : Type := | Z : Nat | S : Nat -> Nat; record Point : Type where x : Nat; end; def point : Point := MkPoint Z;"
+       , compiler_test_unit "b.ouro"
+           "inductive Other : Type := | Marker : Other; record OtherPoint : Type where y : Other; end;"
+       ] : List (Pair(List Nat, List Nat))) in
+  MkDriverLaw "qualified record projection keeps its imported base and owner"
+    (match result with
+     | CErr _ => False
+     | COk program =>
+         match driver_test_core_for program "projected" with
+         | Nothing => False
+         | Just projected => match driver_test_core_for program "explicit" with
+           | Nothing => False
+           | Just explicit =>
+               match driver_test_core_for program "localProjected" with
+               | Nothing => False
+               | Just localProjected =>
+                   match driver_test_core_for program "localExplicit" with
+                   | Nothing => False
+                   | Just localExplicit =>
+                       match driver_test_core_for program "made" with
+                       | Nothing => False
+                       | Just made =>
+                           match driver_test_core_for program "madeBare" with
+                           | Nothing => False
+                           | Just madeBare =>
+                               match driver_test_core_for program "madeExplicit" with
+                               | Nothing => False
+                               | Just madeExplicit =>
+                                   andb(eqTerm 500 projected explicit,
+                                     andb(eqTerm 500 localProjected localExplicit,
+                                       andb(eqTerm 500 made madeExplicit,
+                                         eqTerm 500 madeBare madeExplicit)))
+                               end
+                           end
+                       end
+                   end
+               end
+           end
+         end
+     end)
+    (driver_test_status CheckedProgram result);
+
+def driver_test_local_record_equivalence : DriverLaw :=
+  let result : CompResult CheckedProgram := compile_checked_source
+    driver_test_fuel (driver_test_source
+      "record Point : Type where x : Nat; end; def point : Point := MkPoint Z; def explicit : Nat := Point_x point; def projected : Nat := point.x;") in
+  MkDriverLaw "internal self-owner alias preserves the canonical accessor"
+    (match result with
+     | CErr _ => False
+     | COk program => match driver_test_core_for program "explicit" with
+       | Nothing => False
+       | Just explicit => match driver_test_core_for program "projected" with
+         | Nothing => False
+         | Just projected => eqTerm 500 explicit projected
+         end
+       end
+     end) (driver_test_status CheckedProgram result);
+
+def driver_test_unaliased_record_shadow : DriverLaw :=
+  let result : CompResult CheckedProgram := compile_checked_units
+    driver_test_fuel (prim_string_to_char_codes "main.ouro")
+      ([ compiler_test_unit "main.ouro"
+           "import \"dep.ouro\"; def Point_x (p : Point) : Nat := S Z; def point : Point := MkPoint Z; def explicit : Nat := Point_x point; def projected : Nat := point.x;"
+       , compiler_test_unit "dep.ouro"
+           "inductive Nat : Type := | Z : Nat | S : Nat -> Nat; record Point : Type where x : Nat; end;"
+       ] : List (Pair(List Nat, List Nat))) in
+  MkDriverLaw "internal imported-owner alias bypasses a local forged accessor"
+    (match result with
+     | CErr _ => False
+     | COk program => match driver_test_core_for program "explicit" with
+       | Nothing => False
+       | Just explicit => match driver_test_core_for program "projected" with
+         | Nothing => False
+         | Just projected => notb (eqTerm 500 explicit projected)
+         end
+       end
+     end) (driver_test_status CheckedProgram result);
+
+def driver_test_typed_record_shadow : DriverLaw :=
+  let result : CompResult CheckedProgram := compile_checked_source
+    driver_test_fuel (driver_test_source
+      "record Point : Type where x : Nat; end; def canonical_accessor (unused : Point -> Nat) (p : Point) : Nat := Point_x p; def shadow_accessor (Point_x : Point -> Nat) (p : Point) : Nat := p.x; def canonical_ctor (unused : Nat -> Point) : Point := MkPoint Z; def shadow_ctor (MkPoint : Nat -> Point) : Point := {x := Z};") in
+  MkDriverLaw "typed local shadows cannot capture generated record references"
+    (match result with
+     | CErr _ => False
+     | COk program => match driver_test_core_for program "canonical_accessor" with
+       | Nothing => False
+       | Just accessor => match driver_test_core_for program "shadow_accessor" with
+         | Nothing => False
+         | Just shadow_accessor =>
+             match driver_test_core_for program "canonical_ctor" with
+             | Nothing => False
+             | Just ctor => match driver_test_core_for program "shadow_ctor" with
+               | Nothing => False
+               | Just shadow_ctor =>
+                   andb(eqTerm 500 accessor shadow_accessor,
+                     eqTerm 500 ctor shadow_ctor)
+               end
+             end
+         end
+       end
+     end) (driver_test_status CheckedProgram result);
+
+def driver_test_qualified_global_shadow : DriverLaw :=
+  let result : CompResult CheckedProgram := compile_checked_units
+    driver_test_fuel (prim_string_to_char_codes "main.ouro")
+      ([ compiler_test_unit "main.ouro"
+           "import \"a.ouro\" as A; def canonical (unused : Nat) : Nat := A.target; def shadow (target : Nat) : Nat := A.target; def local (target : Nat) : Nat := target;"
+       , compiler_test_unit "a.ouro"
+           "inductive Nat : Type := | Z : Nat; def target : Nat := Z;"
+       ] : List (Pair(List Nat, List Nat))) in
+  MkDriverLaw "qualified global references survive same-name local binders"
+    (match result with
+     | CErr _ => False
+     | COk program => match driver_test_core_for program "canonical" with
+       | Nothing => False
+       | Just canonical => match driver_test_core_for program "shadow" with
+         | Nothing => False
+         | Just shadow => match driver_test_core_for program "local" with
+           | Nothing => False
+           | Just local =>
+               andb(eqTerm 500 canonical shadow,
+                 notb (eqTerm 500 shadow local))
+           end
+         end
+       end
+     end) (driver_test_status CheckedProgram result);
+
 def driver_test_alias_collision : CompResult (List (Pair Nat CoreTerm)) :=
     driver_test_module_pair
       "import \"a.ouro\" as A; import \"b.ouro\" as B; def left : Type := A.Shared; def right : Type := B.Shared;"
@@ -384,6 +537,58 @@ def driver_test_import_laws : List DriverLaw :=
           "import \"a.ouro\" as A; def point : A.Point := A.MkPoint A.Z; def value : A.Nat := A.Point_x point;"
           "inductive Nat : Type := | Z : Nat; record Point : Type where x : Nat; end;"
           "axiom Other : Type;")
+    , driver_test_qualified_record_projection
+    , driver_test_local_record_equivalence
+    , driver_test_unaliased_record_shadow
+    , driver_test_typed_record_shadow
+    , driver_test_qualified_global_shadow
+    , driver_test_good
+        "custom record constructor still permits a literal in its own file"
+        "record Point : Type where constructor BuildPoint; x : Nat; end; def made : Point := {x := Z};"
+    , driver_test_accept (List (Pair Nat CoreTerm))
+        "plain imported record sugar keeps the legacy no-alias closure"
+        (driver_test_units
+          "import \"dep.ouro\"; def made : Point := {x := Z}; def get (p : Point) : Nat := p.x;"
+          "inductive Nat : Type := | Z : Nat; record Point : Type where x : Nat; end;")
+    , driver_test_accept (List (Pair Nat CoreTerm))
+        "plain imported record sugar survives a nested alias graph"
+        (driver_test_module_pair
+          "import \"a.ouro\"; def made : Point := {x := Z}; def get (p : Point) : Nat := p.x;"
+          "import \"b.ouro\" as B; record Point : Type where x : B.Nat; end;"
+          "inductive Nat : Type := | Z : Nat;")
+    , driver_test_accept (List (Pair Nat CoreTerm))
+        "plain imported record sugar keeps its owner under a shadowing accessor"
+        (driver_test_module_pair
+          "import \"a.ouro\"; def Point_x (p : Point) : Nat := Z; def get (p : Point) : Nat := p.x;"
+          "import \"b.ouro\" as B; record Point : Type where x : B.Nat; end;"
+          "inductive Nat : Type := | Z : Nat;")
+    , driver_test_error (List (Pair Nat CoreTerm))
+        "qualified literal cannot borrow another module's record shape" 73
+        (driver_test_module_pair
+          "import \"a.ouro\" as A; import \"b.ouro\" as B; def wrong : A.Point := {x := B.Z};"
+          "axiom Point : Type;"
+          "inductive Nat : Type := | Z : Nat; record Point : Type where x : Nat; end;")
+    , driver_test_error (List (Pair Nat CoreTerm))
+        "qualified projection rejects a forged same-type accessor" 77
+        (driver_test_module_pair
+          "import \"a.ouro\" as A; import \"b.ouro\" as B; def bad : B.Nat := A.point.x;"
+          "import \"b.ouro\" as B; def point : B.Point := B.MkPoint B.Z; def Point_x (p : B.Point) : B.Nat := B.S B.Z;"
+          "inductive Nat : Type := | Z : Nat | S : Nat -> Nat; record Point : Type where x : Nat; end;")
+    , driver_test_error (List (Pair Nat CoreTerm))
+        "qualified projection rejects a transitive record owner" 77
+        (driver_test_module_pair
+          "import \"a.ouro\" as A; import \"b.ouro\" as B; def bad : B.Nat := A.point.x;"
+          "import \"b.ouro\" as B; def point : B.Point := B.MkPoint B.Z;"
+          "inductive Nat : Type := | Z : Nat; record Point : Type where x : Nat; end;")
+    , driver_test_good
+        "local record sugar coexists with an explicit accessor call"
+        "record Point : Type where x : Nat; end; def explicit (p : Point) : Nat := Point_x p; def sugar (p : Point) : Nat := p.x;"
+    , driver_test_good
+        "local record projection ignores a same-named typed binder"
+        "record Point : Type where x : Nat; end; def get (Point_x : Point -> Nat) (p : Point) : Nat := p.x;"
+    , driver_test_good
+        "local record literal ignores a same-named typed binder"
+        "record Point : Type where x : Nat; end; def make (MkPoint : Nat -> Point) : Point := {x := Z};"
     , driver_test_error (List (Pair Nat CoreTerm))
         "unqualified colliding imports are ambiguous" 96
         (driver_test_module_pair
