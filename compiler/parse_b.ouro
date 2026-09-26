@@ -62,6 +62,52 @@ def parse_b_binding (parse : Nat -> Mode -> List Token -> Nat -> Value -> ParseR
                 finish after next extra)
       end);
 
+def parse_b_distinct_pattern_vars : List Nat -> Bool :=
+  fix distinct (vars : List Nat) : Bool :=
+    match vars with
+    | Nil => True
+    | Cons name rest =>
+        andb (orb(eqNat name Z, notb(elem Nat eqNat name rest)))
+          (distinct rest)
+    end;
+
+def parse_b_destructure (parse : Nat -> Mode -> List Token -> Nat -> Value -> ParseResult Value)
+    (fuel' : Nat) (toks : List Token) (pos : Nat) (extra : Value)
+    (finish : Pair Nat (List Nat) -> Expr -> List Token -> Nat -> ParseResult Value)
+    : ParseResult Value :=
+  bindParseResult Unit Value (expect_lparen toks pos)
+    (fun (_open : Unit) (pattern_tokens : List Token) (pattern_pos : Nat) =>
+      bindValue (Pair(Nat, List Nat)) asPairNatListNat
+        (parse fuel' MPattern pattern_tokens pattern_pos extra)
+        (fun (pattern : Pair Nat (List Nat)) (after_pattern : List Token)
+            (close_pos : Nat) =>
+          match pattern with
+          | MkPair _ vars =>
+              match parse_b_distinct_pattern_vars vars with
+              | False => PErr Value close_pos
+              | True =>
+                  bindParseResult Unit Value (expect_rparen after_pattern close_pos)
+                    (fun (_close : Unit) (after_close : List Token)
+                        (assign_pos : Nat) =>
+                      bindParseResult Unit Value
+                        (expect_colon_eq after_close assign_pos)
+                        (fun (_assign : Unit) (subject_tokens : List Token)
+                            (subject_pos : Nat) =>
+                          bindValue Expr asExpr
+                            (parse fuel' MExpr subject_tokens subject_pos extra)
+                            (fun (subject : Expr) (after_subject : List Token)
+                                (end_pos : Nat) =>
+                              finish pattern subject after_subject end_pos)))
+              end
+          end));
+
+def parse_b_destructure_match (pattern : Pair Nat (List Nat))
+    (subject body : Expr) : Expr :=
+  match pattern with
+  | MkPair ctor vars =>
+      EMatch subject (EBranch (Cons Nat ctor vars) body ENoBranch)
+  end;
+
 def parse_b_block_final
     (parse : Nat -> Mode -> List Token -> Nat -> Value -> ParseResult Value)
     (fuel' : Nat) (toks : List Token) (pos : Nat) (extra : Value)
@@ -71,6 +117,27 @@ def parse_b_block_final
       bindParseResult Unit Value (expect_brace_r after position)
         (fun (_close : Unit) (rest : List Token) (end_pos : Nat) =>
           okExpr value rest end_pos));
+
+def parse_b_block_binding_tail
+    (parse : Nat -> Mode -> List Token -> Nat -> Value -> ParseResult Value)
+    (fuel' : Nat) (continue : List Token -> Nat -> ParseResult Value)
+    (wrap : Expr -> Expr) (after_value : List Token) (end_pos : Nat)
+    (extra : Value) : ParseResult Value :=
+  match is_semi (peek after_value) with
+  | True =>
+      bindParseResult Unit Value (expect_tag tagSemi after_value end_pos)
+        (fun (_semi : Unit) (tail : List Token) (tail_pos : Nat) =>
+          bindValue Expr asExpr (continue tail tail_pos)
+            (fun (body : Expr) (rest : List Token) (past : Nat) =>
+              okExpr (wrap body) rest past))
+  | False =>
+      bindParseResult Unit Value (expect_keyword kwIn after_value end_pos)
+        (fun (_in : Unit) (tail : List Token) (tail_pos : Nat) =>
+          bindValue Expr asExpr
+            (parse_b_block_final parse fuel' tail tail_pos extra)
+            (fun (body : Expr) (rest : List Token) (past : Nat) =>
+              okExpr (wrap body) rest past))
+  end;
 
 -- The braces identify a pure expression scope. Each semicolon introduces an
 -- ordinary ELet; the final expression is mandatory and has no semicolon.
@@ -95,34 +162,27 @@ def parse_b_block_body
                     match eqNat(token_tag (peek after_let), tagBraceL) with
                     | True => parse_b_block_final parse next items position extra
                     | False =>
-                        parse_b_binding parse next after_let (S position) extra
-                          (fun (name : Nat) (ann : Maybe Expr) (value : Expr)
-                              (after_value : List Token) (end_pos : Nat) =>
-                            match is_semi (peek after_value) with
-                            | True =>
-                                bindParseResult Unit Value
-                                  (expect_tag tagSemi after_value end_pos)
-                                  (fun (_semi : Unit) (tail : List Token)
-                                      (tail_pos : Nat) =>
-                                    bindValue Expr asExpr
-                                      (go next tail tail_pos)
-                                      (fun (body : Expr) (rest : List Token)
-                                          (past : Nat) =>
-                                        okExpr (ELet name ann value body)
-                                          rest past))
-                            | False =>
-                                bindParseResult Unit Value
-                                  (expect_keyword kwIn after_value end_pos)
-                                  (fun (_in : Unit) (tail : List Token)
-                                      (tail_pos : Nat) =>
-                                    bindValue Expr asExpr
-                                      (parse_b_block_final parse next
-                                        tail tail_pos extra)
-                                      (fun (body : Expr) (rest : List Token)
-                                          (past : Nat) =>
-                                        okExpr (ELet name ann value body)
-                                          rest past))
-                            end)
+                        let continue (tail : List Token) (tail_pos : Nat)
+                            : ParseResult Value := go next tail tail_pos in
+                        match is_lparen (peek after_let) with
+                        | True =>
+                            parse_b_destructure parse next after_let (S position)
+                              extra
+                              (fun (pattern : Pair Nat (List Nat))
+                                  (subject : Expr) (after_subject : List Token)
+                                  (end_pos : Nat) =>
+                                parse_b_block_binding_tail parse next continue
+                                  (fun (body : Expr) =>
+                                    parse_b_destructure_match pattern subject body)
+                                  after_subject end_pos extra)
+                        | False =>
+                            parse_b_binding parse next after_let (S position) extra
+                              (fun (name : Nat) (ann : Maybe Expr) (value : Expr)
+                                  (after_value : List Token) (end_pos : Nat) =>
+                                parse_b_block_binding_tail parse next continue
+                                  (fun (body : Expr) => ELet name ann value body)
+                                  after_value end_pos extra)
+                        end
                     end
                 end
             end
@@ -248,14 +308,30 @@ def parse_b_let (parse : Nat -> Mode -> List Token -> Nat -> Value -> ParseResul
         (fun (_open : Unit) (body : List Token) (body_pos : Nat) =>
           parse_b_block_body parse fuel' body body_pos extra)
   | False =>
-      parse_b_binding parse fuel' toks pos extra
-        (fun (name : Nat) (ann : Maybe Expr) (value : Expr)
-            (after_value : List Token) (end_pos : Nat) =>
-          bindParseResult Unit Value (expect_keyword kwIn after_value end_pos)
-            (fun (_in : Unit) (body_tokens : List Token) (body_pos : Nat) =>
-              bindValue Expr asExpr (parse fuel' MExpr body_tokens body_pos extra)
-                (fun (body : Expr) (rest : List Token) (past : Nat) =>
-                  okExpr (ELet name ann value body) rest past)))
+      match is_lparen (peek toks) with
+      | True =>
+          parse_b_destructure parse fuel' toks pos extra
+            (fun (pattern : Pair Nat (List Nat)) (subject : Expr)
+                (after_subject : List Token) (end_pos : Nat) =>
+              bindParseResult Unit Value
+                (expect_keyword kwIn after_subject end_pos)
+                (fun (_in : Unit) (body_tokens : List Token) (body_pos : Nat) =>
+                  bindValue Expr asExpr
+                    (parse fuel' MExpr body_tokens body_pos extra)
+                    (fun (body : Expr) (rest : List Token) (past : Nat) =>
+                      okExpr
+                        (parse_b_destructure_match pattern subject body)
+                        rest past)))
+      | False =>
+          parse_b_binding parse fuel' toks pos extra
+            (fun (name : Nat) (ann : Maybe Expr) (value : Expr)
+                (after_value : List Token) (end_pos : Nat) =>
+              bindParseResult Unit Value (expect_keyword kwIn after_value end_pos)
+                (fun (_in : Unit) (body_tokens : List Token) (body_pos : Nat) =>
+                  bindValue Expr asExpr (parse fuel' MExpr body_tokens body_pos extra)
+                    (fun (body : Expr) (rest : List Token) (past : Nat) =>
+                      okExpr (ELet name ann value body) rest past)))
+      end
   end
   end;
 

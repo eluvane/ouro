@@ -357,6 +357,37 @@ and `maybe` keep their meanings. Comments and multiline layout are allowed
 between tokens. Record literals inside a block still need the same supported
 type context as record literals elsewhere.
 
+## Checked destructuring lets
+
+```ouro
+let (MkPair left right) := pair in add left right
+let { let (MkPair left _) := pair; left }
+```
+
+The pattern is one constructor with flat field names or `_` wildcards, enclosed
+in parentheses. It is accepted only when the existing checked `match` for that
+single branch is exhaustive. The parser constructs `EMatch` with one `EBranch`;
+the compiler checker verifies the subject family, field arity, indices, branch
+type, and completeness. A lone `Just` pattern for `Maybe A` is incomplete and
+is rejected. Repeated field names are rejected by the parser.
+
+The subject occupies the single match scrutinee and is evaluated once. Field
+names scope over the expression after `in`, or the rest of the block after `;`;
+they are unavailable in the subject and after the expression. Blocks retain
+their mandatory final expression and cannot sequence standalone actions.
+
+The current match lowerer uses the subject family as its result hint when an
+unannotated local value has no expected result type. If the destructuring body
+returns another type, put it in an expected context, for example an explicitly
+typed definition or `let selected : Nat := let (MkPair left right) := pair in left
+in selected`. An unannotated `let selected := ...` in that situation is rejected.
+For parameterized families, the current matcher obtains family arguments from a
+typed local subject. Bind a direct constructor to a typed local first, for
+example `let pair : Pair Nat Nat := MkPair Nat Nat Z Z in let (MkPair left right)
+:= pair in left`. This is the same restriction as the corresponding `match`.
+Nested patterns, alternatives, guards, and a partial-match fallback are not
+provided by this form.
+
 ## List literal trailing commas
 
 ```text
