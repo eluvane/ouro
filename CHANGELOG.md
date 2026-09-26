@@ -6,6 +6,8 @@ Development changes; see the [compatibility policy](docs/stability.md).
 
 ### Added
 
+- Pure `let { ... }` expression blocks accept sequential local bindings and a
+  mandatory final expression; see [Ergonomic syntax](docs/language/ergonomic-syntax.md#pure-expression-blocks).
 - Nonempty list literals can infer an element type from their first element
   without an expected `List A` context; empty and ambiguous literals still
   require an annotation.

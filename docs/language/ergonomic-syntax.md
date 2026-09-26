@@ -1,8 +1,9 @@
 # Ergonomic syntax
 
-Grouped imports, positional calls, and typed local helpers lower to existing
-syntax nodes. The maintained [syntax reference](../syntax.md) states accepted
-forms; this page records desugaring and compatibility boundaries.
+Grouped imports, positional calls, typed local helpers, and pure expression
+blocks lower to existing syntax nodes. The maintained
+[syntax reference](../syntax.md) states accepted forms; this page records
+desugaring and compatibility boundaries.
 
 ## Grouped imports
 
@@ -164,11 +165,49 @@ The first lacks a parameter annotation; the second has an unannotated nested
 lambda with no expected function type; the third uses an out-of-scope parameter.
 Existing unparameterized `let` syntax and its inference behavior are unchanged.
 
+## Pure expression blocks
+
+```ouro
+let {
+  let base : Nat := value;
+  let double (x : Nat) := add x x;
+  double base
+}
+```
+
+The contextual `let {` opener begins an expression block. The block has zero
+or more semicolon-terminated local bindings and one mandatory final expression
+without a trailing semicolon. The bindings use the ordinary local `let` grammar,
+including optional annotations and typed helper parameters. Each binding scopes
+over the following bindings and final expression, but not over its own value.
+The example lowers to:
+
+```ouro
+let base : Nat := value in
+let double (x : Nat) := add x x in
+double base
+```
+
+The parser constructs nested `ELet` nodes; it does not introduce an AST or
+checker form. The final expression may itself be a nested block or an ordinary
+`let ... in` expression. Values and final expressions keep their usual typing
+rules, including when their type is `IO A`. A block does not sequence actions:
+standalone expression statements and `let!` are not accepted. Use `do` for
+effectful sequencing. Empty blocks, missing final expressions, and a final
+semicolon are rejected. Unresolved holes retain their ordinary rejection.
+
+The opener is distinguished from record braces by the preceding `let`.
+Ordinary record syntax and existing identifiers such as `block`, `result`,
+and `maybe` keep their meanings. Comments and multiline layout are allowed
+between tokens. Record literals inside a block still need the same supported
+type context as record literals elsewhere.
+
 ## Integration and fixtures
 
-All three forms reuse existing `DImport`, `EApp`, `EAscribe`, `ELam`, `EPi`,
-and `ELet` nodes. The formatter retains grouped imports, call spelling, and
-compact local helpers without expanding them in source. The fixture inventory
+These forms reuse existing `DImport`, `EApp`, `EAscribe`, `ELam`, `EPi`,
+and `ELet` nodes. The formatter retains grouped imports, call spelling,
+compact local helpers, and block spelling without expanding them in source.
+The fixture inventory
 is `tests/language_ergonomics/cases.json`; it includes desugaring pairs,
 rejected forms, import graph/diagnostic cases, and formatter round trips.
 [CI](../ci.md#local-profiles) owns validation commands and gate status.

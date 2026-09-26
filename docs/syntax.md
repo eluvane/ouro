@@ -75,6 +75,21 @@ typed parameters; the result annotation may be omitted when the body type can
 be inferred. [Ergonomic syntax](language/ergonomic-syntax.md#typed-local-helper-declarations)
 explains their scope and desugaring.
 
+An expression block groups sequential pure bindings with a final expression:
+
+```ouro
+let {
+  let first : Nat := value;
+  let second (x : Nat) := add first x;
+  second 2
+}
+```
+
+Each binding ends with `;`; the final expression has no trailing semicolon.
+The block lowers to nested local `let ... in` expressions. See
+[Pure expression blocks](language/ergonomic-syntax.md#pure-expression-blocks)
+for scope and rejection rules.
+
 ## Inductive data and pattern matching
 
 ```ouro
