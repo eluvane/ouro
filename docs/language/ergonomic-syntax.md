@@ -194,8 +194,15 @@ With a known nominal result type, update checks the base as that record type,
 binds it once, then binds changed values in source order. It constructs the new
 record in declaration field order, reading omitted fields from the bound base.
 Unknown and repeated fields are errors. A bare update name without `:=` is not
-an assignment. Nested field paths and update without an annotated nominal
-result type are not implemented yet.
+an assignment. Paths through nominal record fields, such as
+`{ person with address.city := next_city, address.zip := next_zip }`, rebuild
+each affected nested record. Sibling paths are accepted; exact duplicates and
+ancestor/descendant overlaps are errors. Changed right-hand sides are bound
+once in source order. A typed local binding, record-valued field, or explicit
+literal ascription `({ city := next_city, zip := saved_zip } : Address)` supplies a nominal
+expected type for that value. It does not infer a type for arbitrary call
+arguments. Updates without nominal context and dependent record fields remain
+unsupported.
 
 ## Integration and fixtures
 
