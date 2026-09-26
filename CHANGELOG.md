@@ -6,14 +6,23 @@ Development changes; see the [compatibility policy](docs/stability.md).
 
 ### Added
 
+- Finite directional `Nat` range values with exclusive/inclusive endpoints,
+  checked step magnitude, and bounded pull-iterator consumption.
+- Pure bounded pull iterators with lazy map/filter/take adapters and explicit
+  typed failure or pull-limit results when collecting a list.
+- Overlapping list windows, state scans, state-threading maps, stable grouping
+  by key, and first-failure `Either`/`Maybe` folds in `std/collections.ouro`.
 - Lazy error-aware fallback for `Either` and ordered `Maybe` list traversal in
   the practical standard library.
+- Typed local helpers may omit the result annotation when their body type is
+  inferable; see [Ergonomic syntax](docs/language/ergonomic-syntax.md#typed-local-helper-declarations).
 - Review-only Clippy proofs for Result/Maybe error flow, collection and string
   composition, List producer/consumer laws, arithmetic, literal bounds, Boolean
   identities, and normalization. Rule contracts and exclusions live in the
   [Clippy reference](docs/clippy_grade_firewall.md).
 - [Grouped imports, positional call groups, and typed local helpers](docs/language/ergonomic-syntax.md),
   including the migration from `f (a, b)` as one grouped expression to two arguments.
+- Trailing commas in nonempty list literals, including multiline lists with comments.
 - Local and pinned-Git package dependencies with deterministic manifests and
   locks, rejection fixtures, a reusable-library sample, and a consuming
   application; see [Packages](docs/pkg.md).
@@ -90,6 +99,8 @@ Development changes; see the [compatibility policy](docs/stability.md).
 
 ### Fixed
 
+- `adjacent_pairs` now advances its left element; `list_traverse_result` evaluates
+  conversions in input order and stops when one returns `Left`.
 - Recognize manifest-owned Clippy precision fixtures in the structural gate,
   retaining extraction, path confinement, and checks on unlisted sources.
 - Cover `ESpan` in OuroSmith parser observations and keep comment delimiters
