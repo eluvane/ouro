@@ -9,6 +9,8 @@ Development changes; see the [compatibility policy](docs/stability.md).
 - Final-tail list spreads `[first, ..rest]` build checked `List A` constructor
   spines with once-bound prefix values and tail; a complete tail type can guide
   an unannotated local list. See [Lists](docs/syntax.md#lists).
+- Finite directional `Nat` range values with exclusive/inclusive endpoints,
+  checked step magnitude, and bounded pull-iterator consumption.
 - Pure bounded pull iterators with lazy map/filter/take adapters and explicit
   typed failure or pull-limit results when collecting a list.
 - Overlapping list windows, state scans, state-threading maps, stable grouping

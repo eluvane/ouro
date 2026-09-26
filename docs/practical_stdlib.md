@@ -9,7 +9,7 @@ Choose a module by task; the generated [API reference](api/README.md) owns decla
 | Task | Modules |
 | --- | --- |
 | Shared types and results | `std/types.ouro`, `std/prelude.ouro`, `std/data.ouro`, `std/result.ouro` |
-| Lists and iterators | `std/collections.ouro`, `std/iter.ouro` |
+| Lists and iterators | `std/collections.ouro`, `std/iter.ouro`, `std/range.ouro` |
 | Text and numbers | `std/string.ouro`, `std/text.ouro`, `std/num.ouro`, `std/utf8_scalar.ouro` |
 | CLI and configuration | `std/args.ouro`, `std/cli.ouro`, `std/config.ouro`, `std/configx.ouro` |
 | Files and workspace | `std/fs.ouro`, `std/fsx.ouro`, `std/fs_walk.ouro`, `std/fs_replace.ouro`, `std/workspace.ouro` |
@@ -155,6 +155,46 @@ list and allocates another list when reversing it at completion; iterator
 wrappers and step results also allocate. Pull traversal is bounded by
 `max_pulls`, with callback and source-step costs in addition. No
 constant-allocation or automatically fused pipeline is promised.
+
+## Finite Nat ranges
+
+`std/range.ouro` builds finite `Nat` range values for the pull iterator API.
+`nat_range_exclusive start stop` omits `stop`; `nat_range_inclusive start stop`
+includes it when the step lands exactly on it. Both start with step one. The
+original endpoints determine direction: `start < stop` ascends, `start > stop`
+descends, equal endpoints give an empty exclusive range or one inclusive item.
+`nat_range_by step range` replaces the step magnitude and returns
+`Either NatRangeError NatRange`; step zero returns `RangeZeroStep`. The public
+`MkNatRange` constructor is checked again by `iter_from_nat_range`, and a
+forged zero-step cursor returns `IterFail RangeZeroStep` when pulled.
+A directly constructed cursor holds a resume position: the pull checks both
+interval bounds, but does not require the position to align with the step.
+`iter_from_nat_range` starts its cursor at the declared `start`.
+
+```ouro
+import "../std/practical.ouro";
+
+def descending_range_example : Bool :=
+  match iter_from_nat_range (nat_range_inclusive 5 0) with
+  | Left _ => False
+  | Right source =>
+      match collect_list NatRangeCursor NatRangeError Nat 7 source with
+      | Left _ => False
+      | Right values =>
+          list_eq Nat eq_nat values ([5, 4, 3, 2, 1, 0] : List Nat)
+      end
+  end;
+```
+
+`nat_range_by 3 (nat_range_inclusive 10 0)` yields `10, 7, 4, 1`; it does not
+fabricate zero when the step passes the endpoint. An exclusive range `0` to
+`10` by `3` yields `0, 3, 6, 9`. The source itself does not materialize a
+list. `collect_list` returns a typed pull-limit error when its budget is
+exhausted: an empty range needs one pull to observe `IterDone`, and `n`
+yields need `n + 1` pulls. Each pull does constant work apart from Nat
+arithmetic on the values; collecting allocates the final list as described
+above. This lazy, directional API is separate from the eager
+`nat_range_count` and `nat_range_closed` helpers in `std/num.ouro`.
 
 ## Numbers
 
