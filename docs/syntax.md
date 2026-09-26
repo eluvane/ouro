@@ -238,14 +238,14 @@ quoted strings can contain physical line breaks; they do not strip indentation.
 
 For text containing backslashes or quotes, `r#"..."#` is a raw `String`
 literal. It preserves every byte between the delimiters, including physical
-line breaks, UTF-8 bytes, and backslashes; `\\n` is two bytes rather than a
+line breaks, UTF-8 bytes, and backslashes; `\n` is two bytes rather than a
 newline. The first `"#` closes it even when preceded by a backslash. Exactly
 one `#` is supported, and an unclosed raw literal is a lexical error. Raw
 quoted imports use the same spelling and preserve their path bytes before the
 usual path normalization.
 
 ```ouro
-def path : String := r#"C:\\temp\\data"#;
+def path : String := r#"C:\temp\data"#;
 def quote : String := r#"say "hello""#;
 ```
 
