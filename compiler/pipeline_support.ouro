@@ -75,12 +75,158 @@ def name_List : List Nat := ([76, 105, 115, 116] : List Nat);
 def name_Nil : List Nat := ([78, 105, 108] : List Nat);
 def name_Cons : List Nat := ([67, 111, 110, 115] : List Nat);
 
-def collect_lower_env_from (st : InternState) : List Decl -> LowerEnv :=
-  fix go (ds : List Decl) : LowerEnv :=
+inductive PipelineRoleChoice : Type :=
+  | PipelineNoRole : PipelineRoleChoice
+  | PipelineOneRole : Nat -> PipelineRoleChoice
+  | PipelineDuplicateRole : PipelineRoleChoice;
+
+def pipeline_literal_id (st : InternState) (bytes : List Nat) : Maybe Nat :=
+  match st with
+  | MkIntern _ _ strings _ => source_lookup_id strings bytes
+  end;
+
+def pipeline_add_role (choice : PipelineRoleChoice) (name : Nat)
+    : PipelineRoleChoice :=
+  match choice with
+  | PipelineNoRole => PipelineOneRole name
+  | PipelineOneRole _ => PipelineDuplicateRole
+  | PipelineDuplicateRole => PipelineDuplicateRole
+  end;
+
+-- These are only lowering hints. Every intrinsic and representation is still
+-- validated by the declaration checker after lowering.
+def pipeline_role_choice (st : InternState) (key : List Nat)
+    (intrinsic : Bool) (decls : List Decl) : PipelineRoleChoice :=
+  match pipeline_literal_id st key with
+  | Nothing => PipelineNoRole
+  | Just label =>
+      foldl Decl PipelineRoleChoice
+        (fun (choice : PipelineRoleChoice) (decl : Decl) =>
+          match decl with
+          | DIntrinsic name _ current _ =>
+              match andb(intrinsic, eqNat current label) with
+              | True => pipeline_add_role choice name
+              | False => choice
+              end
+          | DRepresentation name current =>
+              match andb(notb intrinsic, eqNat current label) with
+              | True => pipeline_add_role choice name
+              | False => choice
+              end
+          | DDef _ _ _ => choice
+          | DAxiom _ _ => choice
+          | DInductive _ _ _ _ => choice
+          | DEffect _ _ _ => choice
+          | DExtern _ _ _ => choice
+          | DImport _ => choice
+          end) PipelineNoRole decls
+  end;
+
+def pipeline_role_or_name (st : InternState) (name : List Nat)
+    (choice : PipelineRoleChoice) : Nat :=
+  match choice with
+  | PipelineNoRole => id_of_name st name
+  | PipelineOneRole selected => selected
+  | PipelineDuplicateRole => Z
+  end;
+
+def pipeline_declares_const (name : Nat) : List Decl -> Bool :=
+  fix find (decls : List Decl) : Bool :=
+    match decls with
+    | Nil => False
+    | Cons decl rest =>
+        match decl with
+        | DDef current _ _ => orb(eqNat current name, find rest)
+        | DAxiom current _ => orb(eqNat current name, find rest)
+        | DIntrinsic current _ _ _ => orb(eqNat current name, find rest)
+        | DExtern current _ _ => orb(eqNat current name, find rest)
+        | DInductive _ _ _ _ => find rest
+        | DEffect _ _ _ => find rest
+        | DRepresentation _ _ => find rest
+        | DImport _ => find rest
+        end
+    end;
+
+-- Keep a checked local wrapper for legacy `do` syntax when it exists. If an
+-- alias collision removed its bare name, use the intrinsic role instead.
+def pipeline_runtime_hint (st : InternState) (name : List Nat)
+    (choice : PipelineRoleChoice) (decls : List Decl) : Nat :=
+  let ordinary : Nat := id_of_name st name in
+  match choice with
+  | PipelineNoRole => ordinary
+  | PipelineDuplicateRole => Z
+  | PipelineOneRole intrinsic =>
+      match pipeline_declares_const ordinary decls with
+      | True => ordinary
+      | False => intrinsic
+      end
+  end;
+
+def pipeline_role_ctors (name : Nat) : List Decl -> Pair Nat Nat :=
+  fix find (decls : List Decl) : Pair Nat Nat :=
+    match decls with
+    | Nil => MkPair Nat Nat Z Z
+    | Cons decl rest =>
+        match decl with
+        | DInductive current _ _ ctors =>
+            match eqNat current name with
+            | False => find rest
+            | True => match ctors with
+              | Cons first tail => match first with
+                | MkPair nil_id _ => match tail with
+                  | Cons second _ => match second with
+                    | MkPair cons_id _ => MkPair Nat Nat nil_id cons_id
+                    end
+                  | Nil => MkPair Nat Nat Z Z
+                  end
+                end
+              | Nil => MkPair Nat Nat Z Z
+              end
+            end
+        | DDef _ _ _ => find rest
+        | DAxiom _ _ => find rest
+        | DEffect _ _ _ => find rest
+        | DIntrinsic _ _ _ _ => find rest
+        | DExtern _ _ _ => find rest
+        | DRepresentation _ _ => find rest
+        | DImport _ => find rest
+        end
+    end;
+
+def collect_lower_env_from (st : InternState) (decls : List Decl) : LowerEnv :=
+    let string_role : PipelineRoleChoice := pipeline_role_choice st
+      ([111, 117, 114, 111, 46, 115, 116, 114, 105, 110, 103] : List Nat)
+      True decls in
+    let unit_role : PipelineRoleChoice := pipeline_role_choice st
+      ([111, 117, 114, 111, 46, 117, 110, 105, 116] : List Nat)
+      False decls in
+    let list_role : PipelineRoleChoice := pipeline_role_choice st
+      ([111, 117, 114, 111, 46, 108, 105, 115, 116] : List Nat)
+      False decls in
+    let runtime_role : PipelineRoleChoice := pipeline_role_choice st
+      ([111, 117, 114, 111, 46, 114, 117, 110, 116, 105, 109, 101] : List Nat)
+      True decls in
+    let runtime_bind_role : PipelineRoleChoice := pipeline_role_choice st
+      ([111, 117, 114, 111, 46, 114, 117, 110, 116, 105, 109, 101,
+        46, 98, 105, 110, 100] : List Nat) True decls in
+    let list_name : Nat := pipeline_role_or_name st name_List list_role in
+    let list_ctors : Pair Nat Nat := match list_role with
+      | PipelineNoRole => MkPair Nat Nat
+          (id_of_name st name_Nil) (id_of_name st name_Cons)
+      | PipelineOneRole selected => pipeline_role_ctors selected decls
+      | PipelineDuplicateRole => MkPair Nat Nat Z Z
+      end in
+    let specials : List Nat := match list_ctors with
+      | MkPair nil_id cons_id =>
+          ([pipeline_role_or_name st name_String string_role,
+            pipeline_role_or_name st name_Unit unit_role,
+            pipeline_runtime_hint st name_IO runtime_role decls,
+            pipeline_runtime_hint st name_io_bind runtime_bind_role decls,
+            id_of_name st name_pure, list_name, nil_id, cons_id] : List Nat)
+      end in
+  (fix go (ds : List Decl) : LowerEnv :=
     match ds with
     | Nil =>
-        let specials : List Nat :=
-          ([id_of_name st name_String, id_of_name st name_Unit, id_of_name st name_IO, id_of_name st name_io_bind, id_of_name st name_pure, id_of_name st name_List, id_of_name st name_Nil, id_of_name st name_Cons] : List Nat) in
         MkLowerEnv (Nil Nat) (Nil Nat) (Nil CtorInfo)
           specials
           (Nil (Pair Nat Surface)) (Nil (Pair Nat Surface))
@@ -109,7 +255,7 @@ def collect_lower_env_from (st : InternState) : List Decl -> LowerEnv :=
                 MkLowerEnv cids iids ctors specials pays types
             end
         end
-    end;
+    end) decls;
 
 def lower_decls_env
   (lower_expr_env2 : LowerEnv -> Maybe Surface -> Expr -> Surface)

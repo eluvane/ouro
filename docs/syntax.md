@@ -23,21 +23,37 @@ The parser expands the group into ordered imports. Aliases remain on separate
 single-path declarations. [Ergonomic syntax](language/ergonomic-syntax.md#grouped-imports)
 explains the desugaring and rejected forms.
 
-An import alias qualifies names from the imported file:
+An import alias qualifies declarations owned by that imported file:
 
 ```ouro
 def two : N.Nat := N.S N.one;
 ```
 
-Ouro currently uses a flat imported namespace. Import aliases and local opens
-are bounded conveniences, not a full module system:
+Plain imports keep unique short names available. A local term binder takes
+precedence over a bare module name, followed by a declaration owned by the
+current file. With aliases in the reached import graph, a bare name with no
+current-file declaration is ambiguous when two imported files own it; use
+their aliases to select the intended declaration. A graph of plain imports
+without aliases retains the existing duplicate-declaration error for a
+collision. An alias cannot select a declaration only imported transitively by
+its file. Aliases are local to the importing file, and a local term binder does
+not change the meaning of `N.member`.
+Two supplied source units with the same normalized path are rejected, even
+when their path spellings differ; importing one unit through both spellings
+still selects the same module.
+Collisions of the legacy `IO`, `io_bind`, and `pure` lowering names report
+ambiguity even for qualified uses until those forms carry module-local
+operation metadata. Unambiguous `do` programs keep their current behavior.
+
+Local opens retain their existing bounded source form:
 
 ```ouro
 def three : Nat := open N in add two one;
 ```
 
-Top-level `open` declarations, selective imports, hidden exports, and nested
-module declarations are not supported.
+`open N in` currently removes the qualifier only; it does not disambiguate
+colliding short names. Top-level `open` declarations, selective imports, hidden
+exports, and nested module declarations are not supported.
 
 ## Definitions and dependent functions
 

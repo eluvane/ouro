@@ -1,4 +1,5 @@
--- Import aliases and local opens are source rewrites; the flattened module model below this point is unchanged.
+-- Import qualification retains a marker for compiler-owned module resolution.
+-- Local opens still use the existing source rewrite.
 
 -- @entry preprocess_imports
 -- @export empty_imp_reg; @doc docs/syntax.md
@@ -7,19 +8,23 @@
 -- @export preprocess_imports_reg; @doc docs/syntax.md
 
 import "source_text.ouro",
+  "lexer.ouro",
   "../std/data.ouro",
   "base.ouro",
   "pipeline_abi.ouro";
 
-def empty_imp_reg : ImpReg := MkImpReg (Nil (List Nat));
+def empty_imp_reg : ImpReg :=
+  MkImpReg (Nil (List Nat)) (Nil (Pair(List Nat, List Nat)));
 
 def imp_code_malformed : Nat := S Z;
 def imp_code_dup : Nat := 2;
 def imp_code_unknown : Nat := 3;
 def imp_code_badname : Nat := 4;
+def imp_code_raw_marker : Nat := 5;
 
 def ch_dq_i : Nat := source_ch_double_quote;
 def ch_dot_i : Nat := 46;
+def ch_marker_i : Nat := 64;
 def ch_semi_i : Nat := 59;
 
 def n1i (a : Nat) : List Nat := ([a] : List Nat);
@@ -117,7 +122,9 @@ def imports_maybe_needed (src : List Nat) : Bool :=
             match source_is_comment xs with
             | True => go(remaining, source_skip_line rest)
             | False =>
-                match eqNat c ch_dq_i with
+                match eqNat c ch_marker_i with
+                | True => True
+                | False => match eqNat c ch_dq_i with
                 | True => go(remaining, source_skip_string rest)
                 | False =>
                     match source_word_at w_open xs with
@@ -136,9 +143,38 @@ def imports_maybe_needed (src : List Nat) : Bool :=
                         end
                     end
                 end
+                end
             end
         end
     end) (S (length Nat src)) src;
+
+def import_path_spelling (src : List Nat) : Maybe (List Nat) :=
+  match src with
+  | Nil => Nothing (List Nat)
+  | Cons quote rest =>
+      match eqNat quote ch_dq_i with
+      | False => Nothing (List Nat)
+      | True =>
+          match take_string (S (length Nat rest)) rest (Nil Nat) with
+          | StrErr => Nothing (List Nat)
+          | StrOk path _ => Just(List Nat, path)
+          end
+      end
+  end;
+
+def import_mask_byte (byte : Nat) : Nat :=
+  match orb(eqNat byte source_ch_lf, eqNat byte source_ch_cr) with
+  | True => byte
+  | False => source_ch_space
+  end;
+
+-- Erased alias/open syntax is replaced by equal-length whitespace, keeping
+-- token byte offsets for the import pass aligned with the original source.
+def import_mask_consumed (acc : List Nat) (before : List Nat)
+    (after : List Nat) : List Nat :=
+  source_emit_reversed acc
+    (map Nat Nat import_mask_byte
+      (take Nat (sub (length Nat before) (length Nat after)) before));
 
 -- @bound(cyclo <= 77)
 def preprocess_imports_reg (reg0 : ImpReg) (src : List Nat)
@@ -146,19 +182,23 @@ def preprocess_imports_reg (reg0 : ImpReg) (src : List Nat)
   match imports_maybe_needed src with
   | False => MkPair ImpReg ImpPrep reg0 (ImpOk src)
   | True =>
-      (fix go (fuel : Nat) (aliases : List (List Nat)) (xs : List Nat) (acc : List Nat)
+      (fix go (fuel : Nat) (aliases : List (List Nat))
+          (bindings : List (Pair (List Nat) (List Nat)))
+          (xs : List Nat) (acc : List Nat)
           : Pair ImpReg ImpPrep :=
         match fuel with
-        | Z => MkPair(ImpReg, ImpPrep, MkImpReg aliases, ImpErr imp_code_malformed Z)
+        | Z => MkPair(ImpReg, ImpPrep, MkImpReg aliases bindings,
+            ImpErr imp_code_malformed Z)
         | S remaining =>
             match xs with
             | Nil =>
-                MkPair(ImpReg, ImpPrep, MkImpReg aliases, ImpOk (reverse Nat acc))
+                MkPair(ImpReg, ImpPrep, MkImpReg aliases bindings,
+                  ImpOk (reverse Nat acc))
             | Cons c rest =>
                 match source_copy_comment_or_string acc xs with
                 | Just p =>
                     match p with
-                    | MkPair acc2 xs2 => go remaining aliases xs2 acc2
+                    | MkPair acc2 xs2 => go remaining aliases bindings xs2 acc2
                     end
                 | Nothing =>
                     match source_word_at w_import xs with
@@ -166,18 +206,22 @@ def preprocess_imports_reg (reg0 : ImpReg) (src : List Nat)
                         let after_kw : List Nat := source_drop_prefix w_import xs in
                         match copy_ws_i(source_emit_reversed acc w_import, after_kw) with
                         | MkPair acc2 xs2 =>
-                            match source_copy_quoted acc2 xs2 with
+                            match import_path_spelling xs2 with
                             | Nothing =>
-                                MkPair ImpReg ImpPrep (MkImpReg aliases)
+                                MkPair ImpReg ImpPrep (MkImpReg aliases bindings)
                                   (ImpErr imp_code_malformed Z)
-                            | Just sp =>
-                                match sp with
+                            | Just spelling =>
+                              match source_copy_quoted acc2 xs2 with
+                              | Nothing =>
+                                  MkPair ImpReg ImpPrep (MkImpReg aliases bindings)
+                                    (ImpErr imp_code_malformed Z)
+                              | Just sp => match sp with
                                 | MkPair acc3 xs3 =>
                                     match copy_ws_i acc3 xs3 with
                                     | MkPair acc4 xs4 =>
                                         match source_word_at w_as xs4 with
                                         | False =>
-                                            go remaining aliases xs4 acc4
+                                            go remaining aliases bindings xs4 acc4
                                         | True =>
                                             let xs5 : List Nat :=
                                               skip_ws_i (source_drop_prefix w_as xs4) in
@@ -186,15 +230,19 @@ def preprocess_imports_reg (reg0 : ImpReg) (src : List Nat)
                                                 match import_single_alias_error alias aliases xs6 with
                                                 | Z =>
                                                     go remaining (Cons (List Nat) alias aliases)
-                                                      xs6 acc4
+                                                      (Cons (Pair(List Nat, List Nat))
+                                                        (MkPair(List Nat, List Nat, alias, spelling))
+                                                        bindings) xs6
+                                                      (import_mask_consumed acc4 xs4 xs6)
                                                 | S code =>
-                                                    MkPair ImpReg ImpPrep (MkImpReg aliases)
+                                                    MkPair ImpReg ImpPrep (MkImpReg aliases bindings)
                                                       (ImpErr(S code, Z))
                                                 end
                                             end
                                         end
                                     end
                                 end
+                              end
                             end
                         end
                     | False =>
@@ -206,33 +254,35 @@ def preprocess_imports_reg (reg0 : ImpReg) (src : List Nat)
                             | MkPair alias xs3 =>
                                 match alias with
                                 | Nil =>
-                                    MkPair ImpReg ImpPrep (MkImpReg aliases)
+                                    MkPair ImpReg ImpPrep (MkImpReg aliases bindings)
                                       (ImpErr imp_code_malformed Z)
                                 | Cons _ _ =>
                                     match name_in alias aliases with
                                     | False =>
-                                        MkPair ImpReg ImpPrep (MkImpReg aliases)
+                                        MkPair ImpReg ImpPrep (MkImpReg aliases bindings)
                                           (ImpErr imp_code_unknown Z)
                                     | True =>
                                         let xs4 : List Nat := skip_ws_i xs3 in
                                         match source_word_at w_in xs4 with
                                         | True =>
-                                            go remaining aliases
+                                            go remaining aliases bindings
                                               (skip_ws_i (source_drop_prefix w_in xs4))
-                                              acc
+                                              (import_mask_consumed acc xs
+                                                (skip_ws_i (source_drop_prefix w_in xs4)))
                                         | False =>
                                             match xs4 with
                                             | Cons sc xs5 =>
                                                 match eqNat sc ch_semi_i with
-                                                | True => go remaining aliases xs5 acc
+                                                | True => go remaining aliases bindings xs5
+                                                    (import_mask_consumed acc xs xs5)
                                                 | False =>
                                                     MkPair ImpReg ImpPrep
-                                                      (MkImpReg aliases)
+                                                      (MkImpReg aliases bindings)
                                                       (ImpErr imp_code_malformed Z)
                                                 end
                                             | Nil =>
                                                 MkPair ImpReg ImpPrep
-                                                  (MkImpReg aliases)
+                                                  (MkImpReg aliases bindings)
                                                   (ImpErr imp_code_malformed Z)
                                             end
                                         end
@@ -254,27 +304,39 @@ def preprocess_imports_reg (reg0 : ImpReg) (src : List Nat)
                                                 match fld with
                                                 | Nil =>
                                                     MkPair ImpReg ImpPrep
-                                                      (MkImpReg aliases)
+                                                      (MkImpReg aliases bindings)
                                                       (ImpErr imp_code_malformed Z)
                                                 | Cons _ _ =>
-                                                    go remaining aliases after3
-                                                      (source_emit_reversed acc fld)
+                                                    go remaining aliases bindings after3
+                                                      (source_emit_reversed
+                                                        (Cons Nat ch_marker_i
+                                                          (source_emit_reversed acc id)) fld)
                                                 end
                                             end
                                         | False =>
-                                            go remaining aliases after (source_emit_reversed acc id)
+                                            go remaining aliases bindings after
+                                              (source_emit_reversed acc id)
                                         end
                                     | Nil =>
-                                        go remaining aliases after (source_emit_reversed acc id)
+                                        go remaining aliases bindings after
+                                          (source_emit_reversed acc id)
                                     end
                                 end
-                            | False => go remaining aliases rest (Cons Nat c acc)
+                            | False =>
+                                match eqNat c ch_marker_i with
+                                | True => MkPair ImpReg ImpPrep (MkImpReg aliases bindings)
+                                    (ImpErr imp_code_raw_marker Z)
+                                | False => go remaining aliases bindings rest (Cons Nat c acc)
+                                end
                             end
                         end
                     end
                 end
             end
-        end) (S (length Nat src)) (match reg0 with | MkImpReg a => a end) src (Nil Nat)
+        end) (S (length Nat src))
+          (match reg0 with | MkImpReg a _ => a end)
+          (match reg0 with | MkImpReg _ b => b end)
+          src (Nil Nat)
   end;
 
 def preprocess_imports (src : List Nat) : ImpPrep :=

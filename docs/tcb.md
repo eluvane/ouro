@@ -15,6 +15,12 @@ primitive contracts. Rejected, exhausted, cancelled, and malformed operations
 remain errors. Parser success and a successful lowering traversal do not
 establish declaration acceptance.
 
+`compiler/module_registry.ouro` and `compiler/module_names.ouro` resolve
+source-module names before the ordered declaration plan reaches the checker.
+They cannot authorize an unchecked import: each reached declaration and body
+still enters the same compiler-owned checking path. The module pass adds no
+checker allowlist dependency or host IO authority.
+
 The declaration plan derives definition membership from its supplied name
 list using the existing numeric-name index. Filtering retains core order,
 duplicate bodies, and complete terms; the index does not replace checking.

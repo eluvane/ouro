@@ -36,8 +36,8 @@ Duplicate paths remain present in the parsed declarations; dependency traversal
 continues to load each canonical path once. Both fast and preprocessed dependency
 collection paths discover every operand, including the second edge of a cycle.
 
-The existing alias implementation is a source rewrite over a flattened
-namespace, not compiler-owned module identity. Aliases therefore remain on
+Aliases bind the directly imported source unit. Qualification is resolved by
+the compiler before the complete import closure is checked. Aliases remain on
 separate single-path declarations:
 
 ```text
@@ -56,12 +56,16 @@ import "a.ouro" as A, "b.ouro";
 import "a.ouro" as A,;
 ```
 
-The legacy alias boundary now explicitly rejects a comma after an alias,
+The alias boundary explicitly rejects a comma after an alias,
 including across comments, with the existing `OURO-IMP-001` diagnostic. Without
 that rejection, erasing `as A` could accidentally grant meaning to a mixed
 group. This guard is not the implementation of grouped imports: acceptance of
-plain groups belongs to the declaration parser. Compiler-owned alias scoping,
-qualification, and shadowing are not provided by this syntax.
+plain groups belongs to the declaration parser. An alias selects direct
+declarations of its file; a transitive dependency needs its own direct import.
+When imported short names collide in a reached graph using aliases, a bare use
+without a local binder or current-file declaration requires qualification. A
+plain-only graph still rejects duplicate declarations. Local
+opens still erase their prefix and cannot resolve such a collision.
 
 Dependency-tail diagnostics distinguish missing paths from malformed quoted
 strings. The direct parser retains its existing positional `PErr` protocol;
@@ -169,9 +173,9 @@ rejected forms, import graph/diagnostic cases, and formatter round trips.
 
 ## Scope
 
-These forms add no module identity, tuple or named call syntax, implicit type
-argument inference, early return, or general effect handling. Aliases remain
-the existing flattened-namespace source rewrite. For language direction and
+These forms add no selective imports, private exports, tuple or named call
+syntax, implicit type argument inference, early return, or general effect
+handling. For language direction and
 compatibility, see [Design](../design.md#language-direction) and
 [Stability](../stability.md#experimental-areas).
 

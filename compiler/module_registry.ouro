@@ -1,0 +1,745 @@
+-- Module ownership is derived from canonical parsed units before lowering.
+-- Name rewriting never removes a declaration from the checked import closure.
+
+import "ast.ouro",
+  "pipeline_abi.ouro",
+  "pipeline_support.ouro",
+  "import_resolve.ouro",
+  "module_names.ouro",
+  "lexer.ouro",
+  "source_text.ouro",
+  "../std/natx.ouro",
+  "../std/data.ouro";
+
+inductive ModuleAliasUnit : Type :=
+  | MkModuleAliasUnit : Nat -> List (Pair (List Nat) Nat) -> ModuleAliasUnit;
+
+inductive ModuleMember : Type :=
+  | MkModuleMember : Nat -> Nat -> Nat -> ModuleMember;
+
+inductive ModuleMaps : Type :=
+  | MkModuleMaps : List (Pair Nat Nat) -> List (Pair Nat Nat) ->
+      List (Pair Nat Nat) -> ModuleMaps;
+
+inductive ModuleDecision : Type :=
+  | ModuleAbsent : ModuleDecision
+  | ModuleFound : Nat -> ModuleDecision
+  | ModuleAmbiguous : ModuleDecision;
+
+def module_path_id (st : InternState) (path : List Nat) : Maybe Nat :=
+  match st with
+  | MkIntern _ _ strings _ => source_lookup_id strings path
+  end;
+
+def module_alias_bindings (st : InternState) (base : List Nat)
+    (bindings : List (Pair (List Nat) (List Nat)))
+    : ResolveResult (List (Pair (List Nat) Nat)) :=
+  (fix go (xs : List (Pair (List Nat) (List Nat)))
+      : ResolveResult (List (Pair (List Nat) Nat)) :=
+    match xs with
+    | Nil => ROk (List (Pair (List Nat) Nat)) (Nil (Pair(List Nat, Nat)))
+    | Cons item rest =>
+        match item with
+        | MkPair alias spelling =>
+            match module_path_id st (canon_path base spelling) with
+            | Nothing => RErr (List (Pair (List Nat) Nat)) 8 Z
+            | Just target =>
+                match go rest with
+                | RErr code detail => RErr (List (Pair (List Nat) Nat)) code detail
+                | ROk tail =>
+                    ROk (List (Pair (List Nat) Nat))
+                      (Cons (Pair(List Nat, Nat))
+                        (MkPair(List Nat, Nat, alias, target)) tail)
+                end
+            end
+        end
+    end) bindings;
+
+def module_alias_units (st : InternState)
+    (files : List (Pair (List Nat) ImpReg))
+    : ResolveResult (List ModuleAliasUnit) :=
+  (fix go (xs : List (Pair (List Nat) ImpReg))
+      : ResolveResult (List ModuleAliasUnit) :=
+    match xs with
+    | Nil => ROk (List ModuleAliasUnit) (Nil ModuleAliasUnit)
+    | Cons item rest =>
+        match item with
+        | MkPair path reg =>
+            let canonical : List Nat := canon_path (Nil Nat) path in
+            match module_path_id st canonical with
+            | Nothing => RErr (List ModuleAliasUnit) 8 Z
+            | Just owner =>
+                match reg with
+                | MkImpReg _ bindings =>
+                    match module_alias_bindings st canonical bindings with
+                    | RErr code detail => RErr (List ModuleAliasUnit) code detail
+                    | ROk aliases =>
+                        match go rest with
+                        | RErr code detail => RErr (List ModuleAliasUnit) code detail
+                        | ROk tail =>
+                            ROk (List ModuleAliasUnit)
+                              (Cons ModuleAliasUnit
+                                (MkModuleAliasUnit owner aliases) tail)
+                        end
+                    end
+                end
+            end
+        end
+    end) files;
+
+def module_decl_names : List Decl -> List Nat :=
+  fix go (decls : List Decl) : List Nat :=
+    match decls with
+    | Nil => Nil Nat
+    | Cons decl rest =>
+        let tail : List Nat := go rest in
+        match decl with
+        | DDef name _ _ => Cons Nat name tail
+        | DAxiom name _ => Cons Nat name tail
+        | DInductive name _ _ constructors =>
+            Cons Nat name (append Nat (rec_field_names constructors) tail)
+        | DEffect name _ operations =>
+            Cons Nat name (append Nat (rec_field_names operations) tail)
+        | DIntrinsic name _ _ _ => Cons Nat name tail
+        | DExtern name _ _ => Cons Nat name tail
+        | DImport _ => tail
+        | DRepresentation _ _ => tail
+        end
+    end;
+
+def module_ctor_names : List Decl -> List Nat :=
+  fix go (decls : List Decl) : List Nat :=
+    match decls with
+    | Nil => Nil Nat
+    | Cons decl rest =>
+        match decl with
+        | DInductive _ _ _ constructors =>
+            append Nat (rec_field_names constructors) (go rest)
+        | DDef _ _ _ => go rest
+        | DAxiom _ _ => go rest
+        | DEffect _ _ _ => go rest
+        | DImport _ => go rest
+        | DIntrinsic _ _ _ _ => go rest
+        | DExtern _ _ _ => go rest
+        | DRepresentation _ _ => go rest
+        end
+    end;
+
+def module_visible_ctors (units : List SrcUnit) (paths : List Nat)
+    : List Nat :=
+  (fix go (remaining : List Nat) (seen : List Nat) : List Nat :=
+    match remaining with
+    | Nil => seen
+    | Cons owner rest =>
+        match findUnit owner units with
+        | None => go rest seen
+        | Some decls =>
+            let names : List Nat := module_ctor_names decls in
+            let updated : List Nat :=
+              (fix add_names (xs : List Nat) (acc : List Nat) : List Nat :=
+                match xs with
+                | Nil => acc
+                | Cons name tail =>
+                    match memNat name acc with
+                    | True => add_names tail acc
+                    | False => add_names tail (Cons Nat name acc)
+                    end
+                end) names seen in
+            go rest updated
+        end
+    end) paths (Nil Nat);
+
+def module_seed_names (owner : Nat) (names : List Nat)
+    (initial : List (Pair Nat Nat)) : List (Pair Nat Nat) :=
+  (fix go (xs : List Nat) (seen : List Nat)
+      (acc : List (Pair Nat Nat))
+      : List (Pair Nat Nat) :=
+    match xs with
+    | Nil => acc
+    | Cons name rest =>
+        match memNat name seen with
+        | True => go rest seen acc
+        | False =>
+            go rest (Cons Nat name seen)
+              (Cons (Pair Nat Nat) (MkPair Nat Nat owner name) acc)
+        end
+    end) names (Nil Nat) initial;
+
+def module_seed_units (units : List SrcUnit) (reached : List Nat)
+    : List (Pair Nat Nat) :=
+  (fix go (paths : List Nat) (acc : List (Pair Nat Nat))
+      : List (Pair Nat Nat) :=
+    match paths with
+    | Nil => acc
+    | Cons owner rest =>
+        match findUnit owner units with
+        | None => go rest acc
+        | Some decls => go rest (module_seed_names owner (module_decl_names decls) acc)
+        end
+    end) reached (Nil (Pair Nat Nat));
+
+def module_name_conflicts (owner : Nat) (name : Nat)
+    : List (Pair Nat Nat) -> Bool :=
+  fix go (items : List (Pair Nat Nat)) : Bool :=
+    match items with
+    | Nil => False
+    | Cons item rest =>
+        match item with
+        | MkPair p n =>
+            match andb(eqNat n name, notb(eqNat p owner)) with
+            | True => True
+            | False => go rest
+            end
+        end
+    end;
+
+def module_conflict_names (seeds : List (Pair Nat Nat)) : List Nat :=
+  (fix go (rows : List (Pair Nat Nat)) (found : List Nat)
+      : List Nat :=
+    match rows with
+    | Nil => found
+    | Cons row rest =>
+        match row with
+        | MkPair owner name =>
+            match memNat name found with
+            | True => go rest found
+            | False =>
+                match module_name_conflicts owner name seeds with
+                | True => go rest (Cons Nat name found)
+                | False => go rest found
+                end
+            end
+        end
+    end) seeds (Nil Nat);
+
+-- `do` and pure-handler lowering still carry legacy wrapper names. Until
+-- those forms have per-module operation metadata, a colliding wrapper cannot
+-- be selected from an unrelated file by its bare spelling.
+def module_legacy_special_collision (st : InternState)
+    (conflicts : List Nat) : Maybe Nat :=
+  match st with
+  | MkIntern identifiers _ _ _ =>
+      (fix find (names : List (List Nat)) : Maybe Nat :=
+        match names with
+        | Nil => Nothing Nat
+        | Cons spelling rest =>
+            match source_lookup_id identifiers spelling with
+            | Nothing => find rest
+            | Just name =>
+                match memNat name conflicts with
+                | True => Just Nat name
+                | False => find rest
+                end
+            end
+        end)
+        ([name_IO, name_io_bind, name_pure] : List (List Nat))
+  end;
+
+def module_has_aliases : List (Pair (List Nat) ImpReg) -> Bool :=
+  fix go (files : List (Pair (List Nat) ImpReg)) : Bool :=
+    match files with
+    | Nil => False
+    | Cons item rest =>
+        match item with
+        | MkPair _ reg =>
+            match reg with
+            | MkImpReg names _ =>
+                match names with
+                | Nil => go rest
+                | Cons _ _ => True
+                end
+            end
+        end
+    end;
+
+def module_has_reached_aliases (reached : List Nat)
+    : List ModuleAliasUnit -> Bool :=
+  fix go (items : List ModuleAliasUnit) : Bool :=
+    match items with
+    | Nil => False
+    | Cons item rest =>
+        match item with
+        | MkModuleAliasUnit owner bindings =>
+            match andb(memNat owner reached,
+                match bindings with | Nil => False | Cons _ _ => True end) with
+            | True => True
+            | False => go rest
+            end
+        end
+    end;
+
+-- Every supplied source unit must have one canonical owner. Otherwise
+-- findUnit's first-match behavior could silently select one of two bodies.
+def module_duplicate_units (units : List SrcUnit) : Maybe Nat :=
+  (fix go (remaining : List SrcUnit) (seen : List Nat) : Maybe Nat :=
+    match remaining with
+    | Nil => Nothing Nat
+    | Cons unit rest =>
+        match unit with
+        | MkSrcUnit path _ =>
+            match memNat path seen with
+            | True => Just Nat path
+            | False => go rest (Cons Nat path seen)
+            end
+        end
+    end) units (Nil Nat);
+
+def module_ordinal (owner : Nat) : List Nat -> Maybe Nat :=
+  fix go (paths : List Nat) : Maybe Nat :=
+    match paths with
+    | Nil => Nothing Nat
+    | Cons path rest =>
+        match eqNat path owner with
+        | True => Just Nat Z
+        | False => mapMaybe Nat Nat S (go rest)
+        end
+    end;
+
+def module_symbol_bytes (ordinal : Nat) (spelling : List Nat)
+    : List Nat :=
+  append Nat ([95, 111, 117, 114, 111, 95, 109, 95] : List Nat)
+    (append Nat
+      (map Nat Nat (fun (digit : Nat) => add 48 digit) (to_digits ordinal))
+      (Cons Nat 95 spelling));
+
+def module_members (st0 : InternState) (root : Nat) (reached : List Nat)
+    (conflicts : List Nat) (seeds : List (Pair Nat Nat))
+    : ResolveResult (Pair (List ModuleMember) InternState) :=
+  (fix go (rows : List (Pair Nat Nat)) (st : InternState)
+      : ResolveResult (Pair (List ModuleMember) InternState) :=
+    match rows with
+    | Nil => ROk (Pair (List ModuleMember) InternState)
+        (MkPair (List ModuleMember) InternState (Nil ModuleMember) st)
+    | Cons row rest =>
+        match row with
+        | MkPair owner name =>
+            let collision : Bool := memNat name conflicts in
+            match andb collision (notb(eqNat owner root)) with
+            | False =>
+                match go rest st with
+                | RErr code detail =>
+                    RErr (Pair (List ModuleMember) InternState) code detail
+                | ROk result =>
+                    match result with
+                    | MkPair tail final_st =>
+                        ROk (Pair (List ModuleMember) InternState)
+                          (MkPair (List ModuleMember) InternState
+                            (Cons ModuleMember (MkModuleMember owner name name) tail)
+                            final_st)
+                    end
+                end
+            | True =>
+                match module_ordinal owner reached with
+                | Nothing => RErr (Pair (List ModuleMember) InternState) 8 owner
+                | Just ordinal =>
+                    let generated : List Nat :=
+                      module_symbol_bytes ordinal (name_of_id st name) in
+                    match st with
+                    | MkIntern ids _ _ _ =>
+                        match source_lookup_id ids generated with
+                        | Just existing =>
+                            RErr (Pair (List ModuleMember) InternState) 8 existing
+                        | Nothing =>
+                            match intern_ident st generated with
+                            | MkPair symbol next_st =>
+                                match go rest next_st with
+                                | RErr code detail =>
+                                    RErr (Pair (List ModuleMember) InternState) code detail
+                                | ROk result =>
+                                    match result with
+                                    | MkPair tail final_st =>
+                                        ROk (Pair (List ModuleMember) InternState)
+                                          (MkPair (List ModuleMember) InternState
+                                            (Cons ModuleMember
+                                              (MkModuleMember owner name symbol) tail)
+                                            final_st)
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end) seeds st0;
+
+def module_member (owner : Nat) (name : Nat)
+    : List ModuleMember -> Maybe Nat :=
+  fix go (members : List ModuleMember) : Maybe Nat :=
+    match members with
+    | Nil => Nothing Nat
+    | Cons item rest =>
+        match item with
+        | MkModuleMember path spelling symbol =>
+            match andb(eqNat path owner, eqNat spelling name) with
+            | True => Just Nat symbol
+            | False => go rest
+            end
+        end
+    end;
+
+def module_member_bytes (st : InternState) (owner : Nat)
+    (spelling : List Nat) : List ModuleMember -> Maybe Nat :=
+  fix go (members : List ModuleMember) : Maybe Nat :=
+    match members with
+    | Nil => Nothing Nat
+    | Cons item rest =>
+        match item with
+        | MkModuleMember path name symbol =>
+            match andb(eqNat path owner,
+                source_bytes_equal (name_of_id st name) spelling) with
+            | True => Just Nat symbol
+            | False => go rest
+            end
+        end
+    end;
+
+def module_aliases_for (owner : Nat)
+    : List ModuleAliasUnit -> List (Pair (List Nat) Nat) :=
+  fix go (units : List ModuleAliasUnit)
+      : List (Pair (List Nat) Nat) :=
+    match units with
+    | Nil => Nil (Pair(List Nat, Nat))
+    | Cons unit rest =>
+        match unit with
+        | MkModuleAliasUnit path bindings =>
+            match eqNat path owner with
+            | True => bindings
+            | False => go rest
+            end
+        end
+    end;
+
+def module_alias_target (alias : List Nat)
+    : List (Pair (List Nat) Nat) -> Maybe Nat :=
+  fix go (bindings : List (Pair (List Nat) Nat)) : Maybe Nat :=
+    match bindings with
+    | Nil => Nothing Nat
+    | Cons item rest =>
+        match item with
+        | MkPair name target =>
+            match source_bytes_equal name alias with
+            | True => Just Nat target
+            | False => go rest
+            end
+        end
+    end;
+
+def module_split_marker (name : List Nat)
+    : Maybe (Pair (List Nat) (List Nat)) :=
+  (fix go (bytes : List Nat) (prefix : List Nat)
+      : Maybe (Pair (List Nat) (List Nat)) :=
+    match bytes with
+    | Nil => Nothing (Pair(List Nat, List Nat))
+    | Cons c rest =>
+        match eqNat c 64 with
+        | True =>
+            match prefix with
+            | Nil => Nothing (Pair(List Nat, List Nat))
+            | Cons _ _ =>
+                match rest with
+                | Nil => Nothing (Pair(List Nat, List Nat))
+                | Cons _ _ => Just (Pair(List Nat, List Nat))
+                    (MkPair(List Nat, List Nat, reverse Nat prefix, rest))
+                end
+            end
+        | False => go rest (Cons Nat c prefix)
+        end
+    end) name (Nil Nat);
+
+-- A declaration in the current file wins over imported short names. Multiple
+-- distinct imported owners with the same short spelling are ambiguous.
+def module_unqualified (owner : Nat) (visible : List Nat)
+    (name : Nat) (members : List ModuleMember) : ModuleDecision :=
+  match module_member owner name members with
+  | Just symbol => ModuleFound symbol
+  | Nothing =>
+      (fix go (rows : List ModuleMember) (found : Maybe Nat)
+          : ModuleDecision :=
+        match rows with
+        | Nil =>
+            match found with
+            | Nothing => ModuleAbsent
+            | Just symbol => ModuleFound symbol
+            end
+        | Cons item rest =>
+            match item with
+            | MkModuleMember path short symbol =>
+                match andb(eqNat short name, memNat path visible) with
+                | False => go rest found
+                | True =>
+                    match found with
+                    | Nothing => go rest (Just Nat symbol)
+                    | Just _ => ModuleAmbiguous
+                    end
+                end
+            end
+        end) members (Nothing Nat)
+  end;
+
+def module_heads (owner : Nat) (conflicts : List Nat)
+    : List ModuleMember -> List (Pair Nat Nat) :=
+  fix go (members : List ModuleMember) : List (Pair Nat Nat) :=
+    match members with
+    | Nil => Nil (Pair Nat Nat)
+    | Cons item rest =>
+        match item with
+        | MkModuleMember path short symbol =>
+            match andb(eqNat path owner, memNat short conflicts) with
+            | True => Cons (Pair Nat Nat) (MkPair Nat Nat short symbol) (go rest)
+            | False => go rest
+            end
+        end
+    end;
+
+def module_unqualified_maps (owner : Nat) (visible : List Nat)
+    (conflicts : List Nat) (members : List ModuleMember) : ModuleMaps :=
+  (fix go (names : List Nat)
+      (refs : List (Pair Nat Nat)) (errors : List (Pair Nat Nat))
+      : ModuleMaps :=
+    match names with
+    | Nil => MkModuleMaps (module_heads owner conflicts members) refs errors
+    | Cons short rest =>
+        match module_unqualified owner visible short members with
+        | ModuleAbsent => go rest refs errors
+        | ModuleFound symbol =>
+            go rest (Cons (Pair Nat Nat) (MkPair Nat Nat short symbol) refs)
+              errors
+        | ModuleAmbiguous =>
+            go rest refs
+              (Cons (Pair Nat Nat) (MkPair Nat Nat short 6) errors)
+        end
+    end) conflicts (Nil (Pair Nat Nat)) (Nil (Pair Nat Nat));
+
+def module_marker_ids (st : InternState) : List (Pair (List Nat) Nat) :=
+  match st with
+  | MkIntern identifiers _ _ _ =>
+      (fix go (rows : List (Pair (List Nat) Nat))
+          : List (Pair (List Nat) Nat) :=
+        match rows with
+        | Nil => Nil (Pair(List Nat, Nat))
+        | Cons item rest =>
+            match item with
+            | MkPair spelling _ =>
+                match module_split_marker spelling with
+                | Nothing => go rest
+                | Just _ => Cons (Pair(List Nat) Nat) item (go rest)
+                end
+            end
+        end) identifiers
+  end;
+
+-- A source-only entry has no imported unit bodies to resolve. It still must
+-- reject a qualified marker in a declaration or binder before its existing
+-- unresolved-import failure, rather than treating that marker as a new name.
+def module_source_guard (fuel : Nat) (aliases : ImpReg)
+    (st : InternState) (decls : List Decl) : ResolveResult (List Decl) :=
+  match aliases with
+  | MkImpReg names _ =>
+      match names with
+      | Nil => ROk (List Decl) decls
+      | Cons _ _ =>
+          let marker_ids : List Nat :=
+            map (Pair(List Nat, Nat)) Nat
+              (fun (item : Pair (List Nat) Nat) =>
+                match item with | MkPair _ id => id end) (module_marker_ids st) in
+          match marker_ids with
+          | Nil => ROk (List Decl) decls
+          | Cons _ _ =>
+              module_rewrite_decls fuel
+                (Nil (Pair Nat Nat)) (Nil (Pair Nat Nat)) (Nil (Pair Nat Nat))
+                marker_ids (module_ctor_names decls) decls
+          end
+      end
+  end;
+
+def module_marker_maps (st : InternState)
+    (aliases : List (Pair (List Nat) Nat)) (members : List ModuleMember)
+    (markers : List (Pair (List Nat) Nat))
+    (initial : ModuleMaps) : ModuleMaps :=
+      (fix go (ids : List (Pair (List Nat) Nat))
+          (refs : List (Pair Nat Nat)) (errors : List (Pair Nat Nat))
+          (heads : List (Pair Nat Nat)) : ModuleMaps :=
+        match ids with
+        | Nil => MkModuleMaps heads refs errors
+        | Cons item rest =>
+            match item with
+            | MkPair spelling id =>
+                match module_split_marker spelling with
+                | Nothing => go rest refs errors heads
+                | Just parts =>
+                    match parts with
+                    | MkPair alias member =>
+                        match module_alias_target alias aliases with
+                        | Nothing => go rest refs errors heads
+                        | Just target =>
+                            match module_member_bytes st target member members with
+                            | Nothing =>
+                                go rest refs
+                                  (Cons (Pair Nat Nat) (MkPair Nat Nat id 5) errors)
+                                  heads
+                            | Just symbol =>
+                                go rest
+                                  (Cons (Pair Nat Nat) (MkPair Nat Nat id symbol) refs)
+                                  errors heads
+                            end
+                        end
+                    end
+                end
+            end
+        end) markers
+          (match initial with | MkModuleMaps _ refs _ => refs end)
+          (match initial with | MkModuleMaps _ _ errors => errors end)
+          (match initial with | MkModuleMaps heads _ _ => heads end);
+
+def module_qualified_ctors (units : List SrcUnit) (st : InternState)
+    (aliases : List (Pair (List Nat) Nat))
+    (markers : List (Pair (List Nat) Nat)) : List Nat :=
+  (fix go (rows : List (Pair (List Nat) Nat)) : List Nat :=
+    match rows with
+    | Nil => Nil Nat
+    | Cons item rest =>
+        let tail : List Nat := go rest in
+        match item with
+        | MkPair spelling marker =>
+            match module_split_marker spelling with
+            | Nothing => tail
+            | Just parts => match parts with
+              | MkPair alias member =>
+                  match module_alias_target alias aliases with
+                  | Nothing => tail
+                  | Just target =>
+                      match findUnit target units with
+                      | None => tail
+                      | Some decls =>
+                          match st with
+                          | MkIntern identifiers _ _ _ =>
+                              match source_lookup_id identifiers member with
+                              | Nothing => tail
+                              | Just name =>
+                                  match memNat name (module_ctor_names decls) with
+                                  | True => Cons Nat marker tail
+                                  | False => tail
+                                  end
+                              end
+                          end
+                      end
+                  end
+              end
+            end
+        end
+    end) markers;
+
+def module_maps_for (units : List SrcUnit) (aliases : List ModuleAliasUnit)
+    (members : List ModuleMember) (conflicts : List Nat)
+    (markers : List (Pair (List Nat) Nat))
+    (st : InternState) (owner : Nat)
+    : ResolveResult (Pair ModuleMaps (List Nat)) :=
+  match resolve_import_paths units owner with
+  | RErr code detail => RErr (Pair ModuleMaps (List Nat)) code detail
+  | ROk visible =>
+      let local_aliases : List (Pair (List Nat) Nat) :=
+        module_aliases_for owner aliases in
+      ROk (Pair ModuleMaps (List Nat))
+        (MkPair ModuleMaps (List Nat)
+          (module_marker_maps st local_aliases members markers
+            (module_unqualified_maps owner visible conflicts members))
+          (append Nat (module_visible_ctors units visible)
+            (module_qualified_ctors units st local_aliases markers)))
+  end;
+
+def module_rewrite_units (fuel : Nat) (units : List SrcUnit)
+    (reached : List Nat) (aliases : List ModuleAliasUnit)
+    (members : List ModuleMember) (conflicts : List Nat)
+    (markers : List (Pair (List Nat) Nat)) (marker_ids : List Nat)
+    (st : InternState)
+    : ResolveResult (List SrcUnit) :=
+  (fix go (remaining : List SrcUnit) : ResolveResult (List SrcUnit) :=
+    match remaining with
+    | Nil => ROk (List SrcUnit) (Nil SrcUnit)
+    | Cons unit rest =>
+        match unit with
+        | MkSrcUnit owner decls =>
+            match memNat owner reached with
+            | False =>
+                match go rest with
+                | RErr code detail => RErr (List SrcUnit) code detail
+                | ROk tail => ROk (List SrcUnit) (Cons SrcUnit unit tail)
+                end
+            | True =>
+                match module_maps_for units aliases members conflicts markers st owner with
+                | RErr code detail => RErr (List SrcUnit) code detail
+                | ROk scoped_maps =>
+                    match scoped_maps with
+                    | MkPair maps constructors =>
+                      match maps with
+                      | MkModuleMaps heads refs errors =>
+                        match module_rewrite_decls fuel heads refs errors
+                            marker_ids constructors decls with
+                        | RErr code detail => RErr (List SrcUnit) code detail
+                        | ROk updated =>
+                            match go rest with
+                            | RErr code detail => RErr (List SrcUnit) code detail
+                            | ROk tail =>
+                                ROk (List SrcUnit)
+                                  (Cons SrcUnit (MkSrcUnit owner updated) tail)
+                            end
+                        end
+                      end
+                    end
+                end
+            end
+        end
+    end) units;
+
+def module_resolve_units (fuel : Nat) (units : List SrcUnit)
+    (alias_files : List (Pair (List Nat) ImpReg))
+    (root : Nat) (st : InternState)
+    : ResolveResult (Pair (List SrcUnit) InternState) :=
+  match module_duplicate_units units with
+  | Just _ => RErr (Pair (List SrcUnit) InternState) 8 0
+  | Nothing => match module_has_aliases alias_files with
+  | False => ROk (Pair (List SrcUnit) InternState)
+      (MkPair (List SrcUnit) InternState units st)
+  | True => match resolve_import_paths units root with
+  | RErr code detail => RErr (Pair (List SrcUnit) InternState) code detail
+  | ROk reached =>
+      match module_alias_units st alias_files with
+      | RErr code detail => RErr (Pair (List SrcUnit) InternState) code detail
+      | ROk aliases =>
+          match module_has_reached_aliases reached aliases with
+          | False => ROk (Pair (List SrcUnit) InternState)
+              (MkPair (List SrcUnit) InternState units st)
+          | True =>
+          let seeds : List (Pair Nat Nat) := module_seed_units units reached in
+          let conflicts : List Nat := module_conflict_names seeds in
+          match module_legacy_special_collision st conflicts with
+          | Just name =>
+              RErr (Pair (List SrcUnit) InternState) 6 name
+          | Nothing =>
+          let markers : List (Pair (List Nat) Nat) := module_marker_ids st in
+          let marker_ids : List Nat :=
+            map (Pair(List Nat, Nat)) Nat
+              (fun (item : Pair (List Nat) Nat) =>
+                match item with | MkPair _ id => id end) markers in
+          match module_members st root reached conflicts seeds with
+          | RErr code detail => RErr (Pair (List SrcUnit) InternState) code detail
+          | ROk built =>
+              match built with
+              | MkPair members st2 =>
+                  match module_rewrite_units fuel units reached aliases members
+                      conflicts markers marker_ids st2 with
+                  | RErr code detail =>
+                      RErr (Pair (List SrcUnit) InternState) code detail
+                  | ROk updated =>
+                      ROk (Pair (List SrcUnit) InternState)
+                        (MkPair (List SrcUnit) InternState updated st2)
+                  end
+              end
+          end
+          end
+          end
+      end
+  end
+  end
+  end;

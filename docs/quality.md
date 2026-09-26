@@ -470,6 +470,13 @@ remains duplicate imports, `;;`, `<-`/`let!`, typed Cons/Nil spans, and
 alias/open. Language lint owns holes, unbound names, unused binders, and
 shadowing.
 
+Language lint parses qualified import references after compiler preprocessing
+and reports their original dotted spelling. It compares qualified names and
+constructors against names harvested from the alias's direct imported file;
+unqualified names still use the flattened import inventory. This analysis
+does not authorize source acceptance; the compiler module resolver and
+declaration checker decide identity and validity.
+
 The [syntax reference](syntax.md) is the source of truth for accepted language
 forms. Quality policy may restrict project-owned style without claiming that
 every restricted form is absent from the parser. See
