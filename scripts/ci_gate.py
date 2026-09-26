@@ -56,18 +56,18 @@ PR_GROUPS: dict[str, tuple[str, ...]] = {
         "stage-loop-c-object-cache",
         "stage-loop-frontend-regeneration",
         "language-speed-simplicity",
-        "parity",
         "fmt",
         "fix",
         "pkg",
         "doc",
         "docs-examples",
-        "syntax-quality-firewall",
         "strict-quality-firewall",
         "structural-quality-suite",
         "structural-quality",
         "hygiene",
     ),
+    "checks-parity": ("parity",),
+    "checks-quality": ("syntax-quality-firewall",),
     "analysis": (
         "memory-budget",
         "c-static-analysis",
@@ -95,8 +95,8 @@ PR_GROUPS: dict[str, tuple[str, ...]] = {
 }
 
 NIGHTLY_GROUPS: dict[str, tuple[str, ...]] = {
-    "checks": tuple("cache-parity-full" if name == "cache-parity-module" else name
-                    for name in PR_GROUPS["checks"]),
+    "checks": (*tuple("cache-parity-full" if name == "cache-parity-module" else name
+                      for name in PR_GROUPS["checks"]), "parity", "syntax-quality-firewall"),
     "analysis": PR_GROUPS["analysis"],
     "analyzer": ("analyze-precision", "analyze-production"),
     "lint": PR_GROUPS["lint"],
@@ -414,8 +414,9 @@ def plan_paths(paths: Sequence[str]) -> PathSelection:
 
 def selection_matrix(selection: PathSelection) -> dict[str, list[dict[str, str]]]:
     selected = set(selection.gates)
-    # Start the long compiler shards first when runner concurrency is saturated.
-    groups = sorted(PR_GROUPS, key=lambda name: not name.startswith("compiler-"))
+    # Start critical-path checks and compiler shards when runner concurrency is saturated.
+    priority = {"checks": 0, "checks-parity": 0, "checks-quality": 0}
+    groups = sorted(PR_GROUPS, key=lambda name: priority.get(name, 1 if name.startswith("compiler-") else 2))
     return {"include": [{"group": group} for group in groups if selected.intersection(PR_GROUPS[group])]}
 
 
@@ -782,6 +783,8 @@ def run_self_tests(all_gates: Sequence[Gate]) -> int:
                 planned = [row["group"] for row in selection_matrix(full_path_selection("selftest"))["include"]]
                 if len(planned) != len(groups) or set(planned) != set(groups):
                     failures.append("full PR routing omits or duplicates a group")
+                if planned[:3] != ["checks", "checks-parity", "checks-quality"]:
+                    failures.append("long PR checks must start before compiler shards")
             elif matrix != list(groups):
                 failures.append(f"hosted {profile} matrix differs from automatic group inventory: {matrix}")
     lint_workflow = (ROOT / ".github/workflows/ouro-lint.yml").read_text(encoding="utf-8")

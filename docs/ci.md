@@ -53,7 +53,7 @@ List the gates in a profile without running them:
 python3 scripts/ci_gate.py --profile pr --list
 ```
 
-The complete local PR inventory has twenty-one isolated groups. GitHub selects
+The complete local PR inventory has twenty-three isolated groups. GitHub selects
 affected groups and gates for reviewed tool paths; main-branch pushes, merge
 queues and manual CI runs select the complete inventory except `lint`, which
 runs in Nightly and on demand. Run one group with:
@@ -62,7 +62,7 @@ runs in Nightly and on demand. Run one group with:
 python3 scripts/ci_gate.py --profile pr --group checks
 ```
 
-The group names are `checks`, `analysis`, `checker`, `analyzer`, `lint`,
+The group names are `checks`, `checks-parity`, `checks-quality`, `analysis`, `checker`, `analyzer`, `lint`,
 `tests`, `smith`, `samples-1`, `samples-2`, and `compiler-1` through
 `compiler-12`. Substitute the selected name after `--group`.
 
@@ -161,7 +161,8 @@ then the deeper OuroSmith profile in the same checkout. `Full` runs even after
 a job failure and fails unless every matrix group succeeds. Reports are
 uploaded separately as `nightly-<group>` artifacts. Hosted PR matrix jobs use static names `PR` and `Portable` so a skipped
 matrix does not publish an unevaluated expression. When those jobs run,
-GitHub appends the matrix value: `PR (checks)`, `PR (analysis)`, `PR (checker)`,
+GitHub appends the matrix value: `PR (checks)`, `PR (checks-parity)`,
+`PR (checks-quality)`, `PR (analysis)`, `PR (checker)`,
 `PR (analyzer)`, `PR (tests)`,
 `PR (smith)`, `PR (samples-1)`, `PR (samples-2)`, `PR (compiler-1)` through
 `PR (compiler-12)`, `Portable (ubuntu-latest)`,
@@ -243,7 +244,7 @@ succeed; a skipped required job or failed/cancelled matrix cannot satisfy it.
 Do not require individual dynamic matrix names in branch protection.
 
 The GitHub job summary lists selected groups and gates. Full runs enqueue the
-long compiler shards first. PR matrix jobs cancel remaining siblings after a
+three long check groups and compiler shards first. PR matrix jobs cancel remaining siblings after a
 failure, and each group stops at its first blocking failure while recording
 unexecuted gates as `not_run`. Nightly and ordinary local profiles still gather
 all failures. Obsolete runs are cancelled by the existing concurrency group.
