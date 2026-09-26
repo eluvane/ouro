@@ -18,6 +18,9 @@ Development changes; see the [compatibility policy](docs/stability.md).
 - Total `let (Ctor fields) := subject in body` and block `let (Ctor fields) :=
   subject; tail` destructuring use checked constructor matches; result types
   that cannot be inferred from the subject need an expected context.
+- Opt-in `"""` multiline `String` literals strip the closing line's exact
+  space/tab prefix from nonempty content lines while retaining interior line
+  endings and other bytes. See [Numbers and strings](docs/syntax.md#numbers-and-strings).
 - Exclusive `0..10` and inclusive `0..=10` literal-endpoint `NatRange` values,
   checked through nominal Nat, bound, and range representation roles.
 - Final-tail list spreads `[first, ..rest]` build checked `List A` constructor

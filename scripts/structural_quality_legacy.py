@@ -192,6 +192,30 @@ def lex(source, language):
             line += source[start:i].count("\n")
             continue
         char = source[i]
+        if language == "ouro" and source.startswith('"""', i):
+            body = i + 3
+            if source.startswith("\r\n", body):
+                current = body + 2
+            elif source.startswith("\n", body):
+                current = body + 1
+            else:
+                raise ValueError(f"unclosed string at line {line}")
+            while current < len(source):
+                quote = current
+                while quote < len(source) and source[quote] in " \t":
+                    quote += 1
+                if source.startswith('"""', quote):
+                    i = quote + 3
+                    break
+                end = source.find("\n", current)
+                if end < 0:
+                    raise ValueError(f"unclosed string at line {line}")
+                current = end + 1
+            else:
+                raise ValueError(f"unclosed string at line {line}")
+            result.append(Token(source[start:i], start, i, first_line))
+            line += source[start:i].count("\n")
+            continue
         if language == "ouro" and source.startswith('r#"', i):
             close = source.find('"#', i + 3)
             if close < 0:

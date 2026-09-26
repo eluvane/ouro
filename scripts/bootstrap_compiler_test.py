@@ -139,6 +139,21 @@ class BootstrapCompilerTests(unittest.TestCase):
                          ["compiler/real.ouro"])
         self.assertEqual(compact_source.compact_source(compacted), compacted)
 
+    def test_compaction_preserves_dedented_multiline_bytes_and_real_directives(self):
+        literal = b'"""\r\n  -- @export fake\r\n\r\n  import "fake.ouro"; \\n\r\n  """'
+        source = (b'def text : String := ' + literal + b'; -- trailing\n'
+                  b'-- @export real\nimport "real.ouro";\n')
+        compacted = compact_source.compact_source(source)
+        self.assertIn(literal, compacted)
+        self.assertIn(b'-- @export real\n', compacted)
+        self.assertEqual(compact_source.compact_source(compacted), compacted)
+
+    def test_compaction_rejects_malformed_multiline_delimiters(self):
+        for source in (b'"""inline', b'"""\nunfinished'):
+            with self.subTest(source=source), self.assertRaisesRegex(
+                    ValueError, "multiline string"):
+                compact_source.compact_source(source)
+
     def test_compaction_rejects_unclosed_raw_literal(self):
         with self.assertRaisesRegex(ValueError, "unterminated raw string"):
             compact_source.compact_source(b'def text : String := r#"unfinished";')
