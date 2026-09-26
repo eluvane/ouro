@@ -1,6 +1,7 @@
 """Negative controls for source-bound compiler-suite evidence."""
 from copy import deepcopy
 import json
+from pathlib import Path
 import shutil
 import unittest
 from unittest.mock import patch
@@ -38,6 +39,7 @@ class CompilerEvidenceTests(EvidenceTreeTests):
             return_value=(self.native_receipt, [], {})))
         entries = ['tests/compiler_suite_contract_tests.ouro', 'tests/compiler_property_tests.ouro',
                    'tests/source_span_tests.ouro']
+        self.write_registry(entries)
         self.listed = RunResult('ok', 0, '\n'.join(entries) + '\n', '', 0.1, 10)
         self.execute = self.enterContext(patch('ourosmith.limits.run_limited', return_value=self.listed))
         self.log = self.root / 'gate.log'
@@ -54,6 +56,16 @@ class CompilerEvidenceTests(EvidenceTreeTests):
 
     def read(self):
         return evidence.suite_receipt(self.log, self.root / 'compiler')
+
+    def write_registry(self, entries):
+        source = self.root / 'tools/test/suites.ouro'
+        source.parent.mkdir(parents=True, exist_ok=True)
+        names = ['source_spans' if entry == 'tests/source_span_tests.ouro'
+                 else Path(entry).stem.removesuffix('_tests') for entry in entries]
+        rows = [f'MkSuiteFixture "{name}" "{entry}" Z SuiteGoldenNone'
+                for name, entry in zip(names, entries, strict=True)]
+        source.write_text('def compiler_check_suite_fixtures : List SuiteFixture :=\n['
+                          + ',\n'.join(rows) + '];\n', encoding='utf-8')
 
     def test_complete_protocol_binds_every_executed_entry(self):
         receipt = self.read()
@@ -90,6 +102,14 @@ class CompilerEvidenceTests(EvidenceTreeTests):
             self.execute.return_value = result
             with self.subTest(field=field, value=value), self.assertRaises(ValueError):
                 self.read()
+
+    def test_fixture_names_follow_the_source_registry(self):
+        source = self.root / 'tools/test/suites.ouro'
+        original = source.read_text(encoding='utf-8')
+        source.write_text(original.replace('"source_spans" "tests/source_span_tests.ouro"',
+                                           '"source_span" "tests/source_span_tests.ouro"'), encoding='utf-8')
+        with self.assertRaisesRegex(ValueError, 'executed compiler rows'):
+            self.read()
 
     def test_stale_receipts_and_runner_replacement_reject(self):
         self.receipt.side_effect = ValueError('stale receipt')
@@ -209,6 +229,7 @@ class CompilerEvidenceTests(EvidenceTreeTests):
         inventory += ['tests/compiler_property_tests.ouro']
         inventory += [f'tests/compiler_fixture_{index}_tests.ouro' for index in range(10, 12)]
         inventory += ['tests/source_span_tests.ouro']
+        self.write_registry(inventory)
         listed = RunResult('ok', 0, '\n'.join(inventory) + '\n', '', 0.1, 10)
         selected = RunResult('ok', 0, 'tests/compiler_property_tests.ouro\n', '', 0.1, 10)
         self.log.write_text('COMPILER_CHECK_OK compiler_property-run\n'

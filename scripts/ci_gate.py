@@ -318,18 +318,24 @@ def classify_paths(paths: Sequence[str]) -> PathSelection:
     )
 
 
-def compiler_fixture_roots(root: Path) -> list[str]:
+def compiler_fixture_rows(root: Path) -> list[tuple[str, str]]:
     """Read the literal inventory; refuse a shape we cannot prove complete."""
     source = (root / "tools/test/suites.ouro").read_text(encoding="utf-8")
     marker = "def compiler_check_suite_fixtures : List SuiteFixture :="
     if source.count(marker) != 1:
         raise ValueError("compiler fixture inventory marker changed")
     body = source.split(marker)[1].strip()
-    rows = re.findall(r'MkSuiteFixture "[a-z0-9_]+" "(tests/[^"\n]+\.ouro)" Z SuiteGoldenNone', body)
+    rows = re.findall(r'MkSuiteFixture "([a-z0-9_]+)" "(tests/[^"\n]+\.ouro)" Z SuiteGoldenNone', body)
     remainder = re.sub(r'MkSuiteFixture "[a-z0-9_]+" "tests/[^"\n]+\.ouro" Z SuiteGoldenNone', "", body)
-    if not rows or len(set(rows)) != len(rows) or re.sub(r"[\s\[\],;]", "", remainder):
+    if (not rows or len({name for name, _ in rows}) != len(rows)
+            or len({path for _, path in rows}) != len(rows)
+            or re.sub(r"[\s\[\],;]", "", remainder)):
         raise ValueError("compiler fixture inventory is not a complete literal list")
     return rows
+
+
+def compiler_fixture_roots(root: Path) -> list[str]:
+    return [path for _, path in compiler_fixture_rows(root)]
 
 
 def compiler_shard_entries(inventory: Sequence[str], shard: int) -> list[str]:

@@ -10,20 +10,13 @@ import re
 import sys
 from pathlib import Path
 
-from ci_gate import COMPILER_SHARDS, compiler_shard_entries
+from ci_gate import COMPILER_SHARDS, compiler_fixture_rows, compiler_shard_entries
 from repo_support import sha256_file as sha
 from ourosmith import ROOT
 from ourosmith.native import receipt_for
 
 SUITE_ENTRY = 'tools/test/main.ouro'
 PROPERTY_ENTRY = 'tests/compiler_property_tests.ouro'
-SOURCE_SPANS_ENTRY = 'tests/source_span_tests.ouro'
-
-
-def fixture_name(entry):
-    if entry == SOURCE_SPANS_ENTRY:
-        return 'source_spans'
-    return Path(entry).stem.removesuffix('_tests')
 
 
 def property_protocol(text):
@@ -77,6 +70,10 @@ def suite_receipt(log, compiler, shard='all'):
     if (not listed.ok or listed.stderr or not inventory or len(inventory) != len(set(inventory))
             or any(not re.fullmatch(r'tests/[a-z][a-z0-9_]*_tests\.ouro', entry) for entry in inventory)):
         raise ValueError('current Ouro suite inventory is unavailable or malformed')
+    registered = compiler_fixture_rows(ROOT)
+    if inventory != [entry for _, entry in registered]:
+        raise ValueError('compiler suite inventory differs from the source registry')
+    registered_names = {entry: name for name, entry in registered}
     entries = inventory
     if shard != 'all':
         selected = run_limited([*command, '--shard=' + shard], cwd=ROOT, env=environment(jobs=1),
@@ -85,7 +82,7 @@ def suite_receipt(log, compiler, shard='all'):
         if (not selected.ok or selected.stderr or not entries
                 or entries != compiler_shard_entries(inventory, int(shard.split('/')[0]))):
             raise ValueError('compiler shard differs from its complete inventory partition')
-    if names != [fixture_name(entry) for entry in entries]:
+    if names != [registered_names[entry] for entry in entries]:
         raise ValueError('executed compiler rows differ from the current Ouro suite inventory')
     artifacts = []
     for name, entry in zip(names, entries, strict=True):
