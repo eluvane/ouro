@@ -64,6 +64,12 @@ fun (x : A) => body
 let x : A := value in body
 ```
 
+Short lambdas such as `fun x => body` and `fun x y => body` use an expected
+function type when available. Its parameter types can also guide nested
+callbacks and matches in the lambda body; ambiguous or missing context still
+requires an annotation. [Ergonomic syntax](language/ergonomic-syntax.md#expected-types-in-short-lambdas)
+describes the bounded rule.
+
 A local helper can put its typed parameters next to its name:
 
 ```ouro

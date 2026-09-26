@@ -31,6 +31,8 @@ Development changes; see the [compatibility policy](docs/stability.md).
 
 ### Changed
 
+- Expected function domains now guide nested callbacks and parameterized
+  matches inside short lambdas when the domain is unambiguous and complete.
 - Run PR parity and syntax-quality gates in separate required jobs to shorten
   the serial `checks` group; nightly retains both gates in its `checks` group.
 - Split compiler-checking fixtures across sixteen PR and nightly jobs, with
