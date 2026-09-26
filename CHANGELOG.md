@@ -12,6 +12,10 @@ Development changes; see the [compatibility policy](docs/stability.md).
   inference from a direct expected family or direct value-field type hints on
   saturated calls; explicit calls remain valid. See
   [Marked constructor parameters](docs/language/ergonomic-syntax.md#marked-constructor-parameters).
+- Leading `{A : Type}` definition parameters opt calls in to bounded value
+  and expected type inference, including nondependent callback and collection
+  type shapes. Explicit full and partial calls remain valid. See
+  [Marked definition parameters](docs/language/ergonomic-syntax.md#marked-definition-parameters).
 - Typed `let?` blocks propagate `Either`- or `Maybe`-shaped failures through
   explicit constructor roles and lower to checked cases; see
   [Ergonomic syntax](docs/language/ergonomic-syntax.md#typed-fallible-blocks).
