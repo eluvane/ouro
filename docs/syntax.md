@@ -239,7 +239,7 @@ embedded-NUL limits.
 List literals require an expected `List A` type:
 
 ```ouro
-def values : List Nat := [Z, S Z, S (S Z)];
+def values : List Nat := [Z, S Z, S (S Z),];
 def empty : List Nat := [];
 ```
 
@@ -249,8 +249,9 @@ A local type ascription can provide the expected element type:
 def count : Nat := (([Z, S Z] : List Nat) |> length Nat);
 ```
 
-Untyped `[]`, ambiguous list literals, and trailing commas are rejected. List
-literals lower to the standard `Nil` and `Cons` constructors.
+Untyped `[]` and ambiguous list literals are rejected. A nonempty list may
+end with a comma; `[]` remains the empty spelling. List literals lower to the
+standard `Nil` and `Cons` constructors.
 
 ## Records
 
