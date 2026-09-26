@@ -34,6 +34,11 @@ def result : Nat := {n};
   (fun (left : Nat) => fun (right : Nat) =>
     add left (match {flag} with | True => right | False => S right end)) {n} {m};
 """, n + m + (0 if seed % 2 else 1), False
+    yield "named-call", PRELUDE + f"""def combine (front => first : Nat) (back => second : Nat) : Nat := add first second;
+def front : Nat := {n};
+def back : Nat := {m};
+def result : Nat := combine(back :=, front :=);
+""", n + m, False
     yield "large-elimination", PRELUDE + f"""def resultType (n : Nat) : Type :=
   match n with | Z => Nat | S _ => Nat end;
 def value : resultType Z := {n};
@@ -140,6 +145,23 @@ def rest : List Nat := [2];
 def values : List Nat := [{n}, {m}, ..rest];
 def result : Nat := score values;
 """, n + 8 * m + 128, False
+    yield "range-literal", PRELUDE + f"""inductive NatRangeBound : Type :=
+  | RangeExclusive : NatRangeBound | RangeInclusive : NatRangeBound;
+representation NatRangeBound := "ouro.range-bound";
+inductive NatRange : Type :=
+  | MkNatRange : Nat -> Nat -> Nat -> NatRangeBound -> NatRange;
+representation NatRange := "ouro.range";
+def double (value : Nat) : Nat := add value value;
+def quadruple (value : Nat) : Nat := double (double value);
+def score (range : NatRange) : Nat :=
+  match range with
+  | MkNatRange first last step bound =>
+      let weighted : Nat := add first (add (double last) (quadruple step)) in
+      match bound with
+      | RangeExclusive => weighted | RangeInclusive => S weighted end
+  end;
+def result : Nat := add (score ({n}..{m})) (score ({m}..={n}));
+""", 3 * n + 3 * m + 9, False
     yield "record", PRELUDE + f"""record Point : Type where
   x : Nat;
   y : Nat;
