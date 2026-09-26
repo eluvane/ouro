@@ -189,6 +189,21 @@ when it cannot be inferred from the subject. See
 [checked destructuring lets](language/ergonomic-syntax.md#checked-destructuring-lets)
 for the exact limits.
 
+An ordinary conditional is a total expression:
+
+```ouro
+import "std/types.ouro";
+
+def choose (flag : Bool) (left : Nat) (right : Nat) : Nat :=
+  if flag then left else right;
+```
+
+`if` requires the registered `ouro.bool` family. The `else` arm is mandatory,
+and both arms are checked against the result type even when the condition is a
+known constructor. The condition becomes the single scrutinee of a checked
+two-arm case; the first constructor selects `then`, and the second selects
+`else`. Parenthesize a conditional when passing it as an argument.
+
 A family can opt in to omitting a leading universe parameter on saturated
 constructor calls:
 
