@@ -6,6 +6,9 @@ Development changes; see the [compatibility policy](docs/stability.md).
 
 ### Added
 
+- Typed `let?` blocks propagate `Either`- or `Maybe`-shaped failures through
+  explicit constructor roles and lower to checked cases; see
+  [Ergonomic syntax](docs/language/ergonomic-syntax.md#typed-fallible-blocks).
 - Pure `let { ... }` expression blocks accept sequential local bindings and a
   mandatory final expression; see [Ergonomic syntax](docs/language/ergonomic-syntax.md#pure-expression-blocks).
 - Nonempty list literals can infer an element type from their first element

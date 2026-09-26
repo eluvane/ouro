@@ -202,11 +202,57 @@ and `maybe` keep their meanings. Comments and multiline layout are allowed
 between tokens. Record literals inside a block still need the same supported
 type context as record literals elsewhere.
 
+## Typed fallible blocks
+
+```ouro
+let? (Left, Right) : Either Error Value do
+  let first : Item := loadFirst?;
+  let second : Item := loadSecond?;
+  combine first second
+end
+```
+
+`let?` is contextual syntax after `let`; `result` and `maybe` remain ordinary
+identifiers. The header gives the whole result type and names its failure and
+success constructors **in that order**. The type must be a direct application
+of a checked two-constructor inductive family. A Result-shaped family has
+`E` and `A` parameters, with one-argument failure and success constructors;
+a Maybe-shaped family has an `A` parameter, a nullary failure constructor,
+and a one-argument success constructor. The header's order defines the roles;
+the names are resolved as actual constructors, even when a local term binder
+uses the same spelling. The declared order and constructor spelling do not
+choose the roles. The checker validates their complete types and every
+expanded branch. Standard-library `Either E A`
+and `Maybe A` have these shapes; a separate `Result` type is not required.
+
+Within the block, `let x : B := e?;` evaluates `e` as the same family with
+payload `B`. Failure immediately returns the header's failure constructor;
+success binds its payload to `x` for the rest of the block. The annotation
+may be omitted when the existing bounded surface hint can identify `B` from
+`e`. An ambiguous payload needs an explicit annotation. A standalone `e?;`
+discards its successful payload. Ordinary local `let` bindings are also
+allowed. The mandatory final expression is the success payload and is wrapped
+in the header's success constructor. A final `e?` returns the checked
+container directly. There is no automatic conversion between error types.
+The bounded lowering rejects a local binding that reuses an outer type name
+referenced by the block header, avoiding capture of that type in the result.
+
+Only a postfix `?` at the root of a block binding's value, a standalone
+statement, or the final expression propagates. A `?` nested inside an
+application, lambda, `do`, or a nested block belongs to that expression's own
+boundary and does not escape into the enclosing block. Nested fallible blocks
+must state their own header. Bare `?` outside propagation and all unresolved
+named or anonymous holes remain rejected. Empty blocks, missing final
+expressions, and trailing semicolons are rejected. The block lowers to
+ordinary checked `case`, constructor applications, and local lets; it adds no
+new kernel form or effect handler.
+
 ## Integration and fixtures
 
-These forms reuse existing `DImport`, `EApp`, `EAscribe`, `ELam`, `EPi`,
-and `ELet` nodes. The formatter retains grouped imports, call spelling,
-compact local helpers, and block spelling without expanding them in source.
+Grouped imports, calls, local helpers, and pure expression blocks reuse
+existing `DImport`, `EApp`, `EAscribe`, `ELam`, `EPi`, and `ELet` nodes.
+Typed fallible blocks retain a frontend node until lowering verifies their
+constructor roles. The formatter retains their source spelling.
 The fixture inventory
 is `tests/language_ergonomics/cases.json`; it includes desugaring pairs,
 rejected forms, import graph/diagnostic cases, and formatter round trips.
@@ -215,8 +261,8 @@ rejected forms, import graph/diagnostic cases, and formatter round trips.
 ## Scope
 
 These forms add no module identity, tuple or named call syntax, implicit type
-argument inference, early return, or general effect handling. Aliases remain
-the existing flattened-namespace source rewrite. For language direction and
+argument inference, or general effect handling. Aliases remain the existing
+flattened-namespace source rewrite. For language direction and
 compatibility, see [Design](../design.md#language-direction) and
 [Stability](../stability.md#experimental-areas).
 

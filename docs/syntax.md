@@ -90,6 +90,20 @@ The block lowers to nested local `let ... in` expressions. See
 [Pure expression blocks](language/ergonomic-syntax.md#pure-expression-blocks)
 for scope and rejection rules.
 
+For a checked `Either E A` or `Maybe A` family, a typed fallible block can
+propagate a failed value while binding successful payloads:
+
+```ouro
+let? (Left, Right) : Either Error Nat do
+  let n : Nat := operation?;
+  S n
+end
+```
+
+The header identifies the actual failure and success constructors. See
+[Typed fallible blocks](language/ergonomic-syntax.md#typed-fallible-blocks)
+for payload inference, boundaries, and rejection rules.
+
 ## Inductive data and pattern matching
 
 ```ouro
