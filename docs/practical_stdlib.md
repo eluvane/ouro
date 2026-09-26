@@ -9,7 +9,8 @@ Choose a module by task; the generated [API reference](api/README.md) owns decla
 | Task | Modules |
 | --- | --- |
 | Shared types and results | `std/types.ouro`, `std/prelude.ouro`, `std/data.ouro`, `std/result.ouro` |
-| Text and numbers | `std/string.ouro`, `std/text.ouro`, `std/collections.ouro`, `std/num.ouro` |
+| Lists and iterators | `std/collections.ouro`, `std/iter.ouro` |
+| Text and numbers | `std/string.ouro`, `std/text.ouro`, `std/num.ouro` |
 | CLI and configuration | `std/args.ouro`, `std/cli.ouro`, `std/config.ouro`, `std/configx.ouro` |
 | Files and workspace | `std/fs.ouro`, `std/fsx.ouro`, `std/fs_walk.ouro`, `std/fs_replace.ouro`, `std/workspace.ouro` |
 | Data | `std/lines.ouro`, `std/json.ouro`, `std/jsonx.ouro`, `std/csv.ouro`, `std/table.ouro`, `std/tablex.ouro` |
@@ -116,6 +117,40 @@ nonadjacent occurrences. Groups follow the first appearance of each key, and
 members retain input order. `eq` must be an equivalence relation. This list
 implementation searches existing groups for each element, so worst-case work
 is quadratic in the input length.
+
+## Lazy iterators
+
+`std/iter.ouro` provides a pure pull iterator with explicit state, item, and
+error types. `iter_from_list` wraps an existing list without building another
+list. `iter_map`, `iter_filter`, and `iter_take` defer work until a pull;
+filtering a rejected item returns a skip step, so one pull never searches an
+unbounded prefix. `iter_take` counts emitted items, not skipped source steps.
+
+```ouro
+let source : Iterator (List Nat) String Nat :=
+  iter_from_list String Nat ([1, 2, 3] : List Nat) in
+let selected : Iterator (List Nat) String Nat :=
+  iter_filter (List Nat) String Nat
+  (fun (value : Nat) => eq_nat value 2) source in
+collect_list (List Nat) String Nat 4 selected
+```
+
+This returns `Right [2]`. `collect_list` requires an explicit maximum number
+of pulls and returns `Either (IterCollectError E) (List A)`. Each yield, skip,
+failure, or end observation costs one pull. Zero pulls always gives
+`IterPullLimit`, even for an empty source; a list of `n` items needs `n + 1`
+pulls to observe its end. A source failure returns `IterSourceFailure` and
+stops; a pull limit returns `IterPullLimit`. Neither returns a partial list as
+success. `iter_take 0` does not pull its upstream source, though collecting
+its own end still costs one pull. Iterators built from lists are finite, while
+a custom iterator need not be; the pull limit bounds calls to its step
+function, not the work performed inside each step.
+
+Adapters do not build intermediate lists. Materialization builds a reversed
+list and allocates another list when reversing it at completion; iterator
+wrappers and step results also allocate. Pull traversal is bounded by
+`max_pulls`, with callback and source-step costs in addition. No
+constant-allocation or automatically fused pipeline is promised.
 
 ## Numbers
 
