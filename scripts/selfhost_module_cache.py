@@ -115,6 +115,27 @@ def skip_import_alias(after: str) -> str:
     return ident[index:].lstrip()
 
 
+def _multiline_end(source: str, start: int) -> int | None:
+    body = start + 3
+    if source.startswith("\r\n", body):
+        line = body + 2
+    elif source.startswith("\n", body):
+        line = body + 1
+    else:
+        return None
+    while line < len(source):
+        quote = line
+        while quote < len(source) and source[quote] in " \t":
+            quote += 1
+        if source.startswith('"""', quote):
+            return quote + 3
+        next_line = source.find("\n", line)
+        if next_line < 0:
+            break
+        line = next_line + 1
+    return None
+
+
 def quoted_import_targets(source_text: str, source_path: str) -> list[str]:
     """Discover quoted dependencies; source acceptance remains compiler-owned."""
     tokens: list[tuple[str, str]] = []
@@ -126,6 +147,10 @@ def quoted_import_targets(source_text: str, source_path: str) -> list[str]:
         elif source_text.startswith("--", index):
             end = source_text.find("\n", index)
             index = len(source_text) if end < 0 else end + 1
+        elif source_text.startswith('"""', index):
+            close = _multiline_end(source_text, index)
+            tokens.append(("multiline" if close is not None else "unterminated", ""))
+            index = close if close is not None else len(source_text)
         elif source_text.startswith('r#"', index):
             close = source_text.find('"#', index + 3)
             if close < 0:

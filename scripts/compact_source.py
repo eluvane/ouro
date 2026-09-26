@@ -9,6 +9,27 @@ from __future__ import annotations
 KIND = "ouro.compact-source.v1"
 
 
+def _multiline_end(source: bytes, start: int) -> int:
+    body = start + 3
+    if source.startswith(b"\r\n", body):
+        line = body + 2
+    elif source.startswith(b"\n", body):
+        line = body + 1
+    else:
+        raise ValueError(f"COMPACT_SOURCE: malformed multiline string at byte {start}")
+    while line < len(source):
+        quote = line
+        while quote < len(source) and source[quote] in b" \t":
+            quote += 1
+        if source.startswith(b'"""', quote):
+            return quote + 3
+        next_line = source.find(b"\n", line)
+        if next_line < 0:
+            break
+        line = next_line + 1
+    raise ValueError(f"COMPACT_SOURCE: unterminated multiline string at byte {start}")
+
+
 def compact_source(source: bytes) -> bytes:
     """Keep literal bytes, directive comments and existing line boundaries."""
     output = bytearray()
@@ -36,7 +57,9 @@ def compact_source(source: bytes) -> bytes:
         pending = b""
         start = index
         index += 1
-        if source.startswith(b'r#"', start):
+        if source.startswith(b'"""', start):
+            index = _multiline_end(source, start)
+        elif source.startswith(b'r#"', start):
             close = source.find(b'"#', start + 3)
             if close < 0:
                 raise ValueError(f"COMPACT_SOURCE: unterminated raw string at byte {start}")

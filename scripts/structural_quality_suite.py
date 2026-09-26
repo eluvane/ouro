@@ -37,6 +37,14 @@ def mark(rule, related, category='independent-oracle'):
 
 
 class StructuralContracts(unittest.TestCase):
+    def test_dedented_multiline_is_one_opaque_ouro_token(self):
+        literal = '"""\r\n  import "fake.ouro"; -- @entry fake\r\n  mid"""line\r\n  """'
+        tokens, comments = sq.lex('def text : String := ' + literal + ';', 'ouro')
+        self.assertEqual([token.value for token in tokens if token.value == literal], [literal])
+        self.assertEqual(comments, [])
+        with self.assertRaisesRegex(ValueError, 'unclosed string'):
+            sq.lex('"""\n  missing close', 'ouro')
+
     def test_exact_and_renamed_clones(self):
         for arg in ['x', 'renamed']:
             with self.subTest(arg=arg):
