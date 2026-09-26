@@ -126,8 +126,18 @@ source, missing worker result, or inconsistent count fails the bounded runner.
 | `perf.ouro` | `analyze_perf` | `OURO-PERF001`–`005` | Cost smells of the extracted runtime: literal at or above `perf_literal_threshold` inside a fix body, `append`/`snoc`/`concat` on an accumulator parameter fed back into the recursion, `length` compared with 0/1 or scrutinised without reading the count, the same conversion of the same parameter twice on one path, `andb`/`orb` operand that nests control flow or a recursive call. |
 | `naming.ouro` | `analyze_naming`, `nm_ctor_misspelt` | `OURO-NAME001`–`004` | Conventions the other cores depend on: a `_`-spelt binder that is read (shadowing-aware), one-character definition names, a capital initial on a value definition (type-level results are exempt), and lowercase or underscore constructors, anchored at the owning `inductive` line. |
 | `errors.ouro` | `analyze_errors` | `OURO-ERR001`–`003` | Declared `Either String` result (also under `IO`), a failure arm (`Left`, `Fail`) that drops its payload and returns the paired success constructor through lets, `do`, or `io_pure`, and `io_bind` over an `Either` whose result is bound to a discard. |
+
 | `format.ouro` | `analyze`, `format` | `OURO-FMT*` | Local text formatter/checker shared with `tools/fmt.ouro`. |
 | `policy_ids.ouro`, `host.ouro` | layer predicates, exit codes | — | Layer policy shared by the cores; profile and exit-code names for the base runner. |
+
+Named-call labels are metadata, not variable reads. The analyzer traverses the
+callee and actual argument values; known primitive capability, effect, and taint
+checks still apply. `OURO-ERR003` recognizes a named `io_bind` only when its
+interned `A`, `B`, `action`, and `next` labels identify every argument exactly
+once and the callee is not locally shadowed. Other position-sensitive analyzer
+rules do not infer a declaration-order mapping for named calls. This `io_bind`
+case is an analyzer AST boundary: the current compiler rejects named calls to
+its dependent parameter domains, so it is not an accepted source example.
 
 ## Themes shared with Clippy
 

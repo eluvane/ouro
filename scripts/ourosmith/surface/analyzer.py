@@ -19,6 +19,12 @@ class Node:
                 return "([" + ", ".join(emit(item) for item in value) + "] : List Ast)"
             return str(value)
 
+        if self.tag == "ANamedCall":
+            head, rows = self.arguments
+            rendered = ", ".join(
+                f"MkPair Nat Ast {label} {emit(value)}" for label, value in rows
+            )
+            return f"ANamedCall {emit(head)} ([{rendered}] : List (Pair Nat Ast))"
         return " ".join([self.tag, *(emit(arg) for arg in self.arguments)])
 
     def nodes(self):
@@ -52,6 +58,7 @@ def ast_trees(seed):
     yield Node("APerform", (1, many))
     yield Node("ADo", (many,))
     yield Node("AList", (many,))
+    yield Node("ANamedCall", (leaf, ((seed % 7 + 1, pair), (seed % 7 + 2, leaf))))
 
 
 AST_TAGS = tuple(node.tag for node in ast_trees(1))
@@ -93,9 +100,11 @@ def rows(seed):
         ("EDo ([EDoBind 1 (ENat 2), EVar 1] : List Expr)", 4, 6),
         ("EHandle (EVar 1) ([MkPair Nat (Pair (List Nat) Expr) 2 (MkPair (List Nat) Expr (Nil Nat) (EVar 3))] : List (Pair Nat (Pair (List Nat) Expr)))", 3, 5),
         ("EMultiMatch ([EVar 1, EVar 2] : List Expr) ([MkPair (List (Pair Nat (List Nat))) Expr ([MkPair Nat (List Nat) 3 (Nil Nat)] : List (Pair Nat (List Nat))) (EVar 4)] : List (Pair (List (Pair Nat (List Nat))) Expr))", 4, 7),
+        ("ENamedCall (EVar 1) ([MkPair Nat Expr 5 (ENat 2)] : List (Pair Nat Expr))", 3, 3),
     ):
         yield f"show_nat (adapt_size ({expression}))", str(size)
         yield f"show_nat (ast_size (adapt ({expression})))", str(adapted_size)
+    yield "show_bool (alpha_eq (ANamedCall (AVar 1) ([MkPair Nat Ast 2 (ANatLit 3)] : List (Pair Nat Ast))) (ANamedCall (AVar 1) ([MkPair Nat Ast 4 (ANatLit 3)] : List (Pair Nat Ast))))", "false"
 
 
 def run_checks(run, directory, saved=None):

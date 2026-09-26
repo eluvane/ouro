@@ -14,25 +14,29 @@ import "../../std/data.ouro",
 -- Either, String, IO, io_bind, io_pure, and the failure/success constructor
 -- pairs (Left/Right, Fail/Ok); a missing name is Z and matches nothing.
 inductive ErrIds : Type :=
-  | MkErrIds : Nat -> Nat -> Nat -> Nat -> Nat -> List (Pair Nat Nat) -> ErrIds;
+  | MkErrIds : Nat -> Nat -> Nat -> Nat -> Nat -> List (Pair Nat Nat)
+      -> List Nat -> ErrIds;
 
 def errh_either (i : ErrIds) : Nat :=
-    match i with | MkErrIds e _ _ _ _ _ => e end;
+    match i with | MkErrIds e _ _ _ _ _ _ => e end;
 
 def errh_string (i : ErrIds) : Nat :=
-    match i with | MkErrIds _ s _ _ _ _ => s end;
+    match i with | MkErrIds _ s _ _ _ _ _ => s end;
 
 def errh_io (i : ErrIds) : Nat :=
-    match i with | MkErrIds _ _ io _ _ _ => io end;
+    match i with | MkErrIds _ _ io _ _ _ _ => io end;
 
 def errh_bind (i : ErrIds) : Nat :=
-    match i with | MkErrIds _ _ _ b _ _ => b end;
+    match i with | MkErrIds _ _ _ b _ _ _ => b end;
 
 def errh_pure (i : ErrIds) : Nat :=
-    match i with | MkErrIds _ _ _ _ p _ => p end;
+    match i with | MkErrIds _ _ _ _ p _ _ => p end;
 
 def errh_pairs (i : ErrIds) : List (Pair Nat Nat) :=
-    match i with | MkErrIds _ _ _ _ _ ps => ps end;
+    match i with | MkErrIds _ _ _ _ _ ps _ => ps end;
+
+def errh_bind_labels (i : ErrIds) : List Nat :=
+    match i with | MkErrIds _ _ _ _ _ _ labels => labels end;
 
 -- result type is Either String (Z); failure arm drops its payload and
 -- returns the success constructor (failure, success); io_bind over an Either
@@ -152,6 +156,7 @@ def errh_result_head (ids : ErrIds) : Ast -> Nat :=
           | AClause _ _ _ _ => Z
           | ANoClause => Z
           | AList _ => Z
+          | ANamedCall _ _ => Z
           end
       end) (ast_size root) root;
 
@@ -242,6 +247,7 @@ def errh_bind_issue (ids : ErrIds) (discards : List Nat) (a : Ast) : List ErrIss
                         | ANoClause => errh_inil
                         | ADo _ => errh_inil
                         | AList _ => errh_inil
+                        | ANamedCall _ _ => errh_inil
                         end
                     end
                 end
@@ -249,7 +255,88 @@ def errh_bind_issue (ids : ErrIds) (discards : List Nat) (a : Ast) : List ErrIss
         end
     end;
 
-def errh_node_issues (ids : ErrIds) (discards : List Nat) (a : Ast) : List ErrIssue :=
+def errh_ordered_rows : List Nat -> List (Pair Nat Ast) -> Maybe (List Ast) :=
+  fix errh_ordered_rows (labels : List Nat) (seen : List (Pair Nat Ast))
+      : Maybe (List Ast) :=
+    match labels with
+    | Nil => Just(List Ast, Nil Ast)
+    | Cons label rest =>
+        match lookup Nat Ast eq_nat label seen with
+        | Nothing => Nothing (List Ast)
+        | Just value =>
+            match errh_ordered_rows rest seen with
+            | Nothing => Nothing (List Ast)
+            | Just tail => Just(List Ast, Cons Ast value tail)
+            end
+        end
+    end;
+
+-- This rule knows io_bind's four public labels. The analyzer never treats an
+-- arbitrary named-call source order as a positional argument order.
+def errh_named_rows (labels : List Nat) : List (Pair Nat Ast)
+    -> Maybe (List Ast) :=
+  fun (initial_rows : List (Pair Nat Ast)) =>
+  (fix go (rows : List (Pair Nat Ast)) (position : Nat) (named : Bool)
+      (seen : List (Pair Nat Ast)) : Maybe (List Ast) :=
+    match rows with
+    | Nil => errh_ordered_rows labels seen
+    | Cons row rest =>
+        match row with
+        | MkPair label value =>
+            let target : Nat :=
+              match label with
+              | Z => match andb (notb named) (ltb_nat position errh_four) with
+                  | True => nth Nat Z position labels
+                  | False => Z
+                  end
+              | S _ => match mem Nat eq_nat label labels with
+                  | True => label
+                  | False => Z
+                  end
+              end in
+            match target with
+            | Z => Nothing (List Ast)
+            | S _ =>
+                match lookup Nat Ast eq_nat target seen with
+                | Just _ => Nothing (List Ast)
+                | Nothing => go rest
+                    (match label with | Z => S position | S _ => position end)
+                    (orb named (notb(eq_nat label Z)))
+                    (Cons(Pair Nat Ast, MkPair Nat Ast target value, seen))
+                end
+            end
+        end
+    end) initial_rows Z False (Nil (Pair Nat Ast));
+
+def errh_named_bind_issue (ids : ErrIds) (discards : List Nat)
+    (bound : List Nat) (head : Ast) (rows : List (Pair Nat Ast))
+    : List ErrIssue :=
+    let labels : List Nat := errh_bind_labels ids in
+    let valid : Bool := andb (eq_nat(length Nat labels, errh_four))
+      (andb (all Nat (fun (id : Nat) => notb(eq_nat id Z)) labels)
+        (eq_nat(length Nat (nub Nat eq_nat labels), errh_four))) in
+    match andb valid (notb(mem Nat eq_nat (errh_bind ids) bound)) with
+    | False => errh_inil
+    | True =>
+        match ast_app_head head with
+        | Nothing => errh_inil
+        | Just callee =>
+          match andb(notb(eq_nat callee Z), eq_nat callee (errh_bind ids)) with
+          | False => errh_inil
+          | True =>
+            match errh_named_rows labels rows with
+            | Nothing => errh_inil
+            | Just ordered =>
+                errh_bind_issue ids discards
+                  (foldl Ast Ast (fun (f : Ast) (arg : Ast) => AApp f arg)
+                    head ordered)
+            end
+          end
+        end
+    end;
+
+def errh_node_issues (ids : ErrIds) (discards : List Nat)
+    (bound : List Nat) (a : Ast) : List ErrIssue :=
     match a with
     | AMatch _ branches => errh_match_issues ids discards branches
     | AApp _ _ => errh_bind_issue ids discards a
@@ -273,18 +360,65 @@ def errh_node_issues (ids : ErrIds) (discards : List Nat) (a : Ast) : List ErrIs
     | ANoClause => errh_inil
     | ADo _ => errh_inil
     | AList _ => errh_inil
+    | ANamedCall head rows => errh_named_bind_issue ids discards bound head rows
     end;
 
 def errh_walk (ids : ErrIds) (discards : List Nat) : Ast -> List ErrIssue :=
   fun (root : Ast) =>
-    (fix errh_walk (fuel : Nat) (a : Ast) : List ErrIssue :=
+    (fix errh_walk (fuel : Nat) (a : Ast) (bound : List Nat) : List ErrIssue :=
       match fuel with
       | Z => errh_inil
       | S remaining =>
-          let descend (child : Ast) : List ErrIssue := errh_walk remaining child in
-          errh_append (errh_node_issues ids discards a)
-            (concat_map Ast ErrIssue descend (ast_children a))
-      end) (ast_size root) root;
+          let descend (child : Ast) (names : List Nat) : List ErrIssue :=
+            errh_walk remaining child names in
+          let children : List ErrIssue :=
+            match a with
+            | ALam id ann body =>
+                errh_append(descend ann bound, descend body (Cons Nat id bound))
+            | APi id dom cod =>
+                errh_append(descend dom bound, descend cod (Cons Nat id bound))
+            | ALet id ann value body =>
+                errh_append(descend ann bound,
+                  errh_append(descend value bound, descend body (Cons Nat id bound)))
+            | ABinder id ty rest =>
+                errh_append(descend ty bound, descend rest (Cons Nat id bound))
+            | AFix id binders ret body =>
+                let scoped : List Nat :=
+                  append Nat (ast_binder_ids binders) (Cons Nat id bound) in
+                errh_append(descend binders (Cons Nat id bound),
+                  errh_append(descend ret scoped, descend body scoped))
+            | ABranch _ names body rest =>
+                errh_append(descend body (append Nat names bound), descend rest bound)
+            | AClause _ names body rest =>
+                errh_append(descend body (append Nat names bound), descend rest bound)
+            | AVar _ => errh_inil
+            | AHole _ => errh_inil
+            | ASort _ => errh_inil
+            | ANatLit _ => errh_inil
+            | AStr _ => errh_inil
+            | ANoBinder => errh_inil
+            | ANoBranch => errh_inil
+            | ANoClause => errh_inil
+            | AApp _ _ => concat_map Ast ErrIssue
+                (fun (child : Ast) => descend child bound) (ast_children a)
+            | AAscribe _ _ => concat_map Ast ErrIssue
+                (fun (child : Ast) => descend child bound) (ast_children a)
+            | AMatch _ _ => concat_map Ast ErrIssue
+                (fun (child : Ast) => descend child bound) (ast_children a)
+            | APerform _ _ => concat_map Ast ErrIssue
+                (fun (child : Ast) => descend child bound) (ast_children a)
+            | AHandle _ _ => concat_map Ast ErrIssue
+                (fun (child : Ast) => descend child bound) (ast_children a)
+            | ADo _ => concat_map Ast ErrIssue
+                (fun (child : Ast) => descend child bound) (ast_children a)
+            | AList _ => concat_map Ast ErrIssue
+                (fun (child : Ast) => descend child bound) (ast_children a)
+            | ANamedCall _ _ => concat_map Ast ErrIssue
+                (fun (child : Ast) => descend child bound) (ast_children a)
+            end in
+          let here : List ErrIssue := errh_node_issues ids discards bound a in
+          errh_append here children
+      end) (ast_size root) root (Nil Nat);
 
 -- discards: ids whose source spelling starts with `_`.
 def analyze_errors (ids : ErrIds) (discards : List Nat) (a : Ast) : List ErrIssue :=
