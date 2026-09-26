@@ -189,6 +189,17 @@ class RepositorySourceContracts(unittest.TestCase):
         self.assertIn("std/json.ouro", units)
         self.assertNotIn("compiler/base.ouro", units)
 
+    def test_analyzer_closure_has_unique_declaration_names(self):
+        from selfhost_module_cache import declaration_names
+
+        owners = {}
+        for unit in frontend.collect_units("tools/analyze/main.ouro"):
+            for declaration in declaration_names(unit):
+                _kind, name = declaration.split(":", 1)
+                owners.setdefault(name, []).append(unit)
+        self.assertEqual({}, {name: units for name, units in owners.items()
+                              if len(units) > 1})
+
 
 class BuildContracts(unittest.TestCase):
     def setUp(self):
