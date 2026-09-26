@@ -183,6 +183,13 @@ class SourceContracts(unittest.TestCase):
         self.assertEqual(frontend.ouro1_cmd(script), [sys.executable, str(script)])
 
 
+class RepositorySourceContracts(unittest.TestCase):
+    def test_lint_style_cone_keeps_compiler_base_out(self):
+        units = frontend.collect_units("tools/lint_style.ouro")
+        self.assertIn("std/json.ouro", units)
+        self.assertNotIn("compiler/base.ouro", units)
+
+
 class BuildContracts(unittest.TestCase):
     def setUp(self):
         self.stack = ExitStack()
