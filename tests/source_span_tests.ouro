@@ -398,63 +398,79 @@ def ss_reparses (fuel : Nat) (tokens : List Token) (first : Nat) (past : Nat) (i
           (source_bytes_equal(ss_expr(e, Nil Nat), ss_expr(strip_spans inner, Nil Nat)))
     end;
 
--- Byte slices of all spans, or Nothing when lexing or parsing fails, or a
--- range is not nested in its parent, has no byte position, is not exact, or
--- does not reparse to its expression.
-def ss_slices_codes (codes : List Nat) : Maybe (List String) :=
+-- Check each span before folding its exact byte slice. The fold consumes one
+-- slice at a time so whole-file checks do not retain every slice in memory.
+def ss_fold_slices_codes (A : Type) (codes : List Nat)
+    (step : String -> A -> A) (initial : A) : Maybe A :=
     let fuel : Nat := ss_fuel codes in
     let text : String := prim_string_of_char_codes codes in
     let lexed : LexSpanned := lex_spanned fuel codes empty_intern in
     match lex_spanned_result lexed with
-    | LexMalformed _ => Nothing (List String)
-    | LexExhausted _ => Nothing (List String)
+    | LexMalformed _ => Nothing A
+    | LexExhausted _ => Nothing A
     | LexOk tokens _ =>
         match parse_file parse_spanned fuel tokens 0 with
-        | PErr _ => Nothing (List String)
+        | PErr _ => Nothing A
         | POk decls _ _ =>
             let count : Nat := length Token tokens in
             let ranges : List SsRange :=
               foldl Decl (List SsRange) (fun (acc : List SsRange) (d : Decl) => ss_decl_ranges count d acc)
                 (Nil SsRange) decls in
-            (fix go (rs : List SsRange) : Maybe (List String) :=
+            (fix go (rs : List SsRange) (acc : A) : Maybe A :=
               match rs with
-              | Nil => Just(List String, Nil String)
+              | Nil => Just(A, acc)
               | Cons r rest =>
                   match r with
                   | MkSsRange first past nested inner =>
                       match andb(andb(nested, ltb_nat past count), ss_reparses fuel tokens first past inner) with
-                      | False => Nothing (List String)
+                      | False => Nothing A
                       | True =>
                           match token_span_bytes (lex_spanned_tokens lexed) first past with
-                          | Nothing => Nothing (List String)
+                          | Nothing => Nothing A
                           | Just bytes =>
                               match bytes with
-                              | MkPair start stop =>
+                              | MkPair first_byte past_byte =>
                                   match ss_exact_slice tokens first past
-                                      (take(Nat, sub stop start, drop Nat start codes)) with
-                                  | False => Nothing (List String)
-                                  | True =>
-                                      match go rest with
-                                      | Nothing => Nothing (List String)
-                                      | Just more => Just (List String)
-                                          (Cons String (prim_string_slice text start (sub stop start)) more)
-                                      end
+                                      (take(Nat, sub past_byte first_byte, drop Nat first_byte codes)) with
+                                  | False => Nothing A
+                                  | True => go rest
+                                      (step (prim_string_slice text first_byte (sub past_byte first_byte)) acc)
                                   end
                               end
                           end
                       end
                   end
-              end) ranges
+              end) ranges initial
         end
+    end;
+
+-- Byte slices of all spans, or Nothing when any check above fails.
+def ss_slices_codes (codes : List Nat) : Maybe (List String) :=
+    match ss_fold_slices_codes (List String) codes
+        (fun (slice : String) (rev : List String) => Cons String slice rev) (Nil String) with
+    | Nothing => Nothing (List String)
+    | Just rev => Just(List String, reverse String rev)
     end;
 
 def ss_slices (text : String) : Maybe (List String) :=
     ss_slices_codes (prim_string_to_char_codes text);
 
 def ss_well_formed_codes (codes : List Nat) : Bool :=
-    match ss_slices_codes codes with
+    match ss_fold_slices_codes Bool codes
+        (fun (slice : String) (ok : Bool) => andb(ss_trimmed slice, ok)) True with
     | Nothing => False
-    | Just slices => all String ss_trimmed slices
+    | Just ok => ok
+    end;
+
+def ss_stream_agrees_with_slices (text : String) : Bool :=
+    let codes : List Nat := prim_string_to_char_codes text in
+    let collected : Bool := match ss_slices_codes codes with
+      | Nothing => False
+      | Just slices => all String ss_trimmed slices
+      end in
+    match ss_well_formed_codes codes with
+    | True => collected
+    | False => notb collected
     end;
 
 -- Well-formed spans that include every expected slice and none of the absent ones.
@@ -506,6 +522,7 @@ def ss_samples : List String :=
 
 def ss_laws : List (Pair String Bool) :=
     [ MkPair String Bool "agree/samples" (all String ss_agrees ss_samples)
+    , MkPair String Bool "spans/stream-equals-collected" (all String ss_stream_agrees_with_slices ss_samples)
     , MkPair String Bool "parse/valid-samples-parse"
         (all String ss_parses (take String 18 ss_samples))
     , MkPair String Bool "parse/malformed-samples-fail"
