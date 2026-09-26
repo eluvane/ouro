@@ -34,6 +34,8 @@ When a qualified reference resolves to a global name also used by a lexical
 binder, the module pass interns a distinct binder ID before lowering. It
 rewrites bound uses with that ID and keeps the qualified reference attached to
 the global declaration.
+The direct declaration compiler rejects any residual expression-level `open`
+before desugaring or lowering; only module resolution may erase that scope.
 
 The declaration plan derives definition membership from its supplied name
 list using the existing numeric-name index. Filtering retains core order,

@@ -726,6 +726,142 @@ def first_unresolved_import : List Decl -> Maybe Nat :=
       | DIntrinsic _ _ _ _ => scan rest | DExtern _ _ _ => scan rest
       | DRepresentation _ _ => scan rest end end;
 
+def first_residual_open (left : Maybe Nat) (right : Maybe Nat)
+    : Maybe Nat :=
+  match left with
+  | Just alias => Just Nat alias
+  | Nothing => right
+  end;
+
+def first_residual_open_expr : Expr -> Maybe Nat :=
+  fix go (expr : Expr) : Maybe Nat :=
+    match expr with
+    | EOpen alias _ => Just Nat alias
+    | EVar _ => Nothing Nat
+    | EHole _ => Nothing Nat
+    | ESort _ => Nothing Nat
+    | ENat _ => Nothing Nat
+    | EStr _ => Nothing Nat
+    | ENoBranch => Nothing Nat
+    | ENoBinder => Nothing Nat
+    | EApp function argument =>
+        first_residual_open (go function) (go argument)
+    | ELam _ annotation body =>
+        first_residual_open
+          (match annotation with
+           | Nothing => Nothing Nat
+           | Just typ => go typ
+           end) (go body)
+    | EPi _ domain codomain =>
+        first_residual_open (go domain) (go codomain)
+    | ELet _ annotation value body =>
+        first_residual_open
+          (match annotation with
+           | Nothing => Nothing Nat
+           | Just typ => go typ
+           end)
+          (first_residual_open (go value) (go body))
+    | EAscribe value typ =>
+        first_residual_open (go value) (go typ)
+    | EMatch scrutinee branches =>
+        first_residual_open (go scrutinee) (go branches)
+    | EFix _ binders result body =>
+        first_residual_open (go binders)
+          (first_residual_open (go result) (go body))
+    | EEffectRow typ _ => go typ
+    | EPerform _ arguments =>
+        (fix scan (items : List Expr) : Maybe Nat :=
+          match items with
+          | Nil => Nothing Nat
+          | Cons item rest => first_residual_open (go item) (scan rest)
+          end) arguments
+    | EDo items =>
+        (fix scan (pending : List Expr) : Maybe Nat :=
+          match pending with
+          | Nil => Nothing Nat
+          | Cons item rest => first_residual_open (go item) (scan rest)
+          end) items
+    | EList items =>
+        (fix scan (pending : List Expr) : Maybe Nat :=
+          match pending with
+          | Nil => Nothing Nat
+          | Cons item rest => first_residual_open (go item) (scan rest)
+          end) items
+    | EHandle computation clauses =>
+        first_residual_open (go computation)
+          ((fix scan (pending : List (Pair Nat (Pair (List Nat) Expr)))
+              : Maybe Nat :=
+            match pending with
+            | Nil => Nothing Nat
+            | Cons clause rest => match clause with
+              | MkPair _ payload => match payload with
+                | MkPair _ body => first_residual_open (go body) (scan rest)
+                end
+              end
+            end) clauses)
+    | EBranch _ body rest =>
+        first_residual_open (go body) (go rest)
+    | EBinder _ typ rest =>
+        first_residual_open (go typ) (go rest)
+    | EMultiMatch scrutinees rows =>
+        first_residual_open
+          ((fix scan (pending : List Expr) : Maybe Nat :=
+            match pending with
+            | Nil => Nothing Nat
+            | Cons item rest => first_residual_open (go item) (scan rest)
+            end) scrutinees)
+          ((fix scan (pending : List (Pair (List (Pair Nat (List Nat))) Expr))
+              : Maybe Nat :=
+            match pending with
+            | Nil => Nothing Nat
+            | Cons row rest => match row with
+              | MkPair _ body => first_residual_open (go body) (scan rest)
+              end
+            end) rows)
+    | EDoBind _ action => go action
+    | ESpan _ _ inner => go inner
+    end;
+
+def first_residual_open_fields : List (Pair Nat Expr) -> Maybe Nat :=
+  fix scan (fields : List (Pair Nat Expr)) : Maybe Nat :=
+    match fields with
+    | Nil => Nothing Nat
+    | Cons field rest => match field with
+      | MkPair _ typ =>
+          first_residual_open (first_residual_open_expr typ) (scan rest)
+      end
+    end;
+
+def first_residual_open_decls : List Decl -> Maybe Nat :=
+  fix scan (decls : List Decl) : Maybe Nat :=
+    match decls with
+    | Nil => Nothing Nat
+    | Cons decl rest =>
+        let here : Maybe Nat := match decl with
+          | DDef _ typ body =>
+              first_residual_open (first_residual_open_expr typ)
+                (first_residual_open_expr body)
+          | DAxiom _ typ => first_residual_open_expr typ
+          | DInductive _ params family constructors =>
+              first_residual_open (first_residual_open_fields params)
+                (first_residual_open (first_residual_open_expr family)
+                  (first_residual_open_fields constructors))
+          | DEffect _ params operations =>
+              first_residual_open (first_residual_open_fields params)
+                (first_residual_open_fields operations)
+          | DIntrinsic _ typ _ implementation =>
+              first_residual_open (first_residual_open_expr typ)
+                (match implementation with
+                 | Nothing => Nothing Nat
+                 | Just body => first_residual_open_expr body
+                 end)
+          | DExtern _ typ _ => first_residual_open_expr typ
+          | DImport _ => Nothing Nat
+          | DRepresentation _ _ => Nothing Nat
+          end in
+        first_residual_open here (scan rest)
+    end;
+
 -- Canonical stitch: desugar matches, collect env, lower, rewrite dummy
 -- anns, compile_program, fuel32 fallback to elaborate_surfaces, then check the
 -- ordered declaration plan against the exact emitted bodies.
@@ -742,6 +878,9 @@ def compile_checked_from_decls
     match first_unresolved_import ds with
     | Just path => CErr(CheckedProgram, ErrCode 92 path)
     | Nothing =>
+        match first_residual_open_decls ds with
+        | Just alias => CErr(CheckedProgram, ErrCode 98 alias)
+        | Nothing =>
         let ds1 : List Decl := desugar_file ds in
         let base_env : LowerEnv := collect_lower_env_from st ds1 in
         let ds2 : List Decl := rewrite_declarations fuel base_env ds1 in
@@ -753,6 +892,7 @@ def compile_checked_from_decls
         | COk cores =>
             check_emitted_decls check_module lower_expr_env2 elaborate
               selected fuel st env ds2 cores
+        end
         end
     end;
 
