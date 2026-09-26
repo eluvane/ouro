@@ -6,7 +6,8 @@ import "../std/test.ouro",
 def record_test_preprocess (reg : RecReg) (source : List Nat)
     : Pair RecReg PrepResult :=
   match preprocess_records_reg (Nil Nat)
-      (MkImpReg (Nil (List Nat)) (Nil (Pair (List Nat) (List Nat))))
+      (MkImpReg (Nil (List Nat)) (Nil (Pair (List Nat) (List Nat)))
+        (Nil ImpRule))
       reg source with
   | MkPair next tagged => match tagged with
     | MkPair _ result => MkPair RecReg PrepResult next result
@@ -15,7 +16,8 @@ def record_test_preprocess (reg : RecReg) (source : List Nat)
 
 def record_test_type_to_rec (reg : RecReg) (source : List Nat) : Maybe Nat :=
   type_to_rec reg (Nil Nat)
-    (MkImpReg (Nil (List Nat)) (Nil (Pair (List Nat) (List Nat))))
+    (MkImpReg (Nil (List Nat)) (Nil (Pair (List Nat) (List Nat)))
+      (Nil ImpRule))
     source;
 
 def record_test_split (parts : Pair (List Nat) (List Nat)) : String :=
@@ -33,6 +35,11 @@ def record_test_fields : List RecField :=
     [ MkRecField(str_codes "x", str_codes "Nat")
     , MkRecField(str_codes "flag", str_codes "Bool")
     ];
+
+def record_test_info (owner : List Nat) (name : List Nat)
+    (ctor : List Nat) (fields : List RecField) : RecInfo :=
+  MkRecInfo owner name ctor fields
+    empty_rec_owner_scope;
 
 def record_test_count (needle : List Nat) : List Nat -> Nat :=
   fix record_test_count (xs : List Nat) : Nat :=
@@ -66,7 +73,7 @@ def record_test_comment_metadata : Bool :=
   | RecPErr _ => False
   | RecPOk info sort _ =>
       match info with
-      | MkRecInfo _ _ _ fields =>
+      | MkRecInfo _ _ _ fields _ =>
           match fields with
           | Nil => False
           | Cons field _ =>
@@ -80,17 +87,17 @@ def record_test_comment_metadata : Bool :=
   end;
 
 def record_test_registry : RecReg := MkRecReg(0,
-  [MkRecInfo(Nil Nat, str_codes "Point", str_codes "MkPoint", record_test_fields)],
+  [record_test_info(Nil Nat, str_codes "Point", str_codes "MkPoint", record_test_fields)],
   [], []);
 
 def record_test_nested_registry : RecReg := MkRecReg(0,
-  [ MkRecInfo(Nil Nat, str_codes "Address", str_codes "MkAddress",
+  [ record_test_info(Nil Nat, str_codes "Address", str_codes "MkAddress",
       [MkRecField(str_codes "city", str_codes "Nat"),
        MkRecField(str_codes "zip", str_codes "Nat")])
-  , MkRecInfo(Nil Nat, str_codes "User", str_codes "MkUser",
+  , record_test_info(Nil Nat, str_codes "User", str_codes "MkUser",
       [MkRecField(str_codes "address", str_codes "Address -- type\n"),
        MkRecField(str_codes "age", str_codes "Nat")])
-  , MkRecInfo(Nil Nat, str_codes "Other", str_codes "MkOther",
+  , record_test_info(Nil Nat, str_codes "Other", str_codes "MkOther",
       [MkRecField(str_codes "city", str_codes "Nat")])
   ], [], []);
 
@@ -196,14 +203,33 @@ def record_test_update_lowering : Bool :=
       end
   end;
 
+def record_test_has_type_grant (marker : List Nat) (owner : List Nat)
+    (atom : List Nat) : List ImpRule -> Bool :=
+  fix go (rules : List ImpRule) : Bool :=
+    match rules with
+    | Nil => False
+    | Cons rule rest => match rule with
+      | ImpFieldTypeGrant emitted path original =>
+          orb(andb(source_bytes_equal emitted marker,
+            andb(source_bytes_equal path owner,
+              source_bytes_equal original atom)), go rest)
+      | ImpPlain _ => go rest
+      | ImpSelected _ _ => go rest
+      | ImpRecordGrant _ _ _ => go rest
+      end
+    end;
+
 def record_test_imported_updates : Bool :=
   let owner : List Nat := str_codes "a.ouro" in
+  let outer_marker : List Nat := str_codes "_ouro_t_1_0@t0" in
+  let inner_marker : List Nat := str_codes "_ouro_t_0_0@t0" in
   let aliases : ImpReg := MkImpReg [str_codes "A"]
-    [MkPair (List Nat) (List Nat) (str_codes "A") owner] in
+    [MkPair (List Nat) (List Nat) (str_codes "A") owner]
+    (Nil ImpRule) in
   let registry : RecReg := MkRecReg 0
-    [ MkRecInfo owner (str_codes "Inner") (str_codes "MkInner")
+    [ record_test_info owner (str_codes "Inner") (str_codes "MkInner")
         [MkRecField (str_codes "x") (str_codes "Nat")]
-    , MkRecInfo owner (str_codes "Outer") (str_codes "MkOuter")
+    , record_test_info owner (str_codes "Outer") (str_codes "MkOuter")
         [MkRecField (str_codes "inner") (str_codes "Inner")]
     ] [] [MkRecBind (str_codes "outer") 1 owner,
       MkRecBind (str_codes "inner") 0 owner] in
@@ -211,47 +237,65 @@ def record_test_imported_updates : Bool :=
     match preprocess_records_reg (str_codes "main.ouro") aliases registry
         (str_codes "def result : A@Outer := { A@outer with inner := rhs };") with
     | MkPair _ tagged => match tagged with
-      | MkPair _ result => match result with
+      | MkPair granted result => match result with
         | PrepErr _ _ => False
-        | PrepOk output => andb
-            (notb (eqNat (record_test_count (str_codes "A@Inner") output) Z))
-            (notb (eqNat (record_test_count (str_codes "A@MkOuter") output) Z))
+        | PrepOk output => match granted with
+          | MkImpReg _ _ rules =>
+              andb(record_atom_present outer_marker output,
+                andb(record_test_has_type_grant outer_marker owner
+                    (str_codes "Inner") rules,
+                  andb(notb(record_atom_present (str_codes "A@Inner") output),
+                    record_atom_present (str_codes "A@MkOuter") output)))
+          end
         end
       end
     end in
-  let rejected : Bool :=
+  let atomic : Bool :=
     match preprocess_records_reg (str_codes "main.ouro") aliases registry
         (str_codes "def result : A@Inner := { A@inner with x := rhs };") with
     | MkPair _ tagged => match tagged with
-      | MkPair _ result => match result with
-        | PrepErr code _ => eqNat code rec_code_need_ty
-        | PrepOk _ => False
+      | MkPair granted result => match result with
+        | PrepErr _ _ => False
+        | PrepOk output => match granted with
+          | MkImpReg _ _ rules =>
+              andb(record_atom_present inner_marker output,
+                record_test_has_type_grant inner_marker owner
+                  (str_codes "Nat") rules)
+          end
         end
       end
     end in
-  andb accepted rejected;
+  andb accepted atomic;
 
 def record_test_foreign_field_alias : Bool :=
   let root : List Nat := str_codes "main.ouro" in
   let owner : List Nat := str_codes "b.ouro" in
+  let marker : List Nat := str_codes "_ouro_t_2_0@t0" in
   let aliases : ImpReg := MkImpReg [str_codes "B", str_codes "C"]
     [MkPair (List Nat) (List Nat) (str_codes "B") owner,
-     MkPair (List Nat) (List Nat) (str_codes "C") (str_codes "wrong.ouro")] in
+     MkPair (List Nat) (List Nat) (str_codes "C") (str_codes "wrong.ouro")]
+    (Nil ImpRule) in
   let registry : RecReg := MkRecReg 0
-    [ MkRecInfo (str_codes "right.ouro") (str_codes "Inner")
+    [ record_test_info (str_codes "right.ouro") (str_codes "Inner")
         (str_codes "MkInner") [MkRecField (str_codes "x") (str_codes "Nat")]
-    , MkRecInfo (str_codes "wrong.ouro") (str_codes "Inner")
+    , record_test_info (str_codes "wrong.ouro") (str_codes "Inner")
         (str_codes "MkInner") [MkRecField (str_codes "x") (str_codes "Nat")]
-    , MkRecInfo owner (str_codes "Outer") (str_codes "MkOuter")
+    , record_test_info owner (str_codes "Outer") (str_codes "MkOuter")
         [MkRecField (str_codes "inner") (str_codes "C@Inner")]
     ] [] [MkRecBind (str_codes "outer") 2 owner] in
   let direct : Bool :=
     match preprocess_records_reg root aliases registry (str_codes
         "def result : B@Outer := { B@outer with inner := rhs };") with
     | MkPair _ tagged => match tagged with
-      | MkPair _ result => match result with
-        | PrepErr code _ => eqNat code rec_code_need_ty
-        | PrepOk _ => False
+      | MkPair granted result => match result with
+        | PrepErr _ _ => False
+        | PrepOk output => match granted with
+          | MkImpReg _ _ rules =>
+              andb(record_atom_present marker output,
+                andb(record_test_has_type_grant marker owner
+                    (str_codes "C@Inner") rules,
+                  notb(record_atom_present (str_codes "C@Inner") output)))
+          end
         end
       end
     end in
@@ -267,27 +311,135 @@ def record_test_foreign_field_alias : Bool :=
     end in
   andb direct nested;
 
+def record_test_owner_nominal_binding : Bool :=
+  let owner : List Nat := str_codes "a.ouro" in
+  let right : List Nat := str_codes "b.ouro" in
+  let wrong : List Nat := str_codes "c.ouro" in
+  let inner : List Nat := str_codes "Inner" in
+  let registry : RecReg := MkRecReg 0
+    [ record_test_info right inner (str_codes "MkRight")
+        [MkRecField (str_codes "x") (str_codes "Nat")]
+    , record_test_info wrong inner (str_codes "MkWrong")
+        [MkRecField (str_codes "x") (str_codes "Nat")]
+    , record_test_info owner inner (str_codes "MkLocal")
+        [MkRecField (str_codes "x") (str_codes "Nat")]
+    ] [] [] in
+  let qualified_imports : ImpReg := MkImpReg [str_codes "C"]
+    [MkPair (List Nat) (List Nat) (str_codes "C") right]
+    [ImpSelected right [MkImportSelector inner inner]] in
+  let selected_imports : ImpReg := MkImpReg [] []
+    [ImpSelected right [MkImportSelector inner (str_codes "Small")]] in
+  let plain_imports : ImpReg := MkImpReg [] [] [ImpPlain right] in
+  let ambiguous_imports : ImpReg := MkImpReg [] []
+    [ImpPlain right, ImpPlain wrong] in
+  let hidden_imports : ImpReg := MkImpReg [] []
+    [ImpSelected right []] in
+  let qualified : RecInfo := MkRecInfo owner (str_codes "Outer")
+    (str_codes "MkOuter") []
+    (MkRecOwnerScope qualified_imports (Nil (List Nat))) in
+  let selected : RecInfo := MkRecInfo owner (str_codes "Outer")
+    (str_codes "MkOuter") []
+    (MkRecOwnerScope selected_imports (Nil (List Nat))) in
+  let plain : RecInfo := MkRecInfo owner (str_codes "Outer")
+    (str_codes "MkOuter") []
+    (MkRecOwnerScope plain_imports (Nil (List Nat))) in
+  let ambiguous : RecInfo := MkRecInfo owner (str_codes "Outer")
+    (str_codes "MkOuter") []
+    (MkRecOwnerScope ambiguous_imports (Nil (List Nat))) in
+  let hidden : RecInfo := MkRecInfo owner (str_codes "Outer")
+    (str_codes "MkOuter") []
+    (MkRecOwnerScope hidden_imports (Nil (List Nat))) in
+  let shadowed : RecInfo := MkRecInfo owner (str_codes "Outer")
+    (str_codes "MkOuter") []
+    (MkRecOwnerScope plain_imports [inner]) in
+  let imported : RecReg := MkRecReg 0
+    [ record_test_info right inner (str_codes "MkRight") []
+    , record_test_info wrong inner (str_codes "MkWrong") []
+    ] [] [] in
+  andb (match record_field_type_to_rec registry qualified
+      (str_codes "C@Inner") with
+    | Just index => eqNat index 0
+    | Nothing => False end)
+    (andb (match record_field_type_to_rec imported selected
+        (str_codes "Small") with
+      | Just index => eqNat index 0
+      | Nothing => False end)
+      (andb (match record_field_type_to_rec imported plain inner with
+        | Just index => eqNat index 0
+        | Nothing => False end)
+        (andb (match record_field_type_to_rec registry plain inner with
+          | Just index => eqNat index 2
+          | Nothing => False end)
+          (andb (match record_field_type_to_rec imported ambiguous inner with
+            | Nothing => True
+            | Just _ => False end)
+            (andb (match record_field_type_to_rec imported hidden inner with
+              | Nothing => True
+              | Just _ => False end)
+              (match record_field_type_to_rec imported shadowed inner with
+                | Nothing => True
+                | Just _ => False end))))));
+
+def record_test_field_type_grant : Bool :=
+  let owner : List Nat := str_codes "a.ouro" in
+  let imports : ImpReg := MkImpReg [str_codes "C"]
+    [MkPair (List Nat) (List Nat) (str_codes "C") (str_codes "b.ouro")]
+    [ImpSelected (str_codes "b.ouro")
+      [MkImportSelector (str_codes "Count") (str_codes "Count")]] in
+  let parent : RecInfo := MkRecInfo owner (str_codes "Box")
+    (str_codes "MkBox")
+    [MkRecField (str_codes "value") (str_codes "C@Count")]
+    (MkRecOwnerScope imports [str_codes "Box"]) in
+  let registry : RecReg := MkRecReg 0 [parent] []
+    [MkRecBind (str_codes "box") 0 owner] in
+  let caller : ImpReg := MkImpReg [str_codes "A"]
+    [MkPair (List Nat) (List Nat) (str_codes "A") owner]
+    [ImpSelected owner [MkImportSelector (str_codes "Box")
+      (str_codes "Box")]] in
+  let marker : List Nat := str_codes "_ouro_t_0_0@t0" in
+  match preprocess_records_reg (str_codes "main.ouro") caller registry
+      (str_codes "def updated : A@Box := { A@box with value := rhs };") with
+  | MkPair _ tagged => match tagged with
+    | MkPair granted result => match result with
+      | PrepErr _ _ => False
+      | PrepOk output => match granted with
+        | MkImpReg _ _ rules =>
+            andb(record_atom_present marker output,
+              record_test_has_type_grant marker owner (str_codes "C@Count")
+                rules)
+        end
+      end
+    end
+  end;
+
 def record_test_nested_leaf_owner_valid : Bool :=
   let root : List Nat := str_codes "main.ouro" in
   let owner : List Nat := str_codes "b.ouro" in
+  let marker : List Nat := str_codes "_ouro_t_1_0@t0" in
   let aliases : ImpReg := MkImpReg [str_codes "B"]
-    [MkPair (List Nat) (List Nat) (str_codes "B") owner] in
+    [MkPair (List Nat) (List Nat) (str_codes "B") owner]
+    (Nil ImpRule) in
   let registry : RecReg := MkRecReg 0
-    [ MkRecInfo owner (str_codes "Shadow") (str_codes "MkShadow")
+    [ record_test_info owner (str_codes "Shadow") (str_codes "MkShadow")
         [MkRecField (str_codes "x") (str_codes "Nat")]
-    , MkRecInfo owner (str_codes "Inner") (str_codes "MkInner")
+    , record_test_info owner (str_codes "Inner") (str_codes "MkInner")
         [MkRecField (str_codes "leaf") (str_codes "Shadow")]
-    , MkRecInfo root (str_codes "Outer") (str_codes "MkOuter")
+    , record_test_info root (str_codes "Outer") (str_codes "MkOuter")
         [MkRecField (str_codes "inner") (str_codes "B@Inner")]
     ] [] [MkRecBind (str_codes "outer") 2 root] in
   match preprocess_records_reg root aliases registry (str_codes
       "axiom Shadow : Type; def result : Outer := { outer with inner.leaf := rhs };") with
   | MkPair _ tagged => match tagged with
-    | MkPair _ result => match result with
+    | MkPair granted result => match result with
       | PrepErr _ _ => False
-      | PrepOk output => andb
-          (notb (eqNat (record_test_count (str_codes "B@Shadow") output) Z))
-          (notb (eqNat (record_test_count (str_codes "B@MkInner") output) Z))
+      | PrepOk output => match granted with
+        | MkImpReg _ _ rules =>
+            andb(record_atom_present marker output,
+              andb(record_test_has_type_grant marker owner
+                  (str_codes "Shadow") rules,
+                andb(notb(record_atom_present (str_codes "B@Shadow") output),
+                  record_atom_present (str_codes "B@MkInner") output)))
+        end
       end
     end
   end;
@@ -295,22 +447,30 @@ def record_test_nested_leaf_owner_valid : Bool :=
 def record_test_nested_leaf_owner : Bool :=
   let root : List Nat := str_codes "main.ouro" in
   let owner : List Nat := str_codes "b.ouro" in
+  let marker : List Nat := str_codes "_ouro_t_1_0@t0" in
   let aliases : ImpReg := MkImpReg [str_codes "B"]
-    [MkPair (List Nat) (List Nat) (str_codes "B") owner] in
+    [MkPair (List Nat) (List Nat) (str_codes "B") owner]
+    (Nil ImpRule) in
   let registry : RecReg := MkRecReg 0
-    [ MkRecInfo root (str_codes "Shadow") (str_codes "MkShadow")
+    [ record_test_info root (str_codes "Shadow") (str_codes "MkShadow")
         [MkRecField (str_codes "x") (str_codes "Nat")]
-    , MkRecInfo owner (str_codes "Inner") (str_codes "MkInner")
+    , record_test_info owner (str_codes "Inner") (str_codes "MkInner")
         [MkRecField (str_codes "leaf") (str_codes "Shadow")]
-    , MkRecInfo root (str_codes "Outer") (str_codes "MkOuter")
+    , record_test_info root (str_codes "Outer") (str_codes "MkOuter")
         [MkRecField (str_codes "inner") (str_codes "B@Inner")]
     ] [] [MkRecBind (str_codes "outer") 2 root] in
   match preprocess_records_reg root aliases registry (str_codes
       "def result : Outer := { outer with inner.leaf := rhs };") with
   | MkPair _ tagged => match tagged with
-    | MkPair _ result => match result with
-      | PrepErr code _ => eqNat code rec_code_need_ty
-      | PrepOk _ => False
+    | MkPair granted result => match result with
+      | PrepErr _ _ => False
+      | PrepOk output => match granted with
+        | MkImpReg _ _ rules =>
+            andb(record_atom_present marker output,
+              andb(record_test_has_type_grant marker owner
+                  (str_codes "Shadow") rules,
+                notb(record_atom_present (str_codes "Shadow") output)))
+        end
       end
     end
   end;
@@ -375,10 +535,14 @@ def record_test_scanners : List Test :=
           "let { let count : Nat := Z; count }")))
     , assert_true "record update binds base once and RHS in source order"
         record_test_update_lowering
-    , assert_true "imported update carries record type or rejects unowned field type"
+    , assert_true "imported updates carry exact owner field type grants"
         record_test_imported_updates
     , assert_true "foreign field alias is not rebound in the caller"
         record_test_foreign_field_alias
+    , assert_true "record field nominal types use the declaring import scope"
+        record_test_owner_nominal_binding
+    , assert_true "generated field type grant retains exact owner and atom"
+        record_test_field_type_grant
     , assert_true "nested update retains the leaf record owner"
         record_test_nested_leaf_owner
     , assert_true "nested update uses the foreign leaf record type"
@@ -569,15 +733,27 @@ def record_test_scanners : List Test :=
     , assert_true "internal record alias avoids a source identifier"
         (match record_fresh_alias 0
             (record_bare_atoms (str_codes "def _ouro_r_0_0 : Type := Type;"))
-            (MkImpReg [] []) with
+            (MkImpReg [] [] []) with
          | Nothing => False
          | Just alias => source_bytes_equal alias (str_codes "_ouro_r_0_1")
+         end)
+    , assert_true "internal field type alias avoids a source identifier"
+        (match record_fresh_type_alias 0
+            (record_bare_atoms (str_codes "def _ouro_t_0_0 : Type := Type;"))
+            (MkImpReg [] [] []) with
+         | Nothing => False
+         | Just alias => source_bytes_equal alias (str_codes "_ouro_t_0_1")
          end)
     , assert_true "internal alias discovery requires an exact code atom"
         (andb (record_marker_present (str_codes "_ouro_r_0_0")
             (str_codes "_ouro_r_0_0@Point_x"))
           (notb (record_marker_present (str_codes "_ouro_r_0_0")
             (str_codes "prefix_ouro_r_0_0@Point_x -- _ouro_r_0_0@Point_x\n\"_ouro_r_0_0@Point_x\""))))
+    , assert_true "field type grant requires an exact emitted code atom"
+        (andb (record_atom_present (str_codes "_ouro_t_0_0@t0")
+            (str_codes "_ouro_t_0_0@t0"))
+          (notb (record_atom_present (str_codes "_ouro_t_0_0@t0")
+            (str_codes "prefix_ouro_t_0_0@t0 -- _ouro_t_0_0@t0\n\"_ouro_t_0_0@t0\""))))
     , assert_true "raw aliases and temporary names do not claim authority"
         (andb (notb (record_marker_present (str_codes "_ouro_r_0_0")
             (str_codes "r#\"_ouro_r_0_0@Point_x\"#")))
@@ -597,12 +773,12 @@ def record_test_emission : List Test :=
         " x flag"
     , assert_eq "record emission produces constructor and typed accessors"
         (str_of_codes (reverse Nat (emit_record []
-          (MkRecInfo([], str_codes "Point", str_codes "MkPoint", record_test_fields))
+          (record_test_info([], str_codes "Point", str_codes "MkPoint", record_test_fields))
           (str_codes "Type"))))
         "\ninductive Point : Type :=\n  |  MkPoint : Nat -> Bool -> Point;\ndef Point_x (p : Point) : Nat := match p with | MkPoint x flag => x end;\ndef Point_flag (p : Point) : Bool := match p with | MkPoint x flag => flag end;\n"
     , assert_eq "empty record emits a nullary constructor"
         (str_of_codes (reverse Nat (emit_record []
-          (MkRecInfo([], str_codes "Empty", str_codes "MkEmpty", []))
+          (record_test_info([], str_codes "Empty", str_codes "MkEmpty", []))
           (str_codes "Type"))))
         "\ninductive Empty : Type :=\n  |  MkEmpty : Empty;\n"
     ];

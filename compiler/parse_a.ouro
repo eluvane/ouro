@@ -91,33 +91,112 @@ def parse_a_call_argument
 
 def parse_a_call_arguments
   (parse : Nat -> Mode -> List Token -> Nat -> Value -> ParseResult Value)
-  : Nat -> Expr -> List Token -> Nat -> Value -> ParseResult Value :=
-  fix arguments (fuel : Nat) (head : Expr) (toks : List Token) (pos : Nat)
-      (extra : Value) : ParseResult Value :=
+  (fuel : Nat) (head : Expr) (toks : List Token) (pos : Nat)
+  (extra : Value) : ParseResult Value :=
+  let finish (head : Expr) (rows : List (Pair Nat Expr))
+      (named : Bool) : Expr :=
+    match named with
+    | True => ENamedCall head rows
+    | False =>
+        (fix apply (items : List (Pair Nat Expr)) (term : Expr) : Expr :=
+          match items with
+          | Nil => term
+          | Cons pair rest =>
+              match pair with
+              | MkPair _ argument => apply rest (EApp term argument)
+              end
+          end) rows head
+    end in
+  (fix arguments (fuel : Nat) (head : Expr)
+      (rows : List (Pair Nat Expr)) (named : Bool)
+      (toks : List Token) (pos : Nat) (extra : Value) : ParseResult Value :=
     match fuel with
     | Z => PErr Value pos
     | S remaining =>
-        bindValue Expr asExpr (parse_a_call_argument parse remaining toks pos extra)
-          (fun (arg : Expr) (tail : List Token) (position : Nat) =>
-            let applied : Expr := EApp head arg in
-            match is_comma (peek tail) with
-            | False =>
-                bindParseResult Unit Value (expect_rparen tail position)
-                  (fun (_u : Unit) (after : List Token) (next : Nat) =>
-                    okExpr applied after next)
-            | True =>
-                match bump tail position with
-                | MkPair after next =>
-                    match eqNat(token_tag (peek after), tagRparen) with
+        let parsed : ParseResult (Pair Nat Expr) :=
+          match toks with
+          | Nil => PErr (Pair Nat Expr) pos
+          | Cons first after_first =>
+              match tokenIsIdent first with
+              | Nothing =>
+                  match parse_a_call_argument parse remaining toks pos extra with
+                  | PErr p => PErr (Pair Nat Expr) p
+                  | POk value rest end_pos =>
+                      match asExpr value with
+                      | Nothing => PErr (Pair Nat Expr) end_pos
+                      | Just argument =>
+                          POk (Pair Nat Expr) (MkPair Nat Expr Z argument) rest end_pos
+                      end
+                  end
+              | Just label =>
+                  match eqNat(token_tag(peek after_first), tagColonEq) with
+                  | False =>
+                      match parse_a_call_argument parse remaining toks pos extra with
+                      | PErr p => PErr (Pair Nat Expr) p
+                      | POk value rest end_pos =>
+                          match asExpr value with
+                          | Nothing => PErr (Pair Nat Expr) end_pos
+                          | Just argument =>
+                              POk (Pair Nat Expr) (MkPair Nat Expr Z argument) rest end_pos
+                          end
+                      end
+                  | True =>
+                      match bump after_first (S pos) with
+                      | MkPair after_assign rhs_pos =>
+                          match orb(is_comma(peek after_assign),
+                              eqNat(token_tag(peek after_assign), tagRparen)) with
+                          | True =>
+                              POk (Pair Nat Expr)
+                                (MkPair Nat Expr label (EVar label))
+                                after_assign rhs_pos
+                          | False =>
+                              match parse_a_call_argument parse remaining
+                                  after_assign rhs_pos extra with
+                              | PErr p => PErr (Pair Nat Expr) p
+                              | POk value rest end_pos =>
+                                  match asExpr value with
+                                  | Nothing => PErr (Pair Nat Expr) end_pos
+                                  | Just argument =>
+                                      POk (Pair Nat Expr)
+                                        (MkPair Nat Expr label argument) rest end_pos
+                                  end
+                              end
+                          end
+                      end
+                  end
+              end
+          end in
+        bindParseResult (Pair Nat Expr) Value parsed
+          (fun (row : Pair Nat Expr) (tail : List Token) (position : Nat) =>
+            match row with
+            | MkPair label _ =>
+                match andb named (eqNat label Z) with
+                | True => PErr Value pos
+                | False =>
+                    let all : List (Pair Nat Expr) :=
+                      append (Pair Nat Expr) rows [row] in
+                    let any_named : Bool := orb named (notb (eqNat label Z)) in
+                    match is_comma (peek tail) with
+                    | False =>
+                        bindParseResult Unit Value (expect_rparen tail position)
+                          (fun (_u : Unit) (after : List Token) (next : Nat) =>
+                            okExpr (finish head all any_named) after next)
                     | True =>
-                        bindParseResult Unit Value (expect_rparen after next)
-                          (fun (_u : Unit) (rest : List Token) (end_pos : Nat) =>
-                            okExpr applied rest end_pos)
-                    | False => arguments remaining applied after next extra
+                        match bump tail position with
+                        | MkPair after next =>
+                            match eqNat(token_tag (peek after), tagRparen) with
+                            | True =>
+                                bindParseResult Unit Value (expect_rparen after next)
+                                  (fun (_u : Unit) (rest : List Token) (end_pos : Nat) =>
+                                    okExpr (finish head all any_named) rest end_pos)
+                            | False =>
+                                arguments remaining head all any_named after next extra
+                            end
+                        end
                     end
                 end
             end)
-    end;
+    end) fuel head (Nil (Pair Nat Expr)) False toks pos extra;
 
 def parse_a_apptail
   (parse : Nat -> Mode -> List Token -> Nat -> Value -> ParseResult Value)
@@ -387,6 +466,36 @@ def parse_a_commalist
           cont6
     end;
 
+def parse_a_spread_close
+  (elems : List Expr) (tail : Expr) (toks : List Token) (pos : Nat)
+    : ParseResult Value :=
+  match is_comma (peek toks) with
+  | True =>
+      match toks with
+      | Nil => PErr Value pos
+      | Cons _ rest =>
+          bindParseResult Unit Value (expect_bracket_r rest (S pos))
+            (fun (_u : Unit) (after : List Token) (past : Nat) =>
+              okExpr (EListSpread elems tail) after past)
+      end
+  | False =>
+      bindParseResult Unit Value (expect_bracket_r toks pos)
+        (fun (_u : Unit) (after : List Token) (past : Nat) =>
+          okExpr (EListSpread elems tail) after past)
+  end;
+
+def parse_a_spread
+  (parse : Nat -> Mode -> List Token -> Nat -> Value -> ParseResult Value)
+  (fuel' : Nat) (elems : List Expr) (toks : List Token)
+  (pos : Nat) (extra : Value) : ParseResult Value :=
+  match toks with
+  | Nil => PErr Value pos
+  | Cons _ rest =>
+      bindValue Expr asExpr (parse fuel' MExpr rest (S pos) extra)
+        (fun (tail : Expr) (after : List Token) (past : Nat) =>
+          parse_a_spread_close elems tail after past)
+  end;
+
 def parse_a_listelems
   (parse : Nat -> Mode -> List Token -> Nat -> Value -> ParseResult Value)
   (fuel' : Nat) (toks : List Token) (pos : Nat) (extra : Value) : ParseResult Value :=
@@ -396,9 +505,13 @@ def parse_a_listelems
           (fun (_u : Unit) (toks2 : List Token) (pos2 : Nat) =>
             okExpr (EList (Nil Expr)) toks2 pos2)
     | False =>
-        bindValue Expr asExpr (parse fuel' MExpr toks pos extra)
-          (fun (first : Expr) (toks2 : List Token) (pos2 : Nat) =>
-            parse fuel' MListTail toks2 pos2 (VListExpr (list1_expr first)))
+        match is_dot_dot (peek toks) with
+        | True => parse_a_spread parse fuel' (Nil Expr) toks pos extra
+        | False =>
+            bindValue Expr asExpr (parse fuel' MExpr toks pos extra)
+              (fun (first : Expr) (toks2 : List Token) (pos2 : Nat) =>
+                parse fuel' MListTail toks2 pos2 (VListExpr (list1_expr first)))
+        end
     end;
 
 def parse_a_listtail
@@ -418,9 +531,13 @@ def parse_a_listtail
                       (fun (_u : Unit) (tail : List Token) (position : Nat) =>
                         okExpr (EList elems) tail position)
                 | False =>
-                    bindValue Expr asExpr (parse fuel' MExpr rest (S pos) extra)
-                      (fun (next : Expr) (toks2 : List Token) (pos2 : Nat) =>
-                        parse fuel' MListTail toks2 pos2 (VListExpr (append Expr elems (list1_expr next))))
+                    match is_dot_dot (peek rest) with
+                    | True => parse_a_spread parse fuel' elems rest (S pos) extra
+                    | False =>
+                        bindValue Expr asExpr (parse fuel' MExpr rest (S pos) extra)
+                          (fun (next : Expr) (toks2 : List Token) (pos2 : Nat) =>
+                            parse fuel' MListTail toks2 pos2 (VListExpr (append Expr elems (list1_expr next))))
+                    end
                 end
             end
         | False =>

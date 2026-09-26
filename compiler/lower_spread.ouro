@@ -1,0 +1,290 @@
+-- List spreads lower to typed constructor spines after binding source values in order.
+
+import "lower_fallible.ouro";
+
+def spread_reject : Surface := SConst Z;
+
+def spread_max_join (left : Maybe Nat) (right : Maybe Nat) : Maybe Nat :=
+  match left, right with
+  | Just a, Just b => Just Nat (maxNat a b)
+  | Nothing, Just _ => Nothing Nat
+  | Just _, Nothing => Nothing Nat
+  | Nothing, Nothing => Nothing Nat
+  end;
+
+def spread_max_names : List Nat -> Nat :=
+  fix go (names : List Nat) : Nat :=
+    match names with
+    | Nil => Z
+    | Cons name rest => maxNat name (go rest)
+    end;
+
+def spread_max_exprs (visit : Expr -> Maybe Nat)
+    : List Expr -> Maybe Nat :=
+  fix go (items : List Expr) : Maybe Nat :=
+    match items with
+    | Nil => Just Nat Z
+    | Cons item rest => spread_max_join (visit item) (go rest)
+    end;
+
+def spread_max_maybe (visit : Expr -> Maybe Nat) (item : Maybe Expr)
+    : Maybe Nat :=
+  match item with
+  | Nothing => Just Nat Z
+  | Just expr => visit expr
+  end;
+
+def spread_max_patterns : List (Pair Nat (List Nat)) -> Nat :=
+  fix go (patterns : List (Pair Nat (List Nat))) : Nat :=
+    match patterns with
+    | Nil => Z
+    | Cons pattern rest =>
+        match pattern with
+        | MkPair ctor binders =>
+            maxNat ctor (maxNat (spread_max_names binders) (go rest))
+        end
+    end;
+
+def spread_max_rows (visit : Expr -> Maybe Nat)
+    : List (Pair (List (Pair Nat (List Nat))) Expr) -> Maybe Nat :=
+  fix go (rows : List (Pair (List (Pair Nat (List Nat))) Expr))
+      : Maybe Nat :=
+    match rows with
+    | Nil => Just Nat Z
+    | Cons row rest =>
+        match row with
+        | MkPair patterns body =>
+            spread_max_join
+              (spread_max_join (Just Nat (spread_max_patterns patterns))
+                (visit body))
+              (go rest)
+        end
+    end;
+
+def spread_max_clauses (visit : Expr -> Maybe Nat)
+    : List (Pair Nat (Pair (List Nat) Expr)) -> Maybe Nat :=
+  fix go (clauses : List (Pair Nat (Pair (List Nat) Expr)))
+      : Maybe Nat :=
+    match clauses with
+    | Nil => Just Nat Z
+    | Cons clause rest =>
+        match clause with
+        | MkPair operation payload =>
+            match payload with
+            | MkPair binders body =>
+                spread_max_join
+                  (spread_max_join
+                    (Just Nat (maxNat operation (spread_max_names binders)))
+                    (visit body))
+                  (go rest)
+            end
+        end
+    end;
+
+def spread_max_named_rows (visit : Expr -> Maybe Nat)
+    : List (Pair Nat Expr) -> Maybe Nat :=
+  fix go (rows : List (Pair Nat Expr)) : Maybe Nat :=
+    match rows with
+    | Nil => Just Nat Z
+    | Cons row rest =>
+        match row with
+        | MkPair label value =>
+            spread_max_join (spread_max_join (Just Nat label) (visit value))
+              (go rest)
+        end
+    end;
+
+-- Exhaustion rejects the spread, rather than choosing a possibly captured ID.
+def spread_max_expr : Nat -> Expr -> Maybe Nat :=
+  fix visit (fuel : Nat) (term : Expr) : Maybe Nat :=
+    match fuel with
+    | Z => Nothing Nat
+    | S remaining =>
+        let scan (child : Expr) : Maybe Nat := visit remaining child in
+        let both (left : Expr) (right : Expr) : Maybe Nat :=
+          spread_max_join (scan left) (scan right) in
+        let named (name : Nat) (part : Maybe Nat) : Maybe Nat :=
+          spread_max_join (Just Nat name) part in
+        match term with
+        | EVar name => Just Nat name
+        | EHole name =>
+            match name with
+            | Nothing => Just Nat Z
+            | Just id => Just Nat id
+            end
+        | ESort _ => Just Nat Z
+        | ENat _ => Just Nat Z
+        | EStr id => Just Nat id
+        | EApp function argument => both function argument
+        | ELam name ann body =>
+            named name
+              (spread_max_join (spread_max_maybe scan ann) (scan body))
+        | EPi name domain codomain => named name (both domain codomain)
+        | ELet name ann value body =>
+            named name
+              (spread_max_join (spread_max_maybe scan ann)
+                (both value body))
+        | EAscribe value ty => both value ty
+        | EMatch scrutinee branches => both scrutinee branches
+        | EFix name binders ret body =>
+            named name
+              (spread_max_join (scan binders) (both ret body))
+        | EEffectRow ty operations =>
+            named (spread_max_names operations) (scan ty)
+        | EPerform operation arguments =>
+            named operation (spread_max_exprs scan arguments)
+        | EDo expressions => spread_max_exprs scan expressions
+        | EHandle computation clauses =>
+            spread_max_join (scan computation) (spread_max_clauses scan clauses)
+        | EBranch packed body rest =>
+            named (spread_max_names packed) (both body rest)
+        | ENoBranch => Just Nat Z
+        | EBinder name ty rest => named name (both ty rest)
+        | ENoBinder => Just Nat Z
+        | EMultiMatch scrutinees rows =>
+            spread_max_join
+              (spread_max_exprs scan scrutinees) (spread_max_rows scan rows)
+        | EDoBind name action => named name (scan action)
+        | EList elements => spread_max_exprs scan elements
+        | ESpan _ _ inner => scan inner
+        | EFallible container failure success body =>
+            named (maxNat failure success) (both container body)
+        | EOpen alias inner => named alias (scan inner)
+        | EListSpread elements tail =>
+            spread_max_join (spread_max_exprs scan elements) (scan tail)
+        | ENamedCall head rows =>
+            spread_max_join (scan head) (spread_max_named_rows scan rows)
+        end
+    end;
+
+def spread_max_locals : List (Pair Nat Surface) -> Nat :=
+  fix go (locals : List (Pair Nat Surface)) : Nat :=
+    match locals with
+    | Nil => Z
+    | Cons local rest =>
+        match local with
+        | MkPair name ty =>
+            maxNat name (maxNat (fallible_max_var ty) (go rest))
+        end
+    end;
+
+def spread_max_surfaces : List Surface -> Nat :=
+  fix go (items : List Surface) : Nat :=
+    match items with
+    | Nil => Z
+    | Cons item rest => maxNat (fallible_max_var item) (go rest)
+    end;
+
+def spread_list_shape (env : LowerEnv) : Bool :=
+  match lookup_ctor(env_nilId env, env_ctors env),
+    lookup_ctor(env_consId env, env_ctors env) with
+  | Just nil, Just cons =>
+      andb (notb (eqNat (env_listId env) Z))
+        (andb (notb (eqNat (env_nilId env) (env_consId env)))
+          (andb (eqNat (ctor_indId nil) (env_listId env))
+            (andb (eqNat (ctor_indId cons) (env_listId env))
+              (andb (eqNat (ctor_idx nil) Z)
+                (andb (eqNat (ctor_idx cons) 1)
+                  (andb (eqNat (ctor_nparams nil) 1)
+                    (andb (eqNat (ctor_nparams cons) 1)
+                      (andb (eqNat (ctor_arity nil) Z)
+                        (andb (eqNat (ctor_arity cons) 2)
+                          (eqNat (count_ctors_ind (env_listId env)
+                            (env_ctors env)) 2)))))))))))
+  | Nothing, Just _ => False
+  | Just _, Nothing => False
+  | Nothing, Nothing => False
+  end;
+
+def spread_bind_prefix (env : LowerEnv) (elemTy : Surface)
+    (heads : List Surface) (tail : Surface) (start : Nat) : Surface :=
+  (fix go (items : List Surface) (next : Nat) : Surface :=
+    match items with
+    | Nil =>
+        SLet next tail (SApp (SInd (env_listId env)) elemTy) (SVar next)
+    | Cons head rest =>
+        SLet next head elemTy
+          (list_cons_surface env elemTy (SVar next) (go rest (S next)))
+    end) heads start;
+
+def spread_lower_heads
+  (lower_run : Nat -> LowerEnv -> Maybe Surface -> Maybe Nat ->
+    List (Pair Nat Surface) -> LowerMode -> LowerVal)
+  (fuel : Nat) (env : LowerEnv) (elemTy : Surface) (fixSelf : Maybe Nat)
+  (locals : List (Pair Nat Surface)) : List Expr -> List Surface :=
+  fix go (items : List Expr) : List Surface :=
+    match items with
+    | Nil => Nil Surface
+    | Cons item rest =>
+        Cons Surface
+          (vsurf_or_hole
+            (lower_run fuel env (Just Surface elemTy) fixSelf locals (LExpr item)))
+          (go rest)
+    end;
+
+def spread_finish
+  (lower_run : Nat -> LowerEnv -> Maybe Surface -> Maybe Nat ->
+    List (Pair Nat Surface) -> LowerMode -> LowerVal)
+  (fuel : Nat) (env : LowerEnv) (fixSelf : Maybe Nat)
+  (locals : List (Pair Nat Surface)) (elements : List Expr) (tail : Expr)
+  (listTy : Surface) (tailSurface : Surface) : LowerVal :=
+  match peel_list_elem env listTy with
+  | Nothing => VSurf spread_reject
+  | Just elemTy =>
+      match surface_hint_has_placeholder locals fuel1k listTy with
+      | True => VSurf spread_reject
+      | False =>
+          match spread_max_expr fuel (EListSpread elements tail) with
+          | Nothing => VSurf spread_reject
+          | Just sourceMax =>
+              let heads : List Surface :=
+                spread_lower_heads lower_run fuel env elemTy fixSelf locals elements in
+              let expectedMax : Nat := fallible_max_var listTy in
+              let loweredMax : Nat :=
+                maxNat (fallible_max_var tailSurface)
+                  (spread_max_surfaces heads) in
+              let selfMax : Nat :=
+                match fixSelf with
+                | Nothing => Z
+                | Just name => name
+                end in
+              let fresh : Nat :=
+                S (maxNat sourceMax
+                  (maxNat expectedMax
+                    (maxNat loweredMax
+                      (maxNat selfMax (spread_max_locals locals))))) in
+              VSurf (spread_bind_prefix env elemTy heads tailSurface fresh)
+          end
+      end
+  end;
+
+def lower_xvlistspread
+  (lower_run : Nat -> LowerEnv -> Maybe Surface -> Maybe Nat ->
+    List (Pair Nat Surface) -> LowerMode -> LowerVal)
+  (fuel : Nat) (env : LowerEnv) (expected : Maybe Surface)
+  (fixSelf : Maybe Nat) (locals : List (Pair Nat Surface))
+  (elements : List Expr) (tail : Expr) : LowerVal :=
+  match spread_list_shape env with
+  | False => VSurf spread_reject
+  | True =>
+      match expected with
+      | Just listTy =>
+          let tailSurface : Surface :=
+            vsurf_or_hole
+              (lower_run fuel env (Just Surface listTy)
+                fixSelf locals (LExpr tail)) in
+          spread_finish lower_run fuel env fixSelf locals
+            elements tail listTy tailSurface
+      | Nothing =>
+          let tailSurface : Surface :=
+            vsurf_or_hole
+              (lower_run fuel env (Nothing Surface)
+                fixSelf locals (LExpr tail)) in
+          match surface_type_hint env locals fuel1k tailSurface with
+          | Nothing => VSurf spread_reject
+          | Just listTy =>
+              spread_finish lower_run fuel env fixSelf locals
+                elements tail listTy tailSurface
+          end
+      end
+  end;

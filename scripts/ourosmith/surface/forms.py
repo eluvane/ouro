@@ -34,6 +34,11 @@ def result : Nat := {n};
   (fun (left : Nat) => fun (right : Nat) =>
     add left (match {flag} with | True => right | False => S right end)) {n} {m};
 """, n + m + (0 if seed % 2 else 1), False
+    yield "named-call", PRELUDE + f"""def combine (front => first : Nat) (back => second : Nat) : Nat := add first second;
+def front : Nat := {n};
+def back : Nat := {m};
+def result : Nat := combine(back :=, front :=);
+""", n + m, False
     yield "large-elimination", PRELUDE + f"""def resultType (n : Nat) : Type :=
   match n with | Z => Nat | S _ => Nat end;
 def value : resultType Z := {n};
@@ -125,6 +130,21 @@ def length (A : Type) : List A -> Nat :=
 def values : List Nat := [{', '.join(map(str, values))}{',' if values else ''}];
 def result : Nat := values |> length Nat;
 """, len(values), False
+    yield "list-spread", PRELUDE + f"""inductive List (A : Type) : Type := | Nil : List A | Cons : A -> List A -> List A;
+def eight (value : Nat) : Nat :=
+  let two : Nat := add value value in
+  let four : Nat := add two two in
+  add four four;
+def score : List Nat -> Nat :=
+  fix score (items : List Nat) : Nat :=
+    match items with
+    | Nil => Z
+    | Cons head rest => add head (eight (score rest))
+    end;
+def rest : List Nat := [2];
+def values : List Nat := [{n}, {m}, ..rest];
+def result : Nat := score values;
+""", n + 8 * m + 128, False
     yield "record", PRELUDE + f"""record Point : Type where
   x : Nat;
   y : Nat;

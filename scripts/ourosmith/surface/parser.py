@@ -26,6 +26,8 @@ EXPRS = {
     "EStr": ["Nat"], "EDoBind": ["Nat", "Expr"], "EList": ["List Expr"],
     "ESpan": ["Nat", "Nat", "Expr"], "EOpen": ["Nat", "Expr"],
     "EFallible": ["Expr", "Nat", "Nat", "Expr"],
+    "EListSpread": ["List Expr", "Expr"],
+    "ENamedCall": ["Expr", "List (Pair Nat Expr)"],
 }
 
 
@@ -77,7 +79,7 @@ def rows(seed):
     tokens = [f"TIdent {n}", f"TNat {n}", f"TKeyword {n}", f"TType {n}",
               "TColon", "TColonEq", "TArrow", "TFatArrow", "TBar", "TLparen", "TRparen", "TSemi",
               "THole (Nothing Nat)", f"TString {n}", "TComma", "TBraceL", "TBraceR", "TExclam",
-              "TEof", "TBind", "TPipe", "TBracketL", "TBracketR"]
+              "TEof", "TBind", "TPipe", "TBracketL", "TBracketR", "TDotDot"]
     observations = []
     accessors = []
     expected_tokens = []
@@ -114,6 +116,10 @@ def rows(seed):
         (["TKeyword kwLet", f"TIdent {n}", "TColonEq", "TNat 2", "TKeyword kwIn", f"TIdent {n}"], f"ELet({n},none,ENat(2),EVar({n}))"),
         (["TKeyword kwOpen", f"TIdent {n}", "TKeyword kwIn", f"TIdent {n}"], f"EOpen({n},EVar({n}))"),
         (["TBracketL", "TNat 1", "TComma", "TNat 2", "TBracketR"], "EList([ENat(1), ENat(2)])"),
+        (["TBracketL", "TNat 1", "TComma", "TDotDot", f"TIdent {n}", "TBracketR"],
+         f"EListSpread([ENat(1)],EVar({n}))"),
+        (["TBracketL", "TDotDot", f"TIdent {n}", "TComma", "TBracketR"],
+         f"EListSpread([],EVar({n}))"),
     ]
     for body, expected in cases:
         token_list = "([" + ", ".join(f"({token})" for token in [*body, "TSemi"]) + "] : List Token)"

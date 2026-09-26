@@ -8,7 +8,7 @@ This page describes the source forms accepted by the current toolchain.
 Source files are modules. Imports use paths relative to the importing file:
 
 ```ouro
-import "../std/list.ouro";
+import "../std/listx.ouro";
 import "nat_lib.ouro" as N;
 ```
 
@@ -16,7 +16,7 @@ Multiple plain paths can share a declaration, with an optional final comma
 before `;`:
 
 ```ouro
-import "../std/string.ouro", "../std/list.ouro",;
+import "../std/string.ouro", "../std/listx.ouro",;
 ```
 
 The parser expands the group into ordered imports. Aliases remain on separate
@@ -29,16 +29,35 @@ An import alias qualifies declarations owned by that imported file:
 def two : N.Nat := N.S N.one;
 ```
 
+A single-path import can expose chosen direct declarations, with optional
+local names and a final comma:
+
+```ouro
+import "../std/listx.ouro" as Lists exposing (nth as at, foldl,);
+```
+
+`at` is available as a bare name and inside `open Lists in ...`;
+`Lists.nth` keeps the original qualified name. `Lists.at` is not a member.
+`exposing ()` exposes no names. Unlisted members cannot be used bare,
+qualified through that alias, or through its local open. Repeating the same
+canonical import with different exposing clauses is an error. A selected name
+must be declared directly in that file, including a constructor or record
+accessor if it is selected. A plain import inherits the names exposed by its
+dependencies; a selective import exposes only the selected direct declarations
+of its target. An independent plain path can still expose the same declaration.
+Every imported declaration and body is checked even when hidden.
+
 Plain imports keep unique short names available. A local term binder takes
 precedence over a bare module name, followed by a declaration owned by the
 current file, an innermost local open, and then a unique imported short name.
-With aliases in the reached import graph, a bare name not selected by these
-scopes is ambiguous when two imported files own it; use their aliases or a
-local open to select the intended declaration. A graph of plain imports
-without aliases retains the existing duplicate-declaration error for a
-collision. An alias cannot select a declaration only imported transitively by
-its file. Aliases are local to the importing file, and a local term binder does
-not change the meaning of `N.member`.
+When aliases or selective imports occur in the reached graph, a bare name not
+selected by these scopes is ambiguous when two visible imports bind it; use an
+alias or local open to select the intended declaration. A graph of plain
+imports without either feature retains the existing duplicate-declaration
+error for a collision. An alias cannot select a declaration only imported
+transitively by its file. Aliases and exposing clauses are local to the
+importing file, and a local term binder does not change the meaning of
+`N.member`.
 Two supplied source units with the same normalized path are rejected, even
 when their path spellings differ; importing one unit through both spellings
 still selects the same module.
@@ -52,12 +71,14 @@ An expression can open an alias for its own subtree:
 def three : Nat := open N in add two one;
 ```
 
-`open N in` selects declarations owned directly by `N` when their short names
-would otherwise be ambiguous. An inner open wins over an outer one; a local
-term binder or current-file declaration still takes precedence. The opened
-names do not escape the expression. Unknown aliases are rejected, and every
-imported body remains checked. Top-level `open` declarations, selective
-imports, hidden exports, and nested module declarations are not supported.
+`open N in` selects directly owned declarations permitted by that import,
+using their exposing-local names when present. An inner open wins over an
+outer one; a local term binder or current-file declaration still takes
+precedence. The opened names do not escape the expression. Unknown aliases
+are rejected. The legacy top-level `open N;` form remains accepted and is
+erased during preprocessing; bare names still follow ordinary import lookup,
+so it does not resolve collisions or establish expression-local scope. Private
+exports, re-exports, and nested module declarations are not supported.
 
 ## Definitions and dependent functions
 
@@ -100,6 +121,12 @@ This is a non-recursive lambda-binding. Parameterized local helpers require
 typed parameters; the result annotation may be omitted when the body type can
 be inferred. [Ergonomic syntax](language/ergonomic-syntax.md#typed-local-helper-declarations)
 explains their scope and desugaring.
+
+Top-level definitions may use `(public => internal : Type)` to expose a call
+label distinct from the binder used in the body. A direct call can then write
+`f(public := value)` or `f(public :=)` to use an identically named local value.
+See [Named calls and public labels](language/ergonomic-syntax.md#named-calls-and-public-labels)
+for the bounded call rule and compatibility with positional arguments.
 
 An expression block groups sequential pure bindings with a final expression:
 
@@ -391,6 +418,25 @@ Heterogeneous lists are rejected. A nonempty list may end with a comma;
 and `Cons` constructors, and the compiler checks every element against the
 selected type.
 
+A final `..` can reuse an existing list as the tail:
+
+```ouro
+def rest : List Nat := [S Z];
+def joined : List Nat := [Z, ..rest];
+def copy : List Nat := [..rest,];
+```
+
+The tail must have the same exact nominal `List A` type. With no expected
+type, a direct, unambiguous `List A` type hint from the tail suffices, as in
+`let copy := [..rest] in copy`; an untyped empty tail does not. The compiler
+binds each prefix value in source order and then the tail once before
+constructing the `Cons` spine. It allocates a new cell for each prefix value
+and reuses the tail list. A spread must be the sole final tail; it is not an
+expression outside `[...]`. One comma before `]` is optional. Nonfinal,
+multiple, or doubled-comma spreads are syntax errors. See
+[Ergonomic syntax](language/ergonomic-syntax.md#list-spreads) for the
+lowering boundary.
+
 ## Records
 
 Records are a bounded surface form over a single-constructor inductive type and
@@ -445,13 +491,18 @@ literal ascription such as `({ x := Z, y := Z } : Point)` supplies the expected
 nominal type for its own value. That type does not flow into unrelated function
 arguments. Updates without a known nominal result type and dependent record
 fields remain unsupported.
-For an imported record, an updated field's temporary type annotation must be
-a nominal record type declared in that record's own file. The compiler resolves
-each nested field against its actual record owner. Field types that depend on
-the imported file's own aliases, or name a type from another file, are rejected
-until owner-local import bindings can be carried into the caller. Other imported
-field types are also rejected because their type provenance cannot yet be
-carried into the generated annotation.
+For an imported record, a changed field with a single-name type gets its
+temporary annotation from the record declaration's import scope. This includes
+a type declared there, a unique plain import, a selected local rename, and an
+original member qualified by that file's own alias. A same-spelled alias or
+type in the updating file cannot change the annotation. The generated name is
+limited to that field annotation; it does not expose a hidden constructor,
+accessor, or type name to source code. Each nested record field is resolved
+against its declaring record's owner, and reconstruction still requires the
+necessary record members to be visible to the updating file. Compound and
+dependent field types remain unsupported for generated imported annotations.
+Nested paths through a type alias that reduces to a record still need a direct
+nominal record field type. An ambiguous or hidden owner binding is rejected.
 
 Record pattern matching, anonymous records, row polymorphism, subtyping, and
 overloaded field resolution are not implemented.

@@ -34,11 +34,14 @@ inductive Ast : Type :=
   | ANoClause : Ast
   | ADo       : List Ast -> Ast
   | AList     : List Ast -> Ast
-  | AStr      : Nat -> Ast;
+  | AStr      : Nat -> Ast
+  | AListSpread : List Ast -> Ast -> Ast
+  -- Labels are metadata; only the callee and argument values are term nodes.
+  | ANamedCall : Ast -> List (Pair Nat Ast) -> Ast;
 
 -- Shared surface including perform/handle/do and interned string literals.
 def ast_tag_count : Nat :=
-  22;
+  24;
 
 def tag_var : Nat := Z;
 def tag_hole : Nat := S Z;
@@ -62,6 +65,8 @@ def tag_no_clause : Nat := 18;
 def tag_do : Nat := 19;
 def tag_list : Nat := 20;
 def tag_str : Nat := 21;
+def tag_list_spread : Nat := 22;
+def tag_named_call : Nat := 23;
 
 -- Constructor index in declaration order.
 def ast_tag (a : Ast) : Nat :=
@@ -87,7 +92,9 @@ def ast_tag (a : Ast) : Nat :=
     | ANoClause => tag_no_clause
     | ADo _ => tag_do
     | AList _ => tag_list
+    | AListSpread _ _ => tag_list_spread
     | AStr _ => tag_str
+    | ANamedCall _ _ => tag_named_call
     end;
 
 def ast_is (tag : Nat) (a : Ast) : Bool := eq_nat(ast_tag a, tag);
@@ -117,7 +124,9 @@ def ast_payload (a : Ast) : Nat :=
     | ANoClause => Z
     | ADo _ => Z
     | AList _ => Z
+    | AListSpread _ _ => Z
     | AStr n => n
+    | ANamedCall _ _ => Z
     end;
 
 def ast_var_id (a : Ast) : Maybe Nat :=
@@ -150,7 +159,15 @@ def ast_children (a : Ast) : List Ast :=
     | ANoClause => Nil Ast
     | ADo xs => xs
     | AList xs => xs
+    | AListSpread xs tail => append Ast xs [tail]
     | AStr _ => Nil Ast
+    | ANamedCall head rows =>
+        Cons Ast head
+          (map (Pair Nat Ast) Ast
+            (fun (row : Pair Nat Ast) =>
+              match row with
+              | MkPair _ value => value
+              end) rows)
     end;
 
 -- Stops at the first hit: orb evaluates both operands, and the rest of a
@@ -210,6 +227,22 @@ def ast_size : Ast -> Nat :=
         | Nil => Z
         | Cons child rest => add(ast_size child, sum rest)
         end) items)
+    | AListSpread items tail => S (add (ast_size tail)
+        ((fix sum (xs : List Ast) : Nat :=
+          match xs with
+          | Nil => Z
+          | Cons child rest => add(ast_size child, sum rest)
+          end) items))
+    | ANamedCall head rows =>
+        S (add(ast_size head,
+          (fix sum (items : List (Pair Nat Ast)) : Nat :=
+            match items with
+            | Nil => Z
+            | Cons row rest =>
+                match row with
+                | MkPair _ value => add(ast_size value, sum rest)
+                end
+            end) rows))
     end;
 
 -- Every callback visits a direct child, so the exact node count bounds all
@@ -254,7 +287,9 @@ def ast_app_head : Ast -> Maybe Nat :=
     | ANoClause => Nothing Nat
     | ADo _ => Nothing Nat
     | AList _ => Nothing Nat
+    | AListSpread _ _ => Nothing Nat
     | AStr _ => Nothing Nat
+    | ANamedCall head _ => ast_app_head head
     end;
 
 def ast_head_is (n : Nat) (a : Ast) : Bool :=
@@ -266,7 +301,8 @@ def ast_head_is (n : Nat) (a : Ast) : Bool :=
 -- Some application in the tree has `rec` at the head of its spine. A bare
 -- variable is a reference, not a call.
 def ast_calls (rec : Nat) : Ast -> Bool :=
-    ast_exists (fun (a : Ast) => andb(ast_is tag_app a, ast_head_is rec a));
+    ast_exists (fun (a : Ast) => andb(orb(ast_is tag_app a, ast_is tag_named_call a),
+      ast_head_is rec a));
 
 -- Head id through applications, ascriptions, performs, fixes, handles,
 -- clauses and do-blocks; the effect and capability cores use this to name
@@ -299,7 +335,9 @@ def head_id : Ast -> Maybe Nat :=
     | AMatch _ _ => Nothing Nat
     | ANoClause => Nothing Nat
     | AList _ => Nothing Nat
+    | AListSpread _ _ => Nothing Nat
     | AStr _ => Nothing Nat
+    | ANamedCall head _ => head_id head
     end;
 
 -- Ascriptions do not change the shape a core reasons about.
@@ -327,7 +365,9 @@ def ast_peel_ascribe : Ast -> Ast :=
     | ANoClause => a
     | ADo _ => a
     | AList _ => a
+    | AListSpread _ _ => a
     | AStr _ => a
+    | ANamedCall _ _ => a
     end;
 
 -- Parameter ids of a binder telescope; a fix delegates to its telescope.
@@ -355,7 +395,9 @@ def ast_binder_ids : Ast -> List Nat :=
     | ANoClause => Nil Nat
     | ADo _ => Nil Nat
     | AList _ => Nil Nat
+    | AListSpread _ _ => Nil Nat
     | AStr _ => Nil Nat
+    | ANamedCall _ _ => Nil Nat
     end;
 
 -- Constructor of every arm of a branch chain, in order.
@@ -383,7 +425,9 @@ def ast_arm_ctors : Ast -> List Nat :=
     | ANoClause => Nil Nat
     | ADo _ => Nil Nat
     | AList _ => Nil Nat
+    | AListSpread _ _ => Nil Nat
     | AStr _ => Nil Nat
+    | ANamedCall _ _ => Nil Nat
     end;
 
 def ast_arm_count (b : Ast) : Nat := length(Nat, ast_arm_ctors b);
@@ -410,7 +454,9 @@ def ast_spine_uses (ids : List Nat) (root : Ast) : Bool :=
     match ast_var_id s with
     | Just id => mem Nat eq_nat id ids
     | Nothing =>
-        match orb(ast_is tag_app s, orb(ast_is tag_ascribe s, ast_is tag_list s)) with
+        match orb(ast_is tag_app s, orb(ast_is tag_named_call s,
+          orb(ast_is tag_ascribe s,
+            orb(ast_is tag_list s, ast_is tag_list_spread s)))) with
         | True => ast_any(fun (child : Ast) => visit remaining child, ast_children s)
         | False => False
         end
@@ -462,6 +508,8 @@ def ast_matches_using (initial_ids : List Nat) (root : Ast) : Bool :=
         | AClause _ _ _ _ => ast_any(fun (child : Ast) => go remaining ids child, ast_children a)
         | ADo _ => ast_any(fun (child : Ast) => go remaining ids child, ast_children a)
         | AList _ => ast_any(fun (child : Ast) => go remaining ids child, ast_children a)
+        | AListSpread _ _ => ast_any(fun (child : Ast) => go remaining ids child, ast_children a)
+        | ANamedCall _ _ => ast_any(fun (child : Ast) => go remaining ids child, ast_children a)
         end
     end
     end) (ast_size root) initial_ids root;
@@ -504,6 +552,8 @@ def ast_args_rev : Ast -> List Ast :=
     | ANoClause => Nil Ast
     | ADo _ => Nil Ast
     | AList _ => Nil Ast
+    | AListSpread _ _ => Nil Ast
+    | ANamedCall _ _ => Nil Ast
     end;
 
 def ast_args (a : Ast) : List Ast := reverse(Ast, ast_args_rev a);
@@ -549,6 +599,8 @@ def ast_arms : Ast -> Maybe (List AstArm) :=
     | ANoClause => Nothing (List AstArm)
     | ADo _ => Nothing (List AstArm)
     | AList _ => Nothing (List AstArm)
+    | AListSpread _ _ => Nothing (List AstArm)
+    | ANamedCall _ _ => Nothing (List AstArm)
     end;
 
 -- Definition body behind the root ascription, the leading parameter lambdas,
@@ -578,6 +630,8 @@ def ast_core_body : Ast -> Ast :=
     | ANoClause => a
     | ADo _ => a
     | AList _ => a
+    | AListSpread _ _ => a
+    | ANamedCall _ _ => a
     end;
 
 -- Recursive name of a definition whose core is a fix; Z otherwise.
@@ -606,6 +660,8 @@ def ast_root_fix : Ast -> Nat :=
     | ANoClause => Z
     | ADo _ => Z
     | AList _ => Z
+    | AListSpread _ _ => Z
+    | ANamedCall _ _ => Z
     end;
 
 -- Declared type of a definition: the ascription the unit puts at the root.
@@ -633,6 +689,8 @@ def ast_declared_type (a : Ast) : Maybe Ast :=
     | ANoClause => Nothing Ast
     | ADo _ => Nothing Ast
     | AList _ => Nothing Ast
+    | AListSpread _ _ => Nothing Ast
+    | ANamedCall _ _ => Nothing Ast
     end;
 
 -- Final codomain of a Pi telescope: the type a definition's applications
@@ -662,6 +720,8 @@ def ast_result_type : Ast -> Ast :=
     | ANoClause => t
     | ADo _ => t
     | AList _ => t
+    | AListSpread _ _ => t
+    | ANamedCall _ _ => t
     end;
 
 
@@ -690,6 +750,8 @@ def ast_is_fix_body : Ast -> Bool :=
     | ANoClause => False
     | ADo _ => False
     | AList _ => False
+    | AListSpread _ _ => False
+    | ANamedCall _ _ => False
     end;
 
 
@@ -718,6 +780,8 @@ def ast_params : Ast -> List Nat :=
     | ANoClause => Nil Nat
     | ADo _ => Nil Nat
     | AList _ => Nil Nat
+    | AListSpread _ _ => Nil Nat
+    | ANamedCall _ _ => Nil Nat
     end;
 
 
