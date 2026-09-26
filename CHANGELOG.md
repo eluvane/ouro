@@ -6,6 +6,8 @@ Development changes; see the [compatibility policy](docs/stability.md).
 
 ### Added
 
+- Exclusive `0..10` and inclusive `0..=10` literal-endpoint `NatRange` values,
+  checked through nominal Nat, bound, and range representation roles.
 - Final-tail list spreads `[first, ..rest]` build checked `List A` constructor
   spines with once-bound prefix values and tail; a complete tail type can guide
   an unannotated local list. See [Lists](docs/syntax.md#lists).

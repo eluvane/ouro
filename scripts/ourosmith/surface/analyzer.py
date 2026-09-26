@@ -28,6 +28,8 @@ class Node:
         return " ".join([self.tag, *(emit(arg) for arg in self.arguments)])
 
     def nodes(self):
+        if self.tag == "ARange":
+            return 4  # The analyzer exposes both endpoints and the bound as literal children.
         def count(value):
             if isinstance(value, Node):
                 return value.nodes()
@@ -59,6 +61,7 @@ def ast_trees(seed):
     yield Node("ADo", (many,))
     yield Node("AList", (many,))
     yield Node("AListSpread", (many, leaf))
+    yield Node("ARange", (seed % 7, seed % 11, "True"))
     yield Node("ANamedCall", (leaf, ((seed % 7 + 1, pair), (seed % 7 + 2, leaf))))
 
 
@@ -98,6 +101,7 @@ def rows(seed):
         ("EList ([EVar 7, ENat 1] : List Expr)", 3, 3),
         ("EListSpread (Nil Expr) (EList (Nil Expr))", 2, 2),
         ("EListSpread ([EVar 7] : List Expr) (EVar 8)", 3, 3),
+        ("ERange 2 5 True", 1, 4),
         ("ELam 1 (Nothing Expr) (EVar 1)", 2, 3),
         ("ELam 1 (Just Expr (ESort 0)) (EVar 1)", 3, 3),
         ("EDo ([EDoBind 1 (ENat 2), EVar 1] : List Expr)", 4, 6),
