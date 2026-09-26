@@ -171,6 +171,20 @@ def pred (n : Nat) : Nat :=
   end;
 ```
 
+A total constructor pattern can also bind fields in a local expression or a
+pure expression block:
+
+```ouro
+let (MkPair left right) := pair in add left right
+let { let (MkPair left _) := pair; left }
+```
+
+This uses the same checked match as `match pair with | MkPair left right => ... end`.
+The constructor must cover the family, and the result needs an expected type
+when it cannot be inferred from the subject. See
+[checked destructuring lets](language/ergonomic-syntax.md#checked-destructuring-lets)
+for the exact limits.
+
 A family can opt in to omitting a leading universe parameter on saturated
 constructor calls:
 
