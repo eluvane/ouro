@@ -172,6 +172,19 @@ including across whitespace and line comments. The parser builds the same
 parse errors. Empty lists keep the spelling `[]` and still need an expected
 `List A` type.
 
+## Record field punning
+
+```ouro
+{ x, y := next }  -- the x field uses the variable x
+```
+
+A record literal still needs a known nominal record type. A bare field name
+uses the value with that name in the enclosing lexical scope; it does not
+introduce a binder. The record preprocessor expands it to the same constructor
+argument as `x := x`, preserving declaration field order. Missing, duplicate,
+and unknown fields remain errors. Functional record update and nested update
+are not supported by this form.
+
 ## Integration and fixtures
 
 These forms reuse existing `DImport`, `EApp`, `EAscribe`, `ELam`, `EPi`,

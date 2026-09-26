@@ -265,14 +265,22 @@ record Point : Type where
 end;
 
 def origin : Point := { x := Z, y := Z };
+def x : Nat := Z;
+def y : Nat := Z;
+def sameOrigin : Point := { y, x };
 def originX : Nat := origin.x;
 ```
 
 The default constructor is `MkPoint`; generated accessor names use
 `Point_x`, `Point_y`, and so on. Record literals require a known record type,
-and every field must appear exactly once.
+and every field must appear exactly once. A bare field name such as `x` means
+`x := x`; the value resolves in the ordinary lexical scope. Punned and explicit
+fields may be mixed, with comments and a trailing comma. Field order in the
+source does not change the constructor's declared field order. Unknown,
+duplicate, and missing fields remain errors; an unbound punned value is a
+compiler error.
 
-Record update, record pattern matching, anonymous records, row polymorphism,
+Functional record update, record pattern matching, anonymous records, row polymorphism,
 subtyping, and overloaded field resolution are not implemented.
 
 ## Application and the pipe operator

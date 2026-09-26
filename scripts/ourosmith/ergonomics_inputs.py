@@ -30,6 +30,10 @@ def load_cases():
             required = ("type", "sugar", "canonical") if group == "positive" else ("source",)
             if any(not isinstance(case.get(key), str) or not case[key] for key in required):
                 raise ValueError("missing source field: " + name)
+            if group == "positive" and "source" in case:
+                raise ValueError("positive case must use checked equivalence: " + name)
+            if "setup" in case and (group != "positive" or not isinstance(case["setup"], str)):
+                raise ValueError("invalid equivalence setup: " + name)
             if "lint" in case:
                 expected = case["lint"]
                 if group != "positive" or not isinstance(expected, dict) or set(expected) != {"language", "semantic"}:
@@ -61,7 +65,10 @@ def render(case, directory):
     if "source" in case:
         return header + case["source"] + "\n"
     ty = "(" + case["type"] + ")"
-    return header + (
+    setup = case.get("setup", "")
+    if setup and not setup.endswith("\n"):
+        setup += "\n"
+    return header + setup + (
         f'def ergo_expansion_candidate : {ty} := {case["sugar"]};\n'
         f'def ergo_expansion_reference : {ty} := {case["canonical"]};\n'
         f'def ergo_expansion_law : ErgEq {ty} ergo_expansion_candidate '

@@ -1,7 +1,7 @@
 -- Byte-scanner boundaries and record emission must survive structural checks.
 
 import "../std/test.ouro",
-  "../compiler/preprocess_record_text.ouro";
+  "../compiler/preprocess_record.ouro";
 
 def record_test_split (parts : Pair (List Nat) (List Nat)) : String :=
     match parts with
@@ -18,6 +18,10 @@ def record_test_fields : List RecField :=
     [ MkRecField(str_codes "x", str_codes "Nat")
     , MkRecField(str_codes "flag", str_codes "Bool")
     ];
+
+def record_test_registry : RecReg := MkRecReg(0,
+  [MkRecInfo(0, str_codes "Point", str_codes "MkPoint", record_test_fields)],
+  [], []);
 
 def record_test_scanners : List Test :=
     [ assert_eq "whitespace scanner accepts empty source"
@@ -36,21 +40,48 @@ def record_test_scanners : List Test :=
     , assert_eq "word delimiter ignores nesting, comments and escaped quotes"
         (record_test_split (take_until_word w_end
           (str_codes "(end) -- end\n\"end\\\" still\" end;")))
-        "(end) -\n\" |end;"
+        "(end) -- end\n\"end\\\" still\" |end;"
     , assert_eq "character delimiter ignores nesting, comments and strings"
         (record_test_split (take_until_char ch_semi_p
           (str_codes "(;) -- ;\n\";\" ;tail")))
-        "(;) -\n\" |;tail"
+        "(;) -- ;\n\";\" |;tail"
     , assert_eq "assignment delimiter ignores nested and quoted assignments"
         (record_test_split (take_until_coloneq
           (str_codes "(a := b) -- :=\n\":=\" := tail")))
-        "(a := b) -\n\" |:= tail"
+        "(a := b) -- :=\n\":=\" |:= tail"
     , assert_eq "assignment scan keeps a final single byte"
         (record_test_split (take_until_coloneq (str_codes ":"))) ":|"
     , assert_eq "absent word delimiter returns the complete ordinary prefix"
         (record_test_split (take_until_word(w_end, str_codes "x"))) "x|"
     , assert_eq "brace scan ignores quoted and commented closing braces"
-        (record_test_brace "{a {b} -- }\n\"}\" c}tail") "{a {b} -\n\" c}|tail"
+        (record_test_brace "{a {b} -- }\n\"}\" c}tail") "{a {b} -- }\n\"}\" c}|tail"
+    , assert_true "grouped nominal type resolves through nested parentheses"
+        (match type_to_rec record_test_registry (str_codes "((Point))") with
+         | Nothing => False
+         | Just index => eqNat index Z
+         end)
+    , assert_true "grouped nominal type accepts comments and whitespace"
+        (match type_to_rec record_test_registry
+            (str_codes " ( -- before\n ( Point -- inside\n ) ) -- after\n") with
+         | Nothing => False
+         | Just index => eqNat index Z
+         end)
+    , assert_true "grouped type rejects tokens after the closing parenthesis"
+        (match type_to_rec record_test_registry (str_codes "(Point) Other") with
+         | Nothing => True
+         | Just _ => False
+         end)
+    , assert_true "grouped type rejects compound inner expressions"
+        (match type_to_rec record_test_registry (str_codes "(Point -> Point)") with
+         | Nothing => True
+         | Just _ => False
+         end)
+    , assert_eq "record value scan keeps comment newline before comma"
+        (record_test_split (take_until_comma_or_end (str_codes " Z -- kept\n, y")))
+        " Z -- kept\n|, y"
+    , assert_eq "record value scan keeps comment newline before closing brace"
+        (record_test_split (take_until_comma_or_end (str_codes " Z -- kept\n}")))
+        " Z -- kept\n|}"
     , assert_eq "unmatched opening brace is rejected"
         (record_test_brace "{x") "<none>"
     , assert_eq "unmatched closing brace is rejected"
@@ -61,6 +92,14 @@ def record_test_scanners : List Test :=
         (top_has_assign (str_codes "(x := y) \"a := b\" -- :=\n x := y"))
     , assert_true "nested and hidden assignments do not count"
         (notb (top_has_assign (str_codes "(x := y) \"a := b\" -- :=")))
+    , assert_true "pure punned field list is detected"
+        (top_starts_pun (str_codes " x, -- comment\n y "))
+    , assert_true "single punned field is detected"
+        (top_starts_pun (str_codes " x -- comment"))
+    , assert_true "assignment is not mistaken for punning"
+        (notb (top_starts_pun (str_codes "x := value")))
+    , assert_true "nested field list is not a top-level pun"
+        (notb (top_starts_pun (str_codes "(x, y)")))
     , assert_true "top-level with is found after ignored regions"
         (top_has_with (str_codes "(with) \"with\" -- with\n with x"))
     , assert_true "nested, hidden and longer with spellings do not count"
@@ -78,6 +117,8 @@ def record_test_scanners : List Test :=
         (records_maybe_needed (str_codes "point.x"))
     , assert_true "record detection accepts field assignments"
         (records_maybe_needed (str_codes "{x := 1}"))
+    , assert_true "record detection accepts punned fields"
+        (records_maybe_needed (str_codes "{x, y}"))
     , assert_true "record detection accepts an update"
         (records_maybe_needed (str_codes "{point with x := 1}"))
     , assert_true "record detection resumes after an ordinary brace body"
