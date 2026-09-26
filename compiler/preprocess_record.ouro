@@ -215,17 +215,28 @@ def expand_record_decls (reg0 : RecReg) (src : List Nat)
 
 def take_until_comma_or_end (xs0 : List Nat)
     : Pair (List Nat) (List Nat) :=
-  (fix go (xs : List Nat) (acc : List Nat) (depth : Nat)
+  (fix go (fuel : Nat) (xs : List Nat) (acc : List Nat) (depth : Nat)
       : Pair (List Nat) (List Nat) :=
-    match xs with
-    | Nil => MkPair(List Nat, List Nat, reverse Nat acc, Nil Nat)
-    | Cons c rest =>
-        match andb (eqNat depth Z)
-              (orb(eqNat c ch_comma_p, eqNat c ch_rbrace_p)) with
-        | True => MkPair(List Nat, List Nat, reverse Nat acc, xs)
-        | False => go(rest, Cons Nat c acc, bump_depth c depth)
+    match fuel with
+    | Z => MkPair(List Nat, List Nat, reverse Nat acc, Nil Nat)
+    | S remaining =>
+        match xs with
+        | Nil => MkPair(List Nat, List Nat, reverse Nat acc, Nil Nat)
+        | Cons c rest =>
+            match source_copy_comment_or_string acc xs with
+            | Just copied =>
+                match copied with
+                | MkPair acc2 tail => go remaining tail acc2 depth
+                end
+            | Nothing =>
+                match andb (eqNat depth Z)
+                      (orb(eqNat c ch_comma_p, eqNat c ch_rbrace_p)) with
+                | True => MkPair(List Nat, List Nat, reverse Nat acc, xs)
+                | False => go remaining rest (Cons Nat c acc) (bump_depth c depth)
+                end
+            end
         end
-    end) xs0 (Nil Nat) Z;
+    end) (S (length Nat xs0)) xs0 (Nil Nat) Z;
 
 def all_seen (n : Nat) (seen : List Nat) : Bool :=
   (fix go (remaining : Nat) : Bool :=
@@ -261,6 +272,48 @@ def build_ctor_app (ctor : List Nat) (fs : List RecField)
           go(rest, S i, Cons Nat ch_rparen_p a3)
       end) fs Z (emit(Nil Nat, ctor)));
 
+def parse_literal_field_value (field : List Nat) (after : List Nat)
+    : Maybe (Pair (List Nat) (List Nat)) :=
+  match after with
+  | Nil => Just(Pair(List Nat, List Nat), MkPair(List Nat, List Nat, field, Nil Nat))
+  | Cons c rest =>
+      match eqNat c ch_comma_p with
+      | True => Just(Pair(List Nat, List Nat), MkPair(List Nat, List Nat, field, rest))
+      | False =>
+          match eqNat c ch_colon_p with
+          | False => Nothing (Pair(List Nat, List Nat))
+          | True =>
+              match rest with
+              | Nil => Nothing (Pair(List Nat, List Nat))
+              | Cons equals value_src =>
+                  match eqNat equals ch_eq_p with
+                  | False => Nothing (Pair(List Nat, List Nat))
+                  | True =>
+                      match take_until_comma_or_end value_src with
+                      | MkPair raw remainder =>
+                          let value : List Nat := trim_bytes raw in
+                          match value with
+                          | Nil => Nothing (Pair(List Nat, List Nat))
+                          | Cons _ _ =>
+                              let next : List Nat := skip_ws_p remainder in
+                              match next with
+                              | Nil => Just(Pair(List Nat, List Nat),
+                                  MkPair(List Nat, List Nat, value, Nil Nat))
+                              | Cons comma tail =>
+                                  match eqNat comma ch_comma_p with
+                                  | True => Just(Pair(List Nat, List Nat),
+                                      MkPair(List Nat, List Nat, value, tail))
+                                  | False => Nothing (Pair(List Nat, List Nat))
+                                  end
+                              end
+                          end
+                      end
+                  end
+              end
+          end
+      end
+  end;
+
 def fill_literal_go (fs : List RecField) (ctor : List Nat) (n : Nat)
     (input : List Nat) (initial_seen : List Nat) (initial_vals : List (Pair Nat (List Nat))) : RewriteR :=
   (fix fill_literal_go (fuel : Nat) (xs : List Nat) (seen : List Nat)
@@ -288,45 +341,23 @@ def fill_literal_go (fs : List RecField) (ctor : List Nat) (n : Nat)
                     match fld with
                     | Nil => RwErr rec_code_malformed
                     | Cons _ _ =>
-                        match skip_ws_p rest with
-                        | Cons c1 rest2 =>
-                            match rest2 with
-                            | Cons c2 rest3 =>
-                                match andb (eqNat c1 ch_colon_p)
-                                      (eqNat c2 ch_eq_p) with
-                                | True =>
-                                    match find_field_idx fld fs with
-                                    | Nothing => RwErr rec_code_unknown
-                                    | Just idx =>
-                                        match memNat idx seen with
-                                        | True => RwErr rec_code_dup
-                                        | False =>
-                                            match take_until_comma_or_end rest3 with
-                                            | MkPair expr rest4 =>
-                                                let rest5 : List Nat :=
-                                                  skip_ws_p rest4 in
-                                                let rest6 : List Nat :=
-                                                  match rest5 with
-                                                  | Cons cm rcm =>
-                                                      match eqNat cm ch_comma_p with
-                                                      | True => rcm
-                                                      | False => rest5
-                                                      end
-                                                  | Nil => rest5
-                                                  end in
-                                                fill_literal_go remaining rest6 (Cons Nat idx seen)
-                                                  (Cons (Pair(Nat, List Nat))
-                                                    (MkPair Nat (List Nat) idx
-                                                      (trim_bytes expr))
-                                                    vals)
-                                            end
-                                        end
+                        match parse_literal_field_value fld (skip_ws_p rest) with
+                        | Nothing => RwErr rec_code_malformed
+                        | Just parsed =>
+                            match parsed with
+                            | MkPair value tail =>
+                                match find_field_idx fld fs with
+                                | Nothing => RwErr rec_code_unknown
+                                | Just idx =>
+                                    match memNat idx seen with
+                                    | True => RwErr rec_code_dup
+                                    | False =>
+                                        fill_literal_go remaining tail (Cons Nat idx seen)
+                                          (Cons (Pair(Nat, List Nat))
+                                            (MkPair Nat (List Nat) idx value) vals)
                                     end
-                                | False => RwErr rec_code_malformed
                                 end
-                            | Nil => RwErr rec_code_malformed
                             end
-                        | Nil => RwErr rec_code_malformed
                         end
                     end
                 end
@@ -369,7 +400,8 @@ def rewrite_expr (reg : RecReg) (env : RecEnv) (initial_expected : Maybe Nat)
                                   match top_has_with (strip_braces body) with
                                   | True => RwErr rec_code_need_ty
                                   | False =>
-                                      match top_has_assign (strip_braces body) with
+                                      match orb(top_has_assign (strip_braces body),
+                                          top_starts_pun (strip_braces body)) with
                                       | False => go scan_left tail (emit acc body)
                                       | True =>
                                           match expected with
