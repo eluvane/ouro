@@ -1,0 +1,700 @@
+-- Binding-aware module identity rewrite. This stage only rewrites names;
+-- complete declaration and term acceptance remains with the checker.
+
+import "pipeline_abi.ouro";
+
+def module_result_map (A : Type) (B : Type) (make : A -> B)
+    (value : ResolveResult A) : ResolveResult B :=
+    match value with
+    | RErr code detail => RErr B code detail
+    | ROk item => ROk B (make item)
+    end;
+
+def module_result_bind (A : Type) (B : Type) (value : ResolveResult A)
+    (next : A -> ResolveResult B) : ResolveResult B :=
+    match value with
+    | RErr code detail => RErr B code detail
+    | ROk item => next item
+    end;
+
+def module_result_pair (A : Type) (B : Type) (C : Type)
+    (make : A -> B -> C) (left : ResolveResult A) (right : ResolveResult B)
+    : ResolveResult C :=
+    module_result_bind A C left
+      (fun (a : A) => module_result_map B C (make a) right);
+
+def module_result_option (A : Type) (B : Type)
+    (rewrite : A -> ResolveResult B) (value : Maybe A)
+    : ResolveResult (Maybe B) :=
+    match value with
+    | Nothing => ROk (Maybe B) (Nothing B)
+    | Just item => module_result_map B (Maybe B)
+        (fun (out : B) => Just B out) (rewrite item)
+    end;
+
+def module_result_list (A : Type) (B : Type)
+    (rewrite : A -> ResolveResult B) : List A -> ResolveResult (List B) :=
+  fix go (items : List A) : ResolveResult (List B) :=
+    match items with
+    | Nil => ROk (List B) (Nil B)
+    | Cons item rest =>
+        module_result_bind B (List B) (rewrite item)
+          (fun (out : B) => module_result_map (List B) (List B)
+            (Cons B out) (go rest))
+    end;
+
+def module_lookup (name : Nat) : List (Pair Nat Nat) -> Maybe Nat :=
+  fix go (items : List (Pair Nat Nat)) : Maybe Nat :=
+    match items with
+    | Nil => Nothing Nat
+    | Cons pair rest =>
+        match pair with
+        | MkPair key value =>
+            match eqNat key name with
+            | True => Just Nat value
+            | False => go rest
+            end
+        end
+    end;
+
+def module_duplicate_key : List (Pair Nat Nat) -> Maybe Nat :=
+  fix go (items : List (Pair Nat Nat)) : Maybe Nat :=
+    match items with
+    | Nil => Nothing Nat
+    | Cons pair rest =>
+        match pair with
+        | MkPair key _ =>
+            match module_lookup key rest with
+            | Just _ => Just Nat key
+            | Nothing => go rest
+            end
+        end
+    end;
+
+def module_overlap_key (refs : List (Pair Nat Nat))
+    (errors : List (Pair Nat Nat)) : Maybe Nat :=
+    (fix go (items : List (Pair Nat Nat)) : Maybe Nat :=
+      match items with
+      | Nil => Nothing Nat
+      | Cons pair rest =>
+          match pair with
+          | MkPair key _ =>
+              match module_lookup key errors with
+              | Just _ => Just Nat key
+              | Nothing => go rest
+              end
+          end
+      end) refs;
+
+def module_invalid_error_code : List (Pair Nat Nat) -> Maybe Nat :=
+  fix go (items : List (Pair Nat Nat)) : Maybe Nat :=
+    match items with
+    | Nil => Nothing Nat
+    | Cons pair rest =>
+        match pair with
+        | MkPair key code =>
+            match orb(eqNat code 5, eqNat code 6) with
+            | True => go rest
+            | False => Just Nat key
+            end
+        end
+    end;
+
+-- Run once at the public boundary; duplicate declaration heads themselves are
+-- left intact for the existing checker to reject.
+def module_invalid_maps (heads : List (Pair Nat Nat))
+    (refs : List (Pair Nat Nat)) (errors : List (Pair Nat Nat)) : Maybe Nat :=
+    match module_duplicate_key heads with
+    | Just key => Just Nat key
+    | Nothing =>
+        match module_duplicate_key refs with
+        | Just key => Just Nat key
+        | Nothing =>
+            match module_duplicate_key errors with
+            | Just key => Just Nat key
+            | Nothing =>
+                match module_overlap_key refs errors with
+                | Just key => Just Nat key
+                | Nothing => module_invalid_error_code errors
+                end
+            end
+        end
+    end;
+
+def module_check_name (markers : List Nat) (name : Nat) : ResolveResult Unit :=
+    match memNat name markers with
+    | True => RErr Unit 8 name
+    | False => ROk Unit MkUnit
+    end;
+
+def module_guard (A : Type) (markers : List Nat) (name : Nat)
+    (result : ResolveResult A) : ResolveResult A :=
+    match memNat name markers with
+    | True => RErr A 8 name
+    | False => result
+    end;
+
+def module_check_names (markers : List Nat) : List Nat -> ResolveResult Unit :=
+  fix go (names : List Nat) : ResolveResult Unit :=
+    match names with
+    | Nil => ROk Unit MkUnit
+    | Cons name rest =>
+        module_result_bind Unit Unit (module_check_name markers name)
+          (fun (_ : Unit) => go rest)
+    end;
+
+def module_check_named_heads (markers : List Nat)
+    : List (Pair Nat Expr) -> ResolveResult Unit :=
+  fix go (items : List (Pair Nat Expr)) : ResolveResult Unit :=
+    match items with
+    | Nil => ROk Unit MkUnit
+    | Cons pair rest =>
+        match pair with
+        | MkPair name _ =>
+            module_result_bind Unit Unit (module_check_name markers name)
+              (fun (_ : Unit) => go rest)
+        end
+    end;
+
+def module_check_decl_head (markers : List Nat) (decl : Decl)
+    : ResolveResult Unit :=
+    match decl with
+    | DDef name _ _ => module_check_name markers name
+    | DAxiom name _ => module_check_name markers name
+    | DInductive name _ _ constructors =>
+        module_result_bind Unit Unit (module_check_name markers name)
+          (fun (_ : Unit) => module_check_named_heads markers constructors)
+    | DEffect name _ operations =>
+        module_result_bind Unit Unit (module_check_name markers name)
+          (fun (_ : Unit) => module_check_named_heads markers operations)
+    | DImport _ => ROk Unit MkUnit
+    | DIntrinsic name _ _ _ => module_check_name markers name
+    | DExtern name _ _ => module_check_name markers name
+    | DRepresentation _ _ => ROk Unit MkUnit
+    end;
+
+def module_head (heads : List (Pair Nat Nat)) (name : Nat) : Nat :=
+    match module_lookup name heads with
+    | Just qualified => qualified
+    | Nothing => name
+    end;
+
+-- A lexical binder always wins over registry errors and free-reference maps.
+def module_ref (refs : List (Pair Nat Nat)) (errors : List (Pair Nat Nat))
+    (bound : List Nat) (name : Nat) : ResolveResult Nat :=
+    match memNat name bound with
+    | True => ROk Nat name
+    | False =>
+        match module_lookup name errors with
+        | Just code => RErr Nat code name
+        | Nothing =>
+            match module_lookup name refs with
+            | Just qualified => ROk Nat qualified
+            | Nothing => ROk Nat name
+            end
+        end
+    end;
+
+def module_rewrite_ids (refs : List (Pair Nat Nat))
+    (errors : List (Pair Nat Nat)) (bound : List Nat)
+    (ids : List Nat) : ResolveResult (List Nat) :=
+    module_result_list Nat Nat (module_ref refs errors bound) ids;
+
+-- A pattern head is a constructor only when its namespace says so. Other
+-- heads bind like the remaining pattern variables in the branch body.
+def module_pattern_head (refs : List (Pair Nat Nat))
+    (errors : List (Pair Nat Nat)) (markers : List Nat)
+    (constructors : List Nat) (head : Nat) (vars : List Nat)
+    : ResolveResult (Pair Nat (List Nat)) :=
+    match orb(memNat head constructors, memNat head markers) with
+    | True =>
+        module_result_bind Unit (Pair Nat (List Nat))
+          (module_check_names markers vars)
+          (fun (_ : Unit) =>
+            module_result_map Nat (Pair Nat (List Nat))
+              (fun (qualified : Nat) =>
+                MkPair Nat (List Nat) qualified vars)
+              (module_ref refs errors (Nil Nat) head))
+    | False =>
+        module_result_map Unit (Pair Nat (List Nat))
+          (fun (_ : Unit) =>
+            MkPair Nat (List Nat) head (Cons Nat head vars))
+          (module_check_names markers (Cons Nat head vars))
+    end;
+
+-- Constructor heads resolve globally; variable-pattern heads and tails bind
+-- only inside this branch body, never in the next branch.
+def module_branch_pack (refs : List (Pair Nat Nat))
+    (errors : List (Pair Nat Nat)) (markers : List Nat)
+    (constructors : List Nat) (bound : List Nat) (packed : List Nat)
+    : ResolveResult (Pair (List Nat) (List Nat)) :=
+    match packed with
+    | Nil => ROk (Pair (List Nat) (List Nat))
+        (MkPair (List Nat) (List Nat) (Nil Nat) bound)
+    | Cons head vars =>
+        module_result_map (Pair Nat (List Nat))
+          (Pair (List Nat) (List Nat))
+          (fun (rewritten : Pair Nat (List Nat)) =>
+            match rewritten with
+            | MkPair name new_bound =>
+                MkPair (List Nat) (List Nat)
+                  (Cons Nat name vars) (append Nat new_bound bound)
+            end)
+          (module_pattern_head refs errors markers constructors head vars)
+    end;
+
+-- A do binder starts after its action, including when wrapped in a span.
+def module_rewrite_do
+    (rewrite : List Nat -> Expr -> ResolveResult Expr)
+    : List Nat -> List Expr -> ResolveResult (List Expr) :=
+  fix go (bound : List Nat) (items : List Expr) : ResolveResult (List Expr) :=
+    match items with
+    | Nil => ROk (List Expr) (Nil Expr)
+    | Cons item rest =>
+        module_result_bind Expr (List Expr) (rewrite bound item)
+          (fun (out : Expr) =>
+            let next_bound : List Nat :=
+              match do_bind_of out with
+              | Nothing => bound
+              | Just pair => match pair with
+                  | MkPair name _ => Cons Nat name bound
+                  end
+              end in
+            module_result_map (List Expr) (List Expr)
+              (Cons Expr out) (go next_bound rest))
+    end;
+
+def module_rewrite_handlers
+    (refs : List (Pair Nat Nat)) (errors : List (Pair Nat Nat))
+    (markers : List Nat)
+    (rewrite : List Nat -> Expr -> ResolveResult Expr) (bound : List Nat)
+    : List (Pair Nat (Pair (List Nat) Expr)) ->
+      ResolveResult (List (Pair Nat (Pair (List Nat) Expr))) :=
+  fix go (clauses : List (Pair Nat (Pair (List Nat) Expr)))
+      : ResolveResult (List (Pair Nat (Pair (List Nat) Expr))) :=
+    match clauses with
+    | Nil => ROk (List (Pair Nat (Pair (List Nat) Expr)))
+        (Nil (Pair Nat (Pair (List Nat) Expr)))
+    | Cons clause rest =>
+        match clause with
+        | MkPair op payload =>
+            match payload with
+            | MkPair vars body =>
+                module_result_bind Nat
+                  (List (Pair Nat (Pair (List Nat) Expr)))
+                  (module_ref refs errors (Nil Nat) op)
+                  (fun (qualified : Nat) =>
+                    module_result_bind Expr
+                      (List (Pair Nat (Pair (List Nat) Expr)))
+                      (module_result_bind Unit Expr
+                        (module_check_names markers vars)
+                        (fun (_ : Unit) => rewrite (append Nat vars bound) body))
+                      (fun (out : Expr) =>
+                        module_result_map
+                          (List (Pair Nat (Pair (List Nat) Expr)))
+                          (List (Pair Nat (Pair (List Nat) Expr)))
+                          (fun (tail : List (Pair Nat (Pair (List Nat) Expr))) =>
+                            Cons (Pair Nat (Pair (List Nat) Expr))
+                              (MkPair Nat (Pair (List Nat) Expr) qualified
+                                (MkPair (List Nat) Expr vars out)) tail)
+                          (go rest)))
+            end
+        end
+    end;
+
+def module_rewrite_patterns
+    (refs : List (Pair Nat Nat)) (errors : List (Pair Nat Nat))
+    (markers : List Nat) (constructors : List Nat)
+    (bound : List Nat)
+    : List (Pair Nat (List Nat)) ->
+      ResolveResult (Pair (List (Pair Nat (List Nat))) (List Nat)) :=
+  fix go (patterns : List (Pair Nat (List Nat)))
+      : ResolveResult (Pair (List (Pair Nat (List Nat))) (List Nat)) :=
+    match patterns with
+    | Nil => ROk (Pair (List (Pair Nat (List Nat))) (List Nat))
+        (MkPair (List (Pair Nat (List Nat))) (List Nat)
+          (Nil (Pair Nat (List Nat))) bound)
+    | Cons pattern rest =>
+        match pattern with
+        | MkPair head vars =>
+            module_result_bind (Pair Nat (List Nat))
+              (Pair (List (Pair Nat (List Nat))) (List Nat))
+              (module_pattern_head refs errors markers constructors head vars)
+              (fun (rewritten : Pair Nat (List Nat)) =>
+                match rewritten with
+                | MkPair name new_bound =>
+                    module_result_map
+                      (Pair (List (Pair Nat (List Nat))) (List Nat))
+                      (Pair (List (Pair Nat (List Nat))) (List Nat))
+                      (fun (tail : Pair (List (Pair Nat (List Nat))) (List Nat)) =>
+                        match tail with
+                        | MkPair done scope =>
+                            MkPair (List (Pair Nat (List Nat))) (List Nat)
+                              (Cons (Pair Nat (List Nat))
+                                (MkPair Nat (List Nat) name vars) done)
+                              (append Nat new_bound scope)
+                        end)
+                      (go rest)
+                end)
+        end
+    end;
+
+def module_rewrite_rows
+    (refs : List (Pair Nat Nat)) (errors : List (Pair Nat Nat))
+    (markers : List Nat) (constructors : List Nat)
+    (rewrite : List Nat -> Expr -> ResolveResult Expr) (bound : List Nat)
+    : List (Pair (List (Pair Nat (List Nat))) Expr) ->
+      ResolveResult (List (Pair (List (Pair Nat (List Nat))) Expr)) :=
+  fix go (rows : List (Pair (List (Pair Nat (List Nat))) Expr))
+      : ResolveResult (List (Pair (List (Pair Nat (List Nat))) Expr)) :=
+    match rows with
+    | Nil => ROk (List (Pair (List (Pair Nat (List Nat))) Expr))
+        (Nil (Pair (List (Pair Nat (List Nat))) Expr))
+    | Cons row rest =>
+        match row with
+        | MkPair patterns body =>
+            module_result_bind
+              (Pair (List (Pair Nat (List Nat))) (List Nat))
+              (List (Pair (List (Pair Nat (List Nat))) Expr))
+              (module_rewrite_patterns refs errors markers constructors bound patterns)
+              (fun (rewritten : Pair (List (Pair Nat (List Nat))) (List Nat)) =>
+                match rewritten with
+                | MkPair pats scope =>
+                    module_result_bind Expr
+                      (List (Pair (List (Pair Nat (List Nat))) Expr))
+                      (rewrite scope body)
+                      (fun (out : Expr) =>
+                        module_result_map
+                          (List (Pair (List (Pair Nat (List Nat))) Expr))
+                          (List (Pair (List (Pair Nat (List Nat))) Expr))
+                          (fun (tail : List (Pair (List (Pair Nat (List Nat))) Expr)) =>
+                            Cons (Pair (List (Pair Nat (List Nat))) Expr)
+                              (MkPair (List (Pair Nat (List Nat))) Expr pats out) tail)
+                          (go rest))
+                end)
+        end
+    end;
+
+-- A telescope type sees preceding binders. The declared head is separate.
+def module_rewrite_params (markers : List Nat)
+    (rewrite : List Nat -> Expr -> ResolveResult Expr)
+    : List Nat -> List (Pair Nat Expr) ->
+      ResolveResult (Pair (List (Pair Nat Expr)) (List Nat)) :=
+  fix go (bound : List Nat) (params : List (Pair Nat Expr))
+      : ResolveResult (Pair (List (Pair Nat Expr)) (List Nat)) :=
+    match params with
+    | Nil => ROk (Pair (List (Pair Nat Expr)) (List Nat))
+        (MkPair (List (Pair Nat Expr)) (List Nat)
+          (Nil (Pair Nat Expr)) bound)
+    | Cons param rest =>
+        match param with
+        | MkPair name typ =>
+            module_result_bind Expr
+              (Pair (List (Pair Nat Expr)) (List Nat))
+              (module_guard Expr markers name (rewrite bound typ))
+              (fun (out : Expr) =>
+                module_result_map
+                  (Pair (List (Pair Nat Expr)) (List Nat))
+                  (Pair (List (Pair Nat Expr)) (List Nat))
+                  (fun (tail : Pair (List (Pair Nat Expr)) (List Nat)) =>
+                    match tail with
+                    | MkPair done scope =>
+                        MkPair (List (Pair Nat Expr)) (List Nat)
+                          (Cons (Pair Nat Expr) (MkPair Nat Expr name out) done)
+                          scope
+                    end)
+                  (go (Cons Nat name bound) rest))
+        end
+    end;
+
+def module_binder_other
+    (rewrite : List Nat -> Expr -> ResolveResult Expr)
+    (bound : List Nat) (expr : Expr)
+    : ResolveResult (Pair Expr (List Nat)) :=
+    module_result_map Expr (Pair Expr (List Nat))
+      (fun (out : Expr) => MkPair Expr (List Nat) out bound)
+      (rewrite bound expr);
+
+def module_rewrite_binders (markers : List Nat)
+    (rewrite : List Nat -> Expr -> ResolveResult Expr)
+    : Nat -> List Nat -> Expr -> ResolveResult (Pair Expr (List Nat)) :=
+  fix go (fuel : Nat) (bound : List Nat) (binders : Expr)
+      : ResolveResult (Pair Expr (List Nat)) :=
+    match fuel with
+    | Z => RErr (Pair Expr (List Nat)) 7 0
+    | S next =>
+        match binders with
+        | EBinder name typ rest =>
+            module_result_bind Expr (Pair Expr (List Nat))
+              (module_guard Expr markers name (rewrite bound typ))
+              (fun (out : Expr) =>
+                module_result_map (Pair Expr (List Nat))
+                  (Pair Expr (List Nat))
+                  (fun (tail : Pair Expr (List Nat)) =>
+                    match tail with
+                    | MkPair body scope =>
+                        MkPair Expr (List Nat) (EBinder name out body) scope
+                    end)
+                  (go next (Cons Nat name bound) rest))
+        | ESpan first past inner =>
+            module_result_map (Pair Expr (List Nat))
+              (Pair Expr (List Nat))
+              (fun (pair : Pair Expr (List Nat)) => match pair with
+                | MkPair body scope =>
+                    MkPair Expr (List Nat) (ESpan first past body) scope
+                end)
+              (go next bound inner)
+        | ENoBinder => ROk (Pair Expr (List Nat))
+            (MkPair Expr (List Nat) ENoBinder bound)
+        | EVar _ => module_binder_other rewrite bound binders
+        | EHole _ => module_binder_other rewrite bound binders
+        | ESort _ => module_binder_other rewrite bound binders
+        | ENat _ => module_binder_other rewrite bound binders
+        | EApp _ _ => module_binder_other rewrite bound binders
+        | ELam _ _ _ => module_binder_other rewrite bound binders
+        | EPi _ _ _ => module_binder_other rewrite bound binders
+        | ELet _ _ _ _ => module_binder_other rewrite bound binders
+        | EAscribe _ _ => module_binder_other rewrite bound binders
+        | EMatch _ _ => module_binder_other rewrite bound binders
+        | EFix _ _ _ _ => module_binder_other rewrite bound binders
+        | EEffectRow _ _ => module_binder_other rewrite bound binders
+        | EPerform _ _ => module_binder_other rewrite bound binders
+        | EDo _ => module_binder_other rewrite bound binders
+        | EHandle _ _ => module_binder_other rewrite bound binders
+        | EBranch _ _ _ => module_binder_other rewrite bound binders
+        | ENoBranch => module_binder_other rewrite bound binders
+        | EMultiMatch _ _ => module_binder_other rewrite bound binders
+        | EStr _ => module_binder_other rewrite bound binders
+        | EDoBind _ _ => module_binder_other rewrite bound binders
+        | EList _ => module_binder_other rewrite bound binders
+        end
+    end;
+
+def module_rewrite_expr (refs : List (Pair Nat Nat))
+    (errors : List (Pair Nat Nat)) (markers : List Nat)
+    (constructors : List Nat)
+    : Nat -> List Nat -> Expr -> ResolveResult Expr :=
+  fix go (fuel : Nat) (bound : List Nat) (expr : Expr)
+      : ResolveResult Expr :=
+    match fuel with
+    | Z => RErr Expr 7 0
+    | S next =>
+        match expr with
+        | EVar name => module_result_map Nat Expr EVar
+            (module_ref refs errors bound name)
+        | EHole marker => ROk Expr (EHole marker)
+        | ESort level => ROk Expr (ESort level)
+        | ENat value => ROk Expr (ENat value)
+        | EStr value => ROk Expr (EStr value)
+        | EApp function argument =>
+            module_result_pair Expr Expr Expr EApp
+              (go next bound function) (go next bound argument)
+        | ELam name annotation body =>
+            module_result_bind (Maybe Expr) Expr
+              (module_guard (Maybe Expr) markers name
+                (module_result_option Expr Expr
+                  (go next bound) annotation))
+              (fun (ann : Maybe Expr) =>
+                module_result_map Expr Expr
+                  (fun (out : Expr) => ELam name ann out)
+                  (go next (Cons Nat name bound) body))
+        | EPi name domain codomain =>
+            module_result_bind Expr Expr
+              (module_guard Expr markers name (go next bound domain))
+              (fun (dom : Expr) => module_result_map Expr Expr
+                (fun (cod : Expr) => EPi name dom cod)
+                (go next (Cons Nat name bound) codomain))
+        | ELet name annotation value body =>
+            module_result_bind (Maybe Expr) Expr
+              (module_guard (Maybe Expr) markers name
+                (module_result_option Expr Expr
+                  (go next bound) annotation))
+              (fun (ann : Maybe Expr) =>
+                module_result_bind Expr Expr (go next bound value)
+                  (fun (val : Expr) => module_result_map Expr Expr
+                    (fun (out : Expr) => ELet name ann val out)
+                    (go next (Cons Nat name bound) body)))
+        | EAscribe value typ =>
+            module_result_pair Expr Expr Expr EAscribe
+              (go next bound value) (go next bound typ)
+        | EMatch scrutinee branches =>
+            module_result_pair Expr Expr Expr EMatch
+              (go next bound scrutinee) (go next bound branches)
+        | EFix name binders result body =>
+            module_result_bind (Pair Expr (List Nat)) Expr
+              (module_guard (Pair Expr (List Nat)) markers name
+                (module_rewrite_binders markers
+                  (fun (scope : List Nat) (value : Expr) => go next scope value)
+                  next bound binders))
+              (fun (rewritten : Pair Expr (List Nat)) =>
+                match rewritten with
+                | MkPair params scope =>
+                    module_result_pair Expr Expr Expr
+                      (fun (typ : Expr) (out : Expr) =>
+                        EFix name params typ out)
+                      (go next scope result)
+                      (go next (Cons Nat name scope) body)
+                end)
+        | EEffectRow typ operations =>
+            module_result_pair Expr (List Nat) Expr EEffectRow
+              (go next bound typ)
+              (module_rewrite_ids refs errors (Nil Nat) operations)
+        | EPerform operation arguments =>
+            module_result_pair Nat (List Expr) Expr EPerform
+              (module_ref refs errors (Nil Nat) operation)
+              (module_result_list Expr Expr (go next bound) arguments)
+        | EDo items => module_result_map (List Expr) Expr EDo
+            (module_rewrite_do
+              (fun (scope : List Nat) (value : Expr) => go next scope value)
+              bound items)
+        | EHandle computation clauses =>
+            module_result_pair Expr
+              (List (Pair Nat (Pair (List Nat) Expr))) Expr EHandle
+              (go next bound computation)
+              (module_rewrite_handlers refs errors markers
+                (fun (scope : List Nat) (value : Expr) => go next scope value)
+                bound clauses)
+        | EBranch packed body rest =>
+            module_result_bind (Pair (List Nat) (List Nat)) Expr
+              (module_branch_pack refs errors markers constructors bound packed)
+              (fun (rewritten : Pair (List Nat) (List Nat)) =>
+                match rewritten with
+                | MkPair names branch_bound =>
+                    module_result_pair Expr Expr Expr
+                      (fun (out : Expr) (tail : Expr) =>
+                        EBranch names out tail)
+                      (go next branch_bound body) (go next bound rest)
+                end)
+        | ENoBranch => ROk Expr ENoBranch
+        | EBinder _ _ _ =>
+            module_result_map (Pair Expr (List Nat)) Expr
+              (fun (rewritten : Pair Expr (List Nat)) =>
+                match rewritten with | MkPair out _ => out end)
+              (module_rewrite_binders markers
+                (fun (scope : List Nat) (value : Expr) => go next scope value)
+                next bound expr)
+        | ENoBinder => ROk Expr ENoBinder
+        | EMultiMatch scrutinees rows =>
+            module_result_pair (List Expr)
+              (List (Pair (List (Pair Nat (List Nat))) Expr)) Expr
+              EMultiMatch
+              (module_result_list Expr Expr (go next bound) scrutinees)
+              (module_rewrite_rows refs errors markers constructors
+                (fun (scope : List Nat) (value : Expr) => go next scope value)
+                bound rows)
+        | EDoBind name action =>
+            module_result_map Expr Expr (EDoBind name)
+              (module_guard Expr markers name (go next bound action))
+        | EList elements => module_result_map (List Expr) Expr EList
+            (module_result_list Expr Expr (go next bound) elements)
+        | ESpan first past inner =>
+            module_result_map Expr Expr (ESpan first past)
+              (go next bound inner)
+        end
+    end;
+
+def module_rewrite_named_types (heads : List (Pair Nat Nat))
+    (rewrite : Expr -> ResolveResult Expr)
+    : List (Pair Nat Expr) -> ResolveResult (List (Pair Nat Expr)) :=
+  fix go (items : List (Pair Nat Expr))
+      : ResolveResult (List (Pair Nat Expr)) :=
+    match items with
+    | Nil => ROk (List (Pair Nat Expr)) (Nil (Pair Nat Expr))
+    | Cons pair rest =>
+        match pair with
+        | MkPair name typ =>
+            module_result_bind Expr (List (Pair Nat Expr)) (rewrite typ)
+              (fun (out : Expr) =>
+                module_result_map (List (Pair Nat Expr))
+                  (List (Pair Nat Expr))
+                  (fun (tail : List (Pair Nat Expr)) =>
+                    Cons (Pair Nat Expr)
+                      (MkPair Nat Expr (module_head heads name) out) tail)
+                  (go rest))
+        end
+    end;
+
+def module_rewrite_decl (fuel : Nat) (heads : List (Pair Nat Nat))
+    (refs : List (Pair Nat Nat)) (errors : List (Pair Nat Nat))
+    (markers : List Nat) (constructors : List Nat)
+    (decl : Decl) : ResolveResult Decl :=
+    module_result_bind Unit Decl (module_check_decl_head markers decl)
+      (fun (_ : Unit) => match fuel with
+    | Z => RErr Decl 7 0
+    | S _ =>
+        let rewrite : List Nat -> Expr -> ResolveResult Expr :=
+          fun (bound : List Nat) (expr : Expr) =>
+            module_rewrite_expr refs errors markers constructors fuel bound expr in
+        match decl with
+        | DDef name typ body =>
+            module_result_pair Expr Expr Decl
+              (DDef (module_head heads name))
+              (rewrite (Nil Nat) typ) (rewrite (Nil Nat) body)
+        | DAxiom name typ =>
+            module_result_map Expr Decl
+              (DAxiom (module_head heads name))
+              (rewrite (Nil Nat) typ)
+        | DInductive name params sort constructors =>
+            module_result_bind
+              (Pair (List (Pair Nat Expr)) (List Nat)) Decl
+              (module_rewrite_params markers rewrite (Nil Nat) params)
+              (fun (rewritten : Pair (List (Pair Nat Expr)) (List Nat)) =>
+                match rewritten with
+                | MkPair binders scope =>
+                    module_result_pair Expr (List (Pair Nat Expr)) Decl
+                      (fun (out_sort : Expr) (ctors : List (Pair Nat Expr)) =>
+                        DInductive (module_head heads name) binders
+                          out_sort ctors)
+                      (rewrite scope sort)
+                      (module_rewrite_named_types heads
+                        (rewrite scope) constructors)
+                end)
+        | DEffect name params operations =>
+            module_result_bind
+              (Pair (List (Pair Nat Expr)) (List Nat)) Decl
+              (module_rewrite_params markers rewrite (Nil Nat) params)
+              (fun (rewritten : Pair (List (Pair Nat Expr)) (List Nat)) =>
+                match rewritten with
+                | MkPair binders scope =>
+                    module_result_map (List (Pair Nat Expr)) Decl
+                      (fun (ops : List (Pair Nat Expr)) =>
+                        DEffect (module_head heads name) binders ops)
+                      (module_rewrite_named_types heads
+                        (rewrite scope) operations)
+                end)
+        | DImport path => ROk Decl (DImport path)
+        | DIntrinsic name typ primitive specialization =>
+            module_result_pair Expr (Maybe Expr) Decl
+              (fun (out : Expr) (spec : Maybe Expr) =>
+                DIntrinsic (module_head heads name) out primitive spec)
+              (rewrite (Nil Nat) typ)
+              (module_result_option Expr Expr
+                (rewrite (Nil Nat)) specialization)
+        | DExtern name typ external =>
+            module_result_map Expr Decl
+              (fun (out : Expr) =>
+                DExtern (module_head heads name) out external)
+              (rewrite (Nil Nat) typ)
+        | DRepresentation target label =>
+            module_result_map Nat Decl
+              (fun (qualified : Nat) => DRepresentation qualified label)
+              (module_ref refs errors (Nil Nat) target)
+        end
+    end);
+
+-- Map validation is performed once, before any declaration is rewritten.
+-- RErr 5/6 comes from an unresolved/ambiguous free reference, 7 from fuel,
+-- and 8 from malformed maps or a marker used as a declaration/binder.
+def module_rewrite_decls (fuel : Nat) (heads : List (Pair Nat Nat))
+    (refs : List (Pair Nat Nat)) (errors : List (Pair Nat Nat))
+    (markers : List Nat) (constructors : List Nat)
+    (decls : List Decl) : ResolveResult (List Decl) :=
+    match fuel with
+    | Z => RErr (List Decl) 7 0
+    | S _ =>
+        match module_invalid_maps heads refs errors with
+        | Just key => RErr (List Decl) 8 key
+        | Nothing => module_result_list Decl Decl
+            (module_rewrite_decl fuel heads refs errors markers constructors) decls
+        end
+    end;
