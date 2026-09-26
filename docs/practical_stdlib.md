@@ -26,6 +26,19 @@ recorded in the [changelog](../CHANGELOG.md).
 conversion that rejects surrogates and out-of-range values. Its
 `utf8_scalar_bytes` encoder requires an already validated scalar.
 
+## Function composition
+
+`std/logic.ouro` provides `compose A B C after before : A -> C`. It applies
+`before` to the input, then `after` to the intermediate value:
+
+```ouro
+import "../std/logic.ouro";
+import "../std/prelude.ouro";
+
+def twice_then_increment : Nat -> Nat :=
+  compose Nat Nat Nat (add 1) (mul 2);
+```
+
 ## Fallible values
 
 `std/result.ouro` treats `Either E A` as a result: `Left` carries the error
