@@ -40,6 +40,58 @@ def parse_params (parse : Nat -> Mode -> List Token -> Nat -> Value -> ParseResu
         end
     end;
 
+-- Only leading level-zero Type groups opt in to parameter inference.
+def parse_implicit_params
+    (fuel : Nat) (toks : List Token) (pos : Nat)
+    : ParseResult (Pair Nat (List (Pair Nat Expr))) :=
+  (fix go (remaining : Nat) (items : List Token) (position : Nat)
+      : ParseResult (Pair Nat (List (Pair Nat Expr))) :=
+    match remaining with
+    | Z => PErr (Pair Nat (List (Pair Nat Expr))) position
+    | S next =>
+        match eqNat(token_tag(peek items), tagBraceL) with
+        | False => POk (Pair Nat (List (Pair Nat Expr)))
+            (MkPair Nat (List (Pair Nat Expr)) Z (Nil (Pair Nat Expr))) items position
+        | True =>
+            bindParseResult Unit (Pair Nat (List (Pair Nat Expr)))
+              (expect_brace_l items position)
+              (fun (_open : Unit) (after_open : List Token) (name_pos : Nat) =>
+                bindParseResult Nat (Pair Nat (List (Pair Nat Expr)))
+                  (expect_ident after_open name_pos)
+                  (fun (name : Nat) (after_name : List Token) (colon_pos : Nat) =>
+                    bindParseResult Unit (Pair Nat (List (Pair Nat Expr)))
+                      (expect_colon after_name colon_pos)
+                      (fun (_colon : Unit) (after_colon : List Token) (type_pos : Nat) =>
+                        match tokenIsType(peek after_colon) with
+                        | Nothing => PErr (Pair Nat (List (Pair Nat Expr))) type_pos
+                        | Just level =>
+                            match eqNat level Z with
+                            | False => PErr (Pair Nat (List (Pair Nat Expr))) type_pos
+                            | True =>
+                                match bump after_colon type_pos with
+                                | MkPair after_type close_pos =>
+                                    bindParseResult Unit (Pair Nat (List (Pair Nat Expr)))
+                                      (expect_brace_r after_type close_pos)
+                                      (fun (_close : Unit) (tail : List Token) (tail_pos : Nat) =>
+                                        bindParseResult (Pair Nat (List (Pair Nat Expr)))
+                                          (Pair Nat (List (Pair Nat Expr)))
+                                          (go next tail tail_pos)
+                                          (fun (more : Pair Nat (List (Pair Nat Expr)))
+                                              (rest : List Token) (end_pos : Nat) =>
+                                            match more with
+                                            | MkPair count params =>
+                                                POk (Pair Nat (List (Pair Nat Expr)))
+                                                  (MkPair Nat (List (Pair Nat Expr)) (S count)
+                                                    (Cons (Pair Nat Expr)
+                                                      (MkPair Nat Expr name (ESort Z)) params))
+                                                  rest end_pos
+                                            end))
+                                end
+                            end
+                        end)))
+        end
+    end) fuel toks pos;
+
 def parse_ctors (parse : Nat -> Mode -> List Token -> Nat -> Value -> ParseResult Value)
     : Nat -> List Token -> Nat -> Bool -> ParseResult (List (Pair Nat Expr)) :=
   fix parse_ctors (fuel : Nat) (toks : List Token) (pos : Nat) (seen : Bool) : ParseResult (List (Pair Nat Expr)) :=
@@ -186,6 +238,86 @@ def parse_native_decl
                             end)))))
     end;
 
+def parse_inductive_decl
+    (parse : Nat -> Mode -> List Token -> Nat -> Value -> ParseResult Value)
+    (fuel : Nat) (toks : List Token) (pos : Nat) : ParseResult Decl :=
+    bindParseResult Unit Decl (expect_keyword kwInductive toks pos)
+      (fun (_kw : Unit) (toks2 : List Token) (pos2 : Nat) =>
+        bindParseResult Nat Decl (expect_ident toks2 pos2)
+          (fun (name : Nat) (toks3 : List Token) (pos3 : Nat) =>
+            bindParseResult (Pair Nat (List (Pair Nat Expr))) Decl
+              (parse_implicit_params fuel toks3 pos3)
+              (fun (marked : Pair Nat (List (Pair Nat Expr)))
+                  (toks4 : List Token) (pos4 : Nat) =>
+                match marked with
+                | MkPair count prefix =>
+                    bindParseResult (List (Pair Nat Expr)) Decl
+                      (parse_params parse fuel toks4 pos4)
+                      (fun (explicit : List (Pair Nat Expr))
+                          (toks5 : List Token) (pos5 : Nat) =>
+                        bindParseResult Unit Decl (expect_colon toks5 pos5)
+                          (fun (_colon : Unit) (toks6 : List Token) (pos6 : Nat) =>
+                            bindParseResult Expr Decl (parse_expr parse fuel toks6 pos6)
+                              (fun (family : Expr) (toks7 : List Token) (pos7 : Nat) =>
+                                bindParseResult Unit Decl (expect_colon_eq toks7 pos7)
+                                  (fun (_assign : Unit) (toks8 : List Token) (pos8 : Nat) =>
+                                    bindParseResult (List (Pair Nat Expr)) Decl
+                                      (parse_ctors parse fuel toks8 pos8 False)
+                                      (fun (ctors : List (Pair Nat Expr))
+                                          (toks9 : List Token) (pos9 : Nat) =>
+                                        bindParseResult Unit Decl
+                                          (skip_optional_semi toks9 pos9)
+                                          (fun (_semi : Unit) (rest : List Token) (end_pos : Nat) =>
+                                            POk Decl
+                                              (DInductive name
+                                                (append (Pair Nat Expr) prefix explicit)
+                                                family ctors count)
+                                              rest end_pos))))))
+                end)));
+
+def parse_def_after_params
+    (parse : Nat -> Mode -> List Token -> Nat -> Value -> ParseResult Value)
+    (fuel : Nat) (name : Nat) (marked : Nat)
+    (params : List (Pair Nat Expr)) (toks : List Token) (pos : Nat)
+    : ParseResult Decl :=
+  bindParseResult Unit Decl (expect_colon toks pos)
+    (fun (_colon : Unit) (after_colon : List Token) (type_pos : Nat) =>
+      bindParseResult Expr Decl (parse_expr parse fuel after_colon type_pos)
+        (fun (result : Expr) (after_type : List Token) (assign_pos : Nat) =>
+          bindParseResult Unit Decl (expect_colon_eq after_type assign_pos)
+            (fun (_assign : Unit) (after_assign : List Token) (body_pos : Nat) =>
+              bindParseResult Expr Decl (parse_expr parse fuel after_assign body_pos)
+                (fun (body : Expr) (after_body : List Token) (semi_pos : Nat) =>
+                  bindParseResult Unit Decl (skip_optional_semi after_body semi_pos)
+                    (fun (_semi : Unit) (rest : List Token) (end_pos : Nat) =>
+                      POk Decl
+                        (DDef name (mk_pi_chain params result)
+                          (mk_typed_lam_chain params body)
+                          marked (length (Pair Nat Expr) params))
+                        rest end_pos)))));
+
+def parse_def_decl
+    (parse : Nat -> Mode -> List Token -> Nat -> Value -> ParseResult Value)
+    (fuel : Nat) (toks : List Token) (pos : Nat) : ParseResult Decl :=
+  bindParseResult Unit Decl (expect_keyword kwDef toks pos)
+    (fun (_def : Unit) (after_def : List Token) (name_pos : Nat) =>
+      bindParseResult Nat Decl (expect_ident after_def name_pos)
+        (fun (name : Nat) (after_name : List Token) (prefix_pos : Nat) =>
+          bindParseResult (Pair Nat (List (Pair Nat Expr))) Decl
+            (parse_implicit_params fuel after_name prefix_pos)
+            (fun (prefix : Pair Nat (List (Pair Nat Expr)))
+                (after_prefix : List Token) (params_pos : Nat) =>
+              match prefix with
+              | MkPair marked marked_params =>
+                  bindParseResult (List (Pair Nat Expr)) Decl
+                    (parse_params parse fuel after_prefix params_pos)
+                    (fun (explicit : List (Pair Nat Expr))
+                        (after_params : List Token) (colon_pos : Nat) =>
+                      parse_def_after_params parse fuel name marked
+                        (append (Pair Nat Expr) marked_params explicit)
+                        after_params colon_pos)
+              end)));
+
 -- @bound(cyclo <= 40)
 def parse_decl (parse : Nat -> Mode -> List Token -> Nat -> Value -> ParseResult Value)
     (fuel : Nat) (toks : List Token) (pos : Nat) : ParseResult Decl :=
@@ -193,24 +325,7 @@ def parse_decl (parse : Nat -> Mode -> List Token -> Nat -> Value -> ParseResult
     | Nothing => PErr Decl pos
     | Just kw =>
         match eqNat kw kwDef with
-        | True =>
-            bindParseResult Unit Decl (expect_keyword kwDef toks pos)
-              (fun (_u : Unit) (toks2 : List Token) (pos2 : Nat) =>
-                bindParseResult Nat Decl (expect_ident toks2 pos2)
-                  (fun (n : Nat) (toks3 : List Token) (pos3 : Nat) =>
-                    bindParseResult (List (Pair Nat Expr)) Decl (parse_params parse fuel toks3 pos3)
-                      (fun (ps : List (Pair Nat Expr)) (toks4 : List Token) (pos4 : Nat) =>
-                        bindParseResult Unit Decl (expect_colon toks4 pos4)
-                          (fun (_u2 : Unit) (toks5 : List Token) (pos5 : Nat) =>
-                            bindParseResult Expr Decl (parse_expr parse fuel toks5 pos5)
-                              (fun (ret : Expr) (toks6 : List Token) (pos6 : Nat) =>
-                                bindParseResult Unit Decl (expect_colon_eq toks6 pos6)
-                                  (fun (_u3 : Unit) (toks7 : List Token) (pos7 : Nat) =>
-                                    bindParseResult Expr Decl (parse_expr parse fuel toks7 pos7)
-                                      (fun (body : Expr) (toks8 : List Token) (pos8 : Nat) =>
-                                        bindParseResult Unit Decl (skip_optional_semi toks8 pos8)
-                                          (fun (_u4 : Unit) (toks9 : List Token) (pos9 : Nat) =>
-                                            POk Decl (DDef(n, mk_pi_chain ps ret, mk_typed_lam_chain ps body)) toks9 pos9))))))))
+        | True => parse_def_decl parse fuel toks pos
         | False =>
             match eqNat kw kwAxiom with
             | True =>
@@ -227,24 +342,7 @@ def parse_decl (parse : Nat -> Mode -> List Token -> Nat -> Value -> ParseResult
                                     POk Decl (DAxiom n ty) toks6 pos6)))))
             | False =>
                 match eqNat kw kwInductive with
-                | True =>
-                    bindParseResult Unit Decl (expect_keyword kwInductive toks pos)
-                      (fun (_u : Unit) (toks2 : List Token) (pos2 : Nat) =>
-                        bindParseResult Nat Decl (expect_ident toks2 pos2)
-                          (fun (n : Nat) (toks3 : List Token) (pos3 : Nat) =>
-                            bindParseResult (List (Pair Nat Expr)) Decl (parse_params parse fuel toks3 pos3)
-                              (fun (ps : List (Pair Nat Expr)) (toks4 : List Token) (pos4 : Nat) =>
-                                bindParseResult Unit Decl (expect_colon toks4 pos4)
-                                  (fun (_u2 : Unit) (toks5 : List Token) (pos5 : Nat) =>
-                                    bindParseResult Expr Decl (parse_expr parse fuel toks5 pos5)
-                                      (fun (sort : Expr) (toks6 : List Token) (pos6 : Nat) =>
-                                        bindParseResult Unit Decl (expect_colon_eq toks6 pos6)
-                                          (fun (_u3 : Unit) (toks7 : List Token) (pos7 : Nat) =>
-                                            bindParseResult (List (Pair Nat Expr)) Decl (parse_ctors parse fuel toks7 pos7 False)
-                                              (fun (cs : List (Pair Nat Expr)) (toks8 : List Token) (pos8 : Nat) =>
-                                                bindParseResult Unit Decl (skip_optional_semi toks8 pos8)
-                                                  (fun (_u4 : Unit) (toks9 : List Token) (pos9 : Nat) =>
-                                                    POk Decl (DInductive n ps sort cs) toks9 pos9))))))))
+                | True => parse_inductive_decl parse fuel toks pos
                 | False =>
                     match eqNat kw kwEffect with
                     | True =>
