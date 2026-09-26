@@ -23,7 +23,7 @@ Development changes; see the [compatibility policy](docs/stability.md).
 
 - Run PR parity and syntax-quality gates in separate required jobs to shorten
   the serial `checks` group; nightly retains both gates in its `checks` group.
-- Split compiler-checking fixtures across twelve PR and nightly jobs while
+- Split compiler-checking fixtures across sixteen PR and nightly jobs while
   retaining complete, source-bound suite coverage; see [CI](docs/ci.md#local-profiles).
 - Build release toolchains from a [checked compact source copy](docs/canonical_source.md#materialization),
   retaining original-source checks and full generated C equality.

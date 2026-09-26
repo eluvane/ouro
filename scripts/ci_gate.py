@@ -25,7 +25,7 @@ from repo_support import bind_relative_path, hash_json, sha256_file, write_json_
 ROOT = Path(__file__).resolve().parents[1]
 rel = bind_relative_path(ROOT, resolve=True)
 REPORT_KIND = "ouro.ci-gate-report.v1"
-COMPILER_SHARDS = 12
+COMPILER_SHARDS = 16
 
 
 @dataclass(frozen=True)
@@ -1142,14 +1142,25 @@ def run_gate(gate: Gate, *, out: Path) -> dict[str, Any]:
     gate_dir.mkdir(parents=True, exist_ok=True)
     log = gate_dir / "gate.log"
     env = env_for(gate, out)
-    print(f"CI_GATE_START {gate.name} cmd={shlex.join(gate.cmd)}")
+    print(f"CI_GATE_START {gate.name} cmd={shlex.join(gate.cmd)}", flush=True)
     with log.open("w", encoding="utf-8") as f:
         p = subprocess.Popen(gate.cmd, cwd=ROOT, env=env, text=True, stdout=f, stderr=subprocess.STDOUT)
         last_heartbeat = time.perf_counter()
+        last_fixture_progress: tuple[tuple[str, ...], tuple[str, ...]] | None = None
         while p.poll() is None:
             now = time.perf_counter()
             if now - last_heartbeat >= 30.0:
-                print(f"CI_GATE_PROGRESS {gate.name} elapsed_s={now - started:.1f} log={rel(log)}")
+                print(f"CI_GATE_PROGRESS {gate.name} elapsed_s={now - started:.1f} log={rel(log)}", flush=True)
+                if gate.name.startswith("compiler-checking-"):
+                    suite_out = Path(env["TEST_SUITE_OUT"])
+                    built = tuple(sorted(path.name.removesuffix(".exe.build.json")
+                                         for path in suite_out.glob("*.exe.build.json")))
+                    completed = tuple(sorted(path.stem for path in suite_out.glob("*.out")
+                                             if not path.name.startswith("cli-")))
+                    progress = (built, completed)
+                    if progress != last_fixture_progress:
+                        print(f"CI_GATE_FIXTURE_PROGRESS {gate.name} built={','.join(built)} completed={','.join(completed)}", flush=True)
+                        last_fixture_progress = progress
                 last_heartbeat = now
             time.sleep(0.25)
         rc = int(p.returncode or 0)
@@ -1160,7 +1171,7 @@ def run_gate(gate: Gate, *, out: Path) -> dict[str, Any]:
         print(f"CI_GATE_LOG_TAIL {gate.name} lines={len(tail)}")
         for line in tail:
             print(line)
-    print(f"CI_GATE_DONE {gate.name} status={status} rc={rc} elapsed_s={time.perf_counter() - started:.3f} log={rel(log)}")
+    print(f"CI_GATE_DONE {gate.name} status={status} rc={rc} elapsed_s={time.perf_counter() - started:.3f} log={rel(log)}", flush=True)
     return {
         "name": gate.name,
         "blocking": gate.blocking,
