@@ -66,7 +66,7 @@ KEYWORD.update({"kwImport": "property:import-dependency-order", "kwEffect": "fea
                 "kwWhere": "feature:form:handler", "kwDo": "property:test-known-counts",
                 "kwPerform": "feature:form:handler", "kwHandle": "feature:form:handler", "kwRecord": "feature:form:record",
                 "kwAxiom": "negative:effect-root-assumption-type", "kwExtern": "feature:form:extern-declaration",
-                "kwOpen": "feature:parity:imports-open-local"})
+                "kwOpen": "feature:parity:imports-open-local", "kwPrivate": "feature:parity:imports-private"})
 
 # Each exception names an actual missing oracle, rather than accepting new
 # source inventory items automatically. Migration checks treat these as gaps.
