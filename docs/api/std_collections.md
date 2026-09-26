@@ -2,7 +2,7 @@
 
 Practical collection helpers layered over the small prelude/listx core.
 
-Declarations: 25.
+Declarations: 26.
 
 ## def nth_maybe
 
@@ -128,6 +128,12 @@ Keys and elements retain first-seen order; eq must identify equivalent keys.
 
 ```
 def partition_map (A : Type) (L : Type) (R : Type) (f : A -> Either L R)
+```
+
+## def list_partition
+
+```
+def list_partition (A : Type) (p : A -> Bool)
 ```
 
 ## def list_collect_results
