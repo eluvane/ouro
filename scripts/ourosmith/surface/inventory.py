@@ -51,6 +51,7 @@ EXPR = {
     "ERange": "feature:form:range-literal",
     "ENamedCall": "feature:form:named-call",
     "EIf": "feature:form:if-expression",
+    "EIfLet": "feature:form:if-let-expression",
 }
 DECL = {"DDef": "feature:prelude", "DAxiom": "negative:effect-root-assumption-type", "DInductive": "feature:prelude",
         "DEffect": "feature:form:handler", "DImport": "property:import-dependency-order",

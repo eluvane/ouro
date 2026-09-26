@@ -24,6 +24,8 @@ Development changes; see the [compatibility policy](docs/stability.md).
 - Byte-list literals `b"..." : List Nat` with strict ASCII source and `\xHH`
   escapes for arbitrary bytes; malformed escapes and raw non-ASCII are rejected.
 
+- `if let Constructor fields := value then expr else expr` for flat constructor
+  patterns, lowered to a complete checked case with branch-local fields.
 - Total `if condition then expr else expr` expressions for the registered
   `Bool` type, with both arms checked at the result type.
 - Exclusive `0..10` and inclusive `0..=10` literal-endpoint `NatRange` values,

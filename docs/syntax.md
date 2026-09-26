@@ -204,6 +204,28 @@ known constructor. The condition becomes the single scrutinee of a checked
 two-arm case; the first constructor selects `then`, and the second selects
 `else`. Parenthesize a conditional when passing it as an argument.
 
+Use `if let` to handle one flat constructor pattern:
+
+```ouro
+import "std/types.ouro";
+
+def from_maybe (item : Maybe Nat) (fallback : Nat) : Nat :=
+  if let Just value := item then value else fallback;
+```
+
+The `else` arm is mandatory. Constructor fields may be named or ignored with
+`_`; named fields are in scope only in `then`. The subject is evaluated once
+as the scrutinee of a complete checked case, and both arms are checked against
+the result type. The constructor must belong to the subject's non-indexed
+inductive family, and the pattern must name exactly its fields. Nested patterns,
+guards, and extraction into the surrounding scope are not part of this form.
+Parenthesize `if let` when passing it as an argument.
+If the subject's nominal family cannot be determined from its type, ascribe the
+subject explicitly. For example, when `item` has an alias type defined as
+`def MaybeNat : Type := Maybe Nat`, use `(item : Maybe Nat)` as the subject.
+A result type does not select a subject family; an unresolved subject fails
+checking rather than guessing from the pattern.
+
 A family can opt in to omitting a leading universe parameter on saturated
 constructor calls:
 
