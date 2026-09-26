@@ -125,6 +125,21 @@ def length (A : Type) : List A -> Nat :=
 def values : List Nat := [{', '.join(map(str, values))}{',' if values else ''}];
 def result : Nat := values |> length Nat;
 """, len(values), False
+    yield "list-spread", PRELUDE + f"""inductive List (A : Type) : Type := | Nil : List A | Cons : A -> List A -> List A;
+def eight (value : Nat) : Nat :=
+  let two : Nat := add value value in
+  let four : Nat := add two two in
+  add four four;
+def score : List Nat -> Nat :=
+  fix score (items : List Nat) : Nat :=
+    match items with
+    | Nil => Z
+    | Cons head rest => add head (eight (score rest))
+    end;
+def rest : List Nat := [2];
+def values : List Nat := [{n}, {m}, ..rest];
+def result : Nat := score values;
+""", n + 8 * m + 128, False
     yield "record", PRELUDE + f"""record Point : Type where
   x : Nat;
   y : Nat;

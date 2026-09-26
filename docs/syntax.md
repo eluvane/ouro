@@ -390,6 +390,25 @@ Heterogeneous lists are rejected. A nonempty list may end with a comma;
 and `Cons` constructors, and the compiler checks every element against the
 selected type.
 
+A final `..` can reuse an existing list as the tail:
+
+```ouro
+def rest : List Nat := [S Z];
+def joined : List Nat := [Z, ..rest];
+def copy : List Nat := [..rest,];
+```
+
+The tail must have the same exact nominal `List A` type. With no expected
+type, a direct, unambiguous `List A` type hint from the tail suffices, as in
+`let copy := [..rest] in copy`; an untyped empty tail does not. The compiler
+binds each prefix value in source order and then the tail once before
+constructing the `Cons` spine. It allocates a new cell for each prefix value
+and reuses the tail list. A spread must be the sole final tail; it is not an
+expression outside `[...]`. One comma before `]` is optional. Nonfinal,
+multiple, or doubled-comma spreads are syntax errors. See
+[Ergonomic syntax](language/ergonomic-syntax.md#list-spreads) for the
+lowering boundary.
+
 ## Records
 
 Records are a bounded surface form over a single-constructor inductive type and
