@@ -39,6 +39,9 @@ def front : Nat := {n};
 def back : Nat := {m};
 def result : Nat := combine(back :=, front :=);
 """, n + m, False
+    yield "trailing-lambda", PRELUDE + f"""def with_callback (value : Nat) (callback : Nat -> Nat) : Nat := callback value;
+def result : Nat := with_callback({n}) {{ value -> add value {m} }};
+""", n + m, False
     yield "large-elimination", PRELUDE + f"""def resultType (n : Nat) : Type :=
   match n with | Z => Nat | S _ => Nat end;
 def value : resultType Z := {n};

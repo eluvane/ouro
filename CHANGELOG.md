@@ -6,6 +6,9 @@ Development changes; see the [compatibility policy](docs/stability.md).
 
 ### Added
 
+- Trailing `{ value -> body }` callbacks after nonempty positional call groups,
+  checked as ordinary final lambda arguments. See
+  [Trailing lambda calls](docs/language/ergonomic-syntax.md#trailing-lambda-calls).
 - Exclusive `0..10` and inclusive `0..=10` literal-endpoint `NatRange` values,
   checked through nominal Nat, bound, and range representation roles.
 - Final-tail list spreads `[first, ..rest]` build checked `List A` constructor

@@ -124,6 +124,26 @@ remains one argument: changing that would break existing application syntax.
 No new binders are introduced, and argument evaluation/effects follow the
 same nested `EApp` tree as ordinary application.
 
+## Trailing lambda calls
+
+After a nonempty positional call group, `{ name -> body }` supplies one final
+callback argument:
+
+```ouro
+def with_value (value : Nat) (callback : Nat -> Nat) : Nat := callback value;
+
+def next : Nat := with_value(2) { value -> add value 1 };
+```
+
+This has the same checked application as
+`with_value 2 (fun value => add value 1)`. The callback parameter uses the
+expected function type, as for a short `fun` lambda. The body is one
+expression and may contain local bindings, record literals, and record
+updates; record literals retain their usual nominal type-context requirement.
+The callback is evaluated after the positional arguments in their source
+order. The braces and `->` are required: `f() { x -> x }`, `f { x -> x }`,
+`f(a) { x y -> body }`, and a trailing block after a named call are rejected.
+
 ## Named calls and public labels
 
 A top-level definition can give a parameter a public call label distinct from
