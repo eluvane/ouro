@@ -562,8 +562,8 @@ uses `let!` for an action's result, and uses ordinary `let` for a pure value:
 
 ```ouro
 def echo : IO Unit :=
-  do let prompt : String := "Name: ";
-     print prompt;
+  do let label : String := "Name: ";
+     print label;
      let! line := readLine;
      println line
 ```
