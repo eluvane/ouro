@@ -5,7 +5,8 @@ import "doc_model.ouro",
   "../std/json_types.ouro",
   "../std/jsonrpc.ouro",
   "../std/pathx.ouro",
-  "fix/lex.ouro";
+  "fix/lex.ouro",
+  "../compiler/source_text.ouro";
 
 -- Documents the client has open, their aggregate byte size, the canonical
 -- workspace root authorized by the launcher, and whether shutdown was
@@ -588,42 +589,76 @@ def lsp_import_tokens (text : String) : List FxTok :=
           end
       end) (fx_lex text) False False;
 
--- Ouro accepts five escapes and preserves an unknown backslash pair.
+-- Import paths use the compiler's braced Unicode scalar decoder.
 def lsp_import_decode : List Nat -> List Nat -> Maybe String :=
-  fix decode (codes : List Nat) (acc : List Nat) : Maybe String :=
-    match codes with
-    | Nil => Nothing String
-    | Cons code rest =>
-        match eq_nat code ch_quote with
-        | True => match rest with
-            | Nil => Just(String, str_of_codes (reverse Nat acc))
-            | Cons _ _ => Nothing String
-            end
-        | False => match eq_nat code ch_bslash with
-            | False => decode(rest, Cons Nat code acc)
-            | True => match rest with
-                | Nil => Nothing String
-                | Cons escaped after =>
-                    match lookup Nat Nat eq_nat escaped
-                      [ MkPair Nat Nat 110 ch_lf, MkPair Nat Nat 116 ch_tab
-                      , MkPair Nat Nat 114 ch_cr, MkPair Nat Nat ch_quote ch_quote
-                      , MkPair Nat Nat ch_bslash ch_bslash ] with
-                    | Just decoded => decode(after, Cons Nat decoded acc)
-                    | Nothing => decode(after, Cons Nat escaped (Cons Nat ch_bslash acc))
-                    end
-                end
-            end
-        end
-    end;
+  fun (input : List Nat) (initial : List Nat) =>
+    (fix decode (fuel : Nat) (codes : List Nat) (acc : List Nat)
+        : Maybe String :=
+      match fuel with
+      | Z => Nothing String
+      | S remaining =>
+          match codes with
+          | Nil => Nothing String
+          | Cons code rest =>
+              match eq_nat code ch_quote with
+              | True => match rest with
+                  | Nil => Just(String, str_of_codes (reverse Nat acc))
+                  | Cons _ _ => Nothing String
+                  end
+              | False => match eq_nat code ch_bslash with
+                  | False => decode(remaining, rest, Cons Nat code acc)
+                  | True => match rest with
+                      | Nil => Nothing String
+                      | Cons escaped after =>
+                          let braced : Bool := match after with
+                            | Nil => False
+                            | Cons brace _ => eq_nat brace 123
+                            end in
+                          match andb(eq_nat escaped 117, braced) with
+                          | True => match source_unicode_braced after with
+                            | Nothing => Nothing String
+                            | Just parsed => match parsed with
+                              | MkPair bytes tail => decode(remaining, tail,
+                                  append Nat (reverse Nat bytes) acc)
+                              end
+                            end
+                          | False =>
+                              match lookup Nat Nat eq_nat escaped
+                                [ MkPair Nat Nat 110 ch_lf, MkPair Nat Nat 116 ch_tab
+                                , MkPair Nat Nat 114 ch_cr, MkPair Nat Nat ch_quote ch_quote
+                                , MkPair Nat Nat ch_bslash ch_bslash ] with
+                              | Just decoded => decode(remaining, after,
+                                  Cons Nat decoded acc)
+                              | Nothing => decode(remaining, after,
+                                  Cons Nat escaped (Cons Nat ch_bslash acc))
+                              end
+                          end
+                      end
+                  end
+              end
+          end
+      end) (S (length Nat input)) input initial;
 
 def lsp_import_spelling (token : FxTok) : Maybe String :=
-    match str_codes (fx_tok_text token) with
-    | Nil => Nothing String
-    | Cons quote rest =>
-        match eq_nat quote ch_quote with
-        | False => Nothing String
-        | True => lsp_import_decode(rest, Nil Nat)
+    let spelling : List Nat := str_codes (fx_tok_text token) in
+    match source_is_raw_start spelling with
+    | True => match source_take_raw spelling with
+      | Nothing => Nothing String
+      | Just parsed => match parsed with
+        | MkPair bytes tail => match tail with
+          | Nil => Just(String, str_of_codes bytes)
+          | Cons _ _ => Nothing String
+          end
         end
+      end
+    | False => match spelling with
+      | Nil => Nothing String
+      | Cons quote rest =>
+          match eq_nat quote ch_quote with
+          | False => Nothing String
+          | True => lsp_import_decode(rest, Nil Nat)
+          end
+      end
     end;
 
 def imports_of (text : String) : List String :=

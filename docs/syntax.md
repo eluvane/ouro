@@ -67,11 +67,12 @@ let x : A := value in body
 A local helper can put its typed parameters next to its name:
 
 ```ouro
-let twice (x : Nat) : Nat := add x x in twice 2
+let twice (x : Nat) := add x x in twice 2
 ```
 
-This is a non-recursive lambda-binding. Parameterized local helpers require an
-explicit result annotation; [Ergonomic syntax](language/ergonomic-syntax.md#typed-local-helper-declarations)
+This is a non-recursive lambda-binding. Parameterized local helpers require
+typed parameters; the result annotation may be omitted when the body type can
+be inferred. [Ergonomic syntax](language/ergonomic-syntax.md#typed-local-helper-declarations)
 explains their scope and desugaring.
 
 ## Inductive data and pattern matching
@@ -221,10 +222,32 @@ remains an identifier under the existing identifier grammar. These literals do
 not select a machine integer type or perform a narrowing conversion. Typed
 numeric suffixes are not supported.
 
-String literals support `\n`, `\t`, `\r`, `\"`, and `\\` escapes:
+String literals support `\n`, `\t`, `\r`, `\"`, `\\`, and braced Unicode
+scalar escapes:
 
 ```ouro
-def message : String := "hello\n";
+def message : String := "hello\n\u{1F600}";
+```
+
+`\u{...}` requires 1–6 ASCII hexadecimal digits (either case) and a value
+at most `10FFFF` outside the surrogate range `D800..DFFF`. It contributes the
+scalar's UTF-8 bytes to the existing byte-based `String`; `\u{0}` contributes
+one NUL byte. An unclosed braced escape, invalid digits, and invalid scalars
+are lexical errors. Other unknown backslash pairs retain their backslash and
+following character. Quoted import paths use the same decoding. Ordinary
+quoted strings can contain physical line breaks; they do not strip indentation.
+
+For text containing backslashes or quotes, `r#"..."#` is a raw `String`
+literal. It preserves every byte between the delimiters, including physical
+line breaks, UTF-8 bytes, and backslashes; `\n` is two bytes rather than a
+newline. The first `"#` closes it even when preceded by a backslash. Exactly
+one `#` is supported, and an unclosed raw literal is a lexical error. Raw
+quoted imports use the same spelling and preserve their path bytes before the
+usual path normalization.
+
+```ouro
+def path : String := r#"C:\temp\data"#;
+def quote : String := r#"say "hello""#;
 ```
 
 Import `std/string.ouro` to use the standard `String` type and helpers. A
@@ -252,7 +275,7 @@ embedded-NUL limits.
 List literals require an expected `List A` type:
 
 ```ouro
-def values : List Nat := [Z, S Z, S (S Z)];
+def values : List Nat := [Z, S Z, S (S Z),];
 def empty : List Nat := [];
 ```
 
@@ -262,8 +285,9 @@ A local type ascription can provide the expected element type:
 def count : Nat := (([Z, S Z] : List Nat) |> length Nat);
 ```
 
-Untyped `[]`, ambiguous list literals, and trailing commas are rejected. List
-literals lower to the standard `Nil` and `Cons` constructors.
+Untyped `[]` and ambiguous list literals are rejected. A nonempty list may
+end with a comma; `[]` remains the empty spelling. List literals lower to the
+standard `Nil` and `Cons` constructors.
 
 ## Records
 

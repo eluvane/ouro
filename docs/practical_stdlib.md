@@ -9,7 +9,7 @@ Choose a module by task; the generated [API reference](api/README.md) owns decla
 | Task | Modules |
 | --- | --- |
 | Shared types and results | `std/types.ouro`, `std/prelude.ouro`, `std/data.ouro`, `std/result.ouro` |
-| Text and numbers | `std/string.ouro`, `std/text.ouro`, `std/collections.ouro`, `std/num.ouro` |
+| Text and numbers | `std/string.ouro`, `std/text.ouro`, `std/collections.ouro`, `std/num.ouro`, `std/utf8_scalar.ouro` |
 | CLI and configuration | `std/args.ouro`, `std/cli.ouro`, `std/config.ouro`, `std/configx.ouro` |
 | Files and workspace | `std/fs.ouro`, `std/fsx.ouro`, `std/fs_walk.ouro`, `std/fs_replace.ouro`, `std/workspace.ouro` |
 | Data | `std/lines.ouro`, `std/json.ouro`, `std/jsonx.ouro`, `std/csv.ouro`, `std/table.ouro`, `std/tablex.ouro` |
@@ -20,6 +20,10 @@ Choose a module by task; the generated [API reference](api/README.md) owns decla
 without importing platform IO; `std/executable.ouro` supplies the current
 image-path query. The pre-1.0 collection names and removed `_go` helpers are
 recorded in the [changelog](../CHANGELOG.md).
+
+`std/utf8_scalar.ouro` provides `utf8_scalar_checked` for a scalar-to-UTF-8
+conversion that rejects surrogates and out-of-range values. Its
+`utf8_scalar_bytes` encoder requires an already validated scalar.
 
 ## CLI arguments
 
