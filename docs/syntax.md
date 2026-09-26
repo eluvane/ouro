@@ -47,14 +47,33 @@ dependencies; a selective import exposes only the selected direct declarations
 of its target. An independent plain path can still expose the same declaration.
 Every imported declaration and body is checked even when hidden.
 
+Declarations are public by default. Prefix a declaration with `private` to
+keep an internal helper available inside its source file without exporting it:
+
+```ouro
+private def normalize (input : Nat) : Nat := input;
+def process (input : Nat) : Nat := normalize input;
+```
+
+`private` applies to definitions, axioms, inductives, effects, intrinsics,
+externs, and records. A private inductive also hides its constructors; a
+private effect hides its operations; a private record hides its constructor
+and generated accessors. Private members cannot be imported bare, selected
+with `exposing`, reached through an alias or local `open`, or inherited by a
+plain import of another file. The owner can use them normally, and imported
+private declarations and bodies still pass the full checker. `private` does
+not apply to `import` or `representation`; explicit re-export control is
+separate from visibility.
+
 Plain imports keep unique short names available. A local term binder takes
 precedence over a bare module name, followed by a declaration owned by the
 current file, an innermost local open, and then a unique imported short name.
 When aliases or selective imports occur in the reached graph, a bare name not
 selected by these scopes is ambiguous when two visible imports bind it; use an
 alias or local open to select the intended declaration. A graph of plain
-imports without either feature retains the existing duplicate-declaration
-error for a collision. An alias cannot select a declaration only imported
+imports without aliases, selection, or private declarations retains the
+existing duplicate-declaration error for a collision; with private declarations,
+colliding public names are still rejected. An alias cannot select a declaration only imported
 transitively by its file. Aliases and exposing clauses are local to the
 importing file, and a local term binder does not change the meaning of
 `N.member`.
@@ -77,8 +96,8 @@ outer one; a local term binder or current-file declaration still takes
 precedence. The opened names do not escape the expression. Unknown aliases
 are rejected. The legacy top-level `open N;` form remains accepted and is
 erased during preprocessing; bare names still follow ordinary import lookup,
-so it does not resolve collisions or establish expression-local scope. Private
-exports, re-exports, and nested module declarations are not supported.
+so it does not resolve collisions or establish expression-local scope. Explicit
+re-exports and nested module declarations are not supported.
 
 ## Definitions and dependent functions
 
