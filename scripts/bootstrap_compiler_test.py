@@ -35,6 +35,7 @@ class BootstrapCompilerTests(unittest.TestCase):
         self.rejected_source_form = None
         self.different_c = False
         self.abi_stdout = bootstrap.ABI_STDOUT
+        self.bad_detail = 80
 
     def fixture(self, *, compact_sources=False):
         roots = [f"compiler/source-{index}.ouro" for index in range(14)] + ["compiler/backend.ouro"]
@@ -88,7 +89,7 @@ class BootstrapCompilerTests(unittest.TestCase):
             if source == "bootstrap-bad.ouro":
                 code = 1
                 stderr = ("bootstrap-bad.ouro: type mismatch in exact_index\nCHECK_FAIL: front end rejected the input\n"
-                          "ouro1: CErr tag=0 n=1\nouro1: CErr code=41 det=78\n")
+                          f"ouro1: CErr tag=0 n=1\nouro1: CErr code=41 det={self.bad_detail}\n")
             elif source == self.rejected_root and (self.rejected_source_form is None or cwd.name == self.rejected_source_form):
                 code, stderr = 1, "current root rejected\n"
             else:
@@ -294,6 +295,14 @@ class BootstrapCompilerTests(unittest.TestCase):
         self.assertEqual(len(probes), 2)
         for argv in probes:
             self.assertEqual(argv[4:], [part for unit in [*units, argv[2]] for part in ("--unit", unit)])
+
+    def test_negative_behavior_rejects_detail_drift(self):
+        snapshot = self.fixture()
+        self.bad_detail = 79
+        with patch.object(bootstrap, "run_limited", side_effect=self.fake_run):
+            with self.assertRaisesRegex(RuntimeError, "current P2 negative behavior did not preserve the exact rejection"):
+                bootstrap.chain(self.work, snapshot, build)
+        self.assertFalse(json.loads((self.work / "report.json").read_text())["pass"])
 
     def test_complete_frontend_mismatch_rejects_successor(self):
         snapshot = self.fixture()
