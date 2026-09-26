@@ -377,7 +377,9 @@ def _collect_app_spine(src: str, gpos: int, gname: str) -> tuple[int, int, list[
     return spine_start, end, args
 
 
-def strip_poly_type_apps(src: str) -> tuple[str, int]:
+def strip_poly_type_apps(
+    src: str, details: list[str] | None = None
+) -> tuple[str, int]:
     """Keep only the erased value arguments of known polymorphic helpers."""
     gmap = _export_gmap(src)
     targets: list[tuple[str, int]] = []
@@ -410,6 +412,11 @@ def strip_poly_type_apps(src: str) -> tuple[str, int]:
                 rebuilt = f"ouro_app({rebuilt},{arg})"
             hits.append((s0, s1, rebuilt))
             stripped += len(args) - keep
+            if details is not None and len(details) < 8:
+                snippet = " ".join(src[s0:s1].split())[:180]
+                details.append(
+                    f"poly {name}: {len(args)} args, {keep} value args: {snippet}"
+                )
 
     hits.sort(key=lambda h: h[0], reverse=True)
     out = src
@@ -468,7 +475,9 @@ def _rebuild_ctor(tag: int, fields: list[str]) -> str:
     return f"ouro_ctor({tag},{n},(ouro_v *[]){{{inner}}})"
 
 
-def strip_ctor_type_fields(src: str, drop_pair_dummy: bool) -> tuple[str, int]:
+def strip_ctor_type_fields(
+    src: str, drop_pair_dummy: bool, details: list[str] | None = None
+) -> tuple[str, int]:
     """Drop leftover Type fields that extract left on constructors.
 
     `ouro_err(5)` is CInd extracted as a value — never a real field.
@@ -564,6 +573,9 @@ def strip_ctor_type_fields(src: str, drop_pair_dummy: bool) -> tuple[str, int]:
             continue
         hits.append((pos, end, _rebuild_ctor(tag, new_fields)))
         stripped += dropped
+        if details is not None and len(details) < 8:
+            snippet = " ".join(src[pos:end].split())[:180]
+            details.append(f"ctor tag={tag}, dropped={dropped}: {snippet}")
 
     hits.sort(key=lambda h: h[0], reverse=True)
     out = src
@@ -748,6 +760,7 @@ def main() -> int:
         "   Do not hand-edit. Regenerate with scripts/emit_frontend.sh. */\n"
     ]
     dropped_total = 0
+    strict_details: list[str] = []
     for spec in args.pieces:
         if ":" not in spec:
             print(f"pack_frontend: expected SUFFIX:path, got {spec}", file=sys.stderr)
@@ -763,14 +776,24 @@ def main() -> int:
             return 2
         text = uniquify(text)
         if args.strict:
-            _, dropped = strip_poly_type_apps(text)
+            piece_details: list[str] = []
+            _, dropped = strip_poly_type_apps(text, piece_details)
             drop_pair = suf not in ("pa", "pb", "pf")
-            _, dropped_c = strip_ctor_type_fields(text, drop_pair_dummy=drop_pair)
+            _, dropped_c = strip_ctor_type_fields(
+                text, drop_pair_dummy=drop_pair, details=piece_details
+            )
             dropped_total += dropped + dropped_c
+            if dropped or dropped_c:
+                strict_details.append(
+                    f"module={suf} poly={dropped} ctor={dropped_c} source={path}"
+                )
+                strict_details.extend(piece_details)
         chunks.append(f"\n/* ---- frontend TU module={suf} ---- */\n")
         chunks.append(prefix_blob(text, suf))
         chunks.append("\n")
     if args.strict and dropped_total > 0:
+        for detail in strict_details:
+            print(f"pack_frontend: {detail}", file=sys.stderr)
         print(
             f"pack_frontend: STRICT FAIL leftover_type_apps={dropped_total} "
             "(extract.ouro should have dropped these)",
