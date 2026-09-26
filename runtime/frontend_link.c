@@ -869,7 +869,7 @@ static int unit_prepass_incremental(ouro_v *files, ouro_v **out_files,
 			}
 			path = pair_fst(f);
 			src = pair_snd(f);
-			r = ouro_apply(ouro_apply(preprocess_src, reg), src);
+			r = ouro_apply(ouro_apply(ouro_apply(preprocess_src, path), reg), src);
 			if (r == 0 || r->tag != 1 || r->n < 3) {
 				if (r != 0 && r->tag == 0 && r->n >= 2)
 					*out_error = ouro_clone_perm_deep(cerr(

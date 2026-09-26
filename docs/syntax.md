@@ -31,9 +31,10 @@ def two : N.Nat := N.S N.one;
 
 Plain imports keep unique short names available. A local term binder takes
 precedence over a bare module name, followed by a declaration owned by the
-current file. With aliases in the reached import graph, a bare name with no
-current-file declaration is ambiguous when two imported files own it; use
-their aliases to select the intended declaration. A graph of plain imports
+current file, an innermost local open, and then a unique imported short name.
+With aliases in the reached import graph, a bare name not selected by these
+scopes is ambiguous when two imported files own it; use their aliases or a
+local open to select the intended declaration. A graph of plain imports
 without aliases retains the existing duplicate-declaration error for a
 collision. An alias cannot select a declaration only imported transitively by
 its file. Aliases are local to the importing file, and a local term binder does
@@ -45,15 +46,18 @@ Collisions of the legacy `IO`, `io_bind`, and `pure` lowering names report
 ambiguity even for qualified uses until those forms carry module-local
 operation metadata. Unambiguous `do` programs keep their current behavior.
 
-Local opens retain their existing bounded source form:
+An expression can open an alias for its own subtree:
 
 ```ouro
 def three : Nat := open N in add two one;
 ```
 
-`open N in` currently removes the qualifier only; it does not disambiguate
-colliding short names. Top-level `open` declarations, selective imports, hidden
-exports, and nested module declarations are not supported.
+`open N in` selects declarations owned directly by `N` when their short names
+would otherwise be ambiguous. An inner open wins over an outer one; a local
+term binder or current-file declaration still takes precedence. The opened
+names do not escape the expression. Unknown aliases are rejected, and every
+imported body remains checked. Top-level `open` declarations, selective
+imports, hidden exports, and nested module declarations are not supported.
 
 ## Definitions and dependent functions
 
@@ -286,6 +290,18 @@ def originX : Nat := origin.x;
 The default constructor is `MkPoint`; generated accessor names use
 `Point_x`, `Point_y`, and so on. Record literals require a known record type,
 and every field must appear exactly once.
+With an import alias, a literal annotated `A.Point` uses the record declared
+by `A`, and `A.point.x` retains `A.point` as its base. Qualified projection
+requires the value and record declaration to belong directly to that aliased
+file. A value re-exported with a record type from another file needs an
+explicit accessor call from the record's owner. An unqualified local value or
+bare record type backed by an imported record also uses that record's alias
+when available. Without an alias, record sugar retains the existing short
+name when unambiguous. If a local binder or explicit use has the same short
+name, the compiler attaches an internal record-owner reference to the generated
+constructor or accessor. The ordinary `preprocess_records` text-only helper
+rejects an expansion that requires this metadata; compile through the checked
+source or unit entry point instead.
 
 Record update, record pattern matching, anonymous records, row polymorphism,
 subtyping, and overloaded field resolution are not implemented.
