@@ -206,7 +206,20 @@ Natural-number literals elaborate to the current `Nat` representation:
 
 ```ouro
 def two : Nat := 2;
+def thousand : Nat := 1_000;
+def mask : Nat := 0xFF_FF;
+def bits : Nat := 0b1010_0011;
 ```
+
+Decimal digits may contain a single `_` between digits. Hexadecimal `0x`/`0X`
+and binary `0b`/`0B` use the same `Nat` representation, and their digits may
+also be separated by single interior underscores. A base prefix requires at
+least one digit. A leading, doubled, or trailing underscore, a digit outside
+the selected base, and an identifier suffix are rejected as malformed numeric
+tokens; for example `1__0`, `0x_F`, `0b2`, and `12u32`. The spelling `_1`
+remains an identifier under the existing identifier grammar. These literals do
+not select a machine integer type or perform a narrowing conversion. Typed
+numeric suffixes are not supported.
 
 String literals support `\n`, `\t`, `\r`, `\"`, and `\\` escapes:
 
