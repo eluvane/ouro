@@ -135,8 +135,20 @@ def quoted_import_targets(source_text: str, source_path: str) -> list[str]:
                 if char == "\\" and index < len(source_text):
                     escaped = source_text[index]
                     index += 1
-                    value.append({"n": "\n", "r": "\r", "t": "\t", '"': '"', "\\": "\\"}
-                                 .get(escaped, "\\" + escaped))
+                    if escaped == "u" and index < len(source_text) and source_text[index] == "{":
+                        close = source_text.find("}", index + 1)
+                        digits = source_text[index + 1:close] if close >= 0 else ""
+                        if (not 1 <= len(digits) <= 6
+                                or any(digit not in "0123456789abcdefABCDEF" for digit in digits)):
+                            raise ValueError(f"malformed Unicode escape in {source_path}")
+                        scalar = int(digits, 16)
+                        if scalar > 0x10FFFF or 0xD800 <= scalar <= 0xDFFF:
+                            raise ValueError(f"malformed Unicode escape in {source_path}")
+                        value.append(chr(scalar))
+                        index = close + 1
+                    else:
+                        value.append({"n": "\n", "r": "\r", "t": "\t", '"': '"', "\\": "\\"}
+                                     .get(escaped, "\\" + escaped))
                 else:
                     value.append(char)
             closed = index < len(source_text)

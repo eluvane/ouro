@@ -82,6 +82,19 @@ class SourceContracts(unittest.TestCase):
         self.assertEqual(frontend.SMC.quoted_import_targets(source, "root.ouro"),
                          ["left.ouro", "path/part.ouro", "путь 漢字.ouro", "last.ouro", "next.ouro"])
 
+    def test_braced_unicode_imports_match_literal_paths(self):
+        source = r'import "caf\u{e9}.ouro", "\u{1F600}.ouro";'
+        self.assertEqual(frontend.SMC.quoted_import_targets(source, "root.ouro"),
+                         ["café.ouro", "😀.ouro"])
+
+    def test_malformed_braced_unicode_imports_fail_closed(self):
+        for spelling in (r'\u{}', r'\u{12G}', r'\u{0000041}',
+                         r'\u{D800}', r'\u{110000}', r'\u{41'):
+            with self.subTest(spelling=spelling), self.assertRaisesRegex(
+                    ValueError, "malformed Unicode escape"):
+                frontend.SMC.quoted_import_targets(f'import "{spelling}.ouro";',
+                                                     "root.ouro")
+
     def test_projection_named_import_does_not_add_dependencies(self):
         source = ('def field (p : Packet) : Nat := p.import "fake.ouro";\n'
                   'def call (p : Packet) : Nat := p.import("also-fake.ouro");\n'

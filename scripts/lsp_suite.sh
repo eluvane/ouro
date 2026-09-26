@@ -282,8 +282,8 @@ want_attack non-file-uri-empty '"id":103,"result":\[\]'
 want_attack grouped-traversal-completion-empty '"id":109,"result":\[\]'
 want_attack grouped-absolute-completion-empty '"id":110,"result":\[\]'
 
-# Group operands all enter the index, and unsaved multiline groups retain
-# every authorized path when relocated to the private checker scratch file.
+# Group operands all enter the index, including a decoded Unicode escape in
+# an unsaved multiline group relocated to the private checker scratch file.
 GROUP_DIR="$OUT/group-imports"
 mkdir -p "$GROUP_DIR"
 GROUP_LEFT="$GROUP_DIR/left.ouro"
@@ -293,7 +293,7 @@ GROUP_BUFFER="$GROUP_DIR/buffer.ouro"
 printf -- 'inductive LspGroupNat : Type := | LspGroupZero : LspGroupNat;\n' >"$GROUP_LEFT"
 printf -- 'import "left.ouro";\ndef lsp_group_right : LspGroupNat := LspGroupZero;\n' >"$GROUP_RIGHT"
 printf -- 'import "left.ouro", "right.ouro";\n\ndef use_group : LspGroupNat := lsp_group_right;\n' >"$GROUP_DOC"
-printf -- 'import -- first operand\n "left.ouro", -- second operand\n "right.ouro",;\n\ndef use_group : LspGroupNat := lsp_group_right;\n' >"$GROUP_BUFFER"
+printf -- 'import -- first operand\n "left.ouro", -- second operand\n "\\u{72}ight.ouro",;\n\ndef use_group : LspGroupNat := lsp_group_right;\n' >"$GROUP_BUFFER"
 GROUP_URI=$(uri_of_path "$GROUP_DOC")
 GROUP_RIGHT_URI=$(uri_of_path "$GROUP_RIGHT")
 {

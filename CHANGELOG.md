@@ -21,6 +21,8 @@ Development changes; see the [compatibility policy](docs/stability.md).
   require an annotation.
 - Typed local helpers may omit the result annotation when their body type is
   inferable; see [Ergonomic syntax](docs/language/ergonomic-syntax.md#typed-local-helper-declarations).
+- [Braced Unicode scalar escapes in strings and quoted imports](docs/syntax.md#numbers-and-strings),
+  decoded to UTF-8 bytes with malformed scalar rejection.
 - [Decimal digit separators and hexadecimal/binary `Nat` literals](docs/syntax.md#numbers-and-strings)
   with strict malformed-token rejection and no implicit machine-integer conversion.
 - Review-only Clippy proofs for Result/Maybe error flow, collection and string

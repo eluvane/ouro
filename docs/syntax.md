@@ -276,11 +276,20 @@ remains an identifier under the existing identifier grammar. These literals do
 not select a machine integer type or perform a narrowing conversion. Typed
 numeric suffixes are not supported.
 
-String literals support `\n`, `\t`, `\r`, `\"`, and `\\` escapes:
+String literals support `\n`, `\t`, `\r`, `\"`, `\\`, and braced Unicode
+scalar escapes:
 
 ```ouro
-def message : String := "hello\n";
+def message : String := "hello\n\u{1F600}";
 ```
+
+`\u{...}` requires 1–6 ASCII hexadecimal digits (either case) and a value
+at most `10FFFF` outside the surrogate range `D800..DFFF`. It contributes the
+scalar's UTF-8 bytes to the existing byte-based `String`; `\u{0}` contributes
+one NUL byte. An unclosed braced escape, invalid digits, and invalid scalars
+are lexical errors. Other unknown backslash pairs retain their backslash and
+following character. Quoted import paths use the same decoding. Ordinary
+quoted strings can contain physical line breaks; they do not strip indentation.
 
 Import `std/string.ouro` to use the standard `String` type and helpers. A
 standalone prelude must declare `intrinsic String : Type := "ouro.string";`.
