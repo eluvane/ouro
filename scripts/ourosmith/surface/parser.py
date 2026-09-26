@@ -7,7 +7,7 @@ MODES = """MExpr MPipe MPipeTail MPi MApp MAppTail MAtom MParen MFun MLet MMatch
 MTypedBinder MTypedBinderGroup MTypedBinders MFunBinders MPattern MPatternVars
 MPatterns MMultiBranches MScrutList MKeywordAtom MEffectAnnotation MEffectRow
 MCommaList MListElems MListTail MIdentCommaList MDoExprs MPerform MDo MHandle
-MHandleClauses MPiFromApp MDoStmt""".split()
+MHandleClauses MPiFromApp MDoStmt MTrailingLambda""".split()
 
 # This is an observation schema, not a parser or a copy of its decision logic.
 # The exercised expression payloads distinguish a changed AST from a success
@@ -117,6 +117,9 @@ def rows(seed):
         (["TNat 1", "TPipe", f"TIdent {n}"], f"EApp(EVar({n}),ENat(1))"),
         (["TType 0", "TArrow", "TType 1"], "EPi(0,ESort(0),ESort(1))"),
         (["TLparen", "TNat 1", "TRparen"], "ENat(1)"),
+        ([f"TIdent {n}", "TLparen", "TNat 1", "TRparen", "TBraceL",
+          f"TIdent {n + 1}", "TArrow", f"TIdent {n + 1}", "TBraceR"],
+         f"EApp(EApp(EVar({n}),ENat(1)),ELam({n + 1},none,EVar({n + 1})))"),
         (["TKeyword kwFun", f"TIdent {n}", "TFatArrow", f"TIdent {n}"], f"ELam({n},none,EVar({n}))"),
         (["TKeyword kwLet", f"TIdent {n}", "TColonEq", "TNat 2", "TKeyword kwIn", f"TIdent {n}"], f"ELet({n},none,ENat(2),EVar({n}))"),
         (["TKeyword kwOpen", f"TIdent {n}", "TKeyword kwIn", f"TIdent {n}"], f"EOpen({n},EVar({n}))"),
