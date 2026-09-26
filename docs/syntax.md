@@ -67,11 +67,12 @@ let x : A := value in body
 A local helper can put its typed parameters next to its name:
 
 ```ouro
-let twice (x : Nat) : Nat := add x x in twice 2
+let twice (x : Nat) := add x x in twice 2
 ```
 
-This is a non-recursive lambda-binding. Parameterized local helpers require an
-explicit result annotation; [Ergonomic syntax](language/ergonomic-syntax.md#typed-local-helper-declarations)
+This is a non-recursive lambda-binding. Parameterized local helpers require
+typed parameters; the result annotation may be omitted when the body type can
+be inferred. [Ergonomic syntax](language/ergonomic-syntax.md#typed-local-helper-declarations)
 explains their scope and desugaring.
 
 ## Inductive data and pattern matching
