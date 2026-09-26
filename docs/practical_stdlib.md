@@ -33,7 +33,10 @@ error type while retaining the result.
 `std/collections.ouro` provides `list_traverse_maybe A B f xs` for an ordered
 list of fallible conversions. It returns `Just []` for an empty list, `Just`
 with all converted values when every call succeeds, or `Nothing` at the first
-failure. `list_traverse_result` preserves a typed error; `filter_map` drops
+failure. `list_traverse_result E A B f xs` preserves the first typed error and
+does not call `f` on later elements. `list_try_fold_result E A S step initial xs`
+and `list_try_fold_maybe A S step initial xs` likewise stop at the first failure;
+an empty list returns `Right initial` or `Just initial`. `filter_map` drops
 missing values when that is the intended behavior.
 
 ## CLI arguments
@@ -96,6 +99,23 @@ preserves the complete Nat value, including values beyond machine-word range.
 ## Lists and data
 
 Use `std/collections.ouro` when a program needs common list operations that are intentionally outside the small prelude: `nth_maybe`, `filter_map`, `map_indexed`, `indexed`, `find_index`, `split_at`, `chunks_of`, `list_take_last`, `list_drop_last`, `adjacent_pairs`, `dedup_adjacent`, `partition_map`, and `list_collect_results`.
+
+`list_windows A width xs` returns overlapping, complete windows. Width zero,
+an empty input, and a width larger than the input return `[]`; for example,
+width two on `[1, 2, 3]` returns `[[1, 2], [2, 3]]`. `adjacent_pairs` returns
+the successive pairs `(1, 2)` and `(2, 3)` for that input.
+
+`list_scan A S step initial xs` includes the initial state and every successive
+state, so an empty input returns `[initial]`. `list_map_accum A S B step initial xs`
+calls `step : S -> A -> Pair S B` once per element in source order and returns
+the final state with the output values in that order. On an empty input it
+returns `(initial, [])`.
+
+`list_group_by A K eq key xs` puts all equal keys in one group, including
+nonadjacent occurrences. Groups follow the first appearance of each key, and
+members retain input order. `eq` must be an equivalence relation. This list
+implementation searches existing groups for each element, so worst-case work
+is quadratic in the input length.
 
 ## Numbers
 
