@@ -104,7 +104,7 @@ Four hex digits, with the first malformed or missing byte as the error.
 def json_scalar_utf8 (value : Nat) : List Nat
 ```
 
-Only valid Unicode scalars reach this encoder. Split the high groups first so repeated-subtraction division stays bounded by 63, even for U+10FFFF.
+JSON decoding supplies validated scalars; keep this public adapter.
 
 ## def json_unicode_escape
 
