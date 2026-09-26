@@ -63,10 +63,11 @@ that rejection, erasing `as A` could accidentally grant meaning to a mixed
 group. This guard is not the implementation of grouped imports: acceptance of
 plain groups belongs to the declaration parser. An alias selects direct
 declarations of its file; a transitive dependency needs its own direct import.
-When imported short names collide in a reached graph using aliases, a bare use
-without a local binder or current-file declaration requires qualification. A
-plain-only graph still rejects duplicate declarations. Local
-opens still erase their prefix and cannot resolve such a collision.
+When imported short names collide in a reached graph using aliases or
+selective imports, a bare use without a local binder, current-file declaration,
+or local open requires qualification. A plain-only graph still rejects
+duplicate declarations. [Module syntax](../syntax.md#modules-and-imports)
+defines exposing clauses, local names, and scoped opens.
 
 Dependency-tail diagnostics distinguish missing paths from malformed quoted
 strings. The direct parser retains its existing positional `PErr` protocol;
@@ -421,7 +422,7 @@ rejected forms, import graph/diagnostic cases, and formatter round trips.
 
 ## Scope
 
-These forms add no selective imports, private exports, tuple or named call
+These forms add no private exports, re-exports, tuple or named call
 syntax, implicit type argument inference, early return, or general effect
 handling. For language direction and
 compatibility, see [Design](../design.md#language-direction) and

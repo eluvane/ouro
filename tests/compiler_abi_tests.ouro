@@ -157,10 +157,10 @@ def abi_lower_environment : Bool :=
 def abi_import_state : Bool :=
     let aliases : List (List Nat) := [prim_string_to_char_codes "A"] in
     match preprocess_imports_reg(
-      MkImpReg aliases (Nil (Pair(List Nat, List Nat))), Nil Nat) with
+      MkImpReg aliases (Nil (Pair(List Nat, List Nat))) (Nil ImpRule), Nil Nat) with
     | MkPair registry result =>
         match registry with
-        | MkImpReg names _ =>
+        | MkImpReg names _ _ =>
             match names with
             | Nil => False
             | Cons name _ =>
@@ -180,7 +180,7 @@ def abi_import_marker_offsets : Bool :=
     match preprocess_imports_reg empty_imp_reg original with
     | MkPair registry result =>
         match registry with
-        | MkImpReg _ bindings =>
+        | MkImpReg _ bindings _ =>
             match bindings with
             | Nil => False
             | Cons pair rest =>
@@ -189,17 +189,98 @@ def abi_import_marker_offsets : Bool :=
                     andb (abi_codes_equal alias "A")
                       (andb (abi_codes_equal path "a.ouro")
                         (andb (match rest with | Nil => True | Cons _ _ => False end)
+                          (andb (match registry with
+                           | MkImpReg _ _ rules => match rules with
+                             | Nil => False
+                             | Cons rule tail => match tail with
+                               | Nil => match rule with
+                                 | ImpPlain path => abi_codes_equal path "a.ouro"
+                                 | ImpSelected _ _ => False
+                                 | ImpRecordGrant _ _ _ => False
+                                 end
+                               | Cons _ _ => False
+                               end
+                             end
+                           end)
                           (match result with
                           | ImpErr _ _ => False
                           | ImpOk output =>
                               andb (eqNat(length Nat original, length Nat output))
                                 (abi_codes_equal output
                                   "import \"a.ouro\"     ;\ndef x : Type := A@Value;")
-                          end)))
+                          end))))
                 end
             end
         end
     end;
+
+def abi_selective_import_offsets : Bool :=
+    let original : List Nat := prim_string_to_char_codes
+      "import \"a.ouro\" as A exposing (Visible as Pick); def x : Type := A.Visible;" in
+    let suffix : List Nat := prim_string_to_char_codes
+      "def x : Type := A@Visible;" in
+    match preprocess_imports_reg empty_imp_reg original with
+    | MkPair registry result => match registry with
+      | MkImpReg names bindings rules =>
+          andb (name_in (prim_string_to_char_codes "A") names)
+            (andb (match bindings with
+             | Nil => False
+             | Cons binding tail => match tail with
+               | Nil => match binding with
+                 | MkPair alias path => andb(abi_codes_equal alias "A",
+                     abi_codes_equal path "a.ouro")
+                 end
+               | Cons _ _ => False
+               end
+             end)
+            (andb (match rules with
+             | Nil => False
+             | Cons rule tail => match tail with
+               | Nil => match rule with
+                 | ImpSelected path selectors =>
+                     andb(abi_codes_equal path "a.ouro",
+                       match selectors with
+                       | Nil => False
+                       | Cons selector after_selector =>
+                           match after_selector with
+                           | Nil => match selector with
+                             | MkImportSelector original_name local_name =>
+                                 andb(abi_codes_equal original_name "Visible",
+                                   abi_codes_equal local_name "Pick")
+                             end
+                           | Cons _ _ => False
+                           end
+                       end)
+                 | ImpPlain _ => False
+                 | ImpRecordGrant _ _ _ => False
+                 end
+               | Cons _ _ => False
+               end
+             end)
+              (match result with
+              | ImpErr _ _ => False
+              | ImpOk output =>
+                  andb(eqNat(length Nat original, length Nat output),
+                    source_bytes_equal suffix
+                      (drop Nat (sub (length Nat output)
+                        (length Nat suffix)) output))
+              end)))
+      end
+    end;
+
+def abi_selective_rejects_duplicate_names : Bool :=
+  let repeated_original : List Nat := prim_string_to_char_codes
+    "import \"a.ouro\" exposing (Visible as Pick, Visible as Other);" in
+  let repeated_local : List Nat := prim_string_to_char_codes
+    "import \"a.ouro\" exposing (Visible as Pick, Hidden as Pick);" in
+  andb(match preprocess_imports_reg empty_imp_reg repeated_original with
+       | MkPair _ result => match result with
+         | ImpErr code _ => eqNat code imp_code_malformed
+         | ImpOk _ => False end end,
+    match preprocess_imports_reg empty_imp_reg repeated_local with
+    | MkPair _ result => match result with
+      | ImpErr code _ => eqNat code imp_code_malformed
+      | ImpOk _ => False end end);
 
 def abi_raw_import_alias : Bool :=
     let original : List Nat := prim_string_to_char_codes
@@ -210,7 +291,7 @@ def abi_raw_import_alias : Bool :=
     match preprocess_imports_reg empty_imp_reg original with
     | MkPair registry result =>
         match registry with
-        | MkImpReg names bindings =>
+        | MkImpReg names bindings _ =>
             match bindings with
             | Nil => False
             | Cons binding rest => match binding with
@@ -310,18 +391,22 @@ def abi_record_internal_alias : Bool :=
         (prim_string_to_char_codes "main.ouro") empty_rec_reg source with
     | SrcPrepErr _ _ => False
     | SrcPrepOk _ aliases output => match aliases with
-      | MkImpReg names bindings =>
-          andb (name_in (prim_string_to_char_codes "_ouro_r_0_0") names)
+      | MkImpReg names bindings rules =>
+          andb (match names with | Nil => True | Cons _ _ => False end)
             (andb (record_marker_present
               (prim_string_to_char_codes "_ouro_r_0_0") output)
-              (match bindings with
-               | Nil => False
-               | Cons binding _ => match binding with
-                 | MkPair alias target =>
-                     andb(abi_codes_equal alias "_ouro_r_0_0",
-                       abi_codes_equal target "main.ouro")
-                 end
-               end))
+              (andb (match bindings with | Nil => True | Cons _ _ => False end)
+                (match rules with
+                | Nil => False
+                | Cons rule _ => match rule with
+                  | ImpRecordGrant marker owner member =>
+                      andb(abi_codes_equal marker "_ouro_r_0_0@Point_x",
+                        andb(abi_codes_equal owner "main.ouro",
+                          abi_codes_equal member "Point_x"))
+                  | ImpPlain _ => False
+                  | ImpSelected _ _ => False
+                  end
+                end)))
       end
     end;
 
@@ -342,7 +427,10 @@ def abi_laws : List AbiLaw :=
     , MkAbiLaw "compiler error retains code and detail" abi_compiler_error
     , MkAbiLaw "lower environment preserves constructor and hint fields" abi_lower_environment
     , MkAbiLaw "import preprocessing retains registry values" abi_import_state
-    , MkAbiLaw "alias masking preserves byte offsets and qualified markers" abi_import_marker_offsets
+    , MkAbiLaw "alias masking preserves byte offsets and qualified markers"
+        (andb(abi_import_marker_offsets,
+          andb(abi_selective_import_offsets,
+            abi_selective_rejects_duplicate_names)))
     , MkAbiLaw "raw import alias preserves bytes and decoded module path"
         abi_raw_import_alias
     , MkAbiLaw "record callback retains nested record model values" abi_record_state
