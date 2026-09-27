@@ -539,6 +539,22 @@ def semantic_runtime_import_cases(out: Path, worker: Optional[Path] = None) -> l
     return failures
 
 
+def semantic_alias_cases(out: Path, worker: Optional[Path] = None) -> list[str]:
+    return semantic_precision_cases(out / "alias-scope", worker,
+        source_root=ROOT / "tests/clippy_semantic/alias_scope", cases=[
+            {"path": "qualified.ouro", "codes": []},
+            {"path": "selected.ouro", "codes": []},
+            {"path": "selected-hidden.ouro", "codes": [],
+             "error_contains": "unresolved executable declaration: Numbers@hidden"},
+            {"path": "missing-member.ouro", "codes": [],
+             "error_contains": "unresolved executable declaration: Numbers@missing"},
+            {"path": "transitive.ouro", "codes": [],
+             "error_contains": "unresolved executable declaration: Middle@one"},
+            {"path": "unknown-alias.ouro", "codes": [],
+             "error_contains": "import preprocessing failed"},
+        ])
+
+
 def semantic_law_cases(out: Path) -> list[str]:
     """Native proof/contract/resource laws; host code only launches and reports."""
     from clippy_grade_firewall import _native_env
@@ -608,6 +624,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 1 if failures else 0
     if args.precision_only:
         failures = semantic_precision_cases(out, args.worker)
+        failures.extend(semantic_alias_cases(out, args.worker or
+            ROOT / "_build/c" / ("ouro-clippy-structural" + (".exe" if os.name == "nt" else ""))))
         for failure in failures:
             print("CLIPPY_PRECISION_FAIL " + failure, file=sys.stderr)
         return 1 if failures else 0
@@ -623,6 +641,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     failures: list[str] = structural_fact_cases(out)
     failures.extend(semantic_law_cases(out))
     failures.extend(semantic_precision_cases(out))
+    failures.extend(semantic_alias_cases(out,
+        ROOT / "_build/c" / ("ouro-clippy-structural" + (".exe" if os.name == "nt" else ""))))
     failures.extend(semantic_runtime_import_cases(out,
         ROOT / "_build/c" / ("ouro-clippy-structural" + (".exe" if os.name == "nt" else ""))))
     failures.extend(suppression_policy_cases(out))
