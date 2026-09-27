@@ -165,6 +165,8 @@ Development changes; see the [compatibility policy](docs/stability.md).
 
 ### Fixed
 
+- Check expression ascriptions inside untyped local bindings even when the
+  enclosing result type does not constrain the ascribed value.
 - `adjacent_pairs` now advances its left element; `list_traverse_result` evaluates
   conversions in input order and stops when one returns `Left`.
 - Recognize manifest-owned Clippy precision fixtures in the structural gate,

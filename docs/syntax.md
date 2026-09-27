@@ -424,6 +424,9 @@ A local type ascription can provide the expected element type:
 def count : Nat := (([Z, S Z] : List Nat) |> length Nat);
 ```
 
+The compiler checks an expression against its ascribed type even when an
+enclosing untyped local binding does not use the expression's value.
+
 Untyped `[]` and ambiguous list literals still require context. If the first
 element has no inferable type, annotate the literal or binding; later elements
 do not resolve it.
