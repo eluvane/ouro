@@ -144,6 +144,8 @@ Development changes; see the [compatibility policy](docs/stability.md).
   controls and an accent-colored GitHub favicon on both pages. Search retains
   its background highlight without a focus outline.
 - Update the site's transitive Terser plugin and serializer dependencies.
+- Align the argument and closing lines of already-multiline flat comma calls
+  while preserving comments, literals, line breaks, and trailing commas.
 
 ### Removed
 
