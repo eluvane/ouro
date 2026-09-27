@@ -46,6 +46,23 @@ original error. The fallback is called only for `Left`. Use `result_bind` to
 continue with another fallible operation and `result_map_err` to change an
 error type while retaining the result.
 
+`std/data.ouro` provides `maybe_bind A B value next` to continue a `Maybe`
+computation. It calls `next : A -> Maybe B` only for `Just`; `Nothing` passes
+through without calling it.
+
+```ouro
+import "../std/data.ouro";
+
+def next_if_present (value : Nat) : Maybe Nat :=
+    match value with
+    | Z => Nothing Nat
+    | S _ => Just Nat (S value)
+    end;
+
+def example : Maybe Nat :=
+    maybe_bind Nat Nat (Just Nat 2) next_if_present;
+```
+
 `std/collections.ouro` provides `list_traverse_maybe A B f xs` for an ordered
 list of fallible conversions. It returns `Just []` for an empty list, `Just`
 with all converted values when every call succeeds, or `Nothing` at the first
