@@ -1,0 +1,185 @@
+import "../compiler/driver.ouro",
+  "../std/io.ouro";
+
+def probe_error (tag : Nat) (code : Nat) (detail : Nat)
+    : ResolveResult Unit :=
+  match eqNat code 8 with
+  | True => RErr Unit tag detail
+  | False => RErr Unit code detail
+  end;
+
+def probe_rewrite_units (fuel : Nat) (units : List SrcUnit)
+    (reached : List Nat) (aliases : List ModuleAliasUnit)
+    (members : List ModuleMember) (conflicts : List Nat)
+    (markers : List (Pair (List Nat) Nat)) (marker_ids : List Nat)
+    (scope_cache : List ModuleExports) (st : InternState) (isolate : Bool)
+    : ResolveResult Unit :=
+  (fix go (remaining : List SrcUnit) (current : InternState)
+      : ResolveResult Unit :=
+    match remaining with
+    | Nil => ROk Unit MkUnit
+    | Cons unit rest => match unit with
+      | MkSrcUnit owner decls => match memNat owner reached with
+        | False => go rest current
+        | True =>
+            match module_maps_for units aliases members conflicts
+                markers scope_cache current owner isolate with
+            | RErr code detail => probe_error 19 code detail
+            | ROk scoped_maps => match scoped_maps with
+              | MkPair maps constructors => match maps with
+                | MkModuleMaps heads refs errors =>
+                    match module_binder_maps current marker_ids refs with
+                    | RErr code detail => probe_error 20 code detail
+                    | ROk allocation => match allocation with
+                      | MkPair binders next_st =>
+                          let opens : List ModuleOpen :=
+                            module_opens_for units next_st owner
+                              (module_rules_for owner aliases) members
+                              (module_aliases_for owner aliases) in
+                          let pure_label : Nat :=
+                            match module_ident_id next_st name_pure with
+                            | Nothing => 0 | Just name => name end in
+                          match module_invalid_maps heads refs errors with
+                          | Just key => RErr Unit 18 key
+                          | Nothing =>
+                              match module_rewrite_decls_with_opens_pure fuel
+                                  heads refs errors opens marker_ids
+                                  constructors binders pure_label decls with
+                              | RErr code detail => probe_error 21 code detail
+                              | ROk _ => go rest next_st
+                              end
+                          end
+                      end
+                    end
+                end
+              end
+            end
+        end
+      end
+    end) units st;
+
+def probe_resolve_units (fuel : Nat) (units : List SrcUnit)
+    (alias_files : List (Pair (List Nat) ImpReg))
+    (root : Nat) (st : InternState) : ResolveResult Unit :=
+  match module_duplicate_units units with
+  | Just _ => RErr Unit 25 0
+  | Nothing => match module_has_aliases alias_files with
+    | False => ROk Unit MkUnit
+    | True => match resolve_import_paths units root with
+      | RErr code detail => probe_error 26 code detail
+      | ROk reached => match module_alias_units st alias_files with
+        | RErr code detail => probe_error 22 code detail
+        | ROk aliases => match module_has_reached_aliases reached aliases with
+          | False => ROk Unit MkUnit
+          | True =>
+              let seeds : List (Pair Nat Nat) :=
+                module_seed_units units reached in
+              let conflicts : List Nat := module_conflict_names seeds in
+              let isolate : Bool :=
+                module_has_reached_selection reached aliases in
+              match module_legacy_special_collision st conflicts with
+              | Just name => RErr Unit 6 name
+              | Nothing =>
+                  let markers : List (Pair (List Nat) Nat) :=
+                    module_marker_ids st in
+                  let marker_ids : List Nat :=
+                    map (Pair(List Nat, Nat)) Nat
+                      (fun (item : Pair (List Nat) Nat) =>
+                        match item with | MkPair _ id => id end) markers in
+                  match module_members st root reached conflicts seeds isolate with
+                  | RErr code detail => probe_error 23 code detail
+                  | ROk built => match built with
+                    | MkPair members st2 =>
+                        let scopes : ResolveResult (List ModuleExports) :=
+                          match isolate with
+                          | False => ROk (List ModuleExports)
+                              (Nil ModuleExports)
+                          | True => module_export_cache units reached aliases
+                              members st2
+                          end in
+                        match scopes with
+                        | RErr code detail => probe_error 24 code detail
+                        | ROk cache =>
+                            probe_rewrite_units fuel units reached aliases
+                              members conflicts markers marker_ids cache
+                              st2 isolate
+                        end
+                    end
+                  end
+              end
+          end
+        end
+      end
+    end
+  end;
+
+def probe_show (A : Type) (result : ResolveResult A) : String :=
+  match result with
+  | ROk _ => "ok"
+  | RErr code detail => prim_string_concat (prim_string_of_nat code,
+      prim_string_concat ("/", prim_string_of_nat detail))
+  end;
+
+def probe_unit (path : String) (source : String)
+    : Pair (List Nat) (List Nat) :=
+  MkPair (List Nat) (List Nat)
+    (prim_string_to_char_codes path) (prim_string_to_char_codes source);
+
+def probe_case (root_source : String) (owner_source : String)
+    (target_source : String) (shadow_source : String) : String :=
+  let root : List Nat := prim_string_to_char_codes "main.ouro" in
+  let files : List (Pair (List Nat) (List Nat)) :=
+    [ probe_unit "main.ouro" root_source
+    , probe_unit "a.ouro" owner_source
+    , probe_unit "b.ouro" target_source
+    , probe_unit "c.ouro" shadow_source
+    ] in
+  match preprocess_file_list preprocess_imports_reg preprocess_records_reg
+      files with
+  | FilesPrepErr code detail => prim_string_concat ("prep=",
+      prim_string_concat (prim_string_of_nat code,
+        prim_string_concat ("/", prim_string_of_nat detail)))
+  | FilesPrepOk files1 alias_files =>
+      match parse_units lex_go_import intern_string driver_parse_file
+          (mul 100 50) empty_intern files1 with
+      | UsErr code detail _ => prim_string_concat ("parse=",
+          prim_string_concat (prim_string_of_nat code,
+            prim_string_concat ("/", prim_string_of_nat detail)))
+      | UsOk units st => match intern_string st (canon_path (Nil Nat) root) with
+        | MkPair root_id st2 =>
+            prim_string_concat ("original=",
+              prim_string_concat
+                (probe_show (Pair (List SrcUnit) InternState)
+                  (module_resolve_units (mul 100 50) units alias_files
+                    root_id st2),
+                prim_string_concat (" stage=",
+                  probe_show Unit (probe_resolve_units (mul 100 50)
+                    units alias_files root_id st2))))
+        end
+      end
+  end;
+
+def probe_target : String :=
+  "inductive Count : Type := | Seed : Count; record Inner : Type where x : Count; end; def inner : Inner := MkInner Seed;";
+
+def probe_qualified_root : String :=
+  "import \"a.ouro\" as A exposing (Outer, MkOuter, Outer_inner, outer); import \"b.ouro\" as R exposing (Count, Seed, Inner, MkInner, Inner_x); import \"c.ouro\" as C exposing (Inner); def updated : A.Outer := { A.outer with inner.x := R.Seed };";
+
+def probe_qualified_owner : String :=
+  "import \"b.ouro\" as C exposing (Inner, MkInner, Inner_x, inner); record Outer : Type where inner : C.Inner; end; def outer : Outer := MkOuter C.inner;";
+
+def probe_selected_owner : String :=
+  "import \"b.ouro\" exposing (Inner as Small, inner); record Outer : Type where inner : Small; end; def outer : Outer := MkOuter inner;";
+
+-- @entry main
+def main : IO Unit :=
+  do println (prim_string_concat ("qualified ",
+       probe_case probe_qualified_root probe_qualified_owner probe_target
+         "axiom Inner : Type;"));
+     println (prim_string_concat ("literal ",
+       probe_case
+         "import \"a.ouro\" as A exposing (Outer, MkOuter); import \"b.ouro\" as R exposing (Count, Seed, Inner, MkInner); import \"c.ouro\" as C exposing (Inner); def created : A.Outer := { inner := { x := R.Seed } };"
+         probe_qualified_owner probe_target "axiom Inner : Type;"));
+     println (prim_string_concat ("selected ",
+       probe_case probe_qualified_root probe_selected_owner probe_target
+         "axiom Inner : Type;"));
