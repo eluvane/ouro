@@ -18,6 +18,7 @@ are not passes.
 | Workflow policy | `python3 scripts/github_workflow_gate.py` |
 | Formatter / fixer | `sh scripts/fmt_suite.sh` / `sh scripts/fix_suite.sh` |
 | Linter / analyzer | `sh scripts/lint_suite.sh` / `sh scripts/analyze_precision_suite.sh` |
+| Public API fingerprints | `python3 scripts/api_baseline_regen_test.py` and `python3 scripts/api_baseline_regen.py --check` |
 | Packages / LSP | `sh scripts/pkg_suite.sh` / `sh scripts/lsp_suite.sh` |
 | Runtime and IO / samples | `sh scripts/runtime_io_suite.sh` / `sh scripts/samples_suite.sh` |
 | User test runner | `sh scripts/test_suite.sh` |
