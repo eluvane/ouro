@@ -250,6 +250,7 @@ def run_measured(
     label: str,
     budget_kb: Optional[int],
     sample_interval_s: float,
+    progress_file: Optional[Path] = None,
 ) -> dict[str, Any]:
     started = time.perf_counter()
     before = 0
@@ -257,6 +258,33 @@ def run_measured(
         before = resource_mod.getrusage(resource_mod.RUSAGE_CHILDREN).ru_maxrss
     proc_available = Path("/proc").is_dir() or os.name == "nt"
     peak_tree_kb = 0
+    progress_offset = 0
+    progress_tail = ""
+    progress_name: Optional[str] = None
+    progress_peak_kb = 0
+
+    def sample_progress(rss_kb: int) -> None:
+        nonlocal progress_offset, progress_tail, progress_name, progress_peak_kb
+        if progress_file is None:
+            return
+        try:
+            with progress_file.open("r", encoding="utf-8", errors="replace") as source:
+                source.seek(progress_offset)
+                chunk = source.read()
+                progress_offset = source.tell()
+        except OSError:
+            return
+        lines = (progress_tail + chunk).split("\n")
+        progress_tail = lines.pop()
+        for line in lines:
+            if line.startswith("STRICT_MEM_FILE "):
+                if progress_name is not None:
+                    print(f"STRICT_MEM_RSS file={progress_name} peak_kb={progress_peak_kb}", flush=True)
+                progress_name = line[len("STRICT_MEM_FILE "):].strip()
+                progress_peak_kb = 0
+        if progress_name is not None:
+            progress_peak_kb = max(progress_peak_kb, rss_kb)
+
     popen_kwargs: dict[str, Any] = {}
     if os.name == "nt":
         popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
@@ -269,6 +297,7 @@ def run_measured(
             if proc_available:
                 current_tree_kb = tree_rss_kb(p.pid)
                 peak_tree_kb = max(peak_tree_kb, current_tree_kb)
+                sample_progress(current_tree_kb)
                 if budget_kb is not None and current_tree_kb > budget_kb:
                     terminated_for_budget = True
                     terminate_process_tree(p)
@@ -276,8 +305,11 @@ def run_measured(
             time.sleep(sample_interval_s)
         if proc_available:
             peak_tree_kb = max(peak_tree_kb, tree_rss_kb(p.pid))
+            sample_progress(tree_rss_kb(p.pid))
     finally:
         rc = int(p.wait())
+    if progress_name is not None:
+        print(f"STRICT_MEM_RSS file={progress_name} peak_kb={progress_peak_kb}", flush=True)
     child_peak_kb = 0
     if resource_mod is not None:
         after = resource_mod.getrusage(resource_mod.RUSAGE_CHILDREN).ru_maxrss
@@ -338,6 +370,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--json", dest="json_path", default=None)
     ap.add_argument("--markdown", default=None)
     ap.add_argument("--sample-interval", type=float, default=0.05)
+    ap.add_argument("--progress-file", default=None)
     ap.add_argument("command", nargs=argparse.REMAINDER)
     args = ap.parse_args(argv)
     command = list(args.command)
@@ -355,6 +388,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         label=label,
         budget_kb=args.budget_kb,
         sample_interval_s=max(0.01, args.sample_interval),
+        progress_file=None if args.progress_file is None else Path(args.progress_file),
     )
     if args.json_path:
         write_json_atomic(Path(args.json_path), report)
