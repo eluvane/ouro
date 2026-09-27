@@ -199,8 +199,11 @@ struct ouro_heap_context {
 
 static ouro_heap_context *ouro_active_context;
 
+static void ouro_oom_bank_report(void);
+
 static void ouro_oom(const char *where, unsigned long want)
 {
+	ouro_oom_bank_report();
 	fprintf(stderr,
 		"ouro_rt: out of memory (%s want=%lu live_bytes=%llu total_alloc_bytes=%llu)\n",
 		where == 0 ? "?" : where, want, ouro_heap_live_bytes(),
@@ -478,6 +481,34 @@ static int ouro_trace_enabled(void)
 {
 	const char *s = getenv("OURO_MEM_TRACE");
 	return s != 0 && s[0] != 0 && strcmp(s, "0") != 0;
+}
+
+static void ouro_oom_bank_report(void)
+{
+	ouro_heap_context *context;
+	unsigned long contexts = 0;
+	unsigned long long phase, perm0, perm1, statics;
+	unsigned long long context_phase = 0, context_perm0 = 0, context_perm1 = 0;
+	if (!ouro_trace_enabled())
+		return;
+	phase = heap_bytes(ouro_bsizes, ouro_nblocks, ouro_used);
+	perm0 = heap_bytes(ouro_perm_bsizes, ouro_perm_nblocks, ouro_perm_used);
+	perm1 = heap_bytes(ouro_perm1_bsizes, ouro_perm1_nblocks, ouro_perm1_used);
+	statics = heap_bytes(ouro_static_bsizes, ouro_static_nblocks, ouro_static_used);
+	for (context = ouro_active_context; context != 0; context = context->previous) {
+		contexts++;
+		context_phase += heap_bytes(context->phase.bsizes, context->phase.nblocks,
+		                            context->phase.used);
+		context_perm0 += heap_bytes(context->perm[0].bsizes, context->perm[0].nblocks,
+		                            context->perm[0].used);
+		context_perm1 += heap_bytes(context->perm[1].bsizes, context->perm[1].nblocks,
+		                            context->perm[1].used);
+	}
+	fprintf(stderr,
+		"OURO_MEM_OOM_BANKS phase_bytes=%llu perm0_bytes=%llu perm1_bytes=%llu static_bytes=%llu context_phase_bytes=%llu context_perm0_bytes=%llu context_perm1_bytes=%llu contexts=%lu live_bytes=%llu\n",
+		phase, perm0, perm1, statics, context_phase, context_perm0,
+		context_perm1, contexts,
+		phase + perm0 + perm1 + statics + context_phase + context_perm0 + context_perm1);
 }
 
 void ouro_heap_report(const char *label)
