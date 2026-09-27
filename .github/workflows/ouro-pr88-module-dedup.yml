@@ -1,0 +1,201 @@
+name: Diagnostic module name dedup
+
+on:
+  push:
+    branches: [codef/pr88-module-dedup]
+    paths:
+      - .github/workflows/ouro-pr88-module-dedup.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr88-module-dedup-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  OURO_CI: "1"
+  OURO_REPRODUCIBLE: "1"
+  OURO_PACK_STRICT: "1"
+  OURO_JOBS: "2"
+  OURO_CACHE_DIR: _cache/ouro
+  OURO_BUILD_DIR: _build
+  OURO_C_BUILD_DIR: _build/c
+  OURO_CCACHE: disabled
+
+jobs:
+  host:
+    name: Build source-bound Host and verify stages
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    outputs:
+      sha256: ${{ steps.bundle.outputs.sha256 }}
+    steps:
+      - name: Checkout candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+
+      - name: Guard exact candidate source
+        run: |
+          test "$(git rev-parse HEAD^)" = 83daa56fafb7aa56ffd5fa9ab687c2d867aa1ddf
+          test "$(git rev-parse HEAD:compiler/module_registry.ouro)" = e84c2d27c597e5e3617e9b1466983862acdb78e8
+          test "$(git rev-parse HEAD:tests/compiler_driver_tests.ouro)" = 101882a4040ef219603ae9411ab2ae0ee42a66ce
+          test "$(git rev-parse HEAD:CHANGELOG.md)" = 6691fd58a4c2ebf535e708210176a9459c4bd944
+          python3 - <<'PY'
+          import subprocess
+          expected = {
+              '.github/workflows/ouro-pr88-module-dedup.yml',
+              'CHANGELOG.md',
+              'compiler/module_registry.ouro',
+              'tests/compiler_driver_tests.ouro',
+          }
+          changed = set(subprocess.check_output(
+              ['git', 'diff', '--name-only', 'HEAD^', 'HEAD'], text=True
+          ).splitlines())
+          if changed != expected:
+              raise SystemExit(f'unexpected candidate paths: {sorted(changed)}')
+          PY
+
+      - name: Build and verify host compiler
+        run: python3 scripts/ouro_build.py build --verbosity quiet
+
+      - name: Export source-bound compiler receipt
+        id: bundle
+        run: python3 scripts/ci_gate.py --compiler-artifact export >> "$GITHUB_OUTPUT"
+
+      - name: Upload verified Host bundle
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: pr88-module-dedup-host-${{ github.run_id }}-${{ github.run_attempt }}
+          path: _build/ci/host-compiler.tar.gz
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload bootstrap and stage reports
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: pr88-module-dedup-bootstrap-${{ github.run_attempt }}
+          path: |
+            _build/bootstrap/**/*.json
+            _build/bootstrap/**/*.log
+          if-no-files-found: ignore
+          retention-days: 14
+
+  compiler-14:
+    name: Run unchanged compiler-14 and classify driver failures
+    needs: host
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Download verified Host bundle
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: pr88-module-dedup-host-${{ github.run_id }}-${{ github.run_attempt }}
+          path: _build/ci
+
+      - name: Verify source receipt and install Host
+        env:
+          COMPILER_SHA256: ${{ needs.host.outputs.sha256 }}
+        run: python3 scripts/ci_gate.py --compiler-artifact import --compiler-sha256 "$COMPILER_SHA256"
+
+      - name: Run unchanged compiler-14 gate
+        run: python3 scripts/ci_gate.py --profile pr --group compiler-14 --out _build/ci/pr-compiler-14
+
+      - name: Classify exact remaining failures and ABI result
+        if: always()
+        run: |
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          root = Path('_build/compiler_check_suite_14')
+          summary = json.loads(Path('_build/ci/pr-compiler-14/ci-summary.json').read_text())
+          if [gate['name'] for gate in summary['gates']] != ['compiler-checking-14']:
+              raise SystemExit('compiler-14 gate did not run exactly once')
+
+          driver = (root / 'compiler_driver.out').read_text().splitlines()
+          required = {
+              'PASS shared paths deduplicate bindings without hiding ambiguity: module-exports',
+              'PASS qualified selected names stay usable across a short-name collision: COk',
+              'PASS nested qualified record field follows the declaring alias: COk',
+              'PASS nested imported record literal uses the declaring field type: COk',
+              'PASS nested renamed record field follows the declaring selection: COk',
+          }
+          missing = required.difference(driver)
+          if missing:
+              raise SystemExit(f'missing target PASS rows: {sorted(missing)}')
+          if not any(row.startswith('PASS bare selected short-name collision remains ambiguous: CErr 96/')
+                     for row in driver):
+              raise SystemExit('bare selected collision did not retain CErr 96')
+          if 'COMPILER_ABI: PASS' not in (root / 'compiler_abi.out').read_text().splitlines():
+              raise SystemExit('compiler ABI did not pass')
+
+          observed = [row for row in driver if row.startswith('FAIL ')]
+          expected = '''FAIL source guard validates markers without erasing an open: guard
+          FAIL an open requires a file-local alias: CErr 83/0
+          FAIL an open without any alias reports unknown alias: CErr 83/0
+          FAIL a nested unknown open keeps the source diagnostic: CErr 83/0
+          FAIL list literal cannot inhabit an unrelated colliding List: CErr 64/110
+          FAIL an unbound dotted prefix remains an invalid record projection: CErr 11/0
+          FAIL range literal requires represented bound: CErr 42/7
+          FAIL range role rejects another nominal bound family: CErr 42/9
+          FAIL range role rejects swapped constructor fields: CErr 42/7
+          FAIL range endpoint must be a literal: CErr 10/76
+          FAIL inclusive range requires endpoint: CErr 10/70
+          FAIL range rejects chained separators: CErr 10/71
+          FAIL standalone spread stays a parse error: CErr 10/59
+          FAIL nonfinal spread stays a parse error: CErr 10/63
+          FAIL multiple spreads stay a parse error: CErr 10/63
+          FAIL archived annotated record update is now accepted: CErr 45/1'''.splitlines()
+          gate_log = Path('_build/ci/pr-compiler-14/compiler-checking-14/gate.log').read_text().splitlines()
+          fixture_failures = [row for row in gate_log if row.startswith('COMPILER_CHECK_FAIL ')]
+          native_failures = [row for row in gate_log if row.startswith('PRECISION_FAIL ')]
+          expected_fixtures = [
+              'COMPILER_CHECK_FAIL compiler_driver-run exit=1 want=0',
+              'COMPILER_CHECK_FAIL compiler_native_lint-run exit=1 want=0',
+          ]
+          expected_native = [
+              'PRECISION_FAIL native-lint/scoped-open-retains-unknown-precision',
+              'PRECISION_FAIL native-lint/record-owner-marker-keeps-unknown-precision',
+          ]
+          if summary['pass']:
+              if observed or fixture_failures or native_failures:
+                  raise SystemExit('green compiler-14 summary disagrees with fixture reports')
+              print('DIAGNOSTIC: full compiler-14 gate passed, including selected-name cases and ABI')
+          elif (observed == expected and fixture_failures == expected_fixtures
+                and native_failures == expected_native):
+              print('DIAGNOSTIC: three nested-record failures cleared; 16 exact baseline driver failures remain')
+              print('DIAGNOSTIC: unchanged compiler-14 gate remains red, including native-lint')
+          else:
+              print('DIAGNOSTIC: driver failures:', observed)
+              print('DIAGNOSTIC: fixture failures:', fixture_failures)
+              print('DIAGNOSTIC: native-lint failures:', native_failures)
+              raise SystemExit('compiler-14 failure set differs from reviewed baseline')
+          PY
+
+      - name: Upload focused gate reports
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: pr88-module-dedup-compiler14-${{ github.run_attempt }}
+          path: |
+            _build/ci/pr-compiler-14/ci-summary.json
+            _build/ci/pr-compiler-14/compiler-checking-14/gate.log
+            _build/compiler_check_suite_14/*.out
+            _build/compiler_check_suite_14/*.err
+            _build/compiler_check_suite_14/suite.build
+          if-no-files-found: ignore
+          retention-days: 14
