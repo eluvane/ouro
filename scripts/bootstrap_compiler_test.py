@@ -88,7 +88,7 @@ class BootstrapCompilerTests(unittest.TestCase):
             if source == "bootstrap-bad.ouro":
                 code = 1
                 stderr = ("bootstrap-bad.ouro: type mismatch in exact_index\nCHECK_FAIL: front end rejected the input\n"
-                          "ouro1: CErr tag=0 n=1\nouro1: CErr code=41 det=78\n")
+                          "ouro1: CErr tag=0 n=1\nouro1: CErr code=41 det=80\n")
             elif source == self.rejected_root and (self.rejected_source_form is None or cwd.name == self.rejected_source_form):
                 code, stderr = 1, "current root rejected\n"
             else:
