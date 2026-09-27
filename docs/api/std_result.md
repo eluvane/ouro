@@ -2,7 +2,7 @@
 
 Result-style helpers over Either; Right is success and Left is the typed error.
 
-Declarations: 18.
+Declarations: 19.
 
 ## def result_ok
 
@@ -44,6 +44,12 @@ def result_map (E : Type) (A : Type) (B : Type) (f : A -> B)
 
 ```
 def result_map_err (E : Type) (F : Type) (A : Type) (f : E -> F)
+```
+
+## def result_with_context
+
+```
+def result_with_context (C : Type) (E : Type) (A : Type)
 ```
 
 ## def result_bind
