@@ -1,0 +1,205 @@
+name: Ascription P3 fixed-point profile (diagnostic)
+
+on:
+  push:
+    branches: [codef/ascription-p3-profile]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ascription-p3-profile-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  OURO_CI: "1"
+  OURO_REPRODUCIBLE: "1"
+  OURO_PACK_STRICT: "1"
+  OURO_JOBS: "2"
+  OURO_CACHE_DIR: _cache/ouro
+  OURO_BUILD_DIR: _build
+  OURO_C_BUILD_DIR: _build/c
+  OURO_CCACHE: disabled
+
+jobs:
+  profile:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 4
+          persist-credentials: false
+
+      - name: Pin exact diagnostic source
+        run: |
+          test "$(git rev-parse HEAD^)" = 7aef51afa3207ab06ed0a5b520dd762da9dc9784
+          test "$(git diff --name-only HEAD^ HEAD)" = .github/workflows/ascription-p3-profile.yml
+          git checkout --detach 278abc958b9a5c8c6ef04b02953b565811f38055
+          test "$(git rev-parse HEAD^)" = 5f1c84fdd816df833b7deae7a6e3217d0f2544cc
+          test "$(git diff --name-only HEAD^ HEAD)" = compiler/pipeline_support.ouro
+          test "$(git rev-parse HEAD:runtime/ouro_rt.c)" = 220bd5444b2cd82ef59fb7c0d06c0c1e394a76ed
+          test "$(git rev-parse HEAD:runtime/frontend_link.c)" = 4f47c943b98901d0348ac330635430492668c143
+          test "$(git rev-parse HEAD:compiler/pipeline_support.ouro)" = bcc16b56e7b672b24ab32022552168420f6d679f
+          test "$(git rev-parse HEAD:compiler/lower.ouro)" = 112d10465bbcc43a7f00657bea49a4c9c343d657
+          test -z "$(git status --porcelain)"
+
+      - name: Build normal host and retain strict parity failure
+        run: |
+          mkdir -p _build/ci/ascription-p3-profile
+          set +e
+          python3 scripts/ouro_build.py build --verbosity quiet
+          rc=$?
+          set -e
+          printf '%s\n' "$rc" > _build/ci/ascription-p3-profile/host-rc.txt
+          test "$rc" -eq 1
+
+      - name: Strictly check current roots and emit P3 from exact P2
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import shutil
+          import sys
+
+          sys.path.insert(0, str(Path("scripts").resolve()))
+          import bootstrap_compiler as bootstrap
+          import ouro_build as build
+          from ourosmith.limits import clean_env, run_limited
+          from repo_support import hash_json, sha256_file
+
+          output = Path("_build/ci/ascription-p3-profile").resolve()
+          reports = list(Path("_build/bootstrap").glob("*/report.json"))
+          assert len(reports) == 1, reports
+          work = reports[0].parent.resolve()
+          report = json.loads(reports[0].read_text(encoding="utf-8"))
+          inputs = work / "inputs.json"
+          snapshot = json.loads(inputs.read_text(encoding="utf-8"))
+          selected = snapshot["selected"]
+          assert report["inputs_sha256"] == sha256_file(inputs)
+          assert report["key"] == snapshot["key"] == hash_json(selected)
+          assert not bootstrap.changed_inputs(work, snapshot)
+          assert report["memory_mib"] == bootstrap.MEMORY_MIB == 3072
+          assert report["timeout_s"] == bootstrap.TIMEOUT_S == 900
+          assert report["failure"].endswith("complete generated frontend/backend C differs between current P1 and P2")
+          assert [p["phase"] for p in report["phases"]] == ["c0", "bridge", "p1", "p2"]
+          assert all(p["pass"] for p in report["phases"])
+          p1, p2 = report["phases"][2:]
+          assert p1["source_root"] == p2["source_root"] == "o"
+          assert p1["all_current_roots_strictly_checked_before_emission"]
+          assert p2["all_current_roots_strictly_checked_before_emission"]
+          assert len(selected["roots"]) == 15 and selected["roots"][13] == "compiler/pipeline.ouro"
+          for name in ("runtime/ouro_rt.c", "runtime/frontend_link.c",
+                       "compiler/pipeline_support.ouro", "compiler/lower.ouro"):
+              digest = sha256_file(Path(name))
+              assert selected["sources"][name] == snapshot["inputs"]["o/" + name] == digest
+          assert sha256_file(Path(selected["cc_executable"])) == selected["cc_sha256"]
+          p2_binary = work / p2["binary"]
+          assert sha256_file(p2_binary) == p2["binary_sha256"]
+          for name, key in (("driver_u.c", "frontend_sha256"),
+                            ("backend_u.c", "backend_sha256")):
+              assert sha256_file(work / "out/p2" / name) == p2[key]
+
+          p3_work = Path("_build/ascription-p3-frozen").resolve()
+          p3_work.mkdir(parents=True, exist_ok=False)
+          shutil.copyfile(inputs, p3_work / "inputs.json")
+          for name, digest in snapshot["inputs"].items():
+              source = work / name
+              target = p3_work / name
+              target.parent.mkdir(parents=True, exist_ok=True)
+              shutil.copyfile(source, target)
+              assert sha256_file(target) == digest
+          assert sha256_file(p3_work / "inputs.json") == report["inputs_sha256"]
+          assert not bootstrap.changed_inputs(p3_work, snapshot)
+          source_root = p3_work / "o"
+          stage = p3_work / "out/p2"
+          stage.mkdir(parents=True)
+          values = {**snapshot["config"], "cc": selected["cc_executable"], "jobs": 1,
+                    "cache_enabled": False, "ccache": "disabled", "build_dir": str(stage / "b"),
+                    "c_build_dir": str(stage / "c"), "cache_dir": str(stage / "k")}
+          env = clean_env()
+          for name in ("USERPROFILE", "APPDATA", "LOCALAPPDATA", "PROGRAMFILES", "PROGRAMFILES(X86)",
+                       *selected["environment"]):
+              if name in os.environ:
+                  env[name] = os.environ[name]
+          for key, name in build.ENV_MAP.items():
+              value = values[key]
+              env[name] = ("1" if value else "0") if isinstance(value, bool) else str(value)
+          env.update(PYTHONDONTWRITEBYTECODE="1", OURO_FRONTEND_JOBS="1",
+                     OURO1_CHECK_FUEL=bootstrap.FUEL)
+
+          commands = []
+          def run(label, argv):
+              result = run_limited(argv, cwd=source_root, env=env,
+                                   timeout_s=bootstrap.TIMEOUT_S, memory_mb=bootstrap.MEMORY_MIB)
+              row = {"label": label, "status": result.status, "returncode": result.returncode,
+                     "stdout_sha256": hashlib.sha256(result.stdout.encode()).hexdigest(),
+                     "stderr_sha256": hashlib.sha256(result.stderr.encode()).hexdigest(),
+                     "stderr_tail": result.stderr[-1000:]}
+              commands.append(row)
+              (output / "commands.json").write_text(json.dumps(commands, indent=2) + "\n", encoding="utf-8")
+              assert result.status == "ok" and result.returncode == 0, row
+              return result
+
+          for label, source in enumerate([*selected["roots"], *bootstrap.ACCEPTANCE_ROOTS]):
+              units = selected["unit_graph"][source]
+              assert units and units[-1] == source
+              argv = [str(p2_binary), "check", source, bootstrap.FUEL,
+                      *[part for unit in units for part in ("--unit", unit)]]
+              result = run(f"strict-{label:02}-{Path(source).stem}", argv)
+              assert result.stdout == "CHECK_OK\n" and result.stderr == "", source
+
+          worker = [sys.executable, "-B", str(source_root / "scripts/bootstrap_compiler.py"),
+                    "worker", "--snapshot", str(p3_work / "inputs.json"), "--phase", "p2"]
+          run("p3-frontend", [*worker, "--action", "frontend", "--producer", str(p2_binary)])
+          backend_units = selected["unit_graph"]["compiler/backend.ouro"]
+          backend = run("p3-backend", [str(p2_binary), "--module", "_be",
+                                       "compiler/backend.ouro", bootstrap.FUEL,
+                                       *[part for unit in backend_units for part in ("--unit", unit)]])
+          assert backend.stdout.startswith('#include "ouro_rt.h"')
+          assert "ouro_export_count_be" in backend.stdout
+          (stage / "backend_u.c").write_text(backend.stdout, encoding="utf-8", newline="\n")
+          run("p3-link", [*worker, "--action", "link"])
+          p3_binary = stage / "ouro1"
+          assert p3_binary.is_file() and p3_binary.stat().st_size > 4096
+          for name in ("frontend.json", "link.json", "generated_c_shards_report.json"):
+              source = stage / name
+              if source.is_file():
+                  shutil.copyfile(source, output / ("p3-" + name))
+
+          comparison = {"source_head": "278abc958b9a5c8c6ef04b02953b565811f38055",
+                        "inputs_sha256": report["inputs_sha256"],
+                        "p2_binary_sha256": p2["binary_sha256"],
+                        "p3_binary_sha256": sha256_file(p3_binary),
+                        "memory_mib": bootstrap.MEMORY_MIB, "timeout_s": bootstrap.TIMEOUT_S,
+                        "strict_roots": len(selected["roots"]),
+                        "acceptance_roots": len(bootstrap.ACCEPTANCE_ROOTS), "generated_c": {}}
+          for name, key in (("driver_u.c", "frontend_sha256"),
+                            ("backend_u.c", "backend_sha256")):
+              comparison["generated_c"][name] = {"p1_sha256": p1[key],
+                                                  "p2_sha256": p2[key],
+                                                  "p3_sha256": sha256_file(stage / name)}
+          (output / "comparison.json").write_text(json.dumps(comparison, indent=2) + "\n", encoding="utf-8")
+          assert not bootstrap.changed_inputs(work, snapshot)
+          assert not bootstrap.changed_inputs(p3_work, snapshot)
+          assert all(row["p2_sha256"] == row["p3_sha256"] for row in comparison["generated_c"].values())
+          print(json.dumps(comparison, indent=2))
+          PY
+
+      - name: Upload diagnostic receipts and bootstrap report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ascription-p3-profile-${{ github.run_attempt }}
+          path: |
+            _build/ci/ascription-p3-profile/*
+            _build/bootstrap/**/*.json
+            _build/bootstrap/**/*.log
+          if-no-files-found: ignore
+          retention-days: 14
