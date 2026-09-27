@@ -260,11 +260,12 @@ def run_measured(
     peak_tree_kb = 0
     progress_offset = 0
     progress_tail = ""
+    progress_path_name: Optional[str] = None
     progress_name: Optional[str] = None
     progress_peak_kb = 0
 
     def sample_progress(rss_kb: int) -> None:
-        nonlocal progress_offset, progress_tail, progress_name, progress_peak_kb
+        nonlocal progress_offset, progress_tail, progress_path_name, progress_name, progress_peak_kb
         if progress_file is None:
             return
         try:
@@ -280,7 +281,13 @@ def run_measured(
             if line.startswith("STRICT_MEM_FILE "):
                 if progress_name is not None:
                     print(f"STRICT_MEM_RSS file={progress_name} peak_kb={progress_peak_kb}", flush=True)
-                progress_name = line[len("STRICT_MEM_FILE "):].strip()
+                progress_path_name = line[len("STRICT_MEM_FILE "):].strip()
+                progress_name = progress_path_name
+                progress_peak_kb = 0
+            elif line.startswith("STRICT_MEM_STAGE ") and progress_path_name is not None:
+                stage = line[len("STRICT_MEM_STAGE "):].split(" ", 1)[0]
+                print(f"STRICT_MEM_RSS file={progress_path_name}#{stage} peak_kb={progress_peak_kb}", flush=True)
+                progress_name = progress_path_name + "#after-" + stage
                 progress_peak_kb = 0
         if progress_name is not None:
             progress_peak_kb = max(progress_peak_kb, rss_kb)
