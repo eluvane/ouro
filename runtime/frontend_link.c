@@ -162,6 +162,8 @@ static ouro_v *cerr(unsigned long code, unsigned long det)
 static ouro_v *g_closed_parse_file;
 static ouro_v *g_last_intern;
 static ouro_v *g_last_checked_program;
+static ouro_v *g_trace_check_intern;
+static unsigned long g_trace_check_item_count;
 
 ouro_v *ouro_fe_last_intern(void)
 {
@@ -698,6 +700,17 @@ static ouro_v *bounded_elaborate_fuel(ouro_env *env, ouro_v *fuel)
 static ouro_v *bounded_check_item(ouro_env *env, ouro_v *item)
 {
 	ouro_v *result;
+	const char *trace = getenv("OURO_MEM_TRACE");
+	if (trace != 0 && trace[0] != 0 && strcmp(trace, "0") != 0 &&
+	    ++g_trace_check_item_count == 396UL && g_trace_check_intern != 0) {
+		ouro_v *name = ouro_apply(FIND(fc, "file_item_name"), item);
+		ouro_v *codes = ouro_apply(ouro_apply(FIND(pl, "name_of_id"),
+			g_trace_check_intern), name);
+		char text[512];
+		int length = codes_to_buf(codes, text, sizeof(text));
+		fprintf(stderr, "OURO_MEM_CHECK_ITEM ordinal=395 kind=%d name_id=%lu name=%.*s\n",
+			item->tag, as_nat(name), length, text);
+	}
 	ouro_heap_report("frontend-check-item-enter");
 	result = bounded_call(FIND(fc, "check_indexed_declaration"), 4,
 		(ouro_v *[]){ouro_get(env, 2), ouro_get(env, 1), ouro_get(env, 0), item},
@@ -1074,6 +1087,8 @@ static ouro_v *compile_checked_units_impl(ouro_v *fuel, ouro_v *root, ouro_v *fi
 
 	fn = closed_compile_from_decls();
 	ouro_perm_select(1);
+	g_trace_check_item_count = 0;
+	g_trace_check_intern = st2;
 	ouro_heap_report("frontend-check-decls-enter");
 	r = ouro_apply(ouro_apply(ouro_apply(ouro_apply(fn, selected), fuel), st2), ds);
 	ouro_heap_report("frontend-check-decls-return");
