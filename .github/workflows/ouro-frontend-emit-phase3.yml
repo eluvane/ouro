@@ -1,0 +1,96 @@
+name: Frontend post-emission phases (diagnostic)
+
+on:
+  push:
+    branches: [codef/frontend-emit-phase3]
+    paths:
+      - .github/workflows/ouro-frontend-emit-phase3.yml
+
+permissions:
+  contents: read
+  actions: read
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  OURO_CI: "1"
+  OURO_REPRODUCIBLE: "1"
+  OURO_PACK_STRICT: "1"
+  OURO_JOBS: "2"
+  OURO_CACHE_DIR: _cache/ouro
+  OURO_BUILD_DIR: _build
+  OURO_C_BUILD_DIR: _build/c
+  OURO_CCACHE: disabled
+
+jobs:
+  frontend-host:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout exact phase2 source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: 97212517e85b08ecfcfc3f49447840def06e310e
+          persist-credentials: false
+
+      - name: Verify source and diagnostic workflow
+        run: |
+          test "$GITHUB_REF_NAME" = codef/frontend-emit-phase3
+          test "$(git rev-parse HEAD)" = 97212517e85b08ecfcfc3f49447840def06e310e
+          test "$(git hash-object runtime/bootstrap.c)" = 9513799a3d30e1564c11b98d5d8c66d9b66ac9fd
+          test "$(git hash-object scripts/native_tool_build.py)" = 0e6ebc0d0eb31f773ed8c94dcb0c1ab27285d8ce
+
+      - name: Download exact phase2 host compiler
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: host-compiler-36309745906-1
+          run-id: 36309745906
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: _build/ci
+
+      - name: Verify and install host compiler
+        run: |
+          echo "ee563a596bd7bdbbffca4e78b8ea5afa98402cbc2d5fdb86ef7881c6459954d1  _build/ci/host-compiler.tar.gz" | sha256sum -c -
+          python3 scripts/ci_gate.py --compiler-artifact import --compiler-sha256 ee563a596bd7bdbbffca4e78b8ea5afa98402cbc2d5fdb86ef7881c6459954d1
+
+      - name: Run unchanged frontend gate with external phase sampler
+        env:
+          FRONTEND_SECURITY_OUT: _build/frontend_security
+          OURO_DIAG_EMIT_PHASES: "1"
+        run: |
+          mkdir -p _build/frontend_security
+          (
+            while :; do
+              {
+                printf 'PHASE3_TICK time=%s\n' "$(date -u +%FT%TZ)"
+                ps -eo pid=,ppid=,etimes=,rss=,comm= | awk '$5 ~ /^(ouro1|python3|cc1|cc|gcc|as)$/ { printf "PROC pid=%s ppid=%s elapsed_s=%s rss_kib=%s comm=%s\n", $1, $2, $3, $4, $5 }'
+                if test -d _build/frontend_security/host; then
+                  find _build/frontend_security/host -maxdepth 3 -type f \
+                    \( -name 'emit.*.c' -o -name 'backend.gen.c' -o -name 'tool.gen.c' \) \
+                    -printf 'C_FILE bytes=%s path=%p\n'
+                fi
+              } >> _build/frontend_security/phase3-progress.log
+              sleep 10
+            done
+          ) &
+          monitor=$!
+          trap 'kill "$monitor" 2>/dev/null || true' EXIT
+          sh scripts/frontend_security_suite.sh
+
+      - name: Upload diagnostic reports
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: frontend-emit-phase3-reports
+          path: |
+            _build/frontend_security/phase3-progress.log
+            _build/frontend_security/**/*.json
+            _build/frontend_security/**/*.log
+            _build/frontend_security/**/*.out
+            _build/frontend_security/**/*.err
+            _build/frontend_security/**/*.stdout
+            _build/frontend_security/**/*.stderr
+          if-no-files-found: warn
+          retention-days: 7
