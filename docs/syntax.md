@@ -476,6 +476,7 @@ def sameOrigin : Point := { y, x };
 def moved : Point := { origin with x := S Z };
 def originX : Nat := origin.x;
 def originY : Nat := let { y } : Point := origin in y;
+def horizontal : Nat := let { x as axis } : Point := origin in axis;
 ```
 
 The default constructor is `MkPoint`; generated accessor names use
@@ -487,15 +488,17 @@ source does not change the constructor's declared field order. Unknown,
 duplicate, and missing fields remain errors; an unbound punned value is a
 compiler error.
 
-`let { x, y } : Point := value in body` binds selected fields of a local
-nominal record in `body`. The annotation is a direct record name, fields are
-distinct, and `in` is mandatory. The subject is checked as that record type and
-evaluated once; generated accessor calls are checked before the selected names
-enter scope. A field binder can shadow an outer name without changing the
-subject or another accessor. Comments and a trailing comma are allowed in the
-field list. Unknown or repeated fields, a missing nominal annotation, and a
-subject of the wrong type are rejected. This form does not infer a record type
-from the subject, bind renamed fields, or support imported records.
+`let { x, y as vertical } : Point := value in body` binds selected fields of a
+local nominal record in `body`. The annotation is a direct record name, source
+fields and resulting binder names are each distinct, and `in` is mandatory. A
+bare field binds its own name; `field as local` binds `local`. The subject is
+checked as that record type and evaluated once; generated accessor calls are
+checked before the selected names enter scope. A field binder can shadow an
+outer name without changing the subject or another accessor. Comments and a
+trailing comma are allowed in the field list. Unknown or repeated fields,
+duplicate binders, a missing nominal annotation, and a subject of the wrong
+type are rejected. This form does not infer a record type from the subject or
+support imported records. Renamed binders exist only in `body`.
 
 With an import alias, a literal annotated `A.Point` uses the record declared
 by `A`, and `A.point.x` retains `A.point` as its base. Qualified projection

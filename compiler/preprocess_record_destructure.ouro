@@ -2,17 +2,43 @@ import "preprocess_record_update.ouro";
 
 inductive RecDestructureFields : Type :=
   | RecDestructureFieldsErr : Nat -> RecDestructureFields
-  | RecDestructureFieldsOk : List (List Nat) -> RecDestructureFields;
+  | RecDestructureFieldsOk : List (Pair (List Nat) (List Nat)) -> RecDestructureFields;
 
 inductive RecDestructureParse : Type :=
   | RecDestructureNone : RecDestructureParse
   | RecDestructureErr : Nat -> RecDestructureParse
-  | RecDestructureOk : Nat -> List Nat -> List (List Nat) ->
+  | RecDestructureOk : Nat -> List Nat -> List (Pair (List Nat) (List Nat)) ->
       List Nat -> RecDestructureParse;
+
+def destructure_local_name (field : List Nat) (after_field : List Nat)
+    : Maybe (Pair (List Nat) (List Nat)) :=
+  let after : List Nat := skip_ws_p after_field in
+  match source_take_ident after with
+  | MkPair word rest =>
+      match source_bytes_equal word (n2p 97 115) with
+      | False => Just (Pair (List Nat) (List Nat))
+          (MkPair (List Nat) (List Nat) field after)
+      | True =>
+          match source_take_ident (skip_ws_p rest) with
+          | MkPair local tail =>
+              match local with
+              | Nil => Nothing (Pair (List Nat) (List Nat))
+              | Cons first _ =>
+                  match source_is_ident_start first with
+                  | False => Nothing (Pair (List Nat) (List Nat))
+                  | True => Just (Pair (List Nat) (List Nat))
+                      (MkPair (List Nat) (List Nat) local (skip_ws_p tail))
+                  end
+              end
+          end
+      end
+  end;
 
 def parse_destructure_fields (fields : List RecField) (input : List Nat)
     : RecDestructureFields :=
-  (fix go (fuel : Nat) (xs : List Nat) (seen : List (List Nat))
+  (fix go (fuel : Nat) (xs : List Nat)
+      (sources : List (List Nat)) (locals : List (List Nat))
+      (selected : List (Pair (List Nat) (List Nat)))
       : RecDestructureFields :=
     match fuel with
     | Z => RecDestructureFieldsErr rec_code_malformed
@@ -22,30 +48,47 @@ def parse_destructure_fields (fields : List RecField) (input : List Nat)
             match name with
             | Nil => RecDestructureFieldsErr rec_code_malformed
             | Cons _ _ =>
-                match name_in name seen with
+                match name_in name sources with
                 | True => RecDestructureFieldsErr rec_code_dup
                 | False =>
                     match find_field_idx name fields with
                     | Nothing => RecDestructureFieldsErr rec_code_unknown
                     | Just _ =>
-                        let next : List (List Nat) := Cons (List Nat) name seen in
-                        match skip_ws_p after_name with
-                        | Nil => RecDestructureFieldsOk (reverse (List Nat) next)
-                        | Cons comma tail =>
-                            match eqNat comma ch_comma_p with
-                            | False => RecDestructureFieldsErr rec_code_malformed
-                            | True =>
-                                match skip_ws_p tail with
-                                | Nil => RecDestructureFieldsOk (reverse (List Nat) next)
-                                | Cons _ _ => go remaining tail next
-                                end
-                            end
+                        match destructure_local_name name after_name with
+                        | Nothing => RecDestructureFieldsErr rec_code_malformed
+                        | Just binding => match binding with
+                          | MkPair local after_local =>
+                              match name_in local locals with
+                              | True => RecDestructureFieldsErr rec_code_dup
+                              | False =>
+                                  let next : List (Pair (List Nat) (List Nat)) :=
+                                    Cons (Pair (List Nat) (List Nat))
+                                      (MkPair (List Nat) (List Nat) name local) selected in
+                                  match after_local with
+                                  | Nil => RecDestructureFieldsOk
+                                      (reverse (Pair (List Nat) (List Nat)) next)
+                                  | Cons comma tail =>
+                                      match eqNat comma ch_comma_p with
+                                      | False => RecDestructureFieldsErr rec_code_malformed
+                                      | True =>
+                                          match skip_ws_p tail with
+                                          | Nil => RecDestructureFieldsOk
+                                              (reverse (Pair (List Nat) (List Nat)) next)
+                                          | Cons _ _ => go remaining tail
+                                              (Cons (List Nat) name sources)
+                                              (Cons (List Nat) local locals) next
+                                          end
+                                      end
+                                  end
+                              end
+                          end
                         end
                     end
                 end
             end
         end
-    end) (S (length Nat input)) input (Nil (List Nat));
+    end) (S (length Nat input)) input (Nil (List Nat)) (Nil (List Nat))
+      (Nil (Pair (List Nat) (List Nat)));
 
 def parse_record_destructure_typed (reg : RecReg) (current : List Nat)
     (aliases : ImpReg) (pattern : List Nat) (ty : List Nat)
@@ -152,50 +195,55 @@ def wrap_destructure_users (values : List (Pair (List Nat) (List Nat)))
 
 def destructure_body_env (reg : RecReg) (current : List Nat)
     (aliases : ImpReg) (info : RecInfo) (fields : List RecField)
-    (selected : List (List Nat)) (env : RecEnv) : RecEnv :=
-  (fix go (names : List (List Nat)) (scope : RecEnv) : RecEnv :=
+    (selected : List (Pair (List Nat) (List Nat))) (env : RecEnv) : RecEnv :=
+  (fix go (names : List (Pair (List Nat) (List Nat))) (scope : RecEnv) : RecEnv :=
     match names with
     | Nil => scope
-    | Cons name rest =>
+    | Cons binding rest => match binding with
+      | MkPair field local =>
         let next : RecEnv :=
-          match find_field_idx name fields with
-          | Nothing => env_mask scope reg name
+          match find_field_idx field fields with
+          | Nothing => env_mask scope reg local
           | Just index =>
               match update_field_type fields index with
-              | Nothing => env_mask scope reg name
+              | Nothing => env_mask scope reg local
               | Just ty =>
                   match record_field_type_hint reg current aliases info ty with
-                  | Nothing => env_mask scope reg name
+                  | Nothing => env_mask scope reg local
                   | Just hint => match hint with
-                    | MkPair ri _ => env_add scope name ri
+                    | MkPair ri _ => env_add scope local ri
                     end
                   end
               end
           end in
         go rest next
+      end
     end) selected env;
 
 def destructure_accessors (reg : RecReg) (current : List Nat)
     (aliases : ImpReg) (bare_atoms : List (List Nat))
-    (ri : Nat) (record_name : List Nat) (selected : List (List Nat))
+    (ri : Nat) (record_name : List Nat)
+    (selected : List (Pair (List Nat) (List Nat)))
     : Maybe (List (Pair (List Nat) (List Nat))) :=
-  (fix go (names : List (List Nat))
+  (fix go (names : List (Pair (List Nat) (List Nat)))
       : Maybe (List (Pair (List Nat) (List Nat))) :=
     match names with
     | Nil => Just (List (Pair (List Nat) (List Nat)))
         (Nil (Pair (List Nat) (List Nat)))
-    | Cons name rest =>
+    | Cons binding rest => match binding with
+      | MkPair field local =>
         match record_generated_name reg current aliases bare_atoms ri
-            (acc_name record_name name) with
+            (acc_name record_name field) with
         | Nothing => Nothing (List (Pair (List Nat) (List Nat)))
         | Just accessor =>
             match go rest with
             | Nothing => Nothing (List (Pair (List Nat) (List Nat)))
             | Just tail => Just (List (Pair (List Nat) (List Nat)))
                 (Cons (Pair (List Nat) (List Nat))
-                  (MkPair (List Nat) (List Nat) name accessor) tail)
+                  (MkPair (List Nat) (List Nat) local accessor) tail)
             end
         end
+      end
     end) selected;
 
 def destructure_accessor_names
@@ -242,7 +290,7 @@ def build_destructure_projections (source : List Nat)
 def build_record_destructure (reg : RecReg) (current : List Nat)
     (aliases : ImpReg) (bare_atoms : List (List Nat))
     (info : RecInfo) (ri : Nat) (source : List Nat)
-    (ty : List Nat) (selected : List (List Nat))
+    (ty : List Nat) (selected : List (Pair (List Nat) (List Nat)))
     (subject : List Nat) (body : List Nat) : RewriteR :=
   match info with
   | MkRecInfo _ record_name _ _ _ =>

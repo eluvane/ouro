@@ -403,17 +403,18 @@ and unknown fields remain errors.
 ## Record field destructuring
 
 ```ouro
-let { host, port } : Config := loadConfig in host
+let { host as server_host, port } : Config := loadConfig in server_host
 ```
 
 This local expression form selects distinct fields of a directly named local
 nominal record. The annotated subject is evaluated once, then checked accessors
 read the selected fields before their names enter the body scope. The selected
-names may shadow outer bindings. Unknown and duplicate fields, missing type
-context, and a subject of the wrong record type are errors. An `in` body is
-required; imported records, renaming, and block-statement destructuring are
-outside this form. See [Records](../syntax.md#records) for the full syntax
-boundary.
+names may be renamed with `field as local` and may shadow outer bindings. Source
+fields and resulting local names must each be distinct. Unknown fields,
+duplicate names, missing type context, and a subject of the wrong record type
+are errors. An `in` body is required; imported records and block-statement
+destructuring are outside this form. See [Records](../syntax.md#records) for the
+full syntax boundary.
 
 ## Functional record update
 
