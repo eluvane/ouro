@@ -653,6 +653,55 @@ static ouro_v *bounded_call(ouro_v *fn, int count, ouro_v **args,
 	return result;
 }
 
+static ouro_v *bounded_call_profiled(ouro_v *fn, int count, ouro_v **args,
+		ouro_v *(*clone_result)(ouro_v *), const char *stage,
+		unsigned long index, unsigned long sample_mask, double *total_cpu)
+{
+	clock_t started, applied, cloned, reset;
+	unsigned long long before, after_apply, after_clone, after_reset;
+	ouro_v *result;
+	int i;
+	double elapsed;
+#ifdef __linux__
+	struct rusage usage;
+#endif
+	if (!fe_diag_enabled())
+		return bounded_call(fn, count, args, clone_result);
+	started = clock();
+	before = ouro_heap_total_alloc_bytes();
+	ouro_heap_mark();
+	for (i = 0; i < count; i++)
+		fn = ouro_apply(fn, args[i]);
+	applied = clock();
+	after_apply = ouro_heap_total_alloc_bytes();
+	result = clone_result(fn);
+	cloned = clock();
+	after_clone = ouro_heap_total_alloc_bytes();
+	ouro_heap_reset();
+	reset = clock();
+	after_reset = ouro_heap_total_alloc_bytes();
+	elapsed = (double)(reset - started) / (double)CLOCKS_PER_SEC;
+	*total_cpu += elapsed;
+	if ((index & sample_mask) == 0 || elapsed >= 1.0) {
+		fprintf(stderr,
+			"OURO_FE_PART stage=%s index=%lu wall_s=%lld apply_cpu_s=%.3f apply_alloc=%llu clone_cpu_s=%.3f clone_alloc=%llu reset_cpu_s=%.3f reset_alloc=%llu",
+			stage, index, (long long)time(0),
+			(double)(applied - started) / (double)CLOCKS_PER_SEC,
+			after_apply - before,
+			(double)(cloned - applied) / (double)CLOCKS_PER_SEC,
+			after_clone - after_apply,
+			(double)(reset - cloned) / (double)CLOCKS_PER_SEC,
+			after_reset - after_clone);
+#ifdef __linux__
+		if (getrusage(RUSAGE_SELF, &usage) == 0)
+			fprintf(stderr, " peak_rss_kib=%ld", usage.ru_maxrss);
+#endif
+		fputc('\n', stderr);
+		fflush(stderr);
+	}
+	return result;
+}
+
 static ouro_v *bounded_token_state(ouro_env *env, ouro_v *st)
 {
 	return bounded_call(FIND(lx, "next_import_token"), 3,
@@ -692,22 +741,12 @@ static ouro_v *closed_parse_unit(void)
    recursion inside lower_expr_env2 stays in the generated lowerer. */
 static ouro_v *bounded_lower_expr(ouro_env *env, ouro_v *expr)
 {
-	int diag = fe_diag_enabled();
-	clock_t started = 0;
-	unsigned long long allocated_before = 0;
-	ouro_v *result;
-	if (diag) {
+	if (fe_diag_enabled())
 		fe_diag_lower_count++;
-		started = clock();
-		allocated_before = ouro_heap_total_alloc_bytes();
-	}
-	result = bounded_call(FIND(lo, "lower_expr_env2"), 3,
+	return bounded_call_profiled(FIND(lo, "lower_expr_env2"), 3,
 		(ouro_v *[]){ouro_get(env, 1), ouro_get(env, 0), expr},
-		ouro_clone_perm_deep);
-	if (diag)
-		fe_diag_lower_cpu += fe_diag_call("lower-expr", fe_diag_lower_count,
-			started, allocated_before, 127UL);
-	return result;
+		ouro_clone_perm_deep, "lower-expr", fe_diag_lower_count,
+		127UL, &fe_diag_lower_cpu);
 }
 
 static ouro_v *bounded_lower_expected(ouro_env *env, ouro_v *expected)
@@ -789,22 +828,12 @@ static ouro_v *bounded_elaborate_fuel(ouro_env *env, ouro_v *fuel)
    re-entered by check_indexed_declaration's recursive term checks. */
 static ouro_v *bounded_check_item(ouro_env *env, ouro_v *item)
 {
-	int diag = fe_diag_enabled();
-	clock_t started = 0;
-	unsigned long long allocated_before = 0;
-	ouro_v *result;
-	if (diag) {
+	if (fe_diag_enabled())
 		fe_diag_check_count++;
-		started = clock();
-		allocated_before = ouro_heap_total_alloc_bytes();
-	}
-	result = bounded_call(FIND(fc, "check_indexed_declaration"), 4,
+	return bounded_call_profiled(FIND(fc, "check_indexed_declaration"), 4,
 		(ouro_v *[]){ouro_get(env, 2), ouro_get(env, 1), ouro_get(env, 0), item},
-		ouro_clone_perm);
-	if (diag)
-		fe_diag_check_cpu += fe_diag_call("check-item", fe_diag_check_count,
-			started, allocated_before, 15UL);
-	return result;
+		ouro_clone_perm, "check-item", fe_diag_check_count,
+		15UL, &fe_diag_check_cpu);
 }
 
 static ouro_v *bounded_check_signature(ouro_env *env, ouro_v *sig)
