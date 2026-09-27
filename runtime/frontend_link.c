@@ -618,9 +618,13 @@ static ouro_v *closed_parse_unit(void)
    recursion inside lower_expr_env2 stays in the generated lowerer. */
 static ouro_v *bounded_lower_expr(ouro_env *env, ouro_v *expr)
 {
-	return bounded_call(FIND(lo, "lower_expr_env2"), 3,
+	ouro_v *result;
+	ouro_heap_report("frontend-lower-enter");
+	result = bounded_call(FIND(lo, "lower_expr_env2"), 3,
 		(ouro_v *[]){ouro_get(env, 1), ouro_get(env, 0), expr},
 		ouro_clone_perm_deep);
+	ouro_heap_report("frontend-lower-exit");
+	return result;
 }
 
 static ouro_v *bounded_lower_expected(ouro_env *env, ouro_v *expected)
@@ -639,15 +643,23 @@ static ouro_v *bounded_lower_environment(ouro_env *env, ouro_v *lower_env)
    so each mark belongs to one complete, non-reentrant pure pass. */
 static ouro_v *bounded_compile_program(ouro_env *env, ouro_v *surfaces)
 {
+	ouro_v *result;
 	(void)env;
-	return bounded_call(FIND(co, "compile_program"), 1,
+	ouro_heap_report("frontend-preflight-enter");
+	result = bounded_call(FIND(co, "compile_program"), 1,
 		(ouro_v *[]){surfaces}, ouro_clone_perm);
+	ouro_heap_report("frontend-preflight-exit");
+	return result;
 }
 
 static ouro_v *bounded_elaborate_surfaces(ouro_env *env, ouro_v *surfaces)
 {
-	return bounded_call(FIND(el, "elaborate_surfaces"), 2,
+	ouro_v *result;
+	ouro_heap_report("frontend-elaborate-surfaces-enter");
+	result = bounded_call(FIND(el, "elaborate_surfaces"), 2,
 		(ouro_v *[]){ouro_get(env, 0), surfaces}, ouro_clone_perm);
+	ouro_heap_report("frontend-elaborate-surfaces-exit");
+	return result;
 }
 
 static ouro_v *bounded_elaborate_surfaces_fuel(ouro_env *env, ouro_v *fuel)
@@ -658,8 +670,12 @@ static ouro_v *bounded_elaborate_surfaces_fuel(ouro_env *env, ouro_v *fuel)
 
 static ouro_v *bounded_elaborate_context(ouro_env *env, ouro_v *names)
 {
-	return bounded_call(FIND(el, "elaborate_fuel"), 3,
+	ouro_v *result;
+	ouro_heap_report("frontend-elaborate-one-enter");
+	result = bounded_call(FIND(el, "elaborate_fuel"), 3,
 		(ouro_v *[]){ouro_get(env, 1), ouro_get(env, 0), names}, ouro_clone_perm);
+	ouro_heap_report("frontend-elaborate-one-exit");
+	return result;
 }
 
 static ouro_v *bounded_elaborate_surface(ouro_env *env, ouro_v *surface)
@@ -681,9 +697,13 @@ static ouro_v *bounded_elaborate_fuel(ouro_env *env, ouro_v *fuel)
    re-entered by check_indexed_declaration's recursive term checks. */
 static ouro_v *bounded_check_item(ouro_env *env, ouro_v *item)
 {
-	return bounded_call(FIND(fc, "check_indexed_declaration"), 4,
+	ouro_v *result;
+	ouro_heap_report("frontend-check-item-enter");
+	result = bounded_call(FIND(fc, "check_indexed_declaration"), 4,
 		(ouro_v *[]){ouro_get(env, 2), ouro_get(env, 1), ouro_get(env, 0), item},
 		ouro_clone_perm);
+	ouro_heap_report("frontend-check-item-exit");
+	return result;
 }
 
 static ouro_v *bounded_check_signature(ouro_env *env, ouro_v *sig)
@@ -1054,7 +1074,9 @@ static ouro_v *compile_checked_units_impl(ouro_v *fuel, ouro_v *root, ouro_v *fi
 
 	fn = closed_compile_from_decls();
 	ouro_perm_select(1);
+	ouro_heap_report("frontend-check-decls-enter");
 	r = ouro_apply(ouro_apply(ouro_apply(ouro_apply(fn, selected), fuel), st2), ds);
+	ouro_heap_report("frontend-check-decls-return");
 	/* Only generic lowering failures need source hints. Preserve the checked
 	   result across the same lifetime seam before calling the Ouro remapper. */
 	r = ouro_clone_perm_deep(r);
