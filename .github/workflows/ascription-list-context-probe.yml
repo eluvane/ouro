@@ -1,0 +1,193 @@
+name: Ascription list context probe (diagnostic)
+
+on:
+  push:
+    branches: [codef/ascription-list-context-probe]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ascription-list-context-probe-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  OURO_CI: "1"
+  OURO_REPRODUCIBLE: "1"
+  OURO_PACK_STRICT: "1"
+  OURO_JOBS: "2"
+  OURO_CACHE_DIR: _cache/ouro
+  OURO_BUILD_DIR: _build
+  OURO_C_BUILD_DIR: _build/c
+  OURO_CCACHE: disabled
+
+jobs:
+  profile:
+    runs-on: ubuntu-latest
+    timeout-minutes: 70
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 3
+          persist-credentials: false
+
+      - name: Pin exact diagnostic source
+        run: |
+          test "$(git rev-parse HEAD^)" = 278abc958b9a5c8c6ef04b02953b565811f38055
+          test "$(git diff --name-only HEAD^ HEAD)" = .github/workflows/ascription-list-context-probe.yml
+          git checkout --detach 278abc958b9a5c8c6ef04b02953b565811f38055
+          test "$(git rev-parse HEAD^)" = 5f1c84fdd816df833b7deae7a6e3217d0f2544cc
+          test "$(git diff --name-only HEAD^ HEAD)" = compiler/pipeline_support.ouro
+          test "$(git rev-parse HEAD:runtime/ouro_rt.c)" = 220bd5444b2cd82ef59fb7c0d06c0c1e394a76ed
+          test "$(git rev-parse HEAD:runtime/frontend_link.c)" = 4f47c943b98901d0348ac330635430492668c143
+          test "$(git rev-parse HEAD:compiler/pipeline_support.ouro)" = bcc16b56e7b672b24ab32022552168420f6d679f
+          test "$(git rev-parse HEAD:compiler/lower.ouro)" = 112d10465bbcc43a7f00657bea49a4c9c343d657
+          test -z "$(git status --porcelain)"
+
+      - name: Build host with unchanged bootstrap limits and checks
+        run: |
+          mkdir -p _build/ci/ascription-list-context-probe
+          set +e
+          python3 scripts/ouro_build.py build --verbosity quiet
+          rc=$?
+          set -e
+          printf '%s\n' "$rc" > _build/ci/ascription-list-context-probe/host-rc.txt
+          printf 'host build rc=%s\n' "$rc"
+
+      - name: Compare exact p2/check-13 and one-element type rejection
+        run: |
+          python3 - <<'PY'
+          import dataclasses
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import shutil
+          import sys
+
+          sys.path.insert(0, str(Path("scripts").resolve()))
+          import bootstrap_compiler as bootstrap
+          import ouro_build as build
+          from ourosmith.limits import clean_env, run_limited
+          from repo_support import hash_json, sha256_file
+
+          output = Path("_build/ci/ascription-list-context-probe")
+          reports = list(Path("_build/bootstrap").glob("*/report.json"))
+          assert len(reports) == 1, reports
+          work = reports[0].parent.resolve()
+          report = json.loads(reports[0].read_text(encoding="utf-8"))
+          inputs = work / "inputs.json"
+          snapshot = json.loads(inputs.read_text(encoding="utf-8"))
+          selected = snapshot["selected"]
+          assert report["inputs_sha256"] == sha256_file(inputs)
+          assert report["key"] == snapshot["key"] == hash_json(selected)
+          assert not bootstrap.changed_inputs(work, snapshot)
+          runtime_sha = sha256_file(Path("runtime/ouro_rt.c"))
+          assert selected["sources"]["runtime/ouro_rt.c"] == runtime_sha
+          assert snapshot["inputs"]["o/runtime/ouro_rt.c"] == runtime_sha
+          frontend_sha = sha256_file(Path("runtime/frontend_link.c"))
+          assert selected["sources"]["runtime/frontend_link.c"] == frontend_sha
+          assert snapshot["inputs"]["o/runtime/frontend_link.c"] == frontend_sha
+          support_sha = sha256_file(Path("compiler/pipeline_support.ouro"))
+          assert selected["sources"]["compiler/pipeline_support.ouro"] == support_sha
+          assert snapshot["inputs"]["o/compiler/pipeline_support.ouro"] == support_sha
+          assert selected["roots"][13] == "compiler/pipeline.ouro"
+          phase = next(p for p in report["phases"] if p["phase"] == "p2")
+          commands = [c for c in phase["commands"] if c["label"] == "check-13"]
+          assert len(commands) == 1
+          original = commands[0]
+          argv = original["argv"]
+          assert argv[:4] == [phase["producer"], "check", "compiler/pipeline.ouro", bootstrap.FUEL]
+          assert Path(original["cwd"]).resolve() == (work / "o").resolve()
+          assert sha256_file(Path(phase["producer"])) == phase["producer_sha256"]
+          for stream in ("stdout", "stderr"):
+              assert sha256_file(work / original[stream]) == original[stream + "_sha256"]
+
+          receipt = {"source_head": "278abc958b9a5c8c6ef04b02953b565811f38055",
+                     "inputs_sha256": sha256_file(inputs), "report_sha256": sha256_file(reports[0]),
+                     "runtime_sha256": runtime_sha, "frontend_sha256": frontend_sha,
+                     "support_sha256": support_sha,
+                     "producer_sha256": phase["producer_sha256"],
+                     "original_stderr_sha256": original["stderr_sha256"], "argv": argv,
+                     "memory_mib": bootstrap.MEMORY_MIB, "timeout_s": bootstrap.TIMEOUT_S}
+          (output / "receipt.json").write_text(json.dumps(receipt, indent=2) + "\n", encoding="utf-8")
+
+          env = clean_env()
+          for name in ("USERPROFILE", "APPDATA", "LOCALAPPDATA", "PROGRAMFILES", "PROGRAMFILES(X86)",
+                       *selected["environment"]):
+              if name in os.environ:
+                  env[name] = os.environ[name]
+          out = work / "out/p2"
+          values = {**snapshot["config"], "cc": selected["cc_executable"], "jobs": 1,
+                    "cache_enabled": False, "ccache": "disabled", "build_dir": str(out / "b"),
+                    "c_build_dir": str(out / "c"), "cache_dir": str(out / "k")}
+          for key, name in build.ENV_MAP.items():
+              value = values[key]
+              env[name] = ("1" if value else "0") if isinstance(value, bool) else str(value)
+          env.update(PYTHONDONTWRITEBYTECODE="1", OURO_FRONTEND_JOBS="1",
+                     OURO1_CHECK_FUEL=bootstrap.FUEL, OURO_MEM_TRACE="1")
+          positive = run_limited(argv, cwd=work / "o", env=env,
+                                 timeout_s=bootstrap.TIMEOUT_S, memory_mb=bootstrap.MEMORY_MIB)
+          (output / "positive.json").write_text(json.dumps(dataclasses.asdict(positive), indent=2) + "\n", encoding="utf-8")
+          (output / "positive.stderr").write_text(positive.stderr, encoding="utf-8")
+          (output / "positive.stdout").write_text(positive.stdout, encoding="utf-8")
+          assert positive.status == "ok" and positive.returncode == 0, (positive.status, positive.returncode)
+          assert "ouro_rt: out of memory" not in positive.stderr
+          lines = positive.stderr.splitlines()
+          identity_at = [i for i, line in enumerate(lines) if line.startswith("OURO_MEM_CHECK_ITEM ")]
+          assert len(identity_at) == 1, identity_at
+          assert re.fullmatch(r"OURO_MEM_CHECK_ITEM ordinal=395 kind=0 name_id=\d+ name=collect_lower_env_from",
+                              lines[identity_at[0]])
+          exits = [line for line in lines[identity_at[0] + 1:]
+                   if line.startswith("OURO_MEM_HEAP label=frontend-check-item-exit ")]
+          assert exits, lines[-5:]
+          (output / "target-exit.txt").write_text(exits[0] + "\n", encoding="utf-8")
+
+          paths = [Path(argv[2])]
+          for i in range(4, len(argv), 2):
+              assert argv[i] == "--unit", argv[i:]
+              paths.append(Path(argv[i + 1]))
+          assert Path("compiler/pipeline_support.ouro") in paths
+          negative_dir = Path("_build/ascription-list-context-negative-o").resolve()
+          for path in paths:
+              target = negative_dir / path
+              target.parent.mkdir(parents=True, exist_ok=True)
+              shutil.copyfile(work / "o" / path, target)
+          support = negative_dir / "compiler/pipeline_support.ouro"
+          source = support.read_text(encoding="utf-8")
+          assert source.count("pipeline_role_id range_role])") == 1
+          support.write_text(source.replace("pipeline_role_id range_role])", "True])"), encoding="utf-8")
+          negative_env = env.copy()
+          for key, path in (("OURO_BUILD_DIR", "b"), ("OURO_C_BUILD_DIR", "c"),
+                            ("OURO_CACHE_DIR", "k")):
+              negative_env[key] = str(negative_dir.parent / ("negative-" + path))
+          negative = run_limited(argv, cwd=negative_dir, env=negative_env,
+                                 timeout_s=bootstrap.TIMEOUT_S, memory_mb=bootstrap.MEMORY_MIB)
+          (output / "negative.json").write_text(json.dumps(dataclasses.asdict(negative), indent=2) + "\n", encoding="utf-8")
+          (output / "negative.stderr").write_text(negative.stderr, encoding="utf-8")
+          (output / "negative.stdout").write_text(negative.stdout, encoding="utf-8")
+          assert negative.status == "ok" and negative.returncode == 1, (negative.status, negative.returncode)
+          assert "ouro_rt: out of memory" not in negative.stderr
+          assert "type mismatch in collect_lower_env_from" in negative.stderr, negative.stderr[-1000:]
+          assert (output / "host-rc.txt").read_text(encoding="utf-8").strip() == "0"
+          print(lines[identity_at[0]])
+          print(exits[0])
+          print("positive rc=0; negative rc=1, type mismatch in collect_lower_env_from; host rc=0")
+          PY
+
+      - name: Upload diagnostic receipts and bootstrap report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ascription-list-context-probe-${{ github.run_attempt }}
+          path: |
+            _build/ci/ascription-list-context-probe/*
+            _build/bootstrap/**/*.json
+            _build/bootstrap/**/*.log
+            _build/bootstrap/**/out/p2/check-13.stderr
+          if-no-files-found: ignore
+          retention-days: 14
