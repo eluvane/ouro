@@ -6,6 +6,9 @@ Development changes; see the [compatibility policy](docs/stability.md).
 
 ### Added
 
+- `OURO-CLIPPY-ERROR-004` reports ignored results of the registered pure
+  `str_parse_nat`, `str_parse_bool` and `parse_json` APIs, with alias-aware
+  observation and manual failure-handling guidance.
 - Exclusive `0..10` and inclusive `0..=10` literal-endpoint `NatRange` values,
   checked through nominal Nat, bound, and range representation roles.
 - Final-tail list spreads `[first, ..rest]` build checked `List A` constructor
