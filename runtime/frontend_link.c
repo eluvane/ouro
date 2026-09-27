@@ -19,12 +19,26 @@
 #include <sys/resource.h>
 #endif
 
+static unsigned long fe_diag_lower_count;
+static unsigned long fe_diag_elab_count;
+static unsigned long fe_diag_check_count;
+static double fe_diag_lower_cpu;
+static double fe_diag_elab_cpu;
+static double fe_diag_check_cpu;
+
+static int fe_diag_enabled(void)
+{
+	const char *emit = getenv("OURO_EMIT_IO_SHIMS");
+	return getenv("OURO_DIAG_FE_STAGES") != 0 &&
+		emit != 0 && strcmp(emit, "1") == 0;
+}
+
 static void fe_diag_stage(const char *stage, int index)
 {
 #ifdef __linux__
 	struct rusage usage;
 #endif
-	if (getenv("OURO_DIAG_FE_STAGES") == 0)
+	if (!fe_diag_enabled())
 		return;
 	fprintf(stderr, "OURO_FE_STAGE stage=%s index=%d wall_s=%lld cpu_s=%.3f allocated=%llu",
 		stage, index, (long long)time(0),
@@ -35,6 +49,42 @@ static void fe_diag_stage(const char *stage, int index)
 		fprintf(stderr, " peak_rss_kib=%ld", usage.ru_maxrss);
 #endif
 	fputc('\n', stderr);
+	fflush(stderr);
+}
+
+static double fe_diag_call(const char *stage, unsigned long index,
+		clock_t started, unsigned long long allocated_before,
+		unsigned long sample_mask)
+{
+	double elapsed = (double)(clock() - started) / (double)CLOCKS_PER_SEC;
+#ifdef __linux__
+	struct rusage usage;
+#endif
+	if ((index & sample_mask) != 0 && elapsed < 1.0)
+		return elapsed;
+	fprintf(stderr,
+		"OURO_FE_CALL stage=%s index=%lu wall_s=%lld cpu_s=%.3f delta_cpu_s=%.3f delta_allocated=%llu",
+		stage, index, (long long)time(0),
+		(double)clock() / (double)CLOCKS_PER_SEC, elapsed,
+		ouro_heap_total_alloc_bytes() - allocated_before);
+#ifdef __linux__
+	if (getrusage(RUSAGE_SELF, &usage) == 0)
+		fprintf(stderr, " peak_rss_kib=%ld", usage.ru_maxrss);
+#endif
+	fputc('\n', stderr);
+	fflush(stderr);
+	return elapsed;
+}
+
+static void fe_diag_summary(void)
+{
+	if (!fe_diag_enabled())
+		return;
+	fprintf(stderr,
+		"OURO_FE_SUMMARY lower_count=%lu lower_cpu_s=%.3f elab_count=%lu elab_cpu_s=%.3f check_count=%lu check_cpu_s=%.3f\n",
+		fe_diag_lower_count, fe_diag_lower_cpu,
+		fe_diag_elab_count, fe_diag_elab_cpu,
+		fe_diag_check_count, fe_diag_check_cpu);
 	fflush(stderr);
 }
 
@@ -642,9 +692,22 @@ static ouro_v *closed_parse_unit(void)
    recursion inside lower_expr_env2 stays in the generated lowerer. */
 static ouro_v *bounded_lower_expr(ouro_env *env, ouro_v *expr)
 {
-	return bounded_call(FIND(lo, "lower_expr_env2"), 3,
+	int diag = fe_diag_enabled();
+	clock_t started = 0;
+	unsigned long long allocated_before = 0;
+	ouro_v *result;
+	if (diag) {
+		fe_diag_lower_count++;
+		started = clock();
+		allocated_before = ouro_heap_total_alloc_bytes();
+	}
+	result = bounded_call(FIND(lo, "lower_expr_env2"), 3,
 		(ouro_v *[]){ouro_get(env, 1), ouro_get(env, 0), expr},
 		ouro_clone_perm_deep);
+	if (diag)
+		fe_diag_lower_cpu += fe_diag_call("lower-expr", fe_diag_lower_count,
+			started, allocated_before, 127UL);
+	return result;
 }
 
 static ouro_v *bounded_lower_expected(ouro_env *env, ouro_v *expected)
@@ -663,15 +726,23 @@ static ouro_v *bounded_lower_environment(ouro_env *env, ouro_v *lower_env)
    so each mark belongs to one complete, non-reentrant pure pass. */
 static ouro_v *bounded_compile_program(ouro_env *env, ouro_v *surfaces)
 {
+	ouro_v *result;
 	(void)env;
-	return bounded_call(FIND(co, "compile_program"), 1,
+	fe_diag_stage("compile-program-start", 0);
+	result = bounded_call(FIND(co, "compile_program"), 1,
 		(ouro_v *[]){surfaces}, ouro_clone_perm);
+	fe_diag_stage("compile-program-end", 0);
+	return result;
 }
 
 static ouro_v *bounded_elaborate_surfaces(ouro_env *env, ouro_v *surfaces)
 {
-	return bounded_call(FIND(el, "elaborate_surfaces"), 2,
+	ouro_v *result;
+	fe_diag_stage("elaborate-surfaces-start", 0);
+	result = bounded_call(FIND(el, "elaborate_surfaces"), 2,
 		(ouro_v *[]){ouro_get(env, 0), surfaces}, ouro_clone_perm);
+	fe_diag_stage("elaborate-surfaces-end", 0);
+	return result;
 }
 
 static ouro_v *bounded_elaborate_surfaces_fuel(ouro_env *env, ouro_v *fuel)
@@ -682,8 +753,21 @@ static ouro_v *bounded_elaborate_surfaces_fuel(ouro_env *env, ouro_v *fuel)
 
 static ouro_v *bounded_elaborate_context(ouro_env *env, ouro_v *names)
 {
-	return bounded_call(FIND(el, "elaborate_fuel"), 3,
+	int diag = fe_diag_enabled();
+	clock_t started = 0;
+	unsigned long long allocated_before = 0;
+	ouro_v *result;
+	if (diag) {
+		fe_diag_elab_count++;
+		started = clock();
+		allocated_before = ouro_heap_total_alloc_bytes();
+	}
+	result = bounded_call(FIND(el, "elaborate_fuel"), 3,
 		(ouro_v *[]){ouro_get(env, 1), ouro_get(env, 0), names}, ouro_clone_perm);
+	if (diag)
+		fe_diag_elab_cpu += fe_diag_call("elaborate-one", fe_diag_elab_count,
+			started, allocated_before, 15UL);
+	return result;
 }
 
 static ouro_v *bounded_elaborate_surface(ouro_env *env, ouro_v *surface)
@@ -705,9 +789,22 @@ static ouro_v *bounded_elaborate_fuel(ouro_env *env, ouro_v *fuel)
    re-entered by check_indexed_declaration's recursive term checks. */
 static ouro_v *bounded_check_item(ouro_env *env, ouro_v *item)
 {
-	return bounded_call(FIND(fc, "check_indexed_declaration"), 4,
+	int diag = fe_diag_enabled();
+	clock_t started = 0;
+	unsigned long long allocated_before = 0;
+	ouro_v *result;
+	if (diag) {
+		fe_diag_check_count++;
+		started = clock();
+		allocated_before = ouro_heap_total_alloc_bytes();
+	}
+	result = bounded_call(FIND(fc, "check_indexed_declaration"), 4,
 		(ouro_v *[]){ouro_get(env, 2), ouro_get(env, 1), ouro_get(env, 0), item},
 		ouro_clone_perm);
+	if (diag)
+		fe_diag_check_cpu += fe_diag_call("check-item", fe_diag_check_count,
+			started, allocated_before, 15UL);
+	return result;
 }
 
 static ouro_v *bounded_check_signature(ouro_env *env, ouro_v *sig)
@@ -1031,6 +1128,12 @@ static ouro_v *compile_checked_units_impl(ouro_v *fuel, ouro_v *root, ouro_v *fi
 	files = ouro_clone_perm_deep(files);
 	g_last_intern = FIND(lx, "empty_intern");
 	g_last_checked_program = 0;
+	fe_diag_lower_count = 0;
+	fe_diag_elab_count = 0;
+	fe_diag_check_count = 0;
+	fe_diag_lower_cpu = 0;
+	fe_diag_elab_cpu = 0;
+	fe_diag_check_cpu = 0;
 
 	fe_diag_stage("prepass-start", 0);
 	if (!unit_prepass_incremental(files, &files1, &alias_files, &r))
@@ -1097,6 +1200,7 @@ static ouro_v *compile_checked_units_impl(ouro_v *fuel, ouro_v *root, ouro_v *fi
 	r = ouro_clone_perm_deep(r);
 	fe_phase_done("frontend-after-check-decls");
 	fe_diag_stage("check-decls-end", 0);
+	fe_diag_summary();
 	falseb = ouro_ctor(1, 0, 0);
 	r = ouro_apply(ouro_apply(ouro_apply(closed_remap_comp_files(), falseb), files1), r);
 	g_last_intern = st2;
