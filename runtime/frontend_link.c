@@ -990,6 +990,7 @@ static ouro_v *compile_checked_units_impl(ouro_v *fuel, ouro_v *root, ouro_v *fi
 	ouro_v *intern_fn = 0;
 	ouro_v *resolve_fn = 0;
 	ouro_v *falseb;
+	int probe_decl_name = -1;
 
 	/* Survivors are ouro_clone_perm_deep (static share only). Mid-cone
 	   discard_phase then drops the parse/preprocess bump. Host prims
@@ -1059,11 +1060,20 @@ static ouro_v *compile_checked_units_impl(ouro_v *fuel, ouro_v *root, ouro_v *fi
 	   result across the same lifetime seam before calling the Ouro remapper. */
 	r = ouro_clone_perm_deep(r);
 	fe_phase_done("frontend-after-check-decls");
-	if (getenv("OURO_DIAG_RAW_CERR") != NULL && r != 0 && r->tag == 0)
+	if (getenv("OURO_DIAG_RAW_CERR") != NULL && r != 0 && r->tag == 0) {
+		probe_decl_name = cerr_code(r) == 2 ? cerr_det(r) : -1;
 		fprintf(stderr, "OURO_RAW_CERR code=%d det=%d\n", cerr_code(r), cerr_det(r));
+	}
 	falseb = ouro_ctor(1, 0, 0);
 	r = ouro_apply(ouro_apply(ouro_apply(closed_remap_comp_files(), falseb), files1), r);
 	g_last_intern = st2;
+	if (probe_decl_name >= 0) {
+		char probe_name[256];
+		int probe_name_len = decl_name_from_intern(probe_decl_name,
+			probe_name, (int)sizeof probe_name);
+		fprintf(stderr, "OURO_RAW_DECL id=%d name=%s\n", probe_decl_name,
+			probe_name_len > 0 ? probe_name : "<unknown>");
+	}
 	print_units_diag(files1, r);
 	r = ouro_clone_perm_deep(r);
 	g_last_intern = ouro_clone_perm_deep(st2);
