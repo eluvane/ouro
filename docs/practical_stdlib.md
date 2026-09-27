@@ -121,6 +121,16 @@ It returns `(accepted, rejected)`, putting `True` elements on the left and
 `False` elements on the right. Both lists keep their input order; an empty
 input returns `([], [])`.
 
+```ouro
+import "../std/collections.ouro";
+
+def twos_and_rest : Pair (List Nat) (List Nat) :=
+    list_partition Nat (fun (n : Nat) => eq_nat n 2)
+      ([1, 2, 3, 2] : List Nat);
+```
+
+Here `twos_and_rest` is `([2, 2], [1, 3])`.
+
 `list_windows A width xs` returns overlapping, complete windows. Width zero,
 an empty input, and a width larger than the input return `[]`; for example,
 width two on `[1, 2, 3]` returns `[[1, 2], [2, 3]]`. `adjacent_pairs` returns
