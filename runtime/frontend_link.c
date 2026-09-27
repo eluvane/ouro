@@ -547,6 +547,7 @@ static void fe_phase_done(const char *label);
 static ouro_v *g_closed_preprocess_src;
 static ouro_v *g_closed_parse_unit;
 static ouro_v *g_closed_compile_from_decls;
+static int g_probe_first_hole_id = -1;
 static ouro_v *g_closed_remap_comp_files;
 
 static ouro_v *closed_preprocess_src(void)
@@ -643,6 +644,20 @@ static ouro_v *bounded_compile_program(ouro_env *env, ouro_v *surfaces)
 	(void)env;
 	target = getenv("OURO_DIAG_RAW_CERR") != NULL
 		? "compile_program_probe" : "compile_program";
+	if (getenv("OURO_DIAG_RAW_CERR") != NULL) {
+		ouro_v *info = bounded_call(FIND(pl, "surface_probe_info"), 1,
+			(ouro_v *[]){surfaces}, ouro_clone_perm);
+		ouro_v *depth = pair_fst(info);
+		ouro_v *rest = pair_snd(info);
+		ouro_v *holes = pair_fst(rest);
+		ouro_v *first = pair_snd(rest);
+		g_probe_first_hole_id = first != 0 && first->tag == 1
+			&& first->n >= 1 ? (int)as_nat(OURO_F(first, 0)) : -1;
+		fprintf(stderr, "OURO_SURFACE_FLAGS depth32=%d has_hole=%d first_hole_id=%d\n",
+			depth != 0 && depth->tag == 1,
+			holes != 0 && holes->tag == 1,
+			g_probe_first_hole_id);
+	}
 	return bounded_call(FIND(co, target), 1,
 		(ouro_v *[]){surfaces}, ouro_clone_perm);
 }
@@ -1007,6 +1022,7 @@ static ouro_v *compile_checked_units_impl(ouro_v *fuel, ouro_v *root, ouro_v *fi
 	files = ouro_clone_perm_deep(files);
 	g_last_intern = FIND(lx, "empty_intern");
 	g_last_checked_program = 0;
+	g_probe_first_hole_id = -1;
 
 	if (!unit_prepass_incremental(files, &files1, &alias_files, &r))
 		goto failed;
@@ -1075,6 +1091,14 @@ static ouro_v *compile_checked_units_impl(ouro_v *fuel, ouro_v *root, ouro_v *fi
 		int probe_name_len = decl_name_from_intern(probe_decl_name,
 			probe_name, (int)sizeof probe_name);
 		fprintf(stderr, "OURO_RAW_DECL id=%d name=%s\n", probe_decl_name,
+			probe_name_len > 0 ? probe_name : "<unknown>");
+	}
+	if (g_probe_first_hole_id >= 0) {
+		char probe_name[256];
+		int probe_name_len = decl_name_from_intern(g_probe_first_hole_id,
+			probe_name, (int)sizeof probe_name);
+		fprintf(stderr, "OURO_FIRST_HOLE id=%d name=%s\n",
+			g_probe_first_hole_id,
 			probe_name_len > 0 ? probe_name : "<unknown>");
 	}
 	print_units_diag(files1, r);
