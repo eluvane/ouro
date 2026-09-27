@@ -34,6 +34,15 @@ static ouro_v *find_in(const char *name, int n, const char *(*nm)(int),
 	return 0;
 }
 
+static void diag_emit_phase(const char *phase, int index)
+{
+	if (getenv("OURO_DIAG_EMIT_PHASES") == 0)
+		return;
+	fprintf(stderr, "OURO_EMIT_PHASE phase=%s index=%d live=%llu allocated=%llu\n",
+		phase, index, ouro_heap_live_bytes(), ouro_heap_total_alloc_bytes());
+	fflush(stderr);
+}
+
 
 
 
@@ -1034,22 +1043,38 @@ int main(int argc, char **argv)
 
 		fprintf(stderr, "ouro1: emit cores=%d names=%d\n", n, ntab);
 
+		diag_emit_phase("header-start", 0);
 		ouro_write_codes(hdr, stdout);
-		for (i = 0; i < n; i++)
+		diag_emit_phase("header-end", 0);
+		for (i = 0; i < n; i++) {
+			if ((i & 255) == 0)
+				diag_emit_phase("forwards", i);
 			ouro_write_codes(ouro_apply(emit_f, ids[i]), stdout);
+		}
+		diag_emit_phase("forwards-end", n);
 
 		/* Standalone-program mode: bind runtime axioms and string
 		   literals to the C host. Off by default so stage emission
 		   stays byte-identical; scripts/build_tool.sh turns it on. */
+		diag_emit_phase("shims-start", 0);
 		if (getenv("OURO_EMIT_IO_SHIMS") != 0)
 			emit_runtime_shims(intern_perm, ids, n, type_ids_v, bindings_v);
+		diag_emit_phase("shims-end", 0);
 
-		for (i = 0; i < ouro_export_count_be(); i++)
+		for (i = 0; i < ouro_export_count_be(); i++) {
+			if ((i & 255) == 0)
+				diag_emit_phase("exports-force", i);
 			(void)ouro_export_value_be(i);
+		}
+		diag_emit_phase("exports-force-end", ouro_export_count_be());
 		ouro_rt_warmup();
+		diag_emit_phase("warmup-end", 0);
 		ouro_heap_mark();
+		diag_emit_phase("heap-mark", 0);
 		for (i = 0; i < n; i++) {
 			const char *nm = lookup_name(tab, ntab, as_nat(ids[i]));
+			if ((i & 63) == 0)
+				diag_emit_phase("global-start", i);
 			if (nm != 0 && is_fast(nm) &&
 			    !(g_ntype > 0 && is_fast_shape_mismatch(nm))) {
 				unsigned long gid = as_nat(ids[i]);
@@ -1080,6 +1105,7 @@ int main(int argc, char **argv)
 				ouro_heap_reset();
 			}
 		}
+		diag_emit_phase("globals-end", n);
 
 		nil = ouro_ctor(0, 0, 0);
 		fld[0] = ouro_nat(0);
