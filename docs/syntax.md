@@ -23,6 +23,8 @@ The parser expands the group into ordered imports. Aliases remain on separate
 single-path declarations. [Ergonomic syntax](language/ergonomic-syntax.md#grouped-imports)
 explains the desugaring and rejected forms.
 
+### Import aliases
+
 An import alias qualifies declarations owned by that imported file:
 
 ```ouro
@@ -64,6 +66,8 @@ still selects the same module.
 Collisions of the legacy `IO`, `io_bind`, and `pure` lowering names report
 ambiguity even for qualified uses until those forms carry module-local
 operation metadata. Unambiguous `do` programs keep their current behavior.
+
+### Local opens
 
 An expression can open an alias for its own subtree:
 
