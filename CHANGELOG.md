@@ -165,6 +165,7 @@ Development changes; see the [compatibility policy](docs/stability.md).
 
 ### Fixed
 
+- Generated API pages and LSP hover show complete multiline declaration signatures.
 - `adjacent_pairs` now advances its left element; `list_traverse_result` evaluates
   conversions in input order and stops when one returns `Left`.
 - Recognize manifest-owned Clippy precision fixtures in the structural gate,
