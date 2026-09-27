@@ -44,6 +44,9 @@ diagnostic stream; serialization errors fail before opening the file.
 sh scripts/ouro1.sh collect path/to/module.ouro
 ```
 
+A missing imported file reports its resolved path and the file that directly
+imports it. A missing root file reports only its resolved path.
+
 ## Native program compile
 
 `ouro1 build FILE.ouro` compiles the checked import closure to a Windows PE.

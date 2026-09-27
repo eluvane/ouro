@@ -75,6 +75,8 @@ Development changes; see the [compatibility policy](docs/stability.md).
 
 ### Changed
 
+- Missing dependency diagnostics during collection now name the resolved
+  missing path and its direct importing file.
 - Imported record updates resolve simple field type annotations in the record
   declaration's import scope, including local type aliases, selected renames,
   and qualified imported types. Caller aliases cannot rebind those annotations;
