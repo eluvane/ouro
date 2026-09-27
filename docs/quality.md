@@ -242,6 +242,14 @@ live with the analyzer. `--enable-strict` selects promoted structured families;
 ordinary `analyze --strict` remains the base runner. The
 [nightly sweep](ci.md#local-profiles) checks the promoted set.
 
+Public definition fingerprints include the complete header through the body
+`:=`, excluding that delimiter and the body. The native extractor and Python
+baseline generator normalize header whitespace and comments; parentheses,
+brackets, braces, and quoted literals keep inner delimiters from ending the
+header. Simple one-line fingerprints retain their existing values. A malformed
+or unterminated header fails extraction rather than borrowing the next
+declaration's body. This lexical boundary does not establish source acceptance.
+
 ## Code-review profile
 
 `--enable-style` selects the existing `dataflow`, `metrics`, `simplify`, `perf`,
