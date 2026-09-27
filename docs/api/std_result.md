@@ -2,7 +2,7 @@
 
 Result-style helpers over Either; Right is success and Left is the typed error.
 
-Declarations: 19.
+Declarations: 20.
 
 ## def result_ok
 
@@ -74,6 +74,12 @@ def result_or (E : Type) (A : Type) (fallback : A) (r : Either E A) : A
 
 ```
 def result_or_else (E : Type) (A : Type) (r : Either E A)
+```
+
+## def result_recover_if
+
+```
+def result_recover_if (E : Type) (A : Type) (select : E -> Bool)
 ```
 
 ## def result_unwrap_or
