@@ -35,6 +35,19 @@ original error. The fallback is called only for `Left`. Use `result_bind` to
 continue with another fallible operation and `result_map_err` to change an
 error type while retaining the result.
 
+`result_with_context C E A context value` keeps the original `E` alongside a
+typed context. A `Left error` becomes `Left (MkPair context error)` with error
+type `Pair C E`; a `Right` value passes through. Callers can match on both
+fields rather than replacing a structured error with rendered text.
+
+```ouro
+import "../std/result.ouro";
+
+def config_port (parsed : Either String Nat)
+    : Either (Pair String String) Nat :=
+    result_with_context String String Nat "config.port" parsed;
+```
+
 `std/collections.ouro` provides `list_traverse_maybe A B f xs` for an ordered
 list of fallible conversions. It returns `Just []` for an empty list, `Just`
 with all converted values when every call succeeds, or `Nothing` at the first

@@ -27,6 +27,8 @@ Development changes; see the [compatibility policy](docs/stability.md).
   valid; declaration-site defaults remain unsupported.
 - Lazy error-aware fallback for `Either` and ordered `Maybe` list traversal in
   the practical standard library.
+- Typed `Either` error context in `std/result.ouro` preserves the original error
+  alongside caller-provided context in `Pair C E`.
 - Leading `{A : Type}` inductive parameters opt constructors in to bounded
   inference from a direct expected family or direct value-field type hints on
   saturated calls; explicit calls remain valid. See
