@@ -2,7 +2,7 @@
 
 Pure pull iterators with explicit failure and bounded materialization.
 
-Declarations: 8.
+Declarations: 9.
 
 ## inductive IterStep
 
@@ -38,6 +38,12 @@ def iter_map (State : Type) (Error : Type) (Item : Type) (Mapped : Type)
 
 ```
 def iter_filter (State : Type) (Error : Type) (Item : Type)
+```
+
+## def iter_indexed
+
+```
+def iter_indexed (State : Type) (Error : Type) (Item : Type)
 ```
 
 ## def iter_take
