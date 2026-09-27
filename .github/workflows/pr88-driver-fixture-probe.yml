@@ -1,0 +1,115 @@
+name: PR88 driver fixture correction probe
+
+on:
+  push:
+    branches: [codef/pr88-driver-fixture-correction]
+    paths:
+      - .github/workflows/pr88-driver-fixture-probe.yml
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  driver:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      OURO_CI: "1"
+      OURO_REPRODUCIBLE: "1"
+      OURO_PACK_STRICT: "1"
+      OURO_JOBS: "2"
+      OURO_FRONTEND_JOBS: "1"
+      OURO_CACHE_DIR: _cache/ouro
+      OURO_BUILD_DIR: _build
+      OURO_C_BUILD_DIR: _build/c
+      OURO_CCACHE: disabled
+    steps:
+      - name: Checkout exact candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 3
+          persist-credentials: false
+
+      - name: Verify source lineage and fixture blob
+        shell: bash
+        run: |
+          test "$(git rev-parse HEAD^^)" = "83daa56fafb7aa56ffd5fa9ab687c2d867aa1ddf"
+          test "$(git diff --name-only HEAD^^ HEAD^)" = "tests/compiler_driver_tests.ouro"
+          test "$(git diff --name-only HEAD^ HEAD)" = ".github/workflows/pr88-driver-fixture-probe.yml"
+          test "$(git rev-parse HEAD:tests/compiler_driver_tests.ouro)" = "19f6a46442a4c4056f6ad2429fac9f0aebce0af9"
+          test "$(git rev-parse HEAD:scripts/ci_gate.py)" = "16ea86bf60a3d3347c30af2f562a6b6b500b89ef"
+          test "$(git rev-parse HEAD:compiler/driver.ouro)" = "c7c3c7aabae721ab244bb6287fd12bbb8d0fff42"
+
+      - name: Download verified exact-head Host compiler
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: host-compiler-36334723667-1
+          run-id: 36334723667
+          github-token: ${{ github.token }}
+          path: _build/ci
+
+      - name: Verify and install Host compiler
+        shell: bash
+        run: |
+          echo "565c82bdf5c0dc9d5afab272db9b75fe800330a62c64fc0658ed9d3d9fc79e9a  _build/ci/host-compiler.tar.gz" | sha256sum -c -
+          python3 scripts/ci_gate.py --compiler-artifact import --compiler-sha256 565c82bdf5c0dc9d5afab272db9b75fe800330a62c64fc0658ed9d3d9fc79e9a
+
+      - name: Build exact driver fixture
+        shell: bash
+        run: |
+          mkdir -p _build/diagnostic/pr88-driver-fixtures
+          OURO_BUILD_TOOL_MODE=native sh scripts/build_tool.sh \
+            tests/compiler_driver_tests.ouro _build/diagnostic/pr88-driver-fixtures/compiler_driver \
+            >_build/diagnostic/pr88-driver-fixtures/build.log 2>&1
+
+      - name: Check corrected rows and preserve the remaining failures
+        shell: bash
+        run: |
+          out=_build/diagnostic/pr88-driver-fixtures
+          set +e
+          "$out/compiler_driver" >"$out/driver.out" 2>"$out/driver.err"
+          rc=$?
+          set -e
+          printf '%s\n' "$rc" >"$out/driver.rc"
+          cat >"$out/corrected.expected" <<'EOF'
+          PASS source guard validates markers without erasing an open: guard
+          PASS an open requires a file-local alias: CErr 83/0
+          PASS an open without any alias reports unknown alias: CErr 83/0
+          PASS a nested unknown open keeps the source diagnostic: CErr 83/0
+          PASS range literal requires represented bound: CErr 42/7
+          PASS range role rejects another nominal bound family: CErr 42/9
+          PASS range role rejects swapped constructor fields: CErr 42/7
+          PASS range endpoint must be a literal: CErr 10/76
+          PASS inclusive range requires endpoint: CErr 10/70
+          PASS range rejects chained separators: CErr 10/71
+          PASS standalone spread stays a parse error: CErr 10/59
+          PASS nonfinal spread stays a parse error: CErr 10/63
+          PASS multiple spreads stay a parse error: CErr 10/63
+          PASS archived annotated record update is now accepted: COk
+          EOF
+          cat >"$out/remaining.expected" <<'EOF'
+          FAIL list literal cannot inhabit an unrelated colliding List: CErr 64/110
+          FAIL nested qualified record field follows the declaring alias: CErr 98/23
+          FAIL nested imported record literal uses the declaring field type: CErr 98/16
+          FAIL nested renamed record field follows the declaring selection: CErr 98/22
+          FAIL an unbound dotted prefix remains an invalid record projection: CErr 11/0
+          EOF
+          while IFS= read -r row; do
+            grep -Fxq "$row" "$out/driver.out"
+          done <"$out/corrected.expected"
+          grep '^FAIL ' "$out/driver.out" >"$out/remaining.actual"
+          diff -u "$out/remaining.expected" "$out/remaining.actual"
+          test "$rc" -eq 1
+          test "$(grep -c '^PASS ' "$out/driver.out")" -eq 271
+          test "$(grep -c '^FAIL ' "$out/driver.out")" -eq 5
+          grep -Fxq 'COMPILER_DRIVER: FAIL' "$out/driver.out"
+
+      - name: Upload full driver evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: pr88-driver-fixture-correction
+          if-no-files-found: ignore
+          retention-days: 14
+          path: _build/diagnostic/pr88-driver-fixtures/**
