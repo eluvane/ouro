@@ -326,6 +326,8 @@ pins every file's size and SHA-256, the archive, and the committed stage0 pair.
 The C0 runtime matches that seed. The manifest's `syntax_refresh` records the
 reviewed parser backport that lets the bridge read current
 [ergonomic syntax](language/ergonomic-syntax.md), with its patch and member hashes.
+Its `ascription_refresh` records the bridge lowerer update with the exact
+source patch and member hash.
 The historical checker, runtime, and stage0 pair retain their previous bytes.
 The lineage also records earlier seed and compatibility changes. These pinned
 inputs stay separate from the current source snapshot and its acceptance checks
