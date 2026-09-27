@@ -1,0 +1,129 @@
+name: Ascription bridge Host and checker probe (diagnostic)
+
+on:
+  push:
+    branches: [codef/ascription-bridge-host]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ascription-bridge-host-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  OURO_CI: "1"
+  OURO_REPRODUCIBLE: "1"
+  OURO_PACK_STRICT: "1"
+  OURO_JOBS: "2"
+  OURO_CACHE_DIR: _cache/ouro
+  OURO_BUILD_DIR: _build
+  OURO_C_BUILD_DIR: _build/c
+  OURO_CCACHE: disabled
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 3
+          persist-credentials: false
+
+      - name: Pin exact product candidate and historical inputs
+        run: |
+          test "$(git rev-parse HEAD^)" = 2bcf1035886e9a1e2cfa3ca6e9b8db23c2f490d2
+          test "$(git diff --name-only HEAD^ HEAD)" = .github/workflows/ascription-bridge-host.yml
+          git checkout --detach 2bcf1035886e9a1e2cfa3ca6e9b8db23c2f490d2
+          test "$(git rev-parse HEAD^)" = ce4ec74ead6ddb78922a092edf00995e45769a9f
+          test "$(git rev-parse HEAD:compiler/lower.ouro)" = 112d10465bbcc43a7f00657bea49a4c9c343d657
+          test "$(git rev-parse HEAD:compiler/pipeline_support.ouro)" = bcc16b56e7b672b24ab32022552168420f6d679f
+          test "$(git rev-parse HEAD:compiler/bootstrap/c-bootstrap-v1.json)" = 2e384019e1b0c2c4be500474469f579f09982444
+          test "$(git rev-parse HEAD:compiler/bootstrap/c-bootstrap-v1.tar.gz)" = e33630dd7db3521df729f1a8e00182393cccba87
+          test "$(git rev-parse HEAD:tests/language_ergonomics/cases.json)" = 4055c317712f20cb30de64592b86f0ce8f7fd7db
+          test "$(git rev-parse HEAD:runtime/bootstrap.c)" = 5272a92d85d3f693407ec1f5d0e091fe461f8018
+          test "$(git rev-parse HEAD:runtime/ouro_rt.c)" = 5fa7a64f29ef9b25f23b9e322d111e7070516b36
+          test "$(git rev-parse HEAD:runtime/frontend_link.c)" = f10104eb4bc30055dabb3163a82f181c6eae9f1a
+          test "$(git rev-parse HEAD:compiler/stage0/driver_u.c)" = 0056537bcc4e01ea61898d80c802ea50029b63e9
+          test "$(git rev-parse HEAD:compiler/stage0/backend_u.c)" = a1d9ff5f6b5b088d6be166f19ce05b78ca9185c2
+          test "$(git rev-parse HEAD:docs/generated_artifact_hashes.sha256)" = ede8b5e9e67ea566bef9497fe4e84ffdd36776ff
+          printf '%s  %s\n' 5086966057bf39b50e94d6a8a159530053e494e1001645f6b2d3ce258a5d3c45 compiler/bootstrap/c-bootstrap-v1.tar.gz | sha256sum -c -
+          printf '%s  %s\n' c6dd132818bb6aa23f7a81db5297991ff5d78622f5e25a609aca7edae74ff0cf compiler/bootstrap/c-bootstrap-v1.json | sha256sum -c -
+          test -z "$(git status --porcelain)"
+          python3 scripts/bootstrap_inputs.py verify
+
+      - name: Build normal Host with unchanged parity, memory and acceptance gates
+        run: python3 scripts/ouro_build.py build --verbosity quiet
+
+      - name: Check positive ascriptions and reject a false equality
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import json
+          from pathlib import Path
+          import subprocess
+          import sys
+
+          sys.path.insert(0, str(Path("scripts").resolve()))
+          from ourosmith.ergonomics_inputs import load_cases, render, support_source
+
+          output = Path("_build/ci/ascription-bridge-host")
+          output.mkdir(parents=True, exist_ok=False)
+          cases = load_cases()
+          invalid = next(row for row in cases["negative"]
+                         if row["name"] == "ascription-rejects-false-untyped-local")
+          false_index = "ErgEq ErgNat ErgZero (ErgSucc ErgZero)"
+          assert invalid["source"].count(false_index) == 1
+          valid = {"name": "ascription-valid-refl-control",
+                   "source": invalid["source"].replace(
+                       false_index, "ErgEq ErgNat ErgZero ErgZero")}
+          selected = [
+              (next(row for row in cases["positive"] if row["name"] == "ascription-checks-untyped-local"), True),
+              (next(row for row in cases["positive"] if row["name"] == "nested-dependent-ascriptions"), True),
+              (valid, True),
+              (invalid, False),
+          ]
+          results = []
+          for row, accepted in selected:
+              directory = output / row["name"]
+              directory.mkdir()
+              (directory / "support.ouro").write_text(support_source(), encoding="utf-8")
+              source = directory / "main.ouro"
+              source.write_text(render(row, directory), encoding="utf-8")
+              command = ["sh", "scripts/ouro1.sh", "check", str(source), "60000"]
+              result = subprocess.run(command, capture_output=True, text=True, timeout=900, check=False)
+              (directory / "stdout.txt").write_text(result.stdout, encoding="utf-8")
+              (directory / "stderr.txt").write_text(result.stderr, encoding="utf-8")
+              record = {
+                  "name": row["name"], "accepted": accepted, "rc": result.returncode,
+                  "stdout_sha256": hashlib.sha256(result.stdout.encode()).hexdigest(),
+                  "stderr_sha256": hashlib.sha256(result.stderr.encode()).hexdigest(),
+              }
+              results.append(record)
+              (output / "results.json").write_text(json.dumps(results, indent=2) + "\n", encoding="utf-8")
+              marker = "CHECK_OK" if accepted else "CHECK_FAIL"
+              assert result.returncode == (0 if accepted else 1), record
+              assert marker in result.stdout + result.stderr, record
+              if not accepted:
+                  assert "type mismatch in invalid" in result.stderr, record
+                  assert "CHECK_FAIL: front end rejected the input" in result.stderr, record
+          print(json.dumps(results, indent=2))
+          PY
+
+      - name: Upload exact Host and checker evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ascription-bridge-host-${{ github.run_attempt }}
+          path: |
+            _build/ci/ascription-bridge-host/**/*.json
+            _build/ci/ascription-bridge-host/**/*.txt
+            _build/bootstrap/**/*.json
+            _build/bootstrap/**/*.log
+          if-no-files-found: ignore
+          retention-days: 14
