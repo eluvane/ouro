@@ -1,0 +1,139 @@
+name: Doc multiline diagnostic
+
+on:
+  push:
+    branches: [codef/doc-multiline-signatures-probe]
+    paths: [.github/workflows/ouro-doc-multiline-probe.yml]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ouro-doc-multiline-probe
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  OURO_CI: "1"
+  OURO_REPRODUCIBLE: "1"
+  OURO_PACK_STRICT: "1"
+  OURO_JOBS: "2"
+  OURO_CACHE_DIR: _cache/ouro
+  OURO_BUILD_DIR: _build
+  OURO_C_BUILD_DIR: _build/c
+  OURO_CCACHE: disabled
+
+jobs:
+  focused:
+    name: Exact-source doc and LSP
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout reviewed source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: acab63401b86461928a7bb742a908934d3489ad8
+          fetch-depth: 2
+          persist-credentials: false
+
+      - name: Guard exact source and fixture blobs
+        run: |
+          test "$(git rev-parse HEAD)" = acab63401b86461928a7bb742a908934d3489ad8
+          test "$(git rev-parse HEAD^)" = 5e48eb413a100335a7f77ca704d1207b83b768a1
+          test "$(git diff --name-only HEAD^ HEAD)" = CHANGELOG.md
+          test "$(git rev-parse HEAD:CHANGELOG.md)" = d18098cebcdc4426c4b564c26edc6dc63223d2ab
+          test "$(git rev-parse HEAD:tools/doc_model.ouro)" = 2ecdc14c2a302a493a07d18ba9749ba86ae91191
+          test "$(git rev-parse HEAD:scripts/ourosmith/surface/doc_contract.py)" = 4e12822dab03e4f89bf44380c7326d2474b58871
+          test "$(git rev-parse HEAD:scripts/ourosmith/surface/tools.py)" = 3a036a6b815f0e20577b92da6a4247ac053b28bc
+
+      - name: Build and verify host compiler
+        id: host
+        run: python3 scripts/ouro_build.py build --verbosity quiet
+
+      - name: Export host receipt
+        if: steps.host.outcome == 'success'
+        run: |
+          mkdir -p _build/ci
+          python3 scripts/ci_gate.py --compiler-artifact export > _build/ci/host-receipt.txt
+
+      - name: Run independent doc contract and regenerate API pages
+        id: doc
+        env:
+          DOC_SUITE_OUT: _build/doc_suite
+        run: sh scripts/doc_suite.sh --regen
+
+      - name: Run LSP suite on multiline hover
+        if: always() && steps.host.outcome == 'success'
+        env:
+          LSP_SUITE_OUT: _build/lsp_suite
+        run: sh scripts/lsp_suite.sh
+
+      - name: Package changed generated API pages
+        if: always() && steps.host.outcome == 'success'
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import shutil
+          import subprocess
+          from pathlib import Path
+
+          names = subprocess.check_output(
+              ["git", "diff", "--name-only", "--", "docs/api"], text=True
+          ).splitlines()
+          Path("_build/ci/doc-multiline-generated-paths.txt").write_text(
+              "\n".join(names) + "\n", encoding="utf-8"
+          )
+          out = Path("_build/ci/doc-multiline-pages")
+          out.mkdir(parents=True, exist_ok=True)
+          pages = []
+          for name in names:
+              source = Path(name)
+              if source.parent != Path("docs/api") or source.name == "README.md":
+                  raise SystemExit(f"unexpected generated path: {name}")
+              data = source.read_bytes()
+              shutil.copyfile(source, out / source.name)
+              pages.append({"path": name, "sha256": hashlib.sha256(data).hexdigest()})
+          (out / "manifest.json").write_text(
+              json.dumps({"source_sha": "acab63401b86461928a7bb742a908934d3489ad8",
+                          "pages": pages}, indent=2) + "\n",
+              encoding="utf-8",
+          )
+          print(f"changed generated API pages: {len(pages)}")
+          if len(pages) != 21:
+              raise SystemExit("expected exactly 21 generated API pages")
+          PY
+
+      - name: Upload regenerated pages
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: doc-multiline-pages
+          path: _build/ci/doc-multiline-pages/
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Upload focused reports
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: doc-multiline-reports
+          path: |
+            _build/ci/host-receipt.txt
+            _build/ci/doc-multiline-generated-paths.txt
+            _build/bootstrap/**/*.json
+            _build/bootstrap/**/*.log
+            _build/doc_suite/**/*.json
+            _build/doc_suite/**/*.log
+            _build/doc_suite/**/*.tsv
+            _build/doc_suite/**/*.diff
+            _build/lsp_suite/**/*.json
+            _build/lsp_suite/**/*.log
+            _build/lsp_suite/**/*.tsv
+            _build/lsp_suite/**/*.out
+            _build/lsp_suite/**/*.err
+          if-no-files-found: ignore
+          retention-days: 14
