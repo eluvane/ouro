@@ -639,8 +639,11 @@ static ouro_v *bounded_lower_environment(ouro_env *env, ouro_v *lower_env)
    so each mark belongs to one complete, non-reentrant pure pass. */
 static ouro_v *bounded_compile_program(ouro_env *env, ouro_v *surfaces)
 {
+	const char *target;
 	(void)env;
-	return bounded_call(FIND(co, "compile_program"), 1,
+	target = getenv("OURO_DIAG_RAW_CERR") != NULL
+		? "compile_program_probe" : "compile_program";
+	return bounded_call(FIND(co, target), 1,
 		(ouro_v *[]){surfaces}, ouro_clone_perm);
 }
 
