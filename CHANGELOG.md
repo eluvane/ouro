@@ -29,6 +29,8 @@ Development changes; see the [compatibility policy](docs/stability.md).
   the practical standard library.
 - Typed `Either` error context in `std/result.ouro` preserves the original error
   alongside caller-provided context in `Pair C E`.
+- Selective `Either` recovery in `std/result.ouro` handles only errors accepted
+  by a typed predicate and preserves other errors unchanged.
 - Leading `{A : Type}` inductive parameters opt constructors in to bounded
   inference from a direct expected family or direct value-field type hints on
   saturated calls; explicit calls remain valid. See
