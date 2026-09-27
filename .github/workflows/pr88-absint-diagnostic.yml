@@ -1,0 +1,109 @@
+name: PR88 compiler acceptance diagnostics
+
+on:
+  push:
+    branches: [codef/pr88-absint-diagnostic]
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  exact-source-checks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      OURO_CI: "1"
+      OURO_REPRODUCIBLE: "1"
+      OURO_PACK_STRICT: "1"
+      OURO_JOBS: "2"
+      OURO_CACHE_DIR: _cache/ouro
+      OURO_BUILD_DIR: _build
+      OURO_C_BUILD_DIR: _build/c
+      OURO_CCACHE: disabled
+    steps:
+      - name: Checkout exact PR88 source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+
+      - name: Verify source snapshot
+        shell: bash
+        run: |
+          test "$(git rev-parse HEAD^)" = "cdf16527513e18ab46ea3655743ca4d9ae9cf5e4"
+          test "$(git diff --name-only HEAD^ HEAD)" = ".github/workflows/pr88-absint-diagnostic.yml"
+          test "$(git rev-parse HEAD:tests/analyze/precision/absint.ouro)" = "ec822a59a48b58f9199cec1adf822cc0d69e8d58"
+          test "$(git rev-parse HEAD:tests/compiler_driver_tests.ouro)" = "69ba2e9c42dbc439d60510ec77a1f7e1d7e0196f"
+          test "$(git rev-parse HEAD:compiler/preprocess_record.ouro)" = "6df6174e456b6416fd67c40a3e61ec0ac4f0efd6"
+          test "$(git rev-parse HEAD:scripts/ouro1.sh)" = "9665ebb00049d05c097a29d77ec5083b524f9e2d"
+          test "$(git rev-parse HEAD:scripts/ci_gate.py)" = "16ea86bf60a3d3347c30af2f562a6b6b500b89ef"
+
+      - name: Download exact verified Host compiler
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: host-compiler-36323936191-1
+          run-id: 36323936191
+          github-token: ${{ github.token }}
+          path: _build/ci
+
+      - name: Verify and install Host compiler
+        shell: bash
+        run: |
+          echo "0268db29471266308e4880a04659c215c3cfecd64c036a10ac7b6b2e2bb9bd8f  _build/ci/host-compiler.tar.gz" | sha256sum -c -
+          python3 scripts/ci_gate.py --compiler-artifact import --compiler-sha256 0268db29471266308e4880a04659c215c3cfecd64c036a10ac7b6b2e2bb9bd8f
+
+      - name: Capture absint checker rejection
+        shell: bash
+        run: |
+          mkdir -p _build/diag-absint
+          rc=0
+          sh scripts/ouro1.sh check tests/analyze/precision/absint.ouro 200000 \
+            > _build/diag-absint/check.out 2> _build/diag-absint/check.err || rc=$?
+          printf '%s\n' "$rc" > _build/diag-absint/check.rc
+          cat _build/diag-absint/check.out _build/diag-absint/check.err
+          test "$rc" -eq 0
+
+      - name: Capture nested imported record acceptance
+        if: always()
+        shell: bash
+        run: |
+          test -x _build/c/ouro1
+          mkdir -p _build/diag-nested
+          cat > _build/diag-nested/b.ouro <<'OURO'
+          inductive Count : Type := | Seed : Count; record Inner : Type where x : Count; end; def inner : Inner := MkInner Seed;
+          OURO
+          cat > _build/diag-nested/c.ouro <<'OURO'
+          axiom Inner : Type;
+          OURO
+          cat > _build/diag-nested/a.ouro <<'OURO'
+          import "b.ouro" as C exposing (Inner, MkInner, Inner_x, inner); record Outer : Type where inner : C.Inner; end; def outer : Outer := MkOuter C.inner;
+          OURO
+          cat > _build/diag-nested/main.ouro <<'OURO'
+          import "a.ouro" as A exposing (Outer, MkOuter, Outer_inner, outer); import "b.ouro" as R exposing (Count, Seed, Inner, MkInner, Inner_x); import "c.ouro" as C exposing (Inner); def updated : A.Outer := { A.outer with inner.x := R.Seed };
+          OURO
+          sha256sum _build/diag-nested/{main,a,b,c}.ouro > _build/diag-nested/sources.sha256
+          rc=0
+          sh scripts/ouro1.sh check _build/diag-nested/main.ouro 200000 \
+            > _build/diag-nested/check.out 2> _build/diag-nested/check.err || rc=$?
+          printf '%s\n' "$rc" > _build/diag-nested/check.rc
+          cat _build/diag-nested/check.out _build/diag-nested/check.err
+          test "$rc" -eq 0
+          grep -Fx CHECK_OK _build/diag-nested/check.out
+          test ! -s _build/diag-nested/check.err
+
+      - name: Upload checker diagnostics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: pr88-exact-checker-diagnostics
+          if-no-files-found: ignore
+          retention-days: 14
+          path: |
+            _build/diag-absint/check.out
+            _build/diag-absint/check.err
+            _build/diag-absint/check.rc
+            _build/diag-nested/check.out
+            _build/diag-nested/check.err
+            _build/diag-nested/check.rc
+            _build/diag-nested/sources.sha256
