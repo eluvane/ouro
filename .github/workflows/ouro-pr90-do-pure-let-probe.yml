@@ -52,17 +52,18 @@ jobs:
         with:
           ref: ${{ github.sha }}
           path: _build/ci/pr90-candidate
-          fetch-depth: 6
+          fetch-depth: 7
           persist-credentials: false
 
       - name: Verify exact candidate lineage and scope
         working-directory: _build/ci/pr90-candidate
         run: |
-          test "$(git rev-parse HEAD^)" = 84b3717de124426d819190924fa4f7ef579a0568
-          test "$(git rev-parse HEAD^^)" = 6151ec48977d5d412aba9d32d5c39e745d35dff0
-          test "$(git rev-parse HEAD^^^)" = 4626218a847c679dea26f8b9d647b04360719740
-          test "$(git rev-parse HEAD^^^^)" = d0fbefd15651091015e9330d15f4ad7a6586cbf3
-          test "$(git rev-parse HEAD^^^^^)" = 7fddb024bc5d555a4ea8b37f29e8fe7479e6c3b8
+          test "$(git rev-parse HEAD^)" = 755a3eae9b3d22e482dc0da15158d0b8263ea0da
+          test "$(git rev-parse HEAD^^)" = 84b3717de124426d819190924fa4f7ef579a0568
+          test "$(git rev-parse HEAD^^^)" = 6151ec48977d5d412aba9d32d5c39e745d35dff0
+          test "$(git rev-parse HEAD^^^^)" = 4626218a847c679dea26f8b9d647b04360719740
+          test "$(git rev-parse HEAD^^^^^)" = d0fbefd15651091015e9330d15f4ad7a6586cbf3
+          test "$(git rev-parse HEAD^^^^^^)" = 7fddb024bc5d555a4ea8b37f29e8fe7479e6c3b8
           test "$(git diff --name-only HEAD^ HEAD)" = .github/workflows/ouro-pr90-do-pure-let-probe.yml
           git diff --check 7fddb024bc5d555a4ea8b37f29e8fe7479e6c3b8 HEAD
           mkdir -p _build/ci/pr90-do-pure-let
@@ -70,88 +71,124 @@ jobs:
           printf '%s\n' '.github/workflows/ouro-pr90-do-pure-let-probe.yml' 'compiler/parse_b.ouro' 'tests/language_ergonomics/parser_laws.ouro' | sort > _build/ci/pr90-do-pure-let/expected-paths
           diff -u _build/ci/pr90-do-pure-let/expected-paths _build/ci/pr90-do-pure-let/actual-paths
 
-      # The verified PR 90 compiler compiles candidate sources as a predecessor.
-      # This focused probe does not claim a current-source self-hosted bootstrap.
-      - name: Compare baseline and candidate parser laws
+      - name: Build and verify current candidate compiler
+        working-directory: _build/ci/pr90-candidate
+        env:
+          OURO_C_BUILD_DIR: ${{ github.workspace }}/_build/ci/pr90-candidate/_build/c
         run: |
           set -euo pipefail
           report="$GITHUB_WORKSPACE/_build/ci/pr90-isolation"
           mkdir -p "$report"
-          sha256sum tests/language_ergonomics/parser_laws.ouro compiler/parse_b.ouro \
-            _build/ci/pr90-candidate/tests/language_ergonomics/parser_laws.ouro \
-            _build/ci/pr90-candidate/compiler/parse_b.ouro > "$report/source-sha256.txt"
-          baseline_build_rc=0
-          if sh scripts/build_tool.sh tests/language_ergonomics/parser_laws.ouro \
-              "$report/baseline-parser-laws" 60000 > "$report/baseline-build.log" 2>&1; then
-            baseline_build_rc=0
+          test "$OURO_C_BUILD_DIR" = "$PWD/_build/c"
+          sha256sum "$GITHUB_WORKSPACE/tests/language_ergonomics/parser_laws.ouro" \
+            "$GITHUB_WORKSPACE/compiler/parse_b.ouro" \
+            tests/language_ergonomics/parser_laws.ouro compiler/parse_b.ouro \
+            > "$report/source-sha256.txt"
+          sha256sum "$GITHUB_WORKSPACE/_build/c/ouro1" > "$report/baseline-compiler-before.sha256"
+          if python3 scripts/ouro_build.py build --verbosity quiet \
+              > "$report/candidate-compiler-build.log" 2>&1; then
+            echo 'candidate_compiler_build_rc=0' > "$report/compiler-status.txt"
           else
-            baseline_build_rc=$?
+            status=$?
+            echo "candidate_compiler_build_rc=$status" > "$report/compiler-status.txt"
+            tail -n 30 "$report/candidate-compiler-build.log"
+            exit "$status"
           fi
-          candidate_build_rc=0
-          if (cd _build/ci/pr90-candidate && sh scripts/build_tool.sh \
-              tests/language_ergonomics/parser_laws.ouro \
-              _build/ci/pr90-do-pure-let/parser-laws 60000) > "$report/candidate-build.log" 2>&1; then
-            candidate_build_rc=0
+          if python3 scripts/ci_gate.py --compiler-artifact export \
+              > "$report/candidate-compiler-export.log" 2>&1; then
+            echo 'candidate_compiler_export_rc=0' >> "$report/compiler-status.txt"
           else
-            candidate_build_rc=$?
+            status=$?
+            echo "candidate_compiler_export_rc=$status" >> "$report/compiler-status.txt"
+            cat "$report/candidate-compiler-export.log"
+            exit "$status"
           fi
-          baseline_run_rc=125
-          baseline_marker_rc=125
-          if [ "$baseline_build_rc" -eq 0 ]; then
-            if "$report/baseline-parser-laws" > "$report/baseline-run.log" 2>&1; then
-              baseline_run_rc=0
-              if grep -Fxq ERGO_PARSER_OK "$report/baseline-run.log"; then
-                baseline_marker_rc=0
-              else
-                baseline_marker_rc=$?
-              fi
-            else
-              baseline_run_rc=$?
-            fi
-          fi
-          candidate_run_rc=125
-          candidate_marker_rc=125
-          if [ "$candidate_build_rc" -eq 0 ]; then
-            if _build/ci/pr90-candidate/_build/ci/pr90-do-pure-let/parser-laws \
-                > "$report/candidate-run.log" 2>&1; then
-              candidate_run_rc=0
-              if grep -Fxq ERGO_PARSER_OK "$report/candidate-run.log"; then
-                candidate_marker_rc=0
-              else
-                candidate_marker_rc=$?
-              fi
-            else
-              candidate_run_rc=$?
-            fi
-          fi
-          printf 'baseline_build_rc=%s\nbaseline_run_rc=%s\nbaseline_marker_rc=%s\ncandidate_build_rc=%s\ncandidate_run_rc=%s\ncandidate_marker_rc=%s\n' \
-            "$baseline_build_rc" "$baseline_run_rc" "$baseline_marker_rc" \
-            "$candidate_build_rc" "$candidate_run_rc" "$candidate_marker_rc" > "$report/status.txt"
-          cat "$report/status.txt"
-          tail -n 12 "$report/baseline-build.log"
-          tail -n 12 "$report/candidate-build.log"
-          test "$baseline_build_rc" -eq 0
-          test "$baseline_run_rc" -eq 0
-          test "$baseline_marker_rc" -eq 0
-          test "$candidate_build_rc" -eq 0
-          test "$candidate_run_rc" -eq 0
-          test "$candidate_marker_rc" -eq 0
+          sha256sum "$OURO_C_BUILD_DIR/ouro1" > "$report/candidate-compiler.sha256"
+          sha256sum "$GITHUB_WORKSPACE/_build/c/ouro1" > "$report/baseline-compiler-after.sha256"
+          cmp "$report/baseline-compiler-before.sha256" "$report/baseline-compiler-after.sha256"
+          cat "$report/compiler-status.txt" "$report/candidate-compiler-export.log"
 
-      - name: Compile candidate native test tool
+      - name: Run candidate parser laws and six positive fixtures
         working-directory: _build/ci/pr90-candidate
-        run: sh scripts/build_tool.sh tools/test/main.ouro _build/ci/pr90-do-pure-let/ouro-test 60000
-
-      - name: Run focused do pure let manifest
-        working-directory: _build/ci/pr90-candidate
+        env:
+          OURO_C_BUILD_DIR: ${{ github.workspace }}/_build/ci/pr90-candidate/_build/c
         run: |
           set -euo pipefail
-          fixture_root="$(python3 scripts/ouro_smith.py prepare --group manifest --out _build/ci/pr90-do-pure-let/inputs)"
-          _build/ci/pr90-do-pure-let/ouro-test \
-            --manifest="$fixture_root/manifest.tsv" \
-            --prefix=ERGO.expansion-do-pure-let- \
-            --root="$fixture_root" \
-            --out=_build/ci/pr90-do-pure-let/results \
-            --suite-label=ERGONOMICS_SUITE | tee _build/ci/pr90-do-pure-let/manifest.log
+          report="$GITHUB_WORKSPACE/_build/ci/pr90-isolation"
+          test "$OURO_C_BUILD_DIR" = "$PWD/_build/c"
+          test -z "${OURO1_COMPILER:-}"
+          test -z "${OURO_ROOT:-}"
+          test -z "${OURO_TEST_CHECK:-}"
+          laws_build_rc=0
+          if sh scripts/build_tool.sh tests/language_ergonomics/parser_laws.ouro \
+              _build/ci/pr90-do-pure-let/parser-laws 60000 > "$report/candidate-laws-build.log" 2>&1; then
+            laws_build_rc=0
+          else
+            laws_build_rc=$?
+          fi
+          laws_run_rc=125
+          laws_marker_rc=125
+          if [ "$laws_build_rc" -eq 0 ]; then
+            if _build/ci/pr90-do-pure-let/parser-laws > "$report/candidate-laws-run.log" 2>&1; then
+              laws_run_rc=0
+              if grep -Fxq ERGO_PARSER_OK "$report/candidate-laws-run.log"; then
+                laws_marker_rc=0
+              else
+                laws_marker_rc=$?
+              fi
+            else
+              laws_run_rc=$?
+            fi
+          fi
+          tool_build_rc=0
+          if sh scripts/build_tool.sh tools/test/main.ouro "$OURO_C_BUILD_DIR/ouro-test" 60000 \
+              > "$report/candidate-test-tool-build.log" 2>&1; then
+            tool_build_rc=0
+          else
+            tool_build_rc=$?
+          fi
+          selection_rc=125
+          manifest_rc=125
+          if [ "$tool_build_rc" -eq 0 ]; then
+            if fixture_root=$(python3 scripts/ouro_smith.py prepare --group manifest \
+                --out _build/ci/pr90-do-pure-let/inputs 2> "$report/prepare.log"); then
+              printf '%s\n' "$fixture_root" > "$report/fixture-root.txt"
+              awk -F '\t' '$1 ~ /^ERGO[.]expansion-do-pure-let-/ && $4 == "pass" { print }' \
+                "$fixture_root/manifest.tsv" > "$report/six-positive.tsv"
+              if [ "$(wc -l < "$report/six-positive.tsv")" -eq 6 ]; then
+                selection_rc=0
+                if sh scripts/ouro1.sh test \
+                    --manifest="$report/six-positive.tsv" \
+                    --prefix=ERGO.expansion-do-pure-let- \
+                    --root="$fixture_root" \
+                    --out=_build/ci/pr90-do-pure-let/results \
+                    --suite-label=ERGONOMICS_SUITE > "$report/manifest.log" 2>&1; then
+                  manifest_rc=0
+                else
+                  manifest_rc=$?
+                fi
+              else
+                selection_rc=1
+              fi
+            else
+              selection_rc=$?
+            fi
+          fi
+          printf 'laws_build_rc=%s\nlaws_run_rc=%s\nlaws_marker_rc=%s\ntool_build_rc=%s\nselection_rc=%s\nmanifest_rc=%s\n' \
+            "$laws_build_rc" "$laws_run_rc" "$laws_marker_rc" \
+            "$tool_build_rc" "$selection_rc" "$manifest_rc" > "$report/focused-status.txt"
+          cat "$report/focused-status.txt"
+          tail -n 12 "$report/candidate-laws-build.log"
+          tail -n 12 "$report/candidate-test-tool-build.log"
+          if [ -f "$report/manifest.log" ]; then tail -n 30 "$report/manifest.log"; fi
+          sha256sum "$GITHUB_WORKSPACE/_build/c/ouro1" > "$report/baseline-compiler-final.sha256"
+          cmp "$report/baseline-compiler-before.sha256" "$report/baseline-compiler-final.sha256"
+          test "$laws_build_rc" -eq 0
+          test "$laws_run_rc" -eq 0
+          test "$laws_marker_rc" -eq 0
+          test "$tool_build_rc" -eq 0
+          test "$selection_rc" -eq 0
+          test "$manifest_rc" -eq 0
 
       - name: Upload focused evidence
         if: always()
@@ -160,6 +197,7 @@ jobs:
           name: pr90-do-pure-let-probe
           path: |
             _build/ci/pr90-candidate/_build/ci/pr90-do-pure-let
+            _build/ci/pr90-candidate/_build/ci/host-compiler.tar.gz
             _build/ci/pr90-isolation
           if-no-files-found: error
           retention-days: 7
