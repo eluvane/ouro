@@ -49,7 +49,7 @@ if [ ! -x "$quality_inputs" ] && [ -x "${quality_inputs}.exe" ]; then
 	quality_inputs="${quality_inputs}.exe"
 fi
 "$quality_inputs" "$out/input-fixtures" >"$out/quality-input-tests.out"
-tr -d '\r' <"$out/quality-input-tests.out" | grep -Fx 'QUALITY_INPUT_TESTS rows=22 failures=0' >/dev/null
+tr -d '\r' <"$out/quality-input-tests.out" | grep -Fx 'QUALITY_INPUT_TESTS rows=27 failures=0' >/dev/null
 
 "$quality_diagnostics" >"$out/quality-diagnostic-tests.out" 2>"$out/quality-diagnostic-tests.err"
 test ! -s "$out/quality-diagnostic-tests.err"
