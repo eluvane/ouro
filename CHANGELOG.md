@@ -6,6 +6,8 @@ Development changes; see the [compatibility policy](docs/stability.md).
 
 ### Added
 
+- `iter_drop` lazily skips a requested number of emitted iterator values while
+  preserving source skips, failures, and bounded pull accounting.
 - `iter_filter_map` lazily filters and changes item types through a `Maybe`
   callback while preserving source skips, failures, and bounded pulls.
 - `iter_indexed` numbers values from a pure pull iterator starting at zero,
