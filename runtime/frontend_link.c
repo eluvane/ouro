@@ -13,6 +13,30 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdarg.h>
+#include <time.h>
+
+#ifdef __linux__
+#include <sys/resource.h>
+#endif
+
+static void fe_diag_stage(const char *stage, int index)
+{
+#ifdef __linux__
+	struct rusage usage;
+#endif
+	if (getenv("OURO_DIAG_FE_STAGES") == 0)
+		return;
+	fprintf(stderr, "OURO_FE_STAGE stage=%s index=%d wall_s=%lld cpu_s=%.3f allocated=%llu",
+		stage, index, (long long)time(0),
+		(double)clock() / (double)CLOCKS_PER_SEC,
+		ouro_heap_total_alloc_bytes());
+#ifdef __linux__
+	if (getrusage(RUSAGE_SELF, &usage) == 0)
+		fprintf(stderr, " peak_rss_kib=%ld", usage.ru_maxrss);
+#endif
+	fputc('\n', stderr);
+	fflush(stderr);
+}
 
 /* Quality tooling uses the same compiler-owned parser repeatedly without the
    driver's compile-unit phase seam. Scope only its temporary allocations;
@@ -885,6 +909,8 @@ static int unit_prepass_incremental(ouro_v *files, ouro_v **out_files,
 			out_items[i] = perm_pair(path, src2);
 			alias_items[i] = perm_pair(path, aliases);
 			fe_phase_done("frontend-after-preprocess-unit");
+			if (((n - i) & 31) == 0 || i == 0)
+				fe_diag_stage("prepass-unit", n - i);
 		}
 	}
 	free(in_items);
@@ -952,6 +978,8 @@ static int parse_units_incremental(ouro_v *fuel, ouro_v *files,
 			break;
 		}
 		fe_phase_done("frontend-after-parse-unit");
+		if ((nitems & 31) == 0)
+			fe_diag_stage("parse-unit", nitems);
 		cur = OURO_F(cur, 1);
 	}
 	if (!ok) {
@@ -1004,21 +1032,26 @@ static ouro_v *compile_checked_units_impl(ouro_v *fuel, ouro_v *root, ouro_v *fi
 	g_last_intern = FIND(lx, "empty_intern");
 	g_last_checked_program = 0;
 
+	fe_diag_stage("prepass-start", 0);
 	if (!unit_prepass_incremental(files, &files1, &alias_files, &r))
 		goto failed;
 	fe_phase_done("frontend-after-preprocess");
+	fe_diag_stage("prepass-end", 0);
 
 	ouro_perm_select(1);
+	fe_diag_stage("parse-start", 0);
 	if (!parse_units_incremental(fuel, files1, &units, &st, &r)) {
 		if (st != 0)
 			g_last_intern = st;
 		goto failed;
 	}
 	fe_phase_done("frontend-after-parse-units");
+	fe_diag_stage("parse-end", 0);
 
 	intern_fn = FIND(lx, "intern_string");
 	resolve_fn = FIND(ir, "resolve_imports");
 	ouro_perm_select(0);
+	fe_diag_stage("module-plan-start", 0);
 	canonical_root = ouro_apply(ouro_apply(FIND(pl, "canon_path"), perm_nil()), root);
 	pair = ouro_apply(ouro_apply(intern_fn, st), canonical_root);
 	root_id = pair_fst(pair);
@@ -1026,6 +1059,7 @@ static ouro_v *compile_checked_units_impl(ouro_v *fuel, ouro_v *root, ouro_v *fi
 	module_plan = ouro_apply(ouro_apply(ouro_apply(ouro_apply(
 		FIND(pl, "module_resolve_units"), fuel), units), alias_files), root_id);
 	module_plan = ouro_apply(module_plan, st2);
+	fe_diag_stage("module-plan-end", 0);
 	if (module_plan == 0 || module_plan->tag != 0) {
 		g_last_intern = ouro_clone_perm_deep(st2);
 		if (module_plan != 0 && module_plan->tag == 1 && module_plan->n >= 2)
@@ -1037,6 +1071,7 @@ static ouro_v *compile_checked_units_impl(ouro_v *fuel, ouro_v *root, ouro_v *fi
 	scoped = pair_fst(OURO_F(module_plan, 0));
 	st2 = pair_snd(OURO_F(module_plan, 0));
 	selected = ouro_apply(ouro_apply(FIND(pl, "unit_decl_names"), scoped), root_id);
+	fe_diag_stage("import-resolve-start", 0);
 	resolved = ouro_apply(ouro_apply(resolve_fn, scoped), root_id);
 	if (resolved == 0 || resolved->tag != 0) {
 		g_last_intern = ouro_clone_perm_deep(st2);
@@ -1051,14 +1086,17 @@ static ouro_v *compile_checked_units_impl(ouro_v *fuel, ouro_v *root, ouro_v *fi
 	st2 = ouro_clone_perm_deep(st2);
 	ouro_perm_reset_bank(1);
 	fe_phase_done("frontend-after-resolve-imports");
+	fe_diag_stage("import-resolve-end", 0);
 
 	fn = closed_compile_from_decls();
 	ouro_perm_select(1);
+	fe_diag_stage("check-decls-start", 0);
 	r = ouro_apply(ouro_apply(ouro_apply(ouro_apply(fn, selected), fuel), st2), ds);
 	/* Only generic lowering failures need source hints. Preserve the checked
 	   result across the same lifetime seam before calling the Ouro remapper. */
 	r = ouro_clone_perm_deep(r);
 	fe_phase_done("frontend-after-check-decls");
+	fe_diag_stage("check-decls-end", 0);
 	falseb = ouro_ctor(1, 0, 0);
 	r = ouro_apply(ouro_apply(ouro_apply(closed_remap_comp_files(), falseb), files1), r);
 	g_last_intern = st2;
@@ -1067,6 +1105,7 @@ static ouro_v *compile_checked_units_impl(ouro_v *fuel, ouro_v *root, ouro_v *fi
 	g_last_intern = ouro_clone_perm_deep(st2);
 	ouro_perm_reset_bank(0);
 	fe_phase_done("frontend-after-compile-from-decls");
+	fe_diag_stage("compile-checked-end", 0);
 	if (r != 0 && r->tag == 1 && r->n >= 1)
 		g_last_checked_program = OURO_F(r, 0);
 	return r;
