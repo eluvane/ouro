@@ -235,6 +235,7 @@ static ouro_v *cerr(unsigned long code, unsigned long det)
 
 static ouro_v *g_closed_parse_file;
 static ouro_v *g_last_intern;
+static ouro_v *g_fe_diag_intern;
 static ouro_v *g_last_checked_program;
 
 ouro_v *ouro_fe_last_intern(void)
@@ -421,6 +422,16 @@ static int decl_name_from_intern(int id, char *buf, int cap)
 	if (g_last_intern == 0 || buf == 0 || cap <= 0)
 		return 0;
 	codes = ouro_apply(ouro_apply(FIND(pl, "name_of_id"), g_last_intern),
+		ouro_nat((unsigned long)id));
+	return codes_to_buf(codes, buf, cap);
+}
+
+static int fe_diag_name_from_intern(int id, char *buf, int cap)
+{
+	ouro_v *codes;
+	if (g_fe_diag_intern == 0 || buf == 0 || cap <= 0)
+		return 0;
+	codes = ouro_apply(ouro_apply(FIND(pl, "name_of_id"), g_fe_diag_intern),
 		ouro_nat((unsigned long)id));
 	return codes_to_buf(codes, buf, cap);
 }
@@ -655,7 +666,8 @@ static ouro_v *bounded_call(ouro_v *fn, int count, ouro_v **args,
 
 static ouro_v *bounded_call_profiled(ouro_v *fn, int count, ouro_v **args,
 		ouro_v *(*clone_result)(ouro_v *), const char *stage,
-		unsigned long index, unsigned long sample_mask, double *total_cpu)
+		unsigned long index, unsigned long sample_mask, double *total_cpu,
+		ouro_v *item)
 {
 	clock_t started, applied, cloned, reset;
 	unsigned long long before, after_apply, after_clone, after_reset;
@@ -696,6 +708,15 @@ static ouro_v *bounded_call_profiled(ouro_v *fn, int count, ouro_v **args,
 		if (getrusage(RUSAGE_SELF, &usage) == 0)
 			fprintf(stderr, " peak_rss_kib=%ld", usage.ru_maxrss);
 #endif
+		if (item != 0) {
+			int id = (int)as_nat(ouro_apply(FIND(fc, "file_item_name"), item));
+			fprintf(stderr, " item_tag=%d name_id=%d", item->tag, id);
+			if (elapsed >= 1.0) {
+				char namebuf[128];
+				if (fe_diag_name_from_intern(id, namebuf, (int)sizeof namebuf))
+					fprintf(stderr, " name=%s", namebuf);
+			}
+		}
 		fputc('\n', stderr);
 		fflush(stderr);
 	}
@@ -746,7 +767,7 @@ static ouro_v *bounded_lower_expr(ouro_env *env, ouro_v *expr)
 	return bounded_call_profiled(FIND(lo, "lower_expr_env2"), 3,
 		(ouro_v *[]){ouro_get(env, 1), ouro_get(env, 0), expr},
 		ouro_clone_perm_deep, "lower-expr", fe_diag_lower_count,
-		127UL, &fe_diag_lower_cpu);
+		127UL, &fe_diag_lower_cpu, 0);
 }
 
 static ouro_v *bounded_lower_expected(ouro_env *env, ouro_v *expected)
@@ -833,7 +854,7 @@ static ouro_v *bounded_check_item(ouro_env *env, ouro_v *item)
 	return bounded_call_profiled(FIND(fc, "check_indexed_declaration"), 4,
 		(ouro_v *[]){ouro_get(env, 2), ouro_get(env, 1), ouro_get(env, 0), item},
 		ouro_clone_perm, "check-item", fe_diag_check_count,
-		15UL, &fe_diag_check_cpu);
+		15UL, &fe_diag_check_cpu, item);
 }
 
 static ouro_v *bounded_check_signature(ouro_env *env, ouro_v *sig)
@@ -1156,6 +1177,7 @@ static ouro_v *compile_checked_units_impl(ouro_v *fuel, ouro_v *root, ouro_v *fi
 	root = ouro_clone_perm_deep(root);
 	files = ouro_clone_perm_deep(files);
 	g_last_intern = FIND(lx, "empty_intern");
+	g_fe_diag_intern = 0;
 	g_last_checked_program = 0;
 	fe_diag_lower_count = 0;
 	fe_diag_elab_count = 0;
@@ -1216,6 +1238,8 @@ static ouro_v *compile_checked_units_impl(ouro_v *fuel, ouro_v *root, ouro_v *fi
 	ds = ouro_clone_perm_deep(OURO_F(resolved, 0));
 	selected = ouro_clone_perm_deep(selected);
 	st2 = ouro_clone_perm_deep(st2);
+	if (fe_diag_enabled())
+		g_fe_diag_intern = st2;
 	ouro_perm_reset_bank(1);
 	fe_phase_done("frontend-after-resolve-imports");
 	fe_diag_stage("import-resolve-end", 0);
@@ -1224,6 +1248,7 @@ static ouro_v *compile_checked_units_impl(ouro_v *fuel, ouro_v *root, ouro_v *fi
 	ouro_perm_select(1);
 	fe_diag_stage("check-decls-start", 0);
 	r = ouro_apply(ouro_apply(ouro_apply(ouro_apply(fn, selected), fuel), st2), ds);
+	g_fe_diag_intern = 0;
 	/* Only generic lowering failures need source hints. Preserve the checked
 	   result across the same lifetime seam before calling the Ouro remapper. */
 	r = ouro_clone_perm_deep(r);
