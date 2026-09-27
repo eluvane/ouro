@@ -9,7 +9,7 @@ Choose a module by task; the generated [API reference](api/README.md) owns decla
 | Task | Modules |
 | --- | --- |
 | Shared types and results | `std/types.ouro`, `std/prelude.ouro`, `std/data.ouro`, `std/result.ouro` |
-| Lists and iterators | `std/collections.ouro`, `std/iter.ouro`, `std/range.ouro` |
+| Lists and iterators | `std/collections.ouro`, `std/list_builder.ouro`, `std/iter.ouro`, `std/range.ouro` |
 | Text and numbers | `std/string.ouro`, `std/text.ouro`, `std/num.ouro`, `std/utf8_scalar.ouro` |
 | CLI and configuration | `std/args.ouro`, `std/cli.ouro`, `std/config.ouro`, `std/configx.ouro` |
 | Files and workspace | `std/fs.ouro`, `std/fsx.ouro`, `std/fs_walk.ouro`, `std/fs_replace.ouro`, `std/workspace.ouro` |
@@ -131,6 +131,23 @@ def twos_and_rest : Pair (List Nat) (List Nat) :=
 ```
 
 Here `twos_and_rest` is `([2, 2], [1, 3])`.
+
+`std/list_builder.ouro` provides a persistent `ListBuilder A` for constructing
+a list through repeated `list_builder_push A value builder` calls. Each push
+adds one value in constant time; `list_builder_finish` takes linear time to
+return the values in push order. An empty builder finishes as `[]`.
+
+```ouro
+import "../std/list_builder.ouro";
+
+def values : List Nat :=
+  list_builder_finish Nat
+    (list_builder_push Nat 3
+      (list_builder_push Nat 2
+        (list_builder_push Nat 1 (list_builder_empty Nat))));
+```
+
+`values` is `[1, 2, 3]`.
 
 `list_windows A width xs` returns overlapping, complete windows. Width zero,
 an empty input, and a width larger than the input return `[]`; for example,
