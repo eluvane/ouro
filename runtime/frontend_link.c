@@ -579,8 +579,12 @@ static ouro_v *bounded_call(ouro_v *fn, int count, ouro_v **args,
 	return result;
 }
 
-static int trace_callback_milestone(unsigned long ordinal)
+static int trace_callback_milestone(const char *label, unsigned long ordinal)
 {
+	if (ordinal >= 1280 && ordinal < 1408 &&
+	    (strcmp(label, "check-item-enter") == 0 ||
+	     strcmp(label, "check-item-exit") == 0))
+		return 1;
 	return ordinal == 1 || (ordinal & (ordinal - 1)) == 0 ||
 		ordinal % 128 == 0;
 }
@@ -590,7 +594,7 @@ static void trace_callback(const char *label, unsigned long ordinal)
 	const char *enabled = getenv("OURO_MEM_TRACE");
 	if (enabled == 0 || enabled[0] == 0 ||
 		(enabled[0] == '0' && enabled[1] == 0) ||
-		!trace_callback_milestone(ordinal))
+		!trace_callback_milestone(label, ordinal))
 		return;
 	fprintf(stderr, "OURO_MEM_CALLBACK label=%s ordinal=%lu\n", label, ordinal);
 	ouro_heap_report(label);
