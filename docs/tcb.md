@@ -30,7 +30,10 @@ import scope, so a selective edge cannot expose a hidden accessor through
 record syntax. Raw source cannot spell the marker separator, and each
 generated reference still passes through module resolution and the complete
 declaration checker. The text-only record preprocessor rejects output that
-would require this metadata.
+would require this metadata. Dotted expression references left after import
+preprocessing still undergo projection validation when the record registry is empty.
+Comments and quoted literals cannot activate that path, and an unknown prefix
+cannot establish a module owner.
 When a qualified reference resolves to a global name also used by a lexical
 binder, the module pass interns a distinct binder ID before lowering. It
 rewrites bound uses with that ID and keeps the qualified reference attached to

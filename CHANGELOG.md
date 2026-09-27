@@ -165,6 +165,10 @@ Development changes; see the [compatibility policy](docs/stability.md).
 
 ### Fixed
 
+- Validate unresolved dotted projection prefixes even in source units without
+  record declarations, retaining the invalid-projection diagnostic.
+- Finish lexer token streams with a linear reversal while preserving token
+  order, intern state, and malformed or exhausted result handling.
 - Keep qualified selected imports usable when their short names collide; a
   bare colliding name still reports ambiguity.
 - `adjacent_pairs` now advances its left element; `list_traverse_result` evaluates

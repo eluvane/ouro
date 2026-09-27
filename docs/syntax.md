@@ -437,7 +437,10 @@ annotation so the earlier type is not rebound under the later name.
 Heterogeneous lists are rejected. A nonempty list may end with a comma;
 `[]` remains the empty spelling. List literals lower to the standard `Nil`
 and `Cons` constructors, and the compiler checks every element against the
-selected type.
+selected type. For colliding `List` declarations, the literal context follows
+the family registered as `ouro.list`. An unrelated same-spelled family needs
+its explicit `Nil` and `Cons` constructors, and its values retain their
+nominal type.
 
 A final `..` can reuse an existing list as the tail:
 
