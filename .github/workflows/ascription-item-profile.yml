@@ -1,0 +1,165 @@
+name: Ascription checker item profile (diagnostic)
+
+on:
+  push:
+    branches: [codef/ascription-item-profile]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ascription-item-profile-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  OURO_CI: "1"
+  OURO_REPRODUCIBLE: "1"
+  OURO_PACK_STRICT: "1"
+  OURO_JOBS: "2"
+  OURO_CACHE_DIR: _cache/ouro
+  OURO_BUILD_DIR: _build
+  OURO_C_BUILD_DIR: _build/c
+  OURO_CCACHE: disabled
+
+jobs:
+  profile:
+    runs-on: ubuntu-latest
+    timeout-minutes: 70
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 3
+          persist-credentials: false
+
+      - name: Pin exact diagnostic source
+        run: |
+          test "$(git rev-parse HEAD^)" = 367695e22f70ee8fedb71a7d89e9049496451b48
+          test "$(git diff --name-only HEAD^ HEAD)" = .github/workflows/ascription-item-profile.yml
+          git checkout --detach 367695e22f70ee8fedb71a7d89e9049496451b48
+          test "$(git rev-parse HEAD^)" = 1ecefbc7cfaa77bb7d9c9a225838529f0a864455
+          test "$(git diff --name-only HEAD^ HEAD)" = runtime/frontend_link.c
+          test "$(git rev-parse HEAD:runtime/ouro_rt.c)" = 220bd5444b2cd82ef59fb7c0d06c0c1e394a76ed
+          test "$(git rev-parse HEAD:runtime/frontend_link.c)" = 4f47c943b98901d0348ac330635430492668c143
+          test "$(git rev-parse HEAD:compiler/lower.ouro)" = 112d10465bbcc43a7f00657bea49a4c9c343d657
+          test -z "$(git status --porcelain)"
+
+      - name: Build host with unchanged bootstrap limits and checks
+        run: |
+          mkdir -p _build/ci/ascription-item-profile
+          set +e
+          python3 scripts/ouro_build.py build --verbosity quiet
+          rc=$?
+          set -e
+          printf '%s\n' "$rc" > _build/ci/ascription-item-profile/host-rc.txt
+          test "$rc" -ne 0
+
+      - name: Replay exact failed p2/check-13 with OOM trace
+        run: |
+          python3 - <<'PY'
+          import dataclasses
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import sys
+
+          sys.path.insert(0, str(Path("scripts").resolve()))
+          import bootstrap_compiler as bootstrap
+          import ouro_build as build
+          from ourosmith.limits import clean_env, run_limited
+          from repo_support import hash_json, sha256_file
+
+          output = Path("_build/ci/ascription-item-profile")
+          reports = list(Path("_build/bootstrap").glob("*/report.json"))
+          assert len(reports) == 1, reports
+          work = reports[0].parent.resolve()
+          report = json.loads(reports[0].read_text(encoding="utf-8"))
+          inputs = work / "inputs.json"
+          snapshot = json.loads(inputs.read_text(encoding="utf-8"))
+          selected = snapshot["selected"]
+          assert report["inputs_sha256"] == sha256_file(inputs)
+          assert report["key"] == snapshot["key"] == hash_json(selected)
+          assert not bootstrap.changed_inputs(work, snapshot)
+          runtime_sha = sha256_file(Path("runtime/ouro_rt.c"))
+          assert selected["sources"]["runtime/ouro_rt.c"] == runtime_sha
+          assert snapshot["inputs"]["o/runtime/ouro_rt.c"] == runtime_sha
+          frontend_sha = sha256_file(Path("runtime/frontend_link.c"))
+          assert selected["sources"]["runtime/frontend_link.c"] == frontend_sha
+          assert snapshot["inputs"]["o/runtime/frontend_link.c"] == frontend_sha
+          assert selected["roots"][13] == "compiler/pipeline.ouro"
+          phase = next(p for p in report["phases"] if p["phase"] == "p2")
+          commands = [c for c in phase["commands"] if c["label"] == "check-13"]
+          assert len(commands) == 1
+          original = commands[0]
+          argv = original["argv"]
+          assert argv[:4] == [phase["producer"], "check", "compiler/pipeline.ouro", bootstrap.FUEL]
+          assert Path(original["cwd"]).resolve() == (work / "o").resolve()
+          assert sha256_file(Path(phase["producer"])) == phase["producer_sha256"]
+          for stream in ("stdout", "stderr"):
+              assert sha256_file(work / original[stream]) == original[stream + "_sha256"]
+          assert "ouro_rt: out of memory (malloc-phase" in (work / original["stderr"]).read_text(encoding="utf-8")
+
+          receipt = {"source_head": "367695e22f70ee8fedb71a7d89e9049496451b48",
+                     "inputs_sha256": sha256_file(inputs), "report_sha256": sha256_file(reports[0]),
+                     "runtime_sha256": runtime_sha, "frontend_sha256": frontend_sha,
+                     "producer_sha256": phase["producer_sha256"],
+                     "original_stderr_sha256": original["stderr_sha256"], "argv": argv,
+                     "memory_mib": bootstrap.MEMORY_MIB, "timeout_s": bootstrap.TIMEOUT_S}
+          (output / "receipt.json").write_text(json.dumps(receipt, indent=2) + "\n", encoding="utf-8")
+
+          env = clean_env()
+          for name in ("USERPROFILE", "APPDATA", "LOCALAPPDATA", "PROGRAMFILES", "PROGRAMFILES(X86)",
+                       *selected["environment"]):
+              if name in os.environ:
+                  env[name] = os.environ[name]
+          out = work / "out/p2"
+          values = {**snapshot["config"], "cc": selected["cc_executable"], "jobs": 1,
+                    "cache_enabled": False, "ccache": "disabled", "build_dir": str(out / "b"),
+                    "c_build_dir": str(out / "c"), "cache_dir": str(out / "k")}
+          for key, name in build.ENV_MAP.items():
+              value = values[key]
+              env[name] = ("1" if value else "0") if isinstance(value, bool) else str(value)
+          env.update(PYTHONDONTWRITEBYTECODE="1", OURO_FRONTEND_JOBS="1",
+                     OURO1_CHECK_FUEL=bootstrap.FUEL, OURO_MEM_TRACE="1")
+          result = run_limited(argv, cwd=work / "o", env=env,
+                               timeout_s=bootstrap.TIMEOUT_S, memory_mb=bootstrap.MEMORY_MIB)
+          (output / "replay.json").write_text(json.dumps(dataclasses.asdict(result), indent=2) + "\n", encoding="utf-8")
+          (output / "replay.stderr").write_text(result.stderr, encoding="utf-8")
+          assert result.status == "ok" and result.returncode == 1, (result.status, result.returncode)
+          lines = [line for line in result.stderr.splitlines() if line.startswith("OURO_MEM_OOM_BANKS ")]
+          assert len(lines) == 1, lines
+          fields = {key: int(value) for key, value in re.findall(r"([a-z0-9_]+)=(\d+)", lines[0])}
+          banks = ("phase_bytes", "perm0_bytes", "perm1_bytes", "static_bytes",
+                   "context_phase_bytes", "context_perm0_bytes", "context_perm1_bytes")
+          assert all(key in fields for key in (*banks, "live_bytes", "contexts")), fields
+          assert sum(fields[key] for key in banks) == fields["live_bytes"]
+          oom = re.search(r"ouro_rt: out of memory \(malloc-phase want=1048576 live_bytes=(\d+)", result.stderr)
+          assert oom and int(oom.group(1)) == fields["live_bytes"]
+          markers = [s for s in result.stderr.splitlines() if s.startswith("OURO_MEM_HEAP label=frontend-")]
+          assert any("label=frontend-check-decls-enter " in s for s in markers), markers[-5:]
+          identities = [s for s in result.stderr.splitlines() if s.startswith("OURO_MEM_CHECK_ITEM ")]
+          assert len(identities) == 1, identities
+          assert re.fullmatch(r"OURO_MEM_CHECK_ITEM ordinal=395 kind=\d+ name_id=\d+ name=.+", identities[0])
+          (output / "item-identity.txt").write_text(identities[0] + "\n", encoding="utf-8")
+          (output / "last-marker.txt").write_text(markers[-1] + "\n", encoding="utf-8")
+          print(identities[0])
+          print(markers[-1])
+          print(lines[0])
+          PY
+
+      - name: Upload diagnostic receipts and bootstrap report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ascription-item-profile-${{ github.run_attempt }}
+          path: |
+            _build/ci/ascription-item-profile/*
+            _build/bootstrap/**/*.json
+            _build/bootstrap/**/*.log
+            _build/bootstrap/**/out/p2/check-13.stderr
+          if-no-files-found: ignore
+          retention-days: 14
