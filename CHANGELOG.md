@@ -6,6 +6,8 @@ Development changes; see the [compatibility policy](docs/stability.md).
 
 ### Added
 
+- A persistent `ListBuilder A` in `std/list_builder.ouro` with constant-time
+  `list_builder_push` and linear-time ordered `list_builder_finish`.
 - Exclusive `0..10` and inclusive `0..=10` literal-endpoint `NatRange` values,
   checked through nominal Nat, bound, and range representation roles.
 - Final-tail list spreads `[first, ..rest]` build checked `List A` constructor
