@@ -320,6 +320,13 @@ currently provides:
 - document formatting;
 - full-text document synchronization.
 
+Completion keeps name-prefix suggestions. In a direct top-level definition
+with a simple explicit result type, such as `def value : Choice := Re`, it also
+suggests matching nullary constructors from a local, non-parameterized
+`inductive Choice` declaration. This editor hint does not infer types in nested
+expressions or resolve constructors from imports. Complex constructor
+signatures and families with more than 256 arms keep ordinary prefix completion.
+
 The server runs sibling `coil.exe` for checks and `ouro-fmt.exe` for
 formatting through bounded captured processes. Child output is consumed by
 the protocol adapter; it does not enter framed stdout directly. Missing

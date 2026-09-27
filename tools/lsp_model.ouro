@@ -320,9 +320,211 @@ def completion_item (s : Sym) : Json :=
       , MkPair String Json "documentation" (JStr (str_join(" ", decl_docs d))) ] in
     JObj fields;
 
-def completion_result (prefix : String) (syms : List Sym) : Json :=
-    JArr (map Sym Json completion_item
-      (filter Sym (fun (s : Sym) => completion_matches prefix s) syms));
+-- Only an explicit, simple top-level result annotation supplies a family.
+-- Other expression contexts keep the existing name-prefix completion.
+def completion_expected_family (source_line : String) (line : Nat)
+    (col : Nat) (prefix : String) (tokens : List FxTok)
+    : Maybe String :=
+    match ltb_nat(col, S (str_len source_line)) with
+    | False => Nothing String
+    | True =>
+        let start_col : Nat := sub(col, str_len prefix) in
+        let before : List FxTok :=
+          filter FxTok
+            (fun (token : FxTok) =>
+              andb(eq_nat(fx_tok_line token, line),
+                ltb_nat(fx_tok_col token, start_col)))
+            tokens in
+        match before with
+        | Cons keyword (Cons name (Cons colon
+            (Cons family (Cons assign Nil)))) =>
+            let assign_end : Nat :=
+              add(fx_tok_col assign, str_len(fx_tok_text assign)) in
+            let header_ok : Bool := andb(fx_is_word keyword "def",
+              andb(fx_tok_bol keyword,
+                andb(fx_is_ident name,
+                  andb(fx_is_word colon ":",
+                    andb(fx_is_ident family,
+                      fx_is_word assign ":="))))) in
+            let gap_ok : Bool :=
+              andb(leb_nat assign_end start_col,
+                str_null (str_trim (str_slice source_line
+                  assign_end (sub(start_col, assign_end))))) in
+            match andb(header_ok, gap_ok) with
+            | True => Just(String, fx_tok_text family)
+            | False => Nothing String
+            end
+        | _ => Nothing String
+        end
+    end;
+
+-- A simple constructor type ends in its family. Parentheses or other
+-- expression syntax make the declaration too ambiguous for this editor hint.
+def completion_ctor_type (family : String) (tokens : List FxTok)
+    : Maybe (Pair Bool (List FxTok)) :=
+    (fix scan (remaining : List FxTok) (count : Nat)
+        (arrow : Bool) (last_family : Bool)
+        : Maybe (Pair Bool (List FxTok)) :=
+      match remaining with
+      | Nil => Nothing (Pair Bool (List FxTok))
+      | Cons token rest =>
+          match orb(fx_is_word token "|", fx_is_word token ";") with
+          | True =>
+              match andb(last_family,
+                orb(eq_nat count (S Z), arrow)) with
+              | True =>
+                  Just(Pair Bool (List FxTok),
+                    MkPair Bool (List FxTok)
+                      (eq_nat count (S Z)) remaining)
+              | False => Nothing (Pair Bool (List FxTok))
+              end
+          | False =>
+              match fx_is_ident token with
+              | True => scan rest (S count) arrow
+                  (fx_is_word token family)
+              | False =>
+                  match andb(fx_is_word token "->",
+                    notb(eq_nat count Z)) with
+                  | True => scan rest (S count) True False
+                  | False => Nothing (Pair Bool (List FxTok))
+                  end
+              end
+          end
+      end) tokens Z False False;
+
+-- One shared arm budget also bounds duplicate-name comparisons.
+def completion_ctor_arms (family : String) (tokens : List FxTok)
+    : Maybe (List String) :=
+    (fix scan (fuel : Nat) (remaining : List FxTok)
+        (seen : List String) (names : List String)
+        : Maybe (List String) :=
+      match fuel with
+      | Z => Nothing (List String)
+      | S fuel2 =>
+          match remaining with
+          | Cons bar (Cons name (Cons colon after_colon)) =>
+              match andb(fx_is_word bar "|",
+                andb(fx_is_ident name, fx_is_word colon ":")) with
+              | False => Nothing (List String)
+              | True =>
+                  match elem String str_eq (fx_tok_text name) seen with
+                  | True => Nothing (List String)
+                  | False =>
+                      match completion_ctor_type family after_colon with
+                      | Nothing => Nothing (List String)
+                      | Just parsed =>
+                          match parsed with
+                          | MkPair nullary after_type =>
+                              let names2 : List String :=
+                                match nullary with
+                                | True => Cons String (fx_tok_text name) names
+                                | False => names
+                                end in
+                              match after_type with
+                              | Nil => Nothing (List String)
+                              | Cons separator _ =>
+                                  match fx_is_word separator "|" with
+                                  | True => scan fuel2 after_type
+                                      (Cons String (fx_tok_text name) seen) names2
+                                  | False =>
+                                      match fx_is_word separator ";" with
+                                      | True => Just(List String, reverse String names2)
+                                      | False => Nothing (List String)
+                                      end
+                                  end
+                              end
+                          end
+                      end
+                  end
+              end
+          | _ => Nothing (List String)
+          end
+      end) fx_fuel_arms tokens (Nil String) (Nil String);
+
+def completion_ctor_decl (family : String) (tokens : List FxTok)
+    : Maybe (List String) :=
+    match tokens with
+    | Cons _ (Cons colon (Cons universe (Cons assign arms))) =>
+        match andb(fx_is_word colon ":",
+          andb(fx_is_word universe "Type", fx_is_word assign ":=")) with
+        | True => completion_ctor_arms family arms
+        | False => Nothing (List String)
+        end
+    | _ => Nothing (List String)
+    end;
+
+-- Count earlier same-named local families, including malformed declarations.
+-- Duplicates and incomplete declarations produce no constructor suggestions.
+def completion_ctor_matches (family : String) (line : Nat)
+    (tokens : List FxTok) : List (Maybe (List String)) :=
+    (fix scan (remaining : List FxTok) : List (Maybe (List String)) :=
+      match remaining with
+      | Nil => Nil (Maybe (List String))
+      | Cons token rest =>
+          match andb(fx_is_word token "inductive",
+            andb(fx_tok_bol token, ltb_nat(fx_tok_line token, line))) with
+          | False => scan rest
+          | True =>
+              match rest with
+              | Nil => scan rest
+              | Cons name _ =>
+                  match andb(fx_is_ident name, fx_is_word name family) with
+                  | False => scan rest
+                  | True =>
+                      Cons (Maybe (List String))
+                        (completion_ctor_decl family rest) (scan rest)
+                  end
+              end
+          end
+      end) tokens;
+
+def completion_local_ctors (tokens : List FxTok) (line : Nat) (family : String)
+    : List String :=
+    match completion_ctor_matches family line tokens with
+    | Nil => Nil String
+    | Cons candidate rest =>
+        match rest with
+        | Cons _ _ => Nil String
+        | Nil =>
+            match candidate with
+            | Nothing => Nil String
+            | Just names => names
+            end
+        end
+    end;
+
+def completion_ctor_item (family : String) (name : String) : Json :=
+    let fields : List (Pair String Json) :=
+      [ MkPair String Json "label" (JStr name)
+      , MkPair String Json "kind" (json_num 4)
+      , MkPair String Json "detail"
+          (JStr (str_concat "constructor of " family))
+      , MkPair String Json "insertText" (JStr name) ] in
+    JObj fields;
+
+def completion_result (text : String) (line : Nat) (col : Nat)
+    (syms : List Sym) : Json :=
+    let source_line : String := nth String "" line (str_lines text) in
+    let prefix : String := prefix_in_line source_line col in
+    let ordinary : List Json := map Sym Json completion_item
+      (filter Sym (fun (s : Sym) => completion_matches prefix s) syms) in
+    let trimmed_source : String := str_trim source_line in
+    let constructors : List Json :=
+      match andb(str_starts(trimmed_source, "def"),
+        is_ws (prim_string_byte_at trimmed_source 3)) with
+      | False => Nil Json
+      | True =>
+          let token_line : Nat := S line in
+          let tokens : List FxTok := fx_lex text in
+          match completion_expected_family source_line token_line col prefix tokens with
+          | Nothing => Nil Json
+          | Just family =>
+              map String Json (completion_ctor_item family)
+                (filter String (fun (name : String) => str_starts(name, prefix))
+                  (completion_local_ctors tokens token_line family))
+          end
+      end in
+    JArr (append Json constructors ordinary);
 
 def location_result (s : Sym) : Json :=
     let line : Nat := sub(decl_line (sym_decl s), S Z) in
