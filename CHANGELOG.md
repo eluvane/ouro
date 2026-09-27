@@ -6,6 +6,8 @@ Development changes; see the [compatibility policy](docs/stability.md).
 
 ### Added
 
+- `iter_filter_map` lazily filters and changes item types through a `Maybe`
+  callback while preserving source skips, failures, and bounded pulls.
 - `iter_indexed` numbers values from a pure pull iterator starting at zero,
   preserving skips, source failures, and pull limits without building a list.
 - Exclusive `0..10` and inclusive `0..=10` literal-endpoint `NatRange` values,

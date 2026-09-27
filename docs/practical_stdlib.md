@@ -126,9 +126,11 @@ is quadratic in the input length.
 
 `std/iter.ouro` provides a pure pull iterator with explicit state, item, and
 error types. `iter_from_list` wraps an existing list without building another
-list. `iter_map`, `iter_filter`, `iter_indexed`, and `iter_take` defer work until a
-pull; filtering a rejected item returns a skip step, so one pull never searches
-an unbounded prefix. `iter_take` counts emitted items, not skipped source steps.
+list. `iter_map`, `iter_filter`, `iter_filter_map`, `iter_indexed`, and `iter_take`
+defer work until a pull. `iter_filter_map` applies a typed `A -> Maybe B`
+callback: `Nothing` skips that source item and `Just value` emits the mapped
+value. A rejected item returns a skip step, so one pull never searches an
+unbounded prefix. `iter_take` counts emitted items, not skipped source steps.
 `iter_indexed` pairs each emitted value with a zero-based index; skips leave
 that index unchanged, and source failures pass through.
 
@@ -145,6 +147,25 @@ collect_list (Pair Nat (List Nat)) String (Pair Nat Nat) 4 numbered
 
 This returns `Right [MkPair Nat Nat 0 2]`. `collect_list` requires an explicit
 maximum number of pulls and returns `Either (IterCollectError E) (List A)`.
+For a filter and type conversion in one adapter:
+
+```ouro
+let source : Iterator (List Nat) String Nat :=
+  iter_from_list String Nat ([1, 2, 3, 4] : List Nat) in
+let selected : Iterator (List Nat) String String :=
+  iter_filter_map (List Nat) String Nat String
+    (fun (value : Nat) =>
+      match evenb value with
+      | True => Just String (str_of_nat value)
+      | False => Nothing String
+      end) source in
+collect_list (List Nat) String String 5 selected
+```
+
+This returns `Right ["2", "4"]`; the two skipped items and final end observation
+each use one pull. Source skips and failures pass through without calling the
+mapper.
+
 Each yield, skip, failure, or end observation costs one pull. Zero pulls always
 gives `IterPullLimit`, even for an empty source; a list of `n` items needs `n + 1`
 pulls to observe its end. A source failure returns `IterSourceFailure` and
