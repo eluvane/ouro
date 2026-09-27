@@ -11,6 +11,7 @@ import "structural_frontend.ouro",
   "../../compiler/parser_parse.ouro",
   "../../compiler/semantic_scope.ouro",
   "../../compiler/import_resolve.ouro",
+  "../../compiler/module_registry.ouro",
   "../../compiler/canonical_hash.ouro",
   "../quality/source.ouro",
   "../quality/input_error.ouro";
@@ -87,32 +88,66 @@ def cm_graph_units (units : List SrcUnit) : List SrcUnit :=
           (map(Nat, Decl, fun (id : Nat) => DImport id, cm_import_ids decls))
       end) units;
 
+inductive CmResolvedImports : Type :=
+  | CmResolvedImportsOf : List ModuleAliasUnit -> List ModuleMember -> CmResolvedImports;
+
+def cm_empty_resolved_imports : CmResolvedImports :=
+    CmResolvedImportsOf (Nil ModuleAliasUnit) (Nil ModuleMember);
+
 inductive ClippySemanticUnit : Type :=
-  | CmUnit : InternState -> Nat -> String -> List SrcUnit -> List ScDecl -> ScIndex -> List Decl -> Nat -> List CsOriginFact -> ClippySemanticUnit;
+  | CmUnit : InternState -> Nat -> String -> List SrcUnit -> List ScDecl -> ScIndex -> List Decl -> Nat -> List CsOriginFact -> CmResolvedImports -> ClippySemanticUnit;
 
 def cm_intern (item : ClippySemanticUnit) : InternState :=
-    match item with | CmUnit value _ _ _ _ _ _ _ _ => value end;
+    match item with | CmUnit value _ _ _ _ _ _ _ _ _ => value end;
 
 def cm_entry (item : ClippySemanticUnit) : Nat :=
-    match item with | CmUnit _ value _ _ _ _ _ _ _ => value end;
+    match item with | CmUnit _ value _ _ _ _ _ _ _ _ => value end;
 
 def cm_source (item : ClippySemanticUnit) : String :=
-    match item with | CmUnit _ _ value _ _ _ _ _ _ => value end;
+    match item with | CmUnit _ _ value _ _ _ _ _ _ _ => value end;
 
 def cm_units (item : ClippySemanticUnit) : List SrcUnit :=
-    match item with | CmUnit _ _ _ value _ _ _ _ _ => value end;
+    match item with | CmUnit _ _ _ value _ _ _ _ _ _ => value end;
 
 def cm_declarations (item : ClippySemanticUnit) : List ScDecl :=
-    match item with | CmUnit _ _ _ _ value _ _ _ _ => value end;
+    match item with | CmUnit _ _ _ _ value _ _ _ _ _ => value end;
 
 def cm_index (item : ClippySemanticUnit) : ScIndex :=
-    match item with | CmUnit _ _ _ _ _ value _ _ _ => value end;
+    match item with | CmUnit _ _ _ _ _ value _ _ _ _ => value end;
 
 def cm_root_decls (item : ClippySemanticUnit) : List Decl :=
-    match item with | CmUnit _ _ _ _ _ _ value _ _ => value end;
+    match item with | CmUnit _ _ _ _ _ _ value _ _ _ => value end;
 
 def cm_origins (item : ClippySemanticUnit) : List CsOriginFact :=
-    match item with | CmUnit _ _ _ _ _ _ _ _ value => value end;
+    match item with | CmUnit _ _ _ _ _ _ _ _ value _ => value end;
+
+def cm_resolved_imports (item : ClippySemanticUnit) : CmResolvedImports :=
+    match item with | CmUnit _ _ _ _ _ _ _ _ _ value => value end;
+
+-- Qualified references use the compiler's alias, selected-edge and direct
+-- owner decision. An unresolved marker never falls back to a short name.
+def cm_global_name (unit : ClippySemanticUnit) (name : Nat) : Maybe Nat :=
+    let st : InternState := cm_intern unit in
+    let atom : List Nat := name_of_id st name in
+    match module_split_marker atom with
+    | Nothing => Just Nat name
+    | Just _ =>
+        match cm_resolved_imports unit with
+        | CmResolvedImportsOf aliases members =>
+          match module_field_decision (cm_units unit) (Nil ModuleExports)
+                aliases st (cm_entry unit) atom members False with
+            | ModuleAbsent => Nothing Nat
+            | ModuleAmbiguous => Nothing Nat
+            | ModuleFound resolved => Just Nat resolved
+          end
+        end
+    end;
+
+def cm_global_decl (unit : ClippySemanticUnit) (name : Nat) : Maybe ScDecl :=
+    match cm_global_name unit name with
+    | Nothing => Nothing ScDecl
+    | Just resolved => sc_lookup_global(resolved, cm_index unit)
+    end;
 
 def cm_import_stubs (ids : List Nat) : List Decl :=
     map Nat Decl (fun (id : Nat) => DImport id) ids;
@@ -529,13 +564,13 @@ def cm_load_file_cached (req : Pair String String) (intern : InternState)
 -- only for the selected file, to give the reporting process that SAME snapshot.
 def cm_load_pending (root : String) (entry : Nat) : Nat -> Nat -> List Nat -> List Nat
     -> InternState -> List SrcUnit -> List ScDecl -> String -> List Decl
-    -> CmParseCache -> List Nat -> List CsOriginFact
+    -> CmParseCache -> List Nat -> List CsOriginFact -> ImpReg
     -> IO (Either QualityInputError
         (Pair ClippySemanticUnit (Pair InternState CmParseCache))) :=
   fix go (fuel : Nat) (file_budget : Nat) (pending : List Nat) (loaded : List Nat)
       (intern : InternState) (units : List SrcUnit) (symbols : List ScDecl)
       (source : String) (root_decls : List Decl) (cache : CmParseCache)
-      (keep : List Nat) (origins : List CsOriginFact)
+      (keep : List Nat) (origins : List CsOriginFact) (root_aliases : ImpReg)
       : IO (Either QualityInputError
         (Pair ClippySemanticUnit (Pair InternState CmParseCache))) :=
     match pending with
@@ -552,11 +587,30 @@ def cm_load_pending (root : String) (entry : Nat) : Nat -> Nat -> List Nat -> Li
            | Left error => Left QualityInputError
                (Pair(ClippySemanticUnit, Pair InternState CmParseCache))
                (QualityInvalidInput (sc_error_message error))
-           | Right index => Right QualityInputError
-               (Pair(ClippySemanticUnit, Pair InternState CmParseCache))
-               (MkPair ClippySemanticUnit (Pair InternState CmParseCache)
-                 (CmUnit intern entry source units symbols index root_decls (length Nat loaded) origins)
-                 (MkPair InternState CmParseCache intern cache))
+            | Right index =>
+                let path : List Nat := prim_string_to_char_codes(cm_string intern entry) in
+                let files : List (Pair (List Nat) ImpReg) :=
+                  [MkPair (List Nat) ImpReg path root_aliases] in
+                match module_alias_units intern files with
+                | RErr code detail => Left QualityInputError
+                    (Pair(ClippySemanticUnit, Pair InternState CmParseCache))
+                    (QualityInvalidInput (prim_string_concat
+                      "compiler import aliases failed: "
+                      (prim_string_concat (prim_string_of_nat code)
+                        (prim_string_concat(" at ", prim_string_of_nat detail)))))
+                | ROk aliases =>
+                    let members : List ModuleMember := map ScDecl ModuleMember
+                      (fun (decl : ScDecl) => MkModuleMember
+                        (sc_decl_module decl) (sc_decl_name decl)
+                        (sc_decl_name decl)) symbols in
+                    Right QualityInputError
+                      (Pair(ClippySemanticUnit, Pair InternState CmParseCache))
+                      (MkPair ClippySemanticUnit (Pair InternState CmParseCache)
+                        (CmUnit intern entry source units symbols index root_decls
+                          (length Nat loaded) origins
+                          (CmResolvedImportsOf aliases members))
+                        (MkPair InternState CmParseCache intern cache))
+                end
            end
          end)
     | Cons id rest => match fuel with
@@ -565,7 +619,8 @@ def cm_load_pending (root : String) (entry : Nat) : Nat -> Nat -> List Nat -> Li
           (Left QualityInputError (Pair(ClippySemanticUnit, Pair InternState CmParseCache))
             (QualityInvalidInput "semantic source queue traversal exhausted"))
       | S remaining => match elem Nat eq_nat id loaded with
-      | True => go remaining file_budget rest loaded intern units symbols source root_decls cache keep origins
+      | True => go remaining file_budget rest loaded intern units symbols
+          source root_decls cache keep origins root_aliases
       | False => match file_budget with
         | Z => io_pure (Either QualityInputError
             (Pair(ClippySemanticUnit, Pair InternState CmParseCache)))
@@ -579,7 +634,7 @@ def cm_load_pending (root : String) (entry : Nat) : Nat -> Nat -> List Nat -> Li
             | True =>
                 go remaining file_budget rest (Cons Nat id loaded) intern
                   (Cons SrcUnit (MkSrcUnit(id, Nil Decl)) units)
-                  symbols source root_decls cache keep origins
+                  symbols source root_decls cache keep origins root_aliases
             | False =>
             do let! input := quality_read_file (quality_child root path);
                match input with
@@ -588,22 +643,22 @@ def cm_load_pending (root : String) (entry : Nat) : Nat -> Nat -> List Nat -> Li
                    (Left QualityInputError (Pair(ClippySemanticUnit, Pair InternState CmParseCache)) error)
                | Right text =>
                    match eq_nat id entry with
-                   | True => match cm_parse text intern with
+                   | True => match cm_parse_with_aliases text intern with
                      | Left error => io_pure (Either QualityInputError
                          (Pair(ClippySemanticUnit, Pair InternState CmParseCache)))
                          (Left QualityInputError (Pair(ClippySemanticUnit, Pair InternState CmParseCache))
                            (QualityInvalidInput (prim_string_concat path
                              (prim_string_concat(": ", quality_input_message error)))))
                      | Right parsed => match parsed with
-                       | MkPair decls lexed => match cm_after_parse path id True decls lexed with
-                         | MkHarvest updated file_symbols imports canonical _ =>
-                             go remaining files_remaining
-                               (append Nat imports rest) (Cons Nat id loaded)
-                               updated (Cons SrcUnit (MkSrcUnit(id, cm_import_stubs imports)) units)
-                               (append ScDecl file_symbols symbols)
-                               text canonical
-                               cache
-                               imports origins
+                       | MkPair decls metadata => match metadata with
+                         | MkPair lexed aliases => match cm_after_parse path id True decls lexed with
+                           | MkHarvest updated file_symbols imports canonical _ =>
+                               go remaining files_remaining
+                                 (append Nat imports rest) (Cons Nat id loaded)
+                                 updated (Cons SrcUnit (MkSrcUnit(id, cm_import_stubs imports)) units)
+                                 (append ScDecl file_symbols symbols)
+                                 text canonical cache imports origins aliases
+                           end
                          end
                        end
                      end
@@ -620,7 +675,8 @@ def cm_load_pending (root : String) (entry : Nat) : Nat -> Nat -> List Nat -> Li
                                (append Nat imports rest) (Cons Nat id loaded)
                                updated (Cons SrcUnit (MkSrcUnit(id, cm_import_stubs imports)) units)
                                (append ScDecl file_symbols symbols)
-                               source root_decls next_cache keep (append CsOriginFact captured origins)
+                               source root_decls next_cache keep
+                               (append CsOriginFact captured origins) root_aliases
                          end
                        end
                      end
@@ -640,7 +696,7 @@ def cm_load_cached (root : String) (relative : String) (intern : InternState)
         (prim_string_to_char_codes relative)) with
     | MkPair entry next => cm_load_pending root entry cm_load_queue_fuel cm_file_budget
         ([entry] : List Nat) (Nil Nat) next (Nil SrcUnit) (Nil ScDecl) "" (Nil Decl) cache
-        (Nil Nat) (Nil CsOriginFact)
+         (Nil Nat) (Nil CsOriginFact) empty_imp_reg
     end;
 
 def cm_load (root : String) (relative : String) : IO (Either QualityInputError ClippySemanticUnit) :=
