@@ -21,21 +21,101 @@ def st_read_text (path : String) : IO (Either String String) :=
            (Right String String text)
        end
 
+def cg_s_sample_heap (_request : Unit) (_state : Unit) : IO Nat :=
+    do let! _e := eprintln "STRICT_MEM: native heap observer is unavailable";
+       let! _x := exit 1;
+       io_pure Nat 0
+
+def st_trace_stage (label : String) (count : Nat) : IO Unit :=
+    do let! heap := cg_s_sample_heap MkUnit MkUnit;
+       eprintln (str_cat3 "STRICT_MEM_STAGE " label
+         (str_cat3 " count=" (prim_string_of_nat count)
+           (prim_string_concat " live=" (prim_string_of_nat heap))))
+
+def st_scan_defs_staged (mp : List (Pair String QrDiag)) (profile : String)
+    (path : String) (lines : List String) (code_lines : List String)
+    (acc : List QrFinding) : IO (List QrFinding) :=
+    do let! spans := io_pure (List (Pair Nat Nat)) (st_def_spans code_lines);
+       let! _s := st_trace_stage "def-spans" (length (Pair Nat Nat) spans);
+       (fix go (fuel : Nat) (xs : List (Pair Nat Nat)) (out : List QrFinding)
+           : IO (List QrFinding) :=
+         match fuel with
+         | Z => io_pure (List QrFinding) out
+         | S fuel2 => match xs with
+           | Nil => io_pure (List QrFinding) out
+           | Cons span rest => match span with
+             | MkPair start finish =>
+                 do let! next := io_pure (List QrFinding)
+                      (st_scan_def_span
+                        (StDefScanOf mp profile path lines code_lines start finish) out);
+                    let! _s := st_trace_stage
+                      (str_cat3 "def-" (prim_string_of_nat start)
+                        (prim_string_concat "-" (prim_string_of_nat finish)))
+                      (length QrFinding next);
+                    go fuel2 rest next
+             end
+           end
+         end) (add(length(Pair Nat Nat, spans), 1)) spans acc
+
+def st_scan_source_staged (mp : List (Pair String QrDiag)) (profile : String)
+    (path : String) (text : String) : IO (Either ImportScanError (List QrFinding)) :=
+    do let! lines := io_pure (List String) (qt_split_lines text);
+       let! _s1 := st_trace_stage "lines" (length String lines);
+       let! code_lines := io_pure (List String) (qt_source_code_lines text);
+       let! _s2 := st_trace_stage "code-lines" (length String code_lines);
+       let! acc0 := io_pure (List QrFinding)
+         (st_scan_literals mp profile path text lines []);
+       let! _s3 := st_trace_stage "literals" (length QrFinding acc0);
+       let! acc1 := io_pure (List QrFinding)
+         (st_scan_lines mp profile path lines code_lines acc0);
+       let! _s4 := st_trace_stage "lines-scan" (length QrFinding acc1);
+       let! imported := io_pure (Either ImportScanError (List QrFinding))
+         (st_scan_imports mp profile path text lines code_lines acc1);
+       match imported with
+       | Left error => io_pure (Either ImportScanError (List QrFinding))
+           (Left ImportScanError (List QrFinding) error)
+       | Right acc2 =>
+           do let! _s5 := st_trace_stage "imports" (length QrFinding acc2);
+              let! acc3 := st_scan_defs_staged mp profile path lines code_lines acc2;
+              let! _s6 := st_trace_stage "defs" (length QrFinding acc3);
+              let! acc4 := io_pure (List QrFinding)
+                (st_scan_suppress mp profile path text acc3);
+              let! _s7 := st_trace_stage "suppress" (length QrFinding acc4);
+              let! sorted := io_pure (List QrFinding) (qr_sort_findings acc4);
+              let! _s8 := st_trace_stage "sort" (length QrFinding sorted);
+              io_pure (Either ImportScanError (List QrFinding))
+                (Right ImportScanError (List QrFinding) sorted)
+       end
+
+def st_stage_target (path : String) : Bool :=
+    orb (prim_string_eq path "compiler/file_elab_infer.ouro")
+      (orb (prim_string_eq path "compiler/parser_file.ouro")
+        (orb (prim_string_eq path "compiler/pipeline_support.ouro")
+          (prim_string_eq path "compiler/preprocess_record_expr.ouro")));
+
 -- The host arena includes source loading and scanning; only typed results leave.
 def st_scan_request (request : Pair (List (Pair String QrDiag)) String)
     (source : Pair String String) : IO (Either String (List QrFinding)) :=
     match request, source with
     | MkPair mp profile, MkPair root path =>
         do let! loaded := st_read_text path;
-           io_pure (Either(String, List QrFinding))
-             (match loaded with
-              | Left err => Left String (List QrFinding) err
-              | Right text => match st_scan_source mp profile (qr_rel root path) text with
-                | Left error => Left String (List QrFinding)
-                    (st_import_error_message (qr_rel root path) text error)
-                | Right findings => Right String (List QrFinding) findings
-                end
-              end)
+           match loaded with
+           | Left err => io_pure (Either String (List QrFinding))
+               (Left String (List QrFinding) err)
+           | Right text =>
+               let rel : String := qr_rel root path in
+               do let! scanned := match st_stage_target rel with
+                    | True => st_scan_source_staged mp profile rel text
+                    | False => io_pure (Either ImportScanError (List QrFinding))
+                        (st_scan_source mp profile rel text)
+                    end;
+                  io_pure (Either String (List QrFinding))
+                    (match scanned with
+                     | Left error => Left String (List QrFinding)
+                         (st_import_error_message rel text error)
+                     | Right findings => Right String (List QrFinding) findings
+                     end)
+           end
     end;
 
 def st_scan_abs (mp : List (Pair String QrDiag)) (profile : String)
