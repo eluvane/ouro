@@ -126,13 +126,18 @@ is quadratic in the input length.
 
 `std/iter.ouro` provides a pure pull iterator with explicit state, item, and
 error types. `iter_from_list` wraps an existing list without building another
-list. `iter_map`, `iter_filter`, `iter_filter_map`, `iter_indexed`, and `iter_take`
-defer work until a pull. `iter_filter_map` applies a typed `A -> Maybe B`
-callback: `Nothing` skips that source item and `Just value` emits the mapped
-value. A rejected item returns a skip step, so one pull never searches an
-unbounded prefix. `iter_take` counts emitted items, not skipped source steps.
+list. `iter_map`, `iter_filter`, `iter_filter_map`, `iter_indexed`,
+`iter_drop`, and `iter_take` defer work until a pull. `iter_filter_map` applies
+a typed `A -> Maybe B` callback: `Nothing` skips that source item and
+`Just value` emits the mapped value. A rejected item returns a skip step,
+so one pull never searches an unbounded prefix. `iter_take` counts emitted
+items, not skipped source steps.
 `iter_indexed` pairs each emitted value with a zero-based index; skips leave
-that index unchanged, and source failures pass through.
+that index unchanged, and source failures pass through. `iter_drop` also counts
+emitted items: `iter_drop State Error Item n source` omits the first `n`
+values, leaves source skips out of the count, and passes failures through.
+Zero keeps all values; a count larger than a finite source yields none. Each
+source step consumes one pull from `collect_list`'s explicit budget.
 
 ```ouro
 let source : Iterator (List Nat) String Nat :=
