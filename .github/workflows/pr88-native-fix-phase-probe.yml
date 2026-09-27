@@ -1,0 +1,174 @@
+name: PR88 native fix build phase probe
+
+on:
+  push:
+    branches: [codef/pr88-native-fix-phase-probe]
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  native-fix:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      OURO_CI: "1"
+      OURO_REPRODUCIBLE: "1"
+      OURO_PACK_STRICT: "1"
+      OURO_JOBS: "2"
+      OURO_CACHE_DIR: _cache/ouro
+      OURO_BUILD_DIR: _build
+      OURO_C_BUILD_DIR: _build/c
+      OURO_CCACHE: disabled
+    steps:
+      - name: Checkout exact PR88 source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+
+      - name: Verify source snapshot
+        shell: bash
+        run: |
+          test "$(git rev-parse HEAD^)" = "83daa56fafb7aa56ffd5fa9ab687c2d867aa1ddf"
+          test "$(git diff --name-only HEAD^ HEAD)" = ".github/workflows/pr88-native-fix-phase-probe.yml"
+          test "$(git rev-parse HEAD:tools/fix/main.ouro)" = "9a31310cf6f1440d711e1ab136887b379a906311"
+          test "$(git rev-parse HEAD:scripts/native_tool_build.py)" = "0e6ebc0d0eb31f773ed8c94dcb0c1ab27285d8ce"
+          test "$(git rev-parse HEAD:scripts/ourosmith/host.py)" = "289fd1e88a7f3f0927f6ceca5b6f559ba1cd071c"
+          test "$(git rev-parse HEAD:scripts/syntax_quality_suite.py)" = "08ef733cba605e4672529c9b3a209c0501edae73"
+
+      - name: Restore the same PR cache prefix
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            _cache/ouro
+            _build/c
+          key: ouro-pr-checks-quality-${{ runner.os }}-${{ hashFiles('Ouro.seal', 'scripts/**', 'compiler/**', 'runtime/**', 'tools/**', 'tests/**', 'std/**', 'quality/smith/**', 'docs/generated_artifact_hashes.sha256') }}
+          restore-keys: |
+            ouro-pr-checks-quality-${{ runner.os }}-
+            ouro-pr-${{ runner.os }}-
+
+      - name: Download exact verified Host compiler
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: host-compiler-36334723667-1
+          run-id: 36334723667
+          github-token: ${{ github.token }}
+          path: _build/ci
+
+      - name: Verify and install Host compiler
+        shell: bash
+        run: |
+          echo "565c82bdf5c0dc9d5afab272db9b75fe800330a62c64fc0658ed9d3d9fc79e9a  _build/ci/host-compiler.tar.gz" | sha256sum -c -
+          python3 scripts/ci_gate.py --compiler-artifact import --compiler-sha256 565c82bdf5c0dc9d5afab272db9b75fe800330a62c64fc0658ed9d3d9fc79e9a
+
+      - name: Probe the unchanged native fix build
+        shell: bash
+        run: |
+          mkdir -p _build/diag-native-fix
+          python3 - <<'PY'
+          import concurrent.futures
+          import json
+          import os
+          import re
+          import sys
+          import time
+          from pathlib import Path
+
+          sys.path.insert(0, str(Path("scripts").resolve()))
+          from ourosmith import host
+
+          assert host.BUILD_TIMEOUT_S == 900
+          assert host.BUILD_MEMORY_MB == 3072
+          assert os.environ["OURO_JOBS"] == "2"
+          output = Path("_build/diag-native-fix")
+
+          def children(pid):
+              tasks = Path(f"/proc/{pid}/task")
+              found = set()
+              try:
+                  for task in tasks.iterdir():
+                      found.update(int(value) for value in (task / "children").read_text().split())
+              except (OSError, ValueError):
+                  pass
+              return found
+
+          def descendants(pid):
+              pending = list(children(pid))
+              seen = set()
+              while pending:
+                  child = pending.pop()
+                  if child in seen:
+                      continue
+                  seen.add(child)
+                  pending.extend(children(child) - seen)
+              return sorted(seen)
+
+          def process(pid):
+              try:
+                  status = (Path(f"/proc/{pid}/status")).read_text()
+                  command = (Path(f"/proc/{pid}/cmdline")).read_bytes()
+              except OSError:
+                  return None
+              def value(name):
+                  found = re.search(rf"^{name}:\s+(\d+)", status, re.MULTILINE)
+                  return int(found.group(1)) if found else 0
+              if b"native_tool_build.py" in command:
+                  phase = "builder"
+              elif b"pack_frontend.py" in command:
+                  phase = "pack"
+              elif b"ouro1" in command:
+                  phase = "emit-check" if b"tools/fix/check_main.ouro" in command else "emit-main"
+              elif re.search(rb"(?:^|\x00)[^\x00]*(?:cc1|clang|gcc|/cc|/ld)(?:\x00|$)", command):
+                  phase = "c-tool"
+              elif b"build_tool.sh" in command:
+                  phase = "shell"
+              elif b"exec_child.py" in command:
+                  phase = "limit-wrapper"
+              else:
+                  phase = "other"
+              return {"pid": pid, "ppid": value("PPid"), "phase": phase, "rss_kib": value("VmRSS")}
+
+          started = time.monotonic()
+          peak_kib = 0
+          with (output / "phases.jsonl").open("w", encoding="utf-8") as log:
+              with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                  future = pool.submit(host.prepare_entry, "tools/fix/main.ouro", "ouro-fix")
+                  while not future.done():
+                      nodes = [item for pid in descendants(os.getpid()) if (item := process(pid))]
+                      rss_kib = sum(item["rss_kib"] for item in nodes)
+                      peak_kib = max(peak_kib, rss_kib)
+                      log.write(json.dumps({"elapsed_s": round(time.monotonic() - started, 1),
+                                            "rss_kib": rss_kib, "nodes": nodes}, sort_keys=True) + "\n")
+                      log.flush()
+                      time.sleep(5)
+                  try:
+                      binary = future.result()
+                      result = {"status": "ok", "binary": binary.name}
+                  except (OSError, ValueError) as exc:
+                      detail = re.search(r"native build failed status=([a-z-]+) exit=(-?\d+)", str(exc))
+                      result = {"status": detail.group(1) if detail else type(exc).__name__,
+                                "exit": int(detail.group(2)) if detail else None}
+          result.update(elapsed_s=round(time.monotonic() - started, 1), sampled_peak_kib=peak_kib)
+          (output / "result.json").write_text(json.dumps(result, sort_keys=True) + "\n", encoding="utf-8")
+          print(json.dumps(result, sort_keys=True))
+          if result["status"] != "ok":
+              raise SystemExit(1)
+          PY
+
+      - name: Run unchanged syntax quality gate
+        shell: bash
+        run: python3 scripts/syntax_quality_suite.py
+
+      - name: Upload sanitized phase evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: pr88-native-fix-phase-evidence
+          if-no-files-found: ignore
+          retention-days: 14
+          path: |
+            _build/diag-native-fix/*.json
+            _build/diag-native-fix/*.jsonl
+            _build/syntax_quality_suite/*.json
