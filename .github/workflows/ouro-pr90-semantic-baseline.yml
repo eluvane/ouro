@@ -1,0 +1,143 @@
+name: PR 90 semantic baseline control
+
+on:
+  push:
+    branches: [codef/pr90-semantic-baseline-control]
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  pr88_semantic_control:
+    if: ${{ github.repository == 'eluvane/ouro' && github.ref == 'refs/heads/codef/pr90-semantic-baseline-control' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      OURO_CI: '1'
+      OURO_REPRODUCIBLE: '1'
+      OURO_PACK_STRICT: '1'
+      OURO_JOBS: '2'
+      OURO_CACHE_DIR: _cache/ouro
+      OURO_BUILD_DIR: _build
+      OURO_C_BUILD_DIR: ${{ github.workspace }}/_build/c
+      OURO_CCACHE: disabled
+      PR88_ARCHIVE_SHA256: 565c82bdf5c0dc9d5afab272db9b75fe800330a62c64fc0658ed9d3d9fc79e9a
+    steps:
+      - name: Checkout exact PR 88 source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: 83daa56fafb7aa56ffd5fa9ab687c2d867aa1ddf
+          persist-credentials: false
+
+      - name: Download pinned PR 88 host compiler
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: host-compiler-36334723667-1
+          run-id: 36334723667
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: _build/ci
+
+      - name: Import source-bound compiler and render unchanged positive case
+        run: |
+          set -euo pipefail
+          report=_build/ci/pr88-semantic-control
+          fixture=_build/language_ergonomics/run-pr88-control/inferred-list-local-value/main.ouro
+          mkdir -p "$report" "$(dirname "$fixture")"
+          test "$(git rev-parse HEAD)" = 83daa56fafb7aa56ffd5fa9ab687c2d867aa1ddf
+          test "$OURO_C_BUILD_DIR" = "$PWD/_build/c"
+          printf '%s  %s\n' "$PR88_ARCHIVE_SHA256" _build/ci/host-compiler.tar.gz | sha256sum -c - > "$report/archive-check.log" 2>&1
+          python3 scripts/ci_gate.py --compiler-artifact import --compiler-sha256 "$PR88_ARCHIVE_SHA256" > "$report/import.log" 2>&1
+          printf '%s  %s\n' 9e65e84b29ff427032b774bfa7f15cedc4bc14845875cf32fa0cbdda68c19e12 tests/language_ergonomics/cases.json | sha256sum -c -
+          printf '%s  %s\n' 6e21730627e5844e5990916232a15d7207dd6d4ffaad17139d7d247ff5748c1e tests/language_ergonomics/support.ouro | sha256sum -c -
+          printf '%s  %s\n' 0643682a65deb02129922709aa0a9a307ef4c8bc07242e86ad03d87ce1d6e239 scripts/ourosmith/ergonomics_inputs.py | sha256sum -c -
+          printf '%s  %s\n' cae567adc12909a660d942180378fc13c01e96881dd961f13a83f060742e249d tools/clippy/structural_rules.ouro | sha256sum -c -
+          sha256sum "$OURO_C_BUILD_DIR/ouro1" > "$report/compiler-before.sha256"
+          sha256sum tests/language_ergonomics/cases.json tests/language_ergonomics/support.ouro scripts/ourosmith/ergonomics_inputs.py tools/clippy/structural_rules.ouro compiler/parse_b.ouro > "$report/source-sha256.txt"
+          python3 - "$fixture" <<'PY'
+          import sys
+          from pathlib import Path
+          sys.path.insert(0, str(Path("scripts").resolve()))
+          from ourosmith.ergonomics_inputs import load_cases, render, support_source
+
+          path = Path(sys.argv[1])
+          case = next(case for case in load_cases()["positive"]
+                      if case["name"] == "inferred-list-local-value")
+          path.write_text(render(case, path.parent), encoding="utf-8")
+          (path.parent / "support.ouro").write_text(support_source(), encoding="utf-8")
+          PY
+          sha256sum "$fixture" "$(dirname "$fixture")/support.ouro" > "$report/fixture-original.sha256"
+          printf '%s  %s\n' 703fee96f672b5d3c81b42c7be07ffeb0960830a5e902d91eae6bef1de44dca5 "$fixture" | sha256sum -c -
+          cat "$report/import.log"
+
+      - name: Run exact positive case through fmt and semantic lint
+        run: |
+          set -euo pipefail
+          report=_build/ci/pr88-semantic-control
+          fixture=_build/language_ergonomics/run-pr88-control/inferred-list-local-value/main.ouro
+          prebuild() {
+            label=$1
+            entry=$2
+            binary=$3
+            if timeout 1200s env OURO_BUILD_TOOL_MODE=native sh scripts/build_tool.sh "$entry" "$OURO_C_BUILD_DIR/$binary" > "$report/$label-prebuild.log" 2>&1; then
+              rc=0
+            else
+              rc=$?
+            fi
+            printf '%s_prebuild_rc=%s\n' "$label" "$rc" >> "$report/status.txt"
+            test "$rc" -eq 0
+            test -x "$OURO_C_BUILD_DIR/$binary"
+          }
+          prebuild fmt tools/fmt.ouro ouro-fmt
+          prebuild lint tools/lint.ouro ouro-lint
+          run_case() {
+            label=$1
+            expected=$2
+            shift 2
+            if timeout 600s "$@" > "$report/$label.log" 2>&1; then
+              rc=0
+            else
+              rc=$?
+            fi
+            printf '%s_rc=%s\n' "$label" "$rc" >> "$report/status.txt"
+            test "$rc" -eq "$expected"
+          }
+          run_case check_initial 0 sh scripts/ouro1.sh check "$fixture" 60000
+          grep -Fx CHECK_OK "$report/check_initial.log"
+          run_case fmt_write 0 sh scripts/ouro1.sh fmt --write "$fixture"
+          sha256sum "$fixture" > "$report/fixture-formatted.sha256"
+          run_case check_formatted 0 sh scripts/ouro1.sh check "$fixture" 60000
+          grep -Fx CHECK_OK "$report/check_formatted.log"
+          run_case fmt_check 0 sh scripts/ouro1.sh fmt --check "$fixture"
+          run_case fmt_write_again 0 sh scripts/ouro1.sh fmt --write "$fixture"
+          sha256sum "$fixture" > "$report/fixture-formatted-again.sha256"
+          cmp "$report/fixture-formatted.sha256" "$report/fixture-formatted-again.sha256"
+          run_case lint_language 0 sh scripts/ouro1.sh lint --family language "$fixture"
+          run_case lint_semantic 1 sh scripts/ouro1.sh lint --family semantic "$fixture"
+          sha256sum "$OURO_C_BUILD_DIR/ouro1" > "$report/compiler-after.sha256"
+          cmp "$report/compiler-before.sha256" "$report/compiler-after.sha256"
+          python3 - "$report" <<'PY'
+          import re
+          import sys
+          from pathlib import Path
+
+          report = Path(sys.argv[1])
+          output = (report / "lint_semantic.log").read_text(encoding="utf-8")
+          warnings = [line for line in output.splitlines() if "warn[" in line]
+          assert len(warnings) == 1, warnings
+          assert re.search(r":4:49: warn\[OURO-CLIPPY-REDUNDANT-001\]", warnings[0]), warnings
+          assert "unannotated local `values` is immediately returned" in output, output
+          print("PR88_SEMANTIC_BASELINE_REPRODUCED")
+          PY
+          cat "$report/status.txt" "$report/lint_semantic.log"
+
+      - name: Upload PR 88 semantic control evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: pr88-inferred-list-semantic-control
+          path: |
+            _build/ci/pr88-semantic-control
+            _build/language_ergonomics/run-pr88-control/inferred-list-local-value/main.ouro
+          if-no-files-found: error
+          retention-days: 7
