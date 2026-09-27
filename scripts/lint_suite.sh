@@ -20,7 +20,9 @@ fi
 BIN="${OURO_C_BUILD_DIR:-_build/c}/ouro-lint"
 # The builder checks the complete source/compiler/build receipt. A short mtime
 # list misses changes to imports and build-owned Windows process metadata.
-OURO_BUILD_TOOL_MODE=native sh "$ROOT/scripts/build_tool.sh" tools/lint.ouro "$BIN"
+OURO_BUILD_TOOL_MODE=native \
+	"$PYTHON" "$ROOT/scripts/ourosmith/exec_child.py" 3072 \
+	sh "$ROOT/scripts/build_tool.sh" tools/lint.ouro "$BIN"
 
 out="${LINT_SUITE_OUT:-$ROOT/_build/tmp/lint_suite}"
 mkdir -p "$out"
