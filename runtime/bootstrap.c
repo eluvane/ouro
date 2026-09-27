@@ -4,6 +4,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+
+#ifdef __linux__
+#include <sys/resource.h>
+#endif
 
 #ifdef _WIN32
 #include <fcntl.h>
@@ -32,6 +37,27 @@ static ouro_v *find_in(const char *name, int n, const char *(*nm)(int),
 	fprintf(stderr, "ouro1: no export named %s\n", name);
 	exit(2);
 	return 0;
+}
+
+static void diag_emit_phase(const char *phase, int index, int with_live)
+{
+#ifdef __linux__
+	struct rusage usage;
+#endif
+	if (getenv("OURO_DIAG_EMIT_PHASES") == 0)
+		return;
+	fprintf(stderr, "OURO_EMIT_PHASE phase=%s index=%d wall_s=%lld cpu_s=%.3f allocated=%llu",
+		phase, index, (long long)time(0),
+		(double)clock() / (double)CLOCKS_PER_SEC,
+		ouro_heap_total_alloc_bytes());
+	if (with_live)
+		fprintf(stderr, " live=%llu", ouro_heap_live_bytes());
+#ifdef __linux__
+	if (getrusage(RUSAGE_SELF, &usage) == 0)
+		fprintf(stderr, " peak_rss_kib=%ld", usage.ru_maxrss);
+#endif
+	fputc('\n', stderr);
+	fflush(stderr);
 }
 
 
@@ -816,12 +842,14 @@ int main(int argc, char **argv)
 		return 2;
 	}
 	ouro_gc_set_stack_base(&argc);
+	diag_emit_phase("entry", nunits, 0);
 	ouro_heap_report("process-start");
 #ifdef _WIN32
 	_setmode(_fileno(stdout), _O_BINARY);
 #endif
 
 	if (nunits > 0) {
+		diag_emit_phase("compile-units-start", nunits, 0);
 		ouro_heap_report("before-unit-list");
 		fe = find_in("compile_units", ouro_export_count_fe(),
 			     ouro_export_name_fe, ouro_export_value_fe);
@@ -829,12 +857,15 @@ int main(int argc, char **argv)
 					ouro_string_codes(file)),
 			       unit_list_from(units, nunits));
 		ouro_heap_report("after-compile-units");
+		diag_emit_phase("compile-units-end", nunits, 0);
 	} else {
+		diag_emit_phase("compile-source-start", 0, 0);
 		ouro_heap_report("before-source-read");
 		fe = find_in("compile_to_cores", ouro_export_count_fe(),
 			     ouro_export_name_fe, ouro_export_value_fe);
 		res = ouro_apply(ouro_apply(fe, ouro_nat(fuel)), file_codes(file));
 		ouro_heap_report("after-compile-source");
+		diag_emit_phase("compile-source-end", 0, 0);
 	}
 
 	if (res == 0 || res->tag != 1 || res->n < 1) {
@@ -927,6 +958,7 @@ int main(int argc, char **argv)
 		int ntab = 0;
 
 		/* Retain checked metadata before dropping the frontend phase. */
+		diag_emit_phase("metadata-start", 0, 0);
 		metadata = ouro_fe_checked_type_globals(ouro_nat(fuel));
 		if (metadata == 0 || metadata->tag != 1 || metadata->n != 1) {
 			fputs("ouro1: checked type-global classification failed\n", stderr);
@@ -936,6 +968,7 @@ int main(int argc, char **argv)
 		}
 		type_ids_v = ouro_clone_perm(OURO_F(metadata, 0));
 		bindings_v = ouro_clone_perm(ouro_fe_checked_c_shims());
+		diag_emit_phase("metadata-end", 0, 0);
 		if (type_ids_v == 0 || bindings_v == 0) {
 			fputs("ouro1: clone checked metadata failed\n", stderr);
 			backend_failed = 1;
@@ -954,6 +987,7 @@ int main(int argc, char **argv)
 			goto backend_done;
 		}
 		ouro_heap_discard_phase();
+		diag_emit_phase("phase-discard-end", 0, 0);
 		ouro_heap_report("after-phase-discard");
 		fputs("ouro1: walking cores\n", stderr);
 
@@ -1072,30 +1106,47 @@ int main(int argc, char **argv)
 		val_end = find_in("c_exp_val_end", ouro_export_count_be(),
 				  ouro_export_name_be, ouro_export_value_be);
 
-		for (i = 0; i < ouro_export_count_be(); i++)
+		diag_emit_phase("exports-force-start", 0, 1);
+		for (i = 0; i < ouro_export_count_be(); i++) {
+			if ((i & 63) == 0)
+				diag_emit_phase("exports-force", i, 0);
 			(void)ouro_export_value_be(i);
+		}
+		diag_emit_phase("exports-force-end", i, 1);
+		diag_emit_phase("warmup-start", 0, 0);
 		ouro_rt_warmup();
+		diag_emit_phase("warmup-end", 0, 1);
 		fld[0] = ouro_nat(0);
 		dummy = ouro_ctor(0, 1, fld);
 		ouro_heap_mark();
 
 		fprintf(stderr, "ouro1: emit cores=%d names=%d\n", n, ntab);
 
+		diag_emit_phase("header-start", 0, 1);
 		ouro_write_codes(hdr, stdout);
+		diag_emit_phase("header-end", 0, 1);
 		for (i = 0; i < n; i++) {
+			if ((i & 255) == 0)
+				diag_emit_phase("forwards", i, 0);
 			ouro_write_codes(ouro_apply(emit_f, ids[i]), stdout);
 			ouro_heap_reset();
 		}
+		diag_emit_phase("forwards-end", n, 1);
 
 		/* Standalone-program mode: bind runtime axioms and string
 		   literals to the C host. Off by default so stage emission
 		   stays byte-identical; scripts/build_tool.sh turns it on. */
+		diag_emit_phase("shims-start", 0, 0);
 		if (getenv("OURO_EMIT_IO_SHIMS") != 0)
 			emit_runtime_shims(intern_perm, ids, n, type_ids_v, bindings_v);
+		diag_emit_phase("shims-end", 0, 1);
 
 		ouro_heap_mark();
+		diag_emit_phase("globals-start", 0, 1);
 		for (i = 0; i < n; i++) {
 			const char *nm = lookup_name(tab, ntab, as_nat(ids[i]));
+			if ((i & 255) == 0)
+				diag_emit_phase("globals", i, 0);
 			if (nm != 0 && is_fast(nm) &&
 			    !(g_ntype > 0 && is_fast_shape_mismatch(nm))) {
 				unsigned long gid = as_nat(ids[i]);
@@ -1126,7 +1177,9 @@ int main(int argc, char **argv)
 				ouro_heap_reset();
 			}
 		}
+		diag_emit_phase("globals-end", n, 1);
 
+		diag_emit_phase("export-names-start", 0, 1);
 		ouro_write_codes(count_open, stdout);
 		fwrite(mod, 1, strlen(mod), stdout);
 		ouro_write_codes(count_sig, stdout);
@@ -1136,6 +1189,8 @@ int main(int argc, char **argv)
 		fwrite(mod, 1, strlen(mod), stdout);
 		ouro_write_codes(switch_sig, stdout);
 		for (i = 0; i < n; i += 64) {
+			if ((i & 511) == 0)
+				diag_emit_phase("export-names", i, 0);
 			int count = n - i < 64 ? n - i : 64;
 			ouro_v *pieces = export_pieces_chunk(ids, i, count, dummy);
 			ouro_v *names = names_list(tab, ntab, ids + i, count);
@@ -1146,10 +1201,14 @@ int main(int argc, char **argv)
 			ouro_heap_reset();
 		}
 		ouro_write_codes(name_end, stdout);
+		diag_emit_phase("export-names-end", n, 1);
+		diag_emit_phase("export-vals-start", 0, 1);
 		ouro_write_codes(val_open, stdout);
 		fwrite(mod, 1, strlen(mod), stdout);
 		ouro_write_codes(switch_sig, stdout);
 		for (i = 0; i < n; i += 64) {
+			if ((i & 511) == 0)
+				diag_emit_phase("export-vals", i, 0);
 			int count = n - i < 64 ? n - i : 64;
 			ouro_v *pieces = export_pieces_chunk(ids, i, count, dummy);
 			ouro_v *chunk = ouro_apply(
@@ -1159,6 +1218,7 @@ int main(int argc, char **argv)
 			ouro_heap_reset();
 		}
 		ouro_write_codes(val_end, stdout);
+		diag_emit_phase("export-vals-end", n, 1);
 		ouro_gc_collect();
 		ouro_heap_report("after-backend-emit");
 	backend_done:
