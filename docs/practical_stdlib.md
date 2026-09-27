@@ -48,6 +48,21 @@ def config_port (parsed : Either String Nat)
     result_with_context String String Nat "config.port" parsed;
 ```
 
+`result_recover_if E A select recover value` checks `select : E -> Bool` only
+for `Left` errors. A selected error becomes `Right (recover error)`; an
+unselected `Left` keeps its original error. `Right` values pass through without
+calling either callback, and `recover` is not called for an unselected error.
+
+```ouro
+import "../std/result.ouro";
+import "../std/string.ouro";
+
+def recover_missing (checked : Either String Nat) : Either String Nat :=
+    result_recover_if String Nat
+      (fun (error : String) => str_eq error "missing")
+      (fun (_ : String) => 7) checked;
+```
+
 `std/collections.ouro` provides `list_traverse_maybe A B f xs` for an ordered
 list of fallible conversions. It returns `Just []` for an empty list, `Just`
 with all converted values when every call succeeds, or `Nothing` at the first
