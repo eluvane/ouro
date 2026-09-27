@@ -1,0 +1,99 @@
+name: PR87 index ascription controls (diagnostic)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [codef/pr87-index-ascription-controls]
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  index-controls:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      OURO_CI: "1"
+      OURO_REPRODUCIBLE: "1"
+      OURO_PACK_STRICT: "1"
+      OURO_JOBS: "2"
+      OURO_FRONTEND_JOBS: "1"
+      OURO_CCACHE: disabled
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+
+      - name: Verify exact product source
+        run: |
+          test "$(git rev-parse HEAD^)" = "00a1a6aed338551cb73f9c34406eb40f1debbf84"
+          test "$(git hash-object tests/language_ergonomics/cases.json)" = "24cabcc54398a996692a7f2ed05a0cfed7470015"
+          test "$(git diff-tree --no-commit-id --name-only -r HEAD)" = ".github/workflows/ouro-pr87-index-controls.yml"
+          python3 scripts/language_ergonomics_suite.py --validate-manifest
+
+      - name: Build host compiler
+        run: python3 scripts/ouro_build.py build --verbosity quiet
+
+      - name: Check exact index controls
+        run: |
+          python3 - <<'PY'
+          import json
+          import subprocess
+          from pathlib import Path
+
+          out = Path("_build/pr87-index-controls")
+          out.mkdir(parents=True, exist_ok=True)
+          support = Path("tests/language_ergonomics/support.ouro").read_text(encoding="utf-8")
+          false_eq = "ErgEq ErgNat ErgZero (ErgSucc ErgZero)"
+          value = "ErgRefl ErgNat ErgZero"
+          cases = {
+              "standalone-ascription": f"def invalid : {false_eq} := ({value} : {false_eq});",
+              "plain-let-ascription": f"def invalid : ErgNat := let value := ({value} : {false_eq}) in ErgZero;",
+              "typed-let": f"def invalid : ErgNat := let value : {false_eq} := {value} in ErgZero;",
+              "destructure-original": f"def invalid : ErgNat := let (ErgRefl) := ({value} : {false_eq}) in ErgZero;",
+          }
+          rows = []
+          for name, source in cases.items():
+              directory = out / name
+              directory.mkdir()
+              (directory / "support.ouro").write_text(support, encoding="utf-8")
+              path = directory / "main.ouro"
+              path.write_text('import "support.ouro";\n' + source + "\n", encoding="utf-8")
+              result = subprocess.run(
+                  ["sh", "scripts/ouro1.sh", "check", str(path), "60000"],
+                  capture_output=True, text=True, encoding="utf-8", errors="replace",
+                  timeout=600, check=False,
+              )
+              observed = result.stdout + result.stderr
+              (out / f"{name}.out").write_text(observed, encoding="utf-8")
+              row = {"name": name, "source": source, "exit_code": result.returncode,
+                     "stdout": result.stdout, "stderr": result.stderr}
+              rows.append(row)
+              print(f"{name}: exit={result.returncode} {observed.strip()}", flush=True)
+          (out / "report.json").write_text(
+              json.dumps({"product_head": "00a1a6aed338551cb73f9c34406eb40f1debbf84",
+                          "cases_blob": "24cabcc54398a996692a7f2ed05a0cfed7470015",
+                          "results": rows}, indent=2) + "\n", encoding="utf-8",
+          )
+          if any(row["exit_code"] not in (0, 1) or
+                 ("CHECK_OK" if row["exit_code"] == 0 else "CHECK_FAIL") not in
+                 row["stdout"] + row["stderr"] for row in rows):
+              raise SystemExit("unexpected compiler result; inspect report")
+          PY
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: pr87-index-controls
+          path: |
+            _build/pr87-index-controls/report.json
+            _build/pr87-index-controls/*.out
+          if-no-files-found: warn
+          retention-days: 7
