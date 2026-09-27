@@ -1,0 +1,177 @@
+name: PR88 frontend host build phase probe
+
+on:
+  push:
+    branches: [codef/pr88-frontend-host-phase-probe]
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  frontend-host:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      OURO_CI: "1"
+      OURO_REPRODUCIBLE: "1"
+      OURO_PACK_STRICT: "1"
+      OURO_JOBS: "2"
+      OURO_CACHE_DIR: _cache/ouro
+      OURO_BUILD_DIR: _build
+      OURO_C_BUILD_DIR: _build/c
+      OURO_CCACHE: disabled
+    steps:
+      - name: Checkout exact PR88 source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+
+      - name: Verify source snapshot
+        shell: bash
+        run: |
+          test "$(git rev-parse HEAD^)" = "83daa56fafb7aa56ffd5fa9ab687c2d867aa1ddf"
+          test "$(git diff --name-only HEAD^ HEAD)" = ".github/workflows/pr88-frontend-host-phase-probe.yml"
+          test "$(git rev-parse HEAD:scripts/frontend_host_suite.py)" = "0caab7695c6538e8d455f38802bd886b8f285a40"
+          test "$(git rev-parse HEAD:scripts/frontend_security_suite.sh)" = "d56a1d3a0770399cd3ec1489a115bb03ffe54cab"
+          test "$(git rev-parse HEAD:scripts/native_tool_build.py)" = "0e6ebc0d0eb31f773ed8c94dcb0c1ab27285d8ce"
+          test "$(git rev-parse HEAD:tools/native_build.ouro)" = "5ed3c1a3805d03eee2368013cc292b5b9522389f"
+          test "$(git rev-parse HEAD:scripts/ci_gate.py)" = "16ea86bf60a3d3347c30af2f562a6b6b500b89ef"
+
+      - name: Restore the same PR tests cache prefix
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            _cache/ouro
+            _build/c
+          key: ouro-pr-tests-${{ runner.os }}-${{ hashFiles('Ouro.seal', 'scripts/**', 'compiler/**', 'runtime/**', 'tools/**', 'tests/**', 'std/**', 'quality/smith/**', 'docs/generated_artifact_hashes.sha256') }}
+          restore-keys: |
+            ouro-pr-tests-${{ runner.os }}-
+            ouro-pr-${{ runner.os }}-
+
+      - name: Download exact verified Host compiler
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: host-compiler-36334723667-1
+          run-id: 36334723667
+          github-token: ${{ github.token }}
+          path: _build/ci
+
+      - name: Verify and install Host compiler
+        shell: bash
+        run: |
+          echo "565c82bdf5c0dc9d5afab272db9b75fe800330a62c64fc0658ed9d3d9fc79e9a  _build/ci/host-compiler.tar.gz" | sha256sum -c -
+          python3 scripts/ci_gate.py --compiler-artifact import --compiler-sha256 565c82bdf5c0dc9d5afab272db9b75fe800330a62c64fc0658ed9d3d9fc79e9a
+
+      - name: Probe unchanged frontend host suite
+        shell: bash
+        run: |
+          mkdir -p _build/diag-frontend-host
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          import re
+          import subprocess
+          import time
+          from pathlib import Path
+
+          output = Path("_build/diag-frontend-host")
+          command = ["python3", "-B", "scripts/frontend_host_suite.py", "--compiler", "_build/c/ouro1",
+                     "--out", str(output / "host"), "--jobs", "1"]
+          expected_inputs = "f1c3a0850049a9d2c4672bf13d5b522ae2a58a91ad50b9dc962a6217db5ccf05"
+
+          def children(pid):
+              found = set()
+              try:
+                  for task in Path(f"/proc/{pid}/task").iterdir():
+                      found.update(int(value) for value in (task / "children").read_text().split())
+              except (OSError, ValueError):
+                  pass
+              return found
+
+          def descendants(pid):
+              pending = [pid]
+              seen = set()
+              while pending:
+                  child = pending.pop()
+                  if child in seen:
+                      continue
+                  seen.add(child)
+                  pending.extend(children(child) - seen)
+              return sorted(seen)
+
+          def process(pid):
+              try:
+                  status = Path(f"/proc/{pid}/status").read_text()
+                  args = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+              except OSError:
+                  return None
+              def value(name):
+                  found = re.search(rf"^{name}:\s+(\d+)", status, re.MULTILINE)
+                  return int(found.group(1)) if found else 0
+              executable = os.path.basename(os.fsdecode(args[0])) if args and args[0] else ""
+              if any(arg.endswith(b"frontend_host_suite.py") for arg in args):
+                  phase = "worker" if b"--worker" in args else "suite"
+              elif any(arg.endswith(b"pack_frontend.py") for arg in args):
+                  phase = "pack"
+              elif executable == "ouro1":
+                  phase = "emit"
+              elif executable in {"cc", "gcc", "cc1", "collect2", "ld", "as"}:
+                  phase = "c-tool"
+              else:
+                  phase = "other"
+              try:
+                  cpu_count = len(os.sched_getaffinity(pid))
+              except OSError:
+                  cpu_count = None
+              return {"pid": pid, "ppid": value("PPid"), "phase": phase,
+                      "rss_kib": value("VmRSS"), "cpu_count": cpu_count}
+
+          started = time.monotonic()
+          peak_kib = 0
+          with (output / "suite.out").open("wb") as stdout, (output / "suite.err").open("wb") as stderr:
+              with subprocess.Popen(command, stdout=stdout, stderr=stderr) as suite:
+                  with (output / "phases.jsonl").open("w", encoding="utf-8") as log:
+                      while suite.poll() is None:
+                          nodes = [item for pid in descendants(suite.pid) if (item := process(pid))]
+                          rss_kib = sum(item["rss_kib"] for item in nodes)
+                          peak_kib = max(peak_kib, rss_kib)
+                          log.write(json.dumps({"elapsed_s": round(time.monotonic() - started, 1),
+                                                "rss_kib": rss_kib, "nodes": nodes}, sort_keys=True) + "\n")
+                          log.flush()
+                          time.sleep(5)
+                  returncode = suite.wait()
+
+          report_paths = list((output / "host").glob("host-*/report.json"))
+          inputs_paths = list((output / "host").glob("host-*/inputs-before.json"))
+          report = json.loads(report_paths[0].read_text()) if len(report_paths) == 1 else {}
+          inputs_hash = hashlib.sha256(inputs_paths[0].read_bytes()).hexdigest() if len(inputs_paths) == 1 else None
+          build = next((step for step in report.get("steps", []) if step.get("label") == "build"), {})
+          result = {"returncode": returncode, "elapsed_s": round(time.monotonic() - started, 1),
+                    "sampled_peak_kib": peak_kib, "build_status": build.get("status"),
+                    "build_exit": build.get("returncode"), "build_timeout_s": report.get("build_timeout_s"),
+                    "memory_mib": report.get("memory_mib"), "cpu_count": len(report.get("cpu", [])),
+                    "inputs_unchanged": report.get("inputs_unchanged"),
+                    "inputs_sha256": inputs_hash, "inputs_match_cdf": inputs_hash == expected_inputs,
+                    "suite_pass": report.get("pass")}
+          (output / "result.json").write_text(json.dumps(result, sort_keys=True) + "\n", encoding="utf-8")
+          print(json.dumps(result, sort_keys=True))
+          if report.get("build_timeout_s") != 900 or report.get("memory_mib") != 3072 or len(report.get("cpu", [])) != 1:
+              raise SystemExit(2)
+          if inputs_hash != expected_inputs:
+              raise SystemExit(3)
+          raise SystemExit(returncode)
+          PY
+
+      - name: Upload sanitized phase evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: pr88-frontend-host-phase-evidence
+          if-no-files-found: ignore
+          retention-days: 14
+          path: |
+            _build/diag-frontend-host/*.json
+            _build/diag-frontend-host/*.jsonl
