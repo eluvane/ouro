@@ -1,0 +1,132 @@
+name: PR88 absint source isolation
+
+on:
+  push:
+    branches: [codef/pr88-absint-isolation-probe]
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  absint-variants:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      OURO_CI: "1"
+      OURO_REPRODUCIBLE: "1"
+      OURO_PACK_STRICT: "1"
+      OURO_JOBS: "2"
+      OURO_CACHE_DIR: _cache/ouro
+      OURO_BUILD_DIR: _build
+      OURO_C_BUILD_DIR: _build/c
+      OURO_CCACHE: disabled
+    steps:
+      - name: Checkout exact PR88 source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+
+      - name: Verify source snapshot
+        shell: bash
+        run: |
+          test "$(git rev-parse HEAD^)" = "cdf16527513e18ab46ea3655743ca4d9ae9cf5e4"
+          test "$(git diff --name-only HEAD^ HEAD)" = ".github/workflows/pr88-absint-isolation-probe.yml"
+          test "$(git rev-parse HEAD:tests/analyze/precision/absint.ouro)" = "ec822a59a48b58f9199cec1adf822cc0d69e8d58"
+          test "$(git rev-parse HEAD:compiler/preprocess_record.ouro)" = "6df6174e456b6416fd67c40a3e61ec0ac4f0efd6"
+          test "$(git rev-parse HEAD:scripts/ouro1.sh)" = "9665ebb00049d05c097a29d77ec5083b524f9e2d"
+          test "$(git rev-parse HEAD:scripts/ci_gate.py)" = "16ea86bf60a3d3347c30af2f562a6b6b500b89ef"
+
+      - name: Download exact verified Host compiler
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: host-compiler-36323936191-1
+          run-id: 36323936191
+          github-token: ${{ github.token }}
+          path: _build/ci
+
+      - name: Verify and install Host compiler
+        shell: bash
+        run: |
+          echo "0268db29471266308e4880a04659c215c3cfecd64c036a10ac7b6b2e2bb9bd8f  _build/ci/host-compiler.tar.gz" | sha256sum -c -
+          python3 scripts/ci_gate.py --compiler-artifact import --compiler-sha256 0268db29471266308e4880a04659c215c3cfecd64c036a10ac7b6b2e2bb9bd8f
+
+      - name: Generate byte-checked diagnostic variants
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import hashlib
+
+          source_path = Path("tests/analyze/precision/absint.ouro")
+          source = source_path.read_bytes()
+          start = b'    , precision_abs_case "ABS003/bad/spread-empty-tail-is-empty" True\n'
+          adapter = b'    , MkPair String Bool "adapter/range-retains-bounds-and-mode"\n'
+          end = b'    ];\n\ndef main : IO Unit := precision_run "absint" precision_abs_cases;\n'
+          new_import = b'  "../../../tools/analyze/expr_adapt.ouro",\n'
+          assert all(source.count(marker) == 1 for marker in (start, adapter, end, new_import))
+          before, rest = source.split(start, 1)
+          cases, rest = (start + rest).split(adapter, 1)
+          adapters, after = (adapter + rest).split(end, 1)
+          suffix = end + after
+          variants = {
+              "old33": (before + suffix).replace(new_import, b""),
+              "old33_import": before + suffix,
+              "new5": before + cases + suffix,
+              "adapter2": before + adapters + suffix,
+              "full40": source,
+          }
+          expected = {
+              "old33": (33, "586d685865c2d5ee3bd4a9d0903acadf620a3ebc"),
+              "old33_import": (33, "a4df3d099035877f6604e52c0949e3d6b1d89ed3"),
+              "new5": (38, "b348414004f8b3a375d72dfb0b84c155184324f0"),
+              "adapter2": (35, "6d604160b249add81b39edd61336e1c4174fc62e"),
+              "full40": (40, "ec822a59a48b58f9199cec1adf822cc0d69e8d58"),
+          }
+          output = Path("_build/diag-absint-isolation")
+          output.mkdir(parents=True, exist_ok=True)
+          manifest = []
+          for name, data in variants.items():
+              rows = data.count(b'precision_abs_case "ABS') + data.count(b'MkPair String Bool "adapter/')
+              blob = hashlib.sha1(b"blob " + str(len(data)).encode() + b"\0" + data).hexdigest()
+              assert (rows, blob) == expected[name], name
+              path = source_path.with_name(f"absint_probe_{name}.ouro")
+              path.write_bytes(data)
+              assert path.read_bytes() == data
+              manifest.append(f"{name}\t{rows}\t{blob}\t{hashlib.sha256(data).hexdigest()}\n")
+          (output / "variants.tsv").write_text("".join(manifest), encoding="utf-8")
+          PY
+
+      - name: Check all absint variants
+        shell: bash
+        run: |
+          for variant in old33 old33_import new5 adapter2 full40; do
+            rc=0
+            sh scripts/ouro1.sh check "tests/analyze/precision/absint_probe_${variant}.ouro" 200000 \
+              > "_build/diag-absint-isolation/${variant}.out" \
+              2> "_build/diag-absint-isolation/${variant}.err" || rc=$?
+            printf '%s\n' "$rc" > "_build/diag-absint-isolation/${variant}.rc"
+            printf 'ABSINT_VARIANT %s rc=%s\n' "$variant" "$rc"
+            cat "_build/diag-absint-isolation/${variant}.err"
+          done
+          test "$(cat _build/diag-absint-isolation/full40.rc)" -ne 0
+          grep -Fq 'CErr code=64 det=1974' _build/diag-absint-isolation/full40.err
+          smaller_pass=0
+          for variant in old33 old33_import new5 adapter2; do
+            if test "$(cat "_build/diag-absint-isolation/${variant}.rc")" -eq 0 &&
+               grep -Fxq CHECK_OK "_build/diag-absint-isolation/${variant}.out" &&
+               test ! -s "_build/diag-absint-isolation/${variant}.err"; then
+              smaller_pass=1
+            fi
+          done
+          test "$smaller_pass" -eq 1
+
+      - name: Upload variant evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: pr88-absint-isolation-evidence
+          if-no-files-found: ignore
+          retention-days: 14
+          path: _build/diag-absint-isolation/
