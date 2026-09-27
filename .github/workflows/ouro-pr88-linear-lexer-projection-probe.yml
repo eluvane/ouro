@@ -1,0 +1,420 @@
+name: PR88 linear lexer and projection probe
+
+on:
+  push:
+    branches: [codef/pr88-linear-lexer-projection-probe]
+    paths: [.github/workflows/ouro-pr88-linear-lexer-projection-probe.yml]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr88-linear-lexer-projection-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  OURO_CI: "1"
+  OURO_REPRODUCIBLE: "1"
+  OURO_PACK_STRICT: "1"
+  OURO_JOBS: "2"
+
+jobs:
+  host-reviewed:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    outputs:
+      sha256: ${{ steps.bundle.outputs.sha256 }}
+      artifact: ${{ steps.bundle.outputs.artifact }}
+    steps:
+      - name: Checkout diagnostic child
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 3
+          persist-credentials: false
+      - name: Pin reviewed source and blobs
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import json, subprocess
+
+          def git(*args):
+              return subprocess.check_output(["git", *args], text=True).strip()
+
+          source = "973c3a21342e9d6e029479fb33ed7207d010c1bd"
+          parent = "a5edb6eb7263b657f1823a12cb842e1f94d6b848"
+          workflow = ".github/workflows/ouro-pr88-linear-lexer-projection-probe.yml"
+          assert git("rev-parse", "HEAD^") == source
+          assert git("diff", "--name-only", "HEAD^", "HEAD").splitlines() == [workflow]
+          subprocess.run(["git", "checkout", "--detach", source], check=True)
+          assert git("rev-parse", "HEAD^") == parent
+          assert not git("status", "--porcelain")
+          expected = {
+              "CHANGELOG.md": "90bf5a93eeb959c439452a210e6bfc482d17172e",
+              "compiler/lexer.ouro": "b73355a657c9cd09dd83d26c36eb128cfe004207",
+              "compiler/preprocess_record.ouro": "b6e825c025838490e072ce4c6f08af47d72a0307",
+              "compiler/preprocess_record_text.ouro": "4d4ebb46a8f8a8c27d319906d2cd638fa4b6e78a",
+              "docs/syntax.md": "97a2f61ccf16d730751b2cc739caf3bb99427ab5",
+              "docs/tcb.md": "725c3c038f60f5816cb1523ded225041ab093e4b",
+              "tests/compiler_driver_tests.ouro": "c318d5baf7a06dfb1dbe101e3490eb3ca2fd7db1",
+              "tests/compiler_record_text_tests.ouro": "b320d0427c5f7a957f7ea46b0d850d1d7c541f27",
+              "tests/source_span_tests.ouro": "4697a4de09b79d866da49788684293d3d0be2c98",
+              "std/listx.ouro": "6f263efb144908a4510fa3ba63841ca5298b93cf",
+              "runtime/bootstrap.c": "5272a92d85d3f693407ec1f5d0e091fe461f8018",
+          }
+          changed = set(git("diff", "--name-only", parent, source).splitlines())
+          assert changed == set(expected) - {"std/listx.ouro", "runtime/bootstrap.c"}
+          for path, blob in expected.items():
+              assert git("hash-object", path) == blob, path
+          assert git("rev-parse", parent + ":compiler/lexer.ouro") == "f2dedd9389d372ff99d21ae33b41b06393062671"
+          out = Path("_build/probe")
+          out.mkdir(parents=True, exist_ok=True)
+          (out / "source.json").write_text(json.dumps({"source": source, "parent": parent,
+              "blobs": expected, "old_lexer": "f2dedd9389d372ff99d21ae33b41b06393062671"}, indent=2) + "\n")
+          print("PROBE_SOURCE: PASS reviewed source, parent and blobs")
+          PY
+      - name: Build fresh reviewed Host with unchanged bootstrap verification
+        run: |
+          command -v cc || command -v gcc
+          /usr/bin/time -v -o _build/probe/host-time.txt \
+            python3 scripts/ouro_build.py build --verbosity quiet \
+            > _build/probe/host.stdout 2> _build/probe/host.stderr
+      - name: Export source-bound compiler and bootstrap evidence
+        id: bundle
+        run: |
+          python3 scripts/ci_gate.py --compiler-artifact export >> "$GITHUB_OUTPUT"
+          echo "artifact=host-reviewed-${{ github.run_id }}-${{ github.run_attempt }}" >> "$GITHUB_OUTPUT"
+      - name: Upload verified Host
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ steps.bundle.outputs.artifact }}
+          path: _build/ci/host-compiler.tar.gz
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 14
+      - name: Upload Host reports
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: host-reviewed-reports-${{ github.run_id }}-${{ github.run_attempt }}
+          if-no-files-found: error
+          retention-days: 14
+          path: |
+            _build/**/*.json
+            _build/**/*.log
+            _build/**/*.out
+            _build/**/*.err
+            _build/**/*.stdout
+            _build/**/*.stderr
+            _build/**/*.txt
+            _build/**/*.sarif
+            _build/**/*.md
+
+  focused:
+    needs: host-reviewed
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        group: [compiler-14, compiler-16, tests, checks-quality, analysis]
+    steps:
+      - name: Checkout diagnostic child
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 3
+          persist-credentials: false
+      - name: Pin reviewed source and blobs
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import json, subprocess
+
+          def git(*args):
+              return subprocess.check_output(["git", *args], text=True).strip()
+
+          source = "973c3a21342e9d6e029479fb33ed7207d010c1bd"
+          parent = "a5edb6eb7263b657f1823a12cb842e1f94d6b848"
+          workflow = ".github/workflows/ouro-pr88-linear-lexer-projection-probe.yml"
+          assert git("rev-parse", "HEAD^") == source
+          assert git("diff", "--name-only", "HEAD^", "HEAD").splitlines() == [workflow]
+          subprocess.run(["git", "checkout", "--detach", source], check=True)
+          assert git("rev-parse", "HEAD^") == parent
+          assert not git("status", "--porcelain")
+          expected = {
+              "CHANGELOG.md": "90bf5a93eeb959c439452a210e6bfc482d17172e",
+              "compiler/lexer.ouro": "b73355a657c9cd09dd83d26c36eb128cfe004207",
+              "compiler/preprocess_record.ouro": "b6e825c025838490e072ce4c6f08af47d72a0307",
+              "compiler/preprocess_record_text.ouro": "4d4ebb46a8f8a8c27d319906d2cd638fa4b6e78a",
+              "docs/syntax.md": "97a2f61ccf16d730751b2cc739caf3bb99427ab5",
+              "docs/tcb.md": "725c3c038f60f5816cb1523ded225041ab093e4b",
+              "tests/compiler_driver_tests.ouro": "c318d5baf7a06dfb1dbe101e3490eb3ca2fd7db1",
+              "tests/compiler_record_text_tests.ouro": "b320d0427c5f7a957f7ea46b0d850d1d7c541f27",
+              "tests/source_span_tests.ouro": "4697a4de09b79d866da49788684293d3d0be2c98",
+              "std/listx.ouro": "6f263efb144908a4510fa3ba63841ca5298b93cf",
+              "runtime/bootstrap.c": "5272a92d85d3f693407ec1f5d0e091fe461f8018",
+          }
+          changed = set(git("diff", "--name-only", parent, source).splitlines())
+          assert changed == set(expected) - {"std/listx.ouro", "runtime/bootstrap.c"}
+          for path, blob in expected.items():
+              assert git("hash-object", path) == blob, path
+          assert git("rev-parse", parent + ":compiler/lexer.ouro") == "f2dedd9389d372ff99d21ae33b41b06393062671"
+          out = Path("_build/probe")
+          out.mkdir(parents=True, exist_ok=True)
+          (out / "source.json").write_text(json.dumps({"source": source, "parent": parent,
+              "blobs": expected, "old_lexer": "f2dedd9389d372ff99d21ae33b41b06393062671"}, indent=2) + "\n")
+          print("PROBE_SOURCE: PASS reviewed source, parent and blobs")
+          PY
+      - name: Download reviewed Host
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ needs.host-reviewed.outputs.artifact }}
+          path: _build/ci
+      - name: Verify source, binary, host toolchain and bootstrap receipt
+        env:
+          COMPILER_SHA256: ${{ needs.host-reviewed.outputs.sha256 }}
+        run: python3 scripts/ci_gate.py --compiler-artifact import --compiler-sha256 "$COMPILER_SHA256"
+      - name: Run unchanged PR group
+        env:
+          CI_GROUP: ${{ matrix.group }}
+        run: |
+          command -v cc || command -v gcc
+          /usr/bin/time -v -o "_build/probe/$CI_GROUP-time.txt" \
+            python3 scripts/ci_gate.py --profile pr --group "$CI_GROUP" \
+              --fail-fast --out "_build/ci/pr-$CI_GROUP" \
+            > "_build/probe/$CI_GROUP.stdout" 2> "_build/probe/$CI_GROUP.stderr"
+      - name: Require actual frontend PASS at unchanged limits
+        if: ${{ success() && matrix.group == 'tests' }}
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import json
+          report = json.loads(Path("_build/frontend_security/host/frontend-host.json").read_text())
+          assert report["pass"] is True and report["inputs_unchanged"] is True
+          assert report["workers"] == 1 and report["memory_mib"] == 3072
+          assert report["build_timeout_s"] == 900
+          build = next(row for row in report["steps"] if row["label"] == "build")
+          assert build["status"] == "ok" and build["returncode"] == 0
+          print("FRONTEND_LIMITS: PASS actual suite verdict, 900s / 3072MiB / one worker")
+          PY
+      - name: Require strict-quality memory PASS at unchanged budget
+        if: ${{ success() && matrix.group == 'analysis' }}
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import json
+          report = json.loads(Path("_build/memory/memory-report.json").read_text())
+          row = next(case for case in report["cases"] if case["label"] == "strict-quality-gate")
+          assert report["pass"] is True and row["suite_status"] == "pass"
+          assert row["budget_kb"] == 1024000 and row["peak_rss_kb"] <= row["budget_kb"]
+          print("STRICT_MEMORY: PASS actual blocking case, unchanged 1024000KiB budget")
+          PY
+      - name: Retain complete reviewed source-span stdout
+        if: ${{ success() && matrix.group == 'compiler-16' }}
+        run: |
+          test -s _build/compiler_check_suite_16/source_spans.out
+          test -f _build/compiler_check_suite_16/source_spans.err
+          mkdir -p _build/lexer-parity
+          cp _build/compiler_check_suite_16/source_spans.out _build/lexer-parity/reviewed.out
+          cp _build/compiler_check_suite_16/source_spans.err _build/lexer-parity/reviewed.err
+          grep -Fx 'PRECISION_OK tokens/eof-preserves-order-payloads-and-intern-state' _build/lexer-parity/reviewed.out
+      - name: Upload reviewed lexer parity
+        if: ${{ success() && matrix.group == 'compiler-16' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: lexer-reviewed-${{ github.run_id }}-${{ github.run_attempt }}
+          path: _build/lexer-parity
+          if-no-files-found: error
+          retention-days: 14
+      - name: Upload focused gate reports
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: focused-${{ matrix.group }}-${{ github.run_id }}-${{ github.run_attempt }}
+          if-no-files-found: error
+          retention-days: 14
+          path: |
+            _build/**/*.json
+            _build/**/*.log
+            _build/**/*.out
+            _build/**/*.err
+            _build/**/*.stdout
+            _build/**/*.stderr
+            _build/**/*.txt
+            _build/**/*.sarif
+            _build/**/*.md
+
+  old-lexer-control:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout diagnostic child
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 3
+          persist-credentials: false
+      - name: Pin reviewed source and blobs
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import json, subprocess
+
+          def git(*args):
+              return subprocess.check_output(["git", *args], text=True).strip()
+
+          source = "973c3a21342e9d6e029479fb33ed7207d010c1bd"
+          parent = "a5edb6eb7263b657f1823a12cb842e1f94d6b848"
+          workflow = ".github/workflows/ouro-pr88-linear-lexer-projection-probe.yml"
+          assert git("rev-parse", "HEAD^") == source
+          assert git("diff", "--name-only", "HEAD^", "HEAD").splitlines() == [workflow]
+          subprocess.run(["git", "checkout", "--detach", source], check=True)
+          assert git("rev-parse", "HEAD^") == parent
+          assert not git("status", "--porcelain")
+          expected = {
+              "CHANGELOG.md": "90bf5a93eeb959c439452a210e6bfc482d17172e",
+              "compiler/lexer.ouro": "b73355a657c9cd09dd83d26c36eb128cfe004207",
+              "compiler/preprocess_record.ouro": "b6e825c025838490e072ce4c6f08af47d72a0307",
+              "compiler/preprocess_record_text.ouro": "4d4ebb46a8f8a8c27d319906d2cd638fa4b6e78a",
+              "docs/syntax.md": "97a2f61ccf16d730751b2cc739caf3bb99427ab5",
+              "docs/tcb.md": "725c3c038f60f5816cb1523ded225041ab093e4b",
+              "tests/compiler_driver_tests.ouro": "c318d5baf7a06dfb1dbe101e3490eb3ca2fd7db1",
+              "tests/compiler_record_text_tests.ouro": "b320d0427c5f7a957f7ea46b0d850d1d7c541f27",
+              "tests/source_span_tests.ouro": "4697a4de09b79d866da49788684293d3d0be2c98",
+              "std/listx.ouro": "6f263efb144908a4510fa3ba63841ca5298b93cf",
+              "runtime/bootstrap.c": "5272a92d85d3f693407ec1f5d0e091fe461f8018",
+          }
+          changed = set(git("diff", "--name-only", parent, source).splitlines())
+          assert changed == set(expected) - {"std/listx.ouro", "runtime/bootstrap.c"}
+          for path, blob in expected.items():
+              assert git("hash-object", path) == blob, path
+          assert git("rev-parse", parent + ":compiler/lexer.ouro") == "f2dedd9389d372ff99d21ae33b41b06393062671"
+          out = Path("_build/probe")
+          out.mkdir(parents=True, exist_ok=True)
+          (out / "source.json").write_text(json.dumps({"source": source, "parent": parent,
+              "blobs": expected, "old_lexer": "f2dedd9389d372ff99d21ae33b41b06393062671"}, indent=2) + "\n")
+          print("PROBE_SOURCE: PASS reviewed source, parent and blobs")
+          PY
+      - name: Restore only the reviewed baseline lexer in throwaway checkout
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import json, subprocess
+          old = "f2dedd9389d372ff99d21ae33b41b06393062671"
+          path = Path("compiler/lexer.ouro")
+          path.write_bytes(subprocess.check_output(["git", "cat-file", "blob", old]))
+          assert subprocess.check_output(["git", "hash-object", str(path)], text=True).strip() == old
+          assert subprocess.check_output(["git", "diff", "--name-only"], text=True).splitlines() == [str(path)]
+          assert not subprocess.check_output(["git", "ls-files", "--others", "--exclude-standard"], text=True)
+          report = Path("_build/probe/source.json")
+          data = json.loads(report.read_text())
+          data["variant"] = "old-lexer-only"
+          data["blobs"][str(path)] = old
+          report.write_text(json.dumps(data, indent=2) + "\n")
+          print("OLD_LEXER: PASS only baseline lexer restored; same test source")
+          PY
+      - name: Build fresh old-lexer Host with unchanged bootstrap verification
+        run: |
+          command -v cc || command -v gcc
+          /usr/bin/time -v -o _build/probe/host-time.txt \
+            python3 scripts/ouro_build.py build --verbosity quiet \
+            > _build/probe/host.stdout 2> _build/probe/host.stderr
+      - name: Export and verify old-source Host receipt
+        id: bundle
+        run: |
+          python3 scripts/ci_gate.py --compiler-artifact export > _build/probe/bundle.env
+          cat _build/probe/bundle.env >> "$GITHUB_OUTPUT"
+          sha=$(sed -n 's/^sha256=//p' _build/probe/bundle.env)
+          python3 scripts/ci_gate.py --compiler-artifact import --compiler-sha256 "$sha"
+      - name: Check build and run the same source-span suite under old lexer
+        run: |
+          /usr/bin/time -v -o _build/probe/compiler-16-time.txt \
+            python3 scripts/ci_gate.py --profile pr --group compiler-16 --fail-fast \
+              --out _build/ci/pr-compiler-16 \
+            > _build/probe/compiler-16.stdout 2> _build/probe/compiler-16.stderr
+          test -s _build/compiler_check_suite_16/source_spans.out
+          test -f _build/compiler_check_suite_16/source_spans.err
+          mkdir -p _build/lexer-parity
+          cp _build/compiler_check_suite_16/source_spans.out _build/lexer-parity/old.out
+          cp _build/compiler_check_suite_16/source_spans.err _build/lexer-parity/old.err
+          grep -Fx 'PRECISION_OK tokens/eof-preserves-order-payloads-and-intern-state' _build/lexer-parity/old.out
+      - name: Upload old lexer parity
+        if: success()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: lexer-old-${{ github.run_id }}-${{ github.run_attempt }}
+          path: _build/lexer-parity
+          if-no-files-found: error
+          retention-days: 14
+      - name: Upload verified old-lexer Host
+        if: ${{ success() || steps.bundle.outcome == 'success' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: host-old-${{ github.run_id }}-${{ github.run_attempt }}
+          path: _build/ci/host-compiler.tar.gz
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 14
+      - name: Upload old-source reports
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: old-lexer-reports-${{ github.run_id }}-${{ github.run_attempt }}
+          if-no-files-found: error
+          retention-days: 14
+          path: |
+            _build/**/*.json
+            _build/**/*.log
+            _build/**/*.out
+            _build/**/*.err
+            _build/**/*.stdout
+            _build/**/*.stderr
+            _build/**/*.txt
+            _build/**/*.sarif
+            _build/**/*.md
+
+  compare-token-parity:
+    if: ${{ always() && !cancelled() }}
+    needs: [focused, old-lexer-control]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Download reviewed stdout
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: lexer-reviewed-${{ github.run_id }}-${{ github.run_attempt }}
+          path: parity
+      - name: Download old-lexer stdout
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: lexer-old-${{ github.run_id }}-${{ github.run_attempt }}
+          path: parity
+      - name: Compare exact complete stdout and reject stderr findings
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import hashlib, json
+          current = Path("parity/reviewed.out").read_bytes()
+          old = Path("parity/old.out").read_bytes()
+          assert current and current == old, "source-span stdout differs"
+          assert not Path("parity/reviewed.err").read_bytes()
+          assert not Path("parity/old.err").read_bytes()
+          assert b"PRECISION_FAIL" not in current
+          assert b"PRECISION_OK tokens/eof-preserves-order-payloads-and-intern-state\n" in current
+          assert b"PRECISION_SUITE source-spans rows=" in current
+          result = {"pass": True, "source": "973c3a21342e9d6e029479fb33ed7207d010c1bd",
+                    "old_lexer": "f2dedd9389d372ff99d21ae33b41b06393062671",
+                    "stdout_sha256": hashlib.sha256(current).hexdigest(), "bytes": len(current)}
+          Path("parity/comparison.json").write_text(json.dumps(result, indent=2) + "\n")
+          print("TOKEN_PARITY: PASS exact source-span stdout and empty stderr")
+          PY
+      - name: Upload parity evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: token-parity-${{ github.run_id }}-${{ github.run_attempt }}
+          path: parity
+          if-no-files-found: error
+          retention-days: 14
