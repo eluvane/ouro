@@ -20,6 +20,7 @@ def result_err (E : Type) (A : Type) (e : E) : Either E A
 
 ```
 def result_fold (E : Type) (A : Type) (B : Type) (on_err : E -> B)
+    (on_ok : A -> B) (r : Either E A) : B
 ```
 
 ## def result_is_ok
@@ -38,24 +39,28 @@ def result_is_err (E : Type) (A : Type) (r : Either E A) : Bool
 
 ```
 def result_map (E : Type) (A : Type) (B : Type) (f : A -> B)
+    (r : Either E A) : Either E B
 ```
 
 ## def result_map_err
 
 ```
 def result_map_err (E : Type) (F : Type) (A : Type) (f : E -> F)
+    (r : Either E A) : Either F A
 ```
 
 ## def result_bind
 
 ```
 def result_bind (E : Type) (A : Type) (B : Type) (r : Either E A)
+    (k : A -> Either E B) : Either E B
 ```
 
 ## def result_and_then
 
 ```
 def result_and_then (E : Type) (A : Type) (B : Type)
+    (k : A -> Either E B) (r : Either E A) : Either E B
 ```
 
 ## def result_or
@@ -68,12 +73,14 @@ def result_or (E : Type) (A : Type) (fallback : A) (r : Either E A) : A
 
 ```
 def result_or_else (E : Type) (A : Type) (r : Either E A)
+    (fallback : E -> Either E A) : Either E A
 ```
 
 ## def result_unwrap_or
 
 ```
 def result_unwrap_or (E : Type) (A : Type) (fallback : A)
+    (r : Either E A) : A
 ```
 
 ## def result_to_maybe
@@ -86,12 +93,14 @@ def result_to_maybe (E : Type) (A : Type) (r : Either E A) : Maybe A
 
 ```
 def result_from_maybe (E : Type) (A : Type) (e : E) (m : Maybe A)
+    : Either E A
 ```
 
 ## def result_map2
 
 ```
 def result_map2 (E : Type) (A : Type) (B : Type) (C : Type)
+    (f : A -> B -> C) (ra : Either E A) (rb : Either E B) : Either E C
 ```
 
 ## def result_require

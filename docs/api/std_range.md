@@ -44,6 +44,7 @@ def nat_range_inclusive (start : Nat) (stop : Nat) : NatRange
 
 ```
 def nat_range_by (step : Nat) (range : NatRange)
+    : Either NatRangeError NatRange
 ```
 
 ## def nat_range_at_stop
@@ -70,10 +71,13 @@ Compare the step with the remaining distance before subtracting. This prevents N
 
 ```
 def nat_range_pull (cursor : NatRangeCursor)
+    : IterStep NatRangeCursor NatRangeError Nat
 ```
 
 ## def iter_from_nat_range
 
 ```
 def iter_from_nat_range (range : NatRange)
+    : Either NatRangeError
+        (Iterator NatRangeCursor NatRangeError Nat)
 ```

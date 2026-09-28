@@ -52,6 +52,7 @@ Preserve loaded spelling and every byte; only empty/NUL paths are rejected.
 
 ```
 def executable_path_released (result : Either ExecutablePathError String) (released : Bool)
+    : Either ExecutablePathError String
 ```
 
 A release failure never becomes Right, even after a successful query.
