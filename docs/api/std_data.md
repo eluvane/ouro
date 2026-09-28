@@ -2,7 +2,7 @@
 
 Small shared data types and list helpers that the compiler cones are allowed to import.
 
-Declarations: 15.
+Declarations: 16.
 
 ## def maybe
 
@@ -23,6 +23,14 @@ def fromMaybe (A : Type) (d : A) (m : Maybe A) : A
 ```
 def mapMaybe (A : Type) (B : Type) (f : A -> B) (m : Maybe A) : Maybe B
 ```
+
+## def maybe_bind
+
+```
+def maybe_bind (A : Type) (B : Type) (m : Maybe A) (k : A -> Maybe B) : Maybe B
+```
+
+Continue only when a Maybe contains a value.
 
 ## def either
 
