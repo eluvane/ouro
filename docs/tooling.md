@@ -138,9 +138,9 @@ exits 1 with `path: no .ouro files` and does not write. Missing paths report
 `path: no such file`; other valid roots are processed and the command exits 1.
 
 The formatter normalizes line endings, tabs, trailing whitespace, match-arm
-spacing, and the final newline. It is intentionally a conservative text
-formatter rather than a complete AST pretty-printer, so it preserves comments
-and hand-aligned continuation lines.
+spacing, spaces around `|>`, and the final newline. It is intentionally a
+conservative text formatter rather than a complete AST pretty-printer, so it
+preserves comments and hand-aligned continuation lines.
 Unknown options, conflicting write/check modes and mixed file/selftest modes
 exit `2` before reading or changing source files.
 
