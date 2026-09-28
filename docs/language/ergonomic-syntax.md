@@ -429,15 +429,13 @@ names scope over the expression after `in`, or the rest of the block after `;`;
 they are unavailable in the subject and after the expression. Blocks retain
 their mandatory final expression and cannot sequence standalone actions.
 
-The current match lowerer uses the subject family as its result hint when an
-unannotated local value has no expected result type. If the destructuring body
-returns another type, put it in an expected context, for example an explicitly
-typed definition or `let selected : Nat := let (MkPair left right) := pair in left
-in selected`. An unannotated `let selected := ...` in that situation is rejected.
-For parameterized families, the current matcher obtains family arguments from a
-typed local subject. Bind a direct constructor to a typed local first, for
-example `let pair : Pair Nat Nat := MkPair Nat Nat Z Z in let (MkPair left right)
-:= pair in left`. This is the same restriction as the corresponding `match`.
+The existing bidirectional elaborator obtains family parameters from the
+checked subject and infers an unannotated match result from a constructor
+branch when that result does not depend on constructor fields. A fully
+applied constructor such as `MkPair Nat Nat Z Z` can be used directly.
+If the result remains ambiguous, put the destructuring body in an expected
+context, such as an explicitly typed definition or
+`let selected : Nat := let (MkPair left right) := pair in left in selected`.
 Nested patterns, alternatives, guards, and a partial-match fallback are not
 provided by this form.
 
