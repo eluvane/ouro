@@ -746,9 +746,9 @@ uses `let!` for an action's result, and uses ordinary `let` for a pure value:
 
 ```ouro
 def echo : IO Unit :=
-  do let label : String := "Name: ";
+  do let! line := readLine;
+     let label : String := "Name: ";
      print label;
-     let! line := readLine;
      println line
 ```
 
