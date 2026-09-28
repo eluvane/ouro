@@ -1,139 +1,306 @@
-name: Manual
+name: Targeted cold native diagnostics
 
 on:
   workflow_dispatch:
-    inputs:
-      profile:
-        description: Local CI profile to run
-        required: true
-        type: choice
-        default: manual
-        options:
-          - manual
-          - kernel
-          - stage-loop
-      disable_cache:
-        description: Disable Ouro build caches for this run
-        required: true
-        type: boolean
-        default: false
 
 permissions:
   contents: read
+  actions: read
 
 concurrency:
-  group: ouro-manual-trust-${{ github.ref }}-${{ inputs.profile }}
+  group: ouro-targeted-cold-native-${{ github.ref }}
   cancel-in-progress: false
 
 defaults:
   run:
     shell: bash
 
-jobs:
-  groups:
-    name: Select groups
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    outputs:
-      matrix: ${{ steps.groups.outputs.matrix }}
-    steps:
-      - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - name: Select complete profile inventory
-        id: groups
-        env:
-          PROFILE: ${{ inputs.profile }}
-        run: |
-          matrix=$(python3 scripts/ci_gate.py --profile "$PROFILE" --list-groups)
-          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+env:
+  OURO_CI: "1"
+  OURO_REPRODUCIBLE: "1"
+  OURO_PACK_STRICT: "1"
+  OURO_JOBS: "1"
+  OURO_FRONTEND_JOBS: "1"
+  OURO_CACHE: "1"
+  OURO_CCACHE: disabled
+  OURO_BUILD_DIR: _build
+  OURO_C_BUILD_DIR: _build/c
+  OURO_CACHE_DIR: _cache/ouro
+  PYTHONDONTWRITEBYTECODE: "1"
+  PYTHONUNBUFFERED: "1"
 
-  manual-validation:
-    name: ${{ inputs.profile }} (${{ matrix.group }})
-    needs: groups
+jobs:
+  targeted-native:
+    name: ${{ matrix.case }}
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
-        group: ${{ fromJSON(needs.groups.outputs.matrix) }}
-    permissions:
-      contents: read
-    env:
-      OURO_CI: "1"
-      OURO_REPRODUCIBLE: "1"
-      OURO_PACK_STRICT: "1"
-      OURO_JOBS: "10"
-      OURO_CACHE_DIR: _cache/ouro
-      OURO_BUILD_DIR: _build
-      OURO_C_BUILD_DIR: _build/c
-      OURO_CCACHE: disabled
-      OURO_STAGE_MAX: "3"
+        case: [lint-cold-graph, analyzer-fresh]
     steps:
-      - name: Checkout
+      - name: Checkout diagnostic child
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-
-      - name: Restore cache
-        if: ${{ !inputs.disable_cache }}
-        id: ouro-cache
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: |
-            _cache/ouro
-            _build/c
-            _build/stage_loop
-          key: ouro-manual-${{ runner.os }}-${{ inputs.profile }}-${{ matrix.group }}-${{ hashFiles('Ouro.seal', 'scripts/**', 'compiler/**', 'runtime/**', 'tools/**', 'tests/**', 'std/**', 'quality/smith/**', 'docs/generated_artifact_hashes.sha256') }}
-          restore-keys: |
-            ouro-manual-${{ runner.os }}-${{ inputs.profile }}-
-            ouro-manual-${{ runner.os }}-
-
-      - name: Disable cache
-        if: ${{ inputs.disable_cache }}
-        run: echo "OURO_CACHE=0" >> "$GITHUB_ENV"
-
-      - name: Show toolchain
+          fetch-depth: 2
+      - name: Verify source and diagnostic-only scope
         run: |
-          python3 --version
-          python3 -m pip install --disable-pip-version-check --quiet ruff==0.15.21
-          if ! command -v shellcheck >/dev/null 2>&1; then
-            sudo apt-get update
-            sudo apt-get install -y shellcheck
-          fi
-          shellcheck --version
-          cc --version || true
-
-      - name: Build host compiler
-        run: python3 scripts/ouro_build.py build --verbosity quiet
-
-      - name: Run profile
-        run: python3 scripts/ci_gate.py --profile "${{ inputs.profile }}" --group "${{ matrix.group }}" --out "_build/ci/${{ inputs.profile }}-${{ matrix.group }}"
-
-      - name: Save cache
-        if: ${{ !inputs.disable_cache && github.event_name != 'pull_request' && steps.ouro-cache.outputs.cache-hit != 'true' }}
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+          set -euo pipefail
+          test "$(git rev-parse HEAD^)" = caae7349c607e4028523e0347da011e276cfd34c
+          git diff --check HEAD^ HEAD
+          git diff --name-only HEAD^ HEAD > /tmp/targeted-paths.txt
+          test "$(cat /tmp/targeted-paths.txt)" = .github/workflows/ouro-manual-trust.yml
+          test -z "$(git status --porcelain --untracked-files=no)"
+          mkdir -p _build/ci
+      - name: Verify original canonical producer metadata
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh api repos/eluvane/ouro/actions/runs/36448849876 > _build/ci/targeted-run.json
+          gh api repos/eluvane/ouro/actions/jobs/109018152320 > _build/ci/targeted-producer.json
+          gh api repos/eluvane/ouro/actions/artifacts/10984119017 > _build/ci/targeted-artifact.json
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          root = Path('_build/ci')
+          run, job, artifact = [json.loads((root / name).read_bytes()) for name in
+                               ('targeted-run.json', 'targeted-producer.json', 'targeted-artifact.json')]
+          source = '894531def7e111b9c8a4022cab0a3386806bcfbf'
+          assert run['id'] == 36448849876 and run['head_sha'] == source and run['run_attempt'] == 1
+          assert job['id'] == 109018152320 and job['run_id'] == run['id']
+          assert job['name'] == 'Host compiler' and job['head_sha'] == source and job['conclusion'] == 'success'
+          assert artifact['id'] == 10984119017 and artifact['name'] == 'host-compiler-36448849876-1'
+          assert not artifact['expired'] and artifact['workflow_run']['id'] == run['id']
+          assert artifact['workflow_run']['head_sha'] == source
+          assert artifact['digest'] == 'sha256:fa5464ca725f3db14c048a25c5d7641e6411c3bd1f1e629bac39d52f0e589966'
+          assert artifact['size_in_bytes'] == 5782235
+          PY
+      - name: Download original verified Host bundle
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          path: |
-            _cache/ouro
-            _build/c
-            _build/stage_loop
-          key: ${{ steps.ouro-cache.outputs.cache-primary-key }}
+          name: host-compiler-36448849876-1
+          run-id: 36448849876
+          repository: eluvane/ouro
+          github-token: ${{ github.token }}
+          path: _build/ci
+      - name: Import using unchanged canonical verifier
+        run: |
+          set -euo pipefail
+          python3 scripts/ci_gate.py --compiler-artifact import --compiler-sha256 25b9ff9372072b90b1e0ef71652beb5248b03beb6488c7ce2df4f529f9cd59d6 | tee _build/ci/import.log
+          grep -Fx 'CI_COMPILER: PASS current source, host compiler, binary and bootstrap evidence' _build/ci/import.log
+      - name: Write temporary observational worker
+        run: |
+          set -euo pipefail
+          cat > _build/ci/native-phase-probe.py <<'PY'
+          import argparse
+          from dataclasses import asdict
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import shutil
+          import subprocess
+          import sys
+          import time
 
-      - name: Upload reports
+          ROOT = Path.cwd().resolve()
+          sys.path.insert(0, str(ROOT / 'scripts'))
+          import bootstrap_compiler
+          import native_tool_build as native
+          import ouro_build
+          from ourosmith.host import environment
+          from ourosmith.limits import run_limited
+          from repo_support import hash_json
+
+          SOURCE = 'caae7349c607e4028523e0347da011e276cfd34c'
+          COMPILER = '8c48e373e22bc72b14697d20b634f9ec25ece95a2862d5830de82b824abfba6b'
+          LINUX_KEY = '7da6bd7bf3ff6ff90248e4f34916c60143e54fa8e10ff9d4f87e7bacb10ec9d2'
+          REPORT = '721d9de8f3cf3734cff538d38bb356c11bca3343ba8a8e09fc031181d83209ee'
+          INPUTS = 'f64b1dd36473e1b82db67c449a4b812abf9fd1c2eab974324dddba9364ea95f0'
+          ERRORS = '44ef9d783ebb92d4a239603a9eaa58aa658b40ea7761450017154321e87ed125'
+          ENTRIES = {'lint-cold-graph': 'tools/lint.ouro', 'analyzer-fresh': 'tools/analyze/drive_main.ouro'}
+
+
+          def sha(path):
+              return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+          def phase(event, name, entry, started, **extra):
+              print(json.dumps({'kind': 'ouro.native-phase.v1', 'event': event, 'phase': name,
+                                'entry': entry, 'monotonic_s': time.monotonic(),
+                                'elapsed_s': time.monotonic() - started, **extra}), flush=True)
+
+
+          def worker(case, compiler, output, build_dir, cache_dir):
+              stack = []
+
+              def observe(original, name, entry_of):
+                  def measured(*args, **kwargs):
+                      entry = entry_of(args, kwargs)
+                      started = time.monotonic()
+                      phase('begin', name, entry, started)
+                      if name == 'build_tool':
+                          stack.append(entry)
+                      try:
+                          result = original(*args, **kwargs)
+                      except BaseException as exc:
+                          phase('end', name, entry, started, outcome='exception', error_type=type(exc).__name__)
+                          raise
+                      else:
+                          phase('end', name, entry, started, outcome='returned')
+                          return result
+                      finally:
+                          if name == 'build_tool':
+                              assert stack.pop() == entry
+                  return measured
+
+              native.build_tool = observe(native.build_tool, 'build_tool', lambda args, _kwargs: args[0].entry)
+              native.emit = observe(native.emit, 'emit', lambda _args, _kwargs: stack[-1])
+              native.build.build_c_executable = observe(native.build.build_c_executable, 'build_c_executable',
+                                                      lambda _args, _kwargs: stack[-1])
+              return native.main([ENTRIES[case], str(output), '--compiler', str(compiler), '--fuel', '60000',
+                                  '--jobs', '1', '--ccache', 'disabled', '--build-dir', str(build_dir),
+                                  '--cache-dir', str(cache_dir)])
+
+
+          def main():
+              parser = argparse.ArgumentParser()
+              parser.add_argument('case', choices=ENTRIES)
+              parser.add_argument('--worker', action='store_true')
+              args = parser.parse_args()
+              out = ROOT / '_build/triage-native' / args.case
+              compiler, receipt = out / 'c/ouro1', out / 'c/ouro1.bootstrap.json'
+              output = out / 'c' / ('ouro-lint' if args.case == 'lint-cold-graph' else 'ouro-analyze-drive')
+              if args.worker:
+                  return worker(args.case, compiler, output, out / 'b', out / 'k')
+
+              source = subprocess.check_output(['git', 'rev-parse', 'HEAD^'], cwd=ROOT, text=True).strip()
+              assert source == SOURCE
+              assert sha(ROOT / 'tools/analyze/errors.ouro') == ERRORS
+              assert os.name == 'posix' and sys.platform == 'linux'
+              cfg = ouro_build.load_config(argparse.Namespace())
+              selected = bootstrap_compiler.current_inputs(ROOT, cfg, ouro_build)
+              assert hash_json(selected) == LINUX_KEY and len(selected['sources']) == 180
+              original = ROOT / '_build/c/ouro1'
+              original_receipt = original.with_name('ouro1.bootstrap.json')
+              assert sha(original) == COMPILER
+              assert bootstrap_compiler.installed_current(original, original_receipt, selected)
+              work = Path(json.loads(original_receipt.read_bytes())['work'])
+              assert sha(work / 'report.json') == REPORT and sha(work / 'inputs.json') == INPUTS
+              out.mkdir(parents=True, exist_ok=True)
+              for name in ('b', 'c', 'k'):
+                  assert not (out / name).exists()
+                  (out / name).mkdir()
+              shutil.copy2(original, compiler)
+              shutil.copy2(original_receipt, receipt)
+              assert sha(compiler) == COMPILER and sha(receipt) == sha(original_receipt)
+              assert bootstrap_compiler.installed_current(compiler, receipt, selected)
+              for name in ('report.json', 'inputs.json'):
+                  shutil.copyfile(work / name, out / ('producer-' + name))
+              (out / 'current-inputs.json').write_text(json.dumps(selected, indent=2) + '\n', encoding='utf-8')
+              os.environ.update(OURO_BUILD_DIR=str(out / 'b'), OURO_C_BUILD_DIR=str(out / 'c'),
+                                OURO_CACHE_DIR=str(out / 'k'))
+              env = environment(build=True, jobs=1)
+              env['PYTHONUNBUFFERED'] = '1'
+              command = [sys.executable, '-u', '-B', str(Path(__file__).resolve()), args.case, '--worker']
+              result = run_limited(command, cwd=ROOT, env=env, timeout_s=900, memory_mb=3072)
+              (out / 'build.stdout').write_text(result.stdout, encoding='utf-8')
+              (out / 'build.stderr').write_text(result.stderr, encoding='utf-8')
+              print(result.stdout, end='', flush=True)
+              print(result.stderr, end='', file=sys.stderr, flush=True)
+              tools = []
+              tools_current = False
+              tool_error = None
+              if result.ok:
+                  saved_env = dict(os.environ)
+                  try:
+                      os.environ.clear()
+                      os.environ.update(env)
+                      cfg = ouro_build.load_config(argparse.Namespace())
+                      expected = {}
+
+                      def collect(entry, target):
+                          if target in expected:
+                              assert expected[target] == entry, str(target)
+                              return
+                          expected[target] = entry
+                          for companion, name in native.tool_companions(entry):
+                              collect(companion, target.parent / name)
+
+                      collect(ENTRIES[args.case], output)
+                      assert len(expected) == (4 if args.case == 'lint-cold-graph' else 1)
+                      for target, entry in expected.items():
+                          _units, inputs = native.tool_inputs(entry, compiler, 60000, cfg)
+                          key = hash_json(inputs)
+                          tool_receipt = Path(str(target) + '.build.json')
+                          metadata = json.loads(tool_receipt.read_bytes())
+                          assert target.read_bytes()[:4] == b'\x7fELF', str(target)
+                          assert metadata['kind'] == native.KIND and metadata['key'] == key, str(target)
+                          assert metadata['inputs'] == inputs, str(target)
+                          assert native.complete_binary(target, tool_receipt, key), str(target)
+                          assert Path(str(target) + '.sources').read_text() == '\n'.join(inputs['sources']) + '\n'
+                          tools.append({'entry': entry, 'output': str(target), 'key': key,
+                                        'binary_sha256': sha(target), 'receipt_sha256': sha(tool_receipt),
+                                        'current_inputs_equal': True, 'complete_binary': True})
+                      tools_current = True
+                  except (OSError, RuntimeError, ValueError, KeyError, TypeError, AssertionError,
+                          subprocess.CalledProcessError) as exc:
+                      tool_error = f'{type(exc).__name__}: {exc}'
+                      print('NATIVE_TOOL_PROOF: FAIL ' + tool_error, file=sys.stderr, flush=True)
+                  finally:
+                      os.environ.clear()
+                      os.environ.update(saved_env)
+              proof = {'kind': 'ouro.targeted-native-diagnostic.v1', 'source': source, 'case': args.case,
+                       'entry': ENTRIES[args.case], 'compiler_sha256': COMPILER, 'linux_key': LINUX_KEY,
+                       'receipt_sha256': sha(receipt), 'producer_report_sha256': REPORT,
+                       'producer_inputs_sha256': INPUTS, 'limits': {'timeout_s': 900, 'memory_mib': 3072,
+                       'jobs': 1, 'fuel': 60000}, 'command': command, 'result': asdict(result),
+                       'cold_graph': True, 'external_cache_restored_or_saved': False,
+                       'runtime': 'NOT_RUN', 'precision_suite': 'NOT_RUN', 'pass': False,
+                       'tools': tools, 'tools_current': tools_current, 'tool_validation_error': tool_error}
+              proof['result']['stdout'] = 'build.stdout'
+              proof['result']['stderr'] = 'build.stderr'
+              proof['current_unchanged'] = bootstrap_compiler.current_unchanged(ROOT, selected)
+              proof['installed_current'] = bootstrap_compiler.installed_current(compiler, receipt, selected)
+              proof['binary_unchanged'] = sha(compiler) == sha(original) == COMPILER
+              proof['receipt_unchanged'] = sha(receipt) == sha(original_receipt)
+              proof['source_errors_unchanged'] = sha(ROOT / 'tools/analyze/errors.ouro') == ERRORS
+              proof['pass'] = result.ok and tools_current and all(proof[k] for k in ('current_unchanged', 'installed_current',
+                                                'binary_unchanged', 'receipt_unchanged', 'source_errors_unchanged'))
+              (out / 'proof.json').write_text(json.dumps(proof, indent=2) + '\n', encoding='utf-8')
+              print(json.dumps({'case': args.case, 'pass': proof['pass'], 'resource': result.classify(),
+                                'returncode': result.returncode, 'elapsed_s': result.elapsed_s,
+                                'peak_rss_mb': result.peak_rss_mb, 'coverage': 'native build only'}), flush=True)
+              return int(not proof['pass'])
+
+
+          if __name__ == '__main__':
+              raise SystemExit(main())
+          PY
+      - name: Run one whole cold graph under stock deadline
+        run: |
+          set -euo pipefail
+          python3 -u -B _build/ci/native-phase-probe.py "${{ matrix.case }}"
+      - name: Verify tracked source stayed unchanged
+        if: always()
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD^)" = caae7349c607e4028523e0347da011e276cfd34c
+          test -z "$(git status --porcelain --untracked-files=no)"
+      - name: Upload small diagnostic evidence
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: manual-${{ inputs.profile }}-${{ matrix.group }}
-          if-no-files-found: ignore
-          retention-days: 30
+          name: targeted-native-${{ matrix.case }}-${{ github.run_id }}-${{ github.run_attempt }}
+          retention-days: 14
+          if-no-files-found: warn
           path: |
-            _build/**/*.json
-            _build/**/*.log
-            _build/**/*.out
-            _build/**/*.txt
-            _build/**/*.err
-            _build/**/*.sarif
-            _build/**/*.md
-            _build/**/gate.log
+            _build/ci/targeted-*.json
+            _build/ci/import.log
+            _build/triage-native/**/*.json
+            _build/triage-native/**/*.stdout
+            _build/triage-native/**/*.stderr
+            _build/triage-native/**/*.sources
+            _build/triage-native/**/emit.*.err
