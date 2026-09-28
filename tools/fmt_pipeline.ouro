@@ -23,10 +23,239 @@ def fmt_codes (src : List Nat) : List Nat :=
       (map(List Nat, List Nat, fmt_line, splitOnLF body))))
       ([chLF]);
 
+-- Only flat comma calls whose arguments and closing paren already occupy
+-- separate lines own their leading indentation. In particular, declaration
+-- binders and nested groups keep their existing layout.
+inductive FmtCall : Type :=
+  | MkFmtCall : List Nat -> Nat -> List FxTok -> FmtCall;
+
+def fmt_line_for (lines : List String) (t : FxTok) : String :=
+    nth String "" (sub(fx_tok_line t, S Z)) lines;
+
+def fmt_call_line_start (lines : List String) (t : FxTok) : Bool :=
+    let line : String := fmt_line_for lines t in
+    andb (fx_tok_bol t)
+      (andb (notb (str_contains(fx_tok_text t, "\n")))
+        (str_eq(str_slice line Z (fx_tok_col t),
+          str_pad_left "" (fx_tok_col t) chSpace)));
+
+def fmt_call_open_end (lines : List String) (t : FxTok) : Bool :=
+    let line : String := fmt_line_for lines t in
+    str_eq(str_slice line (fx_tok_col t)
+      (sub(str_len line, fx_tok_col t)), "(");
+
+def fmt_call_close_end (lines : List String) (t : FxTok) : Bool :=
+    let line : String := fmt_line_for lines t in
+    let after : String := str_slice line (S (fx_tok_col t))
+      (sub(str_len line, S (fx_tok_col t))) in
+    orb(str_null after, str_eq after ";");
+
+def fmt_call_decl_head (t : FxTok) : Bool :=
+    mem String str_eq (fx_tok_text t)
+      (["def", "fix", "fun", "let", "axiom", "intrinsic", "extern",
+        "effect", "record", "inductive", "representation", "import",
+        "open", "match", "do", "handle", "end", "if", "then", "else",
+        "where"] : List String);
+
+def fmt_call_head (lines : List String) (before : FxTok)
+    (name : FxTok) (opening : FxTok) : Bool :=
+    match fx_is_word opening "(" with
+    | False => False
+    | True => match andb (fx_is_ident name)
+        (notb (fmt_call_decl_head before)) with
+      | False => False
+      | True => fmt_call_open_end lines opening
+      end
+    end;
+
+def fmt_call_other_group (t : FxTok) : Bool :=
+    orb(fx_is_word t "(", orb(fx_is_word t "[",
+      orb(fx_is_word t "{", orb(fx_is_word t "]",
+        fx_is_word t "}"))));
+
+-- The lexer omits comments but retains token lines. Every argument must fit
+-- on one line; comment-only lines between arguments are left untouched.
+def fmt_call_rows (lines : List String) (after : List FxTok)
+    (open_line : Nat) : Maybe FmtCall :=
+  (fix go (tokens : List FxTok) (boundary : Nat) (current : Maybe Nat)
+      (rows : List Nat) (comma_seen : Bool) : Maybe FmtCall :=
+    match tokens with
+    | Nil => Nothing FmtCall
+    | Cons t rest =>
+        match fx_is_word t ")" with
+        | True =>
+            let last_line : Nat :=
+              match current with
+              | Nothing => boundary
+              | Just line => line
+              end in
+            let all_rows : List Nat :=
+              match current with
+              | Nothing => rows
+              | Just line => Cons Nat line rows
+              end in
+            match andb comma_seen
+                (andb (ltb_nat(last_line, fx_tok_line t))
+                  (andb (fmt_call_line_start lines t)
+                    (fmt_call_close_end lines t))) with
+            | True => Just(FmtCall,
+                MkFmtCall (reverse Nat all_rows) (fx_tok_line t) rest)
+            | False => Nothing FmtCall
+            end
+        | False =>
+            match fmt_call_other_group t with
+            | True => Nothing FmtCall
+            | False =>
+                match fx_is_word t "," with
+                | True =>
+                    match current with
+                    | Nothing => Nothing FmtCall
+                    | Just line =>
+                        match eq_nat(fx_tok_line t, line) with
+                        | True => go rest line (Nothing Nat)
+                            (Cons Nat line rows) True
+                        | False => Nothing FmtCall
+                        end
+                    end
+                | False =>
+                    match str_contains(fx_tok_text t, "\n") with
+                    | True => Nothing FmtCall
+                    | False =>
+                        match current with
+                        | Nothing =>
+                            match andb (ltb_nat(boundary, fx_tok_line t))
+                                (andb (notb (fmt_call_decl_head t))
+                                  (fmt_call_line_start lines t)) with
+                            | True => go rest boundary (Just Nat (fx_tok_line t))
+                                rows comma_seen
+                            | False => Nothing FmtCall
+                            end
+                        | Just line =>
+                            match eq_nat(fx_tok_line t, line) with
+                            | True => go rest boundary current rows comma_seen
+                            | False => Nothing FmtCall
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end) after open_line (Nothing Nat) (Nil Nat) False;
+
+def fmt_call_closer (t : FxTok) : Maybe String :=
+    match fx_is_word t "(" with
+    | True => Just(String, ")")
+    | False =>
+        match fx_is_word t "[" with
+        | True => Just(String, "]")
+        | False =>
+            match fx_is_word t "{" with
+            | True => Just(String, "}")
+            | False => Nothing String
+            end
+        end
+    end;
+
+def fmt_call_is_close (t : FxTok) : Bool :=
+    orb(fx_is_word t ")", orb(fx_is_word t "]", fx_is_word t "}"));
+
+def fmt_call_stack (t : FxTok) (stack : List String)
+    : Maybe (List String) :=
+    match fmt_call_closer t with
+    | Just close => Just(List String, Cons String close stack)
+    | Nothing =>
+        match fmt_call_is_close t with
+        | False => Just(List String, stack)
+        | True =>
+            match stack with
+            | Nil => Nothing (List String)
+            | Cons close rest =>
+                match fx_is_word t close with
+                | True => Just(List String, rest)
+                | False => Nothing (List String)
+                end
+            end
+        end
+    end;
+
+def fmt_call_row_edits (rows : List Nat) (indent : Nat)
+    : List (Pair Nat Nat) :=
+    map Nat (Pair Nat Nat)
+      (fun (line : Nat) => MkPair Nat Nat line indent) rows;
+
+def fmt_call_edits (lines : List String) (tokens : List FxTok)
+    : List (Pair Nat Nat) :=
+  (fix scan (fuel : Nat) (rest : List FxTok) (before : FxTok) (previous : FxTok)
+      (stack : List String) : List (Pair Nat Nat) :=
+    match fuel with
+    | Z => Nil (Pair Nat Nat)
+    | S fuel2 =>
+      match rest with
+      | Nil => Nil (Pair Nat Nat)
+      | Cons t tail =>
+        let call : Maybe FmtCall :=
+          match stack with
+          | Nil =>
+              match fmt_call_head lines before previous t with
+              | True => fmt_call_rows lines tail (fx_tok_line t)
+              | False => Nothing FmtCall
+              end
+          | Cons _ _ => Nothing FmtCall
+          end in
+        match call with
+        | Just found =>
+            match found with
+            | MkFmtCall rows closing remaining =>
+                let indent : Nat :=
+                  leadSpaces (str_codes (fmt_line_for lines t)) in
+                append (Pair Nat Nat)
+                  (append (Pair Nat Nat)
+                    (fmt_call_row_edits rows (add indent 2))
+                    [MkPair Nat Nat closing indent])
+                  (scan fuel2 remaining fx_no_tok fx_no_tok (Nil String))
+            end
+        | Nothing =>
+            match fmt_call_stack t stack with
+            | Nothing => Nil (Pair Nat Nat)
+            | Just next =>
+                scan fuel2 tail previous t next
+            end
+        end
+      end
+    end) (S (length FxTok tokens)) tokens fx_no_tok fx_no_tok (Nil String);
+
+def fmt_call_indent_line (edits : List (Pair Nat Nat))
+    (line_no : Nat) (line : String) : String :=
+    match lookup Nat Nat eq_nat line_no edits with
+    | Nothing => line
+    | Just desired =>
+        let old : Nat := leadSpaces (str_codes line) in
+        str_concat (str_pad_left "" desired chSpace)
+          (str_slice line old (sub(str_len line, old)))
+    end;
+
+def fmt_call_indent_lines (edits : List (Pair Nat Nat))
+    : List String -> Nat -> List String :=
+  fix go (lines : List String) (line_no : Nat) : List String :=
+    match lines with
+    | Nil => Nil String
+    | Cons line rest =>
+        Cons String (fmt_call_indent_line edits line_no line)
+          (go rest (S line_no))
+    end;
+
 -- Candidate generation is kept pure for golden tests. Production writers
 -- must use fmt_checked, including the final normalization in ouro-fix.
 def fmt_string (s : String) : String :=
-    str_of_codes (fmt_codes (str_codes s));
+    let base : String := str_of_codes (fmt_codes (str_codes s)) in
+    match str_contains base "(\n" with
+    | False => base
+    | True =>
+        let lines : List String := str_lines base in
+        str_join "\n"
+          (fmt_call_indent_lines (fmt_call_edits lines (fx_lex base))
+            lines (S Z))
+    end;
 
 inductive FmtError : Type :=
   | FmtTokenChange : FmtError
