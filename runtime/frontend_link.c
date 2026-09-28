@@ -563,6 +563,55 @@ static ouro_v *closed_preprocess_src(void)
 	return fn;
 }
 
+/* Disposable emit-only tracing: counters and heap reads never retain Ouro values. */
+static int g_fe_stitch_trace;
+static unsigned long long g_fe_lower_calls;
+static unsigned long long g_fe_compile_calls;
+static unsigned long long g_fe_elaborate_surfaces_calls;
+static unsigned long long g_fe_elaborate_calls;
+static unsigned long long g_fe_check_calls;
+
+static void fe_stitch_trace_start(void)
+{
+	const char *memory = getenv("OURO_MEM_TRACE");
+	const char *stitch = getenv("OURO_FE_STITCH_TRACE");
+	const char *emit = getenv("OURO_EMIT_IO_SHIMS");
+	g_fe_stitch_trace = memory != 0 && strcmp(memory, "1") == 0 &&
+		stitch != 0 && strcmp(stitch, "1") == 0 &&
+		emit != 0 && strcmp(emit, "1") == 0;
+	g_fe_lower_calls = 0;
+	g_fe_compile_calls = 0;
+	g_fe_elaborate_surfaces_calls = 0;
+	g_fe_elaborate_calls = 0;
+	g_fe_check_calls = 0;
+}
+
+static void fe_stitch_marker(const char *label, unsigned long long index)
+{
+	if (!g_fe_stitch_trace)
+		return;
+	fprintf(stderr,
+		"OURO_FE_STITCH label=%s index=%llu live_bytes=%llu total_alloc_bytes=%llu reclaimed_bytes=%llu lower_calls=%llu compile_calls=%llu elaborate_surfaces_calls=%llu elaborate_calls=%llu check_calls=%llu\n",
+		label, index, ouro_heap_live_bytes(), ouro_heap_total_alloc_bytes(),
+		ouro_heap_reclaimed_bytes(), g_fe_lower_calls, g_fe_compile_calls,
+		g_fe_elaborate_surfaces_calls, g_fe_elaborate_calls, g_fe_check_calls);
+	fflush(stderr);
+}
+
+static unsigned long long fe_stitch_sample(const char *label,
+		unsigned long long *count, unsigned long long stride)
+{
+	unsigned long long index;
+	if (!g_fe_stitch_trace)
+		return 0;
+	index = ++*count;
+	if (index == 1 || index % stride == 0) {
+		fe_stitch_marker(label, index);
+		return index;
+	}
+	return 0;
+}
+
 /* These non-reentrant seams share one lifetime protocol. Arguments and the
    caller's stack predate the mark; only the callee's temporaries are reclaimed.
    The selected clone operation preserves the data needed after the reset. */
@@ -618,9 +667,13 @@ static ouro_v *closed_parse_unit(void)
    recursion inside lower_expr_env2 stays in the generated lowerer. */
 static ouro_v *bounded_lower_expr(ouro_env *env, ouro_v *expr)
 {
-	return bounded_call(FIND(lo, "lower_expr_env2"), 3,
+	unsigned long long sample = fe_stitch_sample("lower-begin", &g_fe_lower_calls, 512);
+	ouro_v *result = bounded_call(FIND(lo, "lower_expr_env2"), 3,
 		(ouro_v *[]){ouro_get(env, 1), ouro_get(env, 0), expr},
 		ouro_clone_perm_deep);
+	if (sample != 0)
+		fe_stitch_marker("lower-end", sample);
+	return result;
 }
 
 static ouro_v *bounded_lower_expected(ouro_env *env, ouro_v *expected)
@@ -639,15 +692,25 @@ static ouro_v *bounded_lower_environment(ouro_env *env, ouro_v *lower_env)
    so each mark belongs to one complete, non-reentrant pure pass. */
 static ouro_v *bounded_compile_program(ouro_env *env, ouro_v *surfaces)
 {
+	unsigned long long sample = fe_stitch_sample("compile-begin", &g_fe_compile_calls, 1);
+	ouro_v *result;
 	(void)env;
-	return bounded_call(FIND(co, "compile_program"), 1,
+	result = bounded_call(FIND(co, "compile_program"), 1,
 		(ouro_v *[]){surfaces}, ouro_clone_perm);
+	if (sample != 0)
+		fe_stitch_marker("compile-end", sample);
+	return result;
 }
 
 static ouro_v *bounded_elaborate_surfaces(ouro_env *env, ouro_v *surfaces)
 {
-	return bounded_call(FIND(el, "elaborate_surfaces"), 2,
+	unsigned long long sample = fe_stitch_sample("elaborate-surfaces-begin",
+		&g_fe_elaborate_surfaces_calls, 1);
+	ouro_v *result = bounded_call(FIND(el, "elaborate_surfaces"), 2,
 		(ouro_v *[]){ouro_get(env, 0), surfaces}, ouro_clone_perm);
+	if (sample != 0)
+		fe_stitch_marker("elaborate-surfaces-end", sample);
+	return result;
 }
 
 static ouro_v *bounded_elaborate_surfaces_fuel(ouro_env *env, ouro_v *fuel)
@@ -658,8 +721,12 @@ static ouro_v *bounded_elaborate_surfaces_fuel(ouro_env *env, ouro_v *fuel)
 
 static ouro_v *bounded_elaborate_context(ouro_env *env, ouro_v *names)
 {
-	return bounded_call(FIND(el, "elaborate_fuel"), 3,
+	unsigned long long sample = fe_stitch_sample("elaborate-begin", &g_fe_elaborate_calls, 128);
+	ouro_v *result = bounded_call(FIND(el, "elaborate_fuel"), 3,
 		(ouro_v *[]){ouro_get(env, 1), ouro_get(env, 0), names}, ouro_clone_perm);
+	if (sample != 0)
+		fe_stitch_marker("elaborate-end", sample);
+	return result;
 }
 
 static ouro_v *bounded_elaborate_surface(ouro_env *env, ouro_v *surface)
@@ -681,9 +748,13 @@ static ouro_v *bounded_elaborate_fuel(ouro_env *env, ouro_v *fuel)
    re-entered by check_indexed_declaration's recursive term checks. */
 static ouro_v *bounded_check_item(ouro_env *env, ouro_v *item)
 {
-	return bounded_call(FIND(fc, "check_indexed_declaration"), 4,
+	unsigned long long sample = fe_stitch_sample("check-begin", &g_fe_check_calls, 64);
+	ouro_v *result = bounded_call(FIND(fc, "check_indexed_declaration"), 4,
 		(ouro_v *[]){ouro_get(env, 2), ouro_get(env, 1), ouro_get(env, 0), item},
 		ouro_clone_perm);
+	if (sample != 0)
+		fe_stitch_marker("check-end", sample);
+	return result;
 }
 
 static ouro_v *bounded_check_signature(ouro_env *env, ouro_v *sig)
@@ -991,6 +1062,7 @@ static ouro_v *compile_checked_units_impl(ouro_v *fuel, ouro_v *root, ouro_v *fi
 	ouro_v *resolve_fn = 0;
 	ouro_v *falseb;
 
+	fe_stitch_trace_start();
 	/* Survivors are ouro_clone_perm_deep (static share only). Mid-cone
 	   discard_phase then drops the parse/preprocess bump. Host prims
 	   from ouro_fast live in the static heap so eqNat survives. */
@@ -1052,13 +1124,21 @@ static ouro_v *compile_checked_units_impl(ouro_v *fuel, ouro_v *root, ouro_v *fi
 	ouro_perm_reset_bank(1);
 	fe_phase_done("frontend-after-resolve-imports");
 
+	fe_stitch_marker("binding-begin", 0);
 	fn = closed_compile_from_decls();
+	fe_stitch_marker("binding-end", 0);
 	ouro_perm_select(1);
+	fe_stitch_marker("apply-begin", 0);
 	r = ouro_apply(ouro_apply(ouro_apply(ouro_apply(fn, selected), fuel), st2), ds);
+	fe_stitch_marker("apply-end", 0);
 	/* Only generic lowering failures need source hints. Preserve the checked
 	   result across the same lifetime seam before calling the Ouro remapper. */
+	fe_stitch_marker("result-clone-begin", 0);
 	r = ouro_clone_perm_deep(r);
+	fe_stitch_marker("result-clone-end", 0);
+	fe_stitch_marker("discard-begin", 0);
 	fe_phase_done("frontend-after-check-decls");
+	fe_stitch_marker("discard-end", 0);
 	falseb = ouro_ctor(1, 0, 0);
 	r = ouro_apply(ouro_apply(ouro_apply(closed_remap_comp_files(), falseb), files1), r);
 	g_last_intern = st2;
