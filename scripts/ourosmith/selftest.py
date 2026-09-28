@@ -378,6 +378,58 @@ class HarnessTests(unittest.TestCase):
         self.assertIn("-- final comment\ndef ergo_expansion_candidate", lint)
         self.assertEqual(lint.count("def setup : ErgNat"), 1)
 
+    def test_inline_character_equivalence_retains_both_values_and_equality(self):
+        from ourosmith.ergonomics_inputs import load_cases, render
+
+        cases = load_cases()["positive"]
+        selected = {case["name"]: case for case in cases if case.get("inline_equivalence")}
+        self.assertEqual(set(selected), {"character-four-byte", "character-scalar-boundary"})
+        expected = {"character-four-byte": ("'😀'", "128512"),
+                    "character-scalar-boundary": ("'\\u{10FFFF}'", "1114111")}
+        for name, (sugar, canonical) in expected.items():
+            case = selected[name]
+            self.assertEqual((case["type"], case["sugar"], case["canonical"]),
+                             ("Nat", sugar, canonical))
+            source = render(case, Path("fixture"))
+            self.assertIn(f"def ergo_expansion_candidate : (Nat) := {sugar};\n", source)
+            self.assertIn(f"def ergo_expansion_reference : (Nat) := {canonical};\n", source)
+            self.assertIn(f"def ergo_expansion_law : ErgEq (Nat) ({sugar}) ({canonical}) "
+                          f":= ErgRefl (Nat) ({canonical});\n", source)
+        ordinary = render({"type": "Nat", "sugar": "1", "canonical": "1"}, Path("fixture"))
+        self.assertIn("ErgEq (Nat) ergo_expansion_candidate ergo_expansion_reference "
+                      ":= ErgRefl (Nat) ergo_expansion_reference;", ordinary)
+
+    def test_inline_equivalence_rejects_invalid_flags_and_pointwise_cases(self):
+        from ourosmith.ergonomics_inputs import load_cases, render
+
+        positive = {"name": "positive", "type": "Nat", "sugar": "1", "canonical": "1"}
+        negative = {"name": "negative", "source": "def invalid : Nat := missing;"}
+        invalid = [dict(positive, inline_equivalence=flag) for flag in (None, 0, 1, "true")]
+        invalid.append(dict(positive, inline_equivalence=True, law_type="Nat", law_args="0"))
+        for case in invalid:
+            with self.subTest(case=case), self.assertRaises(ValueError):
+                render(case, Path("fixture"))
+            with patch("ourosmith.ergonomics_inputs.json.loads",
+                       return_value={"positive": [case], "negative": [negative]}), self.assertRaises(ValueError):
+                load_cases()
+        with patch("ourosmith.ergonomics_inputs.json.loads",
+                   return_value={"positive": [positive],
+                                 "negative": [dict(negative, inline_equivalence=False)]}), self.assertRaises(ValueError):
+            load_cases()
+        self.assertEqual(render(positive, Path("fixture")),
+                         render(dict(positive, inline_equivalence=False), Path("fixture")))
+
+    def test_character_runtime_oracle_uses_the_same_wide_values(self):
+        from ourosmith.ergonomics_inputs import load_cases
+
+        source = (ROOT / "tests/character_equivalence_runtime.ouro").read_text(encoding="utf-8")
+        names = {"character-four-byte": "four_byte", "character-scalar-boundary": "maximum"}
+        for case in load_cases()["positive"]:
+            if case["name"] in names:
+                name = names[case["name"]]
+                self.assertIn(f"def character_runtime_{name}_candidate : Nat := {case['sugar']};", source)
+                self.assertIn(f"def character_runtime_{name}_reference : Nat := {case['canonical']};", source)
+
     def test_current_record_update_mapping_keeps_archived_rejection(self):
         from ourosmith.migration import current_record_update_categories, legacy_categories
 

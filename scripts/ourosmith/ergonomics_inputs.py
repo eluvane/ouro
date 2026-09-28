@@ -39,6 +39,10 @@ def load_cases():
             if "law_type" in case and (group != "positive" or any(
                     not isinstance(case[key], str) or not case[key] for key in ("law_type", "law_args"))):
                 raise ValueError("invalid pointwise equivalence: " + name)
+            if "inline_equivalence" in case:
+                if group != "positive":
+                    raise ValueError("inline equivalence requires a positive case: " + name)
+                inline_equivalence(case)
             if "diagnostic" in case and (group != "negative" or not isinstance(case["diagnostic"], str)
                                          or not case["diagnostic"]):
                 raise ValueError("invalid rejection diagnostic: " + name)
@@ -57,6 +61,13 @@ def load_cases():
                 if path.is_absolute() or ".." in path.parts or not module.startswith("std/"):
                     raise ValueError("non-stdlib fixture import: " + module)
     return manifest
+
+
+def inline_equivalence(case):
+    selected = case.get("inline_equivalence", False)
+    if not isinstance(selected, bool) or (selected and ("law_type" in case or "law_args" in case)):
+        raise ValueError("invalid inline equivalence: " + case.get("name", "unnamed"))
+    return selected
 
 
 def support_source():
@@ -81,6 +92,10 @@ def render(case, directory):
                  if "law_args" in case else "ergo_expansion_candidate")
     reference = ("(ergo_expansion_reference " + case["law_args"] + ")"
                  if "law_args" in case else "ergo_expansion_reference")
+    # Keep the same equality without unfolding two distinct global aliases.
+    if inline_equivalence(case):
+        candidate = "(" + case["sugar"] + ")"
+        reference = "(" + case["canonical"] + ")"
     return header + setup + (
         f'def ergo_expansion_candidate : {ty} := {case["sugar"]};\n'
         f'def ergo_expansion_reference : {ty} := {case["canonical"]};\n'
