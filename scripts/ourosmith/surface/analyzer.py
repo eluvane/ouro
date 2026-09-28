@@ -119,6 +119,21 @@ def rows(seed):
         yield f"show_nat (ast_size (adapt ({expression})))", str(adapted_size)
     yield "show_bool (alpha_eq (ANamedCall (AVar 1) ([MkPair Nat Ast 2 (ANatLit 3)] : List (Pair Nat Ast))) (ANamedCall (AVar 1) ([MkPair Nat Ast 4 (ANatLit 3)] : List (Pair Nat Ast))))", "false"
 
+    # Conditions and both branches keep their enclosing binder scope.
+    yield "show_bool (alpha_eq (ALam 11 ANoBinder (AIf (AVar 11) (ANatLit 2) (AVar 12))) (ALam 21 ANoBinder (AIf (AVar 21) (ANatLit 2) (AVar 12))))", "true"
+    conditional = "AIf (AVar 1) (ANatLit 2) (ANatLit 3)"
+    for other in ("AIf (AVar 4) (ANatLit 2) (ANatLit 3)",
+                  "AIf (AVar 1) (ANatLit 4) (ANatLit 3)",
+                  "AIf (AVar 1) (ANatLit 2) (ANatLit 4)"):
+        yield f"show_bool (alpha_eq ({conditional}) ({other}))", "false"
+    # Endpoints and inclusivity are three literal children, without binders.
+    yield "show_bool (alpha_eq (ARange 2 5 False) (ARange 2 5 False))", "true"
+    for other in ("ARange 3 5 False", "ARange 2 6 False", "ARange 2 5 True"):
+        yield f"show_bool (alpha_eq (ARange 2 5 False) ({other}))", "false"
+    yield "show_nat (min_score_nodes (minimal_score (ARange 2 5 False)))", "4"
+    for metric, expected in (("nodes", "4"), ("depth", "2"), ("allocs", "0")):
+        yield f'show_nat (fromMaybe Nat 0 (bnd_metric (bounds_metrics (ARange 2 5 False)) "{metric}"))', expected
+
 
 def run_checks(run, directory, saved=None):
     modules = ["tools/analyze/" + name + ".ouro" for name in
