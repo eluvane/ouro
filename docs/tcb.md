@@ -93,6 +93,14 @@ contracts, representation roles, and emission order. It is not a serialized
 permission to skip checking. Caches, generated outputs, analyzer reports, and
 build receipts remain outside compiler acceptance.
 
+Character literals are decoded by `compiler/source_text.ouro` and the lexer
+into existing `TNat`/`ENat` values. The decoder rejects noncanonical UTF-8,
+surrogates, out-of-range scalars, and multi-scalar payloads before normal Nat
+checking. Preprocessors and tooling only preserve or skip the original quoted
+bytes at an identifier boundary; they do not authenticate a literal or bypass
+checking. This syntax adds no Core form, primitive type, runtime role, or
+bootstrap ABI.
+
 ## Current host assumptions
 
 The working producer still uses committed stage0 C, a system C compiler, the

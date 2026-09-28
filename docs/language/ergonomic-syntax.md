@@ -592,3 +592,12 @@ AST reuse alone does not establish editor behavior. The dedicated parser,
 formatter, frontend/security, Clippy, bootstrap, and PR gates remain required
 for toolchain acceptance; [CI](../ci.md#local-profiles) owns the maintained
 validation commands.
+
+## Character literals
+
+Single-quoted characters are Unicode scalar ordinals of the existing `Nat`
+type: `'A'` equals `65`, while `'é'` equals `233` despite occupying two UTF-8
+bytes. The lexer produces `TNat` and both parsers retain `ENat`; declaration
+checking uses the existing nominal Nat contract. Source spans and formatter
+text retain the complete original spelling. See
+[Numbers and strings](../syntax.md#numbers-and-strings) for escapes and errors.

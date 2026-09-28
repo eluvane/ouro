@@ -166,6 +166,23 @@ class BootstrapCompilerTests(unittest.TestCase):
                          ["compiler/real.ouro"])
         self.assertEqual(compact_source.compact_source(compacted), compacted)
 
+    def test_compaction_and_import_scan_preserve_scalar_literals_and_primes(self):
+        from selfhost_module_cache import quoted_import_targets
+
+        literals = [b"' '", b"'\\n'", b"'\\''", b"'\"'", b"'\\u{1F600}'",
+                    "'é'".encode(), "'€'".encode(), "'😀'".encode()]
+        source = (b"def name' : Nat := 1; def sample : Nat := f " + b" ".join(literals)
+                  + b"; def primes : Nat := name'; import \"real.ouro\";\n")
+        compacted = compact_source.compact_source(source)
+        for literal in literals:
+            self.assertIn(literal, compacted)
+        self.assertIn(b"name'", compacted)
+        self.assertEqual(quoted_import_targets(source.decode(), "compiler/probe.ouro"),
+                         ["compiler/real.ouro"])
+        self.assertEqual(quoted_import_targets(compacted.decode(), "compiler/probe.ouro"),
+                         ["compiler/real.ouro"])
+        self.assertEqual(compact_source.compact_source(compacted), compacted)
+
     def test_compaction_rejects_unclosed_raw_literal(self):
         with self.assertRaisesRegex(ValueError, "unterminated raw string"):
             compact_source.compact_source(b'def text : String := r#"unfinished";')

@@ -228,7 +228,7 @@ def lex(source, language):
             i += 1
             char = source[i]
         # A quote inside an Ouro/OCaml identifier is not a string delimiter.
-        is_quote = char == '"' or (char == "'" and language in {"c", "h", "sh"})
+        is_quote = char == '"' or (char == "'" and language in {"c", "h", "sh", "ouro"})
         if language in {"ml", "mli"} and char == "'":
             is_quote = bool(re.match(r"'(?:[^'\\\n]|\\.)'", source[i:]))
         if is_quote:

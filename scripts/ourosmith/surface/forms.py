@@ -58,6 +58,26 @@ def result : Nat :=
 def message : String := {json.dumps(text)};
 def result : Nat := prim_string_length message;
 """, len(text.encode()), False
+    scalar = ("A", "é", "€", "😀")[seed % 4]
+    ordinal = ord(scalar)
+    escaped = "'\\u{" + format(ordinal, "X") + "}'"
+    # Compare wide values inside the program; the unary runtime printer is bounded.
+    # A known mismatch also rejects an equality helper that always returns True.
+    yield "character-scalar", PRELUDE + f"""def value' : Nat := '{scalar}';
+def same_nat : Nat -> Nat -> Bool :=
+  fix same (left : Nat) (right : Nat) : Bool :=
+    match left with
+    | Z => match right with | Z => True | S _ => False end
+    | S left' => match right with | Z => False | S right' => same left' right' end
+    end;
+def match_score (equal : Bool) : Nat :=
+  match equal with | True => 0 | False => 1 end;
+def result : Nat :=
+  add (add (match_score (same_nat value' {ordinal}))
+           (match_score (same_nat {escaped} {ordinal})))
+      (add (match_score (same_nat (add value' {escaped}) {2 * ordinal}))
+           (match same_nat {ordinal} {ordinal + 1} with | True => 1 | False => 0 end));
+""", 0, False
     # The foreign declaration is checked and preserved through formatting.
     # Its unrelated Nat result exercises ordinary execution, not the FFI call.
     yield "extern-declaration", PRELUDE + f"""intrinsic NativeWord : Type := "ouro.u32";

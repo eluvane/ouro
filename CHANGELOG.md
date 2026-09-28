@@ -33,6 +33,10 @@ Development changes; see the [compatibility policy](docs/stability.md).
   [Trailing lambda calls](docs/language/ergonomic-syntax.md#trailing-lambda-calls).
 - `Maybe A` values accept lazy `value ?? fallback` expressions, checked through
   the registered nominal family; see [Maybe fallback](docs/language/ergonomic-syntax.md#maybe-fallback-operator).
+
+- Single-quoted Unicode scalar literals as existing `Nat` ordinals, with strict
+  UTF-8 and escape validation. See [Numbers and strings](docs/syntax.md#numbers-and-strings).
+
 - Exclusive `0..10` and inclusive `0..=10` literal-endpoint `NatRange` values,
   checked through nominal Nat, bound, and range representation roles.
 - Final-tail list spreads `[first, ..rest]` build checked `List A` constructor
