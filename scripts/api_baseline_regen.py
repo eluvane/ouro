@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import re
+import sys
 from pathlib import Path
 from typing import Optional, Sequence
 
@@ -21,6 +22,9 @@ BASELINE_FRAGMENT_DIR = BASELINE.parent / "api_surface"
 REPORT_KIND = "ouro.api-baseline.v1"
 HEADER = "# Ouro public API baseline v2. Columns: path<TAB>name<TAB>fnv1a64(sig)<TAB>namespace<TAB>use-intent"
 DEF_RE = re.compile(r"^[ \t]*(def|axiom)[ \t]+([A-Za-z0-9_]+)")
+DECL_START_RE = re.compile(
+    r"^[ \t]*(?:private[ \t]+)?(?:def|axiom|inductive|record|effect|import|intrinsic|representation)(?:[ \t]|$)"
+)
 
 
 def hash_text(text: str) -> int:
@@ -31,15 +35,64 @@ def hash_text(text: str) -> int:
     return value
 
 
-def normalize_signature(line: str) -> str:
-    line = line.lstrip(" \t")
-    assignment = line.find(":=")
-    if assignment >= 0:
-        line = line[:assignment]
-    comment = line.find("--")
-    if comment >= 0:
-        line = line[:comment]
-    return " ".join(line.split())
+def collect_signature(lines: Sequence[str], start: int, path: str) -> tuple[str, int]:
+    """Collect a header boundary; source acceptance remains compiler-owned."""
+    parts: list[str] = []
+    brackets: list[str] = []
+    quoted = ""
+    escaped = False
+    for row in range(start, len(lines)):
+        line = lines[row]
+        if row != start and not quoted and DECL_START_RE.match(line):
+            break
+        index = 0
+        while index < len(line):
+            char = line[index]
+            if quoted == "raw":
+                if line.startswith('"#', index):
+                    parts.append('"#')
+                    quoted = ""
+                    index += 2
+                else:
+                    parts.append(char)
+                    index += 1
+                continue
+            if quoted in {'"', "'"}:
+                parts.append(char)
+                index += 1
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == quoted:
+                    quoted = ""
+                continue
+            if line.startswith("--", index):
+                break
+            if line.startswith('r#"', index):
+                parts.append('r#"')
+                quoted = "raw"
+                index += 3
+                continue
+            previous = line[index - 1] if index else "\n"
+            if char == '"' or (char == "'" and previous not in
+                                "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_'"):
+                quoted = char
+            elif not brackets and line.startswith(":=", index):
+                return " ".join("".join(parts).split()), row + 1
+            elif char in "([{":
+                brackets.append({"(": ")", "[": "]", "{": "}"}[char])
+            elif char in ")]}":
+                if not brackets or brackets.pop() != char:
+                    raise ValueError(f"{path}:{start + 1}: malformed API signature")
+            elif char == ";" and not brackets:
+                raise ValueError(f"{path}:{start + 1}: unterminated API signature")
+            parts.append(char)
+            index += 1
+        parts.append("\n")
+        if quoted in {'"', "'"}:
+            escaped = False
+    raise ValueError(f"{path}:{start + 1}: unterminated API signature")
 
 
 def std_sources() -> list[Path]:
@@ -76,11 +129,14 @@ def read_combined_baseline() -> str:
 def rows_for(path: Path) -> list[tuple[str, str, str, str]]:
     relative = path.relative_to(ROOT).as_posix()
     rows: list[tuple[str, str, str, str]] = []
-    for line in path.read_text(encoding="utf-8").splitlines():
-        match = DEF_RE.match(line)
+    lines = path.read_text(encoding="utf-8").splitlines()
+    index = 0
+    while index < len(lines):
+        match = DEF_RE.match(lines[index])
         if not match or match.group(1) == "axiom":
+            index += 1
             continue
-        signature = normalize_signature(line)
+        signature, index = collect_signature(lines, index, relative)
         rows.append((relative, match.group(2), f"{hash_text(signature):x}", signature))
     return rows
 
@@ -145,7 +201,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     if not BASELINE.is_file():
         raise SystemExit(f"API_BASELINE: missing {BASELINE.relative_to(ROOT).as_posix()}")
-    rendered, rows, source_count = render_baseline()
+    try:
+        rendered, rows, source_count = render_baseline()
+    except ValueError as error:
+        print(f"API_BASELINE: FAIL {error}", file=sys.stderr)
+        return 1
     # Fragments are maintainer inputs; the analyzer loads only the generated
     # aggregate, so check that file itself rather than a virtual merged view.
     current = BASELINE.read_text(encoding="utf-8")

@@ -175,6 +175,9 @@ Development changes; see the [compatibility policy](docs/stability.md).
   order, intern state, and malformed or exhausted result handling.
 - Keep qualified selected imports usable when their short names collide; a
   bare colliding name still reports ambiguity.
+- Fingerprint complete multiline public definition headers in the analyzer and
+  API baseline generator, retaining comments and whitespace normalization and
+  rejecting malformed or unterminated headers.
 - `adjacent_pairs` now advances its left element; `list_traverse_result` evaluates
   conversions in input order and stops when one returns `Left`.
 - Recognize manifest-owned Clippy precision fixtures in the structural gate,
