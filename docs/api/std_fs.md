@@ -102,6 +102,7 @@ def fs_list_paths (dir : String) : IO (List String)
 
 ```
 def fs_walk_go : Nat -> List String -> List String
+    -> IO (Maybe (List String))
 ```
 
 Recursive inventory remains compact for common tools while failing closed: exhaustion, unreadable entries, and links/reparse points return no partial list.
