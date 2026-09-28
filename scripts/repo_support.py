@@ -68,6 +68,11 @@ def sha256_file(path: Path, *, chunk_size: int = 1024 * 1024) -> str:
     return digest.hexdigest()
 
 
+def git_blob(data: bytes) -> str:
+    """Return the Git blob object identity for exact bytes."""
+    return hashlib.sha1(b"blob " + str(len(data)).encode() + b"\0" + data, usedforsecurity=False).hexdigest()
+
+
 def write_json_atomic(path: Path, data: Any) -> None:
     """Write sorted, newline-terminated JSON through an atomic replace."""
     path.parent.mkdir(parents=True, exist_ok=True)

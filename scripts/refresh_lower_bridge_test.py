@@ -30,6 +30,15 @@ PREVIOUS_LOWER_COPIES = {'lower_xvnat': {'name': 'lower_xvnat',
                      'sha256': 'c4a2be662f3835813576b4f2d9a34bd6c21cb8ef7917bf494e42d35bf2d0f0f7'}}
 
 
+PREVIOUS_SPREAD_COPY = {'name': 'spread_max_names',
+ 'source': 'compiler/lower_spread.ouro',
+ 'source_blob': 'a3d1d57a730a239427b06d429ee453e5d0c64d38',
+ 'source_sha256': 'c424bbb8d6a5129ad814e2978debd575d1dcfa54f6b92c3d9c196f3e2b214e99',
+ 'first_line': 15,
+ 'bytes': 170,
+ 'sha256': 'fe9c4971dc87b43c31c443a3b8481178e75600b7281c5fae09ccadd8632b6935'}
+
+
 class LowerBridgeRefreshTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -49,13 +58,25 @@ class LowerBridgeRefreshTests(unittest.TestCase):
             provenance = installed['provenance']['lowering_refresh']
             provenance['source_blobs']['compiler/lower.ouro'] = 'bd40cebe82608c5a23042f1349aea9b5964d17c1'
             provenance['source_blobs']['compiler/pipeline_support.ouro'] = blob
+            provenance['source_blobs']['compiler/lower_spread.ouro'] = PREVIOUS_SPREAD_COPY['source_blob']
             provenance['source_copies'] = [
                 copy.deepcopy(PREVIOUS_LOWER_COPIES[row['name']])
-                if row['source'] == 'compiler/lower.ouro' else row
+                if row['source'] == 'compiler/lower.ouro' else
+                copy.deepcopy(PREVIOUS_SPREAD_COPY)
+                if row['source'] == 'compiler/lower_spread.ouro' else row
                 for row in provenance['source_copies']
             ]
             self.assertEqual(sha256_bytes(refresh.encoded_manifest(installed)), identity)
             yield identity, installed
+        installed = copy.deepcopy(self.generated)
+        provenance = installed['provenance']['lowering_refresh']
+        provenance['source_blobs']['compiler/lower_spread.ouro'] = PREVIOUS_SPREAD_COPY['source_blob']
+        provenance['source_copies'] = [
+            copy.deepcopy(PREVIOUS_SPREAD_COPY) if row['source'] == 'compiler/lower_spread.ouro' else row
+            for row in provenance['source_copies']
+        ]
+        self.assertEqual(sha256_bytes(refresh.encoded_manifest(installed)), refresh.LATEST_INSTALLED_MANIFEST)
+        yield refresh.LATEST_INSTALLED_MANIFEST, installed
         yield refresh.NEW_MANIFEST, copy.deepcopy(self.generated)
 
     def test_source_operations_commute_and_preserve_all_other_members(self):
@@ -106,7 +127,7 @@ class LowerBridgeRefreshTests(unittest.TestCase):
                     self.assertEqual({key: old_row[key] for key in ('name', 'first_line', 'bytes', 'sha256')},
                         {key: new_row[key] for key in ('name', 'first_line', 'bytes', 'sha256')})
                 self.assertEqual(len(self.changed), 68)
-        self.assertEqual(len({refresh.PREVIOUS_MANIFEST, refresh.INTERMEDIATE_MANIFEST, refresh.INSTALLED_MANIFEST, refresh.NEW_MANIFEST}), 4)
+        self.assertEqual(len({refresh.PREVIOUS_MANIFEST, refresh.INTERMEDIATE_MANIFEST, refresh.INSTALLED_MANIFEST, refresh.LATEST_INSTALLED_MANIFEST, refresh.NEW_MANIFEST}), 5)
         self.assertEqual(sha256_bytes(self.encoded), refresh.NEW_MANIFEST)
         self.assertEqual((refresh.ROOT / ARCHIVE).read_bytes(), self.archive)
 

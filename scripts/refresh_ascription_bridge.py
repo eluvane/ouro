@@ -4,14 +4,13 @@ from __future__ import annotations
 
 import argparse
 import difflib
-import hashlib
 import json
 import os
 from typing import TYPE_CHECKING
 import tempfile
 
 from bootstrap_inputs import ARCHIVE, MANIFEST, ROOT, archive_bytes, read_bundle, verify_stage0
-from repo_support import sha256_bytes
+from repo_support import git_blob, sha256_bytes
 
 
 if TYPE_CHECKING:
@@ -35,10 +34,6 @@ SOURCE_BLOBS = {
 }
 START = b"def lower_xvascribe\n"
 END = b"def lower_xvmatch\n"
-
-
-def git_blob(data: bytes) -> str:
-    return hashlib.sha1(b"blob " + str(len(data)).encode() + b"\0" + data, usedforsecurity=False).hexdigest()
 
 
 def function(data: bytes) -> bytes:
