@@ -44,42 +44,51 @@ class LowerBridgeRefreshTests(unittest.TestCase):
         self.assertEqual(sha256_bytes(archive_bytes(self.changed)), refresh.NEW_ARCHIVE)
         self.assertEqual(sha256_bytes(self.encoded), refresh.NEW_MANIFEST)
 
-    def test_previous_installed_package_derives_only_new_source_metadata(self):
-        installed = copy.deepcopy(self.generated)
-        installed['provenance']['lowering_refresh']['source_blobs']['compiler/pipeline_support.ouro'] = '602bbe08c9c7446cbec9f056682aad7e62ca0b2c'
-        encoded = refresh.encoded_manifest(installed)
-        self.assertEqual(sha256_bytes(encoded), refresh.PREVIOUS_MANIFEST)
-        contents = self.changed
-        original, previous = refresh.predecessor(encoded, installed, contents, self.sources)
-        result = refresh.compose(original, previous, self.sources)
-        self.assertEqual(result, (self.generated, self.changed, self.archive, self.encoded))
-        with tempfile.TemporaryDirectory(prefix='ouro-lower-bridge-previous-') as directory:
-            root = Path(directory)
-            files = {**self.sources, MANIFEST: encoded, ARCHIVE: self.archive}
-            files.update({name: (refresh.ROOT / name).read_bytes() for name in refresh.nat.SEED})
-            for name, data in files.items():
-                target = root / name
-                target.parent.mkdir(parents=True, exist_ok=True)
-                target.write_bytes(data)
-            self.assertEqual(refresh.candidate(root), result)
-        self.assertNotEqual(refresh.PREVIOUS_MANIFEST, refresh.NEW_MANIFEST)
+    def test_pinned_installed_packages_derive_only_new_source_metadata(self):
+        for identity, blob in (
+            (refresh.PREVIOUS_MANIFEST, '602bbe08c9c7446cbec9f056682aad7e62ca0b2c'),
+            (refresh.INTERMEDIATE_MANIFEST, 'c4fe78b32e212903d6616133651fcf4c36ab463d'),
+            (refresh.NEW_MANIFEST, refresh.SOURCE_BLOBS['compiler/pipeline_support.ouro']),
+        ):
+            with self.subTest(identity=identity):
+                installed = copy.deepcopy(self.generated)
+                installed['provenance']['lowering_refresh']['source_blobs']['compiler/pipeline_support.ouro'] = blob
+                encoded = refresh.encoded_manifest(installed)
+                self.assertEqual(sha256_bytes(encoded), identity)
+                original, previous = refresh.predecessor(encoded, installed, self.changed, self.sources)
+                result = refresh.compose(original, previous, self.sources)
+                self.assertEqual(result, (self.generated, self.changed, self.archive, self.encoded))
+                with tempfile.TemporaryDirectory(prefix='ouro-lower-bridge-previous-') as directory:
+                    root = Path(directory)
+                    files = {**self.sources, MANIFEST: encoded, ARCHIVE: self.archive}
+                    files.update({name: (refresh.ROOT / name).read_bytes() for name in refresh.nat.SEED})
+                    for name, data in files.items():
+                        target = root / name
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        target.write_bytes(data)
+                    self.assertEqual(refresh.candidate(root), result)
+                expected = copy.deepcopy(installed)
+                expected['provenance']['lowering_refresh']['source_blobs'] = refresh.SOURCE_BLOBS
+                self.assertEqual(self.generated, expected)
+                self.assertEqual(self.generated['stage0'], installed['stage0'])
+                self.assertEqual(self.generated['provenance']['lowering_refresh']['source_copies'],
+                    installed['provenance']['lowering_refresh']['source_copies'])
+                self.assertEqual(len(self.changed), 68)
+        self.assertEqual(len({refresh.PREVIOUS_MANIFEST, refresh.INTERMEDIATE_MANIFEST, refresh.NEW_MANIFEST}), 3)
         self.assertEqual(sha256_bytes(self.encoded), refresh.NEW_MANIFEST)
-        self.assertEqual(contents, self.changed)
         self.assertEqual((refresh.ROOT / ARCHIVE).read_bytes(), self.archive)
-        expected = copy.deepcopy(installed)
-        expected['provenance']['lowering_refresh']['source_blobs'] = refresh.SOURCE_BLOBS
-        self.assertEqual(self.generated, expected)
-        self.assertEqual(self.generated['stage0'], installed['stage0'])
-        self.assertEqual(self.generated['provenance']['lowering_refresh']['source_copies'],
-            installed['provenance']['lowering_refresh']['source_copies'])
-        self.assertEqual(len(contents), 68)
 
-    def test_old_and_new_installed_unknown_metadata_or_member_are_rejected(self):
-        old = copy.deepcopy(self.generated)
-        old['provenance']['lowering_refresh']['source_blobs']['compiler/pipeline_support.ouro'] = '602bbe08c9c7446cbec9f056682aad7e62ca0b2c'
-        self.assertEqual(sha256_bytes(refresh.encoded_manifest(old)), refresh.PREVIOUS_MANIFEST)
-        for installed, contents in ((old, self.changed), (self.generated, self.changed)):
-            with self.subTest(identity=sha256_bytes(refresh.encoded_manifest(installed))):
+    def test_pinned_installed_unknown_metadata_or_member_are_rejected(self):
+        for identity, blob in (
+            (refresh.PREVIOUS_MANIFEST, '602bbe08c9c7446cbec9f056682aad7e62ca0b2c'),
+            (refresh.INTERMEDIATE_MANIFEST, 'c4fe78b32e212903d6616133651fcf4c36ab463d'),
+            (refresh.NEW_MANIFEST, refresh.SOURCE_BLOBS['compiler/pipeline_support.ouro']),
+        ):
+            installed = copy.deepcopy(self.generated)
+            installed['provenance']['lowering_refresh']['source_blobs']['compiler/pipeline_support.ouro'] = blob
+            self.assertEqual(sha256_bytes(refresh.encoded_manifest(installed)), identity)
+            contents = self.changed
+            with self.subTest(identity=identity):
                 unknown = copy.deepcopy(installed)
                 unknown['provenance']['lowering_refresh']['source_blobs']['compiler/pipeline_support.ouro'] = '0' * 40
                 with self.assertRaisesRegex(ValueError, 'use the pinned predecessor'):
