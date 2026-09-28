@@ -84,6 +84,9 @@ Development changes; see the [compatibility policy](docs/stability.md).
 
 - The formatter normalizes spaces around `|>` in code while preserving
   comments, quoted text, and existing pipeline line breaks.
+- Large natural-number literals in a parameterless, unindexed zero/successor
+  family lower to compact ordinary checked applications. Values through 255 and
+  legacy family paths keep their existing lowering; resource failures remain errors.
 - Imported record updates resolve simple field type annotations in the record
   declaration's import scope, including local type aliases, selected renames,
   and qualified imported types. Caller aliases cannot rebind those annotations;
