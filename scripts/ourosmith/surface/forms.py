@@ -19,6 +19,12 @@ def result : Nat := match identity Bool {flag} with
 def message : String := {json.dumps(text)};
 def result : Nat := prim_string_length message;
 """, len(text.encode()), False
+    scalar = ("A", "é", "€", "😀")[seed % 4]
+    ordinal = ord(scalar)
+    escaped = "'\\u{" + format(ordinal, "X") + "}'"
+    yield "character-scalar", PRELUDE + f"""def value' : Nat := '{scalar}';
+def result : Nat := add value' {escaped};
+""", 2 * ordinal, False
     # The foreign declaration is checked and preserved through formatting.
     # Its unrelated Nat result exercises ordinary execution, not the FFI call.
     yield "extern-declaration", PRELUDE + f"""intrinsic NativeWord : Type := "ouro.u32";
