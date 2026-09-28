@@ -29,13 +29,14 @@ SOURCE_BLOBS = {
     "compiler/lower_fallible.ouro": "62703e9ae2537c0141cd636833bb5c420227ad14",
     "compiler/lower_named.ouro": "984d677262c5cb4806a4d130a1aceedc9e61f6ce",
     "compiler/lower_spread.ouro": "a3d1d57a730a239427b06d429ee453e5d0c64d38",
-    "compiler/pipeline_support.ouro": "c4fe78b32e212903d6616133651fcf4c36ab463d"
+    "compiler/pipeline_support.ouro": "01883061244d802a36b88c5e2e9e468890ed0bfb"
 }
 MEMBER = nat.MEMBER
 NEW_MEMBER = "6a15b160b72c81abed30cfae70d20da091b52ae7c88403082fadd5ca680a7d83"
 NEW_ARCHIVE = "b704ba53dc81f481b0c22cf5566c382a061cbb2cc0850002d0cf0e1c2f955482"
 PREVIOUS_MANIFEST = "7ca501f51940ab8e8c178aa2341ba00c56f2a4a69551287946baa9d11c154d9a"
-NEW_MANIFEST = "54aff33a1cf0df8f90b1b80c3ee88b6e00d5391af560238062deafb1f59c40e8"
+INTERMEDIATE_MANIFEST = "54aff33a1cf0df8f90b1b80c3ee88b6e00d5391af560238062deafb1f59c40e8"
+NEW_MANIFEST = "449f84146fa314078fa00ccf3fd1d6dc23022c19daeab8a9e92e409546f65a33"
 ASCRIPTION_FUNCTION = "c4a2be662f3835813576b4f2d9a34bd6c21cb8ef7917bf494e42d35bf2d0f0f7"
 LEGACY_NAT = b"def lower_xvnat\n  (_lower_run : Nat -> LowerEnv -> Maybe Surface -> Maybe Nat -> List (Pair Nat Surface) -> LowerMode -> LowerVal)\n  (_fuel' : Nat)\n  (env : LowerEnv)\n  (_er : Maybe Surface)\n  (_fixSelf : Maybe Nat)\n  (_locals : List (Pair Nat Surface))\n  (n : Nat) : LowerVal :=\nVSurf (lower_nat_env env n);\n"
 LEGACY_ASCRIPTION = b"def lower_xvascribe\n  (lower_run : Nat -> LowerEnv -> Maybe Surface -> Maybe Nat -> List (Pair Nat Surface) -> LowerMode -> LowerVal)\n  (fuel' : Nat)\n  (env : LowerEnv)\n  (er : Maybe Surface)\n  (fixSelf : Maybe Nat)\n  (locals : List (Pair Nat Surface))\n  (tm : Expr)\n  (ty : Expr) : LowerVal :=\n    let tyS : Surface :=\n      vsurf_or_hole\n        (lower_run fuel' env er fixSelf locals (LExpr ty)) in\n    lower_run fuel' env (Just Surface tyS) fixSelf locals (LExpr tm);\n\n"
@@ -78,7 +79,7 @@ def predecessor(encoded: bytes, manifest: dict, contents: dict[str, bytes],
         if manifest["archive_sha256"] != nat.OLD_ARCHIVE:
             raise ValueError("historical archive changed")
         return copy.deepcopy(manifest), dict(contents)
-    if identity not in {PREVIOUS_MANIFEST, NEW_MANIFEST} or manifest["archive_sha256"] != NEW_ARCHIVE:
+    if identity not in {PREVIOUS_MANIFEST, INTERMEDIATE_MANIFEST, NEW_MANIFEST} or manifest["archive_sha256"] != NEW_ARCHIVE:
         raise ValueError("historical manifest changed; use the pinned predecessor")
     previous = contents[MEMBER]
     if sha256_bytes(previous) != NEW_MEMBER:
