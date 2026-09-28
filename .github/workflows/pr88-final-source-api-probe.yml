@@ -1,0 +1,367 @@
+name: Final source Host and API regeneration
+
+on:
+  push:
+    branches: [codef/pr88-final-source-api-probe]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr88-final-source-api-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  OURO_CI: "1"
+  OURO_REPRODUCIBLE: "1"
+  OURO_PACK_STRICT: "1"
+  OURO_JOBS: "2"
+  OURO_CACHE_DIR: _cache/ouro
+  OURO_BUILD_DIR: _build
+  OURO_C_BUILD_DIR: _build/c
+  OURO_CCACHE: disabled
+  SOURCE_SHA: f54590f815e94d26d96b557ff0e102af2d399b36
+  SOURCE_TREE_SHA: 31e4878df36cf0987e8ddc369d62c167650c574c
+  COLLECT_CORE_BLOB: 19199382403083ae7fa030f9ae12e8e7f2f0c718
+  BRIDGE_MANIFEST_BLOB: c02f937d0b9f260b8d1a75906f6df7a3ee5cb567
+  BRIDGE_ARCHIVE_BLOB: 3c8842972f03032ff8661b5b7feeaf30a04961fb
+  SOURCE_INPUTS_HASH: 2246f5c3510c94e5ff4e24c898fda0546a1f4a36900c0d6eb4bbac62680c51d5
+  STD_INPUTS_HASH: e3ad138d8e58b60bf652b5dcc23b3b789559256a94e05f52460c0e7512b22041
+  STD_LIST_SHA256: 5db8754a1b35a608b2cb1981d5edc547dc30bb1a8bfea935fd944abc3631b0a6
+  STD_GRAPH_HASH: 2b1e1c0f877163dce7da83dc95011885730665a6cd1a14c1d3ed4e7e5da8551d
+  EXPECTED_API_ROWS: "1177"
+
+jobs:
+  host-compiler:
+    name: Host compiler
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    outputs:
+      sha256: ${{ steps.bundle.outputs.sha256 }}
+      artifact: ${{ steps.bundle.outputs.artifact }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+
+      - name: Require exact product parent and workflow-only child
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git rev-parse HEAD^)" = "$SOURCE_SHA"
+          test "$(git diff --name-only HEAD^ HEAD)" = .github/workflows/pr88-final-source-api-probe.yml
+          test "$(git rev-parse "$SOURCE_SHA^{tree}")" = "$SOURCE_TREE_SHA"
+          test "$(git rev-parse "$SOURCE_SHA:tools/collect_core.ouro")" = "$COLLECT_CORE_BLOB"
+          test "$(git rev-parse "$SOURCE_SHA:compiler/bootstrap/c-bootstrap-v1.json")" = "$BRIDGE_MANIFEST_BLOB"
+          test "$(git rev-parse "$SOURCE_SHA:compiler/bootstrap/c-bootstrap-v1.tar.gz")" = "$BRIDGE_ARCHIVE_BLOB"
+          git checkout --detach "$SOURCE_SHA"
+          test -z "$(git status --porcelain --untracked-files=no)"
+          mkdir -p _build/ci/final-api
+
+      - name: Identify compiler inputs
+        id: inputs
+        run: python3 scripts/ci_gate.py --compiler-artifact key >> "$GITHUB_OUTPUT"
+
+      - name: Restore compiler and bootstrap evidence
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            _build/c/ouro1
+            _build/c/ouro1.bootstrap.json
+            _build/bootstrap/*/report.json
+            _build/bootstrap/*/inputs.json
+            _build/bootstrap/*/out/p1/*.c
+            _build/bootstrap/*/out/p2/*.c
+          key: ouro-host-compiler-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.inputs.outputs.key }}
+
+      - name: Build and verify host compiler
+        run: python3 scripts/ouro_build.py build --verbosity quiet
+
+      - name: Export compiler with bootstrap evidence
+        id: bundle
+        run: |
+          set -euo pipefail
+          python3 scripts/ci_gate.py --compiler-artifact export >> "$GITHUB_OUTPUT"
+          echo "artifact=host-compiler-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
+          cp _build/c/ouro1.bootstrap.json _build/ci/final-api/host-receipt.json
+          python3 scripts/ci_gate.py --compiler-artifact key > _build/ci/final-api/host-key.stdout
+
+      - name: Upload verified compiler
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: host-compiler-${{ github.run_id }}-${{ github.run_attempt }}
+          path: _build/ci/host-compiler.tar.gz
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload canonical bootstrap reports
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: host-compiler-reports-${{ github.run_attempt }}
+          path: |
+            _build/bootstrap/**/*.json
+            _build/bootstrap/**/*.log
+            _build/ci/final-api/*.json
+            _build/ci/final-api/*.stdout
+          if-no-files-found: ignore
+          retention-days: 14
+
+  api-regeneration:
+    name: Native API regeneration
+    needs: host-compiler
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+
+      - name: Require exact product source and owner blobs
+        id: source
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git rev-parse HEAD^)" = "$SOURCE_SHA"
+          test "$(git diff --name-only HEAD^ HEAD)" = .github/workflows/pr88-final-source-api-probe.yml
+          test "$(git rev-parse "$SOURCE_SHA^{tree}")" = "$SOURCE_TREE_SHA"
+          git checkout --detach "$SOURCE_SHA"
+          test -z "$(git status --porcelain --untracked-files=no)"
+          mkdir -p _build/ci/final-api
+          python3 - <<'PY'
+          import hashlib, json, os, subprocess, sys
+          from pathlib import Path
+          sys.path.insert(0, str(Path('scripts').resolve()))
+          import frontend_regen as frontend
+          from repo_support import hash_json
+          def git(*args): return subprocess.check_output(['git', *args], text=True).strip()
+          names = sorted(name for name in git('ls-files', '--', 'std').splitlines() if name.endswith('.ouro'))
+          rows = [{'path': name, 'blob': git('rev-parse', 'HEAD:'+name),
+                   'sha256': hashlib.sha256(Path(name).read_bytes()).hexdigest()} for name in names]
+          assert len(rows) == 69 and len(set(names)) == 69
+          assert hash_json({row['path']: row['sha256'] for row in rows}) == os.environ['STD_INPUTS_HASH']
+          assert hashlib.sha256(('\n'.join(names)+'\n').encode()).hexdigest() == os.environ['STD_LIST_SHA256']
+          graph = frontend.collect_units_many(names)
+          Path('_build/ci/final-api/std-unit-graph.json').write_text(json.dumps(graph, indent=2, sort_keys=True)+'\n')
+          assert len(graph) == 69 and len({name for units in graph.values() for name in units}) == 126
+          assert hash_json(graph) == os.environ['STD_GRAPH_HASH']
+          Path('_build/ci/final-api/source.json').write_text(json.dumps({
+              'workflow_sha': os.environ['GITHUB_SHA'], 'source_sha': git('rev-parse', 'HEAD'),
+              'source_tree': git('rev-parse', 'HEAD^{tree}'), 'std_inputs': rows,
+              'tracked_tree': git('ls-tree', '-r', 'HEAD').splitlines(),
+              'collect_core_blob': git('rev-parse', 'HEAD:tools/collect_core.ouro'),
+              'bridge_manifest_blob': git('rev-parse', 'HEAD:compiler/bootstrap/c-bootstrap-v1.json'),
+              'bridge_archive_blob': git('rev-parse', 'HEAD:compiler/bootstrap/c-bootstrap-v1.tar.gz')},
+              indent=2, sort_keys=True)+'\n')
+          PY
+
+      - name: Download verified matching compiler
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ needs.host-compiler.outputs.artifact }}
+          path: _build/ci
+
+      - name: Verify and install compiler before generation
+        id: import
+        env:
+          COMPILER_SHA256: ${{ needs.host-compiler.outputs.sha256 }}
+        run: |
+          set -euo pipefail
+          python3 scripts/ci_gate.py --compiler-artifact import --compiler-sha256 "$COMPILER_SHA256"
+          python3 scripts/ci_gate.py --compiler-artifact key > _build/ci/final-api/key-before.stdout
+          sha256sum _build/c/ouro1 > _build/ci/final-api/compiler.sha256
+          cp _build/c/ouro1.bootstrap.json _build/ci/final-api/receipt-before.json
+          python3 - <<'PY'
+          import argparse, json, os, sys
+          from pathlib import Path
+          sys.path.insert(0, str(Path('scripts').resolve()))
+          import bootstrap_compiler as bootstrap
+          import ouro_build as build
+          from repo_support import hash_json
+          selected = bootstrap.current_inputs(Path.cwd(), build.load_config(argparse.Namespace()), build)
+          receipt = json.loads(Path('_build/ci/final-api/receipt-before.json').read_text())
+          assert receipt['selected'] == selected
+          Path('_build/ci/final-api/current-inputs-before.json').write_text(json.dumps(selected, indent=2, sort_keys=True)+'\n')
+          projection = {name: selected[name] for name in ('kind', 'roots', 'unit_graph', 'sources',
+              'source_form', 'archive_sha256', 'manifest_sha256', 'stage0')}
+          Path('_build/ci/final-api/source-inputs.json').write_text(json.dumps(projection, indent=2, sort_keys=True)+'\n')
+          assert len(selected['sources']) == 180 and sum(name.endswith('.ouro') for name in selected['sources']) == 149
+          assert len(selected['roots']) == 15 and len(selected['unit_graph']) == 19 and len(selected['stage0']) == 2
+          assert hash_json(projection) == os.environ['SOURCE_INPUTS_HASH']
+          PY
+
+      - name: Regenerate and check the complete API baseline
+        id: baseline
+        run: |
+          set -euo pipefail
+          set +e
+          python3 scripts/api_baseline_regen.py --report _build/ci/final-api/api-write.json >_build/ci/final-api/api-write.stdout 2>_build/ci/final-api/api-write.stderr
+          rc=$?
+          printf '%s\n' "$rc" > _build/ci/final-api/api-write.rc
+          set -e
+          cat _build/ci/final-api/api-write.stdout
+          cat _build/ci/final-api/api-write.stderr >&2
+          test "$rc" -eq 0
+          set +e
+          python3 scripts/api_baseline_regen.py --check --report _build/ci/final-api/api-check.json >_build/ci/final-api/api-check.stdout 2>_build/ci/final-api/api-check.stderr
+          rc=$?
+          printf '%s\n' "$rc" > _build/ci/final-api/api-check.rc
+          set -e
+          cat _build/ci/final-api/api-check.stdout
+          cat _build/ci/final-api/api-check.stderr >&2
+          test "$rc" -eq 0
+
+      - name: Run native Doc contracts and regenerate all 69 pages
+        id: doc_regen
+        if: ${{ always() && steps.import.outcome == 'success' }}
+        env:
+          DOC_SUITE_OUT: _build/doc_regeneration
+        run: |
+          set -euo pipefail
+          set +e
+          sh scripts/doc_suite.sh --regen >_build/ci/final-api/doc-regen.stdout 2>_build/ci/final-api/doc-regen.stderr
+          rc=$?
+          printf '%s\n' "$rc" > _build/ci/final-api/doc-regen.rc
+          set -e
+          cat _build/ci/final-api/doc-regen.stdout
+          cat _build/ci/final-api/doc-regen.stderr >&2
+          test "$rc" -eq 0
+          python3 - <<'PY'
+          import hashlib, json
+          from pathlib import Path
+          files = [Path('quality/api_surface.tsv'), *sorted(path for path in Path('docs/api').rglob('*') if path.is_file())]
+          Path('_build/ci/final-api/generated-before-check.json').write_text(json.dumps({
+              path.as_posix(): hashlib.sha256(path.read_bytes()).hexdigest() for path in files}, sort_keys=True)+'\n')
+          PY
+
+      - name: Require canonical Doc stability without regeneration
+        id: doc_check
+        if: ${{ always() && steps.doc_regen.outcome == 'success' }}
+        env:
+          DOC_SUITE_OUT: _build/doc_stability
+        run: |
+          set -euo pipefail
+          set +e
+          sh scripts/doc_suite.sh >_build/ci/final-api/doc-check.stdout 2>_build/ci/final-api/doc-check.stderr
+          rc=$?
+          printf '%s\n' "$rc" > _build/ci/final-api/doc-check.rc
+          set -e
+          cat _build/ci/final-api/doc-check.stdout
+          cat _build/ci/final-api/doc-check.stderr >&2
+          test "$rc" -eq 0
+
+      - name: Preserve complete output and provenance before assertions
+        if: ${{ always() && steps.import.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import argparse, csv, hashlib, json, os, shutil, subprocess, sys
+          from pathlib import Path
+          out = Path('_build/ci/final-api')
+          source = json.loads((out/'source.json').read_text())
+          sys.path.insert(0, str(Path('scripts').resolve()))
+          import bootstrap_compiler as bootstrap
+          import ouro_build as build
+          docs = sorted(path for path in Path('docs/api').rglob('*') if path.is_file())
+          files = [Path('quality/api_surface.tsv'), *docs]
+          dest = out/'generated'
+          dest.mkdir(parents=True, exist_ok=True)
+          entries = []
+          for path in files:
+              data = path.read_bytes()
+              previous = subprocess.run(['git', 'show', os.environ['SOURCE_SHA']+':'+path.as_posix()], capture_output=True)
+              target = dest/path
+              target.parent.mkdir(parents=True, exist_ok=True)
+              shutil.copyfile(path, target)
+              entry = {'path': path.as_posix(), 'bytes': len(data),
+                       'sha256': hashlib.sha256(data).hexdigest(),
+                       'previous_sha256': hashlib.sha256(previous.stdout).hexdigest() if previous.returncode == 0 else None}
+              if path == Path('docs/api/README.md'): entry['source_inputs'] = source['std_inputs']
+              elif path.parent == Path('docs/api'):
+                  entry['source_path'] = data.decode('utf-8', errors='replace').split('\n', 1)[0].removeprefix('# ')
+              entries.append(entry)
+          rc_names = ['api-write', 'api-check', 'doc-regen', 'doc-check']
+          rcs = {name: int((out/(name+'.rc')).read_text()) if (out/(name+'.rc')).is_file() else None for name in rc_names}
+          changed = subprocess.check_output(['git', 'diff', '--name-only'], text=True).splitlines()
+          manifest = {**source, 'rcs': rcs, 'changed_paths': changed, 'files': entries,
+                      'module_pages': len(docs)-int(Path('docs/api/README.md').is_file()),
+                      'index_pages': int(Path('docs/api/README.md').is_file()),
+                      'compiler_receipt': json.loads((out/'receipt-before.json').read_text())}
+          (dest/'manifest.json').write_text(json.dumps(manifest, indent=2, sort_keys=True)+'\n')
+          (out/'generated.patch').write_bytes(subprocess.check_output(['git', 'diff', '--binary']))
+          selected_after = bootstrap.current_inputs(Path.cwd(), build.load_config(argparse.Namespace()), build)
+          (out/'current-inputs-after.json').write_text(json.dumps(selected_after, indent=2, sort_keys=True)+'\n')
+          key_after = subprocess.run([sys.executable, 'scripts/ci_gate.py', '--compiler-artifact', 'key'], capture_output=True)
+          (out/'key-after.stdout').write_bytes(key_after.stdout)
+          (out/'key-after.stderr').write_bytes(key_after.stderr)
+          (out/'key-after.rc').write_text(str(key_after.returncode)+'\n')
+          assert key_after.returncode == 0, key_after.stderr
+          assert all(rc == 0 for rc in rcs.values()), rcs
+          assert selected_after == json.loads((out/'current-inputs-before.json').read_text())
+          assert {entry['path']: entry['sha256'] for entry in entries} == json.loads((out/'generated-before-check.json').read_text())
+          inputs = {row['path']: row for row in source['std_inputs']}
+          expected = {'docs/api/README.md', *('docs/api/'+name[:-5].replace('/', '_')+'.md' for name in inputs)}
+          assert len(inputs) == 69 and {path.as_posix() for path in docs} == expected
+          assert manifest['module_pages'] == 69 and manifest['index_pages'] == 1
+          assert set(changed) <= expected | {'quality/api_surface.tsv'}, changed
+          for row in source['std_inputs']:
+              assert hashlib.sha256(Path(row['path']).read_bytes()).hexdigest() == row['sha256'], row['path']
+          for entry in entries:
+              assert entry['previous_sha256'] is not None, entry['path']
+              if 'source_path' in entry:
+                  assert entry['source_path'] in inputs, entry
+                  assert entry['path'] == 'docs/api/'+entry['source_path'][:-5].replace('/', '_')+'.md'
+          api = json.loads((out/'api-check.json').read_text())
+          assert api['pass'] and api['check_only'] and not api['drift'] and not api['wrote']
+          assert api['rows'] == int(os.environ['EXPECTED_API_ROWS']) and api['std_sources'] == 69
+          def rows(data):
+              lines = [line for line in data.splitlines() if line and not line.startswith(b'#')]
+              result = {tuple(line.split(b'\t')[:2]): line for line in lines}
+              assert len(result) == len(lines)
+              return result
+          before = rows(subprocess.check_output(['git', 'show', os.environ['SOURCE_SHA']+':quality/api_surface.tsv']))
+          after = rows(Path('quality/api_surface.tsv').read_bytes())
+          added = {(b'std/logic.ouro', b'compose'), (b'std/logic.ouro', b'flip'),
+                   (b'std/data.ouro', b'maybe_unwrap_or_else')}
+          assert before.keys() <= after.keys() and after.keys()-before.keys() <= added
+          assert added <= after.keys() and all(after[key] == row for key, row in before.items())
+          assert (out/'key-before.stdout').read_bytes() == (out/'key-after.stdout').read_bytes()
+          assert Path('_build/doc_regeneration/std.list').read_text().splitlines() == sorted(inputs)
+          assert Path('_build/doc_stability/std.list').read_text().splitlines() == sorted(inputs)
+          rows_ = list(csv.DictReader(Path('_build/doc_stability/selftest-report.tsv').read_text().splitlines(), delimiter='\t'))
+          assert [row['name'] for row in rows_] == ['fixture', 'missing-file', 'missing-files-from', 'files-from', 'api modules=69']
+          assert all(row['pass'] == 'true' and not row['issue'] for row in rows_)
+          print('FINAL_API_OUTPUT: PASS modules=69 index=1 baseline_rows='+str(api['rows']))
+          PY
+          sha256sum --check _build/ci/final-api/compiler.sha256
+          grep -Fx 'DOC_OK api modules=69' _build/ci/final-api/doc-check.stdout
+          grep -E '^DOC_SUITE: PASS rows=5 out=' _build/ci/final-api/doc-check.stdout
+          test ! -s _build/ci/final-api/doc-check.stderr
+          ! grep -E 'DOC_SUITE: SKIP|DOC_SUITE: FAIL|DOC_REGEN' _build/ci/final-api/doc-check.stdout _build/ci/final-api/doc-check.stderr
+
+      - name: Upload complete owner-generated output and reports
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: final-source-api-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            _build/ci/final-api/
+            _build/doc_regeneration/**/*.tsv
+            _build/doc_regeneration/**/*.log
+            _build/doc_regeneration/**/*.diff
+            _build/doc_stability/**/*.tsv
+            _build/doc_stability/**/*.log
+            _build/doc_stability/**/*.diff
+          if-no-files-found: error
+          retention-days: 14
