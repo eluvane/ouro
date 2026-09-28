@@ -92,7 +92,9 @@ frame() {
 # A file as a JSON string body, so the client sends the same text the checker
 # reads from disk and the reported positions line up.
 json_text() {
-	sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' "$1" | awk '{ printf "%s\\n", $0 }'
+	"$PYTHON" -c 'import json, pathlib, sys
+text = pathlib.Path(sys.argv[1]).read_bytes().decode("utf-8")
+sys.stdout.write(json.dumps(text, ensure_ascii=False)[1:-1])' "$1"
 }
 
 FIXTURES=$("$PYTHON" scripts/ouro_smith.py prepare --group lsp --out "$OUT/inputs")
