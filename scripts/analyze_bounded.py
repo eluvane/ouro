@@ -710,8 +710,8 @@ def header_skeleton_self_test() -> int:
     for newline in ("\n", "\r\n"):
         prefix = "-- preserve original locations\n\n".replace("\n", newline)
         body = "    original_body;\n".replace("\n", newline)
-        for header in headers:
-            header = header.replace("\n", newline)
+        for header_template in headers:
+            header = header_template.replace("\n", newline)
             source = prefix + header + body
             skeleton = source_skeleton(source, local_skeleton_line)
             assert skeleton == newline * 2 + header + newline
@@ -721,10 +721,10 @@ def header_skeleton_self_test() -> int:
             assert retained == original
             assert hash_text(retained[0]) == hash_text(original[0])
             checked += 1
-        for header in ("def\tcontinued (x : Nat)\n    : Nat :=\n",
+        for header_template in ("def\tcontinued (x : Nat)\n    : Nat :=\n",
                        "def continued (x : Nat)\n\t: Nat :=\n",
                        "def continued (x : Nat) \n    : Nat :=\n"):
-            header = header.replace("\n", newline)
+            header = header_template.replace("\n", newline)
             source = prefix + header + body
             expected = source if newline == "\r\n" else newline * 2 + header + newline
             assert source_skeleton(source, format_skeleton_line) == expected
