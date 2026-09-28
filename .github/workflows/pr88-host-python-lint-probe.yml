@@ -1,0 +1,164 @@
+name: PR88 host Python lint probe
+
+on:
+  push:
+    branches: [codef/pr88-host-python-lint-probe]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr88-host-python-lint-probe-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  python-checks:
+    name: Exact Python lint and API contracts
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      SOURCE_SHA: 68e16fa58bd086bbc7eac62bb0d907068a0a9361
+      BASE_SHA: c87e9bf3502b72aa362176b1d27d2b725814d278
+      REPORT_DIR: _build/triage/host-python-lint
+      PYTHONDONTWRITEBYTECODE: "1"
+      RAYON_NUM_THREADS: "1"
+    steps:
+      - name: Checkout exact diagnostic child
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 3
+          persist-credentials: false
+
+      - name: Verify source lineage and executable test
+        id: source
+        run: |
+          set -euo pipefail
+          mkdir -p "$REPORT_DIR"
+          python3 - <<'PY' 2>&1 | tee "$REPORT_DIR/source.log"
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import subprocess
+
+          def git(*args):
+              return subprocess.check_output(["git", *args], text=True).strip()
+
+          source, base = os.environ["SOURCE_SHA"], os.environ["BASE_SHA"]
+          report = {"source": source, "base": base, "head": git("rev-parse", "HEAD"), "pass": False}
+          try:
+              assert report["head"] == os.environ["GITHUB_SHA"], "checkout differs from workflow SHA"
+              assert git("rev-parse", "HEAD^") == source, "diagnostic parent differs from exact source"
+              assert git("rev-parse", source + "^") == base, "source parent differs from reviewed base"
+              assert git("diff", "--name-only", source, "HEAD").splitlines() == [
+                  ".github/workflows/pr88-host-python-lint-probe.yml"], "diagnostic scope differs"
+              report["source_paths"] = git("diff", "--name-only", base, source).splitlines()
+              assert report["source_paths"] == ["scripts/analyze_bounded.py", "scripts/api_baseline_regen_test.py"]
+              expected = {
+                  "scripts/analyze_bounded.py": ("b8f381a75bbadac07dfd7eff62ab89699a66b15d", "c54d6fb7ea8d699db964ba9f1efb559d2987d60e1b0f1b087b105de11dba6e1c"),
+                  "scripts/api_baseline_regen_test.py": ("0528a766c8150644bc3ccbb0fee10659c6cee624", "67ba9c1468ff940e4423559e0d0c182b0a1f350081dc080452962c54e96d3cc8"),
+              }
+              report["files"] = {}
+              for path, (blob, digest) in expected.items():
+                  assert git("rev-parse", source + ":" + path) == blob
+                  mode, _kind, actual_blob, _path = git("ls-tree", "HEAD", path).split()
+                  actual = hashlib.sha256(Path(path).read_bytes()).hexdigest()
+                  assert (mode, actual_blob, actual) == ("100755", blob, digest), path
+                  assert os.access(path, os.X_OK), "checkout did not preserve executable mode"
+                  report["files"][path] = {"mode": mode, "blob": actual_blob, "sha256": actual}
+              assert git("rev-parse", base + ":scripts/api_baseline_regen_test.py") == expected["scripts/api_baseline_regen_test.py"][0]
+              assert git("ls-tree", base, "scripts/api_baseline_regen_test.py").startswith("100644 ")
+              report["pass"] = True
+          finally:
+              Path(os.environ["REPORT_DIR"], "source.json").write_text(json.dumps(report, indent=2) + "\n")
+              print(json.dumps(report, sort_keys=True))
+          PY
+
+      - name: Install declared check-only Ruff
+        id: install
+        run: |
+          set -euo pipefail
+          python3 -m pip install --disable-pip-version-check --quiet ruff==0.15.21 2>&1 | tee "$REPORT_DIR/install.log"
+          ruff --version | tee "$REPORT_DIR/ruff-version.log"
+          grep -Fx 'ruff 0.15.21' "$REPORT_DIR/ruff-version.log"
+
+      - name: Run canonical full Python deny lint
+        id: ruff
+        run: |
+          set -euo pipefail
+          ruff check --config quality/ruff.toml scripts 2>&1 | tee "$REPORT_DIR/ruff.log"
+          grep -Fx 'All checks passed!' "$REPORT_DIR/ruff.log"
+
+      - name: Run existing analyzer discovery and skeleton contracts
+        id: analyze
+        if: ${{ always() && steps.source.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          python3 -B scripts/analyze_bounded.py --self-test 2>&1 | tee "$REPORT_DIR/analyze.log"
+          grep -Fx 'ANALYZE_DISCOVERY_SUITE rows=6 import-skeletons=18 api-header-skeletons=24' "$REPORT_DIR/analyze.log"
+
+      - name: Run existing API header unit contracts
+        id: api
+        if: ${{ always() && steps.source.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          python3 -B scripts/api_baseline_regen_test.py -v 2>&1 | tee "$REPORT_DIR/api-tests.log"
+          grep -E '^Ran 10 tests in [0-9.]+s$' "$REPORT_DIR/api-tests.log"
+          grep -Fx 'OK' "$REPORT_DIR/api-tests.log"
+
+      - name: Check canonical API baseline without regeneration
+        id: baseline
+        if: ${{ always() && steps.source.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          python3 -B scripts/api_baseline_regen.py --check --report "$REPORT_DIR/api-baseline.json" 2>&1 | tee "$REPORT_DIR/api-baseline.log"
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          report = json.loads(Path(os.environ["REPORT_DIR"], "api-baseline.json").read_text())
+          assert report["pass"] is True and report["check_only"] is True
+          assert report["drift"] is False and report["wrote"] is False
+          assert (report["rows"], report["std_sources"]) == (1174, 69)
+          PY
+          git diff --exit-code HEAD --
+          test -z "$(git status --porcelain --untracked-files=no)"
+
+      - name: Preserve exact outcomes
+        if: always()
+        env:
+          SOURCE_RESULT: ${{ steps.source.outcome }}
+          INSTALL_RESULT: ${{ steps.install.outcome }}
+          RUFF_RESULT: ${{ steps.ruff.outcome }}
+          ANALYZE_RESULT: ${{ steps.analyze.outcome }}
+          API_RESULT: ${{ steps.api.outcome }}
+          BASELINE_RESULT: ${{ steps.baseline.outcome }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$REPORT_DIR"
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          statuses = {name.lower(): os.environ[name + "_RESULT"]
+                      for name in ("SOURCE", "INSTALL", "RUFF", "ANALYZE", "API", "BASELINE")}
+          report = {"source": os.environ["SOURCE_SHA"], "workflow_sha": os.environ["GITHUB_SHA"],
+                    "outcomes": statuses, "pass": all(value == "success" for value in statuses.values())}
+          Path(os.environ["REPORT_DIR"], "summary.json").write_text(json.dumps(report, indent=2) + "\n")
+          print(json.dumps(report, sort_keys=True))
+          assert report["pass"], "required exact Python checks did not all succeed"
+          PY
+
+      - name: Upload small source and Python reports
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: pr88-host-python-lint-${{ github.run_id }}-${{ github.run_attempt }}
+          path: _build/triage/host-python-lint/
+          if-no-files-found: error
+          retention-days: 14
