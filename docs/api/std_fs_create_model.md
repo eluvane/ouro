@@ -60,6 +60,7 @@ def fs_create_dir_result (created : Bool) : Either FsCreateDirError Unit
 
 ```
 def fs_create_dir_released (result : Either FsCreateDirError Unit) (released : Bool)
+    : Either FsCreateDirError Unit
 ```
 
 A release failure never becomes Right and never loses an earlier claim/error.
