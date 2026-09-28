@@ -6,6 +6,10 @@ Development changes; see the [compatibility policy](docs/stability.md).
 
 ### Added
 
+- Postfix `expression where let helper ...; end` scopes sequential local values
+  and typed helpers over an expression through ordinary checked lets; see
+  [Ergonomic syntax](docs/language/ergonomic-syntax.md#helpers-after-an-expression).
+
 - `OURO-CLIPPY-ERROR-004` reports ignored results of the registered pure
   `str_parse_nat`, `str_parse_bool` and `parse_json` APIs, with alias-aware
   observation and manual failure-handling guidance. Proven nullary-constructor
