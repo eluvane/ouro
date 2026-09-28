@@ -74,7 +74,7 @@ def responses(stream):
 
 def language_server(run, directory):
     name = f"symbol{run.seed}"
-    source = PRELUDE + f"-- Hover contract for {name}.\ndef {name} (n : Nat) : Nat := S n;\ndef usage : Nat := {name} Z;\n"
+    source = PRELUDE + f"-- Hover contract for {name}.\ndef {name} (n : Nat)\n    : Nat := S n;\ndef usage : Nat := {name} Z;\n"
     path = write(directory / "symbols.ouro", source)
     uri = path.as_uri()
     lines = source.splitlines()
@@ -101,7 +101,7 @@ def language_server(run, directory):
     replies = {message["id"]: message for message in messages if "id" in message}
     run.require(set(replies) == {1, 2, 3, 4, 5}, "lsp-reply-ids", [1, 2, 3, 4, 5], sorted(replies))
     hover = json.dumps(replies[2])
-    run.require(f"def {name} (n : Nat) : Nat" in hover and f"Hover contract for {name}" in hover,
+    run.require(f"def {name} (n : Nat)\\n    : Nat" in hover and f"Hover contract for {name}" in hover,
                 "lsp-hover", name, replies[2])
     definition_result = replies[3].get("result")
     run.require(isinstance(definition_result, dict) and definition_result.get("uri") == uri
