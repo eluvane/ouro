@@ -99,7 +99,10 @@ at a report path is never removed. Listing profiles does not change reports.
 Manual and Release prepare the current compiler before running each validation
 group, including when a restored compiler cache lacks its bootstrap evidence.
 PR and Nightly validation jobs allow 120 minutes for the complete group;
-per-program execution and memory limits remain separate. PR Linux jobs depend
+per-program execution and memory limits remain separate. Independent PR matrix
+groups finish when a sibling fails. Each group retains its fail-fast command,
+and the aggregate requires every selected validation job to succeed. PR Linux
+jobs depend
 on one `Host compiler` job, which restores or builds the compiler with its
 complete bootstrap evidence and publishes a workflow-local artifact. Each
 consumer checks the producer's SHA-256 and verifies the binary, current inputs,

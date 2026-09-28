@@ -14,6 +14,22 @@ from repo_support import sha256_bytes
 import refresh_lower_bridge as refresh
 
 
+PREVIOUS_LOWER_COPIES = {'lower_xvnat': {'name': 'lower_xvnat',
+                 'source': 'compiler/lower.ouro',
+                 'source_blob': 'bd40cebe82608c5a23042f1349aea9b5964d17c1',
+                 'source_sha256': '57b4891a493f01435a28ce8ea8a217e3269b8f2dafc92b7fafe97b68853daa83',
+                 'first_line': 79,
+                 'bytes': 329,
+                 'sha256': '80d20f220b11359ed1b2b47318d8a7ae4f5713de4d9fdb6889a9afa702ebf89d'},
+ 'lower_xvascribe': {'name': 'lower_xvascribe',
+                     'source': 'compiler/lower.ouro',
+                     'source_blob': 'bd40cebe82608c5a23042f1349aea9b5964d17c1',
+                     'source_sha256': '57b4891a493f01435a28ce8ea8a217e3269b8f2dafc92b7fafe97b68853daa83',
+                     'first_line': 353,
+                     'bytes': 627,
+                     'sha256': 'c4a2be662f3835813576b4f2d9a34bd6c21cb8ef7917bf494e42d35bf2d0f0f7'}}
+
+
 class LowerBridgeRefreshTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -22,6 +38,25 @@ class LowerBridgeRefreshTests(unittest.TestCase):
         manifest, contents = read_bundle()
         cls.original, cls.contents = refresh.predecessor(encoded, manifest, contents, cls.sources)
         cls.generated, cls.changed, cls.archive, cls.encoded = refresh.compose(cls.original, cls.contents, cls.sources)
+
+    def pinned_installed_packages(self):
+        for identity, blob in (
+            (refresh.PREVIOUS_MANIFEST, '602bbe08c9c7446cbec9f056682aad7e62ca0b2c'),
+            (refresh.INTERMEDIATE_MANIFEST, 'c4fe78b32e212903d6616133651fcf4c36ab463d'),
+            (refresh.INSTALLED_MANIFEST, '01883061244d802a36b88c5e2e9e468890ed0bfb'),
+        ):
+            installed = copy.deepcopy(self.generated)
+            provenance = installed['provenance']['lowering_refresh']
+            provenance['source_blobs']['compiler/lower.ouro'] = 'bd40cebe82608c5a23042f1349aea9b5964d17c1'
+            provenance['source_blobs']['compiler/pipeline_support.ouro'] = blob
+            provenance['source_copies'] = [
+                copy.deepcopy(PREVIOUS_LOWER_COPIES[row['name']])
+                if row['source'] == 'compiler/lower.ouro' else row
+                for row in provenance['source_copies']
+            ]
+            self.assertEqual(sha256_bytes(refresh.encoded_manifest(installed)), identity)
+            yield identity, installed
+        yield refresh.NEW_MANIFEST, copy.deepcopy(self.generated)
 
     def test_source_operations_commute_and_preserve_all_other_members(self):
         previous = self.contents[refresh.MEMBER]
@@ -45,14 +80,8 @@ class LowerBridgeRefreshTests(unittest.TestCase):
         self.assertEqual(sha256_bytes(self.encoded), refresh.NEW_MANIFEST)
 
     def test_pinned_installed_packages_derive_only_new_source_metadata(self):
-        for identity, blob in (
-            (refresh.PREVIOUS_MANIFEST, '602bbe08c9c7446cbec9f056682aad7e62ca0b2c'),
-            (refresh.INTERMEDIATE_MANIFEST, 'c4fe78b32e212903d6616133651fcf4c36ab463d'),
-            (refresh.NEW_MANIFEST, refresh.SOURCE_BLOBS['compiler/pipeline_support.ouro']),
-        ):
+        for identity, installed in self.pinned_installed_packages():
             with self.subTest(identity=identity):
-                installed = copy.deepcopy(self.generated)
-                installed['provenance']['lowering_refresh']['source_blobs']['compiler/pipeline_support.ouro'] = blob
                 encoded = refresh.encoded_manifest(installed)
                 self.assertEqual(sha256_bytes(encoded), identity)
                 original, previous = refresh.predecessor(encoded, installed, self.changed, self.sources)
@@ -69,23 +98,20 @@ class LowerBridgeRefreshTests(unittest.TestCase):
                     self.assertEqual(refresh.candidate(root), result)
                 expected = copy.deepcopy(installed)
                 expected['provenance']['lowering_refresh']['source_blobs'] = refresh.SOURCE_BLOBS
+                expected['provenance']['lowering_refresh']['source_copies'] = self.generated['provenance']['lowering_refresh']['source_copies']
                 self.assertEqual(self.generated, expected)
                 self.assertEqual(self.generated['stage0'], installed['stage0'])
-                self.assertEqual(self.generated['provenance']['lowering_refresh']['source_copies'],
-                    installed['provenance']['lowering_refresh']['source_copies'])
+                for old_row, new_row in zip(installed['provenance']['lowering_refresh']['source_copies'],
+                        self.generated['provenance']['lowering_refresh']['source_copies'], strict=True):
+                    self.assertEqual({key: old_row[key] for key in ('name', 'first_line', 'bytes', 'sha256')},
+                        {key: new_row[key] for key in ('name', 'first_line', 'bytes', 'sha256')})
                 self.assertEqual(len(self.changed), 68)
-        self.assertEqual(len({refresh.PREVIOUS_MANIFEST, refresh.INTERMEDIATE_MANIFEST, refresh.NEW_MANIFEST}), 3)
+        self.assertEqual(len({refresh.PREVIOUS_MANIFEST, refresh.INTERMEDIATE_MANIFEST, refresh.INSTALLED_MANIFEST, refresh.NEW_MANIFEST}), 4)
         self.assertEqual(sha256_bytes(self.encoded), refresh.NEW_MANIFEST)
         self.assertEqual((refresh.ROOT / ARCHIVE).read_bytes(), self.archive)
 
     def test_pinned_installed_unknown_metadata_or_member_are_rejected(self):
-        for identity, blob in (
-            (refresh.PREVIOUS_MANIFEST, '602bbe08c9c7446cbec9f056682aad7e62ca0b2c'),
-            (refresh.INTERMEDIATE_MANIFEST, 'c4fe78b32e212903d6616133651fcf4c36ab463d'),
-            (refresh.NEW_MANIFEST, refresh.SOURCE_BLOBS['compiler/pipeline_support.ouro']),
-        ):
-            installed = copy.deepcopy(self.generated)
-            installed['provenance']['lowering_refresh']['source_blobs']['compiler/pipeline_support.ouro'] = blob
+        for identity, installed in self.pinned_installed_packages():
             self.assertEqual(sha256_bytes(refresh.encoded_manifest(installed)), identity)
             contents = self.changed
             with self.subTest(identity=identity):

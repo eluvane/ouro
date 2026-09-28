@@ -256,11 +256,11 @@ def result : Nat :=
   let pair : Pair Nat Nat := MkPair Nat Nat {n} {m} in
   let (MkPair left right) := pair in add left right;
 """, n + m, False
-    yield "destructure-effectful-subject", PRELUDE + f"""inductive Unit : Type := | MkUnit : Unit;
-effect Tick where | tick : Nat -> Unit
+    yield "destructure-effectful-subject", PRELUDE + f"""inductive TickResult : Type := | MkTickResult : Nat -> TickResult;
+effect Tick where | tick : Nat -> TickResult
 def result : Nat :=
-  handle let (MkUnit) := perform tick({n}) in {m} with
-  | tick (seed) resume => add (S seed) (resume MkUnit)
+  handle let (MkTickResult value) := (perform tick({n}) : TickResult) in add value {m} with
+  | tick (seed) resume => resume (MkTickResult (S seed))
   | pure value => value
   end;
 """, n + m + 1, True

@@ -141,6 +141,12 @@ law drivers, uses the same 3072 MiB limit as tool preparation. Generated program
 execution retains the configured `--memory-mb` limit; preparation failures
 remain fatal.
 
+Generated manifest suites run disjoint prefix batches against the same complete
+manifest. Each batch retains a 300-second deadline and 3072 MiB memory limit.
+The suite fails unless every selected ID appears exactly once in complete native
+reports and every batch succeeds. `manifest-batches.json` in the requested output
+directory records the selections, reports and failures.
+
 Build parallelism follows `OURO_JOBS` (default 10), capped by the runner's
 available CPUs so independent deadlines do not depend on oversubscription.
 Import/cache properties
