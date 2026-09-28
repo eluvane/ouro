@@ -44,15 +44,7 @@ def twice_then_increment : Nat -> Nat :=
 
 `std/logic.ouro` provides `flip A B C f right left`, which calls an ordinary
 binary function as `f left right`. Partially applying `flip A B C f right`
-produces a typed `A -> C` callback with the right argument fixed:
-
-```ouro
-import "../std/logic.ouro", "../std/natx.ouro", "../std/data.ouro";
-
-def only_three : List Nat :=
-  let is_three : Nat -> Bool := flip Nat Nat Bool eq_nat 3 in
-  filter Nat is_three ([1, 3, 4] : List Nat);
-```
+produces a typed `A -> C` callback with the right argument fixed.
 
 This uses ordinary partial application; the parameter types remain explicit
 and no placeholder syntax is introduced.
@@ -62,13 +54,6 @@ and no placeholder syntax is introduced.
 `std/data.ouro` provides `maybe_unwrap_or_else A fallback value` for a
 `Maybe A`. The fallback has type `Unit -> A` and is called only for `Nothing`;
 `Just x` returns `x`. Use `fromMaybe` when the default is already a value.
-
-```ouro
-import "../std/data.ouro";
-
-def port (parsed : Maybe Nat) : Nat :=
-    maybe_unwrap_or_else Nat (fun (_ : Unit) => add 8000 80) parsed;
-```
 
 `std/result.ouro` treats `Either E A` as a result: `Left` carries the error
 and `Right` carries the value. `result_unwrap_or_else E A fallback value`

@@ -50,12 +50,7 @@ of its target. An independent plain path can still expose the same declaration.
 Every imported declaration and body is checked even when hidden.
 
 Declarations are public by default. Prefix a declaration with `private` to
-keep an internal helper available inside its source file without exporting it:
-
-```ouro
-private def normalize (input : Nat) : Nat := input;
-def process (input : Nat) : Nat := normalize input;
-```
+keep an internal helper available inside its source file without exporting it.
 
 `private` applies to definitions, axioms, inductives, effects, intrinsics,
 externs, and records. A private inductive also hides its constructors; a
@@ -240,9 +235,7 @@ def choose (flag : Bool) (left : Nat) (right : Nat) : Nat :=
 
 `if` requires the registered `ouro.bool` family. The `else` arm is mandatory,
 and both arms are checked against the result type even when the condition is a
-known constructor. The condition becomes the single scrutinee of a checked
-two-arm case; the first constructor selects `then`, and the second selects
-`else`. Parenthesize a conditional when passing it as an argument.
+known constructor. Parenthesize a conditional when passing it as an argument.
 
 Use `if let` to handle one flat constructor pattern:
 
@@ -261,8 +254,7 @@ inductive family, and the pattern must name exactly its fields. Nested patterns,
 guards, and extraction into the surrounding scope are not part of this form.
 Parenthesize `if let` when passing it as an argument.
 If the subject's nominal family cannot be determined from its type, ascribe the
-subject explicitly. For example, when `item` has an alias type defined as
-`def MaybeNat : Type := Maybe Nat`, use `(item : Maybe Nat)` as the subject.
+subject explicitly.
 A result type does not select a subject family; an unresolved subject fails
 checking rather than guessing from the pattern.
 
@@ -513,16 +505,7 @@ prefix is a lexical error; an entirely empty line remains empty. Spaces and
 tabs are compared as bytes, without converting tab widths. Interior LF and
 CRLF sequences and all other bytes survive unchanged.
 
-```ouro
-def note : String := """
-  first line
-
-  second line
-  """;
-```
-
-`note` contains `first line`, an empty line, and `second line`, separated by
-LF bytes. Backslashes do not introduce escapes in this form, so `\n` is two
+Backslashes do not introduce escapes in this form, so `\n` is two
 bytes. Three quotes in the middle of a content line are data; only a triple
 quote at the start of a line after its space/tab prefix closes the literal.
 An unclosed delimiter, missing initial line break, or inconsistent indentation
@@ -537,10 +520,6 @@ bytes above ASCII. Raw non-ASCII and control bytes, physical line breaks,
 unknown escapes, and incomplete hex escapes are lexical errors. An empty byte
 literal needs an expected `List Nat` type. Import paths remain `String`
 literals; `import b"..."` is rejected.
-
-```ouro
-def packet : List Nat := b"OK\x00\xFF";
-```
 
 Import `std/string.ouro` to use the standard `String` type and helpers. A
 standalone prelude must declare `intrinsic String : Type := "ouro.string";`.
@@ -579,11 +558,7 @@ def inferred : List Nat := let values := [Z, S Z] in values;
 def nested : List (List Nat) := let rows := [[Z], []] in rows;
 ```
 
-A local type ascription can provide the expected element type:
-
-```ouro
-def count : Nat := (([Z, S Z] : List Nat) |> length Nat);
-```
+A local type ascription can provide the expected element type.
 
 The compiler checks an expression against its ascribed type even when an
 enclosing untyped local binding does not use the expression's value.
@@ -746,9 +721,7 @@ uses `let!` for an action's result, and uses ordinary `let` for a pure value:
 
 ```ouro
 def echo : IO Unit :=
-  do let label : String := "Name: ";
-     print label;
-     let! line := readLine;
+  do let! line := readLine;
      println line
 ```
 

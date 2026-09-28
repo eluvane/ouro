@@ -127,16 +127,9 @@ same nested `EApp` tree as ordinary application.
 ## Trailing lambda calls
 
 After a nonempty positional call group, `{ name -> body }` supplies one final
-callback argument:
+callback argument.
 
-```ouro
-def with_value (value : Nat) (callback : Nat -> Nat) : Nat := callback value;
-
-def next : Nat := with_value(2) { value -> add value 1 };
-```
-
-This has the same checked application as
-`with_value 2 (fun value => add value 1)`. The callback parameter uses the
+The callback parameter uses the
 expected function type, as for a short `fun` lambda. The body is one
 expression and may contain local bindings, record literals, and record
 updates; record literals retain their usual nominal type-context requirement.
@@ -246,13 +239,7 @@ every initializer, including the last. Comments and line breaks are allowed.
 Typed parameters, grouped binders, and inferred helper results use the same
 rules as the local helper declarations above.
 
-The block lowers to ordinary sequential lets, in helper source order:
-
-```text
-body where let first : A := value; let second : B := next; end
-==
-let first : A := value in let second : B := next in body
-```
+The block lowers to ordinary sequential lets, in helper source order.
 
 Every helper is visible in `body`; an initializer sees only earlier helpers and
 outer bindings. Its own name is not in scope there, and parameters stay within
@@ -263,17 +250,7 @@ does not create top-level named-call metadata.
 The postfix applies to the complete expression, including pipes and `??`:
 `value |> apply where
 let value := initial; let apply (input : T) := input; end` puts both names in
-scope over the pipe. An ordinary lambda still extends to the right:
-
-```text
-fun (value : T) => use value where let use (input : T) := input; end
-==
-fun (value : T) => let use := fun (input : T) => input in use value
-
-(fun (value : T) => use value) where let use (input : T) := input; end
-==
-let use := fun (input : T) => input in fun (value : T) => use value
-```
+scope over the pipe. An ordinary lambda still extends to the right.
 
 Parentheses select the whole lambda, or one argument of a larger call.
 The final body of an ordinary `let`, scoped `open`, or `do` statement follows
@@ -440,11 +417,6 @@ type context as record literals elsewhere.
 
 ## Checked destructuring lets
 
-```ouro
-let (MkPair left right) := pair in add left right
-let { let (MkPair left _) := pair; left }
-```
-
 The pattern is one constructor with flat field names or `_` wildcards, enclosed
 in parentheses. It is accepted only when the existing checked `match` for that
 single branch is exhaustive. The parser constructs `EMatch` with one `EBranch`;
@@ -513,10 +485,6 @@ argument as `x := x`, preserving declaration field order. Missing, duplicate,
 and unknown fields remain errors.
 
 ## Record field destructuring
-
-```ouro
-let { host, port } : Config := loadConfig in host
-```
 
 This local expression form selects distinct fields of a directly named local
 nominal record. The annotated subject is evaluated once, then checked accessors
@@ -595,12 +563,6 @@ new kernel form or effect handler.
 
 ## Maybe fallback operator
 
-```ouro
-import "std/types.ouro";
-def choose (value : Maybe Nat) (compute_fallback : Unit -> Nat) : Nat :=
-  value ?? compute_fallback MkUnit;
-```
-
 For the registered `ouro.maybe` family, `value` must have type `Maybe A` and
 the fallback must have type `A`. `Just payload` returns the payload;
 `Nothing` evaluates and returns the fallback. The compiler lowers this to one
@@ -653,12 +615,3 @@ AST reuse alone does not establish editor behavior. The dedicated parser,
 formatter, frontend/security, Clippy, bootstrap, and PR gates remain required
 for toolchain acceptance; [CI](../ci.md#local-profiles) owns the maintained
 validation commands.
-
-## Character literals
-
-Single-quoted characters are Unicode scalar ordinals of the existing `Nat`
-type: `'A'` equals `65`, while `'é'` equals `233` despite occupying two UTF-8
-bytes. The lexer produces `TNat` and both parsers retain `ENat`; declaration
-checking uses the existing nominal Nat contract. Source spans and formatter
-text retain the complete original spelling. See
-[Numbers and strings](../syntax.md#numbers-and-strings) for escapes and errors.
