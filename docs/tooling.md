@@ -144,6 +144,12 @@ preserves comments and hand-aligned continuation lines.
 Unknown options, conflicting write/check modes and mixed file/selftest modes
 exit `2` before reading or changing source files.
 
+For a flat comma call already spread across lines, with each argument and the
+closing parenthesis on its own line, the formatter indents arguments two spaces
+past the opening line and aligns the closing parenthesis. It preserves comments,
+quoted text, line breaks, and the presence or absence of a trailing comma.
+Nested groups and declaration parameter lists keep their existing layout.
+
 ## Autofixer
 
 ```sh
