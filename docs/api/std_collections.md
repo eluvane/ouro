@@ -26,6 +26,7 @@ def filter_map (A : Type) (B : Type) (f : A -> Maybe B) : List A -> List B
 
 ```
 def map_indexed (A : Type) (B : Type) (f : Nat -> A -> B)
+    (xs : List A) : List B
 ```
 
 ## def indexed
@@ -64,6 +65,7 @@ Complete overlapping windows; width zero has no windows.
 
 ```
 def list_scan (A : Type) (S : Type) (step : S -> A -> S)
+    (initial : S) (xs : List A) : List S
 ```
 
 The initial state is the first result, even for an empty input.
@@ -72,6 +74,8 @@ The initial state is the first result, even for an empty input.
 
 ```
 def list_map_accum (A : Type) (S : Type) (B : Type)
+    (step : S -> A -> Pair S B) (initial : S) (xs : List A)
+    : Pair S (List B)
 ```
 
 ## def list_eq
@@ -120,6 +124,7 @@ def dedup_adjacent (A : Type) (eq : A -> A -> Bool) : List A -> List A
 
 ```
 def list_group_by (A : Type) (K : Type) (eq : K -> K -> Bool)
+    (key : A -> K) (xs : List A) : List (Pair K (List A))
 ```
 
 Keys and elements retain first-seen order; eq must identify equivalent keys.
@@ -128,30 +133,36 @@ Keys and elements retain first-seen order; eq must identify equivalent keys.
 
 ```
 def partition_map (A : Type) (L : Type) (R : Type) (f : A -> Either L R)
+    : List A -> Pair (List L) (List R)
 ```
 
 ## def list_collect_results
 
 ```
 def list_collect_results (E : Type) (A : Type)
+    : List (Either E A) -> Either E (List A)
 ```
 
 ## def list_traverse_result
 
 ```
 def list_traverse_result (E : Type) (A : Type) (B : Type)
+    (f : A -> Either E B) (xs : List A) : Either E (List B)
 ```
 
 ## def list_try_fold_result
 
 ```
 def list_try_fold_result (E : Type) (A : Type) (S : Type)
+    (step : S -> A -> Either E S) (initial : S) (xs : List A)
+    : Either E S
 ```
 
 ## def list_try_fold_maybe
 
 ```
 def list_try_fold_maybe (A : Type) (S : Type)
+    (step : S -> A -> Maybe S) (initial : S) (xs : List A) : Maybe S
 ```
 
 ## def list_traverse_maybe

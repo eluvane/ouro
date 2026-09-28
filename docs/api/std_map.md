@@ -108,6 +108,7 @@ def map_filter (V : Type) (p : String -> V -> Bool) (m : Map V) : Map V
 
 ```
 def map_fold (V : Type) (B : Type) (f : String -> V -> B -> B) (z : B)
+    (m : Map V) : B
 ```
 
 ## def map_of_strings

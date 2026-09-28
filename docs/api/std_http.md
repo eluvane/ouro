@@ -166,4 +166,5 @@ def http_fail (msg : String) : HttpResp
 
 ```
 def http_post (url : String) (headers : List (Pair String String))
+    (body : String) : IO HttpResp
 ```

@@ -32,6 +32,7 @@ def table_rows (rows : List (List String)) : List (List String)
 
 ```
 def table_cell (header : List String) (row : List String) (name : String)
+    : Maybe String
 ```
 
 ## def table_record
@@ -68,12 +69,14 @@ def table_require_col (header : List String) (name : String) : Either String Nat
 
 ```
 def table_project_row (header : List String) (names : List String)
+    (row : List String) : List String
 ```
 
 ## def table_project
 
 ```
 def table_project (rows : List (List String)) (names : List String)
+    : List (List String)
 ```
 
 ## def table_count_rows

@@ -26,6 +26,7 @@ def nth (A : Type) (d : A) : Nat -> List A -> A
 
 ```
 def foldl (A : Type) (B : Type) (f : B -> A -> B)
+    (acc : B) (xs : List A) : B
 ```
 
 Left fold. prelude has foldr only, and a scanner that carries state through a list of lines wants the accumulator threaded front to back.
@@ -142,6 +143,7 @@ def is_prefix (A : Type) (eq : A -> A -> Bool) : List A -> List A -> Bool
 
 ```
 def index_of (A : Type) (eq : A -> A -> Bool) (x : A)
+    (xs : List A) : Maybe Nat
 ```
 
 ## def zip_with

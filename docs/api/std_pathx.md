@@ -154,6 +154,7 @@ def path_norm_step (absolute : Bool) (seg : String) (acc : List String) : List S
 
 ```
 def path_normalize_go (absolute : Bool) (parts : List String)
+    (acc : List String) : List String
 ```
 
 ## def path_normalize

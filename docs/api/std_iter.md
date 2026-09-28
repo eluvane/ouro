@@ -26,28 +26,37 @@ inductive IterCollectError (Error : Type) : Type
 
 ```
 def iter_from_list (Error : Type) (Item : Type) (xs : List Item)
+    : Iterator (List Item) Error Item
 ```
 
 ## def iter_map
 
 ```
 def iter_map (State : Type) (Error : Type) (Item : Type) (Mapped : Type)
+    (convert : Item -> Mapped) (source : Iterator State Error Item)
+    : Iterator State Error Mapped
 ```
 
 ## def iter_filter
 
 ```
 def iter_filter (State : Type) (Error : Type) (Item : Type)
+    (accept : Item -> Bool) (source : Iterator State Error Item)
+    : Iterator State Error Item
 ```
 
 ## def iter_take
 
 ```
 def iter_take (State : Type) (Error : Type) (Item : Type)
+    (count : Nat) (source : Iterator State Error Item)
+    : Iterator (Pair Nat State) Error Item
 ```
 
 ## def collect_list
 
 ```
 def collect_list (State : Type) (Error : Type) (Item : Type)
+    (max_pulls : Nat) (source : Iterator State Error Item)
+    : Either (IterCollectError Error) (List Item)
 ```
