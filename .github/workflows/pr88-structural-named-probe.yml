@@ -1,0 +1,239 @@
+name: PR88 structural named-call diagnostics
+
+on:
+  push:
+    branches: [codef/pr88-structural-named-probe]
+    paths: [.github/workflows/pr88-structural-named-probe.yml]
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: pr88-structural-named-probe-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  structural-probes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    env:
+      OURO_JOBS: '1'
+      OURO_BUILD_TOOL_MODE: native
+    defaults:
+      run:
+        shell: bash
+        working-directory: source
+    steps:
+      - name: Checkout diagnostic workflow
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          path: driver
+          fetch-depth: 2
+      - name: Require a workflow-only child of reviewed source
+        working-directory: driver
+        run: |
+          test "$(git rev-parse HEAD^)" = 973c3a21342e9d6e029479fb33ed7207d010c1bd
+          test "$(git diff-tree --no-commit-id --name-only -r HEAD)" = .github/workflows/pr88-structural-named-probe.yml
+      - name: Checkout unchanged product source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: 973c3a21342e9d6e029479fb33ed7207d010c1bd
+          path: source
+      - name: Guard source, fixture and compiler owners
+        run: |
+          test "$(git rev-parse HEAD)" = 973c3a21342e9d6e029479fb33ed7207d010c1bd
+          test -z "$(git status --porcelain)"
+          python3 - <<'PY'
+          import hashlib, subprocess
+          from pathlib import Path
+          blobs = {
+              'tests/compiler_structural_tests.ouro': '6d5aa5df32c894abeabb529d4035e3aebb886ff1',
+              'compiler/lower_env.ouro': '56776adc3e2683aa51e01c9c54a608e18459b94a',
+              'compiler/lower.ouro': '13f4fc2fab55f8e6928fff31c9cd993767c8873e',
+              'compiler/lower_named.ouro': '6d6a481c698fcc390a40bfa807441be8a6828878',
+              'compiler/core.ouro': '9c854884896b4385c2046e61e3729b07d78c9476',
+              'runtime/frontend_link.c': 'f10104eb4bc30055dabb3163a82f181c6eae9f1a',
+              'scripts/bootstrap_compiler.py': '937f93c11a055e42c0ecb22f8c10fce2d748817c',
+              'scripts/ci_gate.py': '16ea86bf60a3d3347c30af2f562a6b6b500b89ef',
+              'scripts/ouro1.sh': '9665ebb00049d05c097a29d77ec5083b524f9e2d',
+              'scripts/ourosmith/limits.py': 'aa92339539ea580b0a2569d7df7f085f94765156',
+          }
+          for path, digest in blobs.items():
+              actual = subprocess.check_output(['git', 'hash-object', path], text=True).strip()
+              assert actual == digest, (path, actual)
+          fixture = Path('tests/compiler_structural_tests.ouro').read_bytes()
+          assert hashlib.sha256(fixture).hexdigest() == '05d41c4cb875c4d063f8174886a57d3c1b707870f104d736789dd57200c6c391'
+          Path('_build/ci/structural-named-probe').mkdir(parents=True)
+          PY
+          python3 scripts/ci_gate.py --compiler-artifact key > _build/ci/structural-named-probe/key.stdout
+          test "$(cat _build/ci/structural-named-probe/key.stdout)" = key=f555bfcaed518aea0e7bc97f04bc5a00638073c071a8ce37388644c9f766934c
+      - name: Download official matching Host
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          artifact-ids: 10946340921
+          run-id: 36360415225
+          github-token: ${{ github.token }}
+          path: source/_build/ci
+          merge-multiple: true
+      - name: Import with the unchanged source-bound verifier
+        run: |
+          python3 scripts/ci_gate.py --compiler-artifact import --compiler-sha256 e72a0940bb011243611bacc8bc348a4352e55c81017ec36e7d9c1ad1e6524da7
+          python3 - <<'PY'
+          import hashlib, json
+          from pathlib import Path
+          receipt = json.loads(Path('_build/c/ouro1.bootstrap.json').read_text())
+          selected = receipt['selected']
+          assert receipt['kind'] == 'ouro.current-c-bootstrap.v1'
+          assert receipt['key'] == 'f555bfcaed518aea0e7bc97f04bc5a00638073c071a8ce37388644c9f766934c'
+          assert receipt['binary_sha256'] == '460904e03e90958461ca1c007505ae76209fdc68727feca32f834f6b0fbe019c'
+          assert hashlib.sha256(Path('_build/c/ouro1').read_bytes()).hexdigest() == receipt['binary_sha256']
+          assert len(selected['sources']) == 177 and len(selected['stage0']) == 2
+          for inputs in (selected['sources'], selected['stage0']):
+              for path, digest in inputs.items():
+                  assert hashlib.sha256(Path(path).read_bytes()).hexdigest() == digest, path
+          report = json.loads((Path(receipt['work']) / 'report.json').read_text())
+          assert report['pass'] and not report['changed_inputs']
+          comparisons = report['complete_generated_c_comparison']
+          assert set(comparisons) == {'driver_u.c', 'backend_u.c'}
+          for row in comparisons.values():
+              assert row['p1_sha256'] == row['p2_sha256']
+          evidence = {'source_sha': '973c3a21342e9d6e029479fb33ed7207d010c1bd',
+                      'key': receipt['key'], 'binary_sha256': receipt['binary_sha256'],
+                      'sources': selected['sources'], 'stage0': selected['stage0'],
+                      'complete_generated_c_comparison': comparisons}
+          Path('_build/ci/structural-named-probe/host-receipt.json').write_text(json.dumps(evidence, indent=2) + '\n')
+          PY
+      - name: Check source-derived diagnostic variants under unchanged acceptance
+        run: |
+          python3 - <<'PY'
+          import difflib, hashlib, json, os, re, sys
+          from pathlib import Path
+          sys.path.insert(0, str(Path('scripts').resolve()))
+          from ourosmith.limits import clean_env, run_limited
+
+          def make_variants(source):
+              start = source.index('def structural_named_order_and_freshness : Bool :=\n')
+              stop = source.index('def structural_named_rejected ', start)
+              original = source[start:stop]
+              outer = '    | SLet first first_value first_domain body =>\n'
+              inner = '        | SLet second second_value second_domain applied =>\n'
+              outer_start = original.index(outer) + len(outer)
+              outer_stop = original.index('\n    | SVar _ => False\n', outer_start) + 1
+              inner_start = original.index(inner) + len(inner)
+              inner_stop = original.index('\n        | SVar _ => False\n', inner_start) + 1
+              call = original[original.index('    match ') + len('    match '):original.index(' with\n')]
+              checks = [
+                  'structural_named_var_is first_value 40',
+                  'structural_named_var_is second_value 41',
+                  'structural_named_ind_is first_domain 9',
+                  'structural_named_ind_is second_domain 9',
+                  'ltb_nat 41 first',
+                  'eqNat second (S first)',
+                  'structural_named_applied_is applied first second',
+              ]
+              for check in checks:
+                  assert original.count(check) == 1, check
+              def branch(expression):
+                  body = '\n'.join('            ' + line for line in expression.splitlines()) + '\n'
+                  return original[:inner_start] + body + original[inner_stop:]
+              typed = ['let probe_named_check_' + str(i) + ' : Bool := ' + check + ' in'
+                       for i, check in enumerate(checks)]
+              folded = 'probe_named_check_6'
+              for i in reversed(range(6)):
+                  folded = 'andb(probe_named_check_' + str(i) + ', ' + folded + ')'
+              typed.append(folded)
+              rename = {'first': 'probe_named_outer_index', 'first_value': 'probe_named_outer_value',
+                        'first_domain': 'probe_named_outer_domain', 'body': 'probe_named_outer_body',
+                        'second': 'probe_named_inner_index', 'second_value': 'probe_named_inner_value',
+                        'second_domain': 'probe_named_inner_domain', 'applied': 'probe_named_inner_applied'}
+              renamed = re.sub(r'\b(' + '|'.join(rename) + r')\b', lambda match: rename[match.group()], original)
+              assert all(name not in source[:start] + source[stop:] for name in rename.values())
+              variants = [
+                  ('original-control', 'original expected CErr41 detail3634', original),
+                  ('lower-call', 'reduction: call assigned Surface, no match',
+                   'def structural_named_order_and_freshness : Bool :=\n    let probe_named_term : Surface := ' + call + ' in\n    False;\n\n'),
+                  ('outer-shape', 'reduction: outer SLet with False branch',
+                   original[:outer_start] + '        False\n' + original[outer_stop:]),
+                  ('nested-shape', 'reduction: both SLet matches with False branch', branch('False')),
+                  ('first-value', 'reduction: outer value application only', branch(checks[0])),
+                  ('second-value', 'reduction: inner value application only', branch(checks[1])),
+                  ('first-domain', 'reduction: outer domain application only', branch(checks[2])),
+                  ('second-domain', 'reduction: inner domain application only', branch(checks[3])),
+                  ('freshness', 'reduction: both Nat binder applications', branch('andb(' + checks[4] + ', ' + checks[5] + ')')),
+                  ('applied', 'reduction: applied Surface and both Nat binders', branch(checks[6])),
+                  ('typed-bool-locals', 'same seven checks with typed Bool locals', branch('\n'.join(typed))),
+                  ('unique-binder-names', 'same seven checks with unique names', renamed),
+              ]
+              assert len(variants) == 12
+              prefix, suffix = source[:start], source[stop:]
+              return [(label, purpose, prefix + replacement + suffix, replacement)
+                      for label, purpose, replacement in variants]
+
+          root = Path.cwd()
+          out = root / '_build/ci/structural-named-probe'
+          original_path = Path('tests/compiler_structural_tests.ouro')
+          original_bytes = original_path.read_bytes()
+          original = original_bytes.decode('utf-8')
+          source_sha256 = hashlib.sha256(original_bytes).hexdigest()
+          assert source_sha256 == '05d41c4cb875c4d063f8174886a57d3c1b707870f104d736789dd57200c6c391'
+          cpu = str(min(os.sched_getaffinity(0)))
+          env = clean_env()
+          env.update({'OURO_JOBS': '1', 'OURO_BUILD_TOOL_MODE': 'native'})
+          rows = []
+          for label, purpose, derived, replacement in make_variants(original):
+              if label == 'original-control':
+                  path = original_path
+                  assert derived == original
+              else:
+                  path = Path('tests/__pr88_structural_' + label.replace('-', '_') + '.ouro')
+                  assert not path.exists(), path
+                  path.write_text(derived, encoding='utf-8', newline='\n')
+              patch = ''.join(difflib.unified_diff(original.splitlines(True), derived.splitlines(True),
+                                                fromfile=str(original_path), tofile=str(path)))
+              (out / (label + '.diff')).write_text(patch, encoding='utf-8')
+              command = ['/usr/bin/time', '-v', '-o', str(out / (label + '.time')),
+                         'taskset', '-c', cpu, 'sh', 'scripts/ouro1.sh', 'check', str(path)]
+              result = run_limited(command, cwd=root, env=env, timeout_s=300, memory_mb=2944)
+              (out / (label + '.stdout')).write_text(result.stdout, encoding='utf-8')
+              (out / (label + '.stderr')).write_text(result.stderr, encoding='utf-8')
+              errors = [{'code': int(code), 'detail': int(detail)}
+                        for code, detail in re.findall(r'CErr code=(\d+) det=(\d+)', result.stderr)]
+              checked = result.ok and re.search(r'^CHECK_OK(?:\s|$)', result.stdout, re.M) is not None
+              row = {'label': label, 'purpose': purpose, 'argv': result.argv,
+                     'status': result.status, 'returncode': result.returncode,
+                     'elapsed_s': result.elapsed_s, 'compiler_checked': checked, 'errors': errors,
+                     'source_sha256': hashlib.sha256(derived.encode('utf-8')).hexdigest(),
+                     'original_sha256': source_sha256, 'cpu': cpu,
+                     'timeout_s': 300, 'memory_mib': 2944,
+                     'note': 'native type check only; reduced predicates do not establish assertion truth'}
+              rows.append(row)
+              (out / (label + '.json')).write_text(json.dumps(row, indent=2) + '\n')
+              (out / 'results.json').write_text(json.dumps(rows, indent=2) + '\n')
+              print('DIAGNOSTIC_CASE ' + json.dumps(row, sort_keys=True), flush=True)
+          assert original_path.read_bytes() == original_bytes
+          control = rows[0]
+          control_matches = (control['status'] == 'ok' and control['returncode'] == 1
+                             and control['errors'] == [{'code': 41, 'detail': 3634}]
+                             and not control['compiler_checked'])
+          complete = {'collected': len(rows), 'expected': 12, 'control_matches': control_matches,
+                      'original_fixture_unchanged': True, 'source_sha256': source_sha256,
+                      'claim': 'diagnostic collection only; original product check remains rejected'}
+          (out / 'collection.json').write_text(json.dumps(complete, indent=2) + '\n')
+          assert control_matches, control
+          # Retain the original failed gate verdict after collecting every reduction.
+          raise SystemExit(control['returncode'])
+          PY
+      - name: Upload small diagnostic receipts and exact check outputs
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: pr88-structural-named-probe-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            source/_build/ci/structural-named-probe/*.json
+            source/_build/ci/structural-named-probe/*.stdout
+            source/_build/ci/structural-named-probe/*.stderr
+            source/_build/ci/structural-named-probe/*.time
+            source/_build/ci/structural-named-probe/*.diff
+          if-no-files-found: error
+          retention-days: 14
