@@ -70,6 +70,7 @@ class LowerBridgeRefreshTests(unittest.TestCase):
             yield identity, installed
         installed = copy.deepcopy(self.generated)
         provenance = installed['provenance']['lowering_refresh']
+        provenance['source_blobs']['compiler/pipeline_support.ouro'] = '01883061244d802a36b88c5e2e9e468890ed0bfb'
         provenance['source_blobs']['compiler/lower_spread.ouro'] = PREVIOUS_SPREAD_COPY['source_blob']
         provenance['source_copies'] = [
             copy.deepcopy(PREVIOUS_SPREAD_COPY) if row['source'] == 'compiler/lower_spread.ouro' else row
@@ -77,6 +78,10 @@ class LowerBridgeRefreshTests(unittest.TestCase):
         ]
         self.assertEqual(sha256_bytes(refresh.encoded_manifest(installed)), refresh.LATEST_INSTALLED_MANIFEST)
         yield refresh.LATEST_INSTALLED_MANIFEST, installed
+        installed = copy.deepcopy(self.generated)
+        installed['provenance']['lowering_refresh']['source_blobs']['compiler/pipeline_support.ouro'] = '01883061244d802a36b88c5e2e9e468890ed0bfb'
+        self.assertEqual(sha256_bytes(refresh.encoded_manifest(installed)), refresh.PRE_SPLIT_MANIFEST)
+        yield refresh.PRE_SPLIT_MANIFEST, installed
         yield refresh.NEW_MANIFEST, copy.deepcopy(self.generated)
 
     def test_source_operations_commute_and_preserve_all_other_members(self):
@@ -127,7 +132,7 @@ class LowerBridgeRefreshTests(unittest.TestCase):
                     self.assertEqual({key: old_row[key] for key in ('name', 'first_line', 'bytes', 'sha256')},
                         {key: new_row[key] for key in ('name', 'first_line', 'bytes', 'sha256')})
                 self.assertEqual(len(self.changed), 68)
-        self.assertEqual(len({refresh.PREVIOUS_MANIFEST, refresh.INTERMEDIATE_MANIFEST, refresh.INSTALLED_MANIFEST, refresh.LATEST_INSTALLED_MANIFEST, refresh.NEW_MANIFEST}), 5)
+        self.assertEqual(len({refresh.PREVIOUS_MANIFEST, refresh.INTERMEDIATE_MANIFEST, refresh.INSTALLED_MANIFEST, refresh.LATEST_INSTALLED_MANIFEST, refresh.PRE_SPLIT_MANIFEST, refresh.NEW_MANIFEST}), 6)
         self.assertEqual(sha256_bytes(self.encoded), refresh.NEW_MANIFEST)
         self.assertEqual((refresh.ROOT / ARCHIVE).read_bytes(), self.archive)
 
