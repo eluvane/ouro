@@ -294,7 +294,7 @@ def chain(work: Path, snapshot: dict, build) -> dict:
             if variant == "good" and (result.stdout != "CHECK_OK\n" or result.stderr):
                 fail("current P2 positive behavior was not accepted")
             expected = ("bootstrap-bad.ouro: type mismatch in exact_index\nCHECK_FAIL: front end rejected the input\n"
-                        "ouro1: CErr tag=0 n=1\nouro1: CErr code=41 det=78\n")
+                        "ouro1: CErr tag=0 n=1\nouro1: CErr code=41 det=80\n")
             if variant == "bad" and (result.returncode != 1 or result.stdout or result.stderr != expected):
                 fail("current P2 negative behavior did not preserve the exact rejection")
         report.update(binary=producer.relative_to(work).as_posix(), binary_sha256=sha256_file(producer), **{"pass": True})
