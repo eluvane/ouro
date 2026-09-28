@@ -52,6 +52,7 @@ EXPR = {
     "ENamedCall": "feature:form:named-call",
     "EIf": "feature:form:if-expression",
     "EIfLet": "feature:form:if-let-expression",
+    "ECoalesce": "feature:form:coalesce-value",
 }
 DECL = {"DDef": "feature:prelude", "DAxiom": "negative:effect-root-assumption-type", "DInductive": "feature:prelude",
         "DEffect": "feature:form:handler", "DImport": "property:import-dependency-order",
@@ -61,7 +62,8 @@ TOKEN = dict.fromkeys(("TIdent", "TNat", "TKeyword", "TType", "TColon", "TColonE
 TOKEN.update({"THole": "negative:named-hole", "TString": "feature:string-length", "TByteString": "feature:form:byte-string", "TComma": "feature:form:list",
               "TBraceL": "feature:form:record", "TBraceR": "feature:form:record", "TBind": "property:test-known-counts",
               "TPipe": "feature:pipe", "TBracketL": "feature:form:list", "TBracketR": "feature:form:list",
-              "TDotDot": "feature:form:list-spread", "TDotDotEq": "feature:form:range-literal"})
+              "TDotDot": "feature:form:list-spread", "TDotDotEq": "feature:form:range-literal",
+              "TCoalesce": "feature:form:coalesce-value"})
 KEYWORD = dict.fromkeys(("kwDef", "kwInductive", "kwFun", "kwMatch", "kwWith", "kwEnd", "kwLet", "kwIn", "kwFix",
                         "kwIntrinsic", "kwRepresentation"), "feature:prelude")
 KEYWORD.update({"kwImport": "property:import-dependency-order", "kwEffect": "feature:form:handler",

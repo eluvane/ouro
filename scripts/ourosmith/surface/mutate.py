@@ -37,6 +37,11 @@ def result : Nat := value;
 """, ("CErr code=44",), fuel=300),
         Mutation("parse-missing-colon", prefix + f"def {name} Nat := Z;", ("CErr code=1", "CErr code=10")),
         Mutation("type-mismatch", prefix + f"def {name} : Nat := True;", ("CErr code=41",)),
+        Mutation("coalesce-fallback-type", prefix + f"""inductive Choice (A : Type) : Type :=
+  | Empty : Choice A | Full : A -> Choice A;
+representation Choice := "ouro.maybe";
+def {name} : Nat := (Full Nat {number}) ?? True;
+""", ("CErr code=41",)),
         Mutation("definition-self-reference", prefix + f"def {name} : Nat := {name};", ("CErr code=41",)),
         Mutation("effect-root-body-type", prefix + "effect Counter where\n  | step : Nat -> Nat\n"
                  + f"def {name} : Nat := True;", ("CErr code=41",)),

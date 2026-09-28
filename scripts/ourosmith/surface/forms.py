@@ -37,6 +37,22 @@ def result : Nat :=
   | pure value => value
   end;
 """, n + 1, True
+    yield "coalesce-value", PRELUDE + f"""inductive Choice (A : Type) : Type :=
+  | Empty : Choice A | Full : A -> Choice A;
+representation Choice := "ouro.maybe";
+def select (choice : Choice Nat) : Nat := choice ?? {m};
+def result : Nat := add (select (Full Nat {n})) (select (Empty Nat));
+""", n + m, False
+    yield "coalesce-lazy-fallback", PRELUDE + f"""inductive Choice (A : Type) : Type :=
+  | Empty : Choice A | Full : A -> Choice A;
+representation Choice := "ouro.maybe";
+effect Probe where | bump : Nat -> Nat
+def result : Nat :=
+  handle (Full Nat {n}) ?? perform bump({m}) with
+  | bump (value) resume => resume (S value)
+  | pure value => value
+  end;
+""", n, True
     text = f'handle perform ?goal{seed}\\"\n'
     yield "text-keywords", PRELUDE + f"""-- handle perform ?unresolved must remain comment text
 def message : String := {json.dumps(text)};
