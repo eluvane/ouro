@@ -331,6 +331,21 @@ The lineage also records earlier seed and compatibility changes. These pinned
 inputs stay separate from the current source snapshot and its acceptance checks
 until the native bootstrap can replace this C-hosted chain.
 
+The manifest's `compact_nat_refresh` records the current source slices copied
+into the historical bridge's Nat lowerer. It changes one Ouro member; the
+historical checker, runtime, stage0 pair, and import graph remain pinned.
+To reproduce that refresh from its exact feature source and predecessor bundle
+(the hashes are guarded by the script), run:
+
+```sh
+python3 -B scripts/refresh_nat_bridge.py
+python3 -B scripts/refresh_nat_bridge.py --write
+```
+
+The refreshed package still requires the full current P1/P2 C comparison, ABI
+laws, and behavior checks before publishing a current compiler. The inventory
+and unpack/repack commands below verify the installed package.
+
 The consumer validates the entire archive inventory before extraction. It
 rejects links, traversal, duplicate, extra, or missing members and size/hash
 mismatches, and extracts only into a new private directory. To inspect the
