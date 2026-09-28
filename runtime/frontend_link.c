@@ -13,6 +13,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdarg.h>
+#include <time.h>
 
 /* Quality tooling uses the same compiler-owned parser repeatedly without the
    driver's compile-unit phase seam. Scope only its temporary allocations;
@@ -563,6 +564,261 @@ static ouro_v *closed_preprocess_src(void)
 	return fn;
 }
 
+/* Disposable emit-only tracing: counters and heap reads never retain Ouro values. */
+static int g_fe_stitch_trace;
+static unsigned long long g_fe_lower_calls;
+static unsigned long long g_fe_compile_calls;
+static unsigned long long g_fe_elaborate_surfaces_calls;
+static unsigned long long g_fe_elaborate_calls;
+static unsigned long long g_fe_check_calls;
+static int g_fe_lower_cost_trace;
+static int g_fe_lower_cost_valid;
+static int g_fe_lower_cost_active;
+static int g_fe_lower_cost_class;
+
+typedef struct {
+	unsigned long long calls, eval_ns, clone_ns, reset_ns;
+	unsigned long long eval_alloc_bytes, clone_alloc_bytes;
+} fe_lower_cost;
+
+static fe_lower_cost g_fe_lower_cost_total[6];
+static fe_lower_cost g_fe_lower_cost_window[6];
+static unsigned long long g_fe_lower_window_first;
+static unsigned long long g_fe_decl_type_calls, g_fe_io_payload_calls;
+static unsigned long long g_fe_definition_count, g_fe_checker_lower_calls;
+
+static void fe_stitch_trace_start(void)
+{
+	const char *memory = getenv("OURO_MEM_TRACE");
+	const char *stitch = getenv("OURO_FE_STITCH_TRACE");
+	const char *emit = getenv("OURO_EMIT_IO_SHIMS");
+	const char *cost = getenv("OURO_FE_LOWER_COST_TRACE");
+	g_fe_stitch_trace = memory != 0 && strcmp(memory, "1") == 0 &&
+		stitch != 0 && strcmp(stitch, "1") == 0 &&
+		emit != 0 && strcmp(emit, "1") == 0;
+	g_fe_lower_calls = 0;
+	g_fe_compile_calls = 0;
+	g_fe_elaborate_surfaces_calls = 0;
+	g_fe_elaborate_calls = 0;
+	g_fe_check_calls = 0;
+	g_fe_lower_cost_trace = g_fe_stitch_trace && cost != 0 && strcmp(cost, "1") == 0;
+	g_fe_lower_cost_valid = 1;
+	g_fe_lower_cost_active = 0;
+	g_fe_lower_cost_class = 0;
+	g_fe_lower_window_first = 1;
+	g_fe_decl_type_calls = g_fe_io_payload_calls = 0;
+	g_fe_definition_count = g_fe_checker_lower_calls = 0;
+	memset(g_fe_lower_cost_total, 0, sizeof(g_fe_lower_cost_total));
+	memset(g_fe_lower_cost_window, 0, sizeof(g_fe_lower_cost_window));
+}
+
+static void fe_stitch_marker(const char *label, unsigned long long index)
+{
+	if (!g_fe_stitch_trace)
+		return;
+	fprintf(stderr,
+		"OURO_FE_STITCH label=%s index=%llu live_bytes=%llu total_alloc_bytes=%llu reclaimed_bytes=%llu lower_calls=%llu compile_calls=%llu elaborate_surfaces_calls=%llu elaborate_calls=%llu check_calls=%llu\n",
+		label, index, ouro_heap_live_bytes(), ouro_heap_total_alloc_bytes(),
+		ouro_heap_reclaimed_bytes(), g_fe_lower_calls, g_fe_compile_calls,
+		g_fe_elaborate_surfaces_calls, g_fe_elaborate_calls, g_fe_check_calls);
+	fflush(stderr);
+}
+
+static unsigned long long fe_stitch_sample(const char *label,
+		unsigned long long *count, unsigned long long stride)
+{
+	unsigned long long index;
+	if (!g_fe_stitch_trace)
+		return 0;
+	index = ++*count;
+	if (index == 1 || index % stride == 0) {
+		fe_stitch_marker(label, index);
+		return index;
+	}
+	return 0;
+}
+
+static unsigned long long fe_lower_clock_ns(void)
+{
+	struct timespec stamp;
+	if (clock_gettime(CLOCK_MONOTONIC, &stamp) != 0) {
+		g_fe_lower_cost_valid = 0;
+		return 0;
+	}
+	return (unsigned long long)stamp.tv_sec * 1000000000ULL +
+		(unsigned long long)stamp.tv_nsec;
+}
+
+static unsigned long long fe_lower_pair_count(ouro_v *items)
+{
+	unsigned long long count = 0;
+	while (items != 0 && items->tag == 1 && items->n == 2) {
+		ouro_v *pair = OURO_F(items, 0);
+		if (pair == 0 || pair->tag != 0 || pair->n != 2) {
+			g_fe_lower_cost_valid = 0;
+			return 0;
+		}
+		count++;
+		items = OURO_F(items, 1);
+	}
+	if (items == 0 || items->tag != 0 || items->n != 0)
+		g_fe_lower_cost_valid = 0;
+	return count;
+}
+
+/* desugar_file/rewrite_declarations preserve declaration kinds and list sizes.
+   These counts delimit the actual callback passes, not expression type guesses. */
+static void fe_lower_cost_declarations(ouro_v *decls)
+{
+	if (!g_fe_lower_cost_trace)
+		return;
+	while (decls != 0 && decls->tag == 1 && decls->n == 2) {
+		ouro_v *decl = OURO_F(decls, 0);
+		if (decl == 0) {
+			g_fe_lower_cost_valid = 0;
+			break;
+		}
+		switch (decl->tag) {
+		case 0: /* DDef */
+			if (decl->n != 5) { g_fe_lower_cost_valid = 0; break; }
+			g_fe_definition_count++;
+			g_fe_io_payload_calls++;
+			g_fe_decl_type_calls++;
+			g_fe_checker_lower_calls++;
+			break;
+		case 1: /* DAxiom */
+			if (decl->n != 2) { g_fe_lower_cost_valid = 0; break; }
+			g_fe_io_payload_calls++;
+			g_fe_decl_type_calls++;
+			g_fe_checker_lower_calls++;
+			break;
+		case 2: { /* DInductive: family and constructors */
+			unsigned long long count;
+			if (decl->n != 5) { g_fe_lower_cost_valid = 0; break; }
+			count = 1 + fe_lower_pair_count(OURO_F(decl, 3));
+			g_fe_decl_type_calls += count;
+			g_fe_checker_lower_calls += count;
+			break;
+		}
+		case 3: { /* DEffect: operation signatures */
+			unsigned long long count;
+			if (decl->n != 3) { g_fe_lower_cost_valid = 0; break; }
+			count = fe_lower_pair_count(OURO_F(decl, 2));
+			g_fe_decl_type_calls += count;
+			g_fe_checker_lower_calls += count;
+			break;
+		}
+		case 4: /* DImport */
+			if (decl->n != 1) g_fe_lower_cost_valid = 0;
+			break;
+		case 5: { /* DIntrinsic: optional specialization is checked too */
+			ouro_v *specialization;
+			if (decl->n != 4) { g_fe_lower_cost_valid = 0; break; }
+			g_fe_decl_type_calls++;
+			g_fe_checker_lower_calls++;
+			specialization = OURO_F(decl, 3);
+			if (specialization != 0 && specialization->tag == 1 && specialization->n == 1)
+				g_fe_checker_lower_calls++;
+			else if (specialization == 0 || specialization->tag != 0 || specialization->n != 0)
+				g_fe_lower_cost_valid = 0;
+			break;
+		}
+		case 6: /* DExtern */
+			if (decl->n != 3) { g_fe_lower_cost_valid = 0; break; }
+			g_fe_decl_type_calls++;
+			g_fe_checker_lower_calls++;
+			break;
+		case 7: /* DRepresentation */
+			if (decl->n != 2) g_fe_lower_cost_valid = 0;
+			break;
+		default: g_fe_lower_cost_valid = 0; break;
+		}
+		decls = OURO_F(decls, 1);
+	}
+	if (decls == 0 || decls->tag != 0 || decls->n != 0)
+		g_fe_lower_cost_valid = 0;
+	fprintf(stderr, "OURO_FE_LOWER_BUDGET valid=%d decl_types=%llu io_payloads=%llu definitions=%llu checker=%llu\n",
+		g_fe_lower_cost_valid, g_fe_decl_type_calls, g_fe_io_payload_calls,
+		g_fe_definition_count, g_fe_checker_lower_calls);
+	fflush(stderr);
+}
+
+static int fe_lower_class(ouro_v *expected)
+{
+	int present;
+	unsigned long long index = g_fe_lower_calls;
+	unsigned long long payload_end = g_fe_decl_type_calls + g_fe_io_payload_calls;
+	unsigned long long preflight_end = payload_end + 2 * g_fe_definition_count;
+	if (expected != 0 && expected->tag == 0 && expected->n == 0)
+		present = 0;
+	else if (expected != 0 && expected->tag == 1 && expected->n == 1)
+		present = 1;
+	else { g_fe_lower_cost_valid = 0; return 0; }
+	if (!g_fe_lower_cost_valid)
+		return 0;
+	if (index > payload_end && index <= preflight_end)
+		return present ? 4 : 3;
+	if (present) { g_fe_lower_cost_valid = 0; return 0; }
+	if (index <= g_fe_decl_type_calls) return 1;
+	if (index <= payload_end) return 2;
+	if (index <= preflight_end + g_fe_checker_lower_calls) return 5;
+	g_fe_lower_cost_valid = 0;
+	return 0;
+}
+
+static void fe_lower_cost_rows(const char *label, unsigned long long checkpoint,
+	fe_lower_cost *rows, unsigned long long first, unsigned long long last)
+{
+	int class_id;
+	for (class_id = 0; class_id < 6; class_id++) {
+		fe_lower_cost *row = &rows[class_id];
+		fprintf(stderr, "OURO_FE_LOWER_COST label=%s checkpoint=%llu valid=%d class=%d first=%llu last=%llu calls=%llu eval_ns=%llu clone_ns=%llu reset_ns=%llu eval_alloc_bytes=%llu clone_alloc_bytes=%llu\n",
+			label, checkpoint, g_fe_lower_cost_valid, class_id, first, last,
+			row->calls, row->eval_ns, row->clone_ns, row->reset_ns,
+			row->eval_alloc_bytes, row->clone_alloc_bytes);
+	}
+	fflush(stderr);
+}
+
+static void fe_lower_cost_checkpoint(unsigned long long checkpoint)
+{
+	unsigned long long preflight = g_fe_decl_type_calls + g_fe_io_payload_calls + 2 * g_fe_definition_count;
+	if (!g_fe_lower_cost_trace)
+		return;
+	if (g_fe_lower_calls != preflight + (checkpoint == 2 ? g_fe_checker_lower_calls : 0) ||
+	    g_fe_lower_cost_total[1].calls != g_fe_decl_type_calls ||
+	    g_fe_lower_cost_total[2].calls != g_fe_io_payload_calls ||
+	    g_fe_lower_cost_total[3].calls != g_fe_definition_count ||
+	    g_fe_lower_cost_total[4].calls != g_fe_definition_count)
+		g_fe_lower_cost_valid = 0;
+	if (checkpoint == 2 && g_fe_lower_cost_total[5].calls != g_fe_checker_lower_calls)
+		g_fe_lower_cost_valid = 0;
+	if (checkpoint == 2 && g_fe_lower_calls % 512 != 0)
+		fe_lower_cost_rows("window", 0, g_fe_lower_cost_window, g_fe_lower_window_first, g_fe_lower_calls);
+	fe_lower_cost_rows("total", checkpoint, g_fe_lower_cost_total, 1, g_fe_lower_calls);
+}
+
+static void fe_lower_cost_add(unsigned long long eval_ns, unsigned long long clone_ns,
+	unsigned long long reset_ns, unsigned long long eval_alloc, unsigned long long clone_alloc)
+{
+	fe_lower_cost *rows[2] = { &g_fe_lower_cost_total[g_fe_lower_cost_class],
+		&g_fe_lower_cost_window[g_fe_lower_cost_class] };
+	int i;
+	for (i = 0; i < 2; i++) {
+		rows[i]->calls++;
+		rows[i]->eval_ns += eval_ns;
+		rows[i]->clone_ns += clone_ns;
+		rows[i]->reset_ns += reset_ns;
+		rows[i]->eval_alloc_bytes += eval_alloc;
+		rows[i]->clone_alloc_bytes += clone_alloc;
+	}
+	if (g_fe_lower_calls % 512 == 0) {
+		fe_lower_cost_rows("window", 0, g_fe_lower_cost_window, g_fe_lower_window_first, g_fe_lower_calls);
+		memset(g_fe_lower_cost_window, 0, sizeof(g_fe_lower_cost_window));
+		g_fe_lower_window_first = g_fe_lower_calls + 1;
+	}
+}
+
 /* These non-reentrant seams share one lifetime protocol. Arguments and the
    caller's stack predate the mark; only the callee's temporaries are reclaimed.
    The selected clone operation preserves the data needed after the reset. */
@@ -571,11 +827,32 @@ static ouro_v *bounded_call(ouro_v *fn, int count, ouro_v **args,
 {
 	ouro_v *result;
 	int i;
+	unsigned long long t0 = 0, t1 = 0, t2 = 0, t3 = 0;
+	unsigned long long a0 = 0, a1 = 0, a2 = 0;
+	if (g_fe_lower_cost_active) {
+		t0 = fe_lower_clock_ns();
+		a0 = ouro_heap_total_alloc_bytes();
+	}
 	ouro_heap_mark();
 	for (i = 0; i < count; i++)
 		fn = ouro_apply(fn, args[i]);
+	if (g_fe_lower_cost_active) {
+		t1 = fe_lower_clock_ns();
+		a1 = ouro_heap_total_alloc_bytes();
+	}
 	result = clone_result(fn);
+	if (g_fe_lower_cost_active) {
+		t2 = fe_lower_clock_ns();
+		a2 = ouro_heap_total_alloc_bytes();
+	}
 	ouro_heap_reset();
+	if (g_fe_lower_cost_active) {
+		t3 = fe_lower_clock_ns();
+		if (t0 == 0 || t1 < t0 || t2 < t1 || t3 < t2)
+			g_fe_lower_cost_valid = 0;
+		else
+			fe_lower_cost_add(t1 - t0, t2 - t1, t3 - t2, a1 - a0, a2 - a1);
+	}
 	return result;
 }
 
@@ -618,9 +895,19 @@ static ouro_v *closed_parse_unit(void)
    recursion inside lower_expr_env2 stays in the generated lowerer. */
 static ouro_v *bounded_lower_expr(ouro_env *env, ouro_v *expr)
 {
-	return bounded_call(FIND(lo, "lower_expr_env2"), 3,
+	unsigned long long sample = fe_stitch_sample("lower-begin", &g_fe_lower_calls, 512);
+	ouro_v *result;
+	if (g_fe_lower_cost_trace) {
+		g_fe_lower_cost_class = fe_lower_class(ouro_get(env, 0));
+		g_fe_lower_cost_active = 1;
+	}
+	result = bounded_call(FIND(lo, "lower_expr_env2"), 3,
 		(ouro_v *[]){ouro_get(env, 1), ouro_get(env, 0), expr},
 		ouro_clone_perm_deep);
+	g_fe_lower_cost_active = 0;
+	if (sample != 0)
+		fe_stitch_marker("lower-end", sample);
+	return result;
 }
 
 static ouro_v *bounded_lower_expected(ouro_env *env, ouro_v *expected)
@@ -639,15 +926,26 @@ static ouro_v *bounded_lower_environment(ouro_env *env, ouro_v *lower_env)
    so each mark belongs to one complete, non-reentrant pure pass. */
 static ouro_v *bounded_compile_program(ouro_env *env, ouro_v *surfaces)
 {
+	unsigned long long sample = fe_stitch_sample("compile-begin", &g_fe_compile_calls, 1);
+	ouro_v *result;
+	fe_lower_cost_checkpoint(1);
 	(void)env;
-	return bounded_call(FIND(co, "compile_program"), 1,
+	result = bounded_call(FIND(co, "compile_program"), 1,
 		(ouro_v *[]){surfaces}, ouro_clone_perm);
+	if (sample != 0)
+		fe_stitch_marker("compile-end", sample);
+	return result;
 }
 
 static ouro_v *bounded_elaborate_surfaces(ouro_env *env, ouro_v *surfaces)
 {
-	return bounded_call(FIND(el, "elaborate_surfaces"), 2,
+	unsigned long long sample = fe_stitch_sample("elaborate-surfaces-begin",
+		&g_fe_elaborate_surfaces_calls, 1);
+	ouro_v *result = bounded_call(FIND(el, "elaborate_surfaces"), 2,
 		(ouro_v *[]){ouro_get(env, 0), surfaces}, ouro_clone_perm);
+	if (sample != 0)
+		fe_stitch_marker("elaborate-surfaces-end", sample);
+	return result;
 }
 
 static ouro_v *bounded_elaborate_surfaces_fuel(ouro_env *env, ouro_v *fuel)
@@ -658,8 +956,12 @@ static ouro_v *bounded_elaborate_surfaces_fuel(ouro_env *env, ouro_v *fuel)
 
 static ouro_v *bounded_elaborate_context(ouro_env *env, ouro_v *names)
 {
-	return bounded_call(FIND(el, "elaborate_fuel"), 3,
+	unsigned long long sample = fe_stitch_sample("elaborate-begin", &g_fe_elaborate_calls, 128);
+	ouro_v *result = bounded_call(FIND(el, "elaborate_fuel"), 3,
 		(ouro_v *[]){ouro_get(env, 1), ouro_get(env, 0), names}, ouro_clone_perm);
+	if (sample != 0)
+		fe_stitch_marker("elaborate-end", sample);
+	return result;
 }
 
 static ouro_v *bounded_elaborate_surface(ouro_env *env, ouro_v *surface)
@@ -681,9 +983,13 @@ static ouro_v *bounded_elaborate_fuel(ouro_env *env, ouro_v *fuel)
    re-entered by check_indexed_declaration's recursive term checks. */
 static ouro_v *bounded_check_item(ouro_env *env, ouro_v *item)
 {
-	return bounded_call(FIND(fc, "check_indexed_declaration"), 4,
+	unsigned long long sample = fe_stitch_sample("check-begin", &g_fe_check_calls, 64);
+	ouro_v *result = bounded_call(FIND(fc, "check_indexed_declaration"), 4,
 		(ouro_v *[]){ouro_get(env, 2), ouro_get(env, 1), ouro_get(env, 0), item},
 		ouro_clone_perm);
+	if (sample != 0)
+		fe_stitch_marker("check-end", sample);
+	return result;
 }
 
 static ouro_v *bounded_check_signature(ouro_env *env, ouro_v *sig)
@@ -991,6 +1297,7 @@ static ouro_v *compile_checked_units_impl(ouro_v *fuel, ouro_v *root, ouro_v *fi
 	ouro_v *resolve_fn = 0;
 	ouro_v *falseb;
 
+	fe_stitch_trace_start();
 	/* Survivors are ouro_clone_perm_deep (static share only). Mid-cone
 	   discard_phase then drops the parse/preprocess bump. Host prims
 	   from ouro_fast live in the static heap so eqNat survives. */
@@ -1052,13 +1359,23 @@ static ouro_v *compile_checked_units_impl(ouro_v *fuel, ouro_v *root, ouro_v *fi
 	ouro_perm_reset_bank(1);
 	fe_phase_done("frontend-after-resolve-imports");
 
+	fe_stitch_marker("binding-begin", 0);
+	fe_lower_cost_declarations(ds);
 	fn = closed_compile_from_decls();
+	fe_stitch_marker("binding-end", 0);
 	ouro_perm_select(1);
+	fe_stitch_marker("apply-begin", 0);
 	r = ouro_apply(ouro_apply(ouro_apply(ouro_apply(fn, selected), fuel), st2), ds);
+	fe_stitch_marker("apply-end", 0);
+	fe_lower_cost_checkpoint(2);
 	/* Only generic lowering failures need source hints. Preserve the checked
 	   result across the same lifetime seam before calling the Ouro remapper. */
+	fe_stitch_marker("result-clone-begin", 0);
 	r = ouro_clone_perm_deep(r);
+	fe_stitch_marker("result-clone-end", 0);
+	fe_stitch_marker("discard-begin", 0);
 	fe_phase_done("frontend-after-check-decls");
+	fe_stitch_marker("discard-end", 0);
 	falseb = ouro_ctor(1, 0, 0);
 	r = ouro_apply(ouro_apply(ouro_apply(closed_remap_comp_files(), falseb), files1), r);
 	g_last_intern = st2;
