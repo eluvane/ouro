@@ -2,7 +2,7 @@
 
 Small shared data types and list helpers that the compiler cones are allowed to import.
 
-Declarations: 16.
+Declarations: 17.
 
 ## def maybe
 
@@ -16,6 +16,12 @@ Fold Maybe: default d on Nothing, f on Just.
 
 ```
 def fromMaybe (A : Type) (d : A) (m : Maybe A) : A
+```
+
+## def maybe_unwrap_or_else
+
+```
+def maybe_unwrap_or_else (A : Type) (fallback : Unit -> A) (m : Maybe A) : A
 ```
 
 ## def mapMaybe
