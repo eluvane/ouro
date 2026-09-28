@@ -992,6 +992,54 @@ class HarnessTests(unittest.TestCase):
         self.assertEqual(observed, [source])
         self.assertEqual(runner.report.findings[0].minimal_input["expected"], 987)
 
+    def test_character_form_keeps_wide_values_and_independent_mismatch(self):
+        from ourosmith.surface.forms import programs
+
+        for seed, scalar in enumerate(("A", "é", "€", "😀")):
+            with self.subTest(seed=seed):
+                selected = [case for case in programs(seed) if case[0] == "character-scalar"]
+                self.assertEqual(len(selected), 1)
+                _name, source, expected, units_needed = selected[0]
+                ordinal = ord(scalar)
+                escaped = "'\\u{" + format(ordinal, "X") + "}'"
+                self.assertIn(f"def value' : Nat := '{scalar}';", source)
+                self.assertIn(f"same_nat value' {ordinal}", source)
+                self.assertIn(f"same_nat {escaped} {ordinal}", source)
+                self.assertIn(f"same_nat (add value' {escaped}) {2 * ordinal}", source)
+                self.assertIn(f"match same_nat {ordinal} {ordinal + 1} with | True => 1 | False => 0 end", source)
+                self.assertEqual(expected, 0)
+                self.assertFalse(units_needed)
+
+    def test_character_form_runtime_rejects_wrong_and_truncated_values(self):
+        from ourosmith.surface.forms import run_forms
+        from ourosmith.surface.gen import nat_output
+        from ourosmith.surface.run import SurfaceRunner
+
+        work = ROOT / "_build/smith/selftest"
+        work.mkdir(parents=True, exist_ok=True)
+        controls = [(0, nat_output(0), True), (0, nat_output(1), False),
+                    (0, "<nat-too-large> : Nat\n", False), (0, nat_output(0) + "extra\n", False),
+                    (1, nat_output(0), False)]
+        for code, stdout, passed in controls:
+            with self.subTest(code=code, stdout=stdout), tempfile.TemporaryDirectory(dir=work) as directory:
+                with patch("ourosmith.surface.run.environment", return_value={}):
+                    runner = SurfaceRunner(report(), Path(directory), [3], shrink_budget=0,
+                                           overrides={"ouro1": Path("unused"), "ouro-fmt": Path("unused")})
+                runner.seed = 3
+
+                def formatted(_argv, directory, _prop):
+                    return RunResult("ok", 0, (directory / "main.ouro").read_text(encoding="utf-8"), "", 0, 0)
+
+                with patch.object(runner, "accepts", return_value="checked"), \
+                     patch.object(runner, "command", side_effect=formatted), \
+                     patch.object(runner, "native", return_value=RunResult("ok", code, stdout, "", 0, 0)):
+                    run_forms(runner, only="character-scalar")
+                self.assertEqual(not runner.report.findings, passed)
+                if not passed:
+                    self.assertEqual(len(runner.report.findings), 1)
+                    self.assertEqual(runner.report.findings[0].prop, "form-runtime-character-scalar")
+                    self.assertEqual(runner.report.findings[0].expected, nat_output(0))
+
     def test_abstention_and_empty_are_not_passes(self):
         value = report()
         self.assertTrue(value.passed)
