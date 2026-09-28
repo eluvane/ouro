@@ -1,0 +1,299 @@
+name: PR88 native lowering preflight observer
+
+on:
+  push:
+    branches: [codef/native-lower-observer-linux-probe]
+    paths: [.github/workflows/pr88-native-lower-observer-linux.yml, scripts/native_lower_observer_probe.py]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: pr88-native-lower-observer-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  OURO_CI: "1"
+  OURO_REPRODUCIBLE: "1"
+  OURO_PACK_STRICT: "1"
+  OURO_JOBS: "1"
+  OURO_FRONTEND_JOBS: "1"
+  OURO_CACHE: "1"
+  OURO_CACHE_DIR: _cache/ouro
+  OURO_BUILD_DIR: _build
+  OURO_C_BUILD_DIR: _build/c
+  OURO_CCACHE: disabled
+  OURO_MEM_TRACE: "0"
+  PYTHONDONTWRITEBYTECODE: "1"
+  HOST_KEY: f555bfcaed518aea0e7bc97f04bc5a00638073c071a8ce37388644c9f766934c
+  HOST_BINARY_SHA: 460904e03e90958461ca1c007505ae76209fdc68727feca32f834f6b0fbe019c
+  HOST_TAR_SHA: e72a0940bb011243611bacc8bc348a4352e55c81017ec36e7d9c1ad1e6524da7
+
+jobs:
+  observe:
+    name: Attribute existing native_lower rejection (diagnostic only)
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    steps:
+      - name: Checkout diagnostic child
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+      - name: Preserve reviewed observer and guard exact source
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, os, shutil, subprocess, sys
+          from pathlib import Path
+          def git(*args): return subprocess.check_output(['git', *args], text=True).strip()
+          source = '973c3a21342e9d6e029479fb33ed7207d010c1bd'
+          assert git('rev-parse', 'HEAD') == os.environ['GITHUB_SHA']
+          assert git('rev-parse', 'HEAD^') == source
+          assert git('diff', '--name-only', 'HEAD^', 'HEAD').splitlines() == [
+              '.github/workflows/pr88-native-lower-observer-linux.yml', 'scripts/native_lower_observer_probe.py']
+          assert not git('status', '--porcelain')
+          subprocess.run(['git', 'diff', '--check', 'HEAD^', 'HEAD'], check=True)
+          out = Path('_build/native_lower_observer')
+          out.mkdir(parents=True)
+          generator = Path('scripts/native_lower_observer_probe.py')
+          assert hashlib.sha256(generator.read_bytes()).hexdigest() == '020670c19974e6aa21684bc83bbd080b83448b7b7290e4986a167db80d50dcd5'
+          shutil.copyfile(generator, out / 'observer_generator.py')
+          subprocess.run(['git', 'checkout', '--detach', source], check=True)
+          assert git('rev-parse', 'HEAD^{tree}') == '2b4b6d86eba6b80060132c4f40ba80bff0106a14'
+          assert not git('status', '--porcelain', '--untracked-files=no')
+          assert git('hash-object', 'runtime/frontend_link.c') == 'f10104eb4bc30055dabb3163a82f181c6eae9f1a'
+          sys.path.insert(0, 'scripts')
+          import frontend_regen
+          units = frontend_regen.collect_units('tests/native_lower_tests.ouro')
+          assert len(units) == len(set(units)) == 169 and units[-1] == 'tests/native_lower_tests.ouro'
+          def digest(value): return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+          hashes = {name: hashlib.sha256(Path(name).read_bytes()).hexdigest() for name in units}
+          assert digest(units) == 'ffa30c4d84788431649258f85c945101a29c73af1c95faf8608ee00bbe1b0a7f'
+          assert digest(hashes) == 'c936a0915a434b0fd1083a30a594b22862df9c4a1462c3917001a8e9642dce48'
+          (out / 'source.json').write_text(json.dumps({'source_sha': source, 'workflow_sha': os.environ['GITHUB_SHA'],
+              'units': units, 'sources': hashes, 'official_host_changed': False, 'diagnostic_only': True}, indent=2) + '\n')
+          PY
+          command -v cc >/dev/null
+          python3 scripts/ci_gate.py --compiler-artifact key > _build/native_lower_observer/key-before.stdout
+          test "$(cat _build/native_lower_observer/key-before.stdout)" = "key=$HOST_KEY"
+      - name: Download pinned official Host ZIP and import through stock verifier
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p _build/ci
+          gh api repos/eluvane/ouro/actions/artifacts/10946340921/zip > _build/native_lower_observer/host.zip
+          python3 - <<'PY'
+          import hashlib, zipfile
+          from pathlib import Path
+          archive = Path('_build/native_lower_observer/host.zip')
+          assert hashlib.sha256(archive.read_bytes()).hexdigest() == 'bddb7be4e2f13745d9af7edb00842651df7189e3cb84a27490ff22f57379a378'
+          with zipfile.ZipFile(archive) as bundle:
+              rows = bundle.infolist()
+              assert len(rows) == 1 and rows[0].filename == 'host-compiler.tar.gz' and not rows[0].is_dir()
+              assert rows[0].file_size == 5246760
+              data = bundle.read(rows[0])
+              assert hashlib.sha256(data).hexdigest() == 'e72a0940bb011243611bacc8bc348a4352e55c81017ec36e7d9c1ad1e6524da7'
+              with Path('_build/ci/host-compiler.tar.gz').open('xb') as stream: stream.write(data)
+          PY
+          python3 scripts/ci_gate.py --compiler-artifact import --compiler-sha256 "$HOST_TAR_SHA" > _build/native_lower_observer/import.stdout 2> _build/native_lower_observer/import.stderr
+          python3 - <<'PY'
+          import argparse, hashlib, json, os, sys
+          from pathlib import Path
+          sys.path.insert(0, 'scripts')
+          import bootstrap_compiler as bootstrap, bootstrap_inputs, ouro_build as build
+          from repo_support import sha256_file
+          root, out = Path.cwd(), Path('_build/native_lower_observer')
+          cfg = build.load_config(argparse.Namespace())
+          selected = bootstrap.current_inputs(root, cfg, build)
+          binary = root / '_build/c/ouro1'
+          receipt_path = binary.with_name('ouro1.bootstrap.json')
+          receipt = json.loads(receipt_path.read_text())
+          assert bootstrap.installed_current(binary, receipt_path, selected)
+          assert receipt['selected'] == selected and receipt['key'] == os.environ['HOST_KEY']
+          assert receipt['binary_sha256'] == sha256_file(binary) == os.environ['HOST_BINARY_SHA']
+          assert selected['source_form'] == 'original' and len(selected['sources']) == 177 and len(selected['stage0']) == 2
+          files = {**selected['sources'], **selected['stage0'],
+                   bootstrap_inputs.ARCHIVE: selected['archive_sha256'], bootstrap_inputs.MANIFEST: selected['manifest_sha256']}
+          for name, digest in files.items(): assert sha256_file(root / name) == digest, name
+          work = Path(receipt['work'])
+          assert work.parent == root / '_build/bootstrap'
+          assert sha256_file(work / 'report.json') == receipt['report_sha256'] == 'ac2d38b146d8ee3aa91ae4b6641ce1f0c69da0ec61475ccf0a8c75a35015dd1f'
+          report = json.loads((work / 'report.json').read_text())
+          assert report['pass'] and not report['changed_inputs'] and report['key'] == receipt['key']
+          assert [p['phase'] for p in report['phases']] == ['c0', 'bridge', 'p1', 'p2'] and all(p['pass'] for p in report['phases'])
+          p2_hashes = {'driver_u.c': '1e251688f9a571f78201f537db1409e4afff015443a76358868d54805b799d25',
+                       'backend_u.c': '921d54bc4c750fa987651dbb991d42f3f899a43773edcb3a586199860f769cb9'}
+          for name, digest in p2_hashes.items():
+              assert report['complete_generated_c_comparison'][name]['p1_sha256'] == report['complete_generated_c_comparison'][name]['p2_sha256'] == digest
+              for phase in ['p1', 'p2']: assert sha256_file(work / 'out' / phase / name) == digest
+          commands = {c['label']: c for c in report['phases'][-1]['commands']}
+          for label, code in [('abi-laws', 0), ('behavior-good', 0), ('behavior-bad', 1)]:
+              assert commands[label]['status'] == 'ok' and commands[label]['returncode'] == code
+          assert commands['abi-laws']['stdout_sha256'] == '16bfd633ac142f812517f82604a5f083b387ea7f22399cd8d8cdeafb7d0cabe2'
+          assert commands['abi-laws']['stderr_sha256'] == hashlib.sha256(b'').hexdigest()
+          proof = {'kind': 'diagnostic-official-input-proof', 'official_stock_binary_sha256': sha256_file(binary),
+                   'selected_source_key': receipt['key'], 'files': files, 'work': str(work), 'p2': p2_hashes,
+                   'report_sha256': receipt['report_sha256'], 'stage_equality': True,
+                   'ABI_behavior_statuses': {k: {'status': commands[k]['status'], 'returncode': commands[k]['returncode'],
+                       'stdout_sha256': commands[k]['stdout_sha256'], 'stderr_sha256': commands[k]['stderr_sha256']}
+                       for k in ['abi-laws', 'behavior-good', 'behavior-bad']}}
+          (out / 'receipt-proof.json').write_text(json.dumps(proof, indent=2) + '\n')
+          PY
+      - name: Build only diagnostic observer from immutable P2 through owning shard and link routines
+        run: |
+          python3 - <<'PY'
+          import argparse, importlib.util, json, os, sys
+          from pathlib import Path
+          sys.path.insert(0, 'scripts')
+          import ouro_build as build, generated_c_shards as shards
+          from repo_support import sha256_file
+          root, out = Path.cwd(), Path('_build/native_lower_observer').resolve()
+          proof = json.loads((out / 'receipt-proof.json').read_text())
+          work = Path(proof['work'])
+          spec = importlib.util.spec_from_file_location('observer_generator', out / 'observer_generator.py')
+          generator = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(generator)
+          stock = root / 'runtime/frontend_link.c'
+          observer = out / 'frontend_link_observer.c'
+          facts = generator.generate(stock, observer)
+          assert facts['stock_sha256'] == 'f858342f2636b43dd240ac6359d6a5e15752f804a3c10aca2ee3fe1a275b6aef'
+          assert facts['observer_sha256'] == '682ac39fe5bb68d212c5bb69c83bae990fd74ad4bd07d463b773b14b75d9cf56'
+          text = observer.read_text()
+          assert text.count(generator.HELPERS + '\n' + generator.REPLACEMENT) == 1
+          reverse = text.replace(generator.HELPERS + '\n' + generator.REPLACEMENT, generator.ORIGINAL).replace(
+              '\tg_last_intern = ouro_clone_perm_deep(st2);\n\tnltp_report_before_cleanup(g_last_intern, r);\n\touro_perm_reset_bank(0);', generator.FINAL_MARKER)
+          assert reverse.encode() == stock.read_bytes()
+          malformed, refused = out / 'malformed-stock.c', out / 'must-not-exist.c'
+          malformed.write_bytes(stock.read_bytes() + b'\n')
+          try: generator.generate(malformed, refused)
+          except ValueError as error: assert str(error).startswith('stock frontend blob mismatch:')
+          else: raise RuntimeError('observer accepted changed stock source')
+          assert not refused.exists()
+          cfg = build.load_config(argparse.Namespace())
+          sources, manifest = shards.materialize_generated_c_shards(
+              frontend_c=work / 'out/p2/driver_u.c', backend_c=work / 'out/p2/backend_u.c',
+              out_dir=out / 'shards', label_prefix='stage2', cache_enabled=True, report_path=out / 'shards-report.json')
+          sources += [('static/ouro_rt', root / 'runtime/ouro_rt.c'), ('static/bootstrap', root / 'runtime/bootstrap.c'), ('static/fe_link', observer)]
+          build.build_c_executable(cfg, name='native-lower-diagnostic-only', sources=sources,
+              output=out / 'native-lower-observer', object_dir=out / 'objects', include_dirs=[root / 'runtime'],
+              extra_cflags=['-Werror=implicit-function-declaration'], jobs=2, report_path=out / 'observer-build.json', generated_c_shards=manifest)
+          assert (out / 'native-lower-observer').is_file() and os.access(out / 'native-lower-observer', os.X_OK)
+          for name, digest in proof['p2'].items(): assert sha256_file(work / 'out/p2' / name) == digest
+          (out / 'observer-proof.json').write_text(json.dumps({**facts, 'observer_binary_sha256': sha256_file(out / 'native-lower-observer'),
+              'reverse_exact': True, 'malformed_stock_refused': True, 'build_jobs': 2, 'official_host_receipt': False}, indent=2) + '\n')
+          PY
+      - name: Run six exact controls then observe original retained rejection
+        run: |
+          python3 - <<'PY'
+          import ast, hashlib, json, os, re, sys
+          from pathlib import Path
+          sys.path.insert(0, 'scripts')
+          from ourosmith.limits import clean_env, run_limited
+          from repo_support import sha256_file
+          root, out = Path.cwd(), Path('_build/native_lower_observer').resolve()
+          source = json.loads((out / 'source.json').read_text())
+          original = root / '_build/c/ouro1'
+          observer = out / 'native-lower-observer'
+          assert sha256_file(original) == os.environ['HOST_BINARY_SHA']
+          assert 0 in os.sched_getaffinity(0)
+          os.sched_setaffinity(0, {0})
+          bad = 'bootstrap-bad.ouro: type mismatch in exact_index\nCHECK_FAIL: front end rejected the input\nouro1: CErr tag=0 n=1\nouro1: CErr code=41 det=78\n'
+          tree = ast.parse(Path('scripts/bootstrap_compiler.py').read_text())
+          probe = next(ast.literal_eval(n.value) for n in tree.body if isinstance(n, ast.Assign)
+                       and any(isinstance(t, ast.Name) and t.id == 'PROBE' for t in n.targets))
+          controls = out / 'controls'
+          std = ['std/types.ouro', 'std/prelude.ouro', 'std/data.ouro']
+          for name in std:
+              target = controls / name
+              target.parent.mkdir(parents=True, exist_ok=True)
+              target.write_bytes(Path(name).read_bytes())
+          def run(binary, file, units, cwd, label, enabled):
+              env = clean_env()
+              env.update({'OURO_NATIVE_LOWER_PROBE': '1' if enabled else '0', 'PYTHONDONTWRITEBYTECODE': '1'})
+              argv = [str(binary), 'check', file, '999999', *[p for unit in units for p in ('--unit', unit)]]
+              result = run_limited(argv, timeout_s=1800, memory_mb=2944, cwd=cwd, env=env)
+              for name in ['stdout', 'stderr']: (out / (label + '.' + name)).write_text(getattr(result, name))
+              row = {'status': result.status, 'returncode': result.returncode, 'elapsed_s': result.elapsed_s,
+                     'peak_rss_mb': result.peak_rss_mb, 'timeout_s': 1800, 'memory_mib': 2944, 'cpu': 0,
+                     'stdout_sha256': hashlib.sha256(result.stdout.encode()).hexdigest(),
+                     'stderr_sha256': hashlib.sha256(result.stderr.encode()).hexdigest(), 'probe_enabled': enabled}
+              (out / (label + '.json')).write_text(json.dumps(row, indent=2) + '\n')
+              return result, row
+          for variant, binary, enabled in [('official-stock', original, False), ('observer-off', observer, False), ('observer-on', observer, True)]:
+              for name, number, code, expected_out, expected_err in [('good', '1', 0, 'CHECK_OK\n', ''), ('bad', '2', 1, '', bad)]:
+                  file = 'bootstrap-' + name + '.ouro'
+                  (controls / file).write_text(probe.replace('INDEX', number))
+                  result, _ = run(binary, file, [*std, file], controls, variant + '-' + name, enabled)
+                  assert result.status == 'ok' and result.returncode == code and result.stdout == expected_out and result.stderr == expected_err
+          result, row = run(observer, 'tests/native_lower_tests.ouro', source['units'], root, 'target-observer', True)
+          assert result.status == 'ok' and result.returncode == 1 and not result.stdout
+          lines = result.stderr.splitlines(keepends=True)
+          trace = [line.rstrip('\n') for line in lines if line.startswith('NLT_NATIVE_')]
+          filtered = ''.join(line for line in lines if not line.startswith('NLT_NATIVE_'))
+          expected = ('OURO-LIST-001 error tests/native_lower_tests.ouro:34:24 list literal without known List A context\n'
+                      'hint: Add a declaration/ascription such as : List Nat.\nCHECK_FAIL: front end rejected the input\n'
+                      'ouro1: CErr tag=0 n=1\nouro1: CErr code=64 det=1974\n')
+          assert filtered == expected
+          (out / 'target-observer.filtered.stderr').write_text(filtered)
+          patterns = [r'NLT_NATIVE_RAW code=2 detail=([01]) depth32=([01]) hole=([01])',
+                      r'NLT_NATIVE_FIRST id=([0-9]+) code=2 detail=([01]) surface_tag=([0-9]+) depth32=([01]) hole=([01]) complete=1',
+                      r"NLT_NATIVE_NAME id=([0-9]+) name=([A-Za-z0-9_@.$']+) lookup=1",
+                      r"NLT_NATIVE_HOLE (?:status=none|id=[0-9]+ name=[A-Za-z0-9_@.$']+ lookup=1)",
+                      r'NLT_NATIVE_FINAL code=64 detail=1974 checker=(NOT_RUN_BLOCKED_PREFLIGHT|NOT_OBSERVED_FALLBACK_POSSIBLE) complete=1']
+          assert len(trace) == len(patterns)
+          matches = [re.fullmatch(pattern, line) for pattern, line in zip(patterns, trace)]
+          assert all(matches)
+          raw, first, named, hole, final = matches
+          assert raw.group(1) == first.group(2) and first.group(1) == named.group(1)
+          assert (raw.group(3) == '0') == (trace[3] == 'NLT_NATIVE_HOLE status=none')
+          blocked = raw.group(2) == '0' or raw.group(3) == '1'
+          assert final.group(1) == ('NOT_RUN_BLOCKED_PREFLIGHT' if blocked else 'NOT_OBSERVED_FALLBACK_POSSIBLE')
+          (out / 'observation.json').write_text(json.dumps({'diagnostic_complete': True, 'canonical_source_rejected': True,
+              'baseline_linux_run': 36382746652, 'original_code': 64, 'original_detail': 1974,
+              'canonical_source_accepted': False, 'small_controls': 6, 'official_host_receipt': False,
+              'trace': trace, 'target': row}, indent=2) + '\n')
+          print('NATIVE_LOWER_OBSERVATION: complete; original rejection retained (64/1974)')
+          PY
+      - name: Verify unchanged source, P2 and official Host after diagnostic
+        if: always()
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, os, subprocess
+          from pathlib import Path
+          out = Path('_build/native_lower_observer')
+          source = json.loads((out / 'source.json').read_text())
+          proof = json.loads((out / 'receipt-proof.json').read_text())
+          for name, digest in {**source['sources'], **proof['files']}.items():
+              assert hashlib.sha256(Path(name).read_bytes()).hexdigest() == digest, name
+          for name, digest in proof['p2'].items():
+              assert hashlib.sha256((Path(proof['work']) / 'out/p2' / name).read_bytes()).hexdigest() == digest
+          assert hashlib.sha256(Path('_build/c/ouro1').read_bytes()).hexdigest() == os.environ['HOST_BINARY_SHA']
+          assert not subprocess.check_output(['git', 'status', '--porcelain', '--untracked-files=no'], text=True).strip()
+          (out / 'after-proof.json').write_text(json.dumps({'source_unchanged': True, 'P2_unchanged': True,
+              'official_Host_unchanged': True, 'official_host_receipt_for_observer': False}) + '\n')
+          PY
+      - name: Upload only small provenance and diagnostic reports
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: native-lower-preflight-observer-${{ github.run_id }}
+          if-no-files-found: error
+          retention-days: 7
+          path: |
+            _build/native_lower_observer/*.json
+            _build/native_lower_observer/*-good.stdout
+            _build/native_lower_observer/*-good.stderr
+            _build/native_lower_observer/*-bad.stdout
+            _build/native_lower_observer/*-bad.stderr
+            _build/native_lower_observer/target-observer.stdout
+            _build/native_lower_observer/target-observer.stderr
+            _build/native_lower_observer/target-observer.filtered.stderr
+            _build/native_lower_observer/key-before.stdout
+            _build/native_lower_observer/import.stdout
+            _build/native_lower_observer/import.stderr
