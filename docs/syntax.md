@@ -456,6 +456,25 @@ unregistered declarations cannot receive a range literal. See
 [finite Nat ranges](practical_stdlib.md#finite-nat-ranges) for iteration and
 bounded collection.
 
+Character literals use single quotes and produce the existing `Nat` scalar
+ordinal. They contain exactly one Unicode scalar, rather than one UTF-8 byte
+or one grapheme cluster:
+
+```ouro
+def letter : Nat := 'A';
+def euro : Nat := '€';
+def smile : Nat := '\u{1F600}';
+```
+
+Raw characters use canonical UTF-8 (one through four bytes). Escapes are
+`\n`, `\t`, `\r`, `\'`, `\"`, `\\`, and `\u{…}` with one through six hex
+digits. Unicode scalar values exclude `0xD800..0xDFFF` and values above
+`0x10FFFF`; noncanonical or truncated UTF-8 is rejected. Empty literals,
+multiple scalars (including a base character plus a combining mark), unknown
+escapes, missing quotes, and physical CR/LF are lexical errors. Use `\u{0}`
+for NUL. These literals have no implicit `String` or byte-list conversion.
+Identifier primes, such as `value'`, retain their existing meaning.
+
 String literals support `\n`, `\t`, `\r`, `\"`, `\\`, and braced Unicode
 scalar escapes:
 

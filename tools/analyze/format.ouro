@@ -4,6 +4,7 @@
 -- @entry format
 
 import "../../compiler/base.ouro",
+  "../../compiler/source_text.ouro",
   "../../std/data.ouro";
 
 -- Issue tag order (fixture codes): 0 crlf … 10 pipe-space.
@@ -74,8 +75,14 @@ def chPipe : Nat := 124;
 
 def isWS (c : Nat) : Bool := orb(eqNat c chSpace, eqNat c chTab);
 
--- The compiler admits apostrophes in identifiers, not as string delimiters.
+-- Callers distinguish character quotes from identifier primes before entering a literal.
 def isQuote (c : Nat) : Bool := eqNat c chDQuote;
+
+def format_quote_at (previous_ident : Bool) (xs : List Nat) : Bool :=
+  match xs with
+  | Nil => False
+  | Cons byte _ => orb(isQuote byte, source_char_boundary previous_ident xs)
+  end;
 
 -- A forward pipe is one token, including at the start of a continuation
 -- line. The diagnostic and rewrite share this distinction from an arm bar.
@@ -188,29 +195,32 @@ inductive StripMode : Type :=
   | SmEsc : Nat -> StripMode;
 
 -- Replace string literals with spaces (open/close → one space each; interior dropped).
-def stripAsciiStringsGo : List Nat -> StripMode -> List Nat :=
-  fix stripAsciiStringsGo (xs : List Nat) (mode : StripMode) : List Nat :=
+def stripAsciiLiteralsGo : List Nat -> StripMode -> Bool -> List Nat :=
+  fix stripAsciiLiteralsGo (xs : List Nat) (mode : StripMode) (previous_ident : Bool) : List Nat :=
     match xs with
     | Nil => Nil Nat
     | Cons c rest =>
         match mode with
         | SmNormal =>
-            match isQuote c with
-            | True => Cons Nat chSpace (stripAsciiStringsGo(rest, SmInStr c))
-            | False => Cons Nat c (stripAsciiStringsGo rest SmNormal)
+            match format_quote_at previous_ident xs with
+            | True => Cons Nat chSpace (stripAsciiLiteralsGo(rest, SmInStr c, False))
+            | False => Cons Nat c (stripAsciiLiteralsGo rest SmNormal (source_is_ident_char c))
             end
         | SmInStr q =>
             match eqNat c chBSlash with
-            | True => stripAsciiStringsGo(rest, SmEsc q)
+            | True => stripAsciiLiteralsGo(rest, SmEsc q, False)
             | False =>
                 match eqNat c q with
-                | True => Cons Nat chSpace (stripAsciiStringsGo rest SmNormal)
-                | False => stripAsciiStringsGo(rest, SmInStr q)
+                | True => Cons Nat chSpace (stripAsciiLiteralsGo rest SmNormal False)
+                | False => stripAsciiLiteralsGo(rest, SmInStr q, False)
                 end
             end
-        | SmEsc q => stripAsciiStringsGo(rest, SmInStr q)
+        | SmEsc q => stripAsciiLiteralsGo(rest, SmInStr q, False)
         end
     end;
+
+def stripAsciiStringsGo (xs : List Nat) (mode : StripMode) : List Nat :=
+  stripAsciiLiteralsGo xs mode False;
 
 def stripAsciiStrings (xs : List Nat) : List Nat := stripAsciiStringsGo xs SmNormal;
 
@@ -405,33 +415,36 @@ def analyze (src : List Nat) : List Issue :=
 
 -- Tabs inside strings are data. This also preserves escaped quotes rather
 -- than accidentally returning to code mode in the middle of a literal.
-def expandCodeTabs : List Nat -> StripMode -> List Nat :=
-  fix expandCodeTabs (xs : List Nat) (mode : StripMode) : List Nat :=
+def expandLiteralTabs : List Nat -> StripMode -> Bool -> List Nat :=
+  fix expandLiteralTabs (xs : List Nat) (mode : StripMode) (previous_ident : Bool) : List Nat :=
     match xs with
     | Nil => Nil Nat
     | Cons c rest =>
         match mode with
         | SmNormal =>
-            match isQuote c with
-            | True => Cons Nat c (expandCodeTabs(rest, SmInStr c))
+            match format_quote_at previous_ident xs with
+            | True => Cons Nat c (expandLiteralTabs(rest, SmInStr c, False))
             | False =>
                 match eqNat c chTab with
-                | True => Cons Nat chSpace (Cons Nat chSpace (expandCodeTabs rest SmNormal))
-                | False => Cons Nat c (expandCodeTabs rest SmNormal)
+                | True => Cons Nat chSpace (Cons Nat chSpace (expandLiteralTabs rest SmNormal False))
+                | False => Cons Nat c (expandLiteralTabs rest SmNormal (source_is_ident_char c))
                 end
             end
         | SmInStr q =>
             match eqNat c chBSlash with
-            | True => Cons Nat c (expandCodeTabs(rest, SmEsc q))
+            | True => Cons Nat c (expandLiteralTabs(rest, SmEsc q, False))
             | False =>
                 match eqNat c q with
-                | True => Cons Nat c (expandCodeTabs rest SmNormal)
-                | False => Cons Nat c (expandCodeTabs(rest, SmInStr q))
+                | True => Cons Nat c (expandLiteralTabs rest SmNormal False)
+                | False => Cons Nat c (expandLiteralTabs(rest, SmInStr q, False))
                 end
             end
-        | SmEsc q => Cons Nat c (expandCodeTabs(rest, SmInStr q))
+        | SmEsc q => Cons Nat c (expandLiteralTabs(rest, SmInStr q, False))
         end
     end;
+
+def expandCodeTabs (xs : List Nat) (mode : StripMode) : List Nat :=
+  expandLiteralTabs xs mode False;
 
 -- @bound(nodes <= 58) @bound(depth <= 12) @bound(allocs <= 21) @bound(stack <= 5) @bound(steps <= 22) @bound(cyclo <= 7) @minimal
 def expandTabs (xs : List Nat) : List Nat := expandCodeTabs xs SmNormal;
@@ -497,8 +510,9 @@ def fixPipeSpace (line : List Nat) : List Nat :=
 
 -- Ops/comments/strings; reversed acc; short-circuit after fixed `--`. prevWS starts True.
 -- @bound(nodes <= 474) @bound(depth <= 31) @bound(allocs <= 186) @bound(stack <= 9) @bound(steps <= 201) @bound(cyclo <= 59)
-def fixContentGo : List Nat -> StripMode -> Bool -> List Nat -> List Nat :=
-  fix fixContentGo (xs : List Nat) (mode : StripMode) (prevWS : Bool) (acc : List Nat) : List Nat :=
+def fixLiteralContentGo : List Nat -> StripMode -> Bool -> Bool -> List Nat -> List Nat :=
+  fix fixLiteralContentGo (xs : List Nat) (mode : StripMode) (prevWS : Bool)
+      (previous_ident : Bool) (acc : List Nat) : List Nat :=
     match xs with
     | Nil => reverseN acc
     | Cons c rest =>
@@ -542,8 +556,8 @@ def fixContentGo : List Nat -> StripMode -> Bool -> List Nat -> List Nat :=
                         | Nil => reverseN accOp
                         | Cons a _ =>
                             match isWS a with
-                            | True => fixContentGo rest2 SmNormal True accOp
-                            | False => fixContentGo rest2 SmNormal True (Cons Nat chSpace accOp)
+                            | True => fixLiteralContentGo rest2 SmNormal True False accOp
+                            | False => fixLiteralContentGo rest2 SmNormal True False (Cons Nat chSpace accOp)
                             end
                         end
                     end
@@ -564,32 +578,36 @@ def fixContentGo : List Nat -> StripMode -> Bool -> List Nat -> List Nat :=
                             | Nil => reverseN accOp
                             | Cons a _ =>
                                 match isWS a with
-                                | True => fixContentGo rest2 SmNormal True accOp
-                                | False => fixContentGo rest2 SmNormal True (Cons Nat chSpace accOp)
+                                | True => fixLiteralContentGo rest2 SmNormal True False accOp
+                                | False => fixLiteralContentGo rest2 SmNormal True False (Cons Nat chSpace accOp)
                                 end
                             end
                         end
                     | False =>
-                        match isQuote c with
-                        | True => fixContentGo(rest, SmInStr c, False, Cons Nat c acc)
-                        | False => fixContentGo(rest, SmNormal, isWS c, Cons Nat c acc)
+                        match format_quote_at previous_ident xs with
+                        | True => fixLiteralContentGo(rest, SmInStr c, False, False, Cons Nat c acc)
+                        | False => fixLiteralContentGo(rest, SmNormal, isWS c, source_is_ident_char c, Cons Nat c acc)
                         end
                     end
                 end
             end
         | SmInStr q =>
             match eqNat c chBSlash with
-            | True => fixContentGo(rest, SmEsc q, False, Cons Nat c acc)
+            | True => fixLiteralContentGo(rest, SmEsc q, False, False, Cons Nat c acc)
             | False =>
                 match eqNat c q with
-                | True => fixContentGo rest SmNormal False (Cons Nat c acc)
-                | False => fixContentGo(rest, SmInStr q, False, Cons Nat c acc)
+                | True => fixLiteralContentGo rest SmNormal False False (Cons Nat c acc)
+                | False => fixLiteralContentGo(rest, SmInStr q, False, False, Cons Nat c acc)
                 end
             end
         | SmEsc q =>
-            fixContentGo(rest, SmInStr q, False, Cons Nat c acc)
+            fixLiteralContentGo(rest, SmInStr q, False, False, Cons Nat c acc)
         end
     end;
+
+def fixContentGo (xs : List Nat) (mode : StripMode) (prevWS : Bool)
+    (acc : List Nat) : List Nat :=
+  fixLiteralContentGo xs mode prevWS False acc;
 
 def fixContent (line : List Nat) : List Nat := fixContentGo line SmNormal True (Nil Nat);
 

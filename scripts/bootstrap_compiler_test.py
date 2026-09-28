@@ -35,6 +35,11 @@ class BootstrapCompilerTests(unittest.TestCase):
         self.rejected_source_form = None
         self.different_c = False
         self.abi_stdout = bootstrap.ABI_STDOUT
+        self.bad_stdout = ""
+        self.bad_stderr = ("bootstrap-bad.ouro: type mismatch in exact_index\nCHECK_FAIL: front end rejected the input\n"
+                           "ouro1: CErr tag=0 n=1\nouro1: CErr code=41 det=82\n")
+        self.bad_returncode = 1
+        self.bad_status = "ok"
 
     def fixture(self, *, compact_sources=False):
         roots = [f"compiler/source-{index}.ouro" for index in range(14)] + ["compiler/backend.ouro"]
@@ -63,7 +68,7 @@ class BootstrapCompilerTests(unittest.TestCase):
         self.assertEqual(memory_mb, bootstrap.MEMORY_MIB)
         self.assertEqual(env["OURO_JOBS"], "1")
         self.events.append((list(argv), cwd))
-        stdout, stderr, code = "", "", 0
+        stdout, stderr, code, status = "", "", 0, "ok"
         if "worker" in argv:
             phase = argv[argv.index("--phase") + 1]
             action = argv[argv.index("--action") + 1]
@@ -86,16 +91,15 @@ class BootstrapCompilerTests(unittest.TestCase):
         elif argv[1] == "check":
             source = argv[2]
             if source == "bootstrap-bad.ouro":
-                code = 1
-                stderr = ("bootstrap-bad.ouro: type mismatch in exact_index\nCHECK_FAIL: front end rejected the input\n"
-                          "ouro1: CErr tag=0 n=1\nouro1: CErr code=41 det=78\n")
+                stdout, stderr = self.bad_stdout, self.bad_stderr
+                code, status = self.bad_returncode, self.bad_status
             elif source == self.rejected_root and (self.rejected_source_form is None or cwd.name == self.rejected_source_form):
                 code, stderr = 1, "current root rejected\n"
             else:
                 stdout = "CHECK_OK\n"
         else:
             self.fail(f"unexpected host fixture command: {argv}")
-        return RunResult("ok", code, stdout, stderr, 0.01, 1.0, list(argv))
+        return RunResult(status, code, stdout, stderr, 0.01, 1.0, list(argv))
 
     def test_compaction_preserves_literal_bytes_directives_and_line_boundaries(self):
         literal = '"  -- @entry other\\n\\\"\\\\\t\r\nЮник\u043eд  "'.encode()
@@ -162,6 +166,23 @@ class BootstrapCompilerTests(unittest.TestCase):
                   b'import "real.ouro";\n')
         compacted = compact_source.compact_source(source)
         self.assertIn(literal, compacted)
+        self.assertEqual(quoted_import_targets(compacted.decode(), "compiler/probe.ouro"),
+                         ["compiler/real.ouro"])
+        self.assertEqual(compact_source.compact_source(compacted), compacted)
+
+    def test_compaction_and_import_scan_preserve_scalar_literals_and_primes(self):
+        from selfhost_module_cache import quoted_import_targets
+
+        literals = [b"' '", b"'\\n'", b"'\\''", b"'\"'", b"'\\u{1F600}'",
+                    "'é'".encode(), "'€'".encode(), "'😀'".encode()]
+        source = (b"def name' : Nat := 1; def sample : Nat := f " + b" ".join(literals)
+                  + b"; def primes : Nat := name'; import \"real.ouro\";\n")
+        compacted = compact_source.compact_source(source)
+        for literal in literals:
+            self.assertIn(literal, compacted)
+        self.assertIn(b"name'", compacted)
+        self.assertEqual(quoted_import_targets(source.decode(), "compiler/probe.ouro"),
+                         ["compiler/real.ouro"])
         self.assertEqual(quoted_import_targets(compacted.decode(), "compiler/probe.ouro"),
                          ["compiler/real.ouro"])
         self.assertEqual(compact_source.compact_source(compacted), compacted)
@@ -236,7 +257,7 @@ class BootstrapCompilerTests(unittest.TestCase):
             key = hash_json(selected)
             compact = bootstrap.current_inputs(root, cfg, build, compact_sources=True)
             self.assertNotEqual(hash_json(compact), key)
-            for name in ("std/prelude.ouro", "runtime/host-key-extra.h", "scripts/bootstrap_compiler.py",
+            for name in ("std/prelude.ouro", "std/data.ouro", "runtime/host-key-extra.h", "scripts/bootstrap_compiler.py",
                          "scripts/compact_source.py", inputs.STAGE0[0], inputs.MANIFEST, inputs.ARCHIVE):
                 with self.subTest(input=name):
                     path = root / name
@@ -321,6 +342,34 @@ class BootstrapCompilerTests(unittest.TestCase):
         self.assertEqual(len(probes), 2)
         for argv in probes:
             self.assertEqual(argv[4:], [part for unit in [*units, argv[2]] for part in ("--unit", unit)])
+
+    def test_negative_behavior_requires_exact_current_rejection_and_successful_execution(self):
+        expected = self.bad_stderr
+        protocols = {
+            "old-index": ("", expected.replace("det=82", "det=78"), 1, "ok"),
+            "maybe-only-index": ("", expected.replace("det=82", "det=80"), 1, "ok"),
+            "wrong-index": ("", expected.replace("det=82", "det=83"), 1, "ok"),
+            "wrong-declaration": ("", expected.replace("exact_index", "other_index"), 1, "ok"),
+            "wrong-code": ("", expected.replace("code=41", "code=40"), 1, "ok"),
+            "missing-line": ("", "".join(expected.splitlines(keepends=True)[1:]), 1, "ok"),
+            "extra-line": ("", expected + "unexpected diagnostic\n", 1, "ok"),
+            "stdout": ("CHECK_FAIL\n", expected, 1, "ok"),
+            "accepted": ("", expected, 0, "ok"),
+            "other-exit": ("", expected, 2, "ok"),
+            "timeout": ("", expected, 1, "timeout"),
+        }
+        for name, protocol in protocols.items():
+            with self.subTest(protocol=name):
+                self.work = self.root / ("negative-" + name)
+                self.work.mkdir()
+                self.bad_stdout, self.bad_stderr, self.bad_returncode, self.bad_status = protocol
+                snapshot = self.fixture()
+                with patch.object(bootstrap, "run_limited", side_effect=self.fake_run):
+                    with self.assertRaises(RuntimeError):
+                        bootstrap.chain(self.work, snapshot, build)
+                report = json.loads((self.work / "report.json").read_text())
+                self.assertFalse(report["pass"])
+                self.assertEqual(report["phases"][-1]["commands"][-1]["label"], "behavior-bad")
 
     def test_complete_frontend_mismatch_rejects_successor(self):
         snapshot = self.fixture()

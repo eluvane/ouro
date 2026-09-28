@@ -10,6 +10,12 @@ Development changes; see the [compatibility policy](docs/stability.md).
   and typed helpers over an expression through ordinary checked lets; see
   [Ergonomic syntax](docs/language/ergonomic-syntax.md#helpers-after-an-expression).
 
+- `std/logic.ouro` now provides typed `compose` for first-class function
+  composition with explicit input, intermediate, and output types.
+- `std/logic.ouro` now has typed `flip` for reversing a binary callback's
+  argument order and fixing its right argument through partial application.
+- `maybe_unwrap_or_else` in `std/data.ouro` evaluates a typed fallback thunk
+  only when its `Maybe` input is `Nothing`.
 - `OURO-CLIPPY-ERROR-004` reports ignored results of the registered pure
   `str_parse_nat`, `str_parse_bool` and `parse_json` APIs, with alias-aware
   observation and manual failure-handling guidance. Proven nullary-constructor
@@ -40,6 +46,11 @@ Development changes; see the [compatibility policy](docs/stability.md).
 - `private` declaration visibility keeps internal helpers, constructors,
   effect operations, and record accessors available to their owner while
   excluding them from imports and re-exports; imported bodies are still checked.
+- Single-quoted Unicode scalar literals as existing `Nat` ordinals, with strict
+  UTF-8 and escape validation. See [Numbers and strings](docs/syntax.md#numbers-and-strings).
+
+- `maybe_bind` in `std/data.ouro` composes `Maybe` computations, calling the
+  continuation only for `Just` and preserving `Nothing`.
 - Exclusive `0..10` and inclusive `0..=10` literal-endpoint `NatRange` values,
   checked through nominal Nat, bound, and range representation roles.
 - Final-tail list spreads `[first, ..rest]` build checked `List A` constructor
@@ -49,6 +60,8 @@ Development changes; see the [compatibility policy](docs/stability.md).
   checked step magnitude, and bounded pull-iterator consumption.
 - Pure bounded pull iterators with lazy map/filter/take adapters and explicit
   typed failure or pull-limit results when collecting a list.
+- Bounded iterator folding over yielded items without list materialization;
+  skips preserve the accumulator and failures remain typed.
 - Overlapping list windows, state scans, state-threading maps, stable grouping
   by key, and first-failure `Either`/`Maybe` folds in `std/collections.ouro`.
 - Single-path `exposing (...)` imports select direct declarations and can give
