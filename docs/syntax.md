@@ -126,6 +126,22 @@ typed parameters; the result annotation may be omitted when the body type can
 be inferred. [Ergonomic syntax](language/ergonomic-syntax.md#typed-local-helper-declarations)
 explains their scope and desugaring.
 
+Helpers can also follow their expression:
+
+```ouro
+def doubled : Nat :=
+  double one where
+    let one : Nat := 1;
+    let double (value : Nat) := add value value;
+  end;
+```
+
+Helpers are sequential and non-recursive. Their initializers see earlier
+helpers, while the main expression sees them all. A lambda's body extends to
+the right; use `(fun ... => ...) where ... end` to wrap the whole lambda.
+[Ergonomic syntax](language/ergonomic-syntax.md#helpers-after-an-expression)
+explains grouping, delimiters, and scope.
+
 Top-level definitions may use `(public => internal : Type)` to expose a call
 label distinct from the binder used in the body. A direct call can then write
 `f(public := value)` or `f(public :=)` to use an identically named local value.

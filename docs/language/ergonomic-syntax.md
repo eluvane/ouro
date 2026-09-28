@@ -1,8 +1,8 @@
 # Ergonomic syntax
 
-Grouped imports, positional calls, typed local helpers, pure expression
-blocks, list trailing commas, and final-tail list spreads lower to existing
-checked constructors. The
+Grouped imports, positional calls, typed local helpers, postfix `where` helpers,
+pure expression blocks, list trailing commas, and final-tail list spreads lower
+to existing checked constructors. The
 maintained [syntax reference](../syntax.md) states accepted forms; this page
 records desugaring and compatibility boundaries.
 
@@ -209,6 +209,66 @@ let f (hidden : Nat) := hidden in hidden
 The first lacks a parameter annotation; the second has an unannotated nested
 lambda with no expected function type; the third uses an out-of-scope parameter.
 Existing unparameterized `let` syntax and its inference behavior are unchanged.
+
+## Helpers after an expression
+
+```ouro
+def double_one : Nat :=
+  double one where
+    let one : Nat := 1;
+    let double (value : Nat) : Nat := add value value;
+  end;
+```
+
+`expression where let ...; end` places local helpers after their main expression.
+The block requires at least one ordinary `let` binding and a semicolon after
+every initializer, including the last. Comments and line breaks are allowed.
+Typed parameters, grouped binders, and inferred helper results use the same
+rules as the local helper declarations above.
+
+The block lowers to ordinary sequential lets, in helper source order:
+
+```text
+body where let first : A := value; let second : B := next; end
+==
+let first : A := value in let second : B := next in body
+```
+
+Every helper is visible in `body`; an initializer sees only earlier helpers and
+outer bindings. Its own name is not in scope there, and parameters stay within
+that helper. There is no implicit or mutual recursion: use explicit `fix` with
+its existing checks. Local helpers still use positional calls; a `where` block
+does not create top-level named-call metadata.
+
+The postfix applies to the complete pipe expression: `value |> apply where
+let value := initial; let apply (input : T) := input; end` puts both names in
+scope over the pipe. An ordinary lambda still extends to the right:
+
+```text
+fun (value : T) => use value where let use (input : T) := input; end
+==
+fun (value : T) => let use := fun (input : T) => input in use value
+
+(fun (value : T) => use value) where let use (input : T) := input; end
+==
+let use := fun (input : T) => input in fun (value : T) => use value
+```
+
+Parentheses select the whole lambda, or one argument of a larger call.
+The final body of an ordinary `let`, scoped `open`, or `do` statement follows
+its existing right-extending grammar. Delimited match, handler, and fallible
+blocks can take an outer `where` after their closing delimiter. The `where`
+owned by record and effect declarations retains its meaning.
+
+This form uses `ELet` and typed `ELam`/`EPi` nodes and the existing checker.
+It does not sequence IO or change effect handling. The spanned parser keeps
+real ranges for the main expression and each initializer; the outer range
+covers the complete `where` expression, without assigning invented positions
+to the reordered lets.
+
+Missing bindings, semicolons, or `end`, untyped helper parameters, `let!`,
+later-helper references in initializers, and escaping helper or parameter names
+are rejected by the existing parser or checker.
 
 ## Expected types in short lambdas
 
