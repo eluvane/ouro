@@ -427,14 +427,6 @@ remains an identifier under the existing identifier grammar. These literals do
 not select a machine integer type or perform a narrowing conversion. Typed
 numeric suffixes are not supported.
 
-For a parameterless, unindexed family with the existing zero/successor shape,
-literals above 255 lower to closed typed function applications that compose
-the same constructors. Small literals and other family shapes retain their
-existing constructor spines. This changes neither the value nor the selected
-family; every generated term still passes declaration checking. Lowering,
-checking, and reduction keep their resource limits, and full normalization
-or execution of a large value can still consume work proportional to its value.
-
 With the nominal `Nat`, `NatRangeBound`, and `NatRange` representations from
 `std/range.ouro`, `0..10` constructs an exclusive range and `0..=10` an
 inclusive range. The two endpoints must be `Nat` literals in this syntax;
