@@ -6,6 +6,10 @@ Development changes; see the [compatibility policy](docs/stability.md).
 
 ### Added
 
+- Postfix `expression where let helper ...; end` scopes sequential local values
+  and typed helpers over an expression through ordinary checked lets; see
+  [Ergonomic syntax](docs/language/ergonomic-syntax.md#helpers-after-an-expression).
+
 - Exclusive `0..10` and inclusive `0..=10` literal-endpoint `NatRange` values,
   checked through nominal Nat, bound, and range representation roles.
 - Final-tail list spreads `[first, ..rest]` build checked `List A` constructor
