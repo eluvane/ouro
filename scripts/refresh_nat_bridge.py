@@ -7,13 +7,16 @@ import difflib
 import hashlib
 import json
 import os
-from pathlib import Path
+from typing import TYPE_CHECKING
 import re
 import tempfile
 
 from bootstrap_inputs import ARCHIVE, MANIFEST, ROOT, archive_bytes, read_bundle, verify_stage0
 from repo_support import sha256_bytes
 
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 BASE_REVISION = "973c3a21342e9d6e029479fb33ed7207d010c1bd"
 FEATURE_REVISION = "a9cfa54f09c3b02ffb22ff1b423c04a78d380764"
@@ -57,7 +60,7 @@ COPIES = (
 
 
 def git_blob(data: bytes) -> str:
-    return hashlib.sha1(b"blob " + str(len(data)).encode() + b"\0" + data).hexdigest()
+    return hashlib.sha1(b"blob " + str(len(data)).encode() + b"\0" + data, usedforsecurity=False).hexdigest()
 
 
 def section(data: bytes, start: bytes, end: bytes | None) -> bytes:

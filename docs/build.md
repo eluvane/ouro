@@ -326,27 +326,32 @@ pins every file's size and SHA-256, the archive, and the committed stage0 pair.
 The C0 runtime matches that seed. The manifest's `syntax_refresh` records the
 reviewed parser backport that lets the bridge read current
 [ergonomic syntax](language/ergonomic-syntax.md), with its patch and member hashes.
-Its `ascription_refresh` records the bridge lowerer update with the exact
-source patch and member hash.
+Its `lowering_refresh` records the composed Nat/ascription lowerer update with
+the exact source slices, original-to-Nat-to-ascription patches, and member hashes.
 The historical checker, runtime, and stage0 pair retain their previous bytes.
 The lineage also records earlier seed and compatibility changes. These pinned
 inputs stay separate from the current source snapshot and its acceptance checks
 until the native bootstrap can replace this C-hosted chain.
 
-The manifest's `compact_nat_refresh` records the current source slices copied
-into the historical bridge's Nat lowerer. It changes one Ouro member; the
+The lowerer refresh copies six verbatim current-source slices into only
+`bridge/compiler/lower.ouro`: the compact Nat helpers and literal dispatch,
+and the checked expression-ascription obligation. The other 67 members,
 historical checker, runtime, stage0 pair, and import graph remain pinned.
-To reproduce that refresh from its exact feature source and predecessor bundle
-(the hashes are guarded by the script), run:
+The original independent `refresh_nat_bridge.py` and `refresh_ascription_bridge.py`
+retain their exact source/predecessor guards; the composed snapshot uses:
 
 ```sh
-python3 -B scripts/refresh_nat_bridge.py
-python3 -B scripts/refresh_nat_bridge.py --write
+python3 -B scripts/refresh_lower_bridge.py
+python3 -B scripts/refresh_lower_bridge_test.py
+python3 -B scripts/refresh_lower_bridge.py --write
 ```
 
-The refreshed package still requires the full current P1/P2 C comparison, ABI
-laws, and behavior checks before publishing a current compiler. The inventory
-and unpack/repack commands below verify the installed package.
+The generator rejects a changed source owner or historical package. Repeating it
+on its exact installed output reproduces identical archive and manifest bytes.
+The refreshed package still requires a fresh full current P1/P2 C comparison,
+ABI laws, and positive/negative behavior checks before publishing a current
+compiler. Local source-copy tests do not establish that bootstrap evidence.
+The inventory and unpack/repack commands below verify the installed package.
 
 The consumer validates the entire archive inventory before extraction. It
 rejects links, traversal, duplicate, extra, or missing members and size/hash

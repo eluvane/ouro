@@ -7,12 +7,15 @@ import difflib
 import hashlib
 import json
 import os
-from pathlib import Path
+from typing import TYPE_CHECKING
 import tempfile
 
 from bootstrap_inputs import ARCHIVE, MANIFEST, ROOT, archive_bytes, read_bundle, verify_stage0
 from repo_support import sha256_bytes
 
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 BASE_REVISION = "cdf16527513e18ab46ea3655743ca4d9ae9cf5e4"
 OLD_MANIFEST = "2ba02545a5fada2e88b4ed969b499a58568fd10dc7a2d5dcc52948a280fba145"
@@ -35,7 +38,7 @@ END = b"def lower_xvmatch\n"
 
 
 def git_blob(data: bytes) -> str:
-    return hashlib.sha1(b"blob " + str(len(data)).encode() + b"\0" + data).hexdigest()
+    return hashlib.sha1(b"blob " + str(len(data)).encode() + b"\0" + data, usedforsecurity=False).hexdigest()
 
 
 def function(data: bytes) -> bytes:
