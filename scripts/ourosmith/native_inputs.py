@@ -84,7 +84,7 @@ def main : IO Unit :=
         dependency = os.path.relpath(ROOT / "std/prelude.ouro", root).replace("\\", "/")
         imports = f'import "{dependency}";\n'
         source = "-- @entry widget\n" + "\n" * (1 + seed % 5) + imports
-        source += f'\n-- Doubles a natural.\ndef widget (n : Nat) : Nat := add n n;\n\ndef widget_zero : Nat := widget {seed % 5};\n'
+        source += f'\n-- Doubles a natural.\ndef widget (n : Nat)\n    : Nat\n    := add n n;\n\ndef widget_zero : Nat := widget {seed % 5};\n'
         write(root / "sample.ouro", source)
         write(root / "messy.ouro", "-- @entry messy\n\n" + imports + "\ndef messy : Nat := add (S Z) Z;   \n")
     elif group == "security":

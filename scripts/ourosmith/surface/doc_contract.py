@@ -29,8 +29,9 @@ def apply{seed} (A : Type) (f : A -> A) (x : A) : A := f x;
 
 -- Continuation signature {seed}.
 def pair{seed} (a : Nat)
-    (b : Nat) : Pair Nat Nat :=
-    MkPair Nat Nat a b;
+    (b : Nat)
+    : Pair Nat Nat
+    := MkPair Nat Nat a b;
 
 -- Type documentation {seed}.
 inductive Tone{seed} : Type :=
@@ -76,7 +77,7 @@ def native_text{seed} : String := "intrinsic Decoy : Type; extern Decoy : Type;"
         ("def", f"silent{seed}", f"def silent{seed} : Nat", ""),
         ("def", f"orphan{seed}", f"def orphan{seed} : Nat", ""),
         ("def", f"apply{seed}", f"def apply{seed} (A : Type) (f : A -> A) (x : A) : A", f"Polymorphic signature {seed}."),
-        ("def", f"pair{seed}", f"def pair{seed} (a : Nat)\n    (b : Nat) : Pair Nat Nat", f"Continuation signature {seed}."),
+        ("def", f"pair{seed}", f"def pair{seed} (a : Nat)\n    (b : Nat)\n    : Pair Nat Nat", f"Continuation signature {seed}."),
         ("inductive", f"Tone{seed}", f"inductive Tone{seed} : Type", f"Type documentation {seed}."),
         ("def", f"shade{seed}", f"def shade{seed} (s : Tone{seed}) : Nat", f"Body documentation {seed}."),
         ("def", f"last{seed}", f"def last{seed} : Nat", ""),
