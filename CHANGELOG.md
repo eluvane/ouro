@@ -17,6 +17,8 @@ Development changes; see the [compatibility policy](docs/stability.md).
   checked step magnitude, and bounded pull-iterator consumption.
 - Pure bounded pull iterators with lazy map/filter/take adapters and explicit
   typed failure or pull-limit results when collecting a list.
+- Bounded iterator folding over yielded items without list materialization;
+  skips preserve the accumulator and failures remain typed.
 - Overlapping list windows, state scans, state-threading maps, stable grouping
   by key, and first-failure `Either`/`Maybe` folds in `std/collections.ouro`.
 - Single-path `exposing (...)` imports select direct declarations and can give

@@ -167,6 +167,18 @@ its own end still costs one pull. Iterators built from lists are finite, while
 a custom iterator need not be; the pull limit bounds calls to its step
 function, not the work performed inside each step.
 
+`iter_fold State Error Item Acc step initial max_pulls source` consumes the
+same bounded pull sequence without building a list. A skip keeps the
+accumulator; a yield applies the pure `step` in source order. The accumulator
+is returned only after an end step, while source failure and budget exhaustion
+return `IterSourceFailure` and `IterPullLimit` rather than a partial success.
+For example, folding `add` over `[1, 2, 3]` with four pulls returns `Right 6`:
+
+```ouro
+iter_fold (List Nat) String Nat Nat add Z 4
+  (iter_from_list String Nat ([1, 2, 3] : List Nat))
+```
+
 Adapters do not build intermediate lists. Materialization builds a reversed
 list and allocates another list when reversing it at completion; iterator
 wrappers and step results also allocate. Pull traversal is bounded by
