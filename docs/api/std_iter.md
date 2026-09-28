@@ -2,7 +2,7 @@
 
 Pure pull iterators with explicit failure and bounded materialization.
 
-Declarations: 8.
+Declarations: 9.
 
 ## inductive IterStep
 
@@ -59,4 +59,13 @@ def iter_take (State : Type) (Error : Type) (Item : Type)
 def collect_list (State : Type) (Error : Type) (Item : Type)
     (max_pulls : Nat) (source : Iterator State Error Item)
     : Either (IterCollectError Error) (List Item)
+```
+
+## def iter_fold
+
+```
+def iter_fold (State : Type) (Error : Type) (Item : Type) (Acc : Type)
+    (step : Acc -> Item -> Acc) (initial : Acc) (max_pulls : Nat)
+    (source : Iterator State Error Item)
+    : Either (IterCollectError Error) Acc
 ```
