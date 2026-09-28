@@ -136,6 +136,7 @@ Structural walk over the list, so no fuel argument is needed.
 
 ```
 def io_fold (A : Type) (B : Type) (f : B -> A -> IO B)
+    (acc : B) (xs : List A) : IO B
 ```
 
 ## def read_chunk
