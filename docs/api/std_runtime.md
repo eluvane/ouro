@@ -216,6 +216,8 @@ The pair is (OS error, child exit); OS error zero denotes a completed wait.
 
 ```
 intrinsic prim_process_capture_bounded : String -> List String ->
+    Pair String (Pair Nat (Pair Nat (Pair Nat (Pair Nat Nat)))) ->
+    IO (Pair Nat (Pair Nat (Pair Nat (Pair String String))))
 ```
 
 Limits: timeout ms, memory MiB, CPU count, stdout bytes, stderr bytes. Reply: kind, detail, measured peak Job commit bytes, exact byte streams.

@@ -68,6 +68,7 @@ def cli_required_nat (a : Args) (name : String) : Either CliError Nat
 
 ```
 def cli_optional_nat (a : Args) (name : String) (fallback : Nat)
+    : Either CliError Nat
 ```
 
 ## def cli_required_bool
@@ -80,6 +81,7 @@ def cli_required_bool (a : Args) (name : String) : Either CliError Bool
 
 ```
 def cli_optional_bool (a : Args) (name : String) (fallback : Bool)
+    : Either CliError Bool
 ```
 
 ## def cli_pos
@@ -98,6 +100,7 @@ def cli_pos_or (a : Args) (i : Nat) (fallback : String) : String
 
 ```
 def cli_required_pos (a : Args) (i : Nat) (name : String)
+    : Either CliError String
 ```
 
 ## def cli_usage

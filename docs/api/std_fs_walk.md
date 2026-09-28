@@ -14,6 +14,7 @@ inductive FsWalkResult : Type
 
 ```
 def fs_walk_map (f : List String -> List String) (r : FsWalkResult)
+    : FsWalkResult
 ```
 
 ## def fs_walk_message
@@ -32,6 +33,7 @@ def fs_walk_path_safe (root_real : String) (path : String) : IO Bool
 
 ```
 def fs_walk_checked_go : Nat -> String -> List String -> List String
+    -> IO FsWalkResult
 ```
 
 The budget counts every visited entry. Children are sorted; links, reparse points, canonical escapes, unreadable directories, and exhaustion are explicit.

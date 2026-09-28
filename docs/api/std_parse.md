@@ -92,6 +92,7 @@ def pstr (s : String) (cs : List Nat) : PRes String
 
 ```
 def pmany_fuel (A : Type) (p : List Nat -> PRes A)
+    : Nat -> List Nat -> PRes (List A)
 ```
 
 Fuel is the remaining input length, so the caller supplies it.
@@ -100,6 +101,7 @@ Fuel is the remaining input length, so the caller supplies it.
 
 ```
 def pmany (A : Type) (p : List Nat -> PRes A) (cs : List Nat)
+    : PRes (List A)
 ```
 
 ## def pmany1

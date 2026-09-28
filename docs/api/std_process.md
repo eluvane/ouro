@@ -192,6 +192,7 @@ def process_capture_peak_bytes (result : ProcessCaptureResult) : Nat
 
 ```
 def process_capture_default_limits (timeout_ms : Nat) (stdout_bytes : Nat) (stderr_bytes : Nat)
+    : ProcessCaptureLimits
 ```
 
 ## def process_capture_limit_name
@@ -246,6 +247,7 @@ def process_capture_limits_pair (limits : ProcessCaptureLimits) : Pair Nat (Pair
 
 ```
 def process_capture_request (limits : ProcessCaptureLimits) (input : String)
+    : Pair String (Pair Nat (Pair Nat (Pair Nat (Pair Nat Nat))))
 ```
 
 ## def process_capture_invalid_field
@@ -258,12 +260,16 @@ def process_capture_invalid_field (field : Nat) : ProcessCaptureError
 
 ```
 def process_capture_decode (limits : ProcessCaptureLimits)
+    (reply : Pair Nat (Pair Nat (Pair Nat (Pair String String))))
+    : Either ProcessCaptureError ProcessCaptureResult
 ```
 
 ## def process_capture_decode_checked
 
 ```
 def process_capture_decode_checked (limits : ProcessCaptureLimits)
+    (reply : Pair Nat (Pair Nat (Pair Nat (Pair String String))))
+    : Either ProcessCaptureError ProcessCaptureResult
 ```
 
 Keep malformed bridge results fail-closed as well. Stream lengths and peak are checked independently from the child's expected exit code.
@@ -272,10 +278,13 @@ Keep malformed bridge results fail-closed as well. Stream lengths and peak are c
 
 ```
 def process_run_captured_bounded_with_input (limits : ProcessCaptureLimits) (command : String)
+    (arguments : List String) (input : String)
+    : IO (Either ProcessCaptureError ProcessCaptureResult)
 ```
 
 ## def process_run_captured_bounded
 
 ```
 def process_run_captured_bounded (limits : ProcessCaptureLimits) (command : String) (arguments : List String)
+    : IO (Either ProcessCaptureError ProcessCaptureResult)
 ```

@@ -104,6 +104,7 @@ def configx_env_override (cfg : Config) (key : String) (env_name : String) : IO 
 
 ```
 def configx_env_overrides (cfg : Config)
+    (pairs : List (Pair String String)) : IO Config
 ```
 
 ## def configx_render_errors
