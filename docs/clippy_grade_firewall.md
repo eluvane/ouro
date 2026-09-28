@@ -30,8 +30,9 @@ malformed registry, missing rule, or incomplete inventory. See
 an intern table inside a worker. Its existing harvest cache uses canonical
 relative path, source byte length and content hash; a hit avoids parsing and
 harvesting that dependency again. Imported harvests retain signatures and compact
-source origins bound to module/declaration identity, never function bodies or
-completed contracts. Each root resolves those origins against its current import
+source origins bound to module/declaration identity and compiler-owned private
+names, never function bodies or completed contracts. Each root resolves those
+origins against its current import
 graph and recomputes summaries within the existing inference limits. It builds
 `compiler/semantic_scope.ouro` identities. A multi-file worker invocation
 reuses the intern table and cache across bounded allocation epochs and
@@ -80,7 +81,11 @@ arguments. The current declaration index must identify the constructor and its
 own family, with zero parameters and a signature returning that family.
 Ordinary global functions, unresolved names and constructors requiring arguments
 do not acquire this summary. Local bindings retain their parameter identities;
-import caches keep source candidates, not completed purity contracts.
+import caches keep source candidates, not completed purity contracts. Private
+constructors and delegates are available to their own module's helper summaries;
+a foreign reference cannot establish that proof or resolve as an executable.
+Public wrappers retain their own private implementation facts, and public type
+aliases retain their owner-private type lookup.
 
 Failure-to-success diagnostics require a checked failure arm and no intervening
 effect/recovery boundary. Literal error codes and rendering are not success

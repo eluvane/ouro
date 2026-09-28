@@ -84,8 +84,9 @@ def cm_import_ids (decls : List Decl) : List Nat :=
 -- copying the growing declaration accumulator on every module completion.
 def cm_graph_units (units : List SrcUnit) : List SrcUnit :=
     map SrcUnit SrcUnit (fun (unit : SrcUnit) => match unit with
-      | MkSrcUnit name decls => MkSrcUnit name
-          (map(Nat, Decl, fun (id : Nat) => DImport id, cm_import_ids decls))
+      | MkSrcUnit name _ => mk_src_unit name
+          (map(Nat, Decl, fun (id : Nat) => DImport id,
+            cm_import_ids (src_unit_decls unit))) []
       end) units;
 
 inductive CmResolvedImports : Type :=
@@ -143,6 +144,12 @@ def cm_global_name (unit : ClippySemanticUnit) (name : Nat) : Maybe Nat :=
         end
     end;
 
+-- Executable visibility is relative to its source owner. Typed signatures keep
+-- the full declaration index, including a public alias's private target type.
+def cm_decl_visible (owner : Nat) (decl : ScDecl) (units : List SrcUnit) : Bool :=
+    orb (eq_nat(owner, sc_decl_module decl))
+      (notb (module_is_private (sc_decl_module decl) (sc_decl_name decl) units));
+
 def cm_global_decl (unit : ClippySemanticUnit) (name : Nat) : Maybe ScDecl :=
     match cm_global_name unit name with
     | Nothing => Nothing ScDecl
@@ -161,22 +168,30 @@ def cm_strip_symbol (item : ScDecl) : ScDecl :=
 def cm_import_symbols (decls : List ScDecl) : List ScDecl :=
     map ScDecl ScDecl cm_strip_symbol decls;
 
+def cm_parsed_decls (file : ParsedFile) : List Decl :=
+    match file with | MkParsedFile decls _ => decls end;
+
+def cm_parsed_private (file : ParsedFile) : List Nat :=
+    match file with | MkParsedFile _ names => names end;
+
 inductive CmHarvest : Type :=
-  | MkHarvest : InternState -> List ScDecl -> List Nat -> List Decl -> List CsOriginFact -> CmHarvest;
+  | MkHarvest : InternState -> List ScDecl -> List Nat -> ParsedFile -> List CsOriginFact -> CmHarvest;
 
 -- Finish one parsed file. Imports keep signatures and compact origins; the
 -- selected file keeps bodies. This helper is unwrapped. The host arena seam wraps
 -- cm_load_file below so leave() drops imported function graphs.
 def cm_after_parse (path : String) (module_id : Nat) (keep_bodies : Bool)
-    (decls : List Decl) (intern : InternState) : CmHarvest :=
-    match cm_canon_imports path decls intern with
+    (file : ParsedFile) (intern : InternState) : CmHarvest :=
+    match cm_canon_imports path (cm_parsed_decls file) intern with
     | MkPair canonical updated =>
         let imports : List Nat := cm_import_ids canonical in
         let raw : List ScDecl := sc_declarations module_id canonical in
         match keep_bodies with
-        | True => MkHarvest updated raw imports canonical []
+        | True => MkHarvest updated raw imports
+            (MkParsedFile canonical (cm_parsed_private file)) []
         | False => MkHarvest updated (cm_import_symbols raw) imports
-            (cm_import_stubs imports) (cs_capture_origins raw)
+            (MkParsedFile (cm_import_stubs imports) (cm_parsed_private file))
+            (cs_capture_origins raw)
         end
     end;
 
@@ -264,8 +279,9 @@ def cm_cache_lookup (cache : CmParseCache) (canonical : String) (src : String)
 -- The current session's intern table is attached again on a cache hit.
 def cm_cache_harvest (harvest : CmHarvest) : CmHarvest :=
     match harvest with
-    | MkHarvest _ symbols imports _ origins => MkHarvest empty_intern
-        (cm_import_symbols symbols) imports (cm_import_stubs imports) origins
+    | MkHarvest _ symbols imports file origins => MkHarvest empty_intern
+        (cm_import_symbols symbols) imports
+        (MkParsedFile (cm_import_stubs imports) (cm_parsed_private file)) origins
     end;
 
 def cm_cache_bytes (cache : CmParseCache) : Nat :=
@@ -427,7 +443,8 @@ def cm_cache_contracts : Bool :=
     let other : String := "def n : Nat := S Z;" in
     let canonical : String := "std/cache_contract.ouro" in
     let harvest : CmHarvest :=
-      MkHarvest(empty_intern, Nil ScDecl, Nil Nat, Nil Decl, Nil CsOriginFact) in
+      MkHarvest(empty_intern, Nil ScDecl, Nil Nat,
+        MkParsedFile (Nil Decl) (Nil Nat), Nil CsOriginFact) in
     let cache : CmParseCache :=
       cm_cache_put cm_cache0 canonical src harvest in
     let hit : Bool := match cm_cache_lookup cache canonical src with
@@ -515,14 +532,16 @@ def cm_load_file (req : Pair String String) (intern : InternState)
     : Either QualityInputError CmHarvest :=
     match req with
     | MkPair path source =>
-        match cm_parse source intern with
+        match cm_parse_with_aliases source intern with
         | Left error => Left QualityInputError CmHarvest error
         | Right parsed => match parsed with
-          | MkPair decls lexed => match load_intern_string lexed
-              (prim_string_to_char_codes path) with
-            | MkPair module_id updated =>
-                Right QualityInputError CmHarvest
-                  (cm_after_parse path module_id False decls updated)
+          | MkPair file metadata => match metadata with
+            | MkPair lexed _ => match load_intern_string lexed
+                (prim_string_to_char_codes path) with
+              | MkPair module_id updated =>
+                  Right QualityInputError CmHarvest
+                    (cm_after_parse path module_id False file updated)
+              end
             end
           end
         end
@@ -602,7 +621,9 @@ def cm_load_pending (root : String) (entry : Nat) : Nat -> Nat -> List Nat -> Li
                     let members : List ModuleMember := map ScDecl ModuleMember
                       (fun (decl : ScDecl) => MkModuleMember
                         (sc_decl_module decl) (sc_decl_name decl)
-                        (sc_decl_name decl)) symbols in
+                        (sc_decl_name decl)
+                        (notb (module_is_private (sc_decl_module decl)
+                          (sc_decl_name decl) units))) symbols in
                     Right QualityInputError
                       (Pair(ClippySemanticUnit, Pair InternState CmParseCache))
                       (MkPair ClippySemanticUnit (Pair InternState CmParseCache)
@@ -633,7 +654,7 @@ def cm_load_pending (root : String) (entry : Nat) : Nat -> Nat -> List Nat -> Li
                   (notb (elem Nat eq_nat id keep))) with
             | True =>
                 go remaining file_budget rest (Cons Nat id loaded) intern
-                  (Cons SrcUnit (MkSrcUnit(id, Nil Decl)) units)
+                  (Cons SrcUnit (mk_src_unit id (Nil Decl) (Nil Nat)) units)
                   symbols source root_decls cache keep origins root_aliases
             | False =>
             do let! input := quality_read_file (quality_child root path);
@@ -652,12 +673,12 @@ def cm_load_pending (root : String) (entry : Nat) : Nat -> Nat -> List Nat -> Li
                      | Right parsed => match parsed with
                        | MkPair decls metadata => match metadata with
                          | MkPair lexed aliases => match cm_after_parse path id True decls lexed with
-                           | MkHarvest updated file_symbols imports canonical _ =>
+                           | MkHarvest updated file_symbols imports file _ =>
                                go remaining files_remaining
                                  (append Nat imports rest) (Cons Nat id loaded)
-                                 updated (Cons SrcUnit (MkSrcUnit(id, cm_import_stubs imports)) units)
+                                 updated (Cons SrcUnit (mk_src_unit id (cm_import_stubs imports) (cm_parsed_private file)) units)
                                  (append ScDecl file_symbols symbols)
-                                 text canonical cache imports origins aliases
+                                 text (cm_parsed_decls file) cache imports origins aliases
                            end
                          end
                        end
@@ -670,10 +691,10 @@ def cm_load_pending (root : String) (entry : Nat) : Nat -> Nat -> List Nat -> Li
                              (prim_string_concat(": ", quality_input_message error)))))
                      | Right loaded_file => match loaded_file with
                        | MkPair harvested next_cache => match harvested with
-                         | MkHarvest updated file_symbols imports _ captured =>
+                         | MkHarvest updated file_symbols imports file captured =>
                              go remaining files_remaining
                                (append Nat imports rest) (Cons Nat id loaded)
-                               updated (Cons SrcUnit (MkSrcUnit(id, cm_import_stubs imports)) units)
+                               updated (Cons SrcUnit (mk_src_unit id (cm_import_stubs imports) (cm_parsed_private file)) units)
                                (append ScDecl file_symbols symbols)
                                source root_decls next_cache keep
                                (append CsOriginFact captured origins) root_aliases

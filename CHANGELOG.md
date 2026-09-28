@@ -37,6 +37,9 @@ Development changes; see the [compatibility policy](docs/stability.md).
   [Trailing lambda calls](docs/language/ergonomic-syntax.md#trailing-lambda-calls).
 - `Maybe A` values accept lazy `value ?? fallback` expressions, checked through
   the registered nominal family; see [Maybe fallback](docs/language/ergonomic-syntax.md#maybe-fallback-operator).
+- `private` declaration visibility keeps internal helpers, constructors,
+  effect operations, and record accessors available to their owner while
+  excluding them from imports and re-exports; imported bodies are still checked.
 - Exclusive `0..10` and inclusive `0..=10` literal-endpoint `NatRange` values,
   checked through nominal Nat, bound, and range representation roles.
 - Final-tail list spreads `[first, ..rest]` build checked `List A` constructor

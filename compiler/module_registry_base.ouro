@@ -22,7 +22,7 @@ inductive ModuleAliasUnit : Type :=
       List ModuleRule -> ModuleAliasUnit;
 
 inductive ModuleMember : Type :=
-  | MkModuleMember : Nat -> Nat -> Nat -> ModuleMember;
+  | MkModuleMember : Nat -> Nat -> Nat -> Bool -> ModuleMember;
 
 inductive ModuleMaps : Type :=
   | MkModuleMaps : List (Pair Nat Nat) -> List (Pair Nat Nat) ->
@@ -302,6 +302,113 @@ def module_seed_units (units : List SrcUnit) (reached : List Nat)
         end
     end) reached (Nil (Pair Nat Nat));
 
+def module_is_private (owner : Nat) (name : Nat)
+    : List SrcUnit -> Bool :=
+  fix go (units : List SrcUnit) : Bool :=
+    match units with
+    | Nil => False
+    | Cons unit rest => match unit with
+      | MkSrcUnit path _ => match eqNat path owner with
+        | True => memNat name (src_unit_private_names unit)
+        | False => go rest
+        end
+      end
+    end;
+
+def module_has_private (reached : List Nat)
+    : List SrcUnit -> Bool :=
+  fix go (units : List SrcUnit) : Bool :=
+    match units with
+    | Nil => False
+    | Cons unit rest => match unit with
+      | MkSrcUnit owner _ =>
+          match andb(memNat owner reached,
+              match src_unit_private_names unit with
+              | Nil => False | Cons _ _ => True end) with
+          | True => True
+          | False => go rest
+          end
+      end
+    end;
+
+def module_has_alias_bindings (reached : List Nat)
+    : List ModuleAliasUnit -> Bool :=
+  fix go (items : List ModuleAliasUnit) : Bool :=
+    match items with
+    | Nil => False
+    | Cons item rest => match item with
+      | MkModuleAliasUnit owner bindings _ =>
+          match andb(memNat owner reached,
+              match bindings with | Nil => False | Cons _ _ => True end) with
+          | True => True
+          | False => go rest
+          end
+      end
+    end;
+
+def module_public_collision (seeds : List (Pair Nat Nat))
+    (units : List SrcUnit) : Maybe Nat :=
+  (fix go (rows : List (Pair Nat Nat)) : Maybe Nat :=
+    match rows with
+    | Nil => Nothing Nat
+    | Cons row rest => match row with
+      | MkPair owner name =>
+          match module_is_private owner name units with
+          | True => go rest
+          | False =>
+              match (fix find (others : List (Pair Nat Nat)) : Bool :=
+                match others with
+                | Nil => False
+                | Cons other tail => match other with
+                  | MkPair path short =>
+                      match andb(eqNat name short,
+                          andb(notb(eqNat owner path),
+                            notb(module_is_private path short units))) with
+                      | True => True
+                      | False => find tail
+                      end
+                  end
+                end) rest with
+              | True => Just Nat name
+              | False => go rest
+              end
+          end
+      end
+    end) seeds;
+
+def module_has_any_private : List SrcUnit -> Bool :=
+  fix go (units : List SrcUnit) : Bool :=
+    match units with
+    | Nil => False
+    | Cons unit rest => match unit with
+      | MkSrcUnit _ _ => match src_unit_private_names unit with
+        | Nil => go rest
+        | Cons _ _ => True
+        end
+      end
+    end;
+
+def module_validate_private : List SrcUnit -> ResolveResult Unit :=
+  fix go (units : List SrcUnit) : ResolveResult Unit :=
+    match units with
+    | Nil => ROk Unit MkUnit
+    | Cons unit rest => match unit with
+      | MkSrcUnit _owner _ =>
+          let declared : List Nat := module_decl_names (src_unit_decls unit) in
+          match (fix check (names : List Nat) : ResolveResult Unit :=
+            match names with
+            | Nil => ROk Unit MkUnit
+            | Cons name tail => match memNat name declared with
+              | False => RErr Unit 8 name
+              | True => check tail
+              end
+            end) (src_unit_private_names unit) with
+          | RErr code detail => RErr Unit code detail
+          | ROk _ => go rest
+          end
+      end
+    end;
+
 def module_name_conflicts (owner : Nat) (name : Nat)
     : List (Pair Nat Nat) -> Bool :=
   fix go (items : List (Pair Nat Nat)) : Bool :=
@@ -518,7 +625,7 @@ def module_binder_maps (st : InternState) (markers : List Nat)
 
 def module_members (st0 : InternState) (root : Nat) (reached : List Nat)
     (conflicts : List Nat) (seeds : List (Pair Nat Nat))
-    (isolate : Bool)
+    (units : List SrcUnit) (isolate : Bool)
     : ResolveResult (Pair (List ModuleMember) InternState) :=
   (fix go (rows : List (Pair Nat Nat)) (st : InternState)
       : ResolveResult (Pair (List ModuleMember) InternState) :=
@@ -529,6 +636,7 @@ def module_members (st0 : InternState) (root : Nat) (reached : List Nat)
         match row with
         | MkPair owner name =>
             let collision : Bool := orb(isolate, memNat name conflicts) in
+            let public : Bool := notb(module_is_private owner name units) in
             match andb collision (notb(eqNat owner root)) with
             | False =>
                 match go rest st with
@@ -539,7 +647,7 @@ def module_members (st0 : InternState) (root : Nat) (reached : List Nat)
                     | MkPair tail final_st =>
                         ROk (Pair (List ModuleMember) InternState)
                           (MkPair (List ModuleMember) InternState
-                            (Cons ModuleMember (MkModuleMember owner name name) tail)
+                            (Cons ModuleMember (MkModuleMember owner name name public) tail)
                             final_st)
                     end
                 end
@@ -566,7 +674,7 @@ def module_members (st0 : InternState) (root : Nat) (reached : List Nat)
                                         ROk (Pair (List ModuleMember) InternState)
                                           (MkPair (List ModuleMember) InternState
                                             (Cons ModuleMember
-                                              (MkModuleMember owner name symbol) tail)
+                                              (MkModuleMember owner name symbol public) tail)
                                             final_st)
                                     end
                                 end
@@ -585,7 +693,7 @@ def module_member (owner : Nat) (name : Nat)
     | Nil => Nothing Nat
     | Cons item rest =>
         match item with
-        | MkModuleMember path spelling symbol =>
+        | MkModuleMember path spelling symbol _ =>
             match andb(eqNat path owner, eqNat spelling name) with
             | True => Just Nat symbol
             | False => go rest
@@ -600,13 +708,29 @@ def module_member_bytes (st : InternState) (owner : Nat)
     | Nil => Nothing Nat
     | Cons item rest =>
         match item with
-        | MkModuleMember path name symbol =>
+        | MkModuleMember path name symbol _ =>
             match andb(eqNat path owner,
                 source_bytes_equal (name_of_id st name) spelling) with
             | True => Just Nat symbol
             | False => go rest
             end
         end
+    end;
+
+def module_public_member_bytes (st : InternState) (owner : Nat)
+    (spelling : List Nat) : List ModuleMember -> Maybe Nat :=
+  fix go (members : List ModuleMember) : Maybe Nat :=
+    match members with
+    | Nil => Nothing Nat
+    | Cons item rest => match item with
+      | MkModuleMember path name symbol public =>
+          match andb(public,
+              andb(eqNat path owner,
+                source_bytes_equal (name_of_id st name) spelling)) with
+          | True => Just Nat symbol
+          | False => go rest
+          end
+      end
     end;
 
 def module_ident_id (st : InternState) (spelling : List Nat) : Maybe Nat :=
@@ -699,7 +823,7 @@ def module_validate_selected (st : InternState)
             | Nil => ROk Unit MkUnit
             | Cons selector tail => match selector with
               | MkImportSelector original _ =>
-                  match module_member_bytes st owner original members with
+                  match module_public_member_bytes st owner original members with
                   | Nothing => RErr Unit 5
                       (match module_ident_id st original with
                       | Nothing => 0 | Just name => name end)
@@ -778,7 +902,7 @@ def module_owned_exports (owner : Nat)
     match members with
     | Nil => Nil (Pair Nat Nat)
     | Cons item rest => match item with
-      | MkModuleMember path short symbol => match eqNat path owner with
+      | MkModuleMember path short symbol public => match andb(public, eqNat path owner) with
         | True => Cons (Pair Nat Nat) (MkPair Nat Nat short symbol) (go rest)
         | False => go rest
         end
@@ -797,7 +921,7 @@ def module_selected_exports (st : InternState) (owner : Nat)
       | MkImportSelector original local =>
           match module_ident_id st local with
           | Nothing => go rest
-          | Just short => match module_member_bytes st owner original members with
+          | Just short => match module_public_member_bytes st owner original members with
             | Nothing => go rest
             | Just symbol => Cons (Pair Nat Nat)
                 (MkPair Nat Nat short symbol) (go rest)

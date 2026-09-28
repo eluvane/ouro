@@ -15,12 +15,39 @@ inductive AbiLaw : Type :=
 
 def abi_fuel : Nat := mul 40 50;
 
-def abi_parse_file (fuel : Nat) (tokens : List Token) (position : Nat)
-    : ParseResult (List Decl) :=
-    parse_file parse fuel tokens position;
-
 def abi_codes_equal (codes : List Nat) (expected : String) : Bool :=
     prim_string_eq(prim_string_of_char_codes codes, expected);
+
+def abi_parse_file (fuel : Nat) (tokens : List Token) (position : Nat)
+    : ParseResult ParsedFile :=
+    closed_parse_file_visibility parse_a parse_b fuel tokens position;
+
+def abi_closed_parser_projection : Bool :=
+    match lex_all_import abi_fuel
+        (prim_string_to_char_codes "private def helper : Type := Type;") with
+    | LexMalformed _ => False
+    | LexExhausted _ => False
+    | LexOk tokens state =>
+        match abi_parse_file abi_fuel tokens 0 with
+        | PErr _ => False
+        | POk parsed remaining past => match parsed with
+          | MkParsedFile declarations names =>
+              match closed_parse_file parse_a parse_b abi_fuel tokens 0 with
+              | PErr _ => False
+              | POk projected remaining2 past2 =>
+                  andb(eqNat past past2,
+                    andb(eqNat (length Token remaining) (length Token remaining2),
+                      andb(eqNat (length Decl declarations) (length Decl projected),
+                        match names with
+                        | Cons name tail =>
+                            andb(abi_codes_equal(name_of_id state name, "helper"),
+                              match tail with | Nil => True | Cons _ _ => False end)
+                        | Nil => False
+                        end)))
+              end
+          end
+        end
+    end;
 
 def abi_decl_name (decls : List Decl) (state : InternState) : Bool :=
     match decls with
@@ -49,14 +76,48 @@ def abi_lex_parse_resolve : Bool :=
     | UErr _ _ _ => False
     | UOk unit state =>
         match unit with
-        | MkSrcUnit path decls =>
+        | MkSrcUnit path _ =>
             andb (abi_codes_equal(str_of_id state path, "a.ouro"))
-              (andb (abi_decl_name decls state)
+              (andb (abi_decl_name (src_unit_decls unit) state)
                 (match resolve_imports([unit] : List SrcUnit, path) with
                 | RErr _ _ => False
                 | ROk ordered => abi_decl_name ordered state
                 end))
         end
+    end;
+
+def abi_private_metadata : Bool :=
+    match parse_unit lex_go intern_string abi_parse_file abi_fuel empty_intern
+      (prim_string_to_char_codes "a.ouro")
+      (prim_string_to_char_codes "private def helper : Type := Type;") with
+    | UErr _ _ _ => False
+    | UOk unit state => match unit with
+      | MkSrcUnit _ _ => match src_unit_private_names unit with
+        | Cons name tail => andb(abi_codes_equal(name_of_id state name, "helper"))
+            (match tail with | Nil => True | Cons _ _ => False end)
+        | Nil => False
+        end
+      end
+    end;
+
+def abi_private_effect_metadata : Bool :=
+    match parse_unit lex_go intern_string abi_parse_file abi_fuel empty_intern
+      (prim_string_to_char_codes "a.ouro")
+      (prim_string_to_char_codes
+        "private effect Console where | write : Type -> Type;") with
+    | UErr _ _ _ => False
+    | UOk unit state => match unit with
+      | MkSrcUnit _ _ => match src_unit_private_names unit with
+        | Cons effect_name rest => match rest with
+          | Cons operation tail =>
+              andb(abi_codes_equal(name_of_id state effect_name, "Console"),
+                andb(abi_codes_equal(name_of_id state operation, "write"),
+                  match tail with | Nil => True | Cons _ _ => False end))
+          | Nil => False
+          end
+        | Nil => False
+        end
+      end
     end;
 
 def abi_unit_error (fuel : Nat) (source : String) (expected : Nat) : Bool :=
@@ -69,7 +130,7 @@ def abi_unit_error (fuel : Nat) (source : String) (expected : Nat) : Bool :=
 
 def abi_resolver_error : Bool :=
     match resolve_imports
-      ([MkSrcUnit(0, [DImport 1] : List Decl)] : List SrcUnit) 0 with
+      ([mk_src_unit 0 ([DImport 1] : List Decl) ([] : List Nat)] : List SrcUnit) 0 with
     | ROk _ => False
     | RErr code missing => andb(eqNat code 2, eqNat missing 1)
     end;
@@ -442,6 +503,9 @@ def abi_record_text_wrapper_rejects_missing_metadata : Bool :=
 
 def abi_laws : List AbiLaw :=
     [ MkAbiLaw "lexer/parser/resolver share declarations and intern state" abi_lex_parse_resolve
+    , MkAbiLaw "closed checked parser retains private metadata and AST projection" abi_closed_parser_projection
+    , MkAbiLaw "private declaration metadata keeps its parsed member identity" abi_private_metadata
+    , MkAbiLaw "private effect metadata includes its operation" abi_private_effect_metadata
     , MkAbiLaw("lexer malformed result crosses parser callback", abi_unit_error abi_fuel "@" 11)
     , MkAbiLaw("lexer exhaustion crosses parser callback", abi_unit_error 0 "def" 12)
     , MkAbiLaw("parser error crosses unit callback", abi_unit_error abi_fuel "def" 10)

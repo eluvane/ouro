@@ -20,6 +20,13 @@ source-module names before the ordered declaration plan reaches the checker.
 They cannot authorize an unchecked import: each reached declaration and body
 still enters the same compiler-owned checking path. The module pass adds no
 checker allowlist dependency or host IO authority.
+
+The parser records each private declaration and its generated members in the
+owning source unit. Module resolution keeps owner-local access and removes
+those members from external plain, selected, qualified, local-open, transitive,
+and generated record-grant scopes. Visibility never removes a declaration from
+the ordered checker input.
+
 Record preprocessing uses canonical source paths and local import bindings to
 select the shape of a qualified literal or projection. It preserves the
 qualified type and base, and fails when the aliased file does not own the
