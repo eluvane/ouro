@@ -6,6 +6,9 @@ Development changes; see the [compatibility policy](docs/stability.md).
 
 ### Added
 
+- Single-quoted Unicode scalar literals as existing `Nat` ordinals, with strict
+  UTF-8 and escape validation. See [Numbers and strings](docs/syntax.md#numbers-and-strings).
+
 - Exclusive `0..10` and inclusive `0..=10` literal-endpoint `NatRange` values,
   checked through nominal Nat, bound, and range representation roles.
 - Final-tail list spreads `[first, ..rest]` build checked `List A` constructor

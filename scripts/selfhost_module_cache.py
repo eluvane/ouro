@@ -134,6 +134,16 @@ def quoted_import_targets(source_text: str, source_path: str) -> list[str]:
             else:
                 tokens.append(("string", source_text[index + 3:close]))
                 index = close + 2
+        elif char == "'":
+            # Identifier words consume their primes; this delimiter begins an opaque scalar.
+            index += 1
+            while index < len(source_text) and source_text[index] != "'":
+                index += 2 if source_text[index] == "\\" else 1
+            if index < len(source_text):
+                index += 1
+                tokens.append(("character", ""))
+            else:
+                tokens.append(("unterminated", ""))
         elif char == '"':
             index += 1
             value: list[str] = []
