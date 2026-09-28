@@ -183,7 +183,7 @@ want capabilities-rename '"renameProvider":true'
 want diagnostics-clean "\"uri\":\"$SAMPLE_URI\",\"diagnostics\":\[\]"
 # Literal JSON needle; backslashes must not expand.
 # shellcheck disable=SC2016
-want hover-signature '"id":2,"result":{"contents":{"kind":"markdown","value":"```ouro\\ndef widget (n : Nat) : Nat\\n```'
+want hover-signature '"id":2,"result":{"contents":{"kind":"markdown","value":"```ouro\\ndef widget (n : Nat)\\n    : Nat\\n```'
 want hover-doc 'Doubles a natural'
 want definition-line "\"id\":3,\"result\":{\"uri\":\"$SAMPLE_URI\",\"range\":{\"start\":{\"line\":$DEF_LINE,"
 want completion-widget '"id":8,"result":'
