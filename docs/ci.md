@@ -63,7 +63,8 @@ runs in Nightly and on demand. Run one group with:
 python3 scripts/ci_gate.py --profile pr --group checks
 ```
 
-The group names are `checks`, `checks-parity`, `checks-quality`, `analysis`, `checker`, `analyzer`, `lint`,
+The group names are `checks`, `checks-parity`, `checks-quality`, `analysis`, `checker`, `analyzer`,
+`analyzer-lint`, `lint`,
 `tests`, `smith`, `samples-1`, `samples-2`, and `compiler-1` through
 `compiler-16`. Substitute the selected name after `--group`.
 
@@ -77,8 +78,10 @@ local command runs every gate in registry order. The runner rejects a group
 inventory that omits, duplicates, or invents a gate; its self-test also checks
 complete matrix coverage and the affected-path routing contracts. The
 `analysis` group owns memory budgets, C analysis, and LSP; `checker` owns
-hardening, scale, and depth; `analyzer` owns analyzer precision and
-`lint-changed`. The complete Ouro lint suite runs in Nightly, the full
+hardening, scale, and depth. In PR validation, `analyzer` owns analyzer
+precision and `analyzer-lint` owns `lint-changed`. They run in separate jobs,
+each with the existing 120-minute limit; their gate commands and per-program
+limits are unchanged. The complete Ouro lint suite runs in Nightly, the full
 **Manual** workflow, and **Lint → Run workflow**; PR, push, merge-queue and
 Release jobs exclude its group. A pull request instead runs `lint-changed`:
 `ouro1 lint --deny` over the changed `.ouro` files that the complete suite's
@@ -167,7 +170,7 @@ uploaded separately as `nightly-<group>` artifacts. Hosted PR matrix jobs use st
 matrix does not publish an unevaluated expression. When those jobs run,
 GitHub appends the matrix value: `PR (checks)`, `PR (checks-parity)`,
 `PR (checks-quality)`, `PR (analysis)`, `PR (checker)`,
-`PR (analyzer)`, `PR (tests)`,
+`PR (analyzer)`, `PR (analyzer-lint)`, `PR (tests)`,
 `PR (smith)`, `PR (samples-1)`, `PR (samples-2)`, `PR (compiler-1)` through
 `PR (compiler-16)`, `Portable (ubuntu-latest)`,
 and `Portable (macos-latest)`. Linux Portable uses the shared compiler;
