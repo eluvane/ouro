@@ -118,7 +118,9 @@ def build_worker(args, cfg) -> None:
     before = json.loads((work / "inputs-before.json").read_text(encoding="utf-8"))
     require_snapshot(args, cfg, before)
     generated = work / "backend.gen.c"
+    print("FRONTEND_HOST_BUILD: emit current backend", flush=True)
     native.emit(args.compiler, before["units"], args.fuel, generated)
+    print("FRONTEND_HOST_BUILD: backend emitted", flush=True)
     exports = set(re.findall(r'case\s+\d+:\s*return\s+"([^"]+)"', generated.read_text(encoding="utf-8")))
     required = set()
     for source in HOST_MAINS.values():
@@ -133,6 +135,7 @@ def build_worker(args, cfg) -> None:
     for name, main in HOST_MAINS.items():
         require_snapshot(args, cfg, before)
         # Identical common sources share only this fresh invocation's checked objects.
+        print(f"FRONTEND_HOST_BUILD: link {name}", flush=True)
         result = build.build_c_executable(cfg, name="frontend-host", sources=[*common, (main, ROOT / main)],
             output=executable(work, name), object_dir=work / "objects", include_dirs=[ROOT / "runtime"],
             extra_cflags=["-Werror=implicit-function-declaration", "-DOURO_FE_FLAT_EXPORTS"], jobs=1)
