@@ -213,7 +213,7 @@ python3 scripts/ci_gate.py --profile docs --out _build/ci/docs
 
 `Paths` first runs the CI runner's self-tests and
 `python3 scripts/clippy_import_gap.py --self-test`, before compiler builds.
-The gap command only reads stub inventories and imports. The repository scan
+The gap command reads stub inventories, imports, and match arms. The repository scan
 is `python3 scripts/clippy_import_gap.py`. It then
 compares the PR base with GitHub's tested merge commit. The NUL-delimited local
 Git diff has no API file-list limit; rename detection is disabled so both the

@@ -20,9 +20,12 @@ python3 scripts/clippy_grade_firewall.py --list-rules
 python3 scripts/clippy_import_gap.py
 ```
 
-`clippy_import_gap.py` reads the stub inventories and import graph. It reports a
-harvested use of a declaration that the walker would not load. It does not run
-the compiler and does not decide whether a program is well typed.
+`clippy_import_gap.py` reads the stub inventories, import graph, and match arms.
+It reports a harvested use of a declaration that the walker would not load, a
+bare name whose only definition is outside that import closure, a stub-list
+line that is missing or repeated, and a match that dropped one or two
+constructors of an inductive it otherwise covers. It does not run the compiler
+and does not decide whether a program is well typed.
 
 `strict` and `release` reject `--warn-only` and fail on deny/fatal findings.
 `project --warn-only` can report ordinary debt but cannot hide a fatal error,
