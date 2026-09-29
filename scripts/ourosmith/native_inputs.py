@@ -14,6 +14,7 @@ from ourosmith.surface.mutate import mutations
 from ourosmith.surface.text_contracts import cases
 
 GROUPS = ("fmt", "fix", "doc", "lint", "manifest", "runtime", "test", "lsp", "security")
+_MANIFEST_BATCH_ROWS = 29
 
 
 def write(path, text):
@@ -200,9 +201,10 @@ def manifest_batches(text, prefix):
         groups.setdefault(key, []).append(name)
     batches, covered = [], set()
     for key, names in sorted(groups.items()):
-        chunks = [names[index:index + 50] for index in range(0, len(names), 50)]
+        chunks = [names[index:index + _MANIFEST_BATCH_ROWS]
+                  for index in range(0, len(names), _MANIFEST_BATCH_ROWS)]
         for chunk in chunks:
-            selectors = [key] if key != "original" and len(names) <= 50 else chunk
+            selectors = [key] if key != "original" and len(names) <= _MANIFEST_BATCH_ROWS else chunk
             actual = {name for name in ids if name.startswith(tuple(selectors))}
             if actual != set(chunk) or covered.intersection(actual):
                 raise ValueError("manifest batch prefixes overlap or select unexpected rows")
