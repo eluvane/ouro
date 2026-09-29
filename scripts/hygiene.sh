@@ -172,8 +172,8 @@ if grep -q '("pi", "_pi", "compiler/preprocess_import.ouro", "pi.c")' scripts/fr
 	&& ! grep -q "preprocess_files" runtime/frontend_link.c \
 	&& grep -q "classify_ergo" compiler/pipeline.ouro \
 	&& ! grep -q "print_ergo_diags" runtime/frontend_link.c \
-	&& grep -q "closed_parse_file" compiler/parser_file.ouro \
-	&& grep -q 'FIND(pf, "closed_parse_file")' runtime/frontend_link.c \
+	&& grep -q "closed_parse_file_visibility" compiler/parser_file.ouro \
+	&& grep -q 'FIND(pf, "closed_parse_file_visibility")' runtime/frontend_link.c \
 	&& ! grep -q "is_core_mode" runtime/frontend_link.c \
 	&& grep -q "def ensure_fe_link" scripts/ouro_build.py; then
 	ok "preprocess + ergo classify + parse dispatch run in packed TUs"
