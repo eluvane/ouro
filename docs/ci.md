@@ -211,7 +211,10 @@ python3 scripts/ci_gate.py --profile docs --out _build/ci/docs
 
 ### Affected PR checks
 
-`Paths` first runs the CI runner's self-tests, before compiler builds. It then
+`Paths` first runs the CI runner's self-tests and
+`python3 scripts/clippy_import_gap.py --self-test`, before compiler builds.
+The gap command only reads stub inventories and imports. The repository scan
+is `python3 scripts/clippy_import_gap.py`. It then
 compares the PR base with GitHub's tested merge commit. The NUL-delimited local
 Git diff has no API file-list limit; rename detection is disabled so both the
 old and new path contribute to selection. Missing revisions, Git errors,

@@ -17,7 +17,12 @@ fixture, and file-inventory queries and JSON/SARIF reports:
 sh scripts/ouro1.sh lint --deny --family semantic --profile project std
 python3 scripts/clippy_grade_firewall.py --profile strict --scope std
 python3 scripts/clippy_grade_firewall.py --list-rules
+python3 scripts/clippy_import_gap.py
 ```
+
+`clippy_import_gap.py` reads the stub inventories and import graph. It reports a
+harvested use of a declaration that the walker would not load. It does not run
+the compiler and does not decide whether a program is well typed.
 
 `strict` and `release` reject `--warn-only` and fail on deny/fatal findings.
 `project --warn-only` can report ordinary debt but cannot hide a fatal error,
