@@ -98,8 +98,10 @@ for the declaration syntax and [TCB](tcb.md) for the pure dependency boundary.
 | Checked program and diagnostic serialization | `compiler/checked_program.ouro` and `compiler/checked_program_output.ouro` |
 
 Environment indexes are derived from accepted declarations. They accelerate
-lookup without granting unchecked declarations authority. Deferred
-substitutions and application processing preserve binder scope and the
+lookup without granting unchecked declarations authority. The positivity walk
+derives each earlier-tail index alongside its certificates. Certificates are
+rebuilt from the declaration list with the same proof fuel and failure checks.
+Deferred substitutions and application processing preserve binder scope and the
 observable reduction budget. Input-work limits reject excessive input with a
 typed resource failure before recursive checking; crashes and process limits
 are separate test failures.
