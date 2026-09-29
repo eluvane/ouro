@@ -76,7 +76,7 @@ def probe_cases():
                              ("lower-bad-contracts", "contracts returned an invalid list")):
         cases.append(("n1-host-selftest", [mode], 2, "", re.escape(f"n1-host: {diagnostic}\n")))
     for mode in ("caller-output", "retained-result", "typed-failure", "nested-context", "allocation-context",
-                 "shared-parent-spine",
+                 "shared-parent-spine", "wrapped-context",
                  "recheck-scale", "recheck-retained", "recheck-late-invalid", "recheck-missing-bodies", "recheck-zero-fuel"):
         argv = [mode, "retained output.exe"] if mode == "caller-output" else [mode]
         stderr = re.escape("probe.ouro: type mismatch in wrong\n") if mode == "typed-failure" else ""

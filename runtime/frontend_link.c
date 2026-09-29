@@ -596,26 +596,17 @@ static ouro_v *bounded_token_fuel(ouro_env *env, ouro_v *fuel)
 	return ouro_clos(bounded_token_source, ouro_cons(fuel, env));
 }
 
-/* Quality lex calls next_import_token directly. One shared intern makes each
-   lookup walk every earlier name; those comparison spines are simultaneously
-   live until the token returns. Keep the token and intern delta, then drop
-   the lookup. Save the outer mark so a compiler bounded_call around this
-   same export still reclaims its own apply temporaries. */
+/* Token/span callbacks borrow caller values, which may belong to an outer
+   phase mark. Copy survivors into the restored caller allocator so an outer
+   clone cannot share a permanent node that still points into that phase. */
 static ouro_v *import_token_state(ouro_env *env, ouro_v *st)
 {
-	unsigned long saved_n = 0;
-	unsigned long saved_used = 0;
 	ouro_v *fn = ouro_get(env, 2);
 	ouro_v *fuel = ouro_get(env, 1);
 	ouro_v *src = ouro_get(env, 0);
-	ouro_v *result;
-	ouro_heap_mark_save(&saved_n, &saved_used);
-	ouro_heap_mark();
-	result = ouro_apply(ouro_apply(ouro_apply(fn, fuel), src), st);
-	result = ouro_clone_since_mark(result);
-	ouro_heap_reset();
-	ouro_heap_mark_restore(saved_n, saved_used);
-	return result;
+	ouro_heap_context *context = ouro_heap_context_enter();
+	ouro_v *result = ouro_apply(ouro_apply(ouro_apply(fn, fuel), src), st);
+	return ouro_heap_context_leave(context, result);
 }
 
 static ouro_v *import_token_source(ouro_env *env, ouro_v *src)

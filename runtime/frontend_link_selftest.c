@@ -10,6 +10,7 @@
 int ouro_export_count(void);
 const char *ouro_export_name(int i);
 ouro_v *ouro_export_value(int i);
+ouro_v *ouro_wrap_settled3(ouro_v *raw);
 
 static int fail(const char *message)
 {
@@ -147,6 +148,61 @@ static int packed_eq(ouro_v *value, const unsigned char *bytes, unsigned long si
 {
 	return value != 0 && value->tag == OURO_TAG_BYTES && value->n == (int)size &&
 		value->u.s != 0 && memcmp(value->u.s, bytes, size) == 0;
+}
+
+static ouro_v *wrapped_context_last(ouro_env *env, ouro_v *last)
+{
+	ouro_v *fields[3] = {ouro_get(env, 1), ouro_get(env, 0), last};
+	(void)ouro_alloc(2UL * 1024UL * 1024UL);
+	return ouro_ctor(0, 3, fields);
+}
+
+static ouro_v *wrapped_context_second(ouro_env *env, ouro_v *second)
+{
+	return ouro_clos(wrapped_context_last, ouro_cons(second, env));
+}
+
+static ouro_v *wrapped_context_first(ouro_env *env, ouro_v *first)
+{
+	(void)env;
+	return ouro_clos(wrapped_context_second, ouro_cons(first, 0));
+}
+
+static int wrapped_context_check(void)
+{
+	ouro_v *raw;
+	ouro_v *wrapped;
+	ouro_v *first;
+	ouro_v *second;
+	ouro_v *last;
+	ouro_v *result;
+	ouro_v *kept;
+	unsigned long long before;
+	ouro_static_begin();
+	raw = ouro_clos(wrapped_context_first, 0);
+	wrapped = ouro_wrap_settled3(raw);
+	ouro_static_end();
+	ouro_heap_mark();
+	first = ouro_string_codes("first");
+	second = ouro_string_codes("second");
+	last = ouro_string_codes("last");
+	before = ouro_heap_live_bytes();
+	result = ouro_apply(ouro_apply(ouro_apply(wrapped, first), second), last);
+	if (result == 0 || result->tag != 0 || result->n != 3 ||
+	    OURO_F(result, 0) != first || OURO_F(result, 1) != second ||
+	    OURO_F(result, 2) != last)
+		return fail("wrapped callback lost caller-owned arguments");
+	if (ouro_heap_live_bytes() > before + 4096ULL)
+		return fail("wrapped callback retained its work arena");
+	kept = ouro_clone_perm(result);
+	ouro_heap_reset();
+	memset(ouro_alloc(4096UL), 0xA5, 4096UL);
+	if (kept == 0 || kept->tag != 0 || kept->n != 3 ||
+	    !packed_eq(OURO_F(kept, 0), (const unsigned char *)"first", 5) ||
+	    !packed_eq(OURO_F(kept, 1), (const unsigned char *)"second", 6) ||
+	    !packed_eq(OURO_F(kept, 2), (const unsigned char *)"last", 4))
+		return fail("wrapped survivor borrowed the reset outer phase");
+	return 0;
 }
 
 static int nested_context_check(void)
@@ -405,6 +461,8 @@ int main(int argc, char **argv)
 		result = retained_result_check();
 	else if (argc == 2 && strcmp(argv[1], "typed-failure") == 0)
 		result = typed_failure_check();
+	else if (argc == 2 && strcmp(argv[1], "wrapped-context") == 0)
+		result = wrapped_context_check();
 	else if (argc == 2 && strcmp(argv[1], "nested-context") == 0)
 		result = nested_context_check();
 	else if (argc == 2 && strcmp(argv[1], "allocation-context") == 0)

@@ -224,6 +224,9 @@ Development changes; see the [compatibility policy](docs/stability.md).
 
 ### Fixed
 
+- Token and source-span callbacks return into their caller's allocation context,
+  preserving borrowed values when an enclosing frontend phase is reset.
+
 - Validate unresolved dotted projection prefixes even in source units without
   record declarations, retaining the invalid-projection diagnostic.
 - Finish lexer token streams with a linear reversal while preserving token
