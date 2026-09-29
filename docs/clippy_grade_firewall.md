@@ -26,8 +26,11 @@ malformed registry, missing rule, or incomplete inventory. See
 
 ## Semantic boundary
 
-`semantic_unit.ouro` reads imported sources for each requested root and shares
-an intern table inside a worker. Its existing harvest cache uses canonical
+`semantic_unit.ouro` follows the complete transitive import graph for each
+requested root and shares an intern table inside a worker. Only the selected root
+retains function bodies. Queue, file-inventory and graph-fuel limits remain
+mandatory; a missing import or exhausted limit returns an input error rather than
+an empty unit. Its existing harvest cache uses canonical
 relative path, source byte length and content hash; a hit avoids parsing and
 harvesting that dependency again. Imported harvests retain signatures and compact
 source origins bound to module/declaration identity and compiler-owned private
