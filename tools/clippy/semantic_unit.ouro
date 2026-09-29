@@ -159,14 +159,241 @@ def cm_global_decl (unit : ClippySemanticUnit) (name : Nat) : Maybe ScDecl :=
 def cm_import_stubs (ids : List Nat) : List Decl :=
     map Nat Decl (fun (id : Nat) => DImport id) ids;
 
+-- Imported signatures only need arity and the result spine. Parameter
+-- domains are the bulk of a compiler cone and are not read after harvest.
+def cm_compact_fuel : Nat := mul 64 64;
+
+def cm_compact_type : Nat -> Expr -> Expr :=
+  fix go (fuel : Nat) (term : Expr) : Expr :=
+    match fuel with
+    | Z => ESort 0
+    | S left => match term with
+      | EPi name _ rest => EPi name (ESort 0) (go left rest)
+      | ELam name _ body => ELam name (Nothing Expr) (go left body)
+      | ESpan _ _ inner => go left inner
+      | EOpen _ inner => go left inner
+      | EAscribe value _ => go left value
+      | EEffectRow result _ => EEffectRow (go left result) (Nil Nat)
+      | EApp head arg => EApp (go left head) (go left arg)
+      | EVar name => EVar name
+      | EHole hole => EHole hole
+      | ESort level => ESort level
+      | ENat _ => ESort 0
+      | ERange _ _ _ => ESort 0
+      | ELet _ _ _ _ => ESort 0
+      | EMatch _ _ => ESort 0
+      | EFix _ _ _ _ => ESort 0
+      | EPerform _ _ => ESort 0
+      | EDo _ => ESort 0
+      | EHandle _ _ => ESort 0
+      | EBranch _ _ _ => ESort 0
+      | ENoBranch => ESort 0
+      | EBinder _ _ _ => ESort 0
+      | ENoBinder => ESort 0
+      | EMultiMatch _ _ => ESort 0
+      | EStr _ => ESort 0
+      | EDoBind _ _ => ESort 0
+      | EList _ => ESort 0
+      | EListSpread _ _ => ESort 0
+      | EFallible _ _ _ _ => ESort 0
+      | ENamedCall _ _ => ESort 0
+      | EIf _ _ _ => ESort 0
+      | EIfLet _ _ _ _ => ESort 0
+      | ECoalesce _ _ => ESort 0
+      end
+    end;
+
+def cm_compact_contracts : Bool :=
+    let sample : Expr := EPi 1 (EVar 9) (EVar 2) in
+    let compact : Expr := cm_compact_type cm_compact_fuel sample in
+    match compact with
+    | EPi name domain result =>
+        andb (eq_nat name 1)
+          (andb (match domain with | ESort level => eq_nat level 0 | EVar _ => False
+            | EHole _ => False | ENat _ => False | EApp _ _ => False | ELam _ _ _ => False
+            | EPi _ _ _ => False | ELet _ _ _ _ => False | EAscribe _ _ => False
+            | EMatch _ _ => False | EFix _ _ _ _ => False | EEffectRow _ _ => False
+            | EPerform _ _ => False | EDo _ => False | EHandle _ _ => False
+            | EBranch _ _ _ => False | ENoBranch => False | EBinder _ _ _ => False
+            | ENoBinder => False | EMultiMatch _ _ => False | EStr _ => False
+            | EDoBind _ _ => False | EList _ => False | EListSpread _ _ => False
+            | ESpan _ _ _ => False | EFallible _ _ _ _ => False | EOpen _ _ => False
+            | ENamedCall _ _ => False | ERange _ _ _ => False | EIf _ _ _ => False
+            | EIfLet _ _ _ _ => False | ECoalesce _ _ => False end)
+            (andb (match result with | EVar name => eq_nat name 2 | ESort _ => False
+              | EHole _ => False | ENat _ => False | EApp _ _ => False | ELam _ _ _ => False
+              | EPi _ _ _ => False | ELet _ _ _ _ => False | EAscribe _ _ => False
+              | EMatch _ _ => False | EFix _ _ _ _ => False | EEffectRow _ _ => False
+              | EPerform _ _ => False | EDo _ => False | EHandle _ _ => False
+              | EBranch _ _ _ => False | ENoBranch => False | EBinder _ _ _ => False
+              | ENoBinder => False | EMultiMatch _ _ => False | EStr _ => False
+              | EDoBind _ _ => False | EList _ => False | EListSpread _ _ => False
+              | ESpan _ _ _ => False | EFallible _ _ _ _ => False | EOpen _ _ => False
+              | ENamedCall _ _ => False | ERange _ _ _ => False | EIf _ _ _ => False
+              | EIfLet _ _ _ _ => False | ECoalesce _ _ => False end)
+              (eq_nat (sc_pi_arity compact) 1)))
+    | EVar _ => False
+    | EHole _ => False
+    | ESort _ => False
+    | ENat _ => False
+    | EApp _ _ => False
+    | ELam _ _ _ => False
+    | ELet _ _ _ _ => False
+    | EAscribe _ _ => False
+    | EMatch _ _ => False
+    | EFix _ _ _ _ => False
+    | EEffectRow _ _ => False
+    | EPerform _ _ => False
+    | EDo _ => False
+    | EHandle _ _ => False
+    | EBranch _ _ _ => False
+    | ENoBranch => False
+    | EBinder _ _ _ => False
+    | ENoBinder => False
+    | EMultiMatch _ _ => False
+    | EStr _ => False
+    | EDoBind _ _ => False
+    | EList _ => False
+    | EListSpread _ _ => False
+    | ESpan _ _ _ => False
+    | EFallible _ _ _ _ => False
+    | EOpen _ _ => False
+    | ENamedCall _ _ => False
+    | ERange _ _ _ => False
+    | EIf _ _ _ => False
+    | EIfLet _ _ _ _ => False
+    | ECoalesce _ _ => False
+    end;
+
 def cm_strip_symbol (item : ScDecl) : ScDecl :=
     match item with
     | ScDeclOf name owner kind parent signature _ prim =>
-        ScDeclOf name owner kind parent signature (Nothing Expr) prim
+        ScDeclOf name owner kind parent (cm_compact_type cm_compact_fuel signature) (Nothing Expr) prim
+    end;
+
+-- Non-std imports keep the Pi spine and drop the result tree. Result spines
+-- outside std/ are what push one lint root over the 8 GiB cap. Checked
+-- Either/IO APIs live in std/ and keep cm_compact_type.
+def cm_keep_result_spine (path : String) : Bool :=
+    prim_string_starts path "std/";
+
+def cm_arity_path_contracts : Bool :=
+    andb (cm_keep_result_spine "std/io.ouro")
+      (notb (cm_keep_result_spine "compiler/lexer.ouro"));
+
+def cm_compact_arity : Nat -> Expr -> Expr :=
+  fix go (fuel : Nat) (term : Expr) : Expr :=
+    match fuel with
+    | Z => ESort 0
+    | S left => match term with
+      | EPi name _ rest => EPi name (ESort 0) (go left rest)
+      | ELam name _ body => ELam name (Nothing Expr) (go left body)
+      | ESpan _ _ inner => go left inner
+      | EOpen _ inner => go left inner
+      | EAscribe inner _ => go left inner
+      | EEffectRow inner _ => go left inner
+      | EVar _ => ESort 0
+      | EHole _ => ESort 0
+      | ESort level => ESort level
+      | ENat _ => ESort 0
+      | ERange _ _ _ => ESort 0
+      | EApp _ _ => ESort 0
+      | ELet _ _ _ _ => ESort 0
+      | EMatch _ _ => ESort 0
+      | EFix _ _ _ _ => ESort 0
+      | EPerform _ _ => ESort 0
+      | EDo _ => ESort 0
+      | EHandle _ _ => ESort 0
+      | EBranch _ _ _ => ESort 0
+      | ENoBranch => ESort 0
+      | EBinder _ _ _ => ESort 0
+      | ENoBinder => ESort 0
+      | EMultiMatch _ _ => ESort 0
+      | EStr _ => ESort 0
+      | EDoBind _ _ => ESort 0
+      | EList _ => ESort 0
+      | EListSpread _ _ => ESort 0
+      | EFallible _ _ _ _ => ESort 0
+      | ENamedCall _ _ => ESort 0
+      | EIf _ _ _ => ESort 0
+      | EIfLet _ _ _ _ => ESort 0
+      | ECoalesce _ _ => ESort 0
+      end
+    end;
+
+def cm_strip_arity (item : ScDecl) : ScDecl :=
+    match item with
+    | ScDeclOf name owner kind parent signature _ prim =>
+        ScDeclOf name owner kind parent (cm_compact_arity cm_compact_fuel signature) (Nothing Expr) prim
+    end;
+
+def cm_compiler_arity_contracts : Bool :=
+    let sample : Expr := EPi 1 (EVar 9) (EApp (EVar 4) (EVar 5)) in
+    let compact : Expr := cm_compact_arity cm_compact_fuel sample in
+    match compact with
+    | EPi name domain result =>
+        andb (eq_nat name 1)
+          (andb (match domain with | ESort level => eq_nat level 0 | EVar _ => False
+            | EHole _ => False | ENat _ => False | EApp _ _ => False | ELam _ _ _ => False
+            | EPi _ _ _ => False | ELet _ _ _ _ => False | EAscribe _ _ => False
+            | EMatch _ _ => False | EFix _ _ _ _ => False | EEffectRow _ _ => False
+            | EPerform _ _ => False | EDo _ => False | EHandle _ _ => False
+            | EBranch _ _ _ => False | ENoBranch => False | EBinder _ _ _ => False
+            | ENoBinder => False | EMultiMatch _ _ => False | EStr _ => False
+            | EDoBind _ _ => False | EList _ => False | EListSpread _ _ => False
+            | ESpan _ _ _ => False | EFallible _ _ _ _ => False | EOpen _ _ => False
+            | ENamedCall _ _ => False | ERange _ _ _ => False | EIf _ _ _ => False
+            | EIfLet _ _ _ _ => False | ECoalesce _ _ => False end)
+            (andb (match result with | ESort level => eq_nat level 0 | EVar _ => False
+              | EHole _ => False | ENat _ => False | EApp _ _ => False | ELam _ _ _ => False
+              | EPi _ _ _ => False | ELet _ _ _ _ => False | EAscribe _ _ => False
+              | EMatch _ _ => False | EFix _ _ _ _ => False | EEffectRow _ _ => False
+              | EPerform _ _ => False | EDo _ => False | EHandle _ _ => False
+              | EBranch _ _ _ => False | ENoBranch => False | EBinder _ _ _ => False
+              | ENoBinder => False | EMultiMatch _ _ => False | EStr _ => False
+              | EDoBind _ _ => False | EList _ => False | EListSpread _ _ => False
+              | ESpan _ _ _ => False | EFallible _ _ _ _ => False | EOpen _ _ => False
+              | ENamedCall _ _ => False | ERange _ _ _ => False | EIf _ _ _ => False
+              | EIfLet _ _ _ _ => False | ECoalesce _ _ => False end)
+              (eq_nat (sc_pi_arity compact) 1)))
+    | EVar _ => False
+    | EHole _ => False
+    | ESort _ => False
+    | ENat _ => False
+    | EApp _ _ => False
+    | ELam _ _ _ => False
+    | ELet _ _ _ _ => False
+    | EAscribe _ _ => False
+    | EMatch _ _ => False
+    | EFix _ _ _ _ => False
+    | EEffectRow _ _ => False
+    | EPerform _ _ => False
+    | EDo _ => False
+    | EHandle _ _ => False
+    | EBranch _ _ _ => False
+    | ENoBranch => False
+    | EBinder _ _ _ => False
+    | ENoBinder => False
+    | EMultiMatch _ _ => False
+    | EStr _ => False
+    | EDoBind _ _ => False
+    | EList _ => False
+    | EListSpread _ _ => False
+    | ESpan _ _ _ => False
+    | EFallible _ _ _ _ => False
+    | EOpen _ _ => False
+    | ENamedCall _ _ => False
+    | ERange _ _ _ => False
+    | EIf _ _ _ => False
+    | EIfLet _ _ _ _ => False
+    | ECoalesce _ _ => False
     end;
 
 def cm_import_symbols (decls : List ScDecl) : List ScDecl :=
     map ScDecl ScDecl cm_strip_symbol decls;
+
+def cm_import_arity (decls : List ScDecl) : List ScDecl :=
+    map ScDecl ScDecl cm_strip_arity decls;
 
 def cm_parsed_decls (file : ParsedFile) : List Decl :=
     match file with | MkParsedFile decls _ => decls end;
@@ -189,7 +416,11 @@ def cm_after_parse (path : String) (module_id : Nat) (keep_bodies : Bool)
         match keep_bodies with
         | True => MkHarvest updated raw imports
             (MkParsedFile canonical (cm_parsed_private file)) []
-        | False => MkHarvest updated (cm_import_symbols raw) imports
+        | False => MkHarvest updated
+            (match cm_keep_result_spine path with
+             | True => cm_import_symbols raw
+             | False => cm_import_arity raw
+             end) imports
             (MkParsedFile (cm_import_stubs imports) (cm_parsed_private file))
             (cs_capture_origins raw)
         end
@@ -276,11 +507,13 @@ def cm_cache_lookup (cache : CmParseCache) (canonical : String) (src : String)
     end;
 
 -- Cached facts never retain historical intern spines or imported bodies.
--- The current session's intern table is attached again on a cache hit.
+-- Symbols are already signature-only; share that list with the unit instead of
+-- cloning it into the cache. The current session's intern table is attached
+-- again on a cache hit.
 def cm_cache_harvest (harvest : CmHarvest) : CmHarvest :=
     match harvest with
     | MkHarvest _ symbols imports file origins => MkHarvest empty_intern
-        (cm_import_symbols symbols) imports
+        symbols imports
         (MkParsedFile (cm_import_stubs imports) (cm_parsed_private file)) origins
     end;
 
@@ -367,7 +600,7 @@ def cm_load_file (req : Pair String String) (intern : InternState)
     : Either QualityInputError CmHarvest :=
     match req with
     | MkPair path source =>
-        match cm_parse_with_aliases source intern with
+        match cm_parse_import source intern with
         | Left error => Left QualityInputError CmHarvest error
         | Right parsed => match parsed with
           | MkPair file metadata => match metadata with

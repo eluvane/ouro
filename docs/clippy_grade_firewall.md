@@ -40,14 +40,17 @@ bodies. Runtime platform sources, `std/process.ouro`, `std/collections.ouro`,
 `std/pathx.ouro`, and the listed analyzer and implementation cones are stubbed
 unless the selected root imports them directly or the root itself is under
 `runtime/`. Harvesting that platform cone in one process exceeds the lint
-address-space cap. Ordinary `compiler/` modules, including the lexer, parser,
-and multi-hop imports, still contribute signatures. Queue, file-inventory and
+address-space cap. Imported modules other than `std/` contribute declaration names and signature
+arity. Their result trees are dropped: keeping them for one heavy root exceeds
+the lint address-space cap. Those imports are parsed without token-span
+wrappers. The selected root still records spans. `std/` imports keep arity and
+the result spine, so checked Either and IO APIs still classify. Queue, file-inventory and
 graph-fuel limits remain mandatory; a missing import or exhausted limit returns
 an input error rather than an empty unit. Its existing harvest cache uses canonical
 relative path, source byte length and content hash; a hit avoids parsing and
-harvesting that dependency again. Imported harvests retain signatures and compact
+harvesting that dependency again. Imported harvests retain those facts, plus compact
 source origins bound to module/declaration identity and compiler-owned private
-names, never function bodies or completed contracts. Each root resolves those
+names, never parameter domains, function bodies, or completed contracts. Each root resolves those
 origins against its current import
 graph and recomputes summaries within the existing inference limits. It builds
 `compiler/semantic_scope.ouro` identities. A multi-file worker invocation

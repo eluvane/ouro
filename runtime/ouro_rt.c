@@ -413,6 +413,18 @@ void ouro_heap_mark(void)
 	ouro_mark_used = ouro_used;
 }
 
+void ouro_heap_mark_save(unsigned long *n, unsigned long *used)
+{
+	*n = ouro_mark_n;
+	*used = ouro_mark_used;
+}
+
+void ouro_heap_mark_restore(unsigned long n, unsigned long used)
+{
+	ouro_mark_n = n;
+	ouro_mark_used = used;
+}
+
 void ouro_heap_reset(void)
 {
 	while (ouro_nblocks > ouro_mark_n) {
@@ -532,6 +544,28 @@ static int ptr_is_current_perm(const void *p)
 	                     ouro_perm_nblocks);
 }
 
+/* Bytes allocated in the phase bank after the current mark. A token step
+   clones only this region onto the permanent bank, then drops it. */
+static int ptr_in_fresh_phase(const void *p)
+{
+	const char *cp = (const char *)p;
+	unsigned long i;
+	if (p == 0 || ouro_blocks == 0)
+		return 0;
+	if (ouro_mark_n > 0 && ouro_mark_n <= ouro_nblocks) {
+		char *block = ouro_blocks[ouro_mark_n - 1];
+		unsigned long size = ouro_bsizes[ouro_mark_n - 1];
+		if (block != 0 && cp >= block + ouro_mark_used && cp < block + size)
+			return 1;
+	}
+	for (i = ouro_mark_n; i < ouro_nblocks; i++) {
+		char *block = ouro_blocks[i];
+		if (block != 0 && cp >= block && cp < block + ouro_bsizes[i])
+			return 1;
+	}
+	return 0;
+}
+
 static int ptr_in_bank_state(const void *p, const ouro_bank_state *bank)
 {
 	return ptr_in_blocks(p, bank->blocks, bank->bsizes, bank->nblocks);
@@ -547,6 +581,9 @@ static int ptr_in_heap_context(const void *p, const ouro_heap_context *context)
 /* Leave() shares caller-owned nodes and copies only the released context.
    NULL disables the exception and keeps the existing clone modes. */
 static const ouro_heap_context *ouro_clone_outside;
+/* Share every node that already existed at ouro_heap_mark. Fresh phase
+   nodes are still copied, so a token step can drop its lookup spine. */
+static int ouro_clone_share_settled;
 
 static int clone_share_outside(const void *p)
 {
@@ -662,11 +699,16 @@ static int clone_tab_grow(clone_tab *t)
 static ouro_env *clone_env_rec(ouro_env *e, clone_tab *tab, int skip_cur_perm);
 static ouro_v *clone_perm_rec(ouro_v *v, clone_tab *tab, int skip_cur_perm);
 
+static int share_settled(const void *p)
+{
+	return ouro_clone_share_settled && !ptr_in_fresh_phase(p);
+}
+
 static int clone_share_env(const ouro_env *e, int skip_cur_perm)
 {
 	if (e == 0)
 		return 1;
-	if (ptr_is_static(e) || clone_share_outside(e))
+	if (ptr_is_static(e) || clone_share_outside(e) || share_settled(e))
 		return 1;
 	return skip_cur_perm && ptr_is_current_perm(e);
 }
@@ -675,7 +717,7 @@ static int clone_share_val(const ouro_v *v, int skip_cur_perm)
 {
 	if (v == 0)
 		return 1;
-	if (ptr_is_static(v) || clone_share_outside(v))
+	if (ptr_is_static(v) || clone_share_outside(v) || share_settled(v))
 		return 1;
 	return skip_cur_perm && ptr_is_current_perm(v);
 }
@@ -753,6 +795,7 @@ static ouro_v *clone_perm_rec(ouro_v *v, clone_tab *tab, int skip_cur_perm)
 		   it for every token otherwise retains quadratic source bytes. Deep
 		   clones still copy buffers in the current bank before its reset. */
 		if (ptr_is_static(v->u.s) || clone_share_outside(v->u.s)
+		    || share_settled(v->u.s)
 		    || (skip_cur_perm && ptr_is_current_perm(v->u.s)))
 			return out;
 		unsigned long n = v->tag == OURO_TAG_STR ? (unsigned long)strlen(v->u.s)
@@ -800,6 +843,15 @@ ouro_v *ouro_clone_perm(ouro_v *v)
 ouro_v *ouro_clone_perm_deep(ouro_v *v)
 {
 	return clone_mode(v, 0, ouro_perm_alloc);
+}
+
+ouro_v *ouro_clone_since_mark(ouro_v *v)
+{
+	ouro_v *out;
+	ouro_clone_share_settled = 1;
+	out = clone_mode(v, 0, ouro_perm_alloc);
+	ouro_clone_share_settled = 0;
+	return out;
 }
 
 ouro_v *ouro_heap_context_leave(ouro_heap_context *context, ouro_v *survivor)

@@ -518,6 +518,8 @@ nats are interned, and `ouro_app`/`ouro_case` hand a single-use closure or
 thunk back to the phase allocator the moment it is consumed. Handwritten hosts
 that keep a closure across calls use `ouro_apply`, which never reclaims. These
 keep native check paths well under their former multi-GiB peaks.
+Import lexing reclaims each token step's intern lookup. The retained token and
+intern delta stay; the comparison spine of earlier names does not.
 The native frontend preserves the checked result in permanent storage and
 releases compilation temporaries before scanning source for diagnostics. A
 large rejected module therefore does not retain both phases' temporary heaps.

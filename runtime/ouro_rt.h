@@ -75,6 +75,9 @@ ouro_v *ouro_clone_perm(ouro_v *v);
 /* Like ouro_clone_perm, but only static nodes are shared. A perm spine
    with phase children is copied instead of returned as-is. */
 ouro_v *ouro_clone_perm_deep(ouro_v *v);
+/* Copy only phase nodes allocated after ouro_heap_mark onto the permanent
+   bank. Earlier phase and permanent nodes stay shared. */
+ouro_v *ouro_clone_since_mark(ouro_v *v);
 void ouro_gc_set_stack_base(void *p);
 void ouro_gc_collect(void);
 void ouro_gc_push_root(ouro_v **slot);
@@ -86,6 +89,8 @@ unsigned long long ouro_heap_total_alloc_bytes(void);
 /* Phase bytes returned early by ouro_app / ouro_case (see ouro_rt.c). */
 unsigned long long ouro_heap_reclaimed_bytes(void);
 void ouro_heap_mark(void);
+void ouro_heap_mark_save(unsigned long *n, unsigned long *used);
+void ouro_heap_mark_restore(unsigned long n, unsigned long used);
 void ouro_heap_reset(void);
 void ouro_heap_discard_phase(void);
 /* Suspend the caller's phase/permanent banks while a bounded host operation
