@@ -1,0 +1,98 @@
+name: PR89 nested record source (diagnostic)
+
+on:
+  push:
+    branches: [codef/pr89-nested-source-probe]
+    paths:
+      - .github/workflows/ouro-pr89-nested-source-probe.yml
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  nested-source:
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: red
+            product_sha: 08de21e0322f1b45eb983ed6a8232dda0277b204
+            fixture_blob: 1e5bf738fd000deb50d594977b1b1263204eeb28
+            scanner_blob: c49ad90c230e5431ddf664f56f4d40dd2912ffcb
+          - variant: green
+            product_sha: 3818faab63b4b6a1c4ec7cf08cde0739d4397f8c
+            fixture_blob: 597ed9026d411d1feaa5298d4234767849686299
+            scanner_blob: 10cd42b3641f0398b7b69e38d19f8bbef403cfb5
+    env:
+      OURO_CI: "1"
+      OURO_REPRODUCIBLE: "1"
+      OURO_PACK_STRICT: "1"
+      OURO_JOBS: "2"
+      OURO_CACHE_DIR: _cache/ouro
+      OURO_BUILD_DIR: _build
+      OURO_C_BUILD_DIR: _build/c
+      OURO_CCACHE: disabled
+    steps:
+      - name: Checkout exact product source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ matrix.product_sha }}
+          persist-credentials: false
+
+      - name: Verify exact product source
+        env:
+          EXPECTED_SOURCE_SHA: ${{ matrix.product_sha }}
+          EXPECTED_FIXTURE_BLOB: ${{ matrix.fixture_blob }}
+          EXPECTED_SCANNER_BLOB: ${{ matrix.scanner_blob }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SOURCE_SHA"
+          test "$(git hash-object tests/compiler_driver_tests.ouro)" = "$EXPECTED_FIXTURE_BLOB"
+          test "$(git hash-object compiler/preprocess_record_expr.ouro)" = "$EXPECTED_SCANNER_BLOB"
+          test "$(git hash-object runtime/bootstrap.c)" = 5272a92d85d3f693407ec1f5d0e091fe461f8018
+
+      - name: Build and verify matching host compiler
+        run: python3 scripts/ouro_build.py build --verbosity quiet
+
+      - name: Export and import matching host evidence
+        run: |
+          mkdir -p _build/ci
+          python3 scripts/ci_gate.py --compiler-artifact export > _build/ci/pr89-nested-bundle.txt
+          compiler_sha=$(sed -n 's/^sha256=//p' _build/ci/pr89-nested-bundle.txt)
+          test -n "$compiler_sha"
+          python3 scripts/ci_gate.py --compiler-artifact import --compiler-sha256 "$compiler_sha"
+
+      - name: Check exact nested and pure-block sources
+        env:
+          VARIANT: ${{ matrix.variant }}
+        run: |
+          mkdir -p _build/ci/pr89-nested-source
+          cat > _build/ci/pr89-nested-source/nested.ouro <<'OURO'
+          inductive Nat : Type := | Z : Nat | S : Nat -> Nat; record Point : Type where x : Nat; y : Nat; end; def x : Nat := Z; def y : Nat := S Z; def point : Point := { x := Z, y := S Z }; def value : Nat := let { x } : Point := let { y } : Point := point in point in x;
+          OURO
+          cat > _build/ci/pr89-nested-source/pure-block.ouro <<'OURO'
+          inductive Nat : Type := | Z : Nat | S : Nat -> Nat; record Point : Type where x : Nat; y : Nat; end; def x : Nat := Z; def y : Nat := S Z; def point : Point := { x := Z, y := S Z }; def value : Nat := let { x } : Point := let { let inner : Point := point; inner } in x;
+          OURO
+          set +e
+          sh scripts/ouro1.sh check _build/ci/pr89-nested-source/nested.ouro 5000 > _build/ci/pr89-nested-source/nested.out 2> _build/ci/pr89-nested-source/nested.err
+          nested_rc=$?
+          sh scripts/ouro1.sh check _build/ci/pr89-nested-source/pure-block.ouro 5000 > _build/ci/pr89-nested-source/pure-block.out 2> _build/ci/pr89-nested-source/pure-block.err
+          pure_rc=$?
+          set -e
+          printf 'variant=%s nested_rc=%s pure_rc=%s\n' "$VARIANT" "$nested_rc" "$pure_rc" | tee _build/ci/pr89-nested-source/result.txt
+          test "$pure_rc" -eq 0
+          if test "$VARIANT" = red; then test "$nested_rc" -ne 0; else test "$nested_rc" -eq 0; fi
+
+      - name: Upload source-check reports
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: pr89-nested-source-${{ matrix.variant }}
+          path: _build/ci/pr89-nested-source/*
+          if-no-files-found: warn
+          retention-days: 7
