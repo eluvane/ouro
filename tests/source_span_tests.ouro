@@ -513,6 +513,109 @@ def ss_reparses (fuel : Nat) (tokens : List Token) (first : Nat) (past : Nat) (i
         end
     end;
 
+-- Derived suffix lookups for the span oracle; leaves retain the original data.
+inductive SsTokenPoint : Type :=
+  | MkSsTokenPoint : List Token -> Pair (List Nat) (List Nat) -> SsTokenPoint;
+
+inductive SsTokenIndex : Type :=
+  | SsIndexEmpty : SsTokenIndex
+  | SsIndexLeaf : SsTokenPoint -> SsTokenIndex
+  | SsIndexBranch : Nat -> Nat -> SsTokenIndex -> SsTokenIndex -> SsTokenIndex;
+
+def ss_token_index_size (tree : SsTokenIndex) : Nat :=
+    match tree with
+    | SsIndexEmpty => Z
+    | SsIndexLeaf _ => 1
+    | SsIndexBranch size _ _ _ => size
+    end;
+
+def ss_token_index_join (left : SsTokenIndex) (right : SsTokenIndex) : SsTokenIndex :=
+    let left_size : Nat := ss_token_index_size left in
+    SsIndexBranch (add left_size (ss_token_index_size right)) left_size left right;
+
+def ss_token_index_leaves : List Token -> List (Pair (List Nat) (List Nat)) ->
+    List SsTokenIndex -> Maybe (List SsTokenIndex) :=
+  fix go (tokens : List Token) (marks : List (Pair (List Nat) (List Nat)))
+      (acc : List SsTokenIndex) : Maybe (List SsTokenIndex) :=
+    match tokens with
+    | Nil => match marks with
+      | Nil => Just (List SsTokenIndex) (reverse_lin SsTokenIndex acc)
+      | Cons _ _ => Nothing (List SsTokenIndex)
+      end
+    | Cons _ rest => match marks with
+      | Nil => Nothing (List SsTokenIndex)
+      | Cons mark remaining =>
+          go rest remaining (Cons SsTokenIndex (SsIndexLeaf (MkSsTokenPoint tokens mark)) acc)
+      end
+    end;
+
+def ss_token_index_pairs : List SsTokenIndex -> List SsTokenIndex -> List SsTokenIndex :=
+  fix go (trees : List SsTokenIndex) (acc : List SsTokenIndex) : List SsTokenIndex :=
+    match trees with
+    | Nil => reverse_lin SsTokenIndex acc
+    | Cons left rest => match rest with
+      | Nil => reverse_lin SsTokenIndex (Cons SsTokenIndex left acc)
+      | Cons right remaining => go remaining (Cons SsTokenIndex (ss_token_index_join left right) acc)
+      end
+    end;
+
+def ss_token_index_collapse : Nat -> List SsTokenIndex -> Maybe SsTokenIndex :=
+  fix go (fuel : Nat) (trees : List SsTokenIndex) : Maybe SsTokenIndex :=
+    match trees with
+    | Nil => Just SsTokenIndex SsIndexEmpty
+    | Cons first rest => match rest with
+      | Nil => Just SsTokenIndex first
+      | Cons _ _ => match fuel with
+        | Z => Nothing SsTokenIndex
+        | S less => go less (ss_token_index_pairs trees (Nil SsTokenIndex))
+        end
+      end
+    end;
+
+def ss_token_index_make (tokens : List Token) (marks : List (Pair (List Nat) (List Nat)))
+    : Maybe SsTokenIndex :=
+    match ss_token_index_leaves tokens marks (Nil SsTokenIndex) with
+    | Nothing => Nothing SsTokenIndex
+    | Just trees => ss_token_index_collapse (length Token tokens) trees
+    end;
+
+def ss_token_index_lookup (index : Nat) (tree : SsTokenIndex) : Maybe SsTokenPoint :=
+    (fix go (node : SsTokenIndex) (position : Nat) : Maybe SsTokenPoint :=
+    match node with
+    | SsIndexEmpty => Nothing SsTokenPoint
+    | SsIndexLeaf point => match eqNat position Z with
+      | True => Just SsTokenPoint point
+      | False => Nothing SsTokenPoint
+      end
+    | SsIndexBranch size left_size left right =>
+        match ltb_nat position size with
+        | False => Nothing SsTokenPoint
+        | True => match ltb_nat position left_size with
+          | True => go left position
+          | False => go right (sub position left_size)
+          end
+        end
+    end) tree index;
+
+def ss_token_index_span_bytes (total : Nat) (tree : SsTokenIndex) (first : Nat) (past : Nat)
+    : Maybe (Pair Nat Nat) :=
+    match ltb_nat first past with
+    | False => Nothing (Pair Nat Nat)
+    | True => match ss_token_index_lookup first tree with
+      | Nothing => Nothing (Pair Nat Nat)
+      | Just opening => match ss_token_index_lookup (sub past 1) tree with
+        | Nothing => Nothing (Pair Nat Nat)
+        | Just closing => match opening with
+          | MkSsTokenPoint _ first_mark => match closing with
+            | MkSsTokenPoint _ last_mark =>
+                token_span_bytes (MkTokenSpans total [first_mark, last_mark]) 0 2
+            end
+          end
+        end
+      end
+    end;
+
+
 -- Check each span before folding its exact byte slice. A partition runs in a
 -- separate process so the runtime can release its arena between partitions.
 def ss_fold_slices_codes_part (A : Type) (codes : List Nat) (part : Nat) (parts : Nat)
@@ -534,6 +637,11 @@ def ss_fold_slices_codes_part (A : Type) (codes : List Nat) (part : Nat) (parts 
             let ranges : List SsRange :=
               foldl Decl (List SsRange) (fun (acc : List SsRange) (d : Decl) => ss_decl_ranges count d acc)
                 (Nil SsRange) decls in
+            match lex_spanned_tokens lexed with
+            | MkTokenSpans total marks =>
+                match ss_token_index_make tokens marks with
+                | Nothing => Nothing A
+                | Just indexed =>
             (fix go (rs : List SsRange) (acc : A) (slot : Nat) : Maybe A :=
               match rs with
               | Nil => Just(A, acc)
@@ -545,26 +653,33 @@ def ss_fold_slices_codes_part (A : Type) (codes : List Nat) (part : Nat) (parts 
                   | True =>
                   match r with
                   | MkSsRange first past nested inner =>
-                      match andb(andb(nested, ltb_nat past count), ss_reparses fuel tokens first past inner) with
+                      match ss_token_index_lookup first indexed with
+                      | Nothing => Nothing A
+                      | Just point => match point with
+                        | MkSsTokenPoint suffix _ =>
+                      match andb(andb(nested, ltb_nat past count), ss_reparses fuel suffix Z (sub past first) inner) with
                       | False => Nothing A
                       | True =>
-                          match token_span_bytes (lex_spanned_tokens lexed) first past with
+                          match ss_token_index_span_bytes total indexed first past with
                           | Nothing => Nothing A
                           | Just bytes =>
                               match bytes with
                               | MkPair first_byte past_byte =>
-                                  match ss_exact_slice tokens first past
-                                      (take(Nat, sub past_byte first_byte, drop Nat first_byte codes)) with
+                                  let slice : String := prim_string_slice text first_byte (sub past_byte first_byte) in
+                                  match ss_exact_slice suffix Z (sub past first) (prim_string_to_char_codes slice) with
                                   | False => Nothing A
-                                  | True => go rest
-                                      (step (prim_string_slice text first_byte (sub past_byte first_byte)) acc) next
+                                  | True => go rest (step slice acc) next
                                   end
                               end
                           end
                       end
+                        end
+                      end
                   end
                   end
               end) ranges initial Z
+                end
+            end
         end
     end
     end;
@@ -1054,6 +1169,120 @@ def ss_laws_private : List (Pair String Bool) :=
           ["Type"] [])
     ];
 
+def ss_token_index_positions : Nat -> List Nat :=
+  fix go (last : Nat) : List Nat :=
+    match last with
+    | Z => [Z]
+    | S previous => Cons Nat last (go previous)
+    end;
+
+def ss_token_index_examples : List String :=
+    [ "", "-- comment\r\n def value : Nat := (next value);",
+      "def text : String := \"A\\u{0}é\";" ];
+
+def ss_token_index_tail_agrees (tree : SsTokenIndex) (tokens : List Token) (position : Nat) : Bool :=
+    match ss_token_index_lookup position tree with
+    | Nothing => match drop Token position tokens with | Nil => True | Cons _ _ => False end
+    | Just point => match point with
+      | MkSsTokenPoint suffix _ =>
+          source_bytes_equal (ss_tokens suffix (Nil Nat))
+            (ss_tokens (drop Token position tokens) (Nil Nat))
+      end
+    end;
+
+def ss_token_index_tails_agree (text : String) : Bool :=
+    let codes : List Nat := prim_string_to_char_codes text in
+    let lexed : LexSpanned := lex_spanned_import (ss_fuel codes) codes empty_intern in
+    match lex_spanned_result lexed with
+    | LexMalformed _ => False
+    | LexExhausted _ => False
+    | LexOk tokens _ => match lex_spanned_tokens lexed with
+      | MkTokenSpans _ marks => match ss_token_index_make tokens marks with
+        | Nothing => False
+        | Just tree => all Nat (ss_token_index_tail_agrees tree tokens)
+            (ss_token_index_positions (add (length Token tokens) 2))
+        end
+      end
+    end;
+
+def ss_token_index_bytes_equal (left : Maybe (Pair Nat Nat)) (right : Maybe (Pair Nat Nat)) : Bool :=
+    match left with
+    | Nothing => match right with | Nothing => True | Just _ => False end
+    | Just actual => match right with
+      | Nothing => False
+      | Just expected => andb (eqNat (fst Nat Nat actual) (fst Nat Nat expected))
+          (eqNat (snd Nat Nat actual) (snd Nat Nat expected))
+      end
+    end;
+
+def ss_token_index_bytes_agree (text : String) : Bool :=
+    let codes : List Nat := prim_string_to_char_codes text in
+    let lexed : LexSpanned := lex_spanned_import (ss_fuel codes) codes empty_intern in
+    match lex_spanned_result lexed with
+    | LexMalformed _ => False
+    | LexExhausted _ => False
+    | LexOk tokens _ => match lex_spanned_tokens lexed with
+      | MkTokenSpans total marks => match ss_token_index_make tokens marks with
+        | Nothing => False
+        | Just tree =>
+            let positions : List Nat := ss_token_index_positions (add (length Token tokens) 2) in
+            all Nat (fun (first : Nat) => all Nat (fun (past : Nat) =>
+              ss_token_index_bytes_equal (ss_token_index_span_bytes total tree first past)
+                (token_span_bytes (lex_spanned_tokens lexed) first past)) positions) positions
+        end
+      end
+    end;
+
+def ss_token_index_rejects_mismatch : Bool :=
+    let mark : Pair (List Nat) (List Nat) := MkPair (List Nat) (List Nat) (Nil Nat) (Nil Nat) in
+    andb (match ss_token_index_make (Nil Token) (Nil (Pair (List Nat) (List Nat))) with
+      | Nothing => False
+      | Just tree => andb (eqNat (ss_token_index_size tree) Z)
+          (match ss_token_index_lookup Z tree with | Nothing => True | Just _ => False end)
+      end)
+      (andb (match ss_token_index_make (Nil Token) [mark] with | Nothing => True | Just _ => False end)
+        (andb (match ss_token_index_make [TEof] (Nil (Pair (List Nat) (List Nat))) with
+          | Nothing => True | Just _ => False end)
+          (andb (match ss_token_index_make [TEof] [mark, mark] with | Nothing => True | Just _ => False end)
+            (match ss_token_index_collapse Z [SsIndexEmpty, SsIndexEmpty] with
+             | Nothing => True | Just _ => False end))));
+
+def ss_token_index_reparse_controls : Bool :=
+    let tokens : List Token :=
+      [TIdent 8, TIdent 9, TBraceL, TIdent 7, TArrow, TIdent 7, TBraceR, TIdent 8, TEof] in
+    let mark : Pair (List Nat) (List Nat) := MkPair (List Nat) (List Nat) (Nil Nat) (Nil Nat) in
+    match ss_token_index_make tokens
+      (map Token (Pair (List Nat) (List Nat)) (fun (_ : Token) => mark) tokens) with
+    | Nothing => False
+    | Just tree => match ss_token_index_lookup 2 tree with
+      | Nothing => False
+      | Just point => match point with
+        | MkSsTokenPoint suffix _ =>
+            let expected : Expr := ELam 7 (Nothing Expr) (EVar 7) in
+            andb (ss_reparses 100 suffix 0 5 expected)
+              (andb (notb (ss_reparses 100 suffix 0 5 (ELam 8 (Nothing Expr) (EVar 7))))
+                (andb (notb (ss_reparses 100 suffix 0 5 (ELam 7 (Nothing Expr) (EVar 8))))
+                  (andb (notb (ss_reparses 100 suffix 0 4 expected))
+                    (andb (notb (ss_reparses 100 suffix 0 6 expected))
+                      (notb (ss_reparses 0 suffix 0 5 expected))))))
+        end
+      end
+    end;
+
+
+def ss_slice_byte_codes_agree (codes : List Nat) : Bool :=
+    let bounds : List Nat := [0, 1, 2, 6, 9] in
+    all Nat (fun (first : Nat) =>
+      all Nat (fun (size : Nat) =>
+        source_bytes_equal
+          (prim_string_to_char_codes
+            (prim_string_slice (prim_string_of_char_codes codes) first size))
+          (take(Nat, size, drop Nat first codes))) bounds) bounds;
+
+def ss_slice_byte_codes_law : Bool :=
+    andb (ss_slice_byte_codes_agree (Nil Nat))
+      (ss_slice_byte_codes_agree ([0, 65, 195, 169, 255, 13, 10] : List Nat));
+
 def ss_laws : List (Pair String Bool) :=
     append (Pair String Bool) ss_laws_first
       (append (Pair String Bool) ss_laws_rest
@@ -1065,7 +1294,16 @@ def ss_laws : List (Pair String Bool) :=
                   (append (Pair String Bool) ss_laws_trailing_lambda
                     (append (Pair String Bool) ss_laws_coalesce
                       (append (Pair String Bool) ss_where_laws
-                        (append (Pair String Bool) ss_laws_private ss_laws_character))))))))));
+                        (append (Pair String Bool) ss_laws_private
+                          (append (Pair String Bool) ss_laws_character
+                            [ MkPair String Bool "slices/native-byte-list-equation" ss_slice_byte_codes_law
+                            , MkPair String Bool "index/token-suffix-equation"
+                                (all String ss_token_index_tails_agree ss_token_index_examples)
+                            , MkPair String Bool "index/byte-range-equation"
+                                (all String ss_token_index_bytes_agree ss_token_index_examples)
+                            , MkPair String Bool "index/shape-and-reparse-controls"
+                                (andb ss_token_index_rejects_mismatch ss_token_index_reparse_controls)
+                            ])))))))))));
 
 -- Repository sources after the same import and record preprocessing that
 -- tools apply before lexing.
