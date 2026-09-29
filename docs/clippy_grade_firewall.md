@@ -26,11 +26,16 @@ malformed registry, missing rule, or incomplete inventory. See
 
 ## Semantic boundary
 
-`semantic_unit.ouro` follows the complete transitive import graph for each
-requested root and shares an intern table inside a worker. Only the selected root
-retains function bodies. Queue, file-inventory and graph-fuel limits remain
-mandatory; a missing import or exhausted limit returns an input error rather than
-an empty unit. Its existing harvest cache uses canonical
+`semantic_unit.ouro` follows transitive imports for each requested root and
+shares an intern table inside a worker. Only the selected root retains function
+bodies. Runtime platform sources, `std/process.ouro`, `std/collections.ouro`,
+`std/pathx.ouro`, and the listed analyzer and implementation cones are stubbed
+unless the selected root imports them directly or the root itself is under
+`runtime/`. Harvesting that platform cone in one process exceeds the lint
+address-space cap. Ordinary `compiler/` modules, including the lexer, parser,
+and multi-hop imports, still contribute signatures. Queue, file-inventory and
+graph-fuel limits remain mandatory; a missing import or exhausted limit returns
+an input error rather than an empty unit. Its existing harvest cache uses canonical
 relative path, source byte length and content hash; a hit avoids parsing and
 harvesting that dependency again. Imported harvests retain signatures and compact
 source origins bound to module/declaration identity and compiler-owned private

@@ -413,18 +413,128 @@ def cm_load_file_cached (req : Pair String String) (intern : InternState)
         end
     end;
 
+-- The selected root and compiler imports keep signatures, including multi-hop
+-- compiler modules. Runtime platform sources and the listed implementation
+-- cones stay stubbed unless this root asked for them directly: harvesting
+-- that cone in one process exceeds the 8 GiB lint address-space cap. A missing
+-- file is still an input error.
+def cm_path_in (path : String) (rows : List String) : Bool :=
+    (fix go (rest : List String) : Bool :=
+      match rest with
+      | Nil => False
+      | Cons row more =>
+          match prim_string_eq path row with
+          | True => True
+          | False => go more
+          end
+      end) rows;
+
+def cm_keep_import_path (path : String) : Bool :=
+    cm_path_in path
+      ([ "compiler/kernel_core.ouro"
+       , "compiler/base.ouro"
+       , "compiler/pipeline_abi.ouro"
+       , "compiler/core.ouro"
+       , "compiler/checked_program.ouro"
+       , "compiler/native/image_types.ouro"
+       , "compiler/source_text.ouro"
+       , "compiler/ast.ouro"
+       , "compiler/parser_file.ouro"
+       , "compiler/parser_parse.ouro"
+       ] : List String);
+
+def cm_skip_analyze_family (path : String) : Bool :=
+    cm_path_in path
+      ([ "tools/analyze/effects.ouro"
+       , "tools/analyze/capability.ouro"
+       , "tools/analyze/extract_leak.ouro"
+       , "tools/analyze/match_cover.ouro"
+       , "tools/analyze/cfg.ouro"
+       , "tools/analyze/dataflow.ouro"
+       , "tools/analyze/semantic.ouro"
+       , "tools/analyze/property.ouro"
+       , "tools/analyze/absint.ouro"
+       , "tools/analyze/symexec.ouro"
+       , "tools/analyze/taint.ouro"
+       , "tools/analyze/contracts.ouro"
+       , "tools/analyze/complexity.ouro"
+       , "tools/analyze/bounds.ouro"
+       , "tools/analyze/minimal.ouro"
+       , "tools/analyze/duplication.ouro"
+       , "tools/analyze/trust.ouro"
+       , "tools/analyze/simplify.ouro"
+       , "tools/analyze/perf.ouro"
+       , "tools/analyze/naming.ouro"
+       , "tools/analyze/errors.ouro"
+       ] : List String);
+
+def cm_skip_impl_path (path : String) : Bool :=
+    cm_path_in path
+      ([ "tools/analyze/model.ouro"
+       , "std/json.ouro"
+       , "std/jsonx.ouro"
+       , "std/format.ouro"
+       , "tools/native_build_output.ouro"
+       , "tools/repo_gate/workflow_checks.ouro"
+       , "tools/repo_gate/policy.ouro"
+       , "tools/analyze/architecture.ouro"
+       , "tools/analyze/deadcode.ouro"
+       , "tools/analyze/suppressions.ouro"
+       , "tools/analyze/api_surface.ouro"
+       , "tools/analyze/format.ouro"
+       , "tools/fix/basic_rules.ouro"
+       , "tools/fix/rules.ouro"
+       , "tools/clippy/structural_frontend.ouro"
+       , "tools/repo_gate/checks.ouro"
+       , "tools/repo_gate/parity_closure.ouro"
+       , "tools/ci_gate/host_bound.ouro"
+       , "tools/analyze/drive_light.ouro"
+       , "tools/analyze/drive_heavy.ouro"
+       , "tools/analyze/drive_smells.ouro"
+       , "tools/analyze/unit.ouro"
+       , "tools/analyze/drive.ouro"
+       , "tools/clippy/scan.ouro"
+       ] : List String);
+
+def cm_skip_import_path (path : String) : Bool :=
+    match cm_keep_import_path path with
+    | True => False
+    | False =>
+        orb (prim_string_starts path "runtime/platform/")
+          (orb (prim_string_eq path "std/process.ouro")
+              (orb (prim_string_eq path "std/collections.ouro")
+                (orb (prim_string_eq path "std/pathx.ouro")
+                  (orb (cm_skip_analyze_family path)
+                    (cm_skip_impl_path path)))))
+    end;
+
+def cm_skip_import_for (entry : String) (path : String) : Bool :=
+    match andb (prim_string_starts entry "runtime/")
+        (prim_string_starts path "runtime/platform/") with
+    | True => False
+    | False => cm_skip_import_path path
+    end;
+
+def cm_import_bound_contracts : Bool :=
+    andb (cm_skip_import_path "runtime/platform/windows_fs.ouro")
+      (andb (notb (cm_skip_import_path "compiler/lower_nat.ouro"))
+        (andb (notb (cm_skip_import_path "compiler/transitive_types.ouro"))
+          (andb (notb (cm_skip_import_path "compiler/lexer.ouro"))
+            (notb (cm_skip_import_for "runtime/managed.ouro"
+              "runtime/platform/windows_x64.ouro")))));
+
 -- Paths are repository-relative compiler canonical paths. The caller anchors
 -- disk reads to an already resolved repository root. Source text is retained
 -- only for the selected file, to give the reporting process that SAME snapshot.
 def cm_load_pending (root : String) (entry : Nat) : Nat -> Nat -> List Nat -> List Nat
     -> InternState -> List SrcUnit -> List ScDecl -> String -> List Decl
-    -> CmParseCache -> List CsOriginFact -> ImpReg
+    -> CmParseCache -> List Nat -> List CsOriginFact -> ImpReg
     -> IO (Either QualityInputError
         (Pair ClippySemanticUnit (Pair InternState CmParseCache))) :=
   fix go (fuel : Nat) (file_budget : Nat) (pending : List Nat) (loaded : List Nat)
       (intern : InternState) (units : List SrcUnit) (symbols : List ScDecl)
       (source : String) (root_decls : List Decl) (cache : CmParseCache)
-      (origins : List CsOriginFact) (root_aliases : ImpReg)
+      (keep : List Nat) (origins : List CsOriginFact) (root_aliases : ImpReg)
       : IO (Either QualityInputError
         (Pair ClippySemanticUnit (Pair InternState CmParseCache))) :=
     match pending with
@@ -476,7 +586,7 @@ def cm_load_pending (root : String) (entry : Nat) : Nat -> Nat -> List Nat -> Li
             (QualityInvalidInput "semantic source queue traversal exhausted"))
       | S remaining => match elem Nat eq_nat id loaded with
       | True => go remaining file_budget rest loaded intern units symbols
-          source root_decls cache origins root_aliases
+          source root_decls cache keep origins root_aliases
       | False => match file_budget with
         | Z => io_pure (Either QualityInputError
             (Pair(ClippySemanticUnit, Pair InternState CmParseCache)))
@@ -484,6 +594,14 @@ def cm_load_pending (root : String) (entry : Nat) : Nat -> Nat -> List Nat -> Li
               (QualityInvalidInput "semantic source inventory exhausted"))
         | S files_remaining =>
             let path : String := cm_string intern id in
+            match andb (notb (eq_nat id entry))
+                (andb (cm_skip_import_for (cm_string intern entry) path)
+                  (notb (elem Nat eq_nat id keep))) with
+            | True =>
+                go remaining file_budget rest (Cons Nat id loaded) intern
+                  (Cons SrcUnit (mk_src_unit id (Nil Decl) (Nil Nat)) units)
+                  symbols source root_decls cache keep origins root_aliases
+            | False =>
             do let! input := quality_read_file (quality_child root path);
                match input with
                | Left error => io_pure (Either QualityInputError
@@ -505,7 +623,7 @@ def cm_load_pending (root : String) (entry : Nat) : Nat -> Nat -> List Nat -> Li
                                  (append Nat imports rest) (Cons Nat id loaded)
                                  updated (Cons SrcUnit (mk_src_unit id (cm_import_stubs imports) (cm_parsed_private file)) units)
                                  (append ScDecl file_symbols symbols)
-                                 text (cm_parsed_decls file) cache origins aliases
+                                 text (cm_parsed_decls file) cache imports origins aliases
                            end
                          end
                        end
@@ -523,13 +641,14 @@ def cm_load_pending (root : String) (entry : Nat) : Nat -> Nat -> List Nat -> Li
                                (append Nat imports rest) (Cons Nat id loaded)
                                updated (Cons SrcUnit (mk_src_unit id (cm_import_stubs imports) (cm_parsed_private file)) units)
                                (append ScDecl file_symbols symbols)
-                               source root_decls next_cache
+                               source root_decls next_cache keep
                                (append CsOriginFact captured origins) root_aliases
                          end
                        end
                      end
                    end
                end
+            end
         end
       end
       end
@@ -543,7 +662,7 @@ def cm_load_cached (root : String) (relative : String) (intern : InternState)
         (prim_string_to_char_codes relative)) with
     | MkPair entry next => cm_load_pending root entry cm_load_queue_fuel cm_file_budget
         ([entry] : List Nat) (Nil Nat) next (Nil SrcUnit) (Nil ScDecl) "" (Nil Decl) cache
-         (Nil CsOriginFact) empty_imp_reg
+         (Nil Nat) (Nil CsOriginFact) empty_imp_reg
     end;
 
 def cm_load (root : String) (relative : String) : IO (Either QualityInputError ClippySemanticUnit) :=
