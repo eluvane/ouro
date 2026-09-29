@@ -421,12 +421,12 @@ def binder_and_matches(
             cursor = index + 1
             nested = 0
             while cursor < count:
-                token_kind, token_text, _token_line, _token_dotted = tokens[cursor]
-                if token_kind == "w" and token_text == "match":
+                word_kind, word, _word_line, _word_dotted = tokens[cursor]
+                if word_kind == "w" and word == "match":
                     nested += 1
-                elif token_kind == "w" and token_text == "with" and nested == 0:
+                elif word_kind == "w" and word == "with" and nested == 0:
                     break
-                elif token_kind == "w" and token_text == "end" and nested:
+                elif word_kind == "w" and word == "end" and nested:
                     nested -= 1
                 cursor += 1
             else:
@@ -436,14 +436,14 @@ def binder_and_matches(
             cursor += 1
             depth = 0
             while cursor < count:
-                token_kind, token_text, _token_line, _token_dotted = tokens[cursor]
-                if token_kind == "w" and token_text == "match":
+                word_kind, word, _word_line, _word_dotted = tokens[cursor]
+                if word_kind == "w" and word == "match":
                     depth += 1
-                elif token_kind == "w" and token_text == "end":
+                elif word_kind == "w" and word == "end":
                     if depth == 0:
                         break
                     depth -= 1
-                elif depth == 0 and token_kind == "s" and token_text == "|":
+                elif depth == 0 and word_kind == "s" and word == "|":
                     if cursor + 1 < count and tokens[cursor + 1][0] == "w":
                         arms.append(tokens[cursor + 1][1])
                     elif cursor + 1 < count and tokens[cursor + 1][1] == "_":
