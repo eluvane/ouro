@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 from pathlib import Path
 import shutil
 import sys
@@ -17,6 +18,8 @@ from repo_support import configure_native_stack, read_json_object_or_none, sha25
 
 ROOT_UNIT = "compiler/lower.ouro"
 BUDGET_S = 600
+DECL_UNITS = {"compiler/lower_fallible.ouro", "compiler/lower_spread.ouro",
+              "compiler/lower_named.ouro", "compiler/lower.ouro"}
 
 
 def failed_check(work: Path):
@@ -37,6 +40,99 @@ def checked_path(work: Path, relative: str) -> Path:
         raise ValueError("bootstrap report path escapes work directory")
     return target
 
+
+def declaration_probe(work: Path, source_root: Path, producer: Path,
+                      env: dict[str, str], deadline: float, prefix: list[str],
+                      first_stderr: str, out: Path, evidence: dict) -> None:
+    unit = prefix[-1]
+    if unit not in DECL_UNITS:
+        evidence["declarations"] = {"unit": unit, "outcome": "unit-outside-target-set"}
+        write_json_atomic(out / "report.json", evidence)
+        return
+    scratch = work / "out/diagnostic/source"
+    scratch.mkdir(parents=True, exist_ok=False)
+    for path in prefix:
+        source = source_root / path
+        destination = scratch / path
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source, destination)
+        if sha256_file(source) != sha256_file(destination):
+            raise ValueError("scratch copy differs from frozen source: " + path)
+    target = scratch / unit
+    original = target.read_bytes()
+    entry = {"unit": unit, "outcome": "incomplete", "checks": [],
+             "first_failing_declaration_prefix": None}
+    evidence["declarations"] = entry
+    write_json_atomic(out / "report.json", evidence)
+
+    def run_stage(label: str, declaration: str, body: bytes):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            entry["outcome"] = "budget-exhausted"
+            write_json_atomic(out / "report.json", evidence)
+            return None
+        target.write_bytes(body)
+        argv = [str(producer), "check", unit, bootstrap.FUEL,
+                *(part for path in prefix for part in ("--unit", path))]
+        result = run_limited(argv, cwd=scratch, env=env,
+                             timeout_s=min(bootstrap.TIMEOUT_S, remaining),
+                             memory_mb=bootstrap.MEMORY_MIB)
+        for stream in ("stdout", "stderr"):
+            (out / (label + "." + stream)).write_text(getattr(result, stream),
+                                                        encoding="utf-8", newline="\n")
+        row = {"label": label, "last_declaration": declaration, "source_bytes": len(body),
+               "status": result.status, "returncode": result.returncode,
+               "elapsed_s": result.elapsed_s,
+               "stdout": label + ".stdout", "stderr": label + ".stderr"}
+        entry["checks"].append(row)
+        write_json_atomic(out / "report.json", evidence)
+        print(f"BOOTSTRAP_PROBE: {label} {declaration}: {result.classify()}", flush=True)
+        return result
+
+    full = run_stage("declaration-full", "<full-source>", original)
+    if full is None or full.status != "ok":
+        entry["outcome"] = "full-scratch-check-unavailable"
+    else:
+        observed = re.search(r"CErr code=\d+ det=\d+", full.stderr)
+        expected = re.search(r"CErr code=\d+ det=\d+", first_stderr)
+        if full.returncode == 0 or observed is None or expected is None or observed.group() != expected.group():
+            entry["outcome"] = "full-scratch-failure-not-reproduced"
+        else:
+            starts = list(re.finditer(
+                rb"(?m)^(?:def|inductive|axiom|intrinsic)[ \t]+([A-Za-z_][A-Za-z0-9_']*)\b",
+                original))
+            if not starts:
+                entry["outcome"] = "no-top-level-declarations"
+            else:
+                entry["outcome"] = "prefixes-complete"
+                for index, declaration in enumerate(starts):
+                    end = starts[index + 1].start() if index + 1 < len(starts) else len(original)
+                    name = declaration.group(1).decode("ascii")
+                    result = run_stage(f"declaration-{index + 1:02}", name, original[:end])
+                    if result is None or result.status != "ok":
+                        entry["outcome"] = "prefix-check-unavailable"
+                        break
+                    if result.returncode != 0 and entry["first_failing_declaration_prefix"] is None:
+                        entry["first_failing_declaration_prefix"] = entry["checks"][-1]
+                if entry["outcome"] == "prefixes-complete" and unit == "compiler/lower_fallible.ouro":
+                    newline = b"\r\n" if b"\r\n" in original else b"\n"
+                    before = newline.join((b"        | XVFallible _ _ _ _ => finish term",
+                                           b"        | XVUnsupported => finish term"))
+                    after = newline.join((b"        | XVFallible _ _ _ _ => finish term",
+                                          b"        | XVRange _ _ _ => finish term",
+                                          b"        | XVListSpread _ _ => finish term",
+                                          b"        | XVNamedCall _ _ => finish term",
+                                          b"        | XVUnsupported => finish term"))
+                    if original.count(before) != 1:
+                        raise ValueError("scratch-only fallible control splice is not unique")
+                    control = run_stage("declaration-control", "lower_fallible_body+3-arms",
+                                        original.replace(before, after))
+                    entry["control_accepts"] = bool(control and control.status == "ok"
+                                                    and control.returncode == 0
+                                                    and control.stdout == "CHECK_OK\n"
+                                                    and not control.stderr)
+    target.write_bytes(original)
+    write_json_atomic(out / "report.json", evidence)
 
 def probe(work: Path, out: Path, report: dict, failed: dict) -> None:
     snapshot_path = work / "inputs.json"
@@ -90,6 +186,7 @@ def probe(work: Path, out: Path, report: dict, failed: dict) -> None:
     configure_native_stack()
     deadline = time.monotonic() + BUDGET_S
 
+    first_failure_stderr = None
     for index, unit in enumerate(units):
         remaining = deadline - time.monotonic()
         if remaining <= 0:
@@ -113,6 +210,7 @@ def probe(work: Path, out: Path, report: dict, failed: dict) -> None:
         elif result.returncode != 0:
             evidence["outcome"] = "first-failing-prefix"
             evidence["first_failing_prefix"] = row
+            first_failure_stderr = result.stderr
         elif result.stdout != "CHECK_OK\n" or result.stderr:
             evidence["outcome"] = "unexpected-check-protocol"
         write_json_atomic(out / "report.json", evidence)
@@ -126,6 +224,10 @@ def probe(work: Path, out: Path, report: dict, failed: dict) -> None:
     else:
         evidence["outcome"] = "all-prefixes-pass"
     write_json_atomic(out / "report.json", evidence)
+    if first_failure_stderr is not None:
+        declaration_probe(work, source_root, producer, env, deadline,
+                          units[:evidence["first_failing_prefix"]["index"] + 1],
+                          first_failure_stderr, out, evidence)
     if sha256_file(producer) != bridge["binary_sha256"] or bootstrap.changed_inputs(work, snapshot):
         evidence["outcome"] = "frozen-producer-or-inputs-changed"
         write_json_atomic(out / "report.json", evidence)
