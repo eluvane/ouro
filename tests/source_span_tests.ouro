@@ -9,7 +9,8 @@ import "../compiler/source_spans.ouro",
   "../std/fs.ouro",
   "../std/processx.ouro",
   "../std/text.ouro",
-  "analyze/precision/assertions.ouro";
+  "analyze/precision/assertions.ouro",
+  "character_literal_cases.ouro";
 
 -- Tagged, length-prefixed codes: equal code lists mean equal trees. ESpan keeps
 -- its own tag, so a wrapper left behind by strip_spans changes the codes.
@@ -606,6 +607,91 @@ def ss_lowfuel_numeric : Bool :=
     | LexExhausted _ => False
     end;
 
+def ss_character_state (st : InternState) : Bool :=
+  match st with
+  | MkIntern ids next_id strings next_string =>
+      andb (andb(nullb (Pair (List Nat) Nat) ids, eqNat next_id 1))
+        (andb(nullb (Pair (List Nat) Nat) strings, eqNat next_string 0))
+  end;
+
+def ss_character_token (codes : List Nat) (expected : Nat) : Bool :=
+  let source : List Nat := append Nat ([32, 9] : List Nat)
+    (append Nat codes ([32] : List Nat)) in
+  let lexed : LexSpanned := lex_spanned 64 source empty_intern in
+  match lex_spanned_result lexed with
+  | LexMalformed _ => False
+  | LexExhausted _ => False
+  | LexOk tokens st =>
+      andb (ss_character_state st)
+        (andb (source_bytes_equal (ss_tokens tokens (Nil Nat))
+          (ss_tokens ([TNat expected, TEof] : List Token) (Nil Nat)))
+          (match token_span_bytes (lex_spanned_tokens lexed) 0 1 with
+           | Nothing => False
+           | Just offsets => match offsets with
+             | MkPair first past =>
+                 andb(eqNat first 2, eqNat past (add 2 (length Nat codes)))
+             end
+           end))
+  end;
+
+def ss_character_valid : List (Pair (List Nat) Nat) -> Bool :=
+  fix go (cases : List (Pair (List Nat) Nat)) : Bool :=
+    match cases with
+    | Nil => True
+    | Cons row rest => match row with
+      | MkPair codes expected =>
+          andb (ss_character_token codes expected) (go rest)
+      end
+    end;
+
+def ss_character_invalid : List (Pair String (List Nat)) -> Bool :=
+  fix go (cases : List (Pair String (List Nat))) : Bool :=
+    match cases with
+    | Nil => True
+    | Cons row rest => match row with
+      | MkPair _ codes =>
+          andb (match lex_all 64 codes with
+            | LexOk _ _ => False
+            | LexExhausted _ => False
+            | LexMalformed st => ss_character_state st
+            end)
+            (andb (match lex_spanned_result (lex_spanned 64 codes empty_intern) with
+              | LexOk _ _ => False
+              | LexExhausted _ => False
+              | LexMalformed st => ss_character_state st
+              end) (go rest))
+      end
+    end;
+
+def ss_character_lowfuel (fuel : Nat) : Bool :=
+  let codes : List Nat := ([39, 97, 39] : List Nat) in
+  andb (match lex_all fuel codes with
+    | LexOk _ _ => False
+    | LexMalformed st => ss_character_state st
+    | LexExhausted st => ss_character_state st
+    end)
+    (match lex_spanned_result (lex_spanned fuel codes empty_intern) with
+    | LexOk _ _ => False
+    | LexMalformed st => ss_character_state st
+    | LexExhausted st => ss_character_state st
+    end);
+
+def ss_character_primes : Bool :=
+  match lex_all 64 (prim_string_to_char_codes "'a''b' name'") with
+  | LexMalformed _ => False
+  | LexExhausted _ => False
+  | LexOk tokens st => match st with
+    | MkIntern ids next_id strings next_string =>
+        andb (source_bytes_equal (ss_tokens tokens (Nil Nat))
+          (ss_tokens ([TNat 97, TNat 98, TIdent 1, TEof] : List Token) (Nil Nat)))
+          (andb (source_bytes_equal (ss_interned ids (Nil Nat))
+            (ss_interned ([MkPair (List Nat) Nat
+              ([110, 97, 109, 101, 39] : List Nat) 1] : List (Pair (List Nat) Nat)) (Nil Nat)))
+            (andb(eqNat next_id 2,
+              andb(nullb (Pair (List Nat) Nat) strings, eqNat next_string 0))))
+    end
+  end;
+
 def ss_samples : List String :=
     [ "def f : Nat := g (h x) |> k;"
     , "def s : String := \"a\\\"b -- c\"; -- trailing"
@@ -775,8 +861,26 @@ def ss_laws_rest : List (Pair String Bool) :=
           ([1, 23, 1, 24, 0] : List Nat))
     ];
 
+def ss_laws_character : List (Pair String Bool) :=
+  [ MkPair String Bool "tokens/character-scalars-and-byte-spans"
+      (ss_character_valid character_valid_cases)
+  , MkPair String Bool "tokens/character-malformed-encodings"
+      (ss_character_invalid character_invalid_cases)
+  , MkPair String Bool "tokens/character-no-prefix-at-lowfuel"
+      (andb (ss_character_lowfuel 0) (andb (ss_character_lowfuel 1)
+        (andb (ss_character_lowfuel 2) (ss_character_lowfuel 3))))
+  , MkPair String Bool "tokens/character-adjacency-and-identifier-primes"
+      ss_character_primes
+  , MkPair String Bool "spans/character-spellings"
+      (ss_spans_expect "def a : Nat := 'A'; def e : Nat := 'é'; def euro : Nat := '€'; def smile : Nat := '😀'; def nul : Nat := '\\u{0}';"
+        (["'A'", "'é'", "'€'", "'😀'", "'\\u{0}'", "Nat"] : List String) ([] : List String))
+  , MkPair String Bool "spans/character-stream-and-parser-agreement"
+      (ss_stream_agrees_with_slices "def name' : Nat := '\\''; def brace : Nat := '{';")
+  ];
+
 def ss_laws : List (Pair String Bool) :=
-    append (Pair String Bool) ss_laws_first ss_laws_rest;
+    append (Pair String Bool) (append (Pair String Bool) ss_laws_first ss_laws_rest)
+      ss_laws_character;
 
 -- Repository sources after the same import and record preprocessing that
 -- tools apply before lexing.
