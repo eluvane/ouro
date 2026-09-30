@@ -770,8 +770,22 @@ def test_frontend_host_protocol(tmp: Path) -> None:
                 "pe-byte-large", "pe-byte-errors", "pe-byte-context", "pe-patch-context", "lower-bad-result", "lower-bad-result-quiet",
                 "lower-bad-chunk", "lower-bad-contracts", "caller-output", "retained-result",
                 "typed-failure", "nested-context", "allocation-context", "shared-parent-spine", "wrapped-context", "recheck-scale",
-                "recheck-retained", "recheck-late-invalid", "recheck-missing-bodies", "recheck-zero-fuel")
-    assert len(cases) == 35 and tuple(case[1][0] for case in host.probe_cases()) == expected
+                "recheck-retained", "recheck-late-invalid", "recheck-missing-bodies", "recheck-zero-fuel",
+                "metadata-parity", "fallback-forward", "root-parity")
+    assert len(cases) == 38 and tuple(case[1][0] for case in host.probe_cases()) == expected
+    for mode, prefix in (("metadata-parity", "FRONTEND_CODEGEN_META"),
+                         ("fallback-forward", "FRONTEND_CODEGEN_SELFTEST"),
+                         ("root-parity", "FRONTEND_CODEGEN_SELFTEST")):
+        success = RunResult("ok", 0, f"{prefix}: passed {mode}\n", "", 0, 0)
+        host.verify_probe(success, cases[mode])
+        for invalid_probe in (replace(success, status="timeout"), replace(success, returncode=1),
+                              replace(success, stdout=""), replace(success, stderr="unexpected\n")):
+            try:
+                host.verify_probe(invalid_probe, cases[mode])
+            except ValueError:
+                pass
+            else:
+                raise AssertionError(f"{mode}: invalid host protocol accepted")
     quiet = RunResult("ok", 0, "N1_HOST_MIR: emitted valid-quiet\n",
                       "n1-host: mir functions=1 live=1\nn1-host: mir-check live=1\n"
                       "n1-host: gc-infer live=1\nn1-host: annotate live=1\n"
