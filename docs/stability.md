@@ -9,7 +9,7 @@ narrower than it will be for a stable release.
 Release tags and shared version files are defined in [Releasing](releasing.md#version).
 
 During the `0.x` series, breaking changes are allowed. A breaking user-visible
-change must be documented in `CHANGELOG.md`, covered by tests or fixtures, and
+change must be documented in its canonical page, covered by tests or fixtures, and
 accompanied by migration guidance. A substantial language or trust-boundary
 change also needs an RFC.
 

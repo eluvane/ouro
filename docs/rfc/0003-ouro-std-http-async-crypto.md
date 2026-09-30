@@ -46,5 +46,5 @@ processes remain outside the logical trusted computing base.
 ## Validation and documentation
 
 The crypto runtime fixture, example program, generated API pages,
-[Effects and IO](../effects_design.md), and changelog cover the implemented
+and [Effects and IO](../effects_design.md) cover the implemented
 slice.

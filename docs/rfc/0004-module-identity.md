@@ -136,7 +136,7 @@ gates. Stage-loop evidence is required before any generated bootstrap update.
 ## Documentation
 
 Update `docs/syntax.md`, `docs/architecture.md`, `docs/language/ergonomic-syntax.md`,
-`docs/tcb.md` if the described trust boundary changes, and `CHANGELOG.md`.
+and `docs/tcb.md` if the described trust boundary changes.
 
 ## Diagnostics and remaining design
 

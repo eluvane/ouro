@@ -988,11 +988,10 @@ def run_self_tests() -> None:
             else:
                 link.unlink()
 
-    changelog_cut_self_tests()
     toolchain_self_tests()
     print(
         "RELEASE_PACKAGE_SELF_TEST: PASS versions=11 tracked_links=5 "
-        "archive_formats=2 reparse=1 changelog_cut=4 toolchains=6 report_checksums=2 "
+        "archive_formats=2 reparse=1 toolchains=6 report_checksums=2 "
         "snapshot_schedule=pass"
     )
 
@@ -1106,124 +1105,6 @@ def toolchain_self_tests() -> None:
             raise SystemExit("release package self-test: manifest version lookup failed")
 
 
-CHANGELOG_REPO = "https://github.com/eluvane/ouro"
-CHANGELOG_UNRELEASED = "## [Unreleased]"
-CHANGELOG_VERSION_RE = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+$")
-CHANGELOG_DATE_RE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$")
-
-
-def changelog_span_end(text: str, start: int) -> int:
-    rest = text[start:]
-    ends = [len(text)]
-    nxt = rest.find("\n## [", 1)
-    if nxt != -1:
-        ends.append(start + nxt)
-    for mark in ("\n[Unreleased]:", "\n<p align="):
-        pos = text.find(mark, start)
-        if pos != -1:
-            ends.append(pos)
-    return min(ends)
-
-
-def changelog_section(version: str) -> str:
-    text = read("CHANGELOG.md")
-    header = f"## [{version}]"
-    start = text.find(header)
-    if start < 0:
-        raise SystemExit(f"release package: CHANGELOG.md has no {header} section")
-    body = text[start:changelog_span_end(text, start)].strip()
-    if not body:
-        raise SystemExit(f"release package: CHANGELOG.md section {header} is empty")
-    return body
-
-
-def cut_unreleased_text(
-    text: str,
-    version: str,
-    date: str,
-    *,
-    repo: str = CHANGELOG_REPO,
-) -> str:
-    if CHANGELOG_VERSION_RE.match(version) is None:
-        raise SystemExit(f"release package: invalid changelog version {version!r}")
-    if CHANGELOG_DATE_RE.match(date) is None:
-        raise SystemExit(f"release package: invalid changelog date {date!r}")
-    if f"## [{version}]" in text:
-        raise SystemExit(f"release package: CHANGELOG.md already has ## [{version}]")
-    idx = text.find(CHANGELOG_UNRELEASED)
-    if idx < 0:
-        raise SystemExit("release package: CHANGELOG.md has no ## [Unreleased] section")
-    body_start = idx + len(CHANGELOG_UNRELEASED)
-    while body_start < len(text) and text[body_start] in "\r\n":
-        body_start += 1
-    body_end = changelog_span_end(text, idx)
-    body = text[body_start:body_end].strip()
-    if not body:
-        raise SystemExit("release package: [Unreleased] is empty; nothing to cut")
-    previous = text[body_end:]
-    older = re.findall(r"^## \[([0-9]+\.[0-9]+\.[0-9]+)\]", previous, flags=re.MULTILINE)
-    version_part = previous
-    for mark in ("\n[Unreleased]:", "\n<p align="):
-        pos = version_part.find(mark)
-        if pos != -1:
-            version_part = version_part[:pos]
-    version_part = version_part.rstrip()
-    if version_part:
-        version_part += "\n\n"
-    footer = ""
-    foot = text.find("\n<p align=")
-    if foot != -1:
-        footer = text[foot:]
-    if not footer.endswith("\n"):
-        footer += "\n"
-    links = [f"[Unreleased]: {repo}/compare/v{version}...HEAD"]
-    if older:
-        links.append(f"[{version}]: {repo}/compare/v{older[0]}...v{version}")
-        for i, ver in enumerate(older):
-            nxt = older[i + 1] if i + 1 < len(older) else None
-            if nxt is None:
-                links.append(f"[{ver}]: {repo}/releases/tag/v{ver}")
-            else:
-                links.append(f"[{ver}]: {repo}/compare/v{nxt}...v{ver}")
-    else:
-        links.append(f"[{version}]: {repo}/releases/tag/v{version}")
-    prelude = text[:idx] + CHANGELOG_UNRELEASED + "\n\n"
-    released = f"## [{version}] - {date}\n\n{body}\n\n"
-    return prelude + released + version_part + "\n".join(links) + "\n" + footer
-
-
-def changelog_cut_self_tests() -> None:
-    sample = (
-        "# Changelog\n\n"
-        "## [Unreleased]\n\n"
-        "- New thing\n\n"
-        "## [0.1.0] - 2026-09-12\n\n"
-        "First release.\n\n"
-        "[Unreleased]: https://github.com/eluvane/ouro/compare/v0.1.0...HEAD\n"
-        "[0.1.0]: https://github.com/eluvane/ouro/releases/tag/v0.1.0\n"
-        "\n<p align=\"center\">\nfooter\n</p>\n"
-    )
-    cut = cut_unreleased_text(sample, "0.1.1", "2026-09-19")
-    if "## [Unreleased]\n\n## [0.1.1] - 2026-09-19\n\n- New thing\n" not in cut:
-        raise SystemExit("release package self-test: cut did not reset Unreleased")
-    if "- New thing" in cut.split("## [0.1.1]", 1)[0]:
-        raise SystemExit("release package self-test: Unreleased still holds cut notes")
-    if "[Unreleased]: https://github.com/eluvane/ouro/compare/v0.1.1...HEAD" not in cut:
-        raise SystemExit("release package self-test: missing Unreleased compare link")
-    if "[0.1.1]: https://github.com/eluvane/ouro/compare/v0.1.0...v0.1.1" not in cut:
-        raise SystemExit("release package self-test: missing version compare link")
-    if "First release." not in cut or "<p align=" not in cut:
-        raise SystemExit("release package self-test: cut dropped earlier release or footer")
-    empty = sample.replace("- New thing\n\n", "")
-    expect_rejected(lambda: cut_unreleased_text(empty, "0.1.1", "2026-09-19"), "[Unreleased] is empty")
-    expect_rejected(lambda: cut_unreleased_text(sample, "0.1.0", "2026-09-19"), "already has")
-    expect_rejected(lambda: cut_unreleased_text(sample, "v0.1.1", "2026-09-19"), "invalid changelog version")
-
-
-def write_release_notes(path: Path, version: str) -> None:
-    path.write_text(f"# Ouro v{version}\n\n{changelog_section(version)}\n", encoding="utf-8")
-
-
 def main(argv: Optional[Sequence[str]] = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--out", default="_build/release", help="release output directory")
@@ -1261,13 +1142,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         help="require all ten host toolchain archives in --out",
     )
     ap.add_argument(
-        "--cut-changelog",
-        action="store_true",
-        help="move [Unreleased] under the seal version and reset [Unreleased]",
-    )
-    ap.add_argument(
         "--date", default=None,
-        help="YYYY-MM-DD for --cut-changelog or --snapshot-due; default is UTC today",
+        help="YYYY-MM-DD for --snapshot-due; default is UTC today",
     )
     args = ap.parse_args(argv)
 
@@ -1278,7 +1154,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     if args.self_test:
         run_self_tests()
-        if not args.check and not args.cut_changelog and not args.checksums_only and not args.verify_dir:
+        if not args.check and not args.checksums_only and not args.verify_dir:
             return 0
 
     out = Path(args.out)
@@ -1301,19 +1177,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             print(f"RELEASE_SHA256 {h}  {name}")
         return 0
 
-    if args.cut_changelog:
-        version = parse_seal_version()
-        date = args.date or datetime.now(UTC).date().isoformat()
-        path = ROOT / "CHANGELOG.md"
-        try:
-            current = path.read_text(encoding="utf-8")
-        except (OSError, UnicodeError) as exc:
-            raise SystemExit(f"release package: cannot read CHANGELOG.md: {exc}") from exc
-        path.write_text(cut_unreleased_text(current, version, date), encoding="utf-8")
-        print(f"CHANGELOG_CUT: PASS version={version} date={date}")
-        if not args.check:
-            return 0
-
     version, version_evidence = validate_versions(args.expect_tag)
     generated = validate_generated_artifacts()
     dirty = git_dirty()
@@ -1321,7 +1184,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         raise SystemExit("release package: refusing tagged release from dirty checkout")
 
     files = list_files()
-    required = ["README.md", "CHANGELOG.md", "CONTRIBUTING.md", "SECURITY.md", "docs/stability.md", "docs/releasing.md"]
+    required = ["README.md", "CONTRIBUTING.md", "SECURITY.md", "docs/stability.md", "docs/releasing.md"]
     missing = [p for p in required if not (ROOT / p).is_file()]
     if missing:
         raise SystemExit("release package: missing required release docs: " + ", ".join(missing))
@@ -1373,7 +1236,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "compiler_bytes": compiler.stat().st_size,
         }
     write_json_atomic(out / f"{prefix}-release-manifest.json", manifest)
-    write_release_notes(out / "release-notes.md", version)
 
     if not args.check:
         if args.source:

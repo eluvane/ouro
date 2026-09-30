@@ -19,8 +19,7 @@ Choose a module by task; the generated [API reference](api/README.md) owns decla
 `std/practical.ouro` imports the practical helpers as a convenience umbrella.
 `std/string_prims.ouro` shares String primitive declarations with the runtime
 without importing platform IO; `std/executable.ouro` supplies the current
-image-path query. The pre-1.0 collection names and removed `_go` helpers are
-recorded in the [changelog](../CHANGELOG.md).
+image-path query.
 
 `std/utf8_scalar.ouro` provides `utf8_scalar_checked` for a scalar-to-UTF-8
 conversion that rejects surrogates and out-of-range values. Its

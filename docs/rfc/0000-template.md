@@ -41,7 +41,7 @@ support the decision.
 
 ## Documentation
 
-List the canonical user, contributor, architecture, and changelog pages that
+List the canonical user, contributor, and architecture pages that
 must change.
 
 ## Unresolved questions

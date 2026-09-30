@@ -86,7 +86,7 @@ The optional `--source` flag still writes source-only `.tar.gz` / `.zip`
 archives for local inspection; those names are not uploaded to GitHub Releases.
 
 A complete hosted set is the ten toolchain archives, a release manifest,
-generated release notes, and `SHA256SUMS`. Repository-local state such as
+and `SHA256SUMS`. Repository-local state such as
 `.git/`, `_build/`, `_cache/`, editor outputs, Python bytecode, and
 `node_modules/` is excluded from the source members.
 Tracked symlinks and selected paths that traverse a symlink or Windows reparse
@@ -103,9 +103,13 @@ snapshot every three days, counting UTC days from 1970-01-01. Other scheduled
 runs skip validation, packaging, and publication. This cycle continues across
 month and year boundaries. Push an annotated `v<version>` tag after the candidate
 checks and package review. A tag run creates a draft GitHub Release and uploads
-the ten host archives, manifest, notes, and checksums.
+the ten host archives, manifest, and checksums. GitHub generates the draft's
+notes from merged PRs using `.github/release.yml`, starting at the highest
+canonical `vX.Y.Z` ancestor other than the current tag. Snapshot and weekly
+tags do not select that starting point. Without a previous version tag,
+GitHub chooses the first draft's comparison automatically.
 
-A maintainer reviews the draft, changelog, checksums, validation reports,
+A maintainer reviews the draft's notes, checksums, validation reports,
 security status, and generated-artifact hashes before publication.
 
 A scheduled snapshot on `main`, or a dispatch on `main` with
@@ -117,7 +121,8 @@ the last snapshot (or in the last three days if none exists). Existing
 `snapshot` is selected. Manual dispatch is independent of the scheduled cycle.
 The snapshot tag points to the workflow's source
 commit, matching its built archives. The snapshot keeps the current project
-version, uses commit subjects as notes, and does not mark the release as latest.
+version and does not mark the release as latest. Its title is `Snapshot YYYY-MM-DD`;
+the notes contain one comparison link, or a commit-history link for the first snapshot.
 Intervals without new commits publish nothing. Dispatch callers must replace
 the former `weekly_snapshot` input with `snapshot`.
 
@@ -129,19 +134,9 @@ python3 scripts/release_package.py --snapshot-due --date 2026-09-25
 
 This prints `true`; the next two dates print `false`.
 
-During development, write user-visible notes under `[Unreleased]`. Do not append
-new work to a published version section. Scheduled snapshots do not cut the
-changelog.
-
-Before tagging a version, bump the shared version files, then cut the log:
-
-```sh
-python3 scripts/release_package.py --cut-changelog
-```
-
-That moves `[Unreleased]` under `## [<version>] - <date>`, leaves `[Unreleased]`
-empty, and rewrites the compare links. An empty `[Unreleased]` section is a
-hard error: there is nothing to publish in the notes.
+Before tagging a version, bump the shared version files. Describe user-visible
+changes in PRs and keep canonical documentation and migration guidance current;
+Git history and GitHub releases carry the change history.
 
 A reproducible host package establishes a reviewable byte baseline for that
 runner. It does not prove type-system soundness, compiler correctness, runtime

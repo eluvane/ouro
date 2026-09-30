@@ -54,8 +54,8 @@ List the gates in a profile without running them:
 python3 scripts/ci_gate.py --profile pr --list
 ```
 
-The complete local PR inventory has twenty-seven isolated groups. GitHub selects
-affected groups and gates for reviewed tool paths; main-branch pushes, merge
+GitHub selects affected groups and gates for reviewed tool and control-plane
+paths; main-branch pushes, merge
 queues and manual CI runs select the complete inventory except `lint`, which
 runs in Nightly and on demand. Run one group with:
 
@@ -197,12 +197,13 @@ required individual `PR (...)` and `Portable (...)` contexts in hosted branch
 rules with `Kernel`; those matrix contexts do not exist when the matrix is
 skipped. Editing the script does not apply hosted settings.
 
-Changes confined to `README.md`, `CHANGELOG.md`, `CONTRIBUTING.md`, or ordinary
+Changes confined to root Markdown files or ordinary
 Markdown under `docs/` use the `docs` profile: workflow/project policy, API
 baseline drift, documentation suite, and documentation examples. Editor and
 site changes keep their own checks when combined with docs. Generated API
-pages, generated hashes, executable examples, trust/build/CI/release/design
-documents and unknown paths retain full PR validation. Empty or unavailable
+pages, generated hashes, executable examples, trust/build/design
+documents and unknown paths retain full PR validation. CI and release documents
+use the focused routes below. Empty or unavailable
 diffs select full validation. A docs-and-code change includes all docs gates.
 
 ```sh
@@ -228,13 +229,26 @@ The explicit routing table in `scripts/ci_gate.py` currently covers these inputs
 | Package manager, scanner fixtures and package suite launcher | Package suite and applicable release packaging checks |
 | LSP implementation and suite launcher | LSP protocol suite |
 | Documentation generator and suite launcher | Documentation and LSP suites, which share the document model |
+| Release workflow, release categories, packaging script and release documentation | Release packaging self-tests and metadata validation |
+| PR workflow, CI runner and CI documentation | Routing/consumer self-tests, compiler configuration and build-cache configuration |
+| OuroSmith provenance collector | Source, binary and stage-receipt regression tests in the CI runner self-test |
+| Native host inventories | Host-bound inventory and delegated native repository policy checks |
+| Native repository checks and policy | Host-bound inventory, native policy checks, user tests and compiler-boundary checks |
+| Strict debt manifest | Strict firewall and structural quality checks |
 
-Every code route retains repository policy, Python/shell lint, API drift,
+Tool routes retain repository policy, Python/shell lint, API drift,
 generated hashes, compiler boundary, strict and structural quality, documentation
 examples, hygiene, and the test/Smith/sample integration suites. The local plan
 also retains the complete lint gate, which the hosted matrix excludes; a route
 that changes production `.ouro` sources selects `lint-changed`. The table
-selects existing gates; it does not change their assertions or profiles.
+does not change gate assertions. Control-plane routes retain Python/shell lint,
+CI runner self-tests, workflow/project policy, structural quality and documentation examples. Mixed
+documentation changes add every docs gate. Changed production `.ouro` files
+still select `lint-changed`, including native policy and inventory modules.
+The `host-bound-inventory` gate also runs in complete PR, Nightly and Manual
+profiles. Compiler, kernel-extra and portable suites are omitted when only
+reviewed control-plane files and ordinary documentation change. The shared
+Host compiler remains required to execute the Ouro-native policy checks.
 Unlisted files select the complete PR inventory and portable checks. Changes
 to compiler, runtime and standard library inputs also retain kernel-extra.
 
