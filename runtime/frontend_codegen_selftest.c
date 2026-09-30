@@ -183,6 +183,41 @@ static ouro_v *test_replace_field(ouro_v *value, int index, ouro_v *replacement)
 	return ouro_ctor(value->tag, value->n, fields);
 }
 
+static int test_root_clear_context(void)
+{
+	ouro_v *slots = test_nil();
+	ouro_v *live = test_cons(ouro_nat(0), test_cons(ouro_nat(127), test_nil()));
+	ouro_v *wrapped = FIND(lo, "codegen_clear_dead_roots");
+	ouro_v *reference;
+	ouro_v *first = 0, *last = 0;
+	ouro_heap_context *context;
+	unsigned long long before, retained, start;
+	int i;
+	if (g_raw_clear_roots == 0)
+		return test_fail("root-clear lifetime hook missing");
+	for (i = 127; i >= 0; i--)
+		slots = test_cons(test_slot((unsigned long)i, 6,
+			4096UL + 8UL * (unsigned long)i), slots);
+	before = ouro_heap_live_bytes();
+	context = ouro_heap_context_enter();
+	reference = ouro_apply(ouro_apply(g_raw_clear_roots, slots), live);
+	reference = ouro_heap_context_leave(context, reference);
+	retained = ouro_heap_live_bytes() - before;
+	start = ouro_heap_live_bytes();
+	for (i = 0; i < 64; i++) {
+		last = ouro_apply(ouro_apply(wrapped, slots), live);
+		if (i == 0)
+			first = last;
+		if (ouro_heap_live_bytes() - start >
+		    (unsigned long long)(i + 1) * (retained + 4096ULL) + 1048576ULL)
+			return test_fail("root-clear temporary work retained");
+	}
+	if (!test_bytes_equal(cgn_right(first), cgn_right(reference))
+	    || !test_bytes_equal(cgn_right(last), cgn_right(reference)))
+		return test_fail("root-clear retained bytes changed");
+	return 0;
+}
+
 static int test_roots(void)
 {
 	ouro_v *slots = test_cons(test_slot(0, 6, 32),
@@ -483,6 +518,8 @@ int main(int argc, char **argv)
 		result = test_forwarded_arguments();
 	else if (strcmp(argv[1], "root-parity") == 0)
 		result = test_roots();
+	else if (strcmp(argv[1], "root-clear-context") == 0)
+		result = test_root_clear_context();
 	else
 		return 2;
 	if (result == 0)

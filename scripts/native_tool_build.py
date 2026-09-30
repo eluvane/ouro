@@ -92,6 +92,7 @@ HOST_HOOKS = (
     ("mir_live_summary_step", "ouro_wrap_mir_live_summary_step", ("compiler/native/mir_live.ouro",)),
     ("codegen_parts", "ouro_wrap_codegen_parts", ("compiler/native/codegen_model.ouro",)),
     ("codegen_live_instructions", "ouro_wrap_codegen_live_instructions", ("compiler/native/codegen_ops.ouro",)),
+    ("codegen_clear_dead_roots", "ouro_wrap_codegen_clear_dead_roots", ("compiler/native/codegen_roots.ouro",)),
     ("codegen_instruction", "ouro_wrap_codegen_instruction", ("compiler/native/codegen_ops.ouro",)),
     ("codegen_block", "ouro_wrap_codegen_block", ("compiler/native/codegen_ops.ouro",)),
     ("codegen_body", "ouro_wrap_codegen_body", ("compiler/native/codegen.ouro",)),

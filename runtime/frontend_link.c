@@ -3387,6 +3387,28 @@ ouro_v *ouro_wrap_codegen_live_instructions(ouro_v *raw)
 	return ouro_clos(cli_slots, 0);
 }
 
+static ouro_v *g_raw_clear_roots;
+
+static ouro_v *cdroot_live(ouro_env *env, ouro_v *live)
+{
+	ouro_heap_context *context = ouro_heap_context_enter();
+	ouro_v *result = ouro_apply(ouro_apply(g_raw_clear_roots,
+		ouro_get(env, 0)), live);
+	return ouro_heap_context_leave(context, result);
+}
+
+static ouro_v *cdroot_slots(ouro_env *env, ouro_v *slots)
+{
+	(void)env;
+	return ouro_clos(cdroot_live, ouro_cons(slots, 0));
+}
+
+ouro_v *ouro_wrap_codegen_clear_dead_roots(ouro_v *raw)
+{
+	g_raw_clear_roots = raw;
+	return ouro_clos(cdroot_slots, 0);
+}
+
 static ouro_v *g_raw_cgi;
 static unsigned long g_cgi_count;
 static unsigned long g_cgi_fallback;

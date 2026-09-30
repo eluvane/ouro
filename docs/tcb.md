@@ -230,8 +230,7 @@ encoding substitutes for MIR validation. The Ouro
 `managed_validate_parts` / `native_emit_image` path retains the same check.
 C wraps around `mir_gc_infer`, `mir_gc_annotate`, `mir_gc_check`,
 `x64_encode`, `codegen_assemble`, `codegen_parts`,
-`codegen_live_instructions`, `codegen_instruction`, `codegen_block`, and
-`codegen_body` substitute
+`codegen_instruction`, `codegen_block`, and `codegen_body` substitute
 equivalent host walks for the same Ouro functions so a compiler-sized
 image can finish on the C-hosted producer. Liveness facts are computed by the
 canonical Ouro solver in a nested allocation context; its complete facts or
@@ -241,10 +240,10 @@ round-local storage; frozen input facts, summary order, convergence and fuel
 remain in the canonical solver. Accelerated
 function emission runs that same liveness check first for managed-root
 functions, preserving unknown-edge and convergence-budget failures.
-The live-instruction wrap
-keeps every managed slot live instead of running the interpreted
-intra-block transfer; that is sound and more conservative. Unrecognized
-instruction shapes fall back to the generated closures. Managed
+The wraps around `codegen_live_instructions` and `codegen_clear_dead_roots`
+retain each canonical operation's complete result in a nested allocation
+context and release its temporary work. Unrecognized instruction shapes
+fall back to the generated closures. Managed
 allocation and managed-context instructions are included in the
 `codegen_instruction` wrap. The wraps do not change which MIR errors
 are accepted; they are a host lifetime and time seam, not a second
