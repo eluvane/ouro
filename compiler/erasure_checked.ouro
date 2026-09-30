@@ -4,20 +4,254 @@ import "erasure.ouro",
   "file_refine_scope.ouro",
   "file_check_result.ouro";
 
+-- Let values remain raw until a type probe needs them. Eager lifting of
+-- repeated references would copy their computation graph at every binder.
+inductive ErasureScope : Type :=
+  | MkErasureScope : RefineScope -> List (Maybe CoreTerm) -> ErasureScope;
+
+def erasure_scope_refine (scope : ErasureScope) : RefineScope :=
+    match scope with | MkErasureScope refined _ => refined end;
+
+def erasure_scope_assume (scope : ErasureScope) (annotation : CoreTerm) : ErasureScope :=
+    match scope with | MkErasureScope refined definitions =>
+      MkErasureScope (refine_scope_assume refined annotation)
+        (Cons (Maybe CoreTerm) (Nothing CoreTerm) definitions) end;
+
+def erasure_scope_define (scope : ErasureScope) (annotation : CoreTerm)
+    (value : CoreTerm) : ErasureScope :=
+    match scope with | MkErasureScope refined definitions =>
+      MkErasureScope (refine_scope_assume refined annotation)
+        (Cons (Maybe CoreTerm) (Just CoreTerm value) definitions) end;
+
+-- Count expansion and subsequent lifts before copying any definition. Each
+-- pending lift charges another traversal of every expanded node, so the
+-- shared budget bounds work across siblings as well as definition depth.
+inductive ErasureExpansionWork : Type :=
+  | ErasureExpansionTerm : List (Maybe CoreTerm) -> Nat -> Nat -> CoreTerm -> ErasureExpansionWork
+  | ErasureExpansionTerms : List (Maybe CoreTerm) -> Nat -> Nat -> List CoreTerm -> ErasureExpansionWork
+  | ErasureExpansionLookup : List (Maybe CoreTerm) -> Nat -> Nat -> ErasureExpansionWork
+  | ErasureExpansionContext : List (Maybe CoreTerm) -> List CoreTerm -> ErasureExpansionWork;
+
+def erasure_expansion_children (work : ErasureExpansionWork)
+    (pending : List ErasureExpansionWork) : List ErasureExpansionWork :=
+    match work with
+    | ErasureExpansionTerm definitions depth copies term =>
+        let child (value : CoreTerm) (rest : List ErasureExpansionWork) : List ErasureExpansionWork :=
+          Cons ErasureExpansionWork (ErasureExpansionTerm definitions depth copies value) rest in
+        let bound (value : CoreTerm) (rest : List ErasureExpansionWork) : List ErasureExpansionWork :=
+          Cons ErasureExpansionWork (ErasureExpansionTerm definitions (S depth) copies value) rest in
+        match term with
+        | CRel index => match compiler_le_nat depth index with
+            | False => pending
+            | True => Cons ErasureExpansionWork
+                (ErasureExpansionLookup definitions (sub index depth) copies) pending end
+        | CPi domain body => child domain (bound body pending)
+        | CLam annotation body => child annotation (bound body pending)
+        | CApp function argument => child function (child argument pending)
+        | CLetIn value annotation body => child value (child annotation (bound body pending))
+        | CFix _ _ _ annotation body => child annotation (bound body pending)
+        | CCase _ predicate scrutinee branches => child predicate (child scrutinee
+            (Cons ErasureExpansionWork (ErasureExpansionTerms definitions depth copies branches) pending))
+        | CSort _ => pending | CConst _ => pending | CInd _ => pending
+        | CConstruct _ _ _ => pending | CStrLit _ _ => pending | CStrBytes _ _ => pending
+        end
+    | ErasureExpansionTerms definitions depth copies terms => match terms with
+        | Nil => pending
+        | Cons term rest => Cons ErasureExpansionWork (ErasureExpansionTerm definitions depth copies term)
+            (Cons ErasureExpansionWork (ErasureExpansionTerms definitions depth copies rest) pending)
+        end
+    | ErasureExpansionLookup definitions remaining copies => match definitions with
+        | Nil => pending
+        | Cons definition rest => match remaining with
+            | S next => Cons ErasureExpansionWork (ErasureExpansionLookup rest next copies) pending
+            | Z => match definition with
+                | Nothing => pending
+                | Just value => Cons ErasureExpansionWork (ErasureExpansionTerm rest 0 (S copies) value) pending
+                end
+            end
+        end
+    | ErasureExpansionContext definitions context => match context with
+        | Nil => pending
+        | Cons annotation rest => Cons ErasureExpansionWork (ErasureExpansionTerm definitions 0 0 annotation)
+            (Cons ErasureExpansionWork
+              (ErasureExpansionContext (match definitions with | Nil => Nil (Maybe CoreTerm)
+                | Cons _ tail => tail end) rest) pending)
+        end
+    end;
+
+def erasure_expansion_cost (work : ErasureExpansionWork) : Nat :=
+    match work with
+    | ErasureExpansionTerm _ _ copies _ => S copies
+    | ErasureExpansionTerms _ _ copies _ => S copies
+    | ErasureExpansionLookup _ _ _ => 1 | ErasureExpansionContext _ _ => 1
+    end;
+
+def erasure_expansion_batch : Nat -> Nat -> List ErasureExpansionWork
+    -> CheckResult (Pair Nat (List ErasureExpansionWork)) :=
+  fix visit (batch : Nat) (fuel : Nat) (pending : List ErasureExpansionWork)
+      : CheckResult (Pair Nat (List ErasureExpansionWork)) :=
+    match pending with
+    | Nil => CheckOk (Pair Nat (List ErasureExpansionWork)) (MkPair Nat (List ErasureExpansionWork) fuel pending)
+    | Cons work rest => match batch with
+        | Z => CheckOk (Pair Nat (List ErasureExpansionWork)) (MkPair Nat (List ErasureExpansionWork) fuel pending)
+        | S next => let cost : Nat := erasure_expansion_cost work in
+            match compiler_le_nat cost fuel with
+            | False => CheckErr (Pair Nat (List ErasureExpansionWork)) CheckResourceLimit
+            | True => visit next (sub fuel cost) (erasure_expansion_children work rest)
+            end
+        end
+    end;
+
+def erasure_expansion_within (fuel : Nat) (pending : List ErasureExpansionWork) : Bool :=
+    let budget : Nat := match compiler_le_nat fuel checker_input_work_limit with
+      | True => fuel | False => checker_input_work_limit end in
+    (fix batches (guard : Nat) (remaining : Nat) (work : List ErasureExpansionWork) : Bool :=
+      match erasure_expansion_batch fuel1k remaining work with
+      | CheckErr _ => False
+      | CheckOk progress => match progress with | MkPair left rest => match rest with
+          | Nil => True | Cons _ _ => match guard with
+              | Z => False | S next => batches next left rest end
+          end end
+      end) budget budget pending;
+
+def erasure_expand_variable
+    (expand : List (Maybe CoreTerm) -> Nat -> CoreTerm -> CheckResult CoreTerm)
+    (definitions : List (Maybe CoreTerm)) (depth : Nat) (index : Nat) : CheckResult CoreTerm :=
+    match compiler_le_nat depth index with
+    | False => CheckOk CoreTerm (CRel index)
+    | True =>
+        let age : Nat := sub index depth in
+        (fix find (rest : List (Maybe CoreTerm)) (remaining : Nat) : CheckResult CoreTerm :=
+          match rest with
+          | Nil => CheckOk CoreTerm (CRel index)
+          | Cons definition tail => match remaining with
+              | S next => find tail next
+              | Z => match definition with
+                  | Nothing => CheckOk CoreTerm (CRel index)
+                  | Just value => check_map CoreTerm CoreTerm
+                      (fun (expanded : CoreTerm) => lift (add depth (S age)) expanded)
+                      (expand tail 0 value)
+                  end
+              end
+          end) definitions age
+    end;
+
+def erasure_expand_worker : Nat -> List (Maybe CoreTerm) -> Nat -> CoreTerm -> CheckResult CoreTerm :=
+  fix expand (fuel : Nat) (definitions : List (Maybe CoreTerm)) (depth : Nat)
+      (term : CoreTerm) : CheckResult CoreTerm :=
+    match fuel with
+    | Z => CheckErr CoreTerm CheckResourceLimit
+    | S next =>
+        let child (value : CoreTerm) : CheckResult CoreTerm := expand next definitions depth value in
+        let bound (value : CoreTerm) : CheckResult CoreTerm := expand next definitions (S depth) value in
+        let pair (make : CoreTerm -> CoreTerm -> CoreTerm) (left : CoreTerm)
+            (right : CheckResult CoreTerm) : CheckResult CoreTerm :=
+          check_bind CoreTerm CoreTerm (child left)
+            (fun (first : CoreTerm) => check_map(CoreTerm, CoreTerm, make first, right)) in
+        match term with
+        | CRel index => erasure_expand_variable
+            (fun (rest : List (Maybe CoreTerm)) (inside : Nat) (value : CoreTerm) => expand next rest inside value)
+            definitions depth index
+        | CSort _ => CheckOk CoreTerm term | CConst _ => CheckOk CoreTerm term
+        | CInd _ => CheckOk CoreTerm term | CConstruct _ _ _ => CheckOk CoreTerm term
+        | CStrLit _ _ => CheckOk CoreTerm term | CStrBytes _ _ => CheckOk CoreTerm term
+        | CPi domain body => pair (fun (first : CoreTerm) (second : CoreTerm) => CPi first second) domain (bound body)
+        | CLam annotation body => pair (fun (first : CoreTerm) (second : CoreTerm) => CLam first second) annotation (bound body)
+        | CApp function argument => pair (fun (first : CoreTerm) (second : CoreTerm) => CApp first second) function (child argument)
+        | CLetIn value annotation body => check_bind CoreTerm CoreTerm (child value)
+            (fun (expanded : CoreTerm) => pair
+              (fun (typ : CoreTerm) (result : CoreTerm) => CLetIn expanded typ result) annotation (bound body))
+        | CFix name argument arity annotation body => pair
+            (fun (typ : CoreTerm) (result : CoreTerm) => CFix name argument arity typ result) annotation (bound body)
+        | CCase info predicate scrutinee branches => check_bind CoreTerm CoreTerm (child predicate)
+            (fun (motive : CoreTerm) => check_bind CoreTerm CoreTerm (child scrutinee)
+              (fun (value : CoreTerm) => check_map (List CoreTerm) CoreTerm
+                (fun (bodies : List CoreTerm) => CCase info motive value bodies)
+                ((fix visit (rest : List CoreTerm) : CheckResult (List CoreTerm) :=
+                  match rest with
+                  | Nil => CheckOk(List CoreTerm, Nil CoreTerm)
+                  | Cons branch tail => check_bind CoreTerm (List CoreTerm) (child branch)
+                      (fun (head : CoreTerm) => check_map(List CoreTerm, List CoreTerm,
+                        fun (remaining : List CoreTerm) => Cons CoreTerm head remaining, visit tail))
+                  end) branches)))
+        end
+    end;
+
+def erasure_expand (fuel : Nat) (definitions : List (Maybe CoreTerm))
+    (term : CoreTerm) : CheckResult CoreTerm :=
+    match erasure_expansion_within fuel [ErasureExpansionTerm definitions 0 0 term] with
+    | False => CheckErr CoreTerm CheckResourceLimit
+    | True => erasure_expand_worker fuel definitions 0 term
+    end;
+
 def erasure_normal_indexed (fuel : Nat) (environment : CheckEnvironment)
-    (scope : RefineScope) (term : CoreTerm) : CheckResult CoreTerm :=
-    check_from_normalize(CoreTerm,
-      whnf_checked_indexed fuel environment (refine_scope_expand scope term));
+    (scope : ErasureScope) (term : CoreTerm) : CheckResult CoreTerm :=
+    check_bind CoreTerm CoreTerm (check_from_normalize(CoreTerm,
+      whnf_checked_indexed fuel environment term))
+      (fun (head : CoreTerm) =>
+        let expand (_ : Unit) : CheckResult CoreTerm :=
+          match scope with | MkErasureScope _ definitions =>
+            check_bind CoreTerm CoreTerm (erasure_expand fuel definitions head)
+              (fun (expanded : CoreTerm) => check_from_normalize(CoreTerm,
+                whnf_checked_indexed fuel environment expanded)) end in
+        match head with
+        | CRel _ => expand MkUnit | CApp _ _ => expand MkUnit
+        | CLetIn _ _ _ => expand MkUnit | CCase _ _ _ _ => expand MkUnit
+        | CFix _ _ _ _ _ => expand MkUnit
+        | CSort _ => CheckOk CoreTerm head | CPi _ _ => CheckOk CoreTerm head
+        | CLam _ _ => CheckOk CoreTerm head | CConst _ => CheckOk CoreTerm head
+        | CInd _ => CheckOk CoreTerm head | CConstruct _ _ _ => CheckOk CoreTerm head
+        | CStrLit _ _ => CheckOk CoreTerm head | CStrBytes _ _ => CheckOk CoreTerm head
+        end);
+
+def erasure_expand_context (fuel : Nat) : List CoreTerm -> List (Maybe CoreTerm) -> CheckResult (List CoreTerm) :=
+  fix visit (context : List CoreTerm) (definitions : List (Maybe CoreTerm)) : CheckResult (List CoreTerm) :=
+    match context with
+    | Nil => CheckOk (List CoreTerm) (Nil CoreTerm)
+    | Cons annotation rest => check_bind CoreTerm (List CoreTerm)
+        (erasure_expand_worker fuel definitions 0 annotation)
+        (fun (expanded : CoreTerm) => check_map (List CoreTerm) (List CoreTerm)
+          (fun (remaining : List CoreTerm) => Cons CoreTerm expanded remaining)
+          (visit rest (match definitions with | Nil => Nil (Maybe CoreTerm) | Cons _ tail => tail end)))
+    end;
+
+def erasure_infer_expanded_indexed (fuel : Nat) (environment : CheckEnvironment)
+    (scope : ErasureScope) (term : CoreTerm) : CheckResult CoreTerm :=
+    match scope with | MkErasureScope refined definitions =>
+      let context : List CoreTerm := refine_scope_context refined in
+      match erasure_expansion_within fuel
+        [ErasureExpansionTerm definitions 0 0 term, ErasureExpansionContext definitions context] with
+      | False => CheckErr CoreTerm CheckResourceLimit
+      | True => check_bind CoreTerm CoreTerm (erasure_expand_worker fuel definitions 0 term)
+          (fun (expanded : CoreTerm) => check_bind (List CoreTerm) CoreTerm
+            (erasure_expand_context fuel context definitions)
+            (fun (expanded_context : List CoreTerm) =>
+              infer_checked_worker fuel environment expanded_context (IGTerm expanded)))
+      end end;
+
+def erasure_infer_indexed (fuel : Nat) (environment : CheckEnvironment)
+    (scope : ErasureScope) (term : CoreTerm) : CheckResult CoreTerm :=
+    let result : CheckResult CoreTerm :=
+      refine_scope_infer_indexed fuel environment (erasure_scope_refine scope) term in
+    match result with
+    | CheckOk _ => result
+    | CheckErr failure => match failure with
+        | CheckTypeFailure _ => erasure_infer_expanded_indexed fuel environment scope term
+        | CheckMalformedCore _ => result | CheckReductionFailure _ => result
+        | CheckResourceLimit => result | CheckUnsupported _ => result | CheckCancelled => result
+        | CheckInternalFailure _ => result | CheckPrimitiveFailure _ => result
+        end
+    end;
 
 def erasure_annotation_normal_indexed (fuel : Nat) (environment : CheckEnvironment)
-    (scope : RefineScope) (annotation : CoreTerm) : CheckResult CoreTerm :=
+    (scope : ErasureScope) (annotation : CoreTerm) : CheckResult CoreTerm :=
     check_map CoreTerm CoreTerm
       (fun (normal : CoreTerm) => match is_sort_ann normal with
         | True => normal | False => annotation end)
       (erasure_normal_indexed fuel environment scope annotation);
 
 def erasure_annotation_indexed (fuel : Nat) (environment : CheckEnvironment)
-    (scope : RefineScope) (annotation : CoreTerm) : CheckResult CoreTerm :=
+    (scope : ErasureScope) (annotation : CoreTerm) : CheckResult CoreTerm :=
     match annotation with
     | CSort _ => CheckOk CoreTerm annotation
     | CInd _ => CheckOk CoreTerm annotation
@@ -57,14 +291,14 @@ def erasure_data_result : CoreTerm -> Bool :=
     | CStrLit _ _ => False | CStrBytes _ _ => False
     end;
 
-def erasure_computed_head (environment : CheckEnvironment) (scope : RefineScope)
+def erasure_computed_head (environment : CheckEnvironment) (scope : ErasureScope)
     : CoreTerm -> Bool :=
   fix computed (term : CoreTerm) : Bool :=
     match term with
     | CApp function _ => computed function
     | CConst name => match check_environment_type name environment with
         | Nothing => True | Just annotation => notb (erasure_data_result annotation) end
-    | CRel index => match lookup_ctx (refine_scope_context scope) index with
+    | CRel index => match lookup_ctx (refine_scope_context (erasure_scope_refine scope)) index with
         | Nothing => True | Just annotation => notb (erasure_data_result annotation) end
     | CLam _ _ => True | CLetIn _ _ _ => True | CCase _ _ _ _ => True
     | CFix _ _ _ annotation _ => notb (erasure_data_result annotation)
@@ -72,7 +306,7 @@ def erasure_computed_head (environment : CheckEnvironment) (scope : RefineScope)
     | CConstruct _ _ _ => False | CStrLit _ _ => False | CStrBytes _ _ => False
     end;
 
-def erasure_computed_argument (environment : CheckEnvironment) (scope : RefineScope)
+def erasure_computed_argument (environment : CheckEnvironment) (scope : ErasureScope)
     (argument : CoreTerm) : Bool :=
     match argument with
     | CApp function _ => erasure_computed_head environment scope function
@@ -84,14 +318,14 @@ def erasure_computed_argument (environment : CheckEnvironment) (scope : RefineSc
     end;
 
 def erasure_argument_indexed (fuel : Nat) (environment : CheckEnvironment)
-    (types : List Nat) (scope : RefineScope) (binders : List BEntry)
+    (types : List Nat) (scope : ErasureScope) (binders : List BEntry)
     (argument : CoreTerm) : CheckResult CoreTerm :=
     match is_type_arg_ctx_with types argument binders with
     | True => CheckOk CoreTerm argument
     | False => match erasure_computed_argument environment scope argument with
         | False => CheckOk CoreTerm argument
         | True => check_bind CoreTerm CoreTerm
-            (refine_scope_infer_indexed fuel environment scope argument)
+            (erasure_infer_indexed fuel environment scope argument)
             (fun (annotation : CoreTerm) => check_bind CoreTerm CoreTerm
               (erasure_normal_indexed fuel environment scope annotation)
               (fun (normal_type : CoreTerm) => match is_sort_ann normal_type with
@@ -107,8 +341,8 @@ def erasure_argument_indexed (fuel : Nat) (environment : CheckEnvironment)
     end;
 
 def erasure_prepare_indexed (environment : CheckEnvironment) (types : List Nat)
-    : Nat -> RefineScope -> List BEntry -> CoreTerm -> CheckResult CoreTerm :=
-  fix prepare (fuel : Nat) (scope : RefineScope) (binders : List BEntry)
+    : Nat -> ErasureScope -> List BEntry -> CoreTerm -> CheckResult CoreTerm :=
+  fix prepare (fuel : Nat) (scope : ErasureScope) (binders : List BEntry)
       (term : CoreTerm) : CheckResult CoreTerm :=
     match fuel with
     | Z => CheckErr CoreTerm CheckResourceLimit
@@ -118,7 +352,7 @@ def erasure_prepare_indexed (environment : CheckEnvironment) (types : List Nat)
           erasure_annotation_indexed next environment scope in
         let assume (original : CoreTerm) (normal : CoreTerm) (body : CoreTerm)
             : CheckResult CoreTerm :=
-          prepare next (refine_scope_assume scope original)
+          prepare next (erasure_scope_assume scope original)
             (Cons BEntry (MkB 0 (is_sort_ann normal)) binders) body in
         match term with
         | CRel _ => CheckOk CoreTerm term | CSort _ => CheckOk CoreTerm term
@@ -139,11 +373,11 @@ def erasure_prepare_indexed (environment : CheckEnvironment) (types : List Nat)
             (fun (normal : CoreTerm) => check_bind CoreTerm CoreTerm (child value)
               (fun (prepared_value : CoreTerm) => check_map(CoreTerm, CoreTerm,
                 fun (prepared_body : CoreTerm) => CLetIn prepared_value normal prepared_body,
-                prepare next (refine_scope_define scope typ value)
+                prepare next (erasure_scope_define scope typ value)
                   (Cons BEntry (MkB 0 (is_sort_ann normal)) binders) body)))
         | CFix name argument arity typ body => check_map(CoreTerm, CoreTerm,
             fun (prepared : CoreTerm) => CFix name argument arity typ prepared,
-            prepare next (refine_scope_assume scope typ)
+            prepare next (erasure_scope_assume scope typ)
               (Cons BEntry (MkB 0 False) binders) body)
         | CCase info predicate scrutinee branches => check_bind CoreTerm CoreTerm (child scrutinee)
             (fun (prepared_scrutinee : CoreTerm) => check_map (List CoreTerm) CoreTerm
@@ -161,4 +395,4 @@ def erasure_prepare_indexed (environment : CheckEnvironment) (types : List Nat)
 def erasure_prepare_closed_indexed (fuel : Nat) (environment : CheckEnvironment)
     (types : List Nat) (term : CoreTerm) : CheckResult CoreTerm :=
     erasure_prepare_indexed environment types fuel
-      (refine_scope_from_context (Nil CoreTerm)) (Nil BEntry) term;
+      (MkErasureScope (refine_scope_from_context (Nil CoreTerm)) (Nil (Maybe CoreTerm))) (Nil BEntry) term;

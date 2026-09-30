@@ -80,6 +80,10 @@ PASS checked erasure retains let computed data arguments
 PASS checked erasure retains polymorphic functions as values
 PASS checked erasure reports exhausted preparation
 PASS checked erasure reports an unsupported residual type computation
+PASS checked erasure resolves type cases controlled by local data
+PASS checked erasure keeps repeated runtime lets without expansion
+PASS checked erasure drops repeated type lets without expansion
+PASS checked erasure bounds deferred type expansion
 COMPILER_ABI: PASS
 """
 PROBE = '''import "std/data.ouro";
