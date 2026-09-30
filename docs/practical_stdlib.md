@@ -133,6 +133,8 @@ with a standalone prelude must use the registered `ouro.string` type instead
 of an opaque `axiom String : Type;`; import `std/string.ouro` for the standard
 declarations. String lengths and offsets count bytes. See
 [the syntax contract](syntax.md#numbers-and-strings) for literal checking.
+`str_index_from` returns `Nothing` when its starting offset exceeds the byte
+length; an empty pattern can match exactly at the end of the string.
 
 The experimental Windows native backend implements these pure String
 intrinsics with byte-preserving managed storage, including embedded NUL.
