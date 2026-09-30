@@ -89,5 +89,5 @@ is useful when it is reproducible and changes the project direction honestly.
   Measure useful workloads and finish the Windows vertical slice before adding
   platforms or speculative backend frameworks.
 
-Progress is reflected in releases and the changelog. Completed engineering
+Progress is reflected in [GitHub releases](https://github.com/eluvane/ouro/releases). Completed engineering
 history remains in Git rather than accumulating in this document.

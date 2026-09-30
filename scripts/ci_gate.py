@@ -136,7 +136,7 @@ PROFILE_GROUPS = {
 SHA40 = re.compile(r"[0-9a-fA-F]{40}\Z")
 EDITOR_PREFIX = "editors/vscode/"
 SITE_PREFIX = "site/"
-DOCS_PATHS = {"README.md", "CHANGELOG.md", "CONTRIBUTING.md"}
+DOCS_PATHS = {"README.md", "CONTRIBUTING.md"}
 FULL_DOCS_PATHS = {
     "docs/architecture.md", "docs/build.md", "docs/ci.md", "docs/design.md",
     "docs/kernel_design.md", "docs/releasing.md", "docs/roadmap.md", "docs/tcb.md",
@@ -857,7 +857,7 @@ def run_self_tests(all_gates: Sequence[Gate]) -> int:
 
     docs_cases = (
         (("README.md",), (False, True)),
-        (("CHANGELOG.md", "CONTRIBUTING.md"), (False, True)),
+        (("README.md", "CONTRIBUTING.md"), (False, True)),
         (("docs/getting_started.md",), (False, True)),
         (("docs/getting_started.md", "tools/fmt.ouro"), (True, True)),
         (("docs/getting_started.md", "editors/vscode/src/extension.ts", "site/src/main.ts"), (False, True)),

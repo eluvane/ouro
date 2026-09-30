@@ -11,7 +11,7 @@ from ourosmith import ROOT
 from ourosmith.host import job_count
 
 INPUTS = ("lib", "scripts", "compiler", "runtime", "tests", "std", "tools", "quality", "test", ".github",
-          "docs", "README.md", "CHANGELOG.md", "CONTRIBUTING.md", "Ouro.seal", "dune", "dune-project", "ouro.opam")
+          "docs", "README.md", "CONTRIBUTING.md", "Ouro.seal", "dune", "dune-project", "ouro.opam")
 EXTENSIONS = {".ouro", ".ml", ".mli", ".py", ".sh", ".c", ".h", ".json", ".toml", ".seal", ".opam",
               ".yml", ".yaml", ".tsv", ".txt", ".in", ".golden", ".md", ".sha256"}
 

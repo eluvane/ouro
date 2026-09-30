@@ -142,7 +142,7 @@ CI gates protecting them. Apply the [TCB contract](docs/tcb.md).
 - Mark experimental/pre-1.0 limits honestly. Do not write pass-history stories,
   AI work narratives, private reasoning, stale promises, or unsupported claims
   such as production-ready, fully safe, or guaranteed correct.
-- Follow [compatibility and changelog policy](CONTRIBUTING.md#documentation-and-compatibility)
+- Follow [compatibility policy](CONTRIBUTING.md#documentation-and-compatibility)
   for user-visible changes. Update existing API/module docs with their interfaces.
 
 ## Commands and validation policy

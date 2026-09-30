@@ -60,4 +60,4 @@ change kernel semantics.
 
 The decision is covered by the quality fixture manifest, strict firewall,
 analyzer and lint suites, [Quality tools](../quality.md),
-[Surface syntax](../syntax.md), and the changelog.
+and [Surface syntax](../syntax.md).

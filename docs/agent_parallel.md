@@ -44,7 +44,7 @@ ready backlog, with exact files rather than whole directories. A free filename
 does not make a task independent when it consumes a changing shared contract.
 
 Each task gets its own branch from refreshed `main` and one reason to exist.
-Shared metadata such as `CHANGELOG.md`, API indexes, registries, and generated
+Shared metadata such as API indexes, registries, and generated
 outputs has one writer at a time. Required metadata stays in the same PR as the
 behavior; serialize that final edit and review instead of making a later
 umbrella PR.

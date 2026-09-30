@@ -197,7 +197,7 @@ required individual `PR (...)` and `Portable (...)` contexts in hosted branch
 rules with `Kernel`; those matrix contexts do not exist when the matrix is
 skipped. Editing the script does not apply hosted settings.
 
-Changes confined to `README.md`, `CHANGELOG.md`, `CONTRIBUTING.md`, or ordinary
+Changes confined to `README.md`, `CONTRIBUTING.md`, or ordinary
 Markdown under `docs/` use the `docs` profile: workflow/project policy, API
 baseline drift, documentation suite, and documentation examples. Editor and
 site changes keep their own checks when combined with docs. Generated API

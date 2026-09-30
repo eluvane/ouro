@@ -29,10 +29,10 @@ host tools, timeouts, and resource limits as unavailable.
 
 ## Documentation and compatibility
 
-A user-visible change updates its tests or fixtures, canonical documentation,
-and the `[Unreleased]` section of `CHANGELOG.md` in the same pull request.
-Released sections stay frozen except for factual corrections. Breaking changes
-need migration guidance; see [Stability](docs/stability.md).
+A user-visible change updates its tests or fixtures and canonical documentation
+in the same pull request. Describe the resulting behavior in the PR so it can
+appear in GitHub release notes. Breaking changes need migration guidance; see
+[Stability](docs/stability.md).
 
 ## Generated artifacts
 
