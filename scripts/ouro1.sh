@@ -894,7 +894,7 @@ EOF
 		# sends resolve the way the client meant them.
 		shift
 		BIN="$C_BUILD_DIR/ouro-lsp"
-		if [ ! -x "$BIN" ] || [ -n "$(find "$ROOT/tools/lsp.ouro" "$ROOT/tools/lsp_model.ouro" "$ROOT/tools/doc.ouro" "$ROOT/tools/doc_model.ouro" \
+		if [ ! -x "$BIN" ] || [ -n "$(find "$ROOT/tools/lsp.ouro" "$ROOT/tools/lsp_model.ouro" "$ROOT/tools/lsp_text_encoding.ouro" "$ROOT/tools/doc.ouro" "$ROOT/tools/doc_model.ouro" \
 			-newer "$BIN" -print -quit 2>/dev/null)" ]; then
 			sh "$ROOT/scripts/build_tool.sh" tools/lsp.ouro "$BIN" >&2
 		fi

@@ -204,6 +204,7 @@ PR_PATH_GATES = {
     "tests/pkg_scanner_tests.ouro": ("pkg",),
     "tools/lsp.ouro": ("lsp",),
     "tools/lsp_model.ouro": ("lsp",),
+    "tools/lsp_text_encoding.ouro": ("lsp",),
     "tools/lsp_process_model.ouro": ("lsp",),
     "tools/doc.ouro": ("doc", "lsp"),
     "tools/doc_model.ouro": ("doc", "lsp"),

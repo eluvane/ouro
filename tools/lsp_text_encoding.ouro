@@ -1,0 +1,174 @@
+import "../std/stringx.ouro",
+  "../std/pathx.ouro",
+  "../compiler/source_text.ouro";
+
+-- URIs. Only file: URIs are supported; percent escapes are decoded because
+-- editors send drive letters as %3A.
+def uri_hex (c : Nat) : Nat :=
+    match is_digit c with
+    | True => sub c ch_zero
+    | False =>
+        match is_upper c with
+        | True => add(sub c ch_A, 10)
+        | False => add(sub c ch_a, 10)
+        end
+    end;
+
+def uri_decode_codes : Nat -> List Nat -> List Nat :=
+  fix uri_decode_codes (fuel : Nat) (cs : List Nat) : List Nat :=
+    match fuel with
+    | Z => cs
+    | S fuel2 =>
+        match cs with
+        | Nil => Nil Nat
+        | Cons c rest =>
+            match eq_nat c ch_percent with
+            | False => Cons Nat c (uri_decode_codes fuel2 rest)
+            | True =>
+                match rest with
+                | Nil => ([c] : List Nat)
+                | Cons h1 rest2 =>
+                    match rest2 with
+                    | Nil => ([c, h1] : List Nat)
+                    | Cons h2 rest3 =>
+                        Cons Nat (add(mul(uri_hex h1, 16), uri_hex h2))
+                          (uri_decode_codes fuel2 rest3)
+                    end
+                end
+            end
+        end
+    end;
+
+def uri_decode (s : String) : String :=
+    str_of_codes (uri_decode_codes(S (str_len s), str_codes s));
+
+-- Percent escapes must be complete hexadecimal bytes.  NUL is rejected
+-- because host filesystem APIs interpret it as a terminator rather than as a
+-- path byte.
+def uri_codes_valid : List Nat -> Bool :=
+  fix uri_codes_valid (cs : List Nat) : Bool :=
+    match cs with
+    | Nil => True
+    | Cons c rest =>
+        match eq_nat c ch_percent with
+        | False => andb(notb (eq_nat c Z), uri_codes_valid rest)
+        | True =>
+            match rest with
+            | Nil => False
+            | Cons h1 rest2 =>
+                match rest2 with
+                | Nil => False
+                | Cons h2 rest3 =>
+                    andb (andb(is_hex h1, is_hex h2))
+                      (andb
+                        (notb (eq_nat(add(mul(uri_hex h1, 16), uri_hex h2), Z)))
+                        (uri_codes_valid rest3))
+                end
+            end
+        end
+    end;
+
+def uri_windows_drive_path (p : String) : String :=
+    match andb(str_starts p "/", path_has_drive (str_drop(p, S Z))) with
+    | True => str_drop(p, S Z)
+    | False => p
+    end;
+
+def uri_file_path (uri : String) : Maybe String :=
+    match str_strip_prefix uri "file://" with
+    | Nothing => Nothing String
+    | Just rest =>
+        match andb (uri_codes_valid (str_codes rest))
+          (andb (notb (str_contains rest "#"))
+            (notb (str_contains rest "?"))) with
+        | False => Nothing String
+        | True =>
+            let path : String := uri_windows_drive_path (uri_decode rest) in
+            match path_is_abs path with
+            | True => Just(String, path_normalize path)
+            | False => Nothing String
+            end
+        end
+    end;
+
+def uri_path_byte (byte : Nat) : String :=
+    match orb(is_alnum byte,
+      elem Nat eq_nat byte ([45, 46, 95, 126, 47, 58] : List Nat)) with
+    | True => str_of_codes [byte]
+    | False =>
+        let high : Nat := div_nat byte 16 in
+        str_cat3 "%" (str_slice "0123456789ABCDEF" high 1)
+          (str_slice "0123456789ABCDEF" (sub(byte, mul high 16)) 1)
+    end;
+
+def path_to_uri (path : String) : String :=
+    let normalized : String := path_from_host path in
+    let encoded : String := str_join ""
+      (map Nat String uri_path_byte (str_codes normalized)) in
+    match str_starts normalized "/" with
+    | True => str_concat "file://" encoded
+    | False => str_cat3 "file://" "/" encoded
+    end;
+
+-- LSP defaults to UTF-16 columns; Ouro source offsets remain UTF-8 bytes.
+def lsp_scalar_utf16_width (scalar : Nat) : Nat :=
+    match ltb_nat(scalar, mul 256 256) with
+    | True => 1
+    | False => 2
+    end;
+
+def lsp_byte_column (source_line : String) (character : Nat) : Maybe Nat :=
+    (fix byte_column (fuel : Nat) (codes : List Nat) (left : Nat)
+        (offset : Nat) : Maybe Nat :=
+      match fuel with
+      | Z => Nothing Nat
+      | S fuel2 => match left with
+        | Z => Just Nat offset
+        | S _ => match codes with
+          | Nil => Just Nat offset
+          | Cons _ _ => match source_take_scalar codes with
+            | Nothing => Nothing Nat
+            | Just parsed => match parsed with
+              | MkPair scalar rest =>
+                  let width : Nat := lsp_scalar_utf16_width scalar in
+                  match ltb_nat left width with
+                  | True => Just Nat offset
+                  | False => byte_column fuel2 rest (sub left width)
+                      (add(offset, length Nat (utf8_scalar_bytes scalar)))
+                  end
+              end
+            end
+          end
+        end
+      end) (S (str_len source_line)) (str_codes source_line) character Z;
+
+def lsp_utf16_column (source_line : String) (column : Nat)
+    (round_up : Bool) : Maybe Nat :=
+    (fix utf16_column (fuel : Nat) (codes : List Nat) (left : Nat)
+        (offset : Nat) : Maybe Nat :=
+      match fuel with
+      | Z => Nothing Nat
+      | S fuel2 => match left with
+        | Z => Just Nat offset
+        | S _ => match codes with
+          | Nil => Just Nat offset
+          | Cons _ _ => match source_take_scalar codes with
+            | Nothing => Nothing Nat
+            | Just parsed => match parsed with
+              | MkPair scalar rest =>
+                  let bytes : Nat := length Nat (utf8_scalar_bytes scalar) in
+                  let width : Nat := lsp_scalar_utf16_width scalar in
+                  match ltb_nat left bytes with
+                  | True => Just Nat (match round_up with
+                      | True => add offset width
+                      | False => offset
+                      end)
+                  | False => utf16_column fuel2 rest (sub left bytes)
+                      (add offset width)
+                  end
+              end
+            end
+          end
+        end
+      end) (S (str_len source_line)) (str_codes source_line) column Z;
+
