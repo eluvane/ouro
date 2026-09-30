@@ -63,7 +63,10 @@ def lsp_send (j : Json) : IO Unit :=
        flush
 
 def lsp_reply (msg : Json) (result : Json) : IO Unit :=
-    lsp_send (rpc_result(rpc_id msg, result));
+    match lsp_message_is_notification msg with
+    | True => io_unit
+    | False => lsp_send (rpc_result(rpc_id msg, result))
+    end;
 
 def lsp_keep (st : Lsp) : IO (Pair Lsp Bool) :=
     io_pure(Pair Lsp Bool, MkPair Lsp Bool st True);
@@ -165,7 +168,7 @@ def lsp_scratch (root : String) : IO String :=
        end
 
 -- Diagnostics invoke the shipped checker after workspace path authorization.
-def lsp_publish (root : String) (uri : String) : IO Unit :=
+def lsp_publish (root : String) (uri : String) (text : String) : IO Unit :=
     do let! authorized := lsp_document_path root uri;
        match authorized with
        | Nothing =>
@@ -174,7 +177,8 @@ def lsp_publish (root : String) (uri : String) : IO Unit :=
        | Just path =>
            do let! result := native_sibling_run lsp_check_process_limits "coil.exe" (native_sibling_check_args path);
               lsp_send (rpc_notify "textDocument/publishDiagnostics"
-                (publish_params(uri, lsp_process_diagnostics path result)))
+                (publish_params(uri, lsp_diagnostics_utf16 text
+                  (lsp_process_diagnostics path result))))
        end
 
 def lsp_rewrite_import_path (root : String) (origin : String) (token : FxTok)
@@ -229,7 +233,8 @@ def lsp_publish_buf_run (uri : String) (text : String) (scratch : String) : IO U
            do let! result := native_sibling_run lsp_check_process_limits "coil.exe" (native_sibling_check_args scratch);
               fs_remove scratch;
               lsp_send (rpc_notify "textDocument/publishDiagnostics"
-                (publish_params(uri, lsp_process_diagnostics scratch result)))
+                (publish_params(uri, lsp_diagnostics_utf16 text
+                  (lsp_process_diagnostics scratch result))))
        end
 
 def lsp_publish_buf (root : String) (uri : String) (origin : String)
@@ -380,7 +385,7 @@ def on_did_change (st : Lsp) (msg : Json) : IO (Pair Lsp Bool) :=
 
 def on_did_save (st : Lsp) (msg : Json) : IO (Pair Lsp Bool) :=
     let uri : String := lsp_doc_uri (rpc_params msg) in
-    do lsp_publish(lsp_root st, uri);
+    do lsp_publish(lsp_root st, uri, lsp_text st uri);
        lsp_keep st
 
 def on_did_close (st : Lsp) (msg : Json) : IO (Pair Lsp Bool) :=
@@ -517,7 +522,7 @@ def on_watched_files (st : Lsp) (_msg : Json) : IO (Pair Lsp Bool) :=
        lsp_keep st
 
 def on_unknown (st : Lsp) (msg : Json) : IO (Pair Lsp Bool) :=
-    match rpc_is_notification msg with
+    match lsp_message_is_notification msg with
     | True => lsp_keep st
     | False =>
         do lsp_send (rpc_error (rpc_id msg) rpc_err_method_not_found
@@ -610,7 +615,13 @@ def lsp_handle_body (st : Lsp) (body : String) : IO (Pair Lsp Bool) :=
     | Nothing =>
         do lsp_send (rpc_error JNull rpc_err_parse "invalid JSON");
            lsp_keep st
-    | Just msg => lsp_dispatch st msg
+    | Just msg => match lsp_message_valid msg with
+      | True => lsp_dispatch st msg
+      | False =>
+          do lsp_send (rpc_error (lsp_message_error_id msg)
+               rpc_err_invalid_request "invalid JSON-RPC request");
+             lsp_keep st
+      end
     end;
 
 def lsp_byte_span : Nat := 256;

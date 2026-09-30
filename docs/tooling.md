@@ -326,6 +326,12 @@ currently provides:
 - document formatting;
 - full-text document synchronization.
 
+Positions use UTF-16 code units, including after Unicode string contents;
+compiler byte columns are converted before publishing diagnostics. Definition
+and symbol URIs percent-encode path bytes so spaces, `%`, `#`, `?`, and Unicode
+retain their file identity. Malformed JSON-RPC request envelopes receive
+`Invalid Request` (`-32600`); valid notifications receive no response.
+
 Completion keeps name-prefix suggestions. In a direct top-level definition
 with a simple explicit result type, such as `def value : Choice := Re`, it also
 suggests matching nullary constructors from a local, non-parameterized

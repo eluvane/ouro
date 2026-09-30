@@ -217,6 +217,120 @@ want rename-edit "\"id\":6,\"result\":{\"changes\":{\"$SAMPLE_URI\""
 want rename-widget2 widget2
 want shutdown '"id":7,"result":null'
 
+"$PYTHON" - "$OUT/envelopes.in" <<'PY'
+import json, pathlib, sys
+messages = [
+    {"jsonrpc": "2.0", "id": 700, "method": "initialize", "params": {}},
+    None, 0, [],
+    {"jsonrpc": "1.0", "id": 701, "method": "initialize", "params": {}},
+    {"jsonrpc": "2.0", "id": [], "method": "initialize", "params": {}},
+    {"jsonrpc": "2.0", "id": 702, "method": False, "params": {}},
+    {"jsonrpc": "2.0", "id": None, "method": "unknown", "params": {}},
+    {"jsonrpc": "2.0", "method": "initialized", "params": {}},
+    {"jsonrpc": "2.0", "method": "unknown", "params": {}},
+    {"jsonrpc": "2.0", "method": "initialize", "params": {}},
+    {"jsonrpc": "2.0", "id": 703, "method": "shutdown", "params": {}},
+    {"jsonrpc": "2.0", "method": "exit"},
+]
+frames = []
+for message in messages:
+    body = json.dumps(message, separators=(",", ":")).encode("utf-8")
+    frames.append(f"Content-Length: {len(body)}\r\n\r\n".encode() + body)
+pathlib.Path(sys.argv[1]).write_bytes(b"".join(frames))
+PY
+set +e
+OURO_ROOT="$ROOT" "$LSP" <"$OUT/envelopes.in" >"$OUT/envelopes.out" 2>"$OUT/envelopes.err"
+envelope_status=$?
+set -e
+if [ "$envelope_status" -eq 0 ] && [ ! -s "$OUT/envelopes.err" ] &&
+	"$PYTHON" - "$OUT/envelopes.out" <<'PY'
+import pathlib, sys
+sys.path.insert(0, str(pathlib.Path("scripts").resolve()))
+from ourosmith.surface.tools import responses
+messages = responses(pathlib.Path(sys.argv[1]).read_bytes().decode("utf-8"))
+assert len(messages) == 9, messages
+assert messages[0]["id"] == 700 and "result" in messages[0], messages
+for message, request_id in zip(messages[1:7], [None, None, None, 701, None, 702]):
+    assert message["id"] == request_id and message["error"]["code"] == -32600, message
+assert messages[7]["id"] is None and messages[7]["error"]["code"] == -32601, messages
+assert messages[8]["id"] == 703 and messages[8]["result"] is None, messages
+PY
+then
+	ok "invalid envelopes rejected, notifications quiet, shutdown responsive"
+else
+	bad envelopes "status=$envelope_status or unexpected JSON-RPC response"
+fi
+
+"$PYTHON" - "$OUT" <<'PY'
+import json, pathlib, sys
+out = pathlib.Path(sys.argv[1]).resolve()
+document = out / "%41#unicode space.ouro"
+source = ('inductive Nat : Type := | Z : Nat | S : Nat -> Nat;\n'
+          'intrinsic String : Type := "ouro.string";\n'
+          'def target : Nat := Z;\n'
+          'def bmp : Nat := let literal : String := "雪" in target;\n'
+          'def astral : Nat := let literal : String := "😀" in target;\n')
+document.write_bytes(source.encode("utf-8"))
+uri = document.as_uri()
+lines = source.splitlines()
+messages = [
+    {"jsonrpc": "2.0", "id": 710, "method": "initialize", "params": {}},
+    {"jsonrpc": "2.0", "method": "textDocument/didOpen", "params": {
+        "textDocument": {"uri": uri, "languageId": "ouro", "version": 1, "text": source}}},
+]
+columns = {}
+for line, base in [(3, 711), (4, 715)]:
+    column = len(lines[line][:lines[line].index("target")].encode("utf-16-le")) // 2
+    columns[str(line)] = column
+    for offset, method in [(0, "hover"), (1, "definition"), (2, "prepareRename"), (3, "completion")]:
+        messages.append({"jsonrpc": "2.0", "id": base + offset, "method": "textDocument/" + method,
+                         "params": {"textDocument": {"uri": uri},
+                                    "position": {"line": line, "character": column + 3}}})
+messages.extend([
+    {"jsonrpc": "2.0", "id": 719, "method": "textDocument/documentSymbol",
+     "params": {"textDocument": {"uri": uri}}},
+    {"jsonrpc": "2.0", "method": "textDocument/didClose", "params": {"textDocument": {"uri": uri}}},
+    {"jsonrpc": "2.0", "id": 720, "method": "shutdown", "params": {}},
+    {"jsonrpc": "2.0", "method": "exit"},
+])
+frames = []
+for message in messages:
+    body = json.dumps(message, separators=(",", ":")).encode("utf-8")
+    frames.append(f"Content-Length: {len(body)}\r\n\r\n".encode() + body)
+(out / "unicode.in").write_bytes(b"".join(frames))
+(out / "unicode.expected.json").write_text(json.dumps({"uri": uri, "columns": columns}), encoding="utf-8")
+PY
+set +e
+OURO_ROOT="$ROOT" "$LSP" <"$OUT/unicode.in" >"$OUT/unicode.out" 2>"$OUT/unicode.err"
+unicode_status=$?
+set -e
+if [ "$unicode_status" -eq 0 ] && [ ! -s "$OUT/unicode.err" ] &&
+	"$PYTHON" - "$OUT/unicode.out" "$OUT/unicode.expected.json" <<'PY'
+import json, pathlib, sys
+sys.path.insert(0, str(pathlib.Path("scripts").resolve()))
+from ourosmith.surface.tools import responses
+messages = responses(pathlib.Path(sys.argv[1]).read_bytes().decode("utf-8"))
+expected = json.loads(pathlib.Path(sys.argv[2]).read_text(encoding="utf-8"))
+replies = {message["id"]: message for message in messages if "id" in message}
+assert replies[710]["result"]["capabilities"]["positionEncoding"] == "utf-16", replies[710]
+for line, base in [(3, 711), (4, 715)]:
+    assert "def target : Nat" in replies[base]["result"]["contents"]["value"], replies[base]
+    definition = replies[base + 1]["result"]
+    assert definition["uri"] == expected["uri"] and definition["range"]["start"]["line"] == 2, definition
+    rename = replies[base + 2]["result"]
+    column = expected["columns"][str(line)]
+    assert rename == {"start": {"line": line, "character": column},
+                      "end": {"line": line, "character": column + len("target")}}, rename
+    assert [item["label"] for item in replies[base + 3]["result"]] == ["target"], replies[base + 3]
+assert all(item["location"]["uri"] == expected["uri"] for item in replies[719]["result"]), replies[719]
+assert replies[720]["result"] is None, replies[720]
+PY
+then
+	ok "UTF-16 BMP/non-BMP lookup and encoded definition/symbol URIs"
+else
+	bad unicode-positions "status=$unicode_status or unexpected UTF-16/URI result"
+fi
+
 # The formatter must not leave the trailing blank it was asked to remove.
 if grep -q 'Z;   ' "$OUT/session.jsonl"; then
 	bad formatting "trailing whitespace survived"
