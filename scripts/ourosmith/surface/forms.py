@@ -14,11 +14,70 @@ def programs(seed):
 def result : Nat := match identity Bool {flag} with
   | True => identity Nat {n} | False => identity Nat {m} end;
 """, n if seed % 2 else m, False
+    yield "if-expression", PRELUDE + f"""representation Bool := "ouro.bool";
+def branch (flag : Bool) : Nat := if flag then {n} else {m};
+def result : Nat := add (branch True) (add (branch False) (branch False));
+""", n + 2 * m, False
+    yield "if-let-expression", PRELUDE + f"""inductive Choice : Type :=
+  | Empty : Choice
+  | Full : Nat -> Choice;
+def branch (choice : Choice) : Nat :=
+  if let Full value := choice then value else {m};
+def result : Nat := add (branch (Full {n})) (branch Empty);
+""", n + m, False
+    yield "if-let-effectful-once", PRELUDE + f"""inductive Choice : Type :=
+  | Empty : Choice
+  | Full : Nat -> Choice;
+effect Probe where
+  | fetch : Nat -> Choice
+def result : Nat :=
+  handle if let Full value := (perform fetch ({n}) : Choice)
+    then value else {m} with
+  | fetch (value) resume => resume (Full (S value))
+  | pure value => value
+  end;
+""", n + 1, True
+    yield "coalesce-value", PRELUDE + f"""inductive Choice (A : Type) : Type :=
+  | Empty : Choice A | Full : A -> Choice A;
+representation Choice := "ouro.maybe";
+def select (choice : Choice Nat) : Nat := choice ?? {m};
+def result : Nat := add (select (Full Nat {n})) (select (Empty Nat));
+""", n + m, False
+    yield "coalesce-lazy-fallback", PRELUDE + f"""inductive Choice (A : Type) : Type :=
+  | Empty : Choice A | Full : A -> Choice A;
+representation Choice := "ouro.maybe";
+effect Probe where | bump : Nat -> Nat
+def result : Nat :=
+  handle (Full Nat {n}) ?? perform bump({m}) with
+  | bump (value) resume => resume (S value)
+  | pure value => value
+  end;
+""", n, True
     text = f'handle perform ?goal{seed}\\"\n'
     yield "text-keywords", PRELUDE + f"""-- handle perform ?unresolved must remain comment text
 def message : String := {json.dumps(text)};
 def result : Nat := prim_string_length message;
 """, len(text.encode()), False
+    scalar = ("A", "é", "€", "😀")[seed % 4]
+    ordinal = ord(scalar)
+    escaped = "'\\u{" + format(ordinal, "X") + "}'"
+    # Compare wide values inside the program; the unary runtime printer is bounded.
+    # A known mismatch also rejects an equality helper that always returns True.
+    yield "character-scalar", PRELUDE + f"""def value' : Nat := '{scalar}';
+def same_nat : Nat -> Nat -> Bool :=
+  fix same (left : Nat) (right : Nat) : Bool :=
+    match left with
+    | Z => match right with | Z => True | S _ => False end
+    | S left' => match right with | Z => False | S right' => same left' right' end
+    end;
+def match_score (equal : Bool) : Nat :=
+  match equal with | True => 0 | False => 1 end;
+def result : Nat :=
+  add (add (match_score (same_nat value' {ordinal}))
+           (match_score (same_nat {escaped} {ordinal})))
+      (add (match_score (same_nat (add value' {escaped}) {2 * ordinal}))
+           (match same_nat {ordinal} {ordinal + 1} with | True => 1 | False => 0 end));
+""", 0, False
     # The foreign declaration is checked and preserved through formatting.
     # Its unrelated Nat result exercises ordinary execution, not the FFI call.
     yield "extern-declaration", PRELUDE + f"""intrinsic NativeWord : Type := "ouro.u32";
@@ -38,6 +97,9 @@ def result : Nat := {n};
 def front : Nat := {n};
 def back : Nat := {m};
 def result : Nat := combine(back :=, front :=);
+""", n + m, False
+    yield "trailing-lambda", PRELUDE + f"""def with_callback (value : Nat) (callback : Nat -> Nat) : Nat := callback value;
+def result : Nat := with_callback({n}) {{ value -> add value {m} }};
 """, n + m, False
     yield "large-elimination", PRELUDE + f"""def resultType (n : Nat) : Type :=
   match n with | Z => Nat | S _ => Nat end;
@@ -123,6 +185,14 @@ def result : Nat := size (Node (Cons Tree (Node children) (Cons Tree Leaf (Nil T
      io_pure Nat value
 def result : Nat := add (choose True) (choose False);
 """, n + m, False
+    yield "do-pure-let", PRELUDE + IDENTITY_IO + f"""def choose : IO Nat :=
+  do let first : Nat := {n};
+     io_pure Unit MkUnit;
+     let second : Nat := add first {m};
+     let! chosen := io_pure Nat second;
+     io_pure Nat (S chosen)
+def result : Nat := choose;
+""", n + m + 1, False
     yield "list", PRELUDE + f"""inductive List (A : Type) : Type := | Nil : List A | Cons : A -> List A -> List A;
 def length (A : Type) : List A -> Nat :=
   fix length (xs : List A) : Nat :=
@@ -130,6 +200,13 @@ def length (A : Type) : List A -> Nat :=
 def values : List Nat := [{', '.join(map(str, values))}{',' if values else ''}];
 def result : Nat := values |> length Nat;
 """, len(values), False
+    payload = "A" * (seed % 4 + 1)
+    yield "byte-string", PRELUDE + f"""inductive List (A : Type) : Type := | Nil : List A | Cons : A -> List A -> List A;
+def length (A : Type) : List A -> Nat :=
+  fix length (xs : List A) : Nat :=
+    match xs with | Nil => Z | Cons _ tail => S (length tail) end;
+def result : Nat := length Nat b"{payload}\\x00\\xFF";
+""", len(payload) + 2, False
     yield "list-spread", PRELUDE + f"""inductive List (A : Type) : Type := | Nil : List A | Cons : A -> List A -> List A;
 def eight (value : Nat) : Nat :=
   let two : Nat := add value value in
@@ -174,6 +251,19 @@ def select (pair : Pair Nat Bool) : Nat :=
   match pair with | MkPair value flag => match flag with | True => value | False => S value end end;
 def result : Nat := select (MkPair Nat Bool {n} {'True' if m % 2 else 'False'});
 """, n if m % 2 else n + 1, False
+    yield "destructure-pair", PRELUDE + f"""inductive Pair (A : Type) (B : Type) : Type := | MkPair : A -> B -> Pair A B;
+def result : Nat :=
+  let pair : Pair Nat Nat := MkPair Nat Nat {n} {m} in
+  let (MkPair left right) := pair in add left right;
+""", n + m, False
+    yield "destructure-effectful-subject", PRELUDE + f"""inductive TickResult : Type := | MkTickResult : Nat -> TickResult;
+effect Tick where | tick : Nat -> TickResult
+def result : Nat :=
+  handle let (MkTickResult value) := (perform tick({n}) : TickResult) in add value {m} with
+  | tick (seed) resume => resume (MkTickResult (S seed))
+  | pure value => value
+  end;
+""", n + m + 1, True
     yield "inferred-lambda", PRELUDE + f"""def identity : Nat -> Nat := fun n => n;
 def result : Nat := identity {n};
 """, n, False

@@ -37,6 +37,11 @@ def result : Nat := value;
 """, ("CErr code=44",), fuel=300),
         Mutation("parse-missing-colon", prefix + f"def {name} Nat := Z;", ("CErr code=1", "CErr code=10")),
         Mutation("type-mismatch", prefix + f"def {name} : Nat := True;", ("CErr code=41",)),
+        Mutation("coalesce-fallback-type", prefix + f"""inductive Choice (A : Type) : Type :=
+  | Empty : Choice A | Full : A -> Choice A;
+representation Choice := "ouro.maybe";
+def {name} : Nat := (Full Nat {number}) ?? True;
+""", ("CErr code=41",)),
         Mutation("definition-self-reference", prefix + f"def {name} : Nat := {name};", ("CErr code=41",)),
         Mutation("effect-root-body-type", prefix + "effect Counter where\n  | step : Nat -> Nat\n"
                  + f"def {name} : Nat := True;", ("CErr code=41",)),
@@ -67,6 +72,10 @@ def result : Nat := value;
         Mutation("applied-lambda-branch", prefix + f"def {name} : Nat := (fun (value : Nat) => match False with | True => value | False => True end) {number};", ("CErr code=41",)),
         Mutation("lambda-argument-domain", prefix + "def apply (f : Nat -> Nat) : Nat := f Z;\n"
                  + f"def {name} : Nat := apply (fun (n : Bool) => n);", ("CErr code=41",)),
+        Mutation("trailing-lambda-wrong-body", prefix
+                 + "def apply_last (value : Nat) (callback : Nat -> Nat) : Nat := callback value;\n"
+                 + f"def {name} : Nat := apply_last({number}) {{ value -> add value True }};",
+                 ("CErr code=41",)),
         Mutation("case-branch-type", prefix + f"def {name} (n : Nat) : Nat := match n with | Z => True | S k => k end;", ("CErr code=41",)),
         Mutation("case-lambda-domain", prefix + f"def {name} (n : Nat) : Nat -> Nat := match n with | Z => fun (b : Bool) => b | S k => fun (x : Nat) => add k x end;", ("CErr code=41",)),
         Mutation("termination-escape", prefix + "def call (f : Nat -> Nat) (n : Nat) : Nat := f n;\n"
@@ -161,6 +170,27 @@ extern {name} : HostAction NativeWord :=
         Mutation("selective-conflicting-edges",
                  'import "dep.ouro" exposing (Visible as First);\nimport "./dep.ouro" exposing (Visible as Second);',
                  ("CErr code=98",), dependencies=(("dep.ouro", "axiom Visible : Type;"),)),
+        Mutation("private-plain-import",
+                 'import "dep.ouro";\ndef bad : Type := Hidden;',
+                 ("CErr code=95",),
+                 dependencies=(("dep.ouro", "private axiom Hidden : Type;"),)),
+        Mutation("private-qualified-import",
+                 'import "dep.ouro" as D;\ndef bad : Type := D.Hidden;',
+                 ("CErr code=95",),
+                 dependencies=(("dep.ouro", "private axiom Hidden : Type;"),)),
+        Mutation("private-exposing-import",
+                 'import "dep.ouro" exposing (Hidden);\naxiom good : Type;',
+                 ("CErr code=95",),
+                 dependencies=(("dep.ouro", "private axiom Hidden : Type;"),)),
+        Mutation("private-transitive-import",
+                 'import "middle.ouro";\ndef bad : Type := Hidden;',
+                 ("CErr code=95",),
+                 dependencies=(("middle.ouro", 'import "dep.ouro";'),
+                               ("dep.ouro", "private axiom Hidden : Type;"))),
+        Mutation("private-invalid-body",
+                 'import "dep.ouro";\naxiom good : Type;',
+                 ("CErr code=41",),
+                 dependencies=(("dep.ouro", PRELUDE + "private def Broken : Nat := Type;"),)),
     ))
     for kind, text, rule in (
         ("lint-import-malformed", f'import "missing{seed}.ouro" as;\ndef {name} : Nat := Z;', "OURO-IMP-001"),

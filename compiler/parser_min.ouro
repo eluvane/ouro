@@ -43,7 +43,10 @@ inductive Mode : Type :=
   | MHandle : Mode
   | MHandleClauses : Mode
   | MPiFromApp : Mode
-  | MDoStmt : Mode;
+  | MDoStmt : Mode
+  | MIf : Mode
+  | MTrailingLambda : Mode
+  | MCoalesce : Mode;
 
 inductive Value : Type :=
   | VExpr : Expr -> Value
@@ -97,6 +100,8 @@ def tagBracketL : Nat := 21;
 def tagBracketR : Nat := 22;
 def tagDotDot : Nat := 23;
 def tagDotDotEq : Nat := 24;
+def tagByteString : Nat := 25;
+def tagCoalesce : Nat := 26;
 
 def token_tag (t : Token) : Nat :=
     match t with
@@ -125,6 +130,8 @@ def token_tag (t : Token) : Nat :=
     | TBracketR => tagBracketR
     | TDotDot => tagDotDot
     | TDotDotEq => tagDotDotEq
+    | TByteString _ => tagByteString
+    | TCoalesce => tagCoalesce
     end;
 
 def is_lparen (t : Token) : Bool := eqNat(token_tag t, tagLparen);
@@ -138,6 +145,7 @@ def is_exclam (t : Token) : Bool := eqNat(token_tag t, tagExclam);
 def is_eof (t : Token) : Bool := eqNat(token_tag t, tagEof);
 def is_bind (t : Token) : Bool := eqNat(token_tag t, tagBind);
 def is_pipe (t : Token) : Bool := eqNat(token_tag t, tagPipe);
+def is_coalesce (t : Token) : Bool := eqNat(token_tag t, tagCoalesce);
 def is_bracket_r (t : Token) : Bool := eqNat(token_tag t, tagBracketR);
 def is_dot_dot (t : Token) : Bool := eqNat(token_tag t, tagDotDot);
 
@@ -167,6 +175,8 @@ def token_nat_payload (t : Token) : Nat :=
     | TBracketR => Z
     | TDotDot => Z
     | TDotDotEq => Z
+    | TByteString _ => Z
+    | TCoalesce => Z
     | TEof => Z
     end;
 
@@ -196,6 +206,8 @@ def token_hole_payload (t : Token) : Maybe Nat :=
     | TBracketR => Nothing Nat
     | TDotDot => Nothing Nat
     | TDotDotEq => Nothing Nat
+    | TByteString _ => Nothing Nat
+    | TCoalesce => Nothing Nat
     | TEof => Nothing Nat
     end;
 
@@ -241,6 +253,37 @@ def tokenIsString (t : Token) : Maybe Nat :=
     | False => Nothing Nat
     end;
 
+def tokenIsByteString (t : Token) : Maybe (List Nat) :=
+    match t with
+    | TByteString bytes => Just (List Nat) bytes
+    | TIdent _ => Nothing (List Nat)
+    | TNat _ => Nothing (List Nat)
+    | TKeyword _ => Nothing (List Nat)
+    | TType _ => Nothing (List Nat)
+    | TColon => Nothing (List Nat)
+    | TColonEq => Nothing (List Nat)
+    | TArrow => Nothing (List Nat)
+    | TFatArrow => Nothing (List Nat)
+    | TBar => Nothing (List Nat)
+    | TLparen => Nothing (List Nat)
+    | TRparen => Nothing (List Nat)
+    | TSemi => Nothing (List Nat)
+    | THole _ => Nothing (List Nat)
+    | TString _ => Nothing (List Nat)
+    | TComma => Nothing (List Nat)
+    | TBraceL => Nothing (List Nat)
+    | TBraceR => Nothing (List Nat)
+    | TExclam => Nothing (List Nat)
+    | TEof => Nothing (List Nat)
+    | TBind => Nothing (List Nat)
+    | TPipe => Nothing (List Nat)
+    | TBracketL => Nothing (List Nat)
+    | TBracketR => Nothing (List Nat)
+    | TDotDot => Nothing (List Nat)
+    | TDotDotEq => Nothing (List Nat)
+    | TCoalesce => Nothing (List Nat)
+    end;
+
 def tokenIsKeyword (t : Token) : Maybe Nat :=
     match eqNat(token_tag t, tagKeyword) with
     | True => Just(Nat, token_nat_payload t)
@@ -262,10 +305,11 @@ def tokenIsBinderName (t : Token) : Maybe Nat :=
     end;
 
 def is_keyword_atom_index (k : Nat) : Bool :=
-    orb (eqNat k kwFun)
+    orb (eqNat k kwIf)
+      (orb (eqNat k kwFun)
       (orb (eqNat k kwLet)
         (orb (eqNat k kwMatch)
-          (eqNat k kwFix)));
+          (eqNat k kwFix))));
 
 def is_atom_start (t : Token) : Bool :=
     orb (orb (eqNat(token_tag t, tagIdent))
@@ -274,7 +318,8 @@ def is_atom_start (t : Token) : Bool :=
                 (orb (eqNat(token_tag t, tagLparen))
                   (orb (eqNat(token_tag t, tagBracketL))
                     (orb (eqNat(token_tag t, tagHole))
-                      (eqNat(token_tag t, tagString))))))))
+                      (orb(eqNat(token_tag t, tagString),
+                        eqNat(token_tag t, tagByteString)))))))))
         (is_keyword_atom_index
           (maybe Nat Nat Z (fun (x : Nat) => x) (tokenIsKeyword t)));
 
@@ -700,3 +745,97 @@ def desugar_match_rows (scruts : List Expr) (rows : List (Pair (List (Pair Nat (
     end;
 
 def parse_min_ok : Nat := Z;
+
+def parse_b_local_value (parse : Nat -> Mode -> List Token -> Nat -> Value -> ParseResult Value)
+    (name : Nat) (fuel' : Nat) (params : List (Pair Nat Expr))
+    (finish : Nat -> Maybe Expr -> Expr -> List Token -> Nat -> ParseResult Value)
+    (toks : List Token) (pos : Nat) (extra : Value) : ParseResult Value :=
+  match is_colon (peek toks) with
+  | True =>
+      bindParseResult Unit Value (expect_colon toks pos)
+        (fun (_u : Unit) (after_colon : List Token) (type_pos : Nat) =>
+          bindValue Expr asExpr (parse fuel' MExpr after_colon type_pos extra)
+            (fun (ann : Expr) (after_type : List Token) (assign_pos : Nat) =>
+              bindParseResult Unit Value (expect_colon_eq after_type assign_pos)
+                (fun (_assign : Unit) (after_assign : List Token) (value_pos : Nat) =>
+                  bindValue Expr asExpr (parse fuel' MExpr after_assign value_pos extra)
+                    (fun (value : Expr) (after_value : List Token) (end_pos : Nat) =>
+                      finish name (Just Expr (mk_pi_chain params ann))
+                        (mk_typed_lam_chain params value) after_value end_pos))))
+  | False =>
+      bindParseResult Unit Value (expect_colon_eq toks pos)
+        (fun (_assign : Unit) (after_assign : List Token) (value_pos : Nat) =>
+          bindValue Expr asExpr (parse fuel' MExpr after_assign value_pos extra)
+            (fun (value : Expr) (after_value : List Token) (end_pos : Nat) =>
+              finish name (Nothing Expr)
+                (mk_typed_lam_chain params value) after_value end_pos))
+  end;
+
+-- Parameters have exactly the declaration telescope's scope. The local name
+-- itself is not in scope in its value; recursion still requires explicit fix.
+def parse_b_binding (parse : Nat -> Mode -> List Token -> Nat -> Value -> ParseResult Value)
+    (fuel' : Nat) (toks : List Token) (pos : Nat) (extra : Value)
+    (finish : Nat -> Maybe Expr -> Expr -> List Token -> Nat -> ParseResult Value)
+    : ParseResult Value :=
+  bindParseResult Nat Value (expect_ident toks pos)
+    (fun (name : Nat) (tail : List Token) (position : Nat) =>
+      match is_binder_ahead tail with
+      | False =>
+          parse_b_local_value parse name fuel' (Nil (Pair Nat Expr))
+            finish tail position extra
+      | True =>
+          bindValue (List (Pair Nat Expr)) asListPairNatExpr
+            (parse fuel' MTypedBinders tail position extra)
+            (fun (params : List (Pair Nat Expr)) (after : List Token) (next : Nat) =>
+              parse_b_local_value parse name fuel' params
+                finish after next extra)
+      end);
+
+-- Where helpers keep the same non-recursive, sequential scope as local lets.
+def parse_b_where_body
+    (parse : Nat -> Mode -> List Token -> Nat -> Value -> ParseResult Value)
+    (fuel : Nat) (body : Expr) (toks : List Token) (pos : Nat) (extra : Value)
+    : ParseResult Value :=
+  (fix helpers (remaining : Nat) (items : List Token) (position : Nat)
+      : ParseResult Value :=
+    match remaining with
+    | Z => PErr Value position
+    | S next =>
+        bindParseResult Unit Value (expect_keyword kwLet items position)
+          (fun (_let : Unit) (after_let : List Token) (binder_pos : Nat) =>
+            parse_b_binding parse next after_let binder_pos extra
+              (fun (name : Nat) (annotation : Maybe Expr) (value : Expr)
+                  (after_value : List Token) (end_pos : Nat) =>
+                bindParseResult Unit Value (expect_tag tagSemi after_value end_pos)
+                  (fun (_semi : Unit) (tail : List Token) (tail_pos : Nat) =>
+                    match andb(eqNat(token_tag(peek tail), tagKeyword),
+                        eqNat(token_nat_payload(peek tail), kwEnd)) with
+                    | True =>
+                        bindParseResult Unit Value (expect_keyword kwEnd tail tail_pos)
+                          (fun (_end : Unit) (rest : List Token) (past : Nat) =>
+                            okExpr (ELet name annotation value body) rest past)
+                    | False =>
+                        bindValue Expr asExpr (helpers next tail tail_pos)
+                          (fun (nested : Expr) (rest : List Token) (past : Nat) =>
+                            okExpr (ELet name annotation value nested) rest past)
+                    end)))
+    end) fuel toks pos;
+
+def parse_b_where_tail
+    (parse : Nat -> Mode -> List Token -> Nat -> Value -> ParseResult Value)
+    (fuel : Nat) (body : Expr) (toks : List Token) (pos : Nat) (extra : Value)
+    : ParseResult Value :=
+  match toks with
+  | Nil => okExpr body toks pos
+  | Cons first after =>
+      match andb(eqNat(token_tag first, tagKeyword),
+          eqNat(token_nat_payload first, kwWhere)) with
+      | False => okExpr body toks pos
+      | True =>
+          match andb(eqNat(token_tag(peek after), tagKeyword),
+              eqNat(token_nat_payload(peek after), kwLet)) with
+          | False => okExpr body toks pos
+          | True => parse_b_where_body parse fuel body after (S pos) extra
+          end
+      end
+  end;

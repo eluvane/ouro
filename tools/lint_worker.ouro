@@ -109,6 +109,10 @@ inductive LintSelectFact : Type :=
 inductive LintNameFact : Type :=
   | MkLintNameFact : String -> List String -> List String -> LintNameFact;
 
+-- Native-tool build scopes this two-argument walk. The preprocessor rewrites a
+-- whole module into the process-lifetime arena; retaining one cone of those
+-- rewrites exceeds the 8 GiB lint address-space cap. Leave copies only the
+-- selected-import rules.
 def lint_select_rules (from : String) (src : String)
     : Either QualityInputError (List LintSelectFact) :=
   match preprocess_imports_reg empty_imp_reg (ncodes src) with
@@ -127,6 +131,26 @@ def lint_select_rules (from : String) (src : String)
                 | ImpFieldTypeGrant _ _ _ => Nil LintSelectFact
                 end) rules)
       end
+    end
+  end;
+
+inductive LintConeFacts : Type :=
+  | MkLintConeFacts : List String -> List LintSelectFact -> List String -> List String
+      -> LintConeFacts;
+
+-- Names, constructors and selected imports from one file. The native builder
+-- attaches ouro_wrap_quality_pure so line walks and the import rewrite die
+-- with the file; only these facts are copied back.
+def lint_cone_facts (path : String) (src : String)
+    : Either QualityInputError LintConeFacts :=
+  match harvest_imports src with
+  | Left scan => Left QualityInputError LintConeFacts (lint_scan_failure path src scan)
+  | Right imports => match lint_select_rules path src with
+    | Left error => Left QualityInputError LintConeFacts error
+    | Right rules =>
+        Right QualityInputError LintConeFacts
+          (MkLintConeFacts imports rules (harvest_public_names src)
+            (harvest_public_ctor_names src))
     end
   end;
 
@@ -250,29 +274,25 @@ def known_go : Nat -> List (Pair String String) -> List LintSelectFact
                        io_pure (Either(QualityInputError, Pair(List String, List String)))
                          (Left QualityInputError (Pair(List String, List String)) e)
                    | Right src =>
-                       match harvest_imports src with
-                       | Left e => known_import_left (lint_scan_failure path src e)
-                       | Right imports =>
-                           match lint_select_rules path src with
-                           | Left e => known_import_left e
-                           | Right local_rules =>
-                               let names2 : List String := harvest_names src in
-                               let ctors2 : List String := harvest_ctor_names src in
-                               known_go fuel2 aliases root_rules
-                                 (append LintSelectFact local_rules selected)
-                                 (Cons LintNameFact
-                                   (MkLintNameFact path names2 ctors2) facts)
-                                 (snoc_resolved path imports rest)
-                                 (Cons String path seen)
-                                 (append String
-                                   (lint_qualified_selected_for_path path aliases
-                                     root_rules names2)
-                                   (append String names2 names))
-                                 (append String
-                                   (lint_qualified_selected_for_path path aliases
-                                     root_rules ctors2)
-                                   (append String ctors2 ctors))
-                           end
+                       match lint_cone_facts path src with
+                       | Left e => known_import_left e
+                       | Right harvested => match harvested with
+                         | MkLintConeFacts imports local_rules names2 ctors2 =>
+                             known_go fuel2 aliases root_rules
+                               (append LintSelectFact local_rules selected)
+                               (Cons LintNameFact
+                                 (MkLintNameFact path names2 ctors2) facts)
+                               (snoc_resolved path imports rest)
+                               (Cons String path seen)
+                               (append String
+                                 (lint_qualified_selected_for_path path aliases
+                                   root_rules names2)
+                                 (append String names2 names))
+                               (append String
+                                 (lint_qualified_selected_for_path path aliases
+                                   root_rules ctors2)
+                                 (append String ctors2 ctors))
+                         end
                        end
                    end
             end
@@ -410,8 +430,8 @@ def lint_cache_fresh_facts (canonical : String) (src : String)
     | Left e => Left QualityInputError LintFileFacts
         (lint_scan_failure canonical src e)
     | Right imports =>
-        let harvested : List String := harvest_names src in
-        let ctors2 : List String := harvest_ctor_names src in
+        let harvested : List String := harvest_public_names src in
+        let ctors2 : List String := harvest_public_ctor_names src in
         Right QualityInputError LintFileFacts
           (MkLintFileFacts imports harvested ctors2
             (lint_cache_put cache canonical

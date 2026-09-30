@@ -381,6 +381,58 @@ static void check_wide_naturals(void)
 	}
 }
 
+static void check_clone_since_mark(void)
+{
+	ouro_v *settled;
+	ouro_v *inner;
+	ouro_v *fresh;
+	ouro_v *kept;
+	unsigned long long before;
+	unsigned long long allocated;
+	settled = ouro_nat(7);
+	ouro_heap_mark();
+	inner = ouro_ctor(3, 1, &settled);
+	fresh = ouro_ctor(4, 1, &inner);
+	before = ouro_heap_total_alloc_bytes();
+	kept = ouro_clone_since_mark(fresh);
+	ouro_heap_reset();
+	allocated = ouro_heap_total_alloc_bytes() - before;
+	if (kept == 0 || kept == fresh || kept->tag != 4 || kept->n != 1 ||
+	    OURO_F(kept, 0) == 0 || OURO_F(kept, 0) == inner ||
+	    OURO_F(kept, 0)->tag != 3 || OURO_F(OURO_F(kept, 0), 0) != settled) {
+		fputs("rt_selftest: mark clone did not keep the settled spine\n", stderr);
+		exit(1);
+	}
+	if (allocated > 4096ULL) {
+		fprintf(stderr, "rt_selftest: mark clone allocated %llu bytes\n", allocated);
+		exit(1);
+	}
+	{
+		int step;
+		ouro_v *spine = ouro_nat(1);
+		unsigned long long spine_before;
+		unsigned long long spine_allocated;
+		spine_before = ouro_heap_total_alloc_bytes();
+		for (step = 0; step < 1000; step++) {
+			ouro_v *cell_fields[2];
+			ouro_v *cell;
+			ouro_heap_mark();
+			cell_fields[0] = ouro_nat((unsigned long)(step % 50));
+			cell_fields[1] = spine;
+			cell = ouro_ctor(1, 2, cell_fields);
+			(void)ouro_ctor(2, 0, 0);
+			spine = ouro_clone_since_mark(cell);
+			ouro_heap_reset();
+		}
+		spine_allocated = ouro_heap_total_alloc_bytes() - spine_before;
+		if (spine == 0 || spine_allocated > 1000000ULL) {
+			fprintf(stderr, "rt_selftest: token spine allocated %llu bytes\n",
+				spine_allocated);
+			exit(1);
+		}
+	}
+}
+
 int main(int argc, char **argv)
 {
 	if (argc == 2) {
@@ -397,6 +449,7 @@ int main(int argc, char **argv)
 	check_phase_apply();
 	check_list_lookup();
 	check_packed_clone_lifetime();
+	check_clone_since_mark();
 	check_wide_naturals();
 	return 0;
 }

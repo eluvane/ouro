@@ -26,7 +26,34 @@ recorded in the [changelog](../CHANGELOG.md).
 conversion that rejects surrogates and out-of-range values. Its
 `utf8_scalar_bytes` encoder requires an already validated scalar.
 
+## Function composition
+
+`std/logic.ouro` provides `compose A B C after before : A -> C`. It applies
+`before` to the input, then `after` to the intermediate value:
+
+```ouro
+import "../std/logic.ouro";
+import "../std/prelude.ouro";
+
+def twice_then_increment : Nat -> Nat :=
+  compose Nat Nat Nat (add 1) (mul 2);
+```
+
+
+## Callback sections
+
+`std/logic.ouro` provides `flip A B C f right left`, which calls an ordinary
+binary function as `f left right`. Partially applying `flip A B C f right`
+produces a typed `A -> C` callback with the right argument fixed.
+
+This uses ordinary partial application; the parameter types remain explicit
+and no placeholder syntax is introduced.
+
 ## Fallible values
+
+`std/data.ouro` provides `maybe_unwrap_or_else A fallback value` for a
+`Maybe A`. The fallback has type `Unit -> A` and is called only for `Nothing`;
+`Just x` returns `x`. Use `fromMaybe` when the default is already a value.
 
 `std/result.ouro` treats `Either E A` as a result: `Left` carries the error
 and `Right` carries the value. `result_unwrap_or_else E A fallback value`
@@ -34,6 +61,23 @@ returns the value on `Right`; on `Left` it calls `fallback : E -> A` with the
 original error. The fallback is called only for `Left`. Use `result_bind` to
 continue with another fallible operation and `result_map_err` to change an
 error type while retaining the result.
+
+`std/data.ouro` provides `maybe_bind A B value next` to continue a `Maybe`
+computation. It calls `next : A -> Maybe B` only for `Just`; `Nothing` passes
+through without calling it.
+
+```ouro
+import "../std/data.ouro";
+
+def next_if_present (value : Nat) : Maybe Nat :=
+    match value with
+    | Z => Nothing Nat
+    | S _ => Just Nat (S value)
+    end;
+
+def example : Maybe Nat :=
+    maybe_bind Nat Nat (Just Nat 2) next_if_present;
+```
 
 `std/collections.ouro` provides `list_traverse_maybe A B f xs` for an ordered
 list of fallible conversions. It returns `Just []` for an empty list, `Just`
@@ -149,6 +193,18 @@ success. `iter_take 0` does not pull its upstream source, though collecting
 its own end still costs one pull. Iterators built from lists are finite, while
 a custom iterator need not be; the pull limit bounds calls to its step
 function, not the work performed inside each step.
+
+`iter_fold State Error Item Acc step initial max_pulls source` consumes the
+same bounded pull sequence without building a list. A skip keeps the
+accumulator; a yield applies the pure `step` in source order. The accumulator
+is returned only after an end step, while source failure and budget exhaustion
+return `IterSourceFailure` and `IterPullLimit` rather than a partial success.
+For example, folding `add` over `[1, 2, 3]` with four pulls returns `Right 6`:
+
+```ouro
+iter_fold (List Nat) String Nat Nat add Z 4
+  (iter_from_list String Nat ([1, 2, 3] : List Nat))
+```
 
 Adapters do not build intermediate lists. Materialization builds a reversed
 list and allocates another list when reversing it at completion; iterator

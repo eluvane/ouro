@@ -17,7 +17,15 @@ fixture, and file-inventory queries and JSON/SARIF reports:
 sh scripts/ouro1.sh lint --deny --family semantic --profile project std
 python3 scripts/clippy_grade_firewall.py --profile strict --scope std
 python3 scripts/clippy_grade_firewall.py --list-rules
+python3 scripts/clippy_import_gap.py
 ```
+
+`clippy_import_gap.py` reads the stub inventories, import graph, and match arms.
+It reports a harvested use of a declaration that the walker would not load, a
+bare name whose only definition is outside that import closure, a stub-list
+line that is missing or repeated, and a match that dropped one or two
+constructors of an inductive it otherwise covers. It does not run the compiler
+and does not decide whether a program is well typed.
 
 `strict` and `release` reject `--warn-only` and fail on deny/fatal findings.
 `project --warn-only` can report ordinary debt but cannot hide a fatal error,
@@ -26,12 +34,24 @@ malformed registry, missing rule, or incomplete inventory. See
 
 ## Semantic boundary
 
-`semantic_unit.ouro` reads imported sources for each requested root and shares
-an intern table inside a worker. Its existing harvest cache uses canonical
+`semantic_unit.ouro` follows transitive imports for each requested root and
+shares an intern table inside a worker. Only the selected root retains function
+bodies. Runtime platform sources, `std/process.ouro`, `std/collections.ouro`,
+`std/pathx.ouro`, and the listed analyzer and implementation cones are stubbed
+unless the selected root imports them directly or the root itself is under
+`runtime/`. Harvesting that platform cone in one process exceeds the lint
+address-space cap. Imported modules other than `std/` contribute declaration names and signature
+arity. Their result trees are dropped: keeping them for one heavy root exceeds
+the lint address-space cap. Those imports are parsed without token-span
+wrappers. The selected root still records spans. `std/` imports keep arity and
+the result spine, so checked Either and IO APIs still classify. Queue, file-inventory and
+graph-fuel limits remain mandatory; a missing import or exhausted limit returns
+an input error rather than an empty unit. Its existing harvest cache uses canonical
 relative path, source byte length and content hash; a hit avoids parsing and
-harvesting that dependency again. Imported harvests retain signatures and compact
-source origins bound to module/declaration identity, never function bodies or
-completed contracts. Each root resolves those origins against its current import
+harvesting that dependency again. Imported harvests retain those facts, plus compact
+source origins bound to module/declaration identity and compiler-owned private
+names, never parameter domains, function bodies, or completed contracts. Each root resolves those
+origins against its current import
 graph and recomputes summaries within the existing inference limits. It builds
 `compiler/semantic_scope.ouro` identities. A multi-file worker invocation
 reuses the intern table and cache across bounded allocation epochs and
@@ -56,13 +76,35 @@ Each definition is traversed once into shared call/value/binder/flow facts.
 Repeated-work rules compare all argument identities, resolved callee, branch,
 effect epoch, registered purity and relevant cost. Higher-order arguments are
 part of the key. Constant inputs do not establish expensive repeated work.
-Result obligations come only from explicitly registered checked APIs and only
-when an IO action is executed. Each execution of an opaque action has a fresh
-value identity and effect boundary, including repeated executions of an alias.
+Checked-result obligations come only from explicitly registered checked APIs
+and activate when an IO action is executed. Each execution of an opaque action
+has a fresh value identity and effect boundary, including repeated executions
+of an alias.
 Proven `io_pure` preserves its exact payload without executing nested actions.
 Aliases of an executed result preserve producer identity; a match,
 return or escape can discharge observation. Generic Either/Maybe values do not
 acquire a must-observe contract from their type or spelling alone.
+
+`OURO-CLIPPY-ERROR-004` separately requires observation of a fully applied pure
+parser registered by canonical identity: `std/text.ouro::str_parse_nat`,
+`std/text.ouro::str_parse_bool`, or `std/json.ouro::parse_json`. An ignored
+`let _parsed := str_parse_nat text in ...` can lose parse failure even though
+the call performs no IO. Aliases preserve the obligation; matching, returning,
+explicit default handling or a possible escape discharges it. Partial calls,
+same-spelled local functions and generic Either/Maybe values stay outside this
+rule. It is `warn` in baseline/project and `deny` in strict/release; handling
+or propagating failure requires manual review.
+
+A helper that returns a resolved nullary constructor can have proven ignored
+arguments. The current declaration index must identify the constructor and its
+own family, with zero parameters and a signature returning that family.
+Ordinary global functions, unresolved names and constructors requiring arguments
+do not acquire this summary. Local bindings retain their parameter identities;
+import caches keep source candidates, not completed purity contracts. Private
+constructors and delegates are available to their own module's helper summaries;
+a foreign reference cannot establish that proof or resolve as an executable.
+Public wrappers retain their own private implementation facts, and public type
+aliases retain their owner-private type lookup.
 
 Failure-to-success diagnostics require a checked failure arm and no intervening
 effect/recovery boundary. Literal error codes and rendering are not success
@@ -99,6 +141,7 @@ produce Clippy diagnostics. Existing lint duplicate-import checks remain.
 | `OURO-CLIPPY-CHECKED-006` | `deny` | An executed, registered must-observe checked result has no observation or escape through any alias. |
 | `OURO-CLIPPY-ERROR-001` | `deny` | A known error branch exits or returns success status. |
 | `OURO-CLIPPY-ERROR-003` | `deny` | A failure arm of a registered must-observe checked result returns the resolved success constructor. |
+| `OURO-CLIPPY-ERROR-004` | `deny` | A fully applied registered pure parser result has no observation or escape through any alias. |
 | `OURO-CLIPPY-MAINT-007` | `deny` | Two nontrivial declarations have identical tokens apart from their own names and trivia, retaining signatures, binders, callees and literal values. |
 | `OURO-CLIPPY-PERF-001` | `deny` | Repeated registered pure conversion, parse or normalization with identical value identities. |
 | `OURO-CLIPPY-PERF-002` | `deny` | Repeated identical registered pure traversal, including callback and all argument identities. |

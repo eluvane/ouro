@@ -1,7 +1,8 @@
 -- Byte-scanner boundaries and record emission must survive structural checks.
 
 import "../std/test.ouro",
-  "../compiler/preprocess_record.ouro";
+  "../compiler/preprocess_record.ouro",
+  "compiler_record_destructure_text.ouro";
 
 def record_test_preprocess (reg : RecReg) (source : List Nat)
     : Pair RecReg PrepResult :=
@@ -43,31 +44,11 @@ def record_test_info (owner : List Nat) (name : List Nat)
   MkRecInfo owner name ctor fields
     empty_rec_owner_scope;
 
-def record_test_count (needle : List Nat) : List Nat -> Nat :=
-  fix record_test_count (xs : List Nat) : Nat :=
-    match xs with
-    | Nil => Z
-    | Cons _ rest =>
-        match source_starts needle xs with
-        | True => S (record_test_count rest)
-        | False => record_test_count rest
-        end
-    end;
+def record_test_count : List Nat -> List Nat -> Nat :=
+  destructure_test_count;
 
-def record_test_before (first : List Nat) (second : List Nat) : List Nat -> Bool :=
-  fix record_test_before (xs : List Nat) : Bool :=
-    match xs with
-    | Nil => False
-    | Cons _ rest =>
-        match source_starts first xs with
-        | True => True
-        | False =>
-            match source_starts second xs with
-            | True => False
-            | False => record_test_before rest
-            end
-        end
-    end;
+def record_test_before : List Nat -> List Nat -> List Nat -> Bool :=
+  destructure_test_before;
 
 def record_test_comment_metadata : Bool :=
   match parse_record (str_codes
@@ -178,6 +159,18 @@ def record_test_block_passthrough : Bool :=
       | PrepErr _ _ => False
       | PrepOk output => source_bytes_equal source output
       end
+  end;
+
+def record_test_trailing_lambda_body : Bool :=
+  match record_test_preprocess record_test_registry (str_codes
+      "def result : Nat := run(Z) { item -> let box : Point := { x := item, flag := True } in let changed : Point := { box with x := S item } in changed.x };") with
+  | MkPair _ result => match result with
+    | PrepErr _ _ => False
+    | PrepOk output =>
+        andb(eqNat(record_test_count (str_codes "MkPoint") output, 2),
+          andb(eqNat(record_test_count (str_codes "Point_flag __ouro_update") output, 1),
+            eqNat(record_test_count (str_codes "Point_x changed") output, 1)))
+    end
   end;
 
 def record_test_block_nested_text : Bool :=
@@ -532,11 +525,37 @@ def record_test_scanners : List Test :=
         "(Nat -> Nat)"
     , assert_true "record prepass preserves a pure let block with trivia"
         record_test_block_passthrough
+    , assert_true "record prepass rewrites literal, update and projection inside trailing lambda"
+        record_test_trailing_lambda_body
+    , assert_true "record candidate scan enters trailing lambda body"
+        (records_maybe_needed (str_codes "run(Z) { item -> { x := item } }"))
+    , assert_true "trailing lambda local binding is not a record assignment"
+        (notb (records_maybe_needed (str_codes "run(Z) { item -> let copy := item in copy }")))
     , assert_true "record candidate scan skips a pure let block"
         (notb (records_maybe_needed (str_codes
           "let { let count : Nat := Z; count }")))
     , assert_true "record update binds base once and RHS in source order"
         record_test_update_lowering
+    , assert_true "record destructure binds an effectful subject once before accessors"
+        destructure_test_lowering
+    , assert_true "record destructure avoids an enclosing temporary name"
+        destructure_test_fresh
+    , assert_true "record destructure preserves leading expression trivia"
+        destructure_test_trivia
+    , assert_true "record destructure leaves a pure block ascription alone"
+        destructure_test_block_ascription
+    , assert_true "record destructure rejects duplicate fields"
+        (destructure_test_error
+          "def value : Nat := let { x, x } : Point := point in x;"
+          rec_code_dup)
+    , assert_true "record destructure rejects unknown fields"
+        (destructure_test_error
+          "def value : Nat := let { other } : Point := point in Z;"
+          rec_code_unknown)
+    , assert_true "record destructure requires a nominal annotation"
+        (destructure_test_error
+          "def value : Nat := let { x } := point in x;"
+          rec_code_need_ty)
     , assert_true "imported updates carry exact owner field type grants"
         record_test_imported_updates
     , assert_true "foreign field alias is not rebound in the caller"
@@ -677,6 +696,28 @@ def record_test_scanners : List Test :=
           (str_codes "recorded my_record \"record\" -- record")))
     , assert_true "keyword-only probe ignores dots and braces"
         (notb (src_has_record_keyword (str_codes "point.x {x := 1}")))
+    , assert_true "projection fastpath detects immediate dotted identifiers"
+        (all String (fun (source : String) => src_has_record_projection (str_codes source))
+          (["point.x", "Unknown.Shared", "_point1.field_2", "-- hidden.x\npoint.x"] : List String))
+    , assert_true "projection fastpath excludes other dotted and brace syntax"
+        (notb (any String (fun (source : String) => src_has_record_projection (str_codes source))
+          (["0..10", "0..=10", "1.2", ".x", "x.", "1x.y", "x..y",
+            "{x := y}", "{x, y}", "{point with x := y}"] : List String)))
+    , assert_true "projection fastpath ignores quoted raw and commented text"
+        (notb (any String (fun (source : String) => src_has_record_projection (str_codes source))
+          (["\"Unknown.Shared\"", "r#\"Unknown.Shared\npoint.x\"#", "-- Unknown.Shared"] : List String)))
+    , assert_true "empty record registry still validates unknown projections"
+        (match preprocess_records (str_codes "def value : Type := Unknown.Shared;") with
+         | PrepOk _ => False
+         | PrepErr code _ => eqNat code rec_code_proj
+         end)
+    , assert_true "empty record registry preserves hidden dotted spellings"
+        (let source : List Nat := str_codes
+           "def value : String := r#\"Unknown.Shared\"#; -- Unknown.Shared" in
+         match preprocess_records source with
+         | PrepErr _ _ => False
+         | PrepOk output => source_bytes_equal source output
+         end)
     , assert_true "record detection accepts a declaration"
         (records_maybe_needed (str_codes "record R"))
     , assert_true "record detection accepts a projection"
@@ -703,6 +744,12 @@ def record_test_scanners : List Test :=
     , assert_true "record detection excludes raw multiline punctuation"
         (notb (records_maybe_needed
           (str_codes "r#\"record . {x := 1}\npoint.x\"#")))
+    , assert_true "record detection excludes dedented multiline punctuation"
+        (notb (records_maybe_needed
+          (str_codes "\"\"\"\n  record . {x := 1}\n  point.x\n  \"\"\"")))
+    , assert_true "record detection resumes after dedented multiline literal"
+        (records_maybe_needed
+          (str_codes "\"\"\"\n  record . {x := 1}\n  \"\"\"; point.x"))
     , assert_true "unterminated ordinary brace does not invent a record"
         (notb (records_maybe_needed (str_codes "{plain")))
     , assert_eq "declaration names preserve order and skip hidden declarations"
@@ -776,12 +823,12 @@ def record_test_emission : List Test :=
     , assert_eq "record emission produces constructor and typed accessors"
         (str_of_codes (reverse Nat (emit_record []
           (record_test_info([], str_codes "Point", str_codes "MkPoint", record_test_fields))
-          (str_codes "Type"))))
+          (str_codes "Type") False)))
         "\ninductive Point : Type :=\n  |  MkPoint : Nat -> Bool -> Point;\ndef Point_x (p : Point) : Nat := match p with | MkPoint x flag => x end;\ndef Point_flag (p : Point) : Bool := match p with | MkPoint x flag => flag end;\n"
     , assert_eq "empty record emits a nullary constructor"
         (str_of_codes (reverse Nat (emit_record []
           (record_test_info([], str_codes "Empty", str_codes "MkEmpty", []))
-          (str_codes "Type"))))
+          (str_codes "Type") False)))
         "\ninductive Empty : Type :=\n  |  MkEmpty : Empty;\n"
     ];
 

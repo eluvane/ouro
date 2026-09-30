@@ -23,6 +23,8 @@ The parser expands the group into ordered imports. Aliases remain on separate
 single-path declarations. [Ergonomic syntax](language/ergonomic-syntax.md#grouped-imports)
 explains the desugaring and rejected forms.
 
+### Import aliases
+
 An import alias qualifies declarations owned by that imported file:
 
 ```ouro
@@ -47,14 +49,28 @@ dependencies; a selective import exposes only the selected direct declarations
 of its target. An independent plain path can still expose the same declaration.
 Every imported declaration and body is checked even when hidden.
 
+Declarations are public by default. Prefix a declaration with `private` to
+keep an internal helper available inside its source file without exporting it.
+
+`private` applies to definitions, axioms, inductives, effects, intrinsics,
+externs, and records. A private inductive also hides its constructors; a
+private effect hides its operations; a private record hides its constructor
+and generated accessors. Private members cannot be imported bare, selected
+with `exposing`, reached through an alias or local `open`, or inherited by a
+plain import of another file. The owner can use them normally, and imported
+private declarations and bodies still pass the full checker. `private` does
+not apply to `import` or `representation`; explicit re-export control is
+separate from visibility.
+
 Plain imports keep unique short names available. A local term binder takes
 precedence over a bare module name, followed by a declaration owned by the
 current file, an innermost local open, and then a unique imported short name.
 When aliases or selective imports occur in the reached graph, a bare name not
 selected by these scopes is ambiguous when two visible imports bind it; use an
 alias or local open to select the intended declaration. A graph of plain
-imports without either feature retains the existing duplicate-declaration
-error for a collision. An alias cannot select a declaration only imported
+imports without aliases, selection, or private declarations retains the
+existing duplicate-declaration error for a collision; with private declarations,
+colliding public names are still rejected. An alias cannot select a declaration only imported
 transitively by its file. Aliases and exposing clauses are local to the
 importing file, and a local term binder does not change the meaning of
 `N.member`.
@@ -64,6 +80,8 @@ still selects the same module.
 Collisions of the legacy `IO`, `io_bind`, and `pure` lowering names report
 ambiguity even for qualified uses until those forms carry module-local
 operation metadata. Unambiguous `do` programs keep their current behavior.
+
+### Local opens
 
 An expression can open an alias for its own subtree:
 
@@ -77,8 +95,8 @@ outer one; a local term binder or current-file declaration still takes
 precedence. The opened names do not escape the expression. Unknown aliases
 are rejected. The legacy top-level `open N;` form remains accepted and is
 erased during preprocessing; bare names still follow ordinary import lookup,
-so it does not resolve collisions or establish expression-local scope. Private
-exports, re-exports, and nested module declarations are not supported.
+so it does not resolve collisions or establish expression-local scope. Explicit
+re-exports and nested module declarations are not supported.
 
 ## Definitions and dependent functions
 
@@ -122,6 +140,22 @@ typed parameters; the result annotation may be omitted when the body type can
 be inferred. [Ergonomic syntax](language/ergonomic-syntax.md#typed-local-helper-declarations)
 explains their scope and desugaring.
 
+Helpers can also follow their expression:
+
+```ouro
+def doubled : Nat :=
+  double one where
+    let one : Nat := 1;
+    let double (value : Nat) := add value value;
+  end;
+```
+
+Helpers are sequential and non-recursive. Their initializers see earlier
+helpers, while the main expression sees them all. A lambda's body extends to
+the right; use `(fun ... => ...) where ... end` to wrap the whole lambda.
+[Ergonomic syntax](language/ergonomic-syntax.md#helpers-after-an-expression)
+explains grouping, delimiters, and scope.
+
 Top-level definitions may use `(public => internal : Type)` to expose a call
 label distinct from the binder used in the body. A direct call can then write
 `f(public := value)` or `f(public :=)` to use an identically named local value.
@@ -157,6 +191,11 @@ The header identifies the actual failure and success constructors. See
 [Typed fallible blocks](language/ergonomic-syntax.md#typed-fallible-blocks)
 for payload inference, boundaries, and rejection rules.
 
+For a registered `Maybe A`, `value ?? fallback` selects the payload of
+`Just` or evaluates `fallback` on `Nothing`. It binds less tightly than `|>`
+and associates to the right. See [Maybe fallback operator](language/ergonomic-syntax.md#maybe-fallback-operator)
+for typing and precedence.
+
 ## Inductive data and pattern matching
 
 ```ouro
@@ -170,6 +209,54 @@ def pred (n : Nat) : Nat :=
   | S k => k
   end;
 ```
+
+A total constructor pattern can also bind fields in a local expression or a
+pure expression block:
+
+```ouro
+let (MkPair left right) := pair in add left right
+let { let (MkPair left _) := pair; left }
+```
+
+This uses the same checked match as `match pair with | MkPair left right => ... end`.
+The constructor must cover the family, and the result needs an expected type
+when it cannot be inferred from the subject. See
+[checked destructuring lets](language/ergonomic-syntax.md#checked-destructuring-lets)
+for the exact limits.
+
+An ordinary conditional is a total expression:
+
+```ouro
+import "std/types.ouro";
+
+def choose (flag : Bool) (left : Nat) (right : Nat) : Nat :=
+  if flag then left else right;
+```
+
+`if` requires the registered `ouro.bool` family. The `else` arm is mandatory,
+and both arms are checked against the result type even when the condition is a
+known constructor. Parenthesize a conditional when passing it as an argument.
+
+Use `if let` to handle one flat constructor pattern:
+
+```ouro
+import "std/types.ouro";
+
+def from_maybe (item : Maybe Nat) (fallback : Nat) : Nat :=
+  if let Just value := item then value else fallback;
+```
+
+The `else` arm is mandatory. Constructor fields may be named or ignored with
+`_`; named fields are in scope only in `then`. The subject is evaluated once
+as the scrutinee of a complete checked case, and both arms are checked against
+the result type. The constructor must belong to the subject's non-indexed
+inductive family, and the pattern must name exactly its fields. Nested patterns,
+guards, and extraction into the surrounding scope are not part of this form.
+Parenthesize `if let` when passing it as an argument.
+If the subject's nominal family cannot be determined from its type, ascribe the
+subject explicitly.
+A result type does not select a subject family; an unresolved subject fails
+checking rather than guessing from the pattern.
 
 A family can opt in to omitting a leading universe parameter on saturated
 constructor calls:
@@ -353,6 +440,25 @@ unregistered declarations cannot receive a range literal. See
 [finite Nat ranges](practical_stdlib.md#finite-nat-ranges) for iteration and
 bounded collection.
 
+Character literals use single quotes and produce the existing `Nat` scalar
+ordinal. They contain exactly one Unicode scalar, rather than one UTF-8 byte
+or one grapheme cluster:
+
+```ouro
+def letter : Nat := 'A';
+def euro : Nat := '€';
+def smile : Nat := '\u{1F600}';
+```
+
+Raw characters use canonical UTF-8 (one through four bytes). Escapes are
+`\n`, `\t`, `\r`, `\'`, `\"`, `\\`, and `\u{…}` with one through six hex
+digits. Unicode scalar values exclude `0xD800..0xDFFF` and values above
+`0x10FFFF`; noncanonical or truncated UTF-8 is rejected. Empty literals,
+multiple scalars (including a base character plus a combining mark), unknown
+escapes, missing quotes, and physical CR/LF are lexical errors. Use `\u{0}`
+for NUL. These literals have no implicit `String` or byte-list conversion.
+Identifier primes, such as `value'`, retain their existing meaning.
+
 String literals support `\n`, `\t`, `\r`, `\"`, `\\`, and braced Unicode
 scalar escapes:
 
@@ -380,6 +486,32 @@ usual path normalization.
 def path : String := r#"C:\temp\data"#;
 def quote : String := r#"say "hello""#;
 ```
+
+An opt-in multiline `String` starts with `"""` followed immediately by LF or
+CRLF. Its closing `"""` begins on a new line after zero or more ASCII spaces
+or tabs; source code may follow the closing delimiter on that line. The
+opening line break and the one immediately before the closing line are not
+part of the value. The exact space/tab prefix before the closing delimiter is
+removed from every nonempty content line. A nonempty line without that exact
+prefix is a lexical error; an entirely empty line remains empty. Spaces and
+tabs are compared as bytes, without converting tab widths. Interior LF and
+CRLF sequences and all other bytes survive unchanged.
+
+Backslashes do not introduce escapes in this form, so `\n` is two
+bytes. Three quotes in the middle of a content line are data; only a triple
+quote at the start of a line after its space/tab prefix closes the literal.
+An unclosed delimiter, missing initial line break, or inconsistent indentation
+is a lexical error. Ordinary strings and `r#"..."#` keep their existing rules.
+Multiline literals are not accepted as import paths.
+
+`b"..."` is a byte-list literal with type `List Nat`. Printable ASCII bytes
+`0x20..0x7E` may appear directly, except `"` and `\`, which must be escaped.
+It accepts `\n`, `\t`, `\r`, `\"`, `\\`, and exactly two hexadecimal digits
+after `\x` (either case). Each `\xHH` contributes one byte, including NUL or
+bytes above ASCII. Raw non-ASCII and control bytes, physical line breaks,
+unknown escapes, and incomplete hex escapes are lexical errors. An empty byte
+literal needs an expected `List Nat` type. Import paths remain `String`
+literals; `import b"..."` is rejected.
 
 Import `std/string.ouro` to use the standard `String` type and helpers. A
 standalone prelude must declare `intrinsic String : Type := "ouro.string";`.
@@ -418,11 +550,10 @@ def inferred : List Nat := let values := [Z, S Z] in values;
 def nested : List (List Nat) := let rows := [[Z], []] in rows;
 ```
 
-A local type ascription can provide the expected element type:
+A local type ascription can provide the expected element type.
 
-```ouro
-def count : Nat := (([Z, S Z] : List Nat) |> length Nat);
-```
+The compiler checks an expression against its ascribed type even when an
+enclosing untyped local binding does not use the expression's value.
 
 Untyped `[]` and ambiguous list literals still require context. If the first
 element has no inferable type, annotate the literal or binding; later elements
@@ -433,7 +564,10 @@ annotation so the earlier type is not rebound under the later name.
 Heterogeneous lists are rejected. A nonempty list may end with a comma;
 `[]` remains the empty spelling. List literals lower to the standard `Nil`
 and `Cons` constructors, and the compiler checks every element against the
-selected type.
+selected type. For colliding `List` declarations, the literal context follows
+the family registered as `ouro.list`. An unrelated same-spelled family needs
+its explicit `Nil` and `Cons` constructors, and its values retain their
+nominal type.
 
 A final `..` can reuse an existing list as the tail:
 
@@ -471,6 +605,7 @@ def y : Nat := Z;
 def sameOrigin : Point := { y, x };
 def moved : Point := { origin with x := S Z };
 def originX : Nat := origin.x;
+def originY : Nat := let { y } : Point := origin in y;
 ```
 
 The default constructor is `MkPoint`; generated accessor names use
@@ -481,6 +616,17 @@ fields may be mixed, with comments and a trailing comma. Field order in the
 source does not change the constructor's declared field order. Unknown,
 duplicate, and missing fields remain errors; an unbound punned value is a
 compiler error.
+
+`let { x, y } : Point := value in body` binds selected fields of a local
+nominal record in `body`. The annotation is a direct record name, fields are
+distinct, and `in` is mandatory. The subject is checked as that record type and
+evaluated once; generated accessor calls are checked before the selected names
+enter scope. A field binder can shadow an outer name without changing the
+subject or another accessor. Comments and a trailing comma are allowed in the
+field list. Unknown or repeated fields, a missing nominal annotation, and a
+subject of the wrong type are rejected. This form does not infer a record type
+from the subject, bind renamed fields, or support imported records.
+
 With an import alias, a literal annotated `A.Point` uses the record declared
 by `A`, and `A.point.x` retains `A.point` as its base. Qualified projection
 requires the value and record declaration to belong directly to that aliased
@@ -521,7 +667,7 @@ dependent field types remain unsupported for generated imported annotations.
 Nested paths through a type alias that reduces to a record still need a direct
 nominal record field type. An ambiguous or hidden owner binding is rejected.
 
-Record pattern matching, anonymous records, row polymorphism, subtyping, and
+General record patterns, anonymous records, row polymorphism, subtyping, and
 overloaded field resolution are not implemented.
 
 ## Application and the pipe operator
@@ -543,6 +689,11 @@ This is left-associated application; a trailing comma is optional.
 [Ergonomic syntax](language/ergonomic-syntax.md#positional-parenthesized-calls)
 for desugaring and compatibility details.
 
+A nonempty positional call may put its last callback in a trailing block:
+`with_value(2) { value -> add value 1 }`. This is an ordinary final lambda
+argument with one inferred binder. See
+[Trailing lambda calls](language/ergonomic-syntax.md#trailing-lambda-calls).
+
 The forward pipe appends its left-hand value as the final argument of the
 application on the right:
 
@@ -557,8 +708,8 @@ argument convention is obvious.
 
 ## IO and `do`
 
-Runnable programs export `main : IO Unit`. The maintained `do` subset supports
-sequencing and `let!` binding:
+Runnable programs export `main : IO Unit`. A `do` expression sequences actions,
+uses `let!` for an action's result, and uses ordinary `let` for a pure value:
 
 ```ouro
 def echo : IO Unit :=
@@ -566,8 +717,13 @@ def echo : IO Unit :=
      println line
 ```
 
-`do let!` is valid only inside a `do` expression. The older `<-` binding
-spelling is not accepted by the strict project profile.
+The pure binding requires a semicolon and a following statement. It scopes
+over the remaining statements, not its own value. Binding an `IO A` value
+leaves that action deferred; use `let!` to run it and bind its result.
+The final statement supplies the `do` expression's result. For `IO A`, make it
+an action of type `IO A`, such as `io_pure A value` for a pure result.
+`let!` is valid only inside a `do` expression. The older `<-` binding spelling
+is not accepted by the strict project profile.
 
 ## Effects and handlers
 

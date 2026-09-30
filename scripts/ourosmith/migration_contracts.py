@@ -58,7 +58,7 @@ TYPED = features("literal", "var", "succ", "add", "lambda", "let", "ascribe", "m
                  "form:nested-descent", "form:nested-tree-fold", "form:bounded-callback",
                  "form:handler", "form:handler-two-ops")
 IMPORTS = features("parity:imports", "parity:imports-open-decl", "parity:imports-open-local",
-                   "parity:imports-plain-alias", "parity:imports-record")
+                   "parity:imports-plain-alias", "parity:imports-record", "parity:imports-private")
 LINT_CLEAN = properties("lint-clean", "lint-clean-used-scopes", "lint-clean-handler-scopes",
                         "lint-clean-imported-refinement", "lint-clean-nullary-multi-match",
                         "lint-clean-refined-slots")

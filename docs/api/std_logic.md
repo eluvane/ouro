@@ -2,7 +2,7 @@
 
 Empty has no constructors; branchless matches are the kernel coverage case for contradiction.
 
-Declarations: 13.
+Declarations: 15.
 
 ## inductive Empty
 
@@ -76,6 +76,18 @@ def curry (A : Type) (B : Type) (C : Type) (f : And A B -> C) (a : A) (b : B) : 
 
 ```
 def uncurry (A : Type) (B : Type) (C : Type) (f : A -> B -> C) (h : And A B) : C
+```
+
+## def compose
+
+```
+def compose (A : Type) (B : Type) (C : Type) (after : B -> C) (before : A -> B) : A -> C
+```
+
+## def flip
+
+```
+def flip (A : Type) (B : Type) (C : Type) (f : A -> B -> C) (right : B) (left : A) : C
 ```
 
 ## inductive Exists

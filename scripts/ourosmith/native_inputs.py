@@ -1,6 +1,7 @@
 """Materialize native selftest inputs from the independent Smith specifications."""
 from __future__ import annotations
 
+import json
 import os
 import tempfile
 from pathlib import Path
@@ -13,6 +14,7 @@ from ourosmith.surface.mutate import mutations
 from ourosmith.surface.text_contracts import cases
 
 GROUPS = ("fmt", "fix", "doc", "lint", "manifest", "runtime", "test", "lsp", "security")
+_MANIFEST_BATCH_ROWS = 29
 
 
 def write(path, text):
@@ -84,7 +86,7 @@ def main : IO Unit :=
         dependency = os.path.relpath(ROOT / "std/prelude.ouro", root).replace("\\", "/")
         imports = f'import "{dependency}";\n'
         source = "-- @entry widget\n" + "\n" * (1 + seed % 5) + imports
-        source += f'\n-- Doubles a natural.\ndef widget (n : Nat) : Nat := add n n;\n\ndef widget_zero : Nat := widget {seed % 5};\n'
+        source += f'\n-- Doubles a natural.\ndef widget (n : Nat)\n    : Nat\n    := add n n;\n\ndef widget_zero : Nat := widget {seed % 5};\n'
         write(root / "sample.ouro", source)
         write(root / "messy.ouro", "-- @entry messy\n\n" + imports + "\ndef messy : Nat := add (S Z) Z;   \n")
     elif group == "security":
@@ -185,6 +187,57 @@ def run(args):
     return 0
 
 
+def manifest_batches(text, prefix):
+    prefixes = tuple(part.strip() for part in prefix.split(",") if part.strip())
+    ids = [line.split("\t", 1)[0].strip() for line in text.splitlines()
+           if line.strip() and not line.lstrip().startswith("#")]
+    selected = sorted({name for name in ids if name.startswith(prefixes)})
+    if not selected:
+        raise ValueError("manifest batch plan selects no rows")
+    groups = {}
+    marker = "ERGO.expansion-"
+    for name in selected:
+        key = name[:len(marker) + 1] if name.startswith(marker) else "original"
+        groups.setdefault(key, []).append(name)
+    batches, covered = [], set()
+    for key, names in sorted(groups.items()):
+        chunks = [names[index:index + _MANIFEST_BATCH_ROWS]
+                  for index in range(0, len(names), _MANIFEST_BATCH_ROWS)]
+        for chunk in chunks:
+            selectors = [key] if key != "original" and len(names) <= _MANIFEST_BATCH_ROWS else chunk
+            actual = {name for name in ids if name.startswith(tuple(selectors))}
+            if actual != set(chunk) or covered.intersection(actual):
+                raise ValueError("manifest batch prefixes overlap or select unexpected rows")
+            covered.update(actual)
+            batches.append((selectors, chunk))
+    if covered != set(selected):
+        raise ValueError("manifest batch coverage differs from the original selection")
+    return batches
+
+
+def manifest_batch_report(directory, manifest, label, prefixes, ids):
+    report = json.loads((directory / "manifest-report.json").read_text(encoding="utf-8"))
+    expected = {"kind": "ouro.test-manifest-report.v1", "version": "1", "suite": label,
+                "manifest": manifest.as_posix(), "root": manifest.parent.as_posix(),
+                "out": directory.as_posix(), "prefixes": prefixes, "rows": len(ids)}
+    if any(report.get(key) != value for key, value in expected.items()):
+        raise ValueError("native manifest report provenance or row count differs")
+    results = report["results"]
+    reported = [row["id"] for row in results]
+    rows = [line.split("|", 1)[0] for line in
+            (directory / "rows.tsv").read_text(encoding="utf-8").splitlines() if line]
+    if len(reported) != len(ids) or set(reported) != set(ids) or rows != reported:
+        raise ValueError("native manifest report has missing, duplicate or unexpected ids")
+    if any(row["status"] not in {"pass", "fail"} for row in results):
+        raise ValueError("native manifest report has an unknown result status")
+    failures = sum(row["status"] == "fail" for row in results)
+    if type(report.get("rows")) is not int or type(report.get("failures")) is not int:
+        raise ValueError("native manifest report counts are not integers")
+    if report["failures"] != failures or report["pass"] is not (failures == 0):
+        raise ValueError("native manifest report status disagrees with its results")
+    return reported, report["pass"]
+
+
 def run_manifest(args):
     from ourosmith.host import binary, ensure_tools, environment
     from ourosmith.limits import run_limited
@@ -197,11 +250,43 @@ def run_manifest(args):
         print("OURO_SMITH: manifest unavailable: " + reason)
         return 1
     fixtures = prepare("manifest", out / "inputs", args.seed)
-    result = run_limited([binary("ouro-test").as_posix(), "--manifest=" + (fixtures / "manifest.tsv").as_posix(),
-                          "--prefix=" + args.prefix, "--out=" + (out / "native").as_posix(),
-                          "--suite-label=" + args.label], cwd=ROOT, env=environment(build=True), timeout_s=300, memory_mb=3072)
-    write(out / "gate.log", result.stdout + result.stderr)
-    print(result.stdout + result.stderr, end="")
-    if not result.ok:
-        print("OURO_SMITH: manifest " + result.classify() + " exit=" + str(result.returncode))
-    return 0 if result.ok else 1
+    manifest = fixtures / "manifest.tsv"
+    master = manifest.read_bytes()
+    batches = manifest_batches(master.decode("utf-8"), args.prefix)
+    records, reported, logs = [], [], []
+    passed = True
+    for index, (prefixes, ids) in enumerate(batches):
+        directory = out / "native" / fixtures.name / f"batch-{index + 1:02d}"
+        result = run_limited([binary("ouro-test").as_posix(), "--manifest=" + manifest.as_posix(),
+                              "--prefix=" + ",".join(prefixes), "--out=" + directory.as_posix(),
+                              "--suite-label=" + args.label], cwd=ROOT, env=environment(build=True),
+                             timeout_s=300, memory_mb=3072)
+        log = result.stdout + result.stderr
+        logs.append(log)
+        write(directory / "gate.log", log)
+        print(log, end="")
+        issue, native_pass = "", False
+        try:
+            batch_ids, native_pass = manifest_batch_report(directory, manifest, args.label, prefixes, ids)
+            reported.extend(batch_ids)
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            issue = str(error)
+        if manifest.read_bytes() != master:
+            issue = "master manifest bytes changed during native execution"
+        batch_passed = result.ok and native_pass and not issue
+        passed = passed and batch_passed
+        records.append({"prefixes": prefixes, "ids": ids, "report": (directory / "manifest-report.json").as_posix(),
+                        "status": result.classify(), "returncode": result.returncode,
+                        "elapsed_s": result.elapsed_s, "native_pass": native_pass,
+                        "pass": batch_passed, "error": issue})
+        if not batch_passed:
+            print("OURO_SMITH: manifest batch " + str(index + 1) + " " + result.classify()
+                  + " exit=" + str(result.returncode) + (": " + issue if issue else ""))
+    selected = [name for _prefixes, ids in batches for name in ids]
+    passed = passed and len(reported) == len(selected) and set(reported) == set(selected)
+    write(out / "gate.log", "".join(logs))
+    write(out / "manifest-batches.json", json.dumps({"kind": "ouro.smith-manifest-batches.v1", "pass": passed,
+          "selected_ids": selected, "reported_ids": reported, "batches": records}, indent=2) + "\n")
+    print(args.label + (": PASS" if passed else ": FAIL") + " rows=" + str(len(reported))
+          + " expected=" + str(len(selected)) + " out=" + (out / "native").as_posix())
+    return 0 if passed else 1

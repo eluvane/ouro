@@ -104,6 +104,22 @@ class SourceContracts(unittest.TestCase):
         self.assertEqual(frontend.SMC.quoted_import_targets(source, "root.ouro"),
                          ["dir/leaf.ouro", "café.ouro"])
 
+    def test_dedented_multiline_hides_imports_and_rejects_import_path(self):
+        source = ('def text : String := """\r\n'
+                  '  import "fake.ouro";\r\n'
+                  '  """; import "real.ouro";')
+        self.assertEqual(frontend.SMC.quoted_import_targets(source, "root.ouro"),
+                         ["real.ouro"])
+        with self.assertRaisesRegex(ValueError, "malformed quoted import"):
+            frontend.SMC.quoted_import_targets('import """\n  path.ouro\n  """;', "root.ouro")
+    def test_byte_literal_does_not_add_import_edges(self):
+        source = (r'def bytes : List Nat := b"import \"fake.ouro\"; -- \x00";'
+                  '\nimport "real.ouro";')
+        self.assertEqual(frontend.SMC.quoted_import_targets(source, "root.ouro"),
+                         ["real.ouro"])
+        with self.assertRaisesRegex(ValueError, "malformed quoted import"):
+            frontend.SMC.quoted_import_targets('import b"invalid.ouro";', "root.ouro")
+
     def test_unterminated_raw_import_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "malformed quoted import"):
             frontend.SMC.quoted_import_targets('import r#"unfinished.ouro";', "root.ouro")
@@ -188,6 +204,19 @@ class RepositorySourceContracts(unittest.TestCase):
         units = frontend.collect_units("tools/lint_style.ouro")
         self.assertIn("std/json.ouro", units)
         self.assertNotIn("compiler/base.ouro", units)
+
+    def test_analyzer_closures_have_unique_declaration_names(self):
+        from selfhost_module_cache import declaration_names
+
+        for root in ("tools/analyze/main.ouro", "tools/analyze/drive_main.ouro"):
+            with self.subTest(root=root):
+                owners = {}
+                for unit in frontend.collect_units(root):
+                    for declaration in declaration_names(unit):
+                        _kind, name = declaration.split(":", 1)
+                        owners.setdefault(name, []).append(unit)
+                self.assertEqual({}, {name: units for name, units in owners.items()
+                                      if len(units) > 1})
 
 
 class BuildContracts(unittest.TestCase):

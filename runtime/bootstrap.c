@@ -208,6 +208,23 @@ static ouro_v *names_list(struct intern_name *tab, int ntab, ouro_v **orig_ids,
 	return list;
 }
 
+static ouro_v *export_pieces_chunk(ouro_v **ids, int start, int count,
+				   ouro_v *dummy)
+{
+	ouro_v *list = ouro_ctor(0, 0, 0);
+	int i;
+	for (i = count - 1; i >= 0; i--) {
+		ouro_v *pair[2];
+		ouro_v *cell[2];
+		pair[0] = ids[start + i];
+		pair[1] = dummy;
+		cell[0] = ouro_ctor(0, 2, pair);
+		cell[1] = list;
+		list = ouro_ctor(1, 2, cell);
+	}
+	return list;
+}
+
 /* Full-length copy of an interned byte list (codes_to_buf truncates at
    MAX_NAME, which is fine for identifiers but not for string literals). */
 static char *codes_to_heap(ouro_v *xs, unsigned long *len_out)
@@ -892,13 +909,18 @@ int main(int argc, char **argv)
 		ouro_v *metadata;
 		ouro_v *emit_g;
 		ouro_v *emit_f;
-		ouro_v *emit_ex;
+		ouro_v *emit_ex_names;
+		ouro_v *emit_ex_vals;
 		ouro_v *hdr;
-		ouro_v *nil;
 		ouro_v *dummy;
-		ouro_v *pieces;
-		ouro_v *nlist;
-		ouro_v *modv;
+		ouro_v *count_open;
+		ouro_v *count_sig;
+		ouro_v *count_end;
+		ouro_v *name_open;
+		ouro_v *switch_sig;
+		ouro_v *name_end;
+		ouro_v *val_open;
+		ouro_v *val_end;
 		ouro_v *fld[2];
 		struct intern_name *tab = 0;
 		int backend_failed = 0;
@@ -1027,16 +1049,43 @@ int main(int argc, char **argv)
 				 ouro_export_name_be, ouro_export_value_be);
 		emit_f = find_in("emit_fwd", ouro_export_count_be(),
 			      ouro_export_name_be, ouro_export_value_be);
-		emit_ex = find_in("emit_exports", ouro_export_count_be(),
-				  ouro_export_name_be, ouro_export_value_be);
+		emit_ex_names = find_in("emit_export_names", ouro_export_count_be(),
+					ouro_export_name_be, ouro_export_value_be);
+		emit_ex_vals = find_in("emit_export_vals", ouro_export_count_be(),
+				       ouro_export_name_be, ouro_export_value_be);
 		hdr = find_in("c_hdr", ouro_export_count_be(),
 			      ouro_export_name_be, ouro_export_value_be);
+		count_open = find_in("c_exp_count_open", ouro_export_count_be(),
+				     ouro_export_name_be, ouro_export_value_be);
+		count_sig = find_in("c_exp_count_sig", ouro_export_count_be(),
+				    ouro_export_name_be, ouro_export_value_be);
+		count_end = find_in("c_exp_count_end", ouro_export_count_be(),
+				    ouro_export_name_be, ouro_export_value_be);
+		name_open = find_in("c_exp_name_open", ouro_export_count_be(),
+				    ouro_export_name_be, ouro_export_value_be);
+		switch_sig = find_in("c_exp_sw_sig", ouro_export_count_be(),
+				    ouro_export_name_be, ouro_export_value_be);
+		name_end = find_in("c_exp_name_end", ouro_export_count_be(),
+				   ouro_export_name_be, ouro_export_value_be);
+		val_open = find_in("c_exp_val_open", ouro_export_count_be(),
+				   ouro_export_name_be, ouro_export_value_be);
+		val_end = find_in("c_exp_val_end", ouro_export_count_be(),
+				  ouro_export_name_be, ouro_export_value_be);
+
+		for (i = 0; i < ouro_export_count_be(); i++)
+			(void)ouro_export_value_be(i);
+		ouro_rt_warmup();
+		fld[0] = ouro_nat(0);
+		dummy = ouro_ctor(0, 1, fld);
+		ouro_heap_mark();
 
 		fprintf(stderr, "ouro1: emit cores=%d names=%d\n", n, ntab);
 
 		ouro_write_codes(hdr, stdout);
-		for (i = 0; i < n; i++)
+		for (i = 0; i < n; i++) {
 			ouro_write_codes(ouro_apply(emit_f, ids[i]), stdout);
+			ouro_heap_reset();
+		}
 
 		/* Standalone-program mode: bind runtime axioms and string
 		   literals to the C host. Off by default so stage emission
@@ -1044,9 +1093,6 @@ int main(int argc, char **argv)
 		if (getenv("OURO_EMIT_IO_SHIMS") != 0)
 			emit_runtime_shims(intern_perm, ids, n, type_ids_v, bindings_v);
 
-		for (i = 0; i < ouro_export_count_be(); i++)
-			(void)ouro_export_value_be(i);
-		ouro_rt_warmup();
 		ouro_heap_mark();
 		for (i = 0; i < n; i++) {
 			const char *nm = lookup_name(tab, ntab, as_nat(ids[i]));
@@ -1081,24 +1127,38 @@ int main(int argc, char **argv)
 			}
 		}
 
-		nil = ouro_ctor(0, 0, 0);
-		fld[0] = ouro_nat(0);
-		dummy = ouro_ctor(0, 1, fld);
-		pieces = nil;
-		for (i = n - 1; i >= 0; i--) {
-			ouro_v *pr[2];
-			pr[0] = ids[i];
-			pr[1] = dummy;
-			fld[0] = ouro_ctor(0, 2, pr);
-			fld[1] = pieces;
-			pieces = ouro_ctor(1, 2, fld);
+		ouro_write_codes(count_open, stdout);
+		fwrite(mod, 1, strlen(mod), stdout);
+		ouro_write_codes(count_sig, stdout);
+		fprintf(stdout, "%d", n);
+		ouro_write_codes(count_end, stdout);
+		ouro_write_codes(name_open, stdout);
+		fwrite(mod, 1, strlen(mod), stdout);
+		ouro_write_codes(switch_sig, stdout);
+		for (i = 0; i < n; i += 64) {
+			int count = n - i < 64 ? n - i : 64;
+			ouro_v *pieces = export_pieces_chunk(ids, i, count, dummy);
+			ouro_v *names = names_list(tab, ntab, ids + i, count);
+			ouro_v *chunk = ouro_apply(
+				ouro_apply(ouro_apply(emit_ex_names, names), pieces),
+				ouro_nat((unsigned long)i));
+			ouro_write_codes(chunk, stdout);
+			ouro_heap_reset();
 		}
-		nlist = names_list(tab, ntab, ids, n);
-		modv = ouro_bytes((const unsigned char *)mod,
-				  (unsigned long)strlen(mod));
-		ouro_write_codes(
-			ouro_apply(ouro_apply(ouro_apply(emit_ex, nlist), pieces), modv),
-			stdout);
+		ouro_write_codes(name_end, stdout);
+		ouro_write_codes(val_open, stdout);
+		fwrite(mod, 1, strlen(mod), stdout);
+		ouro_write_codes(switch_sig, stdout);
+		for (i = 0; i < n; i += 64) {
+			int count = n - i < 64 ? n - i : 64;
+			ouro_v *pieces = export_pieces_chunk(ids, i, count, dummy);
+			ouro_v *chunk = ouro_apply(
+				ouro_apply(emit_ex_vals, pieces),
+				ouro_nat((unsigned long)i));
+			ouro_write_codes(chunk, stdout);
+			ouro_heap_reset();
+		}
+		ouro_write_codes(val_end, stdout);
 		ouro_gc_collect();
 		ouro_heap_report("after-backend-emit");
 	backend_done:

@@ -50,23 +50,30 @@ EXPR = {
     "EListSpread": "feature:form:list-spread",
     "ERange": "feature:form:range-literal",
     "ENamedCall": "feature:form:named-call",
+    "EIf": "feature:form:if-expression",
+    "EIfLet": "feature:form:if-let-expression",
+    "ECoalesce": "feature:form:coalesce-value",
 }
 DECL = {"DDef": "feature:prelude", "DAxiom": "negative:effect-root-assumption-type", "DInductive": "feature:prelude",
         "DEffect": "feature:form:handler", "DImport": "property:import-dependency-order",
         "DIntrinsic": "feature:prelude", "DRepresentation": "feature:prelude", "DExtern": "feature:form:extern-declaration"}
 TOKEN = dict.fromkeys(("TIdent", "TNat", "TKeyword", "TType", "TColon", "TColonEq", "TArrow", "TFatArrow",
                        "TBar", "TLparen", "TRparen", "TSemi", "TEof"), "feature:prelude")
-TOKEN.update({"THole": "negative:named-hole", "TString": "feature:string-length", "TComma": "feature:form:list",
+TOKEN.update({"THole": "negative:named-hole", "TString": "feature:string-length", "TByteString": "feature:form:byte-string", "TComma": "feature:form:list",
               "TBraceL": "feature:form:record", "TBraceR": "feature:form:record", "TBind": "property:test-known-counts",
               "TPipe": "feature:pipe", "TBracketL": "feature:form:list", "TBracketR": "feature:form:list",
-              "TDotDot": "feature:form:list-spread", "TDotDotEq": "feature:form:range-literal"})
+              "TDotDot": "feature:form:list-spread", "TDotDotEq": "feature:form:range-literal",
+              "TCoalesce": "feature:form:coalesce-value"})
 KEYWORD = dict.fromkeys(("kwDef", "kwInductive", "kwFun", "kwMatch", "kwWith", "kwEnd", "kwLet", "kwIn", "kwFix",
                         "kwIntrinsic", "kwRepresentation"), "feature:prelude")
 KEYWORD.update({"kwImport": "property:import-dependency-order", "kwEffect": "feature:form:handler",
                 "kwWhere": "feature:form:handler", "kwDo": "property:test-known-counts",
                 "kwPerform": "feature:form:handler", "kwHandle": "feature:form:handler", "kwRecord": "feature:form:record",
                 "kwAxiom": "negative:effect-root-assumption-type", "kwExtern": "feature:form:extern-declaration",
-                "kwOpen": "feature:parity:imports-open-local"})
+                "kwOpen": "feature:parity:imports-open-local",
+                "kwIf": "feature:form:if-expression", "kwThen": "feature:form:if-expression",
+                "kwElse": "feature:form:if-expression",
+                "kwPrivate": "feature:parity:imports-private"})
 
 # Each exception names an actual missing oracle, rather than accepting new
 # source inventory items automatically. Migration checks treat these as gaps.

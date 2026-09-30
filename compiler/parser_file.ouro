@@ -4,6 +4,7 @@
 -- @export is_core_mode; @doc docs/tcb.md
 -- @export close_parse; @doc docs/tcb.md
 -- @export closed_parse_file; @doc docs/tcb.md
+-- @export closed_parse_file_visibility; @doc docs/tcb.md
 -- @export parse_file; @doc docs/tcb.md
 
 import "parser_min.ouro",
@@ -581,27 +582,93 @@ def parse_declaration_group
             POk (List Decl) [decl] tail position)
     end;
 
-def parse_file (parse : Nat -> Mode -> List Token -> Nat -> Value -> ParseResult Value)
-    : Nat -> List Token -> Nat -> ParseResult (List Decl) :=
-  fix parse_file (fuel : Nat) (toks : List Token) (pos : Nat) : ParseResult (List Decl) :=
+def private_decl_names (decl : Decl) : Maybe (List Nat) :=
+  match decl with
+  | DDef name _ _ _ _ => Just (List Nat) [name]
+  | DAxiom name _ => Just (List Nat) [name]
+  | DInductive name _ _ constructors _ =>
+      Just (List Nat) (Cons Nat name (rec_field_names constructors))
+  | DEffect name _ operations =>
+      Just (List Nat) (Cons Nat name (rec_field_names operations))
+  | DIntrinsic name _ _ _ => Just (List Nat) [name]
+  | DExtern name _ _ => Just (List Nat) [name]
+  | DImport _ => Nothing (List Nat)
+  | DRepresentation _ _ => Nothing (List Nat)
+  end;
+
+def parse_visibility_group
+    (parse : Nat -> Mode -> List Token -> Nat -> Value -> ParseResult Value)
+    (fuel : Nat) (toks : List Token) (pos : Nat) : ParseResult ParsedFile :=
+  match tokenIsKeyword (peek toks) with
+  | Just keyword => match eqNat keyword kwPrivate with
+    | True =>
+        bindParseResult Unit ParsedFile (expect_keyword kwPrivate toks pos)
+          (fun (_ : Unit) (after : List Token) (next : Nat) =>
+            bindParseResult Decl ParsedFile (parse_decl parse fuel after next)
+              (fun (decl : Decl) (tail : List Token) (end_pos : Nat) =>
+                match private_decl_names decl with
+                | Nothing => PErr ParsedFile pos
+                | Just names => POk ParsedFile
+                    (MkParsedFile [decl] names) tail end_pos
+                end))
+    | False =>
+        bindParseResult (List Decl) ParsedFile
+          (parse_declaration_group parse fuel toks pos)
+          (fun (decls : List Decl) (tail : List Token) (end_pos : Nat) =>
+            POk ParsedFile (MkParsedFile decls (Nil Nat)) tail end_pos)
+    end
+  | Nothing =>
+      bindParseResult (List Decl) ParsedFile
+        (parse_declaration_group parse fuel toks pos)
+        (fun (decls : List Decl) (tail : List Token) (end_pos : Nat) =>
+          POk ParsedFile (MkParsedFile decls (Nil Nat)) tail end_pos)
+  end;
+
+def parse_file_visibility
+    (parse : Nat -> Mode -> List Token -> Nat -> Value -> ParseResult Value)
+    : Nat -> List Token -> Nat -> ParseResult ParsedFile :=
+  fix parse_file_visibility (fuel : Nat) (toks : List Token) (pos : Nat)
+      : ParseResult ParsedFile :=
     match fuel with
-    | Z => PErr(List Decl, pos)
+    | Z => PErr(ParsedFile, pos)
     | S fuel' =>
         match is_eof (peek toks) with
-        | True => POk(List Decl, Nil Decl, toks, pos)
+        | True => POk(ParsedFile, MkParsedFile (Nil Decl) (Nil Nat), toks, pos)
         | False =>
-            bindParseResult (List Decl) (List Decl) (parse_declaration_group parse fuel' toks pos)
-              (fun (group : List Decl) (toks2 : List Token) (pos2 : Nat) =>
-                bindParseResult (List Decl) (List Decl) (parse_file fuel' toks2 pos2)
-                  (fun (ds : List Decl) (toks3 : List Token) (pos3 : Nat) =>
-                    POk(List Decl, append Decl group ds, toks3, pos3)))
+            bindParseResult ParsedFile ParsedFile
+              (parse_visibility_group parse fuel' toks pos)
+              (fun (group : ParsedFile) (toks2 : List Token) (pos2 : Nat) =>
+                bindParseResult ParsedFile ParsedFile
+                  (parse_file_visibility fuel' toks2 pos2)
+                  (fun (rest : ParsedFile) (toks3 : List Token) (pos3 : Nat) =>
+                    match group with
+                    | MkParsedFile heads private_heads => match rest with
+                      | MkParsedFile tails private_tails =>
+                          POk ParsedFile
+                            (MkParsedFile (append Decl heads tails)
+                              (append Nat private_heads private_tails))
+                            toks3 pos3
+                      end
+                    end))
         end
     end;
 
--- Same partition as the retired C is_core_mode table (Mode tags 0..34).
+-- AST-only projection for syntax tools. Checked source paths retain
+-- ParsedFile visibility through parse_file_visibility.
+def parse_file (parse : Nat -> Mode -> List Token -> Nat -> Value -> ParseResult Value)
+    (fuel : Nat) (toks : List Token) (pos : Nat) : ParseResult (List Decl) :=
+  match parse_file_visibility parse fuel toks pos with
+  | PErr position => PErr (List Decl) position
+  | POk parsed rest next => match parsed with
+    | MkParsedFile decls _ => POk (List Decl) decls rest next
+    end
+  end;
+
+-- Same partition as the retired C is_core_mode table for the original modes.
 def is_core_mode (m : Mode) : Bool :=
   match m with
   | MExpr => True
+  | MCoalesce => True
   | MPipe => True
   | MPipeTail => True
   | MPi => True
@@ -612,6 +679,7 @@ def is_core_mode (m : Mode) : Bool :=
   | MFun => False
   | MLet => False
   | MMatch => False
+  | MIf => False
   | MFix => False
   | MTypedBinder => True
   | MTypedBinderGroup => True
@@ -636,6 +704,7 @@ def is_core_mode (m : Mode) : Bool :=
   | MHandleClauses => False
   | MPiFromApp => True
   | MDoStmt => False
+  | MTrailingLambda => True
   end;
 
 def close_parse
@@ -665,3 +734,11 @@ def closed_parse_file
       Nat -> Mode -> List Token -> Nat -> Value -> ParseResult Value)
   : Nat -> List Token -> Nat -> ParseResult (List Decl) :=
   parse_file (close_parse parse_a parse_b);
+
+def closed_parse_file_visibility
+  (parse_a : (Nat -> Mode -> List Token -> Nat -> Value -> ParseResult Value) ->
+      Nat -> Mode -> List Token -> Nat -> Value -> ParseResult Value)
+  (parse_b : (Nat -> Mode -> List Token -> Nat -> Value -> ParseResult Value) ->
+      Nat -> Mode -> List Token -> Nat -> Value -> ParseResult Value)
+  : Nat -> List Token -> Nat -> ParseResult ParsedFile :=
+  parse_file_visibility (close_parse parse_a parse_b);

@@ -22,7 +22,7 @@ def ci_compact (harvest : CmHarvest) : Bool :=
       andb (ci_empty_intern intern)
         (andb (all ScDecl (fun (decl : ScDecl) => match sc_decl_body decl with
           | Nothing => True | Just _ => False end) symbols)
-          (andb (nullb Decl decls)
+          (andb (nullb Decl (cm_parsed_decls decls))
             (match origins with
              | Cons fact rest => andb (nullb CsOriginFact rest) (match fact with
                | CsOriginOf owner name origin =>
@@ -30,6 +30,7 @@ def ci_compact (harvest : CmHarvest) : Bool :=
                      andb(eq_nat(owner, sc_decl_module decl), eq_nat(name, sc_decl_name decl))) symbols)
                      (match origin with | CsArgumentOrigin arg => eq_nat arg 1
                       | CsUnknownOrigin => False | CsLiteralOrigin _ _ => False
+                      | CsGlobalValueOrigin _ => False
                       | CsDelegateOrigin _ _ => False end)
                end)
              | Nil => False end)))
@@ -46,7 +47,7 @@ def ci_analyze (intern : InternState) (cache : CmParseCache) (symbols : List ScD
     | Left _ => Nothing CiSnapshot
     | Right index => match load_intern_string(intern, prim_string_to_char_codes "caller.ouro") with
       | MkPair entry keyed =>
-          let unit : ClippySemanticUnit := CmUnit keyed entry "" [] symbols index [] 2 origins in
+          let unit : ClippySemanticUnit := CmUnit keyed entry "" [] symbols index [] 2 origins cm_empty_resolved_imports in
           match cm_build_apis unit index with
           | Left _ => Nothing CiSnapshot
           | Right apis => match cm_api_lookup name
@@ -121,3 +122,93 @@ def ci_cache_law : Bool :=
          end)
       end
     end;
+
+def ci_global_wrapper_source : String :=
+    "import \"target.ouro\"; def ignore_value (value : Choice) : Choice := Value;\n";
+
+def ci_global_target_before : String :=
+    "inductive Choice : Type := | Value : Choice;                             \n";
+
+def ci_global_target_after : String :=
+    "inductive Choice : Type := | Other : Choice;\ndef Value : Choice := Other;\n";
+
+def ci_global_request (source : String) (intern : InternState) (cache : CmParseCache) : Maybe CiSnapshot :=
+    match cm_load_file_cached (MkPair String String "ignored.ouro" ci_global_wrapper_source) intern cache with
+    | Left _ => Nothing CiSnapshot
+    | Right wrapper => match wrapper with | MkPair wh wc => match wh with
+      | MkHarvest wi ws _ _ wo => match ws with
+        | Nil => Nothing CiSnapshot
+        | Cons decl _ => match cm_load_file_cached (MkPair String String "target.ouro" source) wi wc with
+          | Left _ => Nothing CiSnapshot
+          | Right target => match target with | MkPair th tc => match th with
+            | MkHarvest ti ts _ _ target_origins =>
+                ci_analyze ti tc (append ScDecl ws ts) (append CsOriginFact wo target_origins)
+                  (sc_decl_name decl)
+                  (all ScDecl (fun (item : ScDecl) => match sc_decl_body item with
+                    | Nothing => True | Just _ => False end) (append ScDecl ws ts))
+            end end
+          end
+        end
+      end end
+    end;
+
+def ci_global_proven (snapshot : CiSnapshot) : Bool :=
+    match snapshot with | CiSnapshotOf intern _ summary compact =>
+      andb compact (andb (cs_pure summary) (andb (notb (cs_argument_escapes summary 0))
+        (match summary with | CsContract owner name _ _ _ origin _ _ _ _ =>
+          andb (prim_string_eq(cm_string intern owner, "ignored.ouro"))
+            (andb (prim_string_eq(cm_name intern name, "ignore_value"))
+              (match origin with
+               | CsGlobalValueOrigin target => prim_string_eq(cm_name intern target, "Value")
+               | CsUnknownOrigin => False | CsArgumentOrigin _ => False
+               | CsLiteralOrigin _ _ => False | CsDelegateOrigin _ _ => False end))
+          end)))
+    end;
+
+-- Equal-length edits keep the wrapper and intern key; current metadata must win.
+def ci_global_cache_law : Bool :=
+    match ci_global_request ci_global_target_before empty_intern cm_cache0 with
+    | Nothing => False
+    | Just cold => match cold with | CiSnapshotOf intern cache _ _ =>
+      andb (ci_global_proven cold)
+        (match ci_global_request ci_global_target_before intern cache with
+         | Nothing => False
+         | Just warm => match warm with | CiSnapshotOf updated reused _ _ =>
+           andb (ci_global_proven warm)
+             (andb (ci_cache_hit reused "ignored.ouro" ci_global_wrapper_source)
+               (match ci_global_request ci_global_target_after updated reused with
+                | Nothing => False
+                | Just edited => match edited with | CiSnapshotOf _ next rejected _ =>
+                  andb (notb (cs_complete rejected))
+                    (andb (notb (cs_pure rejected))
+                      (andb (ci_cache_hit next "ignored.ouro" ci_global_wrapper_source)
+                        (andb (ci_cache_hit next "target.ouro" ci_global_target_after)
+                          (eq_nat (prim_string_length ci_global_target_before)
+                            (prim_string_length ci_global_target_after)))))
+                  end
+                end))
+           end
+         end)
+      end
+    end;
+
+def ci_global_duplicate_source (source : String) : Bool :=
+    match cm_load_file (MkPair String String "target.ouro" source) empty_intern with
+    | Left _ => False
+    | Right harvest => match harvest with | MkHarvest intern symbols _ _ _ =>
+      andb (eq_nat (length ScDecl (filter ScDecl (fun (decl : ScDecl) =>
+        prim_string_eq(cm_name intern (sc_decl_name decl), "Value")) symbols)) 2)
+        (match sc_index_sorted (quality_sort ScDecl
+          (fun (a : ScDecl) (b : ScDecl) => leb_nat(sc_decl_name a, sc_decl_name b)) symbols) with
+         | Right _ => False
+         | Left error => match error with
+           | ScIndexAmbiguous => True | ScIndexExhausted => False | ScIndexIncomplete => False
+           | ScIndexPartial => False | ScUnresolved _ => False | ScSignatureExhausted => False end
+         end)
+      end
+    end;
+
+def ci_global_duplicate_law : Bool :=
+    all String ci_global_duplicate_source
+      ["inductive Choice : Type := | Value : Choice | Value : Choice;\n",
+       "inductive Choice : Type := | Value : Choice; def Value : Choice := Value;\n"];

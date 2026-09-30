@@ -159,7 +159,7 @@ static ouro_v *cerr(unsigned long code, unsigned long det)
 	return ouro_ctor(0, 1, box);
 }
 
-static ouro_v *g_closed_parse_file;
+static ouro_v *g_closed_parse_file_visibility;
 static ouro_v *g_last_intern;
 static ouro_v *g_last_checked_program;
 
@@ -486,16 +486,16 @@ static ouro_v *pair_snd(ouro_v *p)
 	return OURO_F(p, p->n - 1);
 }
 
-static ouro_v *closed_parse_file(void)
+static ouro_v *closed_parse_file_visibility(void)
 {
 	ouro_v *fn;
-	if (g_closed_parse_file != 0)
-		return g_closed_parse_file;
+	if (g_closed_parse_file_visibility != 0)
+		return g_closed_parse_file_visibility;
 	ouro_static_begin();
-	fn = FIND(pf, "closed_parse_file");
+	fn = FIND(pf, "closed_parse_file_visibility");
 	fn = ouro_apply(fn, FIND(pa, "parse_a"));
 	fn = ouro_apply(fn, FIND(pb, "parse_b"));
-	g_closed_parse_file = fn;
+	g_closed_parse_file_visibility = fn;
 	ouro_static_end();
 	return fn;
 }
@@ -510,7 +510,7 @@ static ouro_v *packed_stitch_source(void)
 	ouro_static_begin();
 	fn = FIND(pl, "stitch_checked_source");
 	fn = ouro_apply(fn, FIND(lx, "lex_go_import"));
-	fn = ouro_apply(fn, closed_parse_file());
+	fn = ouro_apply(fn, closed_parse_file_visibility());
 	fn = ouro_apply(fn, FIND(ds, "desugar_file"));
 	fn = ouro_apply(fn, FIND(lr, "rewrite_declarations"));
 	fn = ouro_apply(fn, FIND(lo, "lower_expr_env2"));
@@ -596,6 +596,39 @@ static ouro_v *bounded_token_fuel(ouro_env *env, ouro_v *fuel)
 	return ouro_clos(bounded_token_source, ouro_cons(fuel, env));
 }
 
+/* Token/span callbacks borrow caller values, which may belong to an outer
+   phase mark. Copy survivors into the restored caller allocator so an outer
+   clone cannot share a permanent node that still points into that phase. */
+static ouro_v *import_token_state(ouro_env *env, ouro_v *st)
+{
+	ouro_v *fn = ouro_get(env, 2);
+	ouro_v *fuel = ouro_get(env, 1);
+	ouro_v *src = ouro_get(env, 0);
+	ouro_heap_context *context = ouro_heap_context_enter();
+	ouro_v *result = ouro_apply(ouro_apply(ouro_apply(fn, fuel), src), st);
+	return ouro_heap_context_leave(context, result);
+}
+
+static ouro_v *import_token_source(ouro_env *env, ouro_v *src)
+{
+	return ouro_clos(import_token_state, ouro_cons(src, env));
+}
+
+static ouro_v *import_token_fuel(ouro_env *env, ouro_v *fuel)
+{
+	return ouro_clos(import_token_source, ouro_cons(fuel, env));
+}
+
+ouro_v *ouro_wrap_settled3(ouro_v *raw)
+{
+	return ouro_clos(import_token_fuel, ouro_cons(raw, 0));
+}
+
+ouro_v *ouro_wrap_import_token(ouro_v *raw)
+{
+	return ouro_wrap_settled3(raw);
+}
+
 static ouro_v *closed_parse_unit(void)
 {
 	ouro_v *fn;
@@ -606,7 +639,7 @@ static ouro_v *closed_parse_unit(void)
 	fn = ouro_apply(fn, ouro_apply(FIND(lx, "lex_go_with"),
 		ouro_clos(bounded_token_fuel, 0)));
 	fn = ouro_apply(fn, FIND(lx, "intern_string"));
-	fn = ouro_apply(fn, closed_parse_file());
+	fn = ouro_apply(fn, closed_parse_file_visibility());
 	g_closed_parse_unit = fn;
 	ouro_static_end();
 	return fn;
@@ -851,8 +884,10 @@ static int unit_prepass_incremental(ouro_v *files, ouro_v **out_files,
 			free(alias_items);
 			return 0;
 		}
-		path = ouro_clone_perm_deep(pair_fst(f));
-		src = ouro_clone_perm_deep(pair_snd(f));
+		/* Inputs already live in this perm bank. Share them; a deep clone
+		   here recopies every source before preprocessing starts. */
+		path = ouro_clone_perm(pair_fst(f));
+		src = ouro_clone_perm(pair_snd(f));
 		in_items[i] = perm_pair(path, src);
 	}
 	if (n > 0 && out_items != 0) {
@@ -878,10 +913,15 @@ static int unit_prepass_incremental(ouro_v *files, ouro_v **out_files,
 				ok = 0;
 				break;
 			}
-			reg = ouro_clone_perm_deep(OURO_F(r, r->n - 3));
-			aliases = ouro_clone_perm_deep(OURO_F(r, r->n - 2));
-			src2 = ouro_clone_perm_deep(OURO_F(r, r->n - 1));
-			path = ouro_clone_perm_deep(path);
+			/* The record registry is threaded through every file. Deep-cloning
+			   it recopies the whole accumulated graph on each file and is
+			   what pushes one native_build emit past the 900s host budget.
+			   Share nodes already in this perm bank; copy only this file's
+			   phase allocations. discard_phase below then drops the scratch. */
+			reg = ouro_clone_perm(OURO_F(r, r->n - 3));
+			aliases = ouro_clone_perm(OURO_F(r, r->n - 2));
+			src2 = ouro_clone_perm(OURO_F(r, r->n - 1));
+			path = ouro_clone_perm(path);
 			out_items[i] = perm_pair(path, src2);
 			alias_items[i] = perm_pair(path, aliases);
 			fe_phase_done("frontend-after-preprocess-unit");

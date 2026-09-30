@@ -1,7 +1,35 @@
 -- First split parser shard; keep shared parser types in parser_min to avoid duplicate generated symbols.
 
 import "parser_min.ouro",
-  "token.ouro";
+  "token.ouro",
+  "parse_b.ouro";
+
+-- Postfix where binds after the complete expression, with ordinary lets.
+def parse_a_expr
+    (parse : Nat -> Mode -> List Token -> Nat -> Value -> ParseResult Value)
+    (fuel : Nat) (toks : List Token) (pos : Nat) (extra : Value)
+    : ParseResult Value :=
+  bindValue Expr asExpr (parse fuel MCoalesce toks pos extra)
+    (fun (body : Expr) (tail : List Token) (past : Nat) =>
+      parse_b_where_tail parse fuel body tail past extra);
+
+def parse_a_coalesce
+  (parse : Nat -> Mode -> List Token -> Nat -> Value -> ParseResult Value)
+  (fuel' : Nat) (toks : List Token) (pos : Nat) (extra : Value) : ParseResult Value :=
+    bindValue Expr asExpr (parse fuel' MPipe toks pos extra)
+      (fun (lhs : Expr) (tail : List Token) (position : Nat) =>
+        match is_coalesce (peek tail) with
+        | False => okExpr lhs tail position
+        | True =>
+            match tail with
+            | Nil => PErr Value position
+            | Cons _ rest =>
+                bindValue Expr asExpr
+                  (parse fuel' MCoalesce rest (S position) extra)
+                  (fun (rhs : Expr) (after : List Token) (end_pos : Nat) =>
+                    okExpr (ECoalesce lhs rhs) after end_pos)
+            end
+        end);
 
 -- One arm per Mode, so the branch count is the size of the mode table.
 -- @bound(cyclo <= 132)
@@ -93,10 +121,10 @@ def parse_a_call_arguments
   (parse : Nat -> Mode -> List Token -> Nat -> Value -> ParseResult Value)
   (fuel : Nat) (head : Expr) (toks : List Token) (pos : Nat)
   (extra : Value) : ParseResult Value :=
-  let finish (head : Expr) (rows : List (Pair Nat Expr))
+  let finish (applied_head : Expr) (rows : List (Pair Nat Expr))
       (named : Bool) : Expr :=
     match named with
-    | True => ENamedCall head rows
+    | True => ENamedCall applied_head rows
     | False =>
         (fix apply (items : List (Pair Nat Expr)) (term : Expr) : Expr :=
           match items with
@@ -105,21 +133,21 @@ def parse_a_call_arguments
               match pair with
               | MkPair _ argument => apply rest (EApp term argument)
               end
-          end) rows head
+          end) rows applied_head
     end in
-  (fix arguments (fuel : Nat) (head : Expr)
+  (fix arguments (step_fuel : Nat) (step_head : Expr)
       (rows : List (Pair Nat Expr)) (named : Bool)
-      (toks : List Token) (pos : Nat) (extra : Value) : ParseResult Value :=
-    match fuel with
-    | Z => PErr Value pos
+      (step_tokens : List Token) (step_pos : Nat) (step_extra : Value) : ParseResult Value :=
+    match step_fuel with
+    | Z => PErr Value step_pos
     | S remaining =>
         let parsed : ParseResult (Pair Nat Expr) :=
-          match toks with
-          | Nil => PErr (Pair Nat Expr) pos
+          match step_tokens with
+          | Nil => PErr (Pair Nat Expr) step_pos
           | Cons first after_first =>
               match tokenIsIdent first with
               | Nothing =>
-                  match parse_a_call_argument parse remaining toks pos extra with
+                  match parse_a_call_argument parse remaining step_tokens step_pos step_extra with
                   | PErr p => PErr (Pair Nat Expr) p
                   | POk value rest end_pos =>
                       match asExpr value with
@@ -131,7 +159,7 @@ def parse_a_call_arguments
               | Just label =>
                   match eqNat(token_tag(peek after_first), tagColonEq) with
                   | False =>
-                      match parse_a_call_argument parse remaining toks pos extra with
+                      match parse_a_call_argument parse remaining step_tokens step_pos step_extra with
                       | PErr p => PErr (Pair Nat Expr) p
                       | POk value rest end_pos =>
                           match asExpr value with
@@ -141,7 +169,7 @@ def parse_a_call_arguments
                           end
                       end
                   | True =>
-                      match bump after_first (S pos) with
+                      match bump after_first (S step_pos) with
                       | MkPair after_assign rhs_pos =>
                           match orb(is_comma(peek after_assign),
                               eqNat(token_tag(peek after_assign), tagRparen)) with
@@ -151,7 +179,7 @@ def parse_a_call_arguments
                                 after_assign rhs_pos
                           | False =>
                               match parse_a_call_argument parse remaining
-                                  after_assign rhs_pos extra with
+                                  after_assign rhs_pos step_extra with
                               | PErr p => PErr (Pair Nat Expr) p
                               | POk value rest end_pos =>
                                   match asExpr value with
@@ -171,7 +199,7 @@ def parse_a_call_arguments
             match row with
             | MkPair label _ =>
                 match andb named (eqNat label Z) with
-                | True => PErr Value pos
+                | True => PErr Value step_pos
                 | False =>
                     let all : List (Pair Nat Expr) :=
                       append (Pair Nat Expr) rows [row] in
@@ -180,7 +208,7 @@ def parse_a_call_arguments
                     | False =>
                         bindParseResult Unit Value (expect_rparen tail position)
                           (fun (_u : Unit) (after : List Token) (next : Nat) =>
-                            okExpr (finish head all any_named) after next)
+                            okExpr (finish step_head all any_named) after next)
                     | True =>
                         match bump tail position with
                         | MkPair after next =>
@@ -188,15 +216,82 @@ def parse_a_call_arguments
                             | True =>
                                 bindParseResult Unit Value (expect_rparen after next)
                                   (fun (_u : Unit) (rest : List Token) (end_pos : Nat) =>
-                                    okExpr (finish head all any_named) rest end_pos)
+                                    okExpr (finish step_head all any_named) rest end_pos)
                             | False =>
-                                arguments remaining head all any_named after next extra
+                                arguments remaining step_head all any_named after next step_extra
                             end
                         end
                     end
                 end
             end)
     end) fuel head (Nil (Pair Nat Expr)) False toks pos extra;
+
+def parse_a_trailing_lambda
+  (parse : Nat -> Mode -> List Token -> Nat -> Value -> ParseResult Value)
+  (fuel' : Nat) (toks : List Token) (pos : Nat) (extra : Value) : ParseResult Value :=
+  bindParseResult Unit Value (expect_brace_l toks pos)
+    (fun (_open : Unit) (after_open : List Token) (binder_pos : Nat) =>
+      bindParseResult Nat Value (expect_ident after_open binder_pos)
+        (fun (binder : Nat) (after_binder : List Token) (arrow_pos : Nat) =>
+          bindParseResult Unit Value (expect_arrow after_binder arrow_pos)
+            (fun (_arrow : Unit) (after_arrow : List Token) (body_pos : Nat) =>
+              bindValue Expr asExpr (parse fuel' MExpr after_arrow body_pos extra)
+                (fun (body : Expr) (after_body : List Token) (close_pos : Nat) =>
+                  bindParseResult Unit Value (expect_brace_r after_body close_pos)
+                    (fun (_close : Unit) (tail : List Token) (end_pos : Nat) =>
+                      okExpr (ELam binder (Nothing Expr) body) tail end_pos)))));
+
+def parse_a_is_named_call (term : Expr) : Bool :=
+  match term with
+  | EVar _ => False
+  | EHole _ => False
+  | ESort _ => False
+  | ENat _ => False
+  | EApp _ _ => False
+  | ELam _ _ _ => False
+  | EPi _ _ _ => False
+  | ELet _ _ _ _ => False
+  | EAscribe _ _ => False
+  | EMatch _ _ => False
+  | ECoalesce _ _ => False
+  | EFix _ _ _ _ => False
+  | EEffectRow _ _ => False
+  | EPerform _ _ => False
+  | EDo _ => False
+  | EHandle _ _ => False
+  | EBranch _ _ _ => False
+  | ENoBranch => False
+  | EBinder _ _ _ => False
+  | ENoBinder => False
+  | EMultiMatch _ _ => False
+  | EStr _ => False
+  | EDoBind _ _ => False
+  | EList _ => False
+  | ESpan _ _ _ => False
+  | EFallible _ _ _ _ => False
+  | EOpen _ _ => False
+  | EListSpread _ _ => False
+  | ENamedCall _ _ => True
+  | ERange _ _ _ => False
+  | EIf _ _ _ => False
+  | EIfLet _ _ _ _ => False
+  end;
+
+def parse_a_call_trailing_lambda
+  (parse : Nat -> Mode -> List Token -> Nat -> Value -> ParseResult Value)
+  (fuel' : Nat) (head : Expr) (toks : List Token) (pos : Nat) (extra : Value)
+  : ParseResult Value :=
+  match eqNat(token_tag (peek toks), tagBraceL) with
+  | False => parse fuel' MAppTail toks pos (VExpr head)
+  | True =>
+      match parse_a_is_named_call head with
+      | True => PErr Value pos
+      | False =>
+          bindValue Expr asExpr (parse fuel' MTrailingLambda toks pos extra)
+            (fun (callback : Expr) (tail : List Token) (end_pos : Nat) =>
+              parse fuel' MAppTail tail end_pos (VExpr (EApp head callback)))
+      end
+  end;
 
 def parse_a_apptail
   (parse : Nat -> Mode -> List Token -> Nat -> Value -> ParseResult Value)
@@ -214,7 +309,7 @@ def parse_a_apptail
                     bindValue Expr asExpr
                       (parse_a_call_arguments parse fuel' head tail position extra)
                       (fun (applied : Expr) (after : List Token) (next : Nat) =>
-                        parse fuel' MAppTail after next (VExpr applied)))
+                        parse_a_call_trailing_lambda parse fuel' applied after next extra))
             | False =>
                 bindValue Expr asExpr (parse fuel' MAtom toks pos extra)
                   (fun (a : Expr) (toks3 : List Token) (pos3 : Nat) =>
@@ -261,6 +356,11 @@ def parse_a_atom
                 match tokenIsString t with
                 | Just n => okExpr(EStr n, rest, S pos)
                 | Nothing =>
+                match tokenIsByteString t with
+                | Just bytes =>
+                    okExpr(EList (map Nat Expr (fun (byte : Nat) => ENat byte) bytes),
+                      rest, S pos)
+                | Nothing =>
                 match tokenIsType t with
                 | Just u => okExpr(ESort u, rest, S pos)
                 | Nothing =>
@@ -280,6 +380,7 @@ def parse_a_atom
                             end
                         end
                     end
+                end
                 end
                 end
             end
@@ -335,15 +436,19 @@ def parse_a_keywordatom
                     match eqNat k kwFix with
                     | True => parse fuel' MFix toks pos extra
                     | False =>
-                        match eqNat k kwPerform with
-                        | True => parse fuel' MPerform toks pos extra
+                        match eqNat k kwIf with
+                        | True => parse fuel' MIf toks pos extra
                         | False =>
-                            match eqNat k kwDo with
-                            | True => parse fuel' MDo toks pos extra
+                            match eqNat k kwPerform with
+                            | True => parse fuel' MPerform toks pos extra
                             | False =>
-                                match eqNat k kwHandle with
-                                | True => parse fuel' MHandle toks pos extra
-                                | False => PErr Value pos
+                                match eqNat k kwDo with
+                                | True => parse fuel' MDo toks pos extra
+                                | False =>
+                                    match eqNat k kwHandle with
+                                    | True => parse fuel' MHandle toks pos extra
+                                    | False => PErr Value pos
+                                    end
                                 end
                             end
                         end
@@ -599,7 +704,8 @@ def parse_a (parse : Nat -> Mode -> List Token -> Nat -> Value -> ParseResult Va
     | Z => PErr Value pos
     | S fuel' =>
         match mode with
-        | MExpr => parse fuel' MPipe toks pos extra
+        | MExpr => parse_a_expr parse fuel' toks pos extra
+        | MCoalesce => parse_a_coalesce parse fuel' toks pos extra
         | MPipe =>
             bindValue Expr asExpr (parse fuel' MPi toks pos extra)
               (fun (lhs : Expr) (toks2 : List Token) (pos2 : Nat) =>
@@ -618,6 +724,7 @@ def parse_a (parse : Nat -> Mode -> List Token -> Nat -> Value -> ParseResult Va
         | MFun => parse fuel mode toks pos extra
         | MLet => parse fuel mode toks pos extra
         | MMatch => parse fuel mode toks pos extra
+        | MIf => parse fuel mode toks pos extra
         | MFix => parse fuel mode toks pos extra
         | MTypedBinder => parse_a_typedbinder parse fuel' toks pos extra
         | MTypedBinderGroup => parse_a_typedbindergroup parse fuel' toks pos extra
@@ -640,5 +747,6 @@ def parse_a (parse : Nat -> Mode -> List Token -> Nat -> Value -> ParseResult Va
         | MDo => parse fuel mode toks pos extra
         | MHandle => parse fuel mode toks pos extra
         | MHandleClauses => parse fuel mode toks pos extra
+        | MTrailingLambda => parse_a_trailing_lambda parse fuel' toks pos extra
         end
     end;

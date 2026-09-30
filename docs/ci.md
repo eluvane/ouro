@@ -18,6 +18,7 @@ are not passes.
 | Workflow policy | `python3 scripts/github_workflow_gate.py` |
 | Formatter / fixer | `sh scripts/fmt_suite.sh` / `sh scripts/fix_suite.sh` |
 | Linter / analyzer | `sh scripts/lint_suite.sh` / `sh scripts/analyze_precision_suite.sh` |
+| Public API fingerprints | `python3 scripts/api_baseline_regen_test.py` and `python3 scripts/api_baseline_regen.py --check` |
 | Packages / LSP | `sh scripts/pkg_suite.sh` / `sh scripts/lsp_suite.sh` |
 | Runtime and IO / samples | `sh scripts/runtime_io_suite.sh` / `sh scripts/samples_suite.sh` |
 | User test runner | `sh scripts/test_suite.sh` |
@@ -62,7 +63,8 @@ runs in Nightly and on demand. Run one group with:
 python3 scripts/ci_gate.py --profile pr --group checks
 ```
 
-The group names are `checks`, `checks-parity`, `checks-quality`, `analysis`, `checker`, `analyzer`, `lint`,
+The group names are `checks`, `checks-parity`, `checks-quality`, `analysis`, `checker`, `analyzer`,
+`analyzer-lint`, `lint`,
 `tests`, `smith`, `samples-1`, `samples-2`, and `compiler-1` through
 `compiler-16`. Substitute the selected name after `--group`.
 
@@ -76,8 +78,10 @@ local command runs every gate in registry order. The runner rejects a group
 inventory that omits, duplicates, or invents a gate; its self-test also checks
 complete matrix coverage and the affected-path routing contracts. The
 `analysis` group owns memory budgets, C analysis, and LSP; `checker` owns
-hardening, scale, and depth; `analyzer` owns analyzer precision and
-`lint-changed`. The complete Ouro lint suite runs in Nightly, the full
+hardening, scale, and depth. In PR validation, `analyzer` owns analyzer
+precision and `analyzer-lint` owns `lint-changed`. They run in separate jobs,
+each with the existing 120-minute limit; their gate commands and per-program
+limits are unchanged. The complete Ouro lint suite runs in Nightly, the full
 **Manual** workflow, and **Lint → Run workflow**; PR, push, merge-queue and
 Release jobs exclude its group. A pull request instead runs `lint-changed`:
 `ouro1 lint --deny` over the changed `.ouro` files that the complete suite's
@@ -98,7 +102,10 @@ at a report path is never removed. Listing profiles does not change reports.
 Manual and Release prepare the current compiler before running each validation
 group, including when a restored compiler cache lacks its bootstrap evidence.
 PR and Nightly validation jobs allow 120 minutes for the complete group;
-per-program execution and memory limits remain separate. PR Linux jobs depend
+per-program execution and memory limits remain separate. Independent PR matrix
+groups finish when a sibling fails. Each group retains its fail-fast command,
+and the aggregate requires every selected validation job to succeed. PR Linux
+jobs depend
 on one `Host compiler` job, which restores or builds the compiler with its
 complete bootstrap evidence and publishes a workflow-local artifact. Each
 consumer checks the producer's SHA-256 and verifies the binary, current inputs,
@@ -163,7 +170,7 @@ uploaded separately as `nightly-<group>` artifacts. Hosted PR matrix jobs use st
 matrix does not publish an unevaluated expression. When those jobs run,
 GitHub appends the matrix value: `PR (checks)`, `PR (checks-parity)`,
 `PR (checks-quality)`, `PR (analysis)`, `PR (checker)`,
-`PR (analyzer)`, `PR (tests)`,
+`PR (analyzer)`, `PR (analyzer-lint)`, `PR (tests)`,
 `PR (smith)`, `PR (samples-1)`, `PR (samples-2)`, `PR (compiler-1)` through
 `PR (compiler-16)`, `Portable (ubuntu-latest)`,
 and `Portable (macos-latest)`. Linux Portable uses the shared compiler;
@@ -204,7 +211,10 @@ python3 scripts/ci_gate.py --profile docs --out _build/ci/docs
 
 ### Affected PR checks
 
-`Paths` first runs the CI runner's self-tests, before compiler builds. It then
+`Paths` first runs the CI runner's self-tests and
+`python3 scripts/clippy_import_gap.py --self-test`, before compiler builds.
+The gap command reads stub inventories, imports, and match arms. The repository scan
+is `python3 scripts/clippy_import_gap.py`. It then
 compares the PR base with GitHub's tested merge commit. The NUL-delimited local
 Git diff has no API file-list limit; rename detection is disabled so both the
 old and new path contribute to selection. Missing revisions, Git errors,
@@ -245,7 +255,7 @@ Do not require individual dynamic matrix names in branch protection.
 
 The GitHub job summary lists selected groups and gates. Full runs enqueue the
 three long check groups and isolated `source_spans` shard before the other compiler shards.
-PR matrix jobs cancel remaining siblings after a
+PR matrix jobs continue independently after a sibling
 failure, and each group stops at its first blocking failure while recording
 unexecuted gates as `not_run`. Nightly and ordinary local profiles still gather
 all failures. Obsolete runs are cancelled by the existing concurrency group.

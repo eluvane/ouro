@@ -160,10 +160,12 @@ def process_run_spec_inherited_checked (command : CommandSpec) : IO (Either Proc
 
 ```
 def process_run_spec_captured_bounded (limits : ProcessCaptureLimits) (command : CommandSpec)
+    : IO (Either ProcessCaptureError ProcessCaptureResult)
 ```
 
 ## def process_run_spec_captured_bounded_with_input
 
 ```
 def process_run_spec_captured_bounded_with_input (limits : ProcessCaptureLimits) (command : CommandSpec) (input : String)
+    : IO (Either ProcessCaptureError ProcessCaptureResult)
 ```

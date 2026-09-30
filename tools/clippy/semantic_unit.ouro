@@ -11,6 +11,7 @@ import "structural_frontend.ouro",
   "../../compiler/parser_parse.ouro",
   "../../compiler/semantic_scope.ouro",
   "../../compiler/import_resolve.ouro",
+  "../../compiler/module_registry.ouro",
   "../../compiler/canonical_hash.ouro",
   "../quality/source.ouro",
   "../quality/input_error.ouro";
@@ -83,65 +84,345 @@ def cm_import_ids (decls : List Decl) : List Nat :=
 -- copying the growing declaration accumulator on every module completion.
 def cm_graph_units (units : List SrcUnit) : List SrcUnit :=
     map SrcUnit SrcUnit (fun (unit : SrcUnit) => match unit with
-      | MkSrcUnit name decls => MkSrcUnit name
-          (map(Nat, Decl, fun (id : Nat) => DImport id, cm_import_ids decls))
+      | MkSrcUnit name _ => mk_src_unit name
+          (map(Nat, Decl, fun (id : Nat) => DImport id,
+            cm_import_ids (src_unit_decls unit))) []
       end) units;
 
+inductive CmResolvedImports : Type :=
+  | CmResolvedImportsOf : List ModuleAliasUnit -> List ModuleMember -> CmResolvedImports;
+
+def cm_empty_resolved_imports : CmResolvedImports :=
+    CmResolvedImportsOf (Nil ModuleAliasUnit) (Nil ModuleMember);
+
 inductive ClippySemanticUnit : Type :=
-  | CmUnit : InternState -> Nat -> String -> List SrcUnit -> List ScDecl -> ScIndex -> List Decl -> Nat -> List CsOriginFact -> ClippySemanticUnit;
+  | CmUnit : InternState -> Nat -> String -> List SrcUnit -> List ScDecl -> ScIndex -> List Decl -> Nat -> List CsOriginFact -> CmResolvedImports -> ClippySemanticUnit;
 
 def cm_intern (item : ClippySemanticUnit) : InternState :=
-    match item with | CmUnit value _ _ _ _ _ _ _ _ => value end;
+    match item with | CmUnit value _ _ _ _ _ _ _ _ _ => value end;
 
 def cm_entry (item : ClippySemanticUnit) : Nat :=
-    match item with | CmUnit _ value _ _ _ _ _ _ _ => value end;
+    match item with | CmUnit _ value _ _ _ _ _ _ _ _ => value end;
 
 def cm_source (item : ClippySemanticUnit) : String :=
-    match item with | CmUnit _ _ value _ _ _ _ _ _ => value end;
+    match item with | CmUnit _ _ value _ _ _ _ _ _ _ => value end;
 
 def cm_units (item : ClippySemanticUnit) : List SrcUnit :=
-    match item with | CmUnit _ _ _ value _ _ _ _ _ => value end;
+    match item with | CmUnit _ _ _ value _ _ _ _ _ _ => value end;
 
 def cm_declarations (item : ClippySemanticUnit) : List ScDecl :=
-    match item with | CmUnit _ _ _ _ value _ _ _ _ => value end;
+    match item with | CmUnit _ _ _ _ value _ _ _ _ _ => value end;
 
 def cm_index (item : ClippySemanticUnit) : ScIndex :=
-    match item with | CmUnit _ _ _ _ _ value _ _ _ => value end;
+    match item with | CmUnit _ _ _ _ _ value _ _ _ _ => value end;
 
 def cm_root_decls (item : ClippySemanticUnit) : List Decl :=
-    match item with | CmUnit _ _ _ _ _ _ value _ _ => value end;
+    match item with | CmUnit _ _ _ _ _ _ value _ _ _ => value end;
 
 def cm_origins (item : ClippySemanticUnit) : List CsOriginFact :=
-    match item with | CmUnit _ _ _ _ _ _ _ _ value => value end;
+    match item with | CmUnit _ _ _ _ _ _ _ _ value _ => value end;
+
+def cm_resolved_imports (item : ClippySemanticUnit) : CmResolvedImports :=
+    match item with | CmUnit _ _ _ _ _ _ _ _ _ value => value end;
+
+-- Qualified references use the compiler's alias, selected-edge and direct
+-- owner decision. An unresolved marker never falls back to a short name.
+def cm_global_name (unit : ClippySemanticUnit) (name : Nat) : Maybe Nat :=
+    let st : InternState := cm_intern unit in
+    let atom : List Nat := name_of_id st name in
+    match module_split_marker atom with
+    | Nothing => Just Nat name
+    | Just _ =>
+        match cm_resolved_imports unit with
+        | CmResolvedImportsOf aliases members =>
+          match module_field_decision (cm_units unit) (Nil ModuleExports)
+                aliases st (cm_entry unit) atom members False with
+            | ModuleAbsent => Nothing Nat
+            | ModuleAmbiguous => Nothing Nat
+            | ModuleFound resolved => Just Nat resolved
+          end
+        end
+    end;
+
+-- Executable visibility is relative to its source owner. Typed signatures keep
+-- the full declaration index, including a public alias's private target type.
+def cm_decl_visible (owner : Nat) (decl : ScDecl) (units : List SrcUnit) : Bool :=
+    orb (eq_nat(owner, sc_decl_module decl))
+      (notb (module_is_private (sc_decl_module decl) (sc_decl_name decl) units));
+
+def cm_global_decl (unit : ClippySemanticUnit) (name : Nat) : Maybe ScDecl :=
+    match cm_global_name unit name with
+    | Nothing => Nothing ScDecl
+    | Just resolved => sc_lookup_global(resolved, cm_index unit)
+    end;
 
 def cm_import_stubs (ids : List Nat) : List Decl :=
     map Nat Decl (fun (id : Nat) => DImport id) ids;
 
+-- Imported signatures only need arity and the result spine. Parameter
+-- domains are the bulk of a compiler cone and are not read after harvest.
+def cm_compact_fuel : Nat := mul 64 64;
+
+def cm_compact_type : Nat -> Expr -> Expr :=
+  fix go (fuel : Nat) (term : Expr) : Expr :=
+    match fuel with
+    | Z => ESort 0
+    | S left => match term with
+      | EPi name _ rest => EPi name (ESort 0) (go left rest)
+      | ELam name _ body => ELam name (Nothing Expr) (go left body)
+      | ESpan _ _ inner => go left inner
+      | EOpen _ inner => go left inner
+      | EAscribe value _ => go left value
+      | EEffectRow result _ => EEffectRow (go left result) (Nil Nat)
+      | EApp head arg => EApp (go left head) (go left arg)
+      | EVar name => EVar name
+      | EHole hole => EHole hole
+      | ESort level => ESort level
+      | ENat _ => ESort 0
+      | ERange _ _ _ => ESort 0
+      | ELet _ _ _ _ => ESort 0
+      | EMatch _ _ => ESort 0
+      | EFix _ _ _ _ => ESort 0
+      | EPerform _ _ => ESort 0
+      | EDo _ => ESort 0
+      | EHandle _ _ => ESort 0
+      | EBranch _ _ _ => ESort 0
+      | ENoBranch => ESort 0
+      | EBinder _ _ _ => ESort 0
+      | ENoBinder => ESort 0
+      | EMultiMatch _ _ => ESort 0
+      | EStr _ => ESort 0
+      | EDoBind _ _ => ESort 0
+      | EList _ => ESort 0
+      | EListSpread _ _ => ESort 0
+      | EFallible _ _ _ _ => ESort 0
+      | ENamedCall _ _ => ESort 0
+      | EIf _ _ _ => ESort 0
+      | EIfLet _ _ _ _ => ESort 0
+      | ECoalesce _ _ => ESort 0
+      end
+    end;
+
+def cm_compact_contracts : Bool :=
+    let sample : Expr := EPi 1 (EVar 9) (EVar 2) in
+    let compact : Expr := cm_compact_type cm_compact_fuel sample in
+    match compact with
+    | EPi name domain result =>
+        andb (eq_nat name 1)
+          (andb (match domain with | ESort level => eq_nat level 0 | EVar _ => False
+            | EHole _ => False | ENat _ => False | EApp _ _ => False | ELam _ _ _ => False
+            | EPi _ _ _ => False | ELet _ _ _ _ => False | EAscribe _ _ => False
+            | EMatch _ _ => False | EFix _ _ _ _ => False | EEffectRow _ _ => False
+            | EPerform _ _ => False | EDo _ => False | EHandle _ _ => False
+            | EBranch _ _ _ => False | ENoBranch => False | EBinder _ _ _ => False
+            | ENoBinder => False | EMultiMatch _ _ => False | EStr _ => False
+            | EDoBind _ _ => False | EList _ => False | EListSpread _ _ => False
+            | ESpan _ _ _ => False | EFallible _ _ _ _ => False | EOpen _ _ => False
+            | ENamedCall _ _ => False | ERange _ _ _ => False | EIf _ _ _ => False
+            | EIfLet _ _ _ _ => False | ECoalesce _ _ => False end)
+            (andb (match result with | EVar result_name => eq_nat result_name 2 | ESort _ => False
+              | EHole _ => False | ENat _ => False | EApp _ _ => False | ELam _ _ _ => False
+              | EPi _ _ _ => False | ELet _ _ _ _ => False | EAscribe _ _ => False
+              | EMatch _ _ => False | EFix _ _ _ _ => False | EEffectRow _ _ => False
+              | EPerform _ _ => False | EDo _ => False | EHandle _ _ => False
+              | EBranch _ _ _ => False | ENoBranch => False | EBinder _ _ _ => False
+              | ENoBinder => False | EMultiMatch _ _ => False | EStr _ => False
+              | EDoBind _ _ => False | EList _ => False | EListSpread _ _ => False
+              | ESpan _ _ _ => False | EFallible _ _ _ _ => False | EOpen _ _ => False
+              | ENamedCall _ _ => False | ERange _ _ _ => False | EIf _ _ _ => False
+              | EIfLet _ _ _ _ => False | ECoalesce _ _ => False end)
+              (eq_nat (sc_pi_arity compact) 1)))
+    | EVar _ => False
+    | EHole _ => False
+    | ESort _ => False
+    | ENat _ => False
+    | EApp _ _ => False
+    | ELam _ _ _ => False
+    | ELet _ _ _ _ => False
+    | EAscribe _ _ => False
+    | EMatch _ _ => False
+    | EFix _ _ _ _ => False
+    | EEffectRow _ _ => False
+    | EPerform _ _ => False
+    | EDo _ => False
+    | EHandle _ _ => False
+    | EBranch _ _ _ => False
+    | ENoBranch => False
+    | EBinder _ _ _ => False
+    | ENoBinder => False
+    | EMultiMatch _ _ => False
+    | EStr _ => False
+    | EDoBind _ _ => False
+    | EList _ => False
+    | EListSpread _ _ => False
+    | ESpan _ _ _ => False
+    | EFallible _ _ _ _ => False
+    | EOpen _ _ => False
+    | ENamedCall _ _ => False
+    | ERange _ _ _ => False
+    | EIf _ _ _ => False
+    | EIfLet _ _ _ _ => False
+    | ECoalesce _ _ => False
+    end;
+
 def cm_strip_symbol (item : ScDecl) : ScDecl :=
     match item with
     | ScDeclOf name owner kind parent signature _ prim =>
-        ScDeclOf name owner kind parent signature (Nothing Expr) prim
+        ScDeclOf name owner kind parent (cm_compact_type cm_compact_fuel signature) (Nothing Expr) prim
+    end;
+
+-- Non-std imports keep the Pi spine and drop the result tree. Result spines
+-- outside std/ are what push one lint root over the 8 GiB cap. Checked
+-- Either/IO APIs live in std/ and keep cm_compact_type.
+def cm_keep_result_spine (path : String) : Bool :=
+    prim_string_starts path "std/";
+
+def cm_arity_path_contracts : Bool :=
+    andb (cm_keep_result_spine "std/io.ouro")
+      (notb (cm_keep_result_spine "compiler/lexer.ouro"));
+
+def cm_compact_arity : Nat -> Expr -> Expr :=
+  fix go (fuel : Nat) (term : Expr) : Expr :=
+    match fuel with
+    | Z => ESort 0
+    | S left => match term with
+      | EPi name _ rest => EPi name (ESort 0) (go left rest)
+      | ELam name _ body => ELam name (Nothing Expr) (go left body)
+      | ESpan _ _ inner => go left inner
+      | EOpen _ inner => go left inner
+      | EAscribe inner _ => go left inner
+      | EEffectRow inner _ => go left inner
+      | EVar _ => ESort 0
+      | EHole _ => ESort 0
+      | ESort level => ESort level
+      | ENat _ => ESort 0
+      | ERange _ _ _ => ESort 0
+      | EApp _ _ => ESort 0
+      | ELet _ _ _ _ => ESort 0
+      | EMatch _ _ => ESort 0
+      | EFix _ _ _ _ => ESort 0
+      | EPerform _ _ => ESort 0
+      | EDo _ => ESort 0
+      | EHandle _ _ => ESort 0
+      | EBranch _ _ _ => ESort 0
+      | ENoBranch => ESort 0
+      | EBinder _ _ _ => ESort 0
+      | ENoBinder => ESort 0
+      | EMultiMatch _ _ => ESort 0
+      | EStr _ => ESort 0
+      | EDoBind _ _ => ESort 0
+      | EList _ => ESort 0
+      | EListSpread _ _ => ESort 0
+      | EFallible _ _ _ _ => ESort 0
+      | ENamedCall _ _ => ESort 0
+      | EIf _ _ _ => ESort 0
+      | EIfLet _ _ _ _ => ESort 0
+      | ECoalesce _ _ => ESort 0
+      end
+    end;
+
+def cm_strip_arity (item : ScDecl) : ScDecl :=
+    match item with
+    | ScDeclOf name owner kind parent signature _ prim =>
+        ScDeclOf name owner kind parent (cm_compact_arity cm_compact_fuel signature) (Nothing Expr) prim
+    end;
+
+def cm_compiler_arity_contracts : Bool :=
+    let sample : Expr := EPi 1 (EVar 9) (EApp (EVar 4) (EVar 5)) in
+    let compact : Expr := cm_compact_arity cm_compact_fuel sample in
+    match compact with
+    | EPi name domain result =>
+        andb (eq_nat name 1)
+          (andb (match domain with | ESort level => eq_nat level 0 | EVar _ => False
+            | EHole _ => False | ENat _ => False | EApp _ _ => False | ELam _ _ _ => False
+            | EPi _ _ _ => False | ELet _ _ _ _ => False | EAscribe _ _ => False
+            | EMatch _ _ => False | EFix _ _ _ _ => False | EEffectRow _ _ => False
+            | EPerform _ _ => False | EDo _ => False | EHandle _ _ => False
+            | EBranch _ _ _ => False | ENoBranch => False | EBinder _ _ _ => False
+            | ENoBinder => False | EMultiMatch _ _ => False | EStr _ => False
+            | EDoBind _ _ => False | EList _ => False | EListSpread _ _ => False
+            | ESpan _ _ _ => False | EFallible _ _ _ _ => False | EOpen _ _ => False
+            | ENamedCall _ _ => False | ERange _ _ _ => False | EIf _ _ _ => False
+            | EIfLet _ _ _ _ => False | ECoalesce _ _ => False end)
+            (andb (match result with | ESort level => eq_nat level 0 | EVar _ => False
+              | EHole _ => False | ENat _ => False | EApp _ _ => False | ELam _ _ _ => False
+              | EPi _ _ _ => False | ELet _ _ _ _ => False | EAscribe _ _ => False
+              | EMatch _ _ => False | EFix _ _ _ _ => False | EEffectRow _ _ => False
+              | EPerform _ _ => False | EDo _ => False | EHandle _ _ => False
+              | EBranch _ _ _ => False | ENoBranch => False | EBinder _ _ _ => False
+              | ENoBinder => False | EMultiMatch _ _ => False | EStr _ => False
+              | EDoBind _ _ => False | EList _ => False | EListSpread _ _ => False
+              | ESpan _ _ _ => False | EFallible _ _ _ _ => False | EOpen _ _ => False
+              | ENamedCall _ _ => False | ERange _ _ _ => False | EIf _ _ _ => False
+              | EIfLet _ _ _ _ => False | ECoalesce _ _ => False end)
+              (eq_nat (sc_pi_arity compact) 1)))
+    | EVar _ => False
+    | EHole _ => False
+    | ESort _ => False
+    | ENat _ => False
+    | EApp _ _ => False
+    | ELam _ _ _ => False
+    | ELet _ _ _ _ => False
+    | EAscribe _ _ => False
+    | EMatch _ _ => False
+    | EFix _ _ _ _ => False
+    | EEffectRow _ _ => False
+    | EPerform _ _ => False
+    | EDo _ => False
+    | EHandle _ _ => False
+    | EBranch _ _ _ => False
+    | ENoBranch => False
+    | EBinder _ _ _ => False
+    | ENoBinder => False
+    | EMultiMatch _ _ => False
+    | EStr _ => False
+    | EDoBind _ _ => False
+    | EList _ => False
+    | EListSpread _ _ => False
+    | ESpan _ _ _ => False
+    | EFallible _ _ _ _ => False
+    | EOpen _ _ => False
+    | ENamedCall _ _ => False
+    | ERange _ _ _ => False
+    | EIf _ _ _ => False
+    | EIfLet _ _ _ _ => False
+    | ECoalesce _ _ => False
     end;
 
 def cm_import_symbols (decls : List ScDecl) : List ScDecl :=
     map ScDecl ScDecl cm_strip_symbol decls;
 
+def cm_import_arity (decls : List ScDecl) : List ScDecl :=
+    map ScDecl ScDecl cm_strip_arity decls;
+
+def cm_parsed_decls (file : ParsedFile) : List Decl :=
+    match file with | MkParsedFile decls _ => decls end;
+
+def cm_parsed_private (file : ParsedFile) : List Nat :=
+    match file with | MkParsedFile _ names => names end;
+
 inductive CmHarvest : Type :=
-  | MkHarvest : InternState -> List ScDecl -> List Nat -> List Decl -> List CsOriginFact -> CmHarvest;
+  | MkHarvest : InternState -> List ScDecl -> List Nat -> ParsedFile -> List CsOriginFact -> CmHarvest;
 
 -- Finish one parsed file. Imports keep signatures and compact origins; the
 -- selected file keeps bodies. This helper is unwrapped. The host arena seam wraps
 -- cm_load_file below so leave() drops imported function graphs.
 def cm_after_parse (path : String) (module_id : Nat) (keep_bodies : Bool)
-    (decls : List Decl) (intern : InternState) : CmHarvest :=
-    match cm_canon_imports path decls intern with
+    (file : ParsedFile) (intern : InternState) : CmHarvest :=
+    match cm_canon_imports path (cm_parsed_decls file) intern with
     | MkPair canonical updated =>
         let imports : List Nat := cm_import_ids canonical in
         let raw : List ScDecl := sc_declarations module_id canonical in
         match keep_bodies with
-        | True => MkHarvest updated raw imports canonical []
-        | False => MkHarvest updated (cm_import_symbols raw) imports
-            (cm_import_stubs imports) (cs_capture_origins raw)
+        | True => MkHarvest updated raw imports
+            (MkParsedFile canonical (cm_parsed_private file)) []
+        | False => MkHarvest updated
+            (match cm_keep_result_spine path with
+             | True => cm_import_symbols raw
+             | False => cm_import_arity raw
+             end) imports
+            (MkParsedFile (cm_import_stubs imports) (cm_parsed_private file))
+            (cs_capture_origins raw)
         end
     end;
 
@@ -226,11 +507,14 @@ def cm_cache_lookup (cache : CmParseCache) (canonical : String) (src : String)
     end;
 
 -- Cached facts never retain historical intern spines or imported bodies.
--- The current session's intern table is attached again on a cache hit.
+-- Symbols are already signature-only; share that list with the unit instead of
+-- cloning it into the cache. The current session's intern table is attached
+-- again on a cache hit.
 def cm_cache_harvest (harvest : CmHarvest) : CmHarvest :=
     match harvest with
-    | MkHarvest _ symbols imports _ origins => MkHarvest empty_intern
-        (cm_import_symbols symbols) imports (cm_import_stubs imports) origins
+    | MkHarvest _ symbols imports file origins => MkHarvest empty_intern
+        symbols imports
+        (MkParsedFile (cm_import_stubs imports) (cm_parsed_private file)) origins
     end;
 
 def cm_cache_bytes (cache : CmParseCache) : Nat :=
@@ -279,120 +563,13 @@ def cm_cache_put (cache : CmParseCache) (canonical : String) (src : String)
         end
     end;
 
--- Runtime platform sources are the Windows/IO implementation. Outside runtime
--- roots, transitive `compiler/` is the same class of cone: selected roots parse in
--- full and direct imports still harvest signatures. A small type-module
--- allowlist (`base`, `pipeline_abi`, `core`, `kernel_core`, `checked_program`,
--- `image_types`) stays harvestable when enqueued. Keep-importing
--- `compiler/driver.ouro` without this skip harvests lexer/parser/elab
--- and exceeds 7 GiB. Exact `std/process.ouro` is the process
--- implementation cone (not a `std/process` prefix: `processx` stays
--- harvestable). Direct importers still keep-harvest it.
-def cm_keep_import_path (path : String) : Bool :=
-    orb (prim_string_eq path "compiler/kernel_core.ouro")
-      (orb (prim_string_eq path "compiler/base.ouro")
-        (orb (prim_string_eq path "compiler/pipeline_abi.ouro")
-          (orb (prim_string_eq path "compiler/core.ouro")
-            (orb (prim_string_eq path "compiler/checked_program.ouro")
-              (orb (prim_string_eq path "compiler/native/image_types.ouro")
-                (orb (prim_string_eq path "compiler/source_text.ouro")
-                  (orb (prim_string_eq path "compiler/ast.ouro")
-                    (orb (prim_string_eq path "compiler/parser_file.ouro")
-                      (prim_string_eq path "compiler/parser_parse.ouro")))))))));
-
--- Family cores only. Wiring, unit/finding, hash/extract and the
--- analyze CLI stay harvestable. Exact `tools/analyze/model.ouro` is the
--- extract fact-core; selected extract still keep-imports it. drive.ouro
--- keep-imports drive_light/drive_heavy, not these cores.
-def cm_skip_analyze_family (path : String) : Bool :=
-    orb (prim_string_eq path "tools/analyze/effects.ouro")
-      (orb (prim_string_eq path "tools/analyze/capability.ouro")
-        (orb (prim_string_eq path "tools/analyze/extract_leak.ouro")
-          (orb (prim_string_eq path "tools/analyze/match_cover.ouro")
-            (orb (prim_string_eq path "tools/analyze/cfg.ouro")
-              (orb (prim_string_eq path "tools/analyze/dataflow.ouro")
-                (orb (prim_string_eq path "tools/analyze/semantic.ouro")
-                  (orb (prim_string_eq path "tools/analyze/property.ouro")
-                    (orb (prim_string_eq path "tools/analyze/absint.ouro")
-                      (orb (prim_string_eq path "tools/analyze/symexec.ouro")
-                        (orb (prim_string_eq path "tools/analyze/taint.ouro")
-                          (orb (prim_string_eq path "tools/analyze/contracts.ouro")
-                            (orb (prim_string_eq path "tools/analyze/complexity.ouro")
-                              (orb (prim_string_eq path "tools/analyze/bounds.ouro")
-                                (orb (prim_string_eq path "tools/analyze/minimal.ouro")
-                                  (orb (prim_string_eq path "tools/analyze/duplication.ouro")
-                                    (orb (prim_string_eq path "tools/analyze/trust.ouro")
-                                      (orb (prim_string_eq path "tools/analyze/simplify.ouro")
-                                        (orb (prim_string_eq path "tools/analyze/perf.ouro")
-                                          (orb (prim_string_eq path "tools/analyze/naming.ouro")
-                                            (prim_string_eq path "tools/analyze/errors.ouro"))))))))))))))))))));
-
--- Implementation cones that are not type modules. Selected files that name
--- these paths still keep-harvest them. Transitive importers get stubs.
-def cm_skip_impl_path (path : String) : Bool :=
-    (fix go (rows : List String) : Bool :=
-      match rows with
-      | Nil => False
-      | Cons row rest =>
-          match prim_string_eq path row with
-          | True => True
-          | False => go rest
-          end
-      end)
-      ([ "tools/analyze/model.ouro"
-       , "std/json.ouro"
-       , "std/jsonx.ouro"
-       , "std/format.ouro"
-       , "tools/native_build_output.ouro"
-       , "tools/repo_gate/workflow_checks.ouro"
-       , "tools/repo_gate/policy.ouro"
-       , "tools/analyze/architecture.ouro"
-       , "tools/analyze/deadcode.ouro"
-       , "tools/analyze/suppressions.ouro"
-       , "tools/analyze/api_surface.ouro"
-       , "tools/analyze/format.ouro"
-       , "tools/fix/basic_rules.ouro"
-       , "tools/fix/rules.ouro"
-       , "tools/clippy/structural_frontend.ouro"
-       , "tools/repo_gate/checks.ouro"
-       , "tools/repo_gate/parity_closure.ouro"
-       , "tools/ci_gate/host_bound.ouro"
-       , "tools/analyze/drive_light.ouro"
-       , "tools/analyze/drive_heavy.ouro"
-       , "tools/analyze/drive_smells.ouro"
-       , "tools/analyze/unit.ouro"
-       , "tools/analyze/drive.ouro"
-       , "tools/clippy/scan.ouro"
-       ] : List String);
-
-def cm_skip_import_path (path : String) : Bool :=
-    match cm_keep_import_path path with
-    | True => False
-    | False =>
-        orb (prim_string_starts path "runtime/platform/")
-          (orb (prim_string_starts path "compiler/")
-            (orb (prim_string_eq path "std/process.ouro")
-              (orb (prim_string_eq path "std/collections.ouro")
-                (orb (prim_string_eq path "std/pathx.ouro")
-                  (orb (cm_skip_analyze_family path)
-                    (cm_skip_impl_path path))))))
-    end;
-
--- Runtime roots need their complete platform vocabulary, including declarations
--- reached through several runtime modules. Imported bodies remain stripped.
-def cm_skip_import_for (entry : String) (path : String) : Bool :=
-    match andb (prim_string_starts entry "runtime/")
-        (prim_string_starts path "runtime/platform/") with
-    | True => False
-    | False => cm_skip_import_path path
-    end;
-
 def cm_cache_contracts : Bool :=
     let src : String := "def n : Nat := Z;" in
     let other : String := "def n : Nat := S Z;" in
     let canonical : String := "std/cache_contract.ouro" in
     let harvest : CmHarvest :=
-      MkHarvest(empty_intern, Nil ScDecl, Nil Nat, Nil Decl, Nil CsOriginFact) in
+      MkHarvest(empty_intern, Nil ScDecl, Nil Nat,
+        MkParsedFile (Nil Decl) (Nil Nat), Nil CsOriginFact) in
     let cache : CmParseCache :=
       cm_cache_put cm_cache0 canonical src harvest in
     let hit : Bool := match cm_cache_lookup cache canonical src with
@@ -415,64 +592,7 @@ def cm_cache_contracts : Bool :=
       | CmCacheHit _ => False
       | CmCacheStale => False
       end in
-    let skip_row (acc : Bool) (row : Bool) : Bool := andb acc row in
-    let skip : Bool :=
-      (fix go (rows : List Bool) (acc : Bool) : Bool :=
-        match rows with
-        | Nil => acc
-        | Cons row rest => go(rest, skip_row acc row)
-        end)
-        [ cm_skip_import_path "runtime/platform/windows_fs.ouro"
-        , cm_skip_import_path "compiler/native/managed_files.ouro"
-        , cm_skip_import_path "compiler/lexer.ouro"
-        , cm_skip_import_path "std/process.ouro"
-        , cm_skip_import_path "std/collections.ouro"
-        , cm_skip_import_path "std/pathx.ouro"
-        , cm_skip_import_path "tools/analyze/effects.ouro"
-        , cm_skip_import_path "tools/analyze/model.ouro"
-        , cm_skip_import_path "std/json.ouro"
-        , cm_skip_import_path "std/jsonx.ouro"
-        , notb (cm_skip_import_path "std/text.ouro")
-        , cm_skip_import_path "tools/fix/rules.ouro"
-        , cm_skip_import_path "tools/ci_gate/host_bound.ouro"
-        , cm_skip_import_path "std/format.ouro"
-        , cm_skip_import_path "tools/native_build_output.ouro"
-        , cm_skip_import_path "tools/repo_gate/workflow_checks.ouro"
-        , cm_skip_import_path "tools/fix/basic_rules.ouro"
-        , cm_skip_import_path "tools/clippy/structural_frontend.ouro"
-        , cm_skip_import_path "tools/repo_gate/checks.ouro"
-        , cm_skip_import_path "tools/repo_gate/parity_closure.ouro"
-        , cm_skip_import_path "tools/analyze/drive_light.ouro"
-        , cm_skip_import_path "tools/analyze/drive_heavy.ouro"
-        , cm_skip_import_path "tools/analyze/drive_smells.ouro"
-        , cm_skip_import_path "tools/analyze/unit.ouro"
-        , cm_skip_import_path "tools/analyze/drive.ouro"
-        , cm_skip_import_path "tools/clippy/scan.ouro"
-        , notb (cm_skip_import_path "tools/analyze/drive_light_run.ouro")
-        , notb (cm_skip_import_path "tools/clippy/scan_types.ouro")
-        , notb (cm_skip_import_path "tools/analyze/model_types.ouro")
-        , notb (cm_skip_analyze_family "tools/analyze/hash.ouro")
-        , notb (cm_skip_import_path "std/processx.ouro")
-        , notb (cm_skip_import_path "std/listx.ouro")
-        , notb (cm_skip_import_path "compiler/pipeline_abi.ouro")
-        , notb (cm_skip_import_path "runtime/native_types.ouro")
-        , notb (cm_skip_import_path "std/fs.ouro")
-        , notb (cm_skip_import_path "tools/lint.ouro")
-        , notb (cm_skip_import_path "compiler/base.ouro")
-        , notb (cm_skip_import_path "compiler/source_text.ouro")
-        , notb (cm_skip_import_path "compiler/parser_file.ouro")
-        , notb (cm_skip_import_path "tools/analyze/drive_env.ouro")
-        , notb (cm_skip_import_path "tools/repo_gate/policy_types.ouro")
-        , notb (cm_skip_import_path "tools/clippy/intern_surface.ouro")
-        , notb (cm_skip_import_path "tools/repo_gate/policy_names.ouro")
-        , notb (cm_skip_import_for "runtime/managed.ouro" "runtime/platform/windows_x64.ouro")
-        , notb (cm_skip_import_for "runtime/platform/windows_clock.ouro" "runtime/platform/windows_x64.ouro")
-        , cm_skip_import_for "std/runtime.ouro" "runtime/platform/windows_x64.ouro"
-        , cm_skip_import_for "runtime_extra/probe.ouro" "runtime/platform/windows_x64.ouro"
-        , cm_skip_import_for "runtime/managed.ouro" "compiler/driver.ouro"
-        ]
-        True in
-    andb(hit, andb(miss, andb(stale, andb reset skip)));
+    andb(hit, andb(miss, andb stale reset));
 
 -- Native-tool build metadata scopes this two-argument import harvest.
 -- Type-alias following on imports stays unknown.
@@ -480,14 +600,16 @@ def cm_load_file (req : Pair String String) (intern : InternState)
     : Either QualityInputError CmHarvest :=
     match req with
     | MkPair path source =>
-        match cm_parse source intern with
+        match cm_parse_import source intern with
         | Left error => Left QualityInputError CmHarvest error
         | Right parsed => match parsed with
-          | MkPair decls lexed => match load_intern_string lexed
-              (prim_string_to_char_codes path) with
-            | MkPair module_id updated =>
-                Right QualityInputError CmHarvest
-                  (cm_after_parse path module_id False decls updated)
+          | MkPair file metadata => match metadata with
+            | MkPair lexed _ => match load_intern_string lexed
+                (prim_string_to_char_codes path) with
+              | MkPair module_id updated =>
+                  Right QualityInputError CmHarvest
+                    (cm_after_parse path module_id False file updated)
+              end
             end
           end
         end
@@ -524,18 +646,138 @@ def cm_load_file_cached (req : Pair String String) (intern : InternState)
         end
     end;
 
+-- The selected root and compiler imports keep signatures, including multi-hop
+-- compiler modules. Runtime platform sources and the listed implementation
+-- cones stay stubbed unless this root asked for them directly: harvesting
+-- that cone in one process exceeds the 8 GiB lint address-space cap. A missing
+-- file is still an input error.
+def cm_path_in (path : String) (rows : List String) : Bool :=
+    (fix go (rest : List String) : Bool :=
+      match rest with
+      | Nil => False
+      | Cons row more =>
+          match prim_string_eq path row with
+          | True => True
+          | False => go more
+          end
+      end) rows;
+
+def cm_keep_import_paths : List String :=
+    [ "compiler/kernel_core.ouro"
+    , "compiler/base.ouro"
+    , "compiler/pipeline_abi.ouro"
+    , "compiler/core.ouro"
+    , "compiler/checked_program.ouro"
+    , "compiler/native/image_types.ouro"
+    , "compiler/source_text.ouro"
+    , "compiler/ast.ouro"
+    , "compiler/parser_file.ouro"
+    , "compiler/parser_parse.ouro"
+    ];
+
+def cm_keep_import_path (path : String) : Bool :=
+    cm_path_in path cm_keep_import_paths;
+
+def cm_skip_analyze_paths : List String :=
+    [ "tools/analyze/effects.ouro"
+       , "tools/analyze/capability.ouro"
+       , "tools/analyze/extract_leak.ouro"
+       , "tools/analyze/match_cover.ouro"
+       , "tools/analyze/cfg.ouro"
+       , "tools/analyze/dataflow.ouro"
+       , "tools/analyze/semantic.ouro"
+       , "tools/analyze/property.ouro"
+       , "tools/analyze/absint.ouro"
+       , "tools/analyze/symexec.ouro"
+       , "tools/analyze/taint.ouro"
+       , "tools/analyze/contracts.ouro"
+       , "tools/analyze/complexity.ouro"
+       , "tools/analyze/bounds.ouro"
+       , "tools/analyze/minimal.ouro"
+       , "tools/analyze/duplication.ouro"
+       , "tools/analyze/trust.ouro"
+       , "tools/analyze/simplify.ouro"
+       , "tools/analyze/perf.ouro"
+       , "tools/analyze/naming.ouro"
+       , "tools/analyze/errors.ouro"
+       ];
+
+def cm_skip_analyze_family (path : String) : Bool :=
+    cm_path_in path cm_skip_analyze_paths;
+
+def cm_skip_impl_paths : List String :=
+    [ "tools/analyze/model.ouro"
+       , "std/json.ouro"
+       , "std/jsonx.ouro"
+       , "std/format.ouro"
+       , "tools/native_build_output.ouro"
+       , "tools/repo_gate/workflow_checks.ouro"
+       , "tools/repo_gate/policy.ouro"
+       , "tools/analyze/architecture.ouro"
+       , "tools/analyze/deadcode.ouro"
+       , "tools/analyze/suppressions.ouro"
+       , "tools/analyze/api_surface.ouro"
+       , "tools/analyze/format.ouro"
+       , "tools/fix/basic_rules.ouro"
+       , "tools/fix/rules.ouro"
+       , "tools/clippy/structural_frontend.ouro"
+       , "tools/repo_gate/checks.ouro"
+       , "tools/repo_gate/parity_closure.ouro"
+       , "tools/ci_gate/host_bound.ouro"
+       , "tools/analyze/drive_light.ouro"
+       , "tools/analyze/drive_heavy.ouro"
+       , "tools/analyze/drive_smells.ouro"
+       , "tools/analyze/unit.ouro"
+       , "tools/analyze/drive.ouro"
+       , "tools/clippy/scan.ouro"
+       ];
+
+def cm_skip_impl_path (path : String) : Bool :=
+    cm_path_in path cm_skip_impl_paths;
+
+def cm_skip_exact_paths : List String :=
+    [ "std/process.ouro"
+    , "std/collections.ouro"
+    , "std/pathx.ouro"
+    ];
+
+def cm_skip_import_path (path : String) : Bool :=
+    match cm_keep_import_path path with
+    | True => False
+    | False =>
+        orb (prim_string_starts path "runtime/platform/")
+          (orb (cm_path_in path cm_skip_exact_paths)
+            (orb (cm_skip_analyze_family path)
+              (cm_skip_impl_path path)))
+    end;
+
+def cm_skip_import_for (entry : String) (path : String) : Bool :=
+    match andb (prim_string_starts entry "runtime/")
+        (prim_string_starts path "runtime/platform/") with
+    | True => False
+    | False => cm_skip_import_path path
+    end;
+
+def cm_import_bound_contracts : Bool :=
+    andb (cm_skip_import_path "runtime/platform/windows_fs.ouro")
+      (andb (notb (cm_skip_import_path "compiler/lower_nat.ouro"))
+        (andb (notb (cm_skip_import_path "compiler/transitive_types.ouro"))
+          (andb (notb (cm_skip_import_path "compiler/lexer.ouro"))
+            (notb (cm_skip_import_for "runtime/managed.ouro"
+              "runtime/platform/windows_x64.ouro")))));
+
 -- Paths are repository-relative compiler canonical paths. The caller anchors
 -- disk reads to an already resolved repository root. Source text is retained
 -- only for the selected file, to give the reporting process that SAME snapshot.
 def cm_load_pending (root : String) (entry : Nat) : Nat -> Nat -> List Nat -> List Nat
     -> InternState -> List SrcUnit -> List ScDecl -> String -> List Decl
-    -> CmParseCache -> List Nat -> List CsOriginFact
+    -> CmParseCache -> List Nat -> List CsOriginFact -> ImpReg
     -> IO (Either QualityInputError
         (Pair ClippySemanticUnit (Pair InternState CmParseCache))) :=
   fix go (fuel : Nat) (file_budget : Nat) (pending : List Nat) (loaded : List Nat)
       (intern : InternState) (units : List SrcUnit) (symbols : List ScDecl)
       (source : String) (root_decls : List Decl) (cache : CmParseCache)
-      (keep : List Nat) (origins : List CsOriginFact)
+      (keep : List Nat) (origins : List CsOriginFact) (root_aliases : ImpReg)
       : IO (Either QualityInputError
         (Pair ClippySemanticUnit (Pair InternState CmParseCache))) :=
     match pending with
@@ -552,11 +794,32 @@ def cm_load_pending (root : String) (entry : Nat) : Nat -> Nat -> List Nat -> Li
            | Left error => Left QualityInputError
                (Pair(ClippySemanticUnit, Pair InternState CmParseCache))
                (QualityInvalidInput (sc_error_message error))
-           | Right index => Right QualityInputError
-               (Pair(ClippySemanticUnit, Pair InternState CmParseCache))
-               (MkPair ClippySemanticUnit (Pair InternState CmParseCache)
-                 (CmUnit intern entry source units symbols index root_decls (length Nat loaded) origins)
-                 (MkPair InternState CmParseCache intern cache))
+            | Right index =>
+                let path : List Nat := prim_string_to_char_codes(cm_string intern entry) in
+                let files : List (Pair (List Nat) ImpReg) :=
+                  [MkPair (List Nat) ImpReg path root_aliases] in
+                match module_alias_units intern files with
+                | RErr code detail => Left QualityInputError
+                    (Pair(ClippySemanticUnit, Pair InternState CmParseCache))
+                    (QualityInvalidInput (prim_string_concat
+                      "compiler import aliases failed: "
+                      (prim_string_concat (prim_string_of_nat code)
+                        (prim_string_concat(" at ", prim_string_of_nat detail)))))
+                | ROk aliases =>
+                    let members : List ModuleMember := map ScDecl ModuleMember
+                      (fun (decl : ScDecl) => MkModuleMember
+                        (sc_decl_module decl) (sc_decl_name decl)
+                        (sc_decl_name decl)
+                        (notb (module_is_private (sc_decl_module decl)
+                          (sc_decl_name decl) units))) symbols in
+                    Right QualityInputError
+                      (Pair(ClippySemanticUnit, Pair InternState CmParseCache))
+                      (MkPair ClippySemanticUnit (Pair InternState CmParseCache)
+                        (CmUnit intern entry source units symbols index root_decls
+                          (length Nat loaded) origins
+                          (CmResolvedImportsOf aliases members))
+                        (MkPair InternState CmParseCache intern cache))
+                end
            end
          end)
     | Cons id rest => match fuel with
@@ -565,7 +828,8 @@ def cm_load_pending (root : String) (entry : Nat) : Nat -> Nat -> List Nat -> Li
           (Left QualityInputError (Pair(ClippySemanticUnit, Pair InternState CmParseCache))
             (QualityInvalidInput "semantic source queue traversal exhausted"))
       | S remaining => match elem Nat eq_nat id loaded with
-      | True => go remaining file_budget rest loaded intern units symbols source root_decls cache keep origins
+      | True => go remaining file_budget rest loaded intern units symbols
+          source root_decls cache keep origins root_aliases
       | False => match file_budget with
         | Z => io_pure (Either QualityInputError
             (Pair(ClippySemanticUnit, Pair InternState CmParseCache)))
@@ -574,12 +838,12 @@ def cm_load_pending (root : String) (entry : Nat) : Nat -> Nat -> List Nat -> Li
         | S files_remaining =>
             let path : String := cm_string intern id in
             match andb (notb (eq_nat id entry))
-                (andb (cm_skip_import_for(cm_string intern entry, path))
+                (andb (cm_skip_import_for (cm_string intern entry) path)
                   (notb (elem Nat eq_nat id keep))) with
             | True =>
                 go remaining file_budget rest (Cons Nat id loaded) intern
-                  (Cons SrcUnit (MkSrcUnit(id, Nil Decl)) units)
-                  symbols source root_decls cache keep origins
+                  (Cons SrcUnit (mk_src_unit id (Nil Decl) (Nil Nat)) units)
+                  symbols source root_decls cache keep origins root_aliases
             | False =>
             do let! input := quality_read_file (quality_child root path);
                match input with
@@ -588,22 +852,22 @@ def cm_load_pending (root : String) (entry : Nat) : Nat -> Nat -> List Nat -> Li
                    (Left QualityInputError (Pair(ClippySemanticUnit, Pair InternState CmParseCache)) error)
                | Right text =>
                    match eq_nat id entry with
-                   | True => match cm_parse text intern with
+                   | True => match cm_parse_with_aliases text intern with
                      | Left error => io_pure (Either QualityInputError
                          (Pair(ClippySemanticUnit, Pair InternState CmParseCache)))
                          (Left QualityInputError (Pair(ClippySemanticUnit, Pair InternState CmParseCache))
                            (QualityInvalidInput (prim_string_concat path
                              (prim_string_concat(": ", quality_input_message error)))))
                      | Right parsed => match parsed with
-                       | MkPair decls lexed => match cm_after_parse path id True decls lexed with
-                         | MkHarvest updated file_symbols imports canonical _ =>
-                             go remaining files_remaining
-                               (append Nat imports rest) (Cons Nat id loaded)
-                               updated (Cons SrcUnit (MkSrcUnit(id, cm_import_stubs imports)) units)
-                               (append ScDecl file_symbols symbols)
-                               text canonical
-                               cache
-                               imports origins
+                       | MkPair decls metadata => match metadata with
+                         | MkPair lexed aliases => match cm_after_parse path id True decls lexed with
+                           | MkHarvest updated file_symbols imports file _ =>
+                               go remaining files_remaining
+                                 (append Nat imports rest) (Cons Nat id loaded)
+                                 updated (Cons SrcUnit (mk_src_unit id (cm_import_stubs imports) (cm_parsed_private file)) units)
+                                 (append ScDecl file_symbols symbols)
+                                 text (cm_parsed_decls file) cache imports origins aliases
+                           end
                          end
                        end
                      end
@@ -615,12 +879,13 @@ def cm_load_pending (root : String) (entry : Nat) : Nat -> Nat -> List Nat -> Li
                              (prim_string_concat(": ", quality_input_message error)))))
                      | Right loaded_file => match loaded_file with
                        | MkPair harvested next_cache => match harvested with
-                         | MkHarvest updated file_symbols imports _ captured =>
+                         | MkHarvest updated file_symbols imports file captured =>
                              go remaining files_remaining
                                (append Nat imports rest) (Cons Nat id loaded)
-                               updated (Cons SrcUnit (MkSrcUnit(id, cm_import_stubs imports)) units)
+                               updated (Cons SrcUnit (mk_src_unit id (cm_import_stubs imports) (cm_parsed_private file)) units)
                                (append ScDecl file_symbols symbols)
-                               source root_decls next_cache keep (append CsOriginFact captured origins)
+                               source root_decls next_cache keep
+                               (append CsOriginFact captured origins) root_aliases
                          end
                        end
                      end
@@ -640,7 +905,7 @@ def cm_load_cached (root : String) (relative : String) (intern : InternState)
         (prim_string_to_char_codes relative)) with
     | MkPair entry next => cm_load_pending root entry cm_load_queue_fuel cm_file_budget
         ([entry] : List Nat) (Nil Nat) next (Nil SrcUnit) (Nil ScDecl) "" (Nil Decl) cache
-        (Nil Nat) (Nil CsOriginFact)
+         (Nil Nat) (Nil CsOriginFact) empty_imp_reg
     end;
 
 def cm_load (root : String) (relative : String) : IO (Either QualityInputError ClippySemanticUnit) :=

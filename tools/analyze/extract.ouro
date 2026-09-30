@@ -41,6 +41,94 @@ def line_kind (trimmed : List Nat) : Nat :=
       end
   end;
 
+inductive ExtractError : Type :=
+  | ExtractImportError : ImportScanError -> ExtractError
+  | ExtractHeaderError : Nat -> ExtractError;
+
+inductive ApiHeaderStep : Type :=
+  | ApiHeaderDone : List Nat -> ApiHeaderStep
+  | ApiHeaderMore : List Nat -> List Nat -> ApiHeaderStep
+  | ApiHeaderBad : ApiHeaderStep;
+
+def api_header_brackets : List (Pair Nat Nat) :=
+  [ MkPair Nat Nat ch_lparen ch_rparen
+  , MkPair Nat Nat ch_lbrack ch_rbrack
+  , MkPair Nat Nat ch_lbrace ch_rbrace
+  ];
+
+-- Masked code decides boundaries; original bytes retain literal types in hashes.
+def api_header_line (code : List Nat) (source : List Nat)
+    (brackets : List Nat) (rev : List Nat) : ApiHeaderStep :=
+  (fix scan (cs : List Nat) (raw : List Nat) (closing : List Nat)
+      (acc : List Nat) : ApiHeaderStep :=
+    match cs with
+    | Nil => match raw with
+        | Nil => ApiHeaderMore closing (Cons Nat ch_lf acc)
+        | Cons _ _ => ApiHeaderBad
+        end
+    | Cons c rest => match raw with
+        | Nil => ApiHeaderBad
+        | Cons original raw_rest =>
+            match andb(nullb Nat closing,
+              codes_start_pair ch_colon ch_eq c rest) with
+            | True => ApiHeaderDone (reverse_lin Nat acc)
+            | False =>
+                match codes_start_pair ch_minus ch_minus c rest with
+                | True => ApiHeaderMore closing (Cons Nat ch_lf acc)
+                | False =>
+                    match andb(nullb Nat closing, eq_nat c ch_semi) with
+                    | True => ApiHeaderBad
+                    | False =>
+                        match lookup Nat Nat eq_nat c api_header_brackets with
+                        | Just last => scan rest raw_rest
+                            (Cons Nat last closing) (Cons Nat original acc)
+                        | Nothing =>
+                            match orb(eq_nat c ch_rparen,
+                              orb(eq_nat c ch_rbrack, eq_nat c ch_rbrace)) with
+                            | False => scan rest raw_rest closing (Cons Nat original acc)
+                            | True => match closing with
+                                | Nil => ApiHeaderBad
+                                | Cons last after => match eq_nat c last with
+                                    | False => ApiHeaderBad
+                                    | True => scan rest raw_rest after (Cons Nat original acc)
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end) code source brackets rev;
+
+def api_header_declaration_start (code : List Nat) : Bool :=
+  let trimmed : List Nat := skip_ws_line code in
+  let kind : Nat := line_kind trimmed in
+  orb(andb(notb(eq_nat kind Z), notb(eq_nat kind 7)),
+    any String
+      (fun (keyword : String) => codes_start_word (str_codes keyword) trimmed)
+      (["private", "intrinsic", "representation"] : List String));
+
+-- Look ahead only through this header, using the remaining structural tail.
+def api_header_collect (code : List Nat) (source : List Nat)
+    (remaining : List (Pair (List Nat) (List Nat))) : Maybe (List Nat) :=
+  (fix collect (rows : List (Pair (List Nat) (List Nat)))
+      (step : ApiHeaderStep) : Maybe (List Nat) :=
+    match step with
+    | ApiHeaderBad => Nothing (List Nat)
+    | ApiHeaderDone header => Just(List Nat, header)
+    | ApiHeaderMore brackets rev => match rows with
+        | Nil => Nothing (List Nat)
+        | Cons row rest => match row with
+            | MkPair next_code next_source =>
+                match api_header_declaration_start next_code with
+                | True => Nothing (List Nat)
+                | False => collect rest (api_header_line next_code next_source brackets rev)
+                end
+            end
+        end
+    end) remaining (api_header_line code source (Nil Nat) (Nil Nat));
+
 def parse_kw_name_cs (line : List Nat) (word : List Nat)
     : Maybe (Pair String Nat) :=
   let trimmed : List Nat := drop_while Nat is_ws line in
@@ -254,9 +342,9 @@ def allow_layer_entry : String := "@allow-layer-import";
 def allow_trust_entry : String := "@allow-trust-import";
 
 def FileAcc_allow_layer (a : FileAcc) : Bool :=
-  name_in(allow_layer_entry, FileAcc_entries a);
+  analyze_name_in(allow_layer_entry, FileAcc_entries a);
 def FileAcc_allow_trust (a : FileAcc) : Bool :=
-  name_in(allow_trust_entry, FileAcc_entries a);
+  analyze_name_in(allow_trust_entry, FileAcc_entries a);
 
 def clear_allow_entries (entries : List String) : List String :=
   filter String
@@ -296,17 +384,17 @@ def add_def (acc : FileAcc) (cs : List Nat) (line_no : Nat)
   let path : String := AFile_path (FileAcc_file acc) in
   let pub : Bool :=
     orb(marked_pub, orb(api_root, path_is_std path)) in
-  let ex : Bool := name_in(name, FileAcc_exports acc) in
+  let ex : Bool := analyze_name_in(name, FileAcc_exports acc) in
   let public : Bool := orb is_ax pub in
   let api_checked : Bool := andb(notb is_ax, pub) in
   let sig_hash : List Nat :=
     match api_checked with
-    | True => fnv1a64_codes (normalize_signature_cs cs)
+    | True => fnv1a64_codes (rtrim_cs (collapse_ws_cs (skip_ws_line cs)))
     | False => w64_zero
     end in
   let d : ADecl :=
     MkADecl name Z line_no col kind_def
-      (orb(name_in(name, FileAcc_entries acc), fe_seam name))
+      (orb(analyze_name_in(name, FileAcc_entries acc), fe_seam name))
       public api_checked
       is_ax ex False (ns_of_path path) ""
       sig_hash in
@@ -318,8 +406,8 @@ def add_ind (acc : FileAcc) (line_no : Nat) (name : String) (col : Nat)
   let pub : Bool := orb(marked_pub, orb(api_root, path_is_std path)) in
   let d : ADecl :=
     MkADecl name Z line_no col kind_def
-      (name_in(name, FileAcc_entries acc)) pub False False
-      (name_in(name, FileAcc_exports acc)) False (ns_of_path path) ""
+      (analyze_name_in(name, FileAcc_entries acc)) pub False False
+      (analyze_name_in(name, FileAcc_exports acc)) False (ns_of_path path) ""
       w64_zero in
   FileAcc_put_decl acc d name;
 
@@ -328,9 +416,9 @@ def add_ctor (acc : FileAcc) (line_no : Nat) (name : String) (col : Nat)
   let path : String := AFile_path (FileAcc_file acc) in
   let d : ADecl :=
     MkADecl name Z line_no col kind_ctor
-      (name_in(name, FileAcc_entries acc))
+      (analyze_name_in(name, FileAcc_entries acc))
       (path_is_std path) False False
-      (name_in(name, FileAcc_exports acc)) False
+      (analyze_name_in(name, FileAcc_exports acc)) False
       (ns_of_path path)
       (FileAcc_last_ind acc) w64_zero in
   FileAcc_put_decl acc d (FileAcc_last_ind acc);
@@ -561,14 +649,22 @@ def step_line (acc : FileAcc) (cs0 : List Nat) (source_cs : List Nat) (line_no :
   end;
 
 def extract_go (acc : FileAcc) (ls : List (Pair (List Nat) (List Nat)))
-    (sites : List ImportAt) (n : Nat) : FileAcc :=
+    (sites : List ImportAt) (n : Nat) : Either ExtractError FileAcc :=
   (fix go (xs : List (Pair (List Nat) (List Nat))) (pending : List ImportAt)
-      (a : FileAcc) (k : Nat) : FileAcc :=
+      (a : FileAcc) (k : Nat) : Either ExtractError FileAcc :=
     match xs with
-    | Nil => a
+    | Nil => Right ExtractError FileAcc a
     | Cons row rest =>
         match row with
         | MkPair ln source_ln =>
+            let header : Maybe (List Nat) :=
+              match eq_nat(line_kind (skip_ws_line ln), 2) with
+              | True => api_header_collect ln source_ln rest
+              | False => Just(List Nat, source_ln)
+              end in
+            match header with
+            | Nothing => Left ExtractError FileAcc (ExtractHeaderError k)
+            | Just signature =>
             match span ImportAt
               (fun (site : ImportAt) => eq_nat(ImportAt_line site, k))
               pending with
@@ -577,25 +673,25 @@ def extract_go (acc : FileAcc) (ls : List (Pair (List Nat) (List Nat)))
                   any ImportAt
                     (fun (site : ImportAt) => eq_nat(ImportAt_decl_line site, k))
                     pending in
-                go(rest, after, step_line a ln source_ln k on_line has_decl, S k)
+                go(rest, after, step_line a ln signature k on_line has_decl, S k)
+            end
             end
         end
     end) ls sites acc n;
 
 def extract_file (path : String) (src : String)
-    : Either ImportScanError FileAcc :=
+    : Either ExtractError FileAcc :=
   match scan_source_imports src with
-  | Left error => Left ImportScanError FileAcc error
+  | Left error => Left ExtractError FileAcc (ExtractImportError error)
   | Right imports =>
       let lines : List (List Nat) := split_on(ch_lf, str_codes src) in
       let code_lines : List (List Nat) := split_on(ch_lf,
         source_mask_literals (str_codes src)) in
       let sites : List ImportAt :=
         map ScannedImport ImportAt (import_at src) imports in
-      Right ImportScanError FileAcc
-        (extract_go
+      extract_go
           (MkFileAcc (classify_file path) (Nil AEdge) (Nil ADecl) ""
             (Nil String) (Nil String) src lines
             (Nil (Pair(Nat, List Nat))))
-          (zip (List Nat) (List Nat) code_lines lines) sites (S Z))
+          (zip (List Nat) (List Nat) code_lines lines) sites (S Z)
   end;

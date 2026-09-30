@@ -92,7 +92,9 @@ frame() {
 # A file as a JSON string body, so the client sends the same text the checker
 # reads from disk and the reported positions line up.
 json_text() {
-	sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' "$1" | awk '{ printf "%s\\n", $0 }'
+	"$PYTHON" -c 'import json, pathlib, sys
+text = pathlib.Path(sys.argv[1]).read_bytes().decode("utf-8")
+sys.stdout.write(json.dumps(text, ensure_ascii=False)[1:-1])' "$1"
 }
 
 FIXTURES=$("$PYTHON" scripts/ouro_smith.py prepare --group lsp --out "$OUT/inputs")
@@ -183,7 +185,7 @@ want capabilities-rename '"renameProvider":true'
 want diagnostics-clean "\"uri\":\"$SAMPLE_URI\",\"diagnostics\":\[\]"
 # Literal JSON needle; backslashes must not expand.
 # shellcheck disable=SC2016
-want hover-signature '"id":2,"result":{"contents":{"kind":"markdown","value":"```ouro\\ndef widget (n : Nat) : Nat\\n```'
+want hover-signature '"id":2,"result":{"contents":{"kind":"markdown","value":"```ouro\\ndef widget (n : Nat)\\n    : Nat\\n```'
 want hover-doc 'Doubles a natural'
 want definition-line "\"id\":3,\"result\":{\"uri\":\"$SAMPLE_URI\",\"range\":{\"start\":{\"line\":$DEF_LINE,"
 want completion-widget '"id":8,"result":'
@@ -221,6 +223,167 @@ if grep -q 'Z;   ' "$OUT/session.jsonl"; then
 else
 	ok "formatting removed trailing whitespace"
 fi
+
+# A direct annotated definition can offer nullary constructors from a local
+# family. A constructor with a value field, another family, or a nested
+# expression must not become an expected-type suggestion.
+CTOR_DOC="$OUT/constructors.ouro"
+STRING_REL=$("$PYTHON" -c 'import os,sys; print(os.path.relpath(sys.argv[1], sys.argv[2]).replace("\\", "/"))' "$ROOT/std/string.ouro" "$OUT")
+printf 'import "%s";\n' "$STRING_REL" >"$CTOR_DOC"
+cat >>"$CTOR_DOC" <<'EOF'
+inductive LspChoice : Type := | LspRed : LspChoice | LspWrap : LspChoice -> LspChoice | LspBlue : LspChoice;
+inductive LspOther : Type := | LspOrange : LspOther;
+def chosen : LspChoice := LspRed;
+def other : LspOther := LspOrange;
+def nested : LspChoice := let picked : LspChoice := LspRed in picked;
+def commented : LspChoice := -- Lsp
+  LspRed;
+def quoted : String := "
+def fakeQuoted : LspChoice := Lsp
+";
+def raw : String := r#"
+def fakeRaw : LspChoice := Lsp
+"#;
+EOF
+CTOR_URI=$(uri_of_path "$CTOR_DOC")
+CHOICE_PREFIX='def chosen : LspChoice := Lsp'
+OTHER_PREFIX='def other : LspOther := Lsp'
+NESTED_PREFIX='def nested : LspChoice := let picked : LspChoice := Lsp'
+COMMENT_PREFIX='def commented : LspChoice := -- Lsp'
+QUOTED_PREFIX='def fakeQuoted : LspChoice := Lsp'
+RAW_PREFIX='def fakeRaw : LspChoice := Lsp'
+DUP_DOC="$OUT/duplicate-constructors.ouro"
+cat >"$DUP_DOC" <<'EOF'
+inductive LspDuplicate : Type := | LspSame : LspDuplicate | LspSame : LspDuplicate;
+def duplicate : LspDuplicate := LspSame;
+EOF
+DUP_URI=$(uri_of_path "$DUP_DOC")
+DUP_PREFIX='def duplicate : LspDuplicate := LspS'
+ADJ_DOC="$OUT/adjacent-constructors.ouro"
+printf 'inductive LspAdjacent : Type := | LspOnly : LspAdjacent;\ndef\tadjacent : LspAdjacent := LspOnly;\ndef untyped := LspOnly;\n' >"$ADJ_DOC"
+ADJ_URI=$(uri_of_path "$ADJ_DOC")
+ADJ_PREFIX=$(printf 'def\tadjacent : LspAdjacent := Lsp')
+UNTYPED_PREFIX='def untyped := Lsp'
+LARGE_DOC="$OUT/large-constructors.ouro"
+{
+	printf 'inductive LspLarge : Type := '
+	arm=1
+	while [ "$arm" -le 128 ]; do
+		printf '| LspArm%s : LspLarge ' "$arm"
+		arm=$((arm + 1))
+	done
+	printf ';\ndef large : LspLarge := LspArm128;\n'
+	printf 'inductive LspBoundary : Type := '
+	arm=1
+	while [ "$arm" -le 256 ]; do
+		printf '| LspBoundaryArm%s : LspBoundary ' "$arm"
+		arm=$((arm + 1))
+	done
+	printf ';\ndef boundary : LspBoundary := LspBoundaryArm256;\n'
+	printf 'inductive LspOver : Type := '
+	arm=1
+	while [ "$arm" -le 257 ]; do
+		printf '| LspOverArm%s : LspOver ' "$arm"
+		arm=$((arm + 1))
+	done
+	printf ';\ndef over : LspOver := LspOverArm257;\n'
+} >"$LARGE_DOC"
+LARGE_URI=$(uri_of_path "$LARGE_DOC")
+LARGE_PREFIX='def large : LspLarge := LspArm128'
+BOUNDARY_PREFIX='def boundary : LspBoundary := LspBoundaryArm256'
+OVER_PREFIX='def over : LspOver := LspOverArm257'
+{
+	frame '{"jsonrpc":"2.0","id":300,"method":"initialize","params":{"capabilities":{}}}'
+	frame '{"jsonrpc":"2.0","method":"initialized","params":{}}'
+	frame "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":{\"uri\":\"$CTOR_URI\",\"languageId\":\"ouro\",\"version\":1,\"text\":\"$(json_text "$CTOR_DOC")\"}}}"
+	frame "{\"jsonrpc\":\"2.0\",\"id\":301,\"method\":\"textDocument/completion\",\"params\":{\"textDocument\":{\"uri\":\"$CTOR_URI\"},\"position\":{\"line\":3,\"character\":${#CHOICE_PREFIX}}}}"
+	frame "{\"jsonrpc\":\"2.0\",\"id\":302,\"method\":\"textDocument/completion\",\"params\":{\"textDocument\":{\"uri\":\"$CTOR_URI\"},\"position\":{\"line\":4,\"character\":${#OTHER_PREFIX}}}}"
+	frame "{\"jsonrpc\":\"2.0\",\"id\":303,\"method\":\"textDocument/completion\",\"params\":{\"textDocument\":{\"uri\":\"$CTOR_URI\"},\"position\":{\"line\":5,\"character\":${#NESTED_PREFIX}}}}"
+	frame "{\"jsonrpc\":\"2.0\",\"id\":305,\"method\":\"textDocument/completion\",\"params\":{\"textDocument\":{\"uri\":\"$CTOR_URI\"},\"position\":{\"line\":6,\"character\":${#COMMENT_PREFIX}}}}"
+	frame "{\"jsonrpc\":\"2.0\",\"id\":306,\"method\":\"textDocument/completion\",\"params\":{\"textDocument\":{\"uri\":\"$CTOR_URI\"},\"position\":{\"line\":9,\"character\":${#QUOTED_PREFIX}}}}"
+	frame "{\"jsonrpc\":\"2.0\",\"id\":307,\"method\":\"textDocument/completion\",\"params\":{\"textDocument\":{\"uri\":\"$CTOR_URI\"},\"position\":{\"line\":12,\"character\":${#RAW_PREFIX}}}}"
+	frame "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":{\"uri\":\"$DUP_URI\",\"languageId\":\"ouro\",\"version\":1,\"text\":\"$(json_text "$DUP_DOC")\"}}}"
+	frame "{\"jsonrpc\":\"2.0\",\"id\":308,\"method\":\"textDocument/completion\",\"params\":{\"textDocument\":{\"uri\":\"$DUP_URI\"},\"position\":{\"line\":1,\"character\":${#DUP_PREFIX}}}}"
+	frame "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":{\"uri\":\"$ADJ_URI\",\"languageId\":\"ouro\",\"version\":1,\"text\":\"$(json_text "$ADJ_DOC")\"}}}"
+	frame "{\"jsonrpc\":\"2.0\",\"id\":304,\"method\":\"textDocument/completion\",\"params\":{\"textDocument\":{\"uri\":\"$ADJ_URI\"},\"position\":{\"line\":1,\"character\":${#ADJ_PREFIX}}}}"
+	frame "{\"jsonrpc\":\"2.0\",\"id\":313,\"method\":\"textDocument/completion\",\"params\":{\"textDocument\":{\"uri\":\"$ADJ_URI\"},\"position\":{\"line\":2,\"character\":${#UNTYPED_PREFIX}}}}"
+	frame "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":{\"uri\":\"$LARGE_URI\",\"languageId\":\"ouro\",\"version\":1,\"text\":\"$(json_text "$LARGE_DOC")\"}}}"
+	frame "{\"jsonrpc\":\"2.0\",\"id\":309,\"method\":\"textDocument/completion\",\"params\":{\"textDocument\":{\"uri\":\"$LARGE_URI\"},\"position\":{\"line\":1,\"character\":${#LARGE_PREFIX}}}}"
+	frame "{\"jsonrpc\":\"2.0\",\"id\":310,\"method\":\"textDocument/completion\",\"params\":{\"textDocument\":{\"uri\":\"$LARGE_URI\"},\"position\":{\"line\":3,\"character\":${#BOUNDARY_PREFIX}}}}"
+	frame "{\"jsonrpc\":\"2.0\",\"id\":311,\"method\":\"textDocument/completion\",\"params\":{\"textDocument\":{\"uri\":\"$LARGE_URI\"},\"position\":{\"line\":5,\"character\":${#OVER_PREFIX}}}}"
+	frame '{"jsonrpc":"2.0","id":314,"method":"shutdown","params":{}}'
+	frame '{"jsonrpc":"2.0","method":"exit"}'
+} >"$OUT/constructors.in"
+set +e
+OURO_ROOT="$ROOT" "$LSP" <"$OUT/constructors.in" >"$OUT/constructors.out" 2>"$OUT/constructors.err"
+ctor_status=$?
+set -e
+tr '\r' '\n' <"$OUT/constructors.out" | grep '^{' >"$OUT/constructors.jsonl" || true
+if [ "$ctor_status" -eq 0 ] && [ ! -s "$OUT/constructors.err" ]; then
+	ok "constructor completion session exits cleanly"
+else
+	bad constructor-session "status=$ctor_status"
+fi
+choice_result=$(grep -F '"id":301,"result":' "$OUT/constructors.jsonl" || true)
+other_result=$(grep -F '"id":302,"result":' "$OUT/constructors.jsonl" || true)
+nested_result=$(grep -F '"id":303,"result":' "$OUT/constructors.jsonl" || true)
+comment_result=$(grep -F '"id":305,"result":' "$OUT/constructors.jsonl" || true)
+quoted_result=$(grep -F '"id":306,"result":' "$OUT/constructors.jsonl" || true)
+raw_result=$(grep -F '"id":307,"result":' "$OUT/constructors.jsonl" || true)
+duplicate_result=$(grep -F '"id":308,"result":' "$OUT/constructors.jsonl" || true)
+adjacent_result=$(grep -F '"id":304,"result":' "$OUT/constructors.jsonl" || true)
+untyped_result=$(grep -F '"id":313,"result":' "$OUT/constructors.jsonl" || true)
+large_result=$(grep -F '"id":309,"result":' "$OUT/constructors.jsonl" || true)
+boundary_result=$(grep -F '"id":310,"result":' "$OUT/constructors.jsonl" || true)
+over_result=$(grep -F '"id":311,"result":' "$OUT/constructors.jsonl" || true)
+case "$choice_result" in
+	*'"label":"LspRed","kind":4'*'"label":"LspBlue","kind":4'*) ok "local nullary constructors match explicit type" ;;
+	*) bad constructor-choice "missing LspRed or LspBlue" ;;
+esac
+case "$choice_result" in
+	*'"label":"LspWrap"'*) bad constructor-arity "non-nullary constructor suggested" ;;
+	*) ok "constructor with a value field is omitted" ;;
+esac
+case "$other_result" in
+	*'"label":"LspOrange","kind":4'*) ok "other family suggests its own constructor" ;;
+	*) bad constructor-other "missing LspOrange" ;;
+esac
+case "$other_result" in
+	*'"label":"LspRed"'* | *'"label":"LspBlue"'*) bad constructor-family "wrong-family constructor suggested" ;;
+	*) ok "other family excludes LspChoice constructors" ;;
+esac
+case "$nested_result" in
+	*'"kind":4'*) bad constructor-nested "nested expression acquired a direct result type" ;;
+	*'"label":"LspChoice"'*) ok "nested expression keeps ordinary prefix completion" ;;
+	*) bad constructor-nested "ordinary prefix completion missing" ;;
+esac
+case "$adjacent_result" in
+	*'"label":"LspOnly","kind":4'*) ok "adjacent family and tab-separated def use the LSP line" ;;
+	*) bad constructor-adjacent "adjacent constructor missing" ;;
+esac
+for response in "$comment_result" "$quoted_result" "$raw_result" "$duplicate_result" "$untyped_result"; do
+	case "$response" in
+		*'"result":'*)
+			case "$response" in
+				*'"kind":4'*) bad constructor-context "constructor suggested in comment, string, duplicate family, or unannotated def" ;;
+				*) ok "unsupported context omits constructor hint" ;;
+			esac ;;
+		*) bad constructor-context "completion reply missing" ;;
+	esac
+done
+case "$large_result" in
+	*'"label":"LspArm128","kind":4'*) ok "large family keeps a late nullary constructor" ;;
+	*) bad constructor-large "late constructor missing" ;;
+esac
+case "$boundary_result" in
+	*'"label":"LspBoundaryArm256","kind":4'*) ok "exact arm budget keeps its last constructor" ;;
+	*) bad constructor-boundary "constructor at exact arm budget missing" ;;
+esac
+case "$over_result" in
+	*'"kind":4'*) bad constructor-budget "family beyond arm budget produced a hint" ;;
+	*'"result":'*) ok "family beyond arm budget keeps ordinary completion" ;;
+	*) bad constructor-budget "completion reply missing" ;;
+esac
 
 # A document root is launch-authorized. Relative traversal, absolute imports,
 # and non-file URIs must never enter the symbol index.

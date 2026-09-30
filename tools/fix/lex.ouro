@@ -7,7 +7,8 @@
 
 import "../../std/natx.ouro",
   "../../std/string.ouro",
-  "../../std/char.ouro";
+  "../../std/char.ouro",
+  "../../compiler/source_text.ouro";
 
 -- kind, start offset, end offset, line, column, first-on-line, text, code
 inductive FxTok : Type :=
@@ -17,6 +18,7 @@ def fx_k_ident : Nat := 0;
 def fx_k_num : Nat := 1;
 def fx_k_str : Nat := 2;
 def fx_k_sym : Nat := 3;
+def fx_k_byte : Nat := 4;
 
 -- Codes 1..8 shape scope scans; higher codes only mark rule triggers.
 def fx_c_plain : Nat := 0;
@@ -208,7 +210,7 @@ def fx_take_ident : Nat -> List Nat -> Nat -> FxPiece :=
 inductive FxQuotedPiece : Type :=
   | MkFxQuotedPiece : List Nat -> Nat -> Nat -> Nat -> FxQuotedPiece;
 
-def fx_take_str : Nat -> List Nat -> Nat -> Nat -> Nat -> FxQuotedPiece :=
+def fx_take_quote (quote : Nat) : Nat -> List Nat -> Nat -> Nat -> Nat -> FxQuotedPiece :=
   fix go (fuel : Nat) (src : List Nat) (n : Nat) (line : Nat) (col : Nat) : FxQuotedPiece :=
     match fuel with
     | Z => MkFxQuotedPiece src n line col
@@ -216,7 +218,7 @@ def fx_take_str : Nat -> List Nat -> Nat -> Nat -> Nat -> FxQuotedPiece :=
         match src with
         | Nil => MkFxQuotedPiece (Nil Nat) n line col
         | Cons c rest =>
-            match eq_nat c ch_quote with
+            match eq_nat c quote with
             | True => MkFxQuotedPiece(rest, S n, line, S col)
             | False =>
                 match eq_nat c ch_bslash with
@@ -239,7 +241,10 @@ def fx_take_str : Nat -> List Nat -> Nat -> Nat -> Nat -> FxQuotedPiece :=
         end
     end;
 
--- Two-character symbols: := => -> <- |>
+def fx_take_str : Nat -> List Nat -> Nat -> Nat -> Nat -> FxQuotedPiece :=
+  fx_take_quote ch_quote;
+
+-- Two-character symbols: := => -> <- |> ??
 def fx_two_char (c : Nat) (d : Nat) : Bool :=
     match eq_nat d ch_gt with
     | True =>
@@ -257,7 +262,7 @@ def fx_two_char (c : Nat) (d : Nat) : Bool :=
         | False =>
             match eq_nat d ch_minus with
             | True => eq_nat c ch_lt
-            | False => False
+            | False => andb(eq_nat c ch_qmark, eq_nat d ch_qmark)
             end
         end
     end;
@@ -456,7 +461,7 @@ def fx_take_raw : Nat -> List Nat -> Nat -> Nat -> Nat -> FxQuotedPiece :=
               end) with
           | True => match rest with
             | Nil => MkFxQuotedPiece (Nil Nat) n line col
-            | Cons marker tail =>
+            | Cons _marker tail =>
                 MkFxQuotedPiece tail (add n 2) line (add col 2)
             end
           | False => match eq_nat c ch_lf with
@@ -465,6 +470,17 @@ def fx_take_raw : Nat -> List Nat -> Nat -> Nat -> Nat -> FxQuotedPiece :=
             end
           end
       end
+    end;
+
+def fx_advance_bytes : List Nat -> Nat -> Nat -> Pair Nat Nat :=
+  fix go (bytes : List Nat) (line : Nat) (col : Nat) : Pair Nat Nat :=
+    match bytes with
+    | Nil => MkPair Nat Nat line col
+    | Cons c rest =>
+        match eq_nat c ch_lf with
+        | True => go rest (S line) Z
+        | False => go rest line (S col)
+        end
     end;
 
 -- Dispatch order follows byte frequency in Ouro source: spaces, identifier
@@ -494,6 +510,17 @@ def fx_lex_go (src : String) : Nat -> List Nat -> Nat -> Nat -> Nat -> Bool -> L
                         (str_slice src pos n) fx_c_plain) acc)
                 end
             | False =>
+            match andb(eq_nat c 98,
+                str_starts (str_slice src pos 2) "b\"") with
+            | True =>
+                match fx_take_str fuel2 (drop Nat 2 cs) 2 line (add col 2) with
+                | MkFxQuotedPiece rest2 n next_line next_col =>
+                    let stop : Nat := add pos n in
+                    go fuel2 rest2 stop next_line next_col False
+                      (Cons FxTok (MkFxTok fx_k_byte pos stop line col bol
+                        (str_slice src pos n) fx_c_plain) acc)
+                end
+            | False =>
             match fx_ident_start c with
             | True =>
                 match fx_ident_piece src pos c cs with
@@ -510,14 +537,34 @@ def fx_lex_go (src : String) : Nat -> List Nat -> Nat -> Nat -> Nat -> Bool -> L
                 match eq_nat c ch_lf with
                 | True => go fuel2 rest (S pos) (S line) Z True acc
                 | False =>
-                match eq_nat c ch_quote with
+                match orb(eq_nat c ch_quote, eq_nat c ch_squote) with
                 | True =>
-                    match fx_take_str fuel2 rest (S Z) line (S col) with
-                    | MkFxQuotedPiece rest2 n next_line next_col =>
+                    match source_is_multiline_start cs with
+                    | True =>
+                        let rest2 : List Nat :=
+                          match source_take_multiline cs with
+                          | Nothing => Nil Nat
+                          | Just parsed => match parsed with
+                            | MkPair _ tail => tail
+                            end
+                          end in
+                        let n : Nat := sub (length Nat cs) (length Nat rest2) in
                         let stop : Nat := add pos n in
-                        go fuel2 rest2 stop next_line next_col False
-                          (Cons FxTok (MkFxTok fx_k_str pos stop line col bol
-                            (str_slice src pos n) fx_c_plain) acc)
+                        match fx_advance_bytes (take Nat n cs) line col with
+                        | MkPair next_line next_col =>
+                            go fuel2 rest2 stop next_line next_col False
+                              (Cons FxTok (MkFxTok fx_k_str pos stop line col bol
+                                (str_slice src pos n) fx_c_plain) acc)
+                        end
+                    | False =>
+                        match fx_take_quote c fuel2 rest (S Z) line (S col) with
+                        | MkFxQuotedPiece rest2 n next_line next_col =>
+                            let stop : Nat := add pos n in
+                            go fuel2 rest2 stop next_line next_col False
+                              (Cons FxTok (MkFxTok
+                                (match eq_nat c ch_squote with | True => fx_k_num | False => fx_k_str end)
+                                pos stop line col bol (str_slice src pos n) fx_c_plain) acc)
+                        end
                     end
                 | False =>
                 match eq_nat c ch_minus with
@@ -585,6 +632,7 @@ def fx_lex_go (src : String) : Nat -> List Nat -> Nat -> Nat -> Nat -> Bool -> L
                       (Cons FxTok (MkFxTok fx_k_sym pos stop line col bol
                         (str_slice src pos n) (fx_sym_code c n)) acc)
                 end
+            end
             end
             end
             end

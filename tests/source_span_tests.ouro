@@ -9,7 +9,8 @@ import "../compiler/source_spans.ouro",
   "../std/fs.ouro",
   "../std/processx.ouro",
   "../std/text.ouro",
-  "analyze/precision/assertions.ouro";
+  "analyze/precision/assertions.ouro",
+  "character_literal_cases.ouro";
 
 -- Tagged, length-prefixed codes: equal code lists mean equal trees. ESpan keeps
 -- its own tag, so a wrapper left behind by strip_spans changes the codes.
@@ -55,6 +56,13 @@ def ss_expr : Expr -> List Nat -> List Nat :=
            end))
     | EAscribe term ty => Cons Nat 9 (ss_expr(term, ss_expr ty acc))
     | EMatch scrut branches => Cons Nat 10 (ss_expr(scrut, ss_expr branches acc))
+    | EIf condition yes no =>
+        Cons Nat 30 (ss_expr(condition, ss_expr(yes, ss_expr no acc)))
+    | EIfLet pattern subject yes no =>
+        Cons Nat 31 (ss_nats pattern
+          (ss_expr(subject, ss_expr(yes, ss_expr no acc))))
+    | ECoalesce operand fallback =>
+        Cons Nat 32 (ss_expr(operand, ss_expr fallback acc))
     | EFix n binders ret body =>
         Cons Nat 11 (Cons Nat n (ss_expr(binders, ss_expr(ret, ss_expr body acc))))
     | EEffectRow ty ops => Cons Nat 12 (ss_expr(ty, ss_nats ops acc))
@@ -188,6 +196,7 @@ def ss_token (t : Token) (acc : List Nat) : List Nat :=
        | TType n => Cons Nat n acc
        | THole h => ss_maybe_nat h acc
        | TString n => Cons Nat n acc
+       | TByteString bytes => ss_nats bytes acc
        | TColon => acc
        | TColonEq => acc
        | TArrow => acc
@@ -205,6 +214,9 @@ def ss_token (t : Token) (acc : List Nat) : List Nat :=
        | TPipe => acc
        | TBracketL => acc
        | TBracketR => acc
+       | TDotDot => acc
+       | TDotDotEq => acc
+       | TCoalesce => acc
        end);
 
 def ss_tokens : List Token -> List Nat -> List Nat :=
@@ -224,17 +236,46 @@ def ss_interned : List (Pair (List Nat) Nat) -> List Nat -> List Nat :=
         end
     end;
 
+def ss_lexer_eof
+    (step_token : Nat -> List Nat -> InternState -> Step)
+    (fuel : Nat) (source : List Nat) : Bool :=
+    let identifiers : List (Pair (List Nat) Nat) :=
+      [MkPair(List Nat, Nat, prim_string_to_char_codes "item", 7)] in
+    let strings : List (Pair (List Nat) Nat) :=
+      [MkPair(List Nat, Nat, prim_string_to_char_codes "text", 3)] in
+    let state : InternState := MkIntern identifiers 8 strings 4 in
+    match lex_go_with step_token fuel source state
+        ([TString 3, TNat 42, TIdent 7] : List Token) with
+    | LexMalformed _ => False
+    | LexExhausted _ => False
+    | LexOk tokens final => match final with
+      | MkIntern ids next_id texts next_string =>
+          andb (source_bytes_equal
+            (ss_tokens tokens (Nil Nat))
+            (ss_tokens ([TIdent 7, TNat 42, TString 3, TEof] : List Token) (Nil Nat)))
+            (andb(eqNat next_id 8,
+              andb(eqNat next_string 4,
+                andb(source_bytes_equal (ss_interned(ids, Nil Nat))
+                  (ss_interned(identifiers, Nil Nat)),
+                  source_bytes_equal (ss_interned(texts, Nil Nat))
+                    (ss_interned(strings, Nil Nat))))))
+      end
+    end;
+
 def ss_fuel (codes : List Nat) : Nat := add(length Nat codes, 1024);
 
 inductive SsParse : Type :=
-  | SsParsed : List Decl -> Nat -> Nat -> SsParse
+  | SsParsed : List Decl -> List Nat -> Nat -> Nat -> SsParse
   | SsParseError : Nat -> SsParse;
 
 def ss_parse_with (parser : Nat -> Mode -> List Token -> Nat -> Value -> ParseResult Value)
     (fuel : Nat) (tokens : List Token) : SsParse :=
-    match parse_file parser fuel tokens 0 with
+    match parse_file_visibility parser fuel tokens 0 with
     | PErr position => SsParseError position
-    | POk decls remaining past => SsParsed decls (length Token remaining) past
+    | POk parsed remaining past => match parsed with
+      | MkParsedFile decls private_names =>
+          SsParsed decls private_names (length Token remaining) past
+      end
     end;
 
 -- Same declarations after stripping, same unconsumed tokens and end position,
@@ -244,13 +285,15 @@ def ss_parse_agrees (fuel : Nat) (tokens : List Token) : Bool :=
     | SsParseError position =>
         match ss_parse_with parse_spanned fuel tokens with
         | SsParseError other => eqNat position other
-        | SsParsed _ _ _ => False
+        | SsParsed _ _ _ _ => False
         end
-    | SsParsed decls remaining past =>
+    | SsParsed decls private_names remaining past =>
         match ss_parse_with parse_spanned fuel tokens with
         | SsParseError _ => False
-        | SsParsed spanned remaining2 past2 =>
-            andb (andb(eqNat remaining remaining2, eqNat past past2))
+        | SsParsed spanned spanned_private remaining2 past2 =>
+            andb (andb(eqNat remaining remaining2,
+              andb(eqNat past past2,
+                source_bytes_equal private_names spanned_private)))
               (source_bytes_equal (ss_decls(decls, Nil Nat))
                 (ss_decls(map Decl Decl strip_decl_spans spanned, Nil Nat)))
         end
@@ -293,8 +336,8 @@ def ss_ranges : Expr -> Nat -> Nat -> List SsRange -> List SsRange :=
     | EOpen _ inner => ss_ranges inner outer_first outer_past acc
     | ENamedCall head rows =>
         ss_ranges head outer_first outer_past
-          ((fix go (items : List (Pair Nat Expr)) (remaining : List Nat)
-              : List Nat :=
+          ((fix go (items : List (Pair Nat Expr)) (remaining : List SsRange)
+              : List SsRange :=
             match items with
             | Nil => remaining
             | Cons row rest =>
@@ -328,6 +371,17 @@ def ss_ranges : Expr -> Nat -> Nat -> List SsRange -> List SsRange :=
     | EAscribe term ty => ss_ranges term outer_first outer_past (ss_ranges ty outer_first outer_past acc)
     | EMatch scrut branches =>
         ss_ranges scrut outer_first outer_past (ss_ranges branches outer_first outer_past acc)
+    | EIf condition yes no =>
+        ss_ranges condition outer_first outer_past
+          (ss_ranges yes outer_first outer_past
+            (ss_ranges no outer_first outer_past acc))
+    | EIfLet _ subject yes no =>
+        ss_ranges subject outer_first outer_past
+          (ss_ranges yes outer_first outer_past
+            (ss_ranges no outer_first outer_past acc))
+    | ECoalesce operand fallback =>
+        ss_ranges operand outer_first outer_past
+          (ss_ranges fallback outer_first outer_past acc)
     | EFix _ binders ret body =>
         ss_ranges binders outer_first outer_past
           (ss_ranges ret outer_first outer_past (ss_ranges body outer_first outer_past acc))
@@ -440,16 +494,127 @@ def ss_exact_slice (tokens : List Token) (first : Nat) (past : Nat) (slice : Lis
     | LexExhausted _ => False
     end;
 
--- The recorded token range, parsed alone as an expression, consumes every
--- token and yields exactly the wrapped expression.
+-- Parse the range in its grammar context, consuming every token and yielding
+-- exactly the wrapped expression. Callback braces are not standalone atoms.
 def ss_reparses (fuel : Nat) (tokens : List Token) (first : Nat) (past : Nat) (inner : Expr) : Bool :=
-    match parse_expr parse fuel
-        (append Token (take(Token, sub past first, drop Token first tokens)) [TEof]) 0 with
+    let fragment : List Token :=
+      append Token (take(Token, sub past first, drop Token first tokens)) [TEof] in
+    let mode : Mode := match eqNat (token_tag (peek fragment)) tagBraceL with
+      | True => MTrailingLambda
+      | False => MExpr
+      end in
+    match parse fuel mode fragment 0 (VNat Z) with
     | PErr _ => False
-    | POk e rest _ =>
-        andb (eqNat(length Token rest, 1))
-          (source_bytes_equal(ss_expr(e, Nil Nat), ss_expr(strip_spans inner, Nil Nat)))
+    | POk value rest _ =>
+        match asExpr value with
+        | Nothing => False
+        | Just e => andb (eqNat(length Token rest, 1))
+            (source_bytes_equal(ss_expr(e, Nil Nat), ss_expr(strip_spans inner, Nil Nat)))
+        end
     end;
+
+-- Derived suffix lookups for the span oracle; leaves retain the original data.
+inductive SsTokenPoint : Type :=
+  | MkSsTokenPoint : List Token -> Pair (List Nat) (List Nat) -> SsTokenPoint;
+
+inductive SsTokenIndex : Type :=
+  | SsIndexEmpty : SsTokenIndex
+  | SsIndexLeaf : SsTokenPoint -> SsTokenIndex
+  | SsIndexBranch : Nat -> Nat -> SsTokenIndex -> SsTokenIndex -> SsTokenIndex;
+
+def ss_token_index_size (tree : SsTokenIndex) : Nat :=
+    match tree with
+    | SsIndexEmpty => Z
+    | SsIndexLeaf _ => 1
+    | SsIndexBranch size _ _ _ => size
+    end;
+
+def ss_token_index_join (left : SsTokenIndex) (right : SsTokenIndex) : SsTokenIndex :=
+    let left_size : Nat := ss_token_index_size left in
+    SsIndexBranch (add left_size (ss_token_index_size right)) left_size left right;
+
+def ss_token_index_leaves : List Token -> List (Pair (List Nat) (List Nat)) ->
+    List SsTokenIndex -> Maybe (List SsTokenIndex) :=
+  fix go (tokens : List Token) (marks : List (Pair (List Nat) (List Nat)))
+      (acc : List SsTokenIndex) : Maybe (List SsTokenIndex) :=
+    match tokens with
+    | Nil => match marks with
+      | Nil => Just (List SsTokenIndex) (reverse_lin SsTokenIndex acc)
+      | Cons _ _ => Nothing (List SsTokenIndex)
+      end
+    | Cons _ rest => match marks with
+      | Nil => Nothing (List SsTokenIndex)
+      | Cons mark remaining =>
+          go rest remaining (Cons SsTokenIndex (SsIndexLeaf (MkSsTokenPoint tokens mark)) acc)
+      end
+    end;
+
+def ss_token_index_pairs : List SsTokenIndex -> List SsTokenIndex -> List SsTokenIndex :=
+  fix go (trees : List SsTokenIndex) (acc : List SsTokenIndex) : List SsTokenIndex :=
+    match trees with
+    | Nil => reverse_lin SsTokenIndex acc
+    | Cons left rest => match rest with
+      | Nil => reverse_lin SsTokenIndex (Cons SsTokenIndex left acc)
+      | Cons right remaining => go remaining (Cons SsTokenIndex (ss_token_index_join left right) acc)
+      end
+    end;
+
+def ss_token_index_collapse : Nat -> List SsTokenIndex -> Maybe SsTokenIndex :=
+  fix go (fuel : Nat) (trees : List SsTokenIndex) : Maybe SsTokenIndex :=
+    match trees with
+    | Nil => Just SsTokenIndex SsIndexEmpty
+    | Cons first rest => match rest with
+      | Nil => Just SsTokenIndex first
+      | Cons _ _ => match fuel with
+        | Z => Nothing SsTokenIndex
+        | S less => go less (ss_token_index_pairs trees (Nil SsTokenIndex))
+        end
+      end
+    end;
+
+def ss_token_index_make (tokens : List Token) (marks : List (Pair (List Nat) (List Nat)))
+    : Maybe SsTokenIndex :=
+    match ss_token_index_leaves tokens marks (Nil SsTokenIndex) with
+    | Nothing => Nothing SsTokenIndex
+    | Just trees => ss_token_index_collapse (length Token tokens) trees
+    end;
+
+def ss_token_index_lookup (index : Nat) (tree : SsTokenIndex) : Maybe SsTokenPoint :=
+    (fix go (node : SsTokenIndex) (position : Nat) : Maybe SsTokenPoint :=
+    match node with
+    | SsIndexEmpty => Nothing SsTokenPoint
+    | SsIndexLeaf point => match eqNat position Z with
+      | True => Just SsTokenPoint point
+      | False => Nothing SsTokenPoint
+      end
+    | SsIndexBranch size left_size left right =>
+        match ltb_nat position size with
+        | False => Nothing SsTokenPoint
+        | True => match ltb_nat position left_size with
+          | True => go left position
+          | False => go right (sub position left_size)
+          end
+        end
+    end) tree index;
+
+def ss_token_index_span_bytes (total : Nat) (tree : SsTokenIndex) (first : Nat) (past : Nat)
+    : Maybe (Pair Nat Nat) :=
+    match ltb_nat first past with
+    | False => Nothing (Pair Nat Nat)
+    | True => match ss_token_index_lookup first tree with
+      | Nothing => Nothing (Pair Nat Nat)
+      | Just opening => match ss_token_index_lookup (sub past 1) tree with
+        | Nothing => Nothing (Pair Nat Nat)
+        | Just closing => match opening with
+          | MkSsTokenPoint _ first_mark => match closing with
+            | MkSsTokenPoint _ last_mark =>
+                token_span_bytes (MkTokenSpans total [first_mark, last_mark]) 0 2
+            end
+          end
+        end
+      end
+    end;
+
 
 -- Check each span before folding its exact byte slice. A partition runs in a
 -- separate process so the runtime can release its arena between partitions.
@@ -472,6 +637,11 @@ def ss_fold_slices_codes_part (A : Type) (codes : List Nat) (part : Nat) (parts 
             let ranges : List SsRange :=
               foldl Decl (List SsRange) (fun (acc : List SsRange) (d : Decl) => ss_decl_ranges count d acc)
                 (Nil SsRange) decls in
+            match lex_spanned_tokens lexed with
+            | MkTokenSpans total marks =>
+                match ss_token_index_make tokens marks with
+                | Nothing => Nothing A
+                | Just indexed =>
             (fix go (rs : List SsRange) (acc : A) (slot : Nat) : Maybe A :=
               match rs with
               | Nil => Just(A, acc)
@@ -483,26 +653,33 @@ def ss_fold_slices_codes_part (A : Type) (codes : List Nat) (part : Nat) (parts 
                   | True =>
                   match r with
                   | MkSsRange first past nested inner =>
-                      match andb(andb(nested, ltb_nat past count), ss_reparses fuel tokens first past inner) with
+                      match ss_token_index_lookup first indexed with
+                      | Nothing => Nothing A
+                      | Just point => match point with
+                        | MkSsTokenPoint suffix _ =>
+                      match andb(andb(nested, ltb_nat past count), ss_reparses fuel suffix Z (sub past first) inner) with
                       | False => Nothing A
                       | True =>
-                          match token_span_bytes (lex_spanned_tokens lexed) first past with
+                          match ss_token_index_span_bytes total indexed first past with
                           | Nothing => Nothing A
                           | Just bytes =>
                               match bytes with
                               | MkPair first_byte past_byte =>
-                                  match ss_exact_slice tokens first past
-                                      (take(Nat, sub past_byte first_byte, drop Nat first_byte codes)) with
+                                  let slice : String := prim_string_slice text first_byte (sub past_byte first_byte) in
+                                  match ss_exact_slice suffix Z (sub past first) (prim_string_to_char_codes slice) with
                                   | False => Nothing A
-                                  | True => go rest
-                                      (step (prim_string_slice text first_byte (sub past_byte first_byte)) acc) next
+                                  | True => go rest (step slice acc) next
                                   end
                               end
                           end
                       end
+                        end
+                      end
                   end
                   end
               end) ranges initial Z
+                end
+            end
         end
     end
     end;
@@ -564,7 +741,7 @@ def ss_parses (text : String) : Bool :=
     match lex_all fuel codes with
     | LexOk tokens _ =>
         match ss_parse_with parse fuel tokens with
-        | SsParsed _ remaining _ => eqNat remaining 1
+        | SsParsed _ _ remaining _ => eqNat remaining 1
         | SsParseError _ => False
         end
     | LexMalformed _ => False
@@ -604,6 +781,91 @@ def ss_lowfuel_numeric : Bool :=
     | LexExhausted _ => False
     end;
 
+def ss_character_state (st : InternState) : Bool :=
+  match st with
+  | MkIntern ids next_id strings next_string =>
+      andb (andb(nullb (Pair (List Nat) Nat) ids, eqNat next_id 1))
+        (andb(nullb (Pair (List Nat) Nat) strings, eqNat next_string 0))
+  end;
+
+def ss_character_token (codes : List Nat) (expected : Nat) : Bool :=
+  let source : List Nat := append Nat ([32, 9] : List Nat)
+    (append Nat codes ([32] : List Nat)) in
+  let lexed : LexSpanned := lex_spanned 64 source empty_intern in
+  match lex_spanned_result lexed with
+  | LexMalformed _ => False
+  | LexExhausted _ => False
+  | LexOk tokens st =>
+      andb (ss_character_state st)
+        (andb (source_bytes_equal (ss_tokens tokens (Nil Nat))
+          (ss_tokens ([TNat expected, TEof] : List Token) (Nil Nat)))
+          (match token_span_bytes (lex_spanned_tokens lexed) 0 1 with
+           | Nothing => False
+           | Just offsets => match offsets with
+             | MkPair first past =>
+                 andb(eqNat first 2, eqNat past (add 2 (length Nat codes)))
+             end
+           end))
+  end;
+
+def ss_character_valid : List (Pair (List Nat) Nat) -> Bool :=
+  fix go (cases : List (Pair (List Nat) Nat)) : Bool :=
+    match cases with
+    | Nil => True
+    | Cons row rest => match row with
+      | MkPair codes expected =>
+          andb (ss_character_token codes expected) (go rest)
+      end
+    end;
+
+def ss_character_invalid : List (Pair String (List Nat)) -> Bool :=
+  fix go (cases : List (Pair String (List Nat))) : Bool :=
+    match cases with
+    | Nil => True
+    | Cons row rest => match row with
+      | MkPair _ codes =>
+          andb (match lex_all 64 codes with
+            | LexOk _ _ => False
+            | LexExhausted _ => False
+            | LexMalformed st => ss_character_state st
+            end)
+            (andb (match lex_spanned_result (lex_spanned 64 codes empty_intern) with
+              | LexOk _ _ => False
+              | LexExhausted _ => False
+              | LexMalformed st => ss_character_state st
+              end) (go rest))
+      end
+    end;
+
+def ss_character_lowfuel (fuel : Nat) : Bool :=
+  let codes : List Nat := ([39, 97, 39] : List Nat) in
+  andb (match lex_all fuel codes with
+    | LexOk _ _ => False
+    | LexMalformed st => ss_character_state st
+    | LexExhausted st => ss_character_state st
+    end)
+    (match lex_spanned_result (lex_spanned fuel codes empty_intern) with
+    | LexOk _ _ => False
+    | LexMalformed st => ss_character_state st
+    | LexExhausted st => ss_character_state st
+    end);
+
+def ss_character_primes : Bool :=
+  match lex_all 64 (prim_string_to_char_codes "'a''b' name'") with
+  | LexMalformed _ => False
+  | LexExhausted _ => False
+  | LexOk tokens st => match st with
+    | MkIntern ids next_id strings next_string =>
+        andb (source_bytes_equal (ss_tokens tokens (Nil Nat))
+          (ss_tokens ([TNat 97, TNat 98, TIdent 1, TEof] : List Token) (Nil Nat)))
+          (andb (source_bytes_equal (ss_interned ids (Nil Nat))
+            (ss_interned ([MkPair (List Nat) Nat
+              ([110, 97, 109, 101, 39] : List Nat) 1] : List (Pair (List Nat) Nat)) (Nil Nat)))
+            (andb(eqNat next_id 2,
+              andb(nullb (Pair (List Nat) Nat) strings, eqNat next_string 0))))
+    end
+  end;
+
 def ss_samples : List String :=
     [ "def f : Nat := g (h x) |> k;"
     , "def s : String := \"a\\\"b -- c\"; -- trailing"
@@ -631,6 +893,24 @@ def ss_samples : List String :=
     , "def bad : String := \"open"
     , "def bad : String := r#\"open"
     ];
+
+def ss_expanded (text : String) : Maybe (List Nat) :=
+    match preprocess_imports_reg empty_imp_reg
+        (prim_string_to_char_codes text) with
+    | MkPair aliases imported => match imported with
+      | ImpErr _ _ => Nothing (List Nat)
+      | ImpOk prepared =>
+          match preprocess_records_reg (Nil Nat) aliases
+              empty_rec_reg prepared with
+          | MkPair _ tagged => match tagged with
+            | MkPair _ result => match result with
+              | PrepErr _ _ => Nothing (List Nat)
+              | PrepOk expanded => Just(List Nat, expanded)
+              end
+            end
+          end
+        end
+    end;
 
 def ss_laws_first : List (Pair String Bool) :=
     [ MkPair String Bool "agree/samples" (all String ss_agrees ss_samples)
@@ -709,26 +989,18 @@ def ss_laws_rest : List (Pair String Bool) :=
     , MkPair String Bool "spans/list-literal"
         (ss_spans_expect "def xs : List Nat := [one, two];" ["[one, two]", "one", "two", "List Nat"] [])
     , MkPair String Bool "spans/preprocessed-record-update"
-        (match preprocess_imports (prim_string_to_char_codes
-            "record Point : Type where x : Nat; y : Nat; end; def x : Nat := Z; def y : Nat := S Z; def p : Point := {x,y}; def q : Point := {p with y := Z -- field\n, x := S Z};") with
-         | ImpErr _ _ => False
-         | ImpOk imported =>
-             match preprocess_records imported with
-             | PrepErr _ _ => False
-             | PrepOk expanded =>
-                 andb (ss_agrees_codes expanded) (ss_well_formed_codes_part expanded 0 1)
-             end
+        (match ss_expanded
+            "record Point : Type where x : Nat; y : Nat; end; def x : Nat := Z; def y : Nat := S Z; def p : Point := {x,y}; def q : Point := {p with y := Z -- field\n, x := S Z};" with
+         | Nothing => False
+         | Just expanded =>
+             andb (ss_agrees_codes expanded) (ss_well_formed_codes_part expanded 0 1)
          end)
     , MkPair String Bool "spans/preprocessed-nested-record-update"
-        (match preprocess_imports (prim_string_to_char_codes
-            "record Address : Type where city : Nat; zip : Nat; end; record User : Type where address : Address; age : Nat; end; def home : Address := {city := Z, zip := Z}; def user : User := {address := home, age := Z}; def next : User := {user with address.city := S Z -- first\n, address.zip := Z};") with
-         | ImpErr _ _ => False
-         | ImpOk imported =>
-             match preprocess_records imported with
-             | PrepErr _ _ => False
-             | PrepOk expanded =>
-                 andb (ss_agrees_codes expanded) (ss_well_formed_codes_part expanded 0 1)
-             end
+        (match ss_expanded
+            "record Address : Type where city : Nat; zip : Nat; end; record User : Type where address : Address; age : Nat; end; def home : Address := {city := Z, zip := Z}; def user : User := {address := home, age := Z}; def next : User := {user with address.city := S Z -- first\n, address.zip := Z};" with
+         | Nothing => False
+         | Just expanded =>
+             andb (ss_agrees_codes expanded) (ss_well_formed_codes_part expanded 0 1)
          end)
     , MkPair String Bool "spans/preprocessed-record-pun"
         (match preprocess_imports (prim_string_to_char_codes
@@ -757,37 +1029,290 @@ def ss_laws_rest : List (Pair String Bool) :=
          | LexMalformed _ => False
          | LexExhausted _ => False
          end)
+    , MkPair String Bool "tokens/eof-preserves-order-payloads-and-intern-state"
+        (andb (andb(ss_lexer_eof next_token 0 (Nil Nat),
+          ss_lexer_eof next_import_token 0 (Nil Nat)))
+          (andb(ss_lexer_eof next_token 64
+            (prim_string_to_char_codes " -- trailing\n "),
+            ss_lexer_eof next_import_token 64
+              (prim_string_to_char_codes " -- trailing\n "))))
+    , MkPair String Bool "tokens/range-token-tags"
+        (list_eq Nat eq_nat
+          (ss_tokens ([TDotDot, TDotDotEq] : List Token) ([] : List Nat))
+          ([1, 23, 1, 24, 0] : List Nat))
     ];
 
+def ss_laws_character : List (Pair String Bool) :=
+  [ MkPair String Bool "tokens/character-scalars-and-byte-spans"
+      (ss_character_valid character_valid_cases)
+  , MkPair String Bool "tokens/character-malformed-encodings"
+      (ss_character_invalid character_invalid_cases)
+  , MkPair String Bool "tokens/character-no-prefix-at-lowfuel"
+      (andb (ss_character_lowfuel 0) (andb (ss_character_lowfuel 1)
+        (andb (ss_character_lowfuel 2) (ss_character_lowfuel 3))))
+  , MkPair String Bool "tokens/character-adjacency-and-identifier-primes"
+      ss_character_primes
+  , MkPair String Bool "spans/character-spellings"
+      (ss_spans_expect "def a : Nat := 'A'; def e : Nat := 'é'; def euro : Nat := '€'; def smile : Nat := '😀'; def nul : Nat := '\\u{0}';"
+        (["'A'", "'é'", "'€'", "'😀'", "'\\u{0}'", "Nat"] : List String) ([] : List String))
+  , MkPair String Bool "spans/character-stream-and-parser-agreement"
+      (ss_stream_agrees_with_slices "def name' : Nat := '\\''; def brace : Nat := '{';")
+  ];
+
+def ss_laws_do : List (Pair String Bool) :=
+    [ MkPair String Bool "spans/do-pure-let"
+        (ss_spans_expect "def main : IO Nat := do let value : Nat := one; io_pure Nat value;"
+          ["do let value : Nat := one; io_pure Nat value", "one", "io_pure Nat value", "value"]
+          ["let value : Nat := one"])
+    ];
+
+def ss_laws_destructure : List (Pair String Bool) :=
+    [ MkPair String Bool "spans/destructure-let"
+        (ss_spans_expect
+          "def chosen : Nat := let (MkPair left right) := pair in left;"
+          ["let (MkPair left right) := pair in left", "pair", "left"] [])
+    , MkPair String Bool "spans/destructure-block"
+        (ss_spans_expect
+          "def chosen : Nat := let { let (MkPair left right) := pair; right };"
+          ["let { let (MkPair left right) := pair; right }", "pair", "right"] [])
+    ];
+
+def ss_laws_multiline : List (Pair String Bool) :=
+    [ MkPair String Bool "spans/multiline-raw-source-and-following-token"
+        (ss_spans_expect
+          "def s : String := \"\"\"\r\n  A\\n\r\n\r\n  B\r\n  \"\"\"; def n : Nat := 42;"
+          ["\"\"\"\r\n  A\\n\r\n\r\n  B\r\n  \"\"\"", "42", "Nat"] [])
+    , MkPair String Bool "spans/multiline-token-stream-agreement"
+        (ss_stream_agrees_with_slices
+          "def s : String := \"\"\"\n  -- import \"fake.ouro\"\n  \"\"\"; def n : Nat := 1;")
+    ];
+
+def ss_laws_byte : List (Pair String Bool) :=
+    [ MkPair String Bool "spans/byte-literal-exact-source"
+        (ss_spans_expect
+          "def bytes : List Nat := b\"A\\x00\\xFF\"; def next : Nat := 42;"
+          ["b\"A\\x00\\xFF\"", "42", "List Nat"] [])
+    , MkPair String Bool "spans/byte-literal-is-one-token"
+        (ss_stream_agrees_with_slices
+          "def bytes : List Nat := b\"-- import \\\"fake.ouro\\\";\"; def n : Nat := 1;")
+    , MkPair String Bool "spans/byte-lex-error-agreement"
+        (ss_agrees "def bad : List Nat := b\"\\u{41}\";")
+    ];
+
+def ss_laws_if : List (Pair String Bool) :=
+    [ MkPair String Bool "spans/if-arms"
+        (ss_spans_expect "def pick (flag : Bool) : Nat := if flag then one else two;"
+          (["if flag then one else two", "flag", "one", "two", "Bool", "Nat"] : List String)
+          (["if flag then one"] : List String))
+    , MkPair String Bool "spans/if-let-arms"
+        (ss_spans_expect
+          "def pick (item : Maybe Nat) : Nat := if let Just value := item then value else zero;"
+          (["if let Just value := item then value else zero", "item",
+            "value", "zero", "Maybe Nat", "Nat"] : List String)
+          (["if let Just value := item then value"] : List String))
+    ];
+
+def ss_trailing_lambda_reparse_controls : Bool :=
+    let tokens : List Token :=
+      [TBraceL, TIdent 7, TArrow, TIdent 7, TBraceR, TIdent 8, TEof] in
+    let expected : Expr := ELam 7 (Nothing Expr) (EVar 7) in
+    andb (ss_reparses 100 tokens 0 5 expected)
+      (andb (notb (ss_reparses 100 tokens 0 5 (ELam 8 (Nothing Expr) (EVar 7))))
+        (andb (notb (ss_reparses 100 tokens 0 5 (ELam 7 (Nothing Expr) (EVar 8))))
+          (andb (notb (ss_reparses 100 tokens 0 4 expected))
+            (notb (ss_reparses 100 tokens 0 6 expected)))));
+
+def ss_laws_trailing_lambda : List (Pair String Bool) :=
+    [ MkPair String Bool "spans/trailing-lambda-call-and-body"
+        (ss_spans_expect "def result : Nat := run(value) { item -> item };"
+          ["run(value) { item -> item }", "{ item -> item }", "value", "item", "Nat"] [])
+    , MkPair String Bool "spans/trailing-lambda-token-stream"
+        (ss_stream_agrees_with_slices
+          "def result : Nat := run(value) { item -> item };")
+    , MkPair String Bool "spans/trailing-lambda-reparse-controls"
+        ss_trailing_lambda_reparse_controls
+    ];
+
+def ss_laws_coalesce : List (Pair String Bool) :=
+    [ MkPair String Bool "spans/coalesce-operands-and-whole"
+        (ss_spans_expect "def choice : Nat := source ?? (fallback value);"
+          ["source ?? (fallback value)", "source", "(fallback value)", "fallback value",
+           "fallback", "value", "Nat"] [])
+    , MkPair String Bool "spans/coalesce-token-stream"
+        (ss_stream_agrees_with_slices "def choice : Nat := source ?? fallback;")
+    ];
+
+def ss_where_laws : List (Pair String Bool) :=
+    [ MkPair String Bool "agree/where-sequential-and-grouped"
+        (all String ss_agrees
+          ["def chosen : Nat := value |> apply where let value : Nat := first; let apply (x : Nat) : Nat := next x; end;",
+           "def chosen : Nat -> Nat := (fun (x : Nat) => apply x) where let apply (y : Nat) : Nat := y; end;"])
+    , MkPair String Bool "spans/where-main-and-initializers"
+        (ss_spans_expect
+          "def chosen : Nat := value |> apply where -- helper scope\n let value : Nat := first; let apply (x : Nat) : Nat := next x; end;"
+          ["value |> apply where -- helper scope\n let value : Nat := first; let apply (x : Nat) : Nat := next x; end",
+           "value |> apply", "first", "next x", "Nat"]
+          ["let value : Nat := first", "let apply (x : Nat) : Nat := next x"])
+    , MkPair String Bool "spans/where-grouped-main-and-nested-initializer"
+        (ss_spans_expect
+          "def chosen : Nat -> Nat := (fun (x : Nat) => apply x) where let apply (y : Nat) : Nat := y where let y : Nat := first; end; end;"
+          ["(fun (x : Nat) => apply x) where let apply (y : Nat) : Nat := y where let y : Nat := first; end; end",
+           "(fun (x : Nat) => apply x)", "apply x", "y where let y : Nat := first; end", "first"]
+          ["let y : Nat := first"])
+    ];
+
+def ss_laws_private : List (Pair String Bool) :=
+    [ MkPair String Bool "agree/private-declaration"
+        (ss_agrees "private def helper : Type := Type;")
+    , MkPair String Bool "spans/private-declaration"
+        (ss_spans_expect "private def helper : Type := Type;"
+          ["Type"] [])
+    ];
+
+def ss_token_index_positions : Nat -> List Nat :=
+  fix go (last : Nat) : List Nat :=
+    match last with
+    | Z => [Z]
+    | S previous => Cons Nat last (go previous)
+    end;
+
+def ss_token_index_examples : List String :=
+    [ "", "-- comment\r\n def value : Nat := (next value);",
+      "def text : String := \"A\\u{0}é\";" ];
+
+def ss_token_index_tail_agrees (tree : SsTokenIndex) (tokens : List Token) (position : Nat) : Bool :=
+    match ss_token_index_lookup position tree with
+    | Nothing => match drop Token position tokens with | Nil => True | Cons _ _ => False end
+    | Just point => match point with
+      | MkSsTokenPoint suffix _ =>
+          source_bytes_equal (ss_tokens suffix (Nil Nat))
+            (ss_tokens (drop Token position tokens) (Nil Nat))
+      end
+    end;
+
+def ss_token_index_tails_agree (text : String) : Bool :=
+    let codes : List Nat := prim_string_to_char_codes text in
+    let lexed : LexSpanned := lex_spanned_import (ss_fuel codes) codes empty_intern in
+    match lex_spanned_result lexed with
+    | LexMalformed _ => False
+    | LexExhausted _ => False
+    | LexOk tokens _ => match lex_spanned_tokens lexed with
+      | MkTokenSpans _ marks => match ss_token_index_make tokens marks with
+        | Nothing => False
+        | Just tree => all Nat (ss_token_index_tail_agrees tree tokens)
+            (ss_token_index_positions (add (length Token tokens) 2))
+        end
+      end
+    end;
+
+def ss_token_index_bytes_equal (left : Maybe (Pair Nat Nat)) (right : Maybe (Pair Nat Nat)) : Bool :=
+    match left with
+    | Nothing => match right with | Nothing => True | Just _ => False end
+    | Just actual => match right with
+      | Nothing => False
+      | Just expected => andb (eqNat (fst Nat Nat actual) (fst Nat Nat expected))
+          (eqNat (snd Nat Nat actual) (snd Nat Nat expected))
+      end
+    end;
+
+def ss_token_index_bytes_agree (text : String) : Bool :=
+    let codes : List Nat := prim_string_to_char_codes text in
+    let lexed : LexSpanned := lex_spanned_import (ss_fuel codes) codes empty_intern in
+    match lex_spanned_result lexed with
+    | LexMalformed _ => False
+    | LexExhausted _ => False
+    | LexOk tokens _ => match lex_spanned_tokens lexed with
+      | MkTokenSpans total marks => match ss_token_index_make tokens marks with
+        | Nothing => False
+        | Just tree =>
+            let positions : List Nat := ss_token_index_positions (add (length Token tokens) 2) in
+            all Nat (fun (first : Nat) => all Nat (fun (past : Nat) =>
+              ss_token_index_bytes_equal (ss_token_index_span_bytes total tree first past)
+                (token_span_bytes (lex_spanned_tokens lexed) first past)) positions) positions
+        end
+      end
+    end;
+
+def ss_token_index_rejects_mismatch : Bool :=
+    let mark : Pair (List Nat) (List Nat) := MkPair (List Nat) (List Nat) (Nil Nat) (Nil Nat) in
+    andb (match ss_token_index_make (Nil Token) (Nil (Pair (List Nat) (List Nat))) with
+      | Nothing => False
+      | Just tree => andb (eqNat (ss_token_index_size tree) Z)
+          (match ss_token_index_lookup Z tree with | Nothing => True | Just _ => False end)
+      end)
+      (andb (match ss_token_index_make (Nil Token) [mark] with | Nothing => True | Just _ => False end)
+        (andb (match ss_token_index_make [TEof] (Nil (Pair (List Nat) (List Nat))) with
+          | Nothing => True | Just _ => False end)
+          (andb (match ss_token_index_make [TEof] [mark, mark] with | Nothing => True | Just _ => False end)
+            (match ss_token_index_collapse Z [SsIndexEmpty, SsIndexEmpty] with
+             | Nothing => True | Just _ => False end))));
+
+def ss_token_index_reparse_controls : Bool :=
+    let tokens : List Token :=
+      [TIdent 8, TIdent 9, TBraceL, TIdent 7, TArrow, TIdent 7, TBraceR, TIdent 8, TEof] in
+    let mark : Pair (List Nat) (List Nat) := MkPair (List Nat) (List Nat) (Nil Nat) (Nil Nat) in
+    match ss_token_index_make tokens
+      (map Token (Pair (List Nat) (List Nat)) (fun (_ : Token) => mark) tokens) with
+    | Nothing => False
+    | Just tree => match ss_token_index_lookup 2 tree with
+      | Nothing => False
+      | Just point => match point with
+        | MkSsTokenPoint suffix _ =>
+            let expected : Expr := ELam 7 (Nothing Expr) (EVar 7) in
+            andb (ss_reparses 100 suffix 0 5 expected)
+              (andb (notb (ss_reparses 100 suffix 0 5 (ELam 8 (Nothing Expr) (EVar 7))))
+                (andb (notb (ss_reparses 100 suffix 0 5 (ELam 7 (Nothing Expr) (EVar 8))))
+                  (andb (notb (ss_reparses 100 suffix 0 4 expected))
+                    (andb (notb (ss_reparses 100 suffix 0 6 expected))
+                      (notb (ss_reparses 0 suffix 0 5 expected))))))
+        end
+      end
+    end;
+
+
+def ss_slice_byte_codes_agree (codes : List Nat) : Bool :=
+    let bounds : List Nat := [0, 1, 2, 6, 9] in
+    all Nat (fun (first : Nat) =>
+      all Nat (fun (size : Nat) =>
+        source_bytes_equal
+          (prim_string_to_char_codes
+            (prim_string_slice (prim_string_of_char_codes codes) first size))
+          (take(Nat, size, drop Nat first codes))) bounds) bounds;
+
+def ss_slice_byte_codes_law : Bool :=
+    andb (ss_slice_byte_codes_agree (Nil Nat))
+      (ss_slice_byte_codes_agree ([0, 65, 195, 169, 255, 13, 10] : List Nat));
+
 def ss_laws : List (Pair String Bool) :=
-    append (Pair String Bool) ss_laws_first ss_laws_rest;
+    append (Pair String Bool) ss_laws_first
+      (append (Pair String Bool) ss_laws_rest
+        (append (Pair String Bool) ss_laws_do
+          (append (Pair String Bool) ss_laws_destructure
+            (append (Pair String Bool) ss_laws_multiline
+              (append (Pair String Bool) ss_laws_byte
+                (append (Pair String Bool) ss_laws_if
+                  (append (Pair String Bool) ss_laws_trailing_lambda
+                    (append (Pair String Bool) ss_laws_coalesce
+                      (append (Pair String Bool) ss_where_laws
+                        (append (Pair String Bool) ss_laws_private
+                          (append (Pair String Bool) ss_laws_character
+                            [ MkPair String Bool "slices/native-byte-list-equation" ss_slice_byte_codes_law
+                            , MkPair String Bool "index/token-suffix-equation"
+                                (all String ss_token_index_tails_agree ss_token_index_examples)
+                            , MkPair String Bool "index/byte-range-equation"
+                                (all String ss_token_index_bytes_agree ss_token_index_examples)
+                            , MkPair String Bool "index/shape-and-reparse-controls"
+                                (andb ss_token_index_rejects_mismatch ss_token_index_reparse_controls)
+                            ])))))))))));
 
 -- Repository sources after the same import and record preprocessing that
 -- tools apply before lexing.
 def ss_files : List String :=
     [ "std/prelude.ouro", "std/data.ouro", "std/io.ouro", "std/string.ouro", "std/collections.ouro"
     , "std/record_demo.ouro", "std/import_alias_demo.ouro", "std/io_hype_inline.ouro"
-    , "compiler/lexer.ouro", "compiler/parse_b.ouro", "compiler/desugar_match.ouro"
+    , "compiler/lexer.ouro", "compiler/parse_b.ouro", "compiler/parser_min.ouro", "compiler/desugar_match.ouro"
     , "samples/examples/handler_demo.ouro", "samples/tutorial/06_effects.ouro", "samples/examples/nat.ouro"
     ];
-
-def ss_expanded (text : String) : Maybe (List Nat) :=
-    match preprocess_imports_reg empty_imp_reg
-        (prim_string_to_char_codes text) with
-    | MkPair aliases imported => match imported with
-      | ImpErr _ _ => Nothing (List Nat)
-      | ImpOk prepared =>
-          match preprocess_records_reg (Nil Nat) aliases
-              empty_rec_reg prepared with
-          | MkPair _ tagged => match tagged with
-            | MkPair _ result => match result with
-              | PrepErr _ _ => Nothing (List Nat)
-              | PrepOk expanded => Just(List Nat, expanded)
-              end
-            end
-          end
-        end
-    end;
 
 def ss_progress (phase : String) : IO Unit :=
     do let! written := fs_write_checked "_build/source_spans.progress" phase;

@@ -3,12 +3,15 @@
 -- @entry canonical_smoke_all
 
 import "../std/data.ouro";
+import "../std/listx.ouro";
 import "../compiler/canonical_model.ouro";
 import "../compiler/canonical_source.ouro";
 import "../compiler/canonical_hash.ouro";
 import "../compiler/token.ouro";
+import "../compiler/lexer.ouro";
+import "../compiler/parser_min.ouro";
+import "character_literal_cases.ouro";
 
--- ouro-structural: {"rule":"STRUCT_DUPLICATE_IMPLEMENTATION","category":"independent-oracle","related":["compiler/source_text.ouro#source_bytes_equal"],"reason":"The expected byte-list equality must remain independent of the source helper used by canonical preprocessing."}
 def ct_eq_nat_list : List Nat -> List Nat -> Bool :=
   fix go (a : List Nat) (b : List Nat) : Bool :=
     match a with
@@ -83,6 +86,61 @@ def canonical_test_string_preservation : Bool :=
   | CanonicalBytesOk bytes => ct_eq_nat_list bytes [34, 45, 45, 32, 120, 34]
   end;
 
+def ct_byte_values : List Nat := [65, 0, 255, 34, 92];
+
+def ct_byte_unit : CanonicalSourceUnit :=
+  canonical_from_lexed
+    (prim_string_to_char_codes "b\"A\\x00\\xFF\\x22\\x5C\"")
+    [TByteString ct_byte_values, TEof];
+
+def canonical_test_byte_roundtrip : Bool :=
+  match canonical_bytes_from ct_idents ct_strings_empty ct_byte_unit with
+  | CanonicalBytesErr _ _ => False
+  | CanonicalBytesOk codes =>
+      andb (ct_eq_nat_list codes
+          (prim_string_to_char_codes "b\"A\\x00\\xFF\\x22\\x5C\""))
+        (match next_token (add(length Nat codes, 8)) codes empty_intern with
+         | StepEof _ => False
+         | LexStepErr _ => False
+         | StepTok token tail _ => match token with
+           | TByteString bytes => andb(ct_eq_nat_list bytes ct_byte_values,
+               ct_eq_nat_list tail [])
+           | TIdent _ => False
+           | TNat _ => False
+           | TKeyword _ => False
+           | TType _ => False
+           | TColon => False
+           | TColonEq => False
+           | TArrow => False
+           | TFatArrow => False
+           | TBar => False
+           | TLparen => False
+           | TRparen => False
+           | TSemi => False
+           | THole _ => False
+           | TString _ => False
+           | TComma => False
+           | TBraceL => False
+           | TBraceR => False
+           | TExclam => False
+           | TEof => False
+           | TBind => False
+           | TPipe => False
+           | TBracketL => False
+           | TBracketR => False
+           | TDotDot => False
+           | TDotDotEq => False
+           | TCoalesce => False
+           end
+         end)
+  end;
+
+def canonical_test_byte_out_of_range : Bool :=
+  match cs_byte_codes [256] with
+  | CanonicalBytesErr code byte => andb(eqNat code cs_err_byte, eqNat byte 256)
+  | CanonicalBytesOk _ => False
+  end;
+
 def ct_directive_source : List Nat :=
   [ 45, 45, 32, 64, 101, 110, 116, 114, 121, 32, 120
   , 10, 34, 45, 45, 34, 10, 45, 45, 32, 110, 111, 114, 109, 97, 108
@@ -93,6 +151,45 @@ def ct_directive_unit : CanonicalSourceUnit :=
 
 def canonical_test_directive_preserved : Bool :=
   eqNat (canonical_directive_count ct_directive_unit) (S Z);
+
+def canonical_test_multiline_directive_masked : Bool :=
+  let source : List Nat := prim_string_to_char_codes
+    "def s : String := \"\"\"\n  -- @entry hidden\n  \"\"\";\n-- @entry real" in
+  eqNat (canonical_directive_count (canonical_from_lexed source [TEof])) (S Z);
+
+def canonical_test_multiline_roundtrip : Bool :=
+  let source : List Nat := prim_string_to_char_codes
+    "\"\"\"\n  A\n  B\n  \"\"\"" in
+  let value : List Nat := [65, 10, 66] in
+  match lex_all (S (length Nat source)) source with
+  | LexMalformed _ => False
+  | LexExhausted _ => False
+  | LexOk tokens st =>
+      let strings : List (Pair (List Nat) Nat) :=
+        match st with | MkIntern _ _ entries _ => entries end in
+      match canonical_bytes_from (unit_intern_ids st) strings
+          (canonical_from_lexed source tokens) with
+      | CanonicalBytesErr _ _ => False
+      | CanonicalBytesOk bytes =>
+          andb (ct_eq_nat_list bytes [34, 65, 92, 110, 66, 34])
+            (match lex_all (S (length Nat bytes)) bytes with
+             | LexMalformed _ => False
+             | LexExhausted _ => False
+             | LexOk roundtrip roundtrip_st => match roundtrip with
+               | Cons token _ => match tokenIsString token with
+                 | Nothing => False
+                 | Just id => match roundtrip_st with
+                   | MkIntern _ _ entries _ => match cs_lookup_id entries id with
+                     | Nothing => False
+                     | Just decoded => ct_eq_nat_list decoded value
+                     end
+                   end
+                 end
+               | Nil => False
+               end
+             end)
+      end
+  end;
 
 def canonical_test_mapping_identity : Bool :=
   eqNat (canonical_original_position ct_decl_unit (S Z)) (S Z);
@@ -113,10 +210,38 @@ def canonical_test_removed_bytes : Bool :=
   | Just removed => eqNat removed 16
   end;
 
+def canonical_test_character (row : Pair (List Nat) Nat) : Bool :=
+  match row with
+  | MkPair source expected => match lex_all 64 source with
+    | LexMalformed _ => False
+    | LexExhausted _ => False
+    | LexOk tokens st => match st with
+      | MkIntern ids _ strings _ =>
+          match canonical_bytes_from ids strings (canonical_from_lexed source tokens) with
+          | CanonicalBytesErr _ _ => False
+          | CanonicalBytesOk bytes =>
+              ct_eq_nat_list bytes (prim_string_to_char_codes (prim_string_of_nat expected))
+          end
+      end
+    end
+  end;
+
+def canonical_test_character_directives : Bool :=
+  eqNat (canonical_directive_count
+    (canonical_from_lexed
+      (append Nat ([39, 34, 39, 10] : List Nat)
+        (prim_string_to_char_codes "-- @entry main\n")) ([] : List Token))) 1;
+
 def canonical_smoke_all : Bool :=
   andb canonical_test_compact_bytes
     (andb canonical_test_token_boundary
       (andb canonical_test_string_preservation
         (andb canonical_test_directive_preserved
-          (andb canonical_test_mapping_identity
-            (andb canonical_test_deterministic_hash canonical_test_removed_bytes)))));
+          (andb canonical_test_multiline_directive_masked
+            (andb canonical_test_multiline_roundtrip
+              (andb canonical_test_byte_roundtrip
+                (andb canonical_test_byte_out_of_range
+              (andb canonical_test_mapping_identity
+                (andb canonical_test_deterministic_hash (andb canonical_test_removed_bytes
+                  (andb canonical_test_character_directives
+                    (all (Pair (List Nat) Nat) canonical_test_character character_valid_cases))))))))))));

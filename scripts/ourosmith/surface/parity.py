@@ -36,8 +36,12 @@ def programs(seed):
            "expected": n + m, "type_name": "Number", "successor": "S",
            "dependencies": [["leaf.ouro", PRELUDE + f"def value : Nat := {n};\n"],
                             ["middle.ouro", 'import "leaf.ouro" exposing (Nat as Number, S, add as plus, value as chosen);\n']]}
+    yield {"name": "imports-private",
+           "source": 'import "leaf.ouro" as L;\ndef result : L.Nat := L.value;\n',
+           "expected": n,
+           "dependencies": [["leaf.ouro", PRELUDE + f"private def helper : Nat := {n};\ndef value : Nat := helper;\n"]]}
     for name, source, expected, units in form_programs(seed):
-        if name in {"record", "list", "list-spread", "do-case-binding", "handler"}:
+        if name in {"record", "list", "list-spread", "do-case-binding", "do-pure-let", "handler"}:
             yield {"name": name, "source": source, "expected": expected, "dependencies": [], "units_needed": units}
     for mutation in mutations(seed):
         if mutation.name in {"pipe-missing-rhs", "list-context", "import-unknown"}:

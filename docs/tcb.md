@@ -20,6 +20,13 @@ source-module names before the ordered declaration plan reaches the checker.
 They cannot authorize an unchecked import: each reached declaration and body
 still enters the same compiler-owned checking path. The module pass adds no
 checker allowlist dependency or host IO authority.
+
+The parser records each private declaration and its generated members in the
+owning source unit. Module resolution keeps owner-local access and removes
+those members from external plain, selected, qualified, local-open, transitive,
+and generated record-grant scopes. Visibility never removes a declaration from
+the ordered checker input.
+
 Record preprocessing uses canonical source paths and local import bindings to
 select the shape of a qualified literal or projection. It preserves the
 qualified type and base, and fails when the aliased file does not own the
@@ -30,7 +37,10 @@ import scope, so a selective edge cannot expose a hidden accessor through
 record syntax. Raw source cannot spell the marker separator, and each
 generated reference still passes through module resolution and the complete
 declaration checker. The text-only record preprocessor rejects output that
-would require this metadata.
+would require this metadata. Dotted expression references left after import
+preprocessing still undergo projection validation when the record registry is empty.
+Comments and quoted literals cannot activate that path, and an unknown prefix
+cannot establish a module owner.
 When a qualified reference resolves to a global name also used by a lexical
 binder, the module pass interns a distinct binder ID before lowering. It
 rewrites bound uses with that ID and keeps the qualified reference attached to
@@ -89,6 +99,14 @@ The diagnostic `ouro.checked-program.v1` dump contains types, bodies, binding
 contracts, representation roles, and emission order. It is not a serialized
 permission to skip checking. Caches, generated outputs, analyzer reports, and
 build receipts remain outside compiler acceptance.
+
+Character literals are decoded by `compiler/source_text.ouro` and the lexer
+into existing `TNat`/`ENat` values. The decoder rejects noncanonical UTF-8,
+surrogates, out-of-range scalars, and multi-scalar payloads before normal Nat
+checking. Preprocessors and tooling only preserve or skip the original quoted
+bytes at an identifier boundary; they do not authenticate a literal or bypass
+checking. This syntax adds no Core form, primitive type, runtime role, or
+bootstrap ABI.
 
 ## Current host assumptions
 

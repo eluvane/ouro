@@ -6,6 +6,51 @@ Development changes; see the [compatibility policy](docs/stability.md).
 
 ### Added
 
+- Postfix `expression where let helper ...; end` scopes sequential local values
+  and typed helpers over an expression through ordinary checked lets; see
+  [Ergonomic syntax](docs/language/ergonomic-syntax.md#helpers-after-an-expression).
+
+- `std/logic.ouro` now provides typed `compose` for first-class function
+  composition with explicit input, intermediate, and output types.
+- `std/logic.ouro` now has typed `flip` for reversing a binary callback's
+  argument order and fixing its right argument through partial application.
+- `maybe_unwrap_or_else` in `std/data.ouro` evaluates a typed fallback thunk
+  only when its `Maybe` input is `Nothing`.
+- `OURO-CLIPPY-ERROR-004` reports ignored results of the registered pure
+  `str_parse_nat`, `str_parse_bool` and `parse_json` APIs, with alias-aware
+  observation and manual failure-handling guidance. Proven nullary-constructor
+  helpers retain ignored arguments without treating unknown global names as pure.
+- Language-server completion suggests local nullary constructors for direct
+  definitions with an explicit, simple expected type while retaining ordinary
+  name-prefix suggestions.
+- Pure `let name := value;` bindings in `do` expressions use ordinary lexical
+  scope between actions; `let!` continues to bind an action's result.
+- Total `let (Ctor fields) := subject in body` and block `let (Ctor fields) :=
+  subject; tail` destructuring use checked constructor matches; result types
+  that cannot be inferred from the subject need an expected context.
+- Opt-in `"""` multiline `String` literals strip the closing line's exact
+  space/tab prefix from nonempty content lines while retaining interior line
+  endings and other bytes. See [Numbers and strings](docs/syntax.md#numbers-and-strings).
+- Byte-list literals `b"..." : List Nat` with strict ASCII source and `\xHH`
+  escapes for arbitrary bytes; malformed escapes and raw non-ASCII are rejected.
+
+- `if let Constructor fields := value then expr else expr` for flat constructor
+  patterns, lowered to a complete checked case with branch-local fields.
+- Total `if condition then expr else expr` expressions for the registered
+  `Bool` type, with both arms checked at the result type.
+- Trailing `{ value -> body }` callbacks after nonempty positional call groups,
+  checked as ordinary final lambda arguments. See
+  [Trailing lambda calls](docs/language/ergonomic-syntax.md#trailing-lambda-calls).
+- `Maybe A` values accept lazy `value ?? fallback` expressions, checked through
+  the registered nominal family; see [Maybe fallback](docs/language/ergonomic-syntax.md#maybe-fallback-operator).
+- `private` declaration visibility keeps internal helpers, constructors,
+  effect operations, and record accessors available to their owner while
+  excluding them from imports and re-exports; imported bodies are still checked.
+- Single-quoted Unicode scalar literals as existing `Nat` ordinals, with strict
+  UTF-8 and escape validation. See [Numbers and strings](docs/syntax.md#numbers-and-strings).
+
+- `maybe_bind` in `std/data.ouro` composes `Maybe` computations, calling the
+  continuation only for `Just` and preserving `Nothing`.
 - Exclusive `0..10` and inclusive `0..=10` literal-endpoint `NatRange` values,
   checked through nominal Nat, bound, and range representation roles.
 - Final-tail list spreads `[first, ..rest]` build checked `List A` constructor
@@ -15,6 +60,8 @@ Development changes; see the [compatibility policy](docs/stability.md).
   checked step magnitude, and bounded pull-iterator consumption.
 - Pure bounded pull iterators with lazy map/filter/take adapters and explicit
   typed failure or pull-limit results when collecting a list.
+- Bounded iterator folding over yielded items without list materialization;
+  skips preserve the accumulator and failures remain typed.
 - Overlapping list windows, state scans, state-threading maps, stable grouping
   by key, and first-failure `Either`/`Maybe` folds in `std/collections.ouro`.
 - Single-path `exposing (...)` imports select direct declarations and can give
@@ -65,6 +112,8 @@ Development changes; see the [compatibility policy](docs/stability.md).
   including the migration from `f (a, b)` as one grouped expression to two arguments.
 - Trailing commas in nonempty list literals, including multiline lists with comments.
 - Record literal field punning with known nominal type and checked field coverage.
+- Local nominal-record field destructuring with an explicit type, selected
+  binders, and once-evaluated subjects.
 - Functional updates of annotated nominal records, including nested field paths, checked changed fields, once-bound base expressions, and typed local/record-field context.
 - Local and pinned-Git package dependencies with deterministic manifests and
   locks, rejection fixtures, a reusable-library sample, and a consuming
@@ -75,6 +124,14 @@ Development changes; see the [compatibility policy](docs/stability.md).
 
 ### Changed
 
+- The formatter normalizes spaces around `|>` in code while preserving
+  comments, quoted text, and existing pipeline line breaks.
+
+- `if`, `then`, and `else` are reserved keywords. Rename existing identifiers
+  or import aliases with those names before using this compiler.
+- Large natural-number literals in a parameterless, unindexed zero/successor
+  family lower to compact ordinary checked applications. Values through 255 and
+  legacy family paths keep their existing lowering; resource failures remain errors.
 - Imported record updates resolve simple field type annotations in the record
   declaration's import scope, including local type aliases, selected renames,
   and qualified imported types. Caller aliases cannot rebind those annotations;
@@ -144,6 +201,8 @@ Development changes; see the [compatibility policy](docs/stability.md).
   controls and an accent-colored GitHub favicon on both pages. Search retains
   its background highlight without a focus outline.
 - Update the site's transitive Terser plugin and serializer dependencies.
+- Align the argument and closing lines of already-multiline flat comma calls
+  while preserving comments, literals, line breaks, and trailing commas.
 
 ### Removed
 
@@ -165,6 +224,21 @@ Development changes; see the [compatibility policy](docs/stability.md).
 
 ### Fixed
 
+- Token and source-span callbacks return into their caller's allocation context,
+  preserving borrowed values when an enclosing frontend phase is reset.
+
+- Validate unresolved dotted projection prefixes even in source units without
+  record declarations, retaining the invalid-projection diagnostic.
+- Finish lexer token streams with a linear reversal while preserving token
+  order, intern state, and malformed or exhausted result handling.
+- Keep qualified selected imports usable when their short names collide; a
+  bare colliding name still reports ambiguity.
+- Fingerprint complete multiline public definition headers in the analyzer and
+  API baseline generator, retaining comments and whitespace normalization and
+  rejecting malformed or unterminated headers.
+- Generated API pages and LSP hover show complete multiline declaration signatures.
+- Check expression ascriptions inside untyped local bindings even when the
+  enclosing result type does not constrain the ascribed value.
 - `adjacent_pairs` now advances its left element; `list_traverse_result` evaluates
   conversions in input order and stops when one returns `Left`.
 - Recognize manifest-owned Clippy precision fixtures in the structural gate,

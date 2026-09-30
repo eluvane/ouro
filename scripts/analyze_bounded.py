@@ -438,8 +438,11 @@ def format_skeleton_line(line: str) -> str:
 
 
 def source_skeleton(text: str, line_filter) -> str:
-    import_lines: set[int] = set()
-    if line_filter in (skeleton_line, local_skeleton_line):
+    lines = text.splitlines(keepends=True)
+    filtered = [line_filter(line) for line in lines]
+    kept_lines: set[int] = set()
+    if line_filter in (skeleton_line, local_skeleton_line, format_skeleton_line):
+        from api_baseline_regen import collect_signature
         from structural_quality import lex
 
         tokens, _comments = lex(text, "ouro")
@@ -448,14 +451,24 @@ def source_skeleton(text: str, line_filter) -> str:
                   if token.value in forms and (index == 0 or tokens[index - 1].value != ".")]
         ends = [*starts[1:], len(tokens)] if starts else []
         for start, past in zip(starts, ends, strict=True):
-            if tokens[start].value == "import":
+            first, last = tokens[start], tokens[past - 1]
+            finish_line = first.line + text.count("\n", first.start, last.end)
+            if first.value == "import" and line_filter != format_skeleton_line:
                 # Keep the entire declaration region, including comments and
                 # malformed tails; the analyzer still owns its syntax errors.
-                first, last = tokens[start], tokens[past - 1]
-                finish_line = first.line + text.count("\n", first.start, last.end)
-                import_lines.update(range(first.line, finish_line + 1))
-    return "".join(line if index in import_lines else line_filter(line)
-                   for index, line in enumerate(text.splitlines(keepends=True), 1))
+                kept_lines.update(range(first.line, finish_line + 1))
+            elif first.value == "def" and line_filter != skeleton_line:
+                try:
+                    _signature, finish_line = collect_signature(lines, first.line - 1,
+                                                               "analyzer input")
+                except ValueError:
+                    # Preserve malformed headers for native diagnostics too.
+                    pass
+                region = range(first.line, finish_line + 1)
+                if any(filtered[line - 1].rstrip("\r\n") for line in region):
+                    kept_lines.update(region)
+    return "".join(line if index in kept_lines else filtered[index - 1]
+                   for index, line in enumerate(lines, 1))
 
 
 def write_skeleton_file(source: Path, target: Path, line_filter) -> None:
@@ -682,6 +695,58 @@ def import_skeleton_self_test() -> None:
         raise AssertionError("skeleton accepted an unterminated import literal")
 
 
+def header_skeleton_self_test() -> int:
+    from api_baseline_regen import collect_signature, hash_text
+
+    headers = [
+        "def abs_div_issue (ids : AbsIds) (env : List (Pair Nat Nat)) (f : Ast) (x : Ast)\n    : List AbsIssue :=\n",
+        "def api_header_line (code : List Nat) (source : List Nat)\n    (brackets : List Nat) (rev : List Nat) : ApiHeaderStep :=\n",
+        "def continued {A : Type} (x : A) -- keep header comments\n    : A\n    :=\n",
+        "def defaulted (x : Nat := 30)\n    : Nat :=\n",
+        'def quoted : Eq String r#"left\ndef hidden := text\nright"# :=\n',
+        "def one_line : Nat := 0;\n",
+    ]
+    checked = 0
+    for newline in ("\n", "\r\n"):
+        prefix = "-- preserve original locations\n\n".replace("\n", newline)
+        body = "    original_body;\n".replace("\n", newline)
+        for header_template in headers:
+            header = header_template.replace("\n", newline)
+            source = prefix + header + body
+            skeleton = source_skeleton(source, local_skeleton_line)
+            assert skeleton == newline * 2 + header + newline
+            assert skeleton.count("\n") == source.count("\n")
+            original = collect_signature(source.splitlines(), 2, "fixtures/headers.ouro")
+            retained = collect_signature(skeleton.splitlines(), 2, "fixtures/headers.ouro")
+            assert retained == original
+            assert hash_text(retained[0]) == hash_text(original[0])
+            checked += 1
+        for header_template in ("def\tcontinued (x : Nat)\n    : Nat :=\n",
+                       "def continued (x : Nat)\n\t: Nat :=\n",
+                       "def continued (x : Nat) \n    : Nat :=\n"):
+            header = header_template.replace("\n", newline)
+            source = prefix + header + body
+            expected = source if newline == "\r\n" else newline * 2 + header + newline
+            assert source_skeleton(source, format_skeleton_line) == expected
+            checked += 1
+        for malformed in ("def incomplete : Nat\n",
+                          "def incomplete ]\n    : Nat := 0;\n",
+                          "def incomplete (x : Nat)\n    : Nat;\ndef next : Nat := 0;\n"):
+            source = prefix + malformed.replace("\n", newline)
+            skeleton = source_skeleton(source, local_skeleton_line)
+            assert skeleton == newline * 2 + malformed.replace("\n", newline)
+            failures = []
+            for text in (source, skeleton):
+                try:
+                    collect_signature(text.splitlines(), 2, "fixtures/headers.ouro")
+                except ValueError as error:
+                    failures.append(str(error))
+            assert len(failures) == 2 and failures[0] == failures[1]
+            assert "fixtures/headers.ouro:3:" in failures[0]
+            checked += 1
+    return checked
+
+
 def self_test() -> int:
     import tempfile
     from unittest.mock import patch
@@ -725,7 +790,8 @@ def self_test() -> int:
         assert first is not None and first is second
         assert len(cache) == 1
     import_skeleton_self_test()
-    print("ANALYZE_DISCOVERY_SUITE rows=6 import-skeletons=18")
+    header_cases = header_skeleton_self_test()
+    print(f"ANALYZE_DISCOVERY_SUITE rows=6 import-skeletons=18 api-header-skeletons={header_cases}")
     return 0
 
 

@@ -78,6 +78,7 @@ def cg_s_parse_expanded (codes : List Nat) : Either QualityInputError CgSUnit :=
               | TSemi => False
               | THole _ => False
               | TString _ => False
+              | TByteString _ => False
               | TComma => False
               | TBraceL => False
               | TBraceR => False
@@ -88,6 +89,7 @@ def cg_s_parse_expanded (codes : List Nat) : Either QualityInputError CgSUnit :=
               | TBracketR => False
               | TDotDot => False
               | TDotDotEq => False
+              | TCoalesce => False
               end
             end in
           match complete with
@@ -178,6 +180,7 @@ def cm_discard_tokens : List Token -> Bool -> InternState
           | TSemi => False
           | THole _ => False
           | TString _ => False
+          | TByteString _ => False
           | TComma => False
           | TBraceL => False
           | TBraceR => False
@@ -189,6 +192,7 @@ def cm_discard_tokens : List Token -> Bool -> InternState
           | TBracketR => False
           | TDotDot => False
               | TDotDotEq => False
+              | TCoalesce => False
           end in
         let rewritten : Pair Token InternState := match token with
           | THole hole => match after_let with
@@ -217,6 +221,7 @@ def cm_discard_tokens : List Token -> Bool -> InternState
           | TRparen => MkPair Token InternState token intern
           | TSemi => MkPair Token InternState token intern
           | TString _ => MkPair Token InternState token intern
+          | TByteString _ => MkPair Token InternState token intern
           | TComma => MkPair Token InternState token intern
           | TBraceL => MkPair Token InternState token intern
           | TBraceR => MkPair Token InternState token intern
@@ -228,6 +233,7 @@ def cm_discard_tokens : List Token -> Bool -> InternState
           | TBracketR => MkPair Token InternState token intern
           | TDotDot => MkPair Token InternState token intern
           | TDotDotEq => MkPair Token InternState token intern
+          | TCoalesce => MkPair Token InternState token intern
           end in
         match rewritten with
         | MkPair head updated => match go rest next updated with
@@ -237,29 +243,69 @@ def cm_discard_tokens : List Token -> Bool -> InternState
         end
     end;
 
-def cm_parse (source : String) (intern : InternState)
-    : Either QualityInputError (Pair (List Decl) InternState) :=
-    match preprocess_imports_reg empty_imp_reg
+-- Preprocess scratch dies in its own heap context. Lex then starts from the
+-- expanded bytes instead of retaining both graphs until the parse returns.
+def cm_prepare_expanded (source : String) (pad : Unit)
+    : Either QualityInputError (Pair (List Nat) ImpReg) :=
+    match pad with
+    | MkUnit => match preprocess_imports_reg empty_imp_reg
         (prim_string_to_char_codes source) with
-    | MkPair aliases imported => match imported with
-    | ImpErr _code position => Left QualityInputError (Pair(List Decl, InternState))
-        (QualityInvalidInput (prim_string_concat("import preprocessing failed: ", prim_string_of_nat position)))
-    | ImpOk prepared => match preprocess_records_reg (Nil Nat)
-        aliases empty_rec_reg prepared with
-      | MkPair _ tagged => match tagged with
-      | MkPair _ result => match result with
-      | PrepErr _code position => Left QualityInputError (Pair(List Decl, InternState))
-          (QualityInvalidInput (prim_string_concat("record preprocessing failed: ", prim_string_of_nat position)))
-      | PrepOk expanded =>
+      | MkPair aliases imported => match imported with
+        | ImpErr _code position => Left QualityInputError (Pair (List Nat) ImpReg)
+            (QualityInvalidInput (prim_string_concat("import preprocessing failed: ", prim_string_of_nat position)))
+        | ImpOk prepared => match preprocess_records_reg (Nil Nat)
+            aliases empty_rec_reg prepared with
+          | MkPair _ tagged => match tagged with
+            | MkPair recorded result => match result with
+              | PrepErr _code position => Left QualityInputError (Pair (List Nat) ImpReg)
+                  (QualityInvalidInput (prim_string_concat("record preprocessing failed: ", prim_string_of_nat position)))
+              | PrepOk expanded => Right QualityInputError (Pair (List Nat) ImpReg)
+                  (MkPair (List Nat) ImpReg expanded recorded)
+              end
+            end
+          end
+        end
+      end
+    end;
+
+-- Identifier lookup spines die with this context. The token list and the
+-- updated intern are the only survivors passed to the parser.
+def cm_lex_expanded (expanded : List Nat) (intern : InternState)
+    : Either QualityInputError (Pair (List Token) InternState) :=
+    let fuel : Nat := add(length Nat expanded, cg_s_lex_fuel_pad) in
+    match lex_go_import fuel expanded intern (Nil Token) with
+    | LexMalformed _ => Left QualityInputError (Pair (List Token) InternState)
+        (QualityInvalidInput "compiler lexer rejected source")
+    | LexExhausted _ => Left QualityInputError (Pair (List Token) InternState)
+        (QualityInvalidInput "compiler lexer exhausted")
+    | LexOk raw lexed => match cm_discard_tokens raw False lexed with
+      | MkPair tokens updated => Right QualityInputError (Pair (List Token) InternState)
+          (MkPair (List Token) InternState tokens updated)
+      end
+    end;
+
+-- Span wrappers are only for the selected root. An import's signature harvest
+-- does not read token ranges, and wrapping every subexpression retains the
+-- position comparisons for the whole file.
+def cm_parse_prepared (spanned : Bool) (source : String) (intern : InternState)
+    : Either QualityInputError (Pair ParsedFile (Pair InternState ImpReg)) :=
+    match cm_prepare_expanded source MkUnit with
+    | Left error => Left QualityInputError (Pair(ParsedFile, Pair InternState ImpReg)) error
+    | Right prepared => match prepared with
+      | MkPair expanded recorded =>
           let fuel : Nat := add(length Nat expanded, cg_s_lex_fuel_pad) in
-          match lex_go_import fuel expanded intern (Nil Token) with
-          | LexMalformed _ => Left(QualityInputError, Pair(List Decl, InternState), QualityInvalidInput "compiler lexer rejected source")
-          | LexExhausted _ => Left(QualityInputError, Pair(List Decl, InternState), QualityInvalidInput "compiler lexer exhausted")
-          | LexOk raw lexed => match cm_discard_tokens raw False lexed with
-            | MkPair tokens updated => match parse_file parse_spanned fuel tokens 0 with
-              | PErr position => Left QualityInputError (Pair(List Decl, InternState))
+          match cm_lex_expanded expanded intern with
+          | Left error => Left QualityInputError (Pair(ParsedFile, Pair InternState ImpReg)) error
+          | Right lexed => match lexed with
+            | MkPair tokens updated =>
+                let parsed : ParseResult ParsedFile := match spanned with
+                  | True => parse_file_visibility parse_spanned fuel tokens 0
+                  | False => parse_file_visibility parse fuel tokens 0
+                  end in
+                match parsed with
+              | PErr position => Left QualityInputError (Pair(ParsedFile, Pair InternState ImpReg))
                   (QualityInvalidInput (prim_string_concat("compiler parser failed at token ", prim_string_of_nat position)))
-              | POk decls remaining _ =>
+              | POk file remaining _ =>
                   let complete : Bool := match remaining with
                     | Nil => True
                     | Cons tok _ => match tok with
@@ -278,6 +324,7 @@ def cm_parse (source : String) (intern : InternState)
                       | TSemi => False
                       | THole _ => False
                       | TString _ => False
+                      | TByteString _ => False
                       | TComma => False
                       | TBraceL => False
                       | TBraceR => False
@@ -288,18 +335,39 @@ def cm_parse (source : String) (intern : InternState)
                       | TBracketR => False
                       | TDotDot => False
               | TDotDotEq => False
+              | TCoalesce => False
                       end
                     end in
                   match complete with
-                | False => Left(QualityInputError, Pair(List Decl, InternState), QualityInvalidInput "incomplete parsed source")
-                | True => Right QualityInputError (Pair(List Decl, InternState))
-                    (MkPair (List Decl) InternState decls updated)
+                  | False => Left(QualityInputError, Pair(ParsedFile, Pair InternState ImpReg), QualityInvalidInput "incomplete parsed source")
+                  | True => Right QualityInputError (Pair(ParsedFile, Pair InternState ImpReg))
+                      (MkPair ParsedFile (Pair InternState ImpReg) file
+                        (MkPair InternState ImpReg updated recorded))
+                  end
                 end
               end
             end
           end
-      end
-      end
-      end
+        end;
+
+def cm_parse_with_aliases (source : String) (intern : InternState)
+    : Either QualityInputError (Pair ParsedFile (Pair InternState ImpReg)) :=
+    cm_parse_prepared True source intern;
+
+def cm_parse_import (source : String) (intern : InternState)
+    : Either QualityInputError (Pair ParsedFile (Pair InternState ImpReg)) :=
+    cm_parse_prepared False source intern;
+
+def cm_parse (source : String) (intern : InternState)
+    : Either QualityInputError (Pair (List Decl) InternState) :=
+    match cm_parse_with_aliases source intern with
+    | Left error => Left QualityInputError (Pair(List Decl, InternState)) error
+    | Right parsed => match parsed with
+      | MkPair file metadata => match file with
+        | MkParsedFile decls _ => match metadata with
+          | MkPair lexed _ => Right QualityInputError (Pair(List Decl, InternState))
+              (MkPair (List Decl) InternState decls lexed)
+          end
+        end
       end
     end;

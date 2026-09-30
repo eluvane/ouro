@@ -138,11 +138,17 @@ exits 1 with `path: no .ouro files` and does not write. Missing paths report
 `path: no such file`; other valid roots are processed and the command exits 1.
 
 The formatter normalizes line endings, tabs, trailing whitespace, match-arm
-spacing, and the final newline. It is intentionally a conservative text
-formatter rather than a complete AST pretty-printer, so it preserves comments
-and hand-aligned continuation lines.
+spacing, spaces around `|>`, and the final newline. It is intentionally a
+conservative text formatter rather than a complete AST pretty-printer, so it
+preserves comments and hand-aligned continuation lines.
 Unknown options, conflicting write/check modes and mixed file/selftest modes
 exit `2` before reading or changing source files.
+
+For a flat comma call already spread across lines, with each argument and the
+closing parenthesis on its own line, the formatter indents arguments two spaces
+past the opening line and aligns the closing parenthesis. It preserves comments,
+quoted text, line breaks, and the presence or absence of a trailing comma.
+Nested groups and declaration parameter lists keep their existing layout.
 
 ## Autofixer
 
@@ -319,6 +325,13 @@ currently provides:
 - whole-buffer rename;
 - document formatting;
 - full-text document synchronization.
+
+Completion keeps name-prefix suggestions. In a direct top-level definition
+with a simple explicit result type, such as `def value : Choice := Re`, it also
+suggests matching nullary constructors from a local, non-parameterized
+`inductive Choice` declaration. This editor hint does not infer types in nested
+expressions or resolve constructors from imports. Complex constructor
+signatures and families with more than 256 arms keep ordinary prefix completion.
 
 The server runs sibling `coil.exe` for checks and `ouro-fmt.exe` for
 formatting through bounded captured processes. Child output is consumed by

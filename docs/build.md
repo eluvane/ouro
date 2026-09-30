@@ -326,10 +326,32 @@ pins every file's size and SHA-256, the archive, and the committed stage0 pair.
 The C0 runtime matches that seed. The manifest's `syntax_refresh` records the
 reviewed parser backport that lets the bridge read current
 [ergonomic syntax](language/ergonomic-syntax.md), with its patch and member hashes.
+Its `lowering_refresh` records the composed Nat/ascription lowerer update with
+the exact source slices, original-to-Nat-to-ascription patches, and member hashes.
 The historical checker, runtime, and stage0 pair retain their previous bytes.
 The lineage also records earlier seed and compatibility changes. These pinned
 inputs stay separate from the current source snapshot and its acceptance checks
 until the native bootstrap can replace this C-hosted chain.
+
+The lowerer refresh copies six verbatim current-source slices into only
+`bridge/compiler/lower.ouro`: the compact Nat helpers and literal dispatch,
+and the checked expression-ascription obligation. The other 67 members,
+historical checker, runtime, stage0 pair, and import graph remain pinned.
+The original independent `refresh_nat_bridge.py` and `refresh_ascription_bridge.py`
+retain their exact source/predecessor guards; the composed snapshot uses:
+
+```sh
+python3 -B scripts/refresh_lower_bridge.py
+python3 -B scripts/refresh_lower_bridge_test.py
+python3 -B scripts/refresh_lower_bridge.py --write
+```
+
+The generator rejects a changed source owner or historical package. Repeating it
+on its exact installed output reproduces identical archive and manifest bytes.
+The refreshed package still requires a fresh full current P1/P2 C comparison,
+ABI laws, and positive/negative behavior checks before publishing a current
+compiler. Local source-copy tests do not establish that bootstrap evidence.
+The inventory and unpack/repack commands below verify the installed package.
 
 The consumer validates the entire archive inventory before extraction. It
 rejects links, traversal, duplicate, extra, or missing members and size/hash
@@ -496,6 +518,10 @@ nats are interned, and `ouro_app`/`ouro_case` hand a single-use closure or
 thunk back to the phase allocator the moment it is consumed. Handwritten hosts
 that keep a closure across calls use `ouro_apply`, which never reclaims. These
 keep native check paths well under their former multi-GiB peaks.
+Import lexing reclaims each token step's intern lookup. The retained token and
+intern delta stay; the comparison spine of earlier names does not. Token and
+span callbacks use nested allocation contexts and return into the caller's
+allocator, so an enclosing phase reset cannot invalidate borrowed arguments.
 The native frontend preserves the checked result in permanent storage and
 releases compilation temporaries before scanning source for diagnostics. A
 large rejected module therefore does not retain both phases' temporary heaps.

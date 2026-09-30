@@ -12,6 +12,7 @@
 
 import "source_text.ouro",
   "base.ouro",
+  "preprocess_import.ouro",
   "pipeline_support.ouro",
   "module_registry.ouro",
   "checked_program_output.ouro",
@@ -26,7 +27,7 @@ def parse_unit
   (lex_go : Nat -> List Nat -> InternState -> List Token ->
       LexResult)
   (intern_string : InternState -> List Nat -> Pair Nat InternState)
-  (parse_file : Nat -> List Token -> Nat -> ParseResult (List Decl))
+  (parse_file : Nat -> List Token -> Nat -> ParseResult ParsedFile)
   (fuel : Nat) (st : InternState) (path : List Nat) (src : List Nat)
   : UnitParse :=
   let canonical : List Nat := canon_path (Nil Nat) path in
@@ -37,10 +38,12 @@ def parse_unit
       | LexExhausted st2 => UErr lex_exhausted_err_code Z st2
       | LexOk toks st2 =>
           match parse_file fuel toks Z with
-          | POk ds _toks _pos =>
-              match canon_imports canonical intern_string st2 ds with
-              | MkPair ds' st3 =>
-                  UOk(MkSrcUnit pid ds', st3)
+          | POk parsed _toks _pos => match parsed with
+              | MkParsedFile ds private_names =>
+                match canon_imports canonical intern_string st2 ds with
+                | MkPair ds' st3 =>
+                    UOk(mk_src_unit pid ds' private_names, st3)
+                end
               end
           | PErr p => UErr parse_err_code p st2
           end
@@ -51,10 +54,7 @@ inductive UnitsParse : Type :=
   | UsOk : List SrcUnit -> InternState -> UnitsParse
   | UsErr : Nat -> Nat -> InternState -> UnitsParse;
 
-def empty_imp_reg_pl : ImpReg :=
-  MkImpReg (MkPair (List (List Nat)) (List (Pair (List Nat) (List Nat)))
-    (Nil (List Nat)) (Nil (Pair(List Nat, List Nat))))
-    (Nil ImpRule);
+def empty_imp_reg_pl : ImpReg := empty_imp_reg;
 
 def empty_rec_reg_pl : RecReg :=
   MkRecReg(Z, Nil RecInfo, Nil (List Nat), Nil RecBind);
@@ -149,7 +149,7 @@ inductive ListScanE : Type :=
   | LsBad : ListScanE;
 
 def scan_list_e (xs : List Nat) : ListScanE :=
-  (fix go (fuel : Nat) (rest0 : List Nat) (depth : Nat) (nested : Nat)
+  (fix go (fuel : Nat) (rest0 : List Nat) (literal_prior : Bool) (depth : Nat) (nested : Nat)
       (bad_separator : Bool) : ListScanE :=
     match fuel with
     | Z => LsBad
@@ -167,42 +167,42 @@ def scan_list_e (xs : List Nat) : ListScanE :=
                 match source_is_comment rest0 with
                 | True =>
                     match source_skip_line_pos(rest, Z) with
-                    | MkPair xs2 _ => go remaining xs2 depth nested bad_separator
+                    | MkPair xs2 _ => go remaining xs2 False depth nested bad_separator
                     end
                 | False =>
-                    match eqNat c ch_dq_e with
+                    match orb(eqNat c ch_dq_e, source_char_boundary literal_prior rest0) with
                     | True =>
-                        match source_skip_string_pos(rest, Z) with
-                        | MkPair xs2 _ => go remaining xs2 depth nested bad_separator
+                        match source_skip_quote_pos(rest, c, Z) with
+                        | MkPair xs2 _ => go remaining xs2 False depth nested bad_separator
                         end
                     | False =>
                         match eqNat c ch_lbrack_e with
-                        | True => go remaining rest (S depth) nested bad_separator
+                        | True => go remaining rest (source_is_ident_char c) (S depth) nested bad_separator
                         | False =>
                             match eqNat c ch_rbrack_e with
-                            | True => go remaining rest d nested bad_separator
+                            | True => go remaining rest (source_is_ident_char c) d nested bad_separator
                             | False =>
                                 match orb(eqNat c ch_lparen_e, eqNat c ch_lbrace_e) with
-                                | True => go remaining rest depth (S nested) bad_separator
+                                | True => go remaining rest (source_is_ident_char c) depth (S nested) bad_separator
                                 | False =>
                                     match orb(eqNat c ch_rparen_e, eqNat c ch_rbrace_e) with
                                     | True =>
                                         match nested with
-                                        | Z => go remaining rest depth nested bad_separator
-                                        | S n => go remaining rest depth n bad_separator
+                                        | Z => go remaining rest (source_is_ident_char c) depth nested bad_separator
+                                        | S n => go remaining rest (source_is_ident_char c) depth n bad_separator
                                         end
                                     | False =>
                                         match andb(eqNat c ch_comma_e,
                                             andb(eqNat(depth, S Z), eqNat(nested, Z))) with
-                                        | False => go remaining rest depth nested bad_separator
+                                        | False => go remaining rest (source_is_ident_char c) depth nested bad_separator
                                         | True =>
                                             match source_skip_ws rest with
                                             | Cons c2 _ =>
                                                 match eqNat c2 ch_comma_e with
-                                                | True => go remaining rest depth nested True
-                                                | False => go remaining rest depth nested bad_separator
+                                                | True => go remaining rest (source_is_ident_char c) depth nested True
+                                                | False => go remaining rest (source_is_ident_char c) depth nested bad_separator
                                                 end
-                                            | Nil => go remaining rest depth nested bad_separator
+                                            | Nil => go remaining rest (source_is_ident_char c) depth nested bad_separator
                                             end
                                         end
                                     end
@@ -213,7 +213,7 @@ def scan_list_e (xs : List Nat) : ListScanE :=
                 end
             end
         end
-    end) (S (length Nat xs)) xs (S Z) Z False;
+    end) (S (length Nat xs)) xs False (S Z) Z False;
 
 def classify_ergo (parse_fail : Bool) (src : List Nat)
     : Maybe (Pair Nat Nat) :=
@@ -231,9 +231,9 @@ def classify_ergo (parse_fail : Bool) (src : List Nat)
                 | MkPair xs2 p2 => go remaining xs2 p2 do_d False
                 end
             | False =>
-                match eqNat c ch_dq_e with
+                match orb(eqNat c ch_dq_e, source_char_boundary prev_id xs) with
                 | True =>
-                    match source_skip_string_pos(rest, S pos) with
+                    match source_skip_quote_pos(rest, c, S pos) with
                     | MkPair xs2 p2 => go remaining xs2 p2 do_d False
                     end
                 | False =>
@@ -343,7 +343,7 @@ def frontend_parse_error (files : List (Pair (List Nat) (List Nat)))
 def parse_units
   (lex_go : Nat -> List Nat -> InternState -> List Token -> LexResult)
   (intern_string : InternState -> List Nat -> Pair Nat InternState)
-  (parse_file : Nat -> List Token -> Nat -> ParseResult (List Decl))
+  (parse_file : Nat -> List Token -> Nat -> ParseResult ParsedFile)
   (fuel : Nat)
   (initial : InternState) (input : List (Pair (List Nat) (List Nat))) : UnitsParse :=
   (fix go (files : List (Pair (List Nat) (List Nat))) (st : InternState)
@@ -482,7 +482,7 @@ def stitch_checked_units
   (lex_go : Nat -> List Nat -> InternState -> List Token ->
       LexResult)
   (intern_string : InternState -> List Nat -> Pair Nat InternState)
-  (parse_file : Nat -> List Token -> Nat -> ParseResult (List Decl))
+  (parse_file : Nat -> List Token -> Nat -> ParseResult ParsedFile)
   (resolve_imports : List SrcUnit -> Nat -> ResolveResult (List Decl))
   (desugar_file : List Decl -> List Decl)
   (rewrite_declarations : Nat -> LowerEnv -> List Decl -> List Decl)
@@ -539,7 +539,7 @@ def stitch_checked_units
 def stitch_checked_source
   (lex_go : Nat -> List Nat -> InternState -> List Token ->
       LexResult)
-  (parse_file : Nat -> List Token -> Nat -> ParseResult (List Decl))
+  (parse_file : Nat -> List Token -> Nat -> ParseResult ParsedFile)
   (desugar_file : List Decl -> List Decl)
   (rewrite_declarations : Nat -> LowerEnv -> List Decl -> List Decl)
   (lower_expr_env2 : LowerEnv -> Maybe Surface -> Expr -> Surface)
@@ -574,7 +574,8 @@ def stitch_checked_source
                 (CErr CheckedProgram
                   (apply_ergo (classify_ergo True src1)
                     (ErrCode parse_err_code p))) st
-          | POk ds _toks _pos =>
+          | POk parsed _toks _pos => match parsed with
+            | MkParsedFile ds private_names =>
               match module_source_guard fuel aliases st ds with
               | RErr code detail =>
                   MkPair (CompResult CheckedProgram) InternState
@@ -598,7 +599,7 @@ def stitch_checked_source
                             match canon_imports (Nil Nat) intern_string st2 guarded with
                             | MkPair canonical st3 =>
                                 match module_resolve_units fuel
-                                    ([MkSrcUnit owner canonical] : List SrcUnit)
+                                    ([mk_src_unit owner canonical private_names] : List SrcUnit)
                                     ([MkPair (List Nat) ImpReg (Nil Nat) aliases]
                                       : List (Pair (List Nat) ImpReg)) owner st3 with
                                 | RErr code detail =>
@@ -627,6 +628,7 @@ def stitch_checked_source
                     end
                   end
               end
+            end
           end
       end
   end;
@@ -635,7 +637,7 @@ def pipeline_compile_checked_units
   (lex_go : Nat -> List Nat -> InternState -> List Token ->
       LexResult)
   (intern_string : InternState -> List Nat -> Pair Nat InternState)
-  (parse_file : Nat -> List Token -> Nat -> ParseResult (List Decl))
+  (parse_file : Nat -> List Token -> Nat -> ParseResult ParsedFile)
   (resolve_imports : List SrcUnit -> Nat -> ResolveResult (List Decl))
   (desugar_file : List Decl -> List Decl)
   (rewrite_declarations : Nat -> LowerEnv -> List Decl -> List Decl)
@@ -660,7 +662,7 @@ def pipeline_compile_checked_units
 def pipeline_compile_checked_source
   (lex_go : Nat -> List Nat -> InternState -> List Token ->
       LexResult)
-  (parse_file : Nat -> List Token -> Nat -> ParseResult (List Decl))
+  (parse_file : Nat -> List Token -> Nat -> ParseResult ParsedFile)
   (desugar_file : List Decl -> List Decl)
   (rewrite_declarations : Nat -> LowerEnv -> List Decl -> List Decl)
   (lower_expr_env2 : LowerEnv -> Maybe Surface -> Expr -> Surface)
@@ -683,7 +685,7 @@ def pipeline_compile_checked_source
 -- Source-native compilation uses pipeline_compile_checked_source above.
 def stitch_source
   (lex_go : Nat -> List Nat -> InternState -> List Token -> LexResult)
-  (parse_file : Nat -> List Token -> Nat -> ParseResult (List Decl))
+  (parse_file : Nat -> List Token -> Nat -> ParseResult ParsedFile)
   (desugar_file : List Decl -> List Decl)
   (rewrite_declarations : Nat -> LowerEnv -> List Decl -> List Decl)
   (lower_expr_env2 : LowerEnv -> Maybe Surface -> Expr -> Surface)

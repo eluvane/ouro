@@ -10,6 +10,8 @@ import "lower_support.ouro",
   "lower_implicit.ouro",
   "lower_implicit_function.ouro",
   "lower_named.ouro",
+  "lower_iflet.ouro",
+  "lower_nat.ouro",
   "../std/types.ouro",
   "pipeline_abi.ouro",
   "lower_env.ouro";
@@ -23,17 +25,35 @@ def lower_xvvar
   (fixSelf : Maybe Nat)
   (locals : List (Pair Nat Surface))
   (n : Nat) : LowerVal :=
-    match lower_implicit_constructor _lower_run _fuel' env _er fixSelf locals
-        (EVar n) with
-    | InferredCtor term => VSurf term
-    | NoMarkedCtor =>
+    let resolved : Surface := resolve_var_fix env fixSelf locals n in
+    match resolved with
+    | SConstruct _ _ _ =>
+        match lower_implicit_constructor _lower_run _fuel' env _er fixSelf locals
+            (EVar n) with
+        | InferredCtor term => VSurf term
+        | NoMarkedCtor => VSurf resolved
+        | MarkedCtorWithoutHint => VSurf resolved
+        end
+    | SConst _ =>
         match lower_implicit_function _lower_run _fuel' env _er fixSelf locals
             (EVar n) with
         | InferredDef term => VSurf term
-        | NoMarkedDef => VSurf (resolve_var_fix env fixSelf locals n)
-        | MarkedDefWithoutHint => VSurf (resolve_var_fix env fixSelf locals n)
+        | NoMarkedDef => VSurf resolved
+        | MarkedDefWithoutHint => VSurf resolved
         end
-    | MarkedCtorWithoutHint => VSurf (resolve_var_fix env fixSelf locals n)
+    | SVar _ => VSurf resolved
+    | SSort _ => VSurf resolved
+    | SPi _ _ _ => VSurf resolved
+    | SLam _ _ _ => VSurf resolved
+    | SApp _ _ => VSurf resolved
+    | SLet _ _ _ _ => VSurf resolved
+    | SInd _ => VSurf resolved
+    | SCase _ _ _ _ => VSurf resolved
+    | SFix _ _ _ _ _ => VSurf resolved
+    | SHole _ => VSurf resolved
+    | SEffectRow _ => VSurf resolved
+    | SPerform _ _ => VSurf resolved
+    | SStr _ _ => VSurf resolved
     end;
 
 def lower_xvhole
@@ -58,13 +78,13 @@ VSurf (SSort u);
 
 def lower_xvnat
   (_lower_run : Nat -> LowerEnv -> Maybe Surface -> Maybe Nat -> List (Pair Nat Surface) -> LowerMode -> LowerVal)
-  (_fuel' : Nat)
+  (fuel : Nat)
   (env : LowerEnv)
   (_er : Maybe Surface)
-  (_fixSelf : Maybe Nat)
-  (_locals : List (Pair Nat Surface))
+  (fixSelf : Maybe Nat)
+  (locals : List (Pair Nat Surface))
   (n : Nat) : LowerVal :=
-VSurf (lower_nat_env env n);
+VSurf (lower_nat_literal fuel env fixSelf locals n);
 
 def lower_xvrange (env : LowerEnv) (start : Nat) (stop : Nat)
     (inclusive : Bool) : LowerVal :=
@@ -181,17 +201,42 @@ def lower_xvapp
           (lower_run fuel' env (surface_argument_expected env locals function)
             fixSelf locals (LExpr a)) in
       VSurf (SApp function argument) in
-    match lower_implicit_constructor lower_run fuel' env er fixSelf locals
-        (EApp f a) with
-    | InferredCtor term => VSurf term
-    | NoMarkedCtor =>
-        match lower_implicit_function lower_run fuel' env er fixSelf locals
-            (EApp f a) with
-        | InferredDef term => VSurf term
-        | NoMarkedDef => ordinary_app (app_function_expected f er)
-        | MarkedDefWithoutHint => ordinary_app (Nothing Surface)
+    match implicit_app_head fuel' (EApp f a) with
+    | Nothing => ordinary_app (app_function_expected f er)
+    | Just spine =>
+        match spine with
+        | MkPair name args =>
+            let resolved : Surface := resolve_var_fix env fixSelf locals name in
+            match resolved with
+            | SConstruct _ _ _ =>
+                match lower_implicit_constructor_head lower_run fuel' env er fixSelf locals
+                    (implicit_ctor_head_resolved env name args resolved) with
+                | InferredCtor term => VSurf term
+                | NoMarkedCtor => ordinary_app (app_function_expected f er)
+                | MarkedCtorWithoutHint => ordinary_app (Nothing Surface)
+                end
+            | SConst _ =>
+                match lower_implicit_function_head lower_run fuel' env er fixSelf locals
+                    (implicit_def_head_resolved env name args resolved) with
+                | InferredDef term => VSurf term
+                | NoMarkedDef => ordinary_app (app_function_expected f er)
+                | MarkedDefWithoutHint => ordinary_app (Nothing Surface)
+                end
+            | SVar _ => ordinary_app (app_function_expected f er)
+            | SSort _ => ordinary_app (app_function_expected f er)
+            | SPi _ _ _ => ordinary_app (app_function_expected f er)
+            | SLam _ _ _ => ordinary_app (app_function_expected f er)
+            | SApp _ _ => ordinary_app (app_function_expected f er)
+            | SLet _ _ _ _ => ordinary_app (app_function_expected f er)
+            | SInd _ => ordinary_app (app_function_expected f er)
+            | SCase _ _ _ _ => ordinary_app (app_function_expected f er)
+            | SFix _ _ _ _ _ => ordinary_app (app_function_expected f er)
+            | SHole _ => ordinary_app (app_function_expected f er)
+            | SEffectRow _ => ordinary_app (app_function_expected f er)
+            | SPerform _ _ => ordinary_app (app_function_expected f er)
+            | SStr _ _ => ordinary_app (app_function_expected f er)
+            end
         end
-    | MarkedCtorWithoutHint => ordinary_app (Nothing Surface)
     end;
 
 def lower_xvlam
@@ -317,7 +362,11 @@ def lower_xvascribe
     let tyS : Surface :=
       vsurf_or_hole
         (lower_run fuel' env er fixSelf locals (LExpr ty)) in
-    lower_run fuel' env (Just Surface tyS) fixSelf locals (LExpr tm);
+    let tmS : Surface :=
+      vsurf_or_hole
+        (lower_run fuel' env (Just Surface tyS) fixSelf locals (LExpr tm)) in
+    -- The let binder scopes only over its own result variable.
+    VSurf (SLet Z tmS tyS (SVar Z));
 
 def lower_xvmatch
   (lower_run : Nat -> LowerEnv -> Maybe Surface -> Maybe Nat -> List (Pair Nat Surface) -> LowerMode -> LowerVal)
@@ -344,6 +393,42 @@ def lower_xvmatch
         VSurf
           (finish_match env er scrutS
             (ReadyMatch indId nparams params family) pairs)
+    end;
+
+def lower_xvif
+  (lower_run : Nat -> LowerEnv -> Maybe Surface -> Maybe Nat -> List (Pair Nat Surface) -> LowerMode -> LowerVal)
+  (fuel' : Nat) (env : LowerEnv) (expected : Maybe Surface)
+  (fixSelf : Maybe Nat) (locals : List (Pair Nat Surface))
+  (condition : Expr) (yes : Expr) (no : Expr) : LowerVal :=
+    let bool_id : Nat := env_boolRoleId env in
+    let valid : Bool :=
+      andb (notb (eqNat bool_id 0))
+        (andb (eqNat (count_ctors_ind bool_id (env_ctors env)) 2)
+          (andb (eqNat (nparams_of_ind bool_id (env_ctors env)) 0)
+            (andb (eqNat (arity_at bool_id 0 (env_ctors env)) 0)
+              (eqNat (arity_at bool_id 1 (env_ctors env)) 0)))) in
+    match valid with
+    | False => VSurf (SConst Z)
+    | True =>
+        let conditionS : Surface := vsurf_or_hole
+          (lower_run fuel' env (Just Surface (SInd bool_id)) fixSelf locals
+            (LExpr condition)) in
+        let yesS : Surface := vsurf_or_hole
+          (lower_run fuel' env expected fixSelf locals (LExpr yes)) in
+        let result : Maybe Surface := match expected with
+          | Just ty => Just Surface ty
+          | Nothing => surface_type_hint env locals fuel1k yesS
+          end in
+        match result with
+        | Nothing => VSurf (SConst Z)
+        | Just resultTy =>
+            let noS : Surface := vsurf_or_hole
+              (lower_run fuel' env (Just Surface resultTy) fixSelf locals
+                (LExpr no)) in
+            VSurf (SCase (MkCaseInfo bool_id 0 ([0, 0] : List Nat))
+              (mk_match_motive bool_id 0 (Nil Surface) resultTy)
+              conditionS ([yesS, noS] : List Surface))
+        end
     end;
 
 def lower_xvfix
@@ -554,6 +639,90 @@ def lower_lbranch
         end
     end;
 
+def coalesce_payload_hint (env : LowerEnv)
+    (locals : List (Pair Nat Surface)) (family : Nat)
+    (operand : Surface) : Maybe Surface :=
+  match surface_type_hint env locals fuel1k operand with
+  | Nothing => Nothing Surface
+  | Just hint =>
+      match peel_ind_apps hint with
+      | Nothing => Nothing Surface
+      | Just head => match head with
+        | MkPair selected params =>
+            match eqNat selected family with
+            | False => Nothing Surface
+            | True => match params with
+              | Cons payload tail =>
+                  match tail with
+                  | Nil => Just Surface payload
+                  | Cons _ _ => Nothing Surface
+                  end
+              | Nil => Nothing Surface
+              end
+            end
+        end
+      end
+  end;
+
+def coalesce_motive (family : Nat) (payloadTy : Surface) : Surface :=
+  let param : Nat := S (fallible_max_var payloadTy) in
+  let scrutinee : Nat := S param in
+  SLam param (SSort Z)
+    (SLam scrutinee (SApp(SInd family, SVar param)) payloadTy);
+
+def lower_xvcoalesce
+  (lower_run : Nat -> LowerEnv -> Maybe Surface -> Maybe Nat -> List (Pair Nat Surface) -> LowerMode -> LowerVal)
+  (fuel' : Nat) (env : LowerEnv) (er : Maybe Surface)
+  (fixSelf : Maybe Nat) (locals : List (Pair Nat Surface))
+  (operand : Expr) (fallback : Expr) : LowerVal :=
+    let family : Nat := env_maybeId env in
+    let missing : Nat := env_nothingId env in
+    let present : Nat := env_justId env in
+    let ctor_shape : Bool :=
+      match lookup_ctor(missing, env_ctors env),
+            lookup_ctor(present, env_ctors env) with
+      | Just first, Just second =>
+          andb(eqNat(ctor_idx first, Z), eqNat(ctor_idx second, 1))
+      | Nothing, Nothing => False
+      | Nothing, Just _presentCtor => False
+      | Just _missingCtor, Nothing => False
+      end in
+    match andb(notb(eqNat family Z),
+      andb(notb(eqNat missing Z),
+        andb(notb(eqNat present Z),
+          andb(fallible_ctor_shape env family missing present 1 0,
+            ctor_shape)))) with
+    | False => VSurf hole0
+    | True =>
+        let probe : Surface := vsurf_or_hole
+          (lower_run fuel' env (Nothing Surface) fixSelf locals
+            (LExpr operand)) in
+        let payload : Maybe Surface :=
+          match coalesce_payload_hint env locals family probe with
+          | Just inferred => Just Surface inferred
+          | Nothing => er
+          end in
+        match payload with
+        | Nothing => VSurf hole0
+        | Just payloadTy =>
+            match surface_hint_has_placeholder locals fuel1k payloadTy with
+            | True => VSurf hole0
+            | False =>
+                let inputTy : Surface := SApp(SInd family, payloadTy) in
+                let input : Surface := vsurf_or_hole
+                  (lower_run fuel' env (Just Surface inputTy) fixSelf locals
+                    (LExpr operand)) in
+                let alternative : Surface := vsurf_or_hole
+                  (lower_run fuel' env (Just Surface payloadTy) fixSelf locals
+                    (LExpr fallback)) in
+                let binder : Nat := S (fallible_max_var payloadTy) in
+                VSurf (SCase (MkCaseInfo family 1 ([Z, S Z] : List Nat))
+                  (coalesce_motive family payloadTy) input
+                  ([alternative, SLam binder payloadTy (SVar binder)] : List Surface))
+            end
+        end
+    end;
+
 def lower_run : Nat -> LowerEnv -> Maybe Surface -> Maybe Nat -> List (Pair Nat Surface) -> LowerMode -> LowerVal :=
   fix lower_run (fuel : Nat) (env : LowerEnv) (er : Maybe Surface) (fixSelf : Maybe Nat) (locals : List (Pair Nat Surface)) (mode : LowerMode) : LowerVal :=
     match fuel with
@@ -580,6 +749,13 @@ def lower_run : Nat -> LowerEnv -> Maybe Surface -> Maybe Nat -> List (Pair Nat 
             | XVLet name ann val body => lower_xvlet recur fuel' env er fixSelf locals name ann val body
             | XVAscribe tm ty => lower_xvascribe recur fuel' env er fixSelf locals tm ty
             | XVMatch scrut branches => lower_xvmatch recur fuel' env er fixSelf locals scrut branches
+            | XVIf condition yes no =>
+                lower_xvif recur fuel' env er fixSelf locals condition yes no
+            | XVIfLet pattern subject yes no =>
+                lower_xviflet recur fuel' env er fixSelf locals
+                  pattern subject yes no
+            | XVCoalesce operand fallback =>
+                lower_xvcoalesce recur fuel' env er fixSelf locals operand fallback
             | XVFix name binders ret body => lower_xvfix recur fuel' env er fixSelf locals name binders ret body
             | XVEffectRow ty ops => lower_xveffectrow recur fuel' env er fixSelf locals ty ops
             | XVPerform op args => lower_xvperform recur fuel' env er fixSelf locals op args

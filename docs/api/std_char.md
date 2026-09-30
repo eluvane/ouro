@@ -2,7 +2,7 @@
 
 ASCII predicates only; Unicode stays a String/runtime concern.
 
-Declarations: 64.
+Declarations: 72.
 
 ## def ch_nul
 

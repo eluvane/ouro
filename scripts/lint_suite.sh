@@ -49,7 +49,7 @@ if [ ! -x "$quality_inputs" ] && [ -x "${quality_inputs}.exe" ]; then
 	quality_inputs="${quality_inputs}.exe"
 fi
 "$quality_inputs" "$out/input-fixtures" >"$out/quality-input-tests.out"
-tr -d '\r' <"$out/quality-input-tests.out" | grep -Fx 'QUALITY_INPUT_TESTS rows=22 failures=0' >/dev/null
+tr -d '\r' <"$out/quality-input-tests.out" | grep -Fx 'QUALITY_INPUT_TESTS rows=29 failures=0' >/dev/null
 
 "$quality_diagnostics" >"$out/quality-diagnostic-tests.out" 2>"$out/quality-diagnostic-tests.err"
 test ! -s "$out/quality-diagnostic-tests.err"
@@ -280,6 +280,37 @@ done
 test "$(sed -n '2p' "$session_dir/transitive.out")" = ok
 test "$(sed -n '2p' "$session_dir/transitive-bad.out")" = error
 grep -F 'unresolved executable declaration: Missing' "$session_dir/transitive-bad.out" >/dev/null
+
+# Ordinary compiler paths retain all three edges, including non-type filenames.
+printf '%s\n' 'inductive ChainType : Type := | ChainValue : ChainType;' \
+    >"$session_dir/sources/compiler/transitive_types.ouro"
+printf '%s\n' 'import "transitive_types.ouro";' \
+    'def chain_identity (x : ChainType) : ChainType := x;' \
+    >"$session_dir/sources/compiler/transitive_bridge.ouro"
+printf '%s\n' 'import "transitive_bridge.ouro";' \
+    'def chain_wrapper (x : ChainType) : ChainType := chain_identity x;' \
+    >"$session_dir/sources/compiler/transitive_facade.ouro"
+printf '%s\n' 'import "compiler/transitive_facade.ouro";' \
+    'def root (x : ChainType) : ChainType := chain_wrapper x;' \
+    >"$session_dir/sources/transitive-ordinary.ouro"
+printf '%s\n' 'import "compiler/transitive_facade.ouro";' \
+    'def root (x : Missing) : Missing := x;' \
+    >"$session_dir/sources/transitive-ordinary-bad.ouro"
+printf '%s\n' 'import "transitive_missing.ouro";' \
+    >"$session_dir/sources/compiler/transitive_missing_facade.ouro"
+printf '%s\n' 'import "missing_leaf.ouro";' \
+    >"$session_dir/sources/compiler/transitive_missing.ouro"
+printf '%s\n' 'import "compiler/transitive_missing_facade.ouro";' \
+    >"$session_dir/sources/transitive-missing.ouro"
+for path in transitive-ordinary transitive-ordinary-bad transitive-missing; do
+    "$PYTHON" "$ROOT/tests/clippy_semantic/session_protocol.py" --capture \
+        "$session_dir" "$path" "$session_worker" "$session_dir/sources" "$path.ouro"
+done
+test "$(sed -n '2p' "$session_dir/transitive-ordinary.out")" = ok
+test "$(sed -n '2p' "$session_dir/transitive-ordinary-bad.out")" = error
+grep -F 'unresolved executable declaration: Missing' "$session_dir/transitive-ordinary-bad.out" >/dev/null
+test "$(sed -n '2p' "$session_dir/transitive-missing.out")" = error
+grep -F 'expected a regular quality source file' "$session_dir/transitive-missing.out" >/dev/null
 
 echo "=== native lint production sources ==="
 # Only the package sample needs a writable snapshot: `pkg install` vendors

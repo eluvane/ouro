@@ -51,6 +51,9 @@ def ast_trees(seed):
         yield Node(tag)
     for tag in ("AApp", "AAscribe", "AMatch", "AHandle"):
         yield Node(tag, (pair, leaf))
+    yield Node("AIf", (pair, leaf, pair))
+    yield Node("AIfLet", (1, ids, pair, leaf, pair))
+    yield Node("ACoalesce", (pair, leaf))
     for tag in ("ALam", "APi", "ABinder"):
         yield Node(tag, (1, pair, leaf))
     for tag in ("ALet", "AFix"):
@@ -108,10 +111,28 @@ def rows(seed):
         ("EHandle (EVar 1) ([MkPair Nat (Pair (List Nat) Expr) 2 (MkPair (List Nat) Expr (Nil Nat) (EVar 3))] : List (Pair Nat (Pair (List Nat) Expr)))", 3, 5),
         ("EMultiMatch ([EVar 1, EVar 2] : List Expr) ([MkPair (List (Pair Nat (List Nat))) Expr ([MkPair Nat (List Nat) 3 (Nil Nat)] : List (Pair Nat (List Nat))) (EVar 4)] : List (Pair (List (Pair Nat (List Nat))) Expr))", 4, 7),
         ("ENamedCall (EVar 1) ([MkPair Nat Expr 5 (ENat 2)] : List (Pair Nat Expr))", 3, 3),
+        ("EIf (EVar 1) (ENat 2) (ENat 3)", 4, 4),
+        ("EIfLet ([4, 5] : List Nat) (EVar 1) (ENat 2) (ENat 3)", 4, 4),
+        ("ECoalesce (EVar 1) (ENat 2)", 3, 3),
     ):
         yield f"show_nat (adapt_size ({expression}))", str(size)
         yield f"show_nat (ast_size (adapt ({expression})))", str(adapted_size)
     yield "show_bool (alpha_eq (ANamedCall (AVar 1) ([MkPair Nat Ast 2 (ANatLit 3)] : List (Pair Nat Ast))) (ANamedCall (AVar 1) ([MkPair Nat Ast 4 (ANatLit 3)] : List (Pair Nat Ast))))", "false"
+
+    # Conditions and both branches keep their enclosing binder scope.
+    yield "show_bool (alpha_eq (ALam 11 ANoBinder (AIf (AVar 11) (ANatLit 2) (AVar 12))) (ALam 21 ANoBinder (AIf (AVar 21) (ANatLit 2) (AVar 12))))", "true"
+    conditional = "AIf (AVar 1) (ANatLit 2) (ANatLit 3)"
+    for other in ("AIf (AVar 4) (ANatLit 2) (ANatLit 3)",
+                  "AIf (AVar 1) (ANatLit 4) (ANatLit 3)",
+                  "AIf (AVar 1) (ANatLit 2) (ANatLit 4)"):
+        yield f"show_bool (alpha_eq ({conditional}) ({other}))", "false"
+    # Endpoints and inclusivity are three literal children, without binders.
+    yield "show_bool (alpha_eq (ARange 2 5 False) (ARange 2 5 False))", "true"
+    for other in ("ARange 3 5 False", "ARange 2 6 False", "ARange 2 5 True"):
+        yield f"show_bool (alpha_eq (ARange 2 5 False) ({other}))", "false"
+    yield "show_nat (min_score_nodes (minimal_score (ARange 2 5 False)))", "4"
+    for metric, expected in (("nodes", "4"), ("depth", "2"), ("allocs", "0")):
+        yield f'show_nat (fromMaybe Nat 0 (bnd_metric (bounds_metrics (ARange 2 5 False)) "{metric}"))', expected
 
 
 def run_checks(run, directory, saved=None):

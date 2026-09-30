@@ -78,7 +78,8 @@ PR_GROUPS: dict[str, tuple[str, ...]] = {
         "compiler-scale",
         "compiler-depth",
     ),
-    "analyzer": ("analyze-precision", "lint-changed"),
+    "analyzer": ("analyze-precision",),
+    "analyzer-lint": ("lint-changed",),
     "lint": ("lint",),
     "tests": (
         "ergonomics",
@@ -803,7 +804,7 @@ def run_self_tests(all_gates: Sequence[Gate]) -> int:
                     "--changed-paths-json", "--selection-key",
                 )):
                     failures.append("PR matrix must consume the routing plan and recompute affected gates")
-                planned = [row["group"] for row in selection_matrix(full_path_selection("selftest"))["include"]]
+                planned = [row["group"] for row in selection_matrix(plan_paths(["compiler/lexer.ouro"]))["include"]]
                 if len(planned) != len(groups) or set(planned) != set(groups):
                     failures.append("full PR routing omits or duplicates a group")
                 if planned[:3] != ["checks", "checks-parity", "checks-quality"]:
@@ -1066,14 +1067,37 @@ def lint_changed_contract_failures() -> list[str]:
         with patch(__name__ + ".lint_changed_sources", side_effect=OSError("unreadable")):
             if set(plan_paths(["tools/lsp.ouro"]).gates) != set(full_path_selection("selftest").gates):
                 failures.append("unreadable lint inventory did not select complete validation")
-        status, printed = listed(["--profile", "pr", "--group", "analyzer", "--changed-paths-json",
+        groups = {row["group"] for row in selection_matrix(route)["include"]}
+        if "analyzer-lint" not in groups or "analyzer" in groups:
+            failures.append("changed LSP source did not isolate lint from analyzer precision")
+        status, printed = listed(["--profile", "pr", "--group", "analyzer-lint", "--changed-paths-json",
                                   '["tools/lsp.ouro"]', "--selection-key", selection_key(route), "--list"])
-        if status != 0 or "BLOCKING lint-changed sh scripts/ouro1.sh lint --deny -- tools/lsp.ouro\n" not in printed:
-            failures.append("PR lint-changed did not receive its changed production source")
-    status, printed = listed(["--profile", "pr", "--group", "analyzer", "--list"])
+        if status != 0 or printed != "BLOCKING lint-changed sh scripts/ouro1.sh lint --deny -- tools/lsp.ouro\n":
+            failures.append("PR lint-changed did not receive only its changed production source")
+        fixture = plan_paths(["tests/analyze/precision/absint.ouro"])
+        groups = {row["group"] for row in selection_matrix(fixture)["include"]}
+        if "analyzer" not in groups or "analyzer-lint" in groups:
+            failures.append("analyzer fixture did not isolate precision from changed production lint")
+        production = plan_paths(["tools/analyze/errors.ouro"])
+        groups = {row["group"] for row in selection_matrix(production)["include"]}
+        if not {"analyzer", "analyzer-lint"} <= groups:
+            failures.append("analyzer source lost one of its independent validation groups")
+        arguments = ["--profile", "pr", "--changed-paths-json", '["tools/analyze/errors.ouro"]',
+                     "--selection-key", selection_key(production), "--list"]
+        for group, expected in (
+            ("analyzer", "BLOCKING analyze-precision sh scripts/analyze_precision_suite.sh\n"),
+            ("analyzer-lint", "BLOCKING lint-changed sh scripts/ouro1.sh lint --deny -- tools/analyze/errors.ouro\n"),
+        ):
+            status, printed = listed([*arguments, "--group", group])
+            if status != 0 or printed != expected:
+                failures.append(f"PR {group} changed or duplicated the selected validation command")
+    status, printed = listed(["--profile", "pr", "--list"])
     if status != 0 or "SKIP lint-changed requires --changed-paths-json\n" not in printed \
             or "BLOCKING lint-changed" in printed:
         failures.append("lint-changed without a routing plan was not reported as skipped")
+    status, printed = listed(["--profile", "pr", "--group", "analyzer-lint", "--list"])
+    if status != 2 or printed:
+        failures.append("isolated lint-changed without a routing plan accepted an empty group")
     return failures
 
 

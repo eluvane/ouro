@@ -1,8 +1,8 @@
 # Ergonomic syntax
 
-Grouped imports, positional calls, typed local helpers, pure expression
-blocks, list trailing commas, and final-tail list spreads lower to existing
-checked constructors. The
+Grouped imports, positional calls, typed local helpers, postfix `where` helpers,
+pure expression blocks, list trailing commas, and final-tail list spreads lower
+to existing checked constructors. The
 maintained [syntax reference](../syntax.md) states accepted forms; this page
 records desugaring and compatibility boundaries.
 
@@ -124,6 +124,19 @@ remains one argument: changing that would break existing application syntax.
 No new binders are introduced, and argument evaluation/effects follow the
 same nested `EApp` tree as ordinary application.
 
+## Trailing lambda calls
+
+After a nonempty positional call group, `{ name -> body }` supplies one final
+callback argument.
+
+The callback parameter uses the
+expected function type, as for a short `fun` lambda. The body is one
+expression and may contain local bindings, record literals, and record
+updates; record literals retain their usual nominal type-context requirement.
+The callback is evaluated after the positional arguments in their source
+order. The braces and `->` are required: `f() { x -> x }`, `f { x -> x }`,
+`f(a) { x y -> body }`, and a trailing block after a named call are rejected.
+
 ## Named calls and public labels
 
 A top-level definition can give a parameter a public call label distinct from
@@ -209,6 +222,51 @@ let f (hidden : Nat) := hidden in hidden
 The first lacks a parameter annotation; the second has an unannotated nested
 lambda with no expected function type; the third uses an out-of-scope parameter.
 Existing unparameterized `let` syntax and its inference behavior are unchanged.
+
+## Helpers after an expression
+
+```ouro
+def double_one : Nat :=
+  double one where
+    let one : Nat := 1;
+    let double (value : Nat) : Nat := add value value;
+  end;
+```
+
+`expression where let ...; end` places local helpers after their main expression.
+The block requires at least one ordinary `let` binding and a semicolon after
+every initializer, including the last. Comments and line breaks are allowed.
+Typed parameters, grouped binders, and inferred helper results use the same
+rules as the local helper declarations above.
+
+The block lowers to ordinary sequential lets, in helper source order.
+
+Every helper is visible in `body`; an initializer sees only earlier helpers and
+outer bindings. Its own name is not in scope there, and parameters stay within
+that helper. There is no implicit or mutual recursion: use explicit `fix` with
+its existing checks. Local helpers still use positional calls; a `where` block
+does not create top-level named-call metadata.
+
+The postfix applies to the complete expression, including pipes and `??`:
+`value |> apply where
+let value := initial; let apply (input : T) := input; end` puts both names in
+scope over the pipe. An ordinary lambda still extends to the right.
+
+Parentheses select the whole lambda, or one argument of a larger call.
+The final body of an ordinary `let`, scoped `open`, or `do` statement follows
+its existing right-extending grammar. Delimited match, handler, and fallible
+blocks can take an outer `where` after their closing delimiter. The `where`
+owned by record and effect declarations retains its meaning.
+
+This form uses `ELet` and typed `ELam`/`EPi` nodes and the existing checker.
+It does not sequence IO or change effect handling. The spanned parser keeps
+real ranges for the main expression and each initializer; the outer range
+covers the complete `where` expression, without assigning invented positions
+to the reordered lets.
+
+Missing bindings, semicolons, or `end`, untyped helper parameters, `let!`,
+later-helper references in initializers, and escaping helper or parameter names
+are rejected by the existing parser or checker.
 
 ## Expected types in short lambdas
 
@@ -357,6 +415,30 @@ and `maybe` keep their meanings. Comments and multiline layout are allowed
 between tokens. Record literals inside a block still need the same supported
 type context as record literals elsewhere.
 
+## Checked destructuring lets
+
+The pattern is one constructor with flat field names or `_` wildcards, enclosed
+in parentheses. It is accepted only when the existing checked `match` for that
+single branch is exhaustive. The parser constructs `EMatch` with one `EBranch`;
+the compiler checker verifies the subject family, field arity, indices, branch
+type, and completeness. A lone `Just` pattern for `Maybe A` is incomplete and
+is rejected. Repeated field names are rejected by the parser.
+
+The subject occupies the single match scrutinee and is evaluated once. Field
+names scope over the expression after `in`, or the rest of the block after `;`;
+they are unavailable in the subject and after the expression. Blocks retain
+their mandatory final expression and cannot sequence standalone actions.
+
+The existing bidirectional elaborator obtains family parameters from the
+checked subject and infers an unannotated match result from a constructor
+branch when that result does not depend on constructor fields. A fully
+applied constructor such as `MkPair Nat Nat Z Z` can be used directly.
+If the result remains ambiguous, put the destructuring body in an expected
+context, such as an explicitly typed definition or
+`let selected : Nat := let (MkPair left right) := pair in left in selected`.
+Nested patterns, alternatives, guards, and a partial-match fallback are not
+provided by this form.
+
 ## List literal trailing commas
 
 ```text
@@ -399,6 +481,17 @@ uses the value with that name in the enclosing lexical scope; it does not
 introduce a binder. The record preprocessor expands it to the same constructor
 argument as `x := x`, preserving declaration field order. Missing, duplicate,
 and unknown fields remain errors.
+
+## Record field destructuring
+
+This local expression form selects distinct fields of a directly named local
+nominal record. The annotated subject is evaluated once, then checked accessors
+read the selected fields before their names enter the body scope. The selected
+names may shadow outer bindings. Unknown and duplicate fields, missing type
+context, and a subject of the wrong record type are errors. An `in` body is
+required; imported records, renaming, and block-statement destructuring are
+outside this form. See [Records](../syntax.md#records) for the full syntax
+boundary.
 
 ## Functional record update
 
@@ -465,6 +558,25 @@ named or anonymous holes remain rejected. Empty blocks, missing final
 expressions, and trailing semicolons are rejected. The block lowers to
 ordinary checked `case`, constructor applications, and local lets; it adds no
 new kernel form or effect handler.
+
+## Maybe fallback operator
+
+For the registered `ouro.maybe` family, `value` must have type `Maybe A` and
+the fallback must have type `A`. `Just payload` returns the payload;
+`Nothing` evaluates and returns the fallback. The compiler lowers this to one
+checked case over `value`, with the fallback in the `Nothing` branch, so the
+source operand occurs once in the emitted term. Both branches are type checked
+even when `value` is a known constructor. The spelling of local bindings named
+`Nothing` or `Just` does not select the constructor roles; the checked
+representation and its ordered constructors do.
+
+`??` associates to the right and binds less tightly than application and
+`|>`: `a ?? b ?? c` is `a ?? (b ?? c)`, and `a ?? b |> f` is
+`a ?? (b |> f)`. Use `(a ?? b) |> f` to pipe the selected value. A complete
+type hint from `value` or an expected result type must determine `A`; an
+ambiguous payload needs an annotation. A similarly shaped unrepresented type,
+a missing fallback, or a fallback of the wrong type is rejected. This operator
+does not propagate failure like the postfix `?` in a typed fallible block.
 
 ## Integration and fixtures
 

@@ -6,6 +6,7 @@ import "source_text.ouro",
   "base.ouro",
   "../std/char.ouro",
   "../std/data.ouro",
+  "../std/listx.ouro",
   "token.ouro",
   "pipeline_abi.ouro";
 
@@ -85,6 +86,10 @@ def kw_chars_extern : List Nat := n6 101 120 116 101 114 110;
 def kw_chars_representation : List Nat :=
   ([114, 101, 112, 114, 101, 115, 101, 110, 116, 97, 116, 105, 111, 110] : List Nat);
 def kw_chars_open : List Nat := n4 111 112 101 110;
+def kw_chars_if : List Nat := n2 105 102;
+def kw_chars_then : List Nat := n4 116 104 101 110;
+def kw_chars_else : List Nat := n4 101 108 115 101;
+def kw_chars_private : List Nat := n7 112 114 105 118 97 116 101;
 def kw_chars_uscore : List Nat := n1 95;
 
 def kp (cs : List Nat) (k : Nat) (tl : List (Pair (List Nat) Nat)) : List (Pair (List Nat) Nat) :=
@@ -92,7 +97,7 @@ def kp (cs : List Nat) (k : Nat) (tl : List (Pair (List Nat) Nat)) : List (Pair 
 
 -- Flat kw table (nested eqListNat towers blow elab). Cons form stays
 -- parseable by the committed stage0 seed during regeneration.
-def kw_table : List (Pair (List Nat) Nat) :=
+def kw_table_base : List (Pair (List Nat) Nat) :=
   kp kw_chars_def kwDef (
   kp kw_chars_axiom kwAxiom (
   kp kw_chars_inductive kwInductive (
@@ -112,7 +117,13 @@ def kw_table : List (Pair (List Nat) Nat) :=
   kp kw_chars_record kwRecord (
   kp kw_chars_intrinsic kwIntrinsic (
   kp kw_chars_extern kwExtern (
-  kp kw_chars_representation kwRepresentation (Nil (Pair(List Nat, Nat))))))))))))))))))))));
+  kp kw_chars_representation kwRepresentation (
+  kp kw_chars_private kwPrivate (Nil (Pair(List Nat, Nat)))))))))))))))))))))));
+
+def kw_table : List (Pair (List Nat) Nat) :=
+  kp kw_chars_if kwIf
+    (kp kw_chars_then kwThen
+      (kp kw_chars_else kwElse kw_table_base));
 
 def classify_ident (name : List Nat) : Maybe Token :=
     match source_bytes_equal name kw_chars_uscore with
@@ -424,6 +435,69 @@ def take_string : Nat -> List Nat -> List Nat -> StrLex :=
         end
     end;
 
+def take_byte_string : Nat -> List Nat -> List Nat -> StrLex :=
+  fix go (fuel : Nat) (src : List Nat) (acc : List Nat) : StrLex :=
+    match fuel with
+    | Z => StrErr
+    | S remaining => match src with
+      | Nil => StrErr
+      | Cons c rest =>
+          match eqNat c ch_dq with
+          | True => StrOk(reverse Nat acc, rest)
+          | False => match eqNat c ch_bs with
+            | True => match rest with
+              | Nil => StrErr
+              | Cons escaped tail =>
+                  match eqNat escaped 120 with
+                  | True => match tail with
+                    | Cons hi after_hi => match after_hi with
+                      | Cons lo after_lo =>
+                          match number_digit 16 hi with
+                          | Nothing => StrErr
+                          | Just upper => match number_digit 16 lo with
+                            | Nothing => StrErr
+                            | Just lower => go remaining after_lo
+                                (Cons Nat (add(mul upper 16, lower)) acc)
+                            end
+                          end
+                      | Nil => StrErr
+                      end
+                    | Nil => StrErr
+                    end
+                  | False =>
+                      let decoded : Maybe Nat :=
+                        match eqNat escaped ch_n with
+                        | True => Just Nat ch_lf
+                        | False => match eqNat escaped ch_t with
+                          | True => Just Nat ch_tab
+                          | False => match eqNat escaped ch_r with
+                            | True => Just Nat ch_cr
+                            | False => match eqNat escaped ch_bs with
+                              | True => Just Nat ch_bs
+                              | False => match eqNat escaped ch_dq with
+                                | True => Just Nat ch_dq
+                                | False => Nothing Nat
+                                end
+                              end
+                            end
+                          end
+                        end in
+                      match decoded with
+                      | Nothing => StrErr
+                      | Just byte => go remaining tail (Cons Nat byte acc)
+                      end
+                  end
+              end
+            | False =>
+                match andb(compiler_le_nat 32 c, compiler_le_nat c 126) with
+                | True => go remaining rest (Cons Nat c acc)
+                | False => StrErr
+                end
+            end
+          end
+      end
+    end;
+
 inductive Step : Type :=
   | StepTok : Token -> List Nat -> InternState -> Step
   | StepEof : InternState -> Step
@@ -489,13 +563,17 @@ def tok_hole (fuel' : Nat) (rest : List Nat) (st : InternState) : Step :=
     match rest with
     | Nil => StepTok(THole (Just Nat Z), Nil Nat, st)
     | Cons c2 rest2 =>
-        match source_is_ident_start c2 with
-        | False => StepTok (THole (Just Nat Z)) rest st
-        | True =>
-            match take_ident(fuel', Cons Nat c2 rest2, Nil Nat) with
-            | MkPair name src' =>
-                match intern_ident st name with
-                | MkPair id st' => StepTok (THole (Just Nat id)) src' st'
+        match eqNat c2 ch_qmark with
+        | True => StepTok TCoalesce rest2 st
+        | False =>
+            match source_is_ident_start c2 with
+            | False => StepTok (THole (Just Nat Z)) rest st
+            | True =>
+                match take_ident(fuel', Cons Nat c2 rest2, Nil Nat) with
+                | MkPair name src' =>
+                    match intern_ident st name with
+                    | MkPair id st' => StepTok (THole (Just Nat id)) src' st'
+                    end
                 end
             end
         end
@@ -509,6 +587,30 @@ def tok_string (fuel' : Nat) (rest : List Nat) (st : InternState) : Step :=
         | MkPair id st' => StepTok (TString id) src' st'
         end
     end;
+
+def tok_multiline (fuel' : Nat) (src : List Nat) (st : InternState) : Step :=
+  match source_take_multiline_bounded (S fuel') src with
+  | Nothing => LexStepErr st
+  | Just parsed => match parsed with
+    | MkPair content tail =>
+        match intern_string st content with
+        | MkPair id st' => StepTok (TString id) tail st'
+        end
+    end
+  end;
+def tok_byte_string (fuel' : Nat) (rest : List Nat) (st : InternState) : Step :=
+    match take_byte_string fuel' rest (Nil Nat) with
+    | StrErr => LexStepErr st
+    | StrOk content src' => StepTok (TByteString content) src' st
+    end;
+
+def tok_character (fuel : Nat) (src : List Nat) (st : InternState) : Step :=
+  match source_take_character fuel src with
+  | Nothing => LexStepErr st
+  | Just decoded => match decoded with
+    | MkPair value rest => StepTok (TNat value) rest st
+    end
+  end;
 
 def tok_colon (rest : List Nat) (st : InternState) : Step :=
     match rest with
@@ -623,9 +725,20 @@ def next_token_char (fuel' : Nat) (c : Nat) (rest : List Nat) (st : InternState)
             match eqNat c ch_qmark with
             | True => tok_hole fuel' rest st
             | False =>
-                match eqNat c ch_dq with
-                | True => tok_string fuel' rest st
+                match eqNat c source_ch_quote with
+                | True => tok_character (S fuel') (Cons Nat c rest) st
                 | False =>
+                match eqNat c ch_dq with
+                | True =>
+                    match source_is_multiline_start (Cons Nat c rest) with
+                    | True => tok_multiline fuel' (Cons Nat c rest) st
+                    | False => tok_string fuel' rest st
+                    end
+                | False =>
+                    match source_is_byte_start (Cons Nat c rest) with
+                    | True => tok_byte_string fuel'
+                        (source_drop_prefix source_byte_prefix (Cons Nat c rest)) st
+                    | False =>
                     match source_is_raw_start (Cons Nat c rest) with
                     | True =>
                         match source_take_raw_bounded (S fuel') (Cons Nat c rest) with
@@ -666,7 +779,9 @@ def next_token_char (fuel' : Nat) (c : Nat) (rest : List Nat) (st : InternState)
                     end
                     end
                     end
+                    end
                 end
+            end
             end
         end
     end;
@@ -688,7 +803,8 @@ def next_import_token (fuel : Nat) (src0 : List Nat) (st : InternState) : Step :
       match skip_ws remaining src0 with
       | Nil => StepEof st
       | Cons c rest =>
-          match source_is_raw_start (Cons Nat c rest) with
+          match orb(source_is_raw_start (Cons Nat c rest),
+              source_is_byte_start (Cons Nat c rest)) with
           | True => next_token_char remaining c rest st
           | False => match source_is_ident_start c with
             | True => tok_import_ident remaining c rest st
@@ -698,8 +814,8 @@ def next_import_token (fuel : Nat) (src0 : List Nat) (st : InternState) : Step :
       end
   end;
 
--- The native host may reclaim one token step's lookup temporaries. Token
--- semantics and this fuel/accumulator traversal stay in the canonical lexer.
+-- The native host reclaims one import-token step's lookup temporaries.
+-- Token semantics and this fuel/accumulator traversal stay in the canonical lexer.
 def lex_go_with
     (step_token : Nat -> List Nat -> InternState -> Step) :
     Nat -> List Nat -> InternState -> List Token ->
@@ -709,13 +825,13 @@ def lex_go_with
     match fuel with
     | Z =>
         match src with
-        | Nil => LexOk(reverse(Token, Cons Token TEof acc), st)
+        | Nil => LexOk(reverse_lin(Token, Cons Token TEof acc), st)
         | Cons _ _ => LexExhausted st
         end
     | S fuel' =>
         match step_token fuel' src st with
         | StepEof st' =>
-            LexOk(reverse(Token, Cons Token TEof acc), st')
+            LexOk(reverse_lin(Token, Cons Token TEof acc), st')
         | LexStepErr st' => LexMalformed st'
         | StepTok tok src' st' =>
             lex_go fuel' src' st' (Cons Token tok acc)
