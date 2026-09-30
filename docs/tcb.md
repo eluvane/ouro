@@ -90,6 +90,8 @@ metadata before native lowering, including a publicly constructed wrapper.
 annotations and computed type arguments using the canonical checker operations.
 This view never replaces checked declarations or diagnostic snapshots. Resource,
 reduction and unsupported residual type-computation failures stop emission.
+The C adapter isolates preparation temporaries per accepted body and retains
+the typed result before releasing that body's temporary arena.
 
 The static gate restricts references to `CheckedProgramOf` in compiler sources
 to those four modules. References to `DeclarationsOk` are restricted to

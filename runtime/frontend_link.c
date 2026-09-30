@@ -193,13 +193,40 @@ ouro_v *ouro_fe_checked_c_shims(void)
 	return ouro_apply(FIND(pl, "checked_program_c_shims"), g_last_checked_program);
 }
 
+/* Each accepted body owns temporary inference and normalization allocations.
+   Retain its typed preparation result before processing the next declaration. */
+static ouro_v *emission_prepare_term(ouro_env *env, ouro_v *term)
+{
+	ouro_heap_context *scope = ouro_heap_context_enter();
+	ouro_v *result = ouro_apply(ouro_apply(ouro_apply(ouro_apply(
+		ouro_get(env, 3), ouro_get(env, 2)), ouro_get(env, 1)),
+		ouro_get(env, 0)), term);
+	return ouro_heap_context_leave(scope, result);
+}
+
+static ouro_v *emission_prepare_types(ouro_env *env, ouro_v *types)
+{
+	return ouro_clos(emission_prepare_term, ouro_cons(types, env));
+}
+
+static ouro_v *emission_prepare_environment(ouro_env *env, ouro_v *environment)
+{
+	return ouro_clos(emission_prepare_types, ouro_cons(environment, env));
+}
+
+static ouro_v *emission_prepare_fuel(ouro_env *env, ouro_v *fuel)
+{
+	return ouro_clos(emission_prepare_environment, ouro_cons(fuel, env));
+}
+
 ouro_v *ouro_fe_checked_emission_cores(ouro_v *fuel)
 {
 	ouro_v *fn;
 	if (g_last_checked_program == 0)
 		return cerr(49, 0);
 	fn = ouro_apply(FIND(pl, "checked_program_emission_cores_indexed"),
-			FIND(pl, "erasure_prepare_closed_indexed"));
+			ouro_clos(emission_prepare_fuel,
+				ouro_cons(FIND(pl, "erasure_prepare_closed_indexed"), 0)));
 	fn = ouro_apply(fn, FIND(fc, "whnf_checked_indexed"));
 	return ouro_apply(ouro_apply(fn, fuel), g_last_checked_program);
 }

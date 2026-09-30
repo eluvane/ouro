@@ -4,6 +4,73 @@
 #endif
 #include "frontend_link.c"
 
+static ouro_v *preparation_probe_term(ouro_env *env, ouro_v *term)
+{
+	ouro_v *temporary[1];
+	ouro_v *fields[1];
+	int i;
+	if (as_nat(ouro_get(env, 2)) != 37UL
+	    || as_nat(ouro_get(env, 1)) != 45UL
+	    || as_nat(ouro_get(env, 0)) != 55UL)
+		return 0;
+	for (i = 0; i < 20000; ++i) {
+		temporary[0] = term;
+		(void)ouro_ctor(71, 1, temporary);
+	}
+	if (as_nat(term) == 0UL) {
+		fields[0] = ouro_ctor(3, 0, 0);
+		return ouro_ctor(1, 1, fields);
+	}
+	temporary[0] = ouro_nat(as_nat(term));
+	fields[0] = ouro_ctor(6, 1, temporary);
+	return ouro_ctor(0, 1, fields);
+}
+
+static ouro_v *preparation_probe_types(ouro_env *env, ouro_v *types)
+{
+	return ouro_clos(preparation_probe_term, ouro_cons(types, env));
+}
+
+static ouro_v *preparation_probe_environment(ouro_env *env, ouro_v *environment)
+{
+	return ouro_clos(preparation_probe_types, ouro_cons(environment, env));
+}
+
+static ouro_v *preparation_probe_fuel(ouro_env *env, ouro_v *fuel)
+{
+	return ouro_clos(preparation_probe_environment, ouro_cons(fuel, env));
+}
+
+static int preparation_context_check(void)
+{
+	ouro_v *raw = ouro_clos(preparation_probe_fuel, 0);
+	ouro_v *prepare = ouro_clos(emission_prepare_fuel, ouro_cons(raw, 0));
+	ouro_v *result;
+	ouro_v *results[16];
+	unsigned long long before;
+	int i;
+	prepare = ouro_apply(ouro_apply(ouro_apply(prepare, ouro_nat(37)),
+		ouro_nat(45)), ouro_nat(55));
+	for (i = 0; i < 16; ++i) {
+		before = ouro_heap_live_bytes();
+		result = ouro_apply(prepare, ouro_nat((unsigned long)(66 + i)));
+		results[i] = result;
+		if (result == 0 || result->tag != 0 || result->n != 1
+		    || OURO_F(result, 0)->tag != 6
+		    || as_nat(OURO_F(OURO_F(result, 0), 0)) != (unsigned long)(66 + i)
+		    || ouro_heap_live_bytes() - before > 65536ULL)
+			return 1;
+	}
+	result = ouro_apply(prepare, ouro_nat(0));
+	if (result == 0 || result->tag != 1 || result->n != 1
+	    || OURO_F(result, 0)->tag != 3 || OURO_F(result, 0)->n != 0)
+		return 1;
+	for (i = 0; i < 16; ++i)
+		if (as_nat(OURO_F(OURO_F(results[i], 0), 0)) != (unsigned long)(66 + i))
+			return 1;
+	return 0;
+}
+
 static ouro_v *meta_program(void)
 {
 	unsigned long ids[] = {65536UL, 65535UL, 1000000UL, 65536UL};
@@ -225,6 +292,10 @@ int main(int argc, char **argv)
 
 	if (argc != 2 || (!parity && strcmp(argv[1], "metadata") != 0))
 		return 2;
+	if (preparation_context_check() != 0) {
+		fputs("FRONTEND_CODEGEN_META: preparation context failed\n", stderr);
+		return 1;
+	}
 	if (metadata_check() != 0)
 		return 1;
 	if (parity && metadata_parity_check() != 0) {
