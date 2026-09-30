@@ -47,6 +47,10 @@ edge is reached. It computes visible names from each file's import edges;
 selective edges filter direct declarations while plain edges inherit the
 target's visible names. This scope does not shrink the ordered import closure.
 The checker still receives every reached imported declaration and body.
+Import resolution bounds graph traversal with `resolve_imports_fuel`; the
+default budget is 256. Ordinary declarations are collected structurally and do
+not consume this graph budget. Exhaustion reports the next unit path rather
+than returning a partial closure.
 [Compiler checking](kernel_design.md) defines the complete declaration plan
 and import-closure checks.
 

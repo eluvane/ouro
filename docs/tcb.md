@@ -110,6 +110,16 @@ bootstrap ABI.
 
 ## Current host assumptions
 
+The transitional C codegen preserves the full six-argument `codegen_block`
+fallback contract, including canonical liveness facts. Safepoint root clearing
+uses the Ouro liveness and clearing operations; incomplete facts remain errors.
+Descriptor metadata deduplicates complete host-representable symbol IDs without
+a 16-bit cutoff. Unrepresentable or malformed metadata declines the fast path
+before publishing a registry. The frontend-host suite compares these paths with
+canonical metadata and emitted bytes, including forced fallback. This is
+regression evidence within the existing execution assumptions, not a new
+program-acceptance authority.
+
 The working producer still uses committed stage0 C, a system C compiler, the
 repository C runtime and IO adapters, and Python/shell build orchestration.
 Windows producer tools reserve a 2 GiB PE stack so the native-build cone can

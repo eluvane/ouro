@@ -19,16 +19,19 @@ import frontend_native_fs_create as direct_fs_create
 import frontend_native_async as direct_async
 import fs_replace_suite as direct_fs_replace
 import ouro_build as build
+from frontend_regen import collect_units
 from kernel_scale import pin_one_cpu
 from ourosmith.limits import run_limited
 from repo_support import configure_native_stack, sha256_file, write_json_atomic
 
 ROOT = Path(__file__).resolve().parents[1]
 KIND = "ouro.frontend-host-suite.v1"
-ENTRY = "tools/native_build.ouro"
+ENTRY = "tests/frontend_host_codegen.ouro"
 HOST_MAINS = {
     "n1-host-selftest": "runtime/n1_host_selftest.c",
     "frontend-link-selftest": "runtime/frontend_link_selftest.c",
+    "frontend-codegen-meta-selftest": "runtime/frontend_codegen_meta_selftest.c",
+    "frontend-codegen-selftest": "runtime/frontend_codegen_selftest.c",
     "n1-host": "runtime/n1_host_main.c",
 }
 SUPERVISOR_INPUTS = (
@@ -81,6 +84,11 @@ def probe_cases():
         argv = [mode, "retained output.exe"] if mode == "caller-output" else [mode]
         stderr = re.escape("probe.ouro: type mismatch in wrong\n") if mode == "typed-failure" else ""
         cases.append(("frontend-link-selftest", argv, 0, f"FRONTEND_LINK_SELFTEST: passed {mode}\n", stderr))
+    cases.append(("frontend-codegen-meta-selftest", ["metadata-parity"], 0,
+                  "FRONTEND_CODEGEN_META: passed metadata-parity\n", ""))
+    for mode in ("fallback-forward", "root-parity"):
+        cases.append(("frontend-codegen-selftest", [mode], 0,
+                      f"FRONTEND_CODEGEN_SELFTEST: passed {mode}\n", ""))
     return cases
 
 
@@ -97,9 +105,12 @@ def snapshot(args, cfg) -> dict:
         inputs["sources"][name] = sha256_file(ROOT / name)
     config = (args.config or ROOT / "Ouro.seal").resolve()
     inputs["sources"][str(config)] = sha256_file(config)
+    runtime_units = collect_units("tests/native_managed/runtime.ouro")
     return {"units": units, "inputs": inputs, "native_process": direct_process.source_snapshot(),
             "native_fs_create": direct_fs_create.source_snapshot(), "native_async": direct_async.source_snapshot(),
-            "native_fs_replace": direct_fs_replace.source_snapshot()}
+            "native_fs_replace": direct_fs_replace.source_snapshot(),
+            "native_live": {"units": runtime_units,
+                            "sources": {name: sha256_file(ROOT / name) for name in runtime_units}}}
 
 
 def require_snapshot(args, cfg, before: dict) -> dict:
@@ -126,6 +137,8 @@ def build_worker(args, cfg) -> None:
     for source in HOST_MAINS.values():
         required.update(re.findall(r'(?:find_export|export_value)\("([^"]+)"',
                                    (ROOT / source).read_text(encoding="utf-8")))
+        required.update(re.findall(r'FIND\(lo,\s*"([^"]+)"',
+                                   (ROOT / source).read_text(encoding="utf-8")))
     missing = required - exports
     if missing:
         raise ValueError("fresh backend lacks required host exports: " + ", ".join(sorted(missing)))
@@ -136,7 +149,9 @@ def build_worker(args, cfg) -> None:
         require_snapshot(args, cfg, before)
         # Identical common sources share only this fresh invocation's checked objects.
         print(f"FRONTEND_HOST_BUILD: link {name}", flush=True)
-        result = build.build_c_executable(cfg, name="frontend-host", sources=[*common, (main, ROOT / main)],
+        sources = [source for source in common if source[0] != "runtime/frontend_link.c"
+                   or name not in ("frontend-codegen-meta-selftest", "frontend-codegen-selftest")]
+        result = build.build_c_executable(cfg, name="frontend-host", sources=[*sources, (main, ROOT / main)],
             output=executable(work, name), object_dir=work / "objects", include_dirs=[ROOT / "runtime"],
             extra_cflags=["-Werror=implicit-function-declaration", "-DOURO_FE_FLAT_EXPORTS"], jobs=1)
         report["binaries"][name] = {"sha256": sha256_file(executable(work, name)), "build": result}
@@ -156,6 +171,30 @@ def verify_artifacts(work: Path, report: dict) -> None:
         binary = executable(work, name)
         if not binary.is_file() or binary.stat().st_size == 0 or sha256_file(binary) != row["sha256"]:
             raise ValueError("host executable missing or changed: " + name)
+
+
+def run_native_live(work, run, build_timeout, probe_timeout, verify_inputs):
+    if os.name != "nt":
+        return {"status": "not-run", "reason": "direct PE execution requires Windows"}
+    report = {"status": "running", "cases": {}}
+    for mode in ("live-reclaim", "live-calls", "live-high-descriptor"):
+        verify_inputs()
+        output = work / (mode + ".exe")
+        result = run(mode + "-emit", [str(executable(work, "frontend-codegen-selftest")),
+                                     mode, str(output)], build_timeout)
+        verify_probe(result, ("frontend-codegen-selftest", [mode], 0,
+                              f"FRONTEND_CODEGEN_SELFTEST: passed {mode}\n", ""))
+        image = direct_process.inspect_image(output, ("kernel32.dll",))
+        digest = sha256_file(output)
+        verify_inputs()
+        result = run(mode + "-pe", [str(output)], probe_timeout)
+        if result.status != "ok" or result.returncode != 42 or result.stdout or result.stderr:
+            raise ValueError(f"{mode}: direct PE reclamation assertions failed")
+        if sha256_file(output) != digest:
+            raise ValueError(f"{mode}: direct PE changed during execution")
+        report["cases"][mode] = {"sha256": digest, "image": image, "exit": 42}
+    report["status"] = "pass"
+    return report
 
 
 def run_suite(args, cfg, argv: list[str]) -> int:
@@ -214,6 +253,8 @@ def run_suite(args, cfg, argv: list[str]) -> int:
             require_snapshot(args, cfg, before)
             verify_artifacts(work, built)
 
+        report["native_live"] = run_native_live(work, run, args.build_timeout,
+                                               args.probe_timeout, verify_native_inputs)
         report["native_process"] = direct_process.run_section(executable(work, "n1-host"), work, run,
             args.build_timeout, args.probe_timeout, verify_native_inputs)
         report["native_fs_create"] = direct_fs_create.run_section(executable(work, "n1-host"), work, run,
@@ -247,8 +288,10 @@ def run_suite(args, cfg, argv: list[str]) -> int:
         fs_status = report["native_fs_create"]["status"]
         async_status = report["native_async"]["status"]
         replace_status = report["native_fs_replace"]["status"]
+        live_status = report["native_live"]["status"]
         print(f"FRONTEND_HOST_SUITE: PASS cases={len(probe_cases())} native_process={native_status} "
-              f"native_fs_create={fs_status} native_async={async_status} native_fs_replace={replace_status} out={work}", flush=True)
+              f"native_fs_create={fs_status} native_async={async_status} native_fs_replace={replace_status} "
+              f"native_live={live_status} out={work}", flush=True)
         return 0
     print(f"FRONTEND_HOST_SUITE: FAIL {report.get('error', report.get('integrity_error'))}; see {work}", file=sys.stderr, flush=True)
     return 1

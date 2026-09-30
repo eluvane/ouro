@@ -545,6 +545,46 @@ case "$watch_last" in
 	;;
 esac
 
+# An authorized document can fail scratch creation before invoking the checker.
+# The failure must stay visible through open/change, followed by a normal close.
+SCRATCH_ROOT=$(mktemp -d "$OUT/no-scratch-XXXXXX")
+SCRATCH_DOC="$SCRATCH_ROOT/main.ouro"
+printf 'inductive Nat : Type := | Z : Nat;\ndef good : Nat := Z;\n' >"$SCRATCH_DOC"
+SCRATCH_URI=$(uri_of_path "$SCRATCH_DOC")
+{
+	frame '{"jsonrpc":"2.0","id":109,"method":"initialize","params":{"capabilities":{}}}'
+	frame "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":{\"uri\":\"$SCRATCH_URI\",\"languageId\":\"ouro\",\"version\":1,\"text\":\"$(json_text "$SCRATCH_DOC")\"}}}"
+	frame "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didChange\",\"params\":{\"textDocument\":{\"uri\":\"$SCRATCH_URI\",\"version\":2},\"contentChanges\":[{\"text\":\"$(json_text "$BROKEN")\"}]}}"
+	frame "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didClose\",\"params\":{\"textDocument\":{\"uri\":\"$SCRATCH_URI\"}}}"
+	frame '{"jsonrpc":"2.0","id":110,"method":"shutdown","params":{}}'
+	frame '{"jsonrpc":"2.0","method":"exit"}'
+} >"$OUT/scratch-failure.in"
+set +e
+OURO_ROOT="$SCRATCH_ROOT" "$LSP" <"$OUT/scratch-failure.in" \
+	>"$OUT/scratch-failure.out" 2>"$OUT/scratch-failure.err"
+scratch_status=$?
+set -e
+if [ "$scratch_status" -eq 0 ] && [ ! -s "$OUT/scratch-failure.err" ] &&
+	"$PYTHON" - "$OUT/scratch-failure.out" "$SCRATCH_URI" <<'PY'
+import json, pathlib, sys
+messages = [json.loads(line) for line in pathlib.Path(sys.argv[1]).read_text(encoding="utf-8").splitlines() if line.startswith("{")]
+publications = [m["params"]["diagnostics"] for m in messages
+                if m.get("method") == "textDocument/publishDiagnostics" and m["params"]["uri"] == sys.argv[2]]
+assert len(publications) == 3, publications
+for diagnostics in publications[:2]:
+    assert len(diagnostics) == 1, diagnostics
+    assert diagnostics[0]["code"] == "TOOL_ERROR", diagnostics
+    assert diagnostics[0]["severity"] == 1, diagnostics
+    assert diagnostics[0]["message"] == "could not create checker scratch file", diagnostics
+assert publications[2] == [], publications
+assert any(m.get("id") == 110 and m.get("result", "missing") is None for m in messages), messages
+PY
+then
+	ok "scratch creation failure remains a tool diagnostic until close"
+else
+	bad scratch-failure "status=$scratch_status or unexpected diagnostic protocol"
+fi
+
 # Oversized framing is rejected from the header, and a valid value one level
 # beyond the JSON nesting budget receives a parse error without killing the
 # subsequent shutdown handshake.

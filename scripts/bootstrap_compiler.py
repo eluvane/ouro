@@ -48,6 +48,15 @@ PASS lexer malformed result crosses parser callback
 PASS lexer exhaustion crosses parser callback
 PASS parser error crosses unit callback
 PASS resolver error retains code and missing path
+PASS 255 ordinary declarations retain the complete closure
+PASS 256 ordinary declarations use only graph fuel
+PASS large root and imported unit use only graph fuel
+PASS interleaved imports retain dependency order and diamond deduplication
+PASS zero graph fuel retains the entry path
+PASS exhausted graph fuel retains the next import path
+PASS exhausted nested graph retains the next import path
+PASS graph cycle retains code and repeated path
+PASS missing graph unit retains code and missing path
 PASS compiler result retains named core
 PASS compiler error retains code and detail
 PASS lower environment preserves constructor and hint fields

@@ -347,7 +347,8 @@ traversal, links/reparse points, non-file URIs, and canonical paths outside that
 root are rejected. Protocol frames are limited to 1 MiB, one retained document
 to 512 KiB, and all open document text to 2 MiB. Formatting and unsaved-buffer
 checks use exclusive scratch files under the root's existing `_build` directory
-and remove them after the child command completes.
+and remove them after the child command completes. A failed scratch creation or
+write publishes a `TOOL_ERROR` diagnostic; it cannot report a clean check.
 
 ## VS Code
 

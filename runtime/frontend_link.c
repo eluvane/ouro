@@ -3319,99 +3319,17 @@ ouro_v *ouro_wrap_codegen_parts(ouro_v *raw)
 	return ouro_clos(parts_apply, 0);
 }
 
-/* Conservative per-instruction live sets: every managed slot stays live.
-   Exact mir_live_after / mir_live_instructions stay as fallback. */
+/* Only the canonical transfer may authorize removing managed roots. */
 static ouro_v *g_raw_live_ins;
-static unsigned long g_cli_count;
-static unsigned long g_cli_fallback;
-
-static ouro_v *cli_try(ouro_v *slots, ouro_v *block)
-{
-	ouro_v **roots = 0;
-	ouro_v **ids = 0;
-	ouro_v **insns = 0;
-	ouro_v **pairs = 0;
-	ouro_v *root_list;
-	ouro_v *out;
-	int nroot = 0;
-	int rcap = 0;
-	int nid = 0;
-	int idcap = 0;
-	int nins = 0;
-	int icap = 0;
-	int i;
-
-	if (host_list_collect(slots, &roots, &nroot, &rcap) != 0)
-		goto fallback;
-	for (i = 0; i < nroot; i++) {
-		ouro_v *slot = roots[i];
-		ouro_v *ty;
-
-		if (slot == 0 || slot->tag != 0 || slot->n < 2)
-			goto fallback;
-		ty = OURO_F(slot, 1);
-		if (ty == 0 || ty->tag != 6)
-			continue;
-		if (!cgasm_grow((void **)&ids, &idcap, nid + 1, sizeof *ids))
-			goto fallback;
-		ids[nid++] = OURO_F(slot, 0);
-	}
-	root_list = cgasm_list(ids, nid);
-	free(ids);
-	ids = 0;
-	free(roots);
-	roots = 0;
-	if (block == 0 || block->tag != 0 || block->n < 2)
-		return 0;
-	if (host_list_collect(OURO_F(block, 1), &insns, &nins, &icap) != 0)
-		goto fallback;
-	pairs = (ouro_v **)malloc((unsigned long)nins * sizeof *pairs);
-	if (nins > 0 && pairs == 0)
-		goto fallback;
-	for (i = 0; i < nins; i++) {
-		ouro_v *pf[2];
-
-		if (insns[i] == 0)
-			goto fallback;
-		pf[0] = insns[i];
-		pf[1] = root_list;
-		pairs[i] = ouro_ctor(0, 2, pf);
-	}
-	{
-		ouro_v *xs = cgasm_list(pairs, nins);
-
-		out = ouro_ctor(1, 1, &xs);
-	}
-	g_cli_count++;
-	if (g_cli_count == 1UL || (g_cli_count % 1000UL) == 0UL)
-		fe_progress("n1-host: live-ins-c blocks=%lu ins=%d\n",
-			g_cli_count, nins);
-	free(insns);
-	free(pairs);
-	return out;
-
-fallback:
-	g_cli_fallback++;
-	if (g_cli_fallback <= 3UL)
-		fe_progress("n1-host: live-ins fallback %lu\n",
-			g_cli_fallback);
-	free(roots);
-	free(ids);
-	free(insns);
-	free(pairs);
-	return 0;
-}
 
 static ouro_v *cli_block(ouro_env *env, ouro_v *block)
 {
 	ouro_v *facts = ouro_get(env, 0);
 	ouro_v *slots = ouro_get(env, 1);
-	ouro_v *fast = cli_try(slots, block);
-
-	if (fast != 0)
-		return fast;
-	return ouro_apply(ouro_apply(ouro_apply(g_raw_live_ins, slots), facts),
-			  block);
+	ouro_heap_context *context = ouro_heap_context_enter();
+	ouro_v *result = ouro_apply(ouro_apply(ouro_apply(g_raw_live_ins,
+		slots), facts), block);
+	return ouro_heap_context_leave(context, result);
 }
 
 static ouro_v *cli_facts(ouro_env *env, ouro_v *facts)
@@ -3428,8 +3346,6 @@ static ouro_v *cli_slots(ouro_env *env, ouro_v *slots)
 ouro_v *ouro_wrap_codegen_live_instructions(ouro_v *raw)
 {
 	g_raw_live_ins = raw;
-	g_cli_count = 0;
-	g_cli_fallback = 0;
 	return ouro_clos(cli_slots, 0);
 }
 
@@ -3846,28 +3762,36 @@ static int cgn_fn_has_roots(ouro_v *fn)
 	int cap = 0;
 	int i;
 	int field;
+	int roots = 0;
 
-	if (fn == 0 || fn->tag != 0 || fn->n < 4)
-		return 0;
+	if (fn == 0 || fn->tag != 0 || fn->n != 7)
+		return -1;
 	for (field = 2; field <= 3; field++) {
 		if (host_list_collect(OURO_F(fn, field), &items, &n, &cap) != 0) {
 			free(items);
 			return -1;
 		}
 		for (i = 0; i < n; i++) {
-			if (items[i] != 0 && items[i]->n >= 2
-			    && OURO_F(items[i], 1) != 0
-			    && OURO_F(items[i], 1)->tag == 6) {
+			ouro_v *type;
+
+			if (items[i] == 0 || items[i]->tag != 0 || items[i]->n != 2) {
 				free(items);
-				return 1;
+				return -1;
 			}
+			type = OURO_F(items[i], 1);
+			if (type == 0 || type->n != 0 || type->tag < 0 || type->tag > 6) {
+				free(items);
+				return -1;
+			}
+			if (type->tag == 6)
+				roots = 1;
 		}
 		free(items);
 		items = 0;
 		n = 0;
 		cap = 0;
 	}
-	return 0;
+	return roots;
 }
 
 static int cgn_max_list_id(ouro_v *list, int field, unsigned long *max_id)
@@ -3884,10 +3808,12 @@ static int cgn_max_list_id(ouro_v *list, int field, unsigned long *max_id)
 	for (i = 0; i < n; i++) {
 		unsigned long id;
 
-		if (items[i] == 0 || items[i]->n <= field)
-			continue;
-		if (x64enc_dec_nat(OURO_F(items[i], field), &id) == 0
-		    && id > *max_id)
+		if (items[i] == 0 || items[i]->tag != 0 || items[i]->n <= field
+		    || x64enc_dec_nat(OURO_F(items[i], field), &id) != 0) {
+			free(items);
+			return -1;
+		}
+		if (id > *max_id)
 			*max_id = id;
 	}
 	free(items);
@@ -3901,7 +3827,7 @@ static int cgn_push_allocs(ouro_v *fn, unsigned long **ids, int *n, int *cap)
 	int bcap = 0;
 	int b;
 
-	if (fn == 0 || fn->n < 7)
+	if (fn == 0 || fn->tag != 0 || fn->n != 7)
 		return -1;
 	if (host_list_collect(OURO_F(fn, 6), &blocks, &nb, &bcap) != 0) {
 		free(blocks);
@@ -3913,8 +3839,10 @@ static int cgn_push_allocs(ouro_v *fn, unsigned long **ids, int *n, int *cap)
 		int icap = 0;
 		int k;
 
-		if (blocks[b] == 0 || blocks[b]->n < 2)
-			continue;
+		if (blocks[b] == 0 || blocks[b]->tag != 0 || blocks[b]->n != 3) {
+			free(blocks);
+			return -1;
+		}
 		if (host_list_collect(OURO_F(blocks[b], 1), &insns, &ni, &icap)
 		    != 0) {
 			free(insns);
@@ -3924,11 +3852,16 @@ static int cgn_push_allocs(ouro_v *fn, unsigned long **ids, int *n, int *cap)
 		for (k = 0; k < ni; k++) {
 			unsigned long desc;
 
-			if (insns[k] == 0 || insns[k]->tag != 11
-			    || insns[k]->n < 4)
+			if (insns[k] != 0 && insns[k]->tag != 11)
 				continue;
-			if (x64enc_dec_nat(OURO_F(insns[k], 3), &desc) != 0)
-				continue;
+			if (insns[k] == 0 || insns[k]->n != 5
+			    || x64enc_dec_nat(OURO_F(insns[k], 3), &desc) != 0
+			    || *n == INT_MAX
+			    || (*n + 1 >= *cap && *cap > INT_MAX / 2)) {
+				free(insns);
+				free(blocks);
+				return -1;
+			}
 			if (!cgasm_grow((void **)ids, cap, *n + 1,
 					sizeof(unsigned long))) {
 				free(insns);
@@ -3943,194 +3876,150 @@ static int cgn_push_allocs(ouro_v *fn, unsigned long **ids, int *n, int *cap)
 	return 0;
 }
 
-static int cgn_add_alloc_descs(ouro_v *fn, unsigned char *seen, int *nuniq)
+typedef struct {
+	unsigned long id;
+	int site;
+} cgn_descriptor;
+
+static int cgn_descriptor_id_order(const void *left, const void *right)
 {
-	ouro_v **blocks = 0;
-	int nb = 0;
-	int bcap = 0;
-	int b;
+	const cgn_descriptor *a = (const cgn_descriptor *)left;
+	const cgn_descriptor *b = (const cgn_descriptor *)right;
 
-	if (fn == 0 || fn->n < 7)
-		return -1;
-	if (host_list_collect(OURO_F(fn, 6), &blocks, &nb, &bcap) != 0) {
-		free(blocks);
-		return -1;
-	}
-	for (b = 0; b < nb; b++) {
-		ouro_v **insns = 0;
-		int ni = 0;
-		int icap = 0;
-		int k;
+	if (a->id != b->id)
+		return a->id < b->id ? -1 : 1;
+	return a->site > b->site ? -1 : a->site < b->site;
+}
 
-		if (blocks[b] == 0 || blocks[b]->n < 2)
-			continue;
-		if (host_list_collect(OURO_F(blocks[b], 1), &insns, &ni, &icap)
-		    != 0) {
-			free(insns);
-			free(blocks);
-			return -1;
-		}
-		for (k = 0; k < ni; k++) {
-			unsigned long desc;
+static int cgn_descriptor_site_order(const void *left, const void *right)
+{
+	const cgn_descriptor *a = (const cgn_descriptor *)left;
+	const cgn_descriptor *b = (const cgn_descriptor *)right;
 
-			if (insns[k] == 0 || insns[k]->tag != 11
-			    || insns[k]->n < 4)
-				continue;
-			if (x64enc_dec_nat(OURO_F(insns[k], 3), &desc) != 0
-			    || desc >= 65536UL)
-				continue;
-			if (seen[desc] == 0) {
-				seen[desc] = 1;
-				(*nuniq)++;
-			}
-		}
-		free(insns);
-	}
-	free(blocks);
-	return 0;
+	return a->site < b->site ? -1 : a->site > b->site;
 }
 
 static int cgn_refresh_meta(ouro_v *program)
 {
 	ouro_v **fns = 0;
 	ouro_v **libs = 0;
-	unsigned char *seen = 0;
+	unsigned long *allocs = 0;
+	cgn_descriptor *descs = 0;
+	unsigned long *objects = 0;
+	unsigned long *all = 0;
 	unsigned long max_id = 0;
+	unsigned long entry;
 	int n = 0;
 	int cap = 0;
 	int nlib = 0;
 	int lcap = 0;
+	int nalloc = 0;
+	int acap = 0;
 	int nuniq = 0;
 	int nroot = 0;
+	int nall;
 	int i;
+	int result = -1;
 
 	if (program == g_cgn_prog && g_cgn_meta_ok)
 		return 0;
-	if (program == 0 || program->n < 3)
+	g_cgn_meta_ok = 0;
+	if (program == 0 || program->tag != 0 || program->n != 4
+	    || x64enc_dec_nat(OURO_F(program, 3), &entry) != 0)
 		return -1;
-	if (cgn_max_list_id(OURO_F(program, 0), 0, &max_id) != 0)
+	if (cgn_max_list_id(OURO_F(program, 0), 0, &max_id) != 0
+	    || cgn_max_list_id(OURO_F(program, 1), 0, &max_id) != 0)
 		return -1;
-	if (program->n >= 2
-	    && cgn_max_list_id(OURO_F(program, 1), 0, &max_id) != 0)
-		return -1;
-	if (host_list_collect(OURO_F(program, 2), &libs, &nlib, &lcap) != 0) {
-		free(libs);
-		return -1;
-	}
+	if (host_list_collect(OURO_F(program, 2), &libs, &nlib, &lcap) != 0)
+		goto done;
 	for (i = 0; i < nlib; i++) {
-		if (libs[i] != 0 && libs[i]->n >= 2
-		    && cgn_max_list_id(OURO_F(libs[i], 1), 1, &max_id) != 0) {
-			free(libs);
-			return -1;
-		}
+		if (libs[i] == 0 || libs[i]->tag != 0 || libs[i]->n != 2
+		    || cgn_max_list_id(OURO_F(libs[i], 1), 1, &max_id) != 0)
+			goto done;
 	}
-	free(libs);
-	seen = (unsigned char *)calloc(65536, 1);
-	if (seen == 0)
-		return -1;
-	if (host_list_collect(OURO_F(program, 0), &fns, &n, &cap) != 0) {
-		free(fns);
-		free(seen);
-		return -1;
-	}
-	{
-		unsigned long *fwd = 0;
-		unsigned long *rev = 0;
-		int nf = 0;
-		int fcap = 0;
-		int nr = 0;
-		int j;
+	if (host_list_collect(OURO_F(program, 0), &fns, &n, &cap) != 0)
+		goto done;
+	if (max_id > ULONG_MAX - 2UL
+	    || (n > 0 && max_id > ULONG_MAX - 2UL - (unsigned long)n))
+		goto done;
+	for (i = 0; i < n; i++) {
+		int roots = cgn_fn_has_roots(fns[i]);
 
+		if (roots < 0 || cgn_push_allocs(fns[i], &allocs, &nalloc, &acap) != 0)
+			goto done;
+		if (roots)
+			nroot++;
+	}
+	if (nalloc > 0) {
+		if ((size_t)nalloc > (size_t)-1 / sizeof *descs)
+			goto done;
+		descs = (cgn_descriptor *)malloc((size_t)nalloc * sizeof *descs);
+		if (descs == 0)
+			goto done;
+		for (i = 0; i < nalloc; i++) {
+			descs[i].id = allocs[i];
+			descs[i].site = i;
+		}
+		/* Ouro foldr/mir_add retains each ID at its last occurrence. */
+		qsort(descs, (size_t)nalloc, sizeof *descs, cgn_descriptor_id_order);
+		for (i = 0; i < nalloc; i++) {
+			if (nuniq == 0 || descs[i].id != descs[nuniq - 1].id)
+				descs[nuniq++] = descs[i];
+		}
+		qsort(descs, (size_t)nuniq, sizeof *descs, cgn_descriptor_site_order);
+	}
+	if (nroot > INT_MAX - nuniq)
+		goto done;
+	nall = nuniq + nroot;
+	if ((unsigned long)nall > (ULONG_MAX - 40UL) / 16UL
+	    || (size_t)nall > (size_t)-1 / sizeof *all)
+		goto done;
+	if (nuniq > 0) {
+		objects = (unsigned long *)malloc((size_t)nuniq * sizeof *objects);
+		if (objects == 0)
+			goto done;
+		for (i = 0; i < nuniq; i++)
+			objects[i] = descs[i].id;
+	}
+	if (nall > 0) {
+		int next = nuniq;
+
+		all = (unsigned long *)malloc((size_t)nall * sizeof *all);
+		if (all == 0)
+			goto done;
+		for (i = 0; i < nuniq; i++)
+			all[i] = objects[i];
 		for (i = 0; i < n; i++) {
 			int roots = cgn_fn_has_roots(fns[i]);
 
-			if (roots < 0 || cgn_push_allocs(fns[i], &fwd, &nf,
-							&fcap) != 0
-			    || cgn_add_alloc_descs(fns[i], seen, &nuniq) != 0) {
-				free(fns);
-				free(seen);
-				free(fwd);
-				return -1;
-			}
+			if (roots < 0)
+				goto done;
 			if (roots)
-				nroot++;
+				all[next++] = max_id + 3UL + (unsigned long)i;
 		}
-		rev = (unsigned long *)malloc(sizeof(unsigned long)
-					      * (unsigned long)(nf + n + 1));
-		if ((nf > 0 && rev == 0) || (n + nf > 0 && rev == 0)) {
-			free(fns);
-			free(seen);
-			free(fwd);
-			free(rev);
-			return -1;
-		}
-		memset(seen, 0, 65536);
-		for (i = nf - 1; i >= 0; i--) {
-			unsigned long desc = fwd[i];
-
-			if (desc >= 65536UL || seen[desc])
-				continue;
-			seen[desc] = 1;
-			rev[nr++] = desc;
-		}
-		free(g_cgn_objects);
-		free(g_cgn_alldesc);
-		g_cgn_objects = 0;
-		g_cgn_alldesc = 0;
-		g_cgn_nobj = nr;
-		if (nr > 0) {
-			g_cgn_objects = (unsigned long *)malloc(
-				sizeof(unsigned long) * (unsigned long)nr);
-			if (g_cgn_objects == 0) {
-				free(fns);
-				free(seen);
-				free(fwd);
-				free(rev);
-				return -1;
-			}
-			for (j = 0; j < nr; j++)
-				g_cgn_objects[j] = rev[nr - 1 - j];
-		}
-		g_cgn_nall = nr + nroot;
-		if (g_cgn_nall > 0) {
-			g_cgn_alldesc = (unsigned long *)malloc(
-				sizeof(unsigned long)
-				* (unsigned long)g_cgn_nall);
-			if (g_cgn_alldesc == 0) {
-				free(fns);
-				free(seen);
-				free(fwd);
-				free(rev);
-				return -1;
-			}
-			for (j = 0; j < nr; j++)
-				g_cgn_alldesc[j] = g_cgn_objects[j];
-			{
-				int s = nr;
-
-				for (i = 0; i < n; i++) {
-					int roots = cgn_fn_has_roots(fns[i]);
-
-					if (roots > 0)
-						g_cgn_alldesc[s++] =
-							max_id + 3UL
-							+ (unsigned long)i;
-				}
-			}
-		}
-		free(fwd);
-		free(rev);
 	}
-	if (program->n >= 4
-	    && x64enc_dec_nat(OURO_F(program, 3), &g_cgn_entry) != 0)
-		g_cgn_entry = 0;
-	free(fns);
-	free(seen);
+	free(g_cgn_objects);
+	free(g_cgn_alldesc);
+	g_cgn_objects = objects;
+	g_cgn_alldesc = all;
+	objects = 0;
+	all = 0;
+	g_cgn_nobj = nuniq;
+	g_cgn_nall = nall;
+	g_cgn_entry = entry;
 	g_cgn_prog = program;
 	g_cgn_runtime_id = max_id + 2UL;
-	g_cgn_budget_off = 40UL + 16UL * (unsigned long)(nuniq + nroot);
+	g_cgn_budget_off = 40UL + 16UL * (unsigned long)nall;
 	g_cgn_meta_ok = 1;
-	return 0;
+	result = 0;
+done:
+	free(fns);
+	free(libs);
+	free(allocs);
+	free(descs);
+	free(objects);
+	free(all);
+	return result;
 }
 
 static ouro_v *cgn_sym(unsigned long id)
@@ -4842,12 +4731,13 @@ static unsigned long g_cgb_fallback;
 static ouro_v *g_raw_cgb;
 
 static ouro_v *cgb_try(ouro_v *program, ouro_v *slots, ouro_v *allocv,
-		       ouro_v *blocksv, ouro_v *block)
+		       ouro_v *facts, ouro_v *blocksv, ouro_v *block)
 {
 	unsigned long allocation;
 	unsigned long id;
 	unsigned long site;
 	ouro_v **insns = 0;
+	ouro_v **annotated = 0;
 	ouro_v **blocks = 0;
 	ouro_v *atoms;
 	ouro_v *part;
@@ -4855,6 +4745,8 @@ static ouro_v *cgb_try(ouro_v *program, ouro_v *slots, ouro_v *allocv,
 	int cap = 0;
 	int nblocks = 0;
 	int bcap = 0;
+	int nannotated = 0;
+	int acap = 0;
 	int i;
 
 	if (block == 0 || block->n < 3
@@ -4870,6 +4762,22 @@ static ouro_v *cgb_try(ouro_v *program, ouro_v *slots, ouro_v *allocv,
 		free(blocks);
 		return 0;
 	}
+	part = ouro_apply(ouro_apply(ouro_apply(
+		FIND(lo, "codegen_live_instructions"), slots), facts), block);
+	if (part != 0 && part->tag == 0 && part->n == 1) {
+		free(insns);
+		free(blocks);
+		return part;
+	}
+	if (part == 0 || part->tag != 1 || part->n != 1
+	    || host_list_collect(OURO_F(part, 0), &annotated,
+				 &nannotated, &acap) != 0
+	    || nannotated != n) {
+		free(insns);
+		free(blocks);
+		free(annotated);
+		return 0;
+	}
 	atoms = cgn_one(cgn_mark_block(id));
 	for (i = 0; i < n; i++) {
 		ouro_v *ins = insns[i];
@@ -4877,6 +4785,14 @@ static ouro_v *cgb_try(ouro_v *program, ouro_v *slots, ouro_v *allocv,
 		int acap = 0;
 		ouro_v **args = 0;
 		unsigned long dest;
+		ouro_v *annotation = annotated[i];
+
+		if (annotation == 0 || annotation->tag != 0 || annotation->n != 2) {
+			free(insns);
+			free(blocks);
+			free(annotated);
+			return 0;
+		}
 
 		site = (unsigned long)i;
 		if (ins != 0 && ins->tag == 10 && ins->n >= 4
@@ -4895,18 +4811,28 @@ static ouro_v *cgb_try(ouro_v *program, ouro_v *slots, ouro_v *allocv,
 			if (part == 0) {
 				free(insns);
 				free(blocks);
+				free(annotated);
 				return 0;
 			}
 			atoms = cgn_cat(atoms, part);
 			free(insns);
 			free(blocks);
+			free(annotated);
 			return cgn_right(atoms);
 		}
 		free(args);
+		if (ins != 0 && (ins->tag == 11
+		    || (ins->tag == 10 && ins->n >= 1
+			&& OURO_F(ins, 0) != 0 && OURO_F(ins, 0)->tag == 1))) {
+			part = ouro_apply(ouro_apply(FIND(lo, "codegen_clear_dead_roots"),
+				slots), OURO_F(annotation, 1));
+			atoms = cgn_cat(atoms, part);
+		}
 		part = cgb_ins_atoms(program, slots, id, site, ins);
 		if (part == 0) {
 			free(insns);
 			free(blocks);
+			free(annotated);
 			return 0;
 		}
 		atoms = cgn_cat(atoms, part);
@@ -4915,6 +4841,7 @@ static ouro_v *cgb_try(ouro_v *program, ouro_v *slots, ouro_v *allocv,
 			OURO_F(block, 2));
 	free(insns);
 	free(blocks);
+	free(annotated);
 	if (part == 0)
 		return 0;
 	return cgn_right(cgn_cat(atoms, part));
@@ -4922,8 +4849,9 @@ static ouro_v *cgb_try(ouro_v *program, ouro_v *slots, ouro_v *allocv,
 
 static ouro_v *cgb_block(ouro_env *env, ouro_v *block)
 {
-	ouro_v *fast = cgb_try(ouro_get(env, 3), ouro_get(env, 2),
-			       ouro_get(env, 1), ouro_get(env, 0), block);
+	ouro_v *fast = cgb_try(ouro_get(env, 4), ouro_get(env, 3),
+			       ouro_get(env, 2), ouro_get(env, 1),
+			       ouro_get(env, 0), block);
 
 	if (fast != 0) {
 		g_cgb_count++;
@@ -4934,9 +4862,9 @@ static ouro_v *cgb_block(ouro_env *env, ouro_v *block)
 	g_cgb_fallback++;
 	if (g_cgb_fallback <= 8UL)
 		fe_progress("n1-host: blk fallback n=%lu\n", g_cgb_fallback);
-	return ouro_apply(ouro_apply(ouro_apply(ouro_apply(ouro_apply(
-		g_raw_cgb, ouro_get(env, 3)), ouro_get(env, 2)),
-		ouro_get(env, 1)), ouro_get(env, 0)), block);
+	return ouro_apply(ouro_apply(ouro_apply(ouro_apply(ouro_apply(ouro_apply(
+		g_raw_cgb, ouro_get(env, 4)), ouro_get(env, 3)),
+		ouro_get(env, 2)), ouro_get(env, 1)), ouro_get(env, 0)), block);
 }
 
 static ouro_v *cgb_blocks(ouro_env *env, ouro_v *blocks)
@@ -4946,8 +4874,7 @@ static ouro_v *cgb_blocks(ouro_env *env, ouro_v *blocks)
 
 static ouro_v *cgb_facts(ouro_env *env, ouro_v *facts)
 {
-	(void)facts;
-	return ouro_clos(cgb_blocks, env);
+	return ouro_clos(cgb_blocks, ouro_cons(facts, env));
 }
 
 static ouro_v *cgb_alloc(ouro_env *env, ouro_v *allocation)
@@ -5161,6 +5088,7 @@ static ouro_v *cgb_body_try(ouro_v *program, ouro_v *function, ouro_v *frame)
 	ouro_v **blks = 0;
 	ouro_v *atoms;
 	ouro_v *part;
+	ouro_v *facts = ouro_ctor(0, 0, 0);
 	int n = 0;
 	int cap = 0;
 	int i;
@@ -5199,6 +5127,7 @@ static ouro_v *cgb_body_try(ouro_v *program, ouro_v *function, ouro_v *frame)
 		}
 		if (analyzed == 0 || analyzed->tag != 1 || analyzed->n != 1)
 			return 0;
+		facts = OURO_F(analyzed, 0);
 	}
 	atoms = cgb_zero_roots(slots);
 	part = cgb_spill(slots, allocation, OURO_F(function, 2));
@@ -5223,7 +5152,7 @@ static ouro_v *cgb_body_try(ouro_v *program, ouro_v *function, ouro_v *frame)
 		return 0;
 	}
 	for (i = 0; i < n; i++) {
-		part = cgb_try(program, slots, ouro_nat(allocation), blocks,
+		part = cgb_try(program, slots, ouro_nat(allocation), facts, blocks,
 			       blks[i]);
 		if (part == 0 || part->tag != 1 || part->n < 1) {
 			free(blks);
