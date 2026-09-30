@@ -893,7 +893,6 @@ int main(int argc, char **argv)
 		return 0;
 	}
 
-	cores = OURO_F(res, 0);
 	{
 		ouro_v **ids = 0;
 		ouro_v **terms = 0;
