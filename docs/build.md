@@ -384,6 +384,9 @@ artifact emission instead of being accepted as a valid prefix.
 `scripts/frontend_regen.py` regenerates frontend C from Ouro compiler sources.
 Its cache keys cover the seed compiler, source and import contents, generator
 and helper versions, fuel, and output packing inputs.
+Each cached translation unit and packed frontend also requires a matching
+input-key and output-hash receipt. Missing, malformed, or stale receipts cause
+regeneration; a cached translation unit must retain its module export table.
 
 A regeneration writes a JSON report under `_build/` with cache decisions,
 timings, and output hashes. The split frontend includes the declaration-checker

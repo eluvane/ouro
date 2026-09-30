@@ -62,6 +62,12 @@ dependent motives, branch types and coverage, and fixpoint metadata. Conversion
 compares semantic fixpoint metadata such as arity and structural-argument index;
 renaming a display binder does not change conversion.
 
+Only leading lambda parameters identify a fixpoint's structural input. The
+termination walk records that binder when it enters scope; annotations, local
+bindings, case fields, and nested binders cannot stand in for an input that has
+not been introduced. A nonrecursive body may still return a function without
+an explicit lambda prefix.
+
 An immediately applied nested fixpoint may inherit a strict-subterm witness
 from its initial structural argument. The application must supply at least its
 declared arity, and that argument must already be smaller than the enclosing

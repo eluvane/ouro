@@ -68,6 +68,18 @@ PASS record callback carries compiler-owned alias metadata
 PASS text-only record wrapper cannot drop required alias metadata
 PASS preprocessors share successful source value
 PASS preprocessor error crosses pipeline callback
+PASS checked erasure resolves a global universe alias
+PASS checked erasure resolves a local universe alias
+PASS checked erasure keeps Nat alias data binders
+PASS checked erasure respects local universe alias shadowing
+PASS checked erasure drops beta computed type arguments
+PASS checked erasure drops let computed type arguments
+PASS checked erasure drops closed case computed type arguments
+PASS checked erasure retains beta computed data arguments
+PASS checked erasure retains let computed data arguments
+PASS checked erasure retains polymorphic functions as values
+PASS checked erasure reports exhausted preparation
+PASS checked erasure reports an unsupported residual type computation
 COMPILER_ABI: PASS
 """
 PROBE = '''import "std/data.ouro";

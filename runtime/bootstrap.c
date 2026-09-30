@@ -947,7 +947,14 @@ int main(int argc, char **argv)
 		if (getenv("OURO_EMIT_IO_SHIMS") != 0 && ouro_fe_last_intern() != 0)
 			intern_perm = ouro_clone_perm(ouro_fe_last_intern());
 		recover_names_from_intern(ouro_fe_last_intern(), &tab, &ntab);
-		cores = ouro_clone_perm(cores);
+		metadata = ouro_fe_checked_emission_cores(ouro_nat(fuel));
+		if (metadata == 0 || metadata->tag != 1 || metadata->n != 1) {
+			fputs("ouro1: checked erasure preparation failed\n", stderr);
+			report_checked_error(metadata);
+			backend_failed = 1;
+			goto backend_done;
+		}
+		cores = ouro_clone_perm(OURO_F(metadata, 0));
 		if (cores == 0) {
 			fputs("ouro1: clone cores failed\n", stderr);
 			backend_failed = 1;

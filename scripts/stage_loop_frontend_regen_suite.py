@@ -210,6 +210,67 @@ def test_frontend_final_and_tu_cache(tmp: Path) -> None:
     report = json.loads((repo / "_build/test_fe/frontend-regeneration.json").read_text(encoding="utf-8"))
     assert report["summary"]["tu_hits"] > 0 and report["summary"]["tu_misses"] == delta
 
+    expected = output.read_bytes()
+
+    def invalidate_outer_results() -> None:
+        for cached in (repo / "_cache_test/gen/frontend-final").glob("driver_*"):
+            cached.unlink()
+        (repo / "_build/test_fe/frontend-regeneration.json").unlink()
+        output.unlink()
+
+    def current_report() -> dict:
+        return json.loads((repo / "_build/test_fe/frontend-regeneration.json").read_text(encoding="utf-8"))
+
+    unit = report["units"][0]
+    tu_cache = repo / "_cache_test/gen/frontend-tu" / f"{unit['module']}_{unit['key']}.c"
+    for damage in ("bytes", "missing", "malformed", "wrong-key", "invalid-export"):
+        metadata = tu_cache.with_suffix(".json")
+        if damage == "bytes":
+            tu_cache.write_text("CORRUPT TU\n", encoding="utf-8")
+        elif damage == "missing":
+            metadata.unlink()
+        elif damage == "malformed":
+            metadata.write_text("{broken", encoding="utf-8")
+        elif damage == "wrong-key":
+            receipt = json.loads(metadata.read_text(encoding="utf-8"))
+            receipt["input_key"] = "wrong"
+            metadata.write_text(json.dumps(receipt), encoding="utf-8")
+        else:
+            tu_cache.write_text("no export table\n", encoding="utf-8")
+            frontend_regen.record_cached_output(tu_cache, unit["key"])
+        invalidate_outer_results()
+        before = count_lines(log)
+        run(repo, common, env)
+        repaired = current_report()
+        assert repaired["summary"]["tu_misses"] == 1, (damage, repaired)
+        assert count_lines(log) == before + 1, damage
+        assert output.read_bytes() == expected, damage
+        assert frontend_regen.cached_output_matches(tu_cache, unit["key"]), damage
+
+    pack_key = current_report()["pack_key"]
+    pack_cache = repo / "_cache_test/gen/frontend-pack" / f"driver_{pack_key}.c"
+    for damage in ("bytes", "missing", "malformed", "wrong-key"):
+        metadata = pack_cache.with_suffix(".json")
+        if damage == "bytes":
+            pack_cache.write_text("CORRUPT PACK\n", encoding="utf-8")
+        elif damage == "missing":
+            metadata.unlink()
+        elif damage == "malformed":
+            metadata.write_text("[]", encoding="utf-8")
+        else:
+            receipt = json.loads(metadata.read_text(encoding="utf-8"))
+            receipt["input_key"] = "wrong"
+            metadata.write_text(json.dumps(receipt), encoding="utf-8")
+        invalidate_outer_results()
+        before = count_lines(log)
+        run(repo, common, env)
+        repaired = current_report()
+        assert repaired["summary"]["tu_hits"] == EXPECTED_FRONTEND_TUS, (damage, repaired)
+        assert repaired["summary"]["pack_cache"] == "miss", (damage, repaired)
+        assert count_lines(log) == before, damage
+        assert output.read_bytes() == expected and pack_cache.read_bytes() == expected, damage
+        assert frontend_regen.cached_output_matches(pack_cache, pack_key), damage
+
 
 def test_stage_loop_input_fast_path(tmp: Path) -> None:
     repo = tmp / "stage_repo"

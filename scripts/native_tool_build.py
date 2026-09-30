@@ -60,6 +60,7 @@ HOST_HOOKS = (
     ("cm_prepare_expanded", "ouro_wrap_quality_pure", ("tools/clippy/structural_frontend.ouro",)),
     ("cm_lex_expanded", "ouro_wrap_quality_pure", ("tools/clippy/structural_frontend.ouro",)),
     ("next_import_token", "ouro_wrap_import_token", ("compiler/lexer.ouro",)),
+    ("next_import_token_indexed", "ouro_wrap_import_token", ("compiler/lexer.ouro",)),
     ("span_expr", "ouro_wrap_settled3", ("compiler/source_spans.ouro",)),
     # Import preprocessing rewrites the whole file. One lint cone keeps every
     # rewrite unless this entry returns only the selected names.

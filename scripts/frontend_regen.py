@@ -242,6 +242,27 @@ def read_manifest(path: Path) -> Optional[dict]:
         return None
 
 
+def cached_output_matches(path: Path, key: str) -> bool:
+    metadata = read_manifest(path.with_suffix(".json"))
+    return bool(
+        metadata is not None
+        and metadata.get("kind") == "ouro.frontend-cache-output.v1"
+        and metadata.get("input_key") == key
+        and isinstance(metadata.get("output_sha256"), str)
+        and path.is_file()
+        and path.stat().st_size > 0
+        and sha256_file(path) == metadata["output_sha256"]
+    )
+
+
+def record_cached_output(path: Path, key: str) -> None:
+    write_json_atomic(path.with_suffix(".json"), {
+        "kind": "ouro.frontend-cache-output.v1",
+        "input_key": key,
+        "output_sha256": sha256_file(path),
+    })
+
+
 def emit_one(
     *,
     ouro1: Path,
@@ -261,7 +282,8 @@ def emit_one(
     out = work / file_name
     err = work / f"{tag}.err"
     cache_file = tu_cache / f"{mod}_{key}.c"
-    if cache_enabled and cache_file.is_file() and cache_file.stat().st_size > 0:
+    if (cache_enabled and cached_output_matches(cache_file, key)
+            and f"ouro_export_count{mod}" in read_required_text(cache_file, "cached frontend unit")):
         copy_atomic(cache_file, out)
         err.write_text("", encoding="utf-8")
         return TuReport(tag, mod, root, len(units), key, "hit", out.stat().st_size, t.elapsed())
@@ -285,6 +307,7 @@ def emit_one(
     os.replace(tmp_err, err)
     if cache_enabled:
         copy_atomic(out, cache_file)
+        record_cached_output(cache_file, key)
     return TuReport(tag, mod, root, len(units), key, "miss", out.stat().st_size, t.elapsed())
 
 
@@ -514,7 +537,7 @@ def regenerate(
     pack_timer = Timer()
     pack_status = "disabled"
     output_status = "updated"
-    if cache_enabled and pack_cache.is_file() and pack_cache.stat().st_size > 0:
+    if cache_enabled and cached_output_matches(pack_cache, pkey):
         pack_status = "hit"
         if out_c.exists() and filecmp.cmp(pack_cache, out_c, shallow=False):
             output_status = "unchanged"
@@ -529,6 +552,7 @@ def regenerate(
         output_status = install_if_changed(tmp, out_c)
         if cache_enabled:
             copy_atomic(out_c, pack_cache)
+            record_cached_output(pack_cache, pkey)
     phases.append({"name": "pack", "elapsed_s": round(pack_timer.elapsed(), 6)})
 
     if cache_enabled:

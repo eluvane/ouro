@@ -86,6 +86,11 @@ declarations and emission metadata for diagnostic comparisons.
 `compiler/native/lower_boundary.ouro` rechecks supplied declarations and
 metadata before native lowering, including a publicly constructed wrapper.
 
+`compiler/erasure_checked.ouro` derives emission bodies with normalized sort
+annotations and computed type arguments using the canonical checker operations.
+This view never replaces checked declarations or diagnostic snapshots. Resource,
+reduction and unsupported residual type-computation failures stop emission.
+
 The static gate restricts references to `CheckedProgramOf` in compiler sources
 to those four modules. References to `DeclarationsOk` are restricted to
 `compiler/file_check_model.ouro`, `compiler/file_elab.ouro`,

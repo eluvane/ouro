@@ -566,8 +566,10 @@ scratch_status=$?
 set -e
 if [ "$scratch_status" -eq 0 ] && [ ! -s "$OUT/scratch-failure.err" ] &&
 	"$PYTHON" - "$OUT/scratch-failure.out" "$SCRATCH_URI" <<'PY'
-import json, pathlib, sys
-messages = [json.loads(line) for line in pathlib.Path(sys.argv[1]).read_text(encoding="utf-8").splitlines() if line.startswith("{")]
+import pathlib, sys
+sys.path.insert(0, str(pathlib.Path("scripts").resolve()))
+from ourosmith.surface.tools import responses
+messages = responses(pathlib.Path(sys.argv[1]).read_bytes().decode("utf-8"))
 publications = [m["params"]["diagnostics"] for m in messages
                 if m.get("method") == "textDocument/publishDiagnostics" and m["params"]["uri"] == sys.argv[2]]
 assert len(publications) == 3, publications

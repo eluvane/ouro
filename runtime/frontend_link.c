@@ -193,6 +193,17 @@ ouro_v *ouro_fe_checked_c_shims(void)
 	return ouro_apply(FIND(pl, "checked_program_c_shims"), g_last_checked_program);
 }
 
+ouro_v *ouro_fe_checked_emission_cores(ouro_v *fuel)
+{
+	ouro_v *fn;
+	if (g_last_checked_program == 0)
+		return cerr(49, 0);
+	fn = ouro_apply(FIND(pl, "checked_program_emission_cores_indexed"),
+			FIND(pl, "erasure_prepare_closed_indexed"));
+	fn = ouro_apply(fn, FIND(fc, "whnf_checked_indexed"));
+	return ouro_apply(ouro_apply(fn, fuel), g_last_checked_program);
+}
+
 /* The C host retains the checked value but does not interpret its entries.
    Only the explicit legacy projection is returned to old C consumers. */
 static ouro_v *publish_checked_result(ouro_v *result)
@@ -581,7 +592,7 @@ static ouro_v *bounded_call(ouro_v *fn, int count, ouro_v **args,
 
 static ouro_v *bounded_token_state(ouro_env *env, ouro_v *st)
 {
-	return bounded_call(FIND(lx, "next_import_token"), 3,
+	return bounded_call(FIND(lx, "next_import_token_indexed"), 3,
 		(ouro_v *[]){ouro_get(env, 1), ouro_get(env, 0), st},
 		ouro_clone_perm);
 }
@@ -636,7 +647,7 @@ static ouro_v *closed_parse_unit(void)
 		return g_closed_parse_unit;
 	ouro_static_begin();
 	fn = FIND(pl, "parse_unit");
-	fn = ouro_apply(fn, ouro_apply(FIND(lx, "lex_go_with"),
+	fn = ouro_apply(fn, ouro_apply(FIND(lx, "lex_go_indexed_with"),
 		ouro_clos(bounded_token_fuel, 0)));
 	fn = ouro_apply(fn, FIND(lx, "intern_string"));
 	fn = ouro_apply(fn, closed_parse_file_visibility());

@@ -1,0 +1,164 @@
+-- Derive an emission-only Core view from checked declarations. Local values
+-- stay transparent to these probes; the accepted program is never replaced.
+import "erasure.ouro",
+  "file_refine_scope.ouro",
+  "file_check_result.ouro";
+
+def erasure_normal_indexed (fuel : Nat) (environment : CheckEnvironment)
+    (scope : RefineScope) (term : CoreTerm) : CheckResult CoreTerm :=
+    check_from_normalize(CoreTerm,
+      whnf_checked_indexed fuel environment (refine_scope_expand scope term));
+
+def erasure_annotation_normal_indexed (fuel : Nat) (environment : CheckEnvironment)
+    (scope : RefineScope) (annotation : CoreTerm) : CheckResult CoreTerm :=
+    check_map CoreTerm CoreTerm
+      (fun (normal : CoreTerm) => match is_sort_ann normal with
+        | True => normal | False => annotation end)
+      (erasure_normal_indexed fuel environment scope annotation);
+
+def erasure_annotation_indexed (fuel : Nat) (environment : CheckEnvironment)
+    (scope : RefineScope) (annotation : CoreTerm) : CheckResult CoreTerm :=
+    match annotation with
+    | CSort _ => CheckOk CoreTerm annotation
+    | CInd _ => CheckOk CoreTerm annotation
+    | CPi _ _ => CheckOk CoreTerm annotation
+    | CRel _ => erasure_annotation_normal_indexed fuel environment scope annotation
+    | CConst _ => erasure_annotation_normal_indexed fuel environment scope annotation
+    | CApp _ _ => erasure_annotation_normal_indexed fuel environment scope annotation
+    | CLetIn _ _ _ => erasure_annotation_normal_indexed fuel environment scope annotation
+    | CCase _ _ _ _ => erasure_annotation_normal_indexed fuel environment scope annotation
+    | CLam _ _ => CheckOk CoreTerm annotation
+    | CConstruct _ _ _ => CheckOk CoreTerm annotation
+    | CFix _ _ _ _ _ => CheckOk CoreTerm annotation
+    | CStrLit _ _ => CheckOk CoreTerm annotation
+    | CStrBytes _ _ => CheckOk CoreTerm annotation
+    end;
+
+-- An inductive result cannot become a sort by substituting application
+-- arguments. This avoids repeating inference for ordinary data-producing calls.
+def erasure_data_head : CoreTerm -> Bool :=
+  fix data_head (term : CoreTerm) : Bool :=
+    match term with
+    | CInd _ => True | CApp function _ => data_head function
+    | CRel _ => False | CSort _ => False | CPi _ _ => False | CLam _ _ => False
+    | CLetIn _ _ _ => False | CConst _ => False | CConstruct _ _ _ => False
+    | CCase _ _ _ _ => False | CFix _ _ _ _ _ => False
+    | CStrLit _ _ => False | CStrBytes _ _ => False
+    end;
+
+def erasure_data_result : CoreTerm -> Bool :=
+  fix data_result (annotation : CoreTerm) : Bool :=
+    match annotation with
+    | CPi _ body => data_result body
+    | CRel _ => False | CSort _ => False | CInd _ => True
+    | CApp function _ => erasure_data_head function
+    | CLam _ _ => False | CLetIn _ _ _ => False | CConst _ => False
+    | CConstruct _ _ _ => False | CCase _ _ _ _ => False | CFix _ _ _ _ _ => False
+    | CStrLit _ _ => False | CStrBytes _ _ => False
+    end;
+
+def erasure_computed_head (environment : CheckEnvironment) (scope : RefineScope)
+    : CoreTerm -> Bool :=
+  fix computed (term : CoreTerm) : Bool :=
+    match term with
+    | CApp function _ => computed function
+    | CConst name => match check_environment_type name environment with
+        | Nothing => True | Just annotation => notb (erasure_data_result annotation) end
+    | CRel index => match lookup_ctx (refine_scope_context scope) index with
+        | Nothing => True | Just annotation => notb (erasure_data_result annotation) end
+    | CLam _ _ => True | CLetIn _ _ _ => True | CCase _ _ _ _ => True
+    | CFix _ _ _ annotation _ => notb (erasure_data_result annotation)
+    | CSort _ => False | CPi _ _ => False | CInd _ => False
+    | CConstruct _ _ _ => False | CStrLit _ _ => False | CStrBytes _ _ => False
+    end;
+
+def erasure_computed_argument (environment : CheckEnvironment) (scope : RefineScope)
+    (argument : CoreTerm) : Bool :=
+    match argument with
+    | CApp function _ => erasure_computed_head environment scope function
+    | CLetIn _ _ _ => True | CCase _ _ _ _ => True
+    | CFix _ _ _ annotation _ => notb (erasure_data_result annotation)
+    | CRel _ => False | CSort _ => False | CPi _ _ => False | CLam _ _ => False
+    | CConst _ => False | CInd _ => False | CConstruct _ _ _ => False
+    | CStrLit _ _ => False | CStrBytes _ _ => False
+    end;
+
+def erasure_argument_indexed (fuel : Nat) (environment : CheckEnvironment)
+    (types : List Nat) (scope : RefineScope) (binders : List BEntry)
+    (argument : CoreTerm) : CheckResult CoreTerm :=
+    match is_type_arg_ctx_with types argument binders with
+    | True => CheckOk CoreTerm argument
+    | False => match erasure_computed_argument environment scope argument with
+        | False => CheckOk CoreTerm argument
+        | True => check_bind CoreTerm CoreTerm
+            (refine_scope_infer_indexed fuel environment scope argument)
+            (fun (annotation : CoreTerm) => check_bind CoreTerm CoreTerm
+              (erasure_normal_indexed fuel environment scope annotation)
+              (fun (normal_type : CoreTerm) => match is_sort_ann normal_type with
+                | False => CheckOk CoreTerm argument
+                | True => check_bind CoreTerm CoreTerm
+                    (erasure_normal_indexed fuel environment scope argument)
+                    (fun (normal : CoreTerm) => match is_type_arg_ctx_with types normal binders with
+                      | True => CheckOk CoreTerm normal
+                      | False => CheckErr CoreTerm (CheckUnsupported 1)
+                      end)
+                end))
+        end
+    end;
+
+def erasure_prepare_indexed (environment : CheckEnvironment) (types : List Nat)
+    : Nat -> RefineScope -> List BEntry -> CoreTerm -> CheckResult CoreTerm :=
+  fix prepare (fuel : Nat) (scope : RefineScope) (binders : List BEntry)
+      (term : CoreTerm) : CheckResult CoreTerm :=
+    match fuel with
+    | Z => CheckErr CoreTerm CheckResourceLimit
+    | S next =>
+        let child (value : CoreTerm) : CheckResult CoreTerm := prepare next scope binders value in
+        let annotation : CoreTerm -> CheckResult CoreTerm :=
+          erasure_annotation_indexed next environment scope in
+        let assume (original : CoreTerm) (normal : CoreTerm) (body : CoreTerm)
+            : CheckResult CoreTerm :=
+          prepare next (refine_scope_assume scope original)
+            (Cons BEntry (MkB 0 (is_sort_ann normal)) binders) body in
+        match term with
+        | CRel _ => CheckOk CoreTerm term | CSort _ => CheckOk CoreTerm term
+        | CConst _ => CheckOk CoreTerm term | CInd _ => CheckOk CoreTerm term
+        | CConstruct _ _ _ => CheckOk CoreTerm term
+        | CStrLit _ _ => CheckOk CoreTerm term | CStrBytes _ _ => CheckOk CoreTerm term
+        | CPi _ _ => CheckOk CoreTerm term
+        | CLam typ body => check_bind CoreTerm CoreTerm (annotation typ)
+            (fun (normal : CoreTerm) => check_map(CoreTerm, CoreTerm,
+              fun (prepared : CoreTerm) => CLam normal prepared, assume typ normal body))
+        | CApp function argument => check_bind CoreTerm CoreTerm
+            (erasure_argument_indexed next environment types scope binders argument)
+            (fun (normal : CoreTerm) => check_bind CoreTerm CoreTerm (child function)
+              (fun (prepared_function : CoreTerm) => check_map(CoreTerm, CoreTerm,
+                fun (prepared_argument : CoreTerm) => CApp prepared_function prepared_argument,
+                child normal)))
+        | CLetIn value typ body => check_bind CoreTerm CoreTerm (annotation typ)
+            (fun (normal : CoreTerm) => check_bind CoreTerm CoreTerm (child value)
+              (fun (prepared_value : CoreTerm) => check_map(CoreTerm, CoreTerm,
+                fun (prepared_body : CoreTerm) => CLetIn prepared_value normal prepared_body,
+                prepare next (refine_scope_define scope typ value)
+                  (Cons BEntry (MkB 0 (is_sort_ann normal)) binders) body)))
+        | CFix name argument arity typ body => check_map(CoreTerm, CoreTerm,
+            fun (prepared : CoreTerm) => CFix name argument arity typ prepared,
+            prepare next (refine_scope_assume scope typ)
+              (Cons BEntry (MkB 0 False) binders) body)
+        | CCase info predicate scrutinee branches => check_bind CoreTerm CoreTerm (child scrutinee)
+            (fun (prepared_scrutinee : CoreTerm) => check_map (List CoreTerm) CoreTerm
+              (fun (prepared_branches : List CoreTerm) => CCase info predicate prepared_scrutinee prepared_branches)
+              ((fix visit (rest : List CoreTerm) : CheckResult (List CoreTerm) :=
+                match rest with
+                | Nil => CheckOk(List CoreTerm, Nil CoreTerm)
+                | Cons branch tail => check_bind CoreTerm (List CoreTerm) (child branch)
+                    (fun (prepared : CoreTerm) => check_map(List CoreTerm, List CoreTerm,
+                      fun (remaining : List CoreTerm) => Cons CoreTerm prepared remaining, visit tail))
+                end) branches))
+        end
+    end;
+
+def erasure_prepare_closed_indexed (fuel : Nat) (environment : CheckEnvironment)
+    (types : List Nat) (term : CoreTerm) : CheckResult CoreTerm :=
+    erasure_prepare_indexed environment types fuel
+      (refine_scope_from_context (Nil CoreTerm)) (Nil BEntry) term;
