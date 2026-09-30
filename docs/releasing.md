@@ -104,7 +104,10 @@ runs skip validation, packaging, and publication. This cycle continues across
 month and year boundaries. Push an annotated `v<version>` tag after the candidate
 checks and package review. A tag run creates a draft GitHub Release and uploads
 the ten host archives, manifest, and checksums. GitHub generates the draft's
-notes from merged PRs using `.github/release.yml`.
+notes from merged PRs using `.github/release.yml`, starting at the highest
+canonical `vX.Y.Z` ancestor other than the current tag. Snapshot and weekly
+tags do not select that starting point. Without a previous version tag,
+GitHub chooses the first draft's comparison automatically.
 
 A maintainer reviews the draft's notes, checksums, validation reports,
 security status, and generated-artifact hashes before publication.

@@ -45,6 +45,7 @@ PR_GROUPS: dict[str, tuple[str, ...]] = {
         "ci-runner-selftest",
         "github-workflow-gate",
         "github-project-gate",
+        "host-bound-inventory",
         "api-baseline-drift",
         "release-package-check",
         "config-show",
@@ -138,20 +139,18 @@ EDITOR_PREFIX = "editors/vscode/"
 SITE_PREFIX = "site/"
 DOCS_PATHS = {"README.md", "CONTRIBUTING.md"}
 FULL_DOCS_PATHS = {
-    "docs/architecture.md", "docs/build.md", "docs/ci.md", "docs/design.md",
-    "docs/kernel_design.md", "docs/releasing.md", "docs/roadmap.md", "docs/tcb.md",
+    "docs/architecture.md", "docs/build.md", "docs/design.md",
+    "docs/kernel_design.md", "docs/tcb.md",
 }
 KERNEL_PREFIXES = (
     "compiler/", "runtime/", "std/", "tests/compiler_", "tests/string_nf_",
     "tests/constructor_", "quality/smith/", "scripts/ourosmith/",
 )
 KERNEL_PATHS = {
-    ".github/workflows/ouro-pr.yml",
     "Ouro.seal",
     "docs/tcb.md",
     "docs/kernel_design.md",
     "quality/kernel_budgets.json",
-    "scripts/ci_gate.py",
     "scripts/kernel_hardening_suite.py",
     "scripts/kernel_profile.py",
     "scripts/kernel_profile_test.py",
@@ -215,6 +214,29 @@ PR_PATH_GATES = {
     "scripts/lsp_suite.sh": ("lsp",),
     "scripts/doc_suite.sh": ("doc", "lsp"),
 }
+# Control-plane changes do not alter language behavior. Their own native
+# policy checks and source-bound receipts remain blocking on these routes.
+CONTROL_BASE_GATES = (
+    "python-syntax", "python-lint", "shell-lint", "ci-runner-selftest",
+    "github-workflow-gate", "github-project-gate", "docs-examples", "structural-quality",
+)
+CONTROL_PATH_GATES = {
+    ".github/workflows/ouro-release.yml": ("release-package-check",),
+    ".github/release.yml": ("release-package-check",),
+    "scripts/release_package.py": ("release-package-check",),
+    "docs/releasing.md": ("release-package-check",),
+    ".github/workflows/ouro-pr.yml": ("config-show", "build-cache-config"),
+    "scripts/ci_gate.py": ("config-show", "build-cache-config"),
+    "docs/ci.md": ("config-show", "build-cache-config"),
+    "scripts/ourosmith/provenance.py": (),
+    "tools/ci_gate/host_inventory.ouro": ("host-bound-inventory",),
+    "tools/ci_gate/host_inventory_python.ouro": ("host-bound-inventory",),
+    "tools/repo_gate/checks.ouro": ("host-bound-inventory", "compiler-boundary", "test"),
+    "tools/repo_gate/policy.ouro": ("host-bound-inventory", "compiler-boundary", "test"),
+    "quality/strict_debt_manifest.json": (
+        "strict-quality-firewall", "structural-quality-suite", "structural-quality",
+    ),
+}
 
 
 @dataclass(frozen=True)
@@ -247,7 +269,7 @@ def is_site_path(path: str) -> bool:
 
 
 def is_docs_path(path: str) -> bool:
-    return path in DOCS_PATHS or (
+    return ("/" not in path and path.endswith(".md")) or path in DOCS_PATHS or (
         path.startswith("docs/") and path.endswith(".md")
         and not path.startswith("docs/api/") and path not in FULL_DOCS_PATHS
         and ".." not in path.split("/")
@@ -255,6 +277,8 @@ def is_docs_path(path: str) -> bool:
 
 
 def is_kernel_path(path: str) -> bool:
+    if path in CONTROL_PATH_GATES:
+        return False
     return path in KERNEL_PATHS or path.startswith(KERNEL_PREFIXES)
 
 
@@ -290,6 +314,10 @@ def classify_paths(paths: Sequence[str]) -> PathSelection:
     for path in normalized:
         if path.startswith("/") or ":" in path or ".." in path.split("/"):
             return full_path_selection("invalid changed path")
+        if path in CONTROL_PATH_GATES:
+            selected.update(CONTROL_BASE_GATES)
+            selected.update(CONTROL_PATH_GATES[path])
+            continue
         if is_editor_path(path) or is_site_path(path) or is_docs_path(path):
             continue
         matches = [names for pattern, names in PR_PATH_GATES.items()
@@ -672,6 +700,7 @@ def gates() -> list[Gate]:
         Gate("ci-runner-selftest", [sys.executable, "scripts/ci_gate.py", "--self-test"], ("pr", "nightly", "manual")),
         Gate("github-workflow-gate", ["sh", "scripts/ouro_repo_gate.sh", "--profile", "workflow-native", "--out", "_build/github_workflow_gate/native-workflow"], ("pr", "nightly", "manual", "docs")),
         Gate("github-project-gate", ["sh", "scripts/ouro_repo_gate.sh", "--profile", "project-native", "--out", "_build/github_project_gate/native-project"], ("pr", "nightly", "manual", "docs")),
+        Gate("host-bound-inventory", ["sh", "scripts/ouro_ci_gate.sh", "--profile", "host-bound", "--out", "_build/ci/host-bound"], ("pr", "nightly", "manual")),
         Gate("api-baseline-drift", [sys.executable, "scripts/api_baseline_regen.py", "--check", "--report", "_build/api_baseline/api-baseline.json"], ("pr", "nightly", "manual", "docs")),
         Gate("release-package-check", [sys.executable, "scripts/release_package.py", "--self-test", "--check", "--out", "_build/release_check"], ("pr", "nightly", "manual")),
         Gate("config-show", [sys.executable, "scripts/ouro_build.py", "config", "show"], ("pr", "nightly", "manual")),
@@ -762,6 +791,7 @@ def run_self_tests(all_gates: Sequence[Gate]) -> int:
     failures: list[str] = []
     failures.extend(summary_contract_failures())
     failures.extend(routing_contract_failures())
+    failures.extend(provenance_contract_failures())
     for profile, groups in PROFILE_GROUPS.items():
         try:
             validate_groups(all_gates, profile, groups)
@@ -846,7 +876,7 @@ def run_self_tests(all_gates: Sequence[Gate]) -> int:
         (("tools/fmt.ouro",), (True, False, False, False)),
         (("tests/analyze/architecture_bad/a.ouro",), (True, False, False, False)),
         (("editors/vscode/src/extension.ts", "README.md"), (False, False, True, False)),
-        ((".github/workflows/ouro-pr.yml",), (True, True, False, True)),
+        ((".github/workflows/ouro-pr.yml",), (True, False, False, True)),
         ((), (True, True, True, True)),
     )
     for paths, expected in cases:
@@ -857,6 +887,7 @@ def run_self_tests(all_gates: Sequence[Gate]) -> int:
 
     docs_cases = (
         (("README.md",), (False, True)),
+        (("AGENTS.md", "RELEASE_HISTORY.md"), (False, True)),
         (("README.md", "CONTRIBUTING.md"), (False, True)),
         (("docs/getting_started.md",), (False, True)),
         (("docs/getting_started.md", "tools/fmt.ouro"), (True, True)),
@@ -897,6 +928,46 @@ def routing_contract_failures() -> list[str]:
 
     failures: list[str] = []
     full = set(full_path_selection("selftest").gates)
+    for path, expected in CONTROL_PATH_GATES.items():
+        selected = classify_paths([path])
+        required = set(CONTROL_BASE_GATES) | set(expected)
+        if not required <= set(selected.gates) < full or selected.portable or selected.kernel:
+            failures.append(f"invalid control-plane route: {path}")
+        for broad in ("compiler/new.ouro", "runtime/new.c", "std/new.ouro",
+                      "scripts/unknown.py", "scripts/ourosmith/kernel.py",
+                      "tools/repo_gate/compiler_boundary.ouro", "unknown/file"):
+            mixed = classify_paths([path, broad])
+            if set(mixed.gates) != full or not mixed.portable:
+                failures.append(f"mixed control-plane route omitted full coverage: {path}, {broad}")
+    for path in ("scripts/ci_gate.py", "scripts/release_package.py", "scripts/ourosmith/provenance.py",
+                 "tools/repo_gate/checks.ouro", "tools/repo_gate/policy.ouro",
+                 "tools/ci_gate/host_inventory.ouro", "tools/ci_gate/host_inventory_python.ouro"):
+        if "structural-quality" not in classify_paths([path]).gates:
+            failures.append(f"control-plane source lost structural policy: {path}")
+    for path in ("tools/repo_gate/checks.ouro", "tools/repo_gate/policy.ouro"):
+        if "test" not in classify_paths([path]).gates:
+            failures.append(f"native policy route lost its user test fixtures: {path}")
+    release = plan_paths([
+        ".github/workflows/ouro-release.yml", "scripts/release_package.py",
+        "scripts/ci_gate.py", "scripts/ourosmith/provenance.py",
+        "tools/ci_gate/host_inventory.ouro", "tools/repo_gate/checks.ouro",
+        "tools/repo_gate/policy.ouro", "quality/strict_debt_manifest.json",
+        "AGENTS.md", "RELEASE_HISTORY.md", "docs/ci.md", "docs/releasing.md",
+        "docs/roadmap.md", "docs/rfc/0000-template.md",
+    ])
+    expected = {
+        "python-syntax", "python-lint", "shell-lint", "ci-runner-selftest",
+        "github-workflow-gate", "github-project-gate", "host-bound-inventory",
+        "api-baseline-drift", "release-package-check", "config-show", "build-cache-config",
+        "doc", "docs-examples", "strict-quality-firewall", "structural-quality-suite",
+        "structural-quality", "compiler-boundary", "test", "lint-changed",
+    }
+    if set(release.gates) != expected or release.kernel or release.portable:
+        failures.append("release/control-plane change lost its focused policy checks")
+    if any(name.startswith("compiler-checking-") for name in release.gates):
+        failures.append("release/control-plane change selected unrelated compiler shards")
+    if {row["group"] for row in selection_matrix(release)["include"]} != {"checks", "tests", "analyzer-lint"}:
+        failures.append("release/control-plane change selected unrelated matrix groups")
     for pattern, expected in PR_PATH_GATES.items():
         path = pattern + "fixture.ouro" if pattern.endswith("/") else pattern
         selected = classify_paths([path])
@@ -1012,6 +1083,84 @@ def routing_contract_failures() -> list[str]:
         if values["core"] != "false" or json.loads(values["changed_paths"]) != list(selected.paths):
             failures.append("filename escaped the GitHub output record")
     failures.extend(lint_changed_contract_failures())
+    return failures
+
+
+def provenance_contract_failures() -> list[str]:
+    import tempfile
+    from unittest.mock import patch
+
+    from ourosmith import provenance
+
+    class Report:
+        def __init__(self, binary: Path):
+            self.sections = {"provenance": provenance.begin()}
+            self.sections["provenance"]["binaries"] = provenance.binary_state([binary])
+            self.skips: list[str] = []
+
+        def skip(self, name: str, _reason: str) -> None:
+            self.skips.append(name)
+
+    failures: list[str] = []
+    with tempfile.TemporaryDirectory(prefix="ouro-provenance-") as temporary:
+        root = Path(temporary)
+        (root / "std").mkdir()
+        (root / "_build").mkdir()
+        (root / "empty-hooks").mkdir()
+        source = root / "std/input.ouro"
+        source.write_bytes(b"def value : Nat := 0;\n")
+        binary = root / "_build/compiler"
+        binary.write_bytes(b"tested compiler")
+        for arguments in (
+            ["init", "--quiet"], ["add", "std/input.ouro"],
+            ["-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+             "-c", "commit.gpgsign=false", "-c", "core.hooksPath=" + str(root / "empty-hooks"),
+             "commit", "--quiet", "-m", "provenance fixture"],
+        ):
+            subprocess.run(["git", *arguments], cwd=root, check=True, capture_output=True, timeout=15)
+        with patch.object(provenance, "ROOT", root):
+            stable = Report(binary)
+            source.write_bytes(b"def value : Nat := 0;\r\n")
+            provenance.finish(stable)
+            if stable.skips:
+                failures.append("provenance rejected stable inputs with normalized line endings")
+            changed = Report(binary)
+            source.write_bytes(b"def value : Nat := 1;\n")
+            provenance.finish(changed)
+            if changed.skips != ["provenance:source"]:
+                failures.append("provenance accepted changed validation sources")
+            untracked = Report(binary)
+            (root / "std/new.ouro").write_text("def new : Nat := 0;\n", encoding="utf-8")
+            provenance.finish(untracked)
+            if untracked.skips != ["provenance:source"]:
+                failures.append("provenance omitted new untracked production sources")
+            removed = Report(binary)
+            source.unlink()
+            provenance.finish(removed)
+            if removed.skips != ["provenance:source"]:
+                failures.append("provenance omitted missing tracked inputs")
+            stale = Report(binary)
+            binary.write_bytes(b"replacement compiler")
+            provenance.finish(stale)
+            if stale.skips != ["provenance:binaries"]:
+                failures.append("provenance accepted a changed tested binary")
+            missing = Report(binary)
+            binary.unlink()
+            provenance.finish(missing)
+            if missing.skips != ["provenance:binaries"]:
+                failures.append("provenance accepted a missing tested binary")
+            binary.write_bytes(b"replacement compiler")
+            stage = Report(binary)
+            stage.sections["stage_parity"] = {
+                "status": "exercised", "binary": "_build/compiler", "sha256": sha256_file(binary),
+            }
+            provenance.finish(stage)
+            if stage.skips:
+                failures.append("provenance rejected a valid stage receipt")
+            stage.sections["stage_parity"]["sha256"] = "0" * 64
+            provenance.finish(stage)
+            if stage.skips != ["provenance:stage"]:
+                failures.append("provenance accepted a stale stage receipt")
     return failures
 
 
