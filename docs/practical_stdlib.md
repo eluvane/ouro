@@ -284,6 +284,13 @@ It sorts children and distinguishes complete, truncated, unreadable, and unsafe
 walks. The compatibility `fs_walk` returns an empty list for every non-complete
 result and must not be used to infer that a directory is empty.
 
+The workspace helpers `fsx_list_files_filtered` and `fsx_copy_tree_checked`
+return `FsOperationFailed` when the checked walk is incomplete or unsafe.
+Copying starts only after a complete inventory. `fsx_remove_tree_checked`
+rejects links and reparse points before enumerating their children; files
+already removed earlier in the walk are not restored. These helpers do not
+provide an atomic filesystem snapshot or rollback.
+
 ```ouro
 import "../std/fsx.ouro";
 

@@ -1,6 +1,7 @@
 -- Workspace, temp-path, backup, and file workflow helpers.
 
 import "fsx.ouro",
+  "fs_walk.ouro",
   "pathx.ouro",
   "report.ouro",
   "validation.ouro";
@@ -85,8 +86,13 @@ def fsx_list_files_filtered (root : String) (p : String -> Bool) : IO (Either Fs
        match ready with
        | Left e => fs_err(List String, e)
        | Right _ =>
-         do let! files := fs_walk root;
-            fs_ok(List String, filter String p files)
+         do let! walked := fs_walk_checked root;
+            match walked with
+            | FsWalkComplete files => fs_ok(List String, filter String p files)
+            | FsWalkTruncated path => fs_err(List String, FsOperationFailed "walk limit" path)
+            | FsWalkUnreadable path => fs_err(List String, FsOperationFailed "walk unreadable" path)
+            | FsWalkUnsafe path => fs_err(List String, FsOperationFailed "walk unsafe entry" path)
+            end
        end
 
 def fsx_list_files_by_ext (root : String) (ext : String) : IO (Either FsError (List String)) :=
@@ -105,15 +111,21 @@ def fsx_copy_tree_checked (src_root : String) (dst_root : String) : IO (Either F
        match ready with
        | Left e => fs_err Unit e
        | Right _ =>
-         do let! made := fs_mkdir_p_checked dst_root;
-            match made with
-            | Left e => fs_err Unit e
-            | Right _ =>
-              do let! files := fs_walk src_root;
-                 io_fold String (Either FsError Unit)
-                   (fsx_copy_one_under src_root dst_root)
-                   (Right FsError Unit MkUnit)
-                   files
+         do let! walked := fs_walk_checked src_root;
+            match walked with
+            | FsWalkComplete files =>
+              do let! made := fs_mkdir_p_checked dst_root;
+                 match made with
+                 | Left e => fs_err Unit e
+                 | Right _ =>
+                     io_fold String (Either FsError Unit)
+                       (fsx_copy_one_under src_root dst_root)
+                       (Right FsError Unit MkUnit)
+                       files
+                 end
+            | FsWalkTruncated path => fs_err(Unit, FsOperationFailed "walk limit" path)
+            | FsWalkUnreadable path => fs_err(Unit, FsOperationFailed "walk unreadable" path)
+            | FsWalkUnsafe path => fs_err(Unit, FsOperationFailed "walk unsafe entry" path)
             end
        end
 
@@ -123,20 +135,22 @@ def fsx_remove_tree_checked (root : String) : IO (Either FsError Unit) :=
     match fs_nonempty_path root with
     | Left e => fs_err Unit e
     | Right _ =>
-      io_bind Bool (Either FsError Unit) (fs_exists root)
-        (fun (exists : Bool) =>
-          match exists with
-          | False => fs_ok Unit MkUnit
-          | True =>
+      io_bind Nat (Either FsError Unit) (prim_fs_kind root)
+        (fun (kind : Nat) =>
+          match eq_nat kind Z with
+          | True => fs_ok Unit MkUnit
+          | False =>
             (fix go (fuel : Nat) (path : String) : IO (Either FsError Unit) :=
               match fuel with
               | Z => fs_err(Unit, FsOperationFailed "remove_tree" path)
               | S fuel2 =>
-                io_bind Bool (Either FsError Unit) (fs_is_dir path)
-                  (fun (is_directory : Bool) =>
-                    match is_directory with
-                    | False => fsx_remove_if_exists path
-                    | True =>
+                io_bind Nat (Either FsError Unit) (prim_fs_kind path)
+                  (fun (entry_kind : Nat) =>
+                    match eq_nat entry_kind (S Z) with
+                    | True => fsx_remove_if_exists path
+                    | False => match eq_nat entry_kind (S (S Z)) with
+                      | False => fs_err(Unit, FsOperationFailed "remove_tree unsafe entry" path)
+                      | True =>
                       io_bind (Either(FsError, List String))
                         (Either FsError Unit)
                         (fs_list_checked path)
@@ -161,6 +175,7 @@ def fsx_remove_tree_checked (root : String) : IO (Either FsError Unit) :=
                                 | Right _ => fsx_remove_if_exists path
                                 end)
                           end)
+                      end
                     end)
               end) fs_walk_fuel root
           end)
