@@ -627,11 +627,17 @@ def check_suppression_comments() -> Check:
         findings = strict_quality.scan_source(OUT / "suppression-comments.ouro", source, registry, "release")
         if any(f.code.startswith("OURO-SUP") for f in findings):
             raise AssertionError(f"suppression scanner treated literal bytes as a directive: {source!r}")
-    source = 'def text : String := "漢字 -- ouro-lint:disable-all"; -- ouro-lint:disable-all\n'
-    findings = strict_quality.scan_source(OUT / "suppression-comments.ouro", source, registry, "release")
-    expected_column = len(source[:source.rindex("ouro-lint:disable-all")].encode("utf-8")) + 1
-    if [(f.code, f.line, f.column) for f in findings] != [("OURO-SUP001", 1, expected_column)]:
-        raise AssertionError(f"real trailing suppression or its byte position was lost: {findings}")
+    multiline = ('-- ordinary header\n'
+                 'def text : String := "漢字 -- ouro-lint:disable-all";\n\n'
+                 'def value : Nat := 0; -- ouro-lint:disable-all\n')
+    for source in ('def text : String := "漢字 -- ouro-lint:disable-all"; -- ouro-lint:disable-all\n',
+                   multiline, multiline.replace("\n", "\r\n")):
+        findings = strict_quality.scan_source(OUT / "suppression-comments.ouro", source, registry, "release")
+        prefix = source[:source.rindex("ouro-lint:disable-all")]
+        expected_line = prefix.count("\n") + 1
+        expected_column = len(prefix.rsplit("\n", 1)[-1].encode("utf-8")) + 1
+        if [(f.code, f.line, f.column) for f in findings] != [("OURO-SUP001", expected_line, expected_column)]:
+            raise AssertionError(f"real trailing suppression or its byte position was lost: {findings}")
     return Check("suppression-comments", "pass", "literal preservation, quoted comment markers, trailing directive location")
 
 
