@@ -145,6 +145,32 @@ def toolchain_paths(evidence: dict, *, compiler: Path | None = None) -> dict[str
     return overrides
 
 
+def scheduled_tool_builds() -> list[tuple[str, str, str]]:
+    """Return (entry, binary name, log stem) with companions before parents.
+
+    Each native_tool_build invocation keeps the existing BUILD_TIMEOUT_S.
+    Lint's companions are full compiles; folding them into the parent
+    deadline is what makes surface:tools hit that deadline. A parent still
+    checks its companions, and a cache hit does not emit them again.
+    """
+    from native_tool_build import tool_companions
+
+    order: list[tuple[str, str, str]] = []
+    seen: set[str] = set()
+
+    def add(entry: str, name: str, log_stem: str) -> None:
+        if entry in seen:
+            return
+        for companion_entry, companion_name in tool_companions(entry):
+            add(companion_entry, companion_name, companion_name)
+        seen.add(entry)
+        order.append((entry, name, log_stem))
+
+    for tool in TOOLS:
+        add(tool_entry(tool), "ouro-" + tool, tool)
+    return order
+
+
 def prepare_tools(out: Path, compiler: Path) -> tuple[dict[str, Path], dict]:
     """Use one explicit producer and source-bound tools without rebuilding a seed."""
     from ourosmith.native import digest
@@ -158,15 +184,17 @@ def prepare_tools(out: Path, compiler: Path) -> tuple[dict[str, Path], dict]:
     if not directory.is_relative_to(ROOT):
         raise ValueError("Smith native tool outputs must stay inside the repository")
     overrides = {"ouro1": compiler}
-    for tool in TOOLS:
-        target = directory / ("ouro-" + tool + (".exe" if os.name == "nt" else ""))
-        command = [sys.executable, "-B", str(ROOT / "scripts/native_tool_build.py"), tool_entry(tool), str(target),
+    names = {"ouro-" + tool for tool in TOOLS}
+    for entry, name, log_stem in scheduled_tool_builds():
+        target = directory / (name + (".exe" if os.name == "nt" else ""))
+        command = [sys.executable, "-B", str(ROOT / "scripts/native_tool_build.py"), entry, str(target),
                    "--compiler", str(compiler), "--jobs", "1", "--ccache", "disabled",
                    "--build-dir", str(directory / "build"), "--cache-dir", str(cfg.path("cache_dir"))]
-        reason = build_command(command, Path(out) / (tool + "-build.log"), timeout_s=BUILD_TIMEOUT_S)
+        reason = build_command(command, Path(out) / (log_stem + "-build.log"), timeout_s=BUILD_TIMEOUT_S)
         if reason:
             raise ValueError(reason)
-        overrides["ouro-" + tool] = binary("ouro-" + tool, directory=directory)
+        if name in names:
+            overrides[name] = binary(name, directory=directory)
     evidence = toolchain_evidence(compiler, overrides)
     if digest(compiler) != producer_hash:
         raise ValueError("native producer changed during tool preparation")

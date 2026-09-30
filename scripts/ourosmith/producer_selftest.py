@@ -120,6 +120,8 @@ class ProducerTests(unittest.TestCase):
         with self.fixture() as fixture:
             calls = []
 
+            scheduled = host.scheduled_tool_builds()
+
             def build(command, log, **kwargs):
                 self.assertEqual(Path(command[2]), ROOT / "scripts/native_tool_build.py")
                 self.assertEqual(command[command.index("--compiler") + 1], str(fixture.compiler))
@@ -127,7 +129,10 @@ class ProducerTests(unittest.TestCase):
                 self.assertEqual(kwargs["timeout_s"], 900)
                 target = Path(command[4])
                 self.assertTrue(target.is_relative_to(fixture.directory / "smith-tools"))
-                fixture.installed(next(tool for tool in host.TOOLS if host.tool_entry(tool) == command[3]), target)
+                entry = command[3]
+                matched = [item for item in scheduled if item[0] == entry]
+                self.assertEqual(len(matched), 1)
+                fixture.installed(matched[0][1], target, entry)
                 calls.append((target, log))
 
             with patch.object(host, "build_config", return_value=SimpleNamespace(path=lambda _key: fixture.directory)), \
@@ -135,8 +140,9 @@ class ProducerTests(unittest.TestCase):
                 first = host.prepare_tools(fixture.directory / "first", fixture.compiler)
                 second = host.prepare_tools(fixture.directory / "repeat", fixture.compiler)
             self.assertEqual(first, second)
-            self.assertEqual(len(calls), 2 * len(host.TOOLS))
-            self.assertNotEqual(calls[0][1], calls[len(host.TOOLS)][1])
+            self.assertEqual(len(calls), 2 * len(scheduled))
+            self.assertGreater(len(scheduled), len(host.TOOLS))
+            self.assertNotEqual(calls[0][1], calls[len(scheduled)][1])
 
     def test_invalid_explicit_producer_precedes_any_execution_or_tool_build(self):
         import ouro_smith
