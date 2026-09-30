@@ -15,6 +15,10 @@ primitive contracts. Rejected, exhausted, cancelled, and malformed operations
 remain errors. Parser success and a successful lowering traversal do not
 establish declaration acceptance.
 
+Emission selects bodies through an index derived only from the accepted
+definition entries. Requested order, first-definition lookup, and typed
+missing/bodyless failures are preserved; the index adds no acceptance authority.
+
 `compiler/module_registry.ouro` and `compiler/module_names.ouro` resolve
 source-module names before the ordered declaration plan reaches the checker.
 They cannot authorize an unchecked import: each reached declaration and body

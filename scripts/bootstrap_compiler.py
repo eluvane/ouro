@@ -58,6 +58,9 @@ PASS exhausted nested graph retains the next import path
 PASS graph cycle retains code and repeated path
 PASS missing graph unit retains code and missing path
 PASS compiler result retains named core
+PASS checked emission retains exact bodies and requested order
+PASS checked emission retains first definitions and ignores metadata
+PASS checked emission rejects missing and bodyless declarations
 PASS compiler error retains code and detail
 PASS lower environment preserves constructor and hint fields
 PASS import preprocessing retains registry values
