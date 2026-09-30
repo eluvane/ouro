@@ -771,11 +771,13 @@ def test_frontend_host_protocol(tmp: Path) -> None:
                 "lower-bad-chunk", "lower-bad-contracts", "caller-output", "retained-result",
                 "typed-failure", "nested-context", "allocation-context", "shared-parent-spine", "wrapped-context", "recheck-scale",
                 "recheck-retained", "recheck-late-invalid", "recheck-missing-bodies", "recheck-zero-fuel",
-                "metadata-parity", "fallback-forward", "root-parity")
-    assert len(cases) == 38 and tuple(case[1][0] for case in host.probe_cases()) == expected
+                "metadata-parity", "fallback-forward", "root-parity", "root-clear-context", "pe-operation-context")
+    assert len(cases) == 40 and tuple(case[1][0] for case in host.probe_cases()) == expected
     for mode, prefix in (("metadata-parity", "FRONTEND_CODEGEN_META"),
                          ("fallback-forward", "FRONTEND_CODEGEN_SELFTEST"),
-                         ("root-parity", "FRONTEND_CODEGEN_SELFTEST")):
+                         ("root-parity", "FRONTEND_CODEGEN_SELFTEST"),
+                         ("root-clear-context", "FRONTEND_CODEGEN_SELFTEST"),
+                         ("pe-operation-context", "FRONTEND_CODEGEN_SELFTEST")):
         success = RunResult("ok", 0, f"{prefix}: passed {mode}\n", "", 0, 0)
         host.verify_probe(success, cases[mode])
         for invalid_probe in (replace(success, status="timeout"), replace(success, returncode=1),

@@ -218,6 +218,103 @@ static int test_root_clear_context(void)
 	return 0;
 }
 
+static ouro_v *test_apply(ouro_v *function, ouro_v **arguments, int count)
+{
+	int i;
+	for (i = 0; i < count; i++)
+		function = ouro_apply(function, arguments[i]);
+	return function;
+}
+
+static int test_pe_value_equal(ouro_v *left, ouro_v *right)
+{
+	unsigned long a, b;
+	int i;
+	if (left == right)
+		return 1;
+	if (left == 0 || right == 0)
+		return 0;
+	if (left->tag == OURO_TAG_NAT || right->tag == OURO_TAG_NAT)
+		return ouro_nat_to_ulong(left, &a) && ouro_nat_to_ulong(right, &b) && a == b;
+	if (left->tag == OURO_TAG_BYTES || right->tag == OURO_TAG_BYTES
+	    || left->tag == OURO_TAG_CAT || right->tag == OURO_TAG_CAT)
+		return test_nat_lists_equal(left, right);
+	if (left->tag < 0 || left->tag != right->tag || left->n != right->n)
+		return 0;
+	for (i = 0; i < left->n; i++)
+		if (!test_pe_value_equal(OURO_F(left, i), OURO_F(right, i)))
+			return 0;
+	return 1;
+}
+
+static int test_pe_operation(ouro_v *wrapped, ouro_v **arguments, int count)
+{
+	ouro_v *raw, *reference, *first = 0, *last = 0;
+	ouro_heap_context *context;
+	unsigned long long before, retained, start;
+	int i;
+	if (wrapped == 0 || wrapped->tag != OURO_TAG_CLOS
+	    || wrapped->u.c.fn != pe_scoped_argument)
+		return test_fail("PE operation lifetime hook missing");
+	raw = ouro_get(wrapped->u.c.env, 1);
+	before = ouro_heap_live_bytes();
+	context = ouro_heap_context_enter();
+	reference = test_apply(raw, arguments, count);
+	reference = ouro_heap_context_leave(context, reference);
+	retained = ouro_heap_live_bytes() - before;
+	start = ouro_heap_live_bytes();
+	for (i = 0; i < 64; i++) {
+		last = test_apply(wrapped, arguments, count);
+		if (i == 0)
+			first = last;
+		if (ouro_heap_live_bytes() - start >
+		    (unsigned long long)(i + 1) * (retained + 4096ULL) + 1048576ULL)
+			return test_fail("PE operation temporary work retained");
+	}
+	if (!test_pe_value_equal(first, reference) || !test_pe_value_equal(last, reference))
+		return test_fail("PE operation complete result changed");
+	return 0;
+}
+
+static int test_pe_operations(void)
+{
+	unsigned char bytes[16384] = {0};
+	ouro_v *section = ouro_ctor(0, 5, (ouro_v *[]){test_nil(), ouro_nat(4096),
+		ouro_nat(1024), ouro_nat(sizeof(bytes)), ouro_packed(bytes, sizeof(bytes))});
+	ouro_v *sections = test_cons(section, test_nil());
+	ouro_v *symbols = test_cons(ouro_ctor(0, 3, (ouro_v *[]){ouro_nat(7),
+		test_nil(), ouro_nat(4096)}), test_nil());
+	ouro_v *measured = ouro_ctor(0, 2, (ouro_v *[]){section, ouro_nat(sizeof(bytes))});
+	ouro_v *arguments[5];
+	ouro_v *fixup = FIND(lo, "pe_resolve_fixup_indexed_with");
+	arguments[0] = ouro_nat(2147483647UL);
+	if (test_pe_operation(FIND(lo, "pe_word32"), arguments, 1))
+		return 1;
+	arguments[0] = ouro_apply(FIND(lo, "pe_cached_section_lookup"),
+		test_cons(measured, test_nil()));
+	arguments[1] = ouro_apply(FIND(lo, "pe_symbol_index_from_symbols"), symbols);
+	arguments[2] = test_nil();
+	arguments[3] = ouro_ctor(0, 4, (ouro_v *[]){test_nil(), ouro_nat(8192),
+		ouro_nat(8196), ouro_ctor(0, 1, (ouro_v *[]){ouro_nat(7)})});
+	arguments[4] = measured;
+	if (test_pe_operation(fixup, arguments, 5))
+		return 1;
+	arguments[3] = ouro_ctor(0, 4, (ouro_v *[]){test_nil(), ouro_nat(8192),
+		ouro_nat(8195), ouro_ctor(0, 1, (ouro_v *[]){ouro_nat(7)})});
+	if (test_pe_operation(fixup, arguments, 5))
+		return 1;
+	arguments[0] = sections;
+	arguments[1] = symbols;
+	arguments[2] = ouro_ctor(0, 4, (ouro_v *[]){ouro_nat(7), ouro_nat(1),
+		test_nil(), test_nil()});
+	arguments[3] = test_nil();
+	if (test_pe_operation(FIND(lo, "pe_function_scan"), arguments, 4))
+		return 1;
+	arguments[2] = ouro_ctor(0, 4, (ouro_v *[]){ouro_nat(8), ouro_nat(1),
+		test_nil(), test_nil()});
+	return test_pe_operation(FIND(lo, "pe_function_scan"), arguments, 4);
+}
+
 static int test_roots(void)
 {
 	ouro_v *slots = test_cons(test_slot(0, 6, 32),
@@ -520,6 +617,8 @@ int main(int argc, char **argv)
 		result = test_roots();
 	else if (strcmp(argv[1], "root-clear-context") == 0)
 		result = test_root_clear_context();
+	else if (strcmp(argv[1], "pe-operation-context") == 0)
+		result = test_pe_operations();
 	else
 		return 2;
 	if (result == 0)

@@ -662,6 +662,55 @@ ouro_v *ouro_wrap_settled3(ouro_v *raw)
 	return ouro_clos(import_token_fuel, ouro_cons(raw, 0));
 }
 
+/* PE scalar operations borrow immutable caller inputs. Only their complete
+   canonical results cross this boundary; traversal and encoding temporaries
+   must not accumulate over thousands of fixups and function records. */
+static ouro_v *pe_scoped_argument(ouro_env *env, ouro_v *argument)
+{
+	unsigned long remaining;
+	ouro_v *args[5];
+	ouro_v *result;
+	ouro_heap_context *context;
+	int count = 0;
+	if (!ouro_nat_to_ulong(ouro_get(env, 0), &remaining) || remaining < 1 || remaining > 5) {
+		fputs("ouro_rt: invalid PE lifetime arity\n", stderr);
+		exit(1);
+	}
+	if (remaining > 1)
+		return ouro_clos(pe_scoped_argument,
+			ouro_cons(ouro_nat(remaining - 1), ouro_cons(argument, env->next)));
+	args[count++] = argument;
+	env = env->next;
+	while (env->next != 0) {
+		if (count == 5) {
+			fputs("ouro_rt: invalid PE lifetime arguments\n", stderr);
+			exit(1);
+		}
+		args[count++] = env->v;
+		env = env->next;
+	}
+	context = ouro_heap_context_enter();
+	result = env->v;
+	while (count > 0)
+		result = ouro_apply(result, args[--count]);
+	return ouro_heap_context_leave(context, result);
+}
+
+ouro_v *ouro_wrap_pe_word32(ouro_v *raw)
+{
+	return ouro_clos(pe_scoped_argument, ouro_cons(ouro_nat(1), ouro_cons(raw, 0)));
+}
+
+ouro_v *ouro_wrap_pe_function_scan(ouro_v *raw)
+{
+	return ouro_clos(pe_scoped_argument, ouro_cons(ouro_nat(4), ouro_cons(raw, 0)));
+}
+
+ouro_v *ouro_wrap_pe_resolve_fixup_indexed(ouro_v *raw)
+{
+	return ouro_clos(pe_scoped_argument, ouro_cons(ouro_nat(5), ouro_cons(raw, 0)));
+}
+
 ouro_v *ouro_wrap_import_token(ouro_v *raw)
 {
 	return ouro_wrap_settled3(raw);

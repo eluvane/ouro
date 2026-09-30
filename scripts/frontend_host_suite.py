@@ -86,7 +86,7 @@ def probe_cases():
         cases.append(("frontend-link-selftest", argv, 0, f"FRONTEND_LINK_SELFTEST: passed {mode}\n", stderr))
     cases.append(("frontend-codegen-meta-selftest", ["metadata-parity"], 0,
                   "FRONTEND_CODEGEN_META: passed metadata-parity\n", ""))
-    for mode in ("fallback-forward", "root-parity", "root-clear-context"):
+    for mode in ("fallback-forward", "root-parity", "root-clear-context", "pe-operation-context"):
         cases.append(("frontend-codegen-selftest", [mode], 0,
                       f"FRONTEND_CODEGEN_SELFTEST: passed {mode}\n", ""))
     return cases
