@@ -226,6 +226,14 @@ static ouro_v *test_apply(ouro_v *function, ouro_v **arguments, int count)
 	return function;
 }
 
+static int test_pe_byte_lists_equal(ouro_v *left, ouro_v *right)
+{
+	char lhs[32768], rhs[32768];
+	int nl = codes_to_buf(left, lhs, sizeof(lhs));
+	int nr = codes_to_buf(right, rhs, sizeof(rhs));
+	return nl >= 0 && nl == nr && memcmp(lhs, rhs, (size_t)nl) == 0;
+}
+
 static int test_pe_value_equal(ouro_v *left, ouro_v *right)
 {
 	unsigned long a, b;
@@ -238,7 +246,7 @@ static int test_pe_value_equal(ouro_v *left, ouro_v *right)
 		return ouro_nat_to_ulong(left, &a) && ouro_nat_to_ulong(right, &b) && a == b;
 	if (left->tag == OURO_TAG_BYTES || right->tag == OURO_TAG_BYTES
 	    || left->tag == OURO_TAG_CAT || right->tag == OURO_TAG_CAT)
-		return test_nat_lists_equal(left, right);
+		return test_pe_byte_lists_equal(left, right);
 	if (left->tag < 0 || left->tag != right->tag || left->n != right->n)
 		return 0;
 	for (i = 0; i < left->n; i++)
@@ -312,7 +320,13 @@ static int test_pe_operations(void)
 		return 1;
 	arguments[2] = ouro_ctor(0, 4, (ouro_v *[]){ouro_nat(8), ouro_nat(1),
 		test_nil(), test_nil()});
-	return test_pe_operation(FIND(lo, "pe_function_scan"), arguments, 4);
+	if (test_pe_operation(FIND(lo, "pe_function_scan"), arguments, 4))
+		return 1;
+	arguments[0] = ouro_ctor(0, 3, (ouro_v *[]){ouro_nat(24576), ouro_nat(20480), sections});
+	arguments[1] = test_cons(ouro_ctor(0, 4, (ouro_v *[]){test_nil(),
+		ouro_nat(8192), test_cons(ouro_nat(1), test_cons(ouro_nat(2),
+			test_cons(ouro_nat(3), test_cons(ouro_nat(4), test_nil())))), test_nil()}), test_nil());
+	return test_pe_operation(FIND(lo, "pe_apply_patches"), arguments, 2);
 }
 
 static int test_roots(void)

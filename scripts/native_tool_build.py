@@ -101,6 +101,7 @@ HOST_HOOKS = (
     ("mir_gc_check", "ouro_wrap_mir_gc_check", ("compiler/native/mir_gc.ouro",)),
     ("pe_run_byte_check", "ouro_wrap_pe_run_byte_check", ("compiler/native/pe_model.ouro",)),
     ("pe_plan_fixups", "ouro_wrap_pe_plan_fixups", ("compiler/native/pe_fixups.ouro",)),
+    ("pe_apply_patches", "ouro_wrap_pe_apply_patches", ("compiler/native/pe_fixups.ouro",)),
     ("pe_resolve_fixup_indexed_with", "ouro_wrap_pe_resolve_fixup_indexed", ("compiler/native/pe_fixups.ouro",)),
     ("pe_function_scan", "ouro_wrap_pe_function_scan", ("compiler/native/pe_unwind.ouro",)),
     ("pe_word32", "ouro_wrap_pe_word32", ("compiler/native/pe_model.ouro",)),

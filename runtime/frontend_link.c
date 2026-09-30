@@ -662,7 +662,7 @@ ouro_v *ouro_wrap_settled3(ouro_v *raw)
 	return ouro_clos(import_token_fuel, ouro_cons(raw, 0));
 }
 
-/* PE scalar operations borrow immutable caller inputs. Only their complete
+/* PE operations borrow immutable caller inputs. Only their complete
    canonical results cross this boundary; traversal and encoding temporaries
    must not accumulate over thousands of fixups and function records. */
 static ouro_v *pe_scoped_argument(ouro_env *env, ouro_v *argument)
@@ -699,6 +699,11 @@ static ouro_v *pe_scoped_argument(ouro_env *env, ouro_v *argument)
 ouro_v *ouro_wrap_pe_word32(ouro_v *raw)
 {
 	return ouro_clos(pe_scoped_argument, ouro_cons(ouro_nat(1), ouro_cons(raw, 0)));
+}
+
+ouro_v *ouro_wrap_pe_apply_patches(ouro_v *raw)
+{
+	return ouro_clos(pe_scoped_argument, ouro_cons(ouro_nat(2), ouro_cons(raw, 0)));
 }
 
 ouro_v *ouro_wrap_pe_function_scan(ouro_v *raw)

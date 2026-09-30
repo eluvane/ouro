@@ -197,7 +197,7 @@ allocation context, retaining its full patch list or typed error before freeing
 the symbol-index and traversal temporaries. Curried arguments and the caller
 remain live. The wrapper does not resolve targets, inspect slots or change
 patch bytes, ordering, validation or diagnostic precedence.
-Individual indexed fixup resolution, function scanning and 32-bit field
+Patch application, indexed fixup resolution, function scanning and 32-bit field
 encoding also run in nested allocation contexts. These boundaries preserve
 their complete canonical result and caller-owned inputs while releasing
 operation-local temporaries; the host does not implement the PE decisions.
