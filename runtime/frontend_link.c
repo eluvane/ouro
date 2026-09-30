@@ -884,8 +884,10 @@ static int unit_prepass_incremental(ouro_v *files, ouro_v **out_files,
 			free(alias_items);
 			return 0;
 		}
-		path = ouro_clone_perm_deep(pair_fst(f));
-		src = ouro_clone_perm_deep(pair_snd(f));
+		/* Inputs already live in this perm bank. Share them; a deep clone
+		   here recopies every source before preprocessing starts. */
+		path = ouro_clone_perm(pair_fst(f));
+		src = ouro_clone_perm(pair_snd(f));
 		in_items[i] = perm_pair(path, src);
 	}
 	if (n > 0 && out_items != 0) {
@@ -911,10 +913,15 @@ static int unit_prepass_incremental(ouro_v *files, ouro_v **out_files,
 				ok = 0;
 				break;
 			}
-			reg = ouro_clone_perm_deep(OURO_F(r, r->n - 3));
-			aliases = ouro_clone_perm_deep(OURO_F(r, r->n - 2));
-			src2 = ouro_clone_perm_deep(OURO_F(r, r->n - 1));
-			path = ouro_clone_perm_deep(path);
+			/* The record registry is threaded through every file. Deep-cloning
+			   it recopies the whole accumulated graph on each file and is
+			   what pushes one native_build emit past the 900s host budget.
+			   Share nodes already in this perm bank; copy only this file's
+			   phase allocations. discard_phase below then drops the scratch. */
+			reg = ouro_clone_perm(OURO_F(r, r->n - 3));
+			aliases = ouro_clone_perm(OURO_F(r, r->n - 2));
+			src2 = ouro_clone_perm(OURO_F(r, r->n - 1));
+			path = ouro_clone_perm(path);
 			out_items[i] = perm_pair(path, src2);
 			alias_items[i] = perm_pair(path, aliases);
 			fe_phase_done("frontend-after-preprocess-unit");
