@@ -111,7 +111,8 @@ Deferred substitutions and application processing preserve binder scope and the
 observable reduction budget. Input-work limits reject excessive input with a
 typed resource failure before recursive checking. The same work limit charges
 demanded local-definition expansion and lifting before materializing let
-substitutions; crashes and process limits
+substitutions, including declaration candidates before source refinement;
+crashes and process limits
 are separate test failures.
 
 `CheckedProgram` is a compiler-owned representation, not an unforgeable module
