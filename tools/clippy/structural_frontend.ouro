@@ -243,28 +243,60 @@ def cm_discard_tokens : List Token -> Bool -> InternState
         end
     end;
 
+-- Preprocess scratch dies in its own heap context. Lex then starts from the
+-- expanded bytes instead of retaining both graphs until the parse returns.
+def cm_prepare_expanded (source : String) (pad : Unit)
+    : Either QualityInputError (Pair (List Nat) ImpReg) :=
+    match pad with
+    | MkUnit => match preprocess_imports_reg empty_imp_reg
+        (prim_string_to_char_codes source) with
+      | MkPair aliases imported => match imported with
+        | ImpErr _code position => Left QualityInputError (Pair (List Nat) ImpReg)
+            (QualityInvalidInput (prim_string_concat("import preprocessing failed: ", prim_string_of_nat position)))
+        | ImpOk prepared => match preprocess_records_reg (Nil Nat)
+            aliases empty_rec_reg prepared with
+          | MkPair _ tagged => match tagged with
+            | MkPair recorded result => match result with
+              | PrepErr _code position => Left QualityInputError (Pair (List Nat) ImpReg)
+                  (QualityInvalidInput (prim_string_concat("record preprocessing failed: ", prim_string_of_nat position)))
+              | PrepOk expanded => Right QualityInputError (Pair (List Nat) ImpReg)
+                  (MkPair (List Nat) ImpReg expanded recorded)
+              end
+            end
+          end
+        end
+      end
+    end;
+
+-- Identifier lookup spines die with this context. The token list and the
+-- updated intern are the only survivors passed to the parser.
+def cm_lex_expanded (expanded : List Nat) (intern : InternState)
+    : Either QualityInputError (Pair (List Token) InternState) :=
+    let fuel : Nat := add(length Nat expanded, cg_s_lex_fuel_pad) in
+    match lex_go_import fuel expanded intern (Nil Token) with
+    | LexMalformed _ => Left QualityInputError (Pair (List Token) InternState)
+        (QualityInvalidInput "compiler lexer rejected source")
+    | LexExhausted _ => Left QualityInputError (Pair (List Token) InternState)
+        (QualityInvalidInput "compiler lexer exhausted")
+    | LexOk raw lexed => match cm_discard_tokens raw False lexed with
+      | MkPair tokens updated => Right QualityInputError (Pair (List Token) InternState)
+          (MkPair (List Token) InternState tokens updated)
+      end
+    end;
+
 -- Span wrappers are only for the selected root. An import's signature harvest
 -- does not read token ranges, and wrapping every subexpression retains the
 -- position comparisons for the whole file.
 def cm_parse_prepared (spanned : Bool) (source : String) (intern : InternState)
     : Either QualityInputError (Pair ParsedFile (Pair InternState ImpReg)) :=
-    match preprocess_imports_reg empty_imp_reg
-        (prim_string_to_char_codes source) with
-    | MkPair aliases imported => match imported with
-    | ImpErr _code position => Left QualityInputError (Pair(ParsedFile, Pair InternState ImpReg))
-        (QualityInvalidInput (prim_string_concat("import preprocessing failed: ", prim_string_of_nat position)))
-    | ImpOk prepared => match preprocess_records_reg (Nil Nat)
-        aliases empty_rec_reg prepared with
-      | MkPair _ tagged => match tagged with
-      | MkPair recorded result => match result with
-      | PrepErr _code position => Left QualityInputError (Pair(ParsedFile, Pair InternState ImpReg))
-          (QualityInvalidInput (prim_string_concat("record preprocessing failed: ", prim_string_of_nat position)))
-      | PrepOk expanded =>
+    match cm_prepare_expanded source MkUnit with
+    | Left error => Left QualityInputError (Pair(ParsedFile, Pair InternState ImpReg)) error
+    | Right prepared => match prepared with
+      | MkPair expanded recorded =>
           let fuel : Nat := add(length Nat expanded, cg_s_lex_fuel_pad) in
-          match lex_go_import fuel expanded intern (Nil Token) with
-          | LexMalformed _ => Left(QualityInputError, Pair(ParsedFile, Pair InternState ImpReg), QualityInvalidInput "compiler lexer rejected source")
-          | LexExhausted _ => Left(QualityInputError, Pair(ParsedFile, Pair InternState ImpReg), QualityInvalidInput "compiler lexer exhausted")
-          | LexOk raw lexed => match cm_discard_tokens raw False lexed with
+          match cm_lex_expanded expanded intern with
+          | Left error => Left QualityInputError (Pair(ParsedFile, Pair InternState ImpReg)) error
+          | Right lexed => match lexed with
             | MkPair tokens updated =>
                 let parsed : ParseResult ParsedFile := match spanned with
                   | True => parse_file_visibility parse_spanned fuel tokens 0
@@ -307,19 +339,16 @@ def cm_parse_prepared (spanned : Bool) (source : String) (intern : InternState)
                       end
                     end in
                   match complete with
-                | False => Left(QualityInputError, Pair(ParsedFile, Pair InternState ImpReg), QualityInvalidInput "incomplete parsed source")
-                | True => Right QualityInputError (Pair(ParsedFile, Pair InternState ImpReg))
-                    (MkPair ParsedFile (Pair InternState ImpReg) file
-                      (MkPair InternState ImpReg updated recorded))
+                  | False => Left(QualityInputError, Pair(ParsedFile, Pair InternState ImpReg), QualityInvalidInput "incomplete parsed source")
+                  | True => Right QualityInputError (Pair(ParsedFile, Pair InternState ImpReg))
+                      (MkPair ParsedFile (Pair InternState ImpReg) file
+                        (MkPair InternState ImpReg updated recorded))
+                  end
                 end
               end
             end
           end
-      end
-      end
-      end
-      end
-    end;
+        end;
 
 def cm_parse_with_aliases (source : String) (intern : InternState)
     : Either QualityInputError (Pair ParsedFile (Pair InternState ImpReg)) :=

@@ -57,6 +57,8 @@ HOST_HOOKS = (
     ("cg_s_epoch_request", "ouro_wrap_quality_io", ("tools/clippy/session.ouro",)),
     ("cg_s_sample_heap", "ouro_wrap_quality_heap", ("tools/clippy/session.ouro",)),
     ("cm_load_file", "ouro_wrap_quality_parse", ("tools/clippy/semantic_unit.ouro",)),
+    ("cm_prepare_expanded", "ouro_wrap_quality_pure", ("tools/clippy/structural_frontend.ouro",)),
+    ("cm_lex_expanded", "ouro_wrap_quality_pure", ("tools/clippy/structural_frontend.ouro",)),
     ("next_import_token", "ouro_wrap_import_token", ("compiler/lexer.ouro",)),
     ("span_expr", "ouro_wrap_settled3", ("compiler/source_spans.ouro",)),
     # Import preprocessing rewrites the whole file. One lint cone keeps every
