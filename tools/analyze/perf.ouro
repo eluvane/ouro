@@ -181,10 +181,11 @@ def perf_accum_issues (ids : PerfIds) (ctor_like : List Nat) (r : Nat) (binders 
           (perf_calls r body)
     end;
 
-def perf_is_length (ids : PerfIds) (a : Ast) : Bool :=
+def perf_is_length (ids : PerfIds) (bound : List Nat) (a : Ast) : Bool :=
     match perf_length ids with
     | Z => False
-    | S _ => andb(ast_is(tag_app, ast_peel_ascribe a), ast_head_is(perf_length ids, a))
+    | S _ => andb (notb(mem Nat eq_nat (perf_length ids) bound))
+        (andb(ast_is(tag_app, ast_peel_ascribe a), ast_head_is(perf_length ids, a)))
     end;
 
 def perf_small_lit (n : Nat) : Bool :=
@@ -194,16 +195,19 @@ def perf_small_lit (n : Nat) : Bool :=
     end;
 
 -- 0, 1, Z, or S Z.
-def perf_small_const (ids : PerfIds) (a : Ast) : Bool :=
+def perf_small_const (ids : PerfIds) (bound : List Nat) (a : Ast) : Bool :=
     let p : Ast := ast_peel_ascribe a in
     match p with
     | ANatLit n => perf_small_lit n
     | ARange _ _ _ => False
-    | AVar v => andb(eq_nat(v, perf_zero ids), notb (eq_nat v Z))
+    | AVar v => andb (notb(mem Nat eq_nat v bound))
+        (andb(eq_nat(v, perf_zero ids), notb (eq_nat v Z)))
     | AApp f x =>
-        andb (eq_nat(ast_var_or_zero f, perf_succ ids))
+        andb (notb (orb (mem Nat eq_nat (perf_succ ids) bound)
+          (mem Nat eq_nat (perf_zero ids) bound)))
+        (andb (eq_nat(ast_var_or_zero f, perf_succ ids))
           (andb (notb (eq_nat(perf_succ ids, Z)))
-            (andb(eq_nat(ast_var_or_zero x, perf_zero ids), notb (eq_nat(perf_zero ids, Z)))))
+            (andb(eq_nat(ast_var_or_zero x, perf_zero ids), notb (eq_nat(perf_zero ids, Z))))))
     | AHole _ => False
     | ASort _ => False
     | AStr _ => False
@@ -232,8 +236,10 @@ def perf_small_const (ids : PerfIds) (a : Ast) : Bool :=
 
 -- `eq_nat (length T xs) Z` and friends: the whole list is walked to learn
 -- whether it is empty or a singleton.
-def perf_length_compare (ids : PerfIds) (a : Ast) : List PerfIssue :=
-    match perf_head_in(perf_compares ids, a) with
+def perf_length_compare (ids : PerfIds) (bound : List Nat) (a : Ast)
+    : List PerfIssue :=
+    match andb (notb(mem Nat eq_nat (perf_head_of a) bound))
+      (perf_head_in(perf_compares ids, a)) with
     | False => perf_inil
     | True =>
         match ast_args a with
@@ -245,8 +251,8 @@ def perf_length_compare (ids : PerfIds) (a : Ast) : List PerfIssue :=
                 match tail with
                 | Cons _ _ => perf_inil
                 | Nil =>
-                    match orb (andb(perf_is_length ids x, perf_small_const ids y))
-                      (andb(perf_is_length ids y, perf_small_const ids x)) with
+                    match orb (andb(perf_is_length ids bound x, perf_small_const ids bound y))
+                      (andb(perf_is_length ids bound y, perf_small_const ids bound x)) with
                     | True => perf_one (ILengthCompare Z)
                     | False => perf_inil
                     end
@@ -265,8 +271,9 @@ def perf_arm_ignores_binders (m : AstArm) : Bool :=
 -- `match length T xs with | Z => .. | S _ => ..` where no arm reads the
 -- count: a match on the list itself answers the same question in constant
 -- time.
-def perf_length_scrut (ids : PerfIds) (scrut : Ast) (branches : Ast) : List PerfIssue :=
-    match perf_is_length ids scrut with
+def perf_length_scrut (ids : PerfIds) (bound : List Nat) (scrut : Ast)
+    (branches : Ast) : List PerfIssue :=
+    match perf_is_length ids bound scrut with
     | False => perf_inil
     | True =>
         match ast_arms branches with
@@ -590,14 +597,16 @@ def perf_literal_issue (thresh : Nat) (recs : List Nat) (n : Nat) : List PerfIss
 -- Value-position walk with the enclosing fixes innermost first. Types and
 -- annotations are skipped: literals there are erased, not rebuilt.
 def perf_walk (ids : PerfIds) (ctor_like : List Nat) (thresh : Nat)
-    : List Nat -> Ast -> List PerfIssue :=
+    (initial_bound : List Nat) : List Nat -> Ast -> List PerfIssue :=
   fun (initial_recs : List Nat) (root : Ast) =>
-    (fix perf_walk (fuel : Nat) (recs : List Nat) (a : Ast) : List PerfIssue :=
+    (fix perf_walk (fuel : Nat) (recs : List Nat) (bound : List Nat)
+        (a : Ast) : List PerfIssue :=
       match fuel with
       | Z => perf_inil
       | S remaining =>
-          let descend (next_recs : List Nat) (child : Ast) : List PerfIssue :=
-            perf_walk remaining next_recs child in
+          let descend (next_recs : List Nat) (names : List Nat)
+              (child : Ast) : List PerfIssue :=
+            perf_walk remaining next_recs names child in
           match a with
           | ANatLit n => perf_literal_issue thresh recs n
           | ARange start stop _inclusive => perf_append (perf_literal_issue thresh recs start) (perf_literal_issue thresh recs stop)
@@ -606,41 +615,52 @@ def perf_walk (ids : PerfIds) (ctor_like : List Nat) (thresh : Nat)
           | ASort _ => perf_inil
           | AStr _ => perf_inil
           | AApp f x =>
-              perf_append (perf_length_compare ids a)
+              perf_append (perf_length_compare ids bound a)
                 (perf_append (perf_strict_operand ids recs a)
-                  (perf_append(descend recs f, descend recs x)))
-          | ALam _ _ body => descend recs body
+                  (perf_append(descend recs bound f, descend recs bound x)))
+          | ALam id _ body => descend recs (Cons Nat id bound) body
           | APi _ _ _ => perf_inil
-          | ALet _ _ v body => perf_append(descend recs v, descend recs body)
-          | AAscribe e _ => descend recs e
+          | ALet id _ v body => perf_append (descend recs bound v)
+              (descend recs (Cons Nat id bound) body)
+          | AAscribe e _ => descend recs bound e
           | ABinder _ _ _ => perf_inil
           | ANoBinder => perf_inil
           | AFix r binders _ body =>
               perf_append (perf_accum_issues ids ctor_like r binders body)
-                (descend(Cons Nat r recs, body))
-          | ABranch _ _ body rest => perf_append(descend recs body, descend recs rest)
+                (descend (Cons Nat r recs)
+                  (append Nat (ast_binder_ids binders) (Cons Nat r bound)) body)
+          | ABranch _ names body rest =>
+              let locals : List Nat :=
+                filter Nat (fun (id : Nat) => notb (mem Nat eq_nat id ctor_like)) names in
+              perf_append (descend recs (append Nat locals bound) body)
+                (descend recs bound rest)
           | ANoBranch => perf_inil
           | AMatch scrut branches =>
-              perf_append (perf_length_scrut ids scrut branches)
-                (perf_append(descend recs scrut, descend recs branches))
+              perf_append (perf_length_scrut ids bound scrut branches)
+                (perf_append(descend recs bound scrut, descend recs bound branches))
           | AIf condition yes no =>
-              perf_append (descend recs condition)
-                (perf_append (descend recs yes) (descend recs no))
-          | AIfLet _ _ subject yes no =>
-              perf_append (descend recs subject)
-                (perf_append (descend recs yes) (descend recs no))
+              perf_append (descend recs bound condition)
+                (perf_append (descend recs bound yes) (descend recs bound no))
+          | AIfLet _ names subject yes no =>
+              let locals : List Nat :=
+                filter Nat (fun (id : Nat) => notb (mem Nat eq_nat id ctor_like)) names in
+              perf_append (descend recs bound subject)
+                (perf_append (descend recs (append Nat locals bound) yes)
+                  (descend recs bound no))
           | ACoalesce operand fallback =>
-              perf_append(descend recs operand, descend recs fallback)
-          | APerform _ args => concat_map Ast PerfIssue (descend recs) args
-          | AHandle inner cls => perf_append(descend recs inner, descend recs cls)
-          | AClause _ _ body rest => perf_append(descend recs body, descend recs rest)
+              perf_append(descend recs bound operand, descend recs bound fallback)
+          | APerform _ args => concat_map Ast PerfIssue (descend recs bound) args
+          | AHandle inner cls => perf_append(descend recs bound inner, descend recs bound cls)
+          | AClause _ names body rest =>
+              perf_append (descend recs (append Nat names bound) body)
+                (descend recs bound rest)
           | ANoClause => perf_inil
-          | ADo xs => concat_map Ast PerfIssue (descend recs) xs
-          | AList xs => concat_map Ast PerfIssue (descend recs) xs
-          | AListSpread _ _ => concat_map Ast PerfIssue (descend recs) (ast_children a)
-          | ANamedCall _ _ => concat_map Ast PerfIssue (descend recs) (ast_children a)
+          | ADo xs => concat_map Ast PerfIssue (descend recs bound) xs
+          | AList xs => concat_map Ast PerfIssue (descend recs bound) xs
+          | AListSpread _ _ => concat_map Ast PerfIssue (descend recs bound) (ast_children a)
+          | ANamedCall _ _ => concat_map Ast PerfIssue (descend recs bound) (ast_children a)
           end
-      end) (ast_size root) initial_recs root;
+      end) (ast_size root) initial_recs initial_bound root;
 
 def perf_root_fix : Ast -> Ast :=
   fix perf_root_fix (a : Ast) : Ast :=
@@ -691,6 +711,11 @@ def analyze_perf (ids : PerfIds) (ctor_like : List Nat) (thresh : Nat) (a : Ast)
     | True => perf_inil
     | False =>
         let root : Ast := perf_root a in
-        perf_append (perf_walk ids ctor_like thresh (Nil Nat) root)
+        let bound : List Nat :=
+          match ast_root_fix a with
+          | Z => ast_params a
+          | S recursive => Cons Nat (S recursive) (ast_params a)
+          end in
+        perf_append (perf_walk ids ctor_like thresh bound (Nil Nat) root)
           (perf_conversion_issues ids ctor_like (ast_params a) root)
     end;

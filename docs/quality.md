@@ -279,6 +279,12 @@ Sibling arms retain their outer scope. A locally bound `notb` or `andb` is not
 assumed to be the standard helper. This is lexical precision over shared AST
 facts, not a proof of whole-program helper identity or arbitrary equivalence.
 
+The error-result check recognizes `io_bind` only while its name is unshadowed;
+the length-for-emptiness check likewise respects local helper and constructor
+bindings. A failure arm reads its payload only through free references: a new
+binding with the same spelling does not count, while its initializer and
+annotation can still read the preceding payload.
+
 Recommendations must also preserve evaluation. Identical-arm elimination and
 absorbing Bool constants do not recommend dropping an unknown call, `perform`,
 or workflow. Identity matches and neutral operands retain their argument once.
