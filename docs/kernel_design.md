@@ -109,7 +109,9 @@ derives each earlier-tail index alongside its certificates. Certificates are
 rebuilt from the declaration list with the same proof fuel and failure checks.
 Deferred substitutions and application processing preserve binder scope and the
 observable reduction budget. Input-work limits reject excessive input with a
-typed resource failure before recursive checking; crashes and process limits
+typed resource failure before recursive checking. The same work limit charges
+demanded local-definition expansion and lifting before materializing let
+substitutions; crashes and process limits
 are separate test failures.
 
 `CheckedProgram` is a compiler-owned representation, not an unforgeable module
