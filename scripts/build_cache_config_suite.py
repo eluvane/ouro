@@ -769,9 +769,9 @@ def test_frontend_host_protocol(tmp: Path) -> None:
                 "codegen-program-context", "mir-phase-errors", "mir-phase-nested", "mir-reachability-rounds", "mir-flow-rounds", "lower-raw-order", "lower-raw-left", "lower-survivors",
                 "pe-byte-large", "pe-byte-errors", "pe-byte-context", "pe-patch-context", "lower-bad-result", "lower-bad-result-quiet",
                 "lower-bad-chunk", "lower-bad-contracts", "caller-output", "retained-result",
-                "typed-failure", "nested-context", "allocation-context", "shared-parent-spine", "recheck-scale",
+                "typed-failure", "nested-context", "allocation-context", "shared-parent-spine", "wrapped-context", "recheck-scale",
                 "recheck-retained", "recheck-late-invalid", "recheck-missing-bodies", "recheck-zero-fuel")
-    assert len(cases) == 34 and tuple(case[1][0] for case in host.probe_cases()) == expected
+    assert len(cases) == 35 and tuple(case[1][0] for case in host.probe_cases()) == expected
     quiet = RunResult("ok", 0, "N1_HOST_MIR: emitted valid-quiet\n",
                       "n1-host: mir functions=1 live=1\nn1-host: mir-check live=1\n"
                       "n1-host: gc-infer live=1\nn1-host: annotate live=1\n"
@@ -797,6 +797,8 @@ def test_frontend_host_protocol(tmp: Path) -> None:
     host.verify_probe(typed, cases["typed-failure"])
     shared = replace(typed, stdout="FRONTEND_LINK_SELFTEST: passed shared-parent-spine\n", stderr="")
     host.verify_probe(shared, cases["shared-parent-spine"])
+    wrapped = replace(shared, stdout="FRONTEND_LINK_SELFTEST: passed wrapped-context\n")
+    host.verify_probe(wrapped, cases["wrapped-context"])
     rejected = RunResult("ok", 1, "", "n1-host: mir functions=1 live=600\n"
                          "n1-host: mir-check live=600\nn1-host: mir-check failed tag=0 n=1 live=31704\n"
                          "n1-host: mir:return\n", 0, 0)
@@ -837,6 +839,9 @@ def test_frontend_host_protocol(tmp: Path) -> None:
                (replace(shared, stdout=""), "shared-parent-spine"),
                (replace(shared, returncode=1), "shared-parent-spine"),
                (replace(shared, status="timeout"), "shared-parent-spine"),
+               (replace(wrapped, stdout=""), "wrapped-context"),
+               (replace(wrapped, returncode=1), "wrapped-context"),
+               (replace(wrapped, status="timeout"), "wrapped-context"),
                (replace(rejected, returncode=0), "bad-return"),
                (replace(rejected, stdout="N1_HOST_MIR: emitted bad-return\n"), "bad-return"),
                (replace(rejected, stderr=rejected.stderr + "n1-host: gc-infer live=1\n"), "bad-return")]
