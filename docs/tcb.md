@@ -18,6 +18,8 @@ establish declaration acceptance.
 Emission selects bodies through an index derived only from the accepted
 definition entries. Requested order, first-definition lookup, and typed
 missing/bodyless failures are preserved; the index adds no acceptance authority.
+Positivity certificate invalidation uses the earlier environment's actual
+entries; constructor reservations alone do not invalidate a certificate.
 
 `compiler/module_registry.ouro` and `compiler/module_names.ouro` resolve
 source-module names before the ordered declaration plan reaches the checker.
