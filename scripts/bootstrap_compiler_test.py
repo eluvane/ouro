@@ -194,7 +194,7 @@ class BootstrapCompilerTests(unittest.TestCase):
                          patch.dict("sys.modules", {"ouro_build": build, "stage_loop": stage, "native_tool_build": native}), \
                          patch.object(bootstrap, "ROOT", self.work / snapshot["roots"][phase]), \
                          patch.object(build, "build_c") as compile_c, \
-                         patch.object(bootstrap.frontend, "collect_units", side_effect=lambda source: snapshot["selected"]["unit_graph"][source]), \
+                         patch.object(bootstrap.frontend, "collect_units", side_effect=snapshot["selected"]["unit_graph"].__getitem__), \
                          patch.object(bootstrap.frontend, "regenerate") as emit:
                         bootstrap.worker(args)
                     if action == "c0":
