@@ -586,6 +586,12 @@ group. The `api` task runs the canonical API generators and checks, then uploads
 a review patch without publishing source changes. This artifact task does not
 run or certify a validation profile.
 
+The `dependency-locks` task updates only the two `brace-expansion` lock entries,
+verifies their registry tarball integrity and runs npm audit before uploading a
+review patch. It does not publish changes or replace dependency review. The full
+Manual profile also runs the site and editor checks in an immutable Docker image
+with read-only source mounts and retains source hashes and execution logs.
+
 Hosted path selection is fail-closed for validation: missing revisions, a Git
 error, or an empty diff runs every applicable job. An editor-only change runs
 the VS Code test job while skipping unrelated compiler work.
