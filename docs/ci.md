@@ -569,7 +569,7 @@ Host-script retirement follows the evidence rules in
 | --- | --- |
 | `ouro-pr.yml` | Parallel PR, kernel, editor, and portable checks |
 | `ouro-nightly-full.yml` | Scheduled full checks |
-| `ouro-manual-trust.yml` | On-demand check profiles |
+| `ouro-manual-trust.yml` | On-demand check profiles on Ubuntu and Windows |
 | `dependency-review.yml` | Changed dependency and workflow checks |
 | `ouro-lint.yml` | Full Ouro lint suite, manual dispatch only |
 | `ouro-release.yml` | Build host toolchains and publish tag drafts and snapshots every three days |
@@ -577,6 +577,14 @@ Host-script retirement follows the evidence rules in
 
 The release workflow builds the host toolchains described in
 [Releasing](releasing.md). Its build and assemble jobs stay read-only.
+
+Manual validates the complete selected profile on Ubuntu and Windows. With
+caching enabled, one compiler producer per OS exports the bootstrap evidence;
+each validation group verifies the artifact SHA, current source and toolchain
+before using it. `disable_cache=true` keeps independent cold builds in every
+group. The `api` task runs the canonical API generators and checks, then uploads
+a review patch without publishing source changes. This artifact task does not
+run or certify a validation profile.
 
 Hosted path selection is fail-closed for validation: missing revisions, a Git
 error, or an empty diff runs every applicable job. An editor-only change runs

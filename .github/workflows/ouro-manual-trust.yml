@@ -3,6 +3,14 @@ name: Manual
 on:
   workflow_dispatch:
     inputs:
+      task:
+        description: Validate a profile or generate a review patch
+        required: true
+        type: choice
+        default: validate
+        options:
+          - validate
+          - api
       profile:
         description: Local CI profile to run
         required: true
@@ -22,7 +30,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: ouro-manual-trust-${{ github.ref }}-${{ inputs.profile }}
+  group: ouro-manual-trust-${{ github.ref }}-${{ inputs.task || 'validate' }}-${{ inputs.profile }}
   cancel-in-progress: false
 
 defaults:
@@ -30,34 +38,11 @@ defaults:
     shell: bash
 
 jobs:
-  groups:
-    name: Select groups
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    outputs:
-      matrix: ${{ steps.groups.outputs.matrix }}
-    steps:
-      - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - name: Select complete profile inventory
-        id: groups
-        env:
-          PROFILE: ${{ inputs.profile }}
-        run: |
-          matrix=$(python3 scripts/ci_gate.py --profile "$PROFILE" --list-groups)
-          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
-
-  manual-validation:
-    name: ${{ inputs.profile }} (${{ matrix.group }})
-    needs: groups
+  api-generation:
+    name: Generate API review patch
+    if: ${{ inputs.task == 'api' }}
     runs-on: ubuntu-latest
     timeout-minutes: 120
-    strategy:
-      fail-fast: false
-      matrix:
-        group: ${{ fromJSON(needs.groups.outputs.matrix) }}
     permissions:
       contents: read
     env:
@@ -75,7 +60,281 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Identify compiler inputs
+        id: inputs
+        run: python3 scripts/ci_gate.py --compiler-artifact key >> "$GITHUB_OUTPUT"
+      - name: Restore compiler and bootstrap evidence
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            _build/c/ouro1
+            _build/c/ouro1.bootstrap.json
+            _build/bootstrap/*/report.json
+            _build/bootstrap/*/inputs.json
+            _build/bootstrap/*/out/p1/*.c
+            _build/bootstrap/*/out/p2/*.c
+          key: ouro-host-compiler-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.inputs.outputs.key }}
+      - name: Generate and verify API artifacts
+        run: |
+          set -euo pipefail
+          mkdir -p _build/ci/api-generation
+          cc --version
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          git status --porcelain > _build/ci/api-generation/initial-status.txt
+          test ! -s _build/ci/api-generation/initial-status.txt
+          git rev-parse HEAD > _build/ci/api-generation/source-commit.txt
+          sha256sum scripts/api_baseline_regen.py scripts/doc_suite.sh tools/doc.ouro std/collections.ouro > _build/ci/api-generation/source-hashes.txt
+          python3 scripts/ouro_build.py build --verbosity quiet 2>&1 | tee _build/ci/api-generation/build.log
+          python3 scripts/api_baseline_regen.py 2>&1 | tee _build/ci/api-generation/baseline-regen.log
+          sh scripts/doc_suite.sh --regen 2>&1 | tee _build/ci/api-generation/doc-regen.log
+          python3 scripts/api_baseline_regen.py --check 2>&1 | tee _build/ci/api-generation/baseline-check.log
+          sh scripts/doc_suite.sh 2>&1 | tee _build/ci/api-generation/doc-check.log
+          git ls-files --others --exclude-standard > _build/ci/api-generation/untracked-paths.txt
+          if [ -s _build/ci/api-generation/untracked-paths.txt ]; then
+            echo "API generation produced untracked files; review them before exporting a patch" >&2
+            exit 1
+          fi
+          git diff --name-only > _build/ci/api-generation/changed-paths.txt
+          while IFS= read -r path; do
+            case "$path" in
+              quality/api_surface.tsv|docs/api/*.md) ;;
+              *) echo "API generation changed an unexpected path: $path" >&2; exit 1 ;;
+            esac
+          done < _build/ci/api-generation/changed-paths.txt
+          git diff --check
+          git diff --binary --full-index -- quality/api_surface.tsv docs/api > _build/ci/api-generation/api.patch
+          sha256sum _build/ci/api-generation/api.patch > _build/ci/api-generation/patch.sha256
+      - name: Upload verified API patch
+        if: success()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: api-review-patch-${{ github.run_id }}-${{ github.run_attempt }}
+          if-no-files-found: error
+          retention-days: 14
+          path: |
+            _build/ci/api-generation/api.patch
+            _build/ci/api-generation/patch.sha256
+            _build/ci/api-generation/source-commit.txt
+            _build/ci/api-generation/source-hashes.txt
+      - name: Upload API generation reports
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: api-generation-reports-${{ github.run_id }}-${{ github.run_attempt }}
+          if-no-files-found: error
+          retention-days: 14
+          path: |
+            _build/ci/api-generation/*.log
+            _build/ci/api-generation/*.txt
+            _build/api_baseline
+            _build/doc_suite
+            _build/bootstrap/**/*.json
+            _build/bootstrap/**/*.log
 
+  groups:
+    name: Select groups
+    if: ${{ inputs.task == 'validate' || inputs.task == '' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.groups.outputs.matrix }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Select complete profile inventory
+        id: groups
+        env:
+          PROFILE: ${{ inputs.profile }}
+        run: |
+          matrix=$(python3 scripts/ci_gate.py --profile "$PROFILE" --list-groups)
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+
+  host-compiler:
+    name: Host compiler (${{ matrix.os }})
+    needs: groups
+    if: ${{ !inputs.disable_cache }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    outputs:
+      sha256_Linux: ${{ steps.producer.outputs.sha256_Linux }}
+      sha256_Windows: ${{ steps.producer.outputs.sha256_Windows }}
+      artifact_Linux: ${{ steps.producer.outputs.artifact_Linux }}
+      artifact_Windows: ${{ steps.producer.outputs.artifact_Windows }}
+    permissions:
+      contents: read
+    env:
+      CC: gcc
+      OURO_CI: "1"
+      OURO_REPRODUCIBLE: "1"
+      OURO_PACK_STRICT: "1"
+      OURO_JOBS: "10"
+      OURO_CACHE_DIR: _cache/ouro
+      OURO_BUILD_DIR: _build
+      OURO_C_BUILD_DIR: _build/c
+      OURO_CCACHE: disabled
+      OURO_STAGE_MAX: "3"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up validation Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+      - name: Install Windows gcc
+        if: ${{ runner.os == 'Windows' }}
+        run: |
+          set -euo pipefail
+          choco install mingw --yes --no-progress
+          found=""
+          for d in \
+            /c/ProgramData/mingw64/mingw64/bin \
+            /c/ProgramData/chocolatey/lib/mingw/tools/install/mingw64/bin \
+            /c/mingw64/bin
+          do
+            if [ -x "$d/gcc.exe" ]; then
+              echo "$d" >> "$GITHUB_PATH"
+              export PATH="$d:$PATH"
+              found=1
+              break
+            fi
+          done
+          if [ -z "$found" ]; then
+            echo "release toolchain: gcc not found after MinGW install" >&2
+            exit 1
+          fi
+          gcc --version
+
+      - name: Identify compiler inputs
+        id: inputs
+        run: python scripts/ci_gate.py --compiler-artifact key >> "$GITHUB_OUTPUT"
+
+      - name: Restore compiler and bootstrap evidence
+        id: compiler-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            _build/c/ouro1
+            _build/c/ouro1.bootstrap.json
+            _build/bootstrap/*/report.json
+            _build/bootstrap/*/inputs.json
+            _build/bootstrap/*/out/p1/*.c
+            _build/bootstrap/*/out/p2/*.c
+          key: ouro-manual-host-compiler-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.inputs.outputs.key }}
+
+      - name: Build and verify host compiler
+        run: python scripts/ouro_build.py build --verbosity quiet
+
+      - name: Export compiler with bootstrap evidence
+        id: bundle
+        run: python scripts/ci_gate.py --compiler-artifact export >> "$GITHUB_OUTPUT"
+
+      - name: Bind producer outputs to this OS and attempt
+        id: producer
+        env:
+          COMPILER_SHA256: ${{ steps.bundle.outputs.sha256 }}
+        run: |
+          echo "sha256_${RUNNER_OS}=$COMPILER_SHA256" >> "$GITHUB_OUTPUT"
+          echo "artifact_${RUNNER_OS}=manual-host-compiler-${{ runner.os }}-${{ github.run_id }}-${{ github.run_attempt }}" >> "$GITHUB_OUTPUT"
+
+      - name: Save compiler and bootstrap evidence
+        if: ${{ github.event_name != 'pull_request' && steps.compiler-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            _build/c/ouro1
+            _build/c/ouro1.bootstrap.json
+            _build/bootstrap/*/report.json
+            _build/bootstrap/*/inputs.json
+            _build/bootstrap/*/out/p1/*.c
+            _build/bootstrap/*/out/p2/*.c
+          key: ${{ steps.compiler-cache.outputs.cache-primary-key }}
+
+      - name: Upload verified compiler
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: manual-host-compiler-${{ runner.os }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: _build/ci/host-compiler.tar.gz
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload bootstrap reports
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: manual-host-compiler-reports-${{ runner.os }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            _build/bootstrap/**/*.json
+            _build/bootstrap/**/*.log
+          if-no-files-found: ignore
+          retention-days: 14
+
+  manual-validation:
+    name: ${{ inputs.profile }} (${{ matrix.group }}, ${{ matrix.os }})
+    needs: [groups, host-compiler]
+    if: ${{ always() && needs.groups.result == 'success' && (inputs.disable_cache || needs.host-compiler.result == 'success') }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        group: ${{ fromJSON(needs.groups.outputs.matrix) }}
+    permissions:
+      contents: read
+    env:
+      CC: gcc
+      OURO_CI: "1"
+      OURO_REPRODUCIBLE: "1"
+      OURO_PACK_STRICT: "1"
+      OURO_JOBS: "10"
+      OURO_CACHE_DIR: _cache/ouro
+      OURO_BUILD_DIR: _build
+      OURO_C_BUILD_DIR: _build/c
+      OURO_CCACHE: disabled
+      OURO_STAGE_MAX: "3"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up validation Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+      - name: Install Windows gcc
+        if: ${{ runner.os == 'Windows' }}
+        run: |
+          set -euo pipefail
+          choco install mingw --yes --no-progress
+          found=""
+          for d in \
+            /c/ProgramData/mingw64/mingw64/bin \
+            /c/ProgramData/chocolatey/lib/mingw/tools/install/mingw64/bin \
+            /c/mingw64/bin
+          do
+            if [ -x "$d/gcc.exe" ]; then
+              echo "$d" >> "$GITHUB_PATH"
+              export PATH="$d:$PATH"
+              found=1
+              break
+            fi
+          done
+          if [ -z "$found" ]; then
+            echo "release toolchain: gcc not found after MinGW install" >&2
+            exit 1
+          fi
+          gcc --version
       - name: Restore cache
         if: ${{ !inputs.disable_cache }}
         id: ouro-cache
@@ -96,20 +355,38 @@ jobs:
 
       - name: Show toolchain
         run: |
-          python3 --version
-          python3 -m pip install --disable-pip-version-check --quiet ruff==0.15.21
+          python --version
+          python -m pip install --disable-pip-version-check --quiet ruff==0.15.21
           if ! command -v shellcheck >/dev/null 2>&1; then
-            sudo apt-get update
-            sudo apt-get install -y shellcheck
+            if [ "${{ runner.os }}" = "Windows" ]; then
+              choco install shellcheck --yes --no-progress
+            else
+              sudo apt-get update
+              sudo apt-get install -y shellcheck
+            fi
           fi
           shellcheck --version
-          cc --version || true
+          gcc --version
 
-      - name: Build host compiler
-        run: python3 scripts/ouro_build.py build --verbosity quiet
+      - name: Download host compiler
+        if: ${{ !inputs.disable_cache }}
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ needs.host-compiler.outputs[format('artifact_{0}', runner.os)] }}
+          path: _build/ci
+
+      - name: Verify and install host compiler
+        if: ${{ !inputs.disable_cache }}
+        env:
+          COMPILER_SHA256: ${{ needs.host-compiler.outputs[format('sha256_{0}', runner.os)] }}
+        run: python scripts/ci_gate.py --compiler-artifact import --compiler-sha256 "$COMPILER_SHA256"
+
+      - name: Build host compiler without cache
+        if: ${{ inputs.disable_cache }}
+        run: python scripts/ouro_build.py build --verbosity quiet
 
       - name: Run profile
-        run: python3 scripts/ci_gate.py --profile "${{ inputs.profile }}" --group "${{ matrix.group }}" --out "_build/ci/${{ inputs.profile }}-${{ matrix.group }}"
+        run: python scripts/ci_gate.py --profile "${{ inputs.profile }}" --group "${{ matrix.group }}" --out "_build/ci/${{ inputs.profile }}-${{ matrix.group }}"
 
       - name: Save cache
         if: ${{ !inputs.disable_cache && github.event_name != 'pull_request' && steps.ouro-cache.outputs.cache-hit != 'true' }}
@@ -125,7 +402,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: manual-${{ inputs.profile }}-${{ matrix.group }}
+          name: manual-${{ inputs.profile }}-${{ matrix.group }}-${{ runner.os }}-${{ github.run_attempt }}
           if-no-files-found: ignore
           retention-days: 30
           path: |
