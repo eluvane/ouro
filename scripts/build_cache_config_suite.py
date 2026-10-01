@@ -1238,8 +1238,9 @@ def test_native_tool_hooks(tmp: Path) -> None:
     checker = hook(source(["compile_checked_units"]), ["compiler/driver.ouro"])
     assert "ouro_fe_compile_checked_units_clos();" in checker
     assert "ouro_wrap_" not in checker, "checker-only tools must not require a backend"
-    parser = hook(source(["cm_load_file"]), ["tools/clippy/semantic_unit.ouro"])
+    parser = hook(source(["cm_load_file", "cm_load_file_cached"]), ["tools/clippy/semantic_unit.ouro"])
     assert "ouro_wrap_quality_parse(ouro_clos(" in parser
+    assert "ouro_wrap_settled3(ouro_clos(" in parser
     assert "ouro_fe_compile_checked_units_clos" not in parser
     assert "ouro_wrap_x64_encode" not in parser
     encoder = hook(source(["x64_encode"]), ["compiler/native/x64.ouro"])
@@ -1279,6 +1280,12 @@ def test_native_tool_hooks(tmp: Path) -> None:
              "cm_load_file export value")
     rejected(source(["cm_load_file"]).replace("ouro_c10=ouro_clos(ouro_f10_,env);", "ouro_c10=0;"), (),
              "could not hook cm_load_file getter")
+    rejected(source(["cm_load_file"]), ["tools/clippy/semantic_unit.ouro"],
+             "cm_load_file_cached export name")
+    rejected(source(["cm_load_file_cached"]).replace("case 0: return ouro_g10();", ""), (),
+             "cm_load_file_cached export value")
+    rejected(source(["cm_load_file_cached"]).replace("ouro_c10=ouro_clos(ouro_f10_,env);", "ouro_c10=0;"), (),
+             "could not hook cm_load_file_cached getter")
     rejected(source(["x64_encode"]).replace("case 0: return ouro_g10();", ""), (),
              "x64_encode export value")
     rejected(source(["x64_encode"]).replace("ouro_c10=ouro_clos(ouro_f10_,env);", "ouro_c10=0;"), (),

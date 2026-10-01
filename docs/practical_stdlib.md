@@ -281,6 +281,18 @@ directory target. `std/fs_replace.ouro` provides
 and installed bytes are verified. See the [replacement contract](effects_design.md#runtime-surface)
 for metadata, refusal, and recovery conditions.
 
+`fs_kind_checked path` returns `Either FsError FsPathKind` without following
+links. Empty paths return `FsEmptyPath`; regular files, directories and
+unsafe entries have distinct constructors. `FsPathUnavailable` means that
+the OS query could not classify the path, so it does not establish absence.
+
+```ouro
+import "../std/fs.ouro";
+
+def inspect_input : IO (Either FsError FsPathKind) :=
+    fs_kind_checked "input.txt";
+```
+
 For security-sensitive inventory, use `fs_walk_checked` from `std/fs_walk.ouro`.
 It sorts children and distinguishes complete, truncated, unreadable, and unsafe
 walks. The compatibility `fs_walk` returns an empty list for every non-complete
@@ -289,7 +301,8 @@ result and must not be used to infer that a directory is empty.
 The workspace helpers `fsx_list_files_filtered` and `fsx_copy_tree_checked`
 return `FsOperationFailed` when the checked walk is incomplete or unsafe.
 Copying starts only after a complete inventory. `fsx_remove_tree_checked`
-rejects links and reparse points before enumerating their children; files
+rejects empty paths with `FsEmptyPath`. Links and reparse points are rejected
+before enumerating their children; files
 already removed earlier in the walk are not restored. These helpers do not
 provide an atomic filesystem snapshot or rollback.
 

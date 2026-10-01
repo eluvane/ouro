@@ -9,7 +9,7 @@ from ourosmith import ROOT
 from ourosmith.host import BUILD_TIMEOUT_S
 from ourosmith.surface.library import quote, string_list
 
-FEATURES = ("filesystem", "filesystem-errors", "walk", "walk-limit", "workspace-walk-errors", "workspace-remove-links", "temporary-files",
+FEATURES = ("filesystem", "filesystem-errors", "walk", "walk-limit", "workspace-walk-errors", "workspace-remove-links", "workspace-remove-empty", "temporary-files",
             "process-argv", "process-status", "environment", "stdin", "clock", "delay-action")
 
 HELPERS = """
@@ -20,6 +20,16 @@ def text_value (r : Either FsError String) : String :=
 def names_value (r : Either FsError (List String)) : String :=
   match r with | Left e => fs_error_code e
   | Right names => str_join "|" (str_sort_uniq names) end;
+def kind_value (r : Either FsError FsPathKind) : String :=
+  match r with
+  | Left e => fs_error_code e
+  | Right kind => match kind with
+    | FsPathUnavailable => "unavailable"
+    | FsRegularFile => "file"
+    | FsDirectory => "directory"
+    | FsUnsafeEntry => "unsafe"
+    end
+  end;
 def walk_value (r : FsWalkResult) : String :=
   match r with
   | FsWalkComplete names => str_join "|" (str_sort_uniq names)
@@ -72,6 +82,10 @@ def program(seed):
     observe("write", f'fs_write_checked "data/a.txt" {quote(body)}', "unit_value", "ok")
     observe("append", 'fs_append_checked "data/a.txt" "-more"', "unit_value", "ok")
     observe("read", 'fs_read_checked "data/a.txt"', "text_value", body + "-more")
+    observe("kind_file", 'fs_kind_checked "data/a.txt"', "kind_value", "file")
+    observe("kind_directory", 'fs_kind_checked "data"', "kind_value", "directory")
+    observe("kind_unavailable", 'fs_kind_checked "data/missing"', "kind_value", "unavailable")
+    observe("kind_empty", 'fs_kind_checked ""', "kind_value", "empty_path")
     observe("copy", 'fs_copy_checked "data/a.txt" "data/b.txt"', "unit_value", "ok")
     observe("copied", 'fs_read_checked "data/b.txt"', "text_value", body + "-more")
     observe("empty", 'fs_write_checked "data/empty.txt" ""', "unit_value", "ok")
@@ -108,10 +122,12 @@ def program(seed):
     observe("copytree", 'fsx_copy_tree_checked "data/tree" "data/copied"', "unit_value", "ok")
     observe("removetree", 'fsx_remove_tree_checked "data/tree"', "unit_value", "ok")
     observe("removemissingtree", 'fsx_remove_tree_checked "data/tree"', "unit_value", "ok")
+    observe("removeemptytree", 'fsx_remove_tree_checked ""', "unit_value", "empty_path")
     observe("treegone", 'fs_exists "data/tree"', "show_bool", "false")
     observe("unsafe_list", 'fsx_list_files_filtered "workspace-unsafe" (fun (_path : String) => True)', "names_value", "operation_failed")
     observe("unsafe_copy", 'fsx_copy_tree_checked "workspace-unsafe" "workspace-rejected-copy"', "unit_value", "operation_failed")
     observe("unsafe_copy_absent", 'fs_exists "workspace-rejected-copy"', "show_bool", "false")
+    observe("kind_unsafe", 'fs_kind_checked "workspace-unsafe/link"', "kind_value", "unsafe")
     observe("unsafe_remove_root", 'fsx_remove_tree_checked "workspace-unsafe/link"', "unit_value", "operation_failed")
     observe("unsafe_remove_child", 'fsx_remove_tree_checked "workspace-unsafe"', "unit_value", "operation_failed")
     observe("unsafe_sentinel", 'fs_read_checked "workspace-outside/sentinel.txt"', "text_value", f"preserved-{seed}")

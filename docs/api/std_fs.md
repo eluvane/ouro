@@ -2,7 +2,7 @@
 
 Filesystem helpers expose raw runtime prims plus checked wrappers that return Either FsError A with stable error codes.
 
-Declarations: 38.
+Declarations: 40.
 
 ## def fs_read
 
@@ -168,6 +168,22 @@ def fs_err (A : Type) (e : FsError) : IO (Either FsError A)
 ```
 def fs_nonempty_path (path : String) : Either FsError Unit
 ```
+
+## inductive FsPathKind
+
+```
+inductive FsPathKind : Type
+```
+
+No-follow classification; an OS query failure does not establish absence.
+
+## def fs_kind_checked
+
+```
+def fs_kind_checked (path : String) : IO (Either FsError FsPathKind)
+```
+
+Empty paths fail. Links, reparse points and unknown kinds remain unsafe.
 
 ## def fs_is_file
 
