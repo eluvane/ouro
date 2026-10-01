@@ -169,6 +169,10 @@ grep -F 'unknown lint option' "$out/unknown-option.err" >/dev/null
 
 # Import scanning must preserve the root lexer diagnostic in both worker modes.
 printf '%s\n' 'def text : String := "unterminated' >"$boundary/lex-malformed.ouro"
+lex_diagnostic_path="$boundary/lex-malformed.ouro"
+case "$(uname -s 2>/dev/null || echo unknown)" in
+MINGW*|MSYS*|CYGWIN*|Windows_NT*) lex_diagnostic_path=$(cygpath -m "$lex_diagnostic_path") ;;
+esac
 for mode in single-file batch-files; do
 	set +e
 	"$BIN" "--$mode" "$boundary/lex-malformed.ouro" \
@@ -177,7 +181,7 @@ for mode in single-file batch-files; do
 	set -e
 	test "$lex_status" -eq 1
 	test ! -s "$out/lex-$mode.err"
-	test "$(tr -d '\r' <"$out/lex-$mode.out")" = "$boundary/lex-malformed.ouro: lex-malformed"
+	test "$(tr -d '\r' <"$out/lex-$mode.out")" = "$lex_diagnostic_path: lex-malformed"
 done
 
 # Directory inventory, child argv and diagnostic locations must all retain
