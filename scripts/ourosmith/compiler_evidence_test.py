@@ -184,14 +184,65 @@ class CompilerEvidenceTests(EvidenceTreeTests):
         with self.assertRaisesRegex(ValueError, 'changed'):
             self.read()
 
-    def test_missing_strict_check_runtime_failure_and_missing_output_reject(self):
+    def test_missing_strict_check_and_incomplete_property_output_reject(self):
         for suffix, bad in [('.check', ''), ('.check', 'CHECK_PROCESS_FAIL exit=1\nCHECK_OK\n'),
-                            ('.check', 'CHECK_OK\nextra\n'), ('.err', 'diagnostic'),
+                            ('.check', 'CHECK_OK\nextra\n'),
                             ('.out', ''), ('.out', 'FAIL property\n')]:
             path = self.directory / ('compiler_property' + suffix)
             original = path.read_bytes()
             path.write_text(bad, encoding='utf-8')
             with self.subTest(suffix=suffix), self.assertRaises(ValueError):
+                self.read()
+            path.write_bytes(original)
+
+    def test_expected_runtime_diagnostics_are_bound_to_successful_suite_evidence(self):
+        diagnostic = ('main.ouro: type mismatch in hidden\n'
+                      'main.ouro: type mismatch in value\n'
+                      'main.ouro: duplicate declaration in Library\n'
+                      'main.ouro: lexer fuel exhausted\n')
+        error = self.directory / 'compiler_property.err'
+        empty = self.read()['artifacts'][1]['stderr_sha256']
+        error.write_text(diagnostic, encoding='utf-8')
+        receipt = self.read()
+        self.assertEqual(receipt['artifacts'][1]['stderr_sha256'], evidence.sha(error))
+        self.assertNotEqual(receipt['artifacts'][1]['stderr_sha256'], empty)
+        self.assertTrue(receipt['artifacts'][1]['default_properties'])
+
+    def test_runtime_diagnostics_cannot_hide_failed_suite_or_strict_check(self):
+        (self.directory / 'compiler_property.err').write_text('expected rejection\n', encoding='utf-8')
+        self.log.write_text(self.log_text.replace('COMPILER_CHECK_OK compiler_property-run',
+                                                 'COMPILER_CHECK_FAIL compiler_property-run'), encoding='utf-8')
+        with self.assertRaisesRegex(ValueError, 'incomplete, failed, or unknown row'):
+            self.read()
+        self.log.write_text(self.log_text, encoding='utf-8')
+        (self.directory / 'compiler_property.check').write_text('CHECK_PROCESS_FAIL exit=1\n', encoding='utf-8')
+        with self.assertRaisesRegex(ValueError, 'unsuccessful strict check'):
+            self.read()
+
+    def test_successful_nonproperty_output_is_bound_without_reinterpreting_it(self):
+        output = self.directory / 'source_spans.out'
+        for text in ('', 'FAIL expected rejection\n'):
+            with self.subTest(text=text):
+                output.write_text(text, encoding='utf-8')
+                row = self.read()['artifacts'][2]
+                self.assertEqual(row['stdout_sha256'], evidence.sha(output))
+                self.assertFalse(row['default_properties'])
+
+    def test_failed_fixture_is_rejected_by_its_canonical_suite_verdict(self):
+        (self.directory / 'source_spans.out').write_text('FAIL law\n', encoding='utf-8')
+        lines = self.log_text.splitlines()
+        failed = [lines[0], lines[1], 'COMPILER_CHECK_FAIL source_spans-run exit=1 want=0',
+                  'COMPILER_CHECK_SUITE: FAIL rows=3 out=' + self.directory.as_posix()]
+        self.log.write_text('\n'.join(failed) + '\n', encoding='utf-8')
+        with self.assertRaisesRegex(ValueError, 'success protocol'):
+            self.read()
+
+    def test_runtime_stream_files_are_required_even_for_a_successful_suite(self):
+        for extension in ('.out', '.err'):
+            path = self.directory / ('source_spans' + extension)
+            original = path.read_bytes()
+            path.unlink()
+            with self.subTest(extension=extension), self.assertRaises(OSError):
                 self.read()
             path.write_bytes(original)
 
