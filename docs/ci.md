@@ -345,9 +345,9 @@ profile. User-test and stage-loop gates remain separate.
 
 On Windows, the required frontend-security host suite also uses its freshly
 built `n1-host` to emit the 29 bounded-process API laws, runtime fixture, and
-denied-commit child as direct PE32+ images. All 38 host probes
+denied-commit child as direct PE32+ images. All 40 host probes
 remain required, including reachability/flow-round fuel, error-payload and nested
-allocation and PE patch-plan lifetime checks, descriptor renumbering, forced
+allocation, root clearing, and PE operation lifetime checks, descriptor renumbering, forced
 codegen fallback, and canonical block/body byte parity. On Windows, the same
 fresh backend also emits the existing reclamation and active-caller fixtures
 as direct PE images, including a validated descriptor renumbering across 65536.
