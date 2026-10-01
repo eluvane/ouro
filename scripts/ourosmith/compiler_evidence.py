@@ -86,7 +86,7 @@ def suite_receipt(log, compiler, shard='all'):
         raise ValueError('executed compiler rows differ from the current Ouro suite inventory')
     artifacts = []
     for name, entry in zip(names, entries, strict=True):
-        executable = directory / (name + suffix)
+        executable = directory / (name + '.exe')
         receipt, _, _ = receipt_for(executable, entry, compiler)
         check, output, error = (directory / (name + extension) for extension in ('.check', '.out', '.err'))
         if check.read_text(encoding='utf-8').splitlines() != ['CHECK_OK'] or error.read_bytes():

@@ -36,7 +36,7 @@ class CompilerEvidenceTests(EvidenceTreeTests):
         self.enterContext(patch('ourosmith.host.environment', return_value={}))
         self.native_receipt = {'binary_sha256': 'a' * 64, 'key': 'b' * 64}
         self.receipt = self.enterContext(patch.object(evidence, 'receipt_for',
-            return_value=(self.native_receipt, [], {})))
+            side_effect=self.native_receipt_for))
         entries = ['tests/compiler_suite_contract_tests.ouro', 'tests/compiler_property_tests.ouro',
                    'tests/source_span_tests.ouro']
         self.write_registry(entries)
@@ -48,11 +48,49 @@ class CompilerEvidenceTests(EvidenceTreeTests):
                          'COMPILER_CHECK_OK source_spans-run\n'
                          'COMPILER_CHECK_SUITE: PASS rows=3 out=' + self.directory.as_posix() + '\n')
         self.log.write_text(self.log_text, encoding='utf-8')
+        suffix = '.exe' if evidence.sys.platform == 'win32' else ''
+        (self.directory / ('ouro-test-suite' + suffix)).write_bytes(b'runner')
         for name in ('compiler_suite_contract', 'compiler_property', 'source_spans'):
+            (self.directory / (name + '.exe')).write_bytes(b'fixture')
             (self.directory / (name + '.check')).write_text('CHECK_OK\n', encoding='utf-8')
             (self.directory / (name + '.err')).write_bytes(b'')
             (self.directory / (name + '.out')).write_text(
                 property_output() if name == 'compiler_property' else 'ok inventory contract\n', encoding='utf-8')
+
+    def native_receipt_for(self, executable, _entry, _compiler):
+        if not Path(executable).is_file():
+            raise ValueError('native fixture executable is missing: ' + str(executable))
+        return self.native_receipt, [], {}
+
+    def test_fixture_executables_follow_the_suite_contract_on_every_host(self):
+        for platform in ('linux', 'win32'):
+            with self.subTest(platform=platform), patch.object(evidence.sys, 'platform', platform):
+                suffix = '.exe' if platform == 'win32' else ''
+                runner = self.directory / ('ouro-test-suite' + suffix)
+                runner.write_bytes(b'runner')
+                self.receipt.reset_mock()
+                self.read()
+                self.assertEqual([call.args[0] for call in self.receipt.call_args_list],
+                    [runner, self.directory / 'compiler_suite_contract.exe',
+                     self.directory / 'compiler_property.exe', self.directory / 'source_spans.exe', runner])
+
+    def test_extensionless_fixture_cannot_replace_the_suite_executable(self):
+        executable = self.directory / 'compiler_property.exe'
+        extensionless = self.directory / 'compiler_property'
+        extensionless.write_bytes(executable.read_bytes())
+        executable.unlink()
+        self.log.write_text('COMPILER_CHECK_OK compiler_property-run\n'
+                            'COMPILER_CHECK_SUITE: PASS rows=1 out=' + self.directory.as_posix() + '\n',
+                            encoding='utf-8')
+        selected = RunResult('ok', 0, 'tests/compiler_property_tests.ouro\n', '', 0.1, 10)
+        for platform in ('linux', 'win32'):
+            with self.subTest(platform=platform), patch.object(evidence.sys, 'platform', platform):
+                suffix = '.exe' if platform == 'win32' else ''
+                (self.directory / ('ouro-test-suite' + suffix)).write_bytes(b'runner')
+                self.execute.side_effect = [self.listed, selected]
+                with self.assertRaisesRegex(ValueError, 'native fixture executable is missing') as missing:
+                    evidence.suite_receipt(self.log, self.root / 'compiler', shard='2/16')
+                self.assertIn(str(executable), str(missing.exception))
 
     def read(self):
         return evidence.suite_receipt(self.log, self.root / 'compiler')
@@ -87,7 +125,7 @@ class CompilerEvidenceTests(EvidenceTreeTests):
                 name = Path(entry).stem
                 self.log.write_text(self.log_text.replace('compiler_property-run', name + '-run'),
                                     encoding='utf-8')
-                for extension in ('.check', '.out', '.err'):
+                for extension in ('.exe', '.check', '.out', '.err'):
                     (self.directory / (name + extension)).write_bytes(
                         (self.directory / ('compiler_property' + extension)).read_bytes())
                 receipt = self.read()
