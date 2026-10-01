@@ -418,36 +418,6 @@ def strip_poly_type_apps(src: str) -> tuple[str, int]:
     return out, stripped
 
 
-def _split_ctor_fields(src: str, start: int) -> tuple[list[str], int] | None:
-    """Parse `field, field, ...}` starting at start. Return (fields, end_after_})."""
-    fields: list[str] = []
-    i = start
-    depth = 0
-    cur: list[str] = []
-    while i < len(src):
-        ch = src[i]
-        if ch in "{(":
-            depth += 1
-            cur.append(ch)
-        elif ch == "}":
-            if depth == 0:
-                if cur:
-                    fields.append("".join(cur).strip())
-                return fields, i + 1
-            depth -= 1
-            cur.append(ch)
-        elif ch == ")":
-            depth -= 1
-            cur.append(ch)
-        elif ch == "," and depth == 0:
-            fields.append("".join(cur).strip())
-            cur = []
-        else:
-            cur.append(ch)
-        i += 1
-    return None
-
-
 def _is_err5_type(arg: str) -> bool:
     a = "".join(arg.split())
     return a == "ouro_err(5)" or a.startswith("ouro_err(5)") or a.startswith(
@@ -468,112 +438,262 @@ def _rebuild_ctor(tag: int, fields: list[str]) -> str:
     return f"ouro_ctor({tag},{n},(ouro_v *[]){{{inner}}})"
 
 
-def strip_ctor_type_fields(src: str, drop_pair_dummy: bool) -> tuple[str, int]:
-    """Drop leftover Type fields that extract left on constructors.
+_CTOR_DELIMITER = re.compile(r"[{}(),]")
 
-    `ouro_err(5)` is CInd extracted as a value — never a real field.
-    Parser TUs keep `POk Unit MkUnit toks pos` as tag0/3 with a dummy
-    Unit, so dummy0-leading triples are only rewritten outside pa/pb/pf.
-    Those triples are leftover `MkPair Type a b` (2-field pair).
+
+def _ctor_array_spans(src: str) -> dict[int, tuple[int, list[int]]]:
+    """Index balanced brace bodies and their direct commas in one source scan.
+
+    Both this index and the field splitter treat punctuation mechanically,
+    including punctuation in literals. Ambiguous delimiters use the splitter.
     """
-    hits: list[tuple[int, int, str]] = []
-    stripped = 0
-    start = 0
-    while True:
-        pos = src.find("ouro_ctor(", start)
-        if pos < 0:
-            break
-        i = pos + len("ouro_ctor(")
-        j = i
-        while j < len(src) and src[j] in " \t":
-            j += 1
-        tag_s = j
-        while j < len(src) and src[j].isdigit():
-            j += 1
-        if tag_s == j:
-            start = pos + 1
-            continue
-        tag = int(src[tag_s:j])
-        while j < len(src) and src[j] in " \t":
-            j += 1
-        if j >= len(src) or src[j] != ",":
-            start = pos + 1
-            continue
-        j += 1
-        while j < len(src) and src[j] in " \t":
-            j += 1
-        n_s = j
-        while j < len(src) and src[j].isdigit():
-            j += 1
-        if n_s == j:
-            start = pos + 1
-            continue
-        n = int(src[n_s:j])
-        while j < len(src) and src[j] in " \t":
-            j += 1
-        if j >= len(src) or src[j] != ",":
-            start = pos + 1
-            continue
-        j += 1
-        while j < len(src) and src[j] in " \t":
-            j += 1
-        if n == 0:
-            start = pos + 1
-            continue
-        if src[j : j + 12] != "(ouro_v *[])":
-            start = pos + 1
-            continue
-        j += 12
-        while j < len(src) and src[j] in " \t":
-            j += 1
-        if j >= len(src) or src[j] != "{":
-            start = pos + 1
-            continue
-        parsed = _split_ctor_fields(src, j + 1)
-        if parsed is None:
-            start = pos + 1
-            continue
-        fields, end = parsed
-        while end < len(src) and src[end] in " \t":
-            end += 1
-        if end < len(src) and src[end] == ")":
-            end += 1
-        new_fields = []
-        nested = 0
-        for f in fields:
-            if "ouro_ctor(" in f:
-                nf, nd = strip_ctor_type_fields(f, drop_pair_dummy)
-                new_fields.append(nf)
-                nested += nd
-            else:
-                new_fields.append(f)
-        dropped = nested
-        while new_fields and _is_err5_type(new_fields[0]):
-            new_fields = new_fields[1:]
-            dropped += 1
-        if (
-            drop_pair_dummy
-            and tag == 0
-            and len(new_fields) == 3
-            and _is_dummy0(new_fields[0])
-        ):
-            new_fields = new_fields[1:]
-            dropped += 1
-        start = end
-        if dropped == 0:
-            continue
-        hits.append((pos, end, _rebuild_ctor(tag, new_fields)))
-        stripped += dropped
+    stack: list[tuple[str, int, list[int]]] = []
+    arrays: dict[int, tuple[int, list[int]]] = {}
+    for token in _CTOR_DELIMITER.finditer(src):
+        char, pos = token.group(), token.start()
+        if char in "({":
+            stack.append((char, pos, []))
+        elif char == ",":
+            if stack and stack[-1][0] == "{":
+                stack[-1][2].append(pos)
+        else:
+            if not stack or stack[-1][0] != ("(" if char == ")" else "{"):
+                return {}
+            opening, start, commas = stack.pop()
+            if opening == "{":
+                arrays[start] = (pos, commas)
+    return {} if stack else arrays
 
-    hits.sort(key=lambda h: h[0], reverse=True)
-    out = src
-    for s0, s1, rebuilt in hits:
-        out = out[:s0] + rebuilt + out[s1:]
-    return out, stripped
+
+def _trim_span(src: str, start: int, end: int) -> tuple[int, int]:
+    while start < end and src[start].isspace():
+        start += 1
+    while end > start and src[end - 1].isspace():
+        end -= 1
+    return start, end
+
+
+def _ctor_field_spans(
+    src: str, start: int, limit: int, arrays: dict[int, tuple[int, list[int]]]
+) -> tuple[list[tuple[int, int]], int] | None:
+    indexed = arrays.get(start - 1)
+    if indexed is not None and indexed[0] < limit:
+        end, commas = indexed
+    else:
+        # Preserve the original splitter's behavior on malformed punctuation.
+        commas = []
+        depth = 0
+        end = start
+        while end < limit:
+            char = src[end]
+            if char in "{(":
+                depth += 1
+            elif char == "}":
+                if depth == 0:
+                    break
+                depth -= 1
+            elif char == ")":
+                depth -= 1
+            elif char == "," and depth == 0:
+                commas.append(end)
+            end += 1
+        else:
+            return None
+    fields = []
+    for comma in commas:
+        fields.append(_trim_span(src, start, comma))
+        start = comma + 1
+    if start < end:
+        fields.append(_trim_span(src, start, end))
+    return fields, end + 1
+
+
+def _compact_field_prefix(src: str, start: int, end: int) -> str:
+    # Erasure predicates need a short prefix; one extra non-space character
+    # distinguishes a complete dummy constructor from a longer expression.
+    prefix: list[str] = []
+    for index in range(start, end):
+        char = src[index]
+        if not char.isspace():
+            prefix.append(char)
+            if len(prefix) == len("ouro_app(ouro_err(5)") + 1:
+                break
+    return "".join(prefix)
+
+
+def strip_ctor_type_fields(src: str, drop_pair_dummy: bool) -> tuple[str, int]:
+    """Drop leftover Type fields, preserving the same constructor rewrite rules.
+
+    `ouro_err(5)` is CInd extracted as a value, never a real field. Parser
+    TUs retain the leading Unit in POk triples; only non-parser TUs drop a
+    leading dummy from a tag-zero triple after erasing leading Type fields.
+
+    Unchanged nested fields remain spans into the original source. Only a
+    constructor with a dropped field materializes rewritten text; the usual
+    strict-validation path does not copy or rescan whole nested subtrees.
+    """
+    arrays = _ctor_array_spans(src) if "ouro_ctor(" in src else {}
+
+    def rewrite(low: int, high: int) -> tuple[str | None, int]:
+        hits: list[tuple[int, int, str]] = []
+        stripped = 0
+        start = low
+        while True:
+            pos = src.find("ouro_ctor(", start, high)
+            if pos < 0:
+                break
+            j = pos + len("ouro_ctor(")
+            while j < high and src[j] in " \t":
+                j += 1
+            tag_s = j
+            while j < high and src[j].isdigit():
+                j += 1
+            if tag_s == j:
+                start = pos + 1
+                continue
+            tag = int(src[tag_s:j])
+            while j < high and src[j] in " \t":
+                j += 1
+            if j >= high or src[j] != ",":
+                start = pos + 1
+                continue
+            j += 1
+            while j < high and src[j] in " \t":
+                j += 1
+            n_s = j
+            while j < high and src[j].isdigit():
+                j += 1
+            if n_s == j:
+                start = pos + 1
+                continue
+            n = int(src[n_s:j])
+            while j < high and src[j] in " \t":
+                j += 1
+            if j >= high or src[j] != ",":
+                start = pos + 1
+                continue
+            j += 1
+            while j < high and src[j] in " \t":
+                j += 1
+            if n == 0 or not src.startswith("(ouro_v *[])", j, high):
+                start = pos + 1
+                continue
+            j += 12
+            while j < high and src[j] in " \t":
+                j += 1
+            if j >= high or src[j] != "{":
+                start = pos + 1
+                continue
+            parsed = _ctor_field_spans(src, j + 1, high, arrays)
+            if parsed is None:
+                start = pos + 1
+                continue
+            fields, end = parsed
+            while end < high and src[end] in " \t":
+                end += 1
+            if end < high and src[end] == ")":
+                end += 1
+            values: list[str | None] = []
+            prefixes: list[str] = []
+            dropped = 0
+            for a, b in fields:
+                value, count = rewrite(a, b)
+                values.append(value)
+                dropped += count
+                prefixes.append(
+                    _compact_field_prefix(src, a, b) if value is None
+                    else _compact_field_prefix(value, 0, len(value))
+                )
+            keep = 0
+            while keep < len(fields) and _is_err5_type(prefixes[keep]):
+                keep += 1
+                dropped += 1
+            if (
+                drop_pair_dummy and tag == 0 and len(fields) - keep == 3
+                and _is_dummy0(prefixes[keep])
+            ):
+                keep += 1
+                dropped += 1
+            start = end
+            if dropped == 0:
+                continue
+            new_fields = [
+                value if value is not None else src[a:b]
+                for (a, b), value in zip(fields[keep:], values[keep:], strict=True)
+            ]
+            hits.append((pos, end, _rebuild_ctor(tag, new_fields)))
+            stripped += dropped
+        if not hits:
+            return None, 0
+        chunks = []
+        cursor = low
+        for start, end, text in hits:
+            chunks.extend((src[cursor:start], text))
+            cursor = end
+        chunks.append(src[cursor:high])
+        return "".join(chunks), stripped
+
+    result, count = rewrite(0, len(src))
+    return (src if result is None else result), count
 
 
 def prefix_blob(src: str, suf: str) -> str:
     return SYM.sub(lambda m: f"ouro_{suf}_{m.group(1)}", src)
+
+
+def _ctor_span_checks() -> list[tuple[str, bool]]:
+    from unittest.mock import patch
+
+    unit = "ouro_ctor(0,0,0)"
+    err = "ouro_err(5)"
+
+    def ctor(tag: str, fields: list[str]) -> str:
+        return f"ouro_ctor({tag},{len(fields)},(ouro_v *[]){{{','.join(fields)}}})"
+
+    cascade = ctor("0", [ctor("0", [err]), "x", "y"])
+    triple = ctor("0", [unit, "x", "y"])
+    cases = [
+        ("nested erasure then dummy", cascade, True, ctor("0", ["x", "y"]), 2),
+        ("parser dummy retained", cascade, False, triple, 1),
+        ("leading dummy", triple, True, ctor("0", ["x", "y"]), 1),
+        ("nonleading error retained", ctor("1", ["x", err]), True,
+         ctor("1", ["x", err]), 0),
+        ("compact error spelling", ctor("1", ["ouro_ \t err(5 )", "x"]), True,
+         ctor("1", ["x"]), 1),
+        ("Unicode whitespace", ctor("0", ["ouro_ctor(0,\u20030,0)", "x", "y"]),
+         True, ctor("0", ["x", "y"]), 1),
+        ("Unicode decimal tag", ctor("\u0660", [err, "x"]), True,
+         ctor("0", ["x"]), 1),
+        ("declared arity does not replace field count", triple.replace(",3,", ",7,"),
+         True, ctor("0", ["x", "y"]), 1),
+        ("nested commas", ctor("1", [err, "f(x,y)", "{x,y}"]), True,
+         ctor("1", ["f(x,y)", "{x,y}"]), 1),
+        ("trailing empty field", triple[:-2] + ",})", True,
+         ctor("0", ["x", "y"]), 1),
+        ("trailing whitespace field", triple[:-2] + ", })", True,
+         triple[:-2] + ", })", 0),
+        ("unbalanced prefix", ")" + ctor("0", [err]), True, ")" + unit, 1),
+        ("missing final parenthesis", triple[:-1], True, ctor("0", ["x", "y"]), 1),
+        ("zero arity still scans nested calls", f"ouro_ctor(0,0,{ctor('0', [err])})",
+         True, f"ouro_ctor(0,0,{unit})", 1),
+        ("surrogate bytes", "\udcff" + ctor("0", [err]), True, "\udcff" + unit, 1),
+    ]
+    checks = [(name, strip_ctor_type_fields(src, flag) == (expected, count))
+              for name, src, flag, expected, count in cases]
+    clean = "ouro_nat(7)"
+    for _ in range(96):
+        clean = ctor("1", [unit, clean])
+    with patch.object(sys.modules[__name__], "_ctor_array_spans", wraps=_ctor_array_spans) as scan:
+        result, count = strip_ctor_type_fields(clean, True)
+        checks.append(("one delimiter scan for nested fields",
+                       scan.call_count == 1 and result is clean and count == 0))
+    try:
+        strip_ctor_type_fields("ouro_ctor(\u00b2,1,(ouro_v *[]){x})", True)
+    except ValueError:
+        checks.append(("invalid decimal remains an error", True))
+    else:
+        checks.append(("invalid decimal remains an error", False))
+    return checks
 
 
 def _selftest() -> int:
@@ -697,6 +817,7 @@ static ouro_v *use4(void){
             "ouro_thunk(foo,e),ouro_thunk(foo_d2,e)" in nout,
         )
     )
+    checks.extend(_ctor_span_checks())
     bad = [name for name, ok in checks if not ok]
     if bad:
         print("pack_frontend selftest FAIL", bad, file=sys.stderr)
