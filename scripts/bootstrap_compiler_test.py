@@ -31,6 +31,7 @@ class BootstrapCompilerTests(unittest.TestCase):
         self.work = self.root / "work"
         self.work.mkdir()
         self.events = []
+        self.expected_workers = 1
         self.rejected_root = None
         self.rejected_source_form = None
         self.different_c = False
@@ -56,7 +57,7 @@ class BootstrapCompilerTests(unittest.TestCase):
                     "source_form": compact_source.KIND if compact_sources else "original",
                     "cc_executable": str(cc), "cc_sha256": sha256_file(cc)}
         snapshot = {"kind": bootstrap.KIND + ".inputs", "key": hash_json(selected), "selected": selected,
-            "config": {**build.DEFAULTS, "verbosity": "quiet"}, "bridge_graph": graph,
+            "config": {**build.DEFAULTS, "jobs": 1, "verbosity": "quiet"}, "bridge_graph": graph,
             "roots": {"c0": "historical/c0", "bridge": "historical/bridge", "p1": "o", "p2": "compact" if compact_sources else "o"},
             "inputs": {path.relative_to(self.work).as_posix(): sha256_file(path)
                        for path in self.work.rglob("*") if path.is_file()}}
@@ -66,7 +67,10 @@ class BootstrapCompilerTests(unittest.TestCase):
     def fake_run(self, argv, *, cwd, env, timeout_s, memory_mb):
         self.assertEqual(timeout_s, bootstrap.TIMEOUT_S)
         self.assertEqual(memory_mb, bootstrap.MEMORY_MIB)
-        self.assertEqual(env["OURO_JOBS"], "1")
+        self.assertEqual(env["OURO_JOBS"], str(self.expected_workers))
+        self.assertEqual(env["OURO_FRONTEND_JOBS"], str(self.expected_workers))
+        self.assertEqual(env["OURO_CACHE"], "0")
+        self.assertEqual(env["OURO_CCACHE"], "disabled")
         self.events.append((list(argv), cwd))
         stdout, stderr, code, status = "", "", 0, "ok"
         if "worker" in argv:
@@ -100,6 +104,115 @@ class BootstrapCompilerTests(unittest.TestCase):
         else:
             self.fail(f"unexpected host fixture command: {argv}")
         return RunResult(status, code, stdout, stderr, 0.01, 1.0, list(argv))
+
+    def test_bootstrap_workers_require_positive_bounded_configuration(self):
+        for requested, expected in ((1, 1), (2, 2), (10, 2)):
+            with self.subTest(jobs=requested):
+                self.assertEqual(bootstrap.bootstrap_workers({"jobs": requested}, build), expected)
+        for cpus, expected in ((None, 1), (1, 1), (8, 2)):
+            with self.subTest(cpus=cpus), patch.object(build.os, "cpu_count", return_value=cpus):
+                self.assertEqual(bootstrap.bootstrap_workers({"jobs": "auto"}, build), expected)
+        for invalid in (0, -1, True, False, 1.5, "2", None):
+            with self.subTest(jobs=invalid), self.assertRaisesRegex(RuntimeError, "positive integer"):
+                bootstrap.bootstrap_workers({"jobs": invalid}, build)
+
+    def test_bootstrap_worker_budget_preserves_complete_command_order(self):
+        reference = None
+        for requested, expected in ((1, 1), (2, 2), (10, 2), ("auto", 2)):
+            with self.subTest(jobs=requested):
+                self.work = self.root / ("workers-" + str(requested))
+                self.work.mkdir()
+                self.events = []
+                self.expected_workers = expected
+                snapshot = self.fixture()
+                snapshot["config"]["jobs"] = requested
+                write_json_atomic(self.work / "inputs.json", snapshot)
+                with patch.object(build.os, "cpu_count", return_value=8), \
+                     patch.object(bootstrap, "run_limited", side_effect=self.fake_run):
+                    report = bootstrap.chain(self.work, snapshot, build)
+                self.assertTrue(report["pass"])
+                self.assertEqual(report["workers"], expected)
+                self.assertEqual([phase["phase"] for phase in report["phases"]], ["c0", "bridge", "p1", "p2"])
+                commands = [([arg.replace(str(self.work), "WORK") for arg in argv], root.relative_to(self.work).as_posix())
+                            for argv, root in self.events]
+                self.assertEqual(len(commands), 48)
+                if reference is None:
+                    reference = commands
+                else:
+                    self.assertEqual(commands, reference)
+
+    def test_parallel_bootstrap_preserves_failure_barriers(self):
+        for mode in ("root", "generated-c", "abi", "negative", "timeout", "tampered-input"):
+            with self.subTest(mode=mode):
+                self.work = self.root / ("parallel-" + mode)
+                self.work.mkdir()
+                self.events = []
+                self.expected_workers = 2
+                self.rejected_root = None
+                self.different_c = mode == "generated-c"
+                self.abi_stdout = "" if mode == "abi" else bootstrap.ABI_STDOUT
+                self.bad_stdout = "unexpected\n" if mode == "negative" else ""
+                self.bad_status = "timeout" if mode == "timeout" else "ok"
+                snapshot = self.fixture()
+                snapshot["config"]["jobs"] = 2
+                write_json_atomic(self.work / "inputs.json", snapshot)
+                if mode == "root":
+                    self.rejected_root = snapshot["selected"]["roots"][-1]
+                if mode == "tampered-input":
+                    (self.work / "o/compiler/backend.ouro").write_text("changed after freeze")
+                with patch.object(bootstrap, "run_limited", side_effect=self.fake_run), self.assertRaises(RuntimeError):
+                    bootstrap.chain(self.work, snapshot, build)
+                self.assertFalse(json.loads((self.work / "report.json").read_text())["pass"])
+                if mode == "root":
+                    self.assertFalse((self.work / "out/p1/driver_u.c").exists())
+                if mode == "abi":
+                    self.assertFalse((self.work / "out/p2/driver_u.c").exists())
+                if mode == "tampered-input":
+                    self.assertEqual(self.events, [])
+
+    def test_worker_actions_receive_the_same_bounded_budget(self):
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+
+        for index, (requested, expected, cpus) in enumerate(((1, 1, 8), (2, 2, 8), (10, 2, 8),
+                                                           ("auto", 2, 8), ("auto", 1, 1))):
+            self.work = self.root / ("dispatch-" + str(index))
+            self.work.mkdir()
+            snapshot = self.fixture()
+            with patch.object(build.os, "cpu_count", return_value=cpus):
+                snapshot["config"]["jobs"] = bootstrap.bootstrap_workers({"jobs": requested}, build)
+            write_json_atomic(self.work / "inputs.json", snapshot)
+            for action, phase in (("c0", "c0"), ("frontend", "p1"), ("link", "p1"), ("abi-build", "p2")):
+                with self.subTest(jobs=requested, action=action):
+                    (self.work / "out" / phase).mkdir(parents=True, exist_ok=True)
+                    stage = SimpleNamespace(build_config=Mock(return_value=SimpleNamespace()),
+                                            build_stage_binary=Mock(return_value={}))
+                    native = SimpleNamespace(build_tool=Mock(return_value={}))
+                    args = SimpleNamespace(snapshot=self.work / "inputs.json", phase=phase, action=action,
+                                           producer=self.root / "producer")
+                    with patch.object(build.os, "cpu_count", side_effect=AssertionError("worker re-resolved auto jobs")), \
+                         patch.dict("sys.modules", {"ouro_build": build, "stage_loop": stage, "native_tool_build": native}), \
+                         patch.object(bootstrap, "ROOT", self.work / snapshot["roots"][phase]), \
+                         patch.object(build, "build_c") as compile_c, \
+                         patch.object(bootstrap.frontend, "collect_units", side_effect=lambda source: snapshot["selected"]["unit_graph"][source]), \
+                         patch.object(bootstrap.frontend, "regenerate") as emit:
+                        bootstrap.worker(args)
+                    if action == "c0":
+                        values = compile_c.call_args.args[0].values
+                    elif action == "frontend":
+                        self.assertEqual(emit.call_args.kwargs["jobs"], expected)
+                        self.assertFalse(emit.call_args.kwargs["cache_enabled"])
+                        continue
+                    elif action == "link":
+                        self.assertEqual(stage.build_stage_binary.call_args.args[3], 1)
+                        config = stage.build_stage_binary.call_args.args[4]
+                        self.assertFalse(config.cache_enabled)
+                        values = config.build_cfg.values
+                    else:
+                        values = vars(native.build_tool.call_args.args[0])
+                    self.assertEqual(values["jobs"], expected)
+                    self.assertFalse(values["cache_enabled"])
+                    self.assertEqual(values["ccache"], "disabled")
 
     def test_compaction_preserves_literal_bytes_directives_and_line_boundaries(self):
         literal = '"  -- @entry other\\n\\\"\\\\\t\r\nЮник\u043eд  "'.encode()
@@ -209,14 +322,19 @@ class BootstrapCompilerTests(unittest.TestCase):
             stage0[name] = sha256_file(path)
         selected = {"sources": {name: sha256_file(root / name) for name in names}, "stage0": stage0,
             "archive_sha256": sha256_file(root / inputs.ARCHIVE), "manifest_sha256": sha256_file(root / inputs.MANIFEST)}
-        cfg = build.ResolvedConfig(dict(build.DEFAULTS), {})
+        cfg = build.ResolvedConfig({**build.DEFAULTS, "jobs": "auto"}, {})
         before = (root / "std/prelude.ouro").read_bytes()
         for form in ("original", compact_source.KIND):
             with self.subTest(source_form=form):
                 selected["source_form"] = form
                 work = self.work / form
                 work.mkdir()
-                snapshot = bootstrap.freeze(root, work, selected, cfg)
+                expected_workers = 1 if form == "original" else 2
+                with patch.object(build.os, "cpu_count", return_value=expected_workers):
+                    snapshot = bootstrap.freeze(root, work, selected, cfg)
+                self.assertEqual(snapshot["config"]["jobs"], expected_workers)
+                self.assertEqual(json.loads((work / "inputs.json").read_text())["config"]["jobs"], expected_workers)
+                self.assertEqual(cfg.values["jobs"], "auto")
                 self.assertEqual((work / "o/std/prelude.ouro").read_bytes(), before)
                 self.assertEqual((root / "std/prelude.ouro").read_bytes(), before)
                 self.assertNotEqual((work / "historical/bridge/std/prelude.ouro").read_bytes(), before)

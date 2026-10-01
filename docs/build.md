@@ -264,15 +264,24 @@ The build driver configures the profile, parallelism, C compiler, optimization,
 build and cache directories, optional `ccache`, verbosity, and reproducibility
 mode. `--c-only`, `--frontend`, `--dune`, and the Dune cache flags are retired; plain `build`
 selects the current C producer without discovering OCaml tools. Run `config show` to see the effective values.
-The repository default is ten workers (`Ouro.seal` `build.jobs`, CI
-`OURO_JOBS`, and the build-driver fallback). Override it with `--jobs` or
-`OURO_JOBS`.
+The repository and build-driver default is ten workers. Override it with
+`--jobs` or `OURO_JOBS`; hosted PR jobs set `OURO_JOBS=2`.
 
-The transitional compiler bootstrap runs one worker per phase with a 3 GiB
-memory limit and a 900-second timeout per command. Windows limits shared
-process-tree commit; POSIX applies an inherited address-space limit per process
-except on Darwin, which rejects finite `RLIMIT_AS`.
-Tool and stage-loop builds retain their configured worker counts.
+The transitional compiler bootstrap keeps C0, bridge, P1 and P2 in order.
+Inside each stage, C builds and split frontend generation use the configured
+worker count, capped at two. `auto` uses the build driver's CPU-count selection,
+resolved once and frozen for all bootstrap workers;
+`--jobs 1` retains serial execution. The frontend keeps its existing memory-aware
+pool throttling. Strict source checks, acceptance laws and stage barriers remain
+serial. The bootstrap report's `workers` field records the selected ceiling,
+not measured utilization.
+
+Each command retains its 3 GiB memory limit and 900-second timeout. Windows
+limits shared process-tree commit; POSIX applies an inherited address-space
+limit per process except on Darwin, which rejects finite `RLIMIT_AS`.
+Parallel POSIX children can therefore use more aggregate memory; the per-process
+limit is not a shared 3 GiB budget. Standalone tool and stage-loop builds retain
+their configured worker counts.
 
 ## C bootstrap
 
