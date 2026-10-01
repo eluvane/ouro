@@ -494,10 +494,19 @@ bootstrap fail its historical input check. A promotion therefore needs a
 separately reviewed, coordinated recovery-input update with matching runtime
 and bundle metadata. The stage-loop command does not regenerate that bundle.
 
+The drift gate verifies the committed stage0 hash manifest and the historical
+bootstrap inputs. Its regeneration reference is the current P2 frontend and
+backend C, whose installed receipt must match the current source and host
+toolchain and retain the complete P1/P2 equality evidence. Fresh frontend
+regeneration and the stage-loop fixpoint must reproduce that verified pair.
+Missing, stale, or changed evidence fails the gate. The reference stays in the
+configured bootstrap directory; regeneration does not update committed stage0.
+
 Promotion updates the committed artifacts and
 `docs/generated_artifact_hashes.sha256`. Windows staging C may use CRLF; the
 promotion writer normalizes it to LF, so drift checks compare promotion-normalized
-bytes as well as raw staging hashes. Hand editing a generated stage0 file breaks
+bytes for both the regenerated output and its P2 reference, and record raw staging
+hashes. Hand editing a generated stage0 file breaks
 the reproducibility model.
 
 [CI](ci.md#local-profiles) owns the heavier stage-loop profile for compiler,

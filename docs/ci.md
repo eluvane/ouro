@@ -72,6 +72,17 @@ The group names are `checks`, `checks-parity`, `checks-quality`, `analysis`, `ch
 `--list-groups` prints the selected profile's complete group list as JSON;
 Manual and Release use that inventory to construct their hosted matrices.
 Release metadata and assembly require every validation group to succeed.
+
+The generated-artifact drift gate retains the historical stage0 manifest checks
+and compares fresh frontend regeneration and the full stage-loop fixpoint with
+the verified current P2 generated C. The installed compiler receipt must bind
+the current source, toolchain, binary, and complete P1/P2 equality evidence before
+and after regeneration. Missing or changed evidence fails the gate; see
+[Build](build.md#generated-artifacts-and-stage-loop) for the retained seed and
+promotion contracts. Its `ouro.generated-artifact-drift-report.v2` report records
+the current reference key and artifact paths, with raw and LF-normalized hashes
+and the frozen binary, receipt, report, and input-evidence hashes.
+
 Use isolated checkouts when running
 groups concurrently: several suites own fixed fixture/output paths. The full
 local command runs every gate in registry order. The runner rejects a group
