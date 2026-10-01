@@ -86,6 +86,107 @@ def fix_cmd(*args: str) -> list[str]:
     return [str(fix_binary()), *resolved]
 
 
+_STRICT_PREPARATION: list[tuple[Path, Path, dict[str, Any]] | None] = [None]
+
+
+def strict_evidence(executable: Path, compiler: Path) -> dict[str, Any]:
+    from ourosmith.native import receipt_for
+
+    receipt, units, sources = receipt_for(executable, "tools/strict/main.ouro", compiler)
+    return {"key": receipt["key"], "binary_sha256": receipt["binary_sha256"],
+            "units": units, "sources": sources}
+
+
+def strict_preparation() -> tuple[Path, Path, dict[str, Any]]:
+    if _STRICT_PREPARATION[0] is None:
+        from ourosmith.host import prepare_entry
+
+        executable = prepare_entry("tools/strict/main.ouro", "ouro-strict-quality-firewall")
+        compiler = binary("ouro1")
+        _STRICT_PREPARATION[0] = executable, compiler, strict_evidence(executable, compiler)
+    return _STRICT_PREPARATION[0]
+
+
+def require_strict_unchanged(phase: str) -> None:
+    executable, compiler, evidence = strict_preparation()
+    if strict_evidence(executable, compiler) != evidence:
+        raise ValueError("native strict scanner inputs changed " + phase)
+
+
+def scan_source(path: Path, text: str, registry: dict[str, dict[str, Any]], profile: str,
+                native_fix: Path | None = None) -> list[strict_quality.Finding]:
+    executable, _compiler, _evidence = strict_preparation()
+    require_strict_unchanged("before execution")
+    try:
+        with patch.object(strict_quality, "_strict_binary", return_value=executable):
+            return strict_quality.scan_source(path, text, registry, profile, native_fix)
+    finally:
+        require_strict_unchanged("during execution")
+
+
+def check_strict_preparation() -> Check:
+    # Stand-ins cover preparation and transport; all rule fixtures execute the owner.
+    previous = _STRICT_PREPARATION[0]
+    executable, compiler = OUT / "strict-stand-in", OUT / "producer-stand-in"
+    evidence = {"key": "original-key", "binary_sha256": "original-binary",
+                "units": ["tools/strict/main.ouro"], "sources": {"unit.ouro": "original"}}
+    outcome = SimpleNamespace(ok=True, status="ok", returncode=0, stdout="[]", stderr="")
+    try:
+        _STRICT_PREPARATION[0] = None
+        with patch("ourosmith.host.prepare_entry", return_value=executable) as prepare, \
+                patch(__name__ + ".binary", return_value=compiler), \
+                patch(__name__ + ".strict_evidence", return_value=evidence), \
+                patch("ourosmith.limits.run_limited", return_value=outcome) as scans:
+            registry = {"code": {}}
+            for text in ("first fixture", "second fixture"):
+                if scan_source(OUT / "fixture.ouro", text, registry, "release") != []:
+                    raise AssertionError("strict scan transport changed the owner result")
+            if prepare.call_count != 1 or scans.call_count != 2:
+                raise AssertionError("strict scanner was rebuilt or a fixture was not freshly scanned")
+            for call, text in zip(scans.call_args_list, ("first fixture", "second fixture"), strict=True):
+                if (call.args[0] != [str(executable), "--scan-source", str(OUT / "fixture.ouro"), "--profile", "release"]
+                        or call.kwargs["stdin_text"] != text or call.kwargs["timeout_s"] != 1800
+                        or call.kwargs["memory_mb"] != 3072 or call.kwargs["cwd"] != ROOT):
+                    raise AssertionError("strict preparation changed a fixture frame or its limits")
+
+        _STRICT_PREPARATION[0] = None
+        with patch("ourosmith.host.prepare_entry", side_effect=ValueError("strict build refused")), \
+                patch("ourosmith.limits.run_limited") as scans:
+            try:
+                scan_source(OUT / "fixture.ouro", "source", {}, "release")
+            except ValueError as error:
+                if str(error) != "strict build refused":
+                    raise AssertionError("strict preparation lost the build failure") from error
+            else:
+                raise AssertionError("strict preparation accepted a refused build")
+            if scans.called or _STRICT_PREPARATION[0] is not None:
+                raise AssertionError("strict preparation executed or retained a failed build")
+
+        changes = ({**evidence, "key": "changed-producer-or-config"},
+                   {**evidence, "binary_sha256": "changed-binary"},
+                   {**evidence, "sources": {"unit.ouro": "changed"}},
+                   ValueError("missing or stale strict receipt"))
+        for phase in ("before", "during"):
+            for changed in changes:
+                _STRICT_PREPARATION[0] = None
+                observations = [evidence, changed] if phase == "before" else [evidence, evidence, changed]
+                with patch("ourosmith.host.prepare_entry", return_value=executable) as prepare, \
+                        patch(__name__ + ".binary", return_value=compiler), \
+                        patch(__name__ + ".strict_evidence", side_effect=observations), \
+                        patch("ourosmith.limits.run_limited", return_value=outcome) as scans:
+                    try:
+                        scan_source(OUT / "fixture.ouro", "source", {}, "release")
+                    except ValueError:
+                        pass
+                    else:
+                        raise AssertionError("strict preparation accepted changed inputs " + phase)
+                    if prepare.call_count != 1 or scans.call_count != int(phase == "during"):
+                        raise AssertionError("strict mutation caused a rebuild or an unsafe scan")
+    finally:
+        _STRICT_PREPARATION[0] = previous
+    return Check("strict-scanner-preparation", "pass", "one preparation, fresh frames/caps, build refusal and 8 mutation guards")
+
+
 def load_json_object(path: Path) -> dict[str, Any]:
     data, error = read_json_value(path)
     if error is not None:
@@ -395,7 +496,7 @@ def check_literal_composition() -> list[Check]:
         # The same bytes under unrelated names must preserve semantic findings.
         reports = []
         for name in ("literal-original.ouro", "renamed 日本語/ordinary.ouro"):
-            findings = strict_quality.scan_source(OUT / name, source, registry, "release", native)
+            findings = scan_source(OUT / name, source, registry, "release", native)
             reports.append([{key: value for key, value in finding.__dict__.items() if key != "path"}
                             for finding in findings if finding.code == "OURO-LINT029"])
         if reports[0] != reports[1] or len(reports[0]) != len(spans):
@@ -601,8 +702,8 @@ def check_syntax_fixtures() -> list[Check]:
     _cfg, registry = strict_quality.load_registry()
     bad_path = ROOT / "quality" / "fixtures" / "bad" / "syntax_surface.ouro"
     good_path = ROOT / "quality" / "fixtures" / "good" / "syntax_surface.ouro"
-    bad_findings = strict_quality.scan_source(bad_path, bad_path.read_text(encoding="utf-8"), registry, "release")
-    good_findings = strict_quality.scan_source(good_path, good_path.read_text(encoding="utf-8"), registry, "release")
+    bad_findings = scan_source(bad_path, bad_path.read_text(encoding="utf-8"), registry, "release")
+    good_findings = scan_source(good_path, good_path.read_text(encoding="utf-8"), registry, "release")
     bad_codes = {finding.code for finding in bad_findings}
     missing = sorted(EXPECTED_SYNTAX_CODES - bad_codes)
     if missing:
@@ -624,7 +725,7 @@ def check_suppression_comments() -> Check:
     for source in ('def text : String := "ouro-lint:disable-all";\n',
                    'def text : String := "-- ouro-lint:disable=*";\n',
                    'def value\' : Nat := 0; -- ouro-lint:disable=OURO-LINT029 reason=local-example\n'):
-        findings = strict_quality.scan_source(OUT / "suppression-comments.ouro", source, registry, "release")
+        findings = scan_source(OUT / "suppression-comments.ouro", source, registry, "release")
         if any(f.code.startswith("OURO-SUP") for f in findings):
             raise AssertionError(f"suppression scanner treated literal bytes as a directive: {source!r}")
     multiline = ('-- ordinary header\n'
@@ -632,7 +733,7 @@ def check_suppression_comments() -> Check:
                  'def value : Nat := 0; -- ouro-lint:disable-all\n')
     for source in ('def text : String := "漢字 -- ouro-lint:disable-all"; -- ouro-lint:disable-all\n',
                    multiline, multiline.replace("\n", "\r\n")):
-        findings = strict_quality.scan_source(OUT / "suppression-comments.ouro", source, registry, "release")
+        findings = scan_source(OUT / "suppression-comments.ouro", source, registry, "release")
         prefix = source[:source.rindex("ouro-lint:disable-all")]
         expected_line = prefix.count("\n") + 1
         expected_column = len(prefix.rsplit("\n", 1)[-1].encode("utf-8")) + 1
@@ -671,7 +772,7 @@ def check_grouped_imports() -> list[Check]:
     cases.append(("unicode-column", unicode_source, [("OURO-LINT037", 1, duplicate_column)]))
     for name, source, expected in cases:
         path = OUT / f"grouped-{name}.ouro"
-        findings = strict_quality.scan_source(path, source, registry, "release")
+        findings = scan_source(path, source, registry, "release")
         actual = [(finding.code, finding.line, finding.column) for finding in findings]
         if actual != expected:
             raise AssertionError(f"grouped import scan {name}: {actual} != {expected}")
@@ -689,7 +790,7 @@ def check_grouped_imports() -> list[Check]:
     ]
     for index, source in enumerate(malformed):
         try:
-            strict_quality.scan_source(OUT / f"malformed-import-{index}.ouro", source, registry, "release")
+            scan_source(OUT / f"malformed-import-{index}.ouro", source, registry, "release")
         except ValueError as error:
             if "malformed import declaration" not in str(error):
                 raise AssertionError(f"malformed import lost its explicit scan failure: {error}") from error
@@ -754,8 +855,10 @@ def check_release_firewall() -> Check:
 
 def main() -> int:
     OUT.mkdir(parents=True, exist_ok=True)
+    _STRICT_PREPARATION[0] = None
     checks: list[Check] = []
     try:
+        checks.append(check_strict_preparation())
         checks.append(check_rejected_manifest())
         checks.extend(check_fix_cases())
         checks.extend(check_native_fix_boundaries())
@@ -770,6 +873,7 @@ def main() -> int:
         checks.append(check_style_grouped_imports())
         checks.append(check_suppression_comments())
         checks.append(check_release_firewall())
+        require_strict_unchanged("during the suite")
     except (AssertionError, OSError, UnicodeError, ValueError) as exc:
         report = {
             "kind": "ouro.syntax-quality-suite-report.v1",
