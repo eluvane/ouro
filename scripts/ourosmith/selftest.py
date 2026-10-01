@@ -28,8 +28,12 @@ def migration_archive():
     from ourosmith.migration import KIND, contracts, legacy_categories, refresh
 
     legacy = "test"
-    manifest = "B.check.1\tbad.ouro\tcheck\tfail\t1\texpected domain\n"
-    paths = sorted(f"{legacy}/suite/{name}" for name in ("manifest.tsv", "bad.ouro", "lsp/messy.ouro"))
+    manifest = ("B.check.1\tbad.ouro\tcheck\tfail\t1\texpected domain\n"
+                "REC.B.check.ambiguous_literal\trecords/bad/ambiguous_literal.ouro\tcheck\tfail\t1\tOURO-REC-003\n"
+                "REC.B.check.update_pending\trecords/bad/update_pending.ouro\tcheck\tfail\t1\tOURO-REC-003\n")
+    paths = sorted(f"{legacy}/suite/{name}" for name in (
+        "manifest.tsv", "bad.ouro", "lsp/messy.ouro",
+        "records/bad/ambiguous_literal.ouro", "records/bad/update_pending.ouro"))
     snapshot = {"revision": "a" * 40, "tree": "b" * 40,
                 "git_blobs": {path: "c" * 40 for path in paths}, "files_sha256": {path: "d" * 64 for path in paths}}
     source = {"head": snapshot["revision"], "source_sha256": "e" * 64, "files": len(paths)}
@@ -43,6 +47,9 @@ def migration_archive():
             else:
                 layer, group, name = strategy.split("/", 2)
                 value["summary"]["layers"].setdefault(layer, {}).setdefault("coverage", {}).setdefault(group, {})[name] = 1
+    coverage = value["summary"]["layers"]["surface"]["coverage"]
+    coverage.setdefault("features", {})["form:record"] = 1
+    external.add("external/ci/ergonomics")
     matrix = {"kind": KIND, "contracts": contracts.CONTRACT_KIND, "source_manifest_sha256": hashlib.sha256(manifest.encode()).hexdigest(),
               "recoverability": {**snapshot, "status": [], "tracked": len(paths)}, "pre_retirement_source": source,
               "legacy_files": paths, "manifest_rows": count, "categories": categories, "retired": False,
