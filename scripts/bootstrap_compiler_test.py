@@ -193,7 +193,7 @@ class BootstrapCompilerTests(unittest.TestCase):
                                            producer=self.root / "producer")
                     with patch.object(build.os, "cpu_count", side_effect=AssertionError("worker re-resolved auto jobs")), \
                          patch.dict("sys.modules", {"ouro_build": build, "stage_loop": stage, "native_tool_build": native}), \
-                         patch.object(bootstrap, "ROOT", self.work / snapshot["roots"][phase]), \
+                         patch.object(bootstrap, "ROOT", (self.work / snapshot["roots"][phase]).resolve()), \
                          patch.object(build, "build_c") as compile_c, \
                          patch.object(bootstrap.frontend, "collect_units", side_effect=snapshot["selected"]["unit_graph"].__getitem__), \
                          patch.object(bootstrap.frontend, "regenerate") as emit:
@@ -214,6 +214,23 @@ class BootstrapCompilerTests(unittest.TestCase):
                     self.assertEqual(values["jobs"], expected)
                     self.assertFalse(values["cache_enabled"])
                     self.assertEqual(values["ccache"], "disabled")
+
+    def test_worker_rejects_foreign_root_and_changed_frozen_inputs(self):
+        from types import SimpleNamespace
+
+        snapshot = self.fixture()
+        args = SimpleNamespace(snapshot=self.work / "inputs.json", phase="c0", action="c0", producer=None)
+        expected_root = (self.work / snapshot["roots"]["c0"]).resolve()
+        for mismatch in ("root", "input"):
+            with self.subTest(mismatch=mismatch):
+                if mismatch == "input":
+                    (self.work / "o/compiler/backend.ouro").write_text("changed after freeze")
+                worker_root = self.root / "foreign" if mismatch == "root" else expected_root
+                with patch.object(bootstrap, "ROOT", worker_root), \
+                     patch.object(build, "build_c") as compile_c, \
+                     self.assertRaisesRegex(RuntimeError, "worker source root or frozen input mismatch"):
+                    bootstrap.worker(args)
+                compile_c.assert_not_called()
 
     def test_compaction_preserves_literal_bytes_directives_and_line_boundaries(self):
         literal = '"  -- @entry other\\n\\\"\\\\\t\r\nЮник\u043eд  "'.encode()
@@ -692,6 +709,8 @@ class BootstrapCompilerTests(unittest.TestCase):
         stage_work = cfg.path("build_dir") / "stage_loop"
 
         def regenerate(argv, *, env, log):
+            self.assertIn("OURO_REPRODUCIBLE", env)
+            self.assertEqual(log.parent, work)
             if "--out" in argv:
                 self.assertEqual(Path(argv[argv.index("--ouro1") + 1]), output)
                 self.assertIn("--no-cache", argv)
@@ -793,13 +812,13 @@ class BootstrapCompilerTests(unittest.TestCase):
             out.write_bytes(b"different current frontend\n")
             issues, _details = drift.frontend_regen_check({}, work, 1, output, references)
             self.assertEqual([row["reason"] for row in issues], ["frontend generated artifact drift"])
-            for name in references:
+            for name, reference in references.items():
                 with self.subTest(artifact=name):
                     path = stage_work / "stage2" / name
                     path.write_bytes(b"different current stage artifact\n")
                     issues, _details = drift.stage_loop_check({}, work, stage_work, references)
                     self.assertEqual([row["artifact"] for row in issues], [name])
-                    path.write_bytes(references[name].read_bytes())
+                    path.write_bytes(reference.read_bytes())
             write_json_atomic(result, {**complete, "backend_eq": False})
             issues, _details = drift.stage_loop_check({}, work, stage_work, references)
             self.assertEqual([row["reason"] for row in issues], ["stage-loop did not prove frontend/backend fixpoint"])

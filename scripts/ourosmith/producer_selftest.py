@@ -161,6 +161,87 @@ class ProducerTests(unittest.TestCase):
             surface.assert_not_called()
             faults.assert_not_called()
 
+    def test_hosted_recipes_use_prepared_helpers_with_runtime_limits(self):
+        from ourosmith.surface import manifest, tools
+        from ourosmith.surface.run import SurfaceRunner
+        from ourosmith.report import Report
+
+        class CapturedCommand(Exception):
+            pass
+
+        with self.fixture() as fixture:
+            evidence = host.toolchain_evidence(fixture.compiler, fixture.tools)
+            selected = host.toolchain_paths(evidence, compiler=fixture.compiler)
+            cold = fixture.directory / "cold"
+            value = Report(profile="nightly", generator_hash="selftest", seeds=[100000], command="helpers")
+            with patch.dict(os.environ, {"OURO1_COMPILER": "untrusted-wrapper", "SMITH_UNRELATED_ENV": "sentinel"}), \
+                 patch.object(host, "build_config", return_value=SimpleNamespace(path=lambda _key: cold)), \
+                 patch.object(host, "shell", return_value=Path(__file__)):
+                runner = SurfaceRunner(value, fixture.directory / "recipes", [100000],
+                                       timeout=20, memory_mb=2048, overrides=selected)
+            runner.seed = 100000
+            self.assertFalse(cold.exists())
+            self.assertNotIn("SMITH_UNRELATED_ENV", runner.env)
+            with patch("ourosmith.surface.run.run_limited", side_effect=CapturedCommand) as execute:
+                for recipe, name in ((tools.language_server, "ouro-lsp"), (manifest.run_checks, "ouro-test")):
+                    directory = fixture.directory / name
+                    directory.mkdir()
+                    with self.subTest(recipe=recipe.__name__), self.assertRaises(CapturedCommand):
+                        recipe(runner, directory)
+                    argv = execute.call_args.args[0]
+                    options = execute.call_args.kwargs
+                    self.assertEqual(argv[0], selected[name].as_posix())
+                    self.assertEqual(options["env"]["OURO1_COMPILER"], fixture.compiler.as_posix())
+                    self.assertEqual(options["env"]["OURO_C_BUILD_DIR"], selected["ouro-collect"].parent.as_posix())
+                    self.assertEqual(options["env"]["OURO_HOSTED_FMT"], selected["ouro-fmt"].as_posix())
+                    self.assertEqual(options["timeout_s"], 20)
+                    self.assertEqual(options["memory_mb"], 2048)
+                    self.assertEqual(options["cwd"], directory)
+                    self.assertEqual(bool(options["stdin_text"]), name == "ouro-lsp")
+            self.assertEqual(execute.call_count, 2)
+            self.assertEqual(host.toolchain_evidence(fixture.compiler, fixture.tools), evidence)
+
+    def test_helper_bindings_keep_partial_and_mutant_overrides(self):
+        from ourosmith.surface.run import SurfaceRunner
+        from ourosmith.report import Report
+
+        with self.fixture() as fixture:
+            default_env = {"OURO_C_BUILD_DIR": "configured-tools", "OURO_HOSTED_FMT": "configured-fmt"}
+            value = Report(profile="faults", generator_hash="selftest", seeds=[1], command="overrides")
+            with patch("ourosmith.surface.run.environment", return_value=default_env):
+                partial = SurfaceRunner(value, fixture.directory, [1], overrides={"ouro1": fixture.compiler})
+                changed_compiler = fixture.directory / "mutant" / "ouro1.exe"
+                changed_fmt = fixture.directory / "mutant" / "ouro-fmt.exe"
+                overrides = {**fixture.tools, "ouro1": changed_compiler, "ouro-fmt": changed_fmt}
+                mutant = SurfaceRunner(value, fixture.directory, [1], overrides=overrides)
+            self.assertEqual(partial.env["OURO1_COMPILER"], fixture.compiler.as_posix())
+            self.assertEqual(partial.env["OURO_C_BUILD_DIR"], "configured-tools")
+            self.assertEqual(partial.env["OURO_HOSTED_FMT"], "configured-fmt")
+            self.assertEqual(mutant.env["OURO1_COMPILER"], changed_compiler.as_posix())
+            self.assertEqual(mutant.env["OURO_C_BUILD_DIR"], fixture.tools["ouro-collect"].parent.as_posix())
+            self.assertEqual(mutant.env["OURO_HOSTED_FMT"], changed_fmt.as_posix())
+            self.assertEqual(mutant.overrides, overrides)
+            self.assertEqual(default_env, {"OURO_C_BUILD_DIR": "configured-tools", "OURO_HOSTED_FMT": "configured-fmt"})
+
+    def test_collector_receipt_rejects_missing_or_changed_prepared_helper(self):
+        for mutation in ("missing-receipt", "changed-binary", "stale-source"):
+            with self.subTest(mutation=mutation), self.fixture() as fixture:
+                evidence = host.toolchain_evidence(fixture.compiler, fixture.tools)
+                collector = fixture.tools["ouro-collect"]
+                receipt = Path(str(collector) + ".build.json")
+                if mutation == "missing-receipt":
+                    receipt.unlink()
+                elif mutation == "changed-binary":
+                    collector.write_bytes(b"changed collector\n" * 400)
+                else:
+                    saved = json.loads(receipt.read_text(encoding="utf-8"))
+                    saved["inputs"]["sources"]["tools/collect.ouro"] = "0" * 64
+                    saved["key"] = hash_json(saved["inputs"])
+                    receipt.write_text(json.dumps(saved), encoding="utf-8")
+                    evidence["tools"]["collect"]["build_key"] = saved["key"]
+                with self.assertRaisesRegex(ValueError, "receipt"):
+                    host.toolchain_paths(evidence, compiler=fixture.compiler)
+
     def test_cli_uses_one_producer_for_core_retained_surface_replay_and_faults(self):
         import ouro_smith
 

@@ -44,9 +44,16 @@ class SurfaceRunner:
         self.summary = report.layer("surface")
         self.coverage = {"features": {}, "negative_kinds": {}, "properties": {}}
         self.summary.coverage = self.coverage
-        self.env = environment()
+        self.env = dict(environment())
         self.overrides = overrides or {}
         self.compiler = self.tool("ouro1")
+        # Hosted checks must use the prepared producer and collector rather
+        # than starting a shared tool build inside the runtime deadline.
+        self.env["OURO1_COMPILER"] = self.compiler.as_posix()
+        if "ouro-collect" in self.overrides:
+            self.env["OURO_C_BUILD_DIR"] = self.overrides["ouro-collect"].parent.as_posix()
+        if "ouro-fmt" in self.overrides:
+            self.env["OURO_HOSTED_FMT"] = self.overrides["ouro-fmt"].as_posix()
         self.runtime_printer = self.overrides.get("runtime-printer", ROOT / "runtime/ouro_eval_main.c")
         self.module_cache = self.overrides.get("module-cache", ROOT / "scripts/selfhost_module_cache.py")
         self.cc = shutil.which("gcc") or shutil.which("cc")

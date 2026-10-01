@@ -73,6 +73,13 @@ The group names are `checks`, `checks-parity`, `checks-quality`, `analysis`, `ch
 Manual and Release use that inventory to construct their hosted matrices.
 Release metadata and assembly require every validation group to succeed.
 
+The stage-loop profile separates `checks-parity` (`parity`) and `checks-quality`
+(`syntax-quality-firewall`) from `trust`. `trust` retains Python syntax,
+strict and structural quality, and the complete stage-loop/drift gate.
+The ungrouped command retains the complete gate inventory and registry order.
+Cold Manual validation bootstraps every group independently; job and process
+limits stay unchanged.
+
 The generated-artifact drift gate retains the historical stage0 manifest checks
 and compares fresh frontend regeneration and the full stage-loop fixpoint with
 the verified current P2 generated C. The installed compiler receipt must bind
@@ -173,9 +180,13 @@ Existing suite assertions and required gates remain in place;
 these explicit invocations do not establish native bootstrap or retire the
 full PR profile.
 
-Nightly uses `checks`, `analysis`, `analyzer`, `lint`, `tests`, `samples-1`, `samples-2`, `kernel`,
-`trust`, and `compiler-1` through `compiler-16` groups. The `trust` job runs the stage-loop fixpoint/drift gate and
-then the deeper OuroSmith profile in the same checkout. `Full` runs even after
+Nightly uses `checks`, `checks-parity`, `checks-quality`, `analysis`, `analyzer`, `lint`,
+`tests`, `samples-1`, `samples-2`, `kernel`, `trust`, and `compiler-1` through `compiler-16`.
+PR, Nightly and Manual isolate parity and syntax quality in their respective
+checks groups, with the existing gate commands and per-program limits.
+The `trust` job runs the stage-loop fixpoint/drift gate, the Smith harness
+self-tests, and then the deeper OuroSmith profile in the same checkout.
+The PR `smith` group runs the same blocking self-tests before its generated profile. `Full` runs even after
 a job failure and fails unless every matrix group succeeds. Reports are
 uploaded separately as `nightly-<group>` artifacts. Hosted PR matrix jobs use static names `PR` and `Portable` so a skipped
 matrix does not publish an unevaluated expression. When those jobs run,
@@ -593,7 +604,12 @@ Manual validates the complete selected profile on Ubuntu and Windows. With
 caching enabled, one compiler producer per OS exports the bootstrap evidence;
 each validation group verifies the artifact SHA, current source and toolchain
 before using it. `disable_cache=true` keeps independent cold builds in every
-group. The `api` task runs the canonical API generators and checks, then uploads
+group. Windows Manual and Release jobs pin MinGW 16.1.0 and select only
+`C:\ProgramData\mingw64\mingw64\bin\gcc.exe`. They add its native directory to
+the next steps' `PATH` and set `CC=gcc`; a native Python check requires that
+exact compiler path and version before building or importing the compiler.
+Compiler and bootstrap receipts retain their complete identity checks.
+The `api` task runs the canonical API generators and checks, then uploads
 a review patch without publishing source changes. This artifact task does not
 run or certify a validation profile.
 

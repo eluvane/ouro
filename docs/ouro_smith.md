@@ -141,6 +141,10 @@ law drivers, uses the same 3072 MiB limit as tool preparation. Generated program
 execution retains the configured `--memory-mb` limit; preparation failures
 remain fatal.
 
+Hosted surface checks use the selected producer and the prepared collector and
+formatter from the source-bound tool map. They retain the ordinary runtime
+deadline; helper preparation stays outside those commands.
+
 Generated manifest suites run disjoint prefix batches against the same complete
 manifest. Batches contain at most 29 IDs to leave deadline headroom for
 sequential compiler scenarios. Each batch retains a 300-second deadline and
@@ -167,6 +171,8 @@ each phase's deadline, duration, and peak memory.
 
 The harness self-test exercises actual memory exhaustion and descendant
 termination, protocol validation, saved-input replay, and failure reporting.
+The blocking `smith-selftest` CI gate runs it in the PR `smith` group and in
+Nightly and Manual `trust` groups before their generated Smith profiles.
 Checker fault injection patches temporary copies of the canonical Ouro
 checker and builds the designated detector with exact input receipts. Each
 mutant requires a clean unmodified baseline and the named semantic failure.

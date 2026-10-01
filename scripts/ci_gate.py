@@ -90,15 +90,17 @@ PR_GROUPS: dict[str, tuple[str, ...]] = {
         "test",
         "compiler-boundary",
     ),
-    "smith": ("ouro-smith",),
+    "smith": ("smith-selftest", "ouro-smith"),
     "samples-1": ("samples-1",),
     "samples-2": ("samples-2",),
     **{f"compiler-{index}": (f"compiler-checking-{index}",) for index in range(1, COMPILER_SHARDS + 1)},
 }
 
 NIGHTLY_GROUPS: dict[str, tuple[str, ...]] = {
-    "checks": (*tuple("cache-parity-full" if name == "cache-parity-module" else name
-                      for name in PR_GROUPS["checks"]), "parity", "syntax-quality-firewall"),
+    "checks": tuple("cache-parity-full" if name == "cache-parity-module" else name
+                    for name in PR_GROUPS["checks"]),
+    "checks-parity": PR_GROUPS["checks-parity"],
+    "checks-quality": PR_GROUPS["checks-quality"],
     "analysis": PR_GROUPS["analysis"],
     "analyzer": ("analyze-precision", "analyze-production"),
     "lint": PR_GROUPS["lint"],
@@ -108,7 +110,7 @@ NIGHTLY_GROUPS: dict[str, tuple[str, ...]] = {
     "kernel": (*PR_GROUPS["checker"], "ouro-smith-kernel"),
     # Keep these in one checkout and preserve registry order. Smith must bind
     # its provenance to the tool binaries installed by the stage loop.
-    "trust": ("stage-loop-fixpoint-and-generated-drift", "ouro-smith-nightly"),
+    "trust": ("stage-loop-fixpoint-and-generated-drift", "smith-selftest", "ouro-smith-nightly"),
     **{name: gates for name, gates in PR_GROUPS.items() if name.startswith("compiler-")},
 }
 KERNEL_GROUPS: dict[str, tuple[str, ...]] = {
@@ -119,10 +121,14 @@ KERNEL_GROUPS: dict[str, tuple[str, ...]] = {
     ),
     **{name: gates for name, gates in PR_GROUPS.items() if name.startswith("compiler-")},
 }
-STAGE_LOOP_GROUPS = {"trust": (
-    "python-syntax", "parity", "syntax-quality-firewall", "strict-quality-firewall",
-    "structural-quality-suite", "structural-quality", "stage-loop-fixpoint-and-generated-drift",
-)}
+STAGE_LOOP_GROUPS = {
+    "checks-parity": ("parity",),
+    "checks-quality": ("syntax-quality-firewall",),
+    "trust": (
+        "python-syntax", "strict-quality-firewall", "structural-quality-suite",
+        "structural-quality", "stage-loop-fixpoint-and-generated-drift",
+    ),
+}
 DOCS_GROUPS = {"docs": (
     "github-workflow-gate", "github-project-gate", "api-baseline-drift", "doc", "docs-examples",
 )}
@@ -178,7 +184,7 @@ PR_BASE_GATES = (
     "syntax-quality-firewall", "strict-quality-firewall",
     "structural-quality-suite", "structural-quality", "hygiene",
 )
-TOOL_INTEGRATION_GATES = ("test", "ouro-smith", "samples-1", "samples-2", "lint")
+TOOL_INTEGRATION_GATES = ("test", "smith-selftest", "ouro-smith", "samples-1", "samples-2", "lint")
 # These gates take the changed paths as input. A selection without a routing
 # plan cannot run them; the complete lint gate owns those runs.
 PATH_INPUT_GATES = ("lint-changed",)
@@ -745,12 +751,13 @@ def gates() -> list[Gate]:
         Gate("structural-quality-suite", [sys.executable, "scripts/structural_quality_suite.py"], ("pr", "nightly", "manual", "stage-loop")),
         Gate("structural-quality", [sys.executable, "scripts/strict_quality_firewall.py", "--structural"], ("pr", "nightly", "manual", "stage-loop")),
         Gate("hygiene", ["sh", "scripts/hygiene.sh"], ("pr", "nightly", "manual", "kernel")),
-        # Native suites above may rebuild tools. Bind Smith's report to the
-        # final installed binaries so validation can reuse this complete run.
-        Gate("ouro-smith", [sys.executable, "scripts/ouro_smith.py", "--profile", "pr", "--out", "_build/ci/smith-pr"], ("pr",)),
         Gate("quickstart-smoke", ["sh", "scripts/quickstart_smoke.sh"], ("nightly", "manual")),
         Gate("ouro-smith-kernel", [sys.executable, "scripts/ouro_smith.py", "--profile", "kernel", "--out", "_build/ci/smith-kernel"], ("nightly", "manual", "kernel", "kernel-extra")),
         Gate("stage-loop-fixpoint-and-generated-drift", [sys.executable, "scripts/generated_artifact_drift_check.py", "--mode", "stage-loop", "--work", "_build/generated_artifact_drift_stage_loop"], ("nightly", "manual", "stage-loop")),
+        Gate("smith-selftest", [sys.executable, "scripts/ouro_smith.py", "--self-test"], ("pr", "nightly", "manual")),
+        # Native suites above may rebuild tools. Bind Smith's report to the
+        # final installed binaries so validation can reuse this complete run.
+        Gate("ouro-smith", [sys.executable, "scripts/ouro_smith.py", "--profile", "pr", "--out", "_build/ci/smith-pr"], ("pr",)),
         Gate("ouro-smith-nightly", [sys.executable, "scripts/ouro_smith.py", "--profile", "nightly", "--out", "_build/ci/smith-nightly"], ("nightly", "manual")),
         Gate("selfhost-bootstrap-evidence", [sys.executable, "scripts/selfhost_bootstrap_evidence.py", "--out", "_build/bootstrap/evidence.json"], ("bootstrap",)),
     ]
@@ -788,11 +795,50 @@ def select_group(all_gates: Sequence[Gate], profile: str, group: str) -> list[Ga
     return [gate for gate in all_gates if profile in gate.profiles and gate.name in names]
 
 
+def windows_gcc_contract_failures(content: str, expected_steps: int) -> list[str]:
+    failures: list[str] = []
+    for name, required in (
+        ("Install Windows gcc", (
+            "if: ${{ runner.os == 'Windows' }}",
+            "choco install mingw --version 16.1.0 --yes --no-progress",
+            "gcc_bin=/c/ProgramData/mingw64/mingw64/bin",
+            'if [ ! -x "$gcc_bin/gcc.exe" ]; then',
+            'cygpath -w "$gcc_bin" >> "$GITHUB_PATH"',
+            'echo "CC=gcc" >> "$GITHUB_ENV"',
+        )),
+        ("Verify Windows gcc", (
+            "if: ${{ runner.os == 'Windows' }}",
+            'Path("C:/ProgramData/mingw64/mingw64/bin/gcc.exe").resolve()',
+            'shutil.which(os.environ["CC"])',
+            "selected is None or Path(selected).resolve() != expected",
+            'if version != "16.1.0":',
+            "raise SystemExit",
+        )),
+    ):
+        steps = re.findall(rf"^      - name: {name}\n(.*?)(?=^      - name: |\Z)",
+                           content, re.MULTILINE | re.DOTALL)
+        if len(steps) != expected_steps or any(item not in step for step in steps for item in required):
+            failures.append("Windows workflows must retain pinned native gcc: " + name)
+    return failures
+
+
 def run_self_tests(all_gates: Sequence[Gate]) -> int:
     failures: list[str] = []
     failures.extend(summary_contract_failures())
     failures.extend(routing_contract_failures())
     failures.extend(provenance_contract_failures())
+    for workflow, expected_steps in (("ouro-manual-trust.yml", 2), ("ouro-release.yml", 1)):
+        content = (ROOT / ".github/workflows" / workflow).read_text(encoding="utf-8")
+        failures.extend(windows_gcc_contract_failures(content, expected_steps))
+        for before, after in (
+            ("--version 16.1.0 ", ""),
+            ('cygpath -w "$gcc_bin"', 'echo "$gcc_bin"'),
+            ('echo "CC=gcc"', 'echo "CC=cc"'),
+            ("Verify Windows gcc", "Show Windows gcc"),
+            ('if version != "16.1.0":', 'if version != "15.2.0":'),
+        ):
+            if not windows_gcc_contract_failures(content.replace(before, after, 1), expected_steps):
+                failures.append("Windows toolchain regression accepted: " + workflow + ": " + before)
     for profile, groups in PROFILE_GROUPS.items():
         try:
             validate_groups(all_gates, profile, groups)
@@ -853,9 +899,26 @@ def run_self_tests(all_gates: Sequence[Gate]) -> int:
     release_workflow = (ROOT / ".github/workflows/ouro-release.yml").read_text(encoding="utf-8")
     if "        exclude:\n          - group: lint\n" not in release_workflow:
         failures.append("release validation must exclude manual-only lint")
-    trust = [gate.name for gate in select_group(all_gates, "nightly", "trust")]
-    if trust != ["stage-loop-fixpoint-and-generated-drift", "ouro-smith-nightly"]:
-        failures.append("nightly must run stage-loop before OuroSmith in the same group")
+    for group in ("checks-parity", "checks-quality"):
+        if NIGHTLY_GROUPS.get(group) != PR_GROUPS[group]:
+            failures.append("nightly/manual must retain the isolated " + group + " group")
+    smith_selftest = next((gate for gate in all_gates if gate.name == "smith-selftest"), None)
+    if smith_selftest is None or not smith_selftest.blocking \
+            or smith_selftest.cmd != [sys.executable, "scripts/ouro_smith.py", "--self-test"] \
+            or smith_selftest.profiles != ("pr", "nightly", "manual"):
+        failures.append("Smith harness self-tests must remain a blocking profile gate")
+    if [gate.name for gate in select_group(all_gates, "pr", "smith")] != ["smith-selftest", "ouro-smith"]:
+        failures.append("PR Smith must run harness self-tests before the generated profile")
+    for profile in ("nightly", "manual"):
+        trust = [gate.name for gate in select_group(all_gates, profile, "trust")]
+        if trust != ["stage-loop-fixpoint-and-generated-drift", "smith-selftest", "ouro-smith-nightly"]:
+            failures.append(profile + " must run stage-loop, Smith self-tests and nightly Smith in order")
+    for group, expected in (("checks-parity", ["parity"]),
+                            ("checks-quality", ["syntax-quality-firewall"])):
+        selected = ([gate.name for gate in select_group(all_gates, "stage-loop", group)]
+                    if group in STAGE_LOOP_GROUPS else [])
+        if selected != expected:
+            failures.append(f"stage-loop/{group} must isolate its long checks")
     profile_names = {profile: {gate.name for gate in all_gates if profile in gate.profiles}
                      for profile in ("pr", "kernel", "kernel-extra", "docs")}
     if profile_names["kernel-extra"] != profile_names["kernel"] - profile_names["pr"]:
@@ -929,6 +992,9 @@ def routing_contract_failures() -> list[str]:
 
     failures: list[str] = []
     full = set(full_path_selection("selftest").gates)
+    for path in ("scripts/ourosmith/producer_selftest.py", "scripts/ourosmith/surface/run.py", "tools/lsp.ouro"):
+        if not {"smith-selftest", "ouro-smith"} <= set(classify_paths([path]).gates):
+            failures.append("Smith route omitted harness regression coverage: " + path)
     for path, expected in CONTROL_PATH_GATES.items():
         selected = classify_paths([path])
         required = set(CONTROL_BASE_GATES) | set(expected)
