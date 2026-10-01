@@ -75,6 +75,25 @@ class CompilerEvidenceTests(EvidenceTreeTests):
         self.assertEqual(self.receipt.call_count, 5)
         self.assertEqual(self.execute.call_args.args[0][-2:], ['--native-suite=compiler-checking', '--list'])
 
+    def test_current_inventory_accepts_registered_nested_and_non_test_paths(self):
+        for entry in ('tests/language_ergonomics/parser_laws.ouro',
+                      'tests/compact_nat_runtime.ouro',
+                      'tests/language_ergonomics/where_parser_laws.ouro'):
+            with self.subTest(entry=entry):
+                entries = ['tests/compiler_suite_contract_tests.ouro', entry,
+                           'tests/source_span_tests.ouro']
+                self.write_registry(entries)
+                self.listed.stdout = '\n'.join(entries) + '\n'
+                name = Path(entry).stem
+                self.log.write_text(self.log_text.replace('compiler_property-run', name + '-run'),
+                                    encoding='utf-8')
+                for extension in ('.check', '.out', '.err'):
+                    (self.directory / (name + extension)).write_bytes(
+                        (self.directory / ('compiler_property' + extension)).read_bytes())
+                receipt = self.read()
+                self.assertEqual(receipt['inventory'], entries)
+                self.assertEqual([row['entry'] for row in receipt['artifacts']], entries)
+
     def test_partial_reordered_duplicate_unknown_and_failed_logs_reject(self):
         lines = self.log_text.splitlines()
         candidates = [[], lines[:-1], [*lines, 'extra'], [lines[1], lines[0], lines[2], lines[3]],
@@ -96,7 +115,14 @@ class CompilerEvidenceTests(EvidenceTreeTests):
         for field, value in [('status', 'timeout'), ('returncode', 1), ('stderr', 'failure'),
                              ('stdout', ''), ('stdout', self.listed.stdout * 2),
                              ('stdout', '../outside.ouro\n'),
-                             ('stdout', 'tests/compiler_suite_contract_tests.ouro\n')]:
+                             ('stdout', 'tests/compiler_suite_contract_tests.ouro\n'),
+                             ('stdout', '\n'.join(reversed(self.listed.stdout.splitlines())) + '\n'),
+                             ('stdout', self.listed.stdout.replace('tests/compiler_property_tests.ouro',
+                                'tests/language_ergonomics/foreign_laws.ouro')),
+                             ('stdout', self.listed.stdout.replace('tests/compiler_property_tests.ouro',
+                                'tests/../outside.ouro')),
+                             ('stdout', self.listed.stdout.replace('tests/compiler_property_tests.ouro',
+                                'not a source path'))]:
             result = deepcopy(self.listed)
             setattr(result, field, value)
             self.execute.return_value = result

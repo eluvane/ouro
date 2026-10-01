@@ -67,8 +67,8 @@ def suite_receipt(log, compiler, shard='all'):
     listed = run_limited(command,
                          cwd=ROOT, env=environment(jobs=1), timeout_s=30, memory_mb=3072)
     inventory = listed.stdout.splitlines()
-    if (not listed.ok or listed.stderr or not inventory or len(inventory) != len(set(inventory))
-            or any(not re.fullmatch(r'tests/[a-z][a-z0-9_]*_tests\.ouro', entry) for entry in inventory)):
+    if (not listed.ok or listed.stderr or not inventory
+            or len(inventory) != len(set(inventory))):
         raise ValueError('current Ouro suite inventory is unavailable or malformed')
     registered = compiler_fixture_rows(ROOT)
     if inventory != [entry for _, entry in registered]:
