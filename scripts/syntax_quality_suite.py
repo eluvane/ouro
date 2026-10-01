@@ -101,7 +101,7 @@ def strict_preparation() -> tuple[Path, Path, dict[str, Any]]:
     if _STRICT_PREPARATION[0] is None:
         from ourosmith.host import prepare_entry
 
-        executable = prepare_entry("tools/strict/main.ouro", "ouro-strict-quality-firewall")
+        executable = prepare_entry("tools/strict/main.ouro", "ouro-syntax-quality-scanner")
         compiler = binary("ouro1")
         _STRICT_PREPARATION[0] = executable, compiler, strict_evidence(executable, compiler)
     return _STRICT_PREPARATION[0]
@@ -143,6 +143,7 @@ def check_strict_preparation() -> Check:
                     raise AssertionError("strict scan transport changed the owner result")
             if prepare.call_count != 1 or scans.call_count != 2:
                 raise AssertionError("strict scanner was rebuilt or a fixture was not freshly scanned")
+            prepare.assert_called_once_with("tools/strict/main.ouro", "ouro-syntax-quality-scanner")
             for call, text in zip(scans.call_args_list, ("first fixture", "second fixture"), strict=True):
                 if (call.args[0] != [str(executable), "--scan-source", str(OUT / "fixture.ouro"), "--profile", "release"]
                         or call.kwargs["stdin_text"] != text or call.kwargs["timeout_s"] != 1800
