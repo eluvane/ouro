@@ -1791,7 +1791,7 @@ def main() -> int:
     test_seal_parse()
     test_host_stack_link_flags()
     with tempfile.TemporaryDirectory(prefix="ouro-build-suite-") as d:
-        tmp = Path(d)
+        tmp = Path(d).resolve()
         test_clang_bracket_depth(tmp)
         test_memory_preparation_failure(tmp)
         test_collect_build_protocol(tmp)
