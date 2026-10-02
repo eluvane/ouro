@@ -854,7 +854,7 @@ static ouro_v *use4(void){
         "(ouro_v *[]){ouro_thunk(alpha_d2,e),ouro_thunk(alpha_d3,e),"
         "ouro_ctor(0,1,(ouro_v *[]){ouro_thunk(beta,e)})});}\n"
         "static ouro_v *tail(void){return ouro_case(s,3,"
-        "(ouro_v *[]){beta_d2,ouro_thunk(beta,e),beta_d3});}\n"
+        "(ouro_v *[]){beta_d2,ouro_thunk(beta_d3,e),beta_d3});}\n"
         "static ouro_v *prefix(ouro_env *e,ouro_v *a){return ouro_thunk(alpha_extra,e);}\n"
     )
     interleaved_out = uniquify(interleaved)
