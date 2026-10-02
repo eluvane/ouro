@@ -41,8 +41,10 @@ bodies. Runtime platform sources, `std/process.ouro`, `std/collections.ouro`,
 unless the selected root imports them directly or the root itself is under
 `runtime/`. Harvesting that platform cone in one process exceeds the lint
 address-space cap. Imported modules other than `std/` contribute declaration names and signature
-arity. Their result trees are dropped: keeping them for one heavy root exceeds
-the lint address-space cap. Those imports are parsed without token-span
+arity. A nullary constructor whose original signature returns its declared parent
+also keeps that parent as one `EVar`; the current family, module and visibility
+checks still govern its proof. Other result trees are dropped: keeping them for
+one heavy root exceeds the lint address-space cap. Those imports are parsed without token-span
 wrappers. The selected root still records spans. `std/` imports keep arity and
 the result spine, so checked Either and IO APIs still classify. Queue, file-inventory and
 graph-fuel limits remain mandatory; a missing import or exhausted limit returns
