@@ -4,19 +4,34 @@
 # frontend. Content-addressed harvest reuse lives in the lint/clippy workers.
 set -eu
 phase=all
+shard=
 case "$#" in
 0) ;;
 1)
 	case "$1" in
 	--phase=all|--phase=fixtures|--phase=production|--phase=clippy) phase=${1#--phase=} ;;
 	*)
-		printf '%s\n' 'usage: lint_suite.sh [--phase=all|fixtures|production|clippy]' >&2
+		printf '%s\n' 'usage: lint_suite.sh [--phase=all|fixtures|production|clippy] [--shard=1/4|2/4|3/4|4/4]' >&2
+		exit 2
+		;;
+	esac
+	;;
+2)
+	if [ "$1" != --phase=production ]; then
+		printf '%s\n' 'usage: lint_suite.sh [--phase=all|fixtures|production|clippy] [--shard=1/4|2/4|3/4|4/4]' >&2
+		exit 2
+	fi
+	phase=production
+	case "$2" in
+	--shard=1/4|--shard=2/4|--shard=3/4|--shard=4/4) shard=${2#--shard=} ;;
+	*)
+		printf '%s\n' 'usage: lint_suite.sh [--phase=all|fixtures|production|clippy] [--shard=1/4|2/4|3/4|4/4]' >&2
 		exit 2
 		;;
 	esac
 	;;
 *)
-	printf '%s\n' 'usage: lint_suite.sh [--phase=all|fixtures|production|clippy]' >&2
+	printf '%s\n' 'usage: lint_suite.sh [--phase=all|fixtures|production|clippy] [--shard=1/4|2/4|3/4|4/4]' >&2
 	exit 2
 	;;
 esac
@@ -379,8 +394,14 @@ done
 # One driver: language, proven style, and semantic Clippy. Sequential
 # family dispatch keeps json and the compiler frontend in separate
 # processes. Do not raise the 8 GiB parent / 3072 MiB Clippy caps.
-sh "$ROOT/scripts/ouro1.sh" lint --deny std compiler tools "$@" \
-	"$production/samples/pkg" samples/bench/core_suite.ouro
+if [ -n "$shard" ]; then
+	set -- --shard "$shard" std compiler tools "$@" \
+		"$production/samples/pkg" samples/bench/core_suite.ouro
+else
+	set -- std compiler tools "$@" \
+		"$production/samples/pkg" samples/bench/core_suite.ouro
+fi
+sh "$ROOT/scripts/ouro1.sh" lint --deny "$@"
 fi
 
 if [ "$phase" = all ] || [ "$phase" = clippy ]; then
@@ -416,5 +437,9 @@ fi
 if [ "$phase" = all ]; then
 	echo "lint_suite: OK"
 else
-	echo "lint_suite: OK phase=$phase"
+	if [ -n "$shard" ]; then
+		echo "lint_suite: OK phase=$phase shard=$shard"
+	else
+		echo "lint_suite: OK phase=$phase"
+	fi
 fi

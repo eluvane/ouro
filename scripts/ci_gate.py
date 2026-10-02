@@ -26,6 +26,7 @@ ROOT = Path(__file__).resolve().parents[1]
 rel = bind_relative_path(ROOT, resolve=True)
 REPORT_KIND = "ouro.ci-gate-report.v1"
 COMPILER_SHARDS = 16
+LINT_PRODUCTION_SHARDS = 4
 
 
 @dataclass(frozen=True)
@@ -104,7 +105,8 @@ NIGHTLY_GROUPS: dict[str, tuple[str, ...]] = {
     "analysis": PR_GROUPS["analysis"],
     "analyzer": ("analyze-precision", "analyze-production"),
     "lint-fixtures": ("lint-fixtures",),
-    "lint-production": ("lint-production",),
+    **{f"lint-production-{index}": (f"lint-production-{index}",)
+       for index in range(1, LINT_PRODUCTION_SHARDS + 1)},
     "lint-clippy": ("lint-clippy",),
     "tests": (*PR_GROUPS["tests"], "quickstart-smoke"),
     "samples-1": PR_GROUPS["samples-1"],
@@ -740,9 +742,16 @@ def gates() -> list[Gate]:
         Gate("pkg", ["sh", "scripts/pkg_suite.sh"], ("pr", "nightly", "manual"), env=(("PKG_SUITE_OUT", "_build/pkg_suite"),)),
         Gate("doc", ["sh", "scripts/doc_suite.sh"], ("pr", "nightly", "manual", "docs"), env=(("DOC_SUITE_OUT", "_build/doc_suite"),)),
         Gate("lint", ["sh", "scripts/lint_suite.sh"], ("pr",), env=(("LINT_SUITE_OUT", "_build/lint_suite"),)),
-        *(Gate(f"lint-{phase}", ["sh", "scripts/lint_suite.sh", f"--phase={phase}"],
-               ("nightly", "manual"), env=(("LINT_SUITE_OUT", f"_build/lint_suite-{phase}"),))
-          for phase in ("fixtures", "production", "clippy")),
+        Gate("lint-fixtures", ["sh", "scripts/lint_suite.sh", "--phase=fixtures"],
+             ("nightly", "manual"), env=(("LINT_SUITE_OUT", "_build/lint_suite-fixtures"),)),
+        *(Gate(f"lint-production-{index}",
+               ["sh", "scripts/lint_suite.sh", "--phase=production",
+                f"--shard={index}/{LINT_PRODUCTION_SHARDS}"],
+               ("nightly", "manual"),
+               env=(("LINT_SUITE_OUT", f"_build/lint_suite-production-{index}"),))
+          for index in range(1, LINT_PRODUCTION_SHARDS + 1)),
+        Gate("lint-clippy", ["sh", "scripts/lint_suite.sh", "--phase=clippy"],
+             ("nightly", "manual"), env=(("LINT_SUITE_OUT", "_build/lint_suite-clippy"),)),
         # main() appends the changed production sources from the routing plan.
         Gate("lint-changed", ["sh", "scripts/ouro1.sh", "lint", "--deny", "--"], ("pr",)),
         Gate("lsp", ["sh", "scripts/lsp_suite.sh"], ("pr", "nightly", "manual"), env=(("LSP_SUITE_OUT", "_build/lsp_suite"),)),
@@ -802,8 +811,10 @@ def validate_groups(all_gates: Sequence[Gate], profile: str, groups: dict[str, t
 
 def group_gate_names(profile: str, group: str) -> tuple[str, ...]:
     if profile in {"nightly", "manual"} and group == "lint":
-        return tuple(name for phase in ("fixtures", "production", "clippy")
-                     for name in PROFILE_GROUPS[profile][f"lint-{phase}"])
+        return tuple(gate for name, gates in PROFILE_GROUPS[profile].items()
+                     if name.startswith("lint-") for gate in gates)
+    if profile in {"nightly", "manual"} and group == "lint-production":
+        return tuple(f"lint-production-{index}" for index in range(1, LINT_PRODUCTION_SHARDS + 1))
     return PROFILE_GROUPS[profile][group]
 
 
@@ -850,17 +861,40 @@ def nightly_trust_contract_failures(groups: dict[str, tuple[str, ...]]) -> list[
 
 def lint_phase_contract_failures(all_gates: Sequence[Gate], groups: dict[str, tuple[str, ...]]) -> list[str]:
     failures: list[str] = []
-    names = [f"lint-{phase}" for phase in ("fixtures", "production", "clippy")]
+    names = ["lint-fixtures", *(f"lint-production-{index}" for index in range(1, 5)), "lint-clippy"]
+    if LINT_PRODUCTION_SHARDS != 4:
+        failures.append("production lint must retain four exhaustive shards")
     if [name for name in groups if name.startswith("lint")] != names:
-        failures.append("lint phases must have three ordered, separate required groups")
+        failures.append("lint phases must retain fixtures, four production shards and Clippy as ordered required groups")
     if [gate.name for gate in all_gates if gate.name in names] != names:
         failures.append("lint gates must retain fixture, production and Clippy order")
-    for phase, name in zip(("fixtures", "production", "clippy"), names, strict=True):
+    for name in names:
+        if name.startswith("lint-production-"):
+            command = ["sh", "scripts/lint_suite.sh", "--phase=production", f"--shard={name.rsplit('-', 1)[1]}/4"]
+        else:
+            command = ["sh", "scripts/lint_suite.sh", f"--phase={name.removeprefix('lint-')}"]
         gate = next((gate for gate in all_gates if gate.name == name), None)
         if groups.get(name) != (name,) or gate is None or not gate.blocking \
-                or gate.cmd != ["sh", "scripts/lint_suite.sh", f"--phase={phase}"] \
+                or gate.cmd != command \
                 or gate.profiles != ("nightly", "manual"):
-            failures.append("missing or changed blocking lint phase: " + phase)
+            failures.append("missing or changed blocking lint phase: " + name)
+    return failures
+
+
+def lint_workflow_contract_failures(content: str) -> list[str]:
+    failures: list[str] = []
+    names = ["lint-fixtures", *(f"lint-production-{index}" for index in range(1, 5)), "lint-clippy"]
+    matrix = re.findall(r"^          - group: ([a-z0-9-]+)$", content, re.MULTILINE)
+    if matrix != names:
+        failures.append("standalone Lint must schedule every required lint group once in order")
+    for required in (
+        "    timeout-minutes: 120\n", "      fail-fast: false\n",
+        "run: python3 scripts/ouro_build.py build --verbosity quiet",
+        'run: python3 scripts/ci_gate.py --profile manual --group "${{ matrix.group }}" --out "_build/ci/${{ matrix.group }}"',
+        "name: lint-${{ matrix.group }}",
+    ):
+        if required not in content:
+            failures.append("standalone Lint lost required command or isolation: " + required.strip())
     return failures
 
 
@@ -869,35 +903,66 @@ def lint_phase_selftest_failures(all_gates: Sequence[Gate]) -> list[str]:
     import io
 
     failures: list[str] = []
+    try:
+        content = (ROOT / ".github/workflows/ouro-lint.yml").read_text(encoding="utf-8")
+    except OSError as exc:
+        failures.append("cannot read standalone Lint workflow: " + str(exc))
+    else:
+        for before, after in (
+            ("          - group: lint-production-3\n", ""),
+            ("          - group: lint-production-2", "          - group: lint-production-1"),
+            ("--profile manual", "--profile pr"),
+            ('--out "_build/ci/${{ matrix.group }}"', "--out _build/ci/lint"),
+            ("      fail-fast: false", "      fail-fast: true"),
+            ("    timeout-minutes: 120", "    timeout-minutes: 180"),
+            ("name: lint-${{ matrix.group }}", "name: lint"),
+        ):
+            if not lint_workflow_contract_failures(content.replace(before, after, 1)):
+                failures.append("standalone Lint scheduling regression was accepted: " + before)
     for profile in ("pr", "nightly", "manual"):
         printed = io.StringIO()
         with contextlib.redirect_stdout(printed):
             status = main(["--profile", profile, "--group", "lint", "--list"])
+        expected_production = "".join(
+            f"BLOCKING lint-production-{index} sh scripts/lint_suite.sh --phase=production --shard={index}/4\n"
+            for index in range(1, 5))
         expected = ("BLOCKING lint sh scripts/lint_suite.sh\n" if profile == "pr" else
-                    "".join(f"BLOCKING lint-{phase} sh scripts/lint_suite.sh --phase={phase}\n"
-                            for phase in ("fixtures", "production", "clippy")))
+                    "BLOCKING lint-fixtures sh scripts/lint_suite.sh --phase=fixtures\n" +
+                    expected_production + "BLOCKING lint-clippy sh scripts/lint_suite.sh --phase=clippy\n")
         if status != 0 or printed.getvalue() != expected:
             failures.append(profile + " lint alias lost complete ordered coverage")
+        if profile != "pr":
+            printed = io.StringIO()
+            with contextlib.redirect_stdout(printed):
+                status = main(["--profile", profile, "--group", "lint-production", "--list"])
+            if status != 0 or printed.getvalue() != expected_production:
+                failures.append(profile + " production alias lost exhaustive shard coverage")
     for mutated in (
-        {name: gates for name, gates in NIGHTLY_GROUPS.items() if name != "lint-production"},
+        *({name: gates for name, gates in NIGHTLY_GROUPS.items() if name != f"lint-production-{index}"}
+          for index in range(1, 5)),
         {**NIGHTLY_GROUPS, "lint-clippy": ("lint-fixtures",)},
         {**NIGHTLY_GROUPS, "lint": ("lint-fixtures", "lint-production", "lint-clippy")},
-        {**NIGHTLY_GROUPS, "lint-production": ("lint-production", "lint-clippy")},
+        {**NIGHTLY_GROUPS, "lint-production-1": ("lint-production-1", "lint-clippy")},
+        {**NIGHTLY_GROUPS, "lint-production": ("lint-production-1",)},
         dict(reversed(list(NIGHTLY_GROUPS.items()))),
     ):
         if not lint_phase_contract_failures(all_gates, mutated):
             failures.append("incomplete or recombined lint phases were accepted")
     for changes in (
         {"blocking": False}, {"cmd": ["sh", "scripts/lint_suite.sh", "--phase=fixtures"]},
+        {"cmd": ["sh", "scripts/lint_suite.sh", "--phase=production", "--shard=1/3"]},
+        {"cmd": ["sh", "scripts/lint_suite.sh", "--phase=production", "--shard=2/4"]},
         {"profiles": ("nightly",)},
     ):
-        mutated_gates = [replace(gate, **changes) if gate.name == "lint-production" else gate
+        mutated_gates = [replace(gate, **changes) if gate.name == "lint-production-1" else gate
                          for gate in all_gates]
         if not lint_phase_contract_failures(mutated_gates, NIGHTLY_GROUPS):
             failures.append("weakened production lint gate was accepted")
     if not lint_phase_contract_failures(list(reversed(all_gates)), NIGHTLY_GROUPS):
         failures.append("reordered lint gates were accepted")
-    for arguments in (("--phase=unknown",), ("--phase=fixtures", "extra"), ("--phase=",)):
+    for arguments in (("--phase=unknown",), ("--phase=fixtures", "extra"), ("--phase=",),
+                      ("--phase=production", "--shard=0/4"), ("--phase=production", "--shard=5/4"),
+                      ("--phase=production", "--shard=1/3"), ("--phase=clippy", "--shard=1/4")):
         try:
             result = subprocess.run(["sh", str(ROOT / "scripts/lint_suite.sh"), *arguments], cwd=ROOT,
                                     capture_output=True, text=True, timeout=5, check=False)
@@ -905,7 +970,7 @@ def lint_phase_selftest_failures(all_gates: Sequence[Gate]) -> list[str]:
             failures.append("cannot verify invalid lint phase: " + str(exc))
             continue
         if result.returncode != 2 or result.stdout or result.stderr.strip() != \
-                "usage: lint_suite.sh [--phase=all|fixtures|production|clippy]":
+                "usage: lint_suite.sh [--phase=all|fixtures|production|clippy] [--shard=1/4|2/4|3/4|4/4]":
             failures.append("invalid lint phase did not fail before tool preparation")
     return failures
 
@@ -983,8 +1048,7 @@ def run_self_tests(all_gates: Sequence[Gate]) -> int:
     triggers = re.search(r"^on:\n(.*?)(?=^\S|\Z)", lint_workflow, re.MULTILINE | re.DOTALL)
     if not triggers or triggers.group(1).strip() != "workflow_dispatch:":
         failures.append("standalone lint workflow must only run manually")
-    if "--profile pr --group lint" not in lint_workflow:
-        failures.append("manual lint must run the complete local lint group")
+    failures.extend(lint_workflow_contract_failures(lint_workflow))
     release_workflow = (ROOT / ".github/workflows/ouro-release.yml").read_text(encoding="utf-8")
     if "        exclude:\n          - group: lint\n" not in release_workflow:
         failures.append("release validation must exclude manual-only lint")
@@ -1632,7 +1696,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print(json.dumps(list(PROFILE_GROUPS[args.profile])))
         return 0
     if args.group is not None and args.group not in PROFILE_GROUPS.get(args.profile, {}) \
-            and not (args.profile in {"nightly", "manual"} and args.group == "lint"):
+            and not (args.profile in {"nightly", "manual"} and args.group in {"lint", "lint-production"}):
         ap.error(f"unknown group {args.group!r} for profile {args.profile}")
     if args.group and args.with_bootstrap_evidence:
         ap.error("--group cannot be combined with --with-bootstrap-evidence")

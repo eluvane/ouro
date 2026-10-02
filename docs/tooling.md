@@ -222,6 +222,11 @@ separate from the repository analyzer so each tool keeps a smaller dependency
 and memory footprint. Directory scans have no file-size cutoff. The launcher
 runs each source in its own process and returns nonzero if a child fails;
 memory exhaustion is not a successful skip.
+`lint --shard N/M` partitions the completed, deduplicated native inventory
+in its stable order: shard 1 receives the first file, shard 2 the second, and
+so on cyclically. Run all shards over the same roots and source revision to
+cover the complete inventory; each selected file retains all requested families.
+Indices satisfy `1 <= N <= M <= 128`; invalid or empty shard selections fail.
 Both tools prune build and dependency directories during root discovery.
 Analyzer diagnostic fixtures are opt-in with `--include-fixtures`; their
 expected findings are checked by the dedicated suites.

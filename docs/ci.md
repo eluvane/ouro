@@ -109,15 +109,23 @@ production sweep would select from `std/`, `compiler/`, `tools/`, and
 stays with the complete suite because it needs a vendored snapshot. Findings
 that a change causes in unchanged files are left to Nightly. Without a routing
 plan, as in local, Manual and Release runs, `lint-changed` is reported as
-skipped and the complete lint suite owns coverage. Nightly and full Manual
-schedule three required groups: `lint-fixtures`, `lint-production`, and
-`lint-clippy`. Each runs the corresponding `lint_suite.sh --phase=...` with
+skipped and the complete lint suite owns coverage. Nightly, full Manual,
+and **Lint → Run workflow** schedule `lint-fixtures`, `lint-production-1`
+through `lint-production-4`, and
+`lint-clippy` as required groups. Each runs `lint_suite.sh --phase=...` with
 the existing 120-minute job limit and checks the complete native tool receipts.
 Fixtures retain the quality, launcher, semantic session, stress and import tests;
-production retains the complete source inventory and deny verdicts; Clippy
+production shards retain the complete source inventory and deny verdicts. Each
+uses `--phase=production --shard=N/4`; the native lint owner completes and
+deduplicates the inventory before selecting every fourth file in its stable
+order. All families run for each selected file, including the prepared package
+snapshot and explicit bench source. Clippy
 retains all four compiler checks and grade fixtures. The registry rejects missing,
-duplicated, reordered or recombined phases. `--group lint` on these profiles
-runs all three phases in order and is excluded from their schedulable inventory.
+duplicated, reordered or recombined phases and production shards. `--group lint`
+on these profiles runs all required groups in order; `--group lint-production`
+runs the four production shards. Both aliases are excluded from their schedulable
+inventory. `lint_suite.sh` without arguments or with `--phase=production` retains
+the complete unsharded production sweep.
 The local PR `lint` group, standalone Lint workflow and `sh scripts/lint_suite.sh`
 without arguments retain the complete suite. Python/shell lint and the other
 quality gates keep their existing schedules.
@@ -190,7 +198,7 @@ these explicit invocations do not establish native bootstrap or retire the
 full PR profile.
 
 Nightly uses `checks`, `checks-parity`, `checks-quality`, `analysis`, `analyzer`,
-`lint-fixtures`, `lint-production`, `lint-clippy`,
+`lint-fixtures`, `lint-production-1` through `lint-production-4`, `lint-clippy`,
 `tests`, `samples-1`, `samples-2`, `kernel`, `smith-selftest`, `trust`, and `compiler-1` through `compiler-16`.
 PR, Nightly and Manual isolate parity and syntax quality in their respective
 checks groups, with the existing gate commands and per-program limits.
