@@ -395,6 +395,22 @@ print("int main(void) { return 0; }")
     invoke("_build/another-suite/tool-test")
     assert counts(cc_log) == baseline, "same entry in another suite must reuse the complete tool"
 
+    cache = repo / "_cache/ouro/native-tools" / first_receipt["key"]
+    (cache / ("tool.exe" if os.name == "nt" else "tool")).unlink()
+    (cache / "tool.json").unlink()
+    installed = invoke()
+    assert "installed-hit" in installed.stdout and counts(cc_log) == baseline
+    # An imported installed image alone does not warm an absent content cache.
+    before_prepare_emit = emit_log.read_text().count("emit")
+    prepared = invoke("_build/memory/bin/tool-test")
+    assert "miss" in prepared.stdout and counts(cc_log) == (baseline[0], baseline[1] + 1)
+    assert emit_log.read_text().count("emit") == before_prepare_emit + 1
+    baseline = counts(cc_log)
+    env["FAKE_EMIT_FAIL"] = "1"
+    invoke("_build/memory/fresh-suite/tool-test")
+    env.pop("FAKE_EMIT_FAIL")
+    assert counts(cc_log) == baseline, "prepared content cache must survive a missing measured image"
+
     if os.name == "nt":
         # A fake linker emits a shell script, not a PE resource image. Quality
         # publication must fail before replacing a previously installed tool.
@@ -1765,6 +1781,44 @@ def test_memory_preparation_failure(tmp: Path) -> None:
         assert not (out / "memory-report.json").exists()
 
 
+def test_memory_preparation_outputs(tmp: Path) -> None:
+    import memory_budget_suite as memory
+    from ourosmith.limits import RunResult
+
+    selected = [case for case in memory.CASES if case.label in {
+        "tool-emission-fmt", "tool-emission-analyze", "formatter-suite",
+    }]
+    configured = tmp / "configured-tools"
+    report_out = tmp / "memory-preparation-reports"
+    success = RunResult("ok", 0, "prepared", "", 1, 1)
+    with patch.object(memory, "ROOT", tmp), \
+         patch.dict(os.environ, {"OURO_C_BUILD_DIR": str(configured),
+                                 "OURO1_COMPILER": str(configured / "ouro1")}), \
+         patch.object(memory, "run_limited", return_value=success) as prepare:
+        report_out.mkdir()
+        reports = memory.prepare_tools(selected, report_out)
+    commands = [call.args[0] for call in prepare.call_args_list]
+    outputs = {(command[2], Path(command[3])) for command in commands}
+    assert outputs == {
+        ("tools/fmt.ouro", configured / "ouro-fmt"),
+        ("tools/analyze/main.ouro", configured / "ouro-analyze"),
+        ("tests/quality_source_write_driver.ouro", configured / "quality-source-write"),
+        ("tools/fmt.ouro", tmp / "_build/memory/bin/ouro-fmt"),
+        ("tools/analyze/main.ouro", tmp / "_build/memory/bin/ouro-analyze"),
+        ("tools/fmt.ouro", tmp / "_build/memory/fmt_suite/ouro-fmt"),
+        ("tests/quality_source_write_driver.ouro", tmp / "_build/memory/fmt_suite/quality-source-write"),
+    }
+    assert all(command[4:] == ["--compiler", str(configured / "ouro1")] for command in commands)
+    assert all(call.kwargs["timeout_s"] == 900 and call.kwargs["memory_mb"] == memory.BUILD_MEMORY_MB
+               for call in prepare.call_args_list)
+    assert len({report["log"] for report in reports}) == len(reports)
+    for case in selected[:2]:
+        with patch.object(memory, "ROOT", tmp), \
+             patch.object(memory, "run_limited", return_value=success) as prepare:
+            memory.prepare_tools([case], report_out)
+        assert any(Path(call.args[0][3]) == tmp / case.cmd[3] for call in prepare.call_args_list)
+
+
 def test_source_replace_report_protocol(tmp: Path) -> None:
     import fs_replace_suite as native
 
@@ -1815,6 +1869,7 @@ def main() -> int:
         tmp = Path(d).resolve()
         test_clang_bracket_depth(tmp)
         test_memory_preparation_failure(tmp)
+        test_memory_preparation_outputs(tmp)
         test_collect_build_protocol(tmp)
         test_collected_unit_arguments(tmp)
         test_build_tool_caller_paths(tmp)

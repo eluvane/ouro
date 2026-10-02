@@ -636,6 +636,11 @@ The memory suite first builds the selected native tools with the separate
 `preparation.json`. Compilation failure blocks the suite. Existing execution
 RSS limits and wrapper-install cases then run unchanged; a cold native emitter
 is not charged to a formatter or analyzer execution budget.
+Preparation includes the measured formatter/analyzer install destinations and
+the formatter suite's own images, warming the checked content cache even when
+only installed tools were imported. Selecting one of those install cases still
+prepares its actual destination; the report directory does not move that target.
+Disabling the cache still forces fresh compilation and retains the same limits.
 
 The import collector jumps between lexical candidates in ordinary source to
 avoid retaining per-byte traversal temporaries across an entire dependency
