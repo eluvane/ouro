@@ -559,7 +559,24 @@ def semantic_law_cases(out: Path) -> list[str]:
     """Native proof/contract/resource laws; host code only launches and reports."""
     from clippy_grade_firewall import _native_env
     from ourosmith.host import prepare_entry
-    from ourosmith.limits import run_limited
+    from ourosmith.limits import RunResult, run_limited
+
+    def retain_run(label: str, result: RunResult, passed: bool) -> dict[str, Any]:
+        stdout_path = out / (label + ".out")
+        stderr_path = out / (label + ".err")
+        stdout_path.write_text(result.stdout, encoding="utf-8")
+        stderr_path.write_text(result.stderr, encoding="utf-8")
+        row = {"pass": passed, "exit_code": result.returncode, "status": result.status,
+               "classification": result.classify(), "elapsed_s": result.elapsed_s,
+               "peak_rss_mb": result.peak_rss_mb, "argv": result.argv,
+               "timeout_s": 180, "memory_mb": 2048,
+               "stdout_path": str(stdout_path), "stderr_path": str(stderr_path)}
+        if not passed:
+            print(f"SEMANTIC_LAW_FAIL {label} {json.dumps(row, sort_keys=True)}", file=sys.stderr)
+            for stream, content in (("stdout", result.stdout), ("stderr", result.stderr)):
+                print(f"SEMANTIC_LAW_{stream.upper()} {label}", file=sys.stderr)
+                print(content, end="" if content.endswith("\n") else "\n", file=sys.stderr)
+        return row
 
     failures: list[str] = []
     rows: list[dict[str, Any]] = []
@@ -570,23 +587,21 @@ def semantic_law_cases(out: Path) -> list[str]:
         if name == "proofs":
             listing = run_limited([str(executable), "--list-groups"], cwd=ROOT, env=_native_env(),
                                   timeout_s=180, memory_mb=2048)
-            (out / "proofs-groups.stdout").write_text(listing.stdout, encoding="utf-8")
-            (out / "proofs-groups.stderr").write_text(listing.stderr, encoding="utf-8")
             groups = listing.stdout.splitlines()
-            if (not listing.ok or listing.stderr or not groups or len(groups) != len(set(groups))
-                    or any(not group or any(c not in "abcdefghijklmnopqrstuvwxyz0123456789-" for c in group)
-                           for group in groups)):
-                rows.append({"entry": entry, "pass": False, "exit_code": listing.returncode})
+            listing_failed = (not listing.ok or listing.stderr or not groups or len(groups) != len(set(groups))
+                              or any(not group or any(c not in "abcdefghijklmnopqrstuvwxyz0123456789-" for c in group)
+                                     for group in groups))
+            listing_row = retain_run("proofs-groups", listing, not listing_failed)
+            if listing_failed:
+                rows.append({"entry": entry, **listing_row})
                 failures.append("native semantic proof group inventory failed")
                 continue
         for group in groups:
             label = name + ("-" + group if group else "")
             command = [str(executable), "--group", group] if group else [str(executable)]
             result = run_limited(command, cwd=ROOT, env=_native_env(), timeout_s=180, memory_mb=2048)
-            (out / (label + "-laws.stdout")).write_text(result.stdout, encoding="utf-8")
-            (out / (label + "-laws.stderr")).write_text(result.stderr, encoding="utf-8")
             passed = result.ok and not result.stderr and "PASS " in result.stdout and "FAIL " not in result.stdout
-            rows.append({"entry": entry, "group": group, "pass": passed, "exit_code": result.returncode})
+            rows.append({"entry": entry, "group": group, **retain_run(label + "-laws", result, passed)})
             if not passed:
                 failures.append("native semantic laws failed: " + label)
     (out / "semantic-laws.json").write_text(json.dumps({"pass": not failures, "cases": rows}, indent=2) + "\n",
