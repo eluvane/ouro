@@ -1364,7 +1364,7 @@ def test_native_emit_phases(tmp: Path) -> None:
         compiler_argv = ["fixture-compiler", units[-1], "321", "--unit", units[0], "--unit", units[1]]
 
         def phase(name, elapsed, *, _events=events, _generated=generated):
-            assert elapsed is None or isinstance(elapsed, float) and elapsed >= 0, (name, elapsed)
+            assert elapsed is None or (isinstance(elapsed, float) and elapsed >= 0), (name, elapsed)
             _events.append((name, "start" if elapsed is None else "done"))
             expected = hooked if name == "publish" and elapsed is not None else prior
             assert _generated.read_bytes() == expected, "phase callback preceded acceptance/publication"

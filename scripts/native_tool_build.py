@@ -12,13 +12,16 @@ import sys
 import sysconfig
 import tempfile
 import time
-from collections.abc import Callable
 from contextlib import nullcontext
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import frontend_regen as frontend
 import ouro_build as build
 from repo_support import configure_native_stack, hash_json, read_json_object_or_none, sha256_file, write_json_atomic
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 ROOT = Path(__file__).resolve().parents[1]
 KIND = "ouro.native-tool-build.v1"
