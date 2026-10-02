@@ -109,9 +109,18 @@ production sweep would select from `std/`, `compiler/`, `tools/`, and
 stays with the complete suite because it needs a vendored snapshot. Findings
 that a change causes in unchanged files are left to Nightly. Without a routing
 plan, as in local, Manual and Release runs, `lint-changed` is reported as
-skipped and the complete `lint` group owns coverage. Local profiles and
-`sh scripts/lint_suite.sh` retain the complete suite; Python/shell lint and the
-other quality gates keep their existing schedules.
+skipped and the complete lint suite owns coverage. Nightly and full Manual
+schedule three required groups: `lint-fixtures`, `lint-production`, and
+`lint-clippy`. Each runs the corresponding `lint_suite.sh --phase=...` with
+the existing 120-minute job limit and checks the complete native tool receipts.
+Fixtures retain the quality, launcher, semantic session, stress and import tests;
+production retains the complete source inventory and deny verdicts; Clippy
+retains all four compiler checks and grade fixtures. The registry rejects missing,
+duplicated, reordered or recombined phases. `--group lint` on these profiles
+runs all three phases in order and is excluded from their schedulable inventory.
+The local PR `lint` group, standalone Lint workflow and `sh scripts/lint_suite.sh`
+without arguments retain the complete suite. Python/shell lint and the other
+quality gates keep their existing schedules.
 Execution removes the previous `ci-summary.json` before starting gates, so an
 interrupted run leaves no old successful aggregate at the current report path.
 The native CI runner also invalidates selected gate reports and the delegated
@@ -180,7 +189,8 @@ Existing suite assertions and required gates remain in place;
 these explicit invocations do not establish native bootstrap or retire the
 full PR profile.
 
-Nightly uses `checks`, `checks-parity`, `checks-quality`, `analysis`, `analyzer`, `lint`,
+Nightly uses `checks`, `checks-parity`, `checks-quality`, `analysis`, `analyzer`,
+`lint-fixtures`, `lint-production`, `lint-clippy`,
 `tests`, `samples-1`, `samples-2`, `kernel`, `smith-selftest`, `trust`, and `compiler-1` through `compiler-16`.
 PR, Nightly and Manual isolate parity and syntax quality in their respective
 checks groups, with the existing gate commands and per-program limits.

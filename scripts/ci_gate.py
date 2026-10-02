@@ -103,7 +103,9 @@ NIGHTLY_GROUPS: dict[str, tuple[str, ...]] = {
     "checks-quality": PR_GROUPS["checks-quality"],
     "analysis": PR_GROUPS["analysis"],
     "analyzer": ("analyze-precision", "analyze-production"),
-    "lint": PR_GROUPS["lint"],
+    "lint-fixtures": ("lint-fixtures",),
+    "lint-production": ("lint-production",),
+    "lint-clippy": ("lint-clippy",),
     "tests": (*PR_GROUPS["tests"], "quickstart-smoke"),
     "samples-1": PR_GROUPS["samples-1"],
     "samples-2": PR_GROUPS["samples-2"],
@@ -737,7 +739,10 @@ def gates() -> list[Gate]:
         Gate("fix", ["sh", "scripts/fix_suite.sh"], ("pr", "nightly", "manual"), env=(("FIX_SUITE_OUT", "_build/fix_suite"),)),
         Gate("pkg", ["sh", "scripts/pkg_suite.sh"], ("pr", "nightly", "manual"), env=(("PKG_SUITE_OUT", "_build/pkg_suite"),)),
         Gate("doc", ["sh", "scripts/doc_suite.sh"], ("pr", "nightly", "manual", "docs"), env=(("DOC_SUITE_OUT", "_build/doc_suite"),)),
-        Gate("lint", ["sh", "scripts/lint_suite.sh"], ("pr", "nightly", "manual"), env=(("LINT_SUITE_OUT", "_build/lint_suite"),)),
+        Gate("lint", ["sh", "scripts/lint_suite.sh"], ("pr",), env=(("LINT_SUITE_OUT", "_build/lint_suite"),)),
+        *(Gate(f"lint-{phase}", ["sh", "scripts/lint_suite.sh", f"--phase={phase}"],
+               ("nightly", "manual"), env=(("LINT_SUITE_OUT", f"_build/lint_suite-{phase}"),))
+          for phase in ("fixtures", "production", "clippy")),
         # main() appends the changed production sources from the routing plan.
         Gate("lint-changed", ["sh", "scripts/ouro1.sh", "lint", "--deny", "--"], ("pr",)),
         Gate("lsp", ["sh", "scripts/lsp_suite.sh"], ("pr", "nightly", "manual"), env=(("LSP_SUITE_OUT", "_build/lsp_suite"),)),
@@ -789,10 +794,21 @@ def validate_groups(all_gates: Sequence[Gate], profile: str, groups: dict[str, t
         if missing:
             details.append("missing=" + ",".join(missing))
         raise ValueError(f"invalid {profile} group partition: " + "; ".join(details))
+    if profile in {"nightly", "manual"}:
+        failures = lint_phase_contract_failures(all_gates, groups)
+        if failures:
+            raise ValueError(f"invalid {profile} lint partition: " + "; ".join(failures))
+
+
+def group_gate_names(profile: str, group: str) -> tuple[str, ...]:
+    if profile in {"nightly", "manual"} and group == "lint":
+        return tuple(name for phase in ("fixtures", "production", "clippy")
+                     for name in PROFILE_GROUPS[profile][f"lint-{phase}"])
+    return PROFILE_GROUPS[profile][group]
 
 
 def select_group(all_gates: Sequence[Gate], profile: str, group: str) -> list[Gate]:
-    names = set(PROFILE_GROUPS[profile][group])
+    names = set(group_gate_names(profile, group))
     return [gate for gate in all_gates if profile in gate.profiles and gate.name in names]
 
 
@@ -832,11 +848,74 @@ def nightly_trust_contract_failures(groups: dict[str, tuple[str, ...]]) -> list[
     return failures
 
 
+def lint_phase_contract_failures(all_gates: Sequence[Gate], groups: dict[str, tuple[str, ...]]) -> list[str]:
+    failures: list[str] = []
+    names = [f"lint-{phase}" for phase in ("fixtures", "production", "clippy")]
+    if [name for name in groups if name.startswith("lint")] != names:
+        failures.append("lint phases must have three ordered, separate required groups")
+    if [gate.name for gate in all_gates if gate.name in names] != names:
+        failures.append("lint gates must retain fixture, production and Clippy order")
+    for phase, name in zip(("fixtures", "production", "clippy"), names, strict=True):
+        gate = next((gate for gate in all_gates if gate.name == name), None)
+        if groups.get(name) != (name,) or gate is None or not gate.blocking \
+                or gate.cmd != ["sh", "scripts/lint_suite.sh", f"--phase={phase}"] \
+                or gate.profiles != ("nightly", "manual"):
+            failures.append("missing or changed blocking lint phase: " + phase)
+    return failures
+
+
+def lint_phase_selftest_failures(all_gates: Sequence[Gate]) -> list[str]:
+    import contextlib
+    import io
+
+    failures: list[str] = []
+    for profile in ("pr", "nightly", "manual"):
+        printed = io.StringIO()
+        with contextlib.redirect_stdout(printed):
+            status = main(["--profile", profile, "--group", "lint", "--list"])
+        expected = ("BLOCKING lint sh scripts/lint_suite.sh\n" if profile == "pr" else
+                    "".join(f"BLOCKING lint-{phase} sh scripts/lint_suite.sh --phase={phase}\n"
+                            for phase in ("fixtures", "production", "clippy")))
+        if status != 0 or printed.getvalue() != expected:
+            failures.append(profile + " lint alias lost complete ordered coverage")
+    for mutated in (
+        {name: gates for name, gates in NIGHTLY_GROUPS.items() if name != "lint-production"},
+        {**NIGHTLY_GROUPS, "lint-clippy": ("lint-fixtures",)},
+        {**NIGHTLY_GROUPS, "lint": ("lint-fixtures", "lint-production", "lint-clippy")},
+        {**NIGHTLY_GROUPS, "lint-production": ("lint-production", "lint-clippy")},
+        dict(reversed(list(NIGHTLY_GROUPS.items()))),
+    ):
+        if not lint_phase_contract_failures(all_gates, mutated):
+            failures.append("incomplete or recombined lint phases were accepted")
+    for changes in (
+        {"blocking": False}, {"cmd": ["sh", "scripts/lint_suite.sh", "--phase=fixtures"]},
+        {"profiles": ("nightly",)},
+    ):
+        mutated_gates = [replace(gate, **changes) if gate.name == "lint-production" else gate
+                         for gate in all_gates]
+        if not lint_phase_contract_failures(mutated_gates, NIGHTLY_GROUPS):
+            failures.append("weakened production lint gate was accepted")
+    if not lint_phase_contract_failures(list(reversed(all_gates)), NIGHTLY_GROUPS):
+        failures.append("reordered lint gates were accepted")
+    for arguments in (("--phase=unknown",), ("--phase=fixtures", "extra"), ("--phase=",)):
+        try:
+            result = subprocess.run(["sh", str(ROOT / "scripts/lint_suite.sh"), *arguments], cwd=ROOT,
+                                    capture_output=True, text=True, timeout=5, check=False)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            failures.append("cannot verify invalid lint phase: " + str(exc))
+            continue
+        if result.returncode != 2 or result.stdout or result.stderr.strip() != \
+                "usage: lint_suite.sh [--phase=all|fixtures|production|clippy]":
+            failures.append("invalid lint phase did not fail before tool preparation")
+    return failures
+
+
 def run_self_tests(all_gates: Sequence[Gate]) -> int:
     failures: list[str] = []
     failures.extend(summary_contract_failures())
     failures.extend(routing_contract_failures())
     failures.extend(provenance_contract_failures())
+    failures.extend(lint_phase_selftest_failures(all_gates))
     for workflow, expected_steps in (("ouro-manual-trust.yml", 2), ("ouro-release.yml", 1)):
         content = (ROOT / ".github/workflows" / workflow).read_text(encoding="utf-8")
         failures.extend(windows_gcc_contract_failures(content, expected_steps))
@@ -1552,7 +1631,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             ap.error(f"profile {args.profile} has no group partition")
         print(json.dumps(list(PROFILE_GROUPS[args.profile])))
         return 0
-    if args.group is not None and args.group not in PROFILE_GROUPS.get(args.profile, {}):
+    if args.group is not None and args.group not in PROFILE_GROUPS.get(args.profile, {}) \
+            and not (args.profile in {"nightly", "manual"} and args.group == "lint"):
         ap.error(f"unknown group {args.group!r} for profile {args.profile}")
     if args.group and args.with_bootstrap_evidence:
         ap.error("--group cannot be combined with --with-bootstrap-evidence")
