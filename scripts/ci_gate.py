@@ -108,9 +108,10 @@ NIGHTLY_GROUPS: dict[str, tuple[str, ...]] = {
     "samples-1": PR_GROUPS["samples-1"],
     "samples-2": PR_GROUPS["samples-2"],
     "kernel": (*PR_GROUPS["checker"], "ouro-smith-kernel"),
+    "smith-selftest": ("smith-selftest",),
     # Keep these in one checkout and preserve registry order. Smith must bind
     # its provenance to the tool binaries installed by the stage loop.
-    "trust": ("stage-loop-fixpoint-and-generated-drift", "smith-selftest", "ouro-smith-nightly"),
+    "trust": ("stage-loop-fixpoint-and-generated-drift", "ouro-smith-nightly"),
     **{name: gates for name, gates in PR_GROUPS.items() if name.startswith("compiler-")},
 }
 KERNEL_GROUPS: dict[str, tuple[str, ...]] = {
@@ -822,6 +823,15 @@ def windows_gcc_contract_failures(content: str, expected_steps: int) -> list[str
     return failures
 
 
+def nightly_trust_contract_failures(groups: dict[str, tuple[str, ...]]) -> list[str]:
+    failures: list[str] = []
+    if groups.get("trust") != ("stage-loop-fixpoint-and-generated-drift", "ouro-smith-nightly"):
+        failures.append("stage-loop and nightly Smith must remain ordered in one trust group")
+    if groups.get("smith-selftest") != ("smith-selftest",):
+        failures.append("Smith harness self-tests must have their own required group")
+    return failures
+
+
 def run_self_tests(all_gates: Sequence[Gate]) -> int:
     failures: list[str] = []
     failures.extend(summary_contract_failures())
@@ -910,9 +920,17 @@ def run_self_tests(all_gates: Sequence[Gate]) -> int:
     if [gate.name for gate in select_group(all_gates, "pr", "smith")] != ["smith-selftest", "ouro-smith"]:
         failures.append("PR Smith must run harness self-tests before the generated profile")
     for profile in ("nightly", "manual"):
-        trust = [gate.name for gate in select_group(all_gates, profile, "trust")]
-        if trust != ["stage-loop-fixpoint-and-generated-drift", "smith-selftest", "ouro-smith-nightly"]:
-            failures.append(profile + " must run stage-loop, Smith self-tests and nightly Smith in order")
+        failures.extend(profile + ": " + failure
+                        for failure in nightly_trust_contract_failures(PROFILE_GROUPS[profile]))
+    for mutated in (
+        {**NIGHTLY_GROUPS, "trust": ("stage-loop-fixpoint-and-generated-drift",)},
+        {**NIGHTLY_GROUPS, "trust": tuple(reversed(NIGHTLY_GROUPS["trust"]))},
+        {**NIGHTLY_GROUPS, "trust": (*NIGHTLY_GROUPS["trust"], "smith-selftest")},
+        {name: gates for name, gates in NIGHTLY_GROUPS.items() if name != "smith-selftest"},
+        {**NIGHTLY_GROUPS, "smith-selftest": ("smith-selftest", "ouro-smith-nightly")},
+    ):
+        if not nightly_trust_contract_failures(mutated):
+            failures.append("invalid nightly/manual trust partition was accepted")
     for group, expected in (("checks-parity", ["parity"]),
                             ("checks-quality", ["syntax-quality-firewall"])):
         selected = ([gate.name for gate in select_group(all_gates, "stage-loop", group)]

@@ -27,6 +27,7 @@ from repo_support import configure_native_stack, sha256_file, write_json_atomic
 ROOT = Path(__file__).resolve().parents[1]
 KIND = "ouro.frontend-host-suite.v1"
 ENTRY = "tests/frontend_host_codegen.ouro"
+BACKEND_GROUP_SIZE = 128
 HOST_MAINS = {
     "n1-host-selftest": "runtime/n1_host_selftest.c",
     "frontend-link-selftest": "runtime/frontend_link_selftest.c",
@@ -36,6 +37,7 @@ HOST_MAINS = {
 }
 SUPERVISOR_INPUTS = (
     "scripts/frontend_host_suite.py", "scripts/frontend_native_process.py", "scripts/frontend_native_fs_create.py",
+    "scripts/generated_c_shards.py",
     "scripts/frontend_native_async.py", "scripts/fs_replace_suite.py", "scripts/frontend_security_suite.sh",
     "scripts/kernel_scale.py", "scripts/ourosmith/host.py", "scripts/ourosmith/limits.py",
     "scripts/ourosmith/exec_child.py", "scripts/ourosmith/windows_job.py",
@@ -124,6 +126,17 @@ def executable(work: Path, name: str) -> Path:
     return work / (name + (".exe" if os.name == "nt" else ""))
 
 
+def require_generated_shards(work: Path, report: dict) -> None:
+    shards = report["generated_c_shards"]
+    manifest = work / "generated-c-shards/generated-c-shards.manifest.json"
+    if shards["manifest_path"] != build.rel(manifest) or sha256_file(manifest) != report["shard_manifest_sha256"]:
+        raise ValueError("generated shard manifest changed")
+    ok, reason = build.GCS.manifest_valid(build.GCS.read_json(manifest),
+        generator_hash=shards["generator_hash"], source_digests=shards["sources"], plan_meta=shards["shards"])
+    if not ok:
+        raise ValueError("generated host shards changed: " + reason)
+
+
 def build_worker(args, cfg) -> None:
     work = args.out
     before = json.loads((work / "inputs-before.json").read_text(encoding="utf-8"))
@@ -142,22 +155,34 @@ def build_worker(args, cfg) -> None:
     missing = required - exports
     if missing:
         raise ValueError("fresh backend lacks required host exports: " + ", ".join(sorted(missing)))
-    report = {"kind": KIND + ".build", "generated_sha256": sha256_file(generated), "binaries": {}}
-    common = [("generated", generated), *((name, ROOT / name) for name in native.RUNTIME
-                                          if name != "runtime/ouro_prog_main.c")]
+    generated_hash = sha256_file(generated)
+    shard_sources, shard_report = build.GCS.materialize_generated_c_shards(
+        frontend_c=None, backend_c=generated, out_dir=work / "generated-c-shards",
+        label_prefix="frontend-host", cache_enabled=False, backend_group_size=BACKEND_GROUP_SIZE,
+        backend_export_suffix="", report_path=work / "generated-c-shards-report.json")
+    if generated_hash != sha256_file(generated):
+        raise ValueError("generated backend changed during sharding")
+    report = {"kind": KIND + ".build", "generated_sha256": generated_hash, "binaries": {},
+              "generated_c_shards": shard_report,
+              "shard_manifest_sha256": sha256_file(work / "generated-c-shards/generated-c-shards.manifest.json")}
+    common = [*shard_sources, *((name, ROOT / name) for name in native.RUNTIME
+                               if name != "runtime/ouro_prog_main.c")]
     for name, main in HOST_MAINS.items():
         require_snapshot(args, cfg, before)
+        require_generated_shards(work, report)
         # Identical common sources share only this fresh invocation's checked objects.
         print(f"FRONTEND_HOST_BUILD: link {name}", flush=True)
         sources = [source for source in common if source[0] != "runtime/frontend_link.c"
                    or name not in ("frontend-codegen-meta-selftest", "frontend-codegen-selftest")]
         result = build.build_c_executable(cfg, name="frontend-host", sources=[*sources, (main, ROOT / main)],
             output=executable(work, name), object_dir=work / "objects", include_dirs=[ROOT / "runtime"],
-            extra_cflags=["-Werror=implicit-function-declaration", "-DOURO_FE_FLAT_EXPORTS"], jobs=1)
+            extra_cflags=["-Werror=implicit-function-declaration", "-DOURO_FE_FLAT_EXPORTS"], jobs=1,
+            generated_c_shards=shard_report)
         report["binaries"][name] = {"sha256": sha256_file(executable(work, name)), "build": result}
     require_snapshot(args, cfg, before)
     if report["generated_sha256"] != sha256_file(generated):
         raise ValueError("generated backend changed during linking")
+    require_generated_shards(work, report)
     write_json_atomic(work / "build.json", report)
     print("FRONTEND_HOST_BUILD: PASS", flush=True)
 
@@ -167,6 +192,7 @@ def verify_artifacts(work: Path, report: dict) -> None:
         raise ValueError("incomplete host build report")
     if report["generated_sha256"] != sha256_file(work / "backend.gen.c"):
         raise ValueError("generated backend changed after emission")
+    require_generated_shards(work, report)
     for name, row in report["binaries"].items():
         binary = executable(work, name)
         if not binary.is_file() or binary.stat().st_size == 0 or sha256_file(binary) != row["sha256"]:
@@ -204,6 +230,7 @@ def run_suite(args, cfg, argv: list[str]) -> int:
     report = {"kind": KIND, "pass": False, "execution_backend": "generated-c-host",
               "native_bootstrap": False, "entry": ENTRY, "work": str(work), "steps": [],
               "workers": 1, "memory_mib": args.memory_mib, "build_timeout_s": args.build_timeout,
+              "backend_group_size": BACKEND_GROUP_SIZE,
               "probe_timeout_s": args.probe_timeout,
               "producer": {"path": str(args.compiler), "selection": "caller-supplied --compiler; lineage not attested"}}
     before = None
@@ -224,7 +251,7 @@ def run_suite(args, cfg, argv: list[str]) -> int:
             result = run_limited(command, cwd=cwd, env=env, timeout_s=timeout, memory_mb=args.memory_mib)
             row = {"label": label, "cwd": str(cwd), **asdict(result)}
             for stream in ("stdout", "stderr"):
-                path = work / (label + "." + stream)
+                path = work / (label + (".out" if stream == "stdout" else ".err"))
                 path.write_text(getattr(result, stream), encoding="utf-8", newline="\n")
                 row[stream] = path.name
                 row[stream + "_sha256"] = sha256_file(path)
@@ -238,7 +265,7 @@ def run_suite(args, cfg, argv: list[str]) -> int:
             command.extend(["--config", str(args.config.resolve())])
         result = run("build", command, args.build_timeout)
         if not result.ok or not result.stdout.endswith("FRONTEND_HOST_BUILD: PASS\n"):
-            raise ValueError(f"host build failed (status={result.status}, exit={result.returncode}); see {work / 'build.stderr'}")
+            raise ValueError(f"host build failed (status={result.status}, exit={result.returncode}); see {work / 'build.err'}")
         built = json.loads((work / "build.json").read_text(encoding="utf-8"))
         verify_artifacts(work, built)
         report["build"] = built

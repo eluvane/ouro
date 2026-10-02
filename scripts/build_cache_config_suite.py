@@ -871,13 +871,34 @@ def test_frontend_host_protocol(tmp: Path) -> None:
     work = tmp / "host-artifacts"
     work.mkdir()
     generated = work / "backend.gen.c"
-    generated.write_text("current generated fixture", encoding="utf-8")
-    report = {"kind": host.KIND + ".build", "generated_sha256": host.sha256_file(generated), "binaries": {}}
+    generated.write_text('#include "ouro_rt.h"\nstatic ouro_v *ouro_g1(void);\n'
+                         'static ouro_v *ouro_g1(void){return 0;}\n'
+                         'int ouro_export_count(void){return 1;}\n'
+                         'const char *ouro_export_name(int i){(void)i;return "fixture";}\n'
+                         'ouro_v *ouro_export_value(int i){(void)i;return ouro_g1();}\n', encoding="utf-8")
+    assert host.BACKEND_GROUP_SIZE == 128 and "scripts/generated_c_shards.py" in host.SUPERVISOR_INPUTS
+    _sources, shards = host.build.GCS.materialize_generated_c_shards(
+        frontend_c=None, backend_c=generated, out_dir=work / "generated-c-shards", label_prefix="host-fixture",
+        backend_group_size=host.BACKEND_GROUP_SIZE, backend_export_suffix="")
+    manifest = work / "generated-c-shards/generated-c-shards.manifest.json"
+    report = {"kind": host.KIND + ".build", "generated_sha256": host.sha256_file(generated), "binaries": {},
+              "generated_c_shards": shards, "shard_manifest_sha256": host.sha256_file(manifest)}
     for name in host.HOST_MAINS:
         binary = host.executable(work, name)
         binary.write_bytes(b"current linked fixture")
         report["binaries"][name] = {"sha256": host.sha256_file(binary)}
     host.verify_artifacts(work, report)
+    for changed in (work / "generated-c-shards/backend_u__shards.h", manifest, generated):
+        original = changed.read_bytes()
+        changed.write_bytes(original + b"\n/* changed artifact */\n")
+        try:
+            host.verify_artifacts(work, report)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("changed generated host artifact accepted: " + str(changed))
+        finally:
+            changed.write_bytes(original)
     host.executable(work, "n1-host").write_bytes(b"stale producer")
     try:
         host.verify_artifacts(work, report)

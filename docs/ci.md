@@ -181,11 +181,12 @@ these explicit invocations do not establish native bootstrap or retire the
 full PR profile.
 
 Nightly uses `checks`, `checks-parity`, `checks-quality`, `analysis`, `analyzer`, `lint`,
-`tests`, `samples-1`, `samples-2`, `kernel`, `trust`, and `compiler-1` through `compiler-16`.
+`tests`, `samples-1`, `samples-2`, `kernel`, `smith-selftest`, `trust`, and `compiler-1` through `compiler-16`.
 PR, Nightly and Manual isolate parity and syntax quality in their respective
 checks groups, with the existing gate commands and per-program limits.
-The `trust` job runs the stage-loop fixpoint/drift gate, the Smith harness
-self-tests, and then the deeper OuroSmith profile in the same checkout.
+The `trust` job runs the stage-loop fixpoint/drift gate and then the deeper
+OuroSmith profile in the same checkout. The required `smith-selftest` group
+runs the harness self-tests separately, preserving all gates and per-program limits.
 The PR `smith` group runs the same blocking self-tests before its generated profile. `Full` runs even after
 a job failure and fails unless every matrix group succeeds. Reports are
 uploaded separately as `nightly-<group>` artifacts. Hosted PR matrix jobs use static names `PR` and `Portable` so a skipped
@@ -364,6 +365,11 @@ The command uses the configured bootstrap in `OURO_C_BUILD_DIR`, runs builds
 with one worker, and writes logs under `_build/compiler_check_suite` (or
 `TEST_SUITE_OUT`). The full unsharded gate remains registered in the Ouro-native `suite-native`
 profile. User-test and stage-loop gates remain separate.
+
+The frontend-security host suite builds the fresh generated backend in shards
+grouped by 128 export clusters. It checks the original generated C, shard manifest
+and shard contents for all five host images, using one worker, `O0`, and the
+existing 3 GiB/900-second build budget. All 40 host probes remain required.
 
 On Windows, the required frontend-security host suite also uses its freshly
 built `n1-host` to emit the 29 bounded-process API laws, runtime fixture, and

@@ -171,8 +171,10 @@ each phase's deadline, duration, and peak memory.
 
 The harness self-test exercises actual memory exhaustion and descendant
 termination, protocol validation, saved-input replay, and failure reporting.
-The blocking `smith-selftest` CI gate runs it in the PR `smith` group and in
-Nightly and Manual `trust` groups before their generated Smith profiles.
+The blocking `smith-selftest` CI gate runs it before the generated profile in
+the PR `smith` group. Nightly and Manual run it in a separate required
+`smith-selftest` group; `trust` keeps stage-loop and the generated Nightly
+profile in the same checkout.
 Checker fault injection patches temporary copies of the canonical Ouro
 checker and builds the designated detector with exact input receipts. Each
 mutant requires a clean unmodified baseline and the named semantic failure.
