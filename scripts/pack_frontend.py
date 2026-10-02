@@ -67,6 +67,25 @@ POLY_VALUE_ARITY = {
 }
 
 
+def _replace_spans(src: str, replacements: list[tuple[int, int, str]]) -> str:
+    """Apply disjoint source spans once, retaining the first duplicate span."""
+    if not replacements:
+        return src
+    pieces = []
+    seen: set[tuple[int, int]] = set()
+    cursor = len(src)
+    for start, end, replacement in sorted(replacements, key=lambda item: item[0], reverse=True):
+        if (start, end) in seen:
+            continue
+        if not 0 <= start <= end <= cursor:
+            raise ValueError(f"pack_frontend: invalid or overlapping replacement span {start}:{end}")
+        seen.add((start, end))
+        pieces.extend((src[end:cursor], replacement))
+        cursor = start
+    pieces.append(src[:cursor])
+    return "".join(reversed(pieces))
+
+
 def uniquify(src: str) -> str:
     """Rename colliding static function bodies with scoped use-binding.
 
@@ -84,6 +103,11 @@ def uniquify(src: str) -> str:
     dups = {n: ms for n, ms in by_name.items() if len(ms) > 1}
     if not dups:
         return spread_case_arms(src)
+    uses_by_name: dict[str, list[re.Match[str]]] = {name: [] for name in dups}
+    for match in IDENT.finditer(src):
+        uses = uses_by_name.get(match.group(0))
+        if uses is not None:
+            uses.append(match)
     repls: list[tuple[int, int, str]] = []
     for name, ms in dups.items():
         for i, m in enumerate(ms):
@@ -94,8 +118,8 @@ def uniquify(src: str) -> str:
         nver = len(ms)
         uses = [
             m
-            for m in IDENT.finditer(src)
-            if m.group(0) == name and (m.start(), m.end()) not in def_spans
+            for m in uses_by_name[name]
+            if (m.start(), m.end()) not in def_spans
         ]
         has_between = any(
             bounds[0] <= u.start() < bounds[nver - 1] for u in uses
@@ -114,15 +138,7 @@ def uniquify(src: str) -> str:
                 later_i += 1
             if ver:
                 repls.append((m.start(), m.end(), f"{name}_d{ver + 1}"))
-    repls.sort(key=lambda x: x[0], reverse=True)
-    seen: set[tuple[int, int]] = set()
-    out = src
-    for a, b, t in repls:
-        if (a, b) in seen:
-            continue
-        seen.add((a, b))
-        out = out[:a] + t + out[b:]
-    return spread_case_arms(out)
+    return spread_case_arms(_replace_spans(src, repls))
 
 
 _ARM_REF = re.compile(
@@ -269,17 +285,7 @@ def spread_case_arms(src: str) -> str:
                     s = am.start(2) + body_s
                     e = am.end(2) + body_s
                 repls.append((s, e, new))
-    if not repls:
-        return src
-    repls.sort(key=lambda x: x[0], reverse=True)
-    out = src
-    seen: set[tuple[int, int]] = set()
-    for a, b, t in repls:
-        if (a, b) in seen:
-            continue
-        seen.add((a, b))
-        out = out[:a] + t + out[b:]
-    return out
+    return _replace_spans(src, repls)
 
 
 def uniquify_file(path: str | Path) -> int:
@@ -817,6 +823,42 @@ static ouro_v *use4(void){
             "ouro_thunk(foo,e),ouro_thunk(foo_d2,e)" in nout,
         )
     )
+    interleaved = (
+        "static ouro_v *before(void){return ouro_thunk(alpha,0);}\n"
+        "static ouro_v *alpha(ouro_env *e,ouro_v *a){return ouro_ctor(1,0,0);}\n"
+        "static ouro_v *beta(ouro_env *e,ouro_v *a){return ouro_ctor(2,0,0);}\n"
+        "static ouro_v *mid(void){return ouro_thunk(alpha,0);}\n"
+        "static ouro_v *alpha(ouro_env *e,ouro_v *a){return ouro_ctor(3,0,0);}\n"
+        "static ouro_v *mid2(void){return ouro_thunk(alpha,0);}\n"
+        "static ouro_v *beta(ouro_env *e,ouro_v *a){return ouro_ctor(4,0,0);}\n"
+        "static ouro_v *alpha(ouro_env *e,ouro_v *a){return ouro_ctor(5,0,0);}\n"
+        "static ouro_v *beta(ouro_env *e,ouro_v *a){return ouro_ctor(6,0,0);}\n"
+        "static ouro_v *after(void){return ouro_case(ouro_app(g(),x),3,"
+        "(ouro_v *[]){ouro_thunk(alpha,e),ouro_thunk(alpha,e),"
+        "ouro_ctor(0,1,(ouro_v *[]){ouro_thunk(beta,e)})});}\n"
+        "static ouro_v *tail(void){return ouro_case(s,3,"
+        "(ouro_v *[]){beta,ouro_thunk(beta,e),beta});}\n"
+        "static ouro_v *prefix(ouro_env *e,ouro_v *a){return ouro_thunk(alpha_extra,e);}\n"
+    )
+    interleaved_expected = (
+        "static ouro_v *before(void){return ouro_thunk(alpha,0);}\n"
+        "static ouro_v *alpha(ouro_env *e,ouro_v *a){return ouro_ctor(1,0,0);}\n"
+        "static ouro_v *beta(ouro_env *e,ouro_v *a){return ouro_ctor(2,0,0);}\n"
+        "static ouro_v *mid(void){return ouro_thunk(alpha,0);}\n"
+        "static ouro_v *alpha_d2(ouro_env *e,ouro_v *a){return ouro_ctor(3,0,0);}\n"
+        "static ouro_v *mid2(void){return ouro_thunk(alpha_d2,0);}\n"
+        "static ouro_v *beta_d2(ouro_env *e,ouro_v *a){return ouro_ctor(4,0,0);}\n"
+        "static ouro_v *alpha_d3(ouro_env *e,ouro_v *a){return ouro_ctor(5,0,0);}\n"
+        "static ouro_v *beta_d3(ouro_env *e,ouro_v *a){return ouro_ctor(6,0,0);}\n"
+        "static ouro_v *after(void){return ouro_case(ouro_app(g(),x),3,"
+        "(ouro_v *[]){ouro_thunk(alpha_d2,e),ouro_thunk(alpha_d3,e),"
+        "ouro_ctor(0,1,(ouro_v *[]){ouro_thunk(beta,e)})});}\n"
+        "static ouro_v *tail(void){return ouro_case(s,3,"
+        "(ouro_v *[]){beta_d2,ouro_thunk(beta,e),beta_d3});}\n"
+        "static ouro_v *prefix(ouro_env *e,ouro_v *a){return ouro_thunk(alpha_extra,e);}\n"
+    )
+    checks.append(("uniquify interleaved scoped names and mixed nested arms",
+                   uniquify(interleaved) == interleaved_expected))
     checks.extend(_ctor_span_checks())
     bad = [name for name, ok in checks if not ok]
     if bad:

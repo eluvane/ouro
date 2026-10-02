@@ -143,7 +143,12 @@ def build_worker(args, cfg) -> None:
     require_snapshot(args, cfg, before)
     generated = work / "backend.gen.c"
     print("FRONTEND_HOST_BUILD: emit current backend", flush=True)
-    native.emit(args.compiler, before["units"], args.fuel, generated)
+
+    def emit_phase(name: str, elapsed: float | None) -> None:
+        event = "start" if elapsed is None else f"done elapsed_s={elapsed:.3f}"
+        print(f"FRONTEND_HOST_EMIT: phase={name} {event}", flush=True)
+
+    native.emit(args.compiler, before["units"], args.fuel, generated, phase_callback=emit_phase)
     print("FRONTEND_HOST_BUILD: backend emitted", flush=True)
     exports = set(re.findall(r'case\s+\d+:\s*return\s+"([^"]+)"', generated.read_text(encoding="utf-8")))
     required = set()

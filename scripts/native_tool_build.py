@@ -12,6 +12,7 @@ import sys
 import sysconfig
 import tempfile
 import time
+from collections.abc import Callable
 from contextlib import nullcontext
 from pathlib import Path
 
@@ -323,7 +324,8 @@ def complete_binary(binary: Path, metadata: Path, key: str) -> bool:
         return False
 
 
-def emit(compiler: Path, units: list[str], fuel: int, generated: Path) -> None:
+def emit(compiler: Path, units: list[str], fuel: int, generated: Path, *,
+         phase_callback: Callable[[str, float | None], None] | None = None) -> None:
     token = f"{os.getpid()}.{time.time_ns()}"
     temporary = generated.with_name(f"emit.{token}.c")
     error_log = generated.with_name(f"emit.{token}.err")
@@ -332,15 +334,33 @@ def emit(compiler: Path, units: list[str], fuel: int, generated: Path) -> None:
         argv.extend(("--unit", unit))
     env = dict(os.environ, OURO_EMIT_IO_SHIMS="1")
     env["WSLENV"] = (env.get("WSLENV", "") + ":OURO_EMIT_IO_SHIMS").lstrip(":")
+
+    def start_phase(name: str) -> float:
+        if phase_callback is not None:
+            phase_callback(name, None)
+        return time.perf_counter()
+
+    def finish_phase(name: str, started: float) -> None:
+        if phase_callback is not None:
+            phase_callback(name, time.perf_counter() - started)
+
     try:
+        started = start_phase("compiler")
         with temporary.open("wb") as output, error_log.open("wb") as errors:
             result = subprocess.run(argv, cwd=ROOT, env=env, stdout=output, stderr=errors, check=False)
         if result.returncode != 0 or temporary.stat().st_size == 0:
             raise RuntimeError(f"emit failed rc={result.returncode}: {error_log.read_text(encoding='utf-8', errors='replace')}")
+        finish_phase("compiler", started)
+        started = start_phase("uniquify")
         subprocess.run([sys.executable, str(ROOT / "scripts/pack_frontend.py"), "--uniquify-only", str(temporary)],
                        cwd=ROOT, check=True)
+        finish_phase("uniquify", started)
+        started = start_phase("hooks")
         hook_compile_checked_units(temporary, units)
+        finish_phase("hooks", started)
+        started = start_phase("publish")
         os.replace(temporary, generated)
+        finish_phase("publish", started)
     finally:
         temporary.unlink(missing_ok=True)
 

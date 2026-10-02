@@ -1340,6 +1340,90 @@ def test_native_tool_hooks(tmp: Path) -> None:
         assert re.search(rf"ouro_v\s*\*\s*{re.escape(wrapper)}\s*\(ouro_v\s*\*raw\)\s*\{{", runtime), wrapper
 
 
+def test_native_emit_phases(tmp: Path) -> None:
+    """Phase completion follows acceptance; failed stages cannot publish a backend."""
+    from contextlib import redirect_stderr, redirect_stdout
+    from io import StringIO
+
+    import native_tool_build as native
+
+    units = ["dependency.ouro", "entry.ouro"]
+    prior = b"previous backend\n"
+    emitted = b"int fixture_main(void){return 0;}\n"
+    packed = emitted + b"/* uniquified */\n"
+    hooked = packed + b"/* hooked */\n"
+    complete = [(name, state) for name in ("compiler", "uniquify", "hooks", "publish")
+                for state in ("start", "done")]
+    for mode, event_count in (("success", 8), ("quiet", 0), ("compiler", 1),
+                              ("uniquify", 3), ("hooks", 5)):
+        work = tmp / ("native-emit-phases-" + mode)
+        work.mkdir()
+        generated = work / "backend.c"
+        generated.write_bytes(prior)
+        events = []
+        compiler_argv = ["fixture-compiler", units[-1], "321", "--unit", units[0], "--unit", units[1]]
+
+        def phase(name, elapsed, *, _events=events, _generated=generated):
+            assert elapsed is None or isinstance(elapsed, float) and elapsed >= 0, (name, elapsed)
+            _events.append((name, "start" if elapsed is None else "done"))
+            expected = hooked if name == "publish" and elapsed is not None else prior
+            assert _generated.read_bytes() == expected, "phase callback preceded acceptance/publication"
+
+        def process(argv, *, _mode=mode, _work=work, _compiler_argv=compiler_argv, **options):
+            assert options["cwd"] == native.ROOT
+            if "stdout" in options:
+                assert argv == _compiler_argv and options["check"] is False
+                assert options["env"]["OURO_EMIT_IO_SHIMS"] == "1"
+                options["stdout"].write(emitted)
+                if _mode == "compiler":
+                    options["stderr"].write(b"fixture compiler failure\n")
+                return subprocess.CompletedProcess(argv, 1 if _mode == "compiler" else 0)
+            assert argv[:3] == [sys.executable, str(native.ROOT / "scripts/pack_frontend.py"),
+                                "--uniquify-only"] and options["check"] is True
+            temporary = Path(argv[3])
+            assert temporary.parent == _work and temporary.read_bytes() == emitted
+            temporary.write_bytes(packed)
+            if _mode == "uniquify":
+                raise subprocess.CalledProcessError(2, argv)
+            return subprocess.CompletedProcess(argv, 0)
+
+        def hook(temporary, observed_units, *, _generated=generated, _mode=mode):
+            assert observed_units == units and temporary.read_bytes() == packed
+            assert _generated.read_bytes() == prior
+            temporary.write_bytes(hooked)
+            if _mode == "hooks":
+                raise RuntimeError("fixture hook failure")
+
+        stdout, stderr = StringIO(), StringIO()
+        with patch.object(native.frontend, "ouro1_cmd", return_value=["fixture-compiler"]), \
+             patch.object(native.subprocess, "run", side_effect=process) as commands, \
+             patch.object(native, "hook_compile_checked_units", side_effect=hook) as hooks, \
+             patch.object(native.os, "replace", wraps=native.os.replace) as publish, \
+             redirect_stdout(stdout), redirect_stderr(stderr):
+            try:
+                if mode == "quiet":
+                    native.emit(work / "compiler", units, 321, generated)
+                else:
+                    native.emit(work / "compiler", units, 321, generated, phase_callback=phase)
+            except (RuntimeError, subprocess.CalledProcessError) as error:
+                if mode == "compiler":
+                    assert isinstance(error, RuntimeError) and "emit failed rc=1" in str(error)
+                    assert "fixture compiler failure" in str(error)
+                elif mode == "uniquify":
+                    assert isinstance(error, subprocess.CalledProcessError) and error.returncode == 2
+                else:
+                    assert mode == "hooks" and str(error) == "fixture hook failure"
+            else:
+                assert mode in ("success", "quiet"), "failed emission stage was accepted"
+            assert commands.call_count == (1 if mode == "compiler" else 2)
+            assert hooks.call_count == (0 if mode in ("compiler", "uniquify") else 1)
+            assert publish.call_count == (1 if mode in ("success", "quiet") else 0)
+        assert events == complete[:event_count]
+        assert stdout.getvalue() == stderr.getvalue() == "", "native emit lost its default-quiet contract"
+        assert generated.read_bytes() == (hooked if mode in ("success", "quiet") else prior)
+        assert not list(work.glob("emit.*.c")), "failed or published emission retained a temporary backend"
+
+
 def test_windows_quality_manifest_protocol(tmp: Path) -> None:
     """Resource failure/cleanup protocol only; native suites test Unicode argv."""
     import ctypes
@@ -1882,6 +1966,7 @@ def main() -> int:
         test_frontend_native_fs_create_protocol(tmp)
         test_destructive_path_policy(tmp)
         test_native_tool_hooks(tmp)
+        test_native_emit_phases(tmp)
         test_windows_quality_manifest_protocol(tmp)
         test_frontend_host_protocol(tmp)
         test_frontend_native_process_protocol(tmp)

@@ -388,6 +388,9 @@ The frontend-security host suite builds the fresh generated backend in shards
 grouped by 128 export clusters. It checks the original generated C, shard manifest
 and shard contents for all five host images, using one worker, `O0`, and the
 existing 3 GiB/900-second build budget. All 40 host probes remain required.
+The host build records start and completion markers for compiler emission,
+helper uniquification, hook installation, and publication, so a timeout can be
+assigned to the last unfinished phase without inferring it from compiler trace.
 
 On Windows, the required frontend-security host suite also uses its freshly
 built `n1-host` to emit the 29 bounded-process API laws, runtime fixture, and
