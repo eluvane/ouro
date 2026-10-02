@@ -52,8 +52,19 @@ def run_checks(files: list[str], out: Path, jobs: int) -> dict:
     # subsequent check invocations only read them and own their output logs.
     rows = [check((0, files[0]))]
     if rows[0]["status"] == "PASS":
+        items = list(enumerate(files[1:], 1))
+        exclusive = (ROOT / "tools/analyze/drive_main.ouro").resolve()
+        # This entry checks the complete analyzer/frontend closure. On Windows,
+        # give its existing deadline CPU time without competing core checks.
+        solo = [item for item in items if os.name == "nt" and Path(item[1]).resolve() == exclusive]
+        pooled = [item for item in items if item not in solo]
+        completed = {0: rows[0]}
+        for item in solo:
+            completed[item[0]] = check(item)
         with ThreadPoolExecutor(max_workers=jobs) as pool:
-            rows.extend(pool.map(check, enumerate(files[1:], 1)))
+            for item, row in zip(pooled, pool.map(check, pooled), strict=True):
+                completed[item[0]] = row
+        rows = [completed[index] for index in range(len(files))]
     passed = len(rows) == len(files) and all(row["status"] == "PASS" for row in rows)
     report = {"kind": "ouro.analyzer-core-checks.v1", "pass": passed,
               "jobs": jobs, "requested_checks": len(files), "wrapper_launches": len(rows),

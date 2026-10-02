@@ -340,6 +340,56 @@ class HarnessTests(unittest.TestCase):
             self.assertEqual(report["wrapper_launches"], 1)
             pool.assert_not_called()
 
+    def test_analyzer_core_pool_isolates_windows_driver_and_preserves_failures(self):
+        import threading
+        import analyze_core_checks as checks
+
+        files = ["warm.ouro", "slow.ouro", "tools/analyze/drive_main.ouro", "later.ouro"]
+        for result in (RunResult("ok", 0, "CHECK_OK\n", "", 1, 2),
+                       RunResult("ok", 1, "", "rejected", 1, 2),
+                       RunResult("timeout", 1, "", "timeout", 1, 2),
+                       RunResult("ok", 0xC0000005, "", "crash", 1, 2)):
+            commands, overtaken = [], threading.Event()
+
+            def execute(argv, result=result, commands=commands, overtaken=overtaken, **kwargs):
+                commands.append(argv[3])
+                self.assertEqual(kwargs["timeout_s"], 300)
+                self.assertEqual(kwargs["memory_mb"], 3072)
+                if argv[3] == files[2]:
+                    self.assertEqual(commands, [files[0], files[2]])
+                    return result
+                if argv[3] == files[1]:
+                    self.assertTrue(overtaken.wait(timeout=5))
+                elif argv[3] == files[3]:
+                    overtaken.set()
+                return RunResult("ok", 0, "CHECK_OK\n", "", 1, 2)
+
+            with tempfile.TemporaryDirectory() as directory, \
+                 patch.object(checks, "os", SimpleNamespace(name="nt", environ={})), \
+                 patch.object(checks, "environment", return_value={}), \
+                 patch.object(checks, "shell", return_value=Path("sh")), \
+                 patch.object(checks, "run_limited", side_effect=execute), \
+                 contextlib.redirect_stdout(io.StringIO()) as output:
+                value = checks.run_checks(files, Path(directory), 2)
+                self.assertEqual(value["pass"], result.ok)
+                self.assertEqual(value["wrapper_launches"], len(files))
+                self.assertEqual(sorted(commands), sorted(files))
+                self.assertEqual([row["file"] for row in value["checks"]], files)
+                self.assertEqual(value["checks"][2]["resource"], result.classify())
+                self.assertEqual([line.split()[2] for line in output.getvalue().splitlines()], files)
+                self.assertTrue(all(Path(row["log"]).is_file() for row in value["checks"]))
+
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.object(checks, "os", SimpleNamespace(name="posix")), \
+             patch.object(checks, "command_environment", return_value={}), \
+             patch.object(checks, "shell", return_value=Path("sh")), \
+             patch.object(checks, "run_limited", return_value=RunResult("ok", 0, "CHECK_OK\n", "", 0, 0)) as execute, \
+             contextlib.redirect_stdout(io.StringIO()):
+            value = checks.run_checks(files, Path(directory), 2)
+            self.assertTrue(value["pass"])
+            self.assertEqual([call.args[0][3] for call in execute.call_args_list], files)
+            self.assertEqual(value["jobs"], 1)
+
     def test_native_inputs_are_isolated_and_invalid_requests_do_not_write(self):
         import csv
         from ourosmith.native_inputs import GROUPS, prepare, run_manifest
