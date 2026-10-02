@@ -1223,6 +1223,26 @@ class LimitTests(unittest.TestCase):
     def execute(self, source, **limits):
         return run_limited([sys.executable, "-c", source], timeout_s=limits.get("timeout", 10), memory_mb=limits.get("memory", 256))
 
+    def assert_posix_process_exited(self, pid):
+        try:
+            state = Path(f"/proc/{pid}/status").read_text()
+        except (FileNotFoundError, ProcessLookupError):
+            return
+        self.assertIn("State:\tZ", state)
+
+    def test_posix_process_observation_handles_reaping(self):
+        for error in (FileNotFoundError(), ProcessLookupError()):
+            with self.subTest(error=type(error).__name__), patch.object(Path, "read_text", autospec=True, side_effect=error) as read:
+                self.assert_posix_process_exited(123)
+                read.assert_called_once_with(Path("/proc/123/status"))
+        with patch.object(Path, "read_text", autospec=True, return_value="State:\tZ (zombie)\n") as read:
+            self.assert_posix_process_exited(123)
+            read.assert_called_once_with(Path("/proc/123/status"))
+        with patch.object(Path, "read_text", autospec=True, return_value="State:\tS (sleeping)\n"), self.assertRaises(AssertionError):
+            self.assert_posix_process_exited(123)
+        with patch.object(Path, "read_text", autospec=True, side_effect=PermissionError()), self.assertRaises(PermissionError):
+            self.assert_posix_process_exited(123)
+
     def test_success_and_nonzero(self):
         result = self.execute("import sys; print(sys.stdin.read()); print('err',file=sys.stderr)")
         self.assertTrue(result.ok, result)
@@ -1318,8 +1338,7 @@ class LimitTests(unittest.TestCase):
                         close_handle(handle)
             else:
                 # A just-orphaned killed process can briefly be a zombie.
-                status = Path(f"/proc/{pid}/status")
-                self.assertTrue(not status.exists() or "State:\tZ" in status.read_text())
+                self.assert_posix_process_exited(pid)
 
 
 def run() -> int:
