@@ -253,7 +253,8 @@ python3 scripts/ci_gate.py --profile docs --out _build/ci/docs
 
 ### Affected PR checks
 
-`Paths` first runs the CI runner's self-tests and
+`Paths` first runs `python3 scripts/pack_frontend.py --selftest`,
+the CI runner's self-tests and
 `python3 scripts/clippy_import_gap.py --self-test`, before compiler builds.
 The gap command reads stub inventories, imports, and match arms. The repository scan
 is `python3 scripts/clippy_import_gap.py`. It then

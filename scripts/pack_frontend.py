@@ -857,12 +857,18 @@ static ouro_v *use4(void){
         "(ouro_v *[]){beta_d2,ouro_thunk(beta,e),beta_d3});}\n"
         "static ouro_v *prefix(ouro_env *e,ouro_v *a){return ouro_thunk(alpha_extra,e);}\n"
     )
+    interleaved_out = uniquify(interleaved)
     checks.append(("uniquify interleaved scoped names and mixed nested arms",
-                   uniquify(interleaved) == interleaved_expected))
+                   interleaved_out == interleaved_expected))
     checks.extend(_ctor_span_checks())
     bad = [name for name, ok in checks if not ok]
     if bad:
         print("pack_frontend selftest FAIL", bad, file=sys.stderr)
+        if interleaved_out != interleaved_expected:
+            print("--- interleaved expected ---", file=sys.stderr)
+            print(interleaved_expected, file=sys.stderr)
+            print("--- interleaved actual ---", file=sys.stderr)
+            print(interleaved_out, file=sys.stderr)
         print("--- mixed ---", file=sys.stderr)
         print(mout, file=sys.stderr)
         print("--- nested ---", file=sys.stderr)
