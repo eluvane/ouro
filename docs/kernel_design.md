@@ -104,7 +104,9 @@ for the declaration syntax and [TCB](tcb.md) for the pure dependency boundary.
 | Checked program and diagnostic serialization | `compiler/checked_program.ouro` and `compiler/checked_program_output.ouro` |
 
 Environment indexes are derived from accepted declarations. They accelerate
-lookup without granting unchecked declarations authority. The positivity walk
+lookup without granting unchecked declarations authority. Type lookup projects
+the selected entry directly, preserving numeric-name normalization, first-match
+shadowing, and constructor reservations. The positivity walk
 derives each earlier-tail index alongside its certificates. Certificates are
 rebuilt from the declaration list with the same proof fuel and failure checks.
 Deferred substitutions and application processing preserve binder scope and the

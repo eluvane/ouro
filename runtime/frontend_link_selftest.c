@@ -489,7 +489,9 @@ static int recheck_check(const char *mode)
 		return fail("recheck changed declaration, metadata or body result");
 	if (retained) {
 		ouro_v *first = result;
+		ouro_heap_context *context = ouro_heap_context_enter();
 		ouro_v *partial = ouro_apply(recheck, fuel);
+		partial = ouro_heap_context_leave(context, partial);
 		if (!recheck_shared_terms(program, first, depth))
 			return fail("recheck recopied caller-owned declaration terms");
 		result = ouro_apply(ouro_apply(recheck, ouro_nat(0)), program);

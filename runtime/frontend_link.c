@@ -803,7 +803,7 @@ static ouro_v *bounded_elaborate_fuel(ouro_env *env, ouro_v *fuel)
    result's new cells back, sharing caller-owned terms and accepted entries. */
 static ouro_v *bounded_check_item(ouro_env *env, ouro_v *item)
 {
-	ouro_v *fn = FIND(fc, "check_indexed_declaration");
+	ouro_v *fn = ouro_get(env, 3);
 	ouro_v *mode = ouro_get(env, 2);
 	ouro_v *fuel = ouro_get(env, 1);
 	ouro_v *sig = ouro_get(env, 0);
@@ -827,6 +827,12 @@ static ouro_v *bounded_check_mode(ouro_env *env, ouro_v *mode)
 	return ouro_clos(bounded_check_fuel, ouro_cons(mode, env));
 }
 
+static ouro_v *bounded_check_declaration(void)
+{
+	return ouro_clos(bounded_check_mode,
+		ouro_cons(FIND(fc, "check_indexed_declaration"), 0));
+}
+
 static ouro_v *closed_compile_from_decls(void)
 {
 	ouro_v *fn;
@@ -841,7 +847,7 @@ static ouro_v *closed_compile_from_decls(void)
 	fn = ouro_apply(fn, ouro_clos(bounded_elaborate_surfaces_fuel, 0));
 	fn = ouro_apply(fn, ouro_clos(bounded_elaborate_fuel, 0));
 	fn = ouro_apply(fn, ouro_apply(FIND(fc, "check_indexed_module_with"),
-		ouro_clos(bounded_check_mode, 0)));
+		bounded_check_declaration()));
 	g_closed_compile_from_decls = fn;
 	ouro_static_end();
 	return fn;
@@ -1366,7 +1372,7 @@ ouro_v *ouro_wrap_lower_recheck_program(ouro_v *raw)
 {
 	(void)raw;
 	return ouro_apply(FIND(lo, "lower_recheck_program_with"),
-		ouro_clos(bounded_check_mode, 0));
+		bounded_check_declaration());
 }
 
 static ouro_v *g_raw_managed_global;
