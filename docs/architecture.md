@@ -39,6 +39,11 @@ an internal marker that the module resolver binds to the directly imported
 unit after parsing; raw source cannot spell that marker. [Canonical source](canonical_source.md)
 owns trivia, directive metadata, source mapping, and hash contracts.
 
+Lexing derives a balanced spelling index from each unit's incoming intern
+tables, then extends it with the tables as new names and strings appear.
+`InternState` retains its ordered lists, constructor layout, and assigned IDs;
+the index supplies lookup only and preserves the first entry for duplicate keys.
+
 The parser uses the same `parse_a.ouro` / `parse_b.ouro` mode helpers and
 `parser_min.ouro` ABI as split bootstrap compilation. Its dispatcher owns the
 recursive fuel boundary. The module resolver gives colliding declarations
@@ -47,6 +52,10 @@ edge is reached. It computes visible names from each file's import edges;
 selective edges filter direct declarations while plain edges inherit the
 target's visible names. This scope does not shrink the ordered import closure.
 The checker still receives every reached imported declaration and body.
+Import resolution bounds graph traversal with `resolve_imports_fuel`; the
+default budget is 256. Ordinary declarations are collected structurally and do
+not consume this graph budget. Exhaustion reports the next unit path rather
+than returning a partial closure.
 [Compiler checking](kernel_design.md) defines the complete declaration plan
 and import-closure checks.
 

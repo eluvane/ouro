@@ -3,6 +3,15 @@ name: Manual
 on:
   workflow_dispatch:
     inputs:
+      task:
+        description: Validate a profile or generate a review patch
+        required: true
+        type: choice
+        default: validate
+        options:
+          - validate
+          - api
+          - dependency-locks
       profile:
         description: Local CI profile to run
         required: true
@@ -22,7 +31,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: ouro-manual-trust-${{ github.ref }}-${{ inputs.profile }}
+  group: ouro-manual-trust-${{ github.ref }}-${{ inputs.task || 'validate' }}-${{ inputs.profile }}
   cancel-in-progress: false
 
 defaults:
@@ -30,34 +39,11 @@ defaults:
     shell: bash
 
 jobs:
-  groups:
-    name: Select groups
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    outputs:
-      matrix: ${{ steps.groups.outputs.matrix }}
-    steps:
-      - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - name: Select complete profile inventory
-        id: groups
-        env:
-          PROFILE: ${{ inputs.profile }}
-        run: |
-          matrix=$(python3 scripts/ci_gate.py --profile "$PROFILE" --list-groups)
-          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
-
-  manual-validation:
-    name: ${{ inputs.profile }} (${{ matrix.group }})
-    needs: groups
+  api-generation:
+    name: Generate API review patch
+    if: ${{ inputs.task == 'api' }}
     runs-on: ubuntu-latest
     timeout-minutes: 120
-    strategy:
-      fail-fast: false
-      matrix:
-        group: ${{ fromJSON(needs.groups.outputs.matrix) }}
     permissions:
       contents: read
     env:
@@ -75,7 +61,301 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Identify compiler inputs
+        id: inputs
+        run: python3 scripts/ci_gate.py --compiler-artifact key >> "$GITHUB_OUTPUT"
+      - name: Restore compiler and bootstrap evidence
+        if: ${{ !inputs.disable_cache }}
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            _build/c/ouro1
+            _build/c/ouro1.bootstrap.json
+            _build/bootstrap/*/report.json
+            _build/bootstrap/*/inputs.json
+            _build/bootstrap/*/out/p1/*.c
+            _build/bootstrap/*/out/p2/*.c
+          key: ouro-host-compiler-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.inputs.outputs.key }}
+      - name: Disable API generation cache
+        if: ${{ inputs.disable_cache }}
+        run: echo "OURO_CACHE=0" >> "$GITHUB_ENV"
+      - name: Generate and verify API artifacts
+        run: |
+          set -euo pipefail
+          mkdir -p _build/ci/api-generation
+          cc --version
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          git status --porcelain > _build/ci/api-generation/initial-status.txt
+          test ! -s _build/ci/api-generation/initial-status.txt
+          git rev-parse HEAD > _build/ci/api-generation/source-commit.txt
+          sha256sum scripts/api_baseline_regen.py scripts/doc_suite.sh tools/doc.ouro tools/doc_model.ouro std/collections.ouro > _build/ci/api-generation/source-hashes.txt
+          python3 scripts/ouro_build.py build --verbosity quiet 2>&1 | tee _build/ci/api-generation/build.log
+          python3 scripts/api_baseline_regen.py 2>&1 | tee _build/ci/api-generation/baseline-regen.log
+          sh scripts/doc_suite.sh --regen 2>&1 | tee _build/ci/api-generation/doc-regen.log
+          python3 scripts/api_baseline_regen.py --check 2>&1 | tee _build/ci/api-generation/baseline-check.log
+          sh scripts/doc_suite.sh 2>&1 | tee _build/ci/api-generation/doc-check.log
+          git ls-files --others --exclude-standard > _build/ci/api-generation/untracked-paths.txt
+          if [ -s _build/ci/api-generation/untracked-paths.txt ]; then
+            echo "API generation produced untracked files; review them before exporting a patch" >&2
+            exit 1
+          fi
+          git diff --name-only > _build/ci/api-generation/changed-paths.txt
+          while IFS= read -r path; do
+            case "$path" in
+              quality/api_surface.tsv|docs/api/*.md) ;;
+              *) echo "API generation changed an unexpected path: $path" >&2; exit 1 ;;
+            esac
+          done < _build/ci/api-generation/changed-paths.txt
+          git diff --check
+          git diff --binary --full-index -- quality/api_surface.tsv docs/api > _build/ci/api-generation/api.patch
+          sha256sum _build/ci/api-generation/api.patch > _build/ci/api-generation/patch.sha256
+      - name: Upload verified API patch
+        if: success()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: api-review-patch-${{ github.run_id }}-${{ github.run_attempt }}
+          if-no-files-found: error
+          retention-days: 14
+          path: |
+            _build/ci/api-generation/api.patch
+            _build/ci/api-generation/patch.sha256
+            _build/ci/api-generation/source-commit.txt
+            _build/ci/api-generation/source-hashes.txt
+      - name: Upload API generation reports
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: api-generation-reports-${{ github.run_id }}-${{ github.run_attempt }}
+          if-no-files-found: error
+          retention-days: 14
+          path: |
+            _build/ci/api-generation/*.log
+            _build/ci/api-generation/*.txt
+            _build/api_baseline
+            _build/doc_suite
+            _build/bootstrap/**/*.json
+            _build/bootstrap/**/*.log
 
+  groups:
+    name: Select groups
+    if: ${{ inputs.task == 'validate' || inputs.task == '' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.groups.outputs.matrix }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Select complete profile inventory
+        id: groups
+        env:
+          PROFILE: ${{ inputs.profile }}
+        run: |
+          matrix=$(python3 scripts/ci_gate.py --profile "$PROFILE" --list-groups)
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+
+  host-compiler:
+    name: Host compiler (${{ matrix.os }})
+    needs: groups
+    if: ${{ !inputs.disable_cache }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    outputs:
+      sha256_Linux: ${{ steps.producer.outputs.sha256_Linux }}
+      sha256_Windows: ${{ steps.producer.outputs.sha256_Windows }}
+      artifact_Linux: ${{ steps.producer.outputs.artifact_Linux }}
+      artifact_Windows: ${{ steps.producer.outputs.artifact_Windows }}
+    permissions:
+      contents: read
+    env:
+      CC: gcc
+      OURO_CI: "1"
+      OURO_REPRODUCIBLE: "1"
+      OURO_PACK_STRICT: "1"
+      OURO_JOBS: "10"
+      OURO_CACHE_DIR: _cache/ouro
+      OURO_BUILD_DIR: _build
+      OURO_C_BUILD_DIR: _build/c
+      OURO_CCACHE: disabled
+      OURO_STAGE_MAX: "3"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up validation Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+      - name: Install Windows gcc
+        if: ${{ runner.os == 'Windows' }}
+        run: |
+          set -euo pipefail
+          choco install mingw --version 16.1.0 --yes --no-progress
+          gcc_bin=/c/ProgramData/mingw64/mingw64/bin
+          if [ ! -x "$gcc_bin/gcc.exe" ]; then
+            echo "Windows toolchain: pinned MinGW gcc is missing" >&2
+            exit 1
+          fi
+          cygpath -w "$gcc_bin" >> "$GITHUB_PATH"
+          echo "CC=gcc" >> "$GITHUB_ENV"
+      - name: Verify Windows gcc
+        if: ${{ runner.os == 'Windows' }}
+        run: |
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          import shutil
+          import subprocess
+
+          expected = Path("C:/ProgramData/mingw64/mingw64/bin/gcc.exe").resolve()
+          selected = shutil.which(os.environ["CC"])
+          if selected is None or Path(selected).resolve() != expected:
+              raise SystemExit("Windows toolchain: native Python selected a different gcc")
+          version = subprocess.check_output([selected, "-dumpfullversion", "-dumpversion"],
+                                            text=True, timeout=10).strip()
+          if version != "16.1.0":
+              raise SystemExit("Windows toolchain: pinned gcc version differs: " + version)
+          print(f"WINDOWS_GCC: PASS {expected} {version}")
+          PY
+
+      - name: Identify compiler inputs
+        id: inputs
+        run: python scripts/ci_gate.py --compiler-artifact key >> "$GITHUB_OUTPUT"
+
+      - name: Restore compiler and bootstrap evidence
+        id: compiler-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            _build/c/ouro1
+            _build/c/ouro1.bootstrap.json
+            _build/bootstrap/*/report.json
+            _build/bootstrap/*/inputs.json
+            _build/bootstrap/*/out/p1/*.c
+            _build/bootstrap/*/out/p2/*.c
+          key: ouro-manual-host-compiler-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.inputs.outputs.key }}
+
+      - name: Build and verify host compiler
+        run: python scripts/ouro_build.py build --verbosity quiet
+
+      - name: Export compiler with bootstrap evidence
+        id: bundle
+        run: python scripts/ci_gate.py --compiler-artifact export >> "$GITHUB_OUTPUT"
+
+      - name: Bind producer outputs to this OS and attempt
+        id: producer
+        env:
+          COMPILER_SHA256: ${{ steps.bundle.outputs.sha256 }}
+        run: |
+          echo "sha256_${RUNNER_OS}=$COMPILER_SHA256" >> "$GITHUB_OUTPUT"
+          echo "artifact_${RUNNER_OS}=manual-host-compiler-${{ runner.os }}-${{ github.run_id }}-${{ github.run_attempt }}" >> "$GITHUB_OUTPUT"
+
+      - name: Save compiler and bootstrap evidence
+        if: ${{ github.event_name != 'pull_request' && steps.compiler-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            _build/c/ouro1
+            _build/c/ouro1.bootstrap.json
+            _build/bootstrap/*/report.json
+            _build/bootstrap/*/inputs.json
+            _build/bootstrap/*/out/p1/*.c
+            _build/bootstrap/*/out/p2/*.c
+          key: ${{ steps.compiler-cache.outputs.cache-primary-key }}
+
+      - name: Upload verified compiler
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: manual-host-compiler-${{ runner.os }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: _build/ci/host-compiler.tar.gz
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload bootstrap reports
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: manual-host-compiler-reports-${{ runner.os }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            _build/bootstrap/**/*.json
+            _build/bootstrap/**/*.log
+          if-no-files-found: ignore
+          retention-days: 14
+
+  manual-validation:
+    name: ${{ inputs.profile }} (${{ matrix.group }}, ${{ matrix.os }})
+    needs: [groups, host-compiler]
+    if: ${{ always() && needs.groups.result == 'success' && (inputs.disable_cache || needs.host-compiler.result == 'success') }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        group: ${{ fromJSON(needs.groups.outputs.matrix) }}
+        os: [ubuntu-latest, windows-latest]
+    permissions:
+      contents: read
+    env:
+      CC: gcc
+      OURO_CI: "1"
+      OURO_REPRODUCIBLE: "1"
+      OURO_PACK_STRICT: "1"
+      OURO_JOBS: "10"
+      OURO_CACHE_DIR: _cache/ouro
+      OURO_BUILD_DIR: _build
+      OURO_C_BUILD_DIR: _build/c
+      OURO_CCACHE: disabled
+      OURO_STAGE_MAX: "3"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up validation Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+      - name: Install Windows gcc
+        if: ${{ runner.os == 'Windows' }}
+        run: |
+          set -euo pipefail
+          choco install mingw --version 16.1.0 --yes --no-progress
+          gcc_bin=/c/ProgramData/mingw64/mingw64/bin
+          if [ ! -x "$gcc_bin/gcc.exe" ]; then
+            echo "Windows toolchain: pinned MinGW gcc is missing" >&2
+            exit 1
+          fi
+          cygpath -w "$gcc_bin" >> "$GITHUB_PATH"
+          echo "CC=gcc" >> "$GITHUB_ENV"
+      - name: Verify Windows gcc
+        if: ${{ runner.os == 'Windows' }}
+        run: |
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          import shutil
+          import subprocess
+
+          expected = Path("C:/ProgramData/mingw64/mingw64/bin/gcc.exe").resolve()
+          selected = shutil.which(os.environ["CC"])
+          if selected is None or Path(selected).resolve() != expected:
+              raise SystemExit("Windows toolchain: native Python selected a different gcc")
+          version = subprocess.check_output([selected, "-dumpfullversion", "-dumpversion"],
+                                            text=True, timeout=10).strip()
+          if version != "16.1.0":
+              raise SystemExit("Windows toolchain: pinned gcc version differs: " + version)
+          print(f"WINDOWS_GCC: PASS {expected} {version}")
+          PY
       - name: Restore cache
         if: ${{ !inputs.disable_cache }}
         id: ouro-cache
@@ -96,20 +376,38 @@ jobs:
 
       - name: Show toolchain
         run: |
-          python3 --version
-          python3 -m pip install --disable-pip-version-check --quiet ruff==0.15.21
+          python --version
+          python -m pip install --disable-pip-version-check --quiet ruff==0.15.21
           if ! command -v shellcheck >/dev/null 2>&1; then
-            sudo apt-get update
-            sudo apt-get install -y shellcheck
+            if [ "${{ runner.os }}" = "Windows" ]; then
+              choco install shellcheck --yes --no-progress
+            else
+              sudo apt-get update
+              sudo apt-get install -y shellcheck
+            fi
           fi
           shellcheck --version
-          cc --version || true
+          gcc --version
 
-      - name: Build host compiler
-        run: python3 scripts/ouro_build.py build --verbosity quiet
+      - name: Download host compiler
+        if: ${{ !inputs.disable_cache }}
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ needs.host-compiler.outputs[format('artifact_{0}', runner.os)] }}
+          path: _build/ci
+
+      - name: Verify and install host compiler
+        if: ${{ !inputs.disable_cache }}
+        env:
+          COMPILER_SHA256: ${{ needs.host-compiler.outputs[format('sha256_{0}', runner.os)] }}
+        run: python scripts/ci_gate.py --compiler-artifact import --compiler-sha256 "$COMPILER_SHA256"
+
+      - name: Build host compiler without cache
+        if: ${{ inputs.disable_cache }}
+        run: python scripts/ouro_build.py build --verbosity quiet
 
       - name: Run profile
-        run: python3 scripts/ci_gate.py --profile "${{ inputs.profile }}" --group "${{ matrix.group }}" --out "_build/ci/${{ inputs.profile }}-${{ matrix.group }}"
+        run: python scripts/ci_gate.py --profile "${{ inputs.profile }}" --group "${{ matrix.group }}" --out "_build/ci/${{ inputs.profile }}-${{ matrix.group }}"
 
       - name: Save cache
         if: ${{ !inputs.disable_cache && github.event_name != 'pull_request' && steps.ouro-cache.outputs.cache-hit != 'true' }}
@@ -125,7 +423,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: manual-${{ inputs.profile }}-${{ matrix.group }}
+          name: manual-${{ inputs.profile }}-${{ matrix.group }}-${{ runner.os }}-${{ github.run_attempt }}
           if-no-files-found: ignore
           retention-days: 30
           path: |
@@ -137,3 +435,229 @@ jobs:
             _build/**/*.sarif
             _build/**/*.md
             _build/**/gate.log
+
+  dependency-locks:
+    name: Generate dependency lock patch
+    if: ${{ inputs.task == 'dependency-locks' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    env:
+      GIT_CONFIG_COUNT: "1"
+      GIT_CONFIG_KEY_0: safe.directory
+      GIT_CONFIG_VALUE_0: ${{ github.workspace }}
+    container:
+      image: mcr.microsoft.com/playwright:v1.63.0-noble@sha256:eff16c30e6f3f4af0a03fa4b706120d5e9b0891c344a27d64559aff5900a4a27
+      options: --platform linux/amd64 --cpus 2 --memory 3g
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Generate only the targeted brace-expansion locks
+        run: |
+          set -euo pipefail
+          out=_build/dependency-locks
+          mkdir -p "$out/registry-tarballs"
+          git rev-parse HEAD > "$out/source-commit.txt"
+          git ls-files -z -- site/package.json site/package-lock.json editors/vscode/package.json editors/vscode/package-lock.json | xargs -0 sha256sum > "$out/source-before.sha256"
+          node --version > "$out/node-version.txt"
+          npm --version > "$out/npm-version.txt"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test -z "$(git status --porcelain=v1)"
+          test -z "$(git ls-files --others --exclude-standard)"
+          cp site/package-lock.json "$out/site-before.json"
+          cp editors/vscode/package-lock.json "$out/editor-before.json"
+          printf '%s\n' 'npm update brace-expansion --package-lock-only --ignore-scripts --no-audit --no-fund' > "$out/update-command.txt"
+          (cd site && npm update brace-expansion --package-lock-only --ignore-scripts --no-audit --no-fund) 2>&1 | tee "$out/site-update.log"
+          (cd editors/vscode && npm update brace-expansion --package-lock-only --ignore-scripts --no-audit --no-fund) 2>&1 | tee "$out/editor-update.log"
+          for version in 1.1.21 5.0.12; do
+            npm view "brace-expansion@$version" version dist --json > "$out/registry-$version.json"
+            npm pack "brace-expansion@$version" --ignore-scripts --json --pack-destination "$PWD/$out/registry-tarballs" > "$out/pack-$version.json"
+          done
+          node --input-type=module <<'NODE'
+          import assert from 'node:assert/strict';
+          import { readFileSync, writeFileSync } from 'node:fs';
+          import { createHash } from 'node:crypto';
+          import { execFileSync } from 'node:child_process';
+          const out = '_build/dependency-locks';
+          const read = path => JSON.parse(readFileSync(path, 'utf8'));
+          const hash = path => createHash('sha256').update(readFileSync(path)).digest('hex');
+          const cases = [
+            ['site', 'site/package-lock.json', '1.1.18', '1.1.21'],
+            ['editor', 'editors/vscode/package-lock.json', '5.0.9', '5.0.12'],
+          ];
+          const records = [];
+          for (const [label, path, oldVersion, version] of cases) {
+            const before = read(`${out}/${label}-before.json`);
+            const after = read(path);
+            const registry = read(`${out}/registry-${version}.json`);
+            const key = 'node_modules/brace-expansion';
+            const entry = after.packages[key];
+            assert.equal(before.packages[key].version, oldVersion);
+            assert.equal(entry.version, version);
+            assert.equal(registry.version, version);
+            assert.equal(registry.dist.tarball, `https://registry.npmjs.org/brace-expansion/-/brace-expansion-${version}.tgz`);
+            assert.equal(entry.resolved, registry.dist.tarball);
+            assert.equal(entry.integrity, registry.dist.integrity);
+            const tarball = `${out}/registry-tarballs/brace-expansion-${version}.tgz`;
+            const integrity = 'sha512-' + createHash('sha512').update(readFileSync(tarball)).digest('base64');
+            assert.equal(integrity, registry.dist.integrity);
+            const packed = read(`${out}/pack-${version}.json`);
+            assert.equal(packed.length, 1);
+            assert.equal(packed[0].version, version);
+            assert.equal(packed[0].integrity, integrity);
+            const beforeRest = structuredClone(before);
+            const afterRest = structuredClone(after);
+            delete beforeRest.packages[key];
+            delete afterRest.packages[key];
+            assert.deepEqual(afterRest, beforeRest, 'Unrelated lock entries changed');
+            const preserved = structuredClone(before);
+            preserved.packages[key] = entry;
+            writeFileSync(path, JSON.stringify(preserved, null, label === 'site' ? '  ' : '\t') + '\n');
+            assert.deepEqual(read(path), after, 'Formatting changed the generated dependency graph');
+            records.push({path, old_version: oldVersion, version, before_sha256: hash(`${out}/${label}-before.json`),
+              after_sha256: hash(path), registry_metadata_sha256: hash(`${out}/registry-${version}.json`),
+              tarball_sha256: hash(tarball), integrity});
+          }
+          const changed = execFileSync('git', ['diff', '--name-only', '-z'], {encoding: 'utf8'}).split('\0').filter(Boolean).sort();
+          assert.deepEqual(changed, cases.map(item => item[1]).sort(), 'Only the two requested lock files may change');
+          assert.equal(execFileSync('git', ['ls-files', '--others', '--exclude-standard', '-z'], {encoding: 'utf8'}), '', 'Unexpected untracked output');
+          assert.equal(execFileSync('git', ['rev-parse', 'HEAD'], {encoding: 'utf8'}).trim(), process.env.GITHUB_SHA, 'Checkout HEAD changed');
+          writeFileSync(`${out}/provenance.json`, JSON.stringify({source_commit: execFileSync('git', ['rev-parse', 'HEAD'], {encoding: 'utf8'}).trim(),
+            image: 'mcr.microsoft.com/playwright:v1.63.0-noble@sha256:eff16c30e6f3f4af0a03fa4b706120d5e9b0891c344a27d64559aff5900a4a27',
+            generation_complete: true, validation_profile_run: false, dependency_review_run: false, records}, null, 2) + '\n');
+          NODE
+          git diff --check
+          git diff --binary -- site/package-lock.json editors/vscode/package-lock.json > "$out/dependency-locks.patch"
+          test -s "$out/dependency-locks.patch"
+          (cd "$out" && sha256sum dependency-locks.patch > patch.sha256)
+          git ls-files -z -- site/package.json site/package-lock.json editors/vscode/package.json editors/vscode/package-lock.json | xargs -0 sha256sum > "$out/source-after.sha256"
+          cp site/package-lock.json "$out/site-package-lock.json"
+          cp editors/vscode/package-lock.json "$out/editor-package-lock.json"
+
+      - name: Audit generated dependency locks
+        run: |
+          set -euo pipefail
+          out=_build/dependency-locks
+          status=0
+          if (cd site && npm audit --audit-level=moderate --json) > "$out/site-audit.json"; then
+            printf 'site audit passed\n'
+          else
+            status=1
+          fi
+          if (cd editors/vscode && npm audit --audit-level=moderate --json) > "$out/editor-audit.json"; then
+            printf 'editor audit passed\n'
+          else
+            status=1
+          fi
+          exit "$status"
+
+      - name: Upload verified lock patch and provenance
+        if: success()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: maintenance-dependency-locks-${{ github.run_id }}-${{ github.run_attempt }}
+          if-no-files-found: error
+          retention-days: 30
+          path: |
+            _build/dependency-locks/dependency-locks.patch
+            _build/dependency-locks/patch.sha256
+            _build/dependency-locks/site-package-lock.json
+            _build/dependency-locks/editor-package-lock.json
+            _build/dependency-locks/provenance.json
+            _build/dependency-locks/source-commit.txt
+            _build/dependency-locks/source-before.sha256
+            _build/dependency-locks/source-after.sha256
+
+      - name: Upload dependency lock diagnostics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: maintenance-dependency-lock-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
+          if-no-files-found: error
+          retention-days: 30
+          path: |
+            _build/dependency-locks/*.log
+            _build/dependency-locks/*.txt
+            _build/dependency-locks/*.json
+
+  docker-site-editor:
+    name: Docker (site and editor)
+    if: ${{ (inputs.task == 'validate' || inputs.task == '') && inputs.profile == 'manual' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Run site and editor in pinned Docker image
+        run: |
+          set -euo pipefail
+          out=_build/docker-site-editor
+          mkdir -p "$out"
+          image=mcr.microsoft.com/playwright:v1.63.0-noble@sha256:eff16c30e6f3f4af0a03fa4b706120d5e9b0891c344a27d64559aff5900a4a27
+          commit=$(git rev-parse HEAD)
+          started=$SECONDS
+          source_hashes() {
+            git ls-files -z -- site editors/vscode quality/biome.json | xargs -0 sha256sum
+          }
+          source_hashes > "$out/source-before.sha256"
+          finish() {
+            status=$?
+            source_hashes > "$out/source-after.sha256" || status=1
+            cmp "$out/source-before.sha256" "$out/source-after.sha256" || status=1
+            printf 'returncode=%s\nsource_commit=%s\nelapsed_s=%s\n' "$status" "$commit" "$((SECONDS - started))" > "$out/result.txt"
+            trap - EXIT
+            exit "$status"
+          }
+          trap finish EXIT
+          cat > "$out/run-checks.sh" <<'BASH'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          mkdir -p /work/site /work/editors/vscode /work/quality
+          cp /quality/biome.json /work/quality/biome.json
+          cd /site
+          tar --exclude=node_modules --exclude=dist -cf - . | tar -xf - -C /work/site
+          cd /editor
+          tar --exclude=node_modules --exclude=out -cf - . | tar -xf - -C /work/editors/vscode
+          node --version
+          npm --version
+          cd /work/site
+          npm ci --prefer-offline --no-audit --no-fund
+          npm run lint
+          npm test
+          npm run build
+          cd /work/editors/vscode
+          npm ci --prefer-offline --no-audit --no-fund
+          npm test
+          printf 'DOCKER_WORKFLOWS: PASS\n'
+          BASH
+          printf 'image=%s\nplatform=linux/amd64\nsource_commit=%s\n' "$image" "$commit" > "$out/provenance.txt"
+          docker pull --platform linux/amd64 "$image" 2>&1 | tee "$out/pull.log"
+          docker image inspect "$image" > "$out/image-inspect.json"
+          command=(docker run --rm --pull never --platform linux/amd64 --cpus 2 --memory 3g
+            --mount "type=bind,source=$PWD/site,target=/site,readonly"
+            --mount "type=bind,source=$PWD/editors/vscode,target=/editor,readonly"
+            --mount "type=bind,source=$PWD/quality,target=/quality,readonly"
+            --mount "type=bind,source=$PWD/$out/run-checks.sh,target=/run-checks.sh,readonly"
+            "$image" bash /run-checks.sh)
+          printf '%q ' "${command[@]}" > "$out/command.txt"
+          printf '\n' >> "$out/command.txt"
+          "${command[@]}" 2>&1 | tee "$out/run.log"
+          test "$(tail -n 1 "$out/run.log")" = 'DOCKER_WORKFLOWS: PASS'
+
+      - name: Upload Docker reports
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: manual-docker-site-editor-${{ github.run_id }}-${{ github.run_attempt }}
+          if-no-files-found: error
+          retention-days: 30
+          path: _build/docker-site-editor

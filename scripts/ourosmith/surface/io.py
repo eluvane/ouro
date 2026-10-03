@@ -9,7 +9,7 @@ from ourosmith import ROOT
 from ourosmith.host import BUILD_TIMEOUT_S
 from ourosmith.surface.library import quote, string_list
 
-FEATURES = ("filesystem", "filesystem-errors", "walk", "walk-limit", "temporary-files",
+FEATURES = ("filesystem", "filesystem-errors", "walk", "walk-limit", "workspace-walk-errors", "workspace-remove-links", "workspace-remove-empty", "temporary-files",
             "process-argv", "process-status", "environment", "stdin", "clock", "delay-action")
 
 HELPERS = """
@@ -20,6 +20,16 @@ def text_value (r : Either FsError String) : String :=
 def names_value (r : Either FsError (List String)) : String :=
   match r with | Left e => fs_error_code e
   | Right names => str_join "|" (str_sort_uniq names) end;
+def kind_value (r : Either FsError FsPathKind) : String :=
+  match r with
+  | Left e => fs_error_code e
+  | Right kind => match kind with
+    | FsPathUnavailable => "unavailable"
+    | FsRegularFile => "file"
+    | FsDirectory => "directory"
+    | FsUnsafeEntry => "unsafe"
+    end
+  end;
 def walk_value (r : FsWalkResult) : String :=
   match r with
   | FsWalkComplete names => str_join "|" (str_sort_uniq names)
@@ -72,6 +82,10 @@ def program(seed):
     observe("write", f'fs_write_checked "data/a.txt" {quote(body)}', "unit_value", "ok")
     observe("append", 'fs_append_checked "data/a.txt" "-more"', "unit_value", "ok")
     observe("read", 'fs_read_checked "data/a.txt"', "text_value", body + "-more")
+    observe("kind_file", 'fs_kind_checked "data/a.txt"', "kind_value", "file")
+    observe("kind_directory", 'fs_kind_checked "data"', "kind_value", "directory")
+    observe("kind_unavailable", 'fs_kind_checked "data/missing"', "kind_value", "unavailable")
+    observe("kind_empty", 'fs_kind_checked ""', "kind_value", "empty_path")
     observe("copy", 'fs_copy_checked "data/a.txt" "data/b.txt"', "unit_value", "ok")
     observe("copied", 'fs_read_checked "data/b.txt"', "text_value", body + "-more")
     observe("empty", 'fs_write_checked "data/empty.txt" ""', "unit_value", "ok")
@@ -108,7 +122,15 @@ def program(seed):
     observe("copytree", 'fsx_copy_tree_checked "data/tree" "data/copied"', "unit_value", "ok")
     observe("removetree", 'fsx_remove_tree_checked "data/tree"', "unit_value", "ok")
     observe("removemissingtree", 'fsx_remove_tree_checked "data/tree"', "unit_value", "ok")
+    observe("removeemptytree", 'fsx_remove_tree_checked ""', "unit_value", "empty_path")
     observe("treegone", 'fs_exists "data/tree"', "show_bool", "false")
+    observe("unsafe_list", 'fsx_list_files_filtered "workspace-unsafe" (fun (_path : String) => True)', "names_value", "operation_failed")
+    observe("unsafe_copy", 'fsx_copy_tree_checked "workspace-unsafe" "workspace-rejected-copy"', "unit_value", "operation_failed")
+    observe("unsafe_copy_absent", 'fs_exists "workspace-rejected-copy"', "show_bool", "false")
+    observe("kind_unsafe", 'fs_kind_checked "workspace-unsafe/link"', "kind_value", "unsafe")
+    observe("unsafe_remove_root", 'fsx_remove_tree_checked "workspace-unsafe/link"', "unit_value", "operation_failed")
+    observe("unsafe_remove_child", 'fsx_remove_tree_checked "workspace-unsafe"', "unit_value", "operation_failed")
+    observe("unsafe_sentinel", 'fs_read_checked "workspace-outside/sentinel.txt"', "text_value", f"preserved-{seed}")
     observe("envvalue", 'env_or "OURO_SMITH_VALUE" "missing"', "", f"env-{seed}")
     observe("envmissing", 'env_or "OURO_SMITH_ABSENT" "fallback"', "", "fallback")
     observe("processenvmissing", 'process_env_or "OURO_SMITH_ABSENT" "fallback"', "", "fallback")
@@ -164,8 +186,29 @@ def run_checks(run, directory, saved=None):
     env = {**run.env, "OURO_SMITH_VALUE": env_value}
     env.pop("OURO_SMITH_ABSENT", None)
     start = time.time_ns() // 1_000_000
-    actual = run.native(path, units=units, io=True, env=env,
-                        arguments=arguments, stdin=stdin, compile_timeout=compile_timeout)
+    link = None
+    try:
+        if "unsafe_list" in expected:
+            unsafe = directory / "workspace-unsafe"
+            outside = directory / "workspace-outside"
+            unsafe.mkdir(exist_ok=True)
+            outside.mkdir(exist_ok=True)
+            (unsafe / "regular.txt").write_text("ordinary file", encoding="utf-8")
+            (outside / "sentinel.txt").write_text(expected["unsafe_sentinel"], encoding="utf-8")
+            link = unsafe / "link"
+            if os.name == "nt":
+                created = run.command(["cmd", "/c", "mklink", "/J", str(link), str(outside)], directory, "io-workspace-link")
+                run.require(created.ok, "io-workspace-link", "junction created", run.output(created))
+            else:
+                link.symlink_to(outside, target_is_directory=True)
+        actual = run.native(path, units=units, io=True, env=env,
+                            arguments=arguments, stdin=stdin, compile_timeout=compile_timeout)
+    finally:
+        if link is not None and (link.exists() or link.is_symlink()):
+            if os.name == "nt":
+                link.rmdir()
+            else:
+                link.unlink()
     end = time.time_ns() // 1_000_000
     run.require(actual.ok and not actual.stderr, "io-run", "exit 0 and empty stderr", run.output(actual))
     observed = {}

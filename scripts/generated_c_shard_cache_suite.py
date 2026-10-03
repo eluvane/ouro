@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Fake-compiler regressions for generated-C shard/cache behavior.
+"""Generated-C shard/cache and runtime ABI regressions.
 
-The suite drives scripts/stage_loop.py's C build seam with generated-like C so it
-can prove shard-level invalidation without running the real bootstrap loop.
+The fake compiler exercises stage-loop shard invalidation. A bounded real C
+fixture checks cross-shard runtime and host declarations without bootstrapping.
 """
 from __future__ import annotations
 
@@ -260,9 +260,120 @@ def test_backend_cluster_memory_shape() -> None:
     assert "transform_backend_cluster(\n                    lines," in source
 
 
+def test_host_backend_shards(tmp: Path) -> None:
+    import generated_c_shards as gcs
+    from ourosmith.limits import run_limited
+
+    fixture = '''#include "ouro_rt.h"
+#include "ouro_quality_scope.h"
+ouro_v *ouro_fe_compile_checked_units_clos(void);
+static ouro_v *ouro_g1(void);
+static ouro_v *ouro_g2(void);
+static ouro_v *ouro_g3(void);
+static ouro_v *ouro_g4(void);
+static ouro_v *ouro_g5(void);
+static ouro_v *ouro_g99(void);
+static ouro_v *ouro_g99_d0(void);
+ouro_v *ouro_io_prim_req(const char *name);
+ouro_v *ouro_io_type_stub(const char *name);
+static ouro_v *ouro_c1;
+static ouro_v *ouro_g1(void){if(ouro_c1==0)ouro_c1=ouro_io_prim_req("prim_string_length");return ouro_c1;}
+static ouro_v *ouro_c2;
+static ouro_v *ouro_g2(void){if(ouro_c2==0)ouro_c2=ouro_g1();return ouro_c2;}
+static ouro_v *ouro_f3_a(ouro_env *env,ouro_v *arg){(void)env;(void)arg;return ouro_g2();}
+static ouro_v *ouro_f3_(ouro_env *env,ouro_v *arg){return ouro_clos(ouro_f3_a,ouro_cons(arg,env));}
+static ouro_v *ouro_c3;
+static ouro_v *ouro_g3(void){if(ouro_c3==0)ouro_c3=ouro_wrap_quality_pure(ouro_clos(ouro_f3_,0));return ouro_c3;}
+static ouro_v *ouro_c4;
+static ouro_v *ouro_g4(void){if(ouro_c4==0)ouro_c4=ouro_fe_compile_checked_units_clos();return ouro_c4;}
+static ouro_v *ouro_c5;
+static ouro_v *ouro_g5(void){if(ouro_c5==0)ouro_c5=ouro_io_type_stub("Shape");return ouro_c5;}
+static ouro_v *ouro_c99;
+static ouro_v *ouro_g99(void){if(ouro_c99==0)ouro_c99=ouro_g2();return ouro_c99;}
+static ouro_v *ouro_c99;
+static ouro_v *ouro_g99_d0(void){if(ouro_c99==0)ouro_c99=ouro_g2();return ouro_c99;}
+int ouro_export_countEXPORT_SUFFIX(void){return 7;}
+const char *ouro_export_nameEXPORT_SUFFIX(int i){switch(i){case 0:return "primitive";case 1:return "alias";case 2:return "quality";case 3:return "frontend";case 4:return "type";case 5:return "shared";case 6:return "shared-alias";default:return "";}}
+ouro_v *ouro_export_valueEXPORT_SUFFIX(int i){switch(i){case 0:return ouro_g1();case 1:return ouro_g2();case 2:return ouro_g3();case 3:return ouro_g4();case 4:return ouro_g5();case 5:return ouro_g99();case 6:return ouro_g99_d0();default:return 0;}}
+'''
+    driver = '''#include "backend_u__shards.h"
+#include <string.h>
+ouro_v *ouro_fe_compile_checked_units_clos(void){return ouro_g3();}
+int main(void){
+ const char *names[]={"primitive","alias","quality","frontend","type","shared","shared-alias"};
+ ouro_v *primitive=ouro_export_valueEXPORT_SUFFIX(0);
+ ouro_v *quality=ouro_export_valueEXPORT_SUFFIX(2);
+ ouro_v *type=ouro_export_valueEXPORT_SUFFIX(4);
+ unsigned long length=0;
+ int i;
+ if(ouro_export_countEXPORT_SUFFIX()!=7)return 1;
+ for(i=0;i<7;i++)if(strcmp(ouro_export_nameEXPORT_SUFFIX(i),names[i])!=0)return 2;
+ if(primitive!=ouro_export_valueEXPORT_SUFFIX(1)||primitive!=ouro_export_valueEXPORT_SUFFIX(5)||primitive!=ouro_export_valueEXPORT_SUFFIX(6))return 3;
+ if(quality!=ouro_export_valueEXPORT_SUFFIX(3)||type==0||type->tag!=OURO_TAG_CLOS||type!=ouro_export_valueEXPORT_SUFFIX(4))return 4;
+ if(!ouro_nat_to_ulong(ouro_apply(primitive,ouro_str("hello")),&length)||length!=5)return 5;
+ primitive=ouro_apply(ouro_apply(quality,ouro_nat(0)),ouro_nat(0));
+ if(!ouro_nat_to_ulong(ouro_apply(primitive,ouro_str("hello")),&length)||length!=5)return 6;
+ puts("BACKEND_SHARD_ABI: PASS SUFFIX_LABEL");return 0;
+}
+'''
+    for suffix, label in (("", "flat"), ("_be", "be")):
+        work = tmp / ("host-shards-" + label)
+        work.mkdir()
+        backend = work / "backend.gen.c"
+        backend.write_text(fixture.replace("EXPORT_SUFFIX", suffix), encoding="utf-8")
+        original_hash = gcs.sha256_file(backend)
+        options = {"backend_export_suffix": ""} if not suffix else {}
+        sources, report = gcs.materialize_generated_c_shards(
+            frontend_c=None, backend_c=backend, out_dir=work / "shards", label_prefix="host",
+            backend_group_size=1, **options)
+        assert report["summary"]["frontend_shards"] == 0 and report["summary"]["source_reads"] == 1, report
+        assert report["summary"]["compile_shards"] == 9, report
+        assert report["shards"][-1]["symbols"] == [f"ouro_export_{kind}{suffix}" for kind in ("count", "name", "value")]
+        header = work / "shards/backend_u__shards.h"
+        header_text = header.read_text(encoding="utf-8")
+        for declaration in ('#include "ouro_quality_scope.h"', "ouro_v *ouro_fe_compile_checked_units_clos(void);",
+                            "ouro_v *ouro_io_prim_req(const char *name);", "ouro_v *ouro_io_type_stub(const char *name);"):
+            assert declaration in header_text, declaration
+        assert "extern ouro_v *ouro_c99;" in header_text
+        main = work / "main.c"
+        main.write_text(driver.replace("EXPORT_SUFFIX", suffix).replace("SUFFIX_LABEL", label), encoding="utf-8")
+        binary = work / ("shard-abi.exe" if os.name == "nt" else "shard-abi")
+        compiler = os.environ.get("CC", "cc")
+        command = [compiler, "-O0", "-std=c99", "-D_POSIX_C_SOURCE=200809L", "-Werror=implicit-function-declaration",
+                   "-I" + str(ROOT / "runtime"), "-I" + str(header.parent),
+                   *(str(path) for _name, path in sources), str(ROOT / "runtime/ouro_rt.c"),
+                   str(ROOT / "runtime/ouro_io.c"), str(main), "-o", str(binary)]
+        compiled = run_limited(command, cwd=ROOT, timeout_s=120, memory_mb=1536)
+        assert compiled.ok, compiled
+        executed = run_limited([str(binary)], cwd=ROOT, timeout_s=15, memory_mb=256)
+        assert executed.ok and executed.stdout == f"BACKEND_SHARD_ABI: PASS {label}\n" and executed.stderr == "", executed
+        mtimes = {str(path): path.stat().st_mtime_ns for _name, path in sources}
+        _sources, warm = gcs.materialize_generated_c_shards(
+            frontend_c=None, backend_c=backend, out_dir=work / "shards", label_prefix="host",
+            backend_group_size=1, **options)
+        assert warm["manifest_cache"] == "hit" and all(row["cache"] == "hit" for row in warm["shards"]), warm
+        assert mtimes == {str(path): path.stat().st_mtime_ns for _name, path in sources}
+        assert original_hash == gcs.sha256_file(backend), "sharding changed the canonical backend"
+        header.write_text(header_text + "\n/* changed header */\n", encoding="utf-8")
+        ok, reason = gcs.manifest_valid(gcs.read_json(Path(report["manifest_path"])),
+            generator_hash=report["generator_hash"], source_digests=report["sources"], plan_meta=report["shards"])
+        assert not ok and reason == "shard-hash", reason
+
+    for text, suffix in ((fixture.replace("EXPORT_SUFFIX", ""), "_be"),
+                         (fixture.replace("EXPORT_SUFFIX", ""), ";invalid"),
+                         (fixture.replace("EXPORT_SUFFIX", "").replace('#include "ouro_rt.h"', '#include "ouro_rt.h"\n#define UNKNOWN_PRELUDE 1'), "")):
+        try:
+            gcs.backend_shards(backend, text, work / "rejected", "host", "fixture", 1, export_suffix=suffix)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("unsupported backend prefix or suffix accepted")
+
+
 def main() -> int:
     with tempfile.TemporaryDirectory(prefix="ouro-generated-c-shard-suite-") as d:
         test_shard_invalidation(Path(d))
+        test_host_backend_shards(Path(d))
     test_backend_cluster_memory_shape()
     print("GENERATED_C_SHARD_CACHE_SUITE: PASS")
     return 0

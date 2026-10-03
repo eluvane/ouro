@@ -122,6 +122,47 @@ def checker_test_signature : List Entry :=
 def checker_test_with (item : FileItem) : List FileItem :=
     append FileItem checker_test_base ([item] : List FileItem);
 
+def checker_test_type_lets (count : Nat) : CoreTerm :=
+    CLetIn checker_test_nat (CSort 0)
+      ((fix build (remaining : Nat) : CoreTerm :=
+        match remaining with
+        | Z => checker_test_zero
+        | S next => CLetIn (CPi (CRel 0) (CRel 1)) (CSort 0) (build next)
+        end) count);
+
+def checker_test_linear_aliases : CoreTerm :=
+    CLetIn checker_test_zero checker_test_nat
+      ((fix build (remaining : Nat) (body : CoreTerm) : CoreTerm :=
+        match remaining with
+        | Z => body
+        | S next => build next (CLetIn (CRel 0) checker_test_nat body)
+        end) (mul 20 1000) (CRel 0));
+
+def checker_test_resource_failure (A : Type) (result : CheckResult A) : Bool :=
+    match result with
+    | CheckOk _ => False
+    | CheckErr failure => match failure with
+        | CheckResourceLimit => True
+        | CheckTypeFailure _ => False | CheckReductionFailure _ => False
+        | CheckMalformedCore _ => False | CheckUnsupported _ => False
+        | CheckCancelled => False | CheckInternalFailure _ => False
+        | CheckPrimitiveFailure _ => False
+        end
+    end;
+
+def checker_test_declaration_expansion (mode : CheckMode) : Bool :=
+    match check_declarations mode keep_checking checker_test_fuel
+        (checker_test_with (FDef 50 checker_test_nat (checker_test_type_lets 20))) with
+    | DeclarationsOk _ => False
+    | DeclarationsErr name phase failure =>
+        andb (eqNat name 50)
+          (andb (checker_test_resource_failure Unit (CheckErr Unit failure))
+            (match phase with
+             | CheckDeclarationBody => True | CheckDeclarationPlan => False
+             | CheckDeclarationType => False | CheckInductiveDeclaration => False
+             end))
+    end;
+
 def checker_test_nat_case (motive : CoreTerm) (annotation : CoreTerm)
     : CoreTerm :=
     CCase (MkCaseInfo 10 0 ([0, 1] : List Nat)) motive
@@ -310,6 +351,89 @@ def checker_test_fix_pair (name : Nat) (rec_arg : Nat) (arity : Nat) : CoreTerm 
     CFix name rec_arg arity checker_test_fix_pair_type
       (CLam(checker_test_nat, CLam(checker_test_nat, CRel 0)));
 
+def checker_test_prefix_box : CoreTerm := CInd 80;
+
+def checker_test_prefix_empty : CoreTerm := CInd 83;
+
+def checker_test_prefix_type : CoreTerm :=
+    CPi(checker_test_prefix_box, CPi checker_test_nat checker_test_prefix_empty);
+
+def checker_test_prefix_items (body : CoreTerm) : List FileItem :=
+    append FileItem checker_test_base
+      ([ FInd (MkIndDecl 80 (Nil Param) (Nil CoreTerm) 0
+           ([MkCtor(81, CPi checker_test_nat checker_test_prefix_box)] : List Ctor))
+       , FInd (MkIndDecl 83 (Nil Param) (Nil CoreTerm) 0 (Nil Ctor))
+       , FDef 50 checker_test_prefix_type (CFix 50 1 2 checker_test_prefix_type body)
+       ] : List FileItem);
+
+-- The constructor field belongs to the first input, before the second exists.
+def checker_test_case_before_parameter : CoreTerm :=
+    CLam checker_test_prefix_box
+      (CCase (MkCaseInfo 80 0 ([1] : List Nat))
+        (CLam checker_test_prefix_box (CPi checker_test_nat checker_test_prefix_empty))
+        (CRel 0)
+        ([CLam checker_test_nat
+          (CLam checker_test_nat (CApp(CApp(CRel 3, CRel 2), CRel 1)))] : List CoreTerm));
+
+def checker_test_let_before_parameter : CoreTerm :=
+    CLam checker_test_prefix_box
+      (CLetIn (CRel 0) checker_test_prefix_box
+        (CLam checker_test_nat
+          (CCase (MkCaseInfo 80 0 ([1] : List Nat))
+            (CLam checker_test_prefix_box checker_test_prefix_empty) (CRel 1)
+            ([CLam checker_test_nat
+              (CApp(CApp(CRel 4, CRel 3), CRel 0))] : List CoreTerm))));
+
+def checker_test_annotation_recursion : CoreTerm :=
+    let typ : CoreTerm := CPi checker_test_nat (CSort 0) in
+    CFix 50 0 1 typ
+      (CLam
+        (CLetIn
+          (CPi checker_test_nat
+            (CCase (MkCaseInfo 10 0 ([0, 1] : List Nat))
+              (CLam checker_test_nat (CSort 0)) (CRel 0)
+              ([checker_test_nat, CLam checker_test_nat (CApp(CRel 2, CRel 0))]
+                : List CoreTerm)))
+          (CSort 0) checker_test_nat)
+        checker_test_nat);
+
+def checker_test_second_descent : CoreTerm :=
+    CFix 50 1 2 checker_test_fix_pair_type
+      (CLam checker_test_nat (CLam checker_test_nat
+        (CLetIn (CRel 1) checker_test_nat
+          (CCase (MkCaseInfo 10 0 ([0, 1] : List Nat))
+            checker_test_nat_motive (CRel 1)
+            ([CRel 0, CLam checker_test_nat
+              (CApp(CApp(CRel 4, CRel 3), CRel 0))] : List CoreTerm)))));
+
+def checker_test_nonterminating_failure (failure : CheckFailure) : Bool :=
+    match failure with
+    | CheckTypeFailure fault => match fault with
+      | CheckNonTerminating => True
+      | CheckTypeMismatch => False | CheckExpectedSort => False
+      | CheckExpectedFunction => False | CheckCaseMotive => False
+      | CheckNonPositive => False | CheckUniverseBound => False
+      end
+    | CheckMalformedCore _ => False | CheckReductionFailure _ => False
+    | CheckResourceLimit => False | CheckUnsupported _ => False
+    | CheckCancelled => False | CheckInternalFailure _ => False
+    | CheckPrimitiveFailure _ => False
+    end;
+
+def checker_test_reject_recursion (name : String) (items : List FileItem) : CheckerTest :=
+    let result : DeclarationResult :=
+      check_declarations CheckExactCore keep_checking checker_test_fuel items in
+    let passed : Bool := match result with
+      | DeclarationsOk _ => False
+      | DeclarationsErr declaration phase failure =>
+          andb (eqNat declaration 50)
+            (andb (match phase with
+              | CheckDeclarationBody => True | CheckDeclarationPlan => False
+              | CheckDeclarationType => False | CheckInductiveDeclaration => False
+              end) (checker_test_nonterminating_failure failure))
+      end in
+    CheckerLaw name passed (checker_test_verdict (declaration_file_result CheckExactCore result));
+
 -- Both inputs have valid recursion metadata. A malformed term or exhausted
 -- conversion must not count as evidence that two neutral fixpoints differ.
 def checker_test_fix_comparison (expected : Bool) (left : CoreTerm)
@@ -459,6 +583,14 @@ def checker_core_tests : List CheckerTest :=
         (checker_test_with (FDef 50 checker_test_fix_pair_type (checker_test_fix_pair 50 0 2)))
     , checker_test_accept "accept fix with second recursive argument"
         (checker_test_with (FDef 50 checker_test_fix_pair_type (checker_test_fix_pair 50 1 2)))
+    , checker_test_reject_recursion "reject case witness before structural parameter"
+        (checker_test_prefix_items checker_test_case_before_parameter)
+    , checker_test_reject_recursion "reject let witness before structural parameter"
+        (checker_test_prefix_items checker_test_let_before_parameter)
+    , checker_test_reject_recursion "reject annotation witness before structural parameter"
+        (checker_test_with (FDef 50 (CPi checker_test_nat (CSort 0)) checker_test_annotation_recursion))
+    , checker_test_accept "accept second structural parameter below a let binder"
+        (checker_test_with (FDef 50 checker_test_fix_pair_type checker_test_second_descent))
     , checker_test_accept "accept fix returning another function"
         (checker_test_with (FDef 50 checker_test_fix_pair_type (checker_test_fix_pair 50 0 1)))
     , checker_test_assert "fix recursive argument affects conversion"
@@ -493,6 +625,30 @@ def checker_core_tests : List CheckerTest :=
          end)
     , checker_test_assert "structural equality exhaustion rejects"
         (notb (eqTerm(0, CRel 0, CRel 0)))
+    , checker_test_assert "linear local aliases stay within expansion budget"
+        (check_expansion_within checker_test_linear_aliases)
+    , checker_test_assert "expansion aliases preserve open terms"
+        (eqTerm 20
+          (check_expansion_local_value [Just CoreTerm (CRel 1)] (CRel 0)) (CRel 0))
+    , checker_test_assert "expansion aliases preserve compound scope"
+        (eqTerm 20
+          (check_expansion_local_value [Just CoreTerm (CPi (CRel 0) (CRel 1))] (CRel 0)) (CRel 0))
+    , checker_test_assert "local type expansion stays within work budget"
+        (match check_term_checked checker_test_fuel checker_test_signature (Nil CoreTerm)
+            (checker_test_type_lets 12) checker_test_nat with
+         | CheckOk _ => True | CheckErr _ => False end)
+    , checker_test_assert "local type expansion rejects before materialization"
+        (checker_test_resource_failure Unit
+          (check_term_checked checker_test_fuel checker_test_signature (Nil CoreTerm)
+            (checker_test_type_lets 20) checker_test_nat))
+    , checker_test_assert "inferred local type expansion rejects before materialization"
+        (checker_test_resource_failure CoreTerm
+          (infer_checked checker_test_fuel checker_test_signature (Nil CoreTerm)
+            (IGTerm (checker_test_type_lets 20))))
+    , checker_test_assert "exact declarations bound local expansion"
+        (checker_test_declaration_expansion CheckExactCore)
+    , checker_test_assert "source declarations bound expansion before refinement"
+        (checker_test_declaration_expansion CheckSourceCore)
     , checker_test_assert "lift crosses 200 binders" checker_test_deep_lift
     , checker_test_assert "substitution crosses 200 binders" checker_test_deep_substitution
     , checker_test_assert "substitution lifts an open replacement"

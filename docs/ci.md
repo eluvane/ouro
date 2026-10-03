@@ -72,6 +72,24 @@ The group names are `checks`, `checks-parity`, `checks-quality`, `analysis`, `ch
 `--list-groups` prints the selected profile's complete group list as JSON;
 Manual and Release use that inventory to construct their hosted matrices.
 Release metadata and assembly require every validation group to succeed.
+
+The stage-loop profile separates `checks-parity` (`parity`) and `checks-quality`
+(`syntax-quality-firewall`) from `trust`. `trust` retains Python syntax,
+strict and structural quality, and the complete stage-loop/drift gate.
+The ungrouped command retains the complete gate inventory and registry order.
+Cold Manual validation bootstraps every group independently; job and process
+limits stay unchanged.
+
+The generated-artifact drift gate retains the historical stage0 manifest checks
+and compares fresh frontend regeneration and the full stage-loop fixpoint with
+the verified current P2 generated C. The installed compiler receipt must bind
+the current source, toolchain, binary, and complete P1/P2 equality evidence before
+and after regeneration. Missing or changed evidence fails the gate; see
+[Build](build.md#generated-artifacts-and-stage-loop) for the retained seed and
+promotion contracts. Its `ouro.generated-artifact-drift-report.v2` report records
+the current reference key and artifact paths, with raw and LF-normalized hashes
+and the frozen binary, receipt, report, and input-evidence hashes.
+
 Use isolated checkouts when running
 groups concurrently: several suites own fixed fixture/output paths. The full
 local command runs every gate in registry order. The runner rejects a group
@@ -91,9 +109,26 @@ production sweep would select from `std/`, `compiler/`, `tools/`, and
 stays with the complete suite because it needs a vendored snapshot. Findings
 that a change causes in unchanged files are left to Nightly. Without a routing
 plan, as in local, Manual and Release runs, `lint-changed` is reported as
-skipped and the complete `lint` group owns coverage. Local profiles and
-`sh scripts/lint_suite.sh` retain the complete suite; Python/shell lint and the
-other quality gates keep their existing schedules.
+skipped and the complete lint suite owns coverage. Nightly, full Manual,
+and **Lint → Run workflow** schedule `lint-fixtures`, `lint-production-1`
+through `lint-production-4`, and
+`lint-clippy` as required groups. Each runs `lint_suite.sh --phase=...` with
+the existing 120-minute job limit and checks the complete native tool receipts.
+Fixtures retain the quality, launcher, semantic session, stress and import tests;
+production shards retain the complete source inventory and deny verdicts. Each
+uses `--phase=production --shard=N/4`; the native lint owner completes and
+deduplicates the inventory before selecting every fourth file in its stable
+order. All families run for each selected file, including the prepared package
+snapshot and explicit bench source. Clippy
+retains all four compiler checks and grade fixtures. The registry rejects missing,
+duplicated, reordered or recombined phases and production shards. `--group lint`
+on these profiles runs all required groups in order; `--group lint-production`
+runs the four production shards. Both aliases are excluded from their schedulable
+inventory. `lint_suite.sh` without arguments or with `--phase=production` retains
+the complete unsharded production sweep.
+The local PR `lint` group, standalone Lint workflow and `sh scripts/lint_suite.sh`
+without arguments retain the complete suite. Python/shell lint and the other
+quality gates keep their existing schedules.
 Execution removes the previous `ci-summary.json` before starting gates, so an
 interrupted run leaves no old successful aggregate at the current report path.
 The native CI runner also invalidates selected gate reports and the delegated
@@ -162,9 +197,15 @@ Existing suite assertions and required gates remain in place;
 these explicit invocations do not establish native bootstrap or retire the
 full PR profile.
 
-Nightly uses `checks`, `analysis`, `analyzer`, `lint`, `tests`, `samples-1`, `samples-2`, `kernel`,
-`trust`, and `compiler-1` through `compiler-16` groups. The `trust` job runs the stage-loop fixpoint/drift gate and
-then the deeper OuroSmith profile in the same checkout. `Full` runs even after
+Nightly uses `checks`, `checks-parity`, `checks-quality`, `analysis`, `analyzer`,
+`lint-fixtures`, `lint-production-1` through `lint-production-4`, `lint-clippy`,
+`tests`, `samples-1`, `samples-2`, `kernel`, `smith-selftest`, `trust`, and `compiler-1` through `compiler-16`.
+PR, Nightly and Manual isolate parity and syntax quality in their respective
+checks groups, with the existing gate commands and per-program limits.
+The `trust` job runs the stage-loop fixpoint/drift gate and then the deeper
+OuroSmith profile in the same checkout. The required `smith-selftest` group
+runs the harness self-tests separately, preserving all gates and per-program limits.
+The PR `smith` group runs the same blocking self-tests before its generated profile. `Full` runs even after
 a job failure and fails unless every matrix group succeeds. Reports are
 uploaded separately as `nightly-<group>` artifacts. Hosted PR matrix jobs use static names `PR` and `Portable` so a skipped
 matrix does not publish an unevaluated expression. When those jobs run,
@@ -212,7 +253,8 @@ python3 scripts/ci_gate.py --profile docs --out _build/ci/docs
 
 ### Affected PR checks
 
-`Paths` first runs the CI runner's self-tests and
+`Paths` first runs `python3 scripts/pack_frontend.py --selftest`,
+the CI runner's self-tests and
 `python3 scripts/clippy_import_gap.py --self-test`, before compiler builds.
 The gap command reads stub inventories, imports, and match arms. The repository scan
 is `python3 scripts/clippy_import_gap.py`. It then
@@ -269,6 +311,8 @@ Do not require individual dynamic matrix names in branch protection.
 
 The GitHub job summary lists selected groups and gates. Full runs enqueue the
 three long check groups and isolated `source_spans` shard before the other compiler shards.
+Manual creates both operating-system jobs for each group before advancing to the
+next group, so Windows jobs enter the queue alongside their Linux counterparts.
 PR matrix jobs continue independently after a sibling
 failure, and each group stops at its first blocking failure while recording
 unexecuted gates as `not_run`. Nightly and ordinary local profiles still gather
@@ -343,11 +387,23 @@ with one worker, and writes logs under `_build/compiler_check_suite` (or
 `TEST_SUITE_OUT`). The full unsharded gate remains registered in the Ouro-native `suite-native`
 profile. User-test and stage-loop gates remain separate.
 
+The frontend-security host suite builds the fresh generated backend in shards
+grouped by 128 export clusters. It checks the original generated C, shard manifest
+and shard contents for all five host images, using one worker, `O0`, and the
+existing 3 GiB/900-second build budget. All 40 host probes remain required.
+The host build records start and completion markers for compiler emission,
+helper uniquification, hook installation, and publication, so a timeout can be
+assigned to the last unfinished phase without inferring it from compiler trace.
+
 On Windows, the required frontend-security host suite also uses its freshly
 built `n1-host` to emit the 29 bounded-process API laws, runtime fixture, and
-denied-commit child as direct PE32+ images. All 32 host probes
+denied-commit child as direct PE32+ images. All 40 host probes
 remain required, including reachability/flow-round fuel, error-payload and nested
-allocation and PE patch-plan lifetime checks. Default-quiet host progress and
+allocation, root clearing, and PE operation lifetime checks, descriptor renumbering, forced
+codegen fallback, and canonical block/body byte parity. On Windows, the same
+fresh backend also emits the existing reclamation and active-caller fixtures
+as direct PE images, including a validated descriptor renumbering across 65536.
+All three images must return 42 after their heap/root assertions. Default-quiet host progress and
 unchanged failure diagnostics are checked separately. The native section requires all 29 API result lines in
 order, including the two separate `capture cap` laws, 13 runtime cases, and
 5 source-helper rejections after successful source checking and rechecking. The cases cover
@@ -565,7 +621,7 @@ Host-script retirement follows the evidence rules in
 | --- | --- |
 | `ouro-pr.yml` | Parallel PR, kernel, editor, and portable checks |
 | `ouro-nightly-full.yml` | Scheduled full checks |
-| `ouro-manual-trust.yml` | On-demand check profiles |
+| `ouro-manual-trust.yml` | On-demand check profiles on Ubuntu and Windows |
 | `dependency-review.yml` | Changed dependency and workflow checks |
 | `ouro-lint.yml` | Full Ouro lint suite, manual dispatch only |
 | `ouro-release.yml` | Build host toolchains and publish tag drafts and snapshots every three days |
@@ -573,6 +629,25 @@ Host-script retirement follows the evidence rules in
 
 The release workflow builds the host toolchains described in
 [Releasing](releasing.md). Its build and assemble jobs stay read-only.
+
+Manual validates the complete selected profile on Ubuntu and Windows. With
+caching enabled, one compiler producer per OS exports the bootstrap evidence;
+each validation group verifies the artifact SHA, current source and toolchain
+before using it. `disable_cache=true` keeps independent cold builds in every
+group. Windows Manual and Release jobs pin MinGW 16.1.0 and select only
+`C:\ProgramData\mingw64\mingw64\bin\gcc.exe`. They add its native directory to
+the next steps' `PATH` and set `CC=gcc`; a native Python check requires that
+exact compiler path and version before building or importing the compiler.
+Compiler and bootstrap receipts retain their complete identity checks.
+The `api` task runs the canonical API generators and checks, then uploads
+a review patch without publishing source changes. This artifact task does not
+run or certify a validation profile.
+
+The `dependency-locks` task updates only the two `brace-expansion` lock entries,
+verifies their registry tarball integrity and runs npm audit before uploading a
+review patch. It does not publish changes or replace dependency review. The full
+Manual profile also runs the site and editor checks in an immutable Docker image
+with read-only source mounts and retains source hashes and execution logs.
 
 Hosted path selection is fail-closed for validation: missing revisions, a Git
 error, or an empty diff runs every applicable job. An editor-only change runs

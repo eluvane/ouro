@@ -222,6 +222,11 @@ separate from the repository analyzer so each tool keeps a smaller dependency
 and memory footprint. Directory scans have no file-size cutoff. The launcher
 runs each source in its own process and returns nonzero if a child fails;
 memory exhaustion is not a successful skip.
+`lint --shard N/M` partitions the completed, deduplicated native inventory
+in its stable order: shard 1 receives the first file, shard 2 the second, and
+so on cyclically. Run all shards over the same roots and source revision to
+cover the complete inventory; each selected file retains all requested families.
+Indices satisfy `1 <= N <= M <= 128`; invalid or empty shard selections fail.
 Both tools prune build and dependency directories during root discovery.
 Analyzer diagnostic fixtures are opt-in with `--include-fixtures`; their
 expected findings are checked by the dedicated suites.
@@ -326,6 +331,12 @@ currently provides:
 - document formatting;
 - full-text document synchronization.
 
+Positions use UTF-16 code units, including after Unicode string contents;
+compiler byte columns are converted before publishing diagnostics. Definition
+and symbol URIs percent-encode path bytes so spaces, `%`, `#`, `?`, and Unicode
+retain their file identity. Malformed JSON-RPC request envelopes receive
+`Invalid Request` (`-32600`); valid notifications receive no response.
+
 Completion keeps name-prefix suggestions. In a direct top-level definition
 with a simple explicit result type, such as `def value : Choice := Re`, it also
 suggests matching nullary constructors from a local, non-parameterized
@@ -347,7 +358,8 @@ traversal, links/reparse points, non-file URIs, and canonical paths outside that
 root are rejected. Protocol frames are limited to 1 MiB, one retained document
 to 512 KiB, and all open document text to 2 MiB. Formatting and unsaved-buffer
 checks use exclusive scratch files under the root's existing `_build` directory
-and remove them after the child command completes.
+and remove them after the child command completes. A failed scratch creation or
+write publishes a `TOOL_ERROR` diagnostic; it cannot report a clean check.
 
 ## VS Code
 

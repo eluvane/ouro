@@ -48,7 +48,19 @@ PASS lexer malformed result crosses parser callback
 PASS lexer exhaustion crosses parser callback
 PASS parser error crosses unit callback
 PASS resolver error retains code and missing path
+PASS 255 ordinary declarations retain the complete closure
+PASS 256 ordinary declarations use only graph fuel
+PASS large root and imported unit use only graph fuel
+PASS interleaved imports retain dependency order and diamond deduplication
+PASS zero graph fuel retains the entry path
+PASS exhausted graph fuel retains the next import path
+PASS exhausted nested graph retains the next import path
+PASS graph cycle retains code and repeated path
+PASS missing graph unit retains code and missing path
 PASS compiler result retains named core
+PASS checked emission retains exact bodies and requested order
+PASS checked emission retains first definitions and ignores metadata
+PASS checked emission rejects missing and bodyless declarations
 PASS compiler error retains code and detail
 PASS lower environment preserves constructor and hint fields
 PASS import preprocessing retains registry values
@@ -59,6 +71,22 @@ PASS record callback carries compiler-owned alias metadata
 PASS text-only record wrapper cannot drop required alias metadata
 PASS preprocessors share successful source value
 PASS preprocessor error crosses pipeline callback
+PASS checked erasure resolves a global universe alias
+PASS checked erasure resolves a local universe alias
+PASS checked erasure keeps Nat alias data binders
+PASS checked erasure respects local universe alias shadowing
+PASS checked erasure drops beta computed type arguments
+PASS checked erasure drops let computed type arguments
+PASS checked erasure drops closed case computed type arguments
+PASS checked erasure retains beta computed data arguments
+PASS checked erasure retains let computed data arguments
+PASS checked erasure retains polymorphic functions as values
+PASS checked erasure reports exhausted preparation
+PASS checked erasure reports an unsupported residual type computation
+PASS checked erasure resolves type cases controlled by local data
+PASS checked erasure keeps repeated runtime lets without expansion
+PASS checked erasure drops repeated type lets without expansion
+PASS checked erasure bounds deferred type expansion
 COMPILER_ABI: PASS
 """
 PROBE = '''import "std/data.ouro";
@@ -118,6 +146,9 @@ def current_unchanged(root: Path, selected: dict) -> bool:
 
 
 def freeze(root: Path, work: Path, selected: dict, cfg) -> dict:
+    import ouro_build as build
+
+    config = {**cfg.values, "jobs": bootstrap_workers(cfg.values, build)}
     manifest = bootstrap_inputs.unpack(work / "historical", root)
     original = work / "o"
     for name, digest in selected["sources"].items():
@@ -162,7 +193,7 @@ def freeze(root: Path, work: Path, selected: dict, cfg) -> dict:
     files = {path.relative_to(work).as_posix(): sha256_file(path)
              for directory in directories for path in sorted(directory.rglob("*")) if path.is_file()}
     snapshot = {"kind": KIND + ".inputs", "key": hash_json(selected), "selected": selected,
-        "inputs": files, "config": cfg.values, "bridge_graph": manifest["ordered_unit_graph"],
+        "inputs": files, "config": config, "bridge_graph": manifest["ordered_unit_graph"],
         "roots": {"c0": "historical/c0", "bridge": "historical/bridge", "p1": "o", "p2": "compact" if compaction else "o"},
         "compaction": compaction,
         "current_o_projection": "None; every current source is copied byte for byte."}
@@ -186,9 +217,17 @@ def compare_generated(first: Path, second: Path) -> dict:
     return result
 
 
+def bootstrap_workers(config: dict, build) -> int:
+    jobs = config["jobs"]
+    if jobs != "auto" and (type(jobs) is not int or jobs < 1):
+        fail("bootstrap jobs must be auto or a positive integer")
+    return min(build.jobs_value(build.ResolvedConfig(config, {})), 2)
+
+
 def chain(work: Path, snapshot: dict, build) -> dict:
+    workers = bootstrap_workers(snapshot["config"], build)
     report = {"kind": KIND, "key": snapshot["key"], "inputs_sha256": sha256_file(work / "inputs.json"),
-        "workers": 1, "memory_mib": MEMORY_MIB, "timeout_s": TIMEOUT_S, "phases": [], "pass": False}
+        "workers": workers, "memory_mib": MEMORY_MIB, "timeout_s": TIMEOUT_S, "phases": [], "pass": False}
     selected, producers = snapshot["selected"], {}
     phase, out = "prepare", work
 
@@ -204,12 +243,12 @@ def chain(work: Path, snapshot: dict, build) -> dict:
         for name in ("USERPROFILE", "APPDATA", "LOCALAPPDATA", "PROGRAMFILES", "PROGRAMFILES(X86)", *selected["environment"]):
             if name in os.environ:
                 env[name] = os.environ[name]
-        values = {**snapshot["config"], "cc": selected["cc_executable"], "jobs": 1, "cache_enabled": False, "ccache": "disabled",
+        values = {**snapshot["config"], "cc": selected["cc_executable"], "jobs": workers, "cache_enabled": False, "ccache": "disabled",
                   "build_dir": str(out / "b"), "c_build_dir": str(out / "c"), "cache_dir": str(out / "k")}
         for key, name in build.ENV_MAP.items():
             value = values[key]
             env[name] = ("1" if value else "0") if isinstance(value, bool) else str(value)
-        env.update(PYTHONDONTWRITEBYTECODE="1", OURO_FRONTEND_JOBS="1", OURO1_CHECK_FUEL=FUEL)
+        env.update(PYTHONDONTWRITEBYTECODE="1", OURO_FRONTEND_JOBS=str(workers), OURO1_CHECK_FUEL=FUEL)
         if snapshot["config"]["verbosity"] != "quiet":
             print(f"BOOTSTRAP: {phase}/{label}", flush=True)
         result = run_limited(argv, cwd=root, env=env, timeout_s=TIMEOUT_S, memory_mb=MEMORY_MIB)
@@ -370,7 +409,8 @@ def worker(args) -> None:
     import ouro_build as build
     import stage_loop
     out = work / "out" / args.phase
-    values = {**snapshot["config"], "cc": snapshot["selected"]["cc_executable"], "jobs": 1, "cache_enabled": False, "ccache": "disabled",
+    workers = bootstrap_workers(snapshot["config"], build)
+    values = {**snapshot["config"], "cc": snapshot["selected"]["cc_executable"], "jobs": workers, "cache_enabled": False, "ccache": "disabled",
               "build_dir": str(out / "b"), "c_build_dir": str(out / "c"), "cache_dir": str(out / "k")}
     cfg = build.ResolvedConfig(values, {key: "frozen bootstrap invocation" for key in values})
     graph = snapshot["bridge_graph"] if args.phase == "bridge" else snapshot["selected"]["unit_graph"]
@@ -382,7 +422,7 @@ def worker(args) -> None:
         if any(frontend.collect_units(source) != graph[source] for source in snapshot["selected"]["roots"]):
             fail("worker ordered source closure changed")
         frontend.regenerate(ouro1=args.producer, fuel=FUEL, out_c=out / "driver_u.c", work=out / "fe",
-            cache_root=out / "k", cache_enabled=False, report_path=out / "frontend.json", jobs=1)
+            cache_root=out / "k", cache_enabled=False, report_path=out / "frontend.json", jobs=workers)
     elif args.action == "link":
         config = stage_loop.build_config(argparse.Namespace(promote=False))
         config.build_cfg = cfg
@@ -392,7 +432,7 @@ def worker(args) -> None:
     elif args.action == "abi-build":
         import native_tool_build
         law_args = argparse.Namespace(entry="tests/compiler_abi_tests.ouro", output=out / "abi", compiler=args.producer,
-            fuel=int(FUEL), check=False, config=None, profile=None, opt_level="O0", jobs=1, cc=values["cc"],
+            fuel=int(FUEL), check=False, config=None, profile=None, opt_level="O0", jobs=workers, cc=values["cc"],
             ccache="disabled", cache_enabled=False, build_dir=str(out / "ab"), c_build_dir=str(out / "ac"),
             cache_dir=str(out / "ak"), reproducible=values["reproducible"], verbosity=values["verbosity"])
         result = native_tool_build.build_tool(law_args)

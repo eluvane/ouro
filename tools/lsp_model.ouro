@@ -2,6 +2,7 @@
 -- Formatting is delegated to the CLI to avoid namespace collisions and keep editor output identical.
 
 import "doc_model.ouro",
+  "lsp_text_encoding.ouro",
   "../std/json_types.ouro",
   "../std/jsonrpc.ouro",
   "../std/pathx.ouro",
@@ -72,101 +73,6 @@ def lsp_shutdown (s : Lsp) : Lsp :=
 def lsp_text (s : Lsp) (uri : String) : String :=
     map_get_or String "" uri (lsp_docs s);
 
--- URIs. Only file: URIs are supported; percent escapes are decoded because
--- editors send drive letters as %3A.
-def uri_hex (c : Nat) : Nat :=
-    match is_digit c with
-    | True => sub c ch_zero
-    | False =>
-        match is_upper c with
-        | True => add(sub c ch_A, 10)
-        | False => add(sub c ch_a, 10)
-        end
-    end;
-
-def uri_decode_codes : Nat -> List Nat -> List Nat :=
-  fix uri_decode_codes (fuel : Nat) (cs : List Nat) : List Nat :=
-    match fuel with
-    | Z => cs
-    | S fuel2 =>
-        match cs with
-        | Nil => Nil Nat
-        | Cons c rest =>
-            match eq_nat c ch_percent with
-            | False => Cons Nat c (uri_decode_codes fuel2 rest)
-            | True =>
-                match rest with
-                | Nil => ([c] : List Nat)
-                | Cons h1 rest2 =>
-                    match rest2 with
-                    | Nil => ([c, h1] : List Nat)
-                    | Cons h2 rest3 =>
-                        Cons Nat (add(mul(uri_hex h1, 16), uri_hex h2))
-                          (uri_decode_codes fuel2 rest3)
-                    end
-                end
-            end
-        end
-    end;
-
-def uri_decode (s : String) : String :=
-    str_of_codes (uri_decode_codes(S (str_len s), str_codes s));
-
--- Percent escapes must be complete hexadecimal bytes.  NUL is rejected
--- because host filesystem APIs interpret it as a terminator rather than as a
--- path byte.
-def uri_codes_valid : List Nat -> Bool :=
-  fix uri_codes_valid (cs : List Nat) : Bool :=
-    match cs with
-    | Nil => True
-    | Cons c rest =>
-        match eq_nat c ch_percent with
-        | False => andb(notb (eq_nat c Z), uri_codes_valid rest)
-        | True =>
-            match rest with
-            | Nil => False
-            | Cons h1 rest2 =>
-                match rest2 with
-                | Nil => False
-                | Cons h2 rest3 =>
-                    andb (andb(is_hex h1, is_hex h2))
-                      (andb
-                        (notb (eq_nat(add(mul(uri_hex h1, 16), uri_hex h2), Z)))
-                        (uri_codes_valid rest3))
-                end
-            end
-        end
-    end;
-
-def uri_windows_drive_path (p : String) : String :=
-    match andb(str_starts p "/", path_has_drive (str_drop(p, S Z))) with
-    | True => str_drop(p, S Z)
-    | False => p
-    end;
-
-def uri_file_path (uri : String) : Maybe String :=
-    match str_strip_prefix uri "file://" with
-    | Nothing => Nothing String
-    | Just rest =>
-        match andb (uri_codes_valid (str_codes rest))
-          (andb (notb (str_contains rest "#"))
-            (notb (str_contains rest "?"))) with
-        | False => Nothing String
-        | True =>
-            let path : String := uri_windows_drive_path (uri_decode rest) in
-            match path_is_abs path with
-            | True => Just(String, path_normalize path)
-            | False => Nothing String
-            end
-        end
-    end;
-
-def path_to_uri (path : String) : String :=
-    match str_starts path "/" with
-    | True => str_concat "file://" path
-    | False => str_cat3 "file://" "/" path
-    end;
-
 -- Positions. LSP counts lines and characters from zero.
 def lsp_pos (line : Nat) (character : Nat) : Json :=
     let fields : List (Pair String Json) :=
@@ -233,7 +139,11 @@ def word_in_line (line : String) (col : Nat) : String :=
     end;
 
 def word_at (text : String) (line : Nat) (col : Nat) : String :=
-    word_in_line(nth String "" line (str_lines text), col);
+    let source_line : String := nth String "" line (str_lines text) in
+    match lsp_byte_column source_line col with
+    | Nothing => ""
+    | Just column => word_in_line source_line column
+    end;
 
 -- Completion uses the prefix up to the cursor, not the whole identifier.
 def prefix_in_line (line : String) (col : Nat) : String :=
@@ -542,26 +452,30 @@ def completion_ctor_item (family : String) (name : String) : Json :=
 def completion_result (text : String) (line : Nat) (col : Nat)
     (syms : List Sym) : Json :=
     let source_line : String := nth String "" line (str_lines text) in
-    let prefix : String := prefix_in_line source_line col in
-    let ordinary : List Json := map Sym Json completion_item
-      (filter Sym (fun (s : Sym) => completion_matches prefix s) syms) in
-    let trimmed_source : String := str_trim source_line in
-    let constructors : List Json :=
-      match andb(str_starts(trimmed_source, "def"),
-        is_ws (prim_string_byte_at trimmed_source 3)) with
-      | False => Nil Json
-      | True =>
-          let token_line : Nat := S line in
-          let tokens : List FxTok := fx_lex text in
-          match completion_expected_family source_line token_line col prefix tokens with
-          | Nothing => Nil Json
-          | Just family =>
-              map String Json (completion_ctor_item family)
-                (filter String (fun (name : String) => str_starts(name, prefix))
-                  (completion_local_ctors tokens token_line family))
-          end
-      end in
-    JArr (append Json constructors ordinary);
+    match lsp_byte_column source_line col with
+    | Nothing => JArr (Nil Json)
+    | Just column =>
+        let prefix : String := prefix_in_line source_line column in
+        let ordinary : List Json := map Sym Json completion_item
+          (filter Sym (fun (s : Sym) => completion_matches prefix s) syms) in
+        let trimmed_source : String := str_trim source_line in
+        let constructors : List Json :=
+          match andb(str_starts(trimmed_source, "def"),
+            is_ws (prim_string_byte_at trimmed_source 3)) with
+          | False => Nil Json
+          | True =>
+              let token_line : Nat := S line in
+              let tokens : List FxTok := fx_lex text in
+              match completion_expected_family source_line token_line column prefix tokens with
+              | Nothing => Nil Json
+              | Just family =>
+                  map String Json (completion_ctor_item family)
+                    (filter String (fun (name : String) => str_starts(name, prefix))
+                      (completion_local_ctors tokens token_line family))
+              end
+          end in
+        JArr (append Json constructors ordinary)
+    end;
 
 def location_result (s : Sym) : Json :=
     let line : Nat := sub(decl_line (sym_decl s), S Z) in
@@ -599,11 +513,21 @@ def prepare_rename_result (text : String) (line : Nat) (col : Nat) : Json :=
     | True => JNull
     | False =>
         let ln : String := nth String "" line (str_lines text) in
-        let cs : List Nat := str_codes ln in
-        let n : Nat := length Nat cs in
-        let i : Nat := word_start(S n, cs, minNat col n) in
-        let j : Nat := word_end (S n) cs i in
-        lsp_range line i line j
+        match lsp_byte_column ln col with
+        | Nothing => JNull
+        | Just column =>
+            let cs : List Nat := str_codes ln in
+            let n : Nat := length Nat cs in
+            let i : Nat := word_start(S n, cs, minNat column n) in
+            let j : Nat := word_end (S n) cs i in
+            match lsp_utf16_column ln i False with
+            | Nothing => JNull
+            | Just first => match lsp_utf16_column ln j True with
+              | Nothing => JNull
+              | Just last => lsp_range line first line last
+              end
+            end
+        end
     end;
 
 -- Textual rename over identifier tokens in the open buffer only. Not
@@ -672,6 +596,7 @@ def rename_result (uri : String) (old_text : String) (new_text : String) : Json 
 def lsp_capabilities : Json :=
     let fields : List (Pair String Json) :=
       [ MkPair String Json "textDocumentSync" (json_num (S Z))
+      , MkPair String Json "positionEncoding" (JStr "utf-16")
       , MkPair String Json "hoverProvider" (JBool True)
       , MkPair String Json "definitionProvider" (JBool True)
       , MkPair String Json "completionProvider" (JBool True)
@@ -692,6 +617,49 @@ def lsp_initialize_result : Json :=
       [ MkPair String Json "capabilities" lsp_capabilities
       , MkPair String Json "serverInfo" lsp_server_info ] in
     JObj fields;
+
+def lsp_message_id_valid (id : Json) : Bool :=
+    match id with
+    | JNull => True
+    | JNum _ => True
+    | JStr _ => True
+    | JBool _ => False
+    | JArr _ => False
+    | JObj _ => False
+    end;
+
+def lsp_message_error_id (msg : Json) : Json :=
+    let id : Json := rpc_id msg in
+    match lsp_message_id_valid id with
+    | True => id
+    | False => JNull
+    end;
+
+def lsp_message_is_notification (msg : Json) : Bool :=
+    match json_obj_get msg "id" with
+    | Nothing => True
+    | Just _ => False
+    end;
+
+def lsp_message_valid (msg : Json) : Bool :=
+    match msg with
+    | JObj _ =>
+        let method_ok : Bool := match json_field msg "method" with
+          | JStr _ => True
+          | JNull => False
+          | JBool _ => False
+          | JNum _ => False
+          | JArr _ => False
+          | JObj _ => False
+          end in
+        andb (str_eq(json_field_str msg "jsonrpc" "", "2.0"))
+          (andb method_ok (lsp_message_id_valid (rpc_id msg)))
+    | JNull => False
+    | JBool _ => False
+    | JNum _ => False
+    | JStr _ => False
+    | JArr _ => False
+    end;
 
 -- Diagnostics come from the checker's own output, so the editor shows exactly
 -- what `ouro1 check` reports. Two shapes matter:
@@ -805,6 +773,38 @@ def diags_of_output (path : String) (out : String) : List Json :=
     concat_map String Json
       (fun (line : String) => diag_keep(path, diag_of_line line))
       (str_lines out);
+
+def lsp_diagnostic_utf16 (lines : List String) (diagnostic : Json) : Json :=
+    let range : Json := json_field diagnostic "range" in
+    let start : Json := json_field range "start" in
+    let finish : Json := json_field range "end" in
+    let first_line : Nat := json_field_nat start "line" Z in
+    let last_line : Nat := json_field_nat finish "line" Z in
+    let first : Maybe Nat := lsp_utf16_column (nth String "" first_line lines)
+      (json_field_nat start "character" Z) False in
+    let last : Maybe Nat := lsp_utf16_column (nth String "" last_line lines)
+      (json_field_nat finish "character" Z) True in
+    let unavailable : Json := diag_of "CHECK_PROTOCOL" (JNum "1") Z Z
+      (str_concat "invalid UTF-8 source position in checker diagnostic: "
+        (json_field_str diagnostic "message" "")) in
+    match first with
+    | Nothing => unavailable
+    | Just first_col => match last with
+      | Nothing => unavailable
+      | Just last_col =>
+          JObj (map (Pair String Json) (Pair String Json)
+            (fun (field : Pair String Json) => match field with
+              | MkPair key value => MkPair String Json key
+                  (match str_eq key "range" with
+                  | True => lsp_range first_line first_col last_line last_col
+                  | False => value
+                  end)
+              end) (json_pairs diagnostic))
+      end
+    end;
+
+def lsp_diagnostics_utf16 (text : String) (diagnostics : List Json) : List Json :=
+    map Json Json (lsp_diagnostic_utf16 (str_lines text)) diagnostics;
 
 def publish_params (uri : String) (ds : List Json) : Json :=
     let fields : List (Pair String Json) :=

@@ -210,6 +210,67 @@ def test_frontend_final_and_tu_cache(tmp: Path) -> None:
     report = json.loads((repo / "_build/test_fe/frontend-regeneration.json").read_text(encoding="utf-8"))
     assert report["summary"]["tu_hits"] > 0 and report["summary"]["tu_misses"] == delta
 
+    expected = output.read_bytes()
+
+    def invalidate_outer_results() -> None:
+        for cached in (repo / "_cache_test/gen/frontend-final").glob("driver_*"):
+            cached.unlink()
+        (repo / "_build/test_fe/frontend-regeneration.json").unlink()
+        output.unlink()
+
+    def current_report() -> dict:
+        return json.loads((repo / "_build/test_fe/frontend-regeneration.json").read_text(encoding="utf-8"))
+
+    unit = report["units"][0]
+    tu_cache = repo / "_cache_test/gen/frontend-tu" / f"{unit['module']}_{unit['key']}.c"
+    for damage in ("bytes", "missing", "malformed", "wrong-key", "invalid-export"):
+        metadata = tu_cache.with_suffix(".json")
+        if damage == "bytes":
+            tu_cache.write_text("CORRUPT TU\n", encoding="utf-8")
+        elif damage == "missing":
+            metadata.unlink()
+        elif damage == "malformed":
+            metadata.write_text("{broken", encoding="utf-8")
+        elif damage == "wrong-key":
+            receipt = json.loads(metadata.read_text(encoding="utf-8"))
+            receipt["input_key"] = "wrong"
+            metadata.write_text(json.dumps(receipt), encoding="utf-8")
+        else:
+            tu_cache.write_text("no export table\n", encoding="utf-8")
+            frontend_regen.record_cached_output(tu_cache, unit["key"])
+        invalidate_outer_results()
+        before = count_lines(log)
+        run(repo, common, env)
+        repaired = current_report()
+        assert repaired["summary"]["tu_misses"] == 1, (damage, repaired)
+        assert count_lines(log) == before + 1, damage
+        assert output.read_bytes() == expected, damage
+        assert frontend_regen.cached_output_matches(tu_cache, unit["key"]), damage
+
+    pack_key = current_report()["pack_key"]
+    pack_cache = repo / "_cache_test/gen/frontend-pack" / f"driver_{pack_key}.c"
+    for damage in ("bytes", "missing", "malformed", "wrong-key"):
+        metadata = pack_cache.with_suffix(".json")
+        if damage == "bytes":
+            pack_cache.write_text("CORRUPT PACK\n", encoding="utf-8")
+        elif damage == "missing":
+            metadata.unlink()
+        elif damage == "malformed":
+            metadata.write_text("[]", encoding="utf-8")
+        else:
+            receipt = json.loads(metadata.read_text(encoding="utf-8"))
+            receipt["input_key"] = "wrong"
+            metadata.write_text(json.dumps(receipt), encoding="utf-8")
+        invalidate_outer_results()
+        before = count_lines(log)
+        run(repo, common, env)
+        repaired = current_report()
+        assert repaired["summary"]["tu_hits"] == EXPECTED_FRONTEND_TUS, (damage, repaired)
+        assert repaired["summary"]["pack_cache"] == "miss", (damage, repaired)
+        assert count_lines(log) == before, damage
+        assert output.read_bytes() == expected and pack_cache.read_bytes() == expected, damage
+        assert frontend_regen.cached_output_matches(pack_cache, pack_key), damage
+
 
 def test_stage_loop_input_fast_path(tmp: Path) -> None:
     repo = tmp / "stage_repo"
@@ -253,10 +314,49 @@ def test_stage_loop_input_fast_path(tmp: Path) -> None:
     assert result["fast_path"] is True and result["pass"] is True
 
 
+def test_strict_packer(tmp: Path) -> None:
+    run(ROOT, [sys.executable, "scripts/pack_frontend.py", "--selftest"], os.environ.copy())
+    source = tmp / "pack-input.c"
+    output = tmp / "pack-output.c"
+    header = "int ouro_export_count_x(void){return 0;}\n"
+    unit = "ouro_ctor(0,0,0)"
+    triple = "ouro_ctor(0,3,(ouro_v *[]){" + unit + ",x,y})"
+    cases = (
+        ("nested-type", "lx", "ouro_ctor(1,1,(ouro_v *[]){ouro_ctor(0,1,(ouro_v *[]){ouro_err(5)})})", 3),
+        ("dummy-triple", "lx", triple, 3),
+        ("parser-unit", "pa", triple, 0),
+        ("clean", "lx", "ouro_ctor(1,2,(ouro_v *[]){x,y})", 0),
+        ("malformed-prefix", "lx", ")ouro_ctor(0,1,(ouro_v *[]){ouro_err(5)})", 3),
+    )
+    for name, suffix, body, status in cases:
+        source.write_text(header + body + "\n", encoding="utf-8")
+        output.write_bytes(b"previous output\n")
+        result = subprocess.run(
+            [sys.executable, "scripts/pack_frontend.py", "--strict", "-o", str(output),
+             f"{suffix}:{source}"],
+            cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+        )
+        assert result.returncode == status, (name, result)
+        if status:
+            assert "STRICT FAIL leftover_type_apps=" in result.stderr, (name, result)
+            assert output.read_bytes() == b"previous output\n", name
+        else:
+            assert not result.stderr and "mode=strict" in result.stdout, (name, result)
+            assert body in output.read_text(encoding="utf-8"), name
+    output.unlink()
+    rejected = subprocess.run(
+        [sys.executable, "scripts/pack_frontend.py", "--strict", "-o", str(output),
+         f"lx:{source}"],
+        cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+    )
+    assert rejected.returncode == 3 and not output.exists(), rejected
+
+
 def main() -> int:
     test_native_stack_limits()
     with tempfile.TemporaryDirectory(prefix="ouro-stage-loop-suite-") as d:
         tmp = Path(d)
+        test_strict_packer(tmp)
         test_frontend_final_and_tu_cache(tmp)
         test_stage_loop_input_fast_path(tmp)
     print("STAGE_LOOP_FRONTEND_REGEN_SUITE: PASS")

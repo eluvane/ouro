@@ -444,7 +444,8 @@ inductive TermMode : Type :=
   | TMCase : CaseInfo -> CoreTerm -> CoreTerm -> List CoreTerm -> TermMode
   | TMCaseBs : CaseInfo -> CoreTerm -> List CoreTerm -> TermMode
   | TMCaseGo : List Nat -> List CoreTerm -> Bool -> TermMode
-  | TMAll : List CoreTerm -> TermMode;
+  | TMAll : List CoreTerm -> TermMode
+  | TMParams : Nat -> CoreTerm -> TermMode;
 
 def term_app_head (descend : List Nat -> Nat -> TermMode -> CheckResult Bool)
     (small : List Nat) (depth : Nat) (head : CoreTerm)
@@ -528,16 +529,40 @@ def term_branch (descend : List Nat -> Nat -> TermMode -> CheckResult Bool)
         end
     end;
 
-def term_run : Nat -> Nat -> Nat -> List Nat -> Nat -> TermMode -> CheckResult Bool :=
+-- The saved depth is set only when the designated leading parameter enters scope.
+def term_run : Nat -> Nat -> Nat -> List Nat -> Maybe Nat -> Nat -> TermMode -> CheckResult Bool :=
   fix term_run (fuel : Nat) (rec_arg : Nat) (arity : Nat) (small : List Nat)
-      (depth : Nat) (mode : TermMode) : CheckResult Bool :=
+      (structural_depth : Maybe Nat) (depth : Nat) (mode : TermMode) : CheckResult Bool :=
     match fuel with
     | Z => CheckErr Bool CheckResourceLimit
     | S fuel' =>
-        let struct_idx : Nat := sub(depth, S rec_arg) in
         let descend (scope : List Nat) (level : Nat) (next : TermMode) : CheckResult Bool :=
-            term_run fuel' rec_arg arity scope level next in
+            term_run fuel' rec_arg arity scope structural_depth level next in
         match mode with
+        | TMParams remaining body =>
+            match body with
+            | CLam annotation rest =>
+                check_and (descend small depth (TMTerm annotation))
+                  (fun (_annotation : Unit) =>
+                    match remaining with
+                    | Z => term_run fuel' rec_arg arity (shiftSmall small)
+                        (Just Nat (S depth)) (S depth) (TMTerm rest)
+                    | S remaining' => descend (shiftSmall small) (S depth)
+                        (TMParams remaining' rest)
+                    end)
+            | CRel _ => descend small depth (TMTerm body)
+            | CSort _ => descend small depth (TMTerm body)
+            | CPi _ _ => descend small depth (TMTerm body)
+            | CApp _ _ => descend small depth (TMTerm body)
+            | CLetIn _ _ _ => descend small depth (TMTerm body)
+            | CConst _ => descend small depth (TMTerm body)
+            | CInd _ => descend small depth (TMTerm body)
+            | CConstruct _ _ _ => descend small depth (TMTerm body)
+            | CStrBytes _ _ => descend small depth (TMTerm body)
+            | CStrLit _ _ => descend small depth (TMTerm body)
+            | CCase _ _ _ _ => descend small depth (TMTerm body)
+            | CFix _ _ _ _ _ => descend small depth (TMTerm body)
+            end
         | TMTerm t =>
             match t with
             | CRel i => CheckOk(Bool, notb (eqNat i depth))
@@ -611,7 +636,11 @@ def term_run : Nat -> Nat -> Nat -> List Nat -> Nat -> TermMode -> CheckResult B
         | TMCaseBs ci s bs =>
             let gains : Bool :=
               match isRel s with
-              | Just j => orb(eqNat j struct_idx, memNat j small)
+              | Just j => orb
+                  (match structural_depth with
+                   | Nothing => False
+                   | Just introduced => eqNat(j, sub(depth, introduced))
+                   end) (memNat j small)
               | Nothing => False
               end in
             match ci with
@@ -631,7 +660,8 @@ def term_run : Nat -> Nat -> Nat -> List Nat -> Nat -> TermMode -> CheckResult B
 
 def check_termination_checked (rec_arg : Nat) (arity : Nat) (fuel : Nat) (body : CoreTerm)
     : CheckResult Unit :=
-    check_require_result (term_run fuel rec_arg arity (Nil Nat) Z (TMTerm body))
+    check_require_result
+      (term_run fuel rec_arg arity (Nil Nat) (Nothing Nat) Z (TMParams rec_arg body))
       (CheckTypeFailure CheckNonTerminating);
 
 def check_termination (rec_arg : Nat) (arity : Nat) (fuel : Nat) (body : CoreTerm) : Bool :=

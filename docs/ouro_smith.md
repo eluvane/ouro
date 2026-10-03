@@ -22,6 +22,14 @@ OCaml, opam, Dune, or a Python Core interpreter. Missing tools, exhausted
 resources, incomplete protocols, and stale build receipts prevent a passing
 report.
 
+Surface samples compile their generated C and link and execute a fresh program
+on every probe. Only the unchanged runtime translation units use the existing
+verified C object cache, shared across recipe and seed workers. Its keys include
+the selected C compiler bytes, flags, source and header dependencies; object and
+depfile hashes are checked before reuse. `OURO_CACHE=0` uses fresh object paths.
+The Python build child and all C subprocesses share the probe's existing
+compile deadline and memory limit, including cache misses.
+
 ## Profiles and expectations
 
 `quality/smith/seeds.json` defines the seed ranges and generation budgets.
@@ -141,6 +149,10 @@ law drivers, uses the same 3072 MiB limit as tool preparation. Generated program
 execution retains the configured `--memory-mb` limit; preparation failures
 remain fatal.
 
+Hosted surface checks use the selected producer and the prepared collector and
+formatter from the source-bound tool map. They retain the ordinary runtime
+deadline; helper preparation stays outside those commands.
+
 Generated manifest suites run disjoint prefix batches against the same complete
 manifest. Batches contain at most 29 IDs to leave deadline headroom for
 sequential compiler scenarios. Each batch retains a 300-second deadline and
@@ -167,6 +179,10 @@ each phase's deadline, duration, and peak memory.
 
 The harness self-test exercises actual memory exhaustion and descendant
 termination, protocol validation, saved-input replay, and failure reporting.
+The blocking `smith-selftest` CI gate runs it before the generated profile in
+the PR `smith` group. Nightly and Manual run it in a separate required
+`smith-selftest` group; `trust` keeps stage-loop and the generated Nightly
+profile in the same checkout.
 Checker fault injection patches temporary copies of the canonical Ouro
 checker and builds the designated detector with exact input receipts. Each
 mutant requires a clean unmodified baseline and the named semantic failure.
