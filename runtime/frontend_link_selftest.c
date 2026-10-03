@@ -410,10 +410,55 @@ static int recheck_result(ouro_v *result, int error, unsigned long count)
 		recheck_length(OURO_F(value, 1), count + 2) && recheck_length(OURO_F(value, 2), count);
 }
 
+static int recheck_chain(ouro_v *term, int tag, unsigned long depth, unsigned long leaf)
+{
+	while (depth > 0) {
+		ouro_v *annotation;
+		if (term == 0 || term->tag != tag || term->n != 2)
+			return 0;
+		annotation = OURO_F(term, 0);
+		if (annotation == 0 || annotation->tag != 6 || annotation->n != 1 ||
+		    as_nat(OURO_F(annotation, 0)) != 1)
+			return 0;
+		term = OURO_F(term, 1);
+		depth--;
+	}
+	return term != 0 && term->tag == 6 && term->n == 1 && as_nat(OURO_F(term, 0)) == leaf;
+}
+
+static int recheck_shared_terms(ouro_v *program, ouro_v *result, unsigned long depth)
+{
+	ouro_v *original = OURO_F(program, 1);
+	ouro_v *checked = OURO_F(OURO_F(result, 0), 1);
+	while (original != 0 && checked != 0 && original->tag == 1 && original->n == 2 &&
+	       checked->tag == 1 && checked->n == 2) {
+		ouro_v *before = OURO_F(original, 0);
+		ouro_v *after = OURO_F(checked, 0);
+		ouro_v *body;
+		ouro_v *accepted;
+		if (before == 0 || after == 0 || before->tag != 0 || before->n != 3 ||
+		    after->tag != 0 || after->n != 3 ||
+		    OURO_F(before, 1) != OURO_F(after, 1))
+			return 0;
+		body = OURO_F(before, 2);
+		accepted = OURO_F(after, 2);
+		if (body == 0 || accepted == 0 || body->tag != accepted->tag || body->n != accepted->n ||
+		    (body->tag == 1 && (body->n != 1 || OURO_F(body, 0) != OURO_F(accepted, 0) ||
+		     !recheck_chain(OURO_F(before, 1), 2, depth, 1) ||
+		     !recheck_chain(OURO_F(body, 0), 3, depth, 2))))
+			return 0;
+		original = OURO_F(original, 1);
+		checked = OURO_F(checked, 1);
+	}
+	return original != 0 && checked != 0 && original->tag == 0 && original->n == 0 &&
+		checked->tag == 0 && checked->n == 0;
+}
+
 static int recheck_check(const char *mode)
 {
 	unsigned long count = strcmp(mode, "recheck-scale") == 0 ? 8192 : 4096;
 	unsigned long depth = strcmp(mode, "recheck-scale") == 0 ? 64 : 24;
+	int retained = strcmp(mode, "recheck-retained") == 0;
 	int expected = -1;
 	ouro_v *program;
 	ouro_v *sentinel;
@@ -428,21 +473,31 @@ static int recheck_check(const char *mode)
 		expected = 0;
 		count = 32;
 	}
-	program = ouro_keep(recheck_program(count, depth, expected));
+	program = recheck_program(count, depth, expected);
+	if (!retained)
+		program = ouro_keep(program);
 	sentinel = ouro_string_codes("caller survives exact replay");
 	recheck = export_value("lower_recheck_program");
 	fuel = ouro_nat(expected == 0 ? 0 : 200000);
-	result = ouro_apply(ouro_apply(recheck, fuel), program);
+	if (retained) {
+		ouro_heap_context *context = ouro_heap_context_enter();
+		result = ouro_apply(ouro_apply(recheck, fuel), program);
+		result = ouro_heap_context_leave(context, result);
+	} else
+		result = ouro_apply(ouro_apply(recheck, fuel), program);
 	if (!recheck_result(result, expected, count))
 		return fail("recheck changed declaration, metadata or body result");
-	if (strcmp(mode, "recheck-retained") == 0) {
+	if (retained) {
 		ouro_v *first = result;
 		ouro_v *partial = ouro_apply(recheck, fuel);
+		if (!recheck_shared_terms(program, first, depth))
+			return fail("recheck recopied caller-owned declaration terms");
 		result = ouro_apply(ouro_apply(recheck, ouro_nat(0)), program);
 		if (!recheck_result(result, 0, count) || !recheck_result(first, -1, count))
 			return fail("recheck failure released a prior result");
 		result = ouro_apply(partial, program);
-		if (!recheck_result(result, -1, count) || !recheck_result(first, -1, count))
+		if (!recheck_result(result, -1, count) || !recheck_result(first, -1, count) ||
+		    !recheck_shared_terms(program, first, depth) || !recheck_shared_terms(program, result, depth))
 			return fail("recheck released a partial application or prior result");
 	}
 	if (!packed_eq(sentinel, (const unsigned char *)"caller survives exact replay", 28) ||

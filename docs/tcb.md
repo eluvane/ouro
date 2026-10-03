@@ -175,7 +175,9 @@ declaration order, fuel outcomes, or acceptance judgments. The C-hosted
 native-build driver uses the same `compile_checked_units` seam so a
 compiler-sized program does not retain every parse and check temporary.
 The `lower_recheck_program` host wrapper supplies that same bounded declaration
-callback to Ouro's exact replay. The ordinary public entry still selects the
+callback to Ouro's exact replay. Each declaration uses isolated allocation banks;
+the result returns to the caller's restored allocator and shares caller-owned
+terms and earlier accepted entries. The ordinary public entry still selects the
 canonical checker; declaration order, metadata equality, complete body lists,
 fuel failures, and rejection semantics remain Ouro-owned.
 The temporary N1 host also checkpoints the managed preparation result and

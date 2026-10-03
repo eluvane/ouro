@@ -579,7 +579,9 @@ lifetime bug, not extra acceptance. Managed lowering also shares one canonical
 lookup environment across runtime helper resolution, raw lowering, and global
 checks. Each helper still checks its body and complete normalized signature.
 Native lowering's declaration replay uses the same per-declaration lifetime
-callback as initial checking. The public `lower_recheck_program` entry retains
+callback as initial checking. Each call isolates its work banks, then copies new
+result cells into the restored caller allocator while sharing caller-owned terms
+and the earlier signature. The public `lower_recheck_program` entry retains
 the exact checker, complete metadata/body comparison, and typed failures.
 The temporary N1 host releases prepare-phase storage and each raw contract's
 lowering temporaries while retaining ordered results and the first typed error.

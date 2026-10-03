@@ -798,17 +798,18 @@ static ouro_v *bounded_elaborate_fuel(ouro_env *env, ouro_v *fuel)
 	return ouro_clos(bounded_elaborate_surface, ouro_cons(fuel, 0));
 }
 
-/* Only check_indexed_declaration's temporaries belong to this mark. The generated checker
-   still owns coverage, ordering and judgments. Existing permanent signature
-   entries survive every item; cloning only the new result avoids repeatedly
-   copying the growing environment. The enclosing pipeline deep-clones its
-   final result before it resets either permanent bank. This seam is not
-   re-entered by check_indexed_declaration's recursive term checks. */
+/* The generated checker owns coverage, ordering and judgments. Suspend the
+   caller's growing signature while checking one declaration; copy only the
+   result's new cells back, sharing caller-owned terms and accepted entries. */
 static ouro_v *bounded_check_item(ouro_env *env, ouro_v *item)
 {
-	return bounded_call(FIND(fc, "check_indexed_declaration"), 4,
-		(ouro_v *[]){ouro_get(env, 2), ouro_get(env, 1), ouro_get(env, 0), item},
-		ouro_clone_perm);
+	ouro_v *fn = FIND(fc, "check_indexed_declaration");
+	ouro_v *mode = ouro_get(env, 2);
+	ouro_v *fuel = ouro_get(env, 1);
+	ouro_v *sig = ouro_get(env, 0);
+	ouro_heap_context *context = ouro_heap_context_enter();
+	ouro_v *result = ouro_apply(ouro_apply(ouro_apply(ouro_apply(fn, mode), fuel), sig), item);
+	return ouro_heap_context_leave(context, result);
 }
 
 static ouro_v *bounded_check_signature(ouro_env *env, ouro_v *sig)
