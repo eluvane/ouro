@@ -311,6 +311,8 @@ Do not require individual dynamic matrix names in branch protection.
 
 The GitHub job summary lists selected groups and gates. Full runs enqueue the
 three long check groups and isolated `source_spans` shard before the other compiler shards.
+Manual creates both operating-system jobs for each group before advancing to the
+next group, so Windows jobs enter the queue alongside their Linux counterparts.
 PR matrix jobs continue independently after a sibling
 failure, and each group stops at its first blocking failure while recording
 unexecuted gates as `not_run`. Nightly and ordinary local profiles still gather
