@@ -234,7 +234,8 @@ class HarnessTests(unittest.TestCase):
         calls = []
 
         def execute(argv, *, timeout_s, **_kwargs):
-            phase = "check" if "check" in argv else "emit-c" if argv[0] == "compiler" else "native-compile" if argv[0] == "cc" else "native-run"
+            phase = ("check" if "check" in argv else "emit-c" if argv[0] == "compiler" else
+                     "native-compile" if any(arg.endswith("/surface/native_compile.py") for arg in argv) else "native-run")
             calls.append((phase, timeout_s))
             duration = (901 if preparation_hanging else 61) if phase != "native-run" else 21 if hanging else 1
             status = "timeout" if duration > timeout_s else "ok"

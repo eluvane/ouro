@@ -2,9 +2,9 @@
 from __future__ import annotations
 
 import json
-import os
 import re
 import shutil
+import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -37,7 +37,7 @@ class StepFailure(Exception):
 
 
 class SurfaceRunner:
-    def __init__(self, report: Report, work: Path, seeds: list[int], *, depth=4, timeout=20, memory_mb=1024, shrink_budget=40, overrides=None):
+    def __init__(self, report: Report, work: Path, seeds: list[int], *, depth=4, timeout=20, memory_mb=1024, shrink_budget=40, overrides=None, native_work=None):
         self.report, self.work, self.seeds = report, work.resolve(), seeds
         self.depth, self.timeout, self.memory_mb = depth, timeout, memory_mb
         self.shrink_budget = shrink_budget
@@ -46,6 +46,7 @@ class SurfaceRunner:
         self.summary.coverage = self.coverage
         self.env = dict(environment())
         self.overrides = overrides or {}
+        self.native_work = Path(native_work) if native_work is not None else self.work / "native-objects"
         self.compiler = self.tool("ouro1")
         # Hosted checks must use the prepared producer and collector rather
         # than starting a shared tool build inside the runtime deadline.
@@ -102,7 +103,8 @@ class SurfaceRunner:
         if expr is not None and self.shrink_budget:
             probe_report = Report(profile=self.report.profile, generator_hash=self.report.generator_hash, seeds=[self.seed], command="shrink")
             probe = SurfaceRunner(probe_report, self.work / "shrink", [self.seed], depth=self.depth,
-                                  timeout=self.timeout, memory_mb=self.memory_mb, shrink_budget=0, overrides=self.overrides)
+                                  timeout=self.timeout, memory_mb=self.memory_mb, shrink_budget=0, overrides=self.overrides,
+                                  native_work=self.native_work)
             probe.seed, probe.case_id = self.seed, self.case_id
 
             def still_fails(candidate):
@@ -146,6 +148,8 @@ class SurfaceRunner:
         return core
 
     def native(self, path: Path, *, units=(), io=False, arguments=(), env=None, stdin=None, compile_timeout=None):
+        from ourosmith.host import build_config
+
         if self.cc is None:
             raise StepFailure("native-compile", "installed C compiler", "unavailable", "oracle-unavailable")
         emitted = path.with_suffix(".c")
@@ -157,10 +161,11 @@ class SurfaceRunner:
         emitted.write_text(result.stdout, encoding="utf-8")
         exe = path.with_suffix(".exe")
         main = ROOT / "runtime/ouro_prog_main.c" if io else self.runtime_printer
-        stack = ["-Wl,--stack,134217728"] if os.name == "nt" else []
-        result = self.command([self.cc, "-O1", "-std=c99", "-D_POSIX_C_SOURCE=200809L", "-Werror=implicit-function-declaration", *stack,
-                               "-I", ROOT / "runtime", "-o", exe, emitted, ROOT / "runtime/ouro_rt.c",
-                               ROOT / "runtime/ouro_io.c", main], path.parent, "native-compile", timeout=compile_timeout)
+        cache = [] if build_config().get_bool("cache_enabled") else ["--no-cache"]
+        result = self.command([sys.executable, ROOT / "scripts/ourosmith/surface/native_compile.py", emitted,
+                               "--cc", self.cc, "--main", main, "--output", exe,
+                               "--object-dir", self.native_work, "--report", path.with_suffix(".native-build.json"),
+                               *cache], path.parent, "native-compile", timeout=compile_timeout)
         self.require(result.ok, "native-compile", "exit 0", self.output(result))
         return self.command([exe, *arguments], path.parent, "native-run", env=env, stdin=stdin)
 
@@ -278,7 +283,7 @@ class SurfaceRunner:
                         seeds=[seed], command=self.report.command)
         worker = SurfaceRunner(report, self.work / "seeds" / f"{index}-{seed}", [seed], depth=self.depth,
                                timeout=self.timeout, memory_mb=self.memory_mb, shrink_budget=self.shrink_budget,
-                               overrides=self.overrides)
+                               overrides=self.overrides, native_work=self.native_work)
         worker.run_seed(index, seed)
         return report
 
@@ -290,7 +295,7 @@ class SurfaceRunner:
                         seeds=[self.seed], command=self.report.command)
         worker = SurfaceRunner(report, self.work / "recipes" / str(index), [self.seed], depth=self.depth,
                                timeout=self.timeout, memory_mb=self.memory_mb, shrink_budget=self.shrink_budget,
-                               overrides=self.overrides)
+                               overrides=self.overrides, native_work=self.native_work)
         worker.seed = self.seed
         started = time.perf_counter()
         run_tools(worker, only=name)

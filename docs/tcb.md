@@ -351,7 +351,12 @@ alone cannot prove their implementation correct.
 OuroSmith generates typed Core and exercises the canonical checker. Its
 construction laws, known rejections, source mutants, and independent
 surface/runtime expectations are regression evidence. It contains no required
-second Core interpreter. The former OCaml and Python replay owners are retired;
+second Core interpreter. Surface runtime object reuse goes through the existing
+checked C object cache; source/dependency, command, compiler executable, object,
+and depfile hashes bind reuse. Each generated sample still compiles, links, and
+runs under the same bounded process-tree limits. This preparation does not
+authorize generated C or replace compiler-owned acceptance. The former OCaml
+and Python replay owners are retired;
 their historical schema and corpus are documented in
 [Core artifacts](kernel_core_artifact.md).
 

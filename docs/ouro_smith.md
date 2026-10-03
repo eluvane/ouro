@@ -22,6 +22,14 @@ OCaml, opam, Dune, or a Python Core interpreter. Missing tools, exhausted
 resources, incomplete protocols, and stale build receipts prevent a passing
 report.
 
+Surface samples compile their generated C and link and execute a fresh program
+on every probe. Only the unchanged runtime translation units use the existing
+verified C object cache, shared across recipe and seed workers. Its keys include
+the selected C compiler bytes, flags, source and header dependencies; object and
+depfile hashes are checked before reuse. `OURO_CACHE=0` uses fresh object paths.
+The Python build child and all C subprocesses share the probe's existing
+compile deadline and memory limit, including cache misses.
+
 ## Profiles and expectations
 
 `quality/smith/seeds.json` defines the seed ranges and generation budgets.

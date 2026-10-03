@@ -22,6 +22,146 @@ from repo_support import hash_json
 
 class ProducerTests(unittest.TestCase):
     @contextlib.contextmanager
+    def surface_native_fixture(self):
+        import ouro_build as build
+        from build_cache_config_suite import write_fake_cc
+        from ourosmith.surface import native_compile
+        from repo_support import bind_relative_path
+
+        work = ROOT / "_build/smith/selftest"
+        work.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=work) as name:
+            directory = Path(name)
+            runtime = directory / "runtime"
+            runtime.mkdir()
+            (runtime / "ouro_rt.h").write_text("#define SURFACE_VALUE 1\n", encoding="utf-8")
+            for source in ("ouro_rt.c", "ouro_io.c", "ouro_eval_main.c", "ouro_prog_main.c"):
+                (runtime / source).write_text('#include "ouro_rt.h"\n', encoding="utf-8")
+            generated = directory / "sample.c"
+            generated.write_text("int sample(void) { return 1; }\n", encoding="utf-8")
+            compiler = directory / "fake-cc.py"
+            write_fake_cc(compiler)
+            log = directory / "cc.log"
+            args = argparse.Namespace(
+                generated=generated, main=runtime / "ouro_eval_main.c", output=directory / "sample.exe",
+                object_dir=directory / "objects", report=directory / "native-build.json",
+                cc=str(compiler), cache=True)
+            with patch.object(build, "ROOT", directory), patch.object(native_compile, "ROOT", directory), \
+                 patch.object(build, "rel", bind_relative_path(directory, resolve=False)), \
+                 patch.dict(os.environ, {"FAKE_CC_LOG": str(log)}):
+                yield native_compile, args, log
+
+    def test_surface_runtime_cache_keeps_every_generated_compile(self):
+        import subprocess
+
+        with self.surface_native_fixture() as (native, args, log), \
+             patch.object(native.subprocess, "run", wraps=subprocess.run) as execute:
+            cold = native.build_native(args)
+            args.generated.write_text("int sample(void) { return 2; }\n", encoding="utf-8")
+            warm = native.build_native(args)
+            self.assertEqual([row["cache"] for row in cold["runtime"]], ["miss"] * 3)
+            self.assertEqual([row["cache"] for row in warm["runtime"]], ["hit"] * 3)
+            self.assertNotEqual(cold["inputs"][str(args.generated)], warm["inputs"][str(args.generated)])
+            links = [call.args[0] for call in execute.call_args_list if "-o" in call.args[0] and "-c" not in call.args[0]]
+            self.assertEqual(len(links), 2)
+            for command in links:
+                self.assertIn(str(args.generated), command)
+                self.assertIn("-O1", command)
+                self.assertIn("-Werror=implicit-function-declaration", command)
+                self.assertNotIn(str(args.main), command)
+                self.assertEqual([arg for arg in command if arg.startswith("-Wl,--stack,")],
+                                 ["-Wl,--stack,134217728"] if os.name == "nt" else [])
+            self.assertEqual(log.read_text(encoding="utf-8").count("COMPILE "), 3)
+            self.assertEqual(log.read_text(encoding="utf-8").count("LINK "), 2)
+
+    def test_surface_runtime_cache_rechecks_sources_headers_objects_and_compiler(self):
+        with self.surface_native_fixture() as (native, args, _log):
+            native.build_native(args)
+            runtime = args.main.parent
+            with (runtime / "ouro_rt.c").open("a", encoding="utf-8") as source:
+                source.write("/* changed source */\n")
+            changed = native.build_native(args)
+            self.assertEqual([row["cache"] for row in changed["runtime"]], ["miss", "hit", "hit"])
+            (runtime / "ouro_rt.h").write_text("#define SURFACE_VALUE 2\n", encoding="utf-8")
+            changed = native.build_native(args)
+            self.assertEqual([row["cache"] for row in changed["runtime"]], ["miss"] * 3)
+            directory = args.generated.parent
+            for field in ("object", "depfile", "cmdhash"):
+                path = directory / changed["runtime"][0][field]
+                path.write_text("corrupt\n", encoding="utf-8")
+                changed = native.build_native(args)
+                self.assertEqual([row["cache"] for row in changed["runtime"]], ["miss", "hit", "hit"], field)
+            identity = changed["compiler_id"]
+            with Path(args.cc).open("a", encoding="utf-8") as compiler:
+                compiler.write("\n# same version, different compiler bytes\n")
+            changed = native.build_native(args)
+            self.assertEqual(changed["compiler_id"]["version"], identity["version"])
+            self.assertNotEqual(changed["compiler_id"]["executable_sha256"], identity["executable_sha256"])
+            self.assertEqual([row["cache"] for row in changed["runtime"]], ["miss"] * 3)
+
+    def test_surface_runtime_cache_distinguishes_mains_and_disabled_invocations(self):
+        with self.surface_native_fixture() as (native, args, _log):
+            native.build_native(args)
+            args.main = args.main.with_name("ouro_prog_main.c")
+            io = native.build_native(args)
+            self.assertEqual([row["cache"] for row in io["runtime"]], ["hit", "hit", "miss"])
+            args.main = args.main.with_name("mutant_main.c")
+            args.main.write_text('#include "ouro_rt.h"\n/* alternate printer */\n', encoding="utf-8")
+            mutant = native.build_native(args)
+            self.assertEqual([row["cache"] for row in mutant["runtime"]], ["hit", "hit", "miss"])
+            args.cache = False
+            first = native.build_native(args)
+            second = native.build_native(args)
+            self.assertEqual([row["cache"] for row in first["runtime"]], ["miss"] * 3)
+            self.assertEqual([row["cache"] for row in second["runtime"]], ["miss"] * 3)
+            self.assertNotEqual(first["runtime"][0]["object"], second["runtime"][0]["object"])
+
+    def test_surface_runtime_compile_rejects_compiler_change_during_link(self):
+        with self.surface_native_fixture() as (native, args, _log):
+            original = native.subprocess.run
+
+            def change_compiler(argv, **options):
+                result = original(argv, **options)
+                if "-o" in argv and "-c" not in argv:
+                    with Path(args.cc).open("a", encoding="utf-8") as compiler:
+                        compiler.write("\n# changed during linking\n")
+                return result
+
+            with patch.object(native.subprocess, "run", side_effect=change_compiler), \
+                 self.assertRaisesRegex(ValueError, "input changed during compilation"):
+                native.build_native(args)
+            self.assertFalse(args.report.exists())
+
+    def test_surface_native_child_keeps_limits_and_disabled_cache(self):
+        import sys
+        from ourosmith.limits import RunResult
+        from ourosmith.report import Report
+        from ourosmith.surface.run import StepFailure, SurfaceRunner
+
+        with self.fixture() as fixture, \
+             patch("ourosmith.surface.run.environment", return_value={}), \
+             patch.object(host, "build_config", return_value=SimpleNamespace(get_bool=lambda _key: False)), \
+             patch("ourosmith.surface.run.run_limited", return_value=RunResult("ok", 0, "", "", 0, 0)) as execute:
+            report = Report(profile="pr", generator_hash="fixture", seeds=[1], command="native-child")
+            runner = SurfaceRunner(report, fixture.directory / "surface", [1], timeout=20, memory_mb=2048,
+                                   overrides=fixture.tools)
+            runner.cc = "cc"
+            runner.native(fixture.directory / "sample.ouro", compile_timeout=900)
+            self.assertEqual([call.kwargs["timeout_s"] for call in execute.call_args_list], [900, 900, 20])
+            self.assertTrue(all(call.kwargs["memory_mb"] == 2048 for call in execute.call_args_list))
+            command = execute.call_args_list[1].args[0]
+            self.assertEqual(command[0], sys.executable)
+            self.assertIn("--no-cache", command)
+            self.assertEqual(command[command.index("--object-dir") + 1], runner.native_work.as_posix())
+            execute.reset_mock()
+            execute.side_effect = [RunResult("ok", 0, "", "", 0, 0), RunResult("timeout", 1, "", "timeout", 21, 0)]
+            with self.assertRaises(StepFailure) as failure:
+                runner.native(fixture.directory / "sample.ouro")
+            self.assertEqual((failure.exception.prop, failure.exception.classification), ("native-compile", "timeout"))
+            self.assertEqual(execute.call_count, 2)
+            self.assertTrue(all(call.kwargs["timeout_s"] == 20 for call in execute.call_args_list))
+
+    @contextlib.contextmanager
     def fixture(self):
         work = ROOT / "_build/smith/selftest"
         work.mkdir(parents=True, exist_ok=True)
