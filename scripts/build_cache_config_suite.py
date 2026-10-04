@@ -892,7 +892,7 @@ def test_frontend_host_protocol(tmp: Path) -> None:
                          'int ouro_export_count(void){return 1;}\n'
                          'const char *ouro_export_name(int i){(void)i;return "fixture";}\n'
                          'ouro_v *ouro_export_value(int i){(void)i;return ouro_g1();}\n', encoding="utf-8")
-    assert host.BACKEND_GROUP_SIZE == 128 and "scripts/generated_c_shards.py" in host.SUPERVISOR_INPUTS
+    assert host.BACKEND_GROUP_SIZE == 256 and "scripts/generated_c_shards.py" in host.SUPERVISOR_INPUTS
     _sources, shards = host.build.GCS.materialize_generated_c_shards(
         frontend_c=None, backend_c=generated, out_dir=work / "generated-c-shards", label_prefix="host-fixture",
         backend_group_size=host.BACKEND_GROUP_SIZE, backend_export_suffix="")

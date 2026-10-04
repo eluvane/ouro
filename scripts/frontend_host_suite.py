@@ -27,7 +27,7 @@ from repo_support import configure_native_stack, sha256_file, write_json_atomic
 ROOT = Path(__file__).resolve().parents[1]
 KIND = "ouro.frontend-host-suite.v1"
 ENTRY = "tests/frontend_host_codegen.ouro"
-BACKEND_GROUP_SIZE = 128
+BACKEND_GROUP_SIZE = 256
 HOST_MAINS = {
     "n1-host-selftest": "runtime/n1_host_selftest.c",
     "frontend-link-selftest": "runtime/frontend_link_selftest.c",

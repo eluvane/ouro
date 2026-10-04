@@ -388,9 +388,9 @@ with one worker, and writes logs under `_build/compiler_check_suite` (or
 profile. User-test and stage-loop gates remain separate.
 
 The frontend-security host suite builds the fresh generated backend in shards
-grouped by 128 export clusters. It checks the original generated C, shard manifest
-and shard contents for all five host images, using one worker, `O0`, and the
-existing 3 GiB/900-second build budget. All 40 host probes remain required.
+grouped by 256 generated getter clusters. It checks the original generated C,
+shard manifest and shard contents for all five host images, using one worker,
+`O0`, and the existing 3 GiB/900-second build budget. All 40 host probes remain required.
 The host build records start and completion markers for compiler emission,
 helper uniquification, hook installation, and publication, so a timeout can be
 assigned to the last unfinished phase without inferring it from compiler trace.
