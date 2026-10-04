@@ -39,6 +39,26 @@ Later stages replace functions before deleting their implementations. Renaming
 files, hiding binary dependencies, or making a failing gate optional does not
 complete a stage.
 
+## GitHub milestones
+
+The [milestone list](https://github.com/eluvane/ouro/milestones) groups focused
+issues and PRs for three selected stages of this roadmap:
+
+- [P5. Native runtime](https://github.com/eluvane/ouro/milestone/1) tracks the
+  P5 runtime and platform layer.
+- [P7. Native self-hosting](https://github.com/eluvane/ouro/milestone/2) tracks
+  the P7 native compiler stage comparison, seed provenance, and recovery path.
+- [P10. Standalone distribution](https://github.com/eluvane/ouro/milestone/3)
+  tracks the P10 published seed and isolated Windows distribution acceptance.
+
+Assign an issue or PR only when its scope directly contributes to the named
+stage. These milestones retain the prerequisites and completion criteria in
+the transition table; they have no promised dates. GitHub's completion
+percentage counts closed work items. Stage acceptance requires the behavioral,
+artifact, and isolation evidence described here, independently of that count.
+Community and contribution routing is in
+[Contributing](../CONTRIBUTING.md#questions-and-planning).
+
 ## Acceptance and compatibility
 
 Native acceptance has four separate obligations:

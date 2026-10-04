@@ -274,6 +274,7 @@ def selftest_missing_golden(run, directory):
         fixtures = work / "fixtures"
         fixtures.mkdir(parents=True, exist_ok=True)
         write(fixtures / (name + suffix), "def value : Type := Type;\n")
+        (fixtures / (name + ".golden" + (".md" if tool == "doc" else ""))).unlink(missing_ok=True)
         # Doc output names encode the input path; keep the fixture relative so
         # a long work directory cannot hit Windows MAX_PATH before the golden.
         result = run.command([run.tool("ouro-" + tool), option, "--out=result", "--fixtures=fixtures"], work, "selftest-missing-golden-" + tool)
@@ -281,6 +282,16 @@ def selftest_missing_golden(run, directory):
         run.require(result.returncode == 1 and name + ".golden" in output and "path not found:" in output
                     and f"{tool.upper()}_SUITE: FAIL" in output and "SUITE: PASS" not in output,
                     "selftest-read-failure-" + tool, "exit 1 with missing-golden diagnostic", run.output(result))
+
+    doc = directory / "doc"
+    write(doc / "fixtures/sample.golden.md", "# fixtures/sample.ouro\n\nDeclarations: 1.\n\n## def value\n\n```\ndef value : Type\n```\n")
+    (doc / "result/fromlist/README.md").mkdir(parents=True, exist_ok=True)
+    result = run.command([run.tool("ouro-doc"), "--selftest", "--out=result", "--fixtures=fixtures"], doc, "doc-selftest-child-failure")
+    report = (doc / "result/selftest-report.tsv").read_text(encoding="utf-8")
+    run.require(result.returncode == 1 and "files-from\tfalse\toutput\n" in report
+                and "DOC_FAIL files-from output" in result.stderr and "expected file:" in result.stderr
+                and (doc / "result/fromlist.diff").read_text(encoding="utf-8") == "",
+                "doc-selftest-child-failure", "reject child failure despite matching Markdown", run.output(result))
 
 
 def stdlib_strings(run, directory):

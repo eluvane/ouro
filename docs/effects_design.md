@@ -308,6 +308,9 @@ continuations, general handler composition, or a stable public handler syntax.
 
 ## Networking
 
+The HTTP response codec requires an `HTTP/` status-line prefix; unrelated text
+with a numeric second token is returned as status `0` with reason `unparsed`.
+
 `std/http.ouro` provides HTTP message codecs and `http_post`, backed by the
 checked `prim_http_request` intrinsic (`ouro.http.post`). Native Windows
 lowering calls WinHTTP directly; TLS certificate verification belongs to the

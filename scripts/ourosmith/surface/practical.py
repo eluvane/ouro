@@ -21,10 +21,12 @@ def workflow(seed):
             ",".join(map(str, row)) for row in chunks)
     for spelling, expected in (("yes", "true"), ("no", "false"), ("", "invalid"), ("maybe", "invalid")):
         yield f'match str_parse_bool {quote(spelling)} with | Nothing => "invalid" | Just value => show_bool value end', expected
-    text = f"limit={number}\nenabled=yes\npath=input{seed}.txt\n"
+    text = f" # ignored\n\t\nlimit=0\n limit = {number} # bounded\nenabled = yes\npath = input{seed}.txt\n"
     cfg = f"config_parse {quote(text)}"
     yield f'show_nat (result_or ConfigError Nat 99 (config_get_nat ({cfg}) "limit"))', str(number)
     yield f'show_bool (config_get_bool_or ({cfg}) "enabled" False)', "true"
+    for source, key, expected in ((" = value=tail # ignored", "", "value=tail"), (" \t # ignored\nnot a binding\n", "key", "missing")):
+        yield f'config_get_or (config_parse {quote(source)}) {quote(key)} "missing"', expected
     for kind, source in (("String", f'config_require ({cfg}) "missing"'),
                          ("Nat", 'config_get_nat (config_parse "limit=many") "limit"')):
         yield f'show_bool (result_is_err ConfigError {kind} ({source}))', "true"

@@ -35,6 +35,8 @@ def four : Nat := add two two;
 - [Getting started](docs/getting_started.md) — install, check, evaluate, and run.
 - [Documentation](docs/README.md) — language, tools, architecture, and roadmap.
 - [Contributing](CONTRIBUTING.md) — development and submission workflow.
+- [Discussions](https://github.com/eluvane/ouro/discussions) — questions, ideas, and programs built with Ouro.
+- [Native milestones](docs/roadmap.md#github-milestones) — runtime, self-hosting, and standalone distribution work.
 - [Website](https://eluvane.github.io/ouro/).
 
 ## License

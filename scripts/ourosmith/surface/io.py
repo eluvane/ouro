@@ -32,7 +32,7 @@ def kind_value (r : Either FsError FsPathKind) : String :=
   end;
 def walk_value (r : FsWalkResult) : String :=
   match r with
-  | FsWalkComplete names => str_join "|" (str_sort_uniq names)
+  | FsWalkComplete names => str_join "|" names
   | FsWalkTruncated _ => "truncated"
   | FsWalkUnreadable _ => "unreadable"
   | FsWalkUnsafe _ => "unsafe"

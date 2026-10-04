@@ -24,6 +24,8 @@ def string_list(values):
 
 def strings(seed):
     word, count = f"value{seed}", 2 + seed % 4
+    yield 'show_hex 16', "0x10"
+    yield 'show_nat_base 37 37', "37"
     text = word + ",second,,last,"
     for count_arg in (0, 3, len(word) + 2):
         yield f"str_take {quote(word)} {count_arg}", word[:count_arg]
@@ -178,6 +180,7 @@ def protocols(seed):
     yield f'show_nat (json_nat_or (rpc_id ({message})) 0)', str(number)
     yield f'show_nat (json_field_nat (rpc_params ({message})) "n" 0)', str(number + 1)
     yield f'show_bool (rpc_is_notification ({message}))', "false"
+    yield 'show_bool (rpc_is_notification (rpc_request JNull "ping" JNull))', "false"
     yield f'show_bool (rpc_is_notification (rpc_notify "ping" (json_num {number})))', "true"
     yield f'json_print (rpc_result (json_num {number}) (JStr "pong"))', compact({"jsonrpc": "2.0", "id": number, "result": "pong"})
     yield f'json_print (rpc_error (json_num {number}) rpc_err_method_not_found "nope")', compact({"jsonrpc": "2.0", "id": number, "error": {"code": -32601, "message": "nope"}})
@@ -194,7 +197,7 @@ def protocols(seed):
         yield f'show_nat (http_status ({parsed}))', str(code)
         yield f'http_body ({parsed})', text
         yield f'show_bool (http_ok ({parsed}))', str(200 <= code < 300).lower()
-    for bad in ("HTTP/1.0 200 OK\r\nNotAHeader\r\n\r\nbody", "hello\n\nbody"):
+    for bad in ("HTTP/1.0 200 OK\r\nNotAHeader\r\n\r\nbody", "hello\n\nbody", "hello 200 OK\r\n\r\nbody"):
         yield f'http_reason (parse_response {quote(bad)})', "unparsed"
 
 
