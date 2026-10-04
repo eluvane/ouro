@@ -898,6 +898,28 @@ def lint_workflow_contract_failures(content: str) -> list[str]:
     return failures
 
 
+def release_workflow_contract_failures(content: str) -> list[str]:
+    failures: list[str] = []
+    profile_input = re.search(r"^      run_profile:\n(.*?)(?=^      [a-z_]+:|\Z)",
+                              content, re.MULTILINE | re.DOTALL)
+    if not profile_input or "        default: pr\n" not in profile_input.group(1) \
+            or "          - pr\n" not in profile_input.group(1):
+        failures.append("Release dispatch must default to the ordinary PR profile")
+    if content.count("          PROFILE: ${{ inputs.run_profile || 'pr' }}") != 2:
+        failures.append("Release inventory and validation must share the PR fallback")
+    for required in (
+        'if [ "$PROFILE" = pr ]; then',
+        "python3 scripts/ci_gate.py --select-paths --full",
+        '--base "$GITHUB_SHA" --head "$GITHUB_SHA" --github-output "$GITHUB_OUTPUT"',
+        'python3 scripts/ci_gate.py --profile "$PROFILE" --list-groups',
+        "group: ${{ fromJSON(needs.groups.outputs.matrix).include.*.group }}",
+        "        exclude:\n          - group: lint\n",
+    ):
+        if required not in content:
+            failures.append("Release lost complete profile routing: " + required)
+    return failures
+
+
 def lint_phase_selftest_failures(all_gates: Sequence[Gate]) -> list[str]:
     import contextlib
     import io
@@ -1050,8 +1072,18 @@ def run_self_tests(all_gates: Sequence[Gate]) -> int:
         failures.append("standalone lint workflow must only run manually")
     failures.extend(lint_workflow_contract_failures(lint_workflow))
     release_workflow = (ROOT / ".github/workflows/ouro-release.yml").read_text(encoding="utf-8")
-    if "        exclude:\n          - group: lint\n" not in release_workflow:
-        failures.append("release validation must exclude manual-only lint")
+    failures.extend(release_workflow_contract_failures(release_workflow))
+    for before, after in (
+        ("        default: pr\n", "        default: manual\n"),
+        ("          - pr\n", ""),
+        ("inputs.run_profile || 'pr'", "inputs.run_profile || 'manual'"),
+        ("--select-paths --full", "--select-paths"),
+        ("fromJSON(needs.groups.outputs.matrix).include.*.group",
+         "fromJSON(needs.groups.outputs.matrix)"),
+        ("        exclude:\n          - group: lint\n", ""),
+    ):
+        if not release_workflow_contract_failures(release_workflow.replace(before, after, 1)):
+            failures.append("Release profile routing regression was accepted: " + before)
     for group in ("checks-parity", "checks-quality"):
         if NIGHTLY_GROUPS.get(group) != PR_GROUPS[group]:
             failures.append("nightly/manual must retain the isolated " + group + " group")

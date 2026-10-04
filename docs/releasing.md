@@ -45,7 +45,7 @@ Run the public project and workflow policy checks from the
 
 ```sh
 python3 scripts/release_package.py --check --out _build/release_check
-python3 scripts/ci_gate.py --profile manual --out _build/ci/release-manual
+python3 scripts/ci_gate.py --profile pr --out _build/ci/release-pr
 ```
 
 Add the `kernel` compatibility profile for compiler-checking changes:
@@ -96,6 +96,12 @@ Archive timestamps and ownership metadata are normalized so two builds from the
 same inputs can be compared.
 
 ## GitHub release
+
+Release validation defaults to the complete `pr` profile used by ordinary CI
+on `main`, with the same manual-only lint exclusion. It does not select only
+checks affected by the latest commit. Extended `manual`, `kernel`, and
+`stage-loop` profiles remain available through the dispatch `run_profile` input.
+Every selected validation group must succeed before packaging and publication.
 
 `.github/workflows/ouro-release.yml` runs on release tags, a daily schedule,
 and manual dispatch. Scheduled runs check the date at 03:17 UTC and build a
