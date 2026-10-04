@@ -357,6 +357,9 @@ The base JSON parser caps recursive structure at 128 levels. JSON string
 decoding uses an Ouro byte scanner and a balanced byte builder: work is linear
 and call depth is logarithmic in the string length, including on the C host.
 
+`json_print` and `json_escape_str` escape string bytes below 32. Tab, LF, and CR
+use their short escapes; the other control bytes use `\u00xx` escapes.
+
 `std/tablex.ouro` adds column validation and reusable transforms:
 
 ```ouro
