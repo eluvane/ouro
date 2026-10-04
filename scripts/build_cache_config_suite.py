@@ -787,8 +787,24 @@ def test_frontend_host_protocol(tmp: Path) -> None:
                 "lower-bad-chunk", "lower-bad-contracts", "caller-output", "retained-result",
                 "typed-failure", "nested-context", "allocation-context", "shared-parent-spine", "wrapped-context", "recheck-scale",
                 "recheck-retained", "recheck-late-invalid", "recheck-missing-bodies", "recheck-zero-fuel",
-                "metadata-parity", "fallback-forward", "root-parity", "root-clear-context", "pe-operation-context")
-    assert len(cases) == 40 and tuple(case[1][0] for case in host.probe_cases()) == expected
+                "metadata-parity", "fallback-forward", "root-parity", "root-clear-context", "pe-operation-context", "phase-timing")
+    assert len(cases) == 41 and tuple(case[1][0] for case in host.probe_cases()) == expected
+    timing = RunResult("ok", 0, "N1_HOST_TIMING: passed phase-timing\n",
+                       "n1-host: timing phase=sample elapsed_s=1.250\n"
+                       "n1-host: timing phase=start-unavailable elapsed_s=unavailable\n"
+                       "n1-host: timing phase=sample-unavailable elapsed_s=unavailable\n"
+                       "n1-host: timing phase=backward elapsed_s=unavailable\n", 0, 0)
+    host.verify_probe(timing, cases["phase-timing"])
+    for invalid_timing in (replace(timing, status="timeout"), replace(timing, returncode=1),
+                           replace(timing, stdout=""), replace(timing, stderr=""),
+                           replace(timing, stderr=timing.stderr.replace("elapsed_s=unavailable", "elapsed_s=0.000")),
+                           replace(timing, stderr=timing.stderr + "unexpected\n")):
+        try:
+            host.verify_probe(invalid_timing, cases["phase-timing"])
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("invalid phase timing protocol accepted")
     for mode, prefix in (("metadata-parity", "FRONTEND_CODEGEN_META"),
                          ("fallback-forward", "FRONTEND_CODEGEN_SELFTEST"),
                          ("root-parity", "FRONTEND_CODEGEN_SELFTEST"),

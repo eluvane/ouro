@@ -394,6 +394,13 @@ shard manifest and shard contents for all five host images, using one worker,
 The host build records start and completion markers for compiler emission,
 helper uniquification, hook installation, and publication, so a timeout can be
 assigned to the last unfinished phase without inferring it from compiler trace.
+The diagnostic `n1-host --timings ROOT.ouro OUT.exe UNIT.ouro ...` option records
+monotonic elapsed wall seconds at source-checking, replay, type-normalization,
+lowering, MIR, GC, codegen, and publication boundaries. The bounded-process API
+build enables it to locate native-compilation timeouts. Unavailable or backward
+clock samples are reported explicitly; timing never changes acceptance or a
+deadline. A separate host probe checks timing output, alongside all 40 retained
+probes. Ordinary host invocations retain their existing diagnostic bytes.
 
 On Windows, the required frontend-security host suite also uses its freshly
 built `n1-host` to emit the 29 bounded-process API laws, runtime fixture, and

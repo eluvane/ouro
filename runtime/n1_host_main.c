@@ -1,18 +1,77 @@
 /* C-hosted N1 producer: check through frontend_link phase seams, then
    lower/codegen with the generated Ouro backend. Replaces ouro_prog_main
    so compile_checked_units inlining cannot keep every parse temporary. */
+#ifndef _POSIX_C_SOURCE
+#define _POSIX_C_SOURCE 200809L
+#endif
 #include "ouro_host_values.h"
 #include "ouro_io.h"
 
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 int ouro_export_count(void);
 const char *ouro_export_name(int i);
 ouro_v *ouro_export_value(int i);
 void ouro_fe_reset_mir_pins(void);
 void ouro_fe_set_progress(int enabled);
+
+static int g_n1_timings;
+static double g_n1_timing_start = -1.0;
+static double g_n1_timing_last = -1.0;
+
+static double n1_timing_now(void)
+{
+#ifdef _WIN32
+	LARGE_INTEGER counter;
+	LARGE_INTEGER frequency;
+
+	if (!QueryPerformanceFrequency(&frequency) || frequency.QuadPart <= 0 ||
+	    !QueryPerformanceCounter(&counter) || counter.QuadPart < 0)
+		return -1.0;
+	return (double)counter.QuadPart / (double)frequency.QuadPart;
+#else
+	struct timespec now;
+
+	if (clock_gettime(CLOCK_MONOTONIC, &now) != 0 || now.tv_sec < 0 ||
+	    now.tv_nsec < 0 || now.tv_nsec >= 1000000000L)
+		return -1.0;
+	return (double)now.tv_sec + (double)now.tv_nsec / 1000000000.0;
+#endif
+}
+
+static void n1_timing_reset(int enabled)
+{
+	g_n1_timings = enabled;
+	g_n1_timing_start = enabled ? n1_timing_now() : -1.0;
+	g_n1_timing_last = g_n1_timing_start;
+}
+
+static void n1_timing_at(const char *phase, double now)
+{
+	if (!g_n1_timings)
+		return;
+	if (!isfinite(g_n1_timing_start) || g_n1_timing_start < 0.0 ||
+	    !isfinite(now) || now < g_n1_timing_start || now < g_n1_timing_last) {
+		fprintf(stderr, "n1-host: timing phase=%s elapsed_s=unavailable\n", phase);
+		return;
+	}
+	g_n1_timing_last = now;
+	fprintf(stderr, "n1-host: timing phase=%s elapsed_s=%.3f\n",
+		phase, now - g_n1_timing_start);
+}
+
+static void n1_timing(const char *phase)
+{
+	if (g_n1_timings)
+		n1_timing_at(phase, n1_timing_now());
+}
 
 static ouro_v *keep_reset(ouro_v *v)
 {
@@ -228,29 +287,40 @@ static ouro_v *emit_mir(ouro_v *mir)
 		fprintf(stderr, "n1-host: mir functions=%lu live=%llu\n",
 			count_list(OURO_F(mir, 0)), ouro_heap_live_bytes());
 	/* GC annotation and successful encoding cannot establish MIR validity. */
+	n1_timing("mir-check-start");
 	fprintf(stderr, "n1-host: mir-check live=%llu\n", ouro_heap_live_bytes());
 	r = ouro_apply(ouro_apply(find_export("mir_check_program"), compiler_limits()), mir);
 	if (r == 0 || r->tag != 1 || r->n != 1)
 		die_mir("mir-check", r);
 	mir = keep_reset(mir);
+	n1_timing("mir-check-end");
 	flow = ouro_nat(16777216UL);
+	n1_timing("gc-infer-start");
 	fprintf(stderr, "n1-host: gc-infer live=%llu\n", ouro_heap_live_bytes());
 	r = ouro_apply(ouro_apply(find_export("mir_gc_infer"), flow), mir);
 	if (r == 0 || r->tag != 1 || r->n < 1)
 		die_mir("gc-infer", r);
 	bodies = OURO_F(r, 0);
+	n1_timing("gc-infer-end");
+	n1_timing("gc-annotate-start");
 	fprintf(stderr, "n1-host: annotate live=%llu\n", ouro_heap_live_bytes());
 	mir = ouro_apply(ouro_apply(find_export("mir_gc_annotate"), mir), bodies);
+	n1_timing("gc-annotate-end");
+	n1_timing("gc-check-start");
 	r = ouro_apply(ouro_apply(find_export("mir_gc_check"), mir), bodies);
 	if (r == 0 || r->tag != 1)
 		die_mir("gc-check", r);
 	mir = keep_reset(pair(mir, bodies));
 	mir = OURO_F(mir, 0);
+	n1_timing("gc-check-end");
+	n1_timing("codegen-start");
 	fprintf(stderr, "n1-host: codegen live=%llu\n", ouro_heap_live_bytes());
 	r = ouro_apply(find_export("codegen_checked"), mir);
 	if (r == 0 || r->tag != 1 || r->n < 1)
 		die_codegen("codegen", r);
-	return keep_reset(OURO_F(r, 0));
+	r = keep_reset(OURO_F(r, 0));
+	n1_timing("codegen-end");
+	return r;
 }
 
 static ouro_v *compiler_limits(void)
@@ -404,13 +474,21 @@ int main(int argc, char **argv)
 	ouro_v *image;
 	ouro_v *pe;
 	ouro_v *bytes;
+	int timings = 0;
 	int i;
 
+	n1_timing_reset(0);
+	if (argc > 1 && strcmp(argv[1], "--timings") == 0) {
+		timings = 1;
+		argc--;
+		argv++;
+	}
 	if (argc < 3) {
 		fputs("usage: n1-host ROOT.ouro OUT.exe UNIT.ouro ...\n", stderr);
 		return 2;
 	}
 	setvbuf(stderr, 0, _IONBF, 0);
+	n1_timing_reset(timings);
 	ouro_fe_set_progress(1);
 	ouro_fe_reset_mir_pins();
 	snprintf(root, sizeof root, "%s", argv[1]);
@@ -427,24 +505,29 @@ int main(int argc, char **argv)
 	if (argc == 3)
 		files = cons(pair(ouro_string_codes(root), read_file_codes(argv[1])), files);
 
+	n1_timing("check-start");
 	fprintf(stderr, "n1-host: check units=%d live=%llu\n",
 		argc == 3 ? 1 : argc - 3, ouro_heap_live_bytes());
 	result = ouro_fe_compile_checked_units(ouro_nat(200000UL), ouro_string_codes(root), files);
 	if (result == 0 || result->tag != 1 || result->n < 1)
 		die_comp(result);
 	checked = keep_reset(OURO_F(result, 0));
+	n1_timing("check-end");
 	fprintf(stderr, "n1-host: CHECK_OK live=%llu total=%llu\n",
 		ouro_heap_live_bytes(), ouro_heap_total_alloc_bytes());
 	ouro_heap_report("n1-after-check");
 
 	fuel = find_export("native_build_fuel");
+	n1_timing("recheck-start");
 	fprintf(stderr, "n1-host: recheck live=%llu\n", ouro_heap_live_bytes());
 	result = ouro_apply(ouro_apply(find_export("lower_recheck_program"),
 				      fuel), checked);
 	if (result == 0 || result->tag != 1 || result->n < 1)
 		die_as_source("recheck", 1, result == 0 ? 0 : OURO_F(result, 0));
 	checked = keep_reset(OURO_F(result, 0));
+	n1_timing("recheck-end");
 	fprintf(stderr, "n1-host: RECHECK_OK live=%llu\n", ouro_heap_live_bytes());
+	n1_timing("types-start");
 	result = ouro_apply(ouro_apply(ouro_apply(
 		find_export("checked_program_type_globals_indexed"),
 		find_export("normalize_checked_indexed")), fuel), checked);
@@ -452,15 +535,18 @@ int main(int argc, char **argv)
 		die_as_source("types", 0, result == 0 ? 0 : OURO_F(result, 0));
 	result = keep_reset(pair(checked, OURO_F(result, 0)));
 	checked = OURO_F(result, 0);
+	n1_timing("types-end");
 	{
 		ouro_v *types = OURO_F(result, 1);
 
 		fprintf(stderr, "n1-host: TYPES_OK live=%llu\n",
 			ouro_heap_live_bytes());
+		n1_timing("lower-start");
 		entry = lookup_main(checked);
 		fprintf(stderr, "n1-host: lower live=%llu\n",
 			ouro_heap_live_bytes());
 		result = build_managed_parts(&fuel, &entry, &checked, types);
+		n1_timing("lower-end");
 	}
 	if (result == 0 || result->tag != 1 || result->n < 1) {
 		ouro_v *err = (result != 0 && result->n >= 1) ? OURO_F(result, 0) : 0;
@@ -470,12 +556,14 @@ int main(int argc, char **argv)
 			die_as_source("lower", 1, err);
 		fprintf(stderr, "n1-host: managed miss tag=%d; scalar lower\n",
 			tag);
+		n1_timing("scalar-lower-start");
 		limits = compiler_limits();
 		result = ouro_apply(ouro_apply(ouro_apply(ouro_apply(
 			find_export("native_scalar_lower_checked"), fuel),
 			limits), entry), checked);
 		if (result == 0 || result->tag != 1 || result->n < 1)
 			die_either("lower", result);
+		n1_timing("scalar-lower-end");
 		/* NativeLoweredOf checked contracts mir */
 		image = emit_mir(OURO_F(OURO_F(result, 0), 2));
 	} else {
@@ -497,6 +585,7 @@ int main(int argc, char **argv)
 	bytes = OURO_F(pe, 0);
 	/* Use the same byte verification, replacement and cleanup owner as
 	   the native CLI. A failed producer must preserve the prior stage. */
+	n1_timing("publish-start");
 	result = ouro_apply(ouro_apply(find_export("native_build_publish_checked"),
 		ouro_string_codes(output)), ouro_apply(ouro_io_prim_req("prim_string_of_char_codes"), bytes));
 	result = ouro_apply(result, ouro_ctor(0, 0, 0));
@@ -509,6 +598,7 @@ int main(int argc, char **argv)
 		}
 		return 1;
 	}
+	n1_timing("publish-end");
 	fprintf(stderr, "n1-host: WROTE %s live=%llu\n", output,
 		ouro_heap_live_bytes());
 	printf("%s\n", output);

@@ -213,8 +213,9 @@ def run_section(producer, work, run, build_timeout, probe_timeout, verify_inputs
             unchanged()
             output = directory / (Path(entry).stem + ".exe")
             logical = output.relative_to(ROOT).as_posix()
+            timing_args = ["--timings"] if entry == API else []
             result = run("native-build-" + output.stem,
-                         [str(producer), entry, logical, *before["closures"][entry]], build_timeout)
+                         [str(producer), *timing_args, entry, logical, *before["closures"][entry]], build_timeout)
             require(result.ok and result.stdout == logical + "\n", "direct native process build failed: " + entry)
             binaries[entry] = {"path": logical, "image": inspect_image(output, IMPORTS[entry])}
             unchanged()

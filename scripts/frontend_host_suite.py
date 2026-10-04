@@ -91,6 +91,12 @@ def probe_cases():
     for mode in ("fallback-forward", "root-parity", "root-clear-context", "pe-operation-context"):
         cases.append(("frontend-codegen-selftest", [mode], 0,
                       f"FRONTEND_CODEGEN_SELFTEST: passed {mode}\n", ""))
+    cases.append(("n1-host-selftest", ["phase-timing"], 0,
+                  "N1_HOST_TIMING: passed phase-timing\n",
+                  re.escape("n1-host: timing phase=sample elapsed_s=1.250\n"
+                            "n1-host: timing phase=start-unavailable elapsed_s=unavailable\n"
+                            "n1-host: timing phase=sample-unavailable elapsed_s=unavailable\n"
+                            "n1-host: timing phase=backward elapsed_s=unavailable\n")))
     return cases
 
 

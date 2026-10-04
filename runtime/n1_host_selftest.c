@@ -878,6 +878,32 @@ static int check_pe_patch_context(void)
 	return lower_probe_text(caller, "borrowed section") ? 0 : pe_probe_fail("patch planner released caller");
 }
 
+static int check_phase_timing(void)
+{
+	double now;
+
+	n1_timing_reset(0);
+	n1_timing_at("disabled", 11.25);
+	n1_timing_reset(1);
+	now = n1_timing_now();
+	if ((now != -1.0 && (!isfinite(now) || now < 0.0)) ||
+	    (g_n1_timing_start >= 0.0 && now >= 0.0 && now < g_n1_timing_start)) {
+		fputs("N1_HOST_TIMING: invalid monotonic clock sample\n", stderr);
+		return 1;
+	}
+	g_n1_timing_start = 10.0;
+	g_n1_timing_last = 10.0;
+	n1_timing_at("sample", 11.25);
+	g_n1_timing_start = -1.0;
+	n1_timing_at("start-unavailable", 11.25);
+	g_n1_timing_start = 10.0;
+	n1_timing_at("sample-unavailable", -1.0);
+	n1_timing_at("backward", 11.0);
+	n1_timing_reset(0);
+	n1_timing_at("disabled-again", 11.25);
+	return 0;
+}
+
 int main(int argc, char **argv)
 {
 	ouro_v *image;
@@ -893,6 +919,12 @@ int main(int argc, char **argv)
 	else
 		ouro_fe_set_progress(1);
 	ouro_rt_warmup();
+	if (strcmp(mode, "phase-timing") == 0) {
+		result = check_phase_timing();
+		if (result == 0)
+			puts("N1_HOST_TIMING: passed phase-timing");
+		return result;
+	}
 	if (strcmp(mode, "diagnostic-strings") == 0) {
 		ouro_v *parts[2];
 		const unsigned char binary[3] = {'a', 0, 'z'};
