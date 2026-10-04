@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import shutil
@@ -148,11 +149,12 @@ def tool_inputs(entry: str, compiler: Path, fuel: int, cfg: build.ResolvedConfig
     sources = dict.fromkeys([*units, *companion_units, *BUILD_INPUTS, *RUNTIME,
                             *(path.relative_to(ROOT).as_posix() for path in sorted((ROOT / "runtime").glob("*.h")))])
     cc = build.choose_cc(cfg)
-    cc_path = Path(shutil.which(cc) or cc).resolve()
+    compiler_sha256 = sha256_file(compiler)
+    cc_id = build.compiler_id(cc)
     inputs = {
         "kind": KIND, "entry": units[-1], "fuel": fuel,
-        "compiler_sha256": sha256_file(compiler),
-        "cc": build.compiler_id(cc), "cc_sha256": sha256_file(cc_path),
+        "compiler_sha256": compiler_sha256,
+        "cc": cc_id, "cc_sha256": json.loads(cc_id)["executable_sha256"],
         # platform.machine() is empty on Windows when the harness scrubs
         # PROCESSOR_ARCHITECTURE; Python's build platform remains stable.
         "platform": sys.platform, "machine": sysconfig.get_platform(),

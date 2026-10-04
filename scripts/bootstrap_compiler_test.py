@@ -646,6 +646,30 @@ class BootstrapCompilerTests(unittest.TestCase):
         self.assertEqual(output.read_bytes(), before)
         self.assertFalse(output.with_name("ouro1.bootstrap.json").exists())
 
+    def test_publication_reuses_frozen_key_and_complete_evidence(self):
+        snapshot = self.fixture()
+        output = self.root / "published/ouro1"
+        cfg = build.ResolvedConfig({**build.DEFAULTS, "build_dir": str(self.root / "b"),
+                                   "c_build_dir": str(output.parent), "cache_enabled": False}, {})
+        with patch.object(inputs, "read_bundle", return_value=({}, {})), \
+             patch.object(inputs, "verify_stage0"), \
+             patch.object(bootstrap, "current_inputs", return_value=snapshot["selected"]), \
+             patch.object(bootstrap.tempfile, "mkdtemp", return_value=str(self.work)), \
+             patch.object(bootstrap, "freeze", return_value=snapshot), \
+             patch.object(bootstrap, "current_unchanged", return_value=True) as unchanged, \
+             patch.object(bootstrap, "run_limited", side_effect=self.fake_run), \
+             patch.object(bootstrap, "hash_json", wraps=hash_json) as keys:
+            result = bootstrap.ensure_current_compiler(cfg, build, self.root)
+        keys.assert_called_once_with(snapshot["selected"])
+        unchanged.assert_called_once_with(self.root, snapshot["selected"])
+        self.assertEqual(result["key"], snapshot["key"])
+        self.assertEqual(result["selected"], snapshot["selected"])
+        receipt = output.with_name("ouro1.bootstrap.json")
+        self.assertEqual(json.loads(receipt.read_text()), result)
+        self.assertTrue(bootstrap.installed_current(output, receipt, snapshot["selected"]))
+        (self.work / "out/p2/driver_u.c").write_text("changed after publication")
+        self.assertFalse(bootstrap.installed_current(output, receipt, snapshot["selected"]))
+
     def test_cache_rejects_changed_binary_foreign_producer_and_partial_c_comparison(self):
         snapshot = self.fixture()
         with patch.object(bootstrap, "run_limited", side_effect=self.fake_run):

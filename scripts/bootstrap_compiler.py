@@ -394,7 +394,7 @@ def ensure_current_compiler(cfg, build, root: Path = ROOT, *, compact_sources: b
     if sha256_file(temporary) != report["binary_sha256"]:
         fail("successor changed before publication")
     os.replace(temporary, output)
-    result = {"kind": KIND, "key": hash_json(selected), "selected": selected, "work": str(work),
+    result = {"kind": KIND, "key": snapshot["key"], "selected": selected, "work": str(work),
         "report_sha256": sha256_file(work / "report.json"), "binary_sha256": report["binary_sha256"]}
     write_json_atomic(receipt, result)
     build.log(cfg, "BOOTSTRAP: current P2 published after strict source checks, behavior checks and complete C equality")

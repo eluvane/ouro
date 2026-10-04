@@ -247,7 +247,7 @@ class BuildContracts(unittest.TestCase):
         operations = {
             "load_config": lambda _args: self.cfg,
             "choose_cc": lambda _cfg: str(self.cc),
-            "compiler_id": lambda _cc: "fixture-cc",
+            "output_or_empty": lambda _argv: "fixture-cc\n",
             "profile_cflags": lambda _cfg: list(self.flags),
             "host_link_flags": lambda: [],
             "jobs_value": lambda _cfg: 64,
@@ -300,6 +300,20 @@ class BuildContracts(unittest.TestCase):
         self.assertEqual(len(self.emissions), 1)
         self.assertEqual(len(self.links), 1)
         self.assertEqual(self.links[0]["jobs"], 2)
+
+    def test_c_compiler_hash_is_shared_only_within_one_input_snapshot(self):
+        with patch.object(native.build, "sha256_file", wraps=native.build.sha256_file) as compiler_hashes, \
+                patch.object(native, "sha256_file", wraps=native.sha256_file) as input_hashes:
+            _, first = native.tool_inputs(self.args.entry, self.compiler, self.args.fuel, self.cfg)
+            self.mutate(self.cc)
+            _, changed = native.tool_inputs(self.args.entry, self.compiler, self.args.fuel, self.cfg)
+        reads = Counter(Path(call.args[0]).resolve() for call in
+                        [*compiler_hashes.call_args_list, *input_hashes.call_args_list])
+        self.assertEqual(reads[self.cc.resolve()], 2)
+        for inputs in (first, changed):
+            self.assertEqual(inputs["cc_sha256"], json.loads(inputs["cc"])["executable_sha256"])
+        self.assertNotEqual(first["cc_sha256"], changed["cc_sha256"])
+        self.assertNotEqual(native.hash_json(first), native.hash_json(changed))
 
     def test_removed_output_restores_verified_cache_without_emit(self):
         self.run_build()

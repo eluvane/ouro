@@ -658,6 +658,9 @@ exact compiler path and version before building or importing the compiler.
 Compiler and bootstrap receipts retain their complete identity checks.
 Linux Manual uses the project C compiler configuration, matching the other Linux
 producers; Windows selects its pinned gcc before identifying or importing it.
+Ruff and ShellCheck are prepared only for the `checks` group when the selected
+profile includes their gates: `manual` in Manual, and `pr` or `manual` in
+Release. Release packaging does not install these validation tools.
 
 Select `task=frontend-security` in Manual for the canonical frontend-security
 suite alone on Ubuntu and Windows. The diagnostic task reuses compiler

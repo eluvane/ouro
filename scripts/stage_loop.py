@@ -152,13 +152,13 @@ def ensure_seed(cfg: StageConfig) -> Path:
 
 def all_stage_source_units() -> Tuple[List[str], Dict[str, List[str]]]:
     roots = [BACKEND_ROOT] + [root for _tag, _mod, root, _file in freg.FRONTEND_TUS]
-    graph: Dict[str, List[str]] = {}
+    graph = freg.collect_units_many(roots)
     all_units: List[str] = []
+    seen_units: set[str] = set()
     for root in roots:
-        units = freg.collect_units(root)
-        graph[root] = units
-        for u in units:
-            if u not in all_units:
+        for u in graph[root]:
+            if u not in seen_units:
+                seen_units.add(u)
                 all_units.append(u)
     return all_units, graph
 

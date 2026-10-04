@@ -274,6 +274,77 @@ def test_frontend_final_and_tu_cache(tmp: Path) -> None:
         assert frontend_regen.cached_output_matches(pack_cache, pack_key), damage
 
 
+def test_stage_source_unit_preparation(tmp: Path) -> None:
+    import stage_loop as loop
+
+    repo = tmp / "stage-source-units"
+    repo.mkdir()
+    sources = {
+        "base.ouro": "",
+        "shared.ouro": 'import "base.ouro";\n',
+        "backend_leaf.ouro": "",
+        "extra.ouro": "",
+        "backend.ouro": 'import "shared.ouro";\nimport "backend_leaf.ouro";\n',
+        "left.ouro": 'import "shared.ouro";\nimport "extra.ouro";\n',
+        "right.ouro": 'import "shared.ouro", "extra.ouro", "shared.ouro";\n',
+    }
+    for name, text in sources.items():
+        (repo / name).write_text(text, encoding="utf-8")
+    tus = (
+        ("left", "_left", "left.ouro", "left.c"),
+        ("right", "_right", "right.ouro", "right.c"),
+    )
+    expected_graph = {
+        "backend.ouro": ["base.ouro", "shared.ouro", "backend_leaf.ouro", "backend.ouro"],
+        "left.ouro": ["base.ouro", "shared.ouro", "extra.ouro", "left.ouro"],
+        "right.ouro": ["base.ouro", "shared.ouro", "extra.ouro", "right.ouro"],
+    }
+    expected_units = ["base.ouro", "shared.ouro", "backend_leaf.ouro", "backend.ouro",
+                      "extra.ouro", "left.ouro", "right.ouro"]
+    expected_reads = ["backend.ouro", "shared.ouro", "base.ouro", "backend_leaf.ouro",
+                      "left.ouro", "extra.ouro", "right.ouro"]
+    with patch.object(loop, "BACKEND_ROOT", "backend.ouro"), \
+         patch.object(loop.freg, "ROOT", repo), \
+         patch.object(loop.freg, "FRONTEND_TUS", tus), \
+         patch.object(loop.freg, "import_targets", wraps=loop.freg.import_targets) as reads:
+        for _attempt in range(2):
+            reads.reset_mock()
+            assert loop.all_stage_source_units() == (expected_units, expected_graph)
+            assert [call.args[0] for call in reads.call_args_list] == expected_reads
+
+        shared = repo / "shared.ouro"
+        saved = shared.stat()
+        shared.write_text('import "extra.ouro";\n', encoding="utf-8")
+        os.utime(shared, ns=(saved.st_atime_ns, saved.st_mtime_ns))
+        reads.reset_mock()
+        units, graph = loop.all_stage_source_units()
+        assert units == ["extra.ouro", "shared.ouro", "backend_leaf.ouro", "backend.ouro",
+                         "left.ouro", "right.ouro"], units
+        assert graph == {
+            "backend.ouro": ["extra.ouro", "shared.ouro", "backend_leaf.ouro", "backend.ouro"],
+            "left.ouro": ["extra.ouro", "shared.ouro", "left.ouro"],
+            "right.ouro": ["extra.ouro", "shared.ouro", "right.ouro"],
+        }, graph
+        assert [call.args[0] for call in reads.call_args_list] == [
+            "backend.ouro", "shared.ouro", "extra.ouro", "backend_leaf.ouro",
+            "left.ouro", "right.ouro",
+        ]
+        shared.write_text(sources["shared.ouro"], encoding="utf-8")
+        for text, diagnostic in (
+            ('import "shared.ouro";\nimport "right.ouro";\n',
+             "FRONTEND_REGEN: FAIL import cycle while collecting right.ouro: right.ouro"),
+            ('import "shared.ouro";\nimport "missing.ouro";\n',
+             "FRONTEND_REGEN: FAIL missing missing.ouro"),
+        ):
+            (repo / "right.ouro").write_text(text, encoding="utf-8")
+            try:
+                loop.all_stage_source_units()
+            except SystemExit as exc:
+                assert exc.code == diagnostic, exc.code
+            else:
+                raise AssertionError(f"stage source collection accepted {diagnostic}")
+
+
 def test_stage_loop_backend_output_receipt(tmp: Path) -> None:
     import stage_loop as loop
 
@@ -479,6 +550,7 @@ def main() -> int:
     test_native_stack_limits()
     with tempfile.TemporaryDirectory(prefix="ouro-stage-loop-suite-") as d:
         tmp = Path(d)
+        test_stage_source_unit_preparation(tmp)
         test_strict_packer(tmp)
         test_frontend_final_and_tu_cache(tmp)
         test_stage_loop_backend_output_receipt(tmp)
