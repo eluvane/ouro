@@ -28,8 +28,12 @@ def migration_archive():
     from ourosmith.migration import KIND, contracts, legacy_categories, refresh
 
     legacy = "test"
-    manifest = "B.check.1\tbad.ouro\tcheck\tfail\t1\texpected domain\n"
-    paths = sorted(f"{legacy}/suite/{name}" for name in ("manifest.tsv", "bad.ouro", "lsp/messy.ouro"))
+    manifest = ("B.check.1\tbad.ouro\tcheck\tfail\t1\texpected domain\n"
+                "REC.B.check.ambiguous_literal\trecords/bad/ambiguous_literal.ouro\tcheck\tfail\t1\tOURO-REC-003\n"
+                "REC.B.check.update_pending\trecords/bad/update_pending.ouro\tcheck\tfail\t1\tOURO-REC-003\n")
+    paths = sorted(f"{legacy}/suite/{name}" for name in (
+        "manifest.tsv", "bad.ouro", "lsp/messy.ouro",
+        "records/bad/ambiguous_literal.ouro", "records/bad/update_pending.ouro"))
     snapshot = {"revision": "a" * 40, "tree": "b" * 40,
                 "git_blobs": {path: "c" * 40 for path in paths}, "files_sha256": {path: "d" * 64 for path in paths}}
     source = {"head": snapshot["revision"], "source_sha256": "e" * 64, "files": len(paths)}
@@ -43,6 +47,9 @@ def migration_archive():
             else:
                 layer, group, name = strategy.split("/", 2)
                 value["summary"]["layers"].setdefault(layer, {}).setdefault("coverage", {}).setdefault(group, {})[name] = 1
+    coverage = value["summary"]["layers"]["surface"]["coverage"]
+    coverage.setdefault("features", {})["form:record"] = 1
+    external.add("external/ci/ergonomics")
     matrix = {"kind": KIND, "contracts": contracts.CONTRACT_KIND, "source_manifest_sha256": hashlib.sha256(manifest.encode()).hexdigest(),
               "recoverability": {**snapshot, "status": [], "tracked": len(paths)}, "pre_retirement_source": source,
               "legacy_files": paths, "manifest_rows": count, "categories": categories, "retired": False,
@@ -227,7 +234,8 @@ class HarnessTests(unittest.TestCase):
         calls = []
 
         def execute(argv, *, timeout_s, **_kwargs):
-            phase = "check" if "check" in argv else "emit-c" if argv[0] == "compiler" else "native-compile" if argv[0] == "cc" else "native-run"
+            phase = ("check" if "check" in argv else "emit-c" if argv[0] == "compiler" else
+                     "native-compile" if any(arg.endswith("/surface/native_compile.py") for arg in argv) else "native-run")
             calls.append((phase, timeout_s))
             duration = (901 if preparation_hanging else 61) if phase != "native-run" else 21 if hanging else 1
             status = "timeout" if duration > timeout_s else "ok"
@@ -332,6 +340,56 @@ class HarnessTests(unittest.TestCase):
             self.assertEqual(execute.call_count, 1)
             self.assertEqual(report["wrapper_launches"], 1)
             pool.assert_not_called()
+
+    def test_analyzer_core_pool_isolates_windows_driver_and_preserves_failures(self):
+        import threading
+        import analyze_core_checks as checks
+
+        files = ["warm.ouro", "slow.ouro", "tools/analyze/drive_main.ouro", "later.ouro"]
+        for result in (RunResult("ok", 0, "CHECK_OK\n", "", 1, 2),
+                       RunResult("ok", 1, "", "rejected", 1, 2),
+                       RunResult("timeout", 1, "", "timeout", 1, 2),
+                       RunResult("ok", 0xC0000005, "", "crash", 1, 2)):
+            commands, overtaken = [], threading.Event()
+
+            def execute(argv, result=result, commands=commands, overtaken=overtaken, **kwargs):
+                commands.append(argv[3])
+                self.assertEqual(kwargs["timeout_s"], 300)
+                self.assertEqual(kwargs["memory_mb"], 3072)
+                if argv[3] == files[2]:
+                    self.assertEqual(commands, [files[0], files[2]])
+                    return result
+                if argv[3] == files[1]:
+                    self.assertTrue(overtaken.wait(timeout=5))
+                elif argv[3] == files[3]:
+                    overtaken.set()
+                return RunResult("ok", 0, "CHECK_OK\n", "", 1, 2)
+
+            with tempfile.TemporaryDirectory() as directory, \
+                 patch.object(checks, "os", SimpleNamespace(name="nt", environ={})), \
+                 patch.object(checks, "environment", return_value={}), \
+                 patch.object(checks, "shell", return_value=Path("sh")), \
+                 patch.object(checks, "run_limited", side_effect=execute), \
+                 contextlib.redirect_stdout(io.StringIO()) as output:
+                value = checks.run_checks(files, Path(directory), 2)
+                self.assertEqual(value["pass"], result.ok)
+                self.assertEqual(value["wrapper_launches"], len(files))
+                self.assertEqual(sorted(commands), sorted(files))
+                self.assertEqual([row["file"] for row in value["checks"]], files)
+                self.assertEqual(value["checks"][2]["resource"], result.classify())
+                self.assertEqual([line.split()[2] for line in output.getvalue().splitlines()], files)
+                self.assertTrue(all(Path(row["log"]).is_file() for row in value["checks"]))
+
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.object(checks, "os", SimpleNamespace(name="posix")), \
+             patch.object(checks, "command_environment", return_value={}), \
+             patch.object(checks, "shell", return_value=Path("sh")), \
+             patch.object(checks, "run_limited", return_value=RunResult("ok", 0, "CHECK_OK\n", "", 0, 0)) as execute, \
+             contextlib.redirect_stdout(io.StringIO()):
+            value = checks.run_checks(files, Path(directory), 2)
+            self.assertTrue(value["pass"])
+            self.assertEqual([call.args[0][3] for call in execute.call_args_list], files)
+            self.assertEqual(value["jobs"], 1)
 
     def test_native_inputs_are_isolated_and_invalid_requests_do_not_write(self):
         import csv
@@ -1216,6 +1274,26 @@ class LimitTests(unittest.TestCase):
     def execute(self, source, **limits):
         return run_limited([sys.executable, "-c", source], timeout_s=limits.get("timeout", 10), memory_mb=limits.get("memory", 256))
 
+    def assert_posix_process_exited(self, pid):
+        try:
+            state = Path(f"/proc/{pid}/status").read_text()
+        except (FileNotFoundError, ProcessLookupError):
+            return
+        self.assertIn("State:\tZ", state)
+
+    def test_posix_process_observation_handles_reaping(self):
+        for error in (FileNotFoundError(), ProcessLookupError()):
+            with self.subTest(error=type(error).__name__), patch.object(Path, "read_text", autospec=True, side_effect=error) as read:
+                self.assert_posix_process_exited(123)
+                read.assert_called_once_with(Path("/proc/123/status"))
+        with patch.object(Path, "read_text", autospec=True, return_value="State:\tZ (zombie)\n") as read:
+            self.assert_posix_process_exited(123)
+            read.assert_called_once_with(Path("/proc/123/status"))
+        with patch.object(Path, "read_text", autospec=True, return_value="State:\tS (sleeping)\n"), self.assertRaises(AssertionError):
+            self.assert_posix_process_exited(123)
+        with patch.object(Path, "read_text", autospec=True, side_effect=PermissionError()), self.assertRaises(PermissionError):
+            self.assert_posix_process_exited(123)
+
     def test_success_and_nonzero(self):
         result = self.execute("import sys; print(sys.stdin.read()); print('err',file=sys.stderr)")
         self.assertTrue(result.ok, result)
@@ -1311,8 +1389,7 @@ class LimitTests(unittest.TestCase):
                         close_handle(handle)
             else:
                 # A just-orphaned killed process can briefly be a zombie.
-                status = Path(f"/proc/{pid}/status")
-                self.assertTrue(not status.exists() or "State:\tZ" in status.read_text())
+                self.assert_posix_process_exited(pid)
 
 
 def run() -> int:

@@ -28,6 +28,9 @@ FRONTEND_MARK = re.compile(r"(?m)^/\* ---- frontend TU module=([A-Za-z0-9_]+) --
 BACKEND_PROTO = re.compile(r"^static ouro_v \*(ouro_g[0-9]+(?:_d[0-9]+)?)\(void\);\s*$")
 BACKEND_G_DEF = re.compile(r"^static ouro_v \*(ouro_g[0-9]+(?:_d[0-9]+)?)\(void\)\{")
 BACKEND_CACHE = re.compile(r"^static ouro_v \*(ouro_c[0-9]+);\s*$")
+BACKEND_INCLUDE = re.compile(r'^#include "[A-Za-z0-9_./-]+\.h"$')
+BACKEND_DECL = re.compile(r"^ouro_v \*ouro_[A-Za-z0-9_]+\([^;{}]*\);\s*$")
+BACKEND_LOCAL_DEF = re.compile(r"^static ouro_v \*ouro_[ft][A-Za-z0-9_]+\([^;{}]*\)\{")
 
 
 def sha256_text(text: str) -> str:
@@ -244,7 +247,7 @@ def backend_body_start(lines: Sequence[str]) -> int:
         if not s:
             i += 1
             continue
-        if s == '#include "ouro_rt.h"':
+        if BACKEND_INCLUDE.fullmatch(s) or BACKEND_DECL.fullmatch(s):
             i += 1
             continue
         if BACKEND_PROTO.match(s):
@@ -279,13 +282,15 @@ def transform_backend_cluster(
     return "".join(out)
 
 
-def backend_header(g_names: Sequence[str], duplicate_caches: Sequence[str], generator_hash: str) -> str:
+def backend_header(g_names: Sequence[str], duplicate_caches: Sequence[str], generator_hash: str,
+                   *, declarations: str = "", export_suffix: str = "_be") -> str:
     lines = [
         "/* Ouro generated backend shard header. Do not hand-edit. */\n",
         f"/* generator_hash={generator_hash} */\n",
         "#ifndef OURO_GENERATED_BACKEND_SHARDS_H\n",
         "#define OURO_GENERATED_BACKEND_SHARDS_H\n",
         "#include \"ouro_rt.h\"\n",
+        declarations,
     ]
     for c in duplicate_caches:
         lines.append(f"extern ouro_v *{c};\n")
@@ -293,9 +298,9 @@ def backend_header(g_names: Sequence[str], duplicate_caches: Sequence[str], gene
         lines.append(f"ouro_v *{g}(void);\n")
     lines.extend(
         [
-            "int ouro_export_count_be(void);\n",
-            "const char *ouro_export_name_be(int i);\n",
-            "ouro_v *ouro_export_value_be(int i);\n",
+            f"int ouro_export_count{export_suffix}(void);\n",
+            f"const char *ouro_export_name{export_suffix}(int i);\n",
+            f"ouro_v *ouro_export_value{export_suffix}(int i);\n",
             "#endif\n",
         ]
     )
@@ -309,7 +314,11 @@ def backend_shards(
     label_prefix: str,
     generator_hash: str,
     group_size: int,
+    *,
+    export_suffix: str = "_be",
 ) -> List[ShardPlan]:
+    if re.fullmatch(r"(?:_[A-Za-z0-9_]+)?", export_suffix) is None:
+        raise ValueError("unsupported generated backend export suffix")
     lines = src.splitlines(keepends=True)
     if not lines:
         return []
@@ -348,6 +357,18 @@ def backend_shards(
             )
         ]
 
+    first = lines[start_idx].strip()
+    if not (BACKEND_CACHE.fullmatch(first) or BACKEND_G_DEF.match(first) or BACKEND_LOCAL_DEF.match(first)):
+        raise ValueError("unsupported generated backend prelude: " + first[:120])
+    export_symbols = tuple(f"ouro_export_{kind}{export_suffix}" for kind in ("count", "name", "value"))
+    found_exports = re.findall(
+        r"(?m)^(?:int |const char \*|ouro_v \*)(ouro_export_(?:count|name|value)[A-Za-z0-9_]*)\([^;\n]*\)\{", src)
+    if sorted(found_exports) != sorted(export_symbols):
+        raise ValueError("generated backend export table does not match its suffix")
+    declarations = "".join(line for line in lines[:start_idx]
+                           if line.strip() and line.strip() != '#include "ouro_rt.h"'
+                           and BACKEND_PROTO.fullmatch(line.strip()) is None)
+
     duplicate_caches = {name for name, count in cache_counts.items() if count > 1}
     g_names = []
     seen_g: set[str] = set()
@@ -357,7 +378,8 @@ def backend_shards(
             g_names.append(name)
     dup_sorted = sorted(duplicate_caches)
     header_name = "backend_u__shards.h"
-    header_body = backend_header(g_names, dup_sorted, generator_hash)
+    header_body = backend_header(g_names, dup_sorted, generator_hash,
+                                 declarations=declarations, export_suffix=export_suffix)
     plans: List[ShardPlan] = [
         ShardPlan(
             label=f"{label_prefix}/backend/header",
@@ -461,7 +483,7 @@ def backend_shards(
                 role="backend",
                 boundary="backend-export-table",
                 provenance=f"{rel(backend_c)}#exports",
-                symbols=("ouro_export_count_be", "ouro_export_name_be", "ouro_export_value_be"),
+                symbols=export_symbols,
                 deps=(header_name,),
             )
         )
@@ -510,35 +532,43 @@ def manifest_valid(
 
 def materialize_generated_c_shards(
     *,
-    frontend_c: Path,
+    frontend_c: Optional[Path],
     backend_c: Path,
     out_dir: Path,
     label_prefix: str,
     cache_enabled: bool = True,  # public call contract; writes always go through write_text_if_changed
     backend_group_size: Optional[int] = None,
+    backend_export_suffix: str = "_be",
     report_path: Optional[Path] = None,
 ) -> Tuple[List[Tuple[str, Path]], dict]:
     started = time.perf_counter()
-    frontend_c = frontend_c if frontend_c.is_absolute() else ROOT / frontend_c
+    if frontend_c is not None:
+        frontend_c = frontend_c if frontend_c.is_absolute() else ROOT / frontend_c
     backend_c = backend_c if backend_c.is_absolute() else ROOT / backend_c
-    if not frontend_c.is_file():
+    if frontend_c is not None and not frontend_c.is_file():
         raise SystemExit(f"GENERATED_C_SHARDS: FAIL missing frontend {frontend_c}")
     if not backend_c.is_file():
         raise SystemExit(f"GENERATED_C_SHARDS: FAIL missing backend {backend_c}")
     out_dir.mkdir(parents=True, exist_ok=True)
     group_size = backend_group_size or int_env("OURO_GENERATED_C_SHARD_BACKEND_GROUPS", 8)
     settings = {"backend_group_size": group_size, "schema": "v1"}
+    if backend_export_suffix != "_be":
+        settings["backend_export_suffix"] = backend_export_suffix
+    if frontend_c is None:
+        settings["backend_only"] = True
     gen_hash = generator_digest(settings)
-    frontend_text, frontend_digest = read_source_text_digest(frontend_c)
-    plans = frontend_shards(frontend_c, frontend_text, out_dir, label_prefix, gen_hash)
-    del frontend_text
+    plans: List[ShardPlan] = []
+    source_digests = {}
+    if frontend_c is not None:
+        frontend_text, frontend_digest = read_source_text_digest(frontend_c)
+        plans = frontend_shards(frontend_c, frontend_text, out_dir, label_prefix, gen_hash)
+        source_digests["frontend"] = frontend_digest
+        del frontend_text
     backend_text, backend_digest = read_source_text_digest(backend_c)
-    plans.extend(backend_shards(backend_c, backend_text, out_dir, label_prefix, gen_hash, group_size))
+    plans.extend(backend_shards(backend_c, backend_text, out_dir, label_prefix, gen_hash, group_size,
+                                export_suffix=backend_export_suffix))
     del backend_text
-    source_digests = {
-        "frontend": frontend_digest,
-        "backend": backend_digest,
-    }
+    source_digests["backend"] = backend_digest
     plan_meta = [plan.meta() for plan in plans]
     manifest_path = out_dir / "generated-c-shards.manifest.json"
     old_manifest = read_json(manifest_path)
@@ -619,8 +649,8 @@ def materialize_generated_c_shards(
             "emitted_bytes": emitted_bytes,
             "skipped_bytes": skipped_bytes,
             "total_bytes": emitted_bytes + skipped_bytes,
-            "source_reads": 2,
-            "source_bytes_read": int(frontend_digest["bytes"]) + int(backend_digest["bytes"]),
+            "source_reads": len(source_digests),
+            "source_bytes_read": sum(int(source["bytes"]) for source in source_digests.values()),
             "plan_metadata_hashes": len(plan_meta),
             "content_compare_calls": content_compare_calls,
             "content_compare_bytes": content_compare_bytes,

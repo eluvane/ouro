@@ -395,6 +395,22 @@ print("int main(void) { return 0; }")
     invoke("_build/another-suite/tool-test")
     assert counts(cc_log) == baseline, "same entry in another suite must reuse the complete tool"
 
+    cache = repo / "_cache/ouro/native-tools" / first_receipt["key"]
+    (cache / ("tool.exe" if os.name == "nt" else "tool")).unlink()
+    (cache / "tool.json").unlink()
+    installed = invoke()
+    assert "installed-hit" in installed.stdout and counts(cc_log) == baseline
+    # An imported installed image alone does not warm an absent content cache.
+    before_prepare_emit = emit_log.read_text().count("emit")
+    prepared = invoke("_build/memory/bin/tool-test")
+    assert "miss" in prepared.stdout and counts(cc_log) == (baseline[0], baseline[1] + 1)
+    assert emit_log.read_text().count("emit") == before_prepare_emit + 1
+    baseline = counts(cc_log)
+    env["FAKE_EMIT_FAIL"] = "1"
+    invoke("_build/memory/fresh-suite/tool-test")
+    env.pop("FAKE_EMIT_FAIL")
+    assert counts(cc_log) == baseline, "prepared content cache must survive a missing measured image"
+
     if os.name == "nt":
         # A fake linker emits a shell script, not a PE resource image. Quality
         # publication must fail before replacing a previously installed tool.
@@ -770,8 +786,40 @@ def test_frontend_host_protocol(tmp: Path) -> None:
                 "pe-byte-large", "pe-byte-errors", "pe-byte-context", "pe-patch-context", "lower-bad-result", "lower-bad-result-quiet",
                 "lower-bad-chunk", "lower-bad-contracts", "caller-output", "retained-result",
                 "typed-failure", "nested-context", "allocation-context", "shared-parent-spine", "wrapped-context", "recheck-scale",
-                "recheck-retained", "recheck-late-invalid", "recheck-missing-bodies", "recheck-zero-fuel")
-    assert len(cases) == 35 and tuple(case[1][0] for case in host.probe_cases()) == expected
+                "recheck-retained", "recheck-late-invalid", "recheck-missing-bodies", "recheck-zero-fuel",
+                "metadata-parity", "fallback-forward", "root-parity", "root-clear-context", "pe-operation-context", "phase-timing")
+    assert len(cases) == 41 and tuple(case[1][0] for case in host.probe_cases()) == expected
+    timing = RunResult("ok", 0, "N1_HOST_TIMING: passed phase-timing\n",
+                       "n1-host: timing phase=sample elapsed_s=1.250\n"
+                       "n1-host: timing phase=start-unavailable elapsed_s=unavailable\n"
+                       "n1-host: timing phase=sample-unavailable elapsed_s=unavailable\n"
+                       "n1-host: timing phase=backward elapsed_s=unavailable\n", 0, 0)
+    host.verify_probe(timing, cases["phase-timing"])
+    for invalid_timing in (replace(timing, status="timeout"), replace(timing, returncode=1),
+                           replace(timing, stdout=""), replace(timing, stderr=""),
+                           replace(timing, stderr=timing.stderr.replace("elapsed_s=unavailable", "elapsed_s=0.000")),
+                           replace(timing, stderr=timing.stderr + "unexpected\n")):
+        try:
+            host.verify_probe(invalid_timing, cases["phase-timing"])
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("invalid phase timing protocol accepted")
+    for mode, prefix in (("metadata-parity", "FRONTEND_CODEGEN_META"),
+                         ("fallback-forward", "FRONTEND_CODEGEN_SELFTEST"),
+                         ("root-parity", "FRONTEND_CODEGEN_SELFTEST"),
+                         ("root-clear-context", "FRONTEND_CODEGEN_SELFTEST"),
+                         ("pe-operation-context", "FRONTEND_CODEGEN_SELFTEST")):
+        success = RunResult("ok", 0, f"{prefix}: passed {mode}\n", "", 0, 0)
+        host.verify_probe(success, cases[mode])
+        for invalid_probe in (replace(success, status="timeout"), replace(success, returncode=1),
+                              replace(success, stdout=""), replace(success, stderr="unexpected\n")):
+            try:
+                host.verify_probe(invalid_probe, cases[mode])
+            except ValueError:
+                pass
+            else:
+                raise AssertionError(f"{mode}: invalid host protocol accepted")
     quiet = RunResult("ok", 0, "N1_HOST_MIR: emitted valid-quiet\n",
                       "n1-host: mir functions=1 live=1\nn1-host: mir-check live=1\n"
                       "n1-host: gc-infer live=1\nn1-host: annotate live=1\n"
@@ -855,13 +903,34 @@ def test_frontend_host_protocol(tmp: Path) -> None:
     work = tmp / "host-artifacts"
     work.mkdir()
     generated = work / "backend.gen.c"
-    generated.write_text("current generated fixture", encoding="utf-8")
-    report = {"kind": host.KIND + ".build", "generated_sha256": host.sha256_file(generated), "binaries": {}}
+    generated.write_text('#include "ouro_rt.h"\nstatic ouro_v *ouro_g1(void);\n'
+                         'static ouro_v *ouro_g1(void){return 0;}\n'
+                         'int ouro_export_count(void){return 1;}\n'
+                         'const char *ouro_export_name(int i){(void)i;return "fixture";}\n'
+                         'ouro_v *ouro_export_value(int i){(void)i;return ouro_g1();}\n', encoding="utf-8")
+    assert host.BACKEND_GROUP_SIZE == 256 and "scripts/generated_c_shards.py" in host.SUPERVISOR_INPUTS
+    _sources, shards = host.build.GCS.materialize_generated_c_shards(
+        frontend_c=None, backend_c=generated, out_dir=work / "generated-c-shards", label_prefix="host-fixture",
+        backend_group_size=host.BACKEND_GROUP_SIZE, backend_export_suffix="")
+    manifest = work / "generated-c-shards/generated-c-shards.manifest.json"
+    report = {"kind": host.KIND + ".build", "generated_sha256": host.sha256_file(generated), "binaries": {},
+              "generated_c_shards": shards, "shard_manifest_sha256": host.sha256_file(manifest)}
     for name in host.HOST_MAINS:
         binary = host.executable(work, name)
         binary.write_bytes(b"current linked fixture")
         report["binaries"][name] = {"sha256": host.sha256_file(binary)}
     host.verify_artifacts(work, report)
+    for changed in (work / "generated-c-shards/backend_u__shards.h", manifest, generated):
+        original = changed.read_bytes()
+        changed.write_bytes(original + b"\n/* changed artifact */\n")
+        try:
+            host.verify_artifacts(work, report)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("changed generated host artifact accepted: " + str(changed))
+        finally:
+            changed.write_bytes(original)
     host.executable(work, "n1-host").write_bytes(b"stale producer")
     try:
         host.verify_artifacts(work, report)
@@ -1222,8 +1291,9 @@ def test_native_tool_hooks(tmp: Path) -> None:
     checker = hook(source(["compile_checked_units"]), ["compiler/driver.ouro"])
     assert "ouro_fe_compile_checked_units_clos();" in checker
     assert "ouro_wrap_" not in checker, "checker-only tools must not require a backend"
-    parser = hook(source(["cm_load_file"]), ["tools/clippy/semantic_unit.ouro"])
+    parser = hook(source(["cm_load_file", "cm_load_file_cached"]), ["tools/clippy/semantic_unit.ouro"])
     assert "ouro_wrap_quality_parse(ouro_clos(" in parser
+    assert "ouro_wrap_settled3(ouro_clos(" in parser
     assert "ouro_fe_compile_checked_units_clos" not in parser
     assert "ouro_wrap_x64_encode" not in parser
     encoder = hook(source(["x64_encode"]), ["compiler/native/x64.ouro"])
@@ -1263,6 +1333,12 @@ def test_native_tool_hooks(tmp: Path) -> None:
              "cm_load_file export value")
     rejected(source(["cm_load_file"]).replace("ouro_c10=ouro_clos(ouro_f10_,env);", "ouro_c10=0;"), (),
              "could not hook cm_load_file getter")
+    rejected(source(["cm_load_file"]), ["tools/clippy/semantic_unit.ouro"],
+             "cm_load_file_cached export name")
+    rejected(source(["cm_load_file_cached"]).replace("case 0: return ouro_g10();", ""), (),
+             "cm_load_file_cached export value")
+    rejected(source(["cm_load_file_cached"]).replace("ouro_c10=ouro_clos(ouro_f10_,env);", "ouro_c10=0;"), (),
+             "could not hook cm_load_file_cached getter")
     rejected(source(["x64_encode"]).replace("case 0: return ouro_g10();", ""), (),
              "x64_encode export value")
     rejected(source(["x64_encode"]).replace("ouro_c10=ouro_clos(ouro_f10_,env);", "ouro_c10=0;"), (),
@@ -1278,6 +1354,90 @@ def test_native_tool_hooks(tmp: Path) -> None:
                         for path in (*native.RUNTIME, "runtime/ouro_quality_scope.h"))
     for _, wrapper, _ in native.HOST_HOOKS:
         assert re.search(rf"ouro_v\s*\*\s*{re.escape(wrapper)}\s*\(ouro_v\s*\*raw\)\s*\{{", runtime), wrapper
+
+
+def test_native_emit_phases(tmp: Path) -> None:
+    """Phase completion follows acceptance; failed stages cannot publish a backend."""
+    from contextlib import redirect_stderr, redirect_stdout
+    from io import StringIO
+
+    import native_tool_build as native
+
+    units = ["dependency.ouro", "entry.ouro"]
+    prior = b"previous backend\n"
+    emitted = b"int fixture_main(void){return 0;}\n"
+    packed = emitted + b"/* uniquified */\n"
+    hooked = packed + b"/* hooked */\n"
+    complete = [(name, state) for name in ("compiler", "uniquify", "hooks", "publish")
+                for state in ("start", "done")]
+    for mode, event_count in (("success", 8), ("quiet", 0), ("compiler", 1),
+                              ("uniquify", 3), ("hooks", 5)):
+        work = tmp / ("native-emit-phases-" + mode)
+        work.mkdir()
+        generated = work / "backend.c"
+        generated.write_bytes(prior)
+        events = []
+        compiler_argv = ["fixture-compiler", units[-1], "321", "--unit", units[0], "--unit", units[1]]
+
+        def phase(name, elapsed, *, _events=events, _generated=generated):
+            assert elapsed is None or (isinstance(elapsed, float) and elapsed >= 0), (name, elapsed)
+            _events.append((name, "start" if elapsed is None else "done"))
+            expected = hooked if name == "publish" and elapsed is not None else prior
+            assert _generated.read_bytes() == expected, "phase callback preceded acceptance/publication"
+
+        def process(argv, *, _mode=mode, _work=work, _compiler_argv=compiler_argv, **options):
+            assert options["cwd"] == native.ROOT
+            if "stdout" in options:
+                assert argv == _compiler_argv and options["check"] is False
+                assert options["env"]["OURO_EMIT_IO_SHIMS"] == "1"
+                options["stdout"].write(emitted)
+                if _mode == "compiler":
+                    options["stderr"].write(b"fixture compiler failure\n")
+                return subprocess.CompletedProcess(argv, 1 if _mode == "compiler" else 0)
+            assert argv[:3] == [sys.executable, str(native.ROOT / "scripts/pack_frontend.py"),
+                                "--uniquify-only"] and options["check"] is True
+            temporary = Path(argv[3])
+            assert temporary.parent == _work and temporary.read_bytes() == emitted
+            temporary.write_bytes(packed)
+            if _mode == "uniquify":
+                raise subprocess.CalledProcessError(2, argv)
+            return subprocess.CompletedProcess(argv, 0)
+
+        def hook(temporary, observed_units, *, _generated=generated, _mode=mode):
+            assert observed_units == units and temporary.read_bytes() == packed
+            assert _generated.read_bytes() == prior
+            temporary.write_bytes(hooked)
+            if _mode == "hooks":
+                raise RuntimeError("fixture hook failure")
+
+        stdout, stderr = StringIO(), StringIO()
+        with patch.object(native.frontend, "ouro1_cmd", return_value=["fixture-compiler"]), \
+             patch.object(native.subprocess, "run", side_effect=process) as commands, \
+             patch.object(native, "hook_compile_checked_units", side_effect=hook) as hooks, \
+             patch.object(native.os, "replace", wraps=native.os.replace) as publish, \
+             redirect_stdout(stdout), redirect_stderr(stderr):
+            try:
+                if mode == "quiet":
+                    native.emit(work / "compiler", units, 321, generated)
+                else:
+                    native.emit(work / "compiler", units, 321, generated, phase_callback=phase)
+            except (RuntimeError, subprocess.CalledProcessError) as error:
+                if mode == "compiler":
+                    assert isinstance(error, RuntimeError) and "emit failed rc=1" in str(error)
+                    assert "fixture compiler failure" in str(error)
+                elif mode == "uniquify":
+                    assert isinstance(error, subprocess.CalledProcessError) and error.returncode == 2
+                else:
+                    assert mode == "hooks" and str(error) == "fixture hook failure"
+            else:
+                assert mode in ("success", "quiet"), "failed emission stage was accepted"
+            assert commands.call_count == (1 if mode == "compiler" else 2)
+            assert hooks.call_count == (0 if mode in ("compiler", "uniquify") else 1)
+            assert publish.call_count == (1 if mode in ("success", "quiet") else 0)
+        assert events == complete[:event_count]
+        assert stdout.getvalue() == stderr.getvalue() == "", "native emit lost its default-quiet contract"
+        assert generated.read_bytes() == (hooked if mode in ("success", "quiet") else prior)
+        assert not list(work.glob("emit.*.c")), "failed or published emission retained a temporary backend"
 
 
 def test_windows_quality_manifest_protocol(tmp: Path) -> None:
@@ -1721,6 +1881,44 @@ def test_memory_preparation_failure(tmp: Path) -> None:
         assert not (out / "memory-report.json").exists()
 
 
+def test_memory_preparation_outputs(tmp: Path) -> None:
+    import memory_budget_suite as memory
+    from ourosmith.limits import RunResult
+
+    selected = [case for case in memory.CASES if case.label in {
+        "tool-emission-fmt", "tool-emission-analyze", "formatter-suite",
+    }]
+    configured = tmp / "configured-tools"
+    report_out = tmp / "memory-preparation-reports"
+    success = RunResult("ok", 0, "prepared", "", 1, 1)
+    with patch.object(memory, "ROOT", tmp), \
+         patch.dict(os.environ, {"OURO_C_BUILD_DIR": str(configured),
+                                 "OURO1_COMPILER": str(configured / "ouro1")}), \
+         patch.object(memory, "run_limited", return_value=success) as prepare:
+        report_out.mkdir()
+        reports = memory.prepare_tools(selected, report_out)
+    commands = [call.args[0] for call in prepare.call_args_list]
+    outputs = {(command[2], Path(command[3])) for command in commands}
+    assert outputs == {
+        ("tools/fmt.ouro", configured / "ouro-fmt"),
+        ("tools/analyze/main.ouro", configured / "ouro-analyze"),
+        ("tests/quality_source_write_driver.ouro", configured / "quality-source-write"),
+        ("tools/fmt.ouro", tmp / "_build/memory/bin/ouro-fmt"),
+        ("tools/analyze/main.ouro", tmp / "_build/memory/bin/ouro-analyze"),
+        ("tools/fmt.ouro", tmp / "_build/memory/fmt_suite/ouro-fmt"),
+        ("tests/quality_source_write_driver.ouro", tmp / "_build/memory/fmt_suite/quality-source-write"),
+    }
+    assert all(command[4:] == ["--compiler", str(configured / "ouro1")] for command in commands)
+    assert all(call.kwargs["timeout_s"] == 900 and call.kwargs["memory_mb"] == memory.BUILD_MEMORY_MB
+               for call in prepare.call_args_list)
+    assert len({report["log"] for report in reports}) == len(reports)
+    for case in selected[:2]:
+        with patch.object(memory, "ROOT", tmp), \
+             patch.object(memory, "run_limited", return_value=success) as prepare:
+            memory.prepare_tools([case], report_out)
+        assert any(Path(call.args[0][3]) == tmp / case.cmd[3] for call in prepare.call_args_list)
+
+
 def test_source_replace_report_protocol(tmp: Path) -> None:
     import fs_replace_suite as native
 
@@ -1768,9 +1966,10 @@ def main() -> int:
     test_seal_parse()
     test_host_stack_link_flags()
     with tempfile.TemporaryDirectory(prefix="ouro-build-suite-") as d:
-        tmp = Path(d)
+        tmp = Path(d).resolve()
         test_clang_bracket_depth(tmp)
         test_memory_preparation_failure(tmp)
+        test_memory_preparation_outputs(tmp)
         test_collect_build_protocol(tmp)
         test_collected_unit_arguments(tmp)
         test_build_tool_caller_paths(tmp)
@@ -1783,6 +1982,7 @@ def main() -> int:
         test_frontend_native_fs_create_protocol(tmp)
         test_destructive_path_policy(tmp)
         test_native_tool_hooks(tmp)
+        test_native_emit_phases(tmp)
         test_windows_quality_manifest_protocol(tmp)
         test_frontend_host_protocol(tmp)
         test_frontend_native_process_protocol(tmp)

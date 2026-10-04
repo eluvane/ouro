@@ -4,7 +4,8 @@
 
 import "lint_worker.ouro",
   "../compiler/base.ouro",
-  "../std/collections.ouro";
+  "../std/collections.ouro",
+  "../std/text.ouro";
 
 -- Native lint already blocks on every emitted finding. --deny makes that
 -- contract explicit; it does not downgrade diagnostics or select a Python
@@ -60,7 +61,9 @@ inductive LintArgError : Type :=
   | LintMissingValue : String -> LintArgError
   | LintUnknownProfile : String -> LintArgError
   | LintUnknownFamily : String -> LintArgError
-  | LintMissingFamily : LintArgError;
+  | LintMissingFamily : LintArgError
+  | LintInvalidShard : String -> LintArgError
+  | LintRepeatedShard : LintArgError;
 
 def lint_arg_error_message (e : LintArgError) : String :=
     match e with
@@ -69,51 +72,122 @@ def lint_arg_error_message (e : LintArgError) : String :=
     | LintUnknownProfile name => concat "unknown lint profile: " name
     | LintUnknownFamily name => concat "unknown lint family: " name
     | LintMissingFamily => "missing lint family"
+    | LintInvalidShard value => concat
+        "invalid lint shard (expected INDEX/TOTAL, 1 <= INDEX <= TOTAL <= 128): " value
+    | LintRepeatedShard => "repeated lint option: --shard"
+    end;
+
+inductive LintShard : Type :=
+  | MkLintShard : Nat -> Nat -> LintShard;
+
+def lint_shard_nat (value : String) : Maybe Nat :=
+    match andb(leb_nat(str_len value, 3), str_is_digits value) with
+    | False => Nothing Nat
+    | True => str_parse_nat value
+    end;
+
+def lint_parse_shard (value : String) : Either LintArgError LintShard :=
+    let invalid : Either LintArgError LintShard :=
+      Left LintArgError LintShard (LintInvalidShard value) in
+    match leb_nat(str_len value, 7) with
+    | False => invalid
+    | True => match str_split_first value "/" with
+      | Nothing => invalid
+      | Just parts => match parts with
+        | MkPair index_text total_text => match lint_shard_nat index_text with
+          | Nothing => invalid
+          | Just index => match lint_shard_nat total_text with
+            | Nothing => invalid
+            | Just total => match andb (notb (eq_nat index Z))
+                (andb(leb_nat index total, leb_nat total 128)) with
+              | False => invalid
+              | True => Right LintArgError LintShard (MkLintShard index total)
+              end
+            end
+          end
+        end
+      end
+    end;
+
+-- Select after the complete checked inventory; each shard retains file order.
+def lint_shard_paths (shard : LintShard) (files : List String) : List String :=
+    match shard with
+    | MkLintShard index total =>
+        let wanted : Nat := sub index 1 in
+        (fix select (paths : List String) (position : Nat) : List String :=
+          match paths with
+          | Nil => Nil String
+          | Cons path rest =>
+              let next : Nat := match eq_nat (S position) total with
+                | True => Z | False => S position end in
+              let remaining : List String := select rest next in
+              match eq_nat position wanted with
+              | True => Cons String path remaining
+              | False => remaining
+              end
+          end) files Z
+    end;
+
+def lint_shard_inventory (shard : Maybe LintShard)
+    (inventory : Either QualityInputError (List String))
+    : Either QualityInputError (List String) :=
+    match inventory with
+    | Left e => Left QualityInputError (List String) e
+    | Right files => match shard with
+      | Nothing => Right QualityInputError (List String) files
+      | Just selected => match lint_shard_paths selected files with
+        | Nil => Left QualityInputError (List String) QualityNoSources
+        | Cons path rest => Right QualityInputError (List String) (Cons String path rest)
+        end
+      end
     end;
 
 inductive LintRequest : Type :=
-  | MkLintRequest : String -> List LintFamily -> List String -> LintRequest;
+  | MkLintRequest : String -> List LintFamily -> List String -> Maybe LintShard -> LintRequest;
 
 def lint_req_profile (r : LintRequest) : String :=
-    match r with | MkLintRequest p _ _ => p end;
+    match r with | MkLintRequest p _ _ _ => p end;
 
 def lint_req_families (r : LintRequest) : List LintFamily :=
-    match r with | MkLintRequest _ fs _ => fs end;
+    match r with | MkLintRequest _ fs _ _ => fs end;
 
 def lint_req_roots (r : LintRequest) : List String :=
-    match r with | MkLintRequest _ _ xs => xs end;
+    match r with | MkLintRequest _ _ xs _ => xs end;
+
+def lint_req_shard (r : LintRequest) : Maybe LintShard :=
+    match r with | MkLintRequest _ _ _ shard => shard end;
 
 def lint_finish_parse (profile : String) (explicit : Bool)
-    (families : List LintFamily) (rev : List String)
+    (families : List LintFamily) (rev : List String) (shard : Maybe LintShard)
     : Either LintArgError LintRequest :=
     match explicit with
     | False => Right LintArgError LintRequest
-        (MkLintRequest profile lint_all_families (reverse_lin String rev))
+        (MkLintRequest profile lint_all_families (reverse_lin String rev) shard)
     | True => match families with
       | Nil => Left LintArgError LintRequest LintMissingFamily
       | Cons _ _ => Right LintArgError LintRequest
-          (MkLintRequest profile families (reverse_lin String rev))
+          (MkLintRequest profile families (reverse_lin String rev) shard)
       end
     end;
 
 def lint_parse_args : List String -> String -> Bool -> List LintFamily
-    -> List String -> Either LintArgError LintRequest :=
+    -> List String -> Maybe LintShard -> Either LintArgError LintRequest :=
   fix go (args : List String) (profile : String) (explicit : Bool)
-      (families : List LintFamily) (rev : List String)
+      (families : List LintFamily) (rev : List String) (shard : Maybe LintShard)
       : Either LintArgError LintRequest :=
     match args with
-    | Nil => lint_finish_parse profile explicit families rev
+    | Nil => lint_finish_parse profile explicit families rev shard
     | Cons arg rest =>
         match prim_string_eq arg "--" with
-        | True => match lint_finish_parse profile explicit families rev with
+        | True => match lint_finish_parse profile explicit families rev shard with
           | Left e => Left LintArgError LintRequest e
           | Right req => Right LintArgError LintRequest
               (MkLintRequest (lint_req_profile req) (lint_req_families req)
-                (append String (lint_req_roots req) rest))
+                (append String (lint_req_roots req) rest) (lint_req_shard req))
           end
         | False =>
             match prim_string_eq arg "--deny" with
-            | True => go rest profile explicit families rev
+            | True => go rest profile explicit families rev shard
             | False =>
                 match prim_string_eq arg "--profile" with
                 | True => match rest with
@@ -124,7 +198,7 @@ def lint_parse_args : List String -> String -> Bool -> List LintFamily
                       | S _ => match lint_known_profile value with
                         | False => Left LintArgError LintRequest
                             (LintUnknownProfile value)
-                        | True => go more value explicit families rev
+                        | True => go more value explicit families rev shard
                         end
                       end
                   end
@@ -139,16 +213,31 @@ def lint_parse_args : List String -> String -> Bool -> List LintFamily
                             | Nothing => Left LintArgError LintRequest
                                 (LintUnknownFamily value)
                             | Just fam => go more profile True
-                                (lint_add_family families fam) rev
+                                (lint_add_family families fam) rev shard
                             end
                           end
                       end
                     | False =>
-                        match prim_string_starts arg "--" with
-                        | True => Left LintArgError LintRequest
-                            (LintUnknownOption arg)
-                        | False => go rest profile explicit families
-                            (Cons String arg rev)
+                        match prim_string_eq arg "--shard" with
+                        | True => match shard with
+                          | Just _ => Left LintArgError LintRequest LintRepeatedShard
+                          | Nothing => match rest with
+                            | Nil => Left LintArgError LintRequest (LintMissingValue arg)
+                            | Cons value more => match str_null value with
+                              | True => Left LintArgError LintRequest (LintMissingValue arg)
+                              | False => match lint_parse_shard value with
+                                | Left e => Left LintArgError LintRequest e
+                                | Right selected => go more profile explicit families rev
+                                    (Just LintShard selected)
+                                end
+                              end
+                            end
+                          end
+                        | False => match prim_string_starts arg "--" with
+                          | True => Left LintArgError LintRequest (LintUnknownOption arg)
+                          | False => go rest profile explicit families
+                              (Cons String arg rev) shard
+                          end
                         end
                     end
                 end
@@ -343,7 +432,7 @@ def lint_family_semantic (wanted : Bool) (exe : Maybe String)
 
 def start (argv : List String) : IO Unit :=
     match lint_parse_args (tail String argv) "project" False
-        (Nil LintFamily) (Nil String) with
+        (Nil LintFamily) (Nil String) (Nothing LintShard) with
     | Left e =>
         do eprintln (lint_arg_error_message e);
            exit 2
@@ -359,7 +448,7 @@ def start (argv : List String) : IO Unit :=
         let want_style : Bool := lint_has_family families LintFamStyle in
         let want_semantic : Bool := lint_has_family families LintFamSemantic in
         do let! inventory := gather roots;
-           match inventory with
+           match lint_shard_inventory (lint_req_shard req) inventory with
            | Left e =>
                do eprintln (quality_input_message e);
                   exit 2
@@ -640,7 +729,8 @@ def lint_selective_transitive_contracts : Bool :=
 
 def lint_parse_ok (args : List String) (profile : String)
     (families : List String) (roots : List String) : Bool :=
-    match lint_parse_args args "project" False (Nil LintFamily) (Nil String) with
+    match lint_parse_args args "project" False (Nil LintFamily) (Nil String)
+        (Nothing LintShard) with
     | Left _ => False
     | Right req =>
         andb (prim_string_eq(lint_req_profile req, profile))
@@ -649,11 +739,13 @@ def lint_parse_ok (args : List String) (profile : String)
             (andb (all LintFamily (fun (f : LintFamily) =>
                 elem String prim_string_eq (lint_family_name f) families)
               (lint_req_families req))
-              (eqNat(length(String, lint_req_roots req), length String roots))))
+              (andb (list_eq String prim_string_eq (lint_req_roots req) roots)
+                (match lint_req_shard req with | Nothing => True | Just _ => False end))))
     end;
 
 def lint_parse_err (args : List String) (needle : String) : Bool :=
-    match lint_parse_args args "project" False (Nil LintFamily) (Nil String) with
+    match lint_parse_args args "project" False (Nil LintFamily) (Nil String)
+        (Nothing LintShard) with
     | Right _ => False
     | Left e => prim_string_contains(lint_arg_error_message e, needle)
     end;
@@ -671,6 +763,70 @@ def lint_parse_contracts : Bool :=
                   "unknown lint profile")
                 (lint_parse_err (["--family", "frontend"] : List String)
                   "unknown lint family"))))));
+
+def lint_shard_request_ok (value : String) (index : Nat) (total : Nat) : Bool :=
+    match lint_parse_args ["--shard", value, "--deny", "std"] "project" False
+        (Nil LintFamily) (Nil String) (Nothing LintShard) with
+    | Left _ => False
+    | Right req => match lint_req_shard req with
+      | Nothing => False
+      | Just shard => match shard with
+        | MkLintShard actual_index actual_total => all Bool (fun (passed : Bool) => passed)
+            [ eq_nat actual_index index, eq_nat actual_total total
+            , str_eq(lint_req_profile req, "project")
+            , list_eq LintFamily lint_family_eq (lint_req_families req) lint_all_families
+            , list_eq String str_eq (lint_req_roots req) ["std"] ]
+        end
+      end
+    end;
+
+def lint_shard_inventory_ok (shard : Maybe LintShard) (files : List String)
+    (expected : List String) : Bool :=
+    match lint_shard_inventory shard (Right QualityInputError (List String) files) with
+    | Left _ => False
+    | Right actual => list_eq String str_eq actual expected
+    end;
+
+def lint_shard_input_error_ok (inventory : Either QualityInputError (List String))
+    (expected : QualityInputError) : Bool :=
+    match lint_shard_inventory (Just LintShard (MkLintShard 4 4)) inventory with
+    | Right _ => False
+    | Left actual => str_eq(quality_input_message actual, quality_input_message expected)
+    end;
+
+def lint_shard_contracts : Bool :=
+    let paths : List String := ["a", "b", "c", "d", "e", "f", "g", "h", "i"] in
+    let shards : List (List String) := map Nat (List String)
+      (fun (index : Nat) => lint_shard_paths (MkLintShard index 4) paths) [1, 2, 3, 4] in
+    let selected : List String := flatten String shards in
+    let sizes : List Nat := map (List String) Nat (length String) shards in
+    all Bool (fun (passed : Bool) => passed)
+      [ lint_shard_request_ok "1/4" 1 4, lint_shard_request_ok "4/4" 4 4
+      , lint_shard_request_ok "128/128" 128 128
+      , lint_parse_err ["--shard"] "missing value"
+      , lint_parse_err ["--shard", ""] "missing value"
+      , lint_parse_err ["--shard", "1/4", "--shard", "2/4"] "repeated lint option"
+      , lint_parse_ok ["--", "--shard", "1/4"] "project"
+          ["language", "style", "semantic"] ["--shard", "1/4"]
+      , all String (fun (value : String) =>
+          lint_parse_err ["--shard", value] "invalid lint shard")
+          ["0/4", "1/0", "5/4", "1/129", "1", "1/4/1", "1/", "/4",
+           "-1/4", "a/4", "1000/4", "1/1000", " 1/4", "1/4 "]
+      , lint_shard_inventory_ok (Nothing LintShard) paths paths
+      , lint_shard_inventory_ok (Just LintShard (MkLintShard 1 1)) paths paths
+      , list_eq (List String) (list_eq String str_eq) shards
+          [["a", "e", "i"], ["b", "f"], ["c", "g"], ["d", "h"]]
+      , eq_nat(length String selected, length String paths)
+      , all String (fun (path : String) =>
+          eq_nat(count_if String (str_eq path) selected, 1)) paths
+      , all Nat (fun (left_size : Nat) => all Nat (fun (right_size : Nat) =>
+          leb_nat left_size (S right_size)) sizes) sizes
+      , lint_shard_input_error_ok
+          (Right QualityInputError (List String) ["a"]) QualityNoSources
+      , lint_shard_input_error_ok
+          (Left QualityInputError (List String) (QualityInvalidInput "unselected.ouro"))
+          (QualityInvalidInput "unselected.ouro")
+      ];
 
 def lint_semantic_contracts : Bool :=
     let paths : List String := ["std/data.ouro", "std/practical.ouro", "compiler/parser_parse.ouro"] in
@@ -705,6 +861,7 @@ def lint_process_contracts : Bool :=
       , lint_selective_contracts
       , lint_selective_transitive_contracts
       , lint_parse_contracts
+      , lint_shard_contracts
       , lint_semantic_contracts
       ];
 

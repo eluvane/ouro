@@ -264,15 +264,24 @@ The build driver configures the profile, parallelism, C compiler, optimization,
 build and cache directories, optional `ccache`, verbosity, and reproducibility
 mode. `--c-only`, `--frontend`, `--dune`, and the Dune cache flags are retired; plain `build`
 selects the current C producer without discovering OCaml tools. Run `config show` to see the effective values.
-The repository default is ten workers (`Ouro.seal` `build.jobs`, CI
-`OURO_JOBS`, and the build-driver fallback). Override it with `--jobs` or
-`OURO_JOBS`.
+The repository and build-driver default is ten workers. Override it with
+`--jobs` or `OURO_JOBS`; hosted PR jobs set `OURO_JOBS=2`.
 
-The transitional compiler bootstrap runs one worker per phase with a 3 GiB
-memory limit and a 900-second timeout per command. Windows limits shared
-process-tree commit; POSIX applies an inherited address-space limit per process
-except on Darwin, which rejects finite `RLIMIT_AS`.
-Tool and stage-loop builds retain their configured worker counts.
+The transitional compiler bootstrap keeps C0, bridge, P1 and P2 in order.
+Inside each stage, C builds and split frontend generation use the configured
+worker count, capped at two. `auto` uses the build driver's CPU-count selection,
+resolved once and frozen for all bootstrap workers;
+`--jobs 1` retains serial execution. The frontend keeps its existing memory-aware
+pool throttling. Strict source checks, acceptance laws and stage barriers remain
+serial. The bootstrap report's `workers` field records the selected ceiling,
+not measured utilization.
+
+Each command retains its 3 GiB memory limit and 900-second timeout. Windows
+limits shared process-tree commit; POSIX applies an inherited address-space
+limit per process except on Darwin, which rejects finite `RLIMIT_AS`.
+Parallel POSIX children can therefore use more aggregate memory; the per-process
+limit is not a shared 3 GiB budget. Standalone tool and stage-loop builds retain
+their configured worker counts.
 
 ## C bootstrap
 
@@ -384,6 +393,9 @@ artifact emission instead of being accepted as a valid prefix.
 `scripts/frontend_regen.py` regenerates frontend C from Ouro compiler sources.
 Its cache keys cover the seed compiler, source and import contents, generator
 and helper versions, fuel, and output packing inputs.
+Each cached translation unit and packed frontend also requires a matching
+input-key and output-hash receipt. Missing, malformed, or stale receipts cause
+regeneration; a cached translation unit must retain its module export table.
 
 A regeneration writes a JSON report under `_build/` with cache decisions,
 timings, and output hashes. The split frontend includes the declaration-checker
@@ -482,10 +494,19 @@ bootstrap fail its historical input check. A promotion therefore needs a
 separately reviewed, coordinated recovery-input update with matching runtime
 and bundle metadata. The stage-loop command does not regenerate that bundle.
 
+The drift gate verifies the committed stage0 hash manifest and the historical
+bootstrap inputs. Its regeneration reference is the current P2 frontend and
+backend C, whose installed receipt must match the current source and host
+toolchain and retain the complete P1/P2 equality evidence. Fresh frontend
+regeneration and the stage-loop fixpoint must reproduce that verified pair.
+Missing, stale, or changed evidence fails the gate. The reference stays in the
+configured bootstrap directory; regeneration does not update committed stage0.
+
 Promotion updates the committed artifacts and
 `docs/generated_artifact_hashes.sha256`. Windows staging C may use CRLF; the
 promotion writer normalizes it to LF, so drift checks compare promotion-normalized
-bytes as well as raw staging hashes. Hand editing a generated stage0 file breaks
+bytes for both the regenerated output and its P2 reference, and record raw staging
+hashes. Hand editing a generated stage0 file breaks
 the reproducibility model.
 
 [CI](ci.md#local-profiles) owns the heavier stage-loop profile for compiler,
@@ -558,7 +579,9 @@ lifetime bug, not extra acceptance. Managed lowering also shares one canonical
 lookup environment across runtime helper resolution, raw lowering, and global
 checks. Each helper still checks its body and complete normalized signature.
 Native lowering's declaration replay uses the same per-declaration lifetime
-callback as initial checking. The public `lower_recheck_program` entry retains
+callback as initial checking. Each call isolates its work banks, then copies new
+result cells into the restored caller allocator while sharing caller-owned terms
+and the earlier signature. The public `lower_recheck_program` entry retains
 the exact checker, complete metadata/body comparison, and typed failures.
 The temporary N1 host releases prepare-phase storage and each raw contract's
 lowering temporaries while retaining ordered results and the first typed error.
@@ -615,6 +638,11 @@ The memory suite first builds the selected native tools with the separate
 `preparation.json`. Compilation failure blocks the suite. Existing execution
 RSS limits and wrapper-install cases then run unchanged; a cold native emitter
 is not charged to a formatter or analyzer execution budget.
+Preparation includes the measured formatter/analyzer install destinations and
+the formatter suite's own images, warming the checked content cache even when
+only installed tools were imported. Selecting one of those install cases still
+prepares its actual destination; the report directory does not move that target.
+Disabling the cache still forces fresh compilation and retains the same limits.
 
 The import collector jumps between lexical candidates in ordinary source to
 avoid retaining per-byte traversal temporaries across an entire dependency

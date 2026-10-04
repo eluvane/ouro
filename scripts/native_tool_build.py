@@ -14,10 +14,14 @@ import tempfile
 import time
 from contextlib import nullcontext
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import frontend_regen as frontend
 import ouro_build as build
 from repo_support import configure_native_stack, hash_json, read_json_object_or_none, sha256_file, write_json_atomic
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 ROOT = Path(__file__).resolve().parents[1]
 KIND = "ouro.native-tool-build.v1"
@@ -57,9 +61,11 @@ HOST_HOOKS = (
     ("cg_s_epoch_request", "ouro_wrap_quality_io", ("tools/clippy/session.ouro",)),
     ("cg_s_sample_heap", "ouro_wrap_quality_heap", ("tools/clippy/session.ouro",)),
     ("cm_load_file", "ouro_wrap_quality_parse", ("tools/clippy/semantic_unit.ouro",)),
+    ("cm_load_file_cached", "ouro_wrap_settled3", ("tools/clippy/semantic_unit.ouro",)),
     ("cm_prepare_expanded", "ouro_wrap_quality_pure", ("tools/clippy/structural_frontend.ouro",)),
     ("cm_lex_expanded", "ouro_wrap_quality_pure", ("tools/clippy/structural_frontend.ouro",)),
     ("next_import_token", "ouro_wrap_import_token", ("compiler/lexer.ouro",)),
+    ("next_import_token_indexed", "ouro_wrap_import_token", ("compiler/lexer.ouro",)),
     ("span_expr", "ouro_wrap_settled3", ("compiler/source_spans.ouro",)),
     # Import preprocessing rewrites the whole file. One lint cone keeps every
     # rewrite unless this entry returns only the selected names.
@@ -91,6 +97,7 @@ HOST_HOOKS = (
     ("mir_live_summary_step", "ouro_wrap_mir_live_summary_step", ("compiler/native/mir_live.ouro",)),
     ("codegen_parts", "ouro_wrap_codegen_parts", ("compiler/native/codegen_model.ouro",)),
     ("codegen_live_instructions", "ouro_wrap_codegen_live_instructions", ("compiler/native/codegen_ops.ouro",)),
+    ("codegen_clear_dead_roots", "ouro_wrap_codegen_clear_dead_roots", ("compiler/native/codegen_roots.ouro",)),
     ("codegen_instruction", "ouro_wrap_codegen_instruction", ("compiler/native/codegen_ops.ouro",)),
     ("codegen_block", "ouro_wrap_codegen_block", ("compiler/native/codegen_ops.ouro",)),
     ("codegen_body", "ouro_wrap_codegen_body", ("compiler/native/codegen.ouro",)),
@@ -99,6 +106,10 @@ HOST_HOOKS = (
     ("mir_gc_check", "ouro_wrap_mir_gc_check", ("compiler/native/mir_gc.ouro",)),
     ("pe_run_byte_check", "ouro_wrap_pe_run_byte_check", ("compiler/native/pe_model.ouro",)),
     ("pe_plan_fixups", "ouro_wrap_pe_plan_fixups", ("compiler/native/pe_fixups.ouro",)),
+    ("pe_apply_patches", "ouro_wrap_pe_apply_patches", ("compiler/native/pe_fixups.ouro",)),
+    ("pe_resolve_fixup_indexed_with", "ouro_wrap_pe_resolve_fixup_indexed", ("compiler/native/pe_fixups.ouro",)),
+    ("pe_function_scan", "ouro_wrap_pe_function_scan", ("compiler/native/pe_unwind.ouro",)),
+    ("pe_word32", "ouro_wrap_pe_word32", ("compiler/native/pe_model.ouro",)),
 )
 
 
@@ -316,7 +327,8 @@ def complete_binary(binary: Path, metadata: Path, key: str) -> bool:
         return False
 
 
-def emit(compiler: Path, units: list[str], fuel: int, generated: Path) -> None:
+def emit(compiler: Path, units: list[str], fuel: int, generated: Path, *,
+         phase_callback: Callable[[str, float | None], None] | None = None) -> None:
     token = f"{os.getpid()}.{time.time_ns()}"
     temporary = generated.with_name(f"emit.{token}.c")
     error_log = generated.with_name(f"emit.{token}.err")
@@ -325,15 +337,33 @@ def emit(compiler: Path, units: list[str], fuel: int, generated: Path) -> None:
         argv.extend(("--unit", unit))
     env = dict(os.environ, OURO_EMIT_IO_SHIMS="1")
     env["WSLENV"] = (env.get("WSLENV", "") + ":OURO_EMIT_IO_SHIMS").lstrip(":")
+
+    def start_phase(name: str) -> float:
+        if phase_callback is not None:
+            phase_callback(name, None)
+        return time.perf_counter()
+
+    def finish_phase(name: str, started: float) -> None:
+        if phase_callback is not None:
+            phase_callback(name, time.perf_counter() - started)
+
     try:
+        started = start_phase("compiler")
         with temporary.open("wb") as output, error_log.open("wb") as errors:
             result = subprocess.run(argv, cwd=ROOT, env=env, stdout=output, stderr=errors, check=False)
         if result.returncode != 0 or temporary.stat().st_size == 0:
             raise RuntimeError(f"emit failed rc={result.returncode}: {error_log.read_text(encoding='utf-8', errors='replace')}")
+        finish_phase("compiler", started)
+        started = start_phase("uniquify")
         subprocess.run([sys.executable, str(ROOT / "scripts/pack_frontend.py"), "--uniquify-only", str(temporary)],
                        cwd=ROOT, check=True)
+        finish_phase("uniquify", started)
+        started = start_phase("hooks")
         hook_compile_checked_units(temporary, units)
+        finish_phase("hooks", started)
+        started = start_phase("publish")
         os.replace(temporary, generated)
+        finish_phase("publish", started)
     finally:
         temporary.unlink(missing_ok=True)
 

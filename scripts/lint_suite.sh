@@ -3,6 +3,38 @@
 # split modules so one unit never imports both std/json and the compiler
 # frontend. Content-addressed harvest reuse lives in the lint/clippy workers.
 set -eu
+phase=all
+shard=
+case "$#" in
+0) ;;
+1)
+	case "$1" in
+	--phase=all|--phase=fixtures|--phase=production|--phase=clippy) phase=${1#--phase=} ;;
+	*)
+		printf '%s\n' 'usage: lint_suite.sh [--phase=all|fixtures|production|clippy] [--shard=1/4|2/4|3/4|4/4]' >&2
+		exit 2
+		;;
+	esac
+	;;
+2)
+	if [ "$1" != --phase=production ]; then
+		printf '%s\n' 'usage: lint_suite.sh [--phase=all|fixtures|production|clippy] [--shard=1/4|2/4|3/4|4/4]' >&2
+		exit 2
+	fi
+	phase=production
+	case "$2" in
+	--shard=1/4|--shard=2/4|--shard=3/4|--shard=4/4) shard=${2#--shard=} ;;
+	*)
+		printf '%s\n' 'usage: lint_suite.sh [--phase=all|fixtures|production|clippy] [--shard=1/4|2/4|3/4|4/4]' >&2
+		exit 2
+		;;
+	esac
+	;;
+*)
+	printf '%s\n' 'usage: lint_suite.sh [--phase=all|fixtures|production|clippy] [--shard=1/4|2/4|3/4|4/4]' >&2
+	exit 2
+	;;
+esac
 ROOT=$(CDPATH='' cd "$(dirname "$0")/.." && pwd)
 cd "$ROOT"
 ulimit -s unlimited 2>/dev/null || true
@@ -13,9 +45,11 @@ if [ -z "${PYTHON:-}" ]; then
 	exit 127
 fi
 
-"$PYTHON" "$ROOT/scripts/tool_preparation_suite.py"
-"$PYTHON" "$ROOT/scripts/bench_suite.py" --quality-selftest
-"$PYTHON" "$ROOT/tests/clippy_semantic/session_protocol.py" --selftest
+if [ "$phase" = all ] || [ "$phase" = fixtures ]; then
+	"$PYTHON" "$ROOT/scripts/tool_preparation_suite.py"
+	"$PYTHON" "$ROOT/scripts/bench_suite.py" --quality-selftest
+	"$PYTHON" "$ROOT/tests/clippy_semantic/session_protocol.py" --selftest
+fi
 
 BIN="${OURO_C_BUILD_DIR:-_build/c}/ouro-lint"
 # The builder checks the complete source/compiler/build receipt. A short mtime
@@ -32,9 +66,14 @@ semantic_session="$out/clippy-session-laws"
 semantic_wire="$out/clippy-session-wire-laws"
 session_worker="$out/ouro-clippy-session"
 pkg="$out/ouro-pkg"
+if [ "$phase" = all ] || [ "$phase" = fixtures ]; then
 # Bootstrap above remains the compiler owner. Prepare independent fixture
 # tools in one host process; every binary retains its full content check.
 # Execution/assertion order and writable fixture isolation stay unchanged.
+set --
+if [ "$phase" = all ]; then
+	set -- --tool tools/pkg/main.ouro "$pkg"
+fi
 "$PYTHON" "$ROOT/scripts/native_tool_build.py" \
 	--compiler "${OURO_C_BUILD_DIR:-_build/c}/ouro1" \
 	--batch-report "$out/tool-preparation.json" \
@@ -44,7 +83,15 @@ pkg="$out/ouro-pkg"
 	--tool tests/clippy_semantic/session.ouro "$semantic_session" \
 	--tool tests/clippy_semantic/session_wire.ouro "$semantic_wire" \
 	--tool tools/clippy/structural_main.ouro "$session_worker" \
-	--tool tools/pkg/main.ouro "$pkg"
+	"$@"
+elif [ "$phase" = production ]; then
+	"$PYTHON" "$ROOT/scripts/native_tool_build.py" \
+		--compiler "${OURO_C_BUILD_DIR:-_build/c}/ouro1" \
+		--batch-report "$out/tool-preparation.json" \
+		--tool tools/pkg/main.ouro "$pkg"
+fi
+
+if [ "$phase" = all ] || [ "$phase" = fixtures ]; then
 if [ ! -x "$quality_inputs" ] && [ -x "${quality_inputs}.exe" ]; then
 	quality_inputs="${quality_inputs}.exe"
 fi
@@ -169,6 +216,10 @@ grep -F 'unknown lint option' "$out/unknown-option.err" >/dev/null
 
 # Import scanning must preserve the root lexer diagnostic in both worker modes.
 printf '%s\n' 'def text : String := "unterminated' >"$boundary/lex-malformed.ouro"
+lex_diagnostic_path="$boundary/lex-malformed.ouro"
+case "$(uname -s 2>/dev/null || echo unknown)" in
+MINGW*|MSYS*|CYGWIN*|Windows_NT*) lex_diagnostic_path=$(cygpath -m "$lex_diagnostic_path") ;;
+esac
 for mode in single-file batch-files; do
 	set +e
 	"$BIN" "--$mode" "$boundary/lex-malformed.ouro" \
@@ -177,7 +228,7 @@ for mode in single-file batch-files; do
 	set -e
 	test "$lex_status" -eq 1
 	test ! -s "$out/lex-$mode.err"
-	test "$(tr -d '\r' <"$out/lex-$mode.out")" = "$boundary/lex-malformed.ouro: lex-malformed"
+	test "$(tr -d '\r' <"$out/lex-$mode.out")" = "$lex_diagnostic_path: lex-malformed"
 done
 
 # Directory inventory, child argv and diagnostic locations must all retain
@@ -311,7 +362,9 @@ test "$(sed -n '2p' "$session_dir/transitive-ordinary-bad.out")" = error
 grep -F 'unresolved executable declaration: Missing' "$session_dir/transitive-ordinary-bad.out" >/dev/null
 test "$(sed -n '2p' "$session_dir/transitive-missing.out")" = error
 grep -F 'expected a regular quality source file' "$session_dir/transitive-missing.out" >/dev/null
+fi
 
+if [ "$phase" = all ] || [ "$phase" = production ]; then
 echo "=== native lint production sources ==="
 # Only the package sample needs a writable snapshot: `pkg install` vendors
 # into _ouro_pkgs/. Do not copy std/compiler/tools/samples/runtime; lint the
@@ -341,9 +394,17 @@ done
 # One driver: language, proven style, and semantic Clippy. Sequential
 # family dispatch keeps json and the compiler frontend in separate
 # processes. Do not raise the 8 GiB parent / 3072 MiB Clippy caps.
-sh "$ROOT/scripts/ouro1.sh" lint --deny std compiler tools "$@" \
-	"$production/samples/pkg" samples/bench/core_suite.ouro
+if [ -n "$shard" ]; then
+	set -- --shard "$shard" std compiler tools "$@" \
+		"$production/samples/pkg" samples/bench/core_suite.ouro
+else
+	set -- std compiler tools "$@" \
+		"$production/samples/pkg" samples/bench/core_suite.ouro
+fi
+sh "$ROOT/scripts/ouro1.sh" lint --deny "$@"
+fi
 
+if [ "$phase" = all ] || [ "$phase" = clippy ]; then
 echo "=== clippy-grade native compiler check ==="
 # Check the split Clippy units. Grade and structural cones stay separate so
 # one unit never imports both std/json and the compiler frontend. Do not
@@ -371,5 +432,14 @@ done
 
 echo "=== clippy-grade deny firewall fixtures ==="
 "$PYTHON" "$ROOT/scripts/clippy_grade_suite.py" --out "$out/clippy_grade"
+fi
 
-echo "lint_suite: OK"
+if [ "$phase" = all ]; then
+	echo "lint_suite: OK"
+else
+	if [ -n "$shard" ]; then
+		echo "lint_suite: OK phase=$phase shard=$shard"
+	else
+		echo "lint_suite: OK phase=$phase"
+	fi
+fi

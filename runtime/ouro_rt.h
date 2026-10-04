@@ -168,6 +168,7 @@ ouro_v *ouro_fe_last_intern(void);
 ouro_v *ouro_fe_checked_dump(ouro_v *fuel);
 ouro_v *ouro_fe_checked_type_globals(ouro_v *fuel);
 ouro_v *ouro_fe_checked_c_shims(void);
+ouro_v *ouro_fe_checked_emission_cores(ouro_v *fuel);
 /* Explicit C ownership boundary: discards phase storage and replaces both
    permanent banks. The caller must retain unrelated data outside those banks.
    The curried entry instead isolates work storage for ordinary Ouro callers.

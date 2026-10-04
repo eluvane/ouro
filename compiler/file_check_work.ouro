@@ -127,3 +127,123 @@ def check_input_normalize_guard (A : Type) (pending : List CheckInputWork)
     (run : Unit -> NormalizeResult A) : NormalizeResult A :=
     match check_input_within_limit pending with
     | False => NormalizeExhausted A | True => run MkUnit end;
+
+-- Local definitions are expanded by inference. Charge their demanded graph
+-- before substitution can turn a small let chain into an exponential tree.
+inductive CheckExpansionWork : Type :=
+  | CheckExpansionTerm : List (Maybe CoreTerm) -> Nat -> Nat -> CoreTerm -> CheckExpansionWork
+  | CheckExpansionTerms : List (Maybe CoreTerm) -> Nat -> Nat -> List CoreTerm -> CheckExpansionWork
+  | CheckExpansionLookup : List (Maybe CoreTerm) -> Nat -> Nat -> CheckExpansionWork;
+
+-- Closed atomic aliases need no rebasing. Keep their resolved value so a
+-- linear chain does not repeatedly walk all earlier aliases; open terms keep
+-- their original scope and expansion accounting.
+def check_expansion_local_value (definitions : List (Maybe CoreTerm)) (value : CoreTerm) : CoreTerm :=
+    match value with
+    | CRel index => match index with
+      | S _ => value
+      | Z => match definitions with
+        | Cons saved _ => match saved with
+          | Nothing => value
+          | Just prior => match prior with
+            | CSort _ => prior | CConst _ => prior | CInd _ => prior
+            | CConstruct _ _ _ => prior | CStrLit _ _ => prior | CStrBytes _ _ => prior
+            | CRel _ => value | CPi _ _ => value | CLam _ _ => value
+            | CApp _ _ => value | CLetIn _ _ _ => value | CCase _ _ _ _ => value
+            | CFix _ _ _ _ _ => value
+            end
+          end
+        | Nil => value
+        end
+      end
+    | CSort _ => value | CConst _ => value | CInd _ => value | CConstruct _ _ _ => value
+    | CStrLit _ _ => value | CStrBytes _ _ => value | CPi _ _ => value | CLam _ _ => value
+    | CApp _ _ => value | CLetIn _ _ _ => value | CCase _ _ _ _ => value | CFix _ _ _ _ _ => value
+    end;
+
+def check_expansion_children (work : CheckExpansionWork)
+    (pending : List CheckExpansionWork) : List CheckExpansionWork :=
+    match work with
+    | CheckExpansionTerm definitions depth copies term =>
+        let child (value : CoreTerm) (rest : List CheckExpansionWork) : List CheckExpansionWork :=
+          Cons CheckExpansionWork (CheckExpansionTerm definitions depth copies value) rest in
+        let bound (value : CoreTerm) (rest : List CheckExpansionWork) : List CheckExpansionWork :=
+          Cons CheckExpansionWork
+            (CheckExpansionTerm (Cons (Maybe CoreTerm) (Nothing CoreTerm) definitions) depth copies value) rest in
+        match term with
+        | CRel index => match compiler_le_nat depth index with
+            | False => pending
+            | True => Cons CheckExpansionWork
+                (CheckExpansionLookup definitions (sub index depth) copies) pending end
+        | CPi domain body => child domain (bound body pending)
+        | CLam annotation body => child annotation (bound body pending)
+        | CApp function argument => child function (child argument pending)
+        | CLetIn value annotation body =>
+            child value (child annotation
+              (Cons CheckExpansionWork
+                (CheckExpansionTerm (Cons (Maybe CoreTerm)
+                  (Just CoreTerm (check_expansion_local_value definitions value)) definitions) depth copies body)
+                pending))
+        | CFix _ _ _ annotation body => child annotation (bound body pending)
+        | CCase _ predicate scrutinee branches => child predicate (child scrutinee
+            (Cons CheckExpansionWork (CheckExpansionTerms definitions depth copies branches) pending))
+        | CSort _ => pending | CConst _ => pending | CInd _ => pending
+        | CConstruct _ _ _ => pending | CStrLit _ _ => pending | CStrBytes _ _ => pending
+        end
+    | CheckExpansionTerms definitions depth copies terms => match terms with
+        | Nil => pending
+        | Cons term rest => Cons CheckExpansionWork (CheckExpansionTerm definitions depth copies term)
+            (Cons CheckExpansionWork (CheckExpansionTerms definitions depth copies rest) pending)
+        end
+    | CheckExpansionLookup definitions index copies => match definitions with
+        | Nil => pending
+        | Cons value rest => match index with
+            | S next => Cons CheckExpansionWork
+                (CheckExpansionLookup rest next
+                  (match value with | Nothing => S copies | Just _ => copies end)) pending
+            | Z => match value with
+                | Nothing => pending
+                | Just term => Cons CheckExpansionWork (CheckExpansionTerm rest 0 copies term) pending
+                end
+            end
+        end
+    end;
+
+def check_expansion_cost (work : CheckExpansionWork) : Nat :=
+    match work with
+    | CheckExpansionTerm _ _ copies _ => S copies
+    | CheckExpansionTerms _ _ copies _ => S copies
+    | CheckExpansionLookup _ _ _ => 1
+    end;
+
+def check_expansion_batch : Nat -> Nat -> List CheckExpansionWork
+    -> Maybe (Pair Nat (List CheckExpansionWork)) :=
+  fix visit (batch : Nat) (fuel : Nat) (pending : List CheckExpansionWork)
+      : Maybe (Pair Nat (List CheckExpansionWork)) :=
+    match pending with
+    | Nil => Just (Pair Nat (List CheckExpansionWork)) (MkPair Nat (List CheckExpansionWork) fuel pending)
+    | Cons work rest => match batch with
+        | Z => Just (Pair Nat (List CheckExpansionWork)) (MkPair Nat (List CheckExpansionWork) fuel pending)
+        | S next => let cost : Nat := check_expansion_cost work in
+            match compiler_le_nat cost fuel with
+            | False => Nothing (Pair Nat (List CheckExpansionWork))
+            | True => visit next (sub fuel cost) (check_expansion_children work rest)
+            end
+        end
+    end;
+
+def check_expansion_within (term : CoreTerm) : Bool :=
+    (fix batches (guard : Nat) (remaining : Nat) (work : List CheckExpansionWork) : Bool :=
+      match check_expansion_batch fuel1k remaining work with
+      | Nothing => False
+      | Just progress => match progress with | MkPair left rest => match rest with
+          | Nil => True | Cons _ _ => match guard with
+              | Z => False | S next => batches next left rest end
+          end end
+      end) checker_input_work_limit checker_input_work_limit
+        [CheckExpansionTerm (Nil (Maybe CoreTerm)) 0 0 term];
+
+def check_expansion_guard (A : Type) (term : CoreTerm)
+    (run : Unit -> CheckResult A) : CheckResult A :=
+    match check_expansion_within term with
+    | False => CheckErr A CheckResourceLimit | True => run MkUnit end;

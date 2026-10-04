@@ -62,6 +62,12 @@ dependent motives, branch types and coverage, and fixpoint metadata. Conversion
 compares semantic fixpoint metadata such as arity and structural-argument index;
 renaming a display binder does not change conversion.
 
+Only leading lambda parameters identify a fixpoint's structural input. The
+termination walk records that binder when it enters scope; annotations, local
+bindings, case fields, and nested binders cannot stand in for an input that has
+not been introduced. A nonrecursive body may still return a function without
+an explicit lambda prefix.
+
 An immediately applied nested fixpoint may inherit a strict-subterm witness
 from its initial structural argument. The application must supply at least its
 declared arity, and that argument must already be smaller than the enclosing
@@ -98,13 +104,23 @@ for the declaration syntax and [TCB](tcb.md) for the pure dependency boundary.
 | Checked program and diagnostic serialization | `compiler/checked_program.ouro` and `compiler/checked_program_output.ouro` |
 
 Environment indexes are derived from accepted declarations. They accelerate
-lookup without granting unchecked declarations authority. The positivity walk
+lookup without granting unchecked declarations authority. Type lookup projects
+the selected entry directly, preserving numeric-name normalization, first-match
+shadowing, and constructor reservations. The positivity walk
 derives each earlier-tail index alongside its certificates. Certificates are
 rebuilt from the declaration list with the same proof fuel and failure checks.
 Deferred substitutions and application processing preserve binder scope and the
 observable reduction budget. Input-work limits reject excessive input with a
-typed resource failure before recursive checking; crashes and process limits
-are separate test failures.
+typed resource failure before recursive checking. The same work limit charges
+demanded local-definition expansion and lifting before materializing let
+substitutions, including declaration candidates before source refinement.
+Closed atomic aliases are retained in resolved form so linear alias chains
+remain linear work. Open and compound definitions retain their binder scope.
+Sort and function views require positive fuel and project already exposed
+`CSort` and `CPi` fields directly without intermediate `Maybe` values. Aliases
+and other heads retain the original bounded reduction path and typed failures;
+declaration and input-work checks remain in place.
+Crashes and process limits are separate test failures.
 
 `CheckedProgram` is a compiler-owned representation, not an unforgeable module
 seal. Native lowering rechecks a supplied wrapper's declarations and metadata.

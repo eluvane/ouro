@@ -232,6 +232,141 @@ def canonical_test_character_directives : Bool :=
       (append Nat ([39, 34, 39, 10] : List Nat)
         (prim_string_to_char_codes "-- @entry main\n")) ([] : List Token))) 1;
 
+def ct_intern_entries_equal : List (Pair (List Nat) Nat) -> List (Pair (List Nat) Nat) -> Bool :=
+  fix compare (left : List (Pair (List Nat) Nat)) (right : List (Pair (List Nat) Nat)) : Bool :=
+    match left with
+    | Nil => match right with | Nil => True | Cons _ _ => False end
+    | Cons pair rest => match right with
+      | Nil => False
+      | Cons other tail => match pair with | MkPair key id => match other with
+        | MkPair other_key other_id => andb(source_bytes_equal key other_key,
+            andb(eqNat id other_id, compare rest tail))
+        end end
+      end
+    end;
+
+def ct_intern_equal (left : InternState) (right : InternState) : Bool :=
+  match left with | MkIntern ids next_id strings next_string => match right with
+    | MkIntern other_ids other_id other_strings other_string =>
+        andb(eqNat next_id other_id, andb(eqNat next_string other_string,
+          andb(ct_intern_entries_equal ids other_ids, ct_intern_entries_equal strings other_strings)))
+    end
+  end;
+
+def ct_lex_equal (left : LexResult) (right : LexResult) : Bool :=
+  match left with
+  | LexMalformed state => match right with
+    | LexMalformed other => ct_intern_equal state other
+    | LexExhausted _ => False
+    | LexOk _ _ => False
+    end
+  | LexExhausted state => match right with
+    | LexExhausted other => ct_intern_equal state other
+    | LexMalformed _ => False
+    | LexOk _ _ => False
+    end
+  | LexOk tokens state => match right with
+    | LexMalformed _ => False
+    | LexExhausted _ => False
+    | LexOk other_tokens other =>
+        andb(ct_intern_equal state other,
+          match state with | MkIntern ids _ strings _ =>
+            match canonical_bytes_from ids strings (canonical_from_lexed [] tokens) with
+            | CanonicalBytesErr _ _ => False
+            | CanonicalBytesOk bytes =>
+                match canonical_bytes_from ids strings (canonical_from_lexed [] other_tokens) with
+                | CanonicalBytesErr _ _ => False
+                | CanonicalBytesOk other_bytes => source_bytes_equal bytes other_bytes
+                end
+            end
+          end)
+    end
+  end;
+
+def ct_intern_initial : InternState :=
+  MkIntern
+    ([MkPair(List Nat, Nat, prim_string_to_char_codes "alpha", 7),
+      MkPair(List Nat, Nat, prim_string_to_char_codes "alpha", 99),
+      MkPair(List Nat, Nat, prim_string_to_char_codes "beta", 42)] : List (Pair (List Nat) Nat)) 100
+    ([MkPair(List Nat, Nat, prim_string_to_char_codes "text", 3),
+      MkPair(List Nat, Nat, prim_string_to_char_codes "text", 9)] : List (Pair (List Nat) Nat)) 10;
+
+def ct_indexed_parity (fuel : Nat) (source : String) : Bool :=
+  let codes : List Nat := prim_string_to_char_codes source in
+  let acc : List Token := [TString 3, TIdent 7] in
+  andb (ct_lex_equal (lex_go_with next_token fuel codes ct_intern_initial acc)
+      (lex_go fuel codes ct_intern_initial acc))
+    (ct_lex_equal (lex_go_with next_import_token fuel codes ct_intern_initial acc)
+      (lex_go_import fuel codes ct_intern_initial acc));
+
+def canonical_test_intern_parity : Bool :=
+  all Nat (fun (fuel : Nat) => all String (ct_indexed_parity fuel)
+    (["", "alpha beta gamma ?alpha ?gamma ?? \"text\" \"fresh\"",
+      "def gamma : Type := alpha; [1, 2] |> beta",
+      "r#\"text\"# b\"A\\x00\" '\\u{1F600}'",
+      "\"\"\"\n  text\n  \"\"\"", "alpha @", "\"unterminated",
+      "r#\"unterminated", "1_", "?alpha @"] : List String))
+    ([0, 1, 2, 3, 8, 32, 256] : List Nat);
+
+def canonical_test_intern_incremental : Bool :=
+  let first : List Nat := prim_string_to_char_codes "gamma alpha \"fresh\" \"text\"" in
+  match lex_go_with next_import_token 256 first ct_intern_initial [] with
+  | LexMalformed _ => False
+  | LexExhausted _ => False
+  | LexOk _ state => match lex_go_import 256 first ct_intern_initial [] with
+    | LexMalformed _ => False
+    | LexExhausted _ => False
+    | LexOk _ indexed =>
+        let second : List Nat := prim_string_to_char_codes "delta gamma ?alpha \"fresh\" \"later\"" in
+        andb(ct_intern_equal state indexed,
+          ct_lex_equal (lex_go_with next_import_token 256 second state [])
+            (lex_go_import 256 second indexed []))
+    end
+  end;
+
+def ct_index_lookup_equal (table : List (Pair (List Nat) Nat)) (index : SourceNameIndex)
+    (key : List Nat) : Bool :=
+  match source_lookup_id table key with
+  | Nothing => match source_name_index_lookup key index with | Nothing => True | Just _ => False end
+  | Just id => match source_name_index_lookup key index with | Nothing => False | Just other => eqNat id other end
+  end;
+
+def canonical_test_intern_lookup : Bool :=
+  let table : List (Pair (List Nat) Nat) :=
+    [MkPair(List Nat, Nat, [], 5), MkPair(List Nat, Nat, [120], 7),
+      MkPair(List Nat, Nat, [120, 0], 9), MkPair(List Nat, Nat, [120], 99),
+      MkPair(List Nat, Nat, [0, 255], 2), MkPair(List Nat, Nat, [256], 0)] in
+  let index : SourceNameIndex := source_name_index_from table in
+  all (List Nat) (ct_index_lookup_equal table index)
+    ([[], [120], [120, 0], [0, 255], [256], [0], [120, 0, 1], [255]] : List (List Nat));
+
+def ct_intern_scale_table (size : Nat) : List (Pair (List Nat) Nat) :=
+  (fix build (left : Nat) (rows : List (Pair (List Nat) Nat)) : List (Pair (List Nat) Nat) :=
+    match left with
+    | Z => rows
+    | S remaining => build remaining
+        (Cons (Pair (List Nat) Nat) (MkPair (List Nat) Nat
+          (append Nat (prim_string_to_char_codes "shared_")
+            (prim_string_to_char_codes (prim_string_of_nat remaining))) remaining) rows)
+    end) size [];
+
+def canonical_test_intern_scale : Bool :=
+  let table : List (Pair (List Nat) Nat) := ct_intern_scale_table 512 in
+  let index : SourceNameIndex := source_name_index_from table in
+  let later : List Nat := prim_string_to_char_codes "later" in
+  let extended : SourceNameIndex := source_name_index_insert later 512 index in
+  andb (leb_nat (source_name_index_height index) 12)
+    (andb (ct_index_lookup_equal table index later)
+      (andb (match source_name_index_lookup later extended with | Nothing => False | Just id => eqNat id 512 end)
+        (all (Pair (List Nat) Nat) (fun (pair : Pair (List Nat) Nat) => match pair with
+          | MkPair key id => andb (ct_index_lookup_equal table index key)
+              (match source_name_index_lookup key extended with | Nothing => False | Just other => eqNat id other end)
+          end) table)));
+
+def canonical_test_intern_all : Bool :=
+  andb canonical_test_intern_lookup (andb canonical_test_intern_parity
+    (andb canonical_test_intern_incremental canonical_test_intern_scale));
+
 def canonical_smoke_all : Bool :=
   andb canonical_test_compact_bytes
     (andb canonical_test_token_boundary
@@ -244,4 +379,5 @@ def canonical_smoke_all : Bool :=
               (andb canonical_test_mapping_identity
                 (andb canonical_test_deterministic_hash (andb canonical_test_removed_bytes
                   (andb canonical_test_character_directives
-                    (all (Pair (List Nat) Nat) canonical_test_character character_valid_cases))))))))))));
+                    (andb canonical_test_intern_all
+                      (all (Pair (List Nat) Nat) canonical_test_character character_valid_cases)))))))))))));

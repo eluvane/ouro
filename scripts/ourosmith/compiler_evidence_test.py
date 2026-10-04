@@ -36,7 +36,7 @@ class CompilerEvidenceTests(EvidenceTreeTests):
         self.enterContext(patch('ourosmith.host.environment', return_value={}))
         self.native_receipt = {'binary_sha256': 'a' * 64, 'key': 'b' * 64}
         self.receipt = self.enterContext(patch.object(evidence, 'receipt_for',
-            return_value=(self.native_receipt, [], {})))
+            side_effect=self.native_receipt_for))
         entries = ['tests/compiler_suite_contract_tests.ouro', 'tests/compiler_property_tests.ouro',
                    'tests/source_span_tests.ouro']
         self.write_registry(entries)
@@ -48,11 +48,49 @@ class CompilerEvidenceTests(EvidenceTreeTests):
                          'COMPILER_CHECK_OK source_spans-run\n'
                          'COMPILER_CHECK_SUITE: PASS rows=3 out=' + self.directory.as_posix() + '\n')
         self.log.write_text(self.log_text, encoding='utf-8')
+        suffix = '.exe' if evidence.sys.platform == 'win32' else ''
+        (self.directory / ('ouro-test-suite' + suffix)).write_bytes(b'runner')
         for name in ('compiler_suite_contract', 'compiler_property', 'source_spans'):
+            (self.directory / (name + '.exe')).write_bytes(b'fixture')
             (self.directory / (name + '.check')).write_text('CHECK_OK\n', encoding='utf-8')
             (self.directory / (name + '.err')).write_bytes(b'')
             (self.directory / (name + '.out')).write_text(
                 property_output() if name == 'compiler_property' else 'ok inventory contract\n', encoding='utf-8')
+
+    def native_receipt_for(self, executable, _entry, _compiler):
+        if not Path(executable).is_file():
+            raise ValueError('native fixture executable is missing: ' + str(executable))
+        return self.native_receipt, [], {}
+
+    def test_fixture_executables_follow_the_suite_contract_on_every_host(self):
+        for platform in ('linux', 'win32'):
+            with self.subTest(platform=platform), patch.object(evidence.sys, 'platform', platform):
+                suffix = '.exe' if platform == 'win32' else ''
+                runner = self.directory / ('ouro-test-suite' + suffix)
+                runner.write_bytes(b'runner')
+                self.receipt.reset_mock()
+                self.read()
+                self.assertEqual([call.args[0] for call in self.receipt.call_args_list],
+                    [runner, self.directory / 'compiler_suite_contract.exe',
+                     self.directory / 'compiler_property.exe', self.directory / 'source_spans.exe', runner])
+
+    def test_extensionless_fixture_cannot_replace_the_suite_executable(self):
+        executable = self.directory / 'compiler_property.exe'
+        extensionless = self.directory / 'compiler_property'
+        extensionless.write_bytes(executable.read_bytes())
+        executable.unlink()
+        self.log.write_text('COMPILER_CHECK_OK compiler_property-run\n'
+                            'COMPILER_CHECK_SUITE: PASS rows=1 out=' + self.directory.as_posix() + '\n',
+                            encoding='utf-8')
+        selected = RunResult('ok', 0, 'tests/compiler_property_tests.ouro\n', '', 0.1, 10)
+        for platform in ('linux', 'win32'):
+            with self.subTest(platform=platform), patch.object(evidence.sys, 'platform', platform):
+                suffix = '.exe' if platform == 'win32' else ''
+                (self.directory / ('ouro-test-suite' + suffix)).write_bytes(b'runner')
+                self.execute.side_effect = [self.listed, selected]
+                with self.assertRaisesRegex(ValueError, 'native fixture executable is missing') as missing:
+                    evidence.suite_receipt(self.log, self.root / 'compiler', shard='2/16')
+                self.assertIn(str(executable), str(missing.exception))
 
     def read(self):
         return evidence.suite_receipt(self.log, self.root / 'compiler')
@@ -75,6 +113,25 @@ class CompilerEvidenceTests(EvidenceTreeTests):
         self.assertEqual(self.receipt.call_count, 5)
         self.assertEqual(self.execute.call_args.args[0][-2:], ['--native-suite=compiler-checking', '--list'])
 
+    def test_current_inventory_accepts_registered_nested_and_non_test_paths(self):
+        for entry in ('tests/language_ergonomics/parser_laws.ouro',
+                      'tests/compact_nat_runtime.ouro',
+                      'tests/language_ergonomics/where_parser_laws.ouro'):
+            with self.subTest(entry=entry):
+                entries = ['tests/compiler_suite_contract_tests.ouro', entry,
+                           'tests/source_span_tests.ouro']
+                self.write_registry(entries)
+                self.listed.stdout = '\n'.join(entries) + '\n'
+                name = Path(entry).stem
+                self.log.write_text(self.log_text.replace('compiler_property-run', name + '-run'),
+                                    encoding='utf-8')
+                for extension in ('.exe', '.check', '.out', '.err'):
+                    (self.directory / (name + extension)).write_bytes(
+                        (self.directory / ('compiler_property' + extension)).read_bytes())
+                receipt = self.read()
+                self.assertEqual(receipt['inventory'], entries)
+                self.assertEqual([row['entry'] for row in receipt['artifacts']], entries)
+
     def test_partial_reordered_duplicate_unknown_and_failed_logs_reject(self):
         lines = self.log_text.splitlines()
         candidates = [[], lines[:-1], [*lines, 'extra'], [lines[1], lines[0], lines[2], lines[3]],
@@ -96,7 +153,14 @@ class CompilerEvidenceTests(EvidenceTreeTests):
         for field, value in [('status', 'timeout'), ('returncode', 1), ('stderr', 'failure'),
                              ('stdout', ''), ('stdout', self.listed.stdout * 2),
                              ('stdout', '../outside.ouro\n'),
-                             ('stdout', 'tests/compiler_suite_contract_tests.ouro\n')]:
+                             ('stdout', 'tests/compiler_suite_contract_tests.ouro\n'),
+                             ('stdout', '\n'.join(reversed(self.listed.stdout.splitlines())) + '\n'),
+                             ('stdout', self.listed.stdout.replace('tests/compiler_property_tests.ouro',
+                                'tests/language_ergonomics/foreign_laws.ouro')),
+                             ('stdout', self.listed.stdout.replace('tests/compiler_property_tests.ouro',
+                                'tests/../outside.ouro')),
+                             ('stdout', self.listed.stdout.replace('tests/compiler_property_tests.ouro',
+                                'not a source path'))]:
             result = deepcopy(self.listed)
             setattr(result, field, value)
             self.execute.return_value = result
@@ -120,14 +184,65 @@ class CompilerEvidenceTests(EvidenceTreeTests):
         with self.assertRaisesRegex(ValueError, 'changed'):
             self.read()
 
-    def test_missing_strict_check_runtime_failure_and_missing_output_reject(self):
+    def test_missing_strict_check_and_incomplete_property_output_reject(self):
         for suffix, bad in [('.check', ''), ('.check', 'CHECK_PROCESS_FAIL exit=1\nCHECK_OK\n'),
-                            ('.check', 'CHECK_OK\nextra\n'), ('.err', 'diagnostic'),
+                            ('.check', 'CHECK_OK\nextra\n'),
                             ('.out', ''), ('.out', 'FAIL property\n')]:
             path = self.directory / ('compiler_property' + suffix)
             original = path.read_bytes()
             path.write_text(bad, encoding='utf-8')
             with self.subTest(suffix=suffix), self.assertRaises(ValueError):
+                self.read()
+            path.write_bytes(original)
+
+    def test_expected_runtime_diagnostics_are_bound_to_successful_suite_evidence(self):
+        diagnostic = ('main.ouro: type mismatch in hidden\n'
+                      'main.ouro: type mismatch in value\n'
+                      'main.ouro: duplicate declaration in Library\n'
+                      'main.ouro: lexer fuel exhausted\n')
+        error = self.directory / 'compiler_property.err'
+        empty = self.read()['artifacts'][1]['stderr_sha256']
+        error.write_text(diagnostic, encoding='utf-8')
+        receipt = self.read()
+        self.assertEqual(receipt['artifacts'][1]['stderr_sha256'], evidence.sha(error))
+        self.assertNotEqual(receipt['artifacts'][1]['stderr_sha256'], empty)
+        self.assertTrue(receipt['artifacts'][1]['default_properties'])
+
+    def test_runtime_diagnostics_cannot_hide_failed_suite_or_strict_check(self):
+        (self.directory / 'compiler_property.err').write_text('expected rejection\n', encoding='utf-8')
+        self.log.write_text(self.log_text.replace('COMPILER_CHECK_OK compiler_property-run',
+                                                 'COMPILER_CHECK_FAIL compiler_property-run'), encoding='utf-8')
+        with self.assertRaisesRegex(ValueError, 'incomplete, failed, or unknown row'):
+            self.read()
+        self.log.write_text(self.log_text, encoding='utf-8')
+        (self.directory / 'compiler_property.check').write_text('CHECK_PROCESS_FAIL exit=1\n', encoding='utf-8')
+        with self.assertRaisesRegex(ValueError, 'unsuccessful strict check'):
+            self.read()
+
+    def test_successful_nonproperty_output_is_bound_without_reinterpreting_it(self):
+        output = self.directory / 'source_spans.out'
+        for text in ('', 'FAIL expected rejection\n'):
+            with self.subTest(text=text):
+                output.write_text(text, encoding='utf-8')
+                row = self.read()['artifacts'][2]
+                self.assertEqual(row['stdout_sha256'], evidence.sha(output))
+                self.assertFalse(row['default_properties'])
+
+    def test_failed_fixture_is_rejected_by_its_canonical_suite_verdict(self):
+        (self.directory / 'source_spans.out').write_text('FAIL law\n', encoding='utf-8')
+        lines = self.log_text.splitlines()
+        failed = [lines[0], lines[1], 'COMPILER_CHECK_FAIL source_spans-run exit=1 want=0',
+                  'COMPILER_CHECK_SUITE: FAIL rows=3 out=' + self.directory.as_posix()]
+        self.log.write_text('\n'.join(failed) + '\n', encoding='utf-8')
+        with self.assertRaisesRegex(ValueError, 'success protocol'):
+            self.read()
+
+    def test_runtime_stream_files_are_required_even_for_a_successful_suite(self):
+        for extension in ('.out', '.err'):
+            path = self.directory / ('source_spans' + extension)
+            original = path.read_bytes()
+            path.unlink()
+            with self.subTest(extension=extension), self.assertRaises(OSError):
                 self.read()
             path.write_bytes(original)
 

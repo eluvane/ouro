@@ -278,10 +278,11 @@ def prepare_tools(cases: Sequence[Case], out: Path) -> list[dict[str, Any]]:
     if labels & {"native-check-fmt", "native-check-analyze", "native-check-analyze-drive",
                  "import-heavy-batch", "small-source", "medium-selfhost-module"}:
         tools.append(("tools/collect.ouro", "ouro-collect"))
-    if "formatter-suite" in labels:
+    if labels & {"formatter-suite", "tool-emission-fmt"}:
         tools.append(("tools/fmt.ouro", "ouro-fmt"))
+    if "formatter-suite" in labels:
         tools.append(("tests/quality_source_write_driver.ouro", "quality-source-write"))
-    if any(label.startswith("analyzer-") for label in labels):
+    if "tool-emission-analyze" in labels or any(label.startswith("analyzer-") for label in labels):
         tools.append(("tools/analyze/main.ouro", "ouro-analyze"))
     if "analyzer-drive-largest-file" in labels:
         tools.append(("tools/analyze/drive_main.ouro", "ouro-analyze-drive"))
@@ -293,10 +294,25 @@ def prepare_tools(cases: Sequence[Case], out: Path) -> list[dict[str, Any]]:
     if not directory.is_absolute():
         directory = ROOT / directory
     compiler = Path(os.environ.get("OURO1_COMPILER", str(directory / "ouro1")))
+    requests = [(entry, name, directory / name) for entry, name in tools]
+    for case in cases:
+        if case.label in {"tool-emission-fmt", "tool-emission-analyze"}:
+            target = Path(case.cmd[3])
+            requests.append((case.cmd[2], case.label, target if target.is_absolute() else ROOT / target))
+        if case.label == "formatter-suite":
+            target = Path(case.env.get("FMT_SUITE_OUT", os.environ.get("FMT_SUITE_OUT", "_build/fmt_suite")))
+            if not target.is_absolute():
+                target = ROOT / target
+            # Imported installed tools need not have a shared content-cache entry.
+            # The formatter launcher removes its image before installing it again.
+            requests.extend((entry, "formatter-suite-" + name, target / name) for entry, name in (
+                ("tools/fmt.ouro", "ouro-fmt"),
+                ("tests/quality_source_write_driver.ouro", "quality-source-write"),
+            ))
     reports: list[dict[str, Any]] = []
-    for entry, name in tools:
+    for entry, name, target in requests:
         command = [sys.executable, "scripts/native_tool_build.py", entry,
-                   str(directory / name), "--compiler", str(compiler)]
+                   str(target), "--compiler", str(compiler)]
         print(f"MEMORY_PREPARE_START {name}", flush=True)
         result = run_limited(command, cwd=ROOT, env=os.environ,
                              timeout_s=900, memory_mb=BUILD_MEMORY_MB)

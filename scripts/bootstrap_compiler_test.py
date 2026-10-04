@@ -18,6 +18,7 @@ import bootstrap_compiler as bootstrap
 import bootstrap_inputs as inputs
 import compact_source
 import ci_gate
+import generated_artifact_drift_check as drift
 import ouro_build as build
 from ourosmith.limits import RunResult
 from repo_support import hash_json, sha256_file, write_json_atomic
@@ -31,6 +32,7 @@ class BootstrapCompilerTests(unittest.TestCase):
         self.work = self.root / "work"
         self.work.mkdir()
         self.events = []
+        self.expected_workers = 1
         self.rejected_root = None
         self.rejected_source_form = None
         self.different_c = False
@@ -56,7 +58,7 @@ class BootstrapCompilerTests(unittest.TestCase):
                     "source_form": compact_source.KIND if compact_sources else "original",
                     "cc_executable": str(cc), "cc_sha256": sha256_file(cc)}
         snapshot = {"kind": bootstrap.KIND + ".inputs", "key": hash_json(selected), "selected": selected,
-            "config": {**build.DEFAULTS, "verbosity": "quiet"}, "bridge_graph": graph,
+            "config": {**build.DEFAULTS, "jobs": 1, "verbosity": "quiet"}, "bridge_graph": graph,
             "roots": {"c0": "historical/c0", "bridge": "historical/bridge", "p1": "o", "p2": "compact" if compact_sources else "o"},
             "inputs": {path.relative_to(self.work).as_posix(): sha256_file(path)
                        for path in self.work.rglob("*") if path.is_file()}}
@@ -66,7 +68,10 @@ class BootstrapCompilerTests(unittest.TestCase):
     def fake_run(self, argv, *, cwd, env, timeout_s, memory_mb):
         self.assertEqual(timeout_s, bootstrap.TIMEOUT_S)
         self.assertEqual(memory_mb, bootstrap.MEMORY_MIB)
-        self.assertEqual(env["OURO_JOBS"], "1")
+        self.assertEqual(env["OURO_JOBS"], str(self.expected_workers))
+        self.assertEqual(env["OURO_FRONTEND_JOBS"], str(self.expected_workers))
+        self.assertEqual(env["OURO_CACHE"], "0")
+        self.assertEqual(env["OURO_CCACHE"], "disabled")
         self.events.append((list(argv), cwd))
         stdout, stderr, code, status = "", "", 0, "ok"
         if "worker" in argv:
@@ -100,6 +105,132 @@ class BootstrapCompilerTests(unittest.TestCase):
         else:
             self.fail(f"unexpected host fixture command: {argv}")
         return RunResult(status, code, stdout, stderr, 0.01, 1.0, list(argv))
+
+    def test_bootstrap_workers_require_positive_bounded_configuration(self):
+        for requested, expected in ((1, 1), (2, 2), (10, 2)):
+            with self.subTest(jobs=requested):
+                self.assertEqual(bootstrap.bootstrap_workers({"jobs": requested}, build), expected)
+        for cpus, expected in ((None, 1), (1, 1), (8, 2)):
+            with self.subTest(cpus=cpus), patch.object(build.os, "cpu_count", return_value=cpus):
+                self.assertEqual(bootstrap.bootstrap_workers({"jobs": "auto"}, build), expected)
+        for invalid in (0, -1, True, False, 1.5, "2", None):
+            with self.subTest(jobs=invalid), self.assertRaisesRegex(RuntimeError, "positive integer"):
+                bootstrap.bootstrap_workers({"jobs": invalid}, build)
+
+    def test_bootstrap_worker_budget_preserves_complete_command_order(self):
+        reference = None
+        for requested, expected in ((1, 1), (2, 2), (10, 2), ("auto", 2)):
+            with self.subTest(jobs=requested):
+                self.work = self.root / ("workers-" + str(requested))
+                self.work.mkdir()
+                self.events = []
+                self.expected_workers = expected
+                snapshot = self.fixture()
+                snapshot["config"]["jobs"] = requested
+                write_json_atomic(self.work / "inputs.json", snapshot)
+                with patch.object(build.os, "cpu_count", return_value=8), \
+                     patch.object(bootstrap, "run_limited", side_effect=self.fake_run):
+                    report = bootstrap.chain(self.work, snapshot, build)
+                self.assertTrue(report["pass"])
+                self.assertEqual(report["workers"], expected)
+                self.assertEqual([phase["phase"] for phase in report["phases"]], ["c0", "bridge", "p1", "p2"])
+                commands = [([arg.replace(str(self.work), "WORK") for arg in argv], root.relative_to(self.work).as_posix())
+                            for argv, root in self.events]
+                self.assertEqual(len(commands), 48)
+                if reference is None:
+                    reference = commands
+                else:
+                    self.assertEqual(commands, reference)
+
+    def test_parallel_bootstrap_preserves_failure_barriers(self):
+        for mode in ("root", "generated-c", "abi", "negative", "timeout", "tampered-input"):
+            with self.subTest(mode=mode):
+                self.work = self.root / ("parallel-" + mode)
+                self.work.mkdir()
+                self.events = []
+                self.expected_workers = 2
+                self.rejected_root = None
+                self.different_c = mode == "generated-c"
+                self.abi_stdout = "" if mode == "abi" else bootstrap.ABI_STDOUT
+                self.bad_stdout = "unexpected\n" if mode == "negative" else ""
+                self.bad_status = "timeout" if mode == "timeout" else "ok"
+                snapshot = self.fixture()
+                snapshot["config"]["jobs"] = 2
+                write_json_atomic(self.work / "inputs.json", snapshot)
+                if mode == "root":
+                    self.rejected_root = snapshot["selected"]["roots"][-1]
+                if mode == "tampered-input":
+                    (self.work / "o/compiler/backend.ouro").write_text("changed after freeze")
+                with patch.object(bootstrap, "run_limited", side_effect=self.fake_run), self.assertRaises(RuntimeError):
+                    bootstrap.chain(self.work, snapshot, build)
+                self.assertFalse(json.loads((self.work / "report.json").read_text())["pass"])
+                if mode == "root":
+                    self.assertFalse((self.work / "out/p1/driver_u.c").exists())
+                if mode == "abi":
+                    self.assertFalse((self.work / "out/p2/driver_u.c").exists())
+                if mode == "tampered-input":
+                    self.assertEqual(self.events, [])
+
+    def test_worker_actions_receive_the_same_bounded_budget(self):
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+
+        for index, (requested, expected, cpus) in enumerate(((1, 1, 8), (2, 2, 8), (10, 2, 8),
+                                                           ("auto", 2, 8), ("auto", 1, 1))):
+            self.work = self.root / ("dispatch-" + str(index))
+            self.work.mkdir()
+            snapshot = self.fixture()
+            with patch.object(build.os, "cpu_count", return_value=cpus):
+                snapshot["config"]["jobs"] = bootstrap.bootstrap_workers({"jobs": requested}, build)
+            write_json_atomic(self.work / "inputs.json", snapshot)
+            for action, phase in (("c0", "c0"), ("frontend", "p1"), ("link", "p1"), ("abi-build", "p2")):
+                with self.subTest(jobs=requested, action=action):
+                    (self.work / "out" / phase).mkdir(parents=True, exist_ok=True)
+                    stage = SimpleNamespace(build_config=Mock(return_value=SimpleNamespace()),
+                                            build_stage_binary=Mock(return_value={}))
+                    native = SimpleNamespace(build_tool=Mock(return_value={}))
+                    args = SimpleNamespace(snapshot=self.work / "inputs.json", phase=phase, action=action,
+                                           producer=self.root / "producer")
+                    with patch.object(build.os, "cpu_count", side_effect=AssertionError("worker re-resolved auto jobs")), \
+                         patch.dict("sys.modules", {"ouro_build": build, "stage_loop": stage, "native_tool_build": native}), \
+                         patch.object(bootstrap, "ROOT", (self.work / snapshot["roots"][phase]).resolve()), \
+                         patch.object(build, "build_c") as compile_c, \
+                         patch.object(bootstrap.frontend, "collect_units", side_effect=snapshot["selected"]["unit_graph"].__getitem__), \
+                         patch.object(bootstrap.frontend, "regenerate") as emit:
+                        bootstrap.worker(args)
+                    if action == "c0":
+                        values = compile_c.call_args.args[0].values
+                    elif action == "frontend":
+                        self.assertEqual(emit.call_args.kwargs["jobs"], expected)
+                        self.assertFalse(emit.call_args.kwargs["cache_enabled"])
+                        continue
+                    elif action == "link":
+                        self.assertEqual(stage.build_stage_binary.call_args.args[3], 1)
+                        config = stage.build_stage_binary.call_args.args[4]
+                        self.assertFalse(config.cache_enabled)
+                        values = config.build_cfg.values
+                    else:
+                        values = vars(native.build_tool.call_args.args[0])
+                    self.assertEqual(values["jobs"], expected)
+                    self.assertFalse(values["cache_enabled"])
+                    self.assertEqual(values["ccache"], "disabled")
+
+    def test_worker_rejects_foreign_root_and_changed_frozen_inputs(self):
+        from types import SimpleNamespace
+
+        snapshot = self.fixture()
+        args = SimpleNamespace(snapshot=self.work / "inputs.json", phase="c0", action="c0", producer=None)
+        expected_root = (self.work / snapshot["roots"]["c0"]).resolve()
+        for mismatch in ("root", "input"):
+            with self.subTest(mismatch=mismatch):
+                if mismatch == "input":
+                    (self.work / "o/compiler/backend.ouro").write_text("changed after freeze")
+                worker_root = self.root / "foreign" if mismatch == "root" else expected_root
+                with patch.object(bootstrap, "ROOT", worker_root), \
+                     patch.object(build, "build_c") as compile_c, \
+                     self.assertRaisesRegex(RuntimeError, "worker source root or frozen input mismatch"):
+                    bootstrap.worker(args)
+                compile_c.assert_not_called()
 
     def test_compaction_preserves_literal_bytes_directives_and_line_boundaries(self):
         literal = '"  -- @entry other\\n\\\"\\\\\t\r\nЮник\u043eд  "'.encode()
@@ -209,14 +340,19 @@ class BootstrapCompilerTests(unittest.TestCase):
             stage0[name] = sha256_file(path)
         selected = {"sources": {name: sha256_file(root / name) for name in names}, "stage0": stage0,
             "archive_sha256": sha256_file(root / inputs.ARCHIVE), "manifest_sha256": sha256_file(root / inputs.MANIFEST)}
-        cfg = build.ResolvedConfig(dict(build.DEFAULTS), {})
+        cfg = build.ResolvedConfig({**build.DEFAULTS, "jobs": "auto"}, {})
         before = (root / "std/prelude.ouro").read_bytes()
         for form in ("original", compact_source.KIND):
             with self.subTest(source_form=form):
                 selected["source_form"] = form
                 work = self.work / form
                 work.mkdir()
-                snapshot = bootstrap.freeze(root, work, selected, cfg)
+                expected_workers = 1 if form == "original" else 2
+                with patch.object(build.os, "cpu_count", return_value=expected_workers):
+                    snapshot = bootstrap.freeze(root, work, selected, cfg)
+                self.assertEqual(snapshot["config"]["jobs"], expected_workers)
+                self.assertEqual(json.loads((work / "inputs.json").read_text())["config"]["jobs"], expected_workers)
+                self.assertEqual(cfg.values["jobs"], "auto")
                 self.assertEqual((work / "o/std/prelude.ouro").read_bytes(), before)
                 self.assertEqual((root / "std/prelude.ouro").read_bytes(), before)
                 self.assertNotEqual((work / "historical/bridge/std/prelude.ouro").read_bytes(), before)
@@ -551,6 +687,183 @@ class BootstrapCompilerTests(unittest.TestCase):
                         bundle.addfile(member, io.BytesIO(data))
                 with self.assertRaises(ValueError):
                     ci_gate.import_compiler(self.root, output, selected, invalid, sha256_file(invalid))
+
+    def drift_fixture(self):
+        output, selected, _archive = self.compiler_artifact_fixture()
+        cfg = build.ResolvedConfig({**build.DEFAULTS, "build_dir": str(self.root / "_build"),
+                                   "c_build_dir": str(output.parent)}, {})
+        return output, selected, cfg
+
+    def test_generated_drift_uses_verified_current_pair_and_preserves_historical_seed(self):
+        output, selected, cfg = self.drift_fixture()
+        references = {name: self.work / "out/p2" / name for name in ("driver_u.c", "backend_u.c")}
+        stage0 = tuple(self.root / "compiler/stage0" / name for name in references)
+        for path in stage0:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"/* Do not hand-edit; ouro_export_count: historical pinned seed */\n")
+        manifest = self.root / "hashes.sha256"
+        manifest.write_text("".join(f"{sha256_file(path)} {path.relative_to(self.root).as_posix()}\n" for path in stage0),
+                            encoding="utf-8")
+        historical = {path: path.read_bytes() for path in stage0}
+        work = self.root / "drift"
+        stage_work = cfg.path("build_dir") / "stage_loop"
+
+        def regenerate(argv, *, env, log):
+            self.assertIn("OURO_REPRODUCIBLE", env)
+            self.assertEqual(log.parent, work)
+            if "--out" in argv:
+                self.assertEqual(Path(argv[argv.index("--ouro1") + 1]), output)
+                self.assertIn("--no-cache", argv)
+                out = Path(argv[argv.index("--out") + 1])
+                out.parent.mkdir(parents=True, exist_ok=True)
+                out.write_bytes(drift.promotion_bytes(references["driver_u.c"]).replace(b"\n", b"\r\n"))
+            else:
+                self.assertEqual(argv, ["sh", "scripts/stage_loop.sh"])
+                for name, reference in references.items():
+                    out = stage_work / "stage2" / name
+                    out.parent.mkdir(parents=True, exist_ok=True)
+                    out.write_bytes(drift.promotion_bytes(reference).replace(b"\n", b"\r\n"))
+                write_json_atomic(stage_work / "result.json", {"pass": True, "frontend_eq": True,
+                                                               "backend_eq": True, "stages": 2})
+            return 0
+
+        with patch.object(drift, "ROOT", self.root), patch.object(drift, "STAGE0", stage0), \
+             patch.object(drift, "rel", side_effect=lambda path: path.relative_to(self.root).as_posix()), \
+             patch.object(drift, "MANIFEST", manifest), patch.object(build, "load_config", return_value=cfg), \
+             patch.object(inputs, "read_bundle", return_value=({}, {})), patch.object(inputs, "verify_stage0") as pinned, \
+             patch.object(bootstrap, "current_inputs", return_value=selected), patch.object(drift, "run", side_effect=regenerate):
+            self.assertEqual(drift.main(["--mode", "stage-loop", "--work", str(work)]), 0)
+        report = json.loads((work / "generated-artifact-drift.json").read_text())
+        self.assertTrue(report["pass"])
+        self.assertTrue(all(row["pass"] for row in report["details"]["manifest_artifacts"]))
+        comparisons = report["details"]["stage_loop"]["reference_artifact_comparisons"]
+        self.assertEqual({row["artifact"] for row in comparisons}, set(references))
+        self.assertTrue(all(row["pass"] for row in comparisons))
+        self.assertEqual(report["details"]["current_reference"]["sha256"],
+                         {name: sha256_file(path) for name, path in references.items()})
+        pinned.assert_called_with(self.root, {})
+        self.assertEqual({path: path.read_bytes() for path in stage0}, historical)
+
+    def test_generated_drift_rejects_stale_missing_or_tampered_bootstrap_evidence(self):
+        output, selected, cfg = self.drift_fixture()
+        receipt = output.with_name("ouro1.bootstrap.json")
+        report = self.work / "report.json"
+        paths = [output, receipt, report, self.work / "inputs.json",
+                 *(self.work / "out" / phase / name for phase in ("p1", "p2") for name in ("driver_u.c", "backend_u.c"))]
+        before = {path: path.read_bytes() for path in paths}
+        with patch.object(drift, "ROOT", self.root), patch.object(inputs, "read_bundle", return_value=({}, {})), \
+             patch.object(inputs, "verify_stage0"), patch.object(bootstrap, "current_inputs", return_value=selected) as current:
+            references, actual, digests, identity = drift.current_reference(output, cfg)
+            self.assertEqual(actual, selected)
+            self.assertEqual(set(references), {"driver_u.c", "backend_u.c"})
+            self.assertEqual(digests, {name: sha256_file(path) for name, path in references.items()})
+            self.assertEqual(identity, {"binary": sha256_file(output), "receipt": sha256_file(receipt),
+                                        "report": sha256_file(report), "inputs": sha256_file(self.work / "inputs.json")})
+            for mutation in ("receipt", "stale", "report", "inputs", "missing-p1", "missing-p2", "changed-p2", "partial"):
+                with self.subTest(mutation=mutation):
+                    if mutation == "stale":
+                        current.return_value = {**selected, "foreign": "source identity"}
+                    elif mutation == "receipt":
+                        receipt.unlink()
+                    elif mutation == "report":
+                        report.write_bytes(b"unverified report")
+                    elif mutation == "inputs":
+                        (self.work / "inputs.json").write_bytes(b"changed frozen inputs")
+                    elif mutation.startswith("missing-"):
+                        (self.work / "out" / mutation.removeprefix("missing-") / "backend_u.c").unlink()
+                    elif mutation == "changed-p2":
+                        (self.work / "out/p2/driver_u.c").write_bytes(b"changed generated reference")
+                    else:
+                        data = json.loads(before[report])
+                        del data["complete_generated_c_comparison"]["backend_u.c"]
+                        write_json_atomic(report, data)
+                        evidence = json.loads(before[receipt])
+                        evidence["report_sha256"] = sha256_file(report)
+                        write_json_atomic(receipt, evidence)
+                    with self.assertRaisesRegex(ValueError, "does not match current inputs"):
+                        drift.current_reference(output, cfg)
+                    for path in paths:
+                        path.write_bytes(before[path])
+                    current.return_value = selected
+            outside = self.root / "outside"
+            shutil.copytree(self.work, outside)
+            evidence = json.loads(before[receipt])
+            evidence["work"] = str(outside)
+            write_json_atomic(receipt, evidence)
+            self.assertTrue(bootstrap.installed_current(output, receipt, selected))
+            with self.assertRaisesRegex(ValueError, "configured bootstrap directory"):
+                drift.current_reference(output, cfg)
+
+    def test_generated_drift_rejects_regeneration_or_fixpoint_differences(self):
+        output, _selected, cfg = self.drift_fixture()
+        references = {name: self.work / "out/p2" / name for name in ("driver_u.c", "backend_u.c")}
+        stage_work = cfg.path("build_dir") / "stage_loop"
+        work = self.root / "drift"
+        for name, reference in references.items():
+            path = stage_work / "stage2" / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(reference.read_bytes())
+        result = stage_work / "result.json"
+        complete = {"pass": True, "frontend_eq": True, "backend_eq": True, "stages": 2}
+        write_json_atomic(result, complete)
+        with patch.object(drift, "run", return_value=0):
+            out = work / "frontend-regenerated/driver_u.c"
+            out.parent.mkdir(parents=True)
+            out.write_bytes(b"different current frontend\n")
+            issues, _details = drift.frontend_regen_check({}, work, 1, output, references)
+            self.assertEqual([row["reason"] for row in issues], ["frontend generated artifact drift"])
+            for name, reference in references.items():
+                with self.subTest(artifact=name):
+                    path = stage_work / "stage2" / name
+                    path.write_bytes(b"different current stage artifact\n")
+                    issues, _details = drift.stage_loop_check({}, work, stage_work, references)
+                    self.assertEqual([row["artifact"] for row in issues], [name])
+                    path.write_bytes(reference.read_bytes())
+            write_json_atomic(result, {**complete, "backend_eq": False})
+            issues, _details = drift.stage_loop_check({}, work, stage_work, references)
+            self.assertEqual([row["reason"] for row in issues], ["stage-loop did not prove frontend/backend fixpoint"])
+
+    def test_generated_drift_rechecks_reference_after_regeneration(self):
+        output, selected, cfg = self.drift_fixture()
+        work = self.root / "drift"
+        receipt = output.with_name("ouro1.bootstrap.json")
+        report_path = self.work / "report.json"
+        paths = [receipt, report_path, self.work / "out/p1/backend_u.c", self.work / "out/p2/backend_u.c"]
+        before = {path: path.read_bytes() for path in paths}
+        for replacement in ("tampered", "generated-c", "metadata-only"):
+            with self.subTest(replaced_evidence=replacement):
+                def change_reference(*_args, replaced_evidence=replacement):
+                    backend = self.work / "out/p2/backend_u.c"
+                    if replaced_evidence != "metadata-only":
+                        backend.write_bytes(b"reference changed during regeneration")
+                    if replaced_evidence != "tampered":
+                        evidence = json.loads(before[report_path])
+                        if replaced_evidence == "generated-c":
+                            (self.work / "out/p1/backend_u.c").write_bytes(backend.read_bytes())
+                            evidence["complete_generated_c_comparison"]["backend_u.c"] = {
+                                "p1_sha256": sha256_file(backend), "p2_sha256": sha256_file(backend)}
+                        else:
+                            evidence["fixture_metadata"] = "report replaced during regeneration"
+                            self.assertEqual(backend.read_bytes(), before[backend])
+                        write_json_atomic(report_path, evidence)
+                        installed = json.loads(before[receipt])
+                        installed["report_sha256"] = sha256_file(report_path)
+                        write_json_atomic(receipt, installed)
+                        self.assertTrue(bootstrap.installed_current(output, receipt, selected))
+                    return [], {}
+
+                with patch.object(drift, "ROOT", self.root), patch.object(drift, "manifest_checks", return_value=([], [])), \
+                     patch.object(build, "load_config", return_value=cfg), patch.object(inputs, "read_bundle", return_value=({}, {})), \
+                     patch.object(inputs, "verify_stage0"), patch.object(bootstrap, "current_inputs", return_value=selected), \
+                     patch.object(drift, "frontend_regen_check", side_effect=change_reference):
+                    self.assertEqual(drift.main(["--mode", "frontend", "--work", str(work)]), 1)
+                report = json.loads((work / "generated-artifact-drift.json").read_text())
+                self.assertFalse(report["pass"])
+                self.assertEqual(report["issues"][0]["reason"], "unverified current generated-artifact reference")
+                if replacement != "tampered":
+                    self.assertIn("evidence changed during regeneration", report["issues"][0]["error"])
+                for path in paths:
+                    path.write_bytes(before[path])
 
     def test_missing_python_stops_shell_bootstrap_before_compilation(self):
         shell = shutil.which("sh")

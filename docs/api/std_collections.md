@@ -64,8 +64,8 @@ Complete overlapping windows; width zero has no windows.
 ## def list_scan
 
 ```
-def list_scan (A : Type) (S : Type) (step : S -> A -> S)
-    (initial : S) (xs : List A) : List S
+def list_scan (A : Type) (S => State : Type) (step : State -> A -> State)
+    (initial : State) (xs : List A) : List State
 ```
 
 The initial state is the first result, even for an empty input.
@@ -73,9 +73,9 @@ The initial state is the first result, even for an empty input.
 ## def list_map_accum
 
 ```
-def list_map_accum (A : Type) (S : Type) (B : Type)
-    (step : S -> A -> Pair S B) (initial : S) (xs : List A)
-    : Pair S (List B)
+def list_map_accum (A : Type) (S => State : Type) (B : Type)
+    (step : State -> A -> Pair State B) (initial : State) (xs : List A)
+    : Pair State (List B)
 ```
 
 ## def list_eq
@@ -153,16 +153,16 @@ def list_traverse_result (E : Type) (A : Type) (B : Type)
 ## def list_try_fold_result
 
 ```
-def list_try_fold_result (E : Type) (A : Type) (S : Type)
-    (step : S -> A -> Either E S) (initial : S) (xs : List A)
-    : Either E S
+def list_try_fold_result (E : Type) (A : Type) (S => State : Type)
+    (step : State -> A -> Either E State) (initial : State) (xs : List A)
+    : Either E State
 ```
 
 ## def list_try_fold_maybe
 
 ```
-def list_try_fold_maybe (A : Type) (S : Type)
-    (step : S -> A -> Maybe S) (initial : S) (xs : List A) : Maybe S
+def list_try_fold_maybe (A : Type) (S => State : Type)
+    (step : State -> A -> Maybe State) (initial : State) (xs : List A) : Maybe State
 ```
 
 ## def list_traverse_maybe

@@ -15,6 +15,12 @@ primitive contracts. Rejected, exhausted, cancelled, and malformed operations
 remain errors. Parser success and a successful lowering traversal do not
 establish declaration acceptance.
 
+Emission selects bodies through an index derived only from the accepted
+definition entries. Requested order, first-definition lookup, and typed
+missing/bodyless failures are preserved; the index adds no acceptance authority.
+Positivity certificate invalidation uses the earlier environment's actual
+entries; constructor reservations alone do not invalidate a certificate.
+
 `compiler/module_registry.ouro` and `compiler/module_names.ouro` resolve
 source-module names before the ordered declaration plan reaches the checker.
 They cannot authorize an unchecked import: each reached declaration and body
@@ -86,6 +92,13 @@ declarations and emission metadata for diagnostic comparisons.
 `compiler/native/lower_boundary.ouro` rechecks supplied declarations and
 metadata before native lowering, including a publicly constructed wrapper.
 
+`compiler/erasure_checked.ouro` derives emission bodies with normalized sort
+annotations and computed type arguments using the canonical checker operations.
+This view never replaces checked declarations or diagnostic snapshots. Resource,
+reduction and unsupported residual type-computation failures stop emission.
+The C adapter isolates preparation temporaries per accepted body and retains
+the typed result before releasing that body's temporary arena.
+
 The static gate restricts references to `CheckedProgramOf` in compiler sources
 to those four modules. References to `DeclarationsOk` are restricted to
 `compiler/file_check_model.ouro`, `compiler/file_elab.ouro`,
@@ -109,6 +122,16 @@ checking. This syntax adds no Core form, primitive type, runtime role, or
 bootstrap ABI.
 
 ## Current host assumptions
+
+The transitional C codegen preserves the full six-argument `codegen_block`
+fallback contract, including canonical liveness facts. Safepoint root clearing
+uses the Ouro liveness and clearing operations; incomplete facts remain errors.
+Descriptor metadata deduplicates complete host-representable symbol IDs without
+a 16-bit cutoff. Unrepresentable or malformed metadata declines the fast path
+before publishing a registry. The frontend-host suite compares these paths with
+canonical metadata and emitted bytes, including forced fallback. This is
+regression evidence within the existing execution assumptions, not a new
+program-acceptance authority.
 
 The working producer still uses committed stage0 C, a system C compiler, the
 repository C runtime and IO adapters, and Python/shell build orchestration.
@@ -152,7 +175,10 @@ declaration order, fuel outcomes, or acceptance judgments. The C-hosted
 native-build driver uses the same `compile_checked_units` seam so a
 compiler-sized program does not retain every parse and check temporary.
 The `lower_recheck_program` host wrapper supplies that same bounded declaration
-callback to Ouro's exact replay. The ordinary public entry still selects the
+callback to Ouro's exact replay. The callback resolves and captures the canonical
+checker once when constructed. Each declaration uses isolated allocation banks;
+the result returns to the caller's restored allocator and shares caller-owned
+terms and earlier accepted entries. The ordinary public entry still selects the
 canonical checker; declaration order, metadata equality, complete body lists,
 fuel failures, and rejection semantics remain Ouro-owned.
 The temporary N1 host also checkpoints the managed preparation result and
@@ -174,6 +200,10 @@ allocation context, retaining its full patch list or typed error before freeing
 the symbol-index and traversal temporaries. Curried arguments and the caller
 remain live. The wrapper does not resolve targets, inspect slots or change
 patch bytes, ordering, validation or diagnostic precedence.
+Patch application, indexed fixup resolution, function scanning and 32-bit field
+encoding also run in nested allocation contexts. These boundaries preserve
+their complete canonical result and caller-owned inputs while releasing
+operation-local temporaries; the host does not implement the PE decisions.
 Raising the MIR node/flow hard ceiling to `pe_byte3_place` is a host
 resource bound for compiler-sized images; it does not change typing,
 declaration order, or which MIR errors are accepted. The C wrap around
@@ -207,8 +237,7 @@ encoding substitutes for MIR validation. The Ouro
 `managed_validate_parts` / `native_emit_image` path retains the same check.
 C wraps around `mir_gc_infer`, `mir_gc_annotate`, `mir_gc_check`,
 `x64_encode`, `codegen_assemble`, `codegen_parts`,
-`codegen_live_instructions`, `codegen_instruction`, `codegen_block`, and
-`codegen_body` substitute
+`codegen_instruction`, `codegen_block`, and `codegen_body` substitute
 equivalent host walks for the same Ouro functions so a compiler-sized
 image can finish on the C-hosted producer. Liveness facts are computed by the
 canonical Ouro solver in a nested allocation context; its complete facts or
@@ -218,10 +247,10 @@ round-local storage; frozen input facts, summary order, convergence and fuel
 remain in the canonical solver. Accelerated
 function emission runs that same liveness check first for managed-root
 functions, preserving unknown-edge and convergence-budget failures.
-The live-instruction wrap
-keeps every managed slot live instead of running the interpreted
-intra-block transfer; that is sound and more conservative. Unrecognized
-instruction shapes fall back to the generated closures. Managed
+The wraps around `codegen_live_instructions` and `codegen_clear_dead_roots`
+retain each canonical operation's complete result in a nested allocation
+context and release its temporary work. Unrecognized instruction shapes
+fall back to the generated closures. Managed
 allocation and managed-context instructions are included in the
 `codegen_instruction` wrap. The wraps do not change which MIR errors
 are accepted; they are a host lifetime and time seam, not a second
@@ -322,7 +351,12 @@ alone cannot prove their implementation correct.
 OuroSmith generates typed Core and exercises the canonical checker. Its
 construction laws, known rejections, source mutants, and independent
 surface/runtime expectations are regression evidence. It contains no required
-second Core interpreter. The former OCaml and Python replay owners are retired;
+second Core interpreter. Surface runtime object reuse goes through the existing
+checked C object cache; source/dependency, command, compiler executable, object,
+and depfile hashes bind reuse. Each generated sample still compiles, links, and
+runs under the same bounded process-tree limits. This preparation does not
+authorize generated C or replace compiler-owned acceptance. The former OCaml
+and Python replay owners are retired;
 their historical schema and corpus are documented in
 [Core artifacts](kernel_core_artifact.md).
 
