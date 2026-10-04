@@ -117,9 +117,9 @@ substitutions, including declaration candidates before source refinement.
 Closed atomic aliases are retained in resolved form so linear alias chains
 remain linear work. Open and compound definitions retain their binder scope.
 Sort and function views require positive fuel and project already exposed
-`CSort` and `CPi` fields directly. Aliases and other heads retain the original
-bounded reduction path and typed failures; declaration and input-work checks
-remain in place.
+`CSort` and `CPi` fields directly without intermediate `Maybe` values. Aliases
+and other heads retain the original bounded reduction path and typed failures;
+declaration and input-work checks remain in place.
 Crashes and process limits are separate test failures.
 
 `CheckedProgram` is a compiler-owned representation, not an unforgeable module
