@@ -307,6 +307,77 @@ class BuildContracts(unittest.TestCase):
         self.assertEqual(self.run_build()["cache"], "hit")
         self.assertEqual(len(self.emissions), 1)
 
+    def test_current_installed_binary_warms_absent_cache_without_emit_or_link(self):
+        first = self.run_build()
+        directory = self.cfg.path("cache_dir") / "native-tools" / first["key"]
+        cached = directory / ("tool.exe" if os.name == "nt" else "tool")
+        metadata = directory / "tool.json"
+        cached.unlink()
+        metadata.unlink()
+        self.args.check = True
+        self.assertTrue(self.run_build()["current"])
+        self.assertFalse(cached.exists())
+        self.assertFalse(metadata.exists())
+        self.args.check = False
+        with patch.object(native, "emit", side_effect=AssertionError("unexpected emission")), \
+                patch.object(native.build, "build_c_executable", side_effect=AssertionError("unexpected link")):
+            self.assertEqual(self.run_build()["cache"], "installed-hit")
+            self.assertTrue(native.complete_binary(cached, metadata, first["key"]))
+            for missing in (cached, metadata):
+                with self.subTest(missing=missing.name):
+                    missing.unlink()
+                    self.assertEqual(self.run_build()["cache"], "installed-hit")
+                    self.assertTrue(native.complete_binary(cached, metadata, first["key"]))
+            self.args.output = self.root / "another-suite/tool"
+            self.assertEqual(self.run_build()["cache"], "hit")
+        self.assertEqual(len(self.emissions), 1)
+        self.assertEqual(len(self.links), 1)
+        self.assertEqual(self.output().read_bytes(), cached.read_bytes())
+
+    def test_stale_installed_input_cannot_warm_absent_cache(self):
+        for changed in ("binary", "source"):
+            with self.subTest(changed=changed):
+                first = self.run_build()
+                directory = self.cfg.path("cache_dir") / "native-tools" / first["key"]
+                cached = directory / ("tool.exe" if os.name == "nt" else "tool")
+                metadata = directory / "tool.json"
+                cached.unlink()
+                metadata.unlink()
+                receipt = Path(str(self.args.output) + ".build.json")
+                saved_receipt = receipt.read_bytes()
+                self.mutate(self.output() if changed == "binary" else self.root / "lib/base.ouro")
+                with patch.object(native, "emit", side_effect=RuntimeError("fresh emission required")):
+                    with self.assertRaisesRegex(RuntimeError, "fresh emission required"):
+                        self.run_build()
+                self.assertFalse(cached.exists())
+                self.assertFalse(metadata.exists())
+                self.assertEqual(list((self.cfg.path("cache_dir") / "native-tools").glob("*/tool.json")), [])
+                self.assertEqual(receipt.read_bytes(), saved_receipt)
+
+    def test_failed_installed_copy_cannot_publish_cache_completion(self):
+        first = self.run_build()
+        directory = self.cfg.path("cache_dir") / "native-tools" / first["key"]
+        cached = directory / ("tool.exe" if os.name == "nt" else "tool")
+        metadata = directory / "tool.json"
+        cached.unlink()
+        metadata.unlink()
+        receipt = Path(str(self.args.output) + ".build.json")
+        saved_receipt = receipt.read_bytes()
+        saved_output = self.output().read_bytes()
+        original_publish = native.publish
+
+        def damaged_copy(binary, output):
+            original_publish(binary, output)
+            output.write_bytes(b"corrupt copied image")
+
+        with patch.object(native, "publish", side_effect=damaged_copy):
+            with self.assertRaisesRegex(RuntimeError, "installed tool changed while warming content cache"):
+                self.run_build()
+        self.assertFalse(metadata.exists())
+        self.assertFalse(native.complete_binary(cached, metadata, first["key"]))
+        self.assertEqual(self.output().read_bytes(), saved_output)
+        self.assertEqual(receipt.read_bytes(), saved_receipt)
+
     def test_content_inputs_invalidate_even_with_preserved_mtime(self):
         previous = self.run_build()["key"]
         for path in (self.root / "lib/base.ouro", self.compiler, self.cc,

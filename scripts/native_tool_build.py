@@ -428,6 +428,18 @@ def build_tool(args: argparse.Namespace) -> dict:
 
     output.parent.mkdir(parents=True, exist_ok=True)
     report = {"kind": KIND, "key": key, "inputs": inputs, "cache": "installed-hit"}
+    cache_warmed = False
+    if current:
+        directory = cfg.path("cache_dir") / "native-tools" / key
+        binary = directory / ("tool.exe" if os.name == "nt" else "tool")
+        metadata = directory / "tool.json"
+        if not binary.is_file() or not metadata.is_file():
+            directory.mkdir(parents=True, exist_ok=True)
+            publish(output, binary)
+            if not complete_binary(binary, receipt, key):
+                raise RuntimeError("installed tool changed while warming content cache")
+            write_json_atomic(metadata, {"kind": KIND, "key": key, "binary_sha256": sha256_file(binary)})
+            cache_warmed = True
     if not current:
         cache_root = cfg.path("cache_dir") / "native-tools"
         work_root = cache_root if enabled else cfg.path("build_dir") / "native-tools-uncached"
@@ -477,7 +489,7 @@ def build_tool(args: argparse.Namespace) -> dict:
         os.utime(output, ns=(output.stat().st_atime_ns, newest))
     report.update(binary_sha256=sha256_file(output), elapsed_s=round(time.perf_counter() - started, 6))
     write_json_atomic(receipt, report)
-    if enabled and report["cache"] == "miss":
+    if enabled and (report["cache"] == "miss" or cache_warmed):
         build.trim_cache(cfg)
     print(f"BUILD_TOOL_CACHE: {report['cache']} key={key} elapsed_s={report['elapsed_s']}")
     print(f"BUILD_TOOL: OK {output}")

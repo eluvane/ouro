@@ -279,6 +279,8 @@ def write_stage_stamp(stamp: Path, *, signature: str, stage: int, prev_sha: str,
 
 
 def maybe_fast_path(cfg: StageConfig, signature: str, started: float) -> bool:
+    if not cfg.cache_enabled:
+        return False
     if cfg.promote or os.environ.get("OURO_STAGE_FAST_PATH", "1") in {"0", "false", "no", "disabled"}:
         return False
     data = load_json(cfg.result)
@@ -351,7 +353,7 @@ def emit_backend(prev: Path, out: Path, err: Path, cfg: StageConfig, stage: int)
     cache_file = cache_dir / f"backend_{key}.c"
     if cfg.cache_enabled:
         cache_dir.mkdir(parents=True, exist_ok=True)
-    if cfg.cache_enabled and cache_file.is_file() and cache_file.stat().st_size > 0:
+    if cfg.cache_enabled and freg.cached_output_matches(cache_file, key):
         copy_atomic(cache_file, out)
         err.write_text("", encoding="utf-8")
         print(f"STAGE_LOOP: backend cache-hit units={len(units)} -> {out}")
@@ -384,6 +386,7 @@ def emit_backend(prev: Path, out: Path, err: Path, cfg: StageConfig, stage: int)
         os.replace(tmp_err, err)
     if cfg.cache_enabled:
         copy_atomic(out, cache_file)
+        freg.record_cached_output(cache_file, key)
     return {"cache": "miss", "units": len(units), "bytes": out.stat().st_size, "elapsed_s": round(now() - t0, 6), "key": key, "module_cache": module_cache}
 
 
@@ -457,7 +460,7 @@ def build_stage_binary(frontend_c: Path, backend_c: Path, out: Path, stage: int,
     report_path = frontend_c.parent / "c_build_report.json"
     report = OB.build_c_executable(
         cfg.build_cfg,
-        name=f"stage_loop_ouro1_stage{stage}",
+        name="stage_loop_ouro1",
         sources=sources,
         output=out,
         object_dir=cfg.work / "c_objects",
@@ -668,7 +671,7 @@ def run_loop(cfg: StageConfig) -> int:
         stamp = sdir / "stage.stamp.json"
         prev_sha = sha256_file(prev)
         report: dict = {"stage": i, "reused": False}
-        if stage_stamp_ok(stamp, signature=signature, stage=i, prev_sha=prev_sha, stage_dir=sdir, bin_path=bin_path):
+        if cfg.cache_enabled and stage_stamp_ok(stamp, signature=signature, stage=i, prev_sha=prev_sha, stage_dir=sdir, bin_path=bin_path):
             report["reused"] = True
             report["artifacts"] = artifact_summary(sdir, bin_path)
             print(

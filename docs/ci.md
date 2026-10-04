@@ -136,8 +136,10 @@ interrupted run leaves no old successful aggregate at the current report path.
 The native CI runner also invalidates selected gate reports and the delegated
 host-inventory report. Failure to remove a report stops execution; a directory
 at a report path is never removed. Listing profiles does not change reports.
-Manual and Release prepare the current compiler before running each validation
-group, including when a restored compiler cache lacks its bootstrap evidence.
+PR, Nightly, Lint, and Release validation groups import one verified Linux
+compiler artifact. Cached Manual shares one producer per OS; cache-disabled
+Manual builds independently in every group. A restored compiler without its
+complete bootstrap evidence requires a fresh build before export.
 PR and Nightly validation jobs allow 120 minutes for the complete group;
 per-program execution and memory limits remain separate. Independent PR matrix
 groups finish when a sibling fails. Each group retains its fail-fast command,
@@ -639,6 +641,12 @@ Host-script retirement follows the evidence rules in
 The release workflow builds the host toolchains described in
 [Releasing](releasing.md). Its build and assemble jobs stay read-only.
 
+Nightly, Lint, and Release validation share the same verified Linux compiler
+producer contract as PR. Each group imports the producer's artifact and checks
+its SHA, current inputs, toolchain, and complete bootstrap evidence. Their
+validation inventories and limits stay unchanged. Release platform packaging
+continues to build its own compact-source compiler.
+
 Manual validates the complete selected profile on Ubuntu and Windows. With
 caching enabled, one compiler producer per OS exports the bootstrap evidence;
 each validation group verifies the artifact SHA, current source and toolchain
@@ -648,6 +656,8 @@ group. Windows Manual and Release jobs pin MinGW 16.1.0 and select only
 the next steps' `PATH` and set `CC=gcc`; a native Python check requires that
 exact compiler path and version before building or importing the compiler.
 Compiler and bootstrap receipts retain their complete identity checks.
+Linux Manual uses the project C compiler configuration, matching the other Linux
+producers; Windows selects its pinned gcc before identifying or importing it.
 
 Select `task=frontend-security` in Manual for the canonical frontend-security
 suite alone on Ubuntu and Windows. The diagnostic task reuses compiler
@@ -790,8 +800,16 @@ The shared PR compiler cache is keyed by the bootstrap driver's full current
 input identity, including the host C compiler and flags. It includes the
 completion report, input manifest, and both generated C comparisons referenced
 by `ouro1.bootstrap.json`; `_build/c` alone cannot establish a reusable compiler.
-Suite caches remain separate. Kernel and Portable restores try their own cache
-prefix first. Only trusted branch pushes save PR caches.
+Suite caches remain separate. Matrix and Kernel restores try their own cache
+prefix first, then the compatible checks suite cache. Portable restores only its
+own cache, which includes the bootstrap evidence needed on macOS. Only trusted
+branch pushes save PR caches.
+
+Nightly, Release validation, Lint, and cached Manual use the same compiler cache
+namespace and exact input key. Shared compiler cache writes are limited to trusted
+default-branch runs; Lint only restores. Suite caches remain workflow-specific;
+Lint can restore the compatible Nightly cache for its own group before importing
+the verified compiler.
 
 Restored data is followed by the relevant parity, hash, regeneration, or
 compiler-checking validation. Cache state does not establish program acceptance

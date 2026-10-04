@@ -105,7 +105,7 @@ def fail(message: str):
 
 def current_inputs(root: Path, cfg, build, *, compact_sources: bool = False) -> dict:
     roots = [source for _tag, _module, source, _file in frontend.FRONTEND_TUS] + ["compiler/backend.ouro"]
-    graph = {source: frontend.collect_units(source) for source in [*roots, *ACCEPTANCE_ROOTS]}
+    graph = frontend.collect_units_many([*roots, *ACCEPTANCE_ROOTS])
     if len(roots) != 15 or any(not units or units[-1] != source for source, units in graph.items()):
         fail("incomplete current source graph")
     paths = {*HELPERS, *RUNTIME, *(name for units in graph.values() for name in units),
@@ -419,7 +419,8 @@ def worker(args) -> None:
             fail("historical C build requested for a current stage")
         build.build_c(cfg)
     elif args.action == "frontend":
-        if any(frontend.collect_units(source) != graph[source] for source in snapshot["selected"]["roots"]):
+        current_graph = frontend.collect_units_many(snapshot["selected"]["roots"])
+        if any(current_graph[source] != graph[source] for source in snapshot["selected"]["roots"]):
             fail("worker ordered source closure changed")
         frontend.regenerate(ouro1=args.producer, fuel=FUEL, out_c=out / "driver_u.c", work=out / "fe",
             cache_root=out / "k", cache_enabled=False, report_path=out / "frontend.json", jobs=workers)

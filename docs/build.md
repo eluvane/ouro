@@ -433,7 +433,8 @@ complete C comparisons must still match their hashes. A miss or `--no-cache`
 runs the complete bootstrap chain in fresh output directories; this transitional
 path does not reuse individual stages after a source change.
 
-Hosted PR jobs share one Linux compiler build through a workflow artifact.
+Hosted PR, Nightly, Lint, and Release validation jobs share one Linux compiler
+build through a workflow artifact. Cached Manual uses one producer per OS.
 `scripts/ci_gate.py --compiler-artifact export` packages the installed binary,
 its receipt, input manifest, completion report, and both complete generated C
 comparisons. Consumers import the producer's archive with
@@ -443,11 +444,23 @@ bootstrap verifier. Missing or changed evidence fails the job. This transport
 retains the current C-hosted bootstrap contract and does not grant program
 acceptance authority to an artifact or cache. macOS builds its own compiler.
 
+Stage-loop shares checked runtime C objects between stages while keeping generated
+stage inputs and outputs separate. C object and link reuse includes the selected
+compiler's bytes and include/library environment. Disabling the cache bypasses
+object, link, stage, and whole-loop reuse. Cached backend C requires the same
+input-key and output-hash completion record as frontend C.
+
+Module preparation shares import reads only within one invocation; later calls
+reread source contents. Stage labels remain report metadata and do not invalidate
+otherwise identical module artifacts.
+
 `scripts/native_tool_build.py` keys a native tool by its transitive source
 contents, seed compiler and C compiler hashes, runtime sources/headers, build
 helpers, fuel, flags, platform, and compiler include/library environment. It
 checks a completion record and the binary hash before reuse, including reuse
-at another output path. Source timestamps are only launcher startup hints.
+at another output path. A verified installed tool repopulates a missing cache
+binary or completion record, so another output path can reuse that image without
+emission or linking. Source timestamps are only launcher startup hints.
 Changing content with a preserved timestamp invalidates the build-tool key;
 changing only a timestamp does not require recompilation.
 The lint suite always invokes this receipt check before running its binary,

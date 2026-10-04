@@ -178,6 +178,54 @@ def test_generated_c_object_cache(tmp: Path) -> None:
         assert counts(cc_log) == (18, 5), seventh
         assert seventh["compile_misses"] == 5 and seventh["link_cache"] == "miss", seventh
 
+        stage2_dir = repo / "_build/stage_loop/stage2"
+        stage2_fe, stage2_be = write_generated_sources(stage2_dir)
+        shutil.copyfile(fe, stage2_fe)
+        shutil.copyfile(be, stage2_be)
+        stage2_out = repo / "_build/stage_loop/ouro1_stage2"
+        before_compile, before_link = counts(cc_log)
+        shared = mod.build_stage_binary(stage2_fe, stage2_be, stage2_out, 2, cfg_cc2)
+        assert counts(cc_log) == (before_compile + 2, before_link + 1), shared
+        assert shared["compile_hits"] == 3 and shared["compile_misses"] == 2, shared
+        assert shared["link_cache"] == "miss", shared
+        static_objects = {
+            src["label"]: src["object"]
+            for src in seventh["sources"] if src["label"].startswith("static/")
+        }
+        stage2_static_objects = {
+            src["label"]: src["object"]
+            for src in shared["sources"] if src["label"].startswith("static/")
+        }
+        assert len(static_objects) == 3 and stage2_static_objects == static_objects
+        assert [src["label"] for src in shared["sources"] if src["cache"] == "miss"] == [
+            "stage2/frontend", "stage2/backend"
+        ], shared
+
+        runtime_obj = repo / static_objects["static/ouro_rt"]
+        expected_object = runtime_obj.read_bytes()
+        expected_binary = stage2_out.read_bytes()
+        runtime_obj.write_bytes(b"corrupt shared runtime object\n")
+        repaired = mod.build_stage_binary(stage2_fe, stage2_be, stage2_out, 2, cfg_cc2)
+        assert counts(cc_log) == (before_compile + 3, before_link + 1), repaired
+        assert repaired["compile_hits"] == 4 and repaired["compile_misses"] == 1, repaired
+        miss, = [src for src in repaired["sources"] if src["cache"] == "miss"]
+        assert miss["label"] == "static/ouro_rt" and miss["reason"] == "object-hash", miss
+        assert runtime_obj.read_bytes() == expected_object
+        assert repaired["link_cache"] == "hit" and stage2_out.read_bytes() == expected_binary, repaired
+
+        with patch.dict(os.environ, {"OURO_CACHE": "0"}):
+            cfg_off = make_cfg(mod, repo)
+            assert cfg_off.cache_enabled is False
+            for _attempt in range(2):
+                before_compile, before_link = counts(cc_log)
+                cold = mod.build_stage_binary(stage2_fe, stage2_be, stage2_out, 2, cfg_off)
+                assert counts(cc_log) == (before_compile + 5, before_link + 1), cold
+                assert cold["compile_hits"] == 0 and cold["compile_misses"] == 5, cold
+                assert cold["link_cache"] == "miss", cold
+                assert all(src["reason"] == "cache-disabled" for src in cold["sources"]), cold
+                assert cold["link"]["reason"] == "cache-disabled", cold
+                assert stage2_out.read_bytes() == expected_binary
+
 
 def test_promote_normalizes_generated_c_to_lf(tmp: Path) -> None:
     repo = tmp / "repo-promote"

@@ -30,6 +30,7 @@ ROOT = Path(__file__).resolve().parents[1]
 rel = bind_relative_path(ROOT, resolve=True)
 
 DECL_RE = re.compile(r"^\s*(def|inductive|record|axiom|theorem|lemma|effect|handler)\s+([A-Za-z_][A-Za-z0-9_']*)")
+IMPORT_IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_']*")
 
 
 @dataclass(frozen=True)
@@ -198,7 +199,7 @@ def quoted_import_targets(source_text: str, source_path: str) -> list[str]:
             tokens.append(("string" if closed else "unterminated", "".join(value)))
             index += int(closed)
         else:
-            ident = re.match(r"[A-Za-z_][A-Za-z0-9_']*", source_text[index:])
+            ident = IMPORT_IDENT_RE.match(source_text, index)
             value = ident.group(0) if ident else char
             tokens.append(("word", value))
             index += len(value)
@@ -294,12 +295,13 @@ def tool_digest(tool_inputs: Sequence[Path], *, schema: str) -> Tuple[str, dict]
     return hash_json(meta), meta
 
 
-def make_module_plans(modules: Sequence[str], tool_hash: str) -> Dict[str, ModulePlan]:
+def make_module_plans(modules: Sequence[str], tool_hash: str, *, import_reader=None) -> Dict[str, ModulePlan]:
     plans: Dict[str, ModulePlan] = {}
+    read_imports = import_reader or import_targets
     for path in modules:
         p = ROOT / path if not Path(path).is_absolute() else Path(path)
         src = file_digest(p)
-        imports = tuple(import_targets(path))
+        imports = tuple(read_imports(path))
         decls = declaration_names(path)
         direct_key = hash_json(
             {
@@ -356,10 +358,10 @@ def closure_key_for(
     )
 
 
-def closure_of(path: str, unit_graph: Mapping[str, Sequence[str]]) -> List[str]:
+def closure_of(path: str, unit_graph: Mapping[str, Sequence[str]], *, import_reader=None) -> List[str]:
     if path in unit_graph:
         return list(unit_graph[path])
-    return collect_units(path)
+    return collect_units(path, imports=import_reader)
 
 
 def reverse_dependency_closure(changed: Sequence[str], modules: Sequence[str], plans: Mapping[str, ModulePlan]) -> List[str]:
@@ -410,18 +412,26 @@ def materialize_module_artifacts(
     roots_norm = [normalize_path(r) for r in roots]
     if not roots_norm:
         raise SystemExit("MODULE_CACHE: FAIL no roots")
+    # Preparation-local adjacency; the next invocation rereads source contents.
+    import_adjacency: Dict[str, Tuple[str, ...]] = {}
+
+    def read_imports(path: str) -> Tuple[str, ...]:
+        if path not in import_adjacency:
+            import_adjacency[path] = tuple(import_targets(path))
+        return import_adjacency[path]
+
     graph: Dict[str, List[str]] = {}
     if unit_graph is not None:
         for k, v in unit_graph.items():
             graph[normalize_path(k)] = [normalize_path(x) for x in v]
     for root in roots_norm:
-        graph.setdefault(root, collect_units(root))
+        graph.setdefault(root, collect_units(root, imports=read_imports))
     modules = ordered_union(graph[root] for root in roots_norm)
     work.mkdir(parents=True, exist_ok=True)
     schema = "v1"
     tool_hash, tool_meta = tool_digest(tool_inputs, schema=schema)
     seed_digest = file_digest(seed) if seed is not None and seed.exists() else None
-    plans = make_module_plans(modules, tool_hash)
+    plans = make_module_plans(modules, tool_hash, import_reader=read_imports)
     old_manifest = read_json_object_or_none(work / "selfhost-module-cache.json")
     old_modules = old_manifest.get("modules", []) if isinstance(old_manifest, dict) else []
     old_by_path: Dict[str, dict] = {m.get("path"): m for m in old_modules if isinstance(m, dict) and isinstance(m.get("path"), str)}
@@ -445,7 +455,7 @@ def materialize_module_artifacts(
     closure_keys: Dict[str, str] = {}
     closure_lists: Dict[str, List[str]] = {}
     for mod in modules:
-        closure = closure_of(mod, graph)
+        closure = closure_of(mod, graph, import_reader=read_imports)
         # A standalone imported module can be absent from graph if it only appears
         # through caller-provided roots.  Ensure closure contains only planned modules.
         for u in closure:
@@ -460,7 +470,6 @@ def materialize_module_artifacts(
         old = old_by_path.get(mod, {})
         direct_payload: Dict[str, object] = {
             "kind": "ouro.selfhost-module-direct-artifact.v1",
-            "label": label,
             "path": mod,
             "source": asdict(plan.source),
             "imports": list(plan.imports),
@@ -492,7 +501,6 @@ def materialize_module_artifacts(
         phase_keys = phase_keys_for(mod, plan.direct_key, ckey)
         closure_payload: Dict[str, object] = {
             "kind": "ouro.selfhost-module-closure-artifact.v1",
-            "label": label,
             "path": mod,
             "root": mod,
             "closure": [{"path": u, "direct_key": plans[u].direct_key, "source": asdict(plans[u].source)} for u in closure_lists[mod]],
