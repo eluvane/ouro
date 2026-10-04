@@ -1279,18 +1279,20 @@ class LimitTests(unittest.TestCase):
             state = Path(f"/proc/{pid}/status").read_text()
         except (FileNotFoundError, ProcessLookupError):
             return
-        self.assertIn("State:\tZ", state)
+        self.assertRegex(state, r"(?m)^State:\t(?:Z \(zombie\)|X \(dead\))$")
 
     def test_posix_process_observation_handles_reaping(self):
         for error in (FileNotFoundError(), ProcessLookupError()):
             with self.subTest(error=type(error).__name__), patch.object(Path, "read_text", autospec=True, side_effect=error) as read:
                 self.assert_posix_process_exited(123)
                 read.assert_called_once_with(Path("/proc/123/status"))
-        with patch.object(Path, "read_text", autospec=True, return_value="State:\tZ (zombie)\n") as read:
-            self.assert_posix_process_exited(123)
-            read.assert_called_once_with(Path("/proc/123/status"))
-        with patch.object(Path, "read_text", autospec=True, return_value="State:\tS (sleeping)\n"), self.assertRaises(AssertionError):
-            self.assert_posix_process_exited(123)
+        for state in ("State:\tZ (zombie)\n", "Name:\tpython3\nState:\tX (dead)\n"):
+            with self.subTest(state=state), patch.object(Path, "read_text", autospec=True, return_value=state) as read:
+                self.assert_posix_process_exited(123)
+                read.assert_called_once_with(Path("/proc/123/status"))
+        for state in ("State:\tS (sleeping)\n", "Name:\tZ\nState:\tR (running)\n"):
+            with patch.object(Path, "read_text", autospec=True, return_value=state), self.assertRaises(AssertionError):
+                self.assert_posix_process_exited(123)
         with patch.object(Path, "read_text", autospec=True, side_effect=PermissionError()), self.assertRaises(PermissionError):
             self.assert_posix_process_exited(123)
 
@@ -1388,7 +1390,7 @@ class LimitTests(unittest.TestCase):
                     finally:
                         close_handle(handle)
             else:
-                # A just-orphaned killed process can briefly be a zombie.
+                # A killed process can remain visible during reaping.
                 self.assert_posix_process_exited(pid)
 
 

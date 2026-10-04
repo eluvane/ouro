@@ -1,12 +1,12 @@
 # Writing good Ouro
 
-A practical handbook for programmers, coding agents, and reviewers.
+A practical handbook for programmers and reviewers.
 
 **Repository:** `eluvane/ouro` · **Revision:** `182f7210c0e989cd7526b54e6c6a1a58f774134b` · **Reviewed:** 2026-09-30.
 
 This guide describes the `main` snapshot above, not an imagined future language. Ouro is pre-1.0: pin the compiler and standard library together, and recheck programs when upgrading. All repository links below are pinned to the reviewed revision. See the [compatibility policy][stability].
 
-**Verification boundary.** Recommendations were checked against the language contracts, compiler and tool implementations, standard-library source, maintained samples, and focused fixtures. The examples were source-audited, **not compiled or executed in this session**: a runnable toolchain could not be obtained in the execution environment. Illustrative results below describe the reviewed implementation, not newly measured runs.
+**Verification boundary.** Recommendations and examples were source-audited against the language contracts, compiler and tool implementations, standard-library source, maintained samples, and focused fixtures. Illustrative results describe the reviewed implementation; they are not evidence of compiled examples, executed tests, or measured performance.
 
 **Reading code examples.** Unless a block states otherwise, examples are separate modules placed one directory below the repository root, so `import "../std/...";` resolves. Do not concatenate all examples: some intentionally compare alternative declarations with the same responsibility. Adjust relative imports for your own layout. Expression-only examples identify their required scope. Names declared in examples are application code, not claimed standard-library APIs.
 
