@@ -639,6 +639,14 @@ group. Windows Manual and Release jobs pin MinGW 16.1.0 and select only
 the next steps' `PATH` and set `CC=gcc`; a native Python check requires that
 exact compiler path and version before building or importing the compiler.
 Compiler and bootstrap receipts retain their complete identity checks.
+
+Select `task=frontend-security` in Manual for the canonical frontend-security
+suite alone on Ubuntu and Windows. The diagnostic task reuses compiler
+verification, toolchains, cache controls, and the 120-minute job limit; all
+frontend host limits, 40 probes, and Windows direct PE checks remain required.
+Its result does not certify a complete profile. The default `validate` task
+still selects every group in the chosen profile.
+
 The `api` task runs the canonical API generators and checks, then uploads
 a review patch without publishing source changes. This artifact task does not
 run or certify a validation profile.
