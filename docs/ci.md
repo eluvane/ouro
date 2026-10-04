@@ -70,7 +70,9 @@ The group names are `checks`, `checks-parity`, `checks-quality`, `analysis`, `ch
 
 `--group` supports PR, nightly, manual, kernel, stage-loop, docs, and kernel-extra profiles.
 `--list-groups` prints the selected profile's complete group list as JSON;
-Manual and Release use that inventory to construct their hosted matrices.
+Manual and extended Release profiles use that inventory to construct their
+hosted matrices. Release defaults to the same complete PR routing as ordinary
+CI on `main`; changed-file lint groups require a diff and are not selected there.
 Release metadata and assembly require every validation group to succeed.
 
 The stage-loop profile separates `checks-parity` (`parity`) and `checks-quality`
