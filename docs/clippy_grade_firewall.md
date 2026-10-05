@@ -129,6 +129,11 @@ downgrade. Name length, `_checked` spelling, function size, parameter counts,
 stdout text, basename/layer guesses and apparent overwrite intent no longer
 produce Clippy diagnostics. Existing lint duplicate-import checks remain.
 
+The table below covers core and scalar rules. [Result and Maybe laws](#result-and-maybe-laws),
+[collection composition laws](#collection-composition-laws), and the separate
+[collection and string performance guide](clippy-collections-performance.md)
+cover the other active semantic groups without duplicating the registry.
+
 | Rule | Strict | Evidence |
 | --- | --- | --- |
 | `OURO-CLIPPY-FRONTEND-001` | `fatal` | The compiler frontend or structural fact build did not complete; Clippy cannot publish a successful analysis. |
@@ -191,7 +196,7 @@ same branch and effect epoch, without another expression traversal.
 Those same-operation laws require the same resolved callee; composition
 laws instead require their explicitly registered compatible operation roles.
 These are review-required suggestions; evaluation and source spans are not
-edit proofs. All twenty scalar/composition additions use `warn` in baseline
+edit proofs. These operation and composition rules use `warn` in baseline
 and project and `deny` in strict and release.
 
 Composition proofs use the existing sorted producer/consumer join, not source
@@ -210,6 +215,28 @@ Literal text bounds use the byte length reconstructed from a present intern
 entry, not a character count; valid UTF-8 continuation-byte indexes stay clean.
 The zero-count slice and empty-needle search rules take precedence at their
 intersections with out-of-bounds slicing and reflexive search.
+
+## Result and Maybe laws
+
+`OURO-CLIPPY-REDUNDANT-101` through `115` cover fixed constructor choices in
+Result/Maybe maps, binds, recovery, folds, defaults, conversions, and the
+registered unit/Maybe round trips. They require resolved API contracts, exact
+arity, matching types and producer identities in the same branch and effect
+epoch. A skipped callback invocation does not permit dropping evaluation of
+its argument; explicit default and conversion policies are not silent error loss.
+
+`116` through `118` require a complete pure unary identity callback with
+unchanged input/output types. Passing a checked result through that map
+preserves its must-observe obligation. `119` and `120` require the same executed
+checked producer and a dominating selected Left/Right arm; a later predicate or
+success-arm default is redundant only in that branch and effect epoch.
+
+These rules are review-only: baseline/project `warn`, strict/release `deny`.
+`semantic_result_laws.ouro`, `semantic_result_identity.ouro`, and
+`semantic_result_paths.ouro` consume the shared semantic facts.
+`tests/clippy_semantic/result_laws.ouro` and the `result-expansion-*` cases in
+`cases.json` retain positive and negative coverage, including identity maps
+that still require checked-result observation. No automatic edit is authorized.
 
 ## Fix publication and convergence
 

@@ -127,8 +127,8 @@ output bytes. [Effects and IO](effects_design.md#runtime-surface) documents
 line limits, EOF, failures, deferred actions, flush, exit, strict Unicode
 arguments, and environment lookup behavior.
 
-`std/runtime.ouro` declares `String` and its pure operations as checked
-intrinsics. Existing imports and helper signatures stay the same. Programs
+`std/string_prims.ouro` declares `String` and its pure operations as checked
+intrinsics; `std/runtime.ouro` imports those declarations. Programs
 with a standalone prelude must use the registered `ouro.string` type instead
 of an opaque `axiom String : Type;`; import `std/string.ouro` for the standard
 declarations. String lengths and offsets count bytes. See
@@ -325,13 +325,20 @@ configx_validate_schema cfg
   ]
 ```
 
-`std/workspace.ouro` groups checked paths beneath one root:
+`std/workspace.ouro` groups checked file operations around a root path.
+`workspace_file` and `workspace_dir` join strings without validating relative
+paths or preventing `..` escapes:
 
 ```ouro
-match workspace_make "_build/my_tool" with
-| Left e => fs_error_message e
-| Right w => workspace_file w "out/report.txt"
-end
+import "../std/workspace.ouro";
+
+def workspace_report_path : IO (Either FsError String) :=
+    do let! made := workspace_make "_build/my_tool";
+       io_pure (Either FsError String)
+         (let? (Left, Right) : Either FsError String do
+            let w : Workspace := made?;
+            workspace_file w "out/report.txt"
+          end);
 ```
 
 Temp and backup helpers do not promise atomic replacement or unpredictable
@@ -339,7 +346,11 @@ temporary names.
 
 ## JSON, CSV, and tables
 
-`std/csv.ouro` provides bounded CSV parsing/printing. `std/table.ouro` adds header-aware operations, so programs can use column names instead of numeric column positions.
+`std/csv.ouro` provides bounded CSV parsing/printing. Parsing splits physical
+lines before fields; quoted multiline fields are unsupported, and `csv_parse`
+returns rows rather than typed malformed-CSV errors. `std/table.ouro` adds
+header-aware operations, so programs can use column names instead of numeric
+column positions.
 
 ```ouro
 let rows : List (List String) := table_from_csv text in

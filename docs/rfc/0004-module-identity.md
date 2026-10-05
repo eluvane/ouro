@@ -75,11 +75,15 @@ The existing compiler-owned declaration checker still receives the complete
 ordered import closure and decides acceptance. Missing units, cycles, name
 resolution exhaustion, and malformed source remain typed failures.
 
-Identity rewriting activates when the reached graph has an alias or selective
-edge. Plain-only graphs retain the existing duplicate-declaration error for
-collisions. Private declarations, re-exports, and two same-named record
-declarations remain subsequent contracts; record generation still uses a
-shared registry before declaration ownership is assigned.
+Identity rewriting activates when the reached graph has an alias, selective
+edge, or private declaration. Plain-only graphs without private declarations
+retain the existing duplicate-declaration error for collisions. Plain graphs with
+private declarations still reject colliding public names. Private visibility
+follows the current [module syntax](../syntax.md#modules-and-imports);
+hidden declarations and bodies remain in the complete checker input.
+Explicit re-exports and two same-named record declarations remain subsequent
+contracts; record generation still uses a shared registry before declaration
+ownership is assigned.
 
 ## Compatibility and migration
 
@@ -144,5 +148,6 @@ The first implementation uses errors 95 for a missing direct member, 96 for
 an ambiguous imported short name, 97 for resolution fuel exhaustion, and 98
 for a malformed name mapping or a qualified marker in a declaration or binder.
 Raw marker input is a lexical error 11; an unknown dotted prefix follows the
-existing record-projection error 77. The broader privacy and re-export
-contract remains proposed, not maintainer-accepted.
+existing record-projection error 77. This RFC remains proposed despite the
+implemented aliases, selective imports, and private visibility; explicit re-exports
+remain outside that implementation.

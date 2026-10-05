@@ -302,8 +302,8 @@ Object identity includes the source, dependencies, compiler identity, flags,
 profile, and reproducibility mode. Missing or malformed dependency metadata is a
 cache miss, not a successful build.
 
-`scripts/bootstrap.sh` and plain `ouro_build.py build` require Python 3 and a C
-compiler. A clean source checkout needs no Git history, network download, or
+`scripts/bootstrap.sh` and plain `ouro_build.py build` require Python 3.10 or later
+and a C compiler. A clean source checkout needs no Git history, network download, or
 pre-existing Ouro executable. The driver performs four stages:
 
 1. Compile the committed `compiler/stage0/` C with its matching pinned

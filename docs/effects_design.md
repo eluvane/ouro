@@ -11,6 +11,11 @@ The [getting-started program](getting_started.md#run-a-native-program) shows
 `let!` spelling. These forms lower through the existing IO representation and
 do not add effectful computation to the pure typechecker.
 
+Typed [fallible blocks](language/ergonomic-syntax.md#typed-fallible-blocks)
+use `let? ... do ... end` for propagation within a checked container. They
+lower to pure cases and lets, without running IO action values or catching
+runtime failures.
+
 ## Runtime surface
 
 `std/runtime.ouro` declares checked String, standard-stream/exit, argument,

@@ -425,9 +425,10 @@ type, and completeness. A lone `Just` pattern for `Maybe A` is incomplete and
 is rejected. Repeated field names are rejected by the parser.
 
 The subject occupies the single match scrutinee and is evaluated once. Field
-names scope over the expression after `in`, or the rest of the block after `;`;
-they are unavailable in the subject and after the expression. Blocks retain
-their mandatory final expression and cannot sequence standalone actions.
+names scope over the expression after `in`, or the rest of a pure `let { ... }`
+block after `;`; they are unavailable in the subject and after the expression.
+Pure blocks retain their mandatory final expression and cannot sequence
+standalone actions.
 
 The existing bidirectional elaborator obtains family parameters from the
 checked subject and infers an unannotated match result from a constructor
@@ -542,10 +543,13 @@ payload `B`. Failure immediately returns the header's failure constructor;
 success binds its payload to `x` for the rest of the block. The annotation
 may be omitted when the existing bounded surface hint can identify `B` from
 `e`. An ambiguous payload needs an explicit annotation. A standalone `e?;`
-discards its successful payload. Ordinary local `let` bindings are also
-allowed. The mandatory final expression is the success payload and is wrapped
-in the header's success constructor. A final `e?` returns the checked
-container directly. There is no automatic conversion between error types.
+discards its successful payload. Ordinary identifier-binding local `let`
+statements are also allowed. For [constructor destructuring](#checked-destructuring-lets),
+use a parenthesized ordinary `let ... in` expression; a constructor-pattern
+statement ending in `;` is not accepted in this block. The mandatory final
+expression is the success payload and is wrapped in the header's success
+constructor. A final `e?` returns the checked container directly. There is no
+automatic conversion between error types.
 The bounded lowering rejects a local binding that reuses an outer type name
 referenced by the block header, avoiding capture of that type in the result.
 
@@ -558,6 +562,10 @@ named or anonymous holes remain rejected. Empty blocks, missing final
 expressions, and trailing semicolons are rejected. The block lowers to
 ordinary checked `case`, constructor applications, and local lets; it adds no
 new kernel form or effect handler.
+
+The `do ... end` here delimits a pure expression. It does not sequence IO
+actions or accept `let!` bindings; IO action values keep their ordinary
+deferred behavior. See [IO `do`](../syntax.md#io-and-do) for effectful sequencing.
 
 ## Maybe fallback operator
 
@@ -592,8 +600,9 @@ rejected forms, import graph/diagnostic cases, and formatter round trips.
 ## Scope
 
 These forms add no private exports, re-exports, tuple allocation,
-declaration-site defaults, early return, or general effect handling. For language direction and
-compatibility, see [Design](../design.md#language-direction) and
+declaration-site defaults, function-level early return, or general effect
+handling. Fallible propagation ends at the enclosing typed block. For language
+direction and compatibility, see [Design](../design.md#language-direction) and
 [Stability](../stability.md#experimental-areas).
 
 ## Compatibility

@@ -187,8 +187,9 @@ let? (Left, Right) : Either Error Nat do
 end
 ```
 
-The header identifies the actual failure and success constructors. See
-[Typed fallible blocks](language/ergonomic-syntax.md#typed-fallible-blocks)
+The header identifies the actual failure and success constructors. Its
+`do ... end` delimits fallible propagation; [IO `do`](#io-and-do) sequences
+runtime actions. See [Typed fallible blocks](language/ergonomic-syntax.md#typed-fallible-blocks)
 for payload inference, boundaries, and rejection rules.
 
 For a registered `Maybe A`, `value ?? fallback` selects the payload of
@@ -708,8 +709,10 @@ argument convention is obvious.
 
 ## IO and `do`
 
-Runnable programs export `main : IO Unit`. A `do` expression sequences actions,
-uses `let!` for an action's result, and uses ordinary `let` for a pure value:
+IO programs can export `main : IO Unit`; accepted native managed entry types
+are listed under [native declarations](#experimental-native-declarations).
+A `do` expression sequences actions, uses `let!` for an action's result, and
+uses ordinary `let` for a pure value:
 
 ```ouro
 def echo : IO Unit :=

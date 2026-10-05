@@ -63,7 +63,7 @@ runs in Nightly and on demand. Run one group with:
 python3 scripts/ci_gate.py --profile pr --group checks
 ```
 
-The group names are `checks`, `checks-parity`, `checks-quality`, `analysis`, `checker`, `analyzer`,
+The PR group names are `checks`, `checks-parity`, `checks-quality`, `analysis`, `checker`, `analyzer`,
 `analyzer-lint`, `lint`,
 `tests`, `smith`, `samples-1`, `samples-2`, and `compiler-1` through
 `compiler-16`. Substitute the selected name after `--group`.
@@ -169,12 +169,14 @@ sh scripts/samples_suite.sh --shard=2/2
 ```
 
 P6 native tool acceptance can run these retained assertions with explicitly
-provisioned Windows x86-64 candidates. Put `coil.exe`, `ouro-fmt.exe`,
-`ouro-lsp.exe`, `ouro-pkg.exe` and `ouro-test.exe` in one directory, following
-[the standalone build commands](tooling.md#standalone-native-tools), and use
-fresh output directories:
+provisioned Windows x86-64 candidates. Put `coil.exe`, `ouro-native-build.exe`,
+`ouro-fmt.exe`, `ouro-lsp.exe`, `ouro-pkg.exe` and `ouro-test.exe` in one directory,
+following [the standalone build commands](tooling.md#standalone-native-tools),
+and use fresh output directories. Clear hosted checker, build and formatter overrides:
 
 ```sh
+unset OURO_TEST_CHECK OURO_TEST_BUILD OURO_PKG_CHECK
+unset OURO_HOSTED_COMPILER_WRAPPER OURO_HOSTED_FMT
 LSP_SUITE_OUT=_build/p6/lsp sh scripts/lsp_suite.sh --native-tools _build/native
 PKG_SUITE_OUT=_build/p6/pkg sh scripts/pkg_suite.sh --native-tools _build/native
 TEST_SUITE_OUT=_build/p6/test sh scripts/test_suite.sh --native-tools _build/native
@@ -183,12 +185,14 @@ SAMPLES_SUITE_OUT=_build/p6/samples sh scripts/samples_suite.sh --native-tools _
 
 Pass `--native-tools DIR` first; sample shard options and `--compiler-checking`
 follow it. The separate `--native-build-collection` C harness rejects this
-option. Each invocation checks the required sibling images, PE format and
-system imports, records their SHA256 in `native-candidates.json`, and checks
+option. Each invocation checks its selected frontend candidate images, PE format
+and system imports, records their SHA256 in `native-candidates.json`, and checks
 that those images remain unchanged at completion. Missing or invalid native
-candidates fail without a C fallback. Retain the direct-PE build receipts with
-source and producer hashes beside this execution evidence; the candidate
-snapshot alone does not establish how the images were built.
+candidates fail without a C fallback. Retain direct-PE build receipts with
+source and producer hashes beside this execution evidence. The observer does
+not snapshot the `ouro-native-build.exe` backend used by `coil.exe`; acceptance
+also requires binding and rechecking that image. Suite snapshots alone do not
+establish complete companion or build provenance.
 
 The launchers still use shell/Python for fixture preparation and observation.
 The default C build selection remains available separately, and its results
@@ -235,7 +239,7 @@ library, bootstrap, build infrastructure and unclassified changes.
 The static `Kernel` check always runs and requires successful path selection,
 compiler preparation, every selected PR or docs group, selected kernel checks,
 Portable, and Editor. A failed, cancelled, or unexpectedly skipped selected
-job fails this aggregate. Nightly prepares its compiler independently per group.
+job fails this aggregate.
 `scripts/apply_github_settings.py` recommends the stable required contexts
 `Paths`, `Kernel`, `Editor`, and `Review`. When adopting the docs route, replace
 required individual `PR (...)` and `Portable (...)` contexts in hosted branch
@@ -687,11 +691,10 @@ the compiler suites. Pages runs `npm run lint`, `npm test`, and `npm run build`
 for pull requests to and pushes on `main` or `master` that change `site/`,
 `quality/biome.json`, or its workflow. Pull requests only restore the npm cache
 and cannot deploy the site.
-The hosted `Kernel` job builds `ouro1`, then runs
-`python3 scripts/ci_gate.py --profile kernel` and uploads its compiler,
-hardening, boundary, generated-law, scale, and depth reports. Its path
-selector covers the checker and its compiler, runtime, standard-library, test,
-and gate dependencies. Missing required probes fail the job.
+The hosted `Compiler kernel` job imports and verifies the shared compiler,
+then runs `--profile kernel-extra` for the kernel OuroSmith gate absent from PR.
+The static `Kernel` check requires every selected validation job to succeed.
+Missing required probes fail the job.
 The nightly and manual profiles also run `analyze-production`
 (`python3 scripts/analyze_production_suite.py`), which sweeps the production
 scopes with the structured analyzer and fails on any finding from the promoted

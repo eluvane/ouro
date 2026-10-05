@@ -44,7 +44,7 @@ The runnable programs in `samples/examples/` are:
 | `practical_stdin_aggregate.ouro` | Parse stdin lines and report a numeric aggregate |
 | `practical_config_report.ouro` | Read config and render typed values |
 | `workflow_stdin_report.ouro` | Filter comments and blanks, parse `Nat` fields, render a report |
-| `workflow_json_table_transform.ouro` | Select table data from bounded JSON/CSV inputs |
+| `workflow_json_table_transform.ouro` | Read JSON fields and count matching CSV rows |
 | `workflow_process_runner.ouro` | Run a command spec and report stdout or error |
 | `workflow_validation_report.ouro` | Accumulate validation failures |
 | `workflow_workspace_tool.ouro` | Create a workspace, write and copy files |

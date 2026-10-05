@@ -7,7 +7,7 @@ and a native program.
 
 The maintained command path expects:
 
-- Python 3;
+- Python 3.10 or later;
 - a POSIX-compatible shell;
 - a C compiler available as `cc` or `gcc`.
 
@@ -62,7 +62,8 @@ def main : IO Unit :=
      exit 0
 ```
 
-Build and run it as a Windows x86-64 PE:
+Build it as a Windows x86-64 PE. Run the executable and `run` commands below on
+a Windows x86-64 host:
 
 ```sh
 sh scripts/ouro1.sh build samples/demo/01_hello.ouro

@@ -9,7 +9,7 @@ are being developed toward the [native toolchain contract](design.md#native-tool
 
 ```text
 Ouro source and complete import closure
-  -> canonical source, parsing, elaboration, and lowering
+  -> preprocessing, lexing, parsing, elaboration, and lowering
   -> ordered Core declarations
   -> compiler-owned declaration checking
   -> CheckedProgram
@@ -33,8 +33,10 @@ references with lexical binder scope. Elaboration, lowering, and declaration
 checking live in `elab.ouro`, `lower.ouro`, and `file_elab.ouro`.
 `driver.ouro` and `pipeline.ouro` compose the stages.
 
-The production frontend preprocesses import aliases, exposing clauses, and records, then passes a
-`CanonicalSourceUnit` token stream to the parser. Import qualification retains
+The production frontend preprocesses import aliases, exposing clauses, and
+records, then passes lexer tokens directly to the parser. The syntax-only
+`driver.ouro` helper `lex_then_parse` wraps tokens in a `CanonicalSourceUnit`
+for metadata and position mapping. Import qualification retains
 an internal marker that the module resolver binds to the directly imported
 unit after parsing; raw source cannot spell that marker. [Canonical source](canonical_source.md)
 owns trivia, directive metadata, source mapping, and hash contracts.
