@@ -106,13 +106,12 @@ artifacts for bona fide upstream review must identify their contribution-only
 purpose and the official upstream project; they are not general-use releases or
 independent products. Identify third-party material and its license terms.
 
-An accompanying submission message must include this acknowledgment;
-submissions without it must not be merged:
-
-> I have read and accept Sections 9 and 10 of the Mother of Licenses 1.0 for this
-> contribution. I own the submitted material or am authorized to grant the
-> required rights. I have identified any third-party material and its license
-> terms.
+By knowingly submitting a Contribution with notice of Section 9, you accept
+its contribution terms. Contribution and patent grants remain governed by
+Sections 9 and 10. The default workflow does not require a separate acceptance
+statement or checkbox in the pull request or an accompanying message.
+Keep PR descriptions as prose only, without license-acceptance footers.
+Submit only material you own or are authorized to contribute.
 
 Material that cannot be licensed under those terms needs a separate arrangement
 with the licensor before incorporation. For licensing questions, contact

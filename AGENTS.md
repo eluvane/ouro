@@ -173,8 +173,9 @@ implemented, or production-ready beyond the evidence actually obtained.
   migration steps, or trust impact; a short list may cover independent changes.
   Do not require section headings, checklists, or execution history. Keep
   commands, validation results, environment details, and agent narratives in
-  task reports and CI. Put the required contribution-terms acknowledgment in
-  an accompanying submission message; never discard it.
+  task reports and CI. Keep PR descriptions as prose only, without
+  license-acceptance statements or checkbox footers. Submission terms are
+  defined in CONTRIBUTING.md and LICENSE.
 
 ## GitHub planning and community
 
