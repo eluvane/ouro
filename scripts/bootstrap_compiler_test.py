@@ -195,7 +195,7 @@ class BootstrapCompilerTests(unittest.TestCase):
                          patch.dict("sys.modules", {"ouro_build": build, "stage_loop": stage, "native_tool_build": native}), \
                          patch.object(bootstrap, "ROOT", (self.work / snapshot["roots"][phase]).resolve()), \
                          patch.object(build, "build_c") as compile_c, \
-                         patch.object(bootstrap.frontend, "collect_units_many", side_effect=lambda roots: {
+                         patch.object(bootstrap.frontend, "collect_units_many", side_effect=lambda roots, snapshot=snapshot: {
                              source: snapshot["selected"]["unit_graph"][source] for source in roots}), \
                          patch.object(bootstrap.frontend, "regenerate") as emit:
                         bootstrap.worker(args)
