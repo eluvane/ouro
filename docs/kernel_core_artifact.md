@@ -1,10 +1,11 @@
 # Core artifacts and checked snapshots
 
 The compiler's current diagnostic format is `ouro.checked-program.v1`.
-`compiler/checked_program_output.ouro` emits it only after the complete
-declaration plan has passed compiler checking. The public
-`--emit-checked-program` option and framing contract are described in
-[Tooling](tooling.md#check-and-evaluate).
+`compiler/checked_program_output.ouro` owns serialization; the serializer does
+not recheck a supplied `CheckedProgram` wrapper. The public check command emits
+the snapshot only after the complete declaration plan has passed compiler
+checking. The `--emit-checked-program` option and framing contract are described
+in [Tooling](tooling.md#check-and-evaluate).
 
 ## Current checked snapshot
 

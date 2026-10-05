@@ -8,9 +8,10 @@ owns the reusable APIs it composes.
 
 `tools/app_surface_lib.ouro` composes the modules imported by
 `std/practical.ouro`, plus `std/fs_walk.ouro` for bounded deterministic scans.
-It returns `AppSurfaceError` for JSON and CSV failures; the CLI renders those
-errors with `app_surface_error_message`. See the [module guide](practical_stdlib.md#modules)
-for API choices and limits.
+`app_json_minify`, `app_csv_select_column`, and `app_tsv_from_csv_columns`
+return `Either AppSurfaceError String` for invalid JSON or missing required CSV
+columns. The CLI renders those errors with `app_surface_error_message`. See the
+[module guide](practical_stdlib.md#modules) for API choices and limits.
 
 ## Build and run
 

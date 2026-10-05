@@ -241,9 +241,7 @@ def parity_action_line_issues (path : String) (line : String) (issues : List Gat
 
 
 def workflow_selftest_issues (path : String) (text : String) : List GateIssue :=
-    append GateIssue
-      (wf_dangerous_issues_for_text path text (Nil GateIssue))
-      (wf_permission_issues_for_text path text (Nil GateIssue));
+    wf_policy_issues_for_text path text;
 
 
 def workflow_selftest_good : String :=
@@ -291,7 +289,147 @@ def workflow_selftest_require_reject (label : String) (path : String)
     end;
 
 
-def parity_workflow_self_tests_check (_root : String) : IO GateCheck :=
+def workflow_pr_cache_selftest_issues (text : String)
+    (issues : List GateIssue) : List GateIssue :=
+    let path : String := "ouro-pr.yml" in
+    let valid : List GateIssue :=
+      match nullb GateIssue (workflow_selftest_issues path text) with
+      | True => issues
+      | False => issue_add "workflow self-test rejected current PR cache contracts"
+          "selftest" issues
+      end in
+    let dead : List GateIssue := workflow_selftest_require_reject
+      "PR fallback namespace without a producer" path
+      (str_replace text "            ouro-pr-checks-${{ runner.os }}-\n"
+        "            ouro-pr-${{ runner.os }}-\n") valid in
+    let reordered : List GateIssue := workflow_selftest_require_reject
+      "shared PR fallback before the own suite prefix" path
+      (str_replace text
+        "            ouro-pr-${{ matrix.group }}-${{ runner.os }}-\n            ouro-pr-checks-${{ runner.os }}-\n"
+        "            ouro-pr-checks-${{ runner.os }}-\n            ouro-pr-${{ matrix.group }}-${{ runner.os }}-\n")
+      dead in
+    let incompatible : List GateIssue := workflow_selftest_require_reject
+      "shared PR fallback with a different archive path set" path
+      (str_replace text
+        "            _cache/ouro\n            _build/c\n          key: ouro-pr-${{ matrix.group }}"
+        "            _cache/ouro\n            _build/c\n            _build/bootstrap/*/report.json\n          key: ouro-pr-${{ matrix.group }}")
+      reordered in
+    let kernel : List GateIssue := workflow_selftest_require_reject
+      "missing own Kernel cache fallback" path
+      (str_replace text "            ouro-pr-kernel-checks-${{ runner.os }}-\n" "")
+      incompatible in
+    let portable : List GateIssue := workflow_selftest_require_reject
+      "Portable fallback to an incompatible suite archive" path
+      (str_replace text "            ouro-pr-portable-${{ runner.os }}-\n"
+        "            ouro-pr-portable-${{ runner.os }}-\n            ouro-pr-checks-${{ runner.os }}-\n")
+      kernel in
+    workflow_selftest_require_reject "missing Portable bootstrap comparison evidence" path
+      (str_replace text
+        "            _cache/ouro\n            _build/c\n            _build/bootstrap/*/report.json\n            _build/bootstrap/*/inputs.json\n            _build/bootstrap/*/out/p1/*.c\n            _build/bootstrap/*/out/p2/*.c\n"
+        "            _cache/ouro\n            _build/c\n            _build/bootstrap/*/report.json\n            _build/bootstrap/*/inputs.json\n            _build/bootstrap/*/out/p1/*.c\n")
+      portable;
+
+
+def workflow_compiler_selftest_fixture (kind : String) (consumer : String) : String :=
+    let template : String := "name: Shared compiler\non:\n  workflow_dispatch:\npermissions:\n  contents: read\nconcurrency:\n  group: shared-compiler\njobs:\n  host-compiler:\n    name: Host compiler\n    runs-on: ubuntu-latest\n    timeout-minutes: 120\n    outputs:\n      sha256: ${{ steps.bundle.outputs.sha256 }}\n      artifact: ${{ steps.bundle.outputs.artifact }}\n    permissions:\n      contents: read\n    env:\n      OURO_CI: \"1\"\n      OURO_REPRODUCIBLE: \"1\"\n      OURO_PACK_STRICT: \"1\"\n      OURO_JOBS: \"10\"\n      OURO_CACHE_DIR: _cache/ouro\n      OURO_BUILD_DIR: _build\n      OURO_C_BUILD_DIR: _build/c\n      OURO_CCACHE: disabled\n      OURO_STAGE_MAX: \"3\"\n    steps:\n      - name: Checkout\n        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1\n        with:\n          persist-credentials: false\n\n      - name: Identify compiler inputs\n        id: inputs\n        run: python3 scripts/ci_gate.py --compiler-artifact key >> \"$GITHUB_OUTPUT\"\n\n      - name: Restore compiler and bootstrap evidence\n        id: compiler-cache\n        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0\n        with:\n          path: |\n            _build/c/ouro1\n            _build/c/ouro1.bootstrap.json\n            _build/bootstrap/*/report.json\n            _build/bootstrap/*/inputs.json\n            _build/bootstrap/*/out/p1/*.c\n            _build/bootstrap/*/out/p2/*.c\n          key: ouro-host-compiler-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.inputs.outputs.key }}\n\n      - name: Build and verify host compiler\n        run: python3 scripts/ouro_build.py build --verbosity quiet\n\n      - name: Export compiler with bootstrap evidence\n        id: bundle\n        run: |\n          python3 scripts/ci_gate.py --compiler-artifact export >> \"$GITHUB_OUTPUT\"\n          echo \"artifact=nightly-host-compiler-${{ github.run_id }}-${{ github.run_attempt }}\" >> \"$GITHUB_OUTPUT\"\n\n      - name: Save compiler and bootstrap evidence\n        if: ${{ (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'))) && steps.compiler-cache.outputs.cache-hit != 'true' }}\n        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0\n        with:\n          path: |\n            _build/c/ouro1\n            _build/c/ouro1.bootstrap.json\n            _build/bootstrap/*/report.json\n            _build/bootstrap/*/inputs.json\n            _build/bootstrap/*/out/p1/*.c\n            _build/bootstrap/*/out/p2/*.c\n          key: ${{ steps.compiler-cache.outputs.cache-primary-key }}\n\n      - name: Upload verified compiler\n        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1\n        with:\n          name: nightly-host-compiler-${{ github.run_id }}-${{ github.run_attempt }}\n          path: _build/ci/host-compiler.tar.gz\n          compression-level: 0\n          if-no-files-found: error\n          retention-days: 14\n\n      - name: Upload bootstrap reports\n        if: always()\n        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1\n        with:\n          name: nightly-host-compiler-reports-${{ github.run_id }}-${{ github.run_attempt }}\n          path: |\n            _build/bootstrap/**/*.json\n            _build/bootstrap/**/*.log\n          if-no-files-found: ignore\n          retention-days: 14\n\n  validation:\n    needs: host-compiler\n    runs-on: ubuntu-latest\n    timeout-minutes: 120\n    steps:\n      - name: Restore suite cache\n        uses: actions/cache/restore@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n        with:\n          path: _cache/ouro\n\n      - name: Download host compiler\n        uses: actions/download-artifact@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n        with:\n          name: ${{ needs.host-compiler.outputs.artifact }}\n          path: _build/ci\n      - name: Verify and install host compiler\n        env:\n          COMPILER_SHA256: ${{ needs.host-compiler.outputs.sha256 }}\n        run: python3 scripts/ci_gate.py --compiler-artifact import --compiler-sha256 \"$COMPILER_SHA256\"\n\n      - name: Run checks\n        run: python3 scripts/ci_gate.py --profile nightly --group \"${{ matrix.group }}\" --out \"_build/ci/nightly-${{ matrix.group }}\"\n" in
+    let named : String :=
+      str_replace (str_replace template "nightly-host-compiler-" (str_concat kind "-host-compiler-"))
+        "  validation:" (str_cat3 "  " consumer ":") in
+    match str_eq kind "lint" with
+    | True =>
+        str_replace
+          (str_replace (str_replace named "      - name: Save compiler and bootstrap evidence\n        if: ${{ (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'))) && steps.compiler-cache.outputs.cache-hit != 'true' }}\n        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0\n        with:\n          path: |\n            _build/c/ouro1\n            _build/c/ouro1.bootstrap.json\n            _build/bootstrap/*/report.json\n            _build/bootstrap/*/inputs.json\n            _build/bootstrap/*/out/p1/*.c\n            _build/bootstrap/*/out/p2/*.c\n          key: ${{ steps.compiler-cache.outputs.cache-primary-key }}\n\n" "")
+            "      - name: Run checks\n" "      - name: Run lint suite\n")
+          "--profile nightly --group" "--profile manual --group"
+    | False =>
+        match str_eq kind "release" with
+        | False => named
+        | True =>
+            str_replace
+              (str_replace
+                (str_replace named
+                  "  host-compiler:\n"
+                  "  host-compiler:\n    if: ${{ needs.groups.outputs.due == 'true' }}\n")
+                "  release-validation:\n"
+                "  release-validation:\n    if: ${{ needs.groups.outputs.due == 'true' }}\n")
+              "${{ (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'))) && steps.compiler-cache.outputs.cache-hit != 'true' }}"
+              "${{ (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master') && steps.compiler-cache.outputs.cache-hit != 'true' }}"
+        end
+    end;
+
+
+def workflow_compiler_selftest_positive (path : String) (kind : String)
+    (consumer : String) (issues : List GateIssue) : List GateIssue :=
+    match nullb GateIssue (workflow_selftest_issues path (workflow_compiler_selftest_fixture kind consumer)) with
+    | True => issues
+    | False => issue_add (str_concat "workflow self-test rejected shared compiler fixture: " kind)
+        "selftest" issues
+    end;
+
+
+def workflow_compiler_selftest_issues (issues : List GateIssue) : List GateIssue :=
+    let nightly : List GateIssue := workflow_compiler_selftest_positive
+      "ouro-nightly-full.yml" "nightly" "validation" issues in
+    let lint : List GateIssue := workflow_compiler_selftest_positive
+      "ouro-lint.yml" "lint" "lint" nightly in
+    let release : List GateIssue := workflow_compiler_selftest_positive
+      "ouro-release.yml" "release" "release-validation" lint in
+    let good : String := workflow_compiler_selftest_fixture "nightly" "validation" in
+    let bad : List (Pair String String) :=
+      ([ MkPair String String "missing producer job"
+          (str_replace good "  host-compiler:\n" "  unrelated-compiler:\n")
+       , MkPair String String "missing producer dependency"
+          (str_replace good "    needs: host-compiler\n" "    needs: unrelated\n")
+       , MkPair String String "compiler key without host identity"
+          (str_replace good "ouro-host-compiler-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.inputs.outputs.key }}" "ouro-host-compiler-v1-${{ hashFiles('compiler/**') }}")
+       , MkPair String String "missing P2 bootstrap evidence"
+          (str_replace good "            _build/bootstrap/*/out/p2/*.c\n" "")
+       , MkPair String String "broad compiler restore fallback"
+          (str_replace good "          key: ouro-host-compiler-v1-" "          restore-keys: |\n            ouro-host-compiler-v1-Linux-\n          key: ouro-host-compiler-v1-")
+       , MkPair String String "unverified compiler export"
+          (str_replace good "          python3 scripts/ci_gate.py --compiler-artifact export >> \"$GITHUB_OUTPUT\"\n" "          echo \"ignored compiler export\"\n")
+       , MkPair String String "compiler build disabled"
+          (str_replace good "      - name: Build and verify host compiler\n" "      - name: Build and verify host compiler\n        if: false\n")
+       , MkPair String String "wrong producer SHA output"
+          (str_replace good "      sha256: ${{ steps.bundle.outputs.sha256 }}\n" "      sha256: ${{ steps.inputs.outputs.key }}\n")
+       , MkPair String String "wrong consumer SHA"
+          (str_replace good "          COMPILER_SHA256: ${{ needs.host-compiler.outputs.sha256 }}\n" "          COMPILER_SHA256: \"0000000000000000000000000000000000000000000000000000000000000000\"\n")
+       , MkPair String String "consumer artifact from current retry attempt"
+          (str_replace good "${{ needs.host-compiler.outputs.artifact }}" "nightly-host-compiler-${{ github.run_id }}-${{ github.run_attempt }}")
+       , MkPair String String "comment-only import verifier"
+          (str_replace good "        run: python3 scripts/ci_gate.py --compiler-artifact import --compiler-sha256 \"$COMPILER_SHA256\"\n" "        run: echo ignored\n        # run: python3 scripts/ci_gate.py --compiler-artifact import --compiler-sha256 \"$COMPILER_SHA256\"\n")
+       , MkPair String String "unguarded shared compiler writer"
+          (str_replace good "${{ (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'))) && steps.compiler-cache.outputs.cache-hit != 'true' }}" "${{ steps.compiler-cache.outputs.cache-hit != 'true' }}")
+       , MkPair String String "save without complete comparison evidence"
+          (str_replace good "      - name: Save compiler and bootstrap evidence\n        if: ${{ (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'))) && steps.compiler-cache.outputs.cache-hit != 'true' }}\n        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0\n        with:\n          path: |\n            _build/c/ouro1\n            _build/c/ouro1.bootstrap.json\n            _build/bootstrap/*/report.json\n            _build/bootstrap/*/inputs.json\n            _build/bootstrap/*/out/p1/*.c\n            _build/bootstrap/*/out/p2/*.c\n          key: ${{ steps.compiler-cache.outputs.cache-primary-key }}\n\n" "      - name: Save compiler and bootstrap evidence\n        if: ${{ (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'))) && steps.compiler-cache.outputs.cache-hit != 'true' }}\n        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0\n        with:\n          path: |\n            _build/c/ouro1\n            _build/c/ouro1.bootstrap.json\n            _build/bootstrap/*/report.json\n            _build/bootstrap/*/inputs.json\n            _build/bootstrap/*/out/p2/*.c\n          key: ${{ steps.compiler-cache.outputs.cache-primary-key }}\n\n")
+       , MkPair String String "nested action input instead of a build step"
+          (str_replace good "      - name: Build and verify host compiler\n        run: python3 scripts/ouro_build.py build --verbosity quiet\n" "      - name: Unrelated action\n        uses: ./local-action\n        with:\n          name: Build and verify host compiler\n          run: python3 scripts/ouro_build.py build --verbosity quiet\n")
+       , MkPair String String "cache restore after compiler import"
+          (str_replace (str_replace good "      - name: Restore suite cache\n        uses: actions/cache/restore@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n        with:\n          path: _cache/ouro\n\n" "") "        run: python3 scripts/ci_gate.py --compiler-artifact import --compiler-sha256 \"$COMPILER_SHA256\"\n" "        run: python3 scripts/ci_gate.py --compiler-artifact import --compiler-sha256 \"$COMPILER_SHA256\"\n      - name: Restore suite cache\n        uses: actions/cache/restore@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n        with:\n          path: _cache/ouro\n\n")
+       , MkPair String String "producer selected for a different host"
+          (str_replace good "    runs-on: ubuntu-latest\n" "    runs-on: windows-latest\n")
+       , MkPair String String "CI gate before compiler verification"
+          (str_replace (str_replace good "      - name: Run checks\n        run: python3 scripts/ci_gate.py --profile nightly --group \"${{ matrix.group }}\" --out \"_build/ci/nightly-${{ matrix.group }}\"\n" "")
+            "      - name: Verify and install host compiler\n"
+            "      - name: Run checks\n        run: python3 scripts/ci_gate.py --profile nightly --group \"${{ matrix.group }}\" --out \"_build/ci/nightly-${{ matrix.group }}\"\n      - name: Verify and install host compiler\n")
+       , MkPair String String "missing CI gate invocation"
+          (str_replace good "python3 scripts/ci_gate.py --profile nightly"
+            "echo skipped CI gate --profile nightly")
+       ] : List (Pair String String)) in
+    let rejected : List GateIssue :=
+      foldl (Pair String String) (List GateIssue)
+        (fun (acc : List GateIssue) (item : Pair String String) =>
+          workflow_selftest_require_reject (fst String String item) "ouro-nightly-full.yml"
+            (snd String String item) acc)
+        release bad in
+    workflow_selftest_require_reject "cache writer in restore-only Lint" "ouro-lint.yml"
+      (str_replace (workflow_compiler_selftest_fixture "lint" "lint")
+        "      - name: Upload verified compiler\n"
+        "      - name: Save compiler and bootstrap evidence\n        if: ${{ (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'))) && steps.compiler-cache.outputs.cache-hit != 'true' }}\n        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0\n        with:\n          path: |\n            _build/c/ouro1\n            _build/c/ouro1.bootstrap.json\n            _build/bootstrap/*/report.json\n            _build/bootstrap/*/inputs.json\n            _build/bootstrap/*/out/p1/*.c\n            _build/bootstrap/*/out/p2/*.c\n          key: ${{ steps.compiler-cache.outputs.cache-primary-key }}\n\n      - name: Upload verified compiler\n")
+      rejected;
+
+
+def parity_workflow_self_tests_check (root : String) : IO GateCheck :=
     let bad_action : List GateIssue := parity_action_line_issues "selftest" "uses: actions/checkout@v7 # v7.0.1" (Nil GateIssue) in
     let good_action : List GateIssue := parity_action_line_issues "selftest" "uses: actions/checkout@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa # v7.0.1" (Nil GateIssue) in
     let issues0 : List GateIssue :=
@@ -312,7 +450,7 @@ def parity_workflow_self_tests_check (_root : String) : IO GateCheck :=
       end in
     let issues3 : List GateIssue :=
       workflow_selftest_require_reject "comment-only policy markers"
-        "ouro-pr.yml" workflow_selftest_comment_bypass issues2 in
+        "dependency-review.yml" workflow_selftest_comment_bypass issues2 in
     let issues4 : List GateIssue :=
       workflow_selftest_require_reject "duplicate mapping keys"
         "dependency-review.yml" workflow_selftest_duplicate issues3 in
@@ -337,7 +475,16 @@ def parity_workflow_self_tests_check (_root : String) : IO GateCheck :=
       | True => issues9
       | False => issue_add "workflow self-test rejected guarded snapshot publication" "selftest" issues9
       end in
-    io_pure(GateCheck, gate_check "workflow-policy-selftests" issues10);
+    let issues11 : List GateIssue := workflow_compiler_selftest_issues issues10 in
+    do let! loaded := fs_read_checked (repo_join root ".github/workflows/ouro-pr.yml");
+       match loaded with
+       | Left e => io_pure GateCheck
+           (gate_check "workflow-policy-selftests"
+             (issue_add (fs_error_message e) "selftest" issues11))
+       | Right text => io_pure GateCheck
+           (gate_check "workflow-policy-selftests"
+             (workflow_pr_cache_selftest_issues text issues11))
+       end;
 
 
 def control_allowed_migration (value : String) : Bool :=
@@ -732,7 +879,7 @@ def control_plane_inventory_check (root : String) : IO GateCheck :=
                control_inventory_script_paths (Nil GateIssue) in
            let coverage_issues : List GateIssue :=
              control_path_list_issues "duplicate Python/shell inventory row"
-               (control_duplicate_paths control_inventory_all_script_paths)
+               (control_duplicate_paths_go(Nothing String, control_inventory_all_script_paths))
                coverage_issues0 in
            do let! issues := control_rows_issues root host_bound_paths coverage_issues;
               io_pure GateCheck

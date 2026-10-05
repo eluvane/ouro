@@ -1,11 +1,7 @@
-## Summary
-
-Describe the problem and the change.
-
-<!-- Mention material risks, compatibility or trust impact, and limitations only when they apply. -->
-
-## Contribution terms
-
-Follow the [contribution terms](https://github.com/eluvane/ouro/blob/HEAD/CONTRIBUTING.md#license-and-contribution-terms).
-
-<!-- Add the required acknowledgment and identify third-party material and its license terms, or state that there is none. -->
+<!-- Describe the concrete result and reason in one or two short paragraphs.
+Include only material behavior limits, compatibility changes, migration steps,
+or trust impact when needed.
+Keep execution history and validation results in task reports and CI.
+Keep the description as prose only, without license-acceptance statements
+or checkbox footers. Read CONTRIBUTING.md and LICENSE before submitting.
+-->

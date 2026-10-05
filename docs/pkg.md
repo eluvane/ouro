@@ -34,7 +34,8 @@ not a current direct dependency.
 
 The compatibility `scripts/coil.sh` wrapper retains `resolve` and `seal`
 aliases for `lock`. Native `coil.exe` has no package dispatch yet; run
-`ouro-pkg.exe` directly. Keep `coil.exe` beside it for verification.
+`ouro-pkg.exe` directly. Keep `coil.exe` and its `ouro-native-build.exe` backend
+beside it for verification.
 
 ## Seal
 
@@ -120,10 +121,11 @@ then reinstall; do not maintain the vendored copy by hand.
 deterministic digest of the vendored files. The current lock body is generated
 JSON. `list` and `verify` reject an unreadable lockfile instead of treating it
 as empty. `verify` recomputes that digest and typechecks every installed
-`.ouro` file through sibling `coil.exe check`. Verification requires exit
-0 and `CHECK_OK` without `CHECK_FAIL`; process errors remain failures.
-`OURO_PKG_CHECK` no longer selects a checker. Each source has a provisional
-120-second, one-CPU, 3072-MiB child-tree limit and 16 MiB per captured stream.
+`.ouro` file. Verification requires exit 0 and `CHECK_OK` without `CHECK_FAIL`;
+process errors remain failures. Without the
+[hosted overrides](tooling.md#standalone-native-tools), it uses sibling
+`coil.exe check` with a provisional 120-second, one-CPU, 3072-MiB child-tree
+limit and 16 MiB per captured stream for each source.
 
 The digest detects drift; [current limits](#current-limits) describe what it
 does not authenticate. The seal and lock formats remain experimental before 1.0.
@@ -135,9 +137,13 @@ network registry, authenticated source or cryptographic content hash, `pkg:`
 import scheme, or `coil publish` command. The seal and lock formats follow the
 [pre-1.0 compatibility policy](stability.md#experimental-areas).
 
-Native acceptance must provision a direct-PE package executable and its
-sibling checker before running the retained package suite:
+From the repository checkout, provision the direct-PE package executable,
+sibling checker and backend described [above](#commands), leave the hosted
+overrides unset, and select a fresh output directory for native acceptance:
 
 ```sh
-sh scripts/pkg_suite.sh
+PKG_SUITE_OUT=_build/p6/pkg sh scripts/pkg_suite.sh --native-tools _build/native
 ```
+
+The suite's default mode builds a C-host candidate.
+[CI](ci.md#local-profiles) owns candidate receipts and full profile requirements.

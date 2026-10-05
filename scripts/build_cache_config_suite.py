@@ -176,7 +176,7 @@ def test_incremental_invalidation(tmp: Path) -> None:
         "CC": str(fakecc),
         "FAKE_CC_LOG": str(log),
         "OURO_CCACHE": "disabled",
-        "OURO_CACHE": "0",
+        "OURO_CACHE": "1",
     })
     common = ["--build-dir", "_build_test", "--c-build-dir", "_build_test/c", "--cache-dir", "_cache_test", "--jobs", "1", "--verbosity", "quiet"]
 
@@ -203,6 +203,39 @@ def test_incremental_invalidation(tmp: Path) -> None:
     after_source = counts(log)
     assert after_source[0] - before_source[0] == 1, after_source
     assert after_source[1] - before_source[1] == 1, after_source
+
+    report_path = repo / "_build_test/c/ouro1-build-report.json"
+    before_identity = json.loads(json.loads(report_path.read_text(encoding="utf-8"))["compiler_id"])
+    compiler_time = fakecc.stat()
+    fakecc.write_bytes(fakecc.read_bytes() + b"\n# compiler changed with the same version\n")
+    os.utime(fakecc, ns=(compiler_time.st_atime_ns, compiler_time.st_mtime_ns))
+    before_compiler = counts(log)
+    run_c_graph(repo, common, env)
+    assert counts(log) == (before_compiler[0] + cold_compile, before_compiler[1] + 1)
+    changed_identity = json.loads(json.loads(report_path.read_text(encoding="utf-8"))["compiler_id"])
+    assert changed_identity["version"] == before_identity["version"]
+    assert changed_identity["executable_sha256"] != before_identity["executable_sha256"]
+    after_compiler = counts(log)
+    run_c_graph(repo, common, env)
+    assert counts(log) == after_compiler, "unchanged compiler content must keep objects reusable"
+
+    env["CPATH"] = env.get("CPATH", "") + os.pathsep + str(tmp / "identity-includes")
+    before_environment = counts(log)
+    run_c_graph(repo, common, env)
+    assert counts(log) == (before_environment[0] + cold_compile, before_environment[1] + 1)
+    after_environment = counts(log)
+    run_c_graph(repo, common, env)
+    assert counts(log) == after_environment, "unchanged compiler environment must keep objects reusable"
+
+    for cache_env, options in (("1", ["--no-cache"]), ("0", [])):
+        env["OURO_CACHE"] = cache_env
+        before_uncached = counts(log)
+        for _ in range(2):
+            run_c_graph(repo, [*common, *options], env)
+        assert counts(log) == (
+            before_uncached[0] + 2 * cold_compile,
+            before_uncached[1] + 2,
+        ), "cache-off must compile and link afresh beside complete stamps"
 
 
 def test_config_precedence(tmp: Path) -> None:
@@ -293,6 +326,43 @@ def test_seal_parse() -> None:
     import ouro_seal
 
     ouro_seal.self_check()
+
+
+def test_compiler_identity(tmp: Path) -> None:
+    cc = tmp / "identity-cc.py"
+    write_fake_cc(cc)
+    environment = dict.fromkeys(("CPATH", "C_INCLUDE_PATH", "LIBRARY_PATH", "SDKROOT",
+                                 "MACOSX_DEPLOYMENT_TARGET", "SOURCE_DATE_EPOCH"), "")
+    with patch.dict(os.environ, environment), \
+         patch.object(build_driver, "output_or_empty", return_value="fake-cc 1.0\n"):
+        identity = build_driver.compiler_id(str(cc))
+        initial = json.loads(identity)
+        assert initial["path"] == str(cc.resolve())
+        assert initial["version"] == ["fake-cc 1.0"]
+        assert initial["executable_sha256"] == build_driver.sha256_file(cc)
+        assert initial["environment"] == environment
+        assert build_driver.compiler_id(str(cc)) == identity
+        original, timestamp = cc.read_bytes(), cc.stat()
+        os.utime(cc, ns=(timestamp.st_atime_ns, timestamp.st_mtime_ns + 10_000_000_000))
+        assert build_driver.compiler_id(str(cc)) == identity
+        cc.write_bytes(original + b"\n# different compiler bytes\n")
+        os.utime(cc, ns=(timestamp.st_atime_ns, timestamp.st_mtime_ns))
+        changed = json.loads(build_driver.compiler_id(str(cc)))
+        assert changed["version"] == initial["version"]
+        assert changed["executable_sha256"] != initial["executable_sha256"]
+        cc.write_bytes(original)
+        assert build_driver.compiler_id(str(cc)) == identity
+        for name in environment:
+            with patch.dict(os.environ, {name: "changed compiler environment"}):
+                changed = json.loads(build_driver.compiler_id(str(cc)))
+                assert changed["environment"][name] == "changed compiler environment"
+                assert changed["executable_sha256"] == initial["executable_sha256"]
+                assert changed != initial, name
+        with patch.object(build_driver.shutil, "which", return_value=str(cc)):
+            selected = json.loads(build_driver.compiler_id("compiler-on-path"))
+        assert selected["cc"] == "compiler-on-path"
+        assert selected["path"] == initial["path"]
+        assert selected["executable_sha256"] == initial["executable_sha256"]
 
 
 def test_host_stack_link_flags() -> None:
@@ -396,15 +466,20 @@ print("int main(void) { return 0; }")
     assert counts(cc_log) == baseline, "same entry in another suite must reuse the complete tool"
 
     cache = repo / "_cache/ouro/native-tools" / first_receipt["key"]
-    (cache / ("tool.exe" if os.name == "nt" else "tool")).unlink()
+    cached_binary = cache / ("tool.exe" if os.name == "nt" else "tool")
+    cached_binary.unlink()
     (cache / "tool.json").unlink()
+    invoke(options=("--check",))
+    assert not cached_binary.exists() and not (cache / "tool.json").exists(), "check must not populate the cache"
     installed = invoke()
     assert "installed-hit" in installed.stdout and counts(cc_log) == baseline
-    # An imported installed image alone does not warm an absent content cache.
+    assert cached_binary.read_bytes() == binary.read_bytes(), "installed reuse must warm the absent content cache"
     before_prepare_emit = emit_log.read_text().count("emit")
+    env["FAKE_EMIT_FAIL"] = "1"
     prepared = invoke("_build/memory/bin/tool-test")
-    assert "miss" in prepared.stdout and counts(cc_log) == (baseline[0], baseline[1] + 1)
-    assert emit_log.read_text().count("emit") == before_prepare_emit + 1
+    env.pop("FAKE_EMIT_FAIL")
+    assert "BUILD_TOOL_CACHE: hit " in prepared.stdout and counts(cc_log) == baseline
+    assert emit_log.read_text().count("emit") == before_prepare_emit
     baseline = counts(cc_log)
     env["FAKE_EMIT_FAIL"] = "1"
     invoke("_build/memory/fresh-suite/tool-test")
@@ -1967,6 +2042,7 @@ def main() -> int:
     test_host_stack_link_flags()
     with tempfile.TemporaryDirectory(prefix="ouro-build-suite-") as d:
         tmp = Path(d).resolve()
+        test_compiler_identity(tmp)
         test_clang_bracket_depth(tmp)
         test_memory_preparation_failure(tmp)
         test_memory_preparation_outputs(tmp)

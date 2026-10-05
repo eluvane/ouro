@@ -5,7 +5,7 @@ Ouro has two complementary quality layers:
 1. `ouro1 lint` — the only user-facing Ouro source linter. Language,
    proven style, and compiler-proved semantic families are internal to
    that driver;
-2. repository analyzer and policy gates (`analyze`, the Python strict
+2. repository analyzer and policy gates (`analyze`, the strict
    registry/debt firewall, and `--structural`). Those are not a second
    source linter.
 
@@ -21,6 +21,10 @@ structured analysis, and the strict firewall for repository policy:
 sh scripts/ouro1.sh lint --deny --profile project std compiler tools samples
 python3 scripts/strict_quality_firewall.py --profile release
 ```
+
+The Python strict-firewall entry point launches `tools/strict/main.ouro` for
+registry, fixture, debt, source, and report handling. `--structural` retains
+its separate Python repository pass.
 
 [Tooling](tooling.md#analyzer-and-linter) owns analyzer/lint CLI flags and behavior;
 [Analyzer internals](../tools/analyze/README.md) own the family inventory;
@@ -114,7 +118,7 @@ paths and an empty child PATH. Missing cases or a changed image fail the gate.
 The native roots under `tests/analyze/precision/` cover bad, good, and
 false-positive cases with exact issue identities, witnesses or line numbers,
 expected bytes, and repeated-run checks. The precision gate typechecks, builds,
-and executes all nine roots, retaining `precision_build_*` and
+and executes all ten roots, retaining `precision_build_*` and
 `precision_run_*` logs under `_build/analyze_precision/`. Empty case sets and
 missing binaries or reports fail. Formatter and fixer selftests also exercise
 actual refused writes and verify that the original file bytes survive. Existing
@@ -364,6 +368,9 @@ Profiles are:
 | `strict` | New project-owned Ouro code |
 | `compiler` | Compiler and trust-sensitive areas |
 | `release` | Fail-closed release validation |
+
+The `compiler` profile belongs to `quality/diagnostics.json`; semantic Clippy
+accepts `baseline`, `project`, `strict`, and `release`.
 
 A rule without a clean replacement should remain advisory until its precision
 and migration path are demonstrated.

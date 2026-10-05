@@ -102,7 +102,7 @@ def uniquify(src: str) -> str:
         by_name[m.group(1)].append(m)
     dups = {n: ms for n, ms in by_name.items() if len(ms) > 1}
     if not dups:
-        return spread_case_arms(src)
+        return spread_case_arms(src, definitions=defs)
     uses_by_name: dict[str, list[re.Match[str]]] = {name: [] for name in dups}
     for match in IDENT.finditer(src):
         uses = uses_by_name.get(match.group(0))
@@ -187,7 +187,7 @@ def _iter_case_arrays(src: str):
         start = p
 
 
-def spread_case_arms(src: str) -> str:
+def spread_case_arms(src: str, *, definitions: list[re.Match[str]] | None = None) -> str:
     """Give colliding ouro_case arm refs distinct uniquify versions.
 
     print_c can emit sibling thunks with the same path. After uniquify they
@@ -196,7 +196,8 @@ def spread_case_arms(src: str) -> str:
     the enclosing function so a parent is never used as both of its arms.
     """
     defined: dict[str, set[int]] = {}
-    for m in STATIC_DEF.finditer(src):
+    matches = STATIC_DEF.finditer(src) if definitions is None else definitions
+    for m in matches:
         base, ver = _base_ver(m.group(1))
         defined.setdefault(base, set()).add(ver)
     repls: list[tuple[int, int, str]] = []
@@ -704,6 +705,8 @@ def _ctor_span_checks() -> list[tuple[str, bool]]:
 
 def _selftest() -> int:
     """Tiny rewrite checks for 2/3/4-arg poly spines."""
+    from unittest.mock import patch
+
     blob = """
 int ouro_export_count_x(void){return 4;}
 const char *ouro_export_name_x(int i){
@@ -823,6 +826,29 @@ static ouro_v *use4(void){
             "ouro_thunk(foo,e),ouro_thunk(foo_d2,e)" in nout,
         )
     )
+    nested_expected = nested.replace(
+        "ouro_thunk(foo_d2,e),ouro_thunk(foo_d2,e)",
+        "ouro_thunk(foo,e),ouro_thunk(foo_d2,e)",
+    )
+    bare = "int ouro_export_count_x(void){return 0;}\n"
+    for description, source, expected in (
+        ("no static definitions", bare, bare),
+        ("distinct arm versions", nested, nested_expected),
+    ):
+        with patch.object(sys.modules[__name__], "STATIC_DEF", wraps=STATIC_DEF) as scan:
+            result = uniquify(source)
+            checks.append((f"one definition scan for {description}",
+                           scan.finditer.call_count == 1 and result == expected))
+    arms_expected = arms.replace(
+        "static ouro_v *foo(ouro_env *e,ouro_v *a){return e->v;}",
+        "static ouro_v *foo_d2(ouro_env *e,ouro_v *a){return e->v;}",
+    ).replace("{foo,foo}", "{foo,foo_d2}")
+    with patch.object(sys.modules[__name__], "STATIC_DEF", wraps=STATIC_DEF) as scan:
+        result = uniquify(arms)
+        checks.append(("rescan transformed definitions",
+                       scan.finditer.call_count == 2
+                       and scan.finditer.call_args_list[1].args == (arms_expected,)
+                       and result == arms_expected))
     interleaved = (
         "static ouro_v *before(void){return ouro_thunk(alpha,0);}\n"
         "static ouro_v *alpha(ouro_env *e,ouro_v *a){return ouro_ctor(1,0,0);}\n"

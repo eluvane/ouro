@@ -217,6 +217,11 @@ native selftests take it through `--fixtures` (lint uses `--bad-root` and
 Manifest checks require `CHECK_OK` on acceptance and exit 1 on rejection;
 crash exit codes cannot satisfy a negative row.
 
+`ERGO.expansion-*` rows come from `tests/language_ergonomics/cases.json`.
+Positive rows assert compiler-checked equality with canonical expansions; negative
+rows require rejection and the manifest diagnostic. These rows only typecheck;
+independent runtime expectations run in the surface layer.
+
 ## Migration from the manual corpus
 
 The legacy `test/` tree has been retired. The checked-in migration matrix

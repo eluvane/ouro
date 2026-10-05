@@ -195,7 +195,8 @@ class BootstrapCompilerTests(unittest.TestCase):
                          patch.dict("sys.modules", {"ouro_build": build, "stage_loop": stage, "native_tool_build": native}), \
                          patch.object(bootstrap, "ROOT", (self.work / snapshot["roots"][phase]).resolve()), \
                          patch.object(build, "build_c") as compile_c, \
-                         patch.object(bootstrap.frontend, "collect_units", side_effect=snapshot["selected"]["unit_graph"].__getitem__), \
+                         patch.object(bootstrap.frontend, "collect_units_many", side_effect=lambda roots, snapshot=snapshot: {
+                             source: snapshot["selected"]["unit_graph"][source] for source in roots}), \
                          patch.object(bootstrap.frontend, "regenerate") as emit:
                         bootstrap.worker(args)
                     if action == "c0":
@@ -214,6 +215,24 @@ class BootstrapCompilerTests(unittest.TestCase):
                     self.assertEqual(values["jobs"], expected)
                     self.assertFalse(values["cache_enabled"])
                     self.assertEqual(values["ccache"], "disabled")
+
+    def test_frontend_worker_rejects_changed_batched_closure_before_regeneration(self):
+        from types import SimpleNamespace
+
+        snapshot = self.fixture()
+        roots = snapshot["selected"]["roots"]
+        current = {source: list(snapshot["selected"]["unit_graph"][source]) for source in roots}
+        current[roots[-1]] = [bootstrap.ACCEPTANCE_ROOTS[0], roots[-1]]
+        args = SimpleNamespace(snapshot=self.work / "inputs.json", phase="p1", action="frontend",
+                               producer=self.root / "producer")
+        with patch.dict("sys.modules", {"ouro_build": build, "stage_loop": SimpleNamespace()}), \
+             patch.object(bootstrap, "ROOT", (self.work / "o").resolve()), \
+             patch.object(bootstrap.frontend, "collect_units_many", return_value=current) as collect, \
+             patch.object(bootstrap.frontend, "regenerate") as emit:
+            with self.assertRaisesRegex(RuntimeError, "worker ordered source closure changed"):
+                bootstrap.worker(args)
+        collect.assert_called_once_with(roots)
+        emit.assert_not_called()
 
     def test_worker_rejects_foreign_root_and_changed_frozen_inputs(self):
         from types import SimpleNamespace
@@ -386,7 +405,7 @@ class BootstrapCompilerTests(unittest.TestCase):
         compiler = self.root / "selected-host-cc"
         compiler.write_bytes(b"fixed host C compiler")
         cfg = build.ResolvedConfig(dict(build.DEFAULTS), {})
-        with patch.object(bootstrap.frontend, "collect_units", side_effect=lambda name: graph[name]), \
+        with patch.object(bootstrap.frontend, "collect_units_many", return_value=graph), \
              patch.object(build, "choose_cc", return_value=str(compiler)), \
              patch.object(build, "compiler_id", return_value="fixed fixture version"):
             selected = bootstrap.current_inputs(root, cfg, build)
@@ -407,6 +426,61 @@ class BootstrapCompilerTests(unittest.TestCase):
                 self.assertNotEqual(hash_json(bootstrap.current_inputs(root, cfg, build)), key)
             compiler.write_bytes(b"changed compiler with identical version output")
             self.assertNotEqual(hash_json(bootstrap.current_inputs(root, cfg, build)), key)
+
+    def test_current_key_shares_import_reads_and_rereads_each_preparation(self):
+        root = self.root / "shared-key-fixture"
+        roots = [source for _tag, _module, source, _file in bootstrap.frontend.FRONTEND_TUS]
+        roots.append("compiler/backend.ouro")
+        entries = [*roots, *bootstrap.ACCEPTANCE_ROOTS]
+        shared = "std/shared-root.ouro"
+        leaves = ("std/shared-leaf.ouro", "std/changed-leaf.ouro")
+        names = {*bootstrap.HELPERS, *bootstrap.RUNTIME, *inputs.STAGE0, inputs.MANIFEST, inputs.ARCHIVE,
+                 *entries, shared, *leaves}
+        for name in names:
+            path = root / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("owned key fixture " + name, encoding="utf-8")
+        for source in entries:
+            (root / source).write_text('import "../std/shared-root.ouro";\n', encoding="utf-8")
+        source = root / shared
+        source.write_text('import "shared-leaf.ouro";\n', encoding="utf-8")
+        compiler = self.root / "shared-host-cc"
+        compiler.write_bytes(b"fixed host C compiler")
+        cfg = build.ResolvedConfig(dict(build.DEFAULTS), {})
+        with patch.object(bootstrap.frontend, "ROOT", root), \
+             patch.object(bootstrap.frontend, "import_targets",
+                          wraps=bootstrap.frontend.import_targets) as read_imports, \
+             patch.object(build, "choose_cc", return_value=str(compiler)), \
+             patch.object(build, "compiler_id", return_value="fixed fixture version"):
+            selected = bootstrap.current_inputs(root, cfg, build)
+            expected = {entry: [leaves[0], shared, entry] for entry in entries}
+            self.assertEqual(selected["unit_graph"], expected)
+            self.assertEqual(sorted(call.args[0] for call in read_imports.call_args_list),
+                             sorted({*entries, shared, leaves[0]}))
+            original, timestamp = source.read_bytes(), source.stat()
+            source.write_text('import "changed-leaf.ouro";\n', encoding="utf-8")
+            os.utime(source, ns=(timestamp.st_atime_ns, timestamp.st_mtime_ns))
+            read_imports.reset_mock()
+            changed = bootstrap.current_inputs(root, cfg, build)
+            self.assertEqual(changed["unit_graph"],
+                             {entry: [leaves[1], shared, entry] for entry in entries})
+            self.assertNotEqual(hash_json(changed), hash_json(selected))
+            self.assertIn(leaves[1], changed["sources"])
+            self.assertNotIn(leaves[0], changed["sources"])
+            self.assertEqual(sorted(call.args[0] for call in read_imports.call_args_list),
+                             sorted({*entries, shared, leaves[1]}))
+            leaf = root / leaves[1]
+            timestamp = leaf.stat()
+            leaf.write_bytes(leaf.read_bytes() + b" changed without a new timestamp")
+            os.utime(leaf, ns=(timestamp.st_atime_ns, timestamp.st_mtime_ns))
+            read_imports.reset_mock()
+            later = bootstrap.current_inputs(root, cfg, build)
+            self.assertEqual(later["unit_graph"], changed["unit_graph"])
+            self.assertNotEqual(hash_json(later), hash_json(changed))
+            self.assertEqual(sorted(call.args[0] for call in read_imports.call_args_list),
+                             sorted({*entries, shared, leaves[1]}))
+            source.write_bytes(original)
+            self.assertEqual(bootstrap.current_inputs(root, cfg, build), selected)
 
     def test_compact_stage_checks_both_forms_before_emitting_from_compact_sources(self):
         snapshot = self.fixture(compact_sources=True)
@@ -571,6 +645,30 @@ class BootstrapCompilerTests(unittest.TestCase):
                 bootstrap.ensure_current_compiler(cfg, build, self.root)
         self.assertEqual(output.read_bytes(), before)
         self.assertFalse(output.with_name("ouro1.bootstrap.json").exists())
+
+    def test_publication_reuses_frozen_key_and_complete_evidence(self):
+        snapshot = self.fixture()
+        output = self.root / "published/ouro1"
+        cfg = build.ResolvedConfig({**build.DEFAULTS, "build_dir": str(self.root / "b"),
+                                   "c_build_dir": str(output.parent), "cache_enabled": False}, {})
+        with patch.object(inputs, "read_bundle", return_value=({}, {})), \
+             patch.object(inputs, "verify_stage0"), \
+             patch.object(bootstrap, "current_inputs", return_value=snapshot["selected"]), \
+             patch.object(bootstrap.tempfile, "mkdtemp", return_value=str(self.work)), \
+             patch.object(bootstrap, "freeze", return_value=snapshot), \
+             patch.object(bootstrap, "current_unchanged", return_value=True) as unchanged, \
+             patch.object(bootstrap, "run_limited", side_effect=self.fake_run), \
+             patch.object(bootstrap, "hash_json", wraps=hash_json) as keys:
+            result = bootstrap.ensure_current_compiler(cfg, build, self.root)
+        keys.assert_called_once_with(snapshot["selected"])
+        unchanged.assert_called_once_with(self.root, snapshot["selected"])
+        self.assertEqual(result["key"], snapshot["key"])
+        self.assertEqual(result["selected"], snapshot["selected"])
+        receipt = output.with_name("ouro1.bootstrap.json")
+        self.assertEqual(json.loads(receipt.read_text()), result)
+        self.assertTrue(bootstrap.installed_current(output, receipt, snapshot["selected"]))
+        (self.work / "out/p2/driver_u.c").write_text("changed after publication")
+        self.assertFalse(bootstrap.installed_current(output, receipt, snapshot["selected"]))
 
     def test_cache_rejects_changed_binary_foreign_producer_and_partial_c_comparison(self):
         snapshot = self.fixture()

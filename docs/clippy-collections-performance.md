@@ -1,7 +1,9 @@
 # Collection and string composition diagnostics
 
-This diagnostic family contains 20 rules: `OURO-CLIPPY-PERF-008` through `023`,
-and `OURO-CLIPPY-REDUNDANT-022` through `025`.
+This guide covers 20 rules: `OURO-CLIPPY-PERF-008` through `023`,
+and `OURO-CLIPPY-REDUNDANT-022` through `025`. The separate
+[`OURO-CLIPPY-COLLECTION-001` through `020` laws](clippy_grade_firewall.md#collection-composition-laws)
+cover collection queries, replication, separators, prefixes, and singletons.
 
 ## Integration and proof boundary
 
@@ -104,7 +106,7 @@ out of scope until their domain, evaluation and totality obligations are known.
 
 ## Fixtures and native tests
 
-`tests/clippy_semantic/cases.json` retains its earlier 48 cases and adds 52:
+`tests/clippy_semantic/cases.json` lists 52 source cases for this guide:
 40 files named `collections-{perf,redundant}-NNN-{bad,good}.ouro`, plus 12
 focused identity/negative-space fixtures. Each bad file expects its exact new
 ID; each good file expects no diagnostics. Two extra positives check callback

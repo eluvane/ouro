@@ -25,8 +25,70 @@ env:
   OURO_CCACHE: disabled
 
 jobs:
+  host-compiler:
+    name: Host compiler
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    outputs:
+      sha256: ${{ steps.bundle.outputs.sha256 }}
+      artifact: ${{ steps.bundle.outputs.artifact }}
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Identify compiler inputs
+        id: inputs
+        run: python3 scripts/ci_gate.py --compiler-artifact key >> "$GITHUB_OUTPUT"
+
+      - name: Restore compiler and bootstrap evidence
+        id: compiler-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            _build/c/ouro1
+            _build/c/ouro1.bootstrap.json
+            _build/bootstrap/*/report.json
+            _build/bootstrap/*/inputs.json
+            _build/bootstrap/*/out/p1/*.c
+            _build/bootstrap/*/out/p2/*.c
+          key: ouro-host-compiler-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.inputs.outputs.key }}
+
+      - name: Build and verify host compiler
+        run: python3 scripts/ouro_build.py build --verbosity quiet
+
+      - name: Export compiler with bootstrap evidence
+        id: bundle
+        run: |
+          python3 scripts/ci_gate.py --compiler-artifact export >> "$GITHUB_OUTPUT"
+          echo "artifact=lint-host-compiler-${{ github.run_id }}-${{ github.run_attempt }}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload verified compiler
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: lint-host-compiler-${{ github.run_id }}-${{ github.run_attempt }}
+          path: _build/ci/host-compiler.tar.gz
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload bootstrap reports
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: lint-host-compiler-reports-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            _build/bootstrap/**/*.json
+            _build/bootstrap/**/*.log
+          if-no-files-found: ignore
+          retention-days: 14
+
   lint:
     name: Lint (${{ matrix.group }})
+    needs: host-compiler
     runs-on: ubuntu-latest
     timeout-minutes: 120
     strategy:
@@ -45,8 +107,27 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Build host compiler
-        run: python3 scripts/ouro_build.py build --verbosity quiet
+      - name: Restore lint suite cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            _cache/ouro
+            _build/c
+            _build/stage_loop
+          key: ouro-nightly-${{ matrix.group }}-${{ runner.os }}-${{ hashFiles('Ouro.seal', 'scripts/**', 'compiler/**', 'runtime/**', 'tools/**', 'tests/**', 'std/**', 'quality/smith/**', 'docs/generated_artifact_hashes.sha256') }}
+          restore-keys: |
+            ouro-nightly-${{ matrix.group }}-${{ runner.os }}-
+
+      - name: Download host compiler
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ needs.host-compiler.outputs.artifact }}
+          path: _build/ci
+
+      - name: Verify and install host compiler
+        env:
+          COMPILER_SHA256: ${{ needs.host-compiler.outputs.sha256 }}
+        run: python3 scripts/ci_gate.py --compiler-artifact import --compiler-sha256 "$COMPILER_SHA256"
 
       - name: Run lint suite
         run: python3 scripts/ci_gate.py --profile manual --group "${{ matrix.group }}" --out "_build/ci/${{ matrix.group }}"

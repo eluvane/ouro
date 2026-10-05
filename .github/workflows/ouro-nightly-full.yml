@@ -17,8 +17,93 @@ defaults:
     shell: bash
 
 jobs:
+  host-compiler:
+    name: Host compiler
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    outputs:
+      sha256: ${{ steps.bundle.outputs.sha256 }}
+      artifact: ${{ steps.bundle.outputs.artifact }}
+    permissions:
+      contents: read
+    env:
+      OURO_CI: "1"
+      OURO_REPRODUCIBLE: "1"
+      OURO_PACK_STRICT: "1"
+      OURO_JOBS: "10"
+      OURO_CACHE_DIR: _cache/ouro
+      OURO_BUILD_DIR: _build
+      OURO_C_BUILD_DIR: _build/c
+      OURO_CCACHE: disabled
+      OURO_STAGE_MAX: "3"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Identify compiler inputs
+        id: inputs
+        run: python3 scripts/ci_gate.py --compiler-artifact key >> "$GITHUB_OUTPUT"
+
+      - name: Restore compiler and bootstrap evidence
+        id: compiler-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            _build/c/ouro1
+            _build/c/ouro1.bootstrap.json
+            _build/bootstrap/*/report.json
+            _build/bootstrap/*/inputs.json
+            _build/bootstrap/*/out/p1/*.c
+            _build/bootstrap/*/out/p2/*.c
+          key: ouro-host-compiler-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.inputs.outputs.key }}
+
+      - name: Build and verify host compiler
+        run: python3 scripts/ouro_build.py build --verbosity quiet
+
+      - name: Export compiler with bootstrap evidence
+        id: bundle
+        run: |
+          python3 scripts/ci_gate.py --compiler-artifact export >> "$GITHUB_OUTPUT"
+          echo "artifact=nightly-host-compiler-${{ github.run_id }}-${{ github.run_attempt }}" >> "$GITHUB_OUTPUT"
+
+      - name: Save compiler and bootstrap evidence
+        if: ${{ (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'))) && steps.compiler-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            _build/c/ouro1
+            _build/c/ouro1.bootstrap.json
+            _build/bootstrap/*/report.json
+            _build/bootstrap/*/inputs.json
+            _build/bootstrap/*/out/p1/*.c
+            _build/bootstrap/*/out/p2/*.c
+          key: ${{ steps.compiler-cache.outputs.cache-primary-key }}
+
+      - name: Upload verified compiler
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: nightly-host-compiler-${{ github.run_id }}-${{ github.run_attempt }}
+          path: _build/ci/host-compiler.tar.gz
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload bootstrap reports
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: nightly-host-compiler-reports-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            _build/bootstrap/**/*.json
+            _build/bootstrap/**/*.log
+          if-no-files-found: ignore
+          retention-days: 14
+
   validation:
     name: ${{ matrix.label }}
+    needs: host-compiler
     runs-on: ubuntu-latest
     timeout-minutes: 120
     strategy:
@@ -133,9 +218,16 @@ jobs:
           shellcheck --version
           cc --version || true
 
-      - name: Build host compiler
-        if: ${{ matrix.group != 'checks' }}
-        run: python3 scripts/ouro_build.py build --verbosity quiet
+      - name: Download host compiler
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ needs.host-compiler.outputs.artifact }}
+          path: _build/ci
+
+      - name: Verify and install host compiler
+        env:
+          COMPILER_SHA256: ${{ needs.host-compiler.outputs.sha256 }}
+        run: python3 scripts/ci_gate.py --compiler-artifact import --compiler-sha256 "$COMPILER_SHA256"
 
       - name: Run checks
         run: python3 scripts/ci_gate.py --profile nightly --group "${{ matrix.group }}" --out "_build/ci/nightly-${{ matrix.group }}"

@@ -33,9 +33,9 @@ SLA, but reporters will be told when the issue can be disclosed safely.
 
 ## Scope
 
-Security reports may cover the compiler and kernel, C runtime and IO host,
-package verification, generated-artifact promotion, GitHub workflows, release
-packaging, or other repository-owned tooling.
+Security reports may cover the compiler and kernel, Ouro and C runtimes,
+IO and platform adapters, package verification, generated-artifact promotion,
+GitHub workflows, release packaging, or other repository-owned tooling.
 
 Ordinary language bugs, confusing diagnostics, performance regressions, and
 documentation errors can use the public issue forms unless they create a

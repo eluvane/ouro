@@ -95,7 +95,7 @@ their fixtures establish.
 | Area | Migration disposition and boundary |
 | --- | --- |
 | Pure language | Retain dependent functions, universes, explicit assumptions, inductive data, constructor matching, structural recursion, and documented literal/record/pipe sugar from [Syntax](syntax.md). `Nat` must not silently acquire machine-integer overflow semantics. |
-| Modules | Retain relative imports, bounded aliases, and local opens. The current flat namespace is not a mature module system. P1 must check imported declarations and bodies completely; root preflight is insufficient. |
+| Modules | Retain relative imports, bounded aliases, and local opens. The current resolver tracks source-unit ownership for aliases, selective imports, and private declarations; see [Module syntax](syntax.md#modules-and-imports) for limits. P1 must check imported declarations and bodies completely; root preflight is insufficient. |
 | IO and data tools | Retain the documented `main : IO Unit`, sequencing/`let!`, console, arguments, environment, files/directories, time, and child-process capture used by [practical programs](practical_programs.md). Preserve checked-wrapper errors; process stdin and host behavior remain limited to their documented contracts. |
 | One-shot handlers | Temporarily limit support to the existing [handler subset](effects_design.md#experimental-handlers) and cases that lower to checked Core. General effect rows, multi-shot continuations, and arbitrary composition remain unsupported. Effect declarations cannot exempt a module from checking. |
 | Holes and generation | Retain goal reporting and checked candidate generation where implemented. Unresolved holes remain rejected by the packaged checking path. Synthesis or metaprograms cannot mutate acceptance rules. |
@@ -108,7 +108,8 @@ An intentional retirement requires a documented breaking change and updated
 positive/negative expectations. Unrestricted recursion, a general effect
 system, new foreign interfaces, and additional targets are not implied by
 preserving this slice. Native memory reclamation is a required new capability;
-the current phase/process allocation model is not its completed implementation.
+the transitional C host's phase/process allocation model does not establish
+native memory reclamation.
 
 ## Non-goals
 

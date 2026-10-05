@@ -26,6 +26,9 @@ The canonical serializer can materialize inspection bytes from tokens on demand,
 for example `def x:Type:=1`, but this is optional debug/cache evidence. It is
 not required by compilation.
 
+Adjacent string tokens are separated by a space in serialized bytes, so an
+empty string followed by another string cannot become a triple-quote opener.
+
 ## Preserved metadata
 
 Comments whose trimmed line-comment body begins with `@` are preserved as

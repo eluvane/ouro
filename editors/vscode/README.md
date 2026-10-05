@@ -10,9 +10,8 @@ describes supported requests and limitations.
 
 ```sh
 cd editors/vscode
-npm install
-npm run lint
-npm run compile
+npm ci
+npm test
 ```
 
 Open this directory in VS Code and press `F5` to launch an Extension Development
@@ -23,25 +22,23 @@ extensions directory after compiling it.
 
 ## Toolchain
 
-Build the server, then configure its executable as the machine-scoped
-`ouro.server.command` setting:
+Build `ouro-lsp.exe` and `ouro-fmt.exe` with the
+[standalone native tool commands](../../docs/tooling.md#standalone-native-tools).
+Keep them beside `coil.exe` and its `ouro-native-build.exe` backend, then set the
+machine-scoped `ouro.server.command` to the server's absolute path.
 
-```sh
-sh scripts/build_tool.sh tools/lsp.ouro _build/tools/ouro-lsp
-```
-
-The extension does not execute scripts from an opened repository and does not
-start in Restricted Mode. Open a trusted workspace, set `ouro.server.command`
-to the built server (or a trusted wrapper), and optionally set `ouro.root` to
-the checkout directory.
+The extension starts the configured command only in a trusted workspace. It
+uses `ouro.root` (or the first workspace folder) as the working directory and
+`OURO_ROOT` authorization boundary. That root needs an existing `_build`
+directory for unsaved-buffer checks and formatting.
 
 ## Settings
 
 | Setting | Default | Purpose |
 | --- | --- | --- |
-| `ouro.root` | First workspace folder | Machine-scoped Ouro repository used by the server |
+| `ouro.root` | First workspace folder | Machine-scoped working directory and `OURO_ROOT` authorization boundary |
 | `ouro.server.command` | disabled | Machine-scoped trusted LSP command |
-| `ouro.server.args` | `[]` | Additional server arguments |
+| `ouro.server.args` | `[]` | Machine-scoped additional server arguments |
 | `ouro.trace.server` | `off` | JSON-RPC tracing in the Ouro output channel |
 
 ## Troubleshooting

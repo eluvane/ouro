@@ -33,9 +33,8 @@ def ci_gate_flag_known (name : String) : Bool :=
 
 
 def ci_gate_option_known (row : Pair String String) : Bool :=
-    match row with
-    | MkPair name _ => elem String str_eq name ci_gate_allowed_options
-    end;
+    let (MkPair name _) := row in
+    elem String str_eq name ci_gate_allowed_options;
 
 
 def ci_gate_cli_valid (raw : List String) (a : Args) : Bool :=
@@ -141,9 +140,9 @@ def unavailable_result (profile : String) (root : String) (out : String) (gate :
           io_pure CiResult result
 
 
-def process_log (root : String) (out : String) (gate : CiGate) (r : ProcResult) : String :=
+def process_log (command_text : String) (r : ProcResult) : String :=
     str_unlines
-      ([ str_concat("command=", ci_gate_command_text root out gate)
+      ([ str_concat("command=", command_text)
       , str_concat("returncode=", prim_string_of_nat (proc_code r))
       , "stdout:"
       , proc_stdout r
@@ -170,24 +169,25 @@ def run_process_gate (profile : String) (root : String) (out : String) (gate : C
     let report : String := gate_json_path out gate in
     let args : List String := ci_gate_resolved_args root out gate in
     do let! start := time_now_nat_or_zero;
-       ci_print_unless_quiet quiet
-         (str_cat4 "CI_GATE_START " (ci_gate_name gate) " cmd="
-           (ci_gate_command_text root out gate));
-       let! r := process_run_spec (command_spec(ci_gate_program gate, args));
-       let! finish := time_now_nat_or_zero;
-       let elapsed : Nat := sub finish start in
-       let status : String := match proc_ok r with | True => "pass" | False => "fail" end in
-       let result : CiResult :=
-         MkCiResult (ci_gate_name gate) status (ci_gate_argv root out gate)
-           (ci_gate_required gate) (ci_gate_blocking gate) elapsed (Just(Nat, proc_code r))
-           log report (process_failure_issues r) in
-       do repo_write(log, process_log root out gate r);
-          write_ci_result_report profile result;
-          ci_echo_process_output echo_output r;
-          ci_print_unless_quiet quiet
-            (str_cat4 "CI_GATE_DONE " (ci_gate_name gate) " status="
-              (str_concat(status, str_concat " log=" log)));
-          io_pure CiResult result
+       let command_argv : List String := Cons(String, ci_gate_program gate, args) in
+       let command_text : String := str_join " " command_argv in
+       do ci_print_unless_quiet quiet
+            (str_cat4 "CI_GATE_START " (ci_gate_name gate) " cmd=" command_text);
+          let! r := process_run_spec (command_spec(ci_gate_program gate, args));
+          let! finish := time_now_nat_or_zero;
+          let elapsed : Nat := sub finish start in
+          let status : String := match proc_ok r with | True => "pass" | False => "fail" end in
+          let result : CiResult :=
+            MkCiResult (ci_gate_name gate) status command_argv
+              (ci_gate_required gate) (ci_gate_blocking gate) elapsed (Just(Nat, proc_code r))
+              log report (process_failure_issues r) in
+          do repo_write(log, process_log command_text r);
+             write_ci_result_report profile result;
+             ci_echo_process_output echo_output r;
+             ci_print_unless_quiet quiet
+               (str_cat4 "CI_GATE_DONE " (ci_gate_name gate) " status="
+                 (str_concat(status, str_concat " log=" log)));
+             io_pure CiResult result
 
 
 def run_one_gate (profile : String) (root : String) (out : String) (gate : CiGate)
@@ -283,35 +283,28 @@ def json_string_field_eq (doc : Json) (key : String) (want : String) : Bool :=
     end;
 
 def host_bound_validation_report_text_ok (text : String) : Bool :=
-    match gate_parse_json text with
-    | Nothing => False
-    | Just doc =>
-      match gate_jsonx_get_bool doc "pass" with
-      | Nothing => False
-      | Just passed =>
-        match gate_jsonx_get_array doc "gates" with
-        | Nothing => False
-        | Just gates =>
-          andb passed
-            (andb (notb (nullb Json gates))
-              (andb (json_string_field_eq doc "kind"
-                  "ouro.repo-gate-report.v1")
-                (andb (json_string_field_eq doc "version" "1")
-                  (andb (json_string_field_eq doc "profile"
-                      "control-plane-native")
-                    (json_string_field_eq doc "execution_backend"
-                      "ouro-native-repo-gate")))))
-        end
-      end
-    end;
+    (let? (Nothing, Just) : Maybe Bool do
+       let doc : Json := (gate_parse_json text)?;
+       let passed : Bool := (gate_jsonx_get_bool doc "pass")?;
+       let gates : List Json := (gate_jsonx_get_array doc "gates")?;
+       andb passed
+         (andb (notb (nullb Json gates))
+           (andb (json_string_field_eq doc "kind"
+               "ouro.repo-gate-report.v1")
+             (andb (json_string_field_eq doc "version" "1")
+               (andb (json_string_field_eq doc "profile"
+                   "control-plane-native")
+                 (json_string_field_eq doc "execution_backend"
+                   "ouro-native-repo-gate")))))
+     end) ?? False;
 
 
 def host_bound_validation_report_ok (validation_report : String) : IO Bool :=
     do let! loaded := fs_read_checked validation_report;
-       match loaded with
-       | Left _ => io_pure Bool False
-       | Right text => io_pure(Bool, host_bound_validation_report_text_ok text)
-       end
+       io_pure Bool
+         (if let Right text := loaded then
+            host_bound_validation_report_text_ok text
+          else False)
 
 
 def host_bound_effective_code (command_ok : Bool) (report_ok : Bool)
@@ -339,15 +332,16 @@ def finish_host_bound_profile (profile : String) (out : String)
         command_ok report_ok in
     let summary_path : String := fs_child out "ci-summary.json" in
     do repo_write(report_path, host_bound_report_string passed validation_report);
-       repo_write(log_path, str_concat(host_bound_summary_text report_path, "\n"));
-       write_ci_result_report profile result;
-       repo_write(summary_path, ci_report_string(profile, [ result ] : List CiResult));
-       println (host_bound_summary_text report_path);
-       println (ci_summary_text profile ([ result ] : List CiResult) summary_path);
-       match passed with
-       | True => exit 0
-       | False => exit 1
-       end
+       let summary_text : String := host_bound_summary_text report_path in
+       do repo_write(log_path, str_concat(summary_text, "\n"));
+          write_ci_result_report profile result;
+          repo_write(summary_path, ci_report_string(profile, [ result ] : List CiResult));
+          println summary_text;
+          println (ci_summary_text profile ([ result ] : List CiResult) summary_path);
+          match passed with
+          | True => exit 0
+          | False => exit 1
+          end
 
 
 def run_host_bound_profile (profile : String) (root : String) (out : String) : IO Unit :=
@@ -417,9 +411,9 @@ def run_ci_gate_cli (a : Args) : IO Unit :=
 
 def main : IO Unit :=
     do let! xs := argv;
-       let a : Args := args_of_argv_bools ci_gate_switches xs in
-       do ci_gate_validate_cli xs a;
-          match args_flag a "help" with
-          | True => do eprintln ci_gate_usage; exit 2
-          | False => run_ci_gate_cli a
-          end
+       let a : Args := args_of_argv_bools ci_gate_switches xs;
+       ci_gate_validate_cli xs a;
+       match args_flag a "help" with
+       | True => do eprintln ci_gate_usage; exit 2
+       | False => run_ci_gate_cli a
+       end

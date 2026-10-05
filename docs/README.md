@@ -12,6 +12,7 @@
 ## Language
 
 - [Syntax](syntax.md) and [ergonomic forms](language/ergonomic-syntax.md)
+- [Writing good Ouro](best-practices-ouro.md) (revision-pinned handbook)
 - [Design goals](design.md) and [historical proposal](ouro.md)
 - [Effects and IO](effects_design.md)
 - [Stability](stability.md)

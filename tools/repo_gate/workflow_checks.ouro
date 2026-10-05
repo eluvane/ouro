@@ -833,6 +833,364 @@ def workflow_has_upload_action (entries : List WorkflowEntry) : Bool :=
       entries;
 
 
+def workflow_pr_cache_block_matches (entries : List WorkflowEntry)
+    (job : String) (field : String) (expected : String) : Bool :=
+    let prefix : String := str_cat3 "jobs/" job "/steps/" in
+    let caches : List WorkflowEntry := filter WorkflowEntry
+      (fun (entry : WorkflowEntry) =>
+        andb (workflow_entry_is_field entry)
+          (andb (str_starts(workflow_entry_path entry, prefix))
+            (andb (str_eq(workflow_entry_key entry, "id"))
+              (str_eq(workflow_scalar_unquote (workflow_entry_value entry), "ouro-cache")))))
+      entries in
+    match caches with
+    | Cons cache Nil =>
+        let step : String := path_dirname (workflow_entry_path cache) in
+        let wanted : String := str_cat3 step "/with/" field in
+        let values : List String := map WorkflowEntry String workflow_entry_value
+          (filter WorkflowEntry
+            (fun (entry : WorkflowEntry) =>
+              match entry with
+              | WorkflowField _ _ _ => False
+              | WorkflowBody entry_path _ => str_eq entry_path wanted
+              end)
+            entries) in
+        match workflow_field_value_at entries (str_concat step "/uses") with
+        | Nothing => False
+        | Just action =>
+            andb (str_starts (workflow_scalar_unquote action) "actions/cache/restore@")
+              (str_eq(str_join "\n" values, expected))
+        end
+    | _ => False
+    end;
+
+
+def workflow_pr_cache_contract_issues (path : String)
+    (entries : List WorkflowEntry) (issues : List GateIssue) : List GateIssue :=
+    match str_eq(path_basename path, "ouro-pr.yml") with
+    | False => issues
+    | True =>
+        let suite_paths : String := "_cache/ouro\n_build/c" in
+        let contracts : List (Pair String String) :=
+          [ MkPair String String "quick-firewall"
+              "ouro-pr-${{ matrix.group }}-${{ runner.os }}-\nouro-pr-checks-${{ runner.os }}-"
+          , MkPair String String "kernel-validation"
+              "ouro-pr-kernel-checks-${{ runner.os }}-\nouro-pr-checks-${{ runner.os }}-"
+          , MkPair String String "portable-kernel-smoke"
+              "ouro-pr-portable-${{ runner.os }}-"
+          ] in
+        foldl (Pair String String) (List GateIssue)
+          (fun (acc : List GateIssue) (contract : Pair String String) =>
+            match contract with
+            | MkPair job restore_keys =>
+                let expected_paths : String :=
+                  match str_eq job "portable-kernel-smoke" with
+                  | False => suite_paths
+                  | True => str_concat suite_paths
+                      "\n_build/bootstrap/*/report.json\n_build/bootstrap/*/inputs.json\n_build/bootstrap/*/out/p1/*.c\n_build/bootstrap/*/out/p2/*.c"
+                  end in
+                let path_issues : List GateIssue :=
+                  match workflow_pr_cache_block_matches entries job "path" expected_paths with
+                  | True => acc
+                  | False => workflow_issue_add
+                      (str_cat3 "PR cache paths for " job
+                        (str_concat " must be: " (str_replace expected_paths "\n" ", ")))
+                      path acc
+                  end in
+                match workflow_pr_cache_block_matches entries job "restore-keys" restore_keys with
+                | True => path_issues
+                | False => workflow_issue_add
+                    (str_cat3 "PR cache restore-keys for " job
+                      (str_concat " must be ordered as: " (str_replace restore_keys "\n" ", ")))
+                    path path_issues
+                end
+            end)
+          issues contracts
+    end;
+
+
+def workflow_compiler_field_is (entries : List WorkflowEntry) (wanted : String)
+    (expected : String) : Bool :=
+    match workflow_field_value_at entries wanted with
+    | Nothing => False
+    | Just value => str_eq(workflow_scalar_unquote value, expected)
+    end;
+
+
+def workflow_compiler_field_absent (entries : List WorkflowEntry) (wanted : String) : Bool :=
+    match workflow_field_value_at entries wanted with
+    | Nothing => True
+    | Just _ => False
+    end;
+
+
+def workflow_compiler_step (entries : List WorkflowEntry) (job : String)
+    (field : String) (value : String) : String :=
+    let prefix : String := str_cat3 "jobs/" job "/steps/" in
+    let matches : List WorkflowEntry :=
+      filter WorkflowEntry
+        (fun (entry : WorkflowEntry) =>
+          andb (workflow_entry_is_field entry)
+            (andb (str_starts (path_dirname (workflow_entry_path entry)) prefix)
+              (andb (str_starts (path_basename (path_dirname (workflow_entry_path entry))) "[")
+                (andb (str_ends (path_basename (path_dirname (workflow_entry_path entry))) "]")
+                  (andb (str_eq(workflow_entry_key entry, field))
+                    (str_eq(workflow_scalar_unquote (workflow_entry_value entry), value)))))))
+        entries in
+    match matches with
+    | Nil => ""
+    | Cons entry rest =>
+        match rest with
+        | Nil => path_dirname (workflow_entry_path entry)
+        | Cons _ _ => ""
+        end
+    end;
+
+
+def workflow_compiler_scalar_text (entries : List WorkflowEntry) (wanted : String) : String :=
+    match workflow_field_value_at entries wanted with
+    | Nothing => ""
+    | Just value =>
+        match str_eq (str_trim value) "|" with
+        | False => workflow_scalar_unquote value
+        | True =>
+            str_join "\n"
+              (map WorkflowEntry String workflow_entry_value
+                (filter WorkflowEntry
+                  (fun (entry : WorkflowEntry) =>
+                    andb (notb (workflow_entry_is_field entry))
+                      (str_eq(workflow_entry_path entry, wanted))) entries))
+        end
+    end;
+
+
+def workflow_compiler_action_is (entries : List WorkflowEntry) (step : String)
+    (action : String) : Bool :=
+    match workflow_field_value_at entries (str_concat step "/uses") with
+    | Nothing => False
+    | Just value => str_starts (workflow_scalar_unquote value) (str_concat action "@")
+    end;
+
+
+def workflow_compiler_step_before (entries : List WorkflowEntry)
+    (first : String) (second : String) : Bool :=
+    (fix go (rest : List WorkflowEntry) (seen : Bool) : Bool :=
+      match rest with
+      | Nil => False
+      | Cons entry tail =>
+          match str_starts (workflow_entry_path entry) (str_concat second "/") with
+          | True => seen
+          | False => go tail
+              (orb(seen, str_starts (workflow_entry_path entry) (str_concat first "/")))
+          end
+      end) entries False;
+
+
+def workflow_compiler_kind (path : String) : String :=
+    match str_eq(path_basename path, "ouro-nightly-full.yml") with
+    | True => "nightly"
+    | False =>
+        match str_eq(path_basename path, "ouro-lint.yml") with
+        | True => "lint"
+        | False =>
+            match str_eq(path_basename path, "ouro-release.yml") with
+            | True => "release"
+            | False => ""
+            end
+        end
+    end;
+
+
+def workflow_compiler_consumer (kind : String) : String :=
+    match str_eq kind "nightly" with
+    | True => "validation"
+    | False =>
+        match str_eq kind "lint" with
+        | True => "lint"
+        | False => "release-validation"
+        end
+    end;
+
+
+def workflow_compiler_artifact_name (kind : String) : String :=
+    str_concat kind "-host-compiler-${{ github.run_id }}-${{ github.run_attempt }}";
+
+
+def workflow_compiler_evidence_paths : String :=
+    "_build/c/ouro1\n_build/c/ouro1.bootstrap.json\n_build/bootstrap/*/report.json\n_build/bootstrap/*/inputs.json\n_build/bootstrap/*/out/p1/*.c\n_build/bootstrap/*/out/p2/*.c";
+
+
+def workflow_compiler_writer_guard (kind : String) : String :=
+    match str_eq kind "nightly" with
+    | True =>
+        "${{ (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'))) && steps.compiler-cache.outputs.cache-hit != 'true' }}"
+    | False =>
+        "${{ (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master') && steps.compiler-cache.outputs.cache-hit != 'true' }}"
+    end;
+
+
+-- A named consumer must receive the checked producer's exact artifact after
+-- cache restoration; marker text in another step cannot authenticate that flow.
+def workflow_compiler_producer_valid (entries : List WorkflowEntry) (kind : String) : Bool :=
+    let inputs : String := workflow_compiler_step entries "host-compiler" "id" "inputs" in
+    let restore : String := workflow_compiler_step entries "host-compiler" "id" "compiler-cache" in
+    let build : String := workflow_compiler_step entries "host-compiler" "name" "Build and verify host compiler" in
+    let bundle : String := workflow_compiler_step entries "host-compiler" "id" "bundle" in
+    let upload : String := workflow_compiler_step entries "host-compiler" "name" "Upload verified compiler" in
+    all Bool (fun (value : Bool) => value)
+      ([ workflow_compiler_field_is entries "jobs/host-compiler" ""
+       , workflow_compiler_field_is entries "jobs/host-compiler/runs-on" "ubuntu-latest"
+       , workflow_compiler_field_is entries "jobs/host-compiler/outputs/sha256" "${{ steps.bundle.outputs.sha256 }}"
+       , workflow_compiler_field_is entries "jobs/host-compiler/outputs/artifact" "${{ steps.bundle.outputs.artifact }}"
+       , str_eq (workflow_compiler_scalar_text entries (str_concat inputs "/run"))
+           "python3 scripts/ci_gate.py --compiler-artifact key >> \"$GITHUB_OUTPUT\""
+       , workflow_compiler_action_is entries restore "actions/cache/restore"
+       , workflow_compiler_field_is entries (str_concat restore "/with/key")
+           "ouro-host-compiler-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.inputs.outputs.key }}"
+       , str_eq(workflow_compiler_scalar_text entries (str_concat restore "/with/path"),
+           workflow_compiler_evidence_paths)
+       , workflow_compiler_field_absent entries (str_concat restore "/with/restore-keys")
+       , str_eq(workflow_compiler_scalar_text entries (str_concat build "/run"),
+           "python3 scripts/ouro_build.py build --verbosity quiet")
+       , str_eq(workflow_compiler_scalar_text entries (str_concat bundle "/run"),
+           str_cat3 "python3 scripts/ci_gate.py --compiler-artifact export >> \"$GITHUB_OUTPUT\"\necho \"artifact="
+             (workflow_compiler_artifact_name kind) "\" >> \"$GITHUB_OUTPUT\"")
+       , workflow_compiler_action_is entries upload "actions/upload-artifact"
+       , workflow_compiler_field_is entries (str_concat upload "/with/name") (workflow_compiler_artifact_name kind)
+       , workflow_compiler_field_is entries (str_concat upload "/with/path") "_build/ci/host-compiler.tar.gz"
+       , workflow_compiler_field_is entries (str_concat upload "/with/if-no-files-found") "error"
+       , workflow_compiler_step_before entries inputs restore
+       , workflow_compiler_step_before entries restore build
+       , workflow_compiler_step_before entries build bundle
+       , workflow_compiler_step_before entries bundle upload
+       , all String (fun (step : String) =>
+           workflow_compiler_field_absent entries (str_concat step "/if"))
+           [inputs, restore, build, bundle, upload]
+       ] : List Bool);
+
+
+def workflow_compiler_needs_producer (entries : List WorkflowEntry) (consumer : String) : Bool :=
+    match workflow_field_value_at entries (str_cat3 "jobs/" consumer "/needs") with
+    | Nothing => False
+    | Just value =>
+        elem String str_eq "host-compiler"
+          (str_words (str_replace (str_replace (str_replace value "[" " ") "]" " ") "," " "))
+    end;
+
+
+def workflow_compiler_consumer_valid (entries : List WorkflowEntry) (consumer : String) : Bool :=
+    let download : String := workflow_compiler_step entries consumer "name" "Download host compiler" in
+    let verify : String := workflow_compiler_step entries consumer "name" "Verify and install host compiler" in
+    let gate_name : String :=
+      match str_eq consumer "lint" with
+      | True => "Run lint suite"
+      | False => "Run checks"
+      end in
+    let gate : String := workflow_compiler_step entries consumer "name" gate_name in
+    let prefix : String := str_cat3 "jobs/" consumer "/steps/" in
+    all Bool (fun (value : Bool) => value)
+      ([ workflow_compiler_needs_producer entries consumer
+       , workflow_compiler_action_is entries download "actions/download-artifact"
+       , workflow_compiler_field_is entries (str_concat download "/with/name") "${{ needs.host-compiler.outputs.artifact }}"
+       , workflow_compiler_field_is entries (str_concat download "/with/path") "_build/ci"
+       , workflow_compiler_field_is entries (str_concat verify "/env/COMPILER_SHA256") "${{ needs.host-compiler.outputs.sha256 }}"
+       , str_eq(workflow_compiler_scalar_text entries (str_concat verify "/run"),
+           "python3 scripts/ci_gate.py --compiler-artifact import --compiler-sha256 \"$COMPILER_SHA256\"")
+       , workflow_compiler_field_absent entries (str_concat download "/if")
+       , workflow_compiler_field_absent entries (str_concat verify "/if")
+       , workflow_compiler_step_before entries download verify
+       , workflow_compiler_step_before entries verify gate
+       , str_starts (workflow_compiler_scalar_text entries (str_concat gate "/run"))
+           "python3 scripts/ci_gate.py --profile "
+       , workflow_compiler_field_absent entries (str_concat gate "/if")
+       , all WorkflowEntry (fun (entry : WorkflowEntry) =>
+           match andb (workflow_entry_is_field entry)
+                   (andb (str_starts (workflow_entry_path entry) prefix)
+                     (str_eq(workflow_entry_key entry, "uses"))) with
+           | False => True
+           | True =>
+               match str_starts (workflow_scalar_unquote (workflow_entry_value entry)) "actions/cache/restore@" with
+               | False => True
+               | True => workflow_compiler_step_before entries
+                   (path_dirname (workflow_entry_path entry)) verify
+               end
+           end) entries
+       ] : List Bool);
+
+
+def workflow_compiler_writer_valid (entries : List WorkflowEntry) (kind : String) : Bool :=
+    let bundle : String := workflow_compiler_step entries "host-compiler" "id" "bundle" in
+    all WorkflowEntry
+      (fun (entry : WorkflowEntry) =>
+        match andb (workflow_entry_is_field entry)
+                (andb (str_eq(workflow_entry_key entry, "uses"))
+                  (str_starts (workflow_scalar_unquote (workflow_entry_value entry)) "actions/cache/save@")) with
+        | False => True
+        | True =>
+            let step : String := path_dirname (workflow_entry_path entry) in
+            match str_eq kind "lint" with
+            | True => False
+            | False =>
+                match str_starts step "jobs/host-compiler/steps/" with
+                | False => True
+                | True =>
+                    all Bool (fun (value : Bool) => value)
+                      ([ workflow_compiler_field_is entries (str_concat step "/if")
+                           (workflow_compiler_writer_guard kind)
+                       , workflow_compiler_field_is entries (str_concat step "/with/key")
+                           "${{ steps.compiler-cache.outputs.cache-primary-key }}"
+                       , str_eq(workflow_compiler_scalar_text entries (str_concat step "/with/path"),
+                           workflow_compiler_evidence_paths)
+                       , workflow_compiler_step_before entries bundle step
+                       ] : List Bool)
+                end
+            end
+        end) entries;
+
+
+def workflow_compiler_guard_valid (entries : List WorkflowEntry) (kind : String)
+    (consumer : String) : Bool :=
+    match str_eq kind "release" with
+    | True => andb
+        (workflow_compiler_field_is entries "jobs/host-compiler/if" "${{ needs.groups.outputs.due == 'true' }}")
+        (workflow_compiler_field_is entries (str_cat3 "jobs/" consumer "/if") "${{ needs.groups.outputs.due == 'true' }}")
+    | False => andb (workflow_compiler_field_absent entries "jobs/host-compiler/if")
+        (workflow_compiler_field_absent entries (str_cat3 "jobs/" consumer "/if"))
+    end;
+
+
+def workflow_compiler_contract_issues (path : String) (entries : List WorkflowEntry)
+    (issues : List GateIssue) : List GateIssue :=
+    let kind : String := workflow_compiler_kind path in
+    let consumer : String := workflow_compiler_consumer kind in
+    match orb (str_null kind)
+            (workflow_compiler_field_absent entries (str_concat "jobs/" consumer)) with
+    | True => issues
+    | False =>
+        let producer : List GateIssue :=
+          match workflow_compiler_producer_valid entries kind with
+          | True => issues
+          | False => workflow_issue_add
+              "shared compiler producer must bind current input key, complete bootstrap evidence, build, export and artifact outputs to its steps"
+              path issues
+          end in
+        let consumer_issues : List GateIssue :=
+          match andb (workflow_compiler_consumer_valid entries consumer)
+                  (workflow_compiler_guard_valid entries kind consumer) with
+          | True => producer
+          | False => workflow_issue_add
+              "shared compiler consumer must depend on its producer and import its artifact SHA after every cache restore"
+              path producer
+          end in
+        match workflow_compiler_writer_valid entries kind with
+        | True => consumer_issues
+        | False => workflow_issue_add
+            "shared compiler cache writes require complete evidence and the trusted writer guard; Lint is restore-only"
+            path consumer_issues
+        end
+    end;
+
+
 def workflow_permission_issues_for_doc (path : String) (doc : WorkflowDoc)
     (issues : List GateIssue) : List GateIssue :=
     let entries : List WorkflowEntry := workflow_doc_entries doc in
@@ -844,12 +1202,16 @@ def workflow_permission_issues_for_doc (path : String) (doc : WorkflowDoc)
         (fun (acc : List GateIssue) (entry : WorkflowEntry) =>
           workflow_permission_entry_issues path doc entry acc)
         issues0 entries in
+    let issues2 : List GateIssue :=
+      workflow_pr_cache_contract_issues path entries issues1 in
+    let issues3 : List GateIssue :=
+      workflow_compiler_contract_issues path entries issues2 in
     match str_eq(path_basename path, "dependency-review.yml") with
-    | True => issues1
+    | True => issues3
     | False =>
         match workflow_has_upload_action entries with
-        | True => issues1
-        | False => workflow_issue_add "missing report artifact upload" path issues1
+        | True => issues3
+        | False => workflow_issue_add "missing report artifact upload" path issues3
         end
     end;
 
@@ -857,6 +1219,13 @@ def workflow_permission_issues_for_doc (path : String) (doc : WorkflowDoc)
 def workflow_permission_issues_for_text (path : String) (text : String) (issues : List GateIssue)
     : List GateIssue :=
     workflow_permission_issues_for_doc path (workflow_parse path text) issues;
+
+
+def workflow_policy_issues_for_text (path : String) (text : String) : List GateIssue :=
+    let doc : WorkflowDoc := workflow_parse path text in
+    append GateIssue
+      (workflow_dangerous_issues_for_doc path doc (Nil GateIssue))
+      (workflow_permission_issues_for_doc path doc (Nil GateIssue));
 
 
 def workflow_permission_file_issues (root : String) (path : String) (issues : List GateIssue)

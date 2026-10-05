@@ -168,9 +168,33 @@ implemented, or production-ready beyond the evidence actually obtained.
   relabel, or retarget unrelated PRs. Force-push only when necessary to fix your
   own branch.
 - Follow the [submission workflow](CONTRIBUTING.md#opening-a-pull-request).
-  Describe the concrete change and reason concisely, with applicable risks and
-  limitations. Omit empty sections, checklists, validation inventories, and
-  broad completion claims; keep execution evidence in task reports and CI.
+  Use a concrete action title and one or two short paragraphs explaining the
+  result and reason. Add only material behavior limits, incompatibilities,
+  migration steps, or trust impact; a short list may cover independent changes.
+  Do not require section headings, checklists, or execution history. Keep
+  commands, validation results, environment details, and agent narratives in
+  task reports and CI. Keep PR descriptions as prose only, without
+  license-acceptance statements or checkbox footers. Submission terms are
+  defined in CONTRIBUTING.md and LICENSE.
+
+## GitHub planning and community
+
+- Follow [contribution and community routing](CONTRIBUTING.md#questions-and-planning)
+  and the [native milestone mapping](docs/roadmap.md#github-milestones).
+- Perform GitHub writes as `eluvane`. Before writing, verify
+  `gh api user --jq .login`; switch to the existing account with
+  `gh auth switch --user eluvane` if needed. If that account is unavailable,
+  ask for authentication instead of using another account.
+- For authorized issue or PR metadata work, apply the manual label conventions
+  in [Opening a pull request](CONTRIBUTING.md#opening-a-pull-request). Preserve
+  supplied labels and milestones; select an existing native milestone only for
+  work that directly contributes to its roadmap stage.
+- Keep milestone acceptance tied to the roadmap's required evidence. Issue
+  closure, merge status, and GitHub completion percentages do not establish
+  native-stage acceptance.
+- Treat Discussions as community context. Follow maintainer direction and the
+  applicable RFC/review process before implementing a proposed design; these
+  conventions do not authorize unsolicited posts or repository changes.
 
 ## When to stop and ask for maintainer guidance
 

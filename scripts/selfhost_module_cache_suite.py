@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import stat
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from unittest.mock import patch
 
 import cache_parity_suite as cache_parity
+import selfhost_module_cache as module_cache
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -117,6 +120,132 @@ def test_module_cache_precision(tmp: Path) -> None:
     assert s["direct_misses"] == 3 and s["closure_misses"] == 3, s
 
 
+def test_module_cache_import_reads(tmp: Path) -> None:
+    repo = tmp / "import_reads"
+    repo.mkdir()
+    write_modules(repo)
+    mini = repo / "mini"
+    dependency = mini / "d.ouro"
+    dependency.write_text('import "a.ouro";\ndef d : Nat := a;\n', encoding="utf-8")
+    (mini / "c.ouro").write_text('import "b.ouro", "d.ouro";\ndef c : Nat := b;\n', encoding="utf-8")
+    (mini / "e.ouro").write_text('import "b.ouro";\ndef e : Nat := b;\n', encoding="utf-8")
+    paths = {name: module_cache.normalize_path(mini / f"{name}.ouro") for name in "abcde"}
+    graph = {
+        paths["c"]: [paths[name] for name in "abdc"],
+        paths["e"]: [paths[name] for name in "abe"],
+    }
+    kwargs = {
+        "roots": [paths["c"], paths["e"]],
+        "work": repo / "work",
+        "cache_root": repo / "cache",
+        "fuel": "1",
+        "label": "suite-import-reads",
+    }
+    real_imports = module_cache.import_targets
+
+    def prepare(*, cache_enabled: bool = True, supplied_graph: bool = True) -> dict:
+        reads: dict[str, int] = {}
+
+        def counted_imports(path: str) -> list[str]:
+            reads[path] = reads.get(path, 0) + 1
+            return real_imports(path)
+
+        with patch.object(module_cache, "import_targets", side_effect=counted_imports):
+            report = module_cache.materialize_module_artifacts(
+                **kwargs, cache_enabled=cache_enabled,
+                unit_graph=graph if supplied_graph else None,
+            )
+        assert reads == {path: 1 for path in paths.values()}, reads
+        return report
+
+    first = prepare()
+    warm = prepare()
+    assert warm["summary"]["direct_hits"] == 5, warm["summary"]
+    assert warm["summary"]["closure_hits"] == 5, warm["summary"]
+    uncached = prepare(cache_enabled=False, supplied_graph=False)
+    first_rows = by_path(first)
+    for report in (warm, uncached):
+        for path, row in by_path(report).items():
+            for key in ("source_sha256", "bytes", "imports", "decl_count", "closure",
+                        "direct_key", "closure_key", "phase_keys"):
+                assert row[key] == first_rows[path][key], (path, key, row, first_rows[path])
+    assert first_rows[paths["d"]]["closure"] == [paths[name] for name in "ad"], first_rows
+    assert first_rows[paths["c"]]["closure"] == graph[paths["c"]], first_rows
+
+    timestamp = dependency.stat()
+    original = dependency.read_bytes()
+    dependency.write_bytes(original.replace(b'"a.ouro"', b'"b.ouro"'))
+    assert dependency.stat().st_size == timestamp.st_size
+    os.utime(dependency, ns=(timestamp.st_atime_ns, timestamp.st_mtime_ns))
+    changed = prepare()
+    changed_rows = by_path(changed)
+    assert changed["summary"]["direct_misses"] == 1, changed["summary"]
+    assert changed["summary"]["closure_misses"] == 2, changed["summary"]
+    assert changed_rows[paths["d"]]["imports"] == [paths["b"]], changed_rows
+    assert changed_rows[paths["d"]]["closure"] == [paths[name] for name in "abd"], changed_rows
+    assert changed_rows[paths["e"]]["closure_cache"] == "hit", changed_rows
+
+    for body, message in (
+        ('import "missing.ouro";\n', "MODULE_CACHE: FAIL missing"),
+        ('import "c.ouro";\n', "MODULE_CACHE: FAIL import cycle"),
+    ):
+        dependency.write_text(body, encoding="utf-8")
+        try:
+            module_cache.materialize_module_artifacts(**kwargs, unit_graph=graph)
+        except SystemExit as exc:
+            assert message in str(exc), str(exc)
+        else:
+            raise AssertionError(f"supplied graph hid source error: {message}")
+
+
+def test_import_scan_offsets() -> None:
+    source = (
+        "def name' : Nat := 1;\n"
+        'member.import "fake.ouro";\n'
+        'def literal : String := "import \\"fake2.ouro\\";";\n'
+        "def scalar : Nat := 'i';\n"
+        'import "left.ouro", -- grouped import\n r#"right.ouro"# as Right;\n'
+    )
+    assert module_cache.quoted_import_targets(source, "mini/root.ouro") == [
+        "mini/left.ouro", "mini/right.ouro",
+    ]
+    for source in ("import name';", 'import "left.ouro", malformed;'):
+        try:
+            module_cache.quoted_import_targets(source, "mini/root.ouro")
+        except ValueError as exc:
+            assert "malformed quoted import in mini/root.ouro" in str(exc), str(exc)
+        else:
+            raise AssertionError(f"malformed import accepted: {source}")
+
+
+def test_module_cache_label_is_report_metadata(tmp: Path) -> None:
+    import selfhost_module_cache as cache
+
+    repo = tmp / "labels"
+    repo.mkdir()
+    write_modules(repo)
+    kwargs = {
+        "roots": [(repo / "mini/c.ouro").as_posix()],
+        "work": repo / "work",
+        "cache_root": repo / "cache",
+    }
+    first = cache.materialize_module_artifacts(**kwargs, label="stage1/backend")
+    artifacts = {
+        path: (cache.ROOT / path).read_bytes()
+        for row in first["modules"]
+        for path in (row["direct_cache_path"], row["closure_cache_path"])
+    }
+    second = cache.materialize_module_artifacts(**kwargs, label="stage2/backend")
+    assert second["label"] == "stage2/backend", second
+    assert second["summary"]["direct_hits"] == 3, second["summary"]
+    assert second["summary"]["closure_hits"] == 3, second["summary"]
+    assert second["summary"]["direct_changed_modules"] == [], second["summary"]
+    assert second["summary"]["closure_changed_modules"] == [], second["summary"]
+    assert by_path(first).keys() == by_path(second).keys()
+    for path, before in artifacts.items():
+        assert (cache.ROOT / path).read_bytes() == before, path
+
+
 def test_cache_parity_requires_artifacts(tmp: Path) -> None:
     original_run = cache_parity.run
     cache_parity.run = lambda *_args: 0
@@ -135,6 +264,9 @@ def main() -> int:
     with tempfile.TemporaryDirectory(prefix="ouro-module-cache-suite-") as d:
         tmp = Path(d)
         test_module_cache_precision(tmp)
+        test_module_cache_import_reads(tmp)
+        test_import_scan_offsets()
+        test_module_cache_label_is_report_metadata(tmp)
         test_cache_parity_requires_artifacts(tmp)
     print("SELFHOST_MODULE_CACHE_SUITE: PASS")
     return 0

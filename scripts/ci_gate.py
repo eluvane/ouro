@@ -883,18 +883,27 @@ def lint_phase_contract_failures(all_gates: Sequence[Gate], groups: dict[str, tu
 
 def lint_workflow_contract_failures(content: str) -> list[str]:
     failures: list[str] = []
+    jobs: dict[str, str] = {}
+    for name in ("host-compiler", "lint"):
+        section = re.search(rf"^  {name}:\n(.*?)(?=^  [a-z0-9-]+:|\Z)",
+                            content, re.MULTILINE | re.DOTALL)
+        jobs[name] = section.group(1) if section else ""
+        if "    timeout-minutes: 120\n" not in jobs[name]:
+            failures.append("standalone Lint job must retain its 120-minute limit: " + name)
+    lint = jobs["lint"]
     names = ["lint-fixtures", *(f"lint-production-{index}" for index in range(1, 5)), "lint-clippy"]
-    matrix = re.findall(r"^          - group: ([a-z0-9-]+)$", content, re.MULTILINE)
+    matrix = re.findall(r"^          - group: ([a-z0-9-]+)$", lint, re.MULTILINE)
     if matrix != names:
         failures.append("standalone Lint must schedule every required lint group once in order")
     for required in (
-        "    timeout-minutes: 120\n", "      fail-fast: false\n",
-        "run: python3 scripts/ouro_build.py build --verbosity quiet",
+        "      fail-fast: false\n",
         'run: python3 scripts/ci_gate.py --profile manual --group "${{ matrix.group }}" --out "_build/ci/${{ matrix.group }}"',
         "name: lint-${{ matrix.group }}",
     ):
-        if required not in content:
+        if required not in lint:
             failures.append("standalone Lint lost required command or isolation: " + required.strip())
+    if "run: python3 scripts/ouro_build.py build --verbosity quiet" not in jobs["host-compiler"]:
+        failures.append("standalone Lint compiler producer lost its build and verification command")
     return failures
 
 
@@ -938,9 +947,20 @@ def lint_phase_selftest_failures(all_gates: Sequence[Gate]) -> list[str]:
             ("      fail-fast: false", "      fail-fast: true"),
             ("    timeout-minutes: 120", "    timeout-minutes: 180"),
             ("name: lint-${{ matrix.group }}", "name: lint"),
+            ("  host-compiler:\n", "  unrelated-compiler:\n"),
+            ("  lint:\n", "  unrelated-lint:\n"),
         ):
             if not lint_workflow_contract_failures(content.replace(before, after, 1)):
                 failures.append("standalone Lint scheduling regression was accepted: " + before)
+        for name in ("host-compiler", "lint"):
+            section = re.search(rf"^  {name}:\n(.*?)(?=^  [a-z0-9-]+:|\Z)",
+                                content, re.MULTILINE | re.DOTALL)
+            if section:
+                mutated = (content[:section.start()] +
+                           section.group(0).replace("    timeout-minutes: 120", "    timeout-minutes: 180", 1) +
+                           content[section.end():])
+                if not lint_workflow_contract_failures(mutated):
+                    failures.append("standalone Lint accepted a changed job timeout: " + name)
     for profile in ("pr", "nightly", "manual"):
         printed = io.StringIO()
         with contextlib.redirect_stdout(printed):
@@ -997,12 +1017,99 @@ def lint_phase_selftest_failures(all_gates: Sequence[Gate]) -> list[str]:
     return failures
 
 
+def check_tool_preparation_selftest_failures(all_gates: Sequence[Gate]) -> list[str]:
+    import tempfile
+
+    failures: list[str] = []
+    lint_names = {"python-lint", "shell-lint"}
+    for profile, groups in PROFILE_GROUPS.items():
+        selected = {gate.name for gate in all_gates if profile in gate.profiles and gate.name in lint_names}
+        expected = lint_names if profile in {"pr", "nightly", "manual"} else set()
+        owners = {group for group, names in groups.items() if lint_names.intersection(names)}
+        if selected != expected or owners != ({"checks"} if expected else set()):
+            failures.append("host lint tools must remain owned only by pr/nightly/manual checks: " + profile)
+
+    def workflow_step(content: str, job: str, name: str) -> str:
+        section = re.search(rf"^  {job}:\n(.*?)(?=^  [a-z0-9-]+:|\Z)",
+                            content, re.MULTILINE | re.DOTALL)
+        step = re.search(rf"^      - name: {re.escape(name)}\n(.*?)(?=^      - |\Z)",
+                         section.group(1) if section else "", re.MULTILINE | re.DOTALL)
+        if not step:
+            raise ValueError("missing workflow step: " + job + "/" + name)
+        return step.group(1)
+
+    try:
+        manual = (ROOT / ".github/workflows/ouro-manual-trust.yml").read_text(encoding="utf-8")
+        release = (ROOT / ".github/workflows/ouro-release.yml").read_text(encoding="utf-8")
+        toolchain = workflow_step(manual, "manual-validation", "Show toolchain")
+        installer = workflow_step(release, "release-validation", "Install check tools")
+        metadata = workflow_step(release, "release-gates-and-package", "Show context")
+    except (OSError, ValueError) as exc:
+        return [*failures, "cannot inspect check tool preparation: " + str(exc)]
+    if ("          INSTALL_CHECK_TOOLS: ${{ inputs.profile == 'manual' && "
+            "matrix.group == 'checks' }}\n") not in toolchain:
+        failures.append("Manual must prepare host lint tools only for manual/checks")
+    if ("        if: ${{ matrix.group == 'checks' && (inputs.run_profile == 'manual' || "
+            "inputs.run_profile == 'pr' || inputs.run_profile == '') }}\n") not in installer:
+        failures.append("Release must prepare host lint tools only for empty/pr/manual checks")
+    if re.search(r"\b(?:pip|ruff|shellcheck|sudo|choco|apt(?:-get)?)\b", metadata):
+        failures.append("Release metadata must not repeat host lint tool installation")
+    marker = "        run: |\n"
+    if marker not in toolchain:
+        return [*failures, "Manual toolchain must retain an executable literal run body"]
+    body = "\n".join(line[10:] for line in toolchain.split(marker, 1)[1].splitlines())
+    body = body.replace("${{ runner.os }}", "Linux")
+    shell = shutil.which("sh")
+    if shell is None:
+        return [*failures, "check tool preparation self-test requires sh"]
+    shell = str(Path(shell).resolve())
+    pip_call = "python -m pip install --disable-pip-version-check --quiet ruff==0.15.21"
+    versions = ["python --version", "gcc --version"]
+    cases = (
+        ("false", 19, 0, versions),
+        ("true", 0, 0, [versions[0], pip_call, "shellcheck --version", versions[1]]),
+        ("true", 19, 19, [versions[0], pip_call]),
+    )
+    # Every external command is a stub; PATH contains no host executable fallback.
+    stub = (
+        "#!/bin/sh\n"
+        "printf '%s %s\\n' \"${0##*/}\" \"$*\"\n"
+        "case \"${0##*/}:$*\" in\n"
+        '  "python:--version"|"python3:--version"|"gcc:--version"|"shellcheck:--version") exit 0 ;;\n'
+        '  "python:-m pip install "*|"python3:-m pip install "*) exit "$INSTALL_STATUS" ;;\n'
+        "  *) exit 19 ;;\n"
+        "esac\n"
+    )
+    try:
+        with tempfile.TemporaryDirectory(prefix="ouro-check-tool-preparation-") as temporary:
+            root = Path(temporary)
+            for name in ("python", "python3", "gcc", "shellcheck", "sudo", "choco", "apt", "apt-get", "pip"):
+                executable = root / name
+                executable.write_text(stub, encoding="utf-8", newline="\n")
+                executable.chmod(0o755)
+            for enabled, install_status, status, expected in cases:
+                env = {**os.environ, "PATH": str(root), "INSTALL_CHECK_TOOLS": enabled,
+                       "INSTALL_STATUS": str(install_status)}
+                try:
+                    result = subprocess.run([shell, "-e", "-c", body], cwd=root, env=env,
+                                            capture_output=True, text=True, timeout=5, check=False)
+                except (OSError, subprocess.TimeoutExpired) as exc:
+                    failures.append("cannot run isolated tool preparation: " + str(exc))
+                    continue
+                if result.returncode != status or result.stdout.splitlines() != expected or result.stderr:
+                    failures.append(f"Manual tool preparation lost call/failure order: {enabled}/{install_status}")
+    except OSError as exc:
+        failures.append("cannot prepare isolated check tool stubs: " + str(exc))
+    return failures
+
+
 def run_self_tests(all_gates: Sequence[Gate]) -> int:
     failures: list[str] = []
     failures.extend(summary_contract_failures())
     failures.extend(routing_contract_failures())
     failures.extend(provenance_contract_failures())
     failures.extend(lint_phase_selftest_failures(all_gates))
+    failures.extend(check_tool_preparation_selftest_failures(all_gates))
     for workflow, expected_steps in (("ouro-manual-trust.yml", 2), ("ouro-release.yml", 1)):
         content = (ROOT / ".github/workflows" / workflow).read_text(encoding="utf-8")
         failures.extend(windows_gcc_contract_failures(content, expected_steps))

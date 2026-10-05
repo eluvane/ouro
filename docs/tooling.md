@@ -6,9 +6,9 @@ the project-facing name for the same toolchain: `coil check`, `coil fmt`,
 `coil lock`) map onto `ouro1` and `ouro1 pkg`. `doctor` prints the native
 target and rejects `legacy-c`. Most user-facing tools are Ouro programs
 under `tools/`; the wrapper builds them on first use and rebuilds them when
-their sources change. Standalone native LSP, package verification and user
-tests use the PE binaries described below; the transitional C-host tool
-builder does not provision this group.
+their sources change. Standalone Windows tools use the PE binaries described
+below. Hosted suites can also build LSP, package and test tools through the
+C-host builder and supply explicit subprocess wrappers.
 
 ## Check and evaluate
 
@@ -24,7 +24,8 @@ up the compiler from the repository root, but `pkg verify` still typechecks
 `_ouro_pkgs/...` inside the project that invoked it. `eval`
 elaborates and evaluates a declaration or expression in the module's scope.
 The evaluation wrapper defaults to `Nat`; use `--type TYPE` for another result
-type. The declared type is checked before native extraction.
+type. The declared type is checked before C extraction and execution through
+the host C toolchain.
 
 For compiler diagnostics and transformation tests, `check` can write its complete
 checked program:
@@ -65,9 +66,11 @@ forwards to the toolchain driver. `ouro1 run FILE.ouro` compiles to
 limits; [Design](design.md#native-toolchain-contract) owns the native target.
 
 `tools/coil.ouro` provides the native CLI entry for `doctor`, `check`, program
-`build`, and `run FILE.ouro [PROGRAM_ARG ...]`. Its check command collects the
-complete import closure and accepts library modules without an executable entry
-point. Check fuel defaults to 16000; program build and run retain the positional
+`build`, and `run FILE.ouro [PROGRAM_ARG ...]`. Check, build and run delegate to
+`ouro-native-build.exe` beside the loaded launcher; provision that backend with
+`coil.exe`. Its check command collects the complete import closure and accepts
+library modules without an executable entry point. Check fuel defaults to
+16000; program build and run retain the positional
 producer's 200000 budget. Unknown, repeated, or incomplete check/build options
 return nonzero before compilation.
 
@@ -84,8 +87,9 @@ commands during migration.
 
 ## Standalone native tools
 
-With a native `coil.exe` already built in `_build/native`, build the formatter,
-language server, package tool and test runner explicitly:
+With native `coil.exe` and its `ouro-native-build.exe` backend already built in
+`_build/native`, build the formatter, language server, package tool and test
+runner explicitly:
 
 ```powershell
 .\_build\native\coil.exe build tools/fmt.ouro --out _build/native/ouro-fmt.exe
@@ -94,13 +98,14 @@ language server, package tool and test runner explicitly:
 .\_build\native\coil.exe build tools/test/main.ouro --out _build/native/ouro-test.exe
 ```
 
-Invoke these executables directly. `ouro-lsp.exe`, `ouro-pkg.exe` and
-`ouro-test.exe` locate the fixed `coil.exe` beside their loaded Windows image;
-LSP formatting also requires `ouro-fmt.exe` there. Their subprocesses preserve
+Invoke these executables directly. Without hosted overrides, `ouro-lsp.exe`,
+`ouro-pkg.exe` and `ouro-test.exe` locate the fixed `coil.exe` beside their loaded
+Windows image; keep its `ouro-native-build.exe` backend there too. LSP formatting
+also requires `ouro-fmt.exe` there. Their subprocesses preserve
 literal arguments and the real working directory. A missing sibling, timeout,
 resource failure or malformed process result is an explicit failure.
 
-Each child tree uses one CPU, 3072 MiB and 16 MiB per captured stream. The
+The bounded sibling path uses one CPU, 3072 MiB and 16 MiB per captured stream. The
 provisional deadlines are 30 seconds for LSP checks, 10 seconds for formatting,
 120 seconds per package source, 1800 seconds for a test check/build, 300 seconds
 per test executable and 4000 seconds for the recursive runner probe. These
@@ -114,13 +119,17 @@ dispatch and automatic tool builds are separate work. The retained shell
 suites still own their fixture preparation and assertions; native acceptance
 must provision direct-PE candidates and their siblings before running those
 assertions. A C-host candidate cannot exercise the bounded native process API.
-Hosted C-host suites instead pass `OURO_TEST_CHECK` /
-`OURO_HOSTED_COMPILER_WRAPPER` (`scripts/ouro1.sh`) and, for builds,
-`OURO_TEST_BUILD` (`scripts/build_tool.sh`). `ouro1 test` and `ouro1 pkg`
-set those variables when they are unset, and C-host test runs launch the
-child with `prim_proc_exec` instead of bounded capture. Use the retained
-suites' explicit `--native-tools DIR` option as described in
-[native tool acceptance](ci.md#local-profiles).
+Hosted C-host suites select `scripts/ouro1.sh` through `OURO_TEST_CHECK`,
+`OURO_PKG_CHECK`, or `OURO_HOSTED_COMPILER_WRAPPER`, in that priority order.
+LSP formatting uses `OURO_HOSTED_FMT`; test builds use `OURO_TEST_BUILD`
+(`scripts/build_tool.sh`). `ouro1 test` and `ouro1 pkg` set their checker
+variables when unset. These overrides use the host process path without the
+bounded sibling capture limits.
+
+For direct-PE acceptance, leave all five hosted override variables unset and
+use the retained suites' explicit `--native-tools DIR` option as described in
+[native tool acceptance](ci.md#local-profiles). The suites inherit the caller's
+environment; that option alone does not clear hosted overrides.
 
 ## Formatter
 
@@ -334,8 +343,10 @@ currently provides:
 Positions use UTF-16 code units, including after Unicode string contents;
 compiler byte columns are converted before publishing diagnostics. Definition
 and symbol URIs percent-encode path bytes so spaces, `%`, `#`, `?`, and Unicode
-retain their file identity. Malformed JSON-RPC request envelopes receive
-`Invalid Request` (`-32600`); valid notifications receive no response.
+retain their file identity. Document symbols include only declarations whose
+canonical path equals the requested document's path. Malformed JSON-RPC request
+envelopes receive `Invalid Request` (`-32600`); valid notifications omit `id` and
+receive no response. A present `id`, including `null`, denotes a request.
 
 Completion keeps name-prefix suggestions. In a direct top-level definition
 with a simple explicit result type, such as `def value : Choice := Re`, it also
@@ -344,8 +355,9 @@ suggests matching nullary constructors from a local, non-parameterized
 expressions or resolve constructors from imports. Complex constructor
 signatures and families with more than 256 arms keep ordinary prefix completion.
 
-The server runs sibling `coil.exe` for checks and `ouro-fmt.exe` for
-formatting through bounded captured processes. Child output is consumed by
+By default, the server runs sibling `coil.exe` for checks and `ouro-fmt.exe` for
+formatting through bounded captured processes. The hosted overrides described
+[above](#standalone-native-tools) select the host process path. Child output is consumed by
 the protocol adapter; it does not enter framed stdout directly. Missing
 tools and process failures produce diagnostics, and a failed formatter
 returns no edit. `OURO_LSP_OURO1` no longer selects a checker. Several

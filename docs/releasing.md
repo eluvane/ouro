@@ -101,7 +101,12 @@ Release validation defaults to the complete `pr` profile used by ordinary CI
 on `main`, with the same manual-only lint exclusion. It does not select only
 checks affected by the latest commit. Extended `manual`, `kernel`, and
 `stage-loop` profiles remain available through the dispatch `run_profile` input.
-Every selected validation group must succeed before packaging and publication.
+Every selected validation group must succeed before release metadata is
+built. Platform archives build in parallel with validation. Final assembly
+requires the metadata job and every platform job to succeed before publication.
+Linux validation groups share the verified compiler artifact described in
+[CI](ci.md#hosted-workflows); each platform archive still builds its own
+compact-source compiler.
 
 `.github/workflows/ouro-release.yml` runs on release tags, a daily schedule,
 and manual dispatch. Scheduled runs check the date at 03:17 UTC and build a

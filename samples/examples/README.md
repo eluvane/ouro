@@ -24,7 +24,11 @@ This directory contains small programs for the current language, standard librar
 
 ## Workflow acceptance programs
 
-Programs with sibling `.golden` files are exercised by the sample suites. Examples that need stdin also include a sibling `.stdin` file.
+The sample suites use the explicit inventory in
+[`tools/test/sample_cases.ouro`](../../tools/test/sample_cases.ouro), which
+distinguishes check-only inputs from native runs. Each native run checks
+declared `.golden` output and uses `.stdin` when specified. The `practical_*`
+examples are check-only in this inventory.
 
 See the [practical and workflow programs](../../docs/practical_programs.md#runnable-examples)
 for `practical_*` and `workflow_*` inputs, and the [application walkthrough](../../docs/practical_application_surface.md)

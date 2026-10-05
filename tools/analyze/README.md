@@ -17,7 +17,7 @@ sh scripts/ouro1.sh analyze --strict --include-fixtures --enable-taint --scope t
 
 ## Bounded execution
 
-Both binaries run through `scripts/analyze_bounded.py`, one low-priority native process per file, because the extracted runtime keeps a process-lifetime arena. Scope, batch, and keep policy live in `bounded_text.ouro` (`bounded_run`) and are typechecked by the precision suite; the process supervisor is still the Python runner. Limits on a local host:
+Both binaries run through `scripts/analyze_bounded.py`, which selects a guarded direct invocation or bounded per-file workers. The extracted runtime keeps a process-lifetime arena. Scope, batch, and keep policy live in `bounded_text.ouro` (`bounded_run`) and are typechecked by the precision suite; the process supervisor is still the Python runner. Limits on a local host:
 
 - global base-runner modes (`--enable-deadcode`, `--enable-trust`, `--dump-facts`, `--enable-heavy`, `--enable-all`, `--architecture-only`) need a scope of at most 8 files and 64 KiB in total;
 - the drive rejects a single source larger than 40 KiB before starting; the limit covers every production source, and the memory suite selects the largest current source for the budget row `analyzer-drive-largest-file` in `quality/memory_budgets.json`;
@@ -72,8 +72,9 @@ One flag per family: `--enable-effects`, `--enable-capability`, `--enable-extrac
 | --- | --- |
 | `--enable-light` | effects, match, cfg, dataflow, semantic, property, metrics, simplify, perf, naming, errors |
 | `--enable-heavy` | capability, extract, taint, contracts, absint, symexec, duplication, trust |
-| `--enable-strict` | the promoted set below |
-| `--enable-all` | every family |
+| `--enable-style` | dataflow, metrics, simplify, perf, naming |
+| `--enable-strict` | every structured family, the current promoted set |
+| `--enable-all` | every structured family |
 
 `--enable-trust`, `--enable-heavy`, and `--enable-all` also switch on the base runner's import-graph trust pass (`OURO-TRUST001`) over the same scope, and `--enable-all` its dead-code pass, which is why those flags are bounded like the other global modes.
 
@@ -100,7 +101,7 @@ source, missing worker result, or inconsistent count fails the bounded runner.
 
 | Source | Entry | Diagnostics | Input |
 | --- | --- | --- | --- |
-| `ast.ouro` | `ast_children`, `ast_any`, `ast_exists`, `ast_arms`, `ast_core_body` | shared surface `Ast` | One 22-constructor inductive shared by every structured core, with the spine, binder, arm (`AstArm`), scrutinee, and declared-type helpers they need. |
+| `ast.ouro` | `ast_children`, `ast_any`, `ast_exists`, `ast_arms`, `ast_core_body` | shared surface `Ast` | One 28-constructor inductive shared by every structured core, with the spine, binder, arm (`AstArm`), scrutinee, and declared-type helpers they need. |
 | `expr_adapt.ouro` | `adapt` | Expr → Ast | Total adapter from `compiler/ast.ouro`; the drive runs it per definition. |
 | `string_prims.ouro` | string host primitives | shared by analyzer cores | `String` and `prim_string_*` without `std/runtime.ouro`'s Windows platform cone. |
 | `unit.ouro` | `unit_of_source` | `AnalysisUnit` | Frontend pipeline into defs with name/line, `UnitTypes`, `CapIds`, layer marks. |
@@ -124,7 +125,7 @@ source, missing worker result, or inconsistent count fails the bounded runner.
 | `duplication.ouro` | `analyze_duplication`, `alpha_eq`, `near_eq` | `OURO-DUP001`–`002` | Structural clone detection over all definitions of a unit with binder alpha-renaming and global-id preservation. |
 | `simplify.ouro` | `analyze_simplify` | `OURO-SIMP001`–`007` | Rewrite smells with the replacement in the finding: Bool match that returns or negates its scrutinee, arms sharing one body, eta-expanded lambda, `notb (notb e)`, `andb`/`orb` with a constant operand, arms that rebuild their own constructor. The definition of `notb` and lambdas that forward to the enclosing fix are exempt. |
 | `perf.ouro` | `analyze_perf` | `OURO-PERF001`–`005` | Cost smells of the extracted runtime: literal at or above `perf_literal_threshold` inside a fix body, `append`/`snoc`/`concat` on an accumulator parameter fed back into the recursion, `length` compared with 0/1 or scrutinised without reading the count, the same conversion of the same parameter twice on one path, `andb`/`orb` operand that nests control flow or a recursive call. |
-| `naming.ouro` | `analyze_naming`, `nm_ctor_misspelt` | `OURO-NAME001`–`004` | Conventions the other cores depend on: a `_`-spelt binder that is read (shadowing-aware), one-character definition names, a capital initial on a value definition (type-level results are exempt), and lowercase or underscore constructors, anchored at the owning `inductive` line. |
+| `naming.ouro` | `analyze_naming`, `nm_ctor_misspelt` | `OURO-NAME001`, `003`, `004` | Conventions the other cores depend on: a `_`-spelt binder that is read (shadowing-aware), a capital initial on a value definition (type-level results and `Type_field` projections are exempt), and lowercase or underscore constructors, anchored at the owning `inductive` line. Known indexed-family constructor spellings are exempt. |
 | `errors.ouro` | `analyze_errors` | `OURO-ERR001`–`003` | Declared `Either String` result (also under `IO`), a failure arm (`Left`, `Fail`) that drops its payload and returns the paired success constructor through lets, `do`, or `io_pure`, and `io_bind` over an `Either` whose result is bound to a discard. |
 
 | `format.ouro` | `analyze`, `format` | `OURO-FMT*` | Local text formatter/checker shared with `tools/fmt.ouro`. |
@@ -146,7 +147,7 @@ and `OURO-DUP002` stay in this analyzer. The matching Clippy proofs
 (`OURO-CLIPPY-REDUNDANT-004`, `OURO-CLIPPY-PERF-001`, `OURO-CLIPPY-ERROR-003`,
 `OURO-CLIPPY-CHECKED-006`, `OURO-CLIPPY-MAINT-007`) require registered
 contracts, closed enums, or token identity, and they leave the syntactic
-cases above to these warnings. The two IDs use different suppression syntax.
+cases above to these warnings. The analyzer and Clippy use different suppression syntax.
 See [Quality](../../docs/quality.md).
 
 ## Diagnostic contract

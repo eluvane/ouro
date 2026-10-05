@@ -38,7 +38,7 @@ parameters, environment and determinism declarations, input identities, output
 contract, exit status, and stdout/stderr metadata.
 
 Before launch it clears the expected output path. A successful typed result
-requires both exit status zero and a newly present regular output file. Failed
+requires both exit status zero and a newly present, non-directory output path. Failed
 or missing-output attempts retain diagnostic metadata but do not receive
 successful output evidence.
 

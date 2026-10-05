@@ -63,7 +63,7 @@ runs in Nightly and on demand. Run one group with:
 python3 scripts/ci_gate.py --profile pr --group checks
 ```
 
-The group names are `checks`, `checks-parity`, `checks-quality`, `analysis`, `checker`, `analyzer`,
+The PR group names are `checks`, `checks-parity`, `checks-quality`, `analysis`, `checker`, `analyzer`,
 `analyzer-lint`, `lint`,
 `tests`, `smith`, `samples-1`, `samples-2`, and `compiler-1` through
 `compiler-16`. Substitute the selected name after `--group`.
@@ -136,8 +136,10 @@ interrupted run leaves no old successful aggregate at the current report path.
 The native CI runner also invalidates selected gate reports and the delegated
 host-inventory report. Failure to remove a report stops execution; a directory
 at a report path is never removed. Listing profiles does not change reports.
-Manual and Release prepare the current compiler before running each validation
-group, including when a restored compiler cache lacks its bootstrap evidence.
+PR, Nightly, Lint, and Release validation groups import one verified Linux
+compiler artifact. Cached Manual shares one producer per OS; cache-disabled
+Manual builds independently in every group. A restored compiler without its
+complete bootstrap evidence requires a fresh build before export.
 PR and Nightly validation jobs allow 120 minutes for the complete group;
 per-program execution and memory limits remain separate. Independent PR matrix
 groups finish when a sibling fails. Each group retains its fail-fast command,
@@ -167,12 +169,14 @@ sh scripts/samples_suite.sh --shard=2/2
 ```
 
 P6 native tool acceptance can run these retained assertions with explicitly
-provisioned Windows x86-64 candidates. Put `coil.exe`, `ouro-fmt.exe`,
-`ouro-lsp.exe`, `ouro-pkg.exe` and `ouro-test.exe` in one directory, following
-[the standalone build commands](tooling.md#standalone-native-tools), and use
-fresh output directories:
+provisioned Windows x86-64 candidates. Put `coil.exe`, `ouro-native-build.exe`,
+`ouro-fmt.exe`, `ouro-lsp.exe`, `ouro-pkg.exe` and `ouro-test.exe` in one directory,
+following [the standalone build commands](tooling.md#standalone-native-tools),
+and use fresh output directories. Clear hosted checker, build and formatter overrides:
 
 ```sh
+unset OURO_TEST_CHECK OURO_TEST_BUILD OURO_PKG_CHECK
+unset OURO_HOSTED_COMPILER_WRAPPER OURO_HOSTED_FMT
 LSP_SUITE_OUT=_build/p6/lsp sh scripts/lsp_suite.sh --native-tools _build/native
 PKG_SUITE_OUT=_build/p6/pkg sh scripts/pkg_suite.sh --native-tools _build/native
 TEST_SUITE_OUT=_build/p6/test sh scripts/test_suite.sh --native-tools _build/native
@@ -181,12 +185,14 @@ SAMPLES_SUITE_OUT=_build/p6/samples sh scripts/samples_suite.sh --native-tools _
 
 Pass `--native-tools DIR` first; sample shard options and `--compiler-checking`
 follow it. The separate `--native-build-collection` C harness rejects this
-option. Each invocation checks the required sibling images, PE format and
-system imports, records their SHA256 in `native-candidates.json`, and checks
+option. Each invocation checks its selected frontend candidate images, PE format
+and system imports, records their SHA256 in `native-candidates.json`, and checks
 that those images remain unchanged at completion. Missing or invalid native
-candidates fail without a C fallback. Retain the direct-PE build receipts with
-source and producer hashes beside this execution evidence; the candidate
-snapshot alone does not establish how the images were built.
+candidates fail without a C fallback. Retain direct-PE build receipts with
+source and producer hashes beside this execution evidence. The observer does
+not snapshot the `ouro-native-build.exe` backend used by `coil.exe`; acceptance
+also requires binding and rechecking that image. Suite snapshots alone do not
+establish complete companion or build provenance.
 
 The launchers still use shell/Python for fixture preparation and observation.
 The default C build selection remains available separately, and its results
@@ -233,7 +239,7 @@ library, bootstrap, build infrastructure and unclassified changes.
 The static `Kernel` check always runs and requires successful path selection,
 compiler preparation, every selected PR or docs group, selected kernel checks,
 Portable, and Editor. A failed, cancelled, or unexpectedly skipped selected
-job fails this aggregate. Nightly prepares its compiler independently per group.
+job fails this aggregate.
 `scripts/apply_github_settings.py` recommends the stable required contexts
 `Paths`, `Kernel`, `Editor`, and `Review`. When adopting the docs route, replace
 required individual `PR (...)` and `Portable (...)` contexts in hosted branch
@@ -639,6 +645,12 @@ Host-script retirement follows the evidence rules in
 The release workflow builds the host toolchains described in
 [Releasing](releasing.md). Its build and assemble jobs stay read-only.
 
+Nightly, Lint, and Release validation share the same verified Linux compiler
+producer contract as PR. Each group imports the producer's artifact and checks
+its SHA, current inputs, toolchain, and complete bootstrap evidence. Their
+validation inventories and limits stay unchanged. Release platform packaging
+continues to build its own compact-source compiler.
+
 Manual validates the complete selected profile on Ubuntu and Windows. With
 caching enabled, one compiler producer per OS exports the bootstrap evidence;
 each validation group verifies the artifact SHA, current source and toolchain
@@ -648,6 +660,11 @@ group. Windows Manual and Release jobs pin MinGW 16.1.0 and select only
 the next steps' `PATH` and set `CC=gcc`; a native Python check requires that
 exact compiler path and version before building or importing the compiler.
 Compiler and bootstrap receipts retain their complete identity checks.
+Linux Manual uses the project C compiler configuration, matching the other Linux
+producers; Windows selects its pinned gcc before identifying or importing it.
+Ruff and ShellCheck are prepared only for the `checks` group when the selected
+profile includes their gates: `manual` in Manual, and `pr` or `manual` in
+Release. Release packaging does not install these validation tools.
 
 Select `task=frontend-security` in Manual for the canonical frontend-security
 suite alone on Ubuntu and Windows. The diagnostic task reuses compiler
@@ -674,11 +691,10 @@ the compiler suites. Pages runs `npm run lint`, `npm test`, and `npm run build`
 for pull requests to and pushes on `main` or `master` that change `site/`,
 `quality/biome.json`, or its workflow. Pull requests only restore the npm cache
 and cannot deploy the site.
-The hosted `Kernel` job builds `ouro1`, then runs
-`python3 scripts/ci_gate.py --profile kernel` and uploads its compiler,
-hardening, boundary, generated-law, scale, and depth reports. Its path
-selector covers the checker and its compiler, runtime, standard-library, test,
-and gate dependencies. Missing required probes fail the job.
+The hosted `Compiler kernel` job imports and verifies the shared compiler,
+then runs `--profile kernel-extra` for the kernel OuroSmith gate absent from PR.
+The static `Kernel` check requires every selected validation job to succeed.
+Missing required probes fail the job.
 The nightly and manual profiles also run `analyze-production`
 (`python3 scripts/analyze_production_suite.py`), which sweeps the production
 scopes with the structured analyzer and fails on any finding from the promoted
@@ -790,8 +806,16 @@ The shared PR compiler cache is keyed by the bootstrap driver's full current
 input identity, including the host C compiler and flags. It includes the
 completion report, input manifest, and both generated C comparisons referenced
 by `ouro1.bootstrap.json`; `_build/c` alone cannot establish a reusable compiler.
-Suite caches remain separate. Kernel and Portable restores try their own cache
-prefix first. Only trusted branch pushes save PR caches.
+Suite caches remain separate. Matrix and Kernel restores try their own cache
+prefix first, then the compatible checks suite cache. Portable restores only its
+own cache, which includes the bootstrap evidence needed on macOS. Only trusted
+branch pushes save PR caches.
+
+Nightly, Release validation, Lint, and cached Manual use the same compiler cache
+namespace and exact input key. Shared compiler cache writes are limited to trusted
+default-branch runs; Lint only restores. Suite caches remain workflow-specific;
+Lint can restore the compatible Nightly cache for its own group before importing
+the verified compiler.
 
 Restored data is followed by the relevant parity, hash, regeneration, or
 compiler-checking validation. Cache state does not establish program acceptance

@@ -662,13 +662,13 @@ def check_inventory_scale() -> list[Check]:
     result = run_limited(command, cwd=ROOT, timeout_s=60, memory_mb=2944)
     expected = [str((root / name).as_posix()) for name in names]
     if not result.ok or result.stderr:
-        raise AssertionError(f"native inventory could not finish 4096 sources: {result.status}/{result.returncode}")
+        raise AssertionError(f"native inventory could not finish 4096 sources: {result.status}/{result.returncode}\n{result.stderr[-4000:]}")
     report = json.loads(result.stdout)
     if report.get("complete") is not True or report.get("files") != expected:
         raise AssertionError("native inventory dropped or reordered a source in the large corpus")
     repeated = run_limited(command, cwd=ROOT, timeout_s=60, memory_mb=2944)
     if not repeated.ok or repeated.stderr or repeated.stdout != result.stdout:
-        raise AssertionError("large native inventory report is not repeatable")
+        raise AssertionError(f"large native inventory report is not repeatable: {repeated.status}/{repeated.returncode}\n{repeated.stderr[-4000:]}")
     return [Check("native-inventory-scale", "pass", "4096 exact paths, complete and byte-repeatable within 2944 MiB")]
 
 

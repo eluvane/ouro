@@ -232,9 +232,15 @@ def cc_invocation(cc: str) -> list[str]:
 
 
 def compiler_id(cc: str) -> str:
-    path = shutil.which(cc) or (str(Path(cc).resolve()) if Path(cc).is_file() else cc)
+    path = Path(shutil.which(cc) or cc).resolve(strict=True)
     version = output_or_empty(cc_invocation(cc) + ["--version"]).splitlines()[:2]
-    return json.dumps({"cc": cc, "path": path, "version": version}, sort_keys=True)
+    return json.dumps({
+        "cc": cc, "path": str(path), "version": version,
+        "executable_sha256": sha256_file(path),
+        "environment": {name: os.environ.get(name, "") for name in
+                        ("CPATH", "C_INCLUDE_PATH", "LIBRARY_PATH", "SDKROOT",
+                         "MACOSX_DEPLOYMENT_TARGET", "SOURCE_DATE_EPOCH")},
+    }, sort_keys=True)
 
 
 def profile_cflags(cfg: ResolvedConfig) -> List[str]:
@@ -442,7 +448,10 @@ def compile_c_object(
     desired_cmd = [cc] + flags + ["-MMD", "-MP", "-MF", str(dep), "-c", path_key(src), "-o", str(obj)]
     expected = command_hash(desired_cmd, cc_id)
     obj.parent.mkdir(parents=True, exist_ok=True)
-    ok, reason = compile_stamp_ok(obj, dep, stamp, expected, src)
+    if cfg.get_bool("cache_enabled"):
+        ok, reason = compile_stamp_ok(obj, dep, stamp, expected, src)
+    else:
+        ok, reason = False, "cache-disabled"
     if ok:
         elapsed = round(time.perf_counter() - t0, 6)
         log(cfg, f"CC-HIT {path_key(src)}", verbose_only=True)
@@ -543,7 +552,10 @@ def link_c_objects(
     desired_cmd = [cc] + flags + ["-o", str(exe)] + [str(o) for o in objects]
     expected = command_hash(desired_cmd, cc_id)
     stamp = Path(str(exe) + ".cmdhash")
-    ok, reason = link_stamp_ok(exe, stamp, expected, objects)
+    if cfg.get_bool("cache_enabled"):
+        ok, reason = link_stamp_ok(exe, stamp, expected, objects)
+    else:
+        ok, reason = False, "cache-disabled"
     if ok:
         elapsed = round(time.perf_counter() - t0, 6)
         log(cfg, f"LINK-HIT {rel(exe)}", verbose_only=True)

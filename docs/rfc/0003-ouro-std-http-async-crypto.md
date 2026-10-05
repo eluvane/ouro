@@ -21,7 +21,7 @@ higher-level algorithms and codecs in Ouro.
 
 ## Decision
 
-| Module | Implemented role | Explicit limit |
+| Module | Role at acceptance | Explicit limit |
 | --- | --- | --- |
 | `std/word.ouro` | 32-bit bitwise, shift, rotate, and addition operations | Not a new kernel numeric type |
 | `std/crypto.ouro` | SHA-256 and HMAC-SHA256 over the current string/byte model | No signatures or TLS |
@@ -31,7 +31,7 @@ higher-level algorithms and codecs in Ouro.
 At this decision's acceptance, `prim_http_post` was unwired and the request
 helper delegated to host `curl` through the process API. Word operations used
 runtime acceleration with ordinary Ouro definitions for checking. For current
-transport behavior, see [Effects and IO](../effects_design.md).
+transport behavior, see [Networking](../effects_design.md#networking).
 
 ## Compatibility
 
@@ -40,8 +40,8 @@ import the modules are unaffected.
 
 ## Trust
 
-No kernel rule changes. Runtime word operations, host `curl`, clocks, and
-processes remain outside the logical trusted computing base.
+No kernel rule changes. At acceptance, runtime word operations, host `curl`,
+clocks, and processes remained outside the logical trusted computing base.
 
 ## Validation and documentation
 
