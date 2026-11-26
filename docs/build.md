@@ -44,7 +44,7 @@ path inputs also reject embedded NUL bytes. The compatibility wrapper forwards
 each collected path as one literal argument, preserving spaces and wildcard
 characters. POSIX retains byte paths and argv.
 
-macOS host executables reserve a 128 MiB main-thread stack at link time through
+macOS host executables reserve a 256 MiB main-thread stack at link time through
 Mach-O's `-stack_size`, including historical bootstrap producers. This reserve
 does not depend on changing the stack of the host Python interpreter.
 The C IO host enables Darwin's extended declarations so no-follow file writes

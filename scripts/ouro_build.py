@@ -568,7 +568,7 @@ def host_link_flags() -> List[str]:
         return ["-Wl,--stack,2147483648"]
     if sys.platform == "darwin":
         # Mach-O owns the main-thread reserve; host Python may pin RLIMIT_STACK.
-        return ["-Wl,-stack_size,0x8000000"]
+        return ["-Wl,-stack_size,0x10000000"]
     return []
 
 

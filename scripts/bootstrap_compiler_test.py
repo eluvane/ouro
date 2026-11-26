@@ -1677,10 +1677,10 @@ class BootstrapCompilerTests(unittest.TestCase):
                 replacement.replace(archive)
             return open_archive(*args, **kwargs)
 
-        capture_limit = ci_gate._COMPILER_RECEIPT_CAPTURE_LIMIT
+        capture_limit = len(payloads[receipt])
         receipt_modes = ((capture_limit, False, [True]), (0, False, [False, True]),
                          (capture_limit, True, [True, False, True]))
-        spool_modes = ((ci_gate._COMPILER_ARCHIVE_SPOOL_LIMIT, 0), (1, 1))
+        spool_modes = ((len(archive_data), 0), (1, 1))
         rollover = tempfile.SpooledTemporaryFile.rollover
         for spool_mode, receipt_mode in itertools.product(spool_modes, receipt_modes):
             spool_limit, expected_rollovers = spool_mode
@@ -1688,7 +1688,7 @@ class BootstrapCompilerTests(unittest.TestCase):
             with self.subTest(spool_limit=spool_limit, receipt_limit=receipt_limit, fail_capture=fail_capture):
                 receipt_reads = []
 
-                def count_receipt_read(bundle, member):
+                def count_receipt_read(bundle, member, receipt_reads=receipt_reads, fail_capture=fail_capture):
                     if member.name == receipt_name:
                         receipt_reads.append(bundle.fileobj.tell() <= member.offset_data)
                         if fail_capture and len(receipt_reads) == 1:

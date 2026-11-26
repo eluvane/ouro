@@ -656,7 +656,7 @@ def hook_elem_scope(text, units, canonical_units, entry, sources, module="", *, 
         return text
     if wrapper in text:
         raise RuntimeError("elem scope source is already transformed")
-    return _replace_spans(text, [(match.start(), match.end(), header + f"{wrapper}({raw})" + tail),
+    return replace_spans(text, [(match.start(), match.end(), header + f"{wrapper}({raw})" + tail),
                                 (include.end(), include.end(), declaration)])
 
 
@@ -723,7 +723,7 @@ def hook_source_name_compare_scope(text, units, canonical_units, entry, sources,
         return text
     if wrapper in text:
         raise RuntimeError("source name compare scope source is already transformed")
-    return _replace_spans(text, [(match.start(), match.end(), header + f"{wrapper}({raw})" + tail),
+    return replace_spans(text, [(match.start(), match.end(), header + f"{wrapper}({raw})" + tail),
                                 (include.end(), include.end(), declaration)])
 
 
@@ -788,7 +788,7 @@ def hook_pe_fixup_step(text, units, canonical_units, entry, sources, *, installe
     if wrapper in text:
         raise RuntimeError("PE fixup step source is already transformed")
     replacement = header + f"{wrapper}({raw})" + tail
-    return _replace_spans(text, [
+    return replace_spans(text, [
         (getter_start, getter_end, replacement),
         (position, position, declaration),
     ])
@@ -948,7 +948,7 @@ def hook_prelude_arithmetic(text, units, canonical_units, entry, sources,
             if pairs(values).get(opening) != len(values) - 1:
                 raise RuntimeError("noncanonical canonical Nat/List fast value helper body")
             replacements.append((body.start(), body.end(), ""))
-    transformed = _replace_spans(text, replacements)
+    transformed = replace_spans(text, replacements)
     references = re.finditer(
         r'//[^\n]*|/\*.*?\*/|"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\''
         + rf"|(?P<helper>\b(?:{'|'.join(removed_families)})\b)", transformed, re.DOTALL)
@@ -1039,7 +1039,7 @@ def hook_module_lookup(text, units, canonical_units, entry, sources, module="", 
         return text
     if "ouro_wrap_module_lookup" in text:
         raise RuntimeError("module lookup source is already transformed")
-    return _replace_spans(text, [(match.start(), match.end(), header + f"ouro_wrap_module_lookup({raw})" + tail),
+    return replace_spans(text, [(match.start(), match.end(), header + f"ouro_wrap_module_lookup({raw})" + tail),
         (include.end(), include.end(), _MODULE_LOOKUP_DECL)])
 
 
@@ -1144,7 +1144,7 @@ def hook_lower_local_lookup(text, units, canonical_units, entry, sources, module
     replacements = [(match.start(), match.end(), replacement)]
     if not other:
         replacements.append((include.end(), include.end(), _MODULE_LOOKUP_DECL))
-    return _replace_spans(text, replacements)
+    return replace_spans(text, replacements)
 
 
 def hook_module_pure_scopes(
@@ -1306,7 +1306,7 @@ def hook_module_pure_scopes(
                 raise RuntimeError("unexpected module pure scope invocation")
         return text
     replacements.append((include.end(), include.end(), declaration))
-    return _replace_spans(text, replacements)
+    return replace_spans(text, replacements)
 
 
 _LOWER_CTOR_LOOKUP_DECL = "ouro_v *ouro_wrap_lower_ctor_lookup(ouro_v *raw);\n"
@@ -1399,11 +1399,11 @@ def hook_lower_ctor_lookup(text: str, module: str, *, installed: bool = False,
     raw = match.group("raw")
     replacement = match.group().replace(f"{cache}={raw};",
                                        f"{cache}=ouro_wrap_lower_ctor_lookup({raw});", 1)
-    return _replace_spans(text, [(match.start(), match.end(), replacement),
+    return replace_spans(text, [(match.start(), match.end(), replacement),
                                  (include.end(), include.end(), _LOWER_CTOR_LOOKUP_DECL)])
 
 
-def _replace_spans(src: str, replacements: list[tuple[int, int, str]]) -> str:
+def replace_spans(src: str, replacements: list[tuple[int, int, str]]) -> str:
     """Apply disjoint source spans once, retaining the first duplicate span."""
     if not replacements:
         return src
@@ -1473,7 +1473,7 @@ def uniquify(src: str) -> str:
                 later_i += 1
             if ver:
                 repls.append((m.start(), m.end(), f"{name}_d{ver + 1}"))
-    return spread_case_arms(_replace_spans(src, repls))
+    return spread_case_arms(replace_spans(src, repls))
 
 
 _ARM_REF = re.compile(
@@ -1615,7 +1615,7 @@ def spread_case_arms(src: str, *, static_names: Iterable[str] | None = None) -> 
                     s = am.start(2) + body_s
                     e = am.end(2) + body_s
                 repls.append((s, e, new))
-    return _replace_spans(src, repls)
+    return replace_spans(src, repls)
 
 
 def uniquify_file(path: str | Path) -> int:

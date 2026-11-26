@@ -413,7 +413,7 @@ def _rewrite_checked_getter(text: str, match: re.Match[str], replacement: str, w
     # The replacement keeps the getter marker that ends the preamble.
     preamble_end = _host_preamble_end(text)
     if text.find(wrapper, 0, preamble_end) >= 0:
-        return packer._replace_spans(text, replacements)
+        return packer.replace_spans(text, replacements)
 
     include = '#include "ouro_rt.h"\n'
     declaration = f"ouro_v *{wrapper}(void);\n"
@@ -421,9 +421,9 @@ def _rewrite_checked_getter(text: str, match: re.Match[str], replacement: str, w
     if include_start >= 0:
         position = include_start + len(include)
         replacements.append((position, position, declaration))
-        return packer._replace_spans(text, replacements)
+        return packer.replace_spans(text, replacements)
 
-    return packer._replace_spans(text, replacements).replace(include, include + declaration, 1)
+    return packer.replace_spans(text, replacements).replace(include, include + declaration, 1)
 
 
 def hook_checked_units_getter(text: str, *, installed: bool = False, _view: dict | None = None) -> str:

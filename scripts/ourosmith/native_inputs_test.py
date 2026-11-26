@@ -99,7 +99,7 @@ class ManifestBatchesTests(unittest.TestCase):
     def test_weighted_split_keeps_exact_prefix_collisions_in_one_batch(self):
         exact = "ERGO.expansion-case"
         longer = exact + "-more"
-        text = "\n".join([exact, longer, exact])
+        text = f"{exact}\n{longer}\n{exact}"
         costs = dict.fromkeys([exact, longer], 16)
         batches = native_inputs.manifest_batches(text, "ERGO.", row_costs=costs)
         self.assertEqual(batches, [(["ERGO.expansion-c"], [exact, longer])])

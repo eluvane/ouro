@@ -305,7 +305,7 @@ def test_seal_parse() -> None:
 def test_host_stack_link_flags() -> None:
     for system, platform, expected in (
         ("nt", "win32", ["-Wl,--stack,2147483648"]),
-        ("posix", "darwin", ["-Wl,-stack_size,0x8000000"]),
+        ("posix", "darwin", ["-Wl,-stack_size,0x10000000"]),
         ("posix", "linux", []),
     ):
         with patch.object(build_driver.os, "name", system), patch.object(build_driver.sys, "platform", platform):
