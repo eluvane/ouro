@@ -449,8 +449,9 @@ def main() -> int:
          (fmt_inputs / "clean.golden").as_posix()], env=native_build_env)
     c_build_dir = build_config().path("c_build_dir")
     # The builder adds the Windows executable suffix and writes the receipt for the logical path.
-    run(["sh", "scripts/build_tool.sh", tool_entry("test"), (c_build_dir / "ouro-test").as_posix()],
-        env={**native_build_env, "OURO_C_BUILD_DIR": c_build_dir.as_posix()})
+    for tool in ("collect", "test"):
+        run(["sh", "scripts/build_tool.sh", tool_entry(tool), (c_build_dir / f"ouro-{tool}").as_posix()],
+            env={**native_build_env, "OURO_C_BUILD_DIR": c_build_dir.as_posix()})
     manifest_cmd = [
         "sh", "scripts/ouro1.sh", "test",
         "--manifest=" + (fixtures / "manifest.tsv").as_posix(),
