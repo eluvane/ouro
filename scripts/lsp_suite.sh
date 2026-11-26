@@ -590,7 +590,18 @@ set +e
 OURO_ROOT="$ROOT" "$LSP" <"$OUT/group-imports.in" >"$OUT/group-imports.out" 2>"$OUT/group-imports.err"
 group_status=$?
 set -e
-tr '\r' '\n' <"$OUT/group-imports.out" | grep '^{' >"$OUT/group-imports.jsonl" || true
+"$PYTHON" - "$OUT/group-imports.out" >"$OUT/group-imports.jsonl" <<'PY'
+import json
+import pathlib
+import sys
+
+sys.path.insert(0, str(pathlib.Path("scripts").resolve()))
+from ourosmith.surface.tools import responses
+
+stream = pathlib.Path(sys.argv[1]).read_bytes().decode("utf-8")
+for message in responses(stream):
+    print(json.dumps(message, ensure_ascii=False, separators=(",", ":")))
+PY
 if [ "$group_status" -eq 0 ] && [ ! -s "$OUT/group-imports.err" ]; then
 	ok "group import session exits cleanly"
 else

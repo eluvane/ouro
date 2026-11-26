@@ -521,6 +521,14 @@ def hook_compile_checked_units(generated: Path, units: list[str] | tuple[str, ..
         generated.write_text(text, encoding="utf-8")
 
 
+def hook_sha_compress(text, units, canonical_units, entry, sources, *, installed=False, export_index=None):
+    bindings = packer.scoped_host_export_getters(
+        text, units, canonical_units, entry, sources,
+        (("sha_compress", "sha_compress", ("std/crypto.ouro",)),), export_index=export_index)
+    return hook_named_getter(text, "sha_compress", "ouro_wrap_quality_pure",
+                             installed=installed, scoped_getter=bindings["sha_compress"])
+
+
 def hook_emission_scopes(text: str, units: list[str], *, installed: bool = False,
                          parse_bytes: frontend.ImportBytesParser | None = None) -> str:
     entry = units[-1]
@@ -547,12 +555,8 @@ def hook_emission_scopes(text: str, units: list[str], *, installed: bool = False
                         installed=installed, static_index=static_index)
     # Each compression block retains its hash state and releases its scratch values.
     if "std/crypto.ouro" in units:
-        bindings = packer.scoped_host_export_getters(
-            original, units, canonical_units, entry, sources,
-            (("sha_compress", "sha_compress", ("std/crypto.ouro",)),),
-            export_index=export_index)
-        original = hook_named_getter(original, "sha_compress", "ouro_wrap_quality_pure",
-                                     installed=installed, scoped_getter=bindings["sha_compress"])
+        original = hook_sha_compress(original, units, canonical_units, entry, sources,
+                                     installed=installed, export_index=export_index)
     capable = ((packer.MODULE_LOOKUP_OWNER in units or packer.LOWER_LOCAL_LOOKUP_OWNER in units)
                and frontend.module_lookup_capability((ROOT / "runtime/frontend_link.c").read_text(encoding="utf-8")))
     if packer.MODULE_LOOKUP_OWNER in units and capable:

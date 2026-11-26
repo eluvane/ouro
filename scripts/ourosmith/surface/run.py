@@ -173,9 +173,46 @@ class SurfaceRunner:
         args = [self.compiler, path, "999999"]
         for unit in units:
             args += ["--unit", unit]
-        result = self.command(args, path.parent, "emit-c", env={**self.env, "OURO_EMIT_IO_SHIMS": "1"}, timeout=compile_timeout)
+        emit_env = {**self.env, "OURO_EMIT_IO_SHIMS": "1"}
+        source_root = self.overrides.get("source-root", ROOT).resolve()
+        paths = [(path.parent / unit).resolve() for unit in units]
+        crypto = io and source_root / "std/crypto.ouro" in paths
+        if crypto:
+            from frontend_regen import collect_units_many
+            from native_tool_build import emission_environment, hook_sha_compress
+            from pack_frontend import hook_prelude_arithmetic
+            from repo_support import decode_source_text, relative_path
+
+            captured = {}
+
+            def read_source(unit):
+                data = unit.read_bytes()
+                captured[unit.resolve()] = data
+                return data
+
+            entry = path.resolve().as_posix()
+            closure = collect_units_many([entry], parse_bytes=self.import_parser, read_source=read_source)[entry]
+            if [Path(unit).resolve() for unit in closure] != paths:
+                raise StepFailure("emit-c", "ordered source closure", closure)
+            labels = [relative_path(source_root, unit, resolve=False) for unit in paths]
+            if not path.resolve().is_relative_to(source_root):
+                # The binding rules require relative labels for every unit.
+                labels[-1] = "_build/smith/generated-entry.ouro"
+            sources = {label: decode_source_text(captured[unit]) for label, unit in zip(labels, paths, strict=True)}
+            emit_env.update(emission_environment())
+
+        result = self.command(args, path.parent, "emit-c", env=emit_env, timeout=compile_timeout)
         self.require(result.ok, "emit-c", "exit 0", self.output(result))
-        emitted.write_text(result.stdout, encoding="utf-8")
+        generated = result.stdout
+        if crypto:
+            if any(unit.read_bytes() != data for unit, data in captured.items()):
+                raise StepFailure("emit-c", "unchanged source closure", "source changed during emission")
+            try:
+                generated = hook_prelude_arithmetic(generated, labels, labels, labels[-1], sources)
+                generated = hook_sha_compress(generated, labels, labels, labels[-1], sources)
+            except RuntimeError as error:
+                raise StepFailure("emit-c", "source-owned crypto bindings", str(error)) from error
+        emitted.write_text(generated, encoding="utf-8")
         exe = path.with_suffix(".exe")
         main = ROOT / "runtime/ouro_prog_main.c" if io else self.runtime_printer
         cache = [] if build_config().get_bool("cache_enabled") else ["--no-cache"]

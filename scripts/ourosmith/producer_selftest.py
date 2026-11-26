@@ -865,6 +865,36 @@ class ProducerTests(unittest.TestCase):
                         self.assertEqual(call.kwargs["env"], env)
                         self.assertEqual(call.kwargs["cwd"], directory)
 
+    def test_crypto_emission_applies_source_owned_bindings_before_link(self):
+        from ourosmith.limits import RunResult
+        from ourosmith.report import Report
+        from ourosmith.surface.run import SurfaceRunner
+
+        with tempfile.TemporaryDirectory() as name:
+            work = Path(name)
+            root = work / "source"
+            crypto = root / "std/crypto.ouro"
+            crypto.parent.mkdir(parents=True)
+            crypto.write_text("def sha_compress : Type := Type;\n", encoding="utf-8")
+            entry = work / "main.ouro"
+            entry.write_text('import "source/std/crypto.ouro";\n', encoding="utf-8")
+            runner = SurfaceRunner(Report(profile="pr", generator_hash="fixture", seeds=[1], command="crypto"),
+                                   work, [1], overrides={"ouro1": work / "compiler", "source-root": root})
+            runner.cc = "cc"
+            emitted = RunResult("ok", 0, "raw C", "", 0, 0)
+            ok = RunResult("ok", 0, "", "", 0, 0)
+            with patch.object(runner, "command", side_effect=(emitted, ok, ok)) as run, \
+                 patch.object(host, "build_config", return_value=SimpleNamespace(get_bool=lambda _key: True)), \
+                 patch("pack_frontend.hook_prelude_arithmetic", return_value="arithmetic C") as arithmetic, \
+                 patch("native_tool_build.hook_sha_compress", return_value="scoped C") as sha:
+                runner.native(entry, units=[crypto.as_posix(), entry.as_posix()], io=True)
+            names = ["std/crypto.ouro", "_build/smith/generated-entry.ouro"]
+            sources = dict(zip(names, (crypto.read_text(encoding="utf-8"), entry.read_text(encoding="utf-8")), strict=True))
+            arithmetic.assert_called_once_with("raw C", names, names, names[-1], sources)
+            sha.assert_called_once_with("arithmetic C", names, names, names[-1], sources)
+            self.assertEqual(run.call_args_list[0].kwargs["env"]["OURO_EMIT_SCOPED_ARITHMETIC"], "1")
+            self.assertEqual(entry.with_suffix(".c").read_text(encoding="utf-8"), "scoped C")
+
     def test_fault_baseline_and_mutant_keep_the_selected_remaining_tools(self):
         from ourosmith.faults import FAULTS
         from ourosmith.report import Report
