@@ -339,8 +339,10 @@ class HarnessTests(unittest.TestCase):
     def test_analyzer_core_pool_uses_platform_memory_policy(self):
         import analyze_core_checks as checks
 
-        for platform, jobs, memory in (("nt", 10, 3072), ("posix", 1, 2944)):
+        for platform, ceiling, jobs, memory in (("nt", 20, 10, 3072), ("nt", 2, 2, 3072),
+                                                ("posix", 2, 1, 2944)):
             with tempfile.TemporaryDirectory() as directory, \
+                 patch.dict(os.environ, {checks.JOBS_ENV: str(ceiling)}), \
                  patch.object(checks, "os", SimpleNamespace(name=platform)), \
                  patch.object(checks, "command_environment", return_value={}), \
                  patch.object(checks, "shell", return_value=Path("sh")), \

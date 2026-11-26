@@ -218,7 +218,8 @@ class ProducerTests(unittest.TestCase):
                   patch.object(tool_build.build, "load_config", return_value=cfg),
                   patch.object(tool_build.build, "locate_cc", return_value=(str(compiler), None)),
                   patch.object(tool_build.build, "compiler_id", return_value="fixture"),
-                  patch.object(tool_build, "complete_tool", return_value={}) as installed,
+                  patch.object(tool_build, "complete_tool",
+                               return_value={"binary_sha256": digest(output)}) as installed,
                   contextlib.redirect_stdout(io.StringIO())):
                 report = tool_build.build_tool(args)
                 self.assertEqual(report["cache"], "installed-hit")
@@ -226,7 +227,7 @@ class ProducerTests(unittest.TestCase):
 
                 def change_after_capture(*_args, **_kwargs):
                     drift()
-                    return {}
+                    return {"binary_sha256": digest(output)}
 
                 installed.side_effect = change_after_capture
                 with self.assertRaisesRegex(ValueError, "changed before completion"):
