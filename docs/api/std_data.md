@@ -6,7 +6,7 @@ Declarations: 17.
 
 ## def maybe
 
-```
+```ouro
 def maybe (A : Type) (B : Type) (d : B) (f : A -> B) (m : Maybe A) : B
 ```
 
@@ -14,25 +14,25 @@ Fold Maybe: default d on Nothing, f on Just.
 
 ## def fromMaybe
 
-```
+```ouro
 def fromMaybe (A : Type) (d : A) (m : Maybe A) : A
 ```
 
 ## def maybe_unwrap_or_else
 
-```
+```ouro
 def maybe_unwrap_or_else (A : Type) (fallback : Unit -> A) (m : Maybe A) : A
 ```
 
 ## def mapMaybe
 
-```
+```ouro
 def mapMaybe (A : Type) (B : Type) (f : A -> B) (m : Maybe A) : Maybe B
 ```
 
 ## def maybe_bind
 
-```
+```ouro
 def maybe_bind (A : Type) (B : Type) (m : Maybe A) (k : A -> Maybe B) : Maybe B
 ```
 
@@ -40,72 +40,72 @@ Continue only when a Maybe contains a value.
 
 ## def either
 
-```
+```ouro
 def either (A : Type) (B : Type) (C : Type) (f : A -> C) (g : B -> C) (e : Either A B) : C
 ```
 
 ## def mapLeft
 
-```
+```ouro
 def mapLeft (A : Type) (B : Type) (C : Type) (f : A -> C) (e : Either A B) : Either C B
 ```
 
 ## def mapRight
 
-```
+```ouro
 def mapRight (A : Type) (B : Type) (C : Type) (f : B -> C) (e : Either A B) : Either A C
 ```
 
 ## def compareNat
 
-```
+```ouro
 def compareNat : Nat -> Nat -> Ordering
 ```
 
 ## def maxNat
 
-```
+```ouro
 def maxNat (n : Nat) (m : Nat) : Nat
 ```
 
 ## def minNat
 
-```
+```ouro
 def minNat (n : Nat) (m : Nat) : Nat
 ```
 
 ## def reverse
 
-```
+```ouro
 def reverse (A : Type) : List A -> List A
 ```
 
 ## def filter
 
-```
+```ouro
 def filter (A : Type) (p : A -> Bool) : List A -> List A
 ```
 
 ## def zip
 
-```
+```ouro
 def zip (A : Type) (B : Type) : List A -> List B -> List (Pair A B)
 ```
 
 ## def elem
 
-```
+```ouro
 def elem (A : Type) (eq : A -> A -> Bool) (x : A) : List A -> Bool
 ```
 
 ## def take
 
-```
+```ouro
 def take (A : Type) : Nat -> List A -> List A
 ```
 
 ## def drop
 
-```
+```ouro
 def drop (A : Type) : Nat -> List A -> List A
 ```

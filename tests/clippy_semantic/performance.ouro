@@ -2,31 +2,30 @@
 -- projection is a test oracle only; executable semantic decisions stay native.
 -- @entry main
 import "../../tools/clippy/semantic_rules.ouro",
+  "../../tools/clippy/structural_frontend.ouro",
+  "../../tools/clippy/structural_rules.ouro",
+  "../../compiler/source_spans.ouro",
   "../../std/io.ouro";
+import "../compiler_test_list_equal.ouro";
 
 -- Freeze the pre-optimization projections in the oracle. Sharing the new
 -- helpers with both sides would let the same dropped/reordered event pass.
 def cp_calls_reference (events : List CmEvent) : List ClippyCallFact :=
-    concat_map CmEvent ClippyCallFact (fun (event : CmEvent) => match event with
-      | CmCallEvent call => [call]
-      | CmBindEvent _ => [] | CmUseEvent _ => [] | CmFlowEvent _ => []
-      | CmTraversalEvent _ => [] | CmRecursionEvent _ => [] | CmWrapperEvent _ => []
-      | CmFinding _ => [] | CmToken _ _ => [] end) events;
+    concat_map CmEvent ClippyCallFact (fun (event : CmEvent) => if let CmCallEvent call := event then
+        [call]
+      else []) events;
 
 def cp_flow_ids_reference (kinds : List Nat) (events : List CmEvent) : List Nat :=
-    quality_sort Nat leb_nat (concat_map CmEvent Nat (fun (event : CmEvent) => match event with
-      | CmFlowEvent flow => match flow with | CmFlow _ kind id =>
-          match elem Nat eq_nat kind kinds with | True => [id] | False => [] end end
-      | CmCallEvent _ => [] | CmBindEvent _ => [] | CmUseEvent _ => []
-      | CmTraversalEvent _ => [] | CmRecursionEvent _ => [] | CmWrapperEvent _ => []
-      | CmFinding _ => [] | CmToken _ _ => [] end) events);
+    quality_sort Nat leb_nat (concat_map CmEvent Nat (fun (event : CmEvent) => if let CmFlowEvent flow :=
+        event then
+        let (CmFlow _ kind id) := flow in
+        match elem Nat eq_nat kind kinds with | True => [id] | False => [] end
+      else []) events);
 
 def cp_tokens_reference (exact : Bool) (events : List CmEvent) : List Nat :=
-    concat_map CmEvent Nat (fun (event : CmEvent) => match event with
-      | CmToken alpha spelling => [match exact with | True => spelling | False => alpha end]
-      | CmCallEvent _ => [] | CmBindEvent _ => [] | CmUseEvent _ => [] | CmFlowEvent _ => []
-      | CmTraversalEvent _ => [] | CmRecursionEvent _ => [] | CmWrapperEvent _ => []
-      | CmFinding _ => [] end) events;
+    concat_map CmEvent Nat (fun (event : CmEvent) => if let CmToken alpha spelling := event then
+        [match exact with | True => spelling | False => alpha end]
+      else []) events;
 
 def cp_clone_call_known_reference (apis : CmApiIndex) (call : ClippyCallFact) : Bool :=
     andb (cm_call_pure call) (match cm_api_lookup(cm_call_callee call, apis) with
@@ -81,21 +80,18 @@ def cp_range_eq (left : Maybe (Pair Nat Nat)) (right : Maybe (Pair Nat Nat)) : B
     | Nothing => match right with | Nothing => True | Just _ => False end
     | Just one => match right with
       | Nothing => False
-      | Just other => match one with
-        | MkPair left_start left_end => match other with
-          | MkPair right_start right_end =>
-              andb(eq_nat left_start right_start, eq_nat left_end right_end)
-          end
-        end
+      | Just other => let (MkPair left_start left_end) := one in
+        let (MkPair right_start right_end) := other in
+        andb(eq_nat left_start right_start, eq_nat left_end right_end)
       end
     end;
 
 def cp_proof_eq (left : CgSProof) (right : CgSProof) : Bool :=
-    match left with | MkCgSProof lc lo ln lr le => match right with
-      | MkCgSProof rc ro rn rr re => andb (prim_string_eq lc rc)
-          (andb (prim_string_eq lo ro) (andb (eq_nat ln rn)
-            (andb(cp_range_eq lr rr, prim_string_eq le re))))
-      end end;
+    let (MkCgSProof lc lo ln lr le) := left in
+    let (MkCgSProof rc ro rn rr re) := right in
+    andb (prim_string_eq lc rc)
+      (andb (prim_string_eq lo ro) (andb (eq_nat ln rn)
+        (andb(cp_range_eq lr rr, prim_string_eq le re))));
 
 def cp_proofs_eq : List CgSProof -> List CgSProof -> Bool :=
   fix go (left : List CgSProof) (right : List CgSProof) : Bool :=
@@ -107,12 +103,15 @@ def cp_proofs_eq : List CgSProof -> List CgSProof -> Bool :=
       end
     end;
 
--- Original eager eligibility order, including full stream allocation. This
--- deliberately does not delegate to cm_clone_candidate or cm_has_tokens.
+inductive CpCloneInput : Type :=
+  | CpCloneInputOf : ScDecl -> List Nat -> List Nat -> CpCloneInput;
+
+def cp_legacy_rank (tokens : List Nat) : Nat :=
+    foldl Nat Nat (fun (acc : Nat) (token : Nat) => add(mul acc 131, token)) Z tokens;
+
 def cp_eager_clones (unit : ClippySemanticUnit) (apis : CmApiIndex)
-    (definitions : List CmDefinition) : List CmClone :=
-    quality_sort CmClone cm_clone_le
-      (concat_map CmDefinition CmClone (fun (item : CmDefinition) =>
+    (definitions : List CmDefinition) : List CpCloneInput :=
+      concat_map CmDefinition CpCloneInput (fun (item : CmDefinition) =>
         let alpha : List Nat := cp_tokens_reference(False, cm_definition_events item) in
         let decl : ScDecl := cm_definition_decl item in
         let calls : List ClippyCallFact := cp_calls_reference (cm_definition_events item) in
@@ -122,8 +121,80 @@ def cp_eager_clones (unit : ClippySemanticUnit) (apis : CmApiIndex)
             (orb (ltb_nat(length ClippyCallFact calls, 2))
               (notb (all ClippyCallFact (cp_clone_call_known_reference apis) calls)))) with
         | True => []
-        | False => [CmCloneOf (cm_hash alpha) decl alpha
-            (cp_tokens_reference(True, cm_definition_events item))] end) definitions);
+        | False => [CpCloneInputOf decl alpha (cp_tokens_reference(True, cm_definition_events item))]
+        end) definitions;
+
+def cp_legacy_row (intern : InternState) (before : ScDecl) (after : ScDecl)
+    (before_exact : List Nat) (after_exact : List Nat) : CgSProof :=
+    let kind : String := if list_eq Nat eq_nat before_exact after_exact then "exact structural"
+      else "alpha-equivalent" in
+    let prior : String := cm_name intern (sc_decl_name before) in
+    let owner : String := cm_name intern (sc_decl_name after) in
+    MkCgSProof (cm_proof_rule CmDuplicateProof) owner 0 (Nothing (Pair Nat Nat))
+      (prim_string_concat kind (prim_string_concat " duplicate of "
+        (prim_string_concat prior
+          "; signatures, resolved contracts, constructors, literals and flow agree; review shared implementation while preserving public/boundary APIs; no removal is authorized")));
+
+def cp_legacy_rows (intern : InternState) : List (Pair Nat CpCloneInput) -> List CgSProof :=
+  fix go (sorted : List (Pair Nat CpCloneInput)) : List CgSProof :=
+    match sorted with
+    | Nil => []
+    | Cons first rest => match rest with
+      | Nil => []
+      | Cons second _ =>
+          let (MkPair first_rank first_input) := first in
+          let (MkPair second_rank second_input) := second in
+          let (CpCloneInputOf first_decl first_alpha first_exact) := first_input in
+          let (CpCloneInputOf second_decl second_alpha second_exact) := second_input in
+          if andb (eq_nat first_rank second_rank) (list_eq Nat eq_nat first_alpha second_alpha) then
+            Cons CgSProof (cp_legacy_row intern first_decl second_decl first_exact second_exact) (go rest)
+          else go rest
+      end
+    end;
+
+def cp_legacy_clones (unit : ClippySemanticUnit) (inputs : List CpCloneInput) : List CgSProof :=
+    let keyed : List (Pair Nat CpCloneInput) := map CpCloneInput (Pair Nat CpCloneInput)
+      (fun (input : CpCloneInput) => let (CpCloneInputOf _ alpha _) := input in
+        MkPair Nat CpCloneInput (cp_legacy_rank alpha) input) inputs in
+    cp_legacy_rows (cm_intern unit)
+      (quality_sort (Pair Nat CpCloneInput) (fun (left : Pair Nat CpCloneInput)
+        (right : Pair Nat CpCloneInput) =>
+          let (MkPair left_rank left_input) := left in
+          let (MkPair right_rank right_input) := right in
+          let (CpCloneInputOf _ left_alpha _) := left_input in
+          let (CpCloneInputOf _ right_alpha _) := right_input in
+          match compareNat left_rank right_rank with
+          | LT => True
+          | GT => False
+          | EQ => match source_name_compare left_alpha right_alpha with
+            | GT => False | LT => True | EQ => True end
+          end) keyed);
+
+-- Keep the original token walk independent of the shared Clippy index.
+def cp_locate_plain (spans : Maybe TokenSpans) (table : List (Pair Nat (Pair Nat Nat)))
+    (proofs : List CgSProof) : List CgSProof :=
+    map CgSProof CgSProof (fun (proof : CgSProof) =>
+      let (MkCgSProof code owner node range evidence) := proof in
+      match range with
+      | Just _ => proof
+      | Nothing =>
+          let found : Maybe (Pair Nat Nat) := match spans with
+            | Nothing => Nothing (Pair Nat Nat)
+            | Just tokens => match lookup Nat (Pair Nat Nat) eq_nat node table with
+              | Nothing => Nothing (Pair Nat Nat)
+              | Just bounds => let (MkPair first past) := bounds in token_span_bytes tokens first past
+              end
+            end in
+          MkCgSProof code owner node found evidence
+      end) proofs;
+
+def cp_locate_reference (unit : ClippySemanticUnit) (item : CmDefinition)
+    (proofs : List CgSProof) : List CgSProof :=
+    match proofs with
+    | Nil => []
+    | Cons _ _ => cp_locate_plain (cg_s_source_spans (cm_source unit))
+        (cm_definition_spans item) proofs
+    end;
 
 def cp_reference (unit : ClippySemanticUnit) (apis : CmApiIndex)
     : Either QualityInputError (List CgSProof) :=
@@ -132,34 +203,106 @@ def cp_reference (unit : ClippySemanticUnit) (apis : CmApiIndex)
     | Right definitions => Right QualityInputError (List CgSProof)
         (append CgSProof
           (concat_map CmDefinition CgSProof (fun (item : CmDefinition) =>
-            cm_with_locations unit item (cp_definition_proofs_reference unit item
+            cp_locate_reference unit item (cp_definition_proofs_reference unit item
               (cp_calls_reference (cm_definition_events item)))) definitions)
-          (cm_duplicate_proofs(unit, cp_eager_clones unit apis definitions)))
+          (cp_legacy_clones unit (cp_eager_clones unit apis definitions)))
     end;
 
--- The compiler parser and declaration index own this import-free test unit.
-def cp_unit (source : String) : Either QualityInputError ClippySemanticUnit :=
+-- Imports in these fixtures can trigger a rewrite. All declarations are local.
+def cp_unit_at (source : String) (path : String) : Either QualityInputError ClippySemanticUnit :=
     match cm_parse source empty_intern with
     | Left error => Left QualityInputError ClippySemanticUnit error
-    | Right parsed => match parsed with | MkPair decls intern =>
-      match load_intern_string intern (prim_string_to_char_codes
-          "tests/clippy_semantic/performance_subject.ouro") with
-      | MkPair entry keyed => match cm_after_parse
-          "tests/clippy_semantic/performance_subject.ouro" entry True
-          (MkParsedFile decls (Nil Nat)) keyed with
-        | MkHarvest updated symbols _ canonical origins =>
-            match sc_index_sorted (quality_sort ScDecl
-                (fun (a : ScDecl) (b : ScDecl) =>
-                  leb_nat(sc_decl_name a, sc_decl_name b)) symbols) with
-            | Left error => Left QualityInputError ClippySemanticUnit
-                (QualityInvalidInput (sc_error_message error))
-            | Right index => Right QualityInputError ClippySemanticUnit
-                (CmUnit updated entry source
-                  [mk_src_unit entry (cm_parsed_decls canonical) (cm_parsed_private canonical)]
-                  symbols index (cm_parsed_decls canonical) 1 origins cm_empty_resolved_imports)
-            end
-        end
-      end end
+    | Right parsed => let (MkPair decls intern) := parsed in
+      let (MkPair entry keyed) := load_intern_string intern (prim_string_to_char_codes path) in
+      let (MkHarvest updated symbols _ canonical origins) :=
+        cm_after_parse path entry True
+          (MkParsedFile decls (Nil Nat)) keyed in
+      match sc_index_sorted (quality_sort ScDecl
+          (fun (a : ScDecl) (b : ScDecl) =>
+            leb_nat(sc_decl_name a, sc_decl_name b)) symbols) with
+      | Left error => Left QualityInputError ClippySemanticUnit
+          (QualityInvalidInput (sc_error_message error))
+      | Right index => Right QualityInputError ClippySemanticUnit
+          (CmUnit updated entry source
+            [mk_src_unit entry (cm_parsed_decls canonical) (cm_parsed_private canonical)]
+            symbols index (cm_parsed_decls canonical) 1 origins cm_empty_resolved_imports)
+      end
+    end;
+
+def cp_unit (source : String) : Either QualityInputError ClippySemanticUnit :=
+    cp_unit_at source "tests/clippy_semantic/performance_subject.ouro";
+
+def cp_rank_pair (tokens : List Nat) : Pair Nat CmCloneRank :=
+    MkPair Nat CmCloneRank (cp_legacy_rank tokens) (cm_clone_rank tokens);
+
+def cp_order_eq (left : Ordering) (right : Ordering) : Bool :=
+    match left, right with
+    | LT, LT => True
+    | EQ, EQ => True
+    | GT, GT => True
+    | _, _ => False
+    end;
+
+def cp_clone_ranks : Bool :=
+    let wide : Nat := pow_nat 2 80 in
+    let suffix : List Nat := replicate Nat 7 192 in
+    let pairs : List (Pair Nat CmCloneRank) := map (List Nat) (Pair Nat CmCloneRank) cp_rank_pair
+      [[], [0], [0, 0], [1], [1, 0], [2], [0, 131], [131], [wide], [0, wide],
+       [wide, 0], append Nat [1, 0] suffix, append Nat [131] suffix,
+       append Nat [wide] suffix] in
+    all (Pair Nat CmCloneRank) (fun (left : Pair Nat CmCloneRank) =>
+      let (MkPair old_left new_left) := left in
+      all (Pair Nat CmCloneRank) (fun (right : Pair Nat CmCloneRank) =>
+        let (MkPair old_right new_right) := right in
+        cp_order_eq (compareNat old_left old_right) (cm_clone_rank_compare new_left new_right)) pairs) pairs;
+
+def cp_small_clone_groups : Nat -> List (Pair (List Nat) (List Nat)) :=
+  fix groups (count : Nat) : List (Pair (List Nat) (List Nat)) :=
+    match count with
+    | Z => []
+    | S rest =>
+        let tokens : List Nat := [count, 170, 3] in
+        let row : Pair (List Nat) (List Nat) := MkPair (List Nat) (List Nat) tokens tokens in
+        Cons (Pair (List Nat) (List Nat)) row (Cons (Pair (List Nat) (List Nat)) row (groups rest))
+    end;
+
+def cp_clone_fixture_tokens : List (Pair (List Nat) (List Nat)) :=
+    let wide : Nat := pow_nat 2 80 in
+    let suffix : List Nat := replicate Nat 7 128 in
+    let row (alpha : List Nat) (exact : List Nat) : Pair (List Nat) (List Nat) :=
+      MkPair (List Nat) (List Nat) (append Nat alpha suffix) (append Nat exact suffix) in
+    append (Pair (List Nat) (List Nat))
+      [row [1, 0] [1, 0], row [131] [131], row [2] [2], row [1, 0] [1, 0],
+       row [0, 131] [0, 131], row [1, 0] [1, 1], row [131] [132], row [2] [2],
+       row [0, wide] [0, wide], row [0, wide] [0, wide]] (cp_small_clone_groups 12);
+
+def cp_clone_fixture_source : Nat -> String :=
+  fix source (count : Nat) : String :=
+    match count with
+    | Z => ""
+    | S rest => prim_string_concat "def clone_"
+        (prim_string_concat (prim_string_of_nat count)
+          (prim_string_concat " : Type := Type;\n" (source rest)))
+    end;
+
+def cp_clone_fixture (unit : ClippySemanticUnit) (tokens : List (Pair (List Nat) (List Nat))) : Bool :=
+    let inputs : List CpCloneInput := zip_with ScDecl (Pair (List Nat) (List Nat)) CpCloneInput
+      (fun (decl : ScDecl) (streams : Pair (List Nat) (List Nat)) =>
+        let (MkPair alpha exact) := streams in CpCloneInputOf decl alpha exact)
+      (cm_declarations unit) tokens in
+    let clones : List CmClone := map CpCloneInput CmClone
+      (fun (input : CpCloneInput) => let (CpCloneInputOf decl alpha exact) := input in
+        CmCloneOf (cm_clone_rank alpha) decl alpha exact) inputs in
+    let expected : List CgSProof := cp_legacy_clones unit inputs in
+    let actual : List CgSProof := cm_duplicate_proofs unit (quality_sort CmClone cm_clone_le clones) in
+    andb (eq_nat (length CpCloneInput inputs) (length (Pair (List Nat) (List Nat)) tokens))
+      (andb (eq_nat(length CgSProof expected, 17)) (cp_proofs_eq expected actual));
+
+def cp_clone_wire_order : Bool :=
+    let tokens : List (Pair (List Nat) (List Nat)) := cp_clone_fixture_tokens in
+    match cp_unit (cp_clone_fixture_source (length (Pair (List Nat) (List Nat)) tokens)) with
+    | Left _ => False
+    | Right unit => cp_clone_fixture unit tokens
     end;
 
 def cp_wrap : Nat -> String -> String :=
@@ -189,32 +332,124 @@ def cp_parity (source : String) (minimum : Nat) (expect_error : Bool) : Bool :=
           let apis : CmApiIndex := cs_cache
             (cs_analyze unit initial cm_visit_fuel cm_analyze_depth) in
           match cp_reference unit apis with
-          | Left before => match cm_fold_definition_proofs unit apis
-              (cm_declarations unit) [] [] with
+          | Left before => match cm_fold_root_proofs unit apis
+              (cm_declarations unit) [] [] CgSSpansPending with
             | Left after => andb expect_error
                 (prim_string_eq(quality_input_message before, quality_input_message after))
             | Right _ => False end
-          | Right before => match cm_fold_definition_proofs unit apis
-              (cm_declarations unit) [] [] with
+          | Right before => match cm_fold_root_proofs unit apis
+              (cm_declarations unit) [] [] CgSSpansPending with
             | Left _ => False
-            | Right after => andb (notb expect_error)
+            | Right report => let (MkPair after _) := report in andb (notb expect_error)
                 (andb (leb_nat(minimum, length CgSProof before))
                   (cp_proofs_eq before after)) end
           end
       end
     end;
 
+def cp_span_source : String :=
+    prim_string_concat
+      "inductive Flag : Type := | FlagValue : Flag;\ndef eq_nat (lhs : Flag) (rhs : Flag) : Flag := lhs;\n"
+      (prim_string_concat "def span_first (value : Flag) : Flag := eq_nat value value;\n"
+        (prim_string_concat "def span_second (value : Flag) : Flag := eq_nat value value;\n"
+          "def structural (value : Flag) : Flag := let retained := value in retained;\n"));
+
+def cp_proof_range_expected (proof : CgSProof) (with_range : Bool) : Bool :=
+    let (MkCgSProof _ _ _ range _) := proof in
+    match range with | Nothing => notb with_range | Just _ => with_range end;
+
+def cp_structural_span_parity (unit : ClippySemanticUnit) (cache : CgSSpanCache)
+    (with_range : Bool) : Bool :=
+    match cg_s_build(cg_s_build_fuel, cm_root_decls unit) with
+    | Left _ => False
+    | Right facts => match cg_s_proofs_with_spans (cm_intern unit) facts
+        (fun (_ : Unit) => Nothing CgSSourceSpans) with
+      | Left _ => False
+      | Right unlocated =>
+        let expected : List CgSProof := cp_locate_plain (cg_s_source_spans (cm_source unit))
+          (cg_s_spans facts) unlocated in
+        match cg_s_proofs_with_spans (cm_intern unit) facts
+          (fun (_ : Unit) => cg_s_root_span_map (cm_source unit) cache) with
+        | Left _ => False
+        | Right actual => match expected with
+          | Nil => False
+          | Cons proof rest => andb (nullb CgSProof rest)
+              (andb(cp_proof_range_expected proof with_range, cp_proofs_eq expected actual))
+          end
+        end
+      end
+    end;
+
+def cp_span_parity (source : String) (with_range : Bool) : Bool :=
+    match cp_unit_at source "std/natx.ouro" with
+    | Left _ => False
+    | Right unit => match cm_build_apis(unit, cm_index unit) with
+      | Left _ => False
+      | Right apis => match cp_reference unit apis with
+        | Left _ => False
+        | Right expected => match cm_fold_root_proofs unit apis
+            (cm_declarations unit) [] [] CgSSpansPending with
+          | Left _ => False
+          | Right report => let (MkPair actual cache) := report in
+            let cached : Bool := match cache with
+              | CgSSpansPending => False
+              | CgSSpansReady spans => match spans with
+                | Nothing => notb with_range
+                | Just _ => with_range
+                end
+              end in
+            andb cached (andb (eq_nat(length CgSProof expected, 2))
+              (andb (all CgSProof (fun (proof : CgSProof) =>
+                let (MkCgSProof code _ _ _ _) := proof in
+                andb (prim_string_eq code "OURO-CLIPPY-LOGIC-001")
+                  (cp_proof_range_expected proof with_range)) expected)
+                (andb (cp_proofs_eq expected actual)
+                  (cp_structural_span_parity unit cache with_range))))
+          end
+        end
+      end
+    end;
+
+def cp_span_index_bounds : Bool :=
+    let row (node : Nat) (first : Nat) (past : Nat) : Pair Nat (Pair Nat Nat) :=
+        MkPair Nat (Pair Nat Nat) node (MkPair Nat Nat first past) in
+    let missing : Maybe (Pair Nat Nat) := Nothing (Pair Nat Nat) in
+    let present (start : Nat) (stop : Nat) : Maybe (Pair Nat Nat) :=
+        Just (Pair Nat Nat) (MkPair Nat Nat start stop) in
+    let proof (node : Nat) (range : Maybe (Pair Nat Nat)) : CgSProof :=
+        MkCgSProof "range" "owner" node range "evidence" in
+    let table : List (Pair Nat (Pair Nat Nat)) :=
+        [row 11 0 1, row 12 1 2, row 13 2 3, row 14 0 3,
+         row 15 3 4, row 16 1 1, row 17 2 1, row 18 0 4, row 11 1 2] in
+    let proofs : List CgSProof :=
+        [proof 13 missing, proof 11 missing, proof 12 missing, proof 11 missing,
+         proof 18 missing, proof 15 missing, proof 16 missing, proof 17 missing,
+         proof 14 missing, proof 42 missing, proof 15 (present 1 2)] in
+    let spans : Maybe TokenSpans := cg_s_source_spans "  first  second\n" in
+    let actual : List CgSProof := cg_s_locate (cg_s_index_spans spans) table proofs in
+    andb (cp_proofs_eq actual (cp_locate_plain spans table proofs))
+      (cp_proofs_eq actual
+        [proof 13 (present 16 16), proof 11 (present 2 7), proof 12 (present 9 15),
+         proof 11 (present 2 7), proof 18 missing, proof 15 missing, proof 16 missing,
+         proof 17 missing, proof 14 (present 2 16), proof 42 missing, proof 15 (present 1 2)]);
+
+def cp_no_proof_spans : Bool :=
+    match cp_unit "def keep (A : Type) (value : A) : A := value;" with
+    | Left _ => False
+    | Right unit => match cm_semantic_proofs unit with
+      | Left _ => False
+      | Right report => let (MkPair proofs cache) := report in
+        match cache with
+        | CgSSpansPending => nullb CgSProof proofs
+        | CgSSpansReady _ => False
+        end
+      end
+    end;
+
 -- Exact field equality: argument taint/constant/IO flags are not collapsed
 -- into a textual value key when checking the projection contract.
 def cp_list_eq (A : Type) (same : A -> A -> Bool) : List A -> List A -> Bool :=
-  fix go (left : List A) (right : List A) : Bool :=
-    match left with
-    | Nil => nullb A right
-    | Cons value rest => match right with
-      | Nil => False
-      | Cons other tail => andb(same value other, go rest tail)
-      end
-    end;
+  compiler_test_list_equal A same;
 
 def cp_value_eq (left : CmValue) (right : CmValue) : Bool :=
     all Bool (fun (same : Bool) => same)
@@ -272,6 +507,8 @@ def cp_mixed_events : List CmEvent :=
     , CmFlowEvent (CmFlow 11 7 96)
     , CmFlowEvent (CmFlow 12 8 95)
     , CmFlowEvent (CmFlow 13 10 94)
+    , CmFlowEvent (CmFlow 14 10 2)
+    , CmFlowEvent (CmFlow 15 10 94)
     , CmCallEvent cp_call
     ];
 
@@ -293,6 +530,12 @@ def cp_projection_expected : Bool :=
       , cp_list_eq Nat eq_nat (cm_flow_ids [1] cp_mixed_events) [0, 2, 7, 7]
       , cp_list_eq Nat eq_nat (cm_flow_ids [3, 4, 6, 9] cp_mixed_events) [2, 4, 6, 7]
       ];
+
+def cp_result_flow_parity (events : List CmEvent) : Bool :=
+    let (CmResultFlowIdsOf checked parsed observed) := cm_result_flow_ids events in
+    andb (cp_list_eq Nat eq_nat checked (cp_flow_ids_reference [1] events))
+      (andb (cp_list_eq Nat eq_nat parsed (cp_flow_ids_reference [10] events))
+        (cp_list_eq Nat eq_nat observed (cp_flow_ids_reference [3, 4, 6, 9] events)));
 
 def cp_gate_parity (apis : CmApiIndex) (calls : List ClippyCallFact) : Bool :=
     compiler_bool_equal (cm_clone_calls_known apis calls)
@@ -328,6 +571,29 @@ def cp_known_gate_parity : Bool :=
       end
     end;
 
+def cp_repeated_eligibility : Bool :=
+    let local : CmValue := CmValueOf 1 1 0 False False False in
+    let literal : CmValue := CmValueOf 3 7 0 False False True in
+    let missing : CmValue := cm_unknown 2 in
+    let row (role : Nat) (pure : Bool) (cost : Nat) (args : List CmValue)
+        (work : Bool) (traversal : Bool) : Bool :=
+      let call : ClippyCallFact := CmCall 1 1 1 0 role pure cost args False in
+      andb (compiler_bool_equal (cm_work_eligible call) work)
+        (compiler_bool_equal (cm_traversal_eligible call) traversal) in
+    all Bool (fun (value : Bool) => value)
+      [ row 15 True 1 [local, literal] True False
+      , row 15 True 1 [literal] False False
+      , row 15 True 1 [local, missing] False False
+      , row 15 True 1 [] False False
+      , row 15 False 1 [local] False False
+      , row 18 True 1 [local, literal] False False
+      , row 18 True 1 [literal, local] False True
+      , row 18 True 1 [missing, local] False False
+      , row 18 True 1 [] False True
+      , row 18 True 0 [local] False False
+      , row 0 True 1 [local] False False
+      ];
+
 def cp_laws : List (Pair String Bool) :=
     [ MkPair String Bool "token-threshold-equals-full-projection" cp_thresholds
     , MkPair String Bool "two-call-bound-keeps-duplicate-calls" cp_calls_bound
@@ -336,6 +602,9 @@ def cp_laws : List (Pair String Bool) :=
         (andb (cp_projection_parity cp_mixed_events)
           (cp_projection_parity (reverse_lin CmEvent cp_mixed_events)))
     , MkPair String Bool "projection-preserves-payload-order-and-duplicates" cp_projection_expected
+    , MkPair String Bool "result-flow-buckets-match-independent-projections"
+        (andb (cp_result_flow_parity []) (andb (cp_result_flow_parity cp_mixed_events)
+          (cp_result_flow_parity (reverse_lin CmEvent cp_mixed_events))))
     , MkPair String Bool "sparse-event-projection-parity"
         (all Nat (fun (count : Nat) => cp_projection_parity (cp_events count))
           [0, 1, 2, 119, 120, 121, 256, 512])
@@ -344,19 +613,28 @@ def cp_laws : List (Pair String Bool) :=
           (andb (notb (cm_clone_calls_known CmApiEmpty [cp_call, cp_call]))
             (cp_gate_parity CmApiEmpty [cp_call, cp_other_call])))
     , MkPair String Bool "clone-gate-known-and-early-late-rejection-parity" cp_known_gate_parity
+    , MkPair String Bool "repeated-call-gates-preserve-argument-eligibility" cp_repeated_eligibility
     , MkPair String Bool "small-definitions-eager-fold-parity"
         (cp_parity (cp_source 1) 0 False)
     , MkPair String Bool "exact-alpha-clone-order-and-evidence-parity"
         (cp_parity (cp_source 48) 2 False)
+    , MkPair String Bool "clone-rank-order-matches-polynomial" cp_clone_ranks
+    , MkPair String Bool "clone-wire-order-keeps-collisions-and-declaration-ties" cp_clone_wire_order
+    , MkPair String Bool "shared-span-map-keeps-semantic-and-structural-proof-positions"
+        (cp_span_parity cp_span_source True)
+    , MkPair String Bool "shared-span-map-caches-no-range-after-source-rewrite"
+        (cp_span_parity (prim_string_concat "import \"unused.ouro\" as Unused;\n" cp_span_source) False)
+    , MkPair String Bool "indexed-token-ranges-keep-boundaries-and-first-node-match" cp_span_index_bounds
+    , MkPair String Bool "proof-free-root-leaves-span-map-pending" cp_no_proof_spans
     , MkPair String Bool "late-error-does-not-return-earlier-proofs"
         (cp_parity (prim_string_concat (cp_source 48)
           "def invalid (x : Box) : Box := not_bound;\n") 0 True)
     ];
 
 def main : IO Unit :=
-    do io_foreach (Pair String Bool) (fun (law : Pair String Bool) => match law with
-         | MkPair name passed => println (prim_string_concat
-             (match passed with | True => "PASS " | False => "FAIL " end) name) end) cp_laws;
+    do io_foreach (Pair String Bool) (fun (law : Pair String Bool) => let (MkPair name passed) := law in
+      println (prim_string_concat
+        (match passed with | True => "PASS " | False => "FAIL " end) name)) cp_laws;
        exit (match all (Pair String Bool)
          (fun (law : Pair String Bool) => snd String Bool law) cp_laws with
          | True => 0 | False => 1 end)

@@ -1,5 +1,6 @@
 -- Direct native probes. Child modes are test-owned and never invoke a shell.
 import "../../std/processx.ouro",
+  "../../std/fs.ouro",
   "source_file_values.ouro",
   "source_nat_values.ouro";
 
@@ -90,18 +91,13 @@ def capture_probe_mode (program : String) (mode : String) (arguments : List Stri
                   do file_expect (eq_nat(length(IO (Either ProcessCaptureError ProcessCaptureResult), [action, invalid]), 2)); capture_probe_pass "deferred"
               | False => match str_eq mode "--timeout" with
                 | True => do let! result := process_run_captured_bounded (capture_probe_limit (mul 4 250) 7 7) program ["--child-sleep"];
-                             match result with | Left error => match error with
-                               | ProcessCaptureTimedOut _ output stderr =>
+                             match result with | Left error => if let ProcessCaptureTimedOut _ output stderr :=
+                                 error then
                                  match andb(str_eq output file_binary, str_eq stderr file_binary) with
                                  | True => capture_probe_pass "timeout"
                                  | False => do eprintln (str_cat4 "timeout-out=" (show_nat (str_len output))
                                                " err=" (show_nat (str_len stderr))); exit 91 end
-                               | ProcessCaptureInvalidLimits _ => do eprintln (process_capture_error_message error); exit 91
-                               | ProcessCaptureOsError _ => do eprintln (process_capture_error_message error); exit 91
-                               | ProcessCaptureCleanupFailed _ => do eprintln (process_capture_error_message error); exit 91
-                               | ProcessCaptureResourceLimit _ _ _ _ => do eprintln (process_capture_error_message error); exit 91
-                               | ProcessCaptureOutputLimit _ _ _ => do eprintln (process_capture_error_message error); exit 91
-                               | ProcessCaptureProtocolError _ => do eprintln (process_capture_error_message error); exit 91 end
+                               else do eprintln (process_capture_error_message error); exit 91
                              | Right captured => do eprintln (str_concat "timeout-exit="
                                  (show_nat (proc_code (process_capture_proc_result captured)))); exit 91 end
                 | False => match str_eq mode "--stdout-cap" with
@@ -122,20 +118,145 @@ def capture_probe_mode (program : String) (mode : String) (arguments : List Stri
                           | False => match str_eq mode "--oversized" with
                             | True => do let! result := process_run_captured_bounded (capture_probe_limit (mul 20 250) 0 0) first [];
                                          match result with
-                                         | Left error => match error with
-                                           | ProcessCaptureResourceLimit _ _ _ _ => capture_probe_pass "oversized"
-                                           | ProcessCaptureInvalidLimits _ => do eprintln (process_capture_error_message error); exit 91
-                                           | ProcessCaptureOsError _ => do eprintln (process_capture_error_message error); exit 91
-                                           | ProcessCaptureTimedOut _ _ _ => do eprintln (process_capture_error_message error); exit 91
-                                           | ProcessCaptureCleanupFailed _ => do eprintln (process_capture_error_message error); exit 91
-                                           | ProcessCaptureOutputLimit _ _ _ => do eprintln (process_capture_error_message error); exit 91
-                                           | ProcessCaptureProtocolError _ => do eprintln (process_capture_error_message error); exit 91 end
+                                         | Left error => if let ProcessCaptureResourceLimit _ _ _ _ :=
+                                             error then
+                                             capture_probe_pass "oversized"
+                                           else do eprintln (process_capture_error_message error); exit 91
                                          | Right captured => do file_expect (eq_nat(proc_code (process_capture_proc_result captured), 73));
                                                                 println "ENFORCEMENT_GAP hard-limit notification absent"; exit 74 end
                             | False => exit 91 end end end end end end end end end end end end end end end end end end end end end;
 
+def capture_probe_at_success (result : Either ProcessDirectoryError ProcessCaptureResult) : IO Unit :=
+    match result with
+    | Left error => do eprintln (process_directory_error_message error); exit 91
+    | Right captured => capture_probe_success (Right ProcessCaptureError ProcessCaptureResult captured) end;
+
+def capture_probe_at_error (expected : String) (result : Either ProcessDirectoryError ProcessCaptureResult) : IO Unit :=
+    match result with
+    | Right _ => exit 91
+    | Left error => file_expect (str_eq(process_directory_error_code error, expected)) end;
+
+def capture_probe_at_os_error (result : Either ProcessDirectoryError ProcessCaptureResult) : IO Unit :=
+    match result with
+    | Left error => match error with
+      | ProcessInvalidDirectory _ => exit 91
+      | ProcessDirectoryCapture cause => if let ProcessCaptureOsError code := cause then
+          file_expect (notb (eq_nat code 0))
+        else exit 91 end
+    | Right _ => exit 91 end;
+
+def capture_probe_parent_directory : IO Unit :=
+    do let! result := fs_read_checked "cwd.bin";
+       match result with | Left _ => exit 91
+         | Right body => file_expect (str_eq body "parent") end;
+
+def capture_probe_child_directory (arguments : List String) : IO Unit :=
+    do file_expect (source_words_equal arguments ["cwd.bin", str_of_codes [97, 32, 34, 98, 92], ""]);
+       let! result := fs_read_checked "cwd.bin";
+       match result with | Left _ => exit 91
+         | Right body => do file_expect (str_eq body file_binary); capture_probe_input end;
+
+def capture_probe_directory_rejected (program : String) (directory : String) : IO Unit :=
+    do let! result := process_run_captured_bounded_at (capture_probe_limit 0 0 0) directory program ["--child-flood-out"];
+       match result with
+       | Right _ => exit 91
+       | Left error => match error with
+         | ProcessDirectoryCapture _ => exit 91
+         | ProcessInvalidDirectory actual => file_expect (str_eq actual directory)
+         end end;
+
+def capture_probe_directories_rejected (program : String) : List String -> IO Unit :=
+    fix reject (directories : List String) : IO Unit :=
+      match directories with | Nil => io_unit | Cons directory rest =>
+        do capture_probe_directory_rejected program directory; reject rest end;
+
+def capture_probe_at_timeout (result : Either ProcessDirectoryError ProcessCaptureResult) : IO Unit :=
+    match result with
+    | Left error => match error with
+      | ProcessInvalidDirectory _ => exit 91
+      | ProcessDirectoryCapture cause => if let ProcessCaptureTimedOut _ output stderr := cause then
+          file_expect (andb(str_eq output file_binary, str_eq stderr file_binary))
+        else exit 91 end
+    | Right _ => exit 91 end;
+
+def capture_probe_at_resource (result : Either ProcessDirectoryError ProcessCaptureResult) : IO Unit :=
+    match result with
+    | Left error => match error with
+      | ProcessInvalidDirectory _ => do eprintln (process_directory_error_message error); exit 91
+      | ProcessDirectoryCapture cause => if let ProcessCaptureResourceLimit _ _ _ _ := cause then
+          io_unit
+        else do eprintln (process_directory_error_message error); exit 91 end
+    | Right captured => do file_expect (eq_nat(proc_code (process_capture_proc_result captured), 73));
+        println "ENFORCEMENT_GAP hard-limit notification absent"; exit 74 end;
+
+def capture_probe_at_mode (program : String) (mode : String) (arguments : List String) : IO Unit :=
+    let directory : String := nth String "" 0 arguments in
+    let second : String := nth String "" 1 arguments in
+    let third : String := nth String "" 2 arguments in
+    let limits : ProcessCaptureLimits := capture_probe_limit (mul 20 250) 7 7 in
+    let child : List String := ["--child-cwd", "cwd.bin", str_of_codes [97, 32, 34, 98, 92], ""] in
+    match str_eq mode "--child-cwd" with | True => capture_probe_child_directory arguments | False =>
+    match str_eq mode "--cwd" with
+    | True => do let! result := process_run_captured_bounded_at_with_input limits directory program child file_binary;
+                 capture_probe_at_success result; capture_probe_parent_directory; capture_probe_pass "cwd"
+    | False => match str_eq mode "--cwd-reuse" with
+      | True => let partial : List String -> String -> Pair String (Pair Nat (Pair Nat (Pair Nat (Pair Nat Nat)))) -> IO (Pair Nat (Pair Nat (Pair Nat (Pair String String)))) := prim_process_capture_bounded_at program in
+          let located : Pair String (Pair Nat (Pair Nat (Pair Nat (Pair Nat Nat)))) -> IO (Pair Nat (Pair Nat (Pair Nat (Pair String String)))) := partial child directory in
+          let action : IO (Pair Nat (Pair Nat (Pair Nat (Pair String String)))) := located (process_capture_request limits file_binary) in
+          do let! first := action; capture_probe_success (process_capture_decode_checked limits first);
+             capture_probe_parent_directory; let! next := action;
+             capture_probe_success (process_capture_decode_checked limits next);
+             capture_probe_parent_directory; capture_probe_pass "cwd-reuse"
+      | False => match str_eq mode "--cwd-deferred" with
+        | True => let action : IO (Either ProcessDirectoryError ProcessCaptureResult) :=
+            process_run_captured_bounded_at limits directory program ["--child-flood-out"] in
+            let invalid : IO (Either ProcessDirectoryError ProcessCaptureResult) :=
+              process_run_captured_bounded_at limits directory (str_of_codes [255]) [] in
+            do file_expect (eq_nat(length(IO (Either ProcessDirectoryError ProcessCaptureResult), [action, invalid]), 2));
+               capture_probe_parent_directory; capture_probe_pass "cwd-deferred"
+        | False => match str_eq mode "--cwd-invalid" with
+          | True => do capture_probe_directories_rejected program
+              ["", "scratch", "C:scratch", "\\scratch", str_of_codes [67, 58, 92, 0],
+               str_of_codes [67, 58, 92, 255], str_of_codes [67, 58, 92, 237, 160, 128]];
+              let! result := process_run_captured_bounded_at (capture_probe_limit 0 0 0) directory program ["--child-flood-out"];
+              capture_probe_at_error "process_capture_limits" result;
+              capture_probe_parent_directory; capture_probe_pass "cwd-invalid"
+          | False => match str_eq mode "--cwd-missing" with
+            | True => do let! missing := process_run_captured_bounded_at limits second program [];
+                         capture_probe_at_os_error missing;
+                         let! file := process_run_captured_bounded_at limits third program [];
+                         capture_probe_at_os_error file;
+                         capture_probe_parent_directory; capture_probe_pass "cwd-missing"
+            | False => match str_eq mode "--cwd-timeout" with
+              | True => do let! result := process_run_captured_bounded_at
+                  (capture_probe_limit (mul 4 250) 7 7) directory program ["--child-sleep"];
+                  capture_probe_at_timeout result; capture_probe_parent_directory; capture_probe_pass "cwd-timeout"
+              | False => match str_eq mode "--cwd-stdout-cap" with
+                | True => do let! result := process_run_captured_bounded_at
+                    (capture_probe_limit(mul 20 250, mul 16 256, 0)) directory program ["--child-flood-out"];
+                    capture_probe_at_error "process_capture_output_limit" result;
+                    capture_probe_parent_directory; capture_probe_pass "cwd-stdout-cap"
+                | False => match str_eq mode "--cwd-stderr-cap" with
+                  | True => do let! result := process_run_captured_bounded_at
+                      (capture_probe_limit(mul 20 250, 0, mul 16 256)) directory program ["--child-flood-err"];
+                      capture_probe_at_error "process_capture_output_limit" result;
+                      capture_probe_parent_directory; capture_probe_pass "cwd-stderr-cap"
+                  | False => match str_eq mode "--cwd-oversized" with
+                    | True => do let! result := process_run_captured_bounded_at
+                        (capture_probe_limit (mul 20 250) 0 0) directory second [];
+                        capture_probe_at_resource result; capture_probe_parent_directory; capture_probe_pass "cwd-oversized"
+                    | False => match str_eq mode "--cwd-tree-timeout" with
+                      | True => do let! result := process_run_captured_bounded_at
+                          (capture_probe_limit (mul 20 250) 0 0) third program ["--branch", directory, second];
+                          capture_probe_at_error "process_capture_timeout" result; capture_probe_pass "cwd-tree-timeout"
+                      | False => match str_eq mode "--cwd-tree" with
+                        | True => do let! result := process_run_captured_bounded_at
+                            (capture_probe_limit (mul 120 250) 0 0) third program ["--branch", directory, second]; exit 91
+                        | False => capture_probe_mode program mode arguments
+                        end end end end end end end end end end end end;
+
 def main : IO Unit :=
     do let! words := argv;
        match words with | Cons program rest => match rest with
-         | Cons mode arguments => capture_probe_mode program mode arguments
+         | Cons mode arguments => capture_probe_at_mode program mode arguments
          | Nil => exit 91 end | Nil => exit 91 end

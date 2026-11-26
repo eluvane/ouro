@@ -1,0 +1,172 @@
+import "windows_file_managed.ouro", "../../std/io.ouro", "../../std/fs_bounded_model.ouro";
+
+intrinsic bounded_file_usize_to_nat : USize -> Nat := "ouro.usize.to_nat.bits";
+intrinsic bounded_file_u32_to_nat : U32 -> Nat := "ouro.u32.to_nat.bits";
+intrinsic bounded_file_u8_to_nat : U8 -> Nat := "ouro.u8.to_nat.bits";
+
+inductive WindowsBoundedReadOutcome : Type :=
+  | WindowsBoundedReadValue : Either FsBoundedReadError String -> WindowsBoundedReadOutcome
+  | WindowsBoundedReadGuard : WindowsBoundedReadOutcome;
+
+def windows_bounded_read_error (error : FsBoundedReadError) : IO WindowsBoundedReadOutcome :=
+    io_pure(WindowsBoundedReadOutcome, WindowsBoundedReadValue (Left FsBoundedReadError String error));
+
+def windows_bounded_read_os (phase : String) (status : U32) : IO WindowsBoundedReadOutcome :=
+    windows_bounded_read_error (FsBoundedReadOsError phase (bounded_file_u32_to_nat status));
+
+def windows_bounded_read_close (close : RawPtr U8 -> IO U32) (file_handle : RawPtr U8)
+    (outcome : WindowsBoundedReadOutcome) : IO WindowsBoundedReadOutcome :=
+    do let! status := close file_handle;
+       io_pure(WindowsBoundedReadOutcome, match u32_equal(status, u32_sub status status) with
+         | True => outcome | False => WindowsBoundedReadGuard end);
+
+-- These raw bytes are owned, fully initialized and already within the cap.
+def windows_bounded_read_bytes (base : RawPtr U8) (one : USize)
+    : Nat -> USize -> List Nat -> IO String :=
+  fix read (remaining : Nat) (offset : USize) (bytes : List Nat) : IO String :=
+    match remaining with
+    | Z => io_pure(String, str_of_codes (reverse_lin Nat bytes))
+    | S rest => do let! address := raw_add U8 base offset;
+                   let! byte := raw_load_u8 address;
+                   read(rest, usize_add offset one, Cons Nat (bounded_file_u8_to_nat byte) bytes)
+    end;
+
+-- The same handle is used for sizing, all transfers, the EOF probe and resizing.
+-- The one-byte probe uses separate fixed scratch, never a payload extension.
+def windows_bounded_read_complete
+    (measure : RawPtr U8 -> RawPtr USize -> IO U32)
+    (read : RawPtr U8 -> RawPtr U8 -> USize -> RawPtr U32 -> IO U32)
+    (file_handle : RawPtr U8) (size : USize) (length_cell : RawPtr USize)
+    (count : RawPtr U32) (probe : RawPtr U8) (one : USize) : IO WindowsBoundedReadOutcome :=
+    do let! status := read file_handle probe one count;
+       match u32_equal(status, u32_sub status status) with
+       | False => windows_bounded_read_os "read" status
+       | True => do let! actual := raw_load_u32 count;
+                    match u32_less(raw_size_to_u32 one, actual) with
+                    | True => io_pure(WindowsBoundedReadOutcome, WindowsBoundedReadGuard)
+                    | False => match u32_equal(actual, u32_sub actual actual) with
+                    | False => windows_bounded_read_error FsBoundedReadChanged
+                    | True => do let! measured := measure file_handle length_cell;
+                                 match u32_equal(measured, u32_sub measured measured) with
+                                 | False => windows_bounded_read_os "length" measured
+                                 | True => do let! after := raw_load_usize length_cell;
+                                              match usize_equal size after with
+                                              | False => windows_bounded_read_error FsBoundedReadChanged
+                                              | True => io_pure(WindowsBoundedReadOutcome,
+                                                  WindowsBoundedReadValue (Right FsBoundedReadError String ""))
+                                              end
+                                 end
+                    end end
+       end;
+
+-- Each positive transfer consumes at least one byte; S(size) bounds retries.
+def windows_bounded_read_transfer
+    (measure : RawPtr U8 -> RawPtr USize -> IO U32)
+    (read : RawPtr U8 -> RawPtr U8 -> USize -> RawPtr U32 -> IO U32)
+    (file_handle : RawPtr U8) (base : RawPtr U8) (size : USize)
+    (length_cell : RawPtr USize) (count : RawPtr U32) (probe : RawPtr U8)
+    (one : USize) (chunk : USize) : Nat -> USize -> USize -> IO WindowsBoundedReadOutcome :=
+  fix transfer (fuel : Nat) (remaining : USize) (offset : USize) : IO WindowsBoundedReadOutcome :=
+    match fuel with
+    | Z => io_pure(WindowsBoundedReadOutcome, WindowsBoundedReadGuard)
+    | S rest => match usize_equal(remaining, usize_sub one one) with
+      | True => windows_bounded_read_complete measure read file_handle size length_cell count probe one
+      | False => let requested : USize := match usize_less remaining chunk with
+          | True => remaining | False => chunk end in
+        do let! target := raw_add U8 base offset;
+           let! status := read file_handle target requested count;
+           match u32_equal(status, u32_sub status status) with
+           | False => windows_bounded_read_os "read" status
+           | True => do let! actual := raw_load_u32 count;
+                        let got : USize := raw_u32_to_size actual in
+                        match usize_less requested got with
+                        | True => io_pure(WindowsBoundedReadOutcome, WindowsBoundedReadGuard)
+                        | False => match usize_equal(got, usize_sub one one) with
+                          | True => windows_bounded_read_error FsBoundedReadChanged
+                          | False => transfer(rest, usize_sub remaining got, usize_add offset got)
+                          end end
+           end
+      end
+    end;
+
+-- Fixed scratch contains an aligned length cell [0,8), count [8,12), probe [12,13).
+-- The handle is consumed here. Callers retain scratch until this action returns.
+def windows_bounded_read_contents_with
+    (allocate : USize -> USize -> IO (RawPtr U8)) (release : RawPtr U8 -> IO Bool)
+    (measure : RawPtr U8 -> RawPtr USize -> IO U32)
+    (read : RawPtr U8 -> RawPtr U8 -> USize -> RawPtr U32 -> IO U32)
+    (close : RawPtr U8 -> IO U32)
+    (file_handle : RawPtr U8) (scratch : RawPtr U8) (one : USize) (cap : Nat) : IO WindowsBoundedReadOutcome :=
+    -- Only bounded leaves form byte lists; packed halves retain byte order.
+    let pack : Nat -> RawPtr U8 -> Nat -> USize -> IO WindowsBoundedReadOutcome :=
+      fix pack (fuel : Nat) (base : RawPtr U8) (remaining : Nat) (offset : USize) : IO WindowsBoundedReadOutcome :=
+        match fuel with
+        | Z => io_pure(WindowsBoundedReadOutcome, WindowsBoundedReadGuard)
+        | S rest =>
+          match leb_nat remaining 65536 with
+          | True => do let! text := windows_bounded_read_bytes base one remaining offset ([] : List Nat);
+                       io_pure(WindowsBoundedReadOutcome,
+                         WindowsBoundedReadValue (Right FsBoundedReadError String text))
+          | False => let left : Nat := div_nat remaining 2 in
+            match usize_from_nat left with
+            | Nothing => io_pure(WindowsBoundedReadOutcome, WindowsBoundedReadGuard)
+            | Just count => do let! first := pack rest base left offset;
+                               match first with
+                               | WindowsBoundedReadGuard => io_pure(WindowsBoundedReadOutcome, first)
+                               | WindowsBoundedReadValue prefix => match prefix with
+                                 | Left _ => io_pure(WindowsBoundedReadOutcome, first)
+                                 | Right before => do let! second := pack rest base (sub remaining left) (usize_add offset count);
+                                                      match second with
+                                                      | WindowsBoundedReadGuard => io_pure(WindowsBoundedReadOutcome, second)
+                                                      | WindowsBoundedReadValue suffix => match suffix with
+                                                        | Left _ => io_pure(WindowsBoundedReadOutcome, second)
+                                                        | Right after => io_pure(WindowsBoundedReadOutcome,
+                                                            WindowsBoundedReadValue
+                                                              (Right FsBoundedReadError String (str_concat before after)))
+                                                        end
+                                                      end
+                                 end
+                               end
+            end
+          end
+        end in
+    let two : USize := usize_add one one in
+    let four : USize := usize_add two two in
+    let eight : USize := usize_add four four in
+    let sixteen : USize := usize_add eight eight in
+    let chunk : USize := usize_shift_left(one, raw_size_to_u32 sixteen) in
+    do let! length_cell := raw_cast U8 USize scratch;
+       let! count_bytes := raw_add U8 scratch eight;
+       let! count := raw_cast U8 U32 count_bytes;
+       let! probe := raw_add U8 count_bytes four;
+       let! status := measure file_handle length_cell;
+       match u32_equal(status, u32_sub status status) with
+       | False => do let! outcome := windows_bounded_read_os "length" status;
+                     windows_bounded_read_close close file_handle outcome
+       | True => do let! size := raw_load_usize length_cell;
+                    match fs_bounded_read_length cap (bounded_file_usize_to_nat size) with
+                    | Left error => do let! outcome := windows_bounded_read_error error;
+                                       windows_bounded_read_close close file_handle outcome
+                    | Right bytes => match usize_equal(size, usize_sub one one) with
+                      | True => do let! outcome := windows_bounded_read_complete measure read file_handle size length_cell count probe one;
+                                   windows_bounded_read_close close file_handle outcome
+                      | False => do let! base := allocate size eight;
+                                    let! bits := raw_to_bits U8 base;
+                                    match usize_equal(bits, usize_sub one one) with
+                                    | True => windows_bounded_read_close close file_handle WindowsBoundedReadGuard
+                                    | False => do let! outcome := windows_bounded_read_transfer measure read file_handle
+                                                    base size length_cell count probe one chunk (S bytes) size (usize_sub one one);
+                                                  let! value := match outcome with
+                                                    | WindowsBoundedReadGuard => io_pure(WindowsBoundedReadOutcome, outcome)
+                                                    | WindowsBoundedReadValue result => match result with
+                                                      | Left _ => io_pure(WindowsBoundedReadOutcome, outcome)
+                                                      | Right _ => pack (S bytes) base bytes (usize_sub one one)
+                                                      end end;
+                                                  let! closed := windows_bounded_read_close close file_handle value;
+                                                  let! released := release base;
+                                                  io_pure(WindowsBoundedReadOutcome, match released with
+                                                    | True => closed | False => WindowsBoundedReadGuard end)
+                                    end
+                      end
+                    end
+       end;

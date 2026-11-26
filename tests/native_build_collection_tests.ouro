@@ -164,12 +164,54 @@ def native_collect_source_laws : List (Pair String Bool) :=
     , MkPair String Bool "UNC-backslash-import-retains-network-prefix"
         (str_eq(collect_path_resolve "\\\\server\\share\\dir\\main.ouro" "..\\lib.ouro", "//server/share/lib.ouro"))
     , MkPair String Bool "drive-root-normalization-preserved"
-        (str_eq(collect_path_normalize "I:\\src\\.\\main.ouro", "I:/src/main.ouro"))
+        (precision_strings
+          [collect_path_normalize "I:\\src\\.\\main.ouro", path_normalize "I:\\..",
+           path_normalize "I:/..", path_normalize "I:"]
+          ["I:/src/main.ouro", "I:/", "I:/", "I:/"])
     , MkPair String Bool "relative-root-normalization-preserved"
-        (str_eq(collect_path_normalize "./src/../main.ouro", "main.ouro"))
+        (precision_strings
+          (map String String collect_path_normalize ["./src/../main.ouro", "", "a", "../.."])
+          ["main.ouro", ".", "a", "../.."])
     , MkPair String Bool "single-slash-root-is-not-UNC"
-        (str_eq(collect_path_normalize "/src/../main.ouro", "/main.ouro"))
+        (precision_strings
+          [collect_path_normalize "/src/../main.ouro", path_normalize "\\src\\..\\main.ouro",
+           path_normalize "/", path_normalize "//server/share"]
+          ["/main.ouro", "/main.ouro", "/", "/server/share"])
     ];
+
+private def native_collect_read_once (trace : String) (path : String)
+    : IO (Either CollectReadError String) :=
+    match! fs_read_checked trace with
+    | Left error => io_pure (Either CollectReadError String)
+        (Left CollectReadError String (CollectReadFailure error))
+    | Right reads => if elem String str_eq path (str_lines reads) then
+        io_pure (Either CollectReadError String)
+          (Left CollectReadError String (CollectReadFailure (FsOperationFailed "duplicate read" path)))
+      else match! fs_write_checked trace (str_cat3 reads path "\n") with
+        | Left error => io_pure (Either CollectReadError String)
+            (Left CollectReadError String (CollectReadFailure error))
+        | Right _ => collect_read_checked path
+      end
+    end;
+
+private def native_collect_capture_once : IO Bool :=
+    do let! trace := prim_fs_temp_file;
+       if str_null trace then
+         do eprintln "cannot create capture read trace"; io_pure Bool False
+       else
+         do let! captured := collect_snapshot_with_reader (native_collect_read_once trace)
+              collect_fuel "./tests/native_build_collection/positive path/./main.ouro";
+            fs_remove trace;
+            match captured with
+            | Left error => do eprintln error; io_pure Bool False
+            | Right snapshot => io_pure Bool
+                (andb (str_eq (collect_snapshot_root snapshot) native_collect_root)
+                  (precision_strings
+                  (map (Pair String String) String
+                    (fun (file : Pair String String) => let (MkPair path _) := file in path)
+                    (collect_snapshot_files snapshot))
+                  native_collect_expected))
+            end;
 
 def native_collect_laws : IO (List (Pair String Bool)) :=
     do let! ordered := collect_walk collect_fuel [] [] native_collect_root;
@@ -180,6 +222,7 @@ def native_collect_laws : IO (List (Pair String Bool)) :=
        let! missing := collect_walk collect_fuel [] [] native_collect_missing;
        let! cycle := collect_walk collect_fuel [] [] native_collect_cycle;
        let! exhausted := collect_walk Z [] [] native_collect_root;
+       let! captured := native_collect_capture_once;
        io_pure (List (Pair String Bool))
          (append (Pair String Bool) native_collect_source_laws
          [ MkPair String Bool "dependency-order-spaces-and-dedup" (native_collect_units_match ordered)
@@ -188,6 +231,7 @@ def native_collect_laws : IO (List (Pair String Bool)) :=
          , MkPair String Bool "missing-import-ColErr" (native_collect_error_match missing native_collect_missing_error)
          , MkPair String Bool "cycle-ColErr" (native_collect_error_match cycle native_collect_cycle_error)
          , MkPair String Bool "fuel-ColErr" (native_collect_error_match exhausted "collect_units: too many units")
+         , MkPair String Bool "snapshot-reads-each-unit-once" captured
          ])
 
 def native_collect_fail (rows : List (Pair String Bool)) (name : String)

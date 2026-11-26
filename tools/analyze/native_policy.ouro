@@ -1,0 +1,61 @@
+import "native_composition.ouro",
+  "../../std/process.ouro";
+
+-- The caller owns both worker limits. Memory is contained Windows Job commit
+-- in MiB, not the retained RSS budget. No deadline or memory default is inferred.
+inductive NativeAnalyzePolicy : Type :=
+  | NativeAnalyzePolicyOf : ProcessCaptureLimits -> ProcessCaptureLimits -> NativeAnalyzePolicy;
+
+-- This entry policy is provisional. Job commit is not RSS. Retained RSS gates
+-- and actual native worker probes remain required before acceptance.
+private def native_analyze_milliseconds_per_second : Nat := mul 10 100;
+
+def native_analyze_worker_deadline_ms : Nat := mul 120 native_analyze_milliseconds_per_second;
+def native_analyze_base_job_memory_mib : Nat := mul 5 100;
+def native_analyze_drive_job_memory_mib : Nat := mul 3 (mul 32 32);
+
+def native_analyze_entry_policy : NativeAnalyzePolicy :=
+    NativeAnalyzePolicyOf
+      (ProcessCaptureLimitsOf native_analyze_worker_deadline_ms native_analyze_base_job_memory_mib 1
+        bounded_native_report_stream_limit bounded_native_report_stream_limit)
+      (ProcessCaptureLimitsOf native_analyze_worker_deadline_ms native_analyze_drive_job_memory_mib 1
+        bounded_native_report_stream_limit bounded_native_report_stream_limit);
+
+inductive NativeAnalyzePolicyError : Type :=
+  | NativeAnalyzePolicyLimit : NativeAnalyzeWorker -> ProcessCaptureLimitField -> NativeAnalyzePolicyError
+  | NativeAnalyzePolicyCapture : NativeAnalyzeWorker -> NativeAnalyzePolicyError;
+
+def native_analyze_policy_limits (policy : NativeAnalyzePolicy) (worker : NativeAnalyzeWorker)
+    : ProcessCaptureLimits :=
+    match policy with | NativeAnalyzePolicyOf base drive => match worker with
+      | NativeAnalyzeBaseWorker => base
+      | NativeAnalyzeDriveWorker => drive
+      end
+    end;
+
+def native_analyze_policy_worker (worker : NativeAnalyzeWorker) (limits : ProcessCaptureLimits)
+    : Either NativeAnalyzePolicyError Unit :=
+    match process_capture_limits_error limits with
+    | Just field => Left NativeAnalyzePolicyError Unit (NativeAnalyzePolicyLimit worker field)
+    | Nothing => match limits with | ProcessCaptureLimitsOf _ _ _ output errors =>
+        if bounded_native_report_size_valid output errors then Right NativeAnalyzePolicyError Unit MkUnit
+        else Left NativeAnalyzePolicyError Unit (NativeAnalyzePolicyCapture worker)
+      end
+    end;
+
+def native_analyze_policy_checked (policy : NativeAnalyzePolicy) : Either NativeAnalyzePolicyError Unit :=
+    let? (Left, Right) : Either NativeAnalyzePolicyError Unit do
+      (native_analyze_policy_worker NativeAnalyzeBaseWorker
+        (native_analyze_policy_limits policy NativeAnalyzeBaseWorker))?;
+      (native_analyze_policy_worker NativeAnalyzeDriveWorker
+        (native_analyze_policy_limits policy NativeAnalyzeDriveWorker))?;
+      MkUnit
+    end;
+
+def native_analyze_policy_message (error : NativeAnalyzePolicyError) : String :=
+    match error with
+    | NativeAnalyzePolicyLimit worker field => str_cat4
+        "invalid analyzer policy: " (native_analyze_worker_name worker) " " (process_capture_limit_name field)
+    | NativeAnalyzePolicyCapture worker => str_cat3 "invalid analyzer policy: "
+        (native_analyze_worker_name worker) " capture exceeds the native report reader limit"
+    end;

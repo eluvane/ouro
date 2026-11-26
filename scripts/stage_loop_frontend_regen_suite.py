@@ -16,6 +16,7 @@ import tempfile
 from pathlib import Path
 
 import frontend_regen
+import pack_frontend
 
 from build_cache_config_suite import counts
 
@@ -26,6 +27,8 @@ EXPECTED_FRONTEND_TUS = len(frontend_regen.FRONTEND_TUS)
 def copy_repo(dst: Path) -> None:
     ignore = shutil.ignore_patterns("_build", "_cache", ".git", "*.pyc", "__pycache__")
     shutil.copytree(ROOT, dst, ignore=ignore)
+    for dependency in ("runtime/frontend_link.c", "scripts/compact_source.py"):
+        assert (dst / dependency).read_bytes() == (ROOT / dependency).read_bytes(), dependency
 
 
 def write_fake_ouro1(path: Path) -> None:
@@ -34,6 +37,10 @@ def write_fake_ouro1(path: Path) -> None:
     path.write_text(
         r'''#!/usr/bin/env python3
 import os, sys
+sys.path.insert(0, "scripts")
+import pack_frontend as packer
+from frontend_lower_lookup_test import append_helpers, elem_helpers
+from scoped_host_export_routes import PACKED_FRONTEND_EXPORT_ROUTES
 args = sys.argv[1:]
 mod = ""
 root = ""
@@ -47,6 +54,83 @@ if not mod:
 log = os.environ.get("FAKE_OURO1_LOG", "fake_ouro1.log")
 with open(log, "a", encoding="utf-8") as f:
     f.write(f"{mod} {root}\n")
+units = [args[i + 1].replace("\\", "/") for i, token in enumerate(args[:-1]) if token == "--unit"]
+definitions = []
+if "compiler/module_registry_base.ouro" in units:
+    definitions.extend((("module_members", 7), ("module_owned_exports", 2),
+                        ("module_shadow_exports", 2), ("module_unique_exports", 1)))
+if "compiler/module_registry.ouro" in units:
+    definitions.append(("module_maps_for", 9))
+if "compiler/module_names.ouro" in units:
+    definitions.extend((("module_rewrite_decls_with_opens_pure", 10), ("module_rewrite_decl_pure", 10)))
+if "compiler/module_registry.ouro" in units:
+    definitions.extend((("module_scope_maps", 4), ("module_bare_ctors", 5)))
+if "compiler/module_names_base.ouro" in units:
+    definitions.append(("module_invalid_maps", 3))
+if "compiler/module_registry.ouro" in units:
+    definitions.extend((("module_rewrite_unit_pure", 7),
+                        ("module_maps_for_cached_pure", 9), ("module_rewrite_unit_cached_pure", 7)))
+if packer.SOURCE_NAME_COMPARE_OWNER in units:
+    definitions.append(("source_name_compare", 2))
+if "compiler/module_names_base.ouro" in units:
+    definitions.extend((("lookup", 3), ("eqNat", 2), ("module_lookup", 0)))
+if mod == "_lo":
+    if root != "compiler/lower.ouro" or any(unit not in units for unit in (
+            "compiler/lower_env.ouro", "compiler/pipeline_abi.ouro")):
+        raise SystemExit("fake ouro1: invalid lower ctor source closure")
+    definitions.append(("lookup_ctor", 2))
+if packer.LOWER_LOCAL_LOOKUP_OWNER in units:
+    definitions.append(("lookup_local", 2))
+value_routes = (*packer.PRELUDE_ARITHMETIC_ROUTES, packer.PRELUDE_LIST_LENGTH_ROUTE[:2],
+                packer.PRELUDE_LIST_APPEND_ROUTE[:2],
+                ("elem", packer.ELEM_OWNER), ("orb", packer.ELEM_ORB_OWNER))
+value_owners = dict(value_routes)
+value_owners["source_name_compare"] = packer.SOURCE_NAME_COMPARE_OWNER
+value_owners["lookup_local"] = packer.LOWER_LOCAL_LOOKUP_OWNER
+for name, owner in value_routes:
+    if owner in units and not any(existing == name for existing, _arity in definitions):
+        definitions.append((name, packer.PRELUDE_LIST_LENGTH_ROUTE[2] if name == "length"
+                            else packer.ELEM_VALUE_ARITY if name == "elem" else 2))
+scoped = mod in {"_lx", "_co", "_pi", "_pr", "_pl"}
+if scoped:
+    for suffix, _alias, name, owners in PACKED_FRONTEND_EXPORT_ROUTES:
+        if suffix == mod:
+            owner, = (path for path in owners if path in units)
+            value_owners[name] = owner
+            if not any(existing == name for existing, _arity in definitions):
+                definitions.append((name, 1))
+if definitions:
+    print('#include "ouro_rt.h"')
+    names, values = [], []
+    gids = {name: 900 + index for index, (name, _arity) in enumerate(definitions)}
+    for index, (name, arity) in enumerate(definitions):
+        gid = 900 + index
+        if name == "append":
+            print(append_helpers(gid), end="")
+        elif name == "elem":
+            print(elem_helpers(gid, gids["orb"]), end="")
+        else:
+            for step in reversed(range(arity)):
+                suffix = "0_" * step + f"{gid}_"
+                result = f"ouro_clos(ouro_f0_{suffix},env)" if step + 1 < arity else "arg"
+                print(f"static ouro_v *ouro_f{suffix}(ouro_env *env0,ouro_v *arg){{"
+                      f"ouro_env *env=ouro_cons(arg,env0);(void)env;return {result};}}")
+        print(f"static ouro_v *ouro_c{gid};")
+        initializer = (f"ouro_app(ouro_g{gids['lookup']}(),ouro_g{gids['eqNat']}())"
+                       if name == "module_lookup" else f"ouro_fix(ouro_f{gid}_,env)"
+                       if name in ("append", "source_name_compare") else f"ouro_clos(ouro_f{gid}_,env)")
+        print(f"static ouro_v *ouro_g{gid}(void){{ouro_env *env=0;(void)env;"
+              f"if(ouro_c{gid}==0){{ouro_static_begin();"
+              f"ouro_c{gid}={initializer};"
+              f"ouro_static_end();}}return ouro_c{gid};}}")
+        owner = value_owners.get(name)
+        label = f"_ouro_m_{units.index(owner)}_{name}" if scoped and owner and owner != units[-1] else name
+        names.append(f'case {index}: return "{label}";')
+        values.append(f"case {index}: return ouro_g{gid}();")
+    print(f"int ouro_export_count{mod}(void){{return {len(definitions)};}}")
+    print(f"const char *ouro_export_name{mod}(int i){{switch(i){{" + "".join(names) + '}return "";}')
+    print(f"ouro_v *ouro_export_value{mod}(int i){{switch(i){{" + "".join(values) + "}return 0;}")
+    raise SystemExit(0)
 sys.stdout.write("typedef struct ouro_v ouro_v;\n")
 sys.stdout.write("typedef struct ouro_env ouro_env;\n")
 sys.stdout.write("static ouro_v *fake_generated(void){return 0;}\n")
@@ -186,8 +270,49 @@ def test_frontend_final_and_tu_cache(tmp: Path) -> None:
 
     output = repo / "_build/test_driver.c"
     expected = output.read_bytes()
+    parallel = list(common)
+    parallel[parallel.index("--out") + 1] = "_build/test_driver_parallel.c"
+    parallel[parallel.index("--work") + 1] = "_build/test_fe_parallel"
+    parallel[parallel.index("--jobs") + 1] = "2"
+    parallel.append("--no-cache")
+    parallel_env = {**env, "FAKE_OURO1_LOG": str(tmp / "parallel-ouro1.log")}
+    parallel_result = run(repo, parallel, parallel_env)
+    assert f"tu_misses={EXPECTED_FRONTEND_TUS}" in parallel_result.stdout, parallel_result.stdout
+    assert (repo / "_build/test_driver_parallel.c").read_bytes() == expected
+    parallel_report = json.loads((repo / "_build/test_fe_parallel/frontend-regeneration.json").read_text())
+    assert [row["tag"] for row in parallel_report["units"]] == [spec[0] for spec in frontend_regen.FRONTEND_TUS]
+    for index, arity in enumerate((7, 2, 2, 1)):
+        gid = 900 + index
+        assignment = f"ouro_pl_c{gid}=ouro_wrap_module_pure_scope(ouro_clos(ouro_pl_f{gid}_,env),{arity});"
+        assert assignment.encode() in expected, "split pipeline scope was not packed"
+    for gid, wrapper in ((904, "ouro_wrap_module_maps_for_scope"),
+                         (905, "ouro_wrap_module_rewrite_decls_scope"),
+                         (906, "ouro_wrap_module_rewrite_decls_scope"),
+                         (907, "ouro_wrap_module_scope_maps_scope"),
+                         (908, "ouro_wrap_module_bare_ctors_scope"),
+                         (909, "ouro_wrap_module_invalid_maps_scope")):
+        assignment = f"ouro_pl_c{gid}={wrapper}(ouro_clos(ouro_pl_f{gid}_,env));"
+        assert assignment.encode() in expected, "split prefix scope was not packed"
+    assignment = "ouro_pl_c910=ouro_wrap_module_pure_scope(ouro_clos(ouro_pl_f910_,env),7);"
+    assert assignment.encode() in expected, "split module rewrite unit scope was not packed"
+    for gid, wrapper in ((911, "ouro_wrap_module_maps_for_scope"),
+                         (912, "ouro_wrap_module_pure_scope")):
+        raw = f"ouro_clos(ouro_pl_f{gid}_,env)"
+        wrapped = f"{wrapper}({raw},7)" if gid == 912 else f"{wrapper}({raw})"
+        assert f"ouro_pl_c{gid}={wrapped};".encode() in expected, "cached module scope was not packed"
+    lookup = "ouro_clos(ouro_lo_f900_,env)"
+    if frontend_regen.lower_ctor_lookup_capability(
+            (repo / "runtime/frontend_link.c").read_text(encoding="utf-8")):
+        lookup = f"ouro_wrap_lower_ctor_lookup({lookup})"
+    assert f"ouro_lo_c900={lookup};".encode() in expected, "split lower ctor lookup was not packed"
+    local_lookup = "ouro_clos(ouro_lo_f901_,env)"
+    if frontend_regen.module_lookup_capability(
+            (repo / "runtime/frontend_link.c").read_text(encoding="utf-8")):
+        local_lookup = f"ouro_wrap_module_lookup({local_lookup})"
+    assert f"ouro_lo_c901={local_lookup};".encode() in expected, "split lower local lookup was not packed"
     second = run(repo, common, env)
     assert "final cache-hit" in second.stdout, second.stdout
+    assert output.read_bytes() == expected
     assert count_lines(log) == EXPECTED_FRONTEND_TUS, "final fast-path must not invoke ouro1"
 
     final_cache, = (repo / "_cache_test/gen/frontend-final").glob("driver_*.c")
@@ -272,6 +397,18 @@ def test_frontend_final_and_tu_cache(tmp: Path) -> None:
         assert frontend_regen.cached_output_matches(pack_cache, pack_key), damage
 
 
+    packer = repo / "scripts/pack_frontend.py"
+    saved = packer.stat()
+    packer.write_text(packer.read_text(encoding="utf-8") + "\n# invalidate pure-scope installer\n", encoding="utf-8")
+    os.utime(packer, ns=(saved.st_atime_ns, saved.st_mtime_ns))
+    before = count_lines(log)
+    run(repo, common, env)
+    rebuilt = current_report()
+    assert rebuilt["summary"]["tu_misses"] == EXPECTED_FRONTEND_TUS
+    assert count_lines(log) == before + EXPECTED_FRONTEND_TUS
+    assert output.read_bytes() == expected
+
+
 def test_stage_loop_input_fast_path(tmp: Path) -> None:
     repo = tmp / "stage_repo"
     copy_repo(repo)
@@ -314,6 +451,65 @@ def test_stage_loop_input_fast_path(tmp: Path) -> None:
     assert result["fast_path"] is True and result["pass"] is True
 
 
+def parser_unit_fixture() -> str:
+    parts = []
+    for gid, tokens, position in (("2338", "0", "2"), ("2352", "1", "3")):
+        parts.extend((
+            "static ouro_v *ouro_f0_0_" + gid + "_(ouro_env *env0,ouro_v *arg){"
+            "ouro_env *env=ouro_cons(arg,env0);(void)env;"
+            "return ouro_ctor(0,3,(ouro_v *[]){ouro_ctor(0,0,0),ouro_get(env," + tokens + "),"
+            "ouro_ctor(1,1,(ouro_v *[]){ouro_get(env," + position + ")})});}\n",
+            "static ouro_v *ouro_f0_" + gid + "_(ouro_env *env0,ouro_v *arg){"
+            "ouro_env *env=ouro_cons(arg,env0);(void)env;"
+            "return ouro_clos(ouro_f0_0_" + gid + "_,env);}\n",
+            "static ouro_v *ouro_f" + gid + "_(ouro_env *env0,ouro_v *arg){"
+            "ouro_env *env=ouro_cons(arg,env0);(void)env;"
+            "return ouro_clos(ouro_f0_" + gid + "_,env);}\n",
+            "static ouro_v *ouro_c" + gid + ";\n",
+            "static ouro_v *ouro_g" + gid + "(void){ouro_env *env=0;(void)env;"
+            "if(ouro_c" + gid + "==0){ouro_static_begin();ouro_c" + gid
+            + "=ouro_clos(ouro_f" + gid + "_,env);ouro_static_end();}"
+            "return ouro_c" + gid + ";}\n",
+        ))
+    parts.extend((
+        "int ouro_export_count_x(void){return 2;}\n",
+        'const char *ouro_export_name_x(int i){switch(i){case 0:return "expect_tag";'
+        'case 1:return "expect_keyword";default:return "";}}\n',
+        "ouro_v *ouro_export_value_x(int i){switch(i){case 0:return ouro_g2338();"
+        "case 1:return ouro_g2352();default:return 0;}}\n",
+    ))
+    return "".join(parts)
+
+
+def parser_unit_regressions() -> tuple[tuple[str, str, str, int], ...]:
+    source = parser_unit_fixture()
+    bad_pair = "ouro_ctor(0,3,(ouro_v *[]){ouro_ctor(0,0,0),x,y})"
+    extra = "static ouro_v *other(ouro_env *env,ouro_v *arg){return " + bad_pair + ";}\n"
+    return (
+        ("pl-owned-POk-Unit", "pl", source, 0),
+        ("pl-owned-POk-and-bad-pair", "pl", source + extra, 3),
+        ("lx-owned-POk", "lx", source, 3),
+        ("pl-wrong-capture", "pl", source.replace("ouro_get(env,2)", "ouro_get(env,1)"), 3),
+        ("pl-missing-export", "pl", source.replace('"expect_tag"', '"other"'), 3),
+        ("pl-duplicate-index", "pl", source.replace('case 1:return "expect_keyword";',
+                                                   'case 0:return "expect_keyword";'), 3),
+        ("pl-shared-getter", "pl", source.replace("case 1:return ouro_g2352();",
+                                                 "case 1:return ouro_g2338();"), 3),
+        ("pl-wrong-family", "pl", source.replace("ouro_f0_0_2338_", "ouro_f0_0_23380_"), 3),
+        ("pl-missing-getter", "pl", source.replace("static ouro_v *ouro_g2338(void)",
+                                                  "static ouro_v *other_getter(void)"), 3),
+        ("pl-duplicate-getter-after-table", "pl", source + next(
+            line for line in source.splitlines(keepends=True)
+            if line.startswith("static ouro_v *ouro_g2338(void)")), 3),
+        ("pl-two-candidates", "pl", source + source.splitlines(keepends=True)[0].replace(
+            "ouro_f0_0_2338_", "ouro_f9_2338_"), 3),
+        ("pl-wrong-getter-result", "pl", source.replace("return ouro_c2338;", "return ouro_c2352;"), 3),
+        ("pl-other-capture-pair", "pl", source.replace("ouro_get(env,0)", "ouro_get(env,2)").replace("ouro_get(env,2)})", "ouro_get(env,4)})"), 3),
+        ("pl-owned-POk-and-Err5", "pl", source +
+         "ouro_ctor(0,1,(ouro_v *[]){ouro_err(5)})\n", 3),
+    )
+
+
 def test_strict_packer(tmp: Path) -> None:
     run(ROOT, [sys.executable, "scripts/pack_frontend.py", "--selftest"], os.environ.copy())
     source = tmp / "pack-input.c"
@@ -324,12 +520,23 @@ def test_strict_packer(tmp: Path) -> None:
     cases = (
         ("nested-type", "lx", "ouro_ctor(1,1,(ouro_v *[]){ouro_ctor(0,1,(ouro_v *[]){ouro_err(5)})})", 3),
         ("dummy-triple", "lx", triple, 3),
-        ("parser-unit", "pa", triple, 0),
+        *(("parser-unit-" + suffix, suffix, triple, 0)
+          for suffix in ("pa", "pb", "pf")),
+        ("pipeline-unowned-unit", "pl", triple, 3),
+        *(("parser-type-" + suffix, suffix,
+           "ouro_ctor(0,4,(ouro_v *[]){ouro_err(5)," + unit + ",x,y})", 3)
+          for suffix in ("pa", "pb", "pf", "pl")),
+        *parser_unit_regressions(),
+        ("pipeline-poly-type", "pl",
+         'const char *ouro_export_name_x(int i){switch(i){case 0:return "length";default:return "";}}\n'
+         "ouro_v *ouro_export_value_x(int i){switch(i){case 0:return ouro_g1();default:return 0;}}\n"
+         "ouro_app(ouro_app(ouro_g1(),ouro_err(5)),x)", 3),
         ("clean", "lx", "ouro_ctor(1,2,(ouro_v *[]){x,y})", 0),
         ("malformed-prefix", "lx", ")ouro_ctor(0,1,(ouro_v *[]){ouro_err(5)})", 3),
     )
     for name, suffix, body, status in cases:
-        source.write_text(header + body + "\n", encoding="utf-8")
+        prefix = "" if "ouro_export_count_x" in body else header
+        source.write_text(prefix + body + "\n", encoding="utf-8")
         output.write_bytes(b"previous output\n")
         result = subprocess.run(
             [sys.executable, "scripts/pack_frontend.py", "--strict", "-o", str(output),
@@ -342,7 +549,7 @@ def test_strict_packer(tmp: Path) -> None:
             assert output.read_bytes() == b"previous output\n", name
         else:
             assert not result.stderr and "mode=strict" in result.stdout, (name, result)
-            assert body in output.read_text(encoding="utf-8"), name
+            assert pack_frontend.prefix_blob(body, suffix) in output.read_text(encoding="utf-8"), name
     output.unlink()
     rejected = subprocess.run(
         [sys.executable, "scripts/pack_frontend.py", "--strict", "-o", str(output),
@@ -351,12 +558,65 @@ def test_strict_packer(tmp: Path) -> None:
     )
     assert rejected.returncode == 3 and not output.exists(), rejected
 
+    scoped = parser_unit_fixture().replace('"expect_', '"_ouro_m_17_expect_')
+    command = [sys.executable, "scripts/pack_frontend.py", "--strict", "-o", str(output), f"pl:{source}"]
+    mixed = scoped.replace('"_ouro_m_17_expect_tag"', '"expect_tag"')
+    bad_pair = "ouro_ctor(0,3,(ouro_v *[]){ouro_ctor(0,0,0),x,y})"
+    for body, ordinal, status in ((scoped, "17", 0), (scoped, "18", 3), (scoped, None, 3),
+                                  (mixed, "17", 3), (scoped + bad_pair, "17", 3)):
+        source.write_text(body, encoding="utf-8")
+        output.write_bytes(b"previous output\n")
+        options = ["--parser-min-ordinal", ordinal] if ordinal is not None else []
+        result = subprocess.run(command + options, cwd=ROOT, capture_output=True, text=True, check=False)
+        assert result.returncode == status, result
+        if status:
+            assert "STRICT FAIL leftover_type_apps=" in result.stderr, result
+            assert output.read_bytes() == b"previous output\n"
+        else:
+            assert pack_frontend.prefix_blob(scoped, "pl") in output.read_text(encoding="utf-8")
+
+
+def test_multi_piece_packer_output(tmp: Path) -> None:
+    first = tmp / "first.c"
+    second = tmp / "second.c"
+    output = tmp / "multi-pack.c"
+    first.write_bytes(b"int ouro_export_count_lx(void){return 0;}\r\n"
+                      b"static ouro_v *ouro_g1(void){return 0;}\r\n/* \xc3\xa9\xff */\r\n")
+    second.write_bytes(b"int ouro_export_count_pr(void){return 0;}\r"
+                       b"static ouro_v *ouro_g2(void){return 0;}")
+    expected = (
+        b"/* Generated frontend pack: split O8 cones, prefixed statics.\n"
+        b"   Do not hand-edit. Regenerate with scripts/emit_frontend.sh. */\n"
+        b"\n/* ---- frontend TU module=lx ---- */\n"
+        b"int ouro_export_count_lx(void){return 0;}\n"
+        b"static ouro_v *ouro_lx_g1(void){return 0;}\n/* \xc3\xa9\xff */\n\n"
+        b"\n/* ---- frontend TU module=pr ---- */\n"
+        b"int ouro_export_count_pr(void){return 0;}\n"
+        b"static ouro_v *ouro_pr_g2(void){return 0;}\n"
+    ).replace(b"\n", os.linesep.encode("ascii"))
+    command = [sys.executable, "scripts/pack_frontend.py", "--strict", "-o", str(output),
+               f"lx:{first}", f"pr:{second}"]
+    result = subprocess.run(command, cwd=ROOT, capture_output=True, text=True, check=False)
+    assert result.returncode == 0 and result.stderr == "", result
+    assert output.read_bytes() == expected
+
+    first.write_bytes(first.read_bytes() + b"ouro_ctor(0,1,(ouro_v *[]){ouro_err(5)})\n")
+    rejected = subprocess.run(command, cwd=ROOT, capture_output=True, text=True, check=False)
+    assert rejected.returncode == 3 and "STRICT FAIL leftover_type_apps=1" in rejected.stderr, rejected
+    assert output.read_bytes() == expected
+
+    second.write_bytes(b"/* no export table */\n")
+    invalid = subprocess.run(command, cwd=ROOT, capture_output=True, text=True, check=False)
+    assert invalid.returncode == 2 and invalid.stderr == f"pack_frontend: {second} has no export table\n", invalid
+    assert output.read_bytes() == expected
+
 
 def main() -> int:
     test_native_stack_limits()
     with tempfile.TemporaryDirectory(prefix="ouro-stage-loop-suite-") as d:
         tmp = Path(d)
         test_strict_packer(tmp)
+        test_multi_piece_packer_output(tmp)
         test_frontend_final_and_tu_cache(tmp)
         test_stage_loop_input_fast_path(tmp)
     print("STAGE_LOOP_FRONTEND_REGEN_SUITE: PASS")

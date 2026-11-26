@@ -1,0 +1,67 @@
+import "bounded_report.ouro",
+  "../../std/process.ouro",
+  "../../std/result.ouro";
+
+inductive NativeFamilyQueryError : Type :=
+  | NativeFamilyQueryRaw : BoundedNativeReportError -> NativeFamilyQueryError
+  | NativeFamilyQueryMissing : NativeFamilyQueryError
+  | NativeFamilyQueryMalformed : NativeFamilyQueryError
+  | NativeFamilyQueryNames : NativeFamilyQueryError
+  | NativeFamilyQueryStderr : NativeFamilyQueryError
+  | NativeFamilyQueryExit : Nat -> NativeFamilyQueryError
+  | NativeFamilyQueryInconsistent : NativeFamilyQueryError;
+
+def native_family_query_frame_from (stream : ProcessCaptureStream) (text : String) (start : Nat)
+    : Either BoundedNativeReportError Unit :=
+    bounded_native_report_fold_lines Unit Unit stream (BoundedNativeReportNewline stream)
+      (fun (_ : String) (_ : Unit) => MkUnit) (fun (_ : Unit) => MkUnit)
+      text (sub (str_len text) start) start MkUnit;
+
+def native_family_query_output (text : String)
+    : Either BoundedNativeReportError (Maybe String) :=
+    if str_null text then Right BoundedNativeReportError (Maybe String) (Nothing String)
+    else
+      let? (Left, Right) : Either BoundedNativeReportError (Maybe String) do
+        let row : Pair String Nat := (bounded_native_report_line CaptureStdout text Z)?;
+        (native_family_query_frame_from CaptureStdout text (snd String Nat row))?;
+        if eq_nat (snd String Nat row) (str_len text)
+        then Just String (fst String Nat row) else Nothing String
+      end;
+
+-- Capture failures and producer identity remain with the process owner.
+def native_family_query_observe (result : ProcResult) : Either NativeFamilyQueryError String :=
+    let (MkProcResult code output errors) := result in
+    if notb (bounded_native_report_size_valid (str_len output) (str_len errors)) then
+      Left NativeFamilyQueryError String (NativeFamilyQueryRaw BoundedNativeReportByteLimit)
+    else if notb (ltb_nat code process_capture_u32_bound) then
+      Left NativeFamilyQueryError String (NativeFamilyQueryRaw (BoundedNativeReportStatus code))
+    else
+      let? (Left, Right) : Either NativeFamilyQueryError String do
+        let line : Maybe String := (mapLeft BoundedNativeReportError (Maybe String)
+          NativeFamilyQueryError NativeFamilyQueryRaw (native_family_query_output output))?;
+        (mapLeft BoundedNativeReportError Unit NativeFamilyQueryError NativeFamilyQueryRaw
+          (native_family_query_frame_from CaptureStderr errors Z))?;
+        let metadata : String := (match line with
+          | Nothing => Left NativeFamilyQueryError String
+              (if str_null output then NativeFamilyQueryMissing else NativeFamilyQueryMalformed)
+          | Just row => match str_strip_prefix row "ANALYZE_FAMILIES families=" with
+            | Nothing => Left NativeFamilyQueryError String NativeFamilyQueryMalformed
+            | Just names => Right NativeFamilyQueryError String names
+            end
+          end)?;
+        (result_require NativeFamilyQueryError NativeFamilyQueryNames
+          (andb(notb (str_null metadata), bounded_drive_families_valid metadata)))?;
+        (result_require NativeFamilyQueryError NativeFamilyQueryStderr (str_null errors))?;
+        (result_require NativeFamilyQueryError (NativeFamilyQueryExit code) (eq_nat code Z))?;
+        metadata
+      end;
+
+-- Compare existing captures in exact CSV order; no repeated query is required.
+def native_family_query_consistent (earlier : ProcResult) (later : ProcResult)
+    : Either NativeFamilyQueryError String :=
+    let? (Left, Right) : Either NativeFamilyQueryError String do
+      let before : String := (native_family_query_observe earlier)?;
+      let after : String := (native_family_query_observe later)?;
+      (result_require NativeFamilyQueryError NativeFamilyQueryInconsistent (str_eq before after))?;
+      before
+    end;

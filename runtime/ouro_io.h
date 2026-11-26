@@ -1,4 +1,4 @@
-/* C host IO / string prims for std/runtime.ouro. Host only. */
+/* C host primitives for std/runtime.ouro and std/string_prims.ouro. */
 #ifndef OURO_IO_H
 #define OURO_IO_H
 

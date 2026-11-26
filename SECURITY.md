@@ -2,34 +2,28 @@
 
 ## Supported versions
 
-Until tagged release support is announced, security fixes target the current
-`main` branch. See [Stability](docs/stability.md) for pre-1.0 compatibility.
-
-A future security advisory will identify affected tags and state whether a
-backport is available. No compatibility or patch-support window should be
-inferred from the repository version alone.
+Security fixes target `main` until the project announces support for tagged
+releases. Consult individual advisories for affected tags and backport
+availability. See the [pre-1.0 compatibility policy](docs/stability.md).
 
 ## Reporting a vulnerability
 
 Do not open a public issue for a suspected vulnerability.
 
-Use GitHub Private Vulnerability Reporting from the repository's **Security**
-tab, or the **Security vulnerability** contact link in the issue chooser. This
-creates a private advisory visible to the maintainers.
+Use [GitHub Private Vulnerability Reporting](https://github.com/eluvane/ouro/security/advisories/new).
+The **Security vulnerability** contact in the issue chooser opens the same
+form. GitHub shares the report with the repository maintainers.
 
-Include, when available:
+Include the available details.
 
-- the affected commit or tag;
-- the operating system and toolchain;
-- a minimal input and the exact command;
-- the observed impact;
-- whether the issue involves the kernel, runtime, generated artifacts,
-  packages, workflows, or release files;
-- logs or reports that do not contain unrelated secrets.
+- Affected commit or tag
+- Operating system and toolchain version
+- Minimal input and exact command
+- Observed impact and the affected component
+- Relevant logs with unrelated secrets removed
 
-Maintainers will confirm receipt and coordinate investigation and disclosure
-through the private advisory. Ouro does not currently promise a fixed response
-SLA, but reporters will be told when the issue can be disclosed safely.
+Maintainers confirm receipt, coordinate the investigation in the private
+advisory, and tell reporters when disclosure can proceed. Response times vary.
 
 ## Scope
 

@@ -86,9 +86,9 @@ def mir_check_bounds (limits : MirLimits) (program : MirProgram) : Either MirErr
           match mir_count_data objects bytes with | Left err => Left MirError Unit err
           | Right _ => Right MirError Unit MkUnit end end end end end end end;
 
--- Merge singleton runs to check uniqueness in O(n log n) comparisons and
--- temporary list cells. A quadratic elem scan exhausted the previous runtime's
--- bounded arena on an otherwise small 3072-local stack-probing fixture.
+-- Merging singleton runs bounds duplicate detection to O(n log n) comparisons
+-- and temporary list cells. This avoids quadratic scans in large local
+-- namespaces such as the 3072-local stack-probing fixture.
 def mir_merge_ids (make_error : Nat -> MirError) (left : List Nat) (right : List Nat)
     : Either MirError (List Nat) :=
     (fix go (fuel : Nat) (a : List Nat) (b : List Nat) : Either MirError (List Nat) :=
@@ -143,11 +143,21 @@ def mir_check_libraries : List MirLibrary -> Either MirError Unit :=
         mir_checks ([mir_require(andb(pe_name_valid name, notb (nullb MirExtern externs)), MirInvalidName 0),
           mir_require (notb (any MirLibrary (fun (other : MirLibrary) => match other with
             | MirLibraryDef other_name _ => pe_library_equal name other_name end) rest)) (MirInvalidName 0),
-          mir_each MirExtern (fun (external : MirExtern) => match external with | MirExternDef _ id label _ =>
-            mir_require (andb (pe_name_valid label)
-              (match filter MirExtern (fun (other : MirExtern) => match other with
-                | MirExternDef _ _ other_label _ => pe_bytes_equal label other_label end) externs with
-                | Nil => False | Cons _ remaining => nullb MirExtern remaining end)) (MirInvalidName id) end) externs,
+          -- A matching earlier name would have failed its own check.
+          (fix check_names (pending : List MirExtern) : Either MirError Unit :=
+            match pending with
+            | Nil => Right MirError Unit MkUnit
+            | Cons external tail => match external with | MirExternDef _ id label _ =>
+              match pe_name_valid label with
+              | False => Left MirError Unit (MirInvalidName id)
+              | True =>
+                match find MirExtern (fun (other : MirExtern) => match other with
+                  | MirExternDef _ _ other_label _ => pe_bytes_equal label other_label end) tail with
+                | Nothing => check_names tail
+                | Just _ => Left MirError Unit (MirInvalidName id)
+                end
+              end end
+            end) externs,
           mir_check_libraries rest] : List (Either MirError Unit)) end end;
 
 def mir_check_function_with
@@ -184,8 +194,9 @@ def mir_check_program_with
     (limits : MirLimits) (program : MirProgram) : Either MirError Unit :=
     match mir_check_bounds limits program with | Left err => Left MirError Unit err | Right _ =>
       match program with | MirProgramDef functions objects libraries _ => match limits with | MirLimitsWith _ _ flow =>
-        match mir_checks ([mir_unique(fun (id : Nat) => MirDuplicateSymbol id, mir_global_ids program),
-          mir_each(Nat, fun (id : Nat) => mir_require(ltb_nat id pe_max_rva, MirResourceExhausted), mir_global_ids program),
+        let global_ids : List Nat := mir_global_ids program in
+        match mir_checks ([mir_unique(fun (id : Nat) => MirDuplicateSymbol id, global_ids),
+          mir_each(Nat, fun (id : Nat) => mir_require(ltb_nat id pe_max_rva, MirResourceExhausted), global_ids),
           mir_each MirData mir_check_data objects, mir_check_libraries libraries,
           mir_check_entry program, mir_each MirFunction (check_function program flow) functions]
           : List (Either MirError Unit)) with

@@ -14,6 +14,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+from local_scheduler import JOBS_ENV, bounded_jobs
 from ourosmith import ROOT
 from ourosmith.host import environment, job_count, shell
 from ourosmith.limits import run_limited
@@ -31,14 +32,15 @@ def command_environment():
 def run_checks(files: list[str], out: Path, jobs: int) -> dict:
     started = time.perf_counter()
     out.mkdir(parents=True, exist_ok=True)
-    jobs = min(10, max(1, jobs), max(1, len(files) - 1)) if os.name == "nt" else 1
+    jobs = min(10, bounded_jobs(max(1, jobs)), max(1, len(files) - 1)) if os.name == "nt" else 1
     env, sh = command_environment(), shell().as_posix()
+    worker_env = {**env, JOBS_ENV: "1", "OURO_JOBS": "1", "OURO_FRONTEND_JOBS": "1"}
     memory = 3072 if os.name == "nt" else 2944
 
-    def check(item):
+    def check(item, *, child_env=env):
         index, path = item
         argv = [sh, "scripts/ouro1.sh", "check", path, "200000"]
-        result = run_limited(argv, cwd=ROOT, env=env, timeout_s=300, memory_mb=memory)
+        result = run_limited(argv, cwd=ROOT, env=child_env, timeout_s=300, memory_mb=memory)
         status = "PASS" if result.ok else "TIMEOUT" if result.status == "timeout" else "FAIL"
         log = out / f"{index:02}-{Path(path).stem}.log"
         row = {"file": path, "command": argv, "status": status,
@@ -62,7 +64,7 @@ def run_checks(files: list[str], out: Path, jobs: int) -> dict:
         for item in solo:
             completed[item[0]] = check(item)
         with ThreadPoolExecutor(max_workers=jobs) as pool:
-            for item, row in zip(pooled, pool.map(check, pooled), strict=True):
+            for item, row in zip(pooled, pool.map(lambda item: check(item, child_env=worker_env), pooled), strict=True):
                 completed[item[0]] = row
         rows = [completed[index] for index in range(len(files))]
     passed = len(rows) == len(files) and all(row["status"] == "PASS" for row in rows)

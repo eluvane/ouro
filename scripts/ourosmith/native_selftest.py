@@ -6,14 +6,16 @@ import copy
 import hashlib
 import io
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
+from threading import Event
 from types import SimpleNamespace
 from unittest.mock import patch
 
 from ourosmith import ROOT
-from ourosmith.core.run import CONTROLS, NEGATIVES, OPERATIONS, RELATIONS, CoreConfig, Failure, inspect_result, read_recipe, recipe, shrink
+from ourosmith.core.run import CONTROLS, NEGATIVES, OPERATIONS, RELATIONS, CoreConfig, CoreRunner, Failure, inspect_result, read_recipe, recipe, shrink
 from ourosmith.limits import RunResult
 
 
@@ -148,12 +150,13 @@ class NativeHarnessTests(unittest.TestCase):
         return CoreConfig([1], "pr", 1, 1, 0)
 
     def test_complete_native_protocol_and_empty_form_depth(self):
-        coverage, failure = inspect_result(wire(), 1, self.config())
-        self.assertIsNone(failure)
-        self.assertEqual(coverage, {"definitions": 1, "families": [0], "references": [], "forms": [0], "rel_target": 1})
-        coverage, failure = inspect_result(wire(success_stdout(depth=0)), 1, CoreConfig([1], "pr", 0, 1, 0))
-        self.assertIsNone(failure)
-        self.assertEqual(coverage["forms"], [])
+        with patch("ourosmith.core.run.re.fullmatch", side_effect=AssertionError("dynamic pattern on a successful result")):
+            coverage, failure = inspect_result(wire(), 1, self.config())
+            self.assertIsNone(failure)
+            self.assertEqual(coverage, {"definitions": 1, "families": [0], "references": [], "forms": [0], "rel_target": 1})
+            coverage, failure = inspect_result(wire(success_stdout(depth=0)), 1, CoreConfig([1], "pr", 0, 1, 0))
+            self.assertIsNone(failure)
+            self.assertEqual(coverage["forms"], [])
 
     def test_native_protocol_rejects_missing_duplicate_reordered_and_unknown_rows(self):
         rows = success_stdout().splitlines()
@@ -175,6 +178,23 @@ class NativeHarnessTests(unittest.TestCase):
                 _, failure = inspect_result(wire(stdout), 1, self.config())
                 self.assertEqual(failure.prop, "native-protocol")
 
+    def test_native_protocol_preserves_exact_first_mismatch(self):
+        value = success_stdout()
+        for valid, changed, step in (
+            ("ok smith seed=1 domain=2", "ok smith seed=1 domain=2 ", "domain=2"),
+            ("ok smith seed=1 generated=400 family=0 references=",
+             "ok smith seed=2 generated=400 family=0 references=", "generated=400"),
+            ("forms seed=1 selected=0", "forms seed=1 selected=0,", "forms=400"),
+            ("ok smith seed=1 negative=rel-out-of-scope target=1",
+             "ok smith seed=1 negative=rel-out-of-scope target=1a", "negative=rel-out-of-scope"),
+        ):
+            with self.subTest(step=step):
+                changed_output = value.replace(valid + "\n", changed + "\n").replace("ok compiler-smith complete", "bad terminal")
+                coverage, failure = inspect_result(wire(changed_output), 1, self.config())
+                self.assertEqual(coverage, {})
+                self.assertEqual((failure.prop, failure.classification, failure.detail),
+                                 ("native-protocol", "oracle-unavailable", f"unexpected result at {step}: {changed}"))
+
     def test_native_process_failure_never_satisfies_a_semantic_expectation(self):
         for status, code, classification in (("timeout", None, "timeout"), ("memory", None, "memory"),
                                               ("ok", 0xC0000005, "crash"), ("spawn-error", None, "oracle-unavailable")):
@@ -182,6 +202,61 @@ class NativeHarnessTests(unittest.TestCase):
             self.assertEqual(failure.classification, classification)
         for result in (wire(stderr="unexpected"), wire(code=1), wire(code=2)):
             self.assertIsNotNone(inspect_result(result, 1, self.config())[1])
+
+    def test_core_seed_pool_preserves_ordered_findings_and_shrink_evidence(self):
+        from ourosmith.native import save_result
+        from ourosmith.report import Report
+
+        seeds = [11, 22, 11, 33]
+        config = CoreConfig(seeds, "pr", 2, 1, 1)
+        reports = []
+        for jobs in (1, 20):
+            with self.subTest(jobs=jobs), tempfile.TemporaryDirectory() as temporary:
+                work = Path(temporary)
+                later_finished = Event()
+
+                def run(arguments, label, timeout_s, *, jobs=jobs, later_finished=later_finished, work=work):
+                    self.assertEqual(timeout_s, 20)
+                    seed = int(arguments[arguments.index("--seed") + 1])
+                    depth = int(arguments[arguments.index("--depth") + 1])
+                    stdout = success_stdout(seed=seed, depth=depth)
+                    if seed == 33:
+                        result = wire(stdout)
+                    else:
+                        prefix = stdout.split(f"ok smith seed={seed} negative=coverage\n", 1)[0]
+                        result = wire(prefix, stderr=f"not ok compiler-smith seed={seed} negative=coverage coverage accepted input={depth}\n", code=1)
+                    result.elapsed_s, result.peak_rss_mb = 1, seed
+                    if jobs == 20 and label == "seeds/0-11/attempt-1":
+                        self.assertTrue(later_finished.wait(timeout=5), "seed 22 did not run alongside seed 11")
+                    save_result(work / label, result)
+                    if label == "seeds/1-22/attempt-2":
+                        later_finished.set()
+                    return result
+
+                program = SimpleNamespace(work=work, memory_mb=64, run=run)
+                report = Report(profile="pr", generator_hash="frozen", seeds=seeds, command="selftest")
+                with patch("ourosmith.core.run.ROOT", work), patch("ourosmith.core.run.job_count", return_value=jobs), \
+                     patch.dict(os.environ, {"OURO_SCHEDULER_MEMORY_MIB": "128"}):
+                    CoreRunner(config, report, program, log=lambda _: None).run()
+
+                self.assertEqual([finding.seed for finding in report.findings], [11, 22, 11])
+                self.assertEqual([finding.minimal_input["depth"] for finding in report.findings], [0, 0, 0])
+                self.assertEqual([finding.actual for finding in report.findings], ["coverage accepted input=0"] * 3)
+                for ordinal, seed in enumerate(seeds):
+                    seed_work = work / "seeds" / f"{ordinal}-{seed}"
+                    expected_names = ["attempt-1.json"] if seed == 33 else ["attempt-1.json", "attempt-2.json"]
+                    self.assertEqual(sorted(path.name for path in seed_work.glob("attempt-*.json")), expected_names)
+                for finding in report.findings:
+                    finding_path = work / finding.replay.split("--finding ", 1)[1]
+                    self.assertEqual(json.loads(finding_path.read_text(encoding="utf-8")), finding.to_json())
+
+                self.assertEqual(report.timing["kernel.process_s"], 7)
+                self.assertEqual(report.timing["kernel.peak_memory_mib"], 33)
+                self.assertEqual(report.timing["kernel.scheduler.peak_tasks"], 1 if jobs == 1 else 2)
+                self.assertEqual(report.layer("kernel").coverage["definitions"], 1)
+                self.assertFalse(report.passed)
+                reports.append(report.body())
+        self.assertEqual(reports[0], reports[1])
 
     def test_semantic_failure_requires_the_exact_next_property_and_reason(self):
         value = success_stdout()
@@ -260,7 +335,14 @@ Other.smith_negative_body "qualified" typ body fault
     def test_native_inventory_retains_new_source_items_and_separate_owners(self):
         from ourosmith.inventory import code_strategies, compare, source_inventory
 
-        value, strategies = source_inventory(), code_strategies()
+        with patch.object(Path, "open", autospec=True, side_effect=Path.open) as reads:
+            value = source_inventory()
+        self.assertEqual([call.args[0].relative_to(ROOT).as_posix() for call in reads.call_args_list], [
+            "compiler/core.ouro", "compiler/file_check_model.ouro", "compiler/primitive_model.ouro",
+            "runtime/frontend_link.c", "tools/lint_host.ouro", "compiler/ast.ouro", "tools/analyze/ast.ouro",
+            "compiler/token.ouro",
+        ])
+        strategies = code_strategies()
         with patch("ourosmith.inventory.surface_inventory.compare", return_value=[]):
             self.assertEqual(compare(value, strategies), [])
             grown = copy.deepcopy(value)
@@ -276,9 +358,24 @@ Other.smith_negative_body "qualified" typ body fault
         for primitive, owner in (("PrimitiveStdoutWrite", "compiler_primitive_registry_tests"),
                                  ("PrimitiveFileRename", "compiler_primitive_registry_tests"),
                                  ("PrimitiveFileReplace", "compiler_primitive_registry_tests"),
-                                 ("PrimitiveProcessBounded", "compiler_process_bounded_registry_tests")):
+                                 ("PrimitiveProcessBounded", "compiler_process_bounded_registry_tests"),
+                                 ("PrimitiveProcessBoundedAt", "compiler_process_bounded_registry_tests")):
             self.assertEqual(kernel["external_owners"][primitive], "tests/" + owner + ".ouro")
             self.assertNotIn(primitive, kernel["primitives"])
+        primitive = "PrimitiveManagedAllocatedRequestedBytes"
+        self.assertIn(primitive, value["primitives"])
+        self.assertEqual(kernel["external_owners"][primitive], "scripts/frontend_host_suite.py")
+        self.assertNotIn(primitive, kernel["primitives"])
+        with patch("ourosmith.inventory.surface_inventory.compare", return_value=[]):
+            missing = copy.deepcopy(strategies)
+            del missing["layers"]["kernel"]["external_owners"][primitive]
+            self.assertIn(f"primitives {primitive} has no native strategy or explicit canonical suite owner",
+                          compare(value, missing))
+            for owner in ("tests/compiler_managed_heap_observer_tests.ouro", "scripts/ci_gate.py"):
+                changed = copy.deepcopy(strategies)
+                changed["layers"]["kernel"]["external_owners"][primitive] = owner
+                self.assertIn(f"external canonical owner is missing or changed for {primitive}",
+                              compare(value, changed))
 
     def test_retained_protocol_preserves_exact_inventory_and_nonzero_semantics(self):
         from ourosmith.corpus import RETAINED_LAWS, inspect_retained
@@ -314,6 +411,46 @@ Other.smith_negative_body "qualified" typ body fault
             run_corpus(value, None, directory=ROOT / "_build/empty-native-corpus")
         self.assertFalse(value.passed)
         self.assertTrue(value.blocking_gaps)
+
+    def test_corpus_recipes_with_the_same_seed_keep_separate_protocols(self):
+        from ourosmith.corpus import CORPUS_KIND, RETAINED_LAWS, run_corpus, write_case
+        from ourosmith.native import save_result
+        from ourosmith.report import Report
+
+        cases = (("alpha", 1), ("beta", 2))
+        report = Report(profile="pr", generator_hash="frozen", seeds=[], command="test")
+        retained = wire("".join(f"PASS {name}\n" for name in RETAINED_LAWS) + "COMPILER_RETAINED: PASS\n")
+        with (tempfile.TemporaryDirectory() as temporary,
+              patch("ourosmith.core.run.generator_hash", return_value="frozen")):
+            directory = Path(temporary) / "corpus"
+            work = Path(temporary) / "kernel"
+
+            def run(arguments, label, _timeout):
+                seed = int(arguments[arguments.index("--seed") + 1])
+                depth = int(arguments[arguments.index("--depth") + 1])
+                result = wire(success_stdout(seed=seed, depth=depth))
+                result.argv = arguments
+                save_result(work / label, result)
+                return result
+
+            for name, depth in cases:
+                config = CoreConfig([1], "pr", depth, 1, 0)
+                write_case(directory / f"{name}.json", {
+                    "kind": CORPUS_KIND, "name": name, "recipe": recipe(config, 1, "frozen"),
+                    "expect": "all-native-properties-hold", "origin": {"property": "coverage"},
+                })
+            run_corpus(report, SimpleNamespace(run=lambda *_args: retained), directory=directory,
+                       smith_program=SimpleNamespace(run=run))
+
+            self.assertTrue(report.passed)
+            self.assertEqual(report.layer("kernel-corpus").coverage["recipes"], {"alpha": 1, "beta": 1})
+            for name, depth in cases:
+                path = work / "recipes" / f"case-{name}" / "attempt-1"
+                raw = json.loads(path.with_suffix(".json").read_text(encoding="utf-8"))
+                self.assertEqual(raw["argv"], ["--profile", "pr", "--seed", "1", "--count", "1",
+                                               "--depth", str(depth), "--max-defs", "1"])
+                self.assertEqual(path.with_suffix(".stdout").read_text(encoding="utf-8"), success_stdout(depth=depth))
+                self.assertEqual(path.with_suffix(".stderr").read_text(encoding="utf-8"), "")
 
     @contextlib.contextmanager
     def receipt_fixture(self):

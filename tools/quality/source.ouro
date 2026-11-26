@@ -15,10 +15,7 @@ def quality_child (dir : String) (name : String) : String :=
     match prim_string_length dir with
     | Z => name
     | S _ =>
-        match prim_string_eq dir "." with
-        | True => name
-        | False => concat(dir, concat "/" name)
-        end
+        if prim_string_eq dir "." then name else concat(dir, concat "/" name)
     end;
 
 def quality_skip_names : List String :=
@@ -46,33 +43,28 @@ def quality_walk_go (skip : String -> Bool) (keep : String -> Bool)
             (Left(QualityInputError, List String, QualityWalkExhausted path))
         | S fuel2 =>
             do let! kind := prim_fs_kind path;
-               match eq_nat(kind, S Z) with
-               | True =>
-                   match andb(prim_string_ends path ".ouro", keep path) with
-                   | True => go fuel2 rest (Cons String path rev)
-                   | False => go fuel2 rest rev
-                   end
-               | False =>
-                   match eq_nat(kind, S (S Z)) with
-                   | False => io_pure (Either(QualityInputError, List String))
-                       (Left(QualityInputError, List String, QualityInvalidInput path))
-                   | True =>
-                       do let! listable := prim_fs_listable path;
-                          match listable with
-                          | False => io_pure (Either(QualityInputError, List String))
-                              (Left QualityInputError (List String)
-                                (QualityUnreadableDirectory path))
-                          | True =>
-                              do let! names := prim_fs_list_dir path;
-                                 let children : List String :=
-                                   map String String (quality_child path)
-                                     (quality_sort String prim_string_le
-                                       (filter String
-                                         (fun (name : String) => notb (skip name)) names)) in
-                                 go fuel2 (append String children rest) rev
-                          end
-                   end
-               end
+               if eq_nat(kind, S Z) then
+                 if andb(prim_string_ends path ".ouro", keep path) then
+                   go fuel2 rest (Cons String path rev)
+                 else go fuel2 rest rev
+               else
+                 if eq_nat(kind, S (S Z)) then
+                   do let! listable := prim_fs_listable path;
+                      if listable then
+                        do let! names := prim_fs_list_dir path;
+                           let children : List String :=
+                             map String String (quality_child path)
+                               (quality_sort String prim_string_le
+                                 (filter String
+                                   (fun (name : String) => notb (skip name)) names)) in
+                           go fuel2 (append String children rest) rev
+                      else
+                        io_pure (Either(QualityInputError, List String))
+                          (Left QualityInputError (List String)
+                            (QualityUnreadableDirectory path))
+                 else
+                   io_pure (Either(QualityInputError, List String))
+                     (Left(QualityInputError, List String, QualityInvalidInput path))
         end
     end;
 
@@ -120,71 +112,83 @@ def quality_unique_identities (values : List QualitySourceIdentity) : List Strin
         (fun (a : QualitySourceIdentity) (b : QualitySourceIdentity) =>
           leb_nat(quality_identity_index a, quality_identity_index b)) unique);
 
--- Lexical aliases such as ./ and ../ must not duplicate findings. Failed
--- canonicalization cannot publish partial input.
+def quality_paths_increasing (A : Type) (key : A -> String) (values : List A) : Bool :=
+    match values with
+    | Nil => True
+    | Cons first rest =>
+        (fix go (remaining : List A) (previous : String) : Bool :=
+          match remaining with
+          | Nil => True
+          | Cons item more =>
+              let current : String := key item in
+              if
+                andb (prim_string_le previous current)
+                  (notb (prim_string_eq previous current)) then
+                go more current
+              else False
+          end) rest (key first)
+    end;
+
+-- Sorted spellings can resolve out of order or to the same file. Check every
+-- canonical path before reusing the original order or grouping aliases.
 def quality_unique_files (files : List String)
     : IO (Either QualityInputError (List String)) :=
-    do let! identities := quality_source_identities files;
-       match identities with
-       | Left error => io_pure (Either(QualityInputError, List String))
-           (Left QualityInputError (List String) error)
-       | Right values => io_pure (Either(QualityInputError, List String))
-           (Right(QualityInputError, List String, quality_unique_identities values))
-       end
+    match! quality_source_identities files with
+    | Left error => io_pure (Either(QualityInputError, List String))
+        (Left QualityInputError (List String) error)
+    | Right values => io_pure (Either(QualityInputError, List String))
+        (Right QualityInputError (List String)
+          (if quality_paths_increasing QualitySourceIdentity quality_identity_key values then
+              files
+            else quality_unique_identities values))
+    end
 
 -- Sort and deduplicate before any source is read. Explicit files are not
 -- hidden by directory-name exclusions, including files inside _build.
 def quality_inventory (skip : String -> Bool) (keep : String -> Bool)
     (roots : List String) : IO (Either QualityInputError (List String)) :=
-    do let! walked := quality_walk_go skip keep quality_walk_budget
-         (map String String quality_normalize_path roots) (Nil String);
-       match walked with
-       | Left e => io_pure (Either(QualityInputError, List String))
-           (Left QualityInputError (List String) e)
-       | Right files =>
-           match files with
-           | Nil => io_pure (Either(QualityInputError, List String))
-               (Left QualityInputError (List String) QualityNoSources)
-           | Cons _ _ => quality_unique_files
-               (dedup_adjacent String prim_string_eq
-                 (quality_sort String prim_string_le files))
-           end
-       end
+    match! quality_walk_go skip keep quality_walk_budget
+      (map String String quality_normalize_path roots) (Nil String) with
+    | Left e => io_pure (Either(QualityInputError, List String))
+        (Left QualityInputError (List String) e)
+    | Right files =>
+        match files with
+        | Nil => io_pure (Either(QualityInputError, List String))
+            (Left QualityInputError (List String) QualityNoSources)
+        | Cons _ _ => quality_unique_files
+            (if quality_paths_increasing String (fun (path : String) => path) files then files
+              else
+                dedup_adjacent String prim_string_eq
+                  (quality_sort String prim_string_le files))
+        end
+    end
 
 -- Runtime read failures terminate with a nonzero host status. Missing files,
 -- directories and final-component links are rejected before the read; none is
 -- translated into an empty source or an empty constructor inventory.
 def quality_read_file (path : String) : IO (Either QualityInputError String) :=
     do let! kind := prim_fs_kind path;
-       match eq_nat(kind, S Z) with
-       | False => io_pure (Either QualityInputError String)
-           (Left QualityInputError String (QualityExpectedFile path))
-       | True =>
-           do let! text := prim_fs_read_file path;
-              io_pure (Either QualityInputError String)
-                (Right QualityInputError String text)
-       end
+       (if eq_nat(kind, S Z) then
+         do let! text := prim_fs_read_file path;
+            io_pure (Either QualityInputError String)
+              (Right QualityInputError String text)
+       else
+         io_pure (Either QualityInputError String)
+           (Left QualityInputError String (QualityExpectedFile path)))
 
 def quality_repo_root : IO (Either QualityInputError String) :=
     do let! env := prim_env_get "OURO_ROOT";
-       let path : String := match env with | Just value => value | Nothing => "." end in
+       let path : String := (env ?? ".") in
        do let! kind := prim_fs_kind path;
-          match eq_nat kind 2 with
-          | False => io_pure (Either QualityInputError String)
-              (Left QualityInputError String (QualityInvalidInput (prim_string_concat "repository root is not a directory: " path)))
-          | True =>
-              do let! resolved := prim_fs_realpath path;
-                 io_pure (Either QualityInputError String) (match prim_string_length resolved with
-                   | Z => Left QualityInputError String (QualityInvalidInput (prim_string_concat "cannot resolve repository root: " path))
-                   | S _ => Right QualityInputError String (quality_normalize_path resolved)
-                   end)
-          end
+          (if eq_nat kind 2 then
+            do let! resolved := prim_fs_realpath path;
+               io_pure (Either QualityInputError String) (match prim_string_length resolved with
+                 | Z => Left QualityInputError String (QualityInvalidInput (prim_string_concat "cannot resolve repository root: " path))
+                 | S _ => Right QualityInputError String (quality_normalize_path resolved)
+                 end)
+          else
+            io_pure (Either QualityInputError String)
+              (Left QualityInputError String (QualityInvalidInput (prim_string_concat "repository root is not a directory: " path))))
 
 def quality_print_lines : List String -> IO Unit :=
-  fix go (xs : List String) : IO Unit :=
-    match xs with
-    | Nil => io_pure Unit MkUnit
-    | Cons line rest =>
-        do println line;
-           go rest
-    end;
+    io_foreach String println;

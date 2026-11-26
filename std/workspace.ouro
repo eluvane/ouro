@@ -14,6 +14,8 @@ def workspace_root (w : Workspace) : String :=
     | MkWorkspace root => root
     end;
 
+-- This lexical join preserves both path strings as given. Validate the
+-- result separately when it must stay under the workspace root.
 def workspace_file (w : Workspace) (relative : String) : String :=
     path_join ([workspace_root w, relative] : List String);
 
@@ -81,19 +83,24 @@ def fsx_read_transform_write_checked (src : String) (dst : String) (f : String -
        | Right content => fsx_write_text(dst, f content)
        end
 
-def fsx_list_files_filtered (root : String) (p : String -> Bool) : IO (Either FsError (List String)) :=
+private def fsx_walk_files_checked (root : String) : IO (Either FsError (List String)) :=
     do let! ready := fs_check_dir root;
        match ready with
        | Left e => fs_err(List String, e)
        | Right _ =>
          do let! walked := fs_walk_checked root;
             match walked with
-            | FsWalkComplete files => fs_ok(List String, filter String p files)
+            | FsWalkComplete files => fs_ok (List String) files
             | FsWalkTruncated path => fs_err(List String, FsOperationFailed "walk limit" path)
             | FsWalkUnreadable path => fs_err(List String, FsOperationFailed "walk unreadable" path)
             | FsWalkUnsafe path => fs_err(List String, FsOperationFailed "walk unsafe entry" path)
             end
        end
+
+def fsx_list_files_filtered (root : String) (p : String -> Bool) : IO (Either FsError (List String)) :=
+    do let! listed := fsx_walk_files_checked root;
+       io_pure (Either FsError (List String))
+         (mapRight FsError (List String) (List String) (filter String p) listed)
 
 def fsx_list_files_by_ext (root : String) (ext : String) : IO (Either FsError (List String)) :=
     fsx_list_files_filtered(root, fun (path : String) => path_has_ext path ext);
@@ -107,30 +114,25 @@ def fsx_copy_one_under (src_root : String) (dst_root : String) (state : Either F
     end;
 
 def fsx_copy_tree_checked (src_root : String) (dst_root : String) : IO (Either FsError Unit) :=
-    do let! ready := fs_check_dir src_root;
-       match ready with
+    do let! listed := fsx_walk_files_checked src_root;
+       match listed with
        | Left e => fs_err Unit e
-       | Right _ =>
-         do let! walked := fs_walk_checked src_root;
-            match walked with
-            | FsWalkComplete files =>
-              do let! made := fs_mkdir_p_checked dst_root;
-                 match made with
-                 | Left e => fs_err Unit e
-                 | Right _ =>
-                     io_fold String (Either FsError Unit)
-                       (fsx_copy_one_under src_root dst_root)
-                       (Right FsError Unit MkUnit)
-                       files
-                 end
-            | FsWalkTruncated path => fs_err(Unit, FsOperationFailed "walk limit" path)
-            | FsWalkUnreadable path => fs_err(Unit, FsOperationFailed "walk unreadable" path)
-            | FsWalkUnsafe path => fs_err(Unit, FsOperationFailed "walk unsafe entry" path)
+       | Right files =>
+         do let! made := fs_mkdir_p_checked dst_root;
+            match made with
+            | Left e => fs_err Unit e
+            | Right _ =>
+                io_fold String (Either FsError Unit)
+                  (fsx_copy_one_under src_root dst_root)
+                  (Right FsError Unit MkUnit)
+                  files
             end
        end
 
--- Delete files first, then directories, then the root. Fuel bounds directory
--- depth; exhaustion is an error instead of a silent leftover tree.
+-- Remove children before their parent directory. Return success without
+-- removing entries if the initial root check reports `FsPathUnavailable`.
+-- An unavailable entry during traversal returns an error. Exceeding the
+-- depth limit also returns an error. Earlier deletions remain in place.
 def fsx_remove_tree_checked (root : String) : IO (Either FsError Unit) :=
     let remove : String -> IO (Either FsError Unit) :=
       fun (requested : String) =>

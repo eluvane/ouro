@@ -62,13 +62,7 @@ def st_name_rest (b : Nat) : Bool :=
 -- One scalar width, clamped to [1, remaining] so scanning progresses.
 def st_seq_width (s : String) (slen : Nat) (pos : Nat) : Nat :=
     let width : Nat := st_utf8_len (prim_string_byte_at s pos) in
-    match eq_nat width 0 with
-    | True => 1
-    | False => match leb_nat(add pos width, slen) with
-      | True => width
-      | False => 1
-      end
-    end;
+    if eq_nat width 0 then 1 else if leb_nat(add pos width, slen) then width else 1;
 
 -- Scalar count of a byte slice; continuation bytes (128-191) are free.
 -- Token start/end mirror Python str indices exactly on validated UTF-8.
@@ -76,15 +70,11 @@ def st_count_scalars (s : String) : Nat -> Nat -> Nat -> Nat :=
     fix go (fuel : Nat) (p : Nat) (stop : Nat) : Nat :=
       match fuel with
       | Z => 0
-      | S fuel2 => match ltb_nat p stop with
-        | False => 0
-        | True =>
-            let b : Nat := prim_string_byte_at s p in
-            match orb(ltb_nat b 128, leb_nat 192 b) with
-            | True => add(1, go fuel2 (add p 1) stop)
-            | False => go fuel2 (add p 1) stop
-            end
-        end
+      | S fuel2 => if ltb_nat p stop then
+          let b : Nat := prim_string_byte_at s p in
+          if orb(ltb_nat b 128, leb_nat 192 b) then add(1, go fuel2 (add p 1) stop)
+          else go fuel2 (add p 1) stop
+        else 0
       end;
 
 -- Position of the next newline at/after pos, or slen when none remains.
@@ -92,34 +82,24 @@ def st_find_nl (s : String) (slen : Nat) (pos : Nat) : Nat :=
     (fix find (fuel : Nat) (p : Nat) : Nat :=
       match fuel with
       | Z => p
-      | S fuel2 => match ltb_nat p slen with
-        | False => p
-        | True => match eq_nat(prim_string_byte_at s p, 10) with
-          | True => p
-          | False => find(fuel2, add p 1)
-          end
-        end
+      | S fuel2 => if ltb_nat p slen then
+          if eq_nat(prim_string_byte_at s p, 10) then p else find(fuel2, add p 1)
+        else p
       end) (add(sub slen pos, 1)) pos;
 
 -- Here-document line comparison; the tabs variant strips leading tabs first.
 def st_hd_matches (s : String) (start : Nat) (stop : Nat)
     (delimiter : String) (tabs : Bool) : Bool :=
     let content : Nat :=
-      match tabs with
-      | False => start
-      | True =>
-          (fix skip (fuel : Nat) (p : Nat) : Nat :=
-            match fuel with
-            | Z => p
-            | S fuel2 => match ltb_nat p stop with
-              | False => p
-              | True => match eq_nat(prim_string_byte_at s p, 9) with
-                | True => skip(fuel2, add p 1)
-                | False => p
-                end
-              end
-            end) (add(sub stop start, 1)) start
-      end in
+      if tabs then
+        (fix skip (fuel : Nat) (p : Nat) : Nat :=
+          match fuel with
+          | Z => p
+          | S fuel2 => if ltb_nat p stop then
+              if eq_nat(prim_string_byte_at s p, 9) then skip(fuel2, add p 1) else p
+            else p
+          end) (add(sub stop start, 1)) start
+      else start in
     andb (eq_nat(sub stop content, prim_string_length delimiter))
       (st_starts_at s content delimiter);
 
@@ -130,24 +110,15 @@ def st_hd_scan (s : String) (slen : Nat) : Nat -> Nat -> Nat -> Nat -> String ->
         (delimiter : String) (tabs : Bool) : Either StLexError (Pair Nat Nat) :=
       match fuel with
       | Z => Left(StLexError, Pair Nat Nat, StLexUnclosedHereDoc begin_line)
-      | S fuel2 => match ltb_nat pos slen with
-        | False => Left(StLexError, Pair Nat Nat, StLexUnclosedHereDoc begin_line)
-        | True =>
-            let stop : Nat := st_find_nl s slen pos in
-            let newline : Nat := match ltb_nat stop slen with
-              | True => 1
-              | False => 0
-              end in
-            let next : Nat := match ltb_nat stop slen with
-              | True => add stop 1
-              | False => slen
-              end in
-            match st_hd_matches s pos stop delimiter tabs with
-            | True => Right StLexError (Pair Nat Nat)
-                (MkPair Nat Nat next (add line newline))
-            | False => scan fuel2 next (add line newline) begin_line delimiter tabs
-            end
-        end
+      | S fuel2 => if ltb_nat pos slen then
+          let stop : Nat := st_find_nl s slen pos in
+          let newline : Nat := if ltb_nat stop slen then 1 else 0 in
+          let next : Nat := if ltb_nat stop slen then add stop 1 else slen in
+          if st_hd_matches s pos stop delimiter tabs then
+            Right StLexError (Pair Nat Nat)
+              (MkPair Nat Nat next (add line newline))
+          else scan fuel2 next (add line newline) begin_line delimiter tabs
+        else Left(StLexError, Pair Nat Nat, StLexUnclosedHereDoc begin_line)
       end;
 
 -- Process queued here-documents in order, threading position and line.
@@ -161,19 +132,15 @@ def st_hd_all (s : String) (slen : Nat)
       | Nil => Right StLexError (Pair(Pair(Nat, Pair Nat Nat), List STTok))
           (MkPair (Pair(Nat, Pair Nat Nat)) (List STTok)
             (MkPair(Nat, Pair Nat Nat, pos, MkPair Nat Nat line spos)) rev)
-      | Cons hd rest => match hd with
-        | MkPair delimiter tabs =>
-            match st_hd_scan s slen (add(sub slen pos, 1)) pos line line delimiter tabs with
-            | Left message => Left StLexError (Pair(Pair(Nat, Pair Nat Nat), List STTok)) message
-            | Right done => match done with
-              | MkPair next line2 =>
-                  let body : String :=
-                    prim_string_concat "\"" (prim_string_concat
-                      (prim_string_slice s pos (sub next pos)) "\"") in
-                  go rest next line2 next
-                    (Cons STTok (MkSTTok body spos next line) rev)
-              end
-            end
+      | Cons hd rest => let (MkPair delimiter tabs) := hd in
+        match st_hd_scan s slen (add(sub slen pos, 1)) pos line line delimiter tabs with
+        | Left message => Left StLexError (Pair(Pair(Nat, Pair Nat Nat), List STTok)) message
+        | Right done => let (MkPair next line2) := done in
+          let body : String :=
+            prim_string_concat "\"" (prim_string_concat
+              (prim_string_slice s pos (sub next pos)) "\"") in
+          go rest next line2 next
+            (Cons STTok (MkSTTok body spos next line) rev)
         end
       end;
 
@@ -182,58 +149,39 @@ def st_hd_open (s : String) (slen : Nat) (pos : Nat)
     : Maybe (Pair (Pair String Bool) Nat) :=
     let p1 : Nat := add pos 2 in
     let tabs : Bool := eq_nat(prim_string_byte_at s p1, 45) in
-    let p2 : Nat := match tabs with
-      | True => add p1 1
-      | False => p1
-      end in
+    let p2 : Nat := if tabs then add p1 1 else p1 in
     let p3 : Nat := byte_skip_space s (add(sub slen p2, 1)) p2 in
     let q : Nat := prim_string_byte_at s p3 in
     let quoted : Bool := orb(eq_nat q 39, eq_nat q 34) in
-    let p4 : Nat := match quoted with
-      | True => add p3 1
-      | False => p3
-      end in
-    match st_name_first (prim_string_byte_at s p4) with
-    | False => Nothing (Pair(Pair String Bool, Nat))
-    | True =>
-        let p5 : Nat :=
-          (fix scan (fuel : Nat) (p : Nat) : Nat :=
-            match fuel with
-            | Z => p
-            | S fuel2 => match ltb_nat p slen with
-              | False => p
-              | True => match st_name_rest (prim_string_byte_at s p) with
-                | True => scan(fuel2, add p 1)
-                | False => p
-                end
-              end
-            end) (add(sub slen p4, 1)) p4 in
-        let name : String := prim_string_slice s p4 (sub p5 p4) in
-        match quoted with
-        | False => Just (Pair(Pair String Bool, Nat))
-            (MkPair(Pair String Bool, Nat, MkPair String Bool name tabs, p5))
-        | True => match eq_nat(prim_string_byte_at s p5, q) with
-          | False => Nothing (Pair(Pair String Bool, Nat))
-          | True => Just (Pair(Pair String Bool, Nat))
-              (MkPair(Pair String Bool, Nat, MkPair String Bool name tabs, add p5 1))
-          end
-        end
-    end;
+    let p4 : Nat := if quoted then add p3 1 else p3 in
+    if st_name_first (prim_string_byte_at s p4) then
+      let p5 : Nat :=
+        (fix scan (fuel : Nat) (p : Nat) : Nat :=
+          match fuel with
+          | Z => p
+          | S fuel2 => if ltb_nat p slen then
+              if st_name_rest (prim_string_byte_at s p) then scan(fuel2, add p 1) else p
+            else p
+          end) (add(sub slen p4, 1)) p4 in
+      let name : String := prim_string_slice s p4 (sub p5 p4) in
+      if quoted then
+        if eq_nat(prim_string_byte_at s p5, q) then
+          Just (Pair(Pair String Bool, Nat))
+            (MkPair(Pair String Bool, Nat, MkPair String Bool name tabs, add p5 1))
+        else Nothing (Pair(Pair String Bool, Nat))
+      else
+        Just (Pair(Pair String Bool, Nat))
+          (MkPair(Pair String Bool, Nat, MkPair String Bool name tabs, p5))
+    else Nothing (Pair(Pair String Bool, Nat));
 
 -- Line-comment opener per language; py/ml/mli strip no line comments.
 def st_line_opener (language : String) : Maybe String :=
     match st_lang_eq language "ouro" with
     | True => Just String "--"
-    | False => match st_lang_eq language "sh" with
-      | True => Just String "#"
-      | False => match st_lang_eq language "c" with
-        | True => Just String "//"
-        | False => match st_lang_eq language "h" with
-          | True => Just String "//"
-          | False => Nothing String
-          end
-        end
-      end
+    | False => if st_lang_eq language "sh" then Just String "#"
+      else
+        if st_lang_eq language "c" then Just String "//"
+        else if st_lang_eq language "h" then Just String "//" else Nothing String
     end;
 
 -- Block-comment scan; nested only for the OCaml pair.
@@ -244,71 +192,55 @@ def st_block_scan (s : String) (slen : Nat)
     fix go (fuel : Nat) (p : Nat) (depth : Nat) : Either StLexError Nat :=
       match fuel with
       | Z => Left StLexError Nat failure
-      | S fuel2 => match andb(ltb_nat p slen, notb (eq_nat depth 0)) with
-        | False => match eq_nat depth 0 with
-          | True => Right StLexError Nat p
-          | False => Left StLexError Nat failure
-          end
-        | True => match andb(nested, st_starts_at s p opener) with
-          | True => go(fuel2, add p 2, add depth 1)
-          | False => match st_starts_at s p close with
-            | True => go(fuel2, add p 2, sub depth 1)
-            | False => go fuel2 (add p 1) depth
-            end
-          end
-        end
+      | S fuel2 => if andb(ltb_nat p slen, notb (eq_nat depth 0)) then
+          if andb(nested, st_starts_at s p opener) then go(fuel2, add p 2, add depth 1)
+          else
+            if st_starts_at s p close then go(fuel2, add p 2, sub depth 1)
+            else go fuel2 (add p 1) depth
+        else if eq_nat depth 0 then Right StLexError Nat p else Left StLexError Nat failure
       end;
 
 -- OCaml character literal: one scalar, or backslash plus one non-newline.
 def st_scalar_tail (s : String) (slen : Nat) (p : Nat) (first_ok : Bool) : Bool :=
     let width : Nat := st_utf8_len (prim_string_byte_at s p) in
-    match eq_nat width 0 with
-    | True => False
-    | False => match andb(first_ok, leb_nat(add p width, slen)) with
-      | False => False
-      | True => eq_nat(prim_string_byte_at(s, add p width), 39)
-      end
-    end;
+    if eq_nat width 0 then False
+    else
+      if andb(first_ok, leb_nat(add p width, slen)) then
+        eq_nat(prim_string_byte_at(s, add p width), 39)
+      else False;
 
 def st_ml_char (s : String) (slen : Nat) (pos : Nat) : Bool :=
     let p1 : Nat := add pos 1 in
-    match eq_nat(prim_string_byte_at s p1, 92) with
-    | True =>
-        let q : Nat := add p1 1 in
-        st_scalar_tail s slen q (notb (eq_nat(prim_string_byte_at s q, 10)))
-    | False =>
-        let b : Nat := prim_string_byte_at s p1 in
-        st_scalar_tail s slen p1
-          (andb (notb (eq_nat b 39))
-            (andb(notb (eq_nat b 92), notb (eq_nat b 10))))
-    end;
+    if eq_nat(prim_string_byte_at s p1, 92) then
+      let q : Nat := add p1 1 in
+      st_scalar_tail s slen q (notb (eq_nat(prim_string_byte_at s q, 10)))
+    else
+      let b : Nat := prim_string_byte_at s p1 in
+      st_scalar_tail s slen p1
+        (andb (notb (eq_nat b 39))
+          (andb(notb (eq_nat b 92), notb (eq_nat b 10))));
 
 -- Quote detection; the quote byte doubles as the closing delimiter.
 def st_str_quote (s : String) (slen : Nat) (pos : Nat) (language : String)
     : Maybe (Pair Nat Bool) :=
     let b : Nat := prim_string_byte_at s pos in
-    match eq_nat b 34 with
-    | True => Just (Pair Nat Bool)
+    if eq_nat b 34 then
+      Just (Pair Nat Bool)
         (MkPair Nat Bool 34 True)
-    | False => match eq_nat b 39 with
-      | False => Nothing (Pair Nat Bool)
-      | True =>
-          let plain : Bool := orb (st_lang_eq language "c")
-            (orb(st_lang_eq language "h",
-              orb(st_lang_eq language "sh", st_lang_eq language "ouro"))) in
-          match plain with
-          | True => Just (Pair Nat Bool)
-              (MkPair Nat Bool 39 (notb (st_lang_eq language "sh")))
-          | False => match orb(st_lang_eq language "ml", st_lang_eq language "mli") with
-            | False => Nothing (Pair Nat Bool)
-            | True => match st_ml_char s slen pos with
-              | False => Nothing (Pair Nat Bool)
-              | True => Just(Pair Nat Bool, MkPair Nat Bool 39 True)
-              end
-            end
-          end
-      end
-    end;
+    else
+      if eq_nat b 39 then
+        let plain : Bool := orb (st_lang_eq language "c")
+          (orb(st_lang_eq language "h",
+            orb(st_lang_eq language "sh", st_lang_eq language "ouro"))) in
+        if plain then
+          Just (Pair Nat Bool)
+            (MkPair Nat Bool 39 (notb (st_lang_eq language "sh")))
+        else
+          if orb(st_lang_eq language "ml", st_lang_eq language "mli") then
+            if st_ml_char s slen pos then Just(Pair Nat Bool, MkPair Nat Bool 39 True)
+            else Nothing (Pair Nat Bool)
+          else Nothing (Pair Nat Bool)
+      else Nothing (Pair Nat Bool);
 
 -- String scan; only sh single-quote strings disable backslash escapes.
 def st_str_scan (s : String) (slen : Nat) (quote : Nat) (escapes : Bool)
@@ -316,16 +248,12 @@ def st_str_scan (s : String) (slen : Nat) (quote : Nat) (escapes : Bool)
     fix go (fuel : Nat) (p : Nat) (line : Nat) : Either StLexError Nat :=
       match fuel with
       | Z => Left StLexError Nat (StLexUnclosedString line)
-      | S fuel2 => match ltb_nat p slen with
-        | False => Left StLexError Nat (StLexUnclosedString line)
-        | True => match andb(escapes, eq_nat(prim_string_byte_at s p, 92)) with
-          | True => go fuel2 (add p 2) line
-          | False => match eq_nat(prim_string_byte_at s p, quote) with
-            | True => Right StLexError Nat (add p 1)
-            | False => go fuel2 (add p 1) line
-            end
-          end
-        end
+      | S fuel2 => if ltb_nat p slen then
+          if andb(escapes, eq_nat(prim_string_byte_at s p, 92)) then go fuel2 (add p 2) line
+          else
+            if eq_nat(prim_string_byte_at s p, quote) then Right StLexError Nat (add p 1)
+            else go fuel2 (add p 1) line
+        else Left StLexError Nat (StLexUnclosedString line)
       end;
 
 -- Identifier tails: alnum continues, then _/' outside shell, then one scalar.
@@ -335,80 +263,58 @@ def st_raw_scan (s : String) (slen : Nat)
       match fuel with
       | Z => Left StLexError Nat (StLexUnclosedRawString line)
       | S remaining =>
-          match ltb_nat pos slen with
-          | False => Left StLexError Nat (StLexUnclosedRawString line)
-          | True =>
-              match andb(eq_nat(prim_string_byte_at s pos, 34),
-                  andb(ltb_nat(add pos 1, slen),
-                    eq_nat(prim_string_byte_at s (add pos 1), 35))) with
-              | True => Right StLexError Nat (add pos 2)
-              | False => go remaining (add pos 1) line
-              end
-          end
+          if ltb_nat pos slen then
+            if
+              andb(eq_nat(prim_string_byte_at s pos, 34),
+                andb(ltb_nat(add pos 1, slen),
+                  eq_nat(prim_string_byte_at s (add pos 1), 35))) then
+              Right StLexError Nat (add pos 2)
+            else go remaining (add pos 1) line
+          else Left StLexError Nat (StLexUnclosedRawString line)
       end;
 
 def st_multiline_scan (s : String) (slen : Nat) (pos : Nat) (line : Nat)
     : Either StLexError Nat :=
   let body : Nat := add pos 3 in
   let first_line : Nat :=
-    match st_starts_at s body "\r\n" with
-    | True => add body 2
-    | False => match st_starts_at s body "\n" with
-      | True => add body 1
-      | False => body
-      end
-    end in
-  match eq_nat first_line body with
-  | True => Left StLexError Nat (StLexUnclosedString line)
-  | False =>
-      (fix scan (fuel : Nat) (start : Nat) : Either StLexError Nat :=
-        match fuel with
-        | Z => Left StLexError Nat (StLexUnclosedString line)
-        | S remaining =>
-            let quote : Nat :=
-              (fix skip (left : Nat) (p : Nat) : Nat :=
-                match left with
-                | Z => p
-                | S more => match ltb_nat p slen with
-                  | False => p
-                  | True =>
-                      let byte : Nat := prim_string_byte_at s p in
-                      match orb(eq_nat byte 32, eq_nat byte 9) with
-                      | True => skip more (add p 1)
-                      | False => p
-                      end
-                  end
-                end) (add(sub slen start, 1)) start in
-            match st_starts_at s quote "\"\"\"" with
-            | True => Right StLexError Nat (add quote 3)
-            | False =>
-                let next : Nat := st_find_nl s slen start in
-                match ltb_nat next slen with
-                | True => scan remaining (add next 1)
-                | False => Left StLexError Nat (StLexUnclosedString line)
-                end
-            end
-        end) (add(sub slen first_line, 1)) first_line
-  end;
+    if st_starts_at s body "\r\n" then add body 2
+    else if st_starts_at s body "\n" then add body 1 else body in
+  if eq_nat first_line body then Left StLexError Nat (StLexUnclosedString line)
+  else
+    (fix scan (fuel : Nat) (start : Nat) : Either StLexError Nat :=
+      match fuel with
+      | Z => Left StLexError Nat (StLexUnclosedString line)
+      | S remaining =>
+          let quote : Nat :=
+            (fix skip (left : Nat) (p : Nat) : Nat :=
+              match left with
+              | Z => p
+              | S more => if ltb_nat p slen then
+                  let byte : Nat := prim_string_byte_at s p in
+                  if orb(eq_nat byte 32, eq_nat byte 9) then skip more (add p 1) else p
+                else p
+              end) (add(sub slen start, 1)) start in
+          if st_starts_at s quote "\"\"\"" then Right StLexError Nat (add quote 3)
+          else
+            let next : Nat := st_find_nl s slen start in
+            if ltb_nat next slen then scan remaining (add next 1)
+            else Left StLexError Nat (StLexUnclosedString line)
+      end) (add(sub slen first_line, 1)) first_line;
 
 def st_ident_tail (s : String) (slen : Nat) (language : String)
     : Nat -> Nat -> Nat :=
     fix go (fuel : Nat) (q : Nat) : Nat :=
       match fuel with
       | Z => q
-      | S fuel2 => match ltb_nat q slen with
-        | False => q
-        | True =>
-            let b : Nat := prim_string_byte_at s q in
-            match orb (st_is_alnum b)
-                (andb(orb(eq_nat b 95, eq_nat b 39), notb (st_lang_eq language "sh"))) with
-            | True => go(fuel2, add q 1)
-            | False => match leb_nat 128 b with
-              | True => go(fuel2, add(q, st_seq_width s slen q))
-              | False => q
-              end
-            end
-        end
+      | S fuel2 => if ltb_nat q slen then
+          let b : Nat := prim_string_byte_at s q in
+          if
+            orb (st_is_alnum b)
+              (andb(notb (st_lang_eq language "sh"),
+                orb(eq_nat b 95, andb(eq_nat b 39, notb (st_is_c language))))) then
+            go(fuel2, add q 1)
+          else if leb_nat 128 b then go(fuel2, add(q, st_seq_width s slen q)) else q
+        else q
       end;
 
 -- Number tails: alnum continues, then . and _, then one scalar.
@@ -416,18 +322,11 @@ def st_num_tail (s : String) (slen : Nat) : Nat -> Nat -> Nat :=
     fix go (fuel : Nat) (q : Nat) : Nat :=
       match fuel with
       | Z => q
-      | S fuel2 => match ltb_nat q slen with
-        | False => q
-        | True =>
-            let b : Nat := prim_string_byte_at s q in
-            match orb(st_is_alnum b, orb(eq_nat b 46, eq_nat b 95)) with
-            | True => go(fuel2, add q 1)
-            | False => match leb_nat 128 b with
-              | True => go(fuel2, add(q, st_seq_width s slen q))
-              | False => q
-              end
-            end
-        end
+      | S fuel2 => if ltb_nat q slen then
+          let b : Nat := prim_string_byte_at s q in
+          if orb(st_is_alnum b, orb(eq_nat b 46, eq_nat b 95)) then go(fuel2, add q 1)
+          else if leb_nat 128 b then go(fuel2, add(q, st_seq_width s slen q)) else q
+        else q
       end;
 
 -- Operator table in match order, then the single-step driver.
@@ -439,18 +338,12 @@ def st_op_match (s : String) (pos : Nat) : List String -> String :=
     fix go (ops : List String) : String :=
       match ops with
       | Nil => ""
-      | Cons op rest => match st_starts_at s pos op with
-        | True => op
-        | False => go rest
-        end
+      | Cons op rest => if st_starts_at s pos op then op else go rest
       end;
 
 -- First scalar width: ASCII takes one byte, the rest takes a sequence.
 def st_first_width (s : String) (slen : Nat) (pos : Nat) : Nat :=
-    match ltb_nat(prim_string_byte_at s pos, 128) with
-    | True => 1
-    | False => st_seq_width s slen pos
-    end;
+    if ltb_nat(prim_string_byte_at s pos, 128) then 1 else st_seq_width s slen pos;
 
 -- Identifier starts mirror `char.isalpha() or char == "_"` on scalars.
 def st_ident_start (b : Nat) : Bool :=
@@ -459,31 +352,26 @@ def st_ident_start (b : Nat) : Bool :=
 -- Block-comment shapes; only the OCaml pair nests.
 def st_block_open (language : String)
     : Maybe (Pair String (Pair String Bool)) :=
-    match st_is_ml language with
-    | True => Just (Pair(String, Pair String Bool))
+    if st_is_ml language then
+      Just (Pair(String, Pair String Bool))
         (MkPair String (Pair String Bool) "(*"
           (MkPair String Bool "*)" True))
-    | False => match st_is_c language with
-      | True => Just (Pair(String, Pair String Bool))
+    else
+      if st_is_c language then
+        Just (Pair(String, Pair String Bool))
           (MkPair String (Pair String Bool) "/*"
             (MkPair String Bool "*/" False))
-      | False => Nothing (Pair(String, Pair String Bool))
-      end
-    end;
+      else Nothing (Pair(String, Pair String Bool));
 
 -- A sh heredoc opener only commits when the whole pattern matches.
 def st_try_hd_open (s : String) (slen : Nat) (pos : Nat) (language : String)
     : Maybe (Pair (Pair String Bool) Nat) :=
-    match st_is_sh language with
-    | False => Nothing (Pair(Pair String Bool, Nat))
-    | True => match st_starts_at s pos "<<" with
-      | False => Nothing (Pair(Pair String Bool, Nat))
-      | True => match st_starts_at s pos "<<<" with
-        | True => Nothing (Pair(Pair String Bool, Nat))
-        | False => st_hd_open s slen pos
-        end
-      end
-    end;
+    if st_is_sh language then
+      if st_starts_at s pos "<<" then
+        if st_starts_at s pos "<<<" then Nothing (Pair(Pair String Bool, Nat))
+        else st_hd_open s slen pos
+      else Nothing (Pair(Pair String Bool, Nat))
+    else Nothing (Pair(Pair String Bool, Nat));
 
 inductive STStep : Type :=
   | STNext : Nat -> Nat -> List STTok -> List (Pair Nat String)
@@ -502,13 +390,10 @@ def st_count_nl_at (s : String) : Nat -> Nat -> Nat -> Nat :=
     fix go (fuel : Nat) (p : Nat) (stop : Nat) : Nat :=
       match fuel with
       | Z => 0
-      | S fuel2 => match ltb_nat p stop with
-        | False => 0
-        | True => match eq_nat(prim_string_byte_at s p, 10) with
-          | True => add(1, go fuel2 (add p 1) stop)
-          | False => go fuel2 (add p 1) stop
-          end
-        end
+      | S fuel2 => if ltb_nat p stop then
+          if eq_nat(prim_string_byte_at s p, 10) then add(1, go fuel2 (add p 1) stop)
+          else go fuel2 (add p 1) stop
+        else 0
       end;
 
 -- Queued here-documents keep source order.
@@ -527,20 +412,20 @@ def st_hd_snoc : List (Pair String Bool) -> String -> Bool
 def st_lex_tail (s : String) (slen : Nat) (pos : Nat) (line : Nat)
     (rt : List STTok) (rc : List (Pair Nat String)) (hd : List (Pair String Bool))
     (language : String) : STStep :=
-    match andb(st_lang_eq language "ouro",
-        st_starts_at s pos "\"\"\"") with
-    | True =>
-        match st_multiline_scan s slen pos line with
-        | Left message => STFail message
-        | Right stop =>
-            let text : String := prim_string_slice s pos (sub stop pos) in
-            STNext stop (add(line, st_count_nl_at s (add(sub stop pos, 1)) pos stop))
-              (Cons STTok (MkSTTok text pos stop line) rt) rc hd
-        end
-    | False =>
-    match andb(st_lang_eq language "ouro",
-        prim_string_eq(prim_string_slice s pos 3, "r#\"")) with
-    | True =>
+    if
+      andb(st_lang_eq language "ouro",
+        st_starts_at s pos "\"\"\"") then
+      match st_multiline_scan s slen pos line with
+      | Left message => STFail message
+      | Right stop =>
+          let text : String := prim_string_slice s pos (sub stop pos) in
+          STNext stop (add(line, st_count_nl_at s (add(sub stop pos, 1)) pos stop))
+            (Cons STTok (MkSTTok text pos stop line) rt) rc hd
+      end
+    else
+      if
+        andb(st_lang_eq language "ouro",
+          prim_string_eq(prim_string_slice s pos 3, "r#\"")) then
         match st_raw_scan s slen (add(sub slen pos, 1)) (add pos 3) line with
         | Left message => STFail message
         | Right stop =>
@@ -548,111 +433,91 @@ def st_lex_tail (s : String) (slen : Nat) (pos : Nat) (line : Nat)
             STNext stop (add(line, st_count_nl_at s (add(sub stop pos, 1)) pos stop))
               (Cons STTok (MkSTTok text pos stop line) rt) rc hd
         end
-    | False =>
-    match andb(st_lang_eq language "ouro",
-        prim_string_eq(prim_string_slice s pos 2, "b\"")) with
-    | True =>
-        match st_str_scan s slen 34 True
-            (add(sub slen pos, 2)) (add pos 2) line with
-        | Left message => STFail message
-        | Right stop =>
-            let text : String := prim_string_slice s pos (sub stop pos) in
-            STNext stop (add(line, st_count_nl_at s (add(sub stop pos, 1)) pos stop))
-              (Cons STTok (MkSTTok text pos stop line) rt) rc hd
-        end
-    | False =>
-    match st_str_quote s slen pos language with
-    | Just qi => match qi with
-      | MkPair quote escapes =>
-          match st_str_scan s slen quote escapes
-              (add(sub slen pos, 2)) (add pos 1) line with
+      else
+        if
+          andb(st_lang_eq language "ouro",
+            prim_string_eq(prim_string_slice s pos 2, "b\"")) then
+          match st_str_scan s slen 34 True
+              (add(sub slen pos, 2)) (add pos 2) line with
           | Left message => STFail message
           | Right stop =>
               let text : String := prim_string_slice s pos (sub stop pos) in
               STNext stop (add(line, st_count_nl_at s (add(sub stop pos, 1)) pos stop))
                 (Cons STTok (MkSTTok text pos stop line) rt) rc hd
           end
-      end
-    | Nothing =>
-        match st_ident_start (prim_string_byte_at s pos) with
-        | True =>
-            let q0 : Nat := add(pos, st_first_width s slen pos) in
-            let stop : Nat :=
-              st_ident_tail s slen language (add(sub slen q0, 1)) q0 in
-            let text : String := prim_string_slice s pos (sub stop pos) in
-            STNext stop (add(line, st_count_nl_at s (add(sub stop pos, 1)) pos stop))
-              (Cons STTok (MkSTTok text pos stop line) rt) rc hd
-        | False => match st_is_digit (prim_string_byte_at s pos) with
-          | True =>
-              let stop : Nat := st_num_tail(s, slen, add(sub slen pos, 1), add pos 1) in
-              let text : String := prim_string_slice s pos (sub stop pos) in
-              STNext stop (add(line, st_count_nl_at s (add(sub stop pos, 1)) pos stop))
-                (Cons STTok (MkSTTok text pos stop line) rt) rc hd
-          | False =>
-              let op : String := st_op_match s pos st_operators in
-              let width : Nat := match eq_nat(prim_string_length op, 0) with
-                | True => st_first_width s slen pos
-                | False => prim_string_length op
-                end in
-              let text : String := match eq_nat(prim_string_length op, 0) with
-                | True => prim_string_slice s pos width
-                | False => op
-                end in
-              let stop : Nat := add pos width in
-              STNext stop (add(line, st_count_nl_at s (add width 1) pos stop))
-                (Cons STTok (MkSTTok text pos stop line) rt) rc hd
-          end
-        end
-    end
-    end
-    end
-    end;
+        else
+          match st_str_quote s slen pos language with
+          | Just qi => let (MkPair quote escapes) := qi in
+            match st_str_scan s slen quote escapes
+                (add(sub slen pos, 2)) (add pos 1) line with
+            | Left message => STFail message
+            | Right stop =>
+                let text : String := prim_string_slice s pos (sub stop pos) in
+                STNext stop (add(line, st_count_nl_at s (add(sub stop pos, 1)) pos stop))
+                  (Cons STTok (MkSTTok text pos stop line) rt) rc hd
+            end
+          | Nothing =>
+              if st_ident_start (prim_string_byte_at s pos) then
+                let q0 : Nat := add(pos, st_first_width s slen pos) in
+                let stop : Nat :=
+                  st_ident_tail s slen language (add(sub slen q0, 1)) q0 in
+                let text : String := prim_string_slice s pos (sub stop pos) in
+                STNext stop (add(line, st_count_nl_at s (add(sub stop pos, 1)) pos stop))
+                  (Cons STTok (MkSTTok text pos stop line) rt) rc hd
+              else
+                if st_is_digit (prim_string_byte_at s pos) then
+                  let stop : Nat := st_num_tail(s, slen, add(sub slen pos, 1), add pos 1) in
+                  let text : String := prim_string_slice s pos (sub stop pos) in
+                  STNext stop (add(line, st_count_nl_at s (add(sub stop pos, 1)) pos stop))
+                    (Cons STTok (MkSTTok text pos stop line) rt) rc hd
+                else
+                  let op : String := st_op_match s pos st_operators in
+                  let width : Nat := if eq_nat(prim_string_length op, 0) then st_first_width s slen pos
+                    else prim_string_length op in
+                  let text : String := if eq_nat(prim_string_length op, 0) then
+                      prim_string_slice s pos width
+                    else op in
+                  let stop : Nat := add pos width in
+                  STNext stop (add(line, st_count_nl_at s (add width 1) pos stop))
+                    (Cons STTok (MkSTTok text pos stop line) rt) rc hd
+          end;
 
 -- Block-comment consumption shared by both dispatch shapes.
 def st_lex_block (s : String) (slen : Nat) (pos : Nat) (line : Nat)
     (rt : List STTok) (rc : List (Pair Nat String)) (hd : List (Pair String Bool))
     (language : String) (opener : String) (close : String) (nested : Bool) : STStep :=
-    match st_starts_at s pos opener with
-    | True =>
-        match st_block_scan s slen opener close nested line
-            (add(sub slen pos, 2)) (add pos 2) 1 with
-        | Left message => STFail message
-        | Right stop =>
-            let text : String := prim_string_slice s pos (sub stop pos) in
-            STNext stop
-              (add(line, st_count_nl_at s (add(sub stop pos, 1)) pos stop)) rt
-              (Cons(Pair Nat String, MkPair Nat String line text, rc)) hd
-        end
-    | False => st_lex_tail s slen pos line rt rc hd language
-    end;
+    if st_starts_at s pos opener then
+      match st_block_scan s slen opener close nested line
+          (add(sub slen pos, 2)) (add pos 2) 1 with
+      | Left message => STFail message
+      | Right stop =>
+          let text : String := prim_string_slice s pos (sub stop pos) in
+          STNext stop
+            (add(line, st_count_nl_at s (add(sub stop pos, 1)) pos stop)) rt
+            (Cons(Pair Nat String, MkPair Nat String line text, rc)) hd
+      end
+    else st_lex_tail s slen pos line rt rc hd language;
 
 def st_lex_rest (s : String) (slen : Nat) (pos : Nat) (line : Nat)
     (rt : List STTok) (rc : List (Pair Nat String)) (hd : List (Pair String Bool))
     (language : String) : STStep :=
     match st_line_opener language with
-    | Just opener => match st_starts_at s pos opener with
-      | True =>
-          let stop : Nat := st_find_nl s slen pos in
-          let text : String := prim_string_slice s pos (sub stop pos) in
-          STNext stop line rt
-            (Cons(Pair Nat String, MkPair Nat String line text, rc)) hd
-      | False => match st_block_open language with
-        | Just bi => match bi with
-          | MkPair open2 rest2 => match rest2 with
-            | MkPair close nested =>
-                st_lex_block s slen pos line rt rc hd language open2 close nested
-            end
-          end
+    | Just opener => if st_starts_at s pos opener then
+        let stop : Nat := st_find_nl s slen pos in
+        let text : String := prim_string_slice s pos (sub stop pos) in
+        STNext stop line rt
+          (Cons(Pair Nat String, MkPair Nat String line text, rc)) hd
+      else
+        match st_block_open language with
+        | Just bi => let (MkPair open2 rest2) := bi in
+          let (MkPair close nested) := rest2 in
+          st_lex_block s slen pos line rt rc hd language open2 close nested
         | Nothing => st_lex_tail s slen pos line rt rc hd language
         end
-      end
     | Nothing => match st_block_open language with
-      | Just bi => match bi with
-        | MkPair open2 rest2 => match rest2 with
-          | MkPair close nested =>
-              st_lex_block s slen pos line rt rc hd language open2 close nested
-          end
-        end
+      | Just bi => let (MkPair open2 rest2) := bi in
+        let (MkPair close nested) := rest2 in
+        st_lex_block s slen pos line rt rc hd language open2 close nested
       | Nothing => st_lex_tail s slen pos line rt rc hd language
       end
     end;
@@ -662,45 +527,31 @@ def st_lex_step (s : String) (slen : Nat) (language : String)
     (pos : Nat) (line : Nat)
     (rt : List STTok) (rc : List (Pair Nat String)) (hd : List (Pair String Bool))
     : STStep :=
-    match ltb_nat pos slen with
-    | False => STDone
-    | True =>
-        match byte_is_space (prim_string_byte_at s pos) with
-        | True =>
-            let is_nl : Bool := eq_nat(prim_string_byte_at s pos, 10) in
-            let line2 : Nat := match is_nl with
-              | True => add line 1
-              | False => line
-              end in
-            let pos2 : Nat := add pos 1 in
-            match andb(is_nl, st_lex_was_hd hd) with
-            | False => STNext pos2 line2 rt rc hd
-            | True => match st_hd_all s slen hd pos2 line2 pos2 rt with
-              | Left message => STFail message
-              | Right done => match done with
-                | MkPair pl rt2 => match pl with
-                  | MkPair pos3 rest => match rest with
-                    | MkPair line3 _ =>
-                        STNext pos3 line3 rt2 rc (Nil (Pair String Bool))
-                    end
-                  end
-                end
-              end
-            end
-        | False => match st_try_hd_open s slen pos language with
-          | Just hi => match hi with
-            | MkPair name_tabs stop => match name_tabs with
-              | MkPair name tabs =>
-                  let text : String := prim_string_slice s pos (sub stop pos) in
-                  STNext stop line
-                    (Cons STTok (MkSTTok text pos stop line) rt) rc
-                    (st_hd_snoc hd name tabs)
-              end
-            end
-          | Nothing => st_lex_rest s slen pos line rt rc hd language
+    if ltb_nat pos slen then
+      if byte_is_space (prim_string_byte_at s pos) then
+        let is_nl : Bool := eq_nat(prim_string_byte_at s pos, 10) in
+        let line2 : Nat := if is_nl then add line 1 else line in
+        let pos2 : Nat := add pos 1 in
+        if andb(is_nl, st_lex_was_hd hd) then
+          match st_hd_all s slen hd pos2 line2 pos2 rt with
+          | Left message => STFail message
+          | Right done => let (MkPair pl rt2) := done in
+            let (MkPair pos3 rest) := pl in
+            let (MkPair line3 _) := rest in
+            STNext pos3 line3 rt2 rc (Nil (Pair String Bool))
           end
+        else STNext pos2 line2 rt rc hd
+      else
+        match st_try_hd_open s slen pos language with
+        | Just hi => let (MkPair name_tabs stop) := hi in
+          let (MkPair name tabs) := name_tabs in
+          let text : String := prim_string_slice s pos (sub stop pos) in
+          STNext stop line
+            (Cons STTok (MkSTTok text pos stop line) rt) rc
+            (st_hd_snoc hd name tabs)
+        | Nothing => st_lex_rest s slen pos line rt rc hd language
         end
-    end;
+    else STDone;
 
 -- Region scanners use byte offsets. Convert the ordered token stream once;
 -- advancing from the previous token keeps Unicode position work linear.
@@ -708,18 +559,16 @@ def st_scalar_tokens (source : String) (tokens : List STTok) : List STTok :=
     (fix convert (remaining : List STTok) (byte_pos : Nat) (scalar_pos : Nat) : List STTok :=
       match remaining with
       | Nil => []
-      | Cons token rest => match token with
-        | MkSTTok text start stop line =>
-            let begin : Nat := add scalar_pos
-              (st_count_scalars source (add(sub start byte_pos, 1)) byte_pos start) in
-            let finish : Nat := add begin
-              (st_count_scalars source (add(sub stop start, 1)) start stop) in
-            Cons(STTok, MkSTTok text begin finish line, convert rest stop finish)
-        end
+      | Cons token rest => let (MkSTTok text start stop line) := token in
+        let begin : Nat := add scalar_pos
+          (st_count_scalars source (add(sub start byte_pos, 1)) byte_pos start) in
+        let finish : Nat := add begin
+          (st_count_scalars source (add(sub stop start, 1)) start stop) in
+        Cons(STTok, MkSTTok text begin finish line, convert rest stop finish)
       end) tokens 0 0;
 
 -- The driver only threads state; every region loop lives in a helper.
-def st_lex_go (s : String) (slen : Nat) (language : String)
+private def st_lex_bytes_go (s : String) (slen : Nat) (language : String)
     : Nat -> Nat -> Nat -> List STTok -> List (Pair Nat String)
     -> List (Pair String Bool)
     -> Either StLexError (Pair (List STTok) (List (Pair Nat String))) :=
@@ -733,15 +582,25 @@ def st_lex_go (s : String) (slen : Nat) (language : String)
           match st_lex_step s slen language pos line rt rc hd with
           | STDone => Right StLexError (Pair(List STTok, List (Pair Nat String)))
               (MkPair (List STTok) (List (Pair Nat String))
-                (st_scalar_tokens(s, reverse STTok rt)) (reverse(Pair Nat String, rc)))
+                (reverse STTok rt) (reverse(Pair Nat String, rc)))
           | STNext pos2 line2 rt2 rc2 hd2 => go fuel2 pos2 line2 rt2 rc2 hd2
           | STFail message => Left StLexError (Pair(List STTok, List (Pair Nat String))) message
           end
       end;
 
--- Mirror of structural_quality.lex: tokens plus (line, text) comments.
-def st_lex (source : String) (language : String)
+-- Token offsets are byte indices. Token text and line numbers match st_lex.
+def st_lex_byte_offsets (source : String) (language : String)
     : Either StLexError (Pair (List STTok) (List (Pair Nat String))) :=
     let slen : Nat := prim_string_length source in
-    st_lex_go source slen language (add(mul slen 2, 8)) 0 1
+    st_lex_bytes_go source slen language (add(mul slen 2, 8)) 0 1
       (Nil STTok) (Nil (Pair Nat String)) (Nil (Pair String Bool));
+
+-- Mirror of structural_quality.lex: scalar token offsets and (line, text) comments.
+def st_lex (source : String) (language : String)
+    : Either StLexError (Pair (List STTok) (List (Pair Nat String))) :=
+    match st_lex_byte_offsets source language with
+    | Left error => Left StLexError (Pair (List STTok) (List (Pair Nat String))) error
+    | Right lexed => let (MkPair tokens comments) := lexed in
+      Right StLexError (Pair (List STTok) (List (Pair Nat String)))
+        (MkPair (List STTok) (List (Pair Nat String)) (st_scalar_tokens source tokens) comments)
+    end;

@@ -5,7 +5,9 @@ import json
 import re
 from dataclasses import dataclass, replace
 
-from ourosmith import generator_hash
+from local_scheduler import Task, available_memory_mib, run_tasks
+from ourosmith import ROOT, generator_hash
+from ourosmith.host import job_count
 from ourosmith.report import Finding
 
 LAYER = "kernel"
@@ -30,6 +32,9 @@ termination-nested-unchanged-initial termination-nested-growing-inner
 termination-nested-growing-other-parameter termination-nested-captured-unchanged
 termination-nested-partial-escape termination-nested-argument-escape fix-arity fix-rec-arg-range""".split()
 FORMS = ("beta", "let", "polymorphic-id", "polymorphic-const", "nat-case", "structural-fold", "extra-argument-fold", "higher-order")
+GENERATED_FIELDS = re.compile(r"family=(\d+) references=([0-9,]*)")
+FORM_FIELDS = re.compile(r"([0-7](?:,[0-7])*)?")
+REL_TARGET = re.compile(r"(\d+)")
 
 
 @dataclass
@@ -54,6 +59,14 @@ class Failure:
         # Core input rendering is retained in the finding, but shrinking may
         # change that rendering. Preserve the exact law and diagnostic prefix.
         return self.prop, self.classification, self.detail.split(" input=", 1)[0]
+
+
+@dataclass
+class SeedResult:
+    laws: dict
+    finding: Finding | None
+    elapsed_s: float
+    peak_memory_mib: float
 
 
 def recipe(config, seed, digest=None):
@@ -87,20 +100,19 @@ def definition_count(seed, maximum):
     return 1 + (mix(mix(seed) ^ (43 + 2257)) & 255) % maximum
 
 
-def protocol_steps(seed, depth, maximum):
-    count = definition_count(seed, maximum)
+def protocol_steps(seed, depth, maximum, count):
     prefix = f"ok smith seed={seed} "
-    rows = [("domain=" + str(family), re.escape(prefix + "domain=" + str(family))) for family in range(18)]
+    rows = [(f"domain={family}", prefix + f"domain={family}", None) for family in range(18)]
     for name in range(400, 400 + count):
-        rows.extend(((f"generated={name}", re.escape(prefix + f"generated={name} ") + r"family=(\d+) references=([0-9,]*)"),
-                     (f"delta={name}", re.escape(prefix + f"delta={name}")),
-                     (f"forms={name}", re.escape(f"forms seed={seed} selected=") + r"([0-7](?:,[0-7])*)?")))
-    rows.extend((name, re.escape(prefix + name)) for name in OPERATIONS + RELATIONS + CONTROLS)
-    rows.extend(("negative=" + name, re.escape(prefix + "negative=" + name)) for name in NEGATIVES)
-    rows.append(("negative=rel-out-of-scope", re.escape(prefix + "negative=rel-out-of-scope target=") + r"(\d+)"))
-    rows.extend((f"cold-delta={name}", re.escape(prefix + f"cold-delta={name}")) for name in range(400, 400 + count))
-    rows.extend((("summary", re.escape(f"ok compiler-smith seed={seed} definitions={count} depth={depth} max-defs={maximum} domains=18 operations=27 relations=12 negatives=32 controls=3")),
-                 ("complete", re.escape("ok compiler-smith complete"))))
+        rows.extend(((f"generated={name}", prefix + f"generated={name} ", GENERATED_FIELDS),
+                     (f"delta={name}", prefix + f"delta={name}", None),
+                     (f"forms={name}", f"forms seed={seed} selected=", FORM_FIELDS)))
+    rows.extend((name, prefix + name, None) for name in OPERATIONS + RELATIONS + CONTROLS)
+    rows.extend(("negative=" + name, prefix + "negative=" + name, None) for name in NEGATIVES)
+    rows.append(("negative=rel-out-of-scope", prefix + "negative=rel-out-of-scope target=", REL_TARGET))
+    rows.extend((f"cold-delta={name}", prefix + f"cold-delta={name}", None) for name in range(400, 400 + count))
+    rows.extend((("summary", f"ok compiler-smith seed={seed} definitions={count} depth={depth} max-defs={maximum} domains=18 operations=27 relations=12 negatives=32 controls=3", None),
+                 ("complete", "ok compiler-smith complete", None)))
     return rows
 
 
@@ -110,28 +122,36 @@ def inspect_result(result, seed, config):
         category = result.classify()
         return {}, Failure("native-process", category if category in {"crash", "timeout", "memory"} else "oracle-unavailable",
                            f"{category} exit={result.returncode}: {result.stderr}")
-    steps = protocol_steps(seed, config.depth, config.max_defs)
+    count = definition_count(seed, config.max_defs)
+    steps = protocol_steps(seed, config.depth, config.max_defs, count)
     lines = result.stdout.splitlines()
-    coverage = {"definitions": definition_count(seed, config.max_defs), "families": [], "references": [], "forms": [], "rel_target": 0}
+    coverage = {"definitions": count, "families": [], "references": [], "forms": [], "rel_target": 0}
     if len(lines) > len(steps):
         return {}, Failure("native-protocol", "oracle-unavailable", "extra native result lines")
     for index, line in enumerate(lines):
-        name, pattern = steps[index]
-        match = re.fullmatch(pattern, line)
-        if not match:
+        name, expected, suffix = steps[index]
+        if suffix is None:
+            valid = line == expected
+            match = None
+        else:
+            match = suffix.fullmatch(line, len(expected)) if line.startswith(expected) else None
+            valid = match is not None
+        if not valid:
             return {}, Failure("native-protocol", "oracle-unavailable", f"unexpected result at {name}: {line}")
-        if name.startswith("generated="):
+        if match is None:
+            continue
+        if suffix is GENERATED_FIELDS:
             family, names = int(match[1]), match[2].split(",") if match[2] else []
             if family >= 18 or any(not item or not 400 <= int(item) < int(name.split("=")[1]) for item in names):
                 return {}, Failure("native-protocol", "oracle-unavailable", "invalid generated family or forward reference")
             coverage["families"].append(family)
             coverage["references"].extend(int(item) for item in names)
-        elif name.startswith("forms="):
+        elif suffix is FORM_FIELDS:
             forms = [int(item) for item in match[1].split(",")] if match[1] else []
             if len(forms) < config.depth:
                 return {}, Failure("native-protocol", "oracle-unavailable", "generated form depth was truncated")
             coverage["forms"].extend(forms)
-        elif name == "negative=rel-out-of-scope":
+        elif suffix is REL_TARGET:
             coverage["rel_target"] = int(match[1])
     if result.returncode == 0:
         if result.stderr or len(lines) != len(steps):
@@ -191,16 +211,62 @@ class CoreRunner:
     def __init__(self, config, report, program, *, timeout_s=20, log=print):
         self.config, self.report, self.program = config, report, program
         self.timeout_s, self.log = timeout_s, log
-        self.attempt = 0
 
-    def evaluate(self, config, seed):
-        self.attempt += 1
-        result = self.program.run(["--profile", config.profile, "--seed", str(seed), "--count", "1",
-                                   "--depth", str(config.depth), "--max-defs", str(config.max_defs)],
-                                  f"seed-{seed}-attempt-{self.attempt}", self.timeout_s)
-        self.report.timing["kernel.process_s"] = self.report.timing.get("kernel.process_s", 0) + result.elapsed_s
-        self.report.timing["kernel.peak_memory_mib"] = max(self.report.timing.get("kernel.peak_memory_mib", 0), result.peak_rss_mb)
+    def _execute(self, config, seed, label):
+        return self.program.run(["--profile", config.profile, "--seed", str(seed), "--count", "1",
+                                 "--depth", str(config.depth), "--max-defs", str(config.max_defs)],
+                                label, self.timeout_s)
+
+    def _record_timing(self, elapsed_s, peak_memory_mib):
+        self.report.timing["kernel.process_s"] = self.report.timing.get("kernel.process_s", 0) + elapsed_s
+        self.report.timing["kernel.peak_memory_mib"] = max(self.report.timing.get("kernel.peak_memory_mib", 0), peak_memory_mib)
+
+    def evaluate(self, config, seed, *, label):
+        result = self._execute(config, seed, label)
+        self._record_timing(result.elapsed_s, result.peak_rss_mb)
         return inspect_result(result, seed, config)
+
+    def _run_seed(self, ordinal, original):
+        seed, generator_digest = original["seed"], original["generator_hash"]
+        directory = f"seeds/{ordinal}-{seed}"
+        work = self.program.work / directory
+        work.mkdir(parents=True, exist_ok=True)
+        attempt = 0
+        elapsed_s, peak_memory_mib = 0.0, 0.0
+        attempts = {}
+
+        def evaluate(config, selected):
+            nonlocal attempt, elapsed_s, peak_memory_mib
+            attempt += 1
+            result = self._execute(config, selected, f"{directory}/attempt-{attempt}")
+            elapsed_s += result.elapsed_s
+            peak_memory_mib = max(peak_memory_mib, result.peak_rss_mb)
+            laws, failure = inspect_result(result, selected, config)
+            attempts[(config.depth, config.max_defs)] = failure
+            return laws, failure
+
+        laws, failure = evaluate(self.config, seed)
+        if failure is None:
+            return SeedResult(laws, None, elapsed_s, peak_memory_mib)
+
+        minimum = self.config
+        original_failure = failure
+        if self.config.shrink_budget and failure.classification not in {"oracle-unavailable", "crash", "timeout", "memory", "generator-error"}:
+            minimum = shrink(self.config, seed, failure, lambda config, selected: evaluate(config, selected)[1])
+            failure = attempts[(minimum.depth, minimum.max_defs)]
+        saved = recipe(minimum, seed, generator_digest)
+        path = work / f"seed-{seed}-recipe.json"
+        path.write_text(json.dumps({"original": original, "minimal": saved,
+                                    "failure": {"prop": original_failure.prop, "classification": original_failure.classification,
+                                                "detail": original_failure.detail}}, indent=1, sort_keys=True) + "\n", encoding="utf-8")
+        finding = Finding(LAYER, failure.prop, failure.classification, seed, self.config.profile,
+                          generator_digest, f"core-{seed}", "native-kernel", failure.expected, failure.detail,
+                          saved, "", self.config.depth * self.config.max_defs, minimum.depth * minimum.max_defs,
+                          notes=["Original recipe: " + json.dumps(original, sort_keys=True)])
+        finding_path = work / f"finding-{finding.finding_id}.json"
+        finding.replay = f"{self.config.replay_prefix} replay --finding {finding_path.relative_to(ROOT).as_posix()}"
+        finding_path.write_text(json.dumps(finding.to_json(), indent=1, sort_keys=True) + "\n", encoding="utf-8")
+        return SeedResult(laws, finding, elapsed_s, peak_memory_mib)
 
     def run(self):
         summary = self.report.layer(LAYER)
@@ -209,38 +275,26 @@ class CoreRunner:
         summary.coverage = coverage
         def add(group, name, count=1):
             coverage[group][name] = coverage[group].get(name, 0) + count
-        for ordinal, seed in enumerate(self.config.seeds):
-            original = recipe(self.config, seed, self.report.generator_hash)
-            # Validate before executing even for direct API callers.
+        originals = [recipe(self.config, seed, self.report.generator_hash) for seed in self.config.seeds]
+        for original in originals:
             read_recipe(original, self.report.generator_hash)
+        tasks = [Task(str(ordinal), max_jobs=1, memory_mib=self.program.memory_mb)
+                 for ordinal in range(len(originals))]
+        def run_task(task, _allocation):
+            ordinal = int(task.name)
+            return self._run_seed(ordinal, originals[ordinal])
+
+        memory_mib = available_memory_mib(minimum_mib=self.program.memory_mb)
+        results, stats = run_tasks(tasks, jobs=job_count(), memory_mib=memory_mib, run=run_task)
+        self.report.timing.update({f"kernel.scheduler.{name}": value for name, value in stats.items() if value is not None})
+        for ordinal, seed in enumerate(self.config.seeds):
+            result = results[str(ordinal)]
             summary.cases += 1
-            laws, failure = self.evaluate(self.config, seed)
-            if failure is not None:
-                minimum = self.config
-                original_failure = failure
-                attempts = {}
-                def evaluate(candidate, selected, seen=attempts):
-                    found = self.evaluate(candidate, selected)[1]
-                    seen[(candidate.depth, candidate.max_defs)] = found
-                    return found
-                if self.config.shrink_budget and failure.classification not in {"oracle-unavailable", "crash", "timeout", "memory", "generator-error"}:
-                    minimum = shrink(self.config, seed, failure, evaluate)
-                    failure = attempts.get((minimum.depth, minimum.max_defs)) or failure
-                saved = recipe(minimum, seed, self.report.generator_hash)
-                path = self.program.work / f"seed-{seed}-recipe.json"
-                path.write_text(json.dumps({"original": original, "minimal": saved,
-                                            "failure": {"prop": original_failure.prop, "classification": original_failure.classification,
-                                                        "detail": original_failure.detail}}, indent=1, sort_keys=True) + "\n", encoding="utf-8")
-                finding = Finding(LAYER, failure.prop, failure.classification, seed, self.config.profile,
-                                  self.report.generator_hash, f"core-{seed}", "native-kernel", failure.expected,
-                                  failure.detail, saved, "", self.config.depth * self.config.max_defs,
-                                  minimum.depth * minimum.max_defs, notes=["Original recipe: " + json.dumps(original, sort_keys=True)])
-                finding_path = self.program.work / f"finding-{finding.finding_id}.json"
-                from ourosmith import ROOT
-                finding.replay = f"{self.config.replay_prefix} replay --finding {finding_path.relative_to(ROOT).as_posix()}"
-                finding_path.write_text(json.dumps(finding.to_json(), indent=1, sort_keys=True) + "\n", encoding="utf-8")
-                self.report.add(finding)
+            self._record_timing(result.elapsed_s, result.peak_memory_mib)
+            if result.finding is not None:
+                self.report.add(result.finding)
                 continue
+            laws = result.laws
             count = laws["definitions"]
             summary.positive_checks += 48 + count
             summary.negative_checks += 32

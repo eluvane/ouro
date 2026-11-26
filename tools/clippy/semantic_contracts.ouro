@@ -38,25 +38,23 @@ def cs_global_value_contract (units : List SrcUnit) (api : CmApi) (name : Nat) (
     let owner : ScDecl := cm_api_decl api in
     match cm_api_lookup name index with
     | Nothing => cs_unknown owner CsUnsupported
-    | Just target => match cm_api_decl target with
-      | ScDeclOf _ module_id kind parent signature _ _ =>
-          match andb (cm_decl_visible (sc_decl_module owner) (cm_api_decl target) units)
-              (andb (eq_nat kind 3) (andb (eq_nat(cm_api_arity target, 0))
-                (cg_s_returns parent signature))) with
-          | False => cs_unknown owner CsUnsupported
-          | True => match cm_api_lookup parent index with
-            | Nothing => cs_unknown owner CsUnsupported
-            | Just family => match andb (eq_nat(sc_decl_kind (cm_api_decl family), 2))
-                (eq_nat(module_id, sc_decl_module (cm_api_decl family))) with
-              | False => cs_unknown owner CsUnsupported
-              | True => CsContract (sc_decl_module owner) (sc_decl_name owner)
-                  CsComplete CsPure CsUnknownResult (CsGlobalValueOrigin name)
-                  (cs_parameter_facts(cm_api_arity api, Nothing Nat))
-                  (Just Nat 0) (Just Bool False) 0
-              end
-            end
-          end
-      end
+    | Just target => let (ScDeclOf _ module_id kind parent signature _ _) := cm_api_decl target in
+      if
+        andb (cm_decl_visible (sc_decl_module owner) (cm_api_decl target) units)
+          (andb (eq_nat kind 3) (andb (eq_nat(cm_api_arity target, 0))
+            (cg_s_returns parent signature))) then
+        match cm_api_lookup parent index with
+        | Nothing => cs_unknown owner CsUnsupported
+        | Just family => if
+            andb (eq_nat(sc_decl_kind (cm_api_decl family), 2))
+              (eq_nat(module_id, sc_decl_module (cm_api_decl family))) then
+            CsContract (sc_decl_module owner) (sc_decl_name owner)
+              CsComplete CsPure CsUnknownResult (CsGlobalValueOrigin name)
+              (cs_parameter_facts(cm_api_arity api, Nothing Nat))
+              (Just Nat 0) (Just Bool False) 0
+          else cs_unknown owner CsUnsupported
+        end
+      else cs_unknown owner CsUnsupported
     end;
 
 -- Functional update copies only the search path, never all declarations/ASTs.
@@ -84,25 +82,24 @@ def cs_expansions (state : CsAnalysis) : Nat :=
 def cs_unavailable (state : CsAnalysis) : Nat :=
     match state with | CsAnalysisOf _ _ _ _ _ value => value end;
 def cs_save (name : Nat) (contract : CsFunctionContract) (state : CsAnalysis) : CsAnalysis :=
-    match state with | CsAnalysisOf cache budget computed hits edges unavailable =>
-      CsAnalysisOf (cs_cache_put name contract cache) budget computed hits edges unavailable end;
+    let (CsAnalysisOf cache budget computed hits edges unavailable) := state in
+    CsAnalysisOf (cs_cache_put name contract cache) budget computed hits edges unavailable;
 def cs_hit (state : CsAnalysis) : CsAnalysis :=
-    match state with | CsAnalysisOf cache budget computed hits edges unavailable =>
-      CsAnalysisOf cache budget computed (add hits 1) edges unavailable end;
+    let (CsAnalysisOf cache budget computed hits edges unavailable) := state in
+    CsAnalysisOf cache budget computed (add hits 1) edges unavailable;
 def cs_fail (api : CmApi) (status : CsStatus) (state : CsAnalysis) : CsAnalysis :=
-    match cs_save(sc_decl_name (cm_api_decl api), cs_unknown(cm_api_decl api, status), state) with
-    | CsAnalysisOf cache budget computed hits edges unavailable =>
-        CsAnalysisOf cache budget computed hits edges (add unavailable 1) end;
+    let (CsAnalysisOf cache budget computed hits edges unavailable) :=
+      cs_save(sc_decl_name (cm_api_decl api), cs_unknown(cm_api_decl api, status), state) in
+    CsAnalysisOf cache budget computed hits edges (add unavailable 1);
 
 def cs_compose (api : CmApi) (callee : CmApi) (origin : CsOrigin) : CsFunctionContract :=
     let decl : ScDecl := cm_api_decl api in
     let inner : CsFunctionContract := cm_api_summary callee in
-    match cs_complete inner with
-    | False => cs_unknown(decl, cs_status inner)
-    | True => CsContract (sc_decl_module decl) (sc_decl_name decl) CsComplete
+    if cs_complete inner then
+      CsContract (sc_decl_module decl) (sc_decl_name decl) CsComplete
         (cs_effect inner) (cs_result inner) origin (cs_arguments inner)
         (cs_cost inner) (cs_mutation inner) (cs_work_role inner)
-    end;
+    else cs_unknown(decl, cs_status inner);
 
 -- Depth is per chain; the expansion budget is shared by every demand. Completed
 -- contracts are memoized, including unsupported bodies. A cycle/depth/budget
@@ -117,52 +114,47 @@ def cs_infer (units : List SrcUnit) : Nat -> Nat -> CsAnalysis -> CsAnalysis :=
       | CsActive => cs_fail api CsCycle state
       | CsPending => match depth with
         | Z => cs_fail api CsDepth state
-        | S less => match state with
-          | CsAnalysisOf cache budget computed hits edges unavailable => match budget with
-            | Z => cs_fail api CsBudget state
-            | S remaining =>
-                let next : CsAnalysis := cs_save name (cs_unknown(cm_api_decl api, CsActive))
-                  (CsAnalysisOf cache remaining (add computed 1) hits edges unavailable) in
-                match eq_nat(sc_decl_kind (cm_api_decl api), 0) with
-                | False => cs_fail api CsUnsupported next
-                | True =>
-                    let origin : CsOrigin := match sc_decl_body (cm_api_decl api) with
-                      | Nothing => cs_origin (cm_api_summary api)
-                      | Just body => cs_local_origin cm_type_alias_fuel (cm_api_arity api) 0 [] body end in
-                    match origin with
-                    | CsUnknownOrigin => cs_fail api CsUnsupported next
-                    | CsArgumentOrigin _ => cs_save name (cs_direct_contract api origin) next
-                    | CsLiteralOrigin _ _ => cs_save name (cs_direct_contract api origin) next
-                    | CsGlobalValueOrigin target =>
-                        let contract : CsFunctionContract := cs_global_value_contract units api target (cs_cache next) in
-                        match cs_complete contract with
-                        | False => cs_fail api CsUnsupported next
-                        | True => cs_save name contract next end
-                    | CsDelegateOrigin target arguments =>
-                        match andb (eq_nat(length Nat arguments, cm_api_arity api))
-                            (cs_ordered_arguments arguments 0) with
-                        | False => cs_fail api CsUnsupported next
-                        | True => match cm_api_lookup(target, cs_cache next) with
-                          | Nothing => cs_fail api CsUnsupported next
-                          | Just callee => match andb
-                              (cm_decl_visible (sc_decl_module (cm_api_decl api)) (cm_api_decl callee) units)
-                              (eq_nat(cm_api_arity callee, length Nat arguments)) with
-                            | False => cs_fail api CsUnsupported next
-                            | True =>
-                                let expanded : CsAnalysis := match next with
-                                  | CsAnalysisOf table fuel count cached steps missing =>
-                                      CsAnalysisOf table fuel count cached (add steps 1) missing end in
-                                let resolved : CsAnalysis := go less target expanded in
-                                match cm_api_lookup(target, cs_cache resolved) with
-                                | Nothing => cs_fail api CsUnsupported resolved
-                                | Just completed => cs_save name (cs_compose api completed origin) resolved
-                                end
-                            end
+        | S less => let (CsAnalysisOf cache budget computed hits edges unavailable) := state in
+          match budget with
+          | Z => cs_fail api CsBudget state
+          | S remaining =>
+              let next : CsAnalysis := cs_save name (cs_unknown(cm_api_decl api, CsActive))
+                (CsAnalysisOf cache remaining (add computed 1) hits edges unavailable) in
+              if eq_nat(sc_decl_kind (cm_api_decl api), 0) then
+                let origin : CsOrigin := match sc_decl_body (cm_api_decl api) with
+                  | Nothing => cs_origin (cm_api_summary api)
+                  | Just body => cs_local_origin cm_type_alias_fuel (cm_api_arity api) 0 [] body end in
+                match origin with
+                | CsUnknownOrigin => cs_fail api CsUnsupported next
+                | CsArgumentOrigin _ => cs_save name (cs_direct_contract api origin) next
+                | CsLiteralOrigin _ _ => cs_save name (cs_direct_contract api origin) next
+                | CsGlobalValueOrigin target =>
+                    let contract : CsFunctionContract := cs_global_value_contract units api target (cs_cache next) in
+                    if cs_complete contract then cs_save name contract next
+                    else cs_fail api CsUnsupported next
+                | CsDelegateOrigin target arguments =>
+                    if
+                      andb (eq_nat(length Nat arguments, cm_api_arity api))
+                        (cs_ordered_arguments arguments 0) then
+                      match cm_api_lookup(target, cs_cache next) with
+                      | Nothing => cs_fail api CsUnsupported next
+                      | Just callee => if
+                          andb
+                            (cm_decl_visible (sc_decl_module (cm_api_decl api)) (cm_api_decl callee) units)
+                            (eq_nat(cm_api_arity callee, length Nat arguments)) then
+                          let expanded : CsAnalysis := let (CsAnalysisOf table fuel count cached steps missing) :=
+                              next in
+                            CsAnalysisOf table fuel count cached (add steps 1) missing in
+                          let resolved : CsAnalysis := go less target expanded in
+                          match cm_api_lookup(target, cs_cache resolved) with
+                          | Nothing => cs_fail api CsUnsupported resolved
+                          | Just completed => cs_save name (cs_compose api completed origin) resolved
                           end
-                        end
-                    end
+                        else cs_fail api CsUnsupported next
+                      end
+                    else cs_fail api CsUnsupported next
                 end
-            end
+              else cs_fail api CsUnsupported next
           end
         end
       end

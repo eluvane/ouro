@@ -93,7 +93,7 @@ def native_text{seed} : String := "intrinsic Decoy : Type; extern Decoy : Type;"
     ]
     paragraphs = [header, f"Declarations: {len(sections)}."]
     for kind, identifier, declaration, comment in sections:
-        paragraphs.extend([f"## {kind} {identifier}", f"```\n{declaration}\n```"])
+        paragraphs.extend([f"## {kind} {identifier}", f"```ouro\n{declaration}\n```"])
         if comment:
             paragraphs.append(comment)
     return source, "\n\n".join(paragraphs) + "\n", signature, prose

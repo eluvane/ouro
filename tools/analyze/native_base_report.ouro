@@ -1,0 +1,170 @@
+import "native_composition.ouro",
+  "../../std/data.ouro",
+  "../../std/process.ouro";
+
+inductive NativeAnalyzeBaseSummary : Type :=
+  | MkNativeAnalyzeBaseReport : List String -> Maybe String -> NativeAnalyzeBaseSummary;
+
+def native_analyze_wire_message (error : BoundedNativeReportError) : String :=
+    match error with
+    | BoundedNativeReportByteLimit => "native report exceeds its byte limit"
+    | BoundedNativeReportEncoding stream => match stream with
+      | CaptureStdout => "native report stdout is not valid UTF-8 text"
+      | CaptureStderr => "native report stderr is not valid UTF-8 text"
+      end
+    | BoundedNativeReportNewline stream => match stream with
+      | CaptureStdout => "native report stdout has an incomplete or invalid line ending"
+      | CaptureStderr => "native report stderr has an incomplete or invalid line ending"
+      end
+    | BoundedNativeReportStatus code => str_concat "native report status exceeds DWORD: " (str_of_nat code)
+    | BoundedNativeReportPolicy cause => bounded_drive_error_message cause
+    end;
+
+def native_analyze_family_message (error : NativeFamilyQueryError) : String :=
+    match error with
+    | NativeFamilyQueryRaw cause => native_analyze_wire_message cause
+    | NativeFamilyQueryMissing => "native family query omitted its report"
+    | NativeFamilyQueryMalformed => "native family query has a malformed or repeated report"
+    | NativeFamilyQueryNames => "native family query has invalid or repeated family names"
+    | NativeFamilyQueryStderr => "native family query emitted stderr"
+    | NativeFamilyQueryExit code => str_concat "native family query exit=" (str_of_nat code)
+    | NativeFamilyQueryInconsistent => "native family query differs from the requested family list"
+    end;
+
+def native_analyze_report_message (error : NativeAnalyzeCompositionError) : String :=
+    match error with
+    | NativeAnalyzeBaseStatus code => str_concat "base worker exit=" (str_of_nat code)
+    | NativeAnalyzeBaseStderr => "base worker emitted stderr with a success status"
+    | NativeAnalyzeBaseReport => "base worker omitted or malformed the completion report"
+    | NativeAnalyzeBaseBytes cause => native_analyze_wire_message cause
+    | NativeAnalyzeFamilySelection cause => native_analyze_family_message cause
+    | NativeAnalyzeMissingDrive => "requested structured worker result is missing"
+    | NativeAnalyzeUnexpectedDrive => "unrequested structured worker result was supplied"
+    | NativeAnalyzeDriveStatus code => str_concat "structured worker exit=" (str_of_nat code)
+    | NativeAnalyzeDriveReport cause => native_analyze_wire_message cause
+    end;
+
+def native_analyze_base_read (profile : String) (files : String) (result : ProcResult)
+    : Either NativeAnalyzeCompositionError NativeAnalyzeBaseSummary :=
+    let? (Left, Right) : Either NativeAnalyzeCompositionError NativeAnalyzeBaseSummary do
+      (native_analyze_base_verify profile files result)?;
+      let lines : List String := (mapLeft BoundedNativeReportError (List String)
+        NativeAnalyzeCompositionError NativeAnalyzeBaseBytes
+        (native_analyze_base_lines (str_len (proc_stdout result)) (proc_stdout result) Z []))?;
+      let banners : List String := filter String (fun (line : String) => str_starts line "ANALYZE_OK ") lines;
+      let fields : List String := (match banners with
+        | Cons banner _ => match str_strip_prefix banner (str_cat3 "ANALYZE_OK profile=" profile " ") with
+          | Nothing => Left NativeAnalyzeCompositionError (List String) NativeAnalyzeBaseReport
+          | Just body => match native_analyze_base_counts native_analyze_count_keys (str_split body 32) with
+            | Nothing => Left NativeAnalyzeCompositionError (List String) NativeAnalyzeBaseReport
+            | Just counts => Right NativeAnalyzeCompositionError (List String) counts
+            end
+          end
+        | Nil => Left NativeAnalyzeCompositionError (List String) NativeAnalyzeBaseReport
+        end)?;
+      let facts : List String := filter String (fun (line : String) => str_starts line "ANALYZE_FACTS ") lines;
+      let latest : Maybe String := (match facts with
+        | Nil => Right NativeAnalyzeCompositionError (Maybe String) (Nothing String)
+        | Cons fact rest => match rest with
+          | Nil => Right NativeAnalyzeCompositionError (Maybe String) (Just String fact)
+          | Cons _ _ => Left NativeAnalyzeCompositionError (Maybe String) NativeAnalyzeBaseReport
+          end
+        end)?;
+      MkNativeAnalyzeBaseReport fields latest
+    end;
+
+def native_analyze_decimal_add (left : String) (right : String) : Maybe String :=
+    if notb(andb(bounded_native_report_count left, bounded_native_report_count right)) then Nothing String
+    else
+      let digits : Maybe (List Nat) :=
+        (fix plus (fuel : Nat) (a : List Nat) (b : List Nat) (carry : Nat) : Maybe (List Nat) :=
+          match a with
+          | Nil => match b with
+            | Nil => Just (List Nat) (if eq_nat carry Z then [] else [add 48 carry])
+            | Cons digit rest => match fuel with
+              | Z => Nothing (List Nat)
+              | S remaining =>
+                  let total : Nat := add (sub digit 48) carry in
+                  mapMaybe (List Nat) (List Nat)
+                    (fun (tail : List Nat) => Cons Nat
+                      (add 48 (if ltb_nat total 10 then total else sub total 10)) tail)
+                    (plus remaining [] rest (if ltb_nat total 10 then Z else 1))
+              end
+            end
+          | Cons digit rest => match fuel with
+            | Z => Nothing (List Nat)
+            | S remaining =>
+                let total : Nat := add (add (sub digit 48)
+                  (match b with | Nil => Z | Cons other _ => sub other 48 end)) carry in
+                mapMaybe (List Nat) (List Nat)
+                  (fun (tail : List Nat) => Cons Nat
+                    (add 48 (if ltb_nat total 10 then total else sub total 10)) tail)
+                  (plus remaining rest (tail Nat b) (if ltb_nat total 10 then Z else 1))
+            end
+          end) (S (add (str_len left) (str_len right)))
+            (reverse_lin Nat (str_codes left)) (reverse_lin Nat (str_codes right)) Z in
+      mapMaybe (List Nat) String (fun (value : List Nat) => str_of_codes (reverse_lin Nat value)) digits;
+
+def native_analyze_counts_zero : List String :=
+    map String String (fun (_ : String) => "0") native_analyze_count_keys;
+
+def native_analyze_counts_add : List String -> List String -> Maybe (List String) :=
+    fix sum (a : List String) (b : List String) : Maybe (List String) :=
+      match a with
+      | Nil => match b with | Nil => Just (List String) [] | Cons _ _ => Nothing (List String) end
+      | Cons digit rest => match b with
+        | Nil => Nothing (List String)
+        | Cons other more =>
+            let? (Nothing, Just) : Maybe (List String) do
+              let total : String := (native_analyze_decimal_add digit other)?;
+              let tail : List String := (sum rest more)?;
+              Cons String total tail
+            end
+        end
+      end;
+
+def native_analyze_counts_render : List String -> List String -> List String :=
+    fix render (keys : List String) (values : List String) : List String :=
+      match keys with
+      | Nil => []
+      | Cons key rest => match values with
+        | Nil => []
+        | Cons value tail => Cons String (str_cat3 key "=" value) (render rest tail)
+        end
+      end;
+
+def native_analyze_base_banner (profile : String) (counts : List String) : String :=
+    str_cat3 (str_cat3 "ANALYZE_OK profile=" profile " ")
+      (str_join " " (native_analyze_counts_render native_analyze_count_keys counts)) "\n";
+
+def native_analyze_facts_choose (earlier : Maybe String) (later : Maybe String) : Maybe String :=
+    match later with
+    | Nothing => earlier
+    | Just line => match earlier with
+      | Nothing => later
+      | Just _ => if str_contains line "api_surface=baseline " then later else earlier
+      end
+    end;
+
+-- A failed capture can end inside a completion line.
+def native_analyze_failure_output (text : String) : String :=
+    (fix strip (lines : List String) : String :=
+      match lines with
+      | Nil => ""
+      | Cons line rest =>
+          let more : String := strip rest in
+          if orb(str_starts line "ANALYZE_OK ", str_starts line "ANALYZE_FACTS ") then more
+          else str_concat line (if nullb String rest then "" else str_concat "\n" more)
+      end) (str_lines text);
+
+def native_analyze_merge_results (base : ProcResult) (drive : Maybe ProcResult) : ProcResult :=
+    match drive with
+    | Nothing => if eq_nat (proc_code base) Z then base else
+        MkProcResult (proc_code base) (native_analyze_failure_output (proc_stdout base)) (proc_stderr base)
+    | Just structured =>
+        let failed : Bool := orb(notb(eq_nat (proc_code base) Z), notb(eq_nat (proc_code structured) Z)) in
+        MkProcResult (if failed then 1 else Z)
+          (str_concat (if failed then native_analyze_failure_output (proc_stdout base)
+            else proc_stdout base) (proc_stdout structured))
+          (str_concat (proc_stderr base) (proc_stderr structured))
+    end;

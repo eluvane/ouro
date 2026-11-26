@@ -13,9 +13,15 @@ from __future__ import annotations
 import re
 import sys
 import tempfile
+from collections import defaultdict
+from functools import cache, lru_cache
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from selfhost_module_cache import DECL_RE, quoted_import_targets
+
+if TYPE_CHECKING:
+    from collections.abc import Container, Iterator, Mapping
 
 ROOT = Path(__file__).resolve().parents[1]
 UNIT = ROOT / "tools/clippy/semantic_unit.ouro"
@@ -47,6 +53,7 @@ DECL_WORDS = {
     "def", "inductive", "record", "axiom", "theorem", "lemma", "effect", "handler",
     "intrinsic", "extern",
 }
+ImportSnapshot = dict[str, tuple[str, list[str]]]
 
 
 class GapError(ValueError):
@@ -75,7 +82,7 @@ def load_rules(source: str) -> dict[str, tuple[str, ...]]:
     }
 
 
-def stubbed(path: str, root: str, direct: set[str], rules: dict[str, tuple[str, ...]]) -> bool:
+def stubbed(path: str, root: str, direct: set[str], rules: Mapping[str, Container[str]]) -> bool:
     if path == root or path in direct or path in rules["keep"]:
         return False
     if root.startswith("runtime/") and path.startswith(PLATFORM_PREFIX):
@@ -85,9 +92,8 @@ def stubbed(path: str, root: str, direct: set[str], rules: dict[str, tuple[str, 
     return False
 
 
-def code_words(source: str) -> list[tuple[str, int, str | None]]:
+def code_words(source: str) -> Iterator[tuple[str, int, str | None]]:
     """Words outside comments and literals, with the preceding word."""
-    words: list[tuple[str, int, str | None]] = []
     index = 0
     line = 1
     previous: str | None = None
@@ -122,19 +128,18 @@ def code_words(source: str) -> list[tuple[str, int, str | None]]:
             index += 1
             continue
         word = match.group(0)
-        words.append((word, line, previous))
+        yield word, line, previous
         previous = word
         index = match.end()
-    return words
 
 
 def definitions(source: str) -> set[str]:
     return {match.group(2) for line in source.splitlines() if (match := DECL_RE.match(line))}
 
 
-def read_source(root: Path, path: str) -> str:
-    file = (root / path).resolve()
-    if not file.is_relative_to(root.resolve()) or not file.is_file():
+def read_source(resolved_root: Path, path: str) -> str:
+    file = (resolved_root / path).resolve()
+    if not file.is_relative_to(resolved_root) or not file.is_file():
         raise GapError(f"import target is missing: {path}")
     return file.read_text(encoding="utf-8")
 
@@ -153,15 +158,38 @@ def production_roots(root: Path) -> list[str]:
     return found
 
 
-def gaps_for(root: Path, rules: dict[str, tuple[str, ...]], roots: list[str]) -> list[str]:
+def gaps_for(root: Path, rules: dict[str, tuple[str, ...]], roots: list[str], *,
+             import_snapshot: ImportSnapshot | None = None) -> list[str]:
+    resolved_root = root.resolve()
+    rule_paths = {key: frozenset(paths) for key, paths in rules.items()}
     text: dict[str, str] = {}
     imports: dict[str, list[str]] = {}
 
     def load(path: str) -> str:
         if path not in text:
-            text[path] = read_source(root, path)
-            imports[path] = quoted_import_targets(text[path], path)
+            source = read_source(resolved_root, path)
+            targets = quoted_import_targets(source, path)
+            text[path], imports[path] = source, targets
+            if import_snapshot is not None:
+                import_snapshot[path] = (source, targets)
         return text[path]
+
+    @cache
+    def declared_names(path: str) -> set[str]:
+        return definitions(text[path])
+
+    @lru_cache(maxsize=64)
+    def used_lines(path: str) -> dict[str, list[int]]:
+        source = text[path]
+        binders = set(re.findall(r"\(\s*([A-Za-z_][A-Za-z0-9_']*)\s*:", source))
+        positions: dict[str, list[int]] = defaultdict(list)
+        for word, line, previous in code_words(source):
+            if previous == "def" or word in binders:
+                continue
+            lines = positions[word]
+            if not lines or lines[-1] != line:
+                lines.append(line)
+        return positions
 
     full_of: dict[str, set[str]] = {}
 
@@ -182,53 +210,58 @@ def gaps_for(root: Path, rules: dict[str, tuple[str, ...]], roots: list[str]) ->
         full_of[path] = seen
         return seen
 
-    def reachable(entry: str) -> tuple[set[str], set[str]]:
-        """Files the walker parses. Stubbed imports contribute no declarations."""
+    def reachable(entry: str) -> tuple[set[str], bool]:
+        """Return harvested files and whether any import was stubbed."""
         load(entry)
         direct = set(imports[entry])
         harvested: set[str] = set()
-        signatures: set[str] = set()
         seen: set[str] = set()
         pending = [entry]
+        had_stub = False
         while pending:
             path = pending.pop()
             if path in seen:
                 continue
             seen.add(path)
             load(path)
-            if stubbed(path, entry, direct, rules):
+            if stubbed(path, entry, direct, rule_paths):
+                had_stub = True
                 continue
             harvested.add(path)
             pending.extend(imports[path])
-        return harvested, signatures
+        return harvested, had_stub
 
     reports: dict[tuple[str, str, str], str] = {}
     for entry in roots:
-        harvested, signatures = reachable(entry)
-        available: set[str] = set()
-        for path in harvested | signatures:
-            available.update(definitions(text[path]))
+        harvested, had_stub = reachable(entry)
+        if not had_stub:
+            continue
         beyond: dict[str, str] = {}
         for path in full_closure(entry):
-            if path in harvested or path in signatures:
+            if path in harvested:
                 continue
-            for name in definitions(text[path]):
+            for name in declared_names(path):
                 beyond.setdefault(name, path)
         if not beyond:
             continue
+        available: set[str] = set()
         for path in harvested:
-            reached = full_closure(path)
-            binders = set(re.findall(r"\(\s*([A-Za-z_][A-Za-z0-9_']*)\s*:", text[path]))
-            for word, line, previous in code_words(text[path]):
-                if previous == "def" or word in available or word in binders or word not in beyond:
+            available.update(declared_names(path))
+        missing = beyond.keys() - available
+        if not missing:
+            continue
+        for path in harvested:
+            positions = used_lines(path)
+            reached = None
+            for word in positions.keys() & missing:
+                owner = beyond[word]
+                if reached is None:
+                    reached = full_closure(path)
+                if owner not in reached:
                     continue
-                if beyond[word] not in reached:
-                    continue
-                key = (f"{path}:{line}", word, beyond[word])
-                reports.setdefault(
-                    key,
-                    f"CLIPPY_IMPORT_GAP root={entry} use={path}:{line} name={word} stub={beyond[word]}",
-                )
+                for line in positions[word]:
+                    key = (f"{path}:{line}", word, owner)
+                    reports.setdefault(key, f"CLIPPY_IMPORT_GAP root={entry} use={path}:{line} name={word} stub={owner}")
     return sorted(reports.values())
 
 
@@ -482,27 +515,32 @@ def binder_and_matches(
     return binders, uses, matches
 
 
-def read_tree(root: Path, files: list[str]) -> tuple[dict[str, str], dict[str, list[str]]]:
+def read_tree(root: Path, files: list[str], *,
+              import_snapshot: ImportSnapshot | None = None) -> tuple[dict[str, str], dict[str, list[str]]]:
+    resolved_root = root.resolve()
     text: dict[str, str] = {}
     imports: dict[str, list[str]] = {}
     for path in files:
-        source = read_source(root, path)
+        source = read_source(resolved_root, path)
         text[path] = source
-        imports[path] = quoted_import_targets(source, path)
+        previous = import_snapshot.pop(path, None) if import_snapshot is not None else None
+        imports[path] = previous[1] if previous is not None and previous[0] == source else quoted_import_targets(source, path)
     return text, imports
 
 
-def omission_scan(root: Path, checked: list[str]) -> list[str]:
+def omission_scan(root: Path, checked: list[str], *, import_snapshot: ImportSnapshot | None = None) -> list[str]:
     files = repo_sources(root)
-    text, imports = read_tree(root, files)
-    public: dict[str, set[str]] = {}
+    text, imports = read_tree(root, files, import_snapshot=import_snapshot)
+    # A name with more than one owner cannot produce a forgotten-import finding.
+    public_owner: dict[str, str | None] = {}
     shapes: dict[str, set[tuple[str, ...]]] = {}
     ctor_owner: dict[str, str] = {}
     ambiguous: set[str] = set()
     for path in files:
         names, inductives = module_facts(text[path])
         for name in names:
-            public.setdefault(name, set()).add(path)
+            if public_owner.setdefault(name, path) != path:
+                public_owner[name] = None
         for inductive, ctors in inductives.items():
             shapes.setdefault(inductive, set()).add(ctors)
             for ctor in ctors:
@@ -537,21 +575,14 @@ def omission_scan(root: Path, checked: list[str]) -> list[str]:
             raise GapError(f"import target is missing: {path}")
         binders, uses, matches = binder_and_matches(source_tokens(text[path]), constructors)
         reached = closure(path)
-        available = {name for name, owners in public.items() if owners & reached}
-        seen_names: set[tuple[str, str]] = set()
+        seen_names: set[str] = set()
         for name, line in uses:
-            if name in binders or name in available:
+            if name in binders or name in seen_names:
                 continue
-            owners = public.get(name)
-            if owners is None or len(owners) != 1:
+            owner = public_owner.get(name)
+            if owner is None or owner in reached:
                 continue
-            owner = next(iter(owners))
-            if owner in reached:
-                continue
-            key = (path, name, owner)
-            if key in seen_names:
-                continue
-            seen_names.add(key)
+            seen_names.add(name)
             reports[(f"{path}:{line}", name, owner)] = (
                 f"CLIPPY_IMPORT_OMISSION kind=forgotten-import use={path}:{line} name={name} owner={owner}"
             )
@@ -584,14 +615,17 @@ def scan(root: Path) -> list[str]:
     unit = (root / "tools/clippy/semantic_unit.ouro").read_text(encoding="utf-8")
     rules = load_rules(unit)
     roots = production_roots(root)
-    found = gaps_for(root, rules, roots)
+    import_snapshot: ImportSnapshot = {}
+    found = gaps_for(root, rules, roots, import_snapshot=import_snapshot)
     found.extend(inventory_problems(root, rules))
     found.extend(contract_problems(unit, rules))
-    found.extend(omission_scan(root, roots))
+    found.extend(omission_scan(root, roots, import_snapshot=import_snapshot))
     return sorted(set(found))
 
 
 def self_test() -> int:
+    from unittest.mock import patch
+
     failures: list[str] = []
     rules = {
         "keep": ("compiler/base.ouro",),
@@ -604,14 +638,19 @@ def self_test() -> int:
         (root / "compiler").mkdir()
         (root / "std").mkdir()
         (root / "runtime/platform").mkdir(parents=True)
-        (root / "compiler/middle.ouro").write_text(
-            'import "../std/process.ouro";\ndef bridge : Nat := Z;\n',
-            encoding="utf-8",
-        )
+        middle = root / "compiler/middle.ouro"
+        middle_source = ('import "../std/process.ouro";\n'
+                         "def bridge : Nat := add process_spawn process_spawn;\n"
+                         "def other : Nat := process_spawn Z;\n"
+                         "def bound (hidden_only : Nat) : Nat := hidden_only;\n")
+        middle.write_text(middle_source, encoding="utf-8")
         (root / "compiler/root.ouro").write_text(
             'import "middle.ouro", "base.ouro";\n'
             "def main : Nat := add (process_spawn deeper_only) base_value;\n",
             encoding="utf-8",
+        )
+        (root / "compiler/second.ouro").write_text(
+            'import "middle.ouro", "base.ouro";\ndef second : Nat := bridge;\n', encoding="utf-8",
         )
         (root / "std/deeper.ouro").write_text("def deeper_only : Nat := Z;\n", encoding="utf-8")
         (root / "std/hidden.ouro").write_text(
@@ -633,18 +672,128 @@ def self_test() -> int:
             'def text : String := "process_spawn";\n',
             encoding="utf-8",
         )
-        found = gaps_for(root, rules, ["compiler/root.ouro"])
-        if found != [
+        entries = ["compiler/root.ouro", "compiler/second.ouro"]
+        fixture_root = root / "compiler" / ".."
+        with (patch.object(sys.modules[__name__], "definitions", wraps=definitions) as declared,
+              patch.object(sys.modules[__name__], "code_words", wraps=code_words) as lexed,
+              patch.object(Path, "resolve", autospec=True, side_effect=Path.resolve) as resolutions):
+            found = gaps_for(fixture_root, rules, entries)
+        shared_gaps = [
+            f"CLIPPY_IMPORT_GAP root=compiler/root.ouro use=compiler/middle.ouro:{line} "
+            "name=process_spawn stub=std/process.ouro"
+            for line in (2, 3)
+        ]
+        root_gaps = [
             "CLIPPY_IMPORT_GAP root=compiler/root.ouro use=compiler/root.ouro:2 "
             "name=deeper_only stub=std/deeper.ouro",
             "CLIPPY_IMPORT_GAP root=compiler/root.ouro use=compiler/root.ouro:2 "
             "name=process_spawn stub=std/process.ouro",
-        ]:
+        ]
+        expected_gaps = [*shared_gaps, *root_gaps]
+        if found != expected_gaps:
             failures.append("stubbed declarations were not reported exactly: " + repr(found))
-        if gaps_for(root, rules, ["std/direct.ouro"]):
-            failures.append("a direct import of a stub path was treated as stubbed")
+        if declared.call_count != 7:
+            failures.append(f"shared declarations were extracted {declared.call_count} times across seven sources")
+        middle_scans = sum(call.args == (middle_source,) for call in lexed.call_args_list)
+        if middle_scans != 1:
+            failures.append(f"the shared source was scanned {middle_scans} times")
+        reversed_gaps = [*root_gaps, *(line.replace("root=compiler/root.ouro", "root=compiler/second.ouro")
+                                      for line in shared_gaps)]
+        if gaps_for(root, rules, entries[::-1]) != reversed_gaps:
+            failures.append("the gap scan did not credit the first root that harvested a shared use")
+        if [call.args[0] for call in resolutions.call_args_list].count(fixture_root) != 1:
+            failures.append("the import gap scan resolved its root more than once")
+
+        unit = root / "tools/clippy/semantic_unit.ouro"
+        unit.parent.mkdir(parents=True)
+        unit.write_text('def cm_import_bound_contracts : Bool := cm_skip_import_path "std/process.ouro";\n',
+                        encoding="utf-8")
+        module = sys.modules[__name__]
+        with (patch.object(module, "load_rules", return_value=rules),
+              patch.object(module, "production_roots", return_value=entries)):
+            with (patch.object(module, "read_source", wraps=read_source) as reads,
+                  patch.object(module, "quoted_import_targets", wraps=quoted_import_targets) as parsed):
+                combined = scan(root)
+            if combined != expected_gaps:
+                failures.append("the combined scan changed the exact findings: " + repr(combined))
+            middle_path = "compiler/middle.ouro"
+            middle_reads = sum(call.args[1] == middle_path for call in reads.call_args_list)
+            middle_parses = sum(call.args[1] == middle_path for call in parsed.call_args_list)
+            if (middle_reads, middle_parses) != (2, 1):
+                failures.append(f"the combined scan read the shared source {middle_reads} times "
+                                f"and parsed its imports {middle_parses} times")
+
+            def change_import(source: str, current_rules: dict[str, tuple[str, ...]],
+                              check_contracts=contract_problems) -> list[str]:
+                middle.write_text(middle_source.replace("std/process.ouro", "std/missing.ouro"), encoding="utf-8")
+                return check_contracts(source, current_rules)
+
+            with patch.object(module, "contract_problems", side_effect=change_import):
+                try:
+                    scan(root)
+                except GapError as error:
+                    if str(error) != "import target is missing: std/missing.ouro":
+                        failures.append("a changed import reported a different error: " + str(error))
+                else:
+                    failures.append("the omission scan accepted an import replaced between phases")
+        middle.write_text(middle_source, encoding="utf-8")
+
+        (root / "std/deeper.ouro").write_text("def new_deeper : Nat := Z;\n", encoding="utf-8")
+        if gaps_for(root, rules, entries) != [*shared_gaps, root_gaps[-1]]:
+            failures.append("a later scan kept declarations from an earlier source snapshot")
+        middle.write_text(middle_source.replace("process_spawn", "process_spare"), encoding="utf-8")
+        if gaps_for(root, rules, entries) != root_gaps[-1:]:
+            failures.append("a later scan kept uses from an earlier source snapshot")
+        try:
+            read_tree(root / "compiler", ["../std/deeper.ouro"])
+        except GapError as error:
+            if str(error) != "import target is missing: ../std/deeper.ouro":
+                failures.append("an escaping path reported a different import error")
+        else:
+            failures.append("the omission scanner read outside its root")
+        visits: dict[str, int] = defaultdict(int)
+
+        class TrackedImports(list[str]):
+            def __init__(self, path: str, targets: list[str]):
+                super().__init__(targets)
+                self.path = path
+
+            def __iter__(self):
+                visits[self.path] += 1
+                return super().__iter__()
+
+        def track_imports(source: str, path: str, parse=quoted_import_targets) -> list[str]:
+            return TrackedImports(path, parse(source, path))
+
+        with patch.object(module, "quoted_import_targets", side_effect=track_imports):
+            if gaps_for(root, rules, ["std/direct.ouro"]):
+                failures.append("a direct import of a stub path was treated as stubbed")
+        if visits != {"std/direct.ouro": 2, "std/process.ouro": 1, "std/hidden.ouro": 1, "std/deeper.ouro": 1}:
+            failures.append("fully harvested dependencies were traversed twice: " + repr(dict(visits)))
+
         if gaps_for(root, rules, ["compiler/quoted.ouro"]):
             failures.append("a quoted name was treated as a use")
+        hidden = root / "std/hidden.ouro"
+        hidden_source = hidden.read_text(encoding="utf-8")
+        hidden.write_text(hidden_source.replace("deeper.ouro", "absent.ouro"), encoding="utf-8")
+        try:
+            gaps_for(root, rules, entries)
+        except GapError as error:
+            if str(error) != "import target is missing: std/absent.ouro":
+                failures.append("a missing dependency behind a stub reported a different error: " + str(error))
+        else:
+            failures.append("a stub hid its missing transitive dependency")
+        finally:
+            hidden.write_text(hidden_source, encoding="utf-8")
+
+        covered = root / "compiler/covered.ouro"
+        covered.write_text('import "middle.ouro";\n'
+                           'def process_spawn : Nat := Z;\n'
+                           'def hidden_only : Nat := Z;\n'
+                           'def new_deeper : Nat := Z;\n', encoding="utf-8")
+        with patch.object(module, "code_words", wraps=code_words) as lexed:
+            if gaps_for(root, rules, ["compiler/covered.ouro"]) or lexed.called:
+                failures.append("covered stub names must not require a use scan")
         if not stubbed("runtime/platform/windows_fs.ouro", "std/io.ouro", set(), rules):
             failures.append("platform cone was harvested from outside runtime")
         if stubbed("runtime/platform/windows_fs.ouro", "runtime/managed.ouro", set(), rules):
@@ -674,7 +823,10 @@ def self_test() -> int:
         (root / "std").mkdir()
         (root / "compiler").mkdir()
         (root / "std/remote.ouro").write_text("def only_remote : Nat := Z;\ndef x : Nat := Z;\n", encoding="utf-8")
-        (root / "compiler/forgot.ouro").write_text("def main : Nat := only_remote;\n", encoding="utf-8")
+        (root / "std/other.ouro").write_text("def x : Nat := Z;\n", encoding="utf-8")
+        (root / "compiler/forgot.ouro").write_text(
+            "def main : Nat := only_remote x;\ndef repeat : Nat := only_remote;\n", encoding="utf-8",
+        )
         (root / "compiler/bound.ouro").write_text(
             "def main : Nat :=\n  do let! only_remote := Z;\n     only_remote;\n",
             encoding="utf-8",

@@ -1,7 +1,8 @@
 -- Second split parser shard; tag contracts must match parser_min and token exactly.
 
 import "parser_min.ouro",
-  "token.ouro";
+  "token.ouro",
+  "../std/listx.ouro";
 
 def parse_b_fun (parse : Nat -> Mode -> List Token -> Nat -> Value -> ParseResult Value)
     (fuel' : Nat) (toks : List Token) (pos : Nat) (extra : Value) : ParseResult Value :=
@@ -359,21 +360,34 @@ def parse_b_if (parse : Nat -> Mode -> List Token -> Nat -> Value -> ParseResult
 
 def parse_b_match (parse : Nat -> Mode -> List Token -> Nat -> Value -> ParseResult Value)
     (fuel' : Nat) (toks : List Token) (pos : Nat) (extra : Value) : ParseResult Value :=
-  let cont11 (scruts : List Expr) (toks2 : List Token) (pos2 : Nat) : ParseResult Value :=
-      let cont7 (_u : Unit) (toks3 : List Token) (pos3 : Nat) : ParseResult Value :=
-      bindValue (List (Pair(List (Pair(Nat, List Nat)), Expr))) asListRow (parse fuel' MMultiBranches toks3 pos3 extra)
-      (fun (rows : List (Pair (List (Pair Nat (List Nat))) Expr)) (toks4 : List Token) (pos4 : Nat) =>
-      let cont1 (_u2 : Unit) (toks5 : List Token) (pos5 : Nat) : ParseResult Value :=
-      match desugar_match_rows scruts rows toks5 pos5 with
-      | PErr p => PErr Value p
-      | POk e toks6 pos6 => okExpr e toks6 pos6
-      end
-      in bindParseResult Unit Value (expect_keyword kwEnd toks4 pos4)
-      cont1)
-      in bindParseResult Unit Value (expect_keyword kwWith toks2 pos2)
-      cont7
-    in bindValue (List Expr) asListExpr (parse fuel' MScrutList toks pos extra)
-    cont11;
+  let arms (scruts : List Expr) (after_subject : List Token) (with_pos : Nat)
+      (finish : Expr -> List Token -> Nat -> ParseResult Value) : ParseResult Value :=
+    bindParseResult Unit Value (expect_keyword kwWith after_subject with_pos)
+      (fun (_ : Unit) (branch_tokens : List Token) (branch_pos : Nat) =>
+        bindValue (List (Pair (List (Pair Nat (List Nat))) Expr)) asListRow
+          (parse fuel' MMultiBranches branch_tokens branch_pos extra)
+          (fun (rows : List (Pair (List (Pair Nat (List Nat))) Expr))
+              (after_branches : List Token) (end_pos : Nat) =>
+            bindParseResult Unit Value (expect_keyword kwEnd after_branches end_pos)
+              (fun (_ : Unit) (rest : List Token) (past : Nat) =>
+                bindParseResult Expr Value (desugar_match_rows scruts rows rest past) finish))) in
+  match is_exclam (peek toks) with
+  | False =>
+      bindValue (List Expr) asListExpr (parse fuel' MScrutList toks pos extra)
+        (fun (scruts : List Expr) (rest : List Token) (past : Nat) =>
+          arms scruts rest past okExpr)
+  | True =>
+      bindParseResult Unit Value (expect_tag tagExclam toks pos)
+        (fun (_ : Unit) (action_tokens : List Token) (action_pos : Nat) =>
+          bindValue Expr asExpr (parse fuel' MExpr action_tokens action_pos extra)
+            (fun (action : Expr) (rest : List Token) (past : Nat) =>
+              -- Source identifiers have nonzero IDs. The internal reference
+              -- is only the scrutinee in this bind's immediate continuation.
+              arms (list1_expr (EVar Z)) rest past
+                (fun (body : Expr) (after_match : List Token) (match_end : Nat) =>
+                  okExpr (EDo (Cons Expr (EDoBind Z action) (list1_expr body)))
+                    after_match match_end)))
+  end;
 
 def parse_b_fix (parse : Nat -> Mode -> List Token -> Nat -> Value -> ParseResult Value)
     (fuel' : Nat) (toks : List Token) (pos : Nat) (extra : Value) : ParseResult Value :=
@@ -598,6 +612,9 @@ def parse_b_do_items
     (parse : Nat -> Mode -> List Token -> Nat -> Value -> ParseResult Value)
     (fuel : Nat) (toks : List Token) (pos : Nat) (extra : Value)
     (earlier_rev : List Expr) : ParseResult Value :=
+  let finish (stmt : Expr) (prior : List Expr) (rest : List Token)
+      (end_pos : Nat) : ParseResult Value :=
+    okExpr (EDo (reverse_lin Expr (Cons Expr stmt prior))) rest end_pos in
   (fix go (remaining : Nat) (items : List Token) (position : Nat)
       (prior : List Expr) : ParseResult Value :=
     match remaining with
@@ -612,7 +629,6 @@ def parse_b_do_items
             match asExpr parsed with
             | Nothing => PErr Value end_pos
             | Just stmt =>
-                let completed : Expr := EDo (reverse Expr (Cons Expr stmt prior)) in
                 match is_semi (peek after_stmt) with
                 | True =>
                     match parse_b_do_has_next_stmt after_stmt with
@@ -622,10 +638,9 @@ def parse_b_do_items
                           (fun (_semi : Unit) (tail : List Token)
                               (tail_pos : Nat) =>
                             go next tail tail_pos (Cons Expr stmt prior))
-                    | False => okExpr completed after_stmt end_pos
+                    | False => finish stmt prior after_stmt end_pos
                     end
-                | False =>
-                    okExpr completed after_stmt end_pos
+                | False => finish stmt prior after_stmt end_pos
                 end
             end
         end

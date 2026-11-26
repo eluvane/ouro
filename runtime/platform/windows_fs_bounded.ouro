@@ -1,0 +1,125 @@
+import "windows_file_bounded.ouro", "windows_text.ouro";
+
+def windows_fs_bounded_copy (path : String) (owner : RawPtr U8) (one : USize)
+    : Nat -> Nat -> USize -> IO WindowsBoundedReadOutcome :=
+  fix copy (remaining : Nat) (index : Nat) (offset : USize) : IO WindowsBoundedReadOutcome :=
+    match remaining with
+    | Z => io_pure(WindowsBoundedReadOutcome, WindowsBoundedReadValue (Right FsBoundedReadError String ""))
+    | S rest => match u8_from_nat (prim_string_byte_at path index) with
+      | Nothing => io_pure(WindowsBoundedReadOutcome, WindowsBoundedReadGuard)
+      | Just byte => do let! address := raw_add U8 owner offset;
+                        raw_store_u8 address byte;
+                        copy(rest, S index, usize_add offset one)
+      end
+    end;
+
+def windows_fs_bounded_handle (file_handle : RawPtr U8) (scratch : RawPtr U8)
+    (one : USize) (cap : Nat) : IO WindowsBoundedReadOutcome :=
+    let two : USize := usize_add one one in
+    let four : USize := usize_add two two in
+    let eight : USize := usize_add four four in
+    let sixteen : USize := usize_add eight eight in
+    let reparse : USize := usize_shift_left(one, raw_size_to_u32 (usize_add eight two)) in
+    do let! status := windows_file_information file_handle (raw_size_to_u32 (usize_add eight one)) scratch (raw_size_to_u32 eight);
+       match u32_equal(status, u32_sub status status) with
+         | True => do let! error := raw_windows_last_failure one;
+                      let! outcome := windows_bounded_read_os "kind" error;
+                      windows_bounded_read_close raw_windows_file_close file_handle outcome
+         | False => do let! flags_cell := raw_cast U8 U32 scratch;
+                       let! flags := raw_load_u32 flags_cell;
+                       match usize_equal(usize_and(raw_u32_to_size flags, usize_add sixteen reparse), usize_sub one one) with
+                       | False => do let! outcome := windows_bounded_read_error FsBoundedReadUnsafeEntry;
+                                     windows_bounded_read_close raw_windows_file_close file_handle outcome
+                       | True => windows_bounded_read_contents_with raw_pages_allocate raw_pages_release
+                           raw_windows_file_length raw_windows_file_read raw_windows_file_close file_handle scratch one cap
+                       end
+         end;
+
+-- OPEN_EXISTING, GENERIC_READ, FILE_SHARE_READ, OPEN_REPARSE_POINT.
+def windows_fs_bounded_open (wide : RawPtr U8) (scratch : RawPtr U8)
+    (one : USize) (cap : Nat) : IO WindowsBoundedReadOutcome :=
+    let two : USize := usize_add one one in
+    let four : USize := usize_add two two in
+    let eight : USize := usize_add four four in
+    let sixteen : USize := usize_add eight eight in
+    let access : U32 := raw_size_to_u32 (usize_shift_left(one, raw_size_to_u32 (usize_sub(usize_add sixteen sixteen, one)))) in
+    let flags : U32 := raw_size_to_u32 (usize_add(usize_shift_left(one, raw_size_to_u32 (usize_sub eight one)),
+        usize_shift_left(one, raw_size_to_u32 (usize_add sixteen (usize_add four one))))) in
+    do let! file_handle := windows_create_file wide access (raw_size_to_u32 one) (raw_null U8)
+                        (raw_size_to_u32 (usize_add two one)) flags (raw_null U8);
+       let! valid := raw_windows_handle_valid file_handle one;
+       match valid with
+       | False => do let! status := raw_windows_last_failure one; windows_bounded_read_os "open" status
+       | True => windows_fs_bounded_handle file_handle scratch one cap
+       end;
+
+def windows_fs_bounded_convert (owner : RawPtr U8) (bytes : USize) (wide_capacity : USize)
+    (one : USize) (cap : Nat) : IO WindowsBoundedReadOutcome :=
+    let wide_bytes : USize := usize_add wide_capacity wide_capacity in
+    let input_capacity : USize := usize_add wide_bytes wide_capacity in
+    let scratch_offset : USize := usize_add input_capacity wide_bytes in
+    do let! wide := raw_add U8 owner input_capacity;
+       let! scratch := raw_add U8 owner scratch_offset;
+       let! count := raw_cast U8 U32 scratch;
+       let! status := raw_windows_utf8_to_utf16 owner bytes wide (usize_sub wide_capacity one) count;
+       match u32_equal(status, u32_sub status status) with
+       | False => windows_bounded_read_os "path conversion" status
+       | True => do let! actual := raw_load_u32 count;
+                    let units : USize := raw_u32_to_size actual in
+                    match raw_bool_and (usize_less(usize_sub one one, units)) (usize_less units wide_capacity) with
+                    | False => io_pure(WindowsBoundedReadOutcome, WindowsBoundedReadGuard)
+                    | True => match u8_from_nat 0 with
+                      | Nothing => io_pure(WindowsBoundedReadOutcome, WindowsBoundedReadGuard)
+                      | Just nul => do let! first := raw_add U8 wide (usize_add units units);
+                                       raw_store_u8 first nul;
+                                       let! second := raw_add U8 first one;
+                                       raw_store_u8 second nul;
+                                       windows_fs_bounded_open wide scratch one cap
+                      end
+                    end
+       end;
+
+def windows_fs_bounded_finish (outcome : WindowsBoundedReadOutcome) : IO (Either FsBoundedReadError String) :=
+    match outcome with
+    | WindowsBoundedReadValue result => io_pure(Either FsBoundedReadError String, result)
+    | WindowsBoundedReadGuard => do exit 73;
+        io_pure(Either FsBoundedReadError String, Left FsBoundedReadError String (FsBoundedReadOsError "guard" 73))
+    end;
+
+-- Fixed path/scratch storage is independent of the caller's content-byte cap.
+def windows_fs_read_bounded_checked (cap : Nat) (path : String) : IO (Either FsBoundedReadError String) :=
+    match usize_from_nat 1, u32_from_nat 15 with
+    | Just one, Just shift =>
+        let two : USize := usize_add one one in
+        let four : USize := usize_add two two in
+        let eight : USize := usize_add four four in
+        let sixteen : USize := usize_add eight eight in
+        let wide_capacity : USize := usize_shift_left one shift in
+        let wide_bytes : USize := usize_add wide_capacity wide_capacity in
+        let input_capacity : USize := usize_add wide_bytes wide_capacity in
+        let allocation : USize := usize_add(usize_add input_capacity wide_bytes, sixteen) in
+        match fs_bounded_read_path_length path (bounded_file_usize_to_nat input_capacity) with
+        | Left error => io_pure(Either FsBoundedReadError String, Left FsBoundedReadError String error)
+        | Right bytes => do let! owner := raw_pages_allocate allocation eight;
+                            let! bits := raw_to_bits U8 owner;
+                            match usize_equal(bits, usize_sub one one) with
+                            | True => windows_fs_bounded_finish WindowsBoundedReadGuard
+                            | False => do let! copied := windows_fs_bounded_copy path owner one bytes 0 (usize_sub one one);
+                                          let! outcome := match copied with
+                                            | WindowsBoundedReadGuard => io_pure(WindowsBoundedReadOutcome, copied)
+                                            | WindowsBoundedReadValue result => match result with
+                                              | Left _ => io_pure(WindowsBoundedReadOutcome, copied)
+                                              | Right _ => match usize_from_nat bytes with
+                                                | Nothing => io_pure(WindowsBoundedReadOutcome, WindowsBoundedReadGuard)
+                                                | Just count => windows_fs_bounded_convert owner count wide_capacity one cap
+                                                end
+                                              end end;
+                                          let! released := raw_pages_release owner;
+                                          windows_fs_bounded_finish (match released with
+                                            | True => outcome | False => WindowsBoundedReadGuard end)
+                            end
+        end
+    | Just _, Nothing => windows_fs_bounded_finish WindowsBoundedReadGuard
+    | Nothing, Just _ => windows_fs_bounded_finish WindowsBoundedReadGuard
+    | Nothing, Nothing => windows_fs_bounded_finish WindowsBoundedReadGuard
+    end;

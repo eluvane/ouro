@@ -7,6 +7,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Optional, Sequence
@@ -108,6 +109,7 @@ def run_check(
     command: Sequence[str],
     expectation: str,
     timeout: float,
+    cwd: Path = ROOT,
     markers: Sequence[str] = (),
     env: Optional[dict[str, str]] = None,
 ) -> bool:
@@ -118,7 +120,7 @@ def run_check(
     try:
         proc = subprocess.run(
             command_list,
-            cwd=ROOT,
+            cwd=cwd,
             env=env,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
@@ -180,9 +182,18 @@ def windows_clang_target(gcc: str) -> list[str]:
     ]
 
 
+def source_cflags(source: Path) -> tuple[str, ...]:
+    if rel(source) == "runtime/module_pure_scope_selftest.c":
+        return ("-DOURO_MODULE_PURE_SCOPES=1",)
+    return ()
+
+
 def gcc_command(gcc: str, source: Path, obj: Path) -> list[str]:
     obj.parent.mkdir(parents=True, exist_ok=True)
-    return [gcc, *COMMON_FLAGS, "-fanalyzer", "-c", rel(source), "-o", rel(obj)]
+    return [
+        gcc, *COMMON_FLAGS, *source_cflags(source),
+        "-fanalyzer", "-c", rel(source), "-o", rel(obj),
+    ]
 
 
 def available_clang_exclusions(clang: str) -> list[str]:
@@ -211,6 +222,7 @@ def clang_command(
         "-Xanalyzer",
         "-analyzer-output=text",
         *COMMON_FLAGS,
+        *source_cflags(source),
         rel(source),
     ]
 
@@ -312,7 +324,8 @@ def run_suite(args: argparse.Namespace) -> tuple[dict[str, object], int]:
     good = FIXTURES / "good.c"
     bad = FIXTURES / "bad_use_after_free.c"
     allocation_fixture = FIXTURES / "bounded_capture_allocation.c"
-    fixtures = [good, bad, *([allocation_fixture] if os.name == "nt" else [])]
+    clone_fixture = FIXTURES / "clone_tab.c"
+    fixtures = [good, bad, *([allocation_fixture] if os.name == "nt" else []), clone_fixture]
     sources = sorted((ROOT / "runtime").glob("*.c"), key=lambda path: path.name)
     for fixture in fixtures:
         if not fixture.is_file():
@@ -472,7 +485,16 @@ def run_suite(args: argparse.Namespace) -> tuple[dict[str, object], int]:
                 timeout=args.timeout_seconds,
                 env=san_env,
             )
-            for invalid in ("app-null", "app-value", "apply-null", "apply-value"):
+            for invalid, marker in (
+                ("app-null", "ouro_rt: apply of non-function"),
+                ("app-value", "ouro_rt: apply of non-function"),
+                ("apply-null", "ouro_rt: apply of non-function"),
+                ("apply-value", "ouro_rt: apply of non-function"),
+                ("alloc-overflow-phase", "ouro_rt: out of memory (allocation-size want="),
+                ("alloc-overflow-static", "ouro_rt: out of memory (allocation-size want="),
+                ("alloc-overflow-perm0", "ouro_rt: out of memory (allocation-size want="),
+                ("alloc-overflow-perm1", "ouro_rt: out of memory (allocation-size want="),
+            ):
                 run_check(
                     checks,
                     out=out,
@@ -480,7 +502,7 @@ def run_suite(args: argparse.Namespace) -> tuple[dict[str, object], int]:
                     engine="asan-ubsan",
                     command=[str(runtime_exe), invalid],
                     expectation="deny",
-                    markers=("ouro_rt: apply of non-function",),
+                    markers=(marker,),
                     timeout=args.timeout_seconds,
                     env=san_env,
                 )
@@ -505,16 +527,18 @@ def run_suite(args: argparse.Namespace) -> tuple[dict[str, object], int]:
                 timeout=args.timeout_seconds,
             )
             if io_built:
-                run_check(
-                    checks,
-                    out=out,
-                    name="sanitizer-io-run",
-                    engine="asan-ubsan",
-                    command=[str(io_exe)],
-                    expectation="pass",
-                    timeout=args.timeout_seconds,
-                    env=san_env,
-                )
+                with tempfile.TemporaryDirectory(prefix="ouro-sanitizer-io-") as directory:
+                    run_check(
+                        checks,
+                        out=out,
+                        name="sanitizer-io-run",
+                        engine="asan-ubsan",
+                        command=[str(io_exe)],
+                        expectation="pass",
+                        timeout=args.timeout_seconds,
+                        cwd=Path(directory),
+                        env=san_env,
+                    )
                 for invalid in ("u8", "loop"):
                     run_check(
                         checks,
@@ -527,6 +551,31 @@ def run_suite(args: argparse.Namespace) -> tuple[dict[str, object], int]:
                         timeout=args.timeout_seconds,
                         env=san_env,
                     )
+
+    if clang is not None and good.is_file() and bad.is_file() and clone_fixture.is_file():
+        clone_exe = out / "sanitizers" / ("clone-tab.exe" if os.name == "nt" else "clone-tab")
+        clone_built = run_check(
+            checks, out=out, name="sanitizer-clone-tab-build", engine="asan-ubsan",
+            command=sanitizer_command(clang, [clone_fixture], clone_exe),
+            expectation="pass", timeout=args.timeout_seconds, env=san_env,
+        )
+        if clone_built:
+            run_check(
+                checks, out=out, name="sanitizer-clone-tab-run", engine="asan-ubsan",
+                command=[str(clone_exe)], expectation="pass",
+                timeout=args.timeout_seconds, env=san_env,
+            )
+            for mode, marker in (
+                ("fatal-init", "ouro_rt: out of memory (clone-tab want=64 "),
+                ("fatal-entry", "ouro_rt: out of memory (clone-tab-growth want=128 "),
+                ("fatal-index", "ouro_rt: out of memory (clone-tab-index want=4294967295 "),
+                ("fatal-cycle", "ouro_rt: out of memory (clone-tab-index want=1 "),
+            ):
+                run_check(
+                    checks, out=out, name="sanitizer-clone-tab-" + mode, engine="asan-ubsan",
+                    command=[str(clone_exe), mode], expectation="deny", markers=(marker,),
+                    timeout=args.timeout_seconds, env=san_env,
+                )
 
     failed_checks = [check.name for check in checks if check.status != "pass"]
     passed = not issues and not failed_checks

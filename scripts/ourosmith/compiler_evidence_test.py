@@ -57,7 +57,8 @@ class CompilerEvidenceTests(EvidenceTreeTests):
             (self.directory / (name + '.out')).write_text(
                 property_output() if name == 'compiler_property' else 'ok inventory contract\n', encoding='utf-8')
 
-    def native_receipt_for(self, executable, _entry, _compiler):
+    def native_receipt_for(self, executable, _entry, _compiler, *, parse_bytes):
+        self.assertTrue(callable(parse_bytes))
         if not Path(executable).is_file():
             raise ValueError('native fixture executable is missing: ' + str(executable))
         return self.native_receipt, [], {}
@@ -106,12 +107,46 @@ class CompilerEvidenceTests(EvidenceTreeTests):
                           + ',\n'.join(rows) + '];\n', encoding='utf-8')
 
     def test_complete_protocol_binds_every_executed_entry(self):
-        receipt = self.read()
+        with (patch.object(evidence, 'property_protocol', wraps=evidence.property_protocol) as protocol,
+              patch.object(Path, 'open', autospec=True, side_effect=Path.open) as reads):
+            receipt = self.read()
+        protocol.assert_called_once()
+        artifacts = [self.directory / (name + suffix)
+                     for name in ('compiler_suite_contract', 'compiler_property', 'source_spans')
+                     for suffix in ('.check', '.out', '.err')]
+        self.assertEqual([call.args[0] for call in reads.call_args_list if call.args[0] in artifacts], artifacts)
         self.assertEqual([row['entry'] for row in receipt['artifacts']], self.listed.stdout.splitlines())
         self.assertTrue(receipt['artifacts'][1]['default_properties'])
         self.assertEqual(receipt['log_sha256'], evidence.sha(self.log))
         self.assertEqual(self.receipt.call_count, 5)
+        parsers = [call.kwargs['parse_bytes'] for call in self.receipt.call_args_list]
+        self.assertIsNotNone(parsers[0])
+        self.assertTrue(all(parser is parsers[0] for parser in parsers))
         self.assertEqual(self.execute.call_args.args[0][-2:], ['--native-suite=compiler-checking', '--list'])
+
+    def test_receipt_hashes_the_exact_validated_artifact_bytes(self):
+        check = self.directory / 'compiler_property.check'
+        output = self.directory / 'compiler_property.out'
+        check.write_bytes(b'CHECK_OK\r\n')
+        output.write_bytes(property_output().replace('\n', '\r\n').encode('utf-8'))
+        expected = evidence.sha(check), evidence.sha(output)
+        checked_bytes = check.read_bytes()
+        property_protocol = evidence.property_protocol
+
+        def replace_after_read(text):
+            result = property_protocol(text)
+            check.write_bytes(b'CHECK_NO\r\n')
+            output.write_bytes(output.read_bytes().replace(b'count=400', b'count=401', 1))
+            return result
+
+        with patch.object(evidence, 'property_protocol', side_effect=replace_after_read):
+            bound = self.read()['artifacts'][1]
+        self.assertEqual((bound['check_sha256'], bound['stdout_sha256']), expected)
+        with self.assertRaisesRegex(ValueError, 'unsuccessful strict check'):
+            self.read()
+        check.write_bytes(checked_bytes)
+        with self.assertRaisesRegex(ValueError, 'property protocol is incomplete'):
+            self.read()
 
     def test_current_inventory_accepts_registered_nested_and_non_test_paths(self):
         for entry in ('tests/language_ergonomics/parser_laws.ouro',
@@ -272,8 +307,8 @@ class CompilerEvidenceTests(EvidenceTreeTests):
         summary = {'kind': REPORT_KIND, 'profile': 'pr', 'group': 'all', 'gates': rows}
         inventory = ['tests/compiler_suite_contract_tests.ouro', 'tests/compiler_property_tests.ouro',
                      'tests/compiler_abi_tests.ouro', 'tests/compiler_check_tests.ouro',
-                     'tests/compiler_driver_tests.ouro', 'tests/compiler_fault_tests.ouro',
-                     'tests/compiler_module_tests.ouro', 'tests/compiler_positive_tests.ouro',
+                     'tests/compiler_driver_tests.ouro', 'tests/compiler/diagnostics/compiler_fault_tests.ouro',
+                     'tests/compiler_module_tests.ouro', 'tests/compiler/diagnostics/compiler_positive_tests.ouro',
                      'tests/compiler_plan_tests.ouro', 'tests/compiler_refine_tests.ouro',
                      'tests/compiler_result_tests.ouro', 'tests/compiler_structural_tests.ouro',
                      'tests/compiler_fixture_13_tests.ouro', 'tests/compiler_fixture_14_tests.ouro',
@@ -281,11 +316,16 @@ class CompilerEvidenceTests(EvidenceTreeTests):
         receipts = {f'{index}/16': {'inventory': inventory.copy(), 'runner_build_key': 'current',
                                   'runner_sha256': 'current', 'artifacts': [{'entry': entry}]}
                     for index, entry in enumerate(inventory, 1)}
-        with patch('ourosmith.host.binary', return_value=self.root / 'compiler'), \
-             patch.object(evidence, 'suite_receipt', side_effect=lambda _log, _compiler, shard: receipts[shard]) as observed:
+        with patch('ci_gate.gates', return_value=required), \
+             patch('ourosmith.host.binary', side_effect=lambda _name, directory=None: (directory or self.root) / 'compiler'), \
+             patch.object(evidence, 'suite_receipt',
+                          side_effect=lambda _log, _compiler, shard, **_options: receipts[shard]) as observed:
             summary_path.write_text(json.dumps(summary), encoding='utf-8')
             self.assertEqual([row['entry'] for row in evidence.ci_compiler_receipt(out)['artifacts']], inventory)
             self.assertEqual([call.kwargs['shard'] for call in observed.call_args_list], [f'{index}/16' for index in range(1, 17)])
+            parser = observed.call_args_list[0].kwargs['parse_bytes']
+            self.assertTrue(callable(parser))
+            self.assertTrue(all(call.kwargs['parse_bytes'] is parser for call in observed.call_args_list))
             for index in range(16):
                 for key, value in [('blocking', False), ('status', 'skip'), ('returncode', True),
                                    ('returncode', 1), ('command', ['unrelated']), ('log', 'elsewhere'), ('log', None)]:
@@ -307,6 +347,60 @@ class CompilerEvidenceTests(EvidenceTreeTests):
                 with self.assertRaises(ValueError):
                     evidence.ci_compiler_receipt(out)
                 receipts['16/16'][key] = original
+
+            run_root = self.root / '_build/ci-current'
+            isolated = deepcopy(summary)
+            for index, row in enumerate(isolated['gates'], 1):
+                workspace = run_root / f'compiler-{index}'
+                workspace.mkdir(parents=True)
+                row['workspace'] = workspace.relative_to(self.root).as_posix()
+            summary_path.write_text(json.dumps(isolated), encoding='utf-8')
+            observed.reset_mock()
+            self.assertEqual([row['entry'] for row in evidence.ci_compiler_receipt(out)['artifacts']], inventory)
+            isolated_parser = observed.call_args_list[0].kwargs['parse_bytes']
+            self.assertIsNot(isolated_parser, parser)
+            for index, call in enumerate(observed.call_args_list, 1):
+                workspace = run_root / f'compiler-{index}'
+                self.assertEqual(call.kwargs['workspace'], workspace)
+                self.assertEqual(call.args[1], workspace / '_build/c/compiler')
+                self.assertIs(call.kwargs['parse_bytes'], isolated_parser)
+            elsewhere = self.root / '_build/ci-earlier/compiler-16'
+            elsewhere.mkdir(parents=True)
+            for value in (None, '.', '../compiler-16', '_build/ci-current/compiler-1', elsewhere.as_posix()):
+                changed = deepcopy(isolated)
+                changed['gates'][-1]['workspace'] = value
+                summary_path.write_text(json.dumps(changed), encoding='utf-8')
+                with self.subTest(workspace=value), self.assertRaises(ValueError):
+                    evidence.ci_compiler_receipt(out)
+
+    def test_isolated_shard_receipt_binds_its_output_and_source_bytes(self):
+        workspace = self.root / '_build/ci-current/compiler-2'
+        directory = workspace / '_build/compiler_check_suite_2'
+        shutil.copytree(self.directory, directory)
+        compiler = workspace / '_build/c/ouro1'
+        selected = RunResult('ok', 0, 'tests/compiler_property_tests.ouro\n', '', 0.1, 10)
+        entry = 'tests/compiler_property_tests.ouro'
+        source = workspace / entry
+        source.parent.mkdir()
+        source.write_text('current source', encoding='utf-8')
+        self.receipt.return_value = (self.native_receipt, [], {entry: evidence.sha(source)})
+        self.receipt.side_effect = None
+        self.log.write_text('COMPILER_CHECK_OK compiler_property-run\n'
+                            'COMPILER_CHECK_SUITE: PASS rows=1 out=_build/compiler_check_suite_2\n', encoding='utf-8')
+        self.execute.side_effect = [self.listed, selected]
+        receipt = evidence.suite_receipt(self.log, compiler, shard='2/16', workspace=workspace)
+        self.assertEqual([row['entry'] for row in receipt['artifacts']], selected.stdout.splitlines())
+        for call in self.execute.call_args_list:
+            self.assertEqual(call.kwargs['cwd'], workspace)
+            self.assertEqual(call.kwargs['env']['OURO_C_BUILD_DIR'], compiler.parent.as_posix())
+        source.write_text('changed after the gate', encoding='utf-8')
+        self.execute.side_effect = [self.listed, selected]
+        with self.assertRaisesRegex(ValueError, 'shard source differs'):
+            evidence.suite_receipt(self.log, compiler, shard='2/16', workspace=workspace)
+        self.log.write_text('COMPILER_CHECK_OK compiler_property-run\n'
+                            f'COMPILER_CHECK_SUITE: PASS rows=1 out={self.directory.as_posix()}\n', encoding='utf-8')
+        with self.assertRaisesRegex(ValueError, 'artifacts escape'):
+            evidence.suite_receipt(self.log, compiler, shard='2/16', workspace=workspace)
 
     def test_shard_receipt_requires_exact_selection_from_full_current_inventory(self):
         selected = RunResult('ok', 0, 'tests/compiler_property_tests.ouro\n', '', 0.1, 10)

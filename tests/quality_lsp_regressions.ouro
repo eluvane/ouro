@@ -1,0 +1,367 @@
+import "../tools/lsp_model.ouro",
+  "../std/test.ouro";
+
+def quality_lsp_column_is (expected : Nat) (actual : Maybe Nat) : Bool :=
+    match actual with
+    | Nothing => False
+    | Just column => eq_nat column expected
+    end;
+
+def quality_lsp_column_missing (actual : Maybe Nat) : Bool :=
+    match actual with
+    | Nothing => True
+    | Just _ => False
+    end;
+
+private def quality_lsp_bad_continuation_line : String :=
+    str_of_codes [97, 240, 159, 152, 255, 97, 97, 97, 97];
+
+def quality_lsp_completion_prefix (text : String) : Bool :=
+    let symbols : List Sym :=
+      [ MkSym "C:/work/main.ouro" (MkDecl "def" "target" "def target : Nat" [] 1)
+      , MkSym "C:/work/main.ouro" (MkDecl "def" "other" "def other : Nat" [] 2) ] in
+    if let JArr items := (completion_result text 0 99 symbols : Json) then
+      match items with
+      | Nil => False
+      | Cons item rest => andb (nullb Json rest)
+          (str_eq(json_field_str item "label" "", "target"))
+      end
+    else False;
+
+def quality_lsp_crlf_diagnostic : Json :=
+    lsp_diagnostic_utf16 (str_lines "雪😀 target\r\nother")
+      (diag_of "CHECK_FAIL" (JNum "1") 0 14 "at line end");
+
+private def quality_lsp_ctor_labels (text : String) (line : Nat) (expected : List String) : Bool :=
+    let symbols : List Sym :=
+      [MkSym "main.ouro" (MkDecl "def" "Result" "def Result : Nat" [] 1)] in
+    let result : Json := completion_result text line 99 symbols in
+    list_eq String str_eq
+      (map Json String (fun (item : Json) => json_field_str item "label" "") (json_items result))
+      expected;
+
+def quality_lsp_ctor_completion (source_line : String) (expected : List String) : Bool :=
+    quality_lsp_ctor_labels
+      (str_concat "inductive Color : Type := | Red : Color | Blue : Color;\r\n" source_line)
+      1 expected;
+
+def quality_lsp_rename_wire : Bool :=
+    str_eq (json_print (rename_at "file:///main.ouro" "雪😀 target\r\n\r\ntarget;\n" 0 99 "next\ntail"))
+      (str_cat3 "{\"changes\":{\"file:///main.ouro\":[{\"range\":"
+        "{\"start\":{\"line\":0,\"character\":0},\"end\":{\"line\":5,\"character\":0}},"
+        "\"newText\":\"雪😀 next\\ntail\\r\\n\\r\\nnext\\ntail;\\n\"}]}}");
+
+def quality_lsp_rename_refused : Bool :=
+    andb (str_eq (json_print (rename_at "file:///main.ouro" (str_of_codes [255]) 0 99 "next")) "null")
+      (str_eq (json_print (rename_at "file:///main.ouro" "target" 0 2 "")) "null");
+
+def quality_lsp_symbol_group_order : Bool :=
+    let symbol (path : String) (name : String) : Sym :=
+      MkSym path (MkDecl "def" name "" [] 1) in
+    let shared : Sym := symbol "dep.ouro" "shared" in
+    let groups : List (List Sym) :=
+      [[shared, shared], [], [symbol "right.ouro" "same"],
+       [symbol "left.ouro" "same", symbol "left.ouro" "other"], [symbol "root.ouro" "first"]] in
+    let names : List String := map Sym String (fun (s : Sym) =>
+      str_cat3 (sym_path s) ":" (decl_name (sym_decl s))) (lsp_symbols_from_groups groups) in
+    list_eq String str_eq names
+      ["root.ouro:first", "left.ouro:same", "left.ouro:other", "right.ouro:same",
+       "dep.ouro:shared", "dep.ouro:shared"];
+
+private def quality_lsp_cache_seed (text : String) : LspModuleIndex :=
+    MkLspModuleIndex "cache.ouro" text
+      [MkSym "cache.ouro" (MkDecl "def" "cached" "def cached : Nat" [] 1)] [];
+
+private def quality_lsp_document_index_scope : Bool :=
+    let text : String := "import \"dep.ouro\";\n\n-- Export docs.\ndef member : Nat := 0;\n" in
+    let (MkLspModuleIndex _ _ excluded imports) :=
+      lsp_document_module_index "/work/main.ouro" "/work/library.ouro" text in
+    let (MkLspModuleIndex _ _ included matching_imports) :=
+      lsp_document_module_index "/work/main.ouro" "/mirror/work/main.ouro" text in
+    andb (nullb Sym excluded)
+      (andb (list_eq String str_eq imports ["dep.ouro"])
+        (andb (list_eq String str_eq matching_imports imports)
+          (match included with
+           | Nil => False
+           | Cons symbol rest => andb (nullb Sym rest)
+               (andb (str_eq (sym_path symbol) "/mirror/work/main.ouro")
+                 (str_eq (decl_name (sym_decl symbol)) "member"))
+           end)));
+
+private def quality_lsp_cached_symbol (entry : LspModuleIndex) : Bool :=
+    match sym_find "cached" (lsp_module_symbols entry) with
+    | Nothing => False
+    | Just _ => True
+    end;
+
+private def quality_lsp_exact_cache_bytes : Bool :=
+    let before : String := str_of_codes [97, 0, 98] in
+    let after : String := str_of_codes [97, 0, 99] in
+    let cache : List LspModuleIndex := [quality_lsp_cache_seed before] in
+    let (MkPair hit _) := lsp_module_index True "cache.ouro" before cache in
+    let (MkPair changed updated) := lsp_module_index True "cache.ouro" after cache in
+    let (MkPair uncached _) := lsp_module_index False "cache.ouro" before cache in
+    andb (quality_lsp_cached_symbol hit)
+      (andb (notb (quality_lsp_cached_symbol changed))
+        (andb (notb (quality_lsp_cached_symbol uncached))
+          (eq_nat(length LspModuleIndex updated, 1))));
+
+private def quality_lsp_lookup_only_cache : Bool :=
+    let before : String := str_of_codes [97, 0, 98] in
+    let after : String := str_of_codes [97, 0, 99] in
+    let cache : List LspModuleIndex := [quality_lsp_cache_seed before] in
+    let (MkPair hit retained) := lsp_module_index_for LspIndexReuse "cache.ouro" before cache in
+    let (MkPair changed stale) := lsp_module_index_for LspIndexReuse "cache.ouro" after retained in
+    let (MkPair other untouched) := lsp_module_index_for LspIndexReuse "other.ouro" before stale in
+    andb (quality_lsp_cached_symbol hit)
+      (andb (notb (quality_lsp_cached_symbol changed))
+        (andb (notb (quality_lsp_cached_symbol other))
+          (match untouched with
+           | Nil => False
+           | Cons entry rest =>
+               let (MkLspModuleIndex path text _ _) := entry in
+               andb (nullb LspModuleIndex rest)
+                 (andb (str_eq path "cache.ouro") (str_eq text before))
+           end)));
+
+private def quality_lsp_document_cache_seed (text : String) : LspModuleIndex :=
+    MkLspModuleIndex "cache.ouro" text (lsp_module_symbols (quality_lsp_cache_seed text)) ["dep.ouro"];
+
+private def quality_lsp_index_imports (entry : LspModuleIndex) : List String :=
+    let (MkLspModuleIndex _ _ _ imports) := entry in imports;
+
+private def quality_lsp_document_cache_hit : Bool :=
+    let text : String := "def value : Nat := 0;" in
+    let cache : List LspModuleIndex := [quality_lsp_document_cache_seed text] in
+    let (MkPair included _) := lsp_module_index_for (LspIndexDocument "cache.ouro") "cache.ouro" text cache in
+    let (MkPair excluded retained) := lsp_module_index_for (LspIndexDocument "main.ouro") "cache.ouro" text cache in
+    let (MkPair cached _) := lsp_module_index_for LspIndexReuse "cache.ouro" text retained in
+    andb (quality_lsp_cached_symbol included)
+      (andb (nullb Sym (lsp_module_symbols excluded))
+        (andb (list_eq String str_eq (quality_lsp_index_imports excluded) ["dep.ouro"])
+          (quality_lsp_cached_symbol cached)));
+
+private def quality_lsp_document_cache_miss : Bool :=
+    let before : String := str_of_codes [97, 0, 98] in
+    let after : String := str_of_codes [97, 0, 99] in
+    let cache : List LspModuleIndex := [quality_lsp_document_cache_seed before] in
+    let mode : LspIndexMode := LspIndexDocument "main.ouro" in
+    let (MkPair changed retained) := lsp_module_index_for mode "cache.ouro" after cache in
+    let (MkPair moved kept) := lsp_module_index_for mode "other.ouro" before retained in
+    let (MkPair cached _) := lsp_module_index_for LspIndexReuse "cache.ouro" before kept in
+    andb (nullb String (quality_lsp_index_imports changed))
+      (andb (nullb String (quality_lsp_index_imports moved))
+        (andb (eq_nat(length LspModuleIndex kept, 1)) (quality_lsp_cached_symbol cached)));
+
+private def quality_lsp_cache_eviction : Bool :=
+    let cache : List LspModuleIndex :=
+      (fix entries (left : Nat) : List LspModuleIndex :=
+        match left with
+        | Z => [quality_lsp_cache_seed ""]
+        | S rest => Cons LspModuleIndex
+            (MkLspModuleIndex (str_of_nat left) "" [] []) (entries rest)
+        end) 63 in
+    let (MkPair _ filled) := lsp_module_index True "new.ouro" "" cache in
+    let (MkPair evicted _) := lsp_module_index True "cache.ouro" "" filled in
+    andb (eq_nat(length LspModuleIndex filled, 64)) (notb (quality_lsp_cached_symbol evicted));
+
+private def quality_lsp_cache_replace_stale : Bool :=
+    let cache : List LspModuleIndex :=
+      [ MkLspModuleIndex "a.ouro" "" [] []
+      , quality_lsp_cache_seed "old"
+      , MkLspModuleIndex "b.ouro" "" [] []
+      , quality_lsp_cache_seed "older" ] in
+    let (MkPair _ updated) := lsp_module_index True "cache.ouro" "" cache in
+    list_eq String str_eq
+      (map LspModuleIndex String (fun (entry : LspModuleIndex) =>
+        let (MkLspModuleIndex path _ _ _) := entry in path) updated)
+      ["cache.ouro", "a.ouro", "b.ouro"];
+
+private def quality_lsp_cache_row_budget : Bool :=
+    let source : String := str_join "" (replicate String "def many : Nat := 0;\n" 128) in
+    let (MkPair entry cache) := lsp_module_index True "many.ouro" source [] in
+    andb (eq_nat(length Sym (lsp_module_symbols entry), 128))
+      (nullb LspModuleIndex cache);
+
+private def quality_lsp_cache_weight_boundary : Bool :=
+    let declarations : String := str_join "" (replicate String "def value : Nat := 0;\n" 107) in
+    -- The trailing comment adds 294 source bytes and no indexed rows.
+    let at_limit : String := str_cat3 declarations "--" (str_repeat "x" 292) in
+    let (MkPair exact kept) := lsp_module_index True "budget.ouro" at_limit [] in
+    let (MkPair over updated) := lsp_module_index True "budget.ouro" (str_concat at_limit "x") kept in
+    andb (eq_nat (length LspModuleIndex kept) 1)
+      (andb (nullb LspModuleIndex updated)
+        (andb (eq_nat (length Sym (lsp_module_symbols exact)) 107)
+          (eq_nat (length Sym (lsp_module_symbols over)) 107)));
+
+def quality_lsp_regression_laws : List Test :=
+    [ assert_true "ASCII positions past the line clamp to its content"
+        (quality_lsp_column_is 6 (lsp_byte_column "target" 99))
+    , assert_true "raw byte conversion retains an isolated CR"
+        (quality_lsp_column_is 7 (lsp_byte_column "target\r" 99))
+    , assert_true "raw UTF-16 conversion retains an isolated CR"
+        (quality_lsp_column_is 7 (lsp_utf16_column "target\r" 99 True))
+    , assert_true "byte conversion retains an interior CR after Unicode"
+        (quality_lsp_column_is 15 (lsp_byte_column "雪\r😀 target" 99))
+    , assert_true "UTF-16 conversion retains an interior CR after Unicode"
+        (quality_lsp_column_is 11 (lsp_utf16_column "雪\r😀 target" 99 True))
+    , assert_true "a surrogate-pair midpoint retains its byte start"
+        (quality_lsp_column_is 0 (lsp_byte_column "😀target\r" 1))
+    , assert_true "a surrogate-pair endpoint advances by four bytes"
+        (quality_lsp_column_is 4 (lsp_byte_column "😀target\r" 2))
+    , assert_true "a BMP byte midpoint rounds down in UTF-16"
+        (quality_lsp_column_is 0 (lsp_utf16_column "雪😀target\r" 1 False))
+    , assert_true "a BMP byte midpoint rounds up in UTF-16"
+        (quality_lsp_column_is 1 (lsp_utf16_column "雪😀target\r" 1 True))
+    , assert_true "a non-BMP byte midpoint rounds down in UTF-16"
+        (quality_lsp_column_is 1 (lsp_utf16_column "雪😀target\r" 4 False))
+    , assert_true "a non-BMP byte midpoint rounds up in UTF-16"
+        (quality_lsp_column_is 3 (lsp_utf16_column "雪😀target\r" 4 True))
+    , assert_true "malformed UTF-8 before CR remains a byte-column failure"
+        (quality_lsp_column_missing (lsp_byte_column (str_of_codes [255, 13]) 99))
+    , assert_true "malformed UTF-8 before CR remains a UTF-16-column failure"
+        (quality_lsp_column_missing (lsp_utf16_column (str_of_codes [255, 13]) 99 True))
+    , assert_true "malformed UTF-8 after CR remains a byte-column failure"
+        (quality_lsp_column_missing (lsp_byte_column (str_of_codes [97, 13, 255]) 99))
+    , assert_true "malformed UTF-8 after CR remains a UTF-16-column failure"
+        (quality_lsp_column_missing (lsp_utf16_column (str_of_codes [97, 13, 255]) 99 True))
+    , assert_true "column zero does not inspect malformed UTF-8"
+        (andb (quality_lsp_column_is 0 (lsp_byte_column (str_of_codes [255]) 0))
+          (quality_lsp_column_is 0 (lsp_utf16_column (str_of_codes [255]) 0 True)))
+    , assert_true "UTF-16 prefix includes an astral scalar following three-byte scalars"
+        (quality_lsp_column_is 6 (lsp_byte_column "雪雪😀remaining text" 3))
+    , assert_true "byte prefix includes a complete scalar for round-down"
+        (quality_lsp_column_is 1 (lsp_utf16_column "a😀remaining text" 2 False))
+    , assert_true "byte prefix includes a complete scalar for round-up"
+        (quality_lsp_column_is 3 (lsp_utf16_column "a😀remaining text" 2 True))
+    , assert_true "bounded conversion skips malformed UTF-8 after the selected position"
+        (andb
+          (quality_lsp_column_is 1 (lsp_byte_column quality_lsp_bad_continuation_line 1))
+          (quality_lsp_column_is 1 (lsp_utf16_column quality_lsp_bad_continuation_line 1 True)))
+    , assert_true "bounded conversion rejects malformed UTF-8 within a crossing scalar"
+        (andb
+          (quality_lsp_column_missing (lsp_byte_column quality_lsp_bad_continuation_line 2))
+          (quality_lsp_column_missing (lsp_utf16_column quality_lsp_bad_continuation_line 2 True)))
+    , assert_eq "word lookup at CRLF end keeps the clamped identifier"
+        (word_at "target\r\n" 0 99) "target"
+    , assert_eq "word lookup at Unicode CRLF end keeps the identifier"
+        (word_at "雪😀 target\r\nother" 0 99) "target"
+    , assert_eq "word lookup after CRLF keeps its line number"
+        (word_at "雪😀 target\r\nother" 1 99) "other"
+    , assert_eq "word lookup after an interior CR keeps the identifier"
+        (word_at "a\rtarget\nother" 0 99) "target"
+    , assert_eq "an isolated final CR retains its content column"
+        (word_at "target\r" 0 99) ""
+    , assert_eq "only the final CR of CRLF is a terminator"
+        (word_at "target\r\r\nother" 0 99) ""
+    , assert_eq "an empty CRLF line has no identifier"
+        (word_at "\r\nother" 0 99) ""
+    , assert_eq "first-line word lookup stops at LF before a binary suffix"
+        (word_at (str_concat "target\r\n" (str_of_codes [0, 255, 10, 120])) 0 99) "target"
+    , assert_eq "first-line lookup preserves the no-LF split at an embedded NUL"
+        (let text : String := str_of_codes [116, 97, 114, 103, 101, 116, 0, 120] in
+          word_at text 0 99)
+        (let text : String := str_of_codes [116, 97, 114, 103, 101, 116, 0, 120] in
+          word_at (lsp_line_at (str_lines text) 0) 0 99)
+    , assert_eq "prepare rename at Unicode CRLF end uses UTF-16"
+        (json_print (prepare_rename_result "雪😀 target\r\nother" 0 99))
+        (json_print (lsp_range 0 4 0 10))
+    , assert_eq "rename preserves untouched runs around whole identifiers"
+        (let gap : String := str_repeat "雪 + " 192 in
+          rename_text (str_cat3 gap "(name, named)\r\nname\n" gap) "name" "next")
+        (let gap : String := str_repeat "雪 + " 192 in
+          str_cat3 gap "(next, named)\r\nnext\n" gap)
+    , assert_eq "rename keeps bytes after an embedded NUL"
+        (rename_in_line (str_of_codes [120, 0, 120, 33]) "x" "y")
+        (str_of_codes [121, 0, 121, 33])
+    , assert_eq "rename compares whole identifier bytes when a line contains the target"
+        (rename_in_line "nEedle needlelong needle _needle needle' -- needle" "needle" "next")
+        "nEedle needlelong next _needle needle' -- next"
+    , assert_eq "limited rename returns exactly its processed prefix"
+        (rename_in_line_go 2 "name!name" 9 0 "name" "x") "x!"
+    , assert_true "rename wire bytes keep the original range and line endings" quality_lsp_rename_wire
+    , assert_true "rename requires a valid position and a replacement" quality_lsp_rename_refused
+    , assert_true "symbol groups retain file order and duplicate declarations" quality_lsp_symbol_group_order
+    , assert_eq "joining rewritten fragments preserves empty and binary pieces"
+        (lsp_concat_runs ["", "import ", "\"a.ouro\"", str_of_codes [0, 255], "\r\n"])
+        (str_cat3 "import \"a.ouro\"" (str_of_codes [0, 255]) "\r\n")
+    , assert_true "completion at Unicode CRLF end keeps its prefix"
+        (quality_lsp_completion_prefix "雪😀 tar\r\nother")
+    , assert_true "first-line completion excludes constructors declared on later lines"
+        (quality_lsp_ctor_labels "def choice : Color := R\r\ninductive Color : Type := | Red : Color;\n"
+          0 ["Result"])
+    , assert_true "completion after an interior CR keeps its prefix"
+        (quality_lsp_completion_prefix "a\rtar\nother")
+    , assert_true "incomplete constructor annotations keep ordinary completion"
+        (quality_lsp_ctor_completion "def chosen : Color Re" ["Result"])
+    , assert_true "constructor completion retains precedence after assignment"
+        (quality_lsp_ctor_completion "def chosen : Color := Re" ["Red", "Result"])
+    , assert_true "leading spaces and tabs preserve constructor context"
+        (quality_lsp_ctor_completion " \t def chosen : Color := Re" ["Red", "Result"])
+    , assert_true "an assignment after a longer name keeps prefix-only results"
+        (quality_lsp_ctor_completion "define chosen : Color := Re" ["Result"])
+    , assert_true "assignment spelled in a comment does not supply constructor context"
+        (quality_lsp_ctor_completion "def chosen : Color -- := Re" ["Result"])
+    , assert_true "constructor completion ignores a later same-named family"
+        (quality_lsp_ctor_completion
+          "def chosen : Color := Re\r\ninductive Color : Type := | Reject : Color;"
+          ["Red", "Result"])
+    , assert_true "constructor completion does not finish an earlier arm from a later line"
+        (quality_lsp_ctor_labels
+          "inductive Color : Type := | Red : Color\ndef chosen : Color := Re\n;"
+          1 ["Result"])
+    , assert_true "completion text inside a multiline raw string keeps prefix-only results"
+        (quality_lsp_ctor_labels
+          "inductive Color : Type := | Red : Color;\r\ndef raw := r#\"雪\r\ndef chosen : Color := Re\r\n\"#;"
+          2 ["Result"])
+    , assert_eq "diagnostic at Unicode CRLF end stays within content"
+        (json_print (json_field quality_lsp_crlf_diagnostic "range"))
+        (json_print (lsp_range 0 10 0 10))
+    , assert_eq "diagnostic conversion preserves its ID"
+        (json_field_str quality_lsp_crlf_diagnostic "code" "") "CHECK_FAIL"
+    , assert_true "clean checker output publishes an empty diagnostic list"
+        (nullb Json (lsp_diagnostics_utf16 (str_of_codes [255, 13, 10]) []))
+    , assert_eq "cross-line diagnostic converts each endpoint using its own line"
+        (json_print (json_field
+          (lsp_diagnostic_utf16 (str_lines "雪q\r\n😀x")
+            (JObj [MkPair String Json "range" (lsp_range 0 3 1 3)])) "range"))
+        (json_print (lsp_range 0 1 1 2))
+    , assert_eq "an empty CRLF line has a zero-width diagnostic range"
+        (json_print (json_field (lsp_diagnostic_utf16 (str_lines "\r\nother")
+          (diag_of "CHECK_FAIL" (JNum "1") 0 0 "empty line")) "range"))
+        (json_print (lsp_range 0 0 0 0))
+    , assert_eq "malformed source retains the protocol diagnostic ID"
+        (json_field_str (lsp_diagnostic_utf16 [str_of_codes [255, 13]]
+          (diag_of "CHECK_FAIL" (JNum "1") 0 0 "invalid source")) "code" "")
+        "CHECK_PROTOCOL"
+    , assert_eq "malformed UTF-8 after an isolated CR remains a protocol failure"
+        (json_field_str (lsp_diagnostic_utf16 [str_of_codes [97, 13, 255]]
+          (diag_of "CHECK_FAIL" (JNum "1") 0 99 "invalid source")) "code" "")
+        "CHECK_PROTOCOL"
+    , assert_eq "malformed diagnostic endpoint preserves the checker message"
+        (json_field_str (lsp_diagnostic_utf16 ["valid", str_of_codes [255]]
+          (JObj [MkPair String Json "range" (lsp_range 0 1 1 1),
+                 MkPair String Json "message" (JStr "invalid source")])) "message" "")
+        "invalid UTF-8 source position in checker diagnostic: invalid source"
+    , assert_true "navigation cache hits require the same exact bytes and enabled caching"
+        quality_lsp_exact_cache_bytes
+    , assert_true "read-only navigation reuse checks path and bytes and preserves entries"
+        quality_lsp_lookup_only_cache
+    , assert_true "document cache reuse keeps imports on a hit and retains complete cache entries"
+        quality_lsp_document_cache_hit
+    , assert_true "document cache reuse rejects different paths and bytes after NUL"
+        quality_lsp_document_cache_miss
+    , assert_true "document indexing preserves imported paths and the symbol path suffix rule"
+        quality_lsp_document_index_scope
+    , assert_true "navigation cache drops its oldest entry at capacity"
+        quality_lsp_cache_eviction
+    , assert_true "navigation cache replaces stale entries and retains the order of other paths"
+        quality_lsp_cache_replace_stale
+    , assert_true "large symbol indexes remain usable without entering the cache"
+        quality_lsp_cache_row_budget
+    , assert_true "navigation cache accepts the exact weight limit and drops an overweight stale entry"
+        quality_lsp_cache_weight_boundary
+    ];
+
+-- @entry main
+def main : IO Unit := test_run quality_lsp_regression_laws;

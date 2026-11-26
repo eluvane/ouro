@@ -1,0 +1,91 @@
+-- Test-local concrete RawFn adapters; raw storage and DLL lifetimes stay explicit.
+import "../../std/io.ouro",
+  "../../std/natx.ouro",
+  "../../std/string_prims.ouro",
+  "../../runtime/native_types.ouro",
+  "../../runtime/platform/windows_x64.ouro",
+  "../../runtime/platform/windows_io.ouro",
+  "../../runtime/raw_buffer.ouro";
+
+intrinsic rawfn_test_code : Type -> Type := "ouro.raw_fn";
+def RawFnTestSetter : Type := rawfn_test_code (U32 -> RawPtr U8 -> Runtime U32);
+def RawFnTestWriteSignature : Type :=
+    RawPtr U8 -> RawPtr U8 -> U32 -> RawPtr U32 -> RawPtr U8 -> Runtime U32;
+def RawFnTestWriter : Type := rawfn_test_code RawFnTestWriteSignature;
+
+intrinsic rawfn_test_call_setter : RawFnTestSetter -> U32 -> RawPtr U8 -> Runtime U32 :=
+    "ouro.fn.call" (U32 -> RawPtr U8 -> Runtime U32);
+intrinsic rawfn_test_call_writer : RawFnTestWriter -> RawFnTestWriteSignature :=
+    "ouro.fn.call" RawFnTestWriteSignature;
+intrinsic rawfn_test_load_setter : RawPtr RawFnTestSetter -> Runtime RawFnTestSetter := "ouro.raw.load" RawFnTestSetter;
+intrinsic rawfn_test_store_setter : RawPtr RawFnTestSetter -> RawFnTestSetter -> Runtime Unit := "ouro.raw.store" RawFnTestSetter;
+intrinsic rawfn_test_load_writer : RawPtr RawFnTestWriter -> Runtime RawFnTestWriter := "ouro.raw.load" RawFnTestWriter;
+intrinsic rawfn_test_store_writer : RawPtr RawFnTestWriter -> RawFnTestWriter -> Runtime Unit := "ouro.raw.store" RawFnTestWriter;
+
+extern rawfn_test_module_handle : RawPtr U8 -> Runtime (RawPtr Unit) :=
+    "windows-x86_64" "win64" "kernel32.dll" "GetModuleHandleA" "nogc";
+
+def rawfn_test_expect (correct : Bool) : IO Unit :=
+    match correct with | True => io_unit | False => exit 91 end;
+
+def rawfn_test_zero : IO U32 :=
+    do let! zero := raw_to_bits U8 (raw_null U8);
+       io_pure(U32, raw_size_to_u32 zero);
+
+def rawfn_test_word (value : Nat) : IO U32 :=
+    match (u32_from_nat value : Maybe U32) with
+    | Just word => io_pure U32 word
+    | Nothing => do exit 91; rawfn_test_zero end;
+
+def rawfn_test_size (value : Nat) : IO USize :=
+    match (usize_from_nat value : Maybe USize) with
+    | Just size => io_pure USize size
+    | Nothing => do exit 91; raw_to_bits U8 (raw_null U8) end;
+
+def rawfn_test_text (base : RawPtr U8) (capacity : USize) (text : String) : IO Unit :=
+    (fix write (fuel : Nat) (index : Nat) : IO Unit :=
+      match fuel with
+      | Z => exit 91
+      | S remaining =>
+          let more : Bool := ltb_nat index (prim_string_length text) in
+          let byte : Nat := match more with | True => prim_string_byte_at text index | False => 0 end in
+          match (u8_from_nat byte : Maybe U8) with
+          | Nothing => exit 91
+          | Just value => do let! offset := rawfn_test_size index;
+                             let! written := raw_buffer_write base capacity offset value;
+                             rawfn_test_expect written;
+                             match more with | False => io_unit | True => write remaining (S index) end end
+      end) (S (prim_string_length text)) 0;
+
+def rawfn_test_allocate : IO (RawPtr U8) :=
+    do let! bytes := rawfn_test_size 64;
+       let! alignment := rawfn_test_size 8;
+       let! base := raw_pages_allocate bytes alignment;
+       let! bits := raw_to_bits U8 base;
+       rawfn_test_expect (raw_bool_not (usize_equal bits (usize_sub bits bits)));
+       io_pure(RawPtr U8, base);
+
+def rawfn_test_release (base : RawPtr U8) : IO Unit :=
+    do let! released := raw_pages_release base;
+       rawfn_test_expect released;
+
+def rawfn_test_module (base : RawPtr U8) : IO (RawPtr Unit) :=
+    do let! bytes := rawfn_test_size 64;
+       rawfn_test_text base bytes "kernel32.dll";
+       let! module := rawfn_test_module_handle base;
+       let! bits := raw_to_bits Unit module;
+       rawfn_test_expect (raw_bool_not (usize_equal bits (usize_sub bits bits)));
+       io_pure(RawPtr Unit, module);
+
+def rawfn_test_slot (base : RawPtr U8) : IO (RawPtr U8) :=
+    do let! offset := rawfn_test_size 48;
+       raw_add U8 base offset;
+
+-- Inspect stored address bits without treating an arbitrary RawPtr as a callee.
+def rawfn_test_slot_present (slot : RawPtr U8) : IO Unit :=
+    do let! cell := raw_cast U8 USize slot;
+       let! bits := raw_load_usize cell;
+       rawfn_test_expect (raw_bool_not (usize_equal bits (usize_sub bits bits)));
+
+def rawfn_test_partial (code : RawFnTestSetter) (slot : U32) : RawPtr U8 -> IO U32 :=
+    rawfn_test_call_setter code slot;

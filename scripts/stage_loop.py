@@ -8,14 +8,14 @@ reruns do less work without weakening bootstrap correctness.
 from __future__ import annotations
 
 import argparse
-import importlib.util
 import json
 import os
 import shutil
 import subprocess
 import sys
 import time
-from dataclasses import dataclass
+from contextlib import ExitStack
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -29,27 +29,18 @@ rel = bind_relative_path(ROOT, resolve=False)
 sys.path.insert(0, str(ROOT / "scripts"))
 import frontend_regen as freg  # noqa: E402
 import generated_c_shards as GCS  # noqa: E402
+import ouro_build as OB  # noqa: E402
 import selfhost_module_cache as SMC  # noqa: E402
 
+if Path(OB.__file__).resolve() != ROOT / "scripts/ouro_build.py":
+    raise SystemExit("STAGE_LOOP: FAIL scripts/ouro_build.py is from a different checkout")
+
 BACKEND_ROOT = "compiler/backend.ouro"
-C_LINK_SOURCES = (
-    "runtime/ouro_rt.c",
-    "runtime/bootstrap.c",
-    "runtime/frontend_link.c",
-)
-
-
-def load_ouro_build():
-    spec = importlib.util.spec_from_file_location("ouro_build", ROOT / "scripts/ouro_build.py")
-    if spec is None or spec.loader is None:
-        raise SystemExit("STAGE_LOOP: FAIL cannot import scripts/ouro_build.py")
-    mod = importlib.util.module_from_spec(spec)
-    sys.modules["ouro_build"] = mod
-    spec.loader.exec_module(mod)  # type: ignore[union-attr]
-    return mod
-
-
-OB = load_ouro_build()
+C_LINK_SOURCES = {
+    "static/ouro_rt": "runtime/ouro_rt.c",
+    "static/bootstrap": "runtime/bootstrap.c",
+    "static/fe_link": "runtime/frontend_link.c",
+}
 
 
 @dataclass
@@ -116,8 +107,6 @@ def build_config(args: argparse.Namespace) -> StageConfig:
     )
     ob_cfg = OB.load_config(ns)
     env = OB.configured_env(ob_cfg)
-    cc = OB.choose_cc(ob_cfg)
-    env["CC"] = cc
     build_dir = ob_cfg.path("build_dir")
     work = build_dir / "stage_loop"
     status_pub = ROOT.parent / "public/bootstrap-status.json"
@@ -128,7 +117,7 @@ def build_config(args: argparse.Namespace) -> StageConfig:
         max_stages=int(os.environ.get("OURO_STAGE_MAX", "3")),
         fuel=str(os.environ.get("OURO1_CHECK_FUEL", "16000")),
         pack_strict=str(os.environ.get("OURO_PACK_STRICT", "1")),
-        cc=cc,
+        cc=env["CC"],
         c_build_dir=ob_cfg.path("c_build_dir"),
         build_dir=build_dir,
         cache_root=ob_cfg.path("cache_dir"),
@@ -150,21 +139,9 @@ def ensure_seed(cfg: StageConfig) -> Path:
     return seed
 
 
-def all_stage_source_units() -> Tuple[List[str], Dict[str, List[str]]]:
-    roots = [BACKEND_ROOT] + [root for _tag, _mod, root, _file in freg.FRONTEND_TUS]
-    graph: Dict[str, List[str]] = {}
-    all_units: List[str] = []
-    for root in roots:
-        units = freg.collect_units(root)
-        graph[root] = units
-        for u in units:
-            if u not in all_units:
-                all_units.append(u)
-    return all_units, graph
-
-
 def stage_signature(cfg: StageConfig, seed: Path) -> Tuple[str, dict]:
-    units, graph = all_stage_source_units()
+    roots = [BACKEND_ROOT] + [root for _tag, _mod, root, _file in freg.FRONTEND_TUS]
+    graph, captured = freg.capture_unit_inputs(roots)
     files: Dict[str, Path] = {
         "seed_binary": seed,
         "stage_loop_py": ROOT / "scripts/stage_loop.py",
@@ -178,13 +155,13 @@ def stage_signature(cfg: StageConfig, seed: Path) -> Tuple[str, dict]:
         "stage0_driver": ROOT / "compiler/stage0/driver_u.c",
         "stage0_backend": ROOT / "compiler/stage0/backend_u.c",
     }
-    for src in C_LINK_SOURCES:
+    for src in C_LINK_SOURCES.values():
         files[src] = ROOT / src
     for h in sorted((ROOT / "runtime").glob("*.h")):
         files[f"header:{rel(h)}"] = h
-    for u in units:
-        files[u] = ROOT / u
-    digests = {name: file_digest(path) for name, path in sorted(files.items()) if path.exists()}
+    files.update((name, ROOT / name) for name in captured)
+    digests = {name: asdict(captured[name]) if name in captured else file_digest(path)
+               for name, path in sorted(files.items()) if name in captured or path.exists()}
     meta = {
         "kind": "ouro.stage-loop.v5",
         "max_stages": cfg.max_stages,
@@ -253,26 +230,27 @@ def artifact_summary(stage_dir: Path, bin_path: Path) -> dict:
     return out
 
 
-def stage_stamp_ok(stamp: Path, *, signature: str, stage: int, prev_sha: str, stage_dir: Path, bin_path: Path) -> bool:
+def verified_stage_artifacts(stamp: Path, *, signature: str, stage: int, prev_sha: str,
+                             stage_dir: Path, bin_path: Path) -> dict | None:
     data = load_json(stamp)
     if not isinstance(data, dict):
-        return False
+        return None
     if data.get("input_signature") != signature or data.get("stage") != stage or data.get("prev_sha256") != prev_sha:
-        return False
+        return None
     arts = artifact_summary(stage_dir, bin_path)
     expected = data.get("artifacts", {})
     for key in ("backend_sha256", "frontend_sha256", "binary_sha256"):
         if not arts.get(key) or arts.get(key) != expected.get(key):
-            return False
-    return True
+            return None
+    return arts
 
 
-def write_stage_stamp(stamp: Path, *, signature: str, stage: int, prev_sha: str, stage_dir: Path, bin_path: Path, report: dict) -> None:
+def write_stage_stamp(stamp: Path, *, signature: str, stage: int, prev_sha: str, report: dict) -> None:
     data = {
         "stage": stage,
         "input_signature": signature,
         "prev_sha256": prev_sha,
-        "artifacts": artifact_summary(stage_dir, bin_path),
+        "artifacts": report["artifacts"],
         "report": report,
     }
     write_json_atomic(stamp, data)
@@ -330,7 +308,8 @@ def backend_key(prev: Path, cfg: StageConfig, units: Sequence[str]) -> str:
 
 def emit_backend(prev: Path, out: Path, err: Path, cfg: StageConfig, stage: int) -> dict:
     t0 = now()
-    units = freg.collect_units(BACKEND_ROOT)
+    parse_bytes = SMC.cached_import_parser()
+    units = freg.collect_units_many([BACKEND_ROOT], parse_bytes=parse_bytes)[BACKEND_ROOT]
     module_cache = SMC.materialize_module_artifacts(
         roots=[BACKEND_ROOT],
         unit_graph={BACKEND_ROOT: units},
@@ -341,11 +320,13 @@ def emit_backend(prev: Path, out: Path, err: Path, cfg: StageConfig, stage: int)
         label=f"stage{stage}/backend",
         seed=prev,
         fuel=cfg.fuel,
+        parse_bytes=parse_bytes,
         tool_inputs=(
             ROOT / "scripts/stage_loop.py",
             ROOT / "scripts/pack_frontend.py",
         ),
     )
+    del parse_bytes
     key = backend_key(prev, cfg, units)
     cache_dir = cfg.cache_root / "gen/backend"
     cache_file = cache_dir / f"backend_{key}.c"
@@ -433,7 +414,8 @@ def emit_frontend(prev: Path, out: Path, err: Path, stage: int, cfg: StageConfig
     return data
 
 
-def build_stage_binary(frontend_c: Path, backend_c: Path, out: Path, stage: int, cfg: StageConfig) -> dict:
+def build_stage_binary(frontend_c: Path, backend_c: Path, out: Path, stage: int, cfg: StageConfig, *,
+                       object_reuse: dict[str, tuple[str, str]] | None = None) -> dict:
     """Incrementally build one generated stage executable.
 
     This is deliberately routed through scripts/ouro_build.py so stage-loop uses
@@ -450,9 +432,8 @@ def build_stage_binary(frontend_c: Path, backend_c: Path, out: Path, stage: int,
         report_path=frontend_c.parent / "generated_c_shards_report.json",
     )
     sources = list(shard_sources) + [
-        ("static/ouro_rt", ROOT / "runtime/ouro_rt.c"),
-        ("static/bootstrap", ROOT / "runtime/bootstrap.c"),
-        ("static/fe_link", OB.ensure_fe_link()),
+        (label, OB.ensure_fe_link() if label == "static/fe_link" else ROOT / src)
+        for label, src in C_LINK_SOURCES.items()
     ]
     report_path = frontend_c.parent / "c_build_report.json"
     report = OB.build_c_executable(
@@ -466,6 +447,7 @@ def build_stage_binary(frontend_c: Path, backend_c: Path, out: Path, stage: int,
         jobs=OB.jobs_value(cfg.build_cfg),
         report_path=report_path,
         generated_c_shards=shard_report,
+        **({"object_reuse": object_reuse} if object_reuse else {}),
     )
     ss = shard_report.get("summary", {}) if isinstance(shard_report, dict) else {}
     print(
@@ -609,7 +591,48 @@ def summarize_module_caches(stage_reports: Sequence[dict]) -> dict:
     }
 
 def files_eq(a: Path, b: Path) -> bool:
-    return a.is_file() and b.is_file() and a.read_bytes() == b.read_bytes()
+    if not a.is_file() or not b.is_file():
+        return False
+    chunk_size = 1024 * 1024
+    equal = True
+    right_error: OSError | None = None
+    with a.open("rb") as left, ExitStack() as files:
+        try:
+            right = files.enter_context(b.open("rb"))
+        except OSError as error:
+            right = None
+            right_error = error
+        while chunk := left.read(chunk_size):
+            if right is not None:
+                try:
+                    equal &= chunk == right.read(chunk_size)
+                except OSError as error:
+                    right = None
+                    right_error = error
+        # Both streams must reach EOF, with left-side read errors taking priority.
+        if right_error is not None:
+            raise right_error
+        assert right is not None
+        while right.read(chunk_size):
+            equal = False
+    return equal
+
+
+def c_compile_identity(cfg: StageConfig) -> str | None:
+    cc, location = OB.locate_cc(cfg.build_cfg)
+    ccache = cfg.build_cfg.values["ccache"]
+    if ccache != "disabled" and shutil.which("ccache") is not None:
+        return None
+    commands = OB.cc_invocation(cc)
+    paths = [Path((location if command == cc else shutil.which(command)) or command) for command in commands]
+    if not all(path.is_absolute() for path in paths):
+        return None
+    try:
+        compiler = [file_digest(path.resolve(strict=True)) for path in paths]
+    except OSError:
+        return None
+    return hash_json({"commands": commands, "compiler": compiler, "flags": OB.profile_cflags(cfg.build_cfg), "ccache": ccache,
+                      "environment": dict(os.environ)})
 
 
 def promote(cfg: StageConfig, last: int) -> None:
@@ -633,6 +656,17 @@ def promote(cfg: StageConfig, last: int) -> None:
 
 
 def run_loop(cfg: StageConfig) -> int:
+    work = cfg.work.resolve()
+    cache = cfg.cache_root.resolve()
+    if work == cache:
+        # Seed and promotion builds can acquire the cache lock themselves.
+        return _run_loop(cfg, reuse_static=False)
+    overlap = work.is_relative_to(cache) or cache.is_relative_to(work)
+    with OB.cache_access(cfg.work, exclusive=True):
+        return _run_loop(cfg, reuse_static=cfg.cache_enabled and not cfg.promote and not overlap)
+
+
+def _run_loop(cfg: StageConfig, *, reuse_static: bool) -> int:
     started = now()
     cfg.work.mkdir(parents=True, exist_ok=True)
     seed = ensure_seed(cfg)
@@ -658,6 +692,7 @@ def run_loop(cfg: StageConfig) -> int:
     fe_eq = False
     last = 0
     stage_reports: List[dict] = []
+    previous_c_identity = None
 
     for i in range(1, cfg.max_stages + 1):
         sdir = cfg.work / f"stage{i}"
@@ -668,9 +703,12 @@ def run_loop(cfg: StageConfig) -> int:
         stamp = sdir / "stage.stamp.json"
         prev_sha = sha256_file(prev)
         report: dict = {"stage": i, "reused": False}
-        if stage_stamp_ok(stamp, signature=signature, stage=i, prev_sha=prev_sha, stage_dir=sdir, bin_path=bin_path):
+        arts = verified_stage_artifacts(stamp, signature=signature, stage=i, prev_sha=prev_sha,
+                                        stage_dir=sdir, bin_path=bin_path)
+        if arts is not None:
+            previous_c_identity = None
             report["reused"] = True
-            report["artifacts"] = artifact_summary(sdir, bin_path)
+            report["artifacts"] = arts
             print(
                 f"STAGE_LOOP: reuse stage{i} backend={be.stat().st_size} "
                 f"frontend={fe.stat().st_size}"
@@ -697,7 +735,26 @@ def run_loop(cfg: StageConfig) -> int:
                     failed_at=f"stage{i}_frontend",
                 )
             try:
-                report["c_build"] = build_stage_binary(fe, be, bin_path, i, cfg)
+                identity = c_compile_identity(cfg) if reuse_static else None
+                object_reuse = {}
+                if identity is not None and identity == previous_c_identity:
+                    previous = stage_reports[-1]["c_build"]
+                    # Only objects built in this run are bound to the captured compiler digest.
+                    object_reuse = {
+                        row["label"]: (previous["target"], row["object_sha256"])
+                        for row in previous["sources"]
+                        if row["label"] in C_LINK_SOURCES and row["cache"] == "miss"
+                        and row["ccache"] in {"disabled", "auto-unavailable"}
+                    }
+                    prevdir = cfg.work / f"stage{i - 1}"
+                    if object_reuse and not (files_eq(prevdir / "backend_u.c", be) and files_eq(prevdir / "driver_u.c", fe)):
+                        object_reuse = {}
+                options = {"object_reuse": object_reuse} if object_reuse else {}
+                report["c_build"] = build_stage_binary(fe, be, bin_path, i, cfg, **options)
+                unchanged = identity is not None and identity == c_compile_identity(cfg)
+                if object_reuse and not unchanged:
+                    raise RuntimeError("C compiler or build environment changed during object reuse")
+                previous_c_identity = identity if unchanged else None
             except STAGE_OP_ERRORS as exc:
                 return fail_stage(
                     cfg,
@@ -708,7 +765,7 @@ def run_loop(cfg: StageConfig) -> int:
                     message=f"STAGE_LOOP: FAIL c-build stage{i}: {exc}",
                 )
             report["artifacts"] = artifact_summary(sdir, bin_path)
-            write_stage_stamp(stamp, signature=signature, stage=i, prev_sha=prev_sha, stage_dir=sdir, bin_path=bin_path, report=report)
+            write_stage_stamp(stamp, signature=signature, stage=i, prev_sha=prev_sha, report=report)
         print(f"STAGE_LOOP: stage{i} backend={be.stat().st_size} frontend={fe.stat().st_size}")
         if i >= 2:
             prevdir = cfg.work / f"stage{i - 1}"

@@ -1,11 +1,20 @@
-# tools/analyze
+# Analyzer internals
 
-This directory contains project-owned analyzer cores written in Ouro. The analyzer sources are outside the logical kernel TCB; they may reject bad project code or guide cleanup, but they cannot change kernel checking rules.
+These Ouro programs extract repository and source facts and report policy
+findings. The compiler checker retains authority over program acceptance.
 
-Packaged `ouro1 analyze` is two native Ouro IO programs:
+The `ouro1 analyze` wrapper coordinates two Ouro programs.
 
-- `tools/analyze/main.ouro` (`_build/c/ouro-analyze`), the base runner: it extracts repository facts (files, imports, declarations, references, exports, constructors, branches, suppressions) and feeds them to the five policy cores `architecture.ouro`, `deadcode.ouro`, `suppressions.ouro`, `api_surface.ouro`, and `trust.ouro` through the adapters in `tools/analyze/policy.ouro`. The strict format subset is the only text pass left in `tools/analyze/families.ouro`.
-- `tools/analyze/drive_main.ouro` (`_build/c/ouro-analyze-drive`), the structured drive: it parses each source with the real compiler frontend and runs the nineteen structured families listed below. The frontend and shared `Ast` cone are linked only into the drive, so editing a core rebuilds the drive and not `ouro-analyze`.
+- [Base runner](main.ouro) extracts file, import, declaration, reference,
+  export, constructor, branch, and suppression facts. The
+  [policy adapters](policy.ouro) pass these to the architecture, dead-code,
+  suppression, API-surface, and trust cores. `families.ouro` retains the
+  strict format text pass.
+- [Structured drive](drive_main.ouro) parses each selected source with the
+  compiler frontend and runs the requested structured families. The shared
+  frontend and `Ast` dependencies are linked into this binary.
+
+Run the wrapper from the repository root.
 
 ```sh
 sh scripts/ouro1.sh analyze --strict --enable-strict
@@ -14,6 +23,73 @@ sh scripts/ouro1.sh analyze --strict --include-fixtures --enable-taint --scope t
 ```
 
 `scripts/ouro1.sh analyze` runs the base runner on every call and the drive only when a structured flag is present. `ANALYZE_OK` is printed only when both binaries are clean; any `OURO-*` line or rejected source makes the command exit `1`.
+
+## Native bounded entry
+
+`tools/analyze/native_main.ouro` supplies a standalone native entry, and native
+`coil analyze` forwards literal arguments to the fixed `ouro-analyze.exe`
+beside its loaded image. The entry preserves the caller directory, validates
+arguments and input selection, then runs fixed base/drive siblings through
+checked bounded capture with explicit working directories. Image, policy,
+process, input, completion and cleanup failures remain nonzero.
+
+`native_analyze_base_read` in `native_base_report.ouro` returns an
+`Either NativeAnalyzeCompositionError NativeAnalyzeBaseSummary`. The summary
+constructor is `MkNativeAnalyzeBaseReport`. The separate
+`NativeAnalyzeBaseReport` constructor denotes a malformed completion error.
+
+Root discovery belongs to this analyzer entry. An explicit `OURO_ROOT`, including
+an empty value, uses the existing checked quality-root owner; invalid values do
+not fall back to discovery. Without `OURO_ROOT`, the entry starts at the canonical
+caller directory and selects the nearest regular `Ouro.seal`. It inspects at
+most 128 directories, including the caller, and obtains each parent through OS
+realpath of `current/..`. Drive, share, extended UNC and slash roots stop the
+search. A wrong-kind or unavailable listed marker, an unreadable directory,
+failed canonicalization, a repeated or non-immediate parent, no marker or limit
+exhaustion fails nonzero. An unavailable file kind alone does not establish
+absence: checked directory listing requires the existing listable guard.
+Scope and API-baseline arguments remain relative to the original caller; the
+entry does not change cwd or mutate `OURO_ROOT`. The shared quality-root and LSP
+authorization owners remain unchanged. The directory bound limits traversal
+count, not OS call duration or listing materialization. Path checks do not hold
+an enduring directory handle; native root/UNC and failure probes remain required.
+
+The entry policy is provisional: every base/drive worker has a new 120-second
+deadline, one CPU, and 16 MiB per captured stream with 32 MiB aggregate. Base
+workers use a 500 MiB Windows Job committed-memory cap; drive workers, including
+family queries, use 3072 MiB. The base number does not exceed the 512000 KiB
+`analyzer-batch` numeric ceiling. The drive number uses the existing process
+owner's 3072 MiB cap and is below the 3300000 KiB
+`analyzer-drive-largest-file` numeric ceiling. These are separate runtime caps,
+not conversions of RSS measurements. The old analyzer supervisor and RSS
+watcher have no per-worker deadline; 120 seconds is a new bounded scheduling
+contract whose compatibility requires actual probes. The report verifier's
+30-second policy and the tool-build 900-second policy are not worker defaults.
+
+Keep `scripts/analyze_precision_suite.sh`, `scripts/memory_budget_suite.py`,
+the current RSS budgets, and the existing launcher below until native IO,
+precision, memory and integration acceptance is established. Child Job limits
+do not bound the analyzer parent's source/baseline materialization or prove
+RSS parity. Global requests still require at most eight files and 65536 bytes;
+every requested drive input is capped at 40960 bytes.
+
+Provision a fresh sibling group using an accepted native `coil` with its build
+sibling already installed. The raw main owner must be named
+`ouro-analyze-base.exe`; giving the scheduler's name to that base route causes
+recursive dispatch. From the repository root, with a fresh output directory:
+
+```powershell
+New-Item -ItemType Directory _build/native-analyze-candidate
+.\_build\native\coil.exe build tools/coil.ouro --out _build/native-analyze-candidate/coil.exe
+.\_build\native\coil.exe build tools/analyze/main.ouro --out _build/native-analyze-candidate/ouro-analyze-base.exe
+.\_build\native\coil.exe build tools/analyze/drive_main.ouro --out _build/native-analyze-candidate/ouro-analyze-drive.exe
+.\_build\native\coil.exe build tools/analyze/native_main.ouro --out _build/native-analyze-candidate/ouro-analyze.exe
+.\_build\native-analyze-candidate\coil.exe analyze --strict --scope=std/args.ouro
+```
+
+These commands specify SOURCE-to-image routing. Their presence is not evidence
+that products were provisioned or accepted. Build receipts, complete closure
+checking, the native laws and actual worker probes remain required.
 
 ## Bounded execution
 
@@ -46,8 +122,12 @@ other stdlib modules subject to the pure-layer capability and effect checks.
 
 The exact entry points `tools/analyze/main.ouro` and
 `tools/analyze/drive_main.ouro` use the host-tool layer for filesystem and process
-IO. Other files under `tools/analyze/` keep the pure analyzer layer; a matching
-basename in another directory does not grant host capabilities.
+IO. The native bounded entry's exact host owners are `native_main.ouro`,
+`native_request.ouro`, `native_workspace.ouro`, `native_composition.ouro`,
+`native_base_executor.ouro`, `native_drive_executor.ouro` and `native_executor.ouro`
+under that directory. The policy, base report, skeleton and family-query modules
+keep the pure analyzer layer. A matching basename in another directory does not
+grant host capabilities; none of these host roles grants HTTP capability.
 
 Every core returns issues that `drive.ouro` turns into `Finding` values (`finding.ouro`: code, definition line and name, witness). `drive_main.ouro` prints them in the base runner's format, sorted by file/line/column/code and deduplicated, followed by one banner:
 

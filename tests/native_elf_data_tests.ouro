@@ -1,0 +1,249 @@
+-- ELF storage laws and loader probes. Managed/runtime acceptance is separate.
+import "../compiler/native/elf_data.ouro",
+  "../compiler/native/codegen_assembly.ouro",
+  "native_elf_fixtures.ouro",
+  "../std/test.ouro";
+
+inductive ElfDataFixtureError : Type :=
+  | ElfDataFixtureNative : NativeCodegenError -> ElfDataFixtureError
+  | ElfDataFixtureWriter : ElfDataError -> ElfDataFixtureError;
+
+def elf_data_fixture_image (atoms : List CodegenAtom) (readonly_data : List Nat)
+    (writable_data : List Nat) (symbols : List PeSymbol) : Either ElfDataFixtureError (List Nat) :=
+    let? (Left, Right) : Either ElfDataFixtureError (List Nat) do
+      let encoded : CodegenEncoded := mapLeft NativeCodegenError CodegenEncoded ElfDataFixtureError
+        ElfDataFixtureNative (codegen_assemble atoms 0 0)?;
+      match encoded with | CodegenEncodedParts text fixups _ =>
+        mapLeft ElfDataError (List Nat) ElfDataFixtureError ElfDataFixtureWriter
+          (elf_write_data_image text readonly_data writable_data symbols fixups 0) end?
+    end;
+
+def elf_data_fixture_exit (status : Nat) : List CodegenAtom :=
+    codegen_raw [X64MovImm32 X64Rdi (pe_word32 status),
+      X64MovImm32 X64Rax (pe_word32 60), X64Syscall, X64Trap];
+
+def elf_data_fixture_rw42 : Either ElfDataFixtureError (List Nat) :=
+    elf_data_fixture_image
+      ([CodegenSymbolAddress 2 False,
+        CodegenInstruction (X64Load X64Bits32 X64R10 (X64Base X64Rax (codegen_disp 0))),
+        CodegenSymbolAddress 3 False,
+        CodegenInstruction (X64Store X64Bits32 (X64Base X64Rax (codegen_disp 0)) X64R10),
+        CodegenInstruction (X64Load X64Bits32 X64Rdi (X64Base X64Rax (codegen_disp 0))),
+        CodegenInstruction (X64MovImm32 X64Rax (pe_word32 60)),
+        CodegenInstruction X64Syscall, CodegenInstruction X64Trap] : List CodegenAtom)
+      (pe_le32 42) (pe_zeros 4) [PeNamedSymbol 2 PeReadOnly 0, PeNamedSymbol 3 PeWritable 0];
+
+def elf_data_fixture_ro_write : Either ElfDataFixtureError (List Nat) :=
+    elf_data_fixture_image
+      (append CodegenAtom
+        [CodegenSymbolAddress 2 False, CodegenInstruction (X64MovImm32 X64R10 (pe_word32 42)),
+         CodegenInstruction (X64Store X64Bits32 (X64Base X64Rax (codegen_disp 0)) X64R10)]
+        (elf_data_fixture_exit 0)) (pe_le32 42) [] [PeNamedSymbol 2 PeReadOnly 0];
+
+def elf_data_fixture_rw_execute : Either ElfDataFixtureError (List Nat) :=
+    elf_data_fixture_image
+      (append CodegenAtom
+        [CodegenSymbolAddress 3 False, CodegenInstruction (X64CallIndirect (X64RegisterOperand X64Rax))]
+        (elf_data_fixture_exit 0)) [] [195] [PeNamedSymbol 3 PeWritable 0];
+
+def elf_data_fixture_named (name : String) : Maybe (Either ElfDataFixtureError (List Nat)) :=
+    match str_eq name "rw42" with | True => Just (Either ElfDataFixtureError (List Nat)) elf_data_fixture_rw42
+    | False => match str_eq name "ro-write" with | True => Just (Either ElfDataFixtureError (List Nat)) elf_data_fixture_ro_write
+      | False => match str_eq name "rw-execute" with | True => Just (Either ElfDataFixtureError (List Nat)) elf_data_fixture_rw_execute
+        | False => Nothing (Either ElfDataFixtureError (List Nat)) end end end;
+
+def elf_data_test_error (A : Type) (name : String) (accept : ElfDataError -> Bool)
+    (result : Either ElfDataError A) : Test :=
+    match result with | Left error => assert_true name (accept error)
+      | Right _ => test_fail name "invalid input accepted" end;
+
+def elf_data_test_layout_error (error : ElfDataError) : Bool :=
+    match error with | ElfDataLayoutError failure =>
+      match failure with
+      | ElfEmptyText => False | ElfImageTooLarge => True
+      | ElfInvalidEntry _ => False | ElfBytesRejected _ => False end
+    | ElfDataLinkError _ => False end;
+
+def elf_data_test_empty_error (error : ElfDataError) : Bool :=
+    match error with | ElfDataLayoutError failure =>
+      match failure with
+      | ElfEmptyText => True | ElfImageTooLarge => False
+      | ElfInvalidEntry _ => False | ElfBytesRejected _ => False end
+    | ElfDataLinkError _ => False end;
+
+def elf_data_test_entry_error (wanted : Nat) (error : ElfDataError) : Bool :=
+    match error with | ElfDataLayoutError failure =>
+      match failure with
+      | ElfEmptyText => False | ElfImageTooLarge => False
+      | ElfInvalidEntry offset => eq_nat offset wanted | ElfBytesRejected _ => False end
+    | ElfDataLinkError _ => False end;
+
+def elf_data_test_link_error (code : Nat) (detail : Nat) (error : ElfDataError) : Bool :=
+    match error with | ElfDataLayoutError _ => False | ElfDataLinkError failure =>
+      match failure with
+      | PeInvalidByte byte => andb (eq_nat code 0) (eq_nat detail byte)
+      | PeDuplicateSymbol id => andb (eq_nat code 1) (eq_nat detail id)
+      | PeMissingSymbol id => andb (eq_nat code 2) (eq_nat detail id)
+      | PeInvalidSymbol id => andb (eq_nat code 3) (eq_nat detail id)
+      | PeInvalidFixup offset => andb (eq_nat code 4) (eq_nat detail offset)
+      | PeUnorderedFixup offset => andb (eq_nat code 5) (eq_nat detail offset)
+      | PeNonzeroFixup offset => andb (eq_nat code 6) (eq_nat detail offset)
+      | PeImageTooLarge => False | PeEmptyText => False | PeInvalidName => False
+      | PeDuplicateLibrary => False | PeDuplicateImport _ => False | PeMissingImport _ => False
+      | PeEmptyLibrary => False | PeRelativeOverflow _ => False | PeMissingEntry _ => False
+      | PeInvalidFunction _ => False | PeUnorderedFunction _ => False | PeUnsupportedFrame _ => False
+      | PeStackProbeRequired _ => False | PePrologMismatch _ => False | PeInstructionError _ => False
+      end end;
+
+def elf_data_test_legacy : Bool :=
+    match elf_test_exit_code with | Left _ => False | Right text =>
+      match elf_write_image text 0 with | Left _ => False | Right expected =>
+        match elf_write_data_image text [] [] [] [] 0 with
+        | Left _ => False | Right actual => pe_bytes_equal actual expected end end end;
+
+def elf_data_test_segment : List Nat -> Nat -> Nat -> Nat -> Nat -> Bool :=
+    elf_test_load_segment;
+
+def elf_data_test_storage : Bool :=
+    match elf_data_fixture_rw42 with | Left _ => False | Right bytes =>
+      andb (eq_nat (length Nat bytes) 8196)
+        (andb (eq_nat (elf_test_read_word bytes 56 2) 4)
+          (andb (eq_nat (elf_test_read_word bytes 24 8) (add elf_image_base 288))
+            (andb (elf_data_test_segment bytes 64 5 0 319)
+              (andb (elf_data_test_segment bytes 120 4 4096 4)
+                (andb (elf_data_test_segment bytes 176 6 8192 4)
+                  (andb (pe_bytes_equal (take Nat 56 (drop Nat 232 bytes)) elf_stack_segment)
+                    (andb (pe_bytes_equal (take Nat 4 (drop Nat 4096 bytes)) [42,0,0,0])
+                      (pe_bytes_equal (drop Nat 8192 bytes) [0,0,0,0])))))))) end;
+
+def elf_data_test_single_data (readonly_data : List Nat) (writable_data : List Nat)
+    (flags : Nat) : Bool :=
+    match elf_write_data_image [195] readonly_data writable_data [] [] 0 with
+    | Left _ => False | Right bytes =>
+      andb (eq_nat (elf_test_read_word bytes 56 2) 3)
+        (andb (eq_nat (elf_test_read_word bytes 24 8) (add elf_image_base 232))
+          (andb (elf_data_test_segment bytes 64 5 0 233)
+            (andb (elf_data_test_segment bytes 120 flags 4096 1)
+              (pe_bytes_equal (take Nat 56 (drop Nat 176 bytes)) elf_stack_segment)))) end;
+
+def elf_data_test_probe (flags : Nat) (text : List Nat) (data : List Nat)
+    (result : Either ElfDataFixtureError (List Nat)) : Bool :=
+    match result with | Left _ => False | Right bytes =>
+      andb (eq_nat (length Nat bytes) (add 4096 (length Nat data)))
+        (andb (eq_nat (elf_test_read_word bytes 56 2) 3)
+          (andb (eq_nat (elf_test_read_word bytes 24 8) (add elf_image_base 232))
+            (andb (elf_data_test_segment bytes 64 5 0 (add 232 (length Nat text)))
+              (andb (elf_data_test_segment bytes 120 flags 4096 (length Nat data))
+                (andb (pe_bytes_equal (take Nat (length Nat text) (drop Nat 232 bytes)) text)
+                  (pe_bytes_equal (drop Nat 4096 bytes) data)))))) end;
+
+def elf_data_test_fixups : Bool :=
+    match elf_write_data_image [0,0,0,0,0,0,0,0,195] [42] [0]
+        [PeNamedSymbol 2 PeReadOnly 0, PeNamedSymbol 3 PeWritable 0]
+        [PeRel32 PeText 0 4 (PeSymbolTarget 2), PeRel32 PeText 4 8 (PeSymbolTarget 3)] 0 with
+    | Left _ => False | Right bytes => pe_bytes_equal (take Nat 9 (drop Nat 288 bytes))
+        [220,14,0,0,216,30,0,0,195] end;
+
+def elf_data_test_backward : Bool :=
+    match elf_write_data_image [195,0,0,0,0] [42] [] [PeNamedSymbol 2 PeText 0]
+        [PeRel32 PeText 1 5 (PeSymbolTarget 2)] 0 with
+    | Left _ => False | Right bytes => pe_bytes_equal (take Nat 5 (drop Nat 232 bytes))
+        [195,251,255,255,255] end;
+
+def elf_data_test_maximum : Bool :=
+    match elf_data_check_layout 1 1 (sub elf_data_capacity 8192) 0 with
+    | Left _ => False | Right layout => match layout with
+      | ElfDataLayoutAt headers text_offset readonly_offset writable_offset file_size =>
+        andb (eq_nat headers 4) (andb (eq_nat text_offset 288)
+          (andb (eq_nat readonly_offset 4096) (andb (eq_nat writable_offset 8192)
+            (eq_nat file_size elf_data_capacity)))) end end;
+
+def elf_data_test_link (text : List Nat) (symbols : List PeSymbol) (fixups : List PeFixup)
+    : Either ElfDataError (List Nat) :=
+    elf_write_data_image text [42] [0] symbols fixups 0;
+
+def elf_data_test_laws : List Test :=
+    [assert_true "ELF data/empty-data preserves complete scalar image" elf_data_test_legacy,
+     assert_true "ELF data/RX R RW stack headers and payloads" elf_data_test_storage,
+     assert_true "ELF data/readonly-only segment" (elf_data_test_single_data [42] [] 4),
+     assert_true "ELF data/writable-only segment" (elf_data_test_single_data [] [0] 6),
+     assert_true "ELF data/independent forward rel32 vectors to R and RW" elf_data_test_fixups,
+     assert_true "ELF data/independent backwards rel32 vector" elf_data_test_backward,
+     assert_true "ELF data/exact bounded final address without large allocation" elf_data_test_maximum,
+     elf_data_test_error ElfDataLayout "ELF data/empty text"
+       elf_data_test_empty_error
+       (elf_data_check_layout 0 1 1 0),
+     elf_data_test_error ElfDataLayout "ELF data/entry at text end"
+       (elf_data_test_entry_error 1)
+       (elf_data_check_layout 1 1 1 1),
+     elf_data_test_error ElfDataLayout "ELF data/additional header overflow"
+       elf_data_test_layout_error (elf_data_check_layout elf_text_capacity 1 0 0),
+     elf_data_test_error ElfDataLayout "ELF data/page alignment overflow"
+       elf_data_test_layout_error (elf_data_check_layout (sub elf_data_capacity 232) 1 0 0),
+     elf_data_test_error ElfDataLayout "ELF data/readonly extent overflow"
+       elf_data_test_layout_error (elf_data_check_layout 1 elf_data_capacity 0 0),
+     elf_data_test_error ElfDataLayout "ELF data/writable extent overflow"
+       elf_data_test_layout_error (elf_data_check_layout 1 0 elf_data_capacity 0),
+     elf_data_test_error (List Nat) "ELF data/text byte precedes data byte failures"
+       (elf_data_test_link_error 0 256) (elf_write_data_image [256] [257] [258] [] [] 0),
+     elf_data_test_error (List Nat) "ELF data/readonly byte precedes writable byte"
+       (elf_data_test_link_error 0 257) (elf_write_data_image [195] [257] [258] [] [] 0),
+     elf_data_test_error (List Nat) "ELF data/writable byte rejected"
+       (elf_data_test_link_error 0 258) (elf_write_data_image [195] [] [258] [] [] 0),
+     elf_data_test_error (List Nat) "ELF data/duplicate symbol precedes unsupported fixup"
+       (elf_data_test_link_error 1 2)
+       (elf_data_test_link [0,0,0,0] [PeNamedSymbol 2 PeReadOnly 0, PeNamedSymbol 2 PeWritable 0]
+         [PeVa64 PeText 0 (PeSymbolTarget 2)]),
+     elf_data_test_error (List Nat) "ELF data/symbol at readonly end rejected"
+       (elf_data_test_link_error 3 2) (elf_data_test_link [195] [PeNamedSymbol 2 PeReadOnly 1] []),
+     elf_data_test_error (List Nat) "ELF data/symbol cannot name omitted segment"
+       (elf_data_test_link_error 3 2) (elf_write_data_image [195] [] [] [PeNamedSymbol 2 PeWritable 0] [] 0),
+     elf_data_test_error (List Nat) "ELF data/missing fixup target"
+       (elf_data_test_link_error 2 7) (elf_data_test_link [0,0,0,0] [] [PeRel32 PeText 0 4 (PeSymbolTarget 7)]),
+     elf_data_test_error (List Nat) "ELF data/import target remains rejected"
+       (elf_data_test_link_error 4 0) (elf_data_test_link [0,0,0,0] [] [PeRel32 PeText 0 4 (PeImportTarget 7)]),
+     elf_data_test_error (List Nat) "ELF data/PE RVA field remains rejected"
+       (elf_data_test_link_error 4 0) (elf_data_test_link [0,0,0,0] [] [PeRva32 PeText 0 (PeSymbolTarget 7)]),
+     elf_data_test_error (List Nat) "ELF data/PE absolute field remains rejected"
+       (elf_data_test_link_error 4 0) (elf_data_test_link (pe_zeros 8) [] [PeVa64 PeText 0 (PeSymbolTarget 7)]),
+     elf_data_test_error (List Nat) "ELF data/nontext patch remains rejected"
+       (elf_data_test_link_error 4 0) (elf_data_test_link [195] [] [PeRel32 PeWritable 0 4 (PeSymbolTarget 7)]),
+     elf_data_test_error (List Nat) "ELF data/nonzero slot precedes missing target"
+       (elf_data_test_link_error 6 0) (elf_data_test_link [1,0,0,0] [] [PeRel32 PeText 0 4 (PeSymbolTarget 7)]),
+     elf_data_test_error (List Nat) "ELF data/fixup extends beyond text"
+       (elf_data_test_link_error 4 1) (elf_data_test_link [0,0,0,0] [] [PeRel32 PeText 1 5 (PeSymbolTarget 7)]),
+     elf_data_test_error (List Nat) "ELF data/relative origin precedes slot end"
+       (elf_data_test_link_error 4 0) (elf_data_test_link [0,0,0,0] [PeNamedSymbol 2 PeReadOnly 0]
+         [PeRel32 PeText 0 3 (PeSymbolTarget 2)]),
+     elf_data_test_error (List Nat) "ELF data/relative origin exceeds text"
+       (elf_data_test_link_error 4 0) (elf_data_test_link [0,0,0,0] [PeNamedSymbol 2 PeReadOnly 0]
+         [PeRel32 PeText 0 5 (PeSymbolTarget 2)]),
+     elf_data_test_error (List Nat) "ELF data/overlapping fixups rejected"
+       (elf_data_test_link_error 5 0) (elf_data_test_link [0,0,0,0] [PeNamedSymbol 2 PeReadOnly 0]
+         [PeRel32 PeText 0 4 (PeSymbolTarget 2), PeRel32 PeText 0 4 (PeSymbolTarget 2)]),
+     assert_true "ELF data/readonly-write probe is a real ELF image"
+       (elf_data_test_probe 4
+         [72,141,5,17,15,0,0,65,186,42,0,0,0,68,137,16,191,0,0,0,0,184,60,0,0,0,15,5,15,11]
+         [42,0,0,0] elf_data_fixture_ro_write),
+     assert_true "ELF data/writable-execute probe is a real ELF image"
+       (elf_data_test_probe 6
+         [72,141,5,17,15,0,0,255,208,191,0,0,0,0,184,60,0,0,0,15,5,15,11]
+         [195] elf_data_fixture_rw_execute)];
+
+def elf_data_test_emit (name : String) : IO Unit :=
+    match elf_data_fixture_named name with
+    | Nothing => do eprintln (str_concat "ELF_DATA_ERROR unknown-image:" name); exit 2
+    | Just result => match result with
+      | Left _ => do eprintln (str_concat "ELF_DATA_ERROR image:" name); exit 1
+      | Right bytes => println (str_join "," (map Nat String str_of_nat bytes)) end end;
+
+-- @entry main
+def main : IO Unit :=
+    do let! arguments := argv;
+       match eq_nat (length String arguments) 1 with
+       | True => test_run elf_data_test_laws
+       | False => match andb (eq_nat (length String arguments) 3)
+           (str_eq (nth String "" 1 arguments) "--image") with
+         | True => elf_data_test_emit (nth String "" 2 arguments)
+         | False => do eprintln "usage: native_elf_data_tests [--image rw42|ro-write|rw-execute]"; exit 2
+         end end;

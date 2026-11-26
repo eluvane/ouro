@@ -228,6 +228,7 @@ static unsigned long nat_u(ouro_v *v)
 }
 
 static char *codes_to_cstr(ouro_v *xs, unsigned long *len_out);
+static const char *string_input_cstr(ouro_v *value, char **owned);
 
 static char *cstr_of(ouro_v *v)
 {
@@ -250,18 +251,12 @@ static char *cstr_of(ouro_v *v)
 
 static ouro_v *owned_str(const char *s)
 {
-	unsigned long n;
-	char *p;
 	if (s == 0)
 		s = "";
-	n = (unsigned long)strlen(s);
-	p = (char *)ouro_alloc(n + 1UL);
-	memcpy(p, s, n + 1UL);
-	return ouro_str(p);
+	return ouro_str_copy_prefix(s, (unsigned long)strlen(s));
 }
 
-/* Temporary C adapter: length-based bytes for the producer until the C
-   runtime is removed. strlen/fputs cannot emit PE (interior NULs). */
+/* Use the stored byte length so writes preserve embedded NULs in PE images. */
 static int write_value_bytes(FILE *f, ouro_v *v)
 {
 	unsigned long len = 0;
@@ -293,8 +288,10 @@ static char *codes_to_cstr(ouro_v *xs, unsigned long *len_out)
 	unsigned long cap = 128;
 	unsigned long n = 0;
 	char *buf = (char *)malloc(cap);
-	ouro_v *stack[128];
-	int sp = 0;
+	ouro_v *local_stack[128];
+	ouro_v **stack = local_stack;
+	size_t sp = 0;
+	size_t capacity = sizeof local_stack / sizeof local_stack[0];
 	if (buf == 0)
 		return 0;
 	for (;;) {
@@ -308,8 +305,20 @@ static char *codes_to_cstr(ouro_v *xs, unsigned long *len_out)
 			continue;
 		}
 		if (xs->tag == OURO_TAG_CAT && xs->n == 2) {
-			if (sp < 127)
-				stack[sp++] = OURO_F(xs, 1);
+			if (sp == capacity) {
+				ouro_v **grown;
+				if (capacity > SIZE_MAX / sizeof *stack / 2U)
+					goto fail;
+				capacity *= 2U;
+				grown = stack == local_stack ? (ouro_v **)malloc(capacity * sizeof *stack) :
+					(ouro_v **)realloc(stack, capacity * sizeof *stack);
+				if (grown == 0)
+					goto fail;
+				if (stack == local_stack)
+					memcpy(grown, local_stack, sizeof local_stack);
+				stack = grown;
+			}
+			stack[sp++] = OURO_F(xs, 1);
 			xs = OURO_F(xs, 0);
 			continue;
 		}
@@ -321,10 +330,8 @@ static char *codes_to_cstr(ouro_v *xs, unsigned long *len_out)
 				char *grown;
 				cap *= 2;
 				grown = (char *)realloc(buf, cap);
-				if (grown == 0) {
-					free(buf);
-					return 0;
-				}
+				if (grown == 0)
+					goto fail;
 				buf = grown;
 			}
 			memcpy(buf + n, xs->u.s, (size_t)k);
@@ -339,10 +346,8 @@ static char *codes_to_cstr(ouro_v *xs, unsigned long *len_out)
 				char *grown;
 				cap *= 2;
 				grown = (char *)realloc(buf, cap);
-				if (grown == 0) {
-					free(buf);
-					return 0;
-				}
+				if (grown == 0)
+					goto fail;
 				buf = grown;
 			}
 			buf[n++] = (char)(ouro_nat_low32(OURO_F(xs, 0)) & 0xFFU);
@@ -354,7 +359,15 @@ static char *codes_to_cstr(ouro_v *xs, unsigned long *len_out)
 	buf[n] = 0;
 	if (len_out != 0)
 		*len_out = n;
+	if (stack != local_stack)
+		free(stack);
 	return buf;
+
+fail:
+	if (stack != local_stack)
+		free(stack);
+	free(buf);
+	return 0;
 }
 
 static ouro_v *list_cons_str(const char *s, ouro_v *tail)
@@ -415,12 +428,12 @@ static ouro_v *f_io_bind_ma(ouro_env *env, ouro_v *ma)
 
 /* Checked word construction for the raw Runtime operations used by the
    standard library. Words use packed cells; they are not Peano naturals. */
-static ouro_v *word_from_nat(ouro_v *value, uint32_t limit)
+static ouro_v *word_from_nat(ouro_v *value, uint64_t limit)
 {
-	unsigned long count;
-	if (!ouro_nat_to_ulong(value, &count) || count > limit)
+	uint64_t count;
+	if (!ouro_nat_to_u64(value, &count) || count > limit)
 		return v_nothing();
-	return v_just(ouro_nat(count));
+	return v_just(ouro_nat_u64(count));
 }
 
 static ouro_v *f_u8_from_nat(ouro_env *env, ouro_v *value)
@@ -433,6 +446,12 @@ static ouro_v *f_u32_from_nat(ouro_env *env, ouro_v *value)
 {
 	(void)env;
 	return word_from_nat(value, UINT32_MAX);
+}
+
+static ouro_v *f_u64_from_nat(ouro_env *env, ouro_v *value)
+{
+	(void)env;
+	return word_from_nat(value, UINT64_MAX);
 }
 
 static unsigned long word8_value(ouro_v *value)
@@ -488,13 +507,14 @@ static ouro_v *f_runtime_loop(ouro_env *env, ouro_v *initial)
 
 static ouro_v *stream_write_run(FILE *out, ouro_env *env, ouro_v *u)
 {
-	char *s = cstr_of(env->v);
+	char *owned = 0;
+	const char *s = string_input_cstr(env->v, &owned);
 	(void)u;
 	if (s) {
 		fputs(s, out);
 		fflush(out);
-		free(s);
 	}
+	free(owned);
 	return v_unit();
 }
 
@@ -594,7 +614,7 @@ static ouro_v *f_env(ouro_env *env, ouro_v *name)
 	return thunk(env_run, ouro_cons(name, 0));
 }
 
-static char *rename_path_text(ouro_v *value);
+static const char *checked_path_text(ouro_v *value, char **owned);
 
 static ouro_v *read_fail(FILE *f, char *buf, const char *phase)
 {
@@ -607,7 +627,8 @@ static ouro_v *read_fail(FILE *f, char *buf, const char *phase)
 
 static ouro_v *fs_read_run(ouro_env *env, ouro_v *u)
 {
-	char *path;
+	char *owned_path = 0;
+	const char *path;
 	FILE *f;
 	long len;
 	char *buf;
@@ -615,11 +636,11 @@ static ouro_v *fs_read_run(ouro_env *env, ouro_v *u)
 	ouro_v *r;
 	(void)u;
 	sandbox_die("fs_read_file");
-	path = rename_path_text(env->v);
+	path = checked_path_text(env->v, &owned_path);
 	if (path == 0)
 		return read_fail(0, 0, "path");
 	f = ouro_host_fopen(path, "rb");
-	free(path);
+	free(owned_path);
 	if (f == 0)
 		return read_fail(0, 0, "open");
 	if (fstat(fileno(f), &info) != 0 || !S_ISREG(info.st_mode))
@@ -645,6 +666,103 @@ static ouro_v *f_fs_read(ouro_env *env, ouro_v *p)
 {
 	(void)env;
 	return thunk(fs_read_run, ouro_cons(p, 0));
+}
+
+static ouro_v *fs_read_status_reply(unsigned long status, ouro_v *body)
+{
+	ouro_v *fields[2];
+	fields[0] = ouro_nat(status);
+	fields[1] = body;
+	return ouro_ctor(0, 2, fields);
+}
+
+static int fs_read_errno(void)
+{
+	return errno > 0 ? errno : EIO;
+}
+
+static ouro_v *fs_read_status_error(FILE *f, char *buf, int status)
+{
+	free(buf);
+	if (f && fclose(f) != 0)
+		return read_fail(0, 0, "close");
+	return fs_read_status_reply((unsigned long)status, ouro_packed((const unsigned char *)"", 0));
+}
+
+static ouro_v *fs_read_status_run(ouro_env *env, ouro_v *u)
+{
+	char *owned_path = 0;
+	const char *path;
+	FILE *f;
+	long len;
+	char *buf;
+	size_t offset, actual;
+	struct stat info;
+	ouro_v *body;
+	int status;
+#ifdef _WIN32
+	wchar_t *wide_path = 0;
+#endif
+	(void)u;
+	sandbox_die("fs_read_file_status");
+	path = checked_path_text(env->v, &owned_path);
+	if (path == 0)
+		return read_fail(0, 0, "path");
+#ifdef _WIN32
+	if (ouro_host_wide_path(path, &wide_path) != ERROR_SUCCESS) {
+		free(wide_path);
+		return read_fail(0, owned_path, "path");
+	}
+	errno = 0;
+	f = _wfopen(wide_path, L"rb");
+	status = fs_read_errno();
+	free(wide_path);
+#else
+	errno = 0;
+	f = ouro_host_fopen(path, "rb");
+	status = fs_read_errno();
+#endif
+	free(owned_path);
+	if (f == 0)
+		return fs_read_status_error(0, 0, status);
+	errno = 0;
+	if (fstat(fileno(f), &info) != 0)
+		return fs_read_status_error(f, 0, fs_read_errno());
+	if (!S_ISREG(info.st_mode))
+		return fs_read_status_error(f, 0, EINVAL);
+	errno = 0;
+	if (fseek(f, 0L, SEEK_END) != 0)
+		return fs_read_status_error(f, 0, fs_read_errno());
+	errno = 0;
+	len = ftell(f);
+	if (len < 0)
+		return fs_read_status_error(f, 0, fs_read_errno());
+	if (len > INT_MAX)
+		return fs_read_status_error(f, 0, EFBIG);
+	errno = 0;
+	if (fseek(f, 0L, SEEK_SET) != 0)
+		return fs_read_status_error(f, 0, fs_read_errno());
+	buf = (char *)malloc((unsigned long)len + 1UL);
+	if (buf == 0)
+		return read_fail(f, 0, "allocation");
+	for (offset = 0; offset < (size_t)len; offset += actual) {
+		errno = 0;
+		actual = fread(buf + offset, 1, (size_t)len - offset, f);
+		if (ferror(f) || actual == 0)
+			return fs_read_status_error(f, buf, fs_read_errno());
+	}
+	buf[len] = 0;
+	if (fclose(f) != 0)
+		return read_fail(0, buf, "close");
+	body = ouro_packed((const unsigned char *)buf, (unsigned long)len);
+	free(buf);
+	return fs_read_status_reply(0, body);
+}
+
+static ouro_v *f_fs_read_status(ouro_env *env, ouro_v *p)
+{
+	(void)env;
+	return thunk(fs_read_status_run, ouro_cons(p, 0));
 }
 
 /* Scratch files may live below an untrusted workspace.  Open the final path
@@ -698,6 +816,15 @@ static FILE *open_write_file(const char *path)
 #endif
 }
 
+static ouro_v *write_fail(FILE *f, char *path, const char *phase)
+{
+	if (f && fclose(f) != 0)
+		phase = "close";
+	free(path);
+	fprintf(stderr, "ouro run: fs_write_file: %s failed\n", phase);
+	exit(73);
+}
+
 static ouro_v *fs_write_run(ouro_env *env, ouro_v *u)
 {
 	char *path;
@@ -705,13 +832,15 @@ static ouro_v *fs_write_run(ouro_env *env, ouro_v *u)
 	(void)u;
 	sandbox_die("fs_write_file");
 	path = cstr_of(env->next->v);
-	if (path != 0) {
-		f = open_write_file(path);
-		if (f != 0) {
-			(void)write_value_bytes(f, env->v);
-			fclose(f);
-		}
-	}
+	if (path == 0)
+		return write_fail(0, 0, "path");
+	f = open_write_file(path);
+	if (f == 0)
+		return write_fail(0, path, "open");
+	if (write_value_bytes(f, env->v) != 0 || ferror(f))
+		return write_fail(f, path, "complete write");
+	if (fclose(f) != 0)
+		return write_fail(0, path, "close");
 	free(path);
 	return v_unit();
 }
@@ -730,13 +859,14 @@ static ouro_v *f_fs_write_p(ouro_env *env, ouro_v *p)
 #ifdef _WIN32
 static DWORD path_attributes(ouro_v *value)
 {
-	char *path = rename_path_text(value);
+	char *owned_path = 0;
+	const char *path = checked_path_text(value, &owned_path);
 	wchar_t *wide = 0;
 	DWORD attributes = INVALID_FILE_ATTRIBUTES;
 	if (path != 0 && ouro_host_wide_path(path, &wide) == ERROR_SUCCESS)
 		attributes = GetFileAttributesW(wide);
 	free(wide);
-	free(path);
+	free(owned_path);
 	return attributes;
 }
 #else
@@ -986,6 +1116,13 @@ static ouro_v *time_run(ouro_env *env, ouro_v *u)
 	return owned_str(buf);
 }
 
+static ouro_v *f_managed_requested_bytes_unavailable(ouro_env *env, ouro_v *u)
+{
+	(void)env;
+	(void)u;
+	return v_nothing();
+}
+
 static ouro_v *f_time(ouro_env *env, ouro_v *u)
 {
 	(void)env;
@@ -993,25 +1130,57 @@ static ouro_v *f_time(ouro_env *env, ouro_v *u)
 	return time_run(0, 0);
 }
 
+static const char *flat_string_bytes(ouro_v *value)
+{
+	if (value != 0 && (value->tag == OURO_TAG_BYTES || value->tag == OURO_TAG_STR) &&
+	    value->n >= 0)
+		return value->u.s;
+	return 0;
+}
+
+static const char *string_input_bytes(ouro_v *value, unsigned long *len, char **owned)
+{
+	const char *bytes = flat_string_bytes(value);
+	if (bytes != 0) {
+		*len = value->tag == OURO_TAG_BYTES ? (unsigned long)value->n :
+			(unsigned long)strlen(bytes);
+		return bytes;
+	}
+	*owned = codes_to_cstr(value, len);
+	return *owned;
+}
+
+static const char *string_input_cstr(ouro_v *value, char **owned)
+{
+	/* Packed buffers and their suffix views carry a trailing NUL. */
+	const char *bytes = flat_string_bytes(value);
+	if (bytes != 0)
+		return bytes;
+	*owned = cstr_of(value);
+	return *owned;
+}
+
 static ouro_v *str_concat(ouro_env *env, ouro_v *b)
 {
 	unsigned long an = 0;
 	unsigned long bn = 0;
-	char *as = codes_to_cstr(env->v, &an);
-	char *bs = codes_to_cstr(b, &bn);
+	char *owned_a = 0;
+	char *owned_b = 0;
+	const char *as = string_input_bytes(env->v, &an, &owned_a);
+	const char *bs = string_input_bytes(b, &bn, &owned_b);
 	char *out;
 	ouro_v *r;
 	if (as == 0 || bs == 0 || an > (unsigned long)INT_MAX ||
 	    bn > (unsigned long)INT_MAX - an) {
-		free(as);
-		free(bs);
+		free(owned_a);
+		free(owned_b);
 		fputs("ouro run: string concatenation exceeds host capacity\n", stderr);
 		exit(70);
 	}
 	out = (char *)malloc(an + bn + 1UL);
 	if (out == 0) {
-		free(as);
-		free(bs);
+		free(owned_a);
+		free(owned_b);
 		fputs("ouro run: string concatenation allocation failed\n", stderr);
 		exit(70);
 	}
@@ -1019,8 +1188,8 @@ static ouro_v *str_concat(ouro_env *env, ouro_v *b)
 	memcpy(out + an, bs, bn);
 	r = ouro_packed((const unsigned char *)out, an + bn);
 	free(out);
-	free(as);
-	free(bs);
+	free(owned_a);
+	free(owned_b);
 	return r;
 }
 
@@ -1189,14 +1358,13 @@ static ouro_v *f_str_eq(ouro_env *env, ouro_v *a)
 
 static ouro_v *str_starts_run(ouro_env *env, ouro_v *pre_v)
 {
-	char *s = cstr_of(env->v);
-	char *pre = cstr_of(pre_v);
-	size_t s_len = s != 0 ? strlen(s) : 0;
-	size_t pre_len = pre != 0 ? strlen(pre) : 0;
-	int ok = s != 0 && pre != 0 && s_len >= pre_len &&
-		 strncmp(s, pre, pre_len) == 0;
-	free(s);
-	free(pre);
+	char *owned_s = 0;
+	char *owned_pre = 0;
+	const char *s = string_input_cstr(env->v, &owned_s);
+	const char *pre = string_input_cstr(pre_v, &owned_pre);
+	int ok = s != 0 && pre != 0 && strncmp(s, pre, strlen(pre)) == 0;
+	free(owned_s);
+	free(owned_pre);
 	return v_bool(ok);
 }
 
@@ -1208,14 +1376,16 @@ static ouro_v *f_str_starts(ouro_env *env, ouro_v *s)
 
 static ouro_v *str_ends_run(ouro_env *env, ouro_v *suf_v)
 {
-	char *s = cstr_of(env->v);
-	char *suf = cstr_of(suf_v);
+	char *owned_s = 0;
+	char *owned_suf = 0;
+	const char *s = string_input_cstr(env->v, &owned_s);
+	const char *suf = string_input_cstr(suf_v, &owned_suf);
 	size_t s_len = s != 0 ? strlen(s) : 0;
 	size_t suf_len = suf != 0 ? strlen(suf) : 0;
 	int ok = s != 0 && suf != 0 && s_len >= suf_len &&
 		 memcmp(s + s_len - suf_len, suf, suf_len) == 0;
-	free(s);
-	free(suf);
+	free(owned_s);
+	free(owned_suf);
 	return v_bool(ok);
 }
 
@@ -1229,28 +1399,36 @@ static ouro_v *str_contains_run(ouro_env *env, ouro_v *pat_v)
 {
 	unsigned long size = 0;
 	unsigned long width = 0;
-	unsigned long index;
-	char *s = codes_to_cstr(env->v, &size);
-	char *pat = codes_to_cstr(pat_v, &width);
+	char *owned_s = 0;
+	char *owned_pat = 0;
+	const char *s = string_input_bytes(env->v, &size, &owned_s);
+	const char *pat = string_input_bytes(pat_v, &width, &owned_pat);
 	int ok = 0;
 	if (s == 0 || pat == 0) {
-		free(s);
-		free(pat);
+		free(owned_s);
+		free(owned_pat);
 		fputs("ouro run: string search allocation failed\n", stderr);
 		exit(70);
 	}
 	if (width == 0)
 		ok = 1;
+	else if (width == 1)
+		ok = memchr(s, (unsigned char)pat[0], (size_t)size) != 0;
 	else if (width <= size) {
-		for (index = 0; index <= size - width; index++) {
-			if (memcmp(s + index, pat, width) == 0) {
+		const char *candidate = s;
+		const char *limit = s + (size - width + 1UL);
+
+		while ((candidate = (const char *)memchr(candidate,
+				(unsigned char)pat[0], (size_t)(limit - candidate))) != 0) {
+			if (memcmp(candidate + 1, pat + 1, (size_t)(width - 1UL)) == 0) {
 				ok = 1;
 				break;
 			}
+			candidate++;
 		}
 	}
-	free(s);
-	free(pat);
+	free(owned_s);
+	free(owned_pat);
 	return v_bool(ok);
 }
 
@@ -1262,13 +1440,15 @@ static ouro_v *f_str_contains(ouro_env *env, ouro_v *s)
 
 static ouro_v *str_index_run(ouro_env *env, ouro_v *pat_v)
 {
-	char *s = cstr_of(env->v);
-	char *pat = cstr_of(pat_v);
-	char *found = s != 0 && pat != 0 ? strstr(s, pat) : 0;
+	char *owned_s = 0;
+	char *owned_pat = 0;
+	const char *s = string_input_cstr(env->v, &owned_s);
+	const char *pat = string_input_cstr(pat_v, &owned_pat);
+	const char *found = s != 0 && pat != 0 ? strstr(s, pat) : 0;
 	ouro_v *result = found != 0 ? v_just(ouro_nat((unsigned long)(found - s))) :
 					 v_nothing();
-	free(s);
-	free(pat);
+	free(owned_s);
+	free(owned_pat);
 	return result;
 }
 
@@ -1278,20 +1458,19 @@ static ouro_v *f_str_index(ouro_env *env, ouro_v *s)
 	return ouro_clos(str_index_run, ouro_cons(s, 0));
 }
 
-static ouro_v *string_list_cons_slice(char *s, size_t start, size_t end,
+static ouro_v *string_list_cons_slice(const char *s, size_t start, size_t end,
 				       ouro_v *tail)
 {
-	char saved = s[end];
-	ouro_v *result;
-	s[end] = 0;
-	result = list_cons_str(s + start, tail);
-	s[end] = saved;
-	return result;
+	ouro_v *cell[2];
+	cell[0] = ouro_str_copy_prefix(s + start, (unsigned long)(end - start));
+	cell[1] = tail;
+	return ouro_ctor(1, 2, cell);
 }
 
 static ouro_v *str_split_run(ouro_env *env, ouro_v *sep_v)
 {
-	char *s = cstr_of(env->v);
+	char *owned = 0;
+	const char *s = string_input_cstr(env->v, &owned);
 	unsigned long sep = nat_u(sep_v);
 	ouro_v *list = ouro_ctor(0, 0, 0);
 	size_t end;
@@ -1300,7 +1479,7 @@ static ouro_v *str_split_run(ouro_env *env, ouro_v *sep_v)
 		return list_cons_str("", list);
 	if (sep > 255UL) {
 		list = list_cons_str(s, list);
-		free(s);
+		free(owned);
 		return list;
 	}
 	end = strlen(s);
@@ -1311,7 +1490,7 @@ static ouro_v *str_split_run(ouro_env *env, ouro_v *sep_v)
 		}
 	}
 	list = string_list_cons_slice(s, 0, end, list);
-	free(s);
+	free(owned);
 	return list;
 }
 
@@ -1323,38 +1502,40 @@ static ouro_v *f_str_split(ouro_env *env, ouro_v *s)
 
 static ouro_v *str_replace_run(ouro_env *env, ouro_v *rep_v)
 {
-	char *s = cstr_of(ouro_get(env, 1));
-	char *pat = cstr_of(ouro_get(env, 0));
-	char *rep = cstr_of(rep_v);
+	char *owned_s = 0;
+	char *owned_pat = 0;
+	char *owned_rep = 0;
+	const char *s = string_input_cstr(ouro_get(env, 1), &owned_s);
+	const char *pat = string_input_cstr(ouro_get(env, 0), &owned_pat);
+	const char *rep = string_input_cstr(rep_v, &owned_rep);
 	size_t s_len;
 	size_t pat_len;
 	size_t rep_len;
 	size_t count = 0;
 	size_t out_len;
-	char *scan;
-	char *found;
+	const char *scan;
+	const char *found;
 	char *out;
 	char *dst;
 	ouro_v *result;
 	if (s == 0 || pat == 0 || rep == 0 || pat[0] == 0) {
 		result = owned_str(s != 0 ? s : "");
-		free(s);
-		free(pat);
-		free(rep);
-		return result;
+		goto done;
 	}
 	s_len = strlen(s);
 	pat_len = strlen(pat);
-	rep_len = strlen(rep);
 	for (scan = s; (found = strstr(scan, pat)) != 0; scan = found + pat_len)
 		count++;
+	if (count == 0) {
+		result = ouro_str_copy_prefix(s, (unsigned long)s_len);
+		goto done;
+	}
+	rep_len = strlen(rep);
 	if (rep_len >= pat_len) {
 		size_t growth = rep_len - pat_len;
 		if (growth != 0 && count > (SIZE_MAX - s_len - 1U) / growth) {
-			free(s);
-			free(pat);
-			free(rep);
-			return owned_str("");
+			result = owned_str("");
+			goto done;
 		}
 		out_len = s_len + count * growth;
 	} else {
@@ -1362,10 +1543,8 @@ static ouro_v *str_replace_run(ouro_env *env, ouro_v *rep_v)
 	}
 	out = (char *)malloc(out_len + 1U);
 	if (out == 0) {
-		free(s);
-		free(pat);
-		free(rep);
-		return owned_str("");
+		result = owned_str("");
+		goto done;
 	}
 	dst = out;
 	scan = s;
@@ -1377,12 +1556,13 @@ static ouro_v *str_replace_run(ouro_env *env, ouro_v *rep_v)
 		dst += rep_len;
 		scan = found + pat_len;
 	}
-	memcpy(dst, scan, strlen(scan) + 1U);
-	result = owned_str(out);
+	memcpy(dst, scan, s_len - (size_t)(scan - s) + 1U);
+	result = ouro_str_copy_prefix(out, (unsigned long)out_len);
 	free(out);
-	free(s);
-	free(pat);
-	free(rep);
+done:
+	free(owned_s);
+	free(owned_pat);
+	free(owned_rep);
 	return result;
 }
 
@@ -1399,11 +1579,13 @@ static ouro_v *f_str_replace(ouro_env *env, ouro_v *s)
 
 static ouro_v *str_le_run(ouro_env *env, ouro_v *b_v)
 {
-	char *a = cstr_of(env->v);
-	char *b = cstr_of(b_v);
+	char *owned_a = 0;
+	char *owned_b = 0;
+	const char *a = string_input_cstr(env->v, &owned_a);
+	const char *b = string_input_cstr(b_v, &owned_b);
 	int ok = a != 0 && b != 0 && strcmp(a, b) <= 0;
-	free(a);
-	free(b);
+	free(owned_a);
+	free(owned_b);
 	return v_bool(ok);
 }
 
@@ -1420,7 +1602,8 @@ static int string_ws(unsigned char c)
 
 static ouro_v *f_str_tokens(ouro_env *env, ouro_v *s_v)
 {
-	char *s = cstr_of(s_v);
+	char *owned = 0;
+	const char *s = string_input_cstr(s_v, &owned);
 	ouro_v *list = ouro_ctor(0, 0, 0);
 	size_t i;
 	(void)env;
@@ -1437,30 +1620,42 @@ static ouro_v *f_str_tokens(ouro_env *env, ouro_v *s_v)
 		if (end > i)
 			list = string_list_cons_slice(s, i, end, list);
 	}
-	free(s);
+	free(owned);
 	return list;
 }
 
 static ouro_v *str_slice_run(ouro_env *env, ouro_v *len_v)
 {
 	/* env = [start, s]; an overlong slice ends at the final byte. */
+	ouro_v *source = ouro_get(env, 1);
 	unsigned long have = 0;
-	char *s = codes_to_cstr(ouro_get(env, 1), &have);
 	unsigned long start = nat_u(ouro_get(env, 0));
 	unsigned long want = nat_u(len_v);
+	const char *data;
+	char *owned = 0;
 	ouro_v *r;
-	if (s == 0) {
+	if (source != 0 && (source->tag == OURO_TAG_STR || source->tag == OURO_TAG_BYTES) &&
+	    source->u.s != 0 && source->n >= 0) {
+		data = source->u.s;
+		have = (unsigned long)source->n;
+		if (source->tag == OURO_TAG_BYTES && start < have && want >= have - start)
+			return ouro_packed_suffix(source, start);
+	} else {
+		owned = codes_to_cstr(source, &have);
+		data = owned;
+	}
+	if (data == 0) {
 		fputs("ouro run: string slice allocation failed\n", stderr);
 		exit(70);
 	}
 	if (start >= have) {
-		free(s);
+		free(owned);
 		return owned_str("");
 	}
 	if (want > have - start)
 		want = have - start;
-	r = ouro_packed((const unsigned char *)s + start, want);
-	free(s);
+	r = ouro_packed((const unsigned char *)data + start, want);
+	free(owned);
 	return r;
 }
 
@@ -1484,11 +1679,14 @@ static ouro_v *f_str_of_nat(ouro_env *env, ouro_v *n)
 static ouro_v *f_str_to_codes(ouro_env *env, ouro_v *s)
 {
 	ouro_v *r;
+	const char *bytes = flat_string_bytes(s);
 	(void)env;
-	if (s != 0 && (s->tag == OURO_TAG_STR || s->tag == OURO_TAG_BYTES) &&
-	    s->u.s != 0 && s->n >= 0)
-		return ouro_packed((const unsigned char *)s->u.s,
-				   (unsigned long)s->n);
+	if (bytes != 0) {
+		/* The packed representation already supports List Nat operations. */
+		if (s->tag == OURO_TAG_BYTES)
+			return s;
+		return ouro_packed((const unsigned char *)bytes, (unsigned long)s->n);
+	}
 	{
 		unsigned long len = 0;
 		char *p = codes_to_cstr(s, &len);
@@ -1503,9 +1701,12 @@ static ouro_v *f_str_to_codes(ouro_env *env, ouro_v *s)
 static ouro_v *f_str_of_codes(ouro_env *env, ouro_v *xs)
 {
 	unsigned long len = 0;
-	char *p = codes_to_cstr(xs, &len);
+	char *p;
 	ouro_v *r;
 	(void)env;
+	if (xs != 0 && xs->tag == OURO_TAG_BYTES && flat_string_bytes(xs) != 0)
+		return xs;
+	p = codes_to_cstr(xs, &len);
 	if (p == 0)
 		return ouro_packed((const unsigned char *)"", 0);
 	r = ouro_packed((const unsigned char *)p, len);
@@ -1730,15 +1931,14 @@ static ouro_v *f_fs_copy(ouro_env *env, ouro_v *src)
 	return ouro_clos(f_fs_copy_dst, ouro_cons(src, 0));
 }
 
-/* Path-only validation before the legacy flattener: none of its packed,
-   concat, or list chunks may hide a NUL or be silently truncated. */
-static char *rename_path_text(ouro_v *value)
+/* Validate every chunk before passing a NUL-terminated path to the OS. */
+static const char *checked_path_text(ouro_v *value, char **owned)
 {
 	ouro_v *original = value;
 	ouro_v *pending[128];
 	size_t depth = 0;
 	size_t length = 0;
-	char *text;
+	const char *flat;
 	errno = EINVAL;
 	for (;;) {
 		if (value == 0)
@@ -1773,16 +1973,21 @@ static char *rename_path_text(ouro_v *value)
 	}
 	if (length == 0)
 		return 0;
-	text = codes_to_cstr(original, 0);
-	if (text == 0)
+	flat = flat_string_bytes(original);
+	if (flat != 0)
+		return flat;
+	*owned = codes_to_cstr(original, 0);
+	if (*owned == 0)
 		errno = ENOMEM;
-	return text;
+	return *owned;
 }
 
 static ouro_v *fs_rename_run(ouro_env *env, ouro_v *unit)
 {
-	char *source = 0;
-	char *target = 0;
+	char *owned_source = 0;
+	char *owned_target = 0;
+	const char *source;
+	const char *target = 0;
 	unsigned long status;
 #ifdef _WIN32
 	wchar_t *wide_source = 0;
@@ -1790,9 +1995,9 @@ static ouro_v *fs_rename_run(ouro_env *env, ouro_v *unit)
 #endif
 	(void)unit;
 	sandbox_die("fs_rename");
-	source = rename_path_text(env->next->v);
+	source = checked_path_text(env->next->v, &owned_source);
 	if (source != 0)
-		target = rename_path_text(env->v);
+		target = checked_path_text(env->v, &owned_target);
 	if (source == 0 || target == 0) {
 #ifdef _WIN32
 		status = errno == ENOMEM ? ERROR_NOT_ENOUGH_MEMORY : ERROR_INVALID_PARAMETER;
@@ -1815,8 +2020,8 @@ static ouro_v *fs_rename_run(ouro_env *env, ouro_v *unit)
 	free(wide_target);
 	free(wide_source);
 #endif
-	free(target);
-	free(source);
+	free(owned_target);
+	free(owned_source);
 	return ouro_nat(status);
 }
 
@@ -1842,12 +2047,18 @@ static ouro_v *stdin_bytes_run(ouro_env *env, ouro_v *u)
 	(void)u;
 	if (want == 0)
 		return owned_str("");
+	if (want == 1) {
+		unsigned char byte = 0;
+
+		got = fread(&byte, 1, 1, stdin);
+		return ouro_packed(&byte, (unsigned long)got);
+	}
 	buf = (char *)malloc(want + 1UL);
 	if (buf == 0)
 		return owned_str("");
 	got = fread(buf, 1, (size_t)want, stdin);
 	buf[got] = 0;
-	r = owned_str(buf);
+	r = ouro_packed((const unsigned char *)buf, (unsigned long)got);
 	free(buf);
 	return r;
 }
@@ -1886,9 +2097,60 @@ static char *copy_string(const char *s)
 	return copy;
 }
 
+typedef struct {
+	ouro_v *rest;
+	ouro_v *local[16];
+	ouro_v **stack;
+	size_t count;
+	size_t capacity;
+} proc_arg_stream;
+
+enum { PROC_ARG_MALFORMED = -1, PROC_ARG_NO_MEMORY = -2 };
+
+static int proc_arg_next(proc_arg_stream *stream, ouro_v **arg)
+{
+	ouro_v **stack = stream->stack != 0 ? stream->stack : stream->local;
+	size_t capacity = stream->stack != 0 ? stream->capacity : sizeof stream->local / sizeof *stack;
+	for (;;) {
+		ouro_v *node = stream->rest;
+		if (node == 0)
+			return PROC_ARG_MALFORMED;
+		if (node->tag == OURO_TAG_CAT && node->n == 2) {
+			if (stream->count == capacity) {
+				ouro_v **grown;
+				int used_local = stream->stack == 0;
+				if (capacity > SIZE_MAX / sizeof *stack / 2U)
+					return PROC_ARG_NO_MEMORY;
+				capacity *= 2U;
+				grown = (ouro_v **)realloc(stream->stack, capacity * sizeof *stack);
+				if (grown == 0)
+					return PROC_ARG_NO_MEMORY;
+				if (used_local)
+					memcpy(grown, stream->local, sizeof stream->local);
+				stack = stream->stack = grown;
+				stream->capacity = capacity;
+			}
+			stack[stream->count++] = OURO_F(node, 1);
+			stream->rest = OURO_F(node, 0);
+		} else if (node->tag == 0 && node->n == 0) {
+			if (stream->count == 0)
+				return 0;
+			stream->rest = stack[--stream->count];
+		} else if (node->tag == 1 && node->n == 2) {
+			*arg = OURO_F(node, 0);
+			stream->rest = OURO_F(node, 1);
+			return 1;
+		} else {
+			return PROC_ARG_MALFORMED;
+		}
+	}
+}
+
 static char **proc_argv_of(char *cmd, ouro_v *args, size_t *argc_out)
 {
-	ouro_env *pending = 0;
+	proc_arg_stream stream = { .rest = args };
+	ouro_v *arg;
+	int step;
 	size_t capacity = 16;
 	size_t i = 1;
 	size_t j;
@@ -1902,32 +2164,7 @@ static char **proc_argv_of(char *cmd, ouro_v *args, size_t *argc_out)
 		return 0;
 	}
 	argv[0] = cmd;
-	/* append is represented by concat nodes for every List element type.
-	   Traverse its complete spine before launching, including concat tails. */
-	for (;;) {
-		if (args == 0)
-			goto fail;
-		if (args->tag == OURO_TAG_CAT && args->n == 2) {
-			ouro_env *node = (ouro_env *)malloc(sizeof *node);
-			if (node == 0)
-				goto fail;
-			node->v = OURO_F(args, 1);
-			node->next = pending;
-			pending = node;
-			args = OURO_F(args, 0);
-			continue;
-		}
-		if (args->tag == 0 && args->n == 0) {
-			ouro_env *node = pending;
-			if (node == 0)
-				break;
-			args = node->v;
-			pending = node->next;
-			free(node);
-			continue;
-		}
-		if (args->tag != 1 || args->n != 2)
-			goto fail;
+	while ((step = proc_arg_next(&stream, &arg)) > 0) {
 		if (i == capacity - 1U) {
 			char **grown;
 			if (capacity > SIZE_MAX / sizeof *argv / 2U)
@@ -1938,21 +2175,19 @@ static char **proc_argv_of(char *cmd, ouro_v *args, size_t *argc_out)
 				goto fail;
 			argv = grown;
 		}
-		argv[i] = cstr_of(OURO_F(args, 0));
+		argv[i] = cstr_of(arg);
 		if (argv[i] == 0)
 			goto fail;
 		i++;
-		args = OURO_F(args, 1);
 	}
+	if (step < 0)
+		goto fail;
+	free(stream.stack);
 	argv[i] = 0;
 	*argc_out = i;
 	return argv;
 fail:
-	while (pending != 0) {
-		ouro_env *node = pending;
-		pending = node->next;
-		free(node);
-	}
+	free(stream.stack);
 	for (j = 0; j < i; j++)
 		free(argv[j]);
 	free(argv);
@@ -2258,8 +2493,8 @@ static ouro_v *f_proc_exec(ouro_env *env, ouro_v *cmd)
 	return ouro_clos(f_proc_exec_args, ouro_cons(cmd, 0));
 }
 
-/* The checked intrinsic uses ordinary pairs. Keep the legacy ProcResult
-   adapter on the same process implementation until C hosting is retired. */
+/* Share the process implementation with ProcResult and adapt its result
+   to the pair layout required by the checked intrinsic. */
 static ouro_v *proc_capture_run(ouro_env *env, ouro_v *unit)
 {
 	ouro_v *result = proc_exec_run(env, unit);
@@ -2284,8 +2519,8 @@ static ouro_v *f_proc_capture(ouro_env *env, ouro_v *cmd)
 	return ouro_clos(f_proc_capture_args, ouro_cons(cmd, 0));
 }
 
-/* Foreground inherited execution belongs to the native Windows owner.
-   This temporary host returns ERROR_CALL_NOT_IMPLEMENTED only when run. */
+/* The native Windows runtime owns foreground inherited execution.
+   The C host reports ERROR_CALL_NOT_IMPLEMENTED when the action runs. */
 static ouro_v *proc_inherit_unavailable_run(ouro_env *env, ouro_v *unit)
 {
 	ouro_v *fields[2];
@@ -2420,17 +2655,37 @@ static int bounded_utf16(const char *bytes, unsigned long len, wchar_t **out, DW
 }
 
 /* MSVC-style quoting so CommandLineToArgvW recovers each argument exactly. */
-static int bounded_quote(const char *arg, char **out)
+static int bounded_cmd_append_quoted(char **line, size_t *used, size_t *cap,
+	const char *arg, size_t len, int spaced)
 {
-	size_t cap = strlen(arg) * 2U + 3U;
-	size_t at = 0;
+	size_t overhead = spaced ? 4U : 3U;
+	size_t required;
+	size_t at = *used;
 	size_t slashes = 0;
 	const char *p;
-	char *buf = (char *)malloc(cap);
-	if (buf == 0)
+	char *buf;
+	if (len > (SIZE_MAX - overhead) / 2U)
 		return 0;
+	required = len * 2U + overhead;
+	if (at > SIZE_MAX - required)
+		return 0;
+	required += at;
+	if (required > *cap) {
+		size_t next = *cap <= SIZE_MAX / 2U ? *cap * 2U : required;
+		char *grown;
+		if (next < required)
+			next = required;
+		grown = (char *)realloc(*line, next);
+		if (grown == 0)
+			return 0;
+		*line = grown;
+		*cap = next;
+	}
+	buf = *line;
+	if (spaced)
+		buf[at++] = ' ';
 	buf[at++] = '"';
-	for (p = arg; ; p++) {
+	for (p = arg; p < arg + len; p++) {
 		if (*p == '\\') {
 			slashes++;
 			continue;
@@ -2449,8 +2704,6 @@ static int bounded_quote(const char *arg, char **out)
 				buf[at++] = '\\';
 			slashes = 0;
 		}
-		if (*p == 0)
-			break;
 		buf[at++] = *p;
 	}
 	{
@@ -2460,29 +2713,7 @@ static int bounded_quote(const char *arg, char **out)
 	}
 	buf[at++] = '"';
 	buf[at] = 0;
-	*out = buf;
-	return 1;
-}
-
-static int bounded_cmd_append(char **line, size_t *used, size_t *cap, const char *piece, int spaced)
-{
-	size_t n = strlen(piece);
-	size_t extra = n + (spaced ? 1U : 0U);
-	char *grown;
-	if (*used + extra + 1U > *cap) {
-		size_t next = *cap * 2U + extra + 1U;
-		if (next < *cap)
-			return 0;
-		grown = (char *)realloc(*line, next);
-		if (grown == 0)
-			return 0;
-		*line = grown;
-		*cap = next;
-	}
-	if (spaced)
-		(*line)[(*used)++] = ' ';
-	memcpy(*line + *used, piece, n + 1U);
-	*used += n;
+	*used = at;
 	return 1;
 }
 
@@ -2584,7 +2815,7 @@ static int bounded_read_file(const char *path, uint64_t cap,
 	return 0;
 }
 
-static ouro_v *proc_bounded_run(ouro_env *env, ouro_v *unit)
+static ouro_v *proc_bounded_run_at(ouro_env *env, ouro_v *unit, ouro_v *directory_v)
 {
 	ouro_v *request;
 	ouro_v *args;
@@ -2604,15 +2835,20 @@ static ouro_v *proc_bounded_run(ouro_env *env, ouro_v *unit)
 	uint64_t cpu;
 	uint64_t out_cap;
 	uint64_t err_cap;
-	char *stdin_bytes = 0;
+	const char *stdin_bytes;
+	char *owned_stdin = 0;
 	unsigned long stdin_len = 0;
-	char *cmd_bytes = 0;
+	const char *cmd_bytes;
+	char *owned_cmd = 0;
 	unsigned long cmd_len = 0;
 	char *cmdline = 0;
 	size_t cmd_used = 0;
 	size_t cmd_cap = 0;
 	wchar_t *exe_w = 0;
 	wchar_t *cmdline_w = 0;
+	wchar_t *directory_w = 0;
+	char *owned_directory = 0;
+	unsigned long directory_len = 0;
 	char dir[4096];
 	char stdin_path[4096];
 	char out_path[4096];
@@ -2625,14 +2861,16 @@ static ouro_v *proc_bounded_run(ouro_env *env, ouro_v *unit)
 	HANDLE h_process = NULL;
 	LPPROC_THREAD_ATTRIBUTE_LIST attrs = 0;
 	ouro_v *reply = 0;
-	ouro_env *pending = 0;
-	ouro_v *rest = 0;
+	proc_arg_stream arguments = { 0 };
+	ouro_v *arg;
+	int arg_step;
 	int dir_ready = 0;
 	int stdin_ready = 0;
 	int out_ready = 0;
 	int err_ready = 0;
 	DWORD err = 0;
 	(void)unit;
+	(void)directory_v;
 	sandbox_die("proc_bounded");
 	if (env == 0 || env->next == 0 || env->next->next == 0)
 		return bounded_empty(1, 87);
@@ -2659,96 +2897,90 @@ static ouro_v *proc_bounded_run(ouro_env *env, ouro_v *unit)
 	if (!bounded_nat_u64(err_cap_v, &err_cap) ||
 	    err_cap >= 0xFFFFFFFFFFFFFFD1ULL)
 		return bounded_empty(4, 5);
-	stdin_bytes = codes_to_cstr(stdin_v, &stdin_len);
+	stdin_bytes = string_input_bytes(stdin_v, &stdin_len, &owned_stdin);
 	if (stdin_bytes == 0)
 		return bounded_empty(1, 14);
-	cmd_bytes = codes_to_cstr(command_v, &cmd_len);
+	cmd_bytes = string_input_bytes(command_v, &cmd_len, &owned_cmd);
 	if (cmd_bytes == 0) {
-		free(stdin_bytes);
+		free(owned_stdin);
 		return bounded_empty(1, 14);
 	}
 	if (cmd_len == 0 || memchr(cmd_bytes, 0, cmd_len) != 0) {
-		free(stdin_bytes);
-		free(cmd_bytes);
+		free(owned_stdin);
+		free(owned_cmd);
 		return bounded_empty(1, 87);
 	}
 	cmdline = (char *)malloc(256);
 	if (cmdline == 0) {
-		free(stdin_bytes);
-		free(cmd_bytes);
+		free(owned_stdin);
+		free(owned_cmd);
 		return bounded_empty(1, 14);
 	}
 	cmd_cap = 256;
-	{
-		char *quoted = 0;
-		if (!bounded_quote(cmd_bytes, &quoted) ||
-		    !bounded_cmd_append(&cmdline, &cmd_used, &cmd_cap, quoted, 0)) {
-			free(quoted);
-			free(stdin_bytes);
-			free(cmd_bytes);
-			free(cmdline);
-			return bounded_empty(1, 14);
-		}
-		free(quoted);
+	if (!bounded_cmd_append_quoted(&cmdline, &cmd_used, &cmd_cap, cmd_bytes, cmd_len, 0)) {
+		free(owned_stdin);
+		free(owned_cmd);
+		free(cmdline);
+		return bounded_empty(1, 14);
 	}
-	rest = args;
-	for (;;) {
-		char *text = 0;
+	arguments.rest = args;
+	while ((arg_step = proc_arg_next(&arguments, &arg)) > 0) {
+		const char *text;
+		char *owned_text = 0;
 		unsigned long text_len = 0;
-		char *quoted = 0;
-		int ok = 1;
-		if (rest == 0) {
-			reply = bounded_empty(1, 87);
-			goto cleanup;
-		}
-		if (rest->tag == OURO_TAG_CAT && rest->n == 2) {
-			ouro_env *node = (ouro_env *)malloc(sizeof *node);
-			if (node == 0) {
-				reply = bounded_empty(1, 14);
-				goto cleanup;
-			}
-			node->v = OURO_F(rest, 1);
-			node->next = pending;
-			pending = node;
-			rest = OURO_F(rest, 0);
-			continue;
-		}
-		if (rest->tag == 0 && rest->n == 0) {
-			ouro_env *node = pending;
-			if (node == 0)
-				break;
-			rest = node->v;
-			pending = node->next;
-			free(node);
-			continue;
-		}
-		if (rest->tag != 1 || rest->n != 2) {
-			reply = bounded_empty(1, 87);
-			goto cleanup;
-		}
-		text = codes_to_cstr(OURO_F(rest, 0), &text_len);
+		int ok;
+		text = string_input_bytes(arg, &text_len, &owned_text);
 		if (text == 0) {
 			reply = bounded_empty(1, 14);
 			goto cleanup;
 		}
-		if (memchr(text, 0, text_len) != 0)
-			ok = 0;
-		else if (!bounded_quote(text, &quoted))
-			ok = 0;
-		else if (!bounded_cmd_append(&cmdline, &cmd_used, &cmd_cap, quoted, 1))
-			ok = 0;
-		free(quoted);
-		free(text);
+		ok = memchr(text, 0, text_len) == 0
+			&& bounded_cmd_append_quoted(&cmdline, &cmd_used, &cmd_cap, text, text_len, 1);
+		free(owned_text);
 		if (!ok) {
 			reply = bounded_empty(1, 87);
 			goto cleanup;
 		}
-		rest = OURO_F(rest, 1);
 	}
+	if (arg_step < 0) {
+		reply = bounded_empty(1, arg_step == PROC_ARG_NO_MEMORY ? 14 : 87);
+		goto cleanup;
+	}
+	free(arguments.stack);
+	arguments.stack = 0;
 	if (!bounded_utf16(cmd_bytes, cmd_len, &exe_w, &err) ||
 	    !bounded_utf16(cmdline, (unsigned long)cmd_used, &cmdline_w, &err)) {
 		reply = bounded_empty(1, err);
 		goto cleanup;
+	}
+	if (directory_v != 0) {
+		const char *directory_bytes;
+		size_t units;
+		int drive;
+		directory_bytes = string_input_bytes(directory_v, &directory_len, &owned_directory);
+		if (directory_bytes == 0) {
+			reply = bounded_empty(1, 14);
+			goto cleanup;
+		}
+		if (memchr(directory_bytes, 0, (size_t)directory_len) != 0) {
+			reply = bounded_empty(1, ERROR_INVALID_PARAMETER);
+			goto cleanup;
+		}
+		if (!bounded_utf16(directory_bytes, directory_len, &directory_w, &err)) {
+			reply = bounded_empty(1, err);
+			goto cleanup;
+		}
+		units = wcslen(directory_w);
+		drive = units >= 3 &&
+			((directory_w[0] >= L'A' && directory_w[0] <= L'Z') ||
+			 (directory_w[0] >= L'a' && directory_w[0] <= L'z')) &&
+			directory_w[1] == L':' &&
+			(directory_w[2] == L'\\' || directory_w[2] == L'/');
+		if (units < 3 || (!drive &&
+		    !(directory_w[0] == L'\\' && directory_w[1] == L'\\'))) {
+			reply = bounded_empty(1, ERROR_INVALID_PARAMETER);
+			goto cleanup;
+		}
 	}
 	if (wcslen(cmdline_w) >= 32767) {
 		reply = bounded_empty(1, 87);
@@ -2887,7 +3119,7 @@ static ouro_v *proc_bounded_run(ouro_env *env, ouro_v *unit)
 		if (!CreateProcessW(exe_w, cmdline_w, NULL, NULL, TRUE,
 		    EXTENDED_STARTUPINFO_PRESENT | CREATE_NO_WINDOW |
 		    BELOW_NORMAL_PRIORITY_CLASS,
-		    NULL, NULL, &siex.StartupInfo, &pi)) {
+		    NULL, directory_w, &siex.StartupInfo, &pi)) {
 			reply = bounded_empty(1, GetLastError());
 			goto cleanup;
 		}
@@ -3006,16 +3238,14 @@ static ouro_v *proc_bounded_run(ouro_env *env, ouro_v *unit)
 		goto cleanup;
 	}
 cleanup:
-	while (pending != 0) {
-		ouro_env *node = pending;
-		pending = node->next;
-		free(node);
-	}
-	free(stdin_bytes);
-	free(cmd_bytes);
+	free(arguments.stack);
+	free(owned_stdin);
+	free(owned_cmd);
 	free(cmdline);
 	free(exe_w);
 	free(cmdline_w);
+	free(owned_directory);
+	free(directory_w);
 	if (attrs != 0) {
 		DeleteProcThreadAttributeList(attrs);
 		free(attrs);
@@ -3045,13 +3275,52 @@ cleanup:
 	return reply;
 }
 #else
-static ouro_v *proc_bounded_run(ouro_env *env, ouro_v *unit)
+static ouro_v *proc_bounded_run_at(ouro_env *env, ouro_v *unit, ouro_v *directory_v)
 {
 	(void)env;
 	(void)unit;
+	(void)directory_v;
 	return bounded_empty(1, 120);
 }
 #endif
+static ouro_v *proc_bounded_run(ouro_env *env, ouro_v *unit)
+{
+	return proc_bounded_run_at(env, unit, 0);
+}
+static ouro_v *proc_bounded_directory_run(ouro_env *env, ouro_v *unit)
+{
+	ouro_env request;
+	ouro_env arguments;
+	ouro_env program;
+	if (env == 0 || env->next == 0 || env->next->next == 0 ||
+	    env->next->next->next == 0)
+		return bounded_empty(1, 87);
+	program.v = env->next->next->next->v;
+	program.next = 0;
+	arguments.v = env->next->next->v;
+	arguments.next = &program;
+	request.v = env->v;
+	request.next = &arguments;
+	return proc_bounded_run_at(&request, unit, env->next->v);
+}
+static ouro_v *f_proc_bounded_at_request(ouro_env *env, ouro_v *request)
+{
+	return thunk(proc_bounded_directory_run, ouro_cons(request, env));
+}
+static ouro_v *f_proc_bounded_at_directory(ouro_env *env, ouro_v *directory)
+{
+	return ouro_clos(f_proc_bounded_at_request, ouro_cons(directory, env));
+}
+static ouro_v *f_proc_bounded_at_args(ouro_env *env, ouro_v *args)
+{
+	return ouro_clos(f_proc_bounded_at_directory, ouro_cons(args, env));
+}
+static ouro_v *f_proc_bounded_at(ouro_env *env, ouro_v *command)
+{
+	(void)env;
+	return ouro_clos(f_proc_bounded_at_args, ouro_cons(command, 0));
+}
+
 static ouro_v *f_proc_bounded_limits(ouro_env *env, ouro_v *limits)
 {
 	return thunk(proc_bounded_run, ouro_cons(limits, env));
@@ -3166,6 +3435,8 @@ static ouro_v *io_prim_new(const char *name)
 		return ouro_clos(f_u8_from_nat, 0);
 	if (strcmp(name, "ouro.u32.from_nat.checked") == 0)
 		return ouro_clos(f_u32_from_nat, 0);
+	if (strcmp(name, "ouro.u64.from_nat.checked") == 0)
+		return ouro_clos(f_u64_from_nat, 0);
 	if (strcmp(name, "ouro.u8.sub.wrap") == 0)
 		return ouro_clos(f_u8_sub, 0);
 	if (strcmp(name, "io_pure") == 0)
@@ -3186,6 +3457,8 @@ static ouro_v *io_prim_new(const char *name)
 		return ouro_clos(f_env, 0);
 	if (strcmp(name, "prim_fs_read_file") == 0)
 		return ouro_clos(f_fs_read, 0);
+	if (strcmp(name, "prim_fs_read_file_status") == 0)
+		return ouro_clos(f_fs_read_status, 0);
 	if (strcmp(name, "prim_fs_write_file") == 0)
 		return ouro_clos(f_fs_write_p, 0);
 	if (strcmp(name, "prim_fs_exists") == 0)
@@ -3198,6 +3471,8 @@ static ouro_v *io_prim_new(const char *name)
 		return ouro_clos(f_fs_kind, 0);
 	if (strcmp(name, "prim_fs_realpath") == 0)
 		return ouro_clos(f_fs_realpath, 0);
+	if (strcmp(name, "ouro.managed.allocated_requested_bytes") == 0)
+		return ouro_clos(f_managed_requested_bytes_unavailable, 0);
 	if (strcmp(name, "prim_time_now") == 0)
 		return ouro_clos(f_time, 0);
 	if (strcmp(name, "prim_string_concat") == 0)
@@ -3258,6 +3533,8 @@ static ouro_v *io_prim_new(const char *name)
 		return ouro_clos(f_proc_exec, 0);
 	if (strcmp(name, "ouro.process.capture_bounded") == 0)
 		return ouro_clos(f_proc_bounded, 0);
+	if (strcmp(name, "ouro.process.capture_bounded_at") == 0)
+		return ouro_clos(f_proc_bounded_at, 0);
 	if (strcmp(name, "ouro.process.inherit") == 0)
 		return ouro_clos(f_proc_inherit, 0);
 	if (strcmp(name, "ouro.process.capture") == 0)

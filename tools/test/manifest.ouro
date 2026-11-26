@@ -5,6 +5,7 @@ import "../../std/fs.ouro",
   "../../std/process.ouro",
   "../../std/text.ouro",
   "../../std/json.ouro",
+  "../quality/order.ouro",
   "common.ouro";
 
 inductive ManifestRow : Type :=
@@ -67,67 +68,108 @@ def manifest_id_selected (prefixes : List String) (id : String) : Bool :=
     any String (fun (prefix : String) => str_starts id prefix) prefixes;
 
 
+private def manifest_shared_length : List Nat -> List Nat -> Nat -> Nat :=
+  fix shared (left : List Nat) (right : List Nat) (count : Nat) : Nat :=
+    match left with
+    | Nil => count
+    | Cons byte left_rest => match right with
+      | Nil => count
+      | Cons other right_rest =>
+        -- The C host compares prefixes only up to NUL.
+        if andb (eq_nat byte other) (notb (is_nul byte)) then
+          shared left_rest right_rest (S count)
+        else count
+      end
+    end;
+
+
+private def manifest_shared_prefix (prefixes : List String) : Maybe String :=
+    match prefixes with
+    | Nil => Nothing String
+    | Cons first rest =>
+        if nullb String rest then Nothing String
+        else
+          let shared : String := foldl String String
+            (fun (common : String) (prefix : String) =>
+              if str_starts prefix common then common
+              else str_slice common Z (manifest_shared_length (str_codes common) (str_codes prefix) Z))
+            first rest in
+          if str_null shared then Nothing String else Just String shared
+    end;
+
+
 def manifest_field (fields : List String) (index : Nat) : String :=
     str_trim (nth String "" index fields);
 
 
-def manifest_parse_row (prefixes : List String) (line_no : Nat) (line : String) : ManifestLine :=
-    let clean : String := str_trim (strip_cr line) in
-    match orb(str_null clean, str_starts clean "#") with
-    | True => ManifestSkip
-    | False =>
-        let fields : List String := str_split line 9 in
-        let raw_id : String := str_trim (nth String "" Z fields) in
-        match manifest_id_selected prefixes raw_id with
-        | False => ManifestSkip
-        | True =>
-          match eq_nat(length String fields, S (S (S (S (S (S Z)))))) with
-        | False => manifest_line_error line_no "expected exactly six tab-separated columns"
-        | True =>
-            let id : String := str_trim (nth String "" Z fields) in
-            let path : String := str_trim (nth String "" (S Z) fields) in
-            let tool : String := manifest_field fields 2 in
-            let expect : String := manifest_field fields 3 in
-            let min0 : String := manifest_field fields 4 in
-            let diag : String := strip_cr (manifest_field fields 5) in
-            match manifest_safe_id id with
-            | False => manifest_line_error line_no "unsafe or empty id"
-            | True =>
-                match manifest_safe_path path with
-                | False => manifest_line_error line_no "unsafe or empty path"
-                | True =>
-                    match orb(str_eq expect "pass", str_eq expect "fail") with
-                    | False => manifest_line_error line_no "expect must be pass or fail"
-                    | True =>
-                        match str_parse_nat min0 with
-                        | Nothing => manifest_line_error line_no "min_issues must be a natural number"
-                        | Just min_issues =>
-                            ManifestGood (MkManifestRow id path tool expect min_issues diag)
-                        end
-                    end
-                end
-            end
-          end
-        end
+private def manifest_ignored_line (line : String) : Bool :=
+    match drop_while Nat is_ws (str_codes line) with
+    | Nil => True
+    -- The C host stops string replacement at NUL. Managed strings keep the full input.
+    | Cons first _ => if is_nul first then
+        let clean : String := str_trim (strip_cr line) in
+        orb(str_null clean, str_starts clean "#")
+      else eq_nat first ch_hash
     end;
+
+
+private def manifest_parse_row_with_prefix (prefixes : List String) (shared : Maybe String)
+    (line_no : Nat) (line : String) : ManifestLine :=
+    if manifest_ignored_line line then ManifestSkip
+    else
+      let id : String := match str_index line "\t" with
+        | Just tab => str_trim (str_slice line Z tab)
+        | Nothing => manifest_field (str_split line ch_tab) Z
+        end in
+      let selected : Bool := match shared with
+        | Nothing => manifest_id_selected prefixes id
+        | Just prefix => if str_starts id prefix then manifest_id_selected prefixes id else False
+        end in
+      if selected then
+        let fields : List String := str_split line ch_tab in
+        if eq_nat(length String fields, S (S (S (S (S (S Z)))))) then
+          let path : String := str_trim (nth String "" (S Z) fields) in
+          let tool : String := manifest_field fields 2 in
+          let expect : String := manifest_field fields 3 in
+          let min0 : String := manifest_field fields 4 in
+          let diag : String := strip_cr (manifest_field fields 5) in
+          if manifest_safe_id id then
+            if manifest_safe_path path then
+              if orb(str_eq expect "pass", str_eq expect "fail") then
+                match str_parse_nat min0 with
+                | Nothing => manifest_line_error line_no "min_issues must be a natural number"
+                | Just min_issues =>
+                    ManifestGood (MkManifestRow id path tool expect min_issues diag)
+                end
+              else manifest_line_error line_no "expect must be pass or fail"
+            else manifest_line_error line_no "unsafe or empty path"
+          else manifest_line_error line_no "unsafe or empty id"
+        else manifest_line_error line_no "expected exactly six tab-separated columns"
+      else ManifestSkip;
+
+
+def manifest_parse_row (prefixes : List String) (line_no : Nat) (line : String) : ManifestLine :=
+    manifest_parse_row_with_prefix prefixes (Nothing String) line_no line;
 
 
 def manifest_parse_lines_go (prefixes : List String) (initial_line : Nat)
     (initial_lines : List String) (initial_rows : List ManifestRow)
     (initial_errors : List String) : Pair (List ManifestRow) (List String) :=
-  (fix go (lines : List String) (line_no : Nat) (rows : List ManifestRow)
-      (errors : List String) : Pair (List ManifestRow) (List String) :=
+  let shared : Maybe String := manifest_shared_prefix prefixes in
+  (fix go (lines : List String) (line_no : Nat) (rows_rev : List ManifestRow)
+      (errors_rev : List String) : Pair (List ManifestRow) (List String) :=
     match lines with
-    | Nil => MkPair(List ManifestRow, List String, rows, errors)
+    | Nil => MkPair(List ManifestRow, List String,
+        reverse_lin ManifestRow rows_rev, reverse_lin String errors_rev)
     | Cons line rest =>
-        match manifest_parse_row prefixes line_no line with
-        | ManifestSkip => go rest (S line_no) rows errors
+        match manifest_parse_row_with_prefix prefixes shared line_no line with
+        | ManifestSkip => go rest (S line_no) rows_rev errors_rev
         | ManifestBad error =>
-            go(rest, S line_no, rows, snoc String errors error)
+            go(rest, S line_no, rows_rev, Cons String error errors_rev)
         | ManifestGood row =>
-            go(rest, S line_no, snoc ManifestRow rows row, errors)
+            go(rest, S line_no, Cons ManifestRow row rows_rev, errors_rev)
         end
-    end) initial_lines initial_line initial_rows initial_errors;
+    end) initial_lines initial_line (reverse_lin ManifestRow initial_rows) (reverse_lin String initial_errors);
 
 
 def manifest_duplicate_errors_go (initial_seen : List String)
@@ -138,20 +180,36 @@ def manifest_duplicate_errors_go (initial_seen : List String)
     | Cons row rest =>
         let id : String := manifest_row_id row in
         let tail : List String := go(rest, Cons String id seen) in
-        match elem String str_eq id seen with
-        | True => Cons String (str_concat "duplicate id: " id) tail
-        | False => tail
-        end
+        if elem String str_eq id seen then Cons String (str_concat "duplicate id: " id) tail else tail
     end) initial_rows initial_seen;
 
 
+private def manifest_sorted_ids_distinct : List String -> Bool :=
+    fix ordered (ids : List String) : Bool :=
+      match ids with
+      | Nil => True
+      | Cons first rest => match rest with
+        | Nil => True
+        | Cons second _ => if str_le second first then False else ordered rest
+        end
+      end;
+
+
+private def manifest_duplicate_errors (rows : List ManifestRow) : List String :=
+    -- The direct scan uses less memory at the size of a CI batch.
+    if nullb ManifestRow (drop ManifestRow 32 rows) then manifest_duplicate_errors_go [] rows
+    else
+      let ids : List String := quality_sort String str_le (map ManifestRow String manifest_row_id rows) in
+      -- The scan resolves sort ties by byte equality and reports them in source order.
+      if manifest_sorted_ids_distinct ids then [] else manifest_duplicate_errors_go [] rows;
+
+
 def manifest_parse (prefixes : List String) (text : String) : Pair (List ManifestRow) (List String) :=
-    match manifest_parse_lines_go prefixes (S Z) (str_lines text)
-      (Nil ManifestRow) (Nil String) with
-    | MkPair rows errors =>
-        MkPair (List ManifestRow) (List String) rows
-          (append String errors (manifest_duplicate_errors_go(Nil String, rows)))
-    end;
+    let (MkPair rows errors) :=
+      manifest_parse_lines_go prefixes (S Z) (str_lines text)
+      (Nil ManifestRow) (Nil String) in
+    MkPair (List ManifestRow) (List String) rows
+      (append String errors (manifest_duplicate_errors rows));
 
 
 def manifest_prefixes (value : String) : List String :=
@@ -160,7 +218,7 @@ def manifest_prefixes (value : String) : List String :=
 
 
 def manifest_row_selected (prefixes : List String) (row : ManifestRow) : Bool :=
-    any String (fun (prefix : String) => str_starts(manifest_row_id row, prefix)) prefixes;
+    manifest_id_selected prefixes (manifest_row_id row);
 
 
 def manifest_selected_rows (prefixes : List String) (rows : List ManifestRow) : List ManifestRow :=
@@ -168,15 +226,13 @@ def manifest_selected_rows (prefixes : List String) (rows : List ManifestRow) : 
 
 
 def manifest_selected_issues (rows : List ManifestRow) : List String :=
-  foldl ManifestRow (List String)
-    (fun (errors : List String) (row : ManifestRow) =>
-      match str_eq(manifest_row_tool row, "check") with
-      | True => errors
-      | False => snoc String errors
-          (str_cat4 "unsupported selected tool for " (manifest_row_id row) ": "
-            (manifest_row_tool row))
-      end)
-    (Nil String) rows;
+    reverse_lin String (foldl ManifestRow (List String)
+      (fun (errors : List String) (row : ManifestRow) =>
+        if str_eq(manifest_row_tool row, "check") then errors
+        else Cons String
+            (str_cat4 "unsupported selected tool for " (manifest_row_id row) ": "
+              (manifest_row_tool row)) errors)
+      (Nil String) rows);
 
 
 def manifest_row_pipe (row : ManifestRow) : String :=
@@ -222,11 +278,10 @@ def manifest_fail_line (label : String) (id : String) (issue : String) : String 
 
 
 def manifest_write_error (path : String) (content : String) : IO (Maybe String) :=
-    do let! wrote := fs_write_checked path content;
-       match wrote with
-       | Left e => io_pure(Maybe String, Just(String, fs_error_message e))
-       | Right _ => io_pure(Maybe String, Nothing String)
-       end
+    match! fs_write_checked path content with
+    | Left e => io_pure(Maybe String, Just(String, fs_error_message e))
+    | Right _ => io_pure(Maybe String, Nothing String)
+    end
 
 
 def manifest_log_write_failure (label : String) (id : String) (log_path : String)
@@ -239,26 +294,16 @@ def manifest_log_write_failure (label : String) (id : String) (log_path : String
 
 def manifest_process_issue (row : ManifestRow) (result : ProcResult) (output : String) : String :=
     let expected_ok : Bool :=
-      match str_eq(manifest_row_expect row, "pass") with
-      | True => check_result_ok result
-      | False => eq_nat(proc_code result, S Z)
-      end in
-    match expected_ok with
-    | False => str_concat("expected ", manifest_row_expect row)
-    | True =>
-        match str_eq(manifest_row_expect row, "pass") with
-        | True => ""
-        | False =>
-            match str_null (manifest_row_diag row) with
-            | True => ""
-            | False =>
-                match str_contains(output, manifest_row_diag row) with
-                | True => ""
-                | False => str_concat("missing ", manifest_row_diag row)
-                end
-            end
-        end
-    end;
+      if str_eq(manifest_row_expect row, "pass") then check_result_ok result
+      else eq_nat(proc_code result, S Z) in
+    if expected_ok then
+      if str_eq(manifest_row_expect row, "pass") then ""
+      else
+        if str_null (manifest_row_diag row) then ""
+        else
+          if str_contains(output, manifest_row_diag row) then ""
+          else str_concat("missing ", manifest_row_diag row)
+    else str_concat("expected ", manifest_row_expect row);
 
 
 def manifest_run_one (root : String) (out_dir : String)
@@ -267,52 +312,45 @@ def manifest_run_one (root : String) (out_dir : String)
     let file_path : String := fs_child(root, manifest_row_path row) in
     let log_path : String := fs_child(out_dir, str_concat id ".out") in
     do let! present := fs_exists file_path;
-       match present with
-       | False =>
-           do let! log_error := manifest_write_error log_path "missing file\n";
-              match log_error with
-              | Just message => manifest_log_write_failure label id log_path message
-              | Nothing => do eprintln (manifest_fail_line label id "missing file");
-                              io_pure(ManifestResult, MkManifestResult id "fail" 127 log_path "missing file")
+       (if present then
+         do let! outcome := test_check_process file_path True;
+            let output : String := test_process_output outcome in
+            match! manifest_write_error log_path output with
+            | Just message => manifest_log_write_failure label id log_path message
+            | Nothing => match outcome with
+              | Left error =>
+                  let issue : String := test_process_error_message error in
+                  do eprintln (manifest_fail_line label id issue);
+                     io_pure(ManifestResult, MkManifestResult id "fail" 125 log_path issue)
+              | Right result =>
+                  let issue : String := manifest_process_issue row result output in
+                  if str_null issue then
+                    io_pure(ManifestResult, MkManifestResult id "pass" (proc_code result) log_path "")
+                  else
+                    do eprint output; eprintln (manifest_fail_line label id issue);
+                                io_pure(ManifestResult, MkManifestResult id "fail" (proc_code result) log_path issue)
               end
-       | True =>
-           do let! outcome := test_check_process file_path True;
-              let output : String := test_process_output outcome in
-              do let! log_error := manifest_write_error log_path output;
-                 match log_error with
-                 | Just message => manifest_log_write_failure label id log_path message
-                 | Nothing => match outcome with
-                   | Left error =>
-                       let issue : String := test_process_error_message error in
-                       do eprintln (manifest_fail_line label id issue);
-                          io_pure(ManifestResult, MkManifestResult id "fail" 125 log_path issue)
-                   | Right result =>
-                       let issue : String := manifest_process_issue row result output in
-                       match str_null issue with
-                       | True => io_pure(ManifestResult, MkManifestResult id "pass" (proc_code result) log_path "")
-                       | False => do eprint output; eprintln (manifest_fail_line label id issue);
-                                     io_pure(ManifestResult, MkManifestResult id "fail" (proc_code result) log_path issue)
-                       end
-                   end
-                 end
-       end
+            end
+       else
+         match! manifest_write_error log_path "missing file\n" with
+         | Just message => manifest_log_write_failure label id log_path message
+         | Nothing => do eprintln (manifest_fail_line label id "missing file");
+                         io_pure(ManifestResult, MkManifestResult id "fail" 127 log_path "missing file")
+         end)
 
 def manifest_run_rows_go (root : String) (out_dir : String)
     (label : String) (initial_rows : List ManifestRow) (initial_count : Nat)
     (initial_failures : Nat) (initial_results : List ManifestResult) : IO ManifestRun :=
   (fix go (rows : List ManifestRow) (count : Nat) (failures : Nat)
-      (results : List ManifestResult) : IO ManifestRun :=
+      (results_rev : List ManifestResult) : IO ManifestRun :=
     match rows with
-    | Nil => io_pure(ManifestRun, MkManifestRun count failures results)
+    | Nil => io_pure(ManifestRun, MkManifestRun count failures (reverse_lin ManifestResult results_rev))
     | Cons row rest =>
         do let! result := manifest_run_one root out_dir label row;
            let next_failures : Nat :=
-             match manifest_result_ok result with
-             | True => failures
-             | False => S failures
-             end in
-           go(rest, S count, next_failures, snoc ManifestResult results result)
-    end) initial_rows initial_count initial_failures initial_results
+             if manifest_result_ok result then failures else S failures in
+           go(rest, S count, next_failures, Cons ManifestResult result results_rev)
+    end) initial_rows initial_count initial_failures (reverse_lin ManifestResult initial_results)
 
 
 def manifest_run_count (run : ManifestRun) : Nat :=
@@ -371,15 +409,15 @@ def manifest_print_errors (errors : List String) : IO Unit :=
 
 def manifest_finish (label : String) (out_dir : String) (run : ManifestRun) : IO Unit :=
     let count : String := show_nat (manifest_run_count run) in
-    match eq_nat(manifest_run_failures run, Z) with
-    | True => do println
+    (if eq_nat(manifest_run_failures run, Z) then
+      do println
          (str_cat4 label ": PASS rows=" count (str_concat " out=" out_dir));
                exit 0
-    | False => do eprintln
+    else
+      do eprintln
          (str_cat4 label ": FAIL rows=" count
            (str_concat(" failures=", show_nat (manifest_run_failures run))));
-                exit 1
-    end
+                exit 1)
 
 
 def manifest_run_and_report (manifest : String) (prefixes : List String)
@@ -387,9 +425,8 @@ def manifest_run_and_report (manifest : String) (prefixes : List String)
     (selected : List ManifestRow) : IO Unit :=
     do let! run := manifest_run_rows_go root out_dir label selected
          Z Z (Nil ManifestResult);
-       let! report_write := fs_write_checked (fs_child out_dir "manifest-report.json")
-         (manifest_report manifest root out_dir label prefixes run);
-       match report_write with
+       match! fs_write_checked (fs_child out_dir "manifest-report.json")
+         (manifest_report manifest root out_dir label prefixes run) with
        | Left report_error => do eprintln (str_concat("MANIFEST_ERROR ", fs_error_message report_error));
                                   exit 1
        | Right _ => manifest_finish label out_dir run
@@ -399,21 +436,19 @@ def manifest_run_and_report (manifest : String) (prefixes : List String)
 def manifest_write_rows_then_run (manifest : String) (prefixes : List String)
     (root : String) (label : String) (out_dir : String)
     (selected : List ManifestRow) : IO Unit :=
-    do let! made := fs_mkdir_p_checked out_dir;
-       match made with
-       | Left mkdir_error =>
-           do eprintln (str_concat("MANIFEST_ERROR ", fs_error_message mkdir_error));
-              exit 2
-       | Right _ =>
-           do let! rows_write := fs_write_checked (fs_child out_dir "rows.tsv")
-                (manifest_rows_text selected);
-              match rows_write with
-              | Left rows_error =>
-                  do eprintln (str_concat("MANIFEST_ERROR ", fs_error_message rows_error));
-                     exit 2
-              | Right _ => manifest_run_and_report manifest prefixes root label out_dir selected
-              end
-       end
+    match! fs_mkdir_p_checked out_dir with
+    | Left mkdir_error =>
+        do eprintln (str_concat("MANIFEST_ERROR ", fs_error_message mkdir_error));
+           exit 2
+    | Right _ =>
+        match! fs_write_checked (fs_child out_dir "rows.tsv")
+          (manifest_rows_text selected) with
+        | Left rows_error =>
+            do eprintln (str_concat("MANIFEST_ERROR ", fs_error_message rows_error));
+               exit 2
+        | Right _ => manifest_run_and_report manifest prefixes root label out_dir selected
+        end
+    end
 
 
 def manifest_execute (args : Args) (manifest : String) (prefixes : List String)
@@ -423,44 +458,44 @@ def manifest_execute (args : Args) (manifest : String) (prefixes : List String)
        manifest_write_rows_then_run manifest prefixes root label out_dir selected
 
 
+private def manifest_execute_selected (args : Args) (manifest : String)
+    (prefixes : List String) (root : String) (label : String)
+    (selected : List ManifestRow) : IO Unit :=
+    let selected_errors : List String := manifest_selected_issues selected in
+    (if nullb ManifestRow selected then
+      do eprintln "MANIFEST_ERROR no rows selected";
+                 exit 2
+    else
+      if nullb String selected_errors then
+        manifest_execute args manifest prefixes root label selected
+      else
+        do manifest_print_errors selected_errors;
+                    exit 2)
+
+
 def manifest_select_and_execute (args : Args) (manifest : String)
     (prefixes : List String) (root : String) (label : String)
     (rows : List ManifestRow) : IO Unit :=
-    let selected : List ManifestRow := manifest_selected_rows prefixes rows in
-    let selected_errors : List String := manifest_selected_issues selected in
-    match nullb ManifestRow selected with
-    | True => do eprintln "MANIFEST_ERROR no rows selected";
-                 exit 2
-    | False =>
-        match nullb String selected_errors with
-        | False => do manifest_print_errors selected_errors;
-                      exit 2
-        | True => manifest_execute args manifest prefixes root label selected
-        end
-    end
+    manifest_execute_selected args manifest prefixes root label (manifest_selected_rows prefixes rows);
 
 
 def manifest_run_cli (args : Args) (manifest : String) : IO Unit :=
     let prefixes : List String := manifest_prefixes (args_opt_or args "prefix" "") in
     let root : String := args_opt_or args "root" (path_dirname manifest) in
     let label : String := args_opt_or args "suite-label" "MANIFEST_SUITE" in
-    match nullb String prefixes with
-    | True => do eprintln "MANIFEST_ERROR --prefix must select at least one prefix";
+    if nullb String prefixes then
+      do eprintln "MANIFEST_ERROR --prefix must select at least one prefix";
                  exit 2
-    | False =>
-        do let! read_result := fs_read_checked manifest;
-           match read_result with
-           | Left read_error =>
-               do eprintln (str_concat("MANIFEST_ERROR ", fs_error_message read_error));
-                  exit 2
-           | Right text =>
-               match manifest_parse prefixes text with
-               | MkPair rows parse_errors =>
-                   match nullb String parse_errors with
-                   | False => do manifest_print_errors parse_errors;
-                                 exit 2
-                   | True => manifest_select_and_execute args manifest prefixes root label rows
-                   end
-               end
-           end
-    end
+    else
+      match! fs_read_checked manifest with
+      | Left read_error =>
+          do eprintln (str_concat("MANIFEST_ERROR ", fs_error_message read_error));
+             exit 2
+      | Right text =>
+          let (MkPair rows parse_errors) := manifest_parse prefixes text in
+          if nullb String parse_errors then
+            manifest_execute_selected args manifest prefixes root label rows
+          else
+            do manifest_print_errors parse_errors;
+                        exit 2
+      end

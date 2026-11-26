@@ -20,6 +20,7 @@ import "managed_terms.ouro",
   "managed_process_memory.ouro",
   "managed_http_memory.ouro",
   "managed_time.ouro",
+  "managed_heap_observer.ouro",
   "managed_fs_kind.ouro",
   "managed_fs_mutations.ouro",
   "lower_types.ouro",
@@ -64,23 +65,44 @@ def managed_core_globals : Nat -> CoreTerm -> Either NativeLowerError (List Nat)
       | CStrLit _ _ => Right(NativeLowerError, List Nat, [] : List Nat)
       | CStrBytes _ _ => Right(NativeLowerError, List Nat, [] : List Nat) end end;
 
+def managed_raw_reachable_indexed (environment : CheckEnvironment) (body_fuel : Nat)
+    (fuel : Nat) (pending : List Nat) (seen : List Nat) : Either NativeLowerError (List Nat) :=
+    match pending with | Nil => Right NativeLowerError (List Nat) seen
+    | Cons _ _ => match fuel with | Z => Left NativeLowerError (List Nat) LowerResourceExhausted
+      | S _ =>
+        -- Membership is derived from seen; its complete ordered payload survives.
+        let initial : EntryIndex :=
+          (fix collect (remaining : List Nat) (index : EntryIndex) : EntryIndex :=
+            match remaining with | Nil => index
+            | Cons id rest => collect(rest, entry_index_insert id EntryIndexReserved index) end)
+            seen EntryIndexEmpty in
+        (fix visit (remaining : Nat) (work : List Nat) (known : List Nat) (index : EntryIndex)
+            : Either NativeLowerError (List Nat) :=
+          match work with | Nil => Right NativeLowerError (List Nat) known
+          | Cons id rest => match remaining with | Z => Left NativeLowerError (List Nat) LowerResourceExhausted
+            | S next => match entry_index_lookup id index with
+              | Just _ => visit next rest known index
+              | Nothing => match check_environment_lookup id environment with
+                -- Constructor reservations and local binders are not globals.
+                | Nothing => visit next rest known index
+                | Just entry =>
+                  let extended : List Nat := Cons Nat id known in
+                  let updated : EntryIndex := entry_index_insert id EntryIndexReserved index in
+                  match entry with
+                  | MkEntry _ _ body => match body with | Nothing => visit next rest extended updated
+                    | Just term => lower_bind (List Nat) (List Nat) (managed_core_globals body_fuel term)
+                        (fun (references : List Nat) => visit next (append Nat references rest) extended updated) end
+                  | MkBoundEntry _ _ _ => visit next rest extended updated
+                  | MkIndEntry _ _ => visit next rest extended updated
+                  | MkRoleEntry _ => visit next rest extended updated end end end end end)
+          fuel pending seen initial end end;
+
 def managed_raw_reachable (entries : List Entry) (body_fuel : Nat)
     : Nat -> List Nat -> List Nat -> Either NativeLowerError (List Nat) :=
-  fix visit (fuel : Nat) (pending : List Nat) (seen : List Nat) : Either NativeLowerError (List Nat) :=
-    match pending with | Nil => Right NativeLowerError (List Nat) seen
-    | Cons id rest => match fuel with | Z => Left NativeLowerError (List Nat) LowerResourceExhausted
-      | S next => match mir_has id seen with | True => visit next rest seen
-        | False => match lower_find_entry id entries with
-          -- Let-binders and constructors share the intern table with globals.
-          -- A CConst of those names is not a missing declaration.
-          | Nothing => visit next rest seen
-          | Just entry => let known : List Nat := Cons Nat id seen in
-            match entry with
-            | MkEntry _ _ body => match body with | Nothing => visit next rest known
-              | Just term => lower_bind (List Nat) (List Nat) (managed_core_globals body_fuel term)
-                  (fun (references : List Nat) => visit next (append Nat references rest) known) end
-            | MkBoundEntry _ _ _ => visit next rest known
-            | MkIndEntry _ _ => visit next rest known | MkRoleEntry _ => visit next rest known end end end end end;
+    fun (fuel : Nat) (pending : List Nat) (seen : List Nat) =>
+      match pending with | Nil => Right NativeLowerError (List Nat) seen
+      | Cons _ _ => match fuel with | Z => Left NativeLowerError (List Nat) LowerResourceExhausted
+        | S _ => managed_raw_reachable_indexed (check_environment_from_entries entries) body_fuel fuel pending seen end end;
 
 def managed_extern_ids (entries : List Entry) : List Nat :=
     concat_map Entry Nat (fun (entry : Entry) => match entry with
@@ -88,6 +110,16 @@ def managed_extern_ids (entries : List Entry) : List Nat :=
         | PrimitiveIntrinsicBinding _ _ _ _ => ([] : List Nat) end
       | MkEntry _ _ _ => ([] : List Nat) | MkIndEntry _ _ => ([] : List Nat)
       | MkRoleEntry _ => ([] : List Nat) end) entries;
+
+def managed_raw_entries (entries : List Entry) (ids : List Nat) : List Entry :=
+    let index : EntryIndex :=
+      (fix collect (remaining : List Nat) (tree : EntryIndex) : EntryIndex :=
+        match remaining with
+        | Nil => tree
+        | Cons id rest => collect(rest, entry_index_insert id EntryIndexReserved tree)
+        end) ids EntryIndexEmpty in
+    filter Entry (fun (entry : Entry) => match entry_index_lookup (lower_entry_id entry) index with
+      | Nothing => False | Just _ => True end) entries;
 
 def managed_raw_contracts (compiler : ManagedCompiler) (fuel : Nat) : Either NativeLowerError (List LowerContract) :=
     match compiler with | ManagedCompilerOf program _ allocator collector release _ exit _ _ _ =>
@@ -106,12 +138,13 @@ def managed_raw_contracts (compiler : ManagedCompiler) (fuel : Nat) : Either Nat
         lower_bind (List Nat) (List LowerContract) (managed_temp_roots compiler fuel) (fun (temporary : List Nat) =>
         lower_bind (List Nat) (List LowerContract) (managed_process_roots compiler fuel) (fun (processes : List Nat) =>
         lower_bind (List Nat) (List LowerContract) (managed_http_roots compiler fuel) (fun (http : List Nat) =>
+        lower_bind (List Nat) (List LowerContract) (managed_heap_observer_roots compiler fuel) (fun (heap_observer : List Nat) =>
         lower_bind (List Nat) (List LowerContract)
-          (managed_raw_reachable entries fuel fuel
+          (managed_raw_reachable_indexed (managed_compiler_environment compiler) fuel fuel
             (append Nat http (append Nat processes (append Nat temporary
-              (append(Nat, append Nat realpaths directories, append(Nat, append Nat copies renames, append Nat mutations (append Nat kinds (append Nat files (append Nat stdin (append Nat startup (append Nat clock (append Nat stdio (append(Nat, [allocator, collector, release, exit] : List Nat, managed_extern_ids entries)))))))))))))) ([] : List Nat))
+              (append(Nat, append Nat realpaths directories, append(Nat, append Nat copies renames, append Nat mutations (append Nat kinds (append Nat files (append Nat stdin (append Nat startup (append Nat clock (append Nat stdio (append(Nat, [allocator, collector, release, exit] : List Nat, append Nat (managed_extern_ids entries) heap_observer)))))))))))))) ([] : List Nat))
           (fun (ids : List Nat) => lower_collect_contracts_indexed (managed_compiler_environment compiler) fuel
-            (filter(Entry, fun (entry : Entry) => mir_has(lower_entry_id entry, ids), reverse Entry entries))))))))))))))))) end;
+            (managed_raw_entries (reverse Entry entries) ids))))))))))))))))) end;
 
 -- Runtime Unit is the ordinary effectful program entry. It exits with zero
 -- after the action and heap cleanup; the existing U32 entries retain their code.
@@ -199,7 +232,7 @@ def managed_process_entry (compiler : ManagedCompiler) : MirFunction :=
 def managed_finish_program (compiler : ManagedCompiler) (contracts : List LowerContract)
     (raw : List MirFunction) (libraries : List MirLibrary) (state : ManagedState)
     : Either NativeLowerError ManagedProgramParts :=
-    match state with | ManagedStateOf _ functions constants _ _ _ =>
+    match state with | ManagedStateOf _ functions constants _ _ _ _ =>
       let data : List MirData := map Nat MirData (fun (kind : Nat) =>
         MirDataDef(managed_descriptor compiler kind, False, mir_managed_descriptor_bytes kind))
           ([1,2,3,4,5,6,7,8,9,10,11,12,13,14,15] : List Nat) in
@@ -230,7 +263,8 @@ def managed_finish_plan_with
       lower_bind (List MirLibrary) ManagedProgramParts (lower_libraries contracts) (fun (libraries : List MirLibrary) =>
         lower_bind ManagedState ManagedProgramParts
           (managed_entry_adapter compiler fuel entry typ
-            (ManagedStateOf(fresh, [] : List MirFunction, [] : List MirData, [] : List Nat, [] : List Nat, lower_empty_state 0)))
+            (ManagedStateOf(fresh, [] : List MirFunction, [] : List MirData, [] : List Nat, [] : List Nat,
+              lower_empty_state 0, NativeOriginsDisabled)))
           (fun (initial : ManagedState) => lower_bind ManagedState ManagedProgramParts
             (managed_global_functions_with run_global compiler fuel fuel initial)
             (managed_finish_program compiler contracts raw libraries))) end;
@@ -240,25 +274,55 @@ def managed_finish_plan (fuel : Nat) (plan : ManagedSourcePlan) (raw : List MirF
     managed_finish_plan_with
       (fun (work : Unit -> Either NativeLowerError ManagedState) => work MkUnit) fuel plan raw;
 
+-- Raw functions retain the checked contract ID used by lower_function_indexed.
+def managed_finish_origins (compiler : ManagedCompiler) (raw : List MirFunction) (state : ManagedState)
+    : List NativeFunctionOrigin :=
+    Cons NativeFunctionOrigin
+      (NativeFunctionOriginOf (managed_descriptor compiler 16) NativeFunctionUnknown)
+      (append NativeFunctionOrigin (native_origins_rows (managed_origins state))
+        (map MirFunction NativeFunctionOrigin (fun (function : MirFunction) =>
+          NativeFunctionOriginOf (mir_function_id function)
+            (NativeFunctionSource (mir_function_id function) False)) raw));
+
+def managed_finish_plan_with_origins
+    (run_global : (Unit -> Either NativeLowerError ManagedState) -> Either NativeLowerError ManagedState)
+    (fuel : Nat) (plan : ManagedSourcePlan) (raw : List MirFunction)
+    : Either NativeLowerError (Pair ManagedProgramParts (List NativeFunctionOrigin)) :=
+    match plan with | ManagedSourcePlanOf compiler contracts typ entry fresh =>
+      lower_bind (List MirLibrary) (Pair ManagedProgramParts (List NativeFunctionOrigin))
+        (lower_libraries contracts) (fun (libraries : List MirLibrary) =>
+        lower_bind ManagedState (Pair ManagedProgramParts (List NativeFunctionOrigin))
+          (managed_entry_adapter compiler fuel entry typ
+            (ManagedStateOf(fresh, [] : List MirFunction, [] : List MirData, [] : List Nat, [] : List Nat,
+              lower_empty_state 0, NativeOriginsEnabled (Nothing Nat) ([] : List NativeFunctionOrigin))))
+          (fun (initial : ManagedState) => lower_bind ManagedState (Pair ManagedProgramParts (List NativeFunctionOrigin))
+            (managed_global_functions_with run_global compiler fuel fuel initial)
+            (fun (finished : ManagedState) => lower_map ManagedProgramParts (Pair ManagedProgramParts (List NativeFunctionOrigin))
+              (fun (parts : ManagedProgramParts) => MkPair ManagedProgramParts (List NativeFunctionOrigin) parts
+                (managed_finish_origins compiler raw finished))
+              (managed_finish_program compiler contracts raw libraries finished)))) end;
+
 def managed_prepare_rechecked (fuel : Nat) (entry : Nat) (program : CheckedProgram)
     (types : List Nat) : Either NativeLowerError ManagedSourcePlan :=
     let maximum : Nat := foldr Entry Nat (fun (item : Entry) (other : Nat) => maxNat(lower_entry_max item, other))
       0 (checked_program_entries program) in
     let fresh : Nat := add(mul 2 maximum, 64) in
     lower_bind Unit ManagedSourcePlan (lower_require(ltb_nat fresh pe_max_rva, LowerResourceExhausted))
-      (fun (_ : Unit) => lower_bind Nat ManagedSourcePlan
-        (managed_source_symbol(program, [109,97,110,97,103,101,100,95,97,108,108,111,99,97,116,101,95,114,97,119] : List Nat))
+      (fun (_ : Unit) =>
+        let environment : CheckEnvironment := check_environment_from_entries (checked_program_entries program) in
+        lower_bind Nat ManagedSourcePlan
+        (managed_source_symbol_using(program, environment, [109,97,110,97,103,101,100,95,97,108,108,111,99,97,116,101,95,114,97,119] : List Nat))
         (fun (allocator : Nat) => lower_bind Nat ManagedSourcePlan
-          (managed_source_symbol(program, [109,97,110,97,103,101,100,95,99,111,108,108,101,99,116] : List Nat))
+          (managed_source_symbol_using(program, environment, [109,97,110,97,103,101,100,95,99,111,108,108,101,99,116] : List Nat))
           (fun (collector : Nat) => lower_bind Nat ManagedSourcePlan
-          (managed_source_symbol(program, [109,97,110,97,103,101,100,95,114,101,108,101,97,115,101,95,97,108,108] : List Nat))
+          (managed_source_symbol_using(program, environment, [109,97,110,97,103,101,100,95,114,101,108,101,97,115,101,95,97,108,108] : List Nat))
           (fun (release : Nat) => lower_bind Nat ManagedSourcePlan
-            (managed_source_symbol(program, [109,97,110,97,103,101,100,95,105,110,115,112,101,99,116,95,114,111,111,116,115] : List Nat))
+            (managed_source_symbol_using(program, environment, [109,97,110,97,103,101,100,95,105,110,115,112,101,99,116,95,114,111,111,116,115] : List Nat))
             (fun (inspect : Nat) => lower_bind Nat ManagedSourcePlan
-              (managed_source_symbol(program, [119,105,110,100,111,119,115,95,101,120,105,116,95,112,114,111,99,101,115,115] : List Nat))
+              (managed_source_symbol_using(program, environment, [119,105,110,100,111,119,115,95,101,120,105,116,95,112,114,111,99,101,115,115] : List Nat))
               (fun (exit : Nat) => managed_prepare_entry
                 (ManagedCompilerOf program types allocator collector release inspect exit (S maximum) ([] : List LowerContract)
-                  (check_environment_from_entries (checked_program_entries program)))
+                  environment)
                   fuel entry fresh))))));
 
 def managed_build_rechecked (fuel : Nat) (entry : Nat) (program : CheckedProgram)
@@ -275,15 +339,21 @@ def managed_lower_rechecked (fuel : Nat) (limits : MirLimits) (entry : Nat) (pro
     lower_bind ManagedProgramParts NativeLoweredProgram (managed_build_rechecked fuel entry program types)
       (managed_validate_parts limits);
 
+def native_managed_lower_rechecked (limits : MirLimits) (entry : Nat) (rechecked : NativeRecheckedProgram)
+    : Either NativeSourceError NativeLoweredProgram :=
+    let fuel : Nat := native_rechecked_fuel rechecked in
+    let checked : CheckedProgram := native_rechecked_program rechecked in
+    match checked_program_type_globals_indexed source_normalize_indexed fuel checked with
+    | CErr err => Left NativeSourceError NativeLoweredProgram (NativeSourceCheckError err)
+    | COk types => match managed_lower_rechecked fuel limits entry checked types with
+      | Left err => Left NativeSourceError NativeLoweredProgram (NativeSourceLowerError err)
+      | Right lowered => Right NativeSourceError NativeLoweredProgram lowered end end;
+
 def native_managed_lower_checked (fuel : Nat) (limits : MirLimits) (entry : Nat) (input : CheckedProgram)
     : Either NativeSourceError NativeLoweredProgram :=
-    match lower_recheck_input fuel input with
+    match native_prepare_rechecked_program fuel input with
     | Left err => Left NativeSourceError NativeLoweredProgram (NativeSourceLowerError err)
-    | Right checked => match checked_program_type_globals_indexed source_normalize_indexed fuel checked with
-      | CErr err => Left NativeSourceError NativeLoweredProgram (NativeSourceCheckError err)
-      | COk types => match managed_lower_rechecked fuel limits entry checked types with
-        | Left err => Left NativeSourceError NativeLoweredProgram (NativeSourceLowerError err)
-        | Right lowered => Right NativeSourceError NativeLoweredProgram lowered end end end;
+    | Right rechecked => native_managed_lower_rechecked limits entry rechecked end;
 
 def native_managed_lower_units (fuel : Nat) (limits : MirLimits) (entry_name : List Nat) (root : List Nat)
     (files : List (Pair (List Nat) (List Nat))) : Either NativeSourceError NativeLoweredProgram :=

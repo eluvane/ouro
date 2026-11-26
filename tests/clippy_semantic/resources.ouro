@@ -30,20 +30,20 @@ def cr_many (count : Nat) (budget : Nat) : Bool :=
 -- import-resolution fix into one expression and exceed Clang bracket-depth.
 def cr_import_fuel : Nat :=
     (fix go (n : Nat) : Nat := match n with | Z => add 2048 2048 | S k => go k end) 0;
-def cr_graph_ok (units : List SrcUnit) (expected : Nat) : Bool :=
+def cr_graph_ok (units : List SrcUnit) (expected : Nat) (paths : List Nat) : Bool :=
     match resolve_imports_fuel cr_import_fuel units 1 with
     | RErr _ _ => False
-    | ROk original => match resolve_imports_fuel cr_import_fuel (cm_graph_units units) 1 with
+    | ROk original => match resolve_import_paths_fuel cr_import_fuel units 1 with
       | RErr _ _ => False
-      | ROk projected => andb(eq_nat(length Decl original, expected), nullb Decl projected) end
+      | ROk reached => andb(eq_nat(length Decl original, expected), list_eq Nat eq_nat reached paths) end
     end;
-def cr_graph_error (units : List SrcUnit) (code : Nat) : Bool :=
-    match resolve_imports_fuel cr_import_fuel units 1 with
+def cr_graph_error (fuel : Nat) (units : List SrcUnit) (code : Nat) (path : Nat) : Bool :=
+    match resolve_imports_fuel fuel units 1 with
     | ROk _ => False
-    | RErr original detail => match resolve_imports_fuel cr_import_fuel (cm_graph_units units) 1 with
+    | RErr original detail => match resolve_import_paths_fuel fuel units 1 with
       | ROk _ => False
-      | RErr projected projected_detail => andb (eq_nat original code)
-          (andb(eq_nat projected code, eq_nat detail projected_detail)) end
+      | RErr projected projected_detail => andb (andb(eq_nat original code, eq_nat detail path))
+          (andb(eq_nat projected code, eq_nat projected_detail path)) end
     end;
 def cr_skip_stub_unit : ClippySemanticUnit :=
     let intern : InternState := MkIntern (Nil (Pair(List Nat, Nat))) 0
@@ -66,6 +66,119 @@ def cr_binding (unit : ClippySemanticUnit) (name : String) (expected : Bool) : B
         [CmContractOf "api.ouro" name 15 True 1 False] with
       | Left _ => False | Right _ => True end in
     match expected with | True => valid | False => notb valid end;
+
+def cr_first_binding_error : Bool :=
+    match cm_validate_contract_bindings (cr_binding_unit 1)
+        [CmContractOf "unloaded.ouro" "ignored" 15 True 1 False,
+         CmContractOf "api.ouro" "first_missing" 15 True 1 False,
+         CmContractOf "api.ouro" "second_missing" 15 True 1 False] with
+    | Left error => prim_string_eq (quality_input_message error)
+        (quality_input_message (QualityInvalidInput
+          "stale or ambiguous semantic API registry identity: api.ouro#first_missing"))
+    | Right _ => False
+    end;
+
+def cr_registry_intern : InternState :=
+    MkIntern
+      [MkPair (List Nat) Nat (prim_string_to_char_codes "io_pure") 10,
+       MkPair (List Nat) Nat (prim_string_to_char_codes "renamed") 11,
+       MkPair (List Nat) Nat (prim_string_to_char_codes "Either") 12,
+       MkPair (List Nat) Nat (prim_string_to_char_codes "IO") 13,
+       MkPair (List Nat) Nat (prim_string_to_char_codes "Alias") 14,
+       MkPair (List Nat) Nat (prim_string_to_char_codes "Missing") 15,
+       MkPair (List Nat) Nat (prim_string_to_char_codes "consume") 16] 17
+      [MkPair (List Nat) Nat (prim_string_to_char_codes "std/runtime.ouro") 1,
+       MkPair (List Nat) Nat (prim_string_to_char_codes "std/nested/runtime.ouro") 2,
+       MkPair (List Nat) Nat (prim_string_to_char_codes "ouro.process.capture_bounded_at") 3,
+       MkPair (List Nat) Nat (prim_string_to_char_codes "std/types.ouro") 4,
+       MkPair (List Nat) Nat (prim_string_to_char_codes "root.ouro") 5] 6;
+
+def cr_contract_equal (first : CmContract) (second : CmContract) : Bool :=
+    let (CmContractOf first_owner first_name first_role first_pure first_cost first_policy) := first in
+    let (CmContractOf second_owner second_name second_role second_pure second_cost second_policy) := second in
+    andb (prim_string_eq first_owner second_owner) (andb (prim_string_eq first_name second_name)
+      (andb (eq_nat first_role second_role) (andb (eq_nat first_cost second_cost)
+        (andb (match first_pure with | True => second_pure | False => notb second_pure end)
+          (match first_policy with | True => second_policy | False => notb second_policy end)))));
+
+def cr_checked_api_unit (first_owner : Nat) : ClippySemanticUnit :=
+    let name : List Nat := prim_string_to_char_codes "fs_create_dir_exclusive_checked" in
+    let intern : InternState := MkIntern [MkPair (List Nat) Nat name 7, MkPair (List Nat) Nat name 8] 9
+      [ MkPair (List Nat) Nat (prim_string_to_char_codes "std/fs_create.ouro") 1
+      , MkPair (List Nat) Nat (prim_string_to_char_codes "other.ouro") 2
+      ] 3 in
+    let first : ScDecl := ScDeclOf 7 first_owner 0 0 (ESort 0) (Nothing Expr) (Nothing Nat) in
+    let second : ScDecl := ScDeclOf 8 1 0 0 (ESort 0) (Nothing Expr) (Nothing Nat) in
+    let index : ScIndex := ScNode first ScEmpty (ScNode second ScEmpty ScEmpty) in
+    CmUnit intern 1 "" [mk_src_unit 1 [] []] [first, second] index [] 1 [] cm_empty_resolved_imports;
+
+def cr_checked_api_selection : Bool :=
+    match cm_build_checked_apis (cr_checked_api_unit 1) with
+    | Left _ => False
+    | Right apis => match cm_api_lookup 7 apis, cm_api_lookup 8 apis with
+      | Just first, Just second =>
+          andb (cr_contract_equal (cm_api_contract first)
+            (CmContractOf "std/fs_create.ouro" "fs_create_dir_exclusive_checked" 24 False 0 False))
+            (cr_contract_equal (cm_api_contract second)
+              (CmContractOf "std/fs_create.ouro" "fs_create_dir_exclusive_checked" 0 False 0 False))
+      | Nothing, Nothing => False
+      | Nothing, Just _ => False
+      | Just _, Nothing => False
+      end
+    end;
+
+def cr_checked_api_owner_error : Bool :=
+    match cm_build_checked_apis (cr_checked_api_unit 2) with
+    | Left error => prim_string_eq (quality_input_message error)
+        (quality_input_message (QualityInvalidInput
+          "stale or ambiguous semantic API registry identity: std/fs_create.ouro#fs_create_dir_exclusive_checked"))
+    | Right _ => False
+    end;
+
+def cr_indexed_contract (name : Nat) (owner : Nat) (intrinsic : Maybe Nat)
+    (expected : CmContract) : Bool :=
+    let decl : ScDecl := ScDeclOf name owner 0 0 (ESort 0) (Nothing Expr) intrinsic in
+    let index : ScIndex := ScNode decl ScEmpty ScEmpty in
+    let unit : ClippySemanticUnit := CmUnit cr_registry_intern 5 "" [] [decl]
+      index [] 1 [] cm_empty_resolved_imports in
+    match cm_build_apis unit index with
+    | Left _ => False
+    | Right apis => match cm_api_lookup name apis with
+      | Nothing => False
+      | Just api => andb (cr_contract_equal (cm_api_contract api) expected)
+          (cr_contract_equal (cm_api_contract api) (cm_contract_for unit decl))
+      end
+    end;
+
+def cr_indexed_type (term : Expr) (fuel : Nat) (locals : List Nat)
+    (expected : Either String Nat) (api_expected : Nat) : Bool :=
+    let either_decl : ScDecl := ScDeclOf 12 4 1 0 (ESort 0) (Nothing Expr) (Nothing Nat) in
+    let io_decl : ScDecl := ScDeclOf 13 1 1 0 (ESort 0) (Nothing Expr) (Nothing Nat) in
+    let alias_decl : ScDecl := ScDeclOf 14 4 0 0 (ESort 0) (Just Expr (EVar 12)) (Nothing Nat) in
+    let decl : ScDecl := ScDeclOf 16 5 0 0 term (Nothing Expr) (Nothing Nat) in
+    let decls : List ScDecl := [either_decl, io_decl, alias_decl, decl] in
+    match sc_index_sorted decls with
+    | Left _ => False
+    | Right index =>
+      let unit : ClippySemanticUnit := CmUnit cr_registry_intern 5 ""
+        [mk_src_unit 4 [] [14]] decls index [] 1 [] cm_empty_resolved_imports in
+      let classification : Bool := match cm_type_class unit fuel locals term with
+        | Right value => match expected with | Left _ => False | Right result => eq_nat value result end
+        | Left error => match expected with
+          | Right _ => False
+          | Left message => prim_string_eq (quality_input_message error)
+              (quality_input_message (QualityInvalidInput message))
+          end
+        end in
+      match cm_build_apis unit index with
+      | Left _ => False
+      | Right apis => match cm_api_lookup 16 apis with
+        | Nothing => False
+        | Just api => andb classification (eq_nat (cm_api_result api) api_expected)
+        end
+      end
+    end;
+
 def cr_import_priority : Bool :=
     let root : ScDecl := cr_local 100 in
     let imported : ScDecl := ScDeclOf 101 2 0 0 (EPi(10, ESort 0, ESort 0))
@@ -84,6 +197,37 @@ def cr_import_priority : Bool :=
              | Nothing => False | Just api => notb (cs_complete (cm_api_summary api)) end))
     end;
 
+def cr_load_duplicate_imports (fuel : Nat) (budget : Nat)
+    : IO (Either QualityInputError (Pair ClippySemanticUnit (Pair InternState CmParseCache))) :=
+    let intern : InternState := MkIntern [] Z
+      [ MkPair (List Nat) Nat (prim_string_to_char_codes "std/json.ouro") 2
+      , MkPair (List Nat) Nat (prim_string_to_char_codes "root.ouro") 1 ] 3 in
+    cm_load_pending "" 1 fuel budget [2, 2] [1] (lexer_intern_from intern)
+      [mk_src_unit 1 [DImport 2] []] [] "" [] cm_cache0 [] [] empty_imp_reg;
+
+def cr_load_error (result : Either QualityInputError (Pair ClippySemanticUnit (Pair InternState CmParseCache)))
+    (expected : String) : Bool :=
+    match result with
+    | Left error => prim_string_eq (quality_input_message error)
+        (quality_input_message (QualityInvalidInput expected))
+    | Right _ => False
+    end;
+
+def cr_duplicate_import_budget : IO Bool :=
+    do let! completed := cr_load_duplicate_imports 2 1;
+       let! queue_exhausted := cr_load_duplicate_imports 1 1;
+       let! inventory_exhausted := cr_load_duplicate_imports 2 0;
+       let unique_files : Bool := match completed with
+         | Left _ => False
+         | Right loaded => let (MkPair unit _) := loaded in
+           match unit with | CmUnit _ _ _ units _ _ _ count _ _ =>
+             andb (eq_nat count 2) (eq_nat (length SrcUnit units) 2)
+           end
+         end in
+       io_pure (Bool, andb unique_files
+         (andb (cr_load_error queue_exhausted "semantic source queue traversal exhausted")
+           (cr_load_error inventory_exhausted "semantic source inventory exhausted")));
+
 def cr_laws : List (Pair String Bool) :=
     [ MkPair String Bool "root-summaries-precede-imported-origins-with-one-shared-budget" cr_import_priority
     , MkPair String Bool "256-definitions-one-summary-each" (cr_many 256 256)
@@ -92,18 +236,50 @@ def cr_laws : List (Pair String Bool) :=
     , MkPair String Bool "empty-unit-builds-no-summaries" (cr_many 0 16)
     , MkPair String Bool "graph-projection-retains-closure" (cr_graph_ok
         [mk_src_unit 1 [DImport 2, DDef(3, ESort 0, ESort 0, 0, [])] [],
-         mk_src_unit 2 [DDef(4, ESort 0, ESort 0, 0, [])] []] 2)
+         mk_src_unit 2 [DDef(4, ESort 0, ESort 0, 0, [])] []] 2 [2, 1])
     , MkPair String Bool "large-declaration-list-not-flattened" (cr_graph_ok
         [mk_src_unit 1 (Cons(Decl, DImport 2, replicate Decl (DDef(3, ESort 0, ESort 0, 0, [])) 256)) ([] : List Nat),
-         mk_src_unit 2 (replicate Decl (DDef(4, ESort 0, ESort 0, 0, [])) 256) ([] : List Nat)] 512)
-    , MkPair String Bool "graph-cycle-error-preserved" (cr_graph_error
-        [mk_src_unit 1 [DImport 2] [], mk_src_unit 2 [DImport 1] []] errCycle)
-    , MkPair String Bool "graph-missing-unit-error-preserved" (cr_graph_error [mk_src_unit 1 [DImport 2] []] errMissing)
+         mk_src_unit 2 (replicate Decl (DDef(4, ESort 0, ESort 0, 0, [])) 256) ([] : List Nat)] 512 [2, 1])
+    , MkPair String Bool "graph-cycle-error-preserved" (cr_graph_error cr_import_fuel
+        [mk_src_unit 1 [DImport 2] [], mk_src_unit 2 [DImport 1] []] errCycle 1)
+    , MkPair String Bool "graph-missing-unit-error-preserved" (cr_graph_error cr_import_fuel
+        [mk_src_unit 1 [DImport 2] []] errMissing 2)
+    , MkPair String Bool "graph-fuel-error-preserved" (cr_graph_error 2
+        [mk_src_unit 1 [DImport 2] [], mk_src_unit 2 [] []] errFuel 2)
     , MkPair String Bool "registered-declaration-owner-resolves" (cr_binding (cr_binding_unit 1) "parse" True)
     , MkPair String Bool "stale-registered-name-fails-closed" (cr_binding (cr_binding_unit 1) "missing" False)
     , MkPair String Bool "wrong-declaration-owner-fails-closed" (cr_binding (cr_binding_unit 2) "parse" False)
     , MkPair String Bool "skipped-process-stub-is-not-stale" cr_process_stub_binding
+    , MkPair String Bool "registry-reports-first-loaded-stale-binding" cr_first_binding_error
+    , MkPair String Bool "checked-api-bindings-retain-first-spelling-and-contract" cr_checked_api_selection
+    , MkPair String Bool "checked-api-build-rejects-stale-first-spelling" cr_checked_api_owner_error
+    , MkPair String Bool "intrinsic-precedes-the-named-contract"
+        (cr_indexed_contract 10 1 (Just Nat 3)
+          (CmContractOf "" "ouro.process.capture_bounded_at" 3 False 0 False))
+    , MkPair String Bool "named-contract-survives-missing-intrinsic"
+        (cr_indexed_contract 10 1 (Nothing Nat) (CmContractOf "std/runtime.ouro" "io_pure" 9 True 0 False))
+    , MkPair String Bool "lookalike-owner-keeps-exact-default-contract"
+        (cr_indexed_contract 10 2 (Just Nat 3)
+          (CmContractOf "std/nested/runtime.ouro" "io_pure" 0 False 0 False))
+    , MkPair String Bool "unknown-intrinsic-keeps-exact-default-contract"
+        (cr_indexed_contract 11 1 (Just Nat 5) (CmContractOf "std/runtime.ouro" "renamed" 0 False 0 False))
+    , MkPair String Bool "applied-non-io-head-keeps-fuel-boundary"
+        (cr_indexed_type (EApp (EVar 12) (ESort 0)) 1 []
+          (Left String Nat "semantic type-alias traversal exhausted") 1)
+    , MkPair String Bool "applied-io-keeps-private-type-alias"
+        (cr_indexed_type (EApp (EVar 13) (EVar 14)) 3 [] (Right String Nat 11) 11)
+    , MkPair String Bool "local-type-parameter-takes-precedence"
+        (cr_indexed_type (EApp (EVar 12) (ESort 0)) 1 [12] (Right String Nat 0) 1)
+    , MkPair String Bool "unresolved-applied-type-keeps-error-and-harvest-fallback"
+        (cr_indexed_type (EApp (EVar 15) (ESort 0)) 2 []
+          (Left String Nat "unresolved applied result type: Missing") 0)
+    , MkPair String Bool "malformed-io-type-keeps-error-and-harvest-fallback"
+        (cr_indexed_type (EApp (EApp (EVar 13) (EVar 12)) (ESort 0)) 3 []
+          (Left String Nat "malformed IO result type") 0)
     ];
 def main : IO Unit :=
-    do let! ok := io_fold (Pair String Bool) Bool quality_test_print True cr_laws;
+    do let! duplicate_imports := cr_duplicate_import_budget;
+       let! ok := io_fold (Pair String Bool) Bool quality_test_print True
+         (append (Pair String Bool) cr_laws
+           [MkPair String Bool "duplicate imports use queue fuel and count one loaded file" duplicate_imports]);
        exit (match ok with | True => 0 | False => 1 end)

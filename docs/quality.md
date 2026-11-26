@@ -1,32 +1,25 @@
 # Quality tools
 
-Ouro has two complementary quality layers:
-
-1. `ouro1 lint` — the only user-facing Ouro source linter. Language,
-   proven style, and compiler-proved semantic families are internal to
-   that driver;
-2. repository analyzer and policy gates (`analyze`, the Python strict
-   registry/debt firewall, and `--structural`). Those are not a second
-   source linter.
-
-These tools improve source quality and repository architecture. They do not
-participate in kernel acceptance.
+Use `ouro1 lint` for language, proven style, and semantic diagnostics in
+Ouro source. Use `ouro1 analyze` for repository and structured analysis.
+The strict and structural gates enforce repository policy. The compiler
+determines which programs pass typechecking.
 
 ## Commands
 
-Use `ouro1 lint` for Ouro source, `ouro1 analyze` for repository and
-structured analysis, and the strict firewall for repository policy:
+Run source lint and the release policy gate from the repository root.
 
 ```sh
 sh scripts/ouro1.sh lint --deny --profile project std compiler tools samples
 python3 scripts/strict_quality_firewall.py --profile release
 ```
 
-[Tooling](tooling.md#analyzer-and-linter) owns analyzer/lint CLI flags and behavior;
-[Analyzer internals](../tools/analyze/README.md) own the family inventory;
-[Clippy-grade rules](clippy_grade_firewall.md) own semantic rule evidence.
-[CI](ci.md#local-profiles) owns focused suites, profiles, and gate commands.
-Formatter and fixer usage is in [Tooling](tooling.md#formatter).
+See the [analyzer and lint command reference](tooling.md#analyzer-and-linter),
+[analyzer family inventory](../tools/analyze/README.md), and
+[semantic rule evidence](clippy_grade_firewall.md). Use the
+[CI validation matrix](ci.md#validation-matrix) to select a focused suite.
+Use the [formatter](tooling.md#formatter) for layout and the
+[autofixer](tooling.md#autofixer) for supported source rewrites.
 
 ## Native input boundary and host adapter retirement
 
@@ -73,9 +66,11 @@ would change literal contents, including a raw CR or affected multiline string,
 is refused with a nonzero status before output or writing. Refusal is not a claim
 that the source itself is invalid. Comments and layout are not language tokens.
 
-The production fixer uses `fx_prepare` in `tools/fix/pipeline.ouro`. It requires
-a complete imported constructor inventory, a converged rewrite plan, checked
-formatting, and no reopened rewrite after formatting. Missing imports and
+The production fixer uses `fx_converge` and `fx_format_converged` in
+`tools/fix/pipeline.ouro`. It requires a complete imported constructor inventory,
+a converged rewrite plan, checked formatting, and no reopened rewrite after
+formatting. The compiler worker checks each saved transition in application order
+and checks the final candidate separately. Missing imports and
 exhausted import or rewrite budgets are errors, not partial success. A
 formatting-only change is reported as such. Existing `FxEdit` rule intents drive
 both rewriting and convergence checks; ambiguous diagnostics such as a zero
@@ -95,7 +90,9 @@ The exact metadata and concurrency limits are in the
 retains its separate contract.
 
 `fix --write` and `fmt --write` run `ouro-fix-check` before replacement. The
-worker accepts candidate bytes on stdin or `SOURCE file PATH`. POSIX C-host
+worker accepts candidate bytes on stdin or `SOURCE file PATH`. It reads each
+normalized imported path once and checks file kinds in dependency order before
+passing the captured bytes to the compiler. POSIX C-host
 bounded capture returns OS status 120; the frontend then uses file mode and
 `process_run_spec_checked` without changing the C runtime. The POSIX file-mode
 path does not apply the bounded 120s/memory caps; a hanging worker is still
@@ -114,9 +111,10 @@ paths and an empty child PATH. Missing cases or a changed image fail the gate.
 The native roots under `tests/analyze/precision/` cover bad, good, and
 false-positive cases with exact issue identities, witnesses or line numbers,
 expected bytes, and repeated-run checks. The precision gate typechecks, builds,
-and executes all nine roots, retaining `precision_build_*` and
+and executes its registered roots. It retains `precision_build_*` and
 `precision_run_*` logs under `_build/analyze_precision/`. Empty case sets and
-missing binaries or reports fail. Formatter and fixer selftests also exercise
+missing binaries or reports fail. See the [precision suite](../scripts/analyze_precision_suite.sh)
+for the current inventory. Formatter and fixer selftests also exercise
 actual refused writes and verify that the original file bytes survive. Existing
 frontend/pipeline goldens and production sweeps remain separate requirements;
 a core assertion is not a substitute for those gates or kernel checking.
@@ -292,22 +290,29 @@ Constructor sections and recursion-sensitive eta forms keep their existing
 exemptions. A Bool identity uses its specific rule rather than a second generic
 reconstruction diagnostic.
 
-The existing fixer owns the safe mechanical subset. In particular, an unused
-parameter can become `_unused`; the style profile does not make every
-`OURO-SIMP*` hint an automatic rewrite. Public signatures, dependent types,
-effects, and name collisions must not be changed by a guessed fix. Review the
-remaining suggestions after running the normal tools:
+The fixer applies certified syntax repairs. Use `fix --check` to list pending
+edits and proposals that require review. It exits 1 while either remains.
+[Autofixer applicability](tooling.md#autofixer)
 
 ```sh
-sh scripts/ouro1.sh fix --write path/to/file.ouro
+sh scripts/ouro1.sh fix --check path/to/file.ouro
+```
+
+Check the binder's scope and public signature before manually renaming an
+unused parameter to `_unused`. Format the file and rerun the style analyzer
+after applying the rename.
+
+```sh
 sh scripts/ouro1.sh fmt --write path/to/file.ouro
 sh scripts/ouro1.sh analyze --enable-style --scope path/to/file.ouro
 ```
 
-`tests/analyze/precision/style.ouro` adds exact-list binder, scope, evaluation,
-and eta regressions. The precision launcher also checks profile/explicit-family
-parity, duplicate flags, bad/good fixtures, and the native unused-binder
-`fix -> fmt -> analyze` round trip with read-only convergence checks. Separate
+`tests/analyze/precision/style.ouro` covers binder scope, evaluation, and eta
+regressions with exact diagnostic lists. The precision launcher also checks
+profile and explicit-family parity, duplicate flags, and good and bad fixtures.
+Its unused-binder case checks that `fix --write` preserves the source and
+reports a review suggestion. After applying the discard manually, the case
+checks formatting, analyzer results, and read-only convergence. Separate
 stand-in-process tests exercise the actual shell launcher's argument and verdict
 handling; they are not substitutes for native analyzer execution. Structured
 runs cannot claim success on a diagnostic, rejected unit, missing report, or
@@ -373,8 +378,9 @@ and migration path are demonstrated.
 [Native repository gates](native_repo_gates.md) own the Ouro policy and
 migration inventory; [CI](ci.md#ouro-native-control-plane-displacement)
 owns profile composition, parity evidence, and host-bound reports.
-`pr-native` covers the supported docs/project/workflow subset and does not
-replace the full Python PR profile.
+The `ouro_ci_gate.sh --profile pr-native` profile runs the documentation,
+project-surface, workflow, and `compiler-boundary` gates. Use the Python PR
+profile for full PR validation.
 
 ## Suppressions
 
@@ -466,7 +472,7 @@ The strict project surface generally prefers:
 - `do let!` over retired bind notation;
 - local opens and explicit aliases over namespace leakage;
 - small helpers and modules over large mixed-responsibility files;
-- structured diagnostics over-ad-hoc panic text;
+- structured diagnostics over ad hoc panic text;
 - documented public APIs over accidental exports;
 - explicit discards over unused names;
 - checked filesystem/process/config/CLI/CSV APIs over raw primitives in

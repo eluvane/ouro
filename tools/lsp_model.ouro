@@ -1,7 +1,7 @@
 -- Pure LSP model; hover uses the same doc scanner as ouro doc so editor and generated reference agree.
 -- Formatting is delegated to the CLI to avoid namespace collisions and keep editor output identical.
 
-import "doc_model.ouro",
+import "doc/model.ouro",
   "lsp_text_encoding.ouro",
   "../std/json_types.ouro",
   "../std/jsonrpc.ouro",
@@ -9,40 +9,55 @@ import "doc_model.ouro",
   "fix/lex.ouro",
   "../compiler/source_text.ouro";
 
+inductive Sym : Type :=
+  | MkSym : String -> Decl -> Sym;
+
+-- Import spellings are resolved against the current filesystem on every request.
+inductive LspModuleIndex : Type :=
+  | MkLspModuleIndex : String -> String -> List Sym -> List String -> LspModuleIndex;
+
+inductive LspIndexMode : Type :=
+  | LspIndexUncached : LspIndexMode
+  | LspIndexReuse : LspIndexMode
+  | LspIndexRemember : LspIndexMode
+  | LspIndexDocument : String -> LspIndexMode;
+
 -- Documents the client has open, their aggregate byte size, the canonical
--- workspace root authorized by the launcher, and whether shutdown was
--- requested.  The root is never taken from an untrusted document URI.
+-- workspace root, the shutdown flag, and the navigation cache.
+-- The root is never taken from an untrusted document URI.
 inductive Lsp : Type :=
-  | MkLsp : Map String -> Nat -> String -> Bool -> Lsp;
+  | MkLsp : Map String -> Nat -> String -> Bool -> List LspModuleIndex -> Lsp;
 
 def lsp_docs (s : Lsp) : Map String :=
-    match s with
-    | MkLsp d _ _ _ => d
-    end;
+    let (MkLsp d _ _ _ _) := s in
+    d;
 
 def lsp_docs_bytes (s : Lsp) : Nat :=
-    match s with
-    | MkLsp _ n _ _ => n
-    end;
+    let (MkLsp _ n _ _ _) := s in
+    n;
 
 def lsp_root (s : Lsp) : String :=
-    match s with
-    | MkLsp _ _ root _ => root
-    end;
+    let (MkLsp _ _ root _ _) := s in
+    root;
 
 def lsp_down (s : Lsp) : Bool :=
-    match s with
-    | MkLsp _ _ _ b => b
-    end;
+    let (MkLsp _ _ _ b _) := s in
+    b;
 
-def lsp_empty : Lsp := MkLsp (map_empty String) Z "" False;
+def lsp_navigation_cache (s : Lsp) : List LspModuleIndex :=
+    let (MkLsp _ _ _ _ cache) := s in
+    cache;
+
+def lsp_with_navigation_cache (s : Lsp) (cache : List LspModuleIndex) : Lsp :=
+    MkLsp(lsp_docs s, lsp_docs_bytes s, lsp_root s, lsp_down s, cache);
+
+def lsp_empty : Lsp := MkLsp (map_empty String) Z "" False [];
 
 def lsp_with_root (s : Lsp) (root : String) : Lsp :=
-    MkLsp(lsp_docs s, lsp_docs_bytes s, root, lsp_down s);
+    MkLsp(lsp_docs s, lsp_docs_bytes s, root, lsp_down s, []);
 
--- Frames have their own larger cap in lsp.ouro.  Keeping an individual
--- source buffer below 512 KiB and all open buffers below 2 MiB prevents a
--- normal full-sync client from retaining attacker-selected memory forever.
+-- The frame cap includes protocol overhead. Cap retained text at 512 KiB
+-- per document and 2 MiB across all open documents.
 def lsp_kib : Nat := mul 32 32;
 
 def lsp_max_document_bytes : Nat := mul(mul 64 8, lsp_kib);
@@ -53,22 +68,21 @@ def lsp_put_checked (s : Lsp) (uri : String) (text : String) : Maybe Lsp :=
     let old : String := map_get_or String "" uri (lsp_docs s) in
     let total : Nat :=
       add(sub(lsp_docs_bytes s, str_len old), str_len text) in
-    match andb (leb_nat(str_len text, lsp_max_document_bytes))
-      (leb_nat total lsp_max_open_bytes) with
-    | False => Nothing Lsp
-    | True =>
-        Just Lsp
-          (MkLsp (map_insert String uri text (lsp_docs s)) total
-            (lsp_root s) (lsp_down s))
-    end;
+    if
+      andb (leb_nat(str_len text, lsp_max_document_bytes))
+      (leb_nat total lsp_max_open_bytes) then
+      Just Lsp
+        (MkLsp (map_insert String uri text (lsp_docs s)) total
+          (lsp_root s) (lsp_down s) (lsp_navigation_cache s))
+    else Nothing Lsp;
 
 def lsp_drop (s : Lsp) (uri : String) : Lsp :=
     let old : String := map_get_or String "" uri (lsp_docs s) in
     MkLsp (map_delete String uri (lsp_docs s))
-      (sub(lsp_docs_bytes s, str_len old)) (lsp_root s) (lsp_down s);
+      (sub(lsp_docs_bytes s, str_len old)) (lsp_root s) (lsp_down s) [];
 
 def lsp_shutdown (s : Lsp) : Lsp :=
-    MkLsp(lsp_docs s, lsp_docs_bytes s, lsp_root s, True);
+    MkLsp(lsp_docs s, lsp_docs_bytes s, lsp_root s, True, []);
 
 def lsp_text (s : Lsp) (uri : String) : String :=
     map_get_or String "" uri (lsp_docs s);
@@ -95,83 +109,68 @@ def lsp_pos_char (params : Json) : Nat :=
 def lsp_doc_uri (params : Json) : String :=
     json_field_str (json_field params "textDocument") "uri" "";
 
--- The identifier under the cursor: walk left to the start of the word, then
--- right to its end. Out-of-range positions give the empty string.
-def word_start : Nat -> List Nat -> Nat -> Nat :=
-  fix word_start (fuel : Nat) (cs : List Nat) (i : Nat) : Nat :=
-    match fuel with
-    | Z => i
-    | S fuel2 =>
-        match i with
-        | Z => Z
-        | S i2 =>
-            match is_ident_cont (nth Nat ch_space i2 cs) with
-            | True => word_start fuel2 cs i2
-            | False => i
-            end
-        end
+-- A cursor just after an identifier still selects that word.
+def word_start (line : String) : Nat -> Nat :=
+  fix go (column : Nat) : Nat :=
+    match column with
+    | Z => Z
+    | S previous =>
+        if is_ident_cont (prim_string_byte_at line previous) then go previous else column
     end;
 
-def word_end : Nat -> List Nat -> Nat -> Nat :=
-  fix word_end (fuel : Nat) (cs : List Nat) (i : Nat) : Nat :=
-    match fuel with
-    | Z => i
-    | S fuel2 =>
-        match ltb_nat(i, length Nat cs) with
-        | False => i
-        | True =>
-            match is_ident_cont (nth Nat ch_space i cs) with
-            | True => word_end fuel2 cs (S i)
-            | False => i
-            end
-        end
+def word_end (line : String) : Nat -> Nat -> Nat :=
+  fix go (remaining : Nat) (column : Nat) : Nat :=
+    match remaining with
+    | Z => column
+    | S rest =>
+        if is_ident_cont (prim_string_byte_at line column) then go rest (S column) else column
     end;
+
+def lsp_word_bounds (line : String) (col : Nat) : Pair Nat Nat :=
+    let n : Nat := str_len line in
+    if leb_nat col n then
+      let first : Nat := word_start line col in
+      MkPair Nat Nat first (word_end line (sub n col) col)
+    else MkPair Nat Nat Z Z;
 
 def word_in_line (line : String) (col : Nat) : String :=
-    let cs : List Nat := str_codes line in
-    let n : Nat := length Nat cs in
-    match ltb_nat(col, S n) with
-    | False => ""
-    | True =>
-        let i : Nat := word_start(S n, cs, minNat col n) in
-        let j : Nat := word_end (S n) cs i in
-        str_slice line i (sub j i)
-    end;
+    let (MkPair first last) := lsp_word_bounds line col in
+    str_slice line first (sub last first);
 
-def word_at (text : String) (line : Nat) (col : Nat) : String :=
-    let source_line : String := nth String "" line (str_lines text) in
+private def lsp_word_at_line (source_line : String) (col : Nat) : String :=
     match lsp_byte_column source_line col with
     | Nothing => ""
     | Just column => word_in_line source_line column
     end;
 
+-- The second segment marks LF so lsp_line_at can recognize CRLF.
+private def lsp_position_lines (text : String) (line : Nat) : List String :=
+    match line with
+    | Z => match str_index text "\n" with
+      | Nothing => str_lines text
+      | Just stop => [str_slice text Z stop, ""]
+      end
+    | S _ => str_lines text
+    end;
+
+def word_at (text : String) (line : Nat) (col : Nat) : String :=
+    lsp_word_at_line (lsp_line_at (lsp_position_lines text line) line) col;
+
 -- Completion uses the prefix up to the cursor, not the whole identifier.
 def prefix_in_line (line : String) (col : Nat) : String :=
-    let cs : List Nat := str_codes line in
-    let n : Nat := length Nat cs in
-    match ltb_nat(col, S n) with
-    | False => ""
-    | True =>
-        let i : Nat := word_start(S n, cs, minNat col n) in
-        str_slice line i (sub(minNat col n, i))
-    end;
+    if leb_nat(col, str_len line) then
+      let first : Nat := word_start line col in
+      str_slice line first (sub col first)
+    else "";
 
-
--- Hover and definition both answer from the declarations of the document and
--- the files it imports, which lsp.ouro collects. A declaration keeps the file
--- it came from so definition can point at another module.
-inductive Sym : Type :=
-  | MkSym : String -> Decl -> Sym;
 
 def sym_path (s : Sym) : String :=
-    match s with
-    | MkSym p _ => p
-    end;
+    let (MkSym p _) := s in
+    p;
 
 def sym_decl (s : Sym) : Decl :=
-    match s with
-    | MkSym _ d => d
-    end;
+    let (MkSym _ d) := s in
+    d;
 
 def syms_of_module (path : String) (text : String) : List Sym :=
     map Decl Sym (fun (d : Decl) => MkSym path d)
@@ -179,6 +178,14 @@ def syms_of_module (path : String) (text : String) : List Sym :=
 
 def sym_find (name : String) (syms : List Sym) : Maybe Sym :=
     find Sym (fun (s : Sym) => str_eq(decl_name (sym_decl s), name)) syms;
+
+-- Prepend each group to the finished suffix so append copies only that group.
+def lsp_symbols_from_groups (newest_first : List (List Sym)) : List Sym :=
+    match newest_first with
+    | Nil => Nil Sym
+    | Cons newest earlier => foldl (List Sym) (List Sym)
+        (fun (suffix : List Sym) (group : List Sym) => append Sym group suffix) newest earlier
+    end;
 
 -- Hover value: the signature in a fenced block, then the doc comment.
 def hover_markup (s : Sym) : String :=
@@ -188,10 +195,8 @@ def hover_markup (s : Sym) : String :=
     let prose : String := str_join(" ", decl_docs d) in
     let origin : String :=
       str_cat3 "_" (str_cat3(sym_path s, ":", prim_string_of_nat (decl_line d))) "_" in
-    match str_null prose with
-    | True => str_cat3 code "\n\n" origin
-    | False => str_cat4 code "\n\n" prose (str_concat "\n\n" origin)
-    end;
+    if str_null prose then str_cat3 code "\n\n" origin
+    else str_cat4 code "\n\n" prose (str_concat "\n\n" origin);
 
 def hover_result (s : Sym) : Json :=
     let contents : List (Pair String Json) :=
@@ -210,10 +215,7 @@ def completion_kind_rows : List (Pair String Nat) :=
   ];
 
 def completion_kind_num (kind : String) : Nat :=
-  match lookup String Nat str_eq kind completion_kind_rows with
-  | Nothing => 3
-  | Just n => n
-  end;
+  lookup String Nat str_eq kind completion_kind_rows ?? 3;
 
 def completion_matches (prefix : String) (s : Sym) : Bool :=
     str_starts(decl_name (sym_decl s), prefix);
@@ -233,57 +235,53 @@ def completion_item (s : Sym) : Json :=
 def completion_expected_family (source_line : String) (line : Nat)
     (col : Nat) (prefix : String) (tokens : List FxTok)
     : Maybe String :=
-    match ltb_nat(col, S (str_len source_line)) with
-    | False => Nothing String
-    | True =>
-        let start_col : Nat := sub(col, str_len prefix) in
-        let before : List FxTok :=
-          filter FxTok
-            (fun (token : FxTok) =>
-              andb(eq_nat(fx_tok_line token, line),
-                ltb_nat(fx_tok_col token, start_col)))
-            tokens in
-        match before with
-        | Nil => Nothing String
-        | Cons keyword after_keyword =>
-            match after_keyword with
-            | Nil => Nothing String
-            | Cons name after_name =>
-                match after_name with
-                | Nil => Nothing String
-                | Cons colon after_colon =>
-                    match after_colon with
-                    | Nil => Nothing String
-                    | Cons family after_family =>
-                        match after_family with
-                        | Nil => Nothing String
-                        | Cons assign after_assign =>
-                            match after_assign with
-                            | Nil =>
-                                let assign_end : Nat :=
-                                  add(fx_tok_col assign, str_len(fx_tok_text assign)) in
-                                let header_ok : Bool := andb(fx_is_word keyword "def",
-                                  andb(fx_tok_bol keyword,
-                                    andb(fx_is_ident name,
-                                      andb(fx_is_word colon ":",
-                                        andb(fx_is_ident family,
-                                          fx_is_word assign ":="))))) in
-                                let gap_ok : Bool :=
-                                  andb(leb_nat assign_end start_col,
-                                    str_null (str_trim (str_slice source_line
-                                      assign_end (sub(start_col, assign_end))))) in
-                                match andb(header_ok, gap_ok) with
-                                | True => Just(String, fx_tok_text family)
-                                | False => Nothing String
-                                end
-                            | Cons _ _ => Nothing String
-                            end
-                        end
-                    end
-                end
-            end
-        end
-    end;
+    if ltb_nat(col, S (str_len source_line)) then
+      let start_col : Nat := sub(col, str_len prefix) in
+      let before : List FxTok :=
+        filter FxTok
+          (fun (token : FxTok) =>
+            andb(eq_nat(fx_tok_line token, line),
+              ltb_nat(fx_tok_col token, start_col)))
+          tokens in
+      match before with
+      | Nil => Nothing String
+      | Cons keyword after_keyword =>
+          match after_keyword with
+          | Nil => Nothing String
+          | Cons name after_name =>
+              match after_name with
+              | Nil => Nothing String
+              | Cons colon after_colon =>
+                  match after_colon with
+                  | Nil => Nothing String
+                  | Cons family after_family =>
+                      match after_family with
+                      | Nil => Nothing String
+                      | Cons assign after_assign =>
+                          match after_assign with
+                          | Nil =>
+                              let assign_end : Nat :=
+                                add(fx_tok_col assign, str_len(fx_tok_text assign)) in
+                              let header_ok : Bool := andb(fx_is_word keyword "def",
+                                andb(fx_tok_bol keyword,
+                                  andb(fx_is_ident name,
+                                    andb(fx_is_word colon ":",
+                                      andb(fx_is_ident family,
+                                        fx_is_word assign ":="))))) in
+                              let gap_ok : Bool :=
+                                andb(leb_nat assign_end start_col,
+                                  str_null (str_trim (str_slice source_line
+                                    assign_end (sub(start_col, assign_end))))) in
+                              if andb(header_ok, gap_ok) then Just(String, fx_tok_text family)
+                              else Nothing String
+                          | Cons _ _ => Nothing String
+                          end
+                      end
+                  end
+              end
+          end
+      end
+    else Nothing String;
 
 -- A simple constructor type ends in its family. Parentheses or other
 -- expression syntax make the declaration too ambiguous for this editor hint.
@@ -295,28 +293,24 @@ def completion_ctor_type (family : String) (tokens : List FxTok)
       match remaining with
       | Nil => Nothing (Pair Bool (List FxTok))
       | Cons token rest =>
-          match orb(fx_is_word token "|", fx_is_word token ";") with
-          | True =>
-              match andb(last_family,
-                orb(eq_nat count (S Z), arrow)) with
-              | True =>
-                  Just(Pair Bool (List FxTok),
-                    MkPair Bool (List FxTok)
-                      (eq_nat count (S Z)) remaining)
-              | False => Nothing (Pair Bool (List FxTok))
-              end
-          | False =>
-              match fx_is_ident token with
-              | True => scan rest (S count) arrow
-                  (fx_is_word token family)
-              | False =>
-                  match andb(fx_is_word token "->",
-                    notb(eq_nat count Z)) with
-                  | True => scan rest (S count) True False
-                  | False => Nothing (Pair Bool (List FxTok))
-                  end
-              end
-          end
+          if orb(fx_is_word token "|", fx_is_word token ";") then
+            if
+              andb(last_family,
+              orb(eq_nat count (S Z), arrow)) then
+              Just(Pair Bool (List FxTok),
+                MkPair Bool (List FxTok)
+                  (eq_nat count (S Z)) remaining)
+            else Nothing (Pair Bool (List FxTok))
+          else
+            if fx_is_ident token then
+              scan rest (S count) arrow
+                (fx_is_word token family)
+            else
+              if
+                andb(fx_is_word token "->",
+                notb(eq_nat count Z)) then
+                scan rest (S count) True False
+              else Nothing (Pair Bool (List FxTok))
       end) tokens Z False False;
 
 -- One shared arm budget also bounds duplicate-name comparisons.
@@ -337,40 +331,30 @@ def completion_ctor_arms (family : String) (tokens : List FxTok)
                   match after_name with
                   | Nil => Nothing (List String)
                   | Cons colon after_colon =>
-                      match andb(fx_is_word bar "|",
-                        andb(fx_is_ident name, fx_is_word colon ":")) with
-                      | False => Nothing (List String)
-                      | True =>
-                          match elem String str_eq (fx_tok_text name) seen with
-                          | True => Nothing (List String)
-                          | False =>
-                              match completion_ctor_type family after_colon with
-                              | Nothing => Nothing (List String)
-                              | Just parsed =>
-                                  match parsed with
-                                  | MkPair nullary after_type =>
-                                      let names2 : List String :=
-                                        match nullary with
-                                        | True => Cons String (fx_tok_text name) names
-                                        | False => names
-                                        end in
-                                      match after_type with
-                                      | Nil => Nothing (List String)
-                                      | Cons separator _ =>
-                                          match fx_is_word separator "|" with
-                                          | True => scan fuel2 after_type
-                                              (Cons String (fx_tok_text name) seen) names2
-                                          | False =>
-                                              match fx_is_word separator ";" with
-                                              | True => Just(List String, reverse String names2)
-                                              | False => Nothing (List String)
-                                              end
-                                          end
-                                      end
-                                  end
+                      if
+                        andb(fx_is_word bar "|",
+                        andb(fx_is_ident name, fx_is_word colon ":")) then
+                        if elem String str_eq (fx_tok_text name) seen then Nothing (List String)
+                        else
+                          match completion_ctor_type family after_colon with
+                          | Nothing => Nothing (List String)
+                          | Just parsed =>
+                              let (MkPair nullary after_type) := parsed in
+                              let names2 : List String :=
+                                if nullary then Cons String (fx_tok_text name) names else names in
+                              match after_type with
+                              | Nil => Nothing (List String)
+                              | Cons separator _ =>
+                                  if fx_is_word separator "|" then
+                                    scan fuel2 after_type
+                                      (Cons String (fx_tok_text name) seen) names2
+                                  else
+                                    if fx_is_word separator ";" then
+                                      Just(List String, reverse String names2)
+                                    else Nothing (List String)
                               end
                           end
-                      end
+                      else Nothing (List String)
                   end
               end
           end
@@ -390,11 +374,11 @@ def completion_ctor_decl (family : String) (tokens : List FxTok)
                 match after_universe with
                 | Nil => Nothing (List String)
                 | Cons assign arms =>
-                    match andb(fx_is_word colon ":",
-                      andb(fx_is_word universe "Type", fx_is_word assign ":=")) with
-                    | True => completion_ctor_arms family arms
-                    | False => Nothing (List String)
-                    end
+                    if
+                      andb(fx_is_word colon ":",
+                      andb(fx_is_word universe "Type", fx_is_word assign ":=")) then
+                      completion_ctor_arms family arms
+                    else Nothing (List String)
                 end
             end
         end
@@ -408,21 +392,18 @@ def completion_ctor_matches (family : String) (line : Nat)
       match remaining with
       | Nil => Nil (Maybe (List String))
       | Cons token rest =>
-          match andb(fx_is_word token "inductive",
-            andb(fx_tok_bol token, ltb_nat(fx_tok_line token, line))) with
-          | False => scan rest
-          | True =>
-              match rest with
-              | Nil => scan rest
-              | Cons name _ =>
-                  match andb(fx_is_ident name, fx_is_word name family) with
-                  | False => scan rest
-                  | True =>
-                      Cons (Maybe (List String))
-                        (completion_ctor_decl family rest) (scan rest)
-                  end
-              end
-          end
+          if
+            andb(fx_is_word token "inductive",
+            andb(fx_tok_bol token, ltb_nat(fx_tok_line token, line))) then
+            match rest with
+            | Nil => scan rest
+            | Cons name _ =>
+                if andb(fx_is_ident name, fx_is_word name family) then
+                  Cons (Maybe (List String))
+                    (completion_ctor_decl family rest) (scan rest)
+                else scan rest
+            end
+          else scan rest
       end) tokens;
 
 def completion_local_ctors (tokens : List FxTok) (line : Nat) (family : String)
@@ -433,10 +414,7 @@ def completion_local_ctors (tokens : List FxTok) (line : Nat) (family : String)
         match rest with
         | Cons _ _ => Nil String
         | Nil =>
-            match candidate with
-            | Nothing => Nil String
-            | Just names => names
-            end
+            (candidate ?? Nil String)
         end
     end;
 
@@ -449,147 +427,229 @@ def completion_ctor_item (family : String) (name : String) : Json :=
       , MkPair String Json "insertText" (JStr name) ] in
     JObj fields;
 
+-- Keep the entire target line. Its header colon rejects an unfinished earlier constructor type.
+private def completion_lex_source (text : String) (lines : List String) (line : Nat) : String :=
+    (fix prefix (remaining : List String) (target : Nat) (offset : Nat) : String :=
+      match remaining with
+      | Nil => text
+      | Cons raw rest => match rest with
+        | Nil => text
+        | Cons _ _ =>
+            let stop : Nat := add offset (S (str_len raw)) in
+            match target with
+            | Z => if ltb_nat stop (str_len text) then str_take text stop else text
+            | S next => prefix rest next stop
+            end
+        end
+      end) lines line Z;
+
+private def completion_definition_line (source_line : String) : Bool :=
+    if str_contains source_line ":=" then
+      let first : Nat :=
+        (fix skip (remaining : Nat) (column : Nat) : Nat :=
+          match remaining with
+          | Z => column
+          | S rest =>
+              if is_ws (prim_string_byte_at source_line column) then skip rest (S column)
+              else column
+          end) (str_len source_line) Z in
+      if is_ws (prim_string_byte_at source_line (add first 3)) then
+        str_eq (str_slice source_line first 3) "def"
+      else False
+    else False;
+
 def completion_result (text : String) (line : Nat) (col : Nat)
     (syms : List Sym) : Json :=
-    let source_line : String := nth String "" line (str_lines text) in
+    let lines : List String := lsp_position_lines text line in
+    let source_line : String := lsp_line_at lines line in
     match lsp_byte_column source_line col with
     | Nothing => JArr (Nil Json)
     | Just column =>
         let prefix : String := prefix_in_line source_line column in
         let ordinary : List Json := map Sym Json completion_item
           (filter Sym (fun (s : Sym) => completion_matches prefix s) syms) in
-        let trimmed_source : String := str_trim source_line in
-        let constructors : List Json :=
-          match andb(str_starts(trimmed_source, "def"),
-            is_ws (prim_string_byte_at trimmed_source 3)) with
-          | False => Nil Json
-          | True =>
-              let token_line : Nat := S line in
-              let tokens : List FxTok := fx_lex text in
-              match completion_expected_family source_line token_line column prefix tokens with
-              | Nothing => Nil Json
-              | Just family =>
-                  map String Json (completion_ctor_item family)
-                    (filter String (fun (name : String) => str_starts(name, prefix))
-                      (completion_local_ctors tokens token_line family))
-              end
+        -- Constructor suggestions come from declarations above the cursor line.
+        let constructor_context : Bool :=
+          match line with
+          | Z => False
+          | S _ => completion_definition_line source_line
           end in
+        let constructors : List Json :=
+          if constructor_context then
+            let token_line : Nat := S line in
+            let tokens : List FxTok := fx_lex (completion_lex_source text lines line) in
+            match completion_expected_family source_line token_line column prefix tokens with
+            | Nothing => Nil Json
+            | Just family =>
+                map String Json (completion_ctor_item family)
+                  (filter String (fun (name : String) => str_starts(name, prefix))
+                    (completion_local_ctors tokens token_line family))
+            end
+          else Nil Json in
         JArr (append Json constructors ordinary)
     end;
 
-def location_result (s : Sym) : Json :=
-    let line : Nat := sub(decl_line (sym_decl s), S Z) in
+def location_at_uri (uri : String) (d : Decl) : Json :=
+    let line : Nat := sub(decl_line d, S Z) in
     let fields : List (Pair String Json) :=
-      [ MkPair String Json "uri" (JStr (path_to_uri (sym_path s)))
+      [ MkPair String Json "uri" (JStr uri)
       , MkPair String Json "range" (lsp_range line Z line Z) ] in
     JObj fields;
 
+def location_result (s : Sym) : Json :=
+    location_at_uri (path_to_uri (sym_path s)) (sym_decl s);
+
 -- SymbolInformation-shaped so document and workspace symbol share one item.
-def document_symbol_item (s : Sym) : Json :=
-    let d : Decl := sym_decl s in
+def symbol_item_at_uri (uri : String) (d : Decl) : Json :=
     let fields : List (Pair String Json) :=
       [ MkPair String Json "name" (JStr (decl_name d))
       , MkPair String Json "kind" (json_num (completion_kind_num (decl_kind d)))
-      , MkPair String Json "location" (location_result s) ] in
+      , MkPair String Json "location" (location_at_uri uri d) ] in
     JObj fields;
+
+def document_symbol_item (s : Sym) : Json :=
+    symbol_item_at_uri (path_to_uri (sym_path s)) (sym_decl s);
+
+def document_symbol_items (syms : List Sym) : List Json :=
+    match syms with
+    | Nil => Nil Json
+    | Cons first _ =>
+        let first_path : String := sym_path first in
+        (fix go (remaining : List Sym) (previous : String) (uri : String) : List Json :=
+          match remaining with
+          | Nil => Nil Json
+          | Cons s rest =>
+              let path : String := sym_path s in
+              let current : String := if str_eq path previous then uri else path_to_uri path in
+              Cons Json (symbol_item_at_uri current (sym_decl s)) (go rest path current)
+          end) syms first_path (path_to_uri first_path)
+    end;
 
 def document_symbol_here (path : String) (s : Sym) : Bool :=
     str_ends(sym_path s, path);
 
 def document_symbol_result (path : String) (syms : List Sym) : Json :=
-    JArr (map Sym Json document_symbol_item
+    JArr (document_symbol_items
       (filter Sym (fun (s : Sym) => document_symbol_here path s) syms));
 
 def workspace_symbol_match (query : String) (s : Sym) : Bool :=
     str_contains(decl_name (sym_decl s), query);
 
 def workspace_symbol_result (query : String) (syms : List Sym) : Json :=
-    JArr (map Sym Json document_symbol_item
+    JArr (document_symbol_items
       (filter Sym (fun (s : Sym) => workspace_symbol_match query s) syms));
 
 def prepare_rename_result (text : String) (line : Nat) (col : Nat) : Json :=
-    let w : String := word_at text line col in
-    match str_null w with
-    | True => JNull
-    | False =>
-        let ln : String := nth String "" line (str_lines text) in
-        match lsp_byte_column ln col with
+    let ln : String := lsp_line_at (lsp_position_lines text line) line in
+    match lsp_byte_column ln col with
+    | Nothing => JNull
+    | Just column => let (MkPair start finish) := lsp_word_bounds ln column in
+      if eq_nat start finish then JNull
+      else
+        match lsp_utf16_column ln start False with
         | Nothing => JNull
-        | Just column =>
-            let cs : List Nat := str_codes ln in
-            let n : Nat := length Nat cs in
-            let i : Nat := word_start(S n, cs, minNat column n) in
-            let j : Nat := word_end (S n) cs i in
-            match lsp_utf16_column ln i False with
-            | Nothing => JNull
-            | Just first => match lsp_utf16_column ln j True with
-              | Nothing => JNull
-              | Just last => lsp_range line first line last
-              end
-            end
+        | Just first => match lsp_utf16_column ln finish True with
+          | Nothing => JNull
+          | Just last => lsp_range line first line last
+          end
         end
     end;
+
+private def lsp_concat_pairs : List String -> List String :=
+  fix pairs (pieces : List String) : List String :=
+    match pieces with
+    | Nil => pieces
+    | Cons first rest => match rest with
+      | Nil => pieces
+      | Cons second more => Cons String (str_concat first second) (pairs more)
+      end
+    end;
+
+-- Pairwise joins retain the runtime's checked concatenation limits.
+def lsp_concat_runs (runs : List String) : String :=
+    (fix join (fuel : Nat) (pieces : List String) : String :=
+      match fuel with
+      | Z => foldr String String str_concat "" pieces
+      | S rest => match pieces with
+        | Nil => ""
+        | Cons first tail => match tail with
+          | Nil => first
+          | Cons _ _ => join rest (lsp_concat_pairs pieces)
+          end
+        end
+      end) (length String runs) runs;
 
 -- Textual rename over identifier tokens in the open buffer only. Not
 -- type-aware: a same-named token in another binding is rewritten too.
-def rename_in_line_go : Nat -> String -> List Nat -> Nat -> String -> String
-    -> String :=
-  fix rename_in_line_go (fuel : Nat) (line : String) (cs : List Nat) (i : Nat)
-      (from : String) (to : String) : String :=
-    match fuel with
-    | Z => ""
-    | S fuel2 =>
-        let n : Nat := length Nat cs in
-        match ltb_nat i n with
-        | False => ""
-        | True =>
-            match is_ident_cont (nth Nat ch_space i cs) with
-            | False =>
-                str_concat (str_slice line i (S Z))
-                  (rename_in_line_go fuel2 line cs (S i) from to)
-            | True =>
-                let i0 : Nat := word_start (S n) cs i in
-                let j : Nat := word_end (S n) cs i0 in
-                let tok : String := str_slice line i0 (sub j i0) in
-                let piece : String :=
-                  match str_eq tok from with
-                  | True => to
-                  | False => tok
-                  end in
-                str_concat(piece, rename_in_line_go fuel2 line cs j from to)
-            end
-        end
-    end;
+def rename_in_line_go (fuel : Nat) (line : String) (n : Nat) (i : Nat)
+    (from : String) (to : String) : String :=
+    let width : Nat := str_len from in
+    let finish (start : Nat) (stop : Nat) (pieces : List String) : String :=
+      match pieces with
+      | Nil => if andb(eq_nat start Z, eq_nat stop (str_len line)) then line
+          else str_slice line start (sub stop start)
+      | Cons _ _ => lsp_concat_runs (reverse_lin String
+          (Cons String (str_slice line start (sub stop start)) pieces))
+      end in
+    (fix go (remaining : Nat) (at : Nat) (start : Nat) (pieces : List String) : String :=
+      match remaining with
+      | Z => finish start at pieces
+      | S rest =>
+          if ltb_nat at n then
+            if is_ident_cont (prim_string_byte_at line at) then
+              let past : Nat := word_end line (sub n (S at)) (S at) in
+              let matches : Bool := if eq_nat (sub past at) width then
+                  str_eq (str_slice line at width) from
+                else False in
+              if matches then
+                go rest past past (Cons String to
+                  (Cons String (str_slice line start (sub at start)) pieces))
+              else go rest past start pieces
+            else go rest (S at) start pieces
+          else finish start at pieces
+      end) fuel i i [];
 
 def rename_in_line (line : String) (from : String) (to : String) : String :=
-    match str_null from with
-    | True => line
-    | False =>
-        let cs : List Nat := str_codes line in
-        rename_in_line_go (S (length Nat cs)) line cs Z from to
-    end;
+    if str_null from then line
+    else if str_contains line from then
+      let n : Nat := str_len line in
+      rename_in_line_go (S n) line n Z from to
+    else line;
 
 -- str_lines retains a trailing empty segment, so joining preserves newlines.
+private def lsp_rename_lines (lines : List String) (from : String) (to : String) : String :=
+    str_join "\n" (map String String (fun (ln : String) => rename_in_line ln from to) lines);
+
 def rename_text (text : String) (from : String) (to : String) : String :=
-    str_join "\n"
-      (map String String (fun (ln : String) => rename_in_line ln from to)
-        (str_lines text));
+    lsp_rename_lines (str_lines text) from to;
 
 -- Formatting and rename share the existing whole-document replacement range.
-def format_edits (text : String) (out : String) : Json :=
-    let lines : Nat := length(String, str_lines text) in
+private def lsp_whole_document_edits (line_count : Nat) (out : String) : Json :=
     let fields : List (Pair String Json) :=
-      [ MkPair String Json "range" (lsp_range Z Z (S lines) Z)
+      [ MkPair String Json "range" (lsp_range Z Z (S line_count) Z)
       , MkPair String Json "newText" (JStr out) ] in
     let edits : List Json := [ JObj fields ] in
     JArr edits;
 
-def rename_result (uri : String) (old_text : String) (new_text : String) : Json :=
+def format_edits (text : String) (out : String) : Json :=
+    lsp_whole_document_edits (length String (str_lines text)) out;
+
+private def lsp_rename_edits (uri : String) (edits : Json) : Json :=
     let changes : List (Pair String Json) :=
-      [ MkPair String Json uri (format_edits old_text new_text) ] in
+      [ MkPair String Json uri edits ] in
     let fields : List (Pair String Json) :=
       [ MkPair String Json "changes" (JObj changes) ] in
     JObj fields;
+
+def rename_result (uri : String) (old_text : String) (new_text : String) : Json :=
+    lsp_rename_edits uri (format_edits old_text new_text);
+
+def rename_at (uri : String) (text : String) (line : Nat) (col : Nat) (new_name : String) : Json :=
+    let lines : List String := str_lines text in
+    let old : String := lsp_word_at_line (lsp_line_at lines line) col in
+    if orb(str_null old, str_null new_name) then JNull
+    else lsp_rename_edits uri (lsp_whole_document_edits (length String lines)
+      (lsp_rename_lines lines old new_name));
 
 -- Capabilities: full document sync (1), hover, definition, completion,
 -- formatting, document/workspace symbols, and textual rename.
@@ -630,10 +690,7 @@ def lsp_message_id_valid (id : Json) : Bool :=
 
 def lsp_message_error_id (msg : Json) : Json :=
     let id : Json := rpc_id msg in
-    match lsp_message_id_valid id with
-    | True => id
-    | False => JNull
-    end;
+    if lsp_message_id_valid id then id else JNull;
 
 def lsp_message_is_notification (msg : Json) : Bool :=
     match json_obj_get msg "id" with
@@ -642,31 +699,17 @@ def lsp_message_is_notification (msg : Json) : Bool :=
     end;
 
 def lsp_message_valid (msg : Json) : Bool :=
-    match msg with
-    | JObj _ =>
-        let method_ok : Bool := match json_field msg "method" with
-          | JStr _ => True
-          | JNull => False
-          | JBool _ => False
-          | JNum _ => False
-          | JArr _ => False
-          | JObj _ => False
-          end in
-        andb (str_eq(json_field_str msg "jsonrpc" "", "2.0"))
-          (andb method_ok (lsp_message_id_valid (rpc_id msg)))
-    | JNull => False
-    | JBool _ => False
-    | JNum _ => False
-    | JStr _ => False
-    | JArr _ => False
-    end;
+    if let JObj _ := msg then
+      let method_ok : Bool :=
+        if let JStr _ := json_field msg "method" then True else False in
+      andb (str_eq(json_field_str msg "jsonrpc" "", "2.0"))
+        (andb method_ok (lsp_message_id_valid (rpc_id msg)))
+    else False;
 
--- Diagnostics come from the checker's own output, so the editor shows exactly
--- what `ouro1 check` reports. Two shapes matter:
+-- The server reads two forms of checker diagnostics.
 --   OURO-LIST-001 error path/file.ouro:2:18 message
 --   CHECK_FAIL: front end rejected the input
--- Anything else (hints, internal CErr traces) is not a positioned diagnostic
--- and is dropped rather than guessed at.
+-- It ignores other output such as hints and internal traces.
 def diag_of (code : String) (sev : Json) (line : Nat) (col : Nat)
     (msg : String) : Json :=
     let fields : List (Pair String Json) :=
@@ -678,53 +721,49 @@ def diag_of (code : String) (sev : Json) (line : Nat) (col : Nat)
     JObj fields;
 
 def diag_sev_of (word : String) : Json :=
-    match str_eq word "warning" with
-    | True => JNum "2"
-    | False => JNum "1"
-    end;
+    if str_eq word "warning" then JNum "2" else JNum "1";
 
 -- A trailing "file:line:col" token. The path may itself contain colons, so the
 -- last two fields win and the rest is the path.
 inductive Loc : Type :=
   | MkLoc : String -> Nat -> Nat -> Loc;
 
+private def loc_parse_parts (parts : List String) : Maybe Loc :=
+    let n : Nat := length String parts in
+    if ltb_nat n 3 then Nothing Loc
+    else
+      let col : Maybe Nat := parse_nat (nth String "" (sub n 1) parts) in
+      let line : Maybe Nat := parse_nat (nth String "" (sub n 2) parts) in
+      let path : String :=
+        str_join(":", take String (sub n 2) parts) in
+      match line with
+      | Nothing => Nothing Loc
+      | Just l =>
+          match col with
+          | Nothing => Nothing Loc
+          | Just c => Just(Loc, MkLoc(path, sub(l, S Z), sub(c, S Z)))
+          end
+      end;
+
 -- Zero-based, saturating: the compiler counts from one.
 def loc_parse (tok : String) : Maybe Loc :=
-    let parts : List String := str_split_str tok ":" in
-    let n : Nat := length String parts in
-    match ltb_nat n 3 with
-    | True => Nothing Loc
-    | False =>
-        let col : Maybe Nat := parse_nat (nth String "" (sub n 1) parts) in
-        let line : Maybe Nat := parse_nat (nth String "" (sub n 2) parts) in
-        let path : String :=
-          str_join(":", take String (sub n 2) parts) in
-        match line with
-        | Nothing => Nothing Loc
-        | Just l =>
-            match col with
-            | Nothing => Nothing Loc
-            | Just c => Just(Loc, MkLoc(path, sub(l, S Z), sub(c, S Z)))
-            end
-        end
-    end;
+    loc_parse_parts (str_split_str tok ":");
 
 def diag_of_ouro_line (line : String) : Maybe (Pair Loc Json) :=
     let ws : List String := str_words line in
-    match ltb_nat(length String ws, 3) with
-    | True => Nothing (Pair Loc Json)
-    | False =>
-        match loc_parse (nth String "" 2 ws) with
+    match drop String 2 ws with
+    | Nil => Nothing (Pair Loc Json)
+    | Cons location words =>
+        -- On the C host, the word split has already handled the NUL boundary.
+        match loc_parse_parts (str_split location ch_colon) with
         | Nothing => Nothing (Pair Loc Json)
         | Just l =>
-            match l with
-            | MkLoc _ source_line col =>
-                Just (Pair Loc Json)
-                  (MkPair Loc Json l
-                    (diag_of (nth String "" Z ws)
-                      (diag_sev_of (nth String "" (S Z) ws))
-                      source_line col (str_join(" ", drop String 3 ws))))
-            end
+            let (MkLoc _ source_line col) := l in
+            Just (Pair Loc Json)
+              (MkPair Loc Json l
+                (diag_of (nth String "" Z ws)
+                  (diag_sev_of (nth String "" (S Z) ws))
+                  source_line col (str_join " " words)))
         end
     end;
 
@@ -738,35 +777,24 @@ def diag_of_fail_line (line : String) : Maybe (Pair Loc Json) :=
     end;
 
 def diag_of_line (line : String) : Maybe (Pair Loc Json) :=
-    match str_starts line "OURO-" with
-    | True => diag_of_ouro_line line
-    | False => diag_of_fail_line (str_trim line)
-    end;
+    if str_starts line "OURO-" then diag_of_ouro_line line
+    else if str_contains line "CHECK_FAIL:" then diag_of_fail_line (str_ltrim line)
+    else Nothing (Pair Loc Json);
 
 -- Keep only what belongs to the file being checked: LSP publishes per URI, and
 -- a diagnostic in an imported module is not attached to this document. An
 -- unpositioned CHECK_FAIL has no path and belongs to the file that was checked.
 -- Failed checks with no remaining local diagnostic still publish CHECK_FAIL.
 def diag_here (path : String) (l : Loc) : Bool :=
-    match l with
-    | MkLoc p _ _ =>
-        match str_null p with
-        | True => True
-        | False => str_ends path p
-        end
-    end;
+    let (MkLoc p _ _) := l in
+    if str_null p then True else str_ends path p;
 
 def diag_keep (path : String) (m : Maybe (Pair Loc Json)) : List Json :=
     match m with
     | Nothing => Nil Json
     | Just p =>
-        match p with
-        | MkPair l j =>
-            match diag_here path l with
-            | True => ([j] : List Json)
-            | False => Nil Json
-            end
-        end
+        let (MkPair l j) := p in
+        if diag_here path l then ([j] : List Json) else Nil Json
     end;
 
 def diags_of_output (path : String) (out : String) : List Json :=
@@ -774,43 +802,64 @@ def diags_of_output (path : String) (out : String) : List Json :=
       (fun (line : String) => diag_keep(path, diag_of_line line))
       (str_lines out);
 
+private def lsp_invalid_diagnostic_position (diagnostic : Json) : Json :=
+    diag_of "CHECK_PROTOCOL" (JNum "1") Z Z
+      (str_concat "invalid UTF-8 source position in checker diagnostic: "
+        (json_field_str diagnostic "message" ""));
+
 def lsp_diagnostic_utf16 (lines : List String) (diagnostic : Json) : Json :=
     let range : Json := json_field diagnostic "range" in
     let start : Json := json_field range "start" in
     let finish : Json := json_field range "end" in
     let first_line : Nat := json_field_nat start "line" Z in
     let last_line : Nat := json_field_nat finish "line" Z in
-    let first : Maybe Nat := lsp_utf16_column (nth String "" first_line lines)
+    let first_text : String := lsp_line_at lines first_line in
+    let first : Maybe Nat := lsp_utf16_column first_text
       (json_field_nat start "character" Z) False in
-    let last : Maybe Nat := lsp_utf16_column (nth String "" last_line lines)
-      (json_field_nat finish "character" Z) True in
-    let unavailable : Json := diag_of "CHECK_PROTOCOL" (JNum "1") Z Z
-      (str_concat "invalid UTF-8 source position in checker diagnostic: "
-        (json_field_str diagnostic "message" "")) in
     match first with
-    | Nothing => unavailable
-    | Just first_col => match last with
-      | Nothing => unavailable
-      | Just last_col =>
-          JObj (map (Pair String Json) (Pair String Json)
-            (fun (field : Pair String Json) => match field with
-              | MkPair key value => MkPair String Json key
-                  (match str_eq key "range" with
-                  | True => lsp_range first_line first_col last_line last_col
-                  | False => value
-                  end)
-              end) (json_pairs diagnostic))
-      end
+    | Nothing => lsp_invalid_diagnostic_position diagnostic
+    | Just first_col =>
+        let last_text : String := if eq_nat first_line last_line then first_text else lsp_line_at lines last_line in
+        match lsp_utf16_column last_text (json_field_nat finish "character" Z) True with
+        | Nothing => lsp_invalid_diagnostic_position diagnostic
+        | Just last_col =>
+            JObj (map (Pair String Json) (Pair String Json)
+              (fun (field : Pair String Json) => let (MkPair key value) := field in
+                MkPair String Json key
+                  (if str_eq key "range" then lsp_range first_line first_col last_line last_col else value))
+              (json_pairs diagnostic))
+        end
     end;
 
 def lsp_diagnostics_utf16 (text : String) (diagnostics : List Json) : List Json :=
-    map Json Json (lsp_diagnostic_utf16 (str_lines text)) diagnostics;
+    match diagnostics with
+    | Nil => Nil Json
+    | Cons _ _ => map Json Json (lsp_diagnostic_utf16 (str_lines text)) diagnostics
+    end;
 
 def publish_params (uri : String) (ds : List Json) : Json :=
     let fields : List (Pair String Json) :=
       [ MkPair String Json "uri" (JStr uri)
       , MkPair String Json "diagnostics" (JArr ds) ] in
     JObj fields;
+
+-- A semicolon token ends an import group. Only another import keyword can start one.
+def lsp_tokens_for_import_scan (text : String) : List FxTok :=
+    let header : String := str_take text lsp_kib in
+    match str_index header "import" with
+    | Nothing => if str_contains text "import" then fx_lex text else Nil FxTok
+    | Just keyword => match str_index_from header ";" keyword with
+      | Nothing => fx_lex text
+      | Just semicolon =>
+          let stop : Nat := S semicolon in
+          if str_contains (str_drop text stop) "import" then fx_lex text
+          else
+            let tokens : List FxTok := fx_lex (str_take header stop) in
+            let final : FxTok := last FxTok fx_no_tok tokens in
+            if andb (fx_has_code final fx_c_semi) (eq_nat (fx_tok_end final) stop) then tokens
+            else fx_lex text
+      end
+    end;
 
 -- Keep path spans so unsaved-buffer rewriting preserves groups, aliases,
 -- comments and every non-import byte. The lexer keeps quoted text opaque.
@@ -820,85 +869,43 @@ def lsp_import_tokens (text : String) : List FxTok :=
       match tokens with
       | Nil => Nil FxTok
       | Cons token rest =>
-          match andb(path_expected, fx_is_kind token fx_k_str) with
-          | True => Cons FxTok token (scan rest False True)
-          | False => scan rest
+          if andb(path_expected, fx_is_kind token fx_k_str) then
+            Cons FxTok token (scan rest False True)
+          else
+            scan rest
               (orb (fx_has_code token fx_c_import)
                 (andb(comma_expected, fx_has_code token fx_c_comma))) False
-          end
-      end) (fx_lex text) False False;
+      end) (lsp_tokens_for_import_scan text) False False;
 
 -- Import paths use the compiler's braced Unicode scalar decoder.
 def lsp_import_decode : List Nat -> List Nat -> Maybe String :=
   fun (input : List Nat) (initial : List Nat) =>
-    (fix decode (fuel : Nat) (codes : List Nat) (acc : List Nat)
-        : Maybe String :=
-      match fuel with
-      | Z => Nothing String
-      | S remaining =>
-          match codes with
-          | Nil => Nothing String
-          | Cons code rest =>
-              match eq_nat code ch_quote with
-              | True => match rest with
-                  | Nil => Just(String, str_of_codes (reverse Nat acc))
-                  | Cons _ _ => Nothing String
-                  end
-              | False => match eq_nat code ch_bslash with
-                  | False => decode(remaining, rest, Cons Nat code acc)
-                  | True => match rest with
-                      | Nil => Nothing String
-                      | Cons escaped after =>
-                          let braced : Bool := match after with
-                            | Nil => False
-                            | Cons brace _ => eq_nat brace 123
-                            end in
-                          match andb(eq_nat escaped 117, braced) with
-                          | True => match source_unicode_braced after with
-                            | Nothing => Nothing String
-                            | Just parsed => match parsed with
-                              | MkPair bytes tail => decode(remaining, tail,
-                                  append Nat (reverse Nat bytes) acc)
-                              end
-                            end
-                          | False =>
-                              match lookup Nat Nat eq_nat escaped
-                                [ MkPair Nat Nat 110 ch_lf, MkPair Nat Nat 116 ch_tab
-                                , MkPair Nat Nat 114 ch_cr, MkPair Nat Nat ch_quote ch_quote
-                                , MkPair Nat Nat ch_bslash ch_bslash ] with
-                              | Just decoded => decode(remaining, after,
-                                  Cons Nat decoded acc)
-                              | Nothing => decode(remaining, after,
-                                  Cons Nat escaped (Cons Nat ch_bslash acc))
-                              end
-                          end
-                      end
-                  end
-              end
-          end
-      end) (S (length Nat input)) input initial;
+    match source_take_string (S (length Nat input)) input initial with
+    | Nothing => Nothing String
+    | Just parsed => let (MkPair bytes rest) := parsed in
+        match rest with
+        | Nil => Just String (str_of_codes bytes)
+        | Cons _ _ => Nothing String
+        end
+    end;
 
 def lsp_import_spelling (token : FxTok) : Maybe String :=
     let spelling : List Nat := str_codes (fx_tok_text token) in
-    match source_is_raw_start spelling with
-    | True => match source_take_raw spelling with
+    if source_is_raw_start spelling then
+      match source_take_raw spelling with
       | Nothing => Nothing String
-      | Just parsed => match parsed with
-        | MkPair bytes tail => match tail with
-          | Nil => Just(String, str_of_codes bytes)
-          | Cons _ _ => Nothing String
-          end
+      | Just parsed => let (MkPair bytes tail) := parsed in
+        match tail with
+        | Nil => Just(String, str_of_codes bytes)
+        | Cons _ _ => Nothing String
         end
       end
-    | False => match spelling with
+    else
+      match spelling with
       | Nil => Nothing String
       | Cons quote rest =>
-          match eq_nat quote ch_quote with
-          | False => Nothing String
-          | True => lsp_import_decode(rest, Nil Nat)
-          end
-      end
-    end;
+          if eq_nat quote ch_quote then lsp_import_decode(rest, Nil Nat) else Nothing String
+      end;
 
 def imports_of (text : String) : List String :=
     concat_map FxTok String
@@ -906,3 +913,104 @@ def imports_of (text : String) : List String :=
         | Nothing => Nil String
         | Just path => [path]
         end) (lsp_import_tokens text);
+
+def lsp_module_symbols (entry : LspModuleIndex) : List Sym :=
+    let (MkLspModuleIndex _ _ symbols _) := entry in
+    symbols;
+
+private def lsp_module_at_path (path : String) (entry : LspModuleIndex) : Bool :=
+    let (MkLspModuleIndex known _ _ _) := entry in
+    str_eq path known;
+
+private def lsp_module_has_text (text : String) (entry : LspModuleIndex) : Bool :=
+    let (MkLspModuleIndex _ previous _ _) := entry in
+    str_eq text previous;
+
+private def lsp_cache_text_weight (lines : List String) : Nat :=
+    foldl String Nat (fun (size : Nat) (line : String) =>
+      add(size, add 64 (str_len line))) Z lines;
+
+private def lsp_module_cache_base_weight : Nat := 256;
+private def lsp_module_cache_symbol_weight : Nat := 256;
+private def lsp_module_cache_limit : Nat := mul 32 lsp_kib;
+
+-- Charge copied text and a fixed weight for each retained row.
+private def lsp_module_cache_fits (source_weight : Nat) (symbols : List Sym)
+    (imports : List String) : Bool :=
+    let text_weight : Nat :=
+      add(source_weight, add(lsp_module_cache_base_weight, lsp_cache_text_weight imports)) in
+    (fix fits (rows : List Sym) (weight : Nat) : Bool :=
+      if leb_nat weight lsp_module_cache_limit then
+        match rows with
+        | Nil => True
+        | Cons symbol rest =>
+            let d : Decl := sym_decl symbol in
+            let header : Nat := add(str_len (decl_kind d), str_len (decl_name d)) in
+            let body : Nat := add(str_len (decl_sig d), lsp_cache_text_weight (decl_docs d)) in
+            fits rest (add(weight, add(lsp_module_cache_symbol_weight, add header body)))
+        end
+      else False) symbols text_weight;
+
+private def lsp_extract_module (path : String) (text : String) : LspModuleIndex :=
+    MkLspModuleIndex path text (syms_of_module path text) (imports_of text);
+
+def lsp_document_module_index (document : String) (path : String) (text : String) : LspModuleIndex :=
+    let symbols : List Sym := if str_ends path document then syms_of_module path text else Nil Sym in
+    MkLspModuleIndex path text symbols (imports_of text);
+
+private def lsp_module_cache_miss (path : String) (text : String)
+    (older : List LspModuleIndex) : Pair LspModuleIndex (List LspModuleIndex) :=
+    let entry : LspModuleIndex := lsp_extract_module path text in
+    let (MkLspModuleIndex _ _ symbols imports) := entry in
+    let source_weight : Nat := add(str_len path, str_len text) in
+    let admitted : List LspModuleIndex :=
+      if leb_nat source_weight lsp_module_cache_limit then
+        if lsp_module_cache_fits source_weight symbols imports then
+          Cons LspModuleIndex entry (take LspModuleIndex 63 older)
+        else older
+      else older in
+    MkPair LspModuleIndex (List LspModuleIndex) entry admitted;
+
+private def lsp_module_index_uncached (path : String) (text : String)
+    (cache : List LspModuleIndex) : Pair LspModuleIndex (List LspModuleIndex) :=
+    MkPair LspModuleIndex (List LspModuleIndex) (lsp_extract_module path text) cache;
+
+private def lsp_module_index_cached (remember : Bool) (path : String) (text : String)
+    (cache : List LspModuleIndex) : Pair LspModuleIndex (List LspModuleIndex) :=
+    match find LspModuleIndex (lsp_module_at_path path) cache with
+    | Nothing => if remember then lsp_module_cache_miss path text cache
+        else lsp_module_index_uncached path text cache
+    | Just entry =>
+        if lsp_module_has_text text entry then MkPair LspModuleIndex (List LspModuleIndex) entry cache
+        else if remember then lsp_module_cache_miss path text
+          (filter LspModuleIndex (fun (old : LspModuleIndex) => notb (lsp_module_at_path path old)) cache)
+        else lsp_module_index_uncached path text cache
+    end;
+
+private def lsp_document_index_cached (document : String) (path : String) (text : String)
+    (cache : List LspModuleIndex) : LspModuleIndex :=
+    match find LspModuleIndex (lsp_module_at_path path) cache with
+    | Nothing => lsp_document_module_index document path text
+    | Just entry =>
+        if lsp_module_has_text text entry then
+          if str_ends path document then entry
+          else let (MkLspModuleIndex _ _ _ imports) := entry in
+            MkLspModuleIndex path text (Nil Sym) imports
+        else lsp_document_module_index document path text
+    end;
+
+def lsp_module_index_for (mode : LspIndexMode) (path : String) (text : String)
+    (cache : List LspModuleIndex) : Pair LspModuleIndex (List LspModuleIndex) :=
+    match mode with
+    | LspIndexUncached => lsp_module_index_uncached path text cache
+    | LspIndexReuse => lsp_module_index_cached False path text cache
+    | LspIndexRemember => lsp_module_index_cached True path text cache
+    -- Document indexes can omit symbols. Keep reusable entries complete.
+    | LspIndexDocument document => MkPair LspModuleIndex (List LspModuleIndex)
+        (lsp_document_index_cached document path text cache) cache
+    end;
+
+def lsp_module_index (remember : Bool) (path : String) (text : String)
+    (cache : List LspModuleIndex) : Pair LspModuleIndex (List LspModuleIndex) :=
+    if remember then lsp_module_index_cached True path text cache
+    else lsp_module_index_uncached path text cache;

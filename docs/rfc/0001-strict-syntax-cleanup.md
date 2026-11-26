@@ -6,10 +6,10 @@
 
 ## Summary
 
-Project-owned Ouro code uses a stricter profile than the full parser surface.
-The profile favors forms with clear types, predictable tooling, and practical
-migration paths. Repository quality rules are versioned through stable
-diagnostics, fixtures, and explicit debt rather than informal review taste.
+This decision applies a restricted syntax and quality profile to
+project-owned Ouro source. The profile favors forms the compiler and tools
+can check consistently. Stable diagnostics and fixtures identify what the
+profile rejects and where it permits migration debt.
 
 ## Motivation
 

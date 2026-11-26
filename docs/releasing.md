@@ -1,7 +1,7 @@
 # Releasing
 
-Ouro releases provide toolchain archives for each supported host platform.
-Each GitHub Release includes both `.tar.zst` and `.zip` archives for:
+The release workflow builds toolchain archives in `.tar.zst` and `.zip`
+formats for these hosts.
 
 - `darwin` (macOS x86_64)
 - `darwin_aarch64` (macOS ARM)
@@ -10,13 +10,9 @@ Each GitHub Release includes both `.tar.zst` and `.zip` archives for:
 - `windows` (Windows x86_64)
 
 The archive names are `ouro-<version>-<platform>.tar.zst` and
-`ouro-<version>-<platform>.zip`. There is no `windows_aarch64` archive.
+`ouro-<version>-<platform>.zip`.
 
-The packer writes its report before `SHA256SUMS`, which covers all final files
-in the output directory, including the report. Reusing the directory recomputes
-those hashes after replacing its artifacts.
-
-The x86-64 macOS job uses `macos-15-intel`; ARM uses `macos-latest`.
+The x86-64 macOS job uses `macos-15-intel`. The ARM job uses `macos-latest`.
 
 Each archive is a relocatable prefix with repository sources plus the host
 `ouro1` built on that runner (`bin/ouro1` or `bin/ouro1.exe`) and a `bin/ouro`
@@ -35,27 +31,37 @@ Release tags use `v<version>`. The version is shared by:
 - `editors/vscode/package.json`;
 - `editors/vscode/package-lock.json`.
 
-The release package check rejects missing versions, version drift, and, on a tag build, a tag that
-does not match the project version.
+Bump the shared files before tagging. The packer checks that the versions
+are present and agree. The hosted tag build requires the matching tag name
+and a clean checkout.
 
 ## Release-candidate checks
 
-Run the public project and workflow policy checks from the
-[CI validation matrix](ci.md#validation-matrix). Before tagging, also run:
+Before pushing a release tag, run the public project and workflow policy
+checks in the [validation matrix](ci.md#validation-matrix). Run the commands
+below from the repository root with the
+[source-build prerequisites](getting_started.md#requirements), a Git checkout,
+and Python 3.12. See the [CI profiles](ci.md#local-profiles) for the validation
+commands and their coverage.
+
+The package check writes a manifest, report, and `SHA256SUMS` under
+`_build/release_check/` without creating archives. The PR profile writes its
+reports under `_build/ci/release-pr/`. Require `RELEASE_PACKAGE: PASS` and
+passing CI results before continuing.
 
 ```sh
 python3 scripts/release_package.py --check --out _build/release_check
 python3 scripts/ci_gate.py --profile pr --out _build/ci/release-pr
 ```
 
-Add the `kernel` compatibility profile for compiler-checking changes:
+Add the `kernel` compatibility profile for compiler-checking changes.
 
 ```sh
 python3 scripts/ci_gate.py --profile kernel --out _build/ci/release-kernel
 ```
 
 Add the stage-loop profile when generated compiler artifacts or bootstrap
-behavior changed:
+behavior changed.
 
 ```sh
 python3 scripts/ci_gate.py --profile stage-loop --out _build/ci/release-stage-loop
@@ -63,16 +69,20 @@ python3 scripts/ci_gate.py --profile stage-loop --out _build/ci/release-stage-lo
 
 ## Build release files
 
-Metadata and version checks:
+Run these commands from the repository root with the release-candidate
+prerequisites. This example builds and packages the Linux x86-64 host
+compiler using the default build directories and
+[compact source materialization](canonical_source.md#materialization).
+For another host, use its platform name and compiler path. The default
+Windows x86-64 values are `--platform windows` and `_build/c/ouro1.exe`.
+
+Use a dedicated package output directory. The packer replaces matching
+artifacts and writes `release-package-report.json` before computing
+`SHA256SUMS`. The checksums cover the artifacts, report, and any other files
+already in the output directory.
 
 ```sh
-python3 scripts/release_package.py --out _build/release
-```
-
-One host toolchain, after the
-[compact-source compiler build](canonical_source.md#materialization) used by CI:
-
-```sh
+python3 scripts/ouro_build.py build --compact-sources
 python3 scripts/release_package.py \
   --toolchain \
   --platform linux \
@@ -81,9 +91,10 @@ python3 scripts/release_package.py \
 cat _build/release/SHA256SUMS
 ```
 
-On Windows the compiler path is `_build/c/ouro1.exe` and `--platform windows`.
-The optional `--source` flag still writes source-only `.tar.gz` / `.zip`
-archives for local inspection; those names are not uploaded to GitHub Releases.
+On success, the packer reports `RELEASE_PACKAGE: PASS` and writes the
+toolchain archives, manifest, and checksums. Use `--source` to produce
+source-only `.tar.gz` and `.zip` archives for local inspection. The hosted
+release publishes toolchain archives.
 
 A complete hosted set is the ten toolchain archives, a release manifest,
 and `SHA256SUMS`. Repository-local state such as
@@ -92,8 +103,11 @@ and `SHA256SUMS`. Repository-local state such as
 Tracked symlinks and selected paths that traverse a symlink or Windows reparse
 point are rejected; archive members are regular files only.
 
-Archive timestamps and ownership metadata are normalized so two builds from the
-same inputs can be compared.
+The packer normalizes archive timestamps and ownership metadata. For byte
+comparisons, use the same inputs and compression implementation. Hosted
+toolchain jobs create a Python 3.12 virtual environment for packaging and
+install `zstandard==0.23.0` into it. The local packer can fall back to other
+compression implementations.
 
 ## GitHub release
 
@@ -101,16 +115,21 @@ Release validation defaults to the complete `pr` profile used by ordinary CI
 on `main`, with the same manual-only lint exclusion. It does not select only
 checks affected by the latest commit. Extended `manual`, `kernel`, and
 `stage-loop` profiles remain available through the dispatch `run_profile` input.
-Every selected validation group must succeed before packaging and publication.
+Toolchain archive builds run independently of validation. After validation
+succeeds, the metadata job runs the project gate and writes the release
+manifest. Assembly waits for both the metadata job and the toolchain matrix,
+verifies the archive inventory, and writes `SHA256SUMS` before uploading the
+release files. Draft and snapshot publication depend on successful assembly.
 
-`.github/workflows/ouro-release.yml` runs on release tags, a daily schedule,
-and manual dispatch. Scheduled runs check the date at 03:17 UTC and build a
-snapshot every three days, counting UTC days from 1970-01-01. Other scheduled
-runs skip validation, packaging, and publication. This cycle continues across
-month and year boundaries. Push an annotated `v<version>` tag after the candidate
-checks and package review. A tag run creates a draft GitHub Release and uploads
-the ten host archives, manifest, and checksums. GitHub generates the draft's
-notes from merged PRs using `.github/release.yml`, starting at the highest
+The [release workflow](../.github/workflows/ouro-release.yml) runs on release
+tags, a daily schedule, and manual dispatch. Scheduled runs check the date
+at 03:17 UTC and build a snapshot every three days, counting UTC days from
+1970-01-01. Other scheduled runs skip validation, packaging, and publication.
+The cadence continues across month and year boundaries. A pushed `v<version>` tag triggers archive builds
+and a draft release with ten archives, the manifest, and checksums. Push an
+annotated tag after the candidate checks and package review. GitHub generates
+the draft's notes from merged pull requests using `.github/release.yml`, starting
+at the highest
 canonical `vX.Y.Z` ancestor other than the current tag. Snapshot and weekly
 tags do not select that starting point. Without a previous version tag,
 GitHub chooses the first draft's comparison automatically.
@@ -138,11 +157,11 @@ Check whether a UTC date is scheduled without building or publishing:
 python3 scripts/release_package.py --snapshot-due --date 2026-09-25
 ```
 
-This prints `true`; the next two dates print `false`.
+This prints `true`. The next two dates print `false`.
 
-Before tagging a version, bump the shared version files. Describe user-visible
-changes in PRs and keep canonical documentation and migration guidance current;
-Git history and GitHub releases carry the change history.
+Describe user-visible changes in pull requests and keep canonical
+documentation and migration guidance current. Git history and GitHub releases
+carry the change history.
 
 A reproducible host package establishes a reviewable byte baseline for that
 runner. It does not prove type-system soundness, compiler correctness, runtime

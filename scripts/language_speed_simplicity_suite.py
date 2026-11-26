@@ -218,9 +218,9 @@ exit "$PROTOCOL_STATUS"
              (0, "", "failed\n", 1), (2, "", "bad option\n", 2)]
     arguments = ["--deny", "directory with spaces", "", "line\nbreak.ouro",
                  "каталог/source.ouro", "$(not-a-shell-command).ouro"]
-    # Python's Windows argv quoting leaves a lone LF unquoted, and MSYS splits
-    # it before our launcher starts. Construct the exact test argv in the shell;
-    # only fixed environment variable names enter this command, never values.
+    # Python leaves a lone LF unquoted in Windows argv. MSYS splits it
+    # before the launcher runs. Pass argument values in the environment so
+    # only fixed variable references enter the shell command.
     argument_env = {f"PROTOCOL_ARG_{index}": value for index, value in enumerate(arguments)}
     forwarded = " ".join(f'"$PROTOCOL_ARG_{index}"' for index in range(len(arguments)))
     command = ["sh", "-c", f'exec sh "$1" lint {forwarded}',
@@ -297,13 +297,15 @@ def check_structured_result_protocol(tmp: Path) -> None:
             contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
         if bounded.run_drive_bounded(tmp / "unused", ["--enable-dataflow"], [ROOT / "std/io.ouro"]) != 2:
             raise AssertionError("bounded aggregation hid a missing file")
+    fake_drive = tmp / "fake-production-drive"
+    fake_drive.write_bytes(b"fixture drive\n")
     for code, stdout, stderr in [(137, clean, ""), (0, clean.replace("files=1", "files=0"), "")]:
         proc = subprocess.CompletedProcess([], code, stdout, stderr)
         stale = tmp / "production/report.json"
         stale.parent.mkdir(exist_ok=True)
         stale.write_text('{"pass":true}\n', encoding="utf-8")
-        with patch.object(production, "ensure_drive", return_value=(tmp / "unused", "")), \
-                patch.object(production, "requested_drive_families", return_value="dataflow"), \
+        with patch.object(production, "ensure_drive", return_value=(fake_drive, "")), \
+                patch.object(production, "requested_drive_families", side_effect=["dataflow", "dataflow,effects"]), \
                 patch.object(production, "run_sweep", return_value=(proc, 0.0)), \
                 contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
             if production.main(["--out", str(tmp / "production")]) != 1:
@@ -322,14 +324,106 @@ def check_structured_result_protocol(tmp: Path) -> None:
             raise AssertionError("production accepted a stale executable without checking its receipt")
 
 
+def check_production_sweep_reuse(tmp: Path) -> None:
+    import json
+    from unittest.mock import patch
+
+    import analyze_bounded as bounded
+    import analyze_production_suite as production
+
+    root = tmp / "sweep-workspace"
+    (root / "src").mkdir(parents=True)
+    source = root / "src/input.ouro"
+    binary = root / "drive"
+    policy = root / "policy.json"
+    cases = [
+        ("equivalent", ["dataflow,effects", "dataflow,effects"], ["strict"], 0),
+        ("different-order", ["dataflow,effects", "effects,dataflow"], ["strict", "all"], 0),
+        ("missing-selector", ["dataflow", None], [], 1),
+        ("strict-only", ["dataflow"], ["strict"], 0),
+        ("modified-source", ["dataflow", "dataflow"], ["strict"], 1),
+        ("modified-binary", ["dataflow", "dataflow"], ["strict"], 1),
+        ("incomplete", ["dataflow", "dataflow"], ["strict"], 1),
+        ("strict-finding", ["dataflow", "dataflow"], ["strict"], 1),
+        ("known-rejection", ["dataflow", "dataflow"], ["strict"], 0),
+        ("unexpected-rejection", ["dataflow", "dataflow"], ["strict"], 1),
+    ]
+    for case, families, executed, status in cases:
+        out = root / case
+        binary.write_bytes(b"drive version one")
+        source.write_text("def value : Nat := 0;\n", encoding="utf-8")
+        rejected = case in {"known-rejection", "unexpected-rejection"}
+        found = case == "strict-finding"
+        scope = ["--scope", "src", "--scope", "src/input.ouro"]
+        policy.write_text(json.dumps({
+            "kind": production.POLICY_KIND,
+            "scopes": scope[1::2],
+            "frontend_rejects": [{"path": "src/input.ouro", "reason": "parse-fail"}] if case == "known-rejection" else [],
+        }), encoding="utf-8")
+
+        def run_sweep(_binary, argv, *, scenario=case, selections=families):
+            if scenario == "modified-source":
+                source.write_text("def value : Nat := 1;\n", encoding="utf-8")
+            if scenario == "modified-binary":
+                binary.write_bytes(b"drive version two")
+            selected = selections[int(argv[0] == "--enable-all")]
+            findings = int(scenario == "strict-finding")
+            rejections = int(scenario in {"known-rejection", "unexpected-rejection"})
+            diagnostic = "src/input.ouro:2:1: warning[OURO-DF001] dataflow/unused-param: unused\n" if findings else ""
+            stdout = f"{diagnostic}ANALYZE_DRIVE files=1 findings={findings} rejected={rejections} families={selected}\n"
+            stderr = "src/input.ouro: structured analyzer could not build the unit: parse-fail\n" if rejections else ""
+            return subprocess.CompletedProcess(argv, int(bool(findings or rejections)), stdout, stderr), 1.25
+
+        with patch.object(production, "ROOT", root), patch.object(bounded, "ROOT", root), \
+                patch.object(production, "ensure_drive", return_value=(binary, "")), \
+                patch.object(production, "requested_drive_families", side_effect=families) as select, \
+                patch.object(production, "run_sweep", side_effect=run_sweep) as run, \
+                patch.object(production, "drive_result_error", return_value="incomplete" if case == "incomplete" else "") as verify, \
+                patch.object(production, "drive_banner", side_effect=lambda stdout, f=found, r=rejected: (
+                    {"files": 1, "findings": int(f), "rejected": int(r)}, stdout.rsplit("families=", 1)[1].strip())), \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            argv = ["--out", str(out), "--policy", str(policy)]
+            if case == "strict-only":
+                argv.append("--strict-only")
+            if production.main(argv) != status:
+                raise AssertionError(f"{case}: production sweep status changed")
+        flags = [production.SWEEPS[name] for name in production.SWEEPS][:len(families)]
+        if [call.args for call in select.call_args_list] != [(binary, [flag, *scope]) for flag in flags]:
+            raise AssertionError(f"{case}: production did not verify the requested native selectors")
+        if [call.args for call in run.call_args_list] != [(binary, [production.SWEEPS[name], *scope]) for name in executed]:
+            raise AssertionError(f"{case}: wrong physical sweeps")
+        if verify.call_count != len(executed):
+            raise AssertionError(f"{case}: an executed sweep did not receive exactly one protocol check")
+        report_path = out / "report.json"
+        if case in {"missing-selector", "modified-source", "modified-binary", "incomplete"}:
+            if report_path.exists() or (out / "all.out").exists():
+                raise AssertionError(f"{case}: production published incomplete or stale evidence")
+            continue
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+        if report["pass"] != (status == 0):
+            raise AssertionError(f"{case}: report status differs from gate status")
+        if case in {"different-order", "strict-only"}:
+            if set(report["sweeps"]) != set(executed) or any("reused_from" in row for row in report["sweeps"].values()):
+                raise AssertionError(f"{case}: production marked an execution as reused")
+            continue
+        if (verify.call_args.kwargs != {"files": 1, "families": families[0]}
+                or report["sweeps"]["all"].get("reused_from") != "strict"
+                or report["sweeps"]["all"]["elapsed_s"] != 0.0
+                or any((out / f"all.{suffix}").read_bytes() != (out / f"strict.{suffix}").read_bytes()
+                       for suffix in ("out", "err"))):
+            raise AssertionError(f"{case}: shared sweep did not retain its complete checked result")
+
+
 def main() -> int:
     with tempfile.TemporaryDirectory(prefix="ouro-quality-host-contract-") as directory:
         check_host_quality_retirement(Path(directory))
         check_lint_launcher_protocol(Path(directory))
         check_structured_result_protocol(Path(directory))
+        check_production_sweep_reuse(Path(directory))
     if sys.argv[1:] == ["--host-quality-only"]:
         print("HOST_QUALITY_CONTRACTS: PASS")
         return 0
+    from ourosmith.host import build_config, tool_entry
     from ourosmith.native_inputs import prepare
 
     if not shutil.which("cc") and not shutil.which("gcc"):
@@ -338,12 +432,11 @@ def main() -> int:
     with tempfile.TemporaryDirectory(prefix="ouro-launcher-contract-") as directory:
         check_native_gate_launchers(Path(directory))
 
-    # Build the hot-path binaries before exercising host behavior.
     run([sys.executable, "scripts/ouro_build.py", "build", "--verbosity", "quiet"])
     collect_laws = ROOT / "_build/collect-source-laws"
-    collect_env = {**os.environ, "OURO_BUILD_TOOL_MODE": "native"}
+    native_build_env = {**os.environ, "OURO_BUILD_TOOL_MODE": "native"}
     run(["sh", "scripts/build_tool.sh", "tests/native_build_collection_tests.ouro",
-         str(collect_laws)], env=collect_env)
+         str(collect_laws)], env=native_build_env)
     if os.name == "nt":
         collect_laws = collect_laws.with_suffix(".exe")
     collection = run([str(collect_laws), "--collect-only"])
@@ -353,17 +446,16 @@ def main() -> int:
     fmt_inputs = prepare("fmt", ROOT / "_build/smith/speed-inputs", 1)
     # Warm the native formatter before the no-Python hot-path assertion.
     run(["sh", "scripts/ouro1.sh", "fmt", "--check",
-         (fmt_inputs / "clean.golden").as_posix()], env=collect_env)
-    ergo_cmd = [
+         (fmt_inputs / "clean.golden").as_posix()], env=native_build_env)
+    c_build_dir = build_config().path("c_build_dir")
+    # The builder adds the Windows executable suffix and writes the receipt for the logical path.
+    run(["sh", "scripts/build_tool.sh", tool_entry("test"), (c_build_dir / "ouro-test").as_posix()],
+        env={**native_build_env, "OURO_C_BUILD_DIR": c_build_dir.as_posix()})
+    manifest_cmd = [
         "sh", "scripts/ouro1.sh", "test",
-        "--manifest=" + (fixtures / "manifest.tsv").as_posix(), "--prefix=ERGO.",
-        "--root=" + fixtures.as_posix(), "--out=_build/ergonomics_suite",
-        "--suite-label=ERGONOMICS_SUITE",
+        "--manifest=" + (fixtures / "manifest.tsv").as_posix(),
+        "--root=" + fixtures.as_posix(),
     ]
-    warm_ergo = run(ergo_cmd)
-    if "ERGONOMICS_SUITE: PASS" not in warm_ergo.stdout:
-        raise AssertionError(warm_ergo.stdout)
-    assert_no_path_warning(warm_ergo.stdout, "warm ergonomics suite")
 
     cycle = subprocess.run(
         ["sh", "scripts/ouro1.sh", "collect",
@@ -394,6 +486,16 @@ def main() -> int:
     (ROOT / "_build").mkdir(exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="ouro-speed-suite-", dir=ROOT / "_build") as d:
         tmp = Path(d)
+        warm_out = (tmp.relative_to(ROOT) / "warm-ergo").as_posix()
+        warm_ergo = run([
+            *manifest_cmd, "--prefix=ERGO.pipe-missing-rhs",
+            "--out=" + warm_out, "--suite-label=ERGONOMICS_SUITE",
+        ])
+        if not any(line.startswith("ERGONOMICS_SUITE: PASS rows=1 out=")
+                   for line in warm_ergo.stdout.splitlines()):
+            raise AssertionError(warm_ergo.stdout)
+        assert_no_path_warning(warm_ergo.stdout, "warm ergonomics suite")
+
         log = tmp / "python.log"
         fakebin = fake_python(tmp, log)
         env = os.environ.copy()
@@ -405,7 +507,7 @@ def main() -> int:
         assert_no_path_warning(check.stdout, "ouro1.sh check")
         assert_no_python(log, "ouro1.sh check")
 
-        # Help is also a hot UX path and must not bootstrap/build just to print usage.
+        # Help must print usage without invoking Python or starting a build.
         help_run = subprocess.run(
             ["sh", "scripts/ouro1.sh", "help"],
             cwd=ROOT,
@@ -432,16 +534,17 @@ def main() -> int:
         assert_no_path_warning(coil_help.stdout, "coil.sh help")
         assert_no_python(log, "coil.sh help")
 
-        ergo = run(ergo_cmd, env=env)
+        ergo = run([
+            *manifest_cmd, "--prefix=ERGO.", "--out=_build/ergonomics_suite",
+            "--suite-label=ERGONOMICS_SUITE",
+        ], env=env)
         if "ERGONOMICS_SUITE: PASS" not in ergo.stdout:
             raise AssertionError(ergo.stdout)
         assert_no_path_warning(ergo.stdout, "ergonomics suite hot path")
         assert_no_python(log, "ergonomics_suite hot path")
 
         imp = run([
-            "sh", "scripts/ouro1.sh", "test",
-            "--manifest=" + (fixtures / "manifest.tsv").as_posix(), "--prefix=IMP.",
-            "--root=" + fixtures.as_posix(), "--out=_build/imports_suite",
+            *manifest_cmd, "--prefix=IMP.", "--out=_build/imports_suite",
             "--suite-label=IMPORTS_SUITE",
         ], env=env)
         if "IMPORTS_SUITE: PASS" not in imp.stdout:

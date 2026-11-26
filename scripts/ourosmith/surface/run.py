@@ -6,9 +6,10 @@ import re
 import shutil
 import sys
 import time
-from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 from pathlib import Path
 
+from local_scheduler import Task, available_memory_mib, run_tasks
 from ourosmith import ROOT
 from ourosmith.host import binary, environment, job_count
 from ourosmith.limits import RunResult, run_limited
@@ -37,16 +38,26 @@ class StepFailure(Exception):
 
 
 class SurfaceRunner:
-    def __init__(self, report: Report, work: Path, seeds: list[int], *, depth=4, timeout=20, memory_mb=1024, shrink_budget=40, overrides=None, native_work=None):
+    def __init__(self, report: Report, work: Path, seeds: list[int], *, depth=4, timeout=20, memory_mb=1024, shrink_budget=40,
+                 overrides=None, native_work=None, bound_tools_only=False, allocation=None, import_parser=None):
         self.report, self.work, self.seeds = report, work.resolve(), seeds
         self.depth, self.timeout, self.memory_mb = depth, timeout, memory_mb
+        self.allocation = allocation
+        self.memory_budget_mib = (allocation.memory_mib if allocation is not None
+                                  else available_memory_mib(minimum_mib=memory_mb))
+        if self.memory_budget_mib is not None and memory_mb > self.memory_budget_mib:
+            raise ValueError(f"surface command needs {memory_mb} MiB, budget is {self.memory_budget_mib} MiB")
         self.shrink_budget = shrink_budget
         self.summary = report.layer("surface")
         self.coverage = {"features": {}, "negative_kinds": {}, "properties": {}}
         self.summary.coverage = self.coverage
         self.env = dict(environment())
+        if allocation is not None:
+            self.env.update(allocation.environment())
         self.overrides = overrides or {}
+        self.bound_tools_only = bound_tools_only
         self.native_work = Path(native_work) if native_work is not None else self.work / "native-objects"
+        self.import_parser = import_parser
         self.compiler = self.tool("ouro1")
         # Hosted checks must use the prepared producer and collector rather
         # than starting a shared tool build inside the runtime deadline.
@@ -64,7 +75,11 @@ class SurfaceRunner:
         self.input = None
 
     def tool(self, name):
-        return self.overrides[name] if name in self.overrides else binary(name)
+        if name in self.overrides:
+            return self.overrides[name]
+        if self.bound_tools_only:
+            raise StepFailure("surface-tool", "prepared tool", name, "oracle-unavailable")
+        return binary(name)
 
     def count(self, group, name):
         counts = self.coverage[group]
@@ -73,15 +88,17 @@ class SurfaceRunner:
     def command(self, argv, directory: Path, prop: str, *, env=None, stdin=None, timeout=None) -> RunResult:
         argv = [arg.as_posix() if isinstance(arg, Path) else str(arg) for arg in argv]
         timeout = self.timeout if timeout is None else timeout
+        if env and self.allocation is not None:
+            env = {**env, **self.allocation.environment()}
         result = run_limited(argv, cwd=directory, env=env or self.env,
                              stdin_text=stdin, timeout_s=timeout, memory_mb=self.memory_mb)
         self.sequence += 1
         logs = self.work / "logs"
         logs.mkdir(parents=True, exist_ok=True)
-        (logs / f"{self.sequence:05}-{prop}.log").write_text(
-            json.dumps({"argv": list(map(str, argv)), "status": result.classify(), "exit_code": result.returncode,
-                        "timeout_s": timeout, "elapsed_s": result.elapsed_s, "peak_rss_mb": result.peak_rss_mb})
-            + "\n" + result.stdout + result.stderr, encoding="utf-8")
+        header = json.dumps({"argv": list(map(str, argv)), "status": result.classify(), "exit_code": result.returncode,
+                             "timeout_s": timeout, "elapsed_s": result.elapsed_s, "peak_rss_mb": result.peak_rss_mb})
+        with (logs / f"{self.sequence:05}-{prop}.log").open("w", encoding="utf-8") as log:
+            log.writelines((header, "\n", result.stdout, result.stderr))
         if result.classify() not in {"ok", "nonzero"}:
             raise StepFailure(prop, "normal process termination", self.output(result), result.classify())
         return result
@@ -104,7 +121,7 @@ class SurfaceRunner:
             probe_report = Report(profile=self.report.profile, generator_hash=self.report.generator_hash, seeds=[self.seed], command="shrink")
             probe = SurfaceRunner(probe_report, self.work / "shrink", [self.seed], depth=self.depth,
                                   timeout=self.timeout, memory_mb=self.memory_mb, shrink_budget=0, overrides=self.overrides,
-                                  native_work=self.native_work)
+                                  native_work=self.native_work, bound_tools_only=self.bound_tools_only, allocation=self.allocation)
             probe.seed, probe.case_id = self.seed, self.case_id
 
             def still_fails(candidate):
@@ -277,17 +294,18 @@ class SurfaceRunner:
                 except StepFailure as failure:
                     self.record(failure)
 
-    def seed_report(self, item):
+    def seed_report(self, item, allocation=None):
         index, seed = item
         report = Report(profile=self.report.profile, generator_hash=self.report.generator_hash,
                         seeds=[seed], command=self.report.command)
         worker = SurfaceRunner(report, self.work / "seeds" / f"{index}-{seed}", [seed], depth=self.depth,
                                timeout=self.timeout, memory_mb=self.memory_mb, shrink_budget=self.shrink_budget,
-                               overrides=self.overrides, native_work=self.native_work)
+                               overrides=self.overrides, native_work=self.native_work, bound_tools_only=self.bound_tools_only,
+                               allocation=allocation)
         worker.run_seed(index, seed)
         return report
 
-    def recipe_report(self, item):
+    def recipe_report(self, item, allocation=None, *, import_parser=None):
         from ourosmith.surface.tools import run_tools
 
         index, name = item
@@ -295,7 +313,8 @@ class SurfaceRunner:
                         seeds=[self.seed], command=self.report.command)
         worker = SurfaceRunner(report, self.work / "recipes" / str(index), [self.seed], depth=self.depth,
                                timeout=self.timeout, memory_mb=self.memory_mb, shrink_budget=self.shrink_budget,
-                               overrides=self.overrides, native_work=self.native_work)
+                               overrides=self.overrides, native_work=self.native_work, bound_tools_only=self.bound_tools_only,
+                               allocation=allocation, import_parser=import_parser)
         worker.seed = self.seed
         started = time.perf_counter()
         run_tools(worker, only=name)
@@ -322,20 +341,28 @@ class SurfaceRunner:
             self.report.sections[name] = value
         self.report.timing.update(report.timing)
 
+    def _parallel_reports(self, phase, items, run):
+        tasks = [Task(str(index), max_jobs=1, memory_mib=self.memory_mb) for index in range(len(items))]
+        results, stats = run_tasks(
+            tasks, jobs=job_count(), memory_mib=self.memory_budget_mib,
+            run=lambda task, allocation: run(items[int(task.name)], allocation))
+        self.report.timing.update({f"surface.{phase}.scheduler.{name}": value
+                                   for name, value in stats.items() if value is not None})
+        return [results[task.name] for task in tasks]
+
     def run_recipes(self):
         from ourosmith.surface.tools import PROPERTIES
+        from selfhost_module_cache import cached_import_parser
 
-        # These wrappers may own shared compiler/build outputs. Keep them
-        # outside the direct-tool pool, including missing-golden error paths.
-        # The line scanner compiles the full frontend dependency graph.
-        serial = {"user_test_runner", "compiler_parity", "selftest_missing_golden", "analyzer_lines", "parser_contract"}
+        # These recipes share build outputs or exercise the full job budget.
+        serial = {"user_test_runner", "compiler_parity", "selftest_missing_golden", "analyzer_lines", "parser_contract",
+                  "import_modules", "module_cache"}
         items = [(index, test.__name__) for index, test in enumerate(PROPERTIES)]
         independent = [item for item in items if item[1] not in serial]
-        with ThreadPoolExecutor(max_workers=job_count()) as pool:
-            reports = dict(zip((name for _, name in independent), pool.map(self.recipe_report, independent), strict=True))
-        # Execution order can vary; report order follows the recipe registry.
+        run_recipe = partial(self.recipe_report, import_parser=cached_import_parser())
+        reports = iter(self._parallel_reports("recipes", independent, run_recipe))
         for item in items:
-            report = self.recipe_report(item) if item[1] in serial else reports[item[1]]
+            report = run_recipe(item) if item[1] in serial else next(reports)
             self.merge_seed(report)
 
     def run(self):
@@ -346,11 +373,8 @@ class SurfaceRunner:
 
             run_forms(self)
             self.run_recipes()
-        # Recipe and expression pools never overlap. Generated samples own
-        # independent files, limits, and reports, merged in seed order.
-        with ThreadPoolExecutor(max_workers=job_count()) as pool:
-            for report in pool.map(self.seed_report, enumerate(self.seeds[1:], 1)):
-                self.merge_seed(report)
+        for report in self._parallel_reports("seeds", list(enumerate(self.seeds[1:], 1)), self.seed_report):
+            self.merge_seed(report)
         from ourosmith.surface.corpus import load
 
         for record in load():

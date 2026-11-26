@@ -1,22 +1,19 @@
 -- Literal bytes require a checked String type after transparent reduction.
 import "compiler_string_nf_fixtures.ouro",
+  "../compiler/string_nf_values.ouro",
+  "../compiler/file_check_environment.ouro",
+  "../compiler/primitive_model.ouro",
   "../std/test.ouro";
+import "compiler_wide_nat_fixtures.ouro";
 
 def string_auth_literal (name : Nat) : CoreTerm := CStrBytes([65, 0, 255] : List Nat, name);
 
 def string_auth_failure (name : Nat) (failure : CheckFailure) : Bool :=
-    match failure with
-    | CheckMalformedCore fault => match fault with
-        | CheckLiteralType actual => eqNat name actual
-        | CheckUnboundVariable _ => False | CheckUnboundGlobal _ => False
-        | CheckUnknownInductive _ => False | CheckUnknownConstructor _ _ => False
-        | CheckConstructorParameters => False | CheckCaseMetadata => False
-        | CheckFixMetadata => False | CheckUnresolvedLiteral _ => False | CheckDuplicateName _ => False
-        end
-    | CheckTypeFailure _ => False | CheckReductionFailure _ => False
-    | CheckResourceLimit => False | CheckUnsupported _ => False | CheckCancelled => False
-    | CheckInternalFailure _ => False | CheckPrimitiveFailure _ => False
-    end;
+    if let CheckMalformedCore fault := failure then
+      if let CheckLiteralType actual := fault then
+        eqNat name actual
+      else False
+    else False;
 
 def string_auth_infers (entries : List Entry) (name : Nat) : Bool :=
     match infer_checked(200, entries, [] : List CoreTerm, IGTerm (string_auth_literal name)) with
@@ -65,11 +62,18 @@ def string_auth_cycle : List Entry :=
 def string_auth_cycle_infer : Bool :=
     match infer_checked(40, string_auth_cycle, [] : List CoreTerm, IGTerm (string_auth_literal 610)) with
     | CheckOk _ => False
+    | CheckErr failure => if let CheckResourceLimit := (failure : CheckFailure) then True else False
+    end;
+
+def string_auth_invalid_byte_outcome (fuel : Nat) (expect_limit : Bool) : Bool :=
+    match infer_checked(fuel, Nil Entry, Nil CoreTerm, IGTerm (CStrBytes([65, 256] : List Nat, 777))) with
+    | CheckOk _ => False
     | CheckErr failure => match failure with
-        | CheckResourceLimit => True
-        | CheckMalformedCore _ => False | CheckTypeFailure _ => False | CheckReductionFailure _ => False
-        | CheckUnsupported _ => False | CheckCancelled => False
-        | CheckInternalFailure _ => False | CheckPrimitiveFailure _ => False
+        | CheckResourceLimit => expect_limit
+        | CheckReductionFailure fault => andb (notb expect_limit)
+            (string_nf_test_fault Unit 11 (NormalizeMalformed Unit fault))
+        | CheckMalformedCore _ => False | CheckTypeFailure _ => False | CheckUnsupported _ => False
+        | CheckCancelled => False | CheckInternalFailure _ => False | CheckPrimitiveFailure _ => False
         end
     end;
 
@@ -94,6 +98,45 @@ def string_auth_forged_word_items : List FileItem :=
 def string_auth_opaque_items : List FileItem :=
     [FAxiom(18, CSort 0), FDef(90, CConst 18, string_auth_literal 18)];
 
+def string_auth_index_accepts (entries : List Entry) (name : Nat) : Bool :=
+    match string_value_type_head_indexed (check_environment_from_entries entries) (CConst name) with
+    | Nothing => False
+    | Just actual => eqNat actual name
+    end;
+
+def string_auth_index_rejects (entries : List Entry) (term : CoreTerm) : Bool :=
+    match string_value_type_head_indexed (check_environment_from_entries entries) term with
+    | Nothing => True
+    | Just _ => False
+    end;
+
+def string_auth_index_rejects_heads (entries : List Entry) : List CoreTerm -> Bool :=
+  fix reject (terms : List CoreTerm) : Bool :=
+    match terms with
+    | Nil => True
+    | Cons term rest => andb(string_auth_index_rejects entries term, reject rest)
+    end;
+
+def string_auth_raw_name : Nat -> Nat -> Nat := compiler_test_raw_successors;
+
+def string_auth_reserved : Entry :=
+    MkIndEntry 650 (MkIndDecl 650 [] [] 0 ([MkCtor(18, CInd 650)] : List Ctor));
+
+def string_auth_checked_string (name : Nat) : Entry :=
+    MkBoundEntry(name, CSort 0, primitive_binding(PrimitiveStringType, Nothing CoreTerm));
+
+def string_auth_extern : Entry :=
+    MkBoundEntry 18 (CSort 0) (PrimitiveExternBinding
+      (CheckedExternOf PrimitiveWindowsX64 PrimitiveWin64
+        ([107, 101, 114, 110, 101, 108, 51, 50, 46, 100, 108, 108] : List Nat)
+        ([71, 101, 116, 67, 117, 114, 114, 101, 110, 116, 80, 114, 111, 99, 101, 115, 115, 73, 100] : List Nat)
+        (PrimitiveAbiSignatureOf ([] : List PrimitiveAbiValue)
+          (Just PrimitiveAbiValue (PrimitiveAbiWord PrimitiveWordU32))) PrimitiveNoGc));
+
+def string_auth_constructor_items : List FileItem :=
+    [FInd (MkIndDecl 650 (Nil Param) (Nil CoreTerm) 0 ([MkCtor(18, CInd 650)] : List Ctor)),
+     FDef(90, CInd 650, string_auth_literal 18)];
+
 def string_auth_laws : List Test :=
     [ assert_true "a checked String binding authenticates bytes including NUL"
         (string_auth_infers string_nf_test_environment 18)
@@ -117,6 +160,8 @@ def string_auth_laws : List Test :=
         (string_auth_rejects string_auth_word_scope 650)
     , assert_true "a newer opaque binding shadows an older String identity"
         (string_auth_rejects(string_auth_shadow (MkEntry(18, CSort 0, Nothing CoreTerm)), 18))
+    , assert_true "a transparent alias cannot recover a shadowed String identity"
+        (string_auth_rejects (Cons Entry (MkEntry(18, CSort 0, Nothing CoreTerm)) string_auth_scope) 611)
     , assert_true "a newer inductive binding shadows an older String identity"
         (string_auth_rejects(string_auth_shadow (MkIndEntry 18 string_auth_empty), 18))
     , assert_true "a newer machine binding shadows an older String identity"
@@ -136,6 +181,10 @@ def string_auth_laws : List Test :=
         (string_nf_test_fault Bool 14 (conv_checked 200 string_auth_empty_scope
           (string_auth_literal 610) (string_auth_literal 18)))
     , assert_true "cyclic type aliases preserve inference exhaustion" string_auth_cycle_infer
+    , assert_true "literal inference exhausts fuel before reaching the invalid second byte"
+        (string_auth_invalid_byte_outcome 2 True)
+    , assert_true "literal inference reports the invalid byte before the missing type"
+        (string_auth_invalid_byte_outcome 3 False)
     , assert_true "cyclic type aliases preserve normalization exhaustion"
         (match normalize_checked 40 string_auth_cycle (string_auth_literal 610) with
          | NormalizeExhausted => True | Normalized _ => False | NormalizeMalformed _ => False end)
@@ -151,6 +200,51 @@ def string_auth_laws : List Test :=
         (string_auth_module_rejects CheckExactCore string_auth_opaque_items)
     , assert_true "source module checking rejects an opaque literal with exact type fault"
         (string_auth_module_rejects CheckSourceCore string_auth_opaque_items)
+    , assert_true "indexed String authentication accepts the checked binding"
+        (string_auth_index_accepts string_nf_test_environment 18)
+    , assert_true "indexed String authentication rejects an unknown name"
+        (string_auth_index_rejects string_nf_test_environment (CConst 777))
+    , assert_true "indexed String authentication rejects every nonconstant head"
+        (string_auth_index_rejects_heads string_nf_test_environment
+          ([CRel 18, CSort 0, CPi(CSort 0, CSort 0), CLam(CSort 0, CRel 0),
+            CApp(CConst 18, CConst 18), CLetIn(CSort 0, CSort 1, CRel 0), CInd 18,
+            CConstruct 18 0 0, CCase(MkCaseInfo 18 0 [], CSort 0, CConst 18, []),
+            CFix 18 0 1 (CSort 0) (CRel 0), CStrLit 18 18, string_auth_literal 18] : List CoreTerm))
+    , assert_true "indexed String authentication preserves opaque shadowing"
+        (string_auth_index_rejects
+          (string_auth_shadow (MkEntry(18, CSort 0, Nothing CoreTerm))) (CConst 18))
+    , assert_true "indexed String authentication preserves inductive shadowing"
+        (string_auth_index_rejects (string_auth_shadow (MkIndEntry 18 string_auth_empty)) (CConst 18))
+    , assert_true "indexed String authentication preserves machine shadowing"
+        (string_auth_index_rejects (string_auth_shadow
+          (MkBoundEntry(18, CSort 0, primitive_binding(PrimitiveU32Type, Nothing CoreTerm)))) (CConst 18))
+    , assert_true "indexed String authentication rejects a wrong String operation binding"
+        (string_auth_index_rejects (string_auth_shadow
+          (MkBoundEntry(18, CSort 0, primitive_binding
+            (PrimitiveStringOperation PrimitiveStringLength, Nothing CoreTerm)))) (CConst 18))
+    , assert_true "indexed String authentication preserves extern shadowing and exact faults"
+        (andb(string_auth_index_rejects (string_auth_shadow string_auth_extern) (CConst 18),
+          string_auth_rejects (string_auth_shadow string_auth_extern) 18))
+    , assert_true "indexed String authentication keeps a newer String binding"
+        (string_auth_index_accepts (append Entry string_nf_test_environment
+          ([MkEntry(18, CSort 0, Nothing CoreTerm)] : List Entry)) 18)
+    , assert_true "indexed String authentication ignores representation roles"
+        (string_auth_index_accepts (append Entry string_nf_test_roles string_nf_test_environment) 18)
+    , assert_true "a constructor reservation cannot authenticate String"
+        (string_auth_index_rejects ([string_auth_reserved] : List Entry) (CConst 18))
+    , assert_true "a newer constructor reservation preserves an older String binding"
+        (string_auth_index_accepts (Cons Entry string_auth_reserved string_nf_test_environment) 18)
+    , assert_true "a newer String binding replaces an older constructor reservation"
+        (string_auth_index_accepts ([string_auth_checked_string 18, string_auth_reserved] : List Entry) 18)
+    , assert_true "repeated constructor reservations preserve the String binding"
+        (string_auth_index_accepts (Cons Entry string_auth_reserved
+          (Cons Entry string_auth_reserved string_nf_test_environment)) 18)
+    , assert_true "indexed String authentication accepts a packed name for a Peano binding"
+        (string_auth_index_accepts ([string_auth_checked_string (string_auth_raw_name 18 Z)] : List Entry) 18)
+    , assert_true "indexed String authentication accepts a Peano name for a packed binding"
+        (string_auth_index_accepts ([string_auth_checked_string 18] : List Entry) (string_auth_raw_name 18 Z))
+    , assert_true "a constructor name without a global binding cannot authenticate a literal"
+        (string_auth_module_rejects CheckExactCore string_auth_constructor_items)
     ];
 
 -- @entry main

@@ -15,6 +15,7 @@ import "source_text.ouro",
   "base.ouro",
   "preprocess_import.ouro",
   "pipeline_support.ouro",
+  "lexer_intern.ouro",
   "module_registry.ouro",
   "checked_program_output.ouro",
   "token.ouro",
@@ -24,30 +25,100 @@ inductive UnitParse : Type :=
   | UOk : SrcUnit -> InternState -> UnitParse
   | UErr : Nat -> Nat -> InternState -> UnitParse;
 
-def parse_unit
-  (lex_go : Nat -> List Nat -> InternState -> List Token ->
-      LexResult)
+inductive IndexedUnitParse : Type :=
+  | IndexedUnitOk : SrcUnit -> LexerIntern -> IndexedUnitParse
+  | IndexedUnitErr : Nat -> Nat -> InternState -> IndexedUnitParse;
+
+def finish_parse_unit (State : Type) (A : Type)
+    (canonicalize : State -> List Decl -> Pair (List Decl) State)
+    (success : SrcUnit -> State -> A) (failure : Nat -> State -> A)
+    (pid : Nat) (state : State) (parsed : ParseResult ParsedFile) : A :=
+  match parsed with
+  | POk file _toks _pos => match file with
+    | MkParsedFile decls private_names => match canonicalize state decls with
+      | MkPair resolved final => success (mk_src_unit pid resolved private_names) final
+      end
+    end
+  | PErr position => failure position state
+  end;
+
+def pipeline_lex_unobserved
+    (lex_go : Nat -> List Nat -> InternState -> List Token -> LexResult)
+    (fuel : Nat) (source : List Nat) (state : InternState) : Pair LexResult (Maybe TokenSpans) :=
+  MkPair LexResult (Maybe TokenSpans) (lex_go fuel source state []) (Nothing TokenSpans);
+
+def pipeline_parse_unobserved
+    (parse_file : Nat -> List Token -> Nat -> ParseResult ParsedFile)
+    (fuel : Nat) (tokens : List Token) (position : Nat)
+    : ParseResult (Pair ParsedFile (Maybe (List ParsedSourceOccurrence))) :=
+  match parse_file fuel tokens position with
+  | PErr error => PErr (Pair ParsedFile (Maybe (List ParsedSourceOccurrence))) error
+  | POk parsed rest next => POk (Pair ParsedFile (Maybe (List ParsedSourceOccurrence)))
+      (MkPair ParsedFile (Maybe (List ParsedSourceOccurrence)) parsed
+        (Nothing (List ParsedSourceOccurrence))) rest next
+  end;
+
+def pipeline_unit_no_origins (original : UnitParse)
+    (mapping : Either SourceOriginError (Maybe OriginalSourceMap))
+    : Pair UnitParse (Either SourceOriginError (List OwnedSourceOccurrence)) :=
+  MkPair UnitParse (Either SourceOriginError (List OwnedSourceOccurrence)) original
+    (source_origin_empty_rows mapping);
+
+def parse_unit_observed
+  (lex_go : Nat -> List Nat -> InternState -> Pair LexResult (Maybe TokenSpans))
   (intern_string : InternState -> List Nat -> Pair Nat InternState)
-  (parse_file : Nat -> List Token -> Nat -> ParseResult ParsedFile)
+  (parse_file : Nat -> List Token -> Nat -> ParseResult (Pair ParsedFile (Maybe (List ParsedSourceOccurrence))))
   (fuel : Nat) (st : InternState) (path : List Nat) (src : List Nat)
-  : UnitParse :=
+  (mapping : Either SourceOriginError (Maybe OriginalSourceMap))
+  : Pair UnitParse (Either SourceOriginError (List OwnedSourceOccurrence)) :=
   let canonical : List Nat := canon_path (Nil Nat) path in
   match intern_string st canonical with
   | MkPair pid st1 =>
-      match lex_go fuel src st1 (Nil Token) with
-      | LexMalformed st2 => UErr lex_malformed_err_code Z st2
-      | LexExhausted st2 => UErr lex_exhausted_err_code Z st2
+       match lex_go fuel src st1 with | MkPair lexical spans => match lexical with
+       | LexMalformed st2 => pipeline_unit_no_origins (UErr lex_malformed_err_code Z st2) mapping
+       | LexExhausted st2 => pipeline_unit_no_origins (UErr lex_exhausted_err_code Z st2) mapping
       | LexOk toks st2 =>
           match parse_file fuel toks Z with
-          | POk parsed _toks _pos => match parsed with
+           | POk captured _toks _pos => match captured with | MkPair parsed occurrences => match parsed with
               | MkParsedFile ds private_names =>
                 match canon_imports canonical intern_string st2 ds with
                 | MkPair ds' st3 =>
-                    UOk(mk_src_unit pid ds' private_names, st3)
+                     MkPair UnitParse (Either SourceOriginError (List OwnedSourceOccurrence))
+                       (UOk(mk_src_unit pid ds' private_names, st3))
+                       (source_origin_capture_rows pid ds ds' spans occurrences mapping)
                 end
-              end
-          | PErr p => UErr parse_err_code p st2
+               end end
+           | PErr p => pipeline_unit_no_origins (UErr parse_err_code p st2) mapping
           end
+       end end
+  end;
+
+def parse_unit
+  (lex_go : Nat -> List Nat -> InternState -> List Token -> LexResult)
+  (intern_string : InternState -> List Nat -> Pair Nat InternState)
+  (parse_file : Nat -> List Token -> Nat -> ParseResult ParsedFile)
+  (fuel : Nat) (st : InternState) (path : List Nat) (src : List Nat) : UnitParse :=
+  fst UnitParse (Either SourceOriginError (List OwnedSourceOccurrence))
+    (parse_unit_observed (pipeline_lex_unobserved lex_go) intern_string
+      (pipeline_parse_unobserved parse_file) fuel st path src
+      (Right SourceOriginError (Maybe OriginalSourceMap) (Nothing OriginalSourceMap)));
+
+def parse_unit_indexed
+  (lex_go : Nat -> List Nat -> LexerIntern -> List Token -> IndexedLexResult)
+  (parse_file : Nat -> List Token -> Nat -> ParseResult ParsedFile)
+  (fuel : Nat) (state : LexerIntern) (path : List Nat) (src : List Nat) : IndexedUnitParse :=
+  let canonical : List Nat := canon_path (Nil Nat) path in
+  match lexer_intern_string state canonical with
+  | MkPair pid initial =>
+      match lex_go fuel src initial (Nil Token) with
+      | IndexedLexMalformed final => IndexedUnitErr lex_malformed_err_code Z (lexer_intern_state final)
+      | IndexedLexExhausted final => IndexedUnitErr lex_exhausted_err_code Z (lexer_intern_state final)
+      | IndexedLexOk tokens final =>
+          finish_parse_unit LexerIntern IndexedUnitParse
+            (canon_imports_with LexerIntern canonical lexer_intern_string lexer_intern_state)
+            (fun (unit : SrcUnit) (indexed : LexerIntern) => IndexedUnitOk unit indexed)
+            (fun (pos : Nat) (indexed : LexerIntern) => IndexedUnitErr parse_err_code pos (lexer_intern_state indexed))
+            pid final (parse_file fuel tokens Z)
       end
   end;
 
@@ -341,32 +412,80 @@ def frontend_parse_error (files : List (Pair (List Nat) (List Nat)))
     | False => ErrCode code pos
     end;
 
+def pipeline_origin_file (retain : Bool) (path : List Nat)
+    (files : List (Pair (List Nat) (Either SourceOriginError (Maybe OriginalSourceMap))))
+    : Pair (Either SourceOriginError (Maybe OriginalSourceMap))
+        (List (Pair (List Nat) (Either SourceOriginError (Maybe OriginalSourceMap)))) :=
+  match retain with
+  | False => MkPair (Either SourceOriginError (Maybe OriginalSourceMap))
+      (List (Pair (List Nat) (Either SourceOriginError (Maybe OriginalSourceMap))))
+      (Right SourceOriginError (Maybe OriginalSourceMap) (Nothing OriginalSourceMap)) []
+  | True => match files with
+    | Nil => MkPair (Either SourceOriginError (Maybe OriginalSourceMap))
+        (List (Pair (List Nat) (Either SourceOriginError (Maybe OriginalSourceMap))))
+        (Left SourceOriginError (Maybe OriginalSourceMap) SourceOriginUnit) []
+    | Cons file rest => match file with | MkPair actual origin =>
+      MkPair (Either SourceOriginError (Maybe OriginalSourceMap))
+        (List (Pair (List Nat) (Either SourceOriginError (Maybe OriginalSourceMap))))
+        (match source_bytes_equal actual path with
+         | True => origin
+         | False => Left SourceOriginError (Maybe OriginalSourceMap) SourceOriginUnit
+         end) rest
+      end
+    end
+  end;
+
+def parse_units_observed (retain : Bool)
+  (lex_go : Nat -> List Nat -> InternState -> Pair LexResult (Maybe TokenSpans))
+  (intern_string : InternState -> List Nat -> Pair Nat InternState)
+  (parse_file : Nat -> List Token -> Nat -> ParseResult (Pair ParsedFile (Maybe (List ParsedSourceOccurrence))))
+  (fuel : Nat)
+  (initial : InternState) (input : List (Pair (List Nat) (List Nat)))
+  (origin_files : List (Pair (List Nat) (Either SourceOriginError (Maybe OriginalSourceMap))))
+  : Pair UnitsParse (Either SourceOriginError (List OwnedSourceOccurrence)) :=
+  (fix go (files : List (Pair (List Nat) (List Nat)))
+      (origins : List (Pair (List Nat) (Either SourceOriginError (Maybe OriginalSourceMap)))) (st : InternState)
+    : Pair UnitsParse (Either SourceOriginError (List OwnedSourceOccurrence)) :=
+    match files with
+    | Nil => MkPair UnitsParse (Either SourceOriginError (List OwnedSourceOccurrence))
+        (UsOk(Nil SrcUnit, st))
+        (match origins with
+         | Nil => Right SourceOriginError (List OwnedSourceOccurrence) []
+         | Cons _ _ => Left SourceOriginError (List OwnedSourceOccurrence) SourceOriginUnit
+         end)
+    | Cons f files' =>
+        match f with
+        | MkPair path src =>
+            match pipeline_origin_file retain path origins with | MkPair mapping next_origins =>
+            match parse_unit_observed lex_go intern_string parse_file fuel st path src mapping with
+            | MkPair parsed captured => match parsed with
+            | UErr c p stE =>
+                match frontend_parse_error ([f] : List (Pair(List Nat, List Nat))) c p with
+                | ErrCode code position => MkPair UnitsParse
+                    (Either SourceOriginError (List OwnedSourceOccurrence))
+                    (UsErr code position stE) captured
+                end
+            | UOk u st1 =>
+                match go files' next_origins st1 with | MkPair tail later =>
+                MkPair UnitsParse (Either SourceOriginError (List OwnedSourceOccurrence))
+                  (match tail with
+                   | UsErr c p stE => UsErr c p stE
+                   | UsOk us st2 => UsOk(Cons SrcUnit u us, st2)
+                   end)
+                  (source_origin_rows_append captured later)
+                end
+            end end end
+        end
+    end) input origin_files initial;
+
 def parse_units
   (lex_go : Nat -> List Nat -> InternState -> List Token -> LexResult)
   (intern_string : InternState -> List Nat -> Pair Nat InternState)
   (parse_file : Nat -> List Token -> Nat -> ParseResult ParsedFile)
-  (fuel : Nat)
-  (initial : InternState) (input : List (Pair (List Nat) (List Nat))) : UnitsParse :=
-  (fix go (files : List (Pair (List Nat) (List Nat))) (st : InternState)
-    : UnitsParse :=
-    match files with
-    | Nil => UsOk(Nil SrcUnit, st)
-    | Cons f files' =>
-        match f with
-        | MkPair path src =>
-            match parse_unit lex_go intern_string parse_file fuel st path src with
-            | UErr c p stE =>
-                match frontend_parse_error ([f] : List (Pair(List Nat, List Nat))) c p with
-                | ErrCode code position => UsErr code position stE
-                end
-            | UOk u st1 =>
-                match go files' st1 with
-                | UsErr c p stE => UsErr c p stE
-                | UsOk us st2 => UsOk(Cons SrcUnit u us, st2)
-                end
-            end
-        end
-    end) input initial;
+  (fuel : Nat) (initial : InternState) (input : List (Pair (List Nat) (List Nat))) : UnitsParse :=
+  fst UnitsParse (Either SourceOriginError (List OwnedSourceOccurrence))
+    (parse_units_observed False (pipeline_lex_unobserved lex_go) intern_string
+      (pipeline_parse_unobserved parse_file) fuel initial input []);
 
 -- Source hints refine only generic parser/lowering failures. A typed checker
 -- error already identifies its phase and declaration; scanning unrelated source
@@ -418,70 +537,207 @@ inductive FilesPrep : Type :=
   | FilesPrepOk : List (Pair (List Nat) (List Nat)) ->
       List (Pair (List Nat) ImpReg) -> FilesPrep;
 
-def preprocess_src
+def pipeline_records_unobserved
+    (records : List Nat -> ImpReg -> RecReg -> List Nat -> Pair RecReg (Pair ImpReg PrepResult))
+    (_retain : Bool) (path : List Nat) (aliases : ImpReg) (reg : RecReg) (source : List Nat)
+    : Pair (Pair RecReg (Pair ImpReg PrepResult)) (Either SourceOriginError (Maybe OriginalSourceMap)) :=
+  MkPair (Pair RecReg (Pair ImpReg PrepResult)) (Either SourceOriginError (Maybe OriginalSourceMap))
+    (records path aliases reg source)
+    (Right SourceOriginError (Maybe OriginalSourceMap) (Nothing OriginalSourceMap));
+
+def pipeline_src_origin_error (code : Nat) (detail : Nat)
+    : Pair SrcPrep (Either SourceOriginError (Maybe OriginalSourceMap)) :=
+  MkPair SrcPrep (Either SourceOriginError (Maybe OriginalSourceMap)) (SrcPrepErr code detail)
+    (Right SourceOriginError (Maybe OriginalSourceMap) (Nothing OriginalSourceMap));
+
+def preprocess_src_observed (retain : Bool)
   (preprocess_imports_reg : ImpReg -> List Nat -> Pair ImpReg ImpPrep)
-  (preprocess_records_reg : List Nat -> ImpReg -> RecReg -> List Nat ->
-      Pair RecReg (Pair ImpReg PrepResult))
-  (path : List Nat) (rec_reg : RecReg) (src : List Nat) : SrcPrep :=
+  (preprocess_records_reg : Bool -> List Nat -> ImpReg -> RecReg -> List Nat ->
+      Pair (Pair RecReg (Pair ImpReg PrepResult)) (Either SourceOriginError (Maybe OriginalSourceMap)))
+  (path : List Nat) (rec_reg : RecReg) (src : List Nat)
+  : Pair SrcPrep (Either SourceOriginError (Maybe OriginalSourceMap)) :=
   match preprocess_imports_reg empty_imp_reg_pl src with
   | MkPair imp_reg imp =>
       match imp with
       | ImpErr c p =>
           match eqNat c 5 with
-          | True => SrcPrepErr(lex_malformed_err_code, p)
-          | False => SrcPrepErr(add eighty c, p)
+          | True => pipeline_src_origin_error lex_malformed_err_code p
+          | False => pipeline_src_origin_error (add eighty c) p
           end
       | ImpOk src1 =>
-          match preprocess_records_reg (canon_path (Nil Nat) path)
+          match preprocess_records_reg retain (canon_path (Nil Nat) path)
               imp_reg rec_reg src1 with
-          | MkPair rec2 tagged => match tagged with
+          | MkPair observed origin => match observed with | MkPair rec2 tagged => match tagged with
               | MkPair aliases recp => match recp with
-                | PrepErr c p => SrcPrepErr(add seventy c, p)
-                | PrepOk src2 => SrcPrepOk rec2 aliases src2
+                | PrepErr c p => pipeline_src_origin_error (add seventy c) p
+                | PrepOk src2 => MkPair SrcPrep (Either SourceOriginError (Maybe OriginalSourceMap))
+                    (SrcPrepOk rec2 aliases src2)
+                    (match retain with
+                     | False => origin
+                     | True => match eqNat (length Nat src) (length Nat src1) with
+                       | False => Left SourceOriginError (Maybe OriginalSourceMap) SourceOriginCopyWidth
+                       | True => origin
+                       end
+                     end)
                 end
               end
-          end
+          end end
       end
   end;
 
--- Same order as the retired C preprocess_files: walk the list reversed
--- so the last unit is expanded first, then cons results back to the
--- original file order. RecReg follows that walk.
-def preprocess_file_list
+def preprocess_src
   (preprocess_imports_reg : ImpReg -> List Nat -> Pair ImpReg ImpPrep)
-  (preprocess_records_reg : List Nat -> ImpReg -> RecReg -> List Nat ->
-      Pair RecReg (Pair ImpReg PrepResult))
-  (files : List (Pair (List Nat) (List Nat))) : FilesPrep :=
+  (preprocess_records_reg : List Nat -> ImpReg -> RecReg -> List Nat -> Pair RecReg (Pair ImpReg PrepResult))
+  (path : List Nat) (rec_reg : RecReg) (src : List Nat) : SrcPrep :=
+  fst SrcPrep (Either SourceOriginError (Maybe OriginalSourceMap))
+    (preprocess_src_observed False preprocess_imports_reg
+      (pipeline_records_unobserved preprocess_records_reg) path rec_reg src);
+
+-- Expand the last unit first and carry the record registry through that walk.
+-- Return the expanded units in their original order.
+def preprocess_file_list_observed (retain : Bool)
+  (preprocess_imports_reg : ImpReg -> List Nat -> Pair ImpReg ImpPrep)
+  (preprocess_records_reg : Bool -> List Nat -> ImpReg -> RecReg -> List Nat ->
+      Pair (Pair RecReg (Pair ImpReg PrepResult)) (Either SourceOriginError (Maybe OriginalSourceMap)))
+  (files : List (Pair (List Nat) (List Nat)))
+  : Pair FilesPrep (List (Pair (List Nat) (Either SourceOriginError (Maybe OriginalSourceMap)))) :=
   (fix go (xs : List (Pair (List Nat) (List Nat))) (reg : RecReg)
       (acc : List (Pair (List Nat) (List Nat)))
-      (alias_acc : List (Pair (List Nat) ImpReg)) : FilesPrep :=
+      (alias_acc : List (Pair (List Nat) ImpReg))
+      (origin_acc : List (Pair (List Nat) (Either SourceOriginError (Maybe OriginalSourceMap))))
+      : Pair FilesPrep (List (Pair (List Nat) (Either SourceOriginError (Maybe OriginalSourceMap)))) :=
     match xs with
-    | Nil => FilesPrepOk acc alias_acc
+    | Nil => MkPair FilesPrep (List (Pair (List Nat) (Either SourceOriginError (Maybe OriginalSourceMap))))
+        (FilesPrepOk acc alias_acc) origin_acc
     | Cons f rest =>
         match f with
         | MkPair path src =>
-            match preprocess_src preprocess_imports_reg
+            match preprocess_src_observed retain preprocess_imports_reg
                     preprocess_records_reg path reg src with
-            | SrcPrepErr c p => FilesPrepErr c p
+            | MkPair prepared origin => match prepared with
+            | SrcPrepErr c p => MkPair FilesPrep
+                (List (Pair (List Nat) (Either SourceOriginError (Maybe OriginalSourceMap))))
+                (FilesPrepErr c p) []
             | SrcPrepOk reg2 aliases src2 =>
                 go rest reg2
                   (Cons (Pair(List Nat, List Nat))
                     (MkPair(List Nat, List Nat, path, src2)) acc)
                   (Cons (Pair(List Nat, ImpReg))
                     (MkPair(List Nat, ImpReg, path, aliases)) alias_acc)
-            end
+                  (match retain with
+                   | False => origin_acc
+                   | True => Cons (Pair (List Nat) (Either SourceOriginError (Maybe OriginalSourceMap)))
+                       (MkPair (List Nat) (Either SourceOriginError (Maybe OriginalSourceMap)) path origin) origin_acc
+                   end)
+            end end
         end
     end) (reverse(Pair(List Nat, List Nat), files)) empty_rec_reg_pl
-      (Nil (Pair(List Nat, List Nat))) (Nil (Pair(List Nat, ImpReg)));
+      (Nil (Pair(List Nat, List Nat))) (Nil (Pair(List Nat, ImpReg))) [];
+
+def preprocess_file_list
+  (preprocess_imports_reg : ImpReg -> List Nat -> Pair ImpReg ImpPrep)
+  (preprocess_records_reg : List Nat -> ImpReg -> RecReg -> List Nat -> Pair RecReg (Pair ImpReg PrepResult))
+  (files : List (Pair (List Nat) (List Nat))) : FilesPrep :=
+  fst FilesPrep (List (Pair (List Nat) (Either SourceOriginError (Maybe OriginalSourceMap))))
+    (preprocess_file_list_observed False preprocess_imports_reg
+      (pipeline_records_unobserved preprocess_records_reg) files);
 
 def import_err (A : Type) (c : Nat) (det : Nat) : CompResult A :=
   CErr(A, ErrCode(add 90 c, det));
 
 -- Packed multi-file stitcher. Returns the intern table beside the
 -- CompResult so the host can recover emit names (ouro_fe_last_intern).
+def pipeline_origin_stitch (A : Type) (original : A) (state : InternState)
+    (slots : List SourceModuleSlot) (origins : Either SourceOriginError (List OwnedSourceOccurrence))
+    : Pair (Pair A InternState)
+        (Either SourceOriginError (Pair (List SourceModuleSlot) (List OwnedSourceOccurrence))) :=
+  MkPair (Pair A InternState)
+    (Either SourceOriginError (Pair (List SourceModuleSlot) (List OwnedSourceOccurrence)))
+    (MkPair A InternState original state)
+    (match origins with
+     | Left error => Left SourceOriginError (Pair (List SourceModuleSlot) (List OwnedSourceOccurrence)) error
+     | Right rows => Right SourceOriginError (Pair (List SourceModuleSlot) (List OwnedSourceOccurrence))
+         (MkPair (List SourceModuleSlot) (List OwnedSourceOccurrence) slots rows)
+     end);
+
+def stitch_units_observed (retain_origin : Bool)
+  (retain_slots : Bool) (A : Type)
+   (lex_go : Nat -> List Nat -> InternState -> Pair LexResult (Maybe TokenSpans))
+  (intern_string : InternState -> List Nat -> Pair Nat InternState)
+   (parse_file : Nat -> List Token -> Nat -> ParseResult (Pair ParsedFile (Maybe (List ParsedSourceOccurrence))))
+  (resolve_imports : List SrcUnit -> Nat -> ResolveResult (List SourceDecl))
+  (compile : List (Pair (List Nat) (List Nat)) -> List Nat -> Nat -> InternState -> List SourceDecl -> List SourceModuleSlot -> A)
+  (reject : CompError -> A)
+  (preprocess_imports_reg : ImpReg -> List Nat -> Pair ImpReg ImpPrep)
+   (preprocess_records_reg : Bool -> List Nat -> ImpReg -> RecReg -> List Nat ->
+       Pair (Pair RecReg (Pair ImpReg PrepResult)) (Either SourceOriginError (Maybe OriginalSourceMap)))
+  (fuel : Nat) (root : List Nat) (files : List (Pair (List Nat) (List Nat)))
+   : Pair (Pair A InternState)
+       (Either SourceOriginError (Pair (List SourceModuleSlot) (List OwnedSourceOccurrence))) :=
+   match preprocess_file_list_observed retain_origin preprocess_imports_reg preprocess_records_reg files with
+   | MkPair prepared origin_files => match prepared with
+   | FilesPrepErr code detail => pipeline_origin_stitch A (reject (ErrCode code detail)) empty_intern []
+       (Right SourceOriginError (List OwnedSourceOccurrence) [])
+  | FilesPrepOk files1 alias_files =>
+       match parse_units_observed retain_origin lex_go intern_string parse_file fuel empty_intern files1 origin_files with
+       | MkPair parsed origins => match parsed with
+       | UsErr code detail state => pipeline_origin_stitch A (reject (ErrCode code detail)) state [] origins
+      | UsOk units state => match intern_string state (canon_path (Nil Nat) root) with
+        | MkPair root_id intern =>
+            match module_resolve_units_with_metadata retain_slots fuel units alias_files root_id intern with
+             | RErr code detail => pipeline_origin_stitch A (reject (ErrCode (add 90 code) detail)) intern [] origins
+            | ROk plan => match plan with | ModuleResolvedUnitsOf resolved slots =>
+              match resolved with | MkPair scoped resolved_state =>
+                match resolve_imports scoped root_id with
+                 | RErr code detail => pipeline_origin_stitch A
+                     (reject (ErrCode (add 90 code) detail)) resolved_state slots origins
+                 | ROk sources => pipeline_origin_stitch A
+                    (compile files1 (unit_decl_names scoped root_id) fuel resolved_state sources slots)
+                     resolved_state slots origins
+                end
+              end end
+            end
+        end
+       end end
+   end end;
+
+def stitch_units_with_metadata
+  (retain_slots : Bool) (A : Type)
+  (lex_go : Nat -> List Nat -> InternState -> List Token -> LexResult)
+  (intern_string : InternState -> List Nat -> Pair Nat InternState)
+  (parse_file : Nat -> List Token -> Nat -> ParseResult ParsedFile)
+  (resolve_imports : List SrcUnit -> Nat -> ResolveResult (List SourceDecl))
+  (compile : List (Pair (List Nat) (List Nat)) -> List Nat -> Nat -> InternState -> List SourceDecl -> List SourceModuleSlot -> A)
+  (reject : CompError -> A)
+  (preprocess_imports_reg : ImpReg -> List Nat -> Pair ImpReg ImpPrep)
+  (preprocess_records_reg : List Nat -> ImpReg -> RecReg -> List Nat -> Pair RecReg (Pair ImpReg PrepResult))
+  (fuel : Nat) (root : List Nat) (files : List (Pair (List Nat) (List Nat))) : Pair A InternState :=
+  fst (Pair A InternState)
+    (Either SourceOriginError (Pair (List SourceModuleSlot) (List OwnedSourceOccurrence)))
+    (stitch_units_observed False retain_slots A (pipeline_lex_unobserved lex_go) intern_string
+      (pipeline_parse_unobserved parse_file) resolve_imports compile reject
+      preprocess_imports_reg (pipeline_records_unobserved preprocess_records_reg) fuel root files);
+
+def stitch_units_with_result
+  (A : Type)
+  (lex_go : Nat -> List Nat -> InternState -> List Token -> LexResult)
+  (intern_string : InternState -> List Nat -> Pair Nat InternState)
+  (parse_file : Nat -> List Token -> Nat -> ParseResult ParsedFile)
+  (resolve_imports : List SrcUnit -> Nat -> ResolveResult (List SourceDecl))
+  (compile : List (Pair (List Nat) (List Nat)) -> List Nat -> Nat -> InternState -> List SourceDecl -> A)
+  (reject : CompError -> A)
+  (preprocess_imports_reg : ImpReg -> List Nat -> Pair ImpReg ImpPrep)
+  (preprocess_records_reg : List Nat -> ImpReg -> RecReg -> List Nat -> Pair RecReg (Pair ImpReg PrepResult))
+  (fuel : Nat) (root : List Nat) (files : List (Pair (List Nat) (List Nat)))
+  : Pair A InternState :=
+  stitch_units_with_metadata False A lex_go intern_string parse_file resolve_imports
+    (fun (prepared : List (Pair (List Nat) (List Nat))) (selected : List Nat)
+        (budget : Nat) (state : InternState) (sources : List SourceDecl)
+        (_slots : List SourceModuleSlot) => compile prepared selected budget state sources)
+    reject preprocess_imports_reg preprocess_records_reg fuel root files;
+
 def stitch_checked_units
-  (lex_go : Nat -> List Nat -> InternState -> List Token ->
-      LexResult)
+  (lex_go : Nat -> List Nat -> InternState -> List Token -> LexResult)
   (intern_string : InternState -> List Nat -> Pair Nat InternState)
   (parse_file : Nat -> List Token -> Nat -> ParseResult ParsedFile)
   (resolve_imports : List SrcUnit -> Nat -> ResolveResult (List Decl))
@@ -493,53 +749,152 @@ def stitch_checked_units
   (elaborate : Nat -> Surface -> List Nat -> CoreTerm)
   (check_module : Nat -> List Nat -> List FileItem -> DeclarationResult)
   (preprocess_imports_reg : ImpReg -> List Nat -> Pair ImpReg ImpPrep)
-  (preprocess_records_reg : List Nat -> ImpReg -> RecReg -> List Nat ->
-      Pair RecReg (Pair ImpReg PrepResult))
-  (fuel : Nat) (root : List Nat)
-  (files : List (Pair (List Nat) (List Nat)))
+  (preprocess_records_reg : List Nat -> ImpReg -> RecReg -> List Nat -> Pair RecReg (Pair ImpReg PrepResult))
+  (fuel : Nat) (root : List Nat) (files : List (Pair (List Nat) (List Nat)))
   : Pair (CompResult CheckedProgram) InternState :=
-  match preprocess_file_list preprocess_imports_reg preprocess_records_reg
-          files with
-  | FilesPrepErr c p =>
-      MkPair (CompResult CheckedProgram) InternState
-        (CErr(CheckedProgram, ErrCode c p)) empty_intern
-  | FilesPrepOk files1 alias_files =>
-      match parse_units lex_go intern_string parse_file fuel empty_intern
-              files1 with
-      | UsErr c p stE =>
-          MkPair (CompResult CheckedProgram) InternState
-            (CErr(CheckedProgram, ErrCode c p)) stE
-      | UsOk units st =>
-          match intern_string st (canon_path (Nil Nat) root) with
-          | MkPair rootId st2 =>
-              match module_resolve_units fuel units alias_files rootId st2 with
-              | RErr c det =>
-                  MkPair (CompResult CheckedProgram) InternState
-                    (import_err CheckedProgram c det) st2
-              | ROk plan =>
-                  match plan with
-                  | MkPair scoped st3 =>
-                      match resolve_imports scoped rootId with
-                      | RErr c det =>
-                          MkPair (CompResult CheckedProgram) InternState
-                            (import_err CheckedProgram c det) st3
-                      | ROk ds =>
-                          MkPair (CompResult CheckedProgram) InternState
-                            (remap_comp_files_for CheckedProgram False files1
-                              (compile_checked_from_decls desugar_file rewrite_declarations lower_expr_env2
-                                compile_program elaborate_surfaces elaborate check_module
-                                (unit_decl_names scoped rootId) fuel st3 ds))
-                            st3
+  stitch_units_with_result (CompResult CheckedProgram) lex_go intern_string parse_file
+    (fun (units : List SrcUnit) (entry : Nat) => match resolve_imports units entry with
+      | RErr code detail => RErr (List SourceDecl) code detail
+      | ROk decls => ROk (List SourceDecl) (source_decls_without_unit decls)
+      end)
+    (fun (prepared : List (Pair (List Nat) (List Nat))) (selected : List Nat)
+        (budget : Nat) (state : InternState) (sources : List SourceDecl) =>
+      remap_comp_files_for CheckedProgram False prepared
+        (compile_checked_from_decls desugar_file rewrite_declarations lower_expr_env2
+          compile_program elaborate_surfaces elaborate check_module
+          selected budget state (source_decl_values sources)))
+    (fun (error : CompError) => CErr CheckedProgram error)
+    preprocess_imports_reg preprocess_records_reg fuel root files;
+
+def stitch_checked_units_with_source_packet
+  (lex_go : Nat -> List Nat -> InternState -> List Token -> LexResult)
+  (intern_string : InternState -> List Nat -> Pair Nat InternState)
+  (parse_file : Nat -> List Token -> Nat -> ParseResult ParsedFile)
+  (resolve_imports : List SrcUnit -> Nat -> ResolveResult (List SourceDecl))
+  (desugar_file : List Decl -> List Decl)
+  (rewrite_declarations : Nat -> LowerEnv -> List Decl -> List Decl)
+  (lower_expr : LowerEnv -> Maybe Surface -> Expr -> LoweredSurface)
+  (compile_program : List (Pair Nat Surface) -> CompileProgramLocatedResult)
+  (elaborate_surfaces : Nat -> List (Pair Nat Surface) -> List (Pair Nat CoreTerm))
+  (elaborate : Nat -> Surface -> List Nat -> CoreTerm)
+  (check_module : Nat -> List Nat -> List FileItem -> DeclarationResult)
+  (preprocess_imports_reg : ImpReg -> List Nat -> Pair ImpReg ImpPrep)
+  (preprocess_records_reg : List Nat -> ImpReg -> RecReg -> List Nat -> Pair RecReg (Pair ImpReg PrepResult))
+  (fuel : Nat) (root : List Nat) (files : List (Pair (List Nat) (List Nat)))
+  : Pair (SourceResult CheckedSourcePacket) InternState :=
+  stitch_units_with_metadata True (SourceResult CheckedSourcePacket)
+    lex_go intern_string parse_file resolve_imports
+    (fun (_prepared : List (Pair (List Nat) (List Nat))) (selected : List Nat)
+        (budget : Nat) (state : InternState) (sources : List SourceDecl)
+        (slots : List SourceModuleSlot) =>
+      compile_checked_from_decls_with_source_packet desugar_file rewrite_declarations lower_expr
+        compile_program elaborate_surfaces elaborate check_module slots selected budget state sources)
+    (fun (error : CompError) => SourceErr CheckedSourcePacket (source_failure_unknown error))
+    preprocess_imports_reg preprocess_records_reg fuel root files;
+
+def stitch_checked_units_with_source_origins
+  (lex_go : Nat -> List Nat -> InternState -> Pair LexResult (Maybe TokenSpans))
+  (intern_string : InternState -> List Nat -> Pair Nat InternState)
+  (parse_file : Nat -> List Token -> Nat -> ParseResult (Pair ParsedFile (Maybe (List ParsedSourceOccurrence))))
+  (resolve_imports : List SrcUnit -> Nat -> ResolveResult (List SourceDecl))
+  (desugar_file : List Decl -> List Decl)
+  (rewrite_declarations : Nat -> LowerEnv -> List Decl -> List Decl)
+  (lower_expr : LowerEnv -> Maybe Surface -> Expr -> LoweredSurface)
+  (compile_program : List (Pair Nat Surface) -> CompileProgramLocatedResult)
+  (elaborate_surfaces : Nat -> List (Pair Nat Surface) -> List (Pair Nat CoreTerm))
+  (elaborate : Nat -> Surface -> List Nat -> CoreTerm)
+  (check_module : Nat -> List Nat -> List FileItem -> DeclarationResult)
+  (preprocess_imports_reg : ImpReg -> List Nat -> Pair ImpReg ImpPrep)
+  (preprocess_records_reg : Bool -> List Nat -> ImpReg -> RecReg -> List Nat ->
+      Pair (Pair RecReg (Pair ImpReg PrepResult)) (Either SourceOriginError (Maybe OriginalSourceMap)))
+  (fuel : Nat) (root : List Nat) (files : List (Pair (List Nat) (List Nat))) : SourceOriginCompilation :=
+  source_origin_compilation_finish
+    (stitch_units_observed True True (SourceResult CheckedSourcePacket)
+      lex_go intern_string parse_file resolve_imports
+      (fun (_prepared : List (Pair (List Nat) (List Nat))) (selected : List Nat)
+          (budget : Nat) (state : InternState) (sources : List SourceDecl)
+          (slots : List SourceModuleSlot) =>
+        compile_checked_from_decls_with_source_packet desugar_file rewrite_declarations lower_expr
+          compile_program elaborate_surfaces elaborate check_module slots selected budget state sources)
+      (fun (error : CompError) => SourceErr CheckedSourcePacket (source_failure_unknown error))
+      preprocess_imports_reg preprocess_records_reg fuel root files);
+
+-- @export stitch_checked_units_with_origin; @doc docs/tcb.md
+def stitch_checked_units_with_origin
+  (lex_go : Nat -> List Nat -> InternState -> List Token -> LexResult)
+  (intern_string : InternState -> List Nat -> Pair Nat InternState)
+  (parse_file : Nat -> List Token -> Nat -> ParseResult ParsedFile)
+  (resolve_imports : List SrcUnit -> Nat -> ResolveResult (List SourceDecl))
+  (desugar_file : List Decl -> List Decl)
+  (rewrite_declarations : Nat -> LowerEnv -> List Decl -> List Decl)
+  (lower_expr : LowerEnv -> Maybe Surface -> Expr -> LoweredSurface)
+  (compile_program : List (Pair Nat Surface) -> CompileProgramLocatedResult)
+  (elaborate_surfaces : Nat -> List (Pair Nat Surface) -> List (Pair Nat CoreTerm))
+  (elaborate : Nat -> Surface -> List Nat -> CoreTerm)
+  (check_module : Nat -> List Nat -> List FileItem -> DeclarationResult)
+  (preprocess_imports_reg : ImpReg -> List Nat -> Pair ImpReg ImpPrep)
+  (preprocess_records_reg : List Nat -> ImpReg -> RecReg -> List Nat -> Pair RecReg (Pair ImpReg PrepResult))
+  (fuel : Nat) (root : List Nat) (files : List (Pair (List Nat) (List Nat)))
+  : Pair (SourceResult CheckedProgram) InternState :=
+  stitch_units_with_result (SourceResult CheckedProgram) lex_go intern_string parse_file resolve_imports
+    (fun (_prepared : List (Pair (List Nat) (List Nat))) (selected : List Nat)
+        (budget : Nat) (state : InternState) (sources : List SourceDecl) =>
+      compile_checked_from_decls_with_origin desugar_file rewrite_declarations lower_expr
+        compile_program elaborate_surfaces elaborate check_module selected budget state sources)
+    (fun (error : CompError) => SourceErr CheckedProgram (source_failure_unknown error))
+    preprocess_imports_reg preprocess_records_reg fuel root files;
+
+def stitch_source_with_result
+  (A : Type)
+  (lex_go : Nat -> List Nat -> InternState -> List Token -> LexResult)
+  (parse_file : Nat -> List Token -> Nat -> ParseResult ParsedFile)
+  (compile : List Nat -> List Nat -> Nat -> InternState -> List SourceDecl -> A)
+  (reject : CompError -> A)
+  (preprocess_imports_reg : ImpReg -> List Nat -> Pair ImpReg ImpPrep)
+  (preprocess_records_reg : List Nat -> ImpReg -> RecReg -> List Nat -> Pair RecReg (Pair ImpReg PrepResult))
+  (fuel : Nat) (src : List Nat) : Pair A InternState :=
+  match preprocess_src preprocess_imports_reg preprocess_records_reg (Nil Nat) empty_rec_reg_pl src with
+  | SrcPrepErr code detail => MkPair A InternState (reject (ErrCode code detail)) empty_intern
+  | SrcPrepOk _ aliases prepared => match lex_go fuel prepared empty_intern (Nil Token) with
+      | LexMalformed state => MkPair A InternState (reject (ErrCode lex_malformed_err_code Z)) state
+      | LexExhausted state => MkPair A InternState (reject (ErrCode lex_exhausted_err_code Z)) state
+      | LexOk tokens state => match parse_file fuel tokens Z with
+          | PErr position => MkPair A InternState
+              (reject (apply_ergo (classify_ergo True prepared) (ErrCode parse_err_code position))) state
+          | POk parsed _ _ => match parsed with | MkParsedFile decls private_names =>
+              match module_source_guard fuel aliases state decls with
+              | RErr code detail => MkPair A InternState (reject (ErrCode (add 90 code) detail)) state
+              | ROk guarded => match aliases with | MkImpReg _ rules =>
+                  let names : List (List Nat) := imp_reg_names aliases in
+                  match orb(match names with | Nil => False | Cons _ _ => True end,
+                      module_has_imp_scopes rules) with
+                  | False => MkPair A InternState
+                      (compile prepared (decl_check_names guarded) fuel state
+                        (source_decls_without_unit guarded)) state
+                  | True => match intern_string state (Nil Nat) with
+                      | MkPair owner intern => match canon_imports (Nil Nat) intern_string intern guarded with
+                          | MkPair canonical next => match module_resolve_units fuel
+                              [mk_src_unit owner canonical private_names]
+                              [MkPair (List Nat) ImpReg (Nil Nat) aliases] owner next with
+                              | RErr code detail => MkPair A InternState (reject (ErrCode (add 90 code) detail)) next
+                              | ROk plan => match plan with | MkPair scoped resolved_state =>
+                                  match resolve_imports_with_sources scoped owner with
+                                  | RErr code detail => MkPair A InternState
+                                      (reject (ErrCode (add 90 code) detail)) resolved_state
+                                  | ROk sources => MkPair A InternState
+                                      (compile prepared (unit_decl_names scoped owner) fuel resolved_state sources)
+                                      resolved_state
+                                  end end
+                              end end
+                          end
                       end
-                  end
-              end
+                  end end
+              end end
           end
-      end
   end;
 
 def stitch_checked_source
-  (lex_go : Nat -> List Nat -> InternState -> List Token ->
-      LexResult)
+  (lex_go : Nat -> List Nat -> InternState -> List Token -> LexResult)
   (parse_file : Nat -> List Token -> Nat -> ParseResult ParsedFile)
   (desugar_file : List Decl -> List Decl)
   (rewrite_declarations : Nat -> LowerEnv -> List Decl -> List Decl)
@@ -549,90 +904,39 @@ def stitch_checked_source
   (elaborate : Nat -> Surface -> List Nat -> CoreTerm)
   (check_module : Nat -> List Nat -> List FileItem -> DeclarationResult)
   (preprocess_imports_reg : ImpReg -> List Nat -> Pair ImpReg ImpPrep)
-  (preprocess_records_reg : List Nat -> ImpReg -> RecReg -> List Nat ->
-      Pair RecReg (Pair ImpReg PrepResult))
-  (fuel : Nat) (src : List Nat)
-  : Pair (CompResult CheckedProgram) InternState :=
-  match preprocess_src preprocess_imports_reg preprocess_records_reg
-          (Nil Nat) empty_rec_reg_pl src with
-  | SrcPrepErr c p =>
-      MkPair (CompResult CheckedProgram) InternState
-        (CErr(CheckedProgram, ErrCode c p)) empty_intern
-  | SrcPrepOk _ aliases src1 =>
-      match lex_go fuel src1 empty_intern (Nil Token) with
-      | LexMalformed st =>
-          MkPair (CompResult CheckedProgram) InternState
-            (CErr CheckedProgram
-              (ErrCode lex_malformed_err_code Z)) st
-      | LexExhausted st =>
-          MkPair (CompResult CheckedProgram) InternState
-            (CErr CheckedProgram
-              (ErrCode lex_exhausted_err_code Z)) st
-      | LexOk toks st =>
-          match parse_file fuel toks Z with
-          | PErr p =>
-              MkPair (CompResult CheckedProgram) InternState
-                (CErr CheckedProgram
-                  (apply_ergo (classify_ergo True src1)
-                    (ErrCode parse_err_code p))) st
-          | POk parsed _toks _pos => match parsed with
-            | MkParsedFile ds private_names =>
-              match module_source_guard fuel aliases st ds with
-              | RErr code detail =>
-                  MkPair (CompResult CheckedProgram) InternState
-                    (import_err CheckedProgram code detail) st
-              | ROk guarded =>
-                  match aliases with
-                  | MkImpReg _ rules =>
-                    let names : List (List Nat) := imp_reg_names aliases in
-                    match orb(match names with
-                      | Nil => False | Cons _ _ => True end,
-                      module_has_imp_scopes rules) with
-                    | False => MkPair (CompResult CheckedProgram) InternState
-                        (remap_comp_src_for CheckedProgram False src1
-                          (compile_checked_from_decls desugar_file
-                            rewrite_declarations lower_expr_env2
-                            compile_program elaborate_surfaces elaborate check_module
-                            (decl_check_names guarded) fuel st guarded)) st
-                    | True =>
-                        match intern_string st (Nil Nat) with
-                        | MkPair owner st2 =>
-                            match canon_imports (Nil Nat) intern_string st2 guarded with
-                            | MkPair canonical st3 =>
-                                match module_resolve_units fuel
-                                    ([mk_src_unit owner canonical private_names] : List SrcUnit)
-                                    ([MkPair (List Nat) ImpReg (Nil Nat) aliases]
-                                      : List (Pair (List Nat) ImpReg)) owner st3 with
-                                | RErr code detail =>
-                                    MkPair (CompResult CheckedProgram) InternState
-                                      (import_err CheckedProgram code detail) st3
-                                | ROk plan => match plan with
-                                  | MkPair scoped st4 =>
-                                      match resolve_imports scoped owner with
-                                      | RErr code detail =>
-                                          MkPair (CompResult CheckedProgram) InternState
-                                            (import_err CheckedProgram code detail) st4
-                                      | ROk decls =>
-                                          MkPair (CompResult CheckedProgram) InternState
-                                            (remap_comp_src_for CheckedProgram False src1
-                                              (compile_checked_from_decls desugar_file
-                                                rewrite_declarations lower_expr_env2
-                                                compile_program elaborate_surfaces
-                                                elaborate check_module
-                                                (unit_decl_names scoped owner) fuel st4 decls))
-                                            st4
-                                      end
-                                  end
-                                end
-                            end
-                        end
-                    end
-                  end
-              end
-            end
-          end
-      end
-  end;
+  (preprocess_records_reg : List Nat -> ImpReg -> RecReg -> List Nat -> Pair RecReg (Pair ImpReg PrepResult))
+  (fuel : Nat) (src : List Nat) : Pair (CompResult CheckedProgram) InternState :=
+  stitch_source_with_result (CompResult CheckedProgram) lex_go parse_file
+    (fun (prepared : List Nat) (selected : List Nat) (budget : Nat)
+        (state : InternState) (sources : List SourceDecl) =>
+      remap_comp_src_for CheckedProgram False prepared
+        (compile_checked_from_decls desugar_file rewrite_declarations lower_expr_env2
+          compile_program elaborate_surfaces elaborate check_module
+          selected budget state (source_decl_values sources)))
+    (fun (error : CompError) => CErr CheckedProgram error)
+    preprocess_imports_reg preprocess_records_reg fuel src;
+
+-- @export stitch_checked_source_with_origin; @doc docs/tcb.md
+def stitch_checked_source_with_origin
+  (lex_go : Nat -> List Nat -> InternState -> List Token -> LexResult)
+  (parse_file : Nat -> List Token -> Nat -> ParseResult ParsedFile)
+  (desugar_file : List Decl -> List Decl)
+  (rewrite_declarations : Nat -> LowerEnv -> List Decl -> List Decl)
+  (lower_expr : LowerEnv -> Maybe Surface -> Expr -> LoweredSurface)
+  (compile_program : List (Pair Nat Surface) -> CompileProgramLocatedResult)
+  (elaborate_surfaces : Nat -> List (Pair Nat Surface) -> List (Pair Nat CoreTerm))
+  (elaborate : Nat -> Surface -> List Nat -> CoreTerm)
+  (check_module : Nat -> List Nat -> List FileItem -> DeclarationResult)
+  (preprocess_imports_reg : ImpReg -> List Nat -> Pair ImpReg ImpPrep)
+  (preprocess_records_reg : List Nat -> ImpReg -> RecReg -> List Nat -> Pair RecReg (Pair ImpReg PrepResult))
+  (fuel : Nat) (src : List Nat) : Pair (SourceResult CheckedProgram) InternState :=
+  stitch_source_with_result (SourceResult CheckedProgram) lex_go parse_file
+    (fun (_prepared : List Nat) (selected : List Nat) (budget : Nat)
+        (state : InternState) (sources : List SourceDecl) =>
+      compile_checked_from_decls_with_origin desugar_file rewrite_declarations lower_expr
+        compile_program elaborate_surfaces elaborate check_module selected budget state sources)
+    (fun (error : CompError) => SourceErr CheckedProgram (source_failure_unknown error))
+    preprocess_imports_reg preprocess_records_reg fuel src;
 
 def pipeline_compile_checked_units
   (lex_go : Nat -> List Nat -> InternState -> List Token ->
@@ -682,7 +986,7 @@ def pipeline_compile_checked_source
   | MkPair r _st => r
   end;
 
--- The packed C frontend consumes the explicit compatibility projection.
+-- Legacy source callers consume the explicit compatibility projection.
 -- Source-native compilation uses pipeline_compile_checked_source above.
 def stitch_source
   (lex_go : Nat -> List Nat -> InternState -> List Token -> LexResult)

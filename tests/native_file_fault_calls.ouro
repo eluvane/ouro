@@ -68,11 +68,10 @@ def file_fault_fixed_counts (base : Nat) (mode : Nat) (state : ManagedState)
               (fun (transferred : ManagedState) => lower_bind ManagedState ManagedState (startup_fault_stat base 40 (file_fault_conversion_calls mode) transferred)
                 (startup_fault_stat base 48 (file_fault_close_calls mode)))))));
 
-def file_fault_exit_checks (base : Nat) (mode : Nat) (state : ManagedState)
+def file_fault_exit_checks_expected (base : Nat) (mode : Nat) (expected : Nat) (state : ManagedState)
     : Either NativeLowerError ManagedState :=
-    let success : Bool := orb(eqNat mode 0, orb(eqNat mode 16, leb_nat 20 mode)) in
     lower_bind ManagedState ManagedState (managed_require_equal (MirUse 0)
-      (managed_bits(MirU32, match success with | True => 42 | False => 73 end)) state)
+      (managed_bits MirU32 expected) state)
       (fun (exited : ManagedState) => lower_bind ManagedState ManagedState (startup_fault_stat base 64 0 exited)
         (fun (released : ManagedState) => lower_bind ManagedState ManagedState (startup_fault_stat base 72 0 released)
           (fun (closed : ManagedState) => lower_bind ManagedResult ManagedState (startup_fault_load base 96 MirUSize closed)
@@ -91,6 +90,17 @@ def file_fault_exit_checks (base : Nat) (mode : Nat) (state : ManagedState)
                                     (fun (frees : ManagedResult) => match frees with | ManagedResultOf actual finished =>
                                       managed_require_equal actual total finished end) end)) end) end) end) end))));
 
+def file_fault_exit_checks (base : Nat) (mode : Nat) (state : ManagedState)
+    : Either NativeLowerError ManagedState :=
+    let success : Bool := orb(eqNat mode 0, orb(eqNat mode 16, leb_nat 20 mode)) in
+    file_fault_exit_checks_expected base mode (match success with | True => 42 | False => 73 end) state;
+
+def file_read_status_fault_exit_checks (base : Nat) (mode : Nat) (state : ManagedState)
+    : Either NativeLowerError ManagedState :=
+    let recovered : Bool := orb(andb(leb_nat 8 mode, leb_nat mode 11), eqNat mode 15) in
+    let success : Bool := orb(eqNat mode 0, orb(eqNat mode 16, recovered)) in
+    file_fault_exit_checks_expected base mode (match success with | True => 42 | False => 73 end) state;
+
 def file_fault_arguments (index : Nat) : List MirType :=
     match eqNat index 0 with | True => [MirUSize, MirUSize] | False =>
       match orb(eqNat index 1, orb(eqNat index 9, eqNat index 11)) with | True => [MirRawPtr] | False =>
@@ -101,11 +111,12 @@ def file_fault_arguments (index : Nat) : List MirType :=
                 match eqNat index 10 with | True => [MirU32]
                 | False => [MirRawPtr, MirRawPtr, MirUSize, MirRawPtr] end end end end end end end;
 
-def file_fault_wrapper (base : Nat) (mode : Nat) (index : Nat) (original : Nat)
+def file_fault_wrapper_with_exit (base : Nat) (mode : Nat)
+    (exit_checks : ManagedState -> Either NativeLowerError ManagedState) (index : Nat) (original : Nat)
     : Either NativeLowerError MirFunction :=
     let types : List MirType := file_fault_arguments index in
     let entered : ManagedState := ManagedStateOf 0 ([] : List MirFunction) ([] : List MirData)
-      ([] : List Nat) ([] : List Nat) (lower_empty_state (length MirType types)) in
+      ([] : List Nat) ([] : List Nat) (lower_empty_state (length MirType types)) NativeOriginsDisabled in
     let arguments : List MirValue := map MirLocal MirValue (fun (local : MirLocal) => match local with
       | MirLocalDef id _ => MirUse id end) (startup_fault_locals types) in
     let body : Either NativeLowerError ManagedResult := match eqNat index 0 with
@@ -118,7 +129,7 @@ def file_fault_wrapper (base : Nat) (mode : Nat) (index : Nat) (original : Nat)
             match orb(eqNat index 7, eqNat index 8) with | True => file_fault_transfer base mode original entered | False =>
               match eqNat index 9 with | True => file_fault_close base mode original entered | False =>
                 match eqNat index 11 with | True => startup_fault_collector base original entered | False =>
-                  lower_bind ManagedState ManagedResult (file_fault_exit_checks base mode entered)
+                  lower_bind ManagedState ManagedResult (exit_checks entered)
                     (fun (checked : ManagedState) => startup_fault_result MirU8 1
                       (managed_emit(MirCall(MirMayGc, Nothing Nat, MirDirect original, [MirUse 0] : List MirValue), checked)))
                 end end end end end end end end in
@@ -132,6 +143,18 @@ def file_fault_wrapper (base : Nat) (mode : Nat) (index : Nat) (original : Nat)
           (match exiting with | True => Nothing MirType | False => Just MirType result_type end) 0
           (lower_finish_blocks (match exiting with | True => MirTrap
             | False => MirReturn (Just MirValue value) end) (managed_flow after)) end end) body;
+
+def file_fault_wrapper (base : Nat) (mode : Nat) (index : Nat) (original : Nat)
+    : Either NativeLowerError MirFunction :=
+    file_fault_wrapper_with_exit base mode (file_fault_exit_checks base mode) index original;
+
+def file_read_status_fault_wrappers (base : Nat) (mode : Nat) (symbols : List Nat) : Either NativeLowerError (List MirFunction) :=
+    (fix build (remaining : List Nat) (index : Nat) : Either NativeLowerError (List MirFunction) :=
+      match remaining with | Nil => Right(NativeLowerError, List MirFunction, [] : List MirFunction)
+      | Cons original rest => lower_bind MirFunction (List MirFunction)
+          (file_fault_wrapper_with_exit base mode (file_read_status_fault_exit_checks base mode) index original)
+          (fun (wrapper : MirFunction) => lower_map (List MirFunction) (List MirFunction) (Cons MirFunction wrapper)
+            (build(rest, S index))) end) symbols 0;
 
 def file_fault_wrappers (base : Nat) (mode : Nat) (symbols : List Nat) : Either NativeLowerError (List MirFunction) :=
     (fix build (remaining : List Nat) (index : Nat) : Either NativeLowerError (List MirFunction) :=

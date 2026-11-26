@@ -88,14 +88,15 @@ def errCycle : Nat := S Z;
 def errMissing : Nat := 2;
 def errFuel : Nat := 3;
 
--- DFS resolve (fuel + Mode); mirrors import_resolve.js loadAbs without FS.
+-- A unit contributes declarations after its imports have finished.
 -- @bound(nodes <= 279)
 -- @bound(depth <= 48)
 -- @bound(allocs <= 107)
 -- @bound(stack <= 24)
 -- @bound(steps <= 118)
 -- @bound(cyclo <= 48)
-def run : Nat -> List SrcUnit -> RMode -> ResolveResult St :=
+def resolve_import_graph (collect : List Decl -> List Decl -> List Decl)
+    : Nat -> List SrcUnit -> RMode -> ResolveResult St :=
   fix run (fuel : Nat) (units : List SrcUnit) (m : RMode) : ResolveResult St :=
     match fuel with
     | Z =>
@@ -132,7 +133,7 @@ def run : Nat -> List SrcUnit -> RMode -> ResolveResult St :=
                     ROk St
                       (MkSt
                         (Cons Nat path imp)
-                        (append Decl acc (localsOf allDecls)))
+                        (collect acc allDecls))
                 end
             | Cons d rest =>
                 let nextMode : RMode := MImports path rest allDecls stack st in
@@ -151,6 +152,96 @@ def run : Nat -> List SrcUnit -> RMode -> ResolveResult St :=
         end
     end;
 
+inductive SourceSt : Type :=
+  | SourceStOf : List Nat -> List SourceDecl -> SourceSt;
+
+inductive SourceRMode : Type :=
+  | SourceVisit : Pair Nat (List Nat) -> SourceSt -> SourceRMode
+  | SourceImports : Nat -> List Decl -> List Decl -> List Nat -> SourceSt -> SourceRMode;
+
+-- Ownership is attached when the same DFS appends a unit's local declarations.
+-- @bound(nodes <= 279)
+-- @bound(depth <= 48)
+-- @bound(allocs <= 107)
+-- @bound(stack <= 24)
+-- @bound(steps <= 118)
+-- @bound(cyclo <= 48)
+def run_with_sources : Nat -> List SrcUnit -> SourceRMode -> ResolveResult SourceSt :=
+  fix run (fuel : Nat) (units : List SrcUnit) (mode : SourceRMode) : ResolveResult SourceSt :=
+    match fuel with
+    | Z => match mode with
+        | SourceVisit visiting _ => match visiting with | MkPair path _ => RErr SourceSt errFuel path end
+        | SourceImports path _ _ _ _ => RErr SourceSt errFuel path
+        end
+    | S fuel' => match mode with
+        | SourceVisit visiting state => match visiting with | MkPair path stack => match state with
+            | SourceStOf imported _ => match memNat path imported with
+                | True => ROk SourceSt state
+                | False => match memNat path stack with
+                    | True => RErr SourceSt errCycle path
+                    | False => match findUnit path units with
+                        | None => RErr SourceSt errMissing path
+                        | Some decls => run fuel' units
+                            (SourceImports path (filter Decl isImport decls) decls
+                              (Cons Nat path stack) state)
+                        end
+                    end
+                end
+            end end
+        | SourceImports path remaining all_decls stack state => match remaining with
+            | Nil => match state with
+                | SourceStOf imported acc => ROk SourceSt
+                    (SourceStOf (Cons Nat path imported)
+                      (append SourceDecl acc
+                        (map Decl SourceDecl
+                          (fun (decl : Decl) => SourceDeclOf (Just Nat path) decl)
+                          (localsOf all_decls))))
+                end
+            | Cons decl rest => match importDeclPath decl with
+                | Some dependency => match run fuel' units
+                    (SourceVisit (MkPair Nat (List Nat) dependency stack) state) with
+                    | RErr code detail => RErr SourceSt code detail
+                    | ROk next => run fuel' units (SourceImports path rest all_decls stack next)
+                    end
+                | None => run fuel' units (SourceImports path rest all_decls stack state)
+                end
+            end
+        end
+    end;
+
+def source_state_of (state : St) : SourceSt :=
+  match state with
+  | MkSt paths decls => SourceStOf paths (source_decls_without_unit decls)
+  end;
+
+-- @bound(nodes <= 279)
+-- @bound(depth <= 48)
+-- @bound(allocs <= 107)
+-- @bound(stack <= 24)
+-- @bound(steps <= 118)
+-- @bound(cyclo <= 48)
+def run (fuel : Nat) (units : List SrcUnit) (mode : RMode) : ResolveResult St :=
+  let source_mode : SourceRMode := match mode with
+    | MVisit path stack state =>
+        SourceVisit (MkPair Nat (List Nat) path stack) (source_state_of state)
+    | MImports path remaining decls stack state =>
+        SourceImports path remaining decls stack (source_state_of state)
+    end in
+  match run_with_sources fuel units source_mode with
+  | RErr code detail => RErr St code detail
+  | ROk source_state => match source_state with
+    | SourceStOf paths decls => ROk St (MkSt paths (source_decl_values decls))
+    end
+  end;
+
+def resolve_imports_with_sources_fuel (fuel : Nat) (units : List SrcUnit) (entry : Nat)
+    : ResolveResult (List SourceDecl) :=
+  match run_with_sources fuel units
+      (SourceVisit (MkPair Nat (List Nat) entry (Nil Nat)) (SourceStOf (Nil Nat) (Nil SourceDecl))) with
+  | RErr code detail => RErr (List SourceDecl) code detail
+  | ROk state => match state with | SourceStOf _ decls => ROk (List SourceDecl) decls end
+  end;
+
 -- @bound(nodes <= 69)
 -- @bound(depth <= 14)
 -- @bound(allocs <= 24)
@@ -159,13 +250,10 @@ def run : Nat -> List SrcUnit -> RMode -> ResolveResult St :=
 -- @bound(cyclo <= 8)
 -- @minimal
 def resolve_imports_fuel (fuel : Nat) (units : List SrcUnit) (entry : Nat) : ResolveResult (List Decl) :=
-    match run fuel units (MVisit(entry, Nil Nat, MkSt(Nil Nat, Nil Decl))) with
-    | ROk st =>
-        match st with
-        | MkSt _ decls => ROk(List Decl, decls)
-        end
-    | RErr c det => RErr (List Decl) c det
-    end;
+  match resolve_imports_with_sources_fuel fuel units entry with
+  | RErr code detail => RErr (List Decl) code detail
+  | ROk decls => ROk (List Decl) (source_decl_values decls)
+  end;
 
 def resolve_imports_cap : Nat := 256;
 
@@ -177,17 +265,38 @@ def resolve_imports_cap : Nat := 256;
 -- @bound(cyclo <= 4)
 -- @minimal
 def resolve_imports (units : List SrcUnit) (entry : Nat) : ResolveResult (List Decl) :=
-    resolve_imports_fuel resolve_imports_cap units entry;
+  resolve_imports_fuel resolve_imports_cap units entry;
 
--- Reuse the same cycle/missing-unit traversal for source-module ownership.
--- The path list contains each reached canonical unit once.
+-- @entry resolve_imports_with_sources
+def resolve_imports_with_sources (units : List SrcUnit) (entry : Nat)
+    : ResolveResult (List SourceDecl) :=
+  resolve_imports_with_sources_fuel resolve_imports_cap units entry;
+
+-- Path-only callers retain the same graph steps without accumulating declarations.
+inductive ImportPathMode : Type :=
+  | ImportPathVisit : Nat -> List Nat -> List Nat -> ImportPathMode
+  | ImportPathImports : Nat -> List Decl -> List Nat -> List Nat -> ImportPathMode;
+
+def run_import_paths (fuel : Nat) (units : List SrcUnit) (mode : ImportPathMode)
+    : ResolveResult (List Nat) :=
+  let graph_mode : RMode := match mode with
+    | ImportPathVisit path stack imported => MVisit path stack (MkSt imported (Nil Decl))
+    | ImportPathImports path remaining stack imported =>
+        MImports path remaining (Nil Decl) stack (MkSt imported (Nil Decl))
+    end in
+  match resolve_import_graph (fun (acc : List Decl) (_ : List Decl) => acc) fuel units graph_mode with
+  | RErr code detail => RErr (List Nat) code detail
+  | ROk state => match state with | MkSt paths _ => ROk (List Nat) paths end
+  end;
+
+def resolve_import_paths_fuel (fuel : Nat) (units : List SrcUnit) (entry : Nat)
+    : ResolveResult (List Nat) :=
+  match run_import_paths fuel units (ImportPathVisit entry (Nil Nat) (Nil Nat)) with
+  | RErr code detail => RErr (List Nat) code detail
+  | ROk paths => ROk (List Nat) (reverse Nat paths)
+  end;
+
+-- The path list contains each reached canonical unit once, in dependency order.
 def resolve_import_paths (units : List SrcUnit) (entry : Nat)
     : ResolveResult (List Nat) :=
-  match run resolve_imports_cap units
-      (MVisit(entry, Nil Nat, MkSt(Nil Nat, Nil Decl))) with
-  | RErr code detail => RErr (List Nat) code detail
-  | ROk state =>
-      match state with
-      | MkSt paths _ => ROk (List Nat) (reverse Nat paths)
-      end
-  end;
+  resolve_import_paths_fuel resolve_imports_cap units entry;

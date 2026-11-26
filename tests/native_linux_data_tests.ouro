@@ -1,0 +1,225 @@
+import "native_sysv_fixtures.ouro",
+  "native_elf_fixtures.ouro",
+  "../compiler/native/diagnostics.ouro",
+  "../std/test.ouro";
+
+def linux_data_fixture_objects : List MirData :=
+    [MirDataDef 7 False [41,0,0,0], MirDataDef 8 True [0,0,0,0],
+     MirDataDef 9 False [1,0,0,0]];
+
+def linux_data_fixture_entry : MirFunction :=
+    sysv_fixture_body 1 []
+      [MirLocalDef 0 MirRawPtr, MirLocalDef 1 MirRawPtr, MirLocalDef 2 MirRawPtr,
+       MirLocalDef 3 MirU32, MirLocalDef 4 MirU32, MirLocalDef 5 MirU32]
+      (Just MirType MirU32)
+      [MirAddress 0 7, MirLoad 3 (MirUse 0) (codegen_disp 0),
+       MirAddress 1 9, MirLoad 4 (MirUse 1) (codegen_disp 0),
+       MirBinaryOp 5 MirAdd (MirUse 3) (MirUse 4), MirAddress 2 8,
+       MirStore (MirUse 2) (codegen_disp 0) (MirUse 5),
+       MirLoad 5 (MirUse 2) (codegen_disp 0)]
+      (MirReturn (Just MirValue (MirUse 5)));
+
+def linux_data_fixture_program (function : MirFunction) (objects : List MirData) : MirProgram :=
+    MirProgramDef [function] objects [] 1;
+
+def linux_data_fixture_rw42 : MirProgram :=
+    linux_data_fixture_program linux_data_fixture_entry linux_data_fixture_objects;
+
+def linux_data_fixture_single (writable : Bool) : MirProgram :=
+    linux_data_fixture_program
+      (sysv_fixture_body 1 [] [MirLocalDef 0 MirRawPtr, MirLocalDef 1 MirU32]
+        (Just MirType MirU32)
+        (append MirInstruction [MirAddress 0 7]
+          (append MirInstruction
+            (match writable with | False => []
+             | True => [MirStore (MirUse 0) (codegen_disp 0) (sysv_fixture_word MirU32 42)] end)
+            [MirLoad 1 (MirUse 0) (codegen_disp 0)]))
+        (MirReturn (Just MirValue (MirUse 1))))
+      [MirDataDef 7 writable (match writable with | True => [0,0,0,0] | False => [42,0,0,0] end)];
+
+def linux_data_fixture_ro_write : MirProgram :=
+    linux_data_fixture_program
+      (sysv_fixture_body 1 [] [MirLocalDef 0 MirRawPtr] (Just MirType MirU32)
+        [MirAddress 0 7, MirStore (MirUse 0) (codegen_disp 0) (sysv_fixture_word MirU32 42)]
+        (MirReturn (Just MirValue (sysv_fixture_word MirU32 0))))
+      [MirDataDef 7 False [0,0,0,0]];
+
+def linux_data_fixture_rw_execute : MirProgram :=
+    linux_data_fixture_program
+      (sysv_fixture_body 1 [] [MirLocalDef 0 MirRawPtr, MirLocalDef 1 MirU32]
+        (Just MirType MirU32)
+        [MirAddress 0 7, MirCall MirMayGc (Just Nat 1)
+          (MirIndirect (MirSignatureOf [] (Just MirType MirU32)) (MirUse 0)) []]
+        (MirReturn (Just MirValue (MirUse 1)))) [MirDataDef 7 True [195]];
+
+def linux_data_test_pe_error (error : PeError) : String :=
+    match error with
+    | PeInvalidByte value => str_concat "byte:" (str_of_nat value)
+    | PeDuplicateSymbol id => str_concat "duplicate:" (str_of_nat id)
+    | PeMissingSymbol id => str_concat "missing:" (str_of_nat id)
+    | PeInvalidSymbol id => str_concat "symbol:" (str_of_nat id)
+    | PeInvalidFixup offset => str_concat "invalid:" (str_of_nat offset)
+    | PeNonzeroFixup offset => str_concat "nonzero:" (str_of_nat offset)
+    | PeImageTooLarge => "size" | PeEmptyText => "empty" | PeInvalidName => "name"
+    | PeDuplicateLibrary => "library" | PeDuplicateImport _ => "duplicate-import"
+    | PeMissingImport _ => "missing-import" | PeEmptyLibrary => "empty-library"
+    | PeUnorderedFixup _ => "unordered" | PeRelativeOverflow _ => "relative"
+    | PeMissingEntry _ => "entry" | PeInvalidFunction _ => "function"
+    | PeUnorderedFunction _ => "function-order" | PeUnsupportedFrame _ => "frame"
+    | PeStackProbeRequired _ => "probe" | PePrologMismatch _ => "prolog"
+    | PeInstructionError _ => "instruction" end;
+
+def linux_data_test_error_text (error : LinuxCodegenError) : String :=
+    match error with
+    | LinuxMirRejected problem => managed_driver_error (NativeMirError problem)
+    | LinuxImportsUnsupported _ => "imports" | LinuxDataUnsupported _ => "data"
+    | LinuxManagedTypeUnsupported id => str_concat "managed-type:" (str_of_nat id)
+    | LinuxOperationUnsupported id => str_concat "operation:" (str_of_nat id)
+    | LinuxSignatureUnsupported _ => "signature" | LinuxSysvRejected _ _ => "sysv"
+    | LinuxNativeRejected _ => "encoding"
+    | LinuxFixupRejected problem => str_concat "fixup:" (linux_data_test_pe_error problem)
+    | LinuxElfRejected problem => match problem with
+      | ElfEmptyText => "elf:empty" | ElfImageTooLarge => "elf:size"
+      | ElfInvalidEntry _ => "elf:entry" | ElfBytesRejected _ => "elf:byte" end end;
+
+def linux_data_test_error (name : String) (expected : String)
+    (result : Either LinuxCodegenError (List Nat)) : Test :=
+    match result with
+    | Left error => assert_eq name (linux_data_test_error_text error) expected
+    | Right _ => test_fail name "invalid input accepted" end;
+
+def linux_data_test_segment : List Nat -> Nat -> Nat -> Nat -> Nat -> Bool :=
+    elf_test_load_segment;
+
+def linux_data_test_storage (bytes : List Nat) : Bool :=
+    andb (eq_nat (length Nat bytes) 8200)
+      (andb (eq_nat (elf_test_read_word bytes 56 2) 4)
+        (andb (eq_nat (elf_test_read_word bytes 24 8) (add elf_image_base 288))
+          (andb (eq_nat (elf_test_read_word bytes 68 4) 5)
+            (andb (linux_data_test_segment bytes 120 4 4096 16)
+              (andb (linux_data_test_segment bytes 176 6 8192 8)
+                (andb (pe_bytes_equal (take Nat 56 (drop Nat 232 bytes)) elf_stack_segment)
+                  (andb (pe_bytes_equal (take Nat 16 (drop Nat 4096 bytes))
+                    [41,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0])
+                    (pe_bytes_equal (drop Nat 8192 bytes) [0,0,0,0,0,0,0,0]))))))));
+
+def linux_data_test_produced (name : String) (program : MirProgram) : Test :=
+    match linux_codegen_program mir_default_limits program with
+    | Left error => test_fail name (linux_data_test_error_text error)
+    | Right bytes => assert_true name (linux_data_test_storage bytes) end;
+
+def linux_data_test_single (writable : Bool) : Bool :=
+    match linux_codegen_program mir_default_limits (linux_data_fixture_single writable) with
+    | Left _ => False | Right bytes =>
+      andb (eq_nat (length Nat bytes) 4104)
+        (andb (eq_nat (elf_test_read_word bytes 56 2) 3)
+          (andb (eq_nat (elf_test_read_word bytes 24 8) (add elf_image_base 232))
+            (andb (linux_data_test_segment bytes 120 (match writable with | True => 6 | False => 4 end) 4096 8)
+              (andb (pe_bytes_equal (take Nat 56 (drop Nat 176 bytes)) elf_stack_segment)
+                (pe_bytes_equal (drop Nat 4096 bytes)
+                  (match writable with | True => [0,0,0,0,0,0,0,0] | False => [42,0,0,0,0,0,0,0] end)))))) end;
+
+def linux_data_test_vectors : Bool :=
+    match linux_finish_data_image linux_data_fixture_objects (CodegenEncodedParts [] [] [])
+      (LinuxTextParts [72,141,5,0,0,0,0,72,141,5,0,0,0,0,72,141,5,0,0,0,0,195] []
+        [PeRel32 PeText 3 7 (PeSymbolTarget 7), PeRel32 PeText 10 14 (PeSymbolTarget 9),
+         PeRel32 PeText 17 21 (PeSymbolTarget 8)]) with
+    | Left _ => False | Right bytes => andb (linux_data_test_storage bytes)
+        (pe_bytes_equal (take Nat 22 (drop Nat 288 bytes))
+          [72,141,5,217,14,0,0,72,141,5,218,14,0,0,72,141,5,203,30,0,0,195]) end;
+
+def linux_data_test_legacy : Bool :=
+    let program : MirProgram := sysv_fixture_program [sysv_fixture_entry] in
+    match linux_start 1 with | Left _ => False | Right start =>
+      let base : Nat := match start with | CodegenEncodedParts prefix _ _ => length Nat prefix end in
+      match linux_functions program [sysv_fixture_entry] base with | Left _ => False | Right text =>
+        match linux_finish_image start text with | Left _ => False | Right expected =>
+          match linux_codegen_program mir_default_limits program with
+          | Left _ => False | Right actual => pe_bytes_equal actual expected end end end end;
+
+def linux_data_test_link (bytes : List Nat) (fixups : List PeFixup)
+    : Either LinuxCodegenError (List Nat) :=
+    linux_finish_data_image [MirDataDef 7 False [42]] (CodegenEncodedParts [] [] [])
+      (LinuxTextParts bytes [] fixups);
+
+def linux_data_test_laws : List Test :=
+    [linux_data_test_produced "linux-data/MIR-address-load-store-R-RW" linux_data_fixture_rw42,
+     assert_true "linux-data/readonly-only-checked-producer" (linux_data_test_single False),
+     assert_true "linux-data/writable-only-checked-producer" (linux_data_test_single True),
+     assert_true "linux-data/interleaved-aligned-symbol-independent-rel32-vectors" linux_data_test_vectors,
+     assert_true "linux-data/empty-data-complete-old-image" linux_data_test_legacy,
+     linux_data_test_error "linux-data/invalid-byte-before-encoding" "mir:data:7"
+       (linux_codegen_program mir_default_limits
+         (linux_data_fixture_program sysv_fixture_entry [MirDataDef 7 False [256]])),
+     linux_data_test_error "linux-data/empty-object-before-encoding" "mir:data:7"
+       (linux_codegen_program mir_default_limits
+         (linux_data_fixture_program sysv_fixture_entry [MirDataDef 7 False []])),
+     linux_data_test_error "linux-data/duplicate-across-R-RW" "mir:symbol:7"
+       (linux_codegen_program mir_default_limits
+         (linux_data_fixture_program sysv_fixture_entry [MirDataDef 7 False [42],MirDataDef 7 True [0]])),
+     linux_data_test_error "linux-data/duplicate-function-data" "mir:symbol:1"
+       (linux_codegen_program mir_default_limits
+         (linux_data_fixture_program sysv_fixture_entry [MirDataDef 1 False [42]])),
+     linux_data_test_error "linux-data/missing-address-symbol-before-encoding" "mir:unknown:99"
+       (linux_codegen_program mir_default_limits
+         (linux_data_fixture_program
+           (sysv_fixture_body 1 [] [MirLocalDef 0 MirRawPtr] (Just MirType MirU32)
+             [MirAddress 0 99] (MirReturn (Just MirValue (sysv_fixture_word MirU32 42))))
+           [MirDataDef 7 False [42]])),
+     linux_data_test_error "linux-data/data-byte-budget-remains-strict" "mir:resource"
+       (linux_codegen_program (MirLimitsWith 4096 0 4096)
+         (linux_data_fixture_program sysv_fixture_entry [MirDataDef 7 False [42]])),
+     linux_data_test_error "linux-data/valid-data-does-not-admit-imports" "imports"
+       (linux_codegen_program mir_default_limits
+         (MirProgramDef [sysv_fixture_entry] [MirDataDef 7 False [42]]
+           [MirLibraryDef [108,105,98]
+             [MirExternDef MirNoGc 8 [102,110] (MirSignatureOf [] (Nothing MirType))]] 1)),
+     linux_data_test_error "linux-data/valid-data-does-not-admit-managed-locals" "managed-type:7"
+       (linux_codegen_program mir_default_limits
+         (linux_data_fixture_program
+           (sysv_fixture_body 1 [] [MirLocalDef 7 MirManagedPtr] (Just MirType MirU32) []
+             (MirReturn (Just MirValue (sysv_fixture_word MirU32 42)))) [MirDataDef 8 False [42]])),
+     linux_data_test_error "linux-data/valid-data-does-not-admit-managed-context" "operation:1"
+       (linux_codegen_program mir_default_limits
+         (linux_data_fixture_program
+           (sysv_fixture_body 1 [] [MirLocalDef 0 MirRawPtr] (Just MirType MirU32)
+             [MirManagedContext 0] (MirReturn (Just MirValue (sysv_fixture_word MirU32 42))))
+           [MirDataDef 7 False [42]])),
+     linux_data_test_error "linux-data/missing-text-fixup-target" "fixup:missing:99"
+       (linux_data_test_link [0,0,0,0] [PeRel32 PeText 0 4 (PeSymbolTarget 99)]),
+     linux_data_test_error "linux-data/import-fixup-remains-unsupported" "fixup:invalid:0"
+       (linux_data_test_link [0,0,0,0] [PeRel32 PeText 0 4 (PeImportTarget 7)]),
+     linux_data_test_error "linux-data/absolute-fixup-remains-unsupported" "fixup:invalid:0"
+       (linux_data_test_link [0,0,0,0,0,0,0,0] [PeVa64 PeText 0 (PeSymbolTarget 7)]),
+     linux_data_test_error "linux-data/PE-RVA-fixup-remains-unsupported" "fixup:invalid:0"
+       (linux_data_test_link [0,0,0,0] [PeRva32 PeText 0 (PeSymbolTarget 7)]),
+     linux_data_test_error "linux-data/data-section-patch-remains-unsupported" "fixup:invalid:0"
+       (linux_data_test_link [195] [PeRel32 PeReadOnly 0 4 (PeSymbolTarget 7)]),
+     linux_data_test_error "linux-data/nonzero-slot-precedes-missing-target" "fixup:nonzero:0"
+       (linux_data_test_link [1,0,0,0] [PeRel32 PeText 0 4 (PeSymbolTarget 99)])];
+
+def linux_data_fixture_named (name : String) : Maybe MirProgram :=
+    match str_eq name "rw42" with | True => Just MirProgram linux_data_fixture_rw42
+    | False => match str_eq name "ro-only" with | True => Just MirProgram (linux_data_fixture_single False)
+      | False => match str_eq name "rw-only" with | True => Just MirProgram (linux_data_fixture_single True)
+        | False => match str_eq name "ro-write" with | True => Just MirProgram linux_data_fixture_ro_write
+          | False => match str_eq name "rw-execute" with | True => Just MirProgram linux_data_fixture_rw_execute
+            | False => Nothing MirProgram end end end end end;
+
+def linux_data_test_emit (name : String) : IO Unit :=
+    match linux_data_fixture_named name with
+    | Nothing => do eprintln (str_concat "LINUX_DATA_ERROR unknown-image:" name); exit 2
+    | Just program => match linux_codegen_program mir_default_limits program with
+      | Left error => do eprintln (str_cat4 "LINUX_DATA_ERROR " name ":" (linux_data_test_error_text error)); exit 1
+      | Right bytes => println (str_join "," (map Nat String str_of_nat bytes)) end end;
+
+-- @entry main
+def main : IO Unit :=
+    do let! arguments := argv;
+       match eq_nat (length String arguments) 1 with
+       | True => test_run linux_data_test_laws
+       | False => match andb (eq_nat (length String arguments) 3)
+           (str_eq (nth String "" 1 arguments) "--image") with
+         | True => linux_data_test_emit (nth String "" 2 arguments)
+         | False => do eprintln "usage: native_linux_data_tests [--image rw42|ro-only|rw-only|ro-write|rw-execute]"; exit 2
+         end end;

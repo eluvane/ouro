@@ -2,6 +2,7 @@
 -- Forged records below are rejection probes for the public checked boundary.
 import "native_fast_nat_fixtures.ouro",
   "../compiler/native/managed_source.ouro",
+  "../std/collections.ouro",
   "../std/io.ouro",
   "compiler_program_lookup.ouro",
   "native_nat_test_support.ouro";
@@ -46,16 +47,13 @@ def fast_nat_renumbered : Bool :=
 -- Mutants are deliberately untrusted inputs to the recognizer. The source
 -- program supplying each original body was checked immediately above it.
 def fast_nat_change_fix (mode : Nat) (body : CoreTerm) : CoreTerm :=
-    match body with
-    | CFix name argument arity typ inner =>
-        match eqNat mode 0 with
-        | True => CFix name (S argument) arity typ inner
-        | False => match eqNat mode 1 with
-            | True => CFix name argument (S arity) typ inner
-            | False => CFix (S name) argument arity typ inner end end
-    | CRel _ => body | CConst _ => body | CInd _ => body | CConstruct _ _ _ => body
-    | CSort _ => body | CPi _ _ => body | CLam _ _ => body | CApp _ _ => body
-    | CLetIn _ _ _ => body | CCase _ _ _ _ => body | CStrLit _ _ => body | CStrBytes _ _ => body end;
+    if let CFix name argument arity typ inner := body then
+      match eqNat mode 0 with
+      | True => CFix name (S argument) arity typ inner
+      | False => match eqNat mode 1 with
+          | True => CFix name argument (S arity) typ inner
+          | False => CFix (S name) argument arity typ inner end end
+    else body;
 
 def fast_nat_fix_case (name : String) (mode : Nat) (expected : Nat) : Bool :=
     match compile_checked_source(fast_nat_test_fuel, prim_string_to_char_codes fast_nat_fixture_canonical) with
@@ -64,35 +62,124 @@ def fast_nat_fix_case (name : String) (mode : Nat) (expected : Nat) : Bool :=
         eqNat expected (fast_nat_operation_code (managed_nat_recognize (checked_program_entries program)
           fast_nat_test_fuel id annotation (fast_nat_change_fix mode body)))) end;
 
+private def fast_nat_is_metadata_error (error : NativeLowerError) : Bool :=
+    if let LowerMetadataMismatch _ := error then True else False;
+
+private def fast_nat_is_fuel_error (error : NativeLowerError) : Bool :=
+    if let LowerResourceExhausted := error then True else False;
+
 def fast_nat_metadata_rejected : Bool :=
     match compile_checked_source(fast_nat_test_fuel, prim_string_to_char_codes fast_nat_fixture_canonical) with
     | CErr _ => False
-    | COk program => match program with | CheckedProgramOf names entries bodies =>
+    | COk program => match (program : CheckedProgram) with | CheckedProgramOf names entries bodies =>
         let forged : CheckedProgram := CheckedProgramOf names (map Entry Entry nat_forge_role entries) bodies in
-        match native_managed_lower_checked fast_nat_test_fuel mir_default_limits 0 forged with
+        match (native_managed_lower_checked fast_nat_test_fuel mir_default_limits 0 forged
+          : Either NativeSourceError NativeLoweredProgram) with
         | Right _ => False
-        | Left failure => match failure with
+        | Left failure => match (failure : NativeSourceError) with
             | NativeSourceCheckError _ => False
-            | NativeSourceLowerError error => match error with
-                | LowerMetadataMismatch _ => True
-                | LowerResourceExhausted => False | LowerDeclarationFailure _ _ _ => False
-                | LowerBodyMismatch _ => False | LowerUnsupportedType _ => False
-                | LowerUnsupportedTerm _ => False | LowerUnsupportedPrimitive _ => False
-                | LowerUnknownGlobal _ => False | LowerUnboundLocal _ => False | LowerInvalidCall _ => False
-                | LowerEffectMismatch => False | LowerInvalidEntry _ => False | LowerMirFailure _ => False
-                | LowerBackendFailure _ => False end end end end end;
+            | NativeSourceLowerError error => fast_nat_is_metadata_error error
+          end
+        end
+      end
+    end;
 
 def fast_nat_fuel_rejected : Bool :=
     match compile_checked_source(fast_nat_test_fuel, prim_string_to_char_codes fast_nat_fixture_canonical) with
     | CErr _ => False
     | COk program => nat_test_with_body fast_nat_test_fuel program "add" (fun (id : Nat) (annotation : CoreTerm) (body : CoreTerm) =>
-        match managed_nat_recognize (checked_program_entries program) 0 id annotation body with
-        | Right _ => False | Left error => match error with
-            | LowerResourceExhausted => True | LowerDeclarationFailure _ _ _ => False
-            | LowerMetadataMismatch _ => False | LowerBodyMismatch _ => False | LowerUnsupportedType _ => False
-            | LowerUnsupportedTerm _ => False | LowerUnsupportedPrimitive _ => False | LowerUnknownGlobal _ => False
-            | LowerUnboundLocal _ => False | LowerInvalidCall _ => False | LowerEffectMismatch => False
-            | LowerInvalidEntry _ => False | LowerMirFailure _ => False | LowerBackendFailure _ => False end end) end;
+        match (managed_nat_recognize (checked_program_entries program) 0 id annotation body
+          : Either NativeLowerError (Maybe ManagedNatOperation)) with
+        | Right _ => False
+        | Left error => fast_nat_is_fuel_error error
+        end)
+    end;
+
+def fast_nat_identity_operand (expected : Nat) (values : List MirValue) : Bool :=
+    match values with | Nil => False | Cons value rest =>
+      andb (match value with | MirUse id => eqNat id expected | MirBits _ _ => False end)
+        (match rest with | Nil => True | Cons _ _ => False end) end;
+
+def fast_nat_identity_instruction (functions : List MirFunction) (instruction : MirInstruction) : Nat :=
+    match instruction with
+    | MirCall _ destination target _ => match target with | MirIndirect _ _ => 0 | MirDirect id =>
+        match mir_find_function id functions with | Nothing => 0 | Just function =>
+          match function with | MirFunctionDef _ name parameters _ result _ _ =>
+            match andb (pe_bytes_equal name [111,117,114,111,95,110,97,116,95,99,111,117,110,116])
+              (andb (list_eq MirType mir_type_equal (map MirLocal MirType mir_local_type parameters) [MirManagedPtr])
+                (match destination, result with | Just _, Just ty => mir_type_equal ty MirUSize
+                 | Nothing, Nothing => False | Nothing, Just _ => False | Just _, Nothing => False end)) with
+            | True => 1 | False => 0 end end end end
+    | MirMove _ _ => 2
+    | MirCompare _ comparison _ right => match comparison with
+        | MirNotEqual => match right with | MirUse _ => 0 | MirBits ty word =>
+            match x64_word64_bytes word with | Left _ => 0 | Right bytes =>
+              match andb (mir_type_equal ty MirUSize) (pe_bytes_equal bytes (pe_zeros 8)) with
+              | True => 3 | False => 0 end end end
+        | MirEqual => 0 | MirLess => 0 | MirLessEqual => 0 | MirGreater => 0 | MirGreaterEqual => 0 end
+    | MirBinaryOp _ _ _ _ => 0 | MirConvert _ _ _ => 0 | MirLoad _ _ _ => 0 | MirStore _ _ _ => 0
+    | MirLoadAt _ _ _ => 0 | MirStoreAt _ _ _ => 0 | MirAddress _ _ => 0 | MirPointerAdd _ _ _ => 0
+    | MirManagedAlloc _ _ _ _ _ => 0 | MirManagedContext _ => 0 end;
+
+def fast_nat_identity_return (label : Nat) (result : Nat) (block : MirBlock) : Bool :=
+    match block with | MirBlockDef id instructions terminator =>
+      andb (andb(eqNat id label, eqNat (length MirInstruction instructions) 0))
+        (match terminator with | MirReturn value => match value with
+          | Just returned => fast_nat_identity_operand result [returned] | Nothing => False end
+         | MirJump _ => False | MirBranch _ _ _ => False | MirTrap => False end) end;
+
+def fast_nat_identity_left_zero (functions : List MirFunction) (blocks : List MirBlock)
+    (count : Nat) (result : Nat) (entry : Nat) (finish : Nat) : Bool :=
+    any MirBlock (fun (block : MirBlock) => match block with | MirBlockDef id instructions terminator =>
+      andb (eqNat id entry) (match compiler_nth MirInstruction instructions 0, compiler_nth MirInstruction instructions 1 with
+        | Just copied, Just compared =>
+          andb (list_eq Nat eqNat (map MirInstruction Nat (fast_nat_identity_instruction functions) instructions) [2, 3])
+            (andb (andb(fast_nat_identity_operand 1 (mir_reads copied),
+              match mir_destination copied with | Just target => eqNat target result | Nothing => False end))
+              (andb (fast_nat_identity_operand count (take MirValue 1 (mir_reads compared)))
+                (match mir_destination compared with | Nothing => False | Just flag =>
+                  match terminator with | MirBranch condition _ zero =>
+                  andb (fast_nat_identity_operand flag [condition])
+                    (any MirBlock (fun (joined : MirBlock) => match joined with | MirBlockDef label body end_at =>
+                      andb (andb(eqNat label zero, eqNat(length MirInstruction body, 0)))
+                        (match end_at with | MirJump target => eqNat target finish
+                         | MirBranch _ _ _ => False | MirReturn _ => False | MirTrap => False end) end) blocks)
+                  | MirJump _ => False | MirReturn _ => False | MirTrap => False end end)))
+        | Nothing, Nothing => False | Nothing, Just _ => False | Just _, Nothing => False end) end) blocks;
+
+def fast_nat_identity_shape (subtracting : Bool) : Bool :=
+    match compile_checked_source(fast_nat_test_fuel, prim_string_to_char_codes fast_nat_fixture_canonical) with
+    | CErr _ => False | COk program =>
+      match managed_nat_binary_body (nat_test_compiler program) subtracting (MirUse 0) (MirUse 1)
+          (ManagedStateOf(100, [], [], [], [], lower_empty_state 2, NativeOriginsDisabled)) with
+      | Left _ => False | Right compiled => match compiled with | ManagedResultOf value after =>
+        match value with | MirBits _ _ => False | MirUse result =>
+          let blocks : List MirBlock := lower_finish_blocks (MirReturn (Just MirValue value)) (managed_flow after) in
+          let functions : List MirFunction := match after with | ManagedStateOf _ generated _ _ _ _ _ => generated end in
+          match compiler_nth MirBlock blocks 0 with | Nothing => False
+          | Just entry => match entry with | MirBlockDef _ instructions terminator =>
+            match compiler_nth MirInstruction instructions 0 with | Nothing => False | Just first =>
+            match compiler_nth MirInstruction instructions 1 with | Nothing => False | Just second =>
+            match compiler_nth MirInstruction instructions 2 with | Nothing => False | Just copied =>
+            match compiler_nth MirInstruction instructions 3 with | Nothing => False | Just compared =>
+              andb (list_eq Nat eqNat (map MirInstruction Nat (fast_nat_identity_instruction functions) instructions) [1, 1, 2, 3])
+                (andb (andb(fast_nat_identity_operand 0 (mir_reads first), fast_nat_identity_operand 1 (mir_reads second)))
+                  (andb (andb(fast_nat_identity_operand 0 (mir_reads copied),
+                    match mir_destination copied with | Just id => eqNat id result | Nothing => False end))
+                    (andb (match mir_type_of_value (match managed_flow after with | LowerStateOf _ locals _ _ => locals end) value with
+                      | Left _ => False | Right ty => mir_type_equal ty MirManagedPtr end)
+                      (match mir_destination second, mir_destination compared with
+                       | Just count, Just flag => andb (fast_nat_identity_operand count (take MirValue 1 (mir_reads compared)))
+                           (match terminator with | MirBranch condition work zero =>
+                              andb (fast_nat_identity_operand flag [condition])
+                                (andb (any MirBlock (fast_nat_identity_return zero result) blocks)
+                                  (match subtracting with | True => True | False => match mir_destination first with
+                                    | Nothing => False | Just left_count =>
+                                        fast_nat_identity_left_zero functions blocks left_count result work zero end end))
+                            | MirJump _ => False | MirReturn _ => False | MirTrap => False end)
+                       | Nothing, Nothing => False | Nothing, Just _ => False | Just _, Nothing => False end))))
+            end end end end end end
+        end end end end;
 
 def main : IO Unit := nat_test_run
     [assert_true "four checked standard bodies select native Nat operations"
@@ -123,4 +210,6 @@ def main : IO Unit := nat_test_run
      assert_true("changed fixpoint arity is not recognized", fast_nat_fix_case "add" 1 0),
      assert_true("fixpoint display name has no recognition authority", fast_nat_fix_case "sub" 2 3),
      assert_true "forged representation metadata fails before native specialization" fast_nat_metadata_rejected,
-     assert_true "exact comparison fuel failure propagates" fast_nat_fuel_rejected];
+     assert_true "exact comparison fuel failure propagates" fast_nat_fuel_rejected,
+     assert_true "add zero keeps both validators and reuses its managed input without allocation" (fast_nat_identity_shape False),
+     assert_true "sub zero keeps both validators and reuses its managed input without allocation" (fast_nat_identity_shape True)];

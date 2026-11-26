@@ -1,0 +1,181 @@
+import "native_drive_executor.ouro", "native_policy.ouro";
+
+inductive NativeAnalyzeRunError : Type :=
+  | NativeAnalyzeRunArgs : String -> NativeAnalyzeRunError
+  | NativeAnalyzeRunInput : NativeAnalyzeInputError -> NativeAnalyzeRunError
+  | NativeAnalyzeRunPolicy : NativeAnalyzePolicyError -> NativeAnalyzeRunError
+  | NativeAnalyzeRunExecution : NativeAnalyzeExecutorError -> NativeAnalyzeRunError;
+
+def native_analyze_run_message (error : NativeAnalyzeRunError) : String :=
+    match error with
+    | NativeAnalyzeRunArgs message => message
+    | NativeAnalyzeRunInput cause => native_analyze_input_message cause
+    | NativeAnalyzeRunPolicy cause => native_analyze_policy_message cause
+    | NativeAnalyzeRunExecution cause => native_analyze_executor_message cause
+    end;
+
+def native_analyze_sources_unchanged : List NativeAnalyzeSource -> IO (Either NativeAnalyzeRunError Unit) :=
+    fix check (sources : List NativeAnalyzeSource) : IO (Either NativeAnalyzeRunError Unit) :=
+      match sources with
+      | Nil => io_pure (Either NativeAnalyzeRunError Unit) (Right NativeAnalyzeRunError Unit MkUnit)
+      | Cons source rest => match! native_analyze_source_guard source with
+        | Left error => io_pure (Either NativeAnalyzeRunError Unit)
+            (Left NativeAnalyzeRunError Unit (NativeAnalyzeRunExecution error))
+        | Right _ => check rest
+        end
+      end;
+
+def native_analyze_load_baseline (path : String) : IO (Either NativeAnalyzeRunError (Maybe String)) :=
+    match! fs_kind_checked path with
+    | Left error => io_pure (Either NativeAnalyzeRunError (Maybe String))
+        (Left NativeAnalyzeRunError (Maybe String) (NativeAnalyzeRunInput (NativeAnalyzeSourceRead path error)))
+    | Right actual => match actual with
+      | FsPathUnavailable => io_pure (Either NativeAnalyzeRunError (Maybe String))
+          (Right NativeAnalyzeRunError (Maybe String) (Nothing String))
+      | FsRegularFile => do let! read := fs_read_checked path;
+          io_pure (Either NativeAnalyzeRunError (Maybe String)) (match read with
+            | Left error => Left NativeAnalyzeRunError (Maybe String)
+                (NativeAnalyzeRunInput (NativeAnalyzeSourceRead path error))
+            | Right text => Right NativeAnalyzeRunError (Maybe String) (Just String text)
+            end)
+      | FsDirectory => io_pure (Either NativeAnalyzeRunError (Maybe String))
+          (Left NativeAnalyzeRunError (Maybe String)
+            (NativeAnalyzeRunInput (NativeAnalyzeSourceRead path (FsExpectedFile path))))
+      | FsUnsafeEntry => io_pure (Either NativeAnalyzeRunError (Maybe String))
+          (Left NativeAnalyzeRunError (Maybe String)
+            (NativeAnalyzeRunInput (NativeAnalyzeSourceRead path (FsOperationFailed "unsafe baseline" path))))
+      end
+    end;
+
+def native_analyze_base_direct (capture : NativeAnalyzeCapture) (caller : String)
+    (request : NativeAnalyzeRequest) (sources : List NativeAnalyzeSource)
+    : IO (Either NativeAnalyzeExecutorError ProcResult) :=
+    do let! captured := native_analyze_base_call capture "direct base" caller (native_analyze_request_words request);
+       io_pure (Either NativeAnalyzeExecutorError ProcResult) (match captured with
+         | Left error => Left NativeAnalyzeExecutorError ProcResult error
+         | Right result => if notb(eq_nat (proc_code result) Z) then Right NativeAnalyzeExecutorError ProcResult result
+             else match native_analyze_base_verify (native_analyze_base_profile (native_analyze_request_flags request))
+                 (str_of_nat (length NativeAnalyzeSource sources)) result with
+               | Left error => Left NativeAnalyzeExecutorError ProcResult (NativeAnalyzeDirectReportFailure error result)
+               | Right _ => Right NativeAnalyzeExecutorError ProcResult result
+               end
+         end);
+
+def native_analyze_cleaned (workspace : NativeAnalyzeWorkspace)
+    (result : Either NativeAnalyzeExecutorError ProcResult)
+    : IO (Either NativeAnalyzeExecutorError ProcResult) :=
+    do let! cleanup := native_analyze_workspace_cleanup workspace;
+       io_pure (Either NativeAnalyzeExecutorError ProcResult) (match cleanup with
+         | Right _ => result
+         | Left error => Left NativeAnalyzeExecutorError ProcResult (NativeAnalyzeCleanupFailure error
+             (match result with | Left original => Just NativeAnalyzeExecutorError original
+             | Right _ => Nothing NativeAnalyzeExecutorError end)
+             (match result with | Left _ => Nothing ProcResult | Right process => Just ProcResult process end))
+         end);
+
+def native_analyze_workspace_parent (root : String)
+    : IO (Either NativeAnalyzeRunError String) :=
+    let target : String := quality_child root "_build/analyze-bounded" in
+    (fix prepare (paths : List String) : IO (Either NativeAnalyzeRunError String) :=
+      match paths with
+      | Nil => io_pure (Either NativeAnalyzeRunError String) (Right NativeAnalyzeRunError String target)
+      | Cons path rest => match! fs_kind_checked path with
+        | Left error => io_pure (Either NativeAnalyzeRunError String)
+            (Left NativeAnalyzeRunError String (NativeAnalyzeRunInput (NativeAnalyzeSourceRead path error)))
+        | Right actual =>
+            let create : IO (Either FsError Unit) := match actual with
+              | FsDirectory => fs_ok Unit MkUnit
+              | FsPathUnavailable => fs_mkdir_p_checked path
+              | FsRegularFile => fs_err Unit (FsExpectedDirectory path)
+              | FsUnsafeEntry => fs_err Unit (FsOperationFailed "unsafe workspace parent" path)
+              end in
+            match! create with
+            | Left error => io_pure (Either NativeAnalyzeRunError String)
+                (Left NativeAnalyzeRunError String (NativeAnalyzeRunInput (NativeAnalyzeSourceRead path error)))
+            | Right _ => do let! canonical := prim_fs_realpath path;
+                if str_eq (quality_normalize_path canonical) (quality_normalize_path path) then prepare rest
+                else io_pure (Either NativeAnalyzeRunError String)
+                  (Left NativeAnalyzeRunError String (NativeAnalyzeRunArgs "workspace parent changed or is an alias"))
+            end
+        end
+      end) [quality_child root "_build", target];
+
+def native_analyze_base_execute (capture : NativeAnalyzeCapture) (root : String) (caller : String)
+    (request : NativeAnalyzeRequest) (sources : List NativeAnalyzeSource)
+    : IO (Either NativeAnalyzeRunError ProcResult) :=
+    let flags : List String := native_analyze_rebase_flags caller (native_analyze_request_flags request) in
+    if notb(native_analyze_should_batch_sources flags sources) then
+      do let! result := native_analyze_base_direct capture caller request sources;
+         io_pure (Either NativeAnalyzeRunError ProcResult)
+           (mapLeft NativeAnalyzeExecutorError ProcResult NativeAnalyzeRunError NativeAnalyzeRunExecution result)
+    else
+      let path : String := match native_analyze_request_baseline request with
+        | Nothing => quality_child root "quality/api_surface.tsv"
+        | Just selected => native_analyze_absolute caller selected
+        end in
+      match! native_analyze_load_baseline path with
+      | Left error => io_pure (Either NativeAnalyzeRunError ProcResult) (Left NativeAnalyzeRunError ProcResult error)
+      | Right contents =>
+          do let! format_contents := if native_analyze_flag_present "--strict" flags then
+               native_analyze_load_baseline (quality_child root "quality/api_surface.tsv")
+               else io_pure (Either NativeAnalyzeRunError (Maybe String))
+                 (Right NativeAnalyzeRunError (Maybe String) (Nothing String));
+             match format_contents with
+             | Left error => io_pure (Either NativeAnalyzeRunError ProcResult) (Left NativeAnalyzeRunError ProcResult error)
+             | Right format_baseline => match! native_analyze_workspace_parent root with
+               | Left error => io_pure (Either NativeAnalyzeRunError ProcResult) (Left NativeAnalyzeRunError ProcResult error)
+               | Right directory => match! native_analyze_workspace_create directory with
+                 | Left error => io_pure (Either NativeAnalyzeRunError ProcResult)
+                     (Left NativeAnalyzeRunError ProcResult (NativeAnalyzeRunExecution (NativeAnalyzeWorkspaceFailure error)))
+                 | Right workspace => do let! raw := native_analyze_base_batch capture workspace root flags contents
+                      format_baseline sources;
+                     let! cleaned := native_analyze_cleaned workspace raw;
+                     io_pure (Either NativeAnalyzeRunError ProcResult)
+                       (mapLeft NativeAnalyzeExecutorError ProcResult NativeAnalyzeRunError NativeAnalyzeRunExecution cleaned)
+                 end
+               end
+             end
+      end;
+
+def native_analyze_execute (capture : NativeAnalyzeCapture) (root : String) (caller : String)
+    (request : NativeAnalyzeRequest) (sources : List NativeAnalyzeSource)
+    : IO (Either NativeAnalyzeRunError ProcResult) :=
+    match native_analyze_scope_guard (native_analyze_request_flags request) sources with
+    | Left error => io_pure (Either NativeAnalyzeRunError ProcResult)
+        (Left NativeAnalyzeRunError ProcResult (NativeAnalyzeRunInput error))
+    | Right _ => match! native_analyze_sources_unchanged sources with
+      | Left error => io_pure (Either NativeAnalyzeRunError ProcResult) (Left NativeAnalyzeRunError ProcResult error)
+      | Right _ => match! native_analyze_base_execute capture root caller request sources with
+        | Left error => io_pure (Either NativeAnalyzeRunError ProcResult) (Left NativeAnalyzeRunError ProcResult error)
+        | Right result => match! native_analyze_sources_unchanged sources with
+          | Left error => io_pure (Either NativeAnalyzeRunError ProcResult) (Left NativeAnalyzeRunError ProcResult error)
+          | Right _ => if notb(native_analyze_drive_after_base (native_analyze_request_flags request) result) then
+              io_pure (Either NativeAnalyzeRunError ProcResult)
+                (mapLeft NativeAnalyzeExecutorError ProcResult NativeAnalyzeRunError NativeAnalyzeRunExecution
+                  (native_analyze_result_bounded (native_analyze_merge_results result (Nothing ProcResult))))
+            else match! native_analyze_drive_execute capture root
+                (native_analyze_rebase_flags caller (native_analyze_request_flags request)) sources with
+              | Left error => io_pure (Either NativeAnalyzeRunError ProcResult)
+                  (Left NativeAnalyzeRunError ProcResult (NativeAnalyzeRunExecution error))
+              | Right structured => do let! after_drive := native_analyze_sources_unchanged sources;
+                  io_pure (Either NativeAnalyzeRunError ProcResult) (match after_drive with
+                    | Left error => Left NativeAnalyzeRunError ProcResult error
+                    | Right _ =>
+                        mapLeft NativeAnalyzeExecutorError ProcResult NativeAnalyzeRunError NativeAnalyzeRunExecution
+                          (native_analyze_result_bounded (native_analyze_merge_results result (Just ProcResult structured)))
+                    end)
+              end
+          end
+        end
+      end
+    end;
+
+def native_analyze_execute_native (policy : NativeAnalyzePolicy)
+    (located : Either ExecutablePathError String) (root : String) (caller : String)
+    (request : NativeAnalyzeRequest) (sources : List NativeAnalyzeSource)
+    : IO (Either NativeAnalyzeRunError ProcResult) :=
+    match native_analyze_policy_checked policy with
+    | Left error => io_pure (Either NativeAnalyzeRunError ProcResult)
+        (Left NativeAnalyzeRunError ProcResult (NativeAnalyzeRunPolicy error))
+    | Right _ => native_analyze_execute (native_analyze_capture_bound located policy) root caller request sources
+    end;

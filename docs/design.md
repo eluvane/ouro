@@ -1,7 +1,8 @@
 # Design goals
 
-This page records language direction and non-goals. Current syntax and
-implemented behavior are in [Syntax](syntax.md) and [Tooling](tooling.md).
+The project aims to build a standalone native toolchain for a language with
+dependent types and checked generation. See [Syntax](syntax.md) and
+[Tooling](tooling.md) for the supported forms and commands.
 
 ## Language direction
 
@@ -107,8 +108,12 @@ No feature is removed solely because its implementation is in OCaml or C.
 An intentional retirement requires a documented breaking change and updated
 positive/negative expectations. Unrestricted recursion, a general effect
 system, new foreign interfaces, and additional targets are not implied by
-preserving this slice. Native memory reclamation is a required new capability;
-the current phase/process allocation model is not its completed implementation.
+preserving this slice.
+
+The retained C host manages allocations by phase and process. The
+experimental native Windows runtime implements exact, non-moving mark-and-sweep
+collection. Native release acceptance requires reclamation evidence from
+sustained workloads. [Backends and runtime](architecture.md#backends-and-runtime)
 
 ## Non-goals
 

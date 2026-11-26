@@ -12,6 +12,7 @@
 import "../../std/data.ouro",
   "../../std/listx.ouro",
   "../../std/natx.ouro",
+  "../quality/order.ouro",
   "ast.ouro";
 
 -- name id, source line, body.
@@ -42,30 +43,27 @@ def dup_index_of (target : Nat) : List Nat -> Maybe Nat :=
     match xs with
     | Nil => Nothing Nat
     | Cons y rest =>
-        match eq_nat target y with
-        | True => Just Nat Z
-        | False =>
-            match dup_index_of rest with
-            | Nothing => Nothing Nat
-            | Just n => Just(Nat, S n)
-            end
-        end
+        if eq_nat target y then Just Nat Z
+        else
+          match dup_index_of rest with
+          | Nothing => Nothing Nat
+          | Just n => Just(Nat, S n)
+          end
     end;
 
 -- Bound on both sides at the same depth, or the same global on both sides.
 def dup_same_var (x : Nat) (env_x : List Nat) (y : Nat) (env_y : List Nat) : Bool :=
-    match dup_index_of x env_x with
-    | Nothing =>
-        match dup_index_of y env_y with
-        | Nothing => eq_nat x y
-        | Just _ => False
-        end
-    | Just ix =>
-        match dup_index_of y env_y with
-        | Nothing => False
-        | Just iy => eq_nat ix iy
-        end
-    end;
+  (fix same_depth (left : List Nat) (right : List Nat) : Bool :=
+    match left with
+    | Nil => if eq_nat x y then notb (elem Nat eq_nat y right) else False
+    | Cons first rest => match right with
+      | Nil => if eq_nat x y then notb (elem Nat eq_nat x left) else False
+      | Cons other tail =>
+          if eq_nat x first then eq_nat y other
+          else if eq_nat y other then False
+          else same_depth rest tail
+      end
+    end) env_x env_y;
 
 def dup_none : List Nat := [];
 
@@ -111,8 +109,9 @@ def dup_scopes (a : Ast) : List (List Nat) :=
     | APerform _ args => dup_no_scope args
     | ADo xs => dup_no_scope xs
     | AList xs => dup_no_scope xs
-    | AListSpread _ _ => dup_no_scope (ast_children a)
-    | ANamedCall _ _ => dup_no_scope (ast_children a)
+    | AListSpread xs _ => Cons (List Nat) dup_none (dup_no_scope xs)
+    | ANamedCall _ rows => Cons (List Nat) dup_none
+        (map (Pair Nat Ast) (List Nat) (fun (_row : Pair Nat Ast) => dup_none) rows)
     end;
 
 def dup_same_labels : List (Pair Nat Ast) -> List (Pair Nat Ast) -> Bool :=
@@ -124,22 +123,31 @@ def dup_same_labels : List (Pair Nat Ast) -> List (Pair Nat Ast) -> Bool :=
         match right with
         | Nil => False
         | Cons other tail =>
-            andb (eq_nat(fst Nat Ast row, fst Nat Ast other))
-              (dup_same_labels rest tail)
+            if eq_nat (fst Nat Ast row) (fst Nat Ast other) then dup_same_labels rest tail
+            else False
         end
     end;
 
 -- Payloads that must agree even for near clones: sort levels, branch and
 -- clause constructors, performed ops. Binder names are scoped, variables are
 -- compared through the environments, literals and holes are the loose part.
+private def dup_rigid_tag (tag : Nat) : Bool :=
+    if eq_nat tag tag_sort then True
+    else if eq_nat tag tag_branch then True
+    else if eq_nat tag tag_clause then True
+    else if eq_nat tag tag_perform then True
+    else eq_nat tag tag_if_let;
+
 def dup_rigid_payload (a : Ast) : Bool :=
-    orb (ast_is tag_sort a)
-      (orb (ast_is tag_branch a)
-        (orb(ast_is tag_clause a,
-          orb(ast_is tag_perform a, ast_is tag_if_let a))));
+    dup_rigid_tag (ast_tag a);
+
+private def dup_loose_tag (tag : Nat) : Bool :=
+    if eq_nat tag tag_hole then True
+    else if eq_nat tag tag_nat then True
+    else eq_nat tag tag_str;
 
 def dup_loose_payload (a : Ast) : Bool :=
-    orb(ast_is tag_hole a, orb(ast_is tag_nat a, ast_is tag_str a));
+    dup_loose_tag (ast_tag a);
 
 def dup_same_length_nat : List Nat -> List Nat -> Bool :=
   fix dup_same_length_nat (xs : List Nat) : List Nat -> Bool :=
@@ -152,120 +160,29 @@ def dup_same_length_nat : List Nat -> List Nat -> Bool :=
 
 -- Pattern binder lists of branches and clauses; Nil elsewhere.
 def dup_pattern_ids (a : Ast) : List Nat :=
-    match a with
-    | ABranch _ ids _ _ => ids
-    | AClause _ ids _ _ => ids
-    | AVar _ => Nil Nat
-    | AHole _ => Nil Nat
-    | ASort _ => Nil Nat
-    | ANatLit _ => Nil Nat
-    | ARange _ _ _ => Nil Nat
-    | AStr _ => Nil Nat
-    | AApp _ _ => Nil Nat
-    | ALam _ _ _ => Nil Nat
-    | APi _ _ _ => Nil Nat
-    | ALet _ _ _ _ => Nil Nat
-    | AAscribe _ _ => Nil Nat
-    | ABinder _ _ _ => Nil Nat
-    | ANoBinder => Nil Nat
-    | AFix _ _ _ _ => Nil Nat
-    | ANoBranch => Nil Nat
-    | AMatch _ _ => Nil Nat
-    | AIf _ _ _ => Nil Nat
-    | AIfLet _ names _ _ _ => names
-    | ACoalesce _ _ => Nil Nat
-    | APerform _ _ => Nil Nat
-    | AHandle _ _ => Nil Nat
-    | ANoClause => Nil Nat
-    | ADo _ => Nil Nat
-    | AList _ => Nil Nat
-    | AListSpread _ _ => Nil Nat
-    | ANamedCall _ _ => Nil Nat
-    end;
+    if let ABranch _ ids _ _ := a then ids
+    else if let AClause _ ids _ _ := a then ids
+    else if let AIfLet _ names _ _ _ := a then names
+    else Nil Nat;
 
 -- Node-local agreement: same constructor, same rigid payload, same variable
 -- under the environments, same literal unless `loose`.
 def dup_heads_agree (loose : Bool) (a : Ast) (b : Ast)
     (env_a : List Nat) (env_b : List Nat) : Bool :=
-    match eq_nat(ast_tag a, ast_tag b) with
-    | False => False
-    | True =>
-        let labels_agree : Bool :=
-          match a with
-          | ANamedCall _ rows =>
-              match b with
-              | ANamedCall _ other => dup_same_labels rows other
-              | AVar _ => False
-              | AHole _ => False
-              | ASort _ => False
-              | ANatLit _ => False
-              | ARange _ _ _ => False
-              | AStr _ => False
-              | AApp _ _ => False
-              | ALam _ _ _ => False
-              | APi _ _ _ => False
-              | ALet _ _ _ _ => False
-              | AAscribe _ _ => False
-              | ABinder _ _ _ => False
-              | ANoBinder => False
-              | AFix _ _ _ _ => False
-              | ABranch _ _ _ _ => False
-              | ANoBranch => False
-              | AMatch _ _ => False
-              | AIf _ _ _ => False
-              | AIfLet _ _ _ _ _ => False
-              | ACoalesce _ _ => False
-              | APerform _ _ => False
-              | AHandle _ _ => False
-              | AClause _ _ _ _ => False
-              | ANoClause => False
-              | ADo _ => False
-              | AList _ => False
-              | AListSpread _ _ => False
-              end
-          | AVar _ => True
-          | AHole _ => True
-          | ASort _ => True
-          | ANatLit _ => True
-          | ARange _ _ _ => True
-          | AStr _ => True
-          | AApp _ _ => True
-          | ALam _ _ _ => True
-          | APi _ _ _ => True
-          | ALet _ _ _ _ => True
-          | AAscribe _ _ => True
-          | ABinder _ _ _ => True
-          | ANoBinder => True
-          | AFix _ _ _ _ => True
-          | ABranch _ _ _ _ => True
-          | ANoBranch => True
-          | AMatch _ _ => True
-          | AIf _ _ _ => True
-          | AIfLet _ _ _ _ _ => True
-          | ACoalesce _ _ => True
-          | APerform _ _ => True
-          | AHandle _ _ => True
-          | AClause _ _ _ _ => True
-          | ANoClause => True
-          | ADo _ => True
-          | AList _ => True
-          | AListSpread _ _ => True
-          end in
-        andb labels_agree (match ast_is tag_var a with
-        | True => dup_same_var(ast_payload a, env_a, ast_payload b, env_b)
-        | False =>
-            match dup_rigid_payload a with
-            | True =>
-                andb (eq_nat(ast_payload a, ast_payload b))
-                  (dup_same_length_nat(dup_pattern_ids a, dup_pattern_ids b))
-            | False =>
-                match dup_loose_payload a with
-                | True => orb(loose, eq_nat(ast_payload a, ast_payload b))
-                | False => True
-                end
-            end
-        end)
-    end;
+    let tag : Nat := ast_tag a in
+    if eq_nat tag (ast_tag b) then
+      if let ANamedCall _ rows := a then
+        if let ANamedCall _ other := b then dup_same_labels rows other else False
+      else if eq_nat tag tag_var then
+        dup_same_var(ast_payload a, env_a, ast_payload b, env_b)
+      else if dup_rigid_tag tag then
+        if eq_nat (ast_payload a) (ast_payload b) then
+          dup_same_length_nat (dup_pattern_ids a) (dup_pattern_ids b)
+        else False
+      else if loose then True
+      else if dup_loose_tag tag then eq_nat (ast_payload a) (ast_payload b)
+      else True
+    else False;
 
 -- Children compared pairwise under their scopes; a child-count mismatch is a
 -- mismatch (performs, do-blocks, and lists carry variable arity).
@@ -286,25 +203,30 @@ def dup_zip_children (go : Ast -> Ast -> List Nat -> List Nat -> Bool)
                 match sy with
                 | Nil => False
                 | Cons scope_y syr =>
-                    andb (go(x, y, append Nat scope_x env_a, append Nat scope_y env_b))
-                      (dup_zip_children xr yr sxr syr env_a env_b)
+                    if go x y (append Nat scope_x env_a) (append Nat scope_y env_b) then
+                      dup_zip_children xr yr sxr syr env_a env_b
+                    else False
                 end
             end
         end
     end;
 
+private def dup_eq_with_fuel (loose : Bool) : Nat -> Ast -> Ast -> List Nat -> List Nat -> Bool :=
+  fix compare (fuel : Nat) (a : Ast) (b : Ast) (env_a : List Nat) (env_b : List Nat) : Bool :=
+    match fuel with
+    | Z => False
+    | S remaining =>
+        if dup_heads_agree loose a b env_a env_b then
+          let descend (child : Ast) (next_b : Ast) (next_env_a : List Nat) (next_env_b : List Nat) : Bool :=
+            compare remaining child next_b next_env_a next_env_b in
+          dup_zip_children descend (ast_children a) (ast_children b)
+            (dup_scopes a) (dup_scopes b) env_a env_b
+        else False
+    end;
+
 def dup_eq_go (loose : Bool) : Ast -> Ast -> List Nat -> List Nat -> Bool :=
   fun (root : Ast) (other_root : Ast) (initial_env_a : List Nat) (initial_env_b : List Nat) =>
-    (fix dup_eq_go (fuel : Nat) (a : Ast) (b : Ast) (env_a : List Nat) (env_b : List Nat) : Bool :=
-      match fuel with
-      | Z => False
-      | S remaining =>
-          let descend (child : Ast) (next_b : Ast) (next_env_a : List Nat) (next_env_b : List Nat) : Bool :=
-            dup_eq_go remaining child next_b next_env_a next_env_b in
-          andb (dup_heads_agree loose a b env_a env_b)
-            (dup_zip_children descend (ast_children a) (ast_children b)
-              (dup_scopes a) (dup_scopes b) env_a env_b)
-      end) (ast_size root) root other_root initial_env_a initial_env_b;
+    dup_eq_with_fuel loose (ast_size root) root other_root initial_env_a initial_env_b;
 
 -- Exact alpha-equivalence.
 def alpha_eq (a : Ast) (b : Ast) : Bool := dup_eq_go False a b (Nil Nat) (Nil Nat);
@@ -325,47 +247,110 @@ def dup_sized (min_nodes : Nat) (defs : List DefAst) : List (Pair Nat DefAst) :=
 def dup_has_control (a : Ast) : Bool :=
     ast_exists(ast_is tag_fix, a);
 
+private def dup_pair_issue_with_size (size : Nat) (left : DefAst) (right : DefAst) : List DupIssue :=
+    let left_body : Ast := def_ast_body left in
+    let right_body : Ast := def_ast_body right in
+    if dup_eq_with_fuel False size left_body right_body [] [] then
+      dup_icons(ICloneExact(def_ast_line right, def_ast_id left, def_ast_id right), dup_inil)
+    else
+      if dup_eq_with_fuel True size left_body right_body [] [] then
+        -- Near matches have the same node tags along every path.
+        if ast_exists_with_fuel (ast_is tag_fix) size left_body then
+          dup_icons (ICloneNear (def_ast_line right) (def_ast_id left)
+            (def_ast_id right)) dup_inil
+        else dup_inil
+      else dup_inil;
+
 def dup_pair_issue (left : DefAst) (right : DefAst) : List DupIssue :=
-    match alpha_eq(def_ast_body left, def_ast_body right) with
-    | True =>
-        dup_icons(ICloneExact(def_ast_line right, def_ast_id left, def_ast_id right), dup_inil)
-    | False =>
-        match near_eq(def_ast_body left, def_ast_body right) with
-        | False => dup_inil
-        | True =>
-            match andb (dup_has_control (def_ast_body left))
-              (dup_has_control (def_ast_body right)) with
-            | True =>
-                dup_icons (ICloneNear (def_ast_line right) (def_ast_id left)
-                  (def_ast_id right)) dup_inil
-            | False => dup_inil
-            end
-        end
-    end;
+    dup_pair_issue_with_size (ast_size (def_ast_body left)) left right;
 
 -- Both comparisons demand the same shape, so different node counts settle a
 -- pair without walking either body.
 def dup_compare_one (left : Pair Nat DefAst) (right : Pair Nat DefAst) : List DupIssue :=
-    match eq_nat(fst Nat DefAst left, fst Nat DefAst right) with
-    | False => dup_inil
-    | True => dup_pair_issue(snd Nat DefAst left, snd Nat DefAst right)
+    if eq_nat(fst Nat DefAst left, fst Nat DefAst right) then
+      dup_pair_issue(snd Nat DefAst left, snd Nat DefAst right)
+    else dup_inil;
+
+private def dup_against_rest_with (compare : Pair Nat DefAst -> Pair Nat DefAst -> List DupIssue)
+    (left : Pair Nat DefAst) : List (Pair Nat DefAst) -> List DupIssue :=
+  fix against (xs : List (Pair Nat DefAst)) : List DupIssue :=
+    match xs with
+    | Nil => dup_inil
+    | Cons right rest => dup_append (compare left right) (against rest)
     end;
 
 def dup_against_rest (left : Pair Nat DefAst) : List (Pair Nat DefAst) -> List DupIssue :=
-  fix dup_against_rest (xs : List (Pair Nat DefAst)) : List DupIssue :=
-    match xs with
-    | Nil => dup_inil
-    | Cons right rest => dup_append(dup_compare_one left right, dup_against_rest rest)
-    end;
+    dup_against_rest_with dup_compare_one left;
 
-def dup_pairs : List (Pair Nat DefAst) -> List DupIssue :=
-  fix dup_pairs (defs : List (Pair Nat DefAst)) : List DupIssue :=
+private def dup_pairs_with (compare : Pair Nat DefAst -> Pair Nat DefAst -> List DupIssue)
+    : List (Pair Nat DefAst) -> List DupIssue :=
+  fix pairs (defs : List (Pair Nat DefAst)) : List DupIssue :=
     match defs with
     | Nil => dup_inil
-    | Cons d rest => dup_append(dup_against_rest d rest, dup_pairs rest)
+    | Cons d rest => dup_append (dup_against_rest_with compare d rest) (pairs rest)
     end;
+
+def dup_pairs : List (Pair Nat DefAst) -> List DupIssue := dup_pairs_with dup_compare_one;
+
+private def dup_compare_measured (left : Pair Nat DefAst) (right : Pair Nat DefAst) : List DupIssue :=
+    let (MkPair size left_def) := left in
+    let (MkPair right_size right_def) := right in
+    if eq_nat size right_size then dup_pair_issue_with_size size left_def right_def else dup_inil;
+
+private inductive DupSizedRow : Type :=
+  | DupSizedRowOf : Nat -> Nat -> DefAst -> DupSizedRow;
+
+private inductive DupPairWork : Type :=
+  | DupPairWorkOf : Nat -> Nat -> DefAst -> List DefAst -> DupPairWork;
+
+private def dup_index_sizes : List (Pair Nat DefAst) -> Nat -> List DupSizedRow :=
+  fix index_rows (rows : List (Pair Nat DefAst)) (position : Nat) : List DupSizedRow :=
+    match rows with
+    | Nil => []
+    | Cons row rest =>
+        let (MkPair size definition) := row in
+        Cons DupSizedRow (DupSizedRowOf position size definition) (index_rows rest (add position 1))
+    end;
+
+-- Walking the stable size order backward shares each suffix of later peers.
+private def dup_pair_work : List DupSizedRow -> Nat -> List DefAst -> List DupPairWork -> List DupPairWork :=
+  fix collect (rows : List DupSizedRow) (previous_size : Nat) (peers : List DefAst)
+      (work : List DupPairWork) : List DupPairWork :=
+    match rows with
+    | Nil => work
+    | Cons row rest =>
+        let (DupSizedRowOf position size definition) := row in
+        let same_size : List DefAst := if eq_nat size previous_size then peers else [] in
+        let next_work : List DupPairWork := match same_size with
+          | Nil => work
+          | Cons _ _ => Cons DupPairWork (DupPairWorkOf position size definition same_size) work
+          end in
+        collect rest size (Cons DefAst definition same_size) next_work
+    end;
+
+private def dup_work_in_source_order (sized : List (Pair Nat DefAst)) : List DupPairWork :=
+    let by_size : List DupSizedRow := quality_sort DupSizedRow
+      (fun (left : DupSizedRow) (right : DupSizedRow) =>
+        let (DupSizedRowOf _ left_size _) := left in
+        let (DupSizedRowOf _ right_size _) := right in
+        leb_nat left_size right_size) (dup_index_sizes sized Z) in
+    let work : List DupPairWork := dup_pair_work (reverse_lin DupSizedRow by_size) Z [] [] in
+    quality_sort DupPairWork
+      (fun (left : DupPairWork) (right : DupPairWork) =>
+        let (DupPairWorkOf left_position _ _ _) := left in
+        let (DupPairWorkOf right_position _ _ _) := right in
+        leb_nat left_position right_position) work;
 
 -- Every unordered pair of definitions with at least `min_nodes` nodes each;
 -- the finding is anchored at the later definition.
 def analyze_duplication (min_nodes : Nat) (defs : List DefAst) : List DupIssue :=
-    dup_pairs (dup_sized min_nodes defs);
+    let sized : List (Pair Nat DefAst) := dup_sized min_nodes defs in
+    match drop (Pair Nat DefAst) 8 sized with
+    | Nil => dup_pairs_with dup_compare_measured sized
+    | Cons _ _ =>
+        concat_map DupPairWork DupIssue
+          (fun (work : DupPairWork) =>
+            let (DupPairWorkOf _ size earlier peers) := work in
+            concat_map DefAst DupIssue (dup_pair_issue_with_size size earlier) peers)
+          (dup_work_in_source_order sized)
+    end;

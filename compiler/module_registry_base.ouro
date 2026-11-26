@@ -344,36 +344,6 @@ def module_has_alias_bindings (reached : List Nat)
       end
     end;
 
-def module_public_collision (seeds : List (Pair Nat Nat))
-    (units : List SrcUnit) : Maybe Nat :=
-  (fix go (rows : List (Pair Nat Nat)) : Maybe Nat :=
-    match rows with
-    | Nil => Nothing Nat
-    | Cons row rest => match row with
-      | MkPair owner name =>
-          match module_is_private owner name units with
-          | True => go rest
-          | False =>
-              match (fix find (others : List (Pair Nat Nat)) : Bool :=
-                match others with
-                | Nil => False
-                | Cons other tail => match other with
-                  | MkPair path short =>
-                      match andb(eqNat name short,
-                          andb(notb(eqNat owner path),
-                            notb(module_is_private path short units))) with
-                      | True => True
-                      | False => find tail
-                      end
-                  end
-                end) rest with
-              | True => Just Nat name
-              | False => go rest
-              end
-          end
-      end
-    end) seeds;
-
 def module_has_any_private : List SrcUnit -> Bool :=
   fix go (units : List SrcUnit) : Bool :=
     match units with
@@ -390,8 +360,11 @@ def module_validate_private : List SrcUnit -> ResolveResult Unit :=
   fix go (units : List SrcUnit) : ResolveResult Unit :=
     match units with
     | Nil => ROk Unit MkUnit
-    | Cons unit rest => match unit with
-      | MkSrcUnit _owner _ =>
+    | Cons unit rest =>
+      let private_names : List Nat := src_unit_private_names unit in
+      match private_names with
+      | Nil => go rest
+      | Cons _ _ =>
           let declared : List Nat := module_decl_names (src_unit_decls unit) in
           match (fix check (names : List Nat) : ResolveResult Unit :=
             match names with
@@ -400,7 +373,7 @@ def module_validate_private : List SrcUnit -> ResolveResult Unit :=
               | False => RErr Unit 8 name
               | True => check tail
               end
-            end) (src_unit_private_names unit) with
+            end) private_names with
           | RErr code detail => RErr Unit code detail
           | ROk _ => go rest
           end
@@ -422,24 +395,168 @@ def module_name_conflicts (owner : Nat) (name : Nat)
         end
     end;
 
+inductive ModuleConflictValue : Type :=
+  | ModuleConflictOwner : Nat -> ModuleConflictValue
+  | ModuleConflictPending : ModuleConflictValue
+  | ModuleConflictReported : ModuleConflictValue;
+
+inductive ModuleConflictIndex : Type :=
+  | ModuleConflictIndexEmpty : ModuleConflictIndex
+  | ModuleConflictIndexNode : Nat -> Nat -> ModuleConflictValue ->
+      ModuleConflictIndex -> ModuleConflictIndex -> ModuleConflictIndex;
+
+def module_conflict_index_height (tree : ModuleConflictIndex) : Nat :=
+  match tree with
+  | ModuleConflictIndexEmpty => Z
+  | ModuleConflictIndexNode height _ _ _ _ => height
+  end;
+
+def module_conflict_index_node (key : Nat) (value : ModuleConflictValue)
+    (left : ModuleConflictIndex) (right : ModuleConflictIndex) : ModuleConflictIndex :=
+  ModuleConflictIndexNode
+    (S (maxNat(module_conflict_index_height left, module_conflict_index_height right)))
+    key value left right;
+
+def module_conflict_index_left_heavy (key : Nat) (value : ModuleConflictValue)
+    (left : ModuleConflictIndex) (right : ModuleConflictIndex) : ModuleConflictIndex :=
+  match left with
+  | ModuleConflictIndexEmpty => module_conflict_index_node key value left right
+  | ModuleConflictIndexNode _ first first_value outer inner =>
+      match leb_nat(module_conflict_index_height inner, module_conflict_index_height outer) with
+      | True => module_conflict_index_node first first_value outer
+          (module_conflict_index_node key value inner right)
+      | False => match inner with
+        | ModuleConflictIndexEmpty => module_conflict_index_node first first_value outer
+            (module_conflict_index_node key value inner right)
+        | ModuleConflictIndexNode _ middle middle_value inner_left inner_right =>
+            module_conflict_index_node middle middle_value
+              (module_conflict_index_node first first_value outer inner_left)
+              (module_conflict_index_node key value inner_right right)
+        end
+      end
+  end;
+
+def module_conflict_index_right_heavy (key : Nat) (value : ModuleConflictValue)
+    (left : ModuleConflictIndex) (right : ModuleConflictIndex) : ModuleConflictIndex :=
+  match right with
+  | ModuleConflictIndexEmpty => module_conflict_index_node key value left right
+  | ModuleConflictIndexNode _ last last_value inner outer =>
+      match leb_nat(module_conflict_index_height inner, module_conflict_index_height outer) with
+      | True => module_conflict_index_node last last_value
+          (module_conflict_index_node key value left inner) outer
+      | False => match inner with
+        | ModuleConflictIndexEmpty => module_conflict_index_node last last_value
+            (module_conflict_index_node key value left inner) outer
+        | ModuleConflictIndexNode _ middle middle_value inner_left inner_right =>
+            module_conflict_index_node middle middle_value
+              (module_conflict_index_node key value left inner_left)
+              (module_conflict_index_node last last_value inner_right outer)
+        end
+      end
+  end;
+
+def module_conflict_index_balance (key : Nat) (value : ModuleConflictValue)
+    (left : ModuleConflictIndex) (right : ModuleConflictIndex) : ModuleConflictIndex :=
+  match ltb_nat(S (module_conflict_index_height right), module_conflict_index_height left) with
+  | True => module_conflict_index_left_heavy key value left right
+  | False => match ltb_nat(S (module_conflict_index_height left), module_conflict_index_height right) with
+    | True => module_conflict_index_right_heavy key value left right
+    | False => module_conflict_index_node key value left right
+    end
+  end;
+
+def module_conflict_index_insert (key : Nat) (value : ModuleConflictValue)
+    : ModuleConflictIndex -> ModuleConflictIndex :=
+  fix insert (tree : ModuleConflictIndex) : ModuleConflictIndex :=
+    match tree with
+    | ModuleConflictIndexEmpty =>
+        module_conflict_index_node key value ModuleConflictIndexEmpty ModuleConflictIndexEmpty
+    | ModuleConflictIndexNode height current stored left right =>
+        match compareNat key current with
+        | EQ => ModuleConflictIndexNode height current value left right
+        | LT => module_conflict_index_balance current stored (insert left) right
+        | GT => module_conflict_index_balance current stored left (insert right)
+        end
+    end;
+
+def module_conflict_index_lookup (key : Nat) : ModuleConflictIndex -> Maybe ModuleConflictValue :=
+  fix lookup (tree : ModuleConflictIndex) : Maybe ModuleConflictValue :=
+    match tree with
+    | ModuleConflictIndexEmpty => Nothing ModuleConflictValue
+    | ModuleConflictIndexNode _ current value left right =>
+        match compareNat key current with
+        | EQ => Just ModuleConflictValue value
+        | LT => lookup left
+        | GT => lookup right
+        end
+    end;
+
+def module_conflict_index_from (seeds : List (Pair Nat Nat)) : ModuleConflictIndex :=
+  (fix collect (rows : List (Pair Nat Nat)) (tree : ModuleConflictIndex) : ModuleConflictIndex :=
+    match rows with
+    | Nil => tree
+    | Cons row rest => match row with
+      | MkPair owner name =>
+          let key : Nat := add name Z in
+          match module_conflict_index_lookup key tree with
+          | Nothing => collect rest
+              (module_conflict_index_insert key (ModuleConflictOwner (add owner Z)) tree)
+          | Just state => match state with
+            | ModuleConflictOwner first_owner => match eq_nat first_owner owner with
+              | True => collect rest tree
+              | False => collect rest (module_conflict_index_insert key ModuleConflictPending tree)
+              end
+            | ModuleConflictPending => collect rest tree
+            | ModuleConflictReported => collect rest tree
+            end
+          end
+      end
+    end) seeds ModuleConflictIndexEmpty;
+
+def module_public_collision (seeds : List (Pair Nat Nat))
+    (units : List SrcUnit) : Maybe Nat :=
+  let public_rows : List (Pair Nat Nat) :=
+    filter (Pair Nat Nat)
+      (fun (row : Pair Nat Nat) => match row with
+        | MkPair owner name => notb(module_is_private owner name units)
+        end) seeds in
+  let index : ModuleConflictIndex := module_conflict_index_from public_rows in
+  (fix go (rows : List (Pair Nat Nat)) : Maybe Nat :=
+    match rows with
+    | Nil => Nothing Nat
+    | Cons row rest => match row with
+      | MkPair _ name =>
+          match module_conflict_index_lookup (add name Z) index with
+          | Nothing => go rest
+          | Just state => match state with
+            | ModuleConflictOwner _ => go rest
+            | ModuleConflictPending => Just Nat name
+            | ModuleConflictReported => go rest
+            end
+          end
+      end
+    end) public_rows;
+
+-- Replay the original rows so conflict discovery cannot reorder first names.
 def module_conflict_names (seeds : List (Pair Nat Nat)) : List Nat :=
-  (fix go (rows : List (Pair Nat Nat)) (found : List Nat)
-      : List Nat :=
+  let index : ModuleConflictIndex := module_conflict_index_from seeds in
+  (fix go (rows : List (Pair Nat Nat)) (tree : ModuleConflictIndex) (found : List Nat) : List Nat :=
     match rows with
     | Nil => found
-    | Cons row rest =>
-        match row with
-        | MkPair owner name =>
-            match memNat name found with
-            | True => go rest found
-            | False =>
-                match module_name_conflicts owner name seeds with
-                | True => go rest (Cons Nat name found)
-                | False => go rest found
-                end
+    | Cons row rest => match row with
+      | MkPair _ name =>
+          let key : Nat := add name Z in
+          match module_conflict_index_lookup key tree with
+          | Nothing => go rest tree found
+          | Just state => match state with
+            | ModuleConflictOwner _ => go rest tree found
+            | ModuleConflictPending => go rest
+                (module_conflict_index_insert key ModuleConflictReported tree) (Cons Nat name found)
+            | ModuleConflictReported => go rest tree found
             end
-        end
-    end) seeds (Nil Nat);
+          end
+      end
+    end) seeds index (Nil Nat);
 
 -- `do` and pure-handler lowering still carry legacy wrapper names. Until
 -- those forms have per-module operation metadata, a colliding wrapper cannot
@@ -625,7 +742,60 @@ def module_members (st0 : InternState) (root : Nat) (reached : List Nat)
     (conflicts : List Nat) (seeds : List (Pair Nat Nat))
     (units : List SrcUnit) (isolate : Bool)
     : ResolveResult (Pair (List ModuleMember) InternState) :=
+  -- Reverse nodes use stored ID as key: initial first wins, prepend replaces.
+  let put_name (overwrite : Bool) (spelling : List Nat) (id : Nat)
+      : SourceNameIndex -> SourceNameIndex :=
+    let key : Nat := add id Z in
+    fix put (tree : SourceNameIndex) : SourceNameIndex :=
+      match tree with
+      | SourceNameIndexEmpty =>
+          source_name_index_node spelling key SourceNameIndexEmpty SourceNameIndexEmpty
+      | SourceNameIndexNode height current stored left right =>
+          match compareNat key stored with
+          | EQ => match overwrite with
+            | False => tree
+            | True => SourceNameIndexNode height spelling stored left right
+            end
+          | LT => source_name_index_balance current stored (put left) right
+          | GT => source_name_index_balance current stored left (put right)
+          end
+      end in
+  let lookup_name (id : Nat) : SourceNameIndex -> Maybe (List Nat) :=
+    let key : Nat := add id Z in
+    fix find (tree : SourceNameIndex) : Maybe (List Nat) :=
+      match tree with
+      | SourceNameIndexEmpty => Nothing (List Nat)
+      | SourceNameIndexNode _ spelling stored left right =>
+          match compareNat key stored with
+          | EQ => Just (List Nat) spelling
+          | LT => find left
+          | GT => find right
+          end
+      end in
+  let names_from : List (Pair (List Nat) Nat) -> SourceNameIndex -> SourceNameIndex :=
+    (fix collect (rows : List (Pair (List Nat) Nat)) (tree : SourceNameIndex)
+        : SourceNameIndex :=
+      match rows with
+      | Nil => tree
+      | Cons row rest => match row with
+        | MkPair spelling id => collect rest (put_name False spelling id tree)
+        end
+      end) in
+  -- Keep the owner even when its private name list is empty.
+  let read_private_names (owner : Nat) : Pair (Maybe Nat) (List Nat) :=
+    let names : List Nat :=
+      match find SrcUnit
+          (fun (unit : SrcUnit) => match unit with
+            | MkSrcUnit path _ => eqNat path owner
+          end) units with
+      | Nothing => Nil Nat
+      | Just unit => src_unit_private_names unit
+      end in
+    MkPair (Maybe Nat) (List Nat) (Just Nat owner) names in
   (fix go (rows : List (Pair Nat Nat)) (st : InternState)
+      (indexes : Maybe (Pair SourceNameIndex SourceNameIndex))
+      (prior_owner : Nat) (prior_ordinal : Maybe Nat)
+      (private_names_cache : Pair (Maybe Nat) (List Nat))
       : ResolveResult (Pair (List ModuleMember) InternState) :=
     match rows with
     | Nil => ROk (Pair (List ModuleMember) InternState)
@@ -633,11 +803,26 @@ def module_members (st0 : InternState) (root : Nat) (reached : List Nat)
     | Cons row rest =>
         match row with
         | MkPair owner name =>
-            let collision : Bool := orb(isolate, memNat name conflicts) in
-            let public : Bool := notb(module_is_private owner name units) in
+            let collision : Bool :=
+              match isolate with
+              | True => True
+              | False => memNat name conflicts
+              end in
+            let owner_privacy : Pair (Maybe Nat) (List Nat) :=
+              match private_names_cache with
+              | MkPair cached_owner _ => match cached_owner with
+                | Nothing => read_private_names owner
+                | Just cached => match eqNat owner cached with
+                  | True => private_names_cache
+                  | False => read_private_names owner
+                  end
+                end
+              end in
+            let public : Bool :=
+              match owner_privacy with | MkPair _ names => notb(memNat name names) end in
             match andb collision (notb(eqNat owner root)) with
             | False =>
-                match go rest st with
+                match go rest st indexes prior_owner prior_ordinal owner_privacy with
                 | RErr code detail =>
                     RErr (Pair (List ModuleMember) InternState) code detail
                 | ROk result =>
@@ -650,39 +835,71 @@ def module_members (st0 : InternState) (root : Nat) (reached : List Nat)
                     end
                 end
             | True =>
-                match module_ordinal owner reached with
+                let selected_ordinal : Maybe Nat :=
+                  match prior_ordinal with
+                  | Nothing => module_ordinal owner reached
+                  | Just _ => match eqNat owner prior_owner with
+                    | True => prior_ordinal
+                    | False => module_ordinal owner reached
+                    end
+                  end in
+                match selected_ordinal with
                 | Nothing => RErr (Pair (List ModuleMember) InternState) 8 owner
                 | Just ordinal =>
-                    let generated : List Nat :=
-                      module_symbol_bytes ordinal (name_of_id st name) in
-                    match st with
-                    | MkIntern ids _ _ _ =>
-                        match source_lookup_id ids generated with
+                    let prepared : Pair SourceNameIndex SourceNameIndex :=
+                      match indexes with
+                      | Just current => current
+                      | Nothing => match st with
+                        | MkIntern ids _ _ _ =>
+                            MkPair SourceNameIndex SourceNameIndex
+                              (source_name_index_from ids)
+                              (names_from ids SourceNameIndexEmpty)
+                        end
+                      end in
+                    match prepared with
+                    | MkPair spellings names =>
+                        let generated : List Nat :=
+                          module_symbol_bytes ordinal
+                            (match lookup_name name names with
+                            | Nothing => Nil Nat
+                            | Just spelling => spelling
+                            end) in
+                        match source_name_index_lookup generated spellings with
                         | Just existing =>
                             RErr (Pair (List ModuleMember) InternState) 8 existing
-                        | Nothing =>
-                            match intern_ident st generated with
-                            | MkPair symbol next_st =>
-                                match go rest next_st with
-                                | RErr code detail =>
-                                    RErr (Pair (List ModuleMember) InternState) code detail
-                                | ROk result =>
-                                    match result with
-                                    | MkPair tail final_st =>
-                                        ROk (Pair (List ModuleMember) InternState)
-                                          (MkPair (List ModuleMember) InternState
-                                            (Cons ModuleMember
-                                              (MkModuleMember owner name symbol public) tail)
-                                            final_st)
-                                    end
-                                end
-                            end
+                        | Nothing => match st with
+                          | MkIntern ids nextId strs nextStr =>
+                              let next_st : InternState :=
+                                MkIntern
+                                  (Cons (Pair(List Nat, Nat))
+                                    (MkPair (List Nat) Nat generated nextId) ids)
+                                  (add(nextId, S Z)) strs nextStr in
+                              let next_indexes : Maybe (Pair SourceNameIndex SourceNameIndex) :=
+                                Just (Pair SourceNameIndex SourceNameIndex)
+                                  (MkPair SourceNameIndex SourceNameIndex
+                                    (source_name_index_insert generated nextId spellings)
+                                    (put_name True generated nextId names)) in
+                              match go rest next_st next_indexes owner selected_ordinal owner_privacy with
+                              | RErr code detail =>
+                                  RErr (Pair (List ModuleMember) InternState) code detail
+                              | ROk result =>
+                                  match result with
+                                  | MkPair tail final_st =>
+                                      ROk (Pair (List ModuleMember) InternState)
+                                        (MkPair (List ModuleMember) InternState
+                                          (Cons ModuleMember
+                                            (MkModuleMember owner name nextId public) tail)
+                                          final_st)
+                                  end
+                              end
+                          end
                         end
                     end
                 end
             end
         end
-    end) seeds st0;
+    end) seeds st0 (Nothing (Pair SourceNameIndex SourceNameIndex))
+      root (Nothing Nat) (MkPair (Maybe Nat) (List Nat) (Nothing Nat) (Nil Nat));
 
 def module_member (owner : Nat) (name : Nat)
     : List ModuleMember -> Maybe Nat :=
@@ -959,18 +1176,24 @@ def module_import_exports (st : InternState)
     end;
 
 def module_shadow_exports (owned : List (Pair Nat Nat))
-    : List (Pair Nat Nat) -> List (Pair Nat Nat) :=
-  fix go (imports : List (Pair Nat Nat)) : List (Pair Nat Nat) :=
-    match imports with
-    | Nil => Nil (Pair Nat Nat)
-    | Cons item rest => match item with
-      | MkPair short symbol => match module_lookup short owned with
-        | Just _ => go rest
-        | Nothing => Cons (Pair Nat Nat)
-            (MkPair Nat Nat short symbol) (go rest)
-        end
-      end
-    end;
+    (imports : List (Pair Nat Nat)) : List (Pair Nat Nat) :=
+  match imports with
+  | Nil => imports
+  | Cons _ _ => match owned with
+    | Nil => imports
+    | Cons _ _ =>
+        let owned_names : SourceNameIndex := foldl (Pair Nat Nat) SourceNameIndex
+          (fun (index : SourceNameIndex) (row : Pair Nat Nat) => match row with
+            | MkPair short _ => source_name_index_insert [add short Z] Z index
+          end) SourceNameIndexEmpty owned in
+        filter (Pair Nat Nat) (fun (row : Pair Nat Nat) => match row with
+          | MkPair short _ => match source_name_index_lookup [add short Z] owned_names with
+            | Nothing => True
+            | Just _ => False
+            end
+          end) imports
+    end
+  end;
 
 def module_export_has (short : Nat) (symbol : Nat)
     : List (Pair Nat Nat) -> Bool :=
@@ -989,14 +1212,17 @@ def module_export_has (short : Nat) (symbol : Nat)
 def module_unique_exports (rows : List (Pair Nat Nat))
     : List (Pair Nat Nat) :=
   (fix go (pending_rows : List (Pair Nat Nat)) (seen : List (Pair Nat Nat))
-      : List (Pair Nat Nat) :=
+      (index : SourceNameIndex) : List (Pair Nat Nat) :=
     match pending_rows with
     | Nil => seen
     | Cons item rest => match item with
-      | MkPair short symbol => match module_export_has short symbol seen with
-        | True => go rest seen
-        | False => go rest (Cons (Pair Nat Nat)
-            (MkPair Nat Nat short symbol) seen)
-        end
+      | MkPair short symbol =>
+          let key : List Nat := [short, symbol] in
+          match source_name_index_lookup key index with
+          | Just _ => go rest seen index
+          | Nothing => go rest (Cons (Pair Nat Nat)
+              (MkPair Nat Nat short symbol) seen)
+              (source_name_index_insert key Z index)
+          end
       end
-    end) rows (Nil (Pair Nat Nat));
+    end) rows (Nil (Pair Nat Nat)) SourceNameIndexEmpty;

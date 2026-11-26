@@ -1,4 +1,4 @@
--- Strict command grammar; std/cli owns the option values after validation.
+-- Strict compiler-command grammar; formatter arguments remain formatter-owned.
 import "native_build_args.ouro",
   "../std/io.ouro",
   "../std/args.ouro",
@@ -25,6 +25,88 @@ inductive NativeCliCommand : Type :=
 
 def native_cli_usage : String :=
     "usage:\n  coil doctor\n  coil check FILE [fuel] [--emit-checked-program FILE]\n  coil build FILE.ouro [--backend native] [--target x86_64-windows] [--out FILE]\n  coil run FILE.ouro [PROGRAM_ARG ...]\n";
+
+def native_cli_toolchain_sibling : String := "ouro-toolchain.exe";
+
+def native_cli_analyze_sibling : String := "ouro-analyze.exe";
+
+private def native_cli_forward_words (expected : String)
+    (arguments : List String) : Maybe (List String) :=
+    match arguments with
+    | Nil => Nothing (List String)
+    | Cons _ words => match words with
+      | Nil => Nothing (List String)
+      | Cons command rest => if str_eq command expected then Just (List String) rest
+        else Nothing (List String)
+      end
+    end;
+
+def native_cli_analyze_words (arguments : List String) : Maybe (List String) :=
+    native_cli_forward_words "analyze" arguments;
+
+def native_cli_toolchain_words (arguments : List String) : Maybe (List String) :=
+    native_cli_forward_words "toolchain" arguments;
+
+def native_cli_fmt_sibling : String := "ouro-fmt.exe";
+
+-- Discard argv0 and forward formatter words without interpreting its options.
+def native_cli_fmt_words (arguments : List String) : Maybe (List String) :=
+    native_cli_forward_words "fmt" arguments;
+
+def native_cli_test_sibling : String := "ouro-test.exe";
+
+def native_cli_test_words (arguments : List String) : Maybe (List String) :=
+    native_cli_forward_words "test" arguments;
+
+-- A public native test cannot select the standalone runner's hosted launchers.
+def native_cli_test_hosted_override (test_check : Maybe String) (test_build : Maybe String)
+    (pkg_check : Maybe String) (compiler_wrapper : Maybe String) : Maybe String :=
+    match test_check with
+    | Just _ => Just String "OURO_TEST_CHECK"
+    | Nothing => match test_build with
+      | Just _ => Just String "OURO_TEST_BUILD"
+      | Nothing => match pkg_check with
+        | Just _ => Just String "OURO_PKG_CHECK"
+        | Nothing => match compiler_wrapper with
+          | Just _ => Just String "OURO_HOSTED_COMPILER_WRAPPER"
+          | Nothing => Nothing String
+          end
+        end
+      end
+    end;
+
+def native_cli_read_test_hosted_override : IO (Maybe String) :=
+    do let! test_check := prim_env_get "OURO_TEST_CHECK";
+       let! test_build := prim_env_get "OURO_TEST_BUILD";
+       let! pkg_check := prim_env_get "OURO_PKG_CHECK";
+       let! wrapper := prim_env_get "OURO_HOSTED_COMPILER_WRAPPER";
+       io_pure (Maybe String) (native_cli_test_hosted_override test_check test_build pkg_check wrapper);
+
+def native_cli_lsp_sibling : String := "ouro-lsp.exe";
+
+def native_cli_lsp_words (arguments : List String) : Maybe (List String) :=
+    native_cli_forward_words "lsp" arguments;
+
+-- The public native LSP must keep its checker and formatter on fixed siblings.
+def native_cli_lsp_hosted_override (test_check : Maybe String) (pkg_check : Maybe String)
+    (compiler_wrapper : Maybe String) (formatter : Maybe String) : Maybe String :=
+    match native_cli_test_hosted_override test_check (Nothing String) pkg_check compiler_wrapper with
+    | Just name => Just String name
+    | Nothing => match formatter with
+      | Just _ => Just String "OURO_HOSTED_FMT"
+      | Nothing => Nothing String
+      end
+    end;
+
+def native_cli_pkg_sibling : String := "ouro-pkg.exe";
+
+def native_cli_pkg_words (arguments : List String) : Maybe (List String) :=
+    native_cli_forward_words "pkg" arguments;
+
+-- Package verification consumes these three hosted checker selectors.
+def native_cli_pkg_hosted_override (test_check : Maybe String) (pkg_check : Maybe String)
+    (compiler_wrapper : Maybe String) : Maybe String :=
+    native_cli_test_hosted_override test_check (Nothing String) pkg_check compiler_wrapper;
 
 def native_cli_error_code (error : NativeCliError) : String :=
     match error with
@@ -61,30 +143,28 @@ def native_cli_options : List String -> List String -> List String -> Either Nat
       : Either NativeCliError Unit :=
     match words with
     | Nil => Right NativeCliError Unit MkUnit
-    | Cons word rest => match is_dashed word with
-      | False => options rest allowed seen
-      | True => match elem String str_eq word allowed with
-        | False => Left NativeCliError Unit (NativeCliUnknownOption word)
-        | True => match elem String str_eq word seen with
-          | True => Left NativeCliError Unit (NativeCliDuplicateOption word)
-          | False => match rest with
+    | Cons word rest => if is_dashed word then
+        if elem String str_eq word allowed then
+          if elem String str_eq word seen then
+            Left NativeCliError Unit (NativeCliDuplicateOption word)
+          else
+            match rest with
             | Nil => Left NativeCliError Unit (NativeCliMissingValue word)
-            | Cons value tail => match orb(str_null value, is_dashed value) with
-              | True => Left NativeCliError Unit (NativeCliMissingValue word)
-              | False => options tail allowed (Cons String word seen)
-              end
+            | Cons value tail => if orb(str_null value, is_dashed value) then
+                Left NativeCliError Unit (NativeCliMissingValue word)
+              else options tail allowed (Cons String word seen)
             end
-          end
-        end
-      end
+        else Left NativeCliError Unit (NativeCliUnknownOption word)
+      else options rest allowed seen
     end;
 
 def native_cli_check_words (args : Args) : Either NativeCliError NativeCliCommand :=
     match args_positional args with
     | Nil => Left NativeCliError NativeCliCommand NativeCliMissingSource
-    | Cons source rest => match str_null source with
-      | True => Left NativeCliError NativeCliCommand NativeCliMissingSource
-      | False => match rest with
+    | Cons source rest => if str_null source then
+        Left NativeCliError NativeCliCommand NativeCliMissingSource
+      else
+        match rest with
         | Nil => Right NativeCliError NativeCliCommand
             (NativeCliCheck source native_build_check_default_fuel (args_opt args "emit-checked-program"))
         | Cons value tail => match tail with
@@ -96,49 +176,44 @@ def native_cli_check_words (args : Args) : Either NativeCliError NativeCliComman
             end
           end
         end
-      end
     end;
 
 def native_cli_build_words (args : Args) : Either NativeCliError NativeCliCommand :=
     match args_positional args with
     | Nil => Left NativeCliError NativeCliCommand NativeCliMissingSource
-    | Cons source rest => match str_null source with
-      | True => Left NativeCliError NativeCliCommand NativeCliMissingSource
-      | False => match rest with
+    | Cons source rest => if str_null source then
+        Left NativeCliError NativeCliCommand NativeCliMissingSource
+      else
+        match rest with
         | Cons extra _ => Left NativeCliError NativeCliCommand (NativeCliUnexpectedArgument extra)
-        | Nil => match str_ends source ".ouro" with
-          | False => Left NativeCliError NativeCliCommand (NativeCliInvalidSource source)
-          | True => match native_build_parse
+        | Nil => if str_ends source ".ouro" then
+            match native_build_parse
               (args_opt_or args "backend" native_build_backend_native)
               (args_opt_or args "target" native_build_default_target) source
               (args_opt_or args "out" "") native_build_default_entry with
             | Left error => Left NativeCliError NativeCliCommand (NativeCliBuildRejected error)
             | Right request => Right NativeCliError NativeCliCommand (NativeCliBuild request)
             end
-          end
+          else Left NativeCliError NativeCliCommand (NativeCliInvalidSource source)
         end
-      end
     end;
 
 -- Run has one source position. All following words belong to the program,
 -- including dashed words, empty arguments and a literal -- delimiter.
 def native_cli_run_source (source : String) (arguments : List String)
     : Either NativeCliError NativeCliCommand :=
-    match str_null source with
-    | True => Left NativeCliError NativeCliCommand NativeCliMissingSource
-    | False => match str_ends source ".ouro" with
-      | False => Left NativeCliError NativeCliCommand (NativeCliInvalidSource source)
-      | True =>
-          let base : String := path_basename source in
-          let stem : String := str_take(base, sub(str_len base, str_len ".ouro")) in
-          let output : String := path_join ["_build", "native", "run", str_concat stem ".exe"] in
-          match native_build_parse native_build_backend_native native_build_default_target
-              source output native_build_default_entry with
-          | Left error => Left NativeCliError NativeCliCommand (NativeCliBuildRejected error)
-          | Right request => Right NativeCliError NativeCliCommand (NativeCliRun request arguments)
-          end
-      end
-    end;
+    if str_null source then Left NativeCliError NativeCliCommand NativeCliMissingSource
+    else
+      if str_ends source ".ouro" then
+        let base : String := path_basename source in
+        let stem : String := str_take(base, sub(str_len base, str_len ".ouro")) in
+        let output : String := path_join ["_build", "native", "run", str_concat stem ".exe"] in
+        match native_build_parse native_build_backend_native native_build_default_target
+            source output native_build_default_entry with
+        | Left error => Left NativeCliError NativeCliCommand (NativeCliBuildRejected error)
+        | Right request => Right NativeCliError NativeCliCommand (NativeCliRun request arguments)
+        end
+      else Left NativeCliError NativeCliCommand (NativeCliInvalidSource source);
 
 def native_cli_run_words (words : List String) : Either NativeCliError NativeCliCommand :=
     match words with
@@ -149,29 +224,27 @@ def native_cli_run_words (words : List String) : Either NativeCliError NativeCli
 def native_cli_parse (words : List String) : Either NativeCliError NativeCliCommand :=
     match words with
     | Nil => Left NativeCliError NativeCliCommand NativeCliMissingCommand
-    | Cons command rest => match str_eq command "doctor" with
-      | True => match rest with
+    | Cons command rest => if str_eq command "doctor" then
+        match rest with
         | Nil => Right NativeCliError NativeCliCommand NativeCliDoctor
         | Cons extra _ => Left NativeCliError NativeCliCommand (NativeCliUnexpectedArgument extra)
         end
-      | False => match str_eq command "check" with
-        | True => match native_cli_options(rest, ["--emit-checked-program"] : List String, Nil String) with
+      else
+        if str_eq command "check" then
+          match native_cli_options(rest, ["--emit-checked-program"] : List String, Nil String) with
           | Left error => Left NativeCliError NativeCliCommand error
           | Right _ => native_cli_check_words (args_parse_bools(Nil String, rest))
           end
-        | False => match str_eq command "build" with
-          | False => match str_eq command "run" with
-            | True => native_cli_run_words rest
-            | False => Left NativeCliError NativeCliCommand (NativeCliUnknownCommand command)
-            end
-          | True => match native_cli_options rest
+        else
+          if str_eq command "build" then
+            match native_cli_options rest
               (["--backend", "--target", "--out"] : List String) (Nil String) with
             | Left error => Left NativeCliError NativeCliCommand error
             | Right _ => native_cli_build_words (args_parse_bools(Nil String, rest))
             end
-          end
-        end
-      end
+          else
+            if str_eq command "run" then native_cli_run_words rest
+            else Left NativeCliError NativeCliCommand (NativeCliUnknownCommand command)
     end;
 
 def coil_fail (status : Nat) (message : String) : IO Unit :=

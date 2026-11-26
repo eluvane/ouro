@@ -3,6 +3,8 @@ name: Dependencies
 on:
   pull_request:
     branches: [ main, master ]
+  merge_group:
+    types: [ checks_requested ]
 
 permissions:
   contents: read
@@ -24,6 +26,15 @@ jobs:
     permissions:
       contents: read
       pull-requests: read
+    env:
+      OURO_CI: "1"
+      OURO_REPRODUCIBLE: "1"
+      OURO_PACK_STRICT: "1"
+      OURO_JOBS: "2"
+      OURO_CACHE_DIR: _cache/ouro
+      OURO_BUILD_DIR: _build
+      OURO_C_BUILD_DIR: _build/c
+      OURO_CCACHE: disabled
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -34,40 +45,65 @@ jobs:
       - name: Select checks
         id: changes
         env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-        run: python3 scripts/ci_gate.py --select-paths --base "$BASE_SHA" --head "$HEAD_SHA"
-
-      - name: Select dependency manifests
-        id: dependency-manifests
-        env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-        run: |
-          set -euo pipefail
-          changed=false
-          while IFS= read -r -d '' path; do
-            case "$path" in
-              Ouro.seal|editors/vscode/package.json|editors/vscode/package-lock.json|site/package.json|site/package-lock.json)
-                changed=true
-                ;;
-            esac
-          done < <(git diff --name-only -z "$BASE_SHA" "$HEAD_SHA" --)
-          echo "changed=$changed" >> "$GITHUB_OUTPUT"
-          echo "DEPENDENCY_MANIFESTS changed=$changed"
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+          HEAD_SHA: ${{ github.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha }}
+        run: python3 scripts/ci_gate.py --select-dependencies --base "$BASE_SHA" --head "$HEAD_SHA" --pr-head "$PR_HEAD_SHA"
 
       - name: Dependency review
-        if: ${{ steps.dependency-manifests.outputs.changed == 'true' }}
+        if: ${{ steps.changes.outputs.dependency_manifests != 'false' }}
         uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
         with:
           fail-on-severity: moderate
 
+      - name: Identify compiler inputs
+        if: ${{ steps.changes.outputs.dependency != 'false' }}
+        id: inputs
+        run: python3 scripts/ci_gate.py --compiler-artifact key >> "$GITHUB_OUTPUT"
+
+      - name: Restore compiler and bootstrap evidence
+        if: ${{ steps.changes.outputs.dependency != 'false' }}
+        id: compiler-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            _build/c/ouro1
+            _build/c/ouro1.bootstrap.json
+            _build/bootstrap/*/report.json
+            _build/bootstrap/*/inputs.json
+            _build/bootstrap/*/out/p1/*.c
+            _build/bootstrap/*/out/p2/*.c
+          key: ouro-host-compiler-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.inputs.outputs.key }}
+
+      - name: Restore historical bootstrap stages
+        if: ${{ github.event.repository.visibility == 'public' && steps.changes.outputs.dependency != 'false' && steps.compiler-cache.outputs.cache-hit != 'true' }}
+        id: historical-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/bootstrap-historical/${{ steps.inputs.outputs.historical_key }}.zip
+          key: ouro-bootstrap-historical-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.inputs.outputs.historical_key }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            ouro-bootstrap-historical-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.inputs.outputs.historical_key }}-
+
+      - name: Verify historical bootstrap cache origin
+        id: historical-origin
+        if: ${{ steps.historical-cache.outputs.cache-matched-key != '' }}
+        env:
+          HISTORICAL_KEY: ${{ steps.inputs.outputs.historical_key }}
+        run: python3 scripts/ci_historical_cache.py verify >> "$GITHUB_OUTPUT"
+
+      - name: Build and verify host compiler
+        if: ${{ steps.changes.outputs.dependency != 'false' }}
+        env:
+          OURO_BOOTSTRAP_HISTORY_SHA256: ${{ steps.historical-origin.outputs.verified_sha256 }}
+        run: python3 scripts/ouro_build.py build --verbosity quiet
+
       - name: Check workflows
-        if: ${{ steps.changes.outputs.dependency == 'true' }}
+        if: ${{ steps.changes.outputs.dependency != 'false' }}
         run: python3 scripts/github_workflow_gate.py --work _build/github_workflow_gate
 
       - name: Upload reports
-        if: always()
+        if: ${{ always() && steps.changes.outputs.dependency != 'false' }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: dependencies

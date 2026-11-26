@@ -1,0 +1,522 @@
+import "native_composition.ouro",
+  "native_skeleton.ouro",
+  "model_types.ouro",
+  "../quality/source.ouro",
+  "../../std/fs.ouro",
+  "../../std/fs_bounded.ouro",
+  "../../std/pathx.ouro",
+  "../../std/process.ouro";
+
+inductive NativeAnalyzeRootError : Type :=
+  | NativeAnalyzeRootExplicit : QualityInputError -> NativeAnalyzeRootError
+  | NativeAnalyzeRootFilesystem : String -> FsError -> NativeAnalyzeRootError
+  | NativeAnalyzeRootDirectory : String -> NativeAnalyzeRootError
+  | NativeAnalyzeRootResolve : String -> NativeAnalyzeRootError
+  | NativeAnalyzeRootCanonical : String -> NativeAnalyzeRootError
+  | NativeAnalyzeRootMarker : String -> NativeAnalyzeRootError
+  | NativeAnalyzeRootUnavailable : String -> NativeAnalyzeRootError
+  | NativeAnalyzeRootMissingSeal : String -> NativeAnalyzeRootError
+  | NativeAnalyzeRootTraversalLimit : String -> Nat -> NativeAnalyzeRootError
+  | NativeAnalyzeRootCycle : String -> NativeAnalyzeRootError
+  | NativeAnalyzeRootParent : String -> String -> NativeAnalyzeRootError;
+
+def native_analyze_root_error_message (error : NativeAnalyzeRootError) : String :=
+    match error with
+    | NativeAnalyzeRootExplicit cause => quality_input_message cause
+    | NativeAnalyzeRootFilesystem path cause => str_cat3 path ": " (fs_error_message cause)
+    | NativeAnalyzeRootDirectory path => str_concat "analyzer root search requires a directory: " path
+    | NativeAnalyzeRootResolve path => str_concat "cannot resolve analyzer root search directory: " path
+    | NativeAnalyzeRootCanonical path => str_concat "invalid canonical analyzer root search path: " path
+    | NativeAnalyzeRootMarker path => str_concat "analyzer root marker is not a regular file: " path
+    | NativeAnalyzeRootUnavailable path => str_concat "cannot classify analyzer root marker: " path
+    | NativeAnalyzeRootMissingSeal caller => str_concat "no regular Ouro.seal above analyzer caller directory: " caller
+    | NativeAnalyzeRootTraversalLimit path limit => str_cat4 "analyzer root search directory limit ("
+        (str_of_nat limit) ") reached at: " path
+    | NativeAnalyzeRootCycle path => str_concat "analyzer root search repeated a canonical directory: " path
+    | NativeAnalyzeRootParent current parent => str_cat4
+        "analyzer root search parent is not the immediate ancestor: " parent " of " current
+    end;
+
+def native_analyze_root_search_limit : Nat := 128;
+
+def native_analyze_root_extended_unc (parts : List String) : Bool :=
+    match parts with
+    | Nil => False
+    | Cons prefix rest => match rest with
+      | Nil => False
+      | Cons kind _ => andb(str_eq prefix "?", str_eq (str_lower kind) "unc")
+      end
+    end;
+
+def native_analyze_root_path_valid (path : String) : Bool :=
+    let normalized : String := quality_normalize_path path in
+    let parts : List String := path_split normalized in
+    let network : Bool := str_starts normalized "//" in
+    let body : String := str_slice normalized (if network then 2 else if path_has_drive normalized then 3 else 1)
+      (str_len normalized) in
+    let extended : String := if str_starts normalized "//?/" then
+        str_slice normalized 4 (str_len normalized) else "" in
+    let absolute : Bool := if network then
+        if path_has_drive extended then process_directory_valid (str_replace extended "/" "\\")
+        else leb_nat (if native_analyze_root_extended_unc parts then 4 else 2) (length String parts)
+      else if path_has_drive normalized then process_directory_valid (str_replace normalized "/" "\\")
+      else str_starts normalized "/" in
+    andb(absolute, andb(process_directory_utf8_valid (str_codes normalized),
+      andb(notb(elem Nat eq_nat 0 (str_codes normalized)),
+        andb(notb(orb(str_starts body "/", str_contains body "//")),
+          all String (fun (part : String) => notb(orb(str_eq part ".", str_eq part ".."))) parts))));
+
+def native_analyze_root_boundary (path : String) : Bool :=
+    let normalized : String := quality_normalize_path path in
+    andb(native_analyze_root_path_valid normalized,
+      orb(str_eq normalized "/", if path_has_drive normalized then eq_nat (str_len normalized) 3
+      else andb(str_starts normalized "//", eq_nat (length String (path_split normalized))
+        (if native_analyze_root_extended_unc (path_split normalized) then 4 else 2))));
+
+def native_analyze_root_key (path : String) : String :=
+    let normalized : String := str_lower (quality_normalize_path path) in
+    if andb(ltb_nat 1 (str_len normalized), str_ends normalized "/") then
+      str_slice normalized 0 (sub (str_len normalized) 1) else normalized;
+
+def native_analyze_root_marker_path (directory : String) : String :=
+    str_concat directory (if str_ends directory "/" then "Ouro.seal" else "/Ouro.seal");
+
+def native_analyze_root_parent_path (directory : String) : String :=
+    str_concat directory (if str_ends directory "/" then ".." else "/..");
+
+def native_analyze_root_directory (path : String) : IO (Either NativeAnalyzeRootError String) :=
+    match! fs_kind_checked path with
+    | Left error => io_pure (Either NativeAnalyzeRootError String)
+        (Left NativeAnalyzeRootError String (NativeAnalyzeRootFilesystem path error))
+    | Right entry => match entry with
+      | FsDirectory => do let! resolved := prim_fs_realpath path;
+          let canonical : String := quality_normalize_path resolved in
+          if str_null canonical then io_pure (Either NativeAnalyzeRootError String)
+              (Left NativeAnalyzeRootError String (NativeAnalyzeRootResolve path))
+          else if notb(native_analyze_root_path_valid canonical) then io_pure (Either NativeAnalyzeRootError String)
+              (Left NativeAnalyzeRootError String (NativeAnalyzeRootCanonical canonical))
+          else do let! checked := fs_kind_checked canonical;
+              io_pure (Either NativeAnalyzeRootError String) (match checked with
+              | Left error => Left NativeAnalyzeRootError String (NativeAnalyzeRootFilesystem canonical error)
+              | Right actual => match actual with
+                | FsDirectory => Right NativeAnalyzeRootError String canonical
+                | FsPathUnavailable => Left NativeAnalyzeRootError String (NativeAnalyzeRootDirectory canonical)
+                | FsRegularFile => Left NativeAnalyzeRootError String (NativeAnalyzeRootDirectory canonical)
+                | FsUnsafeEntry => Left NativeAnalyzeRootError String (NativeAnalyzeRootDirectory canonical)
+                end
+              end)
+      | FsPathUnavailable => io_pure (Either NativeAnalyzeRootError String)
+          (Left NativeAnalyzeRootError String (NativeAnalyzeRootDirectory path))
+      | FsRegularFile => io_pure (Either NativeAnalyzeRootError String)
+          (Left NativeAnalyzeRootError String (NativeAnalyzeRootDirectory path))
+      | FsUnsafeEntry => io_pure (Either NativeAnalyzeRootError String)
+          (Left NativeAnalyzeRootError String (NativeAnalyzeRootDirectory path))
+      end
+    end;
+
+def native_analyze_root_absence_checked (directory : String)
+    (listed : Either FsError (List String)) : Either NativeAnalyzeRootError Bool :=
+    match listed with
+    | Left error => Left NativeAnalyzeRootError Bool (NativeAnalyzeRootFilesystem directory error)
+    | Right names => if any String (fun (name : String) => str_eq (str_lower name) "ouro.seal") names then
+        Left NativeAnalyzeRootError Bool (NativeAnalyzeRootUnavailable (native_analyze_root_marker_path directory))
+      else Right NativeAnalyzeRootError Bool False
+    end;
+
+def native_analyze_root_marker_checked (directory : String) (kind : Either FsError FsPathKind)
+    : Either NativeAnalyzeRootError (Maybe Bool) :=
+    let marker : String := native_analyze_root_marker_path directory in
+    match kind with
+    | Left error => Left NativeAnalyzeRootError (Maybe Bool) (NativeAnalyzeRootFilesystem marker error)
+    | Right entry => match entry with
+      | FsRegularFile => Right NativeAnalyzeRootError (Maybe Bool) (Just Bool True)
+      | FsDirectory => Left NativeAnalyzeRootError (Maybe Bool) (NativeAnalyzeRootMarker marker)
+      | FsUnsafeEntry => Left NativeAnalyzeRootError (Maybe Bool) (NativeAnalyzeRootMarker marker)
+      | FsPathUnavailable => Right NativeAnalyzeRootError (Maybe Bool) (Nothing Bool)
+      end
+    end;
+
+def native_analyze_root_marker (directory : String) : IO (Either NativeAnalyzeRootError Bool) :=
+    do let! kind := fs_kind_checked (native_analyze_root_marker_path directory);
+       match native_analyze_root_marker_checked directory kind with
+       | Left error => io_pure (Either NativeAnalyzeRootError Bool) (Left NativeAnalyzeRootError Bool error)
+       | Right found => match found with
+         | Just present => io_pure (Either NativeAnalyzeRootError Bool) (Right NativeAnalyzeRootError Bool present)
+         | Nothing => do let! listable := prim_fs_listable directory;
+             if notb listable then io_pure (Either NativeAnalyzeRootError Bool)
+                 (Left NativeAnalyzeRootError Bool
+                   (NativeAnalyzeRootFilesystem directory (FsOperationFailed "list" directory)))
+             else do let! names := fs_list_checked directory;
+                 io_pure (Either NativeAnalyzeRootError Bool) (native_analyze_root_absence_checked directory names)
+         end
+       end;
+
+def native_analyze_root_parent_checked (current : String) (seen : List String) (parent : String)
+    : Either NativeAnalyzeRootError String :=
+    let canonical : String := quality_normalize_path parent in
+    let key : String := native_analyze_root_key canonical in
+    if notb(native_analyze_root_path_valid canonical) then
+      Left NativeAnalyzeRootError String (NativeAnalyzeRootCanonical canonical)
+    else if orb(str_eq key (native_analyze_root_key current),
+        any String (fun (path : String) => str_eq key (native_analyze_root_key path)) seen) then
+      Left NativeAnalyzeRootError String (NativeAnalyzeRootCycle canonical)
+    -- A skipped directory could contain the nearest project marker.
+    else if notb(andb(path_under key (native_analyze_root_key current),
+        eq_nat (S (length String (path_split canonical))) (length String (path_split current)))) then
+      Left NativeAnalyzeRootError String (NativeAnalyzeRootParent current canonical)
+    else Right NativeAnalyzeRootError String canonical;
+
+def native_analyze_root_parent (directory : String) : IO (Either NativeAnalyzeRootError String) :=
+    native_analyze_root_directory (native_analyze_root_parent_path directory);
+
+-- Fuel counts marker probes, including the caller. An exhausted search must
+-- stop before querying another parent, even if that parent has a marker.
+def native_analyze_root_search_with (fuel : Nat) (caller : String)
+    (inspect : String -> IO (Either NativeAnalyzeRootError Bool))
+    (parent : String -> IO (Either NativeAnalyzeRootError String))
+    : IO (Either NativeAnalyzeRootError String) :=
+    (fix seek (remaining : Nat) (current : String) (seen : List String)
+        : IO (Either NativeAnalyzeRootError String) :=
+      if notb(native_analyze_root_path_valid current) then io_pure (Either NativeAnalyzeRootError String)
+          (Left NativeAnalyzeRootError String (NativeAnalyzeRootCanonical current))
+      else match remaining with
+      | Z => io_pure (Either NativeAnalyzeRootError String)
+          (Left NativeAnalyzeRootError String (NativeAnalyzeRootTraversalLimit current fuel))
+      | S left => match! inspect current with
+        | Left error => io_pure (Either NativeAnalyzeRootError String) (Left NativeAnalyzeRootError String error)
+        | Right present => if present then io_pure (Either NativeAnalyzeRootError String)
+            (Right NativeAnalyzeRootError String current)
+          else if native_analyze_root_boundary current then io_pure (Either NativeAnalyzeRootError String)
+              (Left NativeAnalyzeRootError String (NativeAnalyzeRootMissingSeal caller))
+          else match left with
+            | Z => io_pure (Either NativeAnalyzeRootError String)
+                (Left NativeAnalyzeRootError String (NativeAnalyzeRootTraversalLimit current fuel))
+            | S _ => match! parent current with
+              | Left error => io_pure (Either NativeAnalyzeRootError String) (Left NativeAnalyzeRootError String error)
+              | Right value => match native_analyze_root_parent_checked current seen value with
+                | Left error => io_pure (Either NativeAnalyzeRootError String) (Left NativeAnalyzeRootError String error)
+                | Right canonical => seek left canonical (Cons String current seen)
+                end
+              end
+            end
+        end
+      end) fuel caller [];
+
+def native_analyze_repo_root_with (environment : Maybe String) (caller : String)
+    (configured_root : IO (Either QualityInputError String))
+    (inspect : String -> IO (Either NativeAnalyzeRootError Bool))
+    (parent : String -> IO (Either NativeAnalyzeRootError String))
+    : IO (Either NativeAnalyzeRootError String) :=
+    match environment with
+    | Just _ => do let! resolved := configured_root;
+        io_pure (Either NativeAnalyzeRootError String)
+          (mapLeft QualityInputError String NativeAnalyzeRootError NativeAnalyzeRootExplicit resolved)
+    | Nothing => native_analyze_root_search_with native_analyze_root_search_limit caller inspect parent
+    end;
+
+def native_analyze_repo_root (caller : String) : IO (Either NativeAnalyzeRootError String) :=
+    do let! environment := prim_env_get "OURO_ROOT";
+       native_analyze_repo_root_with environment caller quality_repo_root native_analyze_root_marker native_analyze_root_parent;
+
+inductive NativeAnalyzeRequest : Type :=
+  | MkNativeAnalyzeRequest : List String -> List String -> List String
+      -> Maybe String -> NativeAnalyzeRequest;
+
+def native_analyze_request_words (request : NativeAnalyzeRequest) : List String :=
+    match request with | MkNativeAnalyzeRequest words _ _ _ => words end;
+
+def native_analyze_request_flags (request : NativeAnalyzeRequest) : List String :=
+    match request with | MkNativeAnalyzeRequest _ flags _ _ => flags end;
+
+def native_analyze_request_scopes (request : NativeAnalyzeRequest) : List String :=
+    match request with | MkNativeAnalyzeRequest _ _ scopes _ => scopes end;
+
+def native_analyze_request_baseline (request : NativeAnalyzeRequest) : Maybe String :=
+    match request with | MkNativeAnalyzeRequest _ _ _ baseline => baseline end;
+
+def native_analyze_bool_words : List String :=
+    ["--strict", "--include-fixtures", "--dump-facts", "--enable-deadcode",
+      "--enable-format", "--architecture-only", "--local-only", ..native_analyze_drive_words];
+
+def native_analyze_canonical_words : List String -> List String :=
+  fix canonical (words : List String) : List String :=
+    match words with
+    | Nil => []
+    | Cons word rest =>
+        if native_analyze_option_takes_value word then
+          match rest with
+          | Nil => [word]
+          | Cons value more => [word, value, ..canonical more]
+          end
+        else match str_strip_prefix word "--scope=" with
+          | Just value => ["--scope", value, ..canonical rest]
+          | Nothing => match str_strip_prefix word "--api-baseline=" with
+            | Just value => ["--api-baseline", value, ..canonical rest]
+            | Nothing => if str_eq word "--" then
+                concat_map String String (fun (value : String) => ["--scope", value]) rest
+              else Cons String word (canonical rest)
+            end
+          end
+    end;
+
+def native_analyze_parse (words : List String) : Either String NativeAnalyzeRequest :=
+    let expanded : List String := native_analyze_expand_style (native_analyze_canonical_words words) in
+    (fix parse (remaining : List String) (rev_flags : List String)
+        (rev_scopes : List String) (baseline : Maybe String)
+        : Either String NativeAnalyzeRequest :=
+      match remaining with
+      | Nil => Right String NativeAnalyzeRequest (MkNativeAnalyzeRequest expanded
+          (reverse_lin String rev_flags) (reverse_lin String rev_scopes) baseline)
+      | Cons word rest =>
+          if elem String str_eq word native_analyze_bool_words then
+            parse rest (Cons String word rev_flags) rev_scopes baseline
+          else if native_analyze_option_takes_value word then
+            match rest with
+            | Nil => Left String NativeAnalyzeRequest (str_concat "missing value for " word)
+            | Cons value tail => if str_null value then
+                Left String NativeAnalyzeRequest (str_concat "empty value for " word)
+              else if str_eq word "--scope" then
+                parse tail rev_flags (Cons String value rev_scopes) baseline
+              else parse tail (Cons String value (Cons String word rev_flags))
+                rev_scopes (Just String value)
+            end
+          else if str_starts word "-" then
+            Left String NativeAnalyzeRequest (str_concat "unsupported analyzer option: " word)
+          else parse rest rev_flags (Cons String word rev_scopes) baseline
+      end) expanded [] [] (Nothing String);
+
+def native_analyze_scope_roots (request : NativeAnalyzeRequest) : List String :=
+    match native_analyze_request_scopes request with
+    | Nil => ["std", "compiler", "tools/analyze", "samples"]
+    | Cons _ _ => native_analyze_request_scopes request
+    end;
+
+def native_analyze_absolute (directory : String) (path : String) : String :=
+    if path_is_abs path then quality_normalize_path path else quality_child directory path;
+
+def native_analyze_rebase_flags (caller : String) : List String -> List String :=
+    fix rebase (words : List String) : List String :=
+      match words with
+      | Nil => []
+      | Cons word rest => if str_eq word "--api-baseline" then
+          match rest with
+          | Nil => [word]
+          | Cons path more => Cons String word
+              (Cons String (native_analyze_absolute caller path) (rebase more))
+          end
+        else Cons String word (rebase rest)
+      end;
+
+inductive NativeAnalyzeSource : Type :=
+  | MkNativeAnalyzeSource : String -> String -> String -> NativeAnalyzeSource;
+
+def native_analyze_source_rel (source : NativeAnalyzeSource) : String :=
+    match source with | MkNativeAnalyzeSource rel _ _ => rel end;
+
+def native_analyze_source_path (source : NativeAnalyzeSource) : String :=
+    match source with | MkNativeAnalyzeSource _ path _ => path end;
+
+def native_analyze_source_text (source : NativeAnalyzeSource) : String :=
+    match source with | MkNativeAnalyzeSource _ _ text => text end;
+
+def native_analyze_order_sources : List NativeAnalyzeSource -> List NativeAnalyzeSource :=
+    quality_sort NativeAnalyzeSource (fun (a : NativeAnalyzeSource) (b : NativeAnalyzeSource) =>
+      prim_string_le (native_analyze_source_rel a) (native_analyze_source_rel b));
+
+private def native_analyze_space_ogham : Nat := 5760;
+private def native_analyze_space_en_quad : Nat := 8192;
+private def native_analyze_space_hair : Nat := 8202;
+private def native_analyze_line_separator : Nat := 8232;
+private def native_analyze_paragraph_separator : Nat := 8233;
+private def native_analyze_space_narrow_no_break : Nat := 8239;
+private def native_analyze_space_medium_mathematical : Nat := 8287;
+private def native_analyze_space_ideographic : Nat := 12288;
+
+def native_analyze_suppression_space (code : Nat) : Bool :=
+    orb(elem Nat eq_nat code [9, 10, 11, 12, 13, 28, 29, 30, 31, 32, 133, 160,
+      native_analyze_space_ogham, native_analyze_line_separator, native_analyze_paragraph_separator,
+      native_analyze_space_narrow_no_break, native_analyze_space_medium_mathematical,
+      native_analyze_space_ideographic],
+      andb(leb_nat native_analyze_space_en_quad code, leb_nat code native_analyze_space_hair));
+
+def native_analyze_drop_space_codes : Nat -> List Nat -> List Nat :=
+    fix skip (fuel : Nat) (bytes : List Nat) : List Nat :=
+      match fuel with
+      | Z => bytes
+      | S left => match source_take_scalar bytes with
+        | Nothing => bytes
+        | Just decoded => match decoded with
+          | MkPair scalar rest => if native_analyze_suppression_space scalar then
+              skip left rest else bytes
+          end
+        end
+      end;
+
+-- The legacy selector permits Unicode whitespace and line breaks after --.
+def native_analyze_has_suppression (text : String) : Bool :=
+    let prefix : List Nat := str_codes "ouro-lint:" in
+    (fix seek (fuel : Nat) (bytes : List Nat) (line_start : Bool) : Bool :=
+      match fuel with
+      | Z => False
+      | S remaining =>
+          let pending : List Nat := if line_start then native_analyze_drop_space_codes fuel bytes else bytes in
+          let marker : Bool := if line_start then
+              if is_prefix Nat eq_nat [45, 45] pending then
+                is_prefix Nat eq_nat prefix (native_analyze_drop_space_codes fuel (drop Nat 2 pending))
+              else False
+            else False in
+          if marker then True else match pending with
+            | Nil => False
+            | Cons byte rest => seek remaining rest (eq_nat byte 10)
+            end
+      end) (str_len text) (str_codes text) True;
+
+def native_analyze_source_facts (source : NativeAnalyzeSource) : NativeAnalyzeSourceFacts :=
+    NativeAnalyzeSourceFactsOf (native_analyze_source_rel source)
+      (str_len (native_analyze_source_text source))
+      (native_analyze_has_suppression (native_analyze_source_text source));
+
+def native_analyze_should_batch_sources (flags : List String) (files : List NativeAnalyzeSource) : Bool :=
+    native_analyze_should_batch_by NativeAnalyzeSource flags native_analyze_source_rel
+      (fun (source : NativeAnalyzeSource) => str_len (native_analyze_source_text source))
+      (fun (source : NativeAnalyzeSource) => native_analyze_has_suppression (native_analyze_source_text source))
+      files;
+
+inductive NativeAnalyzeInputError : Type :=
+  | NativeAnalyzeInventoryError : QualityInputError -> NativeAnalyzeInputError
+  | NativeAnalyzeSourceRead : String -> FsError -> NativeAnalyzeInputError
+  | NativeAnalyzeSourceBoundedRead : String -> FsBoundedReadError -> NativeAnalyzeInputError
+  | NativeAnalyzeOutsideRoot : String -> NativeAnalyzeInputError
+  | NativeAnalyzeEmptySelection : NativeAnalyzeInputError
+  | NativeAnalyzeGlobalFiles : Nat -> NativeAnalyzeInputError
+  | NativeAnalyzeGlobalFileBound : String -> Nat -> NativeAnalyzeInputError
+  | NativeAnalyzeGlobalBound : Nat -> Nat -> NativeAnalyzeInputError
+  | NativeAnalyzeDriveBound : String -> Nat -> NativeAnalyzeInputError
+  | NativeAnalyzeRootFailure : NativeAnalyzeRootError -> NativeAnalyzeInputError;
+
+def native_analyze_input_message (error : NativeAnalyzeInputError) : String :=
+    match error with
+    | NativeAnalyzeRootFailure cause => native_analyze_root_error_message cause
+    | NativeAnalyzeInventoryError cause => quality_input_message cause
+    | NativeAnalyzeSourceRead path cause => str_cat3 path ": " (fs_error_message cause)
+    | NativeAnalyzeSourceBoundedRead path cause => str_cat3 path ": " (fs_bounded_read_error_message cause)
+    | NativeAnalyzeOutsideRoot path => str_concat "source is outside repository root: " path
+    | NativeAnalyzeEmptySelection => "analyzer scope contains no selected source files"
+    | NativeAnalyzeGlobalFiles files => str_cat3
+        "global analyzer flags require a bounded scope (limit-files=8 files=" (str_of_nat files) ")"
+    | NativeAnalyzeGlobalFileBound path bytes => str_cat4
+        "global analyzer flags require a bounded scope (limit-bytes=65536 file=" path
+        " bytes=" (str_concat (str_of_nat bytes) ")")
+    | NativeAnalyzeGlobalBound files bytes => str_cat4
+        "global analyzer flags require a bounded scope (limit-files=8 limit-bytes=65536 files="
+        (str_of_nat files) " bytes=" (str_concat (str_of_nat bytes) ")")
+    | NativeAnalyzeDriveBound path bytes => str_cat4
+        "structured analyzer file exceeds the local safety limit (limit-bytes=40960 file="
+        path " bytes=" (str_concat (str_of_nat bytes) ")")
+    end;
+
+def native_analyze_source_read (flags : List String) (rel : String) (path : String)
+    : IO (Either NativeAnalyzeInputError String) :=
+    let cap : Maybe Nat := if native_analyze_global_requested flags then Just Nat native_analyze_global_source_limit
+      else if native_analyze_needs_drive flags then Just Nat (mul 40 (mul 32 32)) else Nothing Nat in
+    match cap with
+    | Nothing => do let! read := fs_read_checked path;
+        io_pure (Either NativeAnalyzeInputError String)
+          (mapLeft FsError String NativeAnalyzeInputError (NativeAnalyzeSourceRead path) read)
+    | Just bytes => do let! read := fs_read_bounded_checked bytes path;
+        io_pure (Either NativeAnalyzeInputError String) (match read with
+          | Right contents => Right NativeAnalyzeInputError String contents
+          | Left error => Left NativeAnalyzeInputError String (match error with
+            | FsBoundedReadTooLarge _ size => if native_analyze_global_requested flags then
+                NativeAnalyzeGlobalFileBound rel size else NativeAnalyzeDriveBound rel size
+            | FsBoundedReadInvalidPath => NativeAnalyzeSourceBoundedRead path error
+            | FsBoundedReadPathTooLong => NativeAnalyzeSourceBoundedRead path error
+            | FsBoundedReadUnsafeEntry => NativeAnalyzeSourceBoundedRead path error
+            | FsBoundedReadChanged => NativeAnalyzeSourceBoundedRead path error
+            | FsBoundedReadOsError _ _ => NativeAnalyzeSourceBoundedRead path error
+            end)
+          end)
+    end;
+
+def native_analyze_select (root : String) (flags : List String)
+    : List String -> List (Pair String String)
+      -> IO (Either NativeAnalyzeInputError (List (Pair String String))) :=
+  fix select (remaining : List String) (rev : List (Pair String String))
+      : IO (Either NativeAnalyzeInputError (List (Pair String String))) :=
+    match remaining with
+    | Nil => match rev with
+      | Nil => io_pure (Either NativeAnalyzeInputError (List (Pair String String)))
+          (Left NativeAnalyzeInputError (List (Pair String String)) NativeAnalyzeEmptySelection)
+      | Cons _ _ => io_pure (Either NativeAnalyzeInputError (List (Pair String String)))
+          (Right NativeAnalyzeInputError (List (Pair String String)) (reverse_lin (Pair String String) rev))
+      end
+    | Cons path rest => do let! canonical := prim_fs_realpath path;
+        let normalized : String := quality_normalize_path canonical in
+        let rel : String := path_relative root normalized in
+        if notb(andb(path_under root normalized, native_skeleton_relative rel)) then
+          io_pure (Either NativeAnalyzeInputError (List (Pair String String)))
+            (Left NativeAnalyzeInputError (List (Pair String String)) (NativeAnalyzeOutsideRoot path))
+        else if andb(notb(native_analyze_flag_present "--include-fixtures" flags), is_fixture rel)
+          then select rest rev
+        else select rest (Cons (Pair String String) (MkPair String String rel canonical) rev)
+    end;
+
+def native_analyze_discover (root : String) (caller : String) (request : NativeAnalyzeRequest)
+    : IO (Either NativeAnalyzeInputError (List NativeAnalyzeSource)) :=
+    match! quality_inventory quality_skip_dir (fun (_ : String) => True)
+      (map String String (native_analyze_absolute caller) (native_analyze_scope_roots request)) with
+    | Left error => io_pure (Either NativeAnalyzeInputError (List NativeAnalyzeSource))
+        (Left NativeAnalyzeInputError (List NativeAnalyzeSource) (NativeAnalyzeInventoryError error))
+    | Right paths => match!
+        native_analyze_select root (native_analyze_request_flags request) paths [] with
+      | Left error => io_pure (Either NativeAnalyzeInputError (List NativeAnalyzeSource))
+          (Left NativeAnalyzeInputError (List NativeAnalyzeSource) error)
+      | Right files => if andb(native_analyze_global_requested (native_analyze_request_flags request),
+            ltb_nat native_analyze_global_file_limit (length (Pair String String) files)) then
+          io_pure (Either NativeAnalyzeInputError (List NativeAnalyzeSource))
+            (Left NativeAnalyzeInputError (List NativeAnalyzeSource)
+              (NativeAnalyzeGlobalFiles (length (Pair String String) files)))
+        else (fix load (remaining : List (Pair String String)) (rev : List NativeAnalyzeSource)
+          : IO (Either NativeAnalyzeInputError (List NativeAnalyzeSource)) :=
+        match remaining with
+        | Nil => match rev with
+          | Nil => io_pure (Either NativeAnalyzeInputError (List NativeAnalyzeSource))
+              (Left NativeAnalyzeInputError (List NativeAnalyzeSource) NativeAnalyzeEmptySelection)
+          | Cons _ _ => io_pure (Either NativeAnalyzeInputError (List NativeAnalyzeSource))
+              (Right NativeAnalyzeInputError (List NativeAnalyzeSource)
+                (native_analyze_order_sources rev))
+          end
+        | Cons file rest => match file with | MkPair rel canonical =>
+          match! native_analyze_source_read (native_analyze_request_flags request) rel canonical with
+          | Left error => io_pure (Either NativeAnalyzeInputError (List NativeAnalyzeSource))
+              (Left NativeAnalyzeInputError (List NativeAnalyzeSource) error)
+          | Right text => load rest (Cons NativeAnalyzeSource
+              (MkNativeAnalyzeSource rel canonical text) rev)
+          end
+          end
+        end) files []
+      end
+    end;
+
+private def native_analyze_drive_scope_guard (flags : List String) (files : List NativeAnalyzeSource)
+    : Either NativeAnalyzeInputError Unit :=
+    if native_analyze_needs_drive flags then
+      let limit : Nat := mul 40 (mul 32 32) in
+      match find NativeAnalyzeSource (fun (file : NativeAnalyzeSource) =>
+          ltb_nat limit (str_len (native_analyze_source_text file))) files with
+      | Nothing => Right NativeAnalyzeInputError Unit MkUnit
+      | Just file => Left NativeAnalyzeInputError Unit (NativeAnalyzeDriveBound
+          (native_analyze_source_rel file) (str_len (native_analyze_source_text file)))
+      end
+    else Right NativeAnalyzeInputError Unit MkUnit;
+
+def native_analyze_scope_guard (flags : List String) (files : List NativeAnalyzeSource)
+    : Either NativeAnalyzeInputError Unit :=
+    if native_analyze_global_requested flags then
+      let count : Nat := length NativeAnalyzeSource files in
+      let bytes : Nat := foldl NativeAnalyzeSource Nat
+        (fun (total : Nat) (file : NativeAnalyzeSource) => add total (str_len (native_analyze_source_text file)))
+        Z files in
+      if native_analyze_global_size_valid count bytes then native_analyze_drive_scope_guard flags files
+      else Left NativeAnalyzeInputError Unit (NativeAnalyzeGlobalBound count bytes)
+    else native_analyze_drive_scope_guard flags files;

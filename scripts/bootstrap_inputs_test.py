@@ -67,6 +67,24 @@ class BootstrapInputTests(unittest.TestCase):
             inputs.unpack(output)
         self.assertEqual((output / next(iter(self.contents))).read_bytes(), next(iter(self.contents.values())))
 
+    def test_bridge2_reproduces_separately_and_rejects_a_legacy_member(self):
+        output = self.root / "next"
+        manifest, contents = inputs.read_bundle(bridge2=True)
+        self.assertEqual(manifest["stage0"], self.manifest["stage0"])
+        self.assertEqual(inputs.unpack(output, bridge2=True), manifest)
+        self.assertEqual({path.relative_to(output).as_posix(): path.read_bytes()
+                          for path in output.rglob("*") if path.is_file()}, contents)
+        reproduced = self.root / "bridge2.tar.gz"
+        inputs.repack(output, reproduced, bridge2=True)
+        self.assertEqual(reproduced.read_bytes(), (inputs.ROOT / inputs.BRIDGE2_ARCHIVE).read_bytes())
+
+        name, row = manifest["files"].popitem()
+        manifest["files"][name.replace("bridge2/", "bridge/", 1)] = row
+        (self.root / inputs.BRIDGE2_MANIFEST).write_text(json.dumps(manifest), encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "unexpected member role"):
+            inputs.unpack(self.root / "invalid", self.root, bridge2=True)
+        self.assertFalse((self.root / "invalid").exists())
+
     def test_symlink_member_rejected_before_any_write(self):
         rows = self.entries()
         rows[0][0].type = tarfile.SYMTYPE

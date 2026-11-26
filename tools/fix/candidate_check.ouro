@@ -35,64 +35,54 @@ def fx_check_reply (source : String) (output : String) : Bool :=
              end))));
 
 def fx_check_posix_unsupported (error : ProcessCaptureError) : Bool :=
-    match error with
-    | ProcessCaptureOsError code => eq_nat code 120
-    | ProcessCaptureInvalidLimits _ => False
-    | ProcessCaptureTimedOut _ _ _ => False
-    | ProcessCaptureCleanupFailed _ => False
-    | ProcessCaptureResourceLimit _ _ _ _ => False
-    | ProcessCaptureOutputLimit _ _ _ => False
-    | ProcessCaptureProtocolError _ => False
-    end
+    if let ProcessCaptureOsError code := error then eq_nat code 120 else False
 
 def fx_check_result (path : String) (source : String) (result : ProcResult)
     : Either FsError Unit :=
-    match andb (proc_ok result)
-        (andb(str_null (proc_stderr result), fx_check_reply(source, proc_stdout result))) with
-    | True => Right FsError Unit MkUnit
-    | False => Left FsError Unit (FsOperationFailed
+    if
+      andb (proc_ok result)
+        (andb(str_null (proc_stderr result), fx_check_reply(source, proc_stdout result))) then
+      Right FsError Unit MkUnit
+    else
+      Left FsError Unit (FsOperationFailed
         (str_cat4 "fix refused: compiler check exit=" (prim_string_of_nat (proc_code result))
-          "; " (proc_stderr result)) path)
-    end;
+          "; " (proc_stderr result)) path);
 
 def fx_check_worker_file (binary : String) (path : String) (source : String)
     : IO (Either FsError Unit) :=
     do let! scratch := prim_fs_temp_file_in (native_build_dirname path);
-       match prim_string_eq scratch "" with
-       | True => fs_err Unit (FsOperationFailed
+       (if prim_string_eq scratch "" then
+         fs_err Unit (FsOperationFailed
            "fix refused: compiler check scratch unavailable" path)
-       | False =>
-           do let! written := fs_write_checked scratch source;
-              match written with
-              | Left error =>
-                  do fs_remove scratch;
-                     fs_err Unit (FsOperationFailed
-                       (str_concat("fix refused: ", fs_error_message error)) path)
-              | Right _ =>
-                  do let! ran := process_run_spec_checked
-                       (command_spec binary [path, "file", scratch]);
-                     fs_remove scratch;
-                     match ran with
-                     | Left error => fs_err Unit (FsOperationFailed
-                         (str_concat("fix refused: ", process_error_message error)) path)
-                     | Right result => io_pure (Either FsError Unit)
-                         (fx_check_result path source result)
-                     end
-              end
-       end
+       else
+         match! fs_write_checked scratch source with
+         | Left error =>
+             do fs_remove scratch;
+                fs_err Unit (FsOperationFailed
+                  (str_concat("fix refused: ", fs_error_message error)) path)
+         | Right _ =>
+             do let! ran := process_run_spec_checked
+                  (command_spec binary [path, "file", scratch]);
+                fs_remove scratch;
+                match ran with
+                | Left error => fs_err Unit (FsOperationFailed
+                    (str_concat("fix refused: ", process_error_message error)) path)
+                | Right result => io_pure (Either FsError Unit)
+                    (fx_check_result path source result)
+                end
+         end)
 
 def fx_check_worker (binary : String) (path : String) (source : String) : IO (Either FsError Unit) :=
-    do let! captured := process_run_spec_captured_bounded_with_input fx_check_limits
-         (command_spec binary [path, prim_string_of_nat (str_len source)]) source;
-       match captured with
-       | Left error => match fx_check_posix_unsupported error with
-         | True => fx_check_worker_file binary path source
-         | False => fs_err Unit (FsOperationFailed
-             (str_concat("fix refused: ", process_capture_error_message error)) path)
-         end
-       | Right captured_result => io_pure (Either FsError Unit)
-           (fx_check_result path source (process_capture_proc_result captured_result))
-       end
+    match! process_run_spec_captured_bounded_with_input fx_check_limits
+      (command_spec binary [path, prim_string_of_nat (str_len source)]) source with
+    | Left error => if fx_check_posix_unsupported error then
+        fx_check_worker_file binary path source
+      else
+        fs_err Unit (FsOperationFailed
+          (str_concat("fix refused: ", process_capture_error_message error)) path)
+    | Right captured_result => io_pure (Either FsError Unit)
+        (fx_check_result path source (process_capture_proc_result captured_result))
+    end
 
 def fx_check_executable : IO (Either FsError String) :=
     do let! argv := prim_argv;
@@ -108,41 +98,26 @@ def fx_check_executable : IO (Either FsError String) :=
 def fx_check_compiler_rejected (error : FsError) : Bool :=
     str_contains(fs_error_message error, "compiler rejected source")
 
+private def fx_check_candidate_with (allow_original_error : FsError -> Bool)
+    (path : String) (original : String) (candidate : String) : IO (Either FsError Unit) :=
+    match! fx_check_executable with
+    | Left error => fs_err Unit (FsOperationFailed
+        (str_concat("fix refused: compiler worker unavailable: ", fs_error_message error)) path)
+    | Right binary =>
+        match! fx_check_worker binary path original with
+        | Left error => if allow_original_error error then fs_ok Unit MkUnit
+          else fs_err Unit error
+        | Right _ => if str_eq original candidate then fs_ok Unit MkUnit
+          else fx_check_worker binary path candidate
+        end
+    end
+
 def fx_check_candidate (path : String) (original : String) (candidate : String) : IO (Either FsError Unit) :=
-    do let! executable := fx_check_executable;
-       match executable with
-       | Left error => fs_err Unit (FsOperationFailed
-           (str_concat("fix refused: compiler worker unavailable: ", fs_error_message error)) path)
-       | Right binary =>
-           do let! accepted := fx_check_worker binary path original;
-              match accepted with
-              | Left error => fs_err Unit error
-              | Right _ => match str_eq original candidate with
-                | True => fs_ok Unit MkUnit
-                | False => fx_check_worker binary path candidate
-                end
-              end
-       end
+    fx_check_candidate_with (fun (_error : FsError) => False) path original candidate
 
 -- Formatter writes may target editor snippets that are not closed units.
 -- If the original already typechecks, the candidate must typecheck too.
 -- Worker, protocol, and IO failures still refuse the write.
 def fmt_check_candidate (path : String) (original : String) (candidate : String)
     : IO (Either FsError Unit) :=
-    do let! executable := fx_check_executable;
-       match executable with
-       | Left error => fs_err Unit (FsOperationFailed
-           (str_concat("fix refused: compiler worker unavailable: ", fs_error_message error)) path)
-       | Right binary =>
-           do let! accepted := fx_check_worker binary path original;
-              match accepted with
-              | Left error => match fx_check_compiler_rejected error with
-                | True => fs_ok Unit MkUnit
-                | False => fs_err Unit error
-                end
-              | Right _ => match str_eq original candidate with
-                | True => fs_ok Unit MkUnit
-                | False => fx_check_worker binary path candidate
-                end
-              end
-       end
+    fx_check_candidate_with fx_check_compiler_rejected path original candidate

@@ -10,22 +10,18 @@ import "scan.ouro",
 -- coverage/binder/let rewrites still lack compiler-owned identity certificates.
 def fx_applicability (edit : FxEdit) : QualityApplicability :=
     let code : String := fx_edit_rule edit in
-    match elem String str_eq code ["dup-import", "do-bind", "double-semi"] with
-    | True => QualityMechanicalEdit
-    | False => match elem String str_eq code
-        ["dead-let", "identity-let", "list-literal", "peano-literal", "unused-binder", "unreachable-arm", "import-alias", "list-type", "nonrec-fix"] with
-      | True => QualitySuggestedEdit
-      | False => QualityNoEdit
-      end
-    end;
+    if elem String str_eq code ["dup-import", "do-bind", "double-semi"] then QualityMechanicalEdit
+    else
+      if
+        elem String str_eq code
+          ["dead-let", "identity-let", "list-literal", "peano-literal", "unused-binder", "unreachable-arm", "import-alias", "list-type", "nonrec-fix"] then
+        QualitySuggestedEdit
+      else QualityNoEdit;
 
--- Only syntax repairs have independently verifiable certificates today. Other rule families
--- remain review-required until they supply their own preservation proofs.
+-- Independently verifiable certificates cover syntax repairs. Other rule
+-- families require review until they provide preservation proofs.
 def fx_edit_priority (edit : FxEdit) : Nat :=
-    match elem String str_eq (fx_edit_rule edit) ["dup-import", "do-bind", "double-semi"] with
-    | True => 0
-    | False => 3
-    end;
+    if elem String str_eq (fx_edit_rule edit) ["dup-import", "do-bind", "double-semi"] then 0 else 3;
 
 def fx_same_edit (a : FxEdit) (b : FxEdit) : Bool :=
     andb (eq_nat(fx_edit_start a, fx_edit_start b))
@@ -57,18 +53,24 @@ def fx_machine_edit (edit : FxEdit) : Bool :=
 -- any edit of a rule touches trivia, keep that whole rule's proposals for review;
 -- never apply half an identity-let/nonrec rewrite. The rule inventory is fixed
 -- and small, so this does not introduce a source-size pairwise scan.
-def fx_trivia_blocked (src : String) (proposals : List FxEdit) : List String :=
+private def fx_trivia_blocked_for (include : FxEdit -> Bool) (src : String)
+    (proposals : List FxEdit) : List String :=
     dedup_adjacent String str_eq (quality_sort String prim_string_le
       (map FxEdit String fx_edit_rule
-        (filter FxEdit (fun (edit : FxEdit) => notb (fx_edit_preserves_trivia src edit)) proposals)));
+        (filter FxEdit (fun (edit : FxEdit) =>
+          if include edit then notb (fx_edit_preserves_trivia src edit) else False) proposals)));
 
+def fx_trivia_blocked (src : String) (proposals : List FxEdit) : List String :=
+    fx_trivia_blocked_for (fun (_ : FxEdit) => True) src proposals;
+
+-- Applicability is fixed per rule. A suggested edit cannot block a mechanical peer.
 def fx_automatic_proposals (src : String) (proposals : List FxEdit) : List FxEdit :=
-    let blocked : List String := fx_trivia_blocked src proposals in
+    let blocked : List String := fx_trivia_blocked_for fx_machine_edit src proposals in
     filter FxEdit (fun (edit : FxEdit) => andb (fx_machine_edit edit)
       (notb (elem String str_eq (fx_edit_rule edit) blocked))) proposals;
 
 def fx_review_proposals (src : String) (proposals : List FxEdit) : List FxEdit :=
-    let blocked : List String := fx_trivia_blocked src proposals in
+    let blocked : List String := fx_trivia_blocked_for fx_machine_edit src proposals in
     filter FxEdit (fun (edit : FxEdit) => orb (notb (fx_machine_edit edit))
       (elem String str_eq (fx_edit_rule edit) blocked)) proposals;
 
@@ -114,35 +116,33 @@ def fx_disjoint_checked : List FxEdit -> Maybe FxEdit -> List FxEdit
     | Nil => Right(FxPlanError, List FxEdit, reverse_lin FxEdit rev)
     | Cons edit rest => match previous with
       | Nothing => go rest (Just FxEdit edit) [edit]
-      | Just last => match fx_same_edit last edit with
-        | True => go rest previous rev
-        | False => match orb (eq_nat(fx_edit_start last, fx_edit_start edit))
-            (ltb_nat(fx_edit_start edit, fx_edit_end last)) with
-          | True => Left FxPlanError (List FxEdit)
+      | Just last => if fx_same_edit last edit then go rest previous rev
+        else
+          if
+            orb (eq_nat(fx_edit_start last, fx_edit_start edit))
+              (ltb_nat(fx_edit_start edit, fx_edit_end last)) then
+            Left FxPlanError (List FxEdit)
               (FxPlanConflict(fx_edit_rule last, fx_edit_rule edit))
-          | False => go(rest, Just FxEdit edit, Cons FxEdit edit rev)
-          end
-        end
+          else go(rest, Just FxEdit edit, Cons FxEdit edit rev)
       end
     end;
 
 def fx_checked_plan (src : String) (proposals : List FxEdit) : Either FxPlanError (List FxEdit) :=
-    match all FxEdit (fx_valid_edit src) proposals with
-    | False => Left FxPlanError (List FxEdit) FxPlanInvalidEdit
-    | True =>
-        let automatic : List FxEdit := fx_automatic_proposals src proposals in
-        match any FxEdit (fun (edit : FxEdit) =>
-            str_eq(fx_slice(src, fx_edit_start edit, fx_edit_end edit), fx_edit_rep edit)) automatic with
-        | True => Left FxPlanError (List FxEdit) FxPlanNoImprove
-        | False => match automatic with
-          | Nil => Right FxPlanError (List FxEdit) []
-          | Cons first rest =>
-              let priority : Nat := foldl FxEdit Nat (fun (best : Nat) (edit : FxEdit) =>
-                match ltb_nat(fx_edit_priority edit, best) with
-                | True => fx_edit_priority edit | False => best end) (fx_edit_priority first) rest in
-              fx_disjoint_checked (fx_sort_edits
-                (filter FxEdit (fun (edit : FxEdit) => eq_nat(priority, fx_edit_priority edit)) automatic))
-                (Nothing FxEdit) []
-          end
+    if all FxEdit (fx_valid_edit src) proposals then
+      let automatic : List FxEdit := fx_automatic_proposals src proposals in
+      if
+        any FxEdit (fun (edit : FxEdit) =>
+          str_eq(fx_slice(src, fx_edit_start edit, fx_edit_end edit), fx_edit_rep edit)) automatic then
+        Left FxPlanError (List FxEdit) FxPlanNoImprove
+      else
+        match automatic with
+        | Nil => Right FxPlanError (List FxEdit) []
+        | Cons first rest =>
+            let priority : Nat := foldl FxEdit Nat (fun (best : Nat) (edit : FxEdit) =>
+              match ltb_nat(fx_edit_priority edit, best) with
+              | True => fx_edit_priority edit | False => best end) (fx_edit_priority first) rest in
+            fx_disjoint_checked (fx_sort_edits
+              (filter FxEdit (fun (edit : FxEdit) => eq_nat(priority, fx_edit_priority edit)) automatic))
+              (Nothing FxEdit) []
         end
-    end;
+    else Left FxPlanError (List FxEdit) FxPlanInvalidEdit;

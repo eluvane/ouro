@@ -1,0 +1,65 @@
+-- Only authenticated U32 operands select a full U64 product.
+import "managed_fast_nat.ouro",
+  "managed_nat_mul_shapes.ouro",
+  "managed_nat.ouro",
+  "managed_closures.ouro",
+  "managed_model.ouro",
+  "lower_model.ouro",
+  "lower_loop.ouro",
+  "mir_model.ouro",
+  "../primitive_model.ouro",
+  "../file_check_model.ouro";
+
+def managed_fast_nat_mul_bits (compiler : ManagedCompiler) (left : MirValue) (right : MirValue)
+    (state : ManagedState) : Either NativeLowerError ManagedResult :=
+    lower_bind ManagedResult ManagedResult (managed_convert MirU64 MirZeroExtend left state)
+      (fun (first : ManagedResult) => match first with | ManagedResultOf a after_left =>
+        lower_bind ManagedResult ManagedResult (managed_convert MirU64 MirZeroExtend right after_left)
+          (fun (second : ManagedResult) => match second with | ManagedResultOf b after_right =>
+            lower_bind ManagedResult ManagedResult (managed_binary MirU64 MirMul a b after_right)
+              (fun (product : ManagedResult) => match product with | ManagedResultOf bits after =>
+                managed_nat_from_word compiler PrimitiveWordU64 bits after end) end) end);
+
+-- Lower the original closed fixpoint directly, so recursive calls retain its
+-- ordinary self closure rather than redispatching to the guarded global.
+def managed_fast_nat_mul_fallback (compiler : ManagedCompiler) (step : ManagedStep) (body : CoreTerm)
+    (left : MirValue) (right : MirValue) (state : ManagedState) : Either NativeLowerError ManagedResult :=
+    lower_bind ManagedResult ManagedResult (step ([] : List (Maybe MirValue)) body state)
+      (fun (original : ManagedResult) => match original with | ManagedResultOf closure next =>
+        lower_bind ManagedResult ManagedResult (managed_call compiler closure left next)
+          (fun (partial : ManagedResult) => match partial with | ManagedResultOf applied after =>
+            managed_call compiler applied right after end) end);
+
+def managed_fast_nat_mul_choose (compiler : ManagedCompiler) (step : ManagedStep) (body : CoreTerm)
+    (fits : MirValue) (left_bits : MirValue) (right_bits : MirValue)
+    (left : MirValue) (right : MirValue) (state : ManagedState) : Either NativeLowerError ManagedResult :=
+    lower_bind (Pair Nat ManagedState) ManagedResult (managed_fresh_local MirManagedPtr state)
+      (fun (fresh : Pair Nat ManagedState) => match fresh with | MkPair cell next =>
+        lower_bind LowerLoopBlocks ManagedResult (lower_loop_blocks (managed_flow next))
+          (fun (labels : LowerLoopBlocks) => match labels with | LowerLoopAt yes no finish flow =>
+            lower_bind ManagedResult ManagedResult (managed_fast_nat_mul_bits compiler left_bits right_bits
+              (managed_switch_block(yes, MirBranch fits yes no, managed_with_flow next flow)))
+              (fun (product : ManagedResult) => match product with | ManagedResultOf value after =>
+                lower_map ManagedResult ManagedResult (fun (ordinary : ManagedResult) => match ordinary with
+                  | ManagedResultOf fallback after_fallback => ManagedResultOf (MirUse cell)
+                      (managed_switch_block(finish, MirJump finish, managed_emit(MirMove cell fallback, after_fallback))) end)
+                  (managed_fast_nat_mul_fallback compiler step body left right
+                    (managed_switch_block(no, MirJump finish, managed_emit(MirMove cell value, after)))) end) end) end);
+
+def managed_fast_nat_mul_result (compiler : ManagedCompiler) (step : ManagedStep) (body : CoreTerm)
+    (left : MirValue) (right : MirValue) (state : ManagedState) : Either NativeLowerError ManagedResult :=
+    lower_bind ManagedNatWordResult ManagedResult (managed_nat_checked_word compiler PrimitiveWordU32 left state)
+      (fun (first : ManagedNatWordResult) => match first with | ManagedNatWordOf left_fits left_bits after_left =>
+        lower_bind ManagedNatWordResult ManagedResult (managed_nat_checked_word compiler PrimitiveWordU32 right after_left)
+          (fun (second : ManagedNatWordResult) => match second with | ManagedNatWordOf right_fits right_bits after_right =>
+            lower_bind ManagedResult ManagedResult (managed_binary MirU8 MirAnd left_fits right_fits after_right)
+              (fun (tested : ManagedResult) => match tested with | ManagedResultOf fits after =>
+                managed_fast_nat_mul_choose compiler step body fits left_bits right_bits left right after end) end) end);
+
+def managed_fast_nat_mul_global (compiler : ManagedCompiler) (step : ManagedStep) (fuel : Nat) (id : Nat)
+    (annotation : CoreTerm) (body : CoreTerm) (state : ManagedState) : Either NativeLowerError ManagedResult :=
+    lower_bind Bool ManagedResult (managed_nat_mul_recognize compiler fuel id annotation body)
+      (fun (selected : Bool) => match selected with
+        | False => step ([] : List (Maybe MirValue)) body state
+        | True => managed_fast_nat_binary_value compiler (managed_fast_nat_mul_result compiler step body)
+            2 ([] : List MirValue) state end);

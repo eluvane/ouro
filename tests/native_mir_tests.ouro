@@ -1,5 +1,6 @@
 import "native_indexed_memory_tests.ouro",
   "native_codegen_assembly_tests.ouro";
+import "compiler_wide_nat_fixtures.ouro";
 
 def mir_test_bytes (name : String) (actual : List Nat) (expected : List Nat) : Test :=
     assert_eq(name, str_join(",", map Nat String str_of_nat actual), str_join(",", map Nat String str_of_nat expected));
@@ -28,7 +29,8 @@ def mir_encoding_tests : List Test :=
       mir_test_encoding "stack probe reads byte without clobbering registers" (X64TestMemory8(X64Base(X64R10, codegen_disp 0), 0))
         ([65, 246, 2, 0] : List Nat),
       match x64_encode (X64TestMemory8(X64Base(X64R10, codegen_disp 0), 256)) with
-      | Left err => match err with | X64ByteOutOfRange byte => assert_true("probe immediate byte range", eq_nat byte 256)
+      | Left err => match (err : X64EncodeError) with
+        | X64ByteOutOfRange byte => assert_true("probe immediate byte range", eq_nat byte 256)
         | X64DisplacementOutOfRange => test_fail "probe immediate byte range" "wrong error"
         | X64StackPointerIndex => test_fail "probe immediate byte range" "wrong error"
         | X64ShiftOutOfRange _ _ => test_fail "probe immediate byte range" "wrong error" end
@@ -40,28 +42,10 @@ def mir_encoding_tests : List Test :=
       mir_test_frame "probed frame accounts for saved RBX" (PeProbedFrame ([X64Rbx] : List X64Register)
         pe_section_alignment (codegen_disp 0)) ([1, 14, 3, 0, 14, 1, 0, 2, 1, 48, 0, 0] : List Nat),
       match pe_encode_frame(7, PeProbedFrame([] : List X64Register, 40, codegen_disp 0)) with
-      | Left err => match err with | PeUnsupportedFrame id => assert_true("small frame cannot claim a probe layout", eq_nat id 7)
-        | PeInvalidByte _ => test_fail "small frame cannot claim a probe layout" "wrong error"
-        | PeImageTooLarge => test_fail "small frame cannot claim a probe layout" "wrong error"
-        | PeEmptyText => test_fail "small frame cannot claim a probe layout" "wrong error"
-        | PeDuplicateSymbol _ => test_fail "small frame cannot claim a probe layout" "wrong error"
-        | PeMissingSymbol _ => test_fail "small frame cannot claim a probe layout" "wrong error"
-        | PeInvalidSymbol _ => test_fail "small frame cannot claim a probe layout" "wrong error"
-        | PeInvalidName => test_fail "small frame cannot claim a probe layout" "wrong error"
-        | PeDuplicateLibrary => test_fail "small frame cannot claim a probe layout" "wrong error"
-        | PeDuplicateImport _ => test_fail "small frame cannot claim a probe layout" "wrong error"
-        | PeMissingImport _ => test_fail "small frame cannot claim a probe layout" "wrong error"
-        | PeEmptyLibrary => test_fail "small frame cannot claim a probe layout" "wrong error"
-        | PeInvalidFixup _ => test_fail "small frame cannot claim a probe layout" "wrong error"
-        | PeUnorderedFixup _ => test_fail "small frame cannot claim a probe layout" "wrong error"
-        | PeNonzeroFixup _ => test_fail "small frame cannot claim a probe layout" "wrong error"
-        | PeRelativeOverflow _ => test_fail "small frame cannot claim a probe layout" "wrong error"
-        | PeMissingEntry _ => test_fail "small frame cannot claim a probe layout" "wrong error"
-        | PeInvalidFunction _ => test_fail "small frame cannot claim a probe layout" "wrong error"
-        | PeUnorderedFunction _ => test_fail "small frame cannot claim a probe layout" "wrong error"
-        | PeStackProbeRequired _ => test_fail "small frame cannot claim a probe layout" "wrong error"
-        | PePrologMismatch _ => test_fail "small frame cannot claim a probe layout" "wrong error"
-        | PeInstructionError _ => test_fail "small frame cannot claim a probe layout" "wrong error" end
+      | Left err =>
+          if let PeUnsupportedFrame id := (err : PeError) then
+            assert_true("small frame cannot claim a probe layout", eq_nat id 7)
+          else test_fail "small frame cannot claim a probe layout" "wrong error"
       | Right _ => test_fail "small frame cannot claim a probe layout" "invalid frame accepted" end];
 
 def mir_codegen_error_text (err : NativeCodegenError) : String :=
@@ -182,6 +166,156 @@ def mir_run_memory_case (name : String) : IO Unit :=
           (mir_test_wide_flow False)] : List Test)
       | False => do eprintln "unknown native MIR case"; exit 2 end end;
 
+def mir_lookup_validation_function (id : Nat) (arguments : List MirLocal)
+    (result : Maybe MirType) : MirFunction :=
+    MirFunctionDef id ([108, 111, 111, 107, 117, 112] : List Nat) arguments ([] : List MirLocal)
+      result 0 ([MirBlockDef 0 ([] : List MirInstruction) MirTrap] : List MirBlock);
+
+def mir_lookup_validation_program (functions : List MirFunction) (externs : List MirExtern)
+    : MirProgram :=
+    MirProgramDef functions
+      ([MirDataDef 30 False (mir_managed_descriptor_bytes 1)] : List MirData)
+      ([mir_fixture_kernel externs] : List MirLibrary) 9000;
+
+def mir_lookup_validation_call (target : Nat) (dest : Maybe Nat) (arguments : List MirValue)
+    : MirFunction :=
+    MirFunctionDef 9000 ([112, 114, 111, 98, 101] : List Nat)
+      ([] : List MirLocal) ([] : List MirLocal) (Nothing MirType) 0
+      ([MirBlockDef 0 ([MirCall MirMayGc dest (MirDirect target) arguments] : List MirInstruction)
+        MirTrap] : List MirBlock);
+
+def mir_lookup_validation_alloc (allocator : Nat) (collector : Nat) : MirFunction :=
+    MirFunctionDef 9000 ([112, 114, 111, 98, 101] : List Nat) ([] : List MirLocal)
+      ([MirLocalDef 10 MirManagedPtr] : List MirLocal) (Nothing MirType) 0
+      ([MirBlockDef 0 ([MirManagedAlloc 10 allocator collector 30 (mir_fixture_nat MirUSize 8)]
+        : List MirInstruction) MirTrap] : List MirBlock);
+
+def mir_lookup_validation_outcome (expected : Maybe MirError)
+    (actual : Either MirError Unit) : Bool :=
+    match expected, actual with
+    | Nothing, Right _ => True
+    | Just wanted, Left problem => str_eq (mir_test_error_text wanted) (mir_test_error_text problem)
+    | Nothing, Left _ => False | Just _, Right _ => False
+    end;
+
+def mir_lookup_validation_wide : Nat := compiler_test_wide_nat_base;
+
+def mir_lookup_validation_tests : List Test :=
+    let no_result : Maybe MirType := Nothing MirType in
+    let no_error : Maybe MirError := Nothing MirError in
+    let no_dest : Maybe Nat := Nothing Nat in
+    let no_args : List MirValue := [] in
+    let plain (id : Nat) : MirFunction := mir_lookup_validation_function id [] no_result in
+    let wrong (id : Nat) : MirFunction :=
+      mir_lookup_validation_function id [MirLocalDef 0 MirU32] no_result in
+    let caller (id : Nat) : MirFunction := mir_lookup_validation_call id no_dest no_args in
+    let check (functions : List MirFunction) (target : Nat) : Either MirError Unit :=
+      mir_check_function (mir_lookup_validation_program functions []) 64 (caller target) in
+    let ordinary : List MirFunction := [plain 7, plain 8, plain 9] in
+    let allocator : MirFunction := mir_lookup_validation_function 7
+      [MirLocalDef 0 MirRawPtr, MirLocalDef 1 MirRawPtr, MirLocalDef 2 MirUSize]
+      (Just MirType MirRawPtr) in
+    let collector : MirFunction := mir_lookup_validation_function 8
+      [MirLocalDef 0 MirRawPtr] (Just MirType MirU8) in
+    let allocation : MirFunction := mir_lookup_validation_alloc 7 8 in
+    let bad_collector : MirFunction := mir_lookup_validation_function 8
+      [MirLocalDef 0 MirRawPtr] (Just MirType MirU32) in
+    let collector_program : MirProgram := MirProgramDef [allocator, collector] [] [] 9000 in
+    let other_collector_program : MirProgram := MirProgramDef [allocator, bad_collector] [] [] 9000 in
+    let collector_check : MirFunction -> Either MirError Unit := mir_check_function collector_program 64 in
+    let other_collector_check : MirFunction -> Either MirError Unit :=
+      mir_check_function other_collector_program 64 in
+    let wide : Nat := mir_lookup_validation_wide in
+    let first_program : MirProgram := mir_lookup_validation_program [plain 7] [] in
+    let second_program : MirProgram := mir_lookup_validation_program [wrong 7] [] in
+    let first_check : MirFunction -> Either MirError Unit := mir_check_function first_program 64 in
+    let second_check : MirFunction -> Either MirError Unit := mir_check_function second_program 64 in
+    let run_unit (work : Unit -> Either MirError Unit) : Either MirError Unit := work MkUnit in
+    let flow_error (_fuel : Nat) (_entry : Nat) (_args : List Nat) (_locals : List Nat)
+        (_blocks : List MirBlock) : Either MirError Unit :=
+      Left MirError Unit (MirUnreachableBlock 77) in
+    [ assert_true "MIR function lookup keeps an empty context missing"
+        (mir_lookup_validation_outcome (Just MirError (MirInvalidCall 7)) (check [] 7))
+    , assert_true "MIR function lookup finds the first function"
+        (mir_lookup_validation_outcome no_error (check ordinary 7))
+    , assert_true "MIR function lookup finds a middle function"
+        (mir_lookup_validation_outcome no_error (check ordinary 8))
+    , assert_true "MIR function lookup finds the last function"
+        (mir_lookup_validation_outcome no_error (check ordinary 9))
+    , assert_true "MIR function lookup preserves the missing target ID"
+        (mir_lookup_validation_outcome (Just MirError (MirInvalidCall 10)) (check ordinary 10))
+    , assert_true "MIR function lookup keeps the first invalid duplicate signature"
+        (mir_lookup_validation_outcome (Just MirError (MirInvalidCall 9000)) (check [wrong 7, plain 7] 7))
+    , assert_true "MIR function lookup keeps a valid signature before an invalid duplicate"
+        (mir_lookup_validation_outcome no_error (check [plain 7, wrong 7] 7))
+    , assert_true "MIR function lookup keeps function priority over a conflicting extern"
+        (mir_lookup_validation_outcome (Just MirError (MirInvalidCall 9000))
+          (mir_check_function (mir_lookup_validation_program [wrong 7]
+            [MirExternDef MirNoGc 7 [101] (MirSignatureOf [] no_result)]) 64 (caller 7)))
+    , assert_true "MIR function lookup preserves the extern fallback"
+        (mir_lookup_validation_outcome no_error
+          (mir_check_function (mir_lookup_validation_program []
+            [MirExternDef MirNoGc 7 [101] (MirSignatureOf [] no_result)]) 64 (caller 7)))
+    , assert_true "MIR function lookup equates zero and Peano keys"
+        (andb (mir_lookup_validation_outcome no_error (check [plain Z] 0))
+          (mir_lookup_validation_outcome no_error (check [plain (S (S Z))] 2)))
+    , assert_true "MIR function lookup retains full wide keys and their first signature"
+        (andb (mir_lookup_validation_outcome no_error (check [plain (S wide)] (add wide 1)))
+          (mir_lookup_validation_outcome (Just MirError (MirInvalidCall 9000))
+            (check [wrong (S wide), plain (add wide 1)] (add wide 1))))
+    , assert_true "MIR function lookup does not truncate wide keys to low limbs"
+        (andb (mir_lookup_validation_outcome (Just MirError (MirInvalidCall 1))
+            (check [plain (S wide)] 1))
+          (mir_lookup_validation_outcome (Just MirError (MirInvalidCall (add wide 2)))
+            (check [plain (S wide)] (add wide 2))))
+    , assert_true "MIR function lookup validates allocator and collector signatures"
+        (mir_lookup_validation_outcome no_error
+          (mir_check_function (mir_lookup_validation_program [allocator, collector] []) 64 allocation))
+    , assert_true "MIR function lookup keeps an invalid allocator before a valid duplicate"
+        (mir_lookup_validation_outcome (Just MirError (MirInvalidCall 7))
+          (mir_check_function (mir_lookup_validation_program [plain 7, allocator, collector] []) 64 allocation))
+    , assert_true "MIR function lookup keeps an invalid collector before a valid duplicate"
+        (mir_lookup_validation_outcome (Just MirError (MirInvalidCall 8))
+          (mir_check_function (mir_lookup_validation_program [allocator, plain 8, collector] []) 64 allocation))
+    , assert_true "MIR function lookup preserves allocator failure before collector failure"
+        (mir_lookup_validation_outcome (Just MirError (MirInvalidCall 7))
+          (mir_check_function (mir_lookup_validation_program [] []) 64 allocation))
+    , assert_true "MIR function lookup preserves a missing collector failure"
+        (mir_lookup_validation_outcome (Just MirError (MirInvalidCall 8))
+          (mir_check_function (mir_lookup_validation_program [allocator] []) 64 allocation))
+    , assert_true "MIR function lookup preserves argument failure before destination failure"
+        (mir_lookup_validation_outcome (Just MirError (MirTypeMismatch 9000))
+          (mir_check_function (mir_lookup_validation_program
+            [mir_lookup_validation_function 7 [MirLocalDef 0 MirU32] (Just MirType MirU32)] []) 64
+            (mir_lookup_validation_call 7 (Just Nat 10) [mir_fixture_nat MirU8 1])))
+    , assert_true "MIR function lookup respects the existing node budget before checking"
+        (mir_lookup_validation_outcome (Just MirError MirResourceExhausted)
+          (mir_check_program_with mir_check_function (MirLimitsWith 0 1000 64) mir_fixture_control))
+    , assert_true "MIR function lookup retains exact flow exhaustion"
+        (mir_lookup_validation_outcome (Just MirError MirResourceExhausted)
+          (mir_check_function first_program 0 (caller 7)))
+    , assert_true "MIR function lookup retains the first interleaved program partial"
+        (andb (mir_lookup_validation_outcome no_error (first_check (caller 7)))
+          (andb (mir_lookup_validation_outcome (Just MirError (MirInvalidCall 9000))
+              (second_check (caller 7)))
+            (mir_lookup_validation_outcome no_error (first_check (caller 7)))))
+    , assert_true "MIR function lookup retains collector context across interleaved program partials"
+        (andb (mir_lookup_validation_outcome (Just MirError (MirInvalidData 30)) (collector_check allocation))
+          (andb (mir_lookup_validation_outcome (Just MirError (MirInvalidCall 8))
+              (other_collector_check allocation))
+            (mir_lookup_validation_outcome (Just MirError (MirInvalidData 30)) (collector_check allocation))))
+    , assert_true "MIR function lookup retains the configured flow callback"
+        (mir_lookup_validation_outcome (Just MirError (MirUnreachableBlock 77))
+          (mir_check_function_with run_unit flow_error first_program 64 (caller 7)))
+    , assert_true "MIR function lookup preserves type failure before the flow callback"
+        (mir_lookup_validation_outcome (Just MirError (MirInvalidCall 9000))
+          (mir_check_function_with run_unit flow_error second_program 64 (caller 7)))
+    , assert_true "MIR function lookup preserves duplicate diagnostics before entry failure"
+        (mir_lookup_validation_outcome (Just MirError (MirDuplicateSymbol 7))
+          (mir_check_program_with mir_check_function (MirLimitsWith 1000 1000 64)
+            (mir_lookup_validation_program [plain 7, wrong 7] [])))
+    ];
+
 -- @entry main
 def main : IO Unit :=
     do let! arguments := argv;
@@ -189,7 +323,8 @@ def main : IO Unit :=
        | True => do mir_run_test_batch mir_tests;
                     mir_run_test_batch native_codegen_assembly_tests;
                     mir_run_memory_case "wide_flow";
-                    mir_run_memory_case "wide_missing_predecessor"
+                    mir_run_memory_case "wide_missing_predecessor";
+                    mir_run_test_batch mir_lookup_validation_tests
        | False => match andb (eq_nat(length String arguments, 2))
            (str_eq(nth String "" 1 arguments, "--list-cases")) with
          | True => println (str_join "\n" mir_memory_case_names)

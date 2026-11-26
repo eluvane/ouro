@@ -2,7 +2,8 @@
 -- No parser, registry, filesystem or error policy belongs in this cone.
 
 import "../std/natx.ouro",
-  "../std/utf8_scalar.ouro";
+  "../std/utf8_scalar.ouro",
+  "../std/listx.ouro";
 
 -- Byte predicates run per character. Cache numeral values so generated code
 -- does not rebuild Peano literals on each comparison.
@@ -39,7 +40,13 @@ def source_is_ident_start (c : Nat) : Bool :=
   orb(source_is_alpha c, eq_nat c source_ch_under);
 
 def source_is_ident_char (c : Nat) : Bool :=
-  orb(source_is_ident_start c, orb(source_is_digit c, eq_nat c source_ch_quote));
+  match source_is_ident_start c with
+  | True => True
+  | False => match source_is_digit c with
+    | True => True
+    | False => eq_nat c source_ch_quote
+    end
+  end;
 
 def source_hex_digit (c : Nat) : Maybe Nat :=
   match source_is_digit c with
@@ -94,6 +101,66 @@ def source_unicode_braced (input : List Nat)
             end) 6 rest Z False
       end
   end;
+
+def source_string_escape_byte (byte : Nat) (acc : List Nat) : List Nat :=
+  match eq_nat byte 110 with
+  | True => Cons Nat source_ch_lf acc
+  | False => match eq_nat byte 116 with
+    | True => Cons Nat source_ch_tab acc
+    | False => match eq_nat byte 114 with
+      | True => Cons Nat source_ch_cr acc
+      | False => match orb(eq_nat byte source_ch_double_quote, eq_nat byte source_ch_backslash) with
+        | True => Cons Nat byte acc
+        | False => Cons Nat byte (Cons Nat source_ch_backslash acc)
+        end
+      end
+    end
+  end;
+
+def source_string_escape (byte : Nat) (src : List Nat) (acc : List Nat)
+    : Maybe (Pair (List Nat) (List Nat)) :=
+  let braced : Bool := match src with
+    | Nil => False
+    | Cons c _ => eq_nat c 123
+    end in
+  match andb(eq_nat byte 117, braced) with
+  | False => Just (Pair (List Nat) (List Nat))
+      (MkPair (List Nat) (List Nat) (source_string_escape_byte byte acc) src)
+  | True => match source_unicode_braced src with
+    | Nothing => Nothing (Pair (List Nat) (List Nat))
+    | Just parsed => match parsed with
+      | MkPair bytes rest => Just (Pair (List Nat) (List Nat))
+          (MkPair (List Nat) (List Nat) (append Nat (reverse Nat bytes) acc) rest)
+      end
+    end
+  end;
+
+-- Start after the opening quote. Return decoded bytes and the unconsumed suffix.
+def source_take_string : Nat -> List Nat -> List Nat -> Maybe (Pair (List Nat) (List Nat)) :=
+  fix scan (fuel : Nat) (src : List Nat) (acc : List Nat)
+      : Maybe (Pair (List Nat) (List Nat)) :=
+    match fuel with
+    | Z => Nothing (Pair (List Nat) (List Nat))
+    | S remaining => match src with
+      | Nil => Nothing (Pair (List Nat) (List Nat))
+      | Cons c rest => match eq_nat c source_ch_double_quote with
+        | True => Just (Pair (List Nat) (List Nat))
+            (MkPair (List Nat) (List Nat) (reverse_lin Nat acc) rest)
+        | False => match eq_nat c source_ch_backslash with
+          | False => scan remaining rest (Cons Nat c acc)
+          | True => match rest with
+            | Nil => Nothing (Pair (List Nat) (List Nat))
+            | Cons escaped tail => match source_string_escape escaped tail acc with
+              | Nothing => Nothing (Pair (List Nat) (List Nat))
+              | Just parsed => match parsed with
+                | MkPair next_acc after => scan remaining after next_acc
+                end
+              end
+            end
+          end
+        end
+      end
+    end;
 
 -- Decode one canonical UTF-8 scalar, retaining the original byte tail.
 def source_scalar_cont : Nat -> List Nat -> Nat -> Nat -> Maybe (Pair Nat (List Nat)) :=
@@ -230,24 +297,7 @@ def source_take_character (fuel : Nat) (src : List Nat)
     end
   end;
 
-def source_bytes_equal : List Nat -> List Nat -> Bool :=
-  fix source_bytes_equal (xs : List Nat) (ys : List Nat) : Bool :=
-    match xs with
-    | Nil =>
-        match ys with
-        | Nil => True
-        | Cons _ _ => False
-        end
-    | Cons x xs' =>
-        match ys with
-        | Nil => False
-        | Cons y ys' =>
-            match eq_nat x y with
-            | True => source_bytes_equal xs' ys'
-            | False => False
-            end
-        end
-    end;
+def source_bytes_equal : List Nat -> List Nat -> Bool := eq_nat_list;
 
 def source_starts : List Nat -> List Nat -> Bool :=
   fix source_starts (pat : List Nat) (xs : List Nat) : Bool :=
@@ -566,6 +616,13 @@ def source_mask_literal_byte (byte : Nat) : Nat :=
   | False => source_ch_space
   end;
 
+def source_emit_reversed (initial : List Nat) (input : List Nat) : List Nat :=
+  (fix source_emit_reversed (xs : List Nat) (acc : List Nat) : List Nat :=
+    match xs with
+    | Nil => acc
+    | Cons c cs => source_emit_reversed(cs, Cons Nat c acc)
+    end) input initial;
+
 def source_mask_reversed (acc : List Nat) (src : List Nat) : List Nat :=
   (fix go (xs : List Nat) (out : List Nat) : List Nat :=
     match xs with
@@ -573,15 +630,24 @@ def source_mask_reversed (acc : List Nat) (src : List Nat) : List Nat :=
     | Cons byte rest => go rest (Cons Nat (source_mask_literal_byte byte) out)
     end) src acc;
 
+inductive SourceMaskProgress : Type :=
+  | SourceMaskMore : List Nat -> Nat -> Nat -> Bool -> Bool -> Bool -> List Nat
+      -> SourceMaskProgress
+  | SourceMaskDone : List Nat -> SourceMaskProgress;
+
+private def source_mask_chunk_bytes : Nat := 256;
+
+-- Resume with the same quote and comment state to bound the host call stack.
 def source_mask_literals (src : List Nat) : List Nat :=
-  reverse Nat
-    ((fix scan (fuel : Nat) (xs : List Nat) (previous : Nat)
+  let scan_chunk : Nat -> List Nat -> Nat -> Nat -> Bool -> Bool -> Bool
+      -> List Nat -> SourceMaskProgress :=
+    fix scan (fuel : Nat) (xs : List Nat) (previous : Nat)
         (quote : Nat) (raw : Bool) (comment : Bool) (escaped : Bool)
-        (acc : List Nat) : List Nat :=
+        (acc : List Nat) : SourceMaskProgress :=
       match fuel with
-      | Z => acc
+      | Z => SourceMaskMore xs previous quote raw comment escaped acc
       | S remaining => match xs with
-        | Nil => acc
+        | Nil => SourceMaskDone acc
         | Cons byte rest =>
             match comment with
             | True => scan remaining rest byte Z False
@@ -614,7 +680,7 @@ def source_mask_literals (src : List Nat) : List Nat :=
                           (Cons Nat byte acc)
                       | False => match source_is_multiline_start xs with
                         | True => match source_take_multiline xs with
-                          | Nothing => source_mask_reversed acc xs
+                          | Nothing => SourceMaskDone (source_mask_reversed acc xs)
                           | Just parsed => match parsed with
                             | MkPair _ tail =>
                                 let consumed : List Nat := take Nat
@@ -632,10 +698,14 @@ def source_mask_literals (src : List Nat) : List Nat :=
                                 (Cons Nat source_ch_space
                                   (Cons Nat source_ch_space acc)))
                           | False =>
-                              let starts_quote : Bool := orb
-                                (eq_nat byte source_ch_double_quote)
-                                (andb(eq_nat byte source_ch_quote,
-                                  notb(source_is_ident_char previous))) in
+                              let starts_quote : Bool :=
+                                match eq_nat byte source_ch_double_quote with
+                                | True => True
+                                | False => match eq_nat byte source_ch_quote with
+                                  | True => notb (source_is_ident_char previous)
+                                  | False => False
+                                  end
+                                end in
                               match starts_quote with
                               | True => scan remaining rest byte byte False False False
                                   (Cons Nat source_ch_space acc)
@@ -649,7 +719,17 @@ def source_mask_literals (src : List Nat) : List Nat :=
               end
             end
         end
-      end) (S (length Nat src)) src Z Z False False False (Nil Nat));
+      end in
+  (fix resume (fuel : Nat) (progress : SourceMaskProgress) : List Nat :=
+    match progress with
+    | SourceMaskDone acc => source_emit_reversed (Nil Nat) acc
+    | SourceMaskMore xs previous quote raw comment escaped acc =>
+        match fuel with
+        | Z => source_emit_reversed (Nil Nat) acc
+        | S remaining => resume remaining
+            (scan_chunk source_mask_chunk_bytes xs previous quote raw comment escaped acc)
+        end
+    end) (S (length Nat src)) (SourceMaskMore src Z Z False False False (Nil Nat));
 
 def source_word_end (src : List Nat) : Bool :=
   match src with
@@ -748,7 +828,10 @@ def source_skip_raw_pos (src : List Nat) (pos : Nat)
   end;
 
 def source_word_at (w : List Nat) (src : List Nat) : Bool :=
-  andb(source_starts w src, source_word_end (source_drop_prefix w src));
+  match source_starts w src with
+  | False => False
+  | True => source_word_end (source_drop_prefix w src)
+  end;
 
 def source_skip_ws (src : List Nat) : List Nat :=
   (fix go (fuel : Nat) (xs : List Nat) : List Nat :=
@@ -769,14 +852,25 @@ def source_skip_ws (src : List Nat) : List Nat :=
         end
     end) (length Nat src) src;
 
+def source_skip_ident : List Nat -> List Nat :=
+  fix source_skip_ident (xs : List Nat) : List Nat :=
+    match xs with
+    | Nil => Nil Nat
+    | Cons c rest =>
+        match source_is_ident_char c with
+        | True => source_skip_ident rest
+        | False => xs
+        end
+    end;
+
 def source_take_ident (src : List Nat) : Pair (List Nat) (List Nat) :=
   (fix go (xs : List Nat) (acc : List Nat) : Pair (List Nat) (List Nat) :=
     match xs with
-    | Nil => MkPair(List Nat, List Nat, reverse Nat acc, Nil Nat)
+    | Nil => MkPair(List Nat, List Nat, reverse_lin Nat acc, Nil Nat)
     | Cons c rest =>
         match source_is_ident_char c with
         | True => go(rest, Cons Nat c acc)
-        | False => MkPair(List Nat, List Nat, reverse Nat acc, xs)
+        | False => MkPair(List Nat, List Nat, reverse_lin Nat acc, xs)
         end
     end) src (Nil Nat);
 
@@ -805,13 +899,6 @@ def source_skip_line_pos : List Nat -> Nat -> Pair (List Nat) Nat :=
         | False => go(rest, S pos)
         end
     end;
-
-def source_emit_reversed (initial : List Nat) (input : List Nat) : List Nat :=
-  (fix source_emit_reversed (xs : List Nat) (acc : List Nat) : List Nat :=
-    match xs with
-    | Nil => acc
-    | Cons c cs => source_emit_reversed(cs, Cons Nat c acc)
-    end) input initial;
 
 def source_copy_raw (acc : List Nat) (src : List Nat)
     : Maybe (Pair (List Nat) (List Nat)) :=

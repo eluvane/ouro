@@ -1,0 +1,112 @@
+import "../compiler/native/pe_imports.ouro",
+  "../std/test.ouro";
+
+private def pe_quality_library (name : String) (imports : List PeImport) : PeLibrary :=
+    PeImportLibrary (str_codes name) imports;
+
+private def pe_quality_libraries : List PeLibrary :=
+    [pe_quality_library "a.dll" [PeNamedImport 7 [79, 110, 101], PeNamedImport 9 [84, 119, 111]],
+     pe_quality_library "b.dll" [PeNamedImport 11 [84, 104, 114, 101, 101]]];
+
+private def pe_quality_target_values (target : Pair Nat Nat) : List Nat :=
+    match target with | MkPair name rva => [name, rva] end;
+
+private def pe_quality_import_bytes : List Nat :=
+    pe_join [[64, 16, 0, 0], pe_zeros 8, [144, 16, 0, 0, 104, 16, 0, 0],
+             [88, 16, 0, 0], pe_zeros 8, [162, 16, 0, 0, 128, 16, 0, 0], pe_zeros 24,
+             [150, 16, 0, 0, 0, 0, 0, 0, 156, 16, 0, 0, 0, 0, 0, 0], pe_zeros 8,
+             [168, 16, 0, 0, 0, 0, 0, 0], pe_zeros 8,
+             [150, 16, 0, 0, 0, 0, 0, 0, 156, 16, 0, 0, 0, 0, 0, 0], pe_zeros 8,
+             [168, 16, 0, 0, 0, 0, 0, 0], pe_zeros 8,
+             [97, 46, 100, 108, 108, 0, 0, 0, 79, 110, 101, 0, 0, 0, 84, 119, 111, 0,
+              98, 46, 100, 108, 108, 0, 0, 0, 84, 104, 114, 101, 101, 0]];
+
+private def pe_quality_table_values (table : PeImportTable) : List Nat :=
+    match table with | PeImportTableData bytes targets iat size directory =>
+      pe_join [[iat, size, directory, length Nat bytes], bytes,
+        concat_map (Pair Nat Nat) Nat pe_quality_target_values targets] end;
+
+private def pe_quality_tables : List Test :=
+    match pe_build_imports pe_section_alignment pe_quality_libraries with
+    | Left _ => [test_fail "PE import ID table" "import validation failed"]
+    | Right table => match table with | PeImportTableData bytes targets iat size directory =>
+        [assert_true "PE import ID validation preserves every descriptor thunk and name byte"
+           (pe_bytes_equal bytes pe_quality_import_bytes),
+         assert_true "PE import ID validation preserves IAT targets in input order"
+           (pe_bytes_equal (concat_map (Pair Nat Nat) Nat pe_quality_target_values targets)
+             [7, 4200, 9, 4208, 11, 4224]),
+         assert_true "PE import ID validation preserves directory and IAT sizes"
+           (pe_bytes_equal [iat, size, directory, length Nat bytes] [4200, 40, 60, 176]),
+         assert_true "PE import ID validation produces identical tables on repeated runs"
+           (match pe_build_imports pe_section_alignment pe_quality_libraries with
+            | Left _ => False | Right repeated => pe_bytes_equal
+                (pe_quality_table_values repeated) (pe_quality_table_values table) end)]
+      end
+    end;
+
+private def pe_quality_ids_valid (imports : List PeImport) : Bool :=
+    match pe_validate_import_ids imports with | Left _ => False | Right _ => True end;
+
+private def pe_quality_error_values (error : PeError) : List Nat :=
+    match error with
+    | PeInvalidByte detail => [1, detail] | PeImageTooLarge => [2, 0] | PeEmptyText => [3, 0]
+    | PeDuplicateSymbol detail => [4, detail] | PeMissingSymbol detail => [5, detail]
+    | PeInvalidSymbol detail => [6, detail] | PeInvalidName => [7, 0] | PeDuplicateLibrary => [8, 0]
+    | PeDuplicateImport detail => [9, detail] | PeMissingImport detail => [10, detail]
+    | PeEmptyLibrary => [11, 0] | PeInvalidFixup detail => [12, detail]
+    | PeUnorderedFixup detail => [13, detail] | PeNonzeroFixup detail => [14, detail]
+    | PeRelativeOverflow detail => [15, detail] | PeMissingEntry detail => [16, detail]
+    | PeInvalidFunction detail => [17, detail] | PeUnorderedFunction detail => [18, detail]
+    | PeUnsupportedFrame detail => [19, detail] | PeStackProbeRequired detail => [20, detail]
+    | PePrologMismatch detail => [21, detail] | PeInstructionError _ => [22, 0]
+    end;
+
+private def pe_quality_rejected (A : Type) (expected : List Nat) (result : Either PeError A) : Bool :=
+    match result with
+    | Right _ => False
+    | Left error => pe_bytes_equal (pe_quality_error_values error) expected
+    end;
+
+private def pe_quality_duplicate_id (name : Nat) (imports : List PeImport) : Bool :=
+    pe_quality_rejected Unit [9, name] (pe_validate_import_ids imports);
+
+private def pe_quality_boundaries : List Test :=
+    let first : PeImport := PeNamedImport 7 [65] in
+    let second : PeImport := PeNamedImport 9 [66] in
+    [assert_true "PE empty import ID list is valid" (pe_quality_ids_valid []),
+     assert_true "PE import IDs remain independent from name validation"
+       (pe_quality_ids_valid [first, PeNamedImport 9 [65]]),
+     assert_true "PE import ID equality retains mathematical Nat values"
+       (pe_quality_ids_valid [PeNamedImport pe_max_rva [], PeNamedImport (S pe_max_rva) []]),
+     assert_true "PE adjacent duplicate IDs retain their exact diagnostic"
+       (pe_quality_duplicate_id 9 [first, second, PeNamedImport 9 [67]]),
+     assert_true "PE duplicate IDs retain first-occurrence diagnostic order"
+       (pe_quality_duplicate_id 7 [first, second, PeNamedImport 9 [67], PeNamedImport 7 [68]]),
+     assert_true "PE duplicate ID equality retains zero"
+       (pe_quality_duplicate_id 0 [PeNamedImport 0 [], first, PeNamedImport 0 []]),
+     assert_true "PE duplicate ID equality retains values above the image range"
+       (pe_quality_duplicate_id (S pe_max_rva)
+         [PeNamedImport (S pe_max_rva) [], first, PeNamedImport (S pe_max_rva) []]),
+     assert_true "PE invalid library names still precede duplicate IDs"
+       (pe_quality_rejected PeImportTable [7, 0] (pe_build_imports pe_section_alignment
+          [pe_quality_library "a.dll" [first], pe_quality_library "" [PeNamedImport 7 [66]]])),
+     assert_true "PE library case duplicates still precede duplicate IDs"
+       (pe_quality_rejected PeImportTable [8, 0] (pe_build_imports pe_section_alignment
+          [pe_quality_library "a.dll" [first], pe_quality_library "A.DLL" [PeNamedImport 7 [66]]])),
+     assert_true "PE duplicate import names still precede global duplicate IDs"
+       (pe_quality_rejected PeImportTable [9, 11] (pe_build_imports pe_section_alignment
+          [pe_quality_library "a.dll" [first, second],
+           pe_quality_library "b.dll" [PeNamedImport 11 [67], PeNamedImport 12 [67]],
+           pe_quality_library "c.dll" [PeNamedImport 7 [68]]]))];
+
+private def pe_quality_scale : List Test :=
+    let ids : List Nat := (fix collect (remaining : Nat) (name : Nat) : List Nat :=
+      match remaining with | Z => [] | S rest => Cons Nat name (collect rest (S name)) end) 512 1 in
+    let imports : List PeImport := map Nat PeImport (fun (name : Nat) => PeNamedImport name [65]) ids in
+    [assert_true "PE import ID validation checks all 512 distinct IDs" (pe_quality_ids_valid imports),
+     assert_true "PE import ID validation finds a duplicate after 512 distinct IDs"
+       (pe_quality_duplicate_id 1 (append PeImport imports [PeNamedImport 1 [66]]))];
+
+-- @entry main
+def main : IO Unit :=
+    test_run (append Test pe_quality_tables (append Test pe_quality_boundaries pe_quality_scale));

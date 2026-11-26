@@ -1,46 +1,77 @@
 # Packages
 
-`ouro-pkg.exe` resolves, vendors, locks and verifies packages. It reads
-dependencies from a local directory registry, vendors their source into
-the project, and records the resolved contents in `Ouro.lock`. Build the
-standalone native tool as described in [Tooling](tooling.md#standalone-native-tools).
-
-The compiler has no package-specific import mechanism. Installed packages are
-ordinary Ouro files reached through ordinary relative imports.
-
-A package unit may be called a ring in branding. The current commands and
-paths still say `pkg`, and the vendor directory is still `_ouro_pkgs/`.
+The package tool resolves dependencies from a local directory registry, copies
+their source into `_ouro_pkgs/`, and records the resolved files in
+`Ouro.lock`. Import installed packages through ordinary relative paths.
 
 ## Commands
 
-Run package commands from the project directory:
+Run package commands from the project directory that contains or will contain
+`Ouro.seal`, `Ouro.lock`, and `_ouro_pkgs/`.
+
+### Native commands
+
+On Windows, build the [standalone native tools](tooling.md#standalone-native-tools)
+first. In PowerShell, replace the example value of `$OuroPkg` with the full
+path to your built tool.
 
 ```powershell
-C:\path\to\ouro\_build\native\ouro-pkg.exe init [--name NAME] [--registry DIR]
-C:\path\to\ouro\_build\native\ouro-pkg.exe add NAME [--range RANGE]
-C:\path\to\ouro\_build\native\ouro-pkg.exe install
-C:\path\to\ouro\_build\native\ouro-pkg.exe lock
-C:\path\to\ouro\_build\native\ouro-pkg.exe remove NAME
-C:\path\to\ouro\_build\native\ouro-pkg.exe update
-C:\path\to\ouro\_build\native\ouro-pkg.exe list
-C:\path\to\ouro\_build\native\ouro-pkg.exe verify
+$OuroPkg = 'C:\src\ouro\_build\native\ouro-pkg.exe'
+& $OuroPkg --help
 ```
 
-`--help` and `help` print usage and exit 0. A missing `--name`, `--registry`,
-or `--range` value is rejected instead of falling back to the default. `add`
-rejects an unreadable range before `Ouro.seal` changes, and prints `updated`
-when it replaces an existing dependency range. `remove` fails if the name is
-not a current direct dependency.
+Native `coil pkg [PACKAGE_ARG ...]` runs the fixed `ouro-pkg.exe` beside its
+loaded Windows image. It forwards arguments and inherits stdin, stdout,
+stderr, the working directory, and the environment. The package tool handles
+help, option validation, and diagnostics. The launcher preserves the
+completed child's exit code. Image or process failures produce a `coil:`
+diagnostic and exit 1. Native verification needs sibling `coil.exe` and its
+checked build backend.
 
-The compatibility `scripts/coil.sh` wrapper retains `resolve` and `seal`
-aliases for `lock`. Native `coil.exe` has no package dispatch yet; run
-`ouro-pkg.exe` directly. Keep `coil.exe` beside it for verification.
+### Hosted commands
+
+After [building the bootstrap toolchain](getting_started.md#build-the-bootstrap-toolchain),
+use a POSIX-compatible shell. Set `ouro_checkout` to the absolute path to
+the checkout and run the command from your project directory.
+
+```sh
+ouro_checkout=/path/to/ouro
+sh "$ouro_checkout/scripts/coil.sh" pkg --help
+```
+
+`scripts/coil.sh pkg` uses `scripts/ouro1.sh pkg`, which builds the hosted
+package tool on demand. The shell wrapper also accepts `coil resolve` and
+`coil seal` as aliases for `coil lock`.
+
+### Command forms
+
+Brackets enclose optional arguments. Replace `NAME`, `DIR`, and `RANGE` with
+your values.
+
+```text
+init [--name NAME] [--registry DIR]
+add NAME [--range RANGE]
+install
+lock
+remove NAME
+update
+list
+verify
+```
+
+`--help` and `help` print usage and exit 0. A missing value for `--name`,
+`--registry`, or `--range` is an error. `add` validates the range before
+changing `Ouro.seal` and prints `updated` when it replaces an existing
+dependency range. `remove` fails if the name is absent from the manifest's
+direct dependencies. On success it updates only `Ouro.seal`. Run `install`
+to refresh the lockfile after changing dependencies.
 
 ## Seal
 
-`Ouro.seal` is the handwritten project form. It is not TOML. Version 1 is a
-header plus named blocks of `key = value`. Comments are `#` or `--` outside
-quotes. Strings use `"..."` with no escapes.
+Write `Ouro.seal` in the versioned seal format. Version 1 starts with
+`seal 1` and uses named blocks with `key = value` entries. Outside strings,
+`#` and `--` start comments. Use double quotes for strings. The format has
+no string escapes.
 
 ```text
 seal 1
@@ -57,28 +88,25 @@ deps {
 registry {
   source = "../registry"
 }
-
 ```
 
 The package tool reads `project`, `deps`, and `registry` while preserving
-other blocks. [Build configuration](build.md#configuration) owns `build` and
-`cache`; [Trusted computing base](tcb.md) explains the `trust` declaration.
+other blocks. See [Build configuration](build.md#configuration) for `build`
+and `cache` and [Trusted computing base](tcb.md) for `trust`.
 
 Supported ranges include `*`, exact versions, `^x.y.z`, `~x.y.z`, and the
-ordinary comparison operators. `add` rejects a range that does not parse as
-one of those forms. A relative registry path is resolved from the
+ordinary comparison operators. Relative registry paths resolve from the
 project directory.
 
-Package and dependency names are single portable path segments of at most 128
-bytes. They use letters, digits, `-`, `.`, or `_`, must begin and end with an
-alphanumeric character, and cannot contain separators, dot segments, drive
-prefixes, whitespace, or controls. A requested/registry directory name must
-match the package identity in `Ouro.seal`, and lockfile names are checked by
-the same rule.
+Package and dependency names are single path segments of at most 128 bytes.
+Use ASCII letters, digits, and the characters `-`, `.`, and `_`. Start and
+end each name with a letter or digit. The requested name, registry directory
+name, and package name in `Ouro.seal` must match. Lockfile names follow the
+same character and length rules.
 
 ## Local registry
 
-A registry contains one directory per package:
+A registry contains one directory per package.
 
 ```text
 registry/
@@ -90,43 +118,53 @@ registry/
     src/lib.ouro
 ```
 
-The current layout stores one directory per package name.
+Use regular files and directories that resolve within the configured registry
+root. Before copying each package, the tool walks its source tree and rejects
+symlinks, Windows reparse points, resolved paths outside that tree, unreadable
+entries, and incomplete walks. The tool reports file read errors as it copies
+the files.
 
-Registry package directories and copied files must be canonical regular
-directories/files beneath the configured registry root. Symlinks, Windows
-reparse points, canonical escapes, unreadable entries, and truncated source
-walks are rejected before installation.
-
-A complete example lives under `samples/pkg/`.
+See the [sample project and local registry](../samples/pkg/).
 
 ## Installation and imports
 
-`install` resolves the dependency graph and copies each package to
-`_ouro_pkgs/<name>/` in the project. Transitive dependencies are installed
-alongside direct dependencies.
+`install`, `lock`, and `update` all resolve the dependency graph against the
+configured registry, copy direct and transitive dependencies into
+`_ouro_pkgs/<name>/`, and write `Ouro.lock` when resolution and copying
+succeed. Copies overwrite matching destination files. Files with no matching
+source remain in the vendor tree. A failed resolution or copy leaves any
+earlier writes in place, exits nonzero, and skips writing the lockfile.
 
-A project imports the vendored source by path:
+For example, a module in the project's `src/` directory can import a
+vendored package by relative path.
 
 ```ouro
 import "../_ouro_pkgs/greet/src/lib.ouro";
 ```
 
 `_ouro_pkgs/` is generated output. Edit the source package or registry entry,
-then reinstall; do not maintain the vendored copy by hand.
+then reinstall.
 
 ## Lockfile and verification
 
-`Ouro.lock` records the resolved package versions, source paths, and a
-deterministic digest of the vendored files. The current lock body is generated
-JSON. `list` and `verify` reject an unreadable lockfile instead of treating it
-as empty. `verify` recomputes that digest and typechecks every installed
-`.ouro` file through sibling `coil.exe check`. Verification requires exit
-0 and `CHECK_OK` without `CHECK_FAIL`; process errors remain failures.
-`OURO_PKG_CHECK` no longer selects a checker. Each source has a provisional
-120-second, one-CPU, 3072-MiB child-tree limit and 16 MiB per captured stream.
+`Ouro.lock` is generated JSON. It records the resolved package versions,
+source paths, and a deterministic digest of each package's vendored files
+to detect drift. `list` and `verify` reject an unreadable or malformed
+lockfile. With a valid manifest and no lockfile, `list` prints `locked: none`.
+`verify` requires a lockfile.
 
-The digest detects drift; [current limits](#current-limits) describe what it
-does not authenticate. The seal and lock formats remain experimental before 1.0.
+`verify` walks only the vendored trees listed in `Ouro.lock`. It recomputes
+each tree's digest and checks every `.ouro` file in that tree after the digest
+matches. Checker success requires exit 0 and `CHECK_OK` without `CHECK_FAIL`.
+Process errors fail verification.
+
+Native verification uses sibling `coil.exe check` with provisional limits
+per source of 120 seconds, one CPU, 3072 MiB per child tree, and 16 MiB per
+captured stream. Before launch, native `coil pkg` refuses the first present
+hosted checker selector, even if its value is empty. The order is
+`OURO_TEST_CHECK`, `OURO_PKG_CHECK`, then `OURO_HOSTED_COMPILER_WRAPPER`.
+The standalone tool can use these selectors to run the hosted checker for
+hosted-suite compatibility.
 
 ## Current limits
 
@@ -135,9 +173,8 @@ network registry, authenticated source or cryptographic content hash, `pkg:`
 import scheme, or `coil publish` command. The seal and lock formats follow the
 [pre-1.0 compatibility policy](stability.md#experimental-areas).
 
-Native acceptance must provision a direct-PE package executable and its
-sibling checker before running the retained package suite:
+## Package suite
 
-```sh
-sh scripts/pkg_suite.sh
-```
+Use the [CI validation matrix](ci.md#validation-matrix) for the hosted package
+suite. For native acceptance, use the [CI provisioning procedure](ci.md#local-profiles)
+for direct-PE candidates, their sibling tools, and a fresh output directory.

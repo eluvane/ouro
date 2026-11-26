@@ -1,15 +1,21 @@
 # Continuous integration
 
-Ouro keeps the authoritative validation commands in repository scripts. GitHub
-Actions invokes the same profiles that contributors can run locally and uploads
-reports from `_build/`.
+Choose a validation suite for the area you changed. Repository scripts run the
+profiles locally. GitHub Actions runs those profiles and uploads reports from
+`_build/`.
 
 ## Validation matrix
 
-Start with the suite for the changed layer. The PR profile is the broader local
-check before review when feasible; a focused pass does not establish full PR
-readiness. Missing host tools, timeouts, skipped probes, and incomplete reports
-are not passes.
+Run local commands from the repository root in a POSIX-compatible shell unless
+the example specifies PowerShell. The Python profiles and the documentation,
+project, and workflow wrappers can invoke `sh`. Use the
+[build prerequisites](getting_started.md#requirements) and have Git available
+for repository checks. A cold run can build the compiler and tools under
+`_build/` and populate `_cache/`.
+
+Run the focused command first. Before opening a PR, run the broader PR profile
+when feasible. Record missing tools, timeouts, skipped probes, and incomplete
+reports as incomplete validation.
 
 | Change | Focused command |
 | --- | --- |
@@ -23,6 +29,7 @@ are not passes.
 | Runtime and IO / samples | `sh scripts/runtime_io_suite.sh` / `sh scripts/samples_suite.sh` |
 | User test runner | `sh scripts/test_suite.sh` |
 | Compiler checking | `sh scripts/test_suite.sh --compiler-checking` and `python3 scripts/ci_gate.py --profile kernel --out _build/ci/kernel` |
+| Prepared stage inputs | `python3 scripts/compiler_stage_contract_suite.py --compiler _build/c/ouro1` |
 | Generated API reference | Regenerate through [Build](build.md#generated-artifacts-and-stage-loop), then `sh scripts/doc_suite.sh` |
 | Bootstrap or stage0 | [Stage-loop profile](#local-profiles); see [promotion](build.md#generated-artifacts-and-stage-loop) |
 
@@ -37,7 +44,7 @@ tools, incomplete results, and skipped checks cannot establish a passing run.
 The normal pull-request profile is:
 
 ```sh
-python3 scripts/ci_gate.py --profile pr --out _build/ci/pr
+python3 scripts/ci_gate.py --profile pr --jobs 20 --out _build/ci/pr
 ```
 
 Other profiles are narrower or heavier:
@@ -54,10 +61,9 @@ List the gates in a profile without running them:
 python3 scripts/ci_gate.py --profile pr --list
 ```
 
-GitHub selects affected groups and gates for reviewed tool and control-plane
-paths; main-branch pushes, merge
-queues and manual CI runs select the complete inventory except `lint`, which
-runs in Nightly and on demand. Run one group with:
+GitHub selects affected checks from the PR diff. Main-branch pushes, merge
+queues and manual CI use the regular complete PR selection. Nightly and manual
+Lint runs cover the complete lint suite. Run one group with:
 
 ```sh
 python3 scripts/ci_gate.py --profile pr --group checks
@@ -66,7 +72,8 @@ python3 scripts/ci_gate.py --profile pr --group checks
 The group names are `checks`, `checks-parity`, `checks-quality`, `analysis`, `checker`, `analyzer`,
 `analyzer-lint`, `lint`,
 `tests`, `smith`, `samples-1`, `samples-2`, and `compiler-1` through
-`compiler-16`. Substitute the selected name after `--group`.
+`compiler-16`. Substitute the selected name after `--group`. A routed PR can
+also select the `lint-fixtures` and `lint-clippy` groups described below.
 
 `--group` supports PR, nightly, manual, kernel, stage-loop, docs, and kernel-extra profiles.
 `--list-groups` prints the selected profile's complete group list as JSON;
@@ -78,7 +85,8 @@ Release metadata and assembly require every validation group to succeed.
 The stage-loop profile separates `checks-parity` (`parity`) and `checks-quality`
 (`syntax-quality-firewall`) from `trust`. `trust` retains Python syntax,
 strict and structural quality, and the complete stage-loop/drift gate.
-The ungrouped command retains the complete gate inventory and registry order.
+The ungrouped command retains the complete gate inventory and each group's
+registry order.
 Cold Manual validation bootstraps every group independently; job and process
 limits stay unchanged.
 
@@ -92,27 +100,53 @@ promotion contracts. Its `ouro.generated-artifact-drift-report.v2` report record
 the current reference key and artifact paths, with raw and LF-normalized hashes
 and the frozen binary, receipt, report, and input-evidence hashes.
 
-Use isolated checkouts when running
-groups concurrently: several suites own fixed fixture/output paths. The full
-local command runs every gate in registry order. The runner rejects a group
+The full local command runs independent groups in separate checkouts under
+`_build`, with the current working tree as input. Each owns its own `_build`
+and cache, and dependent gates share their group's checkout. `--jobs` sets the
+total CPU slots for the run and its nested schedulers. It defaults to
+`OURO_JOBS` or 20, with a ceiling of 20. The runner also reserves memory for
+active tasks using available physical memory and headroom. Use `--jobs 1`
+for a serial run.
+Local `compiler-scale` and `compiler-depth` each reserve one CPU slot and
+3072 MiB. Each runs its checks sequentially on one logical CPU.
+The local `selfhost-module-cache` and `stage-loop-c-object-cache` suites also
+reserve one CPU slot each for their sequential cache checks.
+The full local profile prepares one compiler for its consumer groups. It
+prepares `ouro-test` and `ouro-collect` once for the suites that share them,
+including runtime IO. Production lint shards share one preparation of
+`ouro-lint` with its companions and `ouro-pkg` when `OURO1_COMPILER` is unset.
+Each consumer receives private copies of the binaries and their build evidence.
+Local preparation uses `_build/ci-host` for the source snapshot and
+`_build/ci-bootstrap` for checked compiler artifacts and historical stages.
+Changes outside the compiler's own inputs can reuse the checked compiler
+after verifying its bootstrap evidence. `OURO_CACHE=0` selects fresh
+preparation. Independent checks in the `checks` group can use separate local
+checkouts. The hosted group inventory and nightly stage-to-Smith dependency
+retain their existing order.
+The runner rejects a group
 inventory that omits, duplicates, or invents a gate; its self-test also checks
 complete matrix coverage and the affected-path routing contracts. The
 `analysis` group owns memory budgets, C analysis, and LSP; `checker` owns
 hardening, scale, and depth. In PR validation, `analyzer` owns analyzer
 precision and `analyzer-lint` owns `lint-changed`. They run in separate jobs,
-each with the existing 120-minute limit; their gate commands and per-program
-limits are unchanged. The complete Ouro lint suite runs in Nightly, the full
-**Manual** workflow, and **Lint → Run workflow**; PR, push, merge-queue and
-Release jobs exclude its group. A pull request instead runs `lint-changed`:
+each with a 120-minute limit. On a PR, `lint-changed` runs
 `ouro1 lint --deny` over the changed `.ouro` files that the complete suite's
 production sweep would select from `std/`, `compiler/`, `tools/`, and
 `samples/`. It reads the directory and file exclusions from
 `tools/lint_worker.ouro` and `tools/quality/source.ouro`; the package sample
 stays with the complete suite because it needs a vendored snapshot. Findings
 that a change causes in unchanged files are left to Nightly. Without a routing
-plan, as in local, Manual and Release runs, `lint-changed` is reported as
-skipped and the complete lint suite owns coverage. Nightly, full Manual,
-and **Lint → Run workflow** schedule `lint-fixtures`, `lint-production-1`
+plan, `lint-changed` is reported as skipped.
+
+Changes to mapped semantic fixtures, grade manifests and their launchers select
+the `lint-fixtures` or `lint-clippy` group that consumes them. Shared fixtures,
+the lint driver and Clippy implementation changes select both. Each group runs its
+canonical `scripts/lint_suite.sh` phase. The same rule applies when other
+changed paths require broad validation. An unclassified semantic fixture or
+an unavailable PR diff selects both phases. Main-branch pushes, merge queues
+and default Release validation use their ordinary full selection.
+
+Nightly, full Manual and **Lint → Run workflow** schedule `lint-fixtures`, `lint-production-1`
 through `lint-production-4`, and
 `lint-clippy` as required groups. Each runs `lint_suite.sh --phase=...` with
 the existing 120-minute job limit and checks the complete native tool receipts.
@@ -125,12 +159,22 @@ snapshot and explicit bench source. Clippy
 retains all four compiler checks and grade fixtures. The registry rejects missing,
 duplicated, reordered or recombined phases and production shards. `--group lint`
 on these profiles runs all required groups in order; `--group lint-production`
-runs the four production shards. Both aliases are excluded from their schedulable
-inventory. `lint_suite.sh` without arguments or with `--phase=production` retains
-the complete unsharded production sweep.
+schedules the four production shards in isolated checkouts under the same CPU
+and memory budget. For a local run with the shared prepared toolchain, each
+shard installs its package snapshot once. Workers then process disjoint parts
+of its inventory using private scratch directories. Each worker reserves one
+CPU slot and 3072 MiB. The four gate reports include the worker results, and
+the scheduler reports peak worker concurrency. Both aliases are excluded from
+the hosted matrix inventory.
+`lint_suite.sh` without arguments or with `--phase=production` retains the
+complete unsharded production sweep.
 The local PR `lint` group, standalone Lint workflow and `sh scripts/lint_suite.sh`
-without arguments retain the complete suite. Python/shell lint and the other
-quality gates keep their existing schedules.
+without arguments retain the complete suite.
+
+Local `ergonomics` and `imports` use one CPU slot and 3072 MiB per manifest
+batch. Invalid or missing reports fail the suite. Each batch uses its own
+output directory and the same verified compiler and tools. The suite records
+ordered batch results and peak concurrency in `manifest-batches.json`.
 Execution removes the previous `ci-summary.json` before starting gates, so an
 interrupted run leaves no old successful aggregate at the current report path.
 The native CI runner also invalidates selected gate reports and the delegated
@@ -141,10 +185,11 @@ group, including when a restored compiler cache lacks its bootstrap evidence.
 PR and Nightly validation jobs allow 120 minutes for the complete group;
 per-program execution and memory limits remain separate. Independent PR matrix
 groups finish when a sibling fails. Each group retains its fail-fast command,
-and the aggregate requires every selected validation job to succeed. PR Linux
-jobs depend
-on one `Host compiler` job, which restores or builds the compiler with its
-complete bootstrap evidence and publishes a workflow-local artifact. Each
+and the aggregate requires every selected validation job to succeed. A plan
+limited to Python syntax, Ruff, ShellCheck and CI runner self-tests runs
+directly on the host. A plan that needs Ouro starts one Linux `Host compiler`
+job. It restores or builds the compiler with its complete bootstrap evidence
+and publishes a workflow-local artifact. Each
 consumer checks the producer's SHA-256 and verifies the binary, current inputs,
 host toolchain, and bootstrap evidence before running gates. Partial job retries
 use the successful producer's artifact name, including its original attempt.
@@ -153,6 +198,10 @@ valid for uploads and downstream downloads.
 OuroSmith compiler evidence requires all sixteen compiler gate commands and their
 source-bound receipts. The shard runners must agree on the full inventory and
 binary identity; their combined artifacts must cover every fixture exactly once.
+The standalone `sh scripts/test_suite.sh --compiler-checking` schedules all
+sixteen shards with `OURO_JOBS` or 20 slots and one slot per shard. It writes
+`shards.json` and separate logs under the suite output directory. `--list` and
+an explicit numbered `--shard` keep their existing behavior.
 
 Samples use two shards with separate output directories. The native selector
 alternates native builds and check-only cases independently, preserving all
@@ -166,23 +215,26 @@ sh scripts/samples_suite.sh --shard=1/2
 sh scripts/samples_suite.sh --shard=2/2
 ```
 
-P6 native tool acceptance can run these retained assertions with explicitly
-provisioned Windows x86-64 candidates. Put `coil.exe`, `ouro-fmt.exe`,
+### Native tool acceptance
+
+Run these retained suites with explicitly provisioned Windows x86-64
+candidates. Put `coil.exe`, `ouro-fmt.exe`,
 `ouro-lsp.exe`, `ouro-pkg.exe` and `ouro-test.exe` in one directory, following
-[the standalone build commands](tooling.md#standalone-native-tools), and use
-fresh output directories:
+[the standalone build commands](tooling.md#standalone-native-tools).
+Use a shell on Windows that can execute the PE images and choose fresh output
+directories.
 
 ```sh
-LSP_SUITE_OUT=_build/p6/lsp sh scripts/lsp_suite.sh --native-tools _build/native
-PKG_SUITE_OUT=_build/p6/pkg sh scripts/pkg_suite.sh --native-tools _build/native
-TEST_SUITE_OUT=_build/p6/test sh scripts/test_suite.sh --native-tools _build/native
-SAMPLES_SUITE_OUT=_build/p6/samples sh scripts/samples_suite.sh --native-tools _build/native
+LSP_SUITE_OUT=_build/native-tool-tests/lsp sh scripts/lsp_suite.sh --native-tools _build/native
+PKG_SUITE_OUT=_build/native-tool-tests/pkg sh scripts/pkg_suite.sh --native-tools _build/native
+TEST_SUITE_OUT=_build/native-tool-tests/test sh scripts/test_suite.sh --native-tools _build/native
+SAMPLES_SUITE_OUT=_build/native-tool-tests/samples sh scripts/samples_suite.sh --native-tools _build/native
 ```
 
 Pass `--native-tools DIR` first; sample shard options and `--compiler-checking`
 follow it. The separate `--native-build-collection` C harness rejects this
 option. Each invocation checks the required sibling images, PE format and
-system imports, records their SHA256 in `native-candidates.json`, and checks
+system imports, records their SHA-256 hashes in `native-candidates.json`, and checks
 that those images remain unchanged at completion. Missing or invalid native
 candidates fail without a C fallback. Retain the direct-PE build receipts with
 source and producer hashes beside this execution evidence; the candidate
@@ -195,30 +247,52 @@ native capture. Hosted C-host suites set `OURO_TEST_CHECK` /
 `OURO_HOSTED_COMPILER_WRAPPER` to `scripts/ouro1.sh` (and `OURO_TEST_BUILD` to
 `scripts/build_tool.sh`) so test, LSP, package, sample, and Smith tool
 processes invoke the current compiler without a Windows `coil.exe` sibling.
-Existing suite assertions and required gates remain in place;
-these explicit invocations do not establish native bootstrap or retire the
-full PR profile.
+These invocations supply evidence for the retained suites. Native bootstrap and
+full PR validation have separate requirements.
 
-Nightly uses `checks`, `checks-parity`, `checks-quality`, `analysis`, `analyzer`,
+Run the hash and binary String crypto regressions separately with the provisioned
+direct-PE test runner and its `coil.exe` sibling:
+
+```powershell
+.\_build\native\ouro-test.exe --out _build/ci/crypto-native tests/quality_crypto_native_regressions.ouro
+```
+
+This root includes the hash laws from `tests/native_crypto_hash_laws.ouro` and
+embedded NUL cases. The shared compiler fixture catalog registers the bounded
+stream state and error laws. Runtime IO checks a separate set of 159 SHA-256,
+HMAC and stream observations against their exact golden output on the C host.
+
+### Hosted profile composition
+
+Nightly uses `checks`, `language-speed-simplicity`, `fix`, `checks-parity`,
+`checks-quality`, `analysis`, `analyzer`,
 `lint-fixtures`, `lint-production-1` through `lint-production-4`, `lint-clippy`,
 `tests`, `samples-1`, `samples-2`, `kernel`, `smith-selftest`, `trust`, and `compiler-1` through `compiler-16`.
+Nightly runs `language-speed-simplicity` and `fix` in separate jobs. The Manual
+profile runs both in `checks`.
 PR, Nightly and Manual isolate parity and syntax quality in their respective
 checks groups, with the existing gate commands and per-program limits.
 The `trust` job runs the stage-loop fixpoint/drift gate and then the deeper
 OuroSmith profile in the same checkout. The required `smith-selftest` group
 runs the harness self-tests separately, preserving all gates and per-program limits.
-The PR `smith` group runs the same blocking self-tests before its generated profile. `Full` runs even after
-a job failure and fails unless every matrix group succeeds. Reports are
-uploaded separately as `nightly-<group>` artifacts. Hosted PR matrix jobs use static names `PR` and `Portable` so a skipped
-matrix does not publish an unevaluated expression. When those jobs run,
-GitHub appends the matrix value: `PR (checks)`, `PR (checks-parity)`,
-`PR (checks-quality)`, `PR (analysis)`, `PR (checker)`,
-`PR (analyzer)`, `PR (analyzer-lint)`, `PR (tests)`,
-`PR (smith)`, `PR (samples-1)`, `PR (samples-2)`, `PR (compiler-1)` through
-`PR (compiler-16)`, `Portable (ubuntu-latest)`,
-and `Portable (macos-latest)`. Linux Portable uses the shared compiler;
-macOS Portable restores its own cache and bootstrap evidence, then builds or
-verifies `ouro1` before `kernel_hardening_suite.py`.
+The PR `smith` group runs the same blocking self-tests before its generated
+profile. In the hosted `PR (smith)` job for a pull request, `ouro-smith`
+reserves 4096 MiB for two CPU slots when the job has exactly two slots and a
+known memory budget of at least 4096 MiB after headroom. The one-slot minimum
+is 3072 MiB. A smaller or unknown budget uses the ordinary scheduling policy.
+OuroSmith child processes still use their existing limits.
+
+`Full` runs even after a job failure and requires the compiler producer and
+every matrix group to succeed. Reports are uploaded separately as
+`nightly-<group>` artifacts. The hosted PR matrix has
+the static name `PR`. Selected groups appear as `PR (checks)`, `PR (checker)`,
+or `PR (compiler-1)`, for example.
+
+When portable checks are selected, `PR (checks)` checks Python syntax on Linux.
+`PR (checker)` verifies the imported compiler with the build driver and runs
+`kernel_hardening_suite.py`. Its report is in the `checker-Linux` artifact.
+`Portable (macos-latest)` starts after `Paths`, restores its own bootstrap
+evidence, and builds or verifies `ouro1` before running the same hardening suite.
 macOS keeps the inherited Python stack when the host CPython build rejects
 `setrlimit(RLIMIT_STACK)`. Darwin also rejects finite `RLIMIT_AS` (EINVAL);
 POSIX children on Linux still apply a sticky AS cap when the host allows it,
@@ -227,27 +301,27 @@ The hosted `Compiler kernel` job runs `--profile kernel-extra`: only the
 kernel OuroSmith gate, which is absent from PR. The complete standalone
 `--profile kernel` remains unchanged. A runner self-test requires the union
 of PR and kernel-extra to cover every kernel gate, with no duplicated gates
-in kernel-extra. All sixteen compiler shards run for compiler, runtime, standard
-library, bootstrap, build infrastructure and unclassified changes.
+in kernel-extra. Shared compiler, runtime, standard library and bootstrap
+inputs select all sixteen compiler shards, as do unclassified changes.
 
-The static `Kernel` check always runs and requires successful path selection,
-compiler preparation, every selected PR or docs group, selected kernel checks,
-Portable, and Editor. A failed, cancelled, or unexpectedly skipped selected
-job fails this aggregate. Nightly prepares its compiler independently per group.
+The static `Kernel` check always requires successful path selection. It
+checks the expected result of `Host compiler`, every selected PR or docs
+group, kernel checks, Portable, Editor and Site. A selected job that fails,
+is cancelled or is skipped fails the aggregate.
 `scripts/apply_github_settings.py` recommends the stable required contexts
 `Paths`, `Kernel`, `Editor`, and `Review`. When adopting the docs route, replace
 required individual `PR (...)` and `Portable (...)` contexts in hosted branch
 rules with `Kernel`; those matrix contexts do not exist when the matrix is
 skipped. Editing the script does not apply hosted settings.
 
-Changes confined to root Markdown files or ordinary
-Markdown under `docs/` use the `docs` profile: workflow/project policy, API
-baseline drift, documentation suite, and documentation examples. Editor and
-site changes keep their own checks when combined with docs. Generated API
-pages, generated hashes, executable examples, trust/build/design
-documents and unknown paths retain full PR validation. CI and release documents
-use the focused routes below. Empty or unavailable
-diffs select full validation. A docs-and-code change includes all docs gates.
+Changes confined to root Markdown or ordinary Markdown under `docs/` use the
+`docs` profile. This runs workflow and project policy, API baseline drift,
+documentation generation checks and documentation examples. The same profile
+covers the generated API index and pages matching a current standard-library
+module. The documentation suite compares their contents with the generator's
+output. Unknown API pages, the stage0 hash manifest and trust or build design
+documents keep full PR validation. CI and release documents have the additional
+checks below. Mixed changes combine the selected checks.
 
 ```sh
 python3 scripts/ci_gate.py --profile docs --out _build/ci/docs
@@ -255,51 +329,76 @@ python3 scripts/ci_gate.py --profile docs --out _build/ci/docs
 
 ### Affected PR checks
 
-`Paths` first runs `python3 scripts/pack_frontend.py --selftest`,
-the CI runner's self-tests and
-`python3 scripts/clippy_import_gap.py --self-test`, before compiler builds.
-The gap command reads stub inventories, imports, and match arms. The repository scan
-is `python3 scripts/clippy_import_gap.py`. It then
-compares the PR base with GitHub's tested merge commit. The NUL-delimited local
-Git diff has no API file-list limit; rename detection is disabled so both the
-old and new path contribute to selection. Missing revisions, Git errors,
-timeouts, oversized output, or an empty diff select complete validation.
+`Paths` first runs the CI routing self-tests. It then compares the PR base
+with GitHub's tested merge commit. It reads
+a NUL-delimited local Git diff with rename detection disabled, so both names
+of a renamed file contribute. Missing revisions, Git errors, timeouts,
+oversized output and empty or invalid diffs select the complete pull request
+matrix plus the four production lint shards, `lint-fixtures`, and `lint-clippy`.
 
-The explicit routing table in `scripts/ci_gate.py` currently covers these inputs:
+The pull request matrix runs `runtime-io` and `frontend-security` in separate
+jobs when selected, including when the diff requires the complete matrix.
+The `tests` job runs the affected gates among `ergonomics`, `imports`, `test`,
+and `compiler-boundary`. The six gates share `tests` in local
+`--profile pr --group tests` and in complete Nightly, Manual, and Release
+validation. Pushes to `main` or `master`, merge groups, and manual CI also
+use that grouping through `--full`.
+
+Before a selected host compiler build, `Paths` runs
+`python3 scripts/pack_frontend.py --selftest`. A core plan that needs the
+compiler also runs `python3 scripts/clippy_import_gap.py --self-test`.
+The checks group installs Ruff and ShellCheck individually when it needs them.
+
+The following inputs have mapped consumers in `scripts/ci_gate.py`.
 
 | Changed area | Additional checks |
 | --- | --- |
-| Formatter, fixer, analyzer, analyzer fixtures and their suite launchers | Formatter, fixer, analyzer precision, memory budgets, LSP and language/tool integration |
-| Package manager, scanner fixtures and package suite launcher | Package suite and applicable release packaging checks |
-| LSP implementation and suite launcher | LSP protocol suite |
-| Documentation generator and suite launcher | Documentation and LSP suites, which share the document model |
+| Formatter, fixer and analyzer implementations | Formatter, fixer, analyzer precision, memory budgets, LSP and integration tests |
+| Package manager | Package suite, user tests, memory budgets and release packaging |
+| LSP implementation | LSP protocol, memory budgets and OuroSmith |
+| Documentation generator | Documentation, memory budgets and OuroSmith. The shared document model also selects LSP. |
+| Registered suite fixtures and launchers | Their consuming suites, including analyzer precision, C static analysis, memory budgets or structural quality as applicable |
+| GitHub issue forms, Dependabot configuration, PR template and review ownership | Project policy and documentation checks |
+| License | Project policy, documentation and release packaging |
+| Dependencies, Lint, Nightly and Pages workflows | CI runner self-tests, workflow policy and documentation checks |
 | Release workflow, release categories, packaging script and release documentation | Release packaging self-tests and metadata validation |
+| Manual workflow | Dispatch and matrix self-tests, compiler and build-cache configuration, API drift and documentation suite |
 | PR workflow, CI runner and CI documentation | Routing/consumer self-tests, compiler configuration and build-cache configuration |
 | OuroSmith provenance collector | Source, binary and stage-receipt regression tests in the CI runner self-test |
+| OuroSmith surface regression records | Replay through the PR OuroSmith profile |
+| Kernel hardening budgets and baseline | Kernel hardening on Linux and macOS. The budgets also select kernel-extra and the host-bound inventory. |
+| Memory budgets and baseline | Memory budget suite. The baseline also selects the host-bound inventory. |
+| API fingerprint fragments under `quality/api_surface/` | Regenerate and compare the public API baseline |
 | Native host inventories | Host-bound inventory and delegated native repository policy checks |
 | Native repository checks and policy | Host-bound inventory, native policy checks, user tests and compiler-boundary checks |
 | Strict debt manifest | Strict firewall and structural quality checks |
 
-Tool routes retain repository policy, Python/shell lint, API drift,
-generated hashes, compiler boundary, strict and structural quality, documentation
-examples, hygiene, and the test/Smith/sample integration suites. The local plan
-also retains the complete lint gate, which the hosted matrix excludes; a route
-that changes production `.ouro` sources selects `lint-changed`. The table
-does not change gate assertions. Control-plane routes retain Python/shell lint,
-CI runner self-tests, workflow/project policy, structural quality and documentation examples. Mixed
-documentation changes add every docs gate. Changed production `.ouro` files
-still select `lint-changed`, including native policy and inventory modules.
-The `host-bound-inventory` gate also runs in complete PR, Nightly and Manual
-profiles. Compiler, kernel-extra and portable suites are omitted when only
-reviewed control-plane files and ordinary documentation change. The shared
-Host compiler remains required to execute the Ouro-native policy checks.
-Unlisted files select the complete PR inventory and portable checks. Changes
-to compiler, runtime and standard library inputs also retain kernel-extra.
+Mapped tool implementations run the syntax and strict quality firewalls,
+structural quality and documentation examples. Each implementation also runs
+the integration suites that exercise it. Changed production Ouro sources select
+`lint-changed`. A change confined to `.shellcheckrc` selects ShellCheck,
+and a change confined to `quality/ruff.toml` selects Ruff.
+For unclassified inputs the planner selects the complete PR inventory and
+portable checks. Shared compiler, runtime and standard-library inputs also
+select kernel-extra.
+
+Sample shards derive from the runnable and check-only cases in
+`tools/test/sample_cases.ouro`. A registered `.stdin` or `.golden` companion
+selects every shard that consumes it. For a registered sample source the
+planner follows transitive imports and includes other known suite consumers.
+The sample launcher compares the router's expected cases and execution modes
+with the native test runner's listing for each shard. A mismatch fails the suite.
+Missing files, unsupported inventory entries or an unmapped consumer require
+full validation.
+`tests/workflow_stdlib_tests.golden` selects its assigned sample shard when
+the registered workflow fixture is its sole owner. Ambiguous ownership or
+another consumer requires full validation.
 
 For narrowed routes, the planner follows transitive imports from the canonical
 compiler fixture inventory, using the build system's import reader and checking
 its import count against the existing source tokenizer. A tool
-dependency of a compiler fixture adds that fixture's assigned shard.
+dependency of a compiler fixture adds that fixture's assigned shard. The
+planner also accounts for sibling golden files and sources read as fixture data.
 An unreadable dependency, unsupported import layout or inventory shape selects
 full validation.
 New tool families remain full-validation inputs until their consumers are mapped.
@@ -311,15 +410,20 @@ with the producer is an error. `Kernel` still requires every selected job to
 succeed; a skipped required job or failed/cancelled matrix cannot satisfy it.
 Do not require individual dynamic matrix names in branch protection.
 
-The GitHub job summary lists selected groups and gates. Full runs enqueue the
-three long check groups and isolated `source_spans` shard before the other compiler shards.
+The GitHub job summary lists selected groups and gates. A pull request that
+selects the complete matrix lists `checks`, `tests`, `smith`, `runtime-io`, and
+`frontend-security` first, followed by `checks-parity`, `checks-quality`, and the
+isolated `source_spans` shard. Runner availability determines start times.
 Manual creates both operating-system jobs for each group before advancing to the
 next group, so Windows jobs enter the queue alongside their Linux counterparts.
-PR matrix jobs continue independently after a sibling
-failure, and each group stops at its first blocking failure while recording
-unexecuted gates as `not_run`. Nightly and ordinary local profiles still gather
-all failures. Obsolete runs are cancelled by the existing concurrency group.
-The already-compressed compiler archive uploads with `compression-level: 0`.
+PR matrix jobs continue independently after a sibling failure. Each group
+stops at its first blocking failure and records unexecuted gates as `not_run`.
+On pull requests, routed `--fail-fast` runs emit GitHub error annotations for
+blocking failures after writing `ci-summary.json`. Nightly and ordinary local
+profiles still gather all failures. Obsolete runs are cancelled by the existing
+concurrency group.
+The already-compressed PR compiler archive uploads with `compression-level: 0`
+and requests 30 days of retention, subject to repository policy.
 
 `merge_group` and manual dispatch use the complete inventory, as do pushes to
 `main`/`master`; this also refreshes trusted caches after a merge. Supporting
@@ -358,7 +462,7 @@ retains all 400 + 400 cases, 12 fixed shapes, every-reference mutations and its
 six-line report. Child failure or incomplete coverage cannot produce the
 combined success report. This isolates the transitional C host's arenas without
 changing checker laws or memory budgets. Bounded capture adds
-29 pure API laws alongside the 9 compiler binding and 4 primitive registry
+53 pure API laws alongside the 18 compiler binding and 9 primitive registry
 laws. These check byte preservation, tagged failures, exact child status,
 limit validation, and primitive identity; they do not prove Windows Job
 enforcement or descendant cleanup.
@@ -368,6 +472,12 @@ sh scripts/test_suite.sh --compiler-checking
 sh scripts/test_suite.sh --compiler-checking --list
 sh scripts/test_suite.sh --compiler-checking --shard=1/16
 ```
+
+Register each `tests/compiler_*_tests.ouro` and each `*_tests.ouro` under
+`tests/compiler/` in `compiler_check_suite_fixtures` in `tools/test/suites.ouro`.
+The [checker diagnostic fixtures](../tests/compiler/diagnostics/) run through
+this inventory, not a directory glob. `--list --shard=1/16` shows the paths
+in that shard without running their assertions.
 
 The native-lowering fixture runs each assertion in a separate process to bound
 the transitional C host's compiler heap. It retains the full case inventory,
@@ -391,8 +501,8 @@ profile. User-test and stage-loop gates remain separate.
 
 The frontend-security host suite builds the fresh generated backend in shards
 grouped by 256 generated getter clusters. It checks the original generated C,
-shard manifest and shard contents for all five host images, using one worker,
-`O0`, and the existing 3 GiB/900-second build budget. All 40 host probes remain required.
+shard manifest and shard contents for all six host images, using one worker,
+`O0`, and the existing 3 GiB/900-second build budget. All 60 host probes remain required.
 The host build records start and completion markers for compiler emission,
 helper uniquification, hook installation, and publication, so a timeout can be
 assigned to the last unfinished phase without inferring it from compiler trace.
@@ -401,24 +511,72 @@ monotonic elapsed wall seconds at source-checking, replay, type-normalization,
 lowering, MIR, GC, codegen, and publication boundaries. The bounded-process API
 build enables it to locate native-compilation timeouts. Unavailable or backward
 clock samples are reported explicitly; timing never changes acceptance or a
-deadline. A separate host probe checks timing output, alongside all 40 retained
-probes. Ordinary host invocations retain their existing diagnostic bytes.
+deadline. A required host probe checks timing output. Ordinary host invocations
+retain their existing diagnostic bytes.
 
 On Windows, the required frontend-security host suite also uses its freshly
-built `n1-host` to emit the 29 bounded-process API laws, runtime fixture, and
-denied-commit child as direct PE32+ images. All 40 host probes
+built `n1-host` to emit the 53 bounded-process API laws, runtime fixture, and
+denied-commit child as direct PE32+ images. All 60 host probes
 remain required, including reachability/flow-round fuel, error-payload and nested
-allocation, root clearing, and PE operation lifetime checks, descriptor renumbering, forced
-codegen fallback, and canonical block/body byte parity. On Windows, the same
+allocation, root clearing, per-declaration source checking, per-contract result
+retention, and PE operation
+lifetime checks, descriptor renumbering, forced codegen fallback, and canonical
+block/body byte parity. On Windows, the same
 fresh backend also emits the existing reclamation and active-caller fixtures
 as direct PE images, including a validated descriptor renumbering across 65536.
-All three images must return 42 after their heap/root assertions. Default-quiet host progress and
-unchanged failure diagnostics are checked separately. The native section requires all 29 API result lines in
-order, including the two separate `capture cap` laws, 13 runtime cases, and
-5 source-helper rejections after successful source checking and rechecking. The cases cover
+All six lifetime images (`live-reclaim`, `live-calls`, `live-high-descriptor`,
+`escaping_collect`, `pap_reuse_collect`, `pap_plateau`) must return 42 after
+their heap/root assertions with empty stdout and stderr. The plateau case keeps
+an escaping PAP graph live across 4096 applications and requires at least 16
+observed automatic budget resets with actual object-count reduction. Raw
+observations do not force collection or clear dead slots; requested managed
+bytes and object counts stay bounded, followed by checked empty-heap release.
+These assertions do not measure OS peak commit or establish native bootstrap.
+Default-quiet host progress and
+unchanged failure diagnostics are checked separately. The native section requires all 53 API result lines in
+order, including the two separate `capture cap` laws, 24 runtime cases, and
+8 source-helper rejections after successful source checking and rechecking. The cases cover
 exact captured bytes and binary stdin, deferred/reused actions, child status
 73 and 259, invalid limits, launch failure, memory denial, output caps,
-timeout, descendant completion, and parent termination.
+timeout, descendant completion, and parent termination. The explicit-cwd cases
+retain literal Unicode/space paths, empty and quoted argv, unchanged parent cwd,
+invalid UTF-8/NUL/relative path refusal, binary streams, and the same timeout,
+resource, cap and descendant-cleanup failures. Source, producer, PE imports,
+exact output and cwd input hashes remain bound to the invocation. Host receipt
+protocol laws are separate from native execution acceptance.
+
+The existing native file-read owner retains all 14 read-status cases and three
+source-helper rejections. It also emits the bounded-reader's ten pure laws, six
+order laws, all three cleanup fault modes, public binary probe and source-owned
+call fixture as direct PE images. This section is required on Windows: it checks
+exact NUL/FF bytes, zero/exact/excessive and large Nat caps, the 65537-byte chunk
+boundary, Unicode paths, missing/directory/reparse/sharing refusals, source-owned
+NUL/malformed UTF-8 paths, deferred/reused actions and recovery. Unknown source
+modes and malformed/extra probe arguments must refuse. A host argv failure does
+not replace a malformed String check inside the native helper.
+
+The bounded observer pins complete source closures, the fresh producer, all four
+PE images, input receipt and exact input/output bytes before and after execution.
+All 22 runtime rows, ten/six law lines and three fault outcomes are required;
+truncated or extra bytes, wrong status, stale inputs, timeout, missing reparse
+support or incomplete observation cannot establish bounded native acceptance.
+The existing one-CPU/3 GiB host budgets remain, with 30-second native invocations
+and a 300-second observer deadline. Protocol regressions remain in
+`scripts/fs_read_suite_test.py`, called by the existing runtime IO suite; the
+frontend host suite runs the real native observer before declaring completion.
+C stdin/read controls and all other host/lifetime/process gates remain required.
+
+The runtime IO suite also runs the C writer observer and its protocol tests.
+It compiles the writer harness as separate translation units; only the test
+`ouro_io.c` object receives `ouro_io_write_test.h`. The configured C producer,
+sources, objects and driver are pinned before and after observation. All 12
+write cases and four malformed-driver cases require exact raw status, streams
+and file bytes within a 90-second observer deadline. The existing backend
+enforces the configured 3072 MiB cap for the Windows process tree and each
+Linux process. Darwin inherits the host address-space limit. Windows cases
+hold a readable ordinary file and verify direct-open sharing status 32. POSIX
+cases verify direct no-follow refusal and retain ordinary symlink-target bytes.
+These C controls do not establish native runtime acceptance.
 
 The same fresh host also builds the exclusive-directory API laws and native
 probe from their complete current source closures. The Windows path requires
@@ -454,6 +612,37 @@ The Python observer retains descendant handles before cancellation and
 checks their signaled state before closing the outer supervising Job.
 Memory events, timeouts, malformed verdicts, changed inputs, and missing
 images fail; `ENFORCEMENT_GAP` cannot count as an expected child failure.
+The same required Windows owner also emits the current public `coil` entry,
+all 127 CLI argument laws, and a source-owned sibling transport fixture. Its
+33 public-route cases cover `lsp` and `pkg`, retained `fmt` and `test`, literal
+arguments, inherited binary streams/cwd/environment, present-empty hosted
+selectors, refusal priority, missing siblings and completed DWORD statuses.
+Actual loaded-image paths are checked against cwd, PATH and argv0 decoys;
+source, producer, images, inputs and raw byte receipts must stay unchanged.
+The fixture aliases establish routing only. The retained standalone package
+and LSP suites remain required for their real behavior; these observations do
+not establish native bootstrap or isolated-host acceptance.
+
+The same Windows process owner also emits the native toolchain model, reader,
+IO fixture and source-owned protocol child from their complete current closures.
+All 60 model, 18 paired-reader and 19 IO law lines are required in source order,
+with exact raw output and empty stderr. The reader runs from the repository root;
+the IO fixture uses a fresh owned directory, unrelated cwd, literal Unicode
+environment and the checked bounded-process API. Source, producer, native
+check/recheck/emission phases, exact PE imports and raw reports remain bound
+before and after execution. These fixtures test source capture and transport;
+the child publishes synthetic PE bytes and does not establish N2/N3 equality or
+native independence. The pure model also remains in compiler-checking.
+
+The same required Windows owner emits both internal release folder-staging
+fixtures and requires all 48 model and 12 real-IO rows, exact raw bytes and empty
+stderr. The IO image receives one absolute fresh directory and runs from an
+unrelated cwd with empty PATH and hosted selectors removed. The observer also
+checks the complete hand-expected binary file/directory inventory and retains
+failed or timed-out child streams. This exercises experimental folder staging;
+it does not authenticate native artifact origin, publish a release or replace
+the existing archive, manifest and five-platform release checks.
+
 The source closures, producer, PE machine/imports, images, and byte reports
 are recorded under `host-*/native-process/`. These checks use one CPU and
 the configured outer memory limit (3 GiB by default). POSIX retains the
@@ -461,12 +650,12 @@ strict host probes and records the Windows runtime section as unavailable
 with zero native rows. This transitional Python supervision and C producer
 do not establish native bootstrap or an isolated-host release.
 
-The `compiler-boundary` gate is required in the PR `tests` group, nightly,
-manual, and kernel profiles, and in the Ouro `suite-native` and `pr-native`
-profiles. It checks the documented pure-checker import allowlist, the owners
-of checked-value representations, and their [trust-boundary documentation](tcb.md).
-Unreadable or truncated source inventories fail the gate. The compiler suites
-separately exercise typechecking behavior.
+The `compiler-boundary` gate is required in the Python runner's PR `tests`
+group, nightly, manual, and kernel profiles, and in `ouro_ci_gate.sh` profiles
+`suite-native` and `pr-native`. It checks the pure-checker import allowlist,
+the owners of checked-value representations, and their
+[trust-boundary documentation](tcb.md). Unreadable or truncated source
+inventories fail the gate. The compiler suites exercise typechecking behavior.
 
 ```sh
 sh scripts/ouro_repo_gate.sh --profile compiler-boundary
@@ -511,9 +700,9 @@ run, including declaration IDs and dependency-edge coverage. Depth covers all
 rejection must be the exact typed resource outcome; a crash, timeout, or host
 memory termination cannot satisfy it. The host verifies complete ordered
 protocols, current source and producer hashes, executable receipts, and limits.
-These gates are blocking in PR analysis, nightly kernel, manual, and `kernel`
-profiles. The `kernel` name is retained for command and hosted-job compatibility;
-it runs the canonical compiler suites and the generated Core profile.
+These gates are blocking in the PR `checker` group, the nightly and manual
+`kernel` groups, and the standalone `kernel` profile. The standalone profile
+runs the canonical compiler suites and the generated Core profile.
 
 ### Handwritten C host analysis
 
@@ -581,8 +770,11 @@ sh scripts/ouro_repo_gate.sh --profile retirement --out _build/ouro_repo_gate/re
 sh scripts/ouro_repo_gate.sh --profile pr-native --out _build/ouro_repo_gate/pr-native
 ```
 
-The Python PR profile invokes those `*-native` names; the short names `docs`,
-`project`, and `workflow` are aliases.
+The Python PR profile invokes `docs-native`, `project-native`, and
+`workflow-native` directly. The short names `docs`, `project`, and `workflow`
+select the same repository checks. In `ouro_repo_gate.sh`, `pr-native` is an
+alias for `repo`, which combines documentation, project-surface, and workflow
+checks.
 
 The Ouro-native CI runner can list or run grouped profiles without Python
 composition:
@@ -605,11 +797,10 @@ sh scripts/ouro_ci_gate.sh --profile host-bound --out _build/ouro_ci/host-bound
 defines backend markers, strict CLI selection, report evidence, and retirement
 conditions.
 
-`pr-native` runs the Ouro-native docs, project-surface, and workflow gate subset.
-It is useful for repository-control-plane changes, but it is not full parity
-with `python3 scripts/ci_gate.py --profile pr`. The Python PR profile remains the
-compatibility/reference full PR readiness path for broad suites, bootstrap
-evidence, cache parity, release packaging, and specialized analyzer checks.
+In `ouro_ci_gate.sh`, `pr-native` runs the documentation, project-surface,
+workflow, and `compiler-boundary` gates. Use the Python PR profile for full
+PR validation, including broad suites, bootstrap evidence, cache parity,
+release packaging, and specialized analyzer checks.
 
 Repository suites for manifests, formatting, documentation, lines, native lint
 fixtures, runtime IO, user tests, samples, and quickstart now keep their cases
@@ -628,13 +819,13 @@ Host-script retirement follows the evidence rules in
 
 | Workflow | Role |
 | --- | --- |
-| `ouro-pr.yml` | Parallel PR, kernel, editor, and portable checks |
+| `ouro-pr.yml` | PR path selection, language checks, editor and site validation, and portable checks |
 | `ouro-nightly-full.yml` | Scheduled full checks |
 | `ouro-manual-trust.yml` | On-demand check profiles on Ubuntu and Windows |
 | `dependency-review.yml` | Changed dependency and workflow checks |
 | `ouro-lint.yml` | Full Ouro lint suite, manual dispatch only |
 | `ouro-release.yml` | Build host toolchains and publish tag drafts and snapshots every three days |
-| `ouro-pages.yml` | Test, lint, and build `site/` on PRs and pushes; publish GitHub Pages from `main` |
+| `ouro-pages.yml` | Build selected site changes on push or manual dispatch and publish GitHub Pages from `main` |
 
 The release workflow builds the host toolchains described in
 [Releasing](releasing.md). Its build and assemble jobs stay read-only.
@@ -652,7 +843,7 @@ Compiler and bootstrap receipts retain their complete identity checks.
 Select `task=frontend-security` in Manual for the canonical frontend-security
 suite alone on Ubuntu and Windows. The diagnostic task reuses compiler
 verification, toolchains, cache controls, and the 120-minute job limit; all
-frontend host limits, 40 probes, and Windows direct PE checks remain required.
+frontend host limits, 60 probes, and Windows direct PE checks remain required.
 Its result does not certify a complete profile. The default `validate` task
 still selects every group in the chosen profile.
 
@@ -666,33 +857,47 @@ review patch. It does not publish changes or replace dependency review. The full
 Manual profile also runs the site and editor checks in an immutable Docker image
 with read-only source mounts and retains source hashes and execution logs.
 
-Hosted path selection is fail-closed for validation: missing revisions, a Git
-error, or an empty diff runs every applicable job. An editor-only change runs
-the VS Code test job while skipping unrelated compiler work.
-A `site/`-only change is treated as a dependency/path change and does not start
-the compiler suites. Pages runs `npm run lint`, `npm test`, and `npm run build`
-for pull requests to and pushes on `main` or `master` that change `site/`,
-`quality/biome.json`, or its workflow. Pull requests only restore the npm cache
-and cannot deploy the site.
-The hosted `Kernel` job builds `ouro1`, then runs
-`python3 scripts/ci_gate.py --profile kernel` and uploads its compiler,
-hardening, boundary, generated-law, scale, and depth reports. Its path
-selector covers the checker and its compiler, runtime, standard-library, test,
-and gate dependencies. Missing required probes fail the job.
+`Editor` validates `editors/vscode/`. Its npm manifest and lockfile also select
+the repository version and release packaging checks. `Site` validates `site/`
+and uploads the Pages preview artifact. The shared `quality/biome.json` and
+the PR workflow select both jobs. A change to the Pages workflow also selects
+`Site`. Markdown in either tree selects `docs-examples`. Removing or renaming
+the editor package manifest or the site's Phosphor license also runs this gate
+to check references to the old path.
+
+Both jobs start after `Paths`. Site and Pages use `npm --prefix site run build:ci`
+to install dependencies with `npm ci` and run `npm run check` for linting, tests,
+and the build. Merge-queue and manual CI validation also include the site.
+PR jobs use read-only permissions.
+
+For pushes to `main` and `master`, the separate Pages workflow uses GitHub's
+path filter for `site/**`, `quality/biome.json`, and the Pages workflow itself.
+The workflow also builds the site on `workflow_dispatch`. A successful build
+can publish only on `main`, after a push or manual dispatch.
+
+The stable `Dependencies / Review` job starts for pull requests and merge
+groups. It selects dependency review for changes to `Ouro.seal` or either npm
+project's manifest or lockfile. It selects the native workflow-policy scan for
+changes to workflow definitions, its launchers, or inputs needed to build or
+run the scanner. For pull requests, the selector checks the tested merge and
+PR head diffs against the base for manifest and lockfile changes. The pinned
+dependency-review action compares the PR head with the base. The selector uses
+the tested merge diff for workflow policy, and the scanner reads the current
+checkout. For merge groups, the selector and dependency-review action use the
+group base and head. An empty, invalid or unavailable diff selects both checks.
+
 The nightly and manual profiles also run `analyze-production`
 (`python3 scripts/analyze_production_suite.py`), which sweeps the production
 scopes with the structured analyzer and fails on any finding from the promoted
 `--enable-strict` family set or on a frontend rejection that
 `quality/analyze_production.json` does not list; the PR profile keeps the
-fixture-based `analyze-precision` gate. Dependency review starts for every pull request so its required status is
-stable, but the dependency action and workflow scan run only when their owned
-paths changed.
+fixture-based `analyze-precision` gate.
 
-Workflow permissions are explicit. Validation jobs are read-only; release
-publication requests write access only in the tag-gated draft job and the
-guarded snapshot job. The public
-site workflow requests `pages` and `id-token` write only in the main-branch
-publish job. External actions are pinned to a full commit SHA.
+Validation jobs have read-only permissions. Release publication requests write
+access only in the tag-gated draft job and the guarded snapshot job. The Pages
+publish job requests `pages` and `id-token` write on `main`. The workflow
+policy rejects `pull_request_target` and requires full commit SHAs for external
+actions.
 
 The public site source lives in `site/`. Hosted Pages use
 `https://eluvane.github.io/ouro/`. After a custom domain is attached, rebuild
@@ -718,14 +923,11 @@ Hosted repository reachability is separate from local project-surface policy.
 manual or hosted contexts, but `scripts/github_project_gate.py` does not depend
 on it and does not claim native hosted GitHub API parity.
 
-Policy notes that must stay visible in this page: cache is not trusted;
-`kernel_hardening_suite.py`; generated artifact drift; cache-on/cache-off parity;
-`pull_request_target`; `workflow_dispatch`; nightly; local reproduction; release
-candidate; `github_project_gate.py`; `release_package.py`;
-`strict_quality_firewall.py`; Strict-quality SARIF policy.
-`scripts/hygiene.sh` keeps presence, generated-shape, packer-selftest, and
-stitch needles. It does not re-run those PR-owned gates;
-`python3 scripts/ci_gate.py --profile pr` remains their required owner.
+`scripts/hygiene.sh` checks source presence, generated source shape, driver
+wiring, and the packer self-tests. The Python PR profile owns the remaining
+required gates. See the [release candidate checks](releasing.md#release-candidate-checks)
+for `release_package.py` and [quality reports](quality.md#fixtures-and-reports)
+for JSON and SARIF findings.
 
 ## Reports and failures
 
@@ -760,17 +962,9 @@ Repository checks may also include deterministic `metrics`. CI gate entries
 record exact `command_argv`, `required`, `blocking`, `elapsed_ms`, `returncode`,
 `output_log`, and `gate_report`.
 
-The `host-bound` profile writes `host-bound.json`, covering every current
-repository-visible `.py` and `.sh` path plus explicit `remove` rows for retired
-script paths. Every row has deterministic fields: `kind`, `migration_status`,
-`path`, `role`, `native_replacement`, `parity_status`, `removal_eligibility`,
-`blocker`, and `evidence`. The standalone `host-bound` profile runs native
-inventory consistency before writing the report; missing, stale, duplicate, or
-reappearing removed script paths set both the report and command status to
-failure. The profile also requires a fresh, passing `control-plane-native`
-report with the expected native backend and a nonempty gate list. A child status
-of zero without that report, or with malformed/non-passing evidence, is a
-failure.
+The `host-bound` profile writes `host-bound.json`. Its
+[inventory and validation contract](native_repo_gates.md#host-bound-inventory-and-validation)
+defines the row fields, delegated report requirements, and failure conditions.
 
 Never summarize a timeout, out-of-memory termination, or skipped host tool as a
 pass.
@@ -779,6 +973,10 @@ The Python PR runner keeps complete gate logs under the selected output
 directory. Console tails are printed for failing gates; passing gate tails stay
 on disk unless `OURO_CI_TAIL_PASS=1` is set. This keeps the console useful
 without reading large successful logs back into memory.
+`ci-summary.json` records tool preparation, workspace setup, gate elapsed time,
+and resource allocations. Its peak task, CPU-slot, and memory counts describe
+scheduled work. Compiler shards reserve 3 GiB each and record sampled peak RSS
+for the process tree when the host provides it.
 
 ## Caches
 
@@ -786,12 +984,41 @@ Hosted and local caches may accelerate C objects, native tool binaries,
 frontend regeneration, self-hosted modules, and generated-C shards. Pull requests use restore-only
 cache policy; trusted branch or scheduled workflows may save accelerator state.
 
-The shared PR compiler cache is keyed by the bootstrap driver's full current
-input identity, including the host C compiler and flags. It includes the
-completion report, input manifest, and both generated C comparisons referenced
-by `ouro1.bootstrap.json`; `_build/c` alone cannot establish a reusable compiler.
-Suite caches remain separate. Kernel and Portable restores try their own cache
-prefix first. Only trusted branch pushes save PR caches.
+CI, `Dependencies / Review`, and Nightly restore the compiler cache by the
+same exact key. It includes the runner OS and architecture and the bootstrap
+driver's full current input identity, including the host C compiler and flags.
+The cache holds the compiler, `ouro1.bootstrap.json`, the completion report,
+the input manifest, and the P1/P2 generated C referenced by the receipt. The
+build driver verifies the evidence before reusing the compiler. It builds a
+current compiler when reuse is unavailable.
+
+In CI's `Build and verify host compiler` step, `Host compiler exact cache
+lookup hit=true` records the cache action's lookup result. The build driver's
+`BOOTSTRAP: current compiler unchanged; checked successor reused` records
+verified reuse. CI saves the compiler cache on a miss during a push to `main`
+or `master`. Nightly saves it on a miss during a scheduled run or manual
+dispatch on either branch. `Dependencies / Review` restores it for workflow scans.
+
+Nightly prepares one compiler in `Host compiler` and publishes it in a
+workflow-local artifact. Each matrix job downloads the artifact and verifies
+its SHA-256, compiler, inputs, host toolchain, and bootstrap evidence before
+running its group. Suite caches remain separate.
+
+In public repositories, CI and `Dependencies / Review` can restore the
+historical cache into the runner's temporary directory after a compiler cache
+miss. It covers C0 and both historical bridges in the
+[bootstrap sequence](build.md#c-bootstrap). The driver uses the verified second
+bridge to build current P1, which then builds P2. Private and internal
+repositories build from the pinned historical inputs on a miss.
+
+Each historical cache entry includes the full historical input key and the
+producing run. The archive digest must match evidence from a successful first
+CI attempt on a push to `main` or `master` in the same repository. An unavailable
+digest or a mismatch triggers a build from the pinned inputs.
+
+The pull request `runtime-io` and `frontend-security` jobs restore the existing
+`tests` suite cache. Kernel and Portable try their own suite cache prefixes
+first. Only trusted branch pushes save PR suite caches.
 
 Restored data is followed by the relevant parity, hash, regeneration, or
 compiler-checking validation. Cache state does not establish program acceptance
@@ -846,15 +1073,17 @@ they are very conservative.
 The [validation matrix](#validation-matrix) lists the documentation, project,
 and workflow compatibility entry points. Their wrappers delegate to native
 profiles and require a fresh, passing native report.
-[Native repository gates](native_repo_gates.md#compatibility-and-host-reference-boundaries)
-defines the fail-closed report contract.
+The [wrapper report contract](native_repo_gates.md#compatibility-wrapper-reports)
+defines the evidence each wrapper requires.
 
-The Ouro-native `docs` profile covers canonical docs, Markdown inventory metrics
-including base-ref comparison when available, docs index links, relative links,
-documented repository paths, README example drift, active syntax docs, manifest
-prefixes, sample companion pairs, and generated API presence.
+The Ouro-native repository `docs` profile checks canonical docs, the docs
+index, relative link paths, documented repository paths, README example drift,
+active syntax docs, manifest prefixes, sample companion pairs, and generated
+API presence. Check heading fragments separately from link paths. The gate
+reports Markdown inventory counts. When it can count the Markdown files at
+the base ref, it fails if the current count exceeds that baseline.
 `scripts/docs_examples_gate.py` preserves the legacy report kind and path while
-delegating policy to this native profile.
+delegating to this profile.
 
 The Ouro-native `project` profile covers required files, retired paths, required
 public phrases, public wording, README shape, pull-request template shape, issue
@@ -864,7 +1093,7 @@ to this native profile. Hosted GitHub/API reachability remains host-bound and is
 recorded by `scripts/github_project_hosted_probe.py` when explicitly run.
 
 The Ouro-native `workflow` profile applies the structured, fail-closed YAML
-policy in [Native repository gates](native_repo_gates.md#compatibility-and-host-reference-boundaries).
+[workflow policy](native_repo_gates.md#workflow-policy).
 `scripts/github_workflow_gate.py` preserves the legacy CLI and report path.
 
 `sh scripts/frontend_security_suite.sh` is a blocking PR check for malformed and

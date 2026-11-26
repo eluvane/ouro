@@ -183,14 +183,19 @@ static const char *lookup_name(struct intern_name *tab, int n, unsigned long id)
 	return 0;
 }
 
-static ouro_v *names_list(struct intern_name *tab, int ntab, ouro_v **orig_ids,
+struct core_body {
+	ouro_v *term;
+	const char *name; /* Borrowed from the C name table. */
+};
+
+static ouro_v *names_list(const struct core_body *bodies, ouro_v **orig_ids,
 			  int n)
 {
 	ouro_v *list = ouro_ctor(0, 0, 0);
 	int i;
 	for (i = n - 1; i >= 0; i--) {
 		unsigned long id = as_nat(orig_ids[i]);
-		const char *nm = lookup_name(tab, ntab, id);
+		const char *nm = bodies[i].name;
 		ouro_v *cell[2];
 		ouro_v *pr[2];
 		char fallback[32];
@@ -895,7 +900,7 @@ int main(int argc, char **argv)
 
 	{
 		ouro_v **ids = 0;
-		ouro_v **terms = 0;
+		struct core_body *bodies = 0;
 		ouro_v *stack[256];
 		ouro_v *cur;
 		ouro_v *intern_perm = 0;
@@ -969,8 +974,9 @@ int main(int argc, char **argv)
 			backend_failed = 1;
 			goto backend_done;
 		}
-		terms = (ouro_v **)malloc(sizeof(ouro_v *) * (unsigned)cap);
-		if (terms == 0) {
+		bodies = (struct core_body *)malloc(
+			sizeof(*bodies) * (unsigned)cap);
+		if (bodies == 0) {
 			fputs("ouro1: out of memory\n", stderr);
 			backend_failed = 1;
 			goto backend_done;
@@ -998,7 +1004,8 @@ int main(int argc, char **argv)
 					goto backend_done;
 				}
 				if (n == cap) {
-					ouro_v **grown;
+					ouro_v **grown_ids;
+					struct core_body *grown_bodies;
 					if (n > 20000) {
 						fprintf(stderr,
 							"ouro1: too many cores n=%d (cycle?)\n",
@@ -1007,25 +1014,25 @@ int main(int argc, char **argv)
 						goto backend_done;
 					}
 					cap *= 2;
-					grown = (ouro_v **)realloc(
+					grown_ids = (ouro_v **)realloc(
 						ids, sizeof(ouro_v *) * (unsigned)cap);
-					if (grown == 0) {
+					if (grown_ids == 0) {
 						fputs("ouro1: out of memory\n", stderr);
 						backend_failed = 1;
 						goto backend_done;
 					}
-					ids = grown;
-					grown = (ouro_v **)realloc(
-						terms, sizeof(ouro_v *) * (unsigned)cap);
-					if (grown == 0) {
+					ids = grown_ids;
+					grown_bodies = (struct core_body *)realloc(
+						bodies, sizeof(*bodies) * (unsigned)cap);
+					if (grown_bodies == 0) {
 						fputs("ouro1: out of memory\n", stderr);
 						backend_failed = 1;
 						goto backend_done;
 					}
-					terms = grown;
+					bodies = grown_bodies;
 				}
 				ids[n] = OURO_F(pair, 0);
-				terms[n] = OURO_F(pair, 1);
+				bodies[n].term = OURO_F(pair, 1);
 				n++;
 				if ((n & 63) == 0) {
 					fprintf(stderr, "ouro1: walk n=%d sp=%d\n", n, sp);
@@ -1102,7 +1109,14 @@ int main(int argc, char **argv)
 		ouro_heap_mark();
 		for (i = 0; i < n; i++) {
 			const char *nm = lookup_name(tab, ntab, as_nat(ids[i]));
+			bodies[i].name = nm;
+			/* Leave scoped operations for the source-owner binding pass. */
 			if (nm != 0 && is_fast(nm) &&
+			    !(getenv("OURO_EMIT_SCOPED_ARITHMETIC") != 0 &&
+			      (strcmp(nm, "add") == 0 || strcmp(nm, "mul") == 0 ||
+			       strcmp(nm, "sub") == 0 ||
+			       strcmp(nm, "compareNat") == 0 || strcmp(nm, "eqNat") == 0 ||
+			       strcmp(nm, "length") == 0 || strcmp(nm, "append") == 0)) &&
 			    !(g_ntype > 0 && is_fast_shape_mismatch(nm))) {
 				unsigned long gid = as_nat(ids[i]);
 				printf("static ouro_v *ouro_c%lu;\n", gid);
@@ -1116,7 +1130,7 @@ int main(int argc, char **argv)
 				ouro_v *g1;
 				ouro_v *chunk;
 				ir = ouro_apply(ouro_apply(extract_with, type_ids_v),
-					      terms[i]);
+					      bodies[i].term);
 				if (g_ntype > 0 || g_str_base > 0)
 					ir = rewrite_jsir(ir);
 				g1 = ouro_apply(emit_g, ids[i]);
@@ -1144,7 +1158,7 @@ int main(int argc, char **argv)
 		for (i = 0; i < n; i += 64) {
 			int count = n - i < 64 ? n - i : 64;
 			ouro_v *pieces = export_pieces_chunk(ids, i, count, dummy);
-			ouro_v *names = names_list(tab, ntab, ids + i, count);
+			ouro_v *names = names_list(bodies + i, ids + i, count);
 			ouro_v *chunk = ouro_apply(
 				ouro_apply(ouro_apply(emit_ex_names, names), pieces),
 				ouro_nat((unsigned long)i));
@@ -1169,7 +1183,7 @@ int main(int argc, char **argv)
 		ouro_heap_report("after-backend-emit");
 	backend_done:
 		free(ids);
-		free(terms);
+		free(bodies);
 		free(tab);
 		if (backend_failed)
 			return 1;

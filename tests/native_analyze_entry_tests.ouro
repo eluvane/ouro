@@ -1,0 +1,94 @@
+import "analyze/precision/assertions.ouro",
+  "../tools/analyze/native_request.ouro",
+  "../tools/analyze/native_policy.ouro",
+  "../tools/native_cli_args.ouro";
+
+def native_entry_words (arguments : List String) (expected : Maybe (List String)) : Bool :=
+    match native_cli_analyze_words arguments with
+    | Nothing => match expected with | Nothing => True | Just _ => False end
+    | Just words => match expected with
+      | Nothing => False
+      | Just other => precision_strings words other
+      end
+    end;
+
+def native_entry_limits (worker : NativeAnalyzeWorker) (memory : Nat) : Bool :=
+    match native_analyze_policy_limits native_analyze_entry_policy worker with
+    | ProcessCaptureLimitsOf deadline actual cpu output errors =>
+        andb(eq_nat deadline (mul 120 1000),
+          andb(eq_nat actual memory, andb(eq_nat cpu 1,
+            andb(eq_nat output bounded_native_report_stream_limit,
+              eq_nat errors bounded_native_report_stream_limit))))
+    end;
+
+def native_entry_command (image : String) (arguments : List String)
+    (program : String) (expected : List String) : Bool :=
+    match native_cli_analyze_words arguments with
+    | Nothing => False
+    | Just words => match native_sibling_command_checked (Right ExecutablePathError String image)
+        native_cli_analyze_sibling words with
+      | Left _ => False
+      | Right command => andb(str_eq (command_program command) program,
+          precision_strings (command_args command) expected)
+      end
+    end;
+
+def native_analyze_entry_laws : List (Pair String Bool) :=
+    [ MkPair String Bool "native-entry/policy/current-process-owner-accepts-limits"
+        (match native_analyze_policy_checked native_analyze_entry_policy with
+         | Left _ => False | Right _ => True end)
+    , MkPair String Bool "native-entry/policy/base500MiB-job-commit"
+        (native_entry_limits NativeAnalyzeBaseWorker 500)
+    , MkPair String Bool "native-entry/policy/drive3072MiB-job-commit"
+        (native_entry_limits NativeAnalyzeDriveWorker 3072)
+    , MkPair String Bool "native-entry/policy/finite120-second-worker-deadline"
+        (eq_nat native_analyze_worker_deadline_ms (mul 120 1000))
+    , MkPair String Bool "native-entry/cli/default-analyzer-arguments"
+        (native_entry_words ["coil.exe", "analyze"] (Just (List String) []))
+    , MkPair String Bool "native-entry/cli/literal-byte-order"
+        (native_entry_words ["spoof.exe", "analyze", "", "space 雪😀", "quote\"here", "&|<>",
+            "--scope=--enable-style", "--", "--strict"]
+          (Just (List String) ["", "space 雪😀", "quote\"here", "&|<>",
+            "--scope=--enable-style", "--", "--strict"]))
+    , MkPair String Bool "native-entry/cli/first-exact-command-only"
+        (all (List String) (fun (words : List String) => native_entry_words words (Nothing (List String)))
+          [ [], ["analyze"], ["coil.exe"], ["coil.exe", "Analyze"],
+            ["coil.exe", "fmt", "analyze"], ["coil.exe", "run", "main.ouro", "analyze"] ])
+    , MkPair String Bool "native-entry/cli/loaded-image-over-spoofed-argv0"
+        (native_entry_command "C:\\bundle 雪\\renamed.exe"
+          ["D:\\elsewhere\\coil.exe", "analyze", "--scope=a.ouro", "--local-only"]
+          "C:\\bundle 雪\\ouro-analyze.exe" ["--scope=a.ouro", "--local-only"])
+    , MkPair String Bool "native-entry/cli/UNC-image-prefix-retained"
+        (native_entry_command "\\\\server\\share name\\coil.exe"
+          ["spoof.exe", "analyze", "--scope", "雪.ouro"]
+          "\\\\server\\share name\\ouro-analyze.exe" ["--scope", "雪.ouro"])
+    , MkPair String Bool "native-entry/cli/image-query-fails-closed"
+        (match native_sibling_command_checked (Left ExecutablePathError String ExecutablePathQueryFailed)
+            native_cli_analyze_sibling [] with
+         | Right _ => False
+         | Left error => if let NativeSiblingImageError cause := (error : NativeSiblingError) then
+             str_eq (executable_path_error_message cause) (executable_path_error_message ExecutablePathQueryFailed)
+           else False
+         end)
+    , MkPair String Bool "native-entry/cli/image-without-parent-fails-closed"
+        (match native_sibling_command_checked (Right ExecutablePathError String "coil.exe")
+            native_cli_analyze_sibling [] with
+         | Right _ => False
+         | Left error => if let NativeSiblingParentError path := (error : NativeSiblingError) then
+             str_eq path "coil.exe"
+           else False
+         end)
+    , MkPair String Bool "native-entry/provision/raw-base-cannot-call-scheduler"
+        (andb(str_eq (native_analyze_worker_name NativeAnalyzeBaseWorker) "ouro-analyze-base.exe",
+          notb(str_eq (native_analyze_worker_name NativeAnalyzeBaseWorker) native_cli_analyze_sibling)))
+    , MkPair String Bool "native-entry/provision/fixed-drive-sibling"
+        (str_eq (native_analyze_worker_name NativeAnalyzeDriveWorker) "ouro-analyze-drive.exe")
+    , MkPair String Bool "native-entry/cli/option-validation-stays-analyzer-owned"
+        (match native_cli_analyze_words ["coil.exe", "analyze", "--unknown"] with
+         | Nothing => False
+         | Just words => match native_analyze_parse words with | Left _ => True | Right _ => False end
+         end)
+    ];
+
+-- @entry main
+def main : IO Unit := precision_run "native-analyze-entry" native_analyze_entry_laws;

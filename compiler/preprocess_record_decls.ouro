@@ -177,23 +177,25 @@ def register_record (reg : RecReg) (owner : List Nat) (aliases : ImpReg)
       end
   end;
 
-def expand_record_decls (reg0 : RecReg) (owner : List Nat) (aliases : ImpReg)
+def expand_record_decls_with_origin (retain : Bool) (reg0 : RecReg) (owner : List Nat) (aliases : ImpReg)
     (owner_names : List (List Nat))
     (src : List Nat)
-    : Pair RecReg PrepResult :=
-  (fix go (scan_fuel : Nat) (reg : RecReg) (xs : List Nat)
+    : Pair (Pair RecReg PrepResult) (Either SourceOriginError (Maybe OriginalSourceMap)) :=
+  record_origin_finish src
+  ((fix go (scan_fuel : Nat) (reg : RecReg) (xs : List Nat)
       (literal_prior : Bool) (acc : List Nat) (is_private : Bool)
-      : Pair RecReg PrepResult :=
+      (visibility_origin : Maybe (Pair (List Nat) (List Nat))) (capture : OriginalCapture)
+      : Pair (Pair RecReg PrepResult) OriginalCapture :=
     match scan_fuel with
-    | Z => MkPair RecReg PrepResult reg (PrepErr rec_code_malformed Z)
+    | Z => record_origin_result reg (PrepErr rec_code_malformed Z) capture
     | S remaining =>
         match xs with
-        | Nil => MkPair RecReg PrepResult reg (PrepOk (reverse Nat acc))
+        | Nil => record_origin_result reg (PrepOk (source_emit_reversed (Nil Nat) acc)) capture
         | Cons c rest =>
             match source_copy_comment_or_literal_at literal_prior acc xs with
             | Just p =>
                 match p with
-                | MkPair acc2 xs2 => go remaining reg xs2 False acc2 is_private
+                | MkPair acc2 xs2 => go remaining reg xs2 False acc2 is_private visibility_origin capture
                 end
             | Nothing =>
                 match source_is_ident_start c with
@@ -203,53 +205,56 @@ def expand_record_decls (reg0 : RecReg) (owner : List Nat) (aliases : ImpReg)
                         match source_bytes_equal id w_record with
                         | True =>
                             match parse_record xs with
-                            | RecPErr e => MkPair RecReg PrepResult reg (PrepErr e Z)
+                            | RecPErr e => record_origin_result reg (PrepErr e Z) capture
                             | RecPOk ri sort tail =>
                                 match collide_record reg ri with
                                 | True =>
-                                    MkPair RecReg PrepResult reg
-                                      (PrepErr rec_code_collide Z)
+                                    record_origin_result reg (PrepErr rec_code_collide Z) capture
                                 | False =>
+                                    let registered : RecReg := register_record reg owner aliases owner_names ri in
+                                    let emitted : List Nat := emit_record acc ri sort is_private in
+                                    let captured : OriginalCapture := match visibility_origin with
+                                      | Nothing => original_capture_change capture xs tail acc emitted True
+                                      | Just prefix => match prefix with | MkPair before output_before =>
+                                        original_capture_change capture before tail output_before emitted True
+                                        end
+                                      end in
                                     go remaining
-                                      (register_record reg owner aliases owner_names ri) tail False
-                                      (emit_record acc ri sort is_private) False
+                                      registered tail False
+                                      emitted False (Nothing (Pair (List Nat) (List Nat))) captured
                                 end
                             end
-                        | False => go remaining reg after True (emit acc id)
-                            (source_bytes_equal id w_private_p)
+                        | False =>
+                            let emitted : List Nat := emit acc id in
+                            let private_flag : Bool := source_bytes_equal id w_private_p in
+                            go remaining reg after True emitted private_flag
+                              (match retain with
+                               | False => Nothing (Pair (List Nat) (List Nat))
+                               | True => match private_flag with
+                                 | False => Nothing (Pair (List Nat) (List Nat))
+                                 | True => Just (Pair (List Nat) (List Nat))
+                                     (MkPair (List Nat) (List Nat) xs acc)
+                                 end
+                               end) capture
                         end
                     end
                 | False => go remaining reg rest (source_is_ident_char c)
-                    (Cons Nat c acc) is_private
+                    (Cons Nat c acc) is_private visibility_origin capture
                 end
             end
         end
-    end) (S (length Nat src)) reg0 src False (Nil Nat) False;
+    end) (S (length Nat src)) reg0 src False (Nil Nat) False
+    (Nothing (Pair (List Nat) (List Nat))) (original_capture_start retain));
+
+def expand_record_decls (reg0 : RecReg) (owner : List Nat) (aliases : ImpReg)
+    (owner_names : List (List Nat)) (src : List Nat) : Pair RecReg PrepResult :=
+  fst (Pair RecReg PrepResult) (Either SourceOriginError (Maybe OriginalSourceMap))
+    (expand_record_decls_with_origin False reg0 owner aliases owner_names src);
 
 def take_until_comma_or_end (xs0 : List Nat)
     : Pair (List Nat) (List Nat) :=
-  (fix go (fuel : Nat) (xs : List Nat) (literal_prior : Bool) (acc : List Nat) (depth : Nat)
-      : Pair (List Nat) (List Nat) :=
-    match fuel with
-    | Z => MkPair(List Nat, List Nat, reverse Nat acc, Nil Nat)
-    | S remaining =>
-        match xs with
-        | Nil => MkPair(List Nat, List Nat, reverse Nat acc, Nil Nat)
-        | Cons c rest =>
-            match source_copy_comment_or_literal_at literal_prior acc xs with
-            | Just copied =>
-                match copied with
-                | MkPair acc2 tail => go remaining tail False acc2 depth
-                end
-            | Nothing =>
-                match andb (eqNat depth Z)
-                      (orb(eqNat c ch_comma_p, eqNat c ch_rbrace_p)) with
-                | True => MkPair(List Nat, List Nat, reverse Nat acc, xs)
-                | False => go remaining rest (source_is_ident_char c) (Cons Nat c acc) (bump_depth c depth)
-                end
-            end
-        end
-    end) (S (length Nat xs0)) xs0 False (Nil Nat) Z;
+  record_take_until (fun (_ : Bool) (c : Nat) (_ : List Nat) =>
+    orb(eqNat c ch_comma_p, eqNat c ch_rbrace_p)) (S (length Nat xs0)) xs0;
 
 def all_seen (n : Nat) (seen : List Nat) : Bool :=
   (fix go (remaining : Nat) : Bool :=

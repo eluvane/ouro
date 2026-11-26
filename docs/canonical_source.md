@@ -1,26 +1,27 @@
 # Canonical compact source pipeline
 
-Ouro keeps human-authored `.ouro` files unchanged. The checked compiler pipeline
-feeds the lexer tokens directly to the parser after preprocessing:
+The checked compiler path preprocesses `.ouro` source in memory and passes
+the resulting token stream directly to the parser. Source files stay in
+place.
 
 ```text
 original source bytes
-  -> import / record preprocessing
-  -> existing lexer rules
-  -> Token stream
-  -> parser / elaborator / lowerer / checker / extraction
+  -> import and record preprocessing
+  -> lexer
+  -> token stream
+  -> parser, elaboration, lowering, and checking
 ```
 
-`compiler/driver.ouro`'s `lex_then_parse` helper also wraps tokens in
-`CanonicalSourceUnit` for metadata and position mapping. This artifact is not a
-new source format. Neither path requires serializing and reopening token bytes.
+The syntax-only `lex_then_parse` helper passes its input directly to the
+lexer. It wraps the tokens in a `CanonicalSourceUnit` to retain token
+positions and directive metadata.
+Both paths use tokens as parser input. Compact byte serialization is optional.
+[Source driver](../compiler/driver.ouro)
 
 ## Removed trivia
 
-The existing lexer owns lexical semantics. Whitespace, blank lines, CRLF/LF
-layout trivia, ordinary `--` comments, and formatting-only spacing do not become
-parser input. The canonical stage makes that boundary explicit and exposes the
-compact semantic token representation to later frontend stages.
+The lexer owns lexical semantics. It discards whitespace, blank lines, CRLF/LF
+layout trivia, and ordinary `--` comments outside literals.
 
 The canonical serializer can materialize inspection bytes from tokens on demand,
 for example `def x:Type:=1`, but this is optional debug/cache evidence. It is
@@ -28,11 +29,10 @@ not required by compilation.
 
 ## Preserved metadata
 
-Comments whose trimmed line-comment body begins with `@` are preserved as
-`SourceDirective` metadata with their original source offsets. This keeps current
-repository directives such as `@entry`, `@export`, `@doc`, `@bound`, and similar
-future policy/tooling markers out of the semantic token stream without losing
-that signal.
+`CanonicalSourceUnit` records line comments whose trimmed body begins with `@`
+as `SourceDirective` metadata at their byte offsets in the lexical input.
+Directives such as `@entry`, `@export`, `@doc`, and `@bound` stay outside the
+semantic token stream.
 
 Documentation comments and prose comments are not copied into the semantic
 artifact. Source-aware tools that need comments, such as formatter, LSP,
@@ -41,22 +41,23 @@ of the boundary.
 
 ## Source mapping
 
-The parser reports positions in token-space. The `lex_then_parse` helper maps
-these positions through `CanonicalSourceUnit`, not the optional serialized bytes.
-The current self-hosted lexer ABI does not
-yet expose byte start/end spans for each token; until that ABI grows spans, the
-map stores stable original token-index spans and maps EOF/out-of-range positions
-to the original source length.
+The parser reports token positions. The `CanonicalSourceUnit` map retains
+token ordinals, including the in-range EOF token. If a position is beyond the
+map, `canonical_original_position` returns the byte length of the lexical
+input. Use the byte-span helpers for byte ranges within the input.
+[Canonical source model](../compiler/canonical_model.ouro)
 
-Tools that need byte positions use `compiler/source_spans.ouro`, which the
-compiler pipeline does not import. `lex_spanned` steps the production lexer and
-records where each token starts and ends; `token_span_bytes` maps a token range
-to byte offsets. `parse_spanned` is the production parser dispatcher with
-`ESpan` token ranges around expressions. Every other `Expr` consumer treats
-`ESpan` as transparent, and `strip_spans` returns the production tree. Positions
-refer to the lexed text, so a tool must not report them against the original
-file when import-alias or record preprocessing rewrote it. Clippy reports a
-proof's range only in that unchanged case.
+The byte-span helpers in [`source_spans.ouro`](../compiler/source_spans.ouro)
+step the production lexer and mark token boundaries. `token_span_bytes`
+maps a token range to offsets in the lexed text. Tools can use `parse_spanned`
+to record expression ranges as `ESpan` nodes and `strip_spans` to recover the
+ordinary tree.
+
+`compile_checked_units_with_source_origins` also records token boundaries.
+Its occurrence capture uses a checked map to project ranges onto the original
+source when an original envelope is available. A consumer with offsets into
+preprocessed text alone must use that text. Clippy reports a proof range
+only when its lexed text matches the original.
 Alias qualification keeps the same source byte length when replacing `.` with
 the internal marker, and masked `as` / `open` syntax keeps line endings. This
 does not by itself provide original byte spans for rewritten tokens; tools
@@ -68,20 +69,23 @@ yields its expression.
 
 ## Hashes and cache identity
 
-`canonical_source.ouro` exposes two deterministic hash inputs:
+`canonical_bytes_from` serializes the tokens without directives or ordinary
+trivia. `canonical_semantic_hash_from` hashes those bytes. Tools can read
+directives separately with `canonical_directives`.
+[Token serialization and hashing](../compiler/canonical_source.ouro) ·
+[Directive access](../compiler/canonical_model.ouro)
 
-- semantic bytes: token-derived compact representation with non-semantic trivia
-  removed;
-- tooling bytes: semantic bytes plus preserved `SourceDirective` metadata.
-
-The hash is an identity/cache key, not a cryptographic trust boundary. A future
-cache can use the semantic hash only for work proven independent of ordinary
-comments and formatting; tooling caches need the metadata-bearing or raw-source
-hash as appropriate. These policies remain distinct.
+Use the semantic hash as a cache identity only for work independent of omitted
+source data. A cache for source-aware tooling must include the metadata or
+raw source it depends on. Keep trust checks independent of the semantic hash.
 
 ## Materialization
 
-Release toolchains select a compact final bootstrap stage:
+Release builds emit the final bootstrap stage from a checked compact source
+tree. To reproduce this mode, meet the build requirements and run the command
+from the repository root in a POSIX-compatible shell. The build writes outputs
+under `_build/` by default and reports `BUILD: OK` on success.
+[Build requirements](getting_started.md#requirements)
 
 ```sh
 python3 scripts/ouro_build.py build --compact-sources
@@ -110,21 +114,19 @@ Plain `build` and `rebuild` keep the original-source path; both accept the flag.
 
 ## Regression checks
 
-Host materialization and bootstrap ordering regressions run through
-`python3 scripts/bootstrap_compiler_test.py`. Focused Ouro-native checks live in
-`tests/canonical.ouro` and cover
-compact byte serialization, token-boundary separators, string content containing
-`--`, directive preservation, deterministic hashing, original-position mapping,
-and removed-byte metrics on a small fixture.
-
-Useful local checks:
+From the repository root, run the Python checks for host-side materialization
+and bootstrap ordering. A passing run exits with status zero.
 
 ```sh
-sh scripts/ouro1.sh check tests/canonical.ouro
-sh scripts/ouro1.sh check std/io.ouro
-sh scripts/ouro1.sh fmt --check std/io.ouro
-python3 scripts/bench_suite.py --out _build/bench-canonical
+python3 scripts/bootstrap_compiler_test.py
 ```
 
-The benchmark suite records local wall-clock evidence only; do not claim a
-performance improvement until before/after runs exist on the same machine.
+Run the compiler-checking suite under the same build prerequisites to execute
+the `canonical source smoke behavior` assertion in `compiler_structural`. Its
+fixture checks compact serialization, token separators, string content
+containing `--`, directive preservation, deterministic hashing, token-position
+mapping, and removed-byte counts. Look for a passing `compiler_structural`
+result in the suite report.
+[Canonical fixture](../tests/canonical.ouro) ·
+[Structural test](../tests/compiler_structural_tests.ouro) ·
+[Compiler-checking commands](ci.md#validation-matrix)

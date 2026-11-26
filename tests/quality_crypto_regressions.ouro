@@ -1,0 +1,89 @@
+-- Successful updates must not compress a block in this fixture.
+
+import "../std/crypto.ouro",
+  "../std/test.ouro",
+  "crypto_stream_checks.ouro";
+
+private def crypto_zero_hash : ShaSt := MkSha 0 0 0 0 0 0 0 0;
+
+private def crypto_zero_state (count : Nat) (tail : String) : Sha256Stream :=
+    Sha256StreamOf count crypto_zero_hash tail;
+
+private def crypto_zero_words (hash : ShaSt) : Bool :=
+    let (MkSha a b c d e f g h) := hash in
+    all Nat (fun (lane : Nat) => eq_nat lane 0) [a, b, c, d, e, f, g, h];
+
+private def crypto_state_matches (result : Either Sha256StreamError Sha256Stream)
+    (count : Nat) (tail : String) : Bool :=
+    match result with
+    | Left _ => False
+    | Right state =>
+      let (Sha256StreamOf actual hash buffered) := state in
+      andb (eq_nat actual count)
+        (andb (crypto_zero_words hash) (str_eq buffered tail))
+    end;
+
+private def crypto_limit_state (state : Sha256Stream) (count : Nat) : Bool :=
+    andb (crypto_check_limit_error Sha256Stream count (sha256_stream_update state ""))
+      (crypto_check_limit_error String count (sha256_stream_final state));
+
+private def crypto_last_state : Sha256Stream :=
+    crypto_zero_state (sub sha256_stream_byte_limit 1) (str_of_codes (replicate Nat 97 63));
+
+private def crypto_sequence : Either Sha256StreamError Sha256Stream :=
+    let? (Left, Right) : Either Sha256StreamError Sha256Stream do
+      let first : Sha256Stream := (sha256_stream_update (crypto_zero_state 0 "") "a")?;
+      let complete : Sha256Stream := (sha256_stream_update first "bc")?;
+      complete
+    end;
+
+private def crypto_state_tests : List Test :=
+    [ assert_true "stream empty update returns the checked state"
+        (crypto_state_matches (sha256_stream_update (crypto_zero_state 0 "") "") 0 "")
+    , assert_true "stream short update preserves the hash and exact bytes"
+        (crypto_state_matches (sha256_stream_update (crypto_zero_state 0 "") "abc") 3 "abc")
+    , assert_true "stream empty update preserves a residual tail"
+        (crypto_state_matches (sha256_stream_update (crypto_zero_state 3 "abc") "") 3 "abc")
+    , assert_true "stream sequential short updates carry typed success" (crypto_state_matches crypto_sequence 3 "abc")
+    , assert_true "stream checks shape without requiring a constructed history"
+        (crypto_state_matches (sha256_stream_update (crypto_zero_state 64 "") "") 64 "")
+    , assert_true "stream update and final reject an oversized tail"
+        (crypto_check_invalid_state (crypto_zero_state 0 (str_of_codes (replicate Nat 97 64))))
+    , assert_true "stream update and final reject count and tail mismatch"
+        (crypto_check_invalid_state (crypto_zero_state 3 "ab"))
+    , assert_true "stream update and final reject a missing residual byte"
+        (crypto_check_invalid_state (crypto_zero_state 1 ""))
+    , assert_true "stream update and final reject a count at the byte limit"
+        (crypto_limit_state (crypto_zero_state sha256_stream_byte_limit "") sha256_stream_byte_limit)
+    , assert_true "stream count errors retain an above-limit count"
+        (crypto_limit_state (crypto_zero_state (S sha256_stream_byte_limit) "") (S sha256_stream_byte_limit))
+    , assert_true "stream count error takes precedence over malformed tail"
+        (crypto_limit_state (crypto_zero_state sha256_stream_byte_limit
+          (str_of_codes (replicate Nat 97 64))) sha256_stream_byte_limit)
+    , assert_true "stream short update can reach the last valid byte count"
+        (crypto_state_matches (sha256_stream_update
+          (crypto_zero_state (sub sha256_stream_byte_limit 2) (str_of_codes (replicate Nat 97 62))) "b")
+          (sub sha256_stream_byte_limit 1) (str_concat (str_of_codes (replicate Nat 97 62)) "b"))
+    , assert_true "stream byte limit rejects a full block before compression"
+        (crypto_check_limit_error Sha256Stream sha256_stream_byte_limit (sha256_stream_update crypto_last_state "b"))
+    , assert_true "stream update errors retain the attempted total"
+        (crypto_check_limit_error Sha256Stream (S sha256_stream_byte_limit) (sha256_stream_update crypto_last_state "bc"))
+    , assert_eq "stream invalid state error code" (sha256_stream_error_code Sha256StreamInvalidState)
+        "sha256_stream_invalid_state"
+    , assert_eq "stream count error code" (sha256_stream_error_code (Sha256StreamByteLimitExceeded sha256_stream_byte_limit))
+        "sha256_stream_byte_limit"
+    , assert_eq "stream invalid state error message" (sha256_stream_error_message Sha256StreamInvalidState)
+        "SHA-256 stream state has invalid words, count or tail"
+    , assert_eq "stream count error message"
+        (sha256_stream_error_message (Sha256StreamByteLimitExceeded sha256_stream_byte_limit))
+        "SHA-256 stream byte count 536870912 must be below 536870912"
+    , assert_true "word addition and bit operations discard high bits"
+        (andb (eq_nat (add32 (sub crypto_check_word_limit 1) 2) 1)
+          (eq_nat (xor32 (add crypto_check_word_limit 7) 3) 4))
+    , assert_true "word shifts preserve their behavior on wider naturals"
+        (andb (eq_nat (shl32 crypto_check_word_limit 32) crypto_check_word_limit)
+          (eq_nat (shr32 crypto_check_word_limit 1) (mul 32768 65536)))
+    ];
+
+-- @entry main
+def main : IO Unit := test_run crypto_state_tests;

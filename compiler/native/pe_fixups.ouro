@@ -9,6 +9,9 @@ import "pe_imports.ouro",
 inductive PePatch : Type :=
   | PePatchAt : PeSection -> Nat -> List Nat -> Bool -> PePatch;
 
+inductive PeFixupStep : Type :=
+  | PeFixupStepOf : PePatch -> Nat -> Nat -> List Nat -> PeFixupStep;
+
 -- Derived lookup only. Insertions retain the first occurrence, including an
 -- invalid symbol; the existing resolver still owns every typed RVA check.
 inductive PeSymbolIndex : Type :=
@@ -257,7 +260,41 @@ def pe_resolve_fixup_indexed_with (lookup : PeSection -> Maybe (Pair PePlacedSec
       end in
     pe_resolve_fixup_with lookup selected imports fixup measured;
 
-def pe_plan_fixups (sections : List PePlacedSection) (symbols : List PeSymbol)
+-- The host may scope the complete step after its immutable inputs are captured.
+def pe_run_fixup_step (work : Unit -> Either PeError PeFixupStep) : Either PeError PeFixupStep :=
+    work MkUnit;
+
+def pe_plan_fixup_step (lookup : PeSection -> Maybe (Pair PePlacedSection Nat))
+    (index : PeSymbolIndex) (imports : List (Pair Nat Nat)) (fixup : PeFixup)
+    (last_section : Nat) (last_end : Nat) (available : Bool) (source : List Nat) (_ : Unit)
+    : Either PeError PeFixupStep :=
+    let kind : PeSection := pe_fixup_section fixup in
+    let offset : Nat := pe_fixup_offset fixup in
+    let width : Nat := pe_fixup_width fixup in
+    let code : Nat := pe_section_code kind in
+    match pe_patch_bounds_with lookup kind offset width with
+    | Left error => Left PeError PeFixupStep error
+    | Right extent => match extent with | MkPair section _ =>
+      match section with | PeSectionAt _ _ _ _ original =>
+      -- Backwards inputs inspect the original slot before ordering is checked.
+      let slot : List Nat := match andb(available, andb(eq_nat last_section code, leb_nat last_end offset)) with
+        | True => drop Nat (sub offset last_end) source
+        | False => drop Nat offset original end in
+      match pe_bytes_equal(take Nat width slot, pe_zeros width) with
+      | False => Left(PeError, PeFixupStep, PeNonzeroFixup offset)
+      | True => match pe_resolve_fixup_indexed_with lookup index imports fixup extent with
+    | Left err => Left PeError PeFixupStep err
+    | Right patch => match patch with | PePatchAt _ patch_offset bytes _ =>
+      match orb(ltb_nat last_section code, andb(eq_nat last_section code, leb_nat last_end patch_offset)) with
+      | False => Left(PeError, PeFixupStep, PeUnorderedFixup patch_offset)
+      | True => Right(PeError, PeFixupStep,
+          PeFixupStepOf patch code (add(patch_offset, length Nat bytes)) (drop Nat width slot))
+      end end
+    end end end end end;
+
+def pe_plan_fixups_with
+    (run_step : (Unit -> Either PeError PeFixupStep) -> Either PeError PeFixupStep)
+    (sections : List PePlacedSection) (symbols : List PeSymbol)
     (imports : List (Pair Nat Nat)) (fixups : List PeFixup) : Either PeError (List PePatch) :=
     match fixups with
     | Nil => Right(PeError, List PePatch, [] : List PePatch)
@@ -270,37 +307,45 @@ def pe_plan_fixups (sections : List PePlacedSection) (symbols : List PeSymbol)
       match rest with
       | Nil => Right(PeError, List PePatch, [] : List PePatch)
       | Cons fixup tail =>
-        let kind : PeSection := pe_fixup_section fixup in
-        let offset : Nat := pe_fixup_offset fixup in
-        let width : Nat := pe_fixup_width fixup in
-        let code : Nat := pe_section_code kind in
-        match pe_patch_bounds_with lookup kind offset width with
+        match run_step (pe_plan_fixup_step lookup index imports fixup last_section last_end available source) with
         | Left error => Left PeError (List PePatch) error
-        | Right extent => match extent with | MkPair section _ =>
-          match section with | PeSectionAt _ _ _ _ original =>
-          -- Ordered fixups share a forward cursor through each original
-          -- section. Backwards inputs still inspect their own original slot
-          -- before reporting ordering, preserving the first diagnostic.
-          let slot : List Nat := match andb(available, andb(eq_nat last_section code, leb_nat last_end offset)) with
-            | True => drop Nat (sub offset last_end) source
-            | False => drop Nat offset original end in
-          match pe_bytes_equal(take Nat width slot, pe_zeros width) with
-          | False => Left(PeError, List PePatch, PeNonzeroFixup offset)
-          | True => match pe_resolve_fixup_indexed_with lookup index imports fixup extent with
-        | Left err => Left PeError (List PePatch) err
-        | Right patch =>
-          match patch with
-          | PePatchAt _ patch_offset bytes _ =>
-            match orb(ltb_nat last_section code, andb(eq_nat last_section code, leb_nat last_end patch_offset)) with
-            | False => Left(PeError, List PePatch, PeUnorderedFixup patch_offset)
-            | True => mapRight PeError (List PePatch) (List PePatch)
-                (fun (patches : List PePatch) => Cons PePatch patch patches)
-                (go tail code (add(patch_offset, length Nat bytes)) True (drop Nat width slot))
-            end
+        | Right step => match step with | PeFixupStepOf patch code next_end next_source =>
+          mapRight PeError (List PePatch) (List PePatch)
+            (fun (patches : List PePatch) => Cons PePatch patch patches)
+            (go tail code next_end True next_source)
           end
-        end end end end end
+        end
       end) fixups 0 0 False ([] : List Nat)
     end;
+
+def pe_plan_fixups (sections : List PePlacedSection) (symbols : List PeSymbol)
+    (imports : List (Pair Nat Nat)) (fixups : List PeFixup) : Either PeError (List PePatch) :=
+    pe_plan_fixups_with pe_run_fixup_step sections symbols imports fixups;
+
+-- Keep each traversal's temporary stream cells separate from its retained
+-- prefix and immutable suffix. A staging host may scope this pure step.
+def pe_patch_prefix_step (bytes : List Nat) : Pair (List Nat) (List Nat) :=
+    MkPair (List Nat) (List Nat)
+      (take Nat (mul 4 native_byte_base) bytes) (drop Nat (mul 4 native_byte_base) bytes);
+
+-- The structural guard starts at count and always bounds remaining.
+def pe_patch_prefix (count : Nat) : List Nat -> Pair (List Nat) (List Nat) :=
+    (fix go (guard : Nat) (remaining : Nat) (bytes : List Nat) : Pair (List Nat) (List Nat) :=
+      match guard with
+      | Z => MkPair (List Nat) (List Nat) ([] : List Nat) bytes
+      | S next => match remaining with
+        | Z => MkPair (List Nat) (List Nat) ([] : List Nat) bytes
+        | S _ => match bytes with
+        | Nil => MkPair (List Nat) (List Nat) ([] : List Nat) bytes
+        | Cons _ _ => match leb_nat remaining (mul 4 native_byte_base) with
+          | True => MkPair (List Nat) (List Nat) (take Nat remaining bytes) (drop Nat remaining bytes)
+          | False => match pe_patch_prefix_step bytes with | MkPair prefix suffix =>
+            match go next (sub remaining (mul 4 native_byte_base)) suffix with | MkPair more following =>
+              MkPair (List Nat) (List Nat) (append Nat prefix more) following
+            end end
+          end
+        end end
+      end) count count;
 
 def pe_apply_section_patches (kind : PeSection) (bytes : List Nat) (patches : List PePatch) : List Nat :=
     let local_patches : List PePatch := filter PePatch
@@ -313,9 +358,10 @@ def pe_apply_section_patches (kind : PeSection) (bytes : List Nat) (patches : Li
         | PePatchAt _ offset replacement _ =>
           let prefix_size : Nat := sub offset cursor in
           let replacement_size : Nat := length Nat replacement in
-          let consumed : Nat := add prefix_size replacement_size in
-          pe_join ([take Nat prefix_size source, replacement,
-            go(tail, drop Nat consumed source, add offset replacement_size)] : List (List Nat))
+          match pe_patch_prefix prefix_size source with | MkPair prefix suffix =>
+            pe_join ([prefix, replacement,
+              go(tail, drop Nat replacement_size suffix, add offset replacement_size)] : List (List Nat))
+          end
         end
       end) local_patches bytes 0;
 

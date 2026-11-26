@@ -16,6 +16,7 @@ from unittest.mock import patch
 from repo_support import bind_relative_path, read_json_value, write_json_atomic
 from ourosmith.host import binary
 from ourosmith.surface.text_contracts import syntax_cases
+from selfhost_module_cache import CachedImportParser, cached_import_parser
 import strict_quality_firewall as strict_quality
 import syntax_quality_fix as syntax_native
 
@@ -86,36 +87,38 @@ def fix_cmd(*args: str) -> list[str]:
     return [str(fix_binary()), *resolved]
 
 
-_STRICT_PREPARATION: list[tuple[Path, Path, dict[str, Any]] | None] = [None]
+_STRICT_PREPARATION: list[tuple[Path, Path, dict[str, Any], CachedImportParser] | None] = [None]
 
 
-def strict_evidence(executable: Path, compiler: Path) -> dict[str, Any]:
+def strict_evidence(executable: Path, compiler: Path, *, parse_bytes: CachedImportParser) -> dict[str, Any]:
     from ourosmith.native import receipt_for
 
-    receipt, units, sources = receipt_for(executable, "tools/strict/main.ouro", compiler)
+    receipt, units, sources = receipt_for(executable, "tools/strict/main.ouro", compiler, parse_bytes=parse_bytes)
     return {"key": receipt["key"], "binary_sha256": receipt["binary_sha256"],
             "units": units, "sources": sources}
 
 
-def strict_preparation() -> tuple[Path, Path, dict[str, Any]]:
+def strict_preparation() -> tuple[Path, Path, dict[str, Any], CachedImportParser]:
     if _STRICT_PREPARATION[0] is None:
         from ourosmith.host import prepare_entry
 
         executable = prepare_entry("tools/strict/main.ouro", "ouro-syntax-quality-scanner")
         compiler = binary("ouro1")
-        _STRICT_PREPARATION[0] = executable, compiler, strict_evidence(executable, compiler)
+        parse_bytes = cached_import_parser()
+        evidence = strict_evidence(executable, compiler, parse_bytes=parse_bytes)
+        _STRICT_PREPARATION[0] = executable, compiler, evidence, parse_bytes
     return _STRICT_PREPARATION[0]
 
 
 def require_strict_unchanged(phase: str) -> None:
-    executable, compiler, evidence = strict_preparation()
-    if strict_evidence(executable, compiler) != evidence:
+    executable, compiler, evidence, parse_bytes = strict_preparation()
+    if strict_evidence(executable, compiler, parse_bytes=parse_bytes) != evidence:
         raise ValueError("native strict scanner inputs changed " + phase)
 
 
 def scan_source(path: Path, text: str, registry: dict[str, dict[str, Any]], profile: str,
                 native_fix: Path | None = None) -> list[strict_quality.Finding]:
-    executable, _compiler, _evidence = strict_preparation()
+    executable = strict_preparation()[0]
     require_strict_unchanged("before execution")
     try:
         with patch.object(strict_quality, "_strict_binary", return_value=executable):
@@ -130,12 +133,13 @@ def check_strict_preparation() -> Check:
     executable, compiler = OUT / "strict-stand-in", OUT / "producer-stand-in"
     evidence = {"key": "original-key", "binary_sha256": "original-binary",
                 "units": ["tools/strict/main.ouro"], "sources": {"unit.ouro": "original"}}
+    receipt = evidence, evidence["units"], evidence["sources"]
     outcome = SimpleNamespace(ok=True, status="ok", returncode=0, stdout="[]", stderr="")
     try:
         _STRICT_PREPARATION[0] = None
         with patch("ourosmith.host.prepare_entry", return_value=executable) as prepare, \
                 patch(__name__ + ".binary", return_value=compiler), \
-                patch(__name__ + ".strict_evidence", return_value=evidence), \
+                patch("ourosmith.native.receipt_for", return_value=receipt) as receipts, \
                 patch("ourosmith.limits.run_limited", return_value=outcome) as scans:
             registry = {"code": {}}
             for text in ("first fixture", "second fixture"):
@@ -144,11 +148,31 @@ def check_strict_preparation() -> Check:
             if prepare.call_count != 1 or scans.call_count != 2:
                 raise AssertionError("strict scanner was rebuilt or a fixture was not freshly scanned")
             prepare.assert_called_once_with("tools/strict/main.ouro", "ouro-syntax-quality-scanner")
+            if receipts.call_count != 5:
+                raise AssertionError("strict scanner skipped initial or per-run receipt checks")
+            parse_bytes = receipts.call_args_list[0].kwargs.get("parse_bytes")
+            if not isinstance(parse_bytes, CachedImportParser) or any(
+                call.kwargs.get("parse_bytes") is not parse_bytes for call in receipts.call_args_list
+            ):
+                raise AssertionError("strict receipt checks did not share one import parser")
             for call, text in zip(scans.call_args_list, ("first fixture", "second fixture"), strict=True):
                 if (call.args[0] != [str(executable), "--scan-source", str(OUT / "fixture.ouro"), "--profile", "release"]
                         or call.kwargs["stdin_text"] != text or call.kwargs["timeout_s"] != 1800
                         or call.kwargs["memory_mb"] != 3072 or call.kwargs["cwd"] != ROOT):
                     raise AssertionError("strict preparation changed a fixture frame or its limits")
+            for stdout, message in (
+                ("{}", "native strict scan did not return a JSON array"),
+                ("[null]", "native strict scan returned a non-object finding"),
+                ('[{"code":"OURO-LINT037"},null]', "native strict scan returned a non-object finding"),
+            ):
+                scans.return_value = SimpleNamespace(ok=True, status="ok", returncode=0, stdout=stdout, stderr="")
+                try:
+                    scan_source(OUT / "fixture.ouro", "source", registry, "release")
+                except ValueError as error:
+                    if str(error) != message:
+                        raise AssertionError(f"strict scan returned the wrong error for {stdout}: {error}") from error
+                else:
+                    raise AssertionError(f"strict scan accepted a malformed response: {stdout}")
 
         _STRICT_PREPARATION[0] = None
         with patch("ourosmith.host.prepare_entry", side_effect=ValueError("strict build refused")), \
@@ -243,9 +267,8 @@ def check_fix_cases() -> list[Check]:
             dependency = inp.parent / name
             dependency.parent.mkdir(parents=True, exist_ok=True)
             dependency.write_text(contents, encoding="utf-8", newline="")
-    # Pure byte-level selftests keep incomplete editor inputs. Public preview,
-    # check and write all require compiler acceptance; exercise those below on
-    # complete programs instead of expecting an unchecked preview to succeed.
+    # Byte-level selftests accept incomplete editor input. Public preview,
+    # check and write require compiler acceptance.
     run([str(fix_binary()), "--selftest", "--fixtures=" + str(OUT),
          "--out=" + str(OUT / "byte-selftest")])
     for seed in (1, 6):
@@ -260,9 +283,7 @@ def check_fix_cases() -> list[Check]:
 
 
 def typed_write_programs(generated):
-    # Keep the exact incomplete-editor preview goldens above. Publication
-    # additionally needs real declarations. Combined programs use distinct
-    # definition names instead of concatenating eleven duplicate value names.
+    # Use distinct definition names so the typed fixtures can share a module.
     typed = []
     for seed in (1, 6):
         parts = []
@@ -282,11 +303,8 @@ def typed_write_programs(generated):
             expected = case.automatic.replace(f"def value{seed} ", f"def {label} ")
             review = case.expected != case.automatic
             if case.name == "fix-legacy-bind":
-                # Typed publication must be compiler-accepted: docs/syntax.md do
-                # examples end the last statement without a trailing semicolon,
-                # and the checker rejects the terminator (CErr 10). The original
-                # incomplete-editor preview goldens keep their exact bytes; only
-                # these typed variants drop it. Combined inherits from its parts.
+                # Omit the final do statement's semicolon in the typed fixtures.
+                # Byte-level fixtures retain the original editor input.
                 source = source.replace("; io_pure Nat x;\n", "; io_pure Nat x\n")
                 expected = expected.replace("; io_pure Nat x;\n", "; io_pure Nat x\n")
             if case.name == "fix-list-element":
@@ -333,10 +351,7 @@ def check_native_fix_boundaries() -> list[Check]:
         "comment-bind": '-- do x <- action; S (S (S Z))\ndef value : Nat := 0;\n',
         "distinct-aliases": ('import "alias_source.ouro" as Alpha;\n'
                              'import "alias_source.ouro" as Beta;\n'
-                             # The root definition must not collide with the
-                             # aliased unit's `value`: the checker rejects the
-                             # duplicate global (CErr 3), and --write is
-                             # compiler-checked. Alias shading itself is intact.
+                             # A distinct root name avoids a duplicate global during the write check.
                              'def combined : Nat := add Alpha.value Beta.value;\n'),
     }
     library = Path(os.path.relpath(ROOT / "std/string_prims.ouro", OUT)).as_posix()
@@ -369,8 +384,7 @@ def check_native_fix_boundaries() -> list[Check]:
 
 
 def check_fix_metadata() -> list[Check]:
-    # Independent filesystem observations around the real public executable.
-    # This does not certify atomic replacement or candidate compiler checking.
+    # Before and after snapshots do not establish atomicity or compiler acceptance.
     path = OUT / "native-source-metadata.ouro"
     declaration = b"inductive Nat : Type := | Z : Nat | S : Nat -> Nat;\n"
     original = declaration + b"def retained_value : Nat :=0;\n"
@@ -482,6 +496,8 @@ def check_literal_composition() -> list[Check]:
         ("def a := Nil Nat;\ndef b := Nil Nat;\n", [":= Nil Nat;", ":= Nil Nat;"], set()),
         ("def a := Cons Nat (let x := Nil Nat\n in 1) (Nil Nat);\n",
          ["Cons Nat (let x := Nil Nat\n in 1) (Nil Nat)"], set()),
+        ('def text := r#"\nCons Nat 1 (Nil Nat)\n"#;\ndef items := Nil Nat;\n',
+         [":= Nil Nat;"], {2}),
     )
     registry = strict_quality.load_registry()[1]
     for source, expressions, closed_lines in cases:
@@ -502,7 +518,8 @@ def check_literal_composition() -> list[Check]:
                             for finding in findings if finding.code == "OURO-LINT029"])
         if reports[0] != reports[1] or len(reports[0]) != len(spans):
             raise AssertionError("LINT029 depends on source name or duplicates a nested literal")
-    return [Check("native-literal-composition", "pass", "4 ordered/disjoint combinations and source rename parity")]
+    return [Check("native-literal-composition", "pass",
+                  f"{len(cases)} ordered/disjoint combinations and source rename parity")]
 
 
 def check_literal_report_failures() -> list[Check]:
@@ -807,9 +824,12 @@ def check_style_grouped_imports() -> Check:
     native = prepare_entry("tools/lint_style.ouro", "ouro-lint-style")
     malformed = OUT / "style-malformed-import.ouro"
     malformed.write_text('import "a.ouro", missing;\n', encoding="utf-8")
+    repeated = OUT / "style-repeated-alias.ouro"
+    repeated.write_bytes(('--- é\r\nimport "a.ouro" as lower;\r\n'
+                          'import "b.ouro" as lower;\r\nimport "a.ouro" as Other;\r\n').encode())
     fixtures = ROOT / "quality/fixtures"
     for path, expected in ((fixtures / "good/grouped_imports.ouro", 0),
-                           (fixtures / "bad/grouped_imports.ouro", 1), (malformed, 1)):
+                           (fixtures / "bad/grouped_imports.ouro", 1), (malformed, 1), (repeated, 1)):
         result = run_limited([str(native), "--profile", "release", "--single-file", str(path)],
                              cwd=ROOT, env=strict_quality.native_env(), timeout_s=60, memory_mb=3072)
         if result.returncode != expected:
@@ -819,6 +839,22 @@ def check_style_grouped_imports() -> Check:
                 raise AssertionError("style companion hid its malformed-import failure")
         elif result.stderr or (expected == 0 and result.stdout):
             raise AssertionError(f"unexpected grouped style diagnostics: {result.stdout}{result.stderr}")
+        elif path == repeated:
+            casing = "import alias 'lower' is not canonical PascalCase or shadows a built-in name"
+            expected_rows = [
+                f":2:20: deny[OURO-LINT043] lint/lint043: {casing}",
+                ":3:20: deny[OURO-LINT043] lint/lint043: import alias 'lower' repeats earlier alias on line 2",
+                f":3:20: deny[OURO-LINT043] lint/lint043: {casing}",
+                ":4:8: deny[OURO-LINT037] lint/lint037: duplicate import of 'a.ouro' repeats line 2",
+            ]
+            headers = [line for line in result.stdout.splitlines() if ": deny[" in line]
+            if len(headers) != len(expected_rows) or not all(
+                    line.endswith(suffix) for line, suffix in zip(headers, expected_rows, strict=True)):
+                raise AssertionError(f"style grouped imports lost first locations or diagnostic order: {headers}")
+            witnesses = [line for line in result.stdout.splitlines() if line.startswith("  witness: ")]
+            if witnesses != ['  witness: import "a.ouro" as lower;', '  witness: import "b.ouro" as lower;',
+                             '  witness: import "b.ouro" as lower;', '  witness: import "a.ouro" as Other;']:
+                raise AssertionError(f"style grouped imports changed source witnesses: {witnesses}")
         elif expected == 1:
             locations = [(4, 3, "OURO-LINT037"), (5, 3, "OURO-LINT037"),
                          (6, 24, "OURO-LINT043"), (8, 28, "OURO-LINT043")]
@@ -831,6 +867,23 @@ def check_style_grouped_imports() -> Check:
 
 
 def check_release_firewall() -> Check:
+    from io import StringIO
+
+    from ourosmith.limits import RunResult
+
+    with patch.object(strict_quality, "_strict_binary", return_value=OUT / "strict-stand-in"), \
+            patch("ourosmith.limits.run_limited") as invoke:
+        for status, returncode, expected in (
+            ("ok", 0, 0), ("memory", 0, 1), ("ok", 7, 7),
+            ("memory", 7, 7), ("spawn-error", None, 1),
+        ):
+            result = RunResult(status, returncode, "release output\n", "release diagnostic\n", 0.0, 0.0)
+            invoke.return_value = result
+            with patch.object(sys, "stdout", StringIO()) as stdout, patch.object(sys, "stderr", StringIO()) as stderr:
+                code = strict_quality.main(["--profile", "release"])
+            if (code, stdout.getvalue(), stderr.getvalue()) != (expected, result.stdout, result.stderr):
+                raise AssertionError(f"release firewall changed process result for {status} exit={returncode}")
+
     report = OUT / "release.json"
     sarif = OUT / "release.sarif"
     migration = OUT / "release.md"

@@ -1,10 +1,19 @@
 # OuroSmith
 
-OuroSmith generates reproducible programs and typed Core, checks construction
-laws and independent surface/runtime expectations, and saves minimized failures
-for replay. Core generation and checking run as Ouro programs through the
-canonical compiler checker; Python supervises processes and verifies reports.
-Run it from the repository root with the installed Python interpreter:
+OuroSmith generates test programs and typed Core from seeds. It checks
+construction laws and independent surface and runtime expectations, then
+saves minimized failures for replay. Ouro programs generate and check Core.
+Python supervises processes and validates reports.
+
+Run the commands from the repository root. Full profiles require Python 3,
+a C compiler, and a POSIX-compatible shell. On Windows, use native Python
+and a Windows shell executable such as Git Bash's `sh.exe`. Set `OURO_SH`
+to the shell executable's path if the runner cannot find it.
+[Build requirements](getting_started.md#requirements)
+
+Use a fresh `--out` directory for each run whose results you want to keep.
+A profile run removes its old `report.json` before starting. When it writes
+a new report, it replaces the entire `findings/` directory for that run.
 
 ```sh
 python3 scripts/ouro_smith.py --self-test
@@ -15,20 +24,17 @@ python3 scripts/ouro_smith.py --faults --profile pr --out _build/smith/faults
 python3 scripts/ouro_smith.py --list
 ```
 
-The full profiles currently require a C compiler and POSIX shell. `OURO_SH`
-selects an installed shell. On Windows, use a native Python interpreter;
-generated programs and tools run as native executables. No profile invokes
-OCaml, opam, Dune, or a Python Core interpreter. Missing tools, exhausted
-resources, incomplete protocols, and stale build receipts prevent a passing
-report.
+Profiles use the Ouro checker. Missing tools, exhausted resources, incomplete
+protocols, and stale build receipts prevent a passing report.
 
 Surface samples compile their generated C and link and execute a fresh program
 on every probe. Only the unchanged runtime translation units use the existing
 verified C object cache, shared across recipe and seed workers. Its keys include
 the selected C compiler bytes, flags, source and header dependencies; object and
 depfile hashes are checked before reuse. `OURO_CACHE=0` uses fresh object paths.
-The Python build child and all C subprocesses share the probe's existing
-compile deadline and memory limit, including cache misses.
+The compile deadline also covers the Python build child and its C
+subprocesses on a cache miss. Memory limits apply at the host-specific
+scope described under [Process limits and fault injection](#process-limits-and-fault-injection).
 
 ## Profiles and expectations
 
@@ -93,7 +99,8 @@ Protocol generation bounds numeric values independently of the seed magnitude.
 
 ## Findings and replay
 
-Reports and generated inputs stay under `_build/smith/`. A finding records
+Reports and generated inputs default to `_build/smith/`. Set `--out` to
+write them to another directory within the checkout. A finding records
 the seed, profile, generator hash, input, failed property, expected and actual
 results, and failure classification. Supported classifications distinguish
 wrong acceptance, wrong rejection, diagnostic disagreement, divergence,
@@ -106,6 +113,10 @@ python3 scripts/ouro_smith.py --replay --finding _build/smith/pr/findings/ID.jso
 python3 scripts/ouro_smith.py replay --layer surface --seed 17 --case surface-17
 python3 scripts/ouro_smith.py replay --layer kernel --seed 17 --case core-17
 ```
+
+Replaying a generated `surface-<seed>-runtime_io` case uses the selected Ouro
+compiler and the host C toolchain. Its report records the Ouro compiler hash.
+Full surface runs and saved surface findings prepare the complete tool set.
 
 Seed replay uses the current generator. Saved surface inputs preserve their
 source and dependencies. Saved Core cases contain an exact native seed recipe:
@@ -134,20 +145,24 @@ empty runs, abstentions, and blocking completeness gaps cannot produce PASS.
 
 ## Process limits and fault injection
 
-Each native command has a timeout, scrubbed environment, and private working
-directory. Windows uses a Job Object to cap committed memory and terminate
-descendants; POSIX uses inherited address-space limits and a process session.
-Darwin does not enforce a finite `RLIMIT_AS`; the launcher leaves that limit
-inherited there. The POSIX child launcher permits a recursive native stack up
-to 128 MiB, matching the native PE reserve, within the address-space and
-inherited hard stack limits.
-These resource controls are not filesystem access controls. The generated
-programs and recipes are repository-owned code.
+OuroSmith runs native checks with a timeout and a scrubbed environment.
+Surface probes use their case directories. Core law drivers run from the
+repository root, including their strict checks and builds. The runner
+stores their evidence in the selected output directory.
 
-Compiler preparation, including the complete strict check and build of native
-law drivers, uses the same 3072 MiB limit as tool preparation. Generated program
-execution retains the configured `--memory-mb` limit; preparation failures
-remain fatal.
+Windows uses a Job Object to limit committed memory across the process
+tree and terminate descendants. On Linux, each process inherits an
+`RLIMIT_AS` address-space limit. On Darwin, processes retain the host's
+inherited address-space limit. POSIX launches use a process session to
+terminate descendants. Where the host permits it, the POSIX launcher sets a
+native stack limit of up to 128 MiB, within the address-space and inherited
+hard stack limits. Use these limits with repository-owned programs and
+recipes. They provide resource bounds only.
+
+The strict checks and builds for native law drivers request 3072 MiB.
+The scheduler assigns memory to each prepared surface tool. Generated
+programs use `--memory-mb` at execution time. A preparation failure fails
+the run.
 
 Hosted surface checks use the selected producer and the prepared collector and
 formatter from the source-bound tool map. They retain the ordinary runtime
@@ -161,10 +176,10 @@ The suite fails unless every selected ID appears exactly once in complete native
 reports and every batch succeeds. `manifest-batches.json` in the requested output
 directory records the selections, reports and failures.
 
-Build parallelism follows `OURO_JOBS` (default 10), capped by the runner's
-available CPUs so independent deadlines do not depend on oversubscription.
-Import/cache properties
-also compare single-worker results with the configured worker count.
+`OURO_JOBS` defaults to 20. The runner caps parallelism by available CPUs
+and by `OURO_SCHEDULER_JOBS` when set.
+Import and cache properties also compare single-worker results with the
+configured worker count.
 Surface expression samples and independent tool recipes use the same worker
 count in separate pools. Each worker owns its files and report; results merge
 in seed or recipe order. Recipes that invoke wrappers with shared build
@@ -203,7 +218,7 @@ binary hash. Nightly requires that fixpoint; PR reports its absence explicitly.
 Saved parity and IO inputs include their source, dependencies, expected
 results, process helper, arguments, environment value, and stdin as applicable.
 
-Native suite wrappers materialize specifications into fresh directories:
+By default, `prepare` writes specifications into a fresh directory on each call.
 
 ```sh
 python3 scripts/ouro_smith.py prepare --group fmt --out _build/smith/inputs
@@ -214,6 +229,10 @@ python3 scripts/ouro_smith.py manifest --prefix=ERGO.,REC.,IMP.
 user-test, LSP, and security inputs. Its output is the created directory;
 native selftests take it through `--fixtures` (lint uses `--bad-root` and
 `--good-root`). Expected text and runtime output come from Python contracts.
+The runtime and user-test suites pass `--stable` to give identical generated
+inputs the same path within their output directory. Each invocation verifies
+the complete input tree before passing it to the native runner. Test output
+stays in the suite's working directory.
 Manifest checks require `CHECK_OK` on acceptance and exit 1 on rejection;
 crash exit codes cannot satisfy a negative row.
 

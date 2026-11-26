@@ -1,5 +1,4 @@
 import "semantic_walk.ouro",
-  "structural_frontend.ouro",
   "../../compiler/semantic_scope.ouro";
 
 inductive CmDefinition : Type :=
@@ -12,40 +11,45 @@ def cm_definition_events (item : CmDefinition) : List CmEvent :=
 def cm_definition_spans (item : CmDefinition) : List (Pair Nat (Pair Nat Nat)) :=
     match item with | CmDefinitionOf _ _ spans => spans end;
 
+def cm_definition_has_policy (unit : ClippySemanticUnit) (apis : CmApiIndex) (decl : ScDecl) : Bool :=
+    -- A partial API index may omit the definition's registered contract.
+    match cm_api_lookup(sc_decl_name decl, apis) with
+    | Just api => if eq_nat(sc_decl_module (cm_api_decl api), sc_decl_module decl) then
+        cm_contract_policy (cm_api_contract api)
+      else cm_contract_policy (cm_contract_for unit decl)
+    | Nothing => cm_contract_policy (cm_contract_for unit decl)
+    end;
+
 -- A definition's events are owned by its consumer, not by a module-wide
 -- list. Keep the same visits, fuel, error context and observation boundary.
 def cm_build_definition (unit : ClippySemanticUnit) (apis : CmApiIndex)
     (decl : ScDecl) : Either QualityInputError (Maybe CmDefinition) :=
-    match eq_nat(sc_decl_module decl, cm_entry unit) with
-    | False => Right(QualityInputError, Maybe CmDefinition, Nothing CmDefinition)
-    | True => match sc_decl_body decl with
+    if eq_nat(sc_decl_module decl, cm_entry unit) then
+      match sc_decl_body decl with
       | Nothing => Right(QualityInputError, Maybe CmDefinition, Nothing CmDefinition)
       | Just body =>
           let ctx : CmContext := CmContextOf decl [] 0 False (Nothing Nat)
-            (cm_contract_policy (cm_contract_for unit decl)) False 0 in
+            (cm_definition_has_policy unit apis decl) False 0 in
           match cm_visit unit apis cm_visit_fuel ctx True False (sc_decl_type decl) cm_state0 with
           | Left error => Left QualityInputError (Maybe CmDefinition)
               (QualityInvalidInput (prim_string_concat (cm_name (cm_intern unit)
                 (sc_decl_name decl)) (prim_string_concat ": signature: "
                   (quality_input_message error))))
-          | Right signature => match signature with
-            | MkPair _ typed => match cm_visit unit apis cm_visit_fuel ctx False True body (cm_tag cm_body_tag typed) with
-              | Left error => Left QualityInputError (Maybe CmDefinition)
-                  (QualityInvalidInput (prim_string_concat (cm_name (cm_intern unit)
-                    (sc_decl_name decl)) (prim_string_concat ": "
-                      (quality_input_message error))))
-              | Right built => match built with
-                | MkPair value state =>
-                    let finished : CmState := cm_observe 4 0 value state in
-                    Right QualityInputError (Maybe CmDefinition)
-                    (Just CmDefinition (CmDefinitionOf decl (reverse_lin CmEvent
-                      (cm_events finished)) (cm_node_spans finished)))
-                end
-              end
+          | Right signature => let (MkPair _ typed) := signature in
+            match cm_visit unit apis cm_visit_fuel ctx False True body (cm_tag cm_body_tag typed) with
+            | Left error => Left QualityInputError (Maybe CmDefinition)
+                (QualityInvalidInput (prim_string_concat (cm_name (cm_intern unit)
+                  (sc_decl_name decl)) (prim_string_concat ": "
+                    (quality_input_message error))))
+            | Right built => let (MkPair value state) := built in
+              let finished : CmState := cm_observe 4 0 value state in
+              Right QualityInputError (Maybe CmDefinition)
+              (Just CmDefinition (CmDefinitionOf decl (reverse_lin CmEvent
+                (cm_events finished)) (cm_node_spans finished)))
             end
           end
       end
-    end;
+    else Right(QualityInputError, Maybe CmDefinition, Nothing CmDefinition);
 
 -- Collection API retained for consumers that explicitly need all definitions.
 -- The production proof path below consumes one definition at a time instead.
@@ -73,17 +77,9 @@ def cm_calls (events : List CmEvent) : List ClippyCallFact :=
     (fix go (remaining : List CmEvent) : List ClippyCallFact :=
       match remaining with
       | Nil => []
-      | Cons event rest => match event with
-        | CmCallEvent call => Cons ClippyCallFact call (go rest)
-        | CmBindEvent _ => go rest
-        | CmUseEvent _ => go rest
-        | CmFlowEvent _ => go rest
-        | CmTraversalEvent _ => go rest
-        | CmRecursionEvent _ => go rest
-        | CmWrapperEvent _ => go rest
-        | CmFinding _ => go rest
-        | CmToken _ _ => go rest
-        end
+      | Cons event rest =>
+          if let CmCallEvent call := (event : CmEvent) then Cons ClippyCallFact call (go rest)
+          else go rest
       end) events;
 
 -- Flow producers and observations are joined by the value lineage, not by
@@ -94,22 +90,39 @@ def cm_flow_ids (kinds : List Nat) (events : List CmEvent) : List Nat :=
       ((fix go (remaining : List CmEvent) : List Nat :=
         match remaining with
         | Nil => []
-        | Cons event rest => match event with
-          | CmFlowEvent flow => match flow with | CmFlow _ kind id =>
-              match elem Nat eq_nat kind kinds with
-              | True => Cons Nat id (go rest)
-              | False => go rest
-              end end
-          | CmCallEvent _ => go rest
-          | CmBindEvent _ => go rest
-          | CmUseEvent _ => go rest
-          | CmTraversalEvent _ => go rest
-          | CmRecursionEvent _ => go rest
-          | CmWrapperEvent _ => go rest
-          | CmFinding _ => go rest
-          | CmToken _ _ => go rest
-          end
+        | Cons event rest =>
+            if let CmFlowEvent flow := (event : CmEvent) then
+              let (CmFlow _ kind id) := flow in
+              if elem Nat eq_nat kind kinds then Cons Nat id (go rest)
+              else go rest
+            else go rest
         end) events);
+
+inductive CmResultFlowIds : Type :=
+  | CmResultFlowIdsOf : List Nat -> List Nat -> List Nat -> CmResultFlowIds;
+
+private def CmFlowRuns : Type := List (Maybe (List Nat));
+
+def cm_result_flow_ids (events : List CmEvent) : CmResultFlowIds :=
+    let observed_kinds : List Nat := [3, 4, 6, 9] in
+    let empty : CmFlowRuns := Nil (Maybe (List Nat)) in
+    (fix collect (remaining : List CmEvent) (checked : CmFlowRuns) (parsed : CmFlowRuns)
+        (observed : CmFlowRuns) : CmResultFlowIds :=
+        match remaining with
+        | Nil => CmResultFlowIdsOf (quality_sort_finish Nat leb_nat checked [])
+            (quality_sort_finish Nat leb_nat parsed []) (quality_sort_finish Nat leb_nat observed [])
+        | Cons event rest =>
+            if let CmFlowEvent flow := (event : CmEvent) then
+              let (CmFlow _ kind id) := flow in
+              if eq_nat kind 1 then
+                collect rest (quality_sort_push Nat leb_nat checked [id]) parsed observed
+              else if eq_nat kind 10 then
+                collect rest checked (quality_sort_push Nat leb_nat parsed [id]) observed
+              else if elem Nat eq_nat kind observed_kinds then
+                collect rest checked parsed (quality_sort_push Nat leb_nat observed [id])
+              else collect rest checked parsed observed
+            else collect rest checked parsed observed
+        end) events empty empty empty;
 
 -- Two structurally decreasing cursors retain a linear join without an
 -- unchecked general-recursive merge or a quadratic per-result search.
@@ -117,27 +130,14 @@ def cm_observations_at (id : Nat) : List Nat -> List Nat :=
   fix advance (observed : List Nat) : List Nat :=
     match observed with
     | Nil => []
-    | Cons used rest => match ltb_nat used id with
-      | True => advance rest
-      | False => observed
-      end
+    | Cons used rest => if ltb_nat used id then advance rest else observed
     end;
 
 def cm_render_proof (decl : ScDecl) (owner : String) (proof : CmSemanticProof) : List CgSProof :=
-    match andb(cm_proof_valid proof, cm_proof_owned decl proof) with
-    | False => []
-    | True => [MkCgSProof (cm_proof_rule (cm_proof_kind proof)) owner
-        (cm_proof_node proof) (Nothing (Pair Nat Nat)) (cm_proof_message proof)] end;
-
--- Fill proof ranges from the traversal that produced them. A rewritten source
--- has no token map, so those proofs keep the declaration anchor.
-def cm_with_locations (unit : ClippySemanticUnit) (item : CmDefinition)
-    (proofs : List CgSProof) : List CgSProof :=
-    match proofs with
-    | Nil => []
-    | Cons _ _ => cg_s_locate (cg_s_source_spans (cm_source unit))
-        (cm_definition_spans item) proofs
-    end;
+    if andb(cm_proof_valid proof, cm_proof_owned decl proof) then
+      [MkCgSProof (cm_proof_rule (cm_proof_kind proof)) owner
+        (cm_proof_node proof) (Nothing (Pair Nat Nat)) (cm_proof_message proof)]
+    else [];
 
 def cm_unobserved_using (decl : ScDecl) (owner : String) (kind : CmProofKind)
     (facts : List CmEvidence) (message : String) : List Nat -> List Nat -> Maybe Nat -> List CgSProof :=
@@ -148,12 +148,10 @@ def cm_unobserved_using (decl : ScDecl) (owner : String) (kind : CmProofKind)
         let duplicate : Bool := match previous with | Nothing => False | Just old => eq_nat id old end in
         let remaining : List Nat := cm_observations_at id observed in
         let seen : Bool := match remaining with | Nil => False | Cons used _ => eq_nat used id end in
-        match orb duplicate seen with
-        | True => go rest remaining (Just Nat id)
-        | False =>
-            let proof : CmSemanticProof := cm_proof_for kind decl id 0 0 facts message in
-            append(CgSProof, cm_render_proof decl owner proof, go rest remaining (Just Nat id))
-        end
+        if orb duplicate seen then go rest remaining (Just Nat id)
+        else
+          let proof : CmSemanticProof := cm_proof_for kind decl id 0 0 facts message in
+          append(CgSProof, cm_render_proof decl owner proof, go rest remaining (Just Nat id))
     end;
 
 def cm_unobserved (decl : ScDecl) (owner : String) : List Nat -> List Nat -> Maybe Nat -> List CgSProof :=

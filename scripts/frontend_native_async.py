@@ -14,9 +14,9 @@ import sys
 import time
 
 from frontend_native_process import inspect_image, require
-from frontend_regen import collect_units
+from frontend_regen import ImportBytesParser, SourceBytesReader, capture_unit_inputs
 from ourosmith.limits import clean_env, run_limited
-from repo_support import sha256_file, write_json_atomic
+from repo_support import decode_source_text, sha256_bytes, sha256_file, write_json_atomic
 import selfhost_module_cache as modules
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -39,15 +39,19 @@ def read_json(path):
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def source_snapshot():
-    units = collect_units(ENTRY)
+def source_snapshot(*, parse_bytes: ImportBytesParser | None = None,
+                    read_source: SourceBytesReader | None = None):
+    closures, captured = capture_unit_inputs((ENTRY,), parse_bytes=parse_bytes, read_source=read_source)
+    units = closures[ENTRY]
     require(units and units[-1] == ENTRY and len(units) == len(set(units)) and SLEEP in units,
             "native async source closure is incomplete")
     require(all((ROOT / unit).resolve().is_relative_to(ROOT) for unit in units),
             "native async source escapes repository")
-    body = (ROOT / SLEEP).read_text(encoding="utf-8")
+    sleep_source = ROOT / SLEEP
+    body = (sleep_source.read_text(encoding="utf-8") if read_source is None
+            else decode_source_text(read_source(sleep_source)))
     require(all(body.count(old) == 1 for old, _ in FAULTS.values()), "sleep source-fault anchors changed")
-    return {"entry": ENTRY, "units": units, "sources": {unit: sha256_file(ROOT / unit) for unit in units}}
+    return {"entry": ENTRY, "units": units, "sources": {unit: captured[unit].sha256 for unit in units}}
 
 
 def variant_bytes(before, variant):
@@ -73,7 +77,7 @@ def build_inputs(directory, before, variant):
             "fuel": 200000, "mir_limits": [16777216] * 3, "target": "x86_64-windows", "entry_name": "main"}
 
 
-def verify_source_root(inputs):
+def verify_source_root(inputs, *, parse_bytes: ImportBytesParser | None = None):
     root = Path(inputs["source_root"]).resolve(strict=True)
     require(root.is_relative_to(ROOT), "native async copied root escapes repository")
     units = inputs["units"]
@@ -82,13 +86,14 @@ def verify_source_root(inputs):
         path = (root / unit).resolve(strict=True)
         require(path.is_relative_to(root) and sha256_file(path) == inputs["sources"][unit],
                 "native async copied source changed: " + unit)
+    parser = parse_bytes if parse_bytes is not None else modules.cached_import_parser()
     actual = modules.collect_units(ENTRY,
-        imports=lambda unit: modules.quoted_import_targets((root / unit).read_text(encoding="utf-8"), unit),
+        imports=lambda unit: parser((root / unit).read_bytes(), unit),
         normalize=lambda path: path.replace("\\", "/"))
     require(actual == units, "native async copied import order differs")
 
 
-def freeze_sources(directory, before):
+def freeze_sources(directory, before, *, parse_bytes: ImportBytesParser | None = None):
     for variant in VARIANTS:
         inputs = build_inputs(directory, before, variant)
         root = Path(inputs["source_root"])
@@ -96,7 +101,7 @@ def freeze_sources(directory, before):
             target = root / unit
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(body)
-        verify_source_root(inputs)
+        verify_source_root(inputs, parse_bytes=parse_bytes)
         write_json_atomic(directory / variant / "inputs.json", inputs)
 
 
@@ -105,23 +110,28 @@ def image_info(path, variant):
     return inspect_image(path, IMPORTS, required)
 
 
-def verify_builds(directory, before, producer, producer_hash, receipts, complete=True):
+def verify_builds(directory, before, producer, producer_hash, receipts, complete=True, *,
+                  parse_bytes: ImportBytesParser | None = None):
     require(set(receipts) == set(VARIANTS) if complete else set(receipts).issubset(VARIANTS),
             "native async requires the original and both source-fault builds")
-    require(source_snapshot() == before and sha256_file(producer) == producer_hash,
+    if parse_bytes is None:
+        parse_bytes = modules.cached_import_parser()
+    require(source_snapshot(parse_bytes=parse_bytes) == before and sha256_file(producer) == producer_hash,
             "native async source or fresh producer changed")
     images = {}
     for variant in VARIANTS:
         inputs = build_inputs(directory, before, variant)
         inputs_path = directory / variant / "inputs.json"
         require(read_json(inputs_path) == inputs, "native async build input manifest differs")
-        verify_source_root(inputs)
+        verify_source_root(inputs, parse_bytes=parse_bytes)
         if variant not in receipts:
             continue
         output = directory / variant / "probe.exe"
         receipt_path = directory / variant / "receipt.json"
-        require(sha256_file(receipt_path) == receipts[variant], "native async build receipt changed")
-        receipt = read_json(receipt_path)
+        receipt_bytes = receipt_path.read_bytes()
+        require(sha256_bytes(receipt_bytes) == receipts[variant], "native async build receipt changed")
+        receipt = json.loads(decode_source_text(receipt_bytes))
+        require(isinstance(receipt, dict), "native async build receipt for " + variant + " must be a JSON object")
         command = [str(producer), ENTRY, output.as_posix(), *inputs["units"]]
         image = image_info(output, variant)
         expected = {"kind": KIND + ".build", "status": "passed", "variant": variant,
@@ -139,13 +149,16 @@ def verify_builds(directory, before, producer, producer_hash, receipts, complete
     return images
 
 
-def run_section(producer, work, run, build_timeout, _probe_timeout, verify_inputs):
+def run_section(producer, work, run, build_timeout, _probe_timeout, verify_inputs, *,
+                parse_bytes: ImportBytesParser | None = None):
     if os.name != "nt":
         return {"kind": KIND, "status": "unavailable", "reason": "Windows x86-64 runtime required",
                 "native_bootstrap": False, "rows": []}
     directory = work / "native-async"
     directory.mkdir()
-    before = source_snapshot()
+    if parse_bytes is None:
+        parse_bytes = modules.cached_import_parser()
+    before = source_snapshot(parse_bytes=parse_bytes)
     producer_hash = sha256_file(producer)
     receipts = {}
     report = {"kind": KIND, "status": "running", "execution_backend": "direct-windows-pe",
@@ -154,10 +167,11 @@ def run_section(producer, work, run, build_timeout, _probe_timeout, verify_input
 
     def unchanged():
         verify_inputs()
-        return verify_builds(directory, before, producer, producer_hash, receipts, complete=False)
+        return verify_builds(directory, before, producer, producer_hash, receipts,
+                             complete=False, parse_bytes=parse_bytes)
 
     try:
-        freeze_sources(directory, before)
+        freeze_sources(directory, before, parse_bytes=parse_bytes)
         for variant in VARIANTS:
             unchanged()
             inputs = build_inputs(directory, before, variant)
@@ -181,7 +195,7 @@ def run_section(producer, work, run, build_timeout, _probe_timeout, verify_input
                 write_json_atomic(directory / variant / "receipt.json", receipt)
             receipts[variant] = sha256_file(directory / variant / "receipt.json")
             unchanged()
-        images = verify_builds(directory, before, producer, producer_hash, receipts)
+        images = verify_builds(directory, before, producer, producer_hash, receipts, parse_bytes=parse_bytes)
         spec = {"kind": KIND + ".spec", "inputs": before, "producer": str(producer),
                 "producer_sha256": producer_hash, "receipts": receipts, "images": images}
         spec_path = directory / "spec.json"

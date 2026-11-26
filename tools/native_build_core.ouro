@@ -1,7 +1,6 @@
 -- Shared source loading, canonical checking and native output publication.
 -- Command entry points own messages and exit status; this module returns errors.
 import "../compiler/native/diagnostics.ouro",
-  "../compiler/native/managed_stdio_compile.ouro",
   "../compiler/native/mir_model.ouro",
   "../compiler/native/lower_source.ouro",
   "../compiler/native/image_types.ouro",
@@ -14,16 +13,11 @@ import "../compiler/native/diagnostics.ouro",
   "../std/io.ouro",
   "native_build_args.ouro",
   "native_build_output.ouro",
-  "collect_core.ouro";
+  "collect_core.ouro",
+  "../std/collections.ouro";
 
 def native_build_codes_eq : List Nat -> List Nat -> Bool :=
-  fix go (left : List Nat) (right : List Nat) : Bool :=
-    match left, right with
-    | Nil, Nil => True
-    | Cons x xs, Cons y ys => andb(eq_nat x y, go xs ys)
-    | Nil, Cons _ _ => False
-    | Cons _ _, Nil => False
-    end;
+    list_eq Nat eq_nat;
 
 def native_build_str_eq (left : String) (right : String) : Bool :=
     native_build_codes_eq (prim_string_to_char_codes left)
@@ -39,10 +33,7 @@ def native_build_normalize_codes : List Nat -> List Nat :=
     | Nil => ([] : List Nat)
     | Cons c rest =>
       Cons Nat
-        (match eq_nat c native_build_backslash with
-         | True => native_build_slash
-         | False => c
-         end)
+        (if eq_nat c native_build_backslash then native_build_slash else c)
         (go rest)
     end;
 
@@ -56,7 +47,98 @@ inductive NativeBuildFailure : Type :=
   | NativeBuildFilesystem : FsError -> NativeBuildFailure
   | NativeBuildCollection : String -> NativeBuildFailure
   | NativeBuildConfiguration : NativeBuildError -> NativeBuildFailure
-  | NativeBuildSource : NativeSourceError -> NativeBuildFailure;
+  | NativeBuildSource : NativeSourceError -> NativeBuildFailure
+  | NativeBuildCheck : SourceFailure -> InternState -> NativeBuildFailure;
+
+def native_build_check_phase (phase : CompileProgramPhase) : String :=
+    match phase with
+    | CompileFutureSlotPhase => "future-slot"
+    | CompileDuplicatePhase => "duplicate"
+    | CompileFutureGlobalPhase => "future-global"
+    | CompileSurfacePhase => "surface"
+    | CompileCorePhase => "core"
+    end;
+
+def native_build_check_unit (state : InternState) (unit : Maybe Nat) : String :=
+    match unit with
+    | Nothing => "unknown"
+    | Just path => match str_of_id state path with
+      | Nil => "unknown"
+      | Cons first rest => prim_string_of_char_codes (Cons Nat first rest)
+      end
+    end;
+
+def native_build_check_span (span : Maybe (Pair Nat Nat)) : String :=
+    match span with
+    | Nothing => "unknown"
+    | Just interval => let (MkPair start finish) := interval in
+      managed_driver_join(":", [prim_string_of_nat start, prim_string_of_nat finish] : List String)
+    end;
+
+def native_build_check_cause (cause : Maybe LowerRootCause) : String :=
+    match cause with
+    | Nothing => "none"
+    | Just root => match root with
+      | LowerRootList refusal => prim_string_concat "list:" (match refusal with
+        | LowerListEmptyWithoutExpected => "empty-without-expected"
+        | LowerListHeadWithoutType => "head-without-type"
+        | LowerListHeadPlaceholder => "head-placeholder"
+        | LowerListExpectedNotList => "expected-not-list"
+        end)
+      | LowerRootNamedHole name => prim_string_concat "hole:" (prim_string_of_nat name)
+      end
+    end;
+
+def native_build_check_diagnostic_code (failure : SourceFailure) : Maybe Nat :=
+    let (SourceFailureOf error metadata) := failure in
+    let (ErrCode code detail) := error in
+    if andb(eq_nat code 2, eq_nat detail 0) then
+      let (MkPair owner cause) := metadata in
+      match owner with
+      | Nothing => Nothing Nat
+      | Just selected => let (SourceFailureOwnerOf declaration _) := selected in
+        let (MkPair _ phase) := declaration in
+        match phase with
+        | CompileFutureSlotPhase => Nothing Nat
+        | CompileDuplicatePhase => Nothing Nat
+        | CompileFutureGlobalPhase => Nothing Nat
+        | CompileCorePhase => Nothing Nat
+        | CompileSurfacePhase => match cause with
+          | Nothing => Nothing Nat
+          | Just root => match root with
+            | LowerRootList _ => Just Nat ergo_list1_code
+            | LowerRootNamedHole name => if eq_nat name 0 then Nothing Nat else Just Nat ergo_hole_code
+            end
+          end
+        end
+      end
+    else Nothing Nat;
+
+def native_build_check_prefix (failure : SourceFailure) : String :=
+    let (SourceFailureOf error _) := failure in
+    let original : String := managed_driver_source_error (NativeSourceCheckError error) in
+    match native_build_check_diagnostic_code failure with
+    | Nothing => original
+    | Just code => managed_driver_join("",
+        [original, " diagnostic=", prim_string_of_nat code] : List String)
+    end;
+
+def native_build_check_message (failure : SourceFailure) (state : InternState) : String :=
+    let (SourceFailureOf _ metadata) := failure in
+    let (MkPair owner cause) := metadata in
+    let origin : String := match owner with
+      | Nothing => "owner=unknown phase=unknown unit=unknown span=unknown"
+      | Just selected => let (SourceFailureOwnerOf declaration location) := selected in
+        let (MkPair name phase) := declaration in
+        let (MkPair unit span) := location in
+        managed_driver_join("", ["owner=", prim_string_of_nat name,
+          " phase=", native_build_check_phase phase,
+          " unit=", native_build_check_unit state unit,
+          " span=", native_build_check_span span] : List String)
+      end in
+    managed_driver_join(" ",
+      [native_build_check_prefix failure, origin,
+        prim_string_concat "cause=" (native_build_check_cause cause)] : List String);
 
 def native_build_error_message (error : NativeBuildFailure) : String :=
     match error with
@@ -64,6 +146,7 @@ def native_build_error_message (error : NativeBuildFailure) : String :=
     | NativeBuildCollection message => message
     | NativeBuildConfiguration message => message
     | NativeBuildSource failure => managed_driver_source_error failure
+    | NativeBuildCheck failure state => native_build_check_message failure state
     end;
 
 -- NativeBuildRequest is a public constructor. Validate the backend and target
@@ -77,6 +160,11 @@ def native_build_validate_request (request : NativeBuildRequest) : Either Native
       end
     end;
 
+private def native_build_file_input (path : String) (text : String) : Pair (List Nat) (List Nat) :=
+    MkPair (List Nat) (List Nat)
+      (prim_string_to_char_codes (native_build_normalize path))
+      (prim_string_to_char_codes text);
+
 def native_build_read_files : List String -> IO (Either FsError (List (Pair (List Nat) (List Nat)))) :=
   fix read_files (paths : List String) : IO (Either FsError (List (Pair (List Nat) (List Nat)))) :=
     match paths with
@@ -84,111 +172,87 @@ def native_build_read_files : List String -> IO (Either FsError (List (Pair (Lis
         fs_ok (List (Pair(List Nat, List Nat)))
           (Nil (Pair(List Nat, List Nat)))
     | Cons path rest =>
-        do let! source := fs_read_checked path;
-           match source with
-           | Left e => fs_err(List (Pair(List Nat, List Nat)), e)
-           | Right text =>
-               do let! remaining := read_files rest;
-                  match remaining with
-                  | Left e => fs_err(List (Pair(List Nat, List Nat)), e)
-                  | Right tail =>
-                      fs_ok (List (Pair(List Nat, List Nat)))
-                        (Cons (Pair(List Nat, List Nat))
-                          (MkPair (List Nat) (List Nat)
-                            (prim_string_to_char_codes (native_build_normalize path))
-                            (prim_string_to_char_codes text))
-                          tail)
-                  end
-           end
+        match! fs_read_checked path with
+        | Left e => fs_err(List (Pair(List Nat, List Nat)), e)
+        | Right text =>
+            match! read_files rest with
+            | Left e => fs_err(List (Pair(List Nat, List Nat)), e)
+            | Right tail =>
+                fs_ok (List (Pair(List Nat, List Nat)))
+                    (Cons (Pair(List Nat, List Nat)) (native_build_file_input path text) tail)
+            end
+        end
+    end;
+
+def native_build_capture_source
+    (reader : String -> IO (Either CollectReadError String)) (source : String)
+    : IO (Either NativeBuildFailure CollectSnapshot) :=
+    match! collect_snapshot_with_reader reader collect_fuel source with
+    | Left error => io_pure (Either NativeBuildFailure CollectSnapshot)
+        (Left NativeBuildFailure CollectSnapshot (NativeBuildCollection error))
+    | Right snapshot => io_pure (Either NativeBuildFailure CollectSnapshot)
+        (Right NativeBuildFailure CollectSnapshot snapshot)
+    end;
+
+def native_build_snapshot_files (snapshot : CollectSnapshot) : NativeBuildFiles :=
+    map (Pair String String) (Pair (List Nat) (List Nat))
+      (fun (file : Pair String String) =>
+        let (MkPair path text) := file in native_build_file_input path text)
+      (collect_snapshot_files snapshot);
+
+def native_build_load_source_with_reader
+    (reader : String -> IO (Either CollectReadError String)) (source : String)
+    : IO (Either NativeBuildFailure (Pair String NativeBuildFiles)) :=
+    match! native_build_capture_source reader source with
+    | Left error => io_pure (Either NativeBuildFailure (Pair String NativeBuildFiles))
+        (Left NativeBuildFailure (Pair String NativeBuildFiles) error)
+    | Right snapshot => io_pure (Either NativeBuildFailure (Pair String NativeBuildFiles))
+        (Right NativeBuildFailure (Pair String NativeBuildFiles)
+          (MkPair String NativeBuildFiles (collect_snapshot_root snapshot)
+            (native_build_snapshot_files snapshot)))
     end;
 
 def native_build_load_source (source : String)
     : IO (Either NativeBuildFailure (Pair String NativeBuildFiles)) :=
-    let root : String := collect_path_normalize source in
-    do let! collected := collect_walk(collect_fuel, Nil String, Nil String, root);
-       match collected with
-       | ColErr error => io_pure (Either(NativeBuildFailure, Pair String NativeBuildFiles))
-           (Left(NativeBuildFailure, Pair String NativeBuildFiles, NativeBuildCollection error))
-       | ColOk units => match units with
-         | Nil => io_pure (Either(NativeBuildFailure, Pair String NativeBuildFiles))
-             (Left(NativeBuildFailure, Pair String NativeBuildFiles, NativeBuildCollection "empty source closure"))
-         | Cons _ _ =>
-             do let! loaded := native_build_read_files units;
-                match loaded with
-                | Left error => io_pure (Either(NativeBuildFailure, Pair String NativeBuildFiles))
-                    (Left(NativeBuildFailure, Pair String NativeBuildFiles, NativeBuildFilesystem error))
-                | Right files => io_pure (Either(NativeBuildFailure, Pair String NativeBuildFiles))
-                    (Right(NativeBuildFailure, Pair String NativeBuildFiles, MkPair String NativeBuildFiles root files))
-                end
-         end
-       end
+    native_build_load_source_with_reader collect_read_checked source;
 
 def native_build_check_files (fuel : Nat) (root : String) (files : NativeBuildFiles)
     : CompResult CheckedProgram :=
     compile_checked_units fuel (prim_string_to_char_codes (native_build_normalize root)) files;
 
+def native_build_check_files_with_origin (fuel : Nat) (root : String) (files : NativeBuildFiles)
+    : Either NativeBuildFailure CheckedProgram :=
+    let (MkPair result state) :=
+      compile_checked_units_with_origin fuel
+        (prim_string_to_char_codes (native_build_normalize root)) files in
+    match result with
+    | SourceErr failure => Left NativeBuildFailure CheckedProgram (NativeBuildCheck failure state)
+    | SourceOk checked => Right NativeBuildFailure CheckedProgram checked
+    end;
+
+def native_build_check_snapshot (fuel : Nat) (snapshot : CollectSnapshot)
+    : Either NativeBuildFailure CheckedProgram :=
+    native_build_check_files_with_origin fuel
+      (collect_snapshot_root snapshot) (native_build_snapshot_files snapshot);
+
 def native_build_check_source (source : String) (fuel : Nat)
     : IO (Either NativeBuildFailure CheckedProgram) :=
-    do let! loaded := native_build_load_source source;
-       match loaded with
-       | Left error => io_pure (Either NativeBuildFailure CheckedProgram)
-           (Left NativeBuildFailure CheckedProgram error)
-       | Right input => match input with
-         | MkPair root files => match native_build_check_files fuel root files with
-           | CErr error => io_pure (Either NativeBuildFailure CheckedProgram)
-               (Left NativeBuildFailure CheckedProgram (NativeBuildSource (NativeSourceCheckError error)))
-           | COk checked => io_pure (Either NativeBuildFailure CheckedProgram)
-               (Right NativeBuildFailure CheckedProgram checked)
-           end
-         end
-       end
+    match! native_build_capture_source collect_read_checked source with
+    | Left error => io_pure (Either NativeBuildFailure CheckedProgram)
+        (Left NativeBuildFailure CheckedProgram error)
+    | Right snapshot => io_pure (Either NativeBuildFailure CheckedProgram)
+        (native_build_check_snapshot fuel snapshot)
+    end
 
 def native_build_publish_image (output : String) (image : NativeImage)
     : IO (Either NativeBuildFailure Unit) :=
-    match image with
-    | NativeImageOf pe _ => match pe with
-      | PeImageFile bytes _ =>
-          do let! published := native_build_publish_checked(output, prim_string_of_char_codes bytes);
-             match published with
-             | Left error => io_pure (Either NativeBuildFailure Unit)
-                 (Left NativeBuildFailure Unit (NativeBuildFilesystem error))
-             | Right _ => io_pure(Either NativeBuildFailure Unit, Right NativeBuildFailure Unit MkUnit)
-             end
-      end
-    end;
-
-def native_build_compile_files (request : NativeBuildRequest) (root : String)
-    (files : NativeBuildFiles) : IO (Either NativeBuildFailure Unit) :=
-    match native_build_validate_request request with
+    let (NativeImageOf pe _) := image in
+    let (PeImageFile bytes _) := pe in
+    match! native_build_publish_checked(output, prim_string_of_char_codes bytes) with
     | Left error => io_pure (Either NativeBuildFailure Unit)
-        (Left NativeBuildFailure Unit error)
-    | Right _ => match native_compile_units_auto (native_build_request_fuel request) native_build_limits
-        (prim_string_to_char_codes (native_build_request_entry request))
-        (prim_string_to_char_codes (native_build_normalize root)) files with
-      | Left error => io_pure (Either NativeBuildFailure Unit)
-          (Left NativeBuildFailure Unit (NativeBuildSource error))
-      | Right image => native_build_publish_image(native_build_request_out request, image)
-      end
+        (Left NativeBuildFailure Unit (NativeBuildFilesystem error))
+    | Right _ => io_pure(Either NativeBuildFailure Unit, Right NativeBuildFailure Unit MkUnit)
     end;
-
-def native_build_compile_units_checked (request : NativeBuildRequest) (paths : List String)
-    : IO (Either NativeBuildFailure Unit) :=
-    do let! loaded := native_build_read_files paths;
-       match loaded with
-       | Left error => io_pure (Either NativeBuildFailure Unit)
-           (Left NativeBuildFailure Unit (NativeBuildFilesystem error))
-       | Right files => native_build_compile_files request (native_build_request_source request) files
-       end
-
-def native_build_compile_checked (request : NativeBuildRequest)
-    : IO (Either NativeBuildFailure Unit) :=
-    do let! loaded := native_build_load_source (native_build_request_source request);
-       match loaded with
-       | Left error => io_pure(Either NativeBuildFailure Unit, Left NativeBuildFailure Unit error)
-       | Right input => match input with
-         | MkPair root files => native_build_compile_files request root files
-         end
-       end
 
 def native_build_dump_checked (fuel : Nat) (output : String) (checked : CheckedProgram)
     : IO (Either NativeBuildFailure Unit) :=
@@ -196,10 +260,9 @@ def native_build_dump_checked (fuel : Nat) (output : String) (checked : CheckedP
     | CErr error => io_pure (Either NativeBuildFailure Unit)
         (Left NativeBuildFailure Unit (NativeBuildSource (NativeSourceCheckError error)))
     | COk bytes =>
-        do let! published := native_build_publish_checked(output, prim_string_of_char_codes bytes);
-           match published with
-           | Left error => io_pure (Either NativeBuildFailure Unit)
-               (Left NativeBuildFailure Unit (NativeBuildFilesystem error))
-           | Right _ => io_pure(Either NativeBuildFailure Unit, Right NativeBuildFailure Unit MkUnit)
-           end
+        match! native_build_publish_checked(output, prim_string_of_char_codes bytes) with
+        | Left error => io_pure (Either NativeBuildFailure Unit)
+            (Left NativeBuildFailure Unit (NativeBuildFilesystem error))
+        | Right _ => io_pure(Either NativeBuildFailure Unit, Right NativeBuildFailure Unit MkUnit)
+        end
     end;

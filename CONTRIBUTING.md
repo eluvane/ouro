@@ -1,13 +1,12 @@
 # Contributing to Ouro
 
-Ouro is a pre-1.0 language and toolchain. Contributions to the language,
-tooling, runtime, and documentation are welcome.
+Use this workflow to propose changes to the language, runtime, tools, or
+documentation.
 
 ## Set up the repository
 
-Follow [Getting started](docs/getting_started.md) for prerequisites, clone and
-bootstrap commands. Build configuration, caches, and bootstrap inputs are in
-[Build](docs/build.md).
+Follow the [source setup and bootstrap procedure](docs/getting_started.md#build-the-bootstrap-toolchain).
+See [Build and bootstrap](docs/build.md) for cache and build configuration.
 
 ## Choose a change
 
@@ -22,17 +21,18 @@ language and trust decisions belong in an [RFC](docs/rfc/README.md).
 
 ## Build and test
 
-Run the smallest relevant suite, then the PR profile when feasible before
-opening a pull request. [CI](docs/ci.md#validation-matrix) owns focused
-commands, profiles, and reporting rules. Report missing
-host tools, timeouts, and resource limits as unavailable.
+Run the smallest suite listed for the changed area in the
+[validation matrix](docs/ci.md#validation-matrix). Before opening a pull
+request, also run the [local PR profile](docs/ci.md#local-profiles) when
+feasible. Report failures and incomplete checks with their cause, including
+missing tools, timeouts, or resource limits.
 
 ## Documentation and compatibility
 
-A user-visible change updates its tests or fixtures and canonical documentation
-in the same pull request. Describe the resulting behavior in the PR so it can
-appear in GitHub release notes. Breaking changes need migration guidance; see
-[Stability](docs/stability.md).
+Update tests or fixtures and the canonical documentation in the same pull
+request as a user-visible change. Describe the resulting behavior for the
+release notes. Provide migration guidance for breaking changes under the
+[compatibility policy](docs/stability.md).
 
 ## Generated artifacts
 

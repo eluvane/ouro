@@ -1,0 +1,326 @@
+-- Checked declarations feed the shared provider; synthetic runtime symbols
+-- validate its MIR fragment, while complete source fixtures own PE execution.
+import "../compiler/native/managed_terms.ouro",
+  "../compiler/native/lower_source.ouro",
+  "../compiler/native/mir_live.ouro",
+  "compiler_program_lookup.ouro",
+  "compiler_startup_test_support.ouro";
+
+def checked_word_types : String :=
+    prim_string_concat
+      "intrinsic W : Type := \"ouro.u32\"; intrinsic Size : Type := \"ouro.usize\"; intrinsic Runtime : Type -> Type := \"ouro.runtime\"; "
+      "inductive Choice (A : Type) : Type := | None : Choice A | Some : A -> Choice A; representation Choice := \"ouro.maybe\"; ";
+
+def checked_word_base : String := prim_string_concat checked_word_types
+    (prim_string_concat
+      "intrinsic checked_add : Size -> Size -> Choice Size := \"ouro.usize.add.checked\"; intrinsic checked_convert : Size -> Choice W := \"ouro.convert.usize.u32.checked\"; "
+      "intrinsic widen : W -> Size := \"ouro.convert.u32.usize.zext\"; intrinsic pure : (A : Type) -> A -> Runtime A := \"ouro.runtime.pure\"; intrinsic bind : (A : Type) -> (B : Type) -> Runtime A -> (A -> Runtime B) -> Runtime B := \"ouro.runtime.bind\"; extern pid : Runtime W := \"windows-x86_64\" \"win64\" \"kernel32.dll\" \"GetCurrentProcessId\" \"maygc\"; ");
+
+def checked_word_with (test : CheckedProgram -> Bool) : Bool :=
+    match compile_checked_source 2000 (prim_string_to_char_codes checked_word_base) with
+    | CErr _ => False | COk program => match lower_recheck_program 2000 program with
+      | Left _ => False | Right checked => test checked end end;
+
+def checked_word_compiler (program : CheckedProgram) : ManagedCompiler :=
+    ManagedCompilerOf program ([] : List Nat) 100 101 102 103 104 200 ([] : List LowerContract)
+      (check_environment_from_entries (checked_program_entries program));
+
+def checked_word_state (first : Nat) : ManagedState :=
+    ManagedStateOf 300 ([] : List MirFunction) ([] : List MirData) ([] : List Nat) ([] : List Nat)
+      (lower_empty_state first) NativeOriginsDisabled;
+
+def checked_word_primitive (conversion : Bool) : PrimitiveId :=
+    match conversion with
+    | True => PrimitiveWordConversion PrimitiveWordUSize PrimitiveWordU32 PrimitiveConvertChecked
+    | False => PrimitiveWordOperation PrimitiveWordUSize PrimitiveAddChecked end;
+
+def checked_word_fragment (compiler : ManagedCompiler) (conversion : Bool)
+    : Either NativeLowerError MirFunction :=
+    lower_map ManagedResult MirFunction (fun (result : ManagedResult) => match result with
+      | ManagedResultOf value state => match managed_flow state with | LowerStateOf _ locals _ _ =>
+        MirFunctionDef 1 ([119] : List Nat) ([MirLocalDef 0 MirUSize, MirLocalDef 1 MirUSize] : List MirLocal) (reverse MirLocal locals)
+          (Just MirType MirManagedPtr) 0 (lower_finish_blocks(MirReturn (Just MirValue value), managed_flow state)) end end)
+      (match conversion with
+       | True => managed_usize_to_u32_checked compiler (MirUse 0) (checked_word_state 2)
+       | False => managed_word_result compiler PrimitiveWordUSize PrimitiveAddChecked (MirUse 0) (MirUse 1) (checked_word_state 2) end);
+
+def checked_word_validation_program (fragment : MirFunction) : MirProgram :=
+    MirProgramDef
+      ([fragment,
+       MirFunctionDef 100 ([97] : List Nat) ([MirLocalDef 0 MirRawPtr, MirLocalDef 1 MirRawPtr, MirLocalDef 2 MirUSize] : List MirLocal)
+         ([] : List MirLocal) (Just MirType MirRawPtr) 0
+         ([MirBlockDef 0 ([] : List MirInstruction) (MirReturn (Just MirValue (managed_bits MirRawPtr 0)))] : List MirBlock),
+       MirFunctionDef 101 ([99] : List Nat) ([MirLocalDef 0 MirRawPtr] : List MirLocal) ([] : List MirLocal) (Just MirType MirU8) 0
+         ([MirBlockDef 0 ([] : List MirInstruction) (MirReturn (Just MirValue (managed_bits MirU8 1)))] : List MirBlock)] : List MirFunction)
+      ([MirDataDef 201 False (mir_managed_descriptor_bytes 1),
+       MirDataDef 210 False (mir_managed_descriptor_bytes 10),
+       MirDataDef 213 False (mir_managed_descriptor_bytes 13)] : List MirData) ([] : List MirLibrary) 1;
+
+def checked_word_use (expected : Nat) (value : MirValue) : Bool :=
+    match value with | MirUse actual => eqNat expected actual | MirBits _ _ => False end;
+
+def checked_word_guard_pair (conversion : Bool) (first : MirInstruction) (second : MirInstruction)
+    (terminator : MirTerminator) : Bool :=
+    match conversion with
+    | False => if let MirBinaryOp sum operation left right := (first : MirInstruction) then
+      if let MirCompare fits comparison result original := (second : MirInstruction) then
+        if let MirAdd := (operation : MirBinary) then if let MirGreaterEqual := (comparison : MirComparison) then
+          andb (andb(checked_word_use 0 left, checked_word_use 1 right))
+            (andb(andb(checked_word_use sum result, checked_word_use 0 original),
+              (if let MirBranch flag yes no := (terminator : MirTerminator) then
+                andb(checked_word_use fits flag, andb(eqNat yes 1, eqNat no 2)) else False)))
+          else False else False
+        else False
+      else False
+    | True => if let MirCompare fits comparison value bound := (first : MirInstruction) then
+      if let MirConvert _ conversion_kind original := (second : MirInstruction) then
+        if let MirLessEqual := (comparison : MirComparison) then if let MirNarrow := (conversion_kind : MirConversion) then
+          if let MirBits typ maximum := (bound : MirValue) then if let MirUSize := (typ : MirType) then
+              andb (andb(checked_word_use 0 value, checked_word_use 0 original))
+                (andb(match x64_word64_bytes maximum with | Left _ => False
+                  | Right bytes => pe_bytes_equal bytes ([255,255,255,255,0,0,0,0] : List Nat) end,
+                  (if let MirBranch flag yes no := (terminator : MirTerminator) then
+                    andb(checked_word_use fits flag, andb(eqNat yes 1, eqNat no 2)) else False)))
+            else False else False
+          else False else False
+        else False
+      else False end;
+
+def checked_word_guard (conversion : Bool) (instructions : List MirInstruction) (terminator : MirTerminator) : Bool :=
+    match instructions with | Nil => False | Cons first rest => match rest with
+      | Nil => False | Cons second tail => match tail with
+        | Nil => checked_word_guard_pair conversion first second terminator
+        | Cons _ _ => False end end end;
+
+def checked_word_allocations (descriptor : Nat) (instructions : List MirInstruction) : Nat :=
+    length MirInstruction (filter MirInstruction (fun (instruction : MirInstruction) =>
+      if let MirManagedAlloc _ _ _ actual _ := (instruction : MirInstruction) then eqNat descriptor actual else False) instructions);
+
+def checked_word_shape_blocks (conversion : Bool) (entry : MirBlock) (present_block : MirBlock)
+    (absent_block : MirBlock) (finish_block : MirBlock) : Bool :=
+    match entry, present_block, absent_block, finish_block with
+      | MirBlockDef first instructions guard, MirBlockDef yes present present_end,
+        MirBlockDef no absent absent_end, MirBlockDef finish _ _ =>
+          andb (pe_bytes_equal ([first,yes,no,finish] : List Nat) ([0,1,2,3] : List Nat))
+            (andb (checked_word_guard conversion instructions guard)
+              (andb (andb(eqNat (checked_word_allocations 201 present) 1, eqNat (checked_word_allocations 201 absent) 1))
+                (andb (andb(eqNat (checked_word_allocations (match conversion with | True => 210 | False => 213 end) present) 1,
+                  eqNat (checked_word_allocations (match conversion with | True => 210 | False => 213 end) absent) 0))
+                  (if let MirJump a := (present_end : MirTerminator) then if let MirJump b := (absent_end : MirTerminator) then
+                    andb(eqNat a finish, eqNat b finish) else False else False))))
+      end;
+
+def checked_word_shape (conversion : Bool) (function : MirFunction) : Bool :=
+    match function with | MirFunctionDef _ _ _ _ _ _ blocks => match blocks with
+      | Nil => False | Cons entry rest => match rest with
+        | Nil => False | Cons present more => match more with
+          | Nil => False | Cons absent tail => match tail with
+            | Nil => False | Cons finish last => match last with
+              | Nil => checked_word_shape_blocks conversion entry present absent finish
+              | Cons _ _ => False end end end end end end;
+
+def checked_word_lowered (conversion : Bool) : Bool :=
+    checked_word_with (fun (program : CheckedProgram) => match checked_word_fragment (checked_word_compiler program) conversion with
+      | Left _ => False | Right fragment => andb (checked_word_shape conversion fragment)
+        (match mir_check_function (checked_word_validation_program fragment) 1000 fragment with
+          | Left _ => False | Right _ => True end) end);
+
+def checked_word_box_live (conversion : Bool) : Bool :=
+    checked_word_with (fun (program : CheckedProgram) => match checked_word_fragment (checked_word_compiler program) conversion with
+      | Left _ => False | Right function => match function with | MirFunctionDef _ _ _ _ _ _ blocks =>
+        let roots : List Nat := mir_live_roots function in
+        match mir_live_facts 20 roots blocks with | Left _ => False | Right facts =>
+          match blocks with | Nil => False | Cons _ rest => match rest with
+          | Nil => False | Cons present _ => match present with | MirBlockDef _ instructions _ =>
+            match mir_live_after roots facts present with | Left _ => False | Right after =>
+              match mir_live_instructions roots instructions after with | MkPair _ sites =>
+                any (Pair MirInstruction (List Nat)) (fun (site : Pair MirInstruction (List Nat)) => match site with
+                  | MkPair instruction live => if let MirManagedAlloc _ _ _ descriptor bytes := (instruction : MirInstruction) then
+                        andb (andb(eqNat descriptor 201, match bytes with | MirUse _ => False | MirBits _ size =>
+                          match x64_word64_bytes size with | Left _ => False | Right value => pe_bytes_equal value ([64,0,0,0,0,0,0,0] : List Nat) end end))
+                          (andb(mir_has 5 live, andb(notb (mir_has 0 live), notb (mir_has 1 live))))
+                    else False end) sites end end end
+            end end end end end);
+
+def checked_word_metadata (conversion : Bool) (execution : Bool) : Bool :=
+    checked_word_with (fun (program : CheckedProgram) =>
+      match compiler_test_name program (match conversion with | True => "checked_convert" | False => "checked_add" end) with
+      | Nothing => False | Just expected => match program with | CheckedProgramOf state entries bodies =>
+        let forged : CheckedProgram := CheckedProgramOf state (map Entry Entry (fun (entry : Entry) =>
+          if let MkBoundEntry name typ binding := (entry : Entry) then match binding with | PrimitiveExternBinding _ => entry
+            | PrimitiveIntrinsicBinding primitive mode gc specialization => match primitive_id_equal primitive (checked_word_primitive conversion) with
+              | False => entry | True => MkBoundEntry name typ (PrimitiveIntrinsicBinding primitive
+                  (match execution with | True => PrimitiveRuntimeAction | False => mode end)
+                  (match execution with | True => gc | False => PrimitiveNoGc end) specialization) end end
+          else entry) entries) bodies in
+        match lower_recheck_program 2000 forged with
+        | Left error => if let LowerMetadataMismatch actual := (error : NativeLowerError) then eqNat actual expected else False
+        | Right _ => False end end end);
+
+def checked_word_identity (conversion : Bool) : Bool :=
+    checked_word_with (fun (program : CheckedProgram) =>
+      match compiler_test_name program (match conversion with | True => "checked_convert" | False => "checked_add" end) with
+      | Nothing => False | Just expected => match program with | CheckedProgramOf state entries bodies =>
+        let replacement : PrimitiveId := match conversion with
+          | True => PrimitiveWordConversion PrimitiveWordU32 PrimitiveWordUSize PrimitiveConvertChecked
+          | False => PrimitiveWordOperation PrimitiveWordU32 PrimitiveAddChecked end in
+        let forged : CheckedProgram := CheckedProgramOf state (map Entry Entry (fun (entry : Entry) =>
+          if let MkBoundEntry name typ binding := (entry : Entry) then match binding with | PrimitiveExternBinding _ => entry
+            | PrimitiveIntrinsicBinding primitive mode gc specialization => match primitive_id_equal primitive (checked_word_primitive conversion) with
+              | False => entry | True => MkBoundEntry name typ (PrimitiveIntrinsicBinding replacement mode gc specialization) end end
+          else entry) entries) bodies in
+        match lower_recheck_program 2000 forged with
+        | Left error => if let LowerDeclarationFailure actual phase failure := (error : NativeLowerError) then
+          if let CheckDeclarationType := (phase : CheckPhase) then if let CheckTypeFailure fault := (failure : CheckFailure) then
+            if let CheckTypeMismatch := (fault : CheckTypeFault) then eqNat actual expected else False
+            else False else False
+          else False
+        | Right _ => False end end end);
+
+def checked_word_role_metadata (change_params : Bool) : Bool :=
+    checked_word_with (fun (program : CheckedProgram) => match compiler_test_name program "Choice" with
+      | Nothing => False | Just expected => match program with | CheckedProgramOf state entries bodies =>
+        let forged : CheckedProgram := CheckedProgramOf state (map Entry Entry (fun (entry : Entry) =>
+          if let MkRoleEntry binding := (entry : Entry) then match binding with | PrimitiveRoleOf role shape =>
+            match primitive_role_equal role PrimitiveMaybeRole with | False => entry
+            | True => match shape with | PrimitiveInductiveOf id params indices family constructors =>
+              MkRoleEntry (PrimitiveRoleOf role (PrimitiveInductiveOf id
+                (match change_params with | True => S params | False => params end) indices family
+                (match change_params with | True => constructors | False => reverse CoreTerm constructors end))) end end end
+          else entry) entries) bodies in
+        match lower_recheck_program 2000 forged with
+        | Left error => if let LowerMetadataMismatch actual := (error : NativeLowerError) then eqNat actual expected else False
+        | Right _ => False end end end);
+
+def checked_word_source_rejected (code : Nat) (body : String) : Bool :=
+    match compile_checked_source 2000 (prim_string_to_char_codes (prim_string_concat checked_word_base body)) with
+    | COk _ => False | CErr error => match error with | ErrCode actual name => andb(eqNat actual code, notb (eqNat name 0)) end end;
+
+def checked_word_missing_role : Bool :=
+    checked_word_with (fun (program : CheckedProgram) => match compiler_test_name program "checked_add" with
+      | Nothing => False | Just expected => match program with | CheckedProgramOf state entries bodies =>
+        let forged : CheckedProgram := CheckedProgramOf state (filter Entry (fun (entry : Entry) =>
+          if let MkRoleEntry binding := (entry : Entry) then match binding with
+            | PrimitiveRoleOf role _ => notb (primitive_role_equal role PrimitiveMaybeRole) end
+          else True) entries) bodies in
+        match lower_recheck_program 2000 forged with
+        | Left error => if let LowerDeclarationFailure actual phase failure := (error : NativeLowerError) then
+          if let CheckDeclarationType := (phase : CheckPhase) then if let CheckPrimitiveFailure fault := (failure : CheckFailure) then
+            if let PrimitiveMissingRole role := (fault : PrimitiveError) then if let PrimitiveMaybeRole := (role : PrimitiveRole) then
+              eqNat actual expected else False else False
+            else False else False
+          else False
+        | Right _ => False end end end);
+
+def checked_word_ordinary_axiom : Bool :=
+    match compile_checked_source 2000 (prim_string_to_char_codes (prim_string_concat checked_word_types
+      "axiom checked_add : Size -> Size -> Choice Size; def probe (first : Size) (second : Size) : Choice Size := checked_add first second;")) with
+    | CErr _ => False | COk program => match lower_recheck_program 2000 program with
+      | Left _ => False | Right checked =>
+        match compiler_test_name checked "probe", compiler_test_name checked "checked_add" with
+        | Just probe, Just expected => match lookup_const probe (checked_program_entries checked) with
+          | Just outer => if let CLam _ inner := (outer : CoreTerm) then if let CLam _ body := (inner : CoreTerm) then
+            match managed_expression (checked_word_compiler checked) 2000
+              ([Just(MirValue, MirUse 1), Just(MirValue, MirUse 0)] : List (Maybe MirValue)) body (checked_word_state 2) with
+              | Left error => if let LowerUnknownGlobal actual := (error : NativeLowerError) then eqNat actual expected else False
+              | Right _ => False end
+            else False else False
+          | Nothing => False end
+        | Just _, Nothing => False | Nothing, Just _ => False | Nothing, Nothing => False end end end;
+
+def checked_word_unsupported (primitive : PrimitiveId) (result : Either NativeLowerError ManagedResult) : Bool :=
+    match result with | Left error => if let LowerUnsupportedPrimitive actual := (error : NativeLowerError) then
+      primitive_id_equal actual primitive else False | Right _ => False end;
+
+def checked_word_abort (_ : ManagedScope) (_ : CoreTerm) (_ : ManagedState) : Either NativeLowerError ManagedResult :=
+    Left NativeLowerError ManagedResult (LowerUnknownGlobal 10);
+
+def checked_word_order (allow_first : Bool) : Bool :=
+    checked_word_with (fun (program : CheckedProgram) =>
+      let step : ManagedStep := fun (_ : ManagedScope) (term : CoreTerm) (state : ManagedState) =>
+        if let CRel index := (term : CoreTerm) then match eqNat index 0 with
+          | True => match allow_first with | True => Right NativeLowerError ManagedResult (ManagedResultOf (MirUse 0) state)
+            | False => Left NativeLowerError ManagedResult (LowerUnknownGlobal 10) end
+          | False => Left NativeLowerError ManagedResult (LowerUnknownGlobal 20) end
+          else Left NativeLowerError ManagedResult (LowerInvalidCall 99) in
+      match managed_word_operation (checked_word_compiler program) step ([] : List (Maybe MirValue))
+          PrimitiveWordUSize PrimitiveAddChecked ([CRel 0,CRel 1] : List CoreTerm) (checked_word_state 1) with
+      | Left error => if let LowerUnknownGlobal actual := (error : NativeLowerError) then
+        eqNat actual (match allow_first with | True => 20 | False => 10 end)
+        else False | Right _ => False end);
+
+def checked_word_adjacent : Bool :=
+    checked_word_with (fun (program : CheckedProgram) =>
+      let compiler : ManagedCompiler := checked_word_compiler program in
+      andb (checked_word_unsupported (PrimitiveWordOperation PrimitiveWordUSize PrimitiveSubChecked)
+          (managed_word_result compiler PrimitiveWordUSize PrimitiveSubChecked (MirUse 0) (MirUse 1) (checked_word_state 2)))
+        (andb (checked_word_unsupported (PrimitiveWordOperation PrimitiveWordU32 PrimitiveAddChecked)
+          (managed_word_result compiler PrimitiveWordU32 PrimitiveAddChecked (MirUse 0) (MirUse 1) (checked_word_state 2)))
+          (checked_word_unsupported (PrimitiveWordConversion PrimitiveWordU32 PrimitiveWordUSize PrimitiveConvertChecked)
+            (managed_word_conversion compiler checked_word_abort ([] : List (Maybe MirValue)) PrimitiveWordU32 PrimitiveWordUSize PrimitiveConvertChecked
+              ([CRel 0] : List CoreTerm) (checked_word_state 1)))));
+
+def checked_word_arity : Bool :=
+    checked_word_with (fun (program : CheckedProgram) =>
+      match managed_word_operation (checked_word_compiler program) checked_word_abort ([] : List (Maybe MirValue))
+          PrimitiveWordUSize PrimitiveAddChecked ([CRel 0] : List CoreTerm) (checked_word_state 1),
+        managed_word_conversion (checked_word_compiler program) checked_word_abort ([] : List (Maybe MirValue))
+          PrimitiveWordUSize PrimitiveWordU32 PrimitiveConvertChecked ([CRel 0,CRel 1] : List CoreTerm) (checked_word_state 1) with
+      | Left first_error, Left second_error => if let LowerInvalidCall first := (first_error : NativeLowerError) then
+        if let LowerInvalidCall second := (second_error : NativeLowerError) then andb(eqNat first 0, eqNat second 0) else False else False
+      | Left _, Right _ => False | Right _, Left _ => False | Right _, Right _ => False end);
+
+def checked_word_resources : Bool :=
+    checked_word_with (fun (program : CheckedProgram) =>
+      let compiler : ManagedCompiler := checked_word_compiler program in
+      match managed_expression compiler 0 ([] : List (Maybe MirValue)) (CRel 0) (checked_word_state 1),
+        managed_usize_add_checked compiler (MirUse 0) (MirUse 1) (checked_word_state pe_max_rva),
+        managed_usize_to_u32_checked compiler (MirUse 0) (checked_word_state pe_max_rva) with
+      | Left first_error, Left second_error, Left third_error => if let LowerResourceExhausted := (first_error : NativeLowerError) then
+        if let LowerResourceExhausted := (second_error : NativeLowerError) then if let LowerResourceExhausted := (third_error : NativeLowerError) then
+          True else False else False else False
+      | Left _, Left _, Right _ => False | Left _, Right _, Left _ => False | Left _, Right _, Right _ => False
+      | Right _, Left _, Left _ => False | Right _, Left _, Right _ => False
+      | Right _, Right _, Left _ => False | Right _, Right _, Right _ => False end);
+
+def checked_word_scalar_gap : Bool :=
+    match native_lower_source 2000 mir_default_limits ([109,97,105,110] : List Nat)
+      (prim_string_to_char_codes (prim_string_concat checked_word_base
+        "def main : Runtime W := bind W W pid (fun (word : W) => let size : Size := widen word in match checked_add size size with | None => pure W word | Some _ => pure W word end);")) with
+    | Left source_error => if let NativeSourceLowerError error := (source_error : NativeSourceError) then
+      if let LowerUnsupportedPrimitive primitive := (error : NativeLowerError) then primitive_id_equal primitive (checked_word_primitive False)
+        else False else False | Right _ => False end;
+
+def checked_word_tests (_ : Unit) : List StartupTest :=
+    [startup_test_assert "checked-word/dynamic USize add has unsigned guard and valid Maybe CFG" (checked_word_lowered False),
+     startup_test_assert "checked-word/dynamic USize to U32 has exact upper bound and valid Maybe CFG" (checked_word_lowered True),
+     startup_test_assert "checked-word/add payload box remains rooted at Just allocation" (checked_word_box_live False),
+     startup_test_assert "checked-word/conversion payload box remains rooted at Just allocation" (checked_word_box_live True),
+     startup_test_assert "checked-word/unused add forged NoGc metadata is rejected" (checked_word_metadata False False),
+     startup_test_assert "checked-word/unused add forged Runtime metadata is rejected" (checked_word_metadata False True),
+     startup_test_assert "checked-word/unused conversion forged NoGc metadata is rejected" (checked_word_metadata True False),
+     startup_test_assert "checked-word/unused conversion forged Runtime metadata is rejected" (checked_word_metadata True True),
+     startup_test_assert "checked-word/forged checked add word retains its exact type failure" (checked_word_identity False),
+     startup_test_assert "checked-word/forged checked conversion pair retains its exact type failure" (checked_word_identity True),
+     startup_test_assert "checked-word/forged Maybe parameter metadata differs from its checked inductive" (checked_word_role_metadata True),
+     startup_test_assert "checked-word/forged Maybe constructor metadata differs from its checked inductive" (checked_word_role_metadata False),
+     startup_test_assert "checked-word/missing Maybe role has its exact declaration failure" checked_word_missing_role,
+     startup_test_assert "checked-word/same-spelled ordinary axiom has no intrinsic lowering authority" checked_word_ordinary_axiom,
+     startup_test_assert "checked-word/add arguments retain left failure order" (checked_word_order False),
+     startup_test_assert "checked-word/add preserves the second argument failure" (checked_word_order True),
+     startup_test_assert "checked-word/adjacent unsupported identities retain typed failures" checked_word_adjacent,
+     startup_test_assert "checked-word/invalid arities fail before argument evaluation" checked_word_arity,
+     startup_test_assert "checked-word/fuel and local limits retain resource failure" checked_word_resources,
+     startup_test_assert "checked-word/dynamic scalar Maybe remains explicitly unsupported" checked_word_scalar_gap,
+     startup_test_assert "checked-word/plain word result cannot declare checked add" (checked_word_source_rejected 42
+       "intrinsic wrong : Size -> Size -> Size := \"ouro.usize.add.checked\";"),
+     startup_test_assert "checked-word/reversed checked conversion signature is rejected" (checked_word_source_rejected 42
+       "intrinsic wrong : Size -> Choice W := \"ouro.convert.u32.usize.checked\";"),
+     startup_test_assert "checked-word/ordinary same-spelled Maybe is not the registered role" (checked_word_source_rejected 42
+       "inductive Maybe (A : Type) : Type := | Nothing : Maybe A | Just : A -> Maybe A; intrinsic wrong : Size -> Size -> Maybe Size := \"ouro.usize.add.checked\";"),
+     startup_test_assert "checked-word/add rejects a U32 argument" (checked_word_source_rejected 41
+       "def wrong (size : Size) (word : W) : Choice Size := checked_add size word;"),
+     startup_test_assert "checked-word/conversion rejects a U32 argument" (checked_word_source_rejected 41
+       "def wrong (word : W) : Choice W := checked_convert word;"),
+     startup_test_assert "checked-word/unused malformed body remains checked" (checked_word_source_rejected 41
+       "def wrong (size : Size) : Size := checked_convert size;")];

@@ -13,7 +13,7 @@ def run_checks(run, directory, saved=None):
     run.input = {"recipe": "manifest_contract", "sources": sources}
     for name, text in sources.items():
         (directory / name).write_text(text, encoding="utf-8", newline="\n")
-    def execute(name, text, code, diagnostic, *, env=None):
+    def execute(name, text, code, diagnostic, *, env=None, expected_rows=None):
         manifest = directory / (name + ".tsv")
         manifest.write_text(text, encoding="utf-8", newline="\n")
         out = directory / name
@@ -24,8 +24,13 @@ def run_checks(run, directory, saved=None):
                     "manifest-" + name, {"exit_code": code, "diagnostic": diagnostic}, run.output(result))
         if code < 2:
             data = json.loads((out / "manifest-report.json").read_text(encoding="utf-8"))
-            run.require(data["pass"] is (code == 0) and data["failures"] == code and data["rows"] == 1,
-                        "manifest-report-" + name, {"pass": code == 0, "failures": code, "rows": 1}, data)
+            if expected_rows is None:
+                expected_rows = [(text.split("\t", 1)[0], "pass" if code == 0 else "fail")]
+            reported = [(row["id"], row["status"]) for row in data["results"]]
+            run.require(data["pass"] is (code == 0) and data["failures"] == code
+                        and data["rows"] == len(expected_rows) and reported == expected_rows,
+                        "manifest-report-" + name,
+                        {"pass": code == 0, "failures": code, "rows": len(expected_rows), "results": expected_rows}, data)
 
     good = "SMITH.good\tgood.ouro\tcheck\tpass\t0\tCHECK_OK\n"
     bad = "SMITH.bad\tbad.ouro\tcheck\tfail\t0\tCErr code=41\n"
@@ -35,6 +40,8 @@ def run_checks(run, directory, saved=None):
     execute("invert-reject", bad.replace("\tfail\t", "\tpass\t"), 1, "expected pass")
     execute("diagnostic", bad.replace("CErr code=41", "CErr code=43"), 1, "missing CErr code=43")
     execute("missing", bad.replace("bad.ouro", "missing.ouro"), 1, "missing file")
+    execute("ordered-partial", bad.replace("bad.ouro", "missing.ouro") + "OTHER.bad\tbad\n" + good,
+            1, "missing file", expected_rows=[("SMITH.bad", "fail"), ("SMITH.good", "pass")])
     for name, text, diagnostic in (
         ("duplicate", good + good, "duplicate id:"),
         ("columns", good.rstrip() + "\textra\n", "expected exactly six tab-separated columns"),

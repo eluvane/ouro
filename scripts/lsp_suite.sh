@@ -44,8 +44,8 @@ else
 	fi
 
 	LSP="$OUT/ouro-lsp"
-	# Mixed WSL/Windows trees leave an ELF next to a PE checkout (or the reverse).
-	# build_tool will not replace a still-newer foreign binary; drop it first.
+	# Windows and WSL can share an output directory. Discard an image built
+	# for the other host before preparing the language server.
 	if [ -e "$LSP" ]; then
 		case "$(uname -s 2>/dev/null || echo unknown)" in
 		MINGW*|MSYS*|CYGWIN*|Windows_NT*)
@@ -567,8 +567,10 @@ GROUP_LEFT="$GROUP_DIR/left.ouro"
 GROUP_RIGHT="$GROUP_DIR/right.ouro"
 GROUP_DOC="$GROUP_DIR/main.ouro"
 GROUP_BUFFER="$GROUP_DIR/buffer.ouro"
-printf -- 'inductive LspGroupNat : Type := | LspGroupZero : LspGroupNat;\n' >"$GROUP_LEFT"
-printf -- 'import "left.ouro";\ndef lsp_group_right : LspGroupNat := LspGroupZero;\n' >"$GROUP_RIGHT"
+printf -- 'axiom lsp_group_left_leaf : Type;\n' >"$GROUP_DIR/left-leaf.ouro"
+printf -- 'axiom lsp_group_right_leaf : Type;\n' >"$GROUP_DIR/right-leaf.ouro"
+printf -- 'import "left-leaf.ouro";\ninductive LspGroupNat : Type := | LspGroupZero : LspGroupNat;\ndef lsp_group_left : LspGroupNat := LspGroupZero;\n' >"$GROUP_LEFT"
+printf -- 'import "left.ouro", "right-leaf.ouro";\ndef lsp_group_right : LspGroupNat := LspGroupZero;\n' >"$GROUP_RIGHT"
 printf -- 'import "left.ouro", "right.ouro";\n\ndef use_group : LspGroupNat := lsp_group_right;\n' >"$GROUP_DOC"
 printf -- 'import -- first operand\n "left.ouro", -- second operand\n "\\u{72}ight.ouro",;\n\ndef use_group : LspGroupNat := lsp_group_right;\n' >"$GROUP_BUFFER"
 GROUP_URI=$(uri_of_path "$GROUP_DOC")
@@ -580,6 +582,7 @@ GROUP_RIGHT_URI=$(uri_of_path "$GROUP_RIGHT")
 	frame "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didChange\",\"params\":{\"textDocument\":{\"uri\":\"$GROUP_URI\",\"version\":2},\"contentChanges\":[{\"text\":\"$(json_text "$GROUP_BUFFER")\"}]}}"
 	frame "{\"jsonrpc\":\"2.0\",\"id\":201,\"method\":\"textDocument/hover\",\"params\":{\"textDocument\":{\"uri\":\"$GROUP_URI\"},\"position\":{\"line\":4,\"character\":34}}}"
 	frame "{\"jsonrpc\":\"2.0\",\"id\":202,\"method\":\"textDocument/definition\",\"params\":{\"textDocument\":{\"uri\":\"$GROUP_URI\"},\"position\":{\"line\":4,\"character\":34}}}"
+	frame '{"jsonrpc":"2.0","id":204,"method":"workspace/symbol","params":{"query":"lsp_group_"}}'
 	frame '{"jsonrpc":"2.0","id":203,"method":"shutdown","params":{}}'
 	frame '{"jsonrpc":"2.0","method":"exit"}'
 } >"$OUT/group-imports.in"
@@ -605,10 +608,217 @@ if grep -q '"id":201,"result":{"contents".*def lsp_group_right' "$OUT/group-impo
 else
 	bad group-import-index "second dependency missing from hover or definition"
 fi
+if "$PYTHON" - "$OUT/group-imports.jsonl" <<'PY'
+import json
+import pathlib
+import sys
 
-# A dirty buffer must keep its diagnostics when some other .ouro file
-# changes. The editor sends didChangeWatchedFiles for sibling saves; the
-# server used to recheck the saved path and clear the unsaved error.
+rows = [json.loads(line) for line in pathlib.Path(sys.argv[1]).read_text(encoding="utf-8").splitlines()]
+matches = [row["result"] for row in rows if row.get("id") == 204]
+assert len(matches) == 1, matches
+names = [item["name"] for item in matches[0]]
+assert names == ["lsp_group_left", "lsp_group_right", "lsp_group_left_leaf", "lsp_group_right_leaf"], names
+PY
+then
+	ok "workspace symbols keep breadth-first import order"
+else
+	bad group-import-order "workspace symbols differ from breadth-first import order"
+fi
+
+if "$PYTHON" - "$LSP" "$ROOT" "$OUT" <<'PY'
+import os
+import pathlib
+import queue
+import subprocess
+import sys
+import threading
+
+sys.path.insert(0, str(pathlib.Path("scripts").resolve()))
+from ourosmith.surface.tools import frame, responses
+
+directory = pathlib.Path(sys.argv[3]).resolve() / "navigation"
+directory.mkdir(exist_ok=True)
+base = directory / "base.ouro"
+dependency = directory / "dep.ouro"
+document = directory / "main.ouro"
+second_document = directory / "second.ouro"
+base.write_bytes(b"inductive LspNavNat : Type := | LspNavZero : LspNavNat;\n")
+declaration = b"def nav_target : LspNavNat := LspNavZero;\n"
+old = b'import "base.ouro";\n-- Old doc. \n' + declaration
+new = b'import "base.ouro";\n\n-- New doc.\n' + declaration
+assert len(old) == len(new)
+dependency.write_bytes(old)
+source = 'import "dep.ouro";\ndef nav_use : LspNavNat := nav_target;\n'
+document.write_bytes(source.encode())
+second_source = source.replace("nav_use", "nav_other")
+second_document.write_bytes(second_source.encode())
+uri = document.as_uri()
+second_uri = second_document.as_uri()
+params = {"textDocument": {"uri": uri}}
+position = {**params, "position": {"line": 1, "character": source.splitlines()[1].index("nav_target") + 1}}
+prefix = {**params, "position": {"line": 1, "character": source.splitlines()[1].index("nav_target") + len("nav_")}}
+replies = queue.Queue()
+
+
+def receive(pipe):
+    try:
+        while header := pipe.readline(64):
+            assert header.startswith(b"Content-Length: "), header
+            size = int(header.split(b":", 1)[1])
+            assert 0 < size <= 1048576, header
+            separator = pipe.readline(3)
+            packet = header + separator + pipe.read(size)
+            replies.put(responses(packet.decode())[0])
+    except Exception as error:
+        replies.put(error)
+    finally:
+        replies.put(None)
+
+
+def next_reply():
+    result = replies.get(timeout=40)
+    if isinstance(result, Exception):
+        raise result
+    return result
+
+
+log = directory / "stderr.log"
+executable = pathlib.Path(sys.argv[1]).resolve()
+if os.name == "nt" and not executable.is_file():
+    executable = executable.with_name(executable.name + ".exe")
+with log.open("wb") as stderr, subprocess.Popen(
+    [str(executable)], executable=str(executable),
+    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=stderr,
+    env={**os.environ, "OURO_ROOT": sys.argv[2]},
+) as server:
+    reader = threading.Thread(target=receive, args=(server.stdout,), daemon=True)
+    reader.start()
+
+    def send(method, arguments, request_id=None):
+        message = {"jsonrpc": "2.0", "method": method, "params": arguments}
+        if request_id is not None:
+            message["id"] = request_id
+        server.stdin.write(frame(message).encode())
+        server.stdin.flush()
+
+    def request(request_id, method, arguments):
+        send(method, arguments, request_id)
+        reply = next_reply()
+        assert reply is not None and reply.get("id") == request_id, reply
+        return reply["result"]
+
+    def clean_diagnostics(document_uri=uri):
+        message = next_reply()
+        assert message is not None and message.get("method") == "textDocument/publishDiagnostics", message
+        assert message["params"] == {"uri": document_uri, "diagnostics": []}, message
+
+    def completion(request_id, labels):
+        items = request(request_id, "textDocument/completion", prefix)
+        assert [item["label"] for item in items] == labels, items
+        return items
+
+    def workspace(request_id, names, dependency_line):
+        items = request(request_id, "workspace/symbol", {"query": "nav_"})
+        assert [item["name"] for item in items] == names, items
+        locations = [item["location"] for item in items if item["name"] == "nav_target"]
+        assert len(locations) == names.count("nav_target"), locations
+        assert all(location["uri"] == dependency.as_uri() and location["range"]["start"]["line"] == dependency_line
+                   for location in locations), locations
+
+    try:
+        assert request(801, "initialize", {})["capabilities"]["hoverProvider"]
+        send("textDocument/didOpen", {
+            "textDocument": {"uri": uri, "languageId": "ouro", "version": 1, "text": source}})
+        clean_diagnostics()
+        first_completion = completion(810, ["nav_use", "nav_target"])
+        assert "Old doc." in first_completion[1]["documentation"], first_completion
+        document_items = request(819, "textDocument/documentSymbol", params)
+        assert [item["name"] for item in document_items] == ["nav_use"], document_items
+        assert document_items[0]["location"]["uri"] == uri, document_items
+        edited = source.replace("nav_use", "nav_new")
+        assert len(edited) == len(source)
+        send("textDocument/didChange", {
+            "textDocument": {"uri": uri, "version": 2}, "contentChanges": [{"text": edited}]})
+        clean_diagnostics()
+        edited_items = request(824, "textDocument/documentSymbol", params)
+        assert [item["name"] for item in edited_items] == ["nav_new"], edited_items
+        send("textDocument/didChange", {
+            "textDocument": {"uri": uri, "version": 3}, "contentChanges": [{"text": source}]})
+        clean_diagnostics()
+        assert request(825, "textDocument/documentSymbol", params) == document_items
+        assert completion(811, ["nav_use", "nav_target"]) == first_completion
+        saved_document = directory / "saved-main.ouro"
+        document.replace(saved_document)
+        try:
+            document.mkdir()
+            completion(817, [])
+        finally:
+            if document.is_dir():
+                document.rmdir()
+            saved_document.replace(document)
+        assert completion(818, ["nav_use", "nav_target"]) == first_completion
+        first = request(802, "textDocument/hover", position)
+        assert "Old doc." in first["contents"]["value"], first
+        assert request(803, "textDocument/hover", position) == first
+        location = request(804, "textDocument/definition", position)
+        assert location["uri"] == dependency.as_uri() and location["range"]["start"]["line"] == 2, location
+        one_document = ["nav_use", "nav_target"]
+        workspace(821, one_document, 2)
+        stat = dependency.stat()
+        try:
+            dependency.write_bytes(new)
+            os.utime(dependency, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+            workspace(822, one_document, 3)
+        finally:
+            dependency.write_bytes(old)
+            os.utime(dependency, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+        workspace(823, one_document, 2)
+        send("textDocument/didOpen", {
+            "textDocument": {"uri": second_uri, "languageId": "ouro", "version": 1, "text": second_source}})
+        clean_diagnostics(second_uri)
+        names = ["nav_use", "nav_target", "nav_other", "nav_target"]
+        workspace(814, names, 2)
+
+        stat = dependency.stat()
+        dependency.write_bytes(new)
+        os.utime(dependency, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+        workspace(815, names, 3)
+        changed_completion = completion(812, ["nav_use", "nav_target"])
+        assert "New doc." in changed_completion[1]["documentation"], changed_completion
+        location = request(805, "textDocument/definition", position)
+        assert location["uri"] == dependency.as_uri() and location["range"]["start"]["line"] == 3, location
+        hover = request(806, "textDocument/hover", position)
+        assert "New doc." in hover["contents"]["value"], hover
+
+        dependency.unlink()
+        workspace(816, ["nav_use", "nav_other"], None)
+        assert request(820, "textDocument/documentSymbol", params) == document_items
+        completion(813, ["nav_use"])
+        assert request(807, "textDocument/definition", position) is None
+        assert request(808, "textDocument/hover", position) is None
+        send("textDocument/didClose", params)
+        clean_diagnostics()
+        send("textDocument/didClose", {"textDocument": {"uri": second_uri}})
+        clean_diagnostics(second_uri)
+        assert request(809, "shutdown", {}) is None
+        send("exit", {})
+        assert server.wait(timeout=5) == 0
+        assert next_reply() is None
+    finally:
+        if server.poll() is None:
+            server.kill()
+        server.wait(timeout=5)
+        reader.join(timeout=5)
+assert log.stat().st_size == 0, log.read_text(encoding="utf-8")
+PY
+then
+	ok "warm navigation reflects unnotified changes and removed imports"
+else
+	bad navigation-cache "unexpected request, reply, or exit"
+fi
+
+# A sibling save must preserve diagnostics for the dirty buffer. Reading
+# the saved file in place of the unsaved text would clear the error.
 WATCH_DIR="$OUT/watch-root"
 mkdir -p "$WATCH_DIR"
 WATCH_CLEAN="$WATCH_DIR/dirty.ouro"
@@ -699,6 +909,54 @@ then
 	ok "scratch creation failure remains a tool diagnostic until close"
 else
 	bad scratch-failure "status=$scratch_status or unexpected diagnostic protocol"
+fi
+
+if "$PYTHON" - "$LSP" "$ROOT" <<'PY'
+import json
+import os
+import pathlib
+import subprocess
+import sys
+
+sys.path.insert(0, str(pathlib.Path("scripts").resolve()))
+from ourosmith.surface.tools import frame, responses
+
+
+def padded_header(message, size):
+    body = json.dumps(message, separators=(",", ":")).encode()
+    prefix = f"Content-Length: {len(body)}\r\nX-Fill: ".encode()
+    header = prefix + b"x" * (size - len(prefix) - 4) + b"\r\n\r\n"
+    assert len(header) == size
+    return header + body
+
+
+def run(data):
+    return subprocess.run([sys.argv[1]], input=data, capture_output=True,
+                          env={**os.environ, "OURO_ROOT": sys.argv[2]}, timeout=10)
+
+
+sizes = (64, 65, 66, 67, 68, 4095)
+initializations = b"".join(padded_header({"jsonrpc": "2.0", "id": size,
+                                          "method": "initialize", "params": {}}, size)
+                           for size in sizes)
+shutdown = frame({"jsonrpc": "2.0", "id": 1, "method": "shutdown"}).encode()
+exit_notice = frame({"jsonrpc": "2.0", "method": "exit"}).encode()
+accepted = run(initializations + shutdown + exit_notice)
+assert accepted.returncode == 0 and not accepted.stderr, accepted
+assert [message["id"] for message in responses(accepted.stdout.decode())] == [*sizes, 1]
+
+too_long = padded_header({"jsonrpc": "2.0", "id": 2, "method": "initialize", "params": {}}, 4096)
+with_nul = padded_header({"jsonrpc": "2.0", "id": 3, "method": "initialize", "params": {}}, 130)
+with_nul = with_nul.replace(b"X-Fill: x", b"X-Fill: \0", 1)
+assert b"\0" in with_nul
+for invalid in (too_long, too_long[:100], with_nul):
+    rejected = run(invalid)
+    assert rejected.returncode == 1 and not rejected.stdout and not rejected.stderr, rejected
+PY
+then
+	ok "header chunks keep frame boundaries and the exact header limit"
+else
+	bad header-framing "padded header or cutoff changed the protocol"
 fi
 
 # Oversized framing is rejected from the header, and a valid value one level

@@ -1,14 +1,7 @@
 #!/usr/bin/env sh
-# Seed hygiene is fail-closed: generated-hash checksums, generated-shape
-# needles, packer selftest, source presence, and stitch/wiring needles must
-# agree. Logs go under _build/hygiene/.
-#
-# Do not re-run gates that `python3 scripts/ci_gate.py --profile pr` already
-# owns. Required owners (see docs/ci.md and scripts/ci_gate.py):
-#   kernel-hardening, github-workflow-gate, generated-artifact-hashes,
-#   github-project-gate, release-package-check, docs-examples,
-#   strict-quality-firewall.
-# Local `hygiene.sh` is not their required owner.
+# This gate checks stage0 hashes, generated C shape, packer self-tests,
+# source presence, and compiler wiring. See docs/ci.md for the PR profile's
+# separate checks.
 
 set -eu
 ROOT=$(CDPATH='' cd "$(dirname "$0")/.." && pwd)
@@ -101,10 +94,12 @@ fi
 if grep -q '("pl", "_pl", "compiler/pipeline.ouro", "pl.c")' scripts/frontend_regen.py \
 	&& grep -q 'scripts/frontend_regen.py' scripts/emit_frontend.sh \
 	&& grep -q 'emit_frontend(prev' scripts/stage_loop.py \
-	&& grep -q 'FIND(pl, "compile_checked_from_decls")' runtime/frontend_link.c \
+	&& grep -Fq 'fn = FIND(pl, name);' runtime/frontend_link.c \
+	&& grep -Fq 'closed_compile_decls_entry("compile_checked_from_decls_with_origin",' runtime/frontend_link.c \
+	&& grep -Fq 'closed_compile_decls_entry("compile_checked_from_decls_with_source_packet",' runtime/frontend_link.c \
 	&& grep -q 'parse_units_incremental(fuel' runtime/frontend_link.c \
 	&& ! grep -q 'compile_units_legacy_impl' runtime/frontend_link.c \
-	&& grep -q 'FIND(pl, "stitch_checked_source")' runtime/frontend_link.c \
+	&& grep -Fq 'FIND(pl, "stitch_checked_source_with_origin")' runtime/frontend_link.c \
 	&& grep -q 'ouro_fe_compile_checked_units' runtime/frontend_link.c \
 	&& [ ! -f runtime/ouro_fe_glue.c ]; then
 	ok "pipeline.ouro packed as pl TU (main stitcher); glue is generated fe_link"

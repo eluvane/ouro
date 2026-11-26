@@ -2,6 +2,7 @@
 -- complete declaration and term acceptance remains with the checker.
 
 import "pipeline_abi.ouro",
+  "source_name_index.ouro",
   "../std/listx.ouro";
 
 inductive ModuleOpen : Type :=
@@ -86,33 +87,73 @@ def module_open_constructors (opened : List (Pair Nat Nat))
         end) visible);
 
 def module_duplicate_key : List (Pair Nat Nat) -> Maybe Nat :=
-  fix go (items : List (Pair Nat Nat)) : Maybe Nat :=
+  fun (items : List (Pair Nat Nat)) =>
     match items with
     | Nil => Nothing Nat
-    | Cons pair rest =>
-        match pair with
-        | MkPair key _ =>
-            match module_lookup key rest with
-            | Just _ => Just Nat key
-            | Nothing => go rest
+    | Cons pair rest => match rest with
+      | Nil => Nothing Nat
+      | Cons _ _ =>
+          let suffix : Pair SourceNameIndex (Maybe Nat) :=
+            (fix collect (rows : List (Pair Nat Nat))
+                : Pair SourceNameIndex (Maybe Nat) :=
+              match rows with
+              | Nil => MkPair SourceNameIndex (Maybe Nat)
+                  SourceNameIndexEmpty (Nothing Nat)
+              | Cons row tail => match collect tail with
+                | MkPair seen duplicate => match (row : Pair Nat Nat) with
+                  | MkPair key _ =>
+                      let indexed_key : List Nat := [add key Z] in
+                      MkPair SourceNameIndex (Maybe Nat)
+                        (source_name_index_insert indexed_key Z seen)
+                        (match source_name_index_lookup indexed_key seen with
+                         | Just _ => Just Nat key
+                         | Nothing => duplicate
+                         end)
+                  end
+                end
+              end) rest in
+          match pair with
+          | MkPair key _ => match suffix with
+            | MkPair seen duplicate =>
+                match source_name_index_lookup [add key Z] seen with
+                | Just _ => Just Nat key
+                | Nothing => duplicate
+                end
             end
-        end
+          end
+      end
     end;
 
 def module_overlap_key (refs : List (Pair Nat Nat))
     (errors : List (Pair Nat Nat)) : Maybe Nat :=
-    (fix go (items : List (Pair Nat Nat)) : Maybe Nat :=
-      match items with
-      | Nil => Nothing Nat
-      | Cons pair rest =>
-          match pair with
-          | MkPair key _ =>
-              match module_lookup key errors with
-              | Just _ => Just Nat key
-              | Nothing => go rest
+  match refs with
+  | Nil => Nothing Nat
+  | Cons _ _ => match errors with
+    | Nil => Nothing Nat
+    | Cons _ _ =>
+        let known : SourceNameIndex :=
+          (fix collect (rows : List (Pair Nat Nat)) (index : SourceNameIndex)
+              : SourceNameIndex :=
+            match rows with
+            | Nil => index
+            | Cons row rest => match (row : Pair Nat Nat) with
+              | MkPair key _ => collect rest
+                  (source_name_index_insert [add key Z] Z index)
               end
-          end
-      end) refs;
+            end) errors SourceNameIndexEmpty in
+        (fix go (items : List (Pair Nat Nat)) : Maybe Nat :=
+          match items with
+          | Nil => Nothing Nat
+          | Cons pair rest => match pair with
+            | MkPair key _ =>
+                match source_name_index_lookup [add key Z] known with
+                | Just _ => Just Nat key
+                | Nothing => go rest
+                end
+            end
+          end) refs
+    end
+  end;
 
 def module_invalid_error_code : List (Pair Nat Nat) -> Maybe Nat :=
   fix go (items : List (Pair Nat Nat)) : Maybe Nat :=
@@ -226,7 +267,15 @@ def module_ref_with_binders (refs : List (Pair Nat Nat))
     (binders : List (Pair Nat Nat)) (bound : List Nat) (name : Nat)
     : ResolveResult Nat :=
     let local : Nat := module_binder_name binders name in
-    match orb(memNat name bound, memNat local bound) with
+    let is_bound : Bool :=
+      match memNat name bound with
+      | True => True
+      | False => match eqNat name local with
+        | True => False
+        | False => memNat local bound
+        end
+      end in
+    match is_bound with
     | True => ROk Nat local
     | False =>
         match module_lookup name errors with
@@ -248,37 +297,52 @@ def module_rewrite_ids (refs : List (Pair Nat Nat))
     (ids : List Nat) : ResolveResult (List Nat) :=
     module_result_list Nat Nat (module_ref refs errors bound) ids;
 
+private inductive ModulePatternHeadView : Type :=
+  | MkModulePatternHeadView : Bool -> Nat -> List Nat -> ModulePatternHeadView;
+
 -- Qualified heads must resolve to constructors before lowering. Otherwise
 -- the lowerer would treat a qualified non-constructor as a pattern binder.
+private def module_pattern_head_view (refs : List (Pair Nat Nat))
+    (errors : List (Pair Nat Nat)) (markers : List Nat)
+    (constructors : List Nat) (binders : List (Pair Nat Nat))
+    (head : Nat) (vars : List Nat)
+    : ResolveResult ModulePatternHeadView :=
+    match module_lookup head errors with
+    | Just code => RErr ModulePatternHeadView code head
+    | Nothing =>
+    let known_ctor : Bool := memNat head constructors in
+    match andb(memNat head markers, notb known_ctor) with
+    | True => RErr ModulePatternHeadView 8 head
+    | False =>
+        match known_ctor with
+        | True =>
+            module_result_bind Unit ModulePatternHeadView
+              (module_check_names markers vars)
+              (fun (_ : Unit) =>
+                module_result_map Nat ModulePatternHeadView
+                  (fun (qualified : Nat) =>
+                    MkModulePatternHeadView True qualified vars)
+                  (module_ref_with_binders refs errors binders (Nil Nat) head))
+        | False =>
+            module_result_map Unit ModulePatternHeadView
+              (fun (_ : Unit) =>
+                MkModulePatternHeadView False head (Cons Nat head vars))
+              (module_check_names markers (Cons Nat head vars))
+        end
+    end
+    end;
+
 def module_pattern_head_with_binders (refs : List (Pair Nat Nat))
     (errors : List (Pair Nat Nat)) (markers : List Nat)
     (constructors : List Nat) (binders : List (Pair Nat Nat))
     (head : Nat) (vars : List Nat)
     : ResolveResult (Pair Nat (List Nat)) :=
-    match module_lookup head errors with
-    | Just code => RErr (Pair Nat (List Nat)) code head
-    | Nothing =>
-    let known_ctor : Bool := memNat head constructors in
-    match andb(memNat head markers, notb known_ctor) with
-    | True => RErr (Pair Nat (List Nat)) 8 head
-    | False =>
-        match known_ctor with
-        | True =>
-            module_result_bind Unit (Pair Nat (List Nat))
-              (module_check_names markers vars)
-              (fun (_ : Unit) =>
-                module_result_map Nat (Pair Nat (List Nat))
-                  (fun (qualified : Nat) =>
-                    MkPair Nat (List Nat) qualified vars)
-                  (module_ref_with_binders refs errors binders (Nil Nat) head))
-        | False =>
-            module_result_map Unit (Pair Nat (List Nat))
-              (fun (_ : Unit) =>
-                MkPair Nat (List Nat) head (Cons Nat head vars))
-              (module_check_names markers (Cons Nat head vars))
-        end
-    end
-    end;
+    module_result_map ModulePatternHeadView (Pair Nat (List Nat))
+      (fun (rewritten : ModulePatternHeadView) =>
+        match rewritten with
+        | MkModulePatternHeadView _ name scope => MkPair Nat (List Nat) name scope
+        end)
+      (module_pattern_head_view refs errors markers constructors binders head vars);
 
 def module_pattern_head (refs : List (Pair Nat Nat))
     (errors : List (Pair Nat Nat)) (markers : List Nat)
@@ -306,21 +370,21 @@ def module_branch_pack (refs : List (Pair Nat Nat))
     | Nil => ROk (Pair (List Nat) (List Nat))
         (MkPair (List Nat) (List Nat) (Nil Nat) bound)
     | Cons head vars =>
-        module_result_map (Pair Nat (List Nat))
+        module_result_map ModulePatternHeadView
           (Pair (List Nat) (List Nat))
-          (fun (rewritten : Pair Nat (List Nat)) =>
+          (fun (rewritten : ModulePatternHeadView) =>
             match rewritten with
-            | MkPair name new_bound =>
+            | MkModulePatternHeadView known_ctor name new_bound =>
                 MkPair (List Nat) (List Nat)
                   (Cons Nat
-                    (match memNat head constructors with
+                    (match known_ctor with
                     | True => name
                     | False => module_binder_name binders name
                     end)
                     (module_binder_names binders vars))
                   (append Nat new_bound bound)
             end)
-          (module_pattern_head_with_binders refs errors markers constructors
+          (module_pattern_head_view refs errors markers constructors
             binders head vars)
     end;
 
@@ -407,13 +471,13 @@ def module_rewrite_patterns
     | Cons pattern rest =>
         match pattern with
         | MkPair head vars =>
-            module_result_bind (Pair Nat (List Nat))
+            module_result_bind ModulePatternHeadView
               (Pair (List (Pair Nat (List Nat))) (List Nat))
-              (module_pattern_head_with_binders refs errors markers constructors
+              (module_pattern_head_view refs errors markers constructors
                 binders head vars)
-              (fun (rewritten : Pair Nat (List Nat)) =>
+              (fun (rewritten : ModulePatternHeadView) =>
                 match rewritten with
-                | MkPair name new_bound =>
+                | MkModulePatternHeadView known_ctor name new_bound =>
                     module_result_map
                       (Pair (List (Pair Nat (List Nat))) (List Nat))
                       (Pair (List (Pair Nat (List Nat))) (List Nat))
@@ -423,7 +487,7 @@ def module_rewrite_patterns
                             MkPair (List (Pair Nat (List Nat))) (List Nat)
                               (Cons (Pair Nat (List Nat))
                                 (MkPair Nat (List Nat)
-                                  (match memNat head constructors with
+                                  (match known_ctor with
                                   | True => name
                                   | False => module_binder_name binders name
                                   end)

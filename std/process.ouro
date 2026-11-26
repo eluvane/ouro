@@ -263,3 +263,121 @@ def process_run_captured_bounded_with_input (limits : ProcessCaptureLimits) (com
 def process_run_captured_bounded (limits : ProcessCaptureLimits) (command : String) (arguments : List String)
     : IO (Either ProcessCaptureError ProcessCaptureResult) :=
     process_run_captured_bounded_with_input limits command arguments "";
+
+inductive ProcessDirectoryError : Type :=
+  | ProcessInvalidDirectory : String -> ProcessDirectoryError
+  | ProcessDirectoryCapture : ProcessCaptureError -> ProcessDirectoryError;
+
+def process_directory_continuation (code : Nat) : Bool :=
+    andb(leb_nat 128 code, leb_nat code 191);
+
+def process_directory_utf8_valid : List Nat -> Bool :=
+  fix valid (bytes : List Nat) : Bool :=
+    match bytes with
+    | Nil => True
+    | Cons first rest => match ltb_nat first 128 with
+      | True => valid rest
+      | False => match andb(leb_nat 194 first, leb_nat first 223) with
+        | True => match rest with
+          | Nil => False
+          | Cons second tail => andb(process_directory_continuation second, valid tail)
+          end
+        | False => match andb(leb_nat 224 first, leb_nat first 239) with
+          | True => match rest with
+            | Nil => False
+            | Cons second tail => match tail with
+              | Nil => False
+              | Cons third more =>
+                  let low : Nat := if eq_nat first 224 then 160 else 128 in
+                  let high : Nat := if eq_nat first 237 then 159 else 191 in
+                  andb(andb(leb_nat low second, leb_nat second high),
+                    andb(process_directory_continuation third, valid more))
+              end
+            end
+          | False => match andb(leb_nat 240 first, leb_nat first 244) with
+            | False => False
+            | True => match rest with
+              | Nil => False
+              | Cons second tail => match tail with
+                | Nil => False
+                | Cons third last => match last with
+                  | Nil => False
+                  | Cons fourth more =>
+                      let low : Nat := if eq_nat first 240 then 144 else 128 in
+                      let high : Nat := if eq_nat first 244 then 143 else 191 in
+                      andb(andb(leb_nat low second, leb_nat second high),
+                        andb(process_directory_continuation third,
+                          andb(process_directory_continuation fourth, valid more)))
+                  end
+                end
+              end
+            end
+          end
+        end
+      end
+    end;
+
+def process_directory_valid (directory : String) : Bool :=
+    match ltb_nat(str_len directory, 3) with
+    | True => False
+    | False =>
+        let first : Nat := prim_string_byte_at directory 0 in
+        let second : Nat := prim_string_byte_at directory 1 in
+        let third : Nat := prim_string_byte_at directory 2 in
+        let letter : Bool := orb(andb(leb_nat 65 first, leb_nat first 90),
+          andb(leb_nat 97 first, leb_nat first 122)) in
+        let codes : List Nat := str_codes directory in
+        andb(andb(notb (any Nat (eq_nat 0) codes), process_directory_utf8_valid codes),
+          orb(andb(eq_nat first 92, eq_nat second 92),
+            andb(letter, andb(eq_nat second 58, orb(eq_nat third 47, eq_nat third 92)))))
+    end;
+
+def process_directory_checked (directory : String) : Either ProcessDirectoryError String :=
+    match process_directory_valid directory with
+    | True => Right ProcessDirectoryError String directory
+    | False => Left ProcessDirectoryError String (ProcessInvalidDirectory directory)
+    end;
+
+def process_directory_error_code (error : ProcessDirectoryError) : String :=
+    match error with
+    | ProcessInvalidDirectory _ => "process_capture_directory"
+    | ProcessDirectoryCapture cause => process_capture_error_code cause
+    end;
+
+def process_directory_error_message (error : ProcessDirectoryError) : String :=
+    match error with
+    | ProcessInvalidDirectory directory =>
+        str_concat "invalid process cwd (expected an absolute Windows path in UTF-8 without NUL): " directory
+    | ProcessDirectoryCapture cause => process_capture_error_message cause
+    end;
+
+def process_directory_result (result : Either ProcessCaptureError ProcessCaptureResult)
+    : Either ProcessDirectoryError ProcessCaptureResult :=
+    match result with
+    | Left cause => Left ProcessDirectoryError ProcessCaptureResult (ProcessDirectoryCapture cause)
+    | Right captured => Right ProcessDirectoryError ProcessCaptureResult captured
+    end;
+
+def process_run_captured_bounded_at_with_input (limits : ProcessCaptureLimits) (directory : String)
+    (command : String) (arguments : List String) (input : String)
+    : IO (Either ProcessDirectoryError ProcessCaptureResult) :=
+    match process_directory_checked directory with
+    | Left error => io_pure (Either ProcessDirectoryError ProcessCaptureResult)
+        (Left ProcessDirectoryError ProcessCaptureResult error)
+    | Right checked => match process_capture_limits_error limits with
+      | Just field => io_pure (Either ProcessDirectoryError ProcessCaptureResult)
+          (Left ProcessDirectoryError ProcessCaptureResult
+            (ProcessDirectoryCapture (ProcessCaptureInvalidLimits field)))
+      | Nothing => io_bind (Pair(Nat, Pair(Nat, Pair(Nat, Pair String String))))
+          (Either ProcessDirectoryError ProcessCaptureResult)
+          (prim_process_capture_bounded_at command arguments checked (process_capture_request limits input))
+          (fun (reply : Pair Nat (Pair Nat (Pair Nat (Pair String String)))) =>
+            io_pure (Either ProcessDirectoryError ProcessCaptureResult)
+              (process_directory_result (process_capture_decode_checked limits reply)))
+      end
+    end;
+
+def process_run_captured_bounded_at (limits : ProcessCaptureLimits) (directory : String)
+    (command : String) (arguments : List String)
+    : IO (Either ProcessDirectoryError ProcessCaptureResult) :=
+    process_run_captured_bounded_at_with_input limits directory command arguments "";

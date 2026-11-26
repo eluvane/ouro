@@ -1,5 +1,6 @@
 -- Native source compilation and forged checked-input boundary regressions.
 import "native_lower_constant_fixtures.ouro",
+  "../compiler/native/managed_terms.ouro",
   "../compiler/native/diagnostics.ouro",
   "compiler_program_lookup.ouro",
   "native_lower_error_code.ouro";
@@ -141,14 +142,10 @@ def lower_test_raw_metadata (pure : Bool) : Bool :=
       lower_test_rejected CheckedProgram 2 (lower_recheck_program lower_fixture_fuel forged) end;
 
 def lower_test_load_width (locals : List MirLocal) (instruction : MirInstruction) : Bool :=
-    match instruction with
-    | MirLoad id _ _ => match mir_type_of_local locals id with
+    if let MirLoad id _ _ := instruction then
+      match mir_type_of_local locals id with
         | Left _ => False | Right typ => mir_type_equal typ MirU32 end
-    | MirMove _ _ => False | MirBinaryOp _ _ _ _ => False | MirCompare _ _ _ _ => False
-    | MirConvert _ _ _ => False | MirStore _ _ _ => False | MirAddress _ _ => False
-    | MirLoadAt _ _ _ => False | MirStoreAt _ _ _ => False
-    | MirPointerAdd _ _ _ => False | MirCall _ _ _ _ => False
-    | MirManagedAlloc _ _ _ _ _ => False | MirManagedContext _ => False end;
+    else False;
 
 -- The null-address input is lowered for type inspection, never executed.
 def lower_test_specialized_load : Bool :=
@@ -222,22 +219,18 @@ def lower_test_resource : Bool := lower_test_with_reference (fun (program : Chec
 def lower_test_entry_invalid : Bool := lower_test_with_reference (fun (program : CheckedProgram) =>
     lower_test_rejected MirProgram 11 (native_lower_program lower_fixture_fuel mir_default_limits (mul 16 256) program));
 
+private def lower_test_mir_resource_error (error : NativeLowerError) : Bool :=
+    if let LowerMirFailure failure := error then
+      if let MirResourceExhausted := (failure : MirError) then True else False
+    else False;
+
 def lower_test_mir_limits : Bool := lower_test_with_reference (fun (program : CheckedProgram) =>
     lower_test_named program "main" (fun (id : Nat) =>
-      match native_lower_program lower_fixture_fuel (MirLimitsWith 1 256 1) id program with
-      | Right _ => False | Left err => match err with
-        | LowerMirFailure failure => match failure with
-          | MirResourceExhausted => True | MirDuplicateSymbol _ => False | MirUnknownSymbol _ => False
-          | MirDuplicateLocal _ => False | MirUnknownLocal _ => False | MirDuplicateBlock _ => False | MirUnknownBlock _ => False
-          | MirUninitialized _ _ => False | MirTypeMismatch _ => False | MirInvalidLiteral => False
-          | MirInvalidConversion _ => False | MirInvalidAddress _ => False | MirInvalidCall _ => False
-          | MirInvalidReturn _ => False | MirInvalidEntry _ => False | MirInvalidName _ => False
-          | MirInvalidDisplacement => False | MirInvalidData _ => False | MirUnreachableBlock _ => False
-          | MirGcCallMismatch _ _ => False | MirGcUnsafeRuntime _ => False end
-        | LowerResourceExhausted => False | LowerDeclarationFailure _ _ _ => False | LowerMetadataMismatch _ => False
-        | LowerBodyMismatch _ => False | LowerUnsupportedType _ => False | LowerUnsupportedTerm _ => False
-        | LowerUnsupportedPrimitive _ => False | LowerUnknownGlobal _ => False | LowerUnboundLocal _ => False
-        | LowerInvalidCall _ => False | LowerEffectMismatch => False | LowerInvalidEntry _ => False | LowerBackendFailure _ => False end end));
+      match (native_lower_program lower_fixture_fuel (MirLimitsWith 1 256 1) id program
+        : Either NativeLowerError MirProgram) with
+      | Right _ => False
+      | Left err => lower_test_mir_resource_error err
+      end));
 
 def lower_test_id_overflow : Bool :=
     let program : CheckedProgram := CheckedProgramOf empty_intern
@@ -256,7 +249,152 @@ def lower_test_fix_source : String := prim_string_concat lower_fixture_base
 
 -- Delay each checked compilation until its test runs. Bootstrap drivers can
 -- select individual cases to bound growth of the legacy runtime arena.
+def lower_test_fn_reference : CompResult CheckedProgram := compile_checked_source lower_fixture_fuel
+    (prim_string_to_char_codes (prim_string_concat lower_raw_fn_common
+      "def invoke_getter (code : Getter) : Runtime W := call_getter code; def partial_setter (code : Setter) : W -> Runtime Empty := call_setter code; def main : Runtime W := pid;"));
+
+def lower_test_fn_program (test : CheckedProgram -> Bool) : Bool :=
+    match lower_test_fn_reference with | CErr _ => False | COk program => test program end;
+
+def lower_test_fn_specialization (program : CheckedProgram) (name : String) (test : CoreTerm -> Bool) : Bool :=
+    lower_test_named program name (fun (id : Nat) => match lower_find_entry id (checked_program_entries program) with
+      | Nothing => False | Just entry => match entry with
+        | MkBoundEntry _ _ binding => match binding with | PrimitiveExternBinding _ => False
+          | PrimitiveIntrinsicBinding _ _ _ specialization => match specialization with
+            | Nothing => False | Just signature => test signature end end
+        | MkEntry _ _ _ => False | MkIndEntry _ _ => False | MkRoleEntry _ => False end end);
+
+def lower_test_fn_metadata (mode : Nat) : Bool :=
+    lower_test_fn_program (fun (program : CheckedProgram) => lower_test_named program "call_getter" (fun (target : Nat) =>
+      lower_test_named program "W" (fun (word : Nat) => lower_test_named program "Runtime" (fun (runtime : Nat) =>
+        let forged : CheckedProgram := lower_test_change_entries program (fun (entry : Entry) => match entry with
+          | MkBoundEntry id typ binding => match andb(eqNat id target, compiler_lt_nat mode 4) with
+            | False => entry | True => match binding with | PrimitiveExternBinding _ => entry
+              | PrimitiveIntrinsicBinding primitive execution gc specialization => MkBoundEntry id typ
+                  (PrimitiveIntrinsicBinding primitive (match eqNat mode 2 with | True => PrimitivePureValue | False => execution end)
+                    (match eqNat mode 1 with | True => PrimitiveNoGc | False => gc end)
+                    (match eqNat mode 0 with | True => Nothing CoreTerm | False => match eqNat mode 3 with
+                      | True => Just(CoreTerm, CPi(CConst word, CApp(CConst runtime, CConst word)))
+                      | False => specialization end end)) end end
+          | MkEntry _ _ _ => entry | MkIndEntry _ _ => entry | MkRoleEntry _ => entry end) in
+        lower_test_rejected CheckedProgram (match orb(eqNat mode 0, eqNat mode 3) with | True => 1 | False => 2 end)
+          (lower_recheck_program lower_fixture_fuel forged)))));
+
+def lower_test_fn_partial : Bool := lower_test_fn_program (fun (program : CheckedProgram) =>
+    lower_test_fn_specialization program "call_setter" (fun (signature : CoreTerm) =>
+      let sig : CheckEnvironment := check_environment_from_entries (checked_program_entries program) in
+      let specialization : Maybe CoreTerm := Just CoreTerm signature in
+      match lower_fn_partial lower_fixture_fuel sig specialization [],
+        lower_fn_partial lower_fixture_fuel sig specialization [CRel 0],
+        lower_fn_partial lower_fixture_fuel sig specialization [CRel 0, CRel 1],
+        lower_fn_partial lower_fixture_fuel sig specialization [CRel 0, CRel 1, CRel 2] with
+      | Right empty, Right first, Right saturated, Right extra => andb(andb(empty, first), andb(notb saturated, notb extra))
+      | Left _, Left _, Left _, Left _ => False
+      | Left _, Left _, Left _, Right _ => False
+      | Left _, Left _, Right _, Left _ => False
+      | Left _, Left _, Right _, Right _ => False
+      | Left _, Right _, Left _, Left _ => False
+      | Left _, Right _, Left _, Right _ => False
+      | Left _, Right _, Right _, Left _ => False
+      | Left _, Right _, Right _, Right _ => False
+      | Right _, Left _, Left _, Left _ => False
+      | Right _, Left _, Left _, Right _ => False
+      | Right _, Left _, Right _, Left _ => False
+      | Right _, Left _, Right _, Right _ => False
+      | Right _, Right _, Left _, Left _ => False
+      | Right _, Right _, Left _, Right _ => False
+      | Right _, Right _, Right _, Left _ => False end));
+
+def lower_test_fn_indirect (parameters : List MirType) (result : Maybe MirType) (instruction : MirInstruction) : Bool :=
+    if let MirCall gc destination target actual := instruction then
+      match target with | MirDirect _ => False
+      | MirIndirect signature _ => match signature with | MirSignatureOf arguments returns =>
+          andb (match gc with | MirNoGc => False | MirMayGc => True end)
+            (andb (pe_bytes_equal(map MirType Nat mir_type_code parameters, map MirType Nat mir_type_code arguments))
+              (andb (eqNat(length MirValue actual, length MirType parameters))
+                (match result, returns, destination with
+                | Nothing, Nothing, Nothing => True
+                | Just expected, Just typ, Just _ => mir_type_equal expected typ
+                | Nothing, Nothing, Just _ => False
+                | Nothing, Just _, Nothing => False
+                | Nothing, Just _, Just _ => False
+                | Just _, Nothing, Nothing => False
+                | Just _, Nothing, Just _ => False
+                | Just _, Just _, Nothing => False end))) end end
+    else False;
+
+def lower_test_fn_in_function (parameters : List MirType) (result : Maybe MirType) (function : MirFunction) : Bool :=
+    match function with | MirFunctionDef _ _ _ _ _ _ blocks => any MirBlock (fun (block : MirBlock) => match block with
+      | MirBlockDef _ instructions _ => any MirInstruction (lower_test_fn_indirect parameters result) instructions end) blocks end;
+
+def lower_test_fn_lowered (parameters : List MirType) (result : Maybe MirType) : Bool :=
+    match native_lower_source lower_fixture_fuel mir_default_limits lower_fixture_main
+      (prim_string_to_char_codes lower_raw_fn_fixture) with | Left _ => False | Right lowered => match lowered with
+      | NativeLoweredOf _ _ program => match program with | MirProgramDef functions _ _ _ =>
+          any MirFunction (lower_test_fn_in_function parameters result) functions end end end;
+
+def lower_test_fn_managed (name : String) (parameters : List MirType) (result : Maybe MirType) : Bool :=
+    lower_test_fn_program (fun (program : CheckedProgram) => lower_test_named program name (fun (id : Nat) =>
+      match lookup_const(id, checked_program_entries program) with | Nothing => False | Just body =>
+        let compiler : ManagedCompiler := ManagedCompilerOf program ([] : List Nat) 900 901 902 903 904 1000
+          ([] : List LowerContract) (check_environment_from_entries (checked_program_entries program)) in
+        let state : ManagedState := ManagedStateOf(2000, [] : List MirFunction, [] : List MirData,
+          [] : List Nat, [] : List Nat, lower_empty_state 0, NativeOriginsDisabled) in
+        match managed_expression compiler lower_fixture_fuel ([] : List (Maybe MirValue)) body state with
+        | Left _ => False | Right compiled => match compiled with | ManagedResultOf _ after => match after with
+          | ManagedStateOf _ functions _ _ _ flow _ =>
+            let action_name : List Nat := [111,117,114,111,95,109,97,110,97,103,101,100,95,97,99,116,105,111,110] in
+            andb (match flow with | LowerStateOf _ _ instructions _ =>
+              notb (any MirInstruction (lower_test_fn_indirect parameters result) instructions) end)
+              (andb (any MirFunction (fun (function : MirFunction) => match function with
+                | MirFunctionDef _ label _ _ _ _ _ => andb (pe_bytes_equal label action_name)
+                    (lower_test_fn_in_function parameters result function) end) functions)
+                (notb (any MirFunction (fun (function : MirFunction) => match function with
+                  | MirFunctionDef _ label _ _ _ _ _ => andb (notb (pe_bytes_equal label action_name))
+                      (lower_test_fn_in_function parameters result function) end) functions))) end end end end));
+
 inductive LowerTest : Type := | LowerTestOf : String -> (Unit -> Bool) -> LowerTest;
+
+def lower_fn_tests : List LowerTest :=
+    [LowerTestOf "RawFn zero-argument calls retain their U32 result and MayGc" (fun (_ : Unit) =>
+       lower_test_fn_lowered [] (Just MirType MirU32)),
+     LowerTestOf "RawFn Unit calls retain their argument and absent destination" (fun (_ : Unit) =>
+       lower_test_fn_lowered [MirU32] (Nothing MirType)),
+     LowerTestOf "RawFn six-argument calls retain their full ABI and RawFn result" (fun (_ : Unit) =>
+       lower_test_fn_lowered [MirU32, MirU64, MirU8, MirI32, MirUSize, MirRawPtr] (Just MirType MirRawPtr)),
+     LowerTestOf "RawFn getter runs only inside the managed action" (fun (_ : Unit) =>
+       lower_test_fn_managed "invoke_getter" [] (Just MirType MirU32)),
+     LowerTestOf "RawFn setter runs only inside the managed action" (fun (_ : Unit) =>
+       lower_test_fn_managed "invoke_setter" [MirU32] (Nothing MirType)),
+     LowerTestOf "partially applied RawFn setter retains deferred action execution" (fun (_ : Unit) =>
+       lower_test_fn_managed "partial_setter" [MirU32] (Nothing MirType)),
+     LowerTestOf "RawFn partial and saturated arities are distinguished" (fun (_ : Unit) => lower_test_fn_partial),
+     LowerTestOf "RawFn specialization is required" (fun (_ : Unit) => lower_test_fn_metadata 0),
+     LowerTestOf "RawFn unknown call cannot forge NoGc" (fun (_ : Unit) => lower_test_fn_metadata 1),
+     LowerTestOf "RawFn call cannot forge pure execution metadata" (fun (_ : Unit) => lower_test_fn_metadata 2),
+     LowerTestOf "RawFn specialization must retain the exact signature" (fun (_ : Unit) => lower_test_fn_metadata 3),
+     LowerTestOf "RawPtr is not a RawFn callee" (fun (_ : Unit) => lower_test_checker_rejected
+       (prim_string_concat lower_raw_fn_common "def bad (code : Pointer W) : Runtime W := call_getter code; def main : Runtime W := pid;")),
+     LowerTestOf "managed closure is not a RawFn callee" (fun (_ : Unit) => lower_test_checker_rejected
+       (prim_string_concat lower_raw_fn_common "def bad (value : W) : Runtime Empty := call_setter (fun (x : W) => pure Empty EmptyValue) value; def main : Runtime W := pid;")),
+     LowerTestOf "RawFn argument widths remain checked" (fun (_ : Unit) => lower_test_checker_rejected
+       (prim_string_concat lower_raw_fn_common "def bad (code : Setter) (value : Wide) : Runtime Empty := call_setter code value; def main : Runtime W := pid;")),
+     LowerTestOf "a different RawFn signature is not interchangeable" (fun (_ : Unit) => lower_test_checker_rejected
+       (prim_string_concat lower_raw_fn_common "def bad (code : Getter) (value : W) : Runtime Empty := call_setter code value; def main : Runtime W := pid;")),
+     LowerTestOf "RawFn runtime result cannot escape to a pure word" (fun (_ : Unit) => lower_test_checker_rejected
+       (prim_string_concat lower_raw_fn_common "def bad (code : Getter) : W := call_getter code; def main : Runtime W := pid;")),
+     LowerTestOf "RawFn call rejects missing arguments" (fun (_ : Unit) => lower_test_checker_rejected
+       (prim_string_concat lower_raw_fn_common "def bad (code : Setter) : Runtime Empty := call_setter code; def main : Runtime W := pid;")),
+     LowerTestOf "RawFn call rejects extra arguments" (fun (_ : Unit) => lower_test_checker_rejected
+       (prim_string_concat lower_raw_fn_common "def bad (code : Getter) (value : W) : Runtime W := call_getter code value; def main : Runtime W := pid;")),
+     LowerTestOf "RawFn concrete signatures require a Runtime result" (fun (_ : Unit) => lower_test_checker_rejected
+       (prim_string_concat lower_raw_fn_common "intrinsic pure_call : Code W -> W := \"ouro.fn.call\" W; def main : Runtime W := pid;")),
+     LowerTestOf "RawFn generic proof escape remains rejected" (fun (_ : Unit) => lower_test_checker_rejected
+       (prim_string_concat lower_raw_fn_common "intrinsic generic_call : (S : Type) -> Code S -> S := \"ouro.fn.call\"; def main : Runtime W := pid;")),
+     LowerTestOf "RawFn dependent signatures remain rejected" (fun (_ : Unit) => lower_test_checker_rejected
+       (prim_string_concat lower_raw_fn_common "def Dependent : Type := (A : Type) -> A -> Runtime A; intrinsic dependent_call : Code Dependent -> Dependent := \"ouro.fn.call\" Dependent; def main : Runtime W := pid;")),
+     LowerTestOf "closures cannot specialize raw storage" (fun (_ : Unit) => lower_test_checker_rejected
+       (prim_string_concat lower_raw_fn_common "intrinsic read_closure : Pointer (W -> W) -> Runtime (W -> W) := \"ouro.raw.load\" (W -> W); def main : Runtime W := pid;"))];
 
 def lower_tests : List LowerTest :=
     [ LowerTestOf "strict checked program replay succeeds"
@@ -364,8 +502,8 @@ def lower_test_constant_program (test : CheckedProgram -> Bool) : Bool :=
 def lower_test_constant_case (mode : Nat) : Bool :=
     lower_test_constant_program (fun (program : CheckedProgram) => lower_test_named program "main" (fun (entry : Nat) =>
       match lookup_const(entry, checked_program_entries program) with | Nothing => False | Just body =>
-        match lower_term_view body with
-        | LowerCaseTerm info motive scrutinee branches => match info with | MkCaseInfo family params arities =>
+        if let LowerCaseTerm info motive scrutinee branches := (lower_term_view body : LowerTermView) then
+          match info with | MkCaseInfo family params arities =>
             let changed_info : CaseInfo := match eqNat mode 0 with
               | True => MkCaseInfo family (S params) arities
               | False => match eqNat mode 1 with | True => MkCaseInfo family params ([1, 0] : List Nat) | False => info end end in
@@ -375,9 +513,7 @@ def lower_test_constant_case (mode : Nat) : Bool :=
               | True => take CoreTerm 1 branches | False => branches end in
             lower_test_rejected NativeLoweredProgram 1 (native_lower_checked lower_fixture_fuel mir_default_limits entry
               (lower_test_replace_body program entry (CCase changed_info motive changed_value changed_branches))) end
-        | LowerLocalTerm _ => False | LowerGlobalTerm _ => False | LowerLambdaTerm _ _ => False
-        | LowerApplyTerm _ _ => False | LowerLetTerm _ _ _ => False | LowerConstructorTerm _ _ _ => False
-        | LowerOtherTerm _ => False end end));
+        else False end));
 
 def lower_test_constant_metadata (execution : Bool) : Bool :=
     lower_test_constant_program (fun (program : CheckedProgram) =>
@@ -414,30 +550,27 @@ def lower_test_range_role_items : List FileItem :=
       , FRepresentation(30, lower_role_key PrimitiveRangeRole primitive_role_keys)
       ];
 
+private def lower_test_range_role_family (family : CoreTerm) : Bool :=
+    if let CInd id := family then eqNat id 30 else False;
+
 def lower_test_range_role_replay : Bool :=
-    match check_declarations CheckExactCore keep_checking lower_fixture_fuel lower_test_range_role_items with
+    match (check_declarations CheckExactCore keep_checking lower_fixture_fuel lower_test_range_role_items
+      : DeclarationResult) with
     | DeclarationsErr _ _ _ => False
     | DeclarationsOk entries =>
-        match lower_recheck_program lower_fixture_fuel
-          (CheckedProgramOf empty_intern entries ([] : List (Pair Nat CoreTerm))) with
+        match (lower_recheck_program lower_fixture_fuel
+          (CheckedProgramOf empty_intern entries ([] : List (Pair Nat CoreTerm)))
+          : Either NativeLowerError CheckedProgram) with
         | Left _ => False
         | Right program =>
-            match program with
+            match (program : CheckedProgram) with
             | CheckedProgramOf _ restored _ =>
                 let roles : List PrimitiveRoleBinding :=
                   primitive_roles_environment restored in
                 andb (eqNat (length PrimitiveRoleBinding roles) 3)
-                  (match primitive_role_ref PrimitiveRangeRole roles with
+                  (match (primitive_role_ref PrimitiveRangeRole roles : Either PrimitiveError CoreTerm) with
                    | Left _ => False
-                   | Right family =>
-                       match family with
-                       | CInd id => eqNat id 30
-                       | CRel _ => False | CSort _ => False | CConst _ => False
-                       | CConstruct _ _ _ => False | CApp _ _ => False
-                       | CLam _ _ => False | CPi _ _ => False | CLetIn _ _ _ => False
-                       | CFix _ _ _ _ _ => False | CCase _ _ _ _ => False
-                       | CStrLit _ _ => False | CStrBytes _ _ => False
-                       end
+                   | Right family => lower_test_range_role_family family
                    end)
             end
         end
@@ -545,25 +678,18 @@ def lower_test_indexed_alias : Bool :=
         (lower_test_normalized_as(CSort 0, lower_constant_whnf 100 sig (CConst 7))));
 
 def lower_test_literal_failure (result : Either NativeLowerError CoreTerm) : Bool :=
-    match result with | Right _ => False | Left error => match error with
-      | LowerDeclarationFailure name phase failure => andb (eqNat name 0)
-          (andb (match phase with | CheckDeclarationBody => True | CheckDeclarationPlan => False
-             | CheckDeclarationType => False | CheckInductiveDeclaration => False end)
-            (match failure with | CheckReductionFailure fault => match fault with
-              | NormalizeUnresolvedLiteral => True
-              | NormalizeNonFunction => False | NormalizeCaseBranchCount => False | NormalizeCaseScrutinee => False
-              | NormalizeCaseInductive => False | NormalizeCaseParameters => False | NormalizeCaseConstructor => False
-              | NormalizeCaseArguments => False | NormalizeFixArgument => False | NormalizeFixArity => False
-              | NormalizeUnreducedHead => False | NormalizeStringBytes => False | NormalizeStringArguments => False
-              | NormalizeStringType => False end
-            | CheckTypeFailure _ => False | CheckMalformedCore _ => False | CheckResourceLimit => False
-            | CheckUnsupported _ => False | CheckCancelled => False | CheckInternalFailure _ => False
-            | CheckPrimitiveFailure _ => False end))
-      | LowerResourceExhausted => False | LowerMetadataMismatch _ => False | LowerBodyMismatch _ => False
-      | LowerUnsupportedType _ => False | LowerUnsupportedTerm _ => False | LowerUnsupportedPrimitive _ => False
-      | LowerUnknownGlobal _ => False | LowerUnboundLocal _ => False | LowerInvalidCall _ => False
-      | LowerEffectMismatch => False | LowerInvalidEntry _ => False | LowerMirFailure _ => False
-      | LowerBackendFailure _ => False end end;
+    match result with
+    | Right _ => False
+    | Left error =>
+        if let LowerDeclarationFailure name phase failure := (error : NativeLowerError) then
+          andb (eqNat name 0)
+            (andb (match phase with | CheckDeclarationBody => True | CheckDeclarationPlan => False
+               | CheckDeclarationType => False | CheckInductiveDeclaration => False end)
+              (if let CheckReductionFailure fault := (failure : CheckFailure) then
+                  if let NormalizeUnresolvedLiteral := (fault : NormalizeFault) then True else False
+                else False))
+        else False
+    end;
 
 def lower_test_indexed_errors : Bool :=
     let sig : CheckEnvironment := check_environment_empty in
@@ -693,10 +819,10 @@ def lower_runner_tests : List LowerTest :=
      LowerTestOf "isolated inventory preserves distinct case names" (fun (_ : Unit) =>
        lower_case_name_absent "first" [LowerTestOf("second", fun (_ : Unit) => False)])];
 
-def lower_all_tests : List LowerTest := append LowerTest lower_runner_tests (append LowerTest lower_indexed_tests (append LowerTest lower_tests
+def lower_all_tests : List LowerTest := append LowerTest lower_fn_tests (append LowerTest lower_runner_tests (append LowerTest lower_indexed_tests (append LowerTest lower_tests
     (append LowerTest lower_constant_tests
       (map NativeLowerFixture LowerTest lower_test_fixture
-        (append NativeLowerFixture lower_raw_fixtures (append NativeLowerFixture lower_loop_fixtures lower_constant_fixtures))))));
+        (append NativeLowerFixture lower_raw_fixtures (append NativeLowerFixture lower_loop_fixtures lower_constant_fixtures)))))));
 
 def lower_test_run : List LowerTest -> IO Unit :=
   fix run (tests : List LowerTest) : IO Unit :=

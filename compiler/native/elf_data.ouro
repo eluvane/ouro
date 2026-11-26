@@ -1,0 +1,117 @@
+-- Fixed ELF images with page-separated RX/R/RW storage and no loader imports.
+-- This container does not admit managed MIR or provide a Linux runtime.
+import "elf.ouro",
+  "pe_fixups.ouro";
+
+inductive ElfDataError : Type :=
+  | ElfDataLayoutError : ElfError -> ElfDataError
+  | ElfDataLinkError : PeError -> ElfDataError;
+
+inductive ElfDataLayout : Type :=
+  -- Program-header count, text/R/RW file offsets, and complete file size.
+  | ElfDataLayoutAt : Nat -> Nat -> Nat -> Nat -> Nat -> ElfDataLayout;
+
+def elf_data_from_pe (A : Type) (result : Either PeError A) : Either ElfDataError A :=
+    mapLeft PeError A ElfDataError ElfDataLinkError result;
+
+def elf_data_capacity : Nat := sub pe_max_rva elf_image_base;
+
+def elf_data_segment_count (readonly_size : Nat) (writable_size : Nat) : Nat :=
+    add 2 (add (match readonly_size with | Z => 0 | S _ => 1 end)
+      (match writable_size with | Z => 0 | S _ => 1 end));
+
+def elf_data_advance (offset : Nat) (size : Nat) : Either ElfDataError Nat :=
+    match andb (leb_nat offset elf_data_capacity)
+      (leb_nat size (sub elf_data_capacity offset)) with
+    | False => Left ElfDataError Nat (ElfDataLayoutError ElfImageTooLarge)
+    | True => Right ElfDataError Nat (add offset size) end;
+
+def elf_data_check_layout (text_size : Nat) (readonly_size : Nat)
+    (writable_size : Nat) (entry_offset : Nat) : Either ElfDataError ElfDataLayout :=
+    let? (Left, Right) : Either ElfDataError ElfDataLayout do
+      let _legacy_bounds : Nat := mapLeft ElfError Nat ElfDataError ElfDataLayoutError
+        (elf_check_layout text_size entry_offset)?;
+      let headers : Nat := elf_data_segment_count readonly_size writable_size;
+      let text_offset : Nat := add 64 (mul 56 headers);
+      let text_end : Nat := elf_data_advance text_offset text_size?;
+      let readonly_offset : Nat := match readonly_size with
+        | Z => text_end | S _ => pe_align elf_page_alignment text_end end;
+      let readonly_end : Nat := elf_data_advance readonly_offset readonly_size?;
+      let writable_offset : Nat := match writable_size with
+        | Z => readonly_end | S _ => pe_align elf_page_alignment readonly_end end;
+      let file_size : Nat := elf_data_advance writable_offset writable_size?;
+      ElfDataLayoutAt headers text_offset readonly_offset writable_offset file_size
+    end;
+
+def elf_data_file_header (layout : ElfDataLayout) (entry_offset : Nat) : List Nat :=
+    match layout with | ElfDataLayoutAt headers text_offset _ _ _ =>
+      pe_join [([127,69,76,70,2,1,1,0,0,0,0,0,0,0,0,0] : List Nat),
+        pe_le16 2, pe_le16 62, pe_le32 1,
+        pe_le64_rva (add (add elf_image_base text_offset) entry_offset),
+        pe_le64_rva 64, pe_zeros 12,
+        pe_le16 64, pe_le16 56, pe_le16 headers, pe_zeros 6] end;
+
+def elf_data_load_header (flags : Nat) (offset : Nat) (size : Nat) : List Nat :=
+    pe_join [pe_le32 1, pe_le32 flags, pe_le64_rva offset,
+      pe_le64_rva (add elf_image_base offset), pe_le64_rva 0,
+      pe_le64_rva size, pe_le64_rva size, pe_le64_rva elf_page_alignment];
+
+def elf_data_optional_header (flags : Nat) (offset : Nat) (size : Nat) : List Nat :=
+    match size with | Z => [] | S _ => elf_data_load_header flags offset size end;
+
+def elf_data_sections (layout : ElfDataLayout) (text : List Nat)
+    (readonly_data : List Nat) (writable_data : List Nat) : List PePlacedSection :=
+    match layout with | ElfDataLayoutAt _ text_offset readonly_offset writable_offset _ =>
+      Cons PePlacedSection
+        (PeSectionAt PeText (add elf_image_base text_offset) text_offset (length Nat text) text)
+        (append PePlacedSection
+          (match readonly_data with | Nil => [] | Cons _ _ =>
+            [PeSectionAt PeReadOnly (add elf_image_base readonly_offset) readonly_offset
+              (length Nat readonly_data) readonly_data] end)
+          (match writable_data with | Nil => [] | Cons _ _ =>
+            [PeSectionAt PeWritable (add elf_image_base writable_offset) writable_offset
+              (length Nat writable_data) writable_data] end)) end;
+
+-- Only image-local RIP-relative text fields are supported. Absolute PE
+-- addresses, import targets and patching data are not ELF loader contracts.
+def elf_data_check_fixups : List PeFixup -> Either ElfDataError Unit :=
+  fix check (fixups : List PeFixup) : Either ElfDataError Unit :=
+    match fixups with | Nil => Right ElfDataError Unit MkUnit
+    | Cons fixup rest => match fixup with
+      | PeRel32 section offset _ target => match andb (pe_section_equal section PeText)
+          (match target with | PeSymbolTarget _ => True | PeImportTarget _ => False end) with
+        | True => check rest
+        | False => Left ElfDataError Unit (ElfDataLinkError (PeInvalidFixup offset)) end
+      | PeRva32 _ offset _ => Left ElfDataError Unit (ElfDataLinkError (PeInvalidFixup offset))
+      | PeVa64 _ offset _ => Left ElfDataError Unit (ElfDataLinkError (PeInvalidFixup offset)) end end;
+
+def elf_data_serialize (layout : ElfDataLayout) (entry_offset : Nat)
+    (text : List Nat) (readonly_data : List Nat) (writable_data : List Nat) : List Nat :=
+    match layout with | ElfDataLayoutAt _ text_offset readonly_offset writable_offset _ =>
+      let text_end : Nat := add text_offset (length Nat text) in
+      let readonly_size : Nat := length Nat readonly_data in
+      let readonly_end : Nat := add readonly_offset readonly_size in
+      pe_join [elf_data_file_header layout entry_offset,
+        elf_data_load_header 5 0 text_end,
+        elf_data_optional_header 4 readonly_offset readonly_size,
+        elf_data_optional_header 6 writable_offset (length Nat writable_data),
+        elf_stack_segment, text, pe_zeros (sub readonly_offset text_end), readonly_data,
+        pe_zeros (sub writable_offset readonly_end), writable_data] end;
+
+def elf_write_data_image (text : List Nat) (readonly_data : List Nat) (writable_data : List Nat)
+    (symbols : List PeSymbol) (fixups : List PeFixup) (entry_offset : Nat)
+    : Either ElfDataError (List Nat) :=
+    let? (Left, Right) : Either ElfDataError (List Nat) do
+      let layout : ElfDataLayout := elf_data_check_layout (length Nat text)
+        (length Nat readonly_data) (length Nat writable_data) entry_offset?;
+      let checked_text : List Nat := elf_data_from_pe (List Nat) (pe_check_bytes text)?;
+      let checked_readonly : List Nat := elf_data_from_pe (List Nat) (pe_check_bytes readonly_data)?;
+      let checked_writable : List Nat := elf_data_from_pe (List Nat) (pe_check_bytes writable_data)?;
+      let sections : List PePlacedSection := elf_data_sections layout checked_text checked_readonly checked_writable;
+      let _symbols : Unit := elf_data_from_pe Unit (pe_validate_symbols sections symbols)?;
+      let _supported : Unit := elf_data_check_fixups fixups?;
+      let patches : List PePatch := elf_data_from_pe (List PePatch) (pe_plan_fixups sections symbols [] fixups)?;
+      elf_data_from_pe (List Nat) (pe_check_bytes
+        (elf_data_serialize layout entry_offset
+          (pe_apply_section_patches PeText checked_text patches) checked_readonly checked_writable))?
+    end;

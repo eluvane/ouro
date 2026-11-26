@@ -1,0 +1,63 @@
+-- Bounded freestanding Linux x86-64 ELF64 text image; no host IO or linker.
+-- Fixed ET_EXEC mapping, no interpreter, dynamic metadata, BSS or relocations.
+-- The caller owns code semantics; entry_offset must identify a text byte.
+import "pe_model.ouro";
+
+inductive ElfError : Type :=
+  | ElfEmptyText : ElfError
+  | ElfImageTooLarge : ElfError
+  | ElfInvalidEntry : Nat -> ElfError
+  | ElfBytesRejected : PeError -> ElfError;
+
+def elf_image_base : Nat := mul 64 pe_byte2_place;
+def elf_text_offset : Nat := 176;
+def elf_text_capacity : Nat := sub(pe_max_rva, add elf_image_base elf_text_offset);
+def elf_page_alignment : Nat := 4096;
+
+-- The layout bounds text size and entry position to the range of the shared
+-- little-endian emitters.
+def elf_check_layout (text_size : Nat) (entry_offset : Nat) : Either ElfError Nat :=
+    match text_size with
+    | Z => Left ElfError Nat ElfEmptyText
+    | S _ =>
+      match leb_nat text_size elf_text_capacity with
+      | False => Left ElfError Nat ElfImageTooLarge
+      | True => match ltb_nat entry_offset text_size with
+        | False => Left ElfError Nat (ElfInvalidEntry entry_offset)
+        | True => Right ElfError Nat (add elf_text_offset text_size)
+        end
+      end
+    end;
+
+-- Field emitters are used only after the enclosing layout was checked.
+def elf_file_header (entry_offset : Nat) : List Nat :=
+    pe_join
+      [ ([127, 69, 76, 70, 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0] : List Nat)
+      , pe_le16 2, pe_le16 62, pe_le32 1
+      , pe_le64_rva (add(add elf_image_base elf_text_offset, entry_offset))
+      , pe_le64_rva 64, pe_zeros 12
+      , pe_le16 64, pe_le16 56, pe_le16 2, pe_zeros 6
+      ];
+
+def elf_load_segment (file_size : Nat) : List Nat :=
+    pe_join
+      [ pe_le32 1, pe_le32 5, pe_le64_rva 0, pe_le64_rva elf_image_base
+      , pe_le64_rva 0, pe_le64_rva file_size, pe_le64_rva file_size
+      , pe_le64_rva elf_page_alignment
+      ];
+
+-- PT_GNU_STACK=0x6474e551; PF_R|PF_W, with PF_X absent.
+def elf_stack_segment : List Nat :=
+    pe_join
+      [ ([81, 229, 116, 100, 6, 0, 0, 0] : List Nat)
+      , pe_zeros 40, pe_le64_rva 16
+      ];
+
+def elf_write_image (text : List Nat) (entry_offset : Nat) : Either ElfError (List Nat) :=
+    match elf_check_layout (length Nat text) entry_offset with
+    | Left error => Left ElfError (List Nat) error
+    | Right file_size =>
+      let bytes : List Nat := pe_join
+        [elf_file_header entry_offset, elf_load_segment file_size, elf_stack_segment, text] in
+      mapLeft PeError (List Nat) ElfError ElfBytesRejected (pe_check_bytes bytes)
+    end;

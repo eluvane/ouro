@@ -11,6 +11,9 @@ import "source_text.ouro",
   "../std/data.ouro",
   "../std/listx.ouro",
   "ast.ouro",
+  "source_origin.ouro",
+  "source_spans.ouro",
+  "source_name_index.ouro",
   "token.ouro",
   "core.ouro",
   "pipeline_abi.ouro",
@@ -19,6 +22,7 @@ import "source_text.ouro",
   "file_check_model.ouro",
   "file_check_environment.ouro",
   "path.ouro",
+  "import_paths.ouro",
   "lower_env.ouro",
   "lower_decl_types.ouro",
   "checked_program.ouro",
@@ -279,29 +283,575 @@ def collect_lower_env_from (st : InternState) (decls : List Decl) : LowerEnv :=
       (append Nat (pipeline_standard_special_ids st decls)
         (pipeline_nominal_special_ids st decls)) decls;
 
+inductive LoweredDecl : Type :=
+  | LoweredDeclOf : Nat -> Pair (Maybe Nat) LoweredSurface -> LoweredDecl;
+
+def source_decl_slot (decl : Decl) : Pair Nat Nat :=
+  match decl with
+  | DDef name _ _ _ _ => MkPair Nat Nat 0 name
+  | DAxiom name _ => MkPair Nat Nat 1 name
+  | DInductive name _ _ _ _ => MkPair Nat Nat 2 name
+  | DEffect name _ _ => MkPair Nat Nat 3 name
+  | DImport path => MkPair Nat Nat 4 path
+  | DIntrinsic name _ _ _ => MkPair Nat Nat 5 name
+  | DExtern name _ _ => MkPair Nat Nat 6 name
+  | DRepresentation target _ => MkPair Nat Nat 7 target
+  end;
+
+def source_decl_same_slot (before : Decl) (after : Decl) : Bool :=
+  match source_decl_slot before with | MkPair before_kind before_name =>
+    match source_decl_slot after with | MkPair after_kind after_name =>
+      andb(eqNat before_kind after_kind, eqNat before_name after_name)
+    end end;
+
+-- Provenance rows do not authorize checking or runtime binding.
+inductive SourceModuleSlot : Type :=
+  | SourceModuleSlotOf : Nat -> Pair (Pair Nat Nat) (Maybe (Pair Nat Nat)) -> SourceModuleSlot;
+
+inductive SourceCheckedOwner : Type :=
+  | SourceCheckedOwnerOf : Entry -> Maybe (Pair Nat (Pair Nat Nat)) -> SourceCheckedOwner;
+
+inductive CheckedSourcePacket : Type :=
+  | CheckedSourcePacketOf : CheckedProgram ->
+      Pair (List SourceModuleSlot) (List SourceCheckedOwner) -> CheckedSourcePacket;
+
+def source_slot_equal (left : Pair Nat Nat) (right : Pair Nat Nat) : Bool :=
+  match left with | MkPair left_kind left_name =>
+    match right with | MkPair right_kind right_name =>
+      andb(eqNat left_kind right_kind, eqNat left_name right_name)
+    end end;
+
+def source_origin_rows_append (first : Either SourceOriginError (List OwnedSourceOccurrence))
+    (second : Either SourceOriginError (List OwnedSourceOccurrence))
+    : Either SourceOriginError (List OwnedSourceOccurrence) :=
+  match first with
+  | Left error => Left SourceOriginError (List OwnedSourceOccurrence) error
+  | Right heads => match second with
+    | Left error => Left SourceOriginError (List OwnedSourceOccurrence) error
+    | Right tails => Right SourceOriginError (List OwnedSourceOccurrence)
+        (append OwnedSourceOccurrence heads tails)
+    end
+  end;
+
+def source_origin_empty_rows (mapping : Either SourceOriginError (Maybe OriginalSourceMap))
+    : Either SourceOriginError (List OwnedSourceOccurrence) :=
+  match mapping with
+  | Left error => Left SourceOriginError (List OwnedSourceOccurrence) error
+  | Right optional => match optional with
+    | Nothing => Right SourceOriginError (List OwnedSourceOccurrence) []
+    | Just origin => match original_map_validate origin with
+      | Left error => Left SourceOriginError (List OwnedSourceOccurrence) error
+      | Right _ => Right SourceOriginError (List OwnedSourceOccurrence) []
+      end
+    end
+  end;
+
+def source_origin_occurrence_follows (previous : Maybe (Pair Nat (Pair Nat Nat)))
+    (kind : Nat) (current : Pair Nat Nat) : Bool :=
+  match current with | MkPair first past =>
+    andb(ltb_nat first past,
+      (match previous with
+       | Nothing => True
+       | Just prior => match prior with | MkPair prior_kind interval =>
+         match interval with | MkPair start finish =>
+           orb(leb_nat finish first,
+             andb(eqNat kind 4, andb(eqNat prior_kind 4, andb(eqNat start first, eqNat finish past))))
+         end end
+       end))
+  end;
+
+def source_origin_capture_occurrences (unit : Nat) (before : List Decl) (after : List Decl)
+    (occurrences : List ParsedSourceOccurrence) (spans : TokenSpans) (mapping : OriginalSourceMap)
+    : Either SourceOriginError (List OwnedSourceOccurrence) :=
+  match original_map_validate mapping with
+  | Left error => Left SourceOriginError (List OwnedSourceOccurrence) error
+  | Right checked => match checked with | OriginalSourceMapOf totals _ => match totals with
+    | MkPair _ prepared_total => match spans with | MkTokenSpans actual_total _ =>
+      match eqNat prepared_total actual_total with
+      | False => Left SourceOriginError (List OwnedSourceOccurrence) SourceOriginCoverage
+      | True =>
+          (fix go (originals : List Decl) (canonical : List Decl)
+              (rows : List ParsedSourceOccurrence) (ordinal : Nat) (previous : Maybe (Pair Nat (Pair Nat Nat)))
+              : Either SourceOriginError (List OwnedSourceOccurrence) :=
+            match originals with
+            | Nil => match canonical with
+              | Cons _ _ => Left SourceOriginError (List OwnedSourceOccurrence) SourceOriginOccurrence
+              | Nil => match rows with
+                | Cons _ _ => Left SourceOriginError (List OwnedSourceOccurrence) SourceOriginOccurrence
+                | Nil => Right SourceOriginError (List OwnedSourceOccurrence) []
+                end
+              end
+            | Cons original rest => match canonical with
+              | Nil => Left SourceOriginError (List OwnedSourceOccurrence) SourceOriginOccurrence
+              | Cons current tail => match rows with
+                | Nil => Left SourceOriginError (List OwnedSourceOccurrence) SourceOriginOccurrence
+                | Cons row more => match row with | ParsedSourceOccurrenceOf captured position =>
+                  match position with | MkPair index interval =>
+                    match source_decl_slot original with | MkPair kind _ =>
+                      match source_decl_slot current with | MkPair current_kind _ =>
+                        match andb(eqNat index ordinal,
+                            andb(source_decl_same_slot original captured,
+                              andb(eqNat kind current_kind,
+                                andb((match original with
+                                      | DImport _ => True
+                                      | DDef _ _ _ _ _ => source_decl_same_slot original current
+                                      | DAxiom _ _ => source_decl_same_slot original current
+                                      | DInductive _ _ _ _ _ => source_decl_same_slot original current
+                                      | DEffect _ _ _ => source_decl_same_slot original current
+                                      | DIntrinsic _ _ _ _ => source_decl_same_slot original current
+                                      | DExtern _ _ _ => source_decl_same_slot original current
+                                      | DRepresentation _ _ => source_decl_same_slot original current
+                                      end), source_origin_occurrence_follows previous kind interval)))) with
+                        | False => Left SourceOriginError (List OwnedSourceOccurrence) SourceOriginOccurrence
+                        | True => match interval with | MkPair first past =>
+                          match token_span_bytes spans first past with
+                          | Nothing => Left SourceOriginError (List OwnedSourceOccurrence) SourceOriginOccurrence
+                          | Just bytes => match original_map_cover checked bytes with
+                            | Left error => Left SourceOriginError (List OwnedSourceOccurrence) error
+                            | Right envelope => match go rest tail more (S ordinal)
+                                  (Just (Pair Nat (Pair Nat Nat)) (MkPair Nat (Pair Nat Nat) kind interval)) with
+                              | Left error => Left SourceOriginError (List OwnedSourceOccurrence) error
+                              | Right others => Right SourceOriginError (List OwnedSourceOccurrence)
+                                  (Cons OwnedSourceOccurrence
+                                    (OwnedSourceOccurrenceOf unit
+                                      (MkPair ParsedSourceOccurrence (Maybe OriginalEnvelope)
+                                        (ParsedSourceOccurrenceOf current position) envelope)) others)
+                              end
+                            end
+                          end
+                        end
+                        end
+                      end end
+                    end end
+                  end
+                end
+            end) before after occurrences 0 (Nothing (Pair Nat (Pair Nat Nat)))
+      end
+    end end end
+  end;
+
+def source_origin_occurrence (unit : Nat) (slot : Pair Nat Nat)
+    (occurrences : List OwnedSourceOccurrence) : Maybe OriginalEnvelope :=
+  let candidates : List OwnedSourceOccurrence := filter OwnedSourceOccurrence
+    (fun (row : OwnedSourceOccurrence) => match row with | OwnedSourceOccurrenceOf owner captured =>
+      match captured with | MkPair occurrence _ => match occurrence with | ParsedSourceOccurrenceOf decl _ =>
+        andb(eqNat unit owner, source_slot_equal slot (source_decl_slot decl))
+      end end end) occurrences in
+  match candidates with
+  | Nil => Nothing OriginalEnvelope
+  | Cons row rest => match rest with
+    | Cons _ _ => Nothing OriginalEnvelope
+    | Nil => match row with | OwnedSourceOccurrenceOf _ captured =>
+      match captured with | MkPair _ envelope => envelope end end
+    end
+  end;
+
+def source_origin_capture_rows (unit : Nat) (before : List Decl) (after : List Decl)
+    (spans : Maybe TokenSpans) (occurrences : Maybe (List ParsedSourceOccurrence))
+    (mapping : Either SourceOriginError (Maybe OriginalSourceMap))
+    : Either SourceOriginError (List OwnedSourceOccurrence) :=
+  match mapping with
+  | Left error => Left SourceOriginError (List OwnedSourceOccurrence) error
+  | Right origin => match spans with
+    | Nothing => match occurrences with
+      | Just _ => Left SourceOriginError (List OwnedSourceOccurrence) SourceOriginCoverage
+      | Nothing => match origin with
+        | Just _ => Left SourceOriginError (List OwnedSourceOccurrence) SourceOriginCoverage
+        | Nothing => Right SourceOriginError (List OwnedSourceOccurrence) []
+        end
+      end
+    | Just marks => match occurrences with
+      | Nothing => Left SourceOriginError (List OwnedSourceOccurrence) SourceOriginCoverage
+      | Just rows => match origin with
+        | Nothing => Left SourceOriginError (List OwnedSourceOccurrence) SourceOriginCoverage
+        | Just owned => source_origin_capture_occurrences unit before after rows marks owned
+        end
+      end
+    end
+  end;
+
+def source_module_slot_relation (owner : Nat) (before : List Decl)
+    (after : List Decl) : List SourceModuleSlot :=
+  let complete : Bool := eqNat (length Decl before) (length Decl after) in
+  (fix go (remaining : List Decl) (originals : List Decl) : List SourceModuleSlot :=
+    match remaining with
+    | Nil => []
+    | Cons decl rest =>
+        let current : Pair Nat Nat := source_decl_slot decl in
+        let original : Pair (Maybe (Pair Nat Nat)) (List Decl) :=
+          match originals with
+          | Nil => MkPair (Maybe (Pair Nat Nat)) (List Decl)
+              (Nothing (Pair Nat Nat)) []
+          | Cons prior tail =>
+              let previous : Pair Nat Nat := source_decl_slot prior in
+              MkPair (Maybe (Pair Nat Nat)) (List Decl)
+                (match current with | MkPair current_kind _ =>
+                  match previous with | MkPair prior_kind _ =>
+                    match andb(complete, eqNat current_kind prior_kind) with
+                    | True => Just (Pair Nat Nat) previous
+                    | False => Nothing (Pair Nat Nat)
+                    end
+                  end end) tail
+          end in
+        match original with | MkPair prior tail =>
+          Cons SourceModuleSlot
+            (SourceModuleSlotOf owner
+              (MkPair (Pair Nat Nat) (Maybe (Pair Nat Nat)) current prior))
+            (go rest tail)
+        end
+    end) after before;
+
+def source_module_unit_slots : List SrcUnit -> List SourceModuleSlot :=
+  fix go (units : List SrcUnit) : List SourceModuleSlot :=
+    match units with
+    | Nil => []
+    | Cons unit rest => match unit with | MkSrcUnit owner _ =>
+        let decls : List Decl := src_unit_decls unit in
+        append SourceModuleSlot (source_module_slot_relation owner decls decls) (go rest)
+      end
+    end;
+
+def source_module_original_slot (owner : Nat) (scoped : Pair Nat Nat)
+    (slots : List SourceModuleSlot) : Maybe (Pair Nat Nat) :=
+  let candidates : List SourceModuleSlot := filter SourceModuleSlot
+    (fun (row : SourceModuleSlot) => match row with | SourceModuleSlotOf unit relation =>
+      match relation with | MkPair current _ =>
+        andb(eqNat owner unit, source_slot_equal scoped current)
+      end end) slots in
+  match candidates with
+  | Nil => Nothing (Pair Nat Nat)
+  | Cons row rest => match rest with
+      | Cons _ _ => Nothing (Pair Nat Nat)
+      | Nil => match row with | SourceModuleSlotOf _ relation =>
+          match relation with | MkPair current original => match original with
+          | Nothing => Nothing (Pair Nat Nat)
+          | Just prior => match current with | MkPair current_kind _ =>
+              match prior with | MkPair prior_kind _ =>
+                match eqNat current_kind prior_kind with
+                | True => original
+                | False => Nothing (Pair Nat Nat)
+                end
+              end end
+          end end
+        end
+      end
+  end;
+
+def source_checked_entry_slot (entry : Entry) : Pair Nat Nat :=
+  match entry with
+  | MkEntry name _ body => match body with
+      | Just _ => MkPair Nat Nat 0 name
+      | Nothing => MkPair Nat Nat 1 name
+      end
+  | MkIndEntry name _ => MkPair Nat Nat 2 name
+  | MkBoundEntry name _ binding => match binding with
+      | PrimitiveIntrinsicBinding _ _ _ _ => MkPair Nat Nat 5 name
+      | PrimitiveExternBinding _ => MkPair Nat Nat 6 name
+      end
+  | MkRoleEntry binding => match binding with | PrimitiveRoleOf _ shape =>
+      match shape with | PrimitiveInductiveOf name _ _ _ _ => MkPair Nat Nat 7 name end
+    end
+  end;
+
+def source_checked_unaligned_candidates (slot : Pair Nat Nat)
+    : List SourceDecl -> List (Maybe (Pair Nat (Pair Nat Nat))) :=
+  fix go (sources : List SourceDecl) : List (Maybe (Pair Nat (Pair Nat Nat))) :=
+    match sources with
+    | Nil => []
+    | Cons source rest => match source with | SourceDeclOf _ decl =>
+        let tail : List (Maybe (Pair Nat (Pair Nat Nat))) := go rest in
+        match source_slot_equal slot (source_decl_slot decl) with
+        | True => Cons (Maybe (Pair Nat (Pair Nat Nat)))
+            (Nothing (Pair Nat (Pair Nat Nat))) tail
+        | False => tail
+        end
+      end
+    end;
+
+-- Exhausted/misaligned origins still contribute unknown matching candidates.
+def source_checked_owner_candidates (slot : Pair Nat Nat) (slots : List SourceModuleSlot)
+    (sources : List SourceDecl) (decls : List Decl)
+    : List (Maybe (Pair Nat (Pair Nat Nat))) :=
+  (fix go (remaining : List Decl) (origins : List SourceDecl)
+      : List (Maybe (Pair Nat (Pair Nat Nat))) :=
+    match remaining with
+    | Nil => source_checked_unaligned_candidates slot origins
+    | Cons decl rest =>
+        let position : Pair (Maybe Nat) (List SourceDecl) := match origins with
+          | Nil => MkPair (Maybe Nat) (List SourceDecl) (Nothing Nat) []
+          | Cons source tail => match source with | SourceDeclOf unit prior =>
+              MkPair (Maybe Nat) (List SourceDecl)
+                (match source_decl_same_slot prior decl with
+                 | False => Nothing Nat | True => unit end) tail
+            end
+          end in
+        match position with | MkPair unit tail =>
+          let others : List (Maybe (Pair Nat (Pair Nat Nat))) := go rest tail in
+          match source_slot_equal slot (source_decl_slot decl) with
+          | False => others
+          | True => Cons (Maybe (Pair Nat (Pair Nat Nat)))
+              (match unit with
+               | Nothing => Nothing (Pair Nat (Pair Nat Nat))
+               | Just owner => match source_module_original_slot owner
+                   (source_decl_slot decl) slots with
+                   | Nothing => Nothing (Pair Nat (Pair Nat Nat))
+                   | Just original => Just (Pair Nat (Pair Nat Nat))
+                       (MkPair Nat (Pair Nat Nat) owner original)
+                   end
+               end) others
+          end
+        end
+    end) decls sources;
+
+def source_checked_owners (slots : List SourceModuleSlot)
+    (sources : List SourceDecl) (decls : List Decl) (entries : List Entry)
+    : List SourceCheckedOwner :=
+  let slot_key (slot : Pair Nat Nat) : List Nat :=
+    let (MkPair kind name) := slot in [add kind Z, add name Z] in
+  let duplicates : SourceNameIndex :=
+    (fix collect (remaining : List Entry) (seen : SourceNameIndex)
+        (repeated : SourceNameIndex) : SourceNameIndex :=
+      match remaining with
+      | Nil => repeated
+      | Cons entry rest =>
+          let key : List Nat := slot_key (source_checked_entry_slot entry) in
+          match source_name_index_lookup key seen with
+          | Nothing => collect rest (source_name_index_insert key Z seen) repeated
+          | Just _ => collect rest seen (source_name_index_insert key Z repeated)
+          end
+      end) entries SourceNameIndexEmpty SourceNameIndexEmpty in
+  map Entry SourceCheckedOwner (fun (entry : Entry) =>
+    let slot : Pair Nat Nat := source_checked_entry_slot entry in
+    SourceCheckedOwnerOf entry
+      (match source_name_index_lookup (slot_key slot) duplicates with
+       | Just _ => Nothing (Pair Nat (Pair Nat Nat))
+       | Nothing => match source_checked_owner_candidates slot slots sources decls with
+           | Nil => Nothing (Pair Nat (Pair Nat Nat))
+           | Cons owner rest => match rest with
+               | Nil => owner
+               | Cons _ _ => Nothing (Pair Nat (Pair Nat Nat))
+               end
+           end
+       end)) entries;
+
+def checked_source_packet_program (packet : CheckedSourcePacket) : CheckedProgram :=
+  match packet with | CheckedSourcePacketOf checked _ => checked end;
+
+def checked_source_packet_slots (packet : CheckedSourcePacket) : List SourceModuleSlot :=
+  match packet with | CheckedSourcePacketOf _ metadata =>
+    match metadata with | MkPair slots _ => slots end
+  end;
+
+def checked_source_packet_owners (packet : CheckedSourcePacket) : List SourceCheckedOwner :=
+  match packet with | CheckedSourcePacketOf _ metadata =>
+    match metadata with | MkPair _ owners => owners end
+  end;
+
+def checked_source_packet_project (result : SourceResult CheckedSourcePacket)
+    : SourceResult CheckedProgram :=
+  match result with
+  | SourceErr failure => SourceErr CheckedProgram failure
+  | SourceOk packet => SourceOk CheckedProgram (checked_source_packet_program packet)
+  end;
+
+-- @export checked_source_packet_snapshot; @doc docs/tcb.md
+def checked_source_packet_snapshot (result : SourceResult CheckedSourcePacket) (state : InternState)
+    : Pair (SourceResult CheckedSourcePacket) InternState :=
+  MkPair (SourceResult CheckedSourcePacket) InternState result state;
+
+inductive SourceOriginMetadata : Type :=
+  | SourceOriginMetadataOf : Pair (List SourceModuleSlot) (List OwnedSourceOccurrence) ->
+      List (Pair Entry (Maybe OriginalEnvelope)) -> SourceOriginMetadata;
+
+inductive SourceOriginCompilation : Type :=
+  | SourceOriginCompilationOf : Pair (SourceResult CheckedSourcePacket) InternState ->
+      Either SourceOriginError SourceOriginMetadata -> SourceOriginCompilation;
+
+def source_origin_entry_rows (packet : CheckedSourcePacket) (occurrences : List OwnedSourceOccurrence)
+    : List (Pair Entry (Maybe OriginalEnvelope)) :=
+  map SourceCheckedOwner (Pair Entry (Maybe OriginalEnvelope))
+    (fun (row : SourceCheckedOwner) => match row with | SourceCheckedOwnerOf entry owner =>
+      MkPair Entry (Maybe OriginalEnvelope) entry
+        (match owner with
+         | Nothing => Nothing OriginalEnvelope
+         | Just location => match location with | MkPair unit slot =>
+           source_origin_occurrence unit slot occurrences
+           end
+         end)
+      end) (checked_source_packet_owners packet);
+
+def source_origin_compilation_finish
+    (observed : Pair (Pair (SourceResult CheckedSourcePacket) InternState)
+      (Either SourceOriginError (Pair (List SourceModuleSlot) (List OwnedSourceOccurrence))))
+    : SourceOriginCompilation :=
+  match observed with | MkPair original metadata =>
+    SourceOriginCompilationOf original
+      (match metadata with
+       | Left error => Left SourceOriginError SourceOriginMetadata error
+       | Right locations => match original with | MkPair result _ =>
+         match locations with | MkPair _ occurrences =>
+           Right SourceOriginError SourceOriginMetadata
+             (SourceOriginMetadataOf locations
+               (match result with
+                | SourceErr _ => []
+                | SourceOk packet => source_origin_entry_rows packet occurrences
+                end))
+         end end
+       end)
+  end;
+
+def source_origin_compilation_original (compilation : SourceOriginCompilation)
+    : Pair (SourceResult CheckedSourcePacket) InternState :=
+  match compilation with | SourceOriginCompilationOf original _ => original end;
+
+def source_origin_compilation_metadata (compilation : SourceOriginCompilation)
+    : Either SourceOriginError SourceOriginMetadata :=
+  match compilation with | SourceOriginCompilationOf _ metadata => metadata end;
+
+def source_origin_failure_span (owner : SourceFailureOwner) (metadata : SourceOriginMetadata)
+    : Maybe (Pair Nat Nat) :=
+  match owner with | SourceFailureOwnerOf declaration location =>
+    match declaration with | MkPair name _ => match location with | MkPair unit _ =>
+      match unit with
+      | Nothing => Nothing (Pair Nat Nat)
+      | Just actual_unit => match metadata with | SourceOriginMetadataOf locations _ =>
+        match locations with | MkPair slots occurrences =>
+          let candidates : List SourceModuleSlot := filter SourceModuleSlot
+            (fun (row : SourceModuleSlot) => match row with | SourceModuleSlotOf candidate relation =>
+              match relation with | MkPair current _ => match current with | MkPair _ current_name =>
+                andb(eqNat actual_unit candidate, eqNat name current_name)
+              end end end) slots in
+          match candidates with
+          | Nil => Nothing (Pair Nat Nat)
+          | Cons row rest => match rest with
+            | Cons _ _ => Nothing (Pair Nat Nat)
+            | Nil => match row with | SourceModuleSlotOf _ relation => match relation with
+              | MkPair current _ => match source_module_original_slot actual_unit current slots with
+                | Nothing => Nothing (Pair Nat Nat)
+                | Just original => match source_origin_occurrence actual_unit original occurrences with
+                  | Nothing => Nothing (Pair Nat Nat)
+                  | Just envelope => Just (Pair Nat Nat) (original_envelope_span envelope)
+                  end
+                end
+              end end
+            end
+          end
+        end end
+      end
+    end end
+  end;
+
+def source_origin_failure_with_span (failure : SourceFailure) (metadata : SourceOriginMetadata) : SourceFailure :=
+  match failure with | SourceFailureOf error tagged => match tagged with | MkPair owner cause =>
+    SourceFailureOf error
+      (MkPair (Maybe SourceFailureOwner) (Maybe LowerRootCause)
+        (match owner with
+         | Nothing => Nothing SourceFailureOwner
+         | Just actual => match actual with | SourceFailureOwnerOf declaration location =>
+           match location with | MkPair unit _ =>
+             Just SourceFailureOwner
+               (SourceFailureOwnerOf declaration
+                 (MkPair (Maybe Nat) (Maybe (Pair Nat Nat)) unit (source_origin_failure_span actual metadata)))
+           end end
+         end) cause)
+  end end;
+
+def source_origin_compilation_with_spans (compilation : SourceOriginCompilation)
+    : Either SourceOriginError (Pair (SourceResult CheckedSourcePacket) InternState) :=
+  match compilation with | SourceOriginCompilationOf original metadata =>
+    match metadata with
+    | Left error => Left SourceOriginError (Pair (SourceResult CheckedSourcePacket) InternState) error
+    | Right locations => match original with | MkPair result state =>
+      Right SourceOriginError (Pair (SourceResult CheckedSourcePacket) InternState)
+        (MkPair (SourceResult CheckedSourcePacket) InternState
+          (match result with
+           | SourceErr failure => SourceErr CheckedSourcePacket (source_origin_failure_with_span failure locations)
+           | SourceOk checked => SourceOk CheckedSourcePacket checked
+           end) state)
+      end
+    end
+  end;
+
+-- @export checked_source_packet_reject; @doc docs/tcb.md
+def checked_source_packet_reject (error : CompError) : SourceResult CheckedSourcePacket :=
+  SourceErr CheckedSourcePacket (source_failure_unknown error);
+
+private def lower_definitions
+  (A : Type)
+  (make_definition : Nat -> Maybe Nat -> Surface -> LoweredSurface -> A)
+  (lower_expr : LowerEnv -> Maybe Surface -> Expr -> LoweredSurface)
+  (env : LowerEnv) (sources : List SourceDecl) (decls : List Decl) : List A :=
+  (fix go (rest : List Decl) (origins : List SourceDecl) : List A :=
+    match rest with
+    | Nil => Nil A
+    | Cons decl tail =>
+        let slot : Pair (Maybe Nat) (List SourceDecl) := match origins with
+          | Nil => MkPair (Maybe Nat) (List SourceDecl) (Nothing Nat) (Nil SourceDecl)
+          | Cons original next => match original with | SourceDeclOf unit before =>
+              MkPair (Maybe Nat) (List SourceDecl)
+                (match source_decl_same_slot before decl with
+                 | True => unit | False => Nothing Nat end) next
+              end
+          end in
+        match slot with | MkPair unit next =>
+          match decl with
+          | DDef name typ body _ _ =>
+              let annotation : Surface := lowered_surface_value
+                (lower_expr env (Nothing Surface) typ) in
+              Cons A
+                (make_definition name unit annotation (lower_expr env (Just Surface annotation) body))
+                (go tail next)
+          | DAxiom _ _ => go tail next
+          | DIntrinsic _ _ _ _ => go tail next
+          | DExtern _ _ _ => go tail next
+          | DRepresentation _ _ => go tail next
+          | DInductive _ _ _ _ _ => go tail next
+          | DEffect _ _ _ => go tail next
+          | DImport _ => go tail next
+          end
+        end
+    end) decls sources;
+
+def lower_decls_env_with_cause
+  (lower_expr : LowerEnv -> Maybe Surface -> Expr -> LoweredSurface)
+  (env : LowerEnv) (sources : List SourceDecl) (decls : List Decl) : List LoweredDecl :=
+  lower_definitions LoweredDecl
+    (fun (name : Nat) (unit : Maybe Nat) (_annotation : Surface) (body : LoweredSurface) =>
+      LoweredDeclOf name (MkPair (Maybe Nat) LoweredSurface unit body))
+    lower_expr env sources decls;
+
+private def lowered_decl_surface (decl : LoweredDecl) : Pair Nat Surface :=
+  match decl with | LoweredDeclOf name payload => match payload with
+    | MkPair _ lowered => MkPair Nat Surface name (lowered_surface_value lowered)
+  end end;
+
+private def prepared_definition_body (row : Pair LoweredDecl Surface) : LoweredDecl :=
+  let (MkPair body _) := row in body;
+
+def lowered_decl_surfaces (decls : List LoweredDecl) : List (Pair Nat Surface) :=
+  map LoweredDecl (Pair Nat Surface) lowered_decl_surface decls;
+
+private def rewrite_lowered_surface (lowered : LoweredSurface) : LoweredSurface :=
+  match lowered with | LoweredSurfaceOf surface cause =>
+    LoweredSurfaceOf (rewrite_dummy_anns surface) cause
+  end;
+
+def rewrite_lowered_decls (decls : List LoweredDecl) : List LoweredDecl :=
+  map LoweredDecl LoweredDecl (fun (decl : LoweredDecl) =>
+    match decl with | LoweredDeclOf name payload => match payload with
+      | MkPair unit lowered =>
+          LoweredDeclOf name (MkPair (Maybe Nat) LoweredSurface unit
+            (rewrite_lowered_surface lowered))
+      end end) decls;
+
 def lower_decls_env
   (lower_expr_env2 : LowerEnv -> Maybe Surface -> Expr -> Surface)
-  (env : LowerEnv) : List Decl -> List (Pair Nat Surface) :=
-  fix go (rest : List Decl) : List (Pair Nat Surface) :=
-    match rest with
-    | Nil => Nil (Pair Nat Surface)
-    | Cons d rest' =>
-        match d with
-        | DDef n ty body _ _ =>
-            let tyS : Surface := lower_expr_env2 env (Nothing Surface) ty in
-            Cons (Pair Nat Surface)
-              (MkPair Nat Surface n
-                (lower_expr_env2 env (Just Surface tyS) body))
-              (go rest')
-        | DAxiom _ _ => go rest'
-        | DIntrinsic _ _ _ _ => go rest'
-        | DExtern _ _ _ => go rest'
-        | DRepresentation _ _ => go rest'
-        | DInductive _ _ _ _ _ => go rest'
-        | DEffect _ _ _ => go rest'
-        | DImport _ => go rest'
-        end
-    end;
+  (env : LowerEnv) (decls : List Decl) : List (Pair Nat Surface) :=
+  lowered_decl_surfaces
+    (lower_decls_env_with_cause
+      (fun (environment : LowerEnv) (expected : Maybe Surface) (expr : Expr) =>
+        LoweredSurfaceOf (lower_expr_env2 environment expected expr) (Nothing LowerRootCause))
+      env (source_decls_without_unit decls) decls);
 
 -- SVar 0 in a binder annotation is the underscore dummy. SInd 0 keeps the
 -- established runtime binder shape; expected-directed declaration checking
@@ -320,9 +870,7 @@ def rewrite_surface_pairs : List (Pair Nat Surface) -> List (Pair Nat Surface) :
     end;
 
 def pipeline_env_io_id (env : LowerEnv) : Nat :=
-    match env with
-    | MkLowerEnv _ _ _ specials _ _ _ => compiler_nth_nat 2 specials
-    end;
+    env_ioId env;
 
 def pipeline_surface_result : Surface -> Surface :=
   fix pipeline_surface_result (surface : Surface) : Surface :=
@@ -345,43 +893,9 @@ def pipeline_surface_result : Surface -> Surface :=
     end;
 
 def pipeline_io_payload (env : LowerEnv) (surface : Surface) : Maybe Surface :=
-    match pipeline_surface_result surface with
-    | SApp head _payload =>
-        match head with
-        | SConst name =>
-            match eqNat(name, pipeline_env_io_id env) with
-            | True => Just Surface surface
-            | False => Nothing Surface
-            end
-        | SVar _ => Nothing Surface
-        | SSort _ => Nothing Surface
-        | SPi _ _ _ => Nothing Surface
-        | SLam _ _ _ => Nothing Surface
-        | SApp _ _ => Nothing Surface
-        | SLet _ _ _ _ => Nothing Surface
-        | SInd _ => Nothing Surface
-        | SConstruct _ _ _ => Nothing Surface
-        | SCase _ _ _ _ => Nothing Surface
-        | SFix _ _ _ _ _ => Nothing Surface
-        | SHole _ => Nothing Surface
-        | SEffectRow _ => Nothing Surface
-        | SPerform _ _ => Nothing Surface
-        | SStr _ _ => Nothing Surface
-        end
-    | SVar _ => Nothing Surface
-    | SSort _ => Nothing Surface
-    | SPi _ _ _ => Nothing Surface
-    | SLam _ _ _ => Nothing Surface
-    | SLet _ _ _ _ => Nothing Surface
-    | SConst _ => Nothing Surface
-    | SInd _ => Nothing Surface
-    | SConstruct _ _ _ => Nothing Surface
-    | SCase _ _ _ _ => Nothing Surface
-    | SFix _ _ _ _ _ => Nothing Surface
-    | SHole _ => Nothing Surface
-    | SEffectRow _ => Nothing Surface
-    | SPerform _ _ => Nothing Surface
-    | SStr _ _ => Nothing Surface
+    match peel_io_payload env (pipeline_surface_result surface) with
+    | Just _ => Just Surface surface
+    | Nothing => Nothing Surface
     end;
 
 def collect_io_payloads
@@ -601,28 +1115,44 @@ def surfaces_have_hole : List (Pair Nat Surface) -> Bool :=
 
 -- Declaration checker plan. These helpers preserve declared types, axioms,
 -- inductives, and effects while pairing each DDef with the exact emitted body.
+def compile_surfaces_with_location
+  (compile_program : List (Pair Nat Surface) ->
+    Pair (CompResult (List (Pair Nat CoreTerm))) (Maybe CompileProgramLocation))
+  (elaborate_surfaces : Nat -> List (Pair Nat Surface) -> List (Pair Nat CoreTerm))
+  (fuel : Nat) (surfaces : List (Pair Nat Surface))
+  : Pair (CompResult (List (Pair Nat CoreTerm))) (Maybe CompileProgramLocation) :=
+  match compile_program surfaces with
+  | MkPair result owner => match result with
+    | COk cores => MkPair (CompResult (List (Pair Nat CoreTerm))) (Maybe CompileProgramLocation)
+        (COk (List (Pair Nat CoreTerm)) cores) (Nothing CompileProgramLocation)
+    | CErr error => match error with | ErrCode code _ =>
+        match eqNat code 2 with
+        | False => MkPair (CompResult (List (Pair Nat CoreTerm))) (Maybe CompileProgramLocation)
+            (CErr (List (Pair Nat CoreTerm)) error) owner
+        | True => match andb (surfaces_depth_at_least depth_gate surfaces)
+            (notb (surfaces_have_hole surfaces)) with
+            | False => MkPair (CompResult (List (Pair Nat CoreTerm))) (Maybe CompileProgramLocation)
+                (CErr (List (Pair Nat CoreTerm)) error) owner
+            | True => MkPair (CompResult (List (Pair Nat CoreTerm))) (Maybe CompileProgramLocation)
+                (COk (List (Pair Nat CoreTerm)) (elaborate_surfaces fuel surfaces))
+                (Nothing CompileProgramLocation)
+            end
+        end end
+    end
+  end;
+
 def compile_surfaces
   (compile_program : List (Pair Nat Surface) -> CompResult (List (Pair Nat CoreTerm)))
   (elaborate_surfaces : Nat -> List (Pair Nat Surface) -> List (Pair Nat CoreTerm))
   (fuel : Nat) (surfaces : List (Pair Nat Surface))
   : CompResult (List (Pair Nat CoreTerm)) :=
-    match compile_program surfaces with
-    | COk cores => COk(List (Pair Nat CoreTerm), cores)
-    | CErr e =>
-        match e with
-        | ErrCode c _d =>
-            match eqNat(c, S (S Z)) with
-            | False => CErr(List (Pair Nat CoreTerm), e)
-            | True =>
-                match andb (surfaces_depth_at_least depth_gate surfaces)
-                  (notb (surfaces_have_hole surfaces)) with
-                | False => CErr(List (Pair Nat CoreTerm), e)
-                | True => COk (List (Pair Nat CoreTerm))
-                    (elaborate_surfaces fuel surfaces)
-                end
-            end
-        end
-    end;
+  match compile_surfaces_with_location
+      (fun (items : List (Pair Nat Surface)) =>
+        MkPair (CompResult (List (Pair Nat CoreTerm))) (Maybe CompileProgramLocation)
+          (compile_program items) (Nothing CompileProgramLocation))
+      elaborate_surfaces fuel surfaces with
+  | MkPair result _ => result
+  end;
 
 def decl_check_names : List Decl -> List Nat :=
   fix decl_check_names (decls : List Decl) : List Nat :=
@@ -715,6 +1245,56 @@ def checked_emitted_cores (checked : List Entry)
         end
     end;
 
+inductive CheckedEmittedResult : Type :=
+  | CheckedEmittedError : CompError -> CheckedEmittedResult
+  | CheckedEmittedDeclarationError : List FileItem -> Nat -> CheckPhase -> CheckFailure -> CheckedEmittedResult
+  | CheckedEmittedOk : CheckedProgram -> CheckedEmittedResult;
+
+def checked_emitted_declaration_error (name : Nat) (phase : CheckPhase)
+    (failure : CheckFailure) : CompError :=
+  ErrCode (add 40 (declaration_failure_code CheckSourceCore phase failure)) name;
+
+def checked_emitted_comp_result (result : CheckedEmittedResult) : CompResult CheckedProgram :=
+  match result with
+  | CheckedEmittedError error => CErr CheckedProgram error
+  | CheckedEmittedDeclarationError _ name phase failure =>
+      CErr CheckedProgram (checked_emitted_declaration_error name phase failure)
+  | CheckedEmittedOk checked => COk CheckedProgram checked
+  end;
+
+private def check_emitted_plan_result
+  (check_module : Nat -> List Nat -> List FileItem -> DeclarationResult)
+  (selected : List Nat) (fuel : Nat) (st : InternState)
+  (cores : List (Pair Nat CoreTerm)) (plan : CheckPlan)
+  : CheckedEmittedResult :=
+    match plan with
+    | CheckPlanErr detail =>
+        CheckedEmittedError (ErrCode 46 detail)
+    | CheckPlanOk items =>
+        match resolve_literal_plan fuel st items with
+        | CErr error => CheckedEmittedError error
+        | COk resolved => match check_module fuel selected resolved with
+        | DeclarationsOk checked =>
+            match checked_emitted_cores checked cores with
+            | CErr failure => CheckedEmittedError failure
+            | COk emitted => CheckedEmittedOk (CheckedProgramOf st checked emitted)
+            end
+        | DeclarationsErr name phase failure =>
+            CheckedEmittedDeclarationError resolved name phase failure
+        end
+        end
+    end;
+
+def check_emitted_decls_result
+  (check_module : Nat -> List Nat -> List FileItem -> DeclarationResult)
+  (lower_expr_env2 : LowerEnv -> Maybe Surface -> Expr -> Surface)
+  (elaborate : Nat -> Surface -> List Nat -> CoreTerm)
+  (selected : List Nat) (fuel : Nat) (st : InternState) (env : LowerEnv) (decls : List Decl)
+  (cores : List (Pair Nat CoreTerm))
+  : CheckedEmittedResult :=
+    check_emitted_plan_result check_module selected fuel st cores
+      (build_check_plan lower_expr_env2 elaborate fuel env st decls cores);
+
 def check_emitted_decls
   (check_module : Nat -> List Nat -> List FileItem -> DeclarationResult)
   (lower_expr_env2 : LowerEnv -> Maybe Surface -> Expr -> Surface)
@@ -722,22 +1302,103 @@ def check_emitted_decls
   (selected : List Nat) (fuel : Nat) (st : InternState) (env : LowerEnv) (decls : List Decl)
   (cores : List (Pair Nat CoreTerm))
   : CompResult CheckedProgram :=
-    match build_check_plan lower_expr_env2 elaborate fuel env st decls cores with
-    | CheckPlanErr detail =>
-        CErr(CheckedProgram, ErrCode 46 detail)
-    | CheckPlanOk items =>
-        literal_bind (List FileItem) CheckedProgram (resolve_literal_plan fuel st items)
-          (fun (resolved : List FileItem) => match check_module fuel selected resolved with
-        | DeclarationsOk checked =>
-            match checked_emitted_cores checked cores with
-            | CErr failure => CErr CheckedProgram failure
-            | COk emitted => COk(CheckedProgram, CheckedProgramOf st checked emitted)
-            end
-        | DeclarationsErr name phase failure =>
-            CErr CheckedProgram
-              (ErrCode(add(40, declaration_failure_code CheckSourceCore phase failure), name))
-        end)
-    end;
+  checked_emitted_comp_result
+    (check_emitted_decls_result check_module lower_expr_env2 elaborate
+      selected fuel st env decls cores);
+
+def source_checked_definition_units (name : Nat) (sources : List SourceDecl)
+    (decls : List Decl) : List (Maybe Nat) :=
+  (fix collect (rest : List Decl) (origins : List SourceDecl) : List (Maybe Nat) :=
+    match rest with
+    | Nil => []
+    | Cons decl tail =>
+        let slot : Pair (Maybe Nat) (List SourceDecl) := match origins with
+          | Nil => MkPair (Maybe Nat) (List SourceDecl) (Nothing Nat) (Nil SourceDecl)
+          | Cons original next => match original with | SourceDeclOf unit before =>
+              MkPair (Maybe Nat) (List SourceDecl)
+                (match source_decl_same_slot before decl with
+                 | True => unit | False => Nothing Nat end) next
+              end
+          end in
+        match slot with | MkPair unit next =>
+          let remaining : List (Maybe Nat) := collect tail next in
+          match decl with
+          | DDef current _ _ _ _ => match eqNat current name with
+              | False => remaining
+              | True => Cons (Maybe Nat) unit remaining
+              end
+          | DAxiom _ _ => remaining | DInductive _ _ _ _ _ => remaining
+          | DEffect _ _ _ => remaining | DImport _ => remaining
+          | DIntrinsic _ _ _ _ => remaining | DExtern _ _ _ => remaining
+          | DRepresentation _ _ => remaining
+          end
+        end
+    end) decls sources;
+
+def source_checked_definition_owner (items : List FileItem) (name : Nat)
+    (sources : List SourceDecl) (decls : List Decl) : Maybe SourceFailureOwner :=
+  match filter FileItem (fun (item : FileItem) => match item with
+    | FDef current _ _ => eqNat current name
+    | FAxiom current _ => eqNat current name
+    | FInd declaration => match declaration with | MkIndDecl current _ _ _ _ => eqNat current name end
+    | FIntrinsic current _ _ _ => eqNat current name
+    | FExtern current _ _ => eqNat current name
+    | FRepresentation current _ => eqNat current name
+    end) items with
+  | Nil => Nothing SourceFailureOwner
+  | Cons item rest => match rest with
+      | Cons _ _ => Nothing SourceFailureOwner
+      | Nil => match item with
+          | FDef _ _ _ => match source_checked_definition_units name sources decls with
+              | Nil => Nothing SourceFailureOwner
+              | Cons unit remaining => match remaining with
+                  | Cons _ _ => Nothing SourceFailureOwner
+                  | Nil => match unit with
+                      | Nothing => Nothing SourceFailureOwner
+                      | Just path => Just SourceFailureOwner
+                          (SourceFailureOwnerOf (MkPair Nat CompileProgramPhase name CompileCorePhase)
+                            (MkPair (Maybe Nat) (Maybe (Pair Nat Nat))
+                              (Just Nat path) (Nothing (Pair Nat Nat))))
+                      end
+                  end
+              end
+          | FAxiom _ _ => Nothing SourceFailureOwner
+          | FInd _ => Nothing SourceFailureOwner
+          | FIntrinsic _ _ _ _ => Nothing SourceFailureOwner
+          | FExtern _ _ _ => Nothing SourceFailureOwner
+          | FRepresentation _ _ => Nothing SourceFailureOwner
+          end
+      end
+  end;
+
+def checked_emitted_source_result (sources : List SourceDecl) (decls : List Decl)
+    (result : CheckedEmittedResult) : SourceResult CheckedProgram :=
+  match result with
+  | CheckedEmittedError error => SourceErr CheckedProgram (source_failure_unknown error)
+  | CheckedEmittedOk checked => SourceOk CheckedProgram checked
+  | CheckedEmittedDeclarationError items name phase failure =>
+      let owner : Maybe SourceFailureOwner := match phase with
+        | CheckDeclarationType => source_checked_definition_owner items name sources decls
+        | CheckDeclarationBody => source_checked_definition_owner items name sources decls
+        | CheckDeclarationPlan => Nothing SourceFailureOwner
+        | CheckInductiveDeclaration => Nothing SourceFailureOwner
+        end in
+      SourceErr CheckedProgram
+        (SourceFailureOf (checked_emitted_declaration_error name phase failure)
+          (MkPair (Maybe SourceFailureOwner) (Maybe LowerRootCause)
+            owner (Nothing LowerRootCause)))
+  end;
+
+
+def checked_emitted_packet_result (slots : List SourceModuleSlot) (sources : List SourceDecl)
+    (decls : List Decl) (result : CheckedEmittedResult) : SourceResult CheckedSourcePacket :=
+  match checked_emitted_source_result sources decls result with
+  | SourceErr failure => SourceErr CheckedSourcePacket failure
+  | SourceOk checked => SourceOk CheckedSourcePacket
+      (CheckedSourcePacketOf checked
+        (MkPair (List SourceModuleSlot) (List SourceCheckedOwner) slots
+          (source_checked_owners slots sources decls (checked_program_entries checked))))
+  end;
 
 -- Declaration compilation receives a closed import graph. A remaining import
 -- has no supplied unit and must not disappear during lowering or plan building.
@@ -921,6 +1582,233 @@ def first_residual_open_decls : List Decl -> Maybe Nat :=
 -- Canonical stitch: desugar matches, collect env, lower, rewrite dummy
 -- anns, compile_program, fuel32 fallback to elaborate_surfaces, then check the
 -- ordered declaration plan against the exact emitted bodies.
+def lowered_root_cause (lowered : LoweredSurface) : Maybe LowerRootCause :=
+  match lowered with | LoweredSurfaceOf surface cause => match surface with
+    | SHole name => match cause with
+        | Nothing => Nothing LowerRootCause
+        | Just root => match root with
+          | LowerRootList _ => match eqNat name Z with
+              | True => cause | False => Nothing LowerRootCause end
+          | LowerRootNamedHole expected => match andb(eqNat name expected, notb(eqNat name Z)) with
+              | True => cause | False => Nothing LowerRootCause end
+          end
+        end
+    | SVar _ => Nothing LowerRootCause
+    | SSort _ => Nothing LowerRootCause
+    | SPi _ _ _ => Nothing LowerRootCause
+    | SLam _ _ _ => Nothing LowerRootCause
+    | SApp _ _ => Nothing LowerRootCause
+    | SLet _ _ _ _ => Nothing LowerRootCause
+    | SConst _ => Nothing LowerRootCause
+    | SInd _ => Nothing LowerRootCause
+    | SConstruct _ _ _ => Nothing LowerRootCause
+    | SCase _ _ _ _ => Nothing LowerRootCause
+    | SFix _ _ _ _ _ => Nothing LowerRootCause
+    | SEffectRow _ => Nothing LowerRootCause
+    | SPerform _ _ => Nothing LowerRootCause
+    | SStr _ _ => Nothing LowerRootCause
+    end end;
+
+private def source_program_failure_from
+    (A : Type) (select_decl : A -> LoweredDecl) (decls : List A)
+    (location : CompileProgramLocation) (error : CompError) : SourceFailure :=
+  match location with | CompileProgramLocationOf owner ordinal =>
+    let selected : Maybe LoweredDecl :=
+      (fix at (rest : List A) (index : Nat) : Maybe LoweredDecl :=
+        match rest with
+        | Nil => Nothing LoweredDecl
+        | Cons decl tail => match index with
+          | Z => Just LoweredDecl (select_decl decl)
+          | S previous => at tail previous
+          end
+        end) decls ordinal in
+    let info : Pair (Maybe Nat) (Maybe LowerRootCause) := match selected with
+      | Nothing => MkPair (Maybe Nat) (Maybe LowerRootCause)
+          (Nothing Nat) (Nothing LowerRootCause)
+      | Just decl => match decl with | LoweredDeclOf actual payload => match owner with
+          | MkPair expected phase => match eqNat actual expected with
+            | False => MkPair (Maybe Nat) (Maybe LowerRootCause)
+                (Nothing Nat) (Nothing LowerRootCause)
+            | True => match payload with | MkPair unit lowered =>
+                MkPair (Maybe Nat) (Maybe LowerRootCause) unit
+                  (match phase with
+                   | CompileSurfacePhase => match error with | ErrCode code detail =>
+                       match andb(eqNat code 2, eqNat detail 0) with
+                       | True => lowered_root_cause lowered | False => Nothing LowerRootCause end
+                       end
+                   | CompileFutureSlotPhase => Nothing LowerRootCause
+                   | CompileDuplicatePhase => Nothing LowerRootCause
+                   | CompileFutureGlobalPhase => Nothing LowerRootCause
+                   | CompileCorePhase => Nothing LowerRootCause
+                   end)
+                end
+            end
+          end end
+      end in
+    match info with | MkPair unit cause =>
+      SourceFailureOf error
+        (MkPair (Maybe SourceFailureOwner) (Maybe LowerRootCause)
+          (Just SourceFailureOwner (SourceFailureOwnerOf owner
+            (MkPair (Maybe Nat) (Maybe (Pair Nat Nat)) unit (Nothing (Pair Nat Nat))))) cause)
+    end
+  end;
+
+def source_program_failure (decls : List LoweredDecl)
+    (location : CompileProgramLocation) (error : CompError) : SourceFailure :=
+  source_program_failure_from LoweredDecl (fun (decl : LoweredDecl) => decl) decls location error;
+
+def program_result_with_location (result : CompileProgramLocatedResult)
+    : Pair (CompResult (List (Pair Nat CoreTerm))) (Maybe CompileProgramLocation) :=
+  match result with
+  | CompileProgramLocatedErr location error =>
+      MkPair (CompResult (List (Pair Nat CoreTerm))) (Maybe CompileProgramLocation)
+        (CErr (List (Pair Nat CoreTerm)) error) (Just CompileProgramLocation location)
+  | CompileProgramLocatedOk cores =>
+      MkPair (CompResult (List (Pair Nat CoreTerm))) (Maybe CompileProgramLocation)
+        (COk (List (Pair Nat CoreTerm)) cores) (Nothing CompileProgramLocation)
+  end;
+
+inductive SourceDiagnostic : Type :=
+  | SourceDiagnosticOf : Pair Nat CompileProgramPhase ->
+      Pair (Maybe Nat) (Maybe LowerRootCause) -> SourceDiagnostic;
+
+-- @export source_failure_diagnostic; @doc docs/tcb.md
+def source_failure_diagnostic (failure : SourceFailure) : Maybe SourceDiagnostic :=
+  match failure with | SourceFailureOf _error metadata => match metadata with
+    | MkPair owner cause => match owner with
+      | Nothing => Nothing SourceDiagnostic
+      | Just located => match located with | SourceFailureOwnerOf declaration origin =>
+          match origin with | MkPair unit _span =>
+            Just SourceDiagnostic (SourceDiagnosticOf declaration
+              (MkPair (Maybe Nat) (Maybe LowerRootCause) unit cause))
+          end end
+      end
+    end end;
+
+-- This is the common acceptance path; compatibility adapters erase metadata.
+def compile_checked_decls_with_result
+  (A : Type)
+  (finish : List SourceDecl -> List Decl -> CheckedEmittedResult -> SourceResult A)
+  (desugar_file : List Decl -> List Decl)
+  (rewrite_declarations : Nat -> LowerEnv -> List Decl -> List Decl)
+  (lower_expr : LowerEnv -> Maybe Surface -> Expr -> LoweredSurface)
+  (compile_program : List (Pair Nat Surface) ->
+    Pair (CompResult (List (Pair Nat CoreTerm))) (Maybe CompileProgramLocation))
+  (elaborate_surfaces : Nat -> List (Pair Nat Surface) -> List (Pair Nat CoreTerm))
+  (elaborate : Nat -> Surface -> List Nat -> CoreTerm)
+  (check_module : Nat -> List Nat -> List FileItem -> DeclarationResult)
+  (selected : List Nat) (fuel : Nat) (st : InternState) (sources : List SourceDecl)
+  : SourceResult A :=
+  let ds : List Decl := source_decl_values sources in
+  let lower_value (env : LowerEnv) (expected : Maybe Surface) (expr : Expr) : Surface :=
+    lowered_surface_value (lower_expr env expected expr) in
+  match first_unresolved_import ds with
+  | Just path => SourceErr A (source_failure_unknown (ErrCode 92 path))
+  | Nothing => match first_residual_open_decls ds with
+    | Just alias => SourceErr A (source_failure_unknown (ErrCode 98 alias))
+    | Nothing =>
+        let ds1 : List Decl := desugar_file ds in
+        let base_env : LowerEnv := collect_lower_env_from st ds1 in
+        let ds2 : List Decl := rewrite_declarations fuel base_env ds1 in
+        let env : LowerEnv := populate_io_payloads lower_value base_env ds2 in
+        -- The body needs the raw annotation. The plan rewrites it before elaboration.
+        let prepared : List (Pair LoweredDecl Surface) :=
+          lower_definitions (Pair LoweredDecl Surface)
+            (fun (name : Nat) (unit : Maybe Nat) (annotation : Surface) (body : LoweredSurface) =>
+              MkPair LoweredDecl Surface
+                (LoweredDeclOf name (MkPair (Maybe Nat) LoweredSurface unit (rewrite_lowered_surface body)))
+                annotation)
+            lower_expr env sources ds2 in
+        let surfaces : List (Pair Nat Surface) :=
+          map (Pair LoweredDecl Surface) (Pair Nat Surface)
+            (fun (row : Pair LoweredDecl Surface) =>
+              lowered_decl_surface (prepared_definition_body row))
+            prepared in
+        match compile_surfaces_with_location compile_program elaborate_surfaces fuel surfaces with
+        | MkPair result owner => match result with
+          | CErr error => SourceErr A
+              (match owner with
+               | Nothing => source_failure_unknown error
+               | Just location =>
+                   source_program_failure_from (Pair LoweredDecl Surface) prepared_definition_body
+                     prepared location error
+               end)
+          | COk cores =>
+              let annotations : List (Pair Nat Surface) :=
+                map (Pair LoweredDecl Surface) (Pair Nat Surface)
+                  (fun (row : Pair LoweredDecl Surface) =>
+                    let (MkPair lowered annotation) := row in
+                    let (LoweredDeclOf name _payload) := lowered in
+                    MkPair Nat Surface name annotation)
+                  prepared in
+              finish sources ds2
+                (check_emitted_plan_result check_module selected fuel st cores
+                  (build_check_plan_with_annotations lower_value elaborate fuel env st ds2 cores
+                    (Just (List (Pair Nat Surface)) annotations)))
+          end
+        end
+    end
+  end;
+
+def compile_checked_decls_with_source_packet
+  (desugar_file : List Decl -> List Decl)
+  (rewrite_declarations : Nat -> LowerEnv -> List Decl -> List Decl)
+  (lower_expr : LowerEnv -> Maybe Surface -> Expr -> LoweredSurface)
+  (compile_program : List (Pair Nat Surface) ->
+    Pair (CompResult (List (Pair Nat CoreTerm))) (Maybe CompileProgramLocation))
+  (elaborate_surfaces : Nat -> List (Pair Nat Surface) -> List (Pair Nat CoreTerm))
+  (elaborate : Nat -> Surface -> List Nat -> CoreTerm)
+  (check_module : Nat -> List Nat -> List FileItem -> DeclarationResult)
+  (slots : List SourceModuleSlot) (selected : List Nat) (fuel : Nat) (st : InternState) (sources : List SourceDecl)
+  : SourceResult CheckedSourcePacket :=
+  compile_checked_decls_with_result CheckedSourcePacket (checked_emitted_packet_result slots)
+    desugar_file rewrite_declarations lower_expr compile_program elaborate_surfaces elaborate
+    check_module selected fuel st sources;
+
+def compile_checked_decls_with_metadata
+  (desugar_file : List Decl -> List Decl)
+  (rewrite_declarations : Nat -> LowerEnv -> List Decl -> List Decl)
+  (lower_expr : LowerEnv -> Maybe Surface -> Expr -> LoweredSurface)
+  (compile_program : List (Pair Nat Surface) ->
+    Pair (CompResult (List (Pair Nat CoreTerm))) (Maybe CompileProgramLocation))
+  (elaborate_surfaces : Nat -> List (Pair Nat Surface) -> List (Pair Nat CoreTerm))
+  (elaborate : Nat -> Surface -> List Nat -> CoreTerm)
+  (check_module : Nat -> List Nat -> List FileItem -> DeclarationResult)
+  (selected : List Nat) (fuel : Nat) (st : InternState) (sources : List SourceDecl)
+  : SourceResult CheckedProgram :=
+  compile_checked_decls_with_result CheckedProgram checked_emitted_source_result
+    desugar_file rewrite_declarations lower_expr compile_program elaborate_surfaces elaborate
+    check_module selected fuel st sources;
+
+def compile_checked_from_decls_with_source_packet
+  (desugar_file : List Decl -> List Decl)
+  (rewrite_declarations : Nat -> LowerEnv -> List Decl -> List Decl)
+  (lower_expr : LowerEnv -> Maybe Surface -> Expr -> LoweredSurface)
+  (compile_program : List (Pair Nat Surface) -> CompileProgramLocatedResult)
+  (elaborate_surfaces : Nat -> List (Pair Nat Surface) -> List (Pair Nat CoreTerm))
+  (elaborate : Nat -> Surface -> List Nat -> CoreTerm)
+  (check_module : Nat -> List Nat -> List FileItem -> DeclarationResult)
+  (slots : List SourceModuleSlot) (selected : List Nat) (fuel : Nat) (st : InternState) (sources : List SourceDecl)
+  : SourceResult CheckedSourcePacket :=
+  compile_checked_decls_with_source_packet desugar_file rewrite_declarations lower_expr
+    (fun (items : List (Pair Nat Surface)) => program_result_with_location (compile_program items))
+    elaborate_surfaces elaborate check_module slots selected fuel st sources;
+
+-- @export compile_checked_from_decls_with_origin; @doc docs/tcb.md
+def compile_checked_from_decls_with_origin
+  (desugar_file : List Decl -> List Decl)
+  (rewrite_declarations : Nat -> LowerEnv -> List Decl -> List Decl)
+  (lower_expr : LowerEnv -> Maybe Surface -> Expr -> LoweredSurface)
+  (compile_program : List (Pair Nat Surface) -> CompileProgramLocatedResult)
+  (elaborate_surfaces : Nat -> List (Pair Nat Surface) -> List (Pair Nat CoreTerm))
+  (elaborate : Nat -> Surface -> List Nat -> CoreTerm)
+  (check_module : Nat -> List Nat -> List FileItem -> DeclarationResult)
+  (selected : List Nat) (fuel : Nat) (st : InternState) (sources : List SourceDecl)
+  : SourceResult CheckedProgram :=
+  compile_checked_decls_with_metadata desugar_file rewrite_declarations lower_expr
+    (fun (items : List (Pair Nat Surface)) => program_result_with_location (compile_program items))
+    elaborate_surfaces elaborate check_module selected fuel st sources;
+
 def compile_checked_from_decls
   (desugar_file : List Decl -> List Decl)
   (rewrite_declarations : Nat -> LowerEnv -> List Decl -> List Decl)
@@ -931,26 +1819,14 @@ def compile_checked_from_decls
   (check_module : Nat -> List Nat -> List FileItem -> DeclarationResult)
   (selected : List Nat) (fuel : Nat) (st : InternState) (ds : List Decl)
   : CompResult CheckedProgram :=
-    match first_unresolved_import ds with
-    | Just path => CErr(CheckedProgram, ErrCode 92 path)
-    | Nothing =>
-        match first_residual_open_decls ds with
-        | Just alias => CErr(CheckedProgram, ErrCode 98 alias)
-        | Nothing =>
-        let ds1 : List Decl := desugar_file ds in
-        let base_env : LowerEnv := collect_lower_env_from st ds1 in
-        let ds2 : List Decl := rewrite_declarations fuel base_env ds1 in
-        let env : LowerEnv := populate_io_payloads lower_expr_env2 base_env ds2 in
-        let surfaces : List (Pair Nat Surface) :=
-          rewrite_surface_pairs (lower_decls_env lower_expr_env2 env ds2) in
-        match compile_surfaces compile_program elaborate_surfaces fuel surfaces with
-        | CErr e => CErr CheckedProgram e
-        | COk cores =>
-            check_emitted_decls check_module lower_expr_env2 elaborate
-              selected fuel st env ds2 cores
-        end
-        end
-    end;
+  source_result_comp CheckedProgram
+    (compile_checked_decls_with_metadata desugar_file rewrite_declarations
+      (fun (env : LowerEnv) (expected : Maybe Surface) (expr : Expr) =>
+        LoweredSurfaceOf (lower_expr_env2 env expected expr) (Nothing LowerRootCause))
+      (fun (items : List (Pair Nat Surface)) =>
+        MkPair (CompResult (List (Pair Nat CoreTerm))) (Maybe CompileProgramLocation)
+          (compile_program items) (Nothing CompileProgramLocation))
+      elaborate_surfaces elaborate check_module selected fuel st (source_decls_without_unit ds));
 
 def compile_from_decls
   (desugar_file : List Decl -> List Decl)
@@ -1000,58 +1876,14 @@ def str_of_id (st : InternState) (id : Nat) : List Nat :=
           end) strs
   end;
 
+def canon_imports_with (State : Type) (base : List Nat)
+    (intern_string : State -> List Nat -> Pair Nat State) (intern_state : State -> InternState)
+    (initial : State) (decls : List Decl) : Pair (List Decl) State :=
+  canonicalize_import_declarations State base intern_string
+    (fun (state : State) (id : Nat) => str_of_id (intern_state state) id)
+    initial decls;
+
 def canon_imports (base : List Nat)
     (intern_string : InternState -> List Nat -> Pair Nat InternState)
     (initial : InternState) (decls : List Decl) : Pair (List Decl) InternState :=
-  (fix go (ds : List Decl) (st : InternState)
-    : Pair (List Decl) InternState :=
-    match ds with
-    | Nil => MkPair(List Decl, InternState, Nil Decl, st)
-    | Cons d ds' =>
-        match d with
-        | DImport spellId =>
-            match intern_string(st, canon_path(base, str_of_id st spellId)) with
-            | MkPair cid st1 =>
-                match go ds' st1 with
-                | MkPair rest st2 =>
-                    MkPair (List Decl) InternState
-                      (Cons Decl (DImport cid) rest) st2
-                end
-            end
-        | DDef _ _ _ _ _ =>
-            match go ds' st with
-            | MkPair rest st2 =>
-                MkPair(List Decl, InternState, Cons Decl d rest, st2)
-            end
-        | DAxiom _ _ =>
-            match go ds' st with
-            | MkPair rest st2 =>
-                MkPair(List Decl, InternState, Cons Decl d rest, st2)
-            end
-        | DInductive _ _ _ _ _ =>
-            match go ds' st with
-            | MkPair rest st2 =>
-                MkPair(List Decl, InternState, Cons Decl d rest, st2)
-            end
-        | DEffect _ _ _ =>
-            match go ds' st with
-            | MkPair rest st2 =>
-                MkPair(List Decl, InternState, Cons Decl d rest, st2)
-            end
-        | DIntrinsic _ _ _ _ =>
-            match go ds' st with
-            | MkPair rest st2 =>
-                MkPair(List Decl, InternState, Cons Decl d rest, st2)
-            end
-        | DExtern _ _ _ =>
-            match go ds' st with
-            | MkPair rest st2 =>
-                MkPair(List Decl, InternState, Cons Decl d rest, st2)
-            end
-        | DRepresentation _ _ =>
-            match go ds' st with
-            | MkPair rest st2 =>
-                MkPair(List Decl, InternState, Cons Decl d rest, st2)
-            end
-        end
-    end) decls initial;
+  canon_imports_with InternState base intern_string (fun (st : InternState) => st) initial decls;

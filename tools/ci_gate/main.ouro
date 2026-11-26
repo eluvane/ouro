@@ -1,5 +1,3 @@
--- Ouro-native CI/task runner foundation.
-
 -- @entry main
 
 import "../repo_gate/paths.ouro",
@@ -81,35 +79,6 @@ def gate_log_path (out : String) (gate : CiGate) : String :=
 
 def gate_json_path (out : String) (gate : CiGate) : String :=
     fs_child(out, str_concat(ci_gate_name gate, ".json"));
-
-
-def ci_root_check (root : String) : IO Unit :=
-    do let! ok := fs_is_dir root;
-       match ok with
-       | True => io_unit
-       | False =>
-           do eprintln (str_concat "CI root is not a directory: " root);
-              exit 2
-       end
-
-def write_ci_result_report (profile : String) (result : CiResult) : IO Unit :=
-    repo_write(ci_result_gate_report result, ci_result_report_string profile result)
-
-
--- Invalidate public results before starting children. A failed or interrupted
--- run cannot lend a previous success report to a consumer. Never remove a
--- directory supplied in place of a report file.
-def ci_forget_report (path : String) : IO Unit :=
-    do let! directory := fs_is_dir path;
-       match directory with
-       | True => do eprintln (str_concat "CI report is a directory: " path); exit 1
-       | False =>
-           do let! removed := fsx_remove_if_exists path;
-              match removed with
-              | Left error => do eprintln (fs_error_message error); exit 1
-              | Right _ => io_unit
-              end
-       end
 
 
 def ci_print_unless_quiet (quiet : Bool) (line : String) : IO Unit :=
@@ -234,140 +203,17 @@ def print_ci_gate_list (root : String) (out : String) (gates : List CiGate)
     gates;
 
 
-def internal_host_bound_argv : List String :=
-    [ "ouro-ci-gate", "--profile", "host-bound" ];
-
-
 def host_bound_validation_argv (root : String) (validation_out : String)
     : List String :=
     [ "scripts/ouro_repo_gate.sh", "--profile", "control-plane-native",
       "--root", root, "--out", validation_out ];
 
 
-def host_bound_bool_issue (ok : Bool) (reason : String) : List String :=
-    match ok with
-    | True => Nil String
-    | False => [ reason ]
-    end;
-
-
-def host_bound_validation_issues (command_ok : Bool) (report_ok : Bool)
-    (validation_report : String) : List String :=
-    append String
-      (host_bound_bool_issue command_ok
-        "inventory consistency validation command failed")
-      (host_bound_bool_issue report_ok
-        (str_concat "required native validation report missing, malformed, or non-passing: "
-          validation_report));
-
-
-def host_bound_status (passed : Bool) : String :=
-    match passed with
-    | True => "pass"
-    | False => "fail"
-    end;
-
-
-def host_bound_result (passed : Bool) (code : Nat) (log_path : String)
-    (gate_report : String) (validation_report : String)
-    (command_ok : Bool) (report_ok : Bool) : CiResult :=
-    MkCiResult "host-bound-report" (host_bound_status passed)
-      internal_host_bound_argv True True Z (Just Nat code) log_path gate_report
-      (host_bound_validation_issues command_ok report_ok validation_report);
-
-
-def json_string_field_eq (doc : Json) (key : String) (want : String) : Bool :=
-    match gate_jsonx_get_string doc key with
-    | Nothing => False
-    | Just got => str_eq got want
-    end;
-
-def host_bound_validation_report_text_ok (text : String) : Bool :=
-    match gate_parse_json text with
-    | Nothing => False
-    | Just doc =>
-      match gate_jsonx_get_bool doc "pass" with
-      | Nothing => False
-      | Just passed =>
-        match gate_jsonx_get_array doc "gates" with
-        | Nothing => False
-        | Just gates =>
-          andb passed
-            (andb (notb (nullb Json gates))
-              (andb (json_string_field_eq doc "kind"
-                  "ouro.repo-gate-report.v1")
-                (andb (json_string_field_eq doc "version" "1")
-                  (andb (json_string_field_eq doc "profile"
-                      "control-plane-native")
-                    (json_string_field_eq doc "execution_backend"
-                      "ouro-native-repo-gate")))))
-        end
-      end
-    end;
-
-
-def host_bound_validation_report_ok (validation_report : String) : IO Bool :=
-    do let! loaded := fs_read_checked validation_report;
-       match loaded with
-       | Left _ => io_pure Bool False
-       | Right text => io_pure(Bool, host_bound_validation_report_text_ok text)
-       end
-
-
-def host_bound_effective_code (command_ok : Bool) (report_ok : Bool)
-    (code : Nat) : Nat :=
-    match andb command_ok report_ok with
-    | True => code
-    | False =>
-        match eq_nat code Z with
-        | True => S Z
-        | False => code
-        end
-    end;
-
-
-def finish_host_bound_profile (profile : String) (out : String)
-    (report_path : String) (validation_report : String)
-    (command_ok : Bool) (report_ok : Bool) (code : Nat) : IO Unit :=
-    let passed : Bool := andb command_ok report_ok in
-    let effective_code : Nat :=
-      host_bound_effective_code command_ok report_ok code in
-    let log_path : String := fs_child out "host-bound.log" in
-    let gate_report : String := fs_child out "host-bound-report.json" in
-    let result : CiResult :=
-      host_bound_result passed effective_code log_path gate_report validation_report
-        command_ok report_ok in
-    let summary_path : String := fs_child out "ci-summary.json" in
-    do repo_write(report_path, host_bound_report_string passed validation_report);
-       repo_write(log_path, str_concat(host_bound_summary_text report_path, "\n"));
-       write_ci_result_report profile result;
-       repo_write(summary_path, ci_report_string(profile, [ result ] : List CiResult));
-       println (host_bound_summary_text report_path);
-       println (ci_summary_text profile ([ result ] : List CiResult) summary_path);
-       match passed with
-       | True => exit 0
-       | False => exit 1
-       end
-
-
 def run_host_bound_profile (profile : String) (root : String) (out : String) : IO Unit :=
-    let report_path : String := fs_child out "host-bound.json" in
-    let validation_out : String := fs_child out "inventory-validation" in
-    let validation_report : String := fs_child validation_out "repo-gate.json" in
-    do ci_root_check root;
-       repo_mkdir out;
-       io_foreach String ci_forget_report
-         ([ fs_child out "ci-summary.json", report_path,
-            fs_child out "host-bound-report.json", validation_report ] : List String);
-       let! checked := process_run_spec (command_spec("sh", host_bound_validation_argv root validation_out));
-       let! report_ok := host_bound_validation_report_ok validation_report;
-       finish_host_bound_profile profile out report_path validation_report
-         (proc_ok checked) report_ok (proc_code checked)
-
-
-def list_host_bound_profile : IO Unit :=
-    do println "INFO host-bound-report internal host-bound control-plane inventory";
-       exit 0
+    run_host_bound_profile_with profile root out
+      (fun (validation_root : String) (validation_out : String) =>
+        process_run_spec (command_spec("sh",
+          host_bound_validation_argv validation_root validation_out)))
 
 
 def run_ci_gate_cli (a : Args) : IO Unit :=

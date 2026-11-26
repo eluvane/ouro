@@ -4,10 +4,10 @@
 - Authors: Ouro maintainers
 - Created: 2026-08-20
 
-The decision below records the historical JSON replay boundary. Its
-implementations are retired; the schema is preserved without reinterpretation.
-See [Core artifacts](../kernel_core_artifact.md) for the current checked snapshot
-and retained semantic contracts.
+This RFC records the retired JSON replay interface. The archived schema
+preserves the original format. See
+[checked snapshots and retained contracts](../kernel_core_artifact.md) for
+the compiler-owned checking path.
 
 ## Summary
 

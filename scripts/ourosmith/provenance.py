@@ -7,8 +7,9 @@ import subprocess
 import sys
 from pathlib import Path
 
-from ourosmith import ROOT
+from ourosmith import ROOT, normalized_source_chunks
 from ourosmith.host import job_count
+from repo_support import sha256_file
 
 INPUTS = ("lib", "scripts", "compiler", "runtime", "tests", "std", "tools", "quality", "test", ".github",
           "docs", "README.md", "CONTRIBUTING.md", "Ouro.seal", "dune", "dune-project", "ouro.opam")
@@ -27,14 +28,21 @@ def source_state():
     for name in sorted(set(paths.split("\0")) - {"", "quality/smith/migration_matrix.json"}):
         path = ROOT / name
         if path.suffix in EXTENSIONS or path.name in {"dune", "dune-project"}:
-            hashes[name] = hashlib.sha256(path.read_bytes().replace(b"\r\n", b"\n")).hexdigest() if path.is_file() else "missing"
+            if not path.is_file():
+                hashes[name] = "missing"
+                continue
+            digest = hashlib.sha256()
+            for chunk in normalized_source_chunks(path):
+                digest.update(chunk)
+            hashes[name] = digest.hexdigest()
     digest = hashlib.sha256(json.dumps(hashes, sort_keys=True).encode()).hexdigest()
     return {"head": git("rev-parse", "HEAD").strip(), "source_sha256": digest, "files": len(hashes)}
 
 
-def binary_state(paths):
-    return {Path(path).relative_to(ROOT).as_posix(): hashlib.sha256(Path(path).read_bytes()).hexdigest() if Path(path).is_file() else "missing"
-            for path in sorted(paths)}
+def binary_state(paths, *, root=None):
+    root = ROOT if root is None else root
+    return {path.relative_to(root).as_posix(): sha256_file(path) if path.is_file() else "missing"
+            for path in map(Path, sorted(paths))}
 
 
 def begin():

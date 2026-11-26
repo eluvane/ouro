@@ -203,7 +203,7 @@ def source_policy_cases(out: Path) -> list[str]:
         if not valid:
             failures.append("resolved source policy mismatch: " + rel(source))
 
-    # Folder names and imported basenames alone no longer establish a defect.
+    # Vary paths to check that findings follow resolved declaration identities.
     for target in targets:
         for layer in ("std", "tools/moved", "compiler/kernel", "samples"):
             source = root / layer / (Path(target).stem + "_probe.ouro")
@@ -330,13 +330,15 @@ def frontend_policy_cases(out: Path) -> list[str]:
     return failures
 
 
-def fail_closed_cases(out: Path) -> list[str]:
+def fail_closed_cases(out: Path, executable: Optional[Path] = None) -> list[str]:
     """Black-box native boundary tests; Python does not decide source semantics."""
     from clippy_grade_firewall import _native_env
-    from ourosmith.host import prepare_entry
     from ourosmith.limits import run_limited
 
-    executable = prepare_entry("tools/clippy/main.ouro", "ouro-clippy-grade-firewall")
+    if executable is None:
+        from ourosmith.host import prepare_entry
+
+        executable = prepare_entry("tools/clippy/main.ouro", "ouro-clippy-grade-firewall")
     work = out / "fail-closed"
     work.mkdir(parents=True, exist_ok=True)
     failures: list[str] = []
@@ -653,17 +655,28 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print(f"CLIPPY_GRADE_SUITE: FAIL {exc}", file=sys.stderr)
         return 1
     bad_root, good_root, expected_bad = materialize_fixtures(manifest, out / "fixtures")
-    failures: list[str] = structural_fact_cases(out)
+    failures = structural_fact_cases(out)
     failures.extend(semantic_law_cases(out))
-    failures.extend(semantic_precision_cases(out))
-    failures.extend(semantic_alias_cases(out,
-        ROOT / "_build/c" / ("ouro-clippy-structural" + (".exe" if os.name == "nt" else ""))))
-    failures.extend(semantic_runtime_import_cases(out,
-        ROOT / "_build/c" / ("ouro-clippy-structural" + (".exe" if os.name == "nt" else ""))))
+    worker = None
+    fail_closed_failures = None
+    if os.environ.get("OURO_CI_GATE_NAME") in {"lint", "lint-clippy"}:
+        from ourosmith.host import binary, prepare_entry
+
+        build_log = out / "semantic-precision" / "build.log"
+        build_log.parent.mkdir(parents=True, exist_ok=True)
+        with build_log.open("w", encoding="utf-8") as log:
+            reporter = prepare_entry("tools/clippy/main.ouro", "ouro-clippy-grade-firewall")
+            worker = binary("ouro-clippy-structural", directory=reporter.parent)
+            log.write(f"Prepared {worker} as a companion of {reporter}\n")
+        fail_closed_failures = fail_closed_cases(out, reporter)
+    failures.extend(semantic_precision_cases(out, worker))
+    worker = worker or ROOT / "_build/c" / ("ouro-clippy-structural" + (".exe" if os.name == "nt" else ""))
+    failures.extend(semantic_alias_cases(out, worker))
+    failures.extend(semantic_runtime_import_cases(out, worker))
     failures.extend(suppression_policy_cases(out))
     failures.extend(frontend_policy_cases(out))
     failures.extend(source_policy_cases(out))
-    failures.extend(fail_closed_cases(out))
+    failures.extend(fail_closed_cases(out) if fail_closed_failures is None else fail_closed_failures)
 
     validate = subprocess.run([sys.executable, str(FIREWALL), "--validate-rules"], cwd=ROOT, text=True, capture_output=True, check=False)
     (out / "validate.stdout").write_text(validate.stdout, encoding="utf-8")

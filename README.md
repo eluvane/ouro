@@ -2,12 +2,16 @@
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="site/public/ouro-horizontal-inverse.png">
     <source media="(prefers-color-scheme: light)" srcset="site/public/ouro-horizontal.png">
-    <img src="site/public/ouro-horizontal.png" alt="Ouro" width="512">
+    <img src="site/public/ouro-horizontal.png" alt="Ouro" width="768">
   </picture>
 </p>
 
-Ouro is an experimental dependently typed programming language and toolchain
-([pre-1.0 compatibility](docs/stability.md)).
+Ouro is an experimental dependently typed language. Its compiler checks
+programs and their imports before evaluation or native compilation. See the
+[pre-1.0 compatibility policy](docs/stability.md) before adopting it.
+
+This example defines addition by structural recursion and adds two natural
+numbers.
 
 <!-- readme-example: samples/examples/nat.ouro -->
 ```ouro
@@ -32,10 +36,13 @@ def four : Nat := add two two;
 
 ## Quick start
 
-- [Getting started](docs/getting_started.md) — install, check, evaluate, and run.
-- [Documentation](docs/README.md) — language, tools, architecture, and roadmap.
-- [Contributing](CONTRIBUTING.md) — development and submission workflow.
-- [Website](https://eluvane.github.io/ouro/).
+Follow [Getting started](docs/getting_started.md) to build the toolchain and
+evaluate `four`.
+
+- [Language and tool documentation](docs/README.md)
+- [Contribution workflow](CONTRIBUTING.md)
+- [Security reporting](SECURITY.md)
+- [Ouro website](https://eluvane.github.io/ouro/)
 
 ## License
 

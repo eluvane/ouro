@@ -1,9 +1,8 @@
--- Token and expression source positions for tools. The compiler pipeline does
--- not import this module; its lexer and parser entry points stay unchanged.
+-- Token positions also serve the additive original-origin owner. The separate
+-- expression-spanned parser remains a tools API.
 
 import "lexer.ouro",
-  "parse_a.ouro",
-  "parse_b.ouro",
+  "parser_parse.ouro",
   "parser_min.ouro",
   "token.ouro",
   "ast.ouro",
@@ -30,26 +29,24 @@ def token_spans_eof (total : Nat) (marks : List (Pair (List Nat) (List Nat))) : 
     MkTokenSpans total (reverse_lin (Pair(List Nat, List Nat))
       (Cons(Pair(List Nat, List Nat), MkPair(List Nat, List Nat, Nil Nat, Nil Nat), marks)));
 
--- Steps through the supplied lexer step exactly as lex_go_with does, so the tokens and
--- intern state are the production lexer's. The start mark repeats the
--- skip_ws call that next_token makes with the same fuel.
-def lex_spanned_go_with
-    (next : Nat -> List Nat -> InternState -> Step) (total : Nat)
-    : Nat -> List Nat -> InternState -> List Token -> List (Pair (List Nat) (List Nat)) -> LexSpanned :=
-  fix go (fuel : Nat) (src : List Nat) (st : InternState) (acc : List Token)
+-- The start mark repeats the lexer step's whitespace scan with the same fuel.
+def lex_spanned_walk (State : Type) (finish : State -> InternState)
+    (next : Nat -> List Nat -> State -> LexerStep State) (total : Nat)
+    : Nat -> List Nat -> State -> List Token -> List (Pair (List Nat) (List Nat)) -> LexSpanned :=
+  fix go (fuel : Nat) (src : List Nat) (st : State) (acc : List Token)
       (marks : List (Pair (List Nat) (List Nat))) : LexSpanned :=
     match fuel with
     | Z =>
         match src with
-        | Nil => MkLexSpanned(LexOk(reverse_lin(Token, Cons Token TEof acc), st), token_spans_eof total marks)
-        | Cons _ _ => MkLexSpanned(LexExhausted st, token_spans_none total)
+        | Nil => MkLexSpanned(LexOk(reverse_lin(Token, Cons Token TEof acc), finish st), token_spans_eof total marks)
+        | Cons _ _ => MkLexSpanned(LexExhausted (finish st), token_spans_none total)
         end
     | S fuel' =>
         match next fuel' src st with
-        | StepEof st' =>
-            MkLexSpanned(LexOk(reverse_lin(Token, Cons Token TEof acc), st'), token_spans_eof total marks)
-        | LexStepErr st' => MkLexSpanned(LexMalformed st', token_spans_none total)
-        | StepTok tok rest st' =>
+        | LexerEnd st' =>
+            MkLexSpanned(LexOk(reverse_lin(Token, Cons Token TEof acc), finish st'), token_spans_eof total marks)
+        | LexerMalformed st' => MkLexSpanned(LexMalformed (finish st'), token_spans_none total)
+        | LexerToken tok rest st' =>
             let start : List Nat := match fuel' with
               | Z => src
               | S skip => skip_ws skip src
@@ -59,17 +56,34 @@ def lex_spanned_go_with
         end
     end;
 
-def lex_spanned_go (total : Nat)
-    : Nat -> List Nat -> InternState -> List Token ->
-      List (Pair (List Nat) (List Nat)) -> LexSpanned :=
-    lex_spanned_go_with next_token total;
+def lex_spanned_go_with
+    (next : Nat -> List Nat -> InternState -> Step) (total : Nat)
+    : Nat -> List Nat -> InternState -> List Token -> List (Pair (List Nat) (List Nat)) -> LexSpanned :=
+    lex_spanned_walk InternState (fun (st : InternState) => st)
+      (fun (fuel : Nat) (src : List Nat) (st : InternState) =>
+        match next fuel src st with
+        | StepTok tok rest state => LexerToken InternState tok rest state
+        | StepEof state => LexerEnd InternState state
+        | LexStepErr state => LexerMalformed InternState state
+        end) total;
+
+def lex_spanned_go (total : Nat) (fuel : Nat) (src : List Nat) (st : InternState)
+    : List Token -> List (Pair (List Nat) (List Nat)) -> LexSpanned :=
+    lex_spanned_walk LexerIntern lexer_intern_state next_token_indexed
+      total fuel src (lexer_intern_from st);
 
 def lex_spanned (fuel : Nat) (src : List Nat) (st : InternState) : LexSpanned :=
     lex_spanned_go(length Nat src, fuel, src, st, Nil Token, Nil (Pair(List Nat, List Nat)));
 
 def lex_spanned_import (fuel : Nat) (src : List Nat) (st : InternState) : LexSpanned :=
-    lex_spanned_go_with next_import_token
-      (length Nat src) fuel src st (Nil Token) (Nil (Pair(List Nat, List Nat)));
+    lex_spanned_walk LexerIntern lexer_intern_state next_import_token_indexed
+      (length Nat src) fuel src (lexer_intern_from st) (Nil Token) (Nil (Pair(List Nat, List Nat)));
+
+def lex_import_observed (fuel : Nat) (src : List Nat) (state : InternState)
+    : Pair LexResult (Maybe TokenSpans) :=
+  match lex_spanned_import fuel src state with | MkLexSpanned result spans =>
+    MkPair LexResult (Maybe TokenSpans) result (Just TokenSpans spans)
+  end;
 
 def token_mark : Nat -> List (Pair (List Nat) (List Nat)) -> Maybe (Pair (List Nat) (List Nat)) :=
   fix token_mark (index : Nat) (marks : List (Pair (List Nat) (List Nat)))
@@ -212,10 +226,8 @@ def span_result (first : Nat) (result : ParseResult Value) : ParseResult Value :
         end
     end;
 
--- The production dispatcher from parser_parse.ouro with span_result around
--- the modes that start at an expression's first token. Keyword, paren and
--- list modes start after their opening token, so MAtom records those ranges.
--- Do statements stay unwrapped: consumers match EDoBind directly.
+-- Keyword, paren and list modes start after their opening token, so
+-- MAtom records those ranges. Do statements must expose EDoBind directly.
 def parse_spanned : Nat -> Mode -> List Token -> Nat -> Value -> ParseResult Value :=
   fix parse (fuel : Nat) (mode : Mode) (toks : List Token) (pos : Nat) (extra : Value) : ParseResult Value :=
     match fuel with
@@ -224,53 +236,7 @@ def parse_spanned : Nat -> Mode -> List Token -> Nat -> Value -> ParseResult Val
         let recur (_requested : Nat) (next_mode : Mode) (tokens : List Token)
               (position : Nat) (value : Value) : ParseResult Value :=
             parse fuel' next_mode tokens position value in
-        match mode with
-        | MExpr => span_result(pos, parse_a_expr recur fuel' toks pos extra)
-        | MCoalesce =>
-            span_result(pos, parse_a_coalesce recur fuel' toks pos extra)
-        | MPipe =>
-            span_result pos (bindValue Expr asExpr (parse fuel' MPi toks pos extra)
-              (fun (lhs : Expr) (toks2 : List Token) (pos2 : Nat) =>
-                parse fuel' MPipeTail toks2 pos2 (VExpr lhs)))
-        | MPipeTail => parse_a_pipetail recur fuel' toks pos extra
-        | MPi => span_result(pos, parse_a_pi recur fuel' toks pos extra)
-        | MPiFromApp => parse_a_pifromapp recur fuel' toks pos extra
-        | MApp =>
-            span_result pos (bindValue Expr asExpr (parse fuel' MAtom toks pos extra)
-              (fun (head : Expr) (toks2 : List Token) (pos2 : Nat) =>
-                parse fuel' MAppTail toks2 pos2 (VExpr head)))
-        | MAppTail => parse_a_apptail recur fuel' toks pos extra
-        | MAtom => span_result(pos, parse_a_atom recur fuel' toks pos extra)
-        | MParen => parse_a_paren recur fuel' toks pos extra
-        | MKeywordAtom => parse_a_keywordatom recur fuel' toks pos extra
-        | MFun => parse_b_fun recur fuel' toks pos extra
-        | MLet => parse_b_let recur fuel' toks pos extra
-        | MMatch => parse_b_match recur fuel' toks pos extra
-        | MIf => parse_b_if recur fuel' toks pos extra
-        | MFix => parse_b_fix recur fuel' toks pos extra
-        | MTypedBinder => parse_a_typedbinder recur fuel' toks pos extra
-        | MTypedBinderGroup => parse_a_typedbindergroup recur fuel' toks pos extra
-        | MTypedBinders => parse_a_typedbinders recur fuel' toks pos extra
-        | MFunBinders => parse_a_funbinders recur fuel' toks pos extra
-        | MPattern => parse_b_pattern recur fuel' toks pos extra
-        | MPatternVars => parse_b_pattern_vars recur fuel' toks pos extra
-        | MPatterns => parse_b_patterns recur fuel' toks pos extra
-        | MMultiBranches => parse_b_multi_branches recur fuel' toks pos extra
-        | MScrutList => parse_b_scrut_list recur fuel' toks pos extra
-        | MEffectAnnotation => parse_a_effectannotation recur fuel' toks pos extra
-        | MEffectRow => parse_a_effectrow recur fuel' toks pos extra
-        | MCommaList => parse_a_commalist recur fuel' toks pos extra
-        | MListElems => parse_a_listelems recur fuel' toks pos extra
-        | MListTail => parse_a_listtail recur fuel' toks pos extra
-        | MIdentCommaList => parse_a_identcommalist recur fuel' toks pos extra
-        | MDoStmt => parse_b_do_stmt recur fuel' toks pos extra
-        | MDoExprs => parse_b_do_exprs recur fuel' toks pos extra
-        | MPerform => parse_b_perform recur fuel' toks pos extra
-        | MDo => parse_b_do recur fuel' toks pos extra
-        | MHandle => parse_b_handle recur fuel' toks pos extra
-        | MHandleClauses => parse_b_handle_clauses recur fuel' toks pos extra
-        | MTrailingLambda => span_result(pos, parse_a_trailing_lambda recur fuel' toks pos extra)
-        end
+        parse_dispatch recur span_result fuel' mode toks pos extra
     end;
 
 def strip_spans : Expr -> Expr :=

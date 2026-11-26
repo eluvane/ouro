@@ -3,8 +3,10 @@
 
 import "../../../tools/analyze/unit.ouro",
   "../../../tools/analyze/capability.ouro",
+  "../../../tools/analyze/duplication.ouro",
   "../../../tools/analyze/effects.ouro",
   "../../../tools/analyze/errors.ouro",
+  "../../../tools/analyze/finding.ouro",
   "../../../tools/analyze/taint.ouro",
   "assertions.ouro";
 
@@ -15,6 +17,190 @@ def precision_host_opaque_decls (source : String) (expected : List String) : Boo
         precision_strings (map UnitDef String
           (fun (decl : UnitDef) => unit_name(st, unit_def_name decl)) defs) expected
     end;
+
+def precision_host_marked_notes : Bool :=
+    let note (line : Nat) (text : String) : Pair Nat String := MkPair Nat String line text in
+    let intern : InternState := MkIntern
+      [ MkPair (List Nat) Nat (prim_string_to_char_codes "alpha") 1
+      , MkPair (List Nat) Nat (prim_string_to_char_codes "beta") 2
+      ] 3 [] 0 in
+    let notes : List (Pair Nat String) :=
+      [ note 1 "ordinary comment"
+      , note 2 "example @entry alpha @entry beta"
+      , note 3 "@entry missing"
+      , note 4 "@entry : @entry beta"
+      , note 5 (prim_string_concat (prim_string_of_char_codes [0]) "@entry\t beta")
+      , note 6 "@entry alpha"
+      ] in
+    andb (precision_strings (map Nat String (unit_name intern) (unit_marked_ids intern "@entry" notes))
+        ["alpha", "beta", "alpha"])
+      (precision_strings (map Nat String (unit_name intern)
+        (unit_marked_ids intern "" [note 1 "alpha", note 2 ""])) ["alpha"]);
+
+def precision_host_unit_policy : Bool :=
+    match unit_of_source
+        "-- @export writer\ndef writer : Nat := prim_fs_rename;\n-- @entry reader\n-- ouro-analyze:source=reader\n-- ouro-analyze:sink=writer\n-- ouro-analyze:secret=missing\ndef reader : Nat := prim_fs_read_file;" with
+    | UnitRejected _ => False
+    | MkAnalysisUnit st ids _ marks _ =>
+        let names (members : List Nat) : List String := map Nat String (unit_name st) members in
+        andb (precision_strings (names (cap_fs ids)) ["prim_fs_rename", "prim_fs_read_file"])
+          (andb (precision_strings (names (cap_proc ids)) [])
+            (andb (precision_strings (names (marks_public marks)) ["reader", "writer"])
+              (andb (precision_strings (names (marks_sources marks)) ["reader"])
+                (andb (precision_strings (names (marks_sinks marks)) ["writer"])
+                  (precision_strings (names (marks_secrets marks)) [])))))
+    end;
+
+def precision_host_definition_lines : Bool :=
+    match unit_of_source
+        "-- first\nprivate def lead : Nat := lower;\n-- high note\ndef high : Nat := Z; def inline : Nat := Z;\n-- lower note\ndef lower : Nat := Z;\n-- later high\ndef high : Nat := Z;" with
+    | UnitRejected _ => False
+    | MkAnalysisUnit st _ _ _ defs =>
+        let observed : List String := concat_map UnitDef String
+          (fun (decl : UnitDef) =>
+            let label : String := prim_string_concat (unit_name st (unit_def_name decl))
+              (prim_string_of_nat (unit_def_line decl)) in
+            Cons String label (map (Pair Nat String) String (snd Nat String) (unit_def_notes decl))) defs in
+        precision_strings observed
+          ["lead2", "first", "high4", "high note", "inline0", "lower6", "lower note", "high4", "high note"]
+    end;
+
+def precision_host_inductive_lines : Bool :=
+    match unit_of_source
+        "inductive First : Type := | FirstOf : Later -> First;\ninductive Middle : Type := ; inductive Inline : Type := ;\ninductive Later : Type := ;\ninductive Middle : Type := ;" with
+    | UnitRejected _ => False
+    | MkAnalysisUnit st _ types _ _ =>
+        let observed : List String := map (Pair Nat Nat) String
+          (fun (row : Pair Nat Nat) =>
+            let (MkPair name line) := row in
+            prim_string_concat (unit_name st name) (prim_string_of_nat line)) (types_lines types) in
+        precision_strings observed ["First1", "Middle2", "Inline0", "Later3", "Middle2"]
+    end;
+
+def precision_host_finding_text : Bool :=
+    precision_strings
+      (map Finding String (show_finding "input.ouro")
+        [ MkFinding "OURO-CAP001" 3 "reader" "raw read"
+        , MkFinding "OURO-TRUST004" 5 "trusted" "taint source"
+        , MkFinding "unknown-code" 0 "" "plain witness"
+        ])
+      [ "input.ouro:3:1: warning[OURO-CAP001] capability/fs-primitive: fs primitive outside allowed layer\n  hint: Call the checked std/fs wrapper from an io, tools, or samples layer.\n  witness: def reader: raw read"
+      , "input.ouro:5:1: error[OURO-TRUST004] trust/tainted-proof-path: trusted definition reads a taint source\n  hint: Validate the input outside the trusted path, or record the review with @trust-reviewed REASON.\n  witness: def trusted: taint source"
+      , "input.ouro:1:1: warning[unknown-code] structured/unknown: structured analyzer finding\n  hint: See tools/analyze/README.md for the family table.\n  witness: plain witness"
+      ];
+
+def precision_host_finding_order : Bool :=
+    let first : Finding := MkFinding "A" 5 "first" "same" in
+    let ending : Finding := MkFinding "B" 9 "end" "other" in
+    let rows : List Finding :=
+      [ ending, MkFinding "A" 0 "line-zero" "anchor", first
+      , MkFinding "A" 5 "between" "same", MkFinding "A" 5 "witness-last" "z"
+      , MkFinding "A" 5 "witness-first" "a", MkFinding "B" 5 "code-last" "same"
+      , MkFinding "A" 1 "line-one" "next", first, MkFinding "A" 8 "extra" "another", ending
+      ] in
+    let unique : List Finding := dedupe_findings rows in
+    andb (precision_strings (map Finding String finding_def unique)
+      ["line-zero", "between", "witness-last", "witness-first", "code-last", "line-one", "first", "extra", "end"])
+      (precision_strings (map Finding String finding_def (sort_findings unique))
+        ["line-zero", "line-one", "witness-first", "between", "first", "witness-last", "code-last", "extra", "end"]);
+
+def precision_host_binary_findings : Bool :=
+    let binary (suffix : String) : String := prim_string_concat (prim_string_of_char_codes [65, 0]) suffix in
+    let first : Finding := MkFinding (binary "x") 3 "first" "late" in
+    let middle : Finding := MkFinding (binary "y") 3 "middle" "late" in
+    let last : Finding := MkFinding (binary "x") 3 "last" "early" in
+    let witness_a : Finding := MkFinding "A" 4 "same" (binary "a") in
+    let witness_b : Finding := MkFinding "A" 4 "same" (binary "b") in
+    let filler (n : Nat) : Finding := MkFinding "B" n "filler" "other" in
+    let rows : List Finding :=
+      [first, first, middle, last, filler 8, witness_a, filler 7, witness_b, filler 6, witness_a, filler 5] in
+    let expected : List Finding := [first, middle, last, filler 8, filler 7, witness_b, filler 6, witness_a, filler 5] in
+    let fields (values : List Finding) : List String := concat_map Finding String
+      (fun (f : Finding) => [finding_code f, prim_string_of_nat (finding_line f), finding_def f, finding_witness f]) values in
+    let unique : List Finding := dedupe_findings rows in
+    andb (precision_strings (fields unique) (fields expected))
+      (precision_strings (fields (sort_findings unique)) (fields (sort_insert Finding finding_le expected)));
+
+def precision_host_clone_pairs : Bool :=
+    let loop (binder : Nat) (global : Nat) (value : Nat) : Ast :=
+      AAscribe (AFix 90 (ABinder binder (ASort 0) ANoBinder) (ASort 0)
+        (AApp (AApp (AVar global) (AVar binder)) (ANatLit value))) (ASort 0) in
+    let flat (value : Nat) : Ast := AApp (AApp (AVar 99) (ANatLit 0)) (ANatLit value) in
+    let definitions : List DefAst :=
+      [ MkDefAst 1 11 (loop 40 99 1), MkDefAst 2 22 (loop 41 99 2)
+      , MkDefAst 3 33 (loop 42 99 1), MkDefAst 4 44 (loop 43 88 1)
+      , MkDefAst 5 55 (flat 1), MkDefAst 6 66 (flat 2)
+      , MkDefAst 7 77 (ANatLit 0), MkDefAst 8 88 (ANatLit 0)
+      ] in
+    let label (kind : String) (line : Nat) (earlier : Nat) (later : Nat) : String :=
+      finding_cat3 kind (prim_string_of_nat line)
+        (finding_cat3 ":" (prim_string_of_nat earlier) (prim_string_concat ":" (prim_string_of_nat later))) in
+    precision_strings (map DupIssue String
+      (fun (issue : DupIssue) => match issue with
+        | ICloneExact line earlier later => label "exact" line earlier later
+        | ICloneNear line earlier later => label "near" line earlier later
+        end) (analyze_duplication 5 definitions)) ["near22:1:2", "exact33:1:3", "near33:2:3"];
+
+def precision_host_clone_group_order : Bool :=
+    let row (id : Nat) (line : Nat) (items : Nat) (global : Nat) : DefAst :=
+      MkDefAst id line (AList (replicate Ast (AVar global) items)) in
+    let definitions : List DefAst :=
+      [ row 1 99 4 90, row 2 22 2 91, row 3 33 2 91, row 4 44 4 90
+      , row 5 55 3 92, row 6 66 4 90, row 7 77 2 91, row 8 88 4 93
+      , row 9 89 4 94, row 10 90 2 95, row 11 91 1 91
+      ] in
+    precision_strings (map DupIssue String
+      (fun (issue : DupIssue) => match issue with
+        | ICloneExact line earlier later => finding_cat3 (prim_string_of_nat line) ":"
+            (finding_cat3 (prim_string_of_nat earlier) ":" (prim_string_of_nat later))
+        | ICloneNear _ _ _ => "near"
+        end) (analyze_duplication 3 definitions))
+      ["44:1:4", "66:1:6", "33:2:3", "77:2:7", "77:3:7", "66:4:6"];
+
+def precision_host_clone_variadic_scopes : Bool :=
+    let head : Ast := AVar 44 in
+    let first : Pair Nat Ast := MkPair Nat Ast 51 (AVar 45) in
+    let next : Pair Nat Ast := MkPair Nat Ast 52 (ANatLit 0) in
+    let matches (node : Ast) (expected : Nat) : Bool :=
+      let scopes : List (List Nat) := dup_scopes node in
+      andb (eq_nat (length (List Nat) scopes) expected) (all (List Nat) (nullb Nat) scopes) in
+    andb (matches (ANamedCall head []) 1)
+      (andb (matches (ANamedCall head [first, next]) 3)
+        (andb (matches (AListSpread [] head) 1)
+          (andb (matches (AListSpread [head, ANatLit 0] head) 3)
+            (andb (dup_same_labels [first, next] [first, next])
+              (notb (dup_same_labels [first, next] [next, first]))))));
+
+def precision_host_clone_heads : Bool :=
+    let strict (left : Ast) (right : Ast) : Bool := dup_heads_agree False left right [] [] in
+    let loose (left : Ast) (right : Ast) : Bool := dup_heads_agree True left right [] [] in
+    let branch (ctor : Nat) (ids : List Nat) : Ast := ABranch ctor ids (ANatLit 0) ANoBranch in
+    let called (label : Nat) : Ast := ANamedCall (AVar 44) [MkPair Nat Ast label (ANatLit 0)] in
+    all Bool (fun (agrees : Bool) => agrees)
+      [ dup_heads_agree False (AVar 7) (AVar 8) [7, 9] [8, 9]
+      , notb (dup_heads_agree True (AVar 7) (AVar 7) [7] [])
+      , notb (strict (ANatLit 3) (ANatLit 4)), loose (ANatLit 3) (ANatLit 4)
+      , notb (strict (AHole 7) (AHole 8)), loose (AHole 7) (AHole 8)
+      , notb (strict (AStr 7) (AStr 8)), loose (AStr 7) (AStr 8)
+      , notb (loose (ASort 0) (ASort 1)), notb (loose (ASort 0) (ANatLit 0))
+      , strict (branch 50 [1, 2]) (branch 50 [7, 8])
+      , notb (loose (branch 50 [1, 2]) (branch 50 [7]))
+      , notb (loose (branch 50 [1, 2]) (branch 51 [7, 8]))
+      , notb (loose (APerform 5 []) (APerform 6 []))
+      , strict (called 50) (called 50), notb (loose (called 50) (called 51))
+      ];
+
+def precision_host_clone_binding_depth : Bool :=
+    all Bool (fun (agrees : Bool) => agrees)
+      [ dup_same_var 11 [5, 11, 11, 3] 22 [5, 22, 3]
+      , notb (dup_same_var 11 [11, 5, 11] 22 [5, 22, 22])
+      , notb (dup_same_var 11 [5, 11, 11] 22 [22, 5, 22])
+      , dup_same_var 8 [1] 8 [2, 3, 4]
+      , notb (dup_same_var 8 [1] 8 [2, 8])
+      , notb (dup_same_var 8 [2, 8] 8 [1])
+      , dup_same_var 8 [] 8 []
+      , notb (dup_same_var 8 [] 9 [2, 8])
+      ];
 
 def precision_host_cap_name (st : InternState) (issue : CapIssue) : String :=
     match issue with
@@ -189,7 +375,19 @@ def precision_error_scopes : List (Pair String Bool) :=
     ];
 
 def precision_host_cases : List (Pair String Bool) :=
-    [ MkPair String Bool "host/qualified-alias-source-parses"
+    [ MkPair String Bool "host/marked-notes-keep-first-occurrence-and-order" precision_host_marked_notes
+    , MkPair String Bool "host/parsed-policy-keeps-id-and-mark-order" precision_host_unit_policy
+    , MkPair String Bool "host/definition-lines-use-first-source-spelling" precision_host_definition_lines
+    , MkPair String Bool "host/inductive-lines-use-first-source-spelling" precision_host_inductive_lines
+    , MkPair String Bool "host/finding-text-preserves-exact-rendering" precision_host_finding_text
+    , MkPair String Bool "host/finding-order-keeps-last-copy-and-ties" precision_host_finding_order
+    , MkPair String Bool "host/finding-order-keeps-bytes-after-nul" precision_host_binary_findings
+    , MkPair String Bool "host/clone-pairs-keep-kind-and-pair-order" precision_host_clone_pairs
+    , MkPair String Bool "host/clone-groups-keep-interleaved-pair-order" precision_host_clone_group_order
+    , MkPair String Bool "host/clone-scopes-keep-call-labels-and-spread-arity" precision_host_clone_variadic_scopes
+    , MkPair String Bool "host/clone-heads-keep-rigid-payloads-and-scopes" precision_host_clone_heads
+    , MkPair String Bool "host/clone-vars-use-the-nearest-binding-depth" precision_host_clone_binding_depth
+    , MkPair String Bool "host/qualified-alias-source-parses"
         (precision_host_opaque_decls
           "import \"a.ouro\" as A; def left : Type := A.Shared;" ["left"])
     , MkPair String Bool "host/private-definition-keeps-source-line"
@@ -222,6 +420,48 @@ def precision_host_cases : List (Pair String Bool) :=
         (layer_allows_fs (layer_of_path "tools/analyze/drive_main.ouro"))
     , MkPair String Bool "CAP001/bad/pure-policy"
         (notb (layer_allows_fs (layer_of_path "tools/analyze/drive.ouro")))
+    , MkPair String Bool "CAP001/good/native-analyzer-exact-io-owners"
+        (all String (fun (path : String) => layer_allows_fs (layer_of_path path))
+          [ "tools/analyze/native_main.ouro", "tools/analyze/native_request.ouro"
+          , "tools/analyze/native_workspace.ouro", "tools/analyze/native_composition.ouro"
+          , "tools/analyze/native_base_executor.ouro", "tools/analyze/native_drive_executor.ouro"
+          , "tools/analyze/native_executor.ouro" ])
+    , MkPair String Bool "CAP002/good/native-analyzer-exact-process-owners"
+        (all String (fun (path : String) => layer_allows_proc (layer_of_path path))
+          [ "tools/analyze/native_main.ouro", "tools/analyze/native_request.ouro"
+          , "tools/analyze/native_workspace.ouro", "tools/analyze/native_composition.ouro"
+          , "tools/analyze/native_base_executor.ouro", "tools/analyze/native_drive_executor.ouro"
+          , "tools/analyze/native_executor.ouro" ])
+    , MkPair String Bool "CAP001/bad/native-analyzer-pure-policy"
+        (all String (fun (path : String) => notb(layer_allows_fs (layer_of_path path)))
+          [ "tools/analyze/native_policy.ouro", "tools/analyze/native_base_report.ouro"
+          , "tools/analyze/native_skeleton.ouro", "tools/analyze/native_family_query.ouro" ])
+    , MkPair String Bool "CAP002/bad/native-analyzer-pure-policy"
+        (all String (fun (path : String) => notb(layer_allows_proc (layer_of_path path)))
+          [ "tools/analyze/native_policy.ouro", "tools/analyze/native_base_report.ouro"
+          , "tools/analyze/native_skeleton.ouro", "tools/analyze/native_family_query.ouro" ])
+    , MkPair String Bool "CAP001/bad/native-analyzer-homonyms"
+        (all String (fun (path : String) => notb(layer_allows_fs (layer_of_path path)))
+          [ "tools/analyze/nested/native_main.ouro", "tests/analyze/native_main.ouro"
+          , "tools/analyze/Native_main.ouro", "tools/analyze/native_main.ouro.bak"
+          , "elsewhere/tools/analyze/native_workspace.ouro" ])
+    , MkPair String Bool "CAP002/bad/native-analyzer-homonyms"
+        (all String (fun (path : String) => notb(layer_allows_proc (layer_of_path path)))
+          [ "tools/analyze/nested/native_composition.ouro", "tests/analyze/native_executor.ouro"
+          , "tools/analyze/Native_executor.ouro", "tools/analyze/native_executor.ouro.bak"
+          , "elsewhere/tools/analyze/native_workspace.ouro" ])
+    , MkPair String Bool "CAP003/bad/native-analyzer-http"
+        (all String (fun (path : String) => notb(layer_allows_http (layer_of_path path)))
+          [ "tools/analyze/native_main.ouro", "tools/analyze/native_request.ouro"
+          , "tools/analyze/native_workspace.ouro", "tools/analyze/native_composition.ouro"
+          , "tools/analyze/native_base_executor.ouro", "tools/analyze/native_drive_executor.ouro"
+          , "tools/analyze/native_executor.ouro" ])
+    , MkPair String Bool "capability/good/native-analyzer-direct-io"
+        (precision_host_caps "def path : Nat := prim_fs_realpath; def process : Nat := prim_process_capture;"
+          "tools/analyze/native_main.ouro" [])
+    , MkPair String Bool "capability/bad/native-analyzer-policy-direct-io"
+        (precision_host_caps "def path : Nat := prim_fs_realpath; def process : Nat := prim_process_capture;"
+          "tools/analyze/native_policy.ouro" ["CAP001:prim_fs_realpath", "CAP002:prim_process_capture"])
     , MkPair String Bool "CAP001/bad/nested-cli-name"
         (notb (layer_allows_fs (layer_of_path "tools/analyze/nested/drive_main.ouro")))
     , MkPair String Bool "CAP001/bad/fixture-cli-name"
@@ -412,6 +652,30 @@ def precision_host_cases : List (Pair String Bool) :=
         (precision_host_taint "def bounded : Nat := prim_process_capture_bounded \"tool\" \"args\" \"input\";" [])
     , MkPair String Bool "taint/bounded-checked-wrappers"
         (precision_host_taint "def bounded : Nat := process_run_captured_bounded prim_argv; def input : Nat := process_run_captured_bounded_with_input prim_argv; def spec : Nat := process_run_spec_captured_bounded prim_argv; def spec_input : Nat := process_run_spec_captured_bounded_with_input prim_argv;" [])
+    , MkPair String Bool "CAP002/bad/bounded-cwd-pure-policy"
+        (precision_host_caps "def bounded : Nat := prim_process_capture_bounded_at;" "tools/analyze/drive.ouro" ["CAP002:prim_process_capture_bounded_at"])
+    , MkPair String Bool "CAP002/good/bounded-cwd-owner"
+        (precision_host_caps "def bounded : Nat := prim_process_capture_bounded_at;" "std/runtime.ouro" [])
+    , MkPair String Bool "CAP002/bad/bounded-cwd-owner-lookalike"
+        (precision_host_caps "def bounded : Nat := prim_process_capture_bounded_at;" "std/nested/runtime.ouro" ["CAP002:prim_process_capture_bounded_at"])
+    , MkPair String Bool "capability/bounded-cwd-checked-wrappers"
+        (precision_host_caps "def bounded : Nat := process_run_captured_bounded_at; def input : Nat := process_run_captured_bounded_at_with_input; def spec : Nat := process_run_spec_captured_bounded_at; def spec_input : Nat := process_run_spec_captured_bounded_at_with_input;" "tools/analyze/drive.ouro" [])
+    , MkPair String Bool "effects/bounded-cwd-pure-policy"
+        (precision_host_effects "def bounded : Nat := prim_process_capture_bounded_at;" "tools/analyze/drive.ouro" ["EFF003:prim_process_capture_bounded_at"])
+    , MkPair String Bool "effects/bounded-cwd-owner"
+        (precision_host_effects "def bounded : Nat := prim_process_capture_bounded_at;" "std/runtime.ouro" [])
+    , MkPair String Bool "effects/bounded-cwd-checked-wrappers"
+        (precision_host_effects "def bounded : Nat := process_run_captured_bounded_at; def input : Nat := process_run_captured_bounded_at_with_input; def spec : Nat := process_run_spec_captured_bounded_at; def spec_input : Nat := process_run_spec_captured_bounded_at_with_input;" "tools/analyze/drive.ouro" [])
+    , MkPair String Bool "taint/bounded-cwd-directory-sink"
+        (precision_host_taint "def bounded : Nat := prim_process_capture_bounded_at \"tool\" \"args\" prim_env_get \"input\";" ["TAINT001:prim_process_capture_bounded_at"])
+    , MkPair String Bool "taint/bounded-cwd-input-sink"
+        (precision_host_taint "def bounded : Nat := prim_process_capture_bounded_at \"tool\" \"args\" \"C:/scratch\" prim_stdin_read_bytes;" ["TAINT001:prim_process_capture_bounded_at"])
+    , MkPair String Bool "taint/bounded-cwd-result-source"
+        (precision_host_taint "def bounded : Nat := prim_fs_write_file prim_process_capture_bounded_at;" ["TAINT001:prim_fs_write_file"])
+    , MkPair String Bool "taint/bounded-cwd-clean-literals"
+        (precision_host_taint "def bounded : Nat := prim_process_capture_bounded_at \"tool\" \"args\" \"C:/scratch\" \"input\";" [])
+    , MkPair String Bool "taint/bounded-cwd-checked-wrappers"
+        (precision_host_taint "def bounded : Nat := process_run_captured_bounded_at prim_argv; def input : Nat := process_run_captured_bounded_at_with_input prim_argv; def spec : Nat := process_run_spec_captured_bounded_at prim_argv; def spec_input : Nat := process_run_spec_captured_bounded_at_with_input prim_argv;" [])
     ];
 
 def main : IO Unit :=

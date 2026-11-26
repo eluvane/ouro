@@ -1,17 +1,14 @@
 # Roadmap
 
-The current roadmap is the transition to a standalone native Ouro toolchain.
-The stages below are completion criteria, not claims that the transition has
-already happened. Detailed implementation work belongs in focused changes with
-their own regression evidence.
+These stages define the acceptance criteria for a standalone native Ouro
+toolchain. Use the criteria to distinguish a working component from a
+completed transition stage.
 
 ## Current direction
 
-The [design contract](design.md#native-toolchain-contract) defines the native
-product target. This page tracks the outcomes required to reach it.
-
-The historical starting revision, measurements, and recovery boundary are in
-[Build](build.md#native-transition-baseline).
+The [native toolchain contract](design.md#native-toolchain-contract) defines
+the target. The [transition baseline](build.md#native-transition-baseline)
+records the recovery revision and starting measurements.
 
 ## Transition stages
 

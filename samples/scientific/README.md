@@ -1,11 +1,8 @@
 # Typed external-tool execution
 
-This directory contains a small reusable example for connecting typed inputs to
-an external process and constructing a typed output only after the process
-boundary succeeds.
-
-It is ordinary Ouro library code outside the standard library and logical
-kernel.
+This example shows how to pass typed inputs to an external process and
+construct a typed output after checking the process result. It uses ordinary
+Ouro library code.
 
 ## Flow
 
@@ -37,10 +34,10 @@ The runner records the declared tool and version, ordered arguments and
 parameters, environment and determinism declarations, input identities, output
 contract, exit status, and stdout/stderr metadata.
 
-Before launch it clears the expected output path. A successful typed result
-requires both exit status zero and a newly present regular output file. Failed
-or missing-output attempts retain diagnostic metadata but do not receive
-successful output evidence.
+Use a dedicated output path. Before launch, the runner removes the file at
+that path. It creates successful stage evidence only when the process exits
+with status zero and leaves a new regular output file. Failures retain
+diagnostic metadata.
 
 ## Identity and reproducibility
 

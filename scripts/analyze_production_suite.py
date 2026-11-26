@@ -3,11 +3,13 @@
 
 Runs ouro-analyze-drive over the production scopes named in
 quality/analyze_production.json, one bounded native process per file through
-scripts/analyze_bounded.py. Two sweeps:
+scripts/analyze_bounded.py. The two results have separate policies.
 
 - ``strict``: the strict family set (``--enable-strict``); any finding fails.
 - ``all``: every family (``--enable-all``); findings are counted per family
   and per code for triage and never fail the gate on their own.
+
+Matching native selections share one execution after verifying the inputs.
 
 A source the frontend cannot build a unit for is a rejection. Rejections must
 match the policy list exactly: an unlisted rejection fails (new breakage), and a
@@ -25,8 +27,8 @@ from typing import Any, Sequence
 
 from analyze_bounded import DRIVE_FINDING_RE as FINDING_RE
 from analyze_bounded import DRIVE_REJECT_RE as REJECT_RE
-from analyze_bounded import drive_banner, drive_result_error, requested_drive_families, run_native
-from repo_support import bind_relative_path, read_json_value, write_json_atomic
+from analyze_bounded import drive_banner, drive_result_error, parse_analyzer_args, requested_drive_families, run_native
+from repo_support import bind_relative_path, read_json_value, sha256_file, write_json_atomic
 
 ROOT = Path(__file__).resolve().parents[1]
 rel = bind_relative_path(ROOT, resolve=True)
@@ -97,13 +99,18 @@ def ensure_drive(binary: Path) -> tuple[Path, str]:
     return built, ""
 
 
-def run_sweep(binary: Path, flag: str, scopes: Sequence[str]) -> tuple[subprocess.CompletedProcess[str], float]:
-    cmd = [sys.executable, "scripts/analyze_bounded.py", "--drive", "--bin", str(binary), "--caller", str(ROOT), "--", flag]
-    for scope in scopes:
-        cmd.extend(("--scope", scope))
+def run_sweep(binary: Path, arguments: Sequence[str]) -> tuple[subprocess.CompletedProcess[str], float]:
+    cmd = [sys.executable, "scripts/analyze_bounded.py", "--drive", "--bin", str(binary), "--caller", str(ROOT), "--", *arguments]
     started = time.perf_counter()
-    proc = run_native(Path(cmd[0]), cmd[1:], ROOT)
+    proc = run_native(Path(cmd[0]), cmd[1:], ROOT, env={**os.environ, "OURO_ANALYZE_ALLOW_UNBOUNDED": "1"})
     return proc, round(time.perf_counter() - started, 3)
+
+
+def source_snapshot(arguments: Sequence[str]) -> tuple[tuple[Path, str], ...]:
+    parsed = parse_analyzer_args(arguments, ROOT)
+    if parsed is None or not parsed[1]:
+        raise ValueError("expected a non-empty bounded source scope")
+    return tuple((path, sha256_file(path)) for path in parsed[1])
 
 
 def summarize(stdout: str, stderr: str) -> dict[str, Any] | None:
@@ -173,21 +180,54 @@ def main(argv: Sequence[str] | None = None) -> int:
     sweeps: dict[str, Any] = {}
     problems: list[str] = []
     order = ["strict"] if args.strict_only else ["strict", "all"]
+    scope_arguments = [word for scope in scopes for word in ("--scope", scope)]
+    arguments = {name: [SWEEPS[name], *scope_arguments] for name in order}
+    selections: dict[str, str] = {}
+    try:
+        binary_sha256 = None if args.strict_only else sha256_file(binary)
+        for name in order:
+            families = requested_drive_families(binary, arguments[name])
+            if families is None:
+                return fail(f"sweep {name}: native family selection unavailable")
+            selections[name] = families
+        # The native drive uses these flags only to select families.
+        shared = selections["strict"] == selections.get("all")
+        sources = source_snapshot(arguments["strict"]) if shared else None
+        if binary_sha256 is not None and sha256_file(binary) != binary_sha256:
+            return fail("drive binary changed during family selection")
+    except (OSError, ValueError) as exc:
+        return fail(f"cannot prepare production sweeps: {exc}")
+
+    strict_result: tuple[subprocess.CompletedProcess[str], dict[str, Any]] | None = None
     for name in order:
-        flag = SWEEPS[name]
-        families = requested_drive_families(binary, [flag])
-        if families is None:
-            return fail(f"sweep {name}: native family selection unavailable")
-        print(f"ANALYZE_PRODUCTION_START sweep={name} flag={flag} scopes={','.join(scopes)}")
-        proc, elapsed = run_sweep(binary, flag, scopes)
+        previous = strict_result if name == "all" else None
+        if previous is None:
+            print(f"ANALYZE_PRODUCTION_START sweep={name} flag={SWEEPS[name]} scopes={','.join(scopes)}")
+            proc, elapsed = run_sweep(binary, arguments[name])
+        else:
+            proc, _ = previous
+            elapsed = 0.0
+            print(f"ANALYZE_PRODUCTION_REUSE sweep={name} reused_from=strict flag={SWEEPS[name]}")
         (out / f"{name}.out").write_text(proc.stdout, encoding="utf-8", newline="\n")
         (out / f"{name}.err").write_text(proc.stderr, encoding="utf-8", newline="\n")
-        summary = summarize(proc.stdout, proc.stderr)
-        protocol_error = drive_result_error(proc, families=families)
-        if summary is None or protocol_error:
-            for line in (proc.stdout + proc.stderr).splitlines()[-20:]:
-                print(line, file=sys.stderr)
-            return fail(f"sweep {name}: {protocol_error or 'missing completion report'} (rc={proc.returncode})")
+        if previous is None:
+            summary = summarize(proc.stdout, proc.stderr)
+            protocol_error = drive_result_error(proc, files=len(sources) if sources is not None else None,
+                                                families=selections[name])
+            if summary is None or protocol_error:
+                for line in (proc.stdout + proc.stderr).splitlines()[-20:]:
+                    print(line, file=sys.stderr)
+                return fail(f"sweep {name}: {protocol_error or 'missing completion report'} (rc={proc.returncode})")
+            if sources is not None:
+                try:
+                    if (source_snapshot(arguments["all"]) != sources
+                            or sha256_file(binary) != binary_sha256):
+                        return fail("drive binary or source scope changed during the shared sweep")
+                except (OSError, ValueError) as exc:
+                    return fail(f"cannot verify shared sweep inputs: {exc}")
+                strict_result = (proc, summary)
+        else:
+            summary = dict(previous[1], reused_from="strict")
         summary["returncode"] = proc.returncode
         summary["elapsed_s"] = elapsed
         sweeps[name] = summary

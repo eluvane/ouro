@@ -1,21 +1,37 @@
 # Build and bootstrap
 
-Ouro has a Python build driver, a transitional C bootstrap path, and
-content-addressed caches. The compiler-owned checker runs as an Ouro program;
-OCaml, opam, and Dune are retired from active builds and validation. Follow
-[Getting started](getting_started.md#build-the-bootstrap-toolchain) for the
-first build; this page covers configuration, generated artifacts, and caches.
+Use the Python build driver to build the transitional C bootstrap and manage
+its content-addressed caches. The checker runs as an Ouro program.
+[Getting started](getting_started.md#build-the-bootstrap-toolchain) covers the
+first build. Active builds and validation no longer require OCaml, opam, or
+Dune.
 
 ## Entry points
 
+Run build and inspection commands from the repository root with the
+[source-build prerequisites](getting_started.md#requirements). The build
+installs the compiler in the configured C output directory and records
+bootstrap evidence in the configured build directory. The other commands
+report cache state and resolved configuration.
+
 ```sh
 python3 scripts/ouro_build.py build
-python3 scripts/ouro_build.py rebuild
-python3 scripts/ouro_build.py clean
 python3 scripts/ouro_build.py cache status
-python3 scripts/ouro_build.py cache clean
 python3 scripts/ouro_build.py config show
 ```
+
+Before cleaning, run `config show` with the same configuration and path
+overrides as the intended command. Keep the cache outside both build output
+directories and keep both build output directories outside the cache. Keep
+files you need outside all cleanup targets.
+
+| Command after `python3 scripts/ouro_build.py` | Effect |
+| --- | --- |
+| `rebuild` | Removes the configured C build directory, then builds with the existing cache. |
+| `clean` | Removes the configured build directory and keeps the cache. |
+| `cache clean` | Removes the configured cache directory. Later builds must recreate its contents. |
+
+For artifact updates, follow the [stage-loop procedure](#generated-artifacts-and-stage-loop).
 
 `scripts/ouro1.sh` remains the user-facing wrapper for language and tooling
 commands. `scripts/coil.sh` is the project-facing name for the same toolchain.
@@ -32,29 +48,25 @@ macOS host executables reserve a 128 MiB main-thread stack at link time through
 Mach-O's `-stack_size`, including historical bootstrap producers. This reserve
 does not depend on changing the stack of the host Python interpreter.
 The C IO host enables Darwin's extended declarations so no-follow file writes
-retain `O_NOFOLLOW` under the POSIX feature flags. Release toolchain packaging
-uses Python 3.12 and installs its dependency in a local virtual environment.
-Clang C compilation allows bracket nesting up to 1024 for generated constructor
-expressions; the selected flag participates in the object-cache command key.
+retain `O_NOFOLLOW` under the POSIX feature flags. Clang allows bracket nesting
+up to 1024 for generated constructor expressions. The selected flag is part
+of the object-cache command key.
 
-The standalone Python frontend regenerator, bounded analyzer, and fix-check
-observer reserve a 128 MiB POSIX stack for native compiler processes, capped
-by the inherited hard limit. An already larger or unlimited stack is preserved.
-Standalone C IO programs apply the same reserve at startup because ELF cannot
-encode a link-time stack size. Address-space and memory-budget limits still
-apply; failure to configure the stack is an error.
+The frontend regenerator, bounded analyzer, and fix-check observer try to
+raise the POSIX soft stack limit to 128 MiB, up to the inherited hard limit.
+Standalone C IO programs make the same adjustment at startup because ELF
+provides no link-time stack reserve. They keep a larger or unlimited soft
+limit and continue with the inherited limit if the operating system rejects
+the adjustment. Address-space and memory-budget limits still apply.
 
 ## Native transition baseline
 
-The recovery source for the transition is
-`8ee4a175828f7eb803ca71f19bbd4c24de9b91b1`, observed on 2026-09-06.
-The local `pre-native-pivot` tag pins this recovery revision; it is not a
-native release seed. Reproduce
-it in a separate checkout of that revision. Commands in this baseline section
-belong to that historical checkout, including its now-retired checker tools and
-build flags. They are not commands for the current worktree. The input is generated C
-bootstrap, with these SHA-256 digests also recorded in that revision's
-`docs/generated_artifact_hashes.sha256`:
+This historical record describes recovery revision
+`8ee4a175828f7eb803ca71f19bbd4c24de9b91b1` on 2026-09-06. Use a checkout of
+that revision to reproduce the baseline commands. They require the checker
+tools and build flags from that revision. The native release seed is a
+separate artifact. The revision records these C bootstrap input digests in
+`docs/generated_artifact_hashes.sha256`.
 
 | Bootstrap input | SHA-256 |
 | --- | --- |
@@ -179,18 +191,11 @@ Git Bash must be able to create its process pipes: three preceding sandboxed
 sessions could not launch the driver and emitted empty diagnostics for the
 invalid buffer; those failed runs are excluded from the successful range.
 
-The local measurement command is:
-
-```sh
-python -B _build/native-transition/baseline/programs/measure.py
-```
-
-Its `report.json` records complete argument arrays, input and output SHA-256
-hashes, generated and executable sizes, timeouts, individual runs, and separate
-job committed-memory peaks. `sandbox-report.json` and `lsp-diagnosis/report.json`
-retain the failed host-startup evidence. All measured source hashes were
-unchanged after execution; generated inputs and reports remain under the local
-`baseline/` output tree.
+The measurement driver and raw reports were local artifacts. The reports
+recorded command arguments, input and output hashes, file sizes, per-run
+results, timeouts, and job committed-memory peaks. Reproducing the published
+measurements requires reconstructing the workload from the revision,
+fixtures, and build and process settings above.
 
 These bounded samples do not establish sustained memory behavior, an extended
 editor session, or a native seed. The retained language/runtime scope is listed in
@@ -208,8 +213,8 @@ preserve the trust boundary, and pass the same focused parity checks.
 Windows producer links reserve a 2 GiB PE stack (`-Wl,--stack,2147483648`) so
 the native-build import cone can be checked and emitted. Native PE images write
 the same 2 GiB `SizeOfStackReserve`; the previous 1 MiB default overflows on
-that cone. POSIX child stacks stay at the documented 128 MiB cap unless the
-inherited hard limit is lower.
+that cone. On POSIX, the [host stack adjustments](#entry-points) aim for
+128 MiB while respecting the inherited limits.
 
 Native-build output publication stages the image in a private file beside its
 destination, reads it back, compares every byte, and performs a same-volume
@@ -264,24 +269,55 @@ The build driver configures the profile, parallelism, C compiler, optimization,
 build and cache directories, optional `ccache`, verbosity, and reproducibility
 mode. `--c-only`, `--frontend`, `--dune`, and the Dune cache flags are retired; plain `build`
 selects the current C producer without discovering OCaml tools. Run `config show` to see the effective values.
-The repository and build-driver default is ten workers. Override it with
+The repository and build-driver default is `auto`. Override it with
 `--jobs` or `OURO_JOBS`; hosted PR jobs set `OURO_JOBS=2`.
 
-The transitional compiler bootstrap keeps C0, bridge, P1 and P2 in order.
-Inside each stage, C builds and split frontend generation use the configured
-worker count, capped at two. `auto` uses the build driver's CPU-count selection,
-resolved once and frozen for all bootstrap workers;
-`--jobs 1` retains serial execution. The frontend keeps its existing memory-aware
-pool throttling. Strict source checks, acceptance laws and stage barriers remain
-serial. The bootstrap report's `workers` field records the selected ceiling,
-not measured utilization.
+Compiler and native tool builds can use the same cache concurrently. LRU
+cleanup runs when that cache has no active build. If permissions prevent
+eviction of an entry, automatic cleanup reports it and tries other entries.
+`cache clean` waits for active builds to finish before removing the cache.
 
-Each command retains its 3 GiB memory limit and 900-second timeout. Windows
-limits shared process-tree commit; POSIX applies an inherited address-space
-limit per process except on Darwin, which rejects finite `RLIMIT_AS`.
-Parallel POSIX children can therefore use more aggregate memory; the per-process
-limit is not a shared 3 GiB budget. Standalone tool and stage-loop builds retain
-their configured worker counts.
+The transitional compiler bootstrap runs C0, bridge, bridge2, P1, and P2
+in order. Inside each stage, C builds and split frontend generation use the
+configured worker count. `--jobs 19` requests at most nineteen workers for
+each parallel step. `auto` resolves the host CPU count once and freezes that
+request. Before
+each parallel step, bootstrap caps the request to currently available physical
+memory and fits within any allocation from the local scheduler. It reserves
+512 MiB per additional C worker and 1 GiB per additional frontend worker.
+Concurrent source checks use a shared Windows job budget. On POSIX each check
+reserves its full 3 GiB allowance. The frontend retains memory-aware pool
+throttling. `--jobs 1` retains serial execution.
+
+Independent source checks run in parallel, with one CPU slot per check. P2
+combines compiler and acceptance source checks in one group. The coordinator
+writes results in source order and waits for the checks before starting emission.
+After that barrier, the P2 ABI build and successor generation can use concurrent
+lanes when the shared CPU and memory budget can fit both. ABI laws run after the
+checks and the ABI build. Report rows and the first reported failure keep the
+serial order of checks, ABI build and laws, frontend, backend, and link. Stage
+barriers remain serial. Frontend tasks start with
+the largest source closures; C compilation starts with the largest input files.
+Generated frontend modules over 1 MiB compile as pieces of about 512 KiB; a
+module with an unrecognized generated layout compiles whole and is listed in
+the shard report's `frontend_split_fallbacks`.
+Packing, linker inputs and report rows keep their original order.
+
+Every source check and serial command retains its 3 GiB memory limit and
+900-second timeout. On Windows, each parallel step also has a shared
+process-tree commit limit of 3 GiB plus the planning estimate for each
+additional worker. Nested jobs retain the individual source-check limits
+inside that shared budget. Concurrent emission and ABI build share the phase
+allocation. The report's `requested_workers` field records the
+frozen request; `workers` and `parallel_memory_mib` record the initial selection.
+Command rows record `workers`, `memory_mib`, `started_s` and `finished_s`, with
+`shared_memory_mib` for parallel source checks. The bootstrap report includes
+elapsed time, peak concurrent commands and peak allocated worker slots.
+POSIX retains the inherited 3 GiB address-space limit per process except on
+Darwin, which rejects finite `RLIMIT_AS`; it has no shared Windows Job budget.
+On Linux, parallel bootstrap reserves 8 MiB per Python worker thread stack.
+The launcher still provides the native stack allowance to compiler subprocesses.
+Standalone tool and stage-loop builds retain their configured worker counts.
 
 ## C bootstrap
 
@@ -302,22 +338,34 @@ Object identity includes the source, dependencies, compiler identity, flags,
 profile, and reproducibility mode. Missing or malformed dependency metadata is a
 cache miss, not a successful build.
 
-`scripts/bootstrap.sh` and plain `ouro_build.py build` require Python 3 and a C
-compiler. A clean source checkout needs no Git history, network download, or
-pre-existing Ouro executable. The driver performs four stages:
+C build callers may append flags for an exact source label. Unknown labels fail
+before compiler invocation. These flags remain in the object's command and
+content key; the source report links to that command stamp. The frontend host
+suite applies its required module-scope selftest define only to that main, so
+the six targets can reuse unchanged common objects within their fresh build.
+
+Use the [source-build prerequisites](getting_started.md#requirements) with
+`scripts/bootstrap.sh` or `ouro_build.py build`. The source tree includes the
+bootstrap inputs, so the build can run offline without Git history or an
+installed Ouro compiler. The driver performs five stages.
 
 1. Compile the committed `compiler/stage0/` C with its matching pinned
    runtime to obtain C0.
-2. Use C0 to build the historical Ouro bridge and its matching runtime from
-   `compiler/bootstrap/c-bootstrap-v1.tar.gz`.
-3. Copy the current compiler, stdlib, tool inputs, and runtime into a separate
-   private snapshot, without source transformations. The bridge must strictly
-   check all 15 current compiler roots and their ordered import closures before
-   emitting current P1.
-4. P1 repeats those checks, checks `std/prelude.ouro`, `std/data.ouro`,
+2. Use C0 to build the first historical Ouro bridge and its matching runtime
+   from `compiler/bootstrap/c-bootstrap-v1.tar.gz`.
+3. Use the first bridge to check all 15 roots from `bridge2-v1.tar.gz` and
+   report the results in the recorded root order. Build the second historical
+   bridge (bridge2) after those checks pass. It supports private declarations
+   and their module scopes.
+4. Copy the current compiler, stdlib, tool inputs, and runtime into a separate
+   private snapshot, without source transformations. The second bridge must
+   strictly check all 15 current compiler roots and their ordered import
+   closures before building current P1.
+5. P1 repeats those checks, checks `std/prelude.ouro`, `std/data.ouro`,
    `tools/collect.ouro`, and `tests/compiler_abi_tests.ouro` with their closures,
-   builds and executes the ABI laws, then emits P2 from the same current
-   snapshot. Full frontend and backend C must match between P1 and P2. P2 must
+   builds and executes the ABI laws, and emits P2 from the same current
+   snapshot. P2 is not executed before those checks and laws pass.
+   Full frontend and backend C must match between P1 and P2. P2 must
    also pass the positive and exact negative String-index checks before it is
    published as the current compiler.
 
@@ -334,7 +382,7 @@ The [bootstrap input manifest](../compiler/bootstrap/c-bootstrap-v1.json) record
 pins every file's size and SHA-256, the archive, and the committed stage0 pair.
 The C0 runtime matches that seed. The manifest's `syntax_refresh` records the
 reviewed parser backport that lets the bridge read current
-[ergonomic syntax](language/ergonomic-syntax.md), with its patch and member hashes.
+[ergonomic syntax](language/ergonomic_syntax.md), with its patch and member hashes.
 Its `lowering_refresh` records the composed Nat/ascription lowerer update with
 the exact source slices, original-to-Nat-to-ascription patches, and member hashes.
 The historical checker, runtime, and stage0 pair retain their previous bytes.
@@ -347,20 +395,48 @@ The lowerer refresh copies six verbatim current-source slices into only
 and the checked expression-ascription obligation. The other 67 members,
 historical checker, runtime, stage0 pair, and import graph remain pinned.
 The original independent `refresh_nat_bridge.py` and `refresh_ascription_bridge.py`
-retain their exact source/predecessor guards; the composed snapshot uses:
+retain their exact source and predecessor guards. Inspect the composed
+candidate and run its tests before installing it.
 
 ```sh
 python3 -B scripts/refresh_lower_bridge.py
 python3 -B scripts/refresh_lower_bridge_test.py
+```
+
+For an approved artifact update, `--write` installs the candidate archive and
+manifest under `compiler/bootstrap/`. The generator rejects a changed source
+owner or historical package. Running it again against the exact installed
+output preserves the archive and manifest bytes.
+
+```sh
 python3 -B scripts/refresh_lower_bridge.py --write
 ```
 
-The generator rejects a changed source owner or historical package. Repeating it
-on its exact installed output reproduces identical archive and manifest bytes.
-The refreshed package still requires a fresh full current P1/P2 C comparison,
-ABI laws, and positive/negative behavior checks before publishing a current
-compiler. Local source-copy tests do not establish that bootstrap evidence.
-The inventory and unpack/repack commands below verify the installed package.
+Verify the installed package with the inventory and repack commands below.
+Before publishing a current compiler from these inputs, obtain a fresh full
+P1/P2 C comparison, passing ABI laws, and positive and negative behavior
+checks. Those checks establish the bootstrap evidence beyond the source-copy
+tests.
+
+The [second bridge manifest](../compiler/bootstrap/bridge2-v1.json) pins a
+separate source archive and binds it to the same C0 inputs. It records the hashes
+of the checked source snapshot, bootstrap report, and compiler used to prepare
+the archive. The build compiles this archive from source and retains the second
+bridge checks and producer hashes in its bootstrap report. Both archives and
+their manifests enter the compiler and historical cache keys.
+
+To inspect a second-bridge candidate, replace `BOOTSTRAP_WORK` with the path
+to a fully checked bootstrap work directory. The generator verifies the
+recorded source and binary hashes and the complete P1/P2 C comparison.
+
+```sh
+python3 scripts/refresh_bridge2.py --bootstrap-work "BOOTSTRAP_WORK"
+```
+
+For an approved install, add `--write` to write the archive and manifest
+under `compiler/bootstrap/`. The generator refuses to replace a different
+second-bridge archive or manifest. Pass `--bridge2` before the
+`bootstrap_inputs.py` subcommand to verify, unpack, or reproduce that bundle.
 
 The consumer validates the entire archive inventory before extraction. It
 rejects links, traversal, duplicate, extra, or missing members and size/hash
@@ -408,7 +484,8 @@ data and is not declaration-acceptance evidence.
 
 The repository currently caches:
 
-- completed current compiler builds and their bootstrap evidence;
+- completed current compiler builds, their bootstrap evidence, and the
+  historical C0, bridge, and bridge2 stages;
 - C objects and links;
 - native tools built by `scripts/build_tool.sh`, including the shared native
   test-suite runner and common runtime C objects;
@@ -429,9 +506,13 @@ against a cache-disabled path.
 Compiler reuse requires identical current source, runtime, helper, bootstrap
 bundle, stage0, C compiler, flags, platform, and include/library environment
 identities. The installed binary, completion report, input manifest, and both
-complete C comparisons must still match their hashes. A miss or `--no-cache`
-runs the complete bootstrap chain in fresh output directories; this transitional
-path does not reuse individual stages after a source change.
+complete C comparisons must still match their hashes. On a miss, the driver
+can reuse verified C0, bridge, and bridge2 outputs built from the same pinned
+historical inputs, build helpers, and host toolchain. A change confined to
+current Ouro sources or runtime can reuse these stages. P1 and P2 still run
+in a fresh snapshot, including both strict checks of the compiler roots,
+the ABI laws, the full generated C comparison, and the positive and negative
+behavior checks. `--no-cache` builds all five stages.
 
 Hosted PR jobs share one Linux compiler build through a workflow artifact.
 `scripts/ci_gate.py --compiler-artifact export` packages the installed binary,
@@ -450,6 +531,12 @@ checks a completion record and the binary hash before reuse, including reuse
 at another output path. Source timestamps are only launcher startup hints.
 Changing content with a preserved timestamp invalidates the build-tool key;
 changing only a timestamp does not require recompilation.
+Successful C emission has a separate receipt that also binds the ordered unit
+closure, build configuration, and emission modes. A later C compilation or link
+failure can retain that emission. Reuse rechecks its complete hash and installed
+host hooks before building shards, objects, and the final binary. This receipt
+does not replace the completed tool receipt; `--check` still rejects an
+unfinished build. The build report records this decision as `emission_cache`.
 The lint suite always invokes this receipt check before running its binary,
 including when only a build helper or a transitive import has changed.
 The builder also prepares every required companion beside the parent tool.
@@ -461,7 +548,12 @@ the empty stdout/stderr contract for a clean invocation; build failures print th
 Each installed tool has a `.sources` manifest and a `.build.json` receipt with
 its cache decision, input hashes, and elapsed time. `OURO_CACHE=0` or the
 driver's `--no-cache` forces fresh emission, compilation, and linking. Native
-tool builds use at most two C workers, bounded further by `OURO_JOBS`.
+tool builds take the C worker count from `--jobs` or the resolved configuration.
+The local scheduler bounds this count by the CPU and memory it assigns. An
+automatic standalone build accounts for available memory, with 2560 MiB for
+the build driver and 512 MiB per worker. When available memory is unknown, it
+uses at most two workers. An explicit standalone `--jobs` sets the worker
+count. External memory and timeout limits still apply.
 
 On Windows, C-host builds of lint, both analyzers, fmt, fix, Clippy and the quality
 inventory worker embed a process-local UTF-8 application manifest. They require Windows 10 version 1903
@@ -481,18 +573,38 @@ require a successful rebuild and a second freshness check before execution.
 
 ## Generated artifacts and stage loop
 
-`compiler/stage0/` contains committed generated C used for bootstrapping. These
-files are updated only by the stage loop:
+The stage loop checks whether successive stages produce identical frontend and
+backend C. Run it from the repository root with the source-build prerequisites.
+It writes `stage_loop/result.json` in the configured build directory. If a
+sibling `public/` directory exists, it writes the status file to
+`../public/bootstrap-status.json`. Otherwise, the status file is
+`stage_loop/bootstrap-status.json` in the configured build directory.
 
 ```sh
 sh scripts/stage_loop.sh
-sh scripts/stage_loop.sh --promote
 ```
 
-While `c-bootstrap-v1` is active, promoting stage0 alone makes the next default
-bootstrap fail its historical input check. A promotion therefore needs a
-separately reviewed, coordinated recovery-input update with matching runtime
-and bundle metadata. The stage-loop command does not regenerate that bundle.
+Check the exit status and `result.json` for the recorded fixpoint and cache
+decision.
+
+With caching enabled, a comparison without promotion can reuse static runtime
+objects built directly by the C compiler in the preceding stage of the same
+run. Both generated C files must match byte for byte, and the compiler, command,
+source, dependency, and object checks must pass. Each stage has its own
+generated shards, link target, and build report.
+
+Promotion is the procedure for updating the committed generated C in
+`compiler/stage0/`. Use it only for an approved artifact change, with stage-loop
+evidence and a coordinated update to the pinned recovery inputs, matching runtime,
+and bundle metadata. On a fixpoint, `--promote` writes the two C files and
+`docs/generated_artifact_hashes.sha256` before it invokes the bootstrap in the
+same command. If the recovery manifest still pins different stage0 bytes, that
+bootstrap fails its input check after the files have been written. The recovery
+bundle is updated separately.
+
+```sh
+sh scripts/stage_loop.sh --promote
+```
 
 The drift gate verifies the committed stage0 hash manifest and the historical
 bootstrap inputs. Its regeneration reference is the current P2 frontend and
@@ -502,25 +614,25 @@ regeneration and the stage-loop fixpoint must reproduce that verified pair.
 Missing, stale, or changed evidence fails the gate. The reference stays in the
 configured bootstrap directory; regeneration does not update committed stage0.
 
-Promotion updates the committed artifacts and
-`docs/generated_artifact_hashes.sha256`. Windows staging C may use CRLF; the
-promotion writer normalizes it to LF, so drift checks compare promotion-normalized
-bytes for both the regenerated output and its P2 reference, and record raw staging
-hashes. Hand editing a generated stage0 file breaks
-the reproducibility model.
+Windows staging C may use CRLF. The promotion writer normalizes it to LF.
+Drift checks compare promotion-normalized bytes for the regenerated output and
+its P2 reference and record the raw staging hashes. Hand editing stage0 breaks
+this reproducibility check.
 
 [CI](ci.md#local-profiles) owns the heavier stage-loop profile for compiler,
 frontend, extraction, backend, or promotion changes.
 
-Committed standard-library API pages under `docs/api/` are generated from Ouro
-source. Regenerate them with:
+After changing a standard-library API or its generator, regenerate the
+committed pages in `docs/api/`. This command builds the documentation tool,
+writes the generated pages, and records suite output in `_build/doc_suite/`
+by default.
 
 ```sh
 sh scripts/doc_suite.sh --regen
 ```
 
-Review the resulting diff, then run `sh scripts/doc_suite.sh`; do not hand-edit
-generated API pages.
+Review the generated diff and check it with `sh scripts/doc_suite.sh`.
+Keep changes to the API source or generator.
 
 ## Compiler checking
 
@@ -611,12 +723,12 @@ Global dead-code, duplication, trust, fact-dump, heavy, and all-family modes
 fail before starting when a scope exceeds the local safety limit. Narrow the
 scope for local work. Structured profiles also reject individual source files
 larger than 40 KiB because the extracted frontend retains its arena for the
-process lifetime; the limit covers every production source. The memory suite selects the largest
-current production input for the `analyzer-drive-largest-file` budget in
-`quality/memory_budgets.json`, so a refactor cannot turn it into a tiny-shim test. Split a larger source, or use
+process lifetime. Split a larger source, or use
 `OURO_ANALYZE_ALLOW_UNBOUNDED=1` only on a dedicated high-memory host.
-The largest-source case requires an `ANALYZE_DRIVE` result; a size rejection
-before structured analysis cannot satisfy it.
+The production sweep uses one native process per file and allows larger sources.
+The memory suite uses the same opt-in to measure the largest production source
+under the `analyzer-drive-largest-file` budget in `quality/memory_budgets.json`.
+That case requires an `ANALYZE_DRIVE` result.
 The bounded analyzer wrapper requires the repository Python runner; it fails
 closed when Python is unavailable unless that same override is explicit.
 
@@ -650,6 +762,13 @@ tree. It keeps compiler string decoding and delegates alias/open handling to
 the shared preprocessor. `native_build_collection_tests.ouro --collect-only`
 checks the collection laws on hosted platforms without building a PE image.
 
+Automatic source loading for `native-build` reads each normalized dependency
+path once. The collector keeps the bytes alongside each path in dependency
+order. Its private constructor binds the normalized root and ordered files
+into a `CollectSnapshot`. Automatic checking and image generation accept
+that type and run without a reader. Explicit-unit and freshness checks use
+their own input paths.
+
 Relevant checks include:
 
 ```sh
@@ -662,9 +781,16 @@ python3 scripts/generated_artifact_drift_check.py --mode hashes
 
 ## Benchmarks
 
+With the source-build prerequisites available, run a local wall-time sample of
+`check`, `fmt --check`, and `help`. Run it from the repository root. Tool
+provisioning can be part of the first invocation, so record the build and cache
+state when interpreting the timings.
+
 ```sh
 python3 scripts/bench_suite.py --out _build/bench
 ```
 
-The benchmark harness records local cold and warm timings. Results are evidence
-for a specified host and command, not a repository-wide performance claim.
+The harness writes `report.json` and `report.md` to the output directory. A
+`PASS` result means the commands returned their expected exit codes. Use
+[comparable measurements](code_optimization.md#measure-the-effect) for claims
+about performance changes.

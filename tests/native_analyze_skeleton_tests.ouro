@@ -1,0 +1,547 @@
+-- Literal staging oracles; this executable does not run analyzer workers.
+import "../tools/analyze/native_skeleton.ouro",
+  "../std/test.ouro";
+
+def skeleton_test_contents (mode : NativeSkeletonMode) (source : String) : String :=
+    match native_skeleton_plan mode "std/example.ouro" source with
+    | Left _ => "refused"
+    | Right plan => native_skeleton_contents plan
+    end;
+
+def skeleton_test_token_position
+    (lexed : Either StLexError (Pair (List STTok) (List (Pair Nat String)))) : String :=
+    match lexed with
+    | Left error => st_lex_error_message error
+    | Right result => let (MkPair tokens _) := result in
+      match tokens with
+      | Nil => "no tokens"
+      | Cons token _ => let (MkSTTok value start stop line) := token in
+        str_join ":" [value, str_of_nat start, str_of_nat stop, str_of_nat line]
+      end
+    end;
+
+def skeleton_test_problem (problem : NativeSkeletonProblem) : String :=
+    match problem with
+    | SkeletonInvalidPath => "invalid path"
+    | SkeletonInvalidUtf8 => "invalid utf8"
+    | SkeletonUnsupportedLineBreak => "unsupported line break"
+    | SkeletonUnsupportedCommentPrefix => "unsupported comment prefix"
+    | SkeletonLexical error => str_concat "lexical: " (st_lex_error_message error)
+    | SkeletonRowMismatch => "row mismatch"
+    | SkeletonStagedLexical error => str_concat "staged lexical: " (st_lex_error_message error)
+    end;
+
+def skeleton_test_refusal (mode : NativeSkeletonMode) (path : String)
+    (source : String) : String :=
+    match native_skeleton_plan mode path source with
+    | Right _ => "staged"
+    | Left refusal => let (MkNativeSkeletonRefusal actual rel original problem) := refusal in
+      match andb(native_skeleton_mode_eq actual mode,
+          andb(str_eq rel path, str_eq original source)) with
+      | False => "lost source provenance"
+      | True => skeleton_test_problem problem
+      end
+    end;
+
+def skeleton_test_relative_paths : Bool :=
+    andb(all String native_skeleton_relative ["std/雪 例.ouro", "std/a\tb.ouro"],
+      all String (fun (path : String) => notb(native_skeleton_relative path))
+        ["", "std//a.ouro", "std/a.ouro/", "std/./a.ouro",
+         str_of_codes [97, 0, 98], str_of_codes [97, 255, 98]]);
+
+def skeleton_test_imports (source : String) : String :=
+    match native_skeleton_plan SkeletonLocal "tools/example.ouro" source with
+    | Left _ => "refused"
+    | Right plan => let (MkNativeSkeletonPlan _ _ _ _ _ imports) := plan in
+      match imports with
+      | Left error => let (ImportScanFailure offset) := error in
+        str_concat "import error at " (str_of_nat offset)
+      | Right rows => str_join ","
+          (map ScannedImport String (fun (row : ScannedImport) => let (MkScannedImport path alias _ _ _ _) :=
+              row in
+            match alias with
+            | Nothing => path
+            | Just name => str_cat3 path " as " name
+            end) rows)
+      end
+    end;
+
+def skeleton_test_baseline_result (result : Either NativeBaselineRefusal NativeBaselinePlan) : String :=
+    match result with
+    | Left _ => "refused"
+    | Right plan => match plan with
+      | NativeBaselineUnchanged path => str_concat "unchanged: " path
+      | MkNativeBaselineShard _ _ contents _ => contents
+      end
+    end;
+
+def skeleton_test_baseline (rel : String) (source : Maybe String) : String :=
+    skeleton_test_baseline_result (native_skeleton_baseline rel source);
+
+def skeleton_test_baseline_batch : Bool :=
+    let nul : String := str_of_codes [0] in
+    let row : String := str_concat "std/b.ouro\tb\t" (str_concat nul "\t4") in
+    let malformed : String := str_concat "std/b.ouro" (str_concat nul "\tignored") in
+    let original : String := str_join "\r\n"
+      ["# first", "std/a.ouro\tfirst\t1", row, malformed, "no fields", "# last", "std/a.ouro\tnested\t2"] in
+    let select : String -> Either NativeBaselineRefusal NativeBaselinePlan :=
+      native_skeleton_baseline_planner (Just String original) in
+    let contents (rel : String) : String := skeleton_test_baseline_result (select rel) in
+    andb (str_eq (contents "std/a.ouro") "# first\n# last\nstd/a.ouro\tfirst\t1\nstd/a.ouro\tnested\t2\n")
+      (andb (str_eq (contents "std/missing.ouro") "# first\n# last\n__ouro__/baseline.ouro\t__sentinel\t0\tinternal\tinternal\n")
+        (andb (str_eq (contents "std/b.ouro") (str_concat "# first\n# last\n" (str_concat row "\n")))
+          (str_eq (contents "std/a.ouro\tnested") "# first\n# last\nstd/a.ouro\tnested\t2\n")));
+
+def skeleton_test_baseline_batch_refusal : Bool :=
+    let original : String := str_of_codes [194, 133, 255] in
+    let select : String -> Either NativeBaselineRefusal NativeBaselinePlan :=
+      native_skeleton_baseline_planner (Just String original) in
+    let rejects_as (rel : String) (expected : String) : Bool :=
+      match select rel with
+      | Right _ => False
+      | Left refusal => let (MkNativeBaselineRefusal named source problem) := refusal in
+        match source with
+        | Nothing => False
+        | Just bytes => andb (str_eq named rel)
+            (andb (str_eq bytes original) (str_eq (skeleton_test_problem problem) expected))
+        end
+      end in
+    andb (rejects_as "../outside.ouro" "invalid path") (rejects_as "std/a.ouro" "invalid utf8");
+
+def skeleton_test_baseline_provenance (original : String) (sentinel : Bool) : Bool :=
+    match native_skeleton_baseline "std/new.ouro" (Just String original) with
+    | Left _ => False
+    | Right plan => match plan with
+      | NativeBaselineUnchanged _ => False
+      | MkNativeBaselineShard rel source _ actual =>
+          andb(str_eq rel "std/new.ouro", andb(str_eq source original,
+            match sentinel with | True => actual | False => notb actual end))
+      end
+    end;
+
+def skeleton_test_scopes (paths : List String) : String :=
+    match native_skeleton_compact_scopes paths with
+    | Left message => message
+    | Right scopes => str_join "," scopes
+    end;
+
+def skeleton_test_grouped : String :=
+    "-- prose\nimport\n  \"a.ouro\", -- operand\n  \"b.ouro\";\ndef result : Nat :=\n  1;\n";
+
+def skeleton_test_markers : String :=
+    "-- @entry main\n-- @export value\n-- ouro-analyze: api-root\n-- prose\ndef value : Nat :=\n  1;\n";
+
+def skeleton_test_types : String :=
+    "axiom thing\n  : Nat;\ninductive Color : Type :=\n  | Red : Color\n  | Blue : Color;\nrecord Person : Type := MkPerson {\n  name : String;\n};\neffect Trace (A : Type) : Type :=\n  | note : String -> Trace A Unit;\ndef answer : Nat :=\n  42;\n";
+
+def skeleton_test_literal : String :=
+    "def text : String := r#\"first\n-- ouro-analyze: fake\ndef fake : Nat := 1;\nlast\"#;\ndef n : Nat :=\n  1;\n";
+
+def skeleton_test_provenance : Bool :=
+    let source : String := "-- public\ndef n : Nat :=\n  1;\n" in
+    match native_skeleton_plan SkeletonLocal "std/雪 例.ouro" source with
+    | Left _ => False
+    | Right plan =>
+        andb(str_eq (native_skeleton_original plan) source,
+          andb(native_skeleton_is_for plan SkeletonLocal "std/雪 例.ouro" source,
+            andb(notb(native_skeleton_is_for plan SkeletonFormat "std/雪 例.ouro" source),
+              andb(notb(native_skeleton_is_for plan SkeletonLocal "std/other.ouro" source),
+                notb(native_skeleton_is_for plan SkeletonLocal "std/雪 例.ouro"
+                  "-- public\ndef n : Nat :=\n  2;\n")))))
+    end;
+
+def skeleton_test_chain : String :=
+    "def text : String := r#\"a\nb\"# ++ r#\"c\nd\"# ++ r#\"e\nbad\t\nf\"#;\n";
+
+def skeleton_test_region_ranges (regions : List NativeSkeletonRegion) : String :=
+    str_join "," (map NativeSkeletonRegion String
+      (fun (region : NativeSkeletonRegion) => let (MkNativeSkeletonRegion kind first last) :=
+          region in
+        str_cat3 kind ":" (str_cat3 (str_of_nat first) "-" (str_of_nat last))) regions);
+
+def skeleton_test_literal_ranges (source : String) : String :=
+    match native_skeleton_plan SkeletonFormat "std/example.ouro" source with
+    | Left _ => "refused"
+    | Right plan => let (MkNativeSkeletonPlan _ _ _ _ regions _) := plan in
+      skeleton_test_region_ranges regions
+    end;
+
+def skeleton_test_region_cursor (mode : NativeSkeletonMode) : String :=
+    skeleton_test_region_ranges (native_skeleton_regions mode
+      [ MkNativeSkeletonRegion "import" 1 2
+      , MkNativeSkeletonRegion "open" 2 2
+      , MkNativeSkeletonRegion "def" 3 6
+      , MkNativeSkeletonRegion "record" 7 9
+      , MkNativeSkeletonRegion "open" 10 10
+      , MkNativeSkeletonRegion "def" 11 13
+      , MkNativeSkeletonRegion "def" 3 6
+      , MkNativeSkeletonRegion "def" 20 20
+      ]
+      (map String NativeSkeletonRow (fun (line : String) => MkNativeSkeletonRow line line)
+        ["import \"one.ouro\";", "open N;", "def first : Nat", "\t:=", "  1;", "",
+         "record R : Type := MkR {", "\tfield : Nat;", "};", "open R;",
+         "def last : Nat :=", "  2;"]));
+
+def skeleton_test_rendered_region_order : String :=
+    match native_skeleton_plan SkeletonLocal "std/example.ouro"
+      "import \"a.ouro\";\ndef text : String := r#\"keep\nend\"#;\ndef n : Nat :=\n  1;\n" with
+    | Left _ => "refused"
+    | Right plan => let (MkNativeSkeletonPlan _ _ _ contents regions _) := plan in
+      str_cat3 (skeleton_test_region_ranges regions) "\n" contents
+    end;
+
+def skeleton_test_projection_import_problem : Bool :=
+    let path : String := "std/example.ouro" in
+    let source : String := "import \"a.ouro\", missing;\n" in
+    match native_skeleton_project SkeletonLocal path source with
+    | Left _ => False
+    | Right projected => let (MkPair contents regions) := projected in
+      match native_skeleton_plan SkeletonLocal path source with
+      | Left _ => False
+      | Right plan => let (MkNativeSkeletonPlan _ _ _ planned planned_regions imports) := plan in
+        match imports with
+        | Left error => let (ImportScanFailure offset) := error in
+            andb(eq_nat offset 17, andb(str_eq contents source,
+              andb(str_eq contents planned,
+                str_eq (skeleton_test_region_ranges regions) (skeleton_test_region_ranges planned_regions))))
+        | Right _ => False
+        end
+      end
+    end;
+
+def skeleton_test_chain_provenance : Bool :=
+    match native_skeleton_plan SkeletonFormat "std/雪 例.ouro" skeleton_test_chain with
+    | Left _ => False
+    | Right plan => let (MkNativeSkeletonPlan mode path original contents _ imports) := plan in
+      andb(native_skeleton_mode_eq mode SkeletonFormat,
+        andb(str_eq path "std/雪 例.ouro",
+          andb(str_eq original skeleton_test_chain,
+            andb(str_eq contents skeleton_test_chain,
+              match imports with
+              | Left _ => False
+              | Right rows => nullb ScannedImport rows
+              end))))
+    end;
+
+def main : IO Unit := test_run
+    [ assert_eq "local grouped import retains complete region"
+        (skeleton_test_contents SkeletonLocal skeleton_test_grouped)
+        "\nimport\n  \"a.ouro\", -- operand\n  \"b.ouro\";\ndef result : Nat :=\n\n"
+    , assert_eq "architecture grouped import retains comments and operands"
+        (skeleton_test_contents SkeletonArchitecture skeleton_test_grouped)
+        "\nimport\n  \"a.ouro\", -- operand\n  \"b.ouro\";\n\n\n"
+    , assert_eq "ordered decoded grouped operands come from original source"
+        (skeleton_test_imports skeleton_test_grouped) "a.ouro,b.ouro"
+    , assert_eq "alias on next line retains complete import"
+        (skeleton_test_contents SkeletonArchitecture
+          "import \"a.ouro\"\n  as A;\ndef n : Nat := 1;\n")
+        "import \"a.ouro\"\n  as A;\n\n"
+    , assert_eq "alias observation uses shared import owner"
+        (skeleton_test_imports "import \"a.ouro\"\n  as A;\n") "a.ouro as A"
+    , assert_eq "trailing comma import retains full source region"
+        (skeleton_test_contents SkeletonArchitecture
+          "import\n \"a.ouro\",\n ;\ndef n : Nat := 1;\n")
+        "import\n \"a.ouro\",\n ;\n\n"
+    , assert_eq "malformed grouped operand is retained rather than repaired"
+        (skeleton_test_contents SkeletonLocal
+          "import \"a.ouro\", missing;\ndef n : Nat :=\n  1;\n")
+        "import \"a.ouro\", missing;\ndef n : Nat :=\n\n"
+    , assert_eq "malformed grouped operand carries exact typed scan failure"
+        (skeleton_test_imports "import \"a.ouro\", missing;\n") "import error at 17"
+    , assert_eq "unterminated import quote refuses with original provenance"
+        (skeleton_test_refusal SkeletonLocal "std/a.ouro" "import \"missing\n")
+        "lexical: unclosed string at line 1"
+    , assert_eq "missing import terminator and tail remain visible"
+        (skeleton_test_contents SkeletonArchitecture
+          "import \"a.ouro\"\n  missing;\ndef n : Nat := 1;\n")
+        "import \"a.ouro\"\n  missing;\n\n"
+    , assert_eq "quoted import and declaration words are not form boundaries"
+        (skeleton_test_contents SkeletonArchitecture
+          "def quoted : String := r#\"import \"bad.ouro\"; def fake : Nat\"#;\n") "\n"
+    , assert_eq "quoted imports do not become dependencies"
+        (skeleton_test_imports
+          "def quoted : String := r#\"import \"bad.ouro\"; def fake : Nat\"#;\n") ""
+    , assert_eq "qualified import stays qualified across comments"
+        (skeleton_test_contents SkeletonLocal
+          "def use : Nat := N. -- comment\n  import 1;\n")
+        "def use : Nat := N. -- comment\n\n"
+    , assert_eq "qualified import observation is empty"
+        (skeleton_test_imports "def use : Nat := N. -- comment\n  import 1;\n") ""
+    , assert_eq "public multiline header is retained through body delimiter"
+        (skeleton_test_contents SkeletonLocal
+          "-- public\ndef compose\n  (x : Nat)\n  (y : Nat)\n  : Nat :=\n  add x y;\n")
+        "\ndef compose\n  (x : Nat)\n  (y : Nat)\n  : Nat :=\n\n"
+    , assert_eq "implicit default delimiter does not end the header"
+        (skeleton_test_contents SkeletonLocal
+          "def default\n  {x : Nat := 1}\n  : Nat :=\n  x;\n")
+        "def default\n  {x : Nat := 1}\n  : Nat :=\n\n"
+    , assert_eq "quoted delimiter remains inside the complete header"
+        (skeleton_test_contents SkeletonLocal
+          "def tagged (x : \"import def :=\")\n  : Nat :=\n  1;\n")
+        "def tagged (x : \"import def :=\")\n  : Nat :=\n\n"
+    , assert_eq "malformed closing bracket preserves full declaration region"
+        (skeleton_test_contents SkeletonLocal
+          "def incomplete : Nat\n  ]\ndef other : Nat :=\n  1;\n")
+        "def incomplete : Nat\n  ]\ndef other : Nat :=\n\n"
+    , assert_eq "unterminated header cannot borrow next declaration body"
+        (skeleton_test_contents SkeletonLocal
+          "def incomplete\n  : Nat\ndef other : Nat :=\n  1;\n")
+        "def incomplete\n  : Nat\ndef other : Nat :=\n\n"
+    , assert_eq "malformed clean header remains visible in format staging"
+        (skeleton_test_contents SkeletonFormat "def incomplete : Nat\n  ]\n")
+        "def incomplete : Nat\n  ]\n"
+    , assert_eq "axiom inductive record and effect regions remain complete"
+        (skeleton_test_contents SkeletonLocal skeleton_test_types)
+        "axiom thing\n  : Nat;\ninductive Color : Type :=\n  | Red : Color\n  | Blue : Color;\nrecord Person : Type := MkPerson {\n  name : String;\n};\neffect Trace (A : Type) : Type :=\n  | note : String -> Trace A Unit;\ndef answer : Nat :=\n\n"
+    , assert_eq "multiple forms on one line keep later multiline header"
+        (skeleton_test_contents SkeletonLocal
+          "def first : Nat := 1; def second\n  : Nat :=\n  2;\n")
+        "def first : Nat := 1; def second\n  : Nat :=\n  2;\n"
+    , assert_eq "record field open expression cannot truncate later fields"
+        (skeleton_test_contents SkeletonLocal
+          "record R : Type := MkR {\n  field : open N in Nat;\n  later : String;\n};\ndef n : Nat :=\n  1;\n")
+        "record R : Type := MkR {\n  field : open N in Nat;\n  later : String;\n};\ndef n : Nat :=\n\n"
+    , assert_eq "axiom open expression retains entire multiline type"
+        (skeleton_test_contents SkeletonLocal
+          "axiom value :\n  open N in\n  Nat;\ndef n : Nat :=\n  1;\n")
+        "axiom value :\n  open N in\n  Nat;\ndef n : Nat :=\n\n"
+    , assert_eq "local markers retain entry export and analyzer policy"
+        (skeleton_test_contents SkeletonLocal skeleton_test_markers)
+        "-- @entry main\n-- @export value\n-- ouro-analyze: api-root\n\ndef value : Nat :=\n\n"
+    , assert_eq "architecture retains only its actual policy markers"
+        (skeleton_test_contents SkeletonArchitecture skeleton_test_markers)
+        "\n\n-- ouro-analyze: api-root\n\n\n\n"
+    , assert_eq "architecture keeps lint policy marker"
+        (skeleton_test_contents SkeletonArchitecture "-- ouro-lint: disable X\n  1;\n")
+        "-- ouro-lint: disable X\n\n"
+    , assert_eq "multiline literal sharing a kept line stays complete"
+        (skeleton_test_contents SkeletonLocal skeleton_test_literal)
+        "def text : String := r#\"first\n-- ouro-analyze: fake\ndef fake : Nat := 1;\nlast\"#;\ndef n : Nat :=\n\n"
+    , assert_eq "quoted marker cannot survive architecture masking"
+        (skeleton_test_contents SkeletonArchitecture skeleton_test_literal) "\n\n\n\n\n\n"
+    , assert_eq "shared-line literal closure retains both complete tokens"
+        (skeleton_test_contents SkeletonFormat
+          "def text : String := r#\"first\nlast\"# ++ r#\"second\nbad \t\nend\"#;\n")
+        "def text : String := r#\"first\nlast\"# ++ r#\"second\nbad \t\nend\"#;\n"
+    , assert_eq "strict format clean header and body are blanked"
+        (skeleton_test_contents SkeletonFormat "def n : Nat :=\n  1;\n") "\n\n"
+    , assert_eq "strict format dirty later header line retains whole header"
+        (skeleton_test_contents SkeletonFormat
+          "\n-- public\ndef public (x : Nat)\n  (y : Nat) : Nat :=   \n  x;\n")
+        "\n\ndef public (x : Nat)\n  (y : Nat) : Nat :=   \n\n"
+    , assert_eq "strict format body tab remains a literal finding input"
+        (skeleton_test_contents SkeletonFormat "def n : Nat :=\n\t1;\n") "\n\t1;\n"
+    , assert_eq "strict format dirty record field retains full declaration"
+        (skeleton_test_contents SkeletonFormat "record R : Type := MkR {\n\tfield : Nat;\n};\n")
+        "record R : Type := MkR {\n\tfield : Nat;\n};\n"
+    , assert_eq "strict format CRLF is retained byte for byte"
+        (skeleton_test_contents SkeletonFormat "def n : Nat :=\r\n  1;\r\n")
+        "def n : Nat :=\r\n  1;\r\n"
+    , assert_eq "local blank body keeps its CRLF ending"
+        (skeleton_test_contents SkeletonLocal "def n : Nat :=\r\n  1;\r\n")
+        "def n : Nat :=\r\n\r\n"
+    , assert_eq "missing final newline is not invented"
+        (skeleton_test_contents SkeletonLocal "def n : Nat :=\n  1;") "def n : Nat :=\n"
+    , assert_eq "empty source remains empty"
+        (skeleton_test_contents SkeletonLocal "") ""
+    , assert_eq "Unicode source uses original bytes and correct source lines"
+        (skeleton_test_contents SkeletonLocal "def 雪 : Nat :=\n  1;\n")
+        "def 雪 : Nat :=\n\n"
+    , assert_eq "staging lex uses byte offsets and retains scalar offsets for the public lexer"
+        (let source : String := "-- 雪\nname" in
+          str_cat3 (skeleton_test_token_position (st_lex_byte_offsets source "ouro")) ","
+            (skeleton_test_token_position (st_lex source "ouro")))
+        "name:7:11:2,name:5:9:2"
+    , assert_true "plan binds exact mode relative label and original bytes"
+        skeleton_test_provenance
+    , assert_eq "invalid UTF8 is refused without losing raw bytes"
+        (skeleton_test_refusal SkeletonLocal "std/a.ouro" (str_of_codes [255])) "invalid utf8"
+    , assert_eq "invalid UTF8 takes precedence over an earlier Unicode line separator"
+        (skeleton_test_refusal SkeletonArchitecture "std/a.ouro"
+          (str_of_codes [226, 128, 168, 10, 255])) "invalid utf8"
+    , assert_eq "invalid UTF8 takes precedence over an earlier bare CR"
+        (skeleton_test_refusal SkeletonLocal "std/a.ouro" (str_of_codes [13, 255]))
+        "invalid utf8"
+    , assert_eq "invalid path takes precedence over source problems"
+        (skeleton_test_refusal SkeletonFormat "../a.ouro" (str_of_codes [13, 255]))
+        "invalid path"
+    , assert_eq "bare CR has an explicit preserved-source refusal"
+        (skeleton_test_refusal SkeletonLocal "std/a.ouro" "def n : Nat := 1;\r")
+        "unsupported line break"
+    , assert_eq "Unicode splitlines separator is not silently truncated"
+        (skeleton_test_refusal SkeletonArchitecture "std/a.ouro"
+          (str_of_codes [100, 101, 102, 32, 194, 133])) "unsupported line break"
+    , assert_eq "non-ASCII policy indentation refuses instead of dropping marker"
+        (skeleton_test_refusal SkeletonArchitecture "std/a.ouro"
+          (str_concat (str_of_codes [194, 160]) "-- ouro-analyze: api-root\n"))
+        "unsupported comment prefix"
+    , assert_eq "ASCII unit separator indentation keeps policy marker"
+        (skeleton_test_contents SkeletonArchitecture
+          (str_concat (str_of_codes [31]) "-- ouro-analyze: api-root\n"))
+        (str_concat (str_of_codes [31]) "-- ouro-analyze: api-root\n")
+    , assert_true "policy markers respect mode and masked-code boundaries"
+        (let entry : NativeSkeletonRow := MkNativeSkeletonRow "-- @entry main" "-- @entry main" in
+          andb(native_skeleton_keep SkeletonLocal entry,
+            andb(notb(native_skeleton_keep SkeletonArchitecture entry),
+              andb(notb(native_skeleton_marker False "-- ouro-analyze: api-root" " "),
+                notb(native_skeleton_comment_prefix
+                  (MkNativeSkeletonRow "雪 -- @export value" "雪 -- @export value"))))))
+    , assert_eq "parent traversal path is refused"
+        (skeleton_test_refusal SkeletonLocal "../a.ouro" "") "invalid path"
+    , assert_eq "absolute path is refused"
+        (skeleton_test_refusal SkeletonLocal "/std/a.ouro" "") "invalid path"
+    , assert_eq "drive and backslash path is refused"
+        (skeleton_test_refusal SkeletonLocal "C:\\std\\a.ouro" "") "invalid path"
+    , assert_true "relative path checks preserve UTF8, byte and segment rules"
+        skeleton_test_relative_paths
+    , assert_eq "empty baseline is a real empty shard"
+        (skeleton_test_baseline "std/a.ouro" (Just String "")) ""
+    , assert_eq "unavailable baseline remains unavailable"
+        (skeleton_test_baseline "std/a.ouro" (Nothing String)) "unchanged: std/a.ouro"
+    , assert_eq "baseline comments and matching ordered rows are preserved"
+        (skeleton_test_baseline "std/a.ouro"
+          (Just String "std/b.ouro\tb\t0\n# second\nstd/a.ouro\tfirst\t1\n# last\nstd/a.ouro\tsecond\t2\n"))
+        "# second\n# last\nstd/a.ouro\tfirst\t1\nstd/a.ouro\tsecond\t2\n"
+    , assert_eq "available nonempty baseline without this path gets sentinel"
+        (skeleton_test_baseline "std/a.ouro" (Just String "# baseline\nstd/b.ouro\tb\t0\n"))
+        "# baseline\n__ouro__/baseline.ouro\t__sentinel\t0\tinternal\tinternal\n"
+    , assert_eq "baseline prefix collision is not a matching path row"
+        (skeleton_test_baseline "std/a.ouro" (Just String "std/a.ouro.extra\tx\t0\n"))
+        "__ouro__/baseline.ouro\t__sentinel\t0\tinternal\tinternal\n"
+    , assert_eq "comments alone do not invent an API sentinel"
+        (skeleton_test_baseline "std/a.ouro" (Just String "# baseline\r\n")) "# baseline\n"
+    , assert_eq "baseline accepts bare CR as a line break"
+        (skeleton_test_baseline "std/a.ouro" (Just String "# first\r# second\r"))
+        "# first\n# second\n"
+    , assert_true "baseline refuses invalid UTF8 after a line separator with exact provenance"
+        (let original : String := str_of_codes [194, 133, 255] in
+          match native_skeleton_baseline "std/a.ouro" (Just String original) with
+          | Right _ => False
+          | Left refusal => let (MkNativeBaselineRefusal rel source problem) := refusal in match source with
+            | Nothing => False
+            | Just actual => andb(str_eq (skeleton_test_problem problem) "invalid utf8",
+                andb(str_eq rel "std/a.ouro", str_eq actual original))
+            end
+          end)
+    , assert_eq "indented hash baseline row remains data"
+        (skeleton_test_baseline "std/a.ouro" (Just String " # data\n"))
+        "__ouro__/baseline.ouro\t__sentinel\t0\tinternal\tinternal\n"
+    , assert_true "baseline plan retains exact original and sentinel provenance"
+        (skeleton_test_baseline_provenance "std/old.ouro\told\t0\r\n" True)
+    , assert_true "empty baseline provenance distinguishes absence from empty"
+        (skeleton_test_baseline_provenance "" False)
+    , assert_true "batch baseline preserves ordered rows, NUL bytes, tab paths and sentinel"
+        skeleton_test_baseline_batch
+    , assert_true "batch baseline preserves path error precedence and original bytes"
+        skeleton_test_baseline_batch_refusal
+    , assert_eq "compact scopes are sorted unique top-level source spellings"
+        (skeleton_test_scopes ["tools/analyze/a.ouro", "std/z.ouro", "tools/b.ouro", "a.ouro"])
+        "a.ouro,std,tools"
+    , assert_eq "compact scope unsafe source path fails before scope projection"
+        (skeleton_test_scopes ["std/a.ouro", "../outside.ouro"]) "invalid compact source path"
+    , assert_eq "empty compact inventory stays empty"
+        (skeleton_test_scopes []) ""
+    , assert_eq "last dirty literal retains its complete backward shared-line chain"
+        (skeleton_test_contents SkeletonFormat skeleton_test_chain)
+        "def text : String := r#\"a\nb\"# ++ r#\"c\nd\"# ++ r#\"e\nbad\t\nf\"#;\n"
+    , assert_eq "first dirty literal retains its complete forward shared-line chain"
+        (skeleton_test_contents SkeletonFormat
+          "def text : String := r#\"a\t\nb\"# ++ r#\"c\nd\"# ++ r#\"e\nf\"#;\n")
+        "def text : String := r#\"a\t\nb\"# ++ r#\"c\nd\"# ++ r#\"e\nf\"#;\n"
+    , assert_eq "clean shared-line chain does not invent a format finding"
+        (skeleton_test_contents SkeletonFormat
+          "def text : String := r#\"a\nb\"# ++ r#\"c\nd\"# ++ r#\"e\nf\"#;\n")
+        "\n\n\n\n"
+    , assert_true "retention considers only the inclusive region lines"
+        (let rows : List NativeSkeletonRow :=
+          [ MkNativeSkeletonRow "\t" ""
+          , MkNativeSkeletonRow "" ""
+          , MkNativeSkeletonRow "\t" ""
+          ] in
+          andb(notb(native_skeleton_any_kept SkeletonFormat rows
+              (MkNativeSkeletonRegion "literal" 2 2)),
+            native_skeleton_any_kept SkeletonFormat rows
+              (MkNativeSkeletonRegion "literal" 2 3)))
+    , assert_eq "render preserves bytes across unsorted overlapping regions and uncovered rows"
+        (native_skeleton_render SkeletonLocal
+          [ MkNativeSkeletonRow "first" ""
+          , MkNativeSkeletonRow "second\r" ""
+          , MkNativeSkeletonRow "third" ""
+          , MkNativeSkeletonRow "omitted\r" ""
+          , MkNativeSkeletonRow "fourth" ""
+          , MkNativeSkeletonRow "-- @entry f" "-- @entry f"
+          , MkNativeSkeletonRow "also omitted" ""
+          ]
+          [ MkNativeSkeletonRegion "literal" 5 5
+          , MkNativeSkeletonRegion "literal" 2 3
+          , MkNativeSkeletonRegion "def" 1 2
+          , MkNativeSkeletonRegion "empty" 4 1
+          ])
+        "first\nsecond\r\nthird\n\r\nfourth\n-- @entry f\n"
+    , assert_eq "dirty chain does not retain a detached clean literal component"
+        (skeleton_test_contents SkeletonFormat
+          "def text : String := r#\"a\nb\"# ++ r#\"c\nd\"# ++ r#\"e\nbad\t\nf\"#;\ndef other : String :=\n  r#\"clean\nend\"#;\n")
+        "def text : String := r#\"a\nb\"# ++ r#\"c\nd\"# ++ r#\"e\nbad\t\nf\"#;\n\n\n\n"
+    , assert_eq "literal region provenance retains each extent in source order"
+        (skeleton_test_literal_ranges skeleton_test_chain)
+        "literal:1-2,literal:2-3,literal:3-5"
+    , assert_eq "render order preserves projected bytes and grouped region provenance"
+        skeleton_test_rendered_region_order
+        "import:1-1,def:2-2,def:4-4,literal:2-3\nimport \"a.ouro\";\ndef text : String := r#\"keep\nend\"#;\ndef n : Nat :=\n\n"
+    , assert_true "byte projection preserves malformed imports for the worker"
+        skeleton_test_projection_import_problem
+    , assert_eq "form spans end at the last line of the preceding token"
+        (skeleton_test_region_ranges (native_skeleton_forms
+          [ MkSTTok "def" 0 3 2
+          , MkSTTok "." 4 5 3
+          , MkSTTok "import" 5 11 3
+          , MkSTTok "\"first\nsecond\"" 12 26 3
+          , MkSTTok "axiom" 27 32 7
+          , MkSTTok "\"last\nline\"" 33 44 8
+          ]))
+        "def:2-4,axiom:7-9"
+    , assert_true "token end lines count LF after NUL and ignore CR"
+        (eq_nat_list
+          (map STTok Nat native_skeleton_token_last
+            [ MkSTTok "" 0 0 2
+            , MkSTTok "雪\r" 0 4 3
+            , MkSTTok (str_of_codes [97, 0, 10, 13, 10]) 0 5 5
+            ])
+          [2, 3, 7])
+    , assert_eq "both definitions sharing a line retain their full spans"
+        (skeleton_test_region_ranges (native_skeleton_regions SkeletonLocal
+          [ MkNativeSkeletonRegion "def" 1 1
+          , MkNativeSkeletonRegion "open" 1 1
+          , MkNativeSkeletonRegion "def" 1 3
+          , MkNativeSkeletonRegion "def" 4 5
+          ]
+          (map String NativeSkeletonRow (fun (line : String) => MkNativeSkeletonRow line line)
+            ["def first : Nat := 1; open N in def second", "  : Nat :=", "  2;",
+             "def after : Nat :=", "  3;"])))
+        "def-malformed:1-1,def-malformed:1-3,def:4-4"
+    , assert_eq "region selection keeps header boundaries across row gaps and explicit order"
+        (str_join "|"
+          [ skeleton_test_region_cursor SkeletonLocal
+          , skeleton_test_region_cursor SkeletonFormat
+          , skeleton_test_region_cursor SkeletonArchitecture
+          ])
+        "import:1-2,def:3-4,record:7-10,def:11-11,def:3-4,def-malformed:20-20|def:3-4,record:7-10,def:3-4,def-malformed:20-20|import:1-2"
+    , assert_true "literal chain retains mode path original and import provenance"
+        skeleton_test_chain_provenance
+    , assert_eq "U+2028 line separator refuses all modes with exact provenance"
+        (let source : String := str_of_codes [226, 128, 168] in
+          str_join ","
+            [ skeleton_test_refusal SkeletonLocal "std/雪 例.ouro" source
+            , skeleton_test_refusal SkeletonFormat "std/雪 例.ouro" source
+            , skeleton_test_refusal SkeletonArchitecture "std/雪 例.ouro" source
+            ])
+        "unsupported line break,unsupported line break,unsupported line break"
+    , assert_eq "U+2029 paragraph separator refuses all modes with exact provenance"
+        (let source : String := str_of_codes [226, 128, 169] in
+          str_join ","
+            [ skeleton_test_refusal SkeletonLocal "std/雪 例.ouro" source
+            , skeleton_test_refusal SkeletonFormat "std/雪 例.ouro" source
+            , skeleton_test_refusal SkeletonArchitecture "std/雪 例.ouro" source
+            ])
+        "unsupported line break,unsupported line break,unsupported line break"
+    ];

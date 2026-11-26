@@ -16,7 +16,7 @@ from repo_support import hash_json, sha256_path, write_json_atomic
 
 digest = sha256_path
 
-LAW_ENTRY = "tests/compiler_fault_tests.ouro"
+LAW_ENTRY = "tests/compiler/diagnostics/compiler_fault_tests.ouro"
 LAW_EXPECTATIONS = {
     "CHK.sort-cumul": "90/body/type-mismatch", "CTL.sort-cumul": "accepted",
     "CHK.termination": "90/body/non-terminating", "CTL.termination": "accepted",

@@ -144,31 +144,52 @@ def normalize_fix_application (reduce : CoreTerm -> NormalizeResult CoreTerm)
     (fuel : Nat) (name : Nat) (rec_arg : Nat) (arity : Nat)
     (annotation : CoreTerm) (body : CoreTerm) (arguments : List CoreTerm)
     (argument : CoreTerm) (stuck : CoreTerm) : NormalizeResult CoreTerm :=
-    match snoc_with_len arguments argument with
-    | MkArgsLen supplied count =>
-        match ltNat rec_arg count with
-        | False => Normalized CoreTerm stuck
-        | True =>
-            match compiler_nth CoreTerm supplied rec_arg with
-            | Nothing => NormalizeMalformed CoreTerm NormalizeFixArgument
-            | Just structural =>
-                normalize_bind CoreTerm CoreTerm (reduce structural)
-                  (fun (value : CoreTerm) =>
-                    normalize_bind Spine CoreTerm (app_spine_checked fuel value)
-                      (fun (spine : Spine) =>
-                        match spine with
-                        | MkSpine head _ =>
-                            match asCtorHead head with
-                            | NotCtor => Normalized CoreTerm stuck
-                            | YesCtor _ _ _ =>
-                                let self : CoreTerm := CFix name rec_arg arity annotation body in
-                                let lifted : List CoreTerm := map CoreTerm CoreTerm
-                                  (fun (term : CoreTerm) => lift 1 term) supplied in
-                                reduce (subst(self, mk_app body lifted))
-                            end
-                        end))
+    let selected : Maybe CoreTerm :=
+      (fix select_argument (position : Nat) (prefix : List CoreTerm) : Maybe CoreTerm :=
+        match prefix with
+        | Nil => match position with
+            | Z => Just CoreTerm argument
+            | S _ => Nothing CoreTerm
             end
+        | Cons current rest => match position with
+            | Z => Just CoreTerm current
+            | S next => select_argument next rest
+            end
+        end) rec_arg arguments in
+    match selected with
+    | Nothing => Normalized CoreTerm stuck
+    | Just structural =>
+        normalize_bind CoreTerm CoreTerm (reduce structural)
+          (fun (value : CoreTerm) =>
+            normalize_bind Spine CoreTerm (app_spine_checked fuel value)
+              (fun (spine : Spine) =>
+                match spine with
+                | MkSpine head _ =>
+                    match asCtorHead head with
+                    | NotCtor => Normalized CoreTerm stuck
+                    | YesCtor _ _ _ => match snoc_with_len arguments argument with
+                        | MkArgsLen supplied _ =>
+                            let self : CoreTerm := CFix name rec_arg arity annotation body in
+                            let lifted : List CoreTerm := map CoreTerm CoreTerm
+                              (fun (term : CoreTerm) => lift 1 term) supplied in
+                            reduce (subst(self, mk_app body lifted))
+                        end
+                    end
+                end))
+    end;
+
+-- Keep the complete tail for String type selection and first-role metadata.
+def string_application_lookup_entries (sig : CheckEnvironment) (head : CoreTerm)
+    : List Entry :=
+    match head with
+    | CConst name => match check_environment_lookup name sig with
+        | Nothing => []
+        | Just entry => Cons Entry entry (check_environment_entries sig)
         end
+    | CRel _ => [] | CSort _ => [] | CPi _ _ => [] | CLam _ _ => []
+    | CApp _ _ => [] | CLetIn _ _ _ => [] | CInd _ => []
+    | CConstruct _ _ _ => [] | CCase _ _ _ _ => [] | CFix _ _ _ _ _ => []
+    | CStrLit _ _ => [] | CStrBytes _ _ => []
     end;
 
 def normalize_application (reduce : CoreTerm -> NormalizeResult CoreTerm)
@@ -182,7 +203,7 @@ def normalize_application (reduce : CoreTerm -> NormalizeResult CoreTerm)
             | MkSpine head arguments =>
                 match asFixHead head with
                 | NotFix => normalize_bind (Maybe CoreTerm) CoreTerm
-                    (normalize_string_application reduce fuel (check_environment_entries sig) head arguments argument)
+                    (normalize_string_application reduce fuel (string_application_lookup_entries sig head) head arguments argument)
                     (fun (result : Maybe CoreTerm) => match result with
                       | Nothing => normalize_stuck_application function argument
                       | Just value => Normalized CoreTerm value
@@ -197,16 +218,21 @@ def normalize_application (reduce : CoreTerm -> NormalizeResult CoreTerm)
 def normalize_case_branch (reduce : CoreTerm -> NormalizeResult CoreTerm)
     (nparams : Nat) (arities : List Nat) (branches : List CoreTerm)
     (index : Nat) (arguments : List CoreTerm) : NormalizeResult CoreTerm :=
-    match compiler_nth Nat arities index, compiler_nth CoreTerm branches index with
-    | Nothing, Nothing => NormalizeMalformed CoreTerm NormalizeCaseConstructor
-    | Nothing, Just _ => NormalizeMalformed CoreTerm NormalizeCaseConstructor
-    | Just _, Nothing => NormalizeMalformed CoreTerm NormalizeCaseConstructor
-    | Just arity, Just branch =>
-        match eqNat(length CoreTerm arguments, add nparams arity) with
-        | False => NormalizeMalformed CoreTerm NormalizeCaseArguments
-        | True => reduce (mk_app(branch, drop CoreTerm nparams arguments))
-        end
-    end;
+    (fix select_branch (position : Nat) (remaining_arities : List Nat)
+        (remaining_branches : List CoreTerm) : NormalizeResult CoreTerm :=
+      match remaining_arities, remaining_branches with
+      | Nil, Nil => NormalizeMalformed CoreTerm NormalizeCaseConstructor
+      | Nil, Cons _ _ => NormalizeMalformed CoreTerm NormalizeCaseConstructor
+      | Cons _ _, Nil => NormalizeMalformed CoreTerm NormalizeCaseConstructor
+      | Cons arity rest_arities, Cons branch rest_branches =>
+          match position with
+          | Z => match eqNat(length CoreTerm arguments, add nparams arity) with
+              | False => NormalizeMalformed CoreTerm NormalizeCaseArguments
+              | True => reduce (mk_app(branch, drop CoreTerm nparams arguments))
+              end
+          | S next => select_branch next rest_arities rest_branches
+          end
+      end) index arities branches;
 
 def normalize_case_constructor (reduce : CoreTerm -> NormalizeResult CoreTerm)
     (info : CaseInfo) (branches : List CoreTerm) (ind : Nat) (index : Nat)
@@ -272,7 +298,7 @@ def normalize_string_bytes (reduce : CoreTerm -> NormalizeResult CoreTerm)
     normalize_bind Unit CoreTerm (string_nf_validate fuel bytes)
       (fun (_valid : Unit) => normalize_bind CoreTerm CoreTerm (reduce (CConst typ))
         (fun (normal : CoreTerm) =>
-          match string_value_type_head(check_environment_entries sig, normal) with
+          match string_value_type_head_indexed sig normal with
           | Just name => Normalized(CoreTerm, CStrBytes bytes name)
           | Nothing => NormalizeMalformed CoreTerm NormalizeStringType
           end));
@@ -348,7 +374,32 @@ def whnf_deferred : Nat -> CheckEnvironment -> Nat -> List CoreTerm -> CoreTerm 
     end;
 
 def whnf_checked_worker (fuel : Nat) (sig : CheckEnvironment) (term : CoreTerm) : NormalizeResult CoreTerm :=
-    whnf_deferred fuel sig Z (Nil CoreTerm) term;
+    -- Neutral heads stay fixed without pending substitutions. Fuel for the
+    -- whole spine also covers each shorter prefix scan in the reducer.
+    let neutral_spine : Bool :=
+      if let CApp function _ := (term : CoreTerm) then
+        match fuel with
+        | Z => False
+        | S remaining =>
+            (fix spine_fits (budget : Nat) (head : CoreTerm) : Bool :=
+              match budget with
+              | Z => False
+              | S next => match head with
+                  | CApp prefix _ => spine_fits next prefix
+                  | CRel _ => True
+                  | CInd _ => True
+                  | CConstruct _ _ _ => True
+                  | CSort _ => False | CPi _ _ => False | CLam _ _ => False
+                  | CLetIn _ _ _ => False | CConst _ => False | CCase _ _ _ _ => False
+                  | CFix _ _ _ _ _ => False | CStrBytes _ _ => False | CStrLit _ _ => False
+                  end
+              end) remaining function
+        end
+      else False in
+    match neutral_spine with
+    | True => Normalized CoreTerm term
+    | False => whnf_deferred fuel sig Z (Nil CoreTerm) term
+    end;
 
 def normalize_pair (reduce : CoreTerm -> NormalizeResult CoreTerm)
     (build : CoreTerm -> CoreTerm -> CoreTerm) (first : CoreTerm) (second : CoreTerm)

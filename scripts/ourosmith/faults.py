@@ -176,7 +176,7 @@ FAULTS: tuple[Fault, ...] = (
     Fault("fix-rounds-off", "fix", "tools/fix/pipeline.ouro",
           "def fx_rounds : Nat := 8;", "def fx_rounds : Nat := 0;",
           "fixer performs no rewrite rounds", ("fix-check-dirty", "fix-dead-let"), "recipe:fixer"),
-    Fault("doc-signature-off", "doc", "tools/doc_model.ouro",
+    Fault("doc-signature-off", "doc", "tools/doc/model.ouro",
           'str_cat3 "```" (str_concat "\\n" (decl_sig d))', 'str_cat3 "```" "\\n"',
           "documentation omits declaration signatures", ("doc-signature-comment",), "recipe:documentation"),
     Fault("lsp-line-shift", "lsp", "tools/lsp_model.ouro",

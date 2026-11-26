@@ -1,0 +1,278 @@
+import "model.ouro",
+  "../selftest_fs.ouro",
+  "../../std/fs.ouro",
+  "../../std/args.ouro",
+  "../../std/collections.ouro",
+  "../../std/format.ouro",
+  "../../std/processx.ouro";
+
+def doc_show_bool (b : Bool) : String :=
+    show_bool b;
+
+inductive DocSelftestResult : Type :=
+  | MkDocSelftestResult : String -> Bool -> String -> DocSelftestResult;
+
+
+def doc_selftest_result_name (r : DocSelftestResult) : String :=
+    match r with | MkDocSelftestResult name _ _ => name end;
+
+
+def doc_selftest_result_pass (r : DocSelftestResult) : Bool :=
+    match r with | MkDocSelftestResult _ passed _ => passed end;
+
+
+def doc_selftest_result_issue (r : DocSelftestResult) : String :=
+    match r with | MkDocSelftestResult _ _ issue => issue end;
+
+
+def doc_selftest_write (path : String) (content : String) : IO Unit :=
+    selftest_fs_require "DOC_SUITE: FAIL " (fs_write_checked path content);
+
+
+def doc_selftest_read (path : String) : IO String :=
+    selftest_fs_read "DOC_SUITE: FAIL " path;
+
+
+def doc_selftest_mkdir (path : String) : IO Unit :=
+    selftest_fs_require "DOC_SUITE: FAIL " (fs_mkdir_p_checked path);
+
+
+def doc_selftest_output (result : ProcResult) : String :=
+    str_concat(proc_stdout result, proc_stderr result);
+
+
+def doc_selftest_run_log (exe : String) (run_args : List String) (log : String)
+    : IO ProcResult :=
+    do let! result := process_run_spec (command_spec exe run_args);
+       doc_selftest_write(log, doc_selftest_output result);
+       io_pure ProcResult result
+
+
+def doc_selftest_success (name : String) : IO DocSelftestResult :=
+    do println (str_concat "DOC_OK " name);
+       io_pure(DocSelftestResult, MkDocSelftestResult name True "")
+
+
+def doc_selftest_failure (name : String) (issue : String) (details : String)
+    : IO DocSelftestResult :=
+    do eprintln (str_cat4 "DOC_FAIL " name " " issue);
+       if str_null details then io_unit else eprint details;
+       io_pure(DocSelftestResult, MkDocSelftestResult name False issue)
+
+
+def doc_selftest_expected (probe_failure : Bool) (golden : String) : String :=
+    if probe_failure then str_concat golden "deliberate selftest mismatch\n" else golden;
+
+private def doc_selftest_kind_boundaries : Bool :=
+    list_eq String str_eq
+      (map String String (fun (line : String) => fromMaybe String "" (doc_kind_at line))
+        ["def value", "axiom value", "inductive Value", "record Value", "effect Value",
+         "intrinsic value", "extern value", "def", "def\tvalue", " def value", "define value"])
+      ["def", "axiom", "inductive", "record", "effect", "intrinsic", "extern", "", "", "", ""];
+
+
+def doc_selftest_signature_boundaries : Bool :=
+    let source : String := str_join "\n"
+      ["-- module", "\t \r", "-- attached", "def multi", "  (n : Nat)", "  -- note", "  : Nat := n;",
+       "def before_blank", "", "ignored", "def before_next", "axiom next : Nat;",
+       "def before_space", "\t \r", "ignored", "def before_body", "\t -- note \t", " \t:= value;",
+       "def at_eof", "  (v : Nat)"] in
+    let model : ModDoc := doc_module "sample.ouro" source in
+    let decls : List Decl := mod_decls model in
+    andb (list_eq String str_eq (mod_docs model) ["module"])
+      (andb (list_eq Nat eq_nat (map Decl Nat decl_line decls) [4, 8, 11, 12, 13, 16, 19])
+        (list_eq String str_eq (map Decl String decl_sig decls)
+          ["def multi\n  (n : Nat)\n  : Nat", "def before_blank", "def before_next", "axiom next : Nat",
+           "def before_space", "def before_body", "def at_eof\n  (v : Nat)"]));
+
+
+private def doc_selftest_whitespace_boundaries : Bool :=
+    let closes (line : String) : Bool :=
+      match scan_header (scan_line scan_empty line (Nil String)) with
+      | Nothing => False
+      | Just _ => True
+      end in
+    andb (all String closes ["", " \t\r\n"])
+      (andb (all String (fun (line : String) => notb (closes line))
+          [" \t雪", str_of_codes [32, 0], str_of_codes [32, 11, 12]])
+        (str_eq (doc_signature_tail [" \t-\r", " \t-- omitted", " \t:= value;"] "def value")
+          "def value\n \t-"));
+
+
+private def doc_selftest_assignment_boundaries : Bool :=
+    andb (str_eq (doc_sig_of "def value : String := \":=\"; \r") "def value : String")
+      (andb (str_eq (doc_sig_of "axiom value : Nat  ; \r") "axiom value : Nat")
+        (str_eq (doc_signature_tail ["\t(A : Type)  ", " \t: A  := a := b; \r", "  ignored"] "def value")
+          "def value\n\t(A : Type)\n \t: A"));
+
+
+private def doc_selftest_comment_boundaries : Bool :=
+    let model : ModDoc := doc_module "sample.ouro"
+      "-- \tmodule \r\n-- @module\n\n-- first\n-- \t@entry value \r\n--\n-- last \r\ndef value : Nat := 0;" in
+    andb (list_eq String str_eq (mod_docs model) ["module"])
+      (match mod_decls model with
+       | Nil => False
+       | Cons decl rest => andb (nullb Decl rest)
+           (andb (eq_nat (decl_line decl) 8) (list_eq String str_eq (decl_docs decl) ["first", "", "last"]))
+       end);
+
+
+def doc_selftest_fixture (exe : String) (out : String) (fixtures : String)
+    (probe_failure : Bool) : IO DocSelftestResult :=
+    let fixture_out : String := fs_child out "fixture" in
+    let source : String := fs_child fixtures "sample.ouro" in
+    let generated : String := fs_child(fixture_out, doc_out_name source) in
+    let golden_path : String := fs_child fixtures "sample.golden.md" in
+    let log_path : String := fs_child out "fixture.log" in
+    let diff_path : String := fs_child out "fixture.diff" in
+    do let! run := doc_selftest_run_log exe
+         ([ "--out", fixture_out, source ] : List String)
+         log_path;
+       let! actual := doc_selftest_read generated;
+       let! golden := doc_selftest_read golden_path;
+       let expected : String := doc_selftest_expected probe_failure golden in
+       let passed : Bool := andb(eq_nat(proc_code run, Z), str_eq actual expected) in
+       do doc_selftest_write diff_path
+            (if str_eq actual expected then "" else "generated documentation differs from golden\n");
+          (if passed then
+            if all Bool (fun (passed : Bool) => passed)
+                [doc_selftest_kind_boundaries, doc_selftest_signature_boundaries,
+                 doc_selftest_whitespace_boundaries, doc_selftest_assignment_boundaries,
+                 doc_selftest_comment_boundaries] then
+              doc_selftest_success "fixture"
+            else
+              doc_selftest_failure "fixture" "signatures" "declaration signatures or lines differ\n"
+          else
+            doc_selftest_failure "fixture" "output"
+              (if str_eq actual expected then doc_selftest_output run
+                else "generated documentation differs from golden\n"))
+
+
+private def doc_selftest_missing (exe : String) (run_args : List String) (log : String)
+    (name : String) (diagnostic : String) : IO DocSelftestResult :=
+    do let! run := doc_selftest_run_log exe run_args log;
+       let output : String := doc_selftest_output run in
+       (if eq_nat (proc_code run) Z then doc_selftest_failure name "expected nonzero" ""
+        else if str_contains output diagnostic then doc_selftest_success name
+        else doc_selftest_failure name "no report" output)
+
+def doc_selftest_missing_file (exe : String) (out : String) : IO DocSelftestResult :=
+    doc_selftest_missing exe
+      ["--out", fs_child out "missing", fs_child out "does-not-exist.ouro"]
+      (fs_child out "missing.log") "missing-file" "no such file"
+
+
+def doc_selftest_missing_list (exe : String) (out : String) : IO DocSelftestResult :=
+    doc_selftest_missing exe
+      ["--out", fs_child out "badlist", "--files-from", fs_child out "no-such.list"]
+      (fs_child out "badlist.log") "missing-files-from" "could not read file list"
+
+
+def doc_selftest_files_from (exe : String) (out : String) (fixtures : String) : IO DocSelftestResult :=
+    let list_path : String := fs_child out "one.list" in
+    let source : String := fs_child fixtures "sample.ouro" in
+    let from_out : String := fs_child out "fromlist" in
+    let generated : String := fs_child(from_out, doc_out_name source) in
+    let log : String := fs_child out "fromlist.log" in
+    let diff : String := fs_child out "fromlist.diff" in
+    do doc_selftest_write(list_path, str_concat source "\n");
+       let! run := doc_selftest_run_log exe
+         ([ "--out", from_out, "--files-from", list_path ] : List String) log;
+       let! actual := doc_selftest_read generated;
+       let! golden := doc_selftest_read (fs_child fixtures "sample.golden.md");
+       let passed : Bool := str_eq actual golden in
+       do doc_selftest_write diff
+            (if passed then "" else "generated --files-from documentation differs from golden\n");
+          (if passed then doc_selftest_success "files-from"
+          else
+            doc_selftest_failure "files-from" "output"
+              (str_concat "generated --files-from documentation differs from golden\n"
+                (doc_selftest_output run)))
+
+
+def doc_selftest_std_files : IO (List String) :=
+    do let! files := fs_walk_ouro "std";
+       io_pure(List String, str_sort files)
+
+
+def doc_selftest_api (exe : String) (out : String) (regen : Bool)
+    (files : List String) : IO DocSelftestResult :=
+    let list_path : String := fs_child out "std.list" in
+    let nfiles : Nat := length String files in
+    do let! regen_run :=
+         (if regen then
+           do let! run := doc_selftest_run_log exe
+                ([ "--out", "docs/api", "--files-from", list_path ] : List String)
+                (fs_child out "regen.log");
+              if eq_nat(proc_code run, Z) then
+                do println
+                   (str_cat3 "DOC_REGEN docs/api files="
+                     (prim_string_of_nat nfiles) "");
+                          io_pure(Maybe ProcResult, Just ProcResult run)
+              else io_pure(Maybe ProcResult, Just ProcResult run)
+         else io_pure(Maybe ProcResult, Nothing ProcResult));
+       let! checked := doc_selftest_run_log exe
+         ([ "--check", "--out", "docs/api", "--files-from", list_path ] : List String)
+         (fs_child out "check.log");
+       let regen_ok : Bool :=
+         match regen_run with
+         | Nothing => True
+         | Just run => eq_nat(proc_code run, Z)
+         end in
+       let passed : Bool := andb(regen_ok, eq_nat(proc_code checked, Z)) in
+       let name : String := str_concat("api modules=", prim_string_of_nat nfiles) in
+       (if passed then doc_selftest_success name
+       else
+         doc_selftest_failure "api" "stale"
+           (str_concat
+             (match regen_run with
+              | Nothing => ""
+              | Just run => doc_selftest_output run
+              end)
+             (doc_selftest_output checked)))
+
+
+def doc_selftest_result_row (r : DocSelftestResult) : String :=
+    str_join "\t"
+      ([ doc_selftest_result_name r
+       , doc_show_bool (doc_selftest_result_pass r)
+       , doc_selftest_result_issue r
+       ] : List String);
+
+
+def doc_selftest_report (results : List DocSelftestResult) : String :=
+    str_concat
+      (str_unlines
+        (Cons String "name\tpass\tissue"
+          (map DocSelftestResult String doc_selftest_result_row results))) "\n";
+
+
+def doc_selftest_failure_count (results : List DocSelftestResult) : Nat :=
+    count_if DocSelftestResult
+      (fun (r : DocSelftestResult) => notb (doc_selftest_result_pass r)) results;
+
+
+def doc_selftest_finish (out : String) (display_out : String)
+    (results : List DocSelftestResult) : IO Unit :=
+    do doc_selftest_write (fs_child out "selftest-report.tsv") (doc_selftest_report results);
+       selftest_suite_exit "DOC_SUITE" display_out (length DocSelftestResult results)
+         (doc_selftest_failure_count results)
+
+
+def run_doc_selftest (exe : String) (a : Args) : IO Unit :=
+    let fixtures : String := args_opt_or a "fixtures" "_build/smith/fixtures/doc" in
+    let out : String := args_opt_or a "out" "_build/doc_suite" in
+    do let! display_out := env_or "DOC_SUITE_DISPLAY_OUT" out;
+       doc_selftest_mkdir out;
+       let! files := doc_selftest_std_files;
+       doc_selftest_write (fs_child out "std.list")
+         (str_concat(str_unlines files, "\n"));
+       let! fixture := doc_selftest_fixture exe out fixtures
+         (args_flag a "selftest-probe-failure");
+       let! missing_file := doc_selftest_missing_file exe out;
+       let! missing_list := doc_selftest_missing_list exe out;
+       let! files_from := doc_selftest_files_from exe out fixtures;
+       let! api := doc_selftest_api exe out (args_flag a "regen") files;
+       doc_selftest_finish out display_out
+         ([ fixture, missing_file, missing_list, files_from, api ]
+           : List DocSelftestResult)

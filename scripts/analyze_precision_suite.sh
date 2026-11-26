@@ -269,6 +269,9 @@ set -- tools/analyze/architecture.ouro \
 	tools/analyze/naming.ouro \
 	tools/analyze/errors.ouro \
 	tools/analyze/bounded_text.ouro \
+	tools/analyze/bounded_report.ouro \
+	tools/analyze/bounded_report_main.ouro \
+	tests/analyze/precision/bounded_report.ouro \
 	tests/analyze/precision/absint.ouro \
 	tests/analyze/precision/lint.ouro \
 	tests/analyze/precision/format_fix.ouro \
@@ -397,6 +400,34 @@ check_native_drive_args() (
 		--enable-strict --enable-strict --enable-all
 	cmp -s "$OUT_DIR/native_argv_all.out" "$OUT_DIR/native_argv_strict.out" || \
 		fail_case native_argv_strict "repeated strict/all profiles changed findings"
+	cat >unit-facts.ouro <<'OURO'
+def first : Nat := div_nat (S Z) Z;
+def clean : Nat := Z;
+def last : Nat := prim_fs_write_file prim_argv;
+OURO
+	native_drive_case native_unit_facts 1 1 2 absint,taint --enable-absint --enable-taint \
+		--scope unit-facts.ouro
+	sed -n 's/^unit-facts\.ouro:\([0-9][0-9]*\):1: [a-z]*\[\(OURO-[A-Z0-9]*\)\].*/\1 \2/p' \
+		"$OUT_DIR/native_unit_facts.out" >"$OUT_DIR/native_unit_facts.codes"
+	printf '%s\n' '1 OURO-ABS001' '3 OURO-TAINT001' >"$OUT_DIR/native_unit_facts.expected"
+	cmp -s "$OUT_DIR/native_unit_facts.expected" "$OUT_DIR/native_unit_facts.codes" || \
+		fail_case native_unit_facts "shared unit facts changed definition findings or order"
+	sed -e 's/^-- @complexity$/-- @complexity @bound(nodes <= 0) @bound(cyclo = 0) @minimal/' \
+		-e '/^def main /s/:=$/:= let copy : Bool := b in/' \
+		-e 's/match b with/match copy with/g' \
+		"$ROOT/tests/analyze/metrics_bad/cyclomatic.ouro" >metrics-shared.ouro
+	printf '\ndef unannotated (b : Bool) : Bool := let copy : Bool := b in copy;\n' >>metrics-shared.ouro
+	native_drive_case native_metrics_shared 1 1 4 metrics --enable-metrics --scope metrics-shared.ouro
+	sed -n 's/^  witness: //p' "$OUT_DIR/native_metrics_shared.out" >"$OUT_DIR/native_metrics_shared.witnesses"
+	printf '%s\n' 'def main: malformed @bound(cyclo = 0)' 'def main: nodes = 110 violates @bound(nodes <= 0)' \
+		'def main: cyclomatic 43 exceeds 40' 'def main: let copy aliases a variable or literal' \
+		>"$OUT_DIR/native_metrics_shared.expected"
+	cmp -s "$OUT_DIR/native_metrics_shared.expected" "$OUT_DIR/native_metrics_shared.witnesses" || \
+		fail_case native_metrics_shared "shared AST size changed metric claims, order, or unannotated coverage"
+	printf '%s\n' '-- @requires nonempty' 'inductive Empty : Type := ;' >orphan-contract.ouro
+	native_drive_case native_orphan_contract 1 1 1 contracts --enable-contracts --scope orphan-contract.ouro
+	grep -Fq '[OURO-CTR001]' "$OUT_DIR/native_orphan_contract.out" || \
+		fail_case native_orphan_contract "definition-free unit lost its orphan contract"
 	native_drive_case native_argv_literal_values 0 1 0 dataflow --enable-dataflow \
 		--scope --enable-style --api-baseline --enable-simplify
 	native_drive_case native_argv_unknown_value 0 1 0 dataflow --enable-dataflow \
@@ -524,7 +555,7 @@ check_native_base_inputs
 # The assertions run in Ouro. This launcher only builds, executes and retains
 # logs; failed builds, missing binaries and empty/missing reports fail closed.
 # The deadcode root exercises the host fact extractors through their native ABI.
-for precision_core in absint lint format_fix host style kernel_mirror frontend_helpers deadcode_patterns architecture imports; do
+for precision_core in absint lint format_fix host style kernel_mirror frontend_helpers deadcode_patterns architecture imports bounded_report; do
 	precision_bin="$OUT_DIR/precision-$precision_core"
 	run_case "precision_build_$precision_core" env OURO_BUILD_TOOL_MODE=native \
 		sh scripts/build_tool.sh "tests/analyze/precision/$precision_core.ouro" "$precision_bin"
@@ -534,6 +565,223 @@ for precision_core in absint lint format_fix host style kernel_mirror frontend_h
 	grep -q '^PRECISION_SUITE .* rows=[1-9][0-9]*$' "$OUT_DIR/precision_run_$precision_core.out" || \
 		fail_case "precision_run_$precision_core" "missing nonempty native suite report"
 done
+
+# Retain host lexical observations while executing the sole native verdict owner.
+"$PYTHON" - <<'PY'
+import contextlib
+import io
+import json
+from pathlib import Path
+import subprocess
+from unittest.mock import patch
+import sys
+sys.path.insert(0, "scripts")
+import analyze_bounded as bounded
+from ourosmith.limits import RunResult, run_limited
+
+clean = "ANALYZE_DRIVE files=1 findings=0 rejected=0 families=dataflow\n"
+path = "C:/каталог/漢字 file.ouro"
+finding = (f"{path}:2:1: warning[OURO-DF001] dataflow/unused-param: unused\n"
+           "  hint: use it\n  witness: value\n")
+diagnostic = finding + clean.replace("findings=0", "findings=1")
+cases = [
+    (0, clean, "", ""),
+    (0, clean.replace("\n", "\r\n"), "", ""),
+    (0, clean.replace("files=1", "files=١"), "", ""),
+    (0, clean.replace("files=1", "files=0001").replace("findings=0", "findings=000"), "", ""),
+    (1, diagnostic, "", ""),
+    (0, clean + clean, "crash\n", "missing, malformed or repeated structured completion report"),
+    (0, clean.replace("files=1", "files=-1"), "", "missing, malformed or repeated structured completion report"),
+    (0, clean.replace("files=1", "files=0").replace("dataflow", "effects"), "crash\n",
+     "structured report omitted or duplicated requested files"),
+    (1, clean.replace("dataflow", "effects").replace("findings=0", "findings=1"), "crash\n",
+     "structured report did not run the requested families"),
+    (1, clean.replace("findings=0", "findings=1"), "crash\n",
+     "structured diagnostic counts disagree with the completion report"),
+    (1, diagnostic.replace("  witness: value\n", ""), "",
+     "structured worker emitted unreported output"),
+    (137, clean, "crash\n", "structured worker emitted an unexpected error"),
+    (137, clean + "unreported\n", "", "structured worker emitted unreported output"),
+    (-9, clean, "", "structured exit code disagrees with the completion report"),
+]
+for code, stdout, stderr, expected in cases:
+    actual = bounded.drive_result_error(subprocess.CompletedProcess([], code, stdout, stderr),
+                                       files=1, families="dataflow")
+    assert actual == expected, (expected, actual)
+assert bounded.drive_result_error(subprocess.CompletedProcess([], 1, diagnostic, ""),
+                                  files=1, families="dataflow", path=path) == ""
+assert bounded.drive_result_error(subprocess.CompletedProcess([], 0, clean, ""),
+                                  files=-1, families="effects") == "structured report omitted or duplicated requested files"
+
+large_count = "1" + "0" * 1001
+large = clean.replace("files=1", "files=" + large_count)
+assert bounded.drive_banner(large) == ({"files": int(large_count), "findings": 0, "rejected": 0}, "dataflow")
+assert bounded.drive_result_error(subprocess.CompletedProcess([], 0, large, ""),
+                                  files=1, families="dataflow") == "structured report omitted or duplicated requested files"
+assert bounded.drive_result_error(subprocess.CompletedProcess([], 0, large + clean, ""),
+                                  files=1, families="dataflow") == "missing, malformed or repeated structured completion report"
+for field in ("findings", "rejected"):
+    large_diagnostics = clean.replace(field + "=0", field + "=" + large_count)
+    assert bounded.drive_result_error(subprocess.CompletedProcess([], 1, large_diagnostics, ""),
+                                      files=1, families="dataflow") == "structured diagnostic counts disagree with the completion report"
+
+# Native branch one must run before any public whole-count integer conversion.
+saved_digit_limit = sys.get_int_max_str_digits()
+try:
+    sys.set_int_max_str_digits(640)
+    for digits, valid_error in (
+        ("1" + "0" * 640, "structured report omitted or duplicated requested files"),
+        ("١" + "٠" * 1001, "structured report omitted or duplicated requested files"),
+        ("0" * 640 + "1", ""),
+    ):
+        oversized = clean.replace("files=1", "files=" + digits)
+        for output in (oversized + clean, oversized.replace("dataflow", "dataflow,dataflow")):
+            assert bounded.drive_banner(output) is None
+            error = bounded.drive_result_error(subprocess.CompletedProcess([], 0, output, ""),
+                                              files=1, families="dataflow")
+            assert error == "missing, malformed or repeated structured completion report", error
+        try:
+            bounded.drive_banner(oversized)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("valid banner must retain the public integer digit limit")
+        error = bounded.drive_result_error(subprocess.CompletedProcess([], 0, oversized, ""),
+                                          files=1, families="dataflow")
+        assert error == valid_error, (valid_error, error)
+finally:
+    sys.set_int_max_str_digits(saved_digit_limit)
+
+binary = bounded._drive_report_binary()
+request = {
+    "kind": "ouro.analyze-bounded-report-request.v1", "mode": "verify",
+    "expected": {"files": "1", "families": "dataflow", "path": None},
+    "banners": [{"files": "1", "findings": "0", "rejected": "0", "families": "dataflow"}],
+    "finding_paths": [], "rejection_paths": [], "stdout_unreported": False,
+    "stderr_unexpected": False, "exit": "0", "family_metadata": None,
+}
+payload = json.dumps(request, separators=(",", ":"))
+duplicate = payload[:-1] + ',"exit":"0"}'
+for text in ("{}", duplicate, payload.replace('"stdout_unreported":false', '"stdout_unreported":"false"')):
+    result = run_limited([str(binary), "--input-bytes", str(len(text.encode("utf-8")))],
+                         cwd=bounded.ROOT, timeout_s=30, memory_mb=3072, stdin_text=text)
+    assert result.status == "ok" and result.returncode == 2 and not result.stdout, result
+    assert "ANALYZE_REPORT_FAIL: invalid provider request" in result.stderr, result
+for count in ("01", "-1", "+1", " 1 ", "1.0", "", "١", 1):
+    invalid = {**request, "banners": [{**request["banners"][0], "files": count}]}
+    text = json.dumps(invalid, ensure_ascii=False, separators=(",", ":"))
+    result = run_limited([str(binary), "--input-bytes", str(len(text.encode("utf-8")))],
+                         cwd=bounded.ROOT, timeout_s=30, memory_mb=3072, stdin_text=text)
+    assert result.status == "ok" and result.returncode == 2 and not result.stdout, result
+    assert "ANALYZE_REPORT_FAIL: invalid provider request" in result.stderr, result
+result = run_limited([str(binary), "--input-bytes", str(len(payload.encode("utf-8")) + 1)],
+                     cwd=bounded.ROOT, timeout_s=30, memory_mb=3072, stdin_text=payload)
+assert result.status == "ok" and result.returncode == 2 and not result.stdout, result
+assert "incomplete or excess stdin bytes" in result.stderr, result
+result = run_limited([str(binary), "--input-bytes", str(len(payload.encode("utf-8")))],
+                     cwd=bounded.ROOT, timeout_s=30, memory_mb=3072, stdin_text=payload + "x")
+assert result.status == "ok" and result.returncode == 2 and not result.stdout, result
+assert "incomplete or excess stdin bytes" in result.stderr, result
+result = run_limited([str(binary), "--input-bytes", str(len(payload.encode("utf-8")))],
+                     cwd=bounded.ROOT, timeout_s=30, memory_mb=3072, stdin_text=payload + "\0")
+assert result.status == "ok" and result.returncode == 2 and not result.stdout, result
+assert "incomplete or excess stdin bytes" in result.stderr, result
+
+# Aggregate finding arrays can exceed 1000 rows; paths remain real repo inputs.
+selected = bounded.parse_analyzer_args([], bounded.ROOT)
+assert selected is not None and selected[1]
+real_paths = [bounded.repo_relative(path) for path in selected[1]]
+assert all(path is not None for path in real_paths)
+finding_paths = (real_paths * ((1002 + len(real_paths) - 1) // len(real_paths)))[:1002]
+aggregate = {
+    **request, "expected": {**request["expected"], "files": str(len(real_paths))},
+    "banners": [{"files": str(len(real_paths)), "findings": "1002", "rejected": "0", "families": "dataflow"}],
+    "finding_paths": finding_paths, "exit": "1",
+}
+text = json.dumps(aggregate, ensure_ascii=False, separators=(",", ":"))
+result = run_limited([str(binary), "--input-bytes", str(len(text.encode("utf-8")))],
+                     cwd=bounded.ROOT, timeout_s=30, memory_mb=3072, stdin_text=text)
+assert result.status == "ok" and result.returncode == 0 and not result.stderr, result
+response = json.loads(result.stdout)
+assert response["error"] == "" and response["banner"] == aggregate["banners"][0], response
+
+# A broken provider cannot invoke the old Python policy or fabricate success.
+for result in (RunResult("spawn-error", None, "", "missing", 0, 0),
+               RunResult("timeout", None, "", "", 0, 0),
+               RunResult("ok", 2, "", "invalid request", 0, 0),
+               RunResult("ok", 0, "{}", "", 0, 0)):
+    with patch("ourosmith.limits.run_limited", return_value=result), \
+         patch.object(bounded, "_drive_report_binary", return_value=Path("unused-provider")):
+        proc = subprocess.CompletedProcess([], 0, clean, "")
+        assert bounded.drive_banner(clean) is None
+        assert bounded.drive_result_error(proc, files=1, families="dataflow").startswith(
+            "structured report verifier unavailable:")
+# Even a currently consistent replacement must not become this run's provider.
+initial = ({"key": "initial-key", "binary_sha256": "initial-image"},
+           ["tools/analyze/bounded_report_main.ouro"], {"entry": "initial-source"})
+replacement = ({"key": "replacement-key", "binary_sha256": "replacement-image"},
+               ["tools/analyze/bounded_report_main.ouro", "std/jsonx.ouro"],
+               {"entry": "replacement-source", "std/jsonx.ouro": "replacement-json"})
+accepted = json.dumps({"kind": "ouro.analyze-bounded-report-response.v1",
+                       "banner": request["banners"][0], "families": None, "error": ""})
+for phase, receipts in (("before", [initial, replacement]),
+                        ("during", [initial, initial, replacement])):
+    with patch.dict(bounded._DRIVE_REPORT_CACHE, clear=True), \
+         patch("ourosmith.host.prepare_entry", return_value=Path("unused-provider")), \
+         patch("ourosmith.host.compiler_path", return_value=Path("unused-compiler")), \
+         patch("ourosmith.native.receipt_for", side_effect=receipts), \
+         patch("ourosmith.limits.run_limited",
+               return_value=RunResult("ok", 0, accepted, "", 0, 0)) as child:
+        assert bounded._drive_report_binary() == Path("unused-provider")
+        error = bounded.drive_result_error(subprocess.CompletedProcess([], 0, clean, ""),
+                                          files=1, families="dataflow")
+        assert error == ("structured report verifier unavailable: "
+                         "report provider inputs changed since preparation"), (phase, error)
+        assert child.call_count == (1 if phase == "during" else 0), (phase, child.call_count)
+# One complete verification supplies the banner used for aggregation.
+files = ["std/io.ouro", "std/fs.ouro"]
+finding_body = finding.replace(path, files[1])
+worker_results = [
+    subprocess.CompletedProcess([], 0, clean.replace("files=1", "files=٠٠١"), ""),
+    subprocess.CompletedProcess([], 1, finding_body + clean.replace("findings=0", "findings=1"), ""),
+]
+verified = json.loads(accepted)
+responses = [
+    verified, {**verified, "banner": {**verified["banner"], "findings": "1"}},
+]
+out, err = io.StringIO(), io.StringIO()
+with patch.object(bounded, "requested_drive_families", return_value="dataflow"), \
+     patch.object(bounded, "run_native", side_effect=worker_results), \
+     patch.object(bounded, "_drive_report_binary", return_value=Path("unused-provider")) as provider, \
+     patch("ourosmith.limits.run_limited", side_effect=[
+         RunResult("ok", 0, json.dumps(response), "", 0, 0) for response in responses
+     ]) as report_run, contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+    assert bounded.run_drive_bounded(Path("unused-drive"), [], [bounded.ROOT / name for name in files]) == 1
+    requests = [json.loads(call.kwargs["stdin_text"]) for call in report_run.call_args_list]
+    assert [row["mode"] for row in requests] == ["verify", "verify"]
+    assert [row["expected"]["path"] for row in requests] == files
+    assert [row["banners"][0]["files"] for row in requests] == ["1", "1"]
+    assert provider.call_count == 4
+assert err.getvalue() == ""
+assert out.getvalue() == finding_body + "ANALYZE_DRIVE files=2 findings=1 rejected=0 families=dataflow\n"
+
+malformed = clean + clean
+message = "missing, malformed or repeated structured completion report"
+refused = {**verified, "banner": None, "error": message}
+out, err = io.StringIO(), io.StringIO()
+with patch.object(bounded, "requested_drive_families", return_value="dataflow"), \
+     patch.object(bounded, "run_native", return_value=subprocess.CompletedProcess([], 0, malformed, "")), \
+     patch.object(bounded, "_drive_report_binary", return_value=Path("unused-provider")), \
+     patch("ourosmith.limits.run_limited",
+           return_value=RunResult("ok", 1, json.dumps(refused), "", 0, 0)) as report_run, \
+     contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+    assert bounded.run_drive_bounded(Path("unused-drive"), [], [bounded.ROOT / files[0]]) == 2
+    report_run.assert_called_once()
+assert out.getvalue() == malformed
+assert err.getvalue() == f"ANALYZE_FAIL: {files[0]}: {message}\n"
+print("ANALYZE_REPORT_PROVIDER_SUITE rows=56")
+PY
+
 
 analyze() {
 	sh scripts/ouro1.sh analyze --strict --include-fixtures "$@"

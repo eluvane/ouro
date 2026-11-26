@@ -1,0 +1,136 @@
+-- Full ELF header/segment vectors and checked layout/byte failures.
+import "native_elf_fixtures.ouro",
+  "../std/test.ouro";
+
+def elf_test_byte_text (bytes : List Nat) : String :=
+    str_join(",", map Nat String str_of_nat bytes);
+
+def elf_test_slice (name : String) (bytes : List Nat) (offset : Nat)
+    (expected : List Nat) : Test :=
+    assert_eq name
+      (elf_test_byte_text (take(Nat, length Nat expected, drop Nat offset bytes)))
+      (elf_test_byte_text expected);
+
+def elf_test_field (name : String) (bytes : List Nat) (offset : Nat) (width : Nat)
+    (expected : Nat) : Test :=
+    assert_true name (eq_nat (elf_test_read_word bytes offset width) expected);
+
+def elf_test_error (A : Type) (name : String) (accept : ElfError -> Bool)
+    (result : Either ElfError A) : Test :=
+    match result with
+    | Left error => assert_true name (accept error)
+    | Right _ => test_fail name "invalid input accepted"
+    end;
+
+def elf_test_empty_error (error : ElfError) : Bool :=
+    if let ElfEmptyText := error then True else False;
+def elf_test_size_error (error : ElfError) : Bool :=
+    if let ElfImageTooLarge := error then True else False;
+def elf_test_entry_error (wanted : Nat) (error : ElfError) : Bool :=
+    if let ElfInvalidEntry offset := error then eq_nat offset wanted else False;
+def elf_test_byte_error (wanted : Nat) (error : ElfError) : Bool :=
+    if let ElfBytesRejected byte_error := error then
+      if let PeInvalidByte byte := byte_error then
+        eq_nat byte wanted
+      else False
+    else False;
+
+def elf_test_header : List Nat :=
+    [127, 69, 76, 70, 2, 1, 1, 0,
+     0, 0, 0, 0, 0, 0, 0, 0,
+     2, 0, 62, 0, 1, 0, 0, 0,
+     176, 0, 64, 0, 0, 0, 0, 0,
+     64, 0, 0, 0, 0, 0, 0, 0,
+     0, 0, 0, 0, 0, 0, 0, 0,
+     0, 0, 0, 0, 64, 0, 56, 0,
+     2, 0, 0, 0, 0, 0, 0, 0];
+
+def elf_test_load_header : List Nat :=
+    [1, 0, 0, 0, 5, 0, 0, 0,
+     0, 0, 0, 0, 0, 0, 0, 0,
+     0, 0, 64, 0, 0, 0, 0, 0,
+     0, 0, 0, 0, 0, 0, 0, 0,
+     188, 0, 0, 0, 0, 0, 0, 0,
+     188, 0, 0, 0, 0, 0, 0, 0,
+     0, 16, 0, 0, 0, 0, 0, 0];
+
+def elf_test_stack_header : List Nat :=
+    [81, 229, 116, 100, 6, 0, 0, 0,
+     0, 0, 0, 0, 0, 0, 0, 0,
+     0, 0, 0, 0, 0, 0, 0, 0,
+     0, 0, 0, 0, 0, 0, 0, 0,
+     0, 0, 0, 0, 0, 0, 0, 0,
+     0, 0, 0, 0, 0, 0, 0, 0,
+     16, 0, 0, 0, 0, 0, 0, 0];
+
+
+def elf_test_image_laws : List Test :=
+    match elf_test_exit_image with
+    | Left _ => [test_fail "ELF exit42 fixture" "image rejected"]
+    | Right bytes =>
+      [ elf_test_slice "complete ELF64 little-endian ET_EXEC header" bytes 0 elf_test_header
+      , elf_test_slice "complete RX PT_LOAD" bytes 64 elf_test_load_header
+      , elf_test_slice "complete non-executable GNU stack" bytes 120 elf_test_stack_header
+      , assert_true "ELF exact file length includes both program headers and code"
+          (eq_nat (length Nat bytes) 188)
+      , elf_test_slice "x64 encoder MOV operands and fixture-only syscall" bytes 176
+          [184, 60, 0, 0, 0, 191, 42, 0, 0, 0, 15, 5]
+      , elf_test_field "ELF entry roundtrip" bytes 24 8 4194480
+      , elf_test_field "ELF program header offset roundtrip" bytes 32 8 64
+      , elf_test_field "ELF load offset roundtrip" bytes 72 8 0
+      , elf_test_field "ELF load virtual base roundtrip" bytes 80 8 4194304
+      , elf_test_field "ELF file size roundtrip" bytes 96 8 (length Nat bytes)
+      , elf_test_field "ELF memory size roundtrip" bytes 104 8 (length Nat bytes)
+      , elf_test_field "ELF load alignment roundtrip" bytes 112 8 4096
+      , elf_test_field "ELF GNU stack flags roundtrip" bytes 124 4 6
+      , assert_true "ELF load address and file offset have page congruence"
+          (eq_nat (mod_nat (elf_test_read_word bytes 80 8) 4096)
+            (mod_nat (elf_test_read_word bytes 72 8) 4096))
+      ]
+    end;
+
+def elf_test_bounds_laws : List Test :=
+    [ elf_test_error (List Nat) "ELF empty text" elf_test_empty_error (elf_write_image [] 0)
+    , elf_test_error (List Nat) "ELF entry at text end"
+        (elf_test_entry_error 1) (elf_write_image [195] 1)
+    , elf_test_error (List Nat) "ELF huge entry is rejected before serialization"
+        (elf_test_entry_error pe_max_rva) (elf_write_image [195] pe_max_rva)
+    , elf_test_error (List Nat) "ELF invalid first byte preserves its value"
+        (elf_test_byte_error 256) (elf_write_image [256, 257] 0)
+    , elf_test_error (List Nat) "ELF invalid byte at next shared-check chunk"
+        (elf_test_byte_error 256) (elf_write_image (append Nat (pe_zeros 848) [256, 257]) 0)
+    , elf_test_error Nat "ELF virtual end overflow" elf_test_size_error
+        (elf_check_layout (S elf_text_capacity) 0)
+    , assert_true "ELF exact maximum layout remains representable without huge allocation"
+        (match elf_check_layout elf_text_capacity (sub elf_text_capacity 1) with
+         | Left _ => False | Right size => andb (eq_nat size (sub pe_max_rva elf_image_base))
+             (eq_nat (elf_test_read_word (elf_file_header (sub elf_text_capacity 1)) 24 8)
+               (sub pe_max_rva 1)) end)
+    , assert_true "ELF nonzero entry offset and last code byte remain accepted"
+        (match elf_write_image [0, 255] 1 with
+         | Left _ => False | Right bytes => andb (eq_nat (length Nat bytes) 178)
+             (andb (eq_nat (elf_test_read_word bytes 24 8) 4194481)
+               (andb (eq_nat (elf_test_read_word bytes 96 8) 178)
+                 (andb (eq_nat (elf_test_read_word bytes 104 8) 178)
+                   (pe_bytes_equal (drop Nat 176 bytes) [0, 255])))) end)
+    ];
+
+-- Decimal byte output follows the existing native_pe_tests --image protocol.
+def elf_test_emit : IO Unit :=
+    match elf_test_exit_image with
+    | Left _ => do eprintln "ELF_ERROR fixture-image"; exit 1
+    | Right bytes => println (elf_test_byte_text bytes)
+    end;
+
+-- @entry main
+def main : IO Unit :=
+    do let! arguments := argv;
+       match eq_nat (length String arguments) 1 with
+       | True => test_run (append Test elf_test_image_laws elf_test_bounds_laws)
+       | False => match andb (eq_nat (length String arguments) 3)
+           (andb (str_eq (nth String "" 1 arguments) "--image")
+             (str_eq (nth String "" 2 arguments) "exit42")) with
+         | True => elf_test_emit
+         | False => do eprintln "usage: native_elf_tests [--image exit42]"; exit 2
+         end
+       end;

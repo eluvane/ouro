@@ -296,6 +296,32 @@ def _synthetic_native_gate_failure(
     }
 
 
+def _native_gate_unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    value: dict[str, Any] = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError(f"duplicate native report key: {key}")
+        value[key] = item
+    return value
+
+
+def _read_native_gate_report(path: Path) -> tuple[Any, str | None]:
+    try:
+        return json.loads(
+            path.read_text(encoding="utf-8"),
+            object_pairs_hook=_native_gate_unique_object,
+        ), None
+    except (OSError, ValueError) as exc:
+        return None, str(exc)
+
+
+def _native_gate_string_rows(value: Any, keys: Sequence[str]) -> bool:
+    return isinstance(value, list) and all(
+        isinstance(row, dict) and all(isinstance(row.get(key), str) for key in keys)
+        for row in value
+    )
+
+
 def _native_gate_report_errors(
     data: Any, *, profile: str, native_returncode: int
 ) -> list[str]:
@@ -316,10 +342,45 @@ def _native_gate_report_errors(
     if not isinstance(passed, bool):
         errors.append("native report pass field is not boolean")
     gates = data.get("gates")
-    if not isinstance(gates, list) or not gates:
+    gates_valid = isinstance(gates, list) and bool(gates)
+    collected_issues: list[tuple[str, str]] = []
+    if not gates_valid:
         errors.append("native report has no selected gates")
-    if not isinstance(data.get("issues"), list):
+    else:
+        for index, gate in enumerate(gates):
+            label = f"native report gate {index}"
+            if not isinstance(gate, dict):
+                errors.append(f"{label} is not a JSON object")
+                gates_valid = False
+                continue
+            if not isinstance(gate.get("name"), str):
+                errors.append(f"{label} name is not a string")
+                gates_valid = False
+            if not isinstance(gate.get("blocking"), bool):
+                errors.append(f"{label} blocking field is not boolean")
+                gates_valid = False
+            if not _native_gate_string_rows(gate.get("metrics"), ("name", "value")):
+                errors.append(f"{label} metrics are malformed")
+                gates_valid = False
+            gate_issues = gate.get("issues")
+            if not _native_gate_string_rows(gate_issues, ("reason", "path")):
+                errors.append(f"{label} issues are malformed")
+                gates_valid = False
+                continue
+            expected_status = "pass" if not gate_issues else "fail"
+            if gate.get("status") != expected_status:
+                errors.append(f"{label} status does not match its issues")
+                gates_valid = False
+            collected_issues.extend((issue["reason"], issue["path"]) for issue in gate_issues)
+    issues = data.get("issues")
+    if not isinstance(issues, list):
         errors.append("native report issues field is not an array")
+    elif not _native_gate_string_rows(issues, ("reason", "path")):
+        errors.append("native report issues are malformed")
+    elif gates_valid and [(issue["reason"], issue["path"]) for issue in issues] != collected_issues:
+        errors.append("native report issues do not match gate issues")
+    if gates_valid and isinstance(passed, bool) and passed != (not collected_issues):
+        errors.append("native report pass field does not match gate issues")
     if native_returncode == 0 and passed is not True:
         errors.append("native command returned 0 but report did not pass")
     if native_returncode != 0 and passed is True:
@@ -429,7 +490,7 @@ def run_native_repo_gate(
         )
 
     native_returncode = int(completed.returncode)
-    data, read_error = read_json_value(report_path)
+    data, read_error = _read_native_gate_report(report_path)
     if read_error is not None:
         errors = [f"native report unavailable or malformed: {read_error}"]
     else:
@@ -528,6 +589,10 @@ def filename_fragment(text: str, limit: int, empty: str) -> str:
     """Readable cache label only; callers retain their length and empty policy."""
     fragment = "".join(ch if ch.isalnum() or ch in {"_", "-"} else "_" for ch in text)
     return fragment.strip("_")[:limit] or empty
+
+
+def decode_source_text(data: bytes, *, errors: str = "strict") -> str:
+    return data.decode("utf-8", errors=errors).replace("\r\n", "\n").replace("\r", "\n")
 
 
 def read_required_text(path: Path, label: str) -> str:

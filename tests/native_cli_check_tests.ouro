@@ -1,5 +1,4 @@
--- Pure input fixtures exercise the same checker function called by coil check.
--- No main lookup, filesystem reads or PE lowering belongs in these assertions.
+-- In-memory inputs exercise the same checker function called by coil check.
 import "analyze/precision/assertions.ouro",
   "../tools/native_build_core.ouro";
 
@@ -40,13 +39,136 @@ def native_cli_check_config_error (backend : String) (target : String) (expected
     match native_build_validate_request
         (MkNativeBuildRequest backend target "main.ouro" "app.exe" "main" native_build_fuel) with
     | Right _ => False
-    | Left error => match error with
-      | NativeBuildConfiguration message => str_eq message expected
-      | NativeBuildFilesystem _ => False
-      | NativeBuildCollection _ => False
-      | NativeBuildSource _ => False
+    | Left error => if let NativeBuildConfiguration message := (error : NativeBuildFailure) then
+        str_eq message expected
+      else False
+    end;
+
+def native_cli_check_origin_single (source : String) : Either NativeBuildFailure CheckedProgram :=
+    native_build_check_files_with_origin 5000 "main.ouro"
+      ([native_cli_check_unit "main.ouro" source] : List (Pair(List Nat, List Nat)));
+
+def native_cli_check_origin_dependency (dependency : String) : Either NativeBuildFailure CheckedProgram :=
+    native_build_check_files_with_origin 5000 "main.ouro"
+      ([native_cli_check_unit "dep.ouro" dependency,
+        native_cli_check_unit "main.ouro" "import \"dep.ouro\"; def value : Nat := Z;"] : List (Pair(List Nat, List Nat)));
+
+def native_cli_check_origin_success (legacy : CompResult CheckedProgram)
+    (reported : Either NativeBuildFailure CheckedProgram) : Bool :=
+    match legacy, reported with
+    | CErr _, Left _ => False
+    | CErr _, Right _ => False
+    | COk _, Left _ => False
+    | COk before, Right after => match checked_program_dump 5000 before with
+      | CErr _ => False
+      | COk original => match checked_program_dump 5000 after with
+        | CErr _ => False
+        | COk current => native_build_codes_eq original current
+        end
       end
     end;
+
+def native_cli_check_origin_rejection (expected : Nat) (expected_unit : Maybe String)
+    (legacy : CompResult CheckedProgram) (reported : Either NativeBuildFailure CheckedProgram) : Bool :=
+    match reported with
+    | Right _ => False
+    | Left error => if let NativeBuildCheck failure state := (error : NativeBuildFailure) then
+        let (SourceFailureOf original metadata) := failure in
+        let (ErrCode code detail) := original in
+        andb(eq_nat code expected,
+          andb(match legacy with
+            | COk _ => False
+            | CErr previous => let (ErrCode before_code before_detail) := previous in
+              andb(eq_nat code before_code, eq_nat detail before_detail)
+            end,
+          (let (MkPair owner cause) := metadata in
+          andb(match cause with | Nothing => True | Just _ => False end,
+            match expected_unit, owner with
+            | Nothing, Nothing => str_eq (native_build_error_message error)
+                (prim_string_concat (managed_driver_source_error (NativeSourceCheckError original))
+                  " owner=unknown phase=unknown unit=unknown span=unknown cause=none")
+            | Nothing, Just _ => False
+            | Just _, Nothing => False
+            | Just expected_path, Just selected => let (SourceFailureOwnerOf declaration origin) :=
+                selected in
+              let (MkPair name phase) := declaration in
+              andb(eq_nat name detail,
+                andb((if let CompileCorePhase := (phase : CompileProgramPhase) then True else False),
+                (let (MkPair unit span) := origin in
+                andb(match span with | Nothing => True | Just _ => False end,
+                  match unit with
+                  | Nothing => False
+                  | Just path => str_eq (str_of_codes (str_of_id state path)) expected_path
+                  end))))
+            end))))
+      else False
+    end;
+
+def native_cli_check_origin_list_cause : Bool :=
+    match native_cli_check_origin_single (str_concat native_cli_check_nat "def bad : Nat := [];") with
+    | Right _ => False
+    | Left error => if let NativeBuildCheck failure state := (error : NativeBuildFailure) then
+        let (SourceFailureOf original metadata) := failure in
+        let (ErrCode code detail) := original in
+        andb(eq_nat code 2, andb(eq_nat detail 0,
+        (let (MkPair owner cause) := metadata in
+        andb(match cause with
+          | Nothing => False
+          | Just root => match root with
+            | LowerRootNamedHole _ => False
+            | LowerRootList refusal => if let LowerListExpectedNotList := (refusal : LowerListRefusal) then
+                True
+              else False
+            end
+          end,
+          match owner with
+          | Nothing => False
+          | Just selected => let (SourceFailureOwnerOf _ origin) := selected in
+            let (MkPair unit span) := origin in
+            andb(match unit with
+              | Nothing => False
+              | Just path => str_eq (str_of_codes (str_of_id state path)) "main.ouro"
+              end,
+              andb(match span with | Nothing => True | Just _ => False end,
+                andb(str_starts (native_build_error_message error) "source:2:0 diagnostic=64 ",
+                  str_ends (native_build_error_message error) "span=unknown cause=list:expected-not-list")))
+          end))))
+      else False
+    end;
+
+def native_cli_check_origin_interval (state : InternState) (span : Maybe (Pair Nat Nat)) : NativeBuildFailure :=
+    NativeBuildCheck
+      (SourceFailureOf (ErrCode 2 0)
+        (MkPair (Maybe SourceFailureOwner) (Maybe LowerRootCause)
+          (Just SourceFailureOwner
+            (SourceFailureOwnerOf (MkPair Nat CompileProgramPhase 7 CompileSurfacePhase)
+              (MkPair (Maybe Nat) (Maybe (Pair Nat Nat)) (Just Nat 9) span)))
+          (Just LowerRootCause (LowerRootNamedHole 13)))) state;
+
+def native_cli_check_origin_public_error (source : String) (prefix : String) (cause : String) : Bool :=
+    match native_cli_check_origin_single source with
+    | Right _ => False
+    | Left error => if let NativeBuildCheck failure _ := (error : NativeBuildFailure) then
+        let (SourceFailureOf original _) := failure in
+        let (ErrCode code detail) := original in
+        let message : String := native_build_error_message error in
+        andb(eq_nat code 2, andb(eq_nat detail 0,
+          andb(str_starts message prefix,
+            str_contains message (prim_string_concat " unit=main.ouro span=unknown cause=" cause))))
+      else False
+    end;
+
+def native_cli_check_origin_owner (phase : CompileProgramPhase) : Maybe SourceFailureOwner :=
+    Just SourceFailureOwner
+      (SourceFailureOwnerOf (MkPair Nat CompileProgramPhase 7 phase)
+        (MkPair (Maybe Nat) (Maybe (Pair Nat Nat)) (Nothing Nat) (Nothing (Pair Nat Nat))));
+
+def native_cli_check_origin_unclassified (error : CompError) (owner : Maybe SourceFailureOwner)
+    (cause : Maybe LowerRootCause) : Bool :=
+    let failure : SourceFailure := SourceFailureOf error
+      (MkPair (Maybe SourceFailureOwner) (Maybe LowerRootCause) owner cause) in
+    str_starts (native_build_error_message (NativeBuildCheck failure empty_intern))
+      (prim_string_concat (managed_driver_source_error (NativeSourceCheckError error)) " owner=");
 
 def native_cli_check_laws : List (Pair String Bool) :=
     [ MkPair String Bool "native-cli-check/module-without-main"
@@ -79,7 +201,100 @@ def native_cli_check_laws : List (Pair String Bool) :=
     , MkPair String Bool "native-cli-check/constructed-other-target"
         (native_cli_check_config_error "native" "x86_64-linux"
           (native_build_err_target "x86_64-linux"))
+    , MkPair String Bool "native-cli-check/located-success-preserves-complete-dump"
+        (native_cli_check_origin_success (native_cli_check_single "axiom Library : Type;")
+          (native_cli_check_origin_single "axiom Library : Type;"))
+    , MkPair String Bool "native-cli-check/located-import-success-preserves-complete-dump"
+        (let dependency : String := str_concat native_cli_check_nat "def hidden : Nat := Z;" in
+          native_cli_check_origin_success (native_cli_check_dependency dependency)
+            (native_cli_check_origin_dependency dependency))
+    , MkPair String Bool "native-cli-check/located-parser-error-keeps-unknown-origin"
+        (native_cli_check_origin_rejection 10 (Nothing String) (native_cli_check_single "def")
+          (native_cli_check_origin_single "def"))
+    , MkPair String Bool "native-cli-check/located-lexer-error-keeps-unknown-origin"
+        (native_cli_check_origin_rejection 11 (Nothing String) (native_cli_check_single "@")
+          (native_cli_check_origin_single "@"))
+    , MkPair String Bool "native-cli-check/located-root-body-error-keeps-actual-unit"
+        (let source : String := str_concat native_cli_check_nat "def value : Nat := Type;" in
+          native_cli_check_origin_rejection 41 (Just String "main.ouro") (native_cli_check_single source)
+            (native_cli_check_origin_single source))
+    , MkPair String Bool "native-cli-check/located-unused-import-error-keeps-provider-unit"
+        (let dependency : String := str_concat native_cli_check_nat "def hidden : Nat := Type;" in
+          native_cli_check_origin_rejection 41 (Just String "dep.ouro") (native_cli_check_dependency dependency)
+            (native_cli_check_origin_dependency dependency))
+    , MkPair String Bool "native-cli-check/located-missing-unit-keeps-unknown-origin"
+        (let source : String := "import \"absent.ouro\"; axiom Library : Type;" in
+          native_cli_check_origin_rejection 92 (Nothing String) (native_cli_check_single source)
+            (native_cli_check_origin_single source))
+    , MkPair String Bool "native-cli-check/located-zero-fuel-fails"
+        (let files : List (Pair(List Nat, List Nat)) := [native_cli_check_unit "main.ouro" "axiom Library : Type;"] in
+          native_cli_check_origin_rejection 12 (Nothing String) (native_build_check_files 0 "main.ouro" files)
+            (native_build_check_files_with_origin 0 "main.ouro" files))
+    , MkPair String Bool "native-cli-check/located-root-list-cause-not-guessed-span"
+        native_cli_check_origin_list_cause
+    , MkPair String Bool "native-cli-check/explicit-byte-interval-preserved"
+        (let state : InternState := MkIntern [] 1 [MkPair (List Nat) Nat (str_codes "actual/unit.ouro") 9] 10 in
+          str_eq (native_build_error_message
+            (native_cli_check_origin_interval state (Just (Pair Nat Nat) (MkPair Nat Nat 3 11))))
+            "source:2:0 diagnostic=61 owner=7 phase=surface unit=actual/unit.ouro span=3:11 cause=hole:13")
+    , MkPair String Bool "native-cli-check/unmapped-unit-cannot-fabricate-path"
+        (str_eq (native_build_error_message
+          (native_cli_check_origin_interval empty_intern (Nothing (Pair Nat Nat))))
+          "source:2:0 diagnostic=61 owner=7 phase=surface unit=unknown span=unknown cause=hole:13")
+    , MkPair String Bool "native-cli-check/producer-named-hole-keeps-public-id"
+        (native_cli_check_origin_public_error (str_concat native_cli_check_nat "def goal : Nat := ?pending;")
+          "source:2:0 diagnostic=61 " "hole:")
+    , MkPair String Bool "native-cli-check/prior-list-cannot-reclassify-unrelated-refusal"
+        (native_cli_check_origin_public_error (str_concat native_cli_check_nat
+          "inductive List (A : Type) : Type := | Nil : List A | Cons : A -> List A -> List A; def values : List Nat := [Z,]; def unrelated : Nat := missing;")
+          "source:2:0 " "none")
+    , MkPair String Bool "native-cli-check/metadata-without-owner-not-remapped"
+        (native_cli_check_origin_unclassified (ErrCode 2 0) (Nothing SourceFailureOwner)
+          (Just LowerRootCause (LowerRootList LowerListExpectedNotList)))
+    , MkPair String Bool "native-cli-check/metadata-outside-surface-phase-not-remapped"
+        (all CompileProgramPhase (fun (phase : CompileProgramPhase) =>
+          native_cli_check_origin_unclassified (ErrCode 2 0) (native_cli_check_origin_owner phase)
+            (Just LowerRootCause (LowerRootList LowerListExpectedNotList)))
+          [CompileFutureSlotPhase, CompileDuplicatePhase, CompileFutureGlobalPhase, CompileCorePhase])
+    , MkPair String Bool "native-cli-check/typed-error-cannot-be-remapped-by-metadata"
+        (native_cli_check_origin_unclassified (ErrCode 41 7) (native_cli_check_origin_owner CompileSurfacePhase)
+          (Just LowerRootCause (LowerRootList LowerListExpectedNotList)))
+    , MkPair String Bool "native-cli-check/other-generic-detail-not-remapped"
+        (native_cli_check_origin_unclassified (ErrCode 2 1) (native_cli_check_origin_owner CompileSurfacePhase)
+          (Just LowerRootCause (LowerRootList LowerListExpectedNotList)))
+    , MkPair String Bool "native-cli-check/metadata-without-producer-cause-not-remapped"
+        (native_cli_check_origin_unclassified (ErrCode 2 0) (native_cli_check_origin_owner CompileSurfacePhase)
+          (Nothing LowerRootCause))
+    , MkPair String Bool "native-cli-check/zero-named-hole-cannot-select-hole-id"
+        (native_cli_check_origin_unclassified (ErrCode 2 0) (native_cli_check_origin_owner CompileSurfacePhase)
+          (Just LowerRootCause (LowerRootNamedHole 0)))
     ];
 
+private def native_cli_check_snapshot : IO Bool :=
+    let root : String := "virtual/check/main.ouro" in
+    let dependency : String := "virtual/check/dep.ouro" in
+    let source : String := "import \"dep.ouro\";\r\ndef value : Nat := S Z;" in
+    let reader (path : String) : IO (Either CollectReadError String) :=
+      io_pure (Either CollectReadError String)
+        (if str_eq path root then Right CollectReadError String source
+         else if str_eq path dependency then Right CollectReadError String native_cli_check_nat
+         else Left CollectReadError String CollectMissing) in
+    match! collect_snapshot_with_reader reader collect_fuel root with
+    | Left error => do eprintln error; io_pure Bool False
+    | Right snapshot =>
+        let contents : List String :=
+          concat_map (Pair String String) String
+            (fun (file : Pair String String) => let (MkPair path text) := file in [path, text])
+            (collect_snapshot_files snapshot) in
+        match native_build_check_snapshot 5000 snapshot with
+        | Left error => do eprintln (native_build_error_message error); io_pure Bool False
+        | Right _ => io_pure Bool (precision_strings (Cons String (collect_snapshot_root snapshot) contents)
+            [root, dependency, native_cli_check_nat, root, source])
+        end
+    end;
+
 -- @entry main
-def main : IO Unit := precision_run "native-cli-check" native_cli_check_laws;
+def main : IO Unit :=
+    do let! snapshot := native_cli_check_snapshot;
+       precision_run "native-cli-check" (append (Pair String Bool) native_cli_check_laws
+         [MkPair String Bool "native-cli-check/captured-bytes-reach-checker" snapshot]);

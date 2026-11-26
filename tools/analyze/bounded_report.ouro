@@ -1,0 +1,578 @@
+-- Pure completion policy. Host regex extraction supplies observations, never verdicts.
+import "../../std/jsonx.ouro",
+  "../../std/json_types.ouro",
+  "../../std/process.ouro";
+
+inductive BoundedDriveBanner : Type :=
+  | MkBoundedDriveBanner : String -> String -> String -> String -> BoundedDriveBanner;
+
+inductive BoundedDriveExpected : Type :=
+  | MkBoundedDriveExpected : Maybe String -> Maybe String -> Maybe String -> BoundedDriveExpected;
+
+inductive BoundedDriveObserved : Type :=
+  | MkBoundedDriveObserved : List BoundedDriveBanner -> List String -> List String
+      -> Bool -> Bool -> String -> BoundedDriveObserved;
+
+inductive BoundedDriveReportError : Type :=
+  | BoundedDriveMalformedReport : BoundedDriveReportError
+  | BoundedDriveRequestedFiles : BoundedDriveReportError
+  | BoundedDriveRequestedFamilies : BoundedDriveReportError
+  | BoundedDriveDiagnosticCounts : BoundedDriveReportError
+  | BoundedDriveRejectedFiles : BoundedDriveReportError
+  | BoundedDriveRequestedPath : BoundedDriveReportError
+  | BoundedDriveUnexpectedError : BoundedDriveReportError
+  | BoundedDriveUnreportedOutput : BoundedDriveReportError
+  | BoundedDriveExitCode : BoundedDriveReportError;
+
+def bounded_drive_error_message (error : BoundedDriveReportError) : String :=
+    match error with
+    | BoundedDriveMalformedReport => "missing, malformed or repeated structured completion report"
+    | BoundedDriveRequestedFiles => "structured report omitted or duplicated requested files"
+    | BoundedDriveRequestedFamilies => "structured report did not run the requested families"
+    | BoundedDriveDiagnosticCounts => "structured diagnostic counts disagree with the completion report"
+    | BoundedDriveRejectedFiles => "structured report has duplicate or excess rejected files"
+    | BoundedDriveRequestedPath => "structured diagnostic names an unrequested file"
+    | BoundedDriveUnexpectedError => "structured worker emitted an unexpected error"
+    | BoundedDriveUnreportedOutput => "structured worker emitted unreported output"
+    | BoundedDriveExitCode => "structured exit code disagrees with the completion report"
+    end;
+
+def bounded_drive_family_char (code : Nat) : Bool :=
+    orb(eq_nat code 95, andb(leb_nat 97 code, leb_nat code 122));
+
+def bounded_drive_family_valid (family : String) : Bool :=
+    andb(notb (str_null family), all Nat bounded_drive_family_char (str_codes family));
+
+def bounded_drive_families_valid (families : String) : Bool :=
+    let parts : List String := str_split families 44 in
+    andb(all String bounded_drive_family_valid parts,
+      eq_nat(length String parts, length String (nub String str_eq parts)));
+
+-- Canonical decimal text avoids giant Nat construction and JSON number fuel.
+def bounded_drive_count_valid (count : String) : Bool :=
+    andb(str_is_digits count,
+      orb(str_eq count "0", notb (eq_nat(str_head count, 48))));
+
+def bounded_drive_count_le (left : String) (right : String) : Bool :=
+    orb(ltb_nat(str_len left, str_len right),
+      andb(eq_nat(str_len left, str_len right), str_le left right));
+
+def bounded_drive_banner (banners : List BoundedDriveBanner)
+    : Either BoundedDriveReportError BoundedDriveBanner :=
+    match banners with
+    | Nil => Left BoundedDriveReportError BoundedDriveBanner BoundedDriveMalformedReport
+    | Cons banner rest =>
+        let (MkBoundedDriveBanner files found rejected families) := banner in
+        if andb(nullb BoundedDriveBanner rest,
+          andb(all String bounded_drive_count_valid [files, found, rejected],
+            bounded_drive_families_valid families))
+        then Right BoundedDriveReportError BoundedDriveBanner banner
+        else Left BoundedDriveReportError BoundedDriveBanner BoundedDriveMalformedReport
+    end;
+
+def bounded_drive_require (condition : Bool) (error : BoundedDriveReportError)
+    : Either BoundedDriveReportError Unit :=
+    if condition then Right BoundedDriveReportError Unit MkUnit
+    else Left BoundedDriveReportError Unit error;
+
+-- Check priority matches the public host API even when several faults coexist.
+def bounded_drive_verify_banner (expected : BoundedDriveExpected) (observed : BoundedDriveObserved)
+    (banner : BoundedDriveBanner)
+    : Either BoundedDriveReportError BoundedDriveBanner :=
+    let (MkBoundedDriveExpected want_files want_families want_path) := expected in
+    let (MkBoundedDriveObserved _ findings rejections extra_stdout extra_stderr code) := observed in
+    let (MkBoundedDriveBanner files found rejected families) := banner in
+    let? (Left, Right) : Either BoundedDriveReportError BoundedDriveBanner do
+      (bounded_drive_require
+        (andb(notb (str_eq files "0"), match want_files with
+          | Nothing => True | Just count => str_eq files count end)) BoundedDriveRequestedFiles)?;
+      (bounded_drive_require (match want_families with
+        | Nothing => True | Just names => str_eq families names end) BoundedDriveRequestedFamilies)?;
+      (bounded_drive_require
+        (andb(str_eq (str_of_nat (length String findings)) found,
+          str_eq (str_of_nat (length String rejections)) rejected))
+        BoundedDriveDiagnosticCounts)?;
+      (bounded_drive_require
+        (andb(bounded_drive_count_le rejected files,
+          eq_nat(length String rejections, length String (nub String str_eq rejections))))
+        BoundedDriveRejectedFiles)?;
+      (bounded_drive_require (match want_path with
+        | Nothing => True
+        | Just path => all String (str_eq path) (append String findings rejections)
+        end) BoundedDriveRequestedPath)?;
+      (bounded_drive_require (notb extra_stderr) BoundedDriveUnexpectedError)?;
+      (bounded_drive_require (notb extra_stdout) BoundedDriveUnreportedOutput)?;
+      (bounded_drive_require
+        (str_eq code (if andb(str_eq found "0", str_eq rejected "0") then "0" else "1"))
+        BoundedDriveExitCode)?;
+      banner
+    end;
+
+def bounded_drive_verify (expected : BoundedDriveExpected) (observed : BoundedDriveObserved)
+    : Either BoundedDriveReportError BoundedDriveBanner :=
+    let (MkBoundedDriveObserved banners _ _ _ _ _) := observed in
+    let? (Left, Right) : Either BoundedDriveReportError BoundedDriveBanner do
+      let banner : BoundedDriveBanner := (bounded_drive_banner banners)?;
+      let accepted : BoundedDriveBanner := (bounded_drive_verify_banner expected observed banner)?;
+      accepted
+    end;
+
+def bounded_drive_selected_families (metadata : Maybe String) (code : String) (stderr_present : Bool)
+    : Maybe String :=
+    match metadata with
+    | Nothing => Nothing String
+    | Just families =>
+        if andb(andb(str_eq code "0", notb stderr_present), bounded_drive_families_valid families)
+        then Just String families else Nothing String
+    end;
+
+inductive BoundedReportRequest : Type :=
+  | MkBoundedReportRequest : String -> BoundedDriveExpected -> BoundedDriveObserved
+      -> Maybe String -> BoundedReportRequest;
+
+def bounded_report_guard (ok : Bool) : Maybe Unit :=
+    if ok then Just Unit MkUnit else Nothing Unit;
+
+def bounded_report_keys (value : Json) (expected : List String) : Bool :=
+    let keys : List String := jsonx_object_keys value in
+    andb(eq_nat(length String keys, length String expected),
+      andb(eq_nat(length String keys, length String (nub String str_eq keys)),
+        all String (fun (key : String) => elem String str_eq key expected) keys));
+
+def bounded_report_decode_list (A : Type) (decode : Json -> Maybe A)
+    : List Json -> Maybe (List A) :=
+  fix go (values : List Json) : Maybe (List A) :=
+    match values with
+    | Nil => Just (List A) (Nil A)
+    | Cons value rest => let? (Nothing, Just) : Maybe (List A) do
+        let item : A := (decode value)?;
+        let items : List A := (go rest)?;
+        Cons A item items
+      end
+    end;
+
+def bounded_report_optional_string (value : Json) : Maybe (Maybe String) :=
+    match value with
+    | JNull => Just (Maybe String) (Nothing String)
+    | JStr text => Just (Maybe String) (Just String text)
+    | JNum _ => Nothing (Maybe String) | JBool _ => Nothing (Maybe String)
+    | JArr _ => Nothing (Maybe String) | JObj _ => Nothing (Maybe String)
+    end;
+
+def bounded_report_decode_count (value : Json) (key : String) : Maybe String :=
+    let? (Nothing, Just) : Maybe String do
+      let count : String := (jsonx_get_string value key)?;
+      (bounded_report_guard (bounded_drive_count_valid count))?;
+      count
+    end;
+
+def bounded_report_decode_banner (value : Json) : Maybe BoundedDriveBanner :=
+    let? (Nothing, Just) : Maybe BoundedDriveBanner do
+      (bounded_report_guard
+        (bounded_report_keys value ["files", "findings", "rejected", "families"]))?;
+      let files : String := (bounded_report_decode_count value "files")?;
+      let findings : String := (bounded_report_decode_count value "findings")?;
+      let rejected : String := (bounded_report_decode_count value "rejected")?;
+      let families : String := (jsonx_get_string value "families")?;
+      MkBoundedDriveBanner files findings rejected families
+    end;
+
+def bounded_report_decode_expected (value : Json) : Maybe BoundedDriveExpected :=
+    let? (Nothing, Just) : Maybe BoundedDriveExpected do
+      (bounded_report_guard
+        (bounded_report_keys value ["files", "families", "path"]))?;
+      let files_json : Json := (jsonx_get value "files")?;
+      let files : Maybe String := (bounded_report_optional_string files_json)?;
+      let families_json : Json := (jsonx_get value "families")?;
+      let families : Maybe String := (bounded_report_optional_string families_json)?;
+      let path_json : Json := (jsonx_get value "path")?;
+      let path : Maybe String := (bounded_report_optional_string path_json)?;
+      MkBoundedDriveExpected files families path
+    end;
+
+-- All fields are required; unknown/duplicate keys and wrong types are transport errors.
+def bounded_report_decode (value : Json) : Maybe BoundedReportRequest :=
+    let? (Nothing, Just) : Maybe BoundedReportRequest do
+      (bounded_report_guard (bounded_report_keys value
+        ["kind", "mode", "expected", "banners", "finding_paths", "rejection_paths",
+         "stdout_unreported", "stderr_unexpected", "exit", "family_metadata"]))?;
+      let kind : String := (jsonx_get_string value "kind")?;
+      (bounded_report_guard
+        (str_eq kind "ouro.analyze-bounded-report-request.v1"))?;
+      let mode : String := (jsonx_get_string value "mode")?;
+      (bounded_report_guard
+        (elem String str_eq mode ["banner", "verify", "families"]))?;
+      let expected_json : Json := (jsonx_get value "expected")?;
+      let expected : BoundedDriveExpected := (bounded_report_decode_expected expected_json)?;
+      let banners_json : List Json := (jsonx_get_array value "banners")?;
+      let banners : List BoundedDriveBanner :=
+        (bounded_report_decode_list BoundedDriveBanner bounded_report_decode_banner banners_json)?;
+      let findings_json : List Json := (jsonx_get_array value "finding_paths")?;
+      let findings : List String := (bounded_report_decode_list String jsonx_as_string findings_json)?;
+      let rejections_json : List Json := (jsonx_get_array value "rejection_paths")?;
+      let rejections : List String := (bounded_report_decode_list String jsonx_as_string rejections_json)?;
+      let extra_stdout : Bool := (jsonx_get_bool value "stdout_unreported")?;
+      let extra_stderr : Bool := (jsonx_get_bool value "stderr_unexpected")?;
+      let code : String := (jsonx_get_string value "exit")?;
+      let metadata_json : Json := (jsonx_get value "family_metadata")?;
+      let metadata : Maybe String := (bounded_report_optional_string metadata_json)?;
+      MkBoundedReportRequest mode expected
+        (MkBoundedDriveObserved banners findings rejections extra_stdout extra_stderr code) metadata
+    end;
+
+def bounded_report_banner_json (banner : BoundedDriveBanner) : Json :=
+    let (MkBoundedDriveBanner files findings rejected families) := banner in
+    JObj [ MkPair String Json "files" (JStr files)
+         , MkPair String Json "findings" (JStr findings)
+         , MkPair String Json "rejected" (JStr rejected)
+         , MkPair String Json "families" (JStr families) ];
+
+def bounded_report_response (banner : Maybe BoundedDriveBanner) (families : Maybe String)
+    (error : String) : Json :=
+    JObj [ MkPair String Json "kind" (JStr "ouro.analyze-bounded-report-response.v1")
+         , MkPair String Json "banner" (match banner with
+             | Nothing => JNull | Just row => bounded_report_banner_json row end)
+         , MkPair String Json "families" (match families with
+             | Nothing => JNull | Just names => JStr names end)
+         , MkPair String Json "error" (JStr error) ];
+
+def bounded_report_result (request : BoundedReportRequest) : Pair Json Nat :=
+    let (MkBoundedReportRequest mode expected observed metadata) := request in
+    let (MkBoundedDriveObserved banners _ _ _ extra_stderr code) := observed in
+    if str_eq mode "families" then
+      match bounded_drive_selected_families metadata code extra_stderr with
+      | Nothing => MkPair Json Nat
+          (bounded_report_response (Nothing BoundedDriveBanner) (Nothing String)
+            "unavailable native family selection") 1
+      | Just families => MkPair Json Nat
+          (bounded_report_response (Nothing BoundedDriveBanner) (Just String families) "") 0
+      end
+    else
+      match (if str_eq mode "banner" then bounded_drive_banner banners
+             else bounded_drive_verify expected observed) with
+      | Left error => MkPair Json Nat
+          (bounded_report_response (Nothing BoundedDriveBanner) (Nothing String)
+            (bounded_drive_error_message error)) 1
+      | Right banner => MkPair Json Nat
+          (bounded_report_response (Just BoundedDriveBanner banner) (Nothing String) "") 0
+      end;
+
+inductive BoundedNativeReportError : Type :=
+  | BoundedNativeReportByteLimit : BoundedNativeReportError
+  | BoundedNativeReportEncoding : ProcessCaptureStream -> BoundedNativeReportError
+  | BoundedNativeReportNewline : ProcessCaptureStream -> BoundedNativeReportError
+  | BoundedNativeReportStatus : Nat -> BoundedNativeReportError
+  | BoundedNativeReportPolicy : BoundedDriveReportError -> BoundedNativeReportError;
+
+def bounded_native_report_stream_limit : Nat :=
+    mul(16, mul(mul 32 32, mul 32 32));
+
+def bounded_native_report_byte_limit : Nat :=
+    add bounded_native_report_stream_limit bounded_native_report_stream_limit;
+
+def bounded_native_report_size_valid (output_bytes : Nat) (error_bytes : Nat) : Bool :=
+    andb(andb(leb_nat output_bytes bounded_native_report_stream_limit,
+      leb_nat error_bytes bounded_native_report_stream_limit),
+      leb_nat(add output_bytes error_bytes, bounded_native_report_byte_limit));
+
+def bounded_native_report_chars_from (accept : Nat -> Bool) (text : String) (start : Nat) : Bool :=
+    let bytes : Nat := str_len text in
+    (fix go (fuel : Nat) (offset : Nat) : Bool :=
+      if eq_nat offset bytes then True
+      else match fuel with
+      | Z => False
+      | S remaining =>
+          if accept (prim_string_byte_at text offset) then go remaining (S offset)
+          else False
+      end) (sub bytes start) start;
+
+def bounded_native_report_chars (accept : Nat -> Bool) (text : String) : Bool :=
+    bounded_native_report_chars_from accept text Z;
+
+-- Native counts are canonical ASCII; the legacy host adapter retains its normalization.
+def bounded_native_report_count (text : String) : Bool :=
+    andb(notb (str_null text),
+      andb(bounded_native_report_chars is_digit text,
+        orb(str_eq text "0", notb (eq_nat(str_head text, 48)))));
+
+-- Scalar-sized validation avoids allocating a byte list for the captured stream.
+def bounded_native_report_line (stream : ProcessCaptureStream) (text : String) (start : Nat)
+    : Either BoundedNativeReportError (Pair String Nat) :=
+    let bytes : Nat := str_len text in
+    (fix go (fuel : Nat) (offset : Nat)
+        : Either BoundedNativeReportError (Pair String Nat) :=
+      if eq_nat offset bytes then
+        Left BoundedNativeReportError (Pair String Nat) (BoundedNativeReportNewline stream)
+      else match fuel with
+      | Z => Left BoundedNativeReportError (Pair String Nat) (BoundedNativeReportNewline stream)
+      | S remaining =>
+          let byte : Nat := prim_string_byte_at text offset in
+          if eq_nat byte 10 then
+            Right BoundedNativeReportError (Pair String Nat)
+              (MkPair String Nat (str_slice text start (sub offset start)) (S offset))
+          else if eq_nat byte 13 then
+            if andb(ltb_nat (S offset) bytes, eq_nat(prim_string_byte_at text (S offset), 10)) then
+              Right BoundedNativeReportError (Pair String Nat)
+                (MkPair String Nat (str_slice text start (sub offset start)) (add offset 2))
+            else Left BoundedNativeReportError (Pair String Nat) (BoundedNativeReportNewline stream)
+          else if eq_nat byte Z then
+            Left BoundedNativeReportError (Pair String Nat) (BoundedNativeReportEncoding stream)
+          else if ltb_nat byte 128 then go remaining (S offset)
+          else
+            let width : Nat := if ltb_nat byte 224 then 2 else if ltb_nat byte 240 then 3 else 4 in
+            if andb(leb_nat width (sub bytes offset),
+              process_directory_utf8_valid (str_codes (str_slice text offset width))) then
+              go remaining (add offset width)
+            else Left BoundedNativeReportError (Pair String Nat) (BoundedNativeReportEncoding stream)
+      end) (sub bytes start) start;
+
+def bounded_native_report_literal_at (text : String) (offset : Nat) (literal : String) : Bool :=
+    let bytes : Nat := str_len text in
+    let width : Nat := str_len literal in
+    if notb (leb_nat offset bytes) then False
+    else if notb (leb_nat width (sub bytes offset)) then False
+    else
+      (fix go (fuel : Nat) (index : Nat) : Bool :=
+        match fuel with
+        | Z => True
+        | S remaining =>
+            if eq_nat(prim_string_byte_at text (add offset index), prim_string_byte_at literal index)
+            then go remaining (S index) else False
+        end) width Z;
+
+def bounded_native_report_span_after (accept : Nat -> Bool) (text : String) (bytes : Nat)
+    (start : Nat) : Nat :=
+    (fix go (fuel : Nat) (offset : Nat) : Nat :=
+      match fuel with
+      | Z => offset
+      | S remaining =>
+          if notb (ltb_nat offset bytes) then offset
+          else if accept (prim_string_byte_at text offset) then go remaining (S offset)
+          else offset
+      end) (sub bytes start) start;
+
+def bounded_native_report_span_before (accept : Nat -> Bool) (text : String) (bytes : Nat)
+    (stop : Nat) : Nat :=
+    (fix go (offset : Nat) : Nat :=
+      match offset with
+      | Z => Z
+      | S before =>
+          if notb (ltb_nat before bytes) then offset
+          else if accept (prim_string_byte_at text before) then go before
+          else offset
+      end) stop;
+
+def bounded_native_report_location (text : String) (bytes : Nat) (stop : Nat) : Maybe Nat :=
+    if notb (leb_nat stop bytes) then Nothing Nat
+    else
+      let column : Nat := bounded_native_report_span_before is_digit text bytes stop in
+      if notb (ltb_nat column stop) then Nothing Nat
+      else if andb(eq_nat(prim_string_byte_at text column, 48), notb (eq_nat (S column) stop))
+        then Nothing Nat
+      else match column with
+      | Z => Nothing Nat
+      | S before_column =>
+          if notb (eq_nat(prim_string_byte_at text before_column, 58)) then Nothing Nat
+          else
+            let line : Nat := bounded_native_report_span_before is_digit text bytes before_column in
+            if notb (ltb_nat line before_column) then Nothing Nat
+            else if andb(eq_nat(prim_string_byte_at text line, 48),
+              notb (eq_nat (S line) before_column)) then Nothing Nat
+            else match line with
+            | Z => Nothing Nat
+            | S path_end =>
+                if andb(notb (eq_nat path_end Z), eq_nat(prim_string_byte_at text path_end, 58))
+                then Just Nat path_end else Nothing Nat
+            end
+      end;
+
+def bounded_native_report_rule_char (byte : Nat) : Bool :=
+    orb(is_lower byte, orb(is_digit byte, orb(eq_nat byte 45, eq_nat byte 95)));
+
+def bounded_native_report_header_fields (text : String) (bytes : Nat) (start : Nat) : Bool :=
+    if notb (bounded_native_report_literal_at text start "OURO-") then False
+    else
+      let letters : Nat := add start 5 in
+      let digits : Nat := bounded_native_report_span_after is_upper text bytes letters in
+      if notb (ltb_nat letters digits) then False
+      else
+        let code_end : Nat := bounded_native_report_span_after is_digit text bytes digits in
+        if notb (ltb_nat digits code_end) then False
+        else if notb (bounded_native_report_literal_at text code_end "] ") then False
+        else
+          let owner : Nat := add code_end 2 in
+          let owner_end : Nat := bounded_native_report_span_after bounded_drive_family_char
+            text bytes owner in
+          if notb (ltb_nat owner owner_end) then False
+          else if notb (bounded_native_report_literal_at text owner_end "/") then False
+          else
+            let rule : Nat := S owner_end in
+            let rule_end : Nat := bounded_native_report_span_after bounded_native_report_rule_char
+              text bytes rule in
+            andb(ltb_nat rule rule_end, bounded_native_report_literal_at text rule_end ": ");
+
+-- Validate candidates in place; copy only the path of the first complete header.
+def bounded_native_report_finding (line : String) : Maybe String :=
+    let bytes : Nat := str_len line in
+    let warning : String := ": warning[" in
+    let error : String := ": error[" in
+    (fix go (fuel : Nat) (offset : Nat) : Maybe String :=
+      match fuel with
+      | Z => Nothing String
+      | S remaining =>
+          let start : Maybe Nat :=
+            if bounded_native_report_literal_at line offset warning then Just Nat (add offset 10)
+            else if bounded_native_report_literal_at line offset error then Just Nat (add offset 8)
+            else Nothing Nat in
+          let candidate : Maybe Nat := match start with
+            | Nothing => Nothing Nat
+            | Just fields => match bounded_native_report_location line bytes offset with
+              | Nothing => Nothing Nat
+              | Just path_end =>
+                  if bounded_native_report_header_fields line bytes fields
+                  then Just Nat path_end else Nothing Nat
+              end
+            end in
+          match candidate with
+          | Just path_end => Just String (str_take line path_end)
+          | Nothing => go remaining (S offset)
+          end
+      end) bytes Z;
+
+def bounded_native_report_banner (line : String) : Maybe BoundedDriveBanner :=
+    let? (Nothing, Just) : Maybe BoundedDriveBanner do
+      let body : String := (str_strip_prefix line "ANALYZE_DRIVE files=")?;
+      let files : Pair String String := (str_split_first body " findings=")?;
+      let found : Pair String String := (str_split_first (snd String String files) " rejected=")?;
+      let rejected : Pair String String := (str_split_first (snd String String found) " families=")?;
+      (bounded_report_guard (all String bounded_native_report_count
+        [fst String String files, fst String String found, fst String String rejected]))?;
+      (bounded_report_guard (bounded_drive_families_valid (snd String String rejected)))?;
+      MkBoundedDriveBanner (fst String String files) (fst String String found)
+        (fst String String rejected) (snd String String rejected)
+    end;
+
+inductive BoundedNativeReportPhase : Type :=
+  | BoundedNativeReportHead : BoundedNativeReportPhase
+  | BoundedNativeReportHint : BoundedNativeReportPhase
+  | BoundedNativeReportWitness : BoundedNativeReportPhase;
+
+inductive BoundedNativeReportOutput : Type :=
+  | MkBoundedNativeReportOutput : List BoundedDriveBanner -> List String -> Bool
+      -> BoundedNativeReportPhase -> Bool -> BoundedNativeReportOutput;
+
+-- Count headers before validating advice to preserve completion-policy error priority.
+def bounded_native_report_output_head (line : String) (state : BoundedNativeReportOutput)
+    : BoundedNativeReportOutput :=
+    let (MkBoundedNativeReportOutput banners paths extra _ completed) := state in
+    let trailing : Bool := orb extra completed in
+    match bounded_native_report_finding line with
+    | Just path => MkBoundedNativeReportOutput banners (Cons String path paths)
+        trailing BoundedNativeReportHint completed
+    | Nothing =>
+        if str_starts line "ANALYZE_DRIVE" then
+          -- A malformed completion must occupy a slot in the single-banner check.
+          let banner : BoundedDriveBanner := fromMaybe BoundedDriveBanner
+            (MkBoundedDriveBanner "" "" "" "") (bounded_native_report_banner line) in
+          MkBoundedNativeReportOutput (Cons BoundedDriveBanner banner banners) paths
+            trailing BoundedNativeReportHead True
+        else MkBoundedNativeReportOutput banners paths True BoundedNativeReportHead completed
+    end;
+
+def bounded_native_report_output_step (line : String) (state : BoundedNativeReportOutput)
+    : BoundedNativeReportOutput :=
+    let (MkBoundedNativeReportOutput banners paths extra phase completed) := state in
+    match phase with
+    | BoundedNativeReportHead => bounded_native_report_output_head line state
+    | BoundedNativeReportHint =>
+        if str_starts line "  hint: " then
+          MkBoundedNativeReportOutput banners paths extra BoundedNativeReportWitness completed
+        else bounded_native_report_output_head line
+          (MkBoundedNativeReportOutput banners paths True BoundedNativeReportHead completed)
+    | BoundedNativeReportWitness =>
+        if str_starts line "  witness: " then
+          MkBoundedNativeReportOutput banners paths extra BoundedNativeReportHead completed
+        else bounded_native_report_output_head line
+          (MkBoundedNativeReportOutput banners paths True BoundedNativeReportHead completed)
+    end;
+
+def bounded_native_report_fold_lines (State : Type) (Report : Type)
+    (stream : ProcessCaptureStream) (exhausted : BoundedNativeReportError)
+    (step : String -> State -> State) (finish : State -> Report) (text : String)
+    : Nat -> Nat -> State -> Either BoundedNativeReportError Report :=
+    let bytes : Nat := str_len text in
+    fix scan (fuel : Nat) (offset : Nat) (state : State)
+        : Either BoundedNativeReportError Report :=
+      if eq_nat offset bytes then Right BoundedNativeReportError Report (finish state)
+      else match fuel with
+      | Z => Left BoundedNativeReportError Report exhausted
+      | S remaining => match bounded_native_report_line stream text offset with
+        | Left error => Left BoundedNativeReportError Report error
+        | Right row => let (MkPair line next) := row in
+            scan remaining next (step line state)
+        end
+      end;
+
+def bounded_native_report_output (text : String)
+    : Either BoundedNativeReportError BoundedNativeReportOutput :=
+    bounded_native_report_fold_lines BoundedNativeReportOutput BoundedNativeReportOutput
+      CaptureStdout (BoundedNativeReportNewline CaptureStdout)
+      bounded_native_report_output_step (fun (state : BoundedNativeReportOutput) => state)
+      text (str_len text) Z (MkBoundedNativeReportOutput [] [] False BoundedNativeReportHead False);
+
+def bounded_native_report_rejection (line : String) : Maybe String :=
+    match str_split_first line ": structured analyzer could not build the unit: " with
+    | Nothing => Nothing String
+    | Just parts => let (MkPair path reason) := parts in
+        if andb(notb (str_null path),
+          andb(notb (str_null reason), bounded_native_report_chars is_graph reason)) then
+          Just String path else Nothing String
+    end;
+
+def bounded_native_report_errors (text : String)
+    : Either BoundedNativeReportError (Pair (List String) Bool) :=
+    bounded_native_report_fold_lines (Pair (List String) Bool) (Pair (List String) Bool)
+      CaptureStderr (BoundedNativeReportNewline CaptureStderr)
+      (fun (line : String) (state : Pair (List String) Bool) =>
+        let (MkPair paths extra) := state in
+        match bounded_native_report_rejection line with
+        | Nothing => if extra then state else MkPair (List String) Bool paths True
+        | Just path => MkPair (List String) Bool (Cons String path paths) extra
+        end)
+      (fun (state : Pair (List String) Bool) =>
+        let (MkPair paths extra) := state in
+        MkPair (List String) Bool (reverse_lin String paths) extra)
+      text (str_len text) Z (MkPair (List String) Bool [] False);
+
+-- Worker identity and the raw ProcResult must be retained by the process owner.
+def bounded_native_report_observe (result : ProcResult)
+    : Either BoundedNativeReportError BoundedDriveObserved :=
+    let (MkProcResult code output errors) := result in
+    if notb (bounded_native_report_size_valid (str_len output) (str_len errors)) then
+      Left BoundedNativeReportError BoundedDriveObserved BoundedNativeReportByteLimit
+    else if notb (ltb_nat code process_capture_u32_bound) then
+      Left BoundedNativeReportError BoundedDriveObserved (BoundedNativeReportStatus code)
+    else
+      let? (Left, Right) : Either BoundedNativeReportError BoundedDriveObserved do
+        let output_state : BoundedNativeReportOutput := (bounded_native_report_output output)?;
+        let error_state : Pair (List String) Bool := (bounded_native_report_errors errors)?;
+        (let (MkBoundedNativeReportOutput banners paths extra phase _) := output_state in
+        let pending : Bool := match phase with
+          | BoundedNativeReportHead => False
+          | BoundedNativeReportHint => True
+          | BoundedNativeReportWitness => True
+          end in
+        MkBoundedDriveObserved (reverse_lin BoundedDriveBanner banners) (reverse_lin String paths)
+          (fst (List String) Bool error_state) (orb extra pending)
+          (snd (List String) Bool error_state) (str_of_nat code))
+      end;
+
+def bounded_native_report_verify (expected : BoundedDriveExpected) (result : ProcResult)
+    : Either BoundedNativeReportError BoundedDriveBanner :=
+    match bounded_native_report_observe result with
+    | Left error => Left BoundedNativeReportError BoundedDriveBanner error
+    | Right observed => match bounded_drive_verify expected observed with
+      | Left error => Left BoundedNativeReportError BoundedDriveBanner (BoundedNativeReportPolicy error)
+      | Right banner => Right BoundedNativeReportError BoundedDriveBanner banner
+      end
+    end;

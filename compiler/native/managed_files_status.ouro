@@ -1,0 +1,197 @@
+-- Recover ordinary read errors only after all raw owners have been cleaned.
+-- Cleanup and compiler guards remain terminal; failed reads expose no prefix.
+import "managed_files_path.ouro",
+  "managed_files_transfer.ouro",
+  "managed_files_memory.ouro",
+  "managed_actions.ouro",
+  "managed_closures.ouro",
+  "managed_nat.ouro",
+  "managed_strings.ouro",
+  "managed_string_ops.ouro",
+  "managed_stdio.ouro",
+  "managed_startup_memory.ouro",
+  "managed_model.ouro",
+  "mir_model.ouro",
+  "x64.ouro",
+  "pe_model.ouro",
+  "lower_model.ouro",
+  "lower_loop.ouro",
+  "lower_ops.ouro",
+  "codegen_model.ouro",
+  "../primitive_model.ouro",
+  "../file_check_model.ouro",
+  "../pipeline_abi.ouro";
+
+def managed_file_read_eof_status : Nat := 38;
+
+def managed_file_read_status_pair (compiler : ManagedCompiler) (status : MirValue) (body : MirValue)
+    (state : ManagedState) : Either NativeLowerError ManagedResult :=
+    lower_bind ManagedResult ManagedResult (managed_nat_from_word compiler PrimitiveWordU32 status state)
+      (fun (natural : ManagedResult) => match natural with | ManagedResultOf number next =>
+        lower_bind Nat ManagedResult (lower_role_identity(managed_compiler_entries compiler, PrimitivePairRole))
+          (fun (family : Nat) => managed_constructor compiler family (managed_bits MirUSize 0)
+            ([number, body] : List MirValue) next) end);
+
+def managed_file_read_status_finish (compiler : ManagedCompiler) (scope : ManagedFileScope)
+    (status : MirValue) (body : Maybe MirValue) (state : ManagedState)
+    : Either NativeLowerError ManagedResult :=
+    lower_bind Nat ManagedResult (managed_stdio_exit_symbol compiler) (fun (exit : Nat) =>
+      lower_bind ManagedResult ManagedResult (managed_file_cleanup compiler scope state)
+        (fun (cleaned : ManagedResult) => match cleaned with | ManagedResultOf okay next =>
+          lower_bind ManagedState ManagedResult (managed_stdio_require exit okay next)
+            (fun (released : ManagedState) => lower_bind ManagedResult ManagedResult
+              (match body with
+              | Nothing => managed_string_allocate compiler (managed_bits MirUSize 0) released
+              | Just value => lower_bind ManagedResult ManagedResult (managed_startup_zero status released)
+                  (fun (tested : ManagedResult) => match tested with | ManagedResultOf complete after =>
+                    managed_string_choose MirManagedPtr complete
+                      (fun (selected : ManagedState) => Right NativeLowerError ManagedResult (ManagedResultOf value selected))
+                      (managed_string_allocate compiler (managed_bits MirUSize 0)) after end) end)
+              (fun (selected : ManagedResult) => match selected with | ManagedResultOf bytes final =>
+                managed_file_read_status_pair compiler status bytes final end)) end));
+
+def managed_file_read_status_progress (compiler : ManagedCompiler) (scope : ManagedFileScope)
+    (error : Nat) (value : MirValue) (buffer : MirValue) (offset : MirValue)
+    (requested : MirValue) (count : MirValue) (state : ManagedState)
+    : Either NativeLowerError ManagedResult :=
+    lower_bind ManagedResult ManagedResult (managed_startup_count count state)
+      (fun (loaded : ManagedResult) => match loaded with | ManagedResultOf actual next =>
+        lower_bind ManagedResult ManagedResult (managed_compare MirLessEqual actual requested next)
+          (fun (bounded : ManagedResult) => match bounded with | ManagedResultOf fits after =>
+            lower_bind ManagedState ManagedResult (managed_file_require compiler scope fits after)
+              (fun (checked : ManagedState) => lower_bind ManagedResult ManagedResult
+                (managed_compare MirGreater actual (managed_bits MirUSize 0) checked)
+                (fun (tested : ManagedResult) => match tested with | ManagedResultOf positive final =>
+                  managed_string_choose MirUSize positive
+                    (fun (selected : ManagedState) => lower_map ManagedState ManagedResult
+                      (fun (copied : ManagedState) => ManagedResultOf actual copied)
+                      (managed_file_copy False value buffer offset actual selected))
+                    (fun (selected : ManagedState) => Right NativeLowerError ManagedResult
+                      (ManagedResultOf (managed_bits MirUSize 0)
+                        (managed_emit(MirMove error (managed_bits MirU32 managed_file_read_eof_status), selected))))
+                    final end)) end) end);
+
+def managed_file_read_status_step (compiler : ManagedCompiler) (scope : ManagedFileScope)
+    (error : Nat) (stream_handle : MirValue) (value : MirValue) (buffer : MirValue)
+    (count : MirValue) (bytes : MirValue) (offset : MirValue) (state : ManagedState)
+    : Either NativeLowerError ManagedResult :=
+    lower_bind ManagedResult ManagedResult (managed_binary MirUSize MirSub bytes offset state)
+      (fun (remaining : ManagedResult) => match remaining with | ManagedResultOf available next =>
+        lower_bind ManagedResult ManagedResult (managed_stdio_chunk available next)
+          (fun (chunk : ManagedResult) => match chunk with | ManagedResultOf requested after =>
+            lower_bind ManagedResult ManagedResult
+              (managed_file_call compiler ManagedFileRead ([stream_handle, buffer, requested, count] : List MirValue) after)
+              (fun (called : ManagedResult) => match called with | ManagedResultOf status entered =>
+                lower_bind ManagedResult ManagedResult (managed_startup_zero status entered)
+                  (fun (tested : ManagedResult) => match tested with | ManagedResultOf okay final =>
+                    managed_string_choose MirUSize okay
+                      (managed_file_read_status_progress compiler scope error value buffer offset requested count)
+                      (fun (selected : ManagedState) => Right NativeLowerError ManagedResult
+                        (ManagedResultOf (managed_bits MirUSize 0) (managed_emit(MirMove error status, selected))))
+                      final end) end) end) end);
+
+def managed_file_read_status_loop (compiler : ManagedCompiler) (scope : ManagedFileScope)
+    (stream_handle : MirValue) (value : MirValue) (buffer : MirValue) (count : MirValue) (bytes : MirValue)
+    (state : ManagedState) : Either NativeLowerError ManagedResult :=
+    lower_bind (Pair Nat ManagedState) ManagedResult (managed_fresh_local MirU32 state)
+      (fun (status_cell : Pair Nat ManagedState) => match status_cell with | MkPair error next =>
+        lower_bind (Pair Nat ManagedState) ManagedResult (managed_fresh_local MirUSize next)
+          (fun (offset_cell : Pair Nat ManagedState) => match offset_cell with | MkPair offset entered =>
+            let initialized : ManagedState := managed_emit_all
+              ([MirMove error (managed_bits MirU32 0), MirMove offset (managed_bits MirUSize 0)] : List MirInstruction) entered in
+            lower_bind LowerLoopBlocks ManagedResult (lower_loop_blocks (managed_flow initialized))
+              (fun (labels : LowerLoopBlocks) => match labels with | LowerLoopAt header body finish flow =>
+                lower_bind ManagedResult ManagedResult (managed_compare MirLess (MirUse offset) bytes
+                  (managed_with_flow(initialized, lower_switch_block header (MirJump header) flow)))
+                  (fun (tested : ManagedResult) => match tested with | ManagedResultOf remaining after_test =>
+                    lower_bind ManagedResult ManagedResult (managed_startup_zero (MirUse error) after_test)
+                      (fun (checked : ManagedResult) => match checked with | ManagedResultOf okay after_check =>
+                        lower_bind ManagedResult ManagedResult (managed_binary MirU8 MirAnd remaining okay after_check)
+                          (fun (combined : ManagedResult) => match combined with | ManagedResultOf running after =>
+                            lower_map ManagedResult ManagedResult (fun (stepped : ManagedResult) => match stepped with
+                              | ManagedResultOf actual final => ManagedResultOf (MirUse error)
+                                  (managed_switch_block finish (MirJump header)
+                                    (managed_emit(MirBinaryOp offset MirAdd (MirUse offset) actual, final))) end)
+                              (managed_file_read_status_step compiler scope error stream_handle value buffer count bytes (MirUse offset)
+                                (managed_switch_block body (MirBranch running body finish) after)) end) end) end) end) end) end);
+
+def managed_file_read_status_buffer (compiler : ManagedCompiler) (stream_handle : MirValue)
+    (value : MirValue) (bytes : MirValue) (count : MirValue) (buffer : MirValue)
+    (scope : ManagedFileScope) (state : ManagedState) : Either NativeLowerError ManagedResult :=
+    lower_bind ManagedResult ManagedResult (managed_file_read_status_loop compiler scope stream_handle value buffer count bytes state)
+      (fun (read : ManagedResult) => match read with | ManagedResultOf status next =>
+        managed_file_read_status_finish compiler scope status (Just MirValue value) next end);
+
+def managed_file_read_status_sized (compiler : ManagedCompiler) (scope : ManagedFileScope)
+    (stream_handle : MirValue) (size : MirValue) (count : MirValue) (state : ManagedState)
+    : Either NativeLowerError ManagedResult :=
+    lower_bind ManagedResult ManagedResult (managed_load MirUSize size 0 state)
+      (fun (loaded : ManagedResult) => match loaded with | ManagedResultOf bytes next =>
+        lower_bind ManagedResult ManagedResult (managed_binary MirUSize MirAdd bytes (managed_bits MirUSize 47) next)
+          (fun (added : ManagedResult) => match added with | ManagedResultOf total after =>
+            lower_bind ManagedResult ManagedResult (managed_compare MirGreaterEqual total bytes after)
+              (fun (bounded : ManagedResult) => match bounded with | ManagedResultOf fits final =>
+                lower_bind ManagedState ManagedResult (managed_file_require compiler scope fits final)
+                  (fun (checked : ManagedState) => lower_bind ManagedResult ManagedResult (managed_string_allocate compiler bytes checked)
+                    (fun (allocated : ManagedResult) => match allocated with | ManagedResultOf value ready =>
+                      managed_file_buffer compiler scope (managed_bits MirUSize managed_stdio_buffer_bytes)
+                        (managed_file_read_status_buffer compiler stream_handle value bytes count) ready end)) end) end) end);
+
+def managed_file_read_status_opened (compiler : ManagedCompiler) (scope : ManagedFileScope)
+    (stream_handle : MirValue) (storage : MirValue) (state : ManagedState)
+    : Either NativeLowerError ManagedResult :=
+    lower_bind ManagedResult ManagedResult (managed_startup_pointer storage 8 state)
+      (fun (sized : ManagedResult) => match sized with | ManagedResultOf size next =>
+        lower_bind ManagedResult ManagedResult (managed_startup_pointer storage 16 next)
+          (fun (counted : ManagedResult) => match counted with | ManagedResultOf count after =>
+            lower_bind ManagedResult ManagedResult (managed_file_call compiler ManagedFileLength ([stream_handle, size] : List MirValue) after)
+              (fun (queried : ManagedResult) => match queried with | ManagedResultOf status entered =>
+                lower_bind ManagedResult ManagedResult (managed_startup_zero status entered)
+                  (fun (tested : ManagedResult) => match tested with | ManagedResultOf okay final =>
+                    managed_string_choose MirManagedPtr okay
+                      (managed_file_read_status_sized compiler scope stream_handle size count)
+                      (managed_file_read_status_finish compiler scope status (Nothing MirValue)) final end) end) end) end);
+
+def managed_file_read_status_open (compiler : ManagedCompiler) (storage : MirValue)
+    (wide : MirValue) (units : MirValue) (scope : ManagedFileScope) (state : ManagedState)
+    : Either NativeLowerError ManagedResult :=
+    lower_bind ManagedResult ManagedResult (managed_file_call compiler ManagedFileOpenRead
+      ([wide, units, MirBits(MirU32, X64Words64(X64Bytes32 0 0 0 128, codegen_zero)),
+        managed_bits MirU32 3, managed_bits MirU32 3, managed_bits MirU8 0, storage] : List MirValue) state)
+      (fun (opened : ManagedResult) => match opened with | ManagedResultOf status next =>
+        lower_bind ManagedResult ManagedResult (managed_startup_zero status next)
+          (fun (tested : ManagedResult) => match tested with | ManagedResultOf okay after =>
+            managed_string_choose MirManagedPtr okay
+              (fun (selected : ManagedState) => lower_bind ManagedResult ManagedResult (managed_load MirUSize storage 0 selected)
+                (fun (loaded : ManagedResult) => match loaded with | ManagedResultOf bits entered =>
+                  lower_bind ManagedResult ManagedResult (managed_convert MirRawPtr MirRawFromBits bits entered)
+                    (fun (cast : ManagedResult) => match cast with | ManagedResultOf stream_handle final =>
+                      managed_file_read_status_opened compiler (managed_file_handle stream_handle scope) stream_handle storage final end) end))
+              (managed_file_read_status_finish compiler scope status (Nothing MirValue)) after end) end);
+
+def managed_file_read_status_action (compiler : ManagedCompiler) (path : MirValue) (state : ManagedState)
+    : Either NativeLowerError ManagedResult :=
+    managed_action compiler ([path] : List MirValue) (fun (values : List MirValue) (entered : ManagedState) =>
+      lower_bind MirValue ManagedResult (lower_single MirValue values) (fun (name : MirValue) =>
+        managed_file_path_body compiler name (managed_file_read_status_open compiler) entered)) state;
+
+def managed_file_read_status_value (compiler : ManagedCompiler) (state : ManagedState)
+    : Either NativeLowerError ManagedResult :=
+    let caller : LowerState := managed_flow state in
+    lower_bind (Pair Nat ManagedState) ManagedResult (managed_fresh_symbol state)
+      (fun (fresh : Pair Nat ManagedState) => match fresh with | MkPair symbol reserved =>
+        lower_bind ManagedResult ManagedResult
+          (managed_file_read_status_action compiler (MirUse 1) (managed_with_flow(reserved, lower_empty_state 2)))
+          (fun (compiled : ManagedResult) => match compiled with | ManagedResultOf value after =>
+            let function : MirFunction := managed_finish_function symbol
+              ([111,117,114,111,95,102,105,108,101,95,114,101,97,100,95,115,116,97,116,117,115] : List Nat)
+              ([MirLocalDef 0 MirManagedPtr, MirLocalDef 1 MirManagedPtr] : List MirLocal) value after in
+            managed_emit_callable compiler 3 symbol False ([] : List MirValue)
+              (managed_with_flow(managed_add_function function after, caller)) end) end);
+
+def managed_file_read_status_primitive (compiler : ManagedCompiler) (step : ManagedStep) (scope : ManagedScope)
+    (arguments : List CoreTerm) (state : ManagedState) : Either NativeLowerError ManagedResult :=
+    lower_bind CoreTerm ManagedResult (lower_single CoreTerm arguments) (fun (path : CoreTerm) =>
+      lower_bind ManagedResult ManagedResult (step scope path state)
+        (fun (selected : ManagedResult) => match selected with | ManagedResultOf value next =>
+          managed_file_read_status_action compiler value next end));

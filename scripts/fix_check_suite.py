@@ -129,7 +129,7 @@ def run_suite(fixer: Path, out: Path) -> None:
         directory.mkdir(exist_ok=True)
         (directory / "dep.ouro").write_text(UNIT, encoding="utf-8", newline="")
         path = directory / "source.ouro"
-        source = alias * 2 + body
+        source = alias * 2 + "def main : Unit :=UnitValue;\n"
         expected = alias + body
         path.write_text(source, encoding="utf-8", newline="")
         result = invoke("duplicate-alias-preview", [fixer, path])
@@ -147,11 +147,10 @@ def run_suite(fixer: Path, out: Path) -> None:
         directory.mkdir(exist_ok=True)
         (directory / "dep.ouro").write_text(UNIT, encoding="utf-8", newline="")
         (directory / "left.ouro").write_text('import "dep.ouro";\ndef left : Unit := UnitValue;\n', encoding="utf-8")
-        (directory / "right.ouro").write_text('import "dep.ouro";\ndef right : Unit := UnitValue;\n', encoding="utf-8")
+        (directory / "right.ouro").write_text('import "./dep.ouro";\ndef right : Unit := UnitValue;\n', encoding="utf-8")
         path = directory / "漢字 source.ouro"
-        # The fixer normalizes only ":=" spacing (tools/analyze/format.ouro;
-        # same shape as the fix_suite.sh unicode contract), so the diamond
-        # keeps ":" spaced and tests the import/Unicode path, not colon layout.
+        # The import diamond checks Unicode paths with a spacing edit at `:=`.
+        # Keep the type annotation spacing identical in both versions.
         source = 'import "left.ouro";\nimport "right.ouro";\ndef main : Unit :=left;\n'
         expected = 'import "left.ouro";\nimport "right.ouro";\ndef main : Unit := left;\n'
         path.write_text(source, encoding="utf-8", newline="")
@@ -164,6 +163,14 @@ def run_suite(fixer: Path, out: Path) -> None:
         assert result.stdout.decode().replace("\r\n", "\n") == f"ouro.fix-check.v1\t{len(expected.encode())}\t4\tcomplete\n"
         result = invoke("worker-file-mode", [worker, path, "file", path])
         assert result.stdout.decode().replace("\r\n", "\n") == f"ouro.fix-check.v1\t{len(expected.encode())}\t4\tcomplete\n"
+        overlay_root = directory / "overlay-root.ouro"
+        disk_source = 'import "missing-on-disk.ouro";\n'
+        overlay_root.write_text(disk_source, encoding="utf-8", newline="")
+        overlay = out / "overlay.ouro"
+        overlay.write_text(expected, encoding="utf-8", newline="")
+        result = invoke("worker-overlay-closure", [worker, overlay_root, "file", overlay])
+        assert result.stdout.decode().replace("\r\n", "\n") == f"ouro.fix-check.v1\t{len(expected.encode())}\t4\tcomplete\n"
+        assert overlay_root.read_bytes() == disk_source.encode()
         bad = directory / "bad-candidate.ouro"
         bad.write_text(UNIT + "def main : Unit := unknown;\n", encoding="utf-8", newline="")
         invoke("worker-file-rejected", [worker, path, "file", bad], success=False)
@@ -182,9 +189,7 @@ def run_suite(fixer: Path, out: Path) -> None:
         invoke("worker-missing-root", [worker, directory / "absent.ouro", "0"], source=b"", success=False)
         invoke("worker-directory-root", [worker, directory, "0"], source=b"", success=False)
         large = out / "large-source.ouro"
-        # Single comment lines beyond ~32-64KB are rejected by the checker
-        # itself (worker matches P2: CErr 10:0), so total-size framing is
-        # tested with many short lines instead of one giant line.
+        # Short comment lines isolate total-size framing from the checker line limit.
         large_source = "-- pad line\n" * 11000 + UNIT + "def main : Unit := UnitValue;\n"
         large.write_text(large_source, encoding="utf-8", newline="")
         invoke("worker-large-source", [worker, large, len(large_source)], source=large_source.encode())

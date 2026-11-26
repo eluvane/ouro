@@ -6,9 +6,9 @@
 
 ## Summary
 
-Add a bounded standard-library slice for word operations, SHA-256/HMAC,
-HTTP/1.0 message handling, and sequential sleep without adding a C HTTP stack,
-TLS implementation, digest primitive, scheduler, or kernel rule.
+The accepted standard-library slice covers word operations, SHA-256 and
+HMAC, HTTP/1.0 messages, and sequential sleep. It uses the existing kernel
+rules and limits the host additions to the interfaces described below.
 
 ## Motivation
 

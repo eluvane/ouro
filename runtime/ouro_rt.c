@@ -1,4 +1,5 @@
-/* Runtime for generated C: bump allocation is safe here because compiler/tool runs are short-lived. */
+/* Runtime for generated C. Phase resets reclaim temporaries after callers
+   retain their results. */
 
 #include "ouro_rt.h"
 
@@ -122,6 +123,7 @@ FILE *ouro_host_fopen(const char *path, const char *mode)
 }
 
 #define OURO_BLOCK (1024UL * 1024UL)
+#define OURO_CHILD_BLOCK (64UL * 1024UL)
 /* Cells hold ints and pointers only, so pointer alignment is enough. The
    trailing field vector of a wide constructor relies on the cell size being a
    whole number of pointers. */
@@ -141,6 +143,8 @@ static unsigned long ouro_bcap;
 static char *ouro_block;
 static unsigned long ouro_used;
 static unsigned long ouro_cap;
+/* The policy follows the banks restored before survivor cloning. */
+static unsigned long ouro_bank_minimum = OURO_BLOCK;
 static unsigned long ouro_mark_n;
 static unsigned long ouro_mark_used;
 static unsigned long long ouro_total_alloc_bytes;
@@ -193,12 +197,69 @@ struct ouro_heap_context {
 	unsigned long mark_used;
 	unsigned long static_depth;
 	unsigned long perm_depth;
+	unsigned long bank_minimum;
 	int perm_bank;
 	ouro_heap_context *previous;
 };
 
 static ouro_heap_context *ouro_active_context;
 
+/* Released bank blocks of the standard sizes are reused, newest first, up to
+   a fixed total instead of returning to the C heap, which may unmap them and
+   fault their pages in again. AddressSanitizer builds release every block so
+   stale bank pointers stay detectable. */
+#if defined(__SANITIZE_ADDRESS__)
+#define OURO_BLOCK_CACHE_LIMIT 0UL
+#elif defined(__has_feature)
+#if __has_feature(address_sanitizer)
+#define OURO_BLOCK_CACHE_LIMIT 0UL
+#endif
+#endif
+#ifndef OURO_BLOCK_CACHE_LIMIT
+#define OURO_BLOCK_CACHE_LIMIT (64UL * 1024UL * 1024UL)
+#endif
+#define OURO_BLOCK_CLASSES 5
+static char *ouro_block_cache[OURO_BLOCK_CLASSES];
+static unsigned long ouro_block_cache_bytes;
+
+static int block_class(unsigned long size)
+{
+	int c;
+	for (c = 0; c < OURO_BLOCK_CLASSES; c++)
+		if (size == OURO_CHILD_BLOCK << c)
+			return c;
+	return -1;
+}
+
+static char *block_get(unsigned long size)
+{
+	int c = block_class(size);
+	char *block;
+	if (c < 0 || ouro_block_cache[c] == 0)
+		return (char *)malloc(size);
+	block = ouro_block_cache[c];
+	memcpy(&ouro_block_cache[c], block, sizeof ouro_block_cache[c]);
+	ouro_block_cache_bytes -= size;
+	return block;
+}
+
+static void block_put(char *block, unsigned long size)
+{
+	int c = block_class(size);
+	if (block != 0 && c >= 0 && size <= OURO_BLOCK_CACHE_LIMIT - ouro_block_cache_bytes) {
+		memcpy(block, &ouro_block_cache[c], sizeof ouro_block_cache[c]);
+		ouro_block_cache[c] = block;
+		ouro_block_cache_bytes += size;
+		return;
+	}
+	free(block);
+}
+
+#if defined(_MSC_VER)
+__declspec(noreturn)
+#elif defined(__GNUC__) || defined(__clang__)
+__attribute__((noreturn))
+#endif
 static void ouro_oom(const char *where, unsigned long want)
 {
 	fprintf(stderr,
@@ -208,14 +269,31 @@ static void ouro_oom(const char *where, unsigned long want)
 	exit(1);
 }
 
+static unsigned long round_request_size(unsigned long size)
+{
+	if (size > ULONG_MAX - (OURO_ALIGN - 1UL))
+		ouro_oom("allocation-size", size);
+	return OURO_ROUND(size);
+}
+
+static unsigned long bank_block_size(unsigned long size, unsigned long capacity,
+	unsigned long minimum)
+{
+	unsigned long want = minimum;
+	if (minimum < OURO_BLOCK && capacity != 0)
+		want = capacity < OURO_BLOCK / 2UL ? capacity * 2UL : OURO_BLOCK;
+	return size > want ? size : want;
+}
+
 static void *alloc_bank(unsigned long size, char ***blocks, unsigned long **bsizes,
                         unsigned long *nblocks, unsigned long *bcap,
-                        char **block, unsigned long *used, unsigned long *cap)
+                        char **block, unsigned long *used, unsigned long *cap,
+                        unsigned long minimum)
 {
 	void *p;
-	size = OURO_ROUND(size);
-	if (*block == 0 || *used + size > *cap) {
-		unsigned long want = size > OURO_BLOCK ? size : OURO_BLOCK;
+	size = round_request_size(size);
+	if (*block == 0 || *used > *cap || size > *cap - *used) {
+		unsigned long want = bank_block_size(size, *cap, minimum);
 		if (*nblocks == *bcap) {
 			unsigned long nc = *bcap == 0 ? 16UL : *bcap * 2UL;
 			*blocks = (char **)realloc(*blocks, nc * sizeof(char *));
@@ -224,7 +302,7 @@ static void *alloc_bank(unsigned long size, char ***blocks, unsigned long **bsiz
 				ouro_oom("realloc-bank", nc * (unsigned long)sizeof(char *));
 			*bcap = nc;
 		}
-		*block = (char *)malloc(want);
+		*block = block_get(want);
 		if (*block == 0)
 			ouro_oom("malloc-bank", want);
 		(*blocks)[*nblocks] = *block;
@@ -245,13 +323,12 @@ static void reset_bank(char ***blocks, unsigned long **bsizes,
 {
 	while (*nblocks > 0) {
 		(*nblocks)--;
-		free((*blocks)[*nblocks]);
+		block_put((*blocks)[*nblocks], (*bsizes)[*nblocks]);
 		(*blocks)[*nblocks] = 0;
 	}
 	*block = 0;
 	*used = 0;
 	*cap = 0;
-	(void)bsizes;
 	(void)bcap;
 }
 
@@ -276,6 +353,7 @@ static void exchange_heap_context(ouro_heap_context *context)
 	unsigned long mark_used = ouro_mark_used;
 	unsigned long static_depth = ouro_static_depth;
 	unsigned long perm_depth = ouro_perm_depth;
+	unsigned long bank_minimum = ouro_bank_minimum;
 	int perm_bank = ouro_perm_bank;
 	exchange_bank(&context->phase, &ouro_blocks, &ouro_bsizes, &ouro_nblocks,
 		&ouro_bcap, &ouro_block, &ouro_used, &ouro_cap);
@@ -289,11 +367,13 @@ static void exchange_heap_context(ouro_heap_context *context)
 	ouro_mark_used = context->mark_used;
 	ouro_static_depth = context->static_depth;
 	ouro_perm_depth = context->perm_depth;
+	ouro_bank_minimum = context->bank_minimum;
 	ouro_perm_bank = context->perm_bank;
 	context->mark_n = mark_n;
 	context->mark_used = mark_used;
 	context->static_depth = static_depth;
 	context->perm_depth = perm_depth;
+	context->bank_minimum = bank_minimum;
 	context->perm_bank = perm_bank;
 }
 
@@ -302,6 +382,7 @@ ouro_heap_context *ouro_heap_context_enter(void)
 	ouro_heap_context *context = (ouro_heap_context *)calloc(1, sizeof(*context));
 	if (context == 0)
 		ouro_oom("heap-context", (unsigned long)sizeof(*context));
+	context->bank_minimum = OURO_CHILD_BLOCK;
 	context->previous = ouro_active_context;
 	exchange_heap_context(context);
 	ouro_active_context = context;
@@ -320,7 +401,7 @@ static void *ouro_static_alloc(unsigned long size)
 {
 	return alloc_bank(size, &ouro_static_blocks, &ouro_static_bsizes,
 	                  &ouro_static_nblocks, &ouro_static_bcap,
-	                  &ouro_static_block, &ouro_static_used, &ouro_static_cap);
+	                  &ouro_static_block, &ouro_static_used, &ouro_static_cap, OURO_BLOCK);
 }
 
 void ouro_static_begin(void)
@@ -362,16 +443,46 @@ void ouro_perm_reset_bank(int bank)
 		           &ouro_perm_cap);
 }
 
+#if defined(__GNUC__) || defined(__clang__)
+#define OURO_ALWAYS_INLINE inline __attribute__((always_inline))
+#define OURO_NOINLINE __attribute__((noinline))
+#else
+#define OURO_ALWAYS_INLINE
+#define OURO_NOINLINE
+#endif
+
+static void *alloc_slow(unsigned long size);
+
+/* Phase-bank bump inside the current block. Size checks, other banks and
+   new blocks take the general path. */
+static OURO_ALWAYS_INLINE void *alloc_fast(unsigned long size)
+{
+	if (size <= OURO_CHILD_BLOCK && ouro_static_depth == 0 && ouro_perm_depth == 0 &&
+	    ouro_block != 0 && ouro_used <= ouro_cap &&
+	    OURO_ROUND(size) <= ouro_cap - ouro_used) {
+		void *p = ouro_block + ouro_used;
+		ouro_used += OURO_ROUND(size);
+		ouro_total_alloc_bytes += OURO_ROUND(size);
+		return p;
+	}
+	return alloc_slow(size);
+}
+
 void *ouro_alloc(unsigned long size)
+{
+	return alloc_fast(size);
+}
+
+static OURO_NOINLINE void *alloc_slow(unsigned long size)
 {
 	void *p;
 	if (ouro_static_depth > 0)
 		return ouro_static_alloc(size);
 	if (ouro_perm_depth > 0)
 		return ouro_perm_alloc(size);
-	size = OURO_ROUND(size);
-	if (ouro_block == 0 || ouro_used + size > ouro_cap) {
-		unsigned long want = size > OURO_BLOCK ? size : OURO_BLOCK;
+	size = round_request_size(size);
+	if (ouro_block == 0 || ouro_used > ouro_cap || size > ouro_cap - ouro_used) {
+		unsigned long want = bank_block_size(size, ouro_cap, ouro_bank_minimum);
 		if (ouro_nblocks == ouro_bcap) {
 			unsigned long nc = ouro_bcap == 0 ? 16UL : ouro_bcap * 2UL;
 			ouro_blocks = (char **)realloc(ouro_blocks, nc * sizeof(char *));
@@ -381,7 +492,7 @@ void *ouro_alloc(unsigned long size)
 				ouro_oom("realloc-phase", nc * (unsigned long)sizeof(char *));
 			ouro_bcap = nc;
 		}
-		ouro_block = (char *)malloc(want);
+		ouro_block = block_get(want);
 		if (ouro_block == 0)
 			ouro_oom("malloc-phase", want);
 		ouro_blocks[ouro_nblocks] = ouro_block;
@@ -401,10 +512,10 @@ void *ouro_perm_alloc(unsigned long size)
 	if (ouro_perm_bank == 1)
 		return alloc_bank(size, &ouro_perm1_blocks, &ouro_perm1_bsizes,
 		                  &ouro_perm1_nblocks, &ouro_perm1_bcap,
-		                  &ouro_perm1_block, &ouro_perm1_used, &ouro_perm1_cap);
+		                  &ouro_perm1_block, &ouro_perm1_used, &ouro_perm1_cap, ouro_bank_minimum);
 	return alloc_bank(size, &ouro_perm_blocks, &ouro_perm_bsizes,
 	                  &ouro_perm_nblocks, &ouro_perm_bcap,
-	                  &ouro_perm_block, &ouro_perm_used, &ouro_perm_cap);
+	                  &ouro_perm_block, &ouro_perm_used, &ouro_perm_cap, ouro_bank_minimum);
 }
 
 void ouro_heap_mark(void)
@@ -429,7 +540,7 @@ void ouro_heap_reset(void)
 {
 	while (ouro_nblocks > ouro_mark_n) {
 		ouro_nblocks--;
-		free(ouro_blocks[ouro_nblocks]);
+		block_put(ouro_blocks[ouro_nblocks], ouro_bsizes[ouro_nblocks]);
 		ouro_blocks[ouro_nblocks] = 0;
 	}
 	if (ouro_nblocks == 0) {
@@ -590,12 +701,34 @@ static int clone_share_outside(const void *p)
 	return ouro_clone_outside != 0 && !ptr_in_heap_context(p, ouro_clone_outside);
 }
 
+/* Chunk addresses remain stable until the complete clone is released. */
+#define CLONE_CHUNK_SHIFT 6U
+#define CLONE_CHUNK_SIZE (1UL << CLONE_CHUNK_SHIFT)
+#define CLONE_INITIAL_DIRECTORY 4UL
+
 typedef struct {
-	const void **k;
-	void **v;
+	const void *keys[CLONE_CHUNK_SIZE];
+	void *values[CLONE_CHUNK_SIZE];
+	/* Bucket links always point to an earlier insertion. */
+	uint32_t next[CLONE_CHUNK_SIZE];
+} clone_chunk;
+
+/* The first chunk stays in the caller's stack frame when the table grows. */
+typedef struct {
+	uint32_t heads[CLONE_CHUNK_SIZE];
+	clone_chunk chunk;
+	clone_chunk *directory[CLONE_INITIAL_DIRECTORY];
+} clone_scratch;
+
+typedef struct {
+	uint32_t *heads;
+	clone_chunk **chunks;
 	unsigned long cap;
-	unsigned long used;
+	unsigned long chunk_count;
+	unsigned long chunk_cap;
+	uint32_t used;
 	void *(*allocate)(unsigned long);
+	clone_scratch *scratch;
 } clone_tab;
 
 static unsigned long clone_hash(const void *p)
@@ -609,90 +742,199 @@ static unsigned long clone_hash(const void *p)
 
 static int clone_tab_init(clone_tab *t, unsigned long cap, void *(*allocate)(unsigned long))
 {
-	t->k = (const void **)calloc(cap, sizeof(const void *));
-	t->v = (void **)calloc(cap, sizeof(void *));
-	t->cap = cap;
-	t->used = 0;
+	size_t count = (size_t)cap;
+	memset(t, 0, sizeof *t);
 	t->allocate = allocate;
-	if (t->k != 0 && t->v != 0)
-		return 1;
-	free(t->k);
-	free(t->v);
-	t->k = 0;
-	t->v = 0;
-	t->cap = 0;
-	return 0;
+	if (cap == 0 || (cap & (cap - 1UL)) != 0 ||
+	    (unsigned long)count != cap || count > SIZE_MAX / sizeof *t->heads)
+		return 0;
+	t->heads = (uint32_t *)calloc(count, sizeof *t->heads);
+	if (t->heads == 0)
+		return 0;
+	t->cap = cap;
+	return 1;
+}
+
+static void clone_tab_init_scoped(clone_tab *t, clone_scratch *scratch,
+	void *(*allocate)(unsigned long))
+{
+	memset(scratch->heads, 0, sizeof scratch->heads);
+	scratch->directory[0] = &scratch->chunk;
+	*t = (clone_tab){
+		.heads = scratch->heads,
+		.chunks = scratch->directory,
+		.cap = CLONE_CHUNK_SIZE,
+		.chunk_count = 1UL,
+		.chunk_cap = CLONE_INITIAL_DIRECTORY,
+		.allocate = allocate,
+		.scratch = scratch,
+	};
 }
 
 static void clone_tab_free(clone_tab *t)
 {
-	free(t->k);
-	free(t->v);
-	t->k = 0;
-	t->v = 0;
+	unsigned long i;
+	for (i = t->scratch == 0 ? 0UL : 1UL; i < t->chunk_count; i++)
+		free(t->chunks[i]);
+	if (t->scratch == 0 || t->chunks != t->scratch->directory)
+		free(t->chunks);
+	if (t->scratch == 0 || t->heads != t->scratch->heads)
+		free(t->heads);
+	t->chunks = 0;
+	t->heads = 0;
 	t->cap = 0;
+	t->chunk_count = 0;
+	t->chunk_cap = 0;
 	t->used = 0;
+	t->scratch = 0;
 }
 
-static int clone_tab_grow(clone_tab *t);
+static unsigned long clone_tab_want(const clone_tab *t)
+{
+	return t->cap > ULONG_MAX / 2UL ? ULONG_MAX : t->cap * 2UL;
+}
+
+static clone_chunk *clone_tab_chunk(clone_tab *t, uint32_t index)
+{
+	unsigned long chunk;
+	unsigned long offset;
+	clone_chunk *entries;
+	if (index == 0 || index > t->used)
+		ouro_oom("clone-tab-index", index);
+	chunk = (unsigned long)((index - 1U) >> CLONE_CHUNK_SHIFT);
+	offset = (index - 1U) & (CLONE_CHUNK_SIZE - 1UL);
+	if (chunk >= t->chunk_count || chunk >= t->chunk_cap ||
+	    t->chunks == 0 || t->chunks[chunk] == 0)
+		ouro_oom("clone-tab-index", index);
+	entries = t->chunks[chunk];
+	if (entries->next[offset] >= index)
+		ouro_oom("clone-tab-index", entries->next[offset]);
+	return entries;
+}
+
+static clone_chunk *clone_tab_next(clone_tab *t)
+{
+	unsigned long chunk = (unsigned long)(t->used >> CLONE_CHUNK_SHIFT);
+	unsigned long capacity = t->chunk_cap;
+	clone_chunk **directory = t->chunks;
+	clone_chunk *entries;
+	if (chunk > t->chunk_count || t->chunk_count > t->chunk_cap ||
+	    (t->chunk_cap != 0 && t->chunks == 0))
+		return 0;
+	if (chunk == t->chunk_count) {
+		if (chunk == capacity) {
+			size_t count;
+			if (capacity > ULONG_MAX / 2UL)
+				return 0;
+			capacity = capacity == 0 ? CLONE_INITIAL_DIRECTORY : capacity * 2UL;
+			count = (size_t)capacity;
+			if ((unsigned long)count != capacity ||
+			    count > SIZE_MAX / sizeof *directory)
+				return 0;
+			directory = (clone_chunk **)calloc(count, sizeof *directory);
+			if (directory == 0)
+				return 0;
+			if (t->chunk_count != 0)
+				memcpy(directory, t->chunks, (size_t)t->chunk_count * sizeof *directory);
+		}
+		entries = (clone_chunk *)malloc(sizeof *entries);
+		if (entries == 0) {
+			if (directory != t->chunks)
+				free(directory);
+			return 0;
+		}
+		if (directory != t->chunks) {
+			if (t->scratch == 0 || t->chunks != t->scratch->directory)
+				free(t->chunks);
+			t->chunks = directory;
+			t->chunk_cap = capacity;
+		}
+		t->chunks[t->chunk_count++] = entries;
+	}
+	if (t->chunks[chunk] == 0)
+		return 0;
+	return t->chunks[chunk];
+}
 
 static void *clone_tab_get(clone_tab *t, const void *key)
 {
-	unsigned long i;
-	unsigned long mask;
+	uint32_t index;
 	if (t->cap == 0 || key == 0)
 		return 0;
-	mask = t->cap - 1UL;
-	i = clone_hash(key) & mask;
-	for (;;) {
-		if (t->k[i] == 0)
-			return 0;
-		if (t->k[i] == key)
-			return t->v[i];
-		i = (i + 1UL) & mask;
+	if (t->heads == 0)
+		ouro_oom("clone-tab-index", 0);
+	index = t->heads[clone_hash(key) & (t->cap - 1UL)];
+	while (index != 0) {
+		clone_chunk *entries = clone_tab_chunk(t, index);
+		unsigned long offset = (index - 1U) & (CLONE_CHUNK_SIZE - 1UL);
+		if (entries->keys[offset] == key)
+			return entries->values[offset];
+		index = entries->next[offset];
 	}
-}
-
-static int clone_tab_put(clone_tab *t, const void *key, void *val)
-{
-	unsigned long i;
-	unsigned long mask;
-	if (key == 0)
-		return 1;
-	if (t->used * 2UL >= t->cap && !clone_tab_grow(t))
-		return 0;
-	mask = t->cap - 1UL;
-	i = clone_hash(key) & mask;
-	for (;;) {
-		if (t->k[i] == 0) {
-			t->k[i] = key;
-			t->v[i] = val;
-			t->used++;
-			return 1;
-		}
-		if (t->k[i] == key) {
-			t->v[i] = val;
-			return 1;
-		}
-		i = (i + 1UL) & mask;
-	}
+	return 0;
 }
 
 static int clone_tab_grow(clone_tab *t)
 {
-	clone_tab n;
-	unsigned long i;
-	unsigned long cap = t->cap == 0 ? 64UL : t->cap * 2UL;
-	if (!clone_tab_init(&n, cap, t->allocate))
+	unsigned long cap;
+	size_t count;
+	uint32_t *heads;
+	uint32_t i;
+	if (t->cap == 0 || t->heads == 0 || t->cap > ULONG_MAX / 2UL)
 		return 0;
-	for (i = 0; i < t->cap; i++) {
-		if (t->k[i] != 0 && !clone_tab_put(&n, t->k[i], t->v[i])) {
-			clone_tab_free(&n);
-			return 0;
-		}
+	cap = t->cap * 2UL;
+	count = (size_t)cap;
+	if ((unsigned long)count != cap || count > SIZE_MAX / sizeof *heads)
+		return 0;
+	heads = (uint32_t *)calloc(count, sizeof *heads);
+	if (heads == 0)
+		return 0;
+	/* No lookup runs while chains are relinked; allocation has already succeeded. */
+	for (i = 0; i < t->used; i++) {
+		clone_chunk *entries = clone_tab_chunk(t, i + 1U);
+		unsigned long offset = i & (CLONE_CHUNK_SIZE - 1UL);
+		unsigned long bucket = clone_hash(entries->keys[offset]) & (cap - 1UL);
+		entries->next[offset] = heads[bucket];
+		heads[bucket] = i + 1U;
 	}
-	clone_tab_free(t);
-	*t = n;
+	if (t->scratch == 0 || t->heads != t->scratch->heads)
+		free(t->heads);
+	t->heads = heads;
+	t->cap = cap;
+	return 1;
+}
+
+static int clone_tab_put(clone_tab *t, const void *key, void *value)
+{
+	unsigned long bucket;
+	unsigned long offset;
+	uint32_t index;
+	clone_chunk *entries;
+	if (key == 0)
+		return 1;
+	if (t->used == UINT32_MAX || t->cap == 0 || t->heads == 0)
+		return 0;
+	if (t->used >= t->cap && !clone_tab_grow(t))
+		return 0;
+	bucket = clone_hash(key) & (t->cap - 1UL);
+	index = t->heads[bucket];
+	while (index != 0) {
+		entries = clone_tab_chunk(t, index);
+		offset = (index - 1U) & (CLONE_CHUNK_SIZE - 1UL);
+		if (entries->keys[offset] == key) {
+			entries->values[offset] = value;
+			return 1;
+		}
+		index = entries->next[offset];
+	}
+	entries = clone_tab_next(t);
+	if (entries == 0)
+		return 0;
+	offset = t->used & (CLONE_CHUNK_SIZE - 1UL);
+	entries->keys[offset] = key;
+	entries->values[offset] = value;
+	entries->next[offset] = t->heads[bucket];
+	t->heads[bucket] = ++t->used;
 	return 1;
 }
 
@@ -735,7 +977,7 @@ static ouro_env *clone_env_rec(ouro_env *e, clone_tab *tab, int skip_cur_perm)
 		return (ouro_env *)seen;
 	out = (ouro_env *)tab->allocate(sizeof(ouro_env));
 	if (!clone_tab_put(tab, e, out))
-		ouro_oom("clone-tab-growth", tab->cap * 2UL);
+		ouro_oom("clone-tab-growth", clone_tab_want(tab));
 	out->v = 0;
 	out->next = 0;
 	out->v = clone_perm_rec(e->v, tab, skip_cur_perm);
@@ -776,7 +1018,7 @@ static ouro_v *clone_perm_rec(ouro_v *v, clone_tab *tab, int skip_cur_perm)
 		return (ouro_v *)seen;
 	out = (ouro_v *)tab->allocate(cell_size(v));
 	if (!clone_tab_put(tab, v, out))
-		ouro_oom("clone-tab-growth", tab->cap * 2UL);
+		ouro_oom("clone-tab-growth", clone_tab_want(tab));
 	out->tag = v->tag;
 	out->n = v->n;
 	out->u = v->u;
@@ -785,6 +1027,8 @@ static ouro_v *clone_perm_rec(ouro_v *v, clone_tab *tab, int skip_cur_perm)
 		return out;
 	}
 	if (v->tag == OURO_TAG_CLOS || v->tag == OURO_TAG_THUNK) {
+		/* Cloning preserves shared captures, not exclusive env-spine ownership. */
+		out->n = 0;
 		out->u.c.env = 0;
 		out->u.c.env = clone_env_rec(v->u.c.env, tab, skip_cur_perm);
 		return out;
@@ -820,7 +1064,8 @@ static ouro_v *clone_perm_rec(ouro_v *v, clone_tab *tab, int skip_cur_perm)
 	return out;
 }
 
-static ouro_v *clone_mode(ouro_v *v, int skip_cur_perm, void *(*allocate)(unsigned long))
+static ouro_v *clone_mode(ouro_v *v, int skip_cur_perm, void *(*allocate)(unsigned long),
+	clone_scratch *scratch)
 {
 	clone_tab tab;
 	ouro_v *out;
@@ -828,8 +1073,10 @@ static ouro_v *clone_mode(ouro_v *v, int skip_cur_perm, void *(*allocate)(unsign
 		return 0;
 	if (clone_share_val(v, skip_cur_perm))
 		return v;
-	if (!clone_tab_init(&tab, 64UL, allocate))
-		ouro_oom("clone-tab", 64UL);
+	if (scratch != 0)
+		clone_tab_init_scoped(&tab, scratch, allocate);
+	else if (!clone_tab_init(&tab, CLONE_CHUNK_SIZE, allocate))
+		ouro_oom("clone-tab", CLONE_CHUNK_SIZE);
 	out = clone_perm_rec(v, &tab, skip_cur_perm);
 	clone_tab_free(&tab);
 	return out;
@@ -837,25 +1084,32 @@ static ouro_v *clone_mode(ouro_v *v, int skip_cur_perm, void *(*allocate)(unsign
 
 ouro_v *ouro_clone_perm(ouro_v *v)
 {
-	return clone_mode(v, 1, ouro_perm_alloc);
+	return clone_mode(v, 1, ouro_perm_alloc, 0);
+}
+
+ouro_v *ouro_clone_perm_with_stack_scratch(ouro_v *v)
+{
+	clone_scratch scratch;
+	return clone_mode(v, 1, ouro_perm_alloc, &scratch);
 }
 
 ouro_v *ouro_clone_perm_deep(ouro_v *v)
 {
-	return clone_mode(v, 0, ouro_perm_alloc);
+	return clone_mode(v, 0, ouro_perm_alloc, 0);
 }
 
 ouro_v *ouro_clone_since_mark(ouro_v *v)
 {
 	ouro_v *out;
 	ouro_clone_share_settled = 1;
-	out = clone_mode(v, 0, ouro_perm_alloc);
+	out = clone_mode(v, 0, ouro_perm_alloc, 0);
 	ouro_clone_share_settled = 0;
 	return out;
 }
 
 ouro_v *ouro_heap_context_leave(ouro_heap_context *context, ouro_v *survivor)
 {
+	clone_scratch scratch;
 	ouro_v *retained;
 	if (context == 0 || context != ouro_active_context) {
 		fputs("ouro_rt: heap contexts must leave in reverse entry order\n", stderr);
@@ -866,7 +1120,7 @@ ouro_v *ouro_heap_context_leave(ouro_heap_context *context, ouro_v *survivor)
 	   the restored domain and must not be recopied on every leave. */
 	exchange_heap_context(context);
 	ouro_clone_outside = context;
-	retained = clone_mode(survivor, 0, ouro_alloc);
+	retained = clone_mode(survivor, 0, ouro_alloc, &scratch);
 	ouro_clone_outside = 0;
 	free_context_bank(&context->phase);
 	free_context_bank(&context->perm[0]);
@@ -893,7 +1147,7 @@ ouro_v *ouro_keep(ouro_v *v)
 
 static ouro_v *ouro_new(int tag, int n)
 {
-	ouro_v *v = (ouro_v *)ouro_alloc(sizeof(ouro_v));
+	ouro_v *v = (ouro_v *)alloc_fast(sizeof(ouro_v));
 	v->tag = tag;
 	v->n = n;
 	v->u.inl[0] = 0;
@@ -964,11 +1218,14 @@ static ouro_v *mk_cat(ouro_v *a, ouro_v *b)
 	return v;
 }
 
-static ouro_v *mk_bytes(unsigned char *buf, unsigned long len)
+ouro_v *ouro_packed_suffix(ouro_v *source, unsigned long start)
 {
-	ouro_v *v = ouro_new(OURO_TAG_BYTES, (int)len);
-	v->u.s = (const char *)buf;
-	return v;
+	ouro_v *suffix;
+	if (start == 0)
+		return source;
+	suffix = ouro_new(OURO_TAG_BYTES, source->n - (int)start);
+	suffix->u.s = source->u.s + start;
+	return suffix;
 }
 
 static int is_empty_list(ouro_v *xs)
@@ -1039,13 +1296,33 @@ ouro_v *ouro_thunk(ouro_v *(*fn)(ouro_env *, ouro_v *), ouro_env *env)
 	return v;
 }
 
+/* Phase string cells allocated during one ouro_app. finish_call_env refuses
+   to rewind a frame that created any, because the result may share those
+   cells and evacuate_bounded_tree does not copy string payloads. */
+static unsigned long long ouro_str_allocs;
+
+static ouro_v *str_with_length(const char *s, int len)
+{
+	if (ouro_static_depth == 0)
+		ouro_str_allocs++;
+	ouro_v *v = ouro_new(OURO_TAG_STR, len);
+	v->u.s = s;
+	return v;
+}
+
 ouro_v *ouro_str(const char *s)
 {
 	/* Native strings carry their byte length so parser cursors can inspect
 	   successive bytes without re-running strlen for every character. */
-	ouro_v *v = ouro_new(OURO_TAG_STR, s != 0 ? (int)strlen(s) : 0);
-	v->u.s = s;
-	return v;
+	return str_with_length(s, s != 0 ? (int)strlen(s) : 0);
+}
+
+ouro_v *ouro_str_copy_prefix(const char *s, unsigned long len)
+{
+	char *copy = (char *)ouro_alloc(len + 1UL);
+	memcpy(copy, s, (size_t)len);
+	copy[len] = 0;
+	return str_with_length(copy, (int)len);
 }
 
 ouro_v *ouro_nat(unsigned long n)
@@ -1112,11 +1389,9 @@ void ouro_slash_path(char *p)
 	}
 }
 
-/* Inverse of ouro_bytes: a List Nat back out to a stream, so text a compiled
-   module produced can leave without any algorithm in C. Peano depth is the
-   byte value, and a cell that is neither Nil nor Cons is a bug in the caller,
-   not something to paper over. Packed host nats are the same values. Concat
-   nodes and packed chunks are the same string, just not yet flattened. */
+/* Write a List Nat without flattening packed chunks or concatenation nodes.
+   Peano depth and packed naturals give the same byte values. An invalid
+   list shape terminates the process. */
 void ouro_write_codes(ouro_v *list, FILE *out)
 {
 	ouro_v *stack[4096];
@@ -1186,7 +1461,7 @@ void ouro_write_codes(ouro_v *list, FILE *out)
 
 ouro_env *ouro_cons(ouro_v *v, ouro_env *next)
 {
-	ouro_env *e = (ouro_env *)ouro_alloc(sizeof(ouro_env));
+	ouro_env *e = (ouro_env *)alloc_fast(sizeof(ouro_env));
 	e->v = v;
 	e->next = next;
 	return e;
@@ -1214,10 +1489,13 @@ ouro_v *ouro_get(ouro_env *env, int k)
    which puts them above it in the bump heap. So a closure or thunk that is
    still the newest phase allocation when it is applied or when a branch is
    selected is referenced by nothing except the C expression consuming it, and
-   its bytes can be handed straight back to the allocator. Handwritten hosts
-   may hold closures in C locals and call them repeatedly; they use ouro_apply,
-   which never reclaims. Static and permanent sections never reclaim either,
-   because generated caches live there and are called many times. */
+   its bytes can be handed straight back to the allocator. After the body
+   returns, finish_call_env can also drop the env spine that produced that
+   single-use closure and slide a small constructor result back onto the
+   caller's bump. Handwritten hosts may hold closures in C locals and call
+   them repeatedly; they use ouro_apply, which never reclaims. Static and
+   permanent sections never reclaim either, because generated caches live
+   there and are called many times. */
 static int phase_top(const void *p, unsigned long bytes)
 {
 	return ouro_block != 0 && ouro_static_depth == 0 &&
@@ -1231,19 +1509,182 @@ static void phase_pop(unsigned long bytes)
 	ouro_reclaimed_bytes += bytes;
 }
 
+static int ptr_in_since(const void *p, unsigned long nb0, unsigned long u0)
+{
+	const char *cp = (const char *)p;
+	unsigned long i;
+	if (p == 0 || ouro_blocks == 0 || nb0 == 0 || nb0 > ouro_nblocks)
+		return 0;
+	if (nb0 == ouro_nblocks)
+		return cp >= ouro_block + u0 && cp < ouro_block + ouro_used;
+	{
+		char *b0 = ouro_blocks[nb0 - 1];
+		unsigned long s0 = ouro_bsizes[nb0 - 1];
+		if (b0 != 0 && cp >= b0 + u0 && cp < b0 + s0)
+			return 1;
+	}
+	for (i = nb0; i < ouro_nblocks; i++) {
+		char *b = ouro_blocks[i];
+		if (b != 0 && cp >= b && cp < b + ouro_bsizes[i])
+			return 1;
+	}
+	return 0;
+}
+
+static void phase_rewind_to(unsigned long nb0, unsigned long u0)
+{
+	unsigned long long dropped = 0;
+	while (ouro_nblocks > nb0) {
+		ouro_nblocks--;
+		dropped += (ouro_nblocks == nb0) ? 0 : ouro_bsizes[ouro_nblocks];
+		block_put(ouro_blocks[ouro_nblocks], ouro_bsizes[ouro_nblocks]);
+		ouro_blocks[ouro_nblocks] = 0;
+	}
+	ouro_block = ouro_blocks[ouro_nblocks - 1];
+	ouro_cap = ouro_bsizes[ouro_nblocks - 1];
+	if (ouro_used > u0)
+		dropped += ouro_used - u0;
+	ouro_used = u0;
+	ouro_reclaimed_bytes += dropped;
+}
+
+#define EVAC_MAX 32
+
+/* Copy a small constructor tree allocated after (nb0, u0) onto that mark
+   and drop everything else from the call. Closures, strings, packed bytes,
+   wide field vectors, and graphs larger than EVAC_MAX stay in place. */
+static ouro_v *evacuate_bounded_tree(ouro_v *root, unsigned long nb0, unsigned long u0)
+{
+	const ouro_v *orig[EVAC_MAX];
+	ouro_v copies[EVAC_MAX];
+	int child_idx[EVAC_MAX][2];
+	int count = 0;
+	int head = 0;
+	int i, j;
+
+	orig[0] = root;
+	count = 1;
+	while (head < count) {
+		const ouro_v *v = orig[head];
+		if (v == 0 || v->tag == OURO_TAG_CLOS || v->tag == OURO_TAG_THUNK ||
+		    v->tag == OURO_TAG_STR || v->tag == OURO_TAG_BYTES || v->tag == OURO_TAG_BIG_NAT)
+			return 0;
+		if (has_fields(v) && v->n > OURO_INLINE_FIELDS)
+			return 0;
+		copies[head] = *v;
+		child_idx[head][0] = -1;
+		child_idx[head][1] = -1;
+		if (has_fields(v)) {
+			for (j = 0; j < v->n; j++) {
+				const ouro_v *ch = v->u.inl[j];
+				if (ch != 0 && ptr_in_since(ch, nb0, u0)) {
+					int found = -1;
+					for (i = 0; i < count; i++) {
+						if (orig[i] == ch) {
+							found = i;
+							break;
+						}
+					}
+					if (found < 0) {
+						if (count >= EVAC_MAX)
+							return 0;
+						found = count++;
+						orig[found] = ch;
+					}
+					child_idx[head][j] = found;
+				}
+			}
+		}
+		head++;
+	}
+	if (ouro_nblocks == nb0 && ouro_used - u0 <= (unsigned long)count * sizeof(ouro_v))
+		return root;
+	phase_rewind_to(nb0, u0);
+	{
+		ouro_v *placed[EVAC_MAX];
+		for (i = count - 1; i >= 0; i--) {
+			ouro_v *dst = (ouro_v *)alloc_fast(sizeof(ouro_v));
+			*dst = copies[i];
+			placed[i] = dst;
+		}
+		for (i = 0; i < count; i++) {
+			for (j = 0; j < 2; j++) {
+				if (child_idx[i][j] >= 0)
+					placed[i]->u.inl[j] = placed[child_idx[i][j]];
+			}
+		}
+		return placed[0];
+	}
+}
+
+/* Drop the env spine that produced a single-use closure, then compact a
+   small constructor result onto that mark. Closure n records how many
+   ouro_env cells sit immediately below a generated partial; generated code
+   never reads that field. The rewind mark stays at those env cells: sliding
+   past a still-reachable argument would leave dangling fields. */
+static ouro_v *finish_call_env(unsigned long nb0, char *block0, unsigned long u0,
+			      int curry_envs, unsigned long long str0, ouro_v *res)
+{
+	unsigned long env_bytes = (unsigned long)curry_envs * sizeof(ouro_env);
+	unsigned long u_base;
+	if (ouro_static_depth != 0 || ouro_perm_depth != 0 || nb0 == 0 || nb0 > ouro_nblocks)
+		return res;
+	if (ouro_mark_n > nb0)
+		return res;
+	if (res != 0 && ouro_nblocks == nb0 && ouro_block == block0 &&
+	    ouro_used == u0 + sizeof(ouro_env) + sizeof(ouro_v) &&
+	    res == (ouro_v *)(block0 + u0 + sizeof(ouro_env)) &&
+	    res->tag == OURO_TAG_CLOS &&
+	    res->u.c.env == (ouro_env *)(block0 + u0) &&
+	    curry_envs < 1024) {
+		res->n = curry_envs + 1;
+		return res;
+	}
+	if (ouro_str_allocs != str0)
+		return res;
+	u_base = u0;
+	if (curry_envs > 0 && u_base >= env_bytes &&
+	    (nb0 > ouro_mark_n || u_base - env_bytes >= ouro_mark_used))
+		u_base -= env_bytes;
+	if (!ptr_in_since(res, nb0, u_base)) {
+		phase_rewind_to(nb0, u_base);
+		return res;
+	}
+	{
+		ouro_v *moved = evacuate_bounded_tree(res, nb0, u_base);
+		if (moved != 0)
+			return moved;
+	}
+	return res;
+}
+
 ouro_v *ouro_app(ouro_v *f, ouro_v *a)
 {
 	ouro_v *(*fn)(ouro_env *, ouro_v *);
 	ouro_env *env;
+	unsigned long nb0;
+	char *block0;
+	unsigned long u0;
+	int curry_envs = 0;
+	unsigned long long str0;
+	ouro_v *res;
 	if (f == 0 || f->tag != OURO_TAG_CLOS) {
 		fputs("ouro_rt: apply of non-function\n", stderr);
 		exit(1);
 	}
 	fn = f->u.c.fn;
 	env = f->u.c.env;
-	if (a != f && phase_top(f, sizeof(ouro_v)))
+	if (a != f && phase_top(f, sizeof(ouro_v))) {
+		curry_envs = f->n > 0 ? f->n : 0;
+		f->n = 0;
 		phase_pop(sizeof(ouro_v));
-	return fn(env, a);
+	}
+	nb0 = ouro_nblocks;
+	block0 = ouro_block;
+	u0 = ouro_used;
+	str0 = ouro_str_allocs;
+	res = fn(env, a);
+	return finish_call_env(nb0, block0, u0, curry_envs, str0, res);
 }
 
 ouro_v *ouro_apply(ouro_v *f, ouro_v *a)
@@ -1275,6 +1716,15 @@ static int case_region_top(int n, ouro_v **branches)
 	    ouro_used < bytes)
 		return 0;
 	lo = ouro_block + (ouro_used - bytes);
+	/* Generated code normally allocates the arms in array order. */
+	for (i = 0; i < n; i++) {
+		const ouro_v *b = branches[i];
+		if ((const char *)b != lo + (unsigned long)i * sizeof(ouro_v) ||
+		    (b->tag != OURO_TAG_CLOS && b->tag != OURO_TAG_THUNK))
+			break;
+	}
+	if (i == n)
+		return 1;
 	for (i = 0; i < n; i++) {
 		const ouro_v *b = branches[i];
 		unsigned long off;
@@ -1338,9 +1788,7 @@ static int stream_step(ouro_v **sp, ouro_v **head, ouro_v **tail)
 					continue;
 				}
 				*head = ouro_nat((unsigned long)(unsigned char)left->u.s[0]);
-				*tail = mk_cat(mk_bytes((unsigned char *)(left->u.s + 1),
-							(unsigned long)left->n - 1UL),
-					       right);
+				*tail = mk_cat(ouro_packed_suffix(left, 1), right);
 				return 1;
 			}
 			if (left->tag == 1 && left->n == 2) {
@@ -1355,8 +1803,7 @@ static int stream_step(ouro_v **sp, ouro_v **head, ouro_v **tail)
 			if (s->n <= 0)
 				return 0;
 			*head = ouro_nat((unsigned long)(unsigned char)s->u.s[0]);
-			*tail = mk_bytes((unsigned char *)(s->u.s + 1),
-					 (unsigned long)s->n - 1UL);
+			*tail = ouro_packed_suffix(s, 1);
 			return 1;
 		}
 		if (s != 0 && (s->tag == OURO_TAG_NAT || s->tag == OURO_TAG_BIG_NAT)) {
@@ -1541,38 +1988,70 @@ static ouro_v *list_reverse(ouro_v *xs)
 	return r;
 }
 
+static ouro_v *nat_add(ouro_v *n, ouro_v *m);
+
 static ouro_v *list_length(ouro_v *xs)
 {
-	unsigned long n = 0;
-	ouro_v *stack[64];
-	int sp = 0;
+	uint64_t count = 0;
+	ouro_v *total = 0;
+	ouro_v *local_stack[64];
+	ouro_v **stack = local_stack;
+	unsigned long sp = 0, capacity = 64UL;
 	for (;;) {
+		uint64_t increment;
 		if (is_empty_list(xs)) {
 			if (sp == 0)
-				return ouro_nat(n);
+				break;
 			xs = stack[--sp];
 			continue;
 		}
 		if (xs->tag == OURO_TAG_CAT && xs->n == 2) {
-			if (sp < 63)
-				stack[sp++] = OURO_F(xs, 1);
+			if (sp == capacity) {
+				unsigned long grown;
+				size_t entries, bytes;
+				ouro_v **grown_stack;
+				if (capacity > ULONG_MAX / 2UL)
+					ouro_oom("length-stack", ULONG_MAX);
+				grown = capacity * 2UL;
+				entries = (size_t)grown;
+				if ((unsigned long)entries != grown ||
+				    entries > SIZE_MAX / sizeof *stack ||
+				    grown > ULONG_MAX / (unsigned long)sizeof *stack)
+					ouro_oom("length-stack", ULONG_MAX);
+				bytes = entries * sizeof *stack;
+				grown_stack = stack == local_stack ? (ouro_v **)malloc(bytes) :
+				              (ouro_v **)realloc(stack, bytes);
+				if (grown_stack == 0)
+					ouro_oom("length-stack", (unsigned long)bytes);
+				if (stack == local_stack)
+					memcpy(grown_stack, stack, (size_t)sp * sizeof *stack);
+				stack = grown_stack;
+				capacity = grown;
+			}
+			stack[sp++] = OURO_F(xs, 1);
 			xs = OURO_F(xs, 0);
 			continue;
 		}
 		if (xs->tag == OURO_TAG_BYTES) {
-			n += (unsigned long)xs->n;
-			if (sp == 0)
-				return ouro_nat(n);
-			xs = stack[--sp];
-			continue;
-		}
-		if (xs->tag == 1 && xs->n == 2) {
-			n++;
+			increment = (uint64_t)xs->n;
+			xs = 0;
+		} else if (xs->tag == 1 && xs->n == 2) {
+			increment = 1;
 			xs = OURO_F(xs, 1);
-			continue;
+		} else {
+			break;
 		}
-		return ouro_nat(n);
+		/* Flush before host overflow. Nat retains all completed chunks. */
+		if (UINT64_MAX - count < increment) {
+			ouro_v *chunk = nat_from_u64(count);
+			total = total == 0 ? chunk : nat_add(total, chunk);
+			count = 0;
+		}
+		count += increment;
 	}
+	if (stack != local_stack)
+		free(stack);
+	return total == 0 ? nat_from_u64(count) : nat_add(total, nat_from_u64(count));
 }
 
 static void nat_failure(void)
@@ -1604,7 +2083,7 @@ static ouro_v *nat_add_packed(ouro_v *left, ouro_v *right)
 }
 
 /* A natural may be a constructor chain ending in either packed form. */
-static ouro_v *nat_pack(ouro_v *value)
+static ouro_v *nat_pack_walk(ouro_v *value)
 {
 	unsigned long successors = 0;
 	while (value != 0 && value->tag == 1 && value->n == 1) {
@@ -1622,13 +2101,50 @@ static ouro_v *nat_pack(ouro_v *value)
 	return successors == 0 ? value : nat_add_packed(value, ouro_nat(successors));
 }
 
-int ouro_nat_to_ulong(ouro_v *value, unsigned long *out)
+/* Static cells are immutable and never released, so a successor chain rooted
+   in the static bank always packs to the same value. Packed values of such
+   roots are remembered and built in the static bank up to a fixed total;
+   past it only results that needed no allocation, which are static small
+   nats, are remembered. */
+#define OURO_NAT_MEMO 4096UL
+#define OURO_NAT_MEMO_BYTES (1024UL * 1024UL)
+static const ouro_v *ouro_nat_memo_key[OURO_NAT_MEMO];
+static ouro_v *ouro_nat_memo_value[OURO_NAT_MEMO];
+static unsigned long long ouro_nat_memo_bytes;
+
+static ouro_v *nat_pack(ouro_v *value)
 {
-	unsigned long successors = 0;
+	unsigned long slot;
+	unsigned long long before;
+	ouro_v *packed;
+	if (value == 0 || value->tag != 1 || value->n != 1 || !ptr_is_static(value))
+		return nat_pack_walk(value);
+	slot = clone_hash(value) & (OURO_NAT_MEMO - 1UL);
+	if (ouro_nat_memo_key[slot] == value)
+		return ouro_nat_memo_value[slot];
+	before = ouro_total_alloc_bytes;
+	if (ouro_nat_memo_bytes < OURO_NAT_MEMO_BYTES) {
+		ouro_static_begin();
+		packed = nat_pack_walk(value);
+		ouro_static_end();
+		ouro_nat_memo_bytes += ouro_total_alloc_bytes - before;
+	} else {
+		packed = nat_pack_walk(value);
+		if (ouro_total_alloc_bytes != before)
+			return packed;
+	}
+	ouro_nat_memo_key[slot] = value;
+	ouro_nat_memo_value[slot] = packed;
+	return packed;
+}
+
+static int nat_to_unsigned(ouro_v *value, uint64_t limit, uint64_t *out)
+{
+	uint64_t successors = 0;
 	uint64_t number = 0;
 	int i;
 	while (value != 0 && value->tag == 1 && value->n == 1) {
-		if (successors == ULONG_MAX)
+		if (successors == limit)
 			return 0;
 		successors++;
 		value = OURO_F(value, 0);
@@ -1642,10 +2158,24 @@ int ouro_nat_to_ulong(ouro_v *value, unsigned long *out)
 			number = (number << 32) | nat_limb(value, i);
 	} else if (value->tag != 0 || value->n != 0)
 		return 0;
-	if (number > ULONG_MAX - successors)
+	if (number > limit - successors)
 		return 0;
-	*out = (unsigned long)number + successors;
+	*out = number + successors;
 	return 1;
+}
+
+int ouro_nat_to_ulong(ouro_v *value, unsigned long *out)
+{
+	uint64_t number;
+	if (!nat_to_unsigned(value, ULONG_MAX, &number))
+		return 0;
+	*out = (unsigned long)number;
+	return 1;
+}
+
+int ouro_nat_to_u64(ouro_v *value, uint64_t *out)
+{
+	return nat_to_unsigned(value, UINT64_MAX, out);
 }
 
 uint32_t ouro_nat_low32(ouro_v *value)

@@ -44,19 +44,15 @@ def cm_visit (unit : ClippySemanticUnit) (apis : CmApiIndex)
         | ENat literal => cm_return(CmValueOf 3 literal 0 False False True, cm_tag(literal, cm_tag 104 s))
         | ERange start stop inclusive => cm_return(cm_unknown node, cm_tag(start, cm_tag(stop, cm_tag((match inclusive with | False => 0 | True => 1 end), cm_tag(117, s)))))
         | EStr literal => cm_return(CmValueOf 4 literal 0 False False True, cm_tag(literal, cm_tag 105 s))
-        | EApp _ _ => match sc_spine term [] with
-          | MkPair head args => match visit ctx False head (cm_tag(length Expr args, cm_tag 106 s)) with
+        | EApp _ _ => let (MkPair head args) := sc_spine term [] in
+          match visit ctx False head (cm_tag(length Expr args, cm_tag 106 s)) with
+          | Left error => Left QualityInputError (Pair CmValue CmState) error
+          | Right head_step => let (MkPair callee s2) := head_step in
+            match cm_visit_args visit ctx args s2 [] with
             | Left error => Left QualityInputError (Pair CmValue CmState) error
-            | Right head_step => match head_step with
-              | MkPair callee s2 => match cm_visit_args visit ctx args s2 [] with
-                | Left error => Left QualityInputError (Pair CmValue CmState) error
-                | Right arg_step => match arg_step with
-                  | MkPair values s3 => match type_only with
-                    | True => cm_return(cm_unknown node, s3)
-                    | False => cm_apply_call unit apis ctx node callee values s3 end
-                  end
-                end
-              end
+            | Right arg_step => let (MkPair values s3) := arg_step in
+              if type_only then cm_return(cm_unknown node, s3)
+              else cm_apply_call unit apis ctx node callee values s3
             end
           end
         | ENamedCall head rows =>
@@ -64,33 +60,26 @@ def cm_visit (unit : ClippySemanticUnit) (apis : CmApiIndex)
                 (cm_tag(length (Pair Nat Expr) rows, cm_tag 121 s)) with
             | Left error => Left QualityInputError (Pair CmValue CmState) error
             | Right head_step =>
-                match head_step with
-                | MkPair callee next =>
-                    let values : List Expr :=
-                      map (Pair Nat Expr) Expr
-                        (fun (row : Pair Nat Expr) =>
-                          match row with
-                          | MkPair _ value => value
-                          end) rows in
-                    match cm_visit_args visit ctx values next [] with
-                    | Left error =>
-                        Left QualityInputError (Pair CmValue CmState) error
-                    | Right arg_step =>
-                        match arg_step with
-                        | MkPair actual after =>
-                            let observed : CmState := foldl CmValue CmState
-                              (fun (observed_state : CmState) (value : CmValue) =>
-                                cm_observe 4 node value observed_state) after actual in
-                            let tainted : Bool := any CmValue cm_value_taint actual in
-                            let unknowns : List CmValue := map CmValue CmValue
-                              (fun (_value : CmValue) =>
-                                CmValueOf 0 node 0 False tainted False) actual in
-                            match type_only with
-                            | True => cm_return(cm_unknown node, observed)
-                            | False => cm_apply_call unit apis ctx node callee unknowns observed
-                            end
-                        end
-                    end
+                let (MkPair callee next) := head_step in
+                let values : List Expr :=
+                  map (Pair Nat Expr) Expr
+                    (fun (row : Pair Nat Expr) =>
+                      let (MkPair _ value) := row in
+                      value) rows in
+                match cm_visit_args visit ctx values next [] with
+                | Left error =>
+                    Left QualityInputError (Pair CmValue CmState) error
+                | Right arg_step =>
+                    let (MkPair actual after) := arg_step in
+                    let observed : CmState := foldl CmValue CmState
+                      (fun (observed_state : CmState) (value : CmValue) =>
+                        cm_observe 4 node value observed_state) after actual in
+                    let tainted : Bool := any CmValue cm_value_taint actual in
+                    let unknowns : List CmValue := map CmValue CmValue
+                      (fun (_value : CmValue) =>
+                        CmValueOf 0 node 0 False tainted False) actual in
+                    if type_only then cm_return(cm_unknown node, observed)
+                    else cm_apply_call unit apis ctx node callee unknowns observed
                 end
             end
         | ELam name ann body =>
@@ -99,27 +88,24 @@ def cm_visit (unit : ClippySemanticUnit) (apis : CmApiIndex)
               | Just ty => types ctx ty (cm_tag(1, cm_tag 107 s)) end in
             match annotated with
             | Left error => Left QualityInputError (Pair CmValue CmState) error
-            | Right step => match step with
-              | MkPair _ s2 => match cm_parameter unit ctx name ann s2 with
+            | Right step => let (MkPair _ s2) := step in
+              match cm_parameter unit ctx name ann s2 with
+              | Left error => Left QualityInputError (Pair CmValue CmState) error
+              | Right scoped => let (MkPair bound s3) := scoped in
+                match visit(cm_context_region bound node, True, body, cm_barrier s3) with
                 | Left error => Left QualityInputError (Pair CmValue CmState) error
-                | Right scoped => match scoped with
-                  | MkPair bound s3 => match visit(cm_context_region bound node, True, body, cm_barrier s3) with
-                    | Left error => Left QualityInputError (Pair CmValue CmState) error
-                    | Right body_step => match body_step with
-                      | MkPair returned s4 => cm_return (CmValueOf 9 node 0 False False False)
-                          (cm_barrier (cm_tag(207, cm_observe 4 node returned s4)))
-                      end
-                    end
-                  end
+                | Right body_step => let (MkPair returned s4) := body_step in
+                  -- Keep body facts in their own region. Creating a closure does not run it.
+                  cm_return (CmValueOf 9 node 0 False False False)
+                    (cm_with_epoch (cm_epoch s3) (cm_tag(207, cm_observe 4 node returned s4)))
                 end
               end
             end
         | EPi name ty body => match types ctx ty (cm_tag 108 s) with
           | Left error => Left QualityInputError (Pair CmValue CmState) error
-          | Right step => match step with
-            | MkPair _ s2 => match cm_bind name (cm_unknown (cm_fresh s2)) ctx s2 with
-              | MkPair bound s3 => types bound body s3 end
-            end
+          | Right step => let (MkPair _ s2) := step in
+            match cm_bind name (cm_unknown (cm_fresh s2)) ctx s2 with
+            | MkPair bound s3 => types bound body s3 end
           end
         | ELet name ann value body =>
             let annotated : Either QualityInputError (Pair CmValue CmState) := match ann with
@@ -127,15 +113,12 @@ def cm_visit (unit : ClippySemanticUnit) (apis : CmApiIndex)
               | Just ty => types ctx ty (cm_tag(1, cm_tag 109 s)) end in
             match annotated with
             | Left error => Left QualityInputError (Pair CmValue CmState) error
-            | Right a => match a with
-              | MkPair _ s2 => match visit ctx False value s2 with
-                | Left error => Left QualityInputError (Pair CmValue CmState) error
-                | Right step => match step with
-                  | MkPair produced s3 => match cm_bind name produced ctx s3 with
-                    | MkPair bound s4 => visit bound terminal body (cm_event(CmFlowEvent (CmFlow node 2 (cm_value_id produced)), s4))
-                    end
-                  end
-                end
+            | Right a => let (MkPair _ s2) := a in
+              match visit ctx False value s2 with
+              | Left error => Left QualityInputError (Pair CmValue CmState) error
+              | Right step => let (MkPair produced s3) := step in
+                let (MkPair bound s4) := cm_bind name produced ctx s3 in
+                visit bound terminal body (cm_event(CmFlowEvent (CmFlow node 2 (cm_value_id produced)), s4))
               end
             end
         | EAscribe value ty => match types ctx ty (cm_tag 110 s) with
@@ -143,56 +126,43 @@ def cm_visit (unit : ClippySemanticUnit) (apis : CmApiIndex)
           | Right step => match step with | MkPair _ s2 => visit ctx terminal value s2 end end
         | EMatch scrut branches => match visit ctx False scrut (cm_tag 111 s) with
           | Left error => Left QualityInputError (Pair CmValue CmState) error
-          | Right step => match step with
-            | MkPair value s2 =>
-                let checked : Bool := andb(notb type_only, cm_checked value) in
-                let match_ctx : CmContext := match checked with
-                  | True => cm_context_arm ctx node False | False => ctx end in
-                let flowed : CmState := cm_observe 3 node value (cm_barrier s2) in
-                visit (cm_context_subject match_ctx value) terminal branches
-                  (match checked with
-                   | True => cm_event(CmFlowEvent (CmFlow node 20 (cm_value_id value)), flowed)
-                   | False => flowed end)
-            end
+          | Right step => let (MkPair value s2) := step in
+            let checked : Bool := andb(notb type_only, cm_checked value) in
+            let match_ctx : CmContext := match checked with
+              | True => cm_context_arm ctx node False | False => ctx end in
+            let flowed : CmState := cm_observe 3 node value (cm_barrier s2) in
+            visit (cm_context_subject match_ctx value) terminal branches
+              (if checked then cm_event(CmFlowEvent (CmFlow node 20 (cm_value_id value)), flowed)
+                else flowed)
           end
         | EIf condition yes no =>
             match visit ctx False condition (cm_tag 122 s) with
             | Left error => Left QualityInputError (Pair CmValue CmState) error
-            | Right condition_step => match condition_step with
-              | MkPair value s2 =>
-                  let arm_ctx : CmContext := cm_context_subject ctx value in
-                  match visit arm_ctx terminal yes
-                      (cm_barrier (cm_observe 3 node value s2)) with
-                  | Left error => Left QualityInputError (Pair CmValue CmState) error
-                  | Right yes_step => match yes_step with
-                    | MkPair yes_value s3 =>
-                        match visit arm_ctx terminal no
-                            (cm_barrier (cm_observe 4 node yes_value s3)) with
-                        | Left error => Left QualityInputError (Pair CmValue CmState) error
-                        | Right no_step => match no_step with
-                          | MkPair no_value s4 =>
-                              cm_return (cm_unknown node)
-                                (cm_barrier (cm_observe 4 node no_value s4))
-                          end
-                        end
-                    end
-                  end
+            | Right condition_step => let (MkPair value s2) := condition_step in
+              let arm_ctx : CmContext := cm_context_subject ctx value in
+              match visit arm_ctx terminal yes
+                  (cm_barrier (cm_observe 3 node value s2)) with
+              | Left error => Left QualityInputError (Pair CmValue CmState) error
+              | Right yes_step => let (MkPair yes_value s3) := yes_step in
+                match visit arm_ctx terminal no
+                    (cm_barrier (cm_observe 4 node yes_value s3)) with
+                | Left error => Left QualityInputError (Pair CmValue CmState) error
+                | Right no_step => let (MkPair no_value s4) := no_step in
+                  cm_return (cm_unknown node)
+                    (cm_barrier (cm_observe 4 node no_value s4))
+                end
               end
             end
         | ECoalesce operand fallback =>
             match visit ctx False operand (cm_tag 124 s) with
             | Left error => Left QualityInputError (Pair CmValue CmState) error
-            | Right operand_step => match operand_step with
-              | MkPair operand_value s2 =>
-                  match visit ctx terminal fallback
-                      (cm_barrier (cm_observe 3 node operand_value s2)) with
-                  | Left error => Left QualityInputError (Pair CmValue CmState) error
-                  | Right fallback_step => match fallback_step with
-                    | MkPair fallback_value s3 =>
-                        cm_return (cm_unknown node)
-                          (cm_barrier (cm_observe 4 node fallback_value s3))
-                    end
-                  end
+            | Right operand_step => let (MkPair operand_value s2) := operand_step in
+              match visit ctx terminal fallback
+                  (cm_barrier (cm_observe 3 node operand_value s2)) with
+              | Left error => Left QualityInputError (Pair CmValue CmState) error
+              | Right fallback_step => let (MkPair fallback_value s3) := fallback_step in
+                cm_return (cm_unknown node)
+                  (cm_barrier (cm_observe 4 node fallback_value s3))
               end
             end
         | EIfLet pattern subject yes no =>
@@ -202,110 +172,97 @@ def cm_visit (unit : ClippySemanticUnit) (apis : CmApiIndex)
             | Cons ctor names =>
                 match visit ctx False subject (cm_tag 123 s) with
                 | Left error => Left QualityInputError (Pair CmValue CmState) error
-                | Right subject_step => match subject_step with
-                  | MkPair value s2 =>
-                      let arm_ctx : CmContext := cm_context_subject ctx value in
-                      match cm_pattern unit apis
-                          (cm_context_arm arm_ctx node False) ctor names
-                          (cm_barrier (cm_observe 3 node value s2)) with
+                | Right subject_step => let (MkPair value s2) := subject_step in
+                  let arm_ctx : CmContext := cm_context_subject ctx value in
+                  match cm_pattern unit apis
+                      (cm_context_arm arm_ctx node False) ctor names
+                      (cm_barrier (cm_observe 3 node value s2)) with
+                  | Left error => Left QualityInputError (Pair CmValue CmState) error
+                  | Right scoped => let (MkPair bound s3) := scoped in
+                    match visit bound terminal yes s3 with
+                    | Left error => Left QualityInputError (Pair CmValue CmState) error
+                    | Right yes_step => let (MkPair yes_value s4) := yes_step in
+                      match visit arm_ctx terminal no
+                          (cm_barrier (cm_observe 4 node yes_value s4)) with
                       | Left error => Left QualityInputError (Pair CmValue CmState) error
-                      | Right scoped => match scoped with
-                        | MkPair bound s3 =>
-                            match visit bound terminal yes s3 with
-                            | Left error => Left QualityInputError (Pair CmValue CmState) error
-                            | Right yes_step => match yes_step with
-                              | MkPair yes_value s4 =>
-                                  match visit arm_ctx terminal no
-                                      (cm_barrier (cm_observe 4 node yes_value s4)) with
-                                  | Left error => Left QualityInputError (Pair CmValue CmState) error
-                                  | Right no_step => match no_step with
-                                    | MkPair no_value s5 =>
-                                        cm_return (cm_unknown node)
-                                          (cm_barrier (cm_observe 4 node no_value s5))
-                                    end
-                                  end
-                              end
-                            end
-                        end
+                      | Right no_step => let (MkPair no_value s5) := no_step in
+                        cm_return (cm_unknown node)
+                          (cm_barrier (cm_observe 4 node no_value s5))
                       end
+                    end
                   end
                 end
             end
         | EFix name binders result body =>
             let identity : Nat := cm_fresh s in
-            match cm_bind(name, cm_local_value identity 0, ctx, cm_tag 112 s) with
-            | MkPair recursive s2 =>
-                let self_ctx : CmContext := cm_context_self recursive identity in
-                (fix telescope (budget : Nat) (bs : Expr) (scope : CmContext) (next : CmState)
-                    : Either QualityInputError (Pair CmValue CmState) :=
-                  match budget with
-                  | Z => Left(QualityInputError, Pair CmValue CmState, QualityInvalidInput "semantic telescope traversal exhausted")
-                  | S less => match bs with
-                    | EBinder param ty rest => match types scope ty (cm_tag 212 next) with
-                      | Left error => Left QualityInputError (Pair CmValue CmState) error
-                      | Right typed => match typed with
-                        | MkPair _ t => match cm_parameter unit scope param (Just Expr ty) t with
-                          | Left error => Left QualityInputError (Pair CmValue CmState) error
-                          | Right scoped => match scoped with | MkPair bound t2 => telescope less rest bound t2 end
-                          end
-                        end
-                      end
-                    | ENoBinder => match types scope result (cm_tag 213 next) with
-                      | Left error => Left QualityInputError (Pair CmValue CmState) error
-                      | Right typed => match typed with
-                        | MkPair _ t => match visit(cm_context_region scope node, True, body, cm_barrier t) with
-                          | Left error => Left QualityInputError (Pair CmValue CmState) error
-                          | Right checked => match checked with
-                            | MkPair returned t2 => cm_return (CmValueOf 9 node 0 False False False)
-                              (cm_barrier (cm_tag(214, cm_observe 4 node returned t2))) end
-                          end
-                        end
-                      end
-                    | EVar _ => Left(QualityInputError, Pair CmValue CmState, QualityInvalidInput "invalid semantic telescope")
-                    | EHole _ => Left(QualityInputError, Pair CmValue CmState, QualityInvalidInput "invalid semantic telescope")
-                    | ESort _ => Left(QualityInputError, Pair CmValue CmState, QualityInvalidInput "invalid semantic telescope")
-                    | ENat _ => Left(QualityInputError, Pair CmValue CmState, QualityInvalidInput "invalid semantic telescope")
-                    | ERange _ _ _ => Left(QualityInputError, Pair CmValue CmState, QualityInvalidInput "invalid semantic telescope")
-                    | EApp _ _ => Left(QualityInputError, Pair CmValue CmState, QualityInvalidInput "invalid semantic telescope")
-                    | ELam _ _ _ => Left(QualityInputError, Pair CmValue CmState, QualityInvalidInput "invalid semantic telescope")
-                    | EPi _ _ _ => Left(QualityInputError, Pair CmValue CmState, QualityInvalidInput "invalid semantic telescope")
-                    | ELet _ _ _ _ => Left(QualityInputError, Pair CmValue CmState, QualityInvalidInput "invalid semantic telescope")
-                    | EAscribe _ _ => Left(QualityInputError, Pair CmValue CmState, QualityInvalidInput "invalid semantic telescope")
-                    | EMatch _ _ => Left(QualityInputError, Pair CmValue CmState, QualityInvalidInput "invalid semantic telescope")
-                    | EIf _ _ _ => Left(QualityInputError, Pair CmValue CmState, QualityInvalidInput "invalid semantic telescope")
-                    | EIfLet _ _ _ _ => Left(QualityInputError, Pair CmValue CmState, QualityInvalidInput "invalid semantic telescope")
-                    | ECoalesce _ _ => Left(QualityInputError, Pair CmValue CmState, QualityInvalidInput "invalid semantic telescope")
-                    | EFix _ _ _ _ => Left(QualityInputError, Pair CmValue CmState, QualityInvalidInput "invalid semantic telescope")
-                    | EEffectRow _ _ => Left(QualityInputError, Pair CmValue CmState, QualityInvalidInput "invalid semantic telescope")
-                    | EPerform _ _ => Left(QualityInputError, Pair CmValue CmState, QualityInvalidInput "invalid semantic telescope")
-                    | EDo _ => Left(QualityInputError, Pair CmValue CmState, QualityInvalidInput "invalid semantic telescope")
-                    | EHandle _ _ => Left(QualityInputError, Pair CmValue CmState, QualityInvalidInput "invalid semantic telescope")
-                    | EBranch _ _ _ => Left(QualityInputError, Pair CmValue CmState, QualityInvalidInput "invalid semantic telescope")
-                    | ENoBranch => Left(QualityInputError, Pair CmValue CmState, QualityInvalidInput "invalid semantic telescope")
-                    | EMultiMatch _ _ => Left(QualityInputError, Pair CmValue CmState, QualityInvalidInput "invalid semantic telescope")
-                    | EStr _ => Left(QualityInputError, Pair CmValue CmState, QualityInvalidInput "invalid semantic telescope")
-                    | EDoBind _ _ => Left(QualityInputError, Pair CmValue CmState, QualityInvalidInput "invalid semantic telescope")
-                    | EList _ => Left(QualityInputError, Pair CmValue CmState, QualityInvalidInput "invalid semantic telescope")
-                    | EListSpread _ _ => Left(QualityInputError, Pair CmValue CmState, QualityInvalidInput "invalid semantic telescope")
-                    | ESpan _ _ inner => telescope less inner scope next
-                    | EFallible _ _ _ _ => Left(QualityInputError, Pair CmValue CmState, QualityInvalidInput "invalid semantic telescope")
-                    | EOpen _ _ => Left(QualityInputError, Pair CmValue CmState, QualityInvalidInput "unresolved module open in semantic telescope")
-                    | ENamedCall _ _ => Left(QualityInputError, Pair CmValue CmState, QualityInvalidInput "named call in semantic telescope")
+            let (MkPair recursive s2) := cm_bind(name, cm_local_value identity 0, ctx, cm_tag 112 s) in
+            let self_ctx : CmContext := cm_context_self recursive identity in
+            (fix telescope (budget : Nat) (bs : Expr) (scope : CmContext) (next : CmState)
+                : Either QualityInputError (Pair CmValue CmState) :=
+              match budget with
+              | Z => Left(QualityInputError, Pair CmValue CmState, QualityInvalidInput "semantic telescope traversal exhausted")
+              | S less => match bs with
+                | EBinder param ty rest => match types scope ty (cm_tag 212 next) with
+                  | Left error => Left QualityInputError (Pair CmValue CmState) error
+                  | Right typed => let (MkPair _ t) := typed in
+                    match cm_parameter unit scope param (Just Expr ty) t with
+                    | Left error => Left QualityInputError (Pair CmValue CmState) error
+                    | Right scoped => match scoped with | MkPair bound t2 => telescope less rest bound t2 end
                     end
-                  end) remaining binders self_ctx s2
-            end
+                  end
+                | ENoBinder => match types scope result (cm_tag 213 next) with
+                  | Left error => Left QualityInputError (Pair CmValue CmState) error
+                  | Right typed => let (MkPair _ t) := typed in
+                    match visit(cm_context_region scope node, True, body, cm_barrier t) with
+                    | Left error => Left QualityInputError (Pair CmValue CmState) error
+                    | Right checked => let (MkPair returned t2) := checked in
+                      cm_return (CmValueOf 9 node 0 False False False)
+                      (cm_barrier (cm_tag(214, cm_observe 4 node returned t2)))
+                    end
+                  end
+                | EVar _ => Left(QualityInputError, Pair CmValue CmState, QualityInvalidInput "invalid semantic telescope")
+                | EHole _ => Left(QualityInputError, Pair CmValue CmState, QualityInvalidInput "invalid semantic telescope")
+                | ESort _ => Left(QualityInputError, Pair CmValue CmState, QualityInvalidInput "invalid semantic telescope")
+                | ENat _ => Left(QualityInputError, Pair CmValue CmState, QualityInvalidInput "invalid semantic telescope")
+                | ERange _ _ _ => Left(QualityInputError, Pair CmValue CmState, QualityInvalidInput "invalid semantic telescope")
+                | EApp _ _ => Left(QualityInputError, Pair CmValue CmState, QualityInvalidInput "invalid semantic telescope")
+                | ELam _ _ _ => Left(QualityInputError, Pair CmValue CmState, QualityInvalidInput "invalid semantic telescope")
+                | EPi _ _ _ => Left(QualityInputError, Pair CmValue CmState, QualityInvalidInput "invalid semantic telescope")
+                | ELet _ _ _ _ => Left(QualityInputError, Pair CmValue CmState, QualityInvalidInput "invalid semantic telescope")
+                | EAscribe _ _ => Left(QualityInputError, Pair CmValue CmState, QualityInvalidInput "invalid semantic telescope")
+                | EMatch _ _ => Left(QualityInputError, Pair CmValue CmState, QualityInvalidInput "invalid semantic telescope")
+                | EIf _ _ _ => Left(QualityInputError, Pair CmValue CmState, QualityInvalidInput "invalid semantic telescope")
+                | EIfLet _ _ _ _ => Left(QualityInputError, Pair CmValue CmState, QualityInvalidInput "invalid semantic telescope")
+                | ECoalesce _ _ => Left(QualityInputError, Pair CmValue CmState, QualityInvalidInput "invalid semantic telescope")
+                | EFix _ _ _ _ => Left(QualityInputError, Pair CmValue CmState, QualityInvalidInput "invalid semantic telescope")
+                | EEffectRow _ _ => Left(QualityInputError, Pair CmValue CmState, QualityInvalidInput "invalid semantic telescope")
+                | EPerform _ _ => Left(QualityInputError, Pair CmValue CmState, QualityInvalidInput "invalid semantic telescope")
+                | EDo _ => Left(QualityInputError, Pair CmValue CmState, QualityInvalidInput "invalid semantic telescope")
+                | EHandle _ _ => Left(QualityInputError, Pair CmValue CmState, QualityInvalidInput "invalid semantic telescope")
+                | EBranch _ _ _ => Left(QualityInputError, Pair CmValue CmState, QualityInvalidInput "invalid semantic telescope")
+                | ENoBranch => Left(QualityInputError, Pair CmValue CmState, QualityInvalidInput "invalid semantic telescope")
+                | EMultiMatch _ _ => Left(QualityInputError, Pair CmValue CmState, QualityInvalidInput "invalid semantic telescope")
+                | EStr _ => Left(QualityInputError, Pair CmValue CmState, QualityInvalidInput "invalid semantic telescope")
+                | EDoBind _ _ => Left(QualityInputError, Pair CmValue CmState, QualityInvalidInput "invalid semantic telescope")
+                | EList _ => Left(QualityInputError, Pair CmValue CmState, QualityInvalidInput "invalid semantic telescope")
+                | EListSpread _ _ => Left(QualityInputError, Pair CmValue CmState, QualityInvalidInput "invalid semantic telescope")
+                | ESpan _ _ inner => telescope less inner scope next
+                | EFallible _ _ _ _ => Left(QualityInputError, Pair CmValue CmState, QualityInvalidInput "invalid semantic telescope")
+                | EOpen _ _ => Left(QualityInputError, Pair CmValue CmState, QualityInvalidInput "unresolved module open in semantic telescope")
+                | ENamedCall _ _ => Left(QualityInputError, Pair CmValue CmState, QualityInvalidInput "named call in semantic telescope")
+                end
+              end) remaining binders self_ctx s2
         | EEffectRow value effects =>
             let tagged : CmState := foldl Nat CmState (fun (next : CmState) (effect_id : Nat) => cm_tag effect_id next)
               (cm_tag(length Nat effects, cm_tag 113 s)) effects in
             types ctx value tagged
         | EPerform operation args => match cm_variable unit apis ctx operation (cm_tag 114 s) with
           | Left error => Left QualityInputError (Pair CmValue CmState) error
-          | Right head => match head with
-            | MkPair callee s2 => match cm_visit_args visit ctx args s2 [] with
-              | Left error => Left QualityInputError (Pair CmValue CmState) error
-              | Right step => match step with
-                | MkPair values s3 => cm_apply_call unit apis ctx node callee values (cm_barrier s3) end
-              end
+          | Right head => let (MkPair callee s2) := head in
+            match cm_visit_args visit ctx args s2 [] with
+            | Left error => Left QualityInputError (Pair CmValue CmState) error
+            | Right step => match step with
+              | MkPair values s3 => cm_apply_call unit apis ctx node callee values (cm_barrier s3) end
             end
           end
         | EDo statements =>
@@ -332,19 +289,17 @@ def cm_visit (unit : ClippySemanticUnit) (apis : CmApiIndex)
           | Nil => Left(QualityInputError, Pair CmValue CmState, QualityInvalidInput "empty semantic pattern")
           | Cons ctor names =>
               let entered : CmState := cm_barrier (cm_tag 117 s) in
-              let linked : CmState := match andb(notb type_only, cm_subject_checked ctx) with
-                | True => cm_event(CmFlowEvent (CmFlow node 21 (cm_branch ctx)), entered)
-                | False => entered end in
+              let linked : CmState := if andb(notb type_only, cm_subject_checked ctx) then
+                  cm_event(CmFlowEvent (CmFlow node 21 (cm_branch ctx)), entered)
+                else entered in
               match cm_pattern unit apis (cm_context_arm ctx node False) ctor names linked with
             | Left error => Left QualityInputError (Pair CmValue CmState) error
-            | Right scoped => match scoped with
-              | MkPair bound s2 => match visit bound terminal body s2 with
-                | Left error => Left QualityInputError (Pair CmValue CmState) error
-                | Right step => match step with
-                  | MkPair value s3 => visit ctx terminal rest (cm_barrier (match andb(terminal, notb type_only) with
-                      | True => cm_arm_outcome bound node value (cm_observe 4 node value s3) | False => s3 end))
-                  end
-                end
+            | Right scoped => let (MkPair bound s2) := scoped in
+              match visit bound terminal body s2 with
+              | Left error => Left QualityInputError (Pair CmValue CmState) error
+              | Right step => let (MkPair value s3) := step in
+                visit ctx terminal rest (cm_barrier (match andb(terminal, notb type_only) with
+                  | True => cm_arm_outcome bound node value (cm_observe 4 node value s3) | False => s3 end))
               end
             end
           end
@@ -353,56 +308,48 @@ def cm_visit (unit : ClippySemanticUnit) (apis : CmApiIndex)
         | ENoBinder => Left(QualityInputError, Pair CmValue CmState, QualityInvalidInput "telescope outside semantic fixpoint")
         | EMultiMatch scruts rows => match cm_visit_args visit ctx scruts (cm_tag(length Expr scruts, cm_tag 119 s)) [] with
           | Left error => Left QualityInputError (Pair CmValue CmState) error
-          | Right step => match step with
-            | MkPair values s2 =>
-                let flowed : CmState := foldl CmValue CmState (fun (next : CmState) (value : CmValue) =>
-                  cm_observe 3 node value next) s2 values in
-                cm_visit_rows unit apis visit (cm_context_subject(ctx, cm_unknown node)) (andb(terminal, notb type_only)) rows flowed
-            end
+          | Right step => let (MkPair values s2) := step in
+            let flowed : CmState := foldl CmValue CmState (fun (next : CmState) (value : CmValue) =>
+              cm_observe 3 node value next) s2 values in
+            cm_visit_rows unit apis visit (cm_context_subject(ctx, cm_unknown node)) (andb(terminal, notb type_only)) rows flowed
           end
         | EDoBind _ _ => Left(QualityInputError, Pair CmValue CmState, QualityInvalidInput "effect binder outside semantic do block")
         | EList elements => match cm_visit_args visit ctx elements (cm_tag(length Expr elements, cm_tag 120 s)) [] with
           | Left error => Left QualityInputError (Pair CmValue CmState) error
-          | Right step => match step with
-            | MkPair values s2 => cm_return (CmValueOf 5 node 0 False (any CmValue cm_value_taint values)
-                (andb(leb_nat(length CmValue values, 8), all CmValue cm_value_constant values)))
-                (foldl CmValue CmState (fun (next : CmState) (value : CmValue) => cm_observe 4 node value next) s2 values)
-            end
+          | Right step => let (MkPair values s2) := step in
+            cm_return (CmValueOf 5 node 0 False (any CmValue cm_value_taint values)
+              (andb(leb_nat(length CmValue values, 8), all CmValue cm_value_constant values)))
+              (foldl CmValue CmState (fun (next : CmState) (value : CmValue) => cm_observe 4 node value next) s2 values)
           end
         | EListSpread elements tail => match cm_visit_args visit ctx (append Expr elements [tail]) (cm_tag(S (length Expr elements), cm_tag 120 s)) [] with
           | Left error => Left QualityInputError (Pair CmValue CmState) error
-          | Right step => match step with
-            | MkPair values s2 => cm_return (CmValueOf 5 node 0 False (any CmValue cm_value_taint values)
-                (andb(leb_nat(length CmValue values, 8), all CmValue cm_value_constant values)))
-                (foldl CmValue CmState (fun (next : CmState) (value : CmValue) => cm_observe 4 node value next) s2 values)
-            end
+          | Right step => let (MkPair values s2) := step in
+            cm_return (CmValueOf 5 node 0 False (any CmValue cm_value_taint values)
+              (andb(leb_nat(length CmValue values, 8), all CmValue cm_value_constant values)))
+              (foldl CmValue CmState (fun (next : CmState) (value : CmValue) => cm_observe 4 node value next) s2 values)
           end
         | EFallible container _ _ body =>
             match types ctx container s with
             | Left error => Left QualityInputError (Pair CmValue CmState) error
-            | Right typed => match typed with
-              | MkPair _ after_type =>
-                  match visit ctx terminal (fallible_analysis_body remaining body)
-                      after_type with
-                  | Left error => Left QualityInputError (Pair CmValue CmState) error
-                  | Right walked => match walked with
-                    | MkPair _ after_body => cm_return(cm_unknown node, after_body)
-                    end
-                  end
+            | Right typed => let (MkPair _ after_type) := typed in
+              match visit ctx terminal (fallible_analysis_body remaining body)
+                  after_type with
+              | Left error => Left QualityInputError (Pair CmValue CmState) error
+              | Right walked => let (MkPair _ after_body) := walked in
+                cm_return(cm_unknown node, after_body)
               end
             end
         -- A span wrapper is not a node: keep the unwrapped tree's ordinals.
         -- Nested wrappers share one visit so fuel stays the unwrapped tree's.
         | ESpan first past inner =>
-            match span_peel remaining (Just(Pair Nat Nat, MkPair Nat Nat first past)) inner with
-            | MkPair span core => match walk remaining ctx type_only terminal core
-                (cm_with_span span state) with
-              | Left error => Left QualityInputError (Pair CmValue CmState) error
-              | Right stepped => match stepped with
-                | MkPair value next => Right QualityInputError (Pair CmValue CmState)
-                    (MkPair CmValue CmState value (cm_with_span(cm_span state, next)))
-                end
-              end
+            let (MkPair span core) :=
+              span_peel remaining (Just(Pair Nat Nat, MkPair Nat Nat first past)) inner in
+            match walk remaining ctx type_only terminal core
+              (cm_with_span span state) with
+            | Left error => Left QualityInputError (Pair CmValue CmState) error
+            | Right stepped => let (MkPair value next) := stepped in
+              Right QualityInputError (Pair CmValue CmState)
+                (MkPair CmValue CmState value (cm_with_span(cm_span state, next)))
             end
         | EOpen _ inner => walk remaining ctx type_only terminal inner state
         end

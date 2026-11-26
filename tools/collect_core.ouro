@@ -4,6 +4,7 @@ import "../std/io.ouro",
   "../std/string.ouro",
   "../std/pathx.ouro",
   "../std/data.ouro",
+  "../std/listx.ouro",
   "../compiler/lexer.ouro",
   "../compiler/preprocess_import.ouro";
 
@@ -182,13 +183,13 @@ def collect_next_candidate (src : String) : Nat :=
               (collect_next_index src "'"
                 (collect_next_index src "\"" (str_len src)))))));
 
-def collect_identifier_before (src : String) : Nat -> Bool :=
+def collect_before (stop : Nat -> Bool) (src : String) : Nat -> Bool :=
     fix before (position : Nat) : Bool :=
       match position with
       | Z => False
       | S previous =>
           let byte : Nat := str_head (str_slice src previous 1) in
-          match source_is_ident_start byte with
+          match stop byte with
           | True => True
           | False => match source_is_ident_char byte with
             | True => before previous
@@ -196,6 +197,9 @@ def collect_identifier_before (src : String) : Nat -> Bool :=
             end
           end
       end;
+
+def collect_identifier_before (src : String) : Nat -> Bool :=
+    collect_before source_is_ident_start src;
 
 def collect_word_candidate (src : String) (position : Nat) (word : String) : Bool :=
     match collect_identifier_before src position with
@@ -206,19 +210,7 @@ def collect_word_candidate (src : String) (position : Nat) (word : String) : Boo
     end;
 
 def collect_projection_before (src : String) : Nat -> Bool :=
-    fix before (position : Nat) : Bool :=
-      match position with
-      | Z => False
-      | S previous =>
-          let byte : Nat := str_head (str_slice src previous 1) in
-          match eqNat byte ch_dot_i with
-          | True => True
-          | False => match source_is_ident_char byte with
-            | True => before previous
-            | False => False
-            end
-          end
-      end;
+    collect_before (fun (byte : Nat) => eqNat byte ch_dot_i) src;
 
 def import_paths (original : String) : Col :=
     (fix scan (fuel : Nat) (src : String) (paths : List String) : Col :=
@@ -333,65 +325,152 @@ def add_unit (path : String) (seen : List String) : List String :=
   | False => append String seen (singleton String path)
   end;
 
+private def collect_dependencies (State : Type)
+  (walk : State -> String -> IO (Either String State))
+  (state : State) (path : String) (source : String) : IO (Either String State) :=
+  match import_paths source with
+  | ColErr error => io_pure (Either String State) (Left String State (str_cat3 error " in " path))
+  | ColOk imports =>
+      io_fold String (Either String State)
+        (fun (result : Either String State) (dependency : String) =>
+          match result with
+          | Left _ => io_pure (Either String State) result
+          | Right current => walk current (collect_path_resolve path dependency)
+          end)
+        (Right String State state) imports
+  end;
+
 def collect_after
   (walk : List String -> List String -> String -> IO Col)
   (seen : List String) (vis : List String) (path : String) (src : String)
   : IO Col :=
-  match import_paths src with
-  | ColErr error => io_pure(Col, ColErr (str_cat3 error " in " path))
-  | ColOk imports =>
-    do let! acc :=
-         io_fold String Col
-           (fun (st : Col) (i : String) =>
-             match st with
-             | ColErr e => io_pure(Col, ColErr e)
-             | ColOk seen2 => walk seen2 vis i
-             end)
-           (ColOk seen)
-           (map String String (collect_path_resolve path) imports);
-       match acc with
-       | ColErr e => io_pure(Col, ColErr e)
-       | ColOk seen2 => io_pure(Col, ColOk (add_unit path seen2))
-       end
-  end
+  match! collect_dependencies (List String)
+    (fun (current : List String) (dependency : String) =>
+      match! walk current vis dependency with
+      | ColErr error => io_pure (Either String (List String)) (Left String (List String) error)
+      | ColOk paths => io_pure (Either String (List String)) (Right String (List String) paths)
+      end) seen path src with
+  | Left error => io_pure (Col, ColErr error)
+  | Right paths => io_pure (Col, ColOk (add_unit path paths))
+  end;
 
-def collect_file
+inductive CollectReadError : Type :=
+  | CollectMissing : CollectReadError
+  | CollectReadFailure : FsError -> CollectReadError;
+
+def collect_read_checked (path : String) : IO (Either CollectReadError String) :=
+  do let! exists := fs_exists path;
+     match exists with
+     | False => io_pure(Either CollectReadError String, Left CollectReadError String CollectMissing)
+     | True => do let! loaded := fs_read_checked path;
+                  io_pure (Either CollectReadError String)
+                    (match loaded with
+                     | Left error => Left CollectReadError String (CollectReadFailure error)
+                     | Right source => Right CollectReadError String source end)
+     end;
+
+private def collect_read_source
+  (reader : String -> IO (Either CollectReadError String))
+  (path : String) : IO (Either String String) :=
+  match! reader path with
+  | Left error => io_pure (Either String String) (Left String String
+      (match error with
+       | CollectMissing => str_concat "collect_units: missing " path
+       | CollectReadFailure cause => str_cat3 "collect_units: could not read " path
+           (str_concat(": ", fs_error_message cause))
+       end))
+  | Right source => io_pure (Either String String) (Right String String source)
+  end;
+
+def collect_file_with_reader
+  (reader : String -> IO (Either CollectReadError String))
   (walk : List String -> List String -> String -> IO Col)
   (seen : List String) (vis : List String) (path : String) : IO Col :=
-  do let! ex := fs_exists path;
-     match ex with
-     | False =>
-         io_pure(Col, ColErr (str_concat "collect_units: missing " path))
-     | True =>
-         do let! loaded := fs_read_checked path;
-            match loaded with
-            | Left e =>
-                io_pure Col
-                  (ColErr (str_cat3 "collect_units: could not read " path
-                    (str_concat(": ", fs_error_message e))))
-            | Right src => collect_after walk seen vis path src
-            end
-     end
+  match! collect_read_source reader path with
+  | Left error => io_pure (Col, ColErr error)
+  | Right source => collect_after walk seen vis path source
+  end;
 
-def collect_walk : Nat -> List String -> List String -> String -> IO Col :=
-  fix collect_walk (fuel : Nat) (seen : List String) (vis : List String)
-      (path0 : String) : IO Col :=
+private def collect_visit (State : Type)
+  (reader : String -> IO (Either CollectReadError String))
+  (contains : State -> String -> Bool) (record_unit : State -> String -> String -> State)
+    : Nat -> State -> List String -> String -> IO (Either String State) :=
+  fix visit (fuel : Nat) (state : State) (visiting : List String)
+      (input : String) : IO (Either String State) :=
     match fuel with
-    | Z => io_pure(Col, ColErr "collect_units: too many units")
-    | S fuel' =>
-        let path : String := collect_path_normalize path0 in
-        match elem String str_eq path seen with
-        | True => io_pure(Col, ColOk seen)
+    | Z => io_pure (Either String State) (Left String State "collect_units: too many units")
+    | S remaining =>
+        let path : String := collect_path_normalize input in
+        match contains state path with
+        | True => io_pure (Either String State) (Right String State state)
         | False =>
-            match elem String str_eq path vis with
-            | True =>
-                io_pure Col
-                  (ColErr (str_concat "collect_units: import cycle at " path))
-            | False =>
-                collect_file
-                  (fun (next_seen : List String) (next_vis : List String) (next_path : String) =>
-                    collect_walk fuel' next_seen next_vis next_path) seen
-                  (Cons String path vis) path
+            match elem String str_eq path visiting with
+            | True => io_pure (Either String State)
+                (Left String State (str_concat "collect_units: import cycle at " path))
+            | False => match! collect_read_source reader path with
+              | Left error => io_pure (Either String State) (Left String State error)
+              | Right source => match! collect_dependencies State
+                  (fun (current : State) (dependency : String) =>
+                    visit remaining current (Cons String path visiting) dependency)
+                  state path source with
+                | Left error => io_pure (Either String State) (Left String State error)
+                | Right completed => io_pure (Either String State)
+                    (Right String State (record_unit completed path source))
+                end
+              end
             end
         end
     end;
+
+def collect_walk_with_reader (reader : String -> IO (Either CollectReadError String))
+  (fuel : Nat) (seen : List String) (visiting : List String) (path : String) : IO Col :=
+  match! collect_visit (List String) reader
+    (fun (paths : List String) (name : String) => elem String str_eq name paths)
+    (fun (paths : List String) (name : String) (_source : String) => add_unit name paths)
+    fuel seen visiting path with
+  | Left error => io_pure (Col, ColErr error)
+  | Right paths => io_pure (Col, ColOk paths)
+  end;
+
+private inductive CollectSnapshotData : Type :=
+  | MkCollectSnapshot : String -> List (Pair String String) -> CollectSnapshotData;
+
+def CollectSnapshot : Type := CollectSnapshotData;
+
+def collect_snapshot_root (snapshot : CollectSnapshot) : String :=
+  match snapshot with | MkCollectSnapshot root _ => root end;
+
+def collect_snapshot_files (snapshot : CollectSnapshot) : List (Pair String String) :=
+  match snapshot with | MkCollectSnapshot _ files => files end;
+
+def collect_snapshot_with_reader (reader : String -> IO (Either CollectReadError String))
+  (fuel : Nat) (input : String) : IO (Either String CollectSnapshot) :=
+  match! collect_visit (List (Pair String String)) reader
+    (fun (files : List (Pair String String)) (path : String) =>
+      any (Pair String String) (fun (file : Pair String String) =>
+        let (MkPair name _) := file in str_eq path name) files)
+    (fun (files : List (Pair String String)) (path : String) (source : String) =>
+      Cons (Pair String String) (MkPair String String path source) files)
+    fuel [] [] input with
+  | Left error => io_pure (Either String CollectSnapshot) (Left String CollectSnapshot error)
+  | Right files => match files with
+    | Nil => io_pure (Either String CollectSnapshot)
+        (Left String CollectSnapshot "empty source closure")
+    | Cons last _ =>
+        let (MkPair root _) := last in
+        io_pure (Either String CollectSnapshot)
+          (Right String CollectSnapshot (MkCollectSnapshot root (reverse_lin (Pair String String) files)))
+    end
+  end;
+
+def collect_capture_with_reader (reader : String -> IO (Either CollectReadError String))
+  (fuel : Nat) (root : String) : IO (Either String (List (Pair String String))) :=
+  match! collect_snapshot_with_reader reader fuel root with
+  | Left error => io_pure (Either String (List (Pair String String)))
+      (Left String (List (Pair String String)) error)
+  | Right snapshot => io_pure (Either String (List (Pair String String)))
+      (Right String (List (Pair String String)) (collect_snapshot_files snapshot))
+  end;
+
+def collect_walk : Nat -> List String -> List String -> String -> IO Col :=
+  collect_walk_with_reader collect_read_checked;

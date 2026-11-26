@@ -75,13 +75,10 @@ def opts_from_args (a : Args) : AOpts :=
   foldl String AOpts add_flag o0 (args_flags a);
 
 def analyze_path_from_host (p : String) : String :=
-  str_replace p "\\" "/";
+  quality_normalize_path p;
 
 def keep_path (o : AOpts) (p : String) : Bool :=
-  match (o_fix o) with
-  | True => True
-  | False => notb (is_fixture (analyze_path_from_host p))
-  end;
+  if (o_fix o) then True else notb (is_fixture (analyze_path_from_host p));
 
 def analyze_input_fail (e : QualityInputError) : IO Unit :=
   do eprintln (str_concat("ANALYZE_FAIL: ", quality_input_message e));
@@ -92,38 +89,33 @@ def analyze_read_fail (path : String) (e : FsError) : IO Unit :=
      exit 1
 
 def load_acc (path : String) : IO (Either QualityInputError FileAcc) :=
-  do let! src := quality_read_file path;
-     match src with
-     | Left e => io_pure (Either QualityInputError FileAcc)
-         (Left QualityInputError FileAcc e)
-     | Right text =>
-         match extract_file path text with
-         | Right acc => io_pure (Either QualityInputError FileAcc)
-             (Right QualityInputError FileAcc acc)
-         | Left error =>
-             match error with
-             | ExtractHeaderError line =>
-                 io_pure (Either QualityInputError FileAcc)
-                   (Left QualityInputError FileAcc
-                     (QualityInvalidInput
-                       (str_cat4 path ":" (str_of_nat line)
-                         ": malformed or unterminated API signature")))
-             | ExtractImportError import_error =>
-               match import_error with
-               | ImportScanFailure byte =>
-                 match import_scan_place text byte with
-                 | MkPair line col =>
-                     io_pure (Either QualityInputError FileAcc)
-                       (Left QualityInputError FileAcc
-                         (QualityInvalidInput
-                           (str_cat4 path ":" (str_of_nat line)
-                             (str_cat3 ":" (str_of_nat col)
-                               ": malformed import declaration"))))
-                 end
-               end
-             end
-         end
-     end
+  match! quality_read_file path with
+  | Left e => io_pure (Either QualityInputError FileAcc)
+      (Left QualityInputError FileAcc e)
+  | Right text =>
+      match extract_file path text with
+      | Right acc => io_pure (Either QualityInputError FileAcc)
+          (Right QualityInputError FileAcc acc)
+      | Left error =>
+          match error with
+          | ExtractHeaderError line =>
+              io_pure (Either QualityInputError FileAcc)
+                (Left QualityInputError FileAcc
+                  (QualityInvalidInput
+                    (str_cat4 path ":" (str_of_nat line)
+                      ": malformed or unterminated API signature")))
+          | ExtractImportError import_error =>
+            let (ImportScanFailure byte) := import_error in
+            let (MkPair line col) := import_scan_place text byte in
+            io_pure (Either QualityInputError FileAcc)
+              (Left QualityInputError FileAcc
+                (QualityInvalidInput
+                  (str_cat4 path ":" (str_of_nat line)
+                    (str_cat3 ":" (str_of_nat col)
+                      ": malformed import declaration"))))
+          end
+      end
+  end
 
 def stamp_acc (i : Nat) (acc : FileAcc) : FileAcc :=
   MkFileAcc (FileAcc_file acc)
@@ -156,24 +148,18 @@ def owner_of_file (file : Nat) (decls : List ADecl) : String :=
     match ds with
     | Nil => "_"
     | Cons d rest =>
-        match andb(eq_nat(ADecl_file d, file), eq_nat(ADecl_kind d, kind_def)) with
-        | True =>
-            match (ADecl_is_entry d) with
-            | True => (ADecl_name d)
-            | False =>
-                let nxt : String := go rest in
-                match str_eq nxt "_" with
-                | True => (ADecl_name d)
-                | False => nxt
-                end
-            end
-        | False => go rest
-        end
+        if andb(eq_nat(ADecl_file d, file), eq_nat(ADecl_kind d, kind_def)) then
+          if (ADecl_is_entry d) then (ADecl_name d)
+          else
+            let nxt : String := go rest in
+            if str_eq nxt "_" then (ADecl_name d) else nxt
+        else go rest
     end) decls;
 
 def enrich (accs : List FileAcc) (decls0 : List ADecl)
     : Pair (List ADecl) (List ARef) :=
   let n0 : Nat := length ADecl decls0 in
+  let references : AnalyzeReferences := analyze_prepare_references decls0 in
   (fix go (as_ : List FileAcc) (i : Nat)
       (ds : List ADecl) (rs : List ARef)
       : Pair (List ADecl) (List ARef) :=
@@ -187,7 +173,7 @@ def enrich (accs : List FileAcc) (decls0 : List ADecl)
           shadowed_in lines in
         let br : List ADecl :=
           branch_decls i (owner_of_file i decls0) lines sh in
-        let rs1 : List ARef := refs_for_file i lines decls0 in
+        let rs1 : List ARef := refs_for_file_indexed i lines references in
         let mid : Nat :=
           add(n0, length ADecl ds) in
         let rs2 : List ARef :=
@@ -195,12 +181,10 @@ def enrich (accs : List FileAcc) (decls0 : List ADecl)
             match xs with
             | Nil => a
             | Cons d decl_rest =>
-                match eq_nat(ADecl_file d, i) with
-                | True =>
-                    ln decl_rest (S j)
-                      (Cons ARef (MkARef j mid) a)
-                | False => ln decl_rest (S j) a
-                end
+                if eq_nat(ADecl_file d, i) then
+                  ln decl_rest (S j)
+                    (Cons ARef (MkARef j mid) a)
+                else ln decl_rest (S j) a
             end) decls0 Z rs1 in
         go rest (S i)
           (append ADecl ds (Cons ADecl md br))
@@ -209,27 +193,18 @@ def enrich (accs : List FileAcc) (decls0 : List ADecl)
 
 def extra_facts (o : AOpts) (accs : List FileAcc) (decls0 : List ADecl)
     : Pair (List ADecl) (List ARef) :=
-  match orb(o_dead o, o_dump o) with
-  | True => enrich accs decls0
-  | False =>
-      MkPair(List ADecl, List ARef, Nil ADecl, Nil ARef)
-  end;
+  if orb(o_dead o, o_dump o) then enrich accs decls0
+  else MkPair(List ADecl, List ARef, Nil ADecl, Nil ARef);
 
 def diag_lt (files : List AFile) (a : ADiag) (b : ADiag) : Bool :=
   let pa : String := AFile_path (file_at(ADiag_file a, files)) in
   let pb : String := AFile_path (file_at(ADiag_file b, files)) in
-  match str_eq pa pb with
-  | False => str_lt pa pb
-  | True =>
-      match eq_nat(ADiag_line a, ADiag_line b) with
-      | False => ltb_nat(ADiag_line a, ADiag_line b)
-      | True =>
-          match eq_nat(ADiag_col a, ADiag_col b) with
-          | False => ltb_nat(ADiag_col a, ADiag_col b)
-          | True => str_lt(ADiag_code a, ADiag_code b)
-          end
-      end
-  end;
+  if str_eq pa pb then
+    if eq_nat(ADiag_line a, ADiag_line b) then
+      if eq_nat(ADiag_col a, ADiag_col b) then str_lt(ADiag_code a, ADiag_code b)
+      else ltb_nat(ADiag_col a, ADiag_col b)
+    else ltb_nat(ADiag_line a, ADiag_line b)
+  else str_lt pa pb;
 
 def sort_diags (files : List AFile) : List ADiag -> List ADiag :=
   fix sort_diags (xs : List ADiag) : List ADiag :=
@@ -240,10 +215,7 @@ def sort_diags (files : List AFile) : List ADiag -> List ADiag :=
           match ys with
           | Nil => ([x] : List ADiag)
           | Cons y yr =>
-              match diag_lt files x y with
-              | True => Cons ADiag x ys
-              | False => Cons ADiag y (ins yr)
-              end
+              if diag_lt files x y then Cons ADiag x ys else Cons ADiag y (ins yr)
           end) (sort_diags rest)
     end;
 
@@ -262,10 +234,7 @@ def kind_label_rows : List (Pair Nat String) :=
   ];
 
 def kind_label (k : Nat) (fallback : String) : String :=
-  match lookup Nat String eq_nat k kind_label_rows with
-  | Nothing => fallback
-  | Just label => label
-  end;
+  lookup Nat String eq_nat k kind_label_rows ?? fallback;
 
 def kind_name (k : Nat) : String :=
   kind_label k "def";
@@ -287,19 +256,14 @@ def dump_decl_rows (files : List AFile) (d : ADecl) : List String :=
           (str_cat4 (ADecl_name d) " kind=" (kind_name (ADecl_kind d))
             (str_cat4 " export=" (str_of_nat ex) " entry="
               (str_cat4 (str_of_nat en) " ns=" (ADecl_ns d)
-                (match str_null (ADecl_owner d) with
-                 | True => ""
-                 | False => str_concat(" owner=", ADecl_owner d)
-                 end)))))) in
-  match andb(ADecl_is_export d, eq_nat(ADecl_kind d, kind_def)) with
-  | False => singleton String row
-  | True =>
-      Cons String row
-        (singleton String
-          (str_cat4 "FACT export " p ":"
-            (str_cat4 (str_of_nat (ADecl_line d)) ":" (str_of_nat (ADecl_col d))
-              (str_cat4(" name=", ADecl_name d, " ns=", ADecl_ns d)))))
-  end;
+                (if str_null (ADecl_owner d) then "" else str_concat(" owner=", ADecl_owner d))))))) in
+  if andb(ADecl_is_export d, eq_nat(ADecl_kind d, kind_def)) then
+    Cons String row
+      (singleton String
+        (str_cat4 "FACT export " p ":"
+          (str_cat4 (str_of_nat (ADecl_line d)) ":" (str_of_nat (ADecl_col d))
+            (str_cat4(" name=", ADecl_name d, " ns=", ADecl_ns d)))))
+  else singleton String row;
 
 def dump_ref_rows (files : List AFile) (decls : List ADecl) (r : ARef)
     : List String :=
@@ -386,10 +350,7 @@ def emit_ok (o : AOpts) (files : List AFile) (edges : List AEdge)
 def emit_diags (files : List AFile) : List ADiag -> IO Unit :=
   io_foreach ADiag
     (fun (d : ADiag) =>
-      match ADiag_hidden d with
-      | True => io_unit
-      | False => println (show_diag files d)
-      end);
+      if ADiag_hidden d then io_unit else println (show_diag files d));
 
 def count_shown (xs : List ADiag) : Nat :=
   count_if ADiag
@@ -449,58 +410,40 @@ def add_api (o : AOpts) (files : List AFile) (decls : List ADecl)
 
 def add_dead (o : AOpts) (files : List AFile) (decls : List ADecl)
     (refs : List ARef) (d : List ADiag) : List ADiag :=
-  match (o_dead o) with
-  | False => d
-  | True => append ADiag d (dead_diags files decls refs)
-  end;
+  if (o_dead o) then append ADiag d (dead_diags files decls refs) else d;
 
 def add_fmt (o : AOpts) (accs : List FileAcc) (d : List ADiag)
     : List ADiag :=
-  match orb(o_strict o, on_fmt o) with
-  | False => d
-  | True =>
-      scan_acc_diags accs
-        (fun (i : Nat) (acc : FileAcc) =>
-          match (o_strict o) with
-          | True =>
-              fmt_scan "error" "CRLF" "trailing whitespace" "tab"
-                (on_fmt o) i (FileAcc_lines acc)
-          | False => fmt_enable_scan(i, FileAcc_lines acc)
-          end) d
-  end;
+  if orb(o_strict o, on_fmt o) then
+    scan_acc_diags accs
+      (fun (i : Nat) (acc : FileAcc) =>
+        if (o_strict o) then
+          fmt_scan "error" "CRLF" "trailing whitespace" "tab"
+            (on_fmt o) i (FileAcc_lines acc)
+        else fmt_enable_scan(i, FileAcc_lines acc)) d
+  else d;
 
 def add_trust (o : AOpts) (files : List AFile) (edges : List AEdge)
     (d : List ADiag) : List ADiag :=
-  match on_trust o with
-  | False => d
-  | True => append ADiag d (trust_diags files edges)
-  end;
+  if on_trust o then append ADiag d (trust_diags files edges) else d;
 
 def collect_diags (o : AOpts) (files : List AFile) (edges : List AEdge)
     (decls : List ADecl) (refs : List ARef) (accs : List FileAcc)
     (base : List ABase) : List ADiag :=
-  match o_arch o with
-  | True => arch_diags files edges
-  | False =>
-      let arch : List ADiag :=
-        match o_local o with
-        | True => Nil ADiag
-        | False => arch_diags files edges
-        end in
-      add_trust o files edges
-        (add_fmt o accs
-          (add_dead o files decls refs
-            (add_api o files decls base arch)))
-  end;
+  if o_arch o then arch_diags files edges
+  else
+    let arch : List ADiag :=
+      if o_local o then Nil ADiag else arch_diags files edges in
+    add_trust o files edges
+      (add_fmt o accs
+        (add_dead o files decls refs
+          (add_api o files decls base arch)));
 
 def exit_err : IO Unit := exit (S Z);
 
 def maybe_dump (o : AOpts) (files : List AFile) (decls : List ADecl)
     (refs : List ARef) : IO Unit :=
-  match (o_dump o) with
-  | False => io_unit
-  | True => io_foreach String println (dump_facts files decls refs)
-  end;
+  if (o_dump o) then io_foreach String println (dump_facts files decls refs) else io_unit;
 
 def emit_ok_exit (o : AOpts) (files : List AFile) (edges : List AEdge)
     (decls : List ADecl) (refs : List ARef) (supps : List ASupp)
@@ -525,12 +468,10 @@ def emit_result (o : AOpts) (files : List AFile) (edges : List AEdge)
 def finish_pair (o : AOpts) (files : List AFile) (edges : List AEdge)
     (decls : List ADecl) (refs : List ARef) (okbase : Bool)
     (pair : Pair (List ASupp) (List ADiag)) : IO Unit :=
-  match pair with
-  | MkPair supps diags0 =>
-      emit_result o files edges decls refs supps
-        (sort_diags(files, append ADiag diags0 (supp_diags files supps)))
-        okbase
-  end;
+  let (MkPair supps diags0) := pair in
+  emit_result o files edges decls refs supps
+    (sort_diags(files, append ADiag diags0 (supp_diags files supps)))
+    okbase;
 
 def emit_db (o : AOpts) (files : List AFile) (edges : List AEdge)
     (decls : List ADecl) (refs : List ARef) (accs : List FileAcc)
@@ -542,10 +483,8 @@ def emit_db (o : AOpts) (files : List AFile) (edges : List AEdge)
 def take_extra (o : AOpts) (files : List AFile) (edges : List AEdge)
     (decls0 : List ADecl) (accs : List FileAcc) (base : List ABase)
     (extra : Pair (List ADecl) (List ARef)) : IO Unit :=
-  match extra with
-  | MkPair more refs0 =>
-      emit_db o files edges (append ADecl decls0 more) refs0 accs base
-  end;
+  let (MkPair more refs0) := extra in
+  emit_db o files edges (append ADecl decls0 more) refs0 accs base;
 
 def run_db (o : AOpts) (_paths : List String) (accs0 : List FileAcc)
     (base : List ABase) : IO Unit :=
@@ -577,50 +516,40 @@ def load_accs (paths : List String) (acc : List FileAcc)
           (Right QualityInputError (List FileAcc)
             (append FileAcc acc (reverse FileAcc rev)))
     | Cons path rest =>
-      do let! next := load_acc path;
-         match next with
-         | Left e => io_pure (Either(QualityInputError, List FileAcc))
-             (Left QualityInputError (List FileAcc) e)
-         | Right file_acc => go(rest, Cons FileAcc file_acc rev)
-         end
+      match! load_acc path with
+      | Left e => io_pure (Either(QualityInputError, List FileAcc))
+          (Left QualityInputError (List FileAcc) e)
+      | Right file_acc => go(rest, Cons FileAcc file_acc rev)
+      end
     end) paths (Nil FileAcc);
 
 def load_analysis_base (o : AOpts) (accs : List FileAcc)
     : IO (List ABase) :=
-  match accs_need_base accs with
-  | False => io_pure(List ABase, Nil ABase)
-  | True =>
-    match str_null (o_base o) with
-    | True => io_pure(List ABase, Nil ABase)
-    | False =>
+  (if accs_need_base accs then
+    if str_null (o_base o) then io_pure(List ABase, Nil ABase)
+    else
       do let! ex := fs_exists (o_base o);
-         match ex with
-         | False => io_pure(List ABase, Nil ABase)
-         | True =>
-           do let! loaded := fs_read_checked (o_base o);
-              match loaded with
-              | Left e =>
-                do analyze_read_fail(o_base o, e);
-                   io_pure(List ABase, Nil ABase)
-              | Right text => io_pure(List ABase, load_baseline_text text)
-              end
-         end
-    end
-  end;
+         if ex then
+           match! fs_read_checked (o_base o) with
+           | Left e =>
+             do analyze_read_fail(o_base o, e);
+                io_pure(List ABase, Nil ABase)
+           | Right text => io_pure(List ABase, load_baseline_text text)
+           end
+         else io_pure(List ABase, Nil ABase)
+  else io_pure(List ABase, Nil ABase));
 
 def run_scopes (o : AOpts) (scopes : List String) : IO Unit :=
-  do let! selected := gather_paths o scopes;
-     match selected with
-     | Left e => analyze_input_fail e
-     | Right paths =>
-         do let! loaded := load_accs(paths, Nil FileAcc);
-            match loaded with
-            | Left e => analyze_input_fail e
-            | Right accs =>
-                do let! base := load_analysis_base o accs;
-                   run_db o paths accs base
-            end
-     end
+  match! gather_paths o scopes with
+  | Left e => analyze_input_fail e
+  | Right paths =>
+      match! load_accs(paths, Nil FileAcc) with
+      | Left e => analyze_input_fail e
+      | Right accs =>
+          do let! base := load_analysis_base o accs;
+             run_db o paths accs base
+      end
+  end
 
 -- Args validates the command line and owns flags/single-value options. Its
 -- option map retains only one value, so collect every validated scope here.
@@ -629,30 +558,24 @@ def analyze_scope_values : List String -> List String :=
     match words with
     | Nil => Nil String
     | Cons word rest =>
-        match str_eq word "--" with
-        | True => Nil String
-        | False =>
-            match str_eq word "--scope" with
-            | True =>
-                match rest with
-                | Nil => Nil String
-                | Cons scope more => Cons String scope (go more)
-                end
-            | False =>
-                match str_strip_prefix word "--scope=" with
-                | Just scope => Cons String scope (go rest)
-                | Nothing =>
-                    match str_eq word "--api-baseline" with
-                    | True =>
-                        match rest with
-                        | Nil => Nil String
-                        | Cons _ more => go more
-                        end
-                    | False => go rest
-                    end
-                end
+        if str_eq word "--" then Nil String
+        else
+          if str_eq word "--scope" then
+            match rest with
+            | Nil => Nil String
+            | Cons scope more => Cons String scope (go more)
             end
-        end
+          else
+            match str_strip_prefix word "--scope=" with
+            | Just scope => Cons String scope (go rest)
+            | Nothing =>
+                if str_eq word "--api-baseline" then
+                  match rest with
+                  | Nil => Nil String
+                  | Cons _ more => go more
+                  end
+                else go rest
+            end
     end;
 
 def scopes_of (a : Args) (argv : List String) : List String :=
@@ -662,19 +585,14 @@ def scopes_of (a : Args) (argv : List String) : List String :=
   end;
 
 def finalize_opts (o : AOpts) : AOpts :=
-  match andb(o_fix o, notb (o_bexp o)) with
-  | False => o
-  | True => o_clear_base o
-  end;
+  if andb(o_fix o, notb (o_bexp o)) then o_clear_base o else o;
 
 def start (argv : List String) : IO Unit :=
   let a : Args := args_of_argv_bools analyze_bools argv in
-  match analyze_args_valid argv a with
-  | True => run_scopes(finalize_opts (opts_from_args a), scopes_of a argv)
-  | False =>
-      do eprintln "ANALYZE_FAIL: unknown option or missing option value";
-         exit 2
-  end;
+  (if analyze_args_valid argv a then run_scopes(finalize_opts (opts_from_args a), scopes_of a argv)
+  else
+    do eprintln "ANALYZE_FAIL: unknown option or missing option value";
+       exit 2);
 
 def main : IO Unit :=
   do let! argv := prim_argv;

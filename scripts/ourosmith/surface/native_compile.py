@@ -8,6 +8,7 @@ from pathlib import Path
 import subprocess
 import sys
 import uuid
+from contextlib import nullcontext
 
 ROOT = Path(__file__).resolve().parents[3]
 
@@ -19,8 +20,8 @@ def build_native(args: argparse.Namespace) -> dict:
     cfg = build.load_config(argparse.Namespace(
         cc=args.cc, profile="dev", opt_level="O1", reproducible=False,
         cache_enabled=args.cache, ccache="disabled", verbosity="quiet", jobs=1))
-    cc = build.choose_cc(cfg)
-    identity = json.loads(build.compiler_id(cc))
+    cc, location = build.locate_cc(cfg)
+    identity = json.loads(build.compiler_id(cc, location=location or str(Path(cc).resolve())))
     compiler_path = Path(identity["path"]).resolve()
     identity["executable_sha256"] = sha256_file(compiler_path)
     sources = [ROOT / "runtime/ouro_rt.c", ROOT / "runtime/ouro_io.c", args.main.resolve()]
@@ -30,16 +31,20 @@ def build_native(args: argparse.Namespace) -> dict:
         raise ValueError("surface C compiler changed during preparation")
     cc_id = json.dumps(identity, sort_keys=True)
     object_dir = args.object_dir if args.cache else args.object_dir / uuid.uuid4().hex
+    profile_flags = build.profile_cflags(cfg)
+    runtime_flags = (*build.object_profile_cflags(profile_flags, identity["version"]),
+                     "-Werror=implicit-function-declaration", f"-I{ROOT / 'runtime'}")
     objects = []
     reports = []
-    for source in sources:
-        obj, report = build.compile_c_object(
-            cfg, cc, cc_id, "smith-surface-runtime", source, build.path_key(source),
-            [ROOT / "runtime"], ["-Werror=implicit-function-declaration"], object_dir)
-        objects.append(obj)
-        reports.append(report)
+    # Publish each runtime object, depfile and receipt under one cache lock.
+    with build.cache_access(object_dir, exclusive=True) if args.cache else nullcontext():
+        for source in sources:
+            obj, report = build.compile_c_object(
+                cfg, cc, cc_id, "smith-surface-runtime", source, build.path_key(source), runtime_flags, object_dir)
+            objects.append(obj)
+            reports.append(report)
     stack = ["-Wl,--stack,134217728"] if os.name == "nt" else []
-    command = [*build.cc_invocation(cc), *build.profile_cflags(cfg),
+    command = [*build.cc_invocation(cc), *profile_flags,
                "-Werror=implicit-function-declaration", *stack,
                "-I", str(ROOT / "runtime"), "-o", str(args.output),
                str(args.generated), *map(str, objects)]

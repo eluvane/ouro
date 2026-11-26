@@ -289,18 +289,19 @@ done:
 
 static ouro_v *fs_replace_run(ouro_env *env, ouro_v *unit)
 {
-	char *source = NULL, *stage = NULL, *backup = NULL;
+	char *owned_source = NULL, *owned_stage = NULL, *owned_backup = NULL;
+	const char *source, *stage = NULL, *backup = NULL;
 	unsigned long status;
 #ifdef _WIN32
 	wchar_t *wide_source = NULL, *wide_stage = NULL, *wide_backup = NULL;
 #endif
 	(void)unit;
 	sandbox_die("fs_replace_file");
-	source = rename_path_text(env->next->next->v);
+	source = checked_path_text(env->next->next->v, &owned_source);
 	if (source != NULL)
-		stage = rename_path_text(env->next->v);
+		stage = checked_path_text(env->next->v, &owned_stage);
 	if (stage != NULL)
-		backup = rename_path_text(env->v);
+		backup = checked_path_text(env->v, &owned_backup);
 	if (source == NULL || stage == NULL || backup == NULL) {
 #ifdef _WIN32
 		status = errno == ENOMEM ? ERROR_NOT_ENOUGH_MEMORY : ERROR_INVALID_PARAMETER;
@@ -325,9 +326,9 @@ static ouro_v *fs_replace_run(ouro_env *env, ouro_v *unit)
 	free(wide_stage);
 	free(wide_source);
 #endif
-	free(backup);
-	free(stage);
-	free(source);
+	free(owned_backup);
+	free(owned_stage);
+	free(owned_source);
 	return ouro_nat(status);
 }
 

@@ -1,5 +1,5 @@
--- Real acceptance CLI that composes practical stdlib layers into
--- file/data/config/process tools.
+-- Exercises standard library APIs through file, data, configuration, and
+-- process commands.
 
 -- @entry main
 
@@ -30,9 +30,12 @@ def app_exit_success : Nat := Z;
 
 def app_exit_failure : Nat := S Z;
 
+private def app_print_text_exit (code : Nat) (text : String) : IO Unit :=
+    do process_out_line text;
+       process_exit code
+
 def app_print_usage : IO Unit :=
-    do process_out_line app_usage;
-       process_exit app_exit_success
+    app_print_text_exit app_exit_success app_usage;
 
 def app_fail (msg : String) : IO Unit :=
     do process_err_line (str_concat "error: " msg);
@@ -44,15 +47,19 @@ def app_fail_usage (msg : String) : IO Unit :=
        process_exit app_exit_failure
 
 def app_print_json_exit (code : Nat) (j : Json) : IO Unit :=
-    do process_out_line (app_report_text j);
-       process_exit code
+    app_print_text_exit code (app_report_text j);
+
+private def app_print_text_result (result : Either AppSurfaceError String) : IO Unit :=
+    match result with
+    | Left e => app_fail (app_surface_error_message e)
+    | Right text => app_print_text_exit app_exit_success text
+    end;
 
 def app_read_text (path : String) (k : String -> IO Unit) : IO Unit :=
-    do let! read := fsx_read_text path;
-       match read with
-       | Left e => app_fail (fs_error_message e)
-       | Right text => k text
-       end
+    match! fsx_read_text path with
+    | Left e => app_fail (fs_error_message e)
+    | Right text => k text
+    end
 
 def app_need_pos (a : Args) (index : Nat) (name : String)
     (k : String -> IO Unit) : IO Unit :=
@@ -64,21 +71,16 @@ def app_need_pos (a : Args) (index : Nat) (name : String)
 def app_json_validate_file (path : String) : IO Unit :=
     app_read_text path
       (fun (text : String) =>
-        let report : Json := app_json_validate_report text in
-        match parse_json text with
-        | Nothing => app_print_json_exit app_exit_failure report
-        | Just _ => app_print_json_exit app_exit_success report
-        end);
+        let parsed : Maybe Json := parse_json text in
+        let code : Nat := match parsed with
+          | Nothing => app_exit_failure
+          | Just _ => app_exit_success
+          end in
+        app_print_json_exit code (app_json_validation_report parsed));
 
 def app_json_minify_file (path : String) : IO Unit :=
     app_read_text path
-      (fun (text : String) =>
-        match app_json_minify text with
-        | Left e => app_fail (app_surface_error_message e)
-        | Right out =>
-            do process_out_line out;
-               process_exit app_exit_success
-        end);
+      (fun (text : String) => app_print_text_result (app_json_minify text));
 
 def app_csv_report_file (path : String) : IO Unit :=
     app_read_text path
@@ -89,28 +91,17 @@ def app_csv_report_file (path : String) : IO Unit :=
 def app_csv_select_file (path : String) (column : String) : IO Unit :=
     app_read_text path
       (fun (text : String) =>
-        match app_csv_select_column(csv_parse text, column) with
-        | Left e => app_fail (app_surface_error_message e)
-        | Right out =>
-            do process_out_line out;
-               process_exit app_exit_success
-        end);
+        app_print_text_result (app_csv_select_column(csv_parse text, column)));
 
 def app_csv_tsv_file (path : String) (columns : String) : IO Unit :=
     app_read_text path
       (fun (text : String) =>
-        match app_tsv_from_csv_columns(csv_parse text, str_split_str columns ",") with
-        | Left e => app_fail (app_surface_error_message e)
-        | Right out =>
-            do process_out_line out;
-               process_exit app_exit_success
-        end);
+        app_print_text_result (app_tsv_from_csv_columns(csv_parse text, str_split_str columns ",")));
 
 def app_config_normalize_file (path : String) : IO Unit :=
     app_read_text path
       (fun (text : String) =>
-        do process_out_line (app_config_normalize text);
-           process_exit app_exit_success);
+        app_print_text_exit app_exit_success (app_config_normalize text));
 
 def app_config_report_file (path : String) : IO Unit :=
     app_read_text path
@@ -120,16 +111,9 @@ def app_config_report_file (path : String) : IO Unit :=
 
 def app_fs_scan (root : String) : IO Unit :=
     do let! walked := fs_walk_checked root;
-       match walked with
-       | FsWalkComplete _ =>
-           app_print_json_exit(app_exit_success, app_fs_walk_report_json root walked)
-       | FsWalkTruncated _ =>
-           app_print_json_exit(app_exit_failure, app_fs_walk_report_json root walked)
-       | FsWalkUnreadable _ =>
-           app_print_json_exit(app_exit_failure, app_fs_walk_report_json root walked)
-       | FsWalkUnsafe _ =>
-           app_print_json_exit(app_exit_failure, app_fs_walk_report_json root walked)
-       end
+       if let FsWalkComplete _ := walked then
+         app_print_json_exit(app_exit_success, app_fs_walk_report_json root walked)
+       else app_print_json_exit(app_exit_failure, app_fs_walk_report_json root walked)
 
 def app_run_echo (word : String) : IO Unit :=
     let cmd : CommandSpec := command_spec("echo", [word] : List String) in
@@ -137,108 +121,76 @@ def app_run_echo (word : String) : IO Unit :=
        app_print_json_exit(proc_code result, app_proc_result_report cmd result)
 
 def app_dispatch_json_sub (a : Args) (sub : String) : IO Unit :=
-    match str_eq sub "validate" with
-    | True =>
+    if str_eq sub "validate" then
+      app_need_pos a 2 "path"
+        app_json_validate_file
+    else
+      if str_eq sub "minify" then
         app_need_pos a 2 "path"
-          app_json_validate_file
-    | False =>
-      match str_eq sub "minify" with
-      | True =>
-          app_need_pos a 2 "path"
-            app_json_minify_file
-      | False => app_fail_usage (str_concat "unknown json command: " sub)
-      end
-    end;
+          app_json_minify_file
+      else app_fail_usage (str_concat "unknown json command: " sub);
 
 def app_dispatch_csv_sub (a : Args) (sub : String) : IO Unit :=
-    match str_eq sub "report" with
-    | True =>
+    if str_eq sub "report" then
+      app_need_pos a 2 "path"
+        app_csv_report_file
+    else
+      if str_eq sub "select" then
         app_need_pos a 2 "path"
-          app_csv_report_file
-    | False =>
-      match str_eq sub "select" with
-      | True =>
+          (fun (path : String) =>
+            app_need_pos a 3 "column"
+              (app_csv_select_file path))
+      else
+        if str_eq sub "tsv" then
           app_need_pos a 2 "path"
             (fun (path : String) =>
-              app_need_pos a 3 "column"
-                (app_csv_select_file path))
-      | False =>
-        match str_eq sub "tsv" with
-        | True =>
-            app_need_pos a 2 "path"
-              (fun (path : String) =>
-                app_need_pos a 3 "columns"
-                  (app_csv_tsv_file path))
-        | False => app_fail_usage (str_concat "unknown csv command: " sub)
-        end
-      end
-    end;
+              app_need_pos a 3 "columns"
+                (app_csv_tsv_file path))
+        else app_fail_usage (str_concat "unknown csv command: " sub);
 
 def app_dispatch_config_sub (a : Args) (sub : String) : IO Unit :=
-    match str_eq sub "normalize" with
-    | True =>
+    if str_eq sub "normalize" then
+      app_need_pos a 2 "path"
+        app_config_normalize_file
+    else
+      if str_eq sub "report" then
         app_need_pos a 2 "path"
-          app_config_normalize_file
-    | False =>
-      match str_eq sub "report" with
-      | True =>
-          app_need_pos a 2 "path"
-            app_config_report_file
-      | False => app_fail_usage (str_concat "unknown config command: " sub)
-      end
-    end;
+          app_config_report_file
+      else app_fail_usage (str_concat "unknown config command: " sub);
 
 def app_dispatch_fs_sub (a : Args) (sub : String) : IO Unit :=
-    match str_eq sub "scan" with
-    | True =>
-        app_need_pos a 2 "path" app_fs_scan
-    | False => app_fail_usage (str_concat "unknown fs command: " sub)
-    end;
+    if str_eq sub "scan" then app_need_pos a 2 "path" app_fs_scan
+    else app_fail_usage (str_concat "unknown fs command: " sub);
 
 def app_dispatch_run_sub (a : Args) (sub : String) : IO Unit :=
-    match str_eq sub "echo" with
-    | True =>
-        app_need_pos a 2 "word" app_run_echo
-    | False => app_fail_usage (str_concat "unknown run command: " sub)
-    end;
+    if str_eq sub "echo" then app_need_pos a 2 "word" app_run_echo
+    else app_fail_usage (str_concat "unknown run command: " sub);
 
 def app_dispatch (a : Args) : IO Unit :=
-    match args_flag a "help" with
-    | True => app_print_usage
-    | False =>
+    if args_flag a "help" then app_print_usage
+    else
       app_need_pos a 0 "command"
         (fun (cmd : String) =>
-          match str_eq cmd "json" with
-          | True =>
-              app_need_pos a 1 "json command"
-                (app_dispatch_json_sub a)
-          | False =>
-            match str_eq cmd "csv" with
-            | True =>
-                app_need_pos a 1 "csv command"
-                  (app_dispatch_csv_sub a)
-            | False =>
-              match str_eq cmd "config" with
-              | True =>
-                  app_need_pos a 1 "config command"
-                    (app_dispatch_config_sub a)
-              | False =>
-                match str_eq cmd "fs" with
-                | True =>
-                    app_need_pos a 1 "fs command"
-                      (app_dispatch_fs_sub a)
-                | False =>
-                  match str_eq cmd "run" with
-                  | True =>
-                      app_need_pos a 1 "run command"
-                        (app_dispatch_run_sub a)
-                  | False => app_fail_usage (str_concat "unknown command: " cmd)
-                  end
-                end
-              end
-            end
-          end)
-    end;
+          if str_eq cmd "json" then
+            app_need_pos a 1 "json command"
+              (app_dispatch_json_sub a)
+          else
+            if str_eq cmd "csv" then
+              app_need_pos a 1 "csv command"
+                (app_dispatch_csv_sub a)
+            else
+              if str_eq cmd "config" then
+                app_need_pos a 1 "config command"
+                  (app_dispatch_config_sub a)
+              else
+                if str_eq cmd "fs" then
+                  app_need_pos a 1 "fs command"
+                    (app_dispatch_fs_sub a)
+                else
+                  if str_eq cmd "run" then
+                    app_need_pos a 1 "run command"
+                      (app_dispatch_run_sub a)
+                  else app_fail_usage (str_concat "unknown command: " cmd));
 
 def main : IO Unit :=
     do let! av := process_argv;

@@ -1,7 +1,7 @@
 -- Windows x64 PE32+ image model and bounded byte/layout operations.
 -- Specification: https://learn.microsoft.com/windows/win32/debug/pe-format
--- No host IO is used here. Offsets are mathematical Nat values in the previous
--- compiler's dialect; serialized fields and image bounds are checked explicitly.
+-- Offsets are mathematical Nat values. The image writer checks field widths
+-- and layout bounds before serialization. These operations use no host IO.
 
 import "x64.ouro",
   "image_types.ouro";
@@ -121,11 +121,17 @@ def pe_join : List (List Nat) -> List Nat :=
     match parts with | Nil => ([] : List Nat) | Cons part rest => append Nat part (pe_join rest) end;
 
 def pe_bytes_equal (left : List Nat) (right : List Nat) : Bool :=
-    andb (eq_nat(length Nat left, length Nat right))
-      (foldr (Pair Nat Nat) Bool
-        (fun (pair : Pair Nat Nat) (equal : Bool) =>
-          match pair with | MkPair a b => andb(eq_nat a b, equal) end)
-        True (zip Nat Nat left right));
+    (fix equal (xs : List Nat) (ys : List Nat) : Bool :=
+      match xs, ys with
+      | Nil, Nil => True
+      | Nil, Cons _ _ => False
+      | Cons _ _, Nil => False
+      | Cons left_head left_tail, Cons right_head right_tail =>
+          match eq_nat left_head right_head with
+          | True => equal left_tail right_tail
+          | False => False
+          end
+      end) left right;
 
 def pe_byte_error (err : X64EncodeError) : PeError :=
     match err with
@@ -151,9 +157,14 @@ def pe_check_byte_chunk (bytes : List Nat) : Either PeError Unit :=
 -- Computing the suffix in the same thunk lets a host release its traversal
 -- temporaries and retain the suffix with the checked chunk's result.
 def pe_check_byte_step (chunk : Nat) (remaining : List Nat) (_ : Unit) : Either PeError (List Nat) :=
-    match pe_check_byte_chunk (take Nat chunk remaining) with
-    | Left error => Left PeError (List Nat) error
-    | Right _ => Right(PeError, List Nat, drop Nat chunk remaining) end;
+    (fix check (count : Nat) (bytes : List Nat) : Either PeError (List Nat) :=
+      match count with
+      | Z => Right(PeError, List Nat, bytes)
+      | S next => match bytes with
+        | Nil => Right(PeError, List Nat, bytes)
+        | Cons byte rest => match ltb_nat byte native_byte_base with
+          | False => Left(PeError, List Nat, PeInvalidByte byte)
+          | True => check next rest end end end) chunk remaining;
 
 def pe_check_bytes_with
     (run_check : (Unit -> Either PeError (List Nat)) -> Either PeError (List Nat))
@@ -185,14 +196,24 @@ def pe_lower_ascii (byte : Nat) : Nat :=
     match andb(leb_nat 65 byte, leb_nat byte 90) with | True => add byte 32 | False => byte end;
 
 def pe_library_equal (left : List Nat) (right : List Nat) : Bool :=
-    pe_bytes_equal(map Nat Nat pe_lower_ascii left, map Nat Nat pe_lower_ascii right);
+    (fix equal (xs : List Nat) (ys : List Nat) : Bool :=
+      match xs, ys with
+      | Nil, Nil => True
+      | Nil, Cons _ _ => False
+      | Cons _ _, Nil => False
+      | Cons left_head left_tail, Cons right_head right_tail =>
+          match eq_nat(pe_lower_ascii left_head, pe_lower_ascii right_head) with
+          | True => equal left_tail right_tail
+          | False => False
+          end
+      end) left right;
 
 def pe_align (alignment : Nat) (value : Nat) : Nat :=
     let remainder : Nat := mod_nat value alignment in
     match remainder with | Z => value | S _ => add(value, sub alignment remainder) end;
 
--- Extract a base-256 digit with at most 255 subtractions. This avoids dividing
--- a large RVA by 256 using the previous dialect's linear div_nat implementation.
+-- Each base-256 digit needs at most 255 subtractions of its place value.
+-- The enclosing layout or table bounds the input value.
 def pe_digit (value : Nat) (place : Nat) : Pair Nat Nat :=
     (fix go (fuel : Nat) (rest : Nat) (digit : Nat) : Pair Nat Nat :=
       match fuel with

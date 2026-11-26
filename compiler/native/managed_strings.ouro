@@ -49,37 +49,52 @@ def managed_string_literal (compiler : ManagedCompiler) (bytes : List Nat) (stat
                     (managed_bytes_copy source (managed_bits MirUSize 0) value (managed_bits MirUSize 40)
                       (managed_bits MirUSize count) after_address) end) end) end));
 
+private def managed_bytes_equal_loop (scalar_type : MirType) (stride : Nat)
+    (left : MirValue) (left_offset : MirValue) (right : MirValue) (right_offset : MirValue)
+    (limit : MirValue) (index : Nat) (equal : Nat) (state : ManagedState) : Either NativeLowerError ManagedState :=
+    lower_bind LowerLoopBlocks ManagedState (lower_loop_blocks (managed_flow state))
+      (fun (labels : LowerLoopBlocks) => match labels with | LowerLoopAt header body finish flow =>
+        lower_bind ManagedResult ManagedState (managed_compare MirLess (MirUse index) limit
+          (managed_with_flow(state, lower_switch_block header (MirJump header) flow)))
+          (fun (tested : ManagedResult) => match tested with | ManagedResultOf in_bounds after_test =>
+            lower_bind ManagedResult ManagedState (managed_binary MirU8 MirAnd in_bounds (MirUse equal) after_test)
+              (fun (condition : ManagedResult) => match condition with | ManagedResultOf running after_condition =>
+                lower_bind ManagedResult ManagedState (managed_binary MirUSize MirAdd left_offset (MirUse index)
+                  (managed_switch_block body (MirBranch running body finish) after_condition))
+                  (fun (at_left : ManagedResult) => match at_left with | ManagedResultOf first_offset next =>
+                    lower_bind ManagedResult ManagedState
+                      (managed_fresh scalar_type (fun (local : Nat) => MirLoadAt local left first_offset) next)
+                      (fun (first : ManagedResult) => match first with | ManagedResultOf first_value after_first =>
+                        lower_bind ManagedResult ManagedState (managed_binary MirUSize MirAdd right_offset (MirUse index) after_first)
+                          (fun (at_right : ManagedResult) => match at_right with | ManagedResultOf second_offset after_offset =>
+                            lower_bind ManagedResult ManagedState
+                              (managed_fresh scalar_type (fun (local : Nat) => MirLoadAt local right second_offset) after_offset)
+                              (fun (second : ManagedResult) => match second with | ManagedResultOf second_value after_second =>
+                                Right NativeLowerError ManagedState (managed_switch_block finish (MirJump header)
+                                  (managed_emit_all ([MirCompare equal MirEqual first_value second_value,
+                                    MirBinaryOp(index, MirAdd, MirUse index, managed_bits MirUSize stride)] : List MirInstruction) after_second))
+                                end) end) end) end) end) end) end);
+
+-- The rounded word limit bounds each eight-byte load. The byte tail uses
+-- the same index, so neither loop reads padding or bytes after count.
 def managed_bytes_equal (left : MirValue) (left_offset : MirValue) (right : MirValue)
     (right_offset : MirValue) (count : MirValue) (state : ManagedState) : Either NativeLowerError ManagedResult :=
     lower_bind (Pair Nat ManagedState) ManagedResult (managed_fresh_local MirUSize state)
       (fun (cell : Pair Nat ManagedState) => match cell with | MkPair index after_cell =>
         lower_bind (Pair Nat ManagedState) ManagedResult (managed_fresh_local MirU8 after_cell)
           (fun (flag : Pair Nat ManagedState) => match flag with | MkPair equal after_flag =>
-            let initialized : ManagedState := managed_emit_all
-              ([MirMove(index, managed_bits MirUSize 0), MirMove(equal, managed_bits MirU8 1)] : List MirInstruction) after_flag in
-            lower_bind LowerLoopBlocks ManagedResult (lower_loop_blocks (managed_flow initialized))
-              (fun (labels : LowerLoopBlocks) => match labels with | LowerLoopAt header body finish flow =>
-                lower_bind ManagedResult ManagedResult (managed_compare MirLess (MirUse index) count
-                  (managed_with_flow(initialized, lower_switch_block header (MirJump header) flow)))
-                  (fun (tested : ManagedResult) => match tested with | ManagedResultOf in_bounds after_test =>
-                    lower_bind ManagedResult ManagedResult (managed_binary MirU8 MirAnd in_bounds (MirUse equal) after_test)
-                      (fun (condition : ManagedResult) => match condition with | ManagedResultOf running after_condition =>
-                        lower_bind ManagedResult ManagedResult (managed_binary MirUSize MirAdd left_offset (MirUse index)
-                          (managed_switch_block body (MirBranch running body finish) after_condition))
-                          (fun (at_left : ManagedResult) => match at_left with | ManagedResultOf first_offset next =>
-                            lower_bind ManagedResult ManagedResult
-                              (managed_fresh MirU8 (fun (local : Nat) => MirLoadAt local left first_offset) next)
-                              (fun (first : ManagedResult) => match first with | ManagedResultOf first_byte after_first =>
-                                lower_bind ManagedResult ManagedResult (managed_binary MirUSize MirAdd right_offset (MirUse index) after_first)
-                                  (fun (at_right : ManagedResult) => match at_right with | ManagedResultOf second_offset after_offset =>
-                                    lower_bind ManagedResult ManagedResult
-                                      (managed_fresh MirU8 (fun (local : Nat) => MirLoadAt local right second_offset) after_offset)
-                                      (fun (second : ManagedResult) => match second with | ManagedResultOf second_byte after_second =>
-                                        Right NativeLowerError ManagedResult (ManagedResultOf (MirUse equal)
-                                          (managed_switch_block finish (MirJump header)
-                                            (managed_emit_all ([MirCompare equal MirEqual first_byte second_byte,
-                                              MirBinaryOp(index, MirAdd, MirUse index, managed_bits MirUSize 1)] : List MirInstruction) after_second)))
-                                        end) end) end) end) end) end) end) end) end);
+            lower_bind ManagedResult ManagedResult (managed_binary MirUSize MirAnd count (managed_bits MirUSize 7) after_flag)
+              (fun (tail : ManagedResult) => match tail with | ManagedResultOf remainder after_tail =>
+                lower_bind ManagedResult ManagedResult (managed_binary MirUSize MirSub count remainder after_tail)
+                  (fun (bound : ManagedResult) => match bound with | ManagedResultOf word_limit after_bound =>
+                    let initialized : ManagedState := managed_emit_all
+                      ([MirMove(index, managed_bits MirUSize 0), MirMove(equal, managed_bits MirU8 1)] : List MirInstruction) after_bound in
+                    lower_bind ManagedState ManagedResult
+                      (managed_bytes_equal_loop MirU64 8 left left_offset right right_offset word_limit index equal initialized)
+                      (fun (after_words : ManagedState) => lower_map ManagedState ManagedResult
+                        (fun (finished : ManagedState) => ManagedResultOf (MirUse equal) finished)
+                        (managed_bytes_equal_loop MirU8 1 left left_offset right right_offset count index equal after_words))
+                    end) end) end) end);
 
 def managed_string_equal_values (compiler : ManagedCompiler) (left : MirValue) (right : MirValue) (state : ManagedState)
     : Either NativeLowerError ManagedResult :=

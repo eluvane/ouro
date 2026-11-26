@@ -142,14 +142,166 @@ def data(seed):
     yield 'show_bool (args_flag (args_parse (["--registry"] : List String)) "registry")', "false"
 
 
+def _crypto_stream_bytes(value):
+    if len(value) > 1 and all(code == value[0] + index for index, code in enumerate(value)):
+        return f'str_of_codes (nat_range_count {value[0]} {len(value)})'
+    if len(value) > 1 and all(code == value[0] for code in value):
+        return f'str_of_codes (replicate Nat {value[0]} {len(value)})'
+    return f'str_of_codes ([{", ".join(map(str, value))}] : List Nat)'
+
+
+def _crypto_stream_result(chunks, *, state="sha256_stream_init", final=True):
+    payload = "String" if final else "Sha256Stream"
+    bindings = []
+    previous = state
+    for index, chunk in enumerate(chunks):
+        current = f"stream_state{index}"
+        bindings.append(
+            f"let {current} : Sha256Stream := "
+            f"(sha256_stream_update ({previous}) ({chunk}))?;"
+        )
+        previous = current
+    if final:
+        bindings.append(
+            f"let stream_digest : String := (sha256_stream_final ({previous}))?;"
+        )
+        previous = "stream_digest"
+    return (
+        f"let? (Left, Right) : Either Sha256StreamError {payload} do "
+        + " ".join(bindings) + f" {previous} end"
+    )
+
+
+def _crypto_stream_observe(result, success="value", *, bind="value"):
+    return (
+        f'match ({result}) with '
+        '| Left cause => str_cat3 "error:" (sha256_stream_error_code cause) '
+        '(match cause with | Sha256StreamInvalidState => "" '
+        '| Sha256StreamByteLimitExceeded count => str_concat ":" (show_nat count) end) '
+        f'| Right {bind} => {success} end'
+    )
+
+
 def crypto(seed):
+    rows = []
     for a, b in ((1, 3), (7, 3), (seed % 256, (seed * 7) % 256)):
-        yield f'show_nat (xor32 {a} {b})', str(a ^ b)
-        yield f'show_nat (and32 {a} {b})', str(a & b)
+        rows.append((f'show_nat (xor32 {a} {b})', str(a ^ b)))
+        rows.append((f'show_nat (and32 {a} {b})', str(a & b)))
     for value in ("", "abc", f"seed{seed}"):
-        yield f'sha256 {quote(value)}', hashlib.sha256(value.encode()).hexdigest()
+        rows.append((f'sha256 {quote(value)}', hashlib.sha256(value.encode()).hexdigest()))
     for key, value in (("", ""), (f"key{seed}", f"message{seed}")):
-        yield f'hmac_sha256 {quote(key)} {quote(value)}', hmac.new(key.encode(), value.encode(), hashlib.sha256).hexdigest()
+        digest = hmac.new(key.encode(), value.encode(), hashlib.sha256).hexdigest()
+        rows.append((f'hmac_sha256 {quote(key)} {quote(value)}', digest))
+
+    # RFC 6234 section 8.5 supplies the nonempty literal digest vectors.
+    vectors = (
+        (b"", "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"),
+        (b"abc", "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"),
+        (
+            b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq",
+            "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1",
+        ),
+        (bytes([0x19]), "68aa2e2ee5dff96e3355e6c7ee373e3d6a4e17f75f9518d843709c0c9bc3e3d4"),
+    )
+    for message, digest in vectors:
+        pieces = [_crypto_stream_bytes(message[:1]), '""', _crypto_stream_bytes(message[1:])]
+        rows.append((_crypto_stream_observe(_crypto_stream_result(pieces)), digest))
+
+    binary = bytes(range(256))
+    lengths = (0, 1, 55, 56, 57, 63, 64, 65, 119, 120, 121, 127, 128, 129, 256)
+    for size in lengths:
+        message = binary[:size]
+        pieces = [_crypto_stream_bytes(message[:63]), _crypto_stream_bytes(message[63:]), '""']
+        # Both fixture renderers bind each row as observedN in order.
+        digest_name = f"observed{len(rows)}"
+        rows.append((_crypto_stream_observe(_crypto_stream_result(pieces)), hashlib.sha256(message).hexdigest()))
+        rows.append((f'show_bool (str_eq {digest_name} (sha256 ({_crypto_stream_bytes(message)})))', "true"))
+        state_result = _crypto_stream_result(pieces, final=False)
+        state_shape = (
+            'match value with | Sha256StreamOf count _ tail => '
+            'str_cat3 (show_nat count) ":" (show_nat (str_len tail)) end'
+        )
+        rows.append((_crypto_stream_observe(state_result, state_shape), f"{size}:{size % 64}"))
+    yield from rows
+
+    # Every possible residual length precedes a two-block binary continuation.
+    message = binary[:129]
+    for split in range(64):
+        pieces = [_crypto_stream_bytes(message[:split]), '""', _crypto_stream_bytes(message[split:])]
+        yield _crypto_stream_observe(_crypto_stream_result(pieces)), hashlib.sha256(message).hexdigest()
+
+    pieces = [_crypto_stream_bytes(bytes([value])) for value in (65, 0, 255, 13, 10, 128)]
+    yield _crypto_stream_observe(_crypto_stream_result(pieces)), hashlib.sha256(bytes([65, 0, 255, 13, 10, 128])).hexdigest()
+    state_result = _crypto_stream_result([_crypto_stream_bytes(binary[:65])], final=False)
+    repeated = (
+        f"let? (Left, Right) : Either Sha256StreamError String do "
+        f"let saved : Sha256Stream := ({state_result})?; "
+        "let first : String := (sha256_stream_final saved)?; "
+        "let second : String := (sha256_stream_final saved)?; "
+        "show_bool (str_eq first second) end"
+    )
+    yield _crypto_stream_observe(repeated), "true"
+    continued = (
+        f"let? (Left, Right) : Either Sha256StreamError String do "
+        f"let saved : Sha256Stream := ({state_result})?; "
+        "let first : String := (sha256_stream_final saved)?; "
+        "let next : Sha256Stream := (sha256_stream_update saved \"x\")?; "
+        "let second : String := (sha256_stream_final next)?; "
+        "str_cat3 first \":\" second end"
+    )
+    yield _crypto_stream_observe(continued), (
+        hashlib.sha256(binary[:65]).hexdigest() + ":" + hashlib.sha256(binary[:65] + b"x").hexdigest()
+    )
+
+    iv = "(sha_from_list sha256_iv)"
+    limit = "sha256_stream_byte_limit"
+    shape = (
+        'match value with | Sha256StreamOf count _ tail => '
+        'str_cat3 (show_nat count) ":" (show_nat (str_len tail)) end'
+    )
+    near_limit = f'Sha256StreamOf (sub {limit} 2) {iv} ({_crypto_stream_bytes(b"a" * 62)})'
+    result = _crypto_stream_result(['"b"'], state=near_limit, final=False)
+    yield _crypto_stream_observe(result, shape), "536870911:63"
+    result = _crypto_stream_result(['"b"', '"c"'], state=near_limit, final=False)
+    yield _crypto_stream_observe(result, shape), "error:sha256_stream_byte_limit:536870912"
+    at_last = f'Sha256StreamOf (sub {limit} 1) {iv} ({_crypto_stream_bytes(b"a" * 63)})'
+    yield _crypto_stream_observe(_crypto_stream_result(['""'], state=at_last, final=False), shape), "536870911:63"
+
+    for count, decimal in (
+        (limit, "536870912"),
+        (f"(S {limit})", "536870913"),
+        ("(mul (mul n65536 n65536) (mul n65536 n65536))", "18446744073709551616"),
+    ):
+        state = f'Sha256StreamOf {count} {iv} ""'
+        for result in (f"sha256_stream_update ({state}) \"\"", f"sha256_stream_final ({state})"):
+            yield _crypto_stream_observe(result, '"unexpected success"', bind="_"), f"error:sha256_stream_byte_limit:{decimal}"
+
+    for state in (
+        f'Sha256StreamOf Z {iv} ({_crypto_stream_bytes(b"a" * 64)})',
+        f'Sha256StreamOf 3 {iv} "ab"',
+    ):
+        for result in (f"sha256_stream_update ({state}) \"\"", f"sha256_stream_final ({state})"):
+            yield _crypto_stream_observe(result, '"unexpected success"', bind="_"), "error:sha256_stream_invalid_state"
+
+    word_limit = "(mul n65536 n65536)"
+    for index in range(8):
+        words = ["Z"] * 8
+        words[index] = word_limit
+        state = f'Sha256StreamOf Z (MkSha {" ".join(words)}) ""'
+        for result in (f"sha256_stream_update ({state}) \"\"", f"sha256_stream_final ({state})"):
+            yield _crypto_stream_observe(result, '"unexpected success"', bind="_"), "error:sha256_stream_invalid_state"
+    words = " ".join([f"(sub {word_limit} 1)"] * 8)
+    valid_words = f'Sha256StreamOf Z (MkSha {words}) ""'
+    yield _crypto_stream_observe(f'sha256_stream_update ({valid_words}) ""', shape), "0:0"
+
+    invalid_words = f"MkSha {word_limit} Z Z Z Z Z Z Z"
+    invalid_tail = f"({_crypto_stream_bytes(b'a' * 64)})"
+    invalid_state = f"Sha256StreamOf {limit} ({invalid_words}) {invalid_tail}"
+    yield _crypto_stream_observe(f"sha256_stream_final ({invalid_state})", '"unexpected success"', bind="_"), "error:sha256_stream_byte_limit:536870912"
+    yield (
+        f'match sha256_stream_update ({near_limit}) "bc" with '
+        '| Left cause => sha256_stream_error_message cause | Right _ => "unexpected success" end'
+    ), "SHA-256 stream byte count 536870912 must be below 536870912"
 
 
 def compact(value):
@@ -218,7 +370,7 @@ def tables(seed):
 
 
 FAMILIES = {"strings": (strings, ("std/text.ouro",)), "paths": (paths, ("std/pathx.ouro",)),
-            "data": (data, ("std/map.ouro", "std/semver.ouro", "std/args.ouro")), "crypto": (crypto, ("std/crypto.ouro",)),
+            "data": (data, ("std/map.ouro", "std/semver.ouro", "std/args.ouro")), "crypto": (crypto, ("std/crypto.ouro", "std/num.ouro")),
             "protocols": (protocols, ("std/jsonrpc.ouro", "std/http.ouro")), "tables": (tables, ("std/tablex.ouro",)),
             "helpers": (helpers, ("std/char.ouro", "std/test.ouro")),
             "workflow": (workflow, ("std/practical.ouro",)), "application": (application, ("tools/app_surface_lib.ouro",))}
@@ -247,7 +399,7 @@ def run_expressions(run, directory, recipe, rows, modules, property_name, *, sav
     run.input = {"recipe": recipe, "seed": run.seed, "source": source, "expected_stdout": expected}
     path = directory / "main.ouro"
     path.write_text(imports + source, encoding="utf-8", newline="\n")
-    units = collect_units(path.as_posix())
+    units = collect_units(path.as_posix(), parse_bytes=run.import_parser)
     # Integration recipes check and compile their complete stdlib source cone.
     compile_timeout = BUILD_TIMEOUT_S
     run.accepts(path, artifact=False, units=units, timeout=compile_timeout)

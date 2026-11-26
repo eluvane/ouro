@@ -2,6 +2,7 @@
 -- @entry main
 import "quality_test_support.ouro",
   "../tools/fix/pipeline.ouro",
+  "../tools/strict/literals.ouro",
   "../std/io.ouro";
 
 def fp_edit (start : Nat) (stop : Nat) (replacement : String) (rule : String) : FxEdit :=
@@ -24,12 +25,29 @@ def fp_cycle_round (src : String) : Either FxPrepareError (Pair String (List FxE
 def fp_cycle : Bool :=
     match fx_checked_fixpoint_with fp_cycle_round 8 "A" [] [] with
     | Right _ => False
-    | Left error => match error with
-      | FxCycle => True
-      | FxInvalidPlan _ => False | FxNotConverged => False | FxFormatError _ => False
-      | FxFormatReopensFix => False | FxLiteralBinding => False
-      end
+    | Left error => if let FxCycle := (error : FxPrepareError) then True else False
     end;
+
+def fp_budget_exhausted : Bool :=
+    match fx_checked_fixpoint_with fp_cycle_round Z "A" [] [] with
+    | Right _ => False
+    | Left error => if let FxNotConverged := (error : FxPrepareError) then True else False
+    end;
+
+def fp_prepared_rounds : Bool :=
+    let src : String := "def value:Nat:=1;;\n" in
+    let source : FxLexedSource := fx_lex_source src in
+    let expected : String := "def value:Nat:=1;\n" in
+    andb (str_eq (fx_check_source_lexed source) expected)
+      (match fx_converge_lexed [] source with
+       | Left _ => False
+       | Right converged => match fx_converged_rounds converged with
+         | Nil => False
+         | Cons transition rest => let (MkPair before after) := transition in
+             andb (nullb (Pair String String) rest)
+               (andb (str_eq before src) (str_eq after expected))
+         end
+       end);
 
 def fp_fixed (src : String) : Bool :=
     match fx_prepare [] src with
@@ -53,6 +71,20 @@ def fp_format_commutes (src : String) : Bool :=
       end
     end;
 
+def fp_format_reopens_after_nul : Bool :=
+    let src : String := str_cat3 "-- " (str_of_codes [0, 255])
+      "\nimport \"dep.ouro\";\rimport \"dep.ouro\";\r-- keep\n" in
+    let expected : List Nat := map Nat Nat (fun (byte : Nat) =>
+      match eq_nat byte 13 with | True => 10 | False => byte end) (str_codes src) in
+    match fmt_checked src with
+    | Left _ => False
+    | Right formatted => andb (list_eq Nat eq_nat expected (str_codes formatted))
+        (match fx_finish [] (MkFxOutcome src []) with
+         | Right _ => False
+         | Left cause => if let FxFormatReopensFix := (cause : FxPrepareError) then True else False
+         end)
+    end;
+
 def fp_priority : Bool :=
     match fx_checked_plan "abcd" [fp_edit 0 1 "" "identity-let", fp_edit 2 3 "" "double-semi"] with
     | Left _ => False
@@ -72,11 +104,160 @@ def fp_order : Bool :=
       end
     end;
 
+def fp_apply_bytes : Bool :=
+    let src : String := str_of_codes [0, 255, 10, 65, 66, 67, 68] in
+    let edits : List FxEdit :=
+      [ fp_edit 0 0 "a" "do-bind"
+      , fp_edit 1 1 (str_of_codes [128]) "do-bind"
+      , fp_edit 2 4 (str_of_codes [13, 0]) "do-bind"
+      , fp_edit 4 4 "b" "do-bind"
+      , fp_edit 5 6 "" "double-semi" ] in
+    andb (list_eq Nat eq_nat [97, 0, 128, 255, 13, 0, 98, 66, 68]
+      (str_codes (fx_apply src edits)))
+      (list_eq Nat eq_nat [77, 255, 10, 65, 66, 67, 68]
+        (str_codes (fx_apply_go [] src 1 "M")));
+
 def fp_comment_atomic : Bool :=
     let src : String := "let -- rationale\n x := call in x" in
     let edits : List FxEdit := [fp_edit 0 22 "" "do-bind", fp_edit 27 32 "" "do-bind"] in
     andb (nullb(FxEdit, fx_automatic_proposals src edits))
       (eq_nat(length(FxEdit, fx_review_proposals src edits), 2));
+
+def fp_mixed_trivia : Bool :=
+    let src : String := "-- keep\nx;y;" in
+    let blocked : FxEdit := fp_edit 0 7 "" "do-bind" in
+    let peer : FxEdit := fp_edit 9 10 "" "do-bind" in
+    let suggested : FxEdit := fp_edit 0 6 "" "identity-let" in
+    let automatic : FxEdit := fp_edit 11 12 "" "double-semi" in
+    let other_suggestion : FxEdit := fp_edit 10 11 "" "dead-let" in
+    let edits : List FxEdit := [peer, suggested, automatic, blocked, other_suggestion] in
+    andb (list_eq FxEdit fx_same_edit [automatic] (fx_automatic_proposals src edits))
+      (list_eq FxEdit fx_same_edit [peer, suggested, blocked, other_suggestion]
+        (fx_review_proposals src edits));
+
+def fp_literal_spans (src : String) (expected : List (Pair Nat Nat)) : Bool :=
+    list_eq (Pair Nat Nat)
+      (fun (a : Pair Nat Nat) (b : Pair Nat Nat) =>
+        andb (eq_nat(fst Nat Nat a, fst Nat Nat b)) (eq_nat(snd Nat Nat a, snd Nat Nat b)))
+      expected (st_closed_literal_spans src);
+
+def fp_token_equal (a : FxTok) (b : FxTok) : Bool :=
+    let (MkFxTok kind start stop line column bol text code) := a in
+    let (MkFxTok other_kind other_start other_stop other_line
+        other_column other_bol other_text other_code) := b in
+    andb (list_eq Nat eq_nat [kind, start, stop, line, column, code]
+        [other_kind, other_start, other_stop, other_line, other_column, other_code])
+      (andb (if bol then other_bol else notb other_bol) (str_eq text other_text));
+
+def fp_certified_output_snapshot : Bool :=
+    let src : String := "def value : Nat := 1;;\n-- tail\ndef next : Nat := 2;\n" in
+    let expected : String := "def value : Nat := 1;\n-- tail\ndef next : Nat := 2;\n" in
+    let source : FxLexedSource := fx_lex_source src in
+    match fx_checked_plan(src, fx_simple_rules src (fx_lexed_tokens source)) with
+    | Left _ => False
+    | Right edits => match fx_certify_lexed_transaction_with_output source edits with
+      | Left _ => False
+      | Right certified => let (MkPair proof output) := certified in
+          andb (str_eq (fx_transaction_output proof) expected)
+            (andb (str_eq (fx_lexed_text output) expected)
+              (list_eq FxTok fp_token_equal (fx_lexed_tokens output) (fx_lex expected)))
+      end
+    end;
+
+def fp_format_snapshot : Bool :=
+    let input : String := "def first : Nat := 1;  \r\ndef second : Nat := 2;\r\n" in
+    let expected : String := "def first : Nat := 1;\ndef second : Nat := 2;\n" in
+    match fx_converge [] input with
+    | Left _ => False
+    | Right converged => match fx_format_converged_with_snapshot converged with
+      | Left _ => False
+      | Right prepared => let (MkPair outcome snapshot) := prepared in
+          andb (str_eq (fx_outcome_text outcome) expected)
+            (match snapshot with
+             | Nothing => False
+             | Just source => andb (str_eq (fx_lexed_text source) expected)
+                 (list_eq FxTok fp_token_equal (fx_lexed_tokens source) (fx_lex expected))
+             end)
+      end
+    end;
+
+def fp_terminal_snapshot : Bool :=
+    let input : String := "def value : Nat := 1;;\n-- tail\ndef next : Nat := 2;\n" in
+    let expected : String := "def value : Nat := 1;\n-- tail\ndef next : Nat := 2;\n" in
+    match fx_converge [] input with
+    | Left _ => False
+    | Right converged => match fx_format_converged_with_snapshot converged with
+      | Left _ => False
+      | Right prepared => let (MkPair outcome formatted) := prepared in
+          match formatted with
+          | Just _ => False
+          | Nothing =>
+              let source : FxLexedSource := fx_converged_source converged in
+              andb (str_eq (fx_outcome_text outcome) expected)
+                (andb (str_eq (fx_lexed_text source) expected)
+                  (list_eq FxTok fp_token_equal (fx_lexed_tokens source) (fx_lex expected)))
+          end
+      end
+    end;
+
+def fp_lex_prefix_tokens : Bool :=
+    list_eq FxTok fp_token_equal (fx_lex "r#\"a\"# b\"x\" let! lex! r# b")
+      [ MkFxTok fx_k_str 0 6 1 0 True "r#\"a\"#" fx_c_plain
+      , MkFxTok fx_k_byte 7 11 1 7 False "b\"x\"" fx_c_plain
+      , MkFxTok fx_k_ident 12 16 1 12 False "let!" fx_c_let_bang
+      , MkFxTok fx_k_ident 17 20 1 17 False "lex" fx_c_plain
+      , MkFxTok fx_k_sym 20 21 1 20 False "!" fx_c_plain
+      , MkFxTok fx_k_ident 22 23 1 22 False "r" fx_c_plain
+      , MkFxTok fx_k_sym 23 24 1 23 False "#" fx_c_plain
+      , MkFxTok fx_k_ident 25 26 1 25 False "b" fx_c_plain
+      ];
+
+def fp_lex_multiline_positions : Bool :=
+    let literal : String := "\"\"\"\r\n  雪\r\n  \"\"\"" in
+    list_eq FxTok fp_token_equal (fx_lex (str_concat literal "; tail"))
+      [ MkFxTok fx_k_str 0 17 1 0 True literal fx_c_plain
+      , MkFxTok fx_k_sym 17 18 3 5 False ";" fx_c_semi
+      , MkFxTok fx_k_ident 19 23 3 7 False "tail" fx_c_plain
+      ];
+
+def fp_constructor_lines : Bool :=
+    let source : String := "| First : Shape\n\t  | second : Shape\n  | binder => expr\n  | joined: Shape\n  -- | Comment : Shape\n  \n" in
+    let binary : String := str_concat "  | payload : " (str_of_codes [0, 255]) in
+    andb (list_eq String str_eq (fx_harvest_ctors source) ["First", "second"])
+      (match fx_ctor_of_line binary with
+       | Nothing => False
+       | Just name => str_eq name "payload"
+       end);
+
+def fp_constructor_prefilter : Bool :=
+    let prefix : String := "def ignored : Nat := 0;\n\t\r\n| First : Shape\r\n" in
+    let middle : String := "-- | Comment : Shape\n  | match_arm => body\n\t| First : Shape\n" in
+    let tail : String := str_concat (str_of_codes [0]) "| Hidden : Shape\n" in
+    list_eq String str_eq (fx_harvest_ctors (str_cat3 prefix middle tail)) ["First", "First"];
+
+def fp_initial_ctor_inventory : Bool :=
+    let source : String := "inductive Shape : Type :=\n  | First : Shape\n  | second : Shape;\ndef value : Nat := 0;;\n" in
+    match fx_converge ["First", "external"] source with
+    | Left _ => False
+    | Right converged => andb (notb (nullb (Pair String String) (fx_converged_rounds converged)))
+        (list_eq String str_eq (fx_converged_initial_ctors converged)
+          ["First", "second", "First", "external"])
+    end;
+
+private def fp_review_matches_final (source : String) (expected : String) : Bool :=
+    match fx_converge [] source with
+    | Left _ => False
+    | Right converged => match fx_format_converged_with_review converged [] with
+      | Left _ => False
+      | Right result => let (MkPair outcome review) := result in
+          let final : String := fx_outcome_text outcome in
+          let fresh : List FxEdit := fx_review_proposals final
+            (fx_all_rules final (fx_local_ctors final) (fx_lex final)) in
+          andb (str_eq final expected)
+            (andb (list_eq FxEdit fx_same_edit review fresh)
+              (list_eq String str_eq (fx_report "file.ouro" review) (fx_report "file.ouro" fresh)))
+      end
+    end;
 
 def fp_laws : List (Pair String Bool) :=
     [ MkPair String Bool "same-priority-overlap-fails" (fp_reject "abcd"
@@ -92,15 +273,52 @@ def fp_laws : List (Pair String Bool) :=
     , MkPair String Bool "empty-plan-succeeds" (fp_count "abcd" [] 0)
     , MkPair String Bool "priority-before-byte-position" fp_priority
     , MkPair String Bool "order-independent-disjoint-edits" fp_order
+    , MkPair String Bool "mixed-edits-preserve-exact-source-and-replacement-bytes" fp_apply_bytes
+    , MkPair String Bool "strict-literals-ordered-byte-spans" (fp_literal_spans
+        (str_cat3 "-- é\ndef a := Nil Nat;\n"
+          "def b := Cons Nat 1 (Nil Nat); def hidden := Nil Nat;\n" "def c := Nil Nat\n")
+        [MkPair Nat Nat 12 23, MkPair Nat Nat 33 53, MkPair Nat Nat 84 94])
+    , MkPair String Bool "strict-literals-empty-source" (fp_literal_spans "" [])
+    , MkPair String Bool "strict-literals-nil-only" (fp_literal_spans
+        "def a := Nil Nat;\n" [MkPair Nat Nat 6 17])
+    , MkPair String Bool "strict-literals-open-cons" (fp_literal_spans "def a := Cons Nat 1 tail;\n" [])
+    , MkPair String Bool "strict-literals-no-match" (fp_literal_spans
+        "-- Cons Nat 1 (Nil Nat)\ndef a := Cons Nat 1 tail;\ndef b := NilLike Nat;\n" [])
     , MkPair String Bool "comment-sensitive-compound-is-atomic" fp_comment_atomic
+    , MkPair String Bool "literal-and-let-bang-prefixes-preserve-tokens" fp_lex_prefix_tokens
+    , MkPair String Bool "multiline-crlf-preserves-following-token-positions" fp_lex_multiline_positions
+    , MkPair String Bool "mixed-proposals-preserve-comment-safety-and-review-order" fp_mixed_trivia
+    , MkPair String Bool "constructor-scan-keeps-indent-and-separator-rules" fp_constructor_lines
+    , MkPair String Bool "constructor-prefilter-keeps-order-duplicates-and-nul-boundary" fp_constructor_prefilter
+    , MkPair String Bool "constructor-scan-without-pipe-keeps-an-empty-inventory"
+        (nullb String (fx_harvest_ctors "def value : Nat := 0;\r\n-- comment\n\tdef next : Nat := 2;\n"))
+    , MkPair String Bool "convergence-keeps-the-initial-constructor-inventory" fp_initial_ctor_inventory
+    , MkPair String Bool "review-keeps-proposals-from-the-last-round"
+        (fp_review_matches_final
+          "def use (unused : Nat) : Nat := let value := 0 in 1;;\n"
+          "def use (unused : Nat) : Nat := let value := 0 in 1;\n")
+    , MkPair String Bool "review-keeps-final-spans-after-formatting"
+        (fp_review_matches_final
+          "def use (unused : Nat) : Nat := let value := 0 in 1;  \r\n"
+          "def use (unused : Nat) : Nat := let value := 0 in 1;\n")
+    , MkPair String Bool "review-rechecks-a-changed-local-constructor-inventory"
+        (fp_review_matches_final
+          "inductive Shape : Type :=\n  | lower\t: Shape;\ndef use (shape : Shape) : Nat :=\n  match shape with\n  | lower => 0\n  | other => 1\n  end;\n"
+          "inductive Shape : Type :=\n  | lower  : Shape;\ndef use (shape : Shape) : Nat :=\n  match shape with\n  | lower => 0\n  | other => 1\n  end;\n")
     , MkPair String Bool "comment-looking-string-is-data" (fx_plain_fragment "\"-- data\"")
     , MkPair String Bool "actual-comment-is-protected" (notb (fx_plain_fragment "x -- rationale\n y"))
     , MkPair String Bool "constructor-rewrite-needs-review" (fp_count "S Z" [fp_edit 0 3 "1" "peano-literal"] 0)
     , MkPair String Bool "coverage-rewrite-needs-review" (fp_count "abcd" [fp_edit 0 1 "" "unreachable-arm"] 0)
     , MkPair String Bool "binder-rewrite-needs-review" (fp_count "abcd" [fp_edit 0 1 "_" "unused-binder"] 0)
     , MkPair String Bool "cycle-fails-before-publication" fp_cycle
+    , MkPair String Bool "pending-edits-at-zero-fuel-refuse-the-round" fp_budget_exhausted
+    , MkPair String Bool "prepared-round-keeps-unformatted-transition" fp_prepared_rounds
+    , MkPair String Bool "certified-output-snapshot-keeps-new-bytes-and-spans" fp_certified_output_snapshot
     , MkPair String Bool "second-fix-is-no-op" (fp_fixed "def value : Nat := let unused := 0 in 1;;\n")
     , MkPair String Bool "format-only-is-stable" (fp_fixed "def value:Nat:=1;\n")
+    , MkPair String Bool "formatting-after-nul-reopens-duplicate-import" fp_format_reopens_after_nul
+    , MkPair String Bool "fix-format-snapshot-keeps-exact-bytes-and-spans" fp_format_snapshot
+    , MkPair String Bool "unchanged-format-keeps-certified-terminal-spans" fp_terminal_snapshot
     , MkPair String Bool "fix-fmt-order-commutes" (fp_format_commutes "def value:Nat:=let unused := 0 in 1;;\n")
     , MkPair String Bool "retained-comments-remain-stable" (fp_fixed "def value : Nat := let unused := 0 in -- policy\n  1;\n")
     ];

@@ -1,7 +1,7 @@
 import jqhtml from '@jqhtml/vite-plugin';
 
-// GitHub project Pages live at /ouro/. A later custom domain should build
-// with SITE_BASE=/ and a CNAME in site/public/.
+// GitHub Pages serves the project at /ouro/.
+// After attaching a custom domain, set SITE_BASE=/ and add site/public/CNAME.
 const base = process.env.SITE_BASE || '/ouro/';
 
 export default {

@@ -6,6 +6,7 @@
 
 import "../../../tools/fix/pipeline.ouro",
   "../../../std/stringx.ouro",
+  "../../quality_fmt_test_support.ouro",
   "assertions.ouro";
 
 def precision_fmt_expected (src : String) (expected : String) : Bool :=
@@ -32,11 +33,7 @@ def precision_fmt_code (issue : Issue) : String :=
 def precision_fmt_diagnostics (src : String) (expected : List String) : Bool :=
     precision_strings(expected, map Issue String precision_fmt_code (analyze (str_codes src)));
 
-def precision_fmt_refused (src : String) : Bool :=
-    match fmt_checked src with
-    | Right _ => False
-    | Left e => match e with | FmtTokenChange => True | FmtUnstable => False end
-    end;
+def precision_fmt_refused : String -> Bool := fmt_test_rejects_token_change;
 
 def precision_fix_expected (src : String) (expected : String)
     (rules : List String) : Bool :=
@@ -60,43 +57,23 @@ def precision_fix_budget_refused : Bool :=
         (MkFxOutcome("def n : Nat := 0;;\n", Nil FxEdit)) with
     | Right _ => False
     | Left e =>
-        match e with
-        | FxInvalidPlan _ => False
-        | FxCycle => False
-        | FxNotConverged => True
-        | FxFormatError _ => False
-        | FxFormatReopensFix => False
-        | FxLiteralBinding => False
-        end
+        if let FxNotConverged := (e : FxPrepareError) then True else False
     end;
 
 def precision_fix_format_refused : Bool :=
     match fx_prepare(Nil String, "def s : String := \"a\rb\";\n") with
     | Right _ => False
     | Left e =>
-        match e with
-        | FxInvalidPlan _ => False
-        | FxCycle => False
-        | FxNotConverged => False
-        | FxFormatReopensFix => False
-        | FxLiteralBinding => False
-        | FxFormatError cause =>
-            match cause with | FmtTokenChange => True | FmtUnstable => False end
-        end
+        if let FxFormatError cause := (e : FxPrepareError) then
+          match cause with | FmtTokenChange => True | FmtUnstable => False end
+        else False
     end;
 
 def precision_fix_binding_refused : Bool :=
     match fx_prepare(Nil String, "def keep (S : Nat -> Nat) : Nat := S (S (S Z));\n") with
     | Right _ => False
     | Left e =>
-        match e with
-        | FxInvalidPlan _ => False
-        | FxCycle => False
-        | FxNotConverged => False
-        | FxFormatReopensFix => False
-        | FxFormatError _ => False
-        | FxLiteralBinding => True
-        end
+        if let FxLiteralBinding := (e : FxPrepareError) then True else False
     end;
 
 def precision_fmt_pipe : String := "def y : Nat :=\n  x\n  |> f;\n";
@@ -135,6 +112,14 @@ def precision_byte_token : Bool :=
     let tokens : List FxTok := fx_lex "b\"A\\x00\\xFF\"" in
     andb (all FxTok (fun (token : FxTok) => fx_is_kind token fx_k_byte) tokens)
       (precision_strings ["b\"A\\x00\\xFF\""]
+        (map FxTok String fx_tok_text tokens));
+
+def precision_literal_prefix_tokens : Bool :=
+    let tokens : List FxTok := fx_lex "br\"x\" rb#\"y\"# b\"z\" r#\"w\"#" in
+    andb (list_eq Nat eq_nat
+      [fx_k_ident, fx_k_str, fx_k_ident, fx_k_sym, fx_k_str, fx_k_sym, fx_k_byte, fx_k_str]
+      (map FxTok Nat fx_tok_kind tokens))
+      (precision_strings ["br", "\"x\"", "rb", "#", "\"y\"", "#", "b\"z\"", "r#\"w\"#"]
         (map FxTok String fx_tok_text tokens));
 
 def precision_byte_is_not_string_element : Bool :=
@@ -185,6 +170,13 @@ def precision_format_cases : List (Pair String Bool) :=
         (precision_fmt_expected
           "inductive Box {A : Type} : Type := | MkBox : A -> Box A;\n"
           "inductive Box {A : Type} : Type := | MkBox : A -> Box A;\n")
+    , MkPair String Bool "eof/fix/empty-and-line-ending-only-sources"
+        (all String (fun (src : String) => precision_fmt_expected src "\n")
+          ["", "\n", "\r", "\r\n", "\n\r\n\r\n"])
+    , MkPair String Bool "eof/fix/keep-interior-blank-lines"
+        (precision_fmt_expected
+          "def a : Nat := 0;\r\n\r\n-- kept\r\ndef b : Nat := 1;\r\n \t\r\n\r\n"
+          "def a : Nat := 0;\n\n-- kept\ndef b : Nat := 1;\n")
     , MkPair String Bool "pipe/bad/arm-spacing"
         (precision_fmt_diagnostics("|Z => 0\n", ["IPipeSpace:1"] : List String))
     , MkPair String Bool "pipe/good/canonical-arm"
@@ -206,6 +198,11 @@ def precision_format_cases : List (Pair String Bool) :=
           "def s : String := r#\"x|>f\"#;\n")
     , MkPair String Bool "pipe/fix/arm-and-arrow"
         (precision_fmt_expected "|Z=>0\n" "| Z => 0\n")
+    , MkPair String Bool "pipe/fix/preserve-prefix-and-unchanged-byte-rows"
+        (andb (list_eq Nat eq_nat (fixPipeSpace [9, 32, 124, 90]) [9, 32, 124, 32, 90])
+          (andb (list_eq Nat eq_nat (fixPipeSpace [32, 124]) [32, 124])
+            (andb (list_eq Nat eq_nat (fixPipeSpace [9, 124, 62, 32, 102]) [9, 124, 62, 32, 102])
+              (list_eq Nat eq_nat (fixPipeSpace [32, 0, 124, 90]) [32, 0, 124, 90]))))
     , MkPair String Bool "prime/bad/diagnostic-after-identifier"
         (precision_fmt_diagnostics("def n' : Nat:=0;\n", ["IColonEqSpace:1"] : List String))
     , MkPair String Bool "prime/good/canonical-identifier"
@@ -226,6 +223,17 @@ def precision_format_cases : List (Pair String Bool) :=
     , MkPair String Bool "tabs/fp/escaped-quote-keeps-literal-state"
         (andb (precision_fmt_diagnostics(precision_fmt_escape, [] : List String))
           (precision_fmt_expected precision_fmt_escape precision_fmt_escape))
+    , MkPair String Bool "tabs/fix/keep-nul-and-quoted-tabs"
+        (andb (list_eq Nat eq_nat (fmt_line [97, 9, 0, 98]) [97, 32, 32, 0, 98])
+          (list_eq Nat eq_nat (fmt_line [34, 0, 9, 34, 9, 97]) [34, 0, 9, 34, 32, 32, 97]))
+    , MkPair String Bool "trailing-ws/only-trim-the-final-space-and-tab-run"
+        (andb (list_eq Nat eq_nat (stripTrailingWS [32, 0, 9, 255]) [32, 0, 9, 255])
+          (andb (list_eq Nat eq_nat (stripTrailingWS [32, 0, 9, 255, 32, 9]) [32, 0, 9, 255])
+            (nullb Nat (stripTrailingWS [32, 9, 32]))))
+    , MkPair String Bool "trailing-ws/keep-diagnostic-order-and-exact-output"
+        (let source : String := "-- keep  two spaces \n\t\n-- tail\n" in
+          andb (precision_fmt_diagnostics source ["ITrailingWs:1", "ITabs:2", "ITrailingWs:2"])
+            (precision_fmt_expected source "-- keep  two spaces\n\n-- tail\n"))
     , MkPair String Bool "lists/good/trailing-comma-survives-format"
         (precision_fmt_expected
           "def xs : List Nat:=[Z, S Z,];\n"
@@ -250,7 +258,7 @@ def precision_format_cases : List (Pair String Bool) :=
     , MkPair String Bool "tokens/good/numeric-spellings-are-atomic"
         precision_numeric_tokens
     , MkPair String Bool "tokens/good/byte-spelling-is-atomic"
-        precision_byte_token
+        (andb precision_byte_token precision_literal_prefix_tokens)
     , MkPair String Bool "tokens/good/byte-is-not-a-String-element"
         precision_byte_is_not_string_element
     , MkPair String Bool "tokens/good/byte-format-roundtrip"

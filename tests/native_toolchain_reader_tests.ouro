@@ -1,0 +1,158 @@
+-- Reader injection retains the default graph, refusals and first-error order.
+import "analyze/precision/assertions.ouro",
+  "../tools/collect_core.ouro";
+import "../tools/native_toolchain.ouro" as Stage exposing
+  (native_toolchain_discovery_reader, native_toolchain_captured_reader, native_toolchain_join);
+
+def toolchain_reader_equal (left : Col) (right : Col) : Bool :=
+    match left with
+    | ColErr error => match right with | ColErr other => prim_string_eq error other | ColOk _ => False end
+    | ColOk paths => match right with | ColErr _ => False | ColOk other => precision_strings paths other end
+    end;
+
+def toolchain_reader_paths (result : Col) (expected : List String) : Bool :=
+    match result with | ColErr _ => False | ColOk actual => precision_strings actual expected end;
+
+def toolchain_reader_error (result : Col) (expected : String) : Bool :=
+    match result with | ColErr actual => prim_string_eq actual expected | ColOk _ => False end;
+
+def toolchain_reference_file
+  (walk : List String -> List String -> String -> IO Col)
+  (seen : List String) (vis : List String) (path : String) : IO Col :=
+  do let! ex := fs_exists path;
+     (if ex then
+       do let! loaded := fs_read_checked path;
+          match loaded with
+          | Left e =>
+              io_pure Col
+                (ColErr (str_cat3 "collect_units: could not read " path
+                  (str_concat(": ", fs_error_message e))))
+          | Right src => collect_after walk seen vis path src
+          end
+     else io_pure(Col, ColErr (str_concat "collect_units: missing " path)))
+
+def toolchain_reference_walk : Nat -> List String -> List String -> String -> IO Col :=
+  fix toolchain_reference_walk (fuel : Nat) (seen : List String) (vis : List String)
+      (path0 : String) : IO Col :=
+    match fuel with
+    | Z => io_pure(Col, ColErr "collect_units: too many units")
+    | S fuel' =>
+        let path : String := collect_path_normalize path0 in
+        if elem String str_eq path seen then io_pure(Col, ColOk seen)
+        else
+          if elem String str_eq path vis then
+            io_pure Col
+              (ColErr (str_concat "collect_units: import cycle at " path))
+          else
+            toolchain_reference_file
+              (fun (next_seen : List String) (next_vis : List String) (next_path : String) =>
+                toolchain_reference_walk fuel' next_seen next_vis next_path) seen
+              (Cons String path vis) path
+    end;
+
+def toolchain_reader_graph : List (Pair String String) :=
+    [ MkPair String String "root/main.ouro" "import \"first.ouro\", \"second.ouro\", \"first.ouro\";"
+    , MkPair String String "root/first.ouro" "import \"shared.ouro\";"
+    , MkPair String String "root/second.ouro" "import \"shared.ouro\";"
+    , MkPair String String "root/shared.ouro" "def value : Nat := 1;"
+    , MkPair String String "unreachable.ouro" "import \"unfinished.ouro"
+    ];
+
+def toolchain_reader_race (path : String) : IO (Either CollectReadError String) :=
+    io_pure(Either CollectReadError String, Left CollectReadError String
+      (CollectReadFailure (FsOperationFailed "read status=5" path)));
+
+def toolchain_reader_laws : IO (List (Pair String Bool)) :=
+    let root : String := "tests/native_build_collection/positive path/main.ouro" in
+    let missing : String := "tests/native_build_collection/missing/main.ouro" in
+    let cycle : String := "tests/native_build_collection/cycle/main.ouro" in
+    let bad : String := "tests/native_build_collection/bad_import/main.ouro" in
+    let expected : List String := ["tests/native_build_import_lib.ouro",
+      "tests/native_build_collection/positive path/shared/leaf.ouro",
+      "tests/native_build_collection/positive path/nested lib.ouro", root] in
+    do let! old_order := toolchain_reference_walk collect_fuel [] [] root;
+       let! new_order := collect_walk collect_fuel [] [] root;
+       let! old_missing := toolchain_reference_walk collect_fuel [] [] missing;
+       let! new_missing := collect_walk collect_fuel [] [] missing;
+       let! old_cycle := toolchain_reference_walk collect_fuel [] [] cycle;
+       let! new_cycle := collect_walk collect_fuel [] [] cycle;
+       let! old_bad := toolchain_reference_walk collect_fuel [] [] bad;
+       let! new_bad := collect_walk collect_fuel [] [] bad;
+       let! old_fuel := toolchain_reference_walk 0 [root] [] root;
+       let! new_fuel := collect_walk 0 [root] [] root;
+       let! graph := collect_walk_with_reader (native_toolchain_captured_reader toolchain_reader_graph)
+         collect_fuel [] [] "root/main.ouro";
+       let! changed := collect_walk_with_reader (native_toolchain_captured_reader
+         [MkPair String String "root/main.ouro" "import \"absent.ouro\", \"other.ouro\";"])
+         collect_fuel [] [] "root/main.ouro";
+       let! loop := collect_walk_with_reader (native_toolchain_captured_reader
+         [MkPair String String "root/main.ouro" "import \"child.ouro\";",
+          MkPair String String "root/child.ouro" "import \"main.ouro\";"])
+         collect_fuel [] [] "root/main.ouro";
+       let! syntax := collect_walk_with_reader (native_toolchain_captured_reader
+         [MkPair String String "root/main.ouro" "import \"unfinished.ouro"])
+         collect_fuel [] [] "root/main.ouro";
+       let! limited := collect_walk_with_reader (native_toolchain_captured_reader toolchain_reader_graph)
+         1 [] [] "root/main.ouro";
+       let! remembered := collect_walk_with_reader toolchain_reader_race 1 ["root/main.ouro"] ["root/main.ouro"] "root/main.ouro";
+       let! visited := collect_walk_with_reader toolchain_reader_race 1 [] ["root/main.ouro"] "root/main.ouro";
+       let! race := collect_walk_with_reader toolchain_reader_race 1 [] [] "root/main.ouro";
+       let! escape := native_toolchain_discovery_reader "unreachable physical root" 0 "../outside.ouro";
+       io_pure (List (Pair String Bool))
+         [ MkPair String Bool "native-toolchain-reader/default-order-paired"
+             (andb (toolchain_reader_equal old_order new_order) (toolchain_reader_paths new_order expected))
+         , MkPair String Bool "native-toolchain-reader/default-missing-paired"
+             (andb (toolchain_reader_equal old_missing new_missing)
+               (toolchain_reader_error new_missing "collect_units: missing tests/native_build_collection/missing/absent.ouro"))
+         , MkPair String Bool "native-toolchain-reader/default-cycle-paired"
+             (andb (toolchain_reader_equal old_cycle new_cycle)
+               (toolchain_reader_error new_cycle "collect_units: import cycle at tests/native_build_collection/cycle/main.ouro"))
+         , MkPair String Bool "native-toolchain-reader/default-rejected-body-graph-paired"
+             (andb (toolchain_reader_equal old_bad new_bad)
+               (toolchain_reader_paths new_bad ["tests/native_build_import_lib.ouro",
+                 "tests/native_build_collection/bad_import/bad.ouro", bad]))
+         , MkPair String Bool "native-toolchain-reader/default-fuel-before-seen-paired"
+             (andb (toolchain_reader_equal old_fuel new_fuel)
+               (toolchain_reader_error new_fuel "collect_units: too many units"))
+         , MkPair String Bool "native-toolchain-reader/ordered-deduplicated-postorder"
+             (toolchain_reader_paths graph ["root/shared.ouro", "root/first.ouro", "root/second.ouro", "root/main.ouro"])
+         , MkPair String Bool "native-toolchain-reader/unreachable-malformed-source-not-discovered"
+             (toolchain_reader_paths graph ["root/shared.ouro", "root/first.ouro", "root/second.ouro", "root/main.ouro"])
+         , MkPair String Bool "native-toolchain-reader/first-missing-precedes-second"
+             (toolchain_reader_error changed "collect_units: missing root/absent.ouro")
+         , MkPair String Bool "native-toolchain-reader/cycle-before-read"
+             (toolchain_reader_error loop "collect_units: import cycle at root/main.ouro")
+         , MkPair String Bool "native-toolchain-reader/invalid-import-path-context"
+             (toolchain_reader_error syntax "collect_units: malformed import string in root/main.ouro")
+         , MkPair String Bool "native-toolchain-reader/fuel-before-child-read"
+             (toolchain_reader_error limited "collect_units: too many units")
+         , MkPair String Bool "native-toolchain-reader/seen-before-vis-and-read"
+             (toolchain_reader_paths remembered ["root/main.ouro"])
+         , MkPair String Bool "native-toolchain-reader/vis-before-reader-error"
+             (toolchain_reader_error visited "collect_units: import cycle at root/main.ouro")
+         , MkPair String Bool "native-toolchain-reader/race-read-cause-retained"
+             (toolchain_reader_error race "collect_units: could not read root/main.ouro: filesystem read status=5 failed: root/main.ouro")
+         , MkPair String Bool "native-toolchain-reader/escape-before-filesystem"
+             (match escape with
+              | Right _ => False
+              | Left error => match error with
+                | CollectMissing => False
+                | CollectReadFailure cause => prim_string_eq (fs_error_message cause)
+                    "filesystem rebuild source escapes declared root failed: ../outside.ouro"
+                end
+              end)
+         , MkPair String Bool "native-toolchain-reader/extended-root-is-not-normalized"
+             (prim_string_eq (native_toolchain_join "\\\\?\\C:\\source 雪" "tools/native_build.ouro")
+               "\\\\?\\C:\\source 雪\\tools\\native_build.ouro")
+         , MkPair String Bool "native-toolchain-reader/drive-root-separator-is-not-duplicated"
+             (prim_string_eq (native_toolchain_join "\\\\?\\C:\\" "tools/native_build.ouro")
+               "\\\\?\\C:\\tools\\native_build.ouro")
+         , MkPair String Bool "native-toolchain-reader/extended-UNC-root-is-not-normalized"
+             (prim_string_eq (native_toolchain_join "\\\\?\\UNC\\host\\share" "std/雪 space.ouro")
+               "\\\\?\\UNC\\host\\share\\std\\雪 space.ouro")
+         ];
+
+-- @entry main
+def main : IO Unit :=
+    do let! rows := toolchain_reader_laws;
+       precision_run "native-toolchain-reader" rows;

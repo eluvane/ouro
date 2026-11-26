@@ -1,6 +1,5 @@
-/* ouro_eval_main.c: host printer for ouro1 eval.
-   Forces the last export (the wrapped __ouro_eval body) and prints an
-   Ouro-looking normal form. No compiler algorithm — constructor walk only. */
+/* Host printer for ouro1 eval. The last export is the wrapped __ouro_eval
+   body. */
 #include "ouro_rt.h"
 
 #include <stdio.h>

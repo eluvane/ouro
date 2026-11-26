@@ -1,9 +1,11 @@
--- CSV support is deliberately bounded: comma fields plus one quote pair, no full RFC state machine.
+-- Quoted fields can contain commas and use doubled quotes for literal quotes.
+-- `csv_parse` splits on line feeds before handling quotes, so input rows
+-- must fit on one line. `csv_print` encloses fields that contain line feeds
+-- in quotes.
 
 import "format.ouro";
 
--- Separator is std/char.ouro's ch_comma; imports flatten into one namespace,
--- so redefining it here would emit the same global twice.
+-- Reuse `ch_comma` from `std/char.ouro` to avoid a duplicate name under plain imports.
 
 inductive CsvCell : Type :=
   | MkCell : String -> CsvCell;
@@ -15,7 +17,8 @@ inductive CsvTable : Type :=
   | MkTable : List (List String) -> CsvTable;
 
 def csv_unescape (s : String) : String :=
-    match andb(str_starts s "\"", str_ends s "\"") with
+    match andb(leb_nat 2 (str_len s),
+      andb(str_starts s "\"", str_ends s "\"")) with
     | False => s
     | True =>
       let inner : String := str_slice s 1 (sub(str_len s, 2)) in
@@ -29,6 +32,10 @@ def csv_escape (s : String) : String :=
     end;
 
 def csv_split_row (s : String) : List String :=
+  -- The C host split primitive stops at NUL. The byte scanner preserves the remaining fields.
+  match orb(str_contains s "\"", str_contains s (str_of_codes [ch_nul])) with
+  | False => str_split s ch_comma
+  | True =>
     (fix go (fuel : Nat) (cs : List Nat) (cur : List Nat) (in_q : Bool) (acc : List String) : List String :=
       match fuel with
       | Z => reverse_lin(String, Cons String (str_of_codes (reverse_lin Nat cur)) acc)
@@ -63,11 +70,18 @@ def csv_split_row (s : String) : List String :=
             end
           end
         end
-      end) (S (str_len s)) (str_codes s) (Nil Nat) False (Nil String);
+      end) (S (str_len s)) (str_codes s) (Nil Nat) False (Nil String)
+  end;
+
+private def csv_parse_rows (keep : String -> Bool) (split_row : String -> List String)
+    (text : String) : List (List String) :=
+    map String (List String) split_row (filter String keep (str_lines text));
+
+private def csv_row_nonempty (line : String) : Bool :=
+    notb (str_null line);
 
 def csv_parse (s : String) : List (List String) :=
-    map String (List String) csv_split_row
-      (filter(String, fun (ln : String) => notb (str_null (str_trim ln)), str_lines s));
+    csv_parse_rows (fun (line : String) => csv_row_nonempty (str_trim line)) csv_split_row s;
 
 def csv_join_row (cols : List String) : String :=
     str_join(",", map String String csv_escape cols);
@@ -79,10 +93,7 @@ def csv_col (rows : List (List String)) (i : Nat) : List String :=
     map(List String, String, fun (r : List String) => nth String "" i r, rows);
 
 def csv_header (rows : List (List String)) : List String :=
-    match rows with
-    | Nil => Nil String
-    | Cons h _ => h
-    end;
+    head (List String) (Nil String) rows;
 
 def csv_lookup_col (header : List String) (name : String) : Maybe Nat :=
     index_of String str_eq name header;
@@ -94,25 +105,19 @@ def csv_nrows (rows : List (List String)) : Nat :=
     length(List String, rows);
 
 def csv_ncols (rows : List (List String)) : Nat :=
-    match rows with
-    | Nil => Z
-    | Cons r _ => length String r
-    end;
+    length String (csv_header rows);
 
 def tsv_split_row (s : String) : List String :=
     str_split s 9;
 
 def tsv_parse (s : String) : List (List String) :=
-    map String (List String) tsv_split_row
-      (filter(String, fun (ln : String) => notb (str_null ln), str_lines s));
+    csv_parse_rows csv_row_nonempty tsv_split_row s;
 
 def tsv_print (rows : List (List String)) : String :=
     unlines (map(List String, String, str_join "\t", rows));
 
 def pipe_parse (s : String) : List (List String) :=
-    map String (List String)
-      (fun (ln : String) => str_split ln ch_pipe)
-      (filter(String, fun (ln : String) => notb (str_null ln), str_lines s));
+    csv_parse_rows csv_row_nonempty (fun (line : String) => str_split line ch_pipe) s;
 
 def pipe_lookup (table : String) (key : String) : Maybe String :=
     (fix go (rows : List (List String)) : Maybe String :=

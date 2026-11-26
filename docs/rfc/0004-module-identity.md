@@ -8,10 +8,13 @@
 
 ## Summary
 
-Resolve imported names against the canonical source unit that declares them.
-An alias in `import "path.ouro" as A` names that unit within the importing file;
-`A.member` selects one of its direct declarations. Plain imports continue to
-make declarations available by their short names when lookup is unique.
+This proposal makes the declaring source unit part of imported name lookup.
+An alias in `import "path.ouro" as A` names that unit in the importing file.
+`A.member` selects one of its direct declarations. Plain imports expose
+short names when lookup is unique.
+
+See the [module syntax reference](../syntax.md#modules-and-imports) for the
+forms supported by the toolchain.
 
 ## Motivation
 
@@ -135,7 +138,7 @@ gates. Stage-loop evidence is required before any generated bootstrap update.
 
 ## Documentation
 
-Update `docs/syntax.md`, `docs/architecture.md`, `docs/language/ergonomic-syntax.md`,
+Update `docs/syntax.md`, `docs/architecture.md`, `docs/language/ergonomic_syntax.md`,
 and `docs/tcb.md` if the described trust boundary changes.
 
 ## Diagnostics and remaining design

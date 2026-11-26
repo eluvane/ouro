@@ -3,32 +3,27 @@
 -- @entry main
 import "../../tools/clippy/semantic_unit.ouro",
   "../../tools/clippy/structural_frontend.ouro",
+  "../../compiler/lexer_intern.ouro",
   "../../std/io.ouro";
 
 def cl_name (decls : List Decl) (intern : InternState) (expected : String) : Bool :=
     match decls with
     | Nil => False
-    | Cons decl rest => andb (nullb Decl rest) (match decl with
-      | DDef name _ _ _ _ => prim_string_eq(cm_name intern name, expected)
-      | DImport _ => False
-      | DAxiom _ _ => False
-      | DInductive _ _ _ _ _ => False
-      | DEffect _ _ _ => False
-      | DIntrinsic _ _ _ _ => False
-      | DExtern _ _ _ => False
-      | DRepresentation _ _ => False end)
+    | Cons decl rest => andb (nullb Decl rest) (if let DDef name _ _ _ _ := decl then
+        prim_string_eq(cm_name intern name, expected)
+      else False)
     end;
 
 def cl_survivors : Bool :=
     match cm_parse "def retained (x : Nat) : Nat := x;" empty_intern with
     | Left _ => False
-    | Right first => match first with | MkPair decls intern =>
+    | Right first => let (MkPair decls intern) := first in
       match cm_parse "def next (y : Nat) : Nat := y;" intern with
       | Left _ => False
-      | Right second => match second with | MkPair next updated =>
+      | Right second => let (MkPair next updated) := second in
         andb (cl_name decls intern "retained")
-          (andb(cl_name next updated "next", cl_name decls updated "retained")) end
-      end end
+          (andb(cl_name next updated "next", cl_name decls updated "retained"))
+      end
     end;
 
 def cl_repeated : Nat -> InternState -> Bool :=
@@ -37,8 +32,8 @@ def cl_repeated : Nat -> InternState -> Bool :=
     | Z => True
     | S less => match cm_parse "def same (value : Nat) : Nat := value;" intern with
       | Left _ => False
-      | Right parsed => match parsed with | MkPair decls updated =>
-        andb(cl_name decls updated "same", go less updated) end
+      | Right parsed => let (MkPair decls updated) := parsed in
+        andb(cl_name decls updated "same", go less updated)
       end
     end;
 
@@ -75,18 +70,42 @@ def cl_cache_row_count (cache : CmParseCache) : Nat :=
 def cl_cache_hit_reuses_row : Bool :=
     let src : String := "def n : Nat := Z;" in
     let req : Pair String String := MkPair String String "std/cache_reuse.ouro" src in
-    match cm_load_file_cached req empty_intern cm_cache0 with
+    match cm_load_file_cached_flat req empty_intern cm_cache0 with
     | Left _ => False
-    | Right first => match first with
-      | MkPair _ cache =>
-          match cm_load_file_cached req empty_intern cache with
-          | Left _ => False
-          | Right second => match second with
-            | MkPair _ reused =>
-                andb (eq_nat(cl_cache_row_count cache, S Z))
-                  (eq_nat(cl_cache_row_count reused, S Z))
-            end
-          end
+    | Right first => let (MkPair _ cache) := first in
+      match cm_load_file_cached_flat req empty_intern cache with
+      | Left _ => False
+      | Right second => let (MkPair _ reused) := second in
+        andb (eq_nat(cl_cache_row_count cache, S Z))
+          (eq_nat(cl_cache_row_count reused, S Z))
+      end
+    end;
+
+def cl_cache_hit_keeps_indexes : Bool :=
+    let request : Pair String String := MkPair String String "pkg/cache.ouro"
+      "import \"./dep.ouro\"; def cached : Nat := let _ := Z in Z;" in
+    let carried_name : List Nat := prim_string_to_char_codes "between" in
+    let canonical_path : List Nat := prim_string_to_char_codes "pkg/dep.ouro" in
+    match cm_load_file_cached request (lexer_intern_from empty_intern) cm_cache0 with
+    | Left _ => False
+    | Right cold => let (MkPair harvested first) := cold in
+      let (MkPair indexed cache) := first in
+      let (MkHarvest initial _ imports _ _) := harvested in
+      let (MkIntern _ next_name _ _) := initial in
+      let discard_id : Nat := sub next_name 1 in
+      let discard_name : String := prim_string_concat "$clippy-discard#" (prim_string_of_nat discard_id) in
+      let (MkPair between advanced) := lexer_intern_ident indexed carried_name in
+      match cm_load_file_cached request advanced cache with
+      | Left _ => False
+      | Right warm => let (MkPair _ second) := warm in
+        let (MkPair reused _) := second in
+        let (MkPair reused_name _) := lexer_intern_ident reused carried_name in
+        let (MkPair reused_path _) := lexer_intern_string reused canonical_path in
+        let (MkPair reused_discard _) := lexer_intern_ident reused (prim_string_to_char_codes discard_name) in
+        andb (list_eq Nat eq_nat imports [reused_path])
+          (andb (eq_nat between reused_name)
+            (andb (prim_string_eq (cm_name initial discard_id) discard_name)
+              (eq_nat discard_id reused_discard)))
       end
     end;
 
@@ -94,93 +113,89 @@ def cl_cache_stale_replaces_row : Bool :=
     let src : String := "def n : Nat := Z;" in
     let other : String := "def n : Nat := S Z;" in
     let path : String := "std/cache_stale.ouro" in
-    match cm_load_file_cached (MkPair String String path src) empty_intern cm_cache0 with
+    match cm_load_file_cached_flat (MkPair String String path src) empty_intern cm_cache0 with
     | Left _ => False
-    | Right first => match first with
-      | MkPair _ cache =>
-          match cm_cache_lookup cache path other with
-          | CmCacheStale =>
-              match cm_load_file_cached (MkPair String String path other)
-                  empty_intern cache with
-              | Left _ => False
-              | Right second => match second with
-                | MkPair _ next => andb (eq_nat(cl_cache_row_count next, S Z))
-                    (andb (match cm_cache_lookup next path other with
-                      | CmCacheHit _ => True
-                      | CmCacheMiss => False
-                      | CmCacheStale => False end)
-                      (match cm_cache_lookup next path src with
-                      | CmCacheStale => True
-                      | CmCacheHit _ => False
-                      | CmCacheMiss => False end))
-                end
-              end
-          | CmCacheHit _ => False
-          | CmCacheMiss => False
-          end
-      end
+    | Right first => let (MkPair _ cache) := first in
+      if let CmCacheStale := (cm_cache_lookup cache path other : CmCacheLookup) then
+        match cm_load_file_cached_flat (MkPair String String path other)
+            empty_intern cache with
+        | Left _ => False
+        | Right second => let (MkPair _ next) := second in
+          andb (eq_nat(cl_cache_row_count next, S Z))
+            (andb (if let CmCacheHit _ := (cm_cache_lookup next path other : CmCacheLookup) then
+                True
+              else False)
+              (if let CmCacheStale := (cm_cache_lookup next path src : CmCacheLookup) then
+                  True
+                else False))
+        end
+      else False
+    end;
+
+def cl_cache_rejects_wrong_hash : Bool :=
+    let path : String := "std/cache_wrong_hash.ouro" in
+    let src : String := "def n : Nat := Z;" in
+    match cm_load_file_flat (MkPair String String path src) empty_intern with
+    | Left _ => False
+    | Right harvest =>
+      let cache : CmParseCache := MkCmParseCache
+        [MkCmCachedFile (cm_cache_identity path) (prim_string_length src)
+          (cm_content_hash "def m : Nat := Z;") src harvest] in
+      if let CmCacheStale := (cm_cache_lookup cache path src : CmCacheLookup) then True else False
     end;
 
 def cl_cache_reset_is_miss : Bool :=
     let src : String := "def n : Nat := Z;" in
     let path : String := "std/cache_reset.ouro" in
-    match cm_load_file_cached (MkPair String String path src) empty_intern cm_cache0 with
+    match cm_load_file_cached_flat (MkPair String String path src) empty_intern cm_cache0 with
     | Left _ => False
-    | Right first => match first with
-      | MkPair _ cache =>
-          match cm_cache_lookup (cm_cache_reset cache) path src with
-          | CmCacheMiss => True
-          | CmCacheHit _ => False
-          | CmCacheStale => False
-          end
-      end
+    | Right first => let (MkPair _ cache) := first in
+      if let CmCacheMiss := (cm_cache_lookup (cm_cache_reset cache) path src : CmCacheLookup) then
+        True
+      else False
     end;
 
 def cl_private_source : String :=
     "private inductive Hidden : Type := | HiddenValue : Hidden; inductive Visible : Type := | VisibleValue : Visible;";
 
 def cl_private_snapshot (file : CmHarvest) (intern : InternState) (private_expected : Bool) : Bool :=
-    match file with | MkHarvest _ symbols _ parsed _ =>
-      andb (all ScDecl (fun (decl : ScDecl) => match sc_decl_body decl with
-        | Nothing => True | Just _ => False end) symbols)
-        (match private_expected with
-         | True => list_eq String prim_string_eq
-             (map Nat String (fun (name : Nat) => cm_name intern name) (cm_parsed_private parsed))
-             (["Hidden", "HiddenValue"] : List String)
-         | False => nullb Nat (cm_parsed_private parsed) end)
-    end;
+    let (MkHarvest _ symbols _ parsed _) := file in
+    andb (all ScDecl (fun (decl : ScDecl) => match sc_decl_body decl with
+      | Nothing => True | Just _ => False end) symbols)
+      (match private_expected with
+       | True => list_eq String prim_string_eq
+           (map Nat String (fun (name : Nat) => cm_name intern name) (cm_parsed_private parsed))
+           (["Hidden", "HiddenValue"] : List String)
+       | False => nullb Nat (cm_parsed_private parsed) end);
 
 def cl_private_cache : Bool :=
     let path : String := "private_owner.ouro" in
     let source : String := cl_private_source in
     let public_source : String := prim_string_replace source "private " "        " in
-    match cm_load_file_cached (MkPair String String path source) empty_intern cm_cache0 with
+    match cm_load_file_cached_flat (MkPair String String path source) empty_intern cm_cache0 with
     | Left _ => False
-    | Right first => match first with | MkPair cold cache => match cold with
-      | MkHarvest intern _ _ _ _ =>
-        andb (cl_private_snapshot cold intern True)
-          (andb (match cm_cache_lookup cache path source with
-            | CmCacheHit stored => cl_private_snapshot stored intern True
-            | CmCacheMiss => False | CmCacheStale => False end)
-            (match cm_load_file_cached (MkPair String String path source) intern cache with
-             | Left _ => False
-             | Right second => match second with | MkPair warm reused =>
-               andb (cl_private_snapshot warm intern True)
-                 (andb (match cm_cache_lookup reused path public_source with
-                   | CmCacheStale => True | CmCacheHit _ => False | CmCacheMiss => False end)
-                   (match cm_load_file_cached (MkPair String String path public_source) intern reused with
-                    | Left _ => False
-                    | Right third => match third with | MkPair edited next =>
-                      andb (cl_private_snapshot edited intern False)
-                        (andb (match cm_cache_lookup next path public_source with
-                          | CmCacheHit stored => cl_private_snapshot stored intern False
-                          | CmCacheMiss => False | CmCacheStale => False end)
-                          (eq_nat (prim_string_length source) (prim_string_length public_source)))
-                      end
-                    end))
-               end
-             end))
-      end end
+    | Right first => let (MkPair cold cache) := first in
+      let (MkHarvest intern _ _ _ _) := cold in
+      andb (cl_private_snapshot cold intern True)
+        (andb (match cm_cache_lookup cache path source with
+          | CmCacheHit stored => cl_private_snapshot stored intern True
+          | CmCacheMiss => False | CmCacheStale => False end)
+          (match cm_load_file_cached_flat (MkPair String String path source) intern cache with
+           | Left _ => False
+           | Right second => let (MkPair warm reused) := second in
+             andb (cl_private_snapshot warm intern True)
+               (andb (match cm_cache_lookup reused path public_source with
+                 | CmCacheStale => True | CmCacheHit _ => False | CmCacheMiss => False end)
+                 (match cm_load_file_cached_flat (MkPair String String path public_source) intern reused with
+                  | Left _ => False
+                  | Right third => let (MkPair edited next) := third in
+                    andb (cl_private_snapshot edited intern False)
+                      (andb (match cm_cache_lookup next path public_source with
+                        | CmCacheHit stored => cl_private_snapshot stored intern False
+                        | CmCacheMiss => False | CmCacheStale => False end)
+                        (eq_nat (prim_string_length source) (prim_string_length public_source)))
+                  end))
+           end))
     end;
 
 def cl_laws : List (Pair String Bool) :=
@@ -197,13 +212,15 @@ def cl_laws : List (Pair String Bool) :=
     , MkPair String Bool "success-after-error-remains-success"
         (andb(cl_rejected "def broken : Nat := ;", cl_survivors))
     , MkPair String Bool "content-addressed-cache-hit-reuses-row" cl_cache_hit_reuses_row
+    , MkPair String Bool "cache-hit-keeps-canonical-paths-and-current-identifier-index" cl_cache_hit_keeps_indexes
     , MkPair String Bool "content-addressed-cache-stale-replaces-row" cl_cache_stale_replaces_row
+    , MkPair String Bool "content-addressed-cache-rejects-wrong-hash" cl_cache_rejects_wrong_hash
     , MkPair String Bool "content-addressed-cache-reset-is-miss" cl_cache_reset_is_miss
     , MkPair String Bool "private-names-survive-cold-hit-and-equal-length-edit" cl_private_cache
     ];
 def main : IO Unit :=
-    do io_foreach (Pair String Bool) (fun (law : Pair String Bool) => match law with
-         | MkPair name passed => println (prim_string_concat
-             (match passed with | True => "PASS " | False => "FAIL " end) name) end) cl_laws;
+    do io_foreach (Pair String Bool) (fun (law : Pair String Bool) => let (MkPair name passed) := law in
+      println (prim_string_concat
+        (match passed with | True => "PASS " | False => "FAIL " end) name)) cl_laws;
        exit (match all(Pair String Bool, fun (law : Pair String Bool) => snd String Bool law, cl_laws) with
          | True => 0 | False => 1 end)

@@ -1,6 +1,5 @@
-/* C-hosted N1 producer: check through frontend_link phase seams, then
-   lower/codegen with the generated Ouro backend. Replaces ouro_prog_main
-   so compile_checked_units inlining cannot keep every parse temporary. */
+/* C-hosted N1 producer. The frontend releases parse temporaries between
+   phases. The generated Ouro backend owns lowering and code generation. */
 #ifndef _POSIX_C_SOURCE
 #define _POSIX_C_SOURCE 200809L
 #endif
@@ -21,6 +20,8 @@ const char *ouro_export_name(int i);
 ouro_v *ouro_export_value(int i);
 void ouro_fe_reset_mir_pins(void);
 void ouro_fe_set_progress(int enabled);
+void ouro_fe_set_lowering_timings(int enabled);
+void ouro_fe_set_check_profile(double (*clock_now)(void));
 
 static int g_n1_timings;
 static double g_n1_timing_start = -1.0;
@@ -49,6 +50,7 @@ static double n1_timing_now(void)
 static void n1_timing_reset(int enabled)
 {
 	g_n1_timings = enabled;
+	ouro_fe_set_lowering_timings(enabled);
 	g_n1_timing_start = enabled ? n1_timing_now() : -1.0;
 	g_n1_timing_last = g_n1_timing_start;
 }
@@ -366,6 +368,13 @@ static ouro_v *keep_lower_output(ouro_v *value, ouro_v **fuel,
 	return OURO_F(kept, 0);
 }
 
+/* Only the MIR is used after managed lowering. Keep the complete MIR
+   before dropping the lowering banks and clearing their cached pointers. */
+static ouro_v *keep_managed_mir(ouro_v *parts)
+{
+	return keep_reset(OURO_F(parts, 2));
+}
+
 static void require_lower_result(const char *phase, ouro_v *result)
 {
 	if (result == 0 || (result->tag != 0 && result->tag != 1) ||
@@ -475,9 +484,16 @@ int main(int argc, char **argv)
 	ouro_v *pe;
 	ouro_v *bytes;
 	int timings = 0;
+	int check_profile = 0;
 	int i;
 
 	n1_timing_reset(0);
+	ouro_fe_set_check_profile(0);
+	if (argc > 1 && strcmp(argv[1], "--check-profile") == 0) {
+		check_profile = 1;
+		argc--;
+		argv++;
+	}
 	if (argc > 1 && strcmp(argv[1], "--timings") == 0) {
 		timings = 1;
 		argc--;
@@ -508,7 +524,9 @@ int main(int argc, char **argv)
 	n1_timing("check-start");
 	fprintf(stderr, "n1-host: check units=%d live=%llu\n",
 		argc == 3 ? 1 : argc - 3, ouro_heap_live_bytes());
+	ouro_fe_set_check_profile(check_profile ? n1_timing_now : 0);
 	result = ouro_fe_compile_checked_units(ouro_nat(200000UL), ouro_string_codes(root), files);
+	ouro_fe_set_check_profile(0);
 	if (result == 0 || result->tag != 1 || result->n < 1)
 		die_comp(result);
 	checked = keep_reset(OURO_F(result, 0));
@@ -516,6 +534,10 @@ int main(int argc, char **argv)
 	fprintf(stderr, "n1-host: CHECK_OK live=%llu total=%llu\n",
 		ouro_heap_live_bytes(), ouro_heap_total_alloc_bytes());
 	ouro_heap_report("n1-after-check");
+	if (check_profile) {
+		fputs("n1-host: CHECK_PROFILE_ONLY complete-source-check no-image\n", stderr);
+		return 0;
+	}
 
 	fuel = find_export("native_build_fuel");
 	n1_timing("recheck-start");
@@ -567,13 +589,13 @@ int main(int argc, char **argv)
 		/* NativeLoweredOf checked contracts mir */
 		image = emit_mir(OURO_F(OURO_F(result, 0), 2));
 	} else {
-		ouro_v *parts = keep_reset(OURO_F(result, 0));
+		ouro_v *mir = keep_managed_mir(OURO_F(result, 0));
 
 		fprintf(stderr, "n1-host: BUILD_OK live=%llu\n",
 			ouro_heap_live_bytes());
-		/* ManagedProgramOf checked contracts mir. emit_mir checks the
-		   entire program before GC annotation or instruction encoding. */
-		image = emit_mir(OURO_F(parts, 2));
+		/* emit_mir checks the entire program before GC annotation or
+		   instruction encoding. */
+		image = emit_mir(mir);
 	}
 	fprintf(stderr, "n1-host: LOWER_OK live=%llu\n", ouro_heap_live_bytes());
 	ouro_heap_report("n1-after-lower");

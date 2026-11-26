@@ -13,6 +13,7 @@ import "lower_ops.ouro",
   "../pipeline_abi.ouro",
   "../file_check_environment.ouro",
   "lower_types.ouro",
+  "../primitive_registry.ouro",
   "../primitive_registry_base.ouro",
   "../primitive_check.ouro",
   "../primitive_roles.ouro";
@@ -71,6 +72,55 @@ def lower_storage_type_indexed (fuel : Nat) (sig : CheckEnvironment) (specializa
 def lower_storage_type (fuel : Nat) (entries : List Entry) (specialization : Maybe CoreTerm)
     : Either NativeLowerError LowerType :=
     lower_storage_type_indexed fuel (check_environment_from_entries entries) specialization;
+
+-- The registry validates the concrete Runtime telescope before it becomes an
+-- indirect call signature. The first adapter parameter retains RawFn S in Core.
+def lower_fn_contract (fuel : Nat) (sig : CheckEnvironment) (specialization : Maybe CoreTerm)
+    : Either NativeLowerError LowerContract :=
+    match specialization with
+    | Nothing => Left NativeLowerError LowerContract (LowerInvalidCall 0)
+    | Just signature => lower_bind CoreTerm LowerContract
+        (lower_from_primitive CoreTerm signature
+          (primitive_call_expected (primitive_check_budget fuel) (primitive_normalizer_indexed sig)
+            (primitive_environment (check_environment_entries sig))
+            (primitive_roles_environment (check_environment_entries sig)) signature))
+        (fun (adapter : CoreTerm) => lower_make_contract_indexed fuel sig 0 adapter (Nothing PrimitiveBinding)) end;
+
+def lower_fn_partial (fuel : Nat) (sig : CheckEnvironment) (specialization : Maybe CoreTerm)
+    (arguments : List CoreTerm) : Either NativeLowerError Bool :=
+    lower_map LowerContract Bool (fun (contract : LowerContract) => match contract with
+      | LowerContractOf _ _ parameters _ _ => compiler_lt_nat (length CoreTerm arguments) (length LowerType parameters) end)
+      (lower_fn_contract fuel sig specialization);
+
+def lower_fn_target (contract : LowerContract) (values : List MirValue)
+    : Either NativeLowerError (Pair MirCallTarget (List MirValue)) :=
+    match contract with | LowerContractOf id annotation parameters result binding => match parameters, values with
+    | Cons pointer_type arguments, Cons pointer actual =>
+        lower_bind Unit (Pair MirCallTarget (List MirValue)) (lower_require
+          (andb (match lower_type_mir pointer_type with | Nothing => False | Just typ => mir_type_equal typ MirRawPtr end)
+            (eqNat(length LowerType arguments, length MirValue actual))) (LowerInvalidCall id))
+          (fun (_ : Unit) => lower_map MirSignature (Pair MirCallTarget (List MirValue))
+            (fun (signature : MirSignature) => MkPair(MirCallTarget, List MirValue, MirIndirect signature pointer, actual))
+            (lower_mir_signature (LowerContractOf id annotation arguments result binding)))
+    | Nil, Nil => Left NativeLowerError (Pair MirCallTarget (List MirValue)) (LowerInvalidCall id)
+    | Nil, Cons _ _ => Left NativeLowerError (Pair MirCallTarget (List MirValue)) (LowerInvalidCall id)
+    | Cons _ _, Nil => Left NativeLowerError (Pair MirCallTarget (List MirValue)) (LowerInvalidCall id) end end;
+
+def lower_fn_call (fuel : Nat) (step : LowerStep) (sig : CheckEnvironment) (environment : List LowerBinding)
+    (specialization : Maybe CoreTerm) (args : List CoreTerm) (expected : LowerType) (state : LowerState)
+    : Either NativeLowerError LowerResult :=
+    lower_bind LowerContract LowerResult (lower_fn_contract fuel sig specialization)
+      (fun (contract : LowerContract) => match contract with | LowerContractOf _ _ parameters result _ =>
+        lower_bind Unit LowerResult (lower_type_same fuel expected result) (fun (_ : Unit) =>
+          lower_bind LowerArguments LowerResult (lower_arguments step environment 0 parameters args state)
+            (fun (arguments : LowerArguments) => match arguments with | LowerArgumentsOf values after =>
+              lower_bind (Pair MirCallTarget (List MirValue)) LowerResult (lower_fn_target contract values)
+                (fun (call : Pair MirCallTarget (List MirValue)) => match call with | MkPair target actual =>
+                  match lower_type_mir expected with
+                  | Nothing => Right NativeLowerError LowerResult (LowerResultOf expected (Nothing MirValue)
+                      (lower_emit(MirCall(MirMayGc, Nothing Nat, target, actual), after)))
+                  | Just _ => lower_fresh_result expected
+                      (fun (id : Nat) => MirCall(MirMayGc, Just Nat id, target, actual)) after end end) end)) end);
 
 def lower_raw_load (fuel : Nat) (step : LowerStep) (sig : CheckEnvironment) (environment : List LowerBinding)
     (specialization : Maybe CoreTerm) (args : List CoreTerm) (expected : LowerType) (state : LowerState)

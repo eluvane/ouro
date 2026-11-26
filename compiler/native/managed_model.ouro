@@ -15,7 +15,8 @@ import "lower.ouro",
   "lower_loop.ouro",
   "lower_constants.ouro",
   "lower_types.ouro",
-  "../primitive_roles.ouro";
+  "../primitive_roles.ouro",
+  "origin_model.ouro";
 
 -- Construction is a distinct stage, not evidence of MIR acceptance. The
 -- managed source entry validates these parts before returning them.
@@ -26,9 +27,11 @@ inductive ManagedCompiler : Type :=
   | ManagedCompilerOf : CheckedProgram -> List Nat -> Nat -> Nat -> Nat -> Nat -> Nat -> Nat
       -> List LowerContract -> CheckEnvironment -> ManagedCompiler;
 
--- Fresh symbol, generated functions/data, pending/known globals, current flow.
+-- Fresh symbol, generated functions/data, pending/known globals, current flow,
+-- and optional source parentage.
 inductive ManagedState : Type :=
-  | ManagedStateOf : Nat -> List MirFunction -> List MirData -> List Nat -> List Nat -> LowerState -> ManagedState;
+  | ManagedStateOf : Nat -> List MirFunction -> List MirData -> List Nat -> List Nat -> LowerState
+      -> NativeOriginCapture -> ManagedState;
 
 inductive ManagedResult : Type :=
   | ManagedResultOf : MirValue -> ManagedState -> ManagedResult;
@@ -64,17 +67,94 @@ def managed_compiler_with_raw (compiler : ManagedCompiler) (contracts : List Low
     match compiler with | ManagedCompilerOf program types allocator collector release inspect exit base _ environment =>
       ManagedCompilerOf program types allocator collector release inspect exit base contracts environment end;
 
-def managed_source_symbol (program : CheckedProgram) (name : List Nat) : Either NativeLowerError Nat :=
+def managed_source_module_prefix : List Nat := [95,111,117,114,111,95,109,95];
+
+-- Module envelopes select ordinary definitions. They do not prove source ownership.
+def managed_source_spelling (requested : List Nat) (spelling : List Nat) : Bool :=
+    match source_bytes_equal requested spelling with
+    | True => True
+    | False =>
+        match source_starts managed_source_module_prefix spelling with
+        | False => False
+        | True => match source_drop_prefix managed_source_module_prefix spelling with
+          | Nil => False
+          | Cons first rest => match eqNat first 48 with
+            | True => match rest with
+              | Nil => False
+              | Cons separator tail => andb(eqNat separator 95, source_bytes_equal requested tail)
+              end
+            | False => match source_is_digit first with
+              | False => False
+              | True => (fix digits (remaining : List Nat) : Bool :=
+                  match remaining with
+                  | Nil => False
+                  | Cons digit tail => match eqNat digit 95 with
+                    | True => source_bytes_equal requested tail
+                    | False => match source_is_digit digit with
+                      | False => False
+                      | True => digits tail
+                      end
+                    end
+                  end) rest
+              end
+            end
+          end
+        end
+    end;
+
+-- The derived index filters candidates. Ordered tables establish uniqueness.
+def managed_source_symbol_using (program : CheckedProgram) (environment : CheckEnvironment)
+    (name : List Nat) : Either NativeLowerError Nat :=
     match checked_program_intern program with | MkIntern names _ _ _ =>
-      match source_lookup_id names name with | Just id => Right NativeLowerError Nat id
-      | Nothing => Left NativeLowerError Nat (LowerUnknownGlobal 0) end end;
+      (fix scan (remaining : List (Pair (List Nat) Nat)) (selected : Maybe Nat)
+          : Either NativeLowerError Nat :=
+        match remaining with
+        | Nil => match selected with
+          | Nothing => Left NativeLowerError Nat (LowerUnknownGlobal 0)
+          | Just id =>
+              let declarations : List Entry := filter Entry (fun (entry : Entry) =>
+                match entry with
+                | MkEntry candidate _ _ => eqNat candidate id
+                | MkBoundEntry candidate _ _ => eqNat candidate id
+                | MkIndEntry candidate _ => eqNat candidate id
+                | MkRoleEntry _ => False
+                end) (checked_program_entries program) in
+              let spellings : List (Pair (List Nat) Nat) :=
+                filter (Pair (List Nat) Nat) (fun (row : Pair (List Nat) Nat) =>
+                  match row with | MkPair _ candidate => eqNat candidate id end) names in
+              let unique : Bool := if let Cons _ rest := declarations then
+                if let Cons _ more := spellings then
+                  andb(nullb Entry rest, nullb (Pair (List Nat) Nat) more)
+                else False
+              else False in
+              if unique then Right NativeLowerError Nat id
+              else Left NativeLowerError Nat (LowerMetadataMismatch 0)
+          end
+        | Cons row rest => match row with | MkPair spelling id =>
+            match managed_source_spelling name spelling with
+            | False => scan rest selected
+            | True => match check_environment_lookup id environment with
+              | Nothing => scan rest selected
+              | Just _ => match selected with
+                | Nothing => scan rest (Just Nat id)
+                | Just _ => Left NativeLowerError Nat (LowerMetadataMismatch 0)
+                end
+              end
+            end
+          end
+        end) names (Nothing Nat)
+    end;
+
+def managed_source_symbol (program : CheckedProgram) (name : List Nat) : Either NativeLowerError Nat :=
+    managed_source_symbol_using program
+      (check_environment_from_entries (checked_program_entries program)) name;
 
 -- A runtime spelling selects a candidate definition, never a source primitive.
 -- Require its checked body and complete normalized Core type before linking.
 -- Pointer pointees and Runtime/Bool identities are part of this comparison.
 def managed_runtime_definition (compiler : ManagedCompiler) (fuel : Nat) (name : List Nat)
     (expected : CoreTerm) : Either NativeLowerError Nat :=
-    lower_bind Nat Nat (managed_source_symbol(managed_compiler_program compiler, name)) (fun (id : Nat) =>
+    lower_bind Nat Nat (managed_source_symbol_using(managed_compiler_program compiler, managed_compiler_environment compiler, name)) (fun (id : Nat) =>
       match lower_find_entry(id, managed_compiler_entries compiler) with
       | Nothing => Left NativeLowerError Nat (LowerUnknownGlobal id)
       | Just entry => match entry with
@@ -114,11 +194,22 @@ def managed_bits (typ : MirType) (value : Nat) : MirValue :=
     MirBits(typ, X64Words64(pe_word32 value, codegen_zero));
 
 def managed_flow (state : ManagedState) : LowerState :=
-    match state with | ManagedStateOf _ _ _ _ _ flow => flow end;
+    match state with | ManagedStateOf _ _ _ _ _ flow _ => flow end;
 
 def managed_with_flow (state : ManagedState) (flow : LowerState) : ManagedState :=
-    match state with | ManagedStateOf symbol functions data pending known _ =>
-      ManagedStateOf symbol functions data pending known flow end;
+    match state with | ManagedStateOf symbol functions data pending known _ origins =>
+      ManagedStateOf symbol functions data pending known flow origins end;
+
+def managed_origins (state : ManagedState) : NativeOriginCapture :=
+    match state with | ManagedStateOf _ _ _ _ _ _ origins => origins end;
+
+def managed_with_origin_parent (state : ManagedState) (parent : Maybe Nat) : ManagedState :=
+    match state with | ManagedStateOf symbol functions data pending known flow origins =>
+      match origins with
+      | NativeOriginsDisabled => state
+      | NativeOriginsEnabled _ rows =>
+          ManagedStateOf symbol functions data pending known flow (NativeOriginsEnabled parent rows)
+      end end;
 
 def managed_emit (instruction : MirInstruction) (state : ManagedState) : ManagedState :=
     managed_with_flow(state, lower_emit(instruction, managed_flow state));
@@ -160,24 +251,26 @@ def managed_convert (typ : MirType) (operation : MirConversion) (value : MirValu
     : Either NativeLowerError ManagedResult :=
     managed_fresh typ (fun (local : Nat) => MirConvert local operation value) state;
 
+-- Keep generated symbol IDs packed for repeated MIR lookup.
 def managed_fresh_symbol (state : ManagedState) : Either NativeLowerError (Pair Nat ManagedState) :=
-    match state with | ManagedStateOf symbol functions data pending known flow =>
+    match state with | ManagedStateOf symbol functions data pending known flow origins =>
       lower_map Unit (Pair Nat ManagedState) (fun (_ : Unit) => MkPair Nat ManagedState symbol
-        (ManagedStateOf (S symbol) functions data pending known flow))
+        (ManagedStateOf (add symbol 1) functions data pending known flow origins))
         (lower_require(ltb_nat symbol pe_max_rva, LowerResourceExhausted)) end;
 
 def managed_request_global (id : Nat) (state : ManagedState) : ManagedState :=
-    match state with | ManagedStateOf symbol functions data pending known flow =>
+    match state with | ManagedStateOf symbol functions data pending known flow origins =>
       match mir_has id known with | True => state | False =>
-        ManagedStateOf symbol functions data (Cons Nat id pending) (Cons Nat id known) flow end end;
+        ManagedStateOf symbol functions data (Cons Nat id pending) (Cons Nat id known) flow origins end end;
 
 def managed_add_function (function : MirFunction) (state : ManagedState) : ManagedState :=
-    match state with | ManagedStateOf symbol functions data pending known flow =>
-      ManagedStateOf symbol (Cons MirFunction function functions) data pending known flow end;
+    match state with | ManagedStateOf symbol functions data pending known flow origins =>
+      ManagedStateOf symbol (Cons MirFunction function functions) data pending known flow
+        (native_origins_record (mir_function_id function) origins) end;
 
 def managed_add_data (object : MirData) (state : ManagedState) : ManagedState :=
-    match state with | ManagedStateOf symbol functions data pending known flow =>
-      ManagedStateOf symbol functions (Cons MirData object data) pending known flow end;
+    match state with | ManagedStateOf symbol functions data pending known flow origins =>
+      ManagedStateOf symbol functions (Cons MirData object data) pending known flow origins end;
 
 def managed_finish_function (id : Nat) (name : List Nat) (arguments : List MirLocal)
     (value : MirValue) (state : ManagedState) : MirFunction :=

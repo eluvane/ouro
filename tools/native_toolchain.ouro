@@ -1,0 +1,377 @@
+-- Fixed-input native successor builds. No seed promotion or hosted fallback.
+import "native_toolchain_model.ouro",
+  "native_cli_args.ouro",
+  "native_build_output.ouro",
+  "collect_core.ouro",
+  "../std/fs_bounded.ouro",
+  "../std/fs_create.ouro",
+  "../std/executable.ouro",
+  "../std/pathx.ouro",
+  "../std/process.ouro";
+
+def native_toolchain_ok (A : Type) (value : A) : IO (Either NativeToolchainError A) :=
+    io_pure(Either NativeToolchainError A, Right NativeToolchainError A value);
+def native_toolchain_fail (A : Type) (error : NativeToolchainError) : IO (Either NativeToolchainError A) :=
+    io_pure(Either NativeToolchainError A, Left NativeToolchainError A error);
+
+def native_toolchain_join (directory : String) (relative : String) : String :=
+    let suffix : String := str_replace relative "/" "\\" in
+    if orb (str_ends directory "\\") (str_ends directory "/") then str_concat directory suffix
+    else str_cat3 directory "\\" suffix;
+
+def native_toolchain_read (cap : Nat) (path : String) : IO (Either NativeToolchainError String) :=
+    match! fs_read_bounded_checked cap path with
+    | Left error => native_toolchain_fail String (ToolchainReadError path error)
+    | Right text => native_toolchain_ok String text
+    end;
+
+def native_toolchain_write (path : String) (text : String) : IO (Either NativeToolchainError Unit) :=
+    match! native_build_publish_checked path text with
+    | Left error => native_toolchain_fail Unit (ToolchainWriteError path error)
+    | Right _ => native_toolchain_ok Unit MkUnit
+    end;
+
+def native_toolchain_source_path (directory : String) (relative : String) : IO (Either FsError String) :=
+    let path : String := native_toolchain_join directory relative in
+    (if native_toolchain_relative_unit relative then
+      let parent_name : String := native_build_dirname relative in
+      let requested : String := if str_eq parent_name "." then directory
+        else native_toolchain_join directory parent_name in
+      do let! parent := prim_fs_realpath requested;
+         if str_null parent then
+           io_pure(Either FsError String, Left FsError String
+             (FsOperationFailed "resolve source parent" path))
+         else
+           if native_toolchain_parent_inside directory parent then
+             io_pure(Either FsError String, Right FsError String
+               (native_toolchain_join parent (path_basename relative)))
+           else
+             io_pure(Either FsError String, Left FsError String
+               (FsOperationFailed "source parent outside declared root" path))
+    else
+      io_pure(Either FsError String, Left FsError String
+        (FsOperationFailed "rebuild source escapes declared root" relative)));
+
+def native_toolchain_root_read (directory : String) (cap : Nat) (relative : String)
+    : IO (Either NativeToolchainError String) :=
+    match! native_toolchain_source_path directory relative with
+    | Left error => native_toolchain_fail String (ToolchainInputError (fs_error_message error))
+    | Right path => native_toolchain_read cap path
+    end;
+
+def native_toolchain_discovery_reader (directory : String) (cap : Nat) (relative : String)
+    : IO (Either CollectReadError String) :=
+    (if native_toolchain_relative_unit relative then
+      let path : String := native_toolchain_join directory relative in
+      do let! exists := fs_exists path;
+         if exists then
+           match! native_toolchain_source_path directory relative with
+           | Left error => io_pure(Either CollectReadError String, Left CollectReadError String (CollectReadFailure error))
+           | Right physical =>
+               do let! loaded := fs_read_bounded_checked cap physical;
+                  io_pure (Either CollectReadError String)
+                    (match loaded with
+                     | Left error => Left CollectReadError String
+                         (CollectReadFailure (FsOperationFailed (fs_bounded_read_error_message error) path))
+                     | Right text => Right CollectReadError String text end)
+           end
+         else
+           io_pure(Either CollectReadError String, Left CollectReadError String CollectMissing)
+    else
+      io_pure(Either CollectReadError String, Left CollectReadError String
+        (CollectReadFailure (FsOperationFailed "rebuild source escapes declared root" relative))));
+
+def native_toolchain_collect (directory : String) (cap : Nat) : IO (Either NativeToolchainError (List String)) :=
+    match! collect_walk_with_reader (native_toolchain_discovery_reader directory cap)
+      collect_fuel (Nil String) (Nil String) native_toolchain_root with
+    | ColErr error => native_toolchain_fail (List String) (ToolchainInputError error)
+    | ColOk units => if native_toolchain_inventory units then
+        native_toolchain_ok (List String) units
+      else
+        native_toolchain_fail (List String) (ToolchainInputError "invalid root-inclusive source inventory")
+    end;
+
+def native_toolchain_captured_reader (files : List (Pair String String)) (path : String)
+    : IO (Either CollectReadError String) :=
+    (fix find (rows : List (Pair String String)) : IO (Either CollectReadError String) :=
+      match rows with
+      | Nil => io_pure(Either CollectReadError String, Left CollectReadError String CollectMissing)
+      | Cons row rest => let (MkPair name source) := row in
+        if prim_string_eq path name then
+          io_pure(Either CollectReadError String, Right CollectReadError String source)
+        else find rest
+      end) files;
+
+def native_toolchain_validate_capture (units : List String) (files : List (Pair String String))
+    : IO (Either NativeToolchainError Unit) :=
+    match! collect_walk_with_reader (native_toolchain_captured_reader files)
+      collect_fuel (Nil String) (Nil String) native_toolchain_root with
+    | ColErr error => native_toolchain_fail Unit (ToolchainInputError error)
+    | ColOk actual => if native_toolchain_paths_equal units actual then
+        native_toolchain_ok Unit MkUnit
+      else
+        native_toolchain_fail Unit (ToolchainInputError "source graph changed during capture")
+    end;
+
+def native_toolchain_capture (directory : String) (cap : Nat) (units : List String)
+    : IO (Either NativeToolchainError (List (Pair String String))) :=
+  (fix capture (paths : List String) (remaining : Nat)
+      : IO (Either NativeToolchainError (List (Pair String String))) :=
+    match paths with
+    | Nil => native_toolchain_ok (List (Pair String String)) (Nil (Pair String String))
+    | Cons path rest =>
+        match! native_toolchain_root_read directory remaining path with
+        | Left error => native_toolchain_fail (List (Pair String String)) error
+        | Right text =>
+            match! capture rest (sub remaining (str_len text)) with
+            | Left error => native_toolchain_fail (List (Pair String String)) error
+            | Right rows => native_toolchain_ok (List (Pair String String))
+                (Cons (Pair String String) (MkPair String String path text) rows)
+            end
+        end
+    end) units cap;
+
+def native_toolchain_copy (directory : String) : List (Pair String String) ->
+    IO (Either NativeToolchainError Unit) :=
+  fix copy (files : List (Pair String String)) : IO (Either NativeToolchainError Unit) :=
+    match files with
+    | Nil => native_toolchain_ok Unit MkUnit
+    | Cons file rest => let (MkPair path text) := file in
+      match! native_toolchain_write (native_toolchain_join directory path) text with
+      | Left error => native_toolchain_fail Unit error
+      | Right _ => copy rest
+      end
+    end;
+
+def native_toolchain_verify (directory : String) : List (Pair String String) ->
+    IO (Either NativeToolchainError Unit) :=
+  fix verify (files : List (Pair String String)) : IO (Either NativeToolchainError Unit) :=
+    match files with
+    | Nil => native_toolchain_ok Unit MkUnit
+    | Cons file rest => let (MkPair path expected) := file in
+      match! native_toolchain_root_read directory (str_len expected) path with
+      | Left error => native_toolchain_fail Unit error
+      | Right actual => if prim_string_eq actual expected then verify rest
+        else native_toolchain_fail Unit (ToolchainInputError (str_concat "changed file: " path))
+      end
+    end;
+
+def native_toolchain_verify_pair (original : String) (snapshot : String) (files : List (Pair String String))
+    : IO (Either NativeToolchainError Unit) :=
+    match! native_toolchain_verify original files with
+    | Left error => native_toolchain_fail Unit error
+    | Right _ => native_toolchain_verify snapshot files
+    end;
+
+def native_toolchain_image (policy : NativeToolchainPolicy) (path : String)
+    : IO (Either NativeToolchainError String) :=
+    match! native_toolchain_read (native_toolchain_image_cap policy) path with
+    | Left error => native_toolchain_fail String error
+    | Right image => if
+        andb (native_toolchain_unsigned_image image) (native_toolchain_os_imports image) then
+        native_toolchain_ok String image
+      else native_toolchain_fail String (ToolchainImageError path)
+    end;
+
+private def native_toolchain_write_log (stage : String) (path : String) (result : ProcResult)
+    (text : String) : IO (Either NativeToolchainError Unit) :=
+    match! native_build_publish_checked path text with
+    | Left error => native_toolchain_fail Unit (ToolchainLogError stage path result error)
+    | Right _ => native_toolchain_ok Unit MkUnit
+    end;
+
+def native_toolchain_child (policy : NativeToolchainPolicy) (stage : String) (logs : String)
+    (directory : String) (producer : String) (output : String) (units : List String)
+    : IO (Either NativeToolchainError Unit) :=
+    let command : CommandSpec := command_spec producer (native_toolchain_stage_args output units) in
+    match! process_run_spec_captured_bounded_at
+      (native_toolchain_child_limits policy) directory command with
+    | Left error => native_toolchain_fail Unit (ToolchainProcessError stage error)
+    | Right reply =>
+        let result : ProcResult := process_capture_proc_result reply in
+        let stdout_path : String := native_toolchain_join logs (str_concat stage ".stdout") in
+        let stderr_path : String := native_toolchain_join logs (str_concat stage ".stderr") in
+        match! native_toolchain_write_log stage stdout_path result (proc_stdout result) with
+        | Left error => native_toolchain_fail Unit error
+        | Right _ =>
+            match! native_toolchain_write_log stage stderr_path result (proc_stderr result) with
+            | Left error => native_toolchain_fail Unit error
+            | Right _ => io_pure (Either NativeToolchainError Unit)
+                (native_toolchain_stage_result stage output result)
+            end
+        end
+    end;
+
+def native_toolchain_stage (policy : NativeToolchainPolicy) (stage : String) (logs : String)
+    (original : String) (snapshot : String) (files : List (Pair String String)) (units : List String)
+    (producer : String) (producer_image : String) (output : String)
+    : IO (Either NativeToolchainError String) :=
+    match! native_toolchain_verify_pair original snapshot files with
+    | Left error => native_toolchain_fail String error
+    | Right _ =>
+        match! native_toolchain_image policy producer with
+        | Left error => native_toolchain_fail String error
+        | Right current => if prim_string_eq current producer_image then
+            match! native_toolchain_child policy stage logs snapshot producer output units with
+            | Left error => native_toolchain_fail String error
+            | Right _ =>
+                match! native_toolchain_verify_pair original snapshot files with
+                | Left error => native_toolchain_fail String error
+                | Right _ =>
+                    match! native_toolchain_image policy producer with
+                    | Left error => native_toolchain_fail String error
+                    | Right retained => if
+                        prim_string_eq retained producer_image then
+                        native_toolchain_image policy output
+                      else
+                        native_toolchain_fail String (ToolchainInputError "producer changed during stage")
+                    end
+                end
+            end
+          else
+            native_toolchain_fail String (ToolchainInputError "producer changed before stage")
+        end
+    end;
+
+def native_toolchain_stages (policy : NativeToolchainPolicy) (original : String) (snapshot : String)
+    (output : String) (files : List (Pair String String)) (units : List String) (seed : String)
+    : IO (Either NativeToolchainError Unit) :=
+    let n2 : String := native_toolchain_join output "N2.exe" in
+    let n3 : String := native_toolchain_join output "N3.exe" in
+    match! native_toolchain_image policy seed with
+    | Left error => native_toolchain_fail Unit error
+    | Right n1_image =>
+        match!
+          native_toolchain_stage policy "N2" output original snapshot files units seed n1_image n2 with
+        | Left error => native_toolchain_fail Unit error
+        | Right n2_image =>
+            match!
+              native_toolchain_stage policy "N3" output original snapshot files units n2 n2_image n3 with
+            | Left error => native_toolchain_fail Unit error
+            | Right n3_image => if native_toolchain_compare n2_image n3_image then
+                native_toolchain_ok Unit MkUnit
+              else native_toolchain_fail Unit ToolchainImageMismatch
+            end
+        end
+    end;
+
+def native_toolchain_policy_text (policy : NativeToolchainPolicy) : String :=
+    let (ProcessCaptureLimitsOf timeout memory cpu stdout stderr) := native_toolchain_child_limits policy in
+    str_join "\n" ["native rebuild compare-only; no seed promotion",
+      str_concat "root=" native_toolchain_root,
+      str_concat "target=" native_build_default_target,
+      str_concat "entry=" native_build_default_entry,
+      str_concat "fuel=" (str_of_nat native_build_default_fuel),
+      str_concat "source_total_bytes=" (str_of_nat (native_toolchain_source_cap policy)),
+      str_concat "complete_image_bytes=" (str_of_nat (native_toolchain_image_cap policy)),
+      str_concat "per_stage_timeout_ms=" (str_of_nat timeout),
+      str_concat "per_child_memory_mib=" (str_of_nat memory),
+      str_concat "per_child_cpu_count=" (str_of_nat cpu),
+      str_concat "stdout_bytes=" (str_of_nat stdout),
+      str_concat "stderr_bytes=" (str_of_nat stderr), ""];
+
+def native_toolchain_prepare (policy : NativeToolchainPolicy) (original : String) (output : String)
+    (seed : String) (units : List String) (files : List (Pair String String))
+    : IO (Either NativeToolchainError Unit) :=
+    match! fs_create_dir_exclusive_checked output with
+    | Left error => native_toolchain_fail Unit (ToolchainCreateError output error)
+    | Right _ =>
+        do let! owned := prim_fs_realpath output;
+           if str_null owned then
+             native_toolchain_fail Unit (ToolchainInputError "cannot resolve created output directory")
+           else
+             let snapshot : String := native_toolchain_join owned "source" in
+             match! fs_create_dir_exclusive_checked snapshot with
+             | Left error => native_toolchain_fail Unit (ToolchainCreateError snapshot error)
+             | Right _ =>
+                 match! native_toolchain_copy snapshot files with
+                 | Left error => native_toolchain_fail Unit error
+                 | Right _ =>
+                     match! native_toolchain_write
+                       (native_toolchain_join owned "rebuild.sources") (str_unlines units) with
+                     | Left error => native_toolchain_fail Unit error
+                     | Right _ =>
+                         match! native_toolchain_write
+                           (native_toolchain_join owned "rebuild.policy") (native_toolchain_policy_text policy) with
+                         | Left error => native_toolchain_fail Unit error
+                         | Right _ => native_toolchain_stages policy original snapshot owned files units seed
+                         end
+                     end
+                 end
+             end
+    end;
+
+def native_toolchain_rebuild (policy : NativeToolchainPolicy) (request : NativeToolchainRequest)
+    (seed : String) : IO (Either NativeToolchainError Unit) :=
+    let (NativeToolchainRequestOf source destination) := request in
+    match native_toolchain_request_checked source destination with
+    | Left error => native_toolchain_fail Unit error
+    | Right _ => do let! original := prim_fs_realpath source;
+       let! parent := prim_fs_realpath (native_build_dirname destination);
+       if orb (str_null original) (str_null parent) then
+         native_toolchain_fail Unit (ToolchainInputError "cannot resolve source or output parent")
+       else
+         let output : String := native_toolchain_join parent (path_basename destination) in
+         match! native_toolchain_collect original (native_toolchain_source_cap policy) with
+         | Left error => native_toolchain_fail Unit error
+         | Right units =>
+             match! native_toolchain_capture original (native_toolchain_source_cap policy)
+               (Cons String "Ouro.seal" units) with
+             | Left error => native_toolchain_fail Unit error
+             | Right files =>
+                 match! native_toolchain_validate_capture units files with
+                 | Left error => native_toolchain_fail Unit error
+                 | Right _ => native_toolchain_prepare policy original output seed units files
+                 end
+             end
+         end
+    end;
+
+private def native_toolchain_print_streams (output : String) (errors : String) : IO Unit :=
+    do eprint output;
+       eprint errors
+
+def native_toolchain_die (status : Nat) (error : NativeToolchainError) : IO Unit :=
+    do eprintln (str_concat "toolchain: " (native_toolchain_error_message error));
+       match error with
+       | ToolchainStageExit _ _ output errors => native_toolchain_print_streams output errors
+       | ToolchainStageProtocol _ output errors => native_toolchain_print_streams output errors
+       | ToolchainArgumentError _ => eprintln native_toolchain_usage
+       | ToolchainInputError _ => io_unit
+       | ToolchainReadError _ _ => io_unit
+       | ToolchainWriteError _ _ => io_unit
+       | ToolchainCreateError _ _ => io_unit
+       | ToolchainImagePathError _ => io_unit
+       | ToolchainProcessError _ cause => match native_toolchain_process_streams cause with
+         | Nothing => io_unit
+         | Just streams => match streams with | MkPair output errors => native_toolchain_print_streams output errors end
+         end
+       | ToolchainLogError _ _ result _ => native_toolchain_print_streams (proc_stdout result) (proc_stderr result)
+       | ToolchainImageError _ => io_unit
+       | ToolchainImageMismatch => io_unit
+       end;
+       exit status;
+
+-- @entry main
+def main : IO Unit :=
+    match! argv with
+    | Nil => native_toolchain_die 2 (ToolchainArgumentError "missing rebuild")
+    | Cons _ words => match native_toolchain_parse words with
+      | Left error => native_toolchain_die 2 error
+      | Right request =>
+          match! native_cli_read_test_hosted_override with
+          | Just name => native_toolchain_die 1 (ToolchainInputError (str_concat "hosted override refused: " name))
+          | Nothing =>
+              do let! located := executable_path_checked;
+                 match native_sibling_command_checked located native_toolchain_seed (Nil String) with
+                 | Left error => native_toolchain_die 1 (ToolchainImagePathError error)
+                 | Right command =>
+                     match!
+                       native_toolchain_rebuild native_toolchain_policy request (command_program command) with
+                     | Left error => native_toolchain_die 1 error
+                     | Right _ => println "NATIVE_REBUILD_COMPARE_OK"
+                     end
+                 end
+          end
+      end
+    end;

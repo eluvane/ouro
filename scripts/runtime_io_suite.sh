@@ -12,11 +12,20 @@ mkdir -p "$OUT"
 CC_BIN="${CC:-cc}"
 command -v "$CC_BIN" >/dev/null 2>&1 || CC_BIN=gcc
 if ! command -v "$CC_BIN" >/dev/null 2>&1; then
+	if [ "${OURO_CI_GATE_NAME:-}" = runtime-io ]; then
+		echo "RUNTIME_IO_SUITE: FAIL no system C compiler" >&2
+		exit 127
+	fi
 	echo "RUNTIME_IO_SUITE: SKIP no system C compiler" >&2
 	exit 0
 fi
 
-IO_SELFTEST="$OUT/ouro-io-selftest"
+"$PYTHON" scripts/fs_read_suite_test.py
+STDIN_OUT=$(mktemp -d "$OUT/stdin-bytes.XXXXXX")
+IO_SELFTEST="$STDIN_OUT/ouro-io-selftest"
+STDIN_INPUTS="$STDIN_OUT/inputs.json"
+CC_BIN=$("$PYTHON" scripts/fs_read_suite.py --mode stdin --record-inputs \
+	--producer "$CC_BIN" --driver "$IO_SELFTEST" --inputs "$STDIN_INPUTS" --out "$STDIN_OUT")
 if ! "$CC_BIN" -O1 -std=c99 -D_POSIX_C_SOURCE=200809L \
 	-Werror=implicit-function-declaration -I "$ROOT/runtime" \
 	-o "$IO_SELFTEST" "$ROOT/runtime/ouro_rt.c" \
@@ -29,7 +38,22 @@ fi
 if [ -f "$IO_SELFTEST.exe" ]; then
 	IO_SELFTEST="$IO_SELFTEST.exe"
 fi
-if ! "$IO_SELFTEST" >"$OUT/io-selftest.out" 2>"$OUT/io-selftest.err"; then
+"$PYTHON" scripts/fs_read_suite.py --mode stdin --producer "$CC_BIN" \
+	--driver "$IO_SELFTEST" --inputs "$STDIN_INPUTS" --out "$STDIN_OUT"
+if ! "$PYTHON" -c '
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+
+program = Path(sys.argv[1]).resolve()
+with tempfile.TemporaryDirectory(prefix="ouro-io-selftest-") as directory:
+    streams = subprocess.run([str(program), "--text-stream-child"], cwd=directory,
+                             capture_output=True, timeout=10)
+    if (streams.returncode, streams.stdout, streams.stderr) != (0, b"capture-out", b"capture-err"):
+        raise SystemExit("OURO_IO_SELFTEST: FAIL text streams changed bytes or exit status")
+    raise SystemExit(subprocess.run([str(program)], cwd=directory).returncode)
+' "$IO_SELFTEST" >"$OUT/io-selftest.out" 2>"$OUT/io-selftest.err"; then
 	cat "$OUT/io-selftest.out" >&2
 	cat "$OUT/io-selftest.err" >&2
 	echo "RUNTIME_IO_SUITE: FAIL C IO self-test run" >&2
@@ -41,15 +65,22 @@ if ! grep -q 'OURO_IO_SELFTEST: PASS' "$OUT/io-selftest.out"; then
 	exit 1
 fi
 echo "RUNTIME_IO_C_SELFTEST: PASS"
+"$PYTHON" scripts/fs_write_suite_test.py
+WRITE_OUT=$(mktemp -d "$OUT/source-writing.XXXXXX")
+"$PYTHON" scripts/fs_write_suite.py --producer "$CC_BIN" --out "$WRITE_OUT"
 "$PYTHON" scripts/fs_replace_suite.py --driver "$IO_SELFTEST" --out "$OUT/source-replacement"
 "$PYTHON" scripts/fs_read_suite.py --driver "$IO_SELFTEST" --mode raw --out "$OUT/source-reading"
+"$PYTHON" scripts/fs_read_suite.py --driver "$IO_SELFTEST" --mode status --out "$OUT/source-reading-status"
 
 SUITE="$OUT/ouro-test-suite"
 OURO_TEST_CHECK="$ROOT/scripts/ouro1.sh"
 OURO_TEST_BUILD="$ROOT/scripts/build_tool.sh"
 OURO_HOSTED_COMPILER_WRAPPER="$OURO_TEST_CHECK"
 export OURO_TEST_CHECK OURO_TEST_BUILD OURO_HOSTED_COMPILER_WRAPPER
-if ! sh "$ROOT/scripts/build_tool.sh" tools/test/main.ouro "$SUITE" >"$OUT/suite.build" 2>&1; then
+if [ "${OURO_CI_PREPARED_TEST:-}" = 1 ]; then
+	"$PYTHON" "$ROOT/scripts/compiler_shards.py" --runner "$SUITE" \
+		--verify-with "${OURO_C_BUILD_DIR:-_build/c}/ouro1"
+elif ! sh "$ROOT/scripts/build_tool.sh" tools/test/main.ouro "$SUITE" >"$OUT/suite.build" 2>&1; then
 	echo "RUNTIME_IO_SUITE: FAIL native suite build" >&2
 	tail -n 20 "$OUT/suite.build" >&2
 	exit 1
@@ -58,7 +89,7 @@ fi
 OURO_TEST_SUITE_DISPLAY_OUT="$OUT"
 MSYS2_ENV_CONV_EXCL="${MSYS2_ENV_CONV_EXCL:+$MSYS2_ENV_CONV_EXCL;}OURO_TEST_SUITE_DISPLAY_OUT"
 export OURO_TEST_SUITE_DISPLAY_OUT MSYS2_ENV_CONV_EXCL
-FIXTURES=$("$PYTHON" scripts/ouro_smith.py prepare --group runtime --out "$OUT/inputs")
+FIXTURES=$("$PYTHON" scripts/ouro_smith.py prepare --group runtime --out "$OUT/inputs" --stable)
 "$SUITE" --native-suite=runtime-io "--out=$OUT" "--fixtures=$FIXTURES" "$@" || exit $?
 "$PYTHON" scripts/ouro_smith.py replay --layer surface --seed 1 \
 	--case surface-1-runtime_io --out "$OUT/smith-io"

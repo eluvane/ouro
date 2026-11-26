@@ -126,7 +126,7 @@ fi
 	exit 1
 }
 
-# The native build driver owns content keys, common runtime objects and atomic
-# binary/source-manifest publication. Host-wrapper mode remains explicit above.
+# The native build driver owns content keys and shared runtime objects.
+# It replaces the binary and source manifest with separate atomic writes.
 exec "$PY" "$ROOT/scripts/native_tool_build.py" "$ENTRY" "$OUT" \
 	--compiler "$OURO1" --fuel "$FUEL"

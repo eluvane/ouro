@@ -15,7 +15,7 @@ import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Mapping, Optional, Sequence
+from typing import Mapping, Optional, Sequence, cast
 
 ENV_KEYS = frozenset({"PATH", "PATHEXT", "SYSTEMROOT", "WINDIR", "COMSPEC", "TEMP", "TMP", "TMPDIR"})
 
@@ -50,6 +50,17 @@ class RunResult:
         return "nonzero"
 
 
+@dataclass
+class RunBytesResult:
+    status: str
+    returncode: Optional[int]
+    stdout: bytes
+    stderr: bytes
+    elapsed_s: float
+    peak_rss_mb: float
+    argv: list[str] = field(default_factory=list)
+
+
 def kill_tree(proc: subprocess.Popen) -> None:
     if os.name == "nt":
         if proc.poll() is None:
@@ -65,11 +76,11 @@ def kill_tree(proc: subprocess.Popen) -> None:
         proc.kill()
 
 
-def run_limited(
+def _run_limited(
     argv: Sequence[str], *, timeout_s: float, memory_mb: int,
     cwd: Optional[Path] = None, env: Optional[Mapping[str, str]] = None,
-    stdin_text: Optional[str] = None,
-) -> RunResult:
+    stdin_text: Optional[str] = None, raw: bool = False, shared_job: Optional[str] = None,
+) -> RunResult | RunBytesResult:
     if not argv or not math.isfinite(timeout_s) or timeout_s <= 0 or memory_mb <= 0:
         raise ValueError("command, positive finite timeout, and positive memory limit are required")
     started = time.perf_counter()
@@ -78,12 +89,15 @@ def run_limited(
     proc = None
     peak_mb = 0.0
     status = "ok"
+    result_type = RunBytesResult if raw else RunResult
     child_env = clean_env() if env is None else dict(env)
     executable = shutil.which(argv[0], path=child_env.get("PATH"))
     if executable is None and Path(argv[0]).is_file():
         executable = str(Path(argv[0]).resolve())
     if executable is None:
-        return RunResult("spawn-error", None, "", f"executable not found: {argv[0]}", 0.0, 0.0, argv)
+        message = f"executable not found: {argv[0]}"
+        return result_type("spawn-error", None, b"" if raw else "",
+                           message.encode("utf-8") if raw else message, 0.0, 0.0, argv)
     command = [executable, *argv[1:]]
     try:
         options = {}
@@ -100,7 +114,8 @@ def run_limited(
         # trusted stdlib-only launcher must not acquire that extra lifetime;
         # OuroSmith's job owns the command and all of its descendants.
         interpreter = getattr(sys, "_base_executable", sys.executable) if os.name == "nt" else sys.executable
-        launcher = [interpreter, str(Path(__file__).with_name("exec_child.py")), limit, *command]
+        shared_args = ["--shared-job", shared_job] if shared_job is not None else []
+        launcher = [interpreter, str(Path(__file__).with_name("exec_child.py")), *shared_args, limit, *command]
         proc = subprocess.Popen(launcher, cwd=cwd, env=child_env,
                                 stdin=subprocess.PIPE if stdin_text is not None else subprocess.DEVNULL,
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, **options)
@@ -114,6 +129,7 @@ def run_limited(
                 job.terminate()
             kill_tree(proc)
             stdout, stderr = proc.communicate(timeout=10)
+        raw_stdout, raw_stderr = stdout, stderr
         stdout = stdout.decode("utf-8", errors="replace").replace("\r\n", "\n")
         stderr = stderr.decode("utf-8", errors="replace").replace("\r\n", "\n")
         if job:
@@ -124,12 +140,34 @@ def run_limited(
             status = "memory"
         if stderr.startswith("OURO_SMITH_LIMIT_SETUP:"):
             status = "spawn-error"
-        return RunResult(status, proc.returncode, stdout, stderr, time.perf_counter() - started, peak_mb, argv)
+        return result_type(status, proc.returncode, raw_stdout if raw else stdout,
+                           raw_stderr if raw else stderr, time.perf_counter() - started, peak_mb, argv)
     except OSError as exc:
-        return RunResult("spawn-error", None, "", str(exc), time.perf_counter() - started, peak_mb, argv)
+        message = str(exc)
+        return result_type("spawn-error", None, b"" if raw else "",
+                           message.encode("utf-8") if raw else message,
+                           time.perf_counter() - started, peak_mb, argv)
     finally:
         if job:
             job.close()
         if proc:
             kill_tree(proc)
             proc.wait(timeout=10)
+
+
+def run_limited(
+    argv: Sequence[str], *, timeout_s: float, memory_mb: int,
+    cwd: Optional[Path] = None, env: Optional[Mapping[str, str]] = None,
+    stdin_text: Optional[str] = None, shared_job: Optional[str] = None,
+) -> RunResult:
+    return cast("RunResult", _run_limited(argv, timeout_s=timeout_s, memory_mb=memory_mb,
+                                     cwd=cwd, env=env, stdin_text=stdin_text, shared_job=shared_job))
+
+
+def run_limited_bytes(
+    argv: Sequence[str], *, timeout_s: float, memory_mb: int,
+    cwd: Optional[Path] = None, env: Optional[Mapping[str, str]] = None,
+    stdin_text: Optional[str] = None,
+) -> RunBytesResult:
+    return cast("RunBytesResult", _run_limited(argv, timeout_s=timeout_s, memory_mb=memory_mb,
+                                          cwd=cwd, env=env, stdin_text=stdin_text, raw=True))

@@ -1,0 +1,211 @@
+-- Native Windows transport controls use a test child, never a public seed override.
+import "analyze/precision/assertions.ouro",
+  "native_pe_inspect_fixtures.ouro",
+  "../tools/native_toolchain_model.ouro",
+  "../tools/collect_core.ouro",
+  "../std/fs_create.ouro";
+import "../tools/native_toolchain.ouro" as Stage exposing
+  (native_toolchain_join, native_toolchain_write, native_toolchain_copy,
+   native_toolchain_collect, native_toolchain_capture, native_toolchain_validate_capture,
+   native_toolchain_verify_pair, native_toolchain_image, native_toolchain_child,
+   native_toolchain_stage, native_toolchain_prepare);
+import "native_managed/toolchain_protocol_child.ouro" as Child exposing
+  (toolchain_protocol_units, toolchain_protocol_binary);
+
+def toolchain_io_fail (message : String) : IO Unit :=
+    do eprintln (str_concat "toolchain-fixture: " message); exit 91;
+
+def toolchain_io_setup (result : Either NativeToolchainError Unit) : IO Unit :=
+    match result with
+    | Left error => toolchain_io_fail (native_toolchain_error_message error)
+    | Right _ => io_unit end;
+
+def toolchain_io_create (path : String) : IO Unit :=
+    do let! created := fs_create_dir_exclusive_checked path;
+       match created with
+       | Left error => toolchain_io_fail (fs_create_dir_error_message error)
+       | Right _ => io_unit end;
+
+def toolchain_io_kind (error : NativeToolchainError) : String :=
+    match error with
+    | ToolchainArgumentError _ => "arguments"
+    | ToolchainInputError message => str_concat "input:" message
+    | ToolchainReadError _ cause => str_concat "read:" (fs_bounded_read_error_code cause)
+    | ToolchainWriteError _ _ => "write"
+    | ToolchainCreateError _ cause => str_concat "create:" (fs_create_dir_error_code cause)
+    | ToolchainImagePathError _ => "image-path"
+    | ToolchainProcessError _ cause => str_concat "process:" (process_directory_error_code cause)
+    | ToolchainStageExit _ _ _ _ => "exit"
+    | ToolchainStageProtocol _ _ _ => "protocol"
+    | ToolchainLogError _ _ _ _ => "log"
+    | ToolchainImageError _ => "image"
+    | ToolchainImageMismatch => "mismatch"
+    end;
+
+def toolchain_io_rejected (A : Type) (result : Either NativeToolchainError A) (expected : String) : Bool :=
+    match result with
+    | Right _ => False | Left error => prim_string_eq (toolchain_io_kind error) expected end;
+
+def toolchain_io_completed (result : Either NativeToolchainError Unit) : Bool :=
+    match result with | Left _ => False | Right _ => True end;
+
+def toolchain_io_files : List (Pair String String) :=
+    [ MkPair String String "Ouro.seal" "seal fixture\n"
+    , MkPair String String "library/雪 space.ouro" "def value : Nat := 1;"
+    , MkPair String String native_toolchain_root "import \"../library/雪 space.ouro\";"
+    ];
+
+def toolchain_io_units : List String := ["library/雪 space.ouro", native_toolchain_root];
+
+def toolchain_io_short_policy (timeout : Nat) (output_cap : Nat) : NativeToolchainPolicy :=
+    NativeToolchainPolicyOf (native_toolchain_source_cap native_toolchain_policy)
+      (native_toolchain_image_cap native_toolchain_policy)
+      (ProcessCaptureLimitsOf timeout (mul 3 (mul 32 32)) 1 output_cap native_sibling_capture_bytes);
+
+def toolchain_io_exit259 (result : Either NativeToolchainError Unit) : Bool :=
+    match result with
+    | Right _ => False
+    | Left error => if let ToolchainStageExit stage code output errors := error then
+        andb (str_eq stage "exit259")
+          (andb (eq_nat code 259) (andb (prim_string_eq output toolchain_protocol_binary)
+            (prim_string_eq errors toolchain_protocol_binary)))
+      else False
+    end;
+
+def toolchain_io_log_error (output : String) (path : String)
+    (result : Either NativeToolchainError Unit) : Bool :=
+    match result with
+    | Right _ => False
+    | Left error => if let ToolchainLogError stage actual process cause := error then
+        andb (str_eq stage "log-failure") (andb (prim_string_eq actual path)
+          (andb (eq_nat (proc_code process) 0)
+            (andb (prim_string_eq (proc_stdout process) (str_concat output "\n"))
+              (andb (str_null (proc_stderr process)) (prim_string_eq (fs_error_message cause) (str_concat "expected file: " path))))))
+      else False
+    end;
+
+def toolchain_io_checks (child : String) (owned : String) (original : String)
+    (snapshot : String) (image : String) : IO Unit :=
+    let output : String := native_toolchain_join owned "output 雪 space.exe" in
+    let call : String -> IO (Either NativeToolchainError Unit) :=
+      fun (mode : String) => native_toolchain_child native_toolchain_policy mode owned snapshot child output
+        (toolchain_protocol_units mode) in
+    let stage : String -> IO (Either NativeToolchainError String) :=
+      fun (mode : String) => native_toolchain_stage native_toolchain_policy mode owned original snapshot
+        toolchain_io_files (toolchain_protocol_units mode) child image
+        (native_toolchain_join owned (str_concat mode ".exe")) in
+    do let! collected := native_toolchain_collect original (native_toolchain_source_cap native_toolchain_policy);
+       let! captured := native_toolchain_capture original (native_toolchain_source_cap native_toolchain_policy)
+         (Cons String "Ouro.seal" toolchain_io_units);
+       let! graph := native_toolchain_validate_capture toolchain_io_units toolchain_io_files;
+       let! changed_graph := native_toolchain_validate_capture toolchain_io_units
+         [MkPair String String native_toolchain_root "def value : Nat := 1;"];
+       let! zero_cap := native_toolchain_capture original 0 ["Ouro.seal"];
+       let! success := stage "success";
+       let! wrong_stdout := call "extra-output";
+       let! wrong_stderr := call "binary-stderr";
+       let! nonzero := call "exit259";
+       let! missing_image := stage "no-image";
+       let! mutated_original := stage "mutate-original";
+       let! restore_original := native_toolchain_write (native_toolchain_join original "Ouro.seal") "seal fixture\n";
+       toolchain_io_setup restore_original;
+       let! mutated_snapshot := stage "mutate-snapshot";
+       let! restore_snapshot := native_toolchain_write (native_toolchain_join snapshot "Ouro.seal") "seal fixture\n";
+       toolchain_io_setup restore_snapshot;
+       let! limited := native_toolchain_child (toolchain_io_short_policy (mul 20 250) 16)
+         "output-cap" owned snapshot child output (toolchain_protocol_units "output-cap");
+       let! timed := native_toolchain_child (toolchain_io_short_policy (mul 4 250) native_sibling_capture_bytes)
+         "timeout" owned snapshot child output (toolchain_protocol_units "timeout");
+       let! absent := native_toolchain_child native_toolchain_policy "missing-child" owned snapshot
+         (native_toolchain_join owned "absent.exe") output (toolchain_protocol_units "success");
+       let reused : IO (Either NativeToolchainError Unit) := call "success";
+       let! first := reused;
+       let! second := reused;
+       let log_path : String := native_toolchain_join owned "log-failure.stdout";
+       toolchain_io_create log_path;
+       let! log_failed := native_toolchain_child native_toolchain_policy "log-failure" owned snapshot child output
+         (toolchain_protocol_units "success");
+       let! verified := native_toolchain_verify_pair original snapshot toolchain_io_files;
+       let! exclusive := native_toolchain_prepare native_toolchain_policy original owned child
+         toolchain_io_units toolchain_io_files;
+       precision_run "native-toolchain-io"
+         [ MkPair String Bool "native-toolchain-io/rooted-discovery-from-unrelated-cwd"
+             (match collected with | Left _ => False | Right units => precision_strings units toolchain_io_units end)
+         , MkPair String Bool "native-toolchain-io/config-plus-ordered-complete-capture"
+             (match captured with
+              | Left _ => False | Right files => andb (eq_nat (length (Pair String String) files) 3)
+                  (precision_strings (map (Pair String String) String (fst String String) files)
+                    ["Ouro.seal", "library/雪 space.ouro", native_toolchain_root])
+              end)
+         , MkPair String Bool "native-toolchain-io/captured-graph-replay"
+             (toolchain_io_completed graph)
+         , MkPair String Bool "native-toolchain-io/changed-graph-refused"
+             (toolchain_io_rejected Unit changed_graph "input:source graph changed during capture")
+         , MkPair String Bool "native-toolchain-io/aggregate-byte-cap-no-prefix"
+             (toolchain_io_rejected (List (Pair String String)) zero_cap "read:fs_bounded_read_too_large")
+         , MkPair String Bool "native-toolchain-io/literal-argv-cwd-env-empty-stdin"
+             (match success with | Left _ => False | Right bytes => prim_string_eq bytes native_pe_probe_image end)
+         , MkPair String Bool "native-toolchain-io/stdout-NUL-refusal"
+             (toolchain_io_rejected Unit wrong_stdout "protocol")
+         , MkPair String Bool "native-toolchain-io/stderr-binary-refusal"
+             (toolchain_io_rejected Unit wrong_stderr "protocol")
+         , MkPair String Bool "native-toolchain-io/full-DWORD-and-streams"
+             (toolchain_io_exit259 nonzero)
+         , MkPair String Bool "native-toolchain-io/zero-exit-without-image-refused"
+             (toolchain_io_rejected String missing_image "read:fs_bounded_read_os")
+         , MkPair String Bool "native-toolchain-io/original-config-mutation-refused"
+             (toolchain_io_rejected String mutated_original "input:changed file: Ouro.seal")
+         , MkPair String Bool "native-toolchain-io/snapshot-config-mutation-refused"
+             (toolchain_io_rejected String mutated_snapshot "input:changed file: Ouro.seal")
+         , MkPair String Bool "native-toolchain-io/stream-budget-typed-refusal"
+             (toolchain_io_rejected Unit limited "process:process_capture_output_limit")
+         , MkPair String Bool "native-toolchain-io/deadline-typed-refusal"
+             (toolchain_io_rejected Unit timed "process:process_capture_timeout")
+         , MkPair String Bool "native-toolchain-io/missing-producer-typed-refusal"
+             (toolchain_io_rejected Unit absent "process:process_capture_os")
+         , MkPair String Bool "native-toolchain-io/reused-checked-action"
+             (andb (toolchain_io_completed first) (toolchain_io_completed second))
+         , MkPair String Bool "native-toolchain-io/log-error-retains-complete-child-result"
+             (toolchain_io_log_error output log_path log_failed)
+         , MkPair String Bool "native-toolchain-io/final-original-and-copy-bytes"
+             (toolchain_io_completed verified)
+         , MkPair String Bool "native-toolchain-io/existing-out-before-child-refused"
+             (toolchain_io_rejected Unit exclusive "create:fs_create_dir_create")
+         ];
+
+def toolchain_io_run (child : String) (directory : String) : IO Unit :=
+    do toolchain_io_create directory;
+       let! owned := prim_fs_realpath directory;
+       match str_null owned with
+       | True => toolchain_io_fail "cannot resolve fresh owned directory"
+       | False =>
+           let original : String := native_toolchain_join owned "original" in
+           let snapshot : String := native_toolchain_join owned "snapshot 雪" in
+           do toolchain_io_create original;
+              toolchain_io_create snapshot;
+              let! copied_original := native_toolchain_copy original toolchain_io_files;
+              toolchain_io_setup copied_original;
+              let! copied_snapshot := native_toolchain_copy snapshot toolchain_io_files;
+              toolchain_io_setup copied_snapshot;
+              let! cwd_bytes := native_toolchain_write (native_toolchain_join snapshot "cwd-input.bin") toolchain_protocol_binary;
+              toolchain_io_setup cwd_bytes;
+              let! loaded := native_toolchain_image native_toolchain_policy child;
+              match loaded with
+              | Left error => toolchain_io_fail (native_toolchain_error_message error)
+              | Right image => toolchain_io_checks child owned original snapshot image
+              end
+       end;
+
+-- @entry main
+def main : IO Unit :=
+    do let! arguments := argv;
+       match tail String arguments with
+       | Nil => toolchain_io_fail "expected CHILD.exe NEW_DIR"
+       | Cons child rest => match rest with
+         | Nil => toolchain_io_fail "expected CHILD.exe NEW_DIR"
+         | Cons directory extra => match extra with
+           | Cons _ _ => toolchain_io_fail "expected CHILD.exe NEW_DIR"
+           | Nil => toolchain_io_run child directory
+           end
+         end
+       end;

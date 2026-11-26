@@ -18,7 +18,7 @@ import sys
 import time
 
 from frontend_native_process import inspect_image, require
-from frontend_regen import collect_units
+from frontend_regen import ImportBytesParser, SourceBytesReader, capture_unit_inputs
 from kernel_scale import pin_one_cpu
 from ourosmith.limits import clean_env, run_limited
 from repo_support import sha256_file, write_json_atomic
@@ -45,15 +45,15 @@ CASES = ("positive", "duplicate-directory", "duplicate-file", "missing-parent-ca
          *("fault-" + mode for mode in FAULTS), "race-A", "race-B")
 
 
-def source_snapshot():
-    closures = {entry: collect_units(entry) for entry in (API, PROBE)}
+def source_snapshot(*, parse_bytes: ImportBytesParser | None = None, read_source: SourceBytesReader | None = None):
+    closures, captured = capture_unit_inputs((API, PROBE), parse_bytes=parse_bytes, read_source=read_source)
     for entry, units in closures.items():
         require(units and units[-1] == entry and len(units) == len(set(units)),
                 "incomplete exclusive-directory source closure: " + entry)
     names = sorted({name for units in closures.values() for name in units})
     require(all((ROOT / name).resolve().is_relative_to(ROOT) for name in names),
             "exclusive-directory source escapes the repository")
-    return {"closures": closures, "sources": {name: sha256_file(ROOT / name) for name in names}}
+    return {"closures": closures, "sources": {name: captured[name].sha256 for name in names}}
 
 
 def inspect_entry(path, entry):
@@ -138,13 +138,14 @@ def verify_supervisor_report(report, binary_sha256):
             "exclusive-directory worker status or output differs")
 
 
-def run_section(producer, work, run, build_timeout, probe_timeout, verify_inputs):
+def run_section(producer, work, run, build_timeout, probe_timeout, verify_inputs, *,
+                parse_bytes: ImportBytesParser | None = None):
     if os.name != "nt":
         return {"kind": KIND, "status": "unavailable", "reason": "Windows x86-64 runtime required",
                 "native_bootstrap": False}
     directory = work / "native-fs-create"
     directory.mkdir()
-    before = source_snapshot()
+    before = source_snapshot(parse_bytes=parse_bytes)
     producer_sha256 = sha256_file(producer)
     binaries = {}
     report = {"kind": KIND, "status": "running", "execution_backend": "direct-windows-pe",
@@ -154,7 +155,7 @@ def run_section(producer, work, run, build_timeout, probe_timeout, verify_inputs
 
     def unchanged():
         verify_inputs()
-        require(source_snapshot() == before and sha256_file(producer) == producer_sha256,
+        require(source_snapshot(parse_bytes=parse_bytes) == before and sha256_file(producer) == producer_sha256,
                 "exclusive-directory sources or producer changed")
         for entry, row in binaries.items():
             require(inspect_entry(ROOT / row["path"], entry) == row["image"],
