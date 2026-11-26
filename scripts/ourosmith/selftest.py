@@ -1792,16 +1792,19 @@ class LimitTests(unittest.TestCase):
             state = Path(f"/proc/{pid}/status").read_text()
         except (FileNotFoundError, ProcessLookupError):
             return
-        self.assertIn("State:\tZ", state)
+        self.assertRegex(state, r"(?m)^State:[ \t]+[XZ](?:[ \t]|$)")
 
     def test_posix_process_observation_handles_reaping(self):
         for error in (FileNotFoundError(), ProcessLookupError()):
             with self.subTest(error=type(error).__name__), patch.object(Path, "read_text", autospec=True, side_effect=error) as read:
                 self.assert_posix_process_exited(123)
                 read.assert_called_once_with(Path("/proc/123/status"))
-        with patch.object(Path, "read_text", autospec=True, return_value="State:\tZ (zombie)\n") as read:
-            self.assert_posix_process_exited(123)
-            read.assert_called_once_with(Path("/proc/123/status"))
+        for state in ("Z (zombie)", "X (dead)"):
+            with self.subTest(state=state), patch.object(
+                Path, "read_text", autospec=True, return_value=f"State:\t{state}\n"
+            ) as read:
+                self.assert_posix_process_exited(123)
+                read.assert_called_once_with(Path("/proc/123/status"))
         with patch.object(Path, "read_text", autospec=True, return_value="State:\tS (sleeping)\n"), self.assertRaises(AssertionError):
             self.assert_posix_process_exited(123)
         with patch.object(Path, "read_text", autospec=True, side_effect=PermissionError()), self.assertRaises(PermissionError):
