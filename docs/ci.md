@@ -944,6 +944,8 @@ checks group, nightly, manual, and stage-loop profiles. Run
 `python3 scripts/strict_quality_firewall.py --structural`; its report under
 `_build/quality/structural-quality.json` must be complete, well formed, and
 contain zero unclassified blocking findings. There is no existing-debt baseline.
+On pull requests that select `structural-quality`, Paths runs the scan before
+compiler preparation.
 See [structural quality](quality.md#repository-structural-gate) for precision,
 generated boundaries, and intentional classifications.
 

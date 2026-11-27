@@ -904,8 +904,9 @@ def selection_matrix(
         groups = PULL_REQUEST_GROUPS
     priority = {"checks": 0, "tests": 0, "smith": 0, **dict.fromkeys(PR_ISOLATED_TEST_GATES, 0),
                 "checks-parity": 1, "checks-quality": 1,
-                f"compiler-{COMPILER_SHARDS}": 2}
-    ordered = sorted(groups, key=lambda name: priority.get(name, 3 if name.startswith("compiler-") else 4))
+                f"compiler-{COMPILER_SHARDS}": 2,
+                **dict.fromkeys(("compiler-6", "compiler-8", "compiler-9", "compiler-13", "compiler-14"), 3)}
+    ordered = sorted(groups, key=lambda name: priority.get(name, 4 if name.startswith("compiler-") else 5))
     return {"include": [{"group": group} for group in ordered if selected.intersection(groups[group])]}
 
 
@@ -963,7 +964,7 @@ def write_github_output(path: Path, selection: PathSelection, matrix: dict[str, 
     with path.open("a", encoding="utf-8") as output:
         for name in ("core", "docs", "kernel", "editor", "site", "host_compiler", "dependency", "portable"):
             output.write(f"{name}={bool_text(getattr(selection, name))}\n")
-        for gate in ("python-lint", "shell-lint"):
+        for gate in ("python-lint", "shell-lint", "structural-quality"):
             output.write(f"{gate.replace('-', '_')}={bool_text(gate in selection.gates)}\n")
         output.write(f"mode={selection.mode}\n")
         output.write("matrix=" + json.dumps(matrix, separators=(",", ":")) + "\n")
@@ -1850,6 +1851,8 @@ def run_self_tests(all_gates: Sequence[Gate]) -> int:
                     failures.append("long PR groups must start before compiler shards")
                 if planned[7:8] != [f"compiler-{COMPILER_SHARDS}"]:
                     failures.append("isolated source-spans shard must start before other compiler shards")
+                if planned[8:13] != ["compiler-6", "compiler-8", "compiler-9", "compiler-13", "compiler-14"]:
+                    failures.append("long compiler shards must be queued before ordinary shards")
                 for group, gate_name in (("checks", "python-syntax"), ("checker", "kernel-hardening")):
                     if not any(gate.name == gate_name and gate.blocking for gate in select_group(all_gates, "pr", group)):
                         failures.append("Linux portable validation lost its blocking " + gate_name + " gate in " + group)

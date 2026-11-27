@@ -836,14 +836,6 @@ private def rewrite_lowered_surface (lowered : LoweredSurface) : LoweredSurface 
     LoweredSurfaceOf (rewrite_dummy_anns surface) cause
   end;
 
-def rewrite_lowered_decls (decls : List LoweredDecl) : List LoweredDecl :=
-  map LoweredDecl LoweredDecl (fun (decl : LoweredDecl) =>
-    match decl with | LoweredDeclOf name payload => match payload with
-      | MkPair unit lowered =>
-          LoweredDeclOf name (MkPair (Maybe Nat) LoweredSurface unit
-            (rewrite_lowered_surface lowered))
-      end end) decls;
-
 def lower_decls_env
   (lower_expr_env2 : LowerEnv -> Maybe Surface -> Expr -> Surface)
   (env : LowerEnv) (decls : List Decl) : List (Pair Nat Surface) :=
@@ -1099,19 +1091,44 @@ def surface_has_hole : Surface -> Bool :=
     | SStr _ _ => False
     end;
 
-def surfaces_have_hole : List (Pair Nat Surface) -> Bool :=
-  fix go (xs : List (Pair Nat Surface)) : Bool :=
+private def first_surface_hole (surfaces : List (Pair Nat Surface)) : Maybe CompileProgramLocation :=
+  (fix go (xs : List (Pair Nat Surface)) (ordinal : Nat) : Maybe CompileProgramLocation :=
     match xs with
-    | Nil => False
-    | Cons p xs' =>
-        match p with
-        | MkPair _ s =>
-            match surface_has_hole s with
-            | True => True
-            | False => go xs'
-            end
+    | Nil => Nothing CompileProgramLocation
+    | Cons row rest => match row with | MkPair name surface =>
+        match surface_has_hole surface with
+        | True => Just CompileProgramLocation
+            (CompileProgramLocationOf (MkPair Nat CompileProgramPhase name CompileSurfacePhase) ordinal)
+        | False => go rest (S ordinal)
         end
-    end;
+      end
+    end) surfaces Z;
+
+-- A deep, hole-free preflight failure can hide a later lowering error.
+private def surface_failure_location (surfaces : List (Pair Nat Surface))
+    (original : Maybe CompileProgramLocation) (hole : CompileProgramLocation)
+    : Maybe CompileProgramLocation :=
+  match original with
+  | Nothing => original
+  | Just location => match location with | CompileProgramLocationOf owner ordinal =>
+      match owner with | MkPair name phase =>
+        match phase with
+        | CompileSurfacePhase =>
+            let row : Pair Nat Surface :=
+              nth (Pair Nat Surface) (MkPair Nat Surface Z (SSort Z)) ordinal surfaces in
+            match row with | MkPair actual surface =>
+              if andb (eqNat name actual)
+                  (andb (surface_depth_at_least depth_gate surface) (notb (surface_has_hole surface)))
+              then Just CompileProgramLocation hole else original
+            end
+        | CompileFutureSlotPhase => original
+        | CompileDuplicatePhase => original
+        | CompileFutureGlobalPhase => original
+        | CompileCorePhase => original
+        end
+      end
+    end
+  end;
 
 -- Declaration checker plan. These helpers preserve declared types, axioms,
 -- inductives, and effects while pairing each DDef with the exact emitted body.
@@ -1125,17 +1142,21 @@ def compile_surfaces_with_location
   | MkPair result owner => match result with
     | COk cores => MkPair (CompResult (List (Pair Nat CoreTerm))) (Maybe CompileProgramLocation)
         (COk (List (Pair Nat CoreTerm)) cores) (Nothing CompileProgramLocation)
-    | CErr error => match error with | ErrCode code _ =>
+    | CErr error => match error with | ErrCode code detail =>
         match eqNat code 2 with
         | False => MkPair (CompResult (List (Pair Nat CoreTerm))) (Maybe CompileProgramLocation)
             (CErr (List (Pair Nat CoreTerm)) error) owner
-        | True => match andb (surfaces_depth_at_least depth_gate surfaces)
-            (notb (surfaces_have_hole surfaces)) with
+        | True => match surfaces_depth_at_least depth_gate surfaces with
             | False => MkPair (CompResult (List (Pair Nat CoreTerm))) (Maybe CompileProgramLocation)
                 (CErr (List (Pair Nat CoreTerm)) error) owner
-            | True => MkPair (CompResult (List (Pair Nat CoreTerm))) (Maybe CompileProgramLocation)
-                (COk (List (Pair Nat CoreTerm)) (elaborate_surfaces fuel surfaces))
-                (Nothing CompileProgramLocation)
+            | True => match first_surface_hole surfaces with
+                | Nothing => MkPair (CompResult (List (Pair Nat CoreTerm))) (Maybe CompileProgramLocation)
+                    (COk (List (Pair Nat CoreTerm)) (elaborate_surfaces fuel surfaces))
+                    (Nothing CompileProgramLocation)
+                | Just hole => MkPair (CompResult (List (Pair Nat CoreTerm))) (Maybe CompileProgramLocation)
+                    (CErr (List (Pair Nat CoreTerm)) error)
+                    (if eqNat detail Z then surface_failure_location surfaces owner hole else owner)
+                end
             end
         end end
     end
@@ -1652,10 +1673,6 @@ private def source_program_failure_from
             (MkPair (Maybe Nat) (Maybe (Pair Nat Nat)) unit (Nothing (Pair Nat Nat))))) cause)
     end
   end;
-
-def source_program_failure (decls : List LoweredDecl)
-    (location : CompileProgramLocation) (error : CompError) : SourceFailure :=
-  source_program_failure_from LoweredDecl (fun (decl : LoweredDecl) => decl) decls location error;
 
 def program_result_with_location (result : CompileProgramLocatedResult)
     : Pair (CompResult (List (Pair Nat CoreTerm))) (Maybe CompileProgramLocation) :=

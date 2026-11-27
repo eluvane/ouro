@@ -150,6 +150,16 @@ cat >"$TRACE_INPUTS/named.ouro" <<'EOF'
 inductive Nat : Type := | Z : Nat | S : Nat -> Nat;
 def goal : Nat := ?pending;
 EOF
+cat >"$TRACE_INPUTS/deep.ouro" <<'EOF'
+inductive Nat : Type := | Z : Nat | S : Nat -> Nat;
+def deep : Nat := 100;
+EOF
+cp "$TRACE_INPUTS/deep.ouro" "$TRACE_INPUTS/deep-named.ouro"
+printf '%s\n' 'def goal : Nat := ?pending;' >>"$TRACE_INPUTS/deep-named.ouro"
+cat >"$TRACE_INPUTS/deep-import.ouro" <<'EOF'
+import "deep.ouro";
+def bad : Nat := [];
+EOF
 cat >"$TRACE_INPUTS/import-unrelated.ouro" <<'EOF'
 import "prefix.ouro";
 def unrelated : Nat := missing;
@@ -203,6 +213,11 @@ expect_source_owner nested "$TRACE_INPUTS/nested.ouro" \
 	'<input>: compilation failed in nested (surface); code=2 detail=0' 'OURO-LIST-001'
 expect_source_owner named "$TRACE_INPUTS/named.ouro" \
 	'<input>: OURO-HOLE-001: unresolved named hole in goal (surface)' '<input>:1:1'
+expect_source_owner deep-named "$TRACE_INPUTS/deep-named.ouro" \
+	'<input>: OURO-HOLE-001: unresolved named hole in goal (surface)' 'compilation failed in deep'
+expect_source_owner deep-import "$TRACE_INPUTS/deep-import.ouro" \
+	'deep-import.ouro: OURO-LIST-001: list literal without known List A context in bad (surface)' 'compilation failed in deep' \
+	--unit "$TRACE_INPUTS/deep.ouro" --unit "$TRACE_INPUTS/deep-import.ouro"
 expect_source_owner imported-prior-list "$TRACE_INPUTS/import-unrelated.ouro" \
 	'import-unrelated.ouro: compilation failed in unrelated (surface); code=2 detail=0' 'OURO-LIST-001' \
 	--unit "$TRACE_INPUTS/prefix.ouro" --unit "$TRACE_INPUTS/import-unrelated.ouro"
