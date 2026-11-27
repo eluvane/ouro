@@ -722,7 +722,10 @@ fixtures prove both false-positive behavior and nonzero deny behavior before
 the gate scans every handwritten `runtime/*.c` file. The generated
 `compiler/stage0/` tree remains under stage-loop and generated-artifact policy
 and is not treated as handwritten analyzer input. Reports and per-check logs are
-written under `_build/c_static_analysis/`. Clang's version-dependent
+written under `_build/c_static_analysis/`. Checks have 180 seconds by default.
+GCC gets 300 seconds for `frontend_codegen_selftest.c`, which includes
+`frontend_link.c` and its test callers. Use `--timeout-seconds` to set one limit
+for all checks. Clang's version-dependent
 `unix.Stream` and `unix.Errno` state models are excluded when present because
 they flag ordinary checked `fread`/`ftell` flows; compiler diagnostics and the
 core, bounds, security, allocation, and lifetime checkers remain blocking.

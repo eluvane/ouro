@@ -47,7 +47,7 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--out", default="_build/c_static_analysis")
     p.add_argument("--gcc", default=os.environ.get("OURO_GCC", ""))
     p.add_argument("--clang", default=os.environ.get("OURO_CLANG", ""))
-    p.add_argument("--timeout-seconds", type=float, default=180.0)
+    p.add_argument("--timeout-seconds", type=float, help="Override the time limit for each check.")
     return p
 
 
@@ -108,11 +108,13 @@ def run_check(
     engine: str,
     command: Sequence[str],
     expectation: str,
-    timeout: float,
+    timeout: Optional[float],
     cwd: Path = ROOT,
     markers: Sequence[str] = (),
     env: Optional[dict[str, str]] = None,
 ) -> bool:
+    if timeout is None:
+        timeout = 180.0
     log = out / "logs" / f"{name}.log"
     log.parent.mkdir(parents=True, exist_ok=True)
     command_list = list(command)
@@ -354,6 +356,9 @@ def run_suite(args: argparse.Namespace) -> tuple[dict[str, object], int]:
             timeout=args.timeout_seconds,
         )
         for source in sources:
+            timeout = args.timeout_seconds
+            if timeout is None and source.name == "frontend_codegen_selftest.c":
+                timeout = 300.0
             run_check(
                 checks,
                 out=out,
@@ -361,7 +366,7 @@ def run_suite(args: argparse.Namespace) -> tuple[dict[str, object], int]:
                 engine="gcc-fanalyzer",
                 command=gcc_command(gcc, source, out / "objects" / "gcc" / f"{source.stem}.o"),
                 expectation="pass",
-                timeout=args.timeout_seconds,
+                timeout=timeout,
             )
 
     if gcc is not None and os.name == "nt":

@@ -1138,6 +1138,20 @@ class HarnessTests(unittest.TestCase):
                     self.assertIn(target[0], clang)
                     self.assertIn("-analyzer-disable-checker=unix.Stream,unix.Errno", clang)
 
+    def test_c_static_gcc_codegen_timeout_is_scoped_and_overridable(self):
+        import c_static_analysis_suite as gate
+
+        for extra, codegen_timeout, other_timeout in (([], 300.0, 180.0), (["--timeout-seconds", "12"], 12.0, 12.0)):
+            with self.subTest(extra=extra), tempfile.TemporaryDirectory() as directory, \
+                 patch.object(gate, "find_tool", side_effect=("gcc", None)), \
+                 patch.object(gate, "tool_version", return_value="test"), \
+                 patch.object(gate.subprocess, "run", return_value=SimpleNamespace(returncode=0, stdout="")) as run:
+                gate.run_suite(gate.parser().parse_args(["--out", directory, *extra]))
+                timeouts = {call.args[0][-3]: call.kwargs["timeout"] for call in run.call_args_list
+                            if "-fanalyzer" in call.args[0]}
+                self.assertEqual(timeouts.pop("runtime/frontend_codegen_selftest.c"), codegen_timeout)
+                self.assertEqual(set(timeouts.values()), {other_timeout})
+
     def test_msvc_environment_is_local_and_fail_closed(self):
         import c_static_analysis_suite as gate
 
