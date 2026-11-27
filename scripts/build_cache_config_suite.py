@@ -3546,9 +3546,13 @@ def test_frontend_host_environment_overlay(tmp: Path) -> None:
                            probe_timeout=30, config=None)
     before = {"inputs": {"compiler_sha256": host.sha256_file(compiler)}}
     captured = []
+    workers = host.build.bounded_jobs(2) if host.sys.platform == "linux" else 1
 
     def text_run(command, **options):
         assert options["env"]["OURO_TOOLCHAIN_PROTOCOL"] == "parent value"
+        assert options["timeout_s"] == 900 and options["memory_mb"] == 3072
+        assert command[command.index("--jobs") + 1] == str(workers)
+        assert pin.call_count == (1 if workers == 1 else 0)
         work = Path(command[command.index("--out") + 1])
         host.write_json_atomic(work / "build.json", {})
         (work / "backend.gen.c").write_bytes(b"synthetic generated input")
@@ -3556,6 +3560,7 @@ def test_frontend_host_environment_overlay(tmp: Path) -> None:
 
     def byte_run(command, **options):
         captured.append(dict(options["env"]))
+        pin.assert_called_once()
         assert options["timeout_s"] == 30 and options["memory_mb"] == 3072
         assert options["cwd"] == root and host.os.environ["OURO_TOOLCHAIN_PROTOCOL"] == "parent value"
         return RunBytesResult("ok", 0, b"A\0\xff", b"", 0, 0, command)
@@ -3583,7 +3588,7 @@ def test_frontend_host_environment_overlay(tmp: Path) -> None:
     hosted = ("OURO_TEST_CHECK", "OURO_TEST_BUILD", "OURO_PKG_CHECK", "OURO_HOSTED_COMPILER_WRAPPER", "OURO_HOSTED_FMT")
     with patch.dict(host.os.environ, {"OURO_TOOLCHAIN_PROTOCOL": "parent value", "PATH": "parent path",
                                      **dict.fromkeys(hosted, "parent hosted command")}), \
-            patch.object(host, "pin_one_cpu", return_value=0), patch.object(host, "snapshot", return_value=before), \
+            patch.object(host, "pin_one_cpu", return_value=[0]) as pin, patch.object(host, "snapshot", return_value=before), \
             patch.object(host, "require_snapshot"), patch.object(host, "verify_artifacts"), \
             patch.object(host, "probe_cases", return_value=[]), patch.object(host, "run_limited", side_effect=text_run), \
             patch.object(host, "run_limited_bytes", side_effect=byte_run), \
@@ -3596,7 +3601,7 @@ def test_frontend_host_environment_overlay(tmp: Path) -> None:
             patch.object(host.direct_async, "run_section", return_value={"status": "unavailable"}), \
             patch.object(host.direct_fs_replace, "run_native_section", return_value={"status": "unavailable"}), \
             patch.object(host.direct_fs_read, "run_native_section", return_value={"status": "unavailable"}):
-        assert host.run_suite(args, SimpleNamespace(values={"opt_level": "O1"}), []) == 0
+        assert host.run_suite(args, SimpleNamespace(values={"opt_level": "O1", "jobs": 2}), []) == 0
         assert fs_create.call_args.kwargs["parse_bytes"] is process.call_args.kwargs["parse_bytes"]
     assert captured[0]["OURO_TOOLCHAIN_PROTOCOL"] == "owned 雪" and captured[1]["OURO_TOOLCHAIN_PROTOCOL"] == "parent value"
     assert {key: value for key, value in captured[0].items() if key != "OURO_TOOLCHAIN_PROTOCOL"} == {

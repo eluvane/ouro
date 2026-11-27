@@ -1411,6 +1411,43 @@ class HarnessTests(unittest.TestCase):
             self.assertEqual((root / "crypto.golden").read_bytes(), expected)
             self.assertEqual(len(expected), 7215)
 
+    def test_hosted_crypto_checks_and_replays_all_rows_in_batches(self):
+        from ourosmith.surface.library import crypto, run_family
+        from ourosmith.surface.run import SurfaceRunner
+
+        scratch = ROOT / "_build/smith/selftest"
+        scratch.mkdir(parents=True, exist_ok=True)
+        rows = list(crypto(1))
+        batches = ["".join(value + "\n" for _, value in rows[start:start + 53]) for start in (0, 53, 106)]
+        with tempfile.TemporaryDirectory(dir=scratch) as directory, \
+             patch("ourosmith.surface.run.binary", return_value=Path("unused")), \
+             patch("ourosmith.surface.run.environment", return_value={}), \
+             patch("frontend_regen.collect_units", return_value=["main.ouro"]):
+            root = Path(directory)
+            runner = SurfaceRunner(report(), root, [1], shrink_budget=0)
+            runner.seed = 1
+            saved = None
+            for _ in range(2):
+                with patch.object(runner, "accepts") as check, \
+                     patch.object(runner, "compile_native", return_value=root / "main.exe") as compile_native, \
+                     patch.object(runner, "command", side_effect=[
+                         RunResult("ok", 0, output, "", 0, 0) for output in batches
+                     ]) as command:
+                    run_family(runner, root, "crypto", saved=saved)
+                check.assert_called_once()
+                compile_native.assert_called_once()
+                self.assertEqual([request.args for request in command.call_args_list], [
+                    ([root / "main.exe", str(number)], root, "native-run") for number in range(3)
+                ])
+                self.assertEqual(runner.input["expected_batches"], batches)
+                self.assertEqual(runner.input["expected_stdout"], "".join(batches))
+                source = runner.input["source"]
+                self.assertEqual([line.strip() for line in source.splitlines() if line.lstrip().startswith("println ")],
+                                 [f"println observed{index};" for index in range(159)])
+                if saved is not None:
+                    self.assertEqual(runner.input, saved)
+                saved = runner.input
+
     def test_native_other_library_fixture_source_shape_is_unchanged(self):
         from ourosmith.native_inputs import prepare_library
         from ourosmith.surface.library import FAMILIES

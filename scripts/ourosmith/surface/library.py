@@ -380,29 +380,65 @@ def run_family(run, directory, family, saved=None):
     generate, modules = FAMILIES[family]
     rows = [] if saved is not None and "source" in saved else list(generate(run.seed))
     run_expressions(run, directory, "stdlib_" + family, rows,
-                    list(modules), "stdlib-" + family, saved=saved)
+                    list(modules), "stdlib-" + family, saved=saved, batch_size=53 if family == "crypto" else None)
     run.count("features", "stdlib:" + family)
 
 
-def run_expressions(run, directory, recipe, rows, modules, property_name, *, saved=None, definitions=""):
+def run_expressions(run, directory, recipe, rows, modules, property_name, *, saved=None, definitions="", batch_size=None):
     from frontend_regen import collect_units
 
     source_root = run.overrides.get("source-root", ROOT)
     imports = "".join(f'import {quote(os.path.relpath(source_root / name, directory).replace(chr(92), "/"))};\n'
                       for name in ("std/io.ouro", "std/format.ouro", *modules))
     declarations = "".join(f"def observed{i} : String := {expression};\n" for i, (expression, _) in enumerate(rows))
-    actions = "\n".join(f"     println observed{i};" for i in range(len(rows)))
-    source = definitions + declarations + "\n-- @entry main\ndef main : IO Unit :=\n  do\n" + actions + "\n     exit 0\n"
-    expected = "".join(value + "\n" for _, value in rows)
+    batches = None
     if saved is not None and "source" in saved:
         source, expected = saved["source"], saved["expected_stdout"]
+        if "expected_batches" in saved:
+            batches = saved["expected_batches"]
+            run.require(isinstance(batches, list) and batches and all(isinstance(text, str) and text for text in batches)
+                        and "".join(batches) == expected,
+                        property_name, "ordered batch outputs matching the saved oracle", batches)
+    else:
+        expected = "".join(value + "\n" for _, value in rows)
+        source = definitions + declarations
+        if batch_size is None:
+            actions = "\n".join(f"     println observed{i};" for i in range(len(rows)))
+            source += "\n-- @entry main\ndef main : IO Unit :=\n  do\n" + actions + "\n     exit 0\n"
+        else:
+            batches = []
+            for number, start in enumerate(range(0, len(rows), batch_size)):
+                end = min(start + batch_size, len(rows))
+                batches.append("".join(value + "\n" for _, value in rows[start:end]))
+                actions = "".join(f"  println observed{i};\n" for i in range(start, end))
+                source += f"\ndef run_batch_{number} : IO Unit := do\n{actions}  exit 0;\n"
+            dispatch = " else ".join(f'if str_eq batch "{number}" then run_batch_{number}'
+                                     for number in range(len(batches)))
+            source += ("\n-- @entry main\ndef main : IO Unit :=\n"
+                       "  do let! args := argv;\n"
+                       "     match drop String 1 args with\n"
+                       "     | Nil => exit 2\n"
+                       "     | Cons batch extra => match extra with\n"
+                       f"       | Nil => {dispatch} else exit 2\n"
+                       "       | Cons _ _ => exit 2\n"
+                       "       end\n"
+                       "     end;\n")
     run.input = {"recipe": recipe, "seed": run.seed, "source": source, "expected_stdout": expected}
+    if batches is not None:
+        run.input["expected_batches"] = batches
     path = directory / "main.ouro"
     path.write_text(imports + source, encoding="utf-8", newline="\n")
     units = collect_units(path.as_posix(), parse_bytes=run.import_parser)
     # Integration recipes check and compile their complete stdlib source cone.
     compile_timeout = BUILD_TIMEOUT_S
     run.accepts(path, artifact=False, units=units, timeout=compile_timeout)
-    actual = run.native(path, units=units, io=True, compile_timeout=compile_timeout)
-    run.require(actual.ok and actual.stdout == expected and not actual.stderr,
-                property_name, expected, run.output(actual))
+    if batches is None:
+        actual = run.native(path, units=units, io=True, compile_timeout=compile_timeout)
+        run.require(actual.ok and actual.stdout == expected and not actual.stderr,
+                    property_name, expected, run.output(actual))
+    else:
+        executable = run.compile_native(path, units=units, io=True, compile_timeout=compile_timeout)
+        for number, output in enumerate(batches):
+            actual = run.command([executable, str(number)], path.parent, "native-run")
+            run.require(actual.ok and actual.stdout == output and not actual.stderr,
+                        property_name, output, run.output(actual))

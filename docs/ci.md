@@ -259,8 +259,10 @@ direct-PE test runner and its `coil.exe` sibling:
 
 This root includes the hash laws from `tests/native_crypto_hash_laws.ouro` and
 embedded NUL cases. The shared compiler fixture catalog registers the bounded
-stream state and error laws. Runtime IO checks a separate set of 159 SHA-256,
-HMAC and stream observations against their exact golden output on the C host.
+stream state and error laws. Runtime IO checks 159 SHA-256, HMAC and stream
+observations against exact golden output on the C host. OuroSmith checks those
+observations in three ordered runs of one checked executable, each with the
+standard runtime timeout.
 
 ### Hosted profile composition
 
@@ -501,8 +503,9 @@ profile. User-test and stage-loop gates remain separate.
 
 The frontend-security host suite builds the fresh generated backend in shards
 grouped by 256 generated getter clusters. It checks the original generated C,
-shard manifest and shard contents for all six host images, using one worker,
-`O0`, and the existing 3 GiB/900-second build budget. All 60 host probes remain required.
+shard manifest and shard contents for all six host images. Linux uses up to two C
+build workers within the assigned CPU slots. Other hosts use one build worker.
+The build uses `O0` and a 3 GiB/900-second limit. All host probes run on one CPU.
 The host build records start and completion markers for compiler emission,
 helper uniquification, hook installation, and publication, so a timeout can be
 assigned to the last unfinished phase without inferring it from compiler trace.
@@ -843,7 +846,7 @@ Compiler and bootstrap receipts retain their complete identity checks.
 Select `task=frontend-security` in Manual for the canonical frontend-security
 suite alone on Ubuntu and Windows. The diagnostic task reuses compiler
 verification, toolchains, cache controls, and the 120-minute job limit; all
-frontend host limits, 60 probes, and Windows direct PE checks remain required.
+frontend host limits, all host probes, and Windows direct PE checks remain required.
 Its result does not certify a complete profile. The default `validate` task
 still selects every group in the chosen profile.
 

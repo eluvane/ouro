@@ -963,12 +963,14 @@ def run_file_status_faults(work, run, build_timeout, probe_timeout, verify_input
 
 
 def run_suite(args, cfg, argv: list[str]) -> int:
+    build_workers = min(2, build.jobs_value(cfg)) if sys.platform == "linux" else 1
     args.out.mkdir(parents=True, exist_ok=True)
     work = args.out / ("host-" + uuid.uuid4().hex)
     work.mkdir()
     report = {"kind": KIND, "pass": False, "execution_backend": "generated-c-host",
               "native_bootstrap": False, "entry": ENTRY, "work": str(work), "steps": [],
-              "workers": 1, "memory_mib": args.memory_mib, "build_timeout_s": args.build_timeout,
+              "workers": 1, "build_workers": build_workers,
+              "memory_mib": args.memory_mib, "build_timeout_s": args.build_timeout,
               "backend_group_size": BACKEND_GROUP_SIZE,
               "probe_timeout_s": args.probe_timeout,
               "producer": {"path": str(args.compiler), "selection": "caller-supplied --compiler; lineage not attested"}}
@@ -976,7 +978,8 @@ def run_suite(args, cfg, argv: list[str]) -> int:
     built = None
     parse_bytes = cached_import_parser()
     try:
-        report["cpu"] = pin_one_cpu()
+        if build_workers == 1:
+            report["cpu"] = pin_one_cpu()
         before = snapshot(args, cfg, parse_bytes=parse_bytes)
         report["producer"]["sha256"] = before["inputs"]["compiler_sha256"]
         write_json_atomic(work / "inputs-before.json", before)
@@ -1018,12 +1021,15 @@ def run_suite(args, cfg, argv: list[str]) -> int:
 
         command = [sys.executable, "-B", str(Path(__file__).resolve()), *argv,
                    "--worker", "--compiler", str(args.compiler), "--out", str(work),
-                   "--jobs", "1", "--no-cache", "--ccache", "disabled", "--opt-level", str(cfg.values["opt_level"])]
+                   "--jobs", str(build_workers), "--no-cache", "--ccache", "disabled",
+                   "--opt-level", str(cfg.values["opt_level"])]
         if args.config is not None:
             command.extend(["--config", str(args.config.resolve())])
         result = run("build", command, args.build_timeout)
         if not result.ok or not result.stdout.endswith("FRONTEND_HOST_BUILD: PASS\n"):
             raise ValueError(f"host build failed (status={result.status}, exit={result.returncode}); see {work / 'build.err'}")
+        if build_workers > 1:
+            report["cpu"] = pin_one_cpu()
         built = json.loads((work / "build.json").read_text(encoding="utf-8"))
         verify_artifacts(work, built)
         report["build"] = built
@@ -1133,7 +1139,7 @@ def main(argv: list[str] | None = None) -> int:
         args.config = (ROOT / args.config).resolve()
     if os.name == "nt" and not args.compiler.is_file() and Path(str(args.compiler) + ".exe").is_file():
         args.compiler = Path(str(args.compiler) + ".exe")
-    args.jobs = (args.jobs or "1") if args.worker else "1"
+    args.jobs = args.jobs or "1"
     args.cache_enabled, args.ccache = False, "disabled"
     args.opt_level = args.opt_level or "O0"
     try:

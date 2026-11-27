@@ -226,6 +226,6 @@ expect_source_owner imported-bad "$TRACE_INPUTS/import-bad.ouro" \
 	--unit "$TRACE_INPUTS/bad-list.ouro" --unit "$TRACE_INPUTS/import-bad.ouro"
 
 "$PYTHON" "$ROOT/scripts/frontend_host_suite.py" --compiler "$COMPILER" \
-	--out "$OUT/host" --jobs 1
+	--out "$OUT/host" --jobs "${OURO_JOBS:-1}"
 
 echo "FRONTEND_SECURITY_SUITE: PASS rows=$rows out=$OUT"

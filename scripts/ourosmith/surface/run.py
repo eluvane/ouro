@@ -164,7 +164,7 @@ class SurfaceRunner:
         self.require(result.ok and "CHECK_OK" in result.stdout, "accepts-typed-source", "CHECK_OK and exit 0", self.output(result), "wrong-reject")
         return core
 
-    def native(self, path: Path, *, units=(), io=False, arguments=(), env=None, stdin=None, compile_timeout=None):
+    def compile_native(self, path: Path, *, units=(), io=False, compile_timeout=None):
         from ourosmith.host import build_config
 
         if self.cc is None:
@@ -221,6 +221,10 @@ class SurfaceRunner:
                                "--object-dir", self.native_work, "--report", path.with_suffix(".native-build.json"),
                                *cache], path.parent, "native-compile", timeout=compile_timeout)
         self.require(result.ok, "native-compile", "exit 0", self.output(result))
+        return exe
+
+    def native(self, path: Path, *, units=(), io=False, arguments=(), env=None, stdin=None, compile_timeout=None):
+        exe = self.compile_native(path, units=units, io=io, compile_timeout=compile_timeout)
         return self.command([exe, *arguments], path.parent, "native-run", env=env, stdin=stdin)
 
     def positive(self, expr: gen.Expr):
