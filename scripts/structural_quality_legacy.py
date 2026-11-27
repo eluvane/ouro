@@ -484,12 +484,19 @@ def python_symbols(path, source):
     tree = ast.parse(source, filename=path)
     symbols = []
     lines = source.splitlines()
-    for parent in [tree, *(n for n in ast.walk(tree) if isinstance(n, ast.ClassDef))]:
+    nodes_by_parent = {child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
+    for parent in [tree, *(node for node in nodes_by_parent if isinstance(node, ast.ClassDef))]:
+        scope = []
+        ancestor = parent
+        while ancestor is not tree:
+            if isinstance(ancestor, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+                scope.append(ancestor.name)
+            ancestor = nodes_by_parent[ancestor]
         for node in parent.body:
             if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 continue
             nodes = tuple(ast.walk(node))
-            name = node.name if parent is tree else parent.name + "." + node.name
+            name = ".".join([*reversed(scope), node.name])
             local = [a.arg for a in (*node.args.posonlyargs, *node.args.args, *node.args.kwonlyargs)]
             if node.args.vararg:
                 local.append(node.args.vararg.arg)

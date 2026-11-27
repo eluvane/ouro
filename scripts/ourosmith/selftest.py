@@ -339,20 +339,31 @@ class HarnessTests(unittest.TestCase):
     def test_analyzer_core_pool_uses_platform_memory_policy(self):
         import analyze_core_checks as checks
 
-        for platform, ceiling, jobs, memory in (("nt", 20, 10, 3072), ("nt", 2, 2, 3072),
-                                                ("posix", 2, 1, 2944)):
+        for platform, ceiling, budget, jobs, memory in (
+            ("nt", 20, 3072, 10, 3072), ("nt", 2, 3072, 2, 3072),
+            ("posix", 2, 6015, 1, 2944), ("posix", 2, 6016, 2, 2944),
+        ):
             with tempfile.TemporaryDirectory() as directory, \
                  patch.dict(os.environ, {checks.JOBS_ENV: str(ceiling)}), \
                  patch.object(checks, "os", SimpleNamespace(name=platform)), \
-                 patch.object(checks, "command_environment", return_value={}), \
+                 patch.object(checks, "sys", SimpleNamespace(platform="linux")), \
+                 patch.object(checks, "available_memory_mib", return_value=budget), \
+                 patch.object(checks, "command_environment", return_value={"OURO_C_BUILD_DIR": directory}), \
                  patch.object(checks, "shell", return_value=Path("sh")), \
                  patch.object(checks, "run_limited", return_value=RunResult("ok", 0, "CHECK_OK\n", "", 0, 0)) as execute, \
                  contextlib.redirect_stdout(io.StringIO()):
+                for name in ("ouro1", "ouro-collect"):
+                    (Path(directory) / name).touch()
                 report = checks.run_checks([f"file-{n}.ouro" for n in range(12)], Path(directory), 99)
                 self.assertTrue(report["pass"])
                 self.assertEqual(report["jobs"], jobs)
                 self.assertEqual(report["wrapper_launches"], 12)
                 self.assertTrue(all(call.kwargs["memory_mb"] == memory for call in execute.call_args_list))
+                if platform == "posix" and jobs == 2:
+                    self.assertNotIn("OURO_PREPARED_COLLECTOR", execute.call_args_list[0].kwargs["env"])
+                    for call in execute.call_args_list[1:]:
+                        self.assertEqual(call.kwargs["env"]["OURO_PREPARED_COLLECTOR"],
+                                         (Path(directory) / "ouro-collect").as_posix())
 
     def test_analyzer_core_pool_orders_results_and_preserves_failures(self):
         import threading

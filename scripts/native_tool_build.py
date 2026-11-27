@@ -590,7 +590,8 @@ def verify_emission_hooks(generated: Path, units: list[str], *,
 
 def prepare_emission(compiler: Path, units: list[str], fuel: int, generated: Path,
                      cfg: build.ResolvedConfig, inputs: dict, *, cache_enabled: bool,
-                     parse_bytes: frontend.ImportBytesParser | None = None) -> str:
+                     parse_bytes: frontend.ImportBytesParser | None = None,
+                     phase_callback: Callable[[str, float | None], None] | None = None) -> str:
     # Final tool inputs retain their public schema. Emission also binds closure
     # order, which a sorted input-map hash does not preserve.
     key = hash_json({"kind": "ouro.native-tool-emission.v1", "inputs": inputs, "units": units,
@@ -616,7 +617,8 @@ def prepare_emission(compiler: Path, units: list[str], fuel: int, generated: Pat
     # Reuse import parsing between the installer and its check. Both still read
     # the source independently and the caller's input parser cannot supply it.
     canonical_imports = cached_import_parser()
-    emit(compiler, units, fuel, generated, parse_bytes=canonical_imports)
+    timing = {"phase_callback": phase_callback} if phase_callback is not None else {}
+    emit(compiler, units, fuel, generated, parse_bytes=canonical_imports, **timing)
     unchanged()
     generated_hash = sha256_file(generated)
     verify_emission_hooks(generated, units, parse_bytes=canonical_imports)
@@ -936,6 +938,7 @@ def _build_tool(args: argparse.Namespace, cfg: build.ResolvedConfig, *,
     if parse_bytes is None and (not args.check or tool_companions(args.entry)):
         parse_bytes = cached_import_parser()
     units, inputs = tool_inputs(args.entry, compiler, args.fuel, cfg, parse_bytes=parse_bytes)
+    phases = {"inputs": round(time.perf_counter() - started, 6)}
     process_manifest = WINDOWS_UTF8_MANIFEST if os.name == "nt" and units[-1] in WINDOWS_UTF8_ENTRIES else None
     if process_manifest and sys.getwindowsversion().build < 18362:
         raise ValueError("Windows quality tools require Windows 10 version 1903 or later for UTF-8 argv")
@@ -1047,14 +1050,23 @@ def _build_tool(args: argparse.Namespace, cfg: build.ResolvedConfig, *,
                 if report["cache"] == "miss":
                     metadata.unlink(missing_ok=True)
                     generated = directory / "tool.gen.c"
+
+                    def time_emission(phase, seconds):
+                        if seconds is not None:
+                            phases["emit_" + phase] = round(seconds, 6)
+
+                    prepared = time.perf_counter()
                     report["emission_cache"] = prepare_emission(
                         compiler, units, args.fuel, generated, cfg, inputs, cache_enabled=enabled,
-                        parse_bytes=parse_bytes)
+                        parse_bytes=parse_bytes, phase_callback=time_emission)
+                    phases["emission_preparation"] = round(time.perf_counter() - prepared, 6)
                     generated_hash = sha256_file(generated)
+                    partitioned = time.perf_counter()
                     shard_sources, shard_report = build.GCS.materialize_generated_c_shards(
                         frontend_c=None, backend_c=generated, out_dir=directory / "generated-c-shards",
                         label_prefix="native-tool", cache_enabled=enabled, backend_group_size=SHARD_GROUP_SIZE,
                         backend_export_suffix="", report_path=directory / "generated-c-shards-report.json")
+                    phases["c_sharding"] = round(time.perf_counter() - partitioned, 6)
                     if generated_hash != sha256_file(generated):
                         raise ValueError("generated tool changed during sharding")
                     linked = directory / "tool.link.exe" if process_manifest else binary
@@ -1098,6 +1110,7 @@ def _build_tool(args: argparse.Namespace, cfg: build.ResolvedConfig, *,
         if sha256_file(output) != report["binary_sha256"]:
             raise ValueError(f"published tool binary changed before completion: {output}")
         report["elapsed_s"] = round(time.perf_counter() - started, 6)
+        report["preparation_seconds"] = phases
         write_json_atomic(receipt, report)
     print(f"BUILD_TOOL_CACHE: {report['cache']} key={key} elapsed_s={report['elapsed_s']}")
     print(f"BUILD_TOOL: OK {output}")

@@ -52,6 +52,7 @@ HOST_TOOLS = {
 LINT_PRODUCTION_SHARDS = 4
 LINT_STAGE_ENV = "OURO_CI_LINT_STAGE"
 LINT_SUBSHARD_ENV = "OURO_CI_LINT_SUBSHARD"
+PATH_OUTPUT_BUDGET = 32768
 
 
 @dataclass(frozen=True)
@@ -974,7 +975,7 @@ def run_path_selection(base: str, head: str, github_output: str, *, full: bool =
     paths, reason = (None, "complete validation requested") if full else changed_paths(base, head)
     # Set a conservative limit for GitHub's UTF-16 job output.
     # A larger path list selects the full plan to preserve coverage.
-    if paths is not None and len(json.dumps(paths)) > 32768:
+    if paths is not None and len(json.dumps(paths)) > PATH_OUTPUT_BUDGET:
         paths, reason = None, "changed path output would exceed the routing budget"
     groups = ROUTED_PR_GROUPS if full else PULL_REQUEST_GROUPS
     try:
@@ -1025,7 +1026,10 @@ def run_dependency_selection(base: str, head: str, pr_head: str, github_output: 
     workflow = manifests = True
     for revision in dict.fromkeys((head, pr_head)):
         paths, reason = changed_paths(base, revision)
-        if not paths or len(json.dumps(paths)) > 32768:
+        oversized = paths is not None and len(json.dumps(paths)) > PATH_OUTPUT_BUDGET
+        if not paths or oversized:
+            if revision == head and oversized:
+                workflow = False
             print("CI_DEPENDENCIES: complete review: " + (reason or "empty or oversized diff"))
             break
         normalized = [normalize_changed_path(path) for path in paths]
@@ -1034,7 +1038,9 @@ def run_dependency_selection(base: str, head: str, pr_head: str, github_output: 
             break
         diffs[revision] = normalized
     else:
-        workflow = workflow_scan_required(diffs[head])
+        merged_paths = diffs[head]
+        workflow = (workflow_scan_required(merged_paths)
+                    and "github-workflow-gate" not in classify_paths(merged_paths).gates)
         manifests = any(not DEPENDENCY_PATHS.isdisjoint(paths) for paths in diffs.values())
 
     records = f"dependency={bool_text(workflow)}\ndependency_manifests={bool_text(manifests)}\n"
@@ -1061,17 +1067,18 @@ def dependency_selection_contract_failures() -> list[str]:
     cases = (
         ("site", site, site, False, False),
         ("unrelated script", ["scripts/kernel_scale.py"], site, False, False),
-        ("merged workflow", [".github/workflows/ouro-pr.yml"], site, True, False),
+        ("merged workflow", [".github/workflows/ouro-pr.yml"], site, False, False),
         ("head-only workflow", site, [".github/workflows/ouro-pr.yml"], False, False),
-        ("wrapper", ["scripts/github_workflow_gate.py"], site, True, False),
-        ("build input", ["scripts/repo_support.py"], site, True, False),
-        ("imported tool module", ["tools/fix/lex.ouro"], site, True, False),
+        ("wrapper", ["scripts/github_workflow_gate.py"], site, False, False),
+        ("build input", ["scripts/repo_support.py"], site, False, False),
+        ("imported tool module", ["tools/fix/lex.ouro"], site, False, False),
         ("head-only manifest", site, manifest, False, True),
         ("merged manifest rename", [*manifest, "site/removed.json"], site, False, True),
         ("missing merge", None, site, True, True),
         ("missing head", site, None, True, True),
         ("empty", site, [], True, True),
-        ("oversized", ["x" * 32769], site, True, True),
+        ("oversized merge", ["x" * PATH_OUTPUT_BUDGET], site, False, True),
+        ("oversized head", site, ["x" * PATH_OUTPUT_BUDGET], True, True),
         ("invalid", site, ["../wrong"], True, True),
     )
     failures = []
@@ -1090,6 +1097,11 @@ def dependency_selection_contract_failures() -> list[str]:
     with patch("frontend_regen.collect_units_many", side_effect=ValueError("incomplete import closure")) as collect:
         if workflow_scan_required(site) or not workflow_scan_required(["std/json.ouro"]) or collect.call_count != 1:
             failures.append("unavailable workflow tool closure lost coverage or slowed a site-only change")
+    with (patch(__name__ + ".changed_paths", return_value=(site, "")),
+          patch(__name__ + ".workflow_scan_required", return_value=True),
+          contextlib.redirect_stdout(io.StringIO()) as output):
+        if run_dependency_selection(base, merged, source, "") or "dependency=true\n" not in output.getvalue():
+            failures.append("Dependencies skipped a policy scan the main CI did not route")
     with patch(__name__ + ".changed_paths", return_value=(site, "")) as diff, contextlib.redirect_stdout(io.StringIO()):
         if run_dependency_selection(base, merged, merged, "") or diff.call_count != 1:
             failures.append("identical dependency review revisions did not share one diff")
@@ -3604,6 +3616,11 @@ def schedule_gates(selected: Sequence[Gate], *, out: Path, profile: str, group: 
             from ourosmith.native_inputs import MANIFEST_BATCH_MEMORY_MIB
 
             task = Task(gate.name, dependencies, memory_mib=MANIFEST_BATCH_MEMORY_MIB)
+        elif sys.platform == "linux" and gate.name == "analyze-precision":
+            from analyze_core_checks import POOL_CONTROLLER_MEMORY_MIB, POSIX_WORKER_MEMORY_MIB
+
+            task = Task(gate.name, dependencies, max_jobs=2,
+                        base_memory_mib=POOL_CONTROLLER_MEMORY_MIB, memory_mib=POSIX_WORKER_MEMORY_MIB)
         elif (hosted and profile == "pr" and group == "smith" and gate.name == "ouro-smith"
               and os.environ.get("GITHUB_EVENT_NAME") == "pull_request"
               and jobs == 2 and memory_mib is not None and memory_mib >= 4096):

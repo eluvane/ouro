@@ -94,6 +94,22 @@ class StructuralContracts(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'unclosed string'):
             sq.lex('"""\n  missing close', 'ouro')
 
+    def test_local_methods_keep_their_lexical_owners(self):
+        source = (
+            "def first():\n"
+            "    class Reader:\n"
+            "        def get(self, value):\n"
+            "            if isinstance(value, int):\n"
+            "                return abs(value)\n"
+            "            return 0\n"
+        )
+        distinct = source + source.replace("first", "second").replace("int", "float")
+        self.assertNotIn(DUP, rules(scan({"a.py": distinct})))
+        identical = source + source.replace("first", "second")
+        report = scan({"a.py": identical})
+        groups = [row["members"] for row in report["findings"] if row["rule_id"] == DUP]
+        self.assertIn(["a.py#first.Reader.get", "a.py#second.Reader.get"], groups)
+
     def test_ordinary_quote_spans_keep_positions_escapes_and_errors(self):
         offsets = []
 

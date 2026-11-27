@@ -1619,6 +1619,23 @@ class BootstrapCompilerTests(unittest.TestCase):
                     self.assertLess(export, steps.index(attest))
                     self.assertLess(steps.index(attest), steps.index(publish))
 
+    def test_pr_verified_caches_save_after_their_gates(self):
+        workflow = (ci_gate.ROOT / ".github/workflows/ouro-pr.yml").read_text(encoding="utf-8")
+        for job, gate, save in (
+            ("host-compiler", "Export compiler with bootstrap evidence", "Save compiler and bootstrap evidence"),
+            ("quick-firewall", "Run checks", "Save cache"),
+            ("kernel-validation", "Run additional compiler checks", "Save cache"),
+            ("portable-kernel-smoke", "Run checks", "Save portable cache and bootstrap evidence"),
+        ):
+            with self.subTest(job=job):
+                section = ci_gate.workflow_job(workflow, job)
+                self.assertLess(section.index(f"- name: {gate}\n"), section.index(f"- name: {save}\n"))
+                step = section.split(f"- name: {save}\n", 1)[1].split("\n      - name: ", 1)[0]
+                self.assertIn("github.event_name == 'pull_request'", step)
+                self.assertIn("uses: actions/cache/save@", step)
+                self.assertIn("outputs.cache-hit != 'true'", step)
+                self.assertNotIn("always()", step)
+
     def test_compiler_export_pins_history_only_from_the_checked_report(self):
         output, selected, archive = self.compiler_artifact_fixture()
         receipt_path = output.with_name("ouro1.bootstrap.json")

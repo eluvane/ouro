@@ -995,9 +995,10 @@ current compiler when reuse is unavailable.
 In CI's `Build and verify host compiler` step, `Host compiler exact cache
 lookup hit=true` records the cache action's lookup result. The build driver's
 `BOOTSTRAP: current compiler unchanged; checked successor reused` records
-verified reuse. CI saves the compiler cache on a miss during a push to `main`
-or `master`. Nightly saves it on a miss during a scheduled run or manual
-dispatch on either branch. `Dependencies / Review` restores it for workflow scans.
+verified reuse. CI saves verified compiler evidence on a miss for pull requests
+and pushes to `main` or `master`. GitHub scopes pull request writes to the PR's
+merge ref. Nightly saves it on a miss during a scheduled run or manual dispatch
+on either branch.
 
 Nightly prepares one compiler in `Host compiler` and publishes it in a
 workflow-local artifact. Each matrix job downloads the artifact and verifies
@@ -1016,9 +1017,13 @@ producing run. The archive digest must match evidence from a successful first
 CI attempt on a push to `main` or `master` in the same repository. An unavailable
 digest or a mismatch triggers a build from the pinned inputs.
 
-The pull request `runtime-io` and `frontend-security` jobs restore the existing
-`tests` suite cache. Kernel and Portable try their own suite cache prefixes
-first. Only trusted branch pushes save PR suite caches.
+Successful matrix, Kernel, and Portable jobs save suite caches on a miss in the
+same scopes. `runtime-io` and `frontend-security` try their own keys and can also
+restore the `tests` suite cache.
+
+`Dependencies / Review` runs dependency review for manifest changes. It also
+runs the workflow policy scan when the main CI route does not cover it or the
+selection is incomplete.
 
 Restored data is followed by the relevant parity, hash, regeneration, or
 compiler-checking validation. Cache state does not establish program acceptance
