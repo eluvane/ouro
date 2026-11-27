@@ -283,7 +283,7 @@ fi
 "$semantic_perf" >"$out/semantic-performance.out" 2>"$out/semantic-performance.err"
 cat "$out/semantic-performance.out"
 test ! -s "$out/semantic-performance.err"
-test "$(grep -c '^PASS ' "$out/semantic-performance.out")" -eq 11
+test "$(grep -c '^PASS ' "$out/semantic-performance.out")" -eq 19
 if grep -q '^FAIL ' "$out/semantic-performance.out"; then
 	exit 1
 fi
@@ -310,7 +310,7 @@ if [ -x "${semantic_wire}.exe" ]; then
 fi
 "$semantic_wire" >"$out/session-wire-laws.out" 2>"$out/session-wire-laws.err"
 test ! -s "$out/session-wire-laws.err"
-test "$(grep -c '^PASS ' "$out/session-wire-laws.out")" -eq 25
+test "$(grep -c '^PASS ' "$out/session-wire-laws.out")" -eq 28
 if grep -q '^FAIL ' "$out/session-wire-laws.out"; then
 	exit 1
 fi
