@@ -1982,7 +1982,8 @@ def test_frontend_host_worker_jobs(tmp: Path) -> None:
     for label, worker, words, expected_jobs, expected_opt in (
             ("default-worker", True, [], 1, "O0"),
             ("six-worker", True, ["--jobs", "6", "--opt-level", "O1"], 6, "O1"),
-            ("public-suite", False, ["--jobs", "6", "--opt-level", "O1"], 1, "O1")):
+            ("default-suite", False, [], 1, "O0"),
+            ("public-suite", False, ["--jobs", "6", "--opt-level", "O1"], 6, "O1")):
         output = root / label
         command = [*common, "--out", str(output), *words, *(["--worker"] if worker else [])]
         with patch.object(host, "configure_native_stack"), \
@@ -3546,7 +3547,7 @@ def test_frontend_host_environment_overlay(tmp: Path) -> None:
                            probe_timeout=30, config=None)
     before = {"inputs": {"compiler_sha256": host.sha256_file(compiler)}}
     captured = []
-    workers = host.build.bounded_jobs(2) if host.sys.platform == "linux" else 1
+    workers = min(2, host.build.bounded_jobs(6)) if host.sys.platform == "linux" else 1
 
     def text_run(command, **options):
         assert options["env"]["OURO_TOOLCHAIN_PROTOCOL"] == "parent value"
@@ -3601,7 +3602,7 @@ def test_frontend_host_environment_overlay(tmp: Path) -> None:
             patch.object(host.direct_async, "run_section", return_value={"status": "unavailable"}), \
             patch.object(host.direct_fs_replace, "run_native_section", return_value={"status": "unavailable"}), \
             patch.object(host.direct_fs_read, "run_native_section", return_value={"status": "unavailable"}):
-        assert host.run_suite(args, SimpleNamespace(values={"opt_level": "O1", "jobs": 2}), []) == 0
+        assert host.run_suite(args, SimpleNamespace(values={"opt_level": "O1", "jobs": 6}), []) == 0
         assert fs_create.call_args.kwargs["parse_bytes"] is process.call_args.kwargs["parse_bytes"]
     assert captured[0]["OURO_TOOLCHAIN_PROTOCOL"] == "owned 雪" and captured[1]["OURO_TOOLCHAIN_PROTOCOL"] == "parent value"
     assert {key: value for key, value in captured[0].items() if key != "OURO_TOOLCHAIN_PROTOCOL"} == {
